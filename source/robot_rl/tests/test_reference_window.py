@@ -33,9 +33,22 @@ try:
 except Exception as exc:  # pragma: no cover - environment without a usable warp runtime
     pytest.skip(f"warp runtime unavailable: {exc}", allow_module_level=True)
 
-from isaaclab.utils.math import quat_apply, quat_mul  # noqa: E402
+from isaaclab.utils.math import (  # noqa: E402
+    matrix_from_quat,
+    quat_apply,
+    quat_box_minus,
+    quat_conjugate,
+    quat_mul,
+    yaw_quat,
+)
 
+from robot_rl.flow_matching.transforms import rot6d_to_matrix  # noqa: E402
+
+from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (  # noqa: E402
+    MotionSequenceCommand,
+)
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (  # noqa: E402
+    REFERENCE_WINDOW_BLOCKS,
     REFERENCE_WINDOW_NOISE,
     ReferenceWindowNoiseCfg,
     _window_offsets,
@@ -47,8 +60,11 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import 
     ref_base_velocity_local,
     reference_window,
     reference_window_layout,
+    reference_window_layout_from_dims,
     reference_window_noise_vector,
     reference_window_scale,
+    reference_window_to_world,
+    strided_offsets,
 )
 
 N_ENVS, N_JOINTS, T = 3, 4, 60
@@ -193,6 +209,12 @@ class _StubCommand:
             dim=-1,
         )
 
+    # The window builder itself is the PRODUCTION method, bound onto the stub rather than
+    # re-implemented here: it is the thing under test, and a copy in the test would agree
+    # with itself no matter what the command actually does.  It only touches the accessor
+    # surface above plus ``self.robot.data``, so it runs unmodified against the stub.
+    reference_window_obs = MotionSequenceCommand.reference_window_obs
+
 
 class _StubEnv:
     """An environment exposing just ``command_manager.get_term`` and ``num_envs``."""
@@ -210,20 +232,46 @@ def env_cmd():
     return _StubEnv(cmd), cmd
 
 
-def test_window_offsets_include_the_current_step():
-    """Offsets start at 0, so ``num_steps=1`` is the current step alone."""
-    cmd = SimpleNamespace(device="cpu")
-    assert _window_offsets(cmd, 1, 5).tolist() == [0]
-    assert _window_offsets(cmd, 11, 5).tolist() == [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50]
+def test_strided_offsets_include_the_current_step():
+    """The strided builder starts at 0, so ``num_steps=1`` is the current step alone."""
+    assert strided_offsets(1, 5) == (0,)
+    assert strided_offsets(11, 5) == (0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50)
     # Degenerate inputs clamp rather than producing an empty window.
-    assert _window_offsets(cmd, 0, 0).tolist() == [0]
+    assert strided_offsets(0, 0) == (0,)
+
+
+def test_window_offsets_accept_a_non_uniform_list():
+    """The shipped window is NOT strided: offsets 1 and 2 sit inside a 0.1 s tail."""
+    cmd = SimpleNamespace(device="cpu")
+    shipped = (0, 1, 2, *strided_offsets(11, 5)[1:])
+    assert _window_offsets(cmd, shipped).tolist() == [0, 1, 2, 5, 10, 15, 20, 25, 30,
+                                                      35, 40, 45, 50]
+    assert len(shipped) == 13
+
+
+@pytest.mark.parametrize("bad, match", [
+    ((), "at least one offset"),
+    ((1, 2, 5), "must start at the current step"),
+    ((0, 5, 5), "strictly ascending"),
+    ((0, 10, 5), "strictly ascending"),
+])
+def test_window_offsets_reject_a_list_nothing_downstream_could_use(bad, match):
+    """Three consumers assume offset 0 first and a well-defined maximum; see the docstring.
+
+    Node 0 is what the CLF grades and what enters the generator's autoregressive history,
+    and ``max(offsets)`` is both the episode truncation margin and the horizon the
+    generator is checked against -- none of which would fail visibly.
+    """
+    cmd = SimpleNamespace(device="cpu")
+    with pytest.raises(ValueError, match=match):
+        _window_offsets(cmd, bad)
 
 
 def test_layout_matches_the_robot_and_clip(env_cmd):
     """Block widths follow the joint count and ee frame count."""
     _, cmd = env_cmd
     assert reference_window_layout(cmd) == [
-        ("base_pose", 6), ("base_vel", 6),
+        ("base_pose", 9), ("base_vel", 6),
         ("joint_pos", N_JOINTS), ("joint_vel", N_JOINTS),
         ("ee_pos", 3 * len(EE_FRAMES)),
     ]
@@ -233,19 +281,137 @@ def test_window_shape(env_cmd):
     """``[N, num_steps * D]`` with D from the layout."""
     env, cmd = env_cmd
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    assert reference_window(env, "traj_ref", num_steps=11, stride=5).shape == (N_ENVS, 11 * per_step)
-    assert reference_window(env, "traj_ref", num_steps=1, stride=5).shape == (N_ENVS, per_step)
+    assert reference_window(env, "traj_ref", offsets=strided_offsets(11, 5)).shape == (N_ENVS, 11 * per_step)
+    assert reference_window(env, "traj_ref", offsets=strided_offsets(1, 5)).shape == (N_ENVS, per_step)
 
 
 def test_sample_zero_matches_the_current_step_terms(env_cmd):
     """Offset 0 reproduces the single-step observations the window replaced."""
     env, cmd = env_cmd
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    first = reference_window(env, "traj_ref", num_steps=11, stride=5)[:, :per_step]
+    first = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))[:, :per_step]
 
-    torch.testing.assert_close(first[:, 0:6], base_pose_error(env, "traj_ref"))
-    torch.testing.assert_close(first[:, 6:12], ref_base_velocity_local(env, "traj_ref"))
+    torch.testing.assert_close(first[:, 0:9], base_pose_error(env, "traj_ref"))
+    torch.testing.assert_close(first[:, 9:15], ref_base_velocity_local(env, "traj_ref"))
     torch.testing.assert_close(first[:, -3 * len(EE_FRAMES):], ee_ref_relative_to_base(env, "traj_ref"))
+
+
+def test_base_pose_is_the_reference_pose_in_the_anchor_yaw_frame(env_cmd):
+    """``base_pose`` is ``[R_yawT (p_ref - p_act), rot6d(R_yawT R_ref)]``.
+
+    Pinned against an independent expression rather than against the window's own inverse,
+    because every other check here is a round trip or a cross-check between two functions
+    that share the convention -- flip them together and nothing notices.
+
+    This is the test that guards the SIGN and the FRAME -- neither of which is visible in
+    the observation's width, so nothing but this and
+    :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION` stands between a stale policy
+    and a clean-looking load. It has moved twice with that string: first when the orientation
+    half was flipped from ``Log(R_refT R_act)`` so both halves meant the same thing, then when
+    the anchor became yaw-only so the robot's own tilt stopped rotating the frame.
+    """
+    env, cmd = env_cmd
+    offs = _window_offsets(cmd, strided_offsets(11, 5))
+    ref_p, ref_q, _, _ = cmd.get_future_world_base(offs)
+    n, k = ref_p.shape[:2]
+    act_p = wp.to_torch(cmd.robot.data.root_pos_w)[:, None, :].expand(n, k, 3).reshape(-1, 3)
+    act_q = wp.to_torch(cmd.robot.data.root_quat_w)[:, None, :].expand(n, k, 4).reshape(-1, 4)
+
+    per_step = sum(w for _, w in reference_window_layout(cmd))
+    base_pose = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
+    base_pose = base_pose.reshape(n, k, per_step)[..., 0:9].reshape(-1, 9)
+
+    # The anchor is YAW-ONLY: heading, never the robot's roll/pitch.
+    act_yaw = yaw_quat(act_q)
+    # position: R_yawT (p_ref - p_act) -- robot -> reference, in the anchor's heading frame
+    want_pos = quat_apply(quat_conjugate(act_yaw), ref_p.reshape(-1, 3) - act_p)
+    # orientation: R_yawT R_ref, the SAME direction. Compared as a rotation matrix, since
+    # that is what the 6D pair encodes and it is insensitive to quaternion sign.
+    want_rot = matrix_from_quat(quat_mul(quat_conjugate(act_yaw), ref_q.reshape(-1, 4)))
+    torch.testing.assert_close(base_pose[:, 0:3], want_pos, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(rot6d_to_matrix(base_pose[:, 3:9]), want_rot,
+                               atol=1e-6, rtol=1e-6)
+
+    # ...and sitting exactly on the reference zeroes the position half. The rotation half
+    # does NOT become the identity: with a yaw-only anchor it retains the reference's own
+    # roll and pitch, which is the whole point -- the frame drops the ANCHOR's tilt, never
+    # the reference's. So it equals rot6d(R_yawT R_ref) with R_yaw taken from the reference.
+    cmd.robot.data.root_pos_w = _wp(ref_p[:, 0, :].contiguous())
+    cmd.robot.data.root_quat_w = _wp(ref_q[:, 0, :].contiguous())
+    on_ref = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
+    on_ref = on_ref.reshape(n, k, per_step)[:, 0, 0:9]
+    q0 = ref_q[:, 0, :]
+    torch.testing.assert_close(on_ref[:, 0:3], torch.zeros_like(on_ref[:, 0:3]),
+                               atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        rot6d_to_matrix(on_ref[:, 3:9]),
+        matrix_from_quat(quat_mul(quat_conjugate(yaw_quat(q0)), q0)),
+        atol=1e-6, rtol=1e-6)
+
+
+def test_layout_from_dims_matches_the_command_layout(env_cmd):
+    """The dimension-only layout is the same table the command-based one builds."""
+    _, cmd = env_cmd
+    assert reference_window_layout_from_dims(N_JOINTS, len(EE_FRAMES)) == reference_window_layout(cmd)
+
+
+def _to_world(env, cmd, num_steps: int = 11, stride: int = 5) -> dict:
+    """Round-trip the window back to world through :func:`reference_window_to_world`."""
+    window = reference_window(env, "traj_ref", offsets=strided_offsets(num_steps, stride))
+    return reference_window_to_world(
+        window,
+        wp.to_torch(cmd.robot.data.root_pos_w),
+        wp.to_torch(cmd.robot.data.root_quat_w),
+        num_steps=num_steps, num_joints=N_JOINTS, num_ee_frames=len(EE_FRAMES),
+    )
+
+
+def test_window_to_world_recovers_the_reference(env_cmd):
+    """The inverse reproduces exactly the world-frame reference the command served.
+
+    This is the load-bearing check behind the viser overlay: the debugger draws the
+    reference the POLICY saw by inverting the observation, so if the inverse and the
+    forward transform ever disagree the overlay would show a phantom frame error.
+    """
+    env, cmd = env_cmd
+    offs = _window_offsets(cmd, strided_offsets(11, 5))
+    pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(offs)
+    out = _to_world(env, cmd)
+
+    torch.testing.assert_close(out["base_pos_w"], pos_w, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out["base_lin_vel_w"], lin_w, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out["base_ang_vel_w"], ang_w, atol=1e-5, rtol=1e-5)
+    # quat_box_plus normalises the sign, so compare the ROTATION: q_out * q_in^-1 is
+    # identity up to sign, i.e. |w| == 1 and the vector part is zero.
+    n, k = quat_w.shape[:2]
+    diff = quat_mul(out["base_quat_w"].reshape(n * k, 4),
+                    quat_conjugate(quat_w.reshape(n * k, 4)))
+    torch.testing.assert_close(diff[:, :3], torch.zeros(n * k, 3), atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(diff[:, 3].abs(), torch.ones(n * k), atol=1e-5, rtol=1e-5)
+
+
+def test_window_to_world_recovers_the_ee_frames_and_joints(env_cmd):
+    """ee positions come back in world; the joint blocks pass through untouched."""
+    env, cmd = env_cmd
+    offs = _window_offsets(cmd, strided_offsets(11, 5))
+    ee_w = cmd.get_future_world_frames(EE_FRAMES, offs)[..., 0:3]   # [N, K, F, 3]
+    joint_pos, joint_vel = cmd.get_future_joint_state(offs)
+    out = _to_world(env, cmd)
+
+    torch.testing.assert_close(out["ee_pos_w"], ee_w, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out["joint_pos"], joint_pos, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(out["joint_vel"], joint_vel, atol=1e-5, rtol=1e-5)
+
+
+def test_window_to_world_rejects_a_width_mismatch(env_cmd):
+    """A window built for a different layout fails loudly instead of reshaping silently."""
+    env, cmd = env_cmd
+    window = reference_window(env, "traj_ref", offsets=strided_offsets(11, 5))
+    with pytest.raises(ValueError, match="implies"):
+        reference_window_to_world(
+            window, wp.to_torch(cmd.robot.data.root_pos_w), wp.to_torch(cmd.robot.data.root_quat_w),
+            num_steps=11, num_joints=N_JOINTS + 1, num_ee_frames=len(EE_FRAMES),
+        )
 
 
 def test_joint_block_is_in_robot_order(env_cmd):
@@ -256,8 +422,8 @@ def test_joint_block_is_in_robot_order(env_cmd):
     reversed relative to robot order, so a naive implementation would fail here.
     """
     env, cmd = env_cmd
-    first = reference_window(env, "traj_ref", num_steps=1, stride=5)
-    joint_block = first[:, 12:12 + N_JOINTS]
+    first = reference_window(env, "traj_ref", offsets=strided_offsets(1, 5))
+    joint_block = first[:, 15:15 + N_JOINTS]
     torch.testing.assert_close(joint_block, cmd._cur(cmd.joint_pos))
     # Same values, opposite order: a permutation, not a different quantity.
     torch.testing.assert_close(joint_block, joint_pos_ref(env, "traj_ref").flip(-1))
@@ -268,12 +434,12 @@ def test_later_samples_read_later_clip_steps(env_cmd):
     env, cmd = env_cmd
     num_steps, stride = 4, 5
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    win = reference_window(env, "traj_ref", num_steps=num_steps, stride=stride).view(
+    win = reference_window(env, "traj_ref", offsets=strided_offsets(num_steps, stride)).view(
         N_ENVS, num_steps, per_step
     )
-    offsets = _window_offsets(cmd, num_steps, stride)
+    offsets = _window_offsets(cmd, strided_offsets(num_steps, stride))
     expected = cmd._gather(cmd.joint_pos, offsets)
-    torch.testing.assert_close(win[:, :, 12:12 + N_JOINTS], expected)
+    torch.testing.assert_close(win[:, :, 15:15 + N_JOINTS], expected)
 
 
 def test_base_blocks_are_heading_invariant(env_cmd):
@@ -283,7 +449,7 @@ def test_base_blocks_are_heading_invariant(env_cmd):
     move the observation -- that is what makes it deployable.
     """
     env, cmd = env_cmd
-    before = reference_window(env, "traj_ref", num_steps=6, stride=5)
+    before = reference_window(env, "traj_ref", offsets=strided_offsets(6, 5))
 
     yaw = torch.tensor(0.7)
     rot = torch.tensor([0.0, 0.0, torch.sin(yaw / 2), torch.cos(yaw / 2)]).expand(N_ENVS, 4).contiguous()
@@ -302,7 +468,7 @@ def test_base_blocks_are_heading_invariant(env_cmd):
     cmd.robot.data.root_pos_w = _wp(quat_apply(rot, wp.to_torch(cmd.robot.data.root_pos_w)))
     cmd.robot.data.root_quat_w = _wp(quat_mul(rot, wp.to_torch(cmd.robot.data.root_quat_w)))
 
-    torch.testing.assert_close(reference_window(env, "traj_ref", num_steps=6, stride=5), before,
+    torch.testing.assert_close(reference_window(env, "traj_ref", offsets=strided_offsets(6, 5)), before,
                                atol=1e-5, rtol=1e-5)
 
 
@@ -311,10 +477,10 @@ def test_ee_block_is_relative_to_its_own_reference_base(env_cmd):
     env, cmd = env_cmd
     num_steps, stride = 3, 5
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    win = reference_window(env, "traj_ref", num_steps=num_steps, stride=stride).view(
+    win = reference_window(env, "traj_ref", offsets=strided_offsets(num_steps, stride)).view(
         N_ENVS, num_steps, per_step
     )
-    offsets = _window_offsets(cmd, num_steps, stride)
+    offsets = _window_offsets(cmd, strided_offsets(num_steps, stride))
     torch.testing.assert_close(
         win[:, :, -3 * len(EE_FRAMES):],
         cmd._gather(cmd.ee_local, offsets).flatten(start_dim=2),
@@ -326,8 +492,8 @@ def test_command_window(env_cmd):
     """The joystick window is the raw command at the same offsets."""
     env, cmd = env_cmd
     num_steps, stride = 4, 5
-    got = command_window(env, "traj_ref", num_steps=num_steps, stride=stride)
-    expected = cmd._gather(cmd.target_vel, _window_offsets(cmd, num_steps, stride))
+    got = command_window(env, "traj_ref", offsets=strided_offsets(num_steps, stride))
+    expected = cmd._gather(cmd.target_vel, _window_offsets(cmd, strided_offsets(num_steps, stride)))
     assert got.shape == (N_ENVS, num_steps * 3)
     torch.testing.assert_close(got.view(N_ENVS, num_steps, 3), expected)
 
@@ -337,7 +503,7 @@ def test_window_saturates_at_the_clip_end(env_cmd):
     env, cmd = env_cmd
     cmd._step0 = torch.full((N_ENVS,), T - 3)
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    win = reference_window(env, "traj_ref", num_steps=5, stride=5).view(N_ENVS, 5, per_step)
+    win = reference_window(env, "traj_ref", offsets=strided_offsets(5, 5)).view(N_ENVS, 5, per_step)
     # Samples 1..4 all land past the end, so they hold the final frame.
     for k in range(2, 5):
         torch.testing.assert_close(win[:, k], win[:, 1])
@@ -358,12 +524,12 @@ def test_noise_vector_matches_the_window_layout(env_cmd):
     step = vec[:per_step]
     m = REFERENCE_WINDOW_NOISE
     assert step[0:3] == list(m["base_pos"])                       # per-axis, z tighter
-    assert step[3:6] == [m["base_ori"]] * 3
-    assert step[6:9] == [m["base_lin_vel"]] * 3
-    assert step[9:12] == [m["base_ang_vel"]] * 3
-    assert step[12:12 + N_JOINTS] == [m["joint_pos"]] * N_JOINTS
-    assert step[12 + N_JOINTS:12 + 2 * N_JOINTS] == [m["joint_vel"]] * N_JOINTS
-    assert step[12 + 2 * N_JOINTS:] == list(m["ee_pos"]) * len(EE_FRAMES)
+    assert step[3:9] == [m["base_ori"]] * 6                       # 6D rotation: 6 channels
+    assert step[9:12] == [m["base_lin_vel"]] * 3
+    assert step[12:15] == [m["base_ang_vel"]] * 3
+    assert step[15:15 + N_JOINTS] == [m["joint_pos"]] * N_JOINTS
+    assert step[15 + N_JOINTS:15 + 2 * N_JOINTS] == [m["joint_vel"]] * N_JOINTS
+    assert step[15 + 2 * N_JOINTS:] == list(m["ee_pos"]) * len(EE_FRAMES)
     # Every sample in the window carries the same magnitudes.
     assert vec[-per_step:] == step
 
@@ -371,7 +537,7 @@ def test_noise_vector_matches_the_window_layout(env_cmd):
 def test_noise_vector_rejects_a_layout_mismatch():
     """A magnitudes dict that cannot fill the layout fails loudly, not silently."""
     bad = dict(REFERENCE_WINDOW_NOISE, ee_pos=[0.05, 0.05])  # 2 axes, not 3
-    with pytest.raises(ValueError, match="drifted from reference_window_layout"):
+    with pytest.raises(ValueError, match="drifted from window_blocks"):
         reference_window_noise_vector(2, N_JOINTS, len(EE_FRAMES), bad)
 
 
@@ -418,7 +584,7 @@ def test_only_the_joint_velocity_block_is_scaled(env_cmd):
     num_steps = 3
     per_step = sum(w for _, w in reference_window_layout(cmd))
     step = reference_window_scale(num_steps, N_JOINTS, len(EE_FRAMES))[:per_step]
-    jv = slice(12 + N_JOINTS, 12 + 2 * N_JOINTS)
+    jv = slice(15 + N_JOINTS, 15 + 2 * N_JOINTS)
     assert set(step[jv]) == {0.05}
     assert set(step[:jv.start]) == {1.0}
     assert set(step[jv.stop:]) == {1.0}
@@ -432,9 +598,9 @@ def test_scale_and_noise_share_one_layout():
     bad = {k: 1.0 for k in ("base_pos", "base_ori", "base_lin_vel", "base_ang_vel",
                             "joint_pos", "joint_vel")}
     bad["ee_pos"] = [1.0, 1.0]  # 2 axes, not 3
-    with pytest.raises(ValueError, match="drifted from reference_window_layout"):
+    with pytest.raises(ValueError, match="drifted from window_blocks"):
         reference_window_scale(2, N_JOINTS, len(EE_FRAMES), bad)
-    with pytest.raises(ValueError, match="drifted from reference_window_layout"):
+    with pytest.raises(ValueError, match="drifted from window_blocks"):
         reference_window_noise_vector(2, N_JOINTS, len(EE_FRAMES), bad)
 
 
@@ -447,7 +613,7 @@ def test_noise_is_specified_before_scaling(env_cmd):
     """
     _, cmd = env_cmd
     per_step = sum(w for _, w in reference_window_layout(cmd))
-    jv = slice(12 + N_JOINTS, 12 + 2 * N_JOINTS)
+    jv = slice(15 + N_JOINTS, 15 + 2 * N_JOINTS)
     noise = reference_window_noise_vector(1, N_JOINTS, len(EE_FRAMES))[:per_step]
     scale = reference_window_scale(1, N_JOINTS, len(EE_FRAMES))[:per_step]
     assert set(noise[jv]) == {0.5}      # rad/s, pre-scale
@@ -464,3 +630,153 @@ def test_noise_cfg_from_layout_is_hydra_safe(env_cmd):
     assert isinstance(cfg.n_half, list) and len(cfg.n_half) == 3 * per_step
     assert all(isinstance(v, float) for v in cfg.n_half)
     assert cfg.magnitudes == REFERENCE_WINDOW_NOISE
+
+
+# ---------------------------------------------------------------------------
+# The block selection, as the rest of the pipeline reads it.
+# ---------------------------------------------------------------------------
+def _obs_manager(**groups):
+    """A stub observation manager exposing ``blocks`` per group.
+
+    Args:
+        **groups: ``group_name=blocks`` (``blocks`` may be ``None`` for the default), or
+            ``group_name=None`` for a group with no ``reference_window`` term at all.
+
+    Returns:
+        An object with the two attributes :func:`reference_window_selection` reads.
+    """
+    active, cfgs = {}, {}
+    for name, blocks in groups.items():
+        if blocks is _NO_TERM:
+            active[name], cfgs[name] = ["joint_pos"], [SimpleNamespace(params={})]
+            continue
+        active[name] = ["joint_pos", "reference_window"]
+        cfgs[name] = [SimpleNamespace(params={}),
+                      SimpleNamespace(params={"offsets": (0, 5), "blocks": blocks})]
+    return SimpleNamespace(active_terms=active, _group_obs_term_cfgs=cfgs)
+
+
+_NO_TERM = object()   #: sentinel for "this group does not observe the window"
+
+
+def test_reference_window_selection_is_the_single_producer():
+    """One function answers "which blocks does this teacher pack" for every consumer.
+
+    ``record_data`` stamps it on the recording (setting the generator's training width)
+    and ``export_parameters`` puts it in ``tracker.onnx`` (where the deploy checks the
+    generator against it). Both restating the lookup is how the two came to disagree in
+    the first place.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (
+        reference_window_selection,
+    )
+    slim = ("base_pose", "base_vel", "joint_pos")
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=list(slim)))
+    assert reference_window_selection(env) == slim
+
+    # Canonical packing order, whatever order the cfg names them in.
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=["joint_pos", "base_vel",
+                                                                  "base_pose"]))
+    assert reference_window_selection(env) == slim
+
+    # No selection on the term means all five, not "unknown".
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=None))
+    assert reference_window_selection(env) == REFERENCE_WINDOW_BLOCKS
+    assert len(REFERENCE_WINDOW_BLOCKS) == 5
+
+    # A task without the term: nothing to state, and no exception.
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=_NO_TERM))
+    assert reference_window_selection(env) is None
+
+    # Restricting the search to one group is what the exporter does, so a critic-only
+    # window never lands in a contract the actor's policy does not read.
+    env = SimpleNamespace(observation_manager=_obs_manager(policy=_NO_TERM, critic=list(slim)))
+    assert reference_window_selection(env, groups=["policy"]) is None
+    assert reference_window_selection(env) == slim
+
+
+def test_reference_window_selection_refuses_disagreeing_groups():
+    """One command builds one window; two groups reading different ones is a bug.
+
+    Silent otherwise: each group's term is internally consistent and correctly sized, so
+    only the thing that has to state ONE selection off-sim would ever notice.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (
+        reference_window_selection,
+    )
+    env = SimpleNamespace(observation_manager=_obs_manager(
+        policy=["base_pose", "base_vel", "joint_pos"], critic=["base_pose", "joint_pos"]))
+    with pytest.raises(ValueError, match="different block selections"):
+        reference_window_selection(env)
+
+
+def test_g1_teacher_wires_its_selection_into_the_term():
+    """The env cfg's constant must reach the term's ``params``, or nothing downstream sees it.
+
+    ``reference_window_selection`` reads the TERM, so a term built without ``blocks``
+    would report all five while the observation packs a subset -- and the generator would
+    be trained at the wrong width with every array still the right shape for whoever made
+    it.
+    """
+    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_teacher_env_cfg as tcfg
+    obs = tcfg.G1TeacherEnvCfg().observations
+    found = []
+    for group_name in vars(obs):
+        group = getattr(obs, group_name)
+        term = getattr(group, "reference_window", None)
+        if term is not None:
+            found.append((group_name, tuple((term.params or {}).get("blocks") or ())))
+    assert found, "no observation group carries a reference_window term"
+    for group_name, blocks in found:
+        assert blocks == tuple(tcfg.REFERENCE_WINDOW_BLOCKS), (
+            f"{group_name}'s reference_window does not carry REFERENCE_WINDOW_BLOCKS")
+
+
+def test_g1_teacher_wires_the_same_offsets_into_every_window_term():
+    """All four window terms -- both groups, both terms -- must share one offset list.
+
+    Two separate reasons, both invisible if broken:
+
+    * ``reference_window`` and ``command_window`` are assembled into ONE flat observation,
+      and the deploy runtime refuses a tracker whose two exported specs disagree
+      (``deploy.gen_tracker._resolve_window_offsets``). Catching it here means the export
+      is never written rather than rejected at load.
+    * the ``reference`` and ``critic`` groups are fed by one command term, so a group
+      observing different offsets is reading a window that is not the one being built --
+      the same failure ``reference_window_selection`` guards for ``blocks``.
+    """
+    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_teacher_env_cfg as tcfg
+    obs = tcfg.G1TeacherEnvCfg().observations
+    want = tuple(tcfg.REFERENCE_OFFSETS)
+    found = []
+    for group_name in vars(obs):
+        group = getattr(obs, group_name)
+        for term_name in ("reference_window", "command_window"):
+            term = getattr(group, term_name, None)
+            if term is not None:
+                found.append((f"{group_name}.{term_name}",
+                              tuple((term.params or {}).get("offsets") or ())))
+    assert len(found) == 4, f"expected 4 window terms, found {[n for n, _ in found]}"
+    for where, offsets in found:
+        assert offsets == want, f"{where} declares {offsets}, not REFERENCE_OFFSETS"
+
+
+def test_shipped_offsets_carry_the_short_offset_head():
+    """The point of the non-uniform window: the two steps right after the current one.
+
+    A 0.1 s-spaced window cannot show what happens NEXT, only where the reference will be
+    a tenth of a second from now. Offsets 1 and 2 are what give the policy 50 Hz structure
+    around the present, and they cost no generator horizon -- ``max(offsets)`` is unchanged.
+    """
+    pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (
+        REFERENCE_OFFSETS, REFERENCE_TAIL_NUM_STEPS, REFERENCE_TAIL_STRIDE,
+    )
+    tail = strided_offsets(REFERENCE_TAIL_NUM_STEPS, REFERENCE_TAIL_STRIDE)
+    assert REFERENCE_OFFSETS[:3] == (0, 1, 2)
+    assert REFERENCE_OFFSETS == (0, 1, 2, *tail[1:])
+    # The near samples are pure gain: the horizon the generator must cover is the FURTHEST
+    # offset, which the strided tail alone already sets.
+    assert max(REFERENCE_OFFSETS) == max(tail)

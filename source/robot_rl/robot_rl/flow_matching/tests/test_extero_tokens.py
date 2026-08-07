@@ -18,6 +18,7 @@ import torch
 
 from robot_rl.flow_matching.config import EXTERO_SOURCES, FlowMatchingConfig
 from robot_rl.flow_matching.dataset import build_train_val
+from robot_rl.flow_matching.tests.recording_fixtures import per_step_recording
 from robot_rl.flow_matching.model import FlowMatchingTransformer
 from robot_rl.flow_matching.transforms import (
     DEPTH_CLIP,
@@ -79,44 +80,20 @@ def _camera_spec(n_cameras: int, token_dim: int) -> list[dict]:
 def _synthetic_recording(n_ep=3, L=24, nj=4, K=2, F=6, Ksc=7, Kstep=4, depth=None, seed=0):
     """Synthetic recording with a height scan and optionally a depth array.
 
+    Delegates the trajectory itself to the shared fixture builder -- the dataset validates
+    the recording now, so it has to be a plausible rollout (see
+    :mod:`~robot_rl.flow_matching.tests.recording_fixtures`).
+
     Args:
         depth: ``(num_cameras, per_camera_dim)`` to add a ``depth`` array, or ``None``.
 
     Returns:
         ``(data, meta, nj, K, F, node_dim)``.
     """
-    rng = np.random.default_rng(seed)
-    node = 2 * nj + 15 * (1 + K)
-    parts = []
-    for e in range(n_ep):
-        rows = [np.concatenate([rng.standard_normal(3), [0, 0, 0, 1.0], rng.standard_normal(3),
-                                rng.standard_normal(3), rng.standard_normal(2 * nj),
-                                rng.standard_normal(K * 13)]) for _ in range(L)]
-        s = np.stack(rows).astype(np.float32)
-        rfu = rng.standard_normal((L, F, node)).astype(np.float32)
-        rfu[:, 0, 0:3] = s[:, 0:3]
-        rfu[:, 0, 3:7] = s[:, 3:7]
-        cf = rng.standard_normal((L, F, 3)).astype(np.float32)
-        hs = rng.standard_normal((L, Ksc)).astype(np.float32)
-        ra = (np.arange(L) % Kstep == 0).astype(np.uint8)
-        done = np.zeros(L, np.uint8)
-        done[-1] = 1
-        row = [s, rfu, cf, hs, ra, np.full(L, e, np.int64), np.arange(L, dtype=np.int64), done]
-        if depth is not None:
-            row.append(rng.standard_normal((L, depth[0], depth[1])).astype(np.float32))
-        parts.append(tuple(row))
-    keys = ["state", "ref_future", "cmd_future", "height_scan", "reanchor_active",
-            "episode_id", "step_in_episode", "done"]
-    if depth is not None:
-        keys.append("depth")
-    data = {k: np.concatenate([p[i] for p in parts]) for i, k in enumerate(keys)}
-    stn = ["root_pos_w", "root_quat_w", "root_link_lin_vel_w", "root_link_ang_vel_w",
-           "joint_pos", "joint_vel"]
-    std = [3, 4, 3, 3, nj, nj]
-    frames = [f"f{i}" for i in range(K)]
-    for fr in frames:
-        stn += [f"{fr}:pos_w", f"{fr}:quat_w", f"{fr}:lin_vel_w", f"{fr}:ang_vel_w"]
-        std += [3, 4, 3, 3]
+    data, stn, std, frames = per_step_recording(
+        n_ep=n_ep, length=L, nj=nj, k=K, future_len=F, snap_every=Kstep,
+        num_scan_rays=Ksc, depth=depth, seed=seed,
+    )
     meta = SimpleNamespace(state_term_names=stn, state_term_dims=std, state_frame_names=frames,
                            state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F,
                            # Present only alongside a depth array, exactly as the recorder
@@ -124,7 +101,7 @@ def _synthetic_recording(n_ep=3, L=24, nj=4, K=2, F=6, Ksc=7, Kstep=4, depth=Non
                            # ARRAY (what test_missing_array_names_the_task_to_record_with
                            # pins) rather than on the missing contract.
                            depth_camera_spec=_camera_spec(depth[0], depth[1]) if depth else None)
-    return data, meta, nj, K, F, node
+    return data, meta, nj, K, F, sum(std)
 
 
 def _cfg(**kw) -> FlowMatchingConfig:
@@ -138,17 +115,21 @@ def _cfg(**kw) -> FlowMatchingConfig:
 # Config
 ##
 
-def test_default_source_is_the_height_scan():
-    """The validated signal stays the default, so nothing changes without opting in."""
-    cfg = FlowMatchingConfig()
-    assert cfg.extero_source == "height_scan"
-    assert cfg.extero_tokens == 1
+def test_default_source_is_depth():
+    """The DEPLOYABLE signal is the default: the robot has cameras, not a heightmap.
+
+    Defaulting to the height scan made it too easy to train an FM that could never leave
+    the simulator, so the sim-only signal is now the one you opt into.
+    """
+    assert FlowMatchingConfig().extero_source == "depth"
 
 
 def test_noise_knob_follows_the_source():
     """Each source has its own amplitude -- metres vs normalised depth units."""
-    assert _cfg().noise_extero == pytest.approx(FlowMatchingConfig().noise_height_scan)
-    assert _cfg(extero_source="depth").noise_extero == pytest.approx(FlowMatchingConfig().noise_depth)
+    assert _cfg(extero_source="height_scan").noise_extero == pytest.approx(
+        FlowMatchingConfig().noise_height_scan)
+    assert _cfg(extero_source="depth").noise_extero == pytest.approx(
+        FlowMatchingConfig().noise_depth)
 
 
 def test_unknown_source_is_rejected():
@@ -178,10 +159,14 @@ def test_terrain_penetration_loss_is_gone():
 
 def test_stale_checkpoint_config_with_terrain_keys_loads():
     """Checkpoints trained before the removal carry ``terrain_*`` keys; ignore them."""
-    d = FlowMatchingConfig().to_dict()
+    d = FlowMatchingConfig(extero_source="height_scan").to_dict()
     d["terrain_penetration_weight"] = 200.0
     d["terrain_penetration_mode"] = "ankle"
-    assert FlowMatchingConfig.from_dict(d).extero_source == "height_scan"
+    cfg = FlowMatchingConfig.from_dict(d)
+    # The unknown keys are dropped, and every known one survives round-tripping -- the
+    # recorded source in particular, which must NOT be re-defaulted on load.
+    assert cfg.extero_source == "height_scan"
+    assert not hasattr(cfg, "terrain_penetration_weight")
 
 
 ##
@@ -283,7 +268,7 @@ def test_swapping_two_cameras_changes_the_prediction():
 def test_height_scan_dataset_resolves_one_token():
     """The scan path resolves T=1 and the full ray count as the token width."""
     data, meta, *_ = _synthetic_recording()
-    cfg = _cfg()
+    cfg = _cfg(extero_source="height_scan")      # explicit: the default is depth
     train, _ = build_train_val(data, meta, cfg)
     ksc = data["height_scan"].shape[1]
     assert cfg.extero_tokens == 1 and cfg.height_dim == ksc
@@ -302,7 +287,8 @@ def test_depth_dataset_resolves_one_token_per_camera():
 def test_source_selects_which_array_is_used():
     """Both arrays present -> the config decides, and the widths differ observably."""
     data, meta, *_ = _synthetic_recording(depth=(2, 15))
-    scan_cfg, depth_cfg = _cfg(), _cfg(extero_source="depth")
+    scan_cfg = _cfg(extero_source="height_scan")
+    depth_cfg = _cfg(extero_source="depth")
     scan_ds, _ = build_train_val(data, meta, scan_cfg)
     depth_ds, _ = build_train_val(data, meta, depth_cfg)
     assert scan_ds[0]["height"].shape != depth_ds[0]["height"].shape

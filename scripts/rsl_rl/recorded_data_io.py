@@ -106,6 +106,61 @@ class RecordingMeta:
     content_sha256: str = ""
     format: str = "per_step_npz"
     history_len: int = 0
+    fm_snap_every: int = 0
+    """Control steps between snap (re-plan) events in this recording, from the command's
+    ``fm_snap_every``. The FM tracker's ``fm_update_every`` must equal it -- the horizon is
+    sized from the period and the targets were cut at that cadence. 0 = not recorded."""
+    family_names: list[str] = field(default_factory=list)
+    """Clip-family names indexed by the per-window ``clip_family`` code (0 = ``unknown``).
+
+    Empty for a recording written before the tag existed, or from a library with no terrain
+    manifest -- in both cases every ``clip_family`` is 0 and no family filter can match."""
+    reference_blocks: list[str] | None = None
+    """Reference-window blocks the RECORDING TEACHER's policy observed
+    (``mdp.reference_window_selection``), in packing order.
+
+    Not a property of the recorded arrays -- those are world-frame state rows, from which
+    any selection can be packed -- but of the teacher that produced them, and so the right
+    DEFAULT for the generator trained on this file: an FM must predict exactly the blocks
+    the policy it drives consumes. ``None`` for a recording written before the selection
+    existed, which is necessarily a full five-block one."""
+    extero_corrupted: bool = False
+    """Whether the recorded exteroception already carries the sim's sensor DR.
+
+    True when a depth noiser was installed at record time (the ``resample_depth_noise`` event),
+    i.e. the recorded ``depth`` went through the same plane deviation, blur, dropout and
+    randomized camera pose the RL policy saw. At deploy ONE physical image feeds both the
+    policy and the generator, so they must be corrupted alike -- and the sim's model is
+    STRUCTURED (per-episode plane + blur + pose, per-step additive + dropout) in a way an
+    additive scalar cannot reproduce.
+
+    False for a recording made on a ``-play`` task, which strips those events: the depth is
+    clean at the nominal camera pose, and ``FlowMatchingConfig.noise_depth`` is then the only
+    corruption the generator ever sees.
+
+    The FM dataset reads this and ZEROES ``noise_depth`` when it is True, so the two do not
+    stack. Nothing else consults it."""
+    history_anchor: str = ""
+    """Which frame each ``history_state`` row's root pose is, i.e. what the history is OBSERVED
+    relative to.
+
+    * ``"plan"`` -- rows ``0..H-2`` carry the robot pose at the last re-anchor (the plan anchor),
+      so all the history rows the model conditions on share ONE frame. Row ``H-1`` keeps the
+      measured pose, since that is the target's anchor. This is what the generator sees at
+      deploy, where its history is a slice of its own previous plan and no transformation is
+      applied.
+    * ``"per_step"`` (or ``""`` for a recording predating this field) -- every row carries the
+      measured pose at that row's own step. Differencing each reference against its own
+      contemporaneous robot pose cancels the reference's motion: measured on depth_v5, the four
+      rows' means are FLAT at 0.0196/0.0197/0.0199/0.0199 m and sit 6.9 mm apart, against
+      0.1231 -> 0.1657 m and 45 mm for the same statistic plan-anchored. (Correlation ACROSS
+      rows is NOT the diagnostic: it is 0.97-0.99 either way, because most of the variance is
+      across windows -- where the reference happens to be -- rather than across rows.)
+
+    The dataset REFUSES anything but ``"plan"``: the two are the same shape, so a mismatch would
+    train the generator on a history distribution it will never be served. That also retires the
+    legacy per-step ``.npz`` path as an FM training source -- it has no recorded snapshot pose to
+    substitute, so it is stamped ``"per_step"`` and refused."""
 
 
 def fingerprint_arrays(data: dict[str, np.ndarray]) -> str:
@@ -271,6 +326,9 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         # Nested structure, so JSON rather than an array -- the file stays
         # ``allow_pickle=False`` loadable.
         depth_camera_spec=np.array(json.dumps(meta.depth_camera_spec)),
+        # Nullable list, so JSON for the same reason.
+        reference_blocks=np.array(json.dumps(meta.reference_blocks)),
+        family_names=np.array(json.dumps(meta.family_names)),
         content_sha256=np.array(meta.content_sha256),
     )
 
@@ -349,6 +407,12 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         depth_camera_spec=(
             json.loads(str(z["depth_camera_spec"])) if "depth_camera_spec" in z.files else None
         ),
+        reference_blocks=(
+            json.loads(str(z["reference_blocks"])) if "reference_blocks" in z.files else None
+        ),
+        family_names=(
+            json.loads(str(z["family_names"])) if "family_names" in z.files else []
+        ),
         content_sha256=str(z["content_sha256"]) if "content_sha256" in z.files else "",
     )
     return data, meta
@@ -365,8 +429,11 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
 # byte is used) and streams to a chunked, compressed HDF5 with bounded RAM (np.savez
 # cannot append). Layout per window (raw world-frame; the dataset applies relative_state
 # + normalization at build time):
-#   history_state [W, H, node]  the H most-recent state rows (last row == the snap; its
-#                               root pose is the ego-anchor). H >= trainable N.
+#   history_state [W, H, node]  the H most-recent MEASURED state rows (last row == the
+#                               snap; its root pose is the ego-anchor). H >= trainable N.
+#   history_ref   [W, H, node]  the reference APPLIED at each of those H steps, same
+#                               layout. Feeds ``history_source="reference_partial"``;
+#                               stored unconditionally so that stays a train-time A/B.
 #   ref_future    [W, F, node]  the ego-anchored clip future at the snap.
 #   height_scan   [W, K]        the snap-row height scan (optional).
 #   cmd_future    [W, F, cmd]   the snap-row future command (optional; dataset strides it).
@@ -374,6 +441,7 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
 
 _WINDOW_DTYPES: dict[str, str] = {
     "history_state": "float32",
+    "history_ref": "float32",
     "ref_future": "float32",
     "height_scan": "float32",
     "depth": "float32",
@@ -383,6 +451,11 @@ _WINDOW_DTYPES: dict[str, str] = {
     # around rather than onto). Recorded unconditionally so training can drop those windows with
     # ``train.py --skip_distractors`` without a re-record. Absent in older recordings.
     "is_distractor": "uint8",
+    # Per-window clip FAMILY code, indexing RecordingMeta.family_names (0 = unknown). The
+    # general form of is_distractor: any family can be dropped at train time via
+    # train.py --skip_families, which is why this is recorded rather than re-derived from a
+    # library that may have changed. 0 everywhere for a library with no terrain manifest.
+    "clip_family": "uint8",
 }
 
 
@@ -428,13 +501,19 @@ class RecordedWindowWriter:
         cmd_dim: Future-command width (0 to omit the ``cmd_future`` dataset).
         meta: Provenance/layout metadata (stored as JSON attrs).
         compression: h5py filter ("lzf" fast; "gzip" smaller/slower; None off).
+        tag_families: Also store the per-window clip-family code (``clip_family``), which
+            ``FlowMatchingConfig.skip_families`` filters on. Opt-in for the same reason
+            ``tag_distractors`` is.
+        record_history_ref: Also store the applied-reference history ring (``history_ref``),
+            which ``history_source="reference_partial"`` trains on.
     """
 
     def __init__(
         self, path: str, num_windows: int, history_len: int, node_dim: int,
         future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
-        tag_distractors: bool = False,
+        tag_distractors: bool = False, tag_families: bool = False,
+        record_history_ref: bool = False,
     ) -> None:
         import h5py
 
@@ -445,11 +524,22 @@ class RecordedWindowWriter:
             "ref_future": (num_windows, future_len, node_dim),
             "episode_id": (num_windows,),
         }
+        # The applied-reference history ring, for history_source="reference_partial".
+        # ~H/F extra bytes per window (12% at H=8, F=65) buys a train-time A/B instead of
+        # a second multi-hour recording, so it is not made optional.
+        if record_history_ref:
+            shapes["history_ref"] = (num_windows, history_len, node_dim)
         # Opt-in per-window distractor tag: declared only when the caller will supply it every
         # batch (``write_batch`` requires every declared key), so older writers and the window
         # tests stay valid. ``load_recorded_windows`` treats it as optional on read.
         if tag_distractors:
             shapes["is_distractor"] = (num_windows,)
+        # Same opt-in for the per-window family code, which is the general form of the
+        # distractor flag. This was MISSING while record_data.py assembled the key anyway, so
+        # write_batch silently dropped it (it iterates the declared keys) and
+        # ``--skip_families`` could never find its tag.
+        if tag_families:
+            shapes["clip_family"] = (num_windows,)
         if height_dim > 0:
             shapes["height_scan"] = (num_windows, height_dim)
         if depth_shape is not None:

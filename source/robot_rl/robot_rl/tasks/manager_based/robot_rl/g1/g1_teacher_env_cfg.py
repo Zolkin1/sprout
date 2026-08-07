@@ -21,11 +21,12 @@ from isaaclab.utils import configclass
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.managers import ObservationGroupCfg as ObsGroup
-from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils.noise import UniformNoiseCfg as Unoise
 from isaaclab.managers import SceneEntityCfg
 from isaaclab.sensors import RayCasterCfg, patterns
+from isaaclab.terrains import TerrainGeneratorCfg
+from isaaclab.terrains.trimesh.mesh_terrains_cfg import MeshPlaneTerrainCfg
 
 from motion_gen.joint_names import G1_JOINT_NAMES
 
@@ -41,6 +42,22 @@ from .g1_clf_tracking_base import (
 from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceCommandCfg
 
 
+# Flat TRIANGLE-MESH terrain at z=0.  A RayCaster cannot hit the infinite "plane"
+# primitive, so any tool that needs a ray-castable flat ground builds one from this.
+#
+# No TASK uses it -- the flat-mesh record env that owned it was pruned in 0f26c06.  It
+# lives on for the two depth diagnostics that import it from here
+# (``scripts/rsl_rl/verify_depth_self_scan.py`` and ``compare_depth_sim2sim.py``), both of
+# which want a minimal ray-castable scene rather than the terrain teacher's tiles.  It was
+# deleted with the record env and the scripts were left dangling on it; restored rather
+# than inlined twice.
+FLAT_MESH_TERRAIN_CFG = TerrainGeneratorCfg(
+    size=(8.0, 8.0), border_width=20.0, num_rows=10, num_cols=20,
+    horizontal_scale=0.1, vertical_scale=0.005, slope_threshold=0.75, use_cache=False,
+    sub_terrains={"flat": MeshPlaneTerrainCfg(proportion=1.0)},
+)
+
+
 ##
 # Observation window sizes -- one knob each, shared by the policy and the critic.
 ##
@@ -51,13 +68,46 @@ from ..mdp.commands.traj_tracking.motion_sequence_cmd_cfg import MotionSequenceC
 #: step); only the reference look-ahead below is decimated.  Set to 1 for no history.
 PROPRIO_HISTORY_LENGTH = 10
 
-#: Reference window length in samples, current step included.  11 = the current step
-#: plus 10 future ones.  Set to 1 to observe only the current reference.
-REFERENCE_NUM_STEPS = 11
+#: Samples in the STRIDED tail of the reference window, and their spacing in control
+#: steps.  5 * 0.02 s = 0.1 s, so 11 samples span 0.0 .. 1.0 s of look-ahead.  These two
+#: only parameterize the tail; :data:`REFERENCE_OFFSETS` below is the actual contract.
+REFERENCE_TAIL_NUM_STEPS = 11
+REFERENCE_TAIL_STRIDE = 5
 
-#: Control steps between reference samples.  5 * 0.02 s = 0.1 s, so 11 samples span
-#: 0.0 .. 1.0 s of look-ahead.
-REFERENCE_STRIDE = 5
+#: Clip-step offsets the reference window samples, current step (0) first.  THE window
+#: contract: the observation, its noise/scale vectors, the episode truncation margin
+#: (``mdp.clip_end_reached``), the flow-matching generator's required horizon and the
+#: exported deploy spec are all derived from this one tuple.
+#:
+#: Two regimes, deliberately non-uniform:
+#:
+#: * ``0, 1, 2`` -- the current step and the two immediately after it.  The strided tail
+#:   is spaced 0.1 s apart, which is far too coarse to show what happens NEXT; these give
+#:   the policy the 50 Hz structure around the current step, so it can see where it is
+#:   going rather than only where it will be in a tenth of a second.
+#: * ``5, 10, ... 50`` -- the 0.1 s-spaced tail, out to 1.0 s.
+#:
+#: 13 samples.  ``max(REFERENCE_OFFSETS) + 1`` = 51 is the number of nodes the generator
+#: must predict (``FlowMatchingConfig.future_len``); ``test_fm_tracking_lookahead``
+#: asserts it, so adding a FURTHER offset without widening ``future_len`` fails there
+#: rather than at the first play step.
+REFERENCE_OFFSETS: tuple[int, ...] = (
+    0, 1, 2, *mdp.strided_offsets(REFERENCE_TAIL_NUM_STEPS, REFERENCE_TAIL_STRIDE)[1:],
+)
+
+#: Re-plan period K, in control steps: how often the flow-matching generator produces a new
+#: plan at deploy, and therefore ALSO how often the clip's placement is re-solved here and how
+#: often the recorder cuts a window.  0.24 s at the 0.02 s control dt.
+#:
+#: ONE constant for all three, because they were allowed to disagree and did:
+#: ``ego_anchor_every`` was 1 while ``fm_snap_every`` was 12, so the teacher trained against a
+#: reference re-placed EVERY step while the generator it would be paired with serves a plan
+#: 12 steps old.  The free root DOFs never drifted in training and always drift at deploy.
+#:
+#: Must be <= ``MAX_SERVABLE_REPLAN_PERIOD``, which is what the generator's horizon is sized
+#: for (``FlowMatchingConfig.future_len``), and >= the generator's history length N, so all N
+#: history rows come from a single plan (``FmTrackingCommand`` enforces both).
+REPLAN_PERIOD_K: int = 12
 
 #: End-effector frames the reference window carries (clip output frames minus the base:
 #: both ankles + both wrists).  Only needed to size the per-channel noise vector below;
@@ -65,31 +115,53 @@ REFERENCE_STRIDE = 5
 #: mismatch fails loudly when the noise is broadcast against the observation.
 REFERENCE_NUM_EE_FRAMES = 4
 
+#: Which reference blocks the window carries.  The full set is
+#: ``mdp.REFERENCE_WINDOW_BLOCKS`` = base_pose, base_vel, joint_pos, joint_vel, ee_pos.
+#:
+#: Currently REDUCED to pose + velocity + joint angles: the reference joint VELOCITIES and
+#: the ee positions are dropped, to test whether the policy needs them at all.  The ee block
+#: is largely redundant with joint_pos (forward kinematics of the same posture) and the
+#: velocity block is the noisiest thing the FM has to predict at deploy, so if tracking
+#: holds without them the reference gets cheaper to produce and cheaper to observe.
+#:
+#: One knob: the noise vector, the scale vector and the observation itself are all built
+#: from this, so they cannot disagree.  Restore by setting it to ``None``.
+REFERENCE_WINDOW_BLOCKS = ("base_pose", "base_vel", "joint_pos")
+
+#: Shared by BOTH window terms.  ``command_window`` takes no ``blocks`` -- it is a single
+#: 3-channel command, not a packed layout -- so the selection is added only for
+#: ``reference_window`` below.
 _REF_PARAMS = {
     "command_name": "traj_ref",
-    "num_steps": REFERENCE_NUM_STEPS,
-    "stride": REFERENCE_STRIDE,
+    "offsets": REFERENCE_OFFSETS,
 }
+
+_REF_WINDOW_PARAMS = {**_REF_PARAMS, "blocks": REFERENCE_WINDOW_BLOCKS}
 
 #: Per-channel noise for the merged reference window.  A single scalar cannot serve it:
 #: the window mixes metres, radians and rad/s, so the level that is right for a joint
 #: angle is negligible for a joint velocity.  Magnitudes live in
-#: ``mdp.REFERENCE_WINDOW_NOISE``; this expands them over the full 11 x 82 layout.
+#: ``mdp.REFERENCE_WINDOW_NOISE``; this expands them over whatever
+#: ``REFERENCE_WINDOW_BLOCKS`` selects.
 _REF_NOISE = mdp.ReferenceWindowNoiseCfg.from_layout(
-    num_steps=REFERENCE_NUM_STEPS,
+    num_steps=len(REFERENCE_OFFSETS),
     num_joints=len(G1_JOINT_NAMES),
     num_ee_frames=REFERENCE_NUM_EE_FRAMES,
+    blocks=REFERENCE_WINDOW_BLOCKS,
 )
 
 #: Per-channel multiplier for the reference window, applied AFTER noise and clipping.
-#: Only the joint-velocity block moves (x0.05, matching the proprioceptive ``joint_vel``
-#: term) so the encoder's inputs sit in a comparable range; see
-#: ``mdp.REFERENCE_WINDOW_SCALE``.  Because the scale comes last, the noise half-widths
-#: and the +-20 clip above stay in raw units, exactly as the old joint_vel_ref term had.
+#: ALL ONES as configured: the only non-unity entry in ``mdp.REFERENCE_WINDOW_SCALE`` is the
+#: joint-velocity 0.05, and ``joint_vel`` is not in ``REFERENCE_WINDOW_BLOCKS``.  Kept
+#: because it is built from the same selection as the noise and the observation, so
+#: restoring the full block set restores the scale with it (see that table's note).  Because
+#: the scale comes last, the noise half-widths and the +-20 clip above stay in raw units
+#: either way.
 _REF_SCALE = mdp.reference_window_scale(
-    num_steps=REFERENCE_NUM_STEPS,
+    num_steps=len(REFERENCE_OFFSETS),
     num_joints=len(G1_JOINT_NAMES),
     num_ee_frames=REFERENCE_NUM_EE_FRAMES,
+    blocks=REFERENCE_WINDOW_BLOCKS,
 )
 
 
@@ -152,11 +224,16 @@ class G1TeacherCommandsCfg:
         # Drift is not un-graded, it is graded ONCE, by the termination, against the
         # globally-fixed clip -- see termination_reference_world_state.
         ego_anchor_fraction=1.0,
-        ego_anchor_every=1,
-        # The FM snap flag keeps its own, much slower cadence; sharing this one would
-        # flood the recorder and collapse the FM's training target. Must match the
-        # tracker's fm_update_every.
-        fm_snap_every=12,
+        # Re-place on the SAME cadence the generator re-plans on. These were 1 and 12: the
+        # teacher tracked a reference refreshed every step, while at deploy the generator
+        # serves a plan up to K-1 steps stale, so the free DOFs drift across the period. The
+        # observation (and the recorded FM target) now carry that drift, which is also what
+        # the generator must learn to read off the depth. The mask still pins the
+        # terrain-critical axes at any cadence, so terrain consistency is unaffected, and the
+        # REWARD is unaffected too -- the base is graded against the globally-placed clip
+        # (_write_global_base_des).
+        ego_anchor_every=REPLAN_PERIOD_K,
+        fm_snap_every=REPLAN_PERIOD_K,
     )
 
 
@@ -177,7 +254,7 @@ class G1TeacherObservationsCfg:
       :data:`PROPRIO_HISTORY_LENGTH` consecutive control steps, plus the height
       scan (exteroception, no history).
     * ``reference`` -- the whole reference trajectory over
-      :data:`REFERENCE_NUM_STEPS` samples, all relative / heading-invariant so no
+      :data:`REFERENCE_OFFSETS` samples, all relative / heading-invariant so no
       world coordinate reaches the policy.
     * ``critic`` -- the same history and reference, uncorrupted, plus privileged
       state and the world-frame CLF tracking vectors.
@@ -236,7 +313,7 @@ class G1TeacherObservationsCfg:
         # Per-CHANNEL noise (see _REF_NOISE): position blocks ~cm, velocity blocks
         # 0.25-0.5 in their own units. The clip saturates the velocity channels the way
         # the old joint_vel_ref term did; it is a no-op for the position channels.
-        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_PARAMS,
+        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_WINDOW_PARAMS,
                                    noise=_REF_NOISE, clip=(-20.0, 20.0), scale=_REF_SCALE)
         command_window = ObsTerm(func=mdp.command_window, params=_REF_PARAMS)
 
@@ -266,7 +343,7 @@ class G1TeacherObservationsCfg:
         # Same reference window the actor's encoder sees, uncorrupted.
         # Same window the actor's encoder sees, uncorrupted -- but identically clipped and
         # scaled, so the two networks read the reference in the same units.
-        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_PARAMS,
+        reference_window = ObsTerm(func=mdp.reference_window, params=_REF_WINDOW_PARAMS,
                                    clip=(-20.0, 20.0), scale=_REF_SCALE)
         command_window = ObsTerm(func=mdp.command_window, params=_REF_PARAMS)
 
@@ -312,7 +389,24 @@ class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
     reset_on_clip = EventTerm(
         func=mdp.reset_on_motion_sequence,
         mode="reset",
-        params={"command_name": "traj_ref", "base_frame_name": "pelvis_link"},
+        # ``pin_*`` are evaluation knobs and default to OFF (sample a clip + start step per
+        # reset, as training wants). Declared here rather than left to the function
+        # signature because hydra refuses to override a key absent from the config.
+        #
+        # The sentinels are typed, not None: Isaac Lab's configclass infers a param's type
+        # from its default, so a ``None`` default makes the field NoneType and rejects the
+        # string/int the override supplies. Hence "" and -1 for "off".
+        # See mdp.events.resets.resolve_pinned_clips.
+        # ``spawn_z_offset`` (metres) lifts the robot's spawn height WITHOUT moving the clip.
+        #
+        # TODO(spawn-z): workaround, not the fix. A clip's frame-0 root height disagrees with
+        #   its own frame-0 joint pose, so the foot soles spawn ~1 cm below the ground and
+        #   PhysX ejects the robot, opening every episode with a kick. Lifting the spawn
+        #   measurably helps survival, so it stays on until clip GENERATION makes frame 0
+        #   self-consistent -- then this goes back to 0. Survival numbers are only comparable
+        #   across runs at the same value.
+        params={"command_name": "traj_ref", "base_frame_name": "pelvis_link",
+                "pin_clip_ids": "", "pin_start_step": -1, "spawn_z_offset": 0.005},
     )
 
 
@@ -321,22 +415,25 @@ class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
 ##
 @configclass
 class G1TeacherRewardCfg(G1ClfTrackingRewardCfg):
-    """CLF tracking + penalties, plus dense commanded-velocity tracking."""
+    """CLF tracking + penalties.
 
-    # Track the clip's joystick-level velocity command (target_vel = (vx, vy, wz)) -- the
-    # same signal a velocity joystick would supply -- rather than the achieved reference
-    # base velocity.  Split into planar (xy) + yaw exactly like the stock
-    # track_lin_vel_xy_exp / track_ang_vel_z_exp, but sourced from traj_ref.
-    xy_vel = RewTerm(
-        func=mdp.command_lin_vel_xy_tracking_exp,
-        weight=1.0,
-        params={"command_name": "traj_ref", "std": 0.5},
-    )
-    yaw_vel = RewTerm(
-        func=mdp.command_ang_vel_z_tracking_exp,
-        weight=1.0,
-        params={"command_name": "traj_ref", "std": 0.5},
-    )
+    The two dense commanded-velocity terms that used to live here (``xy_vel`` /
+    ``yaw_vel``, weight 1.0 each against ``clf_reward``'s 10, grading the clip's
+    joystick-level ``target_vel`` against the measured base twist) are GONE: the CLF
+    already grades the base twist against the reference, so they were re-scoring the same
+    quantity through a second, softer lens.
+
+    Removing them does change what is graded, and the change is the point.  The CLF grades
+    reference SHAPE in the locally-anchored frame and deliberately does not double-count
+    planar drift (see the ``ego_anchor_fraction`` note on the command above), so the only
+    remaining pressure to actually travel at the commanded velocity is
+    ``base_pose_error_termination`` against the GLOBAL clip.  If the policy starts
+    under-tracking the command, that is the term to look at first.
+
+    Evaluation is unaffected: ``play_plots.py`` still reports
+    ``vel_track_{forward_vx,lateral_vy,yaw_wz}_mse_*`` from the recorded ``target_vel``.
+    The reward functions themselves are kept in ``mdp.rewards`` for the tracker task.
+    """
 
 
 ##
@@ -445,13 +542,18 @@ class G1TeacherEnvCfg(G1ClfTrackingEnvCfg):
         # ``clf_decreasing_condition`` needs NO matching change: eta_scales is folded into P,
         # not into eta, so eta_max / eta_dot_max keep their physical units.
         #
-        # TODO(clf-scale): 1.15 was derived against body_v2's model_5800 -- a policy trained
-        # under BOTH the old local-base reward and the reset-step placement bug, i.e. two
-        # reward generations stale. It is deliberately NOT re-derived here: depth_v1/v2/v3
-        # all trained on this value, and changing it would make them incomparable to whatever
-        # comes next. Re-derive off a current checkpoint with
-        # ``scripts/rsl_rl/clf_balance_check.py --load_run <run>`` at the point where a fresh
-        # baseline is being established anyway, and move it then -- not before.
+        # RE-DERIVED and left at 1.15. The worry was that this value came from body_v2's
+        # model_5800, trained under both the old local-base reward and the reset-step
+        # placement bug -- two reward generations stale. Measured against depth_v3's
+        # model_4200 in its own env (clf_balance_check.py, 64 envs x 200 steps): mean V 1.10
+        # versus the 1.12 that 1.15 was sized against, i.e. V did not move. The 3x rule wants
+        # 1.09 and the instantaneous reward is already 8.098/10, so the correction is inside
+        # the noise and not worth breaking comparability with depth_v1/v2/v3 for.
+        #
+        # For reference, the same policy measures mean V 1.42 (-> 1.25) in the CURRENT env,
+        # but that is a policy on out-of-distribution depth after the near-camera move plus
+        # harder spawns from the reset cap -- an upper bound that training should recover,
+        # not a reason to move the scale.
         #
         # Two traps when re-tuning this from the dashboard:
         #   * ``Episode_Reward/clf_reward`` is an episode SUM x dt divided by

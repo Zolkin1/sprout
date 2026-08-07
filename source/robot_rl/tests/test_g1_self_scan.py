@@ -38,8 +38,11 @@ def _project_root() -> pathlib.Path:
 
 
 # The USD the G1 articulation cfg actually spawns (see assets/robots/g1_21j.py).
+# Must match ``usd_path`` in assets/robots/g1_21j.py.  Not imported from there: that module
+# pulls in isaaclab, and these tests deliberately run without a simulator.
 _USD_DIR = (
-    _project_root() / "robot_assets" / "g1" / "g1_21j" / "g1_21j_box_merged_29j" / "payloads"
+    _project_root() / "robot_assets" / "g1" / "g1_21j"
+    / "g1_21j_box_merged_29j_hands" / "payloads"
 )
 
 pytestmark = pytest.mark.skipif(
@@ -126,32 +129,77 @@ def test_self_scan_links_are_known_links():
 
 
 def test_self_scan_covers_all_limbs():
-    """The scan set is exactly the limbs -- no spine links, nothing missed.
+    """The scan set is exactly the limbs plus the hands -- no spine, nothing missed.
 
     The spine (``waist_*``, ``torso_link``) carries the cameras themselves, so it is
-    excluded; everything else that moves should be present.
+    excluded; everything else that can occlude them should be present.
     """
     graph = _joint_graph()
     spine = {"waist_yaw_link", "waist_roll_link", "torso_link"}
     assert set(ss.SELF_SCAN_LINKS) == set(graph) - spine
-    assert len(ss.SELF_SCAN_LINKS) == 26
+    assert len(ss.SELF_SCAN_LINKS) == 26 + 16
+
+
+def test_hands_are_fixed_joint_links_on_the_wrist():
+    """The hands must be real links, not visuals hung off the wrist.
+
+    As bare visuals the importer gives them a NON-IDENTITY mesh->body offset, which
+    ``MultiMeshRayCaster`` silently fails to intersect -- the depth cameras then see every
+    limb except the hands.  Regenerate with ``make_hand_links_urdf.py`` if this fails.
+    """
+    graph = _joint_graph()
+    for link in ss.HAND_LINKS:
+        assert link in graph, f"{link} is not a link; re-run make_hand_links_urdf.py"
+        assert graph[link] == f"{link.split('_')[0]}_wrist_yaw_link"
+    text = (_USD_DIR / "Physics" / "physics.usda").read_text()
+    assert text.count('def PhysicsRevoluteJoint "') == 29, "the 29-DOF action space moved"
+    assert text.count('def PhysicsFixedJoint "') == len(ss.HAND_LINKS)
+
+
+def test_leaf_links_are_not_doubled():
+    """A leaf link gets ONE Xform, so its target must not repeat the name.
+
+    This is the asymmetry with links that have children, and getting it wrong fails
+    quietly (the ray caster warns and drops the target).
+    """
+    paths = _prim_paths("base.usda")
+    for link in ss._LEAF_LINKS:
+        wrist = ss._PARENT[link]
+        assert _has_tail(paths, (wrist, link)), f"{wrist}/{link} not in base.usda"
+        assert not _has_tail(paths, (link, link)), f"{link} is unexpectedly doubled"
+        assert ss.visual_prim_path(link).endswith(f"/{wrist}/{link}")
 
 
 @pytest.mark.parametrize("link", ss.SELF_SCAN_LINKS)
 def test_visual_prim_path_resolves_in_usd(link):
-    """Each target path's chain exists in the USD, ending in the doubled visual Xform."""
+    """Each target path's chain exists in the USD, ending in the visual Xform.
+
+    Jointed links end in a doubled tail; hands do not (see ``visual_prim_path``).
+    """
     paths = _prim_paths("base.usda")
-    expected = ss.link_chain(link) + (link,)
+    chain = ss.link_chain(link)
+    expected = chain if link in ss._LEAF_LINKS else chain + (link,)
     assert _has_tail(paths, expected), f"{'/'.join(expected)} not found in base.usda"
+    assert ss.visual_prim_path(link).endswith("/".join(("",) + expected[-2:]))
 
 
 @pytest.mark.parametrize("link", ss.SELF_SCAN_LINKS)
 def test_visual_xform_references_its_geometry_instance(link):
-    """The inner Xform is the instanceable geometry holder, not a bare transform."""
+    """The targeted Xform is the instanceable geometry holder, not a bare transform.
+
+    The index fingers reuse the middle fingers' instance (identical geometry, placed by
+    a different transform), so the instance they name is not always their own -- what
+    matters is that SOME geometry instance is referenced, not which.
+    """
     text = (_USD_DIR / "base.usda").read_text()
-    assert f"</Instances/{link}>" in text
     instances = (_USD_DIR / "instances.usda").read_text()
-    assert f"</Geometries/{link}>" in instances
+    referenced = re.findall(
+        rf'def Xform "{re.escape(link)}" \(\s*\n\s*instanceable = true\s*\n'
+        rf'\s*prepend references = @\./instances\.usda@</Instances/([^>]+)>',
+        text,
+    )
+    assert referenced, f"{link} does not reference a geometry instance"
+    assert f"</Geometries/{referenced[0]}>" in instances
 
 
 def test_root_visual_paths_resolve_in_usd():

@@ -4,12 +4,32 @@ from __future__ import annotations
 
 import torch
 import warp as wp
+from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
 from isaaclab.utils import configclass
-from isaaclab.utils.math import quat_apply, quat_box_minus, quat_inv
+from isaaclab.utils.math import (
+    quat_apply,
+    quat_apply_inverse,
+    quat_box_minus,
+    quat_conjugate,
+    quat_inv,
+    quat_mul,
+    yaw_quat,
+)
 from isaaclab.utils.noise.noise_cfg import NoiseCfg
+
+from robot_rl.flow_matching.transforms import quat_to_rot6d
+from robot_rl.flow_matching.window import (
+    REFERENCE_BLOCK_KEYS as _REFERENCE_BLOCK_KEYS,
+    REFERENCE_WINDOW_BLOCK_NAMES as REFERENCE_WINDOW_BLOCKS,
+    REFERENCE_WINDOW_NOISE,
+    expand_window_blocks,
+    resolve_reference_blocks,
+    window_blocks,
+    window_to_world,
+)
 
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
@@ -48,6 +68,13 @@ def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
     frame, measured against the clip on its reset-time terrain cell -- the same reference
     the pose-drift termination uses.
 
+    Both halves are ``ref - actual``, matching :func:`base_pose_error` and the
+    ``reference_window`` -- see
+    :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.  Kept as a log-map
+    3-vector rather than widened to the window's 6D form: this is privileged, never
+    exported, and global drift is bounded well inside the branch cut by the pose-drift
+    termination that grades the same datum.
+
     This is the drift :func:`tracking_error_local` deliberately cannot see: the reward
     forgives planar drift, but the episode still ends on it, so without this the critic
     would be predicting a termination it has no way to anticipate.
@@ -58,7 +85,7 @@ def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
     root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)
     return torch.cat([
         state[:, 0:3] - root_pos_w,
-        quat_box_minus(root_quat_w, state[:, 3:7]),
+        quat_box_minus(state[:, 3:7], root_quat_w),   # reference - actual
     ], dim=-1)
 
 
@@ -78,15 +105,22 @@ def _joint_output_indices(ordered_names: list[str]) -> list[int]:
 
 
 def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
-    """Reference-vs-actual base pose error, expressed in the actual base frame.
+    """The reference base pose in the robot's current YAW (heading) frame.
 
-    Returns ``[N, 6]`` = position error (3) + orientation error (3), *both*
-    rotated into the robot's current base frame, so the observation is fully
-    heading-invariant (no absolute world heading leaks) and deployable sim2real.
-    The orientation half is the world-frame ``quat_box_minus`` rotation vector
-    (a spatial error whose roll/pitch axes would otherwise rotate with heading)
-    re-expressed in the base frame to match the position half.  Same base
-    tracking error the CLF penalises, surfaced as a base-relative observation.
+    Returns ``[N, 9]`` = position ``ref - actual`` (3) rotated into the robot's heading frame,
+    plus ``R_yawT R_ref`` in the 6D rotation representation (6).  The anchor is yaw-only, so
+    the robot's own roll and pitch never enter; the REFERENCE's tilt is still carried in full.
+    Fully heading-invariant -- no absolute world heading leaks -- and deployable sim2real.
+
+    Identical to node 0 of :func:`reference_window`'s ``base_pose`` block, and computed
+    through the same :func:`~robot_rl.flow_matching.window.world_to_window` convention --
+    ``test_reference_window`` asserts the two agree, which is what keeps them from drifting
+    apart.  See :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.
+
+    No observation group carries this term any more (``reference_window`` replaced it, and
+    node 0 IS this).  It survives as that test's independent oracle and as a diagnostic
+    signal in ``data_logger``, so it has to move with the window rather than be left behind
+    at the old convention.
     """
     cmd = env.command_manager.get_term(command_name)
     state = cmd.reference_world_state()                 # [N, 3+4+3+3+2nj]
@@ -94,12 +128,12 @@ def base_pose_error(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> t
     ref_quat_w = state[:, 3:7]                          # xyzw
     root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)
     root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)  # xyzw
-    inv_root_quat = quat_inv(root_quat_w)
 
-    pos_err_b = quat_apply(inv_root_quat, ref_pos_w - root_pos_w)
-    ori_err_w = quat_box_minus(root_quat_w, ref_quat_w)  # actual ⊟ reference (world frame)
-    ori_err_b = quat_apply(inv_root_quat, ori_err_w)     # -> current base frame
-    return torch.cat([pos_err_b, ori_err_b], dim=-1)
+    root_yaw = yaw_quat(root_quat_w)
+    return torch.cat([
+        quat_apply_inverse(root_yaw, ref_pos_w - root_pos_w),
+        quat_to_rot6d(quat_mul(quat_conjugate(root_yaw), ref_quat_w)),   # R_yawT R_ref
+    ], dim=-1)
 
 
 def joint_pos_ref(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
@@ -191,7 +225,9 @@ def ref_base_velocity_local(env: ManagerBasedRLEnv, command_name: str = "traj_re
     ang_idx = [names.index(f"{base}:ori_{a}") for a in ("x", "y", "z")]
     lin_w = cmd.dy_des[:, lin_idx]
     ang_w = cmd.dy_des[:, ang_idx]
-    inv_root = quat_inv(wp.to_torch(cmd.robot.data.root_quat_w))
+    # Yaw-only, matching the reference window's base_vel block, which this term is the
+    # current-step oracle for: the anchor supplies heading, never the robot's roll/pitch.
+    inv_root = quat_inv(yaw_quat(wp.to_torch(cmd.robot.data.root_quat_w)))
     return torch.cat([quat_apply(inv_root, lin_w), quat_apply(inv_root, ang_w)], dim=-1)
 
 
@@ -202,110 +238,231 @@ def command_velocity(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> 
     "joystick" would supply -- rather than the achieved reference base velocity
     (:func:`ref_base_velocity`, ``dy_des``).  Heading-invariant (planar linear
     velocity + yaw rate in the base/heading frame) and available at deployment.
-    Pairs with the ``command_lin_vel_xy_tracking_exp`` /
-    ``command_ang_vel_z_tracking_exp`` rewards so the command they grade against
-    is observable to the policy.  Returns ``[N, 3]``.  Requires a clip library
-    carrying ``target_vel``.
+    Returns ``[N, 3]``.  Requires a clip library carrying ``target_vel``.
+
+    NOTE this used to pair with the ``command_lin_vel_xy_tracking_exp`` /
+    ``command_ang_vel_z_tracking_exp`` rewards, which no task registers any more -- the
+    teacher's CLF already grades the base twist.  The command is still worth OBSERVING
+    (it is what the reference was generated from, and the deployment joystick supplies
+    it); it is simply no longer separately rewarded.
     """
     cmd = env.command_manager.get_term(command_name)
     return cmd.get_command_velocity().clone()
 
 
 # ----------------------------------------------------------------------
-# Merged reference window (current step + strided look-ahead).
+# Merged reference window (current step + look-ahead).
 #
 # One term carries the WHOLE reference trajectory -- base pose/velocity, joint
-# angles, joint velocities and end-effector positions -- at ``num_steps`` clip
-# steps spaced ``stride`` control steps apart, starting at the CURRENT step
-# (offset 0).  ``num_steps=1`` therefore degenerates to the current step alone.
+# angles, joint velocities and end-effector positions -- at an explicit list of
+# clip-step ``offsets``, the first of which is always the CURRENT step (0).
+# ``offsets=(0,)`` therefore degenerates to the current step alone.
+#
+# The offsets are a LIST rather than a (count, stride) pair because the window is
+# deliberately non-uniform: it samples the two steps immediately after the current
+# one AND a 0.1 s-spaced tail, so no single stride describes it.  See
+# ``g1_teacher_env_cfg.REFERENCE_OFFSETS``.
 #
 # The proprioceptive history is a separate mechanism (per-term
 # ``ObservationTermCfg.history_length``, one entry per control step); only the
-# FUTURE is decimated by ``stride``.
+# FUTURE is decimated.
 # ----------------------------------------------------------------------
 
-def _window_offsets(cmd, num_steps: int, stride: int) -> torch.Tensor:
-    """Clip-step offsets ``[0, stride, 2*stride, ...]`` with ``num_steps`` entries.
+def strided_offsets(num_steps: int, stride: int) -> tuple[int, ...]:
+    """Uniformly strided window offsets ``(0, stride, ..., (num_steps - 1) * stride)``.
 
-    ``num_steps=1`` -> ``[0]`` (current step only).  At the 0.02 s control dt,
-    ``num_steps=11, stride=5`` -> ``[0, 5, ..., 50]`` = 0.0 .. 1.0 s.
+    A builder for the strided TAIL of a window's offset list, so it does not have to be
+    typed out.  At the 0.02 s control dt, ``strided_offsets(11, 5)`` spans 0.0 .. 1.0 s.
+
+    Args:
+        num_steps: Samples to emit, the leading ``0`` included.  Clamped to ``>= 1``.
+        stride: Control steps between samples.  Clamped to ``>= 1``.
+
+    Returns:
+        ``num_steps`` ascending offsets, starting at 0.
     """
-    n = max(1, int(num_steps))
-    s = max(1, int(stride))
-    return torch.arange(n, device=cmd.device, dtype=torch.long) * s
+    return tuple(i * max(1, int(stride)) for i in range(max(1, int(num_steps))))
 
 
-def reference_window_layout(cmd) -> list[tuple[str, int]]:
+def _window_offsets(cmd, offsets: Sequence[int]) -> torch.Tensor:
+    """Validate a window offset list and put it on the command's device.
+
+    Args:
+        cmd: The trajectory command term (supplies the device).
+        offsets: Clip-step offsets, strictly ascending, starting at 0.
+
+    Returns:
+        ``[len(offsets)]`` long tensor.
+
+    Raises:
+        ValueError: If empty, if the first entry is not 0, or if the list is not strictly
+            ascending.  Three consumers depend on exactly those properties and none of
+            them would fail visibly: ``mdp.clip_end_reached`` reserves ``max(offsets)``
+            steps of look-ahead, ``FmTrackingCommand`` checks the generator's horizon
+            against the same maximum, and node 0 is both the step the CLF grades and the
+            one that enters the generator's autoregressive history.
+    """
+    offs = tuple(int(o) for o in offsets)
+    if not offs:
+        raise ValueError("a reference window needs at least one offset, e.g. (0,)")
+    if offs[0] != 0:
+        raise ValueError(
+            f"reference-window offsets must start at the current step (0), got {offs[0]}. "
+            "Node 0 is what the CLF grades and what enters the generator's history."
+        )
+    if any(b <= a for a, b in zip(offs, offs[1:])):
+        raise ValueError(f"reference-window offsets must be strictly ascending, got {offs}")
+    return torch.tensor(offs, device=cmd.device, dtype=torch.long)
+
+
+def reference_window_layout_from_dims(
+    num_joints: int, num_ee_frames: int, blocks=None
+) -> list[tuple[str, int]]:
+    """Per-step block layout of :func:`reference_window` from raw dimensions.
+
+    Kept as the name this side of the codebase reaches for (``export_parameters``,
+    ``data_logger``, the noise/scale expansion below), but the layout itself lives in
+    :func:`robot_rl.flow_matching.window.window_blocks` -- the flow-matching generator
+    predicts in exactly this representation and honours the same block SELECTION, so the
+    definition has to be shared rather than restated on each side.
+
+    Args:
+        num_joints: Robot joint count.
+        num_ee_frames: End-effector frames the clip library exposes.
+        blocks: Subset to include; defaults to all of them.
+
+    Returns:
+        ``[(block_name, width), ...]`` in packing order.
+    """
+    return window_blocks(num_joints, num_ee_frames, blocks)
+
+
+def reference_window_layout(cmd, blocks=None) -> list[tuple[str, int]]:
     """Per-step block layout of :func:`reference_window` as ``[(name, width), ...]``.
 
-    The single source of truth for how one step of the window is packed, so the
-    diagnostics (``scripts/rsl_rl/data_logger.py``) can slice the flat term back
-    into named blocks without restating the layout.  Widths depend on the robot
-    (joint count) and the clip library (ee frame count).
+    Resolves the robot's joint count and the clip library's ee-frame count off the command
+    term, then defers to :func:`reference_window_layout_from_dims`.  Used by the diagnostics
+    (``scripts/rsl_rl/data_logger.py``) to slice the flat term back into named blocks
+    without restating the layout.
+
+    Args:
+        cmd: The trajectory command term.
+        blocks: Subset to include; defaults to all of them.
     """
-    nj = len(cmd.robot.joint_names)
-    n_ee = len(cmd.resolve_ee_frames(None))
-    return [
-        ("base_pose", 6),
-        ("base_vel", 6),
-        ("joint_pos", nj),
-        ("joint_vel", nj),
-        ("ee_pos", 3 * n_ee),
-    ]
+    return reference_window_layout_from_dims(
+        len(cmd.robot.joint_names), len(cmd.resolve_ee_frames(None)), blocks
+    )
 
 
-#: Default per-block uniform-noise HALF-WIDTHS for :func:`reference_window`.
-#:
-#: The window merges quantities on very different scales -- metres, radians, rad/s -- so a
-#: single scalar cannot serve them all: the level that is right for a joint angle is
-#: negligible for a joint velocity.  These stand in for the FM's prediction error at
-#: deploy, which is what the reference noise exists to simulate.  Position-like entries are
-#: per-axis ``(x, y, z)``; the vertical axis is tighter than the horizontal ones.
-REFERENCE_WINDOW_NOISE: dict[str, float | list[float]] = {
-    "base_pos": [0.05, 0.05, 0.01],   # reference base position error, metres
-    "base_ori": 0.03,                 # reference base orientation error, radians
-    "base_lin_vel": 0.25,             # m/s
-    "base_ang_vel": 0.25,             # rad/s
-    "joint_pos": 0.1,                 # rad
-    "joint_vel": 0.5,                 # rad/s
-    "ee_pos": [0.05, 0.05, 0.01],     # ee position rel. reference base, metres
-}
+def reference_window_selection(
+    env: ManagerBasedRLEnv, groups: Sequence[str] | None = None
+) -> tuple[str, ...] | None:
+    """The block selection this environment's :func:`reference_window` term packs.
+
+    The ONE producer of the teacher's selection, for the same reason
+    :func:`~robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth.depth_camera_specs`
+    is the one producer of the camera contract: the generator has to predict exactly the
+    blocks the policy consumes, and both the recording (which sets the generator's training
+    width) and the exported tracker parameters (which the deploy checks the generator
+    against) have to state the same thing. A subset that lands in one and not the others is
+    invisible -- every array is still the right shape for whoever built it.
+
+    Args:
+        env: The environment instance.
+        groups: Observation groups to look in, or ``None`` for all of them.
+
+    Returns:
+        The selection in canonical packing order, or ``None`` when no group observes a
+        ``reference_window`` term.
+
+    Raises:
+        ValueError: If two groups observe the term with DIFFERENT selections. They are
+            fed by one command term and one layout; disagreeing means one of them is
+            reading a window that is not the one being built.
+    """
+    obs_mgr = env.observation_manager
+    wanted = list(groups) if groups is not None else list(obs_mgr.active_terms.keys())
+    found: dict[str, tuple[str, ...]] = {}
+    for group in wanted:
+        names = list(obs_mgr.active_terms.get(group, []))
+        if "reference_window" not in names:
+            continue
+        cfg = obs_mgr._group_obs_term_cfgs[group][names.index("reference_window")]
+        found[group] = resolve_reference_blocks((cfg.params or {}).get("blocks"))
+    if not found:
+        return None
+    selections = set(found.values())
+    if len(selections) > 1:
+        raise ValueError(
+            f"the 'reference_window' term is configured with different block selections "
+            f"per group: { {g: list(b) for g, b in found.items()} }. One command term "
+            "builds one window; the groups must agree on which blocks it packs."
+        )
+    return next(iter(selections))
+
+
+# ``REFERENCE_WINDOW_NOISE`` is defined in ``robot_rl.flow_matching.window`` and imported
+# above: the FM's autoregressive history noise reads the SAME table, because both model
+# the generator's prediction error. Re-exported here so the env cfgs keep importing it
+# from mdp. See that module for why forking it would be a bug.
 
 
 #: Per-block multipliers applied to :func:`reference_window` AFTER noise and clipping.
 #:
-#: Only the joint-velocity block is scaled, by the same 0.05 the proprioceptive
-#: ``joint_vel`` observation uses.  Raw reference joint velocities run to ~6.5 rad/s while
-#: every other block in the window is O(1), so unscaled they would be ~10x hotter than
-#: their neighbours and 20x hotter than the *same physical quantity* entering the trunk
-#: through proprioception -- a pure conditioning problem for the (unnormalized) encoder,
-#: since the noise is applied before the scale and so the signal-to-noise ratio is
-#: untouched.
+#: CURRENTLY A NO-OP, and deliberately kept anyway.  The only non-unity entry is the
+#: joint-velocity 0.05, and ``joint_vel`` is not in the live block selection
+#: (``g1_teacher_env_cfg.REFERENCE_WINDOW_BLOCKS`` = base_pose, base_vel, joint_pos), so
+#: :func:`reference_window_scale` expands to all ones -- :func:`expand_window_blocks`
+#: only builds the SELECTED blocks.  The table survives because it is the restore path:
+#: set ``REFERENCE_WINDOW_BLOCKS = None`` and the 0.05 is live again, immediately.  Do not
+#: prune the unselected keys for tidiness; the expansion would then ``KeyError`` on that
+#: restore.
 #:
-#: TODO(scaling): this is a first pass, tuned only to put the blocks in the same ballpark.
-#: Two things to revisit once there is a trained baseline to compare against:
+#: Why the 0.05 exists, for when it comes back: raw reference joint velocities run to
+#: ~6.5 rad/s while every other block in the window is O(1), so unscaled they would be
+#: ~10x hotter than their neighbours and 20x hotter than the *same physical quantity*
+#: entering the trunk through proprioception (which applies the same 0.05) -- a pure
+#: conditioning problem for the (unnormalized) encoder, since the noise is applied before
+#: the scale and so the signal-to-noise ratio is untouched.
 #:
-#: 1. These numbers are NOT normalization -- they are hand-picked, and the remaining
-#:    spread is still ~5x (measured p99 after scaling: base_pose 0.68, base_vel 1.14,
-#:    joint_pos 1.61, joint_vel 0.32, ee_pos 0.74).  ``agent.actor.obs_normalization=true``
-#:    would handle it properly (``RefEncoderMLPModel`` normalizes the encoder branch
-#:    separately), at the cost of changing training dynamics vs. the unnormalized runs.
-#: 2. The scale does DOUBLE DUTY: it also re-weights the optional reconstruction loss,
-#:    because an MSE weights each channel by its magnitude squared.  Measured share of that
-#:    loss -- before this scale: joint_vel 92%, everything else 8% combined; after:
-#:    joint_pos 62%, base_vel 18%, ee_pos 13%, base_pose 4%, joint_vel 3%.  So the
-#:    ablation's objective is decided by unit magnitudes rather than deliberately.  Fix it
-#:    with a per-block weight vector inside
-#:    ``RefEncoderMLPModel.reconstruction_loss`` rather than by distorting this scale
-#:    further -- this one also feeds the actor's forward pass, so the two cannot be tuned
-#:    independently through it.
+#: DEFERRED (no compute to spend on it now, not a dead end).  Both items below were
+#: measured with the FULL five-block window; dropping ``joint_vel`` and ``ee_pos`` changed
+#: each of them, in opposite directions:
+#:
+#: 1. Conditioning -- now WEAK, and it was mostly a joint_vel problem.  These numbers are
+#:    hand-picked, not normalization; the measured p99 after scaling was base_pose 0.68,
+#:    base_vel 1.14, joint_pos 1.61, joint_vel 0.32, ee_pos 0.74, i.e. a ~5x spread.  Over
+#:    the three LIVE blocks that is 0.68 / 1.14 / 1.61 -- 2.4x, all O(1).
+#:    ``agent.actor.obs_normalization=true`` would handle it properly
+#:    (``RefEncoderMLPModel`` normalizes the encoder branch separately), but it costs a run
+#:    and there is much less left to win.
+#: 2. Reconstruction-loss weighting -- now STEEPER, but no longer coupled to anything.  An
+#:    MSE weights each channel by its magnitude squared, so unit magnitudes rather than
+#:    intent decide what "reconstruct the reference" means.  Measured share of that loss
+#:    with all five blocks -- before this scale: joint_vel 92%, everything else 8%
+#:    combined; after: joint_pos 62%, base_vel 18%, ee_pos 13%, base_pose 4%, joint_vel 3%.
+#:    Renormalizing the post-scale figures over the live blocks ESTIMATES joint_pos ~74%,
+#:    base_vel ~21%, base_pose ~5% -- so the objective is now three-quarters "reconstruct
+#:    the joint angles".  Treat that as an estimate, not a measurement: the encoder's
+#:    per-block error will have shifted now that its input is much narrower.  Fix it with a
+#:    per-block weight vector inside ``RefEncoderMLPModel.reconstruction_loss``.  That used
+#:    to be forced (the scale also feeds the actor's forward pass, so the two could not be
+#:    tuned independently through it); with the scale all ones the constraint is vacuous and
+#:    a weight vector in the loss is a free-standing change.
+#:
+#: When it IS worth spending a run on: (1) is a one-flag A/B
+#: (``agent.actor.obs_normalization=true``, and the critic's) and (2) is dormant while the
+#: reconstruction loss is off (``reconstruction=False``, ``coeff=0.0``), so the two can be
+#: taken one at a time.  The cheap moment for (1) is a round that already breaks baseline
+#: comparability for other reasons -- it needs its own run either way, or it cannot be told
+#: apart from whatever else moved.
 REFERENCE_WINDOW_SCALE: dict[str, float | list[float]] = {
     "base_pos": 1.0,
     "base_ori": 1.0,
     "base_lin_vel": 1.0,
     "base_ang_vel": 1.0,
     "joint_pos": 1.0,
-    "joint_vel": 0.05,   # matches the proprioceptive joint_vel term
+    "joint_vel": 0.05,   # matches the proprioceptive joint_vel term; UNSELECTED, see above
     "ee_pos": 1.0,
 }
 
@@ -315,6 +472,7 @@ def _expand_reference_blocks(
     num_joints: int,
     num_ee_frames: int,
     per_block: dict[str, float | list[float]],
+    blocks: Sequence[str] | None = None,
 ) -> list[float]:
     """Expand per-block values to one value per :func:`reference_window` channel.
 
@@ -334,26 +492,7 @@ def _expand_reference_blocks(
     Raises:
         ValueError: If the built per-step width disagrees with the block layout.
     """
-    def axes(key: str) -> list[float]:
-        """The block's value as three per-axis entries."""
-        value = per_block[key]
-        return [float(v) for v in value] if isinstance(value, (tuple, list)) else [float(value)] * 3
-
-    per_step = (
-        axes("base_pos") + axes("base_ori")                        # base_pose  (6)
-        + axes("base_lin_vel") + axes("base_ang_vel")              # base_vel   (6)
-        + [float(per_block["joint_pos"])] * num_joints             # joint_pos  (nj)
-        + [float(per_block["joint_vel"])] * num_joints             # joint_vel  (nj)
-        + axes("ee_pos") * num_ee_frames                           # ee_pos     (3F)
-    )
-    expected = 6 + 6 + 2 * num_joints + 3 * num_ee_frames
-    if len(per_step) != expected:
-        raise ValueError(
-            f"Built {len(per_step)} per-step channels, expected {expected} "
-            f"(nj={num_joints}, ee={num_ee_frames}). The per-block expansion has drifted "
-            "from reference_window_layout."
-        )
-    return per_step * int(num_steps)
+    return expand_window_blocks(num_joints, num_ee_frames, per_block, blocks) * int(num_steps)
 
 
 def reference_window_noise_vector(
@@ -361,6 +500,7 @@ def reference_window_noise_vector(
     num_joints: int,
     num_ee_frames: int,
     magnitudes: dict[str, float | list[float]] | None = None,
+    blocks: Sequence[str] | None = None,
 ) -> list[float]:
     """Expand per-block noise magnitudes to one half-width per :func:`reference_window` channel.
 
@@ -372,7 +512,7 @@ def reference_window_noise_vector(
     :class:`ReferenceWindowNoiseCfg`.
 
     Args:
-        num_steps: Samples in the window (``REFERENCE_NUM_STEPS``).
+        num_steps: Samples in the window (``len(REFERENCE_OFFSETS)``).
         num_joints: Robot joint count.
         num_ee_frames: End-effector frames the clip library exposes.
         magnitudes: Per-block half-widths; defaults to :data:`REFERENCE_WINDOW_NOISE`.
@@ -381,7 +521,7 @@ def reference_window_noise_vector(
         ``num_steps * D`` half-widths, in the channel order the window packs.
     """
     mags = REFERENCE_WINDOW_NOISE if magnitudes is None else magnitudes
-    return _expand_reference_blocks(num_steps, num_joints, num_ee_frames, mags)
+    return _expand_reference_blocks(num_steps, num_joints, num_ee_frames, mags, blocks)
 
 
 def reference_window_scale(
@@ -389,6 +529,7 @@ def reference_window_scale(
     num_joints: int,
     num_ee_frames: int,
     factors: dict[str, float | list[float]] | None = None,
+    blocks: Sequence[str] | None = None,
 ) -> tuple[float, ...]:
     """Per-channel multiplier for a :func:`reference_window` observation term.
 
@@ -396,7 +537,7 @@ def reference_window_scale(
     or ``tuple`` -- a list is rejected outright by the observation manager.
 
     Args:
-        num_steps: Samples in the window (``REFERENCE_NUM_STEPS``).
+        num_steps: Samples in the window (``len(REFERENCE_OFFSETS)``).
         num_joints: Robot joint count.
         num_ee_frames: End-effector frames the clip library exposes.
         factors: Per-block multipliers; defaults to :data:`REFERENCE_WINDOW_SCALE`.
@@ -405,7 +546,7 @@ def reference_window_scale(
         ``num_steps * D`` multipliers, in the channel order the window packs.
     """
     facs = REFERENCE_WINDOW_SCALE if factors is None else factors
-    return tuple(_expand_reference_blocks(num_steps, num_joints, num_ee_frames, facs))
+    return tuple(_expand_reference_blocks(num_steps, num_joints, num_ee_frames, facs, blocks))
 
 
 def per_channel_uniform_noise(data: torch.Tensor, cfg) -> torch.Tensor:
@@ -475,6 +616,7 @@ class ReferenceWindowNoiseCfg(NoiseCfg):
         num_joints: int,
         num_ee_frames: int,
         magnitudes: dict[str, float | list[float]] | None = None,
+        blocks: Sequence[str] | None = None,
     ) -> "ReferenceWindowNoiseCfg":
         """Build the config by expanding per-block magnitudes over the window layout.
 
@@ -489,24 +631,26 @@ class ReferenceWindowNoiseCfg(NoiseCfg):
         """
         mags = dict(REFERENCE_WINDOW_NOISE if magnitudes is None else magnitudes)
         return cls(
-            n_half=reference_window_noise_vector(num_steps, num_joints, num_ee_frames, mags),
+            n_half=reference_window_noise_vector(num_steps, num_joints, num_ee_frames, mags, blocks),
             magnitudes=mags,
         )
 
 
 def reference_window(
-    env: ManagerBasedRLEnv, command_name: str = "traj_ref", num_steps: int = 11, stride: int = 5,
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", *,
+    offsets: Sequence[int], blocks: Sequence[str] | None = None,
 ) -> torch.Tensor:
-    """The full reference trajectory over a look-ahead window (``[N, num_steps * D]``).
+    """The full reference trajectory over a look-ahead window (``[N, len(offsets) * D]``).
 
     Merges what used to be five separate current-step terms and two root-only
     look-ahead terms into ONE observation.  Per step, in
     :func:`reference_window_layout` order:
 
-    * ``base_pose`` (6) -- reference base position + orientation error relative to
-      the robot's *current actual* base, matching :func:`base_pose_error` (the
-      orientation half is the world-frame ``quat_box_minus`` rotation vector
-      re-expressed in the base frame).
+    * ``base_pose`` (9) -- the reference base pose in the robot's *current* YAW
+      frame: position ``ref - actual`` (3) plus ``R_yawT R_ref`` as a 6D rotation
+      (6).  Yaw-only, so the robot's tilt does not rotate the frame.  Matches
+      :func:`base_pose_error`; see
+      :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTION`.
     * ``base_vel`` (6) -- reference base linear+angular velocity rotated into the
       current actual base frame, matching :func:`ref_base_velocity_local`.
     * ``joint_pos`` / ``joint_vel`` (nj each) -- frame-invariant reference joint
@@ -522,64 +666,146 @@ def reference_window(
     the policy.  Flattened as ``[step0(D), step1(D), ...]`` -- the per-step layout
     the symmetry tiler expects.
 
+    The window is built by the COMMAND (``reference_window_obs``), not here: the
+    flow-matching generator predicts this representation directly, so its command term
+    overrides that accessor and returns its prediction rather than round-tripping it
+    through the world.  This function only resolves the offsets and flattens.
+
     Note the window saturates on the clip's final padded frame near the end of a
     clip (``_future_step_indices`` clamps to the padded library length); the
     episode is truncated by ``clip_end_reached`` before that matters.
+
+    Args:
+        env: The environment instance.
+        command_name: The trajectory command term to read.
+        offsets: Clip-step offsets to sample, ascending from 0 (see
+            :func:`strided_offsets` and ``g1_teacher_env_cfg.REFERENCE_OFFSETS``).
+            Deliberately has no default: the FM's horizon, the episode truncation margin
+            and the exported deploy contract are all derived from it, so a silent
+            fallback would put a different window in one of them.
+        blocks: Layout blocks to pack; defaults to all of them.
+
+    Returns:
+        ``[N, len(offsets) * D]``.
+
+    TODO(perf): the observation manager is the single largest phase of the env step --
+    50.8 ms/frame, ~39%, tied with physics (profiled with the trained depth_v3 at 1024
+    envs via ``play.py --profile``).  Roughly 19 ms of that is the two depth cameras
+    (measured by A/B against ``G1-teacher-clf-terrain-body``, which is otherwise
+    identical), leaving ~31 ms across this window, the critic's height scan and the
+    tracking-error terms.  This term is the prime suspect for the remainder: it gathers
+    ``len(offsets)`` future frames of base + joints + ee for every env every step, then
+    does several quaternion ops on an ``[N*K, .]`` flattening.  Nothing here is
+    instrumented individually, so the first move is a per-term breakdown rather than an
+    optimisation -- the manager total is all we currently know.
     """
     cmd = env.command_manager.get_term(command_name)
-    offs = _window_offsets(cmd, num_steps, stride)
+    offs = _window_offsets(cmd, offsets)
+    win = cmd.reference_window_obs(offs, blocks)    # [N, K, D]
+    return win.reshape(win.shape[0], -1)
 
-    # World-frame reference base over the window; also the anchor the ee block uses.
-    pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(offs)  # [N,K,3] [N,K,4] [N,K,3] [N,K,3]
-    n, k, _ = pos_w.shape
 
-    root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)            # [N, 3]
-    root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)          # [N, 4] xyzw
-    inv_root = quat_inv(root_quat_w)[:, None, :].expand(n, k, 4).reshape(n * k, 4)
-    root_q = root_quat_w[:, None, :].expand(n, k, 4).reshape(n * k, 4)
+def reference_window_to_world(
+    window: torch.Tensor,
+    root_pos_w: torch.Tensor,
+    root_quat_w: torch.Tensor,
+    num_steps: int,
+    num_joints: int,
+    num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
+) -> dict[str, torch.Tensor]:
+    """Exact inverse of :func:`reference_window`: put the observation back in the world.
 
-    pos_err_b = quat_apply(inv_root, (pos_w - root_pos_w[:, None, :]).reshape(n * k, 3))
-    ori_err_w = quat_box_minus(root_q, quat_w.reshape(n * k, 4))   # actual ⊟ reference (world)
-    ori_err_b = quat_apply(inv_root, ori_err_w)                    # -> current base frame
-    base_pose = torch.cat([pos_err_b, ori_err_b], dim=-1).reshape(n, k, 6)
+    The window is entirely base-relative by design -- that is what keeps world coordinates
+    away from the policy -- which also makes it impossible to eyeball.  Given the robot's
+    measured base pose at the same step (the frame the forward direction divided out), this
+    reconstructs the world-frame reference the window encodes, so a viewer can draw *what
+    the policy actually saw* next to what the generator predicted.  A frame bug in
+    :func:`reference_window` then shows up as a visible offset or twist between the two,
+    rather than as a plausible-looking vector of numbers.
 
-    lin_b = quat_apply(inv_root, lin_w.reshape(n * k, 3)).reshape(n, k, 3)
-    ang_b = quat_apply(inv_root, ang_w.reshape(n * k, 3)).reshape(n, k, 3)
-    base_vel = torch.cat([lin_b, ang_b], dim=-1)                   # [N, K, 6]
+    Feed the CLEAN window (as ``data_logger`` computes it), not the corrupted observation:
+    noise, ``clip`` and ``scale`` are applied by the observation manager AFTER this layout
+    and are not inverted here.
 
-    joint_pos, joint_vel = cmd.get_future_joint_state(offs)        # [N, K, nj] each
+    Args:
+        window: ``[N, num_steps * D]`` reference window, packed as
+            :func:`reference_window` emits it.
+        root_pos_w: ``[N, 3]`` measured base position at the same step.
+        root_quat_w: ``[N, 4]`` measured base orientation (xyzw) at the same step.
+        num_steps: Samples in the window.
+        num_joints: Robot joint count.
+        num_ee_frames: End-effector frames the window carries.
+        blocks: The selection the window was packed with (the observation term's own
+            ``blocks``); defaults to all of them.  Pass the term's, or this both mis-sizes
+            the window and reports blocks it does not contain.
 
-    # ee positions relative to the reference base AT THE SAME STEP: the world lift is
-    # rigid, so differencing and unrotating recovers exactly the clip-frame posture
-    # that ee_ref_relative_to_base reports at offset 0.
-    frames = cmd.resolve_ee_frames(None)
-    ee_w = cmd.get_future_world_frames(frames, offs)               # [N, K, F, 13]
-    inv_ref_q = quat_inv(quat_w.reshape(n * k, 4))
-    ee_rel = [
-        quat_apply(inv_ref_q, (ee_w[:, :, i, 0:3] - pos_w).reshape(n * k, 3)).reshape(n, k, 3)
-        for i in range(len(frames))
-    ]
-    ee_pos = torch.cat(ee_rel, dim=-1)                             # [N, K, 3F]
+    Returns:
+        Mapping with whichever of ``base_pos_w`` ``[N, K, 3]``, ``base_quat_w``
+        ``[N, K, 4]`` (xyzw), ``base_lin_vel_w`` / ``base_ang_vel_w`` ``[N, K, 3]``,
+        ``joint_pos`` / ``joint_vel`` ``[N, K, nj]`` (robot joint order, frame-invariant
+        so passed through) and ``ee_pos_w`` ``[N, K, E, 3]`` the selection supports.  A
+        dropped block is ABSENT rather than zero-filled -- a zero here would be drawn as a
+        reference standing at the origin.
 
-    out = torch.cat([base_pose, base_vel, joint_pos, joint_vel, ee_pos], dim=-1)
-    return out.reshape(n, -1)
+    Raises:
+        ValueError: If ``window``'s width disagrees with the layout implied by the
+            dimensions.
+
+    Note:
+        ``base_quat_w`` comes back through ``quat_box_plus``, which normalises the sign
+        (``quat_unique``), so it may be the negation of the quaternion that went in.  That
+        is the same rotation; compare rotations, not raw components.
+    """
+    layout = reference_window_layout_from_dims(num_joints, num_ee_frames, blocks)
+    per_step = sum(width for _, width in layout)
+    k = max(1, int(num_steps))
+    if window.shape[-1] != k * per_step:
+        raise ValueError(
+            f"reference_window_to_world got a {window.shape[-1]}-wide window but the layout "
+            f"implies {k} x {per_step} = {k * per_step} (num_steps={num_steps}, "
+            f"nj={num_joints}, ee={num_ee_frames}, "
+            f"blocks={[n_ for n_, _ in layout]})."
+        )
+    n = window.shape[0]
+    return window_to_world(
+        window.reshape(n, k, per_step),
+        root_pos_w[:, None, :],
+        root_quat_w[:, None, :],
+        num_joints,
+        num_ee_frames,
+        blocks,
+    )
 
 
 def command_window(
-    env: ManagerBasedRLEnv, command_name: str = "traj_ref", num_steps: int = 11, stride: int = 5,
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", *, offsets: Sequence[int],
 ) -> torch.Tensor:
-    """Joystick-level velocity command over the same window (``[N, num_steps * 3]``).
+    """Joystick-level velocity command over the same window (``[N, len(offsets) * 3]``).
 
-    The upstream ``target_vel`` ``(vx, vy, wz)`` (heading frame) at offsets
-    ``[0, stride, ...]``, so index 0 is the current command and the rest is the
-    look-ahead.  Deliberately a SEPARATE term from :func:`reference_window` so it
-    can stay noise-free: at deploy this comes from the joystick / scripted
-    profile, not from the flow-matching generator, so corrupting it would train
-    the policy against noise it will never see.  Requires a clip library carrying
-    ``target_vel``.  Flattened as ``[step0(3), step1(3), ...]``.
+    The upstream ``target_vel`` ``(vx, vy, wz)`` (heading frame) at ``offsets``, so index 0
+    is the current command and the rest is the look-ahead.  Deliberately a SEPARATE term
+    from :func:`reference_window` so it can stay noise-free: at deploy this comes from the
+    joystick / scripted profile, not from the flow-matching generator, so corrupting it
+    would train the policy against noise it will never see.  Requires a clip library
+    carrying ``target_vel``.  Flattened as ``[step0(3), step1(3), ...]``.
+
+    Takes the SAME ``offsets`` as :func:`reference_window`, and must: the deploy runtime
+    refuses to load a tracker whose two window specs disagree
+    (``deploy.gen_tracker._resolve_window_offsets``), since one flat observation is
+    assembled from both.
+
+    Args:
+        env: The environment instance.
+        command_name: The trajectory command term to read.
+        offsets: Clip-step offsets, ascending from 0.  No default, for the reason given in
+            :func:`reference_window`.
+
+    Returns:
+        ``[N, len(offsets) * 3]``.
     """
     cmd = env.command_manager.get_term(command_name)
-    offs = _window_offsets(cmd, num_steps, stride)
+    offs = _window_offsets(cmd, offsets)
     return cmd.get_future_command_velocity(offs).reshape(env.num_envs, -1)
 
 

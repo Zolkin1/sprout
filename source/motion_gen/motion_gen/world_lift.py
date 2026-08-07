@@ -103,6 +103,43 @@ _ANCHOR_MASK_BOX: int = anchor_mask_from_free({"lateral"})                  # 0b
 # ``ego_placement_masked(mask_frame_yaw=...)``, so a rotated tile or a family baked on a rotated
 # heading is handled rather than silently transposed.
 
+# Bits tested by :func:`anchor_mask_is_pinned`; derived from the index so the predicate
+# cannot drift from the bit order.
+_ANCHOR_PLANAR_BITS: int = (1 << _ANCHOR_DOF_INDEX["downrange"]) | (1 << _ANCHOR_DOF_INDEX["yaw"])
+
+
+def anchor_mask_is_pinned(mask: torch.Tensor) -> torch.Tensor:
+    """Whether each mask registers the clip to the terrain rather than to the robot.
+
+    A frame is PINNED when its ``downrange`` or its ``yaw`` DOF is FIXED: either one means
+    the clip's placement in the ground plane comes from the terrain cell, not from
+    re-anchoring onto the robot.  That is exactly the set of frames where the reference is
+    interacting with terrain geometry:
+
+    ===========================  ===========================  =========  =====  ======
+    mask                         used by                      downrange  yaw    pinned
+    ===========================  ===========================  =========  =====  ======
+    35 ``_ANCHOR_MASK_FLAT``     flat, post-terrain walking    free       free   no
+    39 ``_ANCHOR_MASK_LEGACY``   pre-mask libraries            free       free   no
+    2  ``_ANCHOR_MASK_STAIRS``   stair climb                   fixed      fixed  yes
+    2  ``_ANCHOR_MASK_BOX``      box mount / dismount          fixed      fixed  yes
+    3  ``_ANCHOR_MASK_SLOPE``    slope (shelved)               free       fixed  yes
+    ===========================  ===========================  =========  =====  ======
+
+    ``height`` is deliberately NOT part of the test: ``_ANCHOR_MASK_FLAT`` fixes height too
+    (a flat clip keeps its own base height), so it does not separate the two cases.
+    Testing ``downrange`` alone would agree on every terrain library generated so far, but
+    would miss slopes, whose only fixed planar DOF is yaw.
+
+    Args:
+        mask: Any-shaped integer tensor of anchor bitmasks (bit SET = FREE).  ``uint8``
+            works directly -- the sentinel-resolved masks are ``uint8``.
+
+    Returns:
+        A bool tensor of ``mask``'s shape, True where the frame is pinned to the terrain.
+    """
+    return (mask & _ANCHOR_PLANAR_BITS) != _ANCHOR_PLANAR_BITS
+
 
 def anchor_inv_yaw(anchor_quat: torch.Tensor) -> torch.Tensor:
     """Yaw-only rotation that lifts anchor-relative vectors into the world.

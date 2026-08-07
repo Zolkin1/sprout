@@ -42,7 +42,7 @@ def _latest_export() -> str | None:
 
     ``DEPLOY_EXPORT_DIR`` picks one explicitly -- the artifacts under ``logs/`` are
     whatever was last exported there, which may predate the current exporter; point this
-    at a fresh ``export_deploy_onnx.py`` output to test the artifacts you actually mean.
+    at a fresh ``play.py`` export to test the artifacts you actually mean.
     Otherwise the most recently modified ``exported`` dir holding a ``tracker.onnx``.
     """
     override = os.environ.get("DEPLOY_EXPORT_DIR")
@@ -50,25 +50,6 @@ def _latest_export() -> str | None:
         return override
     hits = glob.glob(os.path.join(ROOT, "logs", "rsl_rl", "*", "*", "exported", "tracker.onnx"))
     return os.path.dirname(max(hits, key=os.path.getmtime)) if hits else None
-
-
-def _unsupported_history(policy) -> str | None:
-    """Terms the export needs history for, which the deploy runtime cannot build yet.
-
-    ``GenTrackerPolicy._assemble`` has no observation-history support, so a policy
-    trained with ``history_length`` on any term cannot be assembled at all -- it fails
-    the per-term dim check on the first cycle. Detecting that here turns "the whole
-    hardware smoke is red" into an explicit, self-clearing skip: the moment ``_assemble``
-    grows history buffers, this returns None and the test runs again.
-
-    Args:
-        policy: A loaded :class:`GenTrackerPolicy`.
-
-    Returns:
-        A comma-separated list of history-stacked term names, or None if there are none.
-    """
-    stacked = [t["name"] for t in policy.get_obs_terms() if int(t.get("history_length", 0)) > 0]
-    return ", ".join(stacked) if stacked else None
 
 
 def test_hardware_offline() -> None:
@@ -81,13 +62,23 @@ def test_hardware_offline() -> None:
     print(f"[INFO] artifacts: {exp} (fm.onnx: {'yes' if os.path.exists(fm) else 'no'})")
     policy = GenTrackerPolicy(os.path.join(exp, "tracker.onnx"),
                               fm if os.path.exists(fm) else None)
-    policy.load()
-    stacked = _unsupported_history(policy)
-    if stacked is not None:
-        print(f"[SKIP] This export stacks observation history on: {stacked}. The deploy "
-              "runtime cannot assemble history yet, so there is nothing to smoke here -- "
-              "see the TODO on GenTrackerPolicy._assemble.")
+    try:
+        policy.load()
+    except ValueError as exc:
+        stale = ("base_pose_convention" in str(exc)) or ("window_blocks" in str(exc))
+        if not stale:
+            raise
+        # Refusing an artifact from before the reference-window representation (or before
+        # the base_pose sign fix) is the runtime doing its job -- the whole point of those
+        # guards. There is no policy here to drive until one is retrained and re-exported.
+        # NOTE: a K>1 artifact is no longer in this list -- the runtime serves any
+        # fm_update_every whose horizon fits. A horizon that does NOT fit
+        # ("needs F >= ...") is an unservable export rather than a stale one, so it is
+        # deliberately left to raise: the fix is a config or a retrain, not a skip.
+        print(f"[SKIP] {exp} cannot be served by this runtime: {exc}")
         return
+    stacked = [t["name"] for t in policy.get_obs_terms() if int(t.get("history_length", 0)) > 0]
+    print(f"[INFO] history-stacked terms: {', '.join(stacked) if stacked else '(none)'}")
     isaac = policy.get_joint_names()
     nj = len(isaac)
     depth_spec = policy.get_depth_camera_spec()
@@ -102,16 +93,13 @@ def test_hardware_offline() -> None:
     enc_names = list(reversed(isaac))
     rng = np.random.default_rng(0)
 
-    # The FM conditions on (and predicts) the same ee frames, so the hardware state
-    # supplies them every step (from FK on the measured joints).
-    khist = policy.ctx.num_extra_frames
+    # NOTE: no measured end-effector frames are supplied, and that is the point. The
+    # generator's history is its own previous output, so nothing on the robot needs forward
+    # kinematics; build_hardware_state used to demand `frames` here and would kill the
+    # controller one tick after arming. If this test ever needs FK again, something has
+    # reintroduced a measured-state dependency into the FM conditioning.
 
     def reading(cmd):
-        frames = None
-        if khist > 0:
-            q = rng.standard_normal((khist, 4)); q /= np.linalg.norm(q, axis=-1, keepdims=True)
-            frames = np.concatenate([rng.standard_normal((khist, 3)) * 0.1, q,
-                                     rng.standard_normal((khist, 6)) * 0.05], axis=-1)
         # Exteroception goes in RAW, exactly as the robot supplies it: metres along each
         # camera's optical axis (with a few invalid pixels, which every camera produces),
         # or metres of ground clearance. build_hardware_state owns the normalisation, so
@@ -135,7 +123,6 @@ def test_hardware_offline() -> None:
             joint_vel=rng.standard_normal(nj) * 0.1,
             joint_names=enc_names,
             command=np.asarray(cmd, dtype=np.float64),
-            frames=frames,
             depth_raw=depth_raw,
             height_scan=height_scan,
         )
@@ -149,7 +136,7 @@ def test_hardware_offline() -> None:
         if policy.fm_enabled:
             obs = policy.create_obs(state)
         else:
-            obs = policy._build_obs(state, _clip_like_reference(policy, state, rng))
+            obs = policy.create_obs_from_reference(state, _clip_like_reference(policy, state, rng))
         last = policy.get_action(obs, isaac)
         assert obs.shape == (1, policy.get_num_obs())
         assert last.shape == (nj,)
@@ -213,7 +200,8 @@ def _clip_like_reference(policy, state, rng) -> dict:
             n["body_vel_root"] = rng.standard_normal(6 * nb) * 0.1
         return n
 
-    return {"current": node(), "future": [node() for _ in range(len(policy.future_offsets))]}
+    # One node per window offset, offset 0 (the current step) first.
+    return {"window": [node() for _ in policy.window_offsets]}
 
 
 if __name__ == "__main__":

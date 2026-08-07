@@ -9,6 +9,7 @@ import torch
 import warp as wp
 import numpy as np
 
+from robot_rl.flow_matching.window import BASE_POSE_CONVENTION
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 
@@ -54,6 +55,100 @@ def resolve_actor_obs_groups(obs, actor_obs_groups=None):
             f"(available: {sorted(obs.keys())})."
         )
     return groups
+
+
+def _find_term_cfg(obs_manager, obs_group_names, term_name):
+    """Return the :class:`ObservationTermCfg` for ``term_name``, or None if absent.
+
+    Searches the actor's groups in order and stops at the first hit.  The exported term
+    table already rejects a name appearing in more than one group, so the first hit is
+    the only hit.
+
+    Args:
+        obs_manager: The environment's observation manager.
+        obs_group_names: Ordered observation groups the actor consumes.
+        term_name: Observation term to look up.
+
+    Returns:
+        The term's config object, or None when no actor group has that term.
+    """
+    for group_name in obs_group_names:
+        term_names = obs_manager.active_terms.get(group_name, [])
+        if term_name not in term_names:
+            continue
+        return obs_manager._group_obs_term_cfgs[group_name][term_names.index(term_name)]
+    return None
+
+
+def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
+    """Deploy contract for the ``reference_window`` / ``command_window`` observations.
+
+    The deploy has to rebuild both terms from the generator's prediction, which needs
+    the sample offsets and -- for the reference window -- the per-step block layout.
+    Neither is recoverable from the flat term width, so both are exported here.  The
+    layout comes from :func:`mdp.reference_window_layout`, the single source of truth
+    the observation itself uses, rather than being restated.
+
+    Args:
+        unwrapped_env: The unwrapped Isaac Lab environment.
+        obs_manager: The environment's observation manager.
+        obs_group_names: Ordered observation groups the actor consumes.
+        term_table: The exported ``observation_terms["policy"]`` mapping, used to
+            recover the command width from the term's own flat shape.
+
+    Returns:
+        ``(reference_window_spec, command_window_spec)``; either is None when the
+        actor does not observe that term.
+    """
+    ref_cfg = _find_term_cfg(obs_manager, obs_group_names, "reference_window")
+    cmd_cfg = _find_term_cfg(obs_manager, obs_group_names, "command_window")
+    if ref_cfg is None and cmd_cfg is None:
+        return None, None
+
+    def _offsets(cfg):
+        """The term's own sample offsets in CONTROL steps, verbatim.
+
+        Read off the live term rather than rebuilt from a (count, stride) pair: the window
+        is deliberately non-uniform (it samples offsets 0, 1, 2 and then every 5th step),
+        so no stride describes it and there is nothing to reconstruct it from.
+        """
+        return [int(o) for o in (cfg.params or {})["offsets"]]
+
+    ref_spec = None
+    if ref_cfg is not None:
+        offs = _offsets(ref_cfg)
+        cmd_term = unwrapped_env.command_manager.get_term((ref_cfg.params or {}).get("command_name", "traj_ref"))
+        ref_spec = {
+            "offsets": offs,
+            # [[block_name, width], ...] for ONE step; the term is these blocks
+            # concatenated, then the steps concatenated. The term's OWN selection, not
+            # the full five: a teacher that drops a block observes a narrower window, and
+            # a generator paired with it has to predict exactly this list
+            # (checked in GenTrackerPolicy.load against fm_meta's window_blocks).
+            "blocks": [[name, int(width)] for name, width in mdp.reference_window_layout(
+                cmd_term, (ref_cfg.params or {}).get("blocks"))],
+            # The window's joint blocks are in the ROBOT's own joint order (so they line
+            # up elementwise with the joint_pos / joint_vel / actions proprioception
+            # terms), NOT the `joint_out_names` order that joint_pos_ref used. Recorded
+            # explicitly because the two orders differ and nothing else here says which.
+            "joint_order": "isaac",
+            "ee_frame_names": list(cmd_term.resolve_ee_frames(None)),
+            # Direction and frame of the base_pose block's two difference terms. Recorded
+            # because the SIGN of the orientation half is invisible in the obs shape: a
+            # policy trained under either convention loads clean against the other and
+            # walks sideways. GenTrackerPolicy.load() requires this key and refuses
+            # anything it does not know how to reproduce.
+            "base_pose_convention": BASE_POSE_CONVENTION,
+        }
+
+    cmd_spec = None
+    if cmd_cfg is not None:
+        offs = _offsets(cmd_cfg)
+        flat = term_table["command_window"]["shape"]
+        flat = int(np.prod(flat)) if isinstance(flat, (list, tuple)) else int(flat)
+        cmd_spec = {"offsets": offs, "cmd_dim": flat // len(offs)}
+
+    return ref_spec, cmd_spec
 
 
 def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None):
@@ -108,14 +203,17 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
     except KeyError:
         pass
 
-    # Get skill type
+    # Get skill type. AttributeError as well as KeyError: a command term that exists but
+    # carries no `trajectory_type` / `manager` raises the former, and letting it escape
+    # kills the whole parameter export over two optional fields.
     try:
-        # TODO: Test
-        params["skill_type"] = unwrapped_env.command_manager.get_term("traj_ref").trajectory_type.value
-        params["total_time"] = unwrapped_env.command_manager.get_term("traj_ref").manager.get_total_time()
-    except KeyError:
-        raise ValueError("Could not get skill_type and/or total_time while exporting parameters!")
-        # pass
+        traj = unwrapped_env.command_manager.get_term("traj_ref")
+        params["skill_type"] = traj.trajectory_type.value
+        params["total_time"] = traj.manager.get_total_time()
+    except (KeyError, AttributeError) as exc:
+        raise ValueError(
+            f"Could not get skill_type and/or total_time while exporting parameters ({exc})."
+        ) from exc
 
     # Add velocity command ranges
     try:
@@ -131,8 +229,20 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
     except KeyError:
         pass
 
-    # Add robot joint information
-    params["default_joint_angles"] = wp.to_torch(robot.data.default_joint_pos)[0].detach().cpu().numpy()
+    # Add robot joint information.
+    #
+    # NOMINAL, not env 0's: add_joint_default_pos randomizes default_joint_pos in place at
+    # startup to model calibration error, so the live buffer holds whatever env 0 happened to
+    # draw. Shipping that put a per-joint offset of up to the DR half-width straight into the
+    # deployed PD target -- verified in depth_v5_refslim's exported policy_parameters.yaml,
+    # where 0 of 29 angles were exactly 0.0 despite 9 joints being authored at 0.0.
+    # The event stashes the pre-randomization values for exactly this; same config-over-runtime
+    # rule the kp/kd block below follows.
+    nominal_default_pos = getattr(robot.data, "default_joint_pos_nominal", None)
+    if nominal_default_pos is None:
+        # No DR event ran (e.g. events disabled), so the live buffer IS nominal.
+        nominal_default_pos = wp.to_torch(robot.data.default_joint_pos)[0]
+    params["default_joint_angles"] = nominal_default_pos.detach().cpu().numpy()
     params["joint_names_isaac"] = robot.data.joint_names
 
     # CLF output joint order (the joint:* channels of the trajectory command's
@@ -152,7 +262,7 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
             params["ee_frame_names"] = list(traj_cmd.resolve_ee_frames())
         # Body links whose ROOT-frame targets the POLICY OBSERVES, in the order the
         # body_pos_ref / body_vel_ref terms stack them -- what deploy must serve
-        # (transfer/sim/clip_reference.py).  Gated on the mode, not on what the clip
+        # (transfer/deploy/clip_reference.py).  Gated on the mode, not on what the clip
         # happens to carry: a joint-mode policy trained on a widened library still has the
         # channels available but never looks at them, and advertising them would make the
         # runner build reference blocks no obs term consumes.
@@ -312,6 +422,16 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
             obs_info["policy"][term_name] = term_info
 
     params["observation_terms"] = obs_info
+
+    # Merged reference / command window contract.  `observation_terms` records these two
+    # only as a flat width (11 * 82 = 902) plus a per-channel scale vector, which is not
+    # enough for the deploy to REBUILD them: it also needs the sample offsets and the
+    # per-step block layout.  Both come from the sources the observation itself uses --
+    # the term's own params and mdp.reference_window_layout -- so nothing off-sim
+    # restates a width.  Absent (None) for a task without the window terms.
+    ref_spec, cmd_spec = _window_specs(unwrapped_env, obs_manager, obs_group_names, obs_info["policy"])
+    params["reference_window_spec"] = ref_spec
+    params["command_window_spec"] = cmd_spec
 
     # Height-scan sensor geometry so the MuJoCo / hardware deploy can REPLICATE the scan
     # that both the `height_scan` obs term and the FM height token consume. Read from the

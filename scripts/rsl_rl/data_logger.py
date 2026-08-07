@@ -23,10 +23,49 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import 
     ref_base_velocity_local,
     reference_window,
     reference_window_layout,
+    reference_window_to_world,
 )
 
 # Trajectory command term names to search for (in priority order)
 _TRAJ_TERM_NAMES = ("traj_ref", "hlip_ref")
+
+
+def _obs_term_slice(unwrapped, term: str) -> tuple[str, slice] | None:
+    """Locate ``term`` inside whichever concatenated observation group carries it.
+
+    Args:
+        unwrapped: The unwrapped Isaac Lab env.
+        term: Observation term name.
+
+    Returns:
+        ``(group_name, slice)`` into that group's flat vector, or ``None`` if no active
+        group has the term.
+    """
+    om = unwrapped.observation_manager
+    for group, names in om.active_terms.items():
+        if term not in names:
+            continue
+        dims = [int(np.prod(s)) for s in om.group_obs_term_dim[group]]
+        i = list(names).index(term)
+        start = int(sum(dims[:i]))
+        return group, slice(start, start + dims[i])
+    return None
+
+
+def _group_tensor(obs, group: str) -> torch.Tensor | None:
+    """The concatenated tensor for one observation group, from whatever ``obs`` is.
+
+    rsl-rl hands back a plain tensor (single group), a dict of groups, or a TensorDict
+    (NOT a ``dict`` subclass), so probe by subscripting rather than by type.
+    """
+    if obs is None:
+        return None
+    if hasattr(obs, "ndim") and not hasattr(obs, "keys"):
+        return obs
+    try:
+        return obs[group]
+    except Exception:  # noqa: BLE001 - group absent, or an obs type we do not know
+        return None
 
 
 def _split_reference_window(
@@ -78,7 +117,7 @@ class DataLogger:
         data, metadata = logger.finalize()
     """
 
-    def __init__(self, env, log_fm_window: bool = False) -> None:
+    def __init__(self, env, log_fm_window: bool = False, log_world: bool = False) -> None:
         """Initialize the logger and capture one-time metadata from the env.
 
         Args:
@@ -90,15 +129,28 @@ class DataLogger:
                 tracked reference.  Heavier (``[T, N, F, P]``), so it's opt-in;
                 ``fm_active`` (the cheap source mask used for the transition
                 line) is always logged when available.
+            log_world: If True, additionally log everything a 3-D replay needs -- the
+                measured root pose, tracked body positions, the exteroception readings,
+                the per-env clip/tile assignment, the generator's predicted horizon in
+                world coordinates, and the reference window lifted back to world for BOTH
+                sources.  See :meth:`_collect_world`.  Used by
+                ``scripts/rsl_rl/fm_debug.py``; off for ``play.py``, whose plots need none
+                of it and whose rollouts are long.
         """
         self._data: dict[str, list[torch.Tensor]] = defaultdict(list)
         self._step_count: int = 0
         self._warned_sources: set[str] = set()
         self._log_fm_window = log_fm_window
-        # Reference-window shape; overridden from the obs cfg in _collect_metadata so the
-        # logged obs match exactly what the policy is fed.
-        self._ref_num_steps: int = 11
-        self._ref_stride: int = 5
+        self._log_world = log_world
+        # Reference-window sample offsets; overridden from the obs cfg in _collect_metadata
+        # so the logged obs match exactly what the policy is fed. The fallback is the
+        # current step alone rather than a guessed strided window: the offsets are
+        # non-uniform, so there is nothing to guess, and logging one node is obviously
+        # thin where logging the wrong 13 would look right.
+        self._ref_offsets: tuple[int, ...] = (0,)
+        # Which reference blocks the term actually packs; None = the full default set.
+        # Read from the obs cfg below, so a task that drops blocks is sliced correctly.
+        self._ref_blocks: tuple[str, ...] | None = None
         self.metadata: dict[str, Any] = {}
         # Per-step termination signals, stacked in finalize() into a
         # "successful tracking" mask (steps in episodes that ended via
@@ -131,11 +183,16 @@ class DataLogger:
         self._data["student_actions"].append(student_actions.detach().clone())
         self._data["teacher_actions"].append(teacher_actions.detach().clone())
 
-    def collect_step(self, env) -> None:
+    def collect_step(self, env, policy_obs=None) -> None:
         """Capture all loggable data for the current timestep.
 
         Args:
             env: The RslRlVecEnvWrapper-wrapped environment.
+            policy_obs: The observation dict computed from the SAME simulator state the
+                rest of this row describes -- i.e. what ``env.step`` just returned, not the
+                pre-step observation the action was drawn from.  Only used with
+                ``log_world``; it is the one signal that carries the observation
+                CORRUPTION (noise + clipping), which nothing recomputed here can recover.
         """
         unwrapped = env.unwrapped
         step: dict[str, torch.Tensor] = {}
@@ -163,14 +220,26 @@ class DataLogger:
                         self._warn(f"traj_attr:{attr}",
                                    f"Trajectory term '{self._traj_term_name}' has no attribute '{attr}'")
 
-                # Per-step trajectory indices (multiskill only — others have
-                # a single global trajectory and don't need this).
-                manager = getattr(ref, "manager", None)
-                if manager is not None and hasattr(manager, "get_current_trajectory_indices"):
-                    try:
-                        step["traj_idx"] = manager.get_current_trajectory_indices().clone()
-                    except Exception as exc:
-                        self._warn("traj_idx", f"Could not read traj_idx: {exc}")
+                # Per-step clip index, so a per-env result can be traced back to the CLIP it
+                # ran and replayed with reset_on_clip's pin_clip_ids. Read straight off the
+                # command's `clip_id` buffer, which every MotionSequenceCommand (and the FM
+                # tracker deriving from it) maintains per env.
+                #
+                # This used to go through manager.get_current_trajectory_indices(), which
+                # belonged to the multiskill manager deleted with the online stack -- so the
+                # attribute check silently failed for EVERY current task and traj_idx was
+                # never logged at all. The `hasattr` guard turned a dead path into no data
+                # rather than an error.
+                cid = getattr(ref, "clip_id", None)
+                if isinstance(cid, torch.Tensor):
+                    step["traj_idx"] = cid.clone()
+                else:
+                    manager = getattr(ref, "manager", None)
+                    if manager is not None and hasattr(manager, "get_current_trajectory_indices"):
+                        try:
+                            step["traj_idx"] = manager.get_current_trajectory_indices().clone()
+                        except Exception as exc:
+                            self._warn("traj_idx", f"Could not read traj_idx: {exc}")
 
                 # Contact-gate state (multiskill phase-based command only).
                 # ``gate_rel_phi_pre_snap`` is the post-update, pre-snap
@@ -250,7 +319,8 @@ class DataLogger:
         # expose the reference (the helpers raise).
         if self._traj_term_name is not None:
             name = self._traj_term_name
-            ns, st = self._ref_num_steps, self._ref_stride
+            offsets, blocks = self._ref_offsets, self._ref_blocks
+            ns = len(offsets)
             def _traj_obs() -> dict[str, torch.Tensor]:
                 out = {
                     "base_pose_error": base_pose_error(unwrapped, name).clone(),
@@ -264,8 +334,9 @@ class DataLogger:
                 # CURRENT step (the window starts at offset 0), so block 0 should
                 # track the matching current-step term above.
                 cmd = unwrapped.command_manager.get_term(name)
-                win = reference_window(unwrapped, name, num_steps=ns, stride=st)
-                out.update(_split_reference_window(win, reference_window_layout(cmd), ns))
+                win = reference_window(unwrapped, name, offsets=offsets, blocks=blocks)
+                out.update(_split_reference_window(
+                    win, reference_window_layout(cmd, blocks), ns))
                 return out
             try:
                 for k, v in _traj_obs().items():
@@ -454,10 +525,210 @@ class DataLogger:
         except Exception as exc:
             self._warn("terrain_rc", f"Could not compute terrain (row, col): {exc}")
 
+        if self._log_world:
+            self._collect_world(unwrapped, step, policy_obs)
+
         for key, val in step.items():
             self._data[key].append(val)
 
         self._step_count += 1
+
+    # ------------------------------------------------------------------
+    # World / replay block (opt-in; see ``log_world``)
+    # ------------------------------------------------------------------
+    def _collect_world(self, unwrapped, step: dict[str, torch.Tensor], policy_obs) -> None:
+        """Add everything a 3-D replay needs, in WORLD coordinates.
+
+        Kept in one method (and one flag) rather than sprinkled through
+        :meth:`collect_step` so there is a single capture path feeding both the plots and
+        the viewer -- a second recorder would drift from this one the first time the
+        reference layout changed.
+
+        Each sub-block is guarded independently: a scene without cameras, without a height
+        scanner or without a generator still produces a usable bundle.
+
+        Args:
+            unwrapped: The unwrapped Isaac Lab env.
+            step: This step's output dict, extended in place.
+            policy_obs: The observation the env just returned, or ``None``.
+        """
+        robot = unwrapped.scene.articulations["robot"]
+        try:
+            step["root_pos_w"] = _to_torch(robot.data.root_pos_w).clone()
+            step["root_quat_w"] = _to_torch(robot.data.root_quat_w).clone()   # xyzw
+            step["root_lin_vel_w"] = _to_torch(robot.data.root_link_lin_vel_w).clone()
+            step["root_ang_vel_w"] = _to_torch(robot.data.root_link_ang_vel_w).clone()
+            step["joint_vel"] = _to_torch(robot.data.joint_vel).clone()
+            step["projected_gravity"] = _to_torch(robot.data.projected_gravity_b).clone()
+            if self._world_body_idx is not None:
+                step["body_pos_w"] = _to_torch(robot.data.body_pos_w)[:, self._world_body_idx].clone()
+        except Exception as exc:
+            self._warn("world_robot", f"Could not read world robot state: {exc}")
+
+        cmd = (unwrapped.command_manager.get_term(self._traj_term_name)
+               if self._traj_term_name is not None else None)
+        if cmd is not None:
+            try:
+                for name in ("clip_id", "start_step", "clip_world_pos", "clip_world_quat"):
+                    value = getattr(cmd, name, None)
+                    if isinstance(value, torch.Tensor):
+                        step[name] = value.clone()
+                if isinstance(getattr(cmd, "_step", None), torch.Tensor):
+                    step["clip_step"] = cmd._step.clone()
+            except Exception as exc:
+                self._warn("world_clip", f"Could not read clip assignment: {exc}")
+
+        # Exteroception, raw from the sensor (the observation-side copy travels inside
+        # ``policy_obs`` below, carrying its noise and clipping).
+        try:
+            from isaaclab.envs.mdp import height_scan as _height_scan
+            from isaaclab.managers import SceneEntityCfg
+
+            if "height_scanner" in unwrapped.scene.sensors:
+                step["height_scan_raw"] = _height_scan(
+                    unwrapped, SceneEntityCfg("height_scanner")).clone()
+                hits = _to_torch(unwrapped.scene.sensors["height_scanner"].data.ray_hits_w)
+                step["scan_hits_w"] = hits.clone()
+        except Exception as exc:
+            self._warn("world_scan", f"Could not read the height scan: {exc}")
+
+        if self._has_depth:
+            try:
+                from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+                    depth_obs_stack,
+                )
+                step["depth_raw"] = depth_obs_stack(unwrapped).clone()
+            except Exception as exc:
+                self._warn("world_depth", f"Could not read the depth cameras: {exc}")
+
+        # The generator's predicted horizon, in world coordinates (not the y_des layout --
+        # the viewer poses a robot from it, so it wants root pose + joints directly).
+        if cmd is not None and getattr(cmd, "fm_enabled", False):
+            try:
+                step["fm_pred_root_pos"] = cmd._pred_root_pos.clone()
+                step["fm_pred_root_quat"] = cmd._pred_root_quat.clone()
+                step["fm_pred_joint_pos"] = cmd._pred_jp[..., cmd._fm_to_robot_jperm].clone()
+                step["fm_pred_frame_pos"] = cmd._pred_frame_pos.clone()
+            except Exception as exc:
+                self._warn("world_fm_pred", f"Could not read the FM prediction window: {exc}")
+
+        self._collect_reference_windows(unwrapped, cmd, step, policy_obs)
+
+    def _collect_reference_windows(self, unwrapped, cmd, step, policy_obs) -> None:
+        """Lift the reference window back to world -- per source, and as OBSERVED.
+
+        Three variants, and the differences between them are the point:
+
+        * ``refwin_<src>_*`` -- each source's own look-ahead, straight from the command;
+        * ``refwin_obs_*`` -- the APPLIED source's window round-tripped through
+          :func:`~robot_rl...observations.reference_window` and back, which must reproduce
+          the applied one exactly (it is the same geometry, so a mismatch is a frame bug);
+        * ``refwin_noisy_*`` -- the same, but reconstructed from the observation the POLICY
+          actually received, so it carries the noise and the +-20 clip. This is the only one
+          that shows what the encoder was really fed.
+
+        The scale is divided back out before reconstructing; noise and clipping are not
+        invertible and are not meant to be.
+        """
+        if cmd is None or not hasattr(cmd, "get_future_world_base"):
+            return
+        nj = len(cmd.robot.joint_names)
+        frames = cmd.resolve_ee_frames(None)
+        offsets = self._ref_offsets
+        ns = len(offsets)
+
+        def _capture(prefix: str, available: tuple[str, ...] | None = None) -> None:
+            """Store the served source's look-ahead window in world coordinates.
+
+            Sample 0 is the ANCHORED current-step reference -- what the policy observes --
+            which is NOT the same thing as ``y_des``'s base channels on the clip path:
+            those are re-pointed at the GLOBALLY-placed clip by
+            ``MotionSequenceCommand._write_global_base_des`` so the reward and the drift
+            termination grade the same datum. Both are worth having; conflating them makes
+            accumulated global drift look like a reference error.
+
+            Args:
+                prefix: Key prefix naming the source.
+                available: Window blocks this source can actually serve, or ``None`` for
+                    "all of them". The GENERATOR is limited to the blocks it was trained
+                    to predict, and its accessors raise rather than invent the rest -- so
+                    asking for an ee frame from a generator that predicts none would
+                    abort the whole capture, including the clip source's.
+            """
+            def has(block: str) -> bool:
+                """Whether this source carries ``block``."""
+                return available is None or block in available
+
+            offs = torch.tensor(offsets, device=cmd.device, dtype=torch.long)
+            pos_w, quat_w, _, _ = cmd.get_future_world_base(offs)
+            step[f"refwin_{prefix}_base_pos"] = pos_w.clone()
+            step[f"refwin_{prefix}_base_quat"] = quat_w.clone()
+            # [N, n_offsets, n_frames, 13] -- offset first, matching the layout
+            # ``reference_window_to_world`` returns, so the two are directly comparable.
+            if has("ee_pos"):
+                ee = cmd.get_future_world_frames(frames, offs)
+                step[f"refwin_{prefix}_ee_pos"] = ee[..., 0:3].clone()
+            if has("joint_pos"):
+                # Positions only -- the velocity half comes back NaN on a window without
+                # joint_vel, and this is what the viewer poses its ghost from.
+                joint_pos, _ = cmd.get_future_joint_state(offs)      # robot joint order
+                step[f"refwin_{prefix}_joint_pos"] = joint_pos.clone()
+
+        try:
+            if hasattr(cmd, "as_clip_reference"):
+                managers = {"clip": cmd.as_clip_reference, "fm": cmd.as_fm_reference}
+                for src in (["clip", "fm"] if getattr(cmd, "fm_enabled", False) else ["clip"]):
+                    with managers[src]():
+                        # The clip carries the whole reference; the generator carries only
+                        # the blocks it predicts (== the observation term's, checked at
+                        # load), so that is what it is asked for.
+                        _capture(src, self._ref_blocks if src == "fm" else None)
+            else:
+                _capture("applied")        # a plain clip command: one source, no swapping
+        except Exception as exc:
+            self._warn("refwin_sources", f"Could not capture the per-source windows: {exc}")
+
+        # The clean window round-tripped: identical to the applied source by construction,
+        # so any disagreement localises a frame bug to reference_window itself.
+        try:
+            root_pos = _to_torch(cmd.robot.data.root_pos_w)
+            root_quat = _to_torch(cmd.robot.data.root_quat_w)
+            # The term's OWN block selection on both halves: build the clean window the
+            # way the policy's term does, and take it apart the same way. Defaulting to
+            # all five here would both mis-size the window and invent channels the policy
+            # never saw.
+            blocks = self._ref_blocks
+            clean = reference_window(unwrapped, self._traj_term_name, offsets=offsets,
+                                     blocks=blocks)
+            for tag, win in (("obs", clean), ("noisy", self._observed_window(unwrapped, policy_obs))):
+                if win is None:
+                    continue
+                world = reference_window_to_world(win, root_pos, root_quat, ns, nj, len(frames),
+                                                  blocks)
+                # Only what the selection carries -- a dropped block is absent from
+                # ``world`` rather than zero, so this logs nothing instead of a zero the
+                # plots would draw as a reference sitting at the origin.
+                for key, name in (("base_pos_w", "base_pos"), ("base_quat_w", "base_quat"),
+                                  ("ee_pos_w", "ee_pos"), ("joint_pos", "joint_pos")):
+                    if key in world:
+                        step[f"refwin_{tag}_{name}"] = world[key].clone()
+        except Exception as exc:
+            self._warn("refwin_obs", f"Could not lift the reference window to world: {exc}")
+
+    def _observed_window(self, unwrapped, policy_obs) -> torch.Tensor | None:
+        """The ``reference_window`` slice of ``policy_obs``, with the term scale undone.
+
+        Returns the raw-unit window the policy was fed, still carrying its noise and
+        clipping, or ``None`` when no observation was supplied.
+        """
+        if policy_obs is None or self._refwin_obs is None:
+            return None
+        group, sl = self._refwin_obs
+        tensor = _group_tensor(policy_obs, group)
+        if tensor is None:
+            return None
+        win = tensor[:, sl].float()
+        return win if self._refwin_scale is None else win / self._refwin_scale
 
     def finalize(self) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
         """Stack all timestep data into numpy arrays.
@@ -481,6 +752,10 @@ class DataLogger:
             dones = torch.stack(self._dones, dim=0).cpu().numpy().astype(bool)
             time_outs = torch.stack(self._time_outs, dim=0).cpu().numpy().astype(bool)
             data["_timeout_mask"] = _build_timeout_mask(dones, time_outs)
+            # The raw signals too: a diagnostic wants to mark WHERE an episode ended, not
+            # only whether the steps before it belonged to a successful one.
+            data["dones"] = dones
+            data["time_outs"] = time_outs
 
         # Note: per-trajectory CLF/tracking + termination summaries now live in
         # a dedicated headless eval, which would have far better clip coverage than an
@@ -528,11 +803,20 @@ class DataLogger:
                 if hasattr(ref, "fm_window_len") and hasattr(ref, "fm_novel_start"):
                     self.metadata["fm_window_len"] = int(ref.fm_window_len)
                     self.metadata["fm_novel_start"] = int(ref.fm_novel_start)
-                # Which source drives the robot (FM by default, clip in drive_with_clip
-                # mode) -- lets the positions/velocities plots label the applied line.
+                # Which source drives the robot -- lets the positions/velocities plots
+                # label the applied line, and tells the viewer which overlay is the one
+                # the policy actually tracked.
                 cmd_cfg = getattr(ref, "cfg", None)
-                if cmd_cfg is not None and hasattr(cmd_cfg, "drive_with_clip"):
-                    self.metadata["drive_with_clip"] = bool(cmd_cfg.drive_with_clip)
+                if cmd_cfg is not None and hasattr(cmd_cfg, "reference_source"):
+                    self.metadata["reference_source"] = str(cmd_cfg.reference_source)
+                    self.metadata["drive_with_clip"] = cmd_cfg.reference_source == "clip"
+                    self.metadata["fm_update_every"] = int(getattr(cmd_cfg, "fm_update_every", 1))
+                if getattr(ref, "fm_enabled", False):
+                    ctx = ref.ctx
+                    self.metadata["fm_horizon"] = int(ctx.F)
+                    self.metadata["fm_frame_names"] = list(ctx.frame_names)
+                    self.metadata["fm_num_history"] = int(ctx.N)
+                    self.metadata["fm_extero_source"] = str(ctx.extero_source)
                 manager = getattr(ref, "manager", None)
                 if manager is not None and hasattr(manager, "num_trajectories"):
                     self._num_trajectories = int(manager.num_trajectories)
@@ -556,11 +840,14 @@ class DataLogger:
                     cfg = obs_mgr._group_obs_term_cfgs[group_name][
                         list(group_terms).index("reference_window")
                     ]
-                    self._ref_num_steps = int(cfg.params.get("num_steps", self._ref_num_steps))
-                    self._ref_stride = int(cfg.params.get("stride", self._ref_stride))
+                    self._ref_offsets = tuple(int(o) for o in cfg.params["offsets"])
+                    blocks = cfg.params.get("blocks")
+                    self._ref_blocks = tuple(blocks) if blocks else None
                     break
-            self.metadata["reference_num_steps"] = self._ref_num_steps
-            self.metadata["future_stride"] = self._ref_stride
+            self.metadata["reference_offsets"] = list(self._ref_offsets)
+            self.metadata["reference_num_steps"] = len(self._ref_offsets)
+            self.metadata["reference_blocks"] = list(
+                self._ref_blocks) if self._ref_blocks else "all"
         except Exception as exc:
             print(f"[WARN DataLogger] Could not read reference-window params: {exc}")
 
@@ -597,6 +884,82 @@ class DataLogger:
                 self.metadata["border_cols"] = border_cols
         except Exception as exc:
             print(f"[WARN DataLogger] Could not read terrain grid metadata: {exc}")
+
+        self._collect_world_metadata(unwrapped)
+
+    def _collect_world_metadata(self, unwrapped) -> None:
+        """Resolve everything :meth:`_collect_world` needs once, up front.
+
+        Always runs (the attributes must exist even when ``log_world`` is off), but only
+        the world block reads them.
+        """
+        self._world_body_idx: torch.Tensor | None = None
+        self._world_body_names: list[str] = []
+        self._has_depth = False
+        self._refwin_obs: tuple[str, slice] | None = None
+        self._refwin_scale: torch.Tensor | None = None
+        if not self._log_world:
+            return
+        try:
+            robot = unwrapped.scene.articulations["robot"]
+            cmd = unwrapped.command_manager.get_term(self._traj_term_name)
+            # The base plus the ee reference frames -- the same set the reference window
+            # carries, so measured and reference are directly comparable per frame.
+            names = [cmd.cfg.base_frame_name] + list(cmd.resolve_ee_frames(None))
+            self._world_body_names = [n for n in names if n in robot.body_names]
+            self._world_body_idx = torch.tensor(
+                [robot.body_names.index(n) for n in self._world_body_names],
+                dtype=torch.long, device=unwrapped.device,
+            )
+            self.metadata["world_body_names"] = list(self._world_body_names)
+            self.metadata["base_frame_name"] = str(cmd.cfg.base_frame_name)
+        except Exception as exc:
+            print(f"[WARN DataLogger] Could not resolve world body frames: {exc}")
+
+        obs_names = set()
+        for names in unwrapped.observation_manager.active_terms.values():
+            obs_names.update(names)
+        self._has_depth = bool({"depth_near", "depth_far"} & obs_names)
+        if self._has_depth:
+            try:
+                from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+                    depth_camera_specs,
+                )
+                # The whole camera contract, so the viewer can reshape the flat token axis
+                # back into images (and denormalise them) without restating any geometry.
+                self.metadata["depth_camera_spec"] = depth_camera_specs(unwrapped)
+            except Exception as exc:
+                print(f"[WARN DataLogger] Could not read the depth camera spec: {exc}")
+
+        # Where the reference window sits in the observation the policy receives, and the
+        # per-channel scale to divide back out.
+        try:
+            self._refwin_obs = _obs_term_slice(unwrapped, "reference_window")
+            if self._refwin_obs is not None:
+                group, _ = self._refwin_obs
+                om = unwrapped.observation_manager
+                names = list(om.active_terms[group])
+                cfg = om._group_obs_term_cfgs[group][names.index("reference_window")]
+                if cfg.scale is not None:
+                    self._refwin_scale = torch.as_tensor(
+                        cfg.scale, dtype=torch.float32, device=unwrapped.device)
+                self.metadata["reference_window_group"] = group
+        except Exception as exc:
+            print(f"[WARN DataLogger] Could not locate the reference_window observation: {exc}")
+
+        # Static scene geometry the viewer rebuilds the terrain from.
+        try:
+            importer = getattr(unwrapped.scene, "terrain", None)
+            cmd = unwrapped.command_manager.get_term(self._traj_term_name)
+            if importer is not None and hasattr(importer, "env_terrain_id"):
+                self.metadata["env_terrain_id"] = importer.env_terrain_id.cpu().tolist()
+                self.metadata["env_cell_corner"] = importer.env_cell_corner.cpu().tolist()
+            lib = getattr(cmd, "_clip_lib", None)
+            if lib is not None:
+                self.metadata["terrain_manifest"] = lib.attrs.get("terrain_manifest", [])
+                self.metadata["clip_len"] = cmd.manager.clip_len.cpu().tolist()
+        except Exception as exc:
+            print(f"[WARN DataLogger] Could not read terrain / clip geometry: {exc}")
 
     def _collect_traj_names(self, manager) -> list[str] | None:
         """Build a per-trajectory display name list from the multiskill manager.

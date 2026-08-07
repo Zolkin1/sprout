@@ -2,10 +2,39 @@
 
 # Flow-Matching Workflow
 
-A conditional flow-matching transformer that predicts a robot's **future references**
-(base position, joint pos/vel, base lin/ang velocity, and optionally end-effector
-frames — all in the robot's current local base frame) from **state history + a
-velocity command**. Built on the open-loop motion-sequence task.
+A conditional flow-matching transformer that predicts the teacher's **`reference_window`
+observation vector directly** — up to `[base_pose(9), base_vel(6), joint_pos(nj),
+joint_vel(nj), ee_pos(3K)]` per node — from **its own recent output + exteroception + a
+velocity command**.
+
+Two things follow from that, and they are the point of the design:
+
+- **The generator's output IS the policy's observation.** There is no world-frame lift on
+  the path from the network to the tracker, in simulation or at deploy. The state layout is
+  `robot_rl/flow_matching/window.py`, shared by the observation, the dataset and the
+  torch-free deploy port so it cannot drift between them.
+- **It predicts exactly the blocks that teacher observes**, not always all five. The g1
+  teacher packs `(base_pose, base_vel, joint_pos)` today → `D = 44` (`572` over the
+  11-sample window), and the FM resolves the same selection from the recording
+  (`RecordingMeta.reference_blocks`) rather than assuming the full `D = 82`. A dropped
+  block also drops the loss terms that index it, and the agreement is checked where both
+  artifacts meet: `FmTrackingCommand.reference_window_obs` in sim,
+  `GenTrackerPolicy.load()` at deploy. Override with `--reference_blocks` only to train
+  for a teacher other than the recorded one.
+- **It is autoregressive over itself.** The `N` context tokens are the nodes it emitted at
+  the `N` previous control steps, each already relative to the robot as it was at that step,
+  so deploy pushes back what it just served — no base-pose estimate anywhere on the FM path.
+
+`fm_update_every` is pinned to **1**: the window is anchored on the robot at the re-plan, so
+serving it a step later would need the egomotion since then, which is exactly the
+dependency this representation removes. `F = 51` follows
+(`max(REFERENCE_OFFSETS) + 1`).
+
+The caveat to keep in mind when reading results: at training time the history is the CLIP
+TEACHER's applied reference, never the model's own, so this carries textbook **exposure
+bias**. The defences are `null_cond_prob` and the history-token noise — which is the *same*
+`REFERENCE_WINDOW_NOISE` table the policy's reference observation is corrupted with, because
+both stand in for the same thing (this model's prediction error).
 
 Pipeline: **record data → train → deploy**. Recording needs Isaac Sim; training is pure
 PyTorch (no Isaac). You **record once and train many** FM variants on the same recording —
@@ -19,15 +48,23 @@ The scripts **auto-configure from the data**: they infer `target_source`, `cmd_a
 `clip_device` from the recording's contents, so you rarely pass those flags.
 
 ```bash
-# 1. record teacher rollouts (needs Isaac)
-python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-play \
-    --load_run <teacher-run> --clip <lib.h5> --num_windows 200000 --num_envs 256
+# 1. record teacher rollouts (needs Isaac). Record on the TRAIN task, not -play:
+#    -play trims to 24 envs / 1 terrain row AND disables every domain randomisation,
+#    including the depth-camera noise/intrinsics/extrinsics jitter. Depth is the FM's only
+#    exteroceptive input, so recording on -play trains a generator that has only ever seen
+#    a perfect camera. Observation corruption does NOT corrupt the recorded targets -- the
+#    recorder reads the command term's world state, not the observation tensor.
+python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-depth \
+    --load_run <teacher-run> --clip <lib.h5> --clip_device cpu \
+    --num_windows 200000 --history_len 8 --ref_future_len 51 --num_envs 256 --headless
 
-# 2. train the FM (no Isaac)
-python scripts/flow_matching/train.py --data <windows.h5> --wandb
+# 2. train the FM (no Isaac).  --skip_distractors while the distractor family still has
+#    anchor_mask == 0 clips (the recorder warns when it does).
+python scripts/flow_matching/train.py --data <windows.h5> \
+    --cmd_array target_vel --extero_source depth --skip_distractors --wandb
 
 # 3. deploy: the teacher tracks the FM
-python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-play \
+python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play \
     --load_run <teacher-run> --fm_checkpoint <fm.pt> --clip <lib.h5> --clip_device cpu
 ```
 
@@ -61,12 +98,14 @@ python scripts/flow_matching/train.py --data <run-dir-or-.npz> --wandb
 
 - **`--data`** accepts a `.npz` **or a run directory** (→ newest `recorded_*.npz` under it).
 - **Auto-configured from the recording** (printed as `[auto] target_source=…, cmd_array=…`):
-  - `--target_source` → `reference` if the recording has `ref_state`, else `actual`. Override explicitly.
+  - `--target_source` → `ego_anchored_clip_future` (the only mode the dataset accepts) when the recording has `ref_future`.
   - `--cmd_array` → `target_vel` if that array was recorded, else no command (future-horizon conditioning: past command in the encoder, future in the decoder). Override with an array name or `none`.
 - **`--eval_data <run-or-.npz>`** — a *separate* held-out recording (never trained on); metrics logged under `eval/*`, distinct from the within-recording `val/*`. Must share the train layout. See "Held-out evaluation" below.
 - **`--run_name`** — run dir is `logs/flow_matching/<timestamp>_<run_name>` (defaults to just the timestamp).
-- **`--history_frames`** — extra body frames the history/encoder token consumes. Default (omit / `none` / bare flag) is an **empty set**: the generator needs **no** measured end-effectors at deployment, while the target still predicts every recorded frame for the tracker's `ee_ref`. Pass `all` for symmetric (history uses every recorded frame), or a space-separated subset.
-- Other knobs: `--num_epochs` (100), `--stride` (1; raise to cut RAM on huge datasets), `--history_len` / `--future_len` (25), `--lr`, `--cosine`.
+- **`--history_source`** — what the `N` history tokens are made of. `measured` (default) is the robot's actual state. `reference_partial` is **partially autoregressive**: measured root pose/twist, but joints and end-effector positions taken from the reference applied at those steps — the generator conditioning on its own recent output for posture while the root stays grounded in reality. Both train from the same recording (the applied-reference ring is always stored), so it is a free A/B.
+- Other knobs: `--num_epochs` (100), `--stride` (1; raise to cut RAM on huge datasets), `--num_history_states` (2), `--future_len` (65 — sized to the deploy look-ahead; see `FlowMatchingConfig.future_len`), `--lr`, `--cosine`.
+
+**Horizon and re-recording.** `--future_len` must equal the recording's `--ref_future_len`: windows are cut at record time and the dataset hard-errors on a mismatch. Both default to `FlowMatchingConfig.future_len`, so leaving them alone is correct.
 - **Output:** `logs/flow_matching/<ts>_<run_name>/{best.pt, ckpt_<N>.pt}`. wandb logs per epoch (val every `--val_every`=5); per-step loss → TensorBoard.
 - **Provenance (parity with RL):** each run writes `git/sprout.diff` + `params/fm_config.yaml` (the resolved config) + `params/data.yaml` (train/eval `.npz` paths + their `sha256` + the recording's metadata), and every `.pt` records `data_path`/`data_sha256` — so a run is fully self-describing.
 

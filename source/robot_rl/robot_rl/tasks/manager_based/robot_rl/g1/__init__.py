@@ -92,8 +92,11 @@ if not _registered:
     #    slim-down: the same error reproduces on the old G1-teacher-clf-sym at 681a624.
     #    The unhandled terms are now `reference_window` and `command_window` (the merged
     #    look-ahead that replaced base_vel_ref / ee_ref / future_base_*). reference_window
-    #    is the harder one: it is [step0(D), step1(D), ...] where each step packs
-    #    base_pose(6) + base_vel(6) + joint_pos(nj) + joint_vel(nj) + ee_pos(3*n_ee), so
+    #    is the harder one: it is [sample0(D), sample1(D), ...] over the 13
+    #    REFERENCE_OFFSETS, where each sample packs
+    #    base_pose(9) + base_vel(6) + joint_pos(nj) + joint_vel(nj) + ee_pos(3*n_ee), so
+    #    -- and base_pose's orientation half is a 6D rotation, which does NOT mirror as a
+    #    sign pattern (see motion_gen.features._rot6d for the one that does), so
     #    the handler must reflect per BLOCK within each step -- reuse
     #    mdp.observations.reference_window_layout for the widths, and note the joint block
     #    is in ROBOT joint order (so the existing joint reflection permutation applies
@@ -178,7 +181,25 @@ if not _registered:
         disable_env_checker=True,
         kwargs={
             "env_cfg_entry_point": f"{__name__}.g1_tracker_env_cfg:G1FmTrackerTerrainPlayEnvCfg",
-            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+            # Play-only runner: no privileged critic group, and its weights are not loaded,
+            # so any teacher checkpoint drives this task regardless of tracking_mode.
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FmTrackerPlayRunnerCfg",
+        },
+    )
+
+    # Same tracker, DEPTH exteroception on both sides -- the depth teacher's policy branch
+    # plus a depth-trained generator. Needed because FmTrackingCommand feeds the sensor the
+    # CHECKPOINT names, so a depth FM cannot run in the height-scan task above (no cameras in
+    # its scene), and depth is what FlowMatchingConfig trains by default.
+    gym.register(
+        id="G1-tracker-clf-fm-terrain-depth-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": (
+                f"{__name__}.g1_tracker_env_cfg:G1FmTrackerTerrainDepthPlayEnvCfg"
+            ),
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FmTrackerPlayRunnerCfg",
         },
     )
     _registered = True

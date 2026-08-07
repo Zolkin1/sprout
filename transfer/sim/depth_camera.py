@@ -20,13 +20,14 @@ camera numbers of its own.  What it does hold is the MuJoCo-side convention:
 * ``terrain_group`` (2) -- the floor and stair geoms, matching
   :meth:`Robot.compute_height_scan` and ``generate_stairs_scene.py``.
 
-TODO(depth-parity): MuJoCo group 1 also holds the hand/palm/finger visual meshes, which
-IsaacLab's ``SELF_SCAN_LINKS`` (see ``g1/g1_self_scan.py``) leaves out -- measured at
-~60/780 near-camera pixels in a nominal stance, and ~34/780 on the far camera with the
-arms forward.  The mismatch is knowingly kept until the hardware camera's own occlusion
-geometry is known, since all three (both sims and the robot) should ultimately agree.
-Closing it on this side means filtering by body name: export the self-scan link list
-alongside the camera contract and keep only geoms whose body is in it.
+Group 1 also holds the hand/palm/finger visual meshes.  IsaacLab casts those too, so the
+two agree: ``compare_depth_sim2sim.py`` reports the hand pixels within 0.005 m.  This used
+to be a standing ~60/780-pixel delta, because IsaacLab's ``SELF_SCAN_LINKS`` could not see
+them -- the stock URDF hung the hand meshes off the wrist as bare ``<visual>`` elements,
+which the importer turned into Xforms with a non-identity mesh->body offset that
+``MultiMeshRayCaster`` silently fails to intersect.  The fix was to make them real
+fixed-joint links (``robot_assets/g1/g1_21j/make_hand_links_urdf.py``), so nothing has to
+be filtered out here.
 """
 
 from __future__ import annotations
@@ -246,6 +247,11 @@ class MujocoDepthCameras:
         self._geomgroup = np.zeros(6, dtype=np.uint8)
         self._geomgroup[int(terrain_group)] = 1
         self._geomgroup[int(self_scan_group)] = 1
+        # Geoms in the cast groups, for the cutoff computation in :meth:`_cutoff_for`.
+        self._cast_geoms = np.array(
+            [g for g in range(mj_model.ngeom) if self._geomgroup[mj_model.geom_group[g]]],
+            dtype=np.int32,
+        )
         self._num_rays = self.cameras[0].num_rays
         if any(cam.num_rays != self._num_rays for cam in self.cameras):
             raise ValueError(
@@ -253,6 +259,39 @@ class MujocoDepthCameras:
                 f"({[cam.num_rays for cam in self.cameras]}); compute() returns them as one "
                 "array (and the FM stacks them on one token axis), so they must match."
             )
+
+    def _cutoff_for(self, mj_data, pos: np.ndarray) -> float:
+        """A ``mj_multiRay`` cutoff that provably culls NOTHING in the cast groups.
+
+        THIS EXISTS BECAUSE OF A REAL BUG, so it must not be "optimised" back:
+        ``cutoff`` culls a candidate geom when ``dist(ray_origin, geom_origin) - rbound``
+        exceeds it -- a distance to the geom's ORIGIN, not to its surface. **A plane has
+        ``rbound = 0`` and the ground plane's origin is the world origin**, so passing the
+        camera's ``max_distance`` (8 m near / 12 m far) silently discarded the entire floor
+        once the robot walked that far from spawn. Symptom: every ground pixel in the near
+        camera reads "no reading" while self-occlusion pixels stay perfect, so the policy is
+        handed a depth image with no terrain in it -- and the near camera loses it first,
+        because its cutoff is the smaller one. Measured: ground hits vanish at |x| >= 8.5 m
+        (near) and >= 13 m (far).
+
+        ``max_distance`` is enforced AFTER the cast, by rejecting ``dist > max_distance``
+        (see :meth:`compute`), so the cutoff was never what made the range correct -- it was
+        only ever a speed optimisation, and it buys about 1%.
+
+        Bound: culling needs ``dist_i - rbound_i > cutoff``; with ``rbound_i >= 0`` and
+        ``cutoff >= max_i dist_i``, that can never hold for any geom type, plane included.
+
+        Args:
+            mj_data: MuJoCo data with current forward kinematics.
+            pos: The ray origin (camera position), world frame.
+
+        Returns:
+            The cutoff to pass to ``mj_multiRay``.
+        """
+        if self._cast_geoms.size == 0:
+            return float(np.max([c.max_distance for c in self.cameras]))
+        d = np.linalg.norm(mj_data.geom_xpos[self._cast_geoms] - pos, axis=1).max()
+        return float(d) + float(np.max([c.max_distance for c in self.cameras]))
 
     def enable_noise(self, rng: np.random.Generator) -> "DepthNoiserNp":
         """Attach the training sensor-noise model to these cameras.
@@ -321,13 +360,16 @@ class MujocoDepthCameras:
                 self._model, mj_data, pos, cam._dirs_w.ravel(), self._geomgroup,
                 1,          # flg_static: the terrain lives on the static worldbody
                 -1,         # bodyexclude: nothing (self-occlusion is the point)
-                cam._geomid, cam._dist, None, cam.num_rays, cam.max_distance,
+                cam._geomid, cam._dist, None, cam.num_rays,
+                # NOT max_distance -- that silently culls the ground plane once the robot
+                # walks that far from the world origin. See :meth:`_cutoff_for`.
+                self._cutoff_for(mj_data, pos),
             )
-            # ``cutoff`` culls candidate GEOMS conservatively, so a hit beyond the range
-            # can still be reported; IsaacLab cuts the ray itself at max_distance, so
-            # reject those explicitly. A miss reports exactly max_distance, matching
-            # depth_clipping_behavior="max" -- the sentinel the normalisation treats as
-            # "no reading".
+            # The cast does not bound the ray, so a hit beyond the camera's range can be
+            # reported; IsaacLab cuts the ray itself at max_distance, so reject those
+            # explicitly. THIS is what enforces the range. A miss reports exactly
+            # max_distance, matching depth_clipping_behavior="max" -- the sentinel the
+            # normalisation treats as "no reading".
             hit = (cam._dist >= 0.0) & (cam._dist <= cam.max_distance)
             depth_z = np.where(
                 hit, np.minimum(cam._dist * cam.cos_theta, cam.max_distance), cam.max_distance

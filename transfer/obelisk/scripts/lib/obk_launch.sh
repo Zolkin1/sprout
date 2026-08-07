@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Copyright 2026 Zachary Olkin. All rights reserved.
 #
-# Shared helpers for the obk launch scripts (run_sim_low.sh, run_world.sh,
+# Shared helpers for the obk launch scripts (run_sim_low.sh, run_sim_world.sh,
 # run_hardware_low.sh, stop.sh). Source this from a variant script.
 #
 # Each variant runs in two halves:
@@ -21,6 +21,32 @@
 OBK_SCRIPTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"          # .../obelisk/scripts
 OBK_DOCKER_DIR="$(cd "$OBK_SCRIPTS_DIR/../docker" && pwd)"
 OBK_SERVICE="${OBK_SERVICE:-sim}"
+
+# Make docker/.env AUTHORITATIVE for compose interpolation.
+#
+# Compose resolves `$VAR` from the SHELL environment FIRST and only then from .env, so any
+# of these exported in a login shell silently overrides the file that is documented as the
+# source of truth. That is not hypothetical: a stale `export ROBOT_RL_ROOT=...` in ~/.bashrc
+# (pointing at a previous repo layout) produced a container whose $ROBOT_RL_ROOT named a
+# directory that did not exist, while $REPO_ROOT -- not exported, so read from .env -- was
+# correct. The mount was right and the paths inside it were wrong, which reads as "the repo
+# is not mounted" and sends you looking in the wrong place entirely.
+#
+# Exporting .env here means the shell env and .env AGREE, so precedence stops mattering.
+# Only affects this shell and the compose/exec children it spawns.
+#
+# Assigned line by line rather than `set -a; . .env`: bash's UID is READONLY, so sourcing
+# the file errors on that line -- and under the callers' `set -e` that aborts the launcher
+# outright. Skipping UID costs nothing, because bash does not export UID either, so compose
+# finds no shell value and reads it from .env directly, which is what we want anyway.
+if [ -z "${OBK_IN_CONTAINER:-}" ] && [ -f "$OBK_DOCKER_DIR/.env" ]; then
+    while IFS= read -r _obk_line || [ -n "$_obk_line" ]; do
+        case "$_obk_line" in ''|'#'*|*[!A-Za-z0-9_]*=*) continue ;; esac
+        case "${_obk_line%%=*}" in UID|EUID|PPID|SHELLOPTS|BASHOPTS) continue ;; esac
+        export "${_obk_line?}"
+    done < "$OBK_DOCKER_DIR/.env"
+    unset _obk_line
+fi
 
 # Compose file selection. An explicit OBK_COMPOSE_FILE always wins. Otherwise auto-detect
 # on the HOST: the GPU compose file requests `runtime: nvidia`, which docker can only
@@ -118,6 +144,21 @@ obk_host_launch() {
 # CONTAINER side (tmux pane construction)
 # ---------------------------------------------------------------------------
 
+# Pre-create obelisk's shared log directory, because two obk-launches racing to create it
+# is a coin flip over whether the stack comes up.
+#
+# obelisk's setup_logging_dir() does `if not os.path.exists(d): os.makedirs(d)` -- a TOCTOU
+# race. Every stack here launches the brain and the robot as TWO obk-launches started
+# together, so on a container whose obk_logs does not exist yet they both see it missing and
+# the loser dies with "[Errno 17] File exists: .../obk_logs". Only the SECOND launch is lost,
+# so the symptom is a world with no brain (or vice versa) and one buried [ERROR] line.
+# Deterministic to pre-create; nothing here depends on the directory being fresh.
+# TODO(obelisk-upstream): `os.makedirs(..., exist_ok=True)` in launch_utils.setup_logging_dir
+# removes the need for this.
+if [ -n "${OBK_IN_CONTAINER:-}" ]; then
+    mkdir -p "${ROS_HOME:-${OBELISK_ROOT:-$HOME/obelisk}}/obk_logs" 2>/dev/null || true
+fi
+
 # obk_mk_rcfile <name> <command> [mode]: write a per-pane rcfile that sources the full env
 # and, depending on <mode>:
 #   seed (default) -- queue <command> in history only (press Up then Enter).
@@ -129,9 +170,25 @@ obk_mk_rcfile() {
     local f="/tmp/obk_rc_$name"
     {
         echo 'source ~/.bashrc'
+        # RE-ASSERT the container's paths AFTER ~/.bashrc, which is bind-mounted from the
+        # HOST and is free to export whatever it likes. A stale `export ROBOT_RL_ROOT=...`
+        # in a developer's .bashrc (pointing at a previous repo layout) broke EVERY pane of
+        # EVERY run script, and did so invisibly: .bashrc returns early for non-interactive
+        # shells, so `bash -lc` was unaffected and only the panes -- which are interactive --
+        # picked up the stale value. `install/setup.bash` then did not exist, the workspace
+        # went unsourced, and the failure surfaced three layers later as
+        # "package 'g1_control' not found" from ros2 launch.
+        #
+        # Baked in as literals because this rcfile is generated INSIDE the container, where
+        # the values came from compose (which obk_launch.sh already forces to agree with
+        # docker/.env) and are correct at this moment.
+        printf 'export ROBOT_RL_ROOT=%q\n' "$ROBOT_RL_ROOT"
+        [ -n "${REPO_ROOT:-}" ] && printf 'export REPO_ROOT=%q\n' "$REPO_ROOT"
         echo 'obk'
-        echo 'source "$ROBOT_RL_ROOT/install/setup.bash" 2>/dev/null \
-              || echo "[pane] workspace not built yet -- run: colcon build --symlink-install"'
+        # No `2>/dev/null`: swallowing the error here is what turned a one-line "no such
+        # file" into the package-not-found hunt above.
+        echo 'source "$ROBOT_RL_ROOT/install/setup.bash" \
+              || echo "[pane] NOT SOURCED: $ROBOT_RL_ROOT/install/setup.bash -- run scripts/build.sh"'
         if [ -n "$cmd" ]; then
             # %q keeps the history entry intact (including literal ${ROBOT_RL_ROOT}) so
             # Up-arrow shows exactly what you would have typed.
@@ -142,6 +199,55 @@ obk_mk_rcfile() {
         fi
     } >"$f"
     printf '%s' "$f"
+}
+
+# ---------------------------------------------------------------------------
+# Recording
+# ---------------------------------------------------------------------------
+
+# Topics a run records. An EXPLICIT list, not `ros2 bag record -a`, for two reasons: `-a`
+# also pulls /livox/lidar (a point cloud we do not use in sim) and every obelisk internal,
+# and -- more importantly -- a named list is a statement of what a run is expected to
+# contain, so a missing topic shows up as an empty one in the bag rather than as nothing
+# at all.
+#
+# Between them these reconstruct the whole policy input. /obelisk/g1/est_state gives the
+# proprioception terms, the depth images give the exteroception, and debug/tick carries the
+# per-tick internals that exist nowhere else -- so the observation vector itself is never
+# recorded, only proven via its checksum. See g1_msgs/msg/ControllerDebug.msg.
+OBK_BAG_TOPICS=(
+    # First-party diagnostics: the only source for what happens inside a control tick.
+    /obelisk/g1/debug/tick
+    /obelisk/g1/debug/fm_plan
+    # The control loop proper.
+    /obelisk/g1/ctrl
+    /obelisk/g1/est_state
+    /obelisk/g1/vel_cmd
+    /obelisk/g1/exec_fsm
+    /obelisk/g1/fsm_state
+    # Raw sensing, as the policy received it.
+    /obelisk/g1/joint_encoders
+    /obelisk/g1/pelvis_imu
+    /depth/near/image_processed
+    /depth/far/image_processed
+    /Odometry
+)
+
+# obk_bag_cmd [tag]: the `ros2 bag record` command line for a run, echoed for a tmux pane.
+#
+# MCAP, not the default sqlite3, for two reasons that both bite off the robot: MCAP embeds
+# each message's SCHEMA in the file, so a bag full of custom obelisk messages can be read on
+# a laptop with `pip install mcap` and no ROS workspace at all; and Foxglove reads MCAP
+# natively while it dropped ROS 2 .db3. It is also chunked and append-only, so a bag whose
+# process was killed mid-run -- i.e. every interesting one -- is recoverable.
+#
+# Writes under $REPO_ROOT, which IS bind-mounted, unlike obelisk's own ROS_LOG_DIR: that
+# lives in the container's writable layer and `stop.sh --down` destroys it.
+obk_bag_cmd() {
+    local tag="${1:-run}"
+    local dir="\$REPO_ROOT/transfer/obelisk/log/bags/\$(date +%Y-%m-%d_%H-%M-%S)_${tag}"
+    printf 'mkdir -p "$(dirname %s)" && ros2 bag record -s mcap -o %s %s' \
+        "$dir" "$dir" "${OBK_BAG_TOPICS[*]}"
 }
 
 # obk_pane <name> <command>: pane that SEEDS the command in history (Up then Enter to run).
@@ -177,6 +283,33 @@ control:
     params:
       hf_policy_folder: "${folder}"
 EOF
+    printf '%s' "$f"
+}
+
+# obk_clip_config <base_abs_config> <case> <clip> <start_time> <ego>: write a temp controller
+# config overriding only the debug-clip selection. Empty arguments are omitted, so the base
+# config's value survives -- which is why every field is emitted conditionally rather than
+# with a default restated here (a default in two places is a default that will disagree).
+obk_clip_config() {
+    local base="$1" case="$2" clip="$3" start="$4" ego="$5"
+    local f="/tmp/obk_clip_$(basename "$base")"
+    local cfgname
+    cfgname="$(grep -m1 '^config:' "$base" | awk '{print $2}')"
+    cfgname="${cfgname:-rl_debug_clip}"
+    {
+        echo "# Auto-generated by run_sim_clip.sh. Thin overlay: include the debug-clip"
+        echo "# config and keyed-merge-override ONLY the clip selection."
+        echo "config: ${cfgname}"
+        echo "include:"
+        echo "  - ${base}"
+        echo "control:"
+        echo "  - name: low_level"
+        echo "    params:"
+        [ -n "$case" ]  && echo "      debug_clip_case: \"${case}\""
+        [ -n "$clip" ]  && echo "      debug_clip: \"${clip}\""
+        [ -n "$start" ] && echo "      debug_clip_start_time: ${start}"
+        [ -n "$ego" ]   && echo "      debug_clip_ego_anchor: ${ego}"
+    } >"$f"
     printf '%s' "$f"
 }
 
@@ -293,6 +426,23 @@ obk_stop() {
             echo "[obk] stopping the Jetson ZED node over ssh (best-effort)..."
             "${dc[@]}" exec -T "$OBK_SERVICE" bash -c "$(obk_jetson_stop_cmd)" || true
             "${dc[@]}" exec -T "$OBK_SERVICE" bash -c 'rm -f /tmp/obk_jetson_active 2>/dev/null || true'
+        fi
+        # SIGINT the recorder FIRST and let it finalise. rosbag2 writes metadata.yaml on a
+        # clean shutdown and only then; killed hard, it leaves a directory holding a perfectly
+        # good .mcap that `ros2 bag` refuses to open ("read failed"), recoverable only via
+        # `ros2 bag reindex`. Every bag this stack recorded before this was in that state.
+        # 3 s is generous -- finalising is a summary write, not a flush of the whole file.
+        if "${dc[@]}" exec -T "$OBK_SERVICE" bash -c 'pgrep -f "ros2 bag record" >/dev/null'; then
+            echo "[obk] stopping the bag recorder gracefully (so metadata.yaml is written)..."
+            "${dc[@]}" exec -T "$OBK_SERVICE" bash -c '
+                pkill -INT -f "ros2 bag record" 2>/dev/null || true
+                for _ in $(seq 30); do
+                    pgrep -f "ros2 bag record" >/dev/null || break
+                    sleep 0.1
+                done
+                pgrep -f "ros2 bag record" >/dev/null \
+                    && echo "[obk] recorder still running after 3s; it will be killed -- the bag will need \`ros2 bag reindex\`" \
+                    || true' || true
         fi
         echo "[obk] killing tmux server in container (stops all panes/nodes)..."
         "${dc[@]}" exec -T "$OBK_SERVICE" bash -c 'tmux kill-server 2>/dev/null || true'

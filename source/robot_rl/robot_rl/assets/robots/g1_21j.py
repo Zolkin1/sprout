@@ -41,7 +41,16 @@ ROBOT_ASSETS = str(_find_project_root() / "robot_assets" / "g1")
 G1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
         # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged/g1_21j_box_merged.usda",
-        usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged_29j/g1_21j_box_merged_29j.usda",   # 29 DOF (waist roll/pitch + wrists unlocked)
+        # 29 DOF (waist roll/pitch + wrists unlocked), hands as FIXED-JOINT LINKS.
+        # The "_hands" variant exists because the stock URDF hangs the hand meshes off the
+        # wrist as bare <visual> elements: the importer then gives them a non-identity
+        # mesh->body offset, and MultiMeshRayCaster does not intersect meshes on that path,
+        # so the depth cameras saw every limb except the hands.  Regenerate both with
+        # robot_assets/g1/g1_21j/{make_hand_links_urdf,urdf_to_usd_conversion}.py.
+        # Joint count and ORDER are identical to the pre-hands asset (verified), so
+        # checkpoints trained on it load unchanged; only body_names grows (30 -> 46, the
+        # old list is an exact prefix).
+        usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged_29j_hands/g1_21j_box_merged_29j_hands.usda",
         # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_merged/g1_21j_merged.usda",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(

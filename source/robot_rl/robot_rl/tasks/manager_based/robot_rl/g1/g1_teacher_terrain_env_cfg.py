@@ -71,7 +71,10 @@ class G1TeacherTerrainSceneCfg(G1TeacherSceneCfg):
         collision_group=-1,
         physics_material=sim_utils.RigidBodyMaterialCfg(
             friction_combine_mode="multiply",
-            restitution_combine_mode="multiply",
+            # See G1ClfTrackingSceneCfg: "max" is what makes the restitution DR reach physics
+            # at all. This is the material the teacher ACTUALLY runs on (and the one
+            # __post_init__ copies onto sim), so fixing only the placeholder would do nothing.
+            restitution_combine_mode="max",
             static_friction=1.0,
             dynamic_friction=1.0,
         ),

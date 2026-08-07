@@ -32,6 +32,7 @@ sys.path.insert(0, _TRANSFER)
 
 from deploy import quat_math_np as qn  # noqa: E402
 from deploy import transforms_np as tn  # noqa: E402
+from deploy import window_np as wn  # noqa: E402
 from torch_math import quat_math as qt  # noqa: E402
 
 
@@ -100,18 +101,18 @@ def test_deploy_parity_transforms() -> None:
     vw, ww = torch.randn(n, 3, generator=g, dtype=torch.float64), torch.randn(n, 3, generator=g, dtype=torch.float64)
     jp, jv = torch.randn(n, nj, generator=g, dtype=torch.float64), torch.randn(n, nj, generator=g, dtype=torch.float64)
     p_ref, q_ref = torch.randn(n, 3, generator=g, dtype=torch.float64), _rand_quat(n, g)
+    # Extra frames are position-only in the state vector (see flow_matching.transforms).
     fp = torch.randn(n, K, 3, generator=g, dtype=torch.float64)
-    fq = _rand_quat(n * K, g).reshape(n, K, 4)
-    fl, fa = torch.randn(n, K, 3, generator=g, dtype=torch.float64), torch.randn(n, K, 3, generator=g, dtype=torch.float64)
 
-    rel_t = tt.relative_state(pw, qw, vw, ww, jp, jv, p_ref, q_ref, fp, fq, fl, fa)
+    rel_t = tt.relative_state(pw, qw, vw, ww, jp, jv, p_ref, q_ref, fp)
     rel_np = tn.relative_state(np_(pw), np_(qw), np_(vw), np_(ww), np_(jp), np_(jv), np_(p_ref), np_(q_ref),
-                               np_(fp), np_(fq), np_(fl), np_(fa))
+                               np_(fp))
     _close("relative_state", rel_np, rel_t, atol=1e-9)
+    assert rel_t.shape[-1] == tn.target_state_dim(nj, K) == 2 * nj + 15 + 3 * K
 
     abs_t = tt.state_to_absolute(rel_t, p_ref, q_ref, nj, num_extra_frames=K)
     abs_np = tn.state_to_absolute(rel_np, np_(p_ref), np_(q_ref), nj, num_extra_frames=K)
-    for key in ("root_pos_w", "root_link_lin_vel_w", "frame_pos_w", "frame_lin_vel_w", "joint_pos"):
+    for key in ("root_pos_w", "root_link_lin_vel_w", "frame_pos_w", "joint_pos"):
         _close(f"state_to_absolute[{key}]", abs_np[key], abs_t[key], atol=1e-8)
     # quat fields compared as rotation
     _close("state_to_absolute[root_quat asR]",
@@ -119,7 +120,67 @@ def test_deploy_parity_transforms() -> None:
     print("TRANSFORMS PARITY CHECKS PASSED")
 
 
+def test_deploy_parity_window():
+    """``window_np.world_to_window`` reproduces ``flow_matching.window.world_to_window``.
+
+    The reference window is the representation the policy observes AND the one the
+    generator predicts, so a divergence between the two implementations of it is a
+    sim2real gap that no shape check can see -- both sides produce a correctly-sized
+    observation either way.  The ``base_pose`` block is the sharp edge: both halves are the
+    reference pose in the anchor's frame, and the orientation half is a 6D rotation whose
+    two columns have to come out in the same order on both sides.
+    """
+    wt = pytest.importorskip(
+        "robot_rl.flow_matching.window",
+        reason="needs the isaaclab env for the training-side window oracle",
+        exc_type=ImportError,
+    )
+    g = torch.Generator().manual_seed(1)
+    n, k, nj, K = 6, 11, 21, 4
+    np_ = lambda t: t.detach().numpy()
+
+    act_p = torch.randn(n, 1, 3, generator=g, dtype=torch.float64)
+    act_q = _rand_quat(n, g)[:, None, :]
+    ref_p = torch.randn(n, k, 3, generator=g, dtype=torch.float64)
+    ref_q = _rand_quat(n * k, g).view(n, k, 4)
+    ref_l = torch.randn(n, k, 3, generator=g, dtype=torch.float64)
+    ref_a = torch.randn(n, k, 3, generator=g, dtype=torch.float64)
+    jp = torch.randn(n, k, nj, generator=g, dtype=torch.float64)
+    jv = torch.randn(n, k, nj, generator=g, dtype=torch.float64)
+    ee = torch.randn(n, k, K, 3, generator=g, dtype=torch.float64)
+
+    win_t = wt.world_to_window(act_p, act_q, ref_p, ref_q, ref_l, ref_a, jp, jv, ee)
+    win_np = wn.world_to_window(np_(act_p), np_(act_q), np_(ref_p), np_(ref_q), np_(ref_l),
+                                np_(ref_a), np_(jp), np_(jv), np_(ee))
+    _close("world_to_window", win_np, win_t, atol=1e-9)
+
+    # The layout tables must agree too -- the numpy side restates them, and a silent
+    # disagreement would slice the right width out of the wrong columns.
+    assert wn.window_blocks(nj, K) == [(n_, w) for n_, w in wt.window_blocks(nj, K)]
+    assert wn.window_dim(nj, K) == wt.window_dim(nj, K) == win_t.shape[-1]
+    assert wn.window_block_slices(nj, K) == wt.window_block_slices(nj, K)
+
+    # A teacher may pack a SUBSET, and both sides have to drop the same columns -- the
+    # deploy builds the clip-path window from its tracker's list, so a port that ignored
+    # the selection would hand the policy a differently-shaped (or differently-ordered)
+    # vector than the one it trained on.
+    slim = ("base_pose", "base_vel", "joint_pos")
+    slim_t = wt.world_to_window(act_p, act_q, ref_p, ref_q, ref_l, ref_a, jp, jv, ee,
+                                blocks=slim)
+    slim_np = wn.world_to_window(np_(act_p), np_(act_q), np_(ref_p), np_(ref_q), np_(ref_l),
+                                 np_(ref_a), np_(jp), np_(jv), np_(ee), blocks=slim)
+    _close("world_to_window[slim]", slim_np, slim_t, atol=1e-9)
+    assert wn.window_blocks(nj, K, slim) == [(n_, w) for n_, w in wt.window_blocks(nj, K, slim)]
+    assert wn.window_dim(nj, K, slim) == wt.window_dim(nj, K, slim) == slim_t.shape[-1]
+    assert wn.window_block_slices(nj, K, slim) == wt.window_block_slices(nj, K, slim)
+    # Naming the blocks out of order still packs them in canonical order, on both sides.
+    assert (wn.resolve_reference_blocks(("joint_pos", "base_pose", "base_vel"))
+            == wt.resolve_reference_blocks(("joint_pos", "base_pose", "base_vel")) == slim)
+    print("WINDOW PARITY CHECKS PASSED")
+
+
 if __name__ == "__main__":
     test_deploy_parity_quat_math()
     test_deploy_parity_transforms()
+    test_deploy_parity_window()
     print("ALL DEPLOY-CORE PARITY CHECKS PASSED")

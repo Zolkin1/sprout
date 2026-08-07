@@ -31,17 +31,21 @@ _TRANSFER = os.path.dirname(_OBELISK_ROOT)
 sys.path.insert(0, _TRANSFER)
 
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
-from deploy.hardware import fetch_artifacts  # noqa: E402
+from deploy.hardware import DEFAULT_HF_REPO_ID, fetch_artifacts  # noqa: E402
 
-#: Where the controller looks; must match g1_control/controller.py's cache path.
+#: Where the controller looks; must equal ``g1_control.controller.HF_CACHE_DIR``. Both are
+#: built from the same anchor (``<repo>/transfer``) in the same way, which is the only reason
+#: they can be trusted to agree -- importing the constant from here would drag in rclpy and
+#: the obelisk ROS stack, which this script deliberately does not need.
 DEFAULT_CACHE = os.path.join(_OBELISK_ROOT, "g1_control", "resource", "hf_cache")
 
 
 def main() -> None:
     """Download and validate the policy pair into the controller's cache."""
     parser = argparse.ArgumentParser(description="Pre-warm the on-robot policy cache.")
-    parser.add_argument("--hf_repo_id", default="zolkin/robot-rl-policies",
-                        help="HuggingFace repo id; must match the controller config.")
+    parser.add_argument("--hf_repo_id", default=DEFAULT_HF_REPO_ID,
+                        help=f"HuggingFace repo id; must match the controller config. "
+                             f"Defaults to {DEFAULT_HF_REPO_ID}.")
     parser.add_argument("--hf_policy_folder", required=True,
                         help="Folder within the repo, as set in the controller config.")
     parser.add_argument("--cache_root", default=DEFAULT_CACHE,

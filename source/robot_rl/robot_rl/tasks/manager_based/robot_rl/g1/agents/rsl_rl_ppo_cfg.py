@@ -100,7 +100,13 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
 
     num_steps_per_env = 24
     max_iterations = 10000
-    save_interval = 200
+    # A checkpoint is ~98 MB, so this is the dominant consumer of log storage: at the old
+    # 200 a full run wrote ~10 GB and the archive had reached 3500 checkpoints / 92 GB.
+    # 400 halves that while keeping the exposure on a crash under an hour (~55 min at the
+    # ~8.3 s/iter measured at 8192 envs), which matters more than the disk -- do NOT push
+    # this much higher just to save space. Thin FINISHED runs instead; keeping the last few
+    # plus a milestone every 2000 recovers ~85% without touching crash resilience.
+    save_interval = 400
     experiment_name = "g1"
     empirical_normalization = False
     logger = "wandb"
@@ -122,6 +128,34 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     obs_groups = {
         "actor": ["policy", "reference"],
         "critic": ["critic"],
+    }
+
+
+@configclass
+class FmTrackerPlayRunnerCfg(PPORunnerCfg):
+    """Play-only runner for the flow-matching tracker: **the critic is vestigial**.
+
+    Nothing trains in that task -- the policy is the teacher, already trained -- so the
+    value function is never evaluated, and ``play.py`` does not load its weights. Its
+    observation set is pointed at ``policy`` purely so rsl-rl can still construct one; the
+    tracker env has no privileged ``critic`` group to give it (see
+    :class:`~..g1_tracker_env_cfg.G1TrackerObservationsCfg`).
+
+    That is what makes this task teacher-agnostic. The actor's two groups have the same
+    layout under either ``tracking_mode``, so with the critic out of the shape contract, a
+    body-mode teacher and a joint-mode teacher both load here unchanged -- where before, a
+    body-mode checkpoint was rejected on the critic's width alone.
+    """
+
+    load_critic = False
+    """Skip restoring ``critic_state_dict`` (``play.py`` honours this).
+
+    A plain attribute rather than a field of the rsl-rl base cfg, which has no such knob.
+    """
+
+    obs_groups = {
+        "actor": ["policy", "reference"],
+        "critic": ["policy"],
     }
 
 

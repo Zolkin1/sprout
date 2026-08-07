@@ -8,11 +8,14 @@ in their metadata, so there is no sidecar YAML to keep in sync (and no ``policy.
 hardware runtime is torch-free).  ``transfer/deploy/hardware.load_gen_tracker_from_hf``
 is the consumer, and it expects exactly this ``<folder>/{tracker.onnx,fm.onnx}`` layout.
 
-Produce the artifacts first with ``export_deploy_onnx.py`` (which itself wants a
-``play.py``-exported ``policy.pt``), then::
+Produce the artifacts first with ``play.py`` (which writes ``exported/tracker.onnx``,
+and ``exported/fm.onnx`` when given ``--fm_checkpoint``), then::
 
     python scripts/rsl_rl/export_to_hardware.py \\
-        --run_dir logs/rsl_rl/g1/<run> --hf_repo_id user/repo --folder_name <name>
+        --run_dir logs/rsl_rl/g1/<run> --hf_repo_id user/repo
+
+The repo folder defaults to the run directory's own name, so a deployed policy names the
+run that produced it; pass --folder_name only to override that deliberately.
 
 The pair is LOADED before anything is uploaded, which is the point of doing this here
 rather than with ``huggingface-cli upload``: a tracker and a generator that disagree
@@ -30,6 +33,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, 
 sys.path.insert(0, os.path.join(_REPO_ROOT, "transfer"))
 
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
+from deploy.hardware import DEFAULT_HF_REPO_ID  # noqa: E402
 
 #: What the robot downloads. Both are required: the tracker alone cannot walk.
 ARTIFACTS = ("tracker.onnx", "fm.onnx")
@@ -52,8 +56,8 @@ def validate_pair(exported_dir: str) -> GenTrackerPolicy:
     missing = [n for n in ARTIFACTS if not os.path.exists(os.path.join(exported_dir, n))]
     if missing:
         raise FileNotFoundError(
-            f"{exported_dir} is missing {missing}. Run export_deploy_onnx.py first "
-            "(and play.py before that, to produce exported/policy.pt)."
+            f"{exported_dir} is missing {missing}. Run play.py --fm_checkpoint <ckpt> "
+            "first; it writes both files into <run>/exported/."
         )
     policy = GenTrackerPolicy(*(os.path.join(exported_dir, n) for n in ARTIFACTS))
     policy.load()
@@ -93,21 +97,35 @@ def main() -> None:
         description="Upload tracker.onnx + fm.onnx to HuggingFace for hardware deployment.")
     parser.add_argument("--run_dir", required=True,
                         help="Run directory; uploads from <run_dir>/exported.")
-    parser.add_argument("--hf_repo_id", required=True,
-                        help="HuggingFace repository ID (e.g. 'username/repo-name').")
-    parser.add_argument("--folder_name", required=True,
-                        help="Folder within the repo to upload the two ONNX files to.")
+    parser.add_argument("--hf_repo_id", default=DEFAULT_HF_REPO_ID,
+                        help=f"HuggingFace repository ID (e.g. 'username/repo-name'). "
+                             f"Defaults to {DEFAULT_HF_REPO_ID}, the same constant the "
+                             f"on-robot prefetch reads, so upload and download cannot "
+                             f"drift apart.")
+    parser.add_argument("--folder_name", default=None,
+                        help="Folder within the repo to upload the two ONNX files to. "
+                             "Defaults to the RUN DIRECTORY's own name (timestamp + run "
+                             "name), so the repo folder and the local run are the same "
+                             "string and a deployed policy can be traced back to the run "
+                             "that produced it without a lookup table. Override only to "
+                             "publish under a different name deliberately.")
     parser.add_argument("--dry_run", action="store_true",
                         help="Validate the pair and report, but upload nothing.")
     args = parser.parse_args()
 
-    exported = os.path.join(os.path.abspath(args.run_dir), "exported")
+    run_dir = os.path.abspath(args.run_dir.rstrip("/"))
+    folder_name = args.folder_name or os.path.basename(run_dir)
+    exported = os.path.join(run_dir, "exported")
     print(f"[INFO] Validating {exported}")
     policy = validate_pair(exported)
     print(f"[INFO] Artifact pair is self-consistent:\n{describe(policy)}")
 
     if args.dry_run:
-        print("[INFO] --dry_run: nothing uploaded.")
+        # Name the destination even when uploading nothing: the folder is now DERIVED from
+        # the run dir unless overridden, so a dry run has to show what it resolved to.
+        print(f"[INFO] --dry_run: nothing uploaded. Would upload to "
+              f"{args.hf_repo_id}/{folder_name}/{{tracker.onnx,fm.onnx}}"
+              f"{'' if args.folder_name else '  (folder derived from --run_dir)'}")
         return
 
     from huggingface_hub import HfApi, login, repo_exists, whoami
@@ -125,17 +143,17 @@ def main() -> None:
 
     api = HfApi()
     for name in ARTIFACTS:
-        repo_path = f"{args.folder_name}/{name}"
+        repo_path = f"{folder_name}/{name}"
         api.upload_file(
             path_or_fileobj=os.path.join(exported, name),
             path_in_repo=repo_path,
             repo_id=args.hf_repo_id,
-            commit_message=f"Upload {name} to {args.folder_name}",
+            commit_message=f"Upload {name} to {folder_name}",
         )
         print(f"[INFO] Uploaded {repo_path}")
 
-    print(f"[INFO] Done: https://huggingface.co/{args.hf_repo_id}/tree/main/{args.folder_name}")
-    print(f"[INFO] On the robot, point the controller at folder '{args.folder_name}'.")
+    print(f"[INFO] Done: https://huggingface.co/{args.hf_repo_id}/tree/main/{folder_name}")
+    print(f"[INFO] On the robot, point the controller at folder '{folder_name}'.")
 
 
 if __name__ == "__main__":

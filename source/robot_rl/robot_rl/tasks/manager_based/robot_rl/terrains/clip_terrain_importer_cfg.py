@@ -47,8 +47,20 @@ class ClipTerrainImporterCfg(TerrainImporterCfg):
     size_margin: float = 1.0
     """Extra flat (m) added to the terrain / transition footprints."""
 
-    flat_buffer: float = 2.0
-    """Flat-tile margin (m) on each side beyond the flat clips' bbox."""
+    flat_buffer: float = 20.0
+    """Flat-tile margin (m) on each side beyond the flat clips' bbox.
+
+    20 m purely to be safe. The concern is that a small margin silently bounds the survival
+    metric: the tracker task terminates only on ``time_out`` and ``base_fallen``, so a robot
+    that walks off the platform registers as a fall and is indistinguishable from falling
+    over. A wide margin makes that impossible; it is not a measured optimum.
+
+    Sweeping 2 / 10 / 20 / 40 m produced no effect outside the binomial noise floor, in both
+    closed loop and clip control, so nothing here is tuned -- 20 m just buys margin cheaply.
+
+    The real fix is probably a divergence termination on the tracker (the teacher stops at
+    0.3 m of base error; the tracker has no such term), so survival measures tracking rather
+    than how long until the robot leaves the mesh."""
 
     transition_back_buffer: float = 1.0
     """Flat (m) prepended to each transition tile behind the robot's start."""

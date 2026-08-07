@@ -132,14 +132,44 @@ class _CameraSpec(NamedTuple):
         return self.fov_v_deg - 2.0 * self.fov_crop_deg
 
 
-# PLACEHOLDER extrinsics (pos / pitch), in the torso_link frame.  The intent is a near
-# field covering the ground about to be stepped on and a far field starting where the
-# near one ends; the offsets and pitches still need visual confirmation against a
-# rendered frame (scripts/rsl_rl/verify_depth_self_scan.py --viz kit).  The OPTICS below
-# are datasheet values, not placeholders.
+# Extrinsics (pos / pitch), in the torso_link frame.  The intent is a near field covering
+# the ground about to be stepped on and a far field starting where the near one ends.  The
+# OPTICS are datasheet values throughout.
+#
+# _NEAR is the CALIBRATED lower-camera mount, taken from legged_locomotion_rl branch
+# nav-simple-lidar (make_depth_camera in
+# .../config/common/depth_student_cfg.py, cross-checked against depth_config.yml, the
+# g1_27dof.xml depth_camera_site and build_models.py DEPTH_CAMERA_POS, which are all kept
+# in lock-step there).  Its authored values are pos (0.106799, 0, 0.153426), 65 deg pitch
+# down.
+#
+# THE FRAME IS NOT OURS -- a 54 mm correction is applied.  That pose is authored in the
+# waist-yaw frame AT THE PELVIS ORIGIN: the body they call ``torso_link`` is the waist-yaw
+# link (it carries waist_yaw_joint, is a child of pelvis with no offset, and their real
+# upper torso is a separate ``torso_upper_link``).  Our naming differs -- our
+# ``torso_link`` IS the upper torso:
+#
+#     pelvis_link
+#      \_ waist_yaw_link    (0, 0, 0)                <- their "torso_link"
+#          \_ waist_roll_link (-0.0039635, 0, 0.035)
+#              \_ torso_link  (0, 0, 0.019)          <- their "torso_upper_link", our mount
+#
+# so our mount sits at (-0.0039635, 0, 0.054) from theirs (verified identical in the
+# training USD payloads/base.usda and transfer/sim/robots/g1/g1_29j.xml; the logo_link geom
+# at (0.0039635, 0, -0.054) in our torso frame is the same offset inverted).  Subtracting
+# it gives the values below.  Taking the published numbers verbatim would sit the camera
+# 54 mm too high and 4 mm too far forward.
+#
+# The OPTICS are deliberately NOT taken from that reference: its calibrated intrinsics
+# (30x26, fx 25.9928, fy 27.8703, cx 14.9936, cy 12.9966) describe a ~60 x 50 deg frustum,
+# i.e. a much narrower lens than the wide module below.  Only the MOUNT transfers.
+#
+# _FAR is still a PLACEHOLDER -- no calibrated pose exists for the top camera yet, so its
+# offset and pitch need visual confirmation against a rendered frame
+# (scripts/rsl_rl/verify_depth_self_scan.py --viz kit).
 _NEAR = _CameraSpec(
-    pos=(0.10, 0.0, 0.05),
-    pitch_deg=75.0,
+    pos=(0.1107625, 0.0, 0.0994260),
+    pitch_deg=65.0,
     focal_length_mm=2.2,
     fov_h_deg=110.0,     # physical 110 x 80 -> 117.8 deg diagonal
     fov_v_deg=80.0,
@@ -500,8 +530,13 @@ class G1TeacherTerrainDepthImageEnvCfg(G1TeacherTerrainDepthEnvCfg):
 # PLAY variants -- inherit the terrain teacher's play trims, then add depth ones.
 # ---------------------------------------------------------------------------
 
-def _apply_depth_play_trims(cfg) -> None:
+def apply_depth_play_trims(cfg) -> None:
     """Disable depth randomisation and draw both cameras' rays.
+
+    Public because the FM tracker's depth play variant
+    (``g1_tracker_env_cfg.G1FmTrackerTerrainDepthPlayEnvCfg``) needs the same trims: it
+    derives from the depth teacher rather than from the play class below, so it cannot
+    inherit them.
 
     Args:
         cfg: The play env cfg to trim, modified in place.
@@ -528,7 +563,7 @@ class G1TeacherTerrainDepthEnvCfgPlay(G1TeacherTerrainBodyEnvCfgPlay):
 
     def __post_init__(self):
         super().__post_init__()
-        _apply_depth_play_trims(self)
+        apply_depth_play_trims(self)
 
 
 @configclass

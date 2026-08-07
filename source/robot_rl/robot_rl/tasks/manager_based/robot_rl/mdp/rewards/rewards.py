@@ -79,6 +79,11 @@ def command_lin_vel_xy_tracking_exp(
     the velocity-convention note on :class:`FmTrackingCommand`).  Paired
     with :func:`command_ang_vel_z_tracking_exp` for yaw.  Requires a clip library
     carrying ``target_vel``.
+
+    NOT REGISTERED by any task right now: the teacher dropped both velocity terms because
+    its CLF already grades the base twist against the reference, and grading the command
+    again was re-scoring the same quantity through a softer lens.  Kept because the
+    tracker may want them back -- see ``G1TeacherRewardCfg``.
     """
     cmd = env.command_manager.get_term(command_name)
     target_vel = cmd.get_command_velocity()  # [N, 3] = (vx, vy, wz)
@@ -103,6 +108,9 @@ def command_ang_vel_z_tracking_exp(
     the CoM yaw rate, but kept link-frame for convention consistency).  Paired
     with :func:`command_lin_vel_xy_tracking_exp` for planar velocity.  Requires a
     clip library carrying ``target_vel``.
+
+    NOT REGISTERED by any task right now -- see the note on
+    :func:`command_lin_vel_xy_tracking_exp`.
     """
     cmd = env.command_manager.get_term(command_name)
     target_vel = cmd.get_command_velocity()  # [N, 3] = (vx, vy, wz)

@@ -101,3 +101,103 @@ def dump_params_yaml(path: str, obj: Any) -> None:
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as f:
         yaml.safe_dump(obj, f, default_flow_style=False, sort_keys=False)
+
+
+#: Filename, under a run's ``params/``, recording the CODE-level conventions its checkpoints
+#: are only meaningful against. Separate from ``env.yaml`` because these are constants in the
+#: source, not configclass fields -- ``env.yaml`` is byte-identical across a convention change.
+RUN_CONVENTIONS_FILE = "conventions.yaml"
+
+
+def run_conventions(env_cfg: Any = None) -> dict:
+    """The conventions a trained checkpoint is only valid under.
+
+    ``base_pose_convention`` is the load-bearing one: it names the frame and direction of the
+    reference window's ``base_pose`` block. Changing it alters what the observation MEANS
+    without changing its width, so a stale policy loads clean and steers wrong -- which is
+    exactly the failure this file exists to make loud.
+
+    The re-plan cadences are recorded alongside it because the generator's history is a slice
+    of one plan's tail, so they are part of what a checkpoint assumes.
+
+    Args:
+        env_cfg: The environment config, if available; its ``commands.traj_ref`` cadences are
+            read when present. ``None`` records the code constants alone.
+
+    Returns:
+        A YAML-serializable dict.
+    """
+    from robot_rl.flow_matching.window import BASE_POSE_CONVENTION  # noqa: PLC0415
+
+    out: dict = {"base_pose_convention": BASE_POSE_CONVENTION}
+    traj = getattr(getattr(env_cfg, "commands", None), "traj_ref", None)
+    for field in ("fm_snap_every", "ego_anchor_every", "fm_update_every"):
+        value = getattr(traj, field, None)
+        if value is not None:
+            out[field] = int(value)
+    return out
+
+
+def dump_run_conventions(log_dir: str, env_cfg: Any = None) -> dict:
+    """Write :func:`run_conventions` into ``<log_dir>/params/``. Returns what was written."""
+    conv = run_conventions(env_cfg)
+    dump_params_yaml(os.path.join(log_dir, "params", RUN_CONVENTIONS_FILE), conv)
+    return conv
+
+
+def check_run_conventions(log_dir: str, env_cfg: Any = None) -> None:
+    """Refuse to load a run whose recorded conventions disagree with this code.
+
+    HARD refusal, including when the file is absent: a run written before this existed was
+    trained under an older convention, and "no record" is not evidence of agreement. The
+    alternative -- defaulting to the current value when the key is missing -- is what let a
+    stale artifact through on the deploy path until it was tightened, and it is safe only
+    while exactly one convention has ever existed.
+
+    Cadence differences are REPORTED, not refused: overriding the re-plan period at play time
+    is a legitimate experiment, and it changes behaviour visibly rather than silently.
+
+    Args:
+        log_dir: The run directory being loaded (the one holding ``params/``).
+        env_cfg: The environment config about to be built, for the cadence comparison.
+
+    Raises:
+        ValueError: If the record is missing, unreadable, or names a different
+            ``base_pose_convention``.
+    """
+    import yaml  # noqa: PLC0415
+
+    path = os.path.join(log_dir, "params", RUN_CONVENTIONS_FILE)
+    want = run_conventions(env_cfg)
+    if not os.path.isfile(path):
+        raise ValueError(
+            f"{path} is missing, so this run does not record which observation conventions it "
+            f"was trained under. It predates the record, which means it was trained under an "
+            f"older convention -- not the current "
+            f"{want['base_pose_convention']!r}. The reference window's base_pose block has the "
+            "same WIDTH under every convention, so loading it anyway would run a policy whose "
+            "observation means something different, with no visible symptom.\n"
+            "  * To play a pre-convention run, check out the commit it was trained at "
+            "(git tag pre-yaw-frame is the last full-rotation one).\n"
+            "  * To adopt it deliberately, write the file yourself with the convention that "
+            "run actually used."
+        )
+    try:
+        got = yaml.safe_load(open(path)) or {}
+    except Exception as exc:  # noqa: BLE001 - a corrupt record is a refusal, not a warning
+        raise ValueError(f"{path} could not be read ({exc}); refusing to guess the convention.")
+
+    if got.get("base_pose_convention") != want["base_pose_convention"]:
+        raise ValueError(
+            f"This run was trained with base_pose_convention "
+            f"{got.get('base_pose_convention')!r}, but this code implements "
+            f"{want['base_pose_convention']!r}. The observation has the same width under both, "
+            "so the policy would load clean and steer wrong. Check out the commit the run was "
+            "trained at (git tag pre-yaw-frame is the last full-rotation one), or retrain."
+        )
+    drift = {k: (got.get(k), v) for k, v in want.items()
+             if k != "base_pose_convention" and got.get(k) is not None and got.get(k) != v}
+    if drift:
+        print("[WARN] re-plan cadences differ from the trained run (trained -> now): "
+              + ", ".join(f"{k} {a} -> {b}" for k, (a, b) in drift.items())
+              + ". Behaviour will differ; this is allowed as a deliberate override.")

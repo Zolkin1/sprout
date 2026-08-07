@@ -26,7 +26,6 @@ from isaaclab_rl.rsl_rl import (
     RslRlBaseRunnerCfg,
     RslRlVecEnvWrapper,
     export_policy_as_jit,
-    export_policy_as_onnx,
     handle_deprecated_rsl_rl_cfg,
 )
 from isaaclab_rl.utils.pretrained_checkpoint import get_published_pretrained_checkpoint
@@ -38,6 +37,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # local imports
 import cli_args  # isort: skip
+from provenance import check_run_conventions  # isort: skip
 from data_logger import DataLogger  # isort: skip
 from episode_stats import EpisodeStatsAccumulator  # isort: skip
 from play_plots import run_plots, PLOT_REGISTRY  # isort: skip
@@ -113,6 +113,12 @@ parser.add_argument(
     "--agent", type=str, default="rsl_rl_cfg_entry_point", help="Name of the RL agent configuration entry point."
 )
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
+parser.add_argument(
+    "--dr_fingerprint", action="store_true", default=False,
+    help="Print a hash of the per-env domain-randomisation state (joint friction, armature, "
+         "PD gains, default joint pos) after env creation, then continue. Use it to confirm "
+         "that env i is the SAME robot across two runs before comparing them per env -- the "
+         "draws come off the seeded RNG, so a changed --num_envs or event set re-rolls them.")
 parser.add_argument(
     "--use_pretrained_checkpoint",
     action="store_true",
@@ -269,6 +275,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # set the log directory for the environment
         env_cfg.log_dir = log_dir
 
+        # HARD refusal before anything is built: this run's checkpoints are only meaningful
+        # under the observation conventions they were trained with, and a mismatch is
+        # invisible in every shape. Absence counts as a mismatch -- see check_run_conventions.
+        check_run_conventions(log_dir, env_cfg)
+
         # Trajectory-library version check: the saved env.yaml records the
         # portable content fingerprint of the library this policy trained
         # against.  The cfg built from the gym registry has it unset, so inject
@@ -399,6 +410,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # create isaac environment
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
+        # Per-env DR fingerprint. The survival sweep compares env i across runs, which is only
+        # sound if env i is the SAME ROBOT in both -- and the startup DR draws come off the
+        # seeded torch RNG, so anything that shifts that stream (a different --num_envs, an
+        # added/removed event, or a config change that consumes randomness during scene build)
+        # silently re-rolls every env's physics. This prints a hash so that assumption is
+        # checkable rather than assumed: same seed + same fingerprint => env i is comparable.
+        if args_cli.dr_fingerprint:
+            import hashlib
+            import warp as wp
+            _rb = env.unwrapped.scene.articulations["robot"]
+            _parts = []
+            for _name in ("joint_friction", "joint_armature", "joint_stiffness",
+                          "joint_damping", "default_joint_pos"):
+                _v = getattr(_rb.data, _name, None)
+                if _v is None:
+                    continue
+                _a = (wp.to_torch(_v) if not isinstance(_v, torch.Tensor) else _v).detach().cpu().numpy()
+                _parts.append((_name, _a))
+            print("[dr-fingerprint] seed=%s num_envs=%d" % (args_cli.seed, env.unwrapped.num_envs))
+            for _name, _a in _parts:
+                _h = hashlib.sha256(np.ascontiguousarray(_a).tobytes()).hexdigest()[:16]
+                _pe = hashlib.sha256(np.ascontiguousarray(_a[0]).tobytes()).hexdigest()[:8]
+                print(f"[dr-fingerprint]   {_name:20s} shape={tuple(_a.shape)} all={_h} env0={_pe}")
+
         # --- DEBUG: contact sensor ---
         for name, sensor in env.unwrapped.scene.sensors.items():
             if hasattr(sensor, 'body_names'):
@@ -434,7 +469,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-        runner.load(resume_path)
+        # Playing never evaluates the value function, so a runner cfg can opt out of
+        # restoring it (``load_critic = False``). The FM tracker does: it has no privileged
+        # observation group to build a matching critic from, and skipping the load is what
+        # lets ANY teacher checkpoint drive it -- the actor's observation groups are
+        # identical across tracking modes, only the critic's width moves. Actor weights are
+        # still loaded strictly, so a genuine policy mismatch still fails loudly.
+        if getattr(agent_cfg, "load_critic", True):
+            runner.load(resume_path)
+        else:
+            print("[INFO] Skipping the critic (play-only runner): loading actor weights only.")
+            runner.load(resume_path, load_cfg={"actor": True, "critic": False,
+                                               "optimizer": False, "iteration": True, "rnd": True})
 
         # print parameter counts
         if isinstance(runner, DistillationRunner):
@@ -456,13 +502,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner.alg.train_mode()
             print("[INFO] Running policy in torch .train() mode with stochastic actions.")
 
-        # export the trained policy to JIT and ONNX formats
+        # Export the trained policy to TorchScript. NOT to ONNX here: rsl-rl's own ONNX
+        # exporter wrote `policy.onnx` + a `policy.onnx.data` sidecar (weights as external
+        # data, batch axis pinned to 1, no metadata) which nothing in this repo read, and
+        # which sat next to the real deploy artifact `tracker.onnx` looking like an
+        # alternative to it. `tracker.onnx` is the same network re-exported from this
+        # `policy.pt`, but self-contained, batch-dynamic, and carrying the deployment
+        # parameters in its metadata -- see export_tracker_onnx.py below.
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
         if version.parse(installed_version) >= version.parse("4.0.0"):
             # use the new export functions for rsl-rl >= 4.0.0
             runner.export_policy_to_jit(path=export_model_dir, filename="policy.pt")
-            runner.export_policy_to_onnx(path=export_model_dir, filename="policy.onnx")
             policy_nn = None  # Not needed for rsl-rl >= 4.0.0
         else:
             # extract the neural network for rsl-rl < 4.0.0
@@ -479,9 +530,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             else:
                 normalizer = None
 
-            # export to JIT and ONNX
+            # export to JIT only (see above for why no policy.onnx)
             export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-            export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
         _policy_model = runner.alg.student if isinstance(runner, DistillationRunner) else runner.alg.actor
         teacher_model = runner.alg.teacher if isinstance(runner, DistillationRunner) else None
@@ -541,20 +591,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # embedded, so the runner needs no YAML. Done here rather than in a separate step
         # because tracker.onnx needs the policy.pt + policy_parameters.yaml this run just
         # wrote -- exporting them together is what keeps the three in sync.
+        #
+        # NOT wrapped in a try/except. It used to be, and a failure printed a [WARN] and
+        # left a run directory that looks complete but holds a stale fm.onnx (or none) --
+        # which is then what gets benchmarked, sim2sim'd, and uploaded to the robot. A
+        # broken export is a broken export; fail here where it is one line to read.
         if not args_cli.no_deploy_onnx:
-            try:
-                export_tracker_onnx(export_model_dir)
-                _trk = os.path.join(export_model_dir, "tracker.onnx")
-                print(f"[INFO] wrote {_trk} ({os.path.getsize(_trk) / 1e6:.1f} MB)")
-                if args_cli.fm_checkpoint is not None:
-                    fm_out = os.path.join(export_model_dir, "fm.onnx")
-                    export_fm_onnx(args_cli.fm_checkpoint, fm_out)
-                    print(f"[INFO] wrote {fm_out}")
-                else:
-                    print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
-            except Exception as exc:                                        # noqa: BLE001
-                print(f"[WARN] deploy ONNX export failed ({exc}); the run is unaffected. "
-                      f"Re-run export_tracker_onnx.py / export_fm_onnx.py by hand if needed.")
+            export_tracker_onnx(export_model_dir)
+            _trk = os.path.join(export_model_dir, "tracker.onnx")
+            print(f"[INFO] wrote {_trk} ({os.path.getsize(_trk) / 1e6:.1f} MB)")
+            # Truthy, not `is not None`: "" is the documented sentinel for "no generator at
+            # all" (see FmTrackingCommandCfg.fm_checkpoint), valid with reference_source=clip.
+            # Under `is not None` an explicitly empty value got as far as torch.load("") and
+            # died there, so the one configuration that means "no FM" could not be exported
+            # past -- which is what the clip-only survival cell needs.
+            if args_cli.fm_checkpoint:
+                fm_out = os.path.join(export_model_dir, "fm.onnx")
+                export_fm_onnx(args_cli.fm_checkpoint, fm_out)
+                print(f"[INFO] wrote {fm_out}")
+            else:
+                print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
 
         def _ph(name):
             """Phase context (no-op when profiling is off)."""

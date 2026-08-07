@@ -28,6 +28,8 @@ import torch
 import warp as wp
 from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
+from robot_rl.flow_matching.window import resolve_reference_blocks, world_to_window
+
 from .base_trajectory_cmd import BaseTrajectoryCommand
 from motion_gen.joint_names import is_root_frame, root_frame_name
 from motion_gen.sagittal_reflector import NamedReflector, SagittalReflectionConfig
@@ -294,6 +296,11 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._last_reanchor_step = -1
         # True only while _resample_command is running -- see _reanchor_ego_envs.
         self._resampling = False
+        # CLF outputs. Initialised here because ``CommandTerm.compute`` calls
+        # ``_update_metrics`` (which reads them) BEFORE ``_update_command`` (which writes
+        # them), so the very first step of a run would otherwise hit an unset attribute.
+        self.v = torch.zeros(n, device=dev)
+        self.vdot = torch.zeros(n, device=dev)
 
     def _resample_command(self, env_ids) -> None:
         """Reset-time refresh, flagged so the re-anchor sits it out.
@@ -369,7 +376,18 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._wf_world_frames = torch.zeros(self.num_envs, len(self._wf_frames), 13, device=self.device)
 
     def _update_command(self) -> None:
-        """Advance the step, build world-frame desired + measured, update CLF."""
+        """Advance the step, build world-frame desired + measured, update CLF.
+
+        TODO(perf): this term is 13.1 ms/frame, ~10% of the env step -- second only to the
+        observations and the physics themselves.  Profiled with the trained depth_v3 at
+        1024 envs (``play.py --profile``, see the phase table in ``profiling.py``'s report):
+        the instrumented children only account for 7.9 of it (``compute_measured`` 5.4,
+        ``clf`` 1.6, ``desired`` 0.9), so ~5 ms is spread across the uninstrumented steps
+        below -- the re-anchor, the placement refresh and the world lifts, all of which run
+        for EVERY env EVERY step.  Worth a look before touching anything behavioural: it is
+        pure bookkeeping, so any win here is free.  Start by timing the four unlabelled
+        calls individually rather than guessing which one it is.
+        """
         self._advance_step()
         self._reanchor_ego_envs()                  # ego-centric re-anchor snapshot (subset of envs)
         self._refresh_current_placement()          # placement for THIS step's segment mask
@@ -886,6 +904,46 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             ], dim=-1))
         return torch.stack(out, dim=2)  # [N, K, F, 13]
 
+    def reference_window_obs(self, offsets: torch.Tensor, blocks=None) -> torch.Tensor:
+        """The reference window over ``offsets``, in the observation's representation.
+
+        The producer behind ``mdp.reference_window``.  Lives on the command rather than in
+        the observation function because the flow-matching generator predicts this
+        representation *directly*: :class:`~.fm_tracking_cmd.FmTrackingCommand` overrides
+        this to serve its prediction with no world round-trip, in simulation and at deploy
+        alike.  Here -- the clip reference -- the world-frame look-ahead is what exists, so
+        it goes through :func:`~robot_rl.flow_matching.window.world_to_window`.
+
+        Overriding ONE accessor rather than branching inside the observation also keeps the
+        clip/generator swap honest: ``as_clip_reference()`` / ``as_fm_reference()`` flip
+        ``_serving()``, and every look-ahead consumer follows in step.
+
+        Args:
+            offsets: Future step offsets ``[K]`` (``0`` = the current step).
+            blocks: Layout blocks to include; defaults to all of them. A dropped block is
+                not GATHERED either -- the look-ahead accessors are the expensive part here,
+                and the observation manager is the largest phase of the env step.
+
+        Returns:
+            ``[N, K, D]`` window nodes, ``D = window_dim(nj, num_ee_frames, blocks)``.
+        """
+        selected = resolve_reference_blocks(blocks)
+        pos_w, quat_w, lin_w, ang_w = self.get_future_world_base(offsets)   # [N,K,·]
+        if "joint_pos" in selected or "joint_vel" in selected:
+            joint_pos, joint_vel = self.get_future_joint_state(offsets)     # [N,K,nj]
+        else:
+            joint_pos = joint_vel = pos_w.new_zeros(pos_w.shape[:2] + (0,))
+        if "ee_pos" in selected:
+            ee_w = self.get_future_world_frames(self.resolve_ee_frames(None), offsets)
+        else:
+            ee_w = pos_w.new_zeros(pos_w.shape[:2] + (0, 13))
+        root_pos_w = wp.to_torch(self.robot.data.root_pos_w)[:, None, :]    # [N,1,3]
+        root_quat_w = wp.to_torch(self.robot.data.root_quat_w)[:, None, :]  # [N,1,4] xyzw
+        return world_to_window(
+            root_pos_w, root_quat_w, pos_w, quat_w, lin_w, ang_w,
+            joint_pos, joint_vel, ee_w[..., 0:3], blocks=selected,
+        )
+
     # ------------------------------------------------------------------
     # World-frame reference (for reset placement, obs, termination)
     # ------------------------------------------------------------------
@@ -1274,11 +1332,14 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         )
         return self._tb_idx
 
-    def _obs_window_offsets(self) -> torch.Tensor | None:
+    def obs_window_offsets(self) -> torch.Tensor | None:
         """Step offsets of the ``reference_window`` observation, read from the obs manager.
 
-        Read from the live term rather than restated in this cfg, so the drawn ribbon cannot
-        drift from the window the policy is actually fed.  ``None`` if no such term exists.
+        Read from the live term rather than restated in a cfg, so no consumer can drift from
+        the window the policy is actually fed.  ``None`` if no such term exists.
+
+        Two consumers: the debug ribbon, and ``mdp.clip_end_reached``, which truncates this
+        far before the clip's last frame so the observed window never saturates on it.
         """
         cached = getattr(self, "_obs_win_offsets", "unset")
         if cached != "unset":
@@ -1289,9 +1350,12 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             for group, terms in om.active_terms.items():
                 if "reference_window" in terms:
                     p = om._group_obs_term_cfgs[group][list(terms).index("reference_window")].params
-                    ns = max(1, int(p.get("num_steps", 11)))
-                    st = max(1, int(p.get("stride", 5)))
-                    self._obs_win_offsets = torch.arange(ns, device=self.device, dtype=torch.long) * st
+                    # No default: the term itself requires ``offsets``, so a missing key
+                    # means the cfg is broken, and falling back to a guessed window would
+                    # silently reserve the wrong truncation margin.
+                    self._obs_win_offsets = torch.tensor(
+                        [int(o) for o in p["offsets"]], device=self.device, dtype=torch.long
+                    )
                     break
         except Exception as exc:
             print(f"[WARN MotionSequenceCommand] could not read reference_window params: {exc}")
@@ -1306,6 +1370,25 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """
         return None
 
+    def _scene_alive(self) -> bool:
+        """Whether the env still has a scene, i.e. whether it is safe to draw.
+
+        The debug-vis callback is an Omniverse event subscription, and it fires once more
+        while the app shuts down -- AFTER ``env.close()`` has dropped ``env.scene``. Anything
+        in the draw path that reaches back through the env then raises, and because the
+        exception surfaces inside a ``weakref.proxy`` lambda the manager only prints it. The
+        run still exits 0, so it is pure noise -- but a full traceback on every play run is
+        exactly what hides a real one later.
+
+        ``ManagerBase`` exposes ``num_envs`` and ``device`` as properties that dereference
+        ``self._env``, so this cannot be replaced by caching one value; the guard has to sit
+        in front of the draw.
+
+        Returns:
+            True while the scene exists, False once it has been torn down.
+        """
+        return getattr(self._env, "scene", None) is not None
+
     def _debug_vis_callback(self, event) -> None:
         """Draw the upcoming reference ribbon as cylinder segments per env.
 
@@ -1316,6 +1399,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         z-scaled to the segment length.  The prototype index selects the
         frame's colour.
         """
+        if not self._scene_alive():
+            return
         if self._debug_markers is None:
             if not self._debug_vis_pending:
                 return
@@ -1325,27 +1410,27 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             self._debug_markers.set_visibility(True)
             self._debug_vis_pending = False
 
-        # Optionally restrict the ribbon to a subset of envs (e.g. drop envs that
-        # are tracking a different reference). Subselect every per-env quantity so
-        # the batched lift stays aligned; hide the markers if no env qualifies.
+        # Optionally restrict the CLIP ribbon to a subset of envs (e.g. drop envs that are
+        # tracking a different reference). Subselect every per-env quantity so the batched
+        # lift stays aligned. An empty selection suppresses the clip cylinders ONLY -- the
+        # observed-window ribbon and the tracked-body spheres below are about what the policy
+        # sees and what the reward grades, which exist whatever the reference source is.
         mask = self._clip_ribbon_env_mask()
-        if mask is not None:
-            env_ids = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-            if env_ids.numel() == 0:
-                self._debug_markers.set_visibility(False)
-                return
-            self._debug_markers.set_visibility(True)
-            step, clip_id = self._step[env_ids], self.clip_id[env_ids]
-        else:
-            env_ids = None
-            step, clip_id = self._step, self.clip_id
+        env_ids = None if mask is None else torch.nonzero(mask, as_tuple=False).squeeze(-1)
+        sub = slice(None) if env_ids is None else env_ids
+        step, clip_id = self._step[sub], self.clip_id[sub]
+        self._debug_markers.set_visibility(True)
 
         n = step.shape[0]
         T = self.manager.num_steps
         F = len(self._debug_frame_pos_idx)
+        if F == 0:
+            return
         steps = (step[:, None] + self._debug_offsets[None, :]).clamp(max=T - 1)          # [n, Ns]
         ns = steps.shape[1]
-        if F == 0 or n == 0 or ns < 2:
+        draw_clip = n > 0 and ns >= 2
+        if not draw_clip:
+            self._draw_obs_and_bodies(F, None)
             return
         cid = clip_id[:, None].expand(n, ns)                                            # [n, Ns]
 
@@ -1401,27 +1486,43 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         )
         centers, quats = centers.reshape(-1, 3), quats
         scales, marker_indices = scales.reshape(-1, 3), marker_indices
+        self._draw_obs_and_bodies(F, (centers, quats, scales, marker_indices))
+
+    def _draw_obs_and_bodies(self, num_frames: int, clip_ribbon) -> None:
+        """Append the observed-window ribbon to the clip ribbon, visualize, draw the bodies.
+
+        Split out of :meth:`_debug_vis_callback` so it still runs when the clip ribbon is
+        suppressed (see ``_clip_ribbon_env_mask``): the observed window and the tracked-body
+        pairs describe the policy and the reward, not the clip, and are exactly what you want
+        to see on a generator-driven env. Both are drawn for EVERY env -- unlike the clip
+        ribbon they are per-env independent, so there is nothing to subselect for alignment.
+
+        Args:
+            num_frames: Reference-frame count; also the observed-ribbon prototype index.
+            clip_ribbon: ``(centers, quats, scales, marker_indices)`` from the clip ribbon,
+                or ``None`` when it was not drawn.
+        """
+        parts = list(clip_ribbon) if clip_ribbon is not None else None
 
         # The policy's observed reference-window base, as a second ribbon. Anchored, so it
         # rides the robot; its offset from the global clip ribbon is the drift.
-        obs_off = self._obs_window_offsets() if self.cfg.debug_vis_obs_window else None
+        obs_off = self.obs_window_offsets() if self.cfg.debug_vis_obs_window else None
         if obs_off is not None and obs_off.numel() >= 2:
             opos, _, _, _ = self.get_future_world_base(obs_off)                     # [N, K, 3]
-            if env_ids is not None:
-                opos = opos[env_ids]
-            oc, oq, os_, oi = self._ribbon_segments(opos, F)                        # prototype F
-            centers = torch.cat([centers, oc], dim=0)
-            quats = torch.cat([quats, oq], dim=0)
-            scales = torch.cat([scales, os_], dim=0)
-            marker_indices = torch.cat([marker_indices, oi], dim=0)
+            oc, oq, os_, oi = self._ribbon_segments(opos, num_frames)               # prototype F
+            if parts is None:
+                parts = [oc, oq, os_, oi]
+            else:
+                parts = [torch.cat([a, b], dim=0) for a, b in zip(parts, (oc, oq, os_, oi))]
 
-        self._debug_markers.visualize(
-            translations=centers,
-            orientations=quats,
-            scales=scales,
-            marker_indices=marker_indices,
-        )
-        self._draw_body_spheres(env_ids)
+        if parts is None:
+            self._debug_markers.set_visibility(False)
+        else:
+            self._debug_markers.visualize(
+                translations=parts[0], orientations=parts[1],
+                scales=parts[2], marker_indices=parts[3],
+            )
+        self._draw_body_spheres(None)
 
     def _ribbon_segments(self, pts: torch.Tensor, proto: int):
         """Cylinder segments joining consecutive points of a ``[n, K, 3]`` polyline.

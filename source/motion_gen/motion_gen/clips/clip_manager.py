@@ -59,11 +59,46 @@ class MotionClipManager(ManagerBase):
         # clips without a per-step schedule this broadcasts the per-clip mask across T, so
         # re-anchoring reads one uniform [N, T] regardless of clip type.
         self.anchor_mask_t: torch.Tensor = lib.anchor_mask_per_step(self.device)  # [num_clips, T] uint8
+        # Last frame of each clip's terrain-PINNED run -- the end of its terrain sequence.
+        self.terrain_end_step: torch.Tensor = self._compute_terrain_end_step()    # [num_clips] long
 
         # Per-env phase carrier (set by the owning command each step so the
         # base ``_update_command`` can read ``manager.phase``).  Allocated by
         # the command via :meth:`ensure_state`.
         self.phase: torch.Tensor | None = None
+
+    def _compute_terrain_end_step(self) -> torch.Tensor:
+        """Last frame index of each clip's terrain-PINNED run.
+
+        A transition or box clip is a sandwich -- ego approach, a pinned run over the
+        terrain (the stair climb, the box mount or dismount), then ego walking on the raised
+        top or away from it.  Only the middle run is registered to the terrain geometry, so
+        its last frame is the end of the clip's terrain sequence.  Clips with no pinned frame
+        at all (flat, distractors) report ``clip_len - 1``, which makes every consumer a
+        no-op for them rather than needing a special case.
+
+        Two things this must get right, both of which have a wrong-but-plausible shortcut:
+
+        * it reads :attr:`anchor_mask_t`, which is ``ClipLibraryData.anchor_mask_per_step``
+          and has already resolved the ``255 = unset`` sentinel against the per-clip mask.
+          The RAW ``anchor_mask_t`` dataset must never be used here -- in its low 6 bits
+          ``255`` is indistinguishable from "every DOF free".
+        * it masks by :attr:`clip_len` first.  Clips are repeat-last padded, so the tail
+          repeats the final valid mask; an unmasked reverse scan would run a clip that ends
+          pinned all the way out to ``num_steps - 1``.
+
+        Returns:
+            ``[num_clips]`` long tensor on the library device.
+        """
+        from ..world_lift import anchor_mask_is_pinned
+
+        dev = self.anchor_mask_t.device
+        t = self.anchor_mask_t.shape[1]
+        valid = torch.arange(t, device=dev).unsqueeze(0) < self.clip_len.to(dev).unsqueeze(1)
+        pinned = anchor_mask_is_pinned(self.anchor_mask_t) & valid   # [N, T]
+        # Reverse argmax = index of the LAST True; flip the index back into forward order.
+        last = (t - 1) - torch.argmax(pinned.flip(1).to(torch.uint8), dim=1)
+        return torch.where(pinned.any(dim=1), last, self.clip_len.to(dev) - 1).long()
 
     # ------------------------------------------------------------------
     # ManagerBase surface used at command construction
@@ -178,6 +213,14 @@ class MotionClipManager(ManagerBase):
         per-clip mask broadcast across the clip length).
         """
         return self.gather(self.anchor_mask_t, clip_id, step)
+
+    def gather_terrain_end_step(self, clip_id: torch.Tensor) -> torch.Tensor:
+        """Return the last terrain-PINNED frame ``[N]`` long for each env's clip.
+
+        Step-invariant, so this takes only ``clip_id``.  Follows the same CPU-lib / CUDA-env
+        device shuttle as :meth:`gather`.  See :meth:`_compute_terrain_end_step`.
+        """
+        return self.terrain_end_step[clip_id.to(self.terrain_end_step.device)].to(clip_id.device)
 
     # ------------------------------------------------------------------
     # ManagerBase abstract methods (trivial for fixed clips; the command's

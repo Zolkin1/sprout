@@ -145,9 +145,11 @@ python scripts/rsl_rl/play.py --task=G1-teacher-clf-terrain-play \
     --load_run <run_dir> --clip clips/g1_mb_v5.h5 --clip_device cpu
 ```
 
-`play.py` also writes the deploy artifacts: `exported/policy.pt`, `policy.onnx`,
+`play.py` also writes the deploy artifacts: `exported/policy.pt`,
 `policy_parameters.yaml`, and (with `--fm_checkpoint`) `tracker.onnx` + `fm.onnx`. Pass
-`--no_deploy_onnx` to skip the ONNX pair.
+`--no_deploy_onnx` to skip the ONNX pair. `tracker.onnx` is the ONLY ONNX form of the
+tracker — it is `policy.pt` re-exported self-contained, batch-dynamic and with the
+deployment parameters embedded, and it is what MuJoCo and the robot load.
 
 ### 3. Train the flow-matching generator
 
@@ -198,6 +200,45 @@ python scripts/rsl_rl/debug_episodes.py --task G1-teacher-clf-terrain-play ... -
 python scripts/rsl_rl/view_debug_episodes.py bundle.npz     # viser replay + plots, no Isaac
 ```
 
+#### Debugging the generator: `fm_debug.py`
+
+When the tracker follows the clips well but degrades on the FM, this is the tool. It freezes
+**three** clips (a stair transition, a flat walk, a box jump-up) into a small library, rolls
+the tracker over them twice, plots both, and replays both in viser:
+
+```bash
+python scripts/rsl_rl/fm_debug.py --lib clips/g1_mb_v5_body.h5 \
+    --checkpoint logs/rsl_rl/g1/<teacher>/model_XXXX.pt \
+    --fm_checkpoint logs/flow_matching/<fm_run>/best.pt
+# then iterate without touching the GPU:
+python scripts/rsl_rl/fm_debug.py --stage plot --out logs/fm_debug/<run>
+python scripts/rsl_rl/fm_debug.py --stage view --out logs/fm_debug/<run>
+```
+
+The two rollouts differ in exactly one field, `commands.traj_ref.reference_source`:
+
+* **`clip`** — the policy tracks the pre-made clip (the known-good baseline) while the
+  generator runs **passively** every step and its output is recorded. So both references are
+  evaluated at *identical* robot states, and a difference between them is the generator's
+  rather than a consequence of the robot having already diverged.
+* **`fm`** — the policy tracks the generator, from the same spawn pose and the same
+  `target_vel` profile.
+
+Everything is persisted in `<out>/fm_debug.json`, so no argument is retyped across stages
+(and no two stages can disagree). Read the output in this order: `contract_<mode>.txt`
+(the pre-rollout agreement report — checkpoint vs live obs layout, horizon vs window,
+generator frames vs command frames, the depth-camera contract),
+`plots/<mode>/obs_clip_fm_diff_env*.csv` (the reference-observation columns where the two
+sources diverge most, ranked), `plots/compare/` (where the rollouts part), then the viewer.
+
+In viser, the load-bearing comparison is the **FM horizon** layer against the **reference
+window** layer: the window is the generator's prediction after the whole conversion chain
+(world lift → base-relative differencing → observation packing) and back, so they must
+coincide. A constant offset or a yaw twist between them is a frame bug in
+`mdp.reference_window`; agreement moves the search to the generator itself. `--corrupt_obs`
+re-enables training-time observation noise, which the play trims switch off, so the
+"observed" window variant shows how much of the reference the noise eats.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.
@@ -222,7 +263,7 @@ flat task.
 | `G1-teacher-clf-terrain-play` | Play / record / export the teacher. One env per terrain tile. |
 | `G1-teacher-clf-terrain-sym` | Symmetry-augmented training. **Currently broken — see below.** |
 | `G1-teacher-clf-terrain-sym-play` | Play variant of the above. **Currently broken.** |
-| `G1-tracker-clf-fm-terrain-play` | Closed-loop deploy: the teacher tracks the FM predicted from live robot state. **Currently broken — see below.** |
+| `G1-tracker-clf-fm-terrain-play` | Closed-loop deploy: the teacher tracks the FM predicted from live robot state. |
 
 There is no separate tracker *training* task — the tracker policy **is** the teacher.
 
@@ -233,11 +274,15 @@ The teacher's actor takes **two** observation groups and routes them to two bran
 | Group | Contents | Path |
 |---|---|---|
 | `policy` | 5 proprioception terms, each stacked over `PROPRIO_HISTORY_LENGTH` = 10 consecutive 50 Hz control steps (current + 9 back), plus the height scan (no history) | straight to the trunk |
-| `reference` | `reference_window` (base pose/vel + joint pos/vel + ee positions at `REFERENCE_NUM_STEPS` = 11 samples, `REFERENCE_STRIDE` = 5 steps apart → 0.0 … 1.0 s) and the clean `command_window` | through a `[1024, 512, 512]` MLP encoder |
+| `reference` | `reference_window` (base pose/vel + joint pos/vel + ee positions at the 13 `REFERENCE_OFFSETS` = `0, 1, 2, 5, 10, … 50` control steps: the current step, the two right after it, then a 0.1 s tail out to 1.0 s) and the clean `command_window` | through a `[1024, 512, 512]` MLP encoder |
 
-The three constants live at the top of `g1_teacher_env_cfg.py`; setting either count to 1
-degenerates to current-step-only. The critic sees the same history and the same
-(uncorrupted) window, plus the privileged world-frame CLF vectors.
+The constants live at the top of `g1_teacher_env_cfg.py`; `PROPRIO_HISTORY_LENGTH = 1` or
+`REFERENCE_OFFSETS = (0,)` degenerates to current-step-only. `REFERENCE_OFFSETS` is the one
+window contract — the observation, its noise/scale vectors, the truncation margin, the
+generator's required horizon and the exported deploy spec are all derived from it, and the
+`reference` and `critic` groups' two window terms must all declare the same list (the deploy
+runtime refuses a tracker whose two exported specs disagree). The critic sees the same
+history and the same (uncorrupted) window, plus the privileged world-frame CLF vectors.
 
 An **optional** auxiliary loss reconstructs the reference window from the encoder latent.
 It is off by default so it can be ablated, and needs no code change to turn on:
@@ -249,15 +294,51 @@ python scripts/rsl_rl/train.py --task=G1-teacher-clf-terrain --headless --clip <
 
 `AuxPPO` raises if the coefficient is non-zero without `actor.reconstruction=true`.
 
-> **`G1-tracker-clf-fm-terrain-play` does not currently run.** It shares the teacher's
-> observation config, and `reference_window` calls two `FmTrackingCommand` accessors that
-> deliberately raise (`get_future_joint_state` / `get_future_world_frames`) because they
-> would return clip data while the FM drives. Separately, the FM only predicts 0.78 s
-> (`FlowMatchingConfig.future_len = 40`) versus the teacher's 1.0 s window. Reviving it
-> needs both: implement the per-env FM/clip select in `fm_tracking_cmd.py`, then raise
-> `future_len` to ≥ 51 and **re-record + retrain** the FM (windows are cut at record time).
-> The MuJoCo/hardware deploy is blocked on the same change plus observation history in
-> `transfer/deploy/gen_tracker.py:_assemble` — see the TODO there.
+### The generator/clip barrier
+
+`G1-tracker-clf-fm-terrain-play` shares the teacher's observation layout, but the clip
+supplies it only two things: the **reset spawn pose** (and the terrain meshed from the same
+library) and the **`target_vel` command** — the joystick stand-in. Everything the policy
+observes is generated. Enforcing that, rather than assuming it:
+
+- the tracker env has **zero reward terms** and no clip-graded termination (only `time_out`
+  and `base_fallen`);
+- it has **no privileged `critic` observation group at all**, and `play.py` does not restore
+  the critic's weights (`FmTrackerPlayRunnerCfg.load_critic = False`). That group held the
+  last clip-derived observation (`tracking_error_global`, drift against the globally-placed
+  clip), and nothing in a play-only task evaluates a value function. It also makes the task
+  **teacher-agnostic**: the actor's two groups have the same layout under either
+  `tracking_mode`, so a body-mode and a joint-mode teacher both load here — previously a
+  body-mode checkpoint was rejected purely on the critic's width;
+- there is **no clip warmup**: before the history window fills, the generator is sampled with
+  the learned `null_history` embedding it was trained with — the same thing deployment does;
+- `FmTrackingCommandCfg.strict_fm_only` (on by default) fills every `y_des` / `dy_des`
+  channel the FM does not write with **NaN**, so an accidental read of clip-derived data
+  fails immediately instead of quietly tracking the wrong thing.
+
+The generator's horizon is sized from the re-plan period, not guessed:
+
+```
+future_len >= max(REFERENCE_OFFSETS) + 1
+           =  50                     + 1  = 51
+```
+
+There is no `fm_update_every - 1` slack term: the period is pinned to 1, so the requirement
+is exact. Note the bound is the FURTHEST offset, not the sample count — the near samples
+(offsets 1 and 2) cost no horizon at all. `FlowMatchingConfig.future_len = 51`.
+`FmTrackingCommand` re-derives the requirement from the offsets it is actually asked for and
+**raises** if the checkpoint is short — nothing clamps, because a clamp would silently freeze
+the tail of the observed window. The same rule applies at record time (windows whose future
+would cross the clip end are dropped) and in training (`clip_end_reached` truncates one full
+observation window before the clip's last frame).
+
+Observation history off-sim is handled: `_assemble` in `transfer/deploy/gen_tracker.py` pushes
+each term through its own window using the `history_length` the export records, so no consumer
+restates a window length. What is still unimplemented there is the BODY-tracking FM path — a
+tracker trained with `tracking_mode="body"` wants root-frame body targets (`body_pos_ref` /
+`body_vel_ref`), which clip playback supplies but the generator cannot, since turning its
+predicted joint angles into root-frame link poses needs a torch-free FK. `_assemble` raises
+rather than guessing.
 
 > **The two `-sym` tasks do not currently run.** They raise
 > `ValueError: Symmetry augmentation has no handler for obs term ...` at the first PPO
@@ -416,6 +497,25 @@ Both read the artifacts `play.py` exports (`exported/policy_parameters.yaml` +
 `tracker.onnx` / `fm.onnx`), so export before running either. To add a robot, drop its sim
 files in `transfer/sim/robots/` and add a runner.
 
+Neither needs Isaac: on a box without `env_isaaclab`, build the small downstream venv
+(`bash transfer/setup_venv.sh`, see [Other Dependencies](#other-dependencies)) and pull a
+published pair instead of exporting one. `gen_tracker_runner.py` resolves the pair from
+`logs/rsl_rl/<experiment>/<run>/exported/`, so point that at the fetched folder:
+
+```bash
+RUN=<hf folder>                                  # e.g. a run-named folder in zolkin/robot_rl
+python3 transfer/obelisk/scripts/prefetch_policy.py --hf_policy_folder $RUN   # + validates the pair
+mkdir -p logs/rsl_rl/g1/$RUN
+ln -s "$PWD/transfer/obelisk/g1_control/resource/hf_cache/zolkin_robot_rl/$RUN" \
+      logs/rsl_rl/g1/$RUN/exported
+cd transfer/sim && python gen_tracker_runner.py --mode eval --command smooth_ramp_running \
+    --load_run $RUN --robot_name g1_29j --scene basic_scene --headless --total_time 20
+```
+
+The run prints mean FM and tracker inference times every 5 sim seconds. For the numbers
+that decide a deploy box — p50/p95/p99 and `step_worst` against the control period —
+use `transfer/deploy/benchmark.py`, which needs only the two `.onnx` files.
+
 ## Code formatting
 
 We have a pre-commit template to automatically format your code.
@@ -458,10 +558,22 @@ Obelisk folder for further instructions.
 
 
 ## Other Dependencies
-To run the sim2sim transfer, you will to install these dependencies in your conda environment:
-- `pygame`
-- `mujoco`
-- `huggingface_hub`
+Everything under `transfer/` that does **not** import IsaacLab — MuJoCo sim2sim and the
+torch-free ONNX deploy runtime — runs in its own small venv, built from
+`transfer/requirements.txt`:
+
+```bash
+bash transfer/setup_venv.sh          # -> env_transfer/  (uses uv if present, else python3 -m venv)
+source env_transfer/bin/activate
+```
+
+That is the whole install on a box that only plays or benchmarks policies (a Jetson, a
+candidate deploy machine, a laptop): no Isaac Sim, no torch. On a training box
+`env_isaaclab` already has these and you can keep using it.
+
+The venv is CPU-only by default. To run inference on a GPU (`--providers cuda`), swap in
+the matching `onnxruntime-gpu` wheel afterwards — the per-platform recipes, including the
+Jetson ones, are in the GPU section at the bottom of `transfer/requirements.txt`.
 
 ## Updating IsaacLab
 Sometimes you will want to updated the version of IsaacLab you are using. To do this, go to the IsaacLab directory

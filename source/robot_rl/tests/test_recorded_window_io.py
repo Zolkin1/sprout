@@ -39,6 +39,8 @@ def _meta(W: int, H: int, F: int, K: int) -> RecordingMeta:
         ref_future_term_names=["root_pos_w", "root_quat_w", "joint_pos"],
         ref_future_term_dims=[3, 4, 3], height_scan_dim=K,
         format="windowed_h5", history_len=H,
+        reference_blocks=["base_pose", "base_vel", "joint_pos"],
+        history_anchor="plan",
     )
 
 
@@ -72,6 +74,10 @@ def test_writer_roundtrip_bit_exact():
         assert m2.format == "windowed_h5"
         assert m2.state_term_names == meta.state_term_names
         assert m2.state_frame_names == meta.state_frame_names
+        # The recording teacher's window selection: it is what the FM dataset resolves the
+        # generator's WIDTH from, so losing it in the round trip would silently train the
+        # next generator on all five blocks again.
+        assert m2.reference_blocks == meta.reference_blocks
         assert m2.content_sha256 == fingerprint_windows(arrs)
 
 
@@ -124,6 +130,38 @@ def test_optional_arrays_omitted():
             wr.write_batch(batch)
         data, _ = load_recorded_windows(p)
         assert set(data) == {"history_state", "ref_future", "episode_id"}
+
+
+def test_clip_family_needs_tag_families_to_be_stored():
+    """``clip_family`` requires ``tag_families``, the analogue of ``tag_distractors``.
+
+    Regression: the writer declared ``is_distractor`` behind a flag but had no families flag,
+    so ``write_batch`` silently DROPPED the key it was handed and ``train.py --skip_families``
+    could never find a tag to filter on. Asserting the round trip AND the omission, because
+    the failure mode was a silent drop rather than an error.
+    """
+    W, H, F, node = 6, 2, 4, 22
+    meta = _meta(W, H, F, 0)
+    rng = np.random.default_rng(2)
+    fam = np.arange(W, dtype=np.uint8) % 3
+    batch = {
+        "history_state": rng.standard_normal((W, H, node)).astype(np.float32),
+        "ref_future": rng.standard_normal((W, F, node)).astype(np.float32),
+        "episode_id": np.arange(W, dtype=np.int64),
+        "clip_family": fam,
+    }
+    with tempfile.TemporaryDirectory() as d:
+        on = os.path.join(d, "recorded_on.h5")
+        with RecordedWindowWriter(on, W, H, node, F, 0, 0, meta, tag_families=True) as wr:
+            wr.write_batch(batch)
+        data, _ = load_recorded_windows(on)
+        assert np.array_equal(data["clip_family"], fam)
+
+        off = os.path.join(d, "recorded_off.h5")
+        with RecordedWindowWriter(off, W, H, node, F, 0, 0, meta) as wr:
+            wr.write_batch(batch)
+        data_off, _ = load_recorded_windows(off)
+        assert "clip_family" not in data_off
 
 
 def test_depth_roundtrips_alongside_the_height_scan():

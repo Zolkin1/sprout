@@ -5,7 +5,7 @@
 # on the same ROS graph:
 #
 #   hardware -> config/g1_robot_hw.yml   (the real Unitree driver;  run_hardware_low.sh)
-#   sim      -> config/g1_world.yml      (the MuJoCo world;         run_sim_low.sh)
+#   sim      -> config/g1_world.yml      (the MuJoCo world;      run_sim_world.sh)
 #
 # so THIS file is launched unchanged in both cases and there is no sim-vs-hardware fork in
 # the thing being tested. The split also means the world can be restarted without bringing

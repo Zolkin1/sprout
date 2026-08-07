@@ -52,12 +52,16 @@ class SagittalReflectionConfig:
 
     # Per-observation-term sign multipliers (applied via tiling).
     #
-    # ``base_pose_error`` / ``ref_base_vel`` are 6-vectors laid out as
-    # [linear xyz, angular xyz]: the linear part mirrors like a position/lin-vel
-    # (negate y) and the angular part like an axial vector / ang-vel (negate
-    # roll + yaw).  For ``base_pose_error`` the angular half is the
-    # ``quat_box_minus`` rotation-vector tangent, which is the same axial-vector
-    # kind already handled for ``base_ang_vel`` / ``root_quat``.
+    # ``ref_base_vel`` is a 6-vector laid out as [linear xyz, angular xyz]: the linear
+    # part mirrors like a position/lin-vel (negate y) and the angular part like an axial
+    # vector / ang-vel (negate roll + yaw).
+    #
+    # ``base_pose_error`` is DORMANT -- no observation group carries it any more, and its
+    # entry below is stale: the term is 9 wide now (position + a 6D rotation), and a 6D
+    # rotation does NOT mirror as a sign pattern. Reflecting it means conjugating the
+    # rotation, ``M R M`` with ``M = diag(1, -1, 1)``; see ``features._rot6d``, which
+    # already does exactly that for the motion-matching feature vector. Fix this row (and
+    # add the reference_window handler) before reviving the ``-sym`` tasks.
     obs_term_multipliers: dict[str, list[float]] = field(default_factory=lambda: {
         "base_ang_vel": [-1.0, 1.0, -1.0],
         "base_lin_vel": [1.0, -1.0, 1.0],

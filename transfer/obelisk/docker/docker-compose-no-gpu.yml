@@ -1,7 +1,16 @@
 # Identical to docker-compose.yml minus `runtime: nvidia` and the GPU reservation, which
 # docker can only honour when the nvidia container runtime is registered. The launch
-# scripts auto-select this file when `docker info` shows no nvidia runtime -- the onboard
-# minipc has no GPU, and the deploy path is CPU onnxruntime anyway.
+# scripts auto-select this file when `docker info` shows no nvidia runtime.
+#
+# THIS FILE NO LONGER MEANS "a working CPU deployment". The image ships onnxruntime-GPU
+# either way (docker/requirements.txt), so the wheel still advertises a CUDA provider here
+# and nothing at install time notices the GPU is missing; the session simply falls back to
+# the CPU at load. What catches that is G1Controller._require_cuda, which refuses to run
+# rather than miss the control period by 5x -- so with the default `use_cuda: true` the
+# controller will REFUSE TO START under this file. That is deliberate: the generator pair
+# measures 103.5 ms per replan tick on CPU against a 20 ms budget, which is not a degraded
+# mode, it is an unusable one. Running here at all takes a deliberate `use_cuda:=false`
+# AND a plan for the deficit (a smaller generator, or a longer control period).
 x-common: &common
   shm_size: '12gb'
   network_mode: host
@@ -27,9 +36,9 @@ x-common: &common
     - $REPO_ROOT:$REPO_ROOT
     - /tmp/.X11-unix:/tmp/.X11-unix
     - $HOME/.Xauthority:$HOME/.Xauthority:rw
-    - $HOME/.bashrc:$HOME/.bashrc
     - $HOME/.gitconfig:$HOME/.gitconfig
     - $HOME/.ssh:$HOME/.ssh
+    # No $HOME/.bashrc here either -- see docker-compose.yml for why it was removed.
     - /dev/input:/dev/input
     # Joystick hot-reconnect: without this, joy_node misses the re-add when the pad wakes.
     - /run/udev:/run/udev:ro

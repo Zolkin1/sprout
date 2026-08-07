@@ -21,6 +21,12 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="Convert G1 URDF to USD.")
 # parser.add_argument("--headless", action="store_true", default=True, help="Run in headless mode.")
+parser.add_argument(
+    "--urdf", default="g1_21j_box_merged_29j.urdf",
+    help="URDF to convert, relative to this script's directory (or an absolute path). "
+         "The importer names the output directory after the file, so a new URDF lands in "
+         "its own tree and never overwrites the live asset.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -32,7 +38,7 @@ from isaaclab.sim.converters import UrdfConverter, UrdfConverterCfg
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 cfg = UrdfConverterCfg(
-    asset_path=os.path.join(SCRIPT_DIR, "g1_21j_box_merged_29j.urdf"),
+    asset_path=args.urdf if os.path.isabs(args.urdf) else os.path.join(SCRIPT_DIR, args.urdf),
     usd_dir=SCRIPT_DIR,
     fix_base=False,
     merge_fixed_joints=False,

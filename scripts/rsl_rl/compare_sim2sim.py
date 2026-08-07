@@ -82,34 +82,19 @@ def _pick_clip(lib_path: str, case: str) -> tuple[int, int]:
 
 
 def _write_single_clip_library(src: str, dst: str, clip_i: int) -> dict:
-    """Copy ``src`` keeping only clip ``clip_i`` (and only its tile in the manifest)."""
+    """Copy ``src`` keeping only clip ``clip_i`` (and only its tile in the manifest).
+
+    A thin wrapper over the shared subset writer, which also serves
+    ``scripts/rsl_rl/fm_debug.py`` (three clips instead of one).
+    """
     import h5py
 
-    with h5py.File(src, "r") as fi, h5py.File(dst, "w") as fo:
+    from motion_gen.clips.clip_io import write_clip_subset
+
+    manifest = write_clip_subset(src, dst, [clip_i])
+    with h5py.File(src, "r") as fi:
         tid = int(np.asarray(fi["terrain_id"][:])[clip_i])
-        for k in fi.keys():
-            d = fi[k]
-            fo.create_dataset(k, data=np.asarray(d[clip_i:clip_i + 1]), dtype=d.dtype)
-        for k, v in fi.attrs.items():
-            fo.attrs[k] = v
-        man = [m for m in json.loads(fi.attrs["terrain_manifest"])
-               if int(m.get("terrain_id", -2)) == tid]
-        fo.attrs["terrain_manifest"] = json.dumps(man)
-        fo.attrs["num_clips"] = 1
-        fo.attrs["num_clips_written"] = 1
-        # The importer sizes its FLAT tile count from generator_config.counts.flat in
-        # preference to the actual clip count (clip_terrain_loader.default_num_flat_tiles), so
-        # a copied "flat: 60" would build 60 flat tiles for a library holding one stair clip --
-        # and the terrain reset then aborts ("terrain id(s) [-1] have an env tile but NO
-        # clips"). Rewrite it to what this library really contains.
-        gc = fi.attrs.get("generator_config")
-        gcfg = json.loads(gc) if isinstance(gc, str) else (gc or {})
-        if not isinstance(gcfg, dict):
-            gcfg = {}
-        gcfg.setdefault("counts", {})
-        gcfg["counts"]["flat"] = 1 if tid == -1 else 0
-        fo.attrs["generator_config"] = json.dumps(gcfg)
-    return {"clip_index": clip_i, "terrain_id": tid, "tiles": len(man), "path": dst}
+    return {"clip_index": clip_i, "terrain_id": tid, "tiles": len(manifest), "path": dst}
 
 
 def _mujoco_scene_from_tile(man: list[dict], tid: int, robot_xml: str, out_path: str) -> tuple[int, bool]:

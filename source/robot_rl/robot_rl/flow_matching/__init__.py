@@ -8,7 +8,8 @@ measured states (dropped in as clean tokens, inpainting) and a strided
 commanded-velocity profile, generating a future trajectory in the current root frame.
 """
 
-from .config import FlowMatchingConfig
+from .config import EXTERO_SOURCES, FlowMatchingConfig
+from .ema import WeightEMA
 from .dataset import (
     FutureStateDataset,
     build_train_val,
@@ -17,6 +18,7 @@ from .dataset import (
 )
 from motion_gen.fk import FKChain
 from .flow import (
+    body_pose_terms,
     fk_consistency_terms,
     flow_matching_loss,
     frame_consistency_terms,
@@ -28,7 +30,8 @@ from .flow import (
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import (
-    FRAME_BLOCK_DIM,
+    EE_BLOCK_DIM,
+    ROOT_BLOCK_DIM,
     frame_block_start,
     matrix_from_quat,
     matrix_to_rot6d,
@@ -39,14 +42,33 @@ from .transforms import (
     relative_state_from_window,
     rot6d_to_matrix,
     rot6d_to_quat,
+    so3_exp,
     so3_log,
     state_to_absolute,
     yaw_quat,
     target_state_dim,
 )
+from .window import (
+    BASE_POSE_CONVENTION,
+    REFERENCE_BLOCK_KEYS,
+    REFERENCE_WINDOW_BLOCK_NAMES,
+    REFERENCE_WINDOW_NOISE,
+    expand_window_blocks,
+    project_window_rotations,
+    reanchor_window,
+    resolve_reference_blocks,
+    split_window,
+    window_block_slices,
+    window_blocks,
+    window_dim,
+    window_to_world,
+    world_to_window,
+)
 
 __all__ = [
     "FlowMatchingConfig",
+    "WeightEMA",
+    "EXTERO_SOURCES",
     "FlowMatchingTransformer",
     "FutureStateDataset",
     "snap_windows",
@@ -57,6 +79,7 @@ __all__ = [
     "flow_matching_loss",
     "frame_consistency_terms",
     "joint_vel_consistency_term",
+    "body_pose_terms",
     "fk_consistency_terms",
     "sample_flow_batch",
     "sample_trajectory",
@@ -66,6 +89,7 @@ __all__ = [
     "rot6d_to_matrix",
     "quat_to_rot6d",
     "rot6d_to_quat",
+    "so3_exp",
     "so3_log",
     "yaw_quat",
     "relative_state",
@@ -74,6 +98,21 @@ __all__ = [
     "orientation_slice",
     "orientation_slices",
     "frame_block_start",
-    "FRAME_BLOCK_DIM",
+    "ROOT_BLOCK_DIM",
+    "EE_BLOCK_DIM",
     "target_state_dim",
+    "world_to_window",
+    "BASE_POSE_CONVENTION",
+    "REFERENCE_BLOCK_KEYS",
+    "REFERENCE_WINDOW_BLOCK_NAMES",
+    "REFERENCE_WINDOW_NOISE",
+    "expand_window_blocks",
+    "project_window_rotations",
+    "reanchor_window",
+    "resolve_reference_blocks",
+    "window_to_world",
+    "window_blocks",
+    "window_block_slices",
+    "window_dim",
+    "split_window",
 ]

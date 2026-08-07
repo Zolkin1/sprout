@@ -160,3 +160,48 @@ def axis_angle_from_quat(quat: np.ndarray, eps: float = 1.0e-6) -> np.ndarray:
 def quat_box_minus(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
     """Tangent-space difference ``q1 (-) q2`` -> rotation vector ``(..., 3)``."""
     return axis_angle_from_quat(quat_mul(q1, quat_conjugate(q2)))
+
+
+def quat_unique(q: np.ndarray) -> np.ndarray:
+    """Put an xyzw quaternion in the standard form with a non-negative real part.
+
+    ``q`` and ``-q`` are the same rotation; picking one makes results comparable
+    componentwise. Mirrors ``isaaclab.utils.math.quat_unique``.
+    """
+    return np.where(q[..., 3:4] < 0.0, -q, q)
+
+
+def quat_from_axis_angle(delta: np.ndarray, eps: float = 1.0e-6) -> np.ndarray:
+    """Exponential map: rotation vector ``(..., 3)`` -> xyzw quaternion ``(..., 4)``.
+
+    The inverse of :func:`axis_angle_from_quat`. ``eps`` floors the norm so a zero
+    perturbation gives identity instead of dividing by zero -- the same guard, in the same
+    place, as ``isaaclab.utils.math.quat_box_plus``.
+    """
+    delta = np.asarray(delta, dtype=np.float64)
+    norm = np.maximum(np.linalg.norm(delta, axis=-1, keepdims=True), eps)
+    half = 0.5 * norm
+    xyz = (delta / norm) * np.sin(half)
+    q = np.concatenate([xyz, np.cos(half)], axis=-1)
+    return q / np.linalg.norm(q, axis=-1, keepdims=True)
+
+
+def quat_box_plus(q: np.ndarray, delta: np.ndarray, eps: float = 1.0e-6) -> np.ndarray:
+    """Apply an axis-angle increment: ``Exp(delta) * q``, sign-normalised.
+
+    The inverse of :func:`quat_box_minus` and the port of
+    ``isaaclab.utils.math.quat_box_plus``, which is what ``flow_matching.window`` uses to
+    lift a window's ``base_pose`` orientation half back to the world. Parity-tested against
+    it, because a convention slip here rotates a reference rather than failing.
+
+    Args:
+        q: ``(..., 4)`` base orientation, xyzw.
+        delta: ``(..., 3)`` axis-angle increment.
+        eps: Norm floor for ``delta``.
+
+    Returns:
+        ``(..., 4)`` xyzw quaternion with a non-negative real part -- possibly the negation
+        of what a caller expects, which is the SAME rotation. Compare rotations, not
+        components.
+    """
+    return quat_unique(quat_mul(quat_from_axis_angle(delta, eps), q))

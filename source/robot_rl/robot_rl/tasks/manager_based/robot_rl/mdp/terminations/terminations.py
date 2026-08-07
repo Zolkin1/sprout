@@ -183,20 +183,31 @@ def tracked_frame_error_termination(
     return ((pos_err > max_pos_dist) | (ori_err > ori_lim)).any(dim=-1)
 
 
-def clip_end_reached(env, command_name: str = "traj_ref") -> torch.Tensor:
-    """Truncate (good termination) when the clip's last step is reached.
+def clip_end_reached(env, command_name: str = "traj_ref", reserve_lookahead: bool = True) -> torch.Tensor:
+    """Truncate (good termination) when the clip's last USABLE step is reached.
 
     Wire this as ``DoneTerm(..., time_out=True)`` so RSL-RL bootstraps the
     value from the final state rather than treating clip-end as a failure.
     Keyed on the clip step counter so it is correct even when episodes start
     mid-clip (``random_start_phase``).
 
+    With ``reserve_lookahead`` the episode ends one full ``reference_window`` **before**
+    the clip's last frame, rather than at it. The look-ahead gather clamps to the library
+    length (``_future_step_indices``), so without the margin the final
+    ``(num_steps - 1) * stride`` = 50 steps of every clip feed the policy a window that is
+    progressively frozen on the last frame -- and then teach the generator to predict that
+    "the reference stops moving". Reserving the margin costs the tail 1 s of every clip and
+    means no observed sample is ever a clamp artefact. The margin is read off the live
+    ``reference_window`` term, so it cannot drift from the observation.
+
     Args:
         env: IsaacLab environment.
         command_name: The :class:`MotionSequenceCommand` term name.
+        reserve_lookahead: End the episode a full observation window early (default). Set
+            False to run to the clip's true last frame and accept the saturated tail.
 
     Returns:
-        Boolean ``[num_envs]`` -- True for envs at/after the clip's last step.
+        Boolean ``[num_envs]`` -- True for envs at/after the clip's last usable step.
     """
     cmd = env.command_manager.get_term(command_name)
     # Each clip's OWN last real frame (clip_len - 1), so a short clip padded into a longer library
@@ -205,6 +216,12 @@ def clip_end_reached(env, command_name: str = "traj_ref") -> torch.Tensor:
     # THAT device before moving to the env device (device-safe gather).
     clip_len = cmd.manager.clip_len
     last_step = clip_len[cmd.clip_id.to(clip_len.device)].to(cmd.start_step.device) - 1
+    if reserve_lookahead:
+        offsets = cmd.obs_window_offsets()
+        if offsets is not None and offsets.numel() > 0:
+            # clamp_min(0): a clip shorter than the window has no unsaturated step at all,
+            # so it ends immediately rather than silently serving a frozen reference.
+            last_step = (last_step - int(offsets.max().item())).clamp_min(0)
     return (cmd.start_step + env.episode_length_buf) >= last_step
 
 def base_orientation_from_upright(

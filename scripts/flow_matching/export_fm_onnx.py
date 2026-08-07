@@ -18,8 +18,7 @@ relative-state future window back -- no torch, no separate normalizer stats.
   output : trajectory  (V, F, D)          denormalized relative-state FUTURE window;
                                           all F frames are novel (node 0 = "now")
 
-The world-frame lift (``state_to_absolute``) and the conditioning construction
-(``relative_state`` for the history + the sensor read) stay in the deployment glue --
+The conditioning assembly (the history push + the sensor read) stays in the deployment glue --
 they are cheap geometry that needs the per-step anchor.  Deployment metadata (frame
 names, dims, num_steps, joint order, ``ground_z``, which sensor feeds the exteroception
 tokens and its camera contract) is embedded in the ONNX ``metadata_props`` under key
@@ -41,6 +40,7 @@ import onnx
 import torch
 import torch.nn as nn
 
+from robot_rl.flow_matching.window import project_window_rotations, window_blocks
 from robot_rl.flow_matching.online import load_fm_context, FmOnlineContext
 
 
@@ -59,6 +59,10 @@ class _FmSamplerOnnx(nn.Module):
         super().__init__()
         self.model = ctx.model
         self.num_steps = int(ctx.num_steps)
+        # Plain ints/tuples, so the SO(3) projection below traces as fixed slicing.
+        self.nj = int(ctx.nj)
+        self.num_extra_frames = int(ctx.target_num_extra_frames)
+        self.reference_blocks = tuple(ctx.reference_blocks)
         self.register_buffer("s_mean", ctx.state_norm.mean.detach().clone())
         self.register_buffer("s_std", ctx.state_norm.std.detach().clone())
         self.register_buffer("c_mean", ctx.cmd_norm.mean.detach().clone())
@@ -93,7 +97,14 @@ class _FmSamplerOnnx(nn.Module):
             tau = noise[:, 0, 0] * 0.0 + (i * dt)
             v = self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m)
             x = x + dt * v
-        return x * self.s_std + self.s_mean
+        # Project the rotation block back onto SO(3), exactly as
+        # ``flow_matching.online.sample_window`` does for simulation -- the model emits 6
+        # free numbers, and this window is both a reference pose and the next step's history
+        # token. Inside the graph so the torch-free runtime needs no rotation maths.
+        return project_window_rotations(
+            x * self.s_std + self.s_mean,
+            self.nj, self.num_extra_frames, self.reference_blocks,
+        )
 
 
 def _fm_meta(ctx: FmOnlineContext) -> dict:
@@ -103,13 +114,31 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "target_frame_names": list(ctx.target_frame_names),
         "N": ctx.N, "F": ctx.F, "D": ctx.D, "nj": ctx.nj, "num_steps": ctx.num_steps,
         "cmd_dim": ctx.cmd_dim, "cmd_steps": list(ctx.cmd_steps), "num_cmd_tokens": ctx.num_cmd_tokens,
-        "ground_z": float(ctx.ground_z), "height_dim": int(ctx.model.height_dim),
+        "height_dim": int(ctx.model.height_dim),
         # Which sensor feeds the exteroception tokens, how many there are, and -- for the
         # depth cameras -- their full contract, so the deployment feeds the right reading
         # and can verify it describes the same physical sensor as the tracker's.
         "extero_source": str(ctx.extero_source),
         "extero_tokens": int(ctx.model.extero_tokens),
         "extero_spec": ctx.extero_spec,
+        # What the history tokens must be built from, and the re-plan period the targets
+        # were cut at. Both are contracts the runtime has to honour, not descriptions: a
+        # deployment feeding a measured history to a partially autoregressive model, or
+        # re-planning at a different period than the horizon was sized for, is silently
+        # off-distribution. ``fm_session.load_fm_context`` checks them.
+        "fm_snap_every": ctx.fm_snap_every,
+        # The state LAYOUT, which nothing else in the graph reveals. The generator's
+        # output goes STRAIGHT into the tracker's observation now, so a layout
+        # disagreement is not a bad lift -- it is a scrambled observation the policy acts
+        # on. D, nj and the frame count do not pin it down (the previous relative-state
+        # layout is 3 channels wider for every nj/K, close enough to look plausible; and a
+        # window that drops a block is narrower but just as loadable), so the block table
+        # travels explicitly -- with the SELECTION this checkpoint trained on, not the
+        # full five. ``fm_session.load_fm_context`` requires it, and
+        # ``GenTrackerPolicy.load`` requires it to equal the tracker's.
+        "window_blocks": [[name, int(w)] for name, w in
+                          window_blocks(ctx.nj, ctx.target_num_extra_frames,
+                                        ctx.reference_blocks)],
         # Signals to the deploy side that the graph accepts the history_null input, so it can
         # sample with the learned null embedding before its history fills. Absent in graphs
         # exported before that input existed.

@@ -197,16 +197,46 @@ def _slice_to_time_range(
     return sliced, new_metadata
 
 
+#: Pixel budget for a saved figure. The grid plots put one subplot per output CHANNEL, and
+#: the clip reference has ~155 of them -- a 20 x 117 inch figure, which at the nominal 300
+#: dpi is a 198-MEGApixel, 12 MB PNG that takes minutes to rasterise and that no viewer will
+#: open. :func:`_fig_dpi` trades dpi away to stay under this; small figures keep the full
+#: 300 because their budget is never binding.
+_FIG_PIXEL_BUDGET = 15e6
+_FIG_DPI_MAX, _FIG_DPI_MIN = 300, 70
+
+
+def _fig_dpi(fig) -> int:
+    """Save dpi for ``fig``, reduced so the raster stays under :data:`_FIG_PIXEL_BUDGET`."""
+    w, h = fig.get_size_inches()
+    area = max(float(w) * float(h), 1e-6)
+    return int(np.clip((_FIG_PIXEL_BUDGET / area) ** 0.5, _FIG_DPI_MIN, _FIG_DPI_MAX))
+
+
+#: Above this fraction of steps being re-plans, the markers stop meaning anything: they
+#: cover the axis in solid grey AND cost one matplotlib artist per step per subplot, which
+#: on a 1000-step rollout is hundreds of thousands of artists and minutes of rendering.
+#: ``fm_update_every=1`` -- the tracker's default -- re-plans on EVERY step, so this is the
+#: normal case, not an edge one.
+_REPLAN_MARKER_MAX_FRACTION = 0.25
+
+
 def _replan_times(pred_idx_env: np.ndarray | None, dt: float | None, t_offset: float) -> np.ndarray:
     """Times (s, or step indices) where the FM re-planned for one env.
 
     A re-plan is where the applied window index ``fm_pred_idx`` resets to its novel
     start, i.e. does not increase between consecutive steps. Used to mark the FM (and,
     now, clip) re-anchor instants on the trajectory_obs plots.
+
+    Returns nothing once re-plans are dense (see :data:`_REPLAN_MARKER_MAX_FRACTION`) --
+    "the generator re-plans every step" is a property of the config, not something a
+    thousand overlapping vertical lines communicate.
     """
     if pred_idx_env is None or pred_idx_env.shape[0] < 2:
         return np.empty(0)
     drops = np.nonzero(pred_idx_env[1:] <= pred_idx_env[:-1])[0] + 1
+    if drops.size > _REPLAN_MARKER_MAX_FRACTION * pred_idx_env.shape[0]:
+        return np.empty(0)
     return drops * dt + t_offset if dt is not None else drops.astype(float)
 
 
@@ -305,7 +335,7 @@ def _grid_plot(
 
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(os.path.join(save_dir, filename_fmt.format(env_id=env_id)),
-                     dpi=300, bbox_inches="tight")
+                     dpi=_fig_dpi(fig), bbox_inches="tight")
         plt.close(fig)
 
 
@@ -1090,6 +1120,12 @@ def plot_clf(
         plt.close(fig)
 
 
+#: Most peel-off fans :func:`_plot_fm_peeloff` draws per subplot. One fan per re-plan, and
+#: the tracker re-plans every control step by default, so an un-capped 1000-step rollout
+#: would draw 1000 curves in each of ~150 subplots.
+_FM_PEELOFF_MAX_FANS = 60
+
+
 def _plot_fm_peeloff(
     data: dict[str, np.ndarray],
     metadata: dict[str, Any],
@@ -1146,18 +1182,36 @@ def _plot_fm_peeloff(
 
     for env_id in env_ids:
         act_series = data["fm_active"][:, env_id].astype(bool)
-        if not act_series.any():
-            print(f"[INFO plot_fm_predictions] Env {env_id} never tracks the FM; skipping.")
-            continue
+        # A PASSIVE generator (the clip-driven diagnostic rollout) predicts every step
+        # without ever being applied, and that is exactly the run whose predictions are
+        # most worth fanning -- the tracked line is then the clip and each fan shows what
+        # the generator would have done instead. So the gate is "was a window recorded",
+        # not "was the generator tracked"; only the shading below is FM-active-conditional.
+        passive = not act_series.any()
+        live = np.ones_like(act_series) if passive else act_series
 
         p_env = pidx_all[:, env_id].astype(int)            # [T]
-        # Fresh inference == FM active AND the window index did not advance: it
-        # resets to N on a re-infer but strictly increases on a pure advance, so
-        # a non-increase (or the first FM-active step) marks a new prediction.
-        prev_active = np.concatenate([[False], act_series[:-1]])
+        # Fresh inference == live AND the window index did not advance: it resets to 0 on a
+        # re-infer but strictly increases on a pure advance, so a non-increase (or the
+        # first live step) marks a new prediction.
+        prev_live = np.concatenate([[False], live[:-1]])
         prev_pidx = np.concatenate([[0], p_env[:-1]])
-        fresh = act_series & (~prev_active | (p_env <= prev_pidx))
+        fresh = live & (~prev_live | (p_env <= prev_pidx))
         fresh_steps = np.nonzero(fresh)[0]
+        if not fresh_steps.size:
+            print(f"[INFO plot_fm_predictions] Env {env_id}: no generator predictions logged; "
+                  "skipping.")
+            continue
+        # At fm_update_every=1 EVERY step is a fresh prediction, so a 1000-step rollout
+        # would draw 1000 curves in each of ~150 subplots -- minutes of rendering for a
+        # solid block of colour. Subsample evenly and say so, rather than silently drawing
+        # a picture whose density does not mean what it looks like.
+        n_fresh = fresh_steps.size
+        if n_fresh > _FM_PEELOFF_MAX_FANS:
+            keep = np.linspace(0, n_fresh - 1, _FM_PEELOFF_MAX_FANS).round().astype(int)
+            fresh_steps = fresh_steps[np.unique(keep)]
+            print(f"[INFO plot_fm_predictions] Env {env_id}: {n_fresh} predictions, drawing "
+                  f"{fresh_steps.size} evenly spaced.")
 
         vmin = time_s[fresh_steps[0]] if fresh_steps.size else time_s[0]
         vmax = time_s[fresh_steps[-1]] if fresh_steps.size > 1 else time_s[-1]
@@ -1167,8 +1221,9 @@ def _plot_fm_peeloff(
 
         fig, axs = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 3 * n_rows),
                                 constrained_layout=True)
-        fig.suptitle(f"{title} (Env {env_id}) — {fresh_steps.size} FM predictions",
-                     fontsize=16)
+        shown = (f"{fresh_steps.size} of {n_fresh} FM predictions"
+                 if fresh_steps.size < n_fresh else f"{n_fresh} FM predictions")
+        fig.suptitle(f"{title} (Env {env_id}) — {shown}", fontsize=16)
         axs_flat = np.array(axs).flatten()
 
         for i in range(n_dims):
@@ -1205,7 +1260,7 @@ def _plot_fm_peeloff(
         cbar.set_label("FM prediction generated at (s)")
 
         plt.savefig(os.path.join(save_dir, file_fmt.format(env_id=env_id)),
-                    dpi=300, bbox_inches="tight")
+                    dpi=_fig_dpi(fig), bbox_inches="tight")
         plt.close(fig)
 
 
@@ -1306,7 +1361,7 @@ def _plot_future_obs(
             ax.set_visible(False)
         plt.tight_layout(rect=[0, 0.02, 1, 0.95])
         plt.savefig(os.path.join(save_dir, f"trajectory_obs_{fname}_env{env_id}.png"),
-                    dpi=200, bbox_inches="tight")
+                    dpi=_fig_dpi(fig), bbox_inches="tight")
         plt.close(fig)
 
 
@@ -1364,7 +1419,6 @@ def _dump_trajectory_obs(data: dict[str, np.ndarray], metadata: dict[str, Any],
     """Write the logged reference obs (FM ``obs_*`` + clip ``obs_clip_*``) to per-term
     CSVs (time + FM cols + clip cols) and a combined ``.npz`` per env, for exact
     numeric inspection alongside the plots."""
-    import csv as _csv
     dt = metadata.get("dt") or 1.0
     stride = int(metadata.get("future_stride", 5))
     flat, fut = _traj_obs_labels(data, metadata)
@@ -1390,10 +1444,12 @@ def _dump_trajectory_obs(data: dict[str, np.ndarray], metadata: dict[str, Any],
                 header += [f"{l} (clip)" for l in labels]
                 cols.append(clip)
             fname = key[len("obs_"):]
-            with open(os.path.join(save_dir, f"trajectory_obs_{fname}_env{e}.csv"), "w", newline="") as fh:
-                w = _csv.writer(fh)
-                w.writerow(header)
-                w.writerows(np.column_stack(cols))
+            # np.savetxt, not csv.writer: these tables run to ~640 columns x the rollout
+            # length, and the pure-Python writer takes longer than every figure in this
+            # module put together on a 1000-step bundle.
+            np.savetxt(os.path.join(save_dir, f"trajectory_obs_{fname}_env{e}.csv"),
+                       np.column_stack(cols), delimiter=",", fmt="%.6g",
+                       header=",".join(header), comments="")
             bundle[key] = fm
             if clip is not None:
                 bundle[clip_key] = clip
@@ -1616,8 +1672,85 @@ def plot_obs_clip_fm_diff(
     print(f"[plot] obs_clip_fm_diff: wrote ranked bar charts + obs_clip_fm_diff_env*.csv to {save_dir}")
 
 
+def plot_proprioception(
+    data: dict[str, np.ndarray],
+    metadata: dict[str, Any],
+    save_dir: str,
+    env_ids: list[int],
+) -> None:
+    """The MEASURED robot state that feeds the policy trunk, over the rollout.
+
+    The reference plots say what the policy was asked for and ``joint_targets`` says what
+    it commanded; this is the third leg -- what it actually felt. Deliberately the clean
+    physical quantities rather than the corrupted observation vector: the noise is known
+    (it is configured), whereas a divergence in the underlying state is what a tracking
+    failure looks like from the inside.
+
+    Emits three figures per env: per-joint position, per-joint velocity, and a base panel
+    (linear/angular velocity in the body frame plus projected gravity, i.e. tilt).
+    Requires the ``log_world`` capture block for the base panel; the joint figures fall
+    back to whatever is present.
+    """
+    dt = metadata.get("dt")
+    t_off = float(metadata.get("t_offset", 0.0))
+    joints = list(metadata.get("joint_names", []))
+    fm_active = data.get("fm_active")
+    made = False
+
+    for key, title, ylabel in (
+        ("joint_pos", "Measured Joint Positions", "Angle ({unit})"),
+        ("joint_vel", "Measured Joint Velocities", "Rate ({unit}/s)"),
+    ):
+        if key not in data:
+            continue
+        made = True
+        names = joints if len(joints) == data[key].shape[2] else [
+            f"Dim {i}" for i in range(data[key].shape[2])]
+        _grid_plot(
+            data, key, None, names,
+            title_fmt=f"{title} (Env {{env_id}})", y_label_fmt=ylabel,
+            filename_fmt=f"proprioception_{key}_env{{env_id}}.png",
+            save_dir=save_dir, env_ids=env_ids, label_a="Measured",
+            dt=dt, t_offset=t_off, fm_active=fm_active,
+        )
+
+    # Base panel: whichever of the three base signals were captured, stacked.
+    base_keys = [(k, lbl, cols) for k, lbl, cols in (
+        ("robot_base_vel", "base velocity (body frame)", ("vx [m/s]", "vy [m/s]", "wz [rad/s]")),
+        ("root_ang_vel_w", "base angular velocity (world)", ("wx", "wy", "wz")),
+        ("projected_gravity", "projected gravity (tilt)", ("gx", "gy", "gz")),
+    ) if k in data]
+    if base_keys:
+        made = True
+        x = None
+        for env_id in env_ids:
+            fig, axs = plt.subplots(len(base_keys), 1, figsize=(11, 3.0 * len(base_keys)),
+                                    squeeze=False, sharex=True)
+            fig.suptitle(f"Proprioception -- base (Env {env_id})", fontsize=14)
+            for ax, (key, lbl, cols) in zip(axs[:, 0], base_keys):
+                arr = data[key][:, env_id]
+                if x is None:
+                    x = (np.arange(arr.shape[0]) * dt + t_off) if dt else np.arange(arr.shape[0])
+                for c in range(min(arr.shape[1], len(cols))):
+                    ax.plot(x, arr[:, c], lw=1.4, label=cols[c])
+                ax.set_ylabel(lbl, fontsize=9)
+                ax.grid(True, alpha=0.3)
+                ax.legend(fontsize=8, ncol=3, loc="upper right")
+            axs[-1, 0].set_xlabel("Time (s)" if dt else "Time Steps")
+            plt.tight_layout(rect=[0, 0.02, 1, 0.95])
+            plt.savefig(os.path.join(save_dir, f"proprioception_base_env{env_id}.png"),
+                        dpi=200, bbox_inches="tight")
+            plt.close(fig)
+
+    if not made:
+        print("[WARN plot_proprioception] No proprioceptive series logged, skipping.")
+        return
+    print(f"[plot] proprioception: wrote proprioception_*_env*.png to {save_dir}")
+
+
 PLOT_REGISTRY: dict[str, Callable] = {
     "positions": plot_positions,
+    "proprioception": plot_proprioception,
     "trajectory_obs": plot_trajectory_obs,
     "obs_clip_fm_diff": plot_obs_clip_fm_diff,
     "velocities": plot_velocities,
@@ -1664,6 +1797,34 @@ def _time_mean_per_env(arr: np.ndarray, mask: np.ndarray | None) -> np.ndarray:
     return np.where(cnt > 0, out, np.nan)
 
 
+def first_episode_survived(dones: np.ndarray, time_outs: np.ndarray) -> np.ndarray:
+    """Per env: did its FIRST episode end via ``time_out`` rather than a fall.
+
+    Replaces ``timeout_mask.any(axis=0)`` -- "did ANY completed episode end in time_out" --
+    which is biased by how much rollout budget is left after a fall. At ``max_steps=1100``
+    over 1000-step episodes, an env that falls at step 50 gets a SECOND episode spanning
+    50..1050 that completes inside the budget and scores identically to an env that never
+    fell, while one that falls at step 500 gets no such credit (500..1500 is cut off). That
+    rewards failing EARLY and lets max_steps leak into a number meant to describe the policy.
+
+    First-episode scoring removes both: one episode per env, and a fall counts the same
+    whenever it happens.
+
+    Envs whose first episode never completes are False -- unfinished is not survival. With
+    max_steps > episode length that only happens if the env never resets at all.
+
+    Args:
+        dones: ``[T, N]`` bool, True where env ``n`` reset at step ``t``.
+        time_outs: ``[T, N]`` bool, True where that reset was a time_out.
+
+    Returns:
+        ``[N]`` bool, True where the env's first completed episode ended via time_out.
+    """
+    has_done = dones.any(axis=0)
+    first = dones.argmax(axis=0)                    # 0 when no done; gated by has_done
+    return has_done & time_outs[first, np.arange(dones.shape[1])]
+
+
 def _emit_tracking_stats(
     _log: Callable,
     _csv: Callable,
@@ -1671,6 +1832,7 @@ def _emit_tracking_stats(
     metadata: dict[str, Any],
     mask: np.ndarray | None,
     csv_prefix: str,
+    _vec: Callable | None = None,
 ) -> None:
     """Emit the V / norm-sq / position / velocity tracking blocks.
 
@@ -1678,6 +1840,11 @@ def _emit_tracking_stats(
     given), then reduced across envs. ``mask=None`` reproduces the original
     all-steps stats; a step mask restricts to a subset (e.g. successful
     episodes). ``csv_prefix`` namespaces the CSV keys for the masked block.
+
+    ``_vec``, when given, also receives the PER-ENV vector behind each scalar. Two numbers
+    (mean and std) cannot be compared as a distribution, and with clips pinned per env
+    (``mdp.events.resolve_pinned_clips``) the per-env vector is per-CLIP -- which is what a
+    cross-simulator comparison needs.
     """
     # Mean Lyapunov V
     if "v" in data:
@@ -1697,7 +1864,12 @@ def _emit_tracking_stats(
         e_pos = data["y_des"] - data["y_act"]
         e_vel = data["dy_des"] - data["dy_act"]
         e = np.concatenate([e_pos, e_vel], axis=2)
-        norm_sq = (e ** 2).sum(axis=2)
+        # nansum, not sum: on the FM tracker ``strict_fm_only`` NaNs every channel the
+        # generator does not write (the ``@root`` blocks), and a plain sum propagates that
+        # to every entry -- making the headline number nan rather than the error over the
+        # channels there IS a reference for. Identical to sum wherever nothing is NaN, so
+        # the teacher is unaffected. The per-dimension tables below already nan-reduce.
+        norm_sq = np.nansum(e ** 2, axis=2)
         per_env_mean = _time_mean_per_env(norm_sq, mask)
         _log("")
         _log("Norm Squared Error (dot(e,e)):")
@@ -1705,6 +1877,8 @@ def _emit_tracking_stats(
         _log(f"  Std  across envs: {np.nanstd(per_env_mean):.6f}")
         _csv(f"{csv_prefix}norm_sq_error_mean", float(np.nanmean(per_env_mean)))
         _csv(f"{csv_prefix}norm_sq_error_std", float(np.nanstd(per_env_mean)))
+        if _vec is not None:
+            _vec(f"{csv_prefix}norm_sq_error", per_env_mean)
 
     # Position errors
     if "y_des" in data and "y_act" in data:
@@ -1724,7 +1898,21 @@ def _emit_tracking_stats(
             name = pos_names[i] if i < len(pos_names) else f"Dim {i}"
             _log(f"  {name:<40s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
 
-        _print_group_summaries(_log, _csv, pos_names, mean_over_envs, std_over_envs, f"{csv_prefix}pos_error")
+        _print_group_summaries(_log, _csv, pos_names, mean_over_envs, std_over_envs,
+                               f"{csv_prefix}pos_error", per_env_mean_err, _vec)
+
+        # Per-env BASE position error, the one dimension group a MuJoCo run can be compared
+        # against (its reference_tracking.pos_* is the same quantity). The base is the frame
+        # of the first pos entry -- the tracked set is packed base-first -- and only that
+        # frame is emitted, because the ee dims are nan whenever ee_pos is not predicted and
+        # a wall of nan columns would obscure the ones that mean something.
+        if _vec is not None and pos_names and ":" in str(pos_names[0]):
+            base_frame = str(pos_names[0]).split(":")[0]
+            for i in range(n_dims):
+                name = str(pos_names[i]) if i < len(pos_names) else ""
+                if name.startswith(f"{base_frame}:"):
+                    axis = name.split(":", 1)[1]
+                    _vec(f"{csv_prefix}base_{axis}_mse", per_env_mean_err[:, i])
 
     # Velocity errors
     if "dy_des" in data and "dy_act" in data:
@@ -1762,6 +1950,8 @@ def _emit_tracking_stats(
             _log(f"  {chan_names[i]:<14s} {mean_over_envs[i]:12.6f} {std_over_envs[i]:12.6f}")
             _csv(f"{csv_prefix}vel_track_{chan_names[i]}_mse_mean", float(mean_over_envs[i]))
             _csv(f"{csv_prefix}vel_track_{chan_names[i]}_mse_std", float(std_over_envs[i]))
+            if _vec is not None:
+                _vec(f"{csv_prefix}vel_track_{chan_names[i]}_mse", per_env_mean[:, i])
 
 
 def compute_and_save_stats(
@@ -1792,6 +1982,14 @@ def compute_and_save_stats(
 
     def _csv(metric: str, value: float) -> None:
         csv_rows.append({"metric": metric, "value": f"{value:.6f}"})
+
+    # Per-ENV columns behind the scalars above (see _emit_tracking_stats' ``_vec``). With
+    # clips pinned per env this is per-CLIP, which is what makes a distribution -- and a
+    # cross-simulator comparison -- possible at all.
+    per_env_cols: dict[str, np.ndarray] = {}
+
+    def _vec(metric: str, values: np.ndarray) -> None:
+        per_env_cols[metric] = np.asarray(values, dtype=np.float64).reshape(-1)
 
     _log("=" * 60)
     _log("  Play Statistics")
@@ -1831,7 +2029,7 @@ def compute_and_save_stats(
     _log("-" * 60)
     _log("  All Steps  (every logged step, all envs)")
     _log("-" * 60)
-    _emit_tracking_stats(_log, _csv, data, metadata, mask=None, csv_prefix="")
+    _emit_tracking_stats(_log, _csv, data, metadata, mask=None, csv_prefix="", _vec=_vec)
 
     # --- Successful-tracking block (steps in time_out episodes only) ---
     mask = data.get("_timeout_mask")
@@ -1839,21 +2037,51 @@ def compute_and_save_stats(
         total = int(mask.size)
         n_keep = int(mask.sum())
         n_envs_mask = int(mask.shape[1])
-        envs_with = int(mask.any(axis=0).sum())
+        # FIRST-episode survival, not `any` -- see first_episode_survived for why `any`
+        # rewarded falling early. Falls back to the old convention only when the raw signals
+        # are absent (an older recording), and labels the line when it does.
+        _dn, _to = data.get("dones"), data.get("time_outs")
+        _first_ep = _dn is not None and _to is not None
+        survived = (first_episode_survived(_dn, _to) if _first_ep else mask.any(axis=0))
+        envs_with = int(survived.sum())
         pct = (100.0 * n_keep / total) if total else 0.0
         _log("")
         _log("-" * 60)
         _log("  Successful Tracking  (steps in time_out episodes only)")
         _log("-" * 60)
         _log(f"  steps kept: {n_keep}/{total} ({pct:.1f}%)   "
-             f"envs with >=1 kept step: {envs_with}/{n_envs_mask}")
+             f"envs with >=1 kept step: {envs_with}/{n_envs_mask}"
+             f"{'' if _first_ep else '  [LEGACY any-episode: no dones/time_outs]'}")
+        # Per-env survival, the one metric that needs no time-averaging: did this env's
+        # FIRST episode end via time_out rather than a fall.
+        per_env_cols["survived"] = survived.astype(np.float64)
+        if _first_ep:
+            # Diagnostic columns, so one run can explain a survival number instead of
+            # needing a second run under the other convention:
+            #   survived_any    -- the OLD metric ("any completed time_out episode"), kept
+            #                      so the two can be diffed per env rather than in aggregate;
+            #   first_fall_step -- when the first episode ended, -1 if it never did. An env
+            #                      can only differ between the two metrics by falling early
+            #                      enough that a SECOND full episode still fits in the
+            #                      rollout, so this column is what makes that testable:
+            #                      differing envs must all have first_fall_step <=
+            #                      max_steps - episode_len.
+            #   clip_id         -- the clip this env was on at step 0, so a specific failure
+            #                      can be replayed with pin_clip_ids instead of hunted for.
+            per_env_cols["survived_any"] = mask.any(axis=0).astype(np.float64)
+            _fd = np.where(_dn.any(axis=0), _dn.argmax(axis=0), -1)
+            per_env_cols["first_fall_step"] = _fd.astype(np.float64)
+            _ti = data.get("traj_idx")
+            if _ti is not None and getattr(_ti, "ndim", 0) == 2:
+                per_env_cols["clip_id"] = np.asarray(_ti)[0].astype(np.float64)
         _log("  note: keeps only logged steps in episodes that ended via time_out;")
         _log("        excludes fallen/early-terminated and trailing in-progress episodes.")
         if n_keep == 0:
             _log("")
             _log("  (no time_out episodes captured — nothing to report)")
         else:
-            _emit_tracking_stats(_log, _csv, data, metadata, mask=mask, csv_prefix="timeout_")
+            _emit_tracking_stats(_log, _csv, data, metadata, mask=mask,
+                                 csv_prefix="timeout_", _vec=_vec)
 
     _log("")
     _log("=" * 60)
@@ -1874,6 +2102,21 @@ def compute_and_save_stats(
             writer.writerows(csv_rows)
         print(f"CSV saved to: {csv_path}")
 
+    if per_env_cols:
+        # One ROW per env, one column per metric -- the long-form the A/B driver joins on.
+        n = max(v.shape[0] for v in per_env_cols.values())
+        names = sorted(per_env_cols)
+        pe_path = os.path.join(save_dir, "tracking_per_env.csv")
+        with open(pe_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["env_id", *names])
+            for i in range(n):
+                w.writerow([i] + [
+                    (f"{per_env_cols[k][i]:.6f}" if i < per_env_cols[k].shape[0] else "")
+                    for k in names
+                ])
+        print(f"Per-env CSV saved to: {pe_path}")
+
 
 def _print_group_summaries(
     _log: Callable,
@@ -1882,8 +2125,15 @@ def _print_group_summaries(
     mean_over_envs: np.ndarray,
     std_over_envs: np.ndarray,
     csv_prefix: str,
+    per_env: np.ndarray | None = None,
+    _vec: Callable | None = None,
 ) -> None:
-    """Print group summaries (Positions, Orientations, Joints) for error stats."""
+    """Print group summaries (Positions, Orientations, Joints) for error stats.
+
+    With ``per_env`` (``[n_envs, n_dims]``) and ``_vec``, also emits each group's per-env
+    mean. That is the cross-simulator quantity: a MuJoCo run reports the same groups
+    (reference_tracking / joint_tracking), while the individual dimensions do not line up.
+    """
     groups = {"Positions": ":pos_", "Orientations": ":ori_", "Joints": "joint:"}
     _log("")
     _log(f"  Group Summaries:")
@@ -1897,6 +2147,8 @@ def _print_group_summaries(
             _log(f"  {group_name:<40s} {g_mean:12.6f} {g_std:12.6f}")
             _csv(f"{csv_prefix}_{group_name.lower()}_mean", float(g_mean))
             _csv(f"{csv_prefix}_{group_name.lower()}_std", float(g_std))
+            if per_env is not None and _vec is not None:
+                _vec(f"{csv_prefix}_{group_name.lower()}", per_env[:, idxs].mean(axis=1))
 
 
 # ---------------------------------------------------------------------------

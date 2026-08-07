@@ -7,14 +7,21 @@ This module is the single source of truth for two conventions:
 1. The **relative-frame state vector** layout (per timestep), order::
 
        [joint_pos(nj), joint_vel(nj),
-        p_rel(3), v_rel(3), ori6d(6), w_rel(3),                 # base (root) block
-        <per extra frame: pos_rel(3), linvel_rel(3), ori6d(6), angvel_rel(3)> ...]
+        p_rel(3), v_rel(3), ori6d(6), w_rel(3),                 # base (root) block, 15
+        <per extra frame: pos_rel(3)> ...]                      # ee block, 3
 
    where root *and* every extra body frame are expressed relative to a single
-   reference root frame. The base block and each extra-frame block share the
-   identical ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` layout, so an extra
-   frame is just "another base". ``num_extra_frames=0`` reproduces the original
+   reference root frame. ``num_extra_frames=0`` reproduces the original
    base-and-joints-only vector (``2*nj + 15``).
+
+   The extra (end-effector) frames carry **position only**. The single consumer of
+   the predicted ee frames is the teacher's ``reference_window`` observation, whose
+   ``ee_pos`` block is a position (``mdp.observations.reference_window``); ee
+   orientation and twist were predicted but read by nothing except two FM
+   regularizers and the FM tracker's CLF, which no longer grades ee frames. Dropping
+   them takes the G1 state width from 133 to 85. If the joint prediction ever needs
+   the FK orientation/velocity residuals back, widen :data:`EE_BLOCK_DIM` rather than
+   reintroducing the layout by hand -- every offset here is derived from it.
 
 2. The **6D continuous rotation** representation (Zhou et al., 2019): the first
    two *columns* of the rotation matrix. The exact column ordering is reused on
@@ -115,9 +122,46 @@ def so3_log(r: torch.Tensor) -> torch.Tensor:
     return v_raw * factor.unsqueeze(-1)
 
 
-# Per-frame block width: [pos(3), lin_vel(3), ori6d(6), ang_vel(3)]. The base
-# (root) block and every extra body frame share this layout.
-FRAME_BLOCK_DIM = 3 + 3 + 6 + 3  # = 15
+def so3_exp(v: torch.Tensor) -> torch.Tensor:
+    """Rotation matrices ``(..., 3, 3)`` from rotation vectors ``(..., 3)`` (Rodrigues).
+
+    The inverse of :func:`so3_log`.  No longer used by the window: ``base_pose``'s
+    orientation half is a 6D rotation now, so :func:`rot6d_to_matrix` is what decodes it.
+    This survives for the tests and as the natural partner of ``so3_log``, which the
+    angular finite-difference loss still needs to turn a relative rotation into a rate.
+
+    Small-angle safe: the series limits are taken explicitly, so the gradient at ``theta =
+    0`` is finite.
+
+    Args:
+        v: Rotation vectors (axis * angle), shape ``(..., 3)``.
+
+    Returns:
+        Rotation matrices, shape ``(..., 3, 3)``.
+    """
+    theta = torch.linalg.norm(v, dim=-1, keepdim=True)                 # (..., 1)
+    small = theta < 1e-6
+    # sin(t)/t and (1-cos t)/t^2, both with their finite t->0 limits.
+    t2 = theta * theta
+    a = torch.where(small, 1.0 - t2 / 6.0, torch.sin(theta) / theta.clamp_min(1e-12))
+    b = torch.where(small, 0.5 - t2 / 24.0, (1.0 - torch.cos(theta)) / t2.clamp_min(1e-24))
+    x, y, z = v[..., 0], v[..., 1], v[..., 2]
+    zero = torch.zeros_like(x)
+    k = torch.stack([
+        torch.stack([zero, -z, y], dim=-1),
+        torch.stack([z, zero, -x], dim=-1),
+        torch.stack([-y, x, zero], dim=-1),
+    ], dim=-2)                                                          # (..., 3, 3) skew
+    eye = torch.eye(3, dtype=v.dtype, device=v.device).expand(k.shape)
+    return eye + a[..., None] * k + b[..., None] * (k @ k)
+
+
+# Root (base) block width: [pos(3), lin_vel(3), ori6d(6), ang_vel(3)].
+ROOT_BLOCK_DIM = 3 + 3 + 6 + 3  # = 15
+
+# Extra (end-effector) frame block width: [pos(3)]. See the module docstring for why
+# these are position-only.
+EE_BLOCK_DIM = 3
 
 
 def target_state_dim(num_joints: int, num_extra_frames: int = 0) -> int:
@@ -126,12 +170,12 @@ def target_state_dim(num_joints: int, num_extra_frames: int = 0) -> int:
     Args:
         num_joints: Number of joints ``nj``.
         num_extra_frames: Number of extra body frames beyond the root (each adds
-            a :data:`FRAME_BLOCK_DIM`-wide block).
+            an :data:`EE_BLOCK_DIM`-wide block).
 
     Returns:
-        ``2*nj + FRAME_BLOCK_DIM * (1 + num_extra_frames)``.
+        ``2*nj + ROOT_BLOCK_DIM + EE_BLOCK_DIM * num_extra_frames``.
     """
-    return 2 * num_joints + FRAME_BLOCK_DIM * (1 + num_extra_frames)
+    return 2 * num_joints + ROOT_BLOCK_DIM + EE_BLOCK_DIM * num_extra_frames
 
 
 def frame_block_start(num_joints: int, frame_index: int) -> int:
@@ -142,9 +186,12 @@ def frame_block_start(num_joints: int, frame_index: int) -> int:
         frame_index: ``0`` for the root/base block, ``1..K`` for extra frames.
 
     Returns:
-        The start column of that frame's ``[pos, lin_vel, ori6d, ang_vel]`` block.
+        The start column of that frame's block -- ``[pos, lin_vel, ori6d, ang_vel]``
+        for the root, ``[pos]`` for an extra frame.
     """
-    return 2 * num_joints + FRAME_BLOCK_DIM * frame_index
+    if frame_index == 0:
+        return 2 * num_joints
+    return 2 * num_joints + ROOT_BLOCK_DIM + EE_BLOCK_DIM * (frame_index - 1)
 
 
 def height_above_ground(p_ref: torch.Tensor, ground_z: float = 0.0) -> torch.Tensor:
@@ -166,20 +213,26 @@ def height_above_ground(p_ref: torch.Tensor, ground_z: float = 0.0) -> torch.Ten
     return p_ref[..., 2:3] - ground_z
 
 
-def orientation_slice(num_joints: int, frame_index: int = 0) -> tuple[int, int]:
-    """Return ``(start, end)`` of a frame's 6D orientation block.
+def orientation_slice(num_joints: int) -> tuple[int, int]:
+    """Return ``(start, end)`` of the root's 6D orientation block.
+
+    The root is the only frame carrying an orientation -- extra frames are
+    position-only (see the module docstring).
 
     Args:
         num_joints: Number of joints ``nj``.
-        frame_index: ``0`` for the root/base block, ``1..K`` for extra frames.
     """
-    start = frame_block_start(num_joints, frame_index) + 3 + 3
+    start = frame_block_start(num_joints, 0) + 3 + 3
     return start, start + 6
 
 
-def orientation_slices(num_joints: int, num_extra_frames: int = 0) -> list[tuple[int, int]]:
-    """Return the ``(start, end)`` 6D-orientation slice of every frame (base first)."""
-    return [orientation_slice(num_joints, i) for i in range(1 + num_extra_frames)]
+def orientation_slices(num_joints: int) -> list[tuple[int, int]]:
+    """Return every 6D-orientation slice in the state vector (just the root's).
+
+    Kept as a list so the normalizer's identity-mask loop reads the same whether or
+    not more oriented frames are ever added back.
+    """
+    return [orientation_slice(num_joints)]
 
 
 def _frame_relative_block(
@@ -208,6 +261,17 @@ def _frame_relative_block(
     return torch.cat([p_rel, v_rel, ori6d, w_rel], dim=-1)
 
 
+def _frame_relative_position(
+    p_ref: torch.Tensor, q_ref: torch.Tensor, p_w: torch.Tensor
+) -> torch.Tensor:
+    """Express a world position in the anchor's **xyz + yaw** ground frame.
+
+    The position half of :func:`_frame_relative_block`, used for the position-only
+    extra-frame blocks so the two paths cannot drift apart.
+    """
+    return quat_apply_inverse(yaw_quat(q_ref), p_w - p_ref)
+
+
 def relative_state(
     p_w: torch.Tensor,
     q_w: torch.Tensor,
@@ -218,19 +282,16 @@ def relative_state(
     p_ref: torch.Tensor,
     q_ref: torch.Tensor,
     frame_pos_w: torch.Tensor | None = None,
-    frame_quat_w: torch.Tensor | None = None,
-    frame_lin_vel_w: torch.Tensor | None = None,
-    frame_ang_vel_w: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build the relative-frame state vector for a batch of steps.
 
     Every input is ``(M, ·)`` where ``M`` is the number of steps. The root pose
-    (and each extra frame's pose) is expressed relative to the (per-step) **xyz +
+    (and each extra frame's position) is expressed relative to the (per-step) **xyz +
     yaw** ground frame at ``(p_ref, q_ref)`` -- the anchor's position (incl. z) and
     yaw are removed, roll/pitch are kept (see :func:`_frame_relative_block`).
     Velocities are rotated into that frame by a **pure rotation** (a stationary
     world snapshot, not a moving body frame, so no ``w x r`` term is added). Each
-    extra frame appends a block identical in layout to the root block. Absolute
+    extra frame appends a position-only :data:`EE_BLOCK_DIM` block. Absolute
     ground clearance is supplied separately (the height token).
 
     Args:
@@ -243,12 +304,9 @@ def relative_state(
         p_ref: Reference position (world), shape ``(M, 3)``.
         q_ref: Reference quaternion (world, xyzw), shape ``(M, 4)``.
         frame_pos_w: Extra-frame positions (world), shape ``(M, K, 3)`` or ``None``.
-        frame_quat_w: Extra-frame quaternions (world, xyzw), shape ``(M, K, 4)``.
-        frame_lin_vel_w: Extra-frame linear velocities (world), shape ``(M, K, 3)``.
-        frame_ang_vel_w: Extra-frame angular velocities (world), shape ``(M, K, 3)``.
 
     Returns:
-        Relative-state tensor, shape ``(M, 2*nj + 15*(1 + K))``.
+        Relative-state tensor, shape ``(M, 2*nj + 15 + 3*K)``.
     """
     root_block = _frame_relative_block(p_ref, q_ref, p_w, q_w, v_w, w_w)
     parts = [joint_pos, joint_vel, root_block]
@@ -256,11 +314,9 @@ def relative_state(
         m, k = frame_pos_w.shape[0], frame_pos_w.shape[1]
         pr = p_ref.unsqueeze(1).expand(m, k, 3).reshape(m * k, 3)
         qr = q_ref.unsqueeze(1).expand(m, k, 4).reshape(m * k, 4)
-        block = _frame_relative_block(
-            pr, qr,
-            frame_pos_w.reshape(m * k, 3), frame_quat_w.reshape(m * k, 4),
-            frame_lin_vel_w.reshape(m * k, 3), frame_ang_vel_w.reshape(m * k, 3),
-        ).reshape(m, k * FRAME_BLOCK_DIM)
+        block = _frame_relative_position(
+            pr, qr, frame_pos_w.reshape(m * k, 3)
+        ).reshape(m, k * EE_BLOCK_DIM)
         parts.append(block)
     return torch.cat(parts, dim=-1)
 
@@ -289,10 +345,17 @@ def relative_state_from_window(
     return relative_state(p_w, q_w, v_w, w_w, joint_pos, joint_vel, p_ref, q_ref)
 
 
+def _position_to_absolute(
+    p_rel: torch.Tensor, p_ref: torch.Tensor, q_ref: torch.Tensor
+) -> torch.Tensor:
+    """Invert :func:`_frame_relative_position` back to a world position."""
+    return p_ref + quat_apply(yaw_quat(q_ref), p_rel)
+
+
 def _block_to_absolute(
     block: torch.Tensor, p_ref: torch.Tensor, q_ref: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Invert one ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` block to world.
+    """Invert one ``[pos(3), lin_vel(3), ori6d(6), ang_vel(3)]`` root block to world.
 
     Uses the same **xyz + yaw** anchor as :func:`_frame_relative_block`
     (``yaw_quat(q_ref)``), so the round-trip is exact (``yaw_quat`` is idempotent).
@@ -319,7 +382,7 @@ def state_to_absolute(
     """Invert :func:`relative_state` back to world-frame quantities.
 
     Args:
-        rel_state: Relative-state tensor, shape ``(M, 2*nj + 15*(1 + K))``.
+        rel_state: Relative-state tensor, shape ``(M, 2*nj + 15 + 3*K)``.
         p_ref: Reference position (world), shape ``(M, 3)``.
         q_ref: Reference quaternion (world, xyzw), shape ``(M, 4)``.
         num_joints: Number of joints ``nj``.
@@ -328,15 +391,15 @@ def state_to_absolute(
     Returns:
         Dict with ``joint_pos``, ``joint_vel``, ``root_pos_w``, ``root_quat_w``,
         ``root_link_lin_vel_w``, ``root_link_ang_vel_w``. When ``K > 0`` also includes
-        ``frame_pos_w``/``frame_quat_w``/``frame_lin_vel_w``/``frame_ang_vel_w``,
-        each shape ``(..., K, ·)`` in the frame order used by :func:`relative_state`.
+        ``frame_pos_w``, shape ``(..., K, 3)`` in the frame order used by
+        :func:`relative_state` (extra frames are position-only).
     """
     nj = num_joints
     joint_pos = rel_state[..., 0:nj]
     joint_vel = rel_state[..., nj : 2 * nj]
     base = frame_block_start(nj, 0)
     p_w, q_w, v_w, w_w = _block_to_absolute(
-        rel_state[..., base : base + FRAME_BLOCK_DIM], p_ref, q_ref
+        rel_state[..., base : base + ROOT_BLOCK_DIM], p_ref, q_ref
     )
     out = {
         "joint_pos": joint_pos,
@@ -347,17 +410,13 @@ def state_to_absolute(
         "root_link_ang_vel_w": w_w,
     }
     if num_extra_frames > 0:
-        fp, fq, fv, fw = [], [], [], []
+        fp = []
         for k in range(num_extra_frames):
             b = frame_block_start(nj, 1 + k)
-            kp, kq, kv, kw = _block_to_absolute(
-                rel_state[..., b : b + FRAME_BLOCK_DIM], p_ref, q_ref
-            )
-            fp.append(kp); fq.append(kq); fv.append(kv); fw.append(kw)
+            fp.append(_position_to_absolute(
+                rel_state[..., b : b + EE_BLOCK_DIM], p_ref, q_ref
+            ))
         out["frame_pos_w"] = torch.stack(fp, dim=-2)
-        out["frame_quat_w"] = torch.stack(fq, dim=-2)
-        out["frame_lin_vel_w"] = torch.stack(fv, dim=-2)
-        out["frame_ang_vel_w"] = torch.stack(fw, dim=-2)
     return out
 
 

@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
 # Copyright 2026 Zachary Olkin. All rights reserved.
 #
-# The full stack in SIMULATION: the brain (g1.yml) + the MuJoCo world (g1_world.yml) +
-# the FSM echo, in one tmux session.
+# The BRAIN in simulation: g1.yml (controller + estimator + joystick FSM), and nothing else.
 #
-# The brain config launched here is the SAME FILE run_hardware_low.sh launches on the
-# robot -- only the world differs. That is the point of the split: what you test in sim is
-# literally what runs on hardware, not a sim-flavoured variant of it.
+# This is the SAME file, launched the SAME way, that run_hardware_low.sh runs on the robot.
+# The robot half comes from a separately launched config, so what you test in sim is
+# literally what runs on hardware rather than a sim-flavoured variant of it.
 #
-# MuJoCo has no execution FSM, so `fsm_state_echo` republishes the joystick's commanded
-# state as the achieved one; without it the controller would never arm.
+#   sim       ->  scripts/run_sim_world.sh   (MuJoCo + the FSM echo)
+#   hardware  ->  scripts/run_hardware_low.sh
 #
-#   window "main": controller (AUTO-RUN) | world (AUTO-RUN) | fsm echo (AUTO-RUN) | shell
+# LAUNCH THIS FIRST, THEN run_sim_world.sh, and the ordering is not cosmetic. Loading the
+# policy pair takes ~10 s (ONNX + CUDA init) while the MuJoCo world activates in ~2 s, and
+# MuJoCo has no `user_pose` equivalent holding the robot up. Start the world first and it
+# collapses on the floor before the controller can be armed -- you then measure a policy
+# recovering from a heap, which it was never trained to do.
+#
+#   window "main": controller (AUTO-RUN) | MCAP recorder (AUTO-RUN)
 #
 # Usage:
-#   scripts/run_sim_low.sh                       brain + world + echo
-#   scripts/run_sim_low.sh --scene g1_29j_basic_scene
+#   scripts/run_sim_low.sh                       the brain, recorded to MCAP
+#   scripts/run_sim_low.sh --no-bag              ... without recording
 #   scripts/run_sim_low.sh --policy <hf_folder>  override the checkpoint for this run
 #   scripts/run_sim_low.sh --build               colcon build first (needed on first run)
+#
+# To take the generator OUT of the loop and drive the tracker from a pre-made clip, use
+# scripts/run_sim_clip.sh instead. That is the first thing to reach for when this falls.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,26 +34,35 @@ OBK_SESSION=simlow
 
 usage() {
     cat <<'EOF'
-run_sim_low.sh -- brain + MuJoCo world + FSM echo, in one tmux session (simlow).
+run_sim_low.sh -- the BRAIN alone (g1.yml), in tmux session `simlow`.
 
 Options:
-  --scene NAME     transfer/sim/robots/g1/<NAME>.xml instead of the config's default.
   --policy FOLDER  Override the controller's hf_policy_folder for this run.
+  --no-bag         Do NOT record. Recording is ON by default -- a run you cannot
+                   explain afterwards is a run you have to repeat. Bags go to
+                   $REPO_ROOT/transfer/obelisk/log/bags/<timestamp>_fm/.
   --build          colcon build first.
   --build-clean    colcon clean rebuild first.
   -h, --help       Show this help.
 
-The controller comes up DISARMED. Walk the joystick FSM to LOW_LEVEL_CONTROL to arm it;
-it then primes the generator for warmup_time before the policy takes over.
+Run this FIRST, then `scripts/run_sim_world.sh` in another terminal (or detach with
+Ctrl-b d). The world is a separate launch on purpose: the brain needs ~10 s to load the
+policy, and the robot free-falls the moment the world comes up.
+
+There is no --scene here; the scene belongs to the world (run_sim_world.sh --scene NAME).
+
+The controller comes up DISARMED; run_sim_world.sh auto-arms it. There is no PD warm-up
+-- the generator drives the tracker from the first tick, sampled through its learned
+null-history embedding until the history fills, exactly as in training.
 EOF
 }
 
 ORIG_ARGS=("$@")
-SCENE="" ; POLICY="" ; BUILD=""
+POLICY="" ; BUILD="" ; BAG=1
 while [ $# -gt 0 ]; do
     case "$1" in
-        --scene)       SCENE="${2:-}"; shift 2 ;;
         --policy)      POLICY="${2:-}"; shift 2 ;;
+        --no-bag)      BAG=""; shift ;;
         --build)       BUILD=1; shift ;;
         --build-clean) BUILD=clean; shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -62,22 +79,22 @@ fi
 
 SESSION="$OBK_SESSION"
 CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1.yml"
-WORLD_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_world.yml"
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
-[ -n "$SCENE" ]  && WORLD_CFG="$(obk_scene_config "$WORLD_CFG" "$SCENE")"
 
 if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then
     exec tmux attach -t "$SESSION"
 fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-# 2x2: controller | world on top, fsm echo | debug shell below. tmux renumbers panes by
-# POSITION after each split, so once the left column (.0) is split the right column's
-# index shifts from .1 to .2 -- hence the .2 target.
-tmux new-session  -d -s "$SESSION" -n main "$(obk_pane_run ctrl  "obk-launch config=$CTRL_CFG")"
-tmux split-window -h -t "$SESSION":main.0  "$(obk_pane_run world "obk-launch config=$WORLD_CFG")"
-tmux split-window -v -t "$SESSION":main.0  "$(obk_pane_run fsm   "ros2 run g1_control fsm_state_echo")"
-tmux split-window -v -t "$SESSION":main.2  "$(obk_pane_shell dbg)"
+tmux new-session  -d -s "$SESSION" -n main "$(obk_pane_run ctrl "obk-launch config=$CTRL_CFG")"
+# Recording by default, like run_sim_clip.sh and run_hardware_low.sh. It used to be opt-in
+# on the theory that a generator run is the one you iterate on -- but the run you most want
+# a recording of is the one that surprised you, and by then it is over.
+if [ -n "$BAG" ]; then
+    tmux split-window -h -t "$SESSION":main.0 "$(obk_pane_run bag "$(obk_bag_cmd fm)")"
+else
+    tmux split-window -h -t "$SESSION":main.0 "$(obk_pane dbg "$(obk_bag_cmd fm)")"
+fi
 
 tmux select-window -t "$SESSION":main
 tmux select-pane   -t "$SESSION":main.0

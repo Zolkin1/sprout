@@ -33,6 +33,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # local imports
 import cli_args  # isort: skip
+from provenance import dump_run_conventions  # isort: skip
 
 logger = logging.getLogger(__name__)
 
@@ -316,6 +317,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # dump the configuration into log-directory
         dump_yaml(os.path.join(log_dir, "params", "env.yaml"), env_cfg)
         dump_yaml(os.path.join(log_dir, "params", "agent.yaml"), agent_cfg)
+        # ...and the CODE-level conventions this run's checkpoints will only be valid under.
+        # Not derivable from env.yaml: the reference window's base_pose convention is a source
+        # constant, and a convention change leaves env.yaml byte-identical while altering what
+        # the observation MEANS at the same width. play.py refuses a mismatch.
+        conv = dump_run_conventions(log_dir, env_cfg)
+        print(f"[INFO] Run conventions: {conv}")
 
         # optional profiling harness — instrument the manager computes + env.step
         # so the rollout time (rsl_rl's logged Perf/collection_time) is broken

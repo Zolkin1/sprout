@@ -35,9 +35,9 @@ from export_sensor_configs import (  # noqa: E402
 
 CAM = {
     "obs_term": "depth_near", "sensor": "depth_camera_near", "mount_body": "torso_link",
-    "offset_pos": [0.10, 0.0, 0.05],
-    # 75 deg pitch down about y: xyzw.
-    "offset_quat_xyzw": [0.0, math.sin(math.radians(37.5)), 0.0, math.cos(math.radians(37.5))],
+    "offset_pos": [0.1107625, 0.0, 0.0994260],
+    # 65 deg pitch down about y: xyzw.
+    "offset_quat_xyzw": [0.0, math.sin(math.radians(32.5)), 0.0, math.cos(math.radians(32.5))],
     "width": 30, "height": 26, "fx": 12.586494, "fy": 18.565924, "cx": 15.0, "cy": 13.0,
     "max_distance": 8.0, "update_period": 0.02, "clip": [-2.0, 2.0],
     "offset": 0.75, "scale": 0.5, "min_dist": 0.10, "max_dist": 7.9,

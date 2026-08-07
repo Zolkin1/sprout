@@ -46,7 +46,7 @@ SCENE = os.path.join(_SIM, "robots", "g1", "g1_21j_basic_scene.xml")
 # The two trained cameras (g1_depth_env_cfg._NEAR / _FAR), as the exported contract.
 NEAR = {
     "obs_term": "depth_near", "sensor": "depth_camera_near", "mount_body": "torso_link",
-    "offset_pos": [0.10, 0.0, 0.05], "width": WIDTH, "height": HEIGHT,
+    "offset_pos": [0.1107625, 0.0, 0.0994260], "width": WIDTH, "height": HEIGHT,
     "max_distance": 8.0, "min_dist": 0.10, "max_dist": 7.9,
     "offset": 0.75, "scale": 0.5, "min_clip_val": 0.0, "max_clip_val": 0.0,
     "clip": [-2.0, 2.0], "update_period": 0.02,
@@ -75,7 +75,7 @@ def _intrinsics(fov_h_deg: float, fov_v_deg: float) -> dict:
 def _spec() -> list[dict]:
     """The full two-camera contract with the trained optics."""
     return [
-        {**NEAR, **_intrinsics(100.0, 70.0), "offset_quat_xyzw": _pitch_quat_xyzw(75.0)},
+        {**NEAR, **_intrinsics(100.0, 70.0), "offset_quat_xyzw": _pitch_quat_xyzw(65.0)},
         {**FAR, **_intrinsics(70.0, 42.0), "offset_quat_xyzw": _pitch_quat_xyzw(35.0)},
     ]
 
@@ -270,7 +270,7 @@ def test_mount_body_must_exist():
     if not os.path.exists(SCENE):
         pytest.skip("MuJoCo scene not found (run from transfer/sim)")
     model = mujoco.MjModel.from_xml_path(SCENE)
-    spec = [{**NEAR, **_intrinsics(100.0, 70.0), "offset_quat_xyzw": _pitch_quat_xyzw(75.0),
+    spec = [{**NEAR, **_intrinsics(100.0, 70.0), "offset_quat_xyzw": _pitch_quat_xyzw(65.0),
              "mount_body": "not_a_body"}]
     with pytest.raises(ValueError, match="not_a_body"):
         MujocoDepthCameras(model, spec)
@@ -292,6 +292,50 @@ def test_noise_perturbs_without_breaking_the_image(flat_scene, cams):
     assert not np.allclose(noisy, base)
     # Dropout is per frame, so two calls differ even without a reset.
     assert not np.allclose(noisy, noisy_cams.compute(data))
+
+
+@pytest.mark.parametrize("x", [0.0, 8.5, 12.0, 40.0, 200.0])
+def test_ground_is_still_seen_far_from_the_world_origin(flat_scene, cams, x):
+    """The ground must not disappear as the robot walks away from spawn.
+
+    Regression for a real and badly-behaved bug: ``mj_multiRay``'s ``cutoff`` culls a geom
+    by ``dist(ray_origin, geom_ORIGIN) - rbound``, and a plane has ``rbound = 0`` with the
+    ground plane's origin at the world origin. Passing the camera's ``max_distance`` as the
+    cutoff therefore discarded the whole floor once the robot got that far from spawn --
+    every ground pixel read "no reading" while self-occlusion pixels stayed perfect, so the
+    policy was handed a depth image with no terrain in it. The near camera (cutoff 8 m) lost
+    it first, the far camera (12 m) later, which is what made it look intermittent.
+    """
+    model, data = flat_scene
+    data.qpos[0] = x
+    mujoco.mj_forward(model, data)
+    cams.compute(data)
+    for cam, camera in zip(_spec(), cams.cameras):
+        on_terrain = int(((model.geom_group[np.clip(camera._geomid, 0, None)] == 2)
+                          & camera.hit).sum())
+        assert on_terrain > 100, (
+            f"{cam['sensor']}: only {on_terrain} ground pixels at x={x} m "
+            "(the floor plane is being culled by the mj_multiRay cutoff)"
+        )
+
+
+def test_ground_pixel_count_is_independent_of_position(flat_scene, cams):
+    """Same flat floor, same pose, different world offset: the image must not change.
+
+    Pins the fix as a pure restoration rather than a different image -- the count and the
+    depths both have to be invariant, since translating along a plane changes nothing the
+    camera can see.
+    """
+    model, data = flat_scene
+    ref = None
+    for x in (0.0, 6.0, 30.0, 150.0):
+        data.qpos[0] = x
+        mujoco.mj_forward(model, data)
+        img = cams.compute(data).copy()
+        if ref is None:
+            ref = img
+        else:
+            assert np.abs(img - ref).max() < 1e-12, f"image changed at x={x} m"
 
 
 def test_extrinsics_jitter_does_not_compound(cams):

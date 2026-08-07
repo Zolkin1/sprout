@@ -30,23 +30,23 @@ control:
       # parameter out of their metadata: joint order, gains, observation terms and clips,
       # and the depth-camera contract. There is no policy_parameters.yaml any more -- if
       # you find yourself wanting to add one here, the value belongs in the export instead.
-      hf_repo_id: "zolkin/robot-rl-policies"
-      hf_policy_folder: "REPLACE_ME"
-      # Generator re-inference cadence, in control steps: the FM runs every Nth tick and
-      # the tracker consumes its prediction in between. FALLBACK ONLY -- overridden by
-      # `fm_update_every` in the tracker metadata when the export carries it.
-      fm_update_every: 2
-      # onnxruntime execution provider. false = CPU (the onboard minipc has no GPU);
-      # true requests CUDA and falls back to CPU if the installed runtime has no CUDA build.
-      use_cuda: false
-      onnx_threads: 2
+      # Must match deploy.hardware.DEFAULT_HF_REPO_ID, which the uploader
+      # (scripts/rsl_rl/export_to_hardware.py) and prefetch_policy.py both read. A ROS
+      # param cannot import it, so this one restatement is by hand -- change both together.
+      hf_repo_id: "zolkin/robot_rl"
+      hf_policy_folder: "2026-08-04_21-55-17_yaw_k12_v1"
+      use_cuda: true
+      # 4, not the onnxruntime default of 0 (auto): auto measured ~3x SLOWER here (the FM at
+      # 251 ms vs 87 ms on the 27M). Revisit per machine -- this is a measured local optimum,
+      # not a portable constant.
+      onnx_threads: 4
 
       # ---- Exteroception ----
       # One topic per depth camera, in the artifact's CONTRACT ORDER. The controller
       # cross-checks the count against tracker.onnx's depth_camera_spec and refuses to arm
       # on a mismatch, so a policy trained on two cameras cannot be run on one by accident.
       # Leave empty for a height-scan or blind policy.
-      depth_topics: ["/depth/image_processed"]
+      depth_topics: ["/depth/near/image_processed", "/depth/far/image_processed"]
       # Zero the velocity command if no depth frame arrives within this many seconds
       # (<=0 disables). Judged on LOCAL RECEIPT time, not the header stamp: the camera
       # clock is not synchronised to this machine.
@@ -56,18 +56,23 @@ control:
       vel_cmd_timeout: 1.0
 
       # ---- Bring-up ----
-      # The flow-matching generator conditions on a history of MEASURED robot state, so it
-      # must be primed before its first prediction means anything. On entering low-level
-      # control the controller holds the standing pose on stiffened gains for this long,
-      # feeding the history, then hands over to the policy.
-      warmup_time: 1.0
-      hold_kp_scale: 2.0
-      hold_kd_scale: 1.5
+      # There is no PD warm-up. On entering low-level control whatever feeds the tracker --
+      # the generator or a debug clip -- drives it from the first tick, which is what the
+      # MuJoCo sim2sim runner does (`--warmup_time 0`, and it is ignored outright in clip
+      # mode) and what the policy was trained for. A stiffened hold put the robot in a state
+      # no training episode started from, and fed the generator's history rows of zeros
+      # instead of letting the learned null-history embedding cover the first N steps.
 
       # ---- Logging ----
-      log: true
-      log_decimation: 1
-      config_name: "g1.yml"
+      # Diagnostic topics: /obelisk/g1/debug/tick every control step and
+      # /obelisk/g1/debug/fm_plan on every generator re-plan, carrying the quantities that
+      # exist only inside a tick. The launchers record them, and everything else the policy
+      # reads, to an MCAP bag. See "Observability" in transfer/obelisk/README.md.
+      #
+      # ~330 kB/s. Turn it off only if the latency line says publishing is eating the
+      # control period -- a run that was not recorded cannot be explained afterwards.
+      debug_topics: true
+      # Promotes the 5 s latency line from warn-on-over-budget to always.
       verbose: false
     publishers:
       - ros_parameter: pub_ctrl_setting
@@ -107,8 +112,12 @@ control:
     executable: obelisk_unitree_joystick
     params:
       v_x_scale: 1.0
-      v_y_scale: 0.25
-      w_z_scale: 1.0
+      v_y_scale: 0.5
+      w_z_scale: 0.7
+      # Yaw on the RIGHT STICK HORIZONTAL (RX = 3 + AXIS_OFFSET). The upstream default is RY
+      # -- right stick VERTICAL -- which reads as "yaw does nothing" to anyone who pushes the
+      # stick sideways expecting to turn.
+      vel_cmd_yaw: 13
     publishers:
       - ros_parameter: pub_exec_fsm_setting
         topic: /obelisk/g1/exec_fsm

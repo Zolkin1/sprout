@@ -47,6 +47,7 @@ from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_de
 
 import isaaclab_tasks  # noqa: F401
 import robot_rl  # noqa: F401 — register gym environments
+from robot_rl.flow_matching.config import FlowMatchingConfig  # noqa: E402  --ref_future_len default
 from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: E402  height_scan obs fn
 from isaaclab_tasks.utils import add_launcher_args, get_checkpoint_path, launch_simulation
 from isaaclab_tasks.utils.hydra import hydra_task_config
@@ -127,9 +128,20 @@ parser.add_argument(
          "root+joints only.",
 )
 parser.add_argument(
-    "--ref_future_len", type=int, default=40,
+    "--skip_height_scan", action="store_true", default=False,
+    help="Do not record the 'height_scan' array. The recorder normally stores BOTH "
+         "exteroception signals so one recording can train either FM (cfg.extero_source picks "
+         "at train time); pass this when the depth path is the only one you intend to use. "
+         "Note the recorded scan is CLEAN either way -- its noise lives on the obs term and the "
+         "recorder calls mdp.height_scan directly -- whereas depth carries its DR inside the "
+         "obs function, so the two are not symmetric.",
+)
+parser.add_argument(
+    "--ref_future_len", type=int, default=FlowMatchingConfig().future_len,
     help="Number of FUTURE nodes F to record per step in 'ref_future' (the ego-anchored "
-         "clip future = the robot-state-conditioned FM target). Match the FM future_len.",
+         "clip future = the robot-state-conditioned FM target). Defaults to (and MUST "
+         "match) FlowMatchingConfig.future_len -- the dataset hard-errors on a mismatch, "
+         "since windows are cut here and cannot be re-cut at train time.",
 )
 parser.add_argument(
     "--no_ref_future", action="store_true", default=False,
@@ -325,6 +337,85 @@ def _distractor_clip_mask(ref_cmd):
     return flags
 
 
+def _clip_family_codes(ref_cmd) -> tuple["torch.Tensor | None", list[str]]:
+    """Per-clip family index plus the family names, from the library's ``terrain_manifest``.
+
+    The general form of :func:`_distractor_clip_mask`. That one answers a single yes/no
+    question and so could only ever support ``--skip_distractors``; every other family
+    question -- and there are eight families in the v5 library -- needed a re-record to ask.
+    Recording the family as a CODE makes any of them a train-time switch
+    (``train.py --skip_families``), which is the same reasoning that put the distractor flag
+    in the recording rather than in the library.
+
+    The concrete motivation: ``family_jump_off`` is the BACKWARDS jump-off-a-box family, and
+    with forward-facing depth cameras the drop behind the robot is not observable at all --
+    so those windows ask the generator to predict something it cannot see.
+
+    Clips on a tile with no manifest entry (and every clip of a flat-only library) get code
+    0 = ``"unknown"``, which no filter matches.
+
+    Args:
+        ref_cmd: The resolved trajectory command term (``None`` -> no clips).
+
+    Returns:
+        ``([num_clips] long tensor of family codes, [family names])``. ``(None, [])`` when
+        the library carries no manifest or no terrain ids.
+    """
+    mgr = getattr(ref_cmd, "manager", None)
+    lib = getattr(mgr, "lib", None)
+    if lib is None or getattr(lib, "terrain_id", None) is None or lib.terrain_id.numel() == 0:
+        return None, []
+    manifest = lib.attrs.get("terrain_manifest") if hasattr(lib, "attrs") else None
+    if not manifest:
+        return None, []
+    if isinstance(manifest, str):
+        manifest = json.loads(manifest)
+
+    # Family name -> code, with 0 reserved for "no manifest entry".
+    names = ["unknown"]
+    tid_to_code: dict[int, int] = {}
+    for entry in manifest:
+        if "terrain_id" not in entry:
+            continue
+        fam = str(entry.get("family") or "unknown")
+        # Strip the .h5 the composer stamps, so a filter reads family_jump_off not
+        # family_jump_off.h5 -- the extension is an artefact of how the family was stored.
+        fam = fam[:-3] if fam.endswith(".h5") else fam
+        if fam not in names:
+            names.append(fam)
+        tid_to_code[int(entry["terrain_id"])] = names.index(fam)
+
+    tid = lib.terrain_id.to(torch.long)
+    codes = torch.zeros(tid.shape[0], dtype=torch.long, device=tid.device)
+    for t, code in tid_to_code.items():
+        codes[tid == t] = code
+    counts = {names[c]: int((codes == c).sum()) for c in sorted(set(codes.tolist()))}
+    print(f"[INFO] clip families -> per-window 'clip_family' so train.py --skip_families can "
+          f"drop any of them later: {counts}")
+    return codes, names
+
+
+def _extero_is_corrupted(env) -> bool:
+    """Whether a depth noiser is installed, i.e. the recorded depth carries the sim's sensor DR.
+
+    The ``-play`` tasks strip ``resample_depth_noise`` (and the camera extrinsics/intrinsics DR),
+    so a play recording captures CLEAN depth at the nominal pose. Recording on the train task
+    keeps them. Checked through the noiser registry because that is the thing ``depth_image``
+    consults -- an event that is configured but never ran would not corrupt anything.
+
+    Args:
+        env: The unwrapped environment.
+
+    Returns:
+        True when at least one depth observation term has a noiser installed.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.noise import get_depth_noiser
+    for sensor_name, _ in mdp.find_depth_obs_terms(env):
+        if get_depth_noiser(env, sensor_name) is not None:
+            return True
+    return False
+
+
 def _build_recording_meta(
     env: RslRlVecEnvWrapper,
     agent_cfg: RslRlBaseRunnerCfg,
@@ -332,6 +423,7 @@ def _build_recording_meta(
     log_dir: str,
     num_pairs: int,
     state_frames: list[str],
+    windowed: bool,
 ) -> RecordingMeta:
     """Capture provenance and obs/action layout metadata once at the start.
 
@@ -342,6 +434,8 @@ def _build_recording_meta(
         log_dir: Directory the checkpoint lives in.
         num_pairs: Final number of pairs that will be saved.
         state_frames: Extra body frames appended to the state vector (in order).
+        windowed: Whether this is a windowed (.h5) recording. Only that path substitutes the
+            plan anchor into the history rows, so it decides ``history_anchor``.
 
     Returns:
         A populated :class:`RecordingMeta`.
@@ -369,6 +463,8 @@ def _build_recording_meta(
         state_term_names += [f"{f}:pos_w", f"{f}:quat_w", f"{f}:lin_vel_w", f"{f}:ang_vel_w"]
         state_term_dims += [3, 4, 3, 3]
 
+    ref_blocks = mdp.reference_window_selection(env.unwrapped)
+
     return RecordingMeta(
         checkpoint_path=os.path.abspath(resume_path),
         checkpoint_sha256=sha256_file(resume_path),
@@ -395,6 +491,18 @@ def _build_recording_meta(
         # The same producer the tracker export uses, so an FM trained on this recording
         # and the tracker deployed beside it describe one physical camera pair.
         depth_camera_spec=mdp.depth_camera_specs(env.unwrapped) or None,
+        # Which reference-window blocks THIS teacher observes. The recorded arrays are
+        # world-frame rows, so any selection can be packed from them -- but the generator
+        # trained on this file has to predict what the policy consumes, so the teacher's
+        # selection is the default the FM dataset resolves. Same producer the tracker
+        # export reads, so the two artifacts cannot describe different windows.
+        reference_blocks=(list(ref_blocks) if ref_blocks else None),
+        # Windowed recordings substitute the plan anchor into the history rows (see
+        # collect_windows); the per-step .npz path does not, and its rows stay measured.
+        history_anchor="plan" if windowed else "per_step",
+        # Probes the LIVE noiser rather than the event config: depth_image applies noise only
+        # when resample_depth_noise installed one, so this is what actually reached the data.
+        extero_corrupted=_extero_is_corrupted(env.unwrapped),
     )
 
 
@@ -421,6 +529,84 @@ def _assemble_state(robot, state_frames, frame_body_idx, n_envs) -> torch.Tensor
             torch.cat([fpos, fquat, flink[..., :3], flink[..., 3:]], dim=-1).reshape(n_envs, -1)
         )
     return torch.cat(parts, dim=-1)
+
+
+# TODO(latent-fm): also record the reference ENCODER LATENT per window, so a latent-space
+# FM can be trained without re-deriving it. The teacher is a RefEncoderMLPModel: the
+# `reference` group (reference_window 13 samples x D + command_window 13 x 3) goes through
+# [1024, 512, 512] and the trunk only ever sees the resulting 512-d latent. That latent is
+# ~half the width of the window it replaces, so recording it is cheap (~2 KB/window).
+#
+# It IS derivable offline from ref_future + history_state + cmd_future, but only by
+# replicating the observation manager's noise -> clip -> scale ordering exactly and pinning
+# the teacher checkpoint -- the kind of re-derivation that drifts silently, which is why
+# recording it is worth the plumbing.
+#
+# Record the CLEAN latent (an FM target should not be noise-corrupted) and ideally the
+# corrupted one too; the pair measures how much the encoder actually cares about the noise.
+#
+# Two consequences to accept before using it, not after:
+#   * it welds the FM to ONE teacher checkpoint -- today's FM predicts a semantically
+#     defined vector, so any reference_window-consuming teacher can use it;
+#   * a latent is opaque, so it cannot be re-anchored onto the current robot pose or
+#     indexed by a cursor -> fm_update_every is pinned to 1 forever.
+
+
+def _assemble_ref_state(ref_cmd, ref_base_frame: str, state_frames, n_envs) -> torch.Tensor:
+    """The APPLIED reference in the ``_assemble_state`` layout ``[N, node]``.
+
+    The world-frame desired root + joints, plus the same extra body frames the measured
+    state carries, so a reference row is interchangeable with a measured one column-for-
+    column. That is what lets the FM dataset build a MIXED history (measured root, reference
+    joints/ee) by slicing both with one term table -- see
+    ``FlowMatchingConfig.history_source``.
+
+    Timing: ``y_des``/``dy_des`` hold the value written during the previous ``env.step``, so
+    reading this pre-step yields the reference applied at step ``t-1`` -- aligned with the
+    pre-step ``state``/``obs`` snapshot, and matching what the runtime snapshot sees.
+    """
+    ref_state = ref_cmd.get_reference_world_state(ref_base_frame)
+    if state_frames:
+        ref_frames = ref_cmd.reference_world_frames(state_frames)  # [N, K, 13]
+        ref_state = torch.cat([ref_state, ref_frames.reshape(n_envs, -1)], dim=-1)
+    return ref_state
+
+
+def _future_fits_fn(ref_cmd, max_offset: int):
+    """Per-env predicate: is the whole F-node future window inside the clip's REAL frames?
+
+    Short clips are padded into the library by repeating their last frame, and the
+    look-ahead gather clamps to the library length, so a window opened within F steps of
+    ``clip_len - 1`` has a partly FROZEN target. Training on those teaches "the reference
+    stops moving" for conditioning that otherwise means "keep going", and because the FM is
+    multi-modal it would then sample that frozen mode occasionally at deploy. Cheaper to
+    drop those windows than to un-learn the mode -- and it is the record-time half of the
+    no-clamping rule the tracker enforces at inference.
+
+    ``clip_len`` lives on the clip-library device (CPU under ``--clip_device cpu``), so
+    gather there and move the verdict back.
+
+    Args:
+        ref_cmd: The trajectory command (needs ``manager.clip_len``, ``_step``, ``clip_id``).
+        max_offset: Largest future offset the recording will gather.
+
+    Returns:
+        A zero-arg callable returning a ``[N]`` bool tensor, or ``None`` when the command
+        exposes no clip step / length (e.g. an FM-generated reference) and no gate is possible.
+    """
+    clip_len_all = getattr(getattr(ref_cmd, "manager", None), "clip_len", None)
+    if clip_len_all is None or not (hasattr(ref_cmd, "_step") and hasattr(ref_cmd, "clip_id")):
+        print("[WARN] cannot gate on clip length (no clip step/len on the command); "
+              "windows near a clip end may carry a partly frozen future.")
+        return None
+
+    def fut_ok_fn():
+        """True per env when ``step + max_offset`` is still a real (unpadded) clip frame."""
+        cid = ref_cmd.clip_id.to(clip_len_all.device)
+        cl = clip_len_all[cid].to(ref_cmd._step.device)
+        return (ref_cmd._step + max_offset) <= (cl - 1)
+
+    return fut_ok_fn
 
 
 def _assemble_ref_future_node(ref_cmd, future_offsets, state_frames, n_envs) -> torch.Tensor:
@@ -486,7 +672,8 @@ def collect_pairs(
     # Height scan (the FM's height-conditioning token), captured when the recording task
     # has a height_scanner sensor active (e.g. G1-teacher-clf-terrain-play). Same mdp.height_scan
     # used by the FM deploy + (later) the RL obs term, so record/train/deploy stay in sync.
-    has_scan = "height_scanner" in env.unwrapped.scene.sensors
+    has_scan = ("height_scanner" in env.unwrapped.scene.sensors
+                and not args_cli.skip_height_scan)
     # Depth cameras (the deployable FM exteroception signal). Recorded ALONGSIDE the scan
     # whenever the task has depth observation terms, so ONE recording can train either FM
     # and the choice is made at FM-train time via cfg.extero_source.
@@ -531,6 +718,11 @@ def collect_pairs(
         buf["ref_future"] = []
         buf["cmd_future"] = []
         buf["reanchor_active"] = []
+        # Same frozen-future gate the windowed path applies (see _future_fits_fn). Here it
+        # is folded into the recorded snap flag, because ``snap_windows`` cuts training
+        # windows from exactly that flag -- clearing it drops the window at train time.
+        fut_ok_fn = _future_fits_fn(ref_cmd, int(future_offsets.max().item()))
+        n_short = 0
     if has_scan:
         buf["height_scan"] = []
     if has_depth:
@@ -584,12 +776,7 @@ def collect_pairs(
         # obs (last computed during the previous env.step), so this stays aligned
         # with the pre-step ``state``/``obs`` snapshot above.
         if ref_cmd is not None:
-            ref_state = ref_cmd.get_reference_world_state(ref_base_frame)
-            # Append the same extra frames (world-lifted clip reference) so ref_state
-            # shares the state layout (state_term_names) when a 'reference' target is used.
-            if state_frames:
-                ref_frames = ref_cmd.reference_world_frames(state_frames)  # [N, K, 13]
-                ref_state = torch.cat([ref_state, ref_frames.reshape(n_envs, -1)], dim=-1)
+            ref_state = _assemble_ref_state(ref_cmd, ref_base_frame, state_frames, n_envs)
             buf["ref_state"].append(ref_state.detach().cpu().clone())
         if record_cmd_vel:
             buf["target_vel"].append(ref_cmd.get_command_velocity().detach().cpu().clone())
@@ -604,7 +791,12 @@ def collect_pairs(
             buf["cmd_future"].append(
                 ref_cmd.get_future_command_velocity(future_offsets).detach().cpu().clone()
             )
-            buf["reanchor_active"].append(ref_cmd._reanchor_active.detach().cpu().clone())
+            snap = ref_cmd._reanchor_active.to(torch.bool)
+            if fut_ok_fn is not None:
+                fits = fut_ok_fn()
+                n_short += int((snap & ~fits).sum().item())
+                snap = snap & fits
+            buf["reanchor_active"].append(snap.detach().cpu().clone())
         buf["episode_id"].append(episode_id.detach().cpu().clone())
         buf["step_in_episode"].append(step_in_ep.detach().cpu().clone())
 
@@ -648,6 +840,12 @@ def collect_pairs(
         if (step + 1) % 100 == 0:
             print(f"  step {step + 1}/{num_steps}")
 
+    if record_ref_future and n_short:
+        print(f"[INFO] Cleared the snap flag on {n_short} step(s) whose "
+              f"{int(future_offsets.max().item())}-step future would have crossed the clip "
+              "end: those targets are partly the clip's frozen last frame, which the FM "
+              "would learn as a stop-moving mode.")
+
     # Stack to [T, N, ...], flatten time and env into one sample axis, trim.
     out: dict[str, np.ndarray] = {}
     for key, tensors in buf.items():
@@ -675,6 +873,7 @@ def collect_windows(
     writer,
     max_steps: int | None = None,
     distractor_clips=None,
+    family_codes=None,
 ) -> int:
     """Roll out and STREAM pre-formed FM snap windows to ``writer`` (bounded RAM).
 
@@ -685,6 +884,11 @@ def collect_windows(
     ``snap_windows(num_history=history_len, stride=1)`` over a full per-step recording
     (proven by ``tests/test_record_windows.py``), but never holds more than a per-env
     ring of the last ``H`` states plus one flush batch in memory.
+
+    TWO history rings are kept per env, both ``[N, H, node]``: the MEASURED robot state, and
+    the reference that was APPLIED at each of those steps (``history_ref``). The second one
+    is what ``history_source="reference_partial"`` trains on; recording it unconditionally
+    keeps that a train-time A/B rather than a second multi-hour recording.
 
     Args:
         env, policy, policy_nn, initial_obs, stochastic: as in :func:`collect_pairs`.
@@ -703,7 +907,8 @@ def collect_windows(
     device = env.unwrapped.device
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
-    has_scan = "height_scanner" in env.unwrapped.scene.sensors
+    has_scan = ("height_scanner" in env.unwrapped.scene.sensors
+                and not args_cli.skip_height_scan)
     has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped))
 
     state_frames = list(state_frames or [])
@@ -717,9 +922,18 @@ def collect_windows(
 
     obs = initial_obs
     H = int(history_len)
-    # Per-env history ring ([N, H, node]; row H-1 = most recent) + a consecutive-valid
-    # counter reset to 0 on episode end so a window can never span a reset.
+    # Per-env history rings ([N, H, node]; row H-1 = most recent) + a consecutive-valid
+    # counter reset to 0 on episode end so a window can never span a reset. ``hist`` is the
+    # measured robot state; ``hist_ref`` is the reference applied at the same steps.
     hist: torch.Tensor | None = None
+    hist_ref: torch.Tensor | None = None
+    # The PLAN ANCHOR in force at each step: the robot root pose captured at the last
+    # re-anchor (``_snap_target_*``). Ringed per step rather than read once at emit, because
+    # at a snap step the re-anchor has already moved the snapshot onto the robot NOW -- reading
+    # it then would give the anchor of the plan being STARTED, not the one whose tail the
+    # history rows belong to. Per-step also makes a window that straddles a re-plan correct by
+    # construction instead of by argument.
+    hist_anchor: torch.Tensor | None = None
     valid = torch.zeros(n_envs, dtype=torch.long, device=device)
     # Distinct episode ids per env so the FM's by-episode train/val split has no leakage.
     episode_id = torch.arange(n_envs, dtype=torch.int64, device=device)
@@ -734,23 +948,7 @@ def collect_windows(
           f"on {n_envs} envs; max_steps={max_steps}...")
     written = 0
     step = 0
-    # Gate: does this env's whole future window still fall inside the clip's real frames?
-    # ``clip_len`` lives on the clip-library device (CPU under --clip_device cpu), so gather
-    # there and move the verdict back. None when the command exposes no clip step / length
-    # (e.g. an FM-generated reference), in which case no gating is possible.
-    max_off = int(future_offsets.max().item())
-    clip_len_all = getattr(getattr(ref_cmd, "manager", None), "clip_len", None)
-    have_step = hasattr(ref_cmd, "_step") and hasattr(ref_cmd, "clip_id")
-    fut_ok_fn = None
-    if clip_len_all is not None and have_step:
-        def fut_ok_fn():
-            """True per env when ``step + max_offset`` is still a real (unpadded) clip frame."""
-            cid = ref_cmd.clip_id.to(clip_len_all.device)
-            cl = clip_len_all[cid].to(ref_cmd._step.device)
-            return (ref_cmd._step + max_off) <= (cl - 1)
-    else:
-        print("[WARN] cannot gate on clip length (no clip step/len on the command); "
-              "windows near a clip end may carry a partly frozen future.")
+    fut_ok_fn = _future_fits_fn(ref_cmd, int(future_offsets.max().item()))
     n_short = 0
     while written < num_windows and step < max_steps:
         with torch.inference_mode():
@@ -758,13 +956,27 @@ def collect_windows(
 
         # Pre-step snapshot (aligned with obs), matching collect_pairs' snap timing.
         state_t = _assemble_state(robot, state_frames, frame_body_idx, n_envs)  # [N, node]
+        # The reference the policy was tracking when it chose this step's action. ``y_des``
+        # was last written during the PREVIOUS env.step, so a pre-step read gives the
+        # reference applied at step t-1 -- which is exactly the convention the runtime
+        # snapshot uses (``FmTrackingCommand._robot_snapshot`` also runs before this step's
+        # reference is resolved). The two must agree or the partially autoregressive history
+        # is off by one.
+        ref_t = _assemble_ref_state(ref_cmd, ref_base_frame, state_frames, n_envs)
+        anchor_t = torch.cat([ref_cmd._snap_target_pos, ref_cmd._snap_target_quat], dim=-1)
         if hist is None:
             hist = torch.zeros(n_envs, H, state_t.shape[1], device=device)
+            hist_ref = torch.zeros(n_envs, H, ref_t.shape[1], device=device)
+            hist_anchor = torch.zeros(n_envs, H, anchor_t.shape[1], device=device)
         reanchor_t = ref_cmd._reanchor_active.to(torch.bool)                    # [N]
 
-        # Push this step's state into the ring; mark the row valid.
+        # Push this step's rows into the rings; mark the row valid.
         hist = torch.roll(hist, shifts=-1, dims=1)
         hist[:, H - 1] = state_t
+        hist_ref = torch.roll(hist_ref, shifts=-1, dims=1)
+        hist_ref[:, H - 1] = ref_t
+        hist_anchor = torch.roll(hist_anchor, shifts=-1, dims=1)
+        hist_anchor[:, H - 1] = anchor_t
         valid = torch.clamp(valid + 1, max=H)
 
         # Emit a window for each env that snaps AND has a full valid ring AND whose whole
@@ -785,8 +997,22 @@ def collect_windows(
             idx = emit.nonzero(as_tuple=False).flatten()
             ref_future_t = _assemble_ref_future_node(ref_cmd, future_offsets, state_frames, n_envs)
             cmd_future_t = ref_cmd.get_future_command_velocity(future_offsets)  # [N, F, 3]
+            # The dataset reads ONLY root_pos_w / root_quat_w out of history_state, and uses
+            # each history row's copy as the FRAME that row's reference is observed in. So
+            # substituting the plan anchor into rows 0..H-2 is the whole of "observe the
+            # history in its plan's frame" -- no format or dataset change.
+            #
+            # Row H-1 keeps the MEASURED pose: that row is the TARGET's anchor, and the target
+            # is observed relative to the robot as it actually is at the snap.
+            #
+            # The other columns of rows 0..H-2 stay measured and stay unread. That makes those
+            # rows a deliberate mix, which is why RecordingMeta.history_anchor records it and
+            # the dataset refuses a recording that does not say "plan".
+            hist_out = hist[idx].clone()
+            hist_out[:, :H - 1, 0:7] = hist_anchor[idx][:, :H - 1]
             batch = {
-                "history_state": hist[idx].detach().cpu().numpy(),
+                "history_state": hist_out.detach().cpu().numpy(),
+                "history_ref": hist_ref[idx].detach().cpu().numpy(),
                 "ref_future": ref_future_t[idx].detach().cpu().numpy(),
                 "cmd_future": cmd_future_t[idx].detach().cpu().numpy(),
                 "episode_id": episode_id[idx].detach().cpu().numpy(),
@@ -798,6 +1024,13 @@ def collect_windows(
             batch["is_distractor"] = (
                 distractor_clips[cid.to(distractor_clips.device)].to(torch.uint8).cpu().numpy()
                 if distractor_clips is not None
+                else np.zeros(idx.numel(), dtype=np.uint8)
+            )
+            # Per-window family code (see _clip_family_codes). Superset of is_distractor:
+            # that flag stays for the recordings and flags that already exist.
+            batch["clip_family"] = (
+                family_codes[cid.to(family_codes.device)].to(torch.uint8).cpu().numpy()
+                if family_codes is not None
                 else np.zeros(idx.numel(), dtype=np.uint8)
             )
             if has_scan:
@@ -838,8 +1071,9 @@ def collect_windows(
         print(f"[WARN] Reached max_steps={max_steps} with {written}/{num_windows} windows "
               f"(snaps sparser than expected); saving what was collected.")
     if n_short:
-        print(f"[INFO] Dropped {n_short} snap window(s) whose {max_off}-step future would have "
-              f"crossed the clip end ({100.0 * n_short / max(n_short + written, 1):.1f}% of "
+        print(f"[INFO] Dropped {n_short} snap window(s) whose {int(future_offsets.max().item())}"
+              f"-step future would have crossed the clip end "
+              f"({100.0 * n_short / max(n_short + written, 1):.1f}% of "
               f"otherwise-eligible snaps): those targets are partly the clip's frozen last "
               f"frame, which the FM would learn as a stop-moving mode.")
     return written
@@ -920,7 +1154,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
         else:
             raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-        runner.load(resume_path)
+        # Recording never evaluates the value function -- it only needs the actor to
+        # produce actions -- so honour a runner cfg that opts out of restoring the critic
+        # (``load_critic = False``), exactly as play.py does. Without this, recording from
+        # the FM-tracker task (whose runner cfg sets it, because that env has no
+        # privileged critic group) fails on a critic it was never going to use. Actor
+        # weights are still loaded strictly, so a real policy mismatch fails loudly.
+        if getattr(agent_cfg, "load_critic", True):
+            runner.load(resume_path)
+        else:
+            print("[INFO] Skipping the critic (load_critic=False): loading actor weights only.")
+            runner.load(resume_path, load_cfg={"actor": True, "critic": False,
+                                               "optimizer": False, "iteration": True, "rnd": True})
         runner.alg.eval_mode()
 
         policy = runner.get_inference_policy(device=env.unwrapped.device)
@@ -965,8 +1210,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Per-clip distractor flag, recorded so `train.py --skip_distractors` can drop those
         # windows later without re-recording.
         distractor_clips = _distractor_clip_mask(ref_cmd)
+        family_codes, family_names = _clip_family_codes(ref_cmd)
 
-        meta = _build_recording_meta(env, agent_cfg, resume_path, log_dir, num_records, state_frames)
+        meta = _build_recording_meta(
+            env, agent_cfg, resume_path, log_dir, num_records, state_frames, windowed=windowed
+        )
+        # The code -> name table for the per-window 'clip_family' tag. Meaningless without
+        # it, so it travels in the recording rather than being reconstructed from a library
+        # that may have moved on.
+        meta.family_names = list(family_names)
 
         # Ego-anchored clip-future target (robot-state-conditioned FM): recorded when the
         # command exposes the look-ahead accessors + a command velocity, unless disabled.
@@ -980,8 +1232,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             meta.ref_future_len = rf_len
             meta.ref_future_term_names = list(meta.state_term_names)  # node layout == state
             meta.ref_future_term_dims = list(meta.state_term_dims)
+            # The snap period the windows were cut at. The FM tracker's fm_update_every must
+            # match it: the horizon is sized from the re-plan period, so a tracker running a
+            # different one is both off-distribution and possibly short of horizon.
+            meta.fm_snap_every = int(getattr(ref_cmd.cfg, "fm_snap_every", 0))
             print(f"[INFO] Recording ego-anchored clip future (ref_future): F={rf_len} nodes/step "
-                  f"+ cmd_future + reanchor_active (snap events).")
+                  f"+ cmd_future + reanchor_active (snap every {meta.fm_snap_every} steps).")
         elif ref_cmd is not None:
             meta.ref_source = "reference"
 
@@ -1023,14 +1279,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "clip-tracking task exposing get_future_world_base + a command velocity, "
                     "and do not pass --no_ref_future."
                 )
-            if "height_scanner" not in env.unwrapped.scene.sensors:
+            if ("height_scanner" not in env.unwrapped.scene.sensors
+                    and not args_cli.skip_height_scan
+                    and not mdp.find_depth_obs_terms(env.unwrapped)):
                 raise ValueError(
-                    "--num_windows requires a height_scanner sensor (the FM's height token); "
-                    "record on a task that has one (e.g. G1-teacher-clf-terrain-play)."
+                    "--num_windows needs SOME exteroception: a height_scanner sensor, depth obs "
+                    "terms, or --skip_height_scan on a depth task. Record on a task that has "
+                    "one (e.g. G1-teacher-clf-terrain-depth)."
                 )
             H = int(args_cli.history_len)
             node_dim = int(sum(meta.state_term_dims))
-            K = int(mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).shape[1])
+            # 0 makes RecordedWindowWriter omit the dataset entirely. This MUST agree with
+            # collect_windows' own `has_scan`, which is why both read the same two conditions:
+            # the writer accepts only keys it declared, so declaring height_scan while the loop
+            # never fills it is a KeyError on the first emitted batch.
+            _rec_scan = ("height_scanner" in env.unwrapped.scene.sensors
+                         and not args_cli.skip_height_scan)
+            K = (int(mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).shape[1])
+                 if _rec_scan else 0)
             cmd_dim = int(
                 ref_cmd.get_future_command_velocity(
                     torch.arange(1, device=env.unwrapped.device)
@@ -1056,12 +1322,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # tag's PRESENCE is what lets `train.py --skip_distractors` distinguish "none to
                 # drop" from "this recording predates the tag" and refuse the latter.
                 tag_distractors=True,
+                # And the family code it generalises. Without this the writer never declared
+                # the dataset, so the key record_data assembled was silently dropped and
+                # --skip_families could never match.
+                tag_families=True,
+                # Same reasoning for the applied-reference ring: recording it always makes
+                # `history_source=reference_partial` a train-time A/B, and its absence
+                # unambiguously means "this recording predates the mode".
+                record_history_ref=True,
             ) as writer:
                 n_written = collect_windows(
                     env, policy, policy_nn, obs, num_records, H, args_cli.stochastic,
                     ref_cmd=ref_cmd, ref_base_frame=args_cli.ref_base_frame,
                     state_frames=state_frames, future_len=rf_len, writer=writer,
-                    distractor_clips=distractor_clips,
+                    distractor_clips=distractor_clips, family_codes=family_codes,
                 )
             prov_dir = os.path.splitext(out_path)[0] + ".provenance"
             git_snapshot(prov_dir)
