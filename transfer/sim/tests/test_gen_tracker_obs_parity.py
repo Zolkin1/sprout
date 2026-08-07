@@ -270,7 +270,7 @@ def test_obs_parity(run: str | None = None) -> None:
         pol._trk.action_isaac = np.zeros(nj)
         # Each env is an independent comparison, so the history must not carry across them.
         pol.reset()
-        obs_last = pol._build_obs(state, reference)[0]
+        obs_last = pol.create_obs_from_reference(state, reference)[0]
         for name in isaac_terms:
             lo, hi = term_off[name]
             mine[name].append(obs_last[lo:hi])
@@ -360,7 +360,7 @@ def _check_history(pol, term_off, term_dims, nj) -> bool:
             "frame_pos": np.zeros((pol.ctx.target_num_extra_frames, 3)),
         } for _ in pol.window_offsets]}
         pol._trk.action_isaac = np.zeros(nj)
-        return pol._build_obs(state, ref)[0][lo:hi]
+        return pol.create_obs_from_reference(state, ref)[0][lo:hi]
 
     ok = True
     first = _obs_at(1)

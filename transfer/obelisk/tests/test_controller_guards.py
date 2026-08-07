@@ -29,6 +29,11 @@ sys.path.insert(0, os.path.join(_OBELISK, "g1_control"))
 sys.path.insert(0, _TRANSFER)
 
 
+def _msg_init(self) -> None:
+    """Give a stubbed message a ``header`` with a settable ``stamp``, like the real one."""
+    self.header = types.SimpleNamespace(stamp=None)
+
+
 def _stub_ros_modules() -> None:
     """Install minimal stand-ins for the ROS packages ``controller`` imports at module scope.
 
@@ -45,6 +50,13 @@ def _stub_ros_modules() -> None:
     # MagicMock rather than a bare class: module scope reads enum members off these
     # (HistoryPolicy.KEEP_LAST, ...), and a mock conjures whatever is asked for.
     cls = MagicMock
+    # First-party diagnostic messages. Real classes, not mocks: the tests assign typed
+    # fields on them, and a MagicMock would accept literally anything -- including the
+    # field-name typos this is meant to catch.
+    mod("g1_msgs")
+    mod("g1_msgs.msg",
+        ControllerDebug=type("ControllerDebug", (), {"__init__": _msg_init}),
+        FmPlan=type("FmPlan", (), {"__init__": _msg_init}))
     mod("obelisk_control_msgs")
     mod("obelisk_control_msgs.msg", ExecutionFSM=cls(), PDFeedForward=cls(),
         VelocityCommand=cls())

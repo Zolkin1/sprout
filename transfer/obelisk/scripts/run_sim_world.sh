@@ -20,8 +20,18 @@
 # split honest means the sim robot supplies it too. (It is also why running it in both
 # would collide: two nodes of the same name on one graph.)
 #
+# It AUTO-ARMS by default (SIM ONLY): the FSM echo comes up already reporting
+# LOW_LEVEL_CONTROL, so the controller arms as soon as it has a state estimate and no
+# joystick input is needed. MuJoCo has no `user_pose` holding the robot up, so waiting for a
+# button press just means watching it collapse. A joystick command still overrides at any
+# time -- damping and e-stop included -- and `--no-auto-arm` restores the hardware-like flow.
+#
+# This cannot leak to hardware: fsm_state_echo exists only because MuJoCo has no execution
+# FSM and is launched only from here. On a robot the G1 interface publishes the real state
+# and this node never runs.
+#
 # Usage:
-#   scripts/run_sim_world.sh [--scene NAME] [--build|--build-clean]
+#   scripts/run_sim_world.sh [--scene NAME] [--no-auto-arm] [--build|--build-clean]
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -29,14 +39,17 @@ source "$HERE/lib/obk_launch.sh"
 OBK_SESSION=simworld
 
 ORIG_ARGS=("$@")
-SCENE="" ; BUILD=""
+SCENE="" ; BUILD="" ; AUTO_ARM=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --scene)       SCENE="${2:-}"; shift 2 ;;
+        --no-auto-arm) AUTO_ARM=""; shift ;;
         --build)       BUILD=1; shift ;;
         --build-clean) BUILD=clean; shift ;;
         -h|--help)
-            echo "run_sim_world.sh [--scene NAME] [--build|--build-clean]"
+            echo "run_sim_world.sh [--scene NAME] [--no-auto-arm] [--build|--build-clean]"
+            echo "  --no-auto-arm  Come up in INIT and wait for a joystick FSM command,"
+            echo "                 the way hardware does. Default AUTO-ARMS (sim only)."
             echo "  The MuJoCo world + FSM echo, in tmux session 'simworld'."
             echo "  Launch scripts/run_sim_low.sh (the brain) FIRST -- it needs ~10 s to"
             echo "  load the policy, and the robot free-falls once this comes up."
@@ -65,6 +78,14 @@ fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 tmux new-session  -d -s "$SESSION" -n main "$(obk_pane_run world "obk-launch config=$WORLD_CFG")"
-tmux split-window -h -t "$SESSION":main.0  "$(obk_pane_run fsm "ros2 run g1_control fsm_state_echo")"
+# AUTO-ARM lives here, in the SIM-ONLY FSM echo, and deliberately not as a controller
+# option: this node exists only because MuJoCo has no execution FSM and is launched only by
+# this script, so on hardware the capability structurally does not exist rather than merely
+# being switched off. MuJoCo also has no `user_pose` holding the robot up, so every second
+# the controller spends disarmed is a second of the robot collapsing -- waiting for a button
+# press is the wrong default in sim even though it is the only safe one on a robot.
+FSM_CMD="ros2 run g1_control fsm_state_echo"
+[ -n "$AUTO_ARM" ] && FSM_CMD="$FSM_CMD --ros-args -p initial_state:=3"
+tmux split-window -h -t "$SESSION":main.0  "$(obk_pane_run fsm "$FSM_CMD")"
 tmux select-pane  -t "$SESSION":main.0
 exec tmux attach  -t "$SESSION"

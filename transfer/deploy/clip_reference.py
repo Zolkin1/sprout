@@ -1,16 +1,21 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Torch-free baked-clip reference source for the MuJoCo sim2sim runner.
+"""Torch-free baked-clip reference source, shared by MuJoCo sim2sim and hardware.
 
 Loads a dense motion-clip library (the HDF5 produced by
 ``scripts/rsl_rl/generate_mb_library.py``) with numpy
 and serves, per control step, the same world-frame reference dict the online
 flow-matching generator emits -- ``{"window": [{...}, ...]}``, one entry per
 look-ahead offset with offset 0 (the current step) first -- so it
-drops straight into ``GenTrackerPolicy._build_obs(state, reference=...)``.  This
-lets the MuJoCo runner play a fixed clip through the tracker with **no FM**
-(deterministic), and is the counterpart of IsaacLab's ``MotionSequenceCommand``
+drops straight into ``GenTrackerPolicy.create_obs_from_reference(state, reference)``.
+This plays a fixed clip through the tracker with **no FM at all** (the generator
+is not even loaded), and is the counterpart of IsaacLab's ``MotionSequenceCommand``
 playback for sim2sim parity.
+
+It lives in ``deploy`` rather than ``sim`` because BOTH off-sim consumers need it:
+``transfer/sim/gen_tracker_runner.py --clip`` and the obelisk controller's debug-clip
+mode.  ``transfer/sim/__init__.py`` imports mujoco, so a ROS node on the robot cannot
+import from that package at all.
 
 The clip stores its outputs in a single *clip-world* frame (the per-step stance
 anchor baked in at generation time).  The runtime applies a single per-env
@@ -20,6 +25,11 @@ identity (anchor at the origin, identity yaw), so the lift is a pass-through and
 the robot spawns on the clip's step-0 pose.
 
 No torch / isaaclab imports -- numpy + h5py + ``deploy.quat_math_np`` only.
+
+``h5py`` is the ONE dependency ``deploy`` takes beyond numpy + onnxruntime, and it is
+imported lazily inside :meth:`ClipReference.__init__` so importing ``deploy`` -- or
+running the normal FM path, which never touches this module -- does not require it.
+A robot image only needs h5py if it is going to play debug clips.
 """
 
 from __future__ import annotations
@@ -27,7 +37,6 @@ from __future__ import annotations
 import json
 import math
 
-import h5py
 import numpy as np
 
 from deploy.quat_math_np import quat_apply, quat_inv, quat_mul
@@ -53,6 +62,40 @@ def _yaw_quat(q: np.ndarray) -> np.ndarray:
 def _anchor_inv_yaw(anchor_quat: np.ndarray) -> np.ndarray:
     """Lift rotation taking anchor-relative vectors into the world (mirrors world_lift)."""
     return quat_inv(_yaw_quat(quat_inv(anchor_quat)))
+
+
+def resolve_case(path: str, case: str) -> int:
+    """Clip index of a named case in a debug library, via its JSON sidecar.
+
+    ``scripts/rsl_rl/make_debug_clips.py`` writes ``<lib>.json`` mapping case name ->
+    clip index, so a launcher, a ROS config and a MuJoCo run can all say ``stand``
+    rather than restating an index that changes whenever the library is regenerated.
+
+    Args:
+        path: The clip library ``.h5``.
+        case: Case name, e.g. ``"stand"``.
+
+    Returns:
+        The clip index within ``path``.
+
+    Raises:
+        FileNotFoundError: If the sidecar is missing (the library was not built by
+            ``make_debug_clips.py``, so it has no case names -- use an index instead).
+        KeyError: If ``case`` is not in the sidecar, naming the ones that are.
+    """
+    sidecar = str(path).rsplit(".h5", 1)[0] + ".json"
+    try:
+        with open(sidecar) as f:
+            cases = json.load(f)["cases"]
+    except FileNotFoundError:
+        raise FileNotFoundError(
+            f"no case sidecar at {sidecar}, so '{case}' cannot be resolved. Either build "
+            "the library with scripts/rsl_rl/make_debug_clips.py, or select the clip by "
+            "index instead of by name."
+        ) from None
+    if case not in cases:
+        raise KeyError(f"no case '{case}' in {sidecar}; it has {sorted(cases)}.")
+    return int(cases[case]["clip_index"])
 
 
 class ClipReference:
@@ -96,6 +139,8 @@ class ClipReference:
         ego_anchor_every: int = 10,
         root_frame_bodies: list[str] | None = None,
     ) -> None:
+        import h5py  # lazy: see the module docstring -- deploy must import without it
+
         with h5py.File(str(path), "r") as f:
             self.y = np.asarray(f["y_des"][clip_id], dtype=np.float64)    # [T, P] clip-world
             self.dy = np.asarray(f["dy_des"][clip_id], dtype=np.float64)  # [T, V]
@@ -106,10 +151,21 @@ class ClipReference:
             pos_names = json.loads(f.attrs["pos_output_names"])
             vel_names = json.loads(f.attrs["vel_output_names"])
             self.dt = float(json.loads(f.attrs["dt"]))
+            # Where the real motion ends. Clips are stored repeat-last-frame padded to a
+            # common length, and the padding repeats the last COMMAND too -- so a clip whose
+            # motion ends at 331 of 1000 steps otherwise serves 13 s of frozen pose while
+            # still asking for 0.6 m/s. The pose is identical either way (padding repeats
+            # it), but the caller needs to know where to stop, and on hardware "keep
+            # commanding a walk against a stationary reference" is not a state to sit in.
+            self.real_steps = (int(np.asarray(f["clip_len"][clip_id]))
+                               if "clip_len" in f else int(self.y.shape[0]))
         self.num_steps = int(self.y.shape[0])
+        self.real_steps = max(1, min(self.real_steps, self.num_steps))
         self.clip_length_s = self.num_steps * self.dt
+        #: Playable duration of the REAL motion, which is what a run should be sized on.
+        self.real_length_s = self.real_steps * self.dt
         # Step at which playback begins (spawn pose + first served reference).
-        self.start_step = int(min(max(round(float(start_time) / self.dt), 0), self.num_steps - 1))
+        self.start_step = int(min(max(round(float(start_time) / self.dt), 0), self.real_steps - 1))
 
         def pi(name: str) -> int:
             return pos_names.index(name)
@@ -208,8 +264,12 @@ class ClipReference:
     # ------------------------------------------------------------------
 
     def _frame_state(self, step: int) -> dict:
-        """World-frame reference at ``step`` (root + joints + ee), placement-lifted."""
-        s = int(min(max(step, 0), self.num_steps - 1))
+        """World-frame reference at ``step`` (root + joints + ee), placement-lifted.
+
+        Saturates on the last REAL step (see ``real_steps``), mirroring the IsaacLab
+        convention of clamping the look-ahead window at the clip end.
+        """
+        s = int(min(max(step, 0), self.real_steps - 1))
         y, dy = self.y[s], self.dy[s]
         state = {
             "root_pos": self._lift_pos(y[self._base_pos]),
@@ -250,7 +310,7 @@ class ClipReference:
         """Commanded base velocity ``(vx, vy, wz)`` at ``step`` (clip ``target_vel``)."""
         if self.tv is None:
             return np.zeros(3)
-        s = int(min(max(step, 0), self.num_steps - 1))
+        s = int(min(max(step, 0), self.real_steps - 1))
         return self.tv[s].copy()
 
     def future_command_horizon(self, step: int, num_future: int) -> np.ndarray:
@@ -264,7 +324,7 @@ class ClipReference:
         """
         if self.tv is None:
             return np.zeros((num_future, 3))
-        idx = np.minimum(step + 1 + np.arange(num_future), self.num_steps - 1)
+        idx = np.minimum(step + 1 + np.arange(num_future), self.real_steps - 1)
         return self.tv[idx].copy()
 
     def reference_at(self, step: int, window_offsets: list[int]) -> dict:

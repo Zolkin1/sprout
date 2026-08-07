@@ -7,6 +7,11 @@
   <maintainer email="zach.olkin@gmail.com">zolkin</maintainer>
   <license>TODO: License declaration</license>
 
+  <!-- The controller's diagnostic topics. A <depend> rather than an <exec_depend> so colcon
+       orders g1_msgs first: without it the message package may build after this one, and
+       the controller's `from g1_msgs.msg import ...` fails at launch on a clean workspace. -->
+  <depend>g1_msgs</depend>
+
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>

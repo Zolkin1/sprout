@@ -88,3 +88,9 @@ matplotlib>=3.8           # transfer/sim/gen_tracker_metrics.py, plot_from_sim.p
 #                                                 # puts them on the loader path
 #
 # Containerized equivalents of all three: transfer/deploy/docker/Dockerfile.bench.
+
+# Reading recorded obelisk runs off-robot (transfer/obelisk/plot_utils). MCAP embeds every
+# message schema in the bag, so these decode g1_msgs/obelisk_control_msgs with no ROS
+# installation and no workspace -- which is the point of recording MCAP rather than sqlite3.
+mcap>=1.1
+mcap-ros2-support>=0.5

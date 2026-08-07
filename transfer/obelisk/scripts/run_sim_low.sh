@@ -16,12 +16,16 @@
 # collapses on the floor before the controller can be armed -- you then measure a policy
 # recovering from a heap, which it was never trained to do.
 #
-#   window "main": controller (AUTO-RUN) | debug shell
+#   window "main": controller (AUTO-RUN) | MCAP recorder (AUTO-RUN)
 #
 # Usage:
-#   scripts/run_sim_low.sh                       the brain
+#   scripts/run_sim_low.sh                       the brain, recorded to MCAP
+#   scripts/run_sim_low.sh --no-bag              ... without recording
 #   scripts/run_sim_low.sh --policy <hf_folder>  override the checkpoint for this run
 #   scripts/run_sim_low.sh --build               colcon build first (needed on first run)
+#
+# To take the generator OUT of the loop and drive the tracker from a pre-made clip, use
+# scripts/run_sim_clip.sh instead. That is the first thing to reach for when this falls.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -34,6 +38,9 @@ run_sim_low.sh -- the BRAIN alone (g1.yml), in tmux session `simlow`.
 
 Options:
   --policy FOLDER  Override the controller's hf_policy_folder for this run.
+  --no-bag         Do NOT record. Recording is ON by default -- a run you cannot
+                   explain afterwards is a run you have to repeat. Bags go to
+                   $REPO_ROOT/transfer/obelisk/log/bags/<timestamp>_fm/.
   --build          colcon build first.
   --build-clean    colcon clean rebuild first.
   -h, --help       Show this help.
@@ -44,16 +51,18 @@ policy, and the robot free-falls the moment the world comes up.
 
 There is no --scene here; the scene belongs to the world (run_sim_world.sh --scene NAME).
 
-The controller comes up DISARMED. Walk the joystick FSM to LOW_LEVEL_CONTROL to arm it;
-it then primes the generator for warmup_time before the policy takes over.
+The controller comes up DISARMED; run_sim_world.sh auto-arms it. There is no PD warm-up
+-- the generator drives the tracker from the first tick, sampled through its learned
+null-history embedding until the history fills, exactly as in training.
 EOF
 }
 
 ORIG_ARGS=("$@")
-POLICY="" ; BUILD=""
+POLICY="" ; BUILD="" ; BAG=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --policy)      POLICY="${2:-}"; shift 2 ;;
+        --no-bag)      BAG=""; shift ;;
         --build)       BUILD=1; shift ;;
         --build-clean) BUILD=clean; shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -78,7 +87,14 @@ fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
 tmux new-session  -d -s "$SESSION" -n main "$(obk_pane_run ctrl "obk-launch config=$CTRL_CFG")"
-tmux split-window -h -t "$SESSION":main.0  "$(obk_pane_shell dbg)"
+# Recording by default, like run_sim_clip.sh and run_hardware_low.sh. It used to be opt-in
+# on the theory that a generator run is the one you iterate on -- but the run you most want
+# a recording of is the one that surprised you, and by then it is over.
+if [ -n "$BAG" ]; then
+    tmux split-window -h -t "$SESSION":main.0 "$(obk_pane_run bag "$(obk_bag_cmd fm)")"
+else
+    tmux split-window -h -t "$SESSION":main.0 "$(obk_pane dbg "$(obk_bag_cmd fm)")"
+fi
 
 tmux select-window -t "$SESSION":main
 tmux select-pane   -t "$SESSION":main.0

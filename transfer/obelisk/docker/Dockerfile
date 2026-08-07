@@ -129,6 +129,17 @@ p = ort.get_available_providers(); \
 assert 'CUDAExecutionProvider' in p, 'CPU-only onnxruntime wheel installed: %s' % p; \
 print('[image] onnxruntime', ort.__version__, 'providers:', p)"
 
+# MCAP bag storage. rosbag2's default plugin is sqlite3, whose .db3 stores only message
+# TYPE NAMES -- reading one back needs obelisk_control_msgs/obelisk_estimator_msgs/g1_msgs
+# built and sourced, i.e. all analysis happens inside this container. MCAP embeds each
+# schema in the file, so a run can be read on any machine with `pip install mcap` and no ROS
+# at all, and Foxglove opens it directly (it dropped ROS 2 .db3 support). It is also chunked
+# and append-only, so a bag killed mid-run -- which is every run that ends in a fall -- is
+# still readable. scripts/lib/obk_launch.sh records with `-s mcap`.
+RUN sudo apt-get update && sudo apt-get install -y \
+    ros-humble-rosbag2-storage-mcap && \
+    sudo rm -rf /var/lib/apt/lists/*
+
 # ============================================
 # Stage 2: Hardware (adds lidar stack)
 # ============================================

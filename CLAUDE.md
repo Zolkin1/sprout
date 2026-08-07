@@ -117,6 +117,76 @@ term the way training did instead of consulting a hardcoded table (kept only as 
   `transforms_np.py` is now tested against the real `robot_rl.flow_matching.transforms`
   (`importorskip`-guarded, so that half skips without IsaacSim).
 
+# obelisk (ROS2 deploy) — the default run pipeline
+
+Three commands, in this order, every time:
+
+```bash
+cd transfer/obelisk
+scripts/run_sim_low.sh                 # 1. BRAIN   (terminal A) — records MCAP by default
+scripts/run_sim_world.sh               # 2. WORLD   (terminal B) — auto-arms the controller
+python plot_utils/plot_from_bag.py     # 3. PLOTS   -> <bag>/plots/*.png
+```
+
+**Order is load-bearing**: the brain takes ~10 s to load the ONNX pair and MuJoCo has no
+`user_pose` holding the robot up, so a world-first start hands the policy an already
+collapsed robot. `scripts/stop.sh` tears both down (and now SIGINTs the recorder first so
+the bag is finalised).
+
+**When it falls over, take the generator out of the loop first.** `scripts/run_sim_clip.sh
+--case stand` swaps in `g1_debug_clip.yml`, which loads the tracker ALONE (no `fm.onnx` at
+all) and drives it from a baked clip. Cases, easiest first: `stand` (reference never moves —
+if this falls the fault is this stack, not any policy), `stand_walk_stand` (the SAME clip
+untruncated, so a failure isolates the walk transition), `terrain`. Each is known to survive
+in MuJoCo through the same `transfer/deploy` runtime, so a case that falls here and not
+there is a difference in the ROS stack. The clip library is built by
+`scripts/rsl_rl/make_debug_clips.py` out of the library the teacher trained on.
+
+- **No PD warm-up.** Whatever feeds the tracker drives it from the first tick, matching
+  `gen_tracker_runner.py` (`--warmup_time 0`, ignored outright in clip mode). A stiffened
+  hold put the robot in a state no training episode started from, and fed the generator's
+  history rows of ZEROS — `_make_snapshot` reads the runtime's own previously-served node,
+  which does not exist yet — which flipped `null_mask` off and denied the model the learned
+  null-history embedding meant to cover exactly those steps.
+- **Auto-arm is SIM ONLY and structurally so**: it is a parameter of `fsm_state_echo`, a
+  node that exists only because MuJoCo has no execution FSM and is launched only by
+  `run_sim_world.sh`. The controller has no auto-arm and must not grow one
+  (`tests/test_auto_arm_is_sim_only.py`).
+
+## Logging: MCAP, and what is deliberately NOT in it
+
+Bags land in `transfer/obelisk/log/bags/<timestamp>_<tag>/`; figures next to them. The
+observation VECTOR is not recorded — every term is either already on the network
+(`est_state`, the depth topics) or reconstructible — but `obs_checksum` is, so an offline
+reconstruction can PROVE it rebuilt what the network saw. `/obelisk/g1/debug/tick` carries
+only what exists nowhere else: the post-watchdog command, the raw `action_isaac`, the served
+reference window, arm/watchdog state, depth health, and **the stamps of the input samples
+each tick consumed** (the estimator runs at 1 kHz against a 50 Hz tick, so without them no
+recording can say which sample fed which step). `/obelisk/g1/debug/fm_plan` carries the
+generator's output plus everything it was conditioned on, once per re-plan.
+
+Three traps, each of which produced confident wrong numbers before being found:
+
+- **Joint order.** The policy's is interleaved (`left_hip_pitch, right_hip_pitch,
+  waist_yaw, ...`), the robot's is per limb — 27 of 29 positions differ on the G1.
+  `action_isaac` and the reference window are in the POLICY's; `/ctrl` and `/est_state` are
+  in the robot's. Subtracting one from the other gives a large, smooth, fictitious error.
+  Every tick carries `joint_names_isaac`; the plotter refuses to compare without both.
+- **`rosbag2_py` deserialises with the INSTALLED message definition**, not the bag's, so a
+  bag recorded before a `.msg` edit is read through the wrong layout — silently, returning
+  plausible values for the wrong fields. The `mcap` reader uses the bag's own schema and is
+  the default; it also needs no ROS and no `metadata.yaml`.
+- **A `.msg` change needs g1_msgs REBUILT** (`rm -rf build/g1_msgs install/g1_msgs &&
+  scripts/build.sh`) — bindings are generated, not symlinked. The controller now refuses to
+  start on a mismatch rather than recording nothing for a whole run. Relatedly, a literal
+  `*/` anywhere in a `.msg` comment terminates the generated C block comment and the rest
+  compiles as code (`tests/test_msg_comments.py`).
+
+Also pinned by tests: a config parameter the node never declares is silently ignored by
+rclpy, so `tests/test_params_are_live.py` fails the build on one (this bit `log`,
+`log_decimation`, `config_name` and `fm_update_every`). The generator's re-plan cadence
+comes from `tracker.onnx` metadata and nowhere else.
+
 # General Guidelines
 - Don't care for backwards compatibility.
 - Use the uv virtual environment `env_isaaclab` (located at the repo root) for all related python code; activate it with `source env_isaaclab/bin/activate`. The exception is `transfer/` off-sim work (MuJoCo sim2sim + the ONNX deploy runtime), which imports no IsaacLab and runs in the much smaller `env_transfer` — built by `bash transfer/setup_venv.sh` from `transfer/requirements.txt`, so a Jetson or any candidate deploy box can play and benchmark policies without a 10 GB Isaac install. On a training box `env_isaaclab` covers both.

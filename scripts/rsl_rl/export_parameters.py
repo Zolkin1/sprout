@@ -262,7 +262,7 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
             params["ee_frame_names"] = list(traj_cmd.resolve_ee_frames())
         # Body links whose ROOT-frame targets the POLICY OBSERVES, in the order the
         # body_pos_ref / body_vel_ref terms stack them -- what deploy must serve
-        # (transfer/sim/clip_reference.py).  Gated on the mode, not on what the clip
+        # (transfer/deploy/clip_reference.py).  Gated on the mode, not on what the clip
         # happens to carry: a joint-mode policy trained on a widened library still has the
         # channels available but never looks at them, and advertising them would make the
         # runner build reference blocks no obs term consumes.

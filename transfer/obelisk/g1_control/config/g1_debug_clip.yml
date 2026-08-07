@@ -1,0 +1,71 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# The G1 brain with the GENERATOR TAKEN OUT and a pre-made motion clip in its place.
+#
+# Same controller, same estimator, same joystick FSM, same everything as g1.yml -- one
+# variable changed. `debug_clip` makes the node load the tracker ONLY (no fm.onnx at all,
+# not merely an unused one) and drive it from a baked clip, so a failure here cannot be
+# blamed on the flow-matching generator and a success proves the whole path from encoders
+# through the observation to the PD targets.
+#
+# This is the FIRST thing to run on a stack that does not work. The `stand` case asks the
+# robot to hold still, which the tracker can certainly do -- so if it falls, the fault is in
+# this stack (frames, joint order, gains, estimator, timing) and there is no point debugging
+# the generator yet.
+#
+# The robot half is a SEPARATE launch, exactly as with g1.yml:
+#   sim      -> config/g1_world.yml    (run_sim_world.sh)
+#   hardware -> config/g1_robot_hw.yml (run_hardware_low.sh --clip)
+#
+# A distinct top-level `config:` gives this its own obelisk global_state, so it cannot
+# collide with a normal `rl_policy` brain that is still running.
+#
+# Launch (or just use scripts/run_sim_clip.sh, which also picks the case and records):
+#   obk-launch config=${ROBOT_RL_ROOT}/g1_control/config/g1_debug_clip.yml
+config: rl_debug_clip
+
+include:
+  - common/low_level.yml
+
+control:
+  - name: low_level
+    params:
+      # The clip library, relative to the repo root. Built by
+      # scripts/rsl_rl/make_debug_clips.py out of the SAME library the teacher trained on,
+      # so the motion is in-distribution rather than something invented for the test.
+      #
+      # NOT in clips/. The container mounts only $REPO_ROOT, and in a git worktree `clips`
+      # is a SYMLINK out of the tree -- so a library there dangles inside the container and
+      # reads as missing. A real robot has no clips/ directory at all. This path is inside
+      # the package, next to hf_cache, which is where deployment binaries belong.
+      debug_clip: "transfer/obelisk/g1_control/resource/debug_clips/g1_debug_v1.h5"
+      # Case NAME, resolved through the library's JSON sidecar. Names survive a library
+      # regeneration; clip indices do not. Run them in this order:
+      #   stand             -- hold still. If this fails, nothing else is worth trying.
+      #   stand_walk_stand  -- the same clip untruncated: stand, walk, stand. Shares a
+      #                        bit-identical prefix with `stand`, so a failure here isolates
+      #                        the walk transition and nothing else.
+      #   terrain           -- a stairs transition; adds the depth cameras and terrain
+      #                        anchoring. Needs a matching world (--scene terrain_scene).
+      # scripts/run_sim_clip.sh --case overrides this per run.
+      debug_clip_case: "stand"
+      debug_clip_id: 0
+      # Seconds into the clip to begin. The stand cases open with ~12.5 s of standing;
+      # skip most of it with e.g. 11.0 when you want to reach the walk quickly.
+      debug_clip_start_time: 0.0
+      # ON, unlike the MuJoCo runner's default. MuJoCo spawns the robot on the clip's own
+      # step-0 pose; a real robot is wherever it is standing, so the clip must be re-placed
+      # onto IT instead (planar position, heading and height). Without this the reference
+      # starts metres away and the first command is a lunge.
+      debug_clip_ego_anchor: true
+      # Every control step. Matches what the teacher trained with and keeps the reference
+      # receding from the robot rather than running away from it.
+      debug_clip_ego_anchor_every: 1
+
+      # The generator is absent, so the CUDA requirement does not apply: the tracker alone
+      # is ~0.3 ms. Left true so the run matches g1.yml when a GPU is present; the
+      # controller downgrades the refusal to a log line in clip mode.
+      use_cuda: true
+      # Always on for a debug run: the point is to come away with a recording.
+      debug_topics: true
+      verbose: true

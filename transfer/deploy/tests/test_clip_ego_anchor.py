@@ -1,9 +1,9 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Tests for the ego-centric (receding-horizon) clip re-anchoring in the MuJoCo path.
+"""Tests for the ego-centric (receding-horizon) clip re-anchoring in the deploy clip player.
 
 Numpy-only (no torch / isaaclab / simulator): builds a tiny synthetic clip-library
-``.h5`` and drives :class:`clip_reference.ClipReference`.  Verifies the
+``.h5`` and drives :class:`deploy.clip_reference.ClipReference`.  Verifies the
 ``reanchor_ego`` math mirrors IsaacLab's ``world_lift.ego_placement`` /
 ``MotionSequenceCommand._reanchor_ego_envs`` -- after re-anchoring, the served
 reference's current-step base reproduces the robot's planar position + heading
@@ -11,7 +11,7 @@ AND height (z), keeps only the clip's tilt, and the future window recedes from
 the re-anchored placement.  Also pins the world-anchored default (identity
 placement = pass-through) so both modes are covered.
 
-Run: ``python transfer/sim/tests/test_clip_ego_anchor.py``
+Run: ``python transfer/deploy/tests/test_clip_ego_anchor.py``
 """
 
 from __future__ import annotations
@@ -26,8 +26,7 @@ import h5py
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))  # transfer/
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))                   # transfer/sim
-from clip_reference import ClipReference, _yaw_angle  # noqa: E402
+from deploy.clip_reference import ClipReference, _yaw_angle  # noqa: E402
 
 BASE = "pelvis_link"
 JOINTS = ["j0", "j1"]

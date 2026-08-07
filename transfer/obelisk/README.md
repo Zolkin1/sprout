@@ -8,9 +8,14 @@ python3 scripts/prefetch_policy.py --hf_policy_folder <name>   # once per policy
 
 scripts/run_sim_low.sh                                # 1. the BRAIN  (terminal A)
 scripts/run_sim_world.sh --scene g1_29j_basic_scene   # 2. the WORLD  (terminal B)
+python plot_utils/plot_from_bag.py                    # 3. the PLOTS  -> <bag>/plots/
 
 scripts/stop.sh                  # tear both down
 ```
+
+**That is the default pipeline for every obelisk run: brain -> world -> plots.** The brain
+records an MCAP bag by default (`--no-bag` opts out) and the world auto-arms the controller,
+so a run needs no joystick input and always leaves something to look at afterwards.
 
 **Order matters, and it is not cosmetic.** The brain needs ~10 s to load the policy pair
 (ONNX + CUDA) while the MuJoCo world activates in ~2 s, and MuJoCo has no `user_pose`
@@ -36,10 +41,60 @@ Up-arrow away, so a node you Ctrl-C is one keystroke from restarting.
 | script | what it launches |
 |---|---|
 | `run_sim_low.sh` | the BRAIN alone -- `g1.yml`, i.e. controller + estimator + joystick FSM (session `simlow`) |
+| `run_sim_clip.sh` | the brain with the GENERATOR REMOVED, driven by a pre-made clip (session `simclip`) |
 | `run_sim_world.sh` | the sim ROBOT -- MuJoCo world + FSM echo (session `simworld`) |
 | `run_hardware_low.sh` | brain + real G1 driver + Jetson ZED depth (session `lowhw`) |
 | `build.sh` | colcon build inside the container |
 | `stop.sh` | kill the tmux server, reap orphaned launches (`--zed`, `--stop`, `--down`) |
+
+## When the robot falls over, start here
+
+Do not debug the generator first. `run_sim_clip.sh` replaces it with a baked motion clip and
+does not load `fm.onnx` at all, so what remains is the tracker plus everything this stack
+does around it -- encoders, estimator, frames, joint order, gains, depth, timing, PD output.
+Walk the cases upward and stop at the first that fails:
+
+```bash
+scripts/run_sim_clip.sh --case stand                  # 1. hold still. Reference NEVER moves.
+scripts/run_sim_clip.sh --case stand_walk_stand       # 2. stand -> walk -> stand
+scripts/run_sim_clip.sh --case terrain                # 3. + depth and terrain anchoring
+scripts/run_sim_world.sh                              #    (second terminal, as always)
+```
+
+**In sim the controller arms itself.** `run_sim_world.sh` starts the FSM echo already
+reporting `LOW_LEVEL_CONTROL`, so no joystick input is needed -- MuJoCo has nothing holding
+the robot up, so waiting for a button press only means watching it collapse. Pass
+`--no-auto-arm` for the hardware-like flow (come up in INIT, walk the FSM by hand). A
+joystick command still overrides at any time, damping and e-stop included.
+
+This cannot reach hardware: `fsm_state_echo` exists only because MuJoCo has no execution FSM
+and is launched only by `run_sim_world.sh`; on a robot the G1 interface publishes the real
+state and the node never runs. The controller itself has no auto-arm and must not grow one
+(`tests/test_auto_arm_is_sim_only.py` enforces both halves).
+
+`stand` is the one that matters. Its reference is a settled stand held for the whole clip,
+so a robot that cannot hold it has a problem that has nothing to do with any policy. And
+`stand_walk_stand` is the SAME clip untruncated -- they share a bit-identical prefix -- so if
+`stand` holds and it falls, the difference is the walk transition and nothing else.
+
+All three are known to survive in MuJoCo through the same `transfer/deploy` runtime:
+
+```bash
+cd ../sim && python gen_tracker_runner.py --load_run <run> --robot_name g1_29j \
+    --clip transfer/obelisk/g1_control/resource/debug_clips/g1_debug_v1.h5 \\
+    --clip_case stand --clip_ego_anchor --log
+```
+
+so a case that falls in obelisk and not there is a difference in THIS stack. Run the MuJoCo
+one first if there is any doubt -- it is the control, not a formality.
+
+On hardware the same mode is `run_hardware_low.sh --clip [CASE]`, and it is how a robot
+should be brought up: nothing improvises.
+
+The clip library is built by `scripts/rsl_rl/make_debug_clips.py` out of the same library
+the teacher trained on, so the motions are in-distribution rather than invented for the
+test. Cases are referred to by NAME (via the library's JSON sidecar) because indices move
+whenever the library is rebuilt.
 
 The sim is two launches, not one, for the same reason hardware is: `g1.yml` is robot-less
 and the robot comes from its own config, so the brain you test in sim is byte-identical to
@@ -153,6 +208,7 @@ obelisk `global_state`, so either can be restarted without cycling the other.
 g1_control/config/
   common/low_level.yml   fragment: controller + estimator + joystick FSM (no `config:`)
   g1.yml                 THE BRAIN -- launched identically in sim and on hardware
+  g1_debug_clip.yml      the same brain with the GENERATOR REMOVED, driven by a baked clip
   g1_robot_hw.yml        the real Unitree driver, alone
   g1_world.yml           the MuJoCo world, alone
   scan/                  ray-caster configs (the depth ones are GENERATED -- see below)
@@ -170,7 +226,15 @@ obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
 obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml
 ```
 
-Note there is no `device=` argument any more, and `bag` now defaults to off.
+Debug clip -- same robot half, brain with no generator:
+```
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_debug_clip.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_world.yml
+```
+
+Note there is no `device=` argument any more. `obk-launch`'s own `bag=` is NOT used: it
+hardcodes `-a` and sqlite3 storage, so the launchers run their own `ros2 bag record -s mcap`
+against an explicit topic list instead (see "Observability").
 
 ### Selecting a policy
 
@@ -237,9 +301,11 @@ At `low_level_ctrl`, the output from the controller node will be applied to robo
 
 **The controller arms itself off this FSM, not off a button.** Until the robot actually
 reports `LOW_LEVEL_CONTROL` it publishes nothing at all and the interface's passive-hold
-timer drives the robot; on entering it, the controller first spends `warmup_time` holding
-the standing pose on stiffened gains to prime the flow-matching generator's state history,
-then hands over to the policy.
+timer drives the robot; on entering it, whatever feeds the tracker -- the generator or a
+debug clip -- drives from the FIRST tick. There is no PD warm-up phase: it put the robot in
+a state no training episode started from, and on the generator path it fed the history rows
+of zeros instead of letting the learned null-history embedding cover the first N steps.
+In sim `run_sim_world.sh` supplies the FSM state and auto-arms; see below.
 
 E-STOP is right trigger.
 
@@ -302,110 +368,132 @@ To check running containers
 To open a new bash terminal for running container
 ```docker exec -it <container_id or container_name> /bin/bash```
 
-# Observability — known gaps (deferred to the MCAP refactor)
+# Observability
 
-**A hardware run currently records nothing.** This section is the inventory, so it does
-not have to be re-derived. The plan is to replace the whole story with MCAP logging
-rather than revive the deleted CSV writer; until then, treat everything below as
-outstanding. Greppable in the code as `TODO(logging-refactor)`.
+**Every run is recorded to an MCAP bag**, by every launcher, by default (`--no-bag` opts
+out). Bags land in `transfer/obelisk/log/bags/<timestamp>_<tag>/`, under `$REPO_ROOT`
+because that is bind-mounted -- obelisk's own `ROS_LOG_DIR` is not, and `stop.sh --down`
+destroys anything left there.
 
-**What exists today.** ROS 2 logger lines only, and almost all of them are one-shot or
-edge-triggered: policy identity and camera wiring at configure; arm/disarm; dropout
-edges for depth, velocity command and odometry; a degenerate-quaternion warning every
-50th bad sample; and a 5 s p50/p95/p99 policy-latency line that is only printed when it
-exceeds budget unless `verbose: true`. Text goes to the tmux pane and to obelisk's
-`ROS_LOG_DIR`. There are no first-party debug topics.
+```bash
+python plot_utils/plot_from_bag.py                    # newest bag -> <bag>/plots/*.png
+python plot_utils/plot_from_bag.py <bag> --figures health,joints
+python plot_utils/plot_from_bag.py <bag> --interactive
+```
 
-### Blocking, in the order I'd fix them
+Figures are written NEXT TO THE BAG, so runs never overwrite each other, and split by the
+question they answer: `health` (arming, watchdogs, input ages, loop period and latency vs
+budget, per-camera rate and invalid fraction), `command` (commanded vs achieved velocity),
+`tracking` (base error, one axis per subplot: x/y/z and roll/pitch/yaw), `joints` (one
+subplot per joint -- reference, measured and PD target, by joint name), `reference` (how far
+the window reaches and whether it jumps between re-plans), `generator` (re-plan cadence,
+cursor, inference time).
 
-1. **Nothing is recorded.** No bag, no CSV, no ring buffer. `obk-launch` accepts
-   `bag=True` (record-all, via `obelisk_bringup.launch.py`) and no launcher passes it.
-   Cheapest real win: pass it in `scripts/run_hardware_low.sh` with an explicit topic
-   list rather than `-a`, which would otherwise pull the full `/depth/image_processed`
-   stream.
-2. **The obelisk log dir is not bind-mounted.** `docker-compose.yml` mounts only
-   `$REPO_ROOT` and a few dotfiles, so `ROS_LOG_DIR` lives in the container's writable
-   layer and `stop.sh --down` destroys it. Mount it, or set `ROS_HOME` into `$REPO_ROOT`.
-3. **Nothing about the depth cameras is recorded or health-checked** beyond staleness, so
-   a silently degraded camera reads as healthy. Wants measured Hz, inter-arrival jitter,
-   min/max/mean range, and invalid-pixel fraction on a diagnostics topic
-   (`depth_obs.invalid_depth_value` already computes the threshold).
-4. ~~**No finite check on the action before publish.**~~ **DONE** — `_finite_targets`
-   gates every command, falls back to the previous tick's target (not `hold_pose`, which
-   can be far away and would command a jump), names which input went non-finite, and
-   disarms after 10 consecutive bad ticks rather than freezing on a stale target.
-5. **No `est_state` watchdog.** Every other input has a timeout. If the estimator or the
-   driver dies, the controller commands at 50 Hz off frozen arrays, forever, silently.
-6. **Odometry staleness is invisible to the controller.** The estimator knows;
-   `EstimatedState` carries no validity flag; `low_level.yml` claims the controller acts
-   on it and nothing does. The FM history is built from base position and world velocity,
-   so a FAST-LIO dropout corrupts the reference the tracker chases.
-7. **Motor temperatures and error states are not published.** The upstream robot node has
-   `pub_motor_temp` (default false), so `motor_surface_temps` / `motor_winding_temps` /
-   `motor_states` are empty in every `ObkJointEncoders` message. One line in
-   `g1_robot_hw.yml`. Likewise its `logging: true` motor CSV — which additionally needs a
-   `timer_logging` entry under `timers:`, or you get a header-only file.
+`--interactive` opens a frame stepper: both depth images, the reference root path and joint
+trajectory, joints at the cursor, and the velocity trace. LEFT/RIGHT step one tick, UP/DOWN
+ten, PAGEUP/PAGEDOWN a hundred, HOME/END the ends. Every axis is held FIXED across ticks, so
+stepping shows the data changing rather than the axes chasing it.
 
-### Also outstanding
+**Joint order is a trap here.** The policy's order is interleaved
+(`left_hip_pitch, right_hip_pitch, waist_yaw, ...`) and the robot's is per limb
+(`left_hip_pitch, left_hip_roll, ...`) -- 27 of 29 positions differ on the G1. `action_isaac`
+and the reference window are in the POLICY's; `/obelisk/g1/ctrl` and `/obelisk/g1/est_state`
+are in the robot's. Subtracting one from the other yields a large, smooth, entirely
+fictitious error. Every tick therefore carries `joint_names_isaac`, and the plotter refuses
+to compare when it cannot resolve both orders.
 
-- **`log: true` / `log_decimation` / `config_name` in `low_level.yml` do nothing** — they
-  are undeclared parameters, which rclpy silently ignores. Labelled in place.
-- **Dropout warnings are edge-triggered only**; wants a periodic "degraded" heartbeat.
-- **No loop-period / jitter measurement.** The latency line covers `create_obs` +
-  `get_action` only, not timer overrun, executor contention, or estimate age.
-  `transfer/deploy/benchmark.py` reports the same percentiles off-robot, so the two are
-  directly comparable — what is missing is the on-robot loop itself.
-- **Arm / warm-up state is not observable off-node**, only as three log lines.
-- **The `dbg` tmux pane is empty** while every other pane gets a seeded command.
-- **No FAST-LIO pane in `run_hardware_low.sh`.** The estimator subscribes `/Odometry` and
-  nothing in the hardware launcher starts `lidar_scan/launch/localization.launch.py`, so a
-  run comes up with `base_pos`/`base_lin_vel` pinned at zero and the odom watchdog inert
-  (it returns False until the first message ever arrives). `scripts/launch_lidar_odom.sh`
-  also points at workspaces the current Dockerfile does not build.
-  **In SIM this no longer applies**: `g1_world.yml` publishes `/Odometry` from a MuJoCo
-  ground-truth sensor quartet on the pelvis (`TODO(sim-odometry)`), so `base_pos` tracks.
-  That makes the gap *harder* to notice, not smaller — the sim has no drift, no latency and
-  no dropouts, so everything downstream of localisation is still untested. Running the real
-  FAST-LIO in sim is the fix; when it lands, delete the world's `/Odometry` entry or two
-  publishers will fight over the topic.
-- **`/obelisk/g1/odom` from the driver is published and subscribed by nobody** — a free
-  cross-check against FAST-LIO, discarded.
-- **`obk_mark_jetson` is defined and never called**, so `/tmp/obk_jetson_active` never
+`plot_from_bag.py` needs **no ROS installation** off the robot -- MCAP embeds each message's
+schema in the file, so `pip install mcap mcap-ros2-support matplotlib numpy` on a laptop is
+enough to read a bag full of custom obelisk messages. That, plus Foxglove reading MCAP
+natively (it dropped ROS 2 `.db3`), is why the image installs
+`ros-humble-rosbag2-storage-mcap` and the recorder passes `-s mcap`. MCAP is also chunked
+and append-only, so a bag whose process was killed mid-run -- i.e. every interesting one --
+is still readable.
+
+The recorder is a plain `ros2 bag record` in its own tmux pane, **not** `obk-launch
+bag=True`: that hardcodes `-a` and the default sqlite3 storage. `OBK_BAG_TOPICS` in
+`scripts/lib/obk_launch.sh` is the explicit list, which doubles as a statement of what a run
+is expected to contain -- a topic that went missing shows up as an empty one rather than as
+nothing at all.
+
+## What is recorded, and what deliberately is not
+
+The observation vector itself is **not** recorded. Every term in it is either already on the
+network or reconstructible from what is:
+
+| the policy needs | it comes from |
+|---|---|
+| `base_ang_vel`, `projected_gravity`, `joint_pos`, `joint_vel` | `/obelisk/g1/est_state` |
+| `depth_near`, `depth_far` | `/depth/{near,far}/image_processed` + the ONNX camera spec |
+| `actions` | `action_isaac` on the debug tick |
+| `reference_window`, `command_window` | the debug tick carries both directly |
+
+What the two first-party topics add is everything that exists ONLY inside a control tick:
+
+* **`/obelisk/g1/debug/tick`** (`g1_msgs/ControllerDebug`, one per 50 Hz step) -- the
+  *effective* command after the watchdogs (which differs from `/vel_cmd` whenever one
+  latches, and in clip mode comes from the clip); the raw `action_isaac` before scaling and
+  reordering; the served `reference_window`; the arm/warm-up/watchdog state; per-camera
+  rate, jitter, range and invalid-pixel fraction; the generator's plan id, cursor and
+  anchor; and the **stamps of the input samples the tick actually consumed**. That last one
+  is why nothing has to be double-logged: the estimator runs at 1 kHz against a 50 Hz tick,
+  so without the consumed stamp there is no way to tell offline which of twenty candidate
+  messages fed a given step -- and that alignment is a prime suspect whenever sim and robot
+  disagree.
+* **`/obelisk/g1/debug/fm_plan`** (`g1_msgs/FmPlan`, one per re-plan, so ~4 Hz at K=12) --
+  the generator's sampled window in its own anchor frame, plus everything it was
+  conditioned on: the autoregressive history nodes, the command history, the exteroception
+  tokens, and the `history_null` flag. The history is the runtime's own previous output, so
+  an error there is invisible from outside and compounds; this is the only place it can be
+  seen. The plan is published RAW, not re-anchored, so a frame bug in the per-tick
+  re-anchoring shows up as a disagreement against the tick's `reference_window` rather than
+  being baked identically into both.
+
+`obs_checksum` on every tick closes the loop: rebuild the observation offline from the
+bagged inputs, compare, and an exact match proves the reconstruction is the vector the
+network actually saw. Without it a replay bug and a controller bug look identical.
+
+Volume is ~330 kB/s, dominated by `reference_window` and the FM plan. `debug_topics:=false`
+turns the lot off if the latency line ever says publishing is eating the control period.
+
+## Still outstanding
+
+* **No `est_state` watchdog.** Every other input has a timeout. If the estimator or the
+  driver dies, the controller commands at 50 Hz off frozen arrays, forever. The tick's
+  `est_state_age` now makes it visible after the fact; it still does not stop the robot.
+* **Odometry staleness is invisible to the controller.** The estimator knows;
+  `EstimatedState` carries no validity flag; `low_level.yml` claims the controller acts on
+  it and nothing does. The FM history is built from base position and world velocity, so a
+  FAST-LIO dropout corrupts the reference the tracker chases.
+* **Dropout warnings are edge-triggered**; wants a periodic "degraded" heartbeat. The bag
+  makes this recoverable offline, which is most of the value.
+* **Motor temperatures and error states are not published.** The upstream robot node has
+  `pub_motor_temp` (default false), so `motor_surface_temps` / `motor_winding_temps` /
+  `motor_states` are empty in every `ObkJointEncoders`. One line in `g1_robot_hw.yml`.
+* **`log` / `log_decimation` / `config_name` in `low_level.yml` do nothing** -- undeclared
+  parameters, silently ignored by rclpy. Labelled in place; delete them with the next config
+  pass.
+* **No FAST-LIO pane in `run_hardware_low.sh`.** Nothing starts
+  `lidar_scan/launch/localization.launch.py`, so a hardware run comes up with
+  `base_pos`/`base_lin_vel` pinned at zero and the odom watchdog inert.
+  `scripts/launch_lidar_odom.sh` also points at workspaces the current Dockerfile does not
+  build. **In SIM this does not apply** -- `g1_world.yml` publishes `/Odometry` from a MuJoCo
+  ground-truth sensor quartet (`TODO(sim-odometry)`) -- which makes the gap *harder* to
+  notice, not smaller: the sim has no drift, no latency and no dropouts, so everything
+  downstream of localisation is still untested.
+* **`/obelisk/g1/odom` from the driver is published and subscribed by nobody** -- a free
+  cross-check against FAST-LIO, discarded. It is not in `OBK_BAG_TOPICS` either.
+* **`obk_mark_jetson` is defined and never called**, so `/tmp/obk_jetson_active` never
   exists and `stop.sh --zed` can never tear the Jetson node down.
-- **Dead tooling that will mislead the next operator:** `plot_utils/plot_ctrl.py`,
-  `plot_odom.py`, `plot_trajectory_video.py` and `transfer/g1_log_analysis.py` all read
-  log formats nothing writes; the two plotting sections below document them as live. The
-  Optitrack section references a `optitrack_forwarding` entry point that no longer exists.
-- **Obelisk is pinned to a commit SHA, not a release tag**, with the Dockerfile's own TODO
-  saying that is not acceptable on the robot — and the pin is duplicated by hand in the
+* **Obelisk is pinned to a commit SHA, not a release tag**, with the Dockerfile's own TODO
+  saying that is not acceptable on the robot -- and the pin is duplicated by hand in the
   Jetson image.
+* **`TODO(mcap-sim2sim)`**: `transfer/sim/gen_tracker_runner.py --log` still writes
+  `sim_log.csv` plus `.npy` sidecars. Having it write MCAP with these same schemas would let
+  one set of tooling read both sims, which is the natural next step now that the robot side
+  is MCAP.
 
-# Plotting Odomety
-
-> **Note:** nothing in the current stack writes the CSVs this and the next section read
-> (the controller's writer was removed in `f5bc1ad`, and no node has ever written
-> `odom_logs/`). See "Observability" above.
-
-To plot the odometry run
-```
-python plot_odom.py
-```
-or 
-```
-python plot_odom.py /path/to/odom_data.csv
-```
-
-You can also use `--start-time` and `--end-time` to specify and start and end time.
-
-# Plotting the Observations and Actions
-To plot these, run:
-```
-python plot_ctrl.py
-```
-
-You can also use `--start-time` and `--end-time` to specify and start and end time.
-
-## Setting the IP setting through the terminal
+# Setting the IP setting through the terminal
 
 Check the names:
 ```

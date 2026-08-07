@@ -136,7 +136,7 @@ def test_hardware_offline() -> None:
         if policy.fm_enabled:
             obs = policy.create_obs(state)
         else:
-            obs = policy._build_obs(state, _clip_like_reference(policy, state, rng))
+            obs = policy.create_obs_from_reference(state, _clip_like_reference(policy, state, rng))
         last = policy.get_action(obs, isaac)
         assert obs.shape == (1, policy.get_num_obs())
         assert last.shape == (nj,)

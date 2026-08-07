@@ -239,7 +239,7 @@ class TrackerSession:
 
         Empty for a tracker trained with ``tracking_mode="joint"`` (the default) and for any
         export predating the metadata key.  Non-empty means the reference source must supply
-        root-frame body targets -- see ``transfer/sim/clip_reference.py``.
+        root-frame body targets -- see ``transfer/deploy/clip_reference.py``.
         """
         return list(self.params.get("root_frame_bodies") or [])
 

@@ -147,6 +147,7 @@ def load_gen_tracker_from_hf(
     num_threads: int = 0,
     refresh: bool = False,
     providers=None,
+    load_fm: bool = True,
 ) -> GenTrackerPolicy:
     """Resolve ``tracker.onnx`` + ``fm.onnx`` from HF (cached) and load the policy.
 
@@ -160,12 +161,18 @@ def load_gen_tracker_from_hf(
         refresh: Re-download even on a cache hit.
         providers: onnxruntime execution providers (see
             ``tracker_session.resolve_providers``). None = CPU.
+        load_fm: Load the generator. False gives a TRACKER-ONLY policy
+            (``_TrackerOnlyCtx``): the generator graph is never created, so it costs no
+            memory, no GPU and no inference time, and ``create_obs`` raises rather than
+            silently running. That is the mode baked-clip playback wants -- with the FM
+            absent rather than merely unused, a clip run cannot be contaminated by it.
+            Mirrors ``gen_tracker_runner.py``'s ``clip_only`` path.
 
     Returns:
         A loaded :class:`GenTrackerPolicy`.
     """
     tracker, fm = fetch_artifacts(hf_repo_id, hf_policy_folder, cache_root, refresh=refresh)
-    policy = GenTrackerPolicy(tracker, fm, fm_update_every=fm_update_every,
+    policy = GenTrackerPolicy(tracker, fm if load_fm else None, fm_update_every=fm_update_every,
                               num_threads=num_threads, providers=providers)
     policy.load()
     return policy

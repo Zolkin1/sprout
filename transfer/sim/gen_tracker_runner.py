@@ -36,13 +36,13 @@ import yaml
 
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
 from deploy.quat_math_np import quat_apply, quat_box_minus, quat_inv  # noqa: E402
 from deploy.tracker_session import convert_joint_order  # noqa: E402
 from deploy.window_np import window_block_slices  # noqa: E402
 
 from robot import Robot  # noqa: E402
-from clip_reference import ClipReference  # noqa: E402
 from depth_camera import MujocoDepthCameras  # noqa: E402
 import experiments.velocity_commands as vc  # noqa: E402
 
@@ -907,14 +907,14 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 return True
             if total_time > 0 and robot.mj_data.time > total_time:
                 return True
-            s = min(clip_step, clip.num_steps - 1)
+            s = min(clip_step, clip.real_steps - 1)
             state = build_state(robot, policy, clip.command_at(s), depth_cams,
                                 want_depth_hits=viz)
             if (not clip_only) and robot.mj_data.time >= clip_handoff_time:
                 if not handed_off:
                     handoff_time = robot.mj_data.time
                     print(f"[INFO] Clip->FM handoff at t={handoff_time:.2f}s "
-                          f"(clip step {s}/{clip.num_steps - 1}); FM now drives the reference.")
+                          f"(clip step {s}/{clip.real_steps - 1}); FM now drives the reference.")
                     handed_off = True
                 # Feed the FM the clip's ACTUAL upcoming command horizon (matches IsaacLab's
                 # get_command_velocity_horizon), not the held current command.
@@ -931,7 +931,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                     clip.reanchor_ego(s, state["root_pos"], state["root_quat"])
                 policy.observe(state)            # keep the FM history warm for handoff
                 ref = clip.reference_at(s, policy.window_offsets)
-                obs = policy._build_obs(state, reference=ref)
+                obs = policy.create_obs_from_reference(state, ref)
             action = policy.get_action(obs, robot.joint_names)
             robot.apply_action(action)
             if robot.failed():
@@ -1104,6 +1104,13 @@ def main() -> None:
     parser.add_argument("--depth_viz_stride", type=int, default=8,
                         help="Draw every Nth depth pixel's hit point in the viewer (1560 hits per "
                              "step would exceed the scene's geom capacity).")
+    # TODO(mcap-sim2sim): this writes sim_log.csv plus .npy sidecars, while the obelisk side
+    # now records MCAP with schemas (g1_msgs/ControllerDebug + FmPlan) that already carry
+    # most of these columns. Having this runner write MCAP too would let ONE set of tooling
+    # read both sims -- so "walks in MuJoCo, falls in obelisk" becomes a diff rather than two
+    # sets of plots eyeballed side by side. Needs the `mcap` python lib plus schemas written
+    # by hand (there is no ROS here to generate them), and gen_tracker_metrics.py currently
+    # consumes the CSV, so it is a real change rather than a swap.
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Where --log writes sim_log.csv + metrics (default: "
@@ -1127,6 +1134,13 @@ def main() -> None:
     parser.add_argument("--clip_id", type=int, default=0,
                         help="In --clip mode, which clip of the library to play (default 0). Must "
                              "match the Isaac side for a like-for-like sim2sim comparison.")
+    parser.add_argument("--clip_case", type=str, default=None,
+                        help="In --clip mode, name a case from the library's JSON sidecar (e.g. "
+                             "'stand', 'stand_walk_stand', 'terrain' in the debug library under "
+                             "transfer/obelisk/g1_control/resource/debug_clips/) "
+                             "instead of giving --clip_id. Names survive a library regeneration; "
+                             "indices do not. Only libraries built by make_debug_clips.py have a "
+                             "sidecar. Mutually exclusive with --clip_id.")
     parser.add_argument("--clip_start_time", type=float, default=0.0,
                         help="In --clip mode, seconds into the clip to begin playback (default 0). "
                              "The robot spawns on the clip pose at this time and the reference is "
@@ -1225,9 +1239,15 @@ def main() -> None:
     total_time = args.total_time
     if args.clip:
         clip_path = args.clip if os.path.isabs(args.clip) else os.path.join(root_dir, args.clip)
+        clip_id = args.clip_id
+        if args.clip_case is not None:
+            if args.clip_id != 0:
+                sys.exit("[ERROR] Pass either --clip_case or --clip_id, not both.")
+            clip_id = resolve_case(clip_path, args.clip_case)
+            print(f"[INFO] Clip case '{args.clip_case}' -> clip {clip_id}.")
         clip = ClipReference(clip_path, policy.get_joint_names(),
                              list(policy.ctx.target_frame_names), policy.base_frame_name,
-                             clip_id=args.clip_id,
+                             clip_id=clip_id,
                              start_time=args.clip_start_time,
                              ego_anchor=args.clip_ego_anchor,
                              ego_anchor_every=args.clip_ego_anchor_every,
@@ -1237,11 +1257,14 @@ def main() -> None:
                   "regenerate the clip at the control dt.")
         clip_handoff_time = args.clip_handoff_time if args.clip_handoff_time is not None else -1.0
         # Playable duration from the chosen start to the clip end (sim time begins at 0 here).
-        remaining_s = (clip.num_steps - clip.start_step) * clip.dt
+        # Measured against the REAL length: the padded tail is a frozen pose that still
+        # carries the last command, so running into it looks like a tracking failure.
+        remaining_s = (clip.real_steps - clip.start_step) * clip.dt
         if total_time <= 0:  # clip-only -> remaining length; clip->FM -> a few extra seconds of FM.
             total_time = remaining_s if clip_handoff_time < 0 else remaining_s + 5.0
         print(f"[INFO] Clip: {clip_path}\n"
-              f"[INFO] {clip.num_steps} steps, {clip.clip_length_s:.2f}s @ dt={clip.dt}; "
+              f"[INFO] {clip.real_steps} real steps of {clip.num_steps} padded, "
+              f"{clip.real_length_s:.2f}s @ dt={clip.dt}; "
               f"start={clip.start_step * clip.dt:.2f}s (step {clip.start_step}); "
               f"handoff={'clip-only' if clip_handoff_time < 0 else f'{clip_handoff_time:.2f}s'}; "
               f"anchor={f'ego/every {args.clip_ego_anchor_every}' if args.clip_ego_anchor else 'world'}; "

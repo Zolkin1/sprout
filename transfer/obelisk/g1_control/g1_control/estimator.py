@@ -140,7 +140,7 @@ class G1Estimator(ObeliskEstimator):
         """
         if not (self.have_imu and self.have_encoders):
             return None
-        # TODO(logging-refactor): this warning is the ONLY consequence of a stale odometry.
+        # TODO(odom-validity): this warning is the ONLY consequence of a stale odometry.
         # The message below still publishes the last known base_pos / base_lin_vel as if
         # fresh, and EstimatedState carries no validity flag, so the controller cannot see
         # it (low_level.yml's comment claims it treats a flagged estimate as a dropout --

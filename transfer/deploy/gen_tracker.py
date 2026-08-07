@@ -225,6 +225,10 @@ class GenTrackerPolicy:
         # then -- the frame the dataset's history rows use. None until the first serve.
         self._prev_served_node: np.ndarray | None = None
         self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
+        # Last generator sample's inputs + identity, for logging (see _run_fm / last_plan).
+        self._plan_id = 0
+        self._last_plan: dict | None = None
+        self._last_reference_window: np.ndarray | None = None
         # Per-term observation-history windows, keyed by term name (see _push_history).
         self._obs_history: dict[str, list[np.ndarray]] = {}
         self._reset_timing()
@@ -638,7 +642,24 @@ class GenTrackerPolicy:
         t0 = time.perf_counter()
         self._pred = sample_window(ctx, history, height, cmd_tokens, noise,
                                    history_null=np.array([bool(history_null)]))
-        self._fm_infer_s += time.perf_counter() - t0
+        infer_s = time.perf_counter() - t0
+        self._fm_infer_s += infer_s
+        # Stash the conditioning alongside the output so a logger can record what the
+        # generator was ASKED, not just what it answered -- the history in particular is the
+        # runtime's own past output, so when it goes wrong it does so silently and compounds.
+        # Only references are kept (these arrays are freshly built each call and would
+        # otherwise be collected), so this costs a few KB and no copy.
+        self._plan_id += 1
+        self._last_plan = {
+            "plan_id": self._plan_id,
+            "ctrl_step": self._ctrl_step,
+            "history_nodes": nodes,
+            "history_cmd": cmd,
+            "extero_tokens": height,
+            "cmd_tokens": cmd_tokens,
+            "history_null": bool(history_null),
+            "infer_s": infer_s,
+        }
         # Counting the calls, not just their total time: pop_avg_infer_ms divides by this, and
         # the runner suppresses the FM half of its timing line when the count is 0. Without it
         # the generator's inference cost -- ~99% of the deploy step budget -- was invisible in
@@ -808,10 +829,86 @@ class GenTrackerPolicy:
         if not self.fm_enabled:
             raise RuntimeError(
                 "create_obs() needs the FM generator; tracker-only (no-FM) playback must drive "
-                "the tracker via _build_obs(state, reference=<clip reference>)."
+                "the tracker via create_obs_from_reference(state, <clip reference>)."
             )
         self._update_generator(state)
         return self._build_obs(state, reference=None)
+
+    def last_plan(self) -> dict | None:
+        """The generator's most recent sample, inputs and output together.
+
+        FOR LOGGING ONLY -- nothing in the control path reads it. The generator re-plans one
+        tick in ``fm_update_every``, so a logger should publish this when ``plan_id``
+        changes rather than every tick, and record the per-tick cursor
+        (:attr:`served_node_index`) separately.
+
+        The conditioning matters as much as the output: the ``N`` history rows are the
+        runtime's OWN previously served nodes, so an error there is invisible from outside
+        and compounds autoregressively.
+
+        Returns:
+            ``None`` before the first sample (and in tracker-only mode, where there is no
+            generator at all); otherwise a dict with ``plan_id``, ``ctrl_step``,
+            ``history_nodes`` ``(1, N, D)``, ``history_cmd`` ``(1, N, cmd_dim)``,
+            ``extero_tokens``, ``cmd_tokens``, ``history_null`` and ``infer_s``. The output
+            window itself is :attr:`_pred`, exposed via :meth:`predicted_window`.
+        """
+        return self._last_plan
+
+    def last_reference_window(self) -> np.ndarray | None:
+        """The reference window handed to the tracker on the last observation build.
+
+        FOR LOGGING ONLY. Flat ``[offset0(D), offset1(D), ...]`` over
+        :attr:`window_offsets` and :attr:`reference_blocks`, already expressed relative to
+        the robot -- i.e. exactly the ``reference_window`` observation term, before its clip
+        and scale are applied.
+
+        Returns:
+            The window, or ``None`` before the first observation build.
+        """
+        return self._last_reference_window
+
+    def predicted_window(self) -> np.ndarray | None:
+        """The live plan ``[F, D]`` in its OWN anchor frame, or None if none is live.
+
+        Deliberately not re-anchored onto the robot: the re-anchoring happens per step on
+        the way into the observation, so logging the raw plan and the served window
+        separately makes a frame bug in that step visible as a disagreement between them
+        rather than baked identically into both.
+        """
+        return self._pred[0].copy() if self._pred_valid else None
+
+    def create_obs_from_reference(self, state: dict, reference: dict) -> np.ndarray:
+        """Build the tracker observation from an EXTERNAL reference, bypassing the generator.
+
+        The baked-clip counterpart of :meth:`create_obs`: the caller supplies the world-frame
+        reference window that the generator would otherwise have produced, so the tracker can
+        be evaluated on a known-good motion with the FM out of the loop entirely. Used by
+        ``gen_tracker_runner.py --clip`` and by the obelisk controller's debug-clip mode --
+        both go through this one path, so sim2sim and hardware cannot diverge here.
+
+        Safe to call with the generator loaded (it simply is not consulted) and with it
+        absent, which is the usual clip-playback configuration.
+
+        Args:
+            state: The state dict :meth:`create_obs` takes.
+            reference: ``{"window": [...]}``, one world-frame entry per
+                :attr:`window_offsets` value, offset 0 first, each optionally carrying its
+                own ``"command"``. See :meth:`deploy.clip_reference.ClipReference.reference_at`.
+
+        Returns:
+            The tracker observation ``[1, num_obs]``.
+        """
+        if not self._loaded:
+            raise RuntimeError("Call load() before create_obs_from_reference().")
+        n_win, n_off = len(reference["window"]), len(self.window_offsets)
+        if n_win != n_off:
+            raise ValueError(
+                f"reference window has {n_win} entries but the tracker observes {n_off} "
+                f"offsets {list(self.window_offsets)}. Build it with "
+                "ClipReference.reference_at(step, policy.window_offsets)."
+            )
+        return self._build_obs(state, reference=reference)
 
     def _reference_window(self, window: list[dict], root_pos, root_quat) -> np.ndarray:
         """Pack the reference window, mirroring ``mdp.observations.reference_window``.
@@ -901,6 +998,12 @@ class GenTrackerPolicy:
                                    [f64(s["command"]) if "command" in s else command for s in window],
                                    axis=-1)),
         }
+        # The served window is the single most diagnostic quantity in the loop -- it is what
+        # the tracker was actually told to do -- and on the generator path it exists nowhere
+        # else, having been re-anchored out of the raw plan on the way in. Stashed (not
+        # copied; _assemble does not mutate it) so a logger need not recompute it and risk
+        # a replay bug that looks exactly like a controller bug.
+        self._last_reference_window = values["reference_window"]
         # Root-frame body-link targets (tracker trained with tracking_mode="body"). These
         # are pelvis-relative already, so they pass through untransformed. Only a CLIP
         # reference supplies them -- the generator predicts no body links, so on the FM
@@ -1057,6 +1160,10 @@ class GenTrackerPolicy:
             self._anchor_pos = np.zeros(3)
             self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
             self._prev_served_node = None
+            # NOT _plan_id: it identifies a sample, and restarting it at 0 would make two
+            # plans from different episodes share an id in one recording.
+            self._last_plan = None
+            self._last_reference_window = None
             self._reset_timing()
 
     def get_dt(self) -> float:
