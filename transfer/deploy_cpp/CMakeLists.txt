@@ -46,6 +46,7 @@ add_library(g1_deploy STATIC
   src/node_history.cc
   src/policy_params.cc
   src/plan_scheduler.cc
+  src/gen_tracker_core.cc
 )
 add_library(G1Deploy::Core ALIAS g1_deploy)
 
@@ -75,6 +76,54 @@ foreach(flag IN LISTS CMAKE_CXX_FLAGS CMAKE_CXX_FLAGS_RELEASE CMAKE_CXX_FLAGS_RE
 endforeach()
 
 # --------------------------------------------------------------------------------------
+# onnxruntime (optional)
+# --------------------------------------------------------------------------------------
+# The image supplies it at /opt/onnxruntime (docker/Dockerfile.ort builds it; the prefix is
+# identical on both architectures, so nothing here branches on arch). OPTIONAL on purpose:
+# the pure-math half of this library is the part held to the python oracle, and it must stay
+# buildable and testable on a dev box with no ORT and no GPU -- which is also how the oracle
+# itself runs.
+set(ONNXRUNTIME_ROOT "/opt/onnxruntime" CACHE PATH "onnxruntime install prefix")
+find_path(ORT_INCLUDE_DIR onnxruntime/onnxruntime_cxx_api.h HINTS ${ONNXRUNTIME_ROOT}/include
+          NO_DEFAULT_PATH)
+find_library(ORT_LIBRARY onnxruntime HINTS ${ONNXRUNTIME_ROOT}/lib NO_DEFAULT_PATH)
+
+if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
+  message(STATUS "onnxruntime found at ${ONNXRUNTIME_ROOT} -- building the session layer")
+  add_library(onnxruntime::onnxruntime SHARED IMPORTED GLOBAL)
+  set_target_properties(onnxruntime::onnxruntime PROPERTIES
+    IMPORTED_LOCATION "${ORT_LIBRARY}"
+    # SYSTEM include: third-party headers are not clean under -Wall -Wextra -Wpedantic, and
+    # those warnings are worth keeping on our own code. Imported targets get -isystem by
+    # default; this is belt and braces in case NO_SYSTEM_FROM_IMPORTED is ever set.
+    INTERFACE_SYSTEM_INCLUDE_DIRECTORIES "${ORT_INCLUDE_DIR}"
+    INTERFACE_INCLUDE_DIRECTORIES "${ORT_INCLUDE_DIR}")
+
+  # The CUDA provider is a SEPARATE .so that libonnxruntime dlopens at session creation. It is
+  # never linked, but its absence is the difference between a GPU run and a silent CPU one.
+  if(NOT EXISTS ${ONNXRUNTIME_ROOT}/lib/libonnxruntime_providers_cuda.so)
+    message(WARNING "onnxruntime at ${ONNXRUNTIME_ROOT} has no CUDA provider library; "
+                    "this is a CPU-only build and the policy pair cannot meet its budget on it.")
+  endif()
+
+  add_library(g1_deploy_ort STATIC
+    src/ort_session.cc
+    src/tracker_session.cc
+    src/fm_session.cc
+  )
+  add_library(G1Deploy::Ort ALIAS g1_deploy_ort)
+  target_link_libraries(g1_deploy_ort
+    PUBLIC g1_deploy onnxruntime::onnxruntime
+    PRIVATE nlohmann_json::nlohmann_json)
+  target_compile_options(g1_deploy_ort PRIVATE -Wall -Wextra -Wpedantic)
+  set(G1_DEPLOY_HAVE_ORT TRUE)
+else()
+  message(STATUS "onnxruntime not found under ${ONNXRUNTIME_ROOT} -- session layer skipped "
+                 "(the math core and its parity tests still build)")
+  set(G1_DEPLOY_HAVE_ORT FALSE)
+endif()
+
+# --------------------------------------------------------------------------------------
 # Tests
 # --------------------------------------------------------------------------------------
 # Optional so a deploy image can build the library without a test framework present. On a
@@ -83,7 +132,7 @@ include(CTest)
 if(BUILD_TESTING)
   find_package(GTest QUIET)
   if(GTest_FOUND)
-    foreach(name quat_math_parity window_parity depth_obs_parity node_history policy_params plan_scheduler)
+    foreach(name quat_math_parity window_parity depth_obs_parity node_history policy_params plan_scheduler gen_tracker_core)
       add_executable(${name}_test test/${name}_test.cc test/fixture.cc)
       target_include_directories(${name}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
       target_link_libraries(${name}_test
@@ -96,6 +145,18 @@ if(BUILD_TESTING)
         G1_DEPLOY_METADATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/metadata")
       add_test(NAME ${name} COMMAND ${name}_test)
     endforeach()
+
+    # The session tests need onnxruntime AND a real policy pair. They skip without the
+    # artifacts, so they are safe to register wherever ORT exists.
+    if(G1_DEPLOY_HAVE_ORT)
+      add_executable(ort_sessions_test test/ort_sessions_test.cc)
+      target_link_libraries(ort_sessions_test
+        PRIVATE g1_deploy_ort GTest::gtest GTest::gtest_main)
+      target_compile_options(ort_sessions_test PRIVATE -Wall -Wextra -Wpedantic)
+      target_compile_definitions(ort_sessions_test PRIVATE
+        G1_DEPLOY_POLICY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../obelisk/g1_control/resource/hf_cache/zolkin_robot_rl/2026-08-04_21-55-17_yaw_k12_v1")
+      add_test(NAME ort_sessions COMMAND ort_sessions_test)
+    endif()
   else()
     message(STATUS "GTest not found -- skipping g1_deploy tests")
   endif()
