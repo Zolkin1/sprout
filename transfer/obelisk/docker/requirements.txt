@@ -17,7 +17,20 @@
 # puts them on the loader path. Revisit only against a measured box.
 #
 # onnxruntime-gpu REPLACES onnxruntime -- same `onnxruntime` module, so never both.
-onnxruntime-gpu[cuda,cudnn]==1.22.0   # the generator + tracker ONNX pair (transfer/deploy)
+#
+# NOT INSTALLED HERE ANY MORE -- it moved into an arch-branched RUN in the Dockerfile, because
+# which wheel is correct now depends on the architecture:
+#
+#   x86_64  -- onnxruntime-gpu[cuda,cudnn]==1.22.0, exactly as the rationale above describes.
+#   aarch64 -- the plain CPU onnxruntime. PyPI publishes no aarch64 onnxruntime-gpu wheel at
+#              ANY version, and the only build that runs on a Jetson Thor (sm_110 needs CUDA
+#              13) is cp312 while ROS Humble pins the image to cp310. Two C extensions built
+#              for different CPython ABIs cannot share a process, which is precisely why the
+#              deploy runtime is being ported to C++. On that architecture the GPU belongs to
+#              the C++ runtime at /opt/onnxruntime and the python here is the sim2sim driver
+#              and parity oracle only.
+#
+# The rationale above is kept because it still governs the x86_64 pin.
 huggingface_hub      # policy artifact fetch, offline-first (deploy.hardware)
 numpy
 

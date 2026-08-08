@@ -1,0 +1,182 @@
+# syntax=docker/dockerfile:1
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# Builds onnxruntime's C++ shared library, and nothing else. Its only product is an install
+# tree at /opt/onnxruntime that the main Dockerfile picks up with `COPY --from`.
+#
+# ============================ why this file exists ==========================================
+# ROS 2 Humble pins the image to Ubuntu 22.04 / python 3.10, so rclpy is a cp310 C extension.
+# The only onnxruntime GPU build that runs on a Jetson Thor is cp312 (sm_110 needs CUDA 13,
+# and PyPI publishes no aarch64 onnxruntime-gpu wheel at ANY version -- the one that works is
+# onnxruntime_gpu-1.24.0-cp312-cp312-linux_aarch64 from https://pypi.jetson-ai-lab.io/sbsa/cu130).
+# Two C extensions built for different CPython ABIs cannot share a process, and upstream ORT is
+# now `python_requires=">=3.11"`, so a cp310 GPU wheel cannot be built either.
+#
+# C++ dissolves the whole problem: only onnxruntime_pybind11_state.so is ABI-bound. libonnxruntime.so
+# and the provider libraries are plain C/C++. Hence `--build_shared_lib` and deliberately NO
+# `--build_wheel` -- that flag is the only place the python version constraint lives, and
+# tools/ci_build/build.py itself needs just python >= 3.8 (checked at this pin), so the image's
+# 3.10 drives it fine.
+#
+# ============================ why it is a SEPARATE image ====================================
+# The build needs the internet (ORT FetchContents abseil/protobuf/flatbuffers/onnx at configure
+# time), tens of GB of scratch, and 1-2 h of CPU. None of that belongs in an image people rebuild
+# daily, and the robot LAN has no DNS (transfer/jetson/zed/docker/README.md), so a lazy build on
+# the robot is not slow, it is impossible. BuildKit cache mounts were considered and rejected: the
+# cache is per-daemon, so a --no-cache, a fresh box or a pruned builder silently costs two hours.
+#
+#   # once per pin bump per architecture, on each box:
+#   docker build -f transfer/obelisk/docker/Dockerfile.ort \
+#       -t g1-ort:1.24.4-cu130 transfer/obelisk/docker
+#
+# The main Dockerfile then consumes it via ARG ORT_DIST_IMAGE. If the tag is missing the build
+# fails immediately with a pull error rather than silently starting a two-hour compile, which is
+# the right failure. To move it between boxes without a registry: docker save | zstd, and scp.
+#
+# ============================ arch ==========================================================
+# The arch branch lives HERE, in one `case` statement, and NEVER in a CMakeLists. That is the
+# direct lesson of obelisk pinning COMP_ARCH "x86_64" for its MuJoCo download: the aarch64 build
+# died with `libmujoco.so: file in wrong format` deep inside colcon, ~40 s after the real mistake.
+# The install prefix is identical on both machines, so no downstream CMake needs to know the arch.
+
+FROM ubuntu:22.04 AS ortbuild
+SHELL ["/bin/bash", "-c"]
+ENV DEBIAN_FRONTEND=noninteractive
+
+# aarch64 -> sbsa: JetPack 7 ships the arm64-SBSA CUDA packaging, so Thor is served by the same
+# repo as Grace. There is no ubuntu2204/tegra repo and there will not be one.
+#
+# cuda-toolkit-13-0 (not `cuda`, not `cuda-drivers`): nvcc and the dev libraries only. The driver
+# comes from the HOST through the nvidia container runtime; a driver package here would either
+# fail to install or shadow the host's with a mismatched build. CUDA 13 specifically, because
+# Thor is sm_110 and CUDA 12.x has no sm_110 target at all.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg git python3 python3-pip ninja-build g++-12 patchelf && \
+    case "$(uname -m)" in \
+      aarch64) REPO_ARCH=sbsa ;; \
+      x86_64)  REPO_ARCH=x86_64 ;; \
+      *) echo "unsupported arch $(uname -m)" && false ;; \
+    esac && \
+    curl -fsSLO "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${REPO_ARCH}/cuda-keyring_1.1-1_all.deb" && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        cuda-toolkit-13-0 libcudnn9-dev-cuda-13 && \
+    rm -rf /var/lib/apt/lists/*
+
+# ORT 1.24 requires cmake >= 3.28; jammy ships 3.22. Safe to upgrade HERE and only here -- this
+# image is thrown away and the ROS image never sees it.
+RUN curl -fsSL https://apt.kitware.com/keys/kitware-archive-latest.asc \
+      | gpg --dearmor -o /usr/share/keyrings/kitware.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/kitware.gpg] https://apt.kitware.com/ubuntu/ jammy main" \
+      > /etc/apt/sources.list.d/kitware.list && \
+    apt-get update && apt-get install -y --no-install-recommends cmake && \
+    rm -rf /var/lib/apt/lists/* && \
+    cmake --version
+
+# Pinned by SHA, like OBELISK_REF and LIO_LOC_REF. v1.24.4 = the newest patch of the 1.24 line,
+# which is the line verified to run on this GPU (the working Thor wheel is 1.24.0); patch releases
+# within a minor are bugfix-only. Do NOT build `main`: it moves, and its python_requires bump is a
+# sign the tree has already drifted past what was validated here.
+#
+# ORT_REFRESH is the manual cache bust for re-pulling the same ref:
+#   docker build -f Dockerfile.ort --build-arg ORT_REFRESH=$(date +%s) ...
+ARG ORT_REF=2d924974ef147392ced8409d36bd6d2e7fcc8a74
+ARG ORT_REFRESH=0
+RUN echo "ort refresh token: ${ORT_REFRESH}" && \
+    git clone https://github.com/microsoft/onnxruntime.git /src/onnxruntime && \
+    cd /src/onnxruntime && git checkout ${ORT_REF} && \
+    git submodule update --init --recursive -j 8 && \
+    echo "[ort] building $(cat VERSION_NUMBER) at ${ORT_REF}"
+
+# sm_110 (Thor/Blackwell) on aarch64, sm_89 (RTX 4070) on the x86 dev box. Building ONE
+# architecture instead of the default list is the single biggest lever on build time. A bare
+# number (not `-real`) emits SASS *and* PTX, so the fatbin still JITs on a future minor.
+#
+# CPU_ONLY=1 skips CUDA entirely -- a ~25 min dry run that shakes out cmake/gcc/driver-script
+# problems before paying for nvcc. Use it first on a new box.
+#
+# onnxruntime_BUILD_UNIT_TESTS=OFF matters: --skip_tests only skips RUNNING them, it still builds
+# onnxruntime_test_all, which is a large fraction of the total.
+ARG CUDA_ARCH=
+ARG CPU_ONLY=0
+ENV CC=gcc-12 CXX=g++-12 CUDACXX=/usr/local/cuda-13.0/bin/nvcc
+RUN cd /src/onnxruntime && \
+    ARCH="${CUDA_ARCH:-$(case "$(uname -m)" in aarch64) echo 110 ;; *) echo 89 ;; esac)}" && \
+    if [ "${CPU_ONLY}" = "1" ]; then CUDA_ARGS=(); \
+    else CUDA_ARGS=(--use_cuda --cuda_home /usr/local/cuda-13.0 --cudnn_home /usr); fi && \
+    echo "[ort] CPU_ONLY=${CPU_ONLY} CUDA_ARCH=${ARCH} parallel=$(( $(nproc) - 2 ))" && \
+    python3 tools/ci_build/build.py \
+      --build_dir /build --config Release \
+      --parallel $(( $(nproc) - 2 )) --nvcc_threads 2 \
+      --build_shared_lib --skip_tests --skip_submodule_sync \
+      --allow_running_as_root --compile_no_warning_as_error \
+      --cmake_generator Ninja \
+      "${CUDA_ARGS[@]}" \
+      --cmake_extra_defines \
+        CMAKE_CUDA_ARCHITECTURES=${ARCH} \
+        onnxruntime_BUILD_UNIT_TESTS=OFF \
+        CMAKE_INSTALL_PREFIX=/opt/onnxruntime \
+      --update --build && \
+    cmake --install /build/Release --prefix /opt/onnxruntime && \
+    rm -rf /build /src
+
+# Build-time verification, STATIC ONLY. `docker build` has no GPU, and dlopen'ing the CUDA
+# provider segfaults (exit 139) without one -- it reaches the driver even though it does not
+# NEED libcuda.so.1. So never load anything here; inspect instead. This is strictly stronger
+# than the python `get_available_providers()` assert it replaces:
+#
+#   nm -D      proves the shared-lib build actually EXPORTED the CUDA entry point -- the same
+#              static property the python assert reported, without an interpreter.
+#   ldd        runs the loader in trace mode: it resolves NEEDED sonames but does NOT run
+#              initialisers, which is exactly why it does not segfault where dlopen does. This
+#              catches the "libcublasLt.so.13: cannot open shared object file" class of failure
+#              at BUILD time -- the failure that cost us the ==1.22.0 pin in requirements.txt.
+#   cuobjdump  proves the fatbin carries machine code for THIS GPU. Nothing in the python world
+#              could assert that; a CUDA 12 build passes every other check here and then falls
+#              back or JIT-fails on a Blackwell part.
+#
+# In its OWN stage, so `--target ortbuild` yields an inspectable tree when a check fails.
+# A failed assert should let you go and look, not force a rebuild to find out why.
+FROM ortbuild AS ortcheck
+SHELL ["/bin/bash", "-c"]
+ARG CPU_ONLY=0
+ARG CUDA_ARCH=
+#
+# Every inspection is dumped to a FILE and then grepped, never piped into `grep -q`. Under
+# `set -o pipefail` a `-q` grep exits at its first match, the producer keeps writing into a
+# closed pipe, and the pipeline reports 141 (SIGPIPE) -- so the check FAILS precisely because
+# it succeeded early. It bites only when the producer's output exceeds the 64K pipe buffer,
+# which made `nm` fine and `cuobjdump --list-elf` (200 sections) fatal. That asymmetry is
+# exactly how this becomes an intermittent build failure nobody can reproduce, so all of them
+# are file-based rather than only the one that bit.
+RUN set -euo pipefail && \
+    LIB=/opt/onnxruntime/lib && \
+    echo "[ort] the core library exists and exports the C API" && \
+    test -f $LIB/libonnxruntime.so && \
+    nm -D --defined-only $LIB/libonnxruntime.so > /tmp/ort_syms.txt && \
+    grep -q 'OrtGetApiBase' /tmp/ort_syms.txt && \
+    echo "[ort] the C++ headers are installed" && \
+    test -f /opt/onnxruntime/include/onnxruntime/onnxruntime_cxx_api.h && \
+    if [ "${CPU_ONLY}" = "1" ]; then echo "[ort] CPU_ONLY build: skipping the CUDA asserts"; else \
+      ARCH="${CUDA_ARCH:-$(case "$(uname -m)" in aarch64) echo 110 ;; *) echo 89 ;; esac)}" && \
+      echo "[ort] the CUDA provider library exists" && \
+      test -f $LIB/libonnxruntime_providers_cuda.so && \
+      echo "[ort] the CUDA provider entry point is exported" && \
+      grep -q 'OrtSessionOptionsAppendExecutionProvider_CUDA' /tmp/ort_syms.txt && \
+      echo "[ort] every NEEDED library of the provider resolves" && \
+      ldd $LIB/libonnxruntime_providers_cuda.so > /tmp/ort_ldd.txt && \
+      ! grep -q 'not found' /tmp/ort_ldd.txt && \
+      echo "[ort] the fatbin carries SASS for sm_${ARCH}" && \
+      /usr/local/cuda-13.0/bin/cuobjdump --list-elf \
+        $LIB/libonnxruntime_providers_cuda.so > /tmp/ort_elf.txt && \
+      grep -q "sm_${ARCH}" /tmp/ort_elf.txt && \
+      echo "[ort]   $(grep -c "sm_${ARCH}" /tmp/ort_elf.txt) sm_${ARCH} ELF sections" ; \
+    fi && \
+    rm -f /tmp/ort_syms.txt /tmp/ort_ldd.txt /tmp/ort_elf.txt && \
+    echo "[ort] OK" && du -sh /opt/onnxruntime
+
+
+# The distributable: the install tree alone, so `COPY --from` in the main Dockerfile drags in
+# none of the toolchain, the CUDA dev packages or the ORT sources.
+FROM scratch AS ortdist
+COPY --from=ortcheck /opt/onnxruntime /opt/onnxruntime
