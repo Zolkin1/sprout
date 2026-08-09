@@ -164,6 +164,67 @@ def test_clip_family_needs_tag_families_to_be_stored():
         assert "clip_family" not in data_off
 
 
+def test_clip_index_needs_tag_clip_index_to_be_stored():
+    """``clip_id``/``clip_step`` need ``tag_clip_index``, like ``clip_family`` needs its flag.
+
+    Same silent-drop failure mode as ``test_clip_family_needs_tag_families_to_be_stored``:
+    ``write_batch`` iterates the DECLARED keys, so a key the recorder assembles but the
+    writer never declared vanishes without an error. Asserting the round trip AND the
+    omission, because a missing index reads as "this recording predates the tag" rather
+    than as a bug.
+    """
+    W, H, F, node = 6, 2, 4, 22
+    meta = _meta(W, H, F, 0)
+    rng = np.random.default_rng(3)
+    cid = np.arange(W, dtype=np.int32) * 7
+    cstep = np.arange(W, dtype=np.int32) * 13 + 1
+    batch = {
+        "history_state": rng.standard_normal((W, H, node)).astype(np.float32),
+        "ref_future": rng.standard_normal((W, F, node)).astype(np.float32),
+        "episode_id": np.arange(W, dtype=np.int64),
+        "clip_id": cid,
+        "clip_step": cstep,
+    }
+    with tempfile.TemporaryDirectory() as d:
+        on = os.path.join(d, "recorded_on.h5")
+        with RecordedWindowWriter(on, W, H, node, F, 0, 0, meta, tag_clip_index=True) as wr:
+            wr.write_batch(batch)
+        data, _ = load_recorded_windows(on)
+        assert np.array_equal(data["clip_id"], cid)
+        assert np.array_equal(data["clip_step"], cstep)
+
+        off = os.path.join(d, "recorded_off.h5")
+        with RecordedWindowWriter(off, W, H, node, F, 0, 0, meta) as wr:
+            wr.write_batch(batch)
+        data_off, _ = load_recorded_windows(off)
+        assert "clip_id" not in data_off and "clip_step" not in data_off
+
+
+def test_clip_library_identity_roundtrips():
+    """The library path AND its hash survive, so a clip_id join can prove its source.
+
+    ``clip_id`` is a position in one particular library and libraries are regenerated in
+    place under the same filename, so the path alone cannot detect a mismatch.
+    """
+    W, H, F, node = 4, 2, 4, 22
+    meta = _meta(W, H, F, 0)
+    meta.clip_library_path = "clips/g1_mb_v5_body.h5"
+    meta.clip_library_sha256 = "deadbeef" * 8
+    rng = np.random.default_rng(4)
+    batch = {
+        "history_state": rng.standard_normal((W, H, node)).astype(np.float32),
+        "ref_future": rng.standard_normal((W, F, node)).astype(np.float32),
+        "episode_id": np.arange(W, dtype=np.int64),
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "recorded.h5")
+        with RecordedWindowWriter(p, W, H, node, F, 0, 0, meta) as wr:
+            wr.write_batch(batch)
+        _, got = load_recorded_windows(p)
+        assert got.clip_library_path == "clips/g1_mb_v5_body.h5"
+        assert got.clip_library_sha256 == "deadbeef" * 8
+
+
 def test_depth_roundtrips_alongside_the_height_scan():
     """Both exteroception arrays survive one recording, so either FM can train from it.
 

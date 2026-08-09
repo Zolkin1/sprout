@@ -115,6 +115,17 @@ class RecordingMeta:
 
     Empty for a recording written before the tag existed, or from a library with no terrain
     manifest -- in both cases every ``clip_family`` is 0 and no family filter can match."""
+    clip_library_path: str = ""
+    """Clip library the teacher tracked while recording, as passed to ``--clip``.
+
+    Identifies what the per-window ``clip_id`` / ``clip_step`` index INTO. Without it those
+    columns are unjoinable: clip ids are positions in one particular library, and a
+    regenerated library reuses them for different motions. Empty = not recorded."""
+    clip_library_sha256: str = ""
+    """SHA-256 of that library file, so a join can PROVE it read the right one.
+
+    The path alone is not enough -- libraries are regenerated in place under the same name,
+    which is exactly how a silent mismatch happens. Empty = not recorded."""
     reference_blocks: list[str] | None = None
     """Reference-window blocks the RECORDING TEACHER's policy observed
     (``mdp.reference_window_selection``), in packing order.
@@ -456,6 +467,19 @@ _WINDOW_DTYPES: dict[str, str] = {
     # train.py --skip_families, which is why this is recorded rather than re-derived from a
     # library that may have changed. 0 everywhere for a library with no terrain manifest.
     "clip_family": "uint8",
+    # Per-window index BACK INTO the clip library: which clip, and which step of it the
+    # window's node 0 sits at. The general form of clip_family in the same way clip_family
+    # is the general form of is_distractor -- with these two, ANY per-clip or per-step
+    # library column (anchor_mask_t, terrain_id, target_vel, contact) can be joined offline
+    # without a re-record. The motivating one is anchor_mask_t: a mask BOUNDARY inside
+    # [clip_step, clip_step + F] is the ground-truth "this window crosses a terrain
+    # transition", which otherwise has to be guessed from a height threshold.
+    #
+    # Only meaningful against the library that produced them -- join through
+    # RecordingMeta.clip_library_path / clip_library_sha256, never against "whichever
+    # library is on disk now".
+    "clip_id": "int32",
+    "clip_step": "int32",
 }
 
 
@@ -504,6 +528,9 @@ class RecordedWindowWriter:
         tag_families: Also store the per-window clip-family code (``clip_family``), which
             ``FlowMatchingConfig.skip_families`` filters on. Opt-in for the same reason
             ``tag_distractors`` is.
+        tag_clip_index: Also store ``clip_id`` + ``clip_step``, the window's index back into
+            the clip library, so any per-clip/per-step library column can be joined offline
+            instead of re-derived or re-recorded.
         record_history_ref: Also store the applied-reference history ring (``history_ref``),
             which ``history_source="reference_partial"`` trains on.
     """
@@ -513,7 +540,7 @@ class RecordedWindowWriter:
         future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
         tag_distractors: bool = False, tag_families: bool = False,
-        record_history_ref: bool = False,
+        tag_clip_index: bool = False, record_history_ref: bool = False,
     ) -> None:
         import h5py
 
@@ -540,6 +567,12 @@ class RecordedWindowWriter:
         # ``--skip_families`` could never find its tag.
         if tag_families:
             shapes["clip_family"] = (num_windows,)
+        # Opt-in for the same reason: write_batch requires every DECLARED key to be supplied
+        # each batch, so declaring these unconditionally would break any caller that does not
+        # assemble them.
+        if tag_clip_index:
+            shapes["clip_id"] = (num_windows,)
+            shapes["clip_step"] = (num_windows,)
         if height_dim > 0:
             shapes["height_scan"] = (num_windows, height_dim)
         if depth_shape is not None:

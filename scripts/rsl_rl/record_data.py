@@ -1033,6 +1033,12 @@ def collect_windows(
                 if family_codes is not None
                 else np.zeros(idx.numel(), dtype=np.uint8)
             )
+            # Where this window came FROM: clip, and the step its node 0 sits at. Lets any
+            # per-clip/per-step library column be joined offline -- notably anchor_mask_t,
+            # whose boundaries are the ground-truth terrain transitions. `_step` is the same
+            # counter the command uses to gather `ref_future`, so node 0 == this step.
+            batch["clip_id"] = cid.to(torch.int32).cpu().numpy()
+            batch["clip_step"] = ref_cmd._step[idx].to(torch.int32).cpu().numpy()
             if has_scan:
                 scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()
@@ -1219,6 +1225,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # it, so it travels in the recording rather than being reconstructed from a library
         # that may have moved on.
         meta.family_names = list(family_names)
+        # What the per-window clip_id / clip_step index INTO. The hash is the part that
+        # matters: libraries get regenerated in place under the same filename, and a join
+        # against the wrong one returns plausible garbage rather than an error.
+        clip_lib_path = getattr(getattr(ref_cmd, "cfg", None), "path", "") or ""
+        meta.clip_library_path = str(clip_lib_path)
+        meta.clip_library_sha256 = (
+            sha256_file(clip_lib_path) if clip_lib_path and os.path.exists(clip_lib_path) else ""
+        )
 
         # Ego-anchored clip-future target (robot-state-conditioned FM): recorded when the
         # command exposes the look-ahead accessors + a command velocity, unless disabled.
@@ -1326,6 +1340,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # the dataset, so the key record_data assembled was silently dropped and
                 # --skip_families could never match.
                 tag_families=True,
+                # And the index back into the library, which generalises BOTH: with
+                # clip_id + clip_step any per-clip/per-step column joins offline. The one
+                # that motivated it is anchor_mask_t, whose boundaries are the ground-truth
+                # terrain transitions -- previously only guessable from a height threshold.
+                tag_clip_index=True,
                 # Same reasoning for the applied-reference ring: recording it always makes
                 # `history_source=reference_partial` a train-time A/B, and its absence
                 # unambiguously means "this recording predates the mode".
