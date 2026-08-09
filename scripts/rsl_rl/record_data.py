@@ -1039,6 +1039,10 @@ def collect_windows(
             # counter the command uses to gather `ref_future`, so node 0 == this step.
             batch["clip_id"] = cid.to(torch.int32).cpu().numpy()
             batch["clip_step"] = ref_cmd._step[idx].to(torch.int32).cpu().numpy()
+            # The source ENV. Its tile instance and origin are what make the recorded WORLD
+            # poses interpretable off-line; clip_id fixes the tile TYPE but not which of the
+            # identical instances this window sat on.
+            batch["env_id"] = idx.to(torch.int32).cpu().numpy()
             if has_scan:
                 scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()

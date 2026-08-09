@@ -184,6 +184,7 @@ def test_clip_index_needs_tag_clip_index_to_be_stored():
         "episode_id": np.arange(W, dtype=np.int64),
         "clip_id": cid,
         "clip_step": cstep,
+        "env_id": np.arange(W, dtype=np.int32) % 4,
     }
     with tempfile.TemporaryDirectory() as d:
         on = os.path.join(d, "recorded_on.h5")
@@ -192,12 +193,13 @@ def test_clip_index_needs_tag_clip_index_to_be_stored():
         data, _ = load_recorded_windows(on)
         assert np.array_equal(data["clip_id"], cid)
         assert np.array_equal(data["clip_step"], cstep)
+        assert np.array_equal(data["env_id"], np.arange(W, dtype=np.int32) % 4)
 
         off = os.path.join(d, "recorded_off.h5")
         with RecordedWindowWriter(off, W, H, node, F, 0, 0, meta) as wr:
             wr.write_batch(batch)
         data_off, _ = load_recorded_windows(off)
-        assert "clip_id" not in data_off and "clip_step" not in data_off
+        assert not ({"clip_id", "clip_step", "env_id"} & set(data_off))
 
 
 def test_clip_library_identity_roundtrips():

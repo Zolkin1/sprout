@@ -480,6 +480,12 @@ _WINDOW_DTYPES: dict[str, str] = {
     # library is on disk now".
     "clip_id": "int32",
     "clip_step": "int32",
+    # Which ENV produced the window. clip_id gives the tile TYPE (via terrain_id) but not
+    # WHICH INSTANCE of it -- several envs sit on identical tiles at different origins. Any
+    # attempt to recover the instance from the pose is a proximity guess that fails once the
+    # robot is far along its tile, which is exactly how an offline re-render ends up on a
+    # neighbouring tile and metres of depth error. Recorded, so it is never guessed.
+    "env_id": "int32",
 }
 
 
@@ -528,9 +534,10 @@ class RecordedWindowWriter:
         tag_families: Also store the per-window clip-family code (``clip_family``), which
             ``FlowMatchingConfig.skip_families`` filters on. Opt-in for the same reason
             ``tag_distractors`` is.
-        tag_clip_index: Also store ``clip_id`` + ``clip_step``, the window's index back into
-            the clip library, so any per-clip/per-step library column can be joined offline
-            instead of re-derived or re-recorded.
+        tag_clip_index: Also store ``clip_id`` + ``clip_step`` + ``env_id`` -- where the
+            window came from, so any per-clip/per-step library column can be joined offline
+            and the exact source env (hence tile instance and origin) is known rather than
+            inferred.
         record_history_ref: Also store the applied-reference history ring (``history_ref``),
             which ``history_source="reference_partial"`` trains on.
     """
@@ -573,6 +580,7 @@ class RecordedWindowWriter:
         if tag_clip_index:
             shapes["clip_id"] = (num_windows,)
             shapes["clip_step"] = (num_windows,)
+            shapes["env_id"] = (num_windows,)
         if height_dim > 0:
             shapes["height_scan"] = (num_windows, height_dim)
         if depth_shape is not None:
