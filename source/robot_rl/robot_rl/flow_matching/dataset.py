@@ -418,12 +418,17 @@ class FutureStateDataset(Dataset):
         #   windowed (.h5): ``windows`` = a 1-D array of window indices into the pre-formed
         #     arrays; ``history_state``/``history_ref``/``ref_future`` are already snap-formed.
         windowed = "history_state" in data
+        self.window_sel: np.ndarray | None = None
         root_pos_slc, root_quat_slc = s_slc["root_pos_w"], s_slc["root_quat_w"]
         _p = lambda t: t[..., root_pos_slc[0]:root_pos_slc[1]]
         _q = lambda t: t[..., root_quat_slc[0]:root_quat_slc[1]]
         rf_t = torch.from_numpy(np.ascontiguousarray(rf)).float()  # (P|W, F, node)
         if windowed:
             sel = np.asarray(windows, dtype=np.int64)  # (Nw,) window selector
+            # Kept so a caller can map dataset item i back to recorded window sel[i] and join
+            # per-window labels (e.g. the transition mask) onto val results. Only the windowed
+            # path has a 1-D selector; the per-step path leaves this None.
+            self.window_sel = sel
             n_win = int(sel.shape[0])
             hs_state = torch.from_numpy(np.ascontiguousarray(data["history_state"])).float()
             H = int(hs_state.shape[1])
@@ -947,6 +952,126 @@ def _family_keep_mask(
     return ~drop
 
 
+def transition_window_mask(
+    data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig, num_windows: int
+) -> np.ndarray:
+    """Boolean ``[W]``: does each window cross a terrain transition?
+
+    Ground truth, not a height heuristic. A window crosses a transition when the clip's
+    ``anchor_mask_t`` changes pinned-ness strictly inside ``[clip_step, clip_step + F)`` --
+    i.e. the reference goes from ego-anchored flat walking to terrain-registered (or back)
+    somewhere in the horizon the FM predicts. Joined through the recorded ``clip_id`` /
+    ``clip_step``, so it needs the library those ids index into.
+
+    Args:
+        data: Recorded window arrays; ``clip_id`` and ``clip_step`` are read.
+        meta: Recording metadata; supplies the library path and its hash.
+        cfg: Config; ``clip_library_path`` overrides the recorded path, ``future_len`` sets
+            the horizon.
+        num_windows: ``W``, for shape validation.
+
+    Returns:
+        ``[W]`` bool array, True where the window crosses a transition.
+
+    Raises:
+        ValueError: If the recording predates ``clip_id``/``clip_step``, if no library path
+            is known, or if the library on disk does not match the recorded hash. Each is
+            raised rather than defaulting to uniform sampling, because a silent fallback
+            would report a transition-weighted run that never weighted anything.
+    """
+    import hashlib
+    import os
+
+    if "clip_id" not in data or "clip_step" not in data:
+        raise ValueError(
+            "transition_fraction needs the per-window 'clip_id'/'clip_step' index, which "
+            "this recording predates. Re-record with the current record_data.py (it sets "
+            "tag_clip_index=True), or leave transition_fraction=None."
+        )
+    path = cfg.clip_library_path or getattr(meta, "clip_library_path", "") or ""
+    if not path:
+        raise ValueError(
+            "transition_fraction needs the clip library that clip_id indexes into, but the "
+            "recording carries no clip_library_path. Pass --clip_library_path explicitly."
+        )
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"clip library '{path}' (from the recording) does not exist.")
+    want = getattr(meta, "clip_library_sha256", "") or ""
+    if want:
+        got = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        if got != want:
+            raise ValueError(
+                f"clip library '{path}' has sha256 {got[:12]} but the recording was made "
+                f"against {want[:12]}. Clip ids are positions in ONE library and a "
+                "regenerated library reuses them for different motions, so this join would "
+                "silently mislabel every window."
+            )
+    from motion_gen.clips.clip_io import load_clip_library
+    from motion_gen.world_lift import anchor_mask_is_pinned
+
+    lib = load_clip_library(path, device="cpu",
+                            keys=["anchor_mask", "anchor_mask_t", "clip_len"])
+    pinned = anchor_mask_is_pinned(lib.anchor_mask_per_step()).numpy()
+    clip_len = lib.clip_len_or_full().numpy()
+
+    cid = np.asarray(data["clip_id"]).reshape(-1).astype(np.int64)
+    cstep = np.asarray(data["clip_step"]).reshape(-1).astype(np.int64)
+    if cid.shape[0] != num_windows:
+        raise ValueError(f"'clip_id' has {cid.shape[0]} entries but there are {num_windows} "
+                         "windows.")
+    # Boundary count on [start+1, end) via a cumulative sum of per-step changes -- the clip
+    # tail is repeat-last padded, so the span is clamped to the clip's real length.
+    change = np.zeros_like(pinned, dtype=np.int64)
+    change[:, 1:] = (pinned[:, 1:] != pinned[:, :-1]).astype(np.int64)
+    cum = np.concatenate([np.zeros((change.shape[0], 1), np.int64),
+                          np.cumsum(change, axis=1)], axis=1)
+    end = np.minimum(cstep + int(cfg.future_len), clip_len[cid])
+    mask = (cum[cid, end] - cum[cid, np.minimum(cstep + 1, end)]) > 0
+    return mask & ((end - cstep) >= 2)
+
+
+def transition_sampler_weights(
+    data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig,
+    num_windows: int, train_idx: np.ndarray,
+) -> np.ndarray | None:
+    """Per-train-sample weights making transitions ``cfg.transition_fraction`` of an epoch.
+
+    Args:
+        data: Recorded window arrays.
+        meta: Recording metadata.
+        cfg: Config; ``transition_fraction`` is the target fraction (``None`` -> no weighting).
+        num_windows: ``W``, for shape validation.
+        train_idx: Indices of the TRAIN split, so val stays at the natural distribution.
+
+    Returns:
+        ``[len(train_idx)]`` float64 weights, or ``None`` when no weighting is requested.
+
+    Raises:
+        ValueError: If the target fraction is not in ``(0, 1)``, or the train split contains
+            no transition windows (or nothing but), which no reweighting can fix.
+    """
+    p = cfg.transition_fraction
+    if p is None:
+        return None
+    if not 0.0 < float(p) < 1.0:
+        raise ValueError(f"transition_fraction must be in (0, 1), got {p}.")
+    mask = transition_window_mask(data, meta, cfg, num_windows)[train_idx]
+    n_t = int(mask.sum())
+    n_f = int(mask.size - n_t)
+    if n_t == 0 or n_f == 0:
+        raise ValueError(
+            f"transition_fraction={p} needs both kinds in the train split, but it has "
+            f"{n_t} transition and {n_f} non-transition windows."
+        )
+    w_t = float(p) * n_f / ((1.0 - float(p)) * n_t)
+    weights = np.ones(mask.size, dtype=np.float64)
+    weights[mask] = w_t
+    print(f"[fm-data] transition_fraction={p}: {n_t}/{mask.size} "
+          f"({100.0 * n_t / mask.size:.1f}%) of train windows cross a terrain transition; "
+          f"weighting them {w_t:.2f}x (each seen ~{w_t:.1f}x per epoch).")
+    return weights
+
+
 def _build_train_val_windowed(
     data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig
 ) -> tuple[FutureStateDataset, FutureStateDataset | None]:
@@ -983,6 +1108,9 @@ def _build_train_val_windowed(
 
     train_ds = FutureStateDataset(data, meta, cfg, train_idx, add_noise=True)
     train_ds.val_episode_ids = sorted(int(e) for e in val_eps)  # for the bench's eval split
+    # Sampler weights for cfg.transition_fraction, on the TRAIN split only -- val must keep
+    # the natural distribution or its metrics stop being comparable across runs.
+    train_ds.sampler_weights = transition_sampler_weights(data, meta, cfg, W, train_idx)
     val_ds = None
     if val_idx.size > 0:
         val_ds = FutureStateDataset(

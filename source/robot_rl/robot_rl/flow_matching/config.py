@@ -141,6 +141,28 @@ class FlowMatchingConfig:
     # not in the recording at all -- a typo would otherwise read as "nothing to drop".
     skip_families: list[str] | None = None
 
+    # Oversample windows that CROSS a terrain transition until they are this fraction of each
+    # training epoch (e.g. 0.5). ``None`` = natural distribution, which on the v5 library is
+    # 17.8% of the trained subset.
+    #
+    # A sampler weight, not a filter and not a loss weight: epoch size is unchanged and every
+    # window keeps its own loss, so only the RATE at which transitions are drawn changes.
+    # Weight is w = p*n_flat / ((1-p)*n_trans) on transition windows and 1 elsewhere, which
+    # makes the expected per-epoch fraction exactly ``p``. Reaching 0.5 from 17.8% is ~4.6x,
+    # so each transition window is seen ~4.6x per epoch -- watch val for overfitting on them.
+    #
+    # "Crosses a transition" is GROUND TRUTH, not a height heuristic: an ``anchor_mask_t``
+    # boundary strictly inside ``[clip_step, clip_step + F)``, joined through the recorded
+    # ``clip_id``/``clip_step``. Needs a recording carrying those (and the clip library on
+    # disk); errors rather than silently falling back to uniform sampling.
+    transition_fraction: float | None = None
+
+    # Clip library to join ``clip_id``/``clip_step`` against for ``transition_fraction``.
+    # Empty = use ``RecordingMeta.clip_library_path``. The recorded
+    # ``clip_library_sha256`` is verified either way, because clip ids are positions in ONE
+    # library and a regenerated library reuses them for different motions.
+    clip_library_path: str = ""
+
     # Dedicated recorded command array (e.g. "target_vel") giving the per-step
     # commanded velocity over the window. It is sampled every ``cmd_stride`` steps
     # (indices 0, cmd_stride, ...) and each sample becomes its own conditioning token

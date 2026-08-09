@@ -26,7 +26,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 # Make the recording I/O module importable (it lives in scripts/rsl_rl).
@@ -198,6 +198,20 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "which the forward-facing depth cameras cannot observe at all. Errors if the "
              "recording predates the tag or a named family is not in it.",
     )
+    parser.add_argument(
+        "--transition_fraction", type=float, default=_wc.transition_fraction,
+        help="Oversample windows CROSSING a terrain transition until they are this fraction "
+             "of each training epoch (e.g. 0.5; natural rate on the v5 library is 0.178). A "
+             "sampler weight, not a filter: epoch size and per-window loss are unchanged, "
+             "only the draw rate. 'Crosses a transition' is an anchor_mask_t boundary inside "
+             "[clip_step, clip_step+F), joined via the recorded clip_id/clip_step -- ground "
+             "truth, not a height heuristic. Needs a recording carrying that index.",
+    )
+    parser.add_argument(
+        "--clip_library_path", type=str, default=_wc.clip_library_path,
+        help="Clip library to join clip_id/clip_step against for --transition_fraction. "
+             "Default: the path recorded in the .h5. Its sha256 is verified either way.",
+    )
     parser.add_argument("--skip_distractors", action="store_true", default=_wc.skip_distractors,
                         help="Drop DISTRACTOR-family windows (boxes the robot walks AROUND, not "
                              "onto). Train-time switch -- recordings tag every window with "
@@ -255,6 +269,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         skip_distractors=args.skip_distractors,
         skip_families=([f.strip() for f in args.skip_families.split(",") if f.strip()]
                        if args.skip_families else None),
+        transition_fraction=args.transition_fraction,
+        clip_library_path=args.clip_library_path,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
@@ -485,8 +501,20 @@ def main() -> None:
     })
     print(f"[INFO] Provenance -> {out_dir}/params/{{fm_config,data}}.yaml + git/  (data sha {data_sha256[:12]})")
 
+    # cfg.transition_fraction oversamples terrain-transition windows via sampler weights
+    # (see dataset.transition_sampler_weights). `sampler` and `shuffle` are mutually
+    # exclusive in torch, and a WeightedRandomSampler already shuffles. Epoch size is held
+    # at len(train_ds) so "epoch" means the same thing weighted or not, and replacement is
+    # required for a weight >1 to draw a window more than once.
+    _w = getattr(train_ds, "sampler_weights", None)
+    train_sampler = (
+        WeightedRandomSampler(torch.as_tensor(_w, dtype=torch.double),
+                              num_samples=len(train_ds), replacement=True)
+        if _w is not None else None
+    )
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        train_ds, batch_size=cfg.batch_size,
+        shuffle=(train_sampler is None), sampler=train_sampler,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"), drop_last=True,
     )
     val_loader = None

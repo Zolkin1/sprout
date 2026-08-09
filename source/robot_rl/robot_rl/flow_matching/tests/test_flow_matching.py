@@ -1052,6 +1052,66 @@ def test_skip_families_refuses_to_drop_everything():
 
 
 # ---------------------------------------------------------------------------
+# Transition oversampling (--transition_fraction).
+# ---------------------------------------------------------------------------
+def _patched_transition_mask(monkeypatch, mask):
+    """Stub the library join so the weight math is testable without a clip .h5."""
+    from robot_rl.flow_matching import dataset as ds
+    monkeypatch.setattr(ds, "transition_window_mask",
+                        lambda data, meta, cfg, w: np.asarray(mask, dtype=bool))
+    return ds.transition_sampler_weights
+
+
+def test_transition_weights_hit_the_requested_fraction(monkeypatch):
+    """The weight makes the EXPECTED per-epoch transition share equal the target.
+
+    Checked as a probability, not as a raw weight: the whole point of the knob is the
+    resulting mix, and w = p*n_f/((1-p)*n_t) is easy to get subtly wrong (e.g. by using
+    the total instead of the non-transition count).
+    """
+    mask = np.array([True] * 2 + [False] * 8)          # 20% natural, like the real 17.8%
+    weights_fn = _patched_transition_mask(monkeypatch, mask)
+    cfg = FlowMatchingConfig(transition_fraction=0.5)
+    w = weights_fn({}, None, cfg, mask.size, np.arange(mask.size))
+    share = w[mask].sum() / w.sum()
+    assert share == pytest.approx(0.5)
+    assert w[~mask].tolist() == [1.0] * 8              # non-transitions stay at unit weight
+
+
+def test_transition_fraction_none_disables_weighting(monkeypatch):
+    """``None`` must yield no sampler at all, not a uniform weight vector."""
+    weights_fn = _patched_transition_mask(monkeypatch, [True, False])
+    assert weights_fn({}, None, FlowMatchingConfig(transition_fraction=None), 2,
+                      np.arange(2)) is None
+
+
+@pytest.mark.parametrize("p", [0.0, 1.0, -0.1, 1.5])
+def test_transition_fraction_rejects_degenerate_targets(monkeypatch, p):
+    """0 and 1 are unreachable by reweighting and would divide by zero."""
+    weights_fn = _patched_transition_mask(monkeypatch, [True, False])
+    with pytest.raises(ValueError, match="must be in"):
+        weights_fn({}, None, FlowMatchingConfig(transition_fraction=p), 2, np.arange(2))
+
+
+def test_transition_weighting_refuses_a_single_class_split(monkeypatch):
+    """No reweighting can manufacture a class the train split does not contain."""
+    weights_fn = _patched_transition_mask(monkeypatch, [False, False, False])
+    with pytest.raises(ValueError, match="needs both kinds"):
+        weights_fn({}, None, FlowMatchingConfig(transition_fraction=0.5), 3, np.arange(3))
+
+
+def test_transition_mask_refuses_a_recording_without_the_clip_index():
+    """A recording predating clip_id/clip_step must error, not sample uniformly.
+
+    A silent fallback would report a transition-weighted run that never weighted anything.
+    """
+    from robot_rl.flow_matching.dataset import transition_window_mask
+    cfg = FlowMatchingConfig(transition_fraction=0.5)
+    with pytest.raises(ValueError, match="clip_id"):
+        transition_window_mask({"episode_id": np.zeros(3)}, SimpleNamespace(), cfg, 3)
+
+
+# ---------------------------------------------------------------------------
 # Body-link pose terms: the CLF's metric, as a loss
 # ---------------------------------------------------------------------------
 _BODY_FRAMES = ["left_knee_link", "right_knee_link", "left_ankle_roll_link", "torso_link"]
