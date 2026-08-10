@@ -25,6 +25,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 find_package(Eigen3 3.3 REQUIRED)
+find_package(Threads REQUIRED)  # the generator runs on its own thread (fm_worker)
 
 # ONNX metadata is JSON. ordered_json is the part that matters: the default object type sorts
 # keys, and the observation term order IS the observation layout (see policy_params.h).
@@ -47,12 +48,13 @@ add_library(g1_deploy STATIC
   src/policy_params.cc
   src/plan_scheduler.cc
   src/gen_tracker_core.cc
+  src/fm_worker.cc
 )
 add_library(G1Deploy::Core ALIAS g1_deploy)
 
 target_include_directories(g1_deploy PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
-target_link_libraries(g1_deploy PUBLIC Eigen3::Eigen)
+target_link_libraries(g1_deploy PUBLIC Eigen3::Eigen Threads::Threads)
 # PRIVATE: json appears only in policy_params.cc, never in a public header, so consumers do
 # not inherit the dependency.
 target_link_libraries(g1_deploy PRIVATE nlohmann_json::nlohmann_json)
@@ -132,7 +134,7 @@ include(CTest)
 if(BUILD_TESTING)
   find_package(GTest QUIET)
   if(GTest_FOUND)
-    foreach(name quat_math_parity window_parity depth_obs_parity node_history policy_params plan_scheduler gen_tracker_core)
+    foreach(name quat_math_parity window_parity depth_obs_parity node_history policy_params plan_scheduler gen_tracker_core fm_worker)
       add_executable(${name}_test test/${name}_test.cc test/fixture.cc)
       target_include_directories(${name}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
       target_link_libraries(${name}_test
