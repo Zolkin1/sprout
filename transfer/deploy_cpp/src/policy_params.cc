@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <regex>
 #include <stdexcept>
 
 namespace g1_deploy {
@@ -102,6 +103,34 @@ PolicyParams ParsePolicyParameters(const std::string& json) {
   p.dt = root.at("dt").get<double>();
   p.kp = DoubleList(root.at("kp"));
   p.kd = DoubleList(root.at("kd"));
+  if (root.contains("default_joint_angles")) {
+    p.default_joint_angles = DoubleList(root.at("default_joint_angles"));
+  }
+
+  // action_scale is a PATTERN table, not a per-joint list. Resolution rules that matter:
+  //   * std::regex_match, not regex_search -- the python uses re.fullmatch, so a pattern has
+  //     to match the WHOLE joint name. `.*hip.*` and `hip` behave very differently otherwise.
+  //   * FIRST match in the table's own order wins, which is why the metadata is parsed with
+  //     ordered_json: with a sorted map a broad pattern could outrank the specific one that
+  //     was written after it.
+  //   * an unmatched joint throws. A default of 0 would silently freeze that joint.
+  if (root.contains("action_scale")) {
+    const auto& patterns = root.at("action_scale");
+    p.action_scale.reserve(p.joint_names_isaac.size());
+    for (const std::string& joint : p.joint_names_isaac) {
+      bool matched = false;
+      for (const auto& [pattern, value] : patterns.items()) {
+        if (std::regex_match(joint, std::regex(pattern))) {
+          p.action_scale.push_back(value.get<double>());
+          matched = true;
+          break;
+        }
+      }
+      if (!matched) {
+        throw std::runtime_error("no action_scale pattern matches joint '" + joint + "'");
+      }
+    }
+  }
 
   if (root.contains("fm_update_every") && !root["fm_update_every"].is_null()) {
     p.fm_update_every = root["fm_update_every"].get<int>();

@@ -20,8 +20,19 @@ class TrackerSession {
   TrackerSession(const std::string& onnx_path, const std::vector<Provider>& providers,
                  int intra_threads);
 
-  /// Run the policy. `obs` is num_obs floats; `action_out` receives num_actions.
+  /// Run the policy. `obs` is num_obs floats; `action_out` receives num_actions RAW actions
+  /// in the POLICY's joint order.
   void Infer(const float* obs, float* action_out);
+
+  /// Run the policy and return joint POSITION TARGETS in `joint_names_out` order.
+  ///
+  /// target = raw_action * action_scale + default_joint_angles, then permuted. The permutation
+  /// is resolved once and cached: the policy's joint order is interleaved
+  /// (left_hip_pitch, right_hip_pitch, waist_yaw, ...) while the robot's is per limb, and 27
+  /// of 29 positions differ on the G1. Subtracting one from the other gives a large, smooth,
+  /// entirely fictitious error rather than an obvious failure.
+  void GetAction(const float* obs, const std::vector<std::string>& joint_names_out,
+                 double* targets_out);
 
   const PolicyParams& params() const { return params_; }
   OrtModel& model() { return model_; }
@@ -35,6 +46,10 @@ class TrackerSession {
   std::vector<float> last_action_;
   std::string in_name_;
   std::string out_name_;
+  //: joint_names_out -> index into the policy's order. Rebuilt only when the names change.
+  std::vector<int> out_permutation_;
+  std::vector<std::string> cached_out_names_;
+  std::vector<double> targets_isaac_;
 };
 
 /// Refuse a generator and a tracker that do not describe the same window.

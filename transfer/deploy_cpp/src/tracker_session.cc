@@ -52,6 +52,53 @@ void TrackerSession::Infer(const float* obs, float* action_out) {
   std::copy(last_action_.begin(), last_action_.end(), action_out);
 }
 
+void TrackerSession::GetAction(const float* obs, const std::vector<std::string>& joint_names_out,
+                              double* targets_out) {
+  if (params_.action_scale.size() != static_cast<size_t>(params_.num_actions) ||
+      params_.default_joint_angles.size() != static_cast<size_t>(params_.num_actions)) {
+    throw std::runtime_error(
+        "tracker.onnx metadata carries no per-joint action_scale / default_joint_angles, so a "
+        "raw network output cannot be turned into a joint target. Re-export with "
+        "scripts/rsl_rl/export_parameters.py.");
+  }
+  Infer(obs, last_action_.data());
+
+  targets_isaac_.resize(static_cast<size_t>(params_.num_actions));
+  for (int i = 0; i < params_.num_actions; ++i) {
+    targets_isaac_[static_cast<size_t>(i)] =
+        static_cast<double>(last_action_[static_cast<size_t>(i)]) *
+            params_.action_scale[static_cast<size_t>(i)] +
+        params_.default_joint_angles[static_cast<size_t>(i)];
+  }
+
+  // Resolve the permutation once. Doing it per tick is a dict build per joint at 50 Hz, and
+  // more importantly it hides the failure: an unknown joint should be a loud error at the
+  // first tick, not a lookup that happens to miss.
+  if (joint_names_out != cached_out_names_) {
+    out_permutation_.clear();
+    out_permutation_.reserve(joint_names_out.size());
+    for (const std::string& want : joint_names_out) {
+      int found = -1;
+      for (size_t i = 0; i < params_.joint_names_isaac.size(); ++i) {
+        if (params_.joint_names_isaac[i] == want) {
+          found = static_cast<int>(i);
+          break;
+        }
+      }
+      if (found < 0) {
+        throw std::runtime_error("joint '" + want +
+                                 "' is not one the policy produces; the tracker and the robot "
+                                 "disagree about the joint set");
+      }
+      out_permutation_.push_back(found);
+    }
+    cached_out_names_ = joint_names_out;
+  }
+  for (size_t i = 0; i < out_permutation_.size(); ++i) {
+    targets_out[i] = targets_isaac_[static_cast<size_t>(out_permutation_[i])];
+  }
+}
+
 void AssertWindowBlocksAgree(const std::vector<std::pair<std::string, int>>& tracker_blocks,
                              const std::vector<ReferenceBlock>& fm_blocks) {
   bool same = tracker_blocks.size() == fm_blocks.size();

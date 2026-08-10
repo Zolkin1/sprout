@@ -70,6 +70,10 @@ struct PolicyParams {
   double dt = 0.0;
   std::vector<double> kp;
   std::vector<double> kd;
+  //: Per-joint, in joint_names_isaac order. Resolved from the metadata's PATTERN table.
+  std::vector<double> action_scale;
+  //: Per-joint offset the action is added to, in joint_names_isaac order.
+  std::vector<double> default_joint_angles;
   //: The generator re-plan period, in control steps. Absent for a tracker-only artifact;
   //: GenTrackerPolicy raises rather than defaulting when an fm.onnx is loaded without it,
   //: because a wrong cadence is a silent tracking failure.

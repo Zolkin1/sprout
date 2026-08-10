@@ -49,6 +49,7 @@ add_library(g1_deploy STATIC
   src/plan_scheduler.cc
   src/gen_tracker_core.cc
   src/fm_worker.cc
+  src/obs_assembler.cc
 )
 add_library(G1Deploy::Core ALIAS g1_deploy)
 
@@ -134,7 +135,7 @@ include(CTest)
 if(BUILD_TESTING)
   find_package(GTest QUIET)
   if(GTest_FOUND)
-    foreach(name quat_math_parity window_parity depth_obs_parity node_history policy_params plan_scheduler gen_tracker_core fm_worker)
+    foreach(name quat_math_parity window_parity depth_obs_parity node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler)
       add_executable(${name}_test test/${name}_test.cc test/fixture.cc)
       target_include_directories(${name}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
       target_link_libraries(${name}_test
@@ -144,7 +145,8 @@ if(BUILD_TESTING)
       # a freshly dumped set can be checked without rebuilding.
       target_compile_definitions(${name}_test PRIVATE
         G1_DEPLOY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/parity"
-        G1_DEPLOY_METADATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/metadata")
+        G1_DEPLOY_METADATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/metadata"
+        G1_DEPLOY_OBS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/obs")
       add_test(NAME ${name} COMMAND ${name}_test)
     endforeach()
 

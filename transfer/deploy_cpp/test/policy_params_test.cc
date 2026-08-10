@@ -121,6 +121,22 @@ TEST_F(PolicyParamsFixture, ReplanCadenceComesFromMetadata) {
   }
 }
 
+TEST_F(PolicyParamsFixture, ActionScalePatternsResolveExactlyAsPythonDoes) {
+  // action_scale is a PATTERN table; the python resolves it with re.fullmatch, taking the
+  // FIRST match in the table's own order. std::regex_search instead of regex_match, or a
+  // sorted map instead of ordered_json, would give a different per-joint scale -- and a wrong
+  // action scale is a robot that moves the right way by the wrong amount.
+  const PolicyParams p = ParsePolicyParameters(raw_);
+  const auto& want = expected_["action_scale"];
+  ASSERT_EQ(p.action_scale.size(), want.size())
+      << "every joint must resolve to a scale; an unmatched one has to throw, not default";
+  for (size_t i = 0; i < p.action_scale.size(); ++i) {
+    EXPECT_DOUBLE_EQ(p.action_scale[i], want[i].get<double>())
+        << "joint " << i << " (" << p.joint_names_isaac[i] << ")";
+  }
+  EXPECT_EQ(static_cast<int>(p.default_joint_angles.size()), p.num_actions);
+}
+
 TEST_F(PolicyParamsFixture, ReferenceWindowSpecMatchesPython) {
   const PolicyParams p = ParsePolicyParameters(raw_);
   ASSERT_TRUE(p.reference_window.has_value());
