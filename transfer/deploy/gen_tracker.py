@@ -545,12 +545,19 @@ class GenTrackerPolicy:
         self._pred_valid = False
 
     def observe(self, state: dict) -> None:
-        """Append a real snapshot to the history without running the generator.
+        """Advance the step counter during a warmup, without running the generator.
 
-        Used during the stable-stand warmup: the window fills with measured frames
-        while the FM stays dormant (``_pred_valid`` False), so the first live
-        ``create_obs`` cleanly triggers the first FM sample anchored on a settled
-        stand rather than on a static repeated snapshot.
+        Used during the stable-stand warmup, where the FM stays dormant (``_pred_valid``
+        False) so the first live ``create_obs`` triggers the first FM sample from a settled
+        stand.
+
+        The history window is deliberately left INVALID throughout. A history row is a
+        reference-window node this runtime SERVED, and nothing is served during a warmup, so
+        every row pushed here is the zero placeholder. Letting those accumulate into a
+        "complete" window handed the generator an all-zero history with ``history_null`` OFF
+        -- an input training never produced, and precisely the failure the obelisk PD warm-up
+        caused (rows of zeros flipped ``null_mask`` off and denied the model the learned
+        embedding meant to cover exactly those steps).
 
         No-op in tracker-only (no-FM) mode: there is no generator history to keep.
         """
@@ -558,6 +565,7 @@ class GenTrackerPolicy:
             return
         self._ctrl_step += 1
         self._history.append(self._make_snapshot(state))
+        self._history.invalidate(np.ones(1, dtype=bool))
 
     def _update_generator(self, state: dict) -> None:
         """Advance the receding horizon by one control step.
@@ -579,6 +587,17 @@ class GenTrackerPolicy:
         """
         self._ctrl_step += 1
         self._history.append(self._make_snapshot(state))
+        if self._prev_served_node is None:
+            # Nothing has been served yet, so that row is the zero placeholder, not a node
+            # this runtime produced. Keep the window INVALID so the learned null-history
+            # embedding covers it: a zero row counted as real history is off-distribution --
+            # training never presented one -- and it would go in with `history_null` off,
+            # silently, for exactly the steps the embedding exists to handle.
+            #
+            # Without this the window went valid at step N-1 with its OLDEST row still the
+            # placeholder, and on the warmup path (`observe`) it went valid with EVERY row a
+            # placeholder.
+            self._history.invalidate(np.ones(1, dtype=bool))
         null_hist = bool(self._history.null_mask()[0])
         use_null = (self.null_history_warmup and getattr(self.ctx, "has_history_null", False))
 

@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cstdio>
 #include <stdexcept>
 
 namespace g1_deploy {
@@ -79,6 +80,20 @@ FmSession::FmSession(const std::string& onnx_path, const std::vector<Provider>& 
   // has_history_null comes from the GRAPH, not the metadata: what matters is whether the
   // input exists to feed, and a graph exported before the embedding simply has no such input.
   meta_.has_history_null = model_.HasInput("history_null");
+  if (!meta_.has_history_null) {
+    // Said at LOAD, not on the first tick that needs it. Without this input the learned
+    // null-history embedding cannot be reached at all, so the generator conditions on a
+    // window that is partly the zero placeholder and is told nothing about it -- the same
+    // failure the obelisk PD warm-up caused, where history rows of zeros flipped null_mask
+    // off and denied the model the embedding meant to cover exactly those steps. It is
+    // survivable, so this warns rather than refuses, but it must not be silent.
+    std::fprintf(stderr,
+                 "[WARN FmSession] %s has no 'history_null' input, so the learned "
+                 "null-history embedding cannot be used. The first N steps after arming will "
+                 "condition on a not-yet-full history window with no indication that it is "
+                 "incomplete. Re-export with scripts/flow_matching/export_fm_onnx.py.\n",
+                 onnx_path.c_str());
+  }
 
   history_f_.assign(static_cast<size_t>(meta_.n) * meta_.d, 0.0f);
   extero_f_.assign(static_cast<size_t>(meta_.extero_dim()), 0.0f);

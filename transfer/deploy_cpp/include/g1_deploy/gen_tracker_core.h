@@ -123,6 +123,9 @@ class GenTrackerCore {
   bool has_pending_ = false;
   int64_t pending_target_ = 0;
   std::vector<double> prev_served_node_;  //: D, raw
+  //: Whether anything has actually been served. Until it has, the history rows are
+  //: placeholders and the window must be reported as null.
+  bool has_served_ = false;
   Vec3 anchor_pos_ = Vec3::Zero();
   QuatXyzw anchor_quat_{0.0, 0.0, 0.0, 1.0};
 };

@@ -299,6 +299,38 @@ TEST(GenTrackerCore, TheFirstPlanIsRequestedWithHistoryNullSet) {
       << "the first plan is wanted immediately, not at the next boundary";
 }
 
+TEST(GenTrackerCore, HistoryNullHoldsUntilTheWindowIsFullOfRealServedNodes) {
+  // The generator is NEVER handed a zero placeholder dressed up as real history. Training
+  // never produced that input, so it is off-distribution, and it would arrive with
+  // `history_null` OFF -- silently, for exactly the steps the learned embedding exists to
+  // cover.
+  //
+  //   tick : history_null : oldest row is the zero placeholder
+  //    0..3 :      1      :   1        placeholder present -> embedding covers it
+  //    4+   :      0      :   0        N genuinely served nodes, and only then
+  //
+  // The window goes valid at tick N, not N-1: the first append happens before anything has
+  // been served, so it is a placeholder and must not count toward validity. Verified to match
+  // transfer/deploy/gen_tracker.py, which got the same fix -- the two have to agree or sim2sim
+  // and hardware condition the generator differently for the first N steps after arming.
+  const int lead = 0;
+  Harness h(1, lead);  // K=1 so a request fires every tick
+  for (int t = 0; t < 6; ++t) h.Step(MakeState());
+
+  ASSERT_GE(h.sampler->requests.size(), 6u);
+  const std::vector<bool> want_null = {true, true, true, true, false, false};
+  for (size_t t = 0; t < want_null.size(); ++t) {
+    EXPECT_EQ(h.sampler->requests[t].history_null, want_null[t]) << "tick " << t;
+  }
+
+  // And the row that made it valid is a real served node, not the placeholder.
+  const int dim = WindowDim(kNJ, kEE, kSlim);
+  const auto& oldest = h.sampler->requests[4].history_nodes;
+  double mag = 0.0;
+  for (int d = 0; d < dim; ++d) mag = std::max(mag, std::abs(oldest[static_cast<size_t>(d)]));
+  EXPECT_GT(mag, 0.0) << "the oldest row must be a served node once the window is valid";
+}
+
 TEST(GenTrackerCore, ALateGeneratorSaturatesTheFarOffsetsInsteadOfRaising) {
   // The python raises when the cursor runs past the horizon, because there a clamp could
   // only mean a misconfigured horizon. Here lateness is a real, expected, flagged condition,

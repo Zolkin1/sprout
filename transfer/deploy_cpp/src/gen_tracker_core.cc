@@ -28,6 +28,7 @@ void GenTrackerCore::Reset() {
   std::fill(pred_.begin(), pred_.end(), 0.0);
   std::fill(prev_served_node_.begin(), prev_served_node_.end(), 0.0);
   has_pending_ = false;
+  has_served_ = false;
   anchor_pos_ = Vec3::Zero();
   anchor_quat_ = QuatXyzw(0.0, 0.0, 0.0, 1.0);
 }
@@ -84,9 +85,16 @@ void GenTrackerCore::BuildRequest(FmRequest* req) const {
 TickOutcome GenTrackerCore::Step(const CoreState& state, double* window_out) {
   sched_.BeginTick();
 
-  // 1. Push the node served LAST step. Before the first serve there is nothing real to push;
-  //    zeros go in and the learned null-history embedding covers them.
+  // 1. Push the node served LAST step.
+  //
+  //    Before the first serve there is nothing real to push, so the row is a zero placeholder
+  //    -- and the window is then kept INVALID so the learned null-history embedding covers it.
+  //    A zero row counted as real history is off-distribution: training never presented one,
+  //    and it would reach the generator with `history_null` OFF, silently, for exactly the
+  //    steps that embedding exists to handle. Without the invalidate the window went valid at
+  //    step N-1 with its oldest row still the placeholder.
   history_.Append(prev_served_node_.data(), state.command.data());
+  if (!has_served_) history_.Invalidate();
 
   // 2. Ask for a plan, conditioned on the history projected to the boundary it is for.
   if (sched_.ShouldRequest()) {
@@ -156,6 +164,7 @@ TickOutcome GenTrackerCore::Step(const CoreState& state, double* window_out) {
   const int cursor_idx = std::min(sched_.cursor(), cfg_.schedule.horizon - 1);
   const double* served = pred_.data() + static_cast<size_t>(cursor_idx) * node_dim_;
   prev_served_node_.assign(served, served + node_dim_);
+  has_served_ = true;
   return outcome;
 }
 
