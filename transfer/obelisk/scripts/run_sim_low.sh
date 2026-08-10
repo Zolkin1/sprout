@@ -37,6 +37,12 @@ usage() {
 run_sim_low.sh -- the BRAIN alone (g1.yml), in tmux session `simlow`.
 
 Options:
+  --cpp            Use the C++ controller (g1_cpp.yml) instead of the python one.
+                   On aarch64 this is the only one that can reach the GPU: rclpy is a
+                   cp310 C extension and the only onnxruntime GPU build for a Thor is
+                   cp312, so the python node runs the generator on the CPU at ~471 ms
+                   per re-plan against a 20 ms period. The C++ one runs it at ~16 ms,
+                   on its own thread.
   --policy FOLDER  Override the controller's hf_policy_folder for this run.
   --no-bag         Do NOT record. Recording is ON by default -- a run you cannot
                    explain afterwards is a run you have to repeat. Bags go to
@@ -58,9 +64,10 @@ EOF
 }
 
 ORIG_ARGS=("$@")
-POLICY="" ; BUILD="" ; BAG=1
+POLICY="" ; BUILD="" ; BAG=1 ; CPP=""
 while [ $# -gt 0 ]; do
     case "$1" in
+        --cpp)         CPP=1; shift ;;
         --policy)      POLICY="${2:-}"; shift 2 ;;
         --no-bag)      BAG=""; shift ;;
         --build)       BUILD=1; shift ;;
@@ -78,7 +85,13 @@ if [ -z "${OBK_IN_CONTAINER:-}" ]; then
 fi
 
 SESSION="$OBK_SESSION"
-CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1.yml"
+# One line apart, deliberately: the two controllers share every other part of the config, so
+# a difference between them cannot be a difference in what else was launched.
+if [ -n "$CPP" ]; then
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml"
+else
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1.yml"
+fi
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
 
 if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then

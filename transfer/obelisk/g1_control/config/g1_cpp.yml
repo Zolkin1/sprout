@@ -1,0 +1,59 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# The G1 BRAIN, driven by the C++ controller (g1_control_cpp) instead of the python one.
+#
+# Identical to g1.yml in every other respect: the same shared fragment, the same estimator,
+# the same joystick FSM, the same robot-less split (the world or the hardware driver is a
+# SEPARATELY launched config on the same ROS graph). Only the control executable changes, so a
+# regression between the two controllers is isolated by launching this file instead of g1.yml
+# and changing nothing else.
+#
+# ============================ why this exists at all ======================================
+# On a Jetson (aarch64) the python controller cannot reach the GPU. ROS 2 Humble pins the image
+# to python 3.10, so rclpy is a cp310 C extension, while the only onnxruntime GPU build that
+# runs on a Thor is cp312 -- two C extensions built for different CPython ABIs cannot share a
+# process. The python node therefore runs the generator on the CPU at ~471 ms per re-plan tick
+# against a 20 ms control period. This one runs it on the GPU at ~16 ms, on its own thread.
+#
+# Launch:
+#   obk-launch config=${ROBOT_RL_ROOT}/g1_control/config/g1_cpp.yml
+#
+# or, the usual way, which does this for you:
+#   scripts/run_sim_low.sh --cpp
+config: rl_policy_cpp
+
+include:
+  - common/low_level.yml
+
+# Keyed merge: the entry named `low_level` in the fragment, with its executable swapped and the
+# C++-only parameters added. `params` MERGES rather than replaces, so everything the fragment
+# sets (hf_repo_id, hf_policy_folder, use_cuda, onnx_threads, depth_topics, the timeouts) still
+# applies and is not restated here -- restating it is how two configs drift apart.
+control:
+  - name: low_level
+    pkg: g1_control_cpp
+    executable: g1_controller
+    params:
+      # How far BEFORE its cadence boundary the generator is asked for a plan. The cadence
+      # itself is NOT here and must never be: it comes from tracker.onnx's metadata and
+      # nowhere else, so a parameter for it would read as a live knob that can never take
+      # effect (which is exactly what happened to fm_update_every once already).
+      #
+      # 0.05 s is ~3 ticks at dt = 0.02, against a measured generator time of ~16 ms on this
+      # GPU. The margin is deliberate: 16 ms fits a 20 ms period with ~5% to spare on an IDLE
+      # GPU, and the ZED pipeline shares it. Off the control thread the same work has the
+      # whole lead window instead, so contention can cost something without missing a
+      # deadline. Raise it if `fm_plan_late` ever appears in a bag; it is clamped to K-1.
+      fm_lead_sec: 0.05
+
+      # The generator on its own thread. false runs it inline, which is what the tests and the
+      # benchmark do and which is useful for isolating a threading question from a policy one
+      # -- but on this hardware inline means the 50 Hz tick pays 16 ms every twelfth tick.
+      threaded_fm: true
+
+      # Ticks of continuous lateness before disarming. 0 = never, which is the deliberate
+      # default: a late plan is survivable (the cursor keeps advancing and the far end of the
+      # reference window saturates, loudly), and disarming mid-stride is not obviously safer.
+      # Consider ~25 (0.5 s) after the first hardware campaign, when there is data about how
+      # often it happens.
+      fm_late_disarm_ticks: 0
