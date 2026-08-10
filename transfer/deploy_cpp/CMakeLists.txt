@@ -113,6 +113,7 @@ if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
     src/ort_session.cc
     src/tracker_session.cc
     src/fm_session.cc
+    src/policy_runtime.cc
   )
   add_library(G1Deploy::Ort ALIAS g1_deploy_ort)
   target_link_libraries(g1_deploy_ort
@@ -153,13 +154,15 @@ if(BUILD_TESTING)
     # The session tests need onnxruntime AND a real policy pair. They skip without the
     # artifacts, so they are safe to register wherever ORT exists.
     if(G1_DEPLOY_HAVE_ORT)
-      add_executable(ort_sessions_test test/ort_sessions_test.cc)
-      target_link_libraries(ort_sessions_test
-        PRIVATE g1_deploy_ort GTest::gtest GTest::gtest_main)
-      target_compile_options(ort_sessions_test PRIVATE -Wall -Wextra -Wpedantic)
-      target_compile_definitions(ort_sessions_test PRIVATE
-        G1_DEPLOY_POLICY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../obelisk/g1_control/resource/hf_cache/zolkin_robot_rl/2026-08-04_21-55-17_yaw_k12_v1")
-      add_test(NAME ort_sessions COMMAND ort_sessions_test)
+      foreach(ortname ort_sessions policy_runtime)
+        add_executable(${ortname}_test test/${ortname}_test.cc)
+        target_link_libraries(${ortname}_test
+          PRIVATE g1_deploy_ort GTest::gtest GTest::gtest_main)
+        target_compile_options(${ortname}_test PRIVATE -Wall -Wextra -Wpedantic)
+        target_compile_definitions(${ortname}_test PRIVATE
+          G1_DEPLOY_POLICY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../obelisk/g1_control/resource/hf_cache/zolkin_robot_rl/2026-08-04_21-55-17_yaw_k12_v1")
+        add_test(NAME ${ortname} COMMAND ${ortname}_test)
+      endforeach()
     endif()
   else()
     message(STATUS "GTest not found -- skipping g1_deploy tests")

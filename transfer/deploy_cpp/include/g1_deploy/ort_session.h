@@ -45,6 +45,7 @@ class OrtModel {
   ///     auto was ~3x slower than 4 on the generator, so it is worth setting explicitly and
   ///     re-measuring per box.
   OrtModel(const std::string& path, const std::vector<Provider>& providers, int intra_threads);
+  ~OrtModel();
 
   /// A custom metadata entry, e.g. "policy_parameters" or "fm_meta". Throws if absent.
   std::string Metadata(const std::string& key) const;

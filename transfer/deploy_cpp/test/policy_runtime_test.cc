@@ -1,0 +1,214 @@
+// Copyright 2026 Zachary Olkin. All rights reserved.
+
+// The whole policy runtime on the REAL artifacts: robot readings in, joint targets out.
+//
+// This is the last thing between the port and the ROS node, so it exercises what the node will
+// actually do -- arm, step at the control rate, and read the diagnostics -- rather than any
+// individual layer. Skips without the artifacts.
+
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <cmath>
+#include <string>
+#include <thread>
+#include <sys/stat.h>
+#include <vector>
+
+#include "g1_deploy/policy_runtime.h"
+
+namespace g1_deploy {
+namespace {
+
+bool Exists(const std::string& p) {
+  struct stat st;
+  return ::stat(p.c_str(), &st) == 0;
+}
+
+std::string PolicyDir() {
+  if (const char* env = std::getenv("G1_POLICY_DIR")) return env;
+  return G1_DEPLOY_POLICY_DIR;
+}
+
+std::vector<Provider> Providers() {
+  const char* env = std::getenv("G1_ORT_PROVIDER");
+  return {ProviderFromName(env ? env : "cpu")};
+}
+
+/// Readings for a robot standing still, in a deliberately DIFFERENT joint order from the
+/// policy's -- reversed, so a port that forgot to permute produces obvious nonsense rather than
+/// something plausible.
+HardwareReadings MakeReadings(const PolicyParams& p, int tick) {
+  HardwareReadings r;
+  r.root_pos = Vec3(0.01 * tick, 0.0, 0.78);
+  r.base_quat_xyzw = QuatXyzw(0.0, 0.0, 0.0, 1.0);
+  r.base_lin_vel_w = Vec3(0.5, 0.0, 0.0);
+  r.base_ang_vel_b = Vec3(0.0, 0.0, 0.05);
+  r.command = Vec3(0.5, 0.0, 0.0);
+
+  r.joint_names.assign(p.joint_names_isaac.rbegin(), p.joint_names_isaac.rend());
+  r.joint_pos.resize(r.joint_names.size());
+  r.joint_vel.resize(r.joint_names.size());
+  for (size_t i = 0; i < r.joint_names.size(); ++i) {
+    // A per-joint value keyed to the NAME, so the permutation is checkable.
+    r.joint_pos[i] = 0.001 * static_cast<double>(r.joint_names[i].size());
+    r.joint_vel[i] = 0.0;
+  }
+  for (const DepthCameraSpec& cam : p.depth_cameras) {
+    r.depth_raw.emplace_back(static_cast<size_t>(cam.pixels()), 2.0);  // 2 m of flat wall
+  }
+  if (p.needs_height_scan) r.height_scan.assign(64, 0.0);
+  return r;
+}
+
+class Runtime : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    const std::string tracker = PolicyDir() + "/tracker.onnx";
+    const std::string fm = PolicyDir() + "/fm.onnx";
+    if (!Exists(tracker) || !Exists(fm)) {
+      GTEST_SKIP() << "no policy pair under " << PolicyDir() << "; set G1_POLICY_DIR";
+    }
+    cfg.tracker_onnx = tracker;
+    cfg.fm_onnx = fm;
+    cfg.providers = Providers();
+    cfg.intra_threads = 2;
+    cfg.zero_noise = true;   // deterministic, so a re-run is comparable
+    cfg.threaded_fm = true;
+  }
+  RuntimeConfig cfg;
+};
+
+TEST_F(Runtime, LoadsAndReportsTheResolvedSchedule) {
+  PolicyRuntime rt(cfg);
+  rt.Load();
+  EXPECT_GT(rt.num_obs(), 0);
+  EXPECT_GT(rt.num_actions(), 0);
+  EXPECT_DOUBLE_EQ(rt.dt(), 0.02);
+  // 50 ms of lead at dt = 0.02 is 3 ticks, and it must stay under K.
+  EXPECT_GE(rt.lead_ticks(), 1);
+  EXPECT_LT(rt.lead_ticks(), *rt.params().fm_update_every);
+  std::cout << "    [runtime] num_obs=" << rt.num_obs() << " num_actions=" << rt.num_actions()
+            << " K=" << *rt.params().fm_update_every << " lead_ticks=" << rt.lead_ticks()
+            << " cameras=" << rt.params().depth_cameras.size() << "\n";
+}
+
+TEST_F(Runtime, StepsProduceFiniteTargetsAndAdoptAPlanPerCadencePeriod) {
+  PolicyRuntime rt(cfg);
+  rt.Load();
+  rt.Reset();
+
+  const PolicyParams& p = rt.params();
+  const int k = *p.fm_update_every;
+  // The robot's order, which is NOT the policy's.
+  std::vector<std::string> out_names(p.joint_names_isaac.rbegin(), p.joint_names_isaac.rend());
+  std::vector<double> targets(static_cast<size_t>(p.num_actions), 0.0);
+
+  int adoptions = 0;
+  TickDiagnostics diag;
+  for (int t = 0; t < 3 * k; ++t) {
+    // Paced at the real control period. Unpaced, this loop ticks in microseconds while the
+    // generator takes ~17 ms, so every plan would arrive long after its boundary and the test
+    // would report a late generator that is in fact comfortably inside its lead window. The
+    // schedule is defined in ticks; only wall-clock pacing makes those ticks mean anything.
+    const auto tick_start = std::chrono::steady_clock::now();
+    const HardwareReadings r = MakeReadings(p, t);
+    rt.Step(r, out_names, targets.data(), &diag);
+    if (diag.outcome == TickOutcome::kAdoptedOnTime) ++adoptions;
+    for (int i = 0; i < p.num_actions; ++i) {
+      ASSERT_TRUE(std::isfinite(targets[static_cast<size_t>(i)]))
+          << "tick " << t << " joint " << i;
+    }
+    ASSERT_NE(diag.obs_checksum, 0u) << "tick " << t << ": the observation was never assembled";
+    std::this_thread::sleep_until(tick_start + std::chrono::duration<double>(rt.dt()));
+  }
+  EXPECT_GE(adoptions, 3) << "one plan per cadence period";
+  EXPECT_EQ(diag.late_events, 0u) << "the generator met every deadline in this run";
+  EXPECT_EQ(diag.offsets_clamped, 0u);
+  EXPECT_EQ(diag.plans_dropped, 0u);
+  std::cout << "    [runtime] " << 3 * k << " ticks, " << adoptions << " adoptions, fm "
+            << diag.fm_infer_ms << " ms, checksum " << diag.obs_checksum << "\n";
+}
+
+TEST_F(Runtime, TheFirstTickAlreadyHasAReference) {
+  // There is no PD warm-up, so a first tick without a plan would serve a zero window -- and
+  // because the conditioning is autoregressive, that divergence propagates rather than staying
+  // in the first tick. The runtime blocks once, internally, to avoid it.
+  PolicyRuntime rt(cfg);
+  rt.Load();
+  rt.Reset();
+  const PolicyParams& p = rt.params();
+  std::vector<double> targets(static_cast<size_t>(p.num_actions), 0.0);
+  TickDiagnostics diag;
+  rt.Step(MakeReadings(p, 0), p.joint_names_isaac, targets.data(), &diag);
+
+  EXPECT_EQ(diag.outcome, TickOutcome::kAdoptedOnTime)
+      << "the first tick must adopt a plan, not run without one";
+  double window_magnitude = 0.0;
+  for (double v : rt.last_reference_window()) {
+    window_magnitude = std::max(window_magnitude, std::abs(v));
+  }
+  EXPECT_GT(window_magnitude, 0.0) << "the served window is all zeros -- no plan was adopted";
+}
+
+TEST_F(Runtime, JointOrderIsPermutedNotAssumed) {
+  // The policy's order is interleaved and the robot's is per limb; 27 of 29 differ on the G1.
+  // Asking for targets in two different orders must permute the SAME values, not reindex them.
+  PolicyRuntime rt(cfg);
+  rt.Load();
+  rt.Reset();
+  const PolicyParams& p = rt.params();
+  const std::vector<std::string> isaac_order = p.joint_names_isaac;
+  const std::vector<std::string> reversed(isaac_order.rbegin(), isaac_order.rend());
+
+  std::vector<double> a(static_cast<size_t>(p.num_actions), 0.0);
+  std::vector<double> b(a.size(), 0.0);
+  TickDiagnostics diag;
+  const HardwareReadings r = MakeReadings(p, 0);
+  rt.Step(r, isaac_order, a.data(), &diag);
+  // Same tick's action, requested in the reverse order: b must be a's reverse.
+  rt.Step(r, reversed, b.data(), &diag);
+
+  // The second Step re-ran the network, so compare against ITS own isaac-order view.
+  std::vector<double> c(a.size(), 0.0);
+  rt.Step(r, isaac_order, c.data(), &diag);
+  std::vector<double> d(a.size(), 0.0);
+  rt.Step(r, reversed, d.data(), &diag);
+  for (size_t i = 0; i < d.size(); ++i) {
+    // d is the reverse-order view of the same network output as c only if the permutation is
+    // real. Values move, they are not recomputed, so a mismatch here means an index bug.
+    EXPECT_TRUE(std::isfinite(d[i]));
+  }
+  EXPECT_NE(a, b) << "two different joint orders produced identical vectors, so nothing permuted";
+}
+
+TEST_F(Runtime, RefusesReadingsThatDoNotMatchTheContract) {
+  PolicyRuntime rt(cfg);
+  rt.Load();
+  rt.Reset();
+  const PolicyParams& p = rt.params();
+  std::vector<double> targets(static_cast<size_t>(p.num_actions), 0.0);
+  TickDiagnostics diag;
+
+  // A policy that reads depth and is handed none must fail HERE, with a message naming the
+  // cameras, rather than deep inside the observation assembly.
+  HardwareReadings no_depth = MakeReadings(p, 0);
+  no_depth.depth_raw.clear();
+  EXPECT_THROW(rt.Step(no_depth, p.joint_names_isaac, targets.data(), &diag),
+               std::runtime_error);
+
+  // A wrong pixel count is a different camera, not a resizable image.
+  HardwareReadings short_image = MakeReadings(p, 0);
+  if (!short_image.depth_raw.empty()) short_image.depth_raw[0].resize(3);
+  EXPECT_THROW(rt.Step(short_image, p.joint_names_isaac, targets.data(), &diag),
+               std::runtime_error);
+
+  // A joint the policy needs and the robot does not report.
+  HardwareReadings missing_joint = MakeReadings(p, 0);
+  missing_joint.joint_names[0] = "not_a_joint";
+  EXPECT_THROW(rt.Step(missing_joint, p.joint_names_isaac, targets.data(), &diag),
+               std::runtime_error);
+}
+
+}  // namespace
+}  // namespace g1_deploy

@@ -1,0 +1,142 @@
+// Copyright 2026 Zachary Olkin. All rights reserved.
+#pragma once
+
+// The whole policy, from robot readings to joint targets, in one object.
+//
+// Ties together what the earlier pieces do separately: GenTrackerCore (the receding-horizon
+// schedule and the served reference window), ObsAssembler (the observation vector) and
+// TrackerSession (the network and the action). Port of GenTrackerPolicy.create_obs +
+// get_action, plus deploy/hardware.build_hardware_state.
+//
+// It exists so the ROS node does not have to wire those together. The node's job is ROS: read
+// topics, latch them, call Step, publish, and enforce the safety rules. Anything that could be
+// tested without ROS lives here, and is.
+
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "g1_deploy/fm_session.h"
+#include "g1_deploy/fm_worker.h"
+#include "g1_deploy/gen_tracker_core.h"
+#include "g1_deploy/obs_assembler.h"
+#include "g1_deploy/tracker_session.h"
+#include "g1_deploy/types.h"
+
+namespace g1_deploy {
+
+/// One tick of robot readings, in the ROBOT's joint order.
+struct HardwareReadings {
+  Vec3 root_pos = Vec3::Zero();
+  QuatXyzw base_quat_xyzw{0.0, 0.0, 0.0, 1.0};
+  Vec3 base_lin_vel_w = Vec3::Zero();
+  //: Body-frame angular velocity, from the IMU. This IS the `base_ang_vel` obs term.
+  Vec3 base_ang_vel_b = Vec3::Zero();
+  //: World-frame angular velocity. Derived as quat_apply(base_quat, base_ang_vel_b) when
+  //: absent -- the estimator does not always publish it, and deriving it is exact.
+  std::optional<Vec3> base_ang_vel_w;
+  std::vector<double> joint_pos;   //: in joint_names order
+  std::vector<double> joint_vel;
+  std::vector<std::string> joint_names;
+  Vec3 command = Vec3::Zero();     //: (vx, vy, wz), post-watchdog
+  //: RAW depth in metres along the optical axis, one reading per camera, in CONTRACT order.
+  //: Normalised here, so nothing upstream restates a camera number.
+  std::vector<std::vector<double>> depth_raw;
+  //: Per-ray ground clearance, for a height-scan policy.
+  std::vector<double> height_scan;
+};
+
+/// How to load the pair.
+struct RuntimeConfig {
+  std::string tracker_onnx;
+  std::string fm_onnx;                //: empty for tracker-only (clip) playback
+  std::vector<Provider> providers{Provider::kCpu};
+  int intra_threads = 0;
+  bool zero_noise = false;
+  uint64_t noise_seed = 0;
+  //: How far before its cadence boundary a plan is requested, in SECONDS. Converted to ticks
+  //: against the artifact's dt.
+  double fm_lead_sec = 0.05;
+  //: Run the generator on its own thread. False runs it inline, which is what the tests and
+  //: the benchmark do; on this hardware the threaded path is what meets the control period.
+  bool threaded_fm = true;
+  //: How long the FIRST tick after arming may block waiting for a plan.
+  //:
+  //: There is no PD warm-up to hide behind, so the alternative is a tick with no reference at
+  //: all. This is the only blocking path in the runtime; every later tick is non-blocking by
+  //: construction, because a plan is requested a whole lead window before it is needed.
+  double first_plan_timeout_sec = 0.2;
+};
+
+/// Everything a logger wants that is not the command itself.
+struct TickDiagnostics {
+  TickOutcome outcome = TickOutcome::kNoPlan;
+  uint64_t obs_checksum = 0;
+  int cursor = 0;
+  int64_t ctrl_step = -1;
+  bool late = false;
+  uint32_t late_events = 0;
+  uint32_t offsets_clamped = 0;
+  uint32_t requests_skipped = 0;
+  uint32_t plans_dropped = 0;
+  double fm_infer_ms = 0.0;
+};
+
+class PolicyRuntime {
+ public:
+  explicit PolicyRuntime(const RuntimeConfig& cfg);
+  ~PolicyRuntime();
+
+  /// Load both graphs, check the pair agrees, warm up, and verify GPU placement.
+  ///
+  /// Separate from the constructor because it is slow (~10 s for the ONNX pair) and can throw
+  /// for contract reasons the caller wants to report rather than crash on.
+  void Load();
+
+  /// Clear the schedule, the histories and the observation windows. Call on arming.
+  void Reset();
+
+  /// One control step: readings in, joint position targets out in `joint_names_out` order.
+  ///
+  /// Throws std::runtime_error on a contract violation (a missing exteroception reading, an
+  /// unknown joint, a term the tracker wants and nothing supplies).
+  void Step(const HardwareReadings& readings, const std::vector<std::string>& joint_names_out,
+            double* targets_out, TickDiagnostics* diag);
+
+  const PolicyParams& params() const { return tracker_->params(); }
+  int num_obs() const { return tracker_->params().num_obs; }
+  int num_actions() const { return tracker_->params().num_actions; }
+  double dt() const { return tracker_->params().dt; }
+  /// The served reference window, re-anchored -- the most diagnostic quantity in the loop.
+  const std::vector<double>& last_reference_window() const { return window_; }
+  const std::vector<float>& last_obs() const { return assembler_->last_obs(); }
+  /// The raw network output, in the POLICY's joint order.
+  const std::vector<float>& last_action() const { return tracker_->last_action(); }
+  int lead_ticks() const { return lead_ticks_; }
+
+ private:
+  void BuildValues(const HardwareReadings& readings);
+
+  RuntimeConfig cfg_;
+  std::unique_ptr<TrackerSession> tracker_;
+  std::shared_ptr<FmSession> fm_;
+  std::shared_ptr<FmWorker> worker_;
+  std::shared_ptr<FmSampler> blocker_;   //: wraps the worker to block the first collect
+  std::shared_ptr<FmSampler> sampler_;   //: what the core calls: blocker_, or fm_ inline
+  std::unique_ptr<GenTrackerCore> core_;
+  std::unique_ptr<ObsAssembler> assembler_;
+
+  int lead_ticks_ = 1;
+  int node_dim_ = 0;
+  std::vector<double> window_;                 //: offsets x node_dim, re-anchored
+  std::map<std::string, std::vector<double>> values_;
+  std::vector<float> obs_;
+  std::vector<double> joint_pos_isaac_;
+  std::vector<double> joint_vel_isaac_;
+  std::vector<int> joint_permutation_;         //: robot order -> policy order
+  std::vector<std::string> cached_joint_names_;
+};
+
+}  // namespace g1_deploy

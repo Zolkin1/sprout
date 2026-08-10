@@ -54,6 +54,27 @@ struct ReferenceWindowSpec {
   std::string base_pose_convention;
 };
 
+/// One camera's contract: where it is, what it sees, and how its depth is normalised.
+///
+/// Derived by mdp.depth_camera_specs from the sensor cfgs and obs terms, and embedded in BOTH
+/// artifacts so nothing off-sim restates a camera number. `obs_term` is what ties a reading to
+/// its slot in the observation.
+struct DepthCameraSpec {
+  std::string sensor;
+  std::string obs_term;
+  std::string mount_body;
+  int width = 0;
+  int height = 0;
+  double offset = 0.75;
+  double scale = 0.5;
+  double min_dist = 0.2;
+  double max_dist = 9.0;
+  double min_clip_val = 0.0;
+  double max_clip_val = 0.0;
+
+  int pixels() const { return width * height; }
+};
+
 /// The command-window contract, when the policy observes one.
 struct CommandWindowSpec {
   std::vector<int> offsets;
@@ -80,6 +101,10 @@ struct PolicyParams {
   std::optional<int> fm_update_every;
   std::optional<ReferenceWindowSpec> reference_window;
   std::optional<CommandWindowSpec> command_window;
+  //: In CONTRACT order -- the order a caller must supply readings in.
+  std::vector<DepthCameraSpec> depth_cameras;
+  //: True if the policy observes a height scan instead of (or as well as) depth.
+  bool needs_height_scan = false;
 
   /// Sum of the term widths. Must equal num_obs; a mismatch means the layout and the graph
   /// disagree, which no downstream check would catch in time.

@@ -175,6 +175,31 @@ PolicyParams ParsePolicyParameters(const std::string& json) {
     p.command_window = std::move(spec);
   }
 
+  // The camera contract. Order is the CONTRACT order a caller supplies readings in, so it is
+  // read from the array as written -- not sorted, and not keyed by name.
+  if (root.contains("depth_camera_spec") && root["depth_camera_spec"].is_array()) {
+    for (const auto& cam : root["depth_camera_spec"]) {
+      DepthCameraSpec d;
+      if (cam.contains("sensor")) d.sensor = cam.at("sensor").get<std::string>();
+      d.obs_term = cam.at("obs_term").get<std::string>();
+      if (cam.contains("mount_body")) d.mount_body = cam.at("mount_body").get<std::string>();
+      d.width = cam.at("width").get<int>();
+      d.height = cam.at("height").get<int>();
+      d.offset = cam.at("offset").get<double>();
+      d.scale = cam.at("scale").get<double>();
+      d.min_dist = cam.at("min_dist").get<double>();
+      d.max_dist = cam.at("max_dist").get<double>();
+      d.min_clip_val = cam.at("min_clip_val").get<double>();
+      d.max_clip_val = cam.at("max_clip_val").get<double>();
+      p.depth_cameras.push_back(std::move(d));
+    }
+  }
+  // Whether a height scan is needed comes from the OBS TERMS, not from the presence of a
+  // height_scan_spec: an artifact can carry the spec and not observe it.
+  for (const ObsTerm& t : p.obs_terms) {
+    if (t.name == "height_scan") p.needs_height_scan = true;
+  }
+
   if (p.TotalObsWidth() != p.num_obs) {
     throw std::runtime_error("observation terms sum to " + std::to_string(p.TotalObsWidth()) +
                              " but the graph declares num_obs=" + std::to_string(p.num_obs));

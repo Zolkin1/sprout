@@ -75,6 +75,13 @@ OrtModel::OrtModel(const std::string& path, const std::vector<Provider>& provide
     }
   }
 
+  // Profiling must be enabled BEFORE the session is created -- it cannot be turned on later.
+  // WarmUpAndCheckPlacement then reads the trace to learn where nodes actually ran and calls
+  // EndProfiling, which both writes the file and turns profiling OFF, so the hot loop pays
+  // nothing. Without this the placement check has no trace to read, reports CPU, and
+  // RequireCuda refuses to run a perfectly good GPU session.
+  options_.EnableProfiling("/tmp/g1_ort_profile");
+  profiling_enabled_ = true;
   session_ = std::make_unique<Ort::Session>(GlobalOrtEnv(), path.c_str(), options_);
   for (size_t i = 0; i < session_->GetInputCount(); ++i) {
     input_names_.push_back(session_->GetInputNameAllocated(i, alloc_).get());
@@ -128,11 +135,6 @@ void OrtModel::Run(const std::vector<const char*>& input_names,
 }
 
 void OrtModel::WarmUpAndCheckPlacement(int iters) {
-  // Profiling on only for the warm-up. EndProfilingAllocated writes the trace AND disables
-  // further profiling, so the timed path afterwards is unaffected by having asked.
-  Ort::SessionOptions probe_options;
-  probe_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-
   std::vector<WarmupInput> holders(session_->GetInputCount());
   std::vector<Ort::Value> values;
   std::vector<const char*> in_names;
@@ -183,6 +185,7 @@ void OrtModel::WarmUpAndCheckPlacement(int iters) {
   // Placement is read from the profile: it reports where nodes ACTUALLY ran, where the
   // provider list only reports what the build supports.
   const std::string profile = session_->EndProfilingAllocated(alloc_).get();
+  profiling_enabled_ = false;   // EndProfiling also turns it off
   std::ifstream trace(profile);
   std::string line;
   while (std::getline(trace, line)) {
@@ -193,6 +196,19 @@ void OrtModel::WarmUpAndCheckPlacement(int iters) {
   }
   trace.close();
   std::remove(profile.c_str());
+}
+
+OrtModel::~OrtModel() {
+  // A session that was never warmed up still has profiling enabled, and leaving it on writes a
+  // growing trace for the life of the process. End it and discard the file.
+  if (profiling_enabled_ && session_) {
+    try {
+      const std::string path = session_->EndProfilingAllocated(alloc_).get();
+      std::remove(path.c_str());
+    } catch (...) {
+      // A destructor must not throw, and a stale profile file is not worth crashing over.
+    }
+  }
 }
 
 void RequireCuda(const OrtModel& model, const std::vector<Provider>& requested) {
