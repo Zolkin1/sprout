@@ -89,6 +89,14 @@ parser.add_argument("--quat_wxyz", action="store_true",
                     help="Write the root quaternion permuted to wxyz. A/B for the convention: "
                          "the recording states xyzw, the sim API's expectation is what this "
                          "settles empirically against a DR-free delta-0 check.")
+parser.add_argument("--augment_flat", action="store_true",
+                    help="Also augment windows with NO terrain in their horizon. OFF by "
+                         "default and it should stay off: a flat segment is anchor-mask 35 "
+                         "(downrange/lateral/yaw all FREE), i.e. ego-anchored, so under a "
+                         "displaced robot the correct reference MOVES WITH IT. Holding the "
+                         "world clip fixed there would teach the generator to steer back to "
+                         "an arbitrary world position on flat ground -- the opposite of what "
+                         "the mask says, and worse than not augmenting at all.")
 parser.add_argument("--env_seed", type=int, default=42,
                     help="Env seed; MUST equal the recording's --seed or the terrain tiles "
                          "are laid out differently and absolute world poses are meaningless.")
@@ -111,6 +119,7 @@ import robot_rl.tasks  # noqa: F401,E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
+from motion_gen.clips.clip_io import load_clip_library  # noqa: E402
 from recorded_data_io import (  # noqa: E402
     RecordedWindowWriter,
     load_recorded_windows,
@@ -151,6 +160,67 @@ def quat_mul_xyzw(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         aw * bz + ax * by - ay * bx + az * bw,
         aw * bw - ax * bx - ay * by - az * bz,
     ], axis=-1)
+
+
+#: Bit index of each anchor DOF, mirroring ``motion_gen.world_lift._ANCHOR_DOF_NAMES``.
+#: bit SET = that DOF is FREE, i.e. the clip follows the robot along it.
+_DOF_DOWNRANGE, _DOF_LATERAL, _DOF_YAW = 0, 1, 5
+
+
+def apply_free_axis_shift(
+    ref: np.ndarray, node_mask: np.ndarray, robot_pos: np.ndarray, terrain_yaw: np.ndarray,
+    d_dr: np.ndarray, d_lat: np.ndarray, d_yaw: np.ndarray,
+) -> np.ndarray:
+    """Move each reference node by the part of the robot's displacement its mask leaves FREE.
+
+    This is what makes the augmentation teach the MASK rather than "everything is world-fixed".
+    A node whose downrange/lateral/yaw are all free (mask 35, flat walking) receives the WHOLE
+    displacement, so after re-anchoring its target is unchanged -- displacing the robot on flat
+    ground is a genuine no-op, exactly as the ego-anchored semantics say. A stairs/box node
+    (mask 2) is free only in lateral, so it follows the robot sideways but stays put downrange
+    and in yaw, which is precisely the correction the generator has to learn. A transition
+    window therefore gets the full shift across its flat approach and a lateral-only shift
+    across its terrain, in ONE window.
+
+    Args:
+        ref: ``(n, F, D)`` reference nodes, WORLD frame, ``[pos3, quat4(xyzw), lin3, ang3, ...]``.
+        node_mask: ``(n, F)`` uint8 anchor mask per node (bit SET = FREE).
+        robot_pos: ``(n, 3)`` the robot's ORIGINAL world position (the yaw rotation centre).
+        terrain_yaw: ``(n,)`` heading of each window's terrain frame; the mask names its
+            downrange/lateral axes in THIS frame, not the world's.
+        d_dr, d_lat, d_yaw: ``(n,)`` the displacement applied to the robot.
+
+    Returns:
+        ``(n, F, D)`` with node positions, orientations and velocities moved.
+    """
+    out = ref.copy()
+    free_dr = ((node_mask >> _DOF_DOWNRANGE) & 1).astype(np.float64)      # (n, F)
+    free_lat = ((node_mask >> _DOF_LATERAL) & 1).astype(np.float64)
+    free_yaw = ((node_mask >> _DOF_YAW) & 1).astype(np.float64)
+
+    dr_n = d_dr[:, None] * free_dr                                        # (n, F)
+    lat_n = d_lat[:, None] * free_lat
+    yaw_n = d_yaw[:, None] * free_yaw
+
+    ty = terrain_yaw[:, None]
+    dx = dr_n * np.cos(ty) - lat_n * np.sin(ty)                           # terrain -> world
+    dy = dr_n * np.sin(ty) + lat_n * np.cos(ty)
+
+    # Yaw rotates the node about the ROBOT, so a free-yaw node keeps its pose relative to it.
+    c, sn = np.cos(yaw_n), np.sin(yaw_n)
+    rel = out[..., 0:2] - robot_pos[:, None, 0:2]
+    out[..., 0] = robot_pos[:, None, 0] + rel[..., 0] * c - rel[..., 1] * sn + dx
+    out[..., 1] = robot_pos[:, None, 1] + rel[..., 0] * sn + rel[..., 1] * c + dy
+
+    qy = np.zeros(node_mask.shape + (4,))                                 # xyzw yaw quaternion
+    qy[..., 2] = np.sin(yaw_n / 2.0)
+    qy[..., 3] = np.cos(yaw_n / 2.0)
+    out[..., 3:7] = quat_mul_xyzw(qy, out[..., 3:7])
+    for a, b in ((7, 10), (10, 13)):                                      # lin + ang velocity
+        vx, vy = out[..., a], out[..., a + 1]
+        out[..., a] = vx * c - vy * sn
+        out[..., a + 1] = vx * sn + vy * c
+    return out
 
 
 def main() -> int:
@@ -234,6 +304,11 @@ def main() -> int:
     env_org = to_torch(terr.env_origins).detach().cpu().numpy().reshape(-1, 3)
     with h5py.File(lib, "r") as _lf:
         clip_tid = _lf["terrain_id"][:]
+    env_tyaw = to_torch(terr.env_terrain_yaw).detach().cpu().numpy().reshape(-1)
+    _libm = load_clip_library(lib, device="cpu",
+                              keys=["anchor_mask", "anchor_mask_t", "clip_len"])
+    amt_np = _libm.anchor_mask_per_step().numpy()          # (num_clips, T) uint8, 255 resolved
+    clen_np = _libm.clip_len_or_full().numpy()
     envs_for_tid: dict[int, np.ndarray] = {
         int(t): np.flatnonzero(env_tid == int(t)) for t in np.unique(env_tid)
     }
@@ -244,6 +319,29 @@ def main() -> int:
     s_jp = term_slice(names, dims, "joint_pos")
 
     src = np.arange(W if not args_cli.max_source else min(W, args_cli.max_source))
+    if not args_cli.check_only and not args_cli.augment_flat:
+        # Keep only windows whose horizon CONTAINS terrain (>=1 anchor-mask-pinned node):
+        # terrain-only segments and transitions. Pure-flat windows are ego-anchored and must
+        # not be given a world-fixed correction -- see --augment_flat. A transition window
+        # keeps its flat approach, which is wanted: correcting during the run-up to the
+        # terrain is exactly the behaviour that has to be learned.
+        from motion_gen.world_lift import anchor_mask_is_pinned
+        _lib = load_clip_library(lib, device="cpu",
+                                 keys=["anchor_mask", "anchor_mask_t", "clip_len"])
+        _pin = anchor_mask_is_pinned(_lib.anchor_mask_per_step()).numpy()
+        _clen = _lib.clip_len_or_full().numpy()
+        _cid = np.asarray(data["clip_id"]); _cst = np.asarray(data["clip_step"])
+        _F = int(data["ref_future"].shape[1])
+        keep_src = np.array([
+            bool(_pin[_cid[i], _cst[i]:min(_cst[i] + _F, _clen[_cid[i]])].any()) for i in src
+        ])
+        n_before = len(src)
+        src = src[keep_src]
+        print(f"[augment] terrain filter: {len(src)}/{n_before} source windows have terrain in "
+              f"their horizon ({100.0 * len(src) / max(n_before, 1):.1f}%); pure-flat windows "
+              "are skipped (they are ego-anchored and must move WITH the robot).")
+        if len(src) == 0:
+            raise SystemExit("no windows contain terrain; nothing to augment.")
     reps = 1 if args_cli.check_only else int(args_cli.num_augments)
     hs_all = data["history_state"]
 
@@ -267,9 +365,24 @@ def main() -> int:
     allren = []
     allsrc = []
     n_done = 0
-    for rep in range(reps):
-        for lo in range(0, len(src), batch):
-            idx = src[lo:lo + batch]
+    # Schedule passes so NO window is dropped. Only one window per env can be placed per
+    # render pass (they share the env's robot), and after the terrain filter the surviving
+    # windows are NOT evenly spread across envs -- so slicing the list into fixed batches
+    # leaves duplicate envs in a batch, which the placement loop then skips. That silently
+    # lost 51% of the output on the first full run. Bucket by env instead and take the k-th
+    # entry of every env's queue as pass k: every window is placed exactly once.
+    by_env: dict[int, list[int]] = {}
+    src_env_all = np.asarray(data["env_id"]).astype(int)
+    for _rep in range(reps):
+        for i in src:
+            by_env.setdefault(int(src_env_all[i]), []).append(int(i))
+    n_pass = max((len(v) for v in by_env.values()), default=0)
+    passes = [[q[k] for q in by_env.values() if k < len(q)] for k in range(n_pass)]
+    print(f"[augment] {sum(len(p) for p in passes)} placements over {n_pass} passes "
+          f"(<= {len(by_env)} envs each; bucketed by env so none are skipped)")
+    for _pi, _plist in enumerate(passes):
+        for lo in range(0, len(_plist), batch):
+            idx = np.asarray(_plist[lo:lo + batch])
             k = len(idx)
             snap = hs_all[idx, H - 1, :].astype(np.float64)
             pos = snap[:, s_pos].copy()
@@ -314,7 +427,7 @@ def main() -> int:
                         "recording -- check that --env_seed and --num_envs equal the "
                         "recording's, or the recorded world poses are meaningless here.")
                 if e in used_envs:
-                    continue                      # one window per env per render pass
+                    continue                      # safety net; the schedule already prevents it
                 used_envs.add(e)
                 slots.append((e, e))              # place back into the very env it came from
                 keep.append(j)
@@ -436,6 +549,28 @@ def main() -> int:
                 out = {kk: np.asarray(v[sel_idx]).copy() for kk, v in data.items()
                        if isinstance(v, np.ndarray) and v.shape[:1] == (W,)}
                 out["depth"] = dep.astype(np.float32)
+                # Move each reference node by the FREE part of the displacement, per its own
+                # anchor mask. Without this the target says "every axis is world-fixed" and the
+                # generator would learn to correct even along axes the mask leaves free.
+                _F = out["ref_future"].shape[1]
+                _c = np.asarray(data["clip_id"])[sel_idx]
+                _s0 = np.asarray(data["clip_step"])[sel_idx]
+                _steps = np.minimum(_s0[:, None] + np.arange(_F)[None, :],
+                                    (clen_np[_c] - 1)[:, None])
+                _nm = amt_np[_c[:, None], _steps]                       # (n, F) per-node mask
+                out["ref_future"] = apply_free_axis_shift(
+                    out["ref_future"].astype(np.float64), _nm, pos[keep],
+                    env_tyaw[tgt_env], d_dr[keep], d_lat[keep], d_yaw[keep],
+                ).astype(np.float32)
+                # history_ref's LAST row is the applied reference AT THE SNAP, which is by
+                # definition ref_future node 0 -- the dataset asserts the identity. Move it by
+                # the same node-0 shift so the assertion still means something. It cannot leak
+                # the offset into the model: the history block is rows H-1-n .. H-2, which
+                # EXCLUDES this row, and it feeds nothing but that check.
+                out["history_ref"][:, H - 1, :] = apply_free_axis_shift(
+                    out["history_ref"][:, H - 1:H, :].astype(np.float64), _nm[:, :1],
+                    pos[keep], env_tyaw[tgt_env], d_dr[keep], d_lat[keep], d_yaw[keep],
+                )[:, 0, :].astype(np.float32)
                 # ONLY the snap anchor moves: row H-1's position + yaw. History rows and
                 # history_ref stay put so the offset cannot leak in through them.
                 out["history_state"][:, H - 1, s_pos] = place_pos.astype(np.float32)
