@@ -1,0 +1,162 @@
+// Copyright 2026 Zachary Olkin. All rights reserved.
+#pragma once
+
+// The G1 low-level controller, in C++.
+//
+// Port of g1_control/g1_control/controller.py. The POLICY is not implemented here --
+// g1_deploy::PolicyRuntime is, and everything numeric lives there where it can be tested
+// against the python oracle with no ROS. This file is the ROS half: read topics, latch them,
+// call the runtime once per tick, publish, and enforce the safety rules.
+//
+// ============================ why C++ at all ==============================================
+// ROS 2 Humble pins the image to python 3.10, so rclpy is a cp310 C extension, and the only
+// onnxruntime GPU build that runs on a Jetson Thor is cp312. Two C extensions built for
+// different CPython ABIs cannot share a process, so the python controller can only reach the
+// CPU here -- measured 471 ms per generator tick against a 20 ms control period. C++ has no
+// such constraint.
+//
+// ============================ the safety rules are the point ==============================
+// Everything below the control loop is there because it has caught something. Port the
+// behaviour AND the reasons; a guard whose rationale was dropped is a guard someone
+// simplifies away.
+
+#include <obelisk_controller.h>
+#include <obelisk_control_msgs/msg/pd_feed_forward.hpp>
+#include <obelisk_estimator_msgs/msg/estimated_state.hpp>
+#include <sensor_msgs/msg/image.hpp>
+
+#include <g1_msgs/msg/controller_debug.hpp>
+#include <g1_msgs/msg/fm_plan.hpp>
+
+#include <atomic>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "g1_deploy/policy_runtime.h"
+
+namespace g1_control {
+
+using ControlMsg = obelisk_control_msgs::msg::PDFeedForward;
+using EstimatorMsg = obelisk_estimator_msgs::msg::EstimatedState;
+
+/// One estimator sample, latched as a UNIT.
+///
+/// Bundled deliberately. The estimator runs at 1 kHz against a 50 Hz tick, so a tick that read
+/// the pose from message n and the joints from n+1 would mix two instants -- and
+/// ControllerDebug.est_state_stamp, which exists to answer "which sample fed this tick", would
+/// become a lie. The python got this for free from the GIL plus obelisk's single
+/// mutually-exclusive callback group; C++ has to say it.
+struct EstimatorSample {
+  std::vector<double> q_base;      //: 7: position(3) + quaternion(4)
+  std::vector<double> v_base;      //: 6: linear(3) + angular(3)
+  std::vector<double> joint_pos;
+  std::vector<double> joint_vel;
+  std::vector<std::string> joint_names;
+  rclcpp::Time stamp;
+  bool valid = false;
+};
+
+class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg> {
+ public:
+  explicit G1Controller(const std::string& name);
+
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn on_configure(
+      const rclcpp_lifecycle::State& prev) override;
+  rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn on_cleanup(
+      const rclcpp_lifecycle::State& prev) override;
+
+ protected:
+  /// The 50 Hz control tick. Publishes the command itself, per the obelisk contract.
+  ControlMsg ComputeControl() override;
+
+  /// Latch the state estimate. Runs at the estimator's rate, not the control rate.
+  void UpdateXHat(const EstimatorMsg& msg) override;
+
+ private:
+  void DeclareParams();
+  void LoadPolicy();
+  void SetupDepth();
+  void DepthCallback(const sensor_msgs::msg::Image::SharedPtr msg, size_t index);
+
+  void Arm();
+  void Disarm(const std::string& why);
+  /// Refresh the staleness latches, logging only the EDGES. Returns true if anything is stale.
+  bool UpdateWatchdogs();
+  /// The command after the watchdogs: zeros when the joystick has gone quiet.
+  g1_deploy::Vec3 EffectiveCommand();
+  /// Base orientation with the degenerate-quaternion guard applied.
+  bool BaseQuat(g1_deploy::QuatXyzw* out);
+  /// Publish, unless the command is not finite and there is no finite fallback.
+  bool PublishTargets(std::vector<double>* targets, ControlMsg* msg);
+  void PublishDebug(const g1_deploy::TickDiagnostics& diag, bool have_obs);
+  std::string DiagnoseNonFinite() const;
+
+  // ---- policy -------------------------------------------------------------------------
+  std::unique_ptr<g1_deploy::PolicyRuntime> policy_;
+  std::vector<std::string> hw_joint_names_;
+  std::vector<double> targets_;
+  std::vector<double> kp_hw_;
+  std::vector<double> kd_hw_;
+  std::vector<int> policy_to_hw_;   //: hardware index -> policy index, for the gains
+
+  // ---- latched inputs -----------------------------------------------------------------
+  std::mutex est_mutex_;
+  EstimatorSample est_;            //: guarded by est_mutex_
+  double est_time_ = -1.0;
+
+  std::vector<std::vector<double>> depth_;        //: per camera, metres
+  std::vector<double> depth_time_;
+  std::mutex depth_mutex_;
+
+  g1_deploy::Vec3 vel_cmd_{0.0, 0.0, 0.0};
+  double vel_cmd_time_ = -1.0;
+  std::mutex cmd_mutex_;
+
+  std::atomic<bool> armed_{false};
+
+  // ---- guards -------------------------------------------------------------------------
+  //: Ticks of consecutive non-finite commands before disarming. 10 at 50 Hz = 0.2 s.
+  static constexpr int kNonFiniteDisarmTicks = 10;
+  int nonfinite_streak_ = 0;
+  std::vector<double> last_good_targets_;
+  bool have_last_good_ = false;
+  std::vector<double> hold_pose_;                 //: last-resort fallback, captured at arming
+  g1_deploy::QuatXyzw last_good_quat_{0.0, 0.0, 0.0, 1.0};
+  int64_t bad_quat_count_ = 0;
+  int64_t quat_samples_ = 0;
+  bool depth_stale_ = false;
+  bool vel_cmd_stale_ = false;
+  //: Set when a tick's inputs were non-finite, for DiagnoseNonFinite.
+  bool bad_q_base_ = false;
+  bool bad_v_base_ = false;
+  bool bad_joints_ = false;
+  bool bad_depth_ = false;
+
+  // ---- params -------------------------------------------------------------------------
+  std::string hf_repo_id_;
+  std::string hf_policy_folder_;
+  bool use_cuda_ = false;
+  int onnx_threads_ = 2;
+  std::vector<std::string> depth_topics_;
+  double depth_timeout_ = 0.25;
+  double vel_cmd_timeout_ = 1.0;
+  bool verbose_ = false;
+  bool debug_topics_ = true;
+  double fm_lead_sec_ = 0.05;
+  bool threaded_fm_ = true;
+  int fm_late_disarm_ticks_ = 0;
+
+  // ---- diagnostics --------------------------------------------------------------------
+  std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> depth_subs_;
+  rclcpp::Publisher<g1_msgs::msg::ControllerDebug>::SharedPtr debug_pub_;
+  rclcpp::Publisher<g1_msgs::msg::FmPlan>::SharedPtr fm_plan_pub_;
+  rclcpp::CallbackGroup::SharedPtr depth_cbg_;
+  std::deque<double> latency_ms_;
+  double last_latency_report_ = -1.0;
+  int64_t fm_late_streak_ = 0;
+};
+
+}  // namespace g1_control

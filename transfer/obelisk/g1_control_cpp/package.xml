@@ -1,0 +1,42 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>g1_control_cpp</name>
+  <version>0.0.1</version>
+  <description>C++ low-level controller for the G1: the generator + tracker pair on the GPU.</description>
+  <maintainer email="zolkin@caltech.edu">Zach Olkin</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>rclcpp_lifecycle</depend>
+  <depend>sensor_msgs</depend>
+  <depend>ament_index_cpp</depend>
+
+  <!-- NOTE. A double hyphen is illegal inside an XML comment, so none appears below. That is
+       the same shape of trap as a literal star-slash in a .msg comment, which terminates the
+       generated C block comment and is pinned by tests/test_msg_comments.py. Same lesson,
+       different comment syntax; both fail at build time with a message about the file rather
+       than about the punctuation. -->
+
+  <!-- The obelisk message packages are deliberately absent. They live in the obelisk workspace
+       ($OBELISK_ROOT/obelisk_ws), which colcon does not know about, and they reach this target
+       transitively through Obelisk::Core, exactly as they do for robot_sim and robot_viz.
+       Listing them would make colcon look for packages it cannot see. -->
+
+  <!-- depend, not exec_depend: colcon must build the messages BEFORE this package, and a .msg
+       edit has to trigger a rebuild here rather than leaving stale generated bindings. -->
+  <depend>g1_msgs</depend>
+
+  <!-- The prefetched policy pair lives in g1_control's resource tree, which this node resolves
+       through ament_index_cpp. -->
+  <exec_depend>g1_control</exec_depend>
+
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
