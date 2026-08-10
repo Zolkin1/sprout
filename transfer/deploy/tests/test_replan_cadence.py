@@ -70,7 +70,6 @@ class _FakePolicy(GenTrackerPolicy):
         # The learned null-history embedding, as every real fm.onnx has: the generator runs
         # from step 0 instead of waiting N steps for the history to fill. Without it the
         # legacy path withholds inference during the warmup and the cadence starts late.
-        self.null_history_warmup = True
         self.zero_noise = True
         self.window_offsets = list(offsets)
         self.reference_blocks = SLIM

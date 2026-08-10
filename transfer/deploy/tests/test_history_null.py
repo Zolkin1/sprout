@@ -1,6 +1,6 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""The generator is never handed a zero placeholder dressed up as real history.
+"""The generator is never handed a fabricated history.
 
 A history row is a reference-window node this runtime SERVED -- the generator's own past
 output. Before the first serve there is nothing to push, so a zero row goes in as a
@@ -17,7 +17,11 @@ Two paths got this wrong before:
   valid at step ``N-1`` with EVERY row a placeholder, and the first live FM sample was
   conditioned on an all-zero history with the null flag off.
 
-Neither was covered by a test, which is why both survived. The C++ port
+Neither was covered by a test, which is why both survived. The warmup paths are now gone
+entirely -- there is no stand hold, no static fill, and ``advance_dormant_step`` (what
+``observe`` became) touches only the cadence counter -- so no code path can put a placeholder
+into the history at all. That is a stronger property than "placeholders do not count", and it
+is what the last three tests here pin. The C++ port
 (``transfer/deploy_cpp``) carries the same rule and the same expectations; the two have to
 agree or sim2sim and hardware condition the generator differently for the first N steps.
 
@@ -36,15 +40,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_replan_cadence import _FakePolicy, _state  # noqa: E402
 
 
-def _null_flags(policy, steps, use_observe=False):
+def _null_flags(policy, steps):
     """Drive `steps` control steps and return ``history_null`` as seen at each one."""
     flags = []
     for _ in range(steps):
-        state = _state((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0))
-        if use_observe:
-            policy.observe(state)
-        else:
-            policy._update_generator(state)
+        policy._update_generator(_state((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0)))
         flags.append(bool(policy._history.null_mask()[0]))
     return flags
 
@@ -83,22 +83,43 @@ def test_no_row_is_a_placeholder_on_the_step_the_flag_clears():
     assert np.isfinite(stacked).all()
 
 
-def test_the_warmup_never_marks_the_window_valid():
-    """``observe`` serves nothing, so every row it pushes is a placeholder."""
+def test_a_dormant_step_does_not_touch_the_history_at_all():
+    """``advance_dormant_step`` moves the cadence counter and nothing else.
+
+    It used to append a row, and since nothing is served while the generator is dormant every
+    row it appended was a zero placeholder. Enough of them and the window declared itself
+    complete, so the first live FM sample was conditioned on an all-zero history with
+    ``history_null`` OFF. Now there is no path at all that puts a placeholder into the history,
+    which is a stronger property than "the placeholders do not count".
+    """
     p = _FakePolicy(k=1)
-    flags = _null_flags(p, p.ctx.N + 4, use_observe=True)
-    assert all(flags), (
-        "the warmup filled the window with zero placeholders and declared it complete; the "
-        "first FM sample would condition on an all-zero history with history_null off")
+    before = len(p._history._steps)
+    for _ in range(p.ctx.N + 4):
+        p.advance_dormant_step()
+    assert len(p._history._steps) == before, "a dormant step must not append a history row"
+    assert bool(p._history.null_mask()[0]), "an untouched history cannot be complete"
 
 
-def test_the_warmup_does_not_stop_a_later_real_window_becoming_valid():
-    """After the warmup, real served nodes must still be able to fill the window."""
+def test_dormant_steps_advance_the_cadence_counter():
+    """The clip path relies on this: the counter must keep moving while the clip drives.
+
+    Otherwise the first re-plan after a clip->FM handoff lands on the wrong cadence phase.
+    """
     p = _FakePolicy(k=1)
-    _null_flags(p, p.ctx.N + 2, use_observe=True)
+    start = p._ctrl_step
+    for _ in range(5):
+        p.advance_dormant_step()
+    assert p._ctrl_step == start + 5
+
+
+def test_dormant_steps_do_not_stop_a_later_real_window_becoming_valid():
+    """After a dormant stretch, real served nodes must still fill the window."""
+    p = _FakePolicy(k=1)
+    for _ in range(p.ctx.N + 2):
+        p.advance_dormant_step()
     assert bool(p._history.null_mask()[0])
     later = _null_flags(p, p.ctx.N + 1)
-    assert later[-1] is False, "a warmup must not permanently invalidate the history"
+    assert later[-1] is False, "a dormant stretch must not permanently invalidate the history"
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ Thin glue for the obelisk controller to use the shared
   exteroception the policy was trained on.
 
 The ROS2 control loop lives in the obelisk ``g1_control`` controller node; it calls
-``policy.warm_start(build_hardware_state(...))`` on entering low-level control, then each
+``policy.reset()`` on entering low-level control, then each
 50 Hz cycle ``policy.get_action(policy.create_obs(build_hardware_state(...)), hw_names)``.
 
 One frame convention to get right on the estimator side: the FM history needs the base

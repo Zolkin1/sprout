@@ -142,12 +142,17 @@ in MuJoCo through the same `transfer/deploy` runtime, so a case that falls here 
 there is a difference in the ROS stack. The clip library is built by
 `scripts/rsl_rl/make_debug_clips.py` out of the library the teacher trained on.
 
-- **No PD warm-up.** Whatever feeds the tracker drives it from the first tick, matching
-  `gen_tracker_runner.py` (`--warmup_time 0`, ignored outright in clip mode). A stiffened
-  hold put the robot in a state no training episode started from, and fed the generator's
-  history rows of ZEROS — `_make_snapshot` reads the runtime's own previously-served node,
-  which does not exist yet — which flipped `null_mask` off and denied the model the learned
-  null-history embedding meant to cover exactly those steps.
+- **No PD warm-up, and no way to add one.** Whatever feeds the tracker drives it from the
+  first tick, matching `gen_tracker_runner.py`. The warm-up paths are GONE — the stand hold,
+  its stiffened gains, the start-button gate, `warm_start()` and `BatchedHistory.fill()` were
+  all deleted, so nothing can fabricate a generator history any more. Every one of them put
+  the robot in a state no training episode started from and fed the generator history rows of
+  ZEROS: `_make_snapshot` reads the runtime's own previously-served node, which does not exist
+  yet, which flipped `null_mask` off and denied the model the learned null-history embedding
+  meant to cover exactly those steps. What survives is `advance_dormant_step()`, which moves
+  the cadence counter and touches nothing else — the clip path needs it so the first re-plan
+  after a clip→FM handoff lands on the right phase. Pinned by
+  `transfer/deploy/tests/test_history_null.py` on both sides of the port.
 - **Auto-arm is SIM ONLY and structurally so**: it is a parameter of `fsm_state_echo`, a
   node that exists only because MuJoCo has no execution FSM and is launched only by
   `run_sim_world.sh`. The controller has no auto-arm and must not grow one

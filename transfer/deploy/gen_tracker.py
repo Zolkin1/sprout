@@ -109,7 +109,6 @@ class GenTrackerPolicy:
         num_threads: int = 0,
         seed: int | None = 0,
         zero_noise: bool = False,
-        null_history_warmup: bool = True,
         providers=None,
     ):
         """Configure the generator + tracker pair from the ONNX artifacts.
@@ -117,12 +116,17 @@ class GenTrackerPolicy:
         ``fm_onnx`` may be ``None`` for tracker-only (no-FM) clip playback: the
         clip reference then drives the tracker directly (see :class:`_TrackerOnlyCtx`).
 
-        ``null_history_warmup=True`` (default) samples the generator from control step 0 using
-        the model's learned ``null_history`` embedding while the N-step history window fills.
-        The RL side (``FmTrackingCommand``) does the same unconditionally -- it has no clip
-        fallback either -- so the two agree from step 0. It needs an
-        ``fm.onnx`` exported with the ``history_null`` input; without one the policy falls back to
-        withholding the generator until the window is full (and warns once).
+        The generator is sampled from control step 0 using the model's learned
+        ``null_history`` embedding while the N-step history window fills with real served
+        nodes. The RL side (``FmTrackingCommand``) does the same unconditionally, so the two
+        agree from step 0. This needs an ``fm.onnx`` exported with the ``history_null`` input;
+        without one there is no way to tell the model its history is incomplete, and
+        :func:`fm_session.sample_window` warns once.
+
+        There is deliberately no warm-up alternative. The previous options -- a stiffened PD
+        hold that filled the window first, or a static fill that repeated one snapshot into all
+        N slots -- both fabricated a history that never occurs in training, and the static one
+        did it while telling the model the history was real.
 
         ``zero_noise=True`` replaces the Gaussian ``x0`` with zeros (see
         :meth:`_sample_noise`). It defaults to False here -- the training-matched
@@ -140,7 +144,6 @@ class GenTrackerPolicy:
         self.base_frame_name = base_frame_name
         self.num_threads = num_threads
         self.zero_noise = bool(zero_noise)
-        self.null_history_warmup = bool(null_history_warmup)
         self.providers = providers
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
@@ -529,43 +532,26 @@ class GenTrackerPolicy:
                 else self._prev_served_node.reshape(1, self.ctx.D).copy())
         return {"node": node, "cmd": np.array(state["command"], dtype=np.float64, copy=True)[None]}
 
-    def warm_start(self, state: dict) -> None:
-        """Make the generator usable at step 0.
+    def advance_dormant_step(self) -> None:
+        """Advance the control-step counter while the generator is dormant.
 
-        With ``null_history_warmup`` and a graph that accepts ``history_null`` this is a no-op
-        beyond resetting the cadence: the first steps are sampled with the learned null-history
-        embedding, which is what the model was trained for. Only the legacy path fabricates a
-        history by repeating this snapshot into all N slots -- a static window that never occurs
-        in training (real history always has motion between its steps).
-        """
-        if self.null_history_warmup and getattr(self.ctx, "has_history_null", False):
-            self._history.invalidate(np.ones(1, dtype=bool))
-        else:
-            self._history.fill(self._make_snapshot(state))
-        self._pred_valid = False
+        The clip path uses this before the clip->FM handoff: the clip is driving, the generator
+        has produced nothing, and the counter has to keep moving so the first re-plan after the
+        handoff lands on the same cadence phase it would have.
 
-    def observe(self, state: dict) -> None:
-        """Advance the step counter during a warmup, without running the generator.
+        It deliberately touches NOTHING else. It used to also push a row into the generator's
+        conditioning history, which was worse than useless: a history row is a reference-window
+        node this runtime SERVED, nothing is served while the generator is dormant, so every row
+        it pushed was a zero placeholder. Accumulating those into a window that then declared
+        itself complete handed the generator an all-zero history with ``history_null`` OFF --
+        an input training never produced. There is now no path anywhere that puts a placeholder
+        into the history and lets it count as real.
 
-        Used during the stable-stand warmup, where the FM stays dormant (``_pred_valid``
-        False) so the first live ``create_obs`` triggers the first FM sample from a settled
-        stand.
-
-        The history window is deliberately left INVALID throughout. A history row is a
-        reference-window node this runtime SERVED, and nothing is served during a warmup, so
-        every row pushed here is the zero placeholder. Letting those accumulate into a
-        "complete" window handed the generator an all-zero history with ``history_null`` OFF
-        -- an input training never produced, and precisely the failure the obelisk PD warm-up
-        caused (rows of zeros flipped ``null_mask`` off and denied the model the learned
-        embedding meant to cover exactly those steps).
-
-        No-op in tracker-only (no-FM) mode: there is no generator history to keep.
+        No-op in tracker-only (no-FM) mode: there is no generator cadence to keep.
         """
         if not self.fm_enabled:
             return
         self._ctrl_step += 1
-        self._history.append(self._make_snapshot(state))
-        self._history.invalidate(np.ones(1, dtype=bool))
 
     def _update_generator(self, state: dict) -> None:
         """Advance the receding horizon by one control step.
@@ -599,7 +585,7 @@ class GenTrackerPolicy:
             # placeholder.
             self._history.invalidate(np.ones(1, dtype=bool))
         null_hist = bool(self._history.null_mask()[0])
-        use_null = (self.null_history_warmup and getattr(self.ctx, "has_history_null", False))
+        use_null = bool(getattr(self.ctx, "has_history_null", False))
 
         reinfer = (self._ctrl_step % max(self.fm_update_every, 1)) == 0
         infer = reinfer or not self._pred_valid

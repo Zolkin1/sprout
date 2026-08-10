@@ -127,7 +127,7 @@ def test_hardware_offline() -> None:
             height_scan=height_scan,
         )
 
-    policy.warm_start(reading(np.zeros(3)))
+    policy.reset()
     last = None
     for _ in range(8):
         state = reading(np.array([0.4, 0.0, 0.1]))

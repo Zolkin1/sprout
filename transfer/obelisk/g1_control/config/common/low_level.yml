@@ -56,12 +56,13 @@ control:
       vel_cmd_timeout: 1.0
 
       # ---- Bring-up ----
-      # There is no PD warm-up. On entering low-level control whatever feeds the tracker --
-      # the generator or a debug clip -- drives it from the first tick, which is what the
-      # MuJoCo sim2sim runner does (`--warmup_time 0`, and it is ignored outright in clip
-      # mode) and what the policy was trained for. A stiffened hold put the robot in a state
-      # no training episode started from, and fed the generator's history rows of zeros
-      # instead of letting the learned null-history embedding cover the first N steps.
+      # There is no PD warm-up, and the runtime no longer has a way to add one. On entering
+      # low-level control whatever feeds the tracker -- the generator or a debug clip --
+      # drives it from the first tick, which is what the MuJoCo sim2sim runner does and what
+      # the policy was trained for. The warm-up paths were deleted outright: every one of
+      # them put the robot in a state no training episode started from, and fed the
+      # generator's history rows of zeros instead of letting the learned null-history
+      # embedding cover the first N steps.
 
       # ---- Logging ----
       # Diagnostic topics: /obelisk/g1/debug/tick every control step and

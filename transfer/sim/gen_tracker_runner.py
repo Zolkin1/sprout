@@ -363,19 +363,18 @@ def box_top(robot: Robot, spec: str) -> tuple[float, float, float] | None:
 
 
 def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
-        headless: bool, log_path: str | None, warmup_time: float, rt_factor: float,
+        headless: bool, log_path: str | None, rt_factor: float,
         standing_config: str | None, viz: bool, vel_arrow_scale: float, vel_arrow_height: float,
-        hold_kp_scale: float, hold_kv_scale: float, spawn_z_offset: float,
+        spawn_z_offset: float,
         clip_spawn_z_offset: float,
         cmd_max_acc: float, fm_traj_points: int, spawn_on_box: str | None = None,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
         viz_geomgroup: list[int] | None = None, viz_contacts: bool = False) -> bool:
-    """Run the warmup + control loop; return True if the robot did not fall.
+    """Run the control loop; return True if the robot did not fall.
 
-    The robot first PD-holds a stable stand for ``warmup_time`` seconds (at least the
-    FM history length) while the generator history fills with real snapshots, then
-    hands control to the FM + tracker. Playback is paced to real time (scaled by
+    The FM + tracker have control from the first step -- there is no warmup hold, and no
+    way to fabricate a generator history. Playback is paced to real time (scaled by
     ``rt_factor``) in viewer mode; headless/eval runs are never throttled.
 
     Args:
@@ -385,11 +384,6 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         total_time: Stop after this many seconds (``<= 0`` runs until the viewer closes).
         headless: Run without the viewer.
         log_path: CSV path for per-step metrics, or ``None`` to skip logging.
-        warmup_time: Seconds to PD-hold the stand before live control. DEFAULTS TO 0 (skip the
-            hold; fall back to a static warm-start fill), because ``null_history_warmup``
-            makes the FM valid at step 0 without needing real snapshots in the window, so the
-            hold only delays the thing you launched the runner to see. A positive value also
-            arms the joystick start-button gate in viewer runs.
         rt_factor: Real-time speed multiple for viewer playback (``1.0`` = real time,
             ``0.5`` = half speed; ``<= 0`` disables pacing).
         standing_config: Path to a standing ``config_solution.yaml`` to spawn + hold; if
@@ -397,10 +391,6 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         viz: Draw FM root/feet spheres + velocity arrows in the viewer (viewer mode only).
         vel_arrow_scale: Arrow length in metres per (m/s) of planar speed.
         vel_arrow_height: Height (m) above the pelvis to draw the velocity arrows.
-        hold_kp_scale: Leg (hip/knee/ankle) kp multiplier during the hold. Fixed-joint PD
-            at the XML gains cannot balance the robot; a stiff, well-damped hold keeps it
-            standing while the buffer fills. Wiped by the RL gains at handoff.
-        hold_kv_scale: Leg kv (damping) multiplier during the hold.
         clip_spawn_z_offset: Metres to raise the pelvis in CLIP mode. Default 0: a clip frame is
             authored with the feet already on the terrain, and IsaacLab's reset spawns it
             verbatim, so any lift here is a pure sim2sim mismatch -- and an expensive one. It
@@ -465,7 +455,6 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                                   joint_vel_mujoco=convert_joint_order(c_jv, isaac,
                                                                        robot.joint_names))
         robot.set_pd_gains_from_policy(policy)
-        warmup_steps = 0
         print(f"[INFO] Clip mode: spawned on clip step {clip.start_step} state "
               f"(t={clip.start_step * clip.dt:.2f}s, z+{clip_spawn_z_offset}, "
               f"|v|={np.linalg.norm(c_vel_w[:3]):.2f} m/s); RL gains set.")
@@ -494,35 +483,19 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         if standing_config:
             print(f"[WARN] standing_config not found ({standing_config}); holding default_joint_angles.")
         hold_target = convert_joint_order(policy._trk.default_joint_angles, isaac, robot.joint_names)
-    # Stiffen the legs for the hold: fixed-joint PD at the XML gains tips over (the ankles
-    # alone can't balance the inverted pendulum), so a stiff, well-damped leg holds a stand.
-    if clip is None and warmup_time > 0 and (hold_kp_scale != 1.0 or hold_kv_scale != 1.0):
-        robot.scale_gains(hold_kp_scale, hold_kv_scale, name_filter=["hip", "knee", "ankle"])
-        print(f"[INFO] Hold gains: leg kp x{hold_kp_scale}, kv x{hold_kv_scale} "
-              "(reverts to RL gains at handoff).")
-    elif clip is None and warmup_time <= 0:
-        print("[INFO] warmup_time<=0: spawning straight into FM+tracker control "
-              "(no standing hold, no stiffened hold gains, no start-button gate).")
+    # RL tracker gains from the first step. The clip branch above has already done this; this
+    # is the non-clip path, which used to spawn on the XML gains and switch at a handoff that
+    # no longer exists.
     if clip is None:
-        warmup_steps = max(policy.ctx.N, int(math.ceil(warmup_time / dt))) if warmup_time > 0 else 0
-        if warmup_steps == 0:
-            # No hold: fall back to a static warm-start fill so the FM is valid at step 0.
-            policy.warm_start(build_state(robot, policy, np.zeros(3), depth_cams))
+        robot.set_pd_gains_from_policy(policy)
+        print("[INFO] Spawning straight into FM+tracker control on the RL gains (no standing "
+              "hold: the generator runs from step 0 on its learned null-history embedding).")
 
     # Predicted extra-frame indices that are feet (for the FM viz spheres).
     foot_idx = [i for i, n in enumerate(policy.ctx.target_frame_names)
                 if "ankle" in n.lower() or "foot" in n.lower()]
     if viz and not headless:
         print(f"[INFO] FM target frames: {policy.ctx.target_frame_names}; feet -> {foot_idx}")
-
-    # Manual handoff gate: in interactive (joystick) viewer runs, hold the stand until the
-    # operator presses the start button, so standing can be verified before going live.
-    # ``warmup_time <= 0`` is an explicit request to spawn straight into FM control, so it
-    # disables the gate too -- otherwise a joystick run would still wait for a button press
-    # and "no warmup" would silently mean "hold forever until pressed".
-    gate = ((not headless) and warmup_time > 0
-            and isinstance(command_fn, JoystickCommand) and command_fn.joystick is not None)
-    min_hold = max(warmup_steps, policy.ctx.N) if gate else warmup_steps
 
     # Velocity-command rate limit. Prefer the value embedded in the tracker metadata (the rate
     # the policy trained with, so sim2sim can't silently drift from training); otherwise use
@@ -846,36 +819,20 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         _next_report_t[0] += report_every_s
 
     def run_loop(viewer) -> bool:
-        """Warmup hold then live FM + tracker control; return False if the robot fell."""
+        """Live FM + tracker control from the first step; return False if the robot fell.
+
+        There is no warmup hold. The generator drives from step 0 with its learned
+        null-history embedding covering the not-yet-full window, which is what the RL side
+        does and therefore what the pair was trained for. Every alternative that existed here
+        fabricated a history -- a stiffened PD hold that filled the window with standing
+        snapshots, or a static fill that repeated one snapshot into all N slots -- and a
+        fabricated history is off-distribution: real history always has motion between its
+        steps. The hold additionally put the robot in a state no training episode started
+        from.
+        """
         nonlocal handoff_time
-        # Warmup: PD-hold the stand (cmd = 0, XML default gains) while the history fills.
-        # When gated, hold until the start button is pressed (after the buffer is full).
-        if gate:
-            print(f"[INFO] Holding standing pose -- press gamepad button {command_fn.start_button} "
-                  "(A) to hand control to the RL tracker.")
-        held = 0
-        while True:
-            if viewer is not None and not viewer.is_running():
-                return True
-            if total_time > 0 and robot.mj_data.time > total_time:
-                return True
-            state = build_state(robot, policy, np.zeros(3), depth_cams)
-            policy.observe(state)
-            robot.apply_action(hold_target)
-            draw_viz(viewer, state)
-            advance_physics(state, viewer)
-            if robot.failed():
-                print("[WARN] Robot fell during the warmup hold (check PD gains / spawn pose).")
-                return False
-            held += 1
-            if held >= min_hold and (not gate or command_fn.button_pressed()):
-                break
-        # Switch from the XML default gains to the RL tracker gains for live control.
-        robot.set_pd_gains_from_policy(policy)
         handoff_time = robot.mj_data.time
-        print(f"[INFO] Handoff: switched to RL PD gains, handing control to the FM + tracker "
-              f"(t={handoff_time:.2f}s).")
-        # Live: hand control to the FM + tracker.
+        # Live: the FM + tracker have control from here.
         while True:
             if viewer is not None and not viewer.is_running():
                 return True
@@ -929,7 +886,9 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 # the fixed placement untouched.
                 if clip.ego_anchor and (clip_step - clip.start_step) % max(clip.ego_anchor_every, 1) == 0:
                     clip.reanchor_ego(s, state["root_pos"], state["root_quat"])
-                policy.observe(state)            # keep the FM history warm for handoff
+                # Keep the generator's cadence counter moving while the clip drives, so the
+                # first re-plan after the handoff lands on the phase it would have.
+                policy.advance_dormant_step()
                 ref = clip.reference_at(s, policy.window_offsets)
                 obs = policy.create_obs_from_reference(state, ref)
             action = policy.get_action(obs, robot.joint_names)
@@ -1026,18 +985,7 @@ def main() -> None:
                              "'--spawn_on_box 2' or '--spawn_on_box box2' (the generated "
                              "terrain scene has box0..box3 at 0.25/0.40/0.55/0.70 m). The "
                              "standing joint pose is kept; only the support height changes. "
-                             "Pair with --warmup_time 0 to hand straight to the FM on the box.")
-    parser.add_argument("--warmup_time", type=float, default=0.0,
-                        help="Seconds to PD-hold a stand before live control. DEFAULT 0 = spawn "
-                             "DIRECTLY into FM+tracker control: the FM history is warm-started "
-                             "from the spawn state, the leg hold-gain stiffening is skipped, and "
-                             "the joystick start-button gate is disabled. The FM is valid at step "
-                             "0 regardless, because --null_history_warmup (also default on) "
-                             "samples it through the learned null-history embedding. Pass a "
-                             "POSITIVE value (e.g. 1.0, the old default) to get the stand hold "
-                             "back -- and, in a joystick viewer run, the start-button gate that "
-                             "holds until you press start. Ignored in --clip mode, which always "
-                             "spawns on the clip pose with RL gains.")
+                             "The FM takes control immediately.")
     parser.add_argument("--rt_factor", type=float, default=1.0,
                         help="Viewer playback speed vs real time (1.0=real, 0.5=half; <=0 disables pacing).")
     parser.add_argument("--headless", action="store_true", default=False)
@@ -1051,11 +999,6 @@ def main() -> None:
                         help="Velocity-arrow length in metres per (m/s).")
     parser.add_argument("--vel_arrow_height", type=float, default=0.6,
                         help="Height (m) above the pelvis to draw the velocity arrows.")
-    parser.add_argument("--hold_kp_scale", type=float, default=6.0,
-                        help="Leg kp multiplier during the standing hold (XML gains can't "
-                             "balance the robot); reverts to RL gains at handoff.")
-    parser.add_argument("--hold_kv_scale", type=float, default=8.0,
-                        help="Leg kv (damping) multiplier during the standing hold.")
     parser.add_argument("--clip_spawn_z_offset", type=float, default=0.0,
                         help="Pelvis lift in clip mode (default 0 = spawn exactly on the clip "
                              "frame, matching IsaacLab). Non-zero desynchronises the two sims' "
@@ -1069,17 +1012,6 @@ def main() -> None:
                              "straight through (chosen empirically -- it looks better in MuJoCo). "
                              "Pass 2.0 to match the clip library's training ramp rate. Overridden "
                              "by tracker metadata 'max_acc' when that key is present.")
-    nh = parser.add_mutually_exclusive_group()
-    nh.add_argument("--null_history_warmup", dest="null_history_warmup", action="store_true",
-                    default=True,
-                    help="Sample the FM from step 0 using its learned null-history embedding "
-                         "while the N-step window fills (default; the RL side does the "
-                         "same unconditionally). Needs an fm.onnx exported with the "
-                         "history_null input.")
-    nh.add_argument("--no_null_history_warmup", dest="null_history_warmup",
-                    action="store_false",
-                    help="Legacy: withhold the FM until the history window is full, fabricating "
-                         "a repeated static history at spawn.")
     parser.add_argument("--fm_traj_points", type=int, default=0,
                         help="Number of spheres drawn along the FM predicted root/feet trajectory; "
                              "<=0 draws every predicted node (dense ribbon, like IsaacLab).")
@@ -1189,7 +1121,6 @@ def main() -> None:
     policy = GenTrackerPolicy(
         tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
         zero_noise=args.zero_noise,
-        null_history_warmup=args.null_history_warmup,
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
     )
     policy.load()
@@ -1285,9 +1216,9 @@ def main() -> None:
                   "plus mount jitter -- the training distribution, not the play config.")
 
     success = run(policy, robot, command_fn, total_time, args.headless, log_path,
-                  args.warmup_time, args.rt_factor, standing_config, args.viz,
-                  args.vel_arrow_scale, args.vel_arrow_height, args.hold_kp_scale,
-                  args.hold_kv_scale, args.spawn_z_offset, args.clip_spawn_z_offset,
+                  args.rt_factor, standing_config, args.viz,
+                  args.vel_arrow_scale, args.vel_arrow_height,
+                  args.spawn_z_offset, args.clip_spawn_z_offset,
                   args.cmd_max_acc, args.fm_traj_points,
                   viz_geomgroup=([int(g) for g in args.viz_geomgroup.split(",") if g.strip() != ""]
                                  if args.viz_geomgroup else None),
