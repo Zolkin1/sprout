@@ -63,7 +63,12 @@ from motion_gen.joint_names import G1_BODY_TRACK_FRAMES  # noqa: E402
 def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     """Parse CLI arguments into a config plus runtime options."""
     parser = argparse.ArgumentParser(description="Train a flow-matching future-state predictor.")
-    parser.add_argument("--data", type=str, required=True, help="Path to a recorded .npz dataset.")
+    parser.add_argument(
+        "--data", type=str, required=True,
+        help="Recorded dataset. Accepts SEVERAL comma-separated paths, concatenated "
+             "window-wise -- e.g. an original recording plus its registration-augmented "
+             "counterpart, without writing a merged copy to disk. Episode ids are offset per "
+             "file so the episode-wise train/val split cannot leak across them.")
     parser.add_argument(
         "--eval_data", type=str, default=None,
         help="Optional separate held-out recording (.npz) for eval metrics (logged under "
@@ -439,12 +444,39 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device(args.device)
 
-    data_path = _resolve_data_path(args.data)
-    print(f"[INFO] Loading dataset: {data_path}")
-    if is_windowed_recording(data_path):
-        data, meta = load_recorded_windows(data_path)
-    else:
-        data, meta = load_recorded_data(data_path)
+    # --data accepts SEVERAL comma-separated recordings, concatenated window-wise. The case
+    # this exists for is registration augmentation: the augmented windows land in their own
+    # .h5 next to the original, and merging them on disk would mean a second full copy of a
+    # ~10 GB file just to train once.
+    data_paths = [_resolve_data_path(p) for p in str(args.data).split(",") if p.strip()]
+    parts = []
+    for dp in data_paths:
+        print(f"[INFO] Loading dataset: {dp}")
+        parts.append(load_recorded_windows(dp) if is_windowed_recording(dp)
+                     else load_recorded_data(dp))
+    data, meta = parts[0]
+    if len(parts) > 1:
+        # episode_id must stay UNIQUE across files or the train/val split leaks: the split is
+        # by episode, and two files independently numbering from 0 would put the same id in
+        # both halves. Offset each subsequent file past the running maximum.
+        data = {k: v for k, v in data.items()}
+        ep_off = int(np.asarray(data["episode_id"]).max()) + 1
+        for extra, extra_meta in parts[1:]:
+            if set(extra) != set(data):
+                raise SystemExit(
+                    f"recordings carry different arrays and cannot be concatenated:\n"
+                    f"  {sorted(set(data) - set(extra))} missing from a later file\n"
+                    f"  {sorted(set(extra) - set(data))} missing from the first")
+            for k in data:
+                if k == "episode_id":
+                    data[k] = np.concatenate([data[k], np.asarray(extra[k]) + ep_off])
+                else:
+                    data[k] = np.concatenate([data[k], np.asarray(extra[k])])
+            ep_off = int(np.asarray(data["episode_id"]).max()) + 1
+        n_each = [int(np.asarray(p[0]["episode_id"]).shape[0]) for p in parts]
+        print(f"[INFO] concatenated {len(parts)} recordings: {n_each} -> "
+              f"{int(np.asarray(data['episode_id']).shape[0])} windows "
+              "(episode ids offset per file so the val split cannot leak between them)")
     # Auto-config from the recording's content (only the 'auto' sentinel infers;
     # an explicit --cmd_array / --target_source always wins).
     cfg.cmd_array = _resolve_cmd_array(cfg.cmd_array, data)
@@ -485,8 +517,11 @@ def main() -> None:
     # -- run provenance (parity with RL: git snapshot + params yaml + data identity) --
     # cfg dims (state_dim/cmd_dim) are resolved by build_train_val above,
     # so fm_config.yaml captures the *resolved* config.
-    data_path_abs = os.path.abspath(data_path)
-    data_sha256 = sha256_file(data_path)
+    # Provenance for ALL inputs, not just the first: a checkpoint trained on an original plus
+    # its augmented counterpart must name both, or the run cannot be reproduced from what it
+    # records. Comma-joined to match how --data took them.
+    data_path_abs = ",".join(os.path.abspath(p) for p in data_paths)
+    data_sha256 = ",".join(sha256_file(p) for p in data_paths)
     git_snapshot(out_dir)
     dump_params_yaml(os.path.join(out_dir, "params", "fm_config.yaml"), cfg.to_dict())
     dump_params_yaml(os.path.join(out_dir, "params", "data.yaml"), {
