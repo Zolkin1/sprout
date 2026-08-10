@@ -12,7 +12,6 @@
   <depend>rclcpp</depend>
   <depend>rclcpp_lifecycle</depend>
   <depend>sensor_msgs</depend>
-  <depend>ament_index_cpp</depend>
 
   <!-- NOTE. A double hyphen is illegal inside an XML comment, so none appears below. That is
        the same shape of trap as a literal star-slash in a .msg comment, which terminates the
@@ -29,8 +28,9 @@
        edit has to trigger a rebuild here rather than leaving stale generated bindings. -->
   <depend>g1_msgs</depend>
 
-  <!-- The prefetched policy pair lives in g1_control's resource tree, which this node resolves
-       through ament_index_cpp. -->
+  <!-- The prefetched policy pair lives in g1_control's resource tree, in the SOURCE checkout.
+       This node resolves it from ROBOT_RL_ROOT rather than from the ament share directory,
+       because g1_control is ament_python and does not install resource/ at all. -->
   <exec_depend>g1_control</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>

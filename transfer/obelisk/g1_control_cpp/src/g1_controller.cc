@@ -2,11 +2,11 @@
 
 #include "g1_control/g1_controller.h"
 
-#include <ament_index_cpp/get_package_share_directory.hpp>
 #include <obelisk_control_msgs/msg/execution_fsm.hpp>
 #include <obelisk_control_msgs/msg/velocity_command.hpp>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <filesystem>
 #include <numeric>
@@ -138,11 +138,31 @@ void G1Controller::LoadPolicy() {
   // Resolve the prefetched pair. Deliberately no download: an unbounded HTTP call inside
   // on_configure hangs BRING-UP, and the failure mode is a robot that will not arm for reasons
   // that look nothing like networking.
+  //
+  // From the SOURCE tree, via the workspace root the container already exports -- NOT from the
+  // ament share directory. g1_control is ament_python and does not install resource/ at all, so
+  // get_package_share_directory points at a share tree that has never contained the artifacts.
+  // controller.py resolves the same path from its own __file__; this uses the environment
+  // instead, because counting ".." hops from a binary's location is the thing that breaks the
+  // moment a file moves.
+  const char* ws = std::getenv("ROBOT_RL_ROOT");
+  const char* repo_root = std::getenv("REPO_ROOT");
+  std::filesystem::path workspace;
+  if (ws != nullptr && *ws != '\0') {
+    workspace = ws;
+  } else if (repo_root != nullptr && *repo_root != '\0') {
+    workspace = std::filesystem::path(repo_root) / "transfer" / "obelisk";
+  } else {
+    throw std::runtime_error(
+        "neither ROBOT_RL_ROOT nor REPO_ROOT is set, so the policy cache cannot be located. "
+        "Both are exported by docker/docker-compose.yml from docker/.env; running this node "
+        "outside that container needs one of them pointing at transfer/obelisk.");
+  }
+
   std::string repo = hf_repo_id_;
   std::replace(repo.begin(), repo.end(), '/', '_');
   const std::filesystem::path base =
-      std::filesystem::path(ament_index_cpp::get_package_share_directory("g1_control")) /
-      "resource" / "hf_cache" / repo / hf_policy_folder_;
+      workspace / "g1_control" / "resource" / "hf_cache" / repo / hf_policy_folder_;
 
   g1_deploy::RuntimeConfig cfg;
   cfg.tracker_onnx = (base / "tracker.onnx").string();

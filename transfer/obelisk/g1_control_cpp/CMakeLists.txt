@@ -17,7 +17,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(ament_cmake REQUIRED)
 find_package(fastcdr REQUIRED)  # Required for ament transitive dependencies
-find_package(ament_index_cpp REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -58,7 +57,6 @@ target_link_libraries(g1_controller PRIVATE
   G1Deploy::Ort
   rclcpp::rclcpp
   rclcpp_lifecycle::rclcpp_lifecycle
-  ament_index_cpp::ament_index_cpp
   ${sensor_msgs_TARGETS}
   ${g1_msgs_TARGETS})
 
