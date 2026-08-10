@@ -71,6 +71,60 @@ _LOSS_TERM_BLOCKS: dict[str, tuple[str, ...]] = {
 }
 
 
+def _pool_extero_statistics(
+    normalizer: Normalizer, cfg: FlowMatchingConfig, n_sensors: int, sensor_dim: int
+) -> Normalizer:
+    """Collapse a per-element exteroception normalizer to one statistic per SENSOR.
+
+    A no-op unless ``cfg.extero_norm_mode == "per_sensor"``. Motivation, in full, is on
+    :attr:`FlowMatchingConfig.extero_norm_mode`; the short version is that a per-pixel
+    affine is a spatially varying transform, and a convolution's weight sharing assumes the
+    transform is uniform.
+
+    The pooled value is broadcast back over the sensor's elements, so the returned
+    normalizer has the SAME ``(T*K,)`` shape as the fitted one -- the checkpoint, the folded
+    ONNX normalization and the deploy path are all shape-identical either way.
+
+    The std is pooled as the RMS of the per-element stds rather than their mean, because
+    what should be preserved is the total variance the sensor carries, not the average
+    scale; the eps floor is re-applied afterwards so a near-constant sensor still cannot
+    blow the normalization up.
+
+    Args:
+        normalizer: The freshly fitted per-element normalizer.
+        cfg: Training config (``extero_norm_mode`` and ``extero_norm_eps`` are read).
+        n_sensors: Number of sensor rows packed into the flat width.
+        sensor_dim: Elements per sensor.
+
+    Returns:
+        Either ``normalizer`` unchanged, or one with per-sensor-constant statistics.
+
+    Raises:
+        ValueError: On an unrecognised ``extero_norm_mode``.
+    """
+    mode = str(cfg.extero_norm_mode)
+    if mode == "per_element":
+        return normalizer
+    if mode != "per_sensor":
+        raise ValueError(
+            f"extero_norm_mode={mode!r} is not one of ['per_element', 'per_sensor']."
+        )
+    mean = normalizer.mean.reshape(n_sensors, sensor_dim)
+    std = normalizer.std.reshape(n_sensors, sensor_dim)
+    pooled_mean = mean.mean(dim=1, keepdim=True).expand_as(mean)
+    pooled_std = std.square().mean(dim=1, keepdim=True).sqrt().clamp_min(
+        float(cfg.extero_norm_eps)
+    ).expand_as(std)
+    print(f"[fm-data] extero_norm_mode=per_sensor: {n_sensors} sensor(s) standardized by one "
+          f"(mean, std) each -- mean {[round(float(v), 4) for v in pooled_mean[:, 0]]}, "
+          f"std {[round(float(v), 4) for v in pooled_std[:, 0]]}.")
+    return Normalizer(
+        pooled_mean.reshape(-1).contiguous(),
+        pooled_std.reshape(-1).contiguous(),
+        normalizer.standardize_mask,
+    )
+
+
 def resolve_block_selection(cfg: FlowMatchingConfig, meta: Any) -> tuple[str, ...]:
     """Settle which window blocks this model predicts, and disable what they cannot support.
 
@@ -264,7 +318,7 @@ class FutureStateDataset(Dataset):
         windows: list[np.ndarray],
         state_normalizer: Normalizer | None = None,
         cmd_normalizer: Normalizer | None = None,
-        height_normalizer: Normalizer | None = None,
+        extero_normalizer: Normalizer | None = None,
         add_noise: bool = False,
     ):
         """Build and (optionally) fit normalizers over the provided snap windows.
@@ -276,7 +330,7 @@ class FutureStateDataset(Dataset):
             cfg: Config; ``reference_blocks``, ``state_dim``, ``cmd_dim``, ``history_dim``
                 and any unsupportable loss weight are written back here.
             windows: History-row windows (length ``N``) from :func:`snap_windows`.
-            state_normalizer / cmd_normalizer / height_normalizer: reused on the val
+            state_normalizer / cmd_normalizer / extero_normalizer: reused on the val
                 split; fit on the train split when ``None``.
             add_noise: Add resampled observation noise to the history tokens in
                 ``__getitem__`` (train split only); gated by ``cfg.obs_noise``.
@@ -487,30 +541,41 @@ class FutureStateDataset(Dataset):
 
         self._check_window_invariants(target, history, snap_ref, tw[:, 0], s_slc, f)
 
-        # Exteroception tokens at the snap row. The recording carries either
-        # ``height_scan`` (P|W, K) -- one token -- or ``depth`` (P|W, T, K) with one token
-        # per camera, so the token count and per-token width both come from the array's
+        # Exteroception readings at the snap row. The recording carries either
+        # ``height_scan`` (P|W, K) -- one sensor -- or ``depth`` (P|W, T, K) with one row
+        # per camera, so the sensor count and per-sensor width both come from the array's
         # shape rather than being configured.
         hs = torch.from_numpy(np.ascontiguousarray(data[cfg.extero_source])).float()
         if hs.ndim == 2:
             hs = hs.unsqueeze(1)                                   # (P|W, 1, K)
-        n_tokens, token_dim = int(hs.shape[1]), int(hs.shape[2])
+        n_sensors, sensor_dim = int(hs.shape[1]), int(hs.shape[2])
         # Sanitize before the normalizer fit so a non-finite entry cannot poison the
         # per-dimension mean and yield a NaN loss (matches the deploy token builder).
         hs = sanitize_extero(hs, cfg.extero_source)
         # Flattened to (rows, T*K): the normalizer, the noise and __getitem__ all work on
         # the flat width, and the model reshapes back to (B, T, K) internally.
-        hs = hs.reshape(hs.shape[0], n_tokens * token_dim)
-        self.height = (hs[sel] if windowed else hs[snap_rows]).contiguous()  # (Nw, T*K)
-        self.height_dim = token_dim
-        self.extero_tokens = n_tokens
-        cfg.height_dim = token_dim
-        cfg.extero_tokens = n_tokens
-        # Contract of the sensor behind those tokens, carried from the recording so the
+        hs = hs.reshape(hs.shape[0], n_sensors * sensor_dim)
+        self.extero = (hs[sel] if windowed else hs[snap_rows]).contiguous()  # (Nw, T*K)
+        self.extero_sensor_dim = sensor_dim
+        self.extero_sensor_count = n_sensors
+        cfg.extero_sensor_dim = sensor_dim
+        cfg.extero_sensor_count = n_sensors
+        # Contract of the sensor behind those readings, carried from the recording so the
         # trained checkpoint (and the ONNX exported from it) states which cameras it
         # conditions on. Only depth has one; the height scan's geometry travels in the
         # tracker's ``height_scan_spec``.
-        self.extero_spec = self._resolve_extero_spec(cfg, meta, n_tokens, token_dim)
+        self.extero_spec = self._resolve_extero_spec(cfg, meta, n_sensors, sensor_dim)
+        # The per-sensor IMAGE SHAPE, derived from that contract rather than configured --
+        # the flat array cannot state it, and a convolutional encoder cannot fold without
+        # it. Written onto cfg so the checkpoint records the architecture it trained with,
+        # and re-verified wherever it is read again (``online.load_fm_context``).
+        self.extero_image_hw = self._resolve_extero_image_hw(self.extero_spec, sensor_dim)
+        cfg.extero_image_hw = ([list(hw) for hw in self.extero_image_hw]
+                               if self.extero_image_hw else None)
+        # Resolve "auto" HERE, where the source is finally known, and write it back so the
+        # checkpoint says which encoder it trained -- ``from_dict`` must never re-resolve it.
+        cfg.extero_encoder = cfg.resolve_extero_encoder()
+        cfg.check_extero_encoder()
 
         # Reference pose per window (the snap-step robot base), raw for eval/denorm.
         self.p_ref = p_anchor.contiguous()
@@ -544,12 +609,15 @@ class FutureStateDataset(Dataset):
             state_normalizer = Normalizer.fit(target.reshape(-1, self.state_dim), state_mask)
         self.state_normalizer = state_normalizer
 
-        if height_normalizer is None:
-            height_normalizer = Normalizer.fit(
-                self.height, torch.ones(self.height.shape[1], dtype=torch.bool),
-                eps=float(cfg.height_norm_eps),
+        if extero_normalizer is None:
+            extero_normalizer = Normalizer.fit(
+                self.extero, torch.ones(self.extero.shape[1], dtype=torch.bool),
+                eps=float(cfg.extero_norm_eps),
             )
-        self.height_normalizer = height_normalizer
+            extero_normalizer = _pool_extero_statistics(
+                extero_normalizer, cfg, n_sensors, sensor_dim
+            )
+        self.extero_normalizer = extero_normalizer
 
         if cmd_dim > 0:
             if cmd_normalizer is None:
@@ -565,7 +633,7 @@ class FutureStateDataset(Dataset):
         # Pre-normalize once.
         self.state = state_normalizer.normalize(target)           # (Nw, F, D) target
         self.history = state_normalizer.normalize(history)        # (Nw, N, D) conditioning
-        self.height_norm_tokens = height_normalizer.normalize(self.height)  # (Nw, T*K)
+        self.extero_norm_tokens = extero_normalizer.normalize(self.extero)  # (Nw, T*K)
 
         # -- observation noise (train-time augmentation; conditioning tokens only) --
         self.add_noise = bool(add_noise and cfg.obs_noise)
@@ -574,8 +642,8 @@ class FutureStateDataset(Dataset):
         )
         # Height-scan noise (normalized space = raw m / std), per ray. The height token is a
         # real (noisy) sensor at deploy, so it is noised in training like the history tokens.
-        self.height_noise = (
-            (float(cfg.noise_extero) * float(cfg.noise_scale)) / height_normalizer.std
+        self.extero_noise = (
+            (float(cfg.noise_extero) * float(cfg.noise_scale)) / extero_normalizer.std
             if self.add_noise else None
         )
 
@@ -693,9 +761,9 @@ class FutureStateDataset(Dataset):
 
     @staticmethod
     def _resolve_extero_spec(
-        cfg: FlowMatchingConfig, meta: Any, n_tokens: int, token_dim: int
+        cfg: FlowMatchingConfig, meta: Any, n_sensors: int, sensor_dim: int
     ) -> list[dict] | None:
-        """The sensor contract behind the exteroception tokens, validated against them.
+        """The sensor contract behind the exteroception readings, validated against them.
 
         Only the depth source has one: it is the deployable signal, and reproducing it
         off-sim needs the camera geometry, whereas the height scan's grid already travels
@@ -704,8 +772,8 @@ class FutureStateDataset(Dataset):
         Args:
             cfg: The training config (its ``extero_source`` selects the sensor).
             meta: Recording layout metadata.
-            n_tokens: Token count found in the recorded array.
-            token_dim: Per-token width found in the recorded array.
+            n_sensors: Sensor count found in the recorded array.
+            sensor_dim: Per-sensor width found in the recorded array.
 
         Returns:
             The per-camera contract, or ``None`` for the height scan.
@@ -723,19 +791,58 @@ class FutureStateDataset(Dataset):
                 "(the camera geometry the FM must state at deploy); this recording has "
                 "none. Re-record with scripts/rsl_rl/record_data.py on a depth task."
             )
-        if len(spec) != n_tokens:
+        if len(spec) != n_sensors:
             raise ValueError(
                 f"depth_camera_spec lists {len(spec)} cameras but the recorded depth has "
-                f"{n_tokens} token(s)."
+                f"{n_sensors} sensor row(s)."
             )
         for cam in spec:
-            if int(cam["width"]) * int(cam["height"]) != token_dim:
+            if int(cam["width"]) * int(cam["height"]) != sensor_dim:
                 raise ValueError(
                     f"camera '{cam.get('sensor')}' is {cam['width']}x{cam['height']} "
                     f"= {int(cam['width']) * int(cam['height'])} pixels but the recorded "
-                    f"depth token is {token_dim} wide."
+                    f"depth row is {sensor_dim} wide."
                 )
         return [dict(cam) for cam in spec]
+
+    @staticmethod
+    def _resolve_extero_image_hw(
+        spec: list[dict] | None, sensor_dim: int
+    ) -> list[tuple[int, int]] | None:
+        """Per-sensor ``(height, width)`` from the camera contract.
+
+        The recorded depth array is flat per camera, so the 2-D shape exists only here. That
+        was immaterial while the embedding was a flat MLP; a convolution has to fold the row
+        back into an image, and folding it with the axes swapped scrambles every kernel's
+        neighbourhood while leaving all the shapes -- and the loss curve -- looking right.
+        Hence: derived from the one producer that states it, never configured.
+
+        Args:
+            spec: The per-camera contract, or ``None`` (height scan).
+            sensor_dim: Per-sensor flat width, for the cross-check.
+
+        Returns:
+            One ``(height, width)`` per sensor in token order, or ``None`` when there is no
+            camera contract to derive from.
+
+        Raises:
+            ValueError: If a contract entry does not unfold to ``sensor_dim``.  (The
+                per-camera check in :meth:`_resolve_extero_spec` already covers this for
+                the pixel COUNT; this one is here so the tuple built below cannot be built
+                from a mismatched entry regardless of call order.)
+        """
+        if not spec:
+            return None
+        out: list[tuple[int, int]] = []
+        for cam in spec:
+            h, w = int(cam["height"]), int(cam["width"])
+            if h * w != sensor_dim:
+                raise ValueError(
+                    f"camera '{cam.get('sensor')}' contract {h}x{w} does not unfold the "
+                    f"{sensor_dim}-wide recorded row."
+                )
+            out.append((h, w))
+        return out
 
     def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
         """Per-channel uniform noise half-width (normalized space) for a history token.
@@ -763,14 +870,14 @@ class FutureStateDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         history = self.history[i]
-        height = self.height_norm_tokens[i]
+        extero = self.extero_norm_tokens[i]
         if self.add_noise:
             history = history + (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
-            height = height + (torch.rand(self.height.shape[1]) * 2.0 - 1.0) * self.height_noise
+            extero = extero + (torch.rand(self.extero.shape[1]) * 2.0 - 1.0) * self.extero_noise
         item = {
             "state": self.state[i],          # (F, D) ego-anchored clip future target
             "history": history,              # (N, D) real-robot phase conditioning
-            "height": height,                # (K,) height-scan token (noised in train)
+            "extero": extero,                # (T*K,) flat exteroception (noised in train)
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
         }
@@ -837,7 +944,7 @@ def build_train_val(
             data, meta, cfg, val_windows,
             state_normalizer=train_ds.state_normalizer,
             cmd_normalizer=train_ds.cmd_normalizer,
-            height_normalizer=train_ds.height_normalizer,
+            extero_normalizer=train_ds.extero_normalizer,
         )
     return train_ds, val_ds
 
@@ -1117,6 +1224,6 @@ def _build_train_val_windowed(
             data, meta, cfg, val_idx,
             state_normalizer=train_ds.state_normalizer,
             cmd_normalizer=train_ds.cmd_normalizer,
-            height_normalizer=train_ds.height_normalizer,
+            extero_normalizer=train_ds.extero_normalizer,
         )
     return train_ds, val_ds

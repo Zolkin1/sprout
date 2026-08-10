@@ -8,8 +8,14 @@ measured states (dropped in as clean tokens, inpainting) and a strided
 commanded-velocity profile, generating a future trajectory in the current root frame.
 """
 
-from .config import EXTERO_SOURCES, FlowMatchingConfig
+from .config import EXTERO_ENCODERS, EXTERO_SOURCES, FlowMatchingConfig
 from .ema import WeightEMA
+from .extero_encoder import (
+    ExteroImageEncoder,
+    ExteroImageEncoderSet,
+    conv_grid_shape,
+    images_from_flat,
+)
 from .dataset import (
     FutureStateDataset,
     build_train_val,
@@ -69,7 +75,12 @@ __all__ = [
     "FlowMatchingConfig",
     "WeightEMA",
     "EXTERO_SOURCES",
+    "EXTERO_ENCODERS",
     "FlowMatchingTransformer",
+    "ExteroImageEncoder",
+    "ExteroImageEncoderSet",
+    "conv_grid_shape",
+    "images_from_flat",
     "FutureStateDataset",
     "snap_windows",
     "Normalizer",

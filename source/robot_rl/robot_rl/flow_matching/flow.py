@@ -7,7 +7,7 @@ and ``x1`` the (standardized) future window. The target vector field is the cons
 ``v* = x1 - x0``; the model regresses it with MSE over ALL F future tokens. Sampling
 integrates ``dx/dtau = v_theta`` from ``tau = 0`` (noise) to ``tau = 1`` with Euler steps.
 
-Conditioning is passed as SEPARATE tokens to the model (history / height / command) --
+Conditioning is passed as SEPARATE tokens to the model (history / extero / command) --
 it is NOT part of the denoised window, so there is no inpainting / known-mask / re-clamp.
 History (phase) conditioning may be replaced by the model's learned null embedding for a
 fraction of samples via ``history_null_mask`` (classifier-free-guidance / phase-agnostic).
@@ -324,7 +324,7 @@ def flow_matching_loss(
     model: torch.nn.Module,
     x1: torch.Tensor,
     history: torch.Tensor,
-    height: torch.Tensor,
+    extero: torch.Tensor,
     cmd_tokens: torch.Tensor | None = None,
     history_null_mask: torch.Tensor | None = None,
     state_norm: object | None = None,
@@ -359,7 +359,7 @@ def flow_matching_loss(
         model: A :class:`FlowMatchingTransformer`.
         x1: Target future window (standardized), ``(B, F, D)``.
         history: Clean history (phase) conditioning (standardized), ``(B, N, D)``.
-        height: Height conditioning (standardized), ``(B, 1)``.
+        extero: Exteroception conditioning (standardized), flat ``(B, T*K)``.
         cmd_tokens: Strided future command tokens (normalized) or ``None``.
         history_null_mask: ``(B,)`` bool; where True the history is replaced by the
             model's learned null embedding (classifier-free-guidance / phase-agnostic).
@@ -379,7 +379,7 @@ def flow_matching_loss(
         ``fk_pose``.
     """
     x_tau, tau, target_v = sample_flow_batch(x1)
-    v = model(x_tau, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
+    v = model(x_tau, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
     flow_mse = ((v - target_v) ** 2).mean()
     out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
 
@@ -449,7 +449,7 @@ def flow_matching_loss(
 def sample_trajectory(
     model: torch.nn.Module,
     history: torch.Tensor,
-    height: torch.Tensor,
+    extero: torch.Tensor,
     cmd_tokens: torch.Tensor | None,
     future_len: int,
     state_dim: int,
@@ -461,14 +461,14 @@ def sample_trajectory(
 ) -> torch.Tensor:
     """Generate the F-step future window by Euler-integrating the learned flow.
 
-    The conditioning (history / height / command) is fed as separate tokens, held fixed
+    The conditioning (history / extero / command) is fed as separate tokens, held fixed
     across integration; there is no inpainting / re-clamp. The output is in the
     standardized space; the caller denormalizes and Gram-Schmidts the orientation block.
 
     Args:
         model: A :class:`FlowMatchingTransformer`.
         history: History (phase) conditioning (standardized), ``(B, N, D)``.
-        height: Height conditioning (standardized), ``(B, 1)``.
+        extero: Exteroception conditioning (standardized), flat ``(B, T*K)``.
         cmd_tokens: Strided command tokens (normalized) or ``None``, held fixed.
         future_len: Future window length ``F``.
         state_dim: Per-step state width ``D``.
@@ -516,12 +516,12 @@ def sample_trajectory(
                      if history_null_mask is None else history_null_mask)
         null_mask = torch.ones(b, dtype=torch.bool, device=device)
         mask2 = torch.cat([cond_mask, null_mask], dim=0)
-        hist2, height2 = torch.cat([history] * 2, 0), torch.cat([height] * 2, 0)
+        hist2, extero2 = torch.cat([history] * 2, 0), torch.cat([extero] * 2, 0)
         cmd2 = None if cmd_tokens is None else torch.cat([cmd_tokens] * 2, 0)
     for i in range(num_steps):
         tau = torch.full((b,), i * dt, device=device, dtype=history.dtype)
         if guided:
-            v2 = model(torch.cat([x, x], 0), torch.cat([tau, tau], 0), hist2, height2, cmd2,
+            v2 = model(torch.cat([x, x], 0), torch.cat([tau, tau], 0), hist2, extero2, cmd2,
                        history_null_mask=mask2)
             v_cond, v_null = v2[:b], v2[b:]
             # v_null + w (v_cond - v_null): extrapolate along the direction the HISTORY
@@ -529,7 +529,7 @@ def sample_trajectory(
             # no-op for them -- which is what you want for the first N steps after a reset.
             v = v_null + guidance_scale * (v_cond - v_null)
         else:
-            v = model(x, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
+            v = model(x, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
         x = x + dt * v
     return x
 
@@ -537,7 +537,7 @@ def sample_trajectory(
 def sample_trajectory_grad(
     model: torch.nn.Module,
     history: torch.Tensor,
-    height: torch.Tensor,
+    extero: torch.Tensor,
     cmd_tokens: torch.Tensor | None,
     future_len: int,
     state_dim: int,
@@ -567,9 +567,9 @@ def sample_trajectory_grad(
         tau = torch.full((b,), i * step, device=device, dtype=history.dtype)
         if i < no_grad_steps:
             with torch.no_grad():
-                v = model(x, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
+                v = model(x, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
                 x = x + step * v
         else:
-            v = model(x, tau, history, height, cmd_tokens, history_null_mask=history_null_mask)
+            v = model(x, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
             x = x + step * v
     return x

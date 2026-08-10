@@ -135,7 +135,7 @@ def main() -> None:
     ds = FutureStateDataset(data, meta, cfg, np.arange(n_rows),
                             state_normalizer=ctx.state_norm,
                             cmd_normalizer=getattr(ctx, "cmd_norm", None),
-                            height_normalizer=getattr(ctx, "height_norm", None))
+                            extero_normalizer=getattr(ctx, "extero_norm", None))
     pos = ds.block_slices["base_pose"]
     pos = slice(pos.start, pos.start + 3)
 
@@ -143,7 +143,7 @@ def main() -> None:
     P, T = [], []
     for b in loader:
         torch.manual_seed(args.seed)
-        p = sample_trajectory(model, b["history"].to(dev), b["height"].to(dev),
+        p = sample_trajectory(model, b["history"].to(dev), b["extero"].to(dev),
                               b["cmd_tokens"].to(dev) if "cmd_tokens" in b else None,
                               cfg.future_len, cfg.state_dim, cfg.num_sampling_steps)
         P.append(ctx.state_norm.denormalize(p.cpu())[:, :, pos].numpy())

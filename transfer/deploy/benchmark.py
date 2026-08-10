@@ -259,7 +259,7 @@ def _fm_feed(ctx, rng) -> dict:
     """Synthetic inputs for the FM graph, in its declared shapes."""
     feed = {
         "history": rng.standard_normal((1, ctx.N, ctx.D)).astype(np.float32),
-        "extero": rng.standard_normal((1, ctx.extero_tokens * ctx.height_dim)).astype(np.float32),
+        "extero": rng.standard_normal((1, ctx.extero_sensor_count * ctx.extero_sensor_dim)).astype(np.float32),
         "cmd_tokens": rng.standard_normal((1, ctx.num_cmd_tokens, ctx.cmd_dim)).astype(np.float32),
         "noise": rng.standard_normal((1, ctx.F, ctx.D)).astype(np.float32),
     }

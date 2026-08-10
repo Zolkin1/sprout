@@ -10,7 +10,7 @@ tokens + *raw* strided command tokens + sampling noise and gets the *denormalize
 relative-state future window back -- no torch, no separate normalizer stats.
 
   inputs : history     (V, N, D)          raw relative-state history (phase) tokens
-           extero      (V, T*extero_dim)  raw exteroception tokens, flattened: the
+           extero      (V, T*extero_flat_dim)  raw exteroception tokens, flattened: the
                                           176-ray height scan (T=1) or one 780-value
                                           depth image per camera (T=2)
            cmd_tokens  (V, n_cmd, cmd)    raw strided commanded-velocity tokens
@@ -67,8 +67,8 @@ class _FmSamplerOnnx(nn.Module):
         self.register_buffer("s_std", ctx.state_norm.std.detach().clone())
         self.register_buffer("c_mean", ctx.cmd_norm.mean.detach().clone())
         self.register_buffer("c_std", ctx.cmd_norm.std.detach().clone())
-        self.register_buffer("h_mean", ctx.height_norm.mean.detach().clone())
-        self.register_buffer("h_std", ctx.height_norm.std.detach().clone())
+        self.register_buffer("h_mean", ctx.extero_norm.mean.detach().clone())
+        self.register_buffer("h_std", ctx.extero_norm.std.detach().clone())
 
     def forward(
         self,
@@ -86,7 +86,7 @@ class _FmSamplerOnnx(nn.Module):
         deployed generator sample before its history window has filled, matching the RL side.
         """
         hist_n = (history - self.s_mean) / self.s_std        # (V, N, D)
-        height_n = (extero - self.h_mean) / self.h_std       # (V, T*extero_dim)
+        height_n = (extero - self.h_mean) / self.h_std       # (V, T*extero_flat_dim)
         cmd_n = (cmd_tokens - self.c_mean) / self.c_std      # (V, n_cmd, cmd)
         null_m = (history_null.reshape(-1) > 0.5)            # (V,) bool
 
@@ -114,13 +114,28 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "target_frame_names": list(ctx.target_frame_names),
         "N": ctx.N, "F": ctx.F, "D": ctx.D, "nj": ctx.nj, "num_steps": ctx.num_steps,
         "cmd_dim": ctx.cmd_dim, "cmd_steps": list(ctx.cmd_steps), "num_cmd_tokens": ctx.num_cmd_tokens,
-        "height_dim": int(ctx.model.height_dim),
+        "extero_sensor_dim": int(ctx.model.extero_sensor_dim),
         # Which sensor feeds the exteroception tokens, how many there are, and -- for the
         # depth cameras -- their full contract, so the deployment feeds the right reading
         # and can verify it describes the same physical sensor as the tracker's.
         "extero_source": str(ctx.extero_source),
-        "extero_tokens": int(ctx.model.extero_tokens),
+        "extero_sensor_count": int(ctx.model.extero_sensor_count),
         "extero_spec": ctx.extero_spec,
+        # WHICH exteroception embedding is baked into the graph, and the geometry it folds
+        # the flat row with. The runtime does not need these to run -- the reshape is inside
+        # the graph -- but it needs them to CHECK: ``extero_sensor_dim`` alone cannot tell a
+        # 30x26 camera from a 26x30 one, and a transposed camera at deploy is a scrambled
+        # image rather than a reordered vector. ``tokens_per_sensor`` is the sequence
+        # arithmetic, which nothing else in the metadata reveals.
+        "extero_encoder": str(ctx.model.extero_encoder),
+        # Only for the CONVOLUTIONAL encoder. The dataset derives the geometry for any depth
+        # recording, but a flat embedding is permutation-invariant over pixels, so stating
+        # the fold there would have the deploy enforce a constraint that does not exist --
+        # refusing a transposed camera an MLP graph would consume perfectly well.
+        "extero_image_hw": ([[int(h), int(w)] for h, w in ctx.extero_image_hw]
+                            if (ctx.extero_image_hw
+                                and ctx.model.extero_encoder == "cnn") else None),
+        "extero_tokens_per_sensor": int(ctx.model.tokens_per_sensor),
         # What the history tokens must be built from, and the re-plan period the targets
         # were cut at. Both are contracts the runtime has to honour, not descriptions: a
         # deployment feeding a measured history to a partially autoregressive model, or
@@ -155,11 +170,11 @@ def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
 
     v, n, f, d, n_cmd, cmd = 1, ctx.N, ctx.F, ctx.D, ctx.num_cmd_tokens, ctx.cmd_dim
     # FLAT exteroception width: one token per sensor (176-ray scan) or one per camera
-    # (2 x 780 depth). The model reshapes to (B, T, height_dim) internally.
-    edim = int(ctx.model.extero_tokens) * int(ctx.model.height_dim)
+    # (2 x 780 depth). The model reshapes to (B, T, extero_sensor_dim) internally.
+    edim = int(ctx.model.extero_sensor_count) * int(ctx.model.extero_sensor_dim)
     # One dummy per _FmSamplerOnnx.forward arg, in order:
     # (history, extero, cmd_tokens, noise, history_null). ``extero`` is the FLAT width, so a
-    # depth FM traces at 2*780 rather than the scan's 176 -- do NOT use height_dim alone here.
+    # depth FM traces at 2*780 rather than the scan's 176 -- do NOT use extero_sensor_dim alone here.
     dummy = (torch.randn(v, n, d), torch.randn(v, edim), torch.randn(v, n_cmd, cmd),
              torch.randn(v, f, d), torch.zeros(v, 1))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)

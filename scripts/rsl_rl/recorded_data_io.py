@@ -525,7 +525,7 @@ class RecordedWindowWriter:
         history_len: ``H``, history-state rows per window.
         node_dim: Per-row raw state width (== ref_future node width).
         future_len: ``F``, future nodes per window.
-        height_dim: ``K`` rays (0 to omit the ``height_scan`` dataset).
+        height_scan_dim: ``K`` rays (0 to omit the ``height_scan`` dataset).
         depth_shape: ``(num_cameras, H*W)`` for the depth dataset, or ``None`` to omit it.
             Recorded alongside the height scan so one recording can train either FM.
         cmd_dim: Future-command width (0 to omit the ``cmd_future`` dataset).
@@ -544,7 +544,7 @@ class RecordedWindowWriter:
 
     def __init__(
         self, path: str, num_windows: int, history_len: int, node_dim: int,
-        future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
+        future_len: int, height_scan_dim: int, cmd_dim: int, meta: RecordingMeta,
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
         tag_distractors: bool = False, tag_families: bool = False,
         tag_clip_index: bool = False, record_history_ref: bool = False,
@@ -581,8 +581,8 @@ class RecordedWindowWriter:
             shapes["clip_id"] = (num_windows,)
             shapes["clip_step"] = (num_windows,)
             shapes["env_id"] = (num_windows,)
-        if height_dim > 0:
-            shapes["height_scan"] = (num_windows, height_dim)
+        if height_scan_dim > 0:
+            shapes["height_scan"] = (num_windows, height_scan_dim)
         if depth_shape is not None:
             shapes["depth"] = (num_windows, int(depth_shape[0]), int(depth_shape[1]))
         if cmd_dim > 0:

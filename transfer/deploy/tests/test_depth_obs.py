@@ -324,5 +324,64 @@ def test_ingestion_of_no_cameras_is_empty():
     assert normalize_camera_images([], []).size == 0
 
 
+##
+# The convolutional fold: (H, W) is load-bearing, not just H*W
+##
+
+def _fm_ctx(**overrides):
+    """A minimal :class:`FmContext` stand-in for ``_resolve_depth_cameras``."""
+    from types import SimpleNamespace
+    base = dict(extero_source="depth", extero_sensor_count=2, extero_sensor_dim=30 * 26,
+                extero_spec=[],
+                extero_encoder="cnn", extero_image_hw=[(26, 30), (26, 30)],
+                extero_tokens_per_sensor=16)
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _resolve(ctx, spec):
+    """Run ``GenTrackerPolicy._resolve_depth_cameras`` against a hand-built context."""
+    from types import SimpleNamespace
+    from deploy.gen_tracker import GenTrackerPolicy
+    policy = object.__new__(GenTrackerPolicy)
+    policy.ctx = ctx
+    policy._trk = SimpleNamespace(get_depth_camera_spec=lambda: list(spec))
+    GenTrackerPolicy._resolve_depth_cameras(policy)
+    return policy._depth_spec
+
+
+def test_matching_fold_is_accepted():
+    """The shipped pairing: contract HxW equals what the graph folds."""
+    spec = [_cam(), _far_cam()]
+    assert len(_resolve(_fm_ctx(), spec)) == 2
+
+
+def test_transposed_camera_is_refused_by_the_fold_check():
+    """30x26 and 26x30 are the SAME pixel count and different images.
+
+    The pixel-count check passes either way, so before the fold shape travelled this was
+    undetectable -- a convolution would read every kernel's neighbourhood off a transposed
+    frame with every tensor the right size. Only reachable for a convolutional graph, which
+    is the only one it can hurt.
+    """
+    spec = [_cam(width=26, height=30), _far_cam(width=26, height=30)]
+    with pytest.raises(ValueError, match="transposed image is scrambled"):
+        _resolve(_fm_ctx(), spec)
+
+
+def test_a_flat_graph_does_not_check_the_fold():
+    """An MLP graph carries no image shape, and genuinely does not care about pixel order."""
+    spec = [_cam(width=26, height=30), _far_cam(width=26, height=30)]
+    assert len(_resolve(_fm_ctx(extero_encoder="mlp", extero_image_hw=[],
+                                extero_tokens_per_sensor=1), spec)) == 2
+
+
+def test_pixel_count_mismatch_is_still_refused():
+    """The pre-existing width check must survive alongside the new fold check."""
+    spec = [_cam(width=10, height=6), _far_cam(width=10, height=6)]
+    with pytest.raises(ValueError, match="wide"):
+        _resolve(_fm_ctx(extero_image_hw=[(6, 10), (6, 10)]), spec)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

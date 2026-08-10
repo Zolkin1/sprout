@@ -58,7 +58,11 @@ from robot_rl.flow_matching import (
     yaw_quat,
 )
 from isaaclab.utils.math import quat_conjugate, quat_mul, yaw_quat
-from robot_rl.flow_matching.tests.recording_fixtures import per_step_recording
+from robot_rl.flow_matching.tests.recording_fixtures import (
+    camera_spec,
+    per_step_recording,
+    windowed_recording,
+)
 from robot_rl.flow_matching.online import (
     build_cmd_tokens,
     build_extero_tokens,
@@ -323,9 +327,9 @@ def test_flow_batch_no_mask():
 _HK = 8
 
 
-def _model(d=57, f=8, n=2, cmd_dim=3, stride=5, height_dim=_HK, **kw):
+def _model(d=57, f=8, n=2, cmd_dim=3, stride=5, extero_sensor_dim=_HK, **kw):
     return FlowMatchingTransformer(
-        state_dim=d, future_len=f, num_history_states=n, history_dim=d, height_dim=height_dim,
+        state_dim=d, future_len=f, num_history_states=n, history_dim=d, extero_sensor_dim=extero_sensor_dim,
         cmd_dim=cmd_dim, cmd_stride=stride, d_model=32, nhead=4, num_layers=2, dim_feedforward=64, **kw
     ).eval()
 
@@ -635,24 +639,28 @@ def test_snap_windows():
     assert wins[0].tolist() == [3, 4]
 
 
-def _synthetic_recording(n_ep=6, L=40, nj=4, K=2, F=8, Kstep=4, Ksc=6, seed=0):
-    """Synthesize a per-step recording plus its layout meta.
+def _synthetic_recording(n_ep=6, W_ep=6, nj=4, K=2, F=8, H=4, Ksc=6, depth=None, seed=0):
+    """Synthesize a windowed recording plus its layout meta.
 
     Returns ``(data, meta, nj, K, F, state_dim)``. Note the two DIFFERENT widths:
-    ``raw_node`` = ``sum(state_term_dims)`` is what ``state``/``ref_state``/``ref_future``
-    rows are (world-frame, full 13 per extra frame), while ``state_dim`` is the narrower
-    reference-window node the dataset builds from them (ee blocks position-only).
+    ``raw_node`` = ``sum(state_term_dims)`` is what ``history_state``/``history_ref``/
+    ``ref_future`` rows are (world-frame, full 13 per extra frame), while ``state_dim`` is
+    the narrower reference-window node the dataset builds from them (ee blocks
+    position-only).
 
     The trajectory is smooth, tracked and near-upright -- see
     :mod:`~robot_rl.flow_matching.tests.recording_fixtures` for why the dataset now
-    rejects white noise.
+    rejects white noise, and why the history rows are PLAN-anchored.
     """
-    data, stn, std, frames = per_step_recording(
-        n_ep=n_ep, length=L, nj=nj, k=K, future_len=F, snap_every=Kstep,
-        num_scan_rays=Ksc, seed=seed,
+    data, stn, std, frames = windowed_recording(
+        n_ep=n_ep, windows_per_ep=W_ep, history_len=H, future_len=F, nj=nj, k=K,
+        num_scan_rays=Ksc, depth=depth, seed=seed,
     )
     meta = SimpleNamespace(state_term_names=stn, state_term_dims=std, state_frame_names=frames,
-                           state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F)
+                           state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F,
+                           history_anchor="plan", history_len=H,
+                           # Only alongside a depth array, exactly as the recorder behaves.
+                           depth_camera_spec=camera_spec(*depth) if depth else None)
     return data, meta, nj, K, F, window_dim(nj, K)
 
 
@@ -666,13 +674,13 @@ def test_dataset_snap_windows_build():
     ksc = data["height_scan"].shape[1]
     # The built vector is NARROWER than the recorded row: the extra frames' quat/lin/ang
     # columns are recorded but not read (position-only ee blocks).
-    assert state_dim < data["state"].shape[1]
+    assert state_dim < data["history_state"].shape[-1]
     assert it["history"].shape == (2, state_dim)
     assert it["state"].shape == (F, state_dim)
-    assert it["height"].shape == (ksc,)
+    assert it["extero"].shape == (ksc,)
     assert it["cmd_tokens"].shape == (cfg.num_cmd_tokens, 3)
     assert cfg.state_dim == state_dim and cfg.history_dim == state_dim and cfg.cmd_dim == 3
-    assert cfg.height_dim == ksc
+    assert cfg.extero_sensor_dim == ksc
     assert val is not None and len(val) > 0
     assert isinstance(train.val_episode_ids, list)
     # node-0 base offset ~ 0 in the robot frame (ego-anchored): the target's base_pose
@@ -747,7 +755,7 @@ def test_flow_loss_skips_the_terms_whose_blocks_are_absent():
     slim = ("base_pose", "base_vel", "joint_pos")
     d = window_dim(nj, k, slim)
     model = FlowMatchingTransformer(
-        state_dim=d, future_len=f, num_history_states=2, history_dim=d, height_dim=6,
+        state_dim=d, future_len=f, num_history_states=2, history_dim=d, extero_sensor_dim=6,
         cmd_dim=0, d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
     )
     norm = Normalizer(torch.zeros(d), torch.ones(d), torch.ones(d, dtype=torch.bool))
@@ -772,7 +780,7 @@ def test_online_roundtrip():
     # Model must match the ctor load_fm_context will rebuild from cfg.
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=F, num_history_states=N, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
+        extero_sensor_dim=cfg.extero_sensor_dim, cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
         d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward,
     ).eval()
     ckpt = {
@@ -781,7 +789,7 @@ def test_online_roundtrip():
         "num_joints": nj,
         "state_normalizer": train.state_normalizer.state_dict(),
         "cmd_normalizer": train.cmd_normalizer.state_dict(),
-        "height_normalizer": train.height_normalizer.state_dict(),
+        "extero_normalizer": train.extero_normalizer.state_dict(),
         "model": model.state_dict(),
     }
     ctx = load_fm_context(ckpt, device="cpu", num_sampling_steps=4)
@@ -790,9 +798,9 @@ def test_online_roundtrip():
     # The history is window nodes the generator emitted, not robot state -- so the online
     # path takes the same (V, N, D) it produces, closing the autoregressive loop.
     hist = build_history_tokens(ctx, torch.randn(V, N, state_dim))
-    height = build_extero_tokens(ctx, torch.randn(V, cfg.height_dim))
+    height = build_extero_tokens(ctx, torch.randn(V, cfg.extero_sensor_dim))
     cmd = build_cmd_tokens(ctx, torch.randn(V, F, 3))
-    assert (hist.shape == (V, N, state_dim) and height.shape == (V, cfg.height_dim)
+    assert (hist.shape == (V, N, state_dim) and height.shape == (V, cfg.extero_sensor_dim)
             and cmd.shape == (V, ctx.num_cmd_tokens, 3))
     pred = sample_window(ctx, hist, height, cmd)
     assert pred.shape == (V, F, state_dim)
@@ -801,6 +809,70 @@ def test_online_roundtrip():
     assert build_history_tokens(ctx, pred[:, :N]).shape == (V, N, state_dim)
     with pytest.raises(ValueError, match="window nodes"):
         build_history_tokens(ctx, torch.randn(V, N, state_dim + 1))
+
+
+def test_online_roundtrip_with_the_cnn_encoder():
+    """Same loop for the CONVOLUTIONAL encoder: dataset -> ckpt -> context -> sample.
+
+    The whole chain in one test, because each link carries its own contract and they only
+    have to agree end to end: the dataset derives ``extero_image_hw`` from the camera
+    contract, the config carries it into the checkpoint, ``load_fm_context`` rebuilds the
+    per-camera trunks from it and re-checks it against the recorded spec, and the flat
+    ``(V, T*K)`` reading the deploy runtime feeds still folds correctly inside.
+    """
+    torch.manual_seed(0)
+    H, W = 26, 30
+    data, meta, nj, K, F, state_dim = _synthetic_recording(depth=(2, H, W))
+    N = 2
+    cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel",
+                             cmd_stride=4, extero_source="depth", extero_encoder="cnn",
+                             extero_norm_mode="per_sensor",
+                             target_source="ego_anchored_clip_future", val_fraction=0.2,
+                             seed=0, d_model=32, nhead=4, num_layers=2, dim_feedforward=64)
+    train, _ = build_train_val(data, meta, cfg)
+    # The dataset must have DERIVED the geometry -- nothing above stated it.
+    assert cfg.extero_image_hw == [[H, W], [H, W]]
+    assert cfg.extero_sensor_count == 2 and cfg.extero_sensor_dim == H * W
+    assert cfg.tokens_per_sensor == 16 and cfg.extero_seq_tokens == 32
+    model = FlowMatchingTransformer(
+        state_dim=cfg.state_dim, future_len=F, num_history_states=N, history_dim=cfg.state_dim,
+        extero_sensor_dim=cfg.extero_sensor_dim,
+        extero_sensor_count=cfg.extero_sensor_count,
+        cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
+        num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward,
+        extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
+        extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
+    ).eval()
+    ckpt = {
+        "config": cfg.to_dict(),
+        "meta": {"state_joint_names": meta.state_joint_names,
+                 "target_frame_names": meta.state_frame_names,
+                 "extero_spec": train.extero_spec},
+        "num_joints": nj,
+        "state_normalizer": train.state_normalizer.state_dict(),
+        "cmd_normalizer": train.cmd_normalizer.state_dict(),
+        "extero_normalizer": train.extero_normalizer.state_dict(),
+        "model": model.state_dict(),
+    }
+    ctx = load_fm_context(ckpt, device="cpu", num_sampling_steps=4)
+    assert ctx.extero_image_hw == [(H, W), (H, W)]
+    V = 4
+    hist = build_history_tokens(ctx, torch.randn(V, N, state_dim))
+    # FLAT, exactly as the deploy runtime feeds it -- the fold happens inside the model.
+    extero = build_extero_tokens(ctx, torch.randn(V, 2, H * W))
+    assert extero.shape == (V, 2 * H * W)
+    pred = sample_window(ctx, hist, extero, build_cmd_tokens(ctx, torch.randn(V, F, 3)))
+    assert pred.shape == (V, F, state_dim) and torch.isfinite(pred).all()
+
+    # A config that misdescribes the image shape must be refused, not folded anyway --
+    # transposing it keeps every tensor the right size and scrambles every kernel.
+    bad = {**ckpt, "config": {**cfg.to_dict(), "extero_image_hw": [[W, H], [W, H]]}}
+    with pytest.raises(ValueError, match="disagrees with the recorded camera contract"):
+        load_fm_context(bad, device="cpu")
+    # ...and so must a config claiming the other encoder over these weights.
+    stale = {**ckpt, "config": {**cfg.to_dict(), "extero_encoder": "mlp"}}
+    with pytest.raises(ValueError, match="extero_cnn"):
+        load_fm_context(stale, device="cpu")
 
 
 
@@ -820,7 +892,7 @@ def _built(data, meta, F, N=2, **over):
 
 
 def test_history_is_the_applied_reference_not_the_measured_state():
-    """The context tokens come from ``ref_state``, which is the whole point.
+    """The context tokens come from ``history_ref``, which is the whole point.
 
     Conditioning on the measured robot instead would still produce a correctly-shaped
     history and a converging loss -- it would just not be the autoregressive model. Offset
@@ -833,21 +905,22 @@ def test_history_is_the_applied_reference_not_the_measured_state():
 
     base, _ = _built(data, meta, F)
     shifted = {k: v.copy() for k, v in data.items()}
-    a = 13                                        # joint_pos start in the raw node layout
-    shifted["ref_state"][:, a:a + nj] += 0.3      # the APPLIED REFERENCE moves...
-    shifted["ref_future"][:, :, a:a + nj] += 0.3  # ...consistently, since node k IS ref[t+k]
+    a = 13                                           # joint_pos start in the raw node layout
+    shifted["history_ref"][:, :, a:a + nj] += 0.3     # the APPLIED REFERENCE moves...
+    shifted["ref_future"][:, :, a:a + nj] += 0.3     # ...consistently: node 0 IS row H-1
     moved, _ = _built(shifted, meta, F)
 
     assert torch.allclose(moved[..., jp], base[..., jp] + 0.3, atol=1e-4), \
-        "history joints did not follow ref_state -- the history is not the applied reference"
+        "history joints did not follow history_ref -- the history is not the applied reference"
 
 
-def test_history_rows_are_anchored_on_their_own_step():
-    """Each context token uses the robot pose from ITS step, not the snap's.
+def test_history_rows_are_anchored_on_the_plan_not_the_snap():
+    """The context tokens use the PLAN's anchor pose, not the robot at the snap.
 
     This is what lets deploy push back the node it just emitted with no odometry: a row is
-    the window node as it was actually served. Perturbing the measured robot at the snap
-    must therefore leave the earlier history rows untouched while moving the target.
+    the window node in the frame of the plan that produced it. Perturbing the measured
+    robot at the snap row must therefore move the target -- which IS anchored there -- and
+    leave the history rows untouched.
     """
     torch.manual_seed(0)
     data, meta, nj, K, F, _ = _synthetic_recording()
@@ -856,14 +929,12 @@ def test_history_rows_are_anchored_on_their_own_step():
     base_t = ds.state
 
     moved = {k: v.copy() for k, v in data.items()}
-    snaps = data["reanchor_active"].astype(bool)
-    moved["state"] = moved["state"].copy()
-    moved["state"][snaps, 0:3] += 0.05        # only the SNAP rows' measured robot moves
+    moved["history_state"][:, -1, 0:3] += 0.05   # only the SNAP row's measured robot moves
     moved_h, ds2 = _built(moved, meta, F, N=2)
 
     # The target is anchored on the snap robot, so it must move...
     assert not torch.allclose(ds2.state[..., bp], base_t[..., bp], atol=1e-4)
-    # ...while the history rows, anchored on their own (untouched) steps, must not.
+    # ...while the history rows, anchored on the (untouched) plan pose, must not.
     torch.testing.assert_close(moved_h, base_h, atol=1e-5, rtol=1e-5)
 
 
@@ -880,19 +951,20 @@ def test_history_excludes_the_snap_and_abuts_the_target():
 
 
 def test_history_needs_one_more_row_than_it_uses():
-    """The snap row is excluded from the history, so a window spans N+1 recorded steps.
+    """The snap row is excluded from the history, so a window spans N+1 recorded rows.
 
-    (The windowed ``.h5`` path states this as ``H >= N + 1``; the per-step path simply runs
-    out of consecutive rows first -- see ``test_record_windows`` for the ``.h5`` guard.)
+    ``H >= N + 1``: N context rows plus the snap row they precede. Asking for more context
+    than the recording stored has to name the ``--history_len`` to re-record with rather
+    than silently serving a shorter history.
     """
     torch.manual_seed(0)
-    data, meta, _, _, F, _ = _synthetic_recording(L=40, Kstep=4)
-    with pytest.raises(ValueError, match="No valid snap windows"):
+    data, meta, _, _, F, _ = _synthetic_recording(H=4)
+    with pytest.raises(ValueError, match="needs history_len"):
         _built(data, meta, F, N=64)
 
 
 def test_misaligned_reference_ring_is_rejected():
-    """``ref_state[t] != ref_future[t, 0]`` fails loudly rather than skewing the history.
+    """``history_ref[H-1] != ref_future[0]`` fails loudly rather than skewing the history.
 
     An off-by-one between the recorder's applied-reference ring and its look-ahead gather
     is invisible downstream: the shapes are right and the model trains.
@@ -900,9 +972,30 @@ def test_misaligned_reference_ring_is_rejected():
     torch.manual_seed(0)
     data, meta, _, _, F, _ = _synthetic_recording()
     bad = {k: v.copy() for k, v in data.items()}
-    bad["ref_state"] = np.roll(bad["ref_state"], 1, axis=0)
+    # Roll WITHIN each window, so row H-1 is some other step of the same reference -- the
+    # shape stays right and only the alignment breaks, which is the whole point.
+    bad["history_ref"] = np.roll(bad["history_ref"], 1, axis=1)
     with pytest.raises(ValueError, match="history_ref\\[H-1\\] != ref_future\\[0\\]"):
         _built(bad, meta, F)
+
+
+def test_per_step_recording_is_refused():
+    """A per-step (``.npz``) recording cannot build a dataset at all, and must say so.
+
+    The generator conditions on a PLAN-frame history, which only the windowed writer
+    produces, so an absent ``history_anchor`` means the rows are anchored per step --
+    correctly shaped, and describing something the generator is never served. Worth pinning
+    because the guard was added without updating these fixtures, which left every
+    dataset-building test in this package red: a fixture that cannot build is
+    indistinguishable from a fixture that builds the wrong thing unless something asserts
+    which one it is.
+    """
+    torch.manual_seed(0)
+    data, stn, std, frames = per_step_recording(n_ep=3, length=24, nj=4, k=2, future_len=6)
+    meta = SimpleNamespace(state_term_names=stn, state_term_dims=std, state_frame_names=frames,
+                           state_joint_names=[f"j{i}" for i in range(4)], ref_future_len=6)
+    with pytest.raises(ValueError, match="history_anchor"):
+        _built(data, meta, 6)
 
 
 def test_unanchored_future_is_rejected():
@@ -910,9 +1003,9 @@ def test_unanchored_future_is_rejected():
     torch.manual_seed(0)
     data, meta, _, _, F, _ = _synthetic_recording()
     bad = {k: v.copy() for k, v in data.items()}
-    bad["ref_state"] = bad["ref_state"] + 0.0
-    bad["ref_future"] = bad["ref_future"].copy()
-    bad["ref_state"][:, 0:3] += 5.0
+    # Move the reference away from the robot while keeping the ring aligned with the
+    # look-ahead, so the ego-anchor guard is the one that fires rather than guard 3.
+    bad["history_ref"][:, :, 0:3] += 5.0
     bad["ref_future"][:, :, 0:3] += 5.0
     with pytest.raises(ValueError, match="ego-anchored"):
         _built(bad, meta, F)

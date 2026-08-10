@@ -168,9 +168,13 @@ def build_state(
     # tracker observes a scan (spec present) or the FM conditions on one -- NOT merely
     # because the FM has wide exteroception tokens, which a depth FM also has.
     spec = policy._trk.get_height_scan_spec() if hasattr(policy._trk, "get_height_scan_spec") else None
+    # Read the context DIRECTLY, not through getattr-with-a-default. Both context types
+    # (FmContext and _TrackerOnlyCtx) always define these, so the default was never doing
+    # any work -- but it would have silently absorbed the extero rename: a default of 1
+    # makes this False, and the runner would just stop computing state["height_scan"] for a
+    # height-scan FM. An AttributeError is the outcome to want here.
     fm_uses_scan = (
-        getattr(policy.ctx, "extero_source", "height_scan") == "height_scan"
-        and getattr(policy.ctx, "height_dim", 1) > 1
+        policy.ctx.extero_source == "height_scan" and policy.ctx.extero_sensor_dim > 1
     )
     if spec is not None or fm_uses_scan:
         s = spec or {}

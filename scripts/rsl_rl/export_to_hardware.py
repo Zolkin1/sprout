@@ -81,7 +81,7 @@ def describe(policy: GenTrackerPolicy) -> str:
             f"on {c['mount_body']}" for c in spec
         )
     elif policy.needs_height_scan():
-        extero = f"height scan ({policy.ctx.height_dim} rays)"
+        extero = f"height scan ({policy.ctx.extero_sensor_dim} rays)"
     else:
         extero = "none (blind)"
     return (

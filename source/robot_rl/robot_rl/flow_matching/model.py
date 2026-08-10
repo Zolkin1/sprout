@@ -5,23 +5,35 @@
 One transformer (encoder-only, full self-attention) operates on a single token
 sequence assembled from four streams::
 
-    [ history(N) | extero(T) | cmd(Ncmd) | future(F) ]
+    [ history(N) | extero(T*S) | cmd(Ncmd) | future(F) ]
 
 - **history**: ``N`` real-robot-state steps (the recent past, in the xyz+yaw ground
   frame at the anchor = step ``N-1``). Pure conditioning, never noised. Its only job
   is to supply *phase*. Embedded by its own ``history_in`` MLP + a learned
   ``hist_type``. A learned ``null_history`` embedding replaces the history content
   when ``history_null_mask`` is set (classifier-free-guidance / phase-agnostic mode).
-- **extero**: ``T`` exteroception tokens of ``height_dim`` values each, through one
-  shared ``height_in`` + ``height_type`` (+ a per-token ``extero_id`` when T > 1). Pure
-  conditioning. T=1 is the pelvis height scan; T=2 is one token per depth camera.
+- **extero**: ``T`` sensor readings of ``extero_sensor_dim`` values each, becoming ``S``
+  tokens apiece (so ``T*S`` in the sequence), all carrying ``extero_type`` plus a
+  per-sensor ``extero_id`` when T > 1. Pure conditioning. Two encoders:
+
+  * ``extero_encoder="mlp"`` -- ``S = 1``, one token per reading through a shared
+    ``extero_in`` MLP. The height scan's only option (T=1, 176 rays), and the A/B
+    baseline for the cameras.
+  * ``extero_encoder="cnn"`` -- ``S`` = a conv grid's cells (16 on the 30x26 pair), one
+    trunk PER CAMERA, each cell also carrying a learned spatial-slot embedding. The flat
+    path is permutation-invariant over pixels, so nothing in it can attend to WHERE in a
+    frame a step edge is -- which is the shape of the measured registration failure
+    (``scripts/rsl_rl/fm_registration_probe.py``). See
+    :mod:`~robot_rl.flow_matching.extero_encoder`.
+
 - **cmd**: the strided future velocity-command profile, via ``cmd_in`` + ``cmd_type``,
   each token positioned at its future timestep. Pure conditioning.
 - **future**: the ``F`` state tokens the flow denoises -- ALL future (no past echo).
 
 State/history/cmd tokens carry a sinusoidal positional encoding over a ``N + F``
-timeline (history at ``0..N-1``, future at ``N..N+F-1``, each cmd at ``N + its step``);
-the extero tokens are global (no positional encoding). Flow-time ``tau`` is a sinusoidal
+timeline (history at ``0..N-1``, future at ``N..N+F-1``, each cmd at ``N + its step``).
+The extero tokens carry no TIMELINE position -- the reading is "now" -- though under the
+CNN they do carry a spatial one within their frame. Flow-time ``tau`` is a sinusoidal
 embedding through a small MLP, added to every token. The head reads only the trailing
 ``F`` future-token outputs and predicts the flow vector field. There is NO inpainting /
 known-mask: the conditioning is separate tokens, not held-clean slots of the denoised
@@ -31,9 +43,12 @@ window.
 from __future__ import annotations
 
 import math
+from typing import Sequence
 
 import torch
 import torch.nn as nn
+
+from .extero_encoder import ExteroImageEncoderSet
 
 
 def _sinusoidal_positional_encoding(seq_len: int, d_model: int) -> torch.Tensor:
@@ -87,9 +102,9 @@ class FlowMatchingTransformer(nn.Module):
         future_len: Future window length ``F`` (number of denoised state tokens).
         num_history_states: Number of history (phase) conditioning tokens ``N``.
         history_dim: Per-step history-token width (defaults to ``state_dim``).
-        height_dim: Width of ONE exteroception token (176 = height-scan rays,
+        extero_sensor_dim: Width of ONE exteroception token (176 = height-scan rays,
             780 = one depth image).
-        extero_tokens: Number of exteroception tokens (1 = height scan, 2 = both cameras).
+        extero_sensor_count: Number of exteroception tokens (1 = height scan, 2 = both cameras).
         cmd_dim: Per-step command width; ``0`` disables command conditioning.
         cmd_stride: Keep every ``cmd_stride``-th step of the command profile as a token.
         d_model: Transformer hidden dimension.
@@ -105,8 +120,8 @@ class FlowMatchingTransformer(nn.Module):
         future_len: int,
         num_history_states: int = 2,
         history_dim: int | None = None,
-        height_dim: int = 1,
-        extero_tokens: int = 1,
+        extero_sensor_dim: int = 1,
+        extero_sensor_count: int = 1,
         cmd_dim: int = 0,
         cmd_stride: int = 5,
         d_model: int = 256,
@@ -114,6 +129,10 @@ class FlowMatchingTransformer(nn.Module):
         num_layers: int = 4,
         dim_feedforward: int = 512,
         dropout: float = 0.0,
+        extero_encoder: str = "mlp",
+        extero_image_hw: Sequence[Sequence[int]] | None = None,
+        extero_cnn_channels: Sequence[int] = (16, 32, 64),
+        extero_cnn_grid: Sequence[int] | None = None,
     ):
         super().__init__()
         self.d_model = d_model
@@ -121,8 +140,9 @@ class FlowMatchingTransformer(nn.Module):
         self.future_len = future_len
         self.num_history_states = num_history_states
         self.history_dim = history_dim if history_dim is not None else state_dim
-        self.height_dim = height_dim
-        self.extero_tokens = extero_tokens
+        self.extero_sensor_dim = extero_sensor_dim
+        self.extero_sensor_count = extero_sensor_count
+        self.extero_encoder = str(extero_encoder)
         self.cmd_dim = cmd_dim
         self.cmd_stride = cmd_stride
 
@@ -132,17 +152,54 @@ class FlowMatchingTransformer(nn.Module):
         self.history_in = _token_mlp(self.history_dim, d_model)
         self.hist_type = nn.Parameter(torch.zeros(1, 1, d_model))
         self.null_history = nn.Parameter(torch.zeros(1, 1, d_model))
-        # Exteroception conditioning: ``extero_tokens`` tokens of ``height_dim`` values
-        # each, through ONE shared MLP.  The height scan is the T=1 case (176 rays -> one
-        # token); depth cameras are T=2 (one 780-value image per camera), so attention can
-        # weight near against far instead of squeezing both through a single token.
-        self.height_in = _token_mlp(height_dim, d_model)
-        self.height_type = nn.Parameter(torch.zeros(1, 1, d_model))
-        # Per-token id, so tokens sharing the type embedding are still distinguishable.
-        # Only created for T > 1: at T=1 the parameter set stays exactly as it was, so
-        # existing height-scan checkpoints load unchanged.
+        # Exteroception conditioning, one of two shapes -- never both, so a state dict cannot
+        # load into the wrong one:
+        #
+        #   "mlp" -- ONE token per sensor through a shared 2-layer MLP. The height scan's
+        #            only option (176 rays -> one token), and the A/B baseline for depth.
+        #   "cnn" -- a conv trunk PER CAMERA emitting a grid of tokens, so attention can
+        #            weight "under the foot" against "two metres ahead" inside one frame.
+        #            The flat path cannot: it is permutation-invariant over pixels.
+        if self.extero_encoder == "cnn":
+            if not extero_image_hw:
+                raise ValueError(
+                    "extero_encoder='cnn' needs extero_image_hw (one (H, W) per sensor); the "
+                    "dataset derives it from the recording's depth_camera_spec. The height "
+                    "scan has no image shape in an FM recording -- use 'mlp' for it."
+                )
+            shapes = [(int(h), int(w)) for h, w in extero_image_hw]
+            if len(shapes) != extero_sensor_count:
+                raise ValueError(
+                    f"extero_image_hw has {len(shapes)} shape(s) but extero_sensor_count="
+                    f"{extero_sensor_count}."
+                )
+            bad = [hw for hw in shapes if hw[0] * hw[1] != extero_sensor_dim]
+            if bad:
+                raise ValueError(
+                    f"extero_image_hw {bad} does not unfold the {extero_sensor_dim}-wide "
+                    "sensor row."
+                )
+            self.extero_in = None
+            self.extero_cnn = ExteroImageEncoderSet(
+                shapes, d_model, extero_cnn_channels,
+                None if extero_cnn_grid is None else (int(extero_cnn_grid[0]),
+                                                      int(extero_cnn_grid[1])),
+            )
+            self.tokens_per_sensor = int(self.extero_cnn.tokens_per_sensor)
+        elif self.extero_encoder == "mlp":
+            self.extero_in = _token_mlp(extero_sensor_dim, d_model)
+            self.extero_cnn = None
+            self.tokens_per_sensor = 1
+        else:
+            raise ValueError(f"unknown extero_encoder {self.extero_encoder!r}.")
+        self.extero_type = nn.Parameter(torch.zeros(1, 1, d_model))
+        # Per-SENSOR id, so a camera's tokens are distinguishable from the other camera's
+        # (under the CNN it is shared by all of that camera's grid slots -- the slot
+        # embedding separates those). Only created for T > 1: at T=1 the parameter set stays
+        # exactly as it was, so existing height-scan checkpoints load unchanged.
         self.extero_id = (
-            nn.Parameter(torch.zeros(1, extero_tokens, d_model)) if extero_tokens > 1 else None
+            nn.Parameter(torch.zeros(1, extero_sensor_count, d_model))
+            if extero_sensor_count > 1 else None
         )
 
         if cmd_dim > 0:
@@ -161,7 +218,9 @@ class FlowMatchingTransformer(nn.Module):
             nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
         )
         # Timeline of length N + F: history at 0..N-1, future at N..N+F-1, each cmd
-        # token at N + (its future step). The extero tokens are global (no position).
+        # token at N + (its future step). The extero tokens carry no TIMELINE position (the
+        # reading is "now"); under the CNN they do carry a learned SPATIAL one, inside the
+        # encoder.
         self.register_buffer("pos", _sinusoidal_positional_encoding(num_history_states + future_len, d_model))
 
         encoder_layer = nn.TransformerEncoderLayer(
@@ -171,12 +230,28 @@ class FlowMatchingTransformer(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers)
         self.output_head = nn.Linear(d_model, state_dim)
 
+    @property
+    def extero_seq_tokens(self) -> int:
+        """Exteroception tokens in the SEQUENCE (sensors x tokens per sensor).
+
+        Deliberately not called ``extero_sensor_count``: that is how many physical readings
+        there are, and the deploy-side camera checks read it. The two were one number back
+        when a reading was necessarily one token.
+        """
+        return int(self.extero_sensor_count) * int(self.tokens_per_sensor)
+
+    @property
+    def sequence_len(self) -> int:
+        """Total token count the transformer sees."""
+        return (int(self.num_history_states) + self.extero_seq_tokens
+                + int(self.cmd_steps.numel()) + int(self.future_len))
+
     def forward(
         self,
         x_tau: torch.Tensor,
         tau: torch.Tensor,
         history: torch.Tensor,
-        height: torch.Tensor,
+        extero: torch.Tensor,
         cmd_tokens: torch.Tensor | None = None,
         history_null_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -187,8 +262,8 @@ class FlowMatchingTransformer(nn.Module):
                 shape ``(B, F, state_dim)``.
             tau: Flow time in ``[0, 1]``, shape ``(B,)``.
             history: Clean history (phase) conditioning, shape ``(B, N, history_dim)``.
-            height: Exteroception conditioning, shape ``(B, T, height_dim)``,
-                ``(B, T*height_dim)`` or ``(B,)``.
+            extero: Exteroception conditioning, shape ``(B, T, extero_sensor_dim)``,
+                ``(B, T*extero_sensor_dim)`` or ``(B,)``.
             cmd_tokens: Strided future command tokens (normalized), shape
                 ``(B, num_cmd_tokens, cmd_dim)``. Required when built with
                 ``cmd_dim > 0``; ignored otherwise.
@@ -209,12 +284,22 @@ class FlowMatchingTransformer(nn.Module):
             h_content = torch.where(nm, self.null_history.expand(b, n, self.d_model), h_content)
         h = h_content + self.pos[:, :n, :] + self.hist_type  # (B, N, d_model)
 
-        # Exteroception tokens (global; no positional encoding). Accepts (B, T*dim),
-        # (B, dim) or (B,) -- all reshape to (B, T, dim).
-        ht = self.height_in(height.view(b, self.extero_tokens, self.height_dim))
-        ht = ht + self.height_type                                    # (B, T, d_model)
+        # Exteroception tokens. No TIMELINE position -- the reading is "now" -- so the only
+        # identity they carry is the type, the per-sensor id and (CNN) the spatial slot.
+        # Accepts (B, T*dim), (B, dim) or (B,); all reshape to (B, T, dim).
+        #
+        # Both encoders are put through ONE set of identity adds by giving the MLP a
+        # length-1 slot axis. On that path the adds are (1,1,1,d) and (1,T,1,d) broadcasts
+        # followed by a reshape back to (B, T, d), so it stays numerically identical to the
+        # pre-CNN code and the trained baseline's outputs remain bit-comparable.
+        ev = extero.reshape(b, self.extero_sensor_count, self.extero_sensor_dim)
+        et = (self.extero_cnn(ev) if self.extero_cnn is not None
+              else self.extero_in(ev).unsqueeze(2))        # (B, T, S, d_model); S=1 for mlp
+        et = et + self.extero_type.unsqueeze(1)            # (1, 1, 1, d_model)
         if self.extero_id is not None:
-            ht = ht + self.extero_id
+            et = et + self.extero_id.unsqueeze(2)          # (1, T, 1, d) -> every slot of a cam
+        # Camera-major, slot-minor -- the order ``extero_id``/``spatial`` were added in.
+        ht = et.reshape(b, self.extero_seq_tokens, self.d_model)
 
         # Future (denoised) state tokens, positioned at N..N+F-1.
         s = self.state_in(x_tau) + self.pos[:, n:n + f, :]  # (B, F, d_model)

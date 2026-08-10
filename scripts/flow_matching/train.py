@@ -43,6 +43,7 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
     FlowMatchingConfig,
+    EXTERO_ENCODERS,
     EXTERO_SOURCES,
     FlowMatchingTransformer,
     FutureStateDataset,
@@ -108,6 +109,37 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "A/B over one recording. 'depth' is the deployable choice on a "
                              "robot with cameras and no heightmap; the tracker it is paired "
                              "with must agree (checked at load in deploy/gen_tracker.py).")
+    parser.add_argument(
+        "--extero_encoder", type=str, default=FlowMatchingConfig().extero_encoder,
+        choices=["auto", *EXTERO_ENCODERS],
+        help="How ONE exteroception reading becomes transformer tokens. 'cnn' = a 3-layer "
+             "stride-2 conv trunk PER CAMERA, so each camera contributes a grid of tokens "
+             "(16 on the 30x26 pair) each carrying a learned spatial slot -- the flat "
+             "alternative is permutation-invariant over pixels, so nothing in the model can "
+             "attend to WHERE in the frame a step edge is. 'mlp' = the original one token "
+             "per reading, the only option for --extero_source height_scan and the A/B "
+             "baseline. 'auto' picks by source (depth -> cnn, scan -> mlp).")
+    parser.add_argument(
+        "--extero_cnn_channels", type=str,
+        default=",".join(str(c) for c in FlowMatchingConfig().extero_cnn_channels),
+        help="Comma-separated output channels per stride-2 convolution; the COUNT sets the "
+             "depth, so it sets how many times the image is halved. Three entries take "
+             "26x30 to 4x4; a fourth reaches 2x2 natively, which is the cheaper way to "
+             "shrink the sequence (pooling pays for the resolution and then discards it).")
+    parser.add_argument(
+        "--extero_cnn_grid", type=str, default="",
+        help="Optional 'gh,gw' to average-pool the conv trunk down to, i.e. tokens per "
+             "camera. Empty keeps the trunk's native grid. This is the knob that separates "
+             "'a CNN beats an MLP' from '16 tokens beat 1': '1,1' gives the legacy token "
+             "count through a conv trunk.")
+    parser.add_argument(
+        "--extero_norm_mode", type=str, default=FlowMatchingConfig().extero_norm_mode,
+        choices=["per_element", "per_sensor"],
+        help="How the exteroception normalizer is FIT. 'per_element' is one (mean, std) per "
+             "pixel -- the original behaviour, and a spatially VARYING transform, which is "
+             "what a convolution's weight sharing assumes away. 'per_sensor' pools one "
+             "(mean, std) per camera and broadcasts it, so the same edge looks the same "
+             "wherever it sits. Irrelevant to --extero_encoder mlp.")
     parser.add_argument(
         "--reference_blocks", type=str, default=None,
         help="Comma-separated reference-window blocks the generator predicts, out of "
@@ -279,6 +311,11 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
+        extero_encoder=args.extero_encoder,
+        extero_cnn_channels=[int(c) for c in args.extero_cnn_channels.split(",") if c.strip()],
+        extero_cnn_grid=([int(g) for g in args.extero_cnn_grid.split(",") if g.strip()]
+                         or None),
+        extero_norm_mode=args.extero_norm_mode,
     )
     return cfg, args
 
@@ -399,10 +436,10 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
     for batch in loader:
         state = batch["state"].to(device)
         history = batch["history"].to(device)
-        height = batch["height"].to(device)
+        extero = batch["extero"].to(device)
         cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
         b = state.shape[0]
-        cond_out = flow_matching_loss(model, state, history, height, cmd_tokens,
+        cond_out = flow_matching_loss(model, state, history, extero, cmd_tokens,
                                       state_norm=state_normalizer, **ckw)
         flow_sum += cond_out["flow_mse"].item()
         for k in _CONS_KEYS:
@@ -410,11 +447,11 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
                 cons_sums[k] = cons_sums.get(k, 0.0) + cond_out[k].item()
         null_mask = torch.ones(b, dtype=torch.bool, device=device)
         flow_null_sum += flow_matching_loss(
-            model, state, history, height, cmd_tokens, history_null_mask=null_mask
+            model, state, history, extero, cmd_tokens, history_null_mask=null_mask
         )["flow_mse"].item()
         n_batches += 1
         pred = sample_trajectory(
-            model, history, height, cmd_tokens, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
+            model, history, extero, cmd_tokens, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
         )
         pred_full = state_normalizer.denormalize(pred)
         tgt_d = state_normalizer.denormalize(state)
@@ -491,10 +528,22 @@ def main() -> None:
           "must pack exactly these.")
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"cmd_dim={cfg.cmd_dim}, num_cmd_tokens={cfg.num_cmd_tokens}, "
-          f"extero={cfg.extero_source} ({cfg.extero_tokens}x{cfg.height_dim}), "
+          f"extero={cfg.extero_source} ({cfg.extero_sensor_count}x{cfg.extero_sensor_dim}), "
           f"F={cfg.future_len}, N={cfg.num_history_states}, "
           f"null_cond_prob={cfg.null_cond_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
+    # The exteroception embedding and, from it, the SEQUENCE LENGTH -- which nothing printed
+    # before and which is what the transformer's cost actually scales with.
+    shapes = (", ".join(f"{h}x{w}" for h, w in (train_ds.extero_image_hw or []))
+              or "(no image shape)")
+    detail = (f"grid={tuple(cfg.extero_cnn_grid) if cfg.extero_cnn_grid else 'native'}, "
+              f"channels={list(cfg.extero_cnn_channels)}, images {shapes}, "
+              if cfg.extero_encoder == "cnn" else "")
+    print(f"[INFO] extero_encoder={cfg.extero_encoder} ({detail}"
+          f"{cfg.tokens_per_sensor} token(s)/sensor -> {cfg.extero_seq_tokens} extero "
+          f"tokens), extero_norm_mode={cfg.extero_norm_mode}; SEQUENCE LENGTH "
+          f"{cfg.sequence_len} = {cfg.num_history_states} history + {cfg.extero_seq_tokens} "
+          f"extero + {cfg.num_cmd_tokens} cmd + {cfg.future_len} future.")
     if cfg.obs_noise:
         # Only the keys feeding a SELECTED block -- the others are not in the window and
         # so are not applied, and printing them would suggest otherwise.
@@ -564,17 +613,24 @@ def main() -> None:
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=cfg.future_len,
         num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, extero_tokens=cfg.extero_tokens, cmd_dim=cfg.cmd_dim,
+        extero_sensor_dim=cfg.extero_sensor_dim,
+        extero_sensor_count=cfg.extero_sensor_count, cmd_dim=cfg.cmd_dim,
         cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
+        # ``cfg.extero_encoder`` is already RESOLVED (the dataset wrote "auto" out), and
+        # ``extero_image_hw`` was derived from the recording's camera contract there.
+        extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
+        extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
     ).to(device)
+    extero_params = sum(p.numel() for n, p in model.named_parameters() if "extero" in n)
     print(f"[INFO] Model parameters: {sum(p.numel() for p in model.parameters()):,}  "
-          f"(command conditioning: {'on' if cfg.cmd_dim > 0 else 'off'})")
+          f"(exteroception branch: {extero_params:,}; "
+          f"command conditioning: {'on' if cfg.cmd_dim > 0 else 'off'})")
 
     # Normalizers are fit on CPU; move their stats to the model device so
     # (de)normalization during evaluation/sampling stays on one device.
     train_ds.state_normalizer.to(device)
-    train_ds.height_normalizer.to(device)
+    train_ds.extero_normalizer.to(device)
     if train_ds.cmd_normalizer is not None:
         train_ds.cmd_normalizer.to(device)
 
@@ -643,13 +699,13 @@ def main() -> None:
         for batch in train_loader:
             state = batch["state"].to(device)
             history = batch["history"].to(device)
-            height = batch["height"].to(device)
+            extero = batch["extero"].to(device)
             cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
             # Per-sample history null-out (classifier-free guidance / phase-agnostic).
             null_mask = torch.rand(state.shape[0], device=device) < cfg.null_cond_prob
             opt.zero_grad()
             out = flow_matching_loss(
-                model, state, history, height, cmd_tokens,
+                model, state, history, extero, cmd_tokens,
                 history_null_mask=null_mask,
                 state_norm=train_ds.state_normalizer,
                 **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk, body_fk),
@@ -807,7 +863,7 @@ def _build_eval_dataset(eval_path: str, cfg, train_ds) -> FutureStateDataset:
         data, meta, cfg, windows,
         state_normalizer=train_ds.state_normalizer,
         cmd_normalizer=train_ds.cmd_normalizer,
-        height_normalizer=train_ds.height_normalizer,
+        extero_normalizer=train_ds.extero_normalizer,
     )
     got = (ds.state_dim, ds.cmd_dim, ds.num_extra_frames)
     want = (train_ds.state_dim, train_ds.cmd_dim, train_ds.num_extra_frames)
@@ -836,7 +892,7 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
     """
     meta_dict = dict(asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta))
     meta_dict["target_frame_names"] = list(train_ds.target_frame_names)
-    # The contract of the sensor this model ACTUALLY conditions on (None for the height
+    # The contract of the sensor this model ACTUALLY conditions on (None for the extero
     # scan). Distinct from the recording's ``depth_camera_spec``, which is present
     # whenever the cameras were recorded even if this model trained on the scan instead.
     meta_dict["extero_spec"] = train_ds.extero_spec
@@ -845,7 +901,7 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
         "optimizer": opt.state_dict(),
         "config": cfg.to_dict(),
         "state_normalizer": train_ds.state_normalizer.state_dict(),
-        "height_normalizer": train_ds.height_normalizer.state_dict(),
+        "extero_normalizer": train_ds.extero_normalizer.state_dict(),
         "num_joints": train_ds.num_joints,
         "meta": meta_dict,
         "data_path": data_path,

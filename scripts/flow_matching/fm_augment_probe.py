@@ -120,7 +120,7 @@ def main() -> None:
     ds = FutureStateDataset(combo, meta, cfg, np.arange(1 + len(a_rows)),
                             state_normalizer=ctx.state_norm,
                             cmd_normalizer=getattr(ctx, "cmd_norm", None),
-                            height_normalizer=getattr(ctx, "height_norm", None))
+                            extero_normalizer=getattr(ctx, "extero_norm", None))
     pos = ds.block_slices["base_pose"]
     pos = slice(pos.start, pos.start + 3)
 
@@ -129,7 +129,7 @@ def main() -> None:
         item = ds[k]
         torch.manual_seed(args.seed)          # same noise draw for every row: the conditioning
         p = sample_trajectory(                # is the only thing allowed to differ
-            model, item["history"][None].to(dev), item["height"][None].to(dev),
+            model, item["history"][None].to(dev), item["extero"][None].to(dev),
             item["cmd_tokens"][None].to(dev) if "cmd_tokens" in item else None,
             cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
         )

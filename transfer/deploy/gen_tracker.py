@@ -91,10 +91,15 @@ class _TrackerOnlyCtx:
         self.F = 1                          # prediction horizon (unused without FM)
         self.D = 0
         self.cmd_dim = 0
-        self.height_dim = 1                 # exteroception conditioning (unused without FM)
+        self.extero_sensor_dim = 1                 # exteroception conditioning (unused without FM)
         self.extero_source = "height_scan"
-        self.extero_tokens = 1
+        self.extero_sensor_count = 1
         self.extero_spec: list[dict] = []
+        # Kept in lockstep with FmContext so the clip-only path reads the same attributes
+        # (an empty image list means "no convolutional fold to check").
+        self.extero_encoder = "mlp"
+        self.extero_image_hw: list[tuple[int, int]] = []
+        self.extero_tokens_per_sensor = 1
 
 
 class GenTrackerPolicy:
@@ -267,26 +272,40 @@ class GenTrackerPolicy:
                     "depth_camera_spec, so the deployment cannot reproduce its cameras. "
                     "Re-export the FM (its recording must have one) or the tracker."
                 )
-            if len(self._depth_spec) != self.ctx.extero_tokens:
+            if len(self._depth_spec) != self.ctx.extero_sensor_count:
                 raise ValueError(
-                    f"fm.onnx expects {self.ctx.extero_tokens} depth token(s) but the "
-                    f"camera contract lists {len(self._depth_spec)} camera(s)."
+                    f"fm.onnx expects {self.ctx.extero_sensor_count} depth sensor row(s) but "
+                    f"the camera contract lists {len(self._depth_spec)} camera(s)."
                 )
             for cam in self._depth_spec:
                 pixels = int(cam["width"]) * int(cam["height"])
-                if pixels != self.ctx.height_dim:
+                if pixels != self.ctx.extero_sensor_dim:
                     raise ValueError(
                         f"camera '{cam.get('sensor')}' is {cam['width']}x{cam['height']} "
-                        f"= {pixels} pixels but fm.onnx's token is "
-                        f"{self.ctx.height_dim} wide."
+                        f"= {pixels} pixels but fm.onnx's sensor row is "
+                        f"{self.ctx.extero_sensor_dim} wide."
+                    )
+            # And when the graph folds those pixels into an IMAGE, the pixel count is no
+            # longer enough: 30x26 and 26x30 pass the check above and are different images.
+            # Only a convolutional graph carries extero_image_hw, and only it can be hurt.
+            for cam, (h, w) in zip(self._depth_spec, self.ctx.extero_image_hw):
+                if (int(cam["height"]), int(cam["width"])) != (h, w):
+                    raise ValueError(
+                        f"camera '{cam.get('sensor')}' is {cam['height']}x{cam['width']} (HxW) "
+                        f"but fm.onnx folds its rows as {h}x{w}. The generator's exteroception "
+                        "encoder is convolutional, so a transposed image is scrambled input, "
+                        "not a reordered vector -- re-export the FM from a matching recording."
                     )
         if self._depth_spec:
             where = "tracker.onnx" if tracker_spec else "fm.onnx"
+            fold = (f", folded {self.ctx.extero_image_hw[0][0]}x{self.ctx.extero_image_hw[0][1]} "
+                    f"-> {self.ctx.extero_tokens_per_sensor} token(s)/camera by the "
+                    f"{self.ctx.extero_encoder} encoder" if self.ctx.extero_image_hw else "")
             print(f"[INFO GenTrackerPolicy] depth cameras (from {where}): "
                   + ", ".join(
                       f"{c.get('sensor', c['obs_term'])} {c['width']}x{c['height']} "
                       f"on {c['mount_body']}" for c in self._depth_spec
-                  ))
+                  ) + fold)
 
     def get_depth_camera_spec(self) -> list[dict]:
         """The resolved depth-camera contract (empty when the policy has no cameras).
@@ -334,7 +353,7 @@ class GenTrackerPolicy:
         """
         if any(term["name"] == "height_scan" for term in self.get_obs_terms()):
             return True
-        return self.ctx.extero_source == "height_scan" and self.ctx.height_dim > 1
+        return self.ctx.extero_source == "height_scan" and self.ctx.extero_sensor_dim > 1
 
     def _tracker_only_ctx(self) -> _TrackerOnlyCtx:
         """Build a minimal FM-context stand-in from the tracker metadata (no generator).
@@ -625,9 +644,9 @@ class GenTrackerPolicy:
         # (already normalised, matching mdp.depth_obs_stack); the height scan is one token
         # of per-ray clearance. Matches how each is recorded and used in the RL obs.
         if ctx.extero_source == "depth":
-            height = build_extero_tokens(ctx, np.asarray(state["depth"], dtype=np.float64)[None])
+            extero = build_extero_tokens(ctx, np.asarray(state["depth"], dtype=np.float64)[None])
         else:
-            height = build_extero_tokens(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
+            extero = build_extero_tokens(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
         if self._future_cmd_override is not None:
             # Actual future-command horizon (clip->FM handoff) -- matches IsaacLab's
             # get_command_velocity_horizon. Without it the deploy holds the current
@@ -640,7 +659,7 @@ class GenTrackerPolicy:
         noise = self._sample_noise()
 
         t0 = time.perf_counter()
-        self._pred = sample_window(ctx, history, height, cmd_tokens, noise,
+        self._pred = sample_window(ctx, history, extero, cmd_tokens, noise,
                                    history_null=np.array([bool(history_null)]))
         infer_s = time.perf_counter() - t0
         self._fm_infer_s += infer_s
@@ -655,7 +674,10 @@ class GenTrackerPolicy:
             "ctrl_step": self._ctrl_step,
             "history_nodes": nodes,
             "history_cmd": cmd,
-            "extero_tokens": height,
+            # The token ARRAY, not a count -- and the name ``FmPlan.msg`` already uses for
+            # it. Distinct from ``ctx.extero_sensor_count`` (how many sensors there are),
+            # which is why that one got renamed and this one did not.
+            "extero_tokens": extero,
             "cmd_tokens": cmd_tokens,
             "history_null": bool(history_null),
             "infer_s": infer_s,
@@ -850,7 +872,7 @@ class GenTrackerPolicy:
             ``None`` before the first sample (and in tracker-only mode, where there is no
             generator at all); otherwise a dict with ``plan_id``, ``ctrl_step``,
             ``history_nodes`` ``(1, N, D)``, ``history_cmd`` ``(1, N, cmd_dim)``,
-            ``extero_tokens``, ``cmd_tokens``, ``history_null`` and ``infer_s``. The output
+            ``extero_sensor_count``, ``cmd_tokens``, ``history_null`` and ``infer_s``. The output
             window itself is :attr:`_pred`, exposed via :meth:`predicted_window`.
         """
         return self._last_plan

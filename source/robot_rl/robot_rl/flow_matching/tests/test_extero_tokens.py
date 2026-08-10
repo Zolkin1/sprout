@@ -18,7 +18,10 @@ import torch
 
 from robot_rl.flow_matching.config import EXTERO_SOURCES, FlowMatchingConfig
 from robot_rl.flow_matching.dataset import build_train_val
-from robot_rl.flow_matching.tests.recording_fixtures import per_step_recording
+from robot_rl.flow_matching.tests.recording_fixtures import (
+    camera_spec as _camera_spec,
+    windowed_recording,
+)
 from robot_rl.flow_matching.model import FlowMatchingTransformer
 from robot_rl.flow_matching.transforms import (
     DEPTH_CLIP,
@@ -27,80 +30,44 @@ from robot_rl.flow_matching.transforms import (
 )
 
 
-def _camera_spec(n_cameras: int, token_dim: int) -> list[dict]:
-    """A minimal depth-camera contract matching a ``(n_cameras, token_dim)`` depth array.
-
-    Field set and values mirror :func:`mdp.depth_camera_specs` (the real producer) closely
-    enough to satisfy both the dataset's validation and
-    ``deploy.depth_obs.parse_depth_spec``, so a spec built here would survive the real
-    export -> deploy path.
-
-    The GEOMETRY is a placeholder: ``token_dim x 1`` pixels with unit intrinsics, chosen
-    only so ``width * height == token_dim`` for any ``token_dim`` these tests pick.  They
-    exercise token plumbing (counts, widths, source selection, sanitising), not camera
-    reproduction -- nothing here asserts the numbers describe a real camera.
-
-    Args:
-        n_cameras: Number of cameras, one per depth token.
-        token_dim: Per-camera token width (pixels).
-
-    Returns:
-        One contract dict per camera, in token order.
-    """
-    return [
-        {
-            "obs_term": f"depth_cam{i}",
-            "sensor": f"cam{i}",
-            "mount_body": "torso_link",
-            "offset_pos": [0.0, 0.0, 0.0],
-            "offset_quat_xyzw": [0.0, 0.0, 0.0, 1.0],
-            "width": token_dim,
-            "height": 1,
-            "fx": 1.0,
-            "fy": 1.0,
-            "cx": token_dim / 2.0,
-            "cy": 0.5,
-            "max_distance": 9.0,
-            "update_period": 0.0,
-            "data_type": "distance_to_image_plane",
-            "depth_clipping_behavior": "max",
-            "clip": None,
-            # normalize_depth's defaults, as _normalization_params would resolve them.
-            "offset": 0.75,
-            "scale": 0.5,
-            "min_dist": 0.2,
-            "max_dist": 9.0,
-            "min_clip_val": 0.0,
-            "max_clip_val": 0.0,
-        }
-        for i in range(n_cameras)
-    ]
 
 
-def _synthetic_recording(n_ep=3, L=24, nj=4, K=2, F=6, Ksc=7, Kstep=4, depth=None, seed=0):
-    """Synthetic recording with a height scan and optionally a depth array.
+def _synthetic_recording(n_ep=3, W_ep=5, nj=4, K=2, F=6, H=4, Ksc=7, depth=None, seed=0):
+    """Windowed synthetic recording with a height scan and optionally a depth array.
 
     Delegates the trajectory itself to the shared fixture builder -- the dataset validates
     the recording now, so it has to be a plausible rollout (see
     :mod:`~robot_rl.flow_matching.tests.recording_fixtures`).
 
     Args:
-        depth: ``(num_cameras, per_camera_dim)`` to add a ``depth`` array, or ``None``.
+        n_ep: Episodes (the val split is drawn over these).
+        W_ep: Snap windows per episode.
+        nj: Joint count.
+        K: Extra (ee) frame count.
+        F: Future window length.
+        H: History rows per window.
+        Ksc: Height-scan ray count.
+        depth: ``(num_cameras, height, width)`` to add a ``depth`` array, or ``None``.
+        seed: RNG seed.
 
     Returns:
         ``(data, meta, nj, K, F, node_dim)``.
     """
-    data, stn, std, frames = per_step_recording(
-        n_ep=n_ep, length=L, nj=nj, k=K, future_len=F, snap_every=Kstep,
+    data, stn, std, frames = windowed_recording(
+        n_ep=n_ep, windows_per_ep=W_ep, history_len=H, future_len=F, nj=nj, k=K,
         num_scan_rays=Ksc, depth=depth, seed=seed,
     )
     meta = SimpleNamespace(state_term_names=stn, state_term_dims=std, state_frame_names=frames,
                            state_joint_names=[f"j{i}" for i in range(nj)], ref_future_len=F,
+                           # The dataset REQUIRES this: the generator conditions on a
+                           # plan-frame history, and an absent field means a per-step
+                           # recording, which it refuses outright.
+                           history_anchor="plan", history_len=H,
                            # Present only alongside a depth array, exactly as the recorder
                            # behaves -- so the depth=None case still fails on the MISSING
                            # ARRAY (what test_missing_array_names_the_task_to_record_with
                            # pins) rather than on the missing contract.
-                           depth_camera_spec=_camera_spec(depth[0], depth[1]) if depth else None)
+                           depth_camera_spec=_camera_spec(*depth) if depth else None)
     return data, meta, nj, K, F, sum(std)
 
 
@@ -141,10 +108,10 @@ def test_unknown_source_is_rejected():
 def test_old_checkpoint_config_still_loads():
     """A config dict predating the selector resolves to the height-scan path."""
     d = FlowMatchingConfig().to_dict()
-    for k in ("extero_source", "extero_tokens", "noise_depth"):
+    for k in ("extero_source", "extero_sensor_count", "noise_depth"):
         d.pop(k, None)
     cfg = FlowMatchingConfig.from_dict(d)
-    assert cfg.extero_source == "height_scan" and cfg.extero_tokens == 1
+    assert cfg.extero_source == "height_scan" and cfg.extero_sensor_count == 1
 
 
 def test_terrain_penetration_loss_is_gone():
@@ -201,8 +168,8 @@ def test_unknown_source_has_no_clip_band():
 def test_single_token_model_has_no_extra_parameters():
     """T=1 must keep the exact parameter set so height-scan checkpoints load."""
     common = dict(state_dim=12, future_len=6, num_history_states=2, cmd_dim=3)
-    m1 = FlowMatchingTransformer(height_dim=176, extero_tokens=1, **common)
-    m2 = FlowMatchingTransformer(height_dim=780, extero_tokens=2, **common)
+    m1 = FlowMatchingTransformer(extero_sensor_dim=176, extero_sensor_count=1, **common)
+    m2 = FlowMatchingTransformer(extero_sensor_dim=780, extero_sensor_count=2, **common)
     k1 = set(dict(m1.named_parameters()))
     k2 = set(dict(m2.named_parameters()))
     assert not any("extero_id" in k for k in k1)
@@ -213,7 +180,7 @@ def test_single_token_model_has_no_extra_parameters():
 def test_forward_accepts_flat_and_token_shaped_input(tokens, dim):
     """(B, T*dim) and (B, T, dim) must both work -- the recorder writes the latter."""
     m = FlowMatchingTransformer(state_dim=12, future_len=6, num_history_states=2, cmd_dim=3,
-                                height_dim=dim, extero_tokens=tokens)
+                                extero_sensor_dim=dim, extero_sensor_count=tokens)
     b = 4
     x, tau = torch.zeros(b, 6, 12), torch.rand(b)
     hist, cmd = torch.zeros(b, 2, 12), torch.zeros(b, len(m.cmd_steps), 3)
@@ -225,10 +192,10 @@ def test_forward_accepts_flat_and_token_shaped_input(tokens, dim):
 
 def test_token_count_changes_the_sequence_length():
     """Extra extero tokens must actually reach the encoder, not be folded together."""
-    common = dict(state_dim=12, future_len=6, num_history_states=2, cmd_dim=0, height_dim=8)
+    common = dict(state_dim=12, future_len=6, num_history_states=2, cmd_dim=0, extero_sensor_dim=8)
     seen = {}
     for tokens in (1, 3):
-        m = FlowMatchingTransformer(extero_tokens=tokens, **common)
+        m = FlowMatchingTransformer(extero_sensor_count=tokens, **common)
         captured = []
         m.encoder.register_forward_pre_hook(lambda _m, inp: captured.append(inp[0].shape[1]))
         m(torch.zeros(2, 6, 12), torch.rand(2), torch.zeros(2, 2, 12), torch.zeros(2, tokens, 8))
@@ -239,7 +206,7 @@ def test_token_count_changes_the_sequence_length():
 def test_per_token_id_distinguishes_cameras():
     """Without a per-token id the two cameras would be interchangeable to the model."""
     m = FlowMatchingTransformer(state_dim=12, future_len=6, num_history_states=2, cmd_dim=0,
-                                height_dim=8, extero_tokens=2)
+                                extero_sensor_dim=8, extero_sensor_count=2)
     args = (torch.zeros(2, 6, 12), torch.rand(2), torch.zeros(2, 2, 12), torch.zeros(2, 2, 8))
     before = m(*args)
     with torch.no_grad():
@@ -251,7 +218,7 @@ def test_swapping_two_cameras_changes_the_prediction():
     """Order matters: near and far must not be a symmetric pair."""
     torch.manual_seed(0)
     m = FlowMatchingTransformer(state_dim=12, future_len=6, num_history_states=2, cmd_dim=0,
-                                height_dim=8, extero_tokens=2)
+                                extero_sensor_dim=8, extero_sensor_count=2)
     with torch.no_grad():  # break the zero-init symmetry of extero_id
         m.extero_id.normal_()
     near, far = torch.randn(2, 1, 8), torch.randn(2, 1, 8)
@@ -271,27 +238,27 @@ def test_height_scan_dataset_resolves_one_token():
     cfg = _cfg(extero_source="height_scan")      # explicit: the default is depth
     train, _ = build_train_val(data, meta, cfg)
     ksc = data["height_scan"].shape[1]
-    assert cfg.extero_tokens == 1 and cfg.height_dim == ksc
-    assert train[0]["height"].shape == (ksc,)
+    assert cfg.extero_sensor_count == 1 and cfg.extero_sensor_dim == ksc
+    assert train[0]["extero"].shape == (ksc,)
 
 
 def test_depth_dataset_resolves_one_token_per_camera():
     """A (rows, T, dim) depth array yields T tokens of width dim, flattened per item."""
-    data, meta, *_ = _synthetic_recording(depth=(2, 15))
+    data, meta, *_ = _synthetic_recording(depth=(2, 26, 30))
     cfg = _cfg(extero_source="depth")
     train, _ = build_train_val(data, meta, cfg)
-    assert cfg.extero_tokens == 2 and cfg.height_dim == 15
-    assert train[0]["height"].shape == (30,)
+    assert cfg.extero_sensor_count == 2 and cfg.extero_sensor_dim == 26 * 30
+    assert train[0]["extero"].shape == (2 * 26 * 30,)
 
 
 def test_source_selects_which_array_is_used():
     """Both arrays present -> the config decides, and the widths differ observably."""
-    data, meta, *_ = _synthetic_recording(depth=(2, 15))
+    data, meta, *_ = _synthetic_recording(depth=(2, 26, 30))
     scan_cfg = _cfg(extero_source="height_scan")
     depth_cfg = _cfg(extero_source="depth")
     scan_ds, _ = build_train_val(data, meta, scan_cfg)
     depth_ds, _ = build_train_val(data, meta, depth_cfg)
-    assert scan_ds[0]["height"].shape != depth_ds[0]["height"].shape
+    assert scan_ds[0]["extero"].shape != depth_ds[0]["extero"].shape
 
 
 def test_missing_array_names_the_task_to_record_with():
@@ -303,8 +270,8 @@ def test_missing_array_names_the_task_to_record_with():
 
 def test_dataset_sanitizes_the_selected_array():
     """A non-finite recording must not poison the normalizer."""
-    data, meta, *_ = _synthetic_recording(depth=(2, 15))
+    data, meta, *_ = _synthetic_recording(depth=(2, 26, 30))
     data["depth"][0, 0, 0] = float("inf")
     train, _ = build_train_val(data, meta, _cfg(extero_source="depth"))
-    assert torch.isfinite(train.height).all()
-    assert torch.isfinite(train.height_normalizer.mean).all()
+    assert torch.isfinite(train.extero).all()
+    assert torch.isfinite(train.extero_normalizer.mean).all()

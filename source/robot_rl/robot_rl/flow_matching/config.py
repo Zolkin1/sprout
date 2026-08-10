@@ -5,13 +5,32 @@
 from __future__ import annotations
 
 import math
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any
+
+from .extero_encoder import conv_grid_shape
 
 
 #: Recognised :attr:`FlowMatchingConfig.extero_source` values.  These are also the keys
 #: ``record_data.py`` writes, so the dataset looks the array up by this name directly.
 EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
+
+#: Recognised :attr:`FlowMatchingConfig.extero_encoder` values (after ``"auto"`` resolves).
+EXTERO_ENCODERS: tuple[str, ...] = ("mlp", "cnn")
+
+#: Config keys renamed when the exteroception contract stopped being height-scan-shaped:
+#: old name -> new name. Applied by :meth:`FlowMatchingConfig.from_dict`, so a checkpoint
+#: trained before the rename still loads and can still serve as an A/B control.
+#:
+#: One-time and deliberately narrow. The ONNX side has NO such mapping
+#: (``deploy.fm_session`` refuses a stale graph and says to re-export) because the two
+#: artifacts cost different things to regenerate.
+_LEGACY_KEYS: dict[str, str] = {
+    "extero_tokens": "extero_sensor_count",
+    "height_dim": "extero_sensor_dim",
+    "height_norm_eps": "extero_norm_eps",
+}
+
 
 #: Largest re-plan period ``fm_update_every`` a shipped horizon must be able to serve.
 #:
@@ -210,14 +229,71 @@ class FlowMatchingConfig:
     # that lacks the selected array fails loudly at dataset build (see dataset.py), which
     # is what a cameraless task now gets by default.
     extero_source: str = "depth"
-    # Width of ONE exteroception token, and how many there are. Both resolved from the
-    # recorded array at dataset build time (176x1 for the scan, 780x2 for the cameras).
-    height_dim: int = 176
-    extero_tokens: int = 1
-    # Std floor for the height-scan normalizer. On flat ground the per-ray scan is nearly
+    # How many exteroception SENSOR readings there are, and how wide ONE of them is. Both
+    # resolved from the recorded array's shape at dataset build time: 1 x 176 rays for the
+    # scan, 2 x (H*W) pixels for the cameras.
+    #
+    # Sensor-neutral names on purpose. These were ``extero_tokens`` and ``height_dim``, from
+    # when exteroception WAS a height scan and one reading was one transformer token. Neither
+    # holds any more: the scan is not a camera, and one reading can become a grid of tokens
+    # (see the extero encoder), so "tokens" no longer means "sensors". The transformer's
+    # sequence count is a separate, derived quantity.
+    extero_sensor_count: int = 1
+    extero_sensor_dim: int = 176
+
+    # How ONE sensor reading becomes transformer tokens.
+    #   "cnn" -- a 3-layer stride-2 conv trunk PER CAMERA, so each camera contributes a grid
+    #            of tokens (16 on the 30x26 pair) each carrying a learned spatial-slot
+    #            embedding. The deployable choice, and the reason this switch exists: the
+    #            flat path is permutation-invariant over pixels, so nothing in the model can
+    #            attend to WHERE in the frame a step edge is -- which is the shape of the
+    #            measured registration failure (fm_registration_probe.py).
+    #   "mlp" -- the original 2-layer MLP, ONE token per sensor. The only option for
+    #            ``height_scan`` (an FM recording carries the scan's ray count but not its
+    #            grid shape, so there is no image to convolve), and the A/B baseline.
+    #   "auto" -- resolved at dataset build from ``extero_source``: depth -> cnn, height
+    #            scan -> mlp. Same treatment ``cmd_array`` and ``target_source`` get.
+    #
+    # NOTE the asymmetry with the dataclass default below: this field defaults to "auto",
+    # but ``FlowMatchingTransformer``'s constructor argument defaults to "mlp". That is
+    # deliberate -- a bare model built in a test keeps the legacy parameter set, while a
+    # trained config gets the current architecture.
+    extero_encoder: str = "auto"
+    # Per-sensor ``[[H, W], ...]``, DERIVED from the recording's camera contract at dataset
+    # build time (``_resolve_extero_spec``) and then verified wherever it is read again --
+    # never typed by hand. Per-camera trunks mean two cameras with the same pixel count but
+    # transposed shape are legal, so this is stated per sensor rather than once.
+    # ``None`` for the height scan, which has no image shape in an FM recording.
+    extero_image_hw: list[list[int]] | None = None
+    # Output channels per stride-2 k3p1 convolution; ``len`` sets the depth, so it sets how
+    # many times the image is halved. Three entries take 26x30 to 4x4; a fourth reaches 2x2
+    # natively, which is the CHEAPER way to shrink the sequence (pooling pays for the
+    # resolution and then discards it).
+    extero_cnn_channels: list[int] = field(default_factory=lambda: [16, 32, 64])
+    # Optional ``[gh, gw]`` average-pool target after the trunk, i.e. tokens per camera.
+    # ``None`` keeps the trunk's native grid. This is the knob that decouples the token
+    # count from the input resolution -- and the one that isolates "a CNN beats an MLP" from
+    # "16 tokens beat 1", since ``[1, 1]`` gives the legacy token count through a conv trunk.
+    extero_cnn_grid: list[int] | None = None
+    # Std floor for the exteroception normalizer. On flat ground the per-ray scan is nearly
     # constant, so the raw std collapses toward the base Normalizer eps (1e-6) and blows up
     # normalization; a larger floor (~1e-2 m) keeps a near-flat scan well-scaled.
-    height_norm_eps: float = 1e-2
+    extero_norm_eps: float = 1e-2
+    # How the exteroception normalizer is FIT.
+    #   "per_element" -- one (mean, std) per pixel/ray, the original behaviour.
+    #   "per_sensor"  -- one (mean, std) per sensor, broadcast back over its elements.
+    # This matters for the CNN and not at all for the MLP. A per-pixel affine is a
+    # spatially VARYING transform applied before the convolution sees the image, which is
+    # exactly what weight sharing assumes away: the same step edge at row 5 and row 15
+    # arrives as two different patterns. ``extero_norm_eps`` compounds it -- a pixel that
+    # almost always reads the far-clip sentinel gets a floored std, so its rare real
+    # readings become large outliers that one shared kernel then propagates across a whole
+    # feature map, where a per-pixel Linear just learned a small weight.
+    #
+    # The stored statistics keep their ``(T*K,)`` shape either way (the per-sensor value is
+    # broadcast into it), so the Normalizer, the checkpoint, the folded ONNX normalization
+    # and the whole deploy path are shape-identical -- only the numbers change.
+    extero_norm_mode: str = "per_element"
     # Per-step command width (0 disables command conditioning).
     cmd_dim: int = 0
 
@@ -406,6 +482,106 @@ class FlowMatchingConfig:
                 f"extero_source={self.extero_source!r} is not one of {list(EXTERO_SOURCES)}."
             )
 
+    def resolve_extero_encoder(self) -> str:
+        """Settle :attr:`extero_encoder`, expanding ``"auto"`` from the source.
+
+        Depth is an image, so it gets the convolutional grid; the height scan has no image
+        shape in an FM recording (only its ray count travels), so it gets the flat MLP.
+
+        Returns:
+            ``"cnn"`` or ``"mlp"``.
+
+        Raises:
+            ValueError: On an unknown encoder name, or on ``"cnn"`` with a source that has
+                no image to convolve.
+        """
+        self.check_extero_source()
+        encoder = self.extero_encoder
+        if encoder == "auto":
+            return "cnn" if self.extero_source == "depth" else "mlp"
+        if encoder not in EXTERO_ENCODERS:
+            raise ValueError(
+                f"extero_encoder={encoder!r} is not one of {list(EXTERO_ENCODERS)} (or 'auto')."
+            )
+        if encoder == "cnn" and self.extero_source != "depth":
+            raise ValueError(
+                f"extero_encoder='cnn' needs an image, but extero_source={self.extero_source!r} "
+                "has none: an FM recording carries the height scan's ray count and not its "
+                "grid shape. Use --extero_encoder mlp for the scan (or 'auto', which picks it)."
+            )
+        return encoder
+
+    def check_extero_encoder(self) -> None:
+        """Raise if the exteroception encoder settings are not internally coherent.
+
+        Checks the resolved encoder name, and -- for the CNN -- that the derived per-sensor
+        image shapes are present, one per sensor, and each unfold to
+        :attr:`extero_sensor_dim`. Cheap, and it turns a silent mis-fold into a message: a
+        transposed or absent shape would otherwise reach the convolution as a scrambled
+        neighbourhood with every tensor the right size.
+
+        Raises:
+            ValueError: On an unknown encoder, or on CNN image shapes that are missing,
+                miscounted, or inconsistent with the sensor width.
+        """
+        if self.resolve_extero_encoder() != "cnn":
+            return
+        if not self.extero_image_hw:
+            raise ValueError(
+                "extero_encoder='cnn' needs extero_image_hw, which the dataset derives from "
+                "the recording's depth_camera_spec. An empty value means the dataset was not "
+                "built (or the recording carries no camera contract)."
+            )
+        if len(self.extero_image_hw) != self.extero_sensor_count:
+            raise ValueError(
+                f"extero_image_hw lists {len(self.extero_image_hw)} shape(s) but there are "
+                f"{self.extero_sensor_count} sensor(s)."
+            )
+        for hw in self.extero_image_hw:
+            if len(hw) != 2 or int(hw[0]) * int(hw[1]) != self.extero_sensor_dim:
+                raise ValueError(
+                    f"extero_image_hw entry {list(hw)} does not unfold to "
+                    f"extero_sensor_dim={self.extero_sensor_dim}."
+                )
+
+    @property
+    def tokens_per_sensor(self) -> int:
+        """Transformer tokens ONE sensor reading contributes.
+
+        1 for the flat MLP; the convolutional grid's cell count otherwise. Pure arithmetic
+        (no module is built), so ``train.py`` can print the sequence length before the model
+        exists.
+
+        Returns:
+            Tokens per sensor.
+        """
+        if self.resolve_extero_encoder() != "cnn":
+            return 1
+        if self.extero_cnn_grid:
+            return int(self.extero_cnn_grid[0]) * int(self.extero_cnn_grid[1])
+        self.check_extero_encoder()
+        grid = conv_grid_shape(
+            (int(self.extero_image_hw[0][0]), int(self.extero_image_hw[0][1])),
+            len(self.extero_cnn_channels),
+        )
+        return grid[0] * grid[1]
+
+    @property
+    def extero_seq_tokens(self) -> int:
+        """Exteroception tokens in the transformer SEQUENCE (sensors x tokens per sensor).
+
+        Distinct from :attr:`extero_sensor_count`, which is how many physical readings
+        there are -- the two were one number back when a reading was a token, and the
+        deploy-side camera checks still read the sensor count.
+        """
+        return int(self.extero_sensor_count) * self.tokens_per_sensor
+
+    @property
+    def sequence_len(self) -> int:
+        """Total transformer sequence length: history + exteroception + command + future."""
+        return (int(self.num_history_states) + self.extero_seq_tokens
+                + int(self.num_cmd_tokens) + int(self.future_len))
+
     def to_dict(self) -> dict[str, Any]:
         """Return a plain-dict copy of the config (for checkpointing)."""
         return asdict(self)
@@ -421,8 +597,24 @@ class FlowMatchingConfig:
         moment that default changed, which is exactly what happened when it flipped to
         ``"depth"``. Checkpoints written since the field exists always carry it, so this
         only ever affects genuinely old ones.
+
+        The exteroception fields were also RENAMED (see :data:`_LEGACY_KEYS`), and a
+        checkpoint is the artifact worth shimming: re-exporting an ONNX is one command,
+        while re-training a generator is a hundred epochs. Old names are mapped only where
+        the new one is absent, so a checkpoint carrying both (there should be none) keeps
+        the new one.
         """
         names = {f.name for f in fields(cls)}
-        kwargs = {k: v for k, v in d.items() if k in names}
+        renamed = dict(d)
+        for old, new in _LEGACY_KEYS.items():
+            if old in renamed and new not in renamed:
+                renamed[new] = renamed.pop(old)
+        kwargs = {k: v for k, v in renamed.items() if k in names}
         kwargs.setdefault("extero_source", "height_scan")
+        # Same reasoning as extero_source above, and the same trap: a checkpoint written
+        # before the encoder switch existed is necessarily an MLP one, so it must NOT pick up
+        # the current "auto" default. Letting it would reinterpret every pre-CNN checkpoint --
+        # including the trained baseline any new encoder has to be measured against -- as a
+        # convolutional model, and the weights would then fail to load.
+        kwargs.setdefault("extero_encoder", "mlp")
         return cls(**kwargs)

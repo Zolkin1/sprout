@@ -50,7 +50,7 @@ class FmContext:
     num_cmd_tokens: int
     joint_names: list[str]
     target_frame_names: list[str]
-    height_dim: int
+    extero_sensor_dim: int
     reference_blocks: tuple[str, ...] = REFERENCE_WINDOW_BLOCK_NAMES
     """Which reference-window blocks this graph PREDICTS, in packing order.
 
@@ -58,10 +58,25 @@ class FmContext:
     to it verbatim. ``GenTrackerPolicy.load`` is where the two meet."""
     extero_source: str = "height_scan"
     """Which sensor feeds the exteroception tokens ("height_scan" or "depth")."""
-    extero_tokens: int = 1
-    """Number of exteroception tokens: 1 for the scan, one per camera for depth."""
+    extero_sensor_count: int = 1
+    """Number of exteroception SENSOR readings: 1 for the scan, one per camera for depth."""
     extero_spec: list[dict] = field(default_factory=list)
-    """Camera contract behind those tokens (depth only); see ``depth_obs.py``."""
+    """Camera contract behind those readings (depth only); see ``depth_obs.py``."""
+    extero_encoder: str = "mlp"
+    """Which embedding the graph bakes in: ``"mlp"`` (one token per reading) or ``"cnn"``.
+
+    Not needed to RUN the graph -- the embedding is inside it -- but it says whether
+    :attr:`extero_image_hw` is load-bearing."""
+    extero_image_hw: list[tuple[int, int]] = field(default_factory=list)
+    """Per-camera ``(height, width)`` the graph folds each flat row into (CNN only).
+
+    The reason this travels at all: ``extero_sensor_dim`` cannot distinguish a 30x26 camera
+    from a 26x30 one, and under a convolution a transposed camera is a SCRAMBLED image
+    rather than a reordered vector -- every tensor the right size, every kernel reading the
+    wrong neighbourhood. Empty for a flat-MLP graph (where pixel order genuinely does not
+    matter) or one exported before the field existed."""
+    extero_tokens_per_sensor: int = 1
+    """Transformer tokens one reading becomes (the CNN grid's cell count; 1 for the MLP)."""
     fm_snap_every: int | None = None
     """Re-plan period (control steps) the model's training targets were cut at.
 
@@ -69,9 +84,9 @@ class FmContext:
     from this period. ``None`` for a graph exported before the field existed."""
 
     @property
-    def extero_dim(self) -> int:
-        """Flat width of the exteroception input, ``extero_tokens * height_dim``."""
-        return self.extero_tokens * self.height_dim
+    def extero_flat_dim(self) -> int:
+        """Flat width of the exteroception input, ``extero_sensor_count * extero_sensor_dim``."""
+        return self.extero_sensor_count * self.extero_sensor_dim
     has_history_null: bool = False
     """Whether the graph accepts the ``history_null`` input (learned null-history embedding).
 
@@ -158,6 +173,21 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         raise ValueError(f"{onnx_path} has no 'fm_meta' metadata; re-export with metadata.")
     m = json.loads(raw["fm_meta"])
     source = str(m.get("extero_source", "height_scan"))
+    # A graph exported before the exteroception fields were renamed is REFUSED rather than
+    # read through a default. Both keys used to be read with ``.get(..., 1)``, which on a
+    # stale graph silently described a one-sensor, one-pixel camera -- the deploy then
+    # failed later, in the camera-contract check, with a message about pixel counts. The
+    # asymmetry with the .pt loader (which does shim the old names) is deliberate: fixing
+    # this is one re-export, while a checkpoint would be a retrain.
+    stale = [old for old, new in (("height_dim", "extero_sensor_dim"),
+                                  ("extero_tokens", "extero_sensor_count"))
+             if new not in m and old in m]
+    if stale:
+        raise ValueError(
+            f"{onnx_path}: fm_meta carries the pre-rename exteroception keys {stale} and not "
+            "their replacements (extero_sensor_dim / extero_sensor_count). Re-export with "
+            "scripts/flow_matching/export_fm_onnx.py -- the checkpoint itself still loads."
+        )
     # The old history_source refusal is gone: the deploy runtime CAN produce this history,
     # because the history is the runtime's own last output rather than a measured state it
     # would have to estimate.
@@ -169,9 +199,16 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
-        height_dim=int(m.get("height_dim", 1)),
-        extero_source=source, extero_tokens=int(m.get("extero_tokens", 1)),
+        extero_sensor_dim=int(m["extero_sensor_dim"]),
+        extero_source=source, extero_sensor_count=int(m["extero_sensor_count"]),
         extero_spec=parse_depth_spec(m.get("extero_spec"), source=f"{onnx_path} fm_meta"),
+        # ``.get`` here, unlike the two above: these describe the EMBEDDING, and a graph
+        # exported before it was selectable is unambiguously the flat one. The defaults are
+        # therefore correct for such a graph rather than a guess -- which is exactly the
+        # test the two renamed keys fail (they would describe a camera).
+        extero_encoder=str(m.get("extero_encoder", "mlp")),
+        extero_image_hw=[(int(h), int(w)) for h, w in (m.get("extero_image_hw") or [])],
+        extero_tokens_per_sensor=int(m.get("extero_tokens_per_sensor", 1)),
         fm_snap_every=(int(m["fm_snap_every"]) if m.get("fm_snap_every") else None),
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
         has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),
@@ -209,7 +246,7 @@ def build_history_tokens(ctx: FmContext, nodes: np.ndarray) -> np.ndarray:
 
 
 def build_extero_tokens(ctx: FmContext, values: np.ndarray) -> np.ndarray:
-    """Build the **raw** exteroception tokens ``(V, extero_tokens * height_dim)``.
+    """Build the **raw** exteroception tokens ``(V, extero_sensor_count * extero_sensor_dim)``.
 
     Source-agnostic, mirroring ``flow_matching.online.build_extero_tokens``: the context
     knows which sensor the checkpoint was trained on, so the caller passes whichever
@@ -233,10 +270,10 @@ def build_extero_tokens(ctx: FmContext, values: np.ndarray) -> np.ndarray:
     if arr.ndim == 1:
         arr = arr[None, :]
     flat = arr.reshape(arr.shape[0], -1)
-    if flat.shape[-1] != ctx.extero_dim:
+    if flat.shape[-1] != ctx.extero_flat_dim:
         raise ValueError(
-            f"exteroception width {flat.shape[-1]} != fm extero_dim {ctx.extero_dim} "
-            f"({ctx.extero_tokens} x {ctx.height_dim}, source '{ctx.extero_source}')."
+            f"exteroception width {flat.shape[-1]} != fm extero_flat_dim {ctx.extero_flat_dim} "
+            f"({ctx.extero_sensor_count} x {ctx.extero_sensor_dim}, source '{ctx.extero_source}')."
         )
     # Missed rays / bad sensor reads arrive as +/-inf or NaN; the fm.onnx graph folds in
     # the normalization, so a non-finite value here would poison it. The band is
@@ -269,7 +306,7 @@ def sample_window(ctx: FmContext, history, extero, cmd_tokens, noise, history_nu
     Args:
         ctx: Loaded FM context.
         history: Raw context tokens ``(V, N, D)`` from :func:`build_history_tokens`.
-        extero: Raw exteroception tokens ``(V, T*height_dim)``.
+        extero: Raw exteroception tokens ``(V, T*extero_sensor_dim)``.
         cmd_tokens: Raw strided command tokens ``(V, num_cmd_tokens, cmd_dim)``.
         noise: Sampling noise ``(V, F, D)`` (caller-supplied for determinism).
         history_null: Optional ``(V,)`` bool/float; where set, the graph swaps the history

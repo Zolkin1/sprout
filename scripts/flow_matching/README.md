@@ -72,6 +72,47 @@ The sections below document the underlying scripts and their (now mostly optiona
 
 ---
 
+## Exteroception: how a depth image becomes tokens
+
+`--extero_encoder` picks the embedding, and it is the one architectural choice that is
+about TERRAIN rather than about capacity.
+
+* **`cnn`** (what `auto` picks for depth) — a 3-layer stride-2 conv trunk **per camera**
+  takes each 30x26 frame to a 4x4 grid, and every cell becomes one token carrying a learned
+  spatial-slot embedding. 16 tokens per camera, 32 total, sequence length 111.
+* **`mlp`** — the original: the whole 780-value frame through one `Linear`, one token per
+  camera, sequence length 81. The only option for `--extero_source height_scan`, and the
+  baseline the CNN is measured against.
+
+Why it matters: a `Linear` over 780 pixels is **permutation-invariant over pixels**, so
+nothing in the flat model can attend to *where* in the frame a step edge is. That is the
+shape of the measured failure — displace the robot 0.10 / 0.20 m downrange and the predicted
+stair segment slides 0.098 / 0.168 m with it, where the anchor mask requires 0.000
+(`scripts/rsl_rl/fm_registration_probe.py`). The convolutional branch is also ~5x *smaller*
+than the `Linear` it replaces, so this re-allocates capacity toward structure rather than
+adding it.
+
+Two knobs that separate the variables when reading an A/B:
+
+```bash
+--extero_cnn_grid 1,1        # a conv trunk at the LEGACY token count: isolates
+                             # "CNN beats MLP" from "16 tokens beat 1"
+--extero_norm_mode per_sensor  # one (mean, std) per camera instead of per PIXEL
+```
+
+`per_sensor` exists because the default per-pixel normalization is a spatially *varying*
+transform applied before the convolution sees the image — exactly what weight sharing
+assumes away. It is a separate flag so it can be ablated: if a CNN run disappoints, re-run
+with `--extero_norm_mode per_element` before blaming the encoder.
+
+Pixel order is a **contract**, not a convention: the flat row is row-major over `(H, W)`
+with `v = 0` the top row, and the `(H, W)` to fold it with is derived from the recording's
+`depth_camera_spec` — never configured. `extero_sensor_dim` alone cannot tell a 30x26 camera
+from a 26x30 one, so the shape travels into `fm.onnx` and the deploy refuses a mismatch
+(`transfer/deploy/gen_tracker.py`).
+
+---
+
 ## 1. Record training data  (needs Isaac Sim)
 
 Rolls out a trained teacher (clip-tracking) policy and records per-step

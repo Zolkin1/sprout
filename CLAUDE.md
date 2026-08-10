@@ -78,7 +78,18 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
   7.8, `reward` 7.6, `termination` 2.5. ~19 ms of `obs` is the two depth cameras. `TODO(perf)`
   notes sit on `mdp.observations.reference_window` and `MotionSequenceCommand._update_command`;
   neither is instrumented per-term yet, so a breakdown comes before any optimisation.
-- The FM selects depth OR height-scan exteroception tokens (`robot_rl/flow_matching/config.py`).
+- The FM selects depth OR height-scan exteroception (`extero_source`), and how one reading
+  becomes TOKENS (`extero_encoder`, `robot_rl/flow_matching/extero_encoder.py`): `cnn` gives
+  each camera its OWN 3-layer stride-2 trunk → a 4x4 grid of tokens with a learned spatial
+  slot (16/camera, sequence 111); `mlp` is the original one-token-per-reading flat path
+  (sequence 81), and the only option for the height scan. The flat path is
+  permutation-invariant over pixels, so nothing in it can attend to WHERE a step edge is —
+  which is the shape of the registration failure `fm_registration_probe.py` measures. The
+  per-camera `(H, W)` is DERIVED from the recording's `depth_camera_spec`, travels into
+  `fm.onnx`, and is checked at deploy: `extero_sensor_dim` cannot tell 30x26 from 26x30, and
+  under a convolution a transposed camera is scrambled input rather than a reordered vector.
+  `extero_norm_mode=per_sensor` pools the normalizer per camera instead of per pixel (a
+  per-pixel affine is a spatially varying transform, which weight sharing assumes away).
 - `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
 
 ## The camera contract (how depth reaches MuJoCo / hardware)
@@ -86,7 +97,9 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
 intrinsics, range, and the `(d - offset) * scale` normalization — from the sensor cfgs and obs terms.
 It is the single producer for all consumers, so nothing off-sim restates a camera number:
 - `tracker.onnx` metadata `policy_parameters.depth_camera_spec` (via `export_parameters.py`);
-- `fm.onnx` metadata `fm_meta.extero_spec` (+ `extero_source`, `extero_tokens`), plumbed env cfg ->
+- `fm.onnx` metadata `fm_meta.extero_spec` (+ `extero_source`, `extero_sensor_count`,
+  `extero_sensor_dim` — sensor-neutral names; the old `extero_tokens`/`height_dim` are shimmed
+  on `.pt` load but a stale `fm.onnx` is refused and must be re-exported), plumbed env cfg ->
   `RecordingMeta.depth_camera_spec` -> FM dataset -> checkpoint -> export;
 - `GenTrackerPolicy.load()` requires the two to AGREE (`transfer/deploy/depth_obs.py`) — there is one
   physical camera pair, so a tracker and generator running together cannot describe different ones.

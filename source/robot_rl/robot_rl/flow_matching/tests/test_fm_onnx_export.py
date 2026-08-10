@@ -47,29 +47,41 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "transfer"))
 from deploy.fm_session import _check_state_layout  # noqa: E402
 
 
-def _tiny_checkpoint(tmp_path) -> tuple[str, int, int, int, int]:
+def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto") -> tuple[str, int, int, int, int]:
     """Train-free checkpoint in the exact shape ``load_fm_context`` expects.
+
+    Args:
+        tmp_path: pytest temp dir.
+        extero_encoder: Which exteroception embedding to build. ``"auto"`` is what a real
+            depth run resolves to (the convolutional grid); pass ``"mlp"`` for the flat
+            baseline. The model is built from the RESOLVED config rather than the defaults,
+            because a config saying one encoder over the other's weights is exactly what
+            ``load_fm_context`` refuses.
 
     Returns:
         ``(checkpoint_path, num_history_states, future_len, num_joints, num_extra_frames)``.
     """
     torch.manual_seed(0)
-    # Two cameras of 15 px: the shape of the deployable pairing, in miniature.
-    data, meta, nj, k, f, _ = _synthetic_recording(depth=(2, 15))
+    # The deployable pairing at its real per-camera geometry, so the traced graph is the
+    # shipped one -- a placeholder Nx1 "image" would trace a degenerate 1-D encoder.
+    data, meta, nj, k, f, _ = _synthetic_recording(depth=(2, 26, 30))
     state_dim = window_dim(nj, k)
     n = 2
     cfg = FlowMatchingConfig(
         num_history_states=n, future_len=f, cmd_array="target_vel", cmd_stride=4,
         target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
         d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
+        extero_encoder=extero_encoder,
     )
     train, _ = build_train_val(data, meta, cfg)
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=f, num_history_states=n, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, extero_tokens=cfg.extero_tokens,
+        extero_sensor_dim=cfg.extero_sensor_dim, extero_sensor_count=cfg.extero_sensor_count,
         cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
         d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers,
         dim_feedforward=cfg.dim_feedforward,
+        extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
+        extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
     ).eval()
     path = str(tmp_path / "ckpt.pt")
     torch.save({
@@ -83,16 +95,23 @@ def _tiny_checkpoint(tmp_path) -> tuple[str, int, int, int, int]:
         "num_joints": nj,
         "state_normalizer": train.state_normalizer.state_dict(),
         "cmd_normalizer": train.cmd_normalizer.state_dict(),
-        "height_normalizer": train.height_normalizer.state_dict(),
+        "extero_normalizer": train.extero_normalizer.state_dict(),
         "model": model.state_dict(),
     }, path)
     assert state_dim == window_dim(nj, k)
     return path, n, f, nj, k
 
 
-def test_fm_onnx_graph_signature(tmp_path):
-    """The graph must expose exactly the five inputs the deploy runtime feeds by name."""
-    ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path)
+@pytest.mark.parametrize("encoder", ["mlp", "cnn"])
+def test_fm_onnx_graph_signature(tmp_path, encoder):
+    """The graph must expose exactly the five inputs the deploy runtime feeds by name.
+
+    Both encoders, because the input SIGNATURE must not depend on which one is inside:
+    ``extero`` stays the flat ``T * sensor_dim`` the deploy runtime already feeds, and the
+    convolution folds it internally. If that ever stops holding, every off-sim consumer
+    (MuJoCo, hardware) needs changing with it.
+    """
+    ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path, encoder)
     out = str(tmp_path / "fm.onnx")
     export_fm_onnx(ckpt, out, opset=18)
     model = onnx.load(out, load_external_data=False)
@@ -114,9 +133,10 @@ def test_fm_onnx_graph_signature(tmp_path):
     assert len({got_in[k_][0] for k_ in got_in} | {out_shape[0]}) == 1
 
 
-def test_fm_meta_contract(tmp_path):
+@pytest.mark.parametrize("encoder", ["mlp", "cnn"])
+def test_fm_meta_contract(tmp_path, encoder):
     """``fm_meta`` must carry every key the deploy runtime reads, with the right values."""
-    ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path)
+    ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path, encoder)
     out = str(tmp_path / "fm.onnx")
     returned = export_fm_onnx(ckpt, out, opset=18)
 
@@ -128,8 +148,8 @@ def test_fm_meta_contract(tmp_path):
     # Everything transfer/deploy/fm_session.load_fm_context reads.
     required = {
         "joint_names", "target_frame_names", "N", "F", "D", "nj", "num_steps", "cmd_dim",
-        "cmd_steps", "num_cmd_tokens", "height_dim", "extero_source",
-        "extero_tokens", "extero_spec", "fm_snap_every",
+        "cmd_steps", "num_cmd_tokens", "extero_sensor_dim", "extero_source",
+        "extero_sensor_count", "extero_spec", "fm_snap_every",
         "window_blocks", "has_history_null",
     }
     assert required <= set(meta), f"fm_meta is missing {sorted(required - set(meta))}"
@@ -147,6 +167,25 @@ def test_fm_meta_contract(tmp_path):
     stale.pop("window_blocks")
     with pytest.raises(ValueError, match="window_blocks"):
         _check_state_layout("stale.onnx", stale)
+
+
+@pytest.mark.parametrize("encoder,expect_hw", [("cnn", [[26, 30], [26, 30]]), ("mlp", None)])
+def test_only_a_convolutional_graph_states_its_image_fold(tmp_path, encoder, expect_hw):
+    """``extero_image_hw`` is exported for the CNN and withheld for the MLP.
+
+    The dataset derives the geometry for ANY depth recording, so exporting it unconditionally
+    is the easy mistake -- and it makes the deploy enforce a constraint that does not exist:
+    a flat embedding is permutation-invariant over pixels, so it would consume a transposed
+    camera perfectly well and the fold check would refuse it anyway.
+
+    Only a real export catches this (a hand-built context can carry whatever the test
+    wants), which is why it is asserted end to end here rather than in the encoder's units.
+    """
+    ckpt, *_ = _tiny_checkpoint(tmp_path, encoder)
+    meta = export_fm_onnx(ckpt, str(tmp_path / "fm.onnx"), opset=18)
+    assert meta["extero_encoder"] == encoder
+    assert meta["extero_image_hw"] == expect_hw
+    assert meta["extero_tokens_per_sensor"] == (16 if encoder == "cnn" else 1)
 
 
 def test_state_layout_guard_accepts_a_subset_but_not_an_incoherent_one():
@@ -179,10 +218,16 @@ def test_state_layout_guard_accepts_a_subset_but_not_an_incoherent_one():
         _check_state_layout("x.onnx", {**ok, "D": ok["D"] + 1})
 
 
-def test_fm_onnx_matches_torch(tmp_path):
-    """The exported graph must reproduce the torch sampler it was traced from."""
+@pytest.mark.parametrize("encoder", ["mlp", "cnn"])
+def test_fm_onnx_matches_torch(tmp_path, encoder):
+    """The exported graph must reproduce the torch sampler it was traced from.
+
+    Run at ``v=3`` on purpose: it is the check that the convolutional reshapes kept the
+    graph's batch axis DYNAMIC. A reshape traced against a concrete batch would pass at
+    v=1 and fail here.
+    """
     ort = pytest.importorskip("onnxruntime", exc_type=ImportError)
-    ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path)
+    ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path, encoder)
     out = str(tmp_path / "fm.onnx")
     meta = export_fm_onnx(ckpt, out, opset=18)
     d, v = meta["D"], 3
@@ -190,7 +235,7 @@ def test_fm_onnx_matches_torch(tmp_path):
     rng = np.random.default_rng(0)
     feed = {
         "history": rng.standard_normal((v, n, d)).astype(np.float32),
-        "extero": rng.standard_normal((v, meta["extero_tokens"] * meta["height_dim"])).astype(np.float32),
+        "extero": rng.standard_normal((v, meta["extero_sensor_count"] * meta["extero_sensor_dim"])).astype(np.float32),
         "cmd_tokens": rng.standard_normal((v, meta["num_cmd_tokens"], meta["cmd_dim"])).astype(np.float32),
         "noise": rng.standard_normal((v, f, d)).astype(np.float32),
         "history_null": np.zeros((v, 1), dtype=np.float32),
