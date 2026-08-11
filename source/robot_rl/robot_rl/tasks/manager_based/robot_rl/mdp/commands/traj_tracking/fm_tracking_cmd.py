@@ -203,10 +203,14 @@ class FmTrackingCommand(MotionSequenceCommand):
             )
 
         # The live exteroception must be the width this generator conditions on. Checked ONCE
-        # here rather than per step -- the alternative is a shape error from inside the graph,
-        # at which point the useful information (which cameras, which group, which
-        # resolution) is gone.
-        self._check_extero_shape()
+        # rather than per step -- the alternative is a shape error from inside the graph, at
+        # which point the useful information (which cameras, which group, which resolution)
+        # is gone. On the FIRST reading and not here, because the cameras are discovered by
+        # walking the observation manager and it does not exist yet: IsaacLab's
+        # ``ManagerBasedRLEnv.load_managers`` builds the COMMAND manager first (observations
+        # need to know the commands), so anything a command term asks about an obs group at
+        # construction time is asking too early.
+        self._extero_checked = False
 
         # Rolling per-env history of the N reference-window nodes this command last
         # SERVED -- the generator's own output, not the robot's state. That is the
@@ -716,8 +720,8 @@ class FmTrackingCommand(MotionSequenceCommand):
         * the CAMERAS come from the env, by group: its own pair when the task built one at
           the generator's resolution, else the policy's (``fm_depth_groups`` returns
           ``None`` = every group = the shared-pair behaviour);
-        * the WIDTH is checked once at construction (:meth:`_check_extero_shape`), not
-          per step.
+        * the WIDTH is checked on the FIRST reading (:meth:`_check_extero_shape`), not
+          per step and not at construction -- see ``_post_init``.
 
         Returns:
             ``(num_envs, K)`` for the height scan, or ``(num_envs, T, K)`` for depth --
@@ -728,13 +732,18 @@ class FmTrackingCommand(MotionSequenceCommand):
         """
         src = self.ctx.extero_source
         if src == "height_scan":
-            return mdp_height_scan(self.env, SceneEntityCfg("height_scanner"))
-        if src == "depth":
-            return depth_obs_stack(self.env, fm_depth_groups(self.env))
-        raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")
+            reading = mdp_height_scan(self.env, SceneEntityCfg("height_scanner"))
+        elif src == "depth":
+            reading = depth_obs_stack(self.env, fm_depth_groups(self.env))
+        else:
+            raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")
+        if not self._extero_checked:
+            self._check_extero_shape(reading)
+            self._extero_checked = True
+        return reading
 
-    def _check_extero_shape(self) -> None:
-        """Fail at construction if the live cameras are not what the generator expects.
+    def _check_extero_shape(self, reading: torch.Tensor) -> None:
+        """Fail on the first exteroception reading if it is not what the generator expects.
 
         A SHAPE check, deliberately: the full camera contract comparison lives on the deploy
         side (``deploy.depth_obs.assert_depth_specs_agree``) and ``robot_rl`` must not import
@@ -742,10 +751,13 @@ class FmTrackingCommand(MotionSequenceCommand):
         a live reading of the wrong width, or the right total width split over the wrong
         number of cameras.
 
+        Args:
+            reading: The live reading from :meth:`_read_extero`, passed in rather than
+                fetched here so the two cannot recurse.
+
         Raises:
             RuntimeError: On a sensor-count or per-sensor-width disagreement.
         """
-        reading = self._read_extero()
         if reading.ndim == 2:                      # the height scan: one sensor row
             reading = reading.unsqueeze(1)
         count, dim = int(reading.shape[1]), int(reading.shape[2])

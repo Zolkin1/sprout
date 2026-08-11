@@ -188,6 +188,16 @@ class FmOnlineContext:
     mismatch is both off-distribution and possibly short of horizon. ``None`` for a
     checkpoint recorded before the field existed.
     """
+    extero_sensor_count: int = 1
+    """How many exteroception SENSOR readings the checkpoint conditions on (rows).
+
+    1 for the height scan, 2 for the camera pair. Carried beside :attr:`extero_source` for
+    the same reason: a consumer checks what it is about to feed the model against the
+    checkpoint, not against what the task config happens to build. Defaults, with
+    :attr:`extero_sensor_dim`, to the legacy scan a pre-selector checkpoint resolves to.
+    """
+    extero_sensor_dim: int = 176
+    """Width of ONE exteroception reading (rays for the scan, pixels for a camera)."""
     extero_spec: list[dict] | None = None
     """Camera contract behind the exteroception tokens, when :attr:`extero_source` is depth.
 
@@ -491,6 +501,8 @@ def load_fm_context(
         guidance_scale=float(guidance_scale),
         fm_snap_every=(int(meta["fm_snap_every"]) or None) if meta.get("fm_snap_every") else None,
         extero_source=str(cfg.extero_source),
+        extero_sensor_count=int(cfg.extero_sensor_count),
+        extero_sensor_dim=int(cfg.extero_sensor_dim),
         extero_spec=(meta.get("extero_spec") or None),
         extero_image_hw=([(int(h), int(w)) for h, w in cfg.extero_image_hw]
                          if cfg.extero_image_hw else None),

@@ -858,6 +858,10 @@ def test_online_roundtrip_with_the_cnn_encoder():
     }
     ctx = load_fm_context(ckpt, device="cpu", num_sampling_steps=4)
     assert ctx.extero_image_hw == [(H, W), (H, W)]
+    # The width contract a tracker checks its LIVE cameras against
+    # (``FmTrackingCommand._check_extero_shape``) has to be on the context: it is the only
+    # description of the cameras a consumer gets without re-opening the checkpoint.
+    assert (ctx.extero_sensor_count, ctx.extero_sensor_dim) == (2, H * W)
     V = 4
     hist = build_history_tokens(ctx, torch.randn(V, N, state_dim))
     # FLAT, exactly as the deploy runtime feeds it -- the fold happens inside the model.
