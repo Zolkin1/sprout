@@ -43,6 +43,7 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
     FlowMatchingConfig,
+    ATTENTION_MODES,
     EXTERO_ENCODERS,
     EXTERO_SOURCES,
     FlowMatchingTransformer,
@@ -132,6 +133,15 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "camera. Empty keeps the trunk's native grid. This is the knob that separates "
              "'a CNN beats an MLP' from '16 tokens beat 1': '1,1' gives the legacy token "
              "count through a conv trunk.")
+    parser.add_argument(
+        "--attention_mode", type=str, default=FlowMatchingConfig().attention_mode,
+        choices=list(ATTENTION_MODES),
+        help="Which way the conditioning/future dependency runs. 'prefix' (default) has the "
+             "conditioning attend only to ITSELF and keeps the flow-time embedding off it, so "
+             "its representation is a fixed statement rather than a function of the noise "
+             "level -- and is therefore computed once per re-plan instead of every Euler step. "
+             "'full' is what every checkpoint before this flag was trained under; pass it for "
+             "a controlled comparison against one.")
     parser.add_argument(
         "--extero_norm_mode", type=str, default=FlowMatchingConfig().extero_norm_mode,
         choices=["per_element", "per_sensor"],
@@ -316,6 +326,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         extero_cnn_grid=([int(g) for g in args.extero_cnn_grid.split(",") if g.strip()]
                          or None),
         extero_norm_mode=args.extero_norm_mode,
+        attention_mode=args.attention_mode,
     )
     return cfg, args
 
@@ -544,6 +555,15 @@ def main() -> None:
           f"tokens), extero_norm_mode={cfg.extero_norm_mode}; SEQUENCE LENGTH "
           f"{cfg.sequence_len} = {cfg.num_history_states} history + {cfg.extero_seq_tokens} "
           f"extero + {cfg.num_cmd_tokens} cmd + {cfg.future_len} future.")
+    # Stated in the log because a checkpoint carries no structural evidence of it -- the two
+    # attention modes share one parameter set, so this line is how a run's architecture stays
+    # attributable after the fact.
+    cfg.check_attention_mode()
+    prefix_note = ("conditioning attends only to itself and is encoded once per re-plan"
+                   if cfg.attention_mode == "prefix"
+                   else "every token attends to every other (the pre-flag architecture)")
+    print(f"[INFO] attention_mode={cfg.attention_mode}: {prefix_note}; "
+          f"prefix {cfg.sequence_len - cfg.future_len} + future {cfg.future_len} tokens.")
     if cfg.obs_noise:
         # Only the keys feeding a SELECTED block -- the others are not in the window and
         # so are not applied, and printing them would suggest otherwise.
@@ -621,6 +641,7 @@ def main() -> None:
         # ``extero_image_hw`` was derived from the recording's camera contract there.
         extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
         extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
+        attention_mode=cfg.attention_mode,
     ).to(device)
     extero_params = sum(p.numel() for n, p in model.named_parameters() if "extero" in n)
     print(f"[INFO] Model parameters: {sum(p.numel() for p in model.parameters()):,}  "

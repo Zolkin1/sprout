@@ -434,7 +434,13 @@ def load_fm_context(
     # image shape without this firing.
     encoder = cfg.resolve_extero_encoder()
     cfg.check_extero_encoder()
+    cfg.check_attention_mode()
     _check_extero_image_hw(cfg, meta, encoder)
+    # Said out loud because nothing else can reveal it: the two attention modes share one
+    # parameter set, so a checkpoint carries no structural evidence of which it was trained
+    # under. If this line disagrees with what you expect, the config is what to look at.
+    print(f"[INFO load_fm_context] attention_mode={cfg.attention_mode} "
+          f"(extero_encoder={encoder})")
     model = FlowMatchingTransformer(
         state_dim=cfg.state_dim, future_len=cfg.future_len,
         num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
@@ -444,6 +450,7 @@ def load_fm_context(
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
         extero_encoder=encoder, extero_image_hw=cfg.extero_image_hw,
         extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
+        attention_mode=cfg.attention_mode,
     ).to(dev)
     weights, which = ckpt["model"], "raw"
     if use_ema and ckpt.get("model_ema") is not None:

@@ -78,6 +78,20 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
   7.8, `reward` 7.6, `termination` 2.5. ~19 ms of `obs` is the two depth cameras. `TODO(perf)`
   notes sit on `mdp.observations.reference_window` and `MotionSequenceCommand._update_command`;
   neither is instrumented per-term yet, so a breakdown comes before any optimisation.
+- The FM's `attention_mode` decides which way the conditioning/future dependency runs.
+  `prefix` (DEFAULT) has history+extero+cmd attend only to THEMSELVES and keeps the flow-time
+  embedding off them, so their representation is a fixed statement rather than a function of
+  the noise level — and is therefore encoded ONCE per re-plan and reused by every Euler step
+  (`model.encode_prefix` / `decode_future`, hoisted in `flow.sample_trajectory` and in the
+  unrolled ONNX graph). `full` is what every checkpoint before the flag was trained under.
+  **The two modes share one parameter set**, so a mislabelled checkpoint runs silently under
+  the wrong attention — `load_state_dict` cannot catch it. `from_dict` defaults a pre-flag
+  checkpoint to `full`, the mode is printed at load, and it is in `fm_meta`; that is the whole
+  defence. Measured: torch gets 1.34–1.39x on the CNN model at Isaac batch sizes, but the
+  exported graph is ~0.82x at the deploy batch of 1 (fewer FLOPs, ~27% MORE nodes, and
+  onnxruntime is launch-bound there). `prefix` is implemented as the cached decomposition, not
+  as a mask: with a 2-D `attn_mask` the fused kernel materializes `(B, nhead, S, S)` inside
+  `merge_masks` — gigabytes at Isaac env counts — so the masked pass is test-reference only.
 - The FM selects depth OR height-scan exteroception (`extero_source`), and how one reading
   becomes TOKENS (`extero_encoder`, `robot_rl/flow_matching/extero_encoder.py`): `cnn` gives
   each camera its OWN 3-layer stride-2 trunk → a 4x4 grid of tokens with a learned spatial

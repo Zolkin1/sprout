@@ -518,16 +518,32 @@ def sample_trajectory(
         mask2 = torch.cat([cond_mask, null_mask], dim=0)
         hist2, extero2 = torch.cat([history] * 2, 0), torch.cat([extero] * 2, 0)
         cmd2 = None if cmd_tokens is None else torch.cat([cmd_tokens] * 2, 0)
+
+    # Under ``prefix`` attention the conditioning cannot see the noised tokens and never
+    # receives the flow-time embedding, so its transformer representation is IDENTICAL at
+    # every step -- encode it once here instead of ``num_steps`` times inside the loop. The
+    # conditioning tensors were already hoisted above; this hoists their encoding too.
+    #
+    # In the guided branch the prefix is built once at 2B (the conditional half plus the
+    # null-history half), so CFG pays for one doubled prefix pass rather than eight.
+    cache = None
+    if getattr(model, "attention_mode", "full") == "prefix":
+        cache = (model.encode_prefix(hist2, extero2, cmd2, mask2) if guided
+                 else model.encode_prefix(history, extero, cmd_tokens, history_null_mask))
+
     for i in range(num_steps):
         tau = torch.full((b,), i * dt, device=device, dtype=history.dtype)
         if guided:
-            v2 = model(torch.cat([x, x], 0), torch.cat([tau, tau], 0), hist2, extero2, cmd2,
-                       history_null_mask=mask2)
+            x2, tau2 = torch.cat([x, x], 0), torch.cat([tau, tau], 0)
+            v2 = (model.decode_future(x2, tau2, cache) if cache is not None
+                  else model(x2, tau2, hist2, extero2, cmd2, history_null_mask=mask2))
             v_cond, v_null = v2[:b], v2[b:]
             # v_null + w (v_cond - v_null): extrapolate along the direction the HISTORY
             # contributes. Envs already null-masked have v_cond == v_null, so guidance is a
             # no-op for them -- which is what you want for the first N steps after a reset.
             v = v_null + guidance_scale * (v_cond - v_null)
+        elif cache is not None:
+            v = model.decode_future(x, tau, cache)
         else:
             v = model(x, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
         x = x + dt * v
@@ -563,6 +579,12 @@ def sample_trajectory_grad(
     step = 1.0 / num_steps
     keep = min(max(grad_steps, 1), num_steps)
     no_grad_steps = num_steps - keep
+    # DELIBERATELY not prefix-cached, unlike sample_trajectory. The early steps here run under
+    # no_grad and the tail steps do not; a cache built in the no_grad region and reused in the
+    # tail would detach the conditioning embeddings from the autograd graph, so those steps
+    # would stop backpropagating into history/extero/cmd -- silently, since the shapes and the
+    # forward values would all be right. Nothing outside this module and one test calls this
+    # function, so correctness beats the speedup.
     for i in range(num_steps):
         tau = torch.full((b,), i * step, device=device, dtype=history.dtype)
         if i < no_grad_steps:

@@ -111,6 +111,52 @@ with `v = 0` the top row, and the `(H, W)` to fold it with is derived from the r
 from a 26x30 one, so the shape travels into `fm.onnx` and the deploy refuses a mismatch
 (`transfer/deploy/gen_tracker.py`).
 
+### Attention: one-way conditioning (`--attention_mode`)
+
+Which way the dependency between the conditioning and the denoised window runs.
+
+* **`prefix`** (default) — the conditioning (history + extero + cmd) attends only to
+  **itself**, and the future tokens attend to everything including themselves. The flow-time
+  embedding also stops reaching the conditioning.
+* **`full`** — every token attends to every other and the flow-time embedding lands on all of
+  them. What every checkpoint before this flag was trained under; pass it for a controlled
+  comparison against one.
+
+Under `full`, the conditioning attends to tokens carrying noise at level `tau`, so its own
+representation is a function of the noise level — when it should be a fixed statement about
+the robot's past, what it can see and what it was asked to do. That is the bug; the
+dependency should run one way.
+
+The consequence is that a representation which cannot depend on the future or on `tau` is
+computable **once per re-plan** and reusable by every Euler step, which is how
+`flow.sample_trajectory` and the exported graph run it.
+
+**Measured** (8 Euler steps, XL width, CUDA), because this is not where intuition lands:
+
+| path | model | batch | full | prefix | |
+|---|---|---|---|---|---|
+| torch | cnn extero (P=49, S=111) | 64 | 328 ms | 235 ms | **1.39x** |
+| torch | cnn extero | 1024 | 5176 ms | 3872 ms | **1.34x** |
+| torch | mlp extero (P=19, S=81) | 1024 | 3792 ms | 3361 ms | 1.13x |
+| onnx | mlp extero | 1 | 10.8 ms | 13.3 ms | **0.82x** |
+
+So the win lands on the **torch** path — Isaac play, training validation and all four FM
+diagnostics — and is largest for the CNN encoder, whose conditioning is the bigger share of
+the sequence. It roughly cancels the cost the CNN's 32 extero tokens added.
+
+The exported graph is **slower at the deploy batch of 1**: fewer FLOPs, but ~27% more nodes
+(one extra layer stack plus a `Concat` per layer per step), and onnxruntime at batch 1 is
+launch-bound, so time tracks node count rather than arithmetic. If that starts to matter, the
+fix is to export `prefix` mode as a masked full-sequence pass — identical semantics and node
+count to `full`, no speedup — and keep the cached form for torch only.
+
+⚠️ **The two modes share one parameter set.** A mislabelled checkpoint loads without complaint
+and runs under attention it was never trained with; `load_state_dict` cannot catch it the way
+it catches a wrong `--extero_encoder`. `FlowMatchingConfig.from_dict` defaults a pre-flag
+checkpoint to `full`, the resolved mode is printed at train and load time, and it is recorded
+in `fm_meta` — that is the whole defence.
+
+
 ### Changing the generator's resolution without retraining the teacher
 
 The generator can sample the policy's lenses on **its own grid**, so the encoder's input can

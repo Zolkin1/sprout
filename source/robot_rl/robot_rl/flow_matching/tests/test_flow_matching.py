@@ -782,6 +782,7 @@ def test_online_roundtrip():
         state_dim=cfg.state_dim, future_len=F, num_history_states=N, history_dim=cfg.state_dim,
         extero_sensor_dim=cfg.extero_sensor_dim, cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
         d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward,
+        attention_mode=cfg.attention_mode,
     ).eval()
     ckpt = {
         "config": cfg.to_dict(),
@@ -842,6 +843,7 @@ def test_online_roundtrip_with_the_cnn_encoder():
         num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward,
         extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
         extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
+        attention_mode=cfg.attention_mode,
     ).eval()
     ckpt = {
         "config": cfg.to_dict(),

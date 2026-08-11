@@ -92,10 +92,39 @@ class _FmSamplerOnnx(nn.Module):
 
         x = noise                                            # (V, F, D) -- all F denoised
         dt = 1.0 / self.num_steps
+        # Under ``prefix`` attention the conditioning's representation does not depend on the
+        # noised tokens or on the flow time, so it is encoded ONCE rather than ``num_steps``
+        # times. Held as a local, never on ``self``: this module is TorchScript-traced, and a
+        # cache stashed as module state would be constant-folded into the exported weights.
+        #
+        # TODO(fm-onnx-prefix): this hoist makes the exported graph SLOWER at the deploy batch
+        # of 1, which is the opposite of its purpose here. MEASURED on the xl27M: 13.3 ms
+        # against 10.8 ms on CUDA, with 13.4k graph nodes against 10.6k. Fewer FLOPs but more
+        # kernels -- one extra layer stack for the conditioning plus a Concat per layer per
+        # step -- and at batch 1 onnxruntime is launch-bound, so time tracks node count. The
+        # saving is real where the kernels are big: the TORCH path at Isaac's batch sizes gets
+        # 1.34-1.39x on the CNN model, so this is an ORT/graph-shape problem rather than an
+        # arithmetic one.
+        #
+        # First thing to check: ORT has a FUSED Attention kernel that pattern-matches
+        # self-attention (q, k, v from ONE input). ``decode_future`` passes query=future,
+        # key=value=cat(prefix, future), which plausibly breaks that match -- so ``full`` may be
+        # getting a fused kernel that this path is not. Dump both graphs with
+        # ``sess_options.optimized_model_filepath`` and compare their Attention nodes.
+        #
+        # Fallback, already scoped and proven equivalent by
+        # ``test_prefix_attention_matches_a_masked_full_pass``: export ``prefix`` mode as a
+        # MASKED full-sequence pass -- same semantics and same node count as ``full``, no
+        # speedup but no regression -- and keep this cached form for the torch path only. Keep
+        # any such mask strictly 2-D ``(S, S)``, which broadcasts; a 3-D one bakes in a static
+        # batch and breaks the dynamic-batch contract the five graph inputs share.
+        cache = (self.model.encode_prefix(hist_n, height_n, cmd_n, null_m)
+                 if self.model.attention_mode == "prefix" else None)
         for i in range(self.num_steps):
             # Batch-derived tau (V,) so the graph stays dynamic in the batch axis.
             tau = noise[:, 0, 0] * 0.0 + (i * dt)
-            v = self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m)
+            v = (self.model.decode_future(x, tau, cache) if cache is not None
+                 else self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m))
             x = x + dt * v
         # Project the rotation block back onto SO(3), exactly as
         # ``flow_matching.online.sample_window`` does for simulation -- the model emits 6
@@ -136,6 +165,10 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
                             if (ctx.extero_image_hw
                                 and ctx.model.extero_encoder == "cnn") else None),
         "extero_tokens_per_sensor": int(ctx.model.tokens_per_sensor),
+        # Which way the conditioning/future dependency runs. The deploy does not need it --
+        # the graph is opaque and folds the whole sampler in -- but a loaded artifact should
+        # be able to say which architecture it is, because nothing in the weights can.
+        "attention_mode": str(ctx.model.attention_mode),
         # What the history tokens must be built from, and the re-plan period the targets
         # were cut at. Both are contracts the runtime has to honour, not descriptions: a
         # deployment feeding a measured history to a partially autoregressive model, or

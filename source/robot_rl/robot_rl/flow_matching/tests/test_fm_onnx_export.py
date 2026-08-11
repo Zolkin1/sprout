@@ -47,7 +47,8 @@ sys.path.insert(0, os.path.join(_REPO_ROOT, "transfer"))
 from deploy.fm_session import _check_state_layout  # noqa: E402
 
 
-def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto") -> tuple[str, int, int, int, int]:
+def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto",
+                    attention_mode: str | None = None) -> tuple[str, int, int, int, int]:
     """Train-free checkpoint in the exact shape ``load_fm_context`` expects.
 
     Args:
@@ -57,6 +58,9 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto") -> tuple[str, int, 
             baseline. The model is built from the RESOLVED config rather than the defaults,
             because a config saying one encoder over the other's weights is exactly what
             ``load_fm_context`` refuses.
+        attention_mode: ``None`` takes the config default (``"prefix"``); pass ``"full"`` for
+            the legacy architecture. Unlike the encoder, a mismatch here is NOT refusable --
+            the modes are weight-identical -- so the fixture must build what it saves.
 
     Returns:
         ``(checkpoint_path, num_history_states, future_len, num_joints, num_extra_frames)``.
@@ -72,6 +76,7 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto") -> tuple[str, int, 
         target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
         d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
         extero_encoder=extero_encoder,
+        **({} if attention_mode is None else {"attention_mode": attention_mode}),
     )
     train, _ = build_train_val(data, meta, cfg)
     model = FlowMatchingTransformer(
@@ -82,6 +87,11 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto") -> tuple[str, int, 
         dim_feedforward=cfg.dim_feedforward,
         extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
         extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
+        # From the CFG, not the ctor default. The two attention modes share one parameter
+        # set, so a model built "full" under a config saying "prefix" loads and runs without
+        # complaint -- the fixture would silently export a graph whose arithmetic is not the
+        # one its own config describes.
+        attention_mode=cfg.attention_mode,
     ).eval()
     path = str(tmp_path / "ckpt.pt")
     torch.save({

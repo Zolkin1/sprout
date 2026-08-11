@@ -133,8 +133,14 @@ class FlowMatchingTransformer(nn.Module):
         extero_image_hw: Sequence[Sequence[int]] | None = None,
         extero_cnn_channels: Sequence[int] = (16, 32, 64),
         extero_cnn_grid: Sequence[int] | None = None,
+        attention_mode: str = "full",
     ):
         super().__init__()
+        if attention_mode not in ("full", "prefix"):
+            raise ValueError(
+                f"unknown attention_mode {attention_mode!r}; expected 'full' or 'prefix'."
+            )
+        self.attention_mode = str(attention_mode)
         self.d_model = d_model
         self.state_dim = state_dim
         self.future_len = future_len
@@ -243,8 +249,211 @@ class FlowMatchingTransformer(nn.Module):
     @property
     def sequence_len(self) -> int:
         """Total token count the transformer sees."""
+        return self.prefix_len + int(self.future_len)
+
+    @property
+    def prefix_len(self) -> int:
+        """Conditioning tokens: history + exteroception + command.
+
+        The leading, contiguous block of the sequence -- which is what lets ``prefix`` mode
+        split it off without reordering anything.
+        """
         return (int(self.num_history_states) + self.extero_seq_tokens
-                + int(self.cmd_steps.numel()) + int(self.future_len))
+                + int(self.cmd_steps.numel()))
+
+    # ------------------------------------------------------------------
+    # Token assembly, shared by both attention modes.
+    # ------------------------------------------------------------------
+    def _embed_prefix(
+        self,
+        history: torch.Tensor,
+        extero: torch.Tensor,
+        cmd_tokens: torch.Tensor | None,
+        history_null_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Embed the conditioning streams into ``(B, prefix_len, d_model)``.
+
+        Carries NO flow-time embedding: under ``prefix`` attention the conditioning must not
+        be a function of the noise level (that is the point of the mode), and under ``full``
+        attention :meth:`forward` adds ``t_emb`` to the whole sequence afterwards, exactly as
+        it always did.
+
+        Args:
+            history: Raw history (phase) conditioning, ``(B, N, history_dim)``.
+            extero: Exteroception, ``(B, T, extero_sensor_dim)`` / ``(B, T*dim)`` / ``(B,)``.
+            cmd_tokens: Strided command tokens, ``(B, num_cmd_tokens, cmd_dim)`` or ``None``.
+            history_null_mask: Optional ``(B,)`` bool; where True the history content is
+                replaced by the learned ``null_history`` embedding.
+
+        Returns:
+            The assembled conditioning tokens.
+
+        Raises:
+            ValueError: If the model was built with ``cmd_dim > 0`` and no ``cmd_tokens``.
+        """
+        b = history.shape[0]
+        n = self.num_history_states
+
+        # History tokens (content from history_in, or the learned null), positioned.
+        h_content = self.history_in(history)  # (B, N, d_model)
+        if history_null_mask is not None:
+            nm = history_null_mask.view(b, 1, 1)
+            h_content = torch.where(nm, self.null_history.expand(b, n, self.d_model), h_content)
+        h = h_content + self.pos[:, :n, :] + self.hist_type  # (B, N, d_model)
+
+        # Exteroception tokens. No TIMELINE position -- the reading is "now" -- so the only
+        # identity they carry is the type, the per-sensor id and (CNN) the spatial slot.
+        # Accepts (B, T*dim), (B, dim) or (B,); all reshape to (B, T, dim).
+        #
+        # Both encoders are put through ONE set of identity adds by giving the MLP a
+        # length-1 slot axis. On that path the adds are (1,1,1,d) and (1,T,1,d) broadcasts
+        # followed by a reshape back to (B, T, d), so it stays numerically identical to the
+        # pre-CNN code and the trained baseline's outputs remain bit-comparable.
+        ev = extero.reshape(b, self.extero_sensor_count, self.extero_sensor_dim)
+        et = (self.extero_cnn(ev) if self.extero_cnn is not None
+              else self.extero_in(ev).unsqueeze(2))        # (B, T, S, d_model); S=1 for mlp
+        et = et + self.extero_type.unsqueeze(1)            # (1, 1, 1, d_model)
+        if self.extero_id is not None:
+            et = et + self.extero_id.unsqueeze(2)          # (1, T, 1, d) -> every slot of a cam
+        # Camera-major, slot-minor -- the order ``extero_id``/``spatial`` were added in.
+        ht = et.reshape(b, self.extero_seq_tokens, self.d_model)
+
+        parts = [h, ht]
+        if self.cmd_in is not None:
+            if cmd_tokens is None:
+                raise ValueError("Model built with cmd_dim > 0 requires cmd_tokens.")
+            # Each cmd token aligns in time with its future state token (pos at N + step).
+            c = self.cmd_in(cmd_tokens) + self.pos[:, n + self.cmd_steps, :] + self.cmd_type
+            parts.append(c)
+        return torch.cat(parts, dim=1)  # (B, N + T + Ncmd, d_model)
+
+    def _embed_future(self, x_tau: torch.Tensor) -> torch.Tensor:
+        """Embed the denoised state tokens, positioned at ``N .. N+F-1``.
+
+        Args:
+            x_tau: Future state tokens at flow-time tau, ``(B, F, state_dim)``.
+
+        Returns:
+            ``(B, F, d_model)``, without the flow-time embedding.
+        """
+        n, f = self.num_history_states, self.future_len
+        return self.state_in(x_tau) + self.pos[:, n:n + f, :]
+
+    def _time_embedding(self, tau: torch.Tensor) -> torch.Tensor:
+        """Flow-time embedding, ``(B, 1, d_model)``, broadcastable over a token axis."""
+        return self.time_mlp(_timestep_embedding(tau, self.d_model)).unsqueeze(1)
+
+    @staticmethod
+    def _run_layer(layer: nn.Module, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        """One ``nn.TransformerEncoderLayer``, with the key/value source given separately.
+
+        Reproduces the stock POST-norm layer exactly -- ``norm_first=False`` is the default
+        this model builds with -- differing only in that the keys and values may come from a
+        longer sequence than the queries. That is ordinary cross-attention, so the fused
+        in/out projections, the head split and the SDPA scaling all stay PyTorch's.
+
+        Op order is load-bearing and there are THREE distinct dropout modules on the way
+        through (``dropout1`` after attention, ``dropout`` inside the feedforward, ``dropout2``
+        after it); at the shipped ``dropout=0.0`` a mix-up is invisible, which is why
+        ``test_prefix_attention_matches_a_masked_full_pass`` exists.
+
+        Args:
+            layer: One layer of ``self.encoder``.
+            x: Query rows, ``(B, Lq, d_model)`` -- also the residual stream.
+            kv: Key/value rows, ``(B, Lkv, d_model)``.
+
+        Returns:
+            ``(B, Lq, d_model)``.
+        """
+        a = layer.self_attn(x, kv, kv, need_weights=False)[0]
+        x = layer.norm1(x + layer.dropout1(a))
+        ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(x))))
+        return layer.norm2(x + layer.dropout2(ff))
+
+    # ------------------------------------------------------------------
+    # ``prefix`` attention: encode the conditioning once, decode per step.
+    # ------------------------------------------------------------------
+    def encode_prefix(
+        self,
+        history: torch.Tensor,
+        extero: torch.Tensor,
+        cmd_tokens: torch.Tensor | None = None,
+        history_null_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, ...]:
+        """Run the conditioning through the stack on its own; return the per-layer inputs.
+
+        Under ``prefix`` attention the conditioning attends only to itself, so its
+        representation at every layer is a function of the conditioning ALONE -- not of the
+        future tokens and not of the flow time. It can therefore be computed once per re-plan
+        and reused by every Euler step, which is the whole reason the mode exists.
+
+        What the future needs at layer ``i`` is the conditioning's *input* to that layer (its
+        keys and values there), so that is what is returned: ``L`` tensors, not ``L+1``. The
+        conditioning's final output is never read -- nothing downstream consumes it.
+
+        Returned as a tuple rather than stashed on ``self`` deliberately: ``_FmSamplerOnnx``
+        is TorchScript-traced, and a cache held as module state would be constant-folded into
+        the exported graph.
+
+        Args:
+            history: Raw history (phase) conditioning, ``(B, N, history_dim)``.
+            extero: Exteroception, ``(B, T, extero_sensor_dim)`` / ``(B, T*dim)`` / ``(B,)``.
+            cmd_tokens: Strided command tokens, or ``None``.
+            history_null_mask: Optional ``(B,)`` bool null-history selector.
+
+        Returns:
+            One ``(B, prefix_len, d_model)`` tensor per layer, in layer order.
+
+        Raises:
+            RuntimeError: If the model was built with ``attention_mode="full"``.
+        """
+        if self.attention_mode != "prefix":
+            raise RuntimeError(
+                "encode_prefix needs attention_mode='prefix'; a 'full'-attention model's "
+                "conditioning representation depends on the future tokens and the flow time, "
+                "so there is nothing stable to cache."
+            )
+        x = self._embed_prefix(history, extero, cmd_tokens, history_null_mask)
+        cache = []
+        for layer in self.encoder.layers:
+            cache.append(x)
+            x = self._run_layer(layer, x, x)
+        return tuple(cache)
+
+    def decode_future(
+        self, x_tau: torch.Tensor, tau: torch.Tensor,
+        prefix_cache: Sequence[torch.Tensor],
+    ) -> torch.Tensor:
+        """Predict the flow field for the future window against a cached conditioning prefix.
+
+        The future tokens attend to the conditioning AND to each other, so at layer ``i`` the
+        keys and values are ``cat(prefix_cache[i], future)``. No attention mask is needed:
+        the conditioning is simply not in the query set, which is the same thing a prefix mask
+        expresses and considerably cheaper than expressing it.
+
+        The flow-time embedding is added HERE, to the future tokens only -- the property that
+        makes ``prefix_cache`` reusable across Euler steps.
+
+        Args:
+            x_tau: Future state tokens at flow-time ``tau``, ``(B, F, state_dim)``.
+            tau: Flow time in ``[0, 1]``, ``(B,)``.
+            prefix_cache: Per-layer conditioning inputs from :meth:`encode_prefix`.
+
+        Returns:
+            Predicted velocity field, ``(B, F, state_dim)``.
+
+        Raises:
+            ValueError: If the cache does not have one entry per layer.
+        """
+        if len(prefix_cache) != len(self.encoder.layers):
+            raise ValueError(
+                f"prefix_cache has {len(prefix_cache)} entries but the encoder has "
+                f"{len(self.encoder.layers)} layers; it must carry one per layer."
+            )
+        x = self._embed_future(x_tau) + self._time_embedding(tau)
+        for layer, prefix in zip(self.encoder.layers, prefix_cache):
+            x = self._run_layer(layer, x, torch.cat([prefix, x], dim=1))
+        return self.output_head(x)
 
     def forward(
         self,
@@ -274,47 +483,25 @@ class FlowMatchingTransformer(nn.Module):
         Returns:
             Predicted velocity field over the F future tokens, shape ``(B, F, state_dim)``.
         """
-        b, f = x_tau.shape[0], self.future_len
-        n = self.num_history_states
+        f = self.future_len
+        prefix = self._embed_prefix(history, extero, cmd_tokens, history_null_mask)
 
-        # History tokens (content from history_in, or the learned null), positioned.
-        h_content = self.history_in(history)  # (B, N, d_model)
-        if history_null_mask is not None:
-            nm = history_null_mask.view(b, 1, 1)
-            h_content = torch.where(nm, self.null_history.expand(b, n, self.d_model), h_content)
-        h = h_content + self.pos[:, :n, :] + self.hist_type  # (B, N, d_model)
+        if self.attention_mode == "prefix":
+            # One implementation, not two: the single-shot path (training, and any caller that
+            # does not hold a cache) is the cached path with a cache of one use. So there is no
+            # second arithmetic to keep in step with the Euler loop's.
+            cache = []
+            x = prefix
+            for layer in self.encoder.layers:
+                cache.append(x)
+                x = self._run_layer(layer, x, x)
+            return self.decode_future(x_tau, tau, cache)
 
-        # Exteroception tokens. No TIMELINE position -- the reading is "now" -- so the only
-        # identity they carry is the type, the per-sensor id and (CNN) the spatial slot.
-        # Accepts (B, T*dim), (B, dim) or (B,); all reshape to (B, T, dim).
-        #
-        # Both encoders are put through ONE set of identity adds by giving the MLP a
-        # length-1 slot axis. On that path the adds are (1,1,1,d) and (1,T,1,d) broadcasts
-        # followed by a reshape back to (B, T, d), so it stays numerically identical to the
-        # pre-CNN code and the trained baseline's outputs remain bit-comparable.
-        ev = extero.reshape(b, self.extero_sensor_count, self.extero_sensor_dim)
-        et = (self.extero_cnn(ev) if self.extero_cnn is not None
-              else self.extero_in(ev).unsqueeze(2))        # (B, T, S, d_model); S=1 for mlp
-        et = et + self.extero_type.unsqueeze(1)            # (1, 1, 1, d_model)
-        if self.extero_id is not None:
-            et = et + self.extero_id.unsqueeze(2)          # (1, T, 1, d) -> every slot of a cam
-        # Camera-major, slot-minor -- the order ``extero_id``/``spatial`` were added in.
-        ht = et.reshape(b, self.extero_seq_tokens, self.d_model)
-
-        # Future (denoised) state tokens, positioned at N..N+F-1.
-        s = self.state_in(x_tau) + self.pos[:, n:n + f, :]  # (B, F, d_model)
-
-        parts = [h, ht]
-        if self.cmd_in is not None:
-            if cmd_tokens is None:
-                raise ValueError("Model built with cmd_dim > 0 requires cmd_tokens.")
-            # Each cmd token aligns in time with its future state token (pos at N + step).
-            c = self.cmd_in(cmd_tokens) + self.pos[:, n + self.cmd_steps, :] + self.cmd_type
-            parts.append(c)
-        parts.append(s)
-        tokens = torch.cat(parts, dim=1)  # (B, N + T + Ncmd + F, d_model)
-
-        t_emb = self.time_mlp(_timestep_embedding(tau, self.d_model)).unsqueeze(1)  # (B,1,d_model)
-        tokens = tokens + t_emb
+        # ``full``: every token attends to every other, and the flow-time embedding lands on
+        # all of them. Kept byte-identical -- this is what every checkpoint trained before
+        # attention_mode existed was trained under, and the mask adds no parameters, so the
+        # config is the ONLY thing that distinguishes such a checkpoint from a prefix one.
+        tokens = torch.cat([prefix, self._embed_future(x_tau)], dim=1)  # (B, S, d_model)
+        tokens = tokens + self._time_embedding(tau)
         tokens = self.encoder(tokens)  # full self-attention over all tokens
         return self.output_head(tokens[:, -f:, :])  # trailing F future-token outputs

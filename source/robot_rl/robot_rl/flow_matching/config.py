@@ -18,6 +18,9 @@ EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
 #: Recognised :attr:`FlowMatchingConfig.extero_encoder` values (after ``"auto"`` resolves).
 EXTERO_ENCODERS: tuple[str, ...] = ("mlp", "cnn")
 
+#: Recognised :attr:`FlowMatchingConfig.attention_mode` values.
+ATTENTION_MODES: tuple[str, ...] = ("full", "prefix")
+
 #: Config keys renamed when the exteroception contract stopped being height-scan-shaped:
 #: old name -> new name. Applied by :meth:`FlowMatchingConfig.from_dict`, so a checkpoint
 #: trained before the rename still loads and can still serve as an A/B control.
@@ -306,6 +309,32 @@ class FlowMatchingConfig:
     # Probability that a training sample's history (phase) tokens are replaced by the
     # model's learned null embedding -- classifier-free-guidance / phase-agnostic nominal.
     null_cond_prob: float = 0.2
+    # Which way the dependency between the conditioning and the denoised window runs.
+    #   "prefix" -- the conditioning (history + extero + cmd) attends only to ITSELF, and the
+    #               future tokens attend to everything including themselves. Also keeps the
+    #               flow-time embedding off the conditioning entirely. DEFAULT.
+    #   "full"   -- every token attends to every other and the flow-time embedding lands on
+    #               all of them. What every checkpoint before this flag was trained under.
+    #
+    # Why "prefix" is the right shape: under full attention the conditioning attends to tokens
+    # carrying noise at level tau, so its own representation is a function of the noise level
+    # -- when it should be a fixed statement about the robot's past, what it can see and what
+    # it was asked to do. The dependency should run one way.
+    #
+    # The consequence that pays for itself: a representation that cannot depend on the future
+    # or on tau is computable ONCE per re-plan and reusable by every Euler step, which is how
+    # ``flow.sample_trajectory`` and the exported graph now run it (~1.4x on the CNN model,
+    # whose conditioning is the larger share of the sequence).
+    #
+    # NOTE the asymmetry with ``FlowMatchingTransformer``'s constructor, which defaults to
+    # "full": a bare model built in a test keeps the legacy path, while a trained config gets
+    # the current architecture. Same split as ``extero_encoder``.
+    #
+    # WARNING, because nothing else can catch it: the two modes have the SAME PARAMETERS, so
+    # a mislabelled checkpoint loads without complaint and runs under attention it was never
+    # trained with. ``load_state_dict`` caught a wrong ``extero_encoder`` because the weights
+    # differed; here it cannot. ``from_dict``'s default below is the only guard.
+    attention_mode: str = "prefix"
 
     # -- observation noise (train-time augmentation on the clean history tokens) --
     # Mirrors the RL teacher/tracker obs corruption (Unoise per term): the inputs the
@@ -482,6 +511,18 @@ class FlowMatchingConfig:
                 f"extero_source={self.extero_source!r} is not one of {list(EXTERO_SOURCES)}."
             )
 
+    def check_attention_mode(self) -> None:
+        """Raise if :attr:`attention_mode` is not a recognised mode.
+
+        Raises:
+            ValueError: On an unknown mode name.
+        """
+        if self.attention_mode not in ATTENTION_MODES:
+            raise ValueError(
+                f"attention_mode={self.attention_mode!r} is not one of "
+                f"{list(ATTENTION_MODES)}."
+            )
+
     def resolve_extero_encoder(self) -> str:
         """Settle :attr:`extero_encoder`, expanding ``"auto"`` from the source.
 
@@ -617,4 +658,10 @@ class FlowMatchingConfig:
         # including the trained baseline any new encoder has to be measured against -- as a
         # convolutional model, and the weights would then fail to load.
         kwargs.setdefault("extero_encoder", "mlp")
+        # THE guard for the attention mode, and the only one there can be: the two modes share
+        # one parameter set, so unlike ``extero_encoder`` a wrong value here cannot be caught
+        # by ``load_state_dict``. A checkpoint written before the flag existed is definitionally
+        # full-attention, so an absent key must resolve to "full" and never to the current
+        # default -- which is exactly the mistake this file has now recorded three times.
+        kwargs.setdefault("attention_mode", "full")
         return cls(**kwargs)
