@@ -374,6 +374,156 @@ def normalize_depth_np(
     return (out - offset) * scale
 
 
+def pinhole_ray_directions(width: int, height: int, fx: float, fy: float,
+                           cx: float, cy: float) -> np.ndarray:
+    """Unit ray directions in the camera frame, matching IsaacLab's pinhole pattern.
+
+    Reproduces ``isaaclab.sensors.ray_caster.patterns.pinhole_camera_pattern``: pixel
+    CENTRES through the inverse intrinsic matrix, then mapped into the robotics camera
+    frame (x = optical axis, y = left, z = up).  Row-major flat order ``k = v * width + u``
+    with ``v = 0`` the TOP image row (camera +z) and ``u = 0`` the LEFT column (camera +y).
+    The rays are tangent-linear (a true pinhole), not equiangular.
+
+    Lives here rather than in ``transfer/sim`` because three consumers need it and only one
+    of them is a simulator: the MuJoCo caster, :func:`unproject_to_yaw_frame` (which the
+    hardware runtime also calls), and the diagnostics that rebuild a cloud from an image.
+    ``transfer/sim`` imports ``transfer/deploy``, never the reverse.
+
+    Args:
+        width: Image width in pixels.
+        height: Image height in pixels.
+        fx: Horizontal focal length in pixels.
+        fy: Vertical focal length in pixels.
+        cx: Horizontal principal point in pixels.
+        cy: Vertical principal point in pixels.
+
+    Returns:
+        Unit directions ``(width * height, 3)``, float64.
+    """
+    u, v = np.meshgrid(np.arange(width, dtype=np.float64),
+                       np.arange(height, dtype=np.float64), indexing="xy")
+    dirs = np.stack(
+        [np.ones_like(u), -(u + 0.5 - cx) / fx, -(v + 0.5 - cy) / fy], axis=-1
+    ).reshape(-1, 3)
+    return dirs / np.linalg.norm(dirs, axis=-1, keepdims=True)
+
+
+def invalid_depth_mask(cam: dict, image: np.ndarray) -> np.ndarray:
+    """Which pixels of a NORMALISED image carry no usable range reading.
+
+    The test is ``denormalised depth < min_dist``, NOT equality with the sentinel
+    :func:`normalize_depth_np` writes, and the difference is load-bearing.
+
+    The sentinels (``min_clip_val`` for too-near and ``-inf``, ``max_clip_val`` for
+    beyond-range, non-finite and dropped) are exact only in a CLEAN image. In training they
+    are not: ``mdp.sensors.noise.DepthNoiser`` runs after normalisation and adds a plane
+    bias, per-pixel noise and a 3x3 BLUR, which mixes a missed pixel with its neighbours and
+    leaves it near the sentinel rather than on it. An equality test would call those pixels
+    valid and unproject them to ~0.1 m -- a fake surface on the robot itself.
+
+    Thresholding the range instead catches all of it, and catches it the SAME way in every
+    consumer: the live Isaac term, the offline dataset, the MuJoCo caster and the hardware
+    runtime all see only a normalised image, so all four must agree without one of them
+    having privileged access to a clean signal. Both sentinels denormalise to at most
+    ``max(min_clip_val, max_clip_val)`` metres -- 0 m in the shipped contract -- so they are
+    always below the threshold.
+
+    The honest limit: the noise half-width (~0.13 m of range) is comparable to ``min_dist``
+    (0.10-0.15 m), so the classes genuinely overlap and a few missed pixels survive as
+    readings just inside the near limit. That is a handful of sky pixels landing close to the
+    camera, and it is identical in training and at deploy, which is what matters.
+
+    Args:
+        cam: One parsed camera contract entry.
+        image: Normalised depth, any shape.
+
+    Returns:
+        Boolean mask, the shape of ``image``.
+    """
+    arr = np.asarray(image, dtype=np.float64)
+    depth_m = denormalize_depth_np(arr, float(cam["offset"]), float(cam["scale"]))
+    return ~np.isfinite(depth_m) | (depth_m < float(cam["min_dist"]))
+
+
+def unproject_to_yaw_frame(
+    cam: dict,
+    image: np.ndarray,
+    cam_pos: np.ndarray,
+    cam_rot: np.ndarray,
+    dirs_cam: np.ndarray | None = None,
+) -> np.ndarray:
+    """A normalised depth image -> its 3-D points in the root's yaw-aligned frame.
+
+    The frame is the FM's own anchor frame (``flow_matching.transforms``): origin at the
+    root link, axes yaw-aligned, the root's roll and pitch RETAINED in the coordinates --
+    so tilting the pelvis moves the points, which is correct, because the terrain did not
+    move.  Expressing the cloud there is what lets the generator compare "the step edge is
+    at x = 0.8" against its own predicted base position in the same numbers.
+
+    **Nothing here needs a world pose.** The caller supplies the camera pose already in that
+    frame, and the heading cancels out of it: writing ``R_world_root = Rz(psi) @ R_rp``, a
+    point's yaw-frame coordinates are ``R_rp @ p_root``, in which ``psi`` does not appear.
+    So a deployment needs only forward kinematics from the root to the camera and the root's
+    roll/pitch (i.e. gravity, from the IMU) -- never odometry, and a drifting yaw estimate
+    cannot corrupt the result.
+
+    Depth is converted to ray LENGTH before it is projected out
+    (``distance_to_image_plane`` is the perpendicular z-depth, and
+    ``dirs_cam[:, 0]`` is the cosine to the optical axis), matching the reconstruction
+    ``view_depth_compare_viser.py`` documents.
+
+    Two range subtleties, both consequences of feeding the model's own input back through
+    the pinhole model rather than reading the sensor:
+
+    * ``image`` must be the SAME array the depth channel carries -- post-clip and
+      post-sanitise. A valid pixel therefore saturates at the clip band's equivalent range
+      (4.75 m for the shipped ``+-2`` / ``0.5`` / ``0.75``), and the cloud has a wall there.
+      Deriving xyz from an unclipped image instead would describe a different distance than
+      the depth channel it sits beside.
+    * invalid pixels are placed at ``max_dist`` of RAY LENGTH, which is the sensor's honest
+      per-ray "nothing within range this way" -- a spherical shell at its reach. Setting
+      their z-depth to ``max_dist`` instead would put the image corners 13 m out on a 7.9 m
+      camera, a claim it never makes. Left alone they would denormalise to 0 m and pile a
+      fake surface onto the robot's own origin, the worst place for a convolution to find
+      one. The depth channel keeps its sentinel, so validity stays recoverable (see
+      :func:`invalid_depth_mask`).
+
+    Args:
+        cam: One parsed camera contract entry (intrinsics, range, normalisation).
+        image: Normalised depth for this camera, ``(H*W,)`` or ``(H, W)``.
+        cam_pos: Camera origin in the yaw frame, ``(3,)``.
+        cam_rot: Camera-to-yaw-frame rotation, ``(3, 3)``.
+        dirs_cam: Optional precomputed :func:`pinhole_ray_directions` for this camera;
+            recomputed when omitted. Pass it on a hot path -- it depends only on the
+            contract, so it is constant for the life of a run.
+
+    Returns:
+        Points ``(3, H*W)``, float64, row-major in the same pixel order as ``image``.
+
+    Raises:
+        ValueError: If the image does not hold ``height * width`` pixels.
+    """
+    width, height = int(cam["width"]), int(cam["height"])
+    flat = np.asarray(image, dtype=np.float64).reshape(-1)
+    if flat.size != width * height:
+        raise ValueError(
+            f"camera '{cam.get('sensor', cam.get('obs_term'))}' is {width}x{height} "
+            f"({width * height} px) but the image holds {flat.size}."
+        )
+    if dirs_cam is None:
+        dirs_cam = pinhole_ray_directions(width, height, float(cam["fx"]), float(cam["fy"]),
+                                          float(cam["cx"]), float(cam["cy"]))
+    depth_m = denormalize_depth_np(flat, float(cam["offset"]), float(cam["scale"]))
+    # z-depth -> ray length for a real reading; an invalid pixel is given the ray length
+    # DIRECTLY, so the misses form a spherical shell at the sensor's reach rather than a
+    # plane whose corners would sit 13 m out (see the docstring).
+    ray_len = np.where(invalid_depth_mask(cam, flat), float(cam["max_dist"]),
+                       depth_m / dirs_cam[:, 0])
+    points_cam = dirs_cam * ray_len[:, None]                             # (N, 3)
+    return (np.asarray(cam_rot, dtype=np.float64) @ points_cam.T
+            + np.asarray(cam_pos, dtype=np.float64).reshape(3, 1))
+
+
 def sanitize_extero_np(
     values: np.ndarray, source: str, clip: float | None = None
 ) -> np.ndarray:

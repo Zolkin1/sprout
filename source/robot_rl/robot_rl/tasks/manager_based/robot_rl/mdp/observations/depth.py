@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.utils.math import matrix_from_quat, subtract_frame_transforms, yaw_quat
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.noise import get_depth_noiser
 
@@ -98,6 +99,143 @@ def _normalization_params(params: dict) -> dict[str, float]:
         for name, parameter in signature.parameters.items()
         if name != "d"
     }
+
+
+_RAY_DIRS_CACHE: dict[tuple, torch.Tensor] = {}
+"""Per-camera ray directions, keyed by intrinsics + device + dtype.
+
+The pattern depends only on the camera CONTRACT, which is fixed for the life of a run (the
+intrinsics in the contract come from the cfg, so the per-env intrinsics randomisation does
+not reach it -- see :func:`depth_camera_specs`). Recomputing a 780x3 meshgrid every step for
+every camera is pure waste.
+"""
+
+
+def pinhole_ray_directions(
+    width: int,
+    height: int,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    device: torch.device | str,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """Unit ray directions in the camera frame, matching IsaacLab's pinhole pattern.
+
+    Torch counterpart of ``transfer/deploy/depth_obs.pinhole_ray_directions``, which is the
+    reference implementation; the two are parity-tested in
+    ``transfer/deploy/tests/test_depth_unproject.py``. They are separate implementations
+    rather than one shared function because ``robot_rl`` must not import ``transfer``.
+
+    Pixel CENTRES through the inverse intrinsic matrix, mapped into the robotics camera frame
+    (x = optical axis, y = left, z = up). Row-major flat order ``k = v * width + u`` with
+    ``v = 0`` the TOP row and ``u = 0`` the LEFT column -- the same ordering
+    ``flow_matching.extero_encoder`` folds an image with, and the reason that ordering is a
+    contract rather than a convention.
+
+    Results are cached (see :data:`_RAY_DIRS_CACHE`), so the returned tensor is SHARED: treat
+    it as read-only.
+
+    Args:
+        width: Image width in pixels.
+        height: Image height in pixels.
+        fx: Horizontal focal length in pixels.
+        fy: Vertical focal length in pixels.
+        cx: Horizontal principal point in pixels.
+        cy: Vertical principal point in pixels.
+        device: Device to build the directions on.
+        dtype: Floating dtype of the result.
+
+    Returns:
+        Unit directions ``(height * width, 3)``.
+    """
+    key = (int(width), int(height), float(fx), float(fy), float(cx), float(cy),
+           str(device), dtype)
+    cached = _RAY_DIRS_CACHE.get(key)
+    if cached is not None:
+        return cached
+    u = torch.arange(int(width), device=device, dtype=dtype)
+    v = torch.arange(int(height), device=device, dtype=dtype)
+    vv, uu = torch.meshgrid(v, u, indexing="ij")          # row-major: v outer, u inner
+    dirs = torch.stack(
+        [torch.ones_like(uu), -(uu + 0.5 - cx) / fx, -(vv + 0.5 - cy) / fy], dim=-1
+    ).reshape(-1, 3)
+    dirs = dirs / torch.linalg.norm(dirs, dim=-1, keepdim=True)
+    _RAY_DIRS_CACHE[key] = dirs
+    return dirs
+
+
+def invalid_depth_mask(cam: dict, image: torch.Tensor) -> torch.Tensor:
+    """Which pixels of a NORMALISED image carry no usable range reading.
+
+    Torch counterpart of ``transfer/deploy/depth_obs.invalid_depth_mask``, whose docstring
+    carries the reasoning in full. The short version: the test is ``denormalised depth <
+    min_dist``, not equality with the sentinel, because :class:`~robot_rl.tasks.
+    manager_based.robot_rl.mdp.sensors.noise.DepthNoiser` runs AFTER normalisation and blurs
+    a missed pixel off its sentinel -- and because all four consumers of these channels see
+    only a normalised image, so none of them may use a rule the others cannot.
+
+    Args:
+        cam: One camera contract entry (:func:`depth_camera_specs`).
+        image: Normalised depth, any shape.
+
+    Returns:
+        Boolean mask, the shape of ``image``.
+    """
+    depth_m = image / float(cam["scale"]) + float(cam["offset"])
+    return ~torch.isfinite(depth_m) | (depth_m < float(cam["min_dist"]))
+
+
+def unproject_to_yaw_frame(
+    cam: dict,
+    image: torch.Tensor,
+    cam_pos: torch.Tensor,
+    cam_rot: torch.Tensor,
+    dirs_cam: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """A normalised depth image -> its 3-D points in the root's yaw-aligned frame.
+
+    Torch counterpart of ``transfer/deploy/depth_obs.unproject_to_yaw_frame``, which holds
+    the full reasoning: the frame, why the heading cancels out of it (so nothing here needs
+    odometry), the z-depth-to-ray-length conversion, and what happens at the clip band and at
+    an invalid pixel. Parity-tested against it.
+
+    Args:
+        cam: One camera contract entry (:func:`depth_camera_specs`).
+        image: Normalised depth ``(B, H*W)`` -- the SAME array the depth channel carries.
+        cam_pos: Camera origin in the yaw frame, ``(B, 3)``.
+        cam_rot: Camera-to-yaw-frame rotation, ``(B, 3, 3)``.
+        dirs_cam: Optional precomputed :func:`pinhole_ray_directions` for this camera.
+
+    Returns:
+        Points ``(B, 3, H*W)``, row-major in the same pixel order as ``image``.
+
+    Raises:
+        ValueError: If the image does not hold ``height * width`` pixels.
+    """
+    width, height = int(cam["width"]), int(cam["height"])
+    if image.shape[-1] != width * height:
+        raise ValueError(
+            f"camera '{cam.get('sensor', cam.get('obs_term'))}' is {width}x{height} "
+            f"({width * height} px) but the image rows are {image.shape[-1]} wide."
+        )
+    if dirs_cam is None:
+        dirs_cam = pinhole_ray_directions(
+            width, height, float(cam["fx"]), float(cam["fy"]), float(cam["cx"]),
+            float(cam["cy"]), image.device, image.dtype,
+        )
+    depth_m = image / float(cam["scale"]) + float(cam["offset"])
+    # z-depth -> ray length for a real reading; an invalid pixel takes the ray length
+    # DIRECTLY, so misses form a spherical shell at the sensor's reach instead of a plane
+    # whose corners would sit far beyond it.
+    ray_len = torch.where(
+        invalid_depth_mask(cam, image),
+        torch.as_tensor(float(cam["max_dist"]), device=image.device, dtype=image.dtype),
+        depth_m / dirs_cam[:, 0],
+    )
+    points_cam = ray_len.unsqueeze(-1) * dirs_cam                    # (B, N, 3)
+    return torch.bmm(cam_rot, points_cam.transpose(1, 2)) + cam_pos.unsqueeze(-1)
 
 
 def depth_image(
@@ -370,6 +508,209 @@ def depth_obs_stack(
             "so they cannot share one stacked array. This is what scoping is for: pass "
             "mdp.fm_depth_groups(env) for the generator's pair or mdp.rl_depth_groups(env) "
             "for the policy's, rather than reading every group at once."
+        )
+    return torch.stack(rows, dim=1)
+
+
+#: Channel order of a multi-channel depth reading, outermost axis first.
+#:
+#: ``d`` is the normalised depth the single-channel path already carried, so channel 0 of a
+#: 4-channel row is bit-identical to the 1-channel row -- which is what lets a 1-channel
+#: checkpoint and a 4-channel one be compared on the same recording.
+DEPTH_XYZ_CHANNELS: tuple[str, ...] = ("d", "x", "y", "z")
+
+
+def depth_camera_pose_yaw_frame(
+    env: "ManagerBasedRLEnv", cam: dict
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One camera's OPTICAL pose in the robot root's yaw-aligned frame.
+
+    Two choices here, both load-bearing:
+
+    **The pose is built from the MOUNT BODY plus the contract's offset**, never from
+    ``RayCasterData.quat_w``. The sensor bakes ``cfg.offset.rot`` into its ray directions
+    once at init, so reading ``quat_w`` back gives an optical axis of +x with no pitch,
+    unchanged across postures. Mount-body-plus-offset is what the contract means, and it is
+    the same construction ``MujocoDepthCameras._Camera.pose`` and
+    ``compare_depth_sim2sim._isaac_camera_pose`` use -- so all three stacks describe one
+    camera.
+
+    **The offset is the NOMINAL one from the contract**, not the per-env randomised mount.
+    A deployed robot knows its calibrated mount and nothing more, so this is the pose it can
+    reproduce; the extrinsics DR then perturbs the IMAGE relative to the stated geometry,
+    which is exactly the calibration error hardware has. Using the true randomised pose would
+    teach the generator to trust a registration it will never be given.
+
+    The frame is built with ``subtract_frame_transforms`` against ``yaw_quat`` of the root --
+    the same construction ``flow_matching.transforms._frame_relative_block`` uses for the
+    reference window -- so the points and the window the generator predicts cannot end up in
+    two different frames.
+
+    Args:
+        env: The environment instance.
+        cam: One camera contract entry (:func:`depth_camera_specs`).
+
+    Returns:
+        ``(pos (B, 3), rot (B, 3, 3))`` -- the camera origin and its camera-to-yaw-frame
+        rotation, per environment.
+    """
+    robot = env.scene["robot"]
+    body_i = list(robot.data.body_names).index(cam["mount_body"])
+    # EVERY quaternion in this function is scalar-LAST (x, y, z, w) and stays that way:
+    # Isaac Lab 3.0's articulation buffers are scalar-last AND so is ``isaaclab.utils.math``
+    # (see ``matrix_from_quat`` / ``yaw_quat``), so nothing needs reordering. ``to_wxyz`` from
+    # world_lift_isaac is for crossing into MOTION_GEN's helpers, which are scalar-first --
+    # applying it here would be a silent ~180 deg roll about x, which is the bug that file
+    # exists to document. The contract's own ``offset_quat_xyzw`` is already in this order.
+    body_pos = _torch(robot.data.body_pos_w)[:, body_i]
+    body_rot = matrix_from_quat(_torch(robot.data.body_quat_w)[:, body_i])
+
+    dev, dtype = body_pos.device, body_pos.dtype
+    off_pos = torch.as_tensor(cam["offset_pos"], device=dev, dtype=dtype)
+    off_rot = matrix_from_quat(
+        torch.as_tensor(cam["offset_quat_xyzw"], device=dev, dtype=dtype)
+    )
+    cam_pos_w = body_pos + (body_rot @ off_pos)
+    cam_rot_w = body_rot @ off_rot
+
+    root_pos = _torch(robot.data.root_pos_w)
+    q_yaw = yaw_quat(_torch(robot.data.root_quat_w))
+    cam_pos_rel, q_cam_rel = subtract_frame_transforms(
+        root_pos, q_yaw, cam_pos_w, _quat_from_matrix(cam_rot_w)
+    )
+    return cam_pos_rel, matrix_from_quat(q_cam_rel)
+
+
+def _quat_from_matrix(rot: torch.Tensor) -> torch.Tensor:
+    """Quaternion ``(x, y, z, w)`` from a batch of rotation matrices ``(B, 3, 3)``.
+
+    ``isaaclab.utils.math`` has ``matrix_from_quat`` but no inverse, and the composed camera
+    rotation is naturally a matrix (mount rotation times mount offset) while
+    ``subtract_frame_transforms`` wants a quaternion. Scalar-LAST, matching everything else
+    on the Isaac side of this module.
+
+    Shepperd's method: pick the branch whose denominator is largest, which is what keeps it
+    stable near each of the four degenerate cases (a naive ``w``-branch loses all precision at
+    a 180 deg rotation, and the camera mounts here are pitched 35-65 deg).
+
+    Args:
+        rot: Rotation matrices ``(B, 3, 3)``.
+
+    Returns:
+        Quaternions ``(B, 4)`` in ``(x, y, z, w)``.
+    """
+    m = rot
+    trace = m[:, 0, 0] + m[:, 1, 1] + m[:, 2, 2]
+    # Four candidate parametrisations; each is exact where its own denominator is largest.
+    cands = torch.stack([1.0 + trace, 1.0 + 2.0 * m[:, 0, 0] - trace,
+                         1.0 + 2.0 * m[:, 1, 1] - trace, 1.0 + 2.0 * m[:, 2, 2] - trace], -1)
+    best = cands.argmax(dim=-1)
+    s = torch.sqrt(cands.gather(-1, best[:, None]).squeeze(-1).clamp_min(1e-12)) * 0.5
+    quat = torch.zeros(m.shape[0], 4, device=m.device, dtype=m.dtype)
+    for branch in range(4):
+        sel = best == branch
+        if not bool(sel.any()):
+            continue
+        ms, ss = m[sel], s[sel]
+        if branch == 0:                                        # w largest
+            quat[sel] = torch.stack([
+                (ms[:, 2, 1] - ms[:, 1, 2]) / (4 * ss),
+                (ms[:, 0, 2] - ms[:, 2, 0]) / (4 * ss),
+                (ms[:, 1, 0] - ms[:, 0, 1]) / (4 * ss), ss], -1)
+        elif branch == 1:                                      # x largest
+            quat[sel] = torch.stack([
+                ss, (ms[:, 0, 1] + ms[:, 1, 0]) / (4 * ss),
+                (ms[:, 0, 2] + ms[:, 2, 0]) / (4 * ss),
+                (ms[:, 2, 1] - ms[:, 1, 2]) / (4 * ss)], -1)
+        elif branch == 2:                                      # y largest
+            quat[sel] = torch.stack([
+                (ms[:, 0, 1] + ms[:, 1, 0]) / (4 * ss), ss,
+                (ms[:, 1, 2] + ms[:, 2, 1]) / (4 * ss),
+                (ms[:, 0, 2] - ms[:, 2, 0]) / (4 * ss)], -1)
+        else:                                                  # z largest
+            quat[sel] = torch.stack([
+                (ms[:, 0, 2] + ms[:, 2, 0]) / (4 * ss),
+                (ms[:, 1, 2] + ms[:, 2, 1]) / (4 * ss), ss,
+                (ms[:, 1, 0] - ms[:, 0, 1]) / (4 * ss)], -1)
+    return quat
+
+
+def _torch(array) -> torch.Tensor:
+    """A warp array or torch tensor as a torch tensor.
+
+    Isaac Lab 3.0 hands back ``wp.array`` for the articulation buffers; the rest of this
+    module is torch. Mirrors the ``wp.to_torch`` calls the command terms make.
+
+    Args:
+        array: A warp array or an existing torch tensor.
+
+    Returns:
+        The same data as a torch tensor (no copy).
+    """
+    if isinstance(array, torch.Tensor):
+        return array
+    import warp as wp  # noqa: PLC0415  (only present in an Isaac runtime)
+    return wp.to_torch(array)
+
+
+def depth_xyz_stack(
+    env: "ManagerBasedRLEnv", groups: list[str] | None = None
+) -> torch.Tensor:
+    """Depth cameras as 4-channel ``[d, x, y, z]`` rows, ``(B, T, 4*H*W)``.
+
+    The exteroception the CONVOLUTIONAL generator conditions on when
+    ``FlowMatchingConfig.extero_channels == 4``. Channel 0 is exactly what
+    :func:`depth_obs_stack` returns; channels 1-3 are that same image unprojected into the
+    root's yaw-aligned frame (:func:`unproject_to_yaw_frame`), in metres.
+
+    Why the extra channels exist: a convolution over depth alone can see THAT there is a
+    step edge and where in the FRAME it sits, but the frame is a pixel grid. Turning "row 14,
+    column 8, 2.1 m" into "0.8 m ahead and 0.15 m up" needs the camera pose and the pinhole
+    model, neither of which the network ever sees, and both of which change every step as the
+    waist joints move and the pelvis pitches. These channels state it directly, in the frame
+    the generator already predicts its window in.
+
+    Channel-major per camera (all of ``d``, then all of ``x``, ...) rather than interleaved,
+    because ``extero_encoder.images_from_flat`` folds a row to ``(C, H, W)`` and that is the
+    layout a conv2d wants.
+
+    TODO(perf): this re-walks the observation manager and re-derives the camera contract
+    every call, like :func:`depth_obs_stack`. ``obs`` is already 39% of the env step, so if
+    the 4-channel path lands, cache the contract per env rather than paying the walk twice.
+
+    Args:
+        env: The environment instance.
+        groups: Observation groups to read, or ``None`` for all of them. Scope this with
+            :func:`fm_depth_groups` when the generator samples at its own resolution.
+
+    Returns:
+        ``(num_envs, num_cameras, 4 * H * W)``.
+
+    Raises:
+        RuntimeError: If the environment has no depth observation terms in ``groups``.
+        ValueError: If the selected cameras do not share one resolution.
+    """
+    specs = depth_camera_specs(env, groups)
+    if not specs:
+        raise RuntimeError(
+            "no depth observation terms found"
+            + (f" in groups {groups}" if groups else "")
+            + "; depth_xyz_stack needs a depth task (see depth_obs_stack)."
+        )
+    rows = []
+    for cam in specs:
+        params = {k: cam[k] for k in ("offset", "scale", "min_dist", "max_dist",
+                                     "min_clip_val", "max_clip_val")}
+        image = depth_image(env, SceneEntityCfg(cam["sensor"]), **params)   # (B, H*W)
+        cam_pos, cam_rot = depth_camera_pose_yaw_frame(env, cam)
+        points = unproject_to_yaw_frame(cam, image, cam_pos, cam_rot)       # (B, 3, H*W)
+        rows.append(torch.cat([image, points.reshape(image.shape[0], -1)], dim=-1))
+    widths = {int(r.shape[-1]) for r in rows}
+    if len(widths) > 1:
+        raise ValueError(
+            f"cameras {[c['sensor'] for c in specs]} produce rows of differing widths "
+            f"{sorted(widths)}, so they cannot share one stacked array -- scope the groups "
+            "with mdp.fm_depth_groups(env) / mdp.rl_depth_groups(env)."
         )
     return torch.stack(rows, dim=1)
 

@@ -24,7 +24,7 @@ one ``Linear(780, 512)`` it replaces.
 
 **The flat row is row-major over (H, W)**, ``k = v*W + u`` with ``v = 0`` the top row. Every
 producer agrees -- ``mdp.observations.depth.depth_image`` reshaping IsaacLab's ``(B, H, W)``,
-``transfer/sim/depth_camera.pinhole_ray_directions``, ``transfer/deploy/depth_obs`` -- but
+``transfer/deploy/depth_obs.pinhole_ray_directions`` and its unprojection -- but
 that agreement used to be merely tidy. A convolution makes it load-bearing: transpose it and
 every kernel sees a scrambled neighbourhood while the shapes stay right and the loss still
 falls. :func:`images_from_flat` is the single place that folding happens.
