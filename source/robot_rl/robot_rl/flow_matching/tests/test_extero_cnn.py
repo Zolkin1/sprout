@@ -487,3 +487,55 @@ def test_one_model_builder_serves_the_trainer_and_the_loader():
     assert enc.strides == (1, 2, 2, 2)
     assert enc.pos_embed is not None
     assert enc.miss_sentinel == 2.0
+
+##
+# Multi-channel input (depth + the pixel's xyz in the root's yaw frame)
+##
+
+def test_the_fold_is_channel_major():
+    """Plane ``c`` of the row must arrive as image channel ``c``, pixels intact.
+
+    The row layout is the contract between four producers (the Isaac term, the dataset,
+    MuJoCo, hardware) and this fold. Interleaving the channels instead would hand every
+    kernel a scrambled image with every shape still correct -- the same class of failure a
+    transposed ``image_hw`` causes, and just as invisible.
+    """
+    row = torch.arange(4 * _H * _W, dtype=torch.float32)
+    img = images_from_flat(row[None], (_H, _W), 4)
+    assert img.shape == (1, 4, _H, _W)
+    for c in range(4):
+        assert torch.equal(img[0, c].reshape(-1), row[c * _H * _W:(c + 1) * _H * _W])
+
+
+def test_a_four_channel_trunk_keeps_the_token_grid():
+    """Channels widen the first convolution, they do not change the token count.
+
+    The grid comes from ``(H, W)``, so a 4-channel camera still contributes 16 tokens and
+    the transformer's sequence length is unchanged -- which is what makes the 1-channel and
+    4-channel models comparable on everything except the input.
+    """
+    enc = ExteroImageEncoderSet([(_H, _W), (_H, _W)], _D_MODEL, row_channels=4)
+    assert enc.encoders[0].trunk[0].in_channels == 4
+    assert enc.encoders[0].sensor_dim == 4 * _H * _W
+    out = enc(torch.randn(3, 2, 4 * _H * _W))
+    assert out.shape == (3, 2, enc.tokens_per_sensor, _D_MODEL)
+    assert enc.tokens_per_sensor == ExteroImageEncoderSet(
+        [(_H, _W), (_H, _W)], _D_MODEL).tokens_per_sensor
+
+
+def test_the_single_channel_path_is_the_default():
+    """An encoder built without ``in_channels`` is exactly the 1-channel one.
+
+    Every existing checkpoint was trained that way, so the default has to stay the old
+    architecture -- the same reason ``extero_encoder`` defaults to "mlp" on a bare model.
+    """
+    enc = ExteroImageEncoderSet([(_H, _W)], _D_MODEL)
+    assert enc.encoders[0].trunk[0].in_channels == 1
+    assert enc.encoders[0].sensor_dim == _H * _W
+
+
+def test_a_row_of_the_wrong_channel_count_is_refused():
+    """A 1-channel row into a 4-channel trunk is a mismatch, not something to broadcast."""
+    enc = ExteroImageEncoderSet([(_H, _W)], _D_MODEL, row_channels=4)
+    with pytest.raises(ValueError, match="channel"):
+        enc(torch.randn(2, 1, _H * _W))

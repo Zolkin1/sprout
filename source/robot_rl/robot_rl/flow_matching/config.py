@@ -273,6 +273,26 @@ class FlowMatchingConfig:
     # but ``FlowMatchingTransformer``'s constructor argument defaults to "mlp". That is
     # deliberate -- a bare model built in a test keeps the legacy parameter set, while a
     # trained config gets the current architecture.
+    #: Channels per exteroception PIXEL. 1 = depth only, the original signal. 4 adds the
+    #: pixel's 3-D position in the root's yaw-aligned frame -- the same frame the generator
+    #: predicts its window in -- so a step edge arrives as "0.8 m ahead, 0.15 m up" rather
+    #: than as "row 14, column 8, 2.1 m" and the model no longer has to infer the camera
+    #: pose it is never shown. See ``mdp.observations.depth.depth_xyz_stack``.
+    #:
+    #: The channels are DERIVED from the depth image by the pinhole model, never stored: one
+    #: helper (``deploy.depth_obs.unproject_to_yaw_frame`` and its torch mirror) serves the
+    #: Isaac term, the dataset, MuJoCo and hardware, so the four cannot describe different
+    #: geometry. That also means the recording carries only depth plus the camera pose.
+    #:
+    #: ``extero_sensor_dim`` counts CHANNELS TOO (it is ``channels * H * W``), because it is
+    #: the width of one sensor's row as the model receives it. Anything comparing that width
+    #: against an image shape has to divide by this first -- see ``check_extero_encoder``.
+    #: Meaningless for the MLP encoder and for the height scan.
+    extero_channels: int = 1
+    #: Names of those channels, in order, for diagnostics and the ONNX metadata. Purely
+    #: descriptive: the ORDER that matters is the one the encoder folds, and that is fixed by
+    #: ``extero_channels``.
+    extero_channel_names: list[str] = field(default_factory=lambda: ["d"])
     extero_encoder: str = "auto"
     # Per-sensor ``[[H, W], ...]``, DERIVED from the recording's camera contract at dataset
     # build time (``_resolve_extero_spec``) and then verified wherever it is read again --
@@ -777,11 +797,29 @@ class FlowMatchingConfig:
                 f"extero_image_hw lists {len(self.extero_image_hw)} shape(s) but there are "
                 f"{self.extero_sensor_count} sensor(s)."
             )
+        channels = int(self.extero_channels)
+        if channels < 1:
+            raise ValueError(f"extero_channels must be >= 1, got {channels}.")
+        if len(self.extero_channel_names) != channels:
+            raise ValueError(
+                f"extero_channel_names {list(self.extero_channel_names)} has "
+                f"{len(self.extero_channel_names)} entries but extero_channels={channels}."
+            )
+        if self.extero_sensor_dim % channels:
+            raise ValueError(
+                f"extero_sensor_dim={self.extero_sensor_dim} is not divisible by "
+                f"extero_channels={channels}; the row is channels * H * W."
+            )
+        pixels = self.extero_sensor_dim // channels
         for hw in self.extero_image_hw:
-            if len(hw) != 2 or int(hw[0]) * int(hw[1]) != self.extero_sensor_dim:
+            # ``pixels``, not ``extero_sensor_dim``: with C > 1 the row holds C planes of the
+            # same image, so comparing the whole width against H*W would reject the very
+            # thing it is meant to describe.
+            if len(hw) != 2 or int(hw[0]) * int(hw[1]) != pixels:
                 raise ValueError(
-                    f"extero_image_hw entry {list(hw)} does not unfold to "
-                    f"extero_sensor_dim={self.extero_sensor_dim}."
+                    f"extero_image_hw entry {list(hw)} does not unfold to {pixels} pixels "
+                    f"(extero_sensor_dim={self.extero_sensor_dim} / "
+                    f"extero_channels={channels})."
                 )
 
     @property

@@ -102,8 +102,9 @@ class FlowMatchingTransformer(nn.Module):
         future_len: Future window length ``F`` (number of denoised state tokens).
         num_history_states: Number of history (phase) conditioning tokens ``N``.
         history_dim: Per-step history-token width (defaults to ``state_dim``).
-        extero_sensor_dim: Width of ONE exteroception token (176 = height-scan rays,
-            780 = one depth image).
+        extero_sensor_dim: Width of ONE exteroception reading (176 = height-scan rays,
+            780 = one 1-channel depth image, 3120 = the same image with xyz channels).
+            Channels included -- it is the row width the model receives.
         extero_sensor_count: Number of exteroception tokens (1 = height scan, 2 = both cameras).
         cmd_dim: Per-step command width; ``0`` disables command conditioning.
         cmd_stride: Keep every ``cmd_stride``-th step of the command profile as a token.
@@ -151,6 +152,7 @@ class FlowMatchingTransformer(nn.Module):
             extero_grid_ordering=cfg.extero_grid_ordering,
             extero_fourier_bands=cfg.extero_fourier_bands,
             extero_miss_sentinel=cfg.extero_miss_sentinel,
+            extero_channels=cfg.extero_channels,
             attention_mode=cfg.attention_mode,
         )
 
@@ -178,6 +180,7 @@ class FlowMatchingTransformer(nn.Module):
         extero_grid_ordering: str = "xy",
         extero_fourier_bands: int = 4,
         extero_miss_sentinel: float | None = None,
+        extero_channels: int = 1,
         attention_mode: str = "full",
     ):
         super().__init__()
@@ -226,11 +229,20 @@ class FlowMatchingTransformer(nn.Module):
                     f"extero_image_hw has {len(shapes)} shape(s) but extero_sensor_count="
                     f"{extero_sensor_count}."
                 )
-            bad = [hw for hw in shapes if hw[0] * hw[1] != extero_sensor_dim]
+            # Against the PIXEL count, not the row width: with channels the row holds
+            # ``extero_channels`` planes of one image, so comparing the whole width against
+            # H*W would reject exactly the shape it is meant to describe.
+            if extero_sensor_dim % int(extero_channels):
+                raise ValueError(
+                    f"extero_sensor_dim={extero_sensor_dim} is not divisible by "
+                    f"extero_channels={extero_channels}; the row is channels * H * W."
+                )
+            pixels = extero_sensor_dim // int(extero_channels)
+            bad = [hw for hw in shapes if hw[0] * hw[1] != pixels]
             if bad:
                 raise ValueError(
-                    f"extero_image_hw {bad} does not unfold the {extero_sensor_dim}-wide "
-                    "sensor row."
+                    f"extero_image_hw {bad} does not unfold to {pixels} pixels "
+                    f"({extero_sensor_dim}-wide row / {extero_channels} channel(s))."
                 )
             self.extero_in = None
             self.extero_cnn = ExteroImageEncoderSet(
@@ -244,6 +256,7 @@ class FlowMatchingTransformer(nn.Module):
                 ordering=str(extero_grid_ordering),
                 fourier_bands=int(extero_fourier_bands),
                 miss_sentinel=extero_miss_sentinel,
+                row_channels=int(extero_channels),
             )
             self.tokens_per_sensor = int(self.extero_cnn.tokens_per_sensor)
         elif self.extero_encoder == "mlp":

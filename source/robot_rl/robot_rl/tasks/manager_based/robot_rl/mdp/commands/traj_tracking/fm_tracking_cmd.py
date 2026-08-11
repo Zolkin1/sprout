@@ -58,6 +58,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.height_scan import (
 )
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
     depth_obs_stack,
+    depth_xyz_stack,
     fm_depth_groups,
 )
 
@@ -725,6 +726,10 @@ class FmTrackingCommand(MotionSequenceCommand):
           one, else the policy's. For depth that is ``fm_depth_groups`` returning ``None``
           = every group; for the scan it is ``fm_scan_sensor`` falling back to
           ``height_scanner``. Either way a task that did not opt in is unchanged;
+        * the CHANNELS come from the checkpoint too (``ctx.extero_channels``): a generator
+          trained on depth alone gets the depth image, one trained on 4 channels gets it
+          with each pixel's xyz in the root's yaw frame beside it. Same reasoning as the
+          source -- the artifact says what it eats;
         * the WIDTH is checked on the FIRST reading (:meth:`_check_extero_shape`), not
           per step and not at construction -- see ``_post_init``.
 
@@ -738,7 +743,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         if src == "height_scan":
             reading = scan_obs_stack(self.env, fm_scan_sensor(self.env))
         elif src == "depth":
-            reading = depth_obs_stack(self.env, fm_depth_groups(self.env))
+            groups = fm_depth_groups(self.env)
+            reading = (depth_xyz_stack(self.env, groups)
+                       if int(getattr(self.ctx, "extero_channels", 1)) > 1
+                       else depth_obs_stack(self.env, groups))
         else:
             raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")
         if not self._extero_checked:

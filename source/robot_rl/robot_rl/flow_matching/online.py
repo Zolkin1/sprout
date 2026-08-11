@@ -197,7 +197,20 @@ class FmOnlineContext:
     :attr:`extero_sensor_dim`, to the legacy scan a pre-selector checkpoint resolves to.
     """
     extero_sensor_dim: int = 176
-    """Width of ONE exteroception reading (rays for the scan, pixels for a camera)."""
+    """Width of ONE exteroception reading, CHANNELS INCLUDED.
+
+    Rays for the scan; ``extero_channels * H * W`` for a camera. It is the row width the
+    model receives, so a consumer checking what it is about to feed compares against this
+    and divides by :attr:`extero_channels` only when it needs the image shape.
+    """
+    extero_channels: int = 1
+    """Planes per exteroception pixel: 1 = depth alone, 4 = depth plus the pixel's xyz.
+
+    Carried so a runtime knows whether it must UNPROJECT the depth image before feeding it
+    (``deploy.depth_obs.unproject_to_yaw_frame``) or pass it through. A checkpoint written
+    before the channels existed is unambiguously 1-channel, which is what
+    :meth:`FlowMatchingConfig.from_dict`'s default gives it.
+    """
     extero_spec: list[dict] | None = None
     """Camera contract behind the exteroception tokens, when :attr:`extero_source` is depth.
 
@@ -273,6 +286,7 @@ def read_fm_extero_meta(checkpoint: str, map_location: str = "cpu") -> dict:
         "extero_source": cfg.extero_source,
         "extero_sensor_count": int(cfg.extero_sensor_count),
         "extero_sensor_dim": int(cfg.extero_sensor_dim),
+        "extero_channels": int(cfg.extero_channels),
         "extero_encoder": cfg.resolve_extero_encoder(),
         "extero_spec": spec,
         "width": None,
@@ -287,10 +301,14 @@ def read_fm_extero_meta(checkpoint: str, map_location: str = "cpu") -> dict:
             "share one resolution (they are stacked into one array)."
         )
     width, height = sizes.pop()
-    if width * height != out["extero_sensor_dim"]:
+    # Against the PIXEL count: a multi-channel row is ``channels * H * W``, and this is the
+    # function play.py uses to SIZE the generator's cameras -- comparing the whole row width
+    # would demand a camera four times too large.
+    if width * height != out["extero_sensor_dim"] // out["extero_channels"]:
         raise ValueError(
             f"{checkpoint}: cameras are {width}x{height} = {width * height} px but the "
-            f"sensor row is {out['extero_sensor_dim']} wide."
+            f"sensor row is {out['extero_sensor_dim']} wide over "
+            f"{out['extero_channels']} channel(s)."
         )
     out["width"], out["height"] = width, height
     return out
@@ -502,7 +520,9 @@ def load_fm_context(
           f"(extero_encoder={encoder})")
     # ONE construction site, shared with the trainer. ``encoder`` is the resolved name and is
     # already written back onto cfg by the dataset; assert rather than pass it separately, so
-    # there is no second path by which the two could describe different models.
+    # there is no second path by which the two could describe different models. This is also
+    # what makes ``extero_channels`` reach the model here without being restated: it is a cfg
+    # field, and ``from_config`` is the only thing that reads them.
     cfg.extero_encoder = encoder
     model = FlowMatchingTransformer.from_config(cfg).to(dev)
     weights, which = ckpt["model"], "raw"
@@ -546,6 +566,7 @@ def load_fm_context(
         extero_source=str(cfg.extero_source),
         extero_sensor_count=int(cfg.extero_sensor_count),
         extero_sensor_dim=int(cfg.extero_sensor_dim),
+        extero_channels=int(cfg.extero_channels),
         extero_spec=(meta.get("extero_spec") or None),
         extero_image_hw=([(int(h), int(w)) for h, w in cfg.extero_image_hw]
                          if cfg.extero_image_hw else None),

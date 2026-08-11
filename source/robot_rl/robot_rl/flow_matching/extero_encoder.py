@@ -84,29 +84,40 @@ def conv_grid_shape(
     return h, w
 
 
-def images_from_flat(flat: torch.Tensor, image_hw: tuple[int, int]) -> torch.Tensor:
-    """Fold flat sensor rows into single-channel images for a convolution.
+def images_from_flat(
+    flat: torch.Tensor, image_hw: tuple[int, int], in_channels: int = 1
+) -> torch.Tensor:
+    """Fold flat sensor rows into images for a convolution.
+
+    The row is CHANNEL-MAJOR: all of channel 0's pixels, then all of channel 1's, each
+    row-major over ``(height, width)``. That is the layout ``conv2d`` wants and the one
+    ``mdp.observations.depth.depth_xyz_stack`` and ``deploy.depth_obs`` both emit -- an
+    interleaved row would fold into a scrambled image with every shape still correct.
 
     Args:
-        flat: ``(..., height * width)`` rows, row-major with ``v = 0`` the top row (see the
-            module docstring -- this ordering is the contract, not a convention).
+        flat: ``(..., in_channels * height * width)`` rows, row-major with ``v = 0`` the top
+            row (see the module docstring -- this ordering is the contract, not a
+            convention).
         image_hw: ``(height, width)`` the rows unfold to.
+        in_channels: Planes per pixel. 1 = depth only; 4 = depth plus the pixel's xyz in the
+            root's yaw-aligned frame.
 
     Returns:
-        ``(N, 1, height, width)`` where ``N`` is the flattened leading dimensions.
+        ``(N, in_channels, height, width)`` where ``N`` is the flattened leading dimensions.
 
     Raises:
-        ValueError: If the row width is not ``height * width``.
+        ValueError: If the row width is not ``in_channels * height * width``.
     """
-    h, w = int(image_hw[0]), int(image_hw[1])
-    if flat.shape[-1] != h * w:
+    h, w, c = int(image_hw[0]), int(image_hw[1]), int(in_channels)
+    if flat.shape[-1] != c * h * w:
         raise ValueError(
-            f"exteroception row is {flat.shape[-1]} wide but image_hw={(h, w)} needs {h * w}."
+            f"exteroception row is {flat.shape[-1]} wide but image_hw={(h, w)} with "
+            f"{c} channel(s) needs {c * h * w}."
         )
     # ``-1`` rather than an explicit product: the legacy ONNX tracer then emits a Reshape
     # against a constant shape instead of a Shape/Gather/Mul chain, which is what keeps the
     # graph's batch axis dynamic (see export_fm_onnx's note on the dynamo path).
-    return flat.reshape(-1, 1, h, w)
+    return flat.reshape(-1, c, h, w)
 
 
 def pixel_coords_m(
@@ -207,6 +218,12 @@ class ExteroImageEncoder(nn.Module):
             channel is appended: 1 where the pixel is real geometry, 0 where the reading was
             a miss or saturated at the band edge. Without it a hole and a real drop-off are
             the same number, and the convolution cannot tell them apart.
+        row_channels: Planes per pixel carried by the ROW itself (``cfg.extero_channels``).
+            1 = depth alone; 4 = depth plus the pixel's xyz in the root's yaw-aligned frame,
+            which is what lets a kernel see where a step edge is in metres rather than in
+            pixels. Distinct from ``in_channels``, which counts these PLUS the planes the
+            encoder derives for itself (coordinates, validity) and that never travel in the
+            row.
     """
 
     def __init__(
@@ -220,13 +237,13 @@ class ExteroImageEncoder(nn.Module):
         ordering: str = "xy",
         fourier_bands: int = 4,
         miss_sentinel: float | None = None,
+        row_channels: int = 1,
     ):
         super().__init__()
         channels = tuple(int(c) for c in channels)
         if not channels:
             raise ValueError("channels must name at least one convolution.")
         self.image_hw = (int(image_hw[0]), int(image_hw[1]))
-        self.sensor_dim = self.image_hw[0] * self.image_hw[1]
         self.strides = ((2,) * len(channels) if strides is None
                         else tuple(int(s) for s in strides))
         if len(self.strides) != len(channels):
@@ -238,11 +255,19 @@ class ExteroImageEncoder(nn.Module):
         self.coord_extent_m = (None if coord_extent_m is None
                                else (float(coord_extent_m[0]), float(coord_extent_m[1])))
 
-        # Input channels: the reading, plus (x, y) metres, plus validity -- each only when
-        # asked for, so the depth path's Conv2d(1, ...) weights are unchanged.
-        in_ch = 1 + (2 if self.coord_extent_m is not None else 0)
+        # TWO channel counts, and conflating them is a silent shape bug:
+        #   row_channels -- what the ROW carries, so what ``cfg.extero_sensor_dim`` counts and
+        #                   what ``images_from_flat`` folds. The producer decides it.
+        #   in_channels  -- what the CONVOLUTION sees: the row's planes plus the ones this
+        #                   encoder derives itself (metric coordinates, validity), which are
+        #                   computed here and never travel in the row.
+        self.row_channels = int(row_channels)
+        in_ch = self.row_channels + (2 if self.coord_extent_m is not None else 0)
         in_ch += 1 if self.miss_sentinel is not None else 0
         self.in_channels = in_ch
+        # The row width the model receives, channels included -- what ``cfg.extero_sensor_dim``
+        # counts, so a mismatch shows up here rather than inside the convolution.
+        self.sensor_dim = self.row_channels * self.image_hw[0] * self.image_hw[1]
 
         layers: list[nn.Module] = []
         prev = in_ch
@@ -285,14 +310,19 @@ class ExteroImageEncoder(nn.Module):
         """Encode one sensor's flat rows.
 
         Args:
-            flat: ``(B, height * width)`` normalized reading for this sensor.
+            flat: ``(B, row_channels * height * width)`` normalized reading for this sensor,
+                folded CHANNEL-MAJOR (all of plane 0, then plane 1, ...).
 
         Returns:
             ``(B, tokens_per_sensor, d_model)``, cells in row-major order.
         """
-        img = images_from_flat(flat, self.image_hw)
+        img = images_from_flat(flat, self.image_hw, self.row_channels)
         extra = []
         if self.miss_sentinel is not None:
+            # Tested against the DEPTH plane alone: the xyz planes are metres in the
+            # root frame and have no sentinel, so comparing them against one would
+            # mark ordinary geometry invalid wherever a coordinate equalled it.
+            #
             # Exact equality is meaningful here: sanitize clamps a miss to precisely the band
             # edge and the metric affine is a fixed constant, so the sentinel arrives as an
             # exact value. Real readings saturated at the same edge are also marked invalid,
@@ -307,7 +337,7 @@ class ExteroImageEncoder(nn.Module):
             # "not close" -> valid, this says invalid), which cannot arrive: every reading is
             # sanitised to a finite value on both the dataset and the deploy side.
             tol = 1e-6 + 1e-5 * abs(float(self.miss_sentinel))
-            extra.append(((img - float(self.miss_sentinel)).abs() > tol).to(img.dtype))
+            extra.append(((img[:, :1] - float(self.miss_sentinel)).abs() > tol).to(img.dtype))
         if self.coord_extent_m is not None:
             extra.append(self.coord_channels.expand(img.shape[0], -1, -1, -1).to(img.dtype))
         if extra:
@@ -344,6 +374,7 @@ class ExteroImageEncoderSet(nn.Module):
         ordering: Flat-row ordering of the metric grid.
         fourier_bands: Frequency bands per axis in the token position embedding.
         miss_sentinel: Normalized value a missed ray takes, enabling the validity channel.
+        row_channels: Planes per pixel in the row; see :class:`ExteroImageEncoder`.
 
     Raises:
         ValueError: If no sensors are given, or if the cameras do not agree on how many
@@ -363,15 +394,18 @@ class ExteroImageEncoderSet(nn.Module):
         ordering: str = "xy",
         fourier_bands: int = 4,
         miss_sentinel: float | None = None,
+        row_channels: int = 1,
     ):
         super().__init__()
         if not len(image_hw):
             raise ValueError("ExteroImageEncoderSet needs at least one sensor.")
+        self.row_channels = int(row_channels)
         self.encoders = nn.ModuleList([
             ExteroImageEncoder(
                 hw, d_model, channels, grid, strides=strides,
                 coord_extent_m=coord_extent_m, ordering=ordering,
                 fourier_bands=fourier_bands, miss_sentinel=miss_sentinel,
+                row_channels=row_channels,
             )
             for hw in image_hw
         ])
