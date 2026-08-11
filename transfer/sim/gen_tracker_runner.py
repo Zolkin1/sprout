@@ -1013,13 +1013,19 @@ def main() -> None:
     parser.add_argument("--scene", type=str, default="basic_scene")
     parser.add_argument("--robot_name", type=str, default="g1_21j")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
-    parser.add_argument("--providers", default="",
+    parser.add_argument("--providers", default="auto",
                         help="Comma-separated onnxruntime execution providers for BOTH nets, "
-                             "e.g. 'cuda' or 'cuda,cpu' (aliases: cpu/cuda/trt). Empty = CPU "
-                             "only, the deployment default -- a GPU is opt-in so nothing "
-                             "silently starts using one. CPU is always appended as a fallback "
-                             "for ops the accelerator lacks. Needs the onnxruntime-gpu wheel; "
-                             "resolve_providers raises naming it if the provider is absent.")
+                             "e.g. 'cuda' or 'cuda,cpu' (aliases: cpu/cuda/trt). Default "
+                             "'auto' = the GPU when the installed wheel has one, else the "
+                             "CPU. This is a SIM default, not the deployment one: the "
+                             "generator is ~99% of the step cost and runs it in ~100 ms on a "
+                             "CPU, so sim2sim defaults to the GPU while transfer/deploy still "
+                             "requires hardware to state its provider. 'cpu' forces the "
+                             "deployment-representative timing. CPU is always appended as a "
+                             "fallback for ops the accelerator lacks. A NAMED provider the "
+                             "wheel lacks raises; 'auto' never does. What a session actually "
+                             "registered is printed at load -- onnxruntime falls back to the "
+                             "CPU with a warning, not an error.")
     parser.add_argument("--fm_update_every", type=int, default=1,
                         help="Generator re-inference cadence K (control steps); 1 = every step, "
                              "which is the only cadence that pays the full FM cost every tick. "
@@ -1215,6 +1221,11 @@ def main() -> None:
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
     )
     policy.load()
+    # What each graph REGISTERED, not what was asked for. onnxruntime reports a failed CUDA
+    # session as a warning and carries on running on the CPU, so with the GPU now the
+    # default this line is the only thing standing between "the generator is on the GPU" and
+    # a 5x-slower run that never said so.
+    print(f"[INFO] onnxruntime providers: {policy.active_providers()}")
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
