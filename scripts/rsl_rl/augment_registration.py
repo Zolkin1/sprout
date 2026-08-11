@@ -259,17 +259,36 @@ def main() -> int:
     if terrain is not None and hasattr(terrain, "clip_library_path"):
         terrain.clip_library_path = lib
     if args_cli.no_depth_dr:
-        # The REAL event names. An earlier guess ("randomize_depth_mount_*") matched nothing,
-        # so camera EXTRINSICS/INTRINSICS randomization stayed live through every "DR off" run
-        # -- a per-episode camera pose draw, which is why the re-render came out vertically
-        # shifted while the scene structure matched.
-        for ev in ("resample_depth_noise_near", "resample_depth_noise_far",
-                   "randomize_camera_extrinsics_near", "randomize_camera_extrinsics_far",
-                   "randomize_camera_intrinsics_near", "randomize_camera_intrinsics_far"):
-            if not hasattr(env_cfg.events, ev):
-                raise SystemExit(f"--no_depth_dr: event '{ev}' not on this task's cfg; the "
-                                 "name list is stale and DR would silently stay ON.")
-            setattr(env_cfg.events, ev, None)
+        # DERIVED from the event functions rather than a name list. An earlier hardcoded guess
+        # ("randomize_depth_mount_*") matched nothing, so camera EXTRINSICS/INTRINSICS
+        # randomization stayed live through every "DR off" run -- a per-episode camera pose
+        # draw, which is why the re-render came out vertically shifted while the scene
+        # structure matched. A list cannot go stale if there is no list.
+        killed = []
+        for _name, _term in list(vars(env_cfg.events).items()):
+            _func = getattr(_term, "func", None)
+            if getattr(_func, "__module__", "").endswith("mdp.events.depth"):
+                setattr(env_cfg.events, _name, None)
+                killed.append(_name)
+        if not killed:
+            raise SystemExit("--no_depth_dr: this task declares no depth DR events at all; "
+                             "either it is not a depth task or the events moved module.")
+        print(f"[augment] depth DR OFF: {killed}")
+    # A re-render must reproduce the SOURCE exactly, so the resolution comes from the
+    # recording's own camera contract -- not from a flag, and not from whatever the task
+    # happens to default to. When the recording was made at the generator's own resolution
+    # (record_data.py --fm_depth_resolution), that means building the same second pair here.
+    _rec_cams = list(getattr(meta, "depth_camera_spec", None) or [])
+    if _rec_cams:
+        _res = {(int(c["width"]), int(c["height"])) for c in _rec_cams}
+        if len(_res) != 1:
+            raise SystemExit(f"the recording's cameras sample at {sorted(_res)}; one "
+                             "recording's cameras share one resolution.")
+        from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+            add_fm_depth_pair,
+        )
+        add_fm_depth_pair(env_cfg, *_res.pop())
+
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
     robot = u.scene["robot"]
@@ -284,6 +303,31 @@ def main() -> int:
             return torch.as_tensor(np.asarray(x), device=u.device)
 
     u.reset()
+
+    # WHICH cameras to re-render, derived from the observation terms rather than named. The
+    # recorded ``depth`` array came from whichever pair the recorder was scoped to, so this
+    # has to be the same scoping -- re-rendering the policy's cameras into a recording made
+    # from the generator's would be silently wrong (or, if the widths differ, loudly wrong at
+    # the writer, which is the better half of the outcome).
+    _render_groups = mdp.fm_depth_groups(u)
+    _render_sensors = [name for name, _ in mdp.find_depth_obs_terms(u, _render_groups)]
+    if not _render_sensors:
+        raise SystemExit("no depth observation terms on this task; there is nothing to "
+                         "re-render. --task must be a depth task.")
+    _rec_spec = list(getattr(meta, "depth_camera_spec", None) or [])
+    if _rec_spec:
+        _live = mdp.depth_camera_specs(u, _render_groups)
+        _live_res = [(int(c["width"]), int(c["height"])) for c in _live]
+        _rec_res = [(int(c["width"]), int(c["height"])) for c in _rec_spec]
+        if _live_res != _rec_res:
+            raise SystemExit(
+                f"this task samples depth at {_live_res} but the recording was made at "
+                f"{_rec_res}. A re-render must reproduce the source EXACTLY -- pass "
+                "--fm_depth_resolution to record_data.py's resolution, or point --task at "
+                "the task the recording came from."
+            )
+    print(f"[augment] re-rendering {_render_sensors} "
+          f"(obs group(s): {_render_groups or 'all'})")
 
     # Joint ORDER: the recording's joint_pos columns are meaningless unless they line up with
     # this articulation's. A silent mismatch would scramble the posture, which moves the
@@ -525,14 +569,15 @@ def main() -> int:
             # does. This alone was the whole bimodal ~50% delta-0 failure.
             for _read in range(2):
                 u.scene.update(u.physics_dt)
-                for _sname in ("depth_camera_near", "depth_camera_far"):
-                    if _sname not in u.scene.sensors:
-                        raise SystemExit(f"sensor '{_sname}' absent; this list is stale and "
-                                         "the depth read would be silently wrong.")
+                # DERIVED from the observation terms, not a hardcoded pair of names: the
+                # generator may sample the same lenses on its own grid, in which case the
+                # recorded ``depth`` came from THAT pair and re-rendering the policy's would
+                # silently produce the wrong array (or the wrong width).
+                for _sname in _render_sensors:
                     u.scene.sensors[_sname].update(u.physics_dt, force_recompute=True)
                 # Same producer the recorder used, so this is the OBSERVATION value,
                 # normalized identically -- anything else would not be like for like.
-                dep = to_torch(mdp.depth_obs_stack(u))[ti].detach().cpu().numpy()
+                dep = to_torch(mdp.depth_obs_stack(u, _render_groups))[ti].detach().cpu().numpy()
 
             if args_cli.check_only:
                 rec = data["depth"][idx[keep]]

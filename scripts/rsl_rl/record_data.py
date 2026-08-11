@@ -157,6 +157,17 @@ parser.add_argument(
          "you generated.",
 )
 parser.add_argument(
+    "--fm_depth_resolution", type=str, default="",
+    help="'WxH' to record the GENERATOR's depth at, when it should differ from the policy's. "
+         "Adds a second camera pair on the SAME mounts and lenses, sampled on this grid, and "
+         "the recorded 'depth' array plus its camera contract then describe THAT pair -- so a "
+         "generator trained on this file conditions on this resolution while the teacher that "
+         "produced the file keeps its own. Empty (default) records the policy's cameras. "
+         "Costs rays: the pass is ~W*H/780 times the policy pair's per-step depth cost, and "
+         "the 'depth' dataset scales the same way (a 200k-window recording is 1.25 GB at "
+         "30x26 and 5 GB at 60x52), so pick this before recording rather than after.",
+)
+parser.add_argument(
     "--clip_device", type=str, default=None,
     help="Device to hold the motion-clip library on (e.g. 'cpu' to keep the multi-GB "
          "library off a small GPU; gathers copy only the per-env slice). Default: env device.",
@@ -410,7 +421,7 @@ def _extero_is_corrupted(env) -> bool:
         True when at least one depth observation term has a noiser installed.
     """
     from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.noise import get_depth_noiser
-    for sensor_name, _ in mdp.find_depth_obs_terms(env):
+    for sensor_name, _ in mdp.find_depth_obs_terms(env, mdp.fm_depth_groups(env)):
         if get_depth_noiser(env, sensor_name) is not None:
             return True
     return False
@@ -490,7 +501,11 @@ def _build_recording_meta(
         # Contract of the cameras behind the recorded ``depth`` array (None without them).
         # The same producer the tracker export uses, so an FM trained on this recording
         # and the tracker deployed beside it describe one physical camera pair.
-        depth_camera_spec=mdp.depth_camera_specs(env.unwrapped) or None,
+        # Scoped to the cameras the recorded array actually came from. Unscoped, a task
+        # carrying both pairs would describe FOUR cameras behind a two-row array, and the
+        # FM dataset's len(spec) == rows check is the only thing that would notice.
+        depth_camera_spec=mdp.depth_camera_specs(
+            env.unwrapped, mdp.fm_depth_groups(env.unwrapped)) or None,
         # Which reference-window blocks THIS teacher observes. The recorded arrays are
         # world-frame rows, so any selection can be packed from them -- but the generator
         # trained on this file has to predict what the policy consumes, so the teacher's
@@ -677,7 +692,8 @@ def collect_pairs(
     # Depth cameras (the deployable FM exteroception signal). Recorded ALONGSIDE the scan
     # whenever the task has depth observation terms, so ONE recording can train either FM
     # and the choice is made at FM-train time via cfg.extero_source.
-    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped))
+    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped,
+                                              mdp.fm_depth_groups(env.unwrapped)))
 
     # Body indices for the extra frames appended to the state vector (in order).
     state_frames = list(state_frames or [])
@@ -770,7 +786,8 @@ def collect_pairs(
         # Depth at the same pre-step moment, one token row per camera ([N, T, H*W]),
         # normalised by each camera's own obs-term params.
         if has_depth:
-            buf["depth"].append(mdp.depth_obs_stack(env.unwrapped).detach().cpu().clone())
+            buf["depth"].append(mdp.depth_obs_stack(
+                env.unwrapped, mdp.fm_depth_groups(env.unwrapped)).detach().cpu().clone())
         # Desired reference at the same timestep, reconstructed to the world-frame
         # ``state`` layout. ``y_des``/``dy_des`` hold the value backing the current
         # obs (last computed during the previous env.step), so this stays aligned
@@ -909,7 +926,8 @@ def collect_windows(
     robot = env.unwrapped.scene.articulations["robot"]
     has_scan = ("height_scanner" in env.unwrapped.scene.sensors
                 and not args_cli.skip_height_scan)
-    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped))
+    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped,
+                                              mdp.fm_depth_groups(env.unwrapped)))
 
     state_frames = list(state_frames or [])
     frame_body_idx = None
@@ -1047,7 +1065,8 @@ def collect_windows(
                 scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()
             if has_depth:
-                dep = mdp.depth_obs_stack(env.unwrapped)                    # [N, T, H*W]
+                dep = mdp.depth_obs_stack(
+                    env.unwrapped, mdp.fm_depth_groups(env.unwrapped))      # [N, T, H*W]
                 batch["depth"] = dep[idx].detach().cpu().numpy()
             written += writer.write_batch(batch)
             if written >= num_windows:
@@ -1149,6 +1168,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"[INFO] Overriding terrain importer mesh library: "
                       f"{terrain.clip_library_path} -> {args_cli.clip}")
                 terrain.clip_library_path = args_cli.clip
+
+        # Give the GENERATOR its own camera pair when it should record at a resolution the
+        # policy does not use. DECLARED here rather than derived, unlike play.py: there is no
+        # FM artifact yet -- this run is what produces the data one will be trained on.
+        if args_cli.fm_depth_resolution.strip():
+            from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+                add_fm_depth_pair,
+            )
+            spec = args_cli.fm_depth_resolution.replace("x", ",").split(",")
+            if len(spec) != 2:
+                raise ValueError(
+                    f"--fm_depth_resolution={args_cli.fm_depth_resolution!r}; expected 'WxH'."
+                )
+            add_fm_depth_pair(env_cfg, int(spec[0]), int(spec[1]))
 
         # Hold the clip library off-GPU when large (auto: cpu for >1 GB libs, which
         # OOM a small card at scene init). Explicit --clip_device overrides.
@@ -1299,7 +1332,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 )
             if ("height_scanner" not in env.unwrapped.scene.sensors
                     and not args_cli.skip_height_scan
-                    and not mdp.find_depth_obs_terms(env.unwrapped)):
+                    and not mdp.find_depth_obs_terms(
+                        env.unwrapped, mdp.fm_depth_groups(env.unwrapped))):
                 raise ValueError(
                     "--num_windows needs SOME exteroception: a height_scanner sensor, depth obs "
                     "terms, or --skip_height_scan on a depth task. Record on a task that has "
@@ -1323,8 +1357,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Depth (the deployable FM signal) is recorded alongside the scan whenever the
             # task exposes depth obs terms, so one session can train either FM.
             depth_shape = None
-            if mdp.find_depth_obs_terms(env.unwrapped):
-                dep = mdp.depth_obs_stack(env.unwrapped)          # [N, T, H*W]
+            if mdp.find_depth_obs_terms(env.unwrapped,
+                                        mdp.fm_depth_groups(env.unwrapped)):
+                dep = mdp.depth_obs_stack(
+                    env.unwrapped, mdp.fm_depth_groups(env.unwrapped))   # [N, T, H*W]
                 depth_shape = (int(dep.shape[1]), int(dep.shape[2]))
                 print(f"[INFO] recording depth alongside the height scan: {depth_shape} per window")
             meta.format = "windowed_h5"

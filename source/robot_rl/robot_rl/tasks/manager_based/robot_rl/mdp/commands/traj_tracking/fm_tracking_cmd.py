@@ -52,7 +52,10 @@ import warp as wp
 from isaaclab.envs.mdp import height_scan as mdp_height_scan
 from isaaclab.managers import SceneEntityCfg
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import depth_obs_stack
+from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+    depth_obs_stack,
+    fm_depth_groups,
+)
 
 from robot_rl.flow_matching.online import (
     BatchedHistory,
@@ -198,6 +201,12 @@ class FmTrackingCommand(MotionSequenceCommand):
                 f"FM checkpoint extra frames {self.ctx.frame_names} != command ee output "
                 f"frames {ee_frames}; re-record/-train the FM with matching --state_frames."
             )
+
+        # The live exteroception must be the width this generator conditions on. Checked ONCE
+        # here rather than per step -- the alternative is a shape error from inside the graph,
+        # at which point the useful information (which cameras, which group, which
+        # resolution) is gone.
+        self._check_extero_shape()
 
         # Rolling per-env history of the N reference-window nodes this command last
         # SERVED -- the generator's own output, not the robot's state. That is the
@@ -699,9 +708,16 @@ class FmTrackingCommand(MotionSequenceCommand):
     def _read_extero(self) -> torch.Tensor:
         """Live exteroception reading for the sensor this FM checkpoint was trained on.
 
-        The source comes from the CHECKPOINT (``ctx.extero_source``), not the task config,
-        so a depth-trained FM cannot silently be fed a height scan (or vice versa) just
-        because the env happens to have both sensors.
+        Three things pick themselves rather than being configured here, which is what stops
+        a generator being fed something plausible and wrong:
+
+        * the SOURCE comes from the CHECKPOINT (``ctx.extero_source``), so a depth-trained
+          FM cannot be handed a height scan just because the env carries both sensors;
+        * the CAMERAS come from the env, by group: its own pair when the task built one at
+          the generator's resolution, else the policy's (``fm_depth_groups`` returns
+          ``None`` = every group = the shared-pair behaviour);
+        * the WIDTH is checked once at construction (:meth:`_check_extero_shape`), not
+          per step.
 
         Returns:
             ``(num_envs, K)`` for the height scan, or ``(num_envs, T, K)`` for depth --
@@ -714,8 +730,37 @@ class FmTrackingCommand(MotionSequenceCommand):
         if src == "height_scan":
             return mdp_height_scan(self.env, SceneEntityCfg("height_scanner"))
         if src == "depth":
-            return depth_obs_stack(self.env)
+            return depth_obs_stack(self.env, fm_depth_groups(self.env))
         raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")
+
+    def _check_extero_shape(self) -> None:
+        """Fail at construction if the live cameras are not what the generator expects.
+
+        A SHAPE check, deliberately: the full camera contract comparison lives on the deploy
+        side (``deploy.depth_obs.assert_depth_specs_agree``) and ``robot_rl`` must not import
+        ``transfer``. What this catches is the case that would otherwise reach the graph --
+        a live reading of the wrong width, or the right total width split over the wrong
+        number of cameras.
+
+        Raises:
+            RuntimeError: On a sensor-count or per-sensor-width disagreement.
+        """
+        reading = self._read_extero()
+        if reading.ndim == 2:                      # the height scan: one sensor row
+            reading = reading.unsqueeze(1)
+        count, dim = int(reading.shape[1]), int(reading.shape[2])
+        want = (int(self.ctx.extero_sensor_count), int(self.ctx.extero_sensor_dim))
+        if (count, dim) != want:
+            groups = fm_depth_groups(self.env)
+            raise RuntimeError(
+                f"the FM checkpoint conditions on {want[0]} sensor row(s) of {want[1]} "
+                f"values, but this env serves {count} of {dim} "
+                f"(obs group(s): {groups or 'all'}). For depth that is a resolution "
+                "mismatch: build the generator's own camera pair with "
+                "g1_depth_env_cfg.add_fm_depth_pair(env_cfg, W, H) at the resolution the "
+                "checkpoint states (robot_rl.flow_matching.online.read_fm_extero_meta reads "
+                "it), which is what play.py does from --fm_checkpoint."
+            )
 
     def _snapshot_and_infer(self) -> None:
         """Push the served node into history and re-run FM inference (once per step).

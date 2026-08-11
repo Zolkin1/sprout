@@ -16,12 +16,15 @@ from .rewards.rewards import *  # noqa: F401, F403
 from .observations.observations import *  # noqa: F401, F403
 from .observations.depth import (  # noqa: F401
     DEPTH_OBS_FUNCS,
+    FM_DEPTH_OBS_GROUP,
     depth_camera_specs,
     depth_image,
     depth_image_4d,
     depth_obs_stack,
     find_depth_obs_terms,
+    fm_depth_groups,
     normalize_depth,
+    rl_depth_groups,
 )
 from .terminations.terminations import *  # noqa: F401, F403
 from .commands import *  # noqa: F401, F403

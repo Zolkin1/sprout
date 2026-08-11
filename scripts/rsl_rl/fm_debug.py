@@ -430,11 +430,20 @@ def contract_report(env, cmd, args, manifest: dict) -> str:
             from deploy.depth_obs import assert_depth_specs_agree, parse_depth_spec
             from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
                 depth_camera_specs,
+                fm_depth_groups,
             )
 
-            live = depth_camera_specs(u, ["policy"])
+            # The generator's own cameras when it samples its own grid, else the
+            # policy's -- the same scoping FmTrackingCommand._read_extero uses, so
+            # this compares the contract the FM is actually being fed.
+            live = depth_camera_specs(u, fm_depth_groups(u) or ["policy"])
             fm_spec = parse_depth_spec(cmd.ctx.extero_spec, "fm checkpoint")
-            assert_depth_specs_agree(live, fm_spec, "env", "fm checkpoint")
+            # STRICT here, unlike the deploy: these cameras were BUILT from this checkpoint
+            # (play.py reads its resolution and calls add_fm_depth_pair), so they should match
+            # exactly. A difference means the pair was built wrong, which is worth surfacing
+            # rather than tolerating.
+            assert_depth_specs_agree(live, fm_spec, "env", "fm checkpoint",
+                                     require_same_resolution=True)
             _add("depth camera contract", [
                 ("env vs fm checkpoint", "OK"),
                 ("cameras", [c.get("obs_term") or c.get("sensor") for c in live]),

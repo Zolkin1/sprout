@@ -103,6 +103,27 @@ It is the single producer for all consumers, so nothing off-sim restates a camer
   `RecordingMeta.depth_camera_spec` -> FM dataset -> checkpoint -> export;
 - `GenTrackerPolicy.load()` requires the two to AGREE (`transfer/deploy/depth_obs.py`) — there is one
   physical camera pair, so a tracker and generator running together cannot describe different ones.
+
+**The generator may SAMPLE that pair on its own grid** (so its vision input can change without
+retraining the teacher). `add_fm_depth_pair(env_cfg, W, H)` in `g1_depth_env_cfg.py` adds a second
+pair built from the SAME `_CameraSpec` — same mount, apertures, range and normalization, only the
+ray grid differs — in its own `fm_depth` obs group, and EXTENDS the three DR events to
+`sensor_cfgs` lists so one draw moves both samplings (extrinsics copy directly; intrinsics
+transfer as a ratio, which is why `operation="scale"` is now required for a list). It is a no-op
+when the resolutions match, and `mdp.fm_depth_groups(env)` then returns `None` = "all groups" =
+the old behaviour, which is what keeps every scoped call site free.
+- Who states the resolution: `record_data.py --fm_depth_resolution WxH` DECLARES it (no artifact
+  exists yet); `play.py` and `augment_registration.py` DERIVE it (from the checkpoint via
+  `online.read_fm_extero_meta`, and from the recording's own `depth_camera_spec`).
+- Relaxing the deploy agreement is NOT "drop width/height": `fx/fy/cx/cy` are linear in the
+  resolution, so they go free at the same time and a narrower cone on a bigger grid would pass.
+  `depth_obs.py` exchanges the sampling fields for a positive check on the four resolution-invariant
+  pinhole half-angles (all four, not their sum — a compensating principal-point shift preserves the
+  sum). `REQUIRE_SAME_DEPTH_RESOLUTION = False` carries the TODO to re-tighten.
+- MuJoCo casts BOTH grids (`gen_tracker_runner` builds a second `MujocoDepthCameras` from
+  `get_fm_depth_camera_spec()` → `state["fm_depth"]`, with `mirror_extrinsics_from` so the jittered
+  mount is shared). **Hardware is not wired for a split sampling** — `export_sensor_configs.py`
+  raises rather than emitting configs that cover only the tracker.
 Relatedly, `export_parameters.py` now emits each obs term's `clip`, so `_assemble` saturates every
 term the way training did instead of consulting a hardcoded table (kept only as a legacy fallback).
 

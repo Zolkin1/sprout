@@ -197,7 +197,16 @@ parser.add_argument(
     "--fm_checkpoint", type=str, default=None,
     help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
          "command term exposing an fm_checkpoint field (the FmTrackingCommand), "
-         "overriding the cfg default.",
+         "overriding the cfg default. The generator's DEPTH RESOLUTION is read off this "
+         "checkpoint and a matching camera pair is built automatically, so nothing else "
+         "has to state it.",
+)
+parser.add_argument(
+    "--fm_depth_resolution", type=str, default="",
+    help="'WxH' to build the generator's depth cameras at, OVERRIDING what --fm_checkpoint "
+         "states. Only useful for deliberately feeding a generator the wrong sampling to "
+         "see what it does -- the command term's shape check refuses the mismatch, so this "
+         "is for experiments on that check, not a normal knob.",
 )
 parser.add_argument(
     "--no-logging", dest="no_logging", action="store_true", default=False,
@@ -348,6 +357,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if hasattr(term, "fm_checkpoint"):
                     term.fm_checkpoint = args_cli.fm_checkpoint
                     print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
+
+        # The generator may SAMPLE the depth cameras on its own grid (so its vision input
+        # can change without retraining the policy). Read that resolution off the checkpoint
+        # and build the matching camera pair here, BEFORE gym.make -- derived rather than
+        # declared, so a flag cannot disagree with the artifact. A checkpoint at the policy's
+        # own resolution adds nothing and reads the policy's cameras, as it always did.
+        if args_cli.fm_checkpoint is not None:
+            from robot_rl.flow_matching.online import read_fm_extero_meta
+            from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+                add_fm_depth_pair,
+            )
+            fm_extero = read_fm_extero_meta(args_cli.fm_checkpoint)
+            want = (args_cli.fm_depth_resolution or "").strip()
+            if want:
+                w, h = (int(v) for v in want.replace("x", ",").split(","))
+                print(f"[INFO] --fm_depth_resolution {w}x{h} OVERRIDES the checkpoint's "
+                      f"{fm_extero['width']}x{fm_extero['height']}; the command term's shape "
+                      "check will refuse the pair unless you meant this.")
+            elif fm_extero["width"] is not None:
+                w, h = fm_extero["width"], fm_extero["height"]
+            else:
+                w = h = None
+            if w is not None and getattr(env_cfg.scene, "depth_camera_near", None) is not None:
+                add_fm_depth_pair(env_cfg, w, h)
 
         # Apply video-recording knobs to the viewer cfg before env construction.
         # ``env_cfg.viewer.resolution`` is the offscreen-render product size the

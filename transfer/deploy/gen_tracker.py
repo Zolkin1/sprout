@@ -149,6 +149,7 @@ class GenTrackerPolicy:
         self.providers = providers
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
+        self._fm_depth_spec: list[dict] = []
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -247,37 +248,50 @@ class GenTrackerPolicy:
         self._trk_infer_n = 0
 
     def _resolve_depth_cameras(self) -> None:
-        """Settle on ONE depth-camera contract for the whole deployment.
+        """Settle the depth-camera contract(s) for the whole deployment.
 
-        There is a single physical camera pair, so a depth tracker and a depth generator
-        running together must have trained on the same one.  Both artifacts carry their
-        own contract (``policy_parameters.depth_camera_spec`` /
-        ``fm_meta.extero_spec``); when both are present they must agree exactly, and the
-        resolved contract is what the runner casts with.
+        There is a single physical camera PAIR, so a depth tracker and a depth generator
+        running together must have trained on the same mount, cone, range and
+        normalisation. They may however SAMPLE it on different grids -- that is what lets
+        the generator's vision input change without retraining the policy -- so two
+        contracts are resolved rather than one:
+
+        * ``_depth_spec`` -- the tracker's, keyed by observation term. The tracker wins
+          here because ``_build_obs`` looks its cameras up BY TERM NAME.
+        * ``_fm_depth_spec`` -- the generator's, which is what every
+          ``extero_sensor_dim`` / image-fold check has to be measured against.
+
+        When they are the same list (the usual case) nothing downstream renders twice.
 
         Raises:
-            ValueError: If the two artifacts disagree, or if a depth-conditioned
-                generator has no contract to check and none to fall back on.
+            ValueError: If the two artifacts describe different physical cameras, or if a
+                depth-conditioned generator has no contract to check and none to fall back
+                on.
         """
         tracker_spec = self._trk.get_depth_camera_spec() or []
         fm_spec = list(self.ctx.extero_spec or [])
         if tracker_spec and fm_spec:
-            assert_depth_specs_agree(tracker_spec, fm_spec, "tracker.onnx", "fm.onnx")
+            # The ONE relaxation site. Physical geometry is still required to agree; only
+            # the pixel grid may differ. See depth_obs.REQUIRE_SAME_DEPTH_RESOLUTION for
+            # the TODO to re-tighten this once the two train at one resolution again.
+            assert_depth_specs_agree(tracker_spec, fm_spec, "tracker.onnx", "fm.onnx",
+                                     require_same_resolution=None)
         self._depth_spec = tracker_spec or fm_spec
+        self._fm_depth_spec = fm_spec or tracker_spec
 
         if self.ctx.extero_source == "depth":
-            if not self._depth_spec:
+            if not self._fm_depth_spec:
                 raise ValueError(
                     "fm.onnx conditions on depth but neither artifact carries a "
                     "depth_camera_spec, so the deployment cannot reproduce its cameras. "
                     "Re-export the FM (its recording must have one) or the tracker."
                 )
-            if len(self._depth_spec) != self.ctx.extero_sensor_count:
+            if len(self._fm_depth_spec) != self.ctx.extero_sensor_count:
                 raise ValueError(
                     f"fm.onnx expects {self.ctx.extero_sensor_count} depth sensor row(s) but "
-                    f"the camera contract lists {len(self._depth_spec)} camera(s)."
+                    f"its camera contract lists {len(self._fm_depth_spec)} camera(s)."
                 )
-            for cam in self._depth_spec:
+            for cam in self._fm_depth_spec:
                 pixels = int(cam["width"]) * int(cam["height"])
                 if pixels != self.ctx.extero_sensor_dim:
                     raise ValueError(
@@ -288,7 +302,7 @@ class GenTrackerPolicy:
             # And when the graph folds those pixels into an IMAGE, the pixel count is no
             # longer enough: 30x26 and 26x30 pass the check above and are different images.
             # Only a convolutional graph carries extero_image_hw, and only it can be hurt.
-            for cam, (h, w) in zip(self._depth_spec, self.ctx.extero_image_hw):
+            for cam, (h, w) in zip(self._fm_depth_spec, self.ctx.extero_image_hw):
                 if (int(cam["height"]), int(cam["width"])) != (h, w):
                     raise ValueError(
                         f"camera '{cam.get('sensor')}' is {cam['height']}x{cam['width']} (HxW) "
@@ -296,16 +310,83 @@ class GenTrackerPolicy:
                         "encoder is convolutional, so a transposed image is scrambled input, "
                         "not a reordered vector -- re-export the FM from a matching recording."
                     )
+        # The fold belongs to whichever cameras the GENERATOR reads, so it is printed on that
+        # line -- attached to the tracker's it reads as though its grid were the folded one.
+        fold = (f" folded {self.ctx.extero_image_hw[0][0]}x{self.ctx.extero_image_hw[0][1]} -> "
+                f"{self.ctx.extero_tokens_per_sensor} token(s)/camera by the "
+                f"{self.ctx.extero_encoder} encoder." if self.ctx.extero_image_hw else "")
+        split = self.depth_sampling_is_split()
         if self._depth_spec:
             where = "tracker.onnx" if tracker_spec else "fm.onnx"
-            fold = (f", folded {self.ctx.extero_image_hw[0][0]}x{self.ctx.extero_image_hw[0][1]} "
-                    f"-> {self.ctx.extero_tokens_per_sensor} token(s)/camera by the "
-                    f"{self.ctx.extero_encoder} encoder" if self.ctx.extero_image_hw else "")
-            print(f"[INFO GenTrackerPolicy] depth cameras (from {where}): "
+            who = "tracker" if split else "tracker + generator"
+            print(f"[INFO GenTrackerPolicy] depth cameras (from {where}, {who}): "
                   + ", ".join(
                       f"{c.get('sensor', c['obs_term'])} {c['width']}x{c['height']} "
                       f"on {c['mount_body']}" for c in self._depth_spec
-                  ) + fold)
+                  ) + ("" if split else fold))
+        if split:
+            print("[INFO GenTrackerPolicy] the generator SAMPLES those same cameras on its own "
+                  "grid: "
+                  + ", ".join(f"{c.get('sensor', c['obs_term'])} {c['width']}x{c['height']}"
+                              for c in self._fm_depth_spec)
+                  + f".{fold} The runner must cast both and supply state['fm_depth']; the "
+                    "physical cameras are identical (checked above), only the grids differ.")
+
+    def _fm_depth_reading(self, state: dict) -> np.ndarray:
+        """The depth reading the GENERATOR conditions on, at its own sampling.
+
+        ``state["depth"]`` is the tracker's, keyed to its observation terms. When the
+        samplings are split the generator needs its own array -- the two have different
+        widths, so there is nothing to reuse and nothing to resize (upsampling would invent
+        detail the grid never had).
+
+        Args:
+            state: The runtime state dict the runner built this step.
+
+        Returns:
+            ``(T, H*W)`` normalised depth in the generator's sensor-row order.
+
+        Raises:
+            KeyError: If the samplings are split and the runner supplied no ``fm_depth``.
+        """
+        if not self.depth_sampling_is_split():
+            return np.asarray(state["depth"], dtype=np.float64)
+        if "fm_depth" not in state:
+            raise KeyError(
+                "the generator samples the depth cameras at "
+                f"{self._fm_depth_spec[0]['width']}x{self._fm_depth_spec[0]['height']} while "
+                f"the tracker uses {self._depth_spec[0]['width']}x{self._depth_spec[0]['height']}, "
+                "so it needs its own reading in state['fm_depth'] -- cast a second grid from "
+                "get_fm_depth_camera_spec(). state['depth'] is the TRACKER's and is the wrong "
+                "width."
+            )
+        return np.asarray(state["fm_depth"], dtype=np.float64)
+
+    def depth_sampling_is_split(self) -> bool:
+        """Whether the generator samples the cameras on a different grid than the tracker.
+
+        The runner reads this to decide whether it needs a SECOND ray caster, and the
+        hardware path reads it to refuse: there is one real camera stream per lens, so a
+        split sampling has no wiring on a robot yet.
+
+        Returns:
+            True when the two resolved contracts differ in resolution.
+        """
+        if not self._depth_spec or not self._fm_depth_spec:
+            return False
+        return [(int(c["width"]), int(c["height"])) for c in self._depth_spec] != \
+               [(int(c["width"]), int(c["height"])) for c in self._fm_depth_spec]
+
+    def get_fm_depth_camera_spec(self) -> list[dict]:
+        """The GENERATOR's depth-camera contract.
+
+        The same list as :meth:`get_depth_camera_spec` unless the samplings are split, in
+        which case this is the one whose grid the generator's graph expects.
+
+        Returns:
+            One dict per camera, in the generator's sensor-row order.
+        """
+        return list(self._fm_depth_spec)
 
     def get_depth_camera_spec(self) -> list[dict]:
         """The resolved depth-camera contract (empty when the policy has no cameras).
@@ -644,7 +725,7 @@ class GenTrackerPolicy:
         # (already normalised, matching mdp.depth_obs_stack); the height scan is one token
         # of per-ray clearance. Matches how each is recorded and used in the RL obs.
         if ctx.extero_source == "depth":
-            extero = build_extero_tokens(ctx, np.asarray(state["depth"], dtype=np.float64)[None])
+            extero = build_extero_tokens(ctx, self._fm_depth_reading(state)[None])
         else:
             extero = build_extero_tokens(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
         if self._future_cmd_override is not None:

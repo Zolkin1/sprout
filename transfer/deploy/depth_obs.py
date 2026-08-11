@@ -21,6 +21,8 @@ No torch, no isaaclab.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 
@@ -40,11 +42,41 @@ _REQUIRED_FIELDS: tuple[str, ...] = (
     "offset", "scale", "min_dist", "max_dist", "min_clip_val", "max_clip_val",
 )
 
-#: Contract fields two artifacts need NOT agree on. ``obs_term`` because a tracker names
-#: its observation term and a generator has none; ``update_period`` because the deploy
-#: recomputes every control step regardless. Everything else is compared, so a field added
-#: to the contract is checked without touching this module.
-_AGREEMENT_EXCLUDE: frozenset[str] = frozenset({"obs_term", "update_period"})
+#: Contract fields two artifacts never have to agree on. ``obs_term`` because a tracker
+#: names its observation term and a generator has none; ``update_period`` because the deploy
+#: recomputes every control step regardless. Everything not listed here or in
+#: :data:`_SAMPLING_FIELDS` is PHYSICAL and always compared, so a field added to the
+#: contract is checked without touching this module.
+_NAMING_FIELDS: frozenset[str] = frozenset({"obs_term", "update_period"})
+
+#: Fields that describe how a lens is SAMPLED rather than what it is. Comparable only when
+#: the two artifacts are required to sample identically; otherwise replaced by the
+#: resolution-invariant cone check (:func:`camera_half_angles_rad`).
+#:
+#: ``fx/fy/cx/cy`` are here because they are linear in the resolution -- once width and
+#: height may differ, so must they. ``sensor`` is here rather than in
+#: :data:`_NAMING_FIELDS` on purpose: the generator's cameras carry distinct scene names, so
+#: it cannot be compared when the samplings are split, but a re-tightened check should still
+#: catch a swapped or renamed camera.
+_SAMPLING_FIELDS: frozenset[str] = frozenset(
+    {"sensor", "width", "height", "fx", "fy", "cx", "cy"}
+)
+
+#: Whether a tracker and a generator must SAMPLE the depth cameras identically.
+#:
+#: ``False`` so the generator's resolution can be changed and retrained without retraining
+#: the policy. The physical camera is still pinned (mount, cone, range, normalization); only
+#: the pixel grid is free.
+#:
+#: TODO(depth-resolution): flip back to True once the FM and the RL policy train at one
+#: resolution again. ``test_resolution_split_is_opt_in`` fails when this changes, so the
+#: flip is a deliberate edit rather than something that drifts.
+REQUIRE_SAME_DEPTH_RESOLUTION: bool = False
+
+#: Tolerance on the pinhole half-angle comparison (radians). Tight: the two contracts are
+#: derived from the same aperture, so any real difference is a configuration error, not
+#: float noise.
+_FOV_ATOL_RAD: float = 1e-7
 
 
 def parse_depth_spec(raw, source: str = "spec") -> list[dict]:
@@ -199,8 +231,34 @@ def invalid_depth_value(cam: dict) -> float:
     return (float(cam["max_clip_val"]) - float(cam["offset"])) * float(cam["scale"])
 
 
+def camera_half_angles_rad(cam: dict) -> tuple[float, float, float, float]:
+    """The four pinhole half-angles ``(left, right, up, down)`` in radians.
+
+    The quantity that says two cameras look through the same LENS whatever grid they sample
+    it on, and therefore what makes a differing resolution safe to allow. It is exactly
+    resolution-free: with ``fx = W * f / aperture`` and ``cx = W / 2``,
+    ``atan(cx / fx) = atan(aperture / 2f)`` -- the width cancels.
+
+    All four, not their sum: a total FOV would be preserved by a principal point pushed
+    off-centre in one direction and compensated in the other, which is a different camera.
+
+    Args:
+        cam: One parsed camera contract entry.
+
+    Returns:
+        ``(left, right, up, down)`` half-angles.
+    """
+    return (
+        math.atan(float(cam["cx"]) / float(cam["fx"])),
+        math.atan((float(cam["width"]) - float(cam["cx"])) / float(cam["fx"])),
+        math.atan(float(cam["cy"]) / float(cam["fy"])),
+        math.atan((float(cam["height"]) - float(cam["cy"])) / float(cam["fy"])),
+    )
+
+
 def assert_depth_specs_agree(
     a: list[dict], b: list[dict], name_a: str = "tracker", name_b: str = "generator",
+    require_same_resolution: bool | None = None,
 ) -> None:
     """Raise unless two artifacts describe the same physical depth cameras.
 
@@ -208,28 +266,52 @@ def assert_depth_specs_agree(
     have trained on the same mount, optics, range and normalisation.  Mismatched geometry
     is otherwise silent: both networks accept the wrong image and simply behave worse.
 
+    The generator may SAMPLE that pair on its own grid (so its vision input can change
+    without retraining the policy), which is what ``require_same_resolution=False`` allows.
+    Relaxing it is not merely "drop width and height": that would also permit a different
+    LENS, since ``fx/fy/cx/cy`` are free to move once the resolution is. So the sampling
+    fields are exchanged for a positive check on the resolution-invariant cone
+    (:func:`camera_half_angles_rad`) -- the constraint is weakened, not removed.
+
     Args:
         a: Parsed contract from the first artifact.
         b: Parsed contract from the second artifact.
         name_a: Label for the first artifact, used in the error.
         name_b: Label for the second artifact, used in the error.
+        require_same_resolution: Whether the two must sample identically. ``None`` takes
+            :data:`REQUIRE_SAME_DEPTH_RESOLUTION`, the deployment-wide default.
 
     Raises:
-        ValueError: On a differing camera count or any differing field, listing every
-            disagreement rather than only the first.
+        ValueError: On a differing camera count, any differing physical field, or (when
+            resolutions may differ) a differing cone -- listing every disagreement rather
+            than only the first.
     """
+    strict = REQUIRE_SAME_DEPTH_RESOLUTION if require_same_resolution is None \
+        else bool(require_same_resolution)
     if len(a) != len(b):
         raise ValueError(
             f"{name_a} has {len(a)} depth camera(s) but {name_b} has {len(b)}; they "
             "cannot be reading the same physical pair."
         )
+    ignored = _NAMING_FIELDS if strict else (_NAMING_FIELDS | _SAMPLING_FIELDS)
     diffs: list[str] = []
     for i, (cam_a, cam_b) in enumerate(zip(a, b)):
         label = cam_a.get("sensor") or cam_a.get("obs_term") or f"camera {i}"
-        for field in sorted((set(cam_a) | set(cam_b)) - _AGREEMENT_EXCLUDE):
+        for field in sorted((set(cam_a) | set(cam_b)) - ignored):
             va, vb = cam_a.get(field), cam_b.get(field)
             if _values_differ(va, vb):
                 diffs.append(f"  {label}.{field}: {name_a}={va!r} {name_b}={vb!r}")
+        if strict:
+            continue
+        # The sampling is allowed to differ, so the LENS has to be checked directly.
+        for axis, va, vb in zip(("hfov_left", "hfov_right", "vfov_up", "vfov_down"),
+                                camera_half_angles_rad(cam_a), camera_half_angles_rad(cam_b)):
+            if abs(va - vb) > _FOV_ATOL_RAD:
+                diffs.append(
+                    f"  {label}.{axis}: {name_a}={math.degrees(va):.4f}deg "
+                    f"{name_b}={math.degrees(vb):.4f}deg -- same pixel grid or not, these "
+                    "are different lenses"
+                )
     if diffs:
         raise ValueError(
             f"{name_a} and {name_b} disagree about the depth cameras:\n" + "\n".join(diffs)

@@ -34,6 +34,15 @@ The marker for "this term consumes a camera", used to discover the cameras a tas
 actually observes rather than the ones its scene happens to hold.
 """
 
+FM_DEPTH_OBS_GROUP: str = "fm_depth"
+"""Observation group holding the GENERATOR's cameras when it samples at its own resolution.
+
+A separate group rather than extra terms in ``policy`` for two reasons: the policy's
+observation vector must not change (that is the whole point of decoupling the two), and
+:func:`depth_obs_stack` stacks every depth term it is given into one array, which cannot
+hold images of two different widths. See :func:`fm_depth_groups`.
+"""
+
 
 def normalize_depth(
     d: torch.Tensor,
@@ -171,8 +180,44 @@ def _walk_depth_obs_terms(
     return found
 
 
-def find_depth_obs_terms(env: "ManagerBasedRLEnv") -> list[tuple[str, dict]]:
-    """Discover every depth observation term, as ``(sensor_name, params)`` in obs order.
+def fm_depth_groups(env: "ManagerBasedRLEnv") -> list[str] | None:
+    """The observation group holding the GENERATOR's cameras, or ``None`` if there is none.
+
+    ``None`` means "every group", which is the pre-existing behaviour -- so every consumer
+    that scopes itself with this is a no-op on a task whose FM and policy share one camera
+    pair, and no flag has to be plumbed anywhere to keep it that way. The pair only exists
+    when :func:`~robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg.add_fm_depth_pair`
+    put it there, i.e. when the generator's depth resolution differs from the policy's.
+
+    Args:
+        env: The environment instance.
+
+    Returns:
+        ``[FM_DEPTH_OBS_GROUP]`` when that group is active, else ``None``.
+    """
+    return ([FM_DEPTH_OBS_GROUP]
+            if FM_DEPTH_OBS_GROUP in env.observation_manager.active_terms else None)
+
+
+def rl_depth_groups(env: "ManagerBasedRLEnv") -> list[str]:
+    """Every observation group EXCEPT the generator's -- i.e. the policy's own cameras.
+
+    Not simply ``["policy"]``: the ``-image`` task variant puts the policy's depth in its
+    own per-camera groups, so the policy's cameras are "whatever is not the FM's".
+
+    Args:
+        env: The environment instance.
+
+    Returns:
+        Active group names, excluding :data:`FM_DEPTH_OBS_GROUP`.
+    """
+    return [g for g in env.observation_manager.active_terms if g != FM_DEPTH_OBS_GROUP]
+
+
+def find_depth_obs_terms(
+    env: "ManagerBasedRLEnv", groups: list[str] | None = None
+) -> list[tuple[str, dict]]:
+    """Discover depth observation terms, as ``(sensor_name, params)`` in obs order.
 
     The FM's depth conditioning must be normalised EXACTLY as the recorded training data
     was, and the observation terms are the single source of truth for that (each camera
@@ -182,13 +227,17 @@ def find_depth_obs_terms(env: "ManagerBasedRLEnv") -> list[tuple[str, dict]]:
 
     Args:
         env: The environment instance.
+        groups: Observation groups to search, or ``None`` for all of them. Pass
+            :func:`fm_depth_groups` / :func:`rl_depth_groups` when the task carries both a
+            policy and a generator camera pair at different resolutions -- unscoped, the
+            two would be returned as one list.
 
     Returns:
         ``[(sensor_name, params), ...]``, deduplicated, in observation-group order.
         ``params`` is directly usable as :func:`depth_image` keyword arguments.
     """
     out = []
-    for _, sensor_name, params, _ in _walk_depth_obs_terms(env):
+    for _, sensor_name, params, _ in _walk_depth_obs_terms(env, groups):
         # height/width are reshape-only args for the 4d variant; drop them so the
         # stacked reading is always flat per camera.
         params.pop("height", None)
@@ -278,8 +327,10 @@ def depth_camera_specs(
     return specs
 
 
-def depth_obs_stack(env: "ManagerBasedRLEnv") -> torch.Tensor:
-    """All depth cameras' observations stacked on a token axis, ``(B, T, H*W)``.
+def depth_obs_stack(
+    env: "ManagerBasedRLEnv", groups: list[str] | None = None
+) -> torch.Tensor:
+    """Depth cameras' observations stacked on a sensor axis, ``(B, T, H*W)``.
 
     One row per camera, each normalised with that camera's own observation-term
     parameters.  This is the array recorded for the flow-matching generator and the one
@@ -287,24 +338,40 @@ def depth_obs_stack(env: "ManagerBasedRLEnv") -> torch.Tensor:
 
     Args:
         env: The environment instance.
+        groups: Observation groups to read, or ``None`` for all of them. A task carrying
+            BOTH a policy pair and a generator pair at a different resolution must scope
+            this (see :func:`fm_depth_groups`): the rows share one array, so cameras of
+            two widths cannot be stacked together.
 
     Returns:
         Stacked depth, shape ``(num_envs, num_cameras, H*W)``.
 
     Raises:
-        RuntimeError: If the environment has no depth observation terms.
+        RuntimeError: If the environment has no depth observation terms in ``groups``.
+        ValueError: If the selected cameras do not share one resolution.
     """
-    terms = find_depth_obs_terms(env)
+    terms = find_depth_obs_terms(env, groups)
     if not terms:
         raise RuntimeError(
-            "no depth observation terms found; run a depth task so mdp.depth_image terms "
-            "exist to read -- G1-teacher-clf-terrain-depth to train, or "
+            "no depth observation terms found"
+            + (f" in groups {groups}" if groups else "")
+            + "; run a depth task so mdp.depth_image terms exist to read -- "
+            "G1-teacher-clf-terrain-depth to train, or "
             "G1-tracker-clf-fm-terrain-depth-play to deploy a depth-conditioned generator "
             "(the height-scan tracker task has no cameras)."
         )
-    return torch.stack(
-        [depth_image(env, SceneEntityCfg(name), **params) for name, params in terms], dim=1
-    )
+    rows = [depth_image(env, SceneEntityCfg(name), **params) for name, params in terms]
+    widths = {int(r.shape[-1]) for r in rows}
+    if len(widths) > 1:
+        # torch.stack would raise on its own, but with a shape message that says nothing
+        # about WHY two cameras disagree. This is the mixed-group mistake, named.
+        raise ValueError(
+            f"cameras {[n for n, _ in terms]} have differing pixel counts {sorted(widths)}, "
+            "so they cannot share one stacked array. This is what scoping is for: pass "
+            "mdp.fm_depth_groups(env) for the generator's pair or mdp.rl_depth_groups(env) "
+            "for the policy's, rather than reading every group at once."
+        )
+    return torch.stack(rows, dim=1)
 
 
 def depth_image_4d(
@@ -316,10 +383,15 @@ def depth_image_4d(
     max_dist: float = 9.0,
     min_clip_val: float = 0.0,
     max_clip_val: float = 0.0,
-    height: int = 26,
-    width: int = 30,
+    *,
+    height: int,
+    width: int,
 ) -> torch.Tensor:
     """Depth image of shape ``(B, 1, H, W)`` for CNN backbones.
+
+    ``height``/``width`` are REQUIRED (and keyword-only). They used to default to the G1's
+    30x26, which is a silently-wrong reshape waiting for the first task that samples at
+    another resolution -- and the only caller passes them explicitly anyway.
 
     Args:
         env: The environment instance.

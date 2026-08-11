@@ -223,6 +223,61 @@ class FmOnlineContext:
         return self.target_num_extra_frames
 
 
+def read_fm_extero_meta(checkpoint: str, map_location: str = "cpu") -> dict:
+    """Read a checkpoint's exteroception contract WITHOUT building the model.
+
+    For the callers that must know what a generator expects to be fed before the thing that
+    would feed it exists -- ``play.py`` has to size the env's camera pair before
+    ``gym.make``, and building the full context there would mean loading 400 MB of weights
+    to learn two integers.
+
+    DERIVED, never declared: the resolution comes from the artifact rather than a flag, so
+    a generator and the cameras built for it cannot disagree by a typo.
+
+    Args:
+        checkpoint: Path to an FM ``.pt``.
+        map_location: ``torch.load`` map location.
+
+    Returns:
+        ``{"extero_source", "extero_sensor_count", "extero_sensor_dim", "extero_encoder",
+        "extero_spec", "width", "height"}``. ``width``/``height`` are ``None`` unless the
+        checkpoint conditions on depth and states a per-camera geometry.
+
+    Raises:
+        ValueError: If a depth checkpoint's cameras disagree on resolution, or if the stated
+            geometry does not unfold its own sensor row -- both of which would otherwise
+            surface much later as a shape error inside the graph.
+    """
+    ckpt = torch.load(checkpoint, map_location=map_location, weights_only=False)
+    cfg = FlowMatchingConfig.from_dict(ckpt["config"])
+    spec = list((ckpt.get("meta") or {}).get("extero_spec") or [])
+    out = {
+        "extero_source": cfg.extero_source,
+        "extero_sensor_count": int(cfg.extero_sensor_count),
+        "extero_sensor_dim": int(cfg.extero_sensor_dim),
+        "extero_encoder": cfg.resolve_extero_encoder(),
+        "extero_spec": spec,
+        "width": None,
+        "height": None,
+    }
+    if cfg.extero_source != "depth" or not spec:
+        return out
+    sizes = {(int(c["width"]), int(c["height"])) for c in spec}
+    if len(sizes) != 1:
+        raise ValueError(
+            f"{checkpoint}: its cameras sample at {sorted(sizes)}; one generator's cameras "
+            "share one resolution (they are stacked into one array)."
+        )
+    width, height = sizes.pop()
+    if width * height != out["extero_sensor_dim"]:
+        raise ValueError(
+            f"{checkpoint}: cameras are {width}x{height} = {width * height} px but the "
+            f"sensor row is {out['extero_sensor_dim']} wide."
+        )
+    out["width"], out["height"] = width, height
+    return out
+
+
 #: State-dict prefixes renamed with the exteroception contract: old -> new.
 _LEGACY_WEIGHT_PREFIXES: dict[str, str] = {
     "height_in.": "extero_in.",

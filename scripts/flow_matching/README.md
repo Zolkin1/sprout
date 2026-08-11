@@ -111,6 +111,53 @@ with `v = 0` the top row, and the `(H, W)` to fold it with is derived from the r
 from a 26x30 one, so the shape travels into `fm.onnx` and the deploy refuses a mismatch
 (`transfer/deploy/gen_tracker.py`).
 
+### Changing the generator's resolution without retraining the teacher
+
+The generator can sample the policy's lenses on **its own grid**, so the encoder's input can
+change on an FM retrain alone:
+
+```bash
+# 1. record: the policy keeps 30x26, the generator's array is 60x52
+python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-depth \
+    --load_run <teacher> --clip <lib>.h5 --clip_device cpu \
+    --num_windows 200000 --history_len 8 --ref_future_len 62 \
+    --fm_depth_resolution 60x52 --num_envs 256 --headless
+
+# 2. train: the dataset DERIVES 60x52 from the recording's camera contract
+python scripts/flow_matching/train.py --data <windows>.h5 --extero_encoder cnn ...
+
+# 3. play: the resolution is read off the checkpoint and the pair is built to match
+python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play \
+    --load_run <teacher> --fm_checkpoint <fm.pt> --clip <lib>.h5
+```
+
+Only the SAMPLING differs. Both pairs are built from the same `_CameraSpec`, so mount,
+apertures, range and normalization are shared by construction, and the three DR events draw
+ONCE for both — a mount cannot be in two places, and independent draws would make them two
+different physical cameras.
+
+Costs, which is why the resolution is worth choosing before recording rather than after: ray
+cost and the `depth` dataset both scale with `W*H`, so 60x52 is **4x** the 30x26 pair. A
+200k-window recording is 1.25 GB at 30x26 and 5.0 GB at 60x52 (29 GB at 128x112).
+
+**Raising the resolution raises the TOKEN COUNT unless you say otherwise**, which is the trap
+here: the grid is the image ceil-halved once per conv layer, so a bigger image leaves a bigger
+grid and the transformer's sequence grows with it. Measured:
+
+| cameras | flags | tokens/cam | extero tokens | sequence |
+|---|---|---|---|---|
+| 30x26 | — | 16 | 32 | 111 |
+| 60x52 | — | **56** | **112** | **191** |
+| 60x52 | `--extero_cnn_channels 16,32,64,128` | 16 | 32 | 111 |
+| 60x52 | `--extero_cnn_grid 4,4` | 16 | 32 | 111 |
+
+Prefer the 4th conv layer over pooling: it never computes the resolution it would then throw
+away, and the extra layer widens the receptive field, which is the point of the finer grid.
+
+MuJoCo casts both grids. **Hardware does not** — `export_sensor_configs.py` raises rather
+than emitting obelisk/ZED configs that cover only the tracker, so a split-sampling generator
+has to be retrained at the policy's resolution before it can go on the robot.
+
 ---
 
 ## 1. Record training data  (needs Isaac Sim)

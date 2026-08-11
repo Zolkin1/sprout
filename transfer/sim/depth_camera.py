@@ -334,6 +334,41 @@ class MujocoDepthCameras:
             euler = rng.uniform(-1.0, 1.0, 3) * np.asarray(rot_range, dtype=np.float64)
             cam.offset_rot = cam.nominal_offset_rot @ _euler_xyz_to_matrix(euler)
 
+    def mirror_extrinsics_from(self, other: "MujocoDepthCameras") -> None:
+        """Adopt another instance's sampled mount poses, camera by camera.
+
+        For the case where the generator samples the same physical lenses on its own grid:
+        one camera cannot be in two places, so the two casters must share the mount
+        perturbation. Mirrors ``mdp.events.depth.randomize_camera_extrinsics`` with a
+        ``sensor_cfgs`` list on the IsaacLab side, so sim2sim reproduces the same coupling.
+
+        Only the mount is copied -- the per-frame noise draws stay independent, since they
+        cannot be shared across differing pixel counts anyway.
+
+        Args:
+            other: The caster whose sampled mounts to adopt (typically the tracker's).
+
+        Raises:
+            ValueError: On a camera-count mismatch, or if a corresponding pair does not
+                share a NOMINAL mount -- which would mean they are not one physical camera
+                and must not share a perturbation.
+        """
+        if len(self.cameras) != len(other.cameras):
+            raise ValueError(
+                f"cannot mirror mounts: {len(self.cameras)} camera(s) here against "
+                f"{len(other.cameras)} there."
+            )
+        for mine, theirs in zip(self.cameras, other.cameras):
+            if not (np.allclose(mine.nominal_offset_pos, theirs.nominal_offset_pos, atol=1e-9)
+                    and np.allclose(mine.nominal_offset_rot, theirs.nominal_offset_rot,
+                                    atol=1e-9)):
+                raise ValueError(
+                    f"'{mine.sensor}' and '{theirs.sensor}' do not share a nominal mount, so they "
+                    "are not two samplings of one physical camera."
+                )
+            mine.offset_pos = theirs.offset_pos.copy()
+            mine.offset_rot = theirs.offset_rot.copy()
+
     def compute(self, mj_data, want_hits: bool = False):
         """Cast every camera and return the normalised images (and optionally hit points).
 
