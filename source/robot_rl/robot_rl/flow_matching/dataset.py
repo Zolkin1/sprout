@@ -64,7 +64,6 @@ from .window import (
 #: weight rather than letting it index columns that are not there.
 _LOSS_TERM_BLOCKS: dict[str, tuple[str, ...]] = {
     "vel_consistency_weight": ("base_pose", "base_vel"),
-    "accel_consistency_weight": ("base_vel",),
     "joint_vel_consistency_weight": ("joint_pos", "joint_vel"),
     "fk_pose_weight": ("joint_pos", "ee_pos"),
     "body_pose_root_weight": ("joint_pos",),
@@ -119,6 +118,73 @@ def _check_scan_grid_closes(entry: dict, sensor_dim: int) -> None:
             f"scan '{entry.get('sensor')}' states num_rays={entry['num_rays']} but the "
             f"recorded row is {sensor_dim} wide."
         )
+
+
+def declared_state_scales(
+    cfg: FlowMatchingConfig, num_joints: int, num_extra_frames: int,
+    blocks: Sequence[str] | None,
+) -> torch.Tensor | None:
+    """Per-channel declared scale over one window node, ``0`` where the block stays FITTED.
+
+    Expanded through :func:`expand_window_blocks`, the same helper the noise and observation
+    scale tables use, so a layout or block-selection change cannot land here and not there.
+
+    Args:
+        cfg: Training config (the ``state_scale_*`` fields are read).
+        num_joints: ``nj``.
+        num_extra_frames: ``K``.
+        blocks: The window's block selection.
+
+    Returns:
+        ``(D,)`` scales, or ``None`` when no block declares one.
+
+    Raises:
+        ValueError: On a non-positive declared scale, which would divide by zero or flip sign.
+    """
+    table = {
+        "base_pos": cfg.state_scale_base_pos,
+        # Never declared: the rot6d block is already exempt from standardization.
+        "base_ori": None,
+        "base_lin_vel": cfg.state_scale_base_lin_vel,
+        "base_ang_vel": cfg.state_scale_base_ang_vel,
+        "joint_pos": cfg.state_scale_joint_pos,
+        "joint_vel": cfg.state_scale_joint_vel,
+        "ee_pos": cfg.state_scale_ee_pos,
+    }
+    for key, value in table.items():
+        if value is not None and float(value) < 0.0:
+            raise ValueError(
+                f"state_scale_{key}={value} must be positive, or 0/None to fit that block.")
+    # 0 and None both mean "fit this block per channel" -- 0 so the CLI has an off switch.
+    zeroed = {k: (0.0 if v is None else float(v)) for k, v in table.items()}
+    if not any(v > 0.0 for v in zeroed.values()):
+        return None
+    return torch.tensor(
+        expand_window_blocks(num_joints, num_extra_frames, zeroed, blocks), dtype=torch.float32)
+
+
+def apply_declared_scales(normalizer: Normalizer, declared: torch.Tensor | None) -> Normalizer:
+    """Override the fitted statistics wherever a block declares its own scale.
+
+    A declared channel becomes ``mean = 0, std = scale``; the rest keep what was fitted. The
+    normalizer's SHAPE is unchanged, so the checkpoint, the folded ONNX buffers and the whole
+    deploy path are identical either way -- only the numbers move.
+
+    Args:
+        normalizer: The freshly fitted state normalizer.
+        declared: ``(D,)`` from :func:`declared_state_scales`, or ``None``.
+
+    Returns:
+        The same normalizer when nothing is declared, else a new one.
+    """
+    if declared is None:
+        return normalizer
+    sel = declared > 0
+    return Normalizer(
+        torch.where(sel, torch.zeros_like(normalizer.mean), normalizer.mean),
+        torch.where(sel, declared.to(normalizer.std.dtype), normalizer.std),
+        normalizer.standardize_mask.clone(),
+    )
 
 
 def _yaw_from_quat_xyzw(quat: torch.Tensor) -> torch.Tensor:
@@ -755,15 +821,28 @@ class FutureStateDataset(Dataset):
         # windows for information that is one byte per node.
         self.anchor_mask = None
         self.mask_frame_yaw_rel = None
-        if float(cfg.pinned_axis_loss_weight) != 1.0:
-            if not windowed:
+        weighted = float(cfg.pinned_axis_loss_weight) != 1.0
+        if weighted or cfg.pinned_axis_metrics:
+            if weighted and not windowed:
                 raise ValueError(
                     "pinned_axis_loss_weight needs the per-window clip index, which only the "
                     "windowed .h5 recordings carry. Record with --num_windows."
                 )
-            n_all = int(np.asarray(data["clip_id"]).shape[0])
-            masks = window_anchor_masks(data, meta, cfg, n_all)[sel]
-            frame_yaw = window_mask_frame_yaw(data, meta, cfg, n_all)[sel]
+            try:
+                if not windowed:
+                    raise ValueError("the per-window clip index needs a windowed recording")
+                n_all = int(np.asarray(data["clip_id"]).shape[0])
+                masks = window_anchor_masks(data, meta, cfg, n_all)[sel]
+                frame_yaw = window_mask_frame_yaw(data, meta, cfg, n_all)[sel]
+            except Exception as exc:
+                # The LOSS cannot silently lose its weighting; a metric can.
+                if weighted:
+                    raise
+                print(f"[fm-data] pinned/free val split OFF: {type(exc).__name__}: {exc}")
+                masks = frame_yaw = None
+        else:
+            masks = frame_yaw = None
+        if masks is not None:
             # The mask's downrange/lateral axes live in the TERRAIN's frame; the window's x/y
             # are the snap robot's yaw frame. What the loss needs is the angle between them,
             # so it is resolved here where both are known rather than assumed to be zero (the
@@ -775,10 +854,13 @@ class FutureStateDataset(Dataset):
                 torch.from_numpy(frame_yaw).to(snap_yaw.dtype) - snap_yaw)    # (Nw,)
             from motion_gen.world_lift import anchor_mask_is_pinned
             frac = float(anchor_mask_is_pinned(self.anchor_mask).float().mean())
-            print(f"[fm-data] pinned_axis_loss_weight={cfg.pinned_axis_loss_weight:g}: "
-                  f"{100.0 * frac:.1f}% of predicted nodes are terrain-registered; their "
-                  "pinned root DOFs carry that many times the flow loss (weights renormalized "
-                  "to mean 1, so the loss scale is unchanged).")
+            how = (f"their pinned root DOFs carry {cfg.pinned_axis_loss_weight:g}x the flow "
+                   "loss (weights renormalized to mean 1, so the loss scale is unchanged)"
+                   if float(cfg.pinned_axis_loss_weight) != 1.0
+                   else "the loss is UNWEIGHTED; the mask is loaded only to report "
+                        "val/flow_mse_masked vs flow_mse_unmasked")
+            print(f"[fm-data] anchor mask: {100.0 * frac:.1f}% of predicted nodes are "
+                  f"terrain-registered; {how}.")
 
         # Strided future command tokens.
         if cmd_dim > 0:
@@ -806,6 +888,22 @@ class FutureStateDataset(Dataset):
             state_mask[bp + 3:bp + 9] = False
         if state_normalizer is None:
             state_normalizer = Normalizer.fit(target.reshape(-1, self.state_dim), state_mask)
+            declared = declared_state_scales(
+                cfg, self.num_joints, self.num_extra_frames, self.blocks)
+            if declared is not None:
+                fitted_std = state_normalizer.std.clone()
+                state_normalizer = apply_declared_scales(state_normalizer, declared)
+                sel = declared > 0
+                print(f"[fm-data] declared state scales on {int(sel.sum())}/{self.state_dim} "
+                      "channels (mean 0, one scale per block) -- the rest stay fitted. "
+                      "Per block, declared scale vs the fitted std it replaces: "
+                      + ", ".join(
+                          f"{name} {float(declared[s.start]):g} vs "
+                          f"[{float(fitted_std[s].min()):.3f},{float(fitted_std[s].max()):.3f}]"
+                          # A block can be ZERO WIDTH (ee_pos with no extra frames), and its
+                          # slice then starts at state_dim -- indexing it would overrun.
+                          for name, s in self.block_slices.items()
+                          if s.stop > s.start and bool(sel[s.start])))
         self.state_normalizer = state_normalizer
 
         if extero_normalizer is None:
@@ -825,9 +923,33 @@ class FutureStateDataset(Dataset):
 
         if cmd_dim > 0:
             if cmd_normalizer is None:
-                cmd_normalizer = Normalizer.fit(
-                    cmd_strided.reshape(-1, cmd_dim), torch.ones(cmd_dim, dtype=torch.bool)
-                )
+                if cfg.cmd_scale is not None:
+                    scale = [float(v) for v in cfg.cmd_scale]
+                    if len(scale) != cmd_dim:
+                        raise ValueError(
+                            f"cmd_scale has {len(scale)} entries but the command is {cmd_dim} "
+                            "wide; give one scale per channel (vx, vy, wz).")
+                    if any(v <= 0.0 for v in scale):
+                        raise ValueError(f"cmd_scale entries must be positive, got {scale}.")
+                    # Divide by the DESIGNED maximum, mean 0: the command range is a generator
+                    # setting rather than an observed distribution, so this puts it in [-1, 1]
+                    # by construction AND keeps a zero command at zero. Standardizing would
+                    # not: the fitted vx mean is ~1.25 m/s, so "stand still" would arrive as
+                    # a large negative number rather than as nothing.
+                    cmd_normalizer = Normalizer(
+                        torch.zeros(cmd_dim), torch.tensor(scale, dtype=torch.float32),
+                        torch.ones(cmd_dim, dtype=torch.bool))
+                    obs = cmd_strided.reshape(-1, cmd_dim)
+                    frac = (obs.abs() > torch.tensor(scale)).float().mean(0)
+                    print(f"[fm-data] cmd_scale={scale} (declared max, mean 0): "
+                          f"observed max |cmd| "
+                          f"{[round(float(v), 4) for v in obs.abs().max(0).values]}, "
+                          f"fraction outside the scale "
+                          f"{[f'{100 * float(v):.3f}%' for v in frac]}.")
+                else:
+                    cmd_normalizer = Normalizer.fit(
+                        cmd_strided.reshape(-1, cmd_dim), torch.ones(cmd_dim, dtype=torch.bool)
+                    )
             self.cmd_normalizer = cmd_normalizer
             self.cmd_tokens = cmd_normalizer.normalize(cmd_strided).contiguous()
         else:

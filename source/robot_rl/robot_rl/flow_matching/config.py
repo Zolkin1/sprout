@@ -368,6 +368,47 @@ class FlowMatchingConfig:
     # now maps to +clip, the drop-off end, and real terrain also reaches large positive values
     # where the robot stands high above a distant floor. Without the mask those are one number.
     extero_miss_sentinel: float | None = None
+    # DECLARED per-block scales for the state (window) normalizer. ``None`` = fit that block
+    # per channel from the data, which is the historical behaviour and the default.
+    #
+    # A declared scale sets ``mean = 0`` and ``std = scale`` for EVERY channel of the block, so
+    # the block is divided by one number instead of standardized per channel. Two reasons that
+    # is better for the geometric blocks:
+    #
+    # * it PRESERVES the metric relationship between axes. Fitted per channel, base position
+    #   gets std (0.500, 0.111, 0.145) -- x is 4.5x y -- so a metre forward and a metre
+    #   sideways arrive as very different numbers and the model's error is implicitly
+    #   reweighted by how far the robot usually travels along each axis. One scale keeps a
+    #   metre a metre, the same argument as the exteroception's metric mode.
+    # * it makes ZERO mean zero. Standardizing subtracts a mean (0.354 m on base_pos x, since
+    #   the robot advances over the horizon), so "no displacement" stops mapping to 0. For a
+    #   window whose node 0 is the robot's own pose, that is a worse origin.
+    #
+    # ``base_ori`` is deliberately absent: the rot6d block is already exempt from
+    # standardization (two orthonormal columns, O(1) by construction).
+    # Defaults are MEASURED on clips/g1_mb_v5_body.h5 via the depth_v5 recording, chosen so each
+    # block's pooled std lands near 1: base_pos 0.4 -> 0.87, base_lin_vel 0.5 -> 1.05,
+    # base_ang_vel 0.4 -> 1.01. ``0`` (or ``None``) fits that block per channel instead.
+    #
+    # ``joint_pos`` / ``joint_vel`` / ``ee_pos`` deliberately stay FITTED: unlike x/y/z there is
+    # no cross-channel metric to preserve between joints, and their fitted std spans 0.067 to
+    # 0.504, so one shared scale would leave the tightest joints at ~0.17.
+    state_scale_base_pos: float | None = 0.4
+    state_scale_base_lin_vel: float | None = 0.5
+    state_scale_base_ang_vel: float | None = 0.4
+    state_scale_joint_pos: float | None = None
+    state_scale_joint_vel: float | None = None
+    state_scale_ee_pos: float | None = None
+    # DECLARED per-channel scale for the command tokens (``[vx, vy, wz]``), or ``None`` to fit.
+    #
+    # Commands are a DESIGNED range rather than an observed distribution -- the clip generator
+    # was told a maximum -- so dividing by that maximum puts them in [-1, 1] by construction
+    # and keeps a zero command at zero, which standardizing does not (the fitted vx mean is
+    # 1.25 m/s, so "stand still" would arrive as -1.29).
+    # Default is the clip generator's own limits, read off clips/g1_mb_v5_body.h5: the library's
+    # extremes are vx 3.4989, vy 0.9998, wz 0.7999, so these bound it exactly and 0.000% of
+    # commands fall outside. ``None`` fits per channel instead.
+    cmd_scale: list[float] | None = field(default_factory=lambda: [3.5, 1.0, 0.8])
     # Relative weight on the flow loss for root DOFs the anchor mask PINS to the terrain --
     # the axes on which the reference stays where the terrain put it rather than following the
     # robot. 1.0 = off (every channel equal, the historical behaviour).
@@ -382,6 +423,13 @@ class FlowMatchingConfig:
     # the effective learning rate) matches an unweighted run and a with/without A/B differs in
     # one thing only.
     pinned_axis_loss_weight: float = 1.0
+    # Compute the per-node anchor mask so validation can report ``flow_mse`` SPLIT by whether
+    # the terrain pins that coordinate. On by default and independent of the loss weight,
+    # because the split is only useful if BOTH arms of a with/without comparison report it --
+    # gating it on the weight would leave the control arm blind to the very quantity being
+    # compared. Costs one clip-library join at dataset build; degrades to off with a warning
+    # when the library is unavailable, unless the loss weight needs it (then it raises).
+    pinned_axis_metrics: bool = True
     # Per-step command width (0 disables command conditioning).
     cmd_dim: int = 0
 
@@ -457,12 +505,11 @@ class FlowMatchingConfig:
     # ``dt`` is the control step period (seconds), resolved from the recording meta at
     # train time. ``vel_consistency_weight`` ties the predicted ROOT velocity to the
     # finite difference of the predicted root pose; ``joint_vel_consistency_weight`` does
-    # the same for joints; ``accel_consistency_weight`` matches the finite difference of
     # the predicted velocity to that of the data velocity. ``fk_pose_weight`` ties each
     # predicted end-effector POSITION (base-relative) to the forward kinematics of the
     # predicted joints, using ``fk_model_path`` (a MuJoCo MJCF) -- this is what stops the
     # joints and the ee positions describing different postures.
-    # ``consistency_tau_min`` gates the acceleration + FK terms to samples with flow-time
+    # ``consistency_tau_min`` gates the FK + body-pose terms to samples with flow-time
     # ``tau >= consistency_tau_min`` (where the predicted endpoint is a faithful estimate
     # of the clean target); velocity/joint-velocity stay ungated.
     #
@@ -531,14 +578,21 @@ class FlowMatchingConfig:
     # that let ori_scale be set by measurement rather than guessed.
     #
     # Every term needs the blocks it ties together to BE in ``reference_blocks``:
-    # velocity needs base_pose+base_vel, acceleration base_vel, joint-velocity
+    # velocity needs base_pose+base_vel, joint-velocity
     # joint_pos+joint_vel, FK joint_pos+ee_pos, body-pose joint_pos (+base_pose for the
     # world half). A weight whose blocks are absent is zeroed at dataset build with a
     # printed line -- the term has nothing to relate, and the default selection
     # (base_pose, base_vel, joint_pos) already switches two of them off.
     dt: float = 0.02
-    vel_consistency_weight: float = 0.01 #0.0
-    accel_consistency_weight: float = 0.0
+    # 0 by DEFAULT, deliberately a change from the 0.01 every run through 2026-08-10 used:
+    # the current experiment is being run without it. Note what switching it off gives up --
+    # with the shipped ['base_pose', 'base_vel', 'joint_pos'] selection this is the ONLY term
+    # coupling the six base_vel channels to the base_pose they are supposed to differentiate
+    # (joint_vel_consistency needs a joint_vel block, which is not packed), and the flow MSE
+    # treats all 44 channels independently. At 0 the predicted velocities may drift out of
+    # agreement with the predicted pose, and BOTH are served to the policy through
+    # reference_window. It is still reported as a val metric so that drift stays visible.
+    vel_consistency_weight: float = 0.0
     joint_vel_consistency_weight: float = 0.01 #0.0
     fk_pose_weight: float = 0.01 #0.0
     body_pose_root_weight: float = 0.0

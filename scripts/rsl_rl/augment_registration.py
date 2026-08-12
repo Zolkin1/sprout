@@ -471,6 +471,12 @@ def main() -> int:
             int(data["cmd_future"].shape[2]) if "cmd_future" in data else 0,
             meta, depth_shape=depth_shape, tag_distractors=True, tag_families=True,
             tag_clip_index=True, record_history_ref=True,
+            # Inherit the SOURCE's storage dtypes. Without this a float16 recording's scan
+            # comes back float32 in the augmented half -- doubling it on disk and in the
+            # dataset, and making the two halves of one training set disagree about their
+            # own precision after `train.py` concatenates them.
+            dtypes={k: str(v.dtype) for k, v in data.items()
+                    if isinstance(v, np.ndarray) and v.dtype != np.float32},
         )
 
     diffs = []
