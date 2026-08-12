@@ -588,6 +588,7 @@ def sample_window(
     extero: torch.Tensor,
     cmd_tokens: torch.Tensor | None,
     history_null_mask: torch.Tensor | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     """Sample the ``F``-node future window, denormalized.
 
@@ -609,6 +610,13 @@ def sample_window(
             which is also the first ``N`` steps after a reset, when the generator has
             emitted nothing to condition on yet.
 
+    Args:
+        generator: Optional RNG for the initial noise. The default (None) draws from the
+            GLOBAL torch stream, which the environment shares -- so a diagnostic sample taken
+            alongside a rollout would shift every later draw in it (observation noise, DR) and
+            silently change the trajectory. Pass a dedicated generator for any sample that must
+            not perturb the run it is annotating.
+
     Returns:
         Raw (denormalized) window nodes ``(V, F, D)``.
     """
@@ -617,7 +625,8 @@ def sample_window(
     pred_std = sample_trajectory(ctx.model, history, extero, cmd_tokens, ctx.F, ctx.D,
                                  ctx.num_steps, history_null_mask=history_null_mask,
                                  zero_noise=ctx.zero_noise,
-                                 guidance_scale=ctx.guidance_scale)
+                                 guidance_scale=ctx.guidance_scale,
+                                 generator=generator)
     # Project the rotation block back onto SO(3): the model emits 6 free numbers, and the
     # served window is both a reference pose and the next step's history token. The exported
     # ONNX module does the same, so sim and deploy agree.

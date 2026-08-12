@@ -68,6 +68,8 @@ from robot_rl.flow_matching.online import (
 from isaaclab.utils.math import quat_apply
 
 from robot_rl.flow_matching.window import (
+    REFERENCE_BLOCK_KEYS,
+    expand_window_blocks,
     reanchor_window,
     resolve_reference_blocks,
     window_to_world,
@@ -326,6 +328,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._ee_zero_vec = torch.zeros(n, max(k, 1), 3, device=dev)
 
         self._build_strict_masks()
+        self._setup_draw_selection()
 
         # --- FM-prediction debug ribbon: map each ribbon frame (base built by the base
         # _post_init, re-ordered above) to its slot in the FM prediction buffers.
@@ -344,6 +347,117 @@ class FmTrackingCommand(MotionSequenceCommand):
         # The ribbon draws EVERY predicted node (dense), independent of the clip
         # ribbon's debug_vis_stride subsampling. It indexes _pred_window directly
         # rather than through the cursor, so it needs no offset table.
+
+    def _setup_draw_selection(self) -> None:
+        """Validate and prepare best-of-N oracle selection (``cfg.fm_num_draws``).
+
+        Builds one boolean channel mask per :data:`REFERENCE_BLOCK_KEYS` key present in this
+        checkpoint's layout, through ``expand_window_blocks`` -- the same expansion the
+        observation noise and scale tables use, so the score's channel grouping cannot drift
+        from the layout on its own. Masks are built for EVERY present key, not just the
+        weighted ones, so the log can report a magnitude for a key before it is turned on.
+
+        Raises:
+            ValueError: On ``fm_num_draws < 1``; on ``fm_num_draws > 1`` combined with
+                ``fm_zero_noise`` (identical draws) or with no non-zero weight (nothing to
+                select on); or on a weight naming a key this checkpoint does not predict.
+        """
+        n_draws = int(self.cfg.fm_num_draws)
+        if n_draws < 1:
+            raise ValueError(f"fm_num_draws must be >= 1, got {n_draws}.")
+        self._n_draws = n_draws
+        # Diagnostic-only samples, alongside the served one. Meaningless next to selection,
+        # which already records its whole candidate set.
+        self._n_diag = max(0, int(self.cfg.fm_diag_draws)) if n_draws == 1 else 0
+        if int(self.cfg.fm_diag_draws) and n_draws > 1:
+            print("[INFO FmTrackingCommand] fm_diag_draws ignored: fm_num_draws > 1 already "
+                  "records every candidate draw.")
+        total = n_draws if n_draws > 1 else 1 + self._n_diag
+        self._n_viz_reject = (max(0, min(int(self.cfg.fm_viz_num_draws), total) - 1)
+                              if total > 1 else 0)
+        self._viz_draws: torch.Tensor | None = None
+        self._select_key_masks: dict[str, torch.Tensor] = {}
+        self._select_weights: dict[str, float] = {}
+        self._last_draw_stats: dict[str, torch.Tensor] = {}
+        self._replan_count = 0
+        # --- Capture buffers for the offline stepper (see :meth:`fm_conditioning`).
+        # The RAW inputs, before build_*_tokens: normalizing is part of what an offline
+        # replay must reproduce, so storing the normalized form would hide a bug in it.
+        # Every re-plan overwrites the resetting envs' rows, so a reader gets the
+        # conditioning of the plan currently being served.
+        self._cap_hist_nodes: torch.Tensor | None = None
+        self._cap_extero: torch.Tensor | None = None
+        self._cap_cmd: torch.Tensor | None = None
+        self._cap_null = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self._cap_draws: torch.Tensor | None = None
+        self._cap_scores: torch.Tensor | None = None
+        self._cap_chosen = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # RNG for the diagnostic-only draws, kept off the env's shared stream (see
+        # :meth:`_stash_single_draw`). Lazily created so no generator exists unless used.
+        self._diag_gen: torch.Generator | None = None
+        # Absolute node offsets 0..F-1, for the clip window the draws are scored against.
+        self._fm_future_offsets = torch.arange(self.ctx.F, dtype=torch.long, device=self.device)
+        if n_draws > 1 and self.cfg.fm_zero_noise:
+            raise ValueError(
+                "fm_num_draws > 1 with fm_zero_noise=True: integrating from x0 = 0 makes every "
+                "draw identical, so best-of-N would be selecting among N copies of one window. "
+                "Leave the noise Gaussian for the draws, or set fm_num_draws=1."
+            )
+        all_keys = sorted({k for keys in REFERENCE_BLOCK_KEYS.values() for k in keys})
+        for key in all_keys:
+            # One-hot over the keys -> the channels this key owns in the selected blocks.
+            onehot = {k: (1.0 if k == key else 0.0) for k in all_keys}
+            vec = torch.tensor(
+                expand_window_blocks(self.ctx.nj, self.ctx.num_extra_frames, onehot,
+                                     self._fm_blocks),
+                device=self.device,
+            )
+            present = vec > 0
+            if bool(present.any()):
+                self._select_key_masks[key] = present
+            weight = float(getattr(self.cfg, f"fm_select_w_{key}"))
+            if weight == 0.0:
+                continue
+            if not bool(present.any()):
+                raise ValueError(
+                    f"fm_select_w_{key}={weight} weights the {key!r} channels, but this "
+                    f"checkpoint's window carries blocks {list(self._fm_blocks)}, which hold "
+                    f"none of them -- the score would silently ignore the weight. Set it to 0, "
+                    f"or use a checkpoint that predicts that block."
+                )
+            self._select_weights[key] = weight
+        if n_draws > 1 and not self._select_weights:
+            raise ValueError(
+                "fm_num_draws > 1 but every fm_select_w_* is 0, so all draws score identically "
+                "and 'selection' would just take draw 0. Weight at least one key."
+            )
+        if n_draws == 1:
+            # Nothing is SELECTED at one draw, but the single window is still scored against
+            # the clip and stashed as a one-entry draw set: it costs one extra clip-window
+            # build per re-plan and it makes a deploy-representative capture (one draw, and
+            # with zero noise the deployable configuration) readable by exactly the same plots
+            # and browser as an oracle capture, and comparable through the same score.
+            if self._n_diag:
+                print(f"[INFO FmTrackingCommand] fm_diag_draws={self._n_diag}: the served "
+                      f"window stays the "
+                      f"{'DETERMINISTIC (x0=0)' if self.cfg.fm_zero_noise else 'single Gaussian'}"
+                      f" sample -- the physics is unchanged -- and {self._n_diag} extra Gaussian "
+                      f"windows are recorded per re-plan for the diagnostics only (draw 0 = "
+                      f"served).")
+            return
+        terms = " + ".join(f"{w:g}*RMS[{k}]" for k, w in self._select_weights.items())
+        print(f"[INFO FmTrackingCommand] fm_num_draws={n_draws}: ORACLE best-of-N -- every "
+              f"re-plan samples {n_draws} windows and serves the one closest to the CLIP, "
+              f"score = {terms}. NOT deployable: it reads the clip at inference. Cost is "
+              f"{n_draws}x the generator per re-plan.")
+        if self.cfg.history_from == "clip":
+            print("[INFO FmTrackingCommand]   NOTE history_from='clip': the SELECTED draw does "
+                  "not feed the history, the clip does. Selection then changes only what is "
+                  "served, not what the generator conditions on next.")
+        if self._n_viz_reject:
+            print(f"[INFO FmTrackingCommand]   drawing the chosen ribbon plus the next "
+                  f"{self._n_viz_reject} by score, faded "
+                  f"(opacity {float(self.cfg.debug_vis_fm_reject_opacity):g}).")
 
     def _build_strict_masks(self) -> None:
         """Index the output channels the FM does NOT write, for ``strict_fm_only``.
@@ -867,20 +981,287 @@ class FmTrackingCommand(MotionSequenceCommand):
         # Exteroception tokens = the live reading at "now", from whichever sensor this FM
         # checkpoint was TRAINED on -- the same mdp functions the teacher obs uses, so
         # deployment conditions on exactly the training signal.
-        height = build_extero_tokens(self.ctx, self._read_extero()[ids])
+        extero_raw = self._read_extero()[ids]
+        height = build_extero_tokens(self.ctx, extero_raw)
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
-        self._pred_window[ids] = sample_window(
-            self.ctx, history, height, cmd_tokens,
-            history_null_mask=(None if null_hist is None else null_hist[ids]),
-        )
+        null = None if null_hist is None else null_hist[ids]
+        self._stash_conditioning(ids, nodes, extero_raw, fut_cmd, null)
         # Node 0 = "now", and the frame it is expressed in is the robot AT THIS INSTANT.
         # Both are needed to serve the window later: the cursor to index it, the anchor to
         # undo the staleness once the robot has moved on.
+        #
+        # Set BEFORE sampling, not after: best-of-N scores the clip window in the PLAN's
+        # frame, which is this anchor. With the old ordering the score would have been taken
+        # against the PREVIOUS re-plan's anchor -- exactly the mistake that made teacher
+        # forcing measure below the loop it bounds (see _clip_history_node).
         self._pred_idx[ids] = 0
         self._anchor_pos[ids] = wp.to_torch(self.robot.data.root_pos_w)[ids].clone()
         self._anchor_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids].clone()
+        if self._n_draws == 1:
+            window = sample_window(self.ctx, history, height, cmd_tokens,
+                                   history_null_mask=null)
+            self._pred_window[ids] = window
+            self._stash_single_draw(ids, window, history, height, cmd_tokens, null)
+        else:
+            self._pred_window[ids] = self._sample_best_of_n(ids, history, height, cmd_tokens, null)
         self._pred_valid[ids] = True
+
+    def _stash_conditioning(self, ids: torch.Tensor, nodes: torch.Tensor,
+                            extero_raw: torch.Tensor, fut_cmd: torch.Tensor,
+                            null: torch.Tensor | None) -> None:
+        """Keep this re-plan's RAW generator inputs, for the offline stepper.
+
+        Together with the checkpoint these four are everything ``sample_window`` consumes, so a
+        recording of them replays the generator with no simulator: change the sample count, the
+        Euler steps or the guidance and re-sample the same conditioning. Raw rather than
+        normalized on purpose -- the normalizers are part of the path under test.
+        """
+        if self._cap_hist_nodes is None:
+            n = self.num_envs
+            self._cap_hist_nodes = torch.zeros(n, *nodes.shape[1:], device=self.device)
+            self._cap_extero = torch.zeros(n, *extero_raw.shape[1:], device=self.device)
+            self._cap_cmd = torch.zeros(n, *fut_cmd.shape[1:], device=self.device)
+        self._cap_hist_nodes[ids] = nodes
+        self._cap_extero[ids] = extero_raw
+        self._cap_cmd[ids] = fut_cmd
+        self._cap_null[ids] = (torch.zeros_like(ids, dtype=torch.bool) if null is None else null)
+
+    def fm_conditioning(self) -> dict[str, torch.Tensor]:
+        """The generator's raw inputs for the plan each env is currently serving.
+
+        Empty until the first inference. Keys: ``hist_nodes`` ``[N, H, D]``, ``extero``
+        ``[N, ...]`` (the sensor this checkpoint was trained on, NOT necessarily the policy's
+        cameras), ``cmd_future`` ``[N, F, 3]``, ``hist_null`` ``[N]``, plus the plan's
+        ``anchor_pos``/``anchor_quat`` needed to lift any window to the world.
+        """
+        if self._cap_hist_nodes is None:
+            return {}
+        return {"hist_nodes": self._cap_hist_nodes, "extero": self._cap_extero,
+                "cmd_future": self._cap_cmd, "hist_null": self._cap_null,
+                "anchor_pos": self._anchor_pos, "anchor_quat": self._anchor_quat}
+
+    def fm_draws(self) -> dict[str, torch.Tensor]:
+        """Every draw of the plan each env is serving, with its score -- empty at ``n=1``.
+
+        ``draws`` ``[N, n, F, D]`` in the window layout (lift with ``window_to_world`` against
+        the anchor from :meth:`fm_conditioning`), ``scores`` ``[N, n]`` and ``chosen`` ``[N]``.
+        Draw ``chosen[i]`` is the one that became the served window.
+        """
+        if self._cap_draws is None:
+            return {}
+        return {"draws": self._cap_draws, "scores": self._cap_scores, "chosen": self._cap_chosen}
+
+    def _clip_future_window(self) -> torch.Tensor:
+        """The CLIP's window over nodes ``0..F-1``, in the PLAN's frame -- ``[N, F, D]``.
+
+        The scoring counterpart of :meth:`_clip_history_node`, and built the same two ways at
+        once: ``super()`` for the clip's window builder, ``_serve_override`` for the
+        look-ahead accessors underneath it (this class overrides both, and only redirecting
+        one would quietly score the generator against itself).
+
+        ``reference_window_obs`` anchors on the measured robot at THIS step, so the result is
+        re-expressed onto ``_anchor_pos``/``_anchor_quat``. Called from ``_run_fm`` after the
+        anchor is refreshed, those two coincide and the re-anchor is a no-op -- it is here so
+        that stays true if the call ever moves, since a window scored against the wrong anchor
+        measures how far the robot walked rather than how good the draw is.
+
+        Note the clip runs out before the episode does unless the episode is bounded to
+        ``clip_len``: past that the library's repeat-last padding freezes, and the oracle then
+        selects the draw closest to a stationary reference.
+        """
+        prev = self._serve_override
+        self._serve_override = "clip"
+        try:
+            win = super().reference_window_obs(self._fm_future_offsets, self._fm_blocks)
+        finally:
+            self._serve_override = prev
+        f = win.shape[1]
+        pos_now = wp.to_torch(self.robot.data.root_pos_w)[:, None, :].expand(-1, f, -1)
+        quat_now = wp.to_torch(self.robot.data.root_quat_w)[:, None, :].expand(-1, f, -1)
+        return reanchor_window(
+            win, pos_now, quat_now,
+            self._anchor_pos[:, None, :].expand(-1, f, -1),
+            self._anchor_quat[:, None, :].expand(-1, f, -1),
+            self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks,
+        )
+
+    def _draw_key_distances(
+        self, draws: torch.Tensor, clip_win: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """Per-key RMS distance from each draw to the clip window, in RAW units.
+
+        Args:
+            draws: ``[V, n_draws, F, D]`` sampled windows.
+            clip_win: ``[V, F, D]`` the clip's window over the same nodes and anchor.
+
+        Returns:
+            ``{key: [V, n_draws]}`` for every key this checkpoint's layout carries -- weighted
+            or not, so the log can state a magnitude for a key before it is weighted.
+        """
+        sq = (draws - clip_win[:, None]).pow(2)                      # [V, n, F, D]
+        return {key: sq[..., chan].mean(dim=(-2, -1)).sqrt()
+                for key, chan in self._select_key_masks.items()}
+
+    @torch.no_grad()
+    def _sample_best_of_n(
+        self,
+        ids: torch.Tensor,
+        history: torch.Tensor,
+        extero: torch.Tensor,
+        cmd_tokens: torch.Tensor | None,
+        null_hist: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Sample ``cfg.fm_num_draws`` windows and return the one closest to the clip.
+
+        The draws come from ONE ``sample_window`` call at ``V * n_draws`` batch rather than a
+        loop: the noise is drawn per batch row inside the sampler, so repeating each env's
+        conditioning ``n_draws`` times gives that many independent draws of the same
+        conditioning. ``repeat_interleave`` keeps an env's rows adjacent, which is what makes
+        the ``view`` below split them correctly.
+
+        Args:
+            ids: ``[V]`` env indices being re-planned.
+            history: History tokens for ``ids``.
+            extero: Exteroception tokens for ``ids``.
+            cmd_tokens: Command tokens for ``ids``, or None.
+            null_hist: Per-env null-history mask for ``ids``, or None.
+
+        Returns:
+            ``[V, F, D]`` the selected window per env.
+        """
+        n, v = self._n_draws, int(ids.numel())
+
+        def rep(t: torch.Tensor | None) -> torch.Tensor | None:
+            """One copy of each env's conditioning per draw, that env's rows adjacent."""
+            return None if t is None else t.repeat_interleave(n, dim=0)
+
+        draws = sample_window(self.ctx, rep(history), rep(extero), rep(cmd_tokens),
+                              history_null_mask=rep(null_hist))
+        draws = draws.view(v, n, self.ctx.F, self.ctx.D)
+        dists = self._draw_key_distances(draws, self._clip_future_window()[ids])
+        score = sum(w * dists[key] for key, w in self._select_weights.items())   # [V, n]
+        best = torch.argmin(score, dim=1)                                        # [V]
+        if self._n_viz_reject:
+            self._stash_viz_draws(ids, draws, score)
+        # Every draw, for the offline stepper. Lazily sized: n_draws is known but D/F come
+        # from the sampler, and this way the buffer cannot disagree with it.
+        if self._cap_draws is None:
+            self._cap_draws = torch.zeros(self.num_envs, *draws.shape[1:], device=self.device)
+            self._cap_scores = torch.zeros(self.num_envs, n, device=self.device)
+        self._cap_draws[ids] = draws
+        self._cap_scores[ids] = score
+        self._cap_chosen[ids] = best
+        self._record_draw_selection(score, dists, best)
+        return draws[torch.arange(v, device=score.device), best]
+
+    @torch.no_grad()
+    def _stash_single_draw(self, ids: torch.Tensor, window: torch.Tensor, history=None,
+                           extero=None, cmd_tokens=None, null=None) -> None:
+        """Record a served-only re-plan as a draw set: draw 0 served, then any diagnostic draws.
+
+        At ``fm_num_draws == 1`` there is no selection, but the diagnostics should not have to
+        care: this makes the deploy-representative configuration (one draw, and with
+        ``fm_zero_noise`` the deterministic one) produce the same ``fm_draws`` / ``fm_scores`` /
+        ``fm_chosen`` arrays an oracle capture does, so the x-z figures, the viser draws layer
+        and the keyboard browser all read it, and its score is comparable to theirs.
+
+        With ``cfg.fm_diag_draws`` set, N extra GAUSSIAN windows are sampled from the same
+        conditioning and stored after it. They are never served and never fed to the history --
+        the rollout is bit-for-bit what it would be without them -- so the plots can show the
+        sampling spread around a deployable trajectory. ``fm_chosen`` stays 0, which is what
+        makes the plots highlight the served curve and grey the rest.
+
+        Every entry is scored against the clip; the scores are diagnostic throughout.
+        """
+        n_total = 1 + self._n_diag
+        if self._cap_draws is None:
+            self._cap_draws = torch.zeros(self.num_envs, n_total, *window.shape[1:],
+                                          device=self.device)
+            self._cap_scores = torch.zeros(self.num_envs, n_total, device=self.device)
+        self._cap_draws[ids, 0] = window
+        self._cap_chosen[ids] = 0
+        if self._n_diag and history is not None:
+            n, v = self._n_diag, int(ids.numel())
+
+            def rep(t):
+                """One copy of each env's conditioning per diagnostic draw."""
+                return None if t is None else t.repeat_interleave(n, dim=0)
+
+            # Force Gaussian noise for these regardless of how the SERVED sample is drawn:
+            # under fm_zero_noise the context integrates from x0 = 0, and N copies of one
+            # deterministic window would show no spread at all -- which is the opposite of
+            # what they are for. Restored in `finally` so the next served sample is unaffected.
+            #
+            # And draw them from a DEDICATED generator. The sampler's default RNG is the global
+            # torch stream that the whole env shares, so taking N extra samples from it shifts
+            # every later draw in the rollout -- the depth noise and the camera DR among them --
+            # which changes the observations and therefore the trajectory. Measured before this
+            # was fixed: 4.8 cm of root divergence purely from the diagnostics being present.
+            if self._diag_gen is None:
+                self._diag_gen = torch.Generator(device=self.device)
+                self._diag_gen.manual_seed(0xF00D)
+            was_zero = self.ctx.zero_noise
+            try:
+                self.ctx.zero_noise = False
+                extra = sample_window(self.ctx, rep(history), rep(extero), rep(cmd_tokens),
+                                      history_null_mask=rep(null), generator=self._diag_gen)
+            finally:
+                self.ctx.zero_noise = was_zero
+            self._cap_draws[ids, 1:] = extra.view(v, n, *window.shape[1:])
+        if not self._select_weights:
+            return
+        clip_win = self._clip_future_window()[ids]
+        dists = self._draw_key_distances(self._cap_draws[ids], clip_win)
+        score = sum(w * dists[key] for key, w in self._select_weights.items())   # [V, n_total]
+        self._cap_scores[ids] = score
+        if self._n_viz_reject:
+            self._stash_viz_draws(ids, self._cap_draws[ids], score)
+        self._record_draw_selection(score, dists, torch.zeros_like(ids))
+
+    def _stash_viz_draws(self, ids: torch.Tensor, draws: torch.Tensor, score: torch.Tensor) -> None:
+        """Keep the best REJECTED draws for the debug ribbon (``cfg.fm_viz_num_draws``)."""
+        v = score.shape[0]
+        # argsort is best-first and its first column is the chosen draw, so the rejects to
+        # draw are simply the next few.
+        keep = torch.argsort(score, dim=1)[:, 1:1 + self._n_viz_reject]          # [V, M]
+        if self._viz_draws is None:
+            self._viz_draws = torch.zeros(self.num_envs, self._n_viz_reject,
+                                          self.ctx.F, self.ctx.D, device=self.device)
+        self._viz_draws[ids] = draws[torch.arange(v, device=score.device)[:, None], keep]
+
+    def _record_draw_selection(
+        self, score: torch.Tensor, dists: dict[str, torch.Tensor], best: torch.Tensor
+    ) -> None:
+        """Stash the selection stats, and print them every ``cfg.fm_select_log_every`` re-plans."""
+        rows = torch.arange(score.shape[0], device=score.device)
+        self._last_draw_stats = {
+            "chosen": best.detach(),
+            "score_best": score[rows, best].detach(),
+            "score_worst": score.max(dim=1).values.detach(),
+            **{f"rms_{key}": value[rows, best].detach() for key, value in dists.items()},
+        }
+        self._replan_count += 1
+        every = int(self.cfg.fm_select_log_every)
+        if every <= 0 or self._replan_count % every:
+            return
+        stats = self._last_draw_stats
+        best_s = float(stats["score_best"].mean())
+        worst_s = float(stats["score_worst"].mean())
+        rms = "  ".join(f"{k[4:]} {float(v.mean()):.4f}"
+                        for k, v in stats.items() if k.startswith("rms_"))
+        print(f"[fm-draws] re-plan {self._replan_count}: chose {best.tolist()[:8]} of "
+              f"{self._n_draws}  score {best_s:.4f} (worst {worst_s:.4f}, "
+              f"spread {worst_s - best_s:.4f})  RMS[{rms}]")
+
+    def draw_selection_stats(self) -> dict[str, torch.Tensor]:
+        """Last re-plan's best-of-N stats (empty when ``fm_num_draws == 1``).
+
+        ``chosen`` / ``score_best`` / ``score_worst`` plus ``rms_<key>`` for the chosen draw,
+        each ``[num_envs]``. For a diagnostic to log per-step; the spread between best and
+        worst is what bounds any selection rule.
+        """
+        return dict(self._last_draw_stats)
 
     def _pred_world(self, offsets: torch.Tensor) -> dict[str, torch.Tensor]:
         """Lift the served nodes at ``offsets`` to the world frame -- SIMULATION ONLY.
@@ -1254,16 +1635,57 @@ class FmTrackingCommand(MotionSequenceCommand):
                                 self.ctx.num_extra_frames, self._fm_blocks)
         if "ee_pos_w" not in world:
             world["ee_pos_w"] = self._fk_ee_positions(world)
+        translations, marker_indices = self._ribbon_points(world, 0)
+        # The rejected draws, faded: their own prototype block (appended after the chosen
+        # ones in _create_fm_markers, hence the offset) plus a per-instance scale, which IS
+        # available where per-instance colour is not.
+        scales = None
+        if self._n_viz_reject and self._viz_draws is not None:
+            offset = len(self._fm_pred_specs)
+            shrink = float(self.cfg.debug_vis_fm_reject_scale)
+            n_chosen = sum(t.shape[0] for t in translations)
+            for m in range(self._n_viz_reject):
+                rej = window_to_world(self._viz_draws[:, m], self._anchor_pos[:, None, :],
+                                      self._anchor_quat[:, None, :], self.ctx.nj,
+                                      self.ctx.num_extra_frames, self._fm_blocks)
+                if "ee_pos_w" not in rej:
+                    rej["ee_pos_w"] = self._fk_ee_positions(rej)
+                t, i = self._ribbon_points(rej, offset)
+                translations += t
+                marker_indices += i
+            n_reject = sum(t.shape[0] for t in translations) - n_chosen
+            scales = torch.cat([
+                torch.ones(n_chosen, 3, device=self.device),
+                torch.full((n_reject, 3), shrink, device=self.device),
+            ], dim=0)
+        self._fm_markers.set_visibility(True)
+        self._fm_markers.visualize(
+            translations=torch.cat(translations, dim=0),
+            marker_indices=torch.cat(marker_indices, dim=0),
+            scales=scales,
+        )
+
+    def _ribbon_points(
+        self, world: dict[str, torch.Tensor], proto_offset: int
+    ) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
+        """One ribbon's sphere positions and prototype indices, per drawn frame.
+
+        Args:
+            world: A :func:`window_to_world` mapping for one window.
+            proto_offset: Added to each prototype index -- 0 for the chosen draw's opaque
+                prototypes, ``len(_fm_pred_specs)`` for the faded reject block.
+
+        Returns:
+            ``(translations, marker_indices)`` lists, one entry per drawn frame.
+        """
         translations, marker_indices = [], []
         for proto_idx, (_name, _color, kind, k) in enumerate(self._fm_pred_specs):
             pts = (world["base_pos_w"] if kind == "base"
                    else world["ee_pos_w"][:, :, k]).reshape(-1, 3)
             translations.append(pts)
-            marker_indices.append(torch.full((pts.shape[0],), proto_idx, dtype=torch.long, device=self.device))
-        self._fm_markers.set_visibility(True)
-        self._fm_markers.visualize(
-            translations=torch.cat(translations, dim=0), marker_indices=torch.cat(marker_indices, dim=0),
-        )
+            marker_indices.append(torch.full((pts.shape[0],), proto_idx + proto_offset,
+                                             dtype=torch.long, device=self.device))
+        return translations, marker_indices
 
     def _create_fm_markers(self):
         """Build a sphere-per-frame marker set for the FM-prediction ribbon."""
@@ -1280,6 +1702,20 @@ class FmTrackingCommand(MotionSequenceCommand):
             )
             for name, color, _kind, _k in self._fm_pred_specs
         }
+        # A second, low-opacity copy of every frame's prototype for the non-chosen draws.
+        # Appended AFTER the opaque block, and dict order is prototype-index order, so the
+        # reject indices are exactly ``len(_fm_pred_specs) + i`` (see _ribbon_points).
+        if self._n_viz_reject:
+            opacity = float(self.cfg.debug_vis_fm_reject_opacity)
+            prototypes.update({
+                f"fmrej_{name}": sim_utils.SphereCfg(
+                    radius=radius,
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=tuple(color), opacity=opacity,
+                    ),
+                )
+                for name, color, _kind, _k in self._fm_pred_specs
+            })
         cfg = VisualizationMarkersCfg(prim_path="/Visuals/fm_pred", markers=prototypes)
         try:
             return VisualizationMarkers(cfg)

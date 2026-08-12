@@ -40,6 +40,7 @@ exists to prevent.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -52,7 +53,27 @@ from robot_rl.flow_matching.viz.robot import (
     recording_to_urdf_perm,
     xyzw_to_wxyz,
 )
+import fm_resample as _fm_resample
 from view_clip_viser import _DEFAULT_URDF, _terrain_mesh, _tube_mesh
+
+#: Per-foot colours for the draws' FK'd foot paths, in ``fm_frame_names`` order (left, right).
+_FOOT_COLORS: tuple[tuple[float, float, float], ...] = (
+    (0.20, 0.65, 1.00),   # blue  -- left foot
+    (1.00, 0.35, 0.35),   # red   -- right foot
+)
+
+#: Left/right foot colours for the CLIP's horizon path -- warm, so they read as the clip
+#: family next to the FM feet's blue/red rather than as two more draws.
+_CLIP_FOOT_COLORS: tuple[tuple[float, float, float], ...] = (
+    (1.00, 0.78, 0.25),   # amber       -- left foot
+    (0.90, 0.45, 0.08),   # dark orange -- right foot
+)
+
+#: Base line widths for the draw paths, scaled live by the viewer's "line width x" slider.
+#: The feet are drawn THICKER than the base ribbon: they are the part being read against the
+#: tread edges, and at F=62 nodes a thin polyline disappears against terrain.
+_DRAW_WIDTH = {"base_chosen": 5.0, "base_reject": 2.0,
+               "foot_chosen": 8.0, "foot_reject": 3.0}
 
 _COLORS: dict[str, tuple[float, float, float]] = {
     "clip": (0.95, 0.55, 0.10),      # orange -- the pre-made reference
@@ -202,6 +223,38 @@ class FmDebugScene:
                 point_shape="circle", visible=False)
 
         self.state: dict[str, Any] = {"case": None, "static": []}
+        # The generator's own conditioning camera contract, which is NOT `depth_camera_spec`
+        # when it samples the pair on its own grid -- and it is the one whose images actually
+        # conditioned the prediction being drawn.
+        self.fm_extero_spec = list(meta.get("fm_extero_spec") or [])
+        self.meta = meta
+        # Draw ribbons are rebuilt per frame (their count changes with the slider), so they
+        # are tracked for removal rather than reused like the fixed-purpose nodes above.
+        self._draw_nodes: list[Any] = []
+        # FK for the draws' feet: the window predicts joints, not ee positions, so a foot
+        # path has to be derived. Built once (the parse is the slow part) and only when the
+        # bundle actually carries draws.
+        self.fm_frame_names = list(meta.get("fm_frame_names", []))
+        self._clip_horizon_nodes: list[Any] = []
+        self._trail_nodes: list[Any] = []
+        # ONE assembly per rollout, shared with the keyboard browser
+        # (``fm_feet_browser.py``): it owns the FK chain, the y_des column resolution, the
+        # served-trace cache and the terrain profile. Building those here as well would mean
+        # two FK parses and, worse, two implementations that can disagree about which array is
+        # the history.
+        from fm_feet_data import FeetPlotSource
+        self._feet_src = {
+            r.mode: FeetPlotSource(r.data, r.meta, mode=r.mode, depth_image_fn=_depth_image)
+            for r in rollouts
+        }
+        first = next(iter(self._feet_src.values()))
+        self._draw_fk = first.fk
+        # Which of the ee frames are FEET -- the wrists are in the same block and would
+        # quadruple the line count for nothing here.
+        self._foot_slots = first.foot_slots
+        # Columns of y_des_clip for the clip's own path. The FM's feet come from FK, but the
+        # clip states its feet directly, so these are read not derived.
+        self._clip_cols = {"base": first.cols["base"], "feet": first.cols["feet"]}
 
     def _make_ghost(self, name: str, color: tuple[float, float, float]):
         """A translucent URDF ghost with its own root frame."""
@@ -250,6 +303,197 @@ class FmDebugScene:
                 verts, faces = _tube_mesh(path, radius)
                 self.state["static"].append(self.server.scene.add_mesh_simple(
                     f"/paths/{r.mode}/{tag}", vertices=verts, faces=faces, color=color))
+
+    def set_draws(self, roll: Rollout, step: int, env: int, num_shown: int,
+                  show_feet: bool = True, width_scale: float = 1.0) -> None:
+        """Draw the alternative windows this re-plan sampled -- chosen bright, rejects dim.
+
+        Only meaningful on a bundle captured with ``--num_draws > 1``; a no-op otherwise. The
+        rejects are what the oracle had to choose between, so their spread IS the headroom any
+        selection rule could exploit: if they lie on top of each other, no rule helps.
+
+        Sorted by score so ``num_shown`` keeps the best, and every draw of a re-plan shares the
+        plan anchor, so the fan-out is a genuine comparison at one robot pose.
+        """
+        for handle in self._draw_nodes:
+            handle.remove()
+        self._draw_nodes = []
+        draws = roll.get("fm_draws", step, env)
+        if draws is None or num_shown <= 0:
+            return
+        scores = roll.get("fm_scores", step, env)
+        chosen = roll.get("fm_chosen", step, env)
+        order = np.argsort(np.asarray(scores)) if scores is not None else np.arange(len(draws))
+        keep = list(order[:max(1, int(num_shown))])
+        try:
+            paths = _fm_resample.draws_to_world(
+                np.asarray(draws)[keep], roll.get("fm_cond_anchor_pos", step, env),
+                roll.get("fm_cond_anchor_quat", step, env),
+                len(self.joint_names) or 29, len(self.fm_frame_names) or 4,
+                blocks=self.meta.get("fm_reference_blocks"),
+                fk=self._draw_fk if show_feet else None)
+        except Exception as exc:  # a bundle whose layout cannot be inferred
+            print(f"[view] could not lift the draws to world: {exc}")
+            return
+        feet = paths.get("ee")
+        scale = max(float(width_scale), 0.1)
+        for rank, (j, path) in enumerate(zip(keep, paths["base"])):
+            is_chosen = chosen is not None and int(j) == int(chosen)
+            key = "chosen" if is_chosen else "reject"
+            self._add_path(f"/draws/{rank}", path,
+                           (0.05, 1.0, 0.35) if is_chosen else (0.55, 0.55, 0.62),
+                           _DRAW_WIDTH[f"base_{key}"] * scale)
+            if feet is None:
+                continue
+            # One line per foot per drawn window. Only the chosen draw's feet get their own
+            # colours; the rejects' stay grey, or 16 draws x 2 feet reads as noise.
+            for slot_i, slot in enumerate(self._foot_slots):
+                color = (_FOOT_COLORS[slot_i % len(_FOOT_COLORS)] if is_chosen
+                         else (0.45, 0.45, 0.50))
+                # A SIBLING of the base path, not a child: removing a parent takes its
+                # subtree with it, so a nested name is already gone by the time the loop
+                # reaches it and viser warns about the double removal.
+                self._add_path(f"/draws/{rank}_foot{slot}", feet[rank, :, slot], color,
+                               _DRAW_WIDTH[f"foot_{key}"] * scale)
+
+    def terrain_profile_world(self, case_name: str) -> list[tuple[float, float, float]]:
+        """The case tile's top-surface step profile as world ``[(x0, x1, top)]``.
+
+        Overlay boxes are tile-local and the placement is a pure translation onto the tile
+        corner (``clip_frame_origin``), so world x is just ``corner_x + local_x``. Projected to
+        x-z: every box contributes its own span, which is what makes a tread flush on a
+        platform show as two segments at the same height rather than being lost.
+        """
+        env = next((r.env_of_case.get(case_name) for r in self.rollouts
+                    if r.env_of_case.get(case_name) is not None), None)
+        if env is None:
+            return []
+        tids = self.meta.get("env_terrain_id") or []
+        corners = self.meta.get("env_cell_corner") or []
+        if env >= len(tids) or env >= len(corners):
+            return []
+        tid = int(np.asarray(tids).reshape(-1)[env])
+        corner = np.asarray(corners)[env]
+        entry = next((m for m in (self.meta.get("terrain_manifest") or [])
+                      if int(m.get("terrain_id", -999)) == tid), None)
+        if entry is None or "overlays" not in entry:
+            return []
+        segs = []
+        for o in entry["overlays"]:
+            cx, sx = float(o["pos_xy"][0]), float(o["size_xyz"][0])
+            top = float(o["base_z"]) + float(o["size_xyz"][2])
+            segs.append((float(corner[0]) + cx - sx / 2.0,
+                         float(corner[0]) + cx + sx / 2.0,
+                         float(corner[2]) + top))
+        return sorted(segs)
+
+    def feet_plot_inputs(self, roll: Rollout, step: int, env: int, case_name: str,
+                         tail_steps: int = 50) -> dict | None:
+        """Inputs for the x-z figure, via the shared assembly.
+
+        Delegates to :class:`fm_feet_data.FeetPlotSource` so the viser button and the keyboard
+        browser (``fm_feet_browser.py``) draw from ONE implementation -- two copies of this
+        reasoning is how their pictures would come to disagree about which array is the history.
+        """
+        src = self._feet_src.get(roll.mode)
+        if src is None:
+            return None
+        row = src.inputs(step, env, tail_steps=tail_steps)
+        if row is not None:
+            row["row_label"] = f"{roll.mode} / history={src.history_source}"
+        return row
+
+    def served_trace(self, roll: Rollout, env: int) -> dict[str, np.ndarray] | None:
+        """Root + feet of the reference the robot ACTUALLY tracked, per step.
+
+        Delegates to the shared assembly (see ``self._feet_src``), which reads it from
+        ``y_des_fm`` -- the applied desired output, already in world -- and FKs the feet
+        because the window predicts no ``ee_pos``.
+        """
+        src = self._feet_src.get(roll.mode)
+        return None if src is None else src.served_trace(env)
+
+    def set_served_trail(self, roll: Rollout, step: int, env: int, show_feet: bool = True,
+                         width_scale: float = 1.0) -> None:
+        """Trail the served reference from the start of the rollout up to ``step``."""
+        for handle in self._trail_nodes:
+            handle.remove()
+        self._trail_nodes = []
+        trace = self.served_trace(roll, env) if step > 0 else None
+        if trace is None:
+            return
+        scale = max(float(width_scale), 0.1)
+        end = min(step + 1, trace["base"].shape[0])
+        self._add_path("/served/base", trace["base"][:end], _COLORS["fm"],
+                       _DRAW_WIDTH["base_chosen"] * scale, self._trail_nodes)
+        if not show_feet or "feet" not in trace:
+            return
+        for i in range(trace["feet"].shape[1]):
+            pts = trace["feet"][:end, i]
+            if np.isfinite(pts).all():
+                self._add_path(f"/served/foot{i}", pts,
+                               _FOOT_COLORS[i % len(_FOOT_COLORS)],
+                               _DRAW_WIDTH["foot_chosen"] * scale, self._trail_nodes)
+
+    def set_clip_horizon(self, roll: Rollout, step: int, env: int, horizon: int,
+                         show_feet: bool = True, width_scale: float = 1.0) -> None:
+        """Draw the PRE-MADE clip over the same nodes the FM draws span.
+
+        The comparison target the oracle scored against, and the thing the draws should be
+        read against: node *k* of a prediction made at step *t* corresponds to clip step
+        *t + k*, because the clip advances one step per control step. So the clip's own path
+        over that horizon is just ``y_des_clip[t : t+F]`` -- no re-anchoring, no window
+        round-trip, and already in world coordinates (verified identical to
+        ``refwin_clip_base_pos`` sample 0 to 0.0000 m).
+
+        Distinct from the two clip layers that already exist: the clip GHOST is a posed robot
+        at the current step, and the clip TUBE is the whole episode. This is the horizon
+        slice, which is what makes it comparable to a draw.
+        """
+        for handle in self._clip_horizon_nodes:
+            handle.remove()
+        self._clip_horizon_nodes = []
+        arr = roll.data.get("y_des_clip")
+        if arr is None or horizon <= 1 or not self._clip_cols["base"]:
+            return
+        full = np.asarray(arr[:, env])                                # [T, P]
+        scale = max(float(width_scale), 0.1)
+        cut = int(np.clip(step, 1, full.shape[0] - 1))
+        far = int(min(cut + int(horizon), full.shape[0]))
+        # Three tiers of the SAME curve, since a line's colour is per-segment and there is no
+        # per-vertex alpha: what is already behind the robot, the F nodes a draw covers (the
+        # comparison window), and the remainder of the clip.
+        tiers = (("past", slice(0, cut + 1), 0.30, 0.7),
+                 ("horizon", slice(cut, far), 1.00, 1.0),
+                 ("ahead", slice(max(far - 1, 0), full.shape[0]), 0.55, 0.7))
+        curves = [("base", self._clip_cols["base"], _COLORS["clip"],
+                   _DRAW_WIDTH["base_chosen"])]
+        if show_feet:
+            curves += [(f"foot{i}", cols, _CLIP_FOOT_COLORS[i % len(_CLIP_FOOT_COLORS)],
+                        _DRAW_WIDTH["foot_chosen"])
+                       for i, cols in enumerate(self._clip_cols["feet"])]
+        for cname, cols, color, base_w in curves:
+            for tname, sl, dim, wmul in tiers:
+                pts = full[sl, :][:, cols]
+                if pts.shape[0] < 2 or not np.isfinite(pts).all():
+                    continue
+                # Fading toward the background rather than toward black: the terrain is dark,
+                # so a scaled-to-black "past" would read as a solid line, not a faded one.
+                faded = tuple(c * dim + (1.0 - dim) * 0.14 for c in color)
+                self._add_path(f"/clip_path/{cname}_{tname}", pts, faded,
+                               base_w * wmul * scale, self._clip_horizon_nodes)
+
+    def _add_path(self, name: str, points: np.ndarray, color: tuple[float, float, float],
+                  width: float, into: list | None = None) -> None:
+        """Add one polyline through ``points`` and remember it for removal."""
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.shape[0] < 2:
+            return
+        seg = np.stack([pts[:-1], pts[1:]], axis=1)
+        (self._draw_nodes if into is None else into).append(self.server.scene.add_line_segments(
+            name, points=seg,
+            colors=np.tile(np.array(color, np.float32), (seg.shape[0], 2, 1)),
+            line_width=width))
 
     def _base_path(self, roll: Rollout, key: str, env: int) -> np.ndarray | None:
         """The base position over the whole episode, from a world array or a ``y_des``."""
@@ -364,7 +608,7 @@ def _to_u8(color: tuple[float, float, float]) -> tuple[int, int, int]:
 # ---------------------------------------------------------------------------
 
 def serve(bundles: dict[str, tuple[dict, dict]], urdf_path: str | None = None,
-          port: int = 8080) -> int:
+          port: int = 8080, out_dir: str = ".") -> int:
     """Serve the recorded rollouts. Blocks until interrupted.
 
     Args:
@@ -405,19 +649,76 @@ def serve(bundles: dict[str, tuple[dict, dict]], urdf_path: str | None = None,
         toggles["horizon"] = gui.add_checkbox("FM horizon", initial_value=True)
         toggles["window"] = gui.add_checkbox("reference window (observed)", initial_value=True)
         toggles["scan"] = gui.add_checkbox("height-scan dots", initial_value=False)
+        # Kept out of `toggles` because that dict is handed to set_frame as the scene's layer
+        # map; this one drives set_clip_horizon instead.
+        clip_horizon_cb = gui.add_checkbox("clip path (root + feet, past faded)",
+                                           initial_value=True)
+        served_trail_cb = gui.add_checkbox("served FM trail (root + feet)",
+                                          initial_value=True)
         for r in rollouts:
             toggles[f"rollout:{r.mode}"] = gui.add_checkbox(
                 f"rollout: {r.mode}-driven", initial_value=True)
     ghosts = gui.add_slider("horizon ghosts", min=0, max=8, step=1, initial_value=3)
+
+    # --- Multi-sample navigation. A re-plan is where the generator actually inferred; the
+    # steps between it serve that one plan, so stepping frame-by-frame mostly shows the robot
+    # walking through a fixed prediction. These jump between the inferences themselves.
+    n_draws = 0
+    for r in rollouts:
+        arr = r.data.get("fm_draws")
+        if arr is not None:
+            n_draws = max(n_draws, int(np.asarray(arr).shape[2]))
+    draws_shown = draw_feet = None
+    if n_draws:
+        with gui.add_folder(f"draws ({n_draws} per re-plan)"):
+            draws_shown = gui.add_slider("show best N", min=0, max=n_draws, step=1,
+                                         initial_value=min(4, n_draws))
+            draw_feet = gui.add_checkbox("feet (FK of predicted joints)", initial_value=True)
+            draw_width = gui.add_slider("line width x", min=0.5, max=4.0, step=0.1,
+                                        initial_value=1.0)
+            prev_replan = gui.add_button("<- re-plan")
+            next_replan = gui.add_button("re-plan ->")
+            feet_plot_btn = gui.add_button("plot feet x-z here")
     readout = gui.add_markdown("")
+
+    # Horizon the clip slice spans: the generator's own F, so the clip path covers exactly
+    # the nodes a draw does.
+    horizon = int(meta.get("fm_horizon") or 0)
+    if not horizon:
+        for r in rollouts:
+            arr = r.data.get("fm_pred_window")
+            if arr is not None:
+                horizon = int(np.asarray(arr).shape[2])
+                break
+
+    def _replans() -> np.ndarray:
+        """Re-plan steps of the first rollout that recorded the conditioning."""
+        for r in rollouts:
+            if "fm_cond_hist_nodes" in r.data:
+                try:
+                    return _fm_resample.replan_steps(r.data, 0)
+                except SystemExit:
+                    continue
+        return np.arange(num_steps)
 
     depth_views: dict[str, Any] = {}
     if scene.depth_spec and any("depth_raw" in r.data for r in rollouts):
-        with gui.add_folder("depth cameras"):
+        with gui.add_folder("depth cameras (policy)"):
             for i, spec in enumerate(scene.depth_spec):
                 depth_views[str(i)] = gui.add_image(
                     np.zeros((64, 64, 3), np.uint8),
                     label=f"{spec.get('obs_term', f'camera {i}')} (magenta = no reading)")
+    # What the GENERATOR was conditioned on. Same cameras as above whenever it shares the
+    # policy's pair, a different sampling when it does not -- and only this one is the input
+    # to the prediction on screen.
+    fm_depth_views: dict[str, Any] = {}
+    if scene.fm_extero_spec and any("fm_cond_extero" in r.data for r in rollouts):
+        with gui.add_folder("depth cameras (generator input)"):
+            for i, spec in enumerate(scene.fm_extero_spec):
+                fm_depth_views[str(i)] = gui.add_image(
+                    np.zeros((64, 64, 3), np.uint8),
+                    label=f"FM {spec.get('obs_term', f'camera {i}')} "
+                          f"{spec.get('width')}x{spec.get('height')}")
 
     def _layers() -> dict[str, bool]:
         """Current layer visibility, as the scene wants it."""
@@ -432,9 +733,79 @@ def serve(bundles: dict[str, tuple[dict, dict]], urdf_path: str | None = None,
         for visual in scene.robots.values():
             visual.set_num_ghosts(int(ghosts.value))
         scene.set_frame(case, step, _layers(), str(window_sel.value))
-        _update_readout(readout, depth_views, scene, rollouts, case, step, dt)
+        width = float(draw_width.value) if draws_shown is not None else 1.0
+        feet_on = bool(draw_feet.value) if draws_shown is not None else True
+        if draws_shown is not None:
+            for r in rollouts:
+                env = r.env_of_case.get(case)
+                if "fm_draws" in r.data and env is not None:
+                    scene.set_draws(r, step, env, int(draws_shown.value),
+                                    show_feet=feet_on, width_scale=width)
+                    break
+        # The whole clip with the traversed part faded, and the trail of FM output actually
+        # served -- together they show where the two have parted company so far.
+        for r in rollouts:
+            env = r.env_of_case.get(case)
+            if env is None:
+                continue
+            scene.set_clip_horizon(r, step, env, horizon if clip_horizon_cb.value else 0,
+                                   show_feet=feet_on, width_scale=width)
+            scene.set_served_trail(r, step if served_trail_cb.value else 0, env,
+                                   show_feet=feet_on, width_scale=width)
+            break
+        _update_readout(readout, depth_views, scene, rollouts, case, step, dt,
+                        fm_depth_views=fm_depth_views)
 
-    for handle in (case_sel, window_sel, step_slider, ghosts, *toggles.values()):
+    def _jump(delta: int) -> None:
+        """Move to the previous/next re-plan step."""
+        marks = _replans()
+        here = int(step_slider.value)
+        ahead = marks[marks > here]
+        behind = marks[marks < here]
+        if delta > 0 and ahead.size:
+            step_slider.value = int(ahead[0])
+        elif delta < 0 and behind.size:
+            step_slider.value = int(behind[-1])
+
+    feet_plot_view: dict[str, Any] = {}
+
+    def _feet_plot(_evt=None) -> None:
+        """Render the x-z feet figure for the current step into a panel and a PNG."""
+        import fm_feet_plot
+
+        case = str(case_sel.value)
+        step = int(step_slider.value)
+        for r in rollouts:
+            env = r.env_of_case.get(case)
+            if env is None or "fm_draws" not in r.data:
+                continue
+            kw = scene.feet_plot_inputs(r, step, env, case)
+            if kw is None:
+                print("[view] no draws at this step; nothing to plot.")
+                return
+            fig = fm_feet_plot.feet_xz_figure(**kw, title_extra=f"  |  {case} / {r.mode}")
+            if "panel" not in feet_plot_view:
+                with gui.add_folder("feet x-z"):
+                    feet_plot_view["panel"] = gui.add_image(
+                        fm_feet_plot.figure_to_rgb(fig), label="feet x-z (latest)")
+            else:
+                feet_plot_view["panel"].image = fm_feet_plot.figure_to_rgb(fig)
+            path = os.path.join(out_dir, f"feet_xz_{r.mode}_{case}_step{step:04d}.png")
+            fig.savefig(path, dpi=140, bbox_inches="tight")
+            import matplotlib.pyplot as _plt
+            _plt.close(fig)
+            print(f"[view] wrote {path}")
+            return
+        print("[view] this bundle carries no draws (capture with --num_draws > 1).")
+
+    handles = [case_sel, window_sel, step_slider, ghosts, clip_horizon_cb, served_trail_cb,
+               *toggles.values()]
+    if draws_shown is not None:
+        handles += [draws_shown, draw_feet, draw_width]
+        next_replan.on_click(lambda _evt: _jump(+1))
+        prev_replan.on_click(lambda _evt: _jump(-1))
+        feet_plot_btn.on_click(_feet_plot)
+    for handle in handles:
         handle.on_update(lambda _evt: _refresh())
 
     _refresh(rebuild=True)
@@ -456,7 +827,7 @@ def serve(bundles: dict[str, tuple[dict, dict]], urdf_path: str | None = None,
 
 
 def _update_readout(readout, depth_views, scene: FmDebugScene, rollouts: list[Rollout],
-                    case: str, step: int, dt: float) -> None:
+                    case: str, step: int, dt: float, fm_depth_views=None) -> None:
     """Write the per-step numbers next to the 3-D view, and refresh the depth images.
 
     The numbers are the ones you would otherwise go back to the plots for: how far each
@@ -492,4 +863,19 @@ def _update_readout(readout, depth_views, scene: FmDebugScene, rollouts: list[Ro
             for i, spec in enumerate(scene.depth_spec):
                 if str(i) in depth_views and i < depth.shape[0]:
                     depth_views[str(i)].image = _depth_image(depth[i], spec)
+        if fm_depth_views and "fm_cond_extero" in r.data and r.mode == rollouts[0].mode:
+            fm_depth = r.data["fm_cond_extero"][k, env]
+            for i, spec in enumerate(scene.fm_extero_spec):
+                if str(i) in fm_depth_views and i < fm_depth.shape[0]:
+                    fm_depth_views[str(i)].image = _depth_image(fm_depth[i], spec)
+
+        # Best-of-N: the spread across draws is what bounds any selection rule, and the
+        # chosen draw's own score says whether a good window was available at all.
+        scores = r.data.get("fm_scores")
+        if scores is not None:
+            s = np.asarray(scores[k, env])
+            chosen = int(np.asarray(r.data["fm_chosen"][k, env]))
+            lines.append(f"  - draws: chose #{chosen} of {s.size}, score {s[chosen]:.4f}  "
+                         f"(best {s.min():.4f}, worst {s.max():.4f}, "
+                         f"spread {s.max() - s.min():.4f})")
     readout.content = "  \n".join(lines)

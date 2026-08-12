@@ -219,15 +219,67 @@ def select_case_clips(lib_path: str, cases: list[dict], overrides: dict[str, int
     return out
 
 
+def random_family_cases(lib_path: str, family: str, count: int, seed: int
+                        ) -> tuple[list[dict], dict[str, int]]:
+    """``count`` random clips of one family, each on a DISTINCT tile, as cases + overrides.
+
+    Distinct tiles is a hard requirement, not a preference: the terrain importer builds one
+    tile per ``terrain_id`` and the terrain-aware reset assigns each env a clip drawn from the
+    clips standing on ITS tile. Two cases sharing a tile would therefore be interchangeable at
+    reset, and which clip an env replayed would stop being knowable -- the opposite of what a
+    pinned debug set is for.
+
+    Args:
+        lib_path: Source clip library.
+        family: Tile family to draw from (as the manifest spells it, with ``.h5``).
+        count: How many clips.
+        seed: RNG seed, so a run is reproducible from the manifest alone.
+
+    Returns:
+        ``(cases, overrides)`` ready for :func:`select_case_clips`.
+
+    Raises:
+        SystemExit: If the family has fewer distinct tiles than ``count``.
+    """
+    c = _clip_candidates(lib_path)
+    match = np.nonzero((c["family"] == family)
+                       & (c["type_code"] == c["type_names"].index("transition")))[0]
+    if match.size == 0:
+        raise SystemExit(f"no transition clips of family {family!r} in {lib_path}.")
+    rng = np.random.default_rng(seed)
+    by_tile: dict[int, list[int]] = {}
+    for i in match:
+        by_tile.setdefault(int(c["terrain_id"][i]), []).append(int(i))
+    tiles = sorted(by_tile)
+    if len(tiles) < count:
+        raise SystemExit(
+            f"family {family!r} spans only {len(tiles)} distinct tiles but {count} cases were "
+            "asked for; each case needs its own tile so its env replays a known clip.")
+    picked = rng.choice(np.asarray(tiles), size=count, replace=False)
+    cases, overrides = [], {}
+    for n, tile in enumerate(sorted(int(t) for t in picked)):
+        name = f"{family.replace('family_', '').replace('.h5', '')}{n}"
+        cases.append({"name": name, "type": "transition", "family": family})
+        overrides[name] = int(rng.choice(np.asarray(by_tile[int(tile)])))
+    return cases, overrides
+
+
 def stage_prep(args) -> dict:
     """Pick the case clips, write the subset library, and record both in the manifest."""
     from motion_gen.clips.clip_io import write_clip_subset
 
-    cases = [c for c in DEFAULT_CASES if args.cases is None or c["name"] in args.cases]
-    if not cases:
-        raise SystemExit(f"--cases {args.cases} matched none of "
-                         f"{[c['name'] for c in DEFAULT_CASES]}.")
-    overrides = dict(_parse_kv_ints(args.clip_index))
+    if int(args.random_cases):
+        cases, overrides = random_family_cases(
+            args.lib, args.case_family, int(args.random_cases), int(args.case_seed))
+        overrides.update(_parse_kv_ints(args.clip_index))
+        print(f"[prep] {len(cases)} random {args.case_family} clips "
+              f"(seed {args.case_seed}): {[overrides[c['name']] for c in cases]}")
+    else:
+        cases = [c for c in DEFAULT_CASES if args.cases is None or c["name"] in args.cases]
+        if not cases:
+            raise SystemExit(f"--cases {args.cases} matched none of "
+                             f"{[c['name'] for c in DEFAULT_CASES]}.")
+        overrides = dict(_parse_kv_ints(args.clip_index))
     chosen = select_case_clips(args.lib, cases, overrides)
 
     clip_lib = os.path.abspath(args.clip_out)
@@ -290,7 +342,10 @@ def stage_run(args, manifest: dict) -> int:
         # make it look hung.
         cmd = [sys.executable, "-u", os.path.abspath(__file__), "--stage", "run_one",
                "--mode", mode, "--out", args.out, "--task", args.task,
-               "--checkpoint", args.checkpoint, "--num_repeats", str(args.num_repeats)]
+               "--checkpoint", args.checkpoint, "--num_repeats", str(args.num_repeats),
+               "--num_draws", str(args.num_draws), "--viz_draws", str(args.viz_draws),
+               "--diag_draws", str(args.diag_draws),
+               "--select_log_every", str(args.select_log_every)]
         if args.fm_checkpoint:
             cmd += ["--fm_checkpoint", args.fm_checkpoint]
         if args.no_passive_fm:
@@ -309,6 +364,13 @@ def stage_run(args, manifest: dict) -> int:
             cmd += ["--device", args.device]
         if not args.headless:
             cmd += ["--no_headless"]
+        if args.history_from:
+            cmd += ["--history_from", args.history_from]
+        # Anything this parser did not claim is a hydra / AppLauncher override, and run_one
+        # feeds it to hydra. Forwarding it was missing, so a `--stage run
+        # env.commands...=x` override was parsed by the PARENT and then dropped on the way
+        # to the child -- silently, since hydra never saw it to reject it.
+        cmd += args.app_argv
         print(f"[run] {mode}: " + " ".join(cmd))
         rc = subprocess.call(cmd, cwd=_REPO, env=env)
         if rc != 0:
@@ -488,6 +550,22 @@ def _apply_env_overrides(env_cfg, args, manifest: dict) -> None:
             term.reference_source = args.mode
             term.fm_checkpoint = "" if args.no_passive_fm else (args.fm_checkpoint or "")
             term.fm_zero_noise = bool(args.fm_zero_noise)
+            if args.history_from and hasattr(term, "history_from"):
+                term.history_from = args.history_from
+            if int(args.diag_draws) and hasattr(term, "fm_diag_draws"):
+                # Diagnostic-only samples: the served window (and so the physics and the
+                # history) is untouched, which is what makes a zero-noise rollout still show
+                # the sampling spread in the plots.
+                term.fm_diag_draws = int(args.diag_draws)
+                term.fm_viz_num_draws = min(int(args.viz_draws), 1 + int(args.diag_draws))
+                term.fm_select_log_every = int(args.select_log_every)
+            if int(args.num_draws) > 1 and hasattr(term, "fm_num_draws"):
+                # Best-of-N oracle selection, and the whole draw set into the bundle. The
+                # viz count only decides what the LIVE Isaac ribbon draws; the stepper reads
+                # every draw from the log either way.
+                term.fm_num_draws = int(args.num_draws)
+                term.fm_viz_num_draws = min(int(args.viz_draws), int(args.num_draws))
+                term.fm_select_log_every = int(args.select_log_every)
             if args.mode == "clip":
                 # The teacher's anchoring, which is what the clip reference was trained
                 # against. The deploy default (0.0) never re-anchors, so leaving it would
@@ -837,7 +915,7 @@ def stage_view(args) -> int:
     if not modes:
         raise SystemExit(f"no rollouts in {args.out}; run `--stage run` first.")
     bundles = {m: load_bundle(args.out, m) for m in modes}
-    return serve(bundles, urdf_path=args.urdf, port=args.port)
+    return serve(bundles, urdf_path=args.urdf, port=args.port, out_dir=args.out)
 
 
 # ---------------------------------------------------------------------------
@@ -872,6 +950,15 @@ def build_parser() -> argparse.ArgumentParser:
                            f"{[c['name'] for c in DEFAULT_CASES]}.")
     prep.add_argument("--clip_index", action="append", default=None, metavar="NAME=I",
                       help="Force a case onto a specific source-library clip index. Repeatable.")
+    prep.add_argument("--random_cases", type=int, default=0,
+                      help="Instead of the three fixed cases, freeze this many RANDOM clips of "
+                           "--case_family, one per tile, as one case each (and so one env "
+                           "each). For confirming a finding on more than one clip.")
+    prep.add_argument("--case_family", default="family_stairs_up.h5",
+                      help="Family --random_cases draws from (as the manifest spells it).")
+    prep.add_argument("--case_seed", type=int, default=0,
+                      help="Seed for --random_cases, so the set is reproducible from the "
+                           "manifest.")
     prep.add_argument("--reprep", action="store_true",
                       help="Re-run prep even if the run directory already has a manifest.")
 
@@ -894,6 +981,32 @@ def build_parser() -> argparse.ArgumentParser:
                           "clean one -- i.e. shows how much of the reference the training-time "
                           "noise actually eats. Off by default: a noise-free rollout is the "
                           "right baseline for judging the generator.")
+    run.add_argument("--history_from", default=None, choices=("generator", "clip"),
+                     help="Where the generator's autoregressive context comes from. "
+                          "'generator' (the cfg default) is the real CLOSED LOOP -- its own "
+                          "last N served nodes. 'clip' is TEACHER FORCING: it still predicts "
+                          "the future and the tracker still follows it, but the context is "
+                          "always correct, which separates a weak model from a diverging "
+                          "loop. Not deployable (there is no clip on the robot). The bundle's "
+                          "contract report records which one ran.")
+    run.add_argument("--num_draws", type=int, default=1,
+                     help="Sample this many windows per re-plan and serve the one closest to "
+                          "the clip (ORACLE selection -- it reads the clip at inference, so it "
+                          "is a diagnostic, not deployable). Every draw is written to the "
+                          "bundle for the stepper. Costs Nx the generator per re-plan; "
+                          "incompatible with --fm_zero_noise, which makes all draws identical.")
+    run.add_argument("--diag_draws", type=int, default=0,
+                     help="Sample this many EXTRA windows per re-plan for the diagnostics only. "
+                          "They are never served and never enter the history, so the rollout is "
+                          "bit-for-bit what it would be without them -- which is how a "
+                          "--fm_zero_noise (deployable) capture still shows the sampling spread "
+                          "in the x-z plots and the viser draws layer. Ignored when "
+                          "--num_draws > 1.")
+    run.add_argument("--viz_draws", type=int, default=4,
+                     help="Draws the LIVE Isaac ribbon shows (chosen opaque + the rest faded), "
+                          "including the chosen one. Does not affect what is logged.")
+    run.add_argument("--select_log_every", type=int, default=0,
+                     help="Print the draw-selection summary every N re-plans (0 = never).")
     run.add_argument("--num_repeats", type=int, default=1,
                      help="Envs per case. >1 gives independent generator noise draws on the "
                           "same clip; the plots still show the first replica.")

@@ -173,6 +173,91 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     ``--gaussian_noise``) defaults it ON, so a default Isaac run and a default MuJoCo run are
     NOT comparing like with like. ``x0 = 0`` is off the training distribution."""
 
+    # --- Best-of-N oracle selection (diagnostic) ---
+    fm_num_draws: int = 1
+    """Sample this many independent windows per re-plan and SERVE the one closest to the clip.
+
+    ``1`` (default) = one draw, i.e. no selection: the sampled window is served as-is, which
+    with ``fm_zero_noise`` is the DEPLOYABLE configuration. It is still recorded as a
+    one-entry draw set with its clip score (diagnostic only, it changes nothing about what is
+    served), so a deploy-representative capture is readable by the same figures and browser as
+    an oracle capture and comparable through the same number. Above that this is an **ORACLE**: the
+    score consults the clip reference, which does not exist on hardware, so nothing here is
+    deployable. What it measures is the model's SUPPORT -- whether a good window is in the
+    distribution at all -- which is the upper bound on what any deployable selection rule
+    (draw consensus, a learned critic) could ever buy. It exists because the sampling spread
+    at fixed conditioning was measured to be the same order as the total prediction error.
+
+    The selected draw becomes the served window, so it also feeds the autoregressive history
+    (see ``history_from``): the loop continues from the chosen draw, which makes this
+    "oracle-guided closed loop" -- a third case between teacher forcing and the real loop.
+
+    Costs N forwards per re-plan, batched as one N-times-larger call. The generator is ~99%
+    of per-step inference, so wall-clock scales with N once the batch stops being
+    launch-bound -- fine at a handful of envs, not something to leave on for a sweep.
+
+    Requires Gaussian noise: with ``fm_zero_noise`` every draw is identical, so the
+    combination is refused rather than silently selecting among N copies."""
+
+    fm_diag_draws: int = 0
+    """Sample this many EXTRA windows per re-plan for diagnostics only. Never served.
+
+    The point: keep the physics on the deployable sample -- one draw, and with
+    ``fm_zero_noise`` the deterministic one -- while still recording what the sampling
+    distribution looks like around it. So the x-z figures and the viser draws layer show the
+    spread, and the rollout they are annotating is still the one you would deploy.
+
+    Distinct from ``fm_num_draws``, which SELECTS: that one changes what is served (an oracle,
+    since it scores against the clip) and is therefore incompatible with ``fm_zero_noise``.
+    This one changes nothing about the rollout, so it composes with either serving mode.
+
+    Recorded as draw 0 = the SERVED window, draws 1..N = the diagnostic samples, and
+    ``fm_chosen`` = 0. Every entry is scored against the clip, so the plots highlight what was
+    actually served and grey out what merely could have been sampled.
+
+    Ignored when ``fm_num_draws > 1`` (the selection path already records its whole candidate
+    set). Costs N extra forwards per re-plan, batched -- the same price as selection, for
+    information instead of behaviour."""
+
+    fm_select_w_base_pos: float = 1.0
+    fm_select_w_base_ori: float = 0.0
+    fm_select_w_base_lin_vel: float = 0.0
+    fm_select_w_base_ang_vel: float = 0.0
+    fm_select_w_joint_pos: float = 0.0
+    fm_select_w_joint_vel: float = 0.0
+    fm_select_w_ee_pos: float = 0.0
+    """Per-block weights for the draw score (``fm_num_draws > 1``).
+
+    The score is ``sum_key w_key * RMS_key``, where ``RMS_key`` is the root-mean-square
+    difference between the draw and the clip window over that key's channels and all F
+    nodes, in RAW units (metres, m/s, rad). Weighting per key rather than per LAYOUT block
+    because ``base_pose`` and ``base_vel`` are each two halves in different units -- a single
+    RMS over ``base_pose`` would add metres to a 6D rotation. Keys are
+    :data:`~robot_rl.flow_matching.window.REFERENCE_BLOCK_KEYS`' values, and the expansion to
+    channels goes through ``expand_window_blocks``, the same helper the noise and scale tables
+    use, so a layout change cannot misalign the weights here alone.
+
+    The default is ``base_pos`` only: one interpretable unit (metres of base-position error,
+    summed over the horizon), and the quantity closest to the failure this was built for --
+    where the base ends up relative to a stair edge. Everything else defaults to 0 rather
+    than to a guessed relative scale. Turn a key on once you have measured its magnitude:
+    with ``fm_select_log_every`` set, every key's RMS is printed whether or not it is
+    weighted, so one run tells you what a defensible weight would be.
+
+    Separate float fields rather than one dict because IsaacLab's configclass infers a
+    field's type from its default: a ``None`` default makes hydra reject every value (the
+    trap already documented on ``fm_num_sampling_steps``), and a mutable dict default cannot
+    be overridden key-wise from the command line under struct mode. Weighting a key the
+    checkpoint does not predict is an error, not a no-op."""
+
+    fm_select_log_every: int = 0
+    """Print the draw-selection summary every this many re-plans (``0`` = never).
+
+    One line: the chosen draw's index, the best/worst/spread of the score across the N draws,
+    and every key's RMS for the chosen draw. The SPREAD is the number that says how much
+    headroom selection has -- if best and worst are close, no selection rule can buy
+    anything and the model itself is the problem."""
+
     # --- Debug visualization ---
     debug_vis_show_fm_prediction: bool = True
     """Draw the FM's predicted world-frame trajectory as a ribbon of spheres (one color per
@@ -181,3 +266,29 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     debug_vis_fm_marker_radius: float = 0.02
     """Sphere radius (m) for the FM-prediction ribbon points."""
+
+    fm_viz_num_draws: int = 0
+    """Draw this many of the N sampled windows, INCLUDING the chosen one (``0`` = chosen only).
+
+    The chosen draw keeps the full-opacity ribbon; the next ``fm_viz_num_draws - 1`` by score
+    are drawn faded, so the picture shows the spread the selection had to work with and which
+    of it was picked. Capped at ``fm_num_draws``.
+
+    Fading is per-PROTOTYPE, not per-instance: ``VisualizationMarkers.visualize`` takes only
+    translations / orientations / scales / marker_indices, with no per-point colour, so each
+    ribbon frame gets a second low-opacity prototype. That doubles the prototype count and
+    multiplies the sphere count by the number drawn -- at F=62 and 5 frames a draw is ~310
+    spheres, so keep this small (4 is legible; 16 is a cloud)."""
+
+    debug_vis_fm_reject_opacity: float = 0.25
+    """Opacity of the non-chosen draws' ribbons (see ``fm_viz_num_draws``).
+
+    ``PreviewSurfaceCfg.opacity`` affects interactive rendering only, which is exactly this
+    use -- it will not show up in a recorded video pass."""
+
+    debug_vis_fm_reject_scale: float = 0.6
+    """Radius multiplier for the non-chosen draws' spheres, on top of the opacity.
+
+    Applied through the per-instance ``scales`` argument, which IS available even though
+    colour is not -- so shrinking needs no extra prototypes. Transparency alone reads poorly
+    against terrain at F=62; smaller and fainter together separates cleanly."""

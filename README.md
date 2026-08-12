@@ -239,6 +239,145 @@ coincide. A constant offset or a yaw twist between them is a frame bug in
 re-enables training-time observation noise, which the play trims switch off, so the
 "observed" window variant shows how much of the reference the noise eats.
 
+#### Stepping through 16–32 generator samples: `--num_draws` + `fm_resample.py`
+
+`fm_debug.py --num_draws N` samples **N** windows at every re-plan and serves the one closest
+to the clip — an **oracle** (it reads the clip at inference, so it is not deployable), whose
+point is to bound what any real selection rule could buy. Every draw, its score, and the whole
+conditioning go into `<mode>.npz`.
+
+**For representative data, capture the deployable configuration instead**: leave `--num_draws`
+at 1 and pass `--fm_zero_noise`, which is one deterministic draw — what
+`transfer/sim/gen_tracker_runner.py` defaults to. That still records a one-entry draw set with
+its clip score, so the same figures and browser read it and its numbers are directly comparable
+to an oracle capture's. An oracle capture's closed-loop error is the OPTIMISTIC case: the loop
+was handed the best of N at every re-plan, scored against a clip the model cannot see.
+
+**To get both at once** — deployable physics *and* a visible sampling spread — add
+`--diag_draws N` to that:
+
+```bash
+python scripts/rsl_rl/fm_debug.py --stage run --modes fm --out logs/fm_debug/zn16_gen \
+    --checkpoint <teacher>/model_XXXX.pt --fm_checkpoint <fm_run>/best.pt \
+    --fm_zero_noise --diag_draws 16
+```
+
+The served window stays the deterministic sample, so the rollout is bit-for-bit what it would be
+without the flag — the extra draws are never served and never enter the history — while N
+Gaussian windows are recorded per re-plan purely for the plots. They are stored as draw 0 = the
+served one, draws 1..N = the samples, with `fm_chosen = 0`, so every figure highlights what was
+actually served and greys what merely could have been sampled. Distinct from `--num_draws`,
+which *changes* what is served and is therefore incompatible with zero noise.
+
+```bash
+python scripts/rsl_rl/fm_debug.py --stage prep --lib clips/g1_mb_v5_body.h5 \
+    --cases stairs --clip_index stairs=400 --clip_out clips/fm_debug_stairs400.h5 \
+    --out logs/fm_debug/deepdive
+python scripts/rsl_rl/fm_debug.py --stage run --modes fm --out logs/fm_debug/deepdive \
+    --checkpoint <teacher>/model_XXXX.pt --fm_checkpoint <fm_run>/best.pt \
+    --num_draws 16 --select_log_every 8
+python scripts/rsl_rl/fm_debug.py --stage view --out logs/fm_debug/deepdive
+```
+
+In viser the **draws** folder shows the best N as ribbons (chosen bright, rejects dim) with
+`<- re-plan` / `re-plan ->` buttons, since the steps between re-plans only walk through one
+fixed prediction. **feet** adds each draw's two foot paths — the window predicts `joint_pos`
+but no `ee_pos`, so they are FK of the predicted joints (the same chain the live Isaac ribbon
+uses), which makes them a derived view rather than something the generator emitted. The
+chosen draw's feet are coloured left/right, the rejects' stay grey.
+
+Two accumulating layers make the closed-loop history readable at a glance:
+
+* **served FM trail** — root + feet of the reference the robot *actually tracked*, trailing
+  from the start of the rollout to the current step. A re-plan emits 62 nodes but only
+  `fm_update_every` of them are ever served, so this is the spliced sequence that both drove
+  the tracker and fed the autoregressive history — the parts of the FM's output that mattered.
+  Read from `y_des_fm` (the applied desired output, already in world); its ee frames are NaN
+  because the window predicts no `ee_pos`, so the feet are FK of the served joints.
+* **clip path** — the *whole* pre-made clip's root and feet, with the traversed part faded,
+  the next 62 nodes (what a draw covers) at full brightness, and the remainder dimmed. Drawn as
+  three tiers of the same curve because a line's colour is per-segment and viser has no
+  per-vertex alpha. Read from `y_des_clip`, which needs no re-anchoring since the clip
+  advances one step per control step.
+
+Both are distinct from the clip *ghost* (a posed robot at the current step) and the clip *tube*
+(the whole episode, no past/future distinction). Trail-versus-clip is the comparison that shows
+where the two parted company and by how much.
+
+#### Stepping the x-z plots with the keyboard: `fm_feet_browser.py`
+
+```bash
+# one bundle
+python scripts/rsl_rl/fm_feet_browser.py --out logs/fm_debug/stepper16
+# closed loop vs teacher forcing, stacked and stepping together
+python scripts/rsl_rl/fm_feet_browser.py --out logs/fm_debug/stepper16 \
+    --out logs/fm_debug/stepper16_tf
+```
+
+`left`/`right` walk the **re-plans** (the steps where the generator actually inferred — the ones
+in between only serve a plan already made), `up`/`down` walk single steps, `page up`/`down` jump
+ten, `home`/`end` go to the ends, `s` saves a PNG, `q` quits. Each row is one bundle: three x-z
+panels (left foot, right foot, base) plus that row's depth images, on shared axes and moving
+together — so the same re-plan under two different histories sits one above the other. With no
+display it says so and `--save_all` writes every re-plan headlessly.
+
+The assembly behind both this and the viser button lives in `fm_feet_data.FeetPlotSource`, one
+implementation, because the bundle-specific reasoning is where they would otherwise drift: a
+draw needs `window_to_world` against its own re-plan's anchor plus FK for the feet, while the
+history is not a separate array at all — under `history_from="generator"` it IS the last N
+served nodes, and under `"clip"` it is the clip's nodes at those steps.
+
+**`plot feet x-z here`** (in the draws folder) renders a 2-D figure for the current step into a
+viser panel and a PNG next to the bundle: one panel per foot in world x–z, with the terrain as
+its actual step profile (tread noses marked), every draw's foot path, the served one
+highlighted, the previous solve's draws faint (so a re-plan's change is visible), the clip over
+the same nodes, the history nodes the generator conditioned on, the older served tail, and a
+star at the current step — plus the depth images it was conditioned on. The panels use **equal
+aspect** deliberately: the question is whether a swing clears a nose, and an unequal aspect
+makes a 2 cm miss look like a comfortable margin. The title states which history fed the run,
+so two bundles' figures cannot be confused; a bundle captured before `fm_history_from` was
+logged says `unknown-recapture-to-label` rather than guessing. Two depth folders appear: the **policy**'s cameras and the **generator
+input** ones — the same pair unless the generator samples its own grid, and only the second is
+what conditioned the prediction on screen. The readout carries the chosen draw's score and the
+spread across draws; a small spread means no selection rule can help and the model itself is
+the problem.
+
+Because the bundle stores the raw conditioning, the generator replays with **no simulator**:
+
+```bash
+# resample 32 draws at one step, or sweep Euler steps / guidance, in seconds
+python scripts/rsl_rl/fm_resample.py --out logs/fm_debug/deepdive --step 200 --num_draws 32
+# and the check that the recording is complete: an offline zero-noise sample must equal
+# the online one bit-for-bit (needs a bundle captured with --fm_zero_noise)
+python scripts/rsl_rl/fm_resample.py --out logs/fm_debug/deepdive_zn --check
+```
+
+#### Two data measurements: `stair_edge_stats.py`, `transition_census.py`
+
+Both are IsaacLab-free and read the artifacts directly.
+
+```bash
+# where the stair-up reference clips put their feet relative to a tread nose, vs gait phase
+python scripts/rsl_rl/stair_edge_stats.py --lib clips/g1_mb_v5_body.h5 --out plots/stair_edges
+# how many FM training windows contain a flat->terrain anchor change, per family
+python scripts/rsl_rl/transition_census.py --data <recorded_*.h5> \
+    --checkpoint <fm_run>/best.pt --out plots/transition_census
+```
+
+`stair_edge_stats` takes tread geometry from the tile's own `overlays` (never recomputed from
+riser/tread — a tile can be re-datumed after authoring) and detects stance **geometrically**,
+because the library's `contact` flag tests against `ground_height = 0` and is therefore
+all-zero outside the world-pinned window on any clip that walks on a raised platform. The gait
+descriptor `z_right - z_left` is saved against three height references; the default is each
+foot's last stance level, since the instantaneous ground under a *swing* foot jumps by a whole
+riser exactly as it crosses the nose.
+
+`transition_census` imports `flow_matching.dataset.transition_window_mask` rather than
+restating it — the label depends on which mask bits count, the 255 sentinel, `clip_len`
+padding, a strictly-inside convention and `cfg.future_len` (not the recording's
+`ref_future_len`), and a re-implementation that differs in any one of them silently reports a
+different number.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.

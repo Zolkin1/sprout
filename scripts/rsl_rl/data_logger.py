@@ -392,7 +392,14 @@ class DataLogger:
                     # Applied window index, logged every step (cheap, [N] long): a
                     # re-plan is where it resets to fm_novel_start (non-increase), used
                     # to mark the FM/clip re-anchor instants on the trajectory_obs plots.
+                    # The command names this ``_pred_idx``; there has never been an
+                    # ``fm_pred_idx`` attribute, so this silently logged nothing and every
+                    # consumer that derives re-plan instants from it (the trajectory_obs
+                    # markers) saw an absent key. Try the public name first in case one is
+                    # ever added, then the real one.
                     pred_idx = getattr(ref, "fm_pred_idx", None)
+                    if not isinstance(pred_idx, torch.Tensor):
+                        pred_idx = getattr(ref, "_pred_idx", None)
                     if isinstance(pred_idx, torch.Tensor):
                         step["fm_pred_idx"] = pred_idx.clone()
                     if self._log_fm_window and hasattr(ref, "predicted_outputs_window"):
@@ -604,6 +611,25 @@ class DataLogger:
                     unwrapped, rl_depth_groups(unwrapped)).clone()
             except Exception as exc:
                 self._warn("world_depth", f"Could not read the depth cameras: {exc}")
+
+        # The generator's RAW conditioning and, at fm_num_draws > 1, every draw it took. With
+        # the checkpoint these are enough to re-run the generator offline on the same
+        # conditioning -- a different sample count, more Euler steps, guidance -- with no
+        # simulator. ``fm_cond_extero`` is whichever sensor the checkpoint was trained on,
+        # which is NOT necessarily ``depth_raw`` above.
+        if cmd is not None and getattr(cmd, "fm_enabled", False):
+            try:
+                for key, value in getattr(cmd, "fm_conditioning", dict)().items():
+                    step[f"fm_cond_{key}"] = value.clone()
+                for key, value in getattr(cmd, "fm_draws", dict)().items():
+                    step[f"fm_{key}"] = value.clone()
+                # The served window in the model's OWN layout (not the y_des projection
+                # ``fm_pred_y`` carries). This is what an offline re-run produces, so it is
+                # what an offline re-run has to be checked against.
+                step["fm_pred_window"] = cmd._pred_window.clone()
+            except Exception as exc:
+                self._warn("world_fm_cond",
+                           f"Could not read the generator conditioning: {exc}")
 
         # The generator's predicted horizon, in world coordinates (not the y_des layout --
         # the viewer poses a robot from it, so it wants root pose + joints directly).
@@ -821,6 +847,18 @@ class DataLogger:
                     self.metadata["fm_frame_names"] = list(ctx.frame_names)
                     self.metadata["fm_num_history"] = int(ctx.N)
                     self.metadata["fm_extero_source"] = str(ctx.extero_source)
+                    # The generator's own block selection, which is what says where each
+                    # block sits inside a window node. It cannot be inferred from the node
+                    # width: joint_pos and joint_vel are both nj wide, so a 44-wide node is
+                    # genuinely ambiguous between them and any consumer that guesses will
+                    # eventually slice a velocity as a position.
+                    self.metadata["fm_reference_blocks"] = list(ctx.reference_blocks)
+                    # Which history the generator ate. It changes the result more than
+                    # anything else on the command, so a bundle that does not carry it cannot
+                    # be told apart from its counterpart after the fact.
+                    self.metadata["fm_history_from"] = str(
+                        getattr(ref.cfg, "history_from", "generator"))
+                    self.metadata["fm_num_draws"] = int(getattr(ref.cfg, "fm_num_draws", 1))
                 manager = getattr(ref, "manager", None)
                 if manager is not None and hasattr(manager, "num_trajectories"):
                     self._num_trajectories = int(manager.num_trajectories)
@@ -936,6 +974,22 @@ class DataLogger:
                     unwrapped, rl_depth_groups(unwrapped))
             except Exception as exc:
                 print(f"[WARN DataLogger] Could not read the depth camera spec: {exc}")
+
+        # The GENERATOR's own camera contract. When it samples the depth pair on its own grid
+        # this is a DIFFERENT resolution from the policy's, and it is what conditioned the
+        # prediction -- so a stepper showing "the depth the FM saw" must reshape against this
+        # spec, not the policy's. ``fm_depth_groups`` returning None means the two share one
+        # pair, in which case this is simply a copy.
+        if self._has_depth:
+            try:
+                from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+                    depth_camera_specs,
+                    fm_depth_groups,
+                )
+                self.metadata["fm_extero_spec"] = depth_camera_specs(
+                    unwrapped, fm_depth_groups(unwrapped))
+            except Exception as exc:
+                print(f"[WARN DataLogger] Could not read the generator camera spec: {exc}")
 
         # Where the reference window sits in the observation the policy receives, and the
         # per-channel scale to divide back out.
