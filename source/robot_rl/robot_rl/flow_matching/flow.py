@@ -44,12 +44,6 @@ def sample_flow_batch(
     return x_tau, tau, target_v
 
 
-def _masked_mean(per_sample: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
-    """Mean of ``per_sample (B,)`` over the samples where ``gate (B,)`` is True (0 if none)."""
-    g = gate.to(per_sample.dtype)
-    return (per_sample * g).sum() / g.sum().clamp_min(1.0)
-
-
 def frame_consistency_terms(
     pred_phys: torch.Tensor,
     data_phys: torch.Tensor,
@@ -57,8 +51,8 @@ def frame_consistency_terms(
     num_joints: int,
     num_extra_frames: int = 0,
     blocks: Sequence[str] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-sample velocity + acceleration finite-difference consistency for the base block.
+) -> torch.Tensor:
+    """Per-sample VELOCITY finite-difference consistency for the base block.
 
     Operates on ``base_pose`` / ``base_vel`` only (joints are handled separately, and the ee
     block is position-only so it carries no velocity to tie), in DENORMALIZED (physical)
@@ -84,7 +78,7 @@ def frame_consistency_terms(
         num_joints: ``nj``; num_extra_frames: ``K``; blocks: the packed selection.
 
     Returns:
-        ``(vel_per_sample, accel_per_sample)`` each ``(B,)`` (physical units).
+        ``vel_per_sample`` ``(B,)`` (physical units).
 
     Raises:
         ValueError: If the selection lacks ``base_pose`` or ``base_vel`` -- the caller
@@ -95,14 +89,13 @@ def frame_consistency_terms(
     if "base_pose" not in slc or "base_vel" not in slc:
         raise ValueError(
             "frame_consistency_terms ties base_pose to base_vel, but this window packs "
-            f"{sorted(slc)}. Zero vel_consistency_weight / accel_consistency_weight for "
+            f"{sorted(slc)}. Zero vel_consistency_weight for "
             "this block selection."
         )
     bp, bv = slc["base_pose"].start, slc["base_vel"].start
     x = pred_phys
     pos, ori6d = x[..., bp:bp + 3], x[..., bp + 3:bp + 9]
     lin, ang = x[..., bv:bv + 3], x[..., bv + 3:bv + 6]
-    data_lin, data_ang = data_phys[..., bv:bv + 3], data_phys[..., bv + 3:bv + 6]
 
     lin_fd = (pos[:, 1:] - pos[:, :-1]) / dt
     vel = ((lin_fd - lin[:, :-1]) ** 2).mean(dim=(1, 2))
@@ -112,9 +105,7 @@ def frame_consistency_terms(
     ang_fd = so3_log(rmat[:, 1:] @ rmat[:, :-1].transpose(-1, -2)) / dt
     vel = vel + ((ang_fd - ang[:, :-1]) ** 2).mean(dim=(1, 2))
 
-    accel = (((lin[:, 1:] - lin[:, :-1]) / dt - (data_lin[:, 1:] - data_lin[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
-    accel = accel + (((ang[:, 1:] - ang[:, :-1]) / dt - (data_ang[:, 1:] - data_ang[:, :-1]) / dt) ** 2).mean(dim=(1, 2))
-    return vel / 2, accel / 2
+    return vel / 2
 
 
 def joint_vel_consistency_term(
@@ -320,6 +311,229 @@ def body_pose_terms(
     return out
 
 
+#: Bit index of each root DOF in the anchor mask (bit SET = that DOF is FREE). Mirrors
+#: ``motion_gen.world_lift._ANCHOR_DOF_NAMES``; kept here so ``flow`` needs no motion_gen
+#: import, and pinned by a test against the authority.
+_ANCHOR_BIT = {"downrange": 0, "lateral": 1, "height": 2, "roll": 3, "pitch": 4, "yaw": 5}
+
+
+def _planar_terrain_components(
+    err: torch.Tensor, base: int, ang: torch.Tensor, std: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The base-position error resolved onto the TERRAIN's axes, in normalized units.
+
+    Projects in metres onto the terrain's downrange/lateral directions -- which are exactly
+    orthogonal there -- then divides each by the std ALONG that direction, so both come back
+    on the same scale as the other normalized channels. Doing it the other way (projecting the
+    already-normalized error) is wrong under the 4.3x x/y anisotropy; see
+    :func:`pinned_axis_flow_loss`.
+
+    Args:
+        err: ``(B, F, D)`` normalized prediction error.
+        base: Column where the ``base_pose`` block starts.
+        ang: ``(B, F)`` angle from the window frame to the terrain frame.
+        std: ``(2,)`` normalizer std for the x and y position channels.
+
+    Returns:
+        ``(downrange, lateral)``, each ``(B, F)``, in normalized units.
+    """
+    e_m = err[..., base:base + 2] * std                    # metres
+    cos_a, sin_a = torch.cos(ang), torch.sin(ang)
+    std_dr = ((std[0] * cos_a) ** 2 + (std[1] * sin_a) ** 2).sqrt().clamp_min(1e-12)
+    std_lat = ((std[0] * sin_a) ** 2 + (std[1] * cos_a) ** 2).sqrt().clamp_min(1e-12)
+    downrange = (e_m[..., 0] * cos_a + e_m[..., 1] * sin_a) / std_dr
+    lateral = (-e_m[..., 0] * sin_a + e_m[..., 1] * cos_a) / std_lat
+    return downrange, lateral
+
+
+def pinned_axis_split(
+    err: torch.Tensor,
+    anchor_mask: torch.Tensor,
+    mask_frame_yaw_rel: torch.Tensor | None,
+    state_norm: object | None,
+    num_joints: int,
+    num_extra_frames: int,
+    blocks: Sequence[str] | None,
+) -> tuple[float, float]:
+    """Mean squared flow error split by whether the anchor mask PINS that coordinate.
+
+    The diagnostic the whole terrain-registration experiment turns on: the generator's error
+    on coordinates the terrain fixes (which it gets wrong) against its error on coordinates
+    that follow the robot (which it gets right). A single ``flow_mse`` averages the two and
+    hides exactly the effect being chased.
+
+    The split is over COORDINATES, not raw channels: the base-position error is resolved onto
+    the terrain's downrange/lateral axes first (:func:`_planar_terrain_components`), because
+    "downrange is pinned, lateral is free" is a statement about the terrain frame and the
+    window's x/y are the robot's. Height and the 6D rotation are axis-aligned and split
+    directly. Every other block -- velocities, joints -- is unpinned by definition: the anchor
+    mask describes the root placement only, so they count as free.
+
+    Both halves are per-dimension means, so they are directly comparable to each other and to
+    ``flow_mse``.
+
+    Args:
+        err: ``(B, F, D)`` normalized prediction error.
+        anchor_mask: ``(B, F)`` anchor bitmasks (bit SET = FREE).
+        mask_frame_yaw_rel: ``(B,)`` window-to-terrain angle, or ``None`` if aligned.
+        state_norm: State normalizer (for the position std); ``None`` = isotropic.
+        num_joints: ``nj``; num_extra_frames: ``K``; blocks: the window's block selection.
+
+    Returns:
+        ``(masked, unmasked)`` -- mean squared error over pinned and over free coordinates.
+        A half with no members reports ``nan``.
+    """
+    sq = err ** 2
+    slices = window_block_slices(num_joints, num_extra_frames, blocks)
+    if "base_pose" not in slices:
+        return float("nan"), float(sq.mean())
+    base = slices["base_pose"].start
+
+    def is_pinned(name: str) -> torch.Tensor:
+        return ((anchor_mask >> _ANCHOR_BIT[name]) & 1 == 0).to(err.dtype)
+
+    p_dr, p_lat = is_pinned("downrange"), is_pinned("lateral")
+    p_h = is_pinned("height")
+    p_rot = is_pinned("roll") * is_pinned("pitch") * is_pinned("yaw")
+
+    std = torch.ones(2, dtype=err.dtype, device=err.device)
+    if state_norm is not None:
+        std = state_norm.std[base:base + 2].to(err.dtype).to(err.device)
+    ang = (torch.zeros_like(p_dr) if mask_frame_yaw_rel is None
+           else mask_frame_yaw_rel.to(err.dtype).unsqueeze(-1).expand_as(p_dr))
+    dr, lat = _planar_terrain_components(err, base, ang, std)
+
+    z, rot = sq[..., base + 2], sq[..., base + 3:base + 9].sum(dim=-1)
+    pin_sq = (p_dr * dr ** 2 + p_lat * lat ** 2 + p_h * z + p_rot * rot).sum()
+    pin_n = (p_dr + p_lat + p_h + 6.0 * p_rot).sum()
+    # Everything the mask does not describe is free: the two planar axes it leaves free,
+    # height/rotation when free, and every other block outright.
+    other = sq.sum() - sq[..., base:base + 9].sum()
+    other_n = float(err.shape[0] * err.shape[1] * (err.shape[2] - 9))
+    free_sq = ((1 - p_dr) * dr ** 2 + (1 - p_lat) * lat ** 2
+               + (1 - p_h) * z + (1 - p_rot) * rot).sum() + other
+    free_n = ((1 - p_dr) + (1 - p_lat) + (1 - p_h) + 6.0 * (1 - p_rot)).sum() + other_n
+    masked = float(pin_sq / pin_n) if float(pin_n) > 0 else float("nan")
+    unmasked = float(free_sq / free_n) if float(free_n) > 0 else float("nan")
+    return masked, unmasked
+
+
+def pinned_axis_flow_loss(
+    err: torch.Tensor,
+    sq: torch.Tensor,
+    anchor_mask: torch.Tensor,
+    mask_frame_yaw_rel: torch.Tensor | None,
+    weight: float,
+    state_norm: object | None,
+    num_joints: int,
+    num_extra_frames: int,
+    blocks: Sequence[str] | None,
+) -> torch.Tensor:
+    """Flow MSE with the anchor mask's PINNED root DOFs weighted up, renormalized to mean 1.
+
+    A pinned DOF is one the reference keeps from the terrain rather than re-anchoring onto the
+    robot -- height on flat ground, downrange + height + yaw on stairs and boxes. Those are
+    precisely the axes the generator fails on (its predicted stair segment slides along with a
+    displaced robot instead of staying on the terrain), so this concentrates gradient there.
+
+    Three things make this less trivial than a channel mask:
+
+    * **The pinned planar axis is not a channel.** ``downrange`` is named in the TERRAIN's
+      frame while the window's x/y are the snap robot's yaw frame, so the pinned direction is
+      a rotated vector, and the weight is a quadratic form ``I + (w-1) u u^T`` rather than a
+      diagonal.
+    * **x and y are standardized differently** -- measured 0.442 vs 0.102 on the shipped
+      teacher, a 4.3x anisotropy, because the robot travels far downrange and little
+      laterally. A metric direction ``u`` therefore appears in normalized coordinates along
+      ``S^-1 u``, not ``u``; projecting on ``u`` directly would leak most of a pinned
+      downrange weight onto lateral error.
+    * **Yaw is not a channel either** -- the orientation block is a 6D rotation. It is
+      weighted only when roll, pitch AND yaw are all pinned, which is exactly the terrain
+      masks; flat frees yaw, so flat gets no orientation weight and nothing is distorted.
+
+    One residual approximation, measured rather than assumed. Because the base loss is a
+    per-channel normalized MSE, a metric displacement along a DIAGONAL pinned axis also shows
+    up in the un-weighted channel term, diluting the boost: the realised ratio between a
+    pinned-axis and a free-axis error is the nominal ``weight`` at 0/90/180 degrees of
+    relative heading and falls to about ``weight / 5`` at 45. On the shipped library that
+    barely bites -- over terrain-pinned windows of the depth_v5 recording, 90.7% of headings
+    are within 10 degrees of an axis and 96.0% within 20 (the distribution is bimodal at 0 and
+    180, the robot traversing the tile forwards or backwards), leaving ~4% in the diagonal
+    band. Removing it entirely would mean weighting in metric units throughout, which changes
+    the xy/other balance even at ``weight = 1``.
+
+    Weights are renormalized by their own sum, so the returned value has the same scale as the
+    unweighted mean and a with/without comparison does not also change the effective LR.
+
+    Args:
+        err: ``(B, F, D)`` prediction error in NORMALIZED units.
+        sq: ``err ** 2``, precomputed.
+        anchor_mask: ``(B, F)`` integer anchor bitmasks.
+        mask_frame_yaw_rel: ``(B,)`` angle from the window's frame to the terrain's, or
+            ``None`` to treat them as aligned.
+        weight: Multiplier on pinned DOFs (``1.0`` would be a no-op).
+        state_norm: State normalizer, for the per-channel std used in the anisotropy
+            correction. ``None`` falls back to isotropic.
+        num_joints: ``nj``.
+        num_extra_frames: ``K``.
+        blocks: The window's block selection.
+
+    Returns:
+        Scalar weighted mean squared error.
+    """
+    slices = window_block_slices(num_joints, num_extra_frames, blocks)
+    if "base_pose" not in slices:
+        return sq.mean()
+    base = slices["base_pose"].start
+    extra = float(weight) - 1.0
+
+    def is_pinned(name: str) -> torch.Tensor:
+        """(B, F) float: 1 where that DOF is FIXED (bit CLEAR = pinned)."""
+        return ((anchor_mask >> _ANCHOR_BIT[name]) & 1 == 0).to(err.dtype)
+
+    w = torch.ones_like(sq)
+    # Height and the orientation block are axis-aligned, so they ARE channel weights.
+    w[..., base + 2] = 1.0 + extra * is_pinned("height")
+    rot_pinned = is_pinned("roll") * is_pinned("pitch") * is_pinned("yaw")
+    w[..., base + 3:base + 9] = (1.0 + extra * rot_pinned).unsqueeze(-1)
+
+    total = (w * sq).sum()
+    w_sum = w.sum()
+
+    # The planar part: a quadratic form along the pinned direction(s), taken in normalized
+    # coordinates via S^-1 u so the standardization anisotropy above cannot smear it. It is a
+    # rank-1 bump on the 2x2 xy block, so it contributes a SCALAR per node -- accumulated into
+    # the total rather than into the per-channel tensor, which would broadcast it over every
+    # channel in the window.
+    p_dr, p_lat = is_pinned("downrange"), is_pinned("lateral")
+    if float((p_dr + p_lat).sum()) > 0.0:
+        std = torch.ones(2, dtype=err.dtype, device=err.device)
+        if state_norm is not None:
+            std = state_norm.std[base:base + 2].to(err.dtype).to(err.device)
+        ang = (torch.zeros_like(p_dr) if mask_frame_yaw_rel is None
+               else mask_frame_yaw_rel.to(err.dtype).unsqueeze(-1).expand_as(p_dr))
+        # Project in METRES, then divide by that axis's OWN std. Doing it the other way --
+        # projecting the already-normalized error onto the normalized image of the metric axis
+        # -- is wrong under anisotropy: at std (0.442, 0.102) the normalized images of the
+        # metric downrange and lateral axes are only 26 degrees apart at 45 deg of heading, so
+        # a purely LATERAL error would pick up 81% of the downrange weight. Metric projection
+        # gives it exactly zero, and reduces to plain channel weighting at zero heading.
+        e_m = err[..., base:base + 2] * std                      # (B, F, 2) metres
+        for pinned, (ux, uy) in ((p_dr, (torch.cos(ang), torch.sin(ang))),
+                                 (p_lat, (-torch.sin(ang), torch.cos(ang)))):
+            if float(pinned.sum()) == 0.0:
+                continue
+            along = e_m[..., 0] * ux + e_m[..., 1] * uy          # (B, F) metres along the axis
+            # The std ALONG that direction, so the term is commensurate with the normalized
+            # squared errors it is added to.
+            std_u = ((std[0] * ux) ** 2 + (std[1] * uy) ** 2).sqrt().clamp_min(1e-12)
+            total = total + (extra * pinned * (along / std_u) ** 2).sum()
+            # The quadratic form's TRACE is what the mean must divide by: a rank-1 bump of
+            # (weight - 1) adds exactly that to the 2x2 block's trace.
+            w_sum = w_sum + extra * pinned.sum()
+    return total / w_sum.clamp_min(1e-12)
+
+
 def flow_matching_loss(
     model: torch.nn.Module,
     x1: torch.Tensor,
@@ -332,7 +546,6 @@ def flow_matching_loss(
     num_joints: int = 0,
     num_extra_frames: int = 0,
     vel_weight: float = 0.0,
-    accel_weight: float = 0.0,
     joint_vel_weight: float = 0.0,
     fk: object | None = None,
     fk_pose_weight: float = 0.0,
@@ -342,13 +555,17 @@ def flow_matching_loss(
     body_pose_ori_scale: float = 1.0,
     tau_min: float = 0.0,
     blocks: Sequence[str] | None = None,
+    report_consistency: bool = False,
+    anchor_mask: torch.Tensor | None = None,
+    mask_frame_yaw_rel: torch.Tensor | None = None,
+    pinned_axis_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Compute the flow-matching loss (+ optional consistency / FK terms).
 
     The flow MSE is over ALL F future tokens (the conditioning is separate tokens, not
     part of the window). All auxiliary terms act on the predicted endpoint ``x1_hat``
-    (denormalized). Velocity + joint-velocity consistency are ungated; the acceleration
-    and FK terms are **τ-gated** (only ``tau >= tau_min``, where ``x1_hat ≈ x1``).
+    (denormalized). Velocity + joint-velocity consistency are ungated; the FK and body-pose
+    terms are **τ-gated** (only ``tau >= tau_min``, where ``x1_hat ≈ x1``).
 
     Every auxiliary term relates two blocks, so each is skipped unless ``blocks`` packs
     both. ``dataset.resolve_block_selection`` already zeroes the corresponding weight at
@@ -367,26 +584,39 @@ def flow_matching_loss(
             all consistency/FK terms.
         dt: Control step period (seconds) for the finite differences.
         num_joints: ``nj``; num_extra_frames: ``K``.
-        vel_weight / accel_weight / joint_vel_weight: consistency weights.
+        vel_weight / joint_vel_weight: consistency weights.
         fk: An :class:`~motion_gen.fk.FKChain` (or ``None``).
         fk_pose_weight: FK position-consistency weight.
-        tau_min: τ-gate threshold for the acceleration and FK terms (0 disables gating).
+        tau_min: τ-gate threshold for the FK and body-pose terms (0 disables gating).
         blocks: The window's block selection; defaults to all five.
+        report_consistency: Compute ``vel_consistency`` as a METRIC even when its
+            weight is 0. For validation; the training step should leave it off.
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
-        ``vel_consistency`` / ``accel_consistency`` / ``joint_vel_consistency`` /
+        ``vel_consistency`` / ``joint_vel_consistency`` /
         ``fk_pose``.
     """
     x_tau, tau, target_v = sample_flow_batch(x1)
     v = model(x_tau, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
-    flow_mse = ((v - target_v) ** 2).mean()
-    out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
+    err = v - target_v
+    sq = err ** 2
+    # Reported UNWEIGHTED whatever the weighting, so a weighted run's curves stay directly
+    # comparable with an unweighted one's -- that comparison is the point of the option.
+    flow_mse = sq.mean()
+    train_loss = flow_mse
+    if anchor_mask is not None and float(pinned_axis_weight) != 1.0:
+        train_loss = pinned_axis_flow_loss(
+            err, sq, anchor_mask, mask_frame_yaw_rel, float(pinned_axis_weight),
+            state_norm, num_joints, num_extra_frames, blocks,
+        )
+    out = {"loss": train_loss, "flow_mse": flow_mse.detach()}
 
     packed = set(resolve_reference_blocks(blocks))
     has_base = {"base_pose", "base_vel"} <= packed
     has_joints = {"joint_pos", "joint_vel"} <= packed
-    do_base = state_norm is not None and has_base and (vel_weight > 0.0 or accel_weight > 0.0)
+    do_base = state_norm is not None and has_base and (vel_weight > 0.0
+                                                       or report_consistency)
     do_jvel = state_norm is not None and has_joints and joint_vel_weight > 0.0
     do_fk = (fk is not None and state_norm is not None and fk_pose_weight > 0.0
              and {"joint_pos", "ee_pos"} <= packed)
@@ -398,15 +628,17 @@ def flow_matching_loss(
         x1_hat = x_tau + (1.0 - t) * v  # predicted endpoint along the linear path
         pred_phys = state_norm.denormalize(x1_hat)
         data_phys = state_norm.denormalize(x1)
-        gate = tau >= tau_min  # (B,) bool; gates the accel + FK terms
+        gate = tau >= tau_min  # (B,) bool; gates the FK + body-pose terms
         if do_base:
-            vel_ps, accel_ps = frame_consistency_terms(
+            vel_ps = frame_consistency_terms(
                 pred_phys, data_phys, dt, num_joints, num_extra_frames, blocks)
             vel = vel_ps.mean()                                 # ungated
-            accel = _masked_mean(accel_ps, gate)                # τ-gated
             out["vel_consistency"] = vel.detach()
-            out["accel_consistency"] = accel.detach()
-            out["loss"] = out["loss"] + vel_weight * vel + accel_weight * accel
+            # Reported even at zero weight (``report_consistency``), so the pose/velocity
+            # drift the term used to suppress stays VISIBLE after switching it off -- but
+            # only where it is asked for, so the training step does not pay for a metric.
+            if vel_weight > 0.0:
+                out["loss"] = out["loss"] + vel_weight * vel
         if do_jvel:
             jvel = joint_vel_consistency_term(
                 pred_phys, dt, num_joints, num_extra_frames, blocks).mean()   # ungated

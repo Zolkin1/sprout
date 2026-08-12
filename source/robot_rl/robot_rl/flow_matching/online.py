@@ -206,6 +206,14 @@ class FmOnlineContext:
     this generator against the tracker sharing the same physical cameras.  ``None`` for
     the height scan, whose grid travels in the tracker's ``height_scan_spec`` instead.
     """
+    extero_clip: float | None = None
+    """Symmetric clip band this checkpoint was TRAINED under, or ``None`` for the default.
+
+    ``sanitize_extero`` must clamp the live reading exactly as the dataset clamped the
+    recorded one, so the band travels with the checkpoint rather than being re-derived. The
+    scan's 1.0 m default is too tight for a large grid, and a live reading clipped harder than
+    the training data is silently a different sensor.
+    """
     extero_image_hw: list[tuple[int, int]] | None = None
     """Per-sensor ``(height, width)`` the exteroception row folds into, or ``None``.
 
@@ -286,6 +294,47 @@ def read_fm_extero_meta(checkpoint: str, map_location: str = "cpu") -> dict:
         )
     out["width"], out["height"] = width, height
     return out
+
+
+def fm_scan_geometry(spec: list[dict] | None) -> dict | None:
+    """The scan geometry a checkpoint was trained on, for building a matching sensor.
+
+    The scan counterpart of :func:`read_fm_extero_meta`'s ``width``/``height``: what
+    ``play.py`` needs to construct the generator's own scanner from the artifact rather than
+    from a flag, so the two cannot disagree by a typo.
+
+    Args:
+        spec: A checkpoint's ``meta["extero_spec"]``, or ``None``.
+
+    Returns:
+        ``{"size", "resolution", "offset_xy", "ordering", "height", "width", "privileged"}``,
+        or ``None`` when the checkpoint states no scan geometry -- which is the case for every
+        pre-field height-scan checkpoint, and correctly means "build nothing, use the
+        policy's scanner as before".
+
+    Raises:
+        ValueError: If several sensors disagree on the geometry; they would need one sensor.
+    """
+    if not spec or "resolution" not in spec[0]:
+        return None
+    keys = {(float(s["resolution"]), tuple(float(v) for v in s["size"]),
+             str(s.get("ordering", "xy"))) for s in spec}
+    if len(keys) != 1:
+        raise ValueError(
+            f"the checkpoint states {len(keys)} different scan geometries {sorted(keys)}; "
+            "one generator conditions on one grid."
+        )
+    resolution, size, ordering = keys.pop()
+    offset = [float(v) for v in (spec[0].get("offset_pos") or [0.0, 0.0, 0.0])]
+    return {
+        "size": list(size),
+        "resolution": resolution,
+        "offset_xy": (offset[0], offset[1]),
+        "ordering": ordering,
+        "height": int(spec[0]["height"]),
+        "width": int(spec[0]["width"]),
+        "privileged": bool(spec[0].get("privileged", False)),
+    }
 
 
 #: State-dict prefixes renamed with the exteroception contract: old -> new.
@@ -451,17 +500,11 @@ def load_fm_context(
     # under. If this line disagrees with what you expect, the config is what to look at.
     print(f"[INFO load_fm_context] attention_mode={cfg.attention_mode} "
           f"(extero_encoder={encoder})")
-    model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=cfg.future_len,
-        num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
-        extero_sensor_dim=cfg.extero_sensor_dim,
-        extero_sensor_count=cfg.extero_sensor_count, cmd_dim=cfg.cmd_dim,
-        cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
-        num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
-        extero_encoder=encoder, extero_image_hw=cfg.extero_image_hw,
-        extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
-        attention_mode=cfg.attention_mode,
-    ).to(dev)
+    # ONE construction site, shared with the trainer. ``encoder`` is the resolved name and is
+    # already written back onto cfg by the dataset; assert rather than pass it separately, so
+    # there is no second path by which the two could describe different models.
+    cfg.extero_encoder = encoder
+    model = FlowMatchingTransformer.from_config(cfg).to(dev)
     weights, which = ckpt["model"], "raw"
     if use_ema and ckpt.get("model_ema") is not None:
         weights, which = ckpt["model_ema"], "EMA"
@@ -506,6 +549,10 @@ def load_fm_context(
         extero_spec=(meta.get("extero_spec") or None),
         extero_image_hw=([(int(h), int(w)) for h, w in cfg.extero_image_hw]
                          if cfg.extero_image_hw else None),
+        # The band this checkpoint was TRAINED under, so the live token builder clamps the way
+        # the dataset did. Absent in an old checkpoint -> None -> the per-source default, which
+        # is what that checkpoint used.
+        extero_clip=cfg.extero_clip,
     )
 
 
@@ -560,7 +607,8 @@ def build_extero_tokens(ctx: FmOnlineContext, values: torch.Tensor) -> torch.Ten
         Normalized tokens, flattened to ``(V, T*dim)`` -- the model reshapes internally.
     """
     flat = values.reshape(values.shape[0], -1)
-    return ctx.extero_norm.normalize(sanitize_extero(flat, ctx.extero_source))
+    return ctx.extero_norm.normalize(
+        sanitize_extero(flat, ctx.extero_source, clip=ctx.extero_clip))
 
 
 def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Tensor | None:

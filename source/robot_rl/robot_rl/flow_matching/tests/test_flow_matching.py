@@ -465,9 +465,9 @@ def _consistent_frame_traj(nf: int, nj: int, k: int, dt: float, seed: int) -> to
 def test_frame_consistency_zero_for_consistent_traj():
     nf, nj, k, dt = 6, 2, 1, 0.05
     x = _consistent_frame_traj(nf, nj, k, dt, seed=1)
-    vel, accel = frame_consistency_terms(x, x, dt, nj)
+    vel = frame_consistency_terms(x, x, dt, nj)
     jvel = joint_vel_consistency_term(x, dt, nj)
-    assert vel.max().item() < 1e-10 and accel.max().item() < 1e-10 and jvel.max().item() < 1e-10
+    assert vel.max().item() < 1e-10 and jvel.max().item() < 1e-10
 
 
 def test_frame_consistency_penalizes_jump():
@@ -475,7 +475,7 @@ def test_frame_consistency_penalizes_jump():
     x = _consistent_frame_traj(nf, nj, k, dt, seed=2)
     pred = x.clone()
     pred[0, 3, 0:3] += 1.0
-    vel, _ = frame_consistency_terms(pred, x, dt, nj)
+    vel = frame_consistency_terms(pred, x, dt, nj)
     assert vel.max().item() > 1e-2
 
 
@@ -563,15 +563,14 @@ def test_flow_loss_fk_terms_and_tau_gate():
     x1, hist, height = torch.randn(16, f, d), torch.randn(16, n, d), torch.randn(16, _HK)
     norm = _norm(x1)
     ckw = dict(state_norm=norm, dt=0.05, num_joints=nj, num_extra_frames=k,
-               vel_weight=0.1, accel_weight=0.01, joint_vel_weight=0.1,
+               vel_weight=0.1, joint_vel_weight=0.1,
                fk=chain, fk_pose_weight=0.1)
     out = flow_matching_loss(model, x1, hist, height, None, tau_min=0.0, **ckw)
-    for key in ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose"):
+    for key in ("vel_consistency", "joint_vel_consistency", "fk_pose"):
         assert key in out
     assert "fk_vel" not in out
     assert torch.isfinite(out["loss"]) and out["loss"].requires_grad
     out_g = flow_matching_loss(model, x1, hist, height, None, tau_min=2.0, **ckw)
-    assert out_g["accel_consistency"].item() == 0.0
     assert out_g["fk_pose"].item() == 0.0
 
 

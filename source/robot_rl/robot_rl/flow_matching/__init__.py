@@ -10,7 +10,9 @@ commanded-velocity profile, generating a future trajectory in the current root f
 
 from .config import (
     ATTENTION_MODES,
+    EXTERO_CLIP,
     EXTERO_ENCODERS,
+    EXTERO_NORM_MODES,
     EXTERO_SOURCES,
     FlowMatchingConfig,
 )
@@ -34,6 +36,7 @@ from .flow import (
     flow_matching_loss,
     frame_consistency_terms,
     joint_vel_consistency_term,
+    pinned_axis_split,
     sample_flow_batch,
     sample_trajectory,
     sample_trajectory_grad,
@@ -81,6 +84,8 @@ __all__ = [
     "WeightEMA",
     "EXTERO_SOURCES",
     "EXTERO_ENCODERS",
+    "EXTERO_NORM_MODES",
+    "EXTERO_CLIP",
     "ATTENTION_MODES",
     "FlowMatchingTransformer",
     "ExteroImageEncoder",
@@ -98,6 +103,7 @@ __all__ = [
     "joint_vel_consistency_term",
     "body_pose_terms",
     "fk_consistency_terms",
+    "pinned_axis_split",
     "sample_flow_batch",
     "sample_trajectory",
     "sample_trajectory_grad",

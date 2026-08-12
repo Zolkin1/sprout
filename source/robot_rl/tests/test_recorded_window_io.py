@@ -264,3 +264,178 @@ def test_depth_dataset_is_omitted_when_not_recorded():
         data, _ = load_recorded_windows(p)
         assert "depth" not in data
         assert "height_scan" in data
+
+
+##
+# Phase C additions: per-key dtype, byte-capped chunks, the new meta fields
+##
+
+def test_scan_can_be_stored_as_float16():
+    """Opt-in f16 for the dense scan: halves the file and the dataset's RAM.
+
+    1 mm quantisation is far below a 0.025 m grid cell, and lzf compresses f16 sensor data
+    much better than f32 (whose low mantissa bits are effectively noise). The override is
+    per-writer, never a change to the module table, so the depth baseline's arrays stay
+    bit-identical and the A/B is not confounded by a storage change.
+    """
+    W, H, F, node, K, cmd = 8, 4, 5, 10, 121 * 121, 3
+    batch = _rand(W, H, F, node, K, cmd, seed=3)
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "f16.h5")
+        with RecordedWindowWriter(path, W, H, node, F, K, cmd, _meta(W, H, F, K),
+                                  dtypes={"height_scan": "float16"}) as w:
+            w.write_batch(batch)
+        data, _ = load_recorded_windows(path)
+        assert data["height_scan"].dtype == np.float16
+        # Everything else keeps its declared dtype.
+        assert data["history_state"].dtype == np.float32
+        assert data["ref_future"].dtype == np.float32
+        # f16 round-trips the value to ~1e-3, which is 25x finer than the grid cell.
+        assert np.allclose(data["height_scan"], batch["height_scan"], atol=2e-3)
+
+
+def test_an_unknown_dtype_override_is_refused():
+    """A typo'd key would silently do nothing, which is how a "f16 run" ends up f32."""
+    W, H, F, node, K, cmd = 4, 4, 5, 10, 16, 3
+    with tempfile.TemporaryDirectory() as td:
+        with pytest.raises(KeyError, match="unknown window array"):
+            RecordedWindowWriter(os.path.join(td, "x.h5"), W, H, node, F, K, cmd,
+                                 _meta(W, H, F, K), dtypes={"heightscan": "float16"})
+
+
+def test_chunks_are_capped_by_bytes_not_just_window_count():
+    """A fixed 256-window block is a 23 MB chunk on a dense scan.
+
+    That is far past HDF5's 1 MB default chunk cache, so every read pushes the whole chunk
+    through uncached. The block must fall as the row grows -- and must never reach 0.
+    """
+    from recorded_data_io import _CHUNK_TARGET_BYTES, _window_chunk
+
+    # A narrow row still blocks the full 256 windows.
+    assert _window_chunk((10_000, 8, 10), itemsize=4)[0] == 256
+    # A dense scan row must be capped by bytes.
+    dense = _window_chunk((10_000, 121 * 121), itemsize=4)
+    assert dense[0] < 256
+    assert dense[0] * 121 * 121 * 4 <= _CHUNK_TARGET_BYTES
+    # f16 halves the row, so it fits ~twice the windows per chunk (floor division makes the
+    # ratio inexact by one, hence the bound rather than equality).
+    half = _window_chunk((10_000, 121 * 121), itemsize=2)
+    assert 2 * dense[0] <= half[0] <= 2 * dense[0] + 1
+    assert half[0] * 121 * 121 * 2 <= _CHUNK_TARGET_BYTES
+    # Never zero, however wide the row.
+    assert _window_chunk((10, 50_000_000), itemsize=4)[0] == 1
+    # And never more windows than the dataset holds.
+    assert _window_chunk((3, 8, 10), itemsize=4)[0] == 3
+
+
+def test_scan_geometry_and_noise_flag_round_trip():
+    """``height_scan_spec`` / ``extero_noise_free`` survive the JSON attr round-trip.
+
+    The spec is what lets the FM dataset recompute the fold from the physical fields and
+    refuse a file whose statements of the grid disagree, so it has to arrive intact.
+    """
+    W, H, F, node, K, cmd = 4, 4, 5, 10, 121 * 121, 3
+    meta = _meta(W, H, F, K)
+    meta.height_scan_spec = [{
+        "sensor": "fm_height_scanner", "resolution": 0.025, "size": [3.0, 3.0],
+        "ordering": "xy", "height": 121, "width": 121, "num_rays": K,
+        "sensor_offset": 0.5, "privileged": True,
+    }]
+    meta.extero_noise_free = True
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "spec.h5")
+        with RecordedWindowWriter(path, W, H, node, F, K, cmd, meta) as w:
+            w.write_batch(_rand(W, H, F, node, K, cmd, seed=4))
+        _, got = load_recorded_windows(path)
+    assert got.extero_noise_free is True
+    assert got.height_scan_spec == meta.height_scan_spec
+    assert got.height_scan_spec[0]["privileged"] is True
+
+
+def test_a_recording_without_the_new_fields_still_loads():
+    """Backward compatible: the loader filters attrs against the dataclass fields.
+
+    An older file simply has no ``height_scan_spec`` attr, and must come back as the
+    defaults rather than raising -- every existing recording on disk is in that state.
+    """
+    W, H, F, node, K, cmd = 4, 4, 5, 10, 16, 3
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "old.h5")
+        with RecordedWindowWriter(path, W, H, node, F, K, cmd, _meta(W, H, F, K)) as w:
+            w.write_batch(_rand(W, H, F, node, K, cmd, seed=5))
+        import h5py
+        with h5py.File(path, "a") as f:          # simulate a pre-field recording
+            del f.attrs["height_scan_spec"]
+            del f.attrs["extero_noise_free"]
+        _, got = load_recorded_windows(path)
+    assert got.height_scan_spec is None
+    assert got.extero_noise_free is False
+
+
+##
+# Selective loading: read only the arrays and rows a run will actually use
+##
+
+def test_meta_can_be_read_without_touching_arrays():
+    """Deciding WHAT to load must not require loading it."""
+    from recorded_data_io import read_recording_meta
+
+    W, H, F, node, K, cmd = 6, 4, 5, 10, 32, 3
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "m.h5")
+        with RecordedWindowWriter(path, W, H, node, F, K, cmd, _meta(W, H, F, K)) as w:
+            w.write_batch(_rand(W, H, F, node, K, cmd, seed=11))
+        meta, n = read_recording_meta(path)
+    assert n == W and meta.height_scan_dim == K
+
+
+def test_only_the_requested_arrays_are_loaded():
+    """A recording holds BOTH exteroception signals so one file trains either generator.
+
+    A given run reads exactly one, and on a dense scan the unused array is the largest thing
+    in the file -- so not loading it is the biggest single saving available.
+    """
+    W, H, F, node, K, cmd = 6, 4, 5, 10, 64, 3
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "both.h5")
+        with RecordedWindowWriter(path, W, H, node, F, K, cmd, _meta(W, H, F, K),
+                                  depth_shape=(2, 40)) as w:
+            w.write_batch(_rand(W, H, F, node, K, cmd, seed=12) | {
+                "depth": np.zeros((W, 2, 40), np.float32)})
+        full, _ = load_recorded_windows(path)
+        scan_run, _ = load_recorded_windows(
+            path, keys=[k for k in full if k != "depth"])
+    assert "depth" in full and "height_scan" in full
+    assert "depth" not in scan_run and "height_scan" in scan_run
+    assert sum(v.nbytes for v in scan_run.values()) < sum(v.nbytes for v in full.values())
+
+
+def test_row_subset_preserves_the_requested_order():
+    """h5py needs STRICTLY increasing indices, so unsorted or repeated rows must be handled.
+
+    The train/val split hands over arbitrary index arrays; silently returning them in sorted
+    order would pair every window with the wrong label.
+    """
+    W, H, F, node, K, cmd = 12, 4, 5, 10, 16, 3
+    batch = _rand(W, H, F, node, K, cmd, seed=13)
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "rows.h5")
+        with RecordedWindowWriter(path, W, H, node, F, K, cmd, _meta(W, H, F, K)) as w:
+            w.write_batch(batch)
+        rows = np.array([9, 0, 5, 0, 11])          # unsorted, with a duplicate
+        sub, _ = load_recorded_windows(path, keys=["height_scan", "episode_id"], rows=rows)
+    assert sub["height_scan"].shape == (rows.shape[0], K)
+    for i, r in enumerate(rows):
+        assert np.array_equal(sub["height_scan"][i], batch["height_scan"][r])
+    assert np.array_equal(sub["episode_id"], batch["episode_id"][rows])
+
+
+def test_out_of_range_rows_are_refused():
+    """Silently clipping would train on the wrong windows; h5py alone would not catch it."""
+    W, H, F, node, K, cmd = 4, 4, 5, 10, 16, 3
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "oor.h5")
+        with RecordedWindowWriter(path, W, H, node, F, K, cmd, _meta(W, H, F, K)) as w:
+            w.write_batch(_rand(W, H, F, node, K, cmd, seed=14))
+        with pytest.raises(IndexError, match="out of range"):
+            load_recorded_windows(path, rows=np.array([0, W]))

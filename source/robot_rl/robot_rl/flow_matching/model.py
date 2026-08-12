@@ -114,6 +114,46 @@ class FlowMatchingTransformer(nn.Module):
         dropout: Dropout rate.
     """
 
+    @classmethod
+    def from_config(cls, cfg) -> "FlowMatchingTransformer":
+        """Build the model this config describes -- the ONLY way it should be built.
+
+        There used to be two independent construction sites (the trainer and
+        ``online.load_fm_context``) each spelling out the same twenty keyword arguments, and
+        they drifted: a run's banner reported a 256-token metric encoder while the trainer had
+        silently built a 64-token one with a single input channel, because the new arguments
+        were added to one site and not the other. Nothing failed until the checkpoint was
+        reloaded, and the printed architecture was wrong the whole time.
+
+        Every caller goes through here so that cannot recur. ``cfg.extero_encoder`` is expected
+        to be already RESOLVED (the dataset writes ``"auto"`` out) and ``extero_image_hw`` /
+        ``extero_coord_extent_m`` derived from the recording's sensor contract.
+
+        Args:
+            cfg: A :class:`~robot_rl.flow_matching.config.FlowMatchingConfig`.
+
+        Returns:
+            The model, on the CPU; move it yourself.
+        """
+        return cls(
+            state_dim=cfg.state_dim, future_len=cfg.future_len,
+            num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
+            extero_sensor_dim=cfg.extero_sensor_dim,
+            extero_sensor_count=cfg.extero_sensor_count, cmd_dim=cfg.cmd_dim,
+            cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
+            num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward,
+            dropout=cfg.dropout,
+            extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
+            extero_cnn_channels=cfg.extero_cnn_channels,
+            extero_cnn_grid=cfg.extero_cnn_grid,
+            extero_cnn_strides=cfg.extero_cnn_strides,
+            extero_coord_extent_m=cfg.extero_coord_extent_m,
+            extero_grid_ordering=cfg.extero_grid_ordering,
+            extero_fourier_bands=cfg.extero_fourier_bands,
+            extero_miss_sentinel=cfg.extero_miss_sentinel,
+            attention_mode=cfg.attention_mode,
+        )
+
     def __init__(
         self,
         state_dim: int,
@@ -133,6 +173,11 @@ class FlowMatchingTransformer(nn.Module):
         extero_image_hw: Sequence[Sequence[int]] | None = None,
         extero_cnn_channels: Sequence[int] = (16, 32, 64),
         extero_cnn_grid: Sequence[int] | None = None,
+        extero_cnn_strides: Sequence[int] | None = None,
+        extero_coord_extent_m: Sequence[float] | None = None,
+        extero_grid_ordering: str = "xy",
+        extero_fourier_bands: int = 4,
+        extero_miss_sentinel: float | None = None,
         attention_mode: str = "full",
     ):
         super().__init__()
@@ -170,8 +215,10 @@ class FlowMatchingTransformer(nn.Module):
             if not extero_image_hw:
                 raise ValueError(
                     "extero_encoder='cnn' needs extero_image_hw (one (H, W) per sensor); the "
-                    "dataset derives it from the recording's depth_camera_spec. The height "
-                    "scan has no image shape in an FM recording -- use 'mlp' for it."
+                    "dataset derives it from the recording's sensor contract -- "
+                    "depth_camera_spec for depth, height_scan_spec for the scan. A recording "
+                    "carrying only a ray count cannot say what shape the grid was, so use "
+                    "'mlp' for it or re-record."
                 )
             shapes = [(int(h), int(w)) for h, w in extero_image_hw]
             if len(shapes) != extero_sensor_count:
@@ -190,6 +237,13 @@ class FlowMatchingTransformer(nn.Module):
                 shapes, d_model, extero_cnn_channels,
                 None if extero_cnn_grid is None else (int(extero_cnn_grid[0]),
                                                       int(extero_cnn_grid[1])),
+                strides=extero_cnn_strides,
+                coord_extent_m=(None if extero_coord_extent_m is None
+                                else (float(extero_coord_extent_m[0]),
+                                      float(extero_coord_extent_m[1]))),
+                ordering=str(extero_grid_ordering),
+                fourier_bands=int(extero_fourier_bands),
+                miss_sentinel=extero_miss_sentinel,
             )
             self.tokens_per_sensor = int(self.extero_cnn.tokens_per_sensor)
         elif self.extero_encoder == "mlp":

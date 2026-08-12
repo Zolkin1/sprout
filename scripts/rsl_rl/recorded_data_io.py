@@ -17,6 +17,7 @@ import datetime
 import hashlib
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, fields
 
 import numpy as np
@@ -102,6 +103,18 @@ class RecordingMeta:
     ref_future_term_names: list[str] = field(default_factory=list)
     ref_future_term_dims: list[int] = field(default_factory=list)
     height_scan_dim: int = 0
+    height_scan_spec: list[dict] | None = None
+    """Geometry of the scanner(s) the recorded ``height_scan`` came from
+    (``mdp.height_scan_specs``), or ``None`` for a recording written before the field existed.
+
+    :attr:`height_scan_dim` is a bare ray count, which cannot say what SHAPE the grid was --
+    and a convolutional encoder needs the ``(height, width)`` fold, which ``num_rays`` alone
+    cannot distinguish from its transpose. This carries the resolution, extents, ordering and
+    fold, so the FM dataset can recompute the fold from the physical fields and refuse a file
+    whose three statements of the grid disagree.
+
+    Also carries ``privileged``, which is what makes the dense generator-only scan refusable
+    at every off-sim exit: no deployment can reproduce an exact 14k-ray ground-truth map."""
     depth_camera_spec: list[dict] | None = None
     content_sha256: str = ""
     format: str = "per_step_npz"
@@ -151,6 +164,21 @@ class RecordingMeta:
 
     The FM dataset reads this and ZEROES ``noise_depth`` when it is True, so the two do not
     stack. Nothing else consults it."""
+    extero_noise_free: bool = False
+    """Whether the recorded exteroception is noise-free BY CONSTRUCTION.
+
+    The complement of :attr:`extero_corrupted`, and needed because that flag is depth-shaped:
+    it says "the recorded depth already carries the sim's DR", and the dataset's gate on it is
+    explicitly ``and extero_source == "depth"``. A height-scan recording therefore falls
+    through both, and ``FlowMatchingConfig.noise_height_scan`` (0.1 m by default) stays live --
+    silently adding 4 grid cells of vertical error to a signal recorded precisely to be exact.
+
+    True when every source of corruption is provably absent: the scanner has no drift ranges,
+    no event term randomises it, and the reading goes through the raw obs function rather than
+    the observation manager's noise pipeline. The FM dataset zeroes the source's noise field
+    when this is set, so "noise-free" is a property of the ARTIFACT rather than of remembering
+    to pass a flag -- and it lands in ``params/fm_config.yaml`` and the checkpoint, where it
+    can be audited after the fact."""
     history_anchor: str = ""
     """Which frame each ``history_state`` row's root pose is, i.e. what the history is OBSERVED
     relative to.
@@ -499,14 +527,36 @@ def fingerprint_windows(data: dict[str, np.ndarray]) -> str:
     return fingerprint_arrays(data)
 
 
-def _window_chunk(shape: tuple[int, ...], block: int = 256) -> tuple[int, ...]:
+_CHUNK_TARGET_BYTES: int = 4 << 20
+"""Chunk-size target. HDF5's own chunk cache defaults to 1 MB, so a chunk far above that is
+read straight through it every time."""
+
+
+def _window_chunk(
+    shape: tuple[int, ...], block: int = 256, itemsize: int = 4
+) -> tuple[int, ...]:
     """Chunk shape for a windowed dataset: block windows along the first axis.
 
-    Blocking many windows per chunk keeps the chunk count small (millions of
-    single-window chunks bloat the HDF5 B-tree), while a ~1-4 MB chunk stays
-    efficient for the sequential full-load reads the FM dataset does.
+    Blocking many windows per chunk keeps the chunk count small (millions of single-window
+    chunks bloat the HDF5 B-tree), while a few-MB chunk stays efficient for the sequential
+    full-load reads the FM dataset does.
+
+    The block is capped by BYTES, not just by the window count. A fixed 256 windows is fine
+    at the depth path's 6 KiB/window but becomes a 23 MB chunk on a 22801-ray scan -- far past
+    the default 1 MB chunk cache, so every read pushes the whole thing through uncached, and
+    any future random access is hopeless.
+
+    Args:
+        shape: Full dataset shape, windows along axis 0.
+        block: Upper bound on windows per chunk.
+        itemsize: Bytes per element, for the byte cap.
+
+    Returns:
+        The chunk shape, always at least one window.
     """
-    return (min(shape[0], block),) + shape[1:]
+    row_bytes = max(1, int(np.prod(shape[1:], dtype=np.int64)) * int(itemsize))
+    by_bytes = max(1, _CHUNK_TARGET_BYTES // row_bytes)
+    return (max(1, min(shape[0], block, by_bytes)),) + shape[1:]
 
 
 class RecordedWindowWriter:
@@ -540,6 +590,9 @@ class RecordedWindowWriter:
             inferred.
         record_history_ref: Also store the applied-reference history ring (``history_ref``),
             which ``history_source="reference_partial"`` trains on.
+        dtypes: Per-key storage dtype overrides, e.g. ``{"height_scan": "float16"}``. Applies
+            to this writer only -- the module-level table is left alone so existing writers
+            keep their exact output.
     """
 
     def __init__(
@@ -548,11 +601,24 @@ class RecordedWindowWriter:
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
         tag_distractors: bool = False, tag_families: bool = False,
         tag_clip_index: bool = False, record_history_ref: bool = False,
+        dtypes: dict[str, str] | None = None,
     ) -> None:
         import h5py
 
         self.path = str(path)
         self.num_windows = int(num_windows)
+        # Per-key dtype override, NOT a change to the module-level _WINDOW_DTYPES: re-typing
+        # that table would silently change every existing writer's output. The motivating case
+        # is a dense height scan, where float16 halves both the file and the dataset's RAM and
+        # its 1 mm quantisation is 25x finer than the 0.025 m grid cell -- and, measured, lzf
+        # holds ~39x on f16 sensor data where it collapses to ~1.7x on f32 with mantissa jitter.
+        self._dtypes = dict(_WINDOW_DTYPES)
+        for key, dtype in (dtypes or {}).items():
+            if key not in self._dtypes:
+                raise KeyError(
+                    f"dtype override for unknown window array {key!r}; "
+                    f"known: {sorted(self._dtypes)}")
+            self._dtypes[key] = str(dtype)
         shapes: dict[str, tuple[int, ...]] = {
             "history_state": (num_windows, history_len, node_dim),
             "ref_future": (num_windows, future_len, node_dim),
@@ -590,9 +656,11 @@ class RecordedWindowWriter:
         self._keys = list(shapes)
         self._f = h5py.File(self.path, "w")
         for key, shape in shapes.items():
+            dtype = self._dtypes[key]
             self._f.create_dataset(
-                key, shape=shape, dtype=_WINDOW_DTYPES[key],
-                chunks=_window_chunk(shape), compression=compression,
+                key, shape=shape, dtype=dtype,
+                chunks=_window_chunk(shape, itemsize=np.dtype(dtype).itemsize),
+                compression=compression,
             )
         # RecordingMeta as JSON attrs (reconstructed by load_recorded_windows).
         for k, v in asdict(meta).items():
@@ -614,7 +682,7 @@ class RecordedWindowWriter:
         end = start + take
         for key in self._keys:
             arr = np.asarray(batch[key])[:take]
-            self._f[key][start:end] = arr.astype(_WINDOW_DTYPES[key], copy=False)
+            self._f[key][start:end] = arr.astype(self._dtypes[key], copy=False)
         self._written = end
         return take
 
@@ -638,22 +706,86 @@ class RecordedWindowWriter:
         self.close()
 
 
-def load_recorded_windows(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]:
+#: Every per-window array a recording can hold, in declaration order. The public name for
+#: ``_WINDOW_DTYPES``' keys, so a caller can name the subset it needs without reaching into
+#: the dtype table.
+WINDOW_ARRAY_KEYS: tuple[str, ...] = tuple(_WINDOW_DTYPES)
+
+#: Per-window arrays small enough to load in full just to DECIDE what else to load: the
+#: episode split, the family/distractor filters and the library join all read only these.
+#: Everything absent from this set is a per-node or per-pixel array whose cost is the reason
+#: the two-pass load exists.
+WINDOW_INDEX_KEYS: tuple[str, ...] = (
+    "episode_id", "clip_id", "clip_step", "env_id", "is_distractor", "clip_family",
+)
+
+
+def read_recording_meta(path: str) -> tuple[RecordingMeta, int]:
+    """The metadata and window count of a windowed recording, reading NO array data.
+
+    Args:
+        path: Recording ``.h5``.
+
+    Returns:
+        ``(meta, num_windows)``.
+    """
+    import h5py
+
+    with h5py.File(str(path), "r") as f:
+        n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+        raw_attrs = {k: json.loads(v) for k, v in f.attrs.items()
+                     if k not in ("num_windows", "num_windows_written")}
+    field_names = {fld.name for fld in fields(RecordingMeta)}
+    return RecordingMeta(**{k: v for k, v in raw_attrs.items() if k in field_names}), n
+
+
+def load_recorded_windows(
+    path: str, keys: Sequence[str] | None = None, rows: np.ndarray | None = None
+) -> tuple[dict[str, np.ndarray], RecordingMeta]:
     """Load a windowed recording written by :class:`RecordedWindowWriter`.
 
     Returns ``(data, meta)`` where ``data`` holds the pre-formed window arrays
     (``history_state``, ``ref_future``, and -- when present -- ``height_scan``,
     ``cmd_future``, plus ``episode_id``), each trimmed to ``num_windows_written``.
     ``meta`` is reconstructed from the JSON root attrs.
+
+    Args:
+        path: Recording ``.h5``.
+        keys: Only load these arrays (missing ones are skipped). ``None`` loads everything.
+            The motivating case is exteroception: a recording carries BOTH the height scan and
+            the depth images so one file can train either generator, but a given run reads
+            exactly one of them -- and on a dense scan the unused array is the largest thing in
+            the file.
+        rows: Only load these window indices. ``None`` loads all of them. Combined with
+            ``keys`` this is what lets a run hold just its own split of just its own arrays,
+            rather than every window of every array and then discarding most of it.
+
+    Returns:
+        ``(data, meta)``.
     """
     import h5py
 
     data: dict[str, np.ndarray] = {}
+    wanted = None if keys is None else set(keys)
     with h5py.File(str(path), "r") as f:
         n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+        if rows is not None:
+            # h5py fancy indexing requires STRICTLY increasing indices -- not merely sorted,
+            # so a repeated row is rejected too. Read the sorted unique set and expand it back
+            # through the inverse map, which restores the caller's order and any duplicates.
+            take = np.asarray(rows, dtype=np.int64)
+            if take.size and (take.min() < 0 or take.max() >= n):
+                raise IndexError(
+                    f"row index out of range for {path}: got [{take.min()}, {take.max()}] "
+                    f"with {n} windows written.")
+            sorted_take, inverse = np.unique(take, return_inverse=True)
         for key in _WINDOW_DTYPES:
-            if key in f:
+            if key not in f or (wanted is not None and key not in wanted):
+                continue
+            if rows is None:
                 data[key] = f[key][:n]
+            else:
+                data[key] = f[key][sorted_take][inverse]
         raw_attrs = {k: json.loads(v) for k, v in f.attrs.items()
                      if k not in ("num_windows", "num_windows_written")}
     field_names = {fld.name for fld in fields(RecordingMeta)}

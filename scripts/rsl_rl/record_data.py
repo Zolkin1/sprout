@@ -40,7 +40,6 @@ from packaging import version
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.assets import retrieve_file_path
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
@@ -166,6 +165,25 @@ parser.add_argument(
          "Costs rays: the pass is ~W*H/780 times the policy pair's per-step depth cost, and "
          "the 'depth' dataset scales the same way (a 200k-window recording is 1.25 GB at "
          "30x26 and 5 GB at 60x52), so pick this before recording rather than after.",
+)
+parser.add_argument(
+    "--fm_height_scan", type=str, default="",
+    help="'SXxSY@RES' to give the GENERATOR its own dense height scanner, e.g. '3.0x3.0@0.025'. "
+         "Adds a SECOND scanner on the same mount and alignment as the policy's, robot-centred, "
+         "sampled on this grid, and the recorded 'height_scan' array plus its geometry contract "
+         "then describe THAT scanner. The policy's 176-ray scanner is untouched -- it has to be, "
+         "since the depth teacher's critic observes it and a changed width makes the checkpoint "
+         "unloadable. PRIVILEGED: an exact noise-free ground-truth map that no deployment can "
+         "reproduce, so the ONNX/MuJoCo/hardware paths refuse a recording made with it. Costs "
+         "rays and disk: 3.0x3.0@0.025 is 14641 rays (83x the policy's) and 57 KiB/window f32, "
+         "so pair it with --fm_scan_float16.",
+)
+parser.add_argument(
+    "--fm_scan_float16", action="store_true", default=False,
+    help="Store the 'height_scan' array as float16. Halves the file and the training-time "
+         "dataset RAM; 1 mm quantisation is 25x finer than a 0.025 m grid cell, and lzf "
+         "compresses f16 sensor data far better than f32 (whose low mantissa bits are noise). "
+         "Recommended whenever --fm_height_scan is used at a dense grid.",
 )
 parser.add_argument(
     "--clip_device", type=str, default=None,
@@ -685,10 +703,12 @@ def collect_pairs(
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
     # Height scan (the FM's height-conditioning token), captured when the recording task
-    # has a height_scanner sensor active (e.g. G1-teacher-clf-terrain-play). Same mdp.height_scan
-    # used by the FM deploy + (later) the RL obs term, so record/train/deploy stay in sync.
-    has_scan = ("height_scanner" in env.unwrapped.scene.sensors
-                and not args_cli.skip_height_scan)
+    # has a height scanner active (e.g. G1-teacher-clf-terrain-play). Resolved through
+    # mdp.fm_scan_sensor, which prefers the GENERATOR's dense scanner when --fm_height_scan
+    # added one and otherwise returns the policy's -- i.e. exactly the sensor this line used to
+    # name, so a run that does not opt in is unchanged.
+    scan_sensor = None if args_cli.skip_height_scan else mdp.fm_scan_sensor(env.unwrapped)
+    has_scan = scan_sensor is not None
     # Depth cameras (the deployable FM exteroception signal). Recorded ALONGSIDE the scan
     # whenever the task has depth observation terms, so ONE recording can train either FM
     # and the choice is made at FM-train time via cfg.extero_source.
@@ -781,7 +801,7 @@ def collect_pairs(
         # [N, K]); the dataset picks the snap-row scan as the FM height token.
         if has_scan:
             buf["height_scan"].append(
-                mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).detach().cpu().clone()
+                mdp.scan_obs_stack(env.unwrapped, scan_sensor)[:, 0].detach().cpu().clone()
             )
         # Depth at the same pre-step moment, one token row per camera ([N, T, H*W]),
         # normalised by each camera's own obs-term params.
@@ -924,8 +944,9 @@ def collect_windows(
     device = env.unwrapped.device
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
-    has_scan = ("height_scanner" in env.unwrapped.scene.sensors
-                and not args_cli.skip_height_scan)
+    # The generator's dense scanner when --fm_height_scan added one, else the policy's.
+    scan_sensor = None if args_cli.skip_height_scan else mdp.fm_scan_sensor(env.unwrapped)
+    has_scan = scan_sensor is not None
     has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped,
                                               mdp.fm_depth_groups(env.unwrapped)))
 
@@ -1062,7 +1083,7 @@ def collect_windows(
             # identical instances this window sat on.
             batch["env_id"] = idx.to(torch.int32).cpu().numpy()
             if has_scan:
-                scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
+                scan = mdp.scan_obs_stack(env.unwrapped, scan_sensor)[:, 0]  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()
             if has_depth:
                 dep = mdp.depth_obs_stack(
@@ -1182,6 +1203,24 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     f"--fm_depth_resolution={args_cli.fm_depth_resolution!r}; expected 'WxH'."
                 )
             add_fm_depth_pair(env_cfg, int(spec[0]), int(spec[1]))
+
+        # Same story for the generator's own dense height scanner: DECLARED here, and for the
+        # same reason -- no FM artifact exists yet to derive it from.
+        if args_cli.fm_height_scan.strip():
+            from robot_rl.tasks.manager_based.robot_rl.g1.g1_fm_scan_env_cfg import (
+                add_fm_height_scan,
+            )
+            text = args_cli.fm_height_scan.strip()
+            try:
+                extents, _, res = text.partition("@")
+                sx, sy = (float(v) for v in extents.replace("x", ",").split(","))
+                resolution = float(res)
+            except ValueError as exc:
+                raise ValueError(
+                    f"--fm_height_scan={text!r}; expected 'SXxSY@RES' in metres, e.g. "
+                    "'3.0x3.0@0.025'."
+                ) from exc
+            add_fm_height_scan(env_cfg, size=(sx, sy), resolution=resolution)
 
         # Hold the clip library off-GPU when large (auto: cpu for >1 GB libs, which
         # OOM a small card at scene init). Explicit --clip_device overrides.
@@ -1330,25 +1369,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "clip-tracking task exposing get_future_world_base + a command velocity, "
                     "and do not pass --no_ref_future."
                 )
-            if ("height_scanner" not in env.unwrapped.scene.sensors
-                    and not args_cli.skip_height_scan
-                    and not mdp.find_depth_obs_terms(
-                        env.unwrapped, mdp.fm_depth_groups(env.unwrapped))):
+            # 0 makes RecordedWindowWriter omit the dataset entirely. This MUST agree with
+            # collect_windows' own `has_scan`, which is why both go through the same resolver:
+            # the writer accepts only keys it declared, so declaring height_scan while the loop
+            # never fills it is a KeyError on the first emitted batch.
+            _scan_sensor = (None if args_cli.skip_height_scan
+                            else mdp.fm_scan_sensor(env.unwrapped))
+            if _scan_sensor is None and not mdp.find_depth_obs_terms(
+                    env.unwrapped, mdp.fm_depth_groups(env.unwrapped)):
                 raise ValueError(
-                    "--num_windows needs SOME exteroception: a height_scanner sensor, depth obs "
+                    "--num_windows needs SOME exteroception: a height scanner, depth obs "
                     "terms, or --skip_height_scan on a depth task. Record on a task that has "
                     "one (e.g. G1-teacher-clf-terrain-depth)."
                 )
             H = int(args_cli.history_len)
             node_dim = int(sum(meta.state_term_dims))
-            # 0 makes RecordedWindowWriter omit the dataset entirely. This MUST agree with
-            # collect_windows' own `has_scan`, which is why both read the same two conditions:
-            # the writer accepts only keys it declared, so declaring height_scan while the loop
-            # never fills it is a KeyError on the first emitted batch.
-            _rec_scan = ("height_scanner" in env.unwrapped.scene.sensors
-                         and not args_cli.skip_height_scan)
-            K = (int(mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).shape[1])
-                 if _rec_scan else 0)
+            K = (int(mdp.scan_obs_stack(env.unwrapped, _scan_sensor).shape[-1])
+                 if _scan_sensor is not None else 0)
             cmd_dim = int(
                 ref_cmd.get_future_command_velocity(
                     torch.arange(1, device=env.unwrapped.device)
@@ -1366,6 +1403,25 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             meta.format = "windowed_h5"
             meta.history_len = H
             meta.height_scan_dim = K
+            # The scan's GEOMETRY, not just its ray count: a convolutional encoder needs the
+            # (height, width) fold, and num_rays cannot tell a grid from its transpose. Scoped
+            # to the sensor actually recorded, so a depth task's untouched 176-ray critic
+            # scanner is not described alongside the generator's dense one.
+            if _scan_sensor is not None:
+                meta.height_scan_spec = mdp.height_scan_specs(env.unwrapped, _scan_sensor)
+                _spec = meta.height_scan_spec[0]
+                print(f"[INFO] height scan from {_scan_sensor!r}: "
+                      f"{_spec['size'][0]}x{_spec['size'][1]} m @ {_spec['resolution']} m -> "
+                      f"fold ({_spec['height']}, {_spec['width']}) = {K} rays"
+                      + (" [PRIVILEGED: not deployable]" if _spec["privileged"] else ""))
+                # Noise-free BY CONSTRUCTION, and this records the fact so the FM dataset does
+                # not have to be told twice. Every corruption route is provably absent: the
+                # reading goes through the raw obs function (so the observation manager's noise
+                # and clip never run), height_scan_specs has already refused any drift range on
+                # a privileged sensor, and add_fm_height_scan has already refused an event term
+                # that names either scanner. Depth's own flag is the opposite polarity and is
+                # gated on extero_source == "depth", so a scan run falls through it entirely.
+                meta.extero_noise_free = True
             # content_sha256 stays empty for the streamed format (the whole dataset is
             # never in RAM to hash); sha256_file(<.h5>) identifies the file if needed.
             out_path = unique_output_path(out_dir, prefix="recorded", ext=".h5")
@@ -1389,6 +1445,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # `history_source=reference_partial` a train-time A/B, and its absence
                 # unambiguously means "this recording predates the mode".
                 record_history_ref=True,
+                # Opt-in f16 for the scan only. At a dense grid this halves both the file and
+                # the training-time dataset RAM, and 1 mm quantisation is far below the grid
+                # cell -- but it is never the default, so the depth baseline's arrays stay
+                # bit-identical and the A/B is not confounded by a storage change.
+                dtypes=({"height_scan": "float16"} if args_cli.fm_scan_float16 else None),
             ) as writer:
                 n_written = collect_windows(
                     env, policy, policy_nn, obs, num_records, H, args_cli.stochastic,
@@ -1440,6 +1501,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         if data.get("height_scan") is not None:
             meta.height_scan_dim = int(data["height_scan"].shape[1])
+            _npz_scan = mdp.fm_scan_sensor(env.unwrapped)
+            if _npz_scan is not None:
+                meta.height_scan_spec = mdp.height_scan_specs(env.unwrapped, _npz_scan)
+                meta.extero_noise_free = True
             print(f"[INFO] Recorded height_scan: {data['height_scan'].shape} "
                   f"(K={meta.height_scan_dim} rays) -- the FM height-conditioning token.")
 

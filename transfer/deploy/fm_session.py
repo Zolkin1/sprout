@@ -75,6 +75,13 @@ class FmContext:
     rather than a reordered vector -- every tensor the right size, every kernel reading the
     wrong neighbourhood. Empty for a flat-MLP graph (where pixel order genuinely does not
     matter) or one exported before the field existed."""
+    extero_clip: float | None = None
+    """Clip band this graph was TRAINED under, or ``None`` for the per-source default.
+
+    Travels in ``fm_meta`` because a live reading clamped harder (or looser) than the
+    training data is silently a differently-bounded sensor. Absent in a graph exported
+    before the field, where the default is what it used.
+    """
     extero_tokens_per_sensor: int = 1
     """Transformer tokens one reading becomes (the CNN grid's cell count; 1 for the MLP)."""
     fm_snap_every: int | None = None
@@ -209,6 +216,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         extero_encoder=str(m.get("extero_encoder", "mlp")),
         extero_image_hw=[(int(h), int(w)) for h, w in (m.get("extero_image_hw") or [])],
         extero_tokens_per_sensor=int(m.get("extero_tokens_per_sensor", 1)),
+        extero_clip=(None if m.get("extero_clip") is None else float(m["extero_clip"])),
         fm_snap_every=(int(m["fm_snap_every"]) if m.get("fm_snap_every") else None),
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
         has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),
@@ -278,7 +286,7 @@ def build_extero_tokens(ctx: FmContext, values: np.ndarray) -> np.ndarray:
     # Missed rays / bad sensor reads arrive as +/-inf or NaN; the fm.onnx graph folds in
     # the normalization, so a non-finite value here would poison it. The band is
     # per-source: metres for the scan, normalised units for depth.
-    return sanitize_extero_np(flat, ctx.extero_source)
+    return sanitize_extero_np(flat, ctx.extero_source, clip=ctx.extero_clip)
 
 
 def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:

@@ -38,6 +38,7 @@ history distributions. ``cfg.null_cond_prob`` and the per-channel history noise
 
 from __future__ import annotations
 
+import json
 from typing import Any, Sequence
 
 
@@ -63,12 +64,166 @@ from .window import (
 #: weight rather than letting it index columns that are not there.
 _LOSS_TERM_BLOCKS: dict[str, tuple[str, ...]] = {
     "vel_consistency_weight": ("base_pose", "base_vel"),
-    "accel_consistency_weight": ("base_vel",),
     "joint_vel_consistency_weight": ("joint_pos", "joint_vel"),
     "fk_pose_weight": ("joint_pos", "ee_pos"),
     "body_pose_root_weight": ("joint_pos",),
     "body_pose_world_weight": ("joint_pos", "base_pose"),
 }
+
+
+#: Which ``RecordingMeta`` field carries each source's sensor contract. Both state
+#: ``height``/``width``, so one image-shape resolver serves both.
+_EXTERO_SPEC_FIELD: dict[str, str] = {
+    "depth": "depth_camera_spec",
+    "height_scan": "height_scan_spec",
+}
+
+
+def _check_scan_grid_closes(entry: dict, sensor_dim: int) -> None:
+    """Require a scan spec's PHYSICAL fields to reproduce its stated fold.
+
+    This is the check ``extero_sensor_dim`` cannot make. A scan spec states its grid three
+    independent ways -- ``resolution`` + ``size``, ``(height, width)``, and ``num_rays`` -- so
+    recomputing the fold from the physical pair and comparing catches a wrong extent or
+    resolution, which would otherwise sail through every width-based assertion and hand the
+    convolution a correctly-shaped image of the wrong geometry.
+
+    A no-op for a depth spec, which has no ``resolution``/``size`` to recompute from (its
+    equivalent guarantee is the pinhole intrinsics agreement on the deploy path).
+
+    Args:
+        entry: One sensor's spec dict.
+        sensor_dim: Recorded row width for that sensor.
+
+    Raises:
+        ValueError: If the physical fields do not reproduce the stated fold or ray count.
+    """
+    if "resolution" not in entry or "size" not in entry:
+        return
+    from .transforms import scan_grid_shape
+
+    stated = (int(entry["height"]), int(entry["width"]))
+    recomputed = scan_grid_shape(
+        float(entry["resolution"]), entry["size"], str(entry.get("ordering", "xy")))
+    if recomputed != stated:
+        raise ValueError(
+            f"scan '{entry.get('sensor')}' states a {stated[0]}x{stated[1]} fold, but "
+            f"{entry['size']} m at {entry['resolution']} m with ordering "
+            f"{entry.get('ordering', 'xy')!r} is {recomputed[0]}x{recomputed[1]}. The "
+            "recording's geometry and its fold disagree, so one of them is wrong and the "
+            "image would be built from the wrong one."
+        )
+    if "num_rays" in entry and int(entry["num_rays"]) != sensor_dim:
+        raise ValueError(
+            f"scan '{entry.get('sensor')}' states num_rays={entry['num_rays']} but the "
+            f"recorded row is {sensor_dim} wide."
+        )
+
+
+def declared_state_scales(
+    cfg: FlowMatchingConfig, num_joints: int, num_extra_frames: int,
+    blocks: Sequence[str] | None,
+) -> torch.Tensor | None:
+    """Per-channel declared scale over one window node, ``0`` where the block stays FITTED.
+
+    Expanded through :func:`expand_window_blocks`, the same helper the noise and observation
+    scale tables use, so a layout or block-selection change cannot land here and not there.
+
+    Args:
+        cfg: Training config (the ``state_scale_*`` fields are read).
+        num_joints: ``nj``.
+        num_extra_frames: ``K``.
+        blocks: The window's block selection.
+
+    Returns:
+        ``(D,)`` scales, or ``None`` when no block declares one.
+
+    Raises:
+        ValueError: On a non-positive declared scale, which would divide by zero or flip sign.
+    """
+    table = {
+        "base_pos": cfg.state_scale_base_pos,
+        # Never declared: the rot6d block is already exempt from standardization.
+        "base_ori": None,
+        "base_lin_vel": cfg.state_scale_base_lin_vel,
+        "base_ang_vel": cfg.state_scale_base_ang_vel,
+        "joint_pos": cfg.state_scale_joint_pos,
+        "joint_vel": cfg.state_scale_joint_vel,
+        "ee_pos": cfg.state_scale_ee_pos,
+    }
+    for key, value in table.items():
+        if value is not None and float(value) < 0.0:
+            raise ValueError(
+                f"state_scale_{key}={value} must be positive, or 0/None to fit that block.")
+    # 0 and None both mean "fit this block per channel" -- 0 so the CLI has an off switch.
+    zeroed = {k: (0.0 if v is None else float(v)) for k, v in table.items()}
+    if not any(v > 0.0 for v in zeroed.values()):
+        return None
+    return torch.tensor(
+        expand_window_blocks(num_joints, num_extra_frames, zeroed, blocks), dtype=torch.float32)
+
+
+def apply_declared_scales(normalizer: Normalizer, declared: torch.Tensor | None) -> Normalizer:
+    """Override the fitted statistics wherever a block declares its own scale.
+
+    A declared channel becomes ``mean = 0, std = scale``; the rest keep what was fitted. The
+    normalizer's SHAPE is unchanged, so the checkpoint, the folded ONNX buffers and the whole
+    deploy path are identical either way -- only the numbers move.
+
+    Args:
+        normalizer: The freshly fitted state normalizer.
+        declared: ``(D,)`` from :func:`declared_state_scales`, or ``None``.
+
+    Returns:
+        The same normalizer when nothing is declared, else a new one.
+    """
+    if declared is None:
+        return normalizer
+    sel = declared > 0
+    return Normalizer(
+        torch.where(sel, torch.zeros_like(normalizer.mean), normalizer.mean),
+        torch.where(sel, declared.to(normalizer.std.dtype), normalizer.std),
+        normalizer.standardize_mask.clone(),
+    )
+
+
+def _yaw_from_quat_xyzw(quat: torch.Tensor) -> torch.Tensor:
+    """Heading angle (radians) of an ``(..., 4)`` xyzw quaternion.
+
+    The same extraction ``yaw_quat`` performs, as a scalar rather than a rotation, so the
+    angle between the terrain's mask frame and the window's own frame can be taken directly.
+    """
+    x, y, z, w = quat[..., 0], quat[..., 1], quat[..., 2], quat[..., 3]
+    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+
+
+def _resolve_extero_coord_extent(spec: list[dict] | None) -> list[float] | None:
+    """The metric ``[size_x, size_y]`` of a robot-centred sensor grid, or ``None``.
+
+    Present only for a ray-cast grid whose pixels are ground POINTS at known offsets from the
+    robot; a depth pixel is a ray and has no such planar coordinate, so depth returns ``None``
+    and its encoder is unchanged.
+
+    Args:
+        spec: The resolved sensor contract, or ``None``.
+
+    Returns:
+        ``[size_x, size_y]`` in metres, or ``None``.
+
+    Raises:
+        ValueError: If several sensors disagree on the extent -- they share one coordinate
+            grid, so there is no single answer to give the encoder.
+    """
+    if not spec or "size" not in spec[0]:
+        return None
+    extents = {(float(s["size"][0]), float(s["size"][1])) for s in spec}
+    if len(extents) != 1:
+        raise ValueError(
+            f"sensors state different metric extents {sorted(extents)}; they share one "
+            "coordinate grid in the encoder, so give them one geometry."
+        )
+    sx, sy = extents.pop()
+    return [sx, sy]
 
 
 def _pool_extero_statistics(
@@ -102,12 +257,25 @@ def _pool_extero_statistics(
     Raises:
         ValueError: On an unrecognised ``extero_norm_mode``.
     """
+    cfg.check_extero_norm_mode()
     mode = str(cfg.extero_norm_mode)
     if mode == "per_element":
         return normalizer
-    if mode != "per_sensor":
-        raise ValueError(
-            f"extero_norm_mode={mode!r} is not one of ['per_element', 'per_sensor']."
+    if mode == "metric":
+        # A FIXED declared affine, discarding the fit entirely. The stored statistics keep
+        # their (T*K,) shape so the checkpoint, the folded ONNX normalization and the deploy
+        # path are untouched -- only the numbers change, and now they are the same numbers for
+        # every recording of the same world rather than a property of this training set.
+        offset = float(cfg.extero_norm_offset)
+        scale = float(cfg.extero_norm_scale)
+        width = n_sensors * sensor_dim
+        print(f"[fm-data] extero_norm_mode=metric: DECLARED affine (x - {offset:g}) / "
+              f"{scale:g}, no fitting. The network input is metres/{scale:g}, identical "
+              "across recordings.")
+        return Normalizer(
+            torch.full((width,), offset, dtype=normalizer.mean.dtype),
+            torch.full((width,), scale, dtype=normalizer.std.dtype),
+            normalizer.standardize_mask.clone(),
         )
     mean = normalizer.mean.reshape(n_sensors, sensor_dim)
     std = normalizer.std.reshape(n_sensors, sensor_dim)
@@ -380,7 +548,26 @@ class FutureStateDataset(Dataset):
                       "carries the sim's depth DR (extero_corrupted=True), so the train-time "
                       "noise would double-count it.")
                 cfg.noise_depth = 0.0
+        # The complementary gate, and the one the depth-shaped flag above cannot cover: a
+        # recording whose exteroception is noise-free BY CONSTRUCTION must not have train-time
+        # noise added to it. Without this a privileged scan run silently keeps
+        # noise_height_scan=0.1 m -- four grid cells of vertical error on a 0.025 m grid, i.e.
+        # the vertical channel quantised coarser than the step edge being localised, which is
+        # incoherent next to a dense grid and quietly defeats the whole experiment.
+        #
+        # Written on the FIELD rather than through the `noise_extero` property, which is
+        # read-only, and printed either way so a run's log states the amplitude it used.
+        if getattr(meta, "extero_noise_free", False):
+            field = ("noise_height_scan" if cfg.extero_source == "height_scan"
+                     else "noise_depth")
+            if float(getattr(cfg, field)) > 0.0:
+                print(f"[fm-data] {field}={getattr(cfg, field)} -> 0.0: this recording's "
+                      "exteroception is noise-free BY CONSTRUCTION (extero_noise_free=True: no "
+                      "sensor drift, no DR event, read through the raw obs function), so adding "
+                      "noise would corrupt a signal recorded precisely to be exact.")
+                setattr(cfg, field, 0.0)
         cfg.check_extero_source()
+        cfg.check_extero_norm_mode()
         if data.get(cfg.extero_source) is None:
             hint = (
                 "a height_scanner sensor active (e.g. --task G1-teacher-clf-record-play)"
@@ -545,25 +732,53 @@ class FutureStateDataset(Dataset):
         # ``height_scan`` (P|W, K) -- one sensor -- or ``depth`` (P|W, T, K) with one row
         # per camera, so the sensor count and per-sensor width both come from the array's
         # shape rather than being configured.
-        hs = torch.from_numpy(np.ascontiguousarray(data[cfg.extero_source])).float()
-        if hs.ndim == 2:
-            hs = hs.unsqueeze(1)                                   # (P|W, 1, K)
-        n_sensors, sensor_dim = int(hs.shape[1]), int(hs.shape[2])
-        # Sanitize before the normalizer fit so a non-finite entry cannot poison the
-        # per-dimension mean and yield a NaN loss (matches the deploy token builder).
-        hs = sanitize_extero(hs, cfg.extero_source)
-        # Flattened to (rows, T*K): the normalizer, the noise and __getitem__ all work on
-        # the flat width, and the model reshapes back to (B, T, K) internally.
+        raw_extero = data[cfg.extero_source]
+        n_sensors = int(raw_extero.shape[1]) if raw_extero.ndim == 3 else 1
+        sensor_dim = int(raw_extero.shape[-1])
+        # SELECT before sanitizing, and sanitize IN PLACE. The naive order (read whole ->
+        # nan_to_num -> clamp -> fancy-index) holds up to four simultaneous full-size copies of
+        # the array, which at a dense scan is tens of GB before training starts. Here the fancy
+        # index is the only copy and the clamp is applied to it.
+        rows = sel if windowed else snap_rows
+        hs = torch.from_numpy(
+            np.ascontiguousarray(raw_extero[rows.numpy() if torch.is_tensor(rows) else rows])
+        ).float()
         hs = hs.reshape(hs.shape[0], n_sensors * sensor_dim)
-        self.extero = (hs[sel] if windowed else hs[snap_rows]).contiguous()  # (Nw, T*K)
+        # Sanitize before the normalizer fit so a non-finite entry cannot poison the
+        # per-dimension mean and yield a NaN loss (matches the deploy token builder). The band
+        # is the config's, so a run can widen it past the per-source default -- a 1 m band
+        # destroys ~11% of a 3 m scan on this terrain, concentrated downrange.
+        band = cfg.resolve_extero_clip()
+        # MEASURE before clamping, and report. The band is the single most consequential
+        # unmeasured constant on this path: at the scan's historical 1.0 m default a 3 m window
+        # over stairs loses ~11% of its pixels, concentrated downrange where the planning
+        # happens, and nothing warned. A run's log should state what its band cost it.
+        finite = torch.isfinite(hs)
+        n_total = hs.numel()
+        n_miss = int((~finite).sum())
+        vals = hs[finite]
+        n_sat = int((vals.abs() > band).sum())
+        if n_total:
+            q = torch.tensor([0.001, 0.5, 0.999])
+            lo, mid, hi = (torch.quantile(vals.float(), q).tolist()
+                           if vals.numel() else (float("nan"),) * 3)
+            print(f"[fm-data] extero clip band +-{band:g}: "
+                  f"{100.0 * n_sat / n_total:.2f}% of entries saturated, "
+                  f"{100.0 * n_miss / n_total:.2f}% missed rays (-> +{band:g}), "
+                  f"finite range [{float(vals.min()) if vals.numel() else float('nan'):.3f}, "
+                  f"{float(vals.max()) if vals.numel() else float('nan'):.3f}] "
+                  f"(p0.1 {lo:.3f} / p50 {mid:.3f} / p99.9 {hi:.3f}).")
+        torch.nan_to_num_(hs, nan=0.0, posinf=band, neginf=band)
+        hs.clamp_(-band, band)
+        self.extero = hs                                            # (Nw, T*K)
+        self.extero_clip = band
         self.extero_sensor_dim = sensor_dim
         self.extero_sensor_count = n_sensors
         cfg.extero_sensor_dim = sensor_dim
         cfg.extero_sensor_count = n_sensors
         # Contract of the sensor behind those readings, carried from the recording so the
-        # trained checkpoint (and the ONNX exported from it) states which cameras it
-        # conditions on. Only depth has one; the height scan's geometry travels in the
-        # tracker's ``height_scan_spec``.
+        # trained checkpoint (and the ONNX exported from it) states what it conditions on --
+        # ``depth_camera_spec`` for depth, ``height_scan_spec`` for the scan.
         self.extero_spec = self._resolve_extero_spec(cfg, meta, n_sensors, sensor_dim)
         # The per-sensor IMAGE SHAPE, derived from that contract rather than configured --
         # the flat array cannot state it, and a convolutional encoder cannot fold without
@@ -572,14 +787,80 @@ class FutureStateDataset(Dataset):
         self.extero_image_hw = self._resolve_extero_image_hw(self.extero_spec, sensor_dim)
         cfg.extero_image_hw = ([list(hw) for hw in self.extero_image_hw]
                                if self.extero_image_hw else None)
+        # And the METRIC extents, for a grid whose pixels are ground points rather than rays.
+        # This is what lets the encoder give the convolution each pixel's (x, y) offset from
+        # the robot in metres -- the positional information a translation-equivariant kernel
+        # structurally cannot have, and the whole quantity the generator fails to register.
+        # Derived from the same spec; ``None`` for depth, whose pixels have no planar coordinate.
+        cfg.extero_coord_extent_m = _resolve_extero_coord_extent(self.extero_spec)
+        if cfg.extero_coord_extent_m is not None:
+            cfg.extero_grid_ordering = str(self.extero_spec[0].get("ordering", "xy"))
         # Resolve "auto" HERE, where the source is finally known, and write it back so the
         # checkpoint says which encoder it trained -- ``from_dict`` must never re-resolve it.
         cfg.extero_encoder = cfg.resolve_extero_encoder()
         cfg.check_extero_encoder()
+        # Where a MISSED ray lands after sanitize + normalization, so the encoder can mark it
+        # invalid instead of letting a hole share a number with real geometry. Only computable
+        # under the declared affine, where the sentinel is a known constant rather than a
+        # function of the fitted statistics.
+        cfg.extero_miss_sentinel = (
+            (band - float(cfg.extero_norm_offset)) / float(cfg.extero_norm_scale)
+            if (cfg.extero_norm_mode == "metric" and cfg.extero_source == "height_scan")
+            else None
+        )
 
         # Reference pose per window (the snap-step robot base), raw for eval/denorm.
         self.p_ref = p_anchor.contiguous()
         self.q_ref = q_anchor.contiguous()
+
+        # -- pinned-axis loss weighting: the per-node anchor mask, and the terrain frame it is
+        # named in, expressed RELATIVE to this window's own frame --
+        #
+        # Stored compactly (a uint8 per node plus one angle per window) and expanded into
+        # channel weights inside the loss. A dense (Nw, F, D) weight would be 2 GB at 200k
+        # windows for information that is one byte per node.
+        self.anchor_mask = None
+        self.mask_frame_yaw_rel = None
+        weighted = float(cfg.pinned_axis_loss_weight) != 1.0
+        if weighted or cfg.pinned_axis_metrics:
+            if weighted and not windowed:
+                raise ValueError(
+                    "pinned_axis_loss_weight needs the per-window clip index, which only the "
+                    "windowed .h5 recordings carry. Record with --num_windows."
+                )
+            try:
+                if not windowed:
+                    raise ValueError("the per-window clip index needs a windowed recording")
+                n_all = int(np.asarray(data["clip_id"]).shape[0])
+                masks = window_anchor_masks(data, meta, cfg, n_all)[sel]
+                frame_yaw = window_mask_frame_yaw(data, meta, cfg, n_all)[sel]
+            except Exception as exc:
+                # The LOSS cannot silently lose its weighting; a metric can.
+                if weighted:
+                    raise
+                print(f"[fm-data] pinned/free val split OFF: {type(exc).__name__}: {exc}")
+                masks = frame_yaw = None
+        else:
+            masks = frame_yaw = None
+        if masks is not None:
+            # The mask's downrange/lateral axes live in the TERRAIN's frame; the window's x/y
+            # are the snap robot's yaw frame. What the loss needs is the angle between them,
+            # so it is resolved here where both are known rather than assumed to be zero (the
+            # terrain frame is world-aligned in today's libraries, but the ROBOT's heading is
+            # not, so this angle is never trivially zero).
+            snap_yaw = _yaw_from_quat_xyzw(q_anchor)
+            self.anchor_mask = torch.from_numpy(masks.astype(np.int64))       # (Nw, F)
+            self.mask_frame_yaw_rel = (
+                torch.from_numpy(frame_yaw).to(snap_yaw.dtype) - snap_yaw)    # (Nw,)
+            from motion_gen.world_lift import anchor_mask_is_pinned
+            frac = float(anchor_mask_is_pinned(self.anchor_mask).float().mean())
+            how = (f"their pinned root DOFs carry {cfg.pinned_axis_loss_weight:g}x the flow "
+                   "loss (weights renormalized to mean 1, so the loss scale is unchanged)"
+                   if float(cfg.pinned_axis_loss_weight) != 1.0
+                   else "the loss is UNWEIGHTED; the mask is loaded only to report "
+                        "val/flow_mse_masked vs flow_mse_unmasked")
+            print(f"[fm-data] anchor mask: {100.0 * frac:.1f}% of predicted nodes are "
+                  f"terrain-registered; {how}.")
 
         # Strided future command tokens.
         if cmd_dim > 0:
@@ -607,13 +888,34 @@ class FutureStateDataset(Dataset):
             state_mask[bp + 3:bp + 9] = False
         if state_normalizer is None:
             state_normalizer = Normalizer.fit(target.reshape(-1, self.state_dim), state_mask)
+            declared = declared_state_scales(
+                cfg, self.num_joints, self.num_extra_frames, self.blocks)
+            if declared is not None:
+                fitted_std = state_normalizer.std.clone()
+                state_normalizer = apply_declared_scales(state_normalizer, declared)
+                sel = declared > 0
+                print(f"[fm-data] declared state scales on {int(sel.sum())}/{self.state_dim} "
+                      "channels (mean 0, one scale per block) -- the rest stay fitted. "
+                      "Per block, declared scale vs the fitted std it replaces: "
+                      + ", ".join(
+                          f"{name} {float(declared[s.start]):g} vs "
+                          f"[{float(fitted_std[s].min()):.3f},{float(fitted_std[s].max()):.3f}]"
+                          # A block can be ZERO WIDTH (ee_pos with no extra frames), and its
+                          # slice then starts at state_dim -- indexing it would overrun.
+                          for name, s in self.block_slices.items()
+                          if s.stop > s.start and bool(sel[s.start])))
         self.state_normalizer = state_normalizer
 
         if extero_normalizer is None:
-            extero_normalizer = Normalizer.fit(
-                self.extero, torch.ones(self.extero.shape[1], dtype=torch.bool),
-                eps=float(cfg.extero_norm_eps),
-            )
+            width = self.extero.shape[1]
+            mask = torch.ones(width, dtype=torch.bool)
+            if cfg.extero_norm_mode == "metric":
+                # Skip the fit entirely rather than fitting and discarding: on a dense scan
+                # the fit is a full pass over a ~15k-column array whose result is unused.
+                extero_normalizer = Normalizer(torch.zeros(width), torch.ones(width), mask)
+            else:
+                extero_normalizer = Normalizer.fit(
+                    self.extero, mask, eps=float(cfg.extero_norm_eps))
             extero_normalizer = _pool_extero_statistics(
                 extero_normalizer, cfg, n_sensors, sensor_dim
             )
@@ -621,9 +923,33 @@ class FutureStateDataset(Dataset):
 
         if cmd_dim > 0:
             if cmd_normalizer is None:
-                cmd_normalizer = Normalizer.fit(
-                    cmd_strided.reshape(-1, cmd_dim), torch.ones(cmd_dim, dtype=torch.bool)
-                )
+                if cfg.cmd_scale is not None:
+                    scale = [float(v) for v in cfg.cmd_scale]
+                    if len(scale) != cmd_dim:
+                        raise ValueError(
+                            f"cmd_scale has {len(scale)} entries but the command is {cmd_dim} "
+                            "wide; give one scale per channel (vx, vy, wz).")
+                    if any(v <= 0.0 for v in scale):
+                        raise ValueError(f"cmd_scale entries must be positive, got {scale}.")
+                    # Divide by the DESIGNED maximum, mean 0: the command range is a generator
+                    # setting rather than an observed distribution, so this puts it in [-1, 1]
+                    # by construction AND keeps a zero command at zero. Standardizing would
+                    # not: the fitted vx mean is ~1.25 m/s, so "stand still" would arrive as
+                    # a large negative number rather than as nothing.
+                    cmd_normalizer = Normalizer(
+                        torch.zeros(cmd_dim), torch.tensor(scale, dtype=torch.float32),
+                        torch.ones(cmd_dim, dtype=torch.bool))
+                    obs = cmd_strided.reshape(-1, cmd_dim)
+                    frac = (obs.abs() > torch.tensor(scale)).float().mean(0)
+                    print(f"[fm-data] cmd_scale={scale} (declared max, mean 0): "
+                          f"observed max |cmd| "
+                          f"{[round(float(v), 4) for v in obs.abs().max(0).values]}, "
+                          f"fraction outside the scale "
+                          f"{[f'{100 * float(v):.3f}%' for v in frac]}.")
+                else:
+                    cmd_normalizer = Normalizer.fit(
+                        cmd_strided.reshape(-1, cmd_dim), torch.ones(cmd_dim, dtype=torch.bool)
+                    )
             self.cmd_normalizer = cmd_normalizer
             self.cmd_tokens = cmd_normalizer.normalize(cmd_strided).contiguous()
         else:
@@ -633,7 +959,10 @@ class FutureStateDataset(Dataset):
         # Pre-normalize once.
         self.state = state_normalizer.normalize(target)           # (Nw, F, D) target
         self.history = state_normalizer.normalize(history)        # (Nw, N, D) conditioning
-        self.extero_norm_tokens = extero_normalizer.normalize(self.extero)  # (Nw, T*K)
+        # The exteroception is NOT pre-normalized: it is by far the widest array here (a dense
+        # scan is ~15k columns against the state's ~120), so a normalized copy alongside the raw
+        # one doubles the dataset's footprint for an elementwise affine that costs nothing per
+        # item. Applied in __getitem__ instead -- same numbers, same order, one array.
 
         # -- observation noise (train-time augmentation; conditioning tokens only) --
         self.add_noise = bool(add_noise and cfg.obs_noise)
@@ -765,9 +1094,14 @@ class FutureStateDataset(Dataset):
     ) -> list[dict] | None:
         """The sensor contract behind the exteroception readings, validated against them.
 
-        Only the depth source has one: it is the deployable signal, and reproducing it
-        off-sim needs the camera geometry, whereas the height scan's grid already travels
-        in the tracker's ``height_scan_spec``.
+        Each source has its own contract field -- ``depth_camera_spec`` for depth,
+        ``height_scan_spec`` for the scan -- and both state ``height``/``width``, which is what
+        lets one image-shape resolver serve both.
+
+        Absent contract: ``None`` when the resolved encoder is the flat MLP, which keeps every
+        legacy height-scan recording (they carry only a ray count) training exactly as before.
+        A HARD ERROR when the encoder is convolutional, because a bare width cannot say what
+        shape the grid was and a wrong fold is scrambled input at entirely correct sizes.
 
         Args:
             cfg: The training config (its ``extero_source`` selects the sensor).
@@ -776,34 +1110,40 @@ class FutureStateDataset(Dataset):
             sensor_dim: Per-sensor width found in the recorded array.
 
         Returns:
-            The per-camera contract, or ``None`` for the height scan.
+            The per-sensor contract, or ``None``.
 
         Raises:
-            ValueError: If a depth recording carries no camera contract, or if the
-                contract disagrees with the shape of the recorded array.
+            ValueError: If a convolutional run's recording carries no contract, or if the
+                contract disagrees with the shape of the recorded array, or if a scan's three
+                statements of its grid do not close.
         """
-        if cfg.extero_source != "depth":
-            return None
-        spec = getattr(meta, "depth_camera_spec", None)
+        field = _EXTERO_SPEC_FIELD[cfg.extero_source]
+        spec = getattr(meta, field, None)
         if not spec:
+            if cfg.resolve_extero_encoder() != "cnn":
+                return None
             raise ValueError(
-                "extero_source='depth' requires the recording's 'depth_camera_spec' "
-                "(the camera geometry the FM must state at deploy); this recording has "
-                "none. Re-record with scripts/rsl_rl/record_data.py on a depth task."
+                f"extero_encoder='cnn' needs the recording's '{field}' to state the "
+                f"(height, width) fold of its {sensor_dim}-wide rows, and this recording has "
+                "none. A ray/pixel count alone cannot distinguish a grid from its transpose, "
+                "and under a convolution a wrong fold is scrambled input with every tensor the "
+                "right size -- so this is refused rather than guessed. Re-record, or train this "
+                "file with --extero_encoder mlp."
             )
         if len(spec) != n_sensors:
             raise ValueError(
-                f"depth_camera_spec lists {len(spec)} cameras but the recorded depth has "
-                f"{n_sensors} sensor row(s)."
+                f"{field} lists {len(spec)} sensor(s) but the recorded "
+                f"{cfg.extero_source} has {n_sensors} sensor row(s)."
             )
-        for cam in spec:
-            if int(cam["width"]) * int(cam["height"]) != sensor_dim:
+        for entry in spec:
+            if int(entry["width"]) * int(entry["height"]) != sensor_dim:
                 raise ValueError(
-                    f"camera '{cam.get('sensor')}' is {cam['width']}x{cam['height']} "
-                    f"= {int(cam['width']) * int(cam['height'])} pixels but the recorded "
-                    f"depth row is {sensor_dim} wide."
+                    f"sensor '{entry.get('sensor')}' is {entry['width']}x{entry['height']} "
+                    f"= {int(entry['width']) * int(entry['height'])} samples but the recorded "
+                    f"{cfg.extero_source} row is {sensor_dim} wide."
                 )
-        return [dict(cam) for cam in spec]
+            _check_scan_grid_closes(entry, sensor_dim)
+        return [dict(entry) for entry in spec]
 
     @staticmethod
     def _resolve_extero_image_hw(
@@ -870,7 +1210,8 @@ class FutureStateDataset(Dataset):
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         history = self.history[i]
-        extero = self.extero_norm_tokens[i]
+        # Normalized per item rather than held as a second full-width copy (see __init__).
+        extero = self.extero_normalizer.normalize(self.extero[i])
         if self.add_noise:
             history = history + (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
             extero = extero + (torch.rand(self.extero.shape[1]) * 2.0 - 1.0) * self.extero_noise
@@ -881,6 +1222,11 @@ class FutureStateDataset(Dataset):
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
         }
+        if self.anchor_mask is not None:
+            # Compact: one bitmask per predicted node plus one angle. The loss expands these
+            # into channel weights for the batch it is given.
+            item["anchor_mask"] = self.anchor_mask[i]              # (F,) int64
+            item["mask_frame_yaw_rel"] = self.mask_frame_yaw_rel[i]
         if self.cmd_tokens is not None:
             item["cmd_tokens"] = self.cmd_tokens[i]
         return item
@@ -1057,6 +1403,161 @@ def _family_keep_mask(
     print(f"[fm-data] --skip_families {wanted}: dropping {n_drop}/{num_windows} windows "
           f"({100.0 * n_drop / num_windows:.1f}%).")
     return ~drop
+
+
+#: ``(abspath, size, mtime_ns) -> sha256`` for clip libraries verified this process.
+_LIBRARY_SHA_CACHE: dict[tuple, str] = {}
+
+
+def resolve_clip_library(meta: Any, cfg: FlowMatchingConfig, why: str):
+    """Open the clip library the recorded ``clip_id`` indexes into, verifying its identity.
+
+    Shared by every offline join back to the library (transition flags, the per-node anchor
+    mask). Each failure is raised rather than defaulted, because a silent fallback reports a
+    run that used a feature it never actually used.
+
+    Args:
+        meta: Recording metadata (``clip_library_path`` / ``clip_library_sha256``).
+        cfg: Config; ``clip_library_path`` overrides the recorded path.
+        why: Name of the feature needing the join, for the message.
+
+    Returns:
+        The loaded library, with ``anchor_mask`` / ``anchor_mask_t`` / ``clip_len`` present.
+
+    Raises:
+        ValueError: If no path is known, or the library on disk is not the recorded one.
+        FileNotFoundError: If the path does not exist.
+    """
+    import hashlib
+    import os
+
+    path = cfg.clip_library_path or getattr(meta, "clip_library_path", "") or ""
+    if not path:
+        raise ValueError(
+            f"{why} needs the clip library that clip_id indexes into, but the recording "
+            "carries no clip_library_path. Pass --clip_library_path explicitly."
+        )
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"clip library '{path}' (from the recording) does not exist.")
+    want = getattr(meta, "clip_library_sha256", "") or ""
+    if want:
+        # Cached per (path, size, mtime) for the process: the library is multi-GB and both the
+        # train and the val dataset resolve it, so an uncached check hashes ~14 GB per run to
+        # answer the same question twice. Keyed on the stat so a file replaced mid-run is still
+        # re-hashed rather than trusted.
+        st = os.stat(path)
+        key = (os.path.abspath(path), st.st_size, st.st_mtime_ns)
+        got = _LIBRARY_SHA_CACHE.get(key)
+        if got is None:
+            got = hashlib.sha256(open(path, "rb").read()).hexdigest()
+            _LIBRARY_SHA_CACHE[key] = got
+        if got != want:
+            raise ValueError(
+                f"clip library '{path}' has sha256 {got[:12]} but the recording was made "
+                f"against {want[:12]}. Clip ids are positions in ONE library and a "
+                "regenerated library reuses them for different motions, so this join would "
+                "silently mislabel every window."
+            )
+    from motion_gen.clips.clip_io import load_clip_library
+
+    return load_clip_library(path, device="cpu",
+                             keys=["anchor_mask", "anchor_mask_t", "clip_len"])
+
+
+def window_anchor_masks(
+    data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig, num_windows: int
+) -> np.ndarray:
+    """Per-window, per-node anchor bitmask ``[W, F]`` (uint8; bit SET = that DOF is FREE).
+
+    The ground truth for which root DOFs a node's reference is REGISTERED TO THE TERRAIN
+    rather than re-anchored onto the robot -- flat nodes free downrange/lateral/yaw and pin
+    only height, terrain nodes free lateral alone. Joined through the recorded
+    ``clip_id``/``clip_step``, exactly as the transition flags are, so it needs no new
+    recorded array and works on any recording carrying the clip index.
+
+    The clip tail is repeat-last padded, so a node past the clip's real length takes the last
+    real step's mask -- the same convention the reference itself is padded under.
+
+    Args:
+        data: Recorded window arrays; ``clip_id`` and ``clip_step`` are read.
+        meta: Recording metadata; supplies the library path and hash.
+        cfg: Config; ``future_len`` sets the horizon.
+        num_windows: ``W``, for shape validation.
+
+    Returns:
+        ``[W, F]`` uint8 anchor masks.
+
+    Raises:
+        ValueError: If the recording predates ``clip_id``/``clip_step``.
+    """
+    if "clip_id" not in data or "clip_step" not in data:
+        raise ValueError(
+            "the pinned-axis loss weight needs the per-window 'clip_id'/'clip_step' index, "
+            "which this recording predates. Re-record with the current record_data.py."
+        )
+    lib = resolve_clip_library(meta, cfg, "the pinned-axis loss weight")
+    masks = lib.anchor_mask_per_step().numpy()              # (num_clips, T) uint8
+    clip_len = lib.clip_len_or_full().numpy()
+
+    cid = np.asarray(data["clip_id"]).reshape(-1).astype(np.int64)
+    cstep = np.asarray(data["clip_step"]).reshape(-1).astype(np.int64)
+    if cid.shape[0] != num_windows:
+        raise ValueError(f"'clip_id' has {cid.shape[0]} entries but there are {num_windows} "
+                         "windows.")
+    steps = np.minimum(cstep[:, None] + np.arange(int(cfg.future_len))[None, :],
+                       (clip_len[cid] - 1)[:, None])
+    return masks[cid[:, None], steps].astype(np.uint8)      # (W, F)
+
+
+def window_mask_frame_yaw(
+    data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig, num_windows: int
+) -> np.ndarray:
+    """Per-window terrain-frame heading ``[W]`` (radians, world), for the anchor mask's axes.
+
+    The mask's ``downrange`` / ``lateral`` are named in the TERRAIN's frame, not the world's
+    and not the robot's -- which world axes they are is authored per terrain as ``frame_yaw``
+    in the library's manifest. Getting this from the tile rather than assuming ``+x`` is the
+    same correction the mask itself documents: a 90-degree-rotated terrain family once had its
+    traversal axis read as its lateral offset.
+
+    Args:
+        data: Recorded window arrays; ``clip_id`` is read.
+        meta: Recording metadata.
+        cfg: Config.
+        num_windows: ``W``, for shape validation.
+
+    Returns:
+        ``[W]`` float32 world-frame yaw of each window's terrain frame. Zero for clips whose
+        terrain declares none (flat ground has no traversal axis).
+    """
+    import h5py
+
+    path = cfg.clip_library_path or getattr(meta, "clip_library_path", "") or ""
+    cid = np.asarray(data["clip_id"]).reshape(-1).astype(np.int64)
+    with h5py.File(path, "r") as f:
+        terrain_id = f["terrain_id"][:] if "terrain_id" in f else None
+        raw = f.attrs.get("terrain_manifest")
+    yaw_by_terrain: dict[int, float] = {}
+    if raw is not None:
+        manifest = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
+        yaw_by_terrain = {int(m["terrain_id"]): float(m.get("frame_yaw", 0.0))
+                          for m in manifest}
+    if terrain_id is None or not yaw_by_terrain:
+        # Every manifest predating the field was generated under world-axis masking, which is
+        # frame_yaw = 0 -- so this is the correct value, not a fallback.
+        return np.zeros(num_windows, dtype=np.float32)
+    # terrain_id is -1 for a clip on no terrain (flat), which has no traversal axis and no
+    # manifest entry. Indexing a LUT with -1 would silently wrap to the LAST terrain's yaw, so
+    # the lookup is masked rather than relying on the index.
+    tid = terrain_id[cid].astype(np.int64)
+    lut = np.zeros(max(int(terrain_id.max()), 0) + 1, dtype=np.float32)
+    for terrain, yaw in yaw_by_terrain.items():
+        if 0 <= terrain < lut.shape[0]:
+            lut[terrain] = yaw
+    out = np.zeros(num_windows, dtype=np.float32)
+    valid = tid >= 0
+    out[valid] = lut[tid[valid]]
+    return out
 
 
 def transition_window_mask(

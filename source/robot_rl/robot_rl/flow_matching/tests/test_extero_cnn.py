@@ -369,3 +369,121 @@ def test_gradients_reach_every_trunk_and_the_slots():
     enc_set(torch.randn(2, 2, _H * _W)).square().mean().backward()
     missing = [n for n, p in enc_set.named_parameters() if p.grad is None or not p.grad.any()]
     assert not missing, f"no gradient reached {missing}"
+
+
+##
+# The metric scan path: strides, coordinate channels, validity, and ONE builder
+##
+
+def test_strided_trunk_lands_on_the_shipped_token_grid():
+    """121x121 under strides (1, 2, 2, 2) must give 16x16 = 256 tokens.
+
+    The ray count and the token count are coupled through the trunk, so this is the arithmetic
+    that ties the recorded grid to the transformer's sequence length.
+    """
+    from robot_rl.flow_matching.extero_encoder import conv_grid_shape
+
+    assert conv_grid_shape((121, 121), 4, (1, 2, 2, 2)) == (16, 16)
+    # A leading stride-1 layer is what buys the full-resolution first stage: all-stride-2
+    # over-shrinks to 8x8, which is a different model.
+    assert conv_grid_shape((121, 121), 4) == (8, 8)
+    with pytest.raises(ValueError, match="one stride per layer"):
+        conv_grid_shape((121, 121), 4, (1, 2, 2))
+    with pytest.raises(ValueError, match="stride must be"):
+        conv_grid_shape((121, 121), 2, (1, 0))
+
+
+def test_metric_grid_adds_coordinate_and_validity_channels():
+    """A metric grid feeds the convolution (height, x_m, y_m, validity), not just height."""
+    from robot_rl.flow_matching.extero_encoder import ExteroImageEncoder
+
+    plain = ExteroImageEncoder((121, 121), 32, channels=(8, 16), strides=(1, 2))
+    assert plain.in_channels == 1 and plain.pos_embed is None
+
+    metric = ExteroImageEncoder((121, 121), 32, channels=(8, 16), strides=(1, 2),
+                                coord_extent_m=(3.0, 3.0), miss_sentinel=2.0)
+    assert metric.in_channels == 4
+    assert metric.pos_embed is not None
+    assert metric.trunk[0].weight.shape[1] == 4
+    # The coordinate channels are in METRES and span the stated extent.
+    x, y = metric.coord_channels[0, 0], metric.coord_channels[0, 1]
+    assert x.min().item() == pytest.approx(-1.5) and x.max().item() == pytest.approx(1.5)
+    assert y.min().item() == pytest.approx(-1.5) and y.max().item() == pytest.approx(1.5)
+    # Token coordinates are the cell MEANS, derived by pooling the same grid -- so they sit
+    # inside the extent rather than on its edge.
+    xy = metric.token_xy_m[0]
+    assert xy.shape == (metric.tokens_per_sensor, 2)
+    assert xy[:, 0].abs().max() < 1.5 and xy[:, 1].abs().max() < 1.5
+
+
+def test_coordinate_channels_break_translation_equivariance():
+    """The whole point of the metric path, stated as the exact property it changes.
+
+    A shared kernel is translation-EQUIVARIANT: shift the input by a whole number of token
+    cells and the token grid is the SAME multiset of vectors, merely relocated. So a bare
+    convolution can report that a step edge exists and structurally cannot report WHERE -- the
+    failure this feature exists to remove. Coordinate channels break that equivariance, which
+    is what makes position representable.
+
+    Measured as the sorted token norms under a stride-aligned shift: bit-identical (0.0)
+    without coordinates, and clearly different with them. A weaker statistic like the mean over
+    tokens does move, but only by ~6e-5 at random init, which is too close to noise to pin.
+    """
+    from robot_rl.flow_matching.extero_encoder import ExteroImageEncoder
+
+    torch.manual_seed(0)
+    a = torch.zeros(1, 32, 32); a[0, 4:8, 4:8] = 1.0
+    b = torch.zeros(1, 32, 32); b[0, 20:24, 20:24] = 1.0    # +16 px = 8 cells at stride 2
+
+    def sorted_norms(enc, img):
+        with torch.no_grad():
+            return enc(img.reshape(1, -1))[0].norm(dim=-1).sort().values
+
+    bare = ExteroImageEncoder((32, 32), 16, channels=(4, 8), strides=(1, 2)).eval()
+    assert torch.equal(sorted_norms(bare, a), sorted_norms(bare, b))
+
+    metric = ExteroImageEncoder((32, 32), 16, channels=(4, 8), strides=(1, 2),
+                                coord_extent_m=(1.0, 1.0)).eval()
+    assert (sorted_norms(metric, a) - sorted_norms(metric, b)).abs().max() > 1e-3
+
+
+def test_validity_channel_marks_the_sentinel():
+    """A missed ray must be distinguishable from real geometry at the same value."""
+    from robot_rl.flow_matching.extero_encoder import ExteroImageEncoder
+
+    enc = ExteroImageEncoder((8, 8), 16, channels=(4,), strides=(1,),
+                             coord_extent_m=(1.0, 1.0), miss_sentinel=2.0).eval()
+    flat = torch.full((1, 64), 0.25)
+    holes = flat.clone(); holes[0, :10] = 2.0        # ten misses at the band edge
+    with torch.no_grad():
+        assert not torch.allclose(enc(flat), enc(holes), atol=1e-5)
+
+
+def test_one_model_builder_serves_the_trainer_and_the_loader():
+    """``from_config`` must be the only construction path.
+
+    Two hand-written construction sites drifted once already: the trainer built a 64-token,
+    single-channel encoder while the run banner reported the 256-token metric one, and nothing
+    failed until the checkpoint would not reload. This pins that a config's stated architecture
+    is what actually gets built.
+    """
+    from robot_rl.flow_matching.config import FlowMatchingConfig
+    from robot_rl.flow_matching.model import FlowMatchingTransformer
+
+    cfg = FlowMatchingConfig(
+        state_dim=44, history_dim=44, future_len=8, num_history_states=4, cmd_dim=3,
+        d_model=32, nhead=4, num_layers=1, dim_feedforward=64,
+        extero_source="height_scan", extero_encoder="cnn",
+        extero_sensor_count=1, extero_sensor_dim=121 * 121,
+        extero_image_hw=[[121, 121]], extero_cnn_channels=[8, 16, 16, 16],
+        extero_cnn_strides=[1, 2, 2, 2], extero_coord_extent_m=[3.0, 3.0],
+        extero_norm_mode="metric", extero_miss_sentinel=2.0,
+    )
+    model = FlowMatchingTransformer.from_config(cfg)
+    enc = model.extero_cnn.encoders[0]
+    assert model.tokens_per_sensor == cfg.tokens_per_sensor == 256
+    assert model.sequence_len == cfg.sequence_len
+    assert enc.in_channels == 4                      # height + x + y + validity
+    assert enc.strides == (1, 2, 2, 2)
+    assert enc.pos_embed is not None
+    assert enc.miss_sentinel == 2.0
