@@ -303,6 +303,25 @@ def main() -> int:
         )
         add_fm_depth_pair(env_cfg, *_res.pop())
 
+    # Same for the generator's own dense scanner, and for the same reason: the recording was
+    # made on a task PLUS `record_data.py --fm_height_scan`, so the bare task carries only the
+    # policy's 176-ray scanner and a re-cast would be of the wrong grid. DERIVED from the
+    # recording's own contract rather than re-declared, so the two cannot disagree by a typo.
+    _rec_scan = list(getattr(meta, "height_scan_spec", None) or [])
+    if _rec_scan:
+        from robot_rl.flow_matching.online import fm_scan_geometry
+        _geom = fm_scan_geometry(_rec_scan)
+        if _geom is not None:
+            from robot_rl.tasks.manager_based.robot_rl.g1.g1_fm_scan_env_cfg import (
+                add_fm_height_scan,
+            )
+            print(f"[augment] rebuilding the recording's scanner: {_geom['size'][0]}x"
+                  f"{_geom['size'][1]} m @ {_geom['resolution']} m "
+                  f"({_geom['height']}x{_geom['width']})")
+            add_fm_height_scan(env_cfg, size=tuple(_geom["size"]),
+                               resolution=_geom["resolution"],
+                               offset_xy=_geom["offset_xy"])
+
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
     robot = u.scene["robot"]
@@ -481,6 +500,8 @@ def main() -> int:
 
     diffs = []
     scan_diffs = []
+    scan_miss_mismatch = []
+    scan_miss_frac = []
     samples = []
     perwin = []
     allren = []
@@ -670,10 +691,21 @@ def main() -> int:
                 allsrc.append(idx[keep])
                 if scn is not None:
                     # The scan's delta-0 should be TIGHTER than depth's: it carries no DR and
-                    # no noise, so the only residual is float replay of the same cast. A
-                    # non-zero scan diff at zero offset therefore means the placement or the
-                    # tile layout is wrong, not that a sensor was jittered.
-                    scan_diffs.append(np.abs(scn - data["height_scan"][idx[keep]]))
+                    # no noise, so the only residual is float replay of the same cast plus the
+                    # recording's storage quantum. A non-zero scan diff at zero offset
+                    # therefore means the placement or the tile layout is wrong, not that a
+                    # sensor was jittered.
+                    #
+                    # A MISSED ray is -inf on both sides, and inf - inf is NaN -- which
+                    # poisons the mean and reports nothing. Compare the finite rays, and score
+                    # the miss PATTERN separately: two casts of the same geometry must miss on
+                    # the same rays, and that agreement is itself a placement check.
+                    rec_scan = data["height_scan"][idx[keep]].astype(np.float64)
+                    fin_new, fin_rec = np.isfinite(scn), np.isfinite(rec_scan)
+                    both = fin_new & fin_rec
+                    scan_diffs.append(np.abs(scn[both] - rec_scan[both]))
+                    scan_miss_mismatch.append(float((fin_new != fin_rec).mean()))
+                    scan_miss_frac.append(float((~fin_rec).mean()))
                 if len(samples) < 6:      # keep a few raw pairs for visual inspection
                     for j in range(min(6 - len(samples), dep.shape[0])):
                         samples.append((rec[j].copy(), dep[j].copy()))
@@ -734,10 +766,15 @@ def main() -> int:
             stats["rec"] = np.stack([a for a, _ in samples])
             stats["ren"] = np.stack([b for _, b in samples])
         sd = np.concatenate([x.reshape(-1) for x in scan_diffs]) if scan_diffs else None
-        if sd is not None:
+        if sd is not None and sd.size:
+            miss_mm = float(np.mean(scan_miss_mismatch))
             stats.update(scan_mean=float(sd.mean()), scan_p50=float(np.median(sd)),
                          scan_p99=float(np.percentile(sd, 99)), scan_max=float(sd.max()),
-                         scan_frac_gt_1mm=float((sd > 1e-3).mean()))
+                         scan_frac_gt_1mm=float((sd > 1e-3).mean()),
+                         scan_miss_mismatch=miss_mm,
+                         scan_miss_frac=float(np.mean(scan_miss_frac)))
+        elif sd is not None:
+            sd = None
         np.savez(cpath, **stats)
         print(f"[augment] wrote {cpath}")
         print(f"\n=== delta-0 ROUND TRIP over {n_done} windows ===")
@@ -745,9 +782,16 @@ def main() -> int:
               f"{np.median(d):.5f}  p99 {np.percentile(d, 99):.5f}  max {d.max():.5f}")
         print(f"  fraction of pixels > 1e-3: {100.0 * (d > 1e-3).mean():.2f}%")
         if sd is not None:
-            print(f"  |re-cast - recorded|   scan :  mean {sd.mean():.5f}  p50 "
-                  f"{np.median(sd):.5f}  p99 {np.percentile(sd, 99):.5f}  max {sd.max():.5f}")
-            print(f"  fraction of rays > 1e-3:   {100.0 * (sd > 1e-3).mean():.2f}%")
+            print(f"  |re-cast - recorded|   scan :  mean {sd.mean():.6f}  p50 "
+                  f"{np.median(sd):.6f}  p99 {np.percentile(sd, 99):.6f}  max {sd.max():.6f}"
+                  "   [FINITE rays only]")
+            print(f"  fraction of rays > 1e-3:   {100.0 * (sd > 1e-3).mean():.3f}%  "
+                  f"(the recording stores {data['height_scan'].dtype}; its quantum near 1 m "
+                  "is ~1e-3, so this is the floor, not an error)")
+            print(f"  missed-ray PATTERN disagreement: "
+                  f"{100.0 * float(np.mean(scan_miss_mismatch)):.4f}% of rays "
+                  f"(recording misses {100.0 * float(np.mean(scan_miss_frac)):.2f}%) -- two "
+                  "casts of the same geometry must miss on the SAME rays")
             print("  (the scan carries no DR and no noise, so its delta-0 should be TIGHTER "
                   "than depth's -- a non-zero scan diff means placement, not jitter)")
         else:
