@@ -320,6 +320,128 @@ def body_pose_terms(
     return out
 
 
+#: Bit index of each root DOF in the anchor mask (bit SET = that DOF is FREE). Mirrors
+#: ``motion_gen.world_lift._ANCHOR_DOF_NAMES``; kept here so ``flow`` needs no motion_gen
+#: import, and pinned by a test against the authority.
+_ANCHOR_BIT = {"downrange": 0, "lateral": 1, "height": 2, "roll": 3, "pitch": 4, "yaw": 5}
+
+
+def pinned_axis_flow_loss(
+    err: torch.Tensor,
+    sq: torch.Tensor,
+    anchor_mask: torch.Tensor,
+    mask_frame_yaw_rel: torch.Tensor | None,
+    weight: float,
+    state_norm: object | None,
+    num_joints: int,
+    num_extra_frames: int,
+    blocks: Sequence[str] | None,
+) -> torch.Tensor:
+    """Flow MSE with the anchor mask's PINNED root DOFs weighted up, renormalized to mean 1.
+
+    A pinned DOF is one the reference keeps from the terrain rather than re-anchoring onto the
+    robot -- height on flat ground, downrange + height + yaw on stairs and boxes. Those are
+    precisely the axes the generator fails on (its predicted stair segment slides along with a
+    displaced robot instead of staying on the terrain), so this concentrates gradient there.
+
+    Three things make this less trivial than a channel mask:
+
+    * **The pinned planar axis is not a channel.** ``downrange`` is named in the TERRAIN's
+      frame while the window's x/y are the snap robot's yaw frame, so the pinned direction is
+      a rotated vector, and the weight is a quadratic form ``I + (w-1) u u^T`` rather than a
+      diagonal.
+    * **x and y are standardized differently** -- measured 0.442 vs 0.102 on the shipped
+      teacher, a 4.3x anisotropy, because the robot travels far downrange and little
+      laterally. A metric direction ``u`` therefore appears in normalized coordinates along
+      ``S^-1 u``, not ``u``; projecting on ``u`` directly would leak most of a pinned
+      downrange weight onto lateral error.
+    * **Yaw is not a channel either** -- the orientation block is a 6D rotation. It is
+      weighted only when roll, pitch AND yaw are all pinned, which is exactly the terrain
+      masks; flat frees yaw, so flat gets no orientation weight and nothing is distorted.
+
+    One residual approximation, measured rather than assumed. Because the base loss is a
+    per-channel normalized MSE, a metric displacement along a DIAGONAL pinned axis also shows
+    up in the un-weighted channel term, diluting the boost: the realised ratio between a
+    pinned-axis and a free-axis error is the nominal ``weight`` at 0/90/180 degrees of
+    relative heading and falls to about ``weight / 5`` at 45. On the shipped library that
+    barely bites -- over terrain-pinned windows of the depth_v5 recording, 90.7% of headings
+    are within 10 degrees of an axis and 96.0% within 20 (the distribution is bimodal at 0 and
+    180, the robot traversing the tile forwards or backwards), leaving ~4% in the diagonal
+    band. Removing it entirely would mean weighting in metric units throughout, which changes
+    the xy/other balance even at ``weight = 1``.
+
+    Weights are renormalized by their own sum, so the returned value has the same scale as the
+    unweighted mean and a with/without comparison does not also change the effective LR.
+
+    Args:
+        err: ``(B, F, D)`` prediction error in NORMALIZED units.
+        sq: ``err ** 2``, precomputed.
+        anchor_mask: ``(B, F)`` integer anchor bitmasks.
+        mask_frame_yaw_rel: ``(B,)`` angle from the window's frame to the terrain's, or
+            ``None`` to treat them as aligned.
+        weight: Multiplier on pinned DOFs (``1.0`` would be a no-op).
+        state_norm: State normalizer, for the per-channel std used in the anisotropy
+            correction. ``None`` falls back to isotropic.
+        num_joints: ``nj``.
+        num_extra_frames: ``K``.
+        blocks: The window's block selection.
+
+    Returns:
+        Scalar weighted mean squared error.
+    """
+    slices = window_block_slices(num_joints, num_extra_frames, blocks)
+    if "base_pose" not in slices:
+        return sq.mean()
+    base = slices["base_pose"].start
+    extra = float(weight) - 1.0
+
+    def is_pinned(name: str) -> torch.Tensor:
+        """(B, F) float: 1 where that DOF is FIXED (bit CLEAR = pinned)."""
+        return ((anchor_mask >> _ANCHOR_BIT[name]) & 1 == 0).to(err.dtype)
+
+    w = torch.ones_like(sq)
+    # Height and the orientation block are axis-aligned, so they ARE channel weights.
+    w[..., base + 2] = 1.0 + extra * is_pinned("height")
+    rot_pinned = is_pinned("roll") * is_pinned("pitch") * is_pinned("yaw")
+    w[..., base + 3:base + 9] = (1.0 + extra * rot_pinned).unsqueeze(-1)
+
+    total = (w * sq).sum()
+    w_sum = w.sum()
+
+    # The planar part: a quadratic form along the pinned direction(s), taken in normalized
+    # coordinates via S^-1 u so the standardization anisotropy above cannot smear it. It is a
+    # rank-1 bump on the 2x2 xy block, so it contributes a SCALAR per node -- accumulated into
+    # the total rather than into the per-channel tensor, which would broadcast it over every
+    # channel in the window.
+    p_dr, p_lat = is_pinned("downrange"), is_pinned("lateral")
+    if float((p_dr + p_lat).sum()) > 0.0:
+        std = torch.ones(2, dtype=err.dtype, device=err.device)
+        if state_norm is not None:
+            std = state_norm.std[base:base + 2].to(err.dtype).to(err.device)
+        ang = (torch.zeros_like(p_dr) if mask_frame_yaw_rel is None
+               else mask_frame_yaw_rel.to(err.dtype).unsqueeze(-1).expand_as(p_dr))
+        # Project in METRES, then divide by that axis's OWN std. Doing it the other way --
+        # projecting the already-normalized error onto the normalized image of the metric axis
+        # -- is wrong under anisotropy: at std (0.442, 0.102) the normalized images of the
+        # metric downrange and lateral axes are only 26 degrees apart at 45 deg of heading, so
+        # a purely LATERAL error would pick up 81% of the downrange weight. Metric projection
+        # gives it exactly zero, and reduces to plain channel weighting at zero heading.
+        e_m = err[..., base:base + 2] * std                      # (B, F, 2) metres
+        for pinned, (ux, uy) in ((p_dr, (torch.cos(ang), torch.sin(ang))),
+                                 (p_lat, (-torch.sin(ang), torch.cos(ang)))):
+            if float(pinned.sum()) == 0.0:
+                continue
+            along = e_m[..., 0] * ux + e_m[..., 1] * uy          # (B, F) metres along the axis
+            # The std ALONG that direction, so the term is commensurate with the normalized
+            # squared errors it is added to.
+            std_u = ((std[0] * ux) ** 2 + (std[1] * uy) ** 2).sqrt().clamp_min(1e-12)
+            total = total + (extra * pinned * (along / std_u) ** 2).sum()
+            # The quadratic form's TRACE is what the mean must divide by: a rank-1 bump of
+            # (weight - 1) adds exactly that to the 2x2 block's trace.
+            w_sum = w_sum + extra * pinned.sum()
+    return total / w_sum.clamp_min(1e-12)
+
+
 def flow_matching_loss(
     model: torch.nn.Module,
     x1: torch.Tensor,
@@ -342,6 +464,9 @@ def flow_matching_loss(
     body_pose_ori_scale: float = 1.0,
     tau_min: float = 0.0,
     blocks: Sequence[str] | None = None,
+    anchor_mask: torch.Tensor | None = None,
+    mask_frame_yaw_rel: torch.Tensor | None = None,
+    pinned_axis_weight: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     """Compute the flow-matching loss (+ optional consistency / FK terms).
 
@@ -380,8 +505,18 @@ def flow_matching_loss(
     """
     x_tau, tau, target_v = sample_flow_batch(x1)
     v = model(x_tau, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
-    flow_mse = ((v - target_v) ** 2).mean()
-    out = {"loss": flow_mse, "flow_mse": flow_mse.detach()}
+    err = v - target_v
+    sq = err ** 2
+    # Reported UNWEIGHTED whatever the weighting, so a weighted run's curves stay directly
+    # comparable with an unweighted one's -- that comparison is the point of the option.
+    flow_mse = sq.mean()
+    train_loss = flow_mse
+    if anchor_mask is not None and float(pinned_axis_weight) != 1.0:
+        train_loss = pinned_axis_flow_loss(
+            err, sq, anchor_mask, mask_frame_yaw_rel, float(pinned_axis_weight),
+            state_norm, num_joints, num_extra_frames, blocks,
+        )
+    out = {"loss": train_loss, "flow_mse": flow_mse.detach()}
 
     packed = set(resolve_reference_blocks(blocks))
     has_base = {"base_pose", "base_vel"} <= packed

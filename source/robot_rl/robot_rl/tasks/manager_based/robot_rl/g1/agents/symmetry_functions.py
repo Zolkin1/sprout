@@ -57,14 +57,19 @@ def _get_height_scan_shape(env, group: str, term_idx: int, term_name: str) -> tu
     """Return ``(n_y, n_x, flip_dim)`` for a heightmap obs term.
 
     Reads the obs term's ``sensor_cfg`` from the observation manager, fetches
-    the sensor's ``GridPatternCfg``, and computes how many samples lie along
-    each axis using the same inclusive-arange formula IsaacLab uses to build
-    the ray grid.  ``flip_dim`` indexes the y axis inside the reshaped
-    ``(batch, n_y, n_x)`` tensor: 1 for ``"xy"`` ordering, 2 for ``"yx"``.
+    the sensor's ``GridPatternCfg``, and delegates the fold to
+    :func:`~robot_rl.flow_matching.transforms.scan_grid_shape` -- the SINGLE
+    definition of it, shared with the FM's CNN encoder and the recorded scan
+    contract. A second copy of the arange formula here could disagree with that
+    one silently, and ``num_rays`` cannot distinguish a grid from its transpose.
+    ``flip_dim`` indexes the y axis inside the reshaped ``(batch, H, W)``
+    tensor: 1 for ``"xy"`` ordering, 2 for ``"yx"``.
 
     Cached per ``(group, term_name)`` so the lookup runs once per process.
     """
     from isaaclab.sensors.ray_caster.patterns.patterns_cfg import GridPatternCfg
+
+    from robot_rl.flow_matching.transforms import scan_grid_shape, scan_lateral_dim
 
     key = (group, term_name)
     if key in _CACHED_HEIGHT_SCAN_SHAPES:
@@ -81,26 +86,11 @@ def _get_height_scan_shape(env, group: str, term_idx: int, term_name: str) -> tu
             f"whose pattern_cfg is {type(pattern_cfg).__name__}, not GridPatternCfg."
         )
 
-    # Match grid_pattern()'s arange formula exactly so we get the same point
-    # count even at the float-precision edges (the +1e-9 makes the endpoint
-    # inclusive).
-    sx, sy = pattern_cfg.size
-    res = pattern_cfg.resolution
-    n_x = len(torch.arange(start=-sx / 2, end=sx / 2 + 1.0e-9, step=res))
-    n_y = len(torch.arange(start=-sy / 2, end=sy / 2 + 1.0e-9, step=res))
-
-    # With ordering="xy", grid_pattern reshapes to (n_y, n_x) before flatten,
-    # so the y axis is dim 1 of the (batch, n_y, n_x) reshape.  With "yx" the
-    # layout is (n_x, n_y), so the y axis becomes dim 2.
-    if pattern_cfg.ordering == "xy":
-        shape = (n_y, n_x, 1)
-    elif pattern_cfg.ordering == "yx":
-        shape = (n_x, n_y, 2)
-    else:
-        raise ValueError(
-            f"Unknown GridPatternCfg ordering '{pattern_cfg.ordering}' on sensor "
-            f"'{sensor_name}'."
-        )
+    try:
+        h, w = scan_grid_shape(pattern_cfg.resolution, pattern_cfg.size, pattern_cfg.ordering)
+        shape = (h, w, scan_lateral_dim(pattern_cfg.ordering))
+    except ValueError as exc:      # unknown ordering -- name the sensor the caller must fix
+        raise ValueError(f"sensor '{sensor_name}': {exc}") from exc
 
     _CACHED_HEIGHT_SCAN_SHAPES[key] = shape
     return shape

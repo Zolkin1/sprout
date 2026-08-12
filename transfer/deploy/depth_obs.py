@@ -374,25 +374,34 @@ def normalize_depth_np(
     return (out - offset) * scale
 
 
-def sanitize_extero_np(values: np.ndarray, source: str) -> np.ndarray:
-    """Make an exteroception reading finite and clamp it to its source's band.
+def sanitize_extero_np(
+    values: np.ndarray, source: str, clip: float | None = None
+) -> np.ndarray:
+    """Make an exteroception reading finite and clamp it to its band.
 
     Numpy counterpart of ``robot_rl.flow_matching.transforms.sanitize_extero``.  The
     ``fm.onnx`` graph folds in the exteroception normalization, so one non-finite entry
     would poison the conditioning.
 
+    Both non-finite ends map to ``+clip``, matching the torch side: a missed downward ray
+    means "no ground within range", which is ground very far BELOW, so the drop-off end is
+    where it belongs.  Mapping it to ``-clip`` would encode a hole as a wall, a value real
+    terrain also produces.
+
     Args:
         values: Raw reading, any shape.
         source: An :data:`EXTERO_CLIP_NP` key.
+        clip: Band override (the checkpoint's ``fm_meta.extero_clip``).  ``None`` uses the
+            per-source default, which is what a graph exported before the field used.
 
     Returns:
-        A finite array clamped to the source's band.
+        A finite array clamped to the band.
 
     Raises:
         KeyError: On an unknown ``source``.
     """
-    clip = EXTERO_CLIP_NP[source]
+    band = EXTERO_CLIP_NP[source] if clip is None else float(clip)
     finite = np.nan_to_num(
-        np.asarray(values, dtype=np.float64), nan=0.0, posinf=clip, neginf=-clip
+        np.asarray(values, dtype=np.float64), nan=0.0, posinf=band, neginf=band
     )
-    return np.clip(finite, -clip, clip)
+    return np.clip(finite, -band, band)

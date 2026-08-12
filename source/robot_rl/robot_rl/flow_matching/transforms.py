@@ -33,6 +33,8 @@ All quaternions are ``(x, y, z, w)``, matching ``robot.data`` and
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 
 from isaaclab.utils.math import (
@@ -437,12 +439,101 @@ def ori6d_orthonormality_penalty(d6: torch.Tensor) -> torch.Tensor:
     return dot.pow(2).mean() + (n1 - 1.0).pow(2).mean() + (n2 - 1.0).pow(2).mean()
 
 
-HEIGHT_SCAN_CLIP = 1.0
-"""Symmetric clip band (metres) for the height-scan conditioning signal.
+def scan_grid_counts(resolution: float, size: Sequence[float]) -> tuple[int, int]:
+    """Sample counts ``(n_x, n_y)`` of an IsaacLab ``GridPatternCfg``.
 
-Matches the ``height_scan`` RL observation term's ``clip=(-1, 1)`` so the FM's
-height token, the recorded training data, and the deployed policy all condition
-on an identically-bounded signal.
+    Uses ``torch.arange`` with the same inclusive ``+1e-9`` endpoint nudge that
+    ``isaaclab.sensors.ray_caster.patterns.grid_pattern`` uses, so the count matches the
+    library's ray count exactly -- including at the float-precision edges, where a
+    reimplementation with ``int(size / res) + 1`` differs by one.
+
+    Args:
+        resolution: Grid spacing in metres.
+        size: ``(size_x, size_y)`` full extents in metres; ``size[0]`` is the x/forward axis.
+
+    Returns:
+        ``(n_x, n_y)`` -- samples along forward and lateral respectively.
+    """
+    sx, sy = float(size[0]), float(size[1])
+    res = float(resolution)
+    n_x = len(torch.arange(start=-sx / 2, end=sx / 2 + 1.0e-9, step=res))
+    n_y = len(torch.arange(start=-sy / 2, end=sy / 2 + 1.0e-9, step=res))
+    return n_x, n_y
+
+
+def scan_grid_shape(
+    resolution: float, size: Sequence[float], ordering: str = "xy"
+) -> tuple[int, int]:
+    """The ``(H, W)`` image fold of a FLAT height-scan row.
+
+    This is the single definition of that fold, shared by the FM's CNN encoder, the recorded
+    scan contract, and the sagittal-reflection augmentation. Two copies of it can disagree
+    silently -- ``num_rays`` alone cannot distinguish a grid from its transpose -- so callers
+    must go through here rather than reimplementing the arithmetic.
+
+    ``grid_pattern`` builds the flat row with ``meshgrid(x, y, indexing=...)`` then
+    ``flatten()``, so for the default ``ordering="xy"`` the result is y-outer / x-inner
+    (``k = iy * n_x + ix``) and folding row-major gives rows = lateral, columns = forward.
+    ``"yx"`` transposes both.
+
+    Args:
+        resolution: Grid spacing in metres.
+        size: ``(size_x, size_y)`` full extents in metres.
+        ordering: ``GridPatternCfg.ordering`` -- ``"xy"`` (the IsaacLab default) or ``"yx"``.
+
+    Returns:
+        ``(height, width)``, matching the row-major fold ``k = row * width + col``.
+
+    Raises:
+        ValueError: On an unknown ``ordering``.
+    """
+    n_x, n_y = scan_grid_counts(resolution, size)
+    if ordering == "xy":
+        return n_y, n_x
+    if ordering == "yx":
+        return n_x, n_y
+    raise ValueError(
+        f"unknown GridPatternCfg ordering {ordering!r}; expected 'xy' or 'yx'. The fold of a "
+        "flat scan row depends on it, and guessing would transpose the image."
+    )
+
+
+def scan_lateral_dim(ordering: str = "xy") -> int:
+    """Which dim of a ``(batch, H, W)`` folded scan is the LATERAL (y) axis.
+
+    The axis a sagittal reflection has to flip. ``1`` for ``"xy"`` (rows are lateral), ``2``
+    for ``"yx"``. Derived from the same ``ordering`` :func:`scan_grid_shape` reads, so the
+    mirror augmentation and the CNN fold cannot disagree about which way is sideways.
+
+    Raises:
+        ValueError: On an unknown ``ordering``.
+    """
+    if ordering == "xy":
+        return 1
+    if ordering == "yx":
+        return 2
+    raise ValueError(f"unknown GridPatternCfg ordering {ordering!r}; expected 'xy' or 'yx'.")
+
+
+from .config import EXTERO_CLIP  # noqa: E402  (kept below the torch imports)
+
+HEIGHT_SCAN_CLIP = EXTERO_CLIP["height_scan"]
+"""Default symmetric clip band (metres) for the height-scan conditioning signal.
+
+Matches the ``height_scan`` RL observation term's ``clip=(-1, 1)``. That agreement is the
+right default but no longer a rule: when the generator has its OWN scanner the two signals
+are different sensors, and :attr:`~robot_rl.flow_matching.config.FlowMatchingConfig.extero_clip`
+widens the FM's band without touching the teacher's obs terms (whose distribution the critic
+depends on). See :data:`~robot_rl.flow_matching.config.EXTERO_CLIP`, the real home.
+"""
+
+DEPTH_CLIP = EXTERO_CLIP["depth"]
+"""Default symmetric clip band for the depth conditioning signal, in NORMALISED units.
+
+Matches the ``depth_near`` / ``depth_far`` RL observation terms' ``clip=(-2, 2)``.
+``mdp.depth_image`` already applies ``(d - 0.75) * 0.5``, so the recorded depth is in these
+normalised units, not metres -- which is why this band differs from :data:`HEIGHT_SCAN_CLIP`.
+Clamping depth at the scan's 1.0 would silently discard real readings.
 """
 
 
@@ -450,10 +541,16 @@ def sanitize_height_scan(height_scan: torch.Tensor, clip: float = HEIGHT_SCAN_CL
     """Make a raw height scan finite and clamp it to ``[-clip, clip]``.
 
     Ray-cast rays that miss the (finite) mesh come back as ``-inf`` in Isaac Lab
-    (``pos_z - inf - offset``). Left raw, a single such value makes the height
-    normalizer's per-dimension mean non-finite and yields a NaN training loss.
-    This maps non-finite entries to the clip band (a miss -> the band edge) and
-    bounds the signal to the range the teacher's ``height_scan`` obs term uses.
+    (``pos_z - inf - offset``). Left raw, a single such value makes the height normalizer's
+    per-dimension mean non-finite and yields a NaN training loss.
+
+    A miss maps to ``+clip``, the DROP-OFF end. This direction is load-bearing rather than
+    arbitrary: a missed downward ray means "no ground within range", which is geometrically
+    ground very far BELOW -- and the terrain does genuinely reach large positive values where
+    the robot stands high on a staircase over a distant floor. Mapping it to ``-clip`` instead
+    (as this did originally) encodes a hole as "ground a metre ABOVE my feet", i.e. a wall,
+    which is a reading real geometry also produces on ascending stairs. Holes and walls then
+    share a number and nothing downstream can separate them.
 
     Args:
         height_scan: Raw per-ray ground clearance, shape ``(..., K)``.
@@ -462,33 +559,23 @@ def sanitize_height_scan(height_scan: torch.Tensor, clip: float = HEIGHT_SCAN_CL
     Returns:
         Finite, clamped height scan with the same shape as the input.
     """
-    return torch.nan_to_num(height_scan, nan=0.0, posinf=clip, neginf=-clip).clamp(-clip, clip)
+    return torch.nan_to_num(height_scan, nan=0.0, posinf=clip, neginf=clip).clamp(-clip, clip)
 
 
-DEPTH_CLIP = 2.0
-"""Symmetric clip band for the depth conditioning signal, in NORMALISED units.
+def sanitize_extero(
+    values: torch.Tensor, source: str, clip: float | None = None
+) -> torch.Tensor:
+    """Make an exteroception signal finite and clamp it to its band.
 
-Matches the ``depth_near`` / ``depth_far`` RL observation terms' ``clip=(-2, 2)``.
-``mdp.depth_image`` already applies ``(d - 0.75) * 0.5``, so the recorded depth is in
-these normalised units, not metres -- which is why this band differs from
-:data:`HEIGHT_SCAN_CLIP`. Clamping depth at the scan's 1.0 would silently discard real
-readings.
-"""
-
-EXTERO_CLIP: dict[str, float] = {"height_scan": HEIGHT_SCAN_CLIP, "depth": DEPTH_CLIP}
-"""Clip band per :data:`~robot_rl.flow_matching.config.EXTERO_SOURCES` entry."""
-
-
-def sanitize_extero(values: torch.Tensor, source: str) -> torch.Tensor:
-    """Make an exteroception signal finite and clamp it to its source's band.
-
-    Both sources need the guard: the height scan records ``-inf`` for missed rays, and
-    while ``mdp.depth_image`` should already return finite values, a single non-finite
-    entry makes the normalizer's per-dimension mean non-finite and yields a NaN loss.
+    Both sources need the guard: the height scan records ``-inf`` for missed rays, and while
+    ``mdp.depth_image`` should already return finite values, a single non-finite entry makes
+    the normalizer's per-dimension mean non-finite and yields a NaN loss.
 
     Args:
         values: Raw exteroception values, shape ``(..., K)``.
-        source: One of :data:`EXTERO_CLIP`'s keys.
+        source: One of :data:`~robot_rl.flow_matching.config.EXTERO_CLIP`'s keys.
+        clip: Band override (``FlowMatchingConfig.resolve_extero_clip()``). ``None`` uses the
+            per-source default, which is what reproduces an older checkpoint exactly.
 
     Returns:
         Finite, clamped values with the same shape as the input.
@@ -496,4 +583,5 @@ def sanitize_extero(values: torch.Tensor, source: str) -> torch.Tensor:
     Raises:
         KeyError: On an unknown ``source``.
     """
-    return sanitize_height_scan(values, clip=EXTERO_CLIP[source])
+    band = EXTERO_CLIP[source] if clip is None else float(clip)
+    return sanitize_height_scan(values, clip=band)

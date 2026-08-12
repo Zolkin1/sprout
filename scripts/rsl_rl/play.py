@@ -364,23 +364,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # declared, so a flag cannot disagree with the artifact. A checkpoint at the policy's
         # own resolution adds nothing and reads the policy's cameras, as it always did.
         if args_cli.fm_checkpoint is not None:
-            from robot_rl.flow_matching.online import read_fm_extero_meta
-            from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
-                add_fm_depth_pair,
-            )
+            from robot_rl.flow_matching.online import fm_scan_geometry, read_fm_extero_meta
             fm_extero = read_fm_extero_meta(args_cli.fm_checkpoint)
-            want = (args_cli.fm_depth_resolution or "").strip()
-            if want:
-                w, h = (int(v) for v in want.replace("x", ",").split(","))
-                print(f"[INFO] --fm_depth_resolution {w}x{h} OVERRIDES the checkpoint's "
-                      f"{fm_extero['width']}x{fm_extero['height']}; the command term's shape "
-                      "check will refuse the pair unless you meant this.")
-            elif fm_extero["width"] is not None:
-                w, h = fm_extero["width"], fm_extero["height"]
-            else:
-                w = h = None
-            if w is not None and getattr(env_cfg.scene, "depth_camera_near", None) is not None:
-                add_fm_depth_pair(env_cfg, w, h)
+            # Branch on the checkpoint's own SOURCE, so a depth generator can never be given
+            # a scanner and a scan generator can never be given a camera pair.
+            if fm_extero["extero_source"] == "depth":
+                from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+                    add_fm_depth_pair,
+                )
+                want = (args_cli.fm_depth_resolution or "").strip()
+                if want:
+                    w, h = (int(v) for v in want.replace("x", ",").split(","))
+                    print(f"[INFO] --fm_depth_resolution {w}x{h} OVERRIDES the checkpoint's "
+                          f"{fm_extero['width']}x{fm_extero['height']}; the command term's "
+                          "shape check will refuse the pair unless you meant this.")
+                elif fm_extero["width"] is not None:
+                    w, h = fm_extero["width"], fm_extero["height"]
+                else:
+                    w = h = None
+                if w is not None and getattr(env_cfg.scene, "depth_camera_near",
+                                             None) is not None:
+                    add_fm_depth_pair(env_cfg, w, h)
+            elif fm_extero["extero_source"] == "height_scan":
+                geom = fm_scan_geometry(fm_extero["extero_spec"])
+                # ``None`` = a checkpoint that states no scan geometry, i.e. every pre-field
+                # height-scan run. Building nothing then makes the readers fall back to the
+                # policy's scanner, which is exactly what those checkpoints trained on.
+                if geom is not None:
+                    from robot_rl.tasks.manager_based.robot_rl.g1.g1_fm_scan_env_cfg import (
+                        add_fm_height_scan,
+                    )
+                    print(f"[INFO] FM checkpoint conditions on a "
+                          f"{geom['size'][0]}x{geom['size'][1]} m @ {geom['resolution']} m "
+                          f"scan ({geom['height']}x{geom['width']})"
+                          + (" [PRIVILEGED]" if geom["privileged"] else ""))
+                    add_fm_height_scan(env_cfg, size=tuple(geom["size"]),
+                                       resolution=geom["resolution"],
+                                       offset_xy=geom["offset_xy"])
 
         # Apply video-recording knobs to the viewer cfg before env construction.
         # ``env_cfg.viewer.resolution`` is the offscreen-render product size the

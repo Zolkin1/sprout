@@ -18,6 +18,18 @@ EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
 #: Recognised :attr:`FlowMatchingConfig.extero_encoder` values (after ``"auto"`` resolves).
 EXTERO_ENCODERS: tuple[str, ...] = ("mlp", "cnn")
 
+#: Recognised :attr:`FlowMatchingConfig.extero_norm_mode` values.
+EXTERO_NORM_MODES: tuple[str, ...] = ("per_element", "per_sensor", "metric")
+
+#: Default symmetric clip band per :data:`EXTERO_SOURCES` entry, applied by
+#: ``transforms.sanitize_extero`` before normalization.
+#:
+#: Lives here rather than in ``transforms`` because it is keyed by a config enum and is now
+#: overridable per run via :attr:`FlowMatchingConfig.extero_clip`; ``transforms`` re-exports
+#: the two scalars under their historical names. Depth's band is in NORMALISED units (the obs
+#: term already applied ``(d - 0.75) * 0.5``), the scan's in metres -- which is why they differ.
+EXTERO_CLIP: dict[str, float] = {"height_scan": 1.0, "depth": 2.0}
+
 #: Recognised :attr:`FlowMatchingConfig.attention_mode` values.
 ATTENTION_MODES: tuple[str, ...] = ("full", "prefix")
 
@@ -278,6 +290,31 @@ class FlowMatchingConfig:
     # count from the input resolution -- and the one that isolates "a CNN beats an MLP" from
     # "16 tokens beat 1", since ``[1, 1]`` gives the legacy token count through a conv trunk.
     extero_cnn_grid: list[int] | None = None
+    # Per-layer convolution STRIDE, one entry per ``extero_cnn_channels`` entry. ``None`` means
+    # stride 2 everywhere, which is the shipped depth behaviour and leaves every existing
+    # checkpoint's architecture unchanged. A LEADING stride-1 layer is what lets a dense metric
+    # scan keep its full resolution through the first stage while the stack still lands on a
+    # small token grid: 121 -> 121 -> 61 -> 31 -> 16 under (1, 2, 2, 2). The grid target and
+    # this list are coupled -- changing one without the other silently changes the transformer's
+    # sequence length.
+    extero_cnn_strides: list[int] | None = None
+    # ``[size_x, size_y]`` metric extents of a robot-centred exteroception grid, DERIVED from
+    # the recording's ``height_scan_spec`` (never typed). When set, the encoder appends each
+    # pixel's ``(x, y)`` offset in METRES as two input channels and adds a Fourier embedding of
+    # each token's own cell-centre coordinate.
+    #
+    # This is the targeted fix for the registration failure, not a refinement: a shared
+    # convolution kernel is translation-EQUIVARIANT, so it can say a step edge is present but
+    # structurally cannot say WHERE it is -- and "where, relative to the robot" is the whole
+    # quantity being measured. ``None`` for depth, whose pixels are rays rather than ground
+    # points and have no such planar coordinate.
+    extero_coord_extent_m: list[float] | None = None
+    # Flat-row ordering of that metric grid (``GridPatternCfg.ordering``), so the coordinate
+    # channels are laid out the same way the reading is folded.
+    extero_grid_ordering: str = "xy"
+    # Frequency bands per axis in the token position embedding. A single linear map of (x, y)
+    # can only express a plane, which is too smooth to separate neighbouring tokens.
+    extero_fourier_bands: int = 4
     # Std floor for the exteroception normalizer. On flat ground the per-ray scan is nearly
     # constant, so the raw std collapses toward the base Normalizer eps (1e-6) and blows up
     # normalization; a larger floor (~1e-2 m) keeps a near-flat scan well-scaled.
@@ -296,7 +333,55 @@ class FlowMatchingConfig:
     # The stored statistics keep their ``(T*K,)`` shape either way (the per-sensor value is
     # broadcast into it), so the Normalizer, the checkpoint, the folded ONNX normalization
     # and the whole deploy path are shape-identical -- only the numbers change.
+    #   "metric"      -- a FIXED declared affine ``(x - extero_norm_offset) / extero_norm_scale``,
+    #                    no fitting at all.
+    #
+    # "metric" is the mode for a privileged metric height map. Both fitted modes make the input
+    # scale a property of the TRAINING SET rather than of the world: the same terrain maps to
+    # different network inputs in two different recordings, and a checkpoint's notion of "1 m"
+    # depends on what it happened to be trained on. A declared affine removes that, and brings
+    # the scan to parity with depth -- whose first stage, ``(d - 0.75) * 0.5`` inside
+    # ``mdp.depth_image``, has always been declared constants carried in the camera contract.
     extero_norm_mode: str = "per_element"
+    # The declared affine for ``extero_norm_mode="metric"``. The default divides by 1.0, i.e.
+    # the network input IS metres -- which is the point, and makes the value directly readable
+    # in a diagnostic. Recorded into the checkpoint so the band a run trained under is auditable.
+    extero_norm_offset: float = 0.0
+    extero_norm_scale: float = 1.0
+    # Symmetric clip band applied by ``sanitize_extero`` BEFORE normalization. ``None`` keeps
+    # the per-source default (:data:`EXTERO_CLIP`), so every existing checkpoint is unchanged.
+    #
+    # The scan's 1.0 m default is too tight for a large grid: measured on the real recording,
+    # 33% of `stairs_dn_pure` rays already exceed +1 m at the 176-ray grid, and a 3 m window
+    # destroys ~11% of the image overall (42% on descents), concentrated downrange where the
+    # planning happens. The true range on this terrain is about [-1.6, +5.5] m; +-2.0 leaves
+    # 0.5% clipped. Widening it is safe precisely because the generator has its OWN scanner --
+    # the teacher's ``clip=(-1, 1)`` obs terms are untouched, so the critic's input distribution
+    # does not move.
+    extero_clip: float | None = None
+    # Normalized value a MISSED ray takes, DERIVED at dataset build under the metric affine.
+    # When set, the encoder appends a validity channel so a hole is distinguishable from real
+    # geometry. Only computable under a declared affine (otherwise the sentinel depends on the
+    # fitted statistics), and only meaningful for a ray-cast source; ``None`` disables it.
+    #
+    # It matters because the two ends of the band are both physically reachable: a missed ray
+    # now maps to +clip, the drop-off end, and real terrain also reaches large positive values
+    # where the robot stands high above a distant floor. Without the mask those are one number.
+    extero_miss_sentinel: float | None = None
+    # Relative weight on the flow loss for root DOFs the anchor mask PINS to the terrain --
+    # the axes on which the reference stays where the terrain put it rather than following the
+    # robot. 1.0 = off (every channel equal, the historical behaviour).
+    #
+    # Which axes those are is per NODE, from the recorded clip index joined back to the
+    # library: a flat node pins height only, a stair/box node pins downrange, height and yaw,
+    # a distractor node pins everything. Those are exactly the quantities the generator gets
+    # wrong -- it slides its predicted stair segment along with the robot instead of leaving it
+    # on the terrain -- so this puts the gradient where the failure is.
+    #
+    # The weights are RENORMALIZED to mean 1 over each batch, so the loss magnitude (and hence
+    # the effective learning rate) matches an unweighted run and a with/without A/B differs in
+    # one thing only.
+    pinned_axis_loss_weight: float = 1.0
     # Per-step command width (0 disables command conditioning).
     cmd_dim: int = 0
 
@@ -526,15 +611,23 @@ class FlowMatchingConfig:
     def resolve_extero_encoder(self) -> str:
         """Settle :attr:`extero_encoder`, expanding ``"auto"`` from the source.
 
-        Depth is an image, so it gets the convolutional grid; the height scan has no image
-        shape in an FM recording (only its ray count travels), so it gets the flat MLP.
+        ``"auto"`` picks the convolutional grid for depth and the flat MLP for the scan.
+        That default is deliberately NOT source-symmetric even though a scan can now be
+        convolved: flipping the scan's ``"auto"`` to ``"cnn"`` would silently re-architect
+        every existing height-scan run, whose recordings carry no grid geometry at all.
+        Convolving a scan is opt-in, via ``--extero_encoder cnn`` on a recording whose
+        ``height_scan_spec`` states the fold.
+
+        What replaced the old "cnn implies depth" rule is an invariant that does not mention
+        the source: **cnn implies a per-sensor ``(H, W)`` that closes against the recording's
+        own spec**, enforced by :meth:`check_extero_encoder` here, by the dataset's
+        grid-closes check, and again at load time.
 
         Returns:
             ``"cnn"`` or ``"mlp"``.
 
         Raises:
-            ValueError: On an unknown encoder name, or on ``"cnn"`` with a source that has
-                no image to convolve.
+            ValueError: On an unknown encoder name.
         """
         self.check_extero_source()
         encoder = self.extero_encoder
@@ -544,13 +637,38 @@ class FlowMatchingConfig:
             raise ValueError(
                 f"extero_encoder={encoder!r} is not one of {list(EXTERO_ENCODERS)} (or 'auto')."
             )
-        if encoder == "cnn" and self.extero_source != "depth":
-            raise ValueError(
-                f"extero_encoder='cnn' needs an image, but extero_source={self.extero_source!r} "
-                "has none: an FM recording carries the height scan's ray count and not its "
-                "grid shape. Use --extero_encoder mlp for the scan (or 'auto', which picks it)."
-            )
         return encoder
+
+    def resolve_extero_clip(self) -> float:
+        """The symmetric clip band ``sanitize_extero`` should apply, in the source's units.
+
+        :attr:`extero_clip` when set, else the per-source default. Kept as an explicit
+        resolver rather than defaulted in the field so an absent value in an old checkpoint
+        reproduces that checkpoint's behaviour exactly.
+
+        Returns:
+            The band magnitude.
+        """
+        self.check_extero_source()
+        if self.extero_clip is None:
+            return float(EXTERO_CLIP[self.extero_source])
+        band = float(self.extero_clip)
+        if not band > 0.0:
+            raise ValueError(f"extero_clip must be positive, got {band}.")
+        return band
+
+    def check_extero_norm_mode(self) -> None:
+        """Raise if :attr:`extero_norm_mode` is not one of the three supported modes."""
+        if self.extero_norm_mode not in EXTERO_NORM_MODES:
+            raise ValueError(
+                f"extero_norm_mode={self.extero_norm_mode!r} is not one of "
+                f"{list(EXTERO_NORM_MODES)}."
+            )
+        if self.extero_norm_mode == "metric" and not float(self.extero_norm_scale) > 0.0:
+            raise ValueError(
+                f"extero_norm_mode='metric' needs a positive extero_norm_scale, got "
+                f"{self.extero_norm_scale}."
+            )
 
     def check_extero_encoder(self) -> None:
         """Raise if the exteroception encoder settings are not internally coherent.
@@ -569,9 +687,19 @@ class FlowMatchingConfig:
             return
         if not self.extero_image_hw:
             raise ValueError(
-                "extero_encoder='cnn' needs extero_image_hw, which the dataset derives from "
-                "the recording's depth_camera_spec. An empty value means the dataset was not "
-                "built (or the recording carries no camera contract)."
+                "extero_encoder='cnn' needs extero_image_hw, which the dataset derives from the "
+                "recording's sensor contract -- depth_camera_spec for depth, height_scan_spec "
+                "for the scan. An empty value means the dataset was not built, or the recording "
+                "carries no contract for its exteroception (re-record: a bare ray count cannot "
+                "say what shape the grid was, and a wrong fold is scrambled input at the right "
+                "size)."
+            )
+        if self.extero_cnn_strides is not None and (
+                len(self.extero_cnn_strides) != len(self.extero_cnn_channels)):
+            raise ValueError(
+                f"extero_cnn_strides has {len(self.extero_cnn_strides)} entries but "
+                f"extero_cnn_channels names {len(self.extero_cnn_channels)} convolutions; "
+                "one stride per layer."
             )
         if len(self.extero_image_hw) != self.extero_sensor_count:
             raise ValueError(
@@ -604,6 +732,7 @@ class FlowMatchingConfig:
         grid = conv_grid_shape(
             (int(self.extero_image_hw[0][0]), int(self.extero_image_hw[0][1])),
             len(self.extero_cnn_channels),
+            self.extero_cnn_strides,
         )
         return grid[0] * grid[1]
 

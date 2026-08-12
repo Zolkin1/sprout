@@ -182,22 +182,56 @@ def build_state(
         policy.ctx.extero_source == "height_scan" and policy.ctx.extero_sensor_dim > 1
     )
     if spec is not None or fm_uses_scan:
-        s = spec or {}
+        # PREFER the generator's own spec, then the tracker's, and REFUSE rather than default.
+        # The old `s.get(..., 0.1 / (1.5, 1.0))` fallback is the POLICY's historical grid and
+        # cannot be assumed for a generator: a 14641-ray FM would be handed 176 values and die
+        # inside a Normalizer broadcast -- or, at a coincidental width, be fed a completely
+        # different patch of ground at exactly the right shape.
+        fm_spec = next(iter(getattr(policy.ctx, "extero_spec", None) or []), None)
+        s = fm_spec if (fm_spec and "resolution" in fm_spec) else spec
+        if s is None:
+            raise ValueError(
+                "this generator conditions on a height scan but neither it nor the tracker "
+                "states the grid geometry (resolution/size/offset). There is no safe default: "
+                "the historical 0.1 m / 1.5x1.0 m grid is the POLICY's, and casting it for a "
+                "generator trained on another one silently substitutes the wrong signal. "
+                "Re-export the artifacts with a height_scan_spec."
+            )
+        if bool(s.get("privileged")):
+            raise ValueError(
+                f"this generator conditions on the PRIVILEGED dense scan "
+                f"({s.get('size')} m @ {s.get('resolution')} m = {s.get('num_rays')} rays), "
+                "which is exact noise-free ground truth and not reproducible off-sim. "
+                "compute_height_scan is also a per-ray Python loop, so casting it here would "
+                "be ~100x the current cost. It is an Isaac-only diagnostic."
+            )
         off = s.get("offset_pos", [0.75, 0.0, 20.0])
         clr, hits = robot.compute_height_scan(
             state["root_pos"], state["root_quat"],
-            resolution=float(s.get("resolution", 0.1)), size=tuple(s.get("size", (1.5, 1.0))),
+            resolution=float(s["resolution"]), size=tuple(s["size"]),
             offset_fwd=float(off[0]), ray_start_h=float(off[2]),
             sensor_offset=float(s.get("sensor_offset", 0.5)),
         )
+        if fm_uses_scan and clr.shape[-1] != int(policy.ctx.extero_sensor_dim):
+            raise ValueError(
+                f"cast {clr.shape[-1]} rays but the generator conditions on "
+                f"{int(policy.ctx.extero_sensor_dim)}. The grid geometry and the checkpoint "
+                "disagree; a Normalizer broadcast would be the next thing to fail, further "
+                "from the cause."
+            )
         # Missed rays must match IsaacLab's encoding, NOT 0.0. Isaac's miss is ``pos_z - inf -
-        # offset`` = -inf, which sanitize_height_scan maps to -HEIGHT_SCAN_CLIP = -1.0; that is
-        # what both the teacher obs and the FM height token were trained on. Mapping a miss to
-        # 0.0 instead reads as "ground exactly at the nominal sensor plane" -- plausible flat
-        # ground where Isaac reports the band edge. Flat terrain never misses, so this was
+        # offset`` = -inf, and ``sanitize_height_scan`` maps a non-finite reading to the band
+        # edge; that is what both the teacher obs and the FM token were trained on. Mapping a
+        # miss to 0.0 instead reads as "ground exactly at the nominal sensor plane" -- plausible
+        # flat ground where Isaac reports the band edge. Flat terrain never misses, so this was
         # invisible until isolated (has_floor=False) stair/box tiles, where rays overshoot the
         # tile edge and ~2-3% of them miss right at the stair transition.
-        state["height_scan"] = np.nan_to_num(clr, nan=-1.0)
+        #
+        # Leave the miss as -inf rather than substituting here: each consumer then applies its
+        # OWN sanitize with its own band (the FM's comes from the checkpoint), exactly as in
+        # Isaac. Pre-substituting a number hard-codes one consumer's band for all of them --
+        # which was silently wrong the moment the FM's band became configurable.
+        state["height_scan"] = np.where(np.isnan(clr), -np.inf, clr)
         state["height_scan_hits"] = hits
     # Depth cameras: cast the policy's own pinhole grids against the terrain AND the
     # robot's visual meshes, normalised exactly as the observation term does. One cast

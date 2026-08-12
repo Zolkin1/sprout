@@ -10,7 +10,9 @@ commanded-velocity profile, generating a future trajectory in the current root f
 
 from .config import (
     ATTENTION_MODES,
+    EXTERO_CLIP,
     EXTERO_ENCODERS,
+    EXTERO_NORM_MODES,
     EXTERO_SOURCES,
     FlowMatchingConfig,
 )
@@ -81,6 +83,8 @@ __all__ = [
     "WeightEMA",
     "EXTERO_SOURCES",
     "EXTERO_ENCODERS",
+    "EXTERO_NORM_MODES",
+    "EXTERO_CLIP",
     "ATTENTION_MODES",
     "FlowMatchingTransformer",
     "ExteroImageEncoder",

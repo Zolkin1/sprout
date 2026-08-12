@@ -183,7 +183,7 @@ def test_windowed_dataset_matches_per_step():
     assert tl.val_episode_ids == tw.val_episode_ids
 
     def _same(ds_a, ds_b):
-        for attr in ("state", "history", "extero_norm_tokens", "cmd_tokens", "p_ref", "q_ref"):
+        for attr in ("state", "history", "extero", "cmd_tokens", "p_ref", "q_ref"):
             a, b = getattr(ds_a, attr), getattr(ds_b, attr)
             assert torch.allclose(a, b, atol=1e-5), f"{attr} differs (max {(a - b).abs().max():.2e})"
 

@@ -16,7 +16,13 @@ only as a renderer.
 
 What changes, and what deliberately does not:
 
-* ``depth`` -- re-rendered from the displaced pose. The ONLY channel carrying the offset.
+* ``depth`` -- re-rendered from the displaced pose.
+* ``height_scan`` -- re-cast from the displaced pose, when the recording carries one. These two
+  are the ONLY channels carrying the offset. The scan was previously copied through
+  BIT-IDENTICAL while the anchor moved (measured: 0.18 m mean anchor shift, 40/40 windows
+  bit-equal), so a scan-conditioned model saw a sensor that contradicted its own target -- this
+  script's premise, inverted. Which sensor is derived from the RECORDED ray count, not named,
+  since the generator may scan on its own grid.
 * ``history_state[H-1]`` root position + yaw -- the SNAP ANCHOR, the frame the dataset
   anchors ``ref_future`` against (``world_to_window``'s anchor is YAW-ONLY, so roll/pitch
   there are never read). Displacing it is what turns the unchanged world-frame clip into a
@@ -113,9 +119,17 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
+from isaaclab.managers import SceneEntityCfg  # noqa: E402
+
 # After the SimulationApp, or the per-link contact sensors find no bodies (same as play.py).
 import robot_rl.sensors._recursive_contact_sensor_impl  # noqa: F401,E402
 import robot_rl.tasks  # noqa: F401,E402
+
+# Module scope, NOT inside the render loop. A loop body is not a scope, so a
+# ``from ... import mdp`` down there makes ``mdp`` a local of main() for the WHOLE function --
+# and the sensor-scoping added later reads it ~300 lines earlier, which is an
+# UnboundLocalError on the first call. The script has not been runnable since.
+from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: E402
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
@@ -329,6 +343,62 @@ def main() -> int:
     print(f"[augment] re-rendering {_render_sensors} "
           f"(obs group(s): {_render_groups or 'all'})")
 
+    # The HEIGHT SCAN has to be re-cast too. Every per-window array is otherwise copied
+    # straight from the un-displaced source (see the ``out = {...}`` comprehension below), so
+    # before this the scan was carried through BIT-IDENTICAL while the anchor moved by ~0.18 m
+    # -- the sensor said "the riser is here" and the target said "correct back to there". That
+    # is the very shortcut this script exists to remove, inverted, and it is silently worse
+    # than not augmenting at all. Harmless for a depth-conditioned FM, fatal for a
+    # scan-conditioned one.
+    #
+    # WHICH sensor, DERIVED from the recorded width rather than named: the generator may scan
+    # on its own grid, in which case the recorded ``height_scan`` came from THAT sensor and
+    # re-casting the policy's would produce a correctly-shaped array of the wrong geometry.
+    _scan_sensor = None
+    if "height_scan" in data:
+        _rec_k = int(data["height_scan"].shape[1])
+        _cands = {}
+        for _sname in u.scene.sensors:
+            if _sname in _render_sensors:
+                continue          # a depth camera, already handled above
+            try:
+                _cands[_sname] = int(mdp.height_scan(u, SceneEntityCfg(_sname)).shape[1])
+            except Exception:
+                continue          # not a height-scanning RayCaster
+        _match = [n for n, k in _cands.items() if k == _rec_k]
+        if not _match:
+            raise SystemExit(
+                f"the recording carries a {_rec_k}-ray 'height_scan' but this task's scanners "
+                f"cast {_cands or 'nothing'}. A re-cast must reproduce the source EXACTLY, so "
+                "point --task at the task the recording came from (or pass the same "
+                "--fm_height_scan geometry it was recorded with).")
+        if len(_match) > 1:
+            raise SystemExit(
+                f"{_match} all cast {_rec_k} rays, so the recorded scan cannot be attributed "
+                "to one of them. Give them distinct grids, or drop the ambiguous sensor.")
+        _scan_sensor = _match[0]
+        _scan_cfg = SceneEntityCfg(_scan_sensor)
+        # The recording's own geometry must match what this env casts. Same doctrine as the
+        # depth resolution check above: a re-cast has to reproduce the SOURCE, and a scan of
+        # the right ray count over the wrong extent is invisible to every width assertion.
+        _rec_scan_spec = list(getattr(meta, "height_scan_spec", None) or [])
+        if _rec_scan_spec:
+            _live_scan = mdp.height_scan_specs(u, _scan_sensor)
+            _keys = ("resolution", "size", "ordering", "height", "width", "offset_pos",
+                     "ray_alignment", "sensor_offset")
+            _want = {k: _rec_scan_spec[0].get(k) for k in _keys if k in _rec_scan_spec[0]}
+            _got = {k: _live_scan[0].get(k) for k in _keys if k in _rec_scan_spec[0]}
+            if _want != _got:
+                raise SystemExit(
+                    f"the recording's scan geometry differs from this task's:\n"
+                    f"  recording: {_want}\n  task     : {_got}\n"
+                    "A re-cast must reproduce the source EXACTLY -- pass the same "
+                    "--fm_height_scan geometry record_data.py used, or point --task at the "
+                    "task the recording came from.")
+        print(f"[augment] re-casting height scan from {_scan_sensor!r} ({_rec_k} rays)")
+    else:
+        print("[augment] recording carries no 'height_scan'; nothing to re-cast")
+
     # Joint ORDER: the recording's joint_pos columns are meaningless unless they line up with
     # this articulation's. A silent mismatch would scramble the posture, which moves the
     # torso-mounted cameras as well as the self-scan -- i.e. it would corrupt exactly what we
@@ -404,6 +474,7 @@ def main() -> int:
         )
 
     diffs = []
+    scan_diffs = []
     samples = []
     perwin = []
     allren = []
@@ -557,7 +628,6 @@ def main() -> int:
                          wrote_pos=place_pos, achieved_jp=aj, wrote_jp=jp[keep],
                          link_pos=lk, com_pos=cm)
                 main._pose_checked = True
-            from robot_rl.tasks.manager_based.robot_rl import mdp
             # FORCE the ray-casters to re-cast. They carry update_period=0.02 and are normally
             # driven by env.step()'s sensor pass; a bare sim.step() leaves them believing they
             # are already current, so the read returns STALE data -- which looked exactly like
@@ -573,11 +643,17 @@ def main() -> int:
                 # generator may sample the same lenses on its own grid, in which case the
                 # recorded ``depth`` came from THAT pair and re-rendering the policy's would
                 # silently produce the wrong array (or the wrong width).
-                for _sname in _render_sensors:
+                for _sname in _render_sensors + ([_scan_sensor] if _scan_sensor else []):
                     u.scene.sensors[_sname].update(u.physics_dt, force_recompute=True)
                 # Same producer the recorder used, so this is the OBSERVATION value,
                 # normalized identically -- anything else would not be like for like.
                 dep = to_torch(mdp.depth_obs_stack(u, _render_groups))[ti].detach().cpu().numpy()
+                # The scan goes through the RAW obs function, which is exactly how the recorder
+                # reads it (record_data.py calls mdp.height_scan directly) -- so no term noise
+                # and no term clip, on both sides. Same one-read-cycle lag as the cameras, so
+                # it relies on the same "keep the SECOND read" above.
+                scn = (to_torch(mdp.height_scan(u, _scan_cfg))[ti].detach().cpu().numpy()
+                       if _scan_sensor is not None else None)
 
             if args_cli.check_only:
                 rec = data["depth"][idx[keep]]
@@ -586,6 +662,12 @@ def main() -> int:
                                         np.abs(dep - rec).mean(axis=(1, 2))], axis=1))
                 allren.append(dep.astype(np.float32))
                 allsrc.append(idx[keep])
+                if scn is not None:
+                    # The scan's delta-0 should be TIGHTER than depth's: it carries no DR and
+                    # no noise, so the only residual is float replay of the same cast. A
+                    # non-zero scan diff at zero offset therefore means the placement or the
+                    # tile layout is wrong, not that a sensor was jittered.
+                    scan_diffs.append(np.abs(scn - data["height_scan"][idx[keep]]))
                 if len(samples) < 6:      # keep a few raw pairs for visual inspection
                     for j in range(min(6 - len(samples), dep.shape[0])):
                         samples.append((rec[j].copy(), dep[j].copy()))
@@ -594,6 +676,10 @@ def main() -> int:
                 out = {kk: np.asarray(v[sel_idx]).copy() for kk, v in data.items()
                        if isinstance(v, np.ndarray) and v.shape[:1] == (W,)}
                 out["depth"] = dep.astype(np.float32)
+                # Overwrite, do NOT inherit: the comprehension above just copied the
+                # un-displaced scan. Keep the source dtype so an f16 recording round-trips.
+                if scn is not None:
+                    out["height_scan"] = scn.astype(data["height_scan"].dtype)
                 # Move each reference node by the FREE part of the displacement, per its own
                 # anchor mask. Without this the target says "every axis is world-fixed" and the
                 # generator would learn to correct even along axes the mask leaves free.
@@ -641,12 +727,25 @@ def main() -> int:
         if samples:
             stats["rec"] = np.stack([a for a, _ in samples])
             stats["ren"] = np.stack([b for _, b in samples])
+        sd = np.concatenate([x.reshape(-1) for x in scan_diffs]) if scan_diffs else None
+        if sd is not None:
+            stats.update(scan_mean=float(sd.mean()), scan_p50=float(np.median(sd)),
+                         scan_p99=float(np.percentile(sd, 99)), scan_max=float(sd.max()),
+                         scan_frac_gt_1mm=float((sd > 1e-3).mean()))
         np.savez(cpath, **stats)
         print(f"[augment] wrote {cpath}")
         print(f"\n=== delta-0 ROUND TRIP over {n_done} windows ===")
         print(f"  |re-rendered - recorded| depth:  mean {d.mean():.5f}  p50 "
               f"{np.median(d):.5f}  p99 {np.percentile(d, 99):.5f}  max {d.max():.5f}")
         print(f"  fraction of pixels > 1e-3: {100.0 * (d > 1e-3).mean():.2f}%")
+        if sd is not None:
+            print(f"  |re-cast - recorded|   scan :  mean {sd.mean():.5f}  p50 "
+                  f"{np.median(sd):.5f}  p99 {np.percentile(sd, 99):.5f}  max {sd.max():.5f}")
+            print(f"  fraction of rays > 1e-3:   {100.0 * (sd > 1e-3).mean():.2f}%")
+            print("  (the scan carries no DR and no noise, so its delta-0 should be TIGHTER "
+                  "than depth's -- a non-zero scan diff means placement, not jitter)")
+        else:
+            print("  scan: NOT CHECKED (recording carries no 'height_scan')")
         print("  (near-zero => placement, tile alignment and sensor refresh are all correct)")
     else:
         writer.close()

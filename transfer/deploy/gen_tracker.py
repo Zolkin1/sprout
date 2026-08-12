@@ -310,6 +310,35 @@ class GenTrackerPolicy:
                         "encoder is convolutional, so a transposed image is scrambled input, "
                         "not a reordered vector -- re-export the FM from a matching recording."
                     )
+        elif self.ctx.extero_source == "height_scan":
+            # Previously this whole block was depth-only, so a scan graph was neither refused
+            # NOR validated: it fell through with no geometry check at all, and the runner's
+            # fallback grid then cast whatever the policy's historical grid happened to be.
+            fm_scan = next(iter(self.ctx.extero_spec or []), None)
+            if fm_scan and bool(fm_scan.get("privileged")):
+                raise ValueError(
+                    f"fm.onnx conditions on the PRIVILEGED dense height scan "
+                    f"({fm_scan.get('size')} m @ {fm_scan.get('resolution')} m = "
+                    f"{fm_scan.get('num_rays')} rays). That is exact noise-free ground truth "
+                    "over metres of terrain -- no sensor produces it, so this pair cannot be "
+                    "deployed. It is an Isaac-only diagnostic that bounds what perception "
+                    "could buy; export it with --allow_privileged_extero only for a non-deploy "
+                    "use."
+                )
+            tracker_scan = (self._trk.get_height_scan_spec()
+                            if hasattr(self._trk, "get_height_scan_spec") else None)
+            if fm_scan and tracker_scan:
+                keys = ("resolution", "size", "ordering", "offset_pos", "ray_alignment",
+                        "sensor_offset")
+                mine = {k: fm_scan.get(k) for k in keys if k in fm_scan}
+                theirs = {k: tracker_scan.get(k) for k in keys if k in fm_scan}
+                if mine != theirs:
+                    raise ValueError(
+                        "fm.onnx and tracker.onnx describe DIFFERENT height-scan grids:\n"
+                        f"  fm      : {mine}\n  tracker : {theirs}\n"
+                        "There is one physical robot casting one grid, so a tracker and a "
+                        "generator running together cannot each want their own."
+                    )
         # The fold belongs to whichever cameras the GENERATOR reads, so it is printed on that
         # line -- attached to the tracker's it reads as though its grid were the folded one.
         fold = (f" folded {self.ctx.extero_image_hw[0][0]}x{self.ctx.extero_image_hw[0][1]} -> "

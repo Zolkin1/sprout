@@ -191,14 +191,77 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # sample with the learned null embedding before its history fills. Absent in graphs
         # exported before that input existed.
         "has_history_null": True,
+        # The clip band this checkpoint TRAINED under. The deploy port must clamp the same
+        # way or it is feeding a differently-bounded sensor; absent -> the per-source
+        # default, which is what a pre-field graph used.
+        "extero_clip": (None if ctx.extero_clip is None else float(ctx.extero_clip)),
     }
 
 
-def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
-    """Export ``checkpoint`` to ``out_path`` and embed ``fm_meta``; return the meta."""
+def _refuse_privileged_extero(ctx, checkpoint: str, allow: bool) -> None:
+    """Refuse to export a generator conditioned on a signal no deployment can produce.
+
+    A dense noise-free height scan is exact ground truth over metres of terrain: there is no
+    sensor that yields it, MuJoCo's port is a per-ray Python loop, and the hardware config
+    exporter has no wiring for it. An ONNX graph exists to be run off-sim, so emitting one
+    here would produce an artifact whose only possible use is to fail later -- and to fail
+    *quietly*, because the deploy side would fall back to a coarse default grid and hand the
+    model a correctly-shaped array of the wrong signal.
+
+    Args:
+        ctx: The loaded FM context.
+        checkpoint: Path, for the message.
+        allow: Skip the refusal (``--allow_privileged_extero``).
+
+    Raises:
+        ValueError: When the checkpoint's exteroception is marked privileged and ``allow`` is
+            False.
+    """
+    spec = list(ctx.extero_spec or [])
+    if not any(bool(s.get("privileged")) for s in spec):
+        return
+    detail = ", ".join(
+        f"{s.get('sensor')} {s.get('size')} m @ {s.get('resolution')} m "
+        f"({s.get('height')}x{s.get('width')} = {s.get('num_rays')} rays)"
+        for s in spec if s.get("privileged")
+    )
+    if not allow:
+        raise ValueError(
+            f"{checkpoint} conditions on PRIVILEGED exteroception ({detail}), which no "
+            "deployment can reproduce -- it is an exact noise-free ground-truth map, and it "
+            "exists to bound what perception could buy, not to be run off-sim. Exporting it "
+            "would yield a graph whose deploy path substitutes a coarse fallback grid and "
+            "feeds the model the wrong signal at the right shape. Pass "
+            "--allow_privileged_extero if you have a use that is not deployment."
+        )
+    print(f"[WARN] exporting a PRIVILEGED-exteroception generator ({detail}). Nothing off-sim "
+          "can produce this input; the deploy path will refuse it.")
+
+
+def export_fm_onnx(
+    checkpoint: str, out_path: str, opset: int = 18, allow_privileged_extero: bool = False
+) -> dict:
+    """Export ``checkpoint`` to ``out_path`` and embed ``fm_meta``; return the meta.
+
+    Args:
+        checkpoint: Path to the FM ``.pt``.
+        out_path: Output ``.onnx`` path.
+        opset: ONNX opset.
+        allow_privileged_extero: Export even when the generator conditions on a privileged
+            signal no deployment can produce. Off by default, because the whole value of an
+            exported graph is that something off-sim can run it.
+
+    Returns:
+        The embedded ``fm_meta`` dict.
+
+    Raises:
+        ValueError: On a non-command-conditioned checkpoint, or on a privileged-exteroception
+            checkpoint without the override.
+    """
     ctx = load_fm_context(checkpoint, device="cpu")
     if ctx.cmd_dim <= 0:
         raise ValueError("export_fm_onnx expects a command-conditioned checkpoint (cmd_dim>0).")
+    _refuse_privileged_extero(ctx, checkpoint, allow_privileged_extero)
     wrapper = _FmSamplerOnnx(ctx).eval()
 
     v, n, f, d, n_cmd, cmd = 1, ctx.N, ctx.F, ctx.D, ctx.num_cmd_tokens, ctx.cmd_dim
@@ -237,9 +300,16 @@ def main() -> None:
     p.add_argument("--checkpoint", required=True, help="Path to the FM .pt checkpoint.")
     p.add_argument("--out", default=None, help="Output .onnx path (default: alongside the checkpoint).")
     p.add_argument("--opset", type=int, default=18)
+    p.add_argument(
+        "--allow_privileged_extero", action="store_true", default=False,
+        help="Export even when the generator conditions on a PRIVILEGED signal (an exact "
+             "noise-free dense height scan). Refused by default: no deployment can produce "
+             "it, so the graph could only fail later -- and would fail quietly, because the "
+             "deploy path substitutes a coarse fallback grid.")
     args = p.parse_args()
     out = args.out or os.path.join(os.path.dirname(args.checkpoint), "fm.onnx")
-    export_fm_onnx(args.checkpoint, out, args.opset)
+    export_fm_onnx(args.checkpoint, out, args.opset,
+                   allow_privileged_extero=args.allow_privileged_extero)
 
 
 if __name__ == "__main__":

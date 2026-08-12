@@ -34,6 +34,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 sys.path.insert(0, os.path.join(_THIS_DIR, os.pardir, "rsl_rl"))
 from recorded_data_io import (  # noqa: E402  isort: skip
+    WINDOW_ARRAY_KEYS,
     load_recorded_data,
     load_recorded_windows,
     is_windowed_recording,
@@ -45,6 +46,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     FlowMatchingConfig,
     ATTENTION_MODES,
     EXTERO_ENCODERS,
+    EXTERO_NORM_MODES,
     EXTERO_SOURCES,
     FlowMatchingTransformer,
     FutureStateDataset,
@@ -118,8 +120,10 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "(16 on the 30x26 pair) each carrying a learned spatial slot -- the flat "
              "alternative is permutation-invariant over pixels, so nothing in the model can "
              "attend to WHERE in the frame a step edge is. 'mlp' = the original one token "
-             "per reading, the only option for --extero_source height_scan and the A/B "
-             "baseline. 'auto' picks by source (depth -> cnn, scan -> mlp).")
+             "per reading, and the A/B baseline. 'auto' picks by source (depth -> cnn, "
+             "scan -> mlp) -- 'auto' does NOT convolve a scan, because that would silently "
+             "re-architect every existing scan run; pass 'cnn' explicitly, on a recording "
+             "whose height_scan_spec states the grid's (H, W) fold.")
     parser.add_argument(
         "--extero_cnn_channels", type=str,
         default=",".join(str(c) for c in FlowMatchingConfig().extero_cnn_channels),
@@ -143,13 +147,61 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "'full' is what every checkpoint before this flag was trained under; pass it for "
              "a controlled comparison against one.")
     parser.add_argument(
+        "--pinned_axis_loss_weight", type=float,
+        default=FlowMatchingConfig().pinned_axis_loss_weight,
+        help="Relative flow-loss weight on root DOFs the anchor mask PINS to the terrain -- "
+             "height on flat nodes, downrange + height + yaw on stair/box nodes. 1.0 (default) "
+             "is off. These are exactly the axes the generator gets wrong: it slides its "
+             "predicted terrain segment along with a displaced robot instead of leaving it "
+             "where the terrain put it. Weights are RENORMALIZED to mean 1, so the loss scale "
+             "and the effective learning rate match an unweighted run and a with/without A/B "
+             "differs in one thing only. Needs the recorded clip index and the clip library "
+             "(joined and hash-checked, as --transition_fraction is).")
+    parser.add_argument(
+        "--extero_cnn_strides", type=str, default="",
+        help="Comma-separated per-layer convolution stride, one per --extero_cnn_channels "
+             "entry. Empty means stride 2 everywhere (the shipped depth behaviour). A LEADING "
+             "stride-1 layer keeps the first stage at full resolution, which is how a dense "
+             "metric scan preserves 0.025 m detail and still lands on a small token grid: "
+             "'1,2,2,2' takes 121x121 -> 16x16 = 256 tokens. The grid target and this list are "
+             "coupled, so changing one alone changes the transformer's sequence length.")
+    parser.add_argument(
         "--extero_norm_mode", type=str, default=FlowMatchingConfig().extero_norm_mode,
-        choices=["per_element", "per_sensor"],
-        help="How the exteroception normalizer is FIT. 'per_element' is one (mean, std) per "
+        choices=list(EXTERO_NORM_MODES),
+        help="How the exteroception is scaled. 'per_element' is one fitted (mean, std) per "
              "pixel -- the original behaviour, and a spatially VARYING transform, which is "
-             "what a convolution's weight sharing assumes away. 'per_sensor' pools one "
-             "(mean, std) per camera and broadcasts it, so the same edge looks the same "
-             "wherever it sits. Irrelevant to --extero_encoder mlp.")
+             "what a convolution's weight sharing assumes away. 'per_sensor' pools one fitted "
+             "(mean, std) per sensor and broadcasts it, so the same edge looks the same "
+             "wherever it sits. 'metric' uses a DECLARED affine and no fit at all, so the "
+             "input is metres/scale and is identical across recordings -- both fitted modes "
+             "make a checkpoint's notion of '1 m' a property of its training set. Irrelevant "
+             "to --extero_encoder mlp.")
+    parser.add_argument(
+        "--extero_norm_scale", type=float, default=FlowMatchingConfig().extero_norm_scale,
+        help="Divisor for --extero_norm_mode metric. Default 1.0, i.e. the network input IS "
+             "metres.")
+    parser.add_argument(
+        "--extero_clip", type=float, default=None,
+        help="Symmetric clip band applied before normalization, in the source's units. "
+             "Default: 1.0 m for the scan, 2.0 (normalised) for depth. The scan default is "
+             "too tight for a large grid -- measured on the real recording, 33%% of "
+             "stairs_dn_pure rays already exceed +1 m at 176 rays, and a 3 m window destroys "
+             "~11%% of the image (42%% on descents). ~2.0 leaves 0.5%% clipped. Safe to widen "
+             "because the generator has its own scanner, so the teacher's clip=(-1,1) obs "
+             "terms and the critic's input distribution are untouched. The dataset PRINTS the "
+             "saturation and miss fractions it measured, so pick this from a run's own log.")
+    parser.add_argument(
+        "--noise_height_scan", type=float, default=None,
+        help="Train-time uniform noise amplitude on a height-scan reading, in metres "
+             "(default 0.1). Set 0 for a privileged noise-free scan -- and note a recording "
+             "stamped extero_noise_free already zeroes it, so this is only for deliberately "
+             "ADDING noise back as an ablation. Do NOT use --no-obs_noise for this: that also "
+             "kills the history noise and changes two variables at once.")
+    parser.add_argument(
+        "--noise_depth", type=float, default=None,
+        help="Train-time uniform noise amplitude on a depth reading, in normalised units "
+             "(default 0.05 = 0.1 m). Forced to 0 when the recording already carries the sim's "
+             "depth DR (extero_corrupted).")
     parser.add_argument(
         "--reference_blocks", type=str, default=None,
         help="Comma-separated reference-window blocks the generator predicts, out of "
@@ -325,9 +377,22 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         extero_cnn_channels=[int(c) for c in args.extero_cnn_channels.split(",") if c.strip()],
         extero_cnn_grid=([int(g) for g in args.extero_cnn_grid.split(",") if g.strip()]
                          or None),
+        extero_cnn_strides=([int(s) for s in args.extero_cnn_strides.split(",") if s.strip()]
+                            or None),
         extero_norm_mode=args.extero_norm_mode,
+        extero_norm_scale=args.extero_norm_scale,
+        pinned_axis_loss_weight=args.pinned_axis_loss_weight,
         attention_mode=args.attention_mode,
     )
+    # Noise amplitudes and the clip band keep their per-source defaults unless named, so an
+    # unspecified flag reproduces the previous behaviour exactly rather than overwriting it
+    # with an argparse default.
+    if args.extero_clip is not None:
+        cfg.extero_clip = float(args.extero_clip)
+    if args.noise_height_scan is not None:
+        cfg.noise_height_scan = float(args.noise_height_scan)
+    if args.noise_depth is not None:
+        cfg.noise_depth = float(args.noise_depth)
     return cfg, args
 
 
@@ -498,10 +563,18 @@ def main() -> None:
     # ~10 GB file just to train once.
     data_paths = [_resolve_data_path(p) for p in str(args.data).split(",") if p.strip()]
     parts = []
+    # Which arrays this run will actually READ. A recording carries both exteroception
+    # signals so one file can train either generator, and at a dense scan the unused one is
+    # the largest thing in the file -- so not loading it is the single biggest saving
+    # available, and it costs nothing to know in advance.
+    unused_extero = [s for s in EXTERO_SOURCES if s != cfg.extero_source]
+    load_keys = [k for k in WINDOW_ARRAY_KEYS if k not in unused_extero]
     for dp in data_paths:
         print(f"[INFO] Loading dataset: {dp}")
-        parts.append(load_recorded_windows(dp) if is_windowed_recording(dp)
-                     else load_recorded_data(dp))
+        if is_windowed_recording(dp):
+            parts.append(load_recorded_windows(dp, keys=load_keys))
+        else:
+            parts.append(load_recorded_data(dp))
     data, meta = parts[0]
     if len(parts) > 1:
         # episode_id must stay UNIQUE across files or the train/val split leaks: the split is
@@ -515,6 +588,21 @@ def main() -> None:
                     f"recordings carry different arrays and cannot be concatenated:\n"
                     f"  {sorted(set(data) - set(extra))} missing from a later file\n"
                     f"  {sorted(set(extra) - set(data))} missing from the first")
+            # Only the FIRST file's meta survives (see below), so a geometry difference would
+            # be invisible: two scans of the same WIDTH but different extent or resolution
+            # concatenate silently and train as if they were one sensor. Array widths already
+            # fail loudly in np.concatenate; this catches the case they cannot see.
+            for field in ("height_scan_spec", "depth_camera_spec"):
+                mine = getattr(meta, field, None)
+                theirs = getattr(extra_meta, field, None)
+                if _sensor_geometry_key(mine) != _sensor_geometry_key(theirs):
+                    raise SystemExit(
+                        f"recordings disagree on {field}:\n"
+                        f"  first : {_sensor_geometry_key(mine)}\n"
+                        f"  later : {_sensor_geometry_key(theirs)}\n"
+                        "Same-width sensors with different geometry would concatenate "
+                        "silently and train as one. Record them with matching geometry, or "
+                        "train them separately.")
             for k in data:
                 if k == "episode_id":
                     data[k] = np.concatenate([data[k], np.asarray(extra[k]) + ep_off])
@@ -547,14 +635,36 @@ def main() -> None:
     # before and which is what the transformer's cost actually scales with.
     shapes = (", ".join(f"{h}x{w}" for h, w in (train_ds.extero_image_hw or []))
               or "(no image shape)")
+    strides = (tuple(cfg.extero_cnn_strides) if cfg.extero_cnn_strides
+               else (2,) * len(cfg.extero_cnn_channels))
     detail = (f"grid={tuple(cfg.extero_cnn_grid) if cfg.extero_cnn_grid else 'native'}, "
-              f"channels={list(cfg.extero_cnn_channels)}, images {shapes}, "
+              f"channels={list(cfg.extero_cnn_channels)}, strides={list(strides)}, "
+              f"images {shapes}, "
               if cfg.extero_encoder == "cnn" else "")
     print(f"[INFO] extero_encoder={cfg.extero_encoder} ({detail}"
           f"{cfg.tokens_per_sensor} token(s)/sensor -> {cfg.extero_seq_tokens} extero "
           f"tokens), extero_norm_mode={cfg.extero_norm_mode}; SEQUENCE LENGTH "
           f"{cfg.sequence_len} = {cfg.num_history_states} history + {cfg.extero_seq_tokens} "
           f"extero + {cfg.num_cmd_tokens} cmd + {cfg.future_len} future.")
+    # The positional information, stated explicitly because it is the point of the metric
+    # path and a checkpoint carries no obvious evidence of it: a convolution given coordinate
+    # channels is a structurally different model from one that is not.
+    if cfg.extero_coord_extent_m is not None:
+        print(f"[INFO] metric grid {cfg.extero_coord_extent_m[0]}x"
+              f"{cfg.extero_coord_extent_m[1]} m, ordering={cfg.extero_grid_ordering}: "
+              f"pixel (x, y) offsets in METRES as CoordConv channels + a "
+              f"{cfg.extero_fourier_bands}-band Fourier embedding of each token's cell centre"
+              + (f", validity channel on (miss -> {cfg.extero_miss_sentinel:+.3f})"
+                 if cfg.extero_miss_sentinel is not None else "")
+              + ". A shared kernel is translation-equivariant, so without this it cannot "
+                "represent WHERE an edge is.")
+    # The noise that actually reaches the exteroception token, after every gate above.
+    print(f"[INFO] extero={cfg.extero_source} noise: {cfg.noise_extero:g} "
+          f"x noise_scale {cfg.noise_scale:g} "
+          f"(obs_noise={'on' if cfg.obs_noise else 'OFF'}) -> "
+          f"{'NO noise reaches the exteroception token' if not (cfg.obs_noise and cfg.noise_extero) else 'noise IS applied'}"
+          f"; recording extero_noise_free="
+          f"{bool(getattr(meta, 'extero_noise_free', False))}.")
     # Stated in the log because a checkpoint carries no structural evidence of it -- the two
     # attention modes share one parameter set, so this line is how a run's architecture stays
     # attributable after the fact.
@@ -630,19 +740,10 @@ def main() -> None:
         eval_loader = DataLoader(eval_ds, batch_size=cfg.batch_size, shuffle=False,
                                  num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
 
-    model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=cfg.future_len,
-        num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
-        extero_sensor_dim=cfg.extero_sensor_dim,
-        extero_sensor_count=cfg.extero_sensor_count, cmd_dim=cfg.cmd_dim,
-        cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
-        num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
-        # ``cfg.extero_encoder`` is already RESOLVED (the dataset wrote "auto" out), and
-        # ``extero_image_hw`` was derived from the recording's camera contract there.
-        extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
-        extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
-        attention_mode=cfg.attention_mode,
-    ).to(device)
+    # ONE construction site, shared with ``online.load_fm_context`` -- see
+    # ``FlowMatchingTransformer.from_config`` for why spelling the arguments out here twice
+    # was a bug rather than a duplication.
+    model = FlowMatchingTransformer.from_config(cfg).to(device)
     extero_params = sum(p.numel() for n, p in model.named_parameters() if "extero" in n)
     print(f"[INFO] Model parameters: {sum(p.numel() for p in model.parameters()):,}  "
           f"(exteroception branch: {extero_params:,}; "
@@ -729,6 +830,13 @@ def main() -> None:
                 model, state, history, extero, cmd_tokens,
                 history_null_mask=null_mask,
                 state_norm=train_ds.state_normalizer,
+                # Present only when the pinned-axis weighting is on; the loss treats an
+                # absent mask as "every channel equal", which is the historical behaviour.
+                anchor_mask=(batch["anchor_mask"].to(device)
+                             if "anchor_mask" in batch else None),
+                mask_frame_yaw_rel=(batch["mask_frame_yaw_rel"].to(device)
+                                    if "mask_frame_yaw_rel" in batch else None),
+                pinned_axis_weight=cfg.pinned_axis_loss_weight,
                 **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk, body_fk),
             )
             out["loss"].backward()
@@ -806,6 +914,33 @@ def main() -> None:
     if wandb_run is not None:
         wandb_run.finish()
     print(f"[INFO] Done. Checkpoints in {out_dir}")
+
+
+def _sensor_geometry_key(spec: list[dict] | None) -> tuple | None:
+    """The geometry-identifying fields of a sensor contract, for cross-file comparison.
+
+    Deliberately a SUBSET: two recordings from different runs legitimately differ in
+    per-episode noise state or update period, but must agree on what the pixels MEAN. Missing
+    keys compare as ``None`` so an old contract and a new one differ only where they really do.
+
+    Args:
+        spec: A ``height_scan_spec`` / ``depth_camera_spec`` list, or ``None``.
+
+    Returns:
+        A hashable key, or ``None`` when there is no contract.
+    """
+    if not spec:
+        return None
+    keys = ("sensor", "resolution", "size", "ordering", "height", "width", "num_rays",
+            "offset_pos", "ray_alignment", "sensor_offset", "fx", "fy", "cx", "cy",
+            "offset", "scale")
+    out = []
+    for entry in spec:
+        out.append(tuple(
+            (k, tuple(entry[k]) if isinstance(entry.get(k), list) else entry.get(k))
+            for k in keys if k in entry
+        ))
+    return tuple(out)
 
 
 def _resolve_data_path(path: str) -> str:
