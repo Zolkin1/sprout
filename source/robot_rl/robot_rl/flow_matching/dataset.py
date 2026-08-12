@@ -187,6 +187,47 @@ def apply_declared_scales(normalizer: Normalizer, declared: torch.Tensor | None)
     )
 
 
+def declared_scale_summary(
+    block_slices: dict[str, slice], declared: torch.Tensor, fitted_std: torch.Tensor,
+) -> str:
+    """``name[k/width] scale(s) vs fitted [min,max]`` per block, over the DECLARED channels.
+
+    Restricting the fitted range to the channels a declaration actually REPLACES is the
+    whole point. Taken over the full block slice it reported numbers no declaration touches:
+    ``base_pose`` spans position + rot6d, and the rot6d columns are exempt from
+    standardization, so their std is the mask-forced 1.0 -- which is what made the shipped
+    line read ``base_pose 0.4 vs [0.090,1.000]`` and the declared 0.4 look like it was
+    overriding a fitted 1.0 when the position channels it replaces fit to 0.442.
+
+    Two smaller things it also gets right: a block can hold MORE than one declared scale
+    (``base_vel`` is lin 0.5 + ang 0.4, and printing ``declared[s.start]`` showed only the
+    lin one), and a block whose first channel is undeclared but whose later ones are (only
+    ``state_scale_base_ang_vel`` set) was dropped from the line entirely.
+
+    Args:
+        block_slices: Block name -> its slice within one window node.
+        declared: ``(D,)`` declared scales, ``0`` where the channel stays fitted.
+        fitted_std: ``(D,)`` std as FITTED, before the declarations were applied.
+
+    Returns:
+        A ``"; "``-joined summary, empty when nothing is declared.
+    """
+    parts = []
+    for name, s in block_slices.items():
+        # A block can be ZERO WIDTH (ee_pos with no extra frames), and its slice then starts
+        # at state_dim -- indexing it would overrun.
+        if s.stop <= s.start:
+            continue
+        pick = declared[s] > 0
+        if not bool(pick.any()):
+            continue
+        scales = ",".join(dict.fromkeys(f"{float(v):g}" for v in declared[s][pick]))
+        kept = fitted_std[s][pick]
+        parts.append(f"{name}[{int(pick.sum())}/{s.stop - s.start}] {scales} vs fitted "
+                     f"[{float(kept.min()):.3f},{float(kept.max()):.3f}]")
+    return "; ".join(parts)
+
+
 def _yaw_from_quat_xyzw(quat: torch.Tensor) -> torch.Tensor:
     """Heading angle (radians) of an ``(..., 4)`` xyzw quaternion.
 
@@ -895,15 +936,9 @@ class FutureStateDataset(Dataset):
                 state_normalizer = apply_declared_scales(state_normalizer, declared)
                 sel = declared > 0
                 print(f"[fm-data] declared state scales on {int(sel.sum())}/{self.state_dim} "
-                      "channels (mean 0, one scale per block) -- the rest stay fitted. "
-                      "Per block, declared scale vs the fitted std it replaces: "
-                      + ", ".join(
-                          f"{name} {float(declared[s.start]):g} vs "
-                          f"[{float(fitted_std[s].min()):.3f},{float(fitted_std[s].max()):.3f}]"
-                          # A block can be ZERO WIDTH (ee_pos with no extra frames), and its
-                          # slice then starts at state_dim -- indexing it would overrun.
-                          for name, s in self.block_slices.items()
-                          if s.stop > s.start and bool(sel[s.start])))
+                      "channels (mean 0) -- the rest stay fitted. Per block, declared "
+                      "scale(s) vs the fitted std they replace: "
+                      + declared_scale_summary(self.block_slices, declared, fitted_std))
         self.state_normalizer = state_normalizer
 
         if extero_normalizer is None:

@@ -382,6 +382,12 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--lr_warmup_steps", type=int, default=FlowMatchingConfig().lr_warmup_steps,
+        help="Ramp the LR linearly to --lr over this many optimizer steps (0 = off). Composes "
+             "with --cosine. Cheap insurance against the predict-the-mean plateau becoming "
+             "permanent -- see FlowMatchingConfig.lr_warmup_steps.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -412,7 +418,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         transition_fraction=args.transition_fraction,
         clip_library_path=args.clip_library_path,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
-        num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
+        num_epochs=args.num_epochs, grad_clip=args.grad_clip,
+        lr_warmup_steps=args.lr_warmup_steps, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
         extero_encoder=args.extero_encoder,
         extero_cnn_channels=[int(c) for c in args.extero_cnn_channels.split(",") if c.strip()],
@@ -502,6 +509,69 @@ def channel_metrics(
 _CONS_KEYS = ("vel_consistency", "joint_vel_consistency", "fk_pose",
               "body_pose_root", "body_pose_root_pos", "body_pose_root_ori",
               "body_pose_world", "body_pose_world_pos", "body_pose_world_ori")
+
+
+def scheduled_lr(base_lr: float, epoch: int, num_epochs: int, step: int,
+                 warmup_steps: int, cosine: bool) -> float:
+    """The learning rate for one optimizer step: cosine over epochs x linear warmup.
+
+    Both factors are CLOSED FORM in ``(epoch, step)`` rather than a stateful
+    ``lr_scheduler``, because the two have to compose at different granularities -- warmup
+    is per step, the cosine per epoch -- and ``CosineAnnealingLR.get_lr`` is recursive in
+    ``param_group["lr"]``. Mutating the group's LR mid-epoch for the warmup would therefore
+    corrupt the cosine's own state instead of scaling it. The cosine factor reproduces
+    ``CosineAnnealingLR(T_max=num_epochs, eta_min=0)`` exactly at epoch granularity, so
+    ``--cosine`` alone behaves as it always did.
+
+    Args:
+        base_lr: The configured peak LR (``cfg.lr``).
+        epoch: Current epoch index.
+        num_epochs: Total epochs (the cosine's ``T_max``).
+        step: Global optimizer-step index (0-based).
+        warmup_steps: Steps over which to ramp linearly to ``base_lr`` (0 = no warmup).
+        cosine: Whether cosine annealing is on.
+
+    Returns:
+        The LR to use for this step.
+    """
+    lr = base_lr
+    if cosine and num_epochs > 1:
+        lr *= 0.5 * (1.0 + math.cos(math.pi * epoch / num_epochs))
+    if warmup_steps > 0 and step < warmup_steps:
+        lr *= (step + 1) / warmup_steps
+    return lr
+
+
+@torch.no_grad()
+def adam_update_snr(opt: torch.optim.Optimizer) -> float:
+    """Median over parameter tensors of ``|exp_avg| / sqrt(exp_avg_sq)`` -- Adam's own SNR.
+
+    The direct "is this run still learning?" number, and the one the gradient norm cannot
+    give: a frozen run's gradient is not zero, it is zero-MEAN, so the norm stays small but
+    finite while the accumulated direction cancels. This ratio is what Adam actually
+    multiplies the LR by, so it separates the two cases outright.
+
+    MEDIAN, not mean, measured on the 2026-08-12 pinned-axis A/B: over the stalled arm's 131
+    parameter tensors the median read 3.8e-5 against the healthy arm's 7.5e-2 (2000x), while
+    the means were 7.0e-3 vs 7.7e-2 (11x) -- a handful of tensors (biases, LayerNorm gains)
+    keep a healthy ratio even in a frozen network and drag the mean up by 200x. The median
+    is what makes a threshold like 1e-3 mean anything.
+
+    Cheap enough to take every epoch (one pass over ~130 state tensors, no backward).
+
+    Args:
+        opt: An Adam/AdamW optimizer that has taken at least one step.
+
+    Returns:
+        The median ratio, or ``0.0`` before the first step (no state yet).
+    """
+    ratios = []
+    for state in opt.state.values():
+        m, v = state.get("exp_avg"), state.get("exp_avg_sq")
+        if m is None or v is None:
+            continue
+        ratios.append(float(m.abs().mean()) / max(float(v.mean()) ** 0.5, 1e-30))
+    return float(np.median(ratios)) if ratios else 0.0
 
 
 @torch.no_grad()
@@ -870,9 +940,9 @@ def main() -> None:
               f"step window, warmed in). best.pt will be selected on val_ema/flow_mse.")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs) if args.cosine else None
-    )
+    if cfg.lr_warmup_steps > 0:
+        print(f"[INFO] LR warmup: linear over the first {cfg.lr_warmup_steps} optimizer steps "
+              f"to lr={cfg.lr:g}" + (" (then cosine over epochs)." if args.cosine else "."))
 
     writer = SummaryWriter(log_dir=out_dir)
     wandb_run = None
@@ -896,7 +966,16 @@ def main() -> None:
         model.train()
         epoch_start = time.perf_counter()
         epoch_loss, n = 0.0, 0
+        epoch_gnorm, n_clipped = 0.0, 0
+        lr_now = scheduled_lr(cfg.lr, epoch, cfg.num_epochs, global_step,
+                              cfg.lr_warmup_steps, args.cosine)   # also the empty-loader value
         for batch in train_loader:
+            # Closed-form schedule, set before the step it applies to. ``global_step`` is
+            # 0-based here (it is incremented after the step, below).
+            lr_now = scheduled_lr(cfg.lr, epoch, cfg.num_epochs, global_step,
+                                  cfg.lr_warmup_steps, args.cosine)
+            for group in opt.param_groups:
+                group["lr"] = lr_now
             state = batch["state"].to(device)
             history = batch["history"].to(device)
             extero = batch["extero"].to(device)
@@ -918,26 +997,42 @@ def main() -> None:
                 **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk, body_fk),
             )
             out["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            # The PRE-clip total norm, which ``clip_grad_norm_`` returns and this used to
+            # throw away. Logged because it is the cheapest early warning there is: a run
+            # that has stalled at the plateau reads two orders of magnitude below a healthy
+            # one within the first epoch, while every loss curve still looks merely flat.
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
             opt.step()
             if ema is not None:
                 ema.update(model)
             epoch_loss += out["loss"].item()
+            epoch_gnorm += grad_norm
+            n_clipped += int(grad_norm > cfg.grad_clip)
             n += 1
             global_step += 1
             writer.add_scalar("train/loss_step", out["loss"].item(), global_step)
+            writer.add_scalar("train/grad_norm_step", grad_norm, global_step)
+            writer.add_scalar("train/lr_step", lr_now, global_step)
             for k in ("flow_mse", *_CONS_KEYS):
                 if k in out:
                     writer.add_scalar(f"train/{k}_step", out[k].item(), global_step)
-        if scheduler is not None:
-            scheduler.step()
 
         epoch_time = time.perf_counter() - epoch_start
         train_loss = epoch_loss / max(n, 1)
+        grad_norm_mean = epoch_gnorm / max(n, 1)
+        clipped_frac = n_clipped / max(n, 1)
+        # Adam's own signal-to-noise. Together with the norm this distinguishes "small
+        # gradients" from "gradients that cancel", which the norm alone cannot.
+        snr = adam_update_snr(opt)
         writer.add_scalar("train/loss_epoch", train_loss, epoch)
-        writer.add_scalar("train/lr", opt.param_groups[0]["lr"], epoch)
+        writer.add_scalar("train/grad_norm", grad_norm_mean, epoch)
+        writer.add_scalar("train/grad_clipped_frac", clipped_frac, epoch)
+        writer.add_scalar("train/adam_snr", snr, epoch)
+        writer.add_scalar("train/lr", lr_now, epoch)
         writer.add_scalar("train/epoch_time_s", epoch_time, epoch)
-        log_line = f"[epoch {epoch}] train_loss={train_loss:.4f}  train_time={epoch_time:.1f}s"
+        log_line = (f"[epoch {epoch}] train_loss={train_loss:.4f}  train_time={epoch_time:.1f}s"
+                    f"  grad_norm={grad_norm_mean:.3f} (clipped {clipped_frac:.0%})"
+                    f"  adam_snr={snr:.2e}  lr={lr_now:.2e}")
 
         # FLOW metrics every epoch, the sampled-rollout RMSEs on the slower cadence: the
         # flow numbers cost 2-3 forward passes while each RMSE needs a full 8-step
@@ -997,6 +1092,9 @@ def main() -> None:
         print(log_line)
         if wandb_run is not None:
             wandb_run.log({"train/loss_epoch": train_loss, "train/epoch_time_s": epoch_time,
+                           "train/grad_norm": grad_norm_mean,
+                           "train/grad_clipped_frac": clipped_frac,
+                           "train/adam_snr": snr, "train/lr": lr_now,
                            "epoch": epoch}, step=epoch)
         if epoch % args.ckpt_every == 0 or epoch == cfg.num_epochs - 1:
             _save_ckpt(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg, train_ds, meta, epoch, ema=ema,
