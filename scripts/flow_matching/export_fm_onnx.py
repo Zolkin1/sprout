@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 
 import onnx
 import torch
@@ -42,6 +43,13 @@ import torch.nn as nn
 
 from robot_rl.flow_matching.window import project_window_rotations, window_blocks
 from robot_rl.flow_matching.online import load_fm_context, FmOnlineContext
+
+# The artifact NAMING rule is shared with the off-sim consumers that have to find these
+# files again, so it lives on the torch-free side and is imported rather than restated.
+sys.path.insert(0, os.path.join(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)), "transfer"))
+
+from deploy.artifacts import fm_artifact_name  # noqa: E402
 
 
 class _FmSamplerOnnx(nn.Module):
@@ -307,7 +315,10 @@ def main() -> None:
              "it, so the graph could only fail later -- and would fail quietly, because the "
              "deploy path substitutes a coarse fallback grid.")
     args = p.parse_args()
-    out = args.out or os.path.join(os.path.dirname(args.checkpoint), "fm.onnx")
+    # Named for the checkpoint, so exporting a second generator beside the first does not
+    # overwrite it and the filename says which model it holds (deploy.artifacts).
+    out = args.out or os.path.join(os.path.dirname(args.checkpoint),
+                                   fm_artifact_name(args.checkpoint))
     export_fm_onnx(args.checkpoint, out, args.opset,
                    allow_privileged_extero=args.allow_privileged_extero)
 

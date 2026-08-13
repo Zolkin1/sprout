@@ -146,7 +146,9 @@ python scripts/rsl_rl/play.py --task=G1-teacher-clf-terrain-play \
 ```
 
 `play.py` also writes the deploy artifacts: `exported/policy.pt`,
-`policy_parameters.yaml`, and (with `--fm_checkpoint`) `tracker.onnx` + `fm.onnx`. Pass
+`policy_parameters.yaml`, and (with `--fm_checkpoint`) `tracker.onnx` + the generator,
+named for the FM checkpoint it came from (`<fm run>_fm.onnx`) so a run's `exported/` can
+hold every generator trained against that teacher instead of overwriting one file. Pass
 `--no_deploy_onnx` to skip the ONNX pair. `tracker.onnx` is the ONLY ONNX form of the
 tracker — it is `policy.pt` re-exported self-contained, batch-dynamic and with the
 deployment parameters embedded, and it is what MuJoCo and the robot load.
@@ -546,7 +548,8 @@ for a like-for-like comparison against a specific clip, or
 `transfer/sim/gen_tracker_runner.py` for a joystick playground on a generated scene.
 
 Both read the artifacts `play.py` exports (`exported/policy_parameters.yaml` +
-`tracker.onnx` / `fm.onnx`), so export before running either. To add a robot, drop its sim
+`tracker.onnx` + a `*_fm.onnx`), so export before running either. With several generators
+in one `exported/`, name the one you mean with `--fm_onnx`; the runners refuse to guess. To add a robot, drop its sim
 files in `transfer/sim/robots/` and add a runner.
 
 Neither needs Isaac: on a box without `env_isaaclab`, build the small downstream venv

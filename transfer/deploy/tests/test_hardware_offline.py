@@ -43,13 +43,44 @@ def _latest_export() -> str | None:
     ``DEPLOY_EXPORT_DIR`` picks one explicitly -- the artifacts under ``logs/`` are
     whatever was last exported there, which may predate the current exporter; point this
     at a fresh ``play.py`` export to test the artifacts you actually mean.
-    Otherwise the most recently modified ``exported`` dir holding a ``tracker.onnx``.
+    Otherwise the most recently modified ``exported`` dir holding a ``tracker.onnx`` --
+    skipping any pair whose generator conditions on a PRIVILEGED signal.  Such a pair is
+    sim-only by construction (``GenTrackerPolicy`` refuses it without an explicit opt-in, and
+    that refusal is what this test would otherwise be reporting as a hardware failure), so
+    "the newest DEPLOYABLE export" is the thing this test means by "the newest export".
     """
     override = os.environ.get("DEPLOY_EXPORT_DIR")
     if override:
         return override
     hits = glob.glob(os.path.join(ROOT, "logs", "rsl_rl", "*", "*", "exported", "tracker.onnx"))
+    hits = [h for h in hits if not _is_privileged_pair(os.path.dirname(h))]
     return os.path.dirname(max(hits, key=os.path.getmtime)) if hits else None
+
+
+def _is_privileged_pair(exported: str) -> bool:
+    """Whether ``exported`` holds a generator conditioned on a privileged signal.
+
+    Read from the ONNX metadata directly rather than by loading the pair, so this stays a
+    cheap filter and does not depend on the very refusal it is filtering for.
+
+    Args:
+        exported: An ``exported`` directory.
+
+    Returns:
+        True when its ``fm.onnx`` declares a privileged exteroception contract.
+    """
+    fm = os.path.join(exported, "fm.onnx")
+    if not os.path.exists(fm):
+        return False
+    import json
+
+    import onnxruntime as ort
+
+    meta = ort.InferenceSession(fm, providers=["CPUExecutionProvider"]) \
+        .get_modelmeta().custom_metadata_map.get("fm_meta")
+    if not meta:
+        return False
+    return any(bool(s.get("privileged")) for s in (json.loads(meta).get("extero_spec") or []))
 
 
 def test_hardware_offline() -> None:

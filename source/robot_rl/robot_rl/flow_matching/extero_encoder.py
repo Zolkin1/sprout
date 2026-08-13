@@ -297,8 +297,17 @@ class ExteroImageEncoder(nn.Module):
             # edge and the metric affine is a fixed constant, so the sentinel arrives as an
             # exact value. Real readings saturated at the same edge are also marked invalid,
             # which is intended -- both are "no usable geometry here".
-            extra.append((~torch.isclose(
-                img, torch.full_like(img, self.miss_sentinel), atol=1e-6)).to(img.dtype))
+            #
+            # Written out rather than ``torch.isclose``: that operator has no ONNX lowering
+            # at opset 18 (``UnsupportedOperatorError: aten::isclose``), so the whole
+            # generator failed to EXPORT the moment this channel existed -- a training-time
+            # detail that silently made a model undeployable. ``other`` is a constant, so
+            # isclose's band ``atol + rtol * |other|`` is itself constant and the two agree
+            # exactly on every finite input. They differ only on NaN (isclose says
+            # "not close" -> valid, this says invalid), which cannot arrive: every reading is
+            # sanitised to a finite value on both the dataset and the deploy side.
+            tol = 1e-6 + 1e-5 * abs(float(self.miss_sentinel))
+            extra.append(((img - float(self.miss_sentinel)).abs() > tol).to(img.dtype))
         if self.coord_extent_m is not None:
             extra.append(self.coord_channels.expand(img.shape[0], -1, -1, -1).to(img.dtype))
         if extra:

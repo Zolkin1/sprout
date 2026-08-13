@@ -141,6 +141,50 @@ the old behaviour, which is what keeps every scoped call site free.
 Relatedly, `export_parameters.py` now emits each obs term's `clip`, so `_assemble` saturates every
 term the way training did instead of consulting a hardcoded table (kept only as a legacy fallback).
 
+## The height-scan contract, and running a PRIVILEGED generator in sim2sim
+`fm_meta.extero_spec` holds whichever sensor the checkpoint trained on, so it is a camera list
+for one FM and a ray grid for another. `transfer/deploy/scan_obs.py` is the scan half:
+`parse_extero_spec` picks the parser from the contract's own `extero_source` (parsing a scan as
+depth failed for a missing `fx`), and `assert_scan_specs_agree` compares the two artifacts over
+the fields they SHARE — `fm.onnx` embeds the full `mdp.height_scan_specs` dict, `tracker.onnx`
+the six `export_parameters` emits — with a floor so a sparse contract cannot agree by silence.
+- A **depth tracker + scan generator** is a legitimate pair (the robot has cameras, the generator
+  reads the ground). `_resolve_depth_cameras` only reconciles `extero_spec` against the tracker's
+  cameras when the FM's source IS depth.
+- The dense scan is marked `privileged`, and that gate is now **sim-only rather than absolute**:
+  `export_fm_onnx --allow_privileged_extero` (plumbed through `play.py`) emits the graph,
+  `gen_tracker_runner.py --allow_privileged_extero` runs it, and MuJoCo casts the same 121x121
+  grid via `Robot.compute_height_scan` (~20 ms/step for 14641 rays — the per-ray `mj_ray` loop is
+  fine at this size; `mj_multiRay` does NOT apply, since a scan's rays do not share an origin).
+  **Hardware still refuses**, because `GenTrackerPolicy` defaults the flag off and nothing on the
+  robot path passes it. Anything measured this way is a statement about the model given perfect
+  terrain.
+- The dense grid is SQUARE, so a transposed fold is shape-silent. `transfer/sim/tests/`
+  `test_height_scan_grid.py` pins it against the coarse 16x11 cast where the grids coincide (and
+  asserts the transpose would fail). Note an exact-equality check is a coin flip at yaw=0 on
+  stairs: the shared points land on a step edge to 1e-14 m and the two casts differ by one riser.
+- `torch.isclose` has no ONNX lowering, so the miss-sentinel channel in
+  `flow_matching/extero_encoder.py` is written out as `|img - sentinel| > atol + rtol*|sentinel|`
+  (identical on every finite input). Before that, a CNN extero model with a sentinel could train
+  but not export.
+
+## One exported generator per FM run (`transfer/deploy/artifacts.py`)
+Exports are named for the checkpoint they came from — `<fm run>_fm.onnx`, plus the checkpoint
+stem when it is not `best` — so a teacher's `exported/` holds every generator trained against
+it instead of each `play.py` silently replacing the last. `fm_artifact_name()` is the one rule
+(used by `play.py` and `export_fm_onnx.py`); `resolve_fm_onnx()` is how every consumer finds
+one (`gen_tracker_runner.py --fm_onnx`, `benchmark.py --fm`, `export_sensor_configs.py`,
+`export_to_hardware.py --fm_onnx`).
+- **With several in a directory the resolver RAISES and lists them.** Defaulting to the
+  newest would reinstate, as a silent default, the ambiguity the naming removed.
+- **`fm.onnx` is still the DEPLOYMENT name**: a robot installs one pair and the obelisk
+  controller reads a fixed filename, so `export_to_hardware.py` uploads whichever local
+  artifact it was given AS `fm.onnx`. The rename happens at that boundary and nowhere else;
+  the resolver still accepts a bare `fm.onnx` as input.
+- Pre-rename `fm.onnx` files (anything exported before `extero_tokens` ->
+  `extero_sensor_count`) are refused at load and need one `export_fm_onnx.py` call; the `.pt`
+  is unaffected.
+
 ## sim2sim (MuJoCo)
 - `transfer/sim/depth_camera.py` — `mj_multiRay` re-implementation (~3.9 ms/frame for both cameras).
   Casts geom groups {1 = per-link visual meshes, 2 = terrain}: self-occlusion comes from group 1, and

@@ -29,7 +29,8 @@ from dataclasses import dataclass, field
 import numpy as np
 import onnxruntime as ort
 
-from .depth_obs import parse_depth_spec, sanitize_extero_np
+from .depth_obs import sanitize_extero_np
+from .scan_obs import parse_extero_spec
 from .tracker_session import make_session
 from .window_np import REFERENCE_WINDOW_BLOCK_NAMES, window_blocks, window_dim
 
@@ -208,7 +209,13 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
         extero_sensor_dim=int(m["extero_sensor_dim"]),
         extero_source=source, extero_sensor_count=int(m["extero_sensor_count"]),
-        extero_spec=parse_depth_spec(m.get("extero_spec"), source=f"{onnx_path} fm_meta"),
+        # Parsed by the contract's OWN source: the same field holds a camera pair for one
+        # checkpoint and a ray grid for another. It used to go through the depth parser
+        # unconditionally, so a scan-conditioned graph was refused at load for "missing
+        # field(s) ['fx', 'fy', 'cx', 'cy', ...]" -- camera fields a height scanner has no
+        # reason to carry, naming a defect that was not there.
+        extero_spec=parse_extero_spec(m.get("extero_spec"), source,
+                                      source=f"{onnx_path} fm_meta"),
         # ``.get`` here, unlike the two above: these describe the EMBEDDING, and a graph
         # exported before it was selectable is unambiguously the flat one. The defaults are
         # therefore correct for such a graph rather than a guess -- which is exactly the

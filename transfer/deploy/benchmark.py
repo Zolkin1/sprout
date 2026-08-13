@@ -57,6 +57,7 @@ import onnxruntime as ort
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # transfer/
 
+from deploy.artifacts import resolve_fm_onnx  # noqa: E402
 from deploy.fm_session import load_fm_context  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 from deploy.tracker_session import PROVIDER_ALIASES, TrackerSession, resolve_providers  # noqa: E402
@@ -387,7 +388,10 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--run_dir", help="Run directory (its exported/ holds the two .onnx files).")
     p.add_argument("--tracker", help="Path to tracker.onnx (overrides --run_dir).")
-    p.add_argument("--fm", help="Path to fm.onnx (overrides --run_dir).")
+    p.add_argument("--fm", help="Which generator to benchmark: a path, or a bare "
+                                "filename inside the run's exported/. Required when "
+                                "that directory holds several (they are named for "
+                                "their FM checkpoint).")
     p.add_argument("--iters", type=int, default=300, help="Timed iterations per leg.")
     p.add_argument("--threads", default="0",
                    help="Comma-separated intra-op thread counts to sweep; 0 = ORT auto.")
@@ -408,8 +412,9 @@ def main() -> None:
         exp = args.run_dir if os.path.basename(args.run_dir) == "exported" else \
             os.path.join(args.run_dir, "exported")
         tracker_path = os.path.join(exp, "tracker.onnx")
-        fm_path = os.path.join(exp, "fm.onnx")
-        fm_path = fm_path if os.path.exists(fm_path) else None
+        # Exports are named for their checkpoint, so a run dir may hold several; --fm names
+        # one, and this raises rather than benchmarking whichever happens to be newest.
+        fm_path = resolve_fm_onnx(exp, args.fm, required=False)
     else:
         p.error("pass --run_dir or --tracker")
     if not os.path.exists(tracker_path):

@@ -50,6 +50,9 @@ if _FM_SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _FM_SCRIPT_DIR)
 from export_tracker_onnx import export_tracker_onnx  # isort: skip
 from export_fm_onnx import export_fm_onnx  # isort: skip
+# export_fm_onnx already puts transfer/ on the path (it shares the artifact NAMING rule with
+# the off-sim consumers that resolve these files); import from there rather than restate it.
+from deploy.artifacts import fm_artifact_name  # isort: skip
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 with contextlib.suppress(ImportError):
@@ -148,6 +151,15 @@ parser.add_argument(
     help="Skip writing the two deploy ONNX artifacts (exported/tracker.onnx and, with "
          "--fm_checkpoint, exported/fm.onnx). They are written by default because they must "
          "stay in sync with the policy.pt + policy_parameters.yaml this run exports.",
+)
+parser.add_argument(
+    "--allow_privileged_extero", action="store_true", default=False,
+    help="Export exported/fm.onnx even when the generator conditions on a PRIVILEGED "
+         "signal (the exact noise-free dense height scan). Without it the export refuses, "
+         "because no ROBOT can produce that reading -- but MuJoCo can cast the same grid "
+         "against the same terrain, so this is what makes the Isaac-only diagnostic "
+         "runnable in sim2sim (transfer/sim/gen_tracker_runner.py "
+         "--allow_privileged_extero). The hardware path still refuses the pair.",
 )
 parser.add_argument("--max_steps", type=int, default=None, help="Exit after this many steps (None = run forever).")
 parser.add_argument(
@@ -659,11 +671,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # died there, so the one configuration that means "no FM" could not be exported
             # past -- which is what the clip-only survival cell needs.
             if args_cli.fm_checkpoint:
-                fm_out = os.path.join(export_model_dir, "fm.onnx")
-                export_fm_onnx(args_cli.fm_checkpoint, fm_out)
+                # Named for the FM checkpoint rather than a fixed "fm.onnx": a run's
+                # exported/ accumulates one generator per FM trained against that teacher,
+                # and the old fixed name meant each play.py silently replaced the last.
+                # deploy.artifacts.resolve_fm_onnx is how the runners find them again.
+                fm_out = os.path.join(export_model_dir,
+                                      fm_artifact_name(args_cli.fm_checkpoint))
+                export_fm_onnx(args_cli.fm_checkpoint, fm_out,
+                               allow_privileged_extero=args_cli.allow_privileged_extero)
                 print(f"[INFO] wrote {fm_out}")
             else:
-                print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
+                print("[INFO] no --fm_checkpoint, so no generator exported (tracker only).")
 
         def _ph(name):
             """Phase context (no-op when profiling is off)."""

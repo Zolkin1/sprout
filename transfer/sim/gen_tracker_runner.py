@@ -26,6 +26,7 @@ import csv
 import glob
 import math
 import os
+import signal
 import sys
 import time
 
@@ -36,6 +37,7 @@ import yaml
 
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from deploy.artifacts import resolve_fm_onnx  # noqa: E402
 from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
 from deploy.quat_math_np import quat_apply, quat_box_minus, quat_inv  # noqa: E402
@@ -197,19 +199,20 @@ def build_state(
                 "generator trained on another one silently substitutes the wrong signal. "
                 "Re-export the artifacts with a height_scan_spec."
             )
-        if bool(s.get("privileged")):
+        if bool(s.get("privileged")) and not policy.allow_privileged_extero:
             raise ValueError(
                 f"this generator conditions on the PRIVILEGED dense scan "
                 f"({s.get('size')} m @ {s.get('resolution')} m = {s.get('num_rays')} rays), "
-                "which is exact noise-free ground truth and not reproducible off-sim. "
-                "compute_height_scan is also a per-ray Python loop, so casting it here would "
-                "be ~100x the current cost. It is an Isaac-only diagnostic."
+                "which is exact noise-free ground truth and not reproducible on a ROBOT. "
+                "MuJoCo can reproduce it -- it casts the same grid against the same terrain "
+                "-- so pass --allow_privileged_extero to run the pair here. Nothing measured "
+                "under it says anything about hardware."
             )
         off = s.get("offset_pos", [0.75, 0.0, 20.0])
         clr, hits = robot.compute_height_scan(
             state["root_pos"], state["root_quat"],
             resolution=float(s["resolution"]), size=tuple(s["size"]),
-            offset_fwd=float(off[0]), ray_start_h=float(off[2]),
+            offset_fwd=float(off[0]), offset_lat=float(off[1]), ray_start_h=float(off[2]),
             sensor_offset=float(s.get("sensor_offset", 0.5)),
         )
         if fm_uses_scan and clr.shape[-1] != int(policy.ctx.extero_sensor_dim):
@@ -386,6 +389,54 @@ def _add_arrow(scn, base: np.ndarray, vec: np.ndarray, rgba: tuple, width: float
     scn.ngeom += 1
 
 
+class InterruptFlag:
+    """Make Ctrl-C end the run at the next control step instead of unwinding through it.
+
+    A bare ``KeyboardInterrupt`` fires wherever the interpreter happens to be -- typically
+    deep inside the observation build -- and propagates out through the viewer's context
+    manager. Two things go wrong there:
+
+    * the GL drawable is destroyed while the viewer thread still has a buffer swap in
+      flight, which the X server reports as ``GLXBadDrawable`` and Xlib treats as **fatal**,
+      so an interrupted run ends in what looks like a crash;
+    * **every artifact the run was going to write is lost** -- the metrics CSV, the scan
+      rows, the FM prediction windows and the plots are all written *after* the loop, and
+      the exception skips the lot.
+
+    Setting a flag instead lets the loop return normally, so an interrupted run finishes the
+    way a ``--total_time`` run does: the viewer is closed by its own context manager, the
+    artifacts are written, and the exit goes through the same ``os._exit(0)`` that already
+    exists to dodge the native GL teardown race. A SECOND Ctrl-C restores the default
+    handler, so a genuinely wedged run can still be killed.
+    """
+
+    def __init__(self) -> None:
+        self.hit = False
+        self._previous = None
+
+    def __enter__(self) -> "InterruptFlag":
+        """Install the handler, remembering whatever was there before."""
+        self._previous = signal.signal(signal.SIGINT, self._handle)
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        """Restore the previous handler."""
+        if self._previous is not None:
+            signal.signal(signal.SIGINT, self._previous)
+        return False
+
+    def _handle(self, _signum, _frame) -> None:
+        """Flag the interrupt; a second one goes back to the default (immediate) behaviour."""
+        if self.hit:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            print("\n[WARN] second interrupt: the next one exits immediately, with no "
+                  "artifacts written.")
+            return
+        self.hit = True
+        print("\n[INFO] interrupt: stopping at the next control step and writing artifacts "
+              "(Ctrl-C again to skip that).")
+
+
 def box_top(robot: Robot, spec: str) -> tuple[float, float, float] | None:
     """Centre + top height of a named box geom in the loaded scene.
 
@@ -420,8 +471,12 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
         viz_geomgroup: list[int] | None = None, viz_contacts: bool = False,
-        fm_depth_cams: MujocoDepthCameras | None = None) -> bool:
+        fm_depth_cams: MujocoDepthCameras | None = None) -> bool | None:
     """Run the warmup + control loop; return True if the robot did not fall.
+
+    Returns ``None`` when the user interrupts with Ctrl-C, which is neither survival nor a
+    fall. The interrupt is taken at a control-step boundary so the artifacts below still get
+    written -- see :class:`InterruptFlag` for why that matters and what it replaced.
 
     The robot first PD-holds a stable stand for ``warmup_time`` seconds (at least the
     FM history length) while the generator history fills with real snapshots, then
@@ -486,6 +541,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             cloud is subsampled.
     """
     dt = policy.get_dt()
+    # Checked at every control-step boundary by all three loops (see InterruptFlag).
+    interrupt = InterruptFlag()
     decim = int(round(dt / robot.mj_model.opt.timestep))
     sync_every = max(1, math.ceil((1 / 50) / robot.mj_model.opt.timestep))
 
@@ -899,8 +956,13 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         print(msg)
         _next_report_t[0] += report_every_s
 
-    def run_loop(viewer) -> bool:
-        """Warmup hold then live FM + tracker control; return False if the robot fell."""
+    def run_loop(viewer) -> bool | None:
+        """Warmup hold then live FM + tracker control.
+
+        Returns:
+            True if the robot did not fall, False if it did, ``None`` if the user
+            interrupted the run (neither outcome -- see :class:`InterruptFlag`).
+        """
         nonlocal handoff_time
         # Warmup: PD-hold the stand (cmd = 0, XML default gains) while the history fills.
         # When gated, hold until the start button is pressed (after the buffer is full).
@@ -909,6 +971,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                   "(A) to hand control to the RL tracker.")
         held = 0
         while True:
+            if interrupt.hit:
+                return None
             if viewer is not None and not viewer.is_running():
                 return True
             if total_time > 0 and robot.mj_data.time > total_time:
@@ -932,6 +996,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
               f"(t={handoff_time:.2f}s).")
         # Live: hand control to the FM + tracker.
         while True:
+            if interrupt.hit:
+                return None
             if viewer is not None and not viewer.is_running():
                 return True
             if total_time > 0 and robot.mj_data.time > total_time:
@@ -943,7 +1009,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             advance_physics(state, viewer)
             maybe_report_timing()
 
-    def run_clip_loop(viewer) -> bool:
+    def run_clip_loop(viewer) -> bool | None:
         """Play the baked clip through the tracker; optionally hand off to the FM.
 
         Each step the command is the clip's ``target_vel`` (already ramped at
@@ -951,13 +1017,16 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         (``observe()`` keeps the FM history warm). Once ``clip_handoff_time`` is
         reached the reference source switches to the live FM generator; the command
         keeps following the authored clip velocity profile. ``clip_handoff_time < 0``
-        never hands off (clip-only). Returns False if the robot fell.
+        never hands off (clip-only). Returns False if the robot fell, ``None`` if the
+        user interrupted the run.
         """
         nonlocal handoff_time
         clip_only = clip_handoff_time < 0
         handed_off = False
         clip_step = clip.start_step
         while True:
+            if interrupt.hit:
+                return None
             if viewer is not None and not viewer.is_running():
                 return True
             if total_time > 0 and robot.mj_data.time > total_time:
@@ -1004,14 +1073,17 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         raise ValueError("Headless mode requires --total_time > 0.")
 
     pacer.reset(robot.mj_data.time)
-    if headless:
-        success = loop_fn(None)
-    else:
-        with mujoco.viewer.launch_passive(robot.mj_model, robot.mj_data) as viewer:
-            viewer.cam.trackbodyid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
-            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-            _apply_viz_options(viewer, robot.mj_model, viz_geomgroup, viz_contacts)
-            success = loop_fn(viewer)
+    # The handler is installed only around the loop, so a Ctrl-C during setup or during the
+    # artifact writing below still behaves normally.
+    with interrupt:
+        if headless:
+            success = loop_fn(None)
+        else:
+            with mujoco.viewer.launch_passive(robot.mj_model, robot.mj_data) as viewer:
+                viewer.cam.trackbodyid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                _apply_viz_options(viewer, robot.mj_model, viz_geomgroup, viz_contacts)
+                success = loop_fn(viewer)
 
     if log_file:
         log_file.close()
@@ -1040,7 +1112,13 @@ def main() -> None:
     parser.add_argument("--experiment", type=str, default="g1")
     parser.add_argument("--load_run", type=str, default=None, help="Tracker run dir (default: latest).")
     parser.add_argument("--fm_onnx", type=str, default=None,
-                        help="Generator ONNX (default: <run>/exported/fm.onnx).")
+                        help="Which generator to load: a path, or a bare filename resolved "
+                             "inside <run>/exported/. Exports are named for the FM checkpoint "
+                             "(e.g. 2026-08-12_17-07-47_scan_pin1_fm.onnx), so one run dir "
+                             "holds every generator trained against that teacher. Optional "
+                             "when the dir holds exactly one; REQUIRED when it holds several "
+                             "-- defaulting to the newest is the ambiguity the naming exists "
+                             "to remove.")
     parser.add_argument("--mode", choices=["joystick", "eval"], default="joystick")
     parser.add_argument("--command", type=str, default="smooth_ramp_running",
                         help="Scripted velocity profile in experiments.velocity_commands (eval mode).")
@@ -1060,6 +1138,15 @@ def main() -> None:
                              "wheel lacks raises; 'auto' never does. What a session actually "
                              "registered is printed at load -- onnxruntime falls back to the "
                              "CPU with a warning, not an error.")
+    parser.add_argument("--allow_privileged_extero", action="store_true", default=False,
+                        help="Run a generator conditioned on the PRIVILEGED dense height scan "
+                             "(exact, noise-free, 121x121 @ 0.025 m). Refused by default "
+                             "because no robot can produce that reading; MuJoCo can, by "
+                             "casting the same grid against the same terrain, so this makes "
+                             "the Isaac-only diagnostic testable in a second simulator. It "
+                             "costs ~20 ms/step of ray casting (measured, 14641 rays), and "
+                             "any survival number it produces is a statement about the model "
+                             "given perfect terrain -- never about deployment.")
     parser.add_argument("--fm_update_every", type=int, default=1,
                         help="Generator re-inference cadence K (control steps); 1 = every step, "
                              "which is the only cadence that pays the full FM cost every tick. "
@@ -1232,7 +1319,14 @@ def main() -> None:
     run_dir = os.path.join(log_root, run_name)
     exported = os.path.join(run_dir, "exported")
     tracker_onnx = os.path.join(exported, "tracker.onnx")
-    fm_onnx = args.fm_onnx or os.path.join(exported, "fm.onnx")
+    # Generators are named for the checkpoint they came from, so a run's exported/ can hold
+    # several; --fm_onnx names one (a bare filename resolves inside exported/). Ambiguity is
+    # refused rather than defaulted -- reported as a CLI error, since it is a configuration
+    # question for the caller and not a bug to hand back a traceback for.
+    try:
+        fm_onnx = resolve_fm_onnx(exported, args.fm_onnx, required=False)
+    except (ValueError, FileNotFoundError) as exc:
+        sys.exit(f"[ERROR] {exc}")
     # Clip-only playback (a clip with no FM handoff) drives the tracker straight from the
     # clip reference, so the generator is optional -- this is how a pure clip-tracking
     # teacher (which has no fm.onnx) is played in MuJoCo. Every other mode (joystick/eval,
@@ -1242,17 +1336,21 @@ def main() -> None:
         sys.exit(f"[ERROR] Missing {tracker_onnx}. Export with export_tracker_onnx.py first.")
     if clip_only:
         fm_onnx = None
-    elif not os.path.exists(fm_onnx):
-        sys.exit(f"[ERROR] Missing {fm_onnx}. Export with export_fm_onnx.py, or play clip-only "
-                 f"(--clip <h5> without --clip_handoff_time) to run the tracker with no FM.")
+    elif fm_onnx is None:
+        sys.exit(f"[ERROR] No generator in {exported}. Export one with play.py "
+                 "--fm_checkpoint or scripts/flow_matching/export_fm_onnx.py, or play "
+                 "clip-only (--clip <h5> without --clip_handoff_time) to run the tracker "
+                 "with no FM.")
     print(f"[INFO] Tracker run: {run_name}\n[INFO] tracker.onnx: {tracker_onnx}\n"
-          f"[INFO] fm.onnx: {fm_onnx if fm_onnx else '(none -- tracker-only clip playback)'}")
+          f"[INFO] generator: "
+          f"{fm_onnx if fm_onnx else '(none -- tracker-only clip playback)'}")
 
     policy = GenTrackerPolicy(
         tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
         zero_noise=args.zero_noise,
         null_history_warmup=args.null_history_warmup,
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
+        allow_privileged_extero=args.allow_privileged_extero,
     )
     policy.load()
     # What each graph REGISTERED, not what was asked for. onnxruntime reports a failed CUDA
@@ -1381,7 +1479,12 @@ def main() -> None:
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride,
                   fm_depth_cams=fm_depth_cams)
-    print(f"[INFO] Run finished. Survived: {success}")
+    # None = interrupted, which is neither survival nor a fall; saying "Survived: None"
+    # would put a non-result into the same line every sweep greps for.
+    if success is None:
+        print("[INFO] Run INTERRUPTED by the user; artifacts below are partial.")
+    else:
+        print(f"[INFO] Run finished. Survived: {success}")
 
     if log_path:
         import gen_tracker_metrics
