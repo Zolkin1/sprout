@@ -744,8 +744,8 @@ class FmTrackingCommand(MotionSequenceCommand):
             reading = scan_obs_stack(self.env, fm_scan_sensor(self.env))
         elif src == "depth":
             groups = fm_depth_groups(self.env)
-            reading = (depth_xyz_stack(self.env, groups)
-                       if int(getattr(self.ctx, "extero_channels", 1)) > 1
+            n_ch = int(getattr(self.ctx, "extero_channels", 1))
+            reading = (depth_xyz_stack(self.env, groups, channels=n_ch) if n_ch > 1
                        else depth_obs_stack(self.env, groups))
         else:
             raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")

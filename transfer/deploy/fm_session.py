@@ -57,6 +57,13 @@ class FmContext:
 
     Must equal the tracker's ``reference_window_spec['blocks']`` -- the prediction is fed
     to it verbatim. ``GenTrackerPolicy.load`` is where the two meet."""
+    extero_channels: int = 1
+    """Planes per pixel in one sensor row (1 = depth alone, 4 = + xyz, 5 = + validity).
+
+    ``extero_sensor_dim`` counts them, being the row width the graph receives, so anything
+    comparing that width against an image shape divides by this first.
+    """
+
     extero_source: str = "height_scan"
     """Which sensor feeds the exteroception tokens ("height_scan" or "depth")."""
     extero_sensor_count: int = 1
@@ -220,6 +227,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         # exported before it was selectable is unambiguously the flat one. The defaults are
         # therefore correct for such a graph rather than a guess -- which is exactly the
         # test the two renamed keys fail (they would describe a camera).
+        extero_channels=int(m.get("extero_channels", 1)),
         extero_encoder=str(m.get("extero_encoder", "mlp")),
         extero_image_hw=[(int(h), int(w)) for h, w in (m.get("extero_image_hw") or [])],
         extero_tokens_per_sensor=int(m.get("extero_tokens_per_sensor", 1)),

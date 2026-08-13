@@ -654,9 +654,9 @@ def _torch(array) -> torch.Tensor:
 
 
 def depth_xyz_stack(
-    env: "ManagerBasedRLEnv", groups: list[str] | None = None
+    env: "ManagerBasedRLEnv", groups: list[str] | None = None, channels: int = 4
 ) -> torch.Tensor:
-    """Depth cameras as 4-channel ``[d, x, y, z]`` rows, ``(B, T, 4*H*W)``.
+    """Depth cameras as ``[d, x, y, z]`` (or ``[d, x, y, z, v]``) rows, ``(B, T, C*H*W)``.
 
     The exteroception the CONVOLUTIONAL generator conditions on when
     ``FlowMatchingConfig.extero_channels == 4``. Channel 0 is exactly what
@@ -678,18 +678,34 @@ def depth_xyz_stack(
     every call, like :func:`depth_obs_stack`. ``obs`` is already 39% of the env step, so if
     the 4-channel path lands, cache the contract per env rather than paying the walk twice.
 
+    A fifth channel is a VALIDITY plane: 1 where the pixel is a real reading, 0 where it is
+    not. It is found by RANGE (:func:`invalid_depth_mask`), never by comparing against the
+    sentinel, because ``DepthNoiser`` runs after normalisation and its 3x3 blur leaves a
+    missed pixel NEAR the sentinel rather than on it -- only the 2.5% per-frame dropout lands
+    exactly there. The height scan gets the same channel from the encoder instead, where
+    equality IS exact because that signal is noise-free; same channel, different test, and the
+    asymmetry is in the sensor rather than in the intent.
+
     Args:
         env: The environment instance.
         groups: Observation groups to read, or ``None`` for all of them. Scope this with
             :func:`fm_depth_groups` when the generator samples at its own resolution.
+        channels: 4 for ``[d, x, y, z]``, 5 to append the validity plane. Comes from the
+            CHECKPOINT (``cfg.extero_channels``), so the artifact says what it eats.
 
     Returns:
-        ``(num_envs, num_cameras, 4 * H * W)``.
+        ``(num_envs, num_cameras, channels * H * W)``.
 
     Raises:
         RuntimeError: If the environment has no depth observation terms in ``groups``.
-        ValueError: If the selected cameras do not share one resolution.
+        ValueError: If ``channels`` is not 4 or 5, or if the selected cameras do not share
+            one resolution.
     """
+    if channels not in (4, 5):
+        raise ValueError(
+            f"depth_xyz_stack emits 4 ([d, x, y, z]) or 5 (plus validity) channels, "
+            f"got {channels}. 1 channel is depth_obs_stack's job."
+        )
     specs = depth_camera_specs(env, groups)
     if not specs:
         raise RuntimeError(
@@ -704,7 +720,10 @@ def depth_xyz_stack(
         image = depth_image(env, SceneEntityCfg(cam["sensor"]), **params)   # (B, H*W)
         cam_pos, cam_rot = depth_camera_pose_yaw_frame(env, cam)
         points = unproject_to_yaw_frame(cam, image, cam_pos, cam_rot)       # (B, 3, H*W)
-        rows.append(torch.cat([image, points.reshape(image.shape[0], -1)], dim=-1))
+        planes = [image, points.reshape(image.shape[0], -1)]
+        if channels == 5:
+            planes.append((~invalid_depth_mask(cam, image)).to(image.dtype))
+        rows.append(torch.cat(planes, dim=-1))
     widths = {int(r.shape[-1]) for r in rows}
     if len(widths) > 1:
         raise ValueError(

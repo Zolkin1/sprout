@@ -313,9 +313,13 @@ def _pool_extero_statistics(
         print(f"[fm-data] extero_norm_mode=metric: DECLARED affine (x - {offset:g}) / "
               f"{scale:g}, no fitting. The network input is metres/{scale:g}, identical "
               "across recordings.")
+        # Device from the normalizer being replaced, for the same reason: a fresh tensor
+        # otherwise lands on the default device rather than where the data is.
         return Normalizer(
-            torch.full((width,), offset, dtype=normalizer.mean.dtype),
-            torch.full((width,), scale, dtype=normalizer.std.dtype),
+            torch.full((width,), offset, dtype=normalizer.mean.dtype,
+                       device=normalizer.mean.device),
+            torch.full((width,), scale, dtype=normalizer.std.dtype,
+                       device=normalizer.std.device),
             normalizer.standardize_mask.clone(),
         )
     mean = normalizer.mean.reshape(n_sensors, sensor_dim)
@@ -801,31 +805,93 @@ class FutureStateDataset(Dataset):
         n_sat = int((vals.abs() > band).sum())
         if n_total:
             q = torch.tensor([0.001, 0.5, 0.999])
-            lo, mid, hi = (torch.quantile(vals.float(), q).tolist()
+            # SUBSAMPLE for the quantiles: torch.quantile refuses an input past ~16M elements
+            # ("input tensor is too large"), and a real extero array is far past that -- 282M
+            # for the depth pair at 180k windows, 2.6B for the dense scan. A uniform sample of
+            # a few million puts every percentile here well inside its own rounding.
+            _cap = 4_000_000
+            _s = (vals if vals.numel() <= _cap
+                  else vals[torch.randint(vals.numel(), (_cap,), device=vals.device)])
+            lo, mid, hi = (torch.quantile(_s.float(), q).tolist()
                            if vals.numel() else (float("nan"),) * 3)
+            # DEPTH's invalid pixels are FINITE, so ``n_miss`` counts ~0 of them and they are
+            # otherwise tallied as ordinary in-band data -- in the very number
+            # ``--extero_clip``'s help says to pick the band from. Measured on the shipped
+            # pair: 15% of the near camera's pixels and 40% of the far camera's carry no
+            # reading, against the 2% a sentinel-equality test finds (that 2% is the noiser's
+            # per-frame dropout, which lands exactly on the sentinel; a geometric miss is
+            # blurred off it). Report them as their own class.
+            invalid = ""
+            if cfg.extero_source == "depth" and meta.depth_camera_spec:
+                from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+                    invalid_depth_mask,
+                )
+                per_cam = hs.reshape(hs.shape[0], n_sensors, sensor_dim)
+                frac = [float(invalid_depth_mask(cam, per_cam[:, i]).float().mean())
+                        for i, cam in enumerate(meta.depth_camera_spec)]
+                invalid = (" | no reading (by range): "
+                           + ", ".join(f"{c.get('obs_term', i)} {100.0 * v:.1f}%"
+                                       for i, (c, v) in enumerate(
+                                           zip(meta.depth_camera_spec, frac))))
             print(f"[fm-data] extero clip band +-{band:g}: "
                   f"{100.0 * n_sat / n_total:.2f}% of entries saturated, "
                   f"{100.0 * n_miss / n_total:.2f}% missed rays (-> +{band:g}), "
                   f"finite range [{float(vals.min()) if vals.numel() else float('nan'):.3f}, "
                   f"{float(vals.max()) if vals.numel() else float('nan'):.3f}] "
-                  f"(p0.1 {lo:.3f} / p50 {mid:.3f} / p99.9 {hi:.3f}).")
+                  f"(p0.1 {lo:.3f} / p50 {mid:.3f} / p99.9 {hi:.3f})." + invalid)
         torch.nan_to_num_(hs, nan=0.0, posinf=band, neginf=band)
         hs.clamp_(-band, band)
-        self.extero = hs                                            # (Nw, T*K)
+        # Contract of the sensor behind those readings, carried from the recording so the
+        # trained checkpoint (and the ONNX exported from it) states what it conditions on --
+        # ``depth_camera_spec`` for depth, ``height_scan_spec`` for the scan. Resolved BEFORE
+        # the channel widening below, which needs the intrinsics and the mount out of it.
+        self.extero_spec = self._resolve_extero_spec(cfg, meta, n_sensors, sensor_dim)
+        # Widen one pixel from a scalar to a vector, when the run asks for it. The extra
+        # planes are DERIVED here rather than recorded: the recording already carries the root
+        # orientation and the joint angles, and the mount is nominal, so an existing .h5 needs
+        # no re-recording to train a 4-channel model. Done AFTER the clamp on purpose -- see
+        # _depth_xyz_rows.
+        row_channels = int(cfg.extero_channels)
+        if row_channels > 1:
+            if cfg.extero_source != "depth":
+                raise ValueError(
+                    f"extero_channels={row_channels} but extero_source="
+                    f"'{cfg.extero_source}'. The extra planes are a pixel's xyz from the "
+                    "pinhole model; a height scan's rays already ARE ground points."
+                )
+            if row_channels not in (4, 5):
+                raise ValueError(
+                    f"extero_channels={row_channels} is not supported; the depth path emits "
+                    "1 (depth alone), 4 (depth + xyz) or 5 (plus validity)."
+                )
+            poses = self._camera_pose_yaw_frame(
+                self.extero_spec, _q(snap_meas), snap_meas[:, s_slc["joint_pos"][0]:
+                                                           s_slc["joint_pos"][1]],
+                [str(j) for j in meta.state_joint_names], cfg.fk_model_path,
+            )
+            hs = self._depth_xyz_rows(hs, self.extero_spec, poses, n_sensors, sensor_dim,
+                                      channels=row_channels)
+            sensor_dim = row_channels * sensor_dim      # the ROW width the model receives
+            cfg.extero_channel_names = ["d", "x", "y", "z", "v"][:row_channels]
+            print(f"[fm-data] extero_channels={row_channels}: each pixel carries "
+                  f"{cfg.extero_channel_names}, so a sensor row is {sensor_dim} wide "
+                  f"({row_channels} x {sensor_dim // row_channels} px), channel-major.")
+        self.extero = hs                                            # (Nw, T*C*K)
         self.extero_clip = band
         self.extero_sensor_dim = sensor_dim
         self.extero_sensor_count = n_sensors
         cfg.extero_sensor_dim = sensor_dim
         cfg.extero_sensor_count = n_sensors
-        # Contract of the sensor behind those readings, carried from the recording so the
-        # trained checkpoint (and the ONNX exported from it) states what it conditions on --
-        # ``depth_camera_spec`` for depth, ``height_scan_spec`` for the scan.
-        self.extero_spec = self._resolve_extero_spec(cfg, meta, n_sensors, sensor_dim)
         # The per-sensor IMAGE SHAPE, derived from that contract rather than configured --
         # the flat array cannot state it, and a convolutional encoder cannot fold without
         # it. Written onto cfg so the checkpoint records the architecture it trained with,
         # and re-verified wherever it is read again (``online.load_fm_context``).
-        self.extero_image_hw = self._resolve_extero_image_hw(self.extero_spec, sensor_dim)
+        # Against the PIXEL count, not the row width: with channels the row is a stack of
+        # images, and comparing the whole width against one image's shape would reject the
+        # very geometry it exists to describe.
+        self.extero_image_hw = self._resolve_extero_image_hw(
+            self.extero_spec, sensor_dim // row_channels
+        )
         cfg.extero_image_hw = ([list(hw) for hw in self.extero_image_hw]
                                if self.extero_image_hw else None)
         # And the METRIC extents, for a grid whose pixels are ground points rather than rays.
@@ -836,6 +902,16 @@ class FutureStateDataset(Dataset):
         cfg.extero_coord_extent_m = _resolve_extero_coord_extent(self.extero_spec)
         if cfg.extero_coord_extent_m is not None:
             cfg.extero_grid_ordering = str(self.extero_spec[0].get("ordering", "xy"))
+        # A CAMERA's pixels are rays, so their position is an ANGLE rather than a ground
+        # coordinate. Per camera, because the two are different lenses -- one shared set would
+        # label the far camera's tokens 1.43x too wide, and nothing would notice.
+        cfg.extero_camera_intrinsics = (
+            [[float(c["fx"]), float(c["fy"]), float(c["cx"]), float(c["cy"])]
+             for c in self.extero_spec]
+            if (cfg.extero_coord_extent_m is None and self.extero_spec
+                and all("fx" in c for c in self.extero_spec))
+            else None
+        )
         # Resolve "auto" HERE, where the source is finally known, and write it back so the
         # checkpoint says which encoder it trained -- ``from_dict`` must never re-resolve it.
         cfg.extero_encoder = cfg.resolve_extero_encoder()
@@ -947,7 +1023,17 @@ class FutureStateDataset(Dataset):
             if cfg.extero_norm_mode == "metric":
                 # Skip the fit entirely rather than fitting and discarding: on a dense scan
                 # the fit is a full pass over a ~15k-column array whose result is unused.
-                extero_normalizer = Normalizer(torch.zeros(width), torch.ones(width), mask)
+                #
+                # ON THE DATA'S DEVICE, explicitly. The fitted branch below inherits it from
+                # the array it reads; this one builds fresh tensors, which land on the
+                # DEFAULT device -- and train.py sets that to cuda while the dataset stays in
+                # host memory, so ``__getitem__`` died on "at least two devices". A
+                # normalizer belongs where the data it normalizes lives.
+                extero_normalizer = Normalizer(
+                    torch.zeros(width, device=self.extero.device, dtype=self.extero.dtype),
+                    torch.ones(width, device=self.extero.device, dtype=self.extero.dtype),
+                    mask,
+                )
             else:
                 extero_normalizer = Normalizer.fit(
                     self.extero, mask, eps=float(cfg.extero_norm_eps))
@@ -1218,6 +1304,124 @@ class FutureStateDataset(Dataset):
                 )
             out.append((h, w))
         return out
+
+    @staticmethod
+    def _camera_pose_yaw_frame(
+        spec: list[dict], root_quat_w: torch.Tensor, joint_pos: torch.Tensor,
+        joint_names: list[str], fk_model_path: str,
+    ) -> list[tuple[torch.Tensor, torch.Tensor]]:
+        """Each camera's pose in the root's yaw-aligned frame, from RECORDED state alone.
+
+        The offline twin of ``mdp.observations.depth.depth_camera_pose_yaw_frame``, which can
+        read the live articulation; here there is only the recording. It needs no more than a
+        robot has: the root's orientation (gravity, i.e. the IMU), the joint angles (encoders)
+        and the NOMINAL mount from the contract. That is why the existing recordings suffice
+        and nothing has to be re-recorded -- and why the same three inputs reproduce this on
+        hardware.
+
+        The heading cancels out. Writing ``R_world_root = Rz(psi) @ R_rp``, the yaw-frame
+        coordinates of a point are ``R_rp @ p_root``, in which ``psi`` never appears -- so a
+        drifting yaw estimate cannot corrupt the cloud, and no odometry is involved.
+
+        **Nominal, never the domain-randomised mount.** The DR perturbs the IMAGE relative to
+        the stated geometry, which is exactly the calibration error hardware has; using the
+        true randomised pose would teach the generator a registration it will never be given.
+
+        Args:
+            spec: The per-camera contract (``mount_body``, ``offset_pos``,
+                ``offset_quat_xyzw``).
+            root_quat_w: World root orientation ``(Nw, 4)``, scalar-LAST.
+            joint_pos: Joint angles ``(Nw, nj)`` in the recording's joint order.
+            joint_names: That joint order, from ``meta.state_joint_names``.
+            fk_model_path: MJCF the root->mount chain is read from.
+
+        Returns:
+            One ``(pos (Nw, 3), rot (Nw, 3, 3))`` per camera, in contract order.
+
+        Raises:
+            ValueError: If the cameras do not share one mount body -- the FK below resolves a
+                single chain, and silently using it for a second mount would misplace that
+                camera by the offset between them.
+        """
+        from isaaclab.utils.math import matrix_from_quat, quat_inv, quat_mul, yaw_quat
+
+        from motion_gen.fk import FKChain
+
+        mounts = {str(cam["mount_body"]) for cam in spec}
+        if len(mounts) != 1:
+            raise ValueError(
+                f"cameras report different mount bodies {sorted(mounts)}; the offline "
+                "unprojection resolves one FK chain, so they must share a mount."
+            )
+        mount = mounts.pop()
+        # Roll/pitch only: the frame is level (its z IS gravity), so what survives here is the
+        # robot's tilt WITHIN that frame -- which is the whole point, since a pelvis pitch
+        # moves the points while the terrain did not move.
+        q_rp = quat_mul(quat_inv(yaw_quat(root_quat_w)), root_quat_w)
+        r_rp = matrix_from_quat(q_rp)                                        # (Nw, 3, 3)
+
+        chain = FKChain(fk_model_path, list(joint_names), [mount],
+                        base_link="pelvis_link", dtype=joint_pos.dtype)
+        mount_pos, mount_rot, _jv, _jw = chain.pose_and_jacobian(joint_pos)
+        mount_pos, mount_rot = mount_pos[:, 0], mount_rot[:, 0]              # (Nw, 3/3x3)
+
+        out = []
+        for cam in spec:
+            off_p = torch.tensor([float(v) for v in cam["offset_pos"]],
+                                 dtype=joint_pos.dtype, device=joint_pos.device)
+            off_q = torch.tensor([float(v) for v in cam["offset_quat_xyzw"]],
+                                 dtype=joint_pos.dtype, device=joint_pos.device)
+            off_r = matrix_from_quat(off_q.expand(mount_rot.shape[0], 4))
+            # root frame -> yaw frame, mount -> camera. Composed in that order.
+            cam_pos_root = mount_pos + torch.einsum("bij,j->bi", mount_rot, off_p)
+            out.append((torch.einsum("bij,bj->bi", r_rp, cam_pos_root),
+                        r_rp @ mount_rot @ off_r))
+        return out
+
+    @staticmethod
+    def _depth_xyz_rows(
+        hs: torch.Tensor, spec: list[dict], poses: list[tuple[torch.Tensor, torch.Tensor]],
+        n_sensors: int, sensor_dim: int, channels: int = 4,
+    ) -> torch.Tensor:
+        """Widen depth rows to ``[d, x, y, z]`` (optionally ``+ v``) per pixel, CHANNEL-MAJOR.
+
+        Derived from the SAME post-clip array the depth channel carries, so the cloud has its
+        wall at exactly the distance that channel claims; unprojecting an unclipped image
+        instead would describe a different surface than the number beside it.
+
+        Args:
+            hs: Sanitized rows ``(Nw, n_sensors * sensor_dim)``.
+            spec: The per-camera contract, in row order.
+            poses: Per-camera ``(pos, rot)`` in the yaw frame, from
+                :meth:`_camera_pose_yaw_frame`.
+            n_sensors: Cameras per row.
+            sensor_dim: Pixels per camera.
+            channels: 4 for ``[d, x, y, z]``, 5 to append the validity plane. Must match what
+                the live term (``mdp.depth_xyz_stack``) emits for the same checkpoint.
+
+        Returns:
+            ``(Nw, n_sensors * channels * sensor_dim)``, each camera's block laid out as all
+            of ``d``, then all of ``x``, ``y``, ``z`` -- the layout ``images_from_flat`` folds
+            and every other producer emits.
+        """
+        from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+            invalid_depth_mask,
+            unproject_to_yaw_frame,
+        )
+
+        img = hs.reshape(hs.shape[0], n_sensors, sensor_dim)
+        blocks = []
+        for i, cam in enumerate(spec):
+            pos, rot = poses[i]
+            pts = unproject_to_yaw_frame(cam, img[:, i], pos, rot)          # (Nw, 3, K)
+            planes = [img[:, i : i + 1], pts]
+            if channels == 5:
+                # By RANGE, not by sentinel equality: the recording is noised, and the
+                # noiser's blur leaves a missed pixel near the sentinel rather than on it.
+                valid = (~invalid_depth_mask(cam, img[:, i])).to(img.dtype)
+                planes.append(valid.reshape(hs.shape[0], 1, sensor_dim))
+            blocks.append(torch.cat(planes, dim=1))                         # (Nw, C, K)
+        return torch.stack(blocks, dim=1).reshape(hs.shape[0], -1)
 
     def _state_noise_std(self, state_normalizer: Normalizer) -> torch.Tensor:
         """Per-channel uniform noise half-width (normalized space) for a history token.

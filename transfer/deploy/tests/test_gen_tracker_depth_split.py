@@ -116,7 +116,7 @@ def test_the_width_check_is_measured_against_the_generators_own_contract():
     p = _policy(_pair(30, 26), _pair(60, 52, prefix="fm_"))
     assert p.ctx.extero_sensor_dim == 60 * 52
 
-    with pytest.raises(ValueError, match="sensor row is"):
+    with pytest.raises(ValueError, match="sensor row holds"):
         _policy(_pair(30, 26), _pair(60, 52, prefix="fm_"), extero_sensor_dim=30 * 26)
 
 

@@ -30,7 +30,11 @@ import time
 
 import numpy as np
 
-from .depth_obs import assert_depth_specs_agree
+from .depth_obs import (
+    assert_depth_specs_agree,
+    invalid_depth_mask,
+    unproject_to_yaw_frame,
+)
 from .scan_obs import assert_scan_specs_agree, describe as describe_scan_spec, is_privileged
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
 from .history import BatchedHistory
@@ -324,13 +328,23 @@ class GenTrackerPolicy:
                     f"fm.onnx expects {self.ctx.extero_sensor_count} depth sensor row(s) but "
                     f"its camera contract lists {len(self._fm_depth_spec)} camera(s)."
                 )
+            # Against the PIXEL count: with xyz/validity channels the row is a STACK of
+            # images, so comparing the whole row width against one image's shape would
+            # refuse the very geometry it exists to describe.
+            channels = int(getattr(self.ctx, "extero_channels", 1))
+            if self.ctx.extero_sensor_dim % channels:
+                raise ValueError(
+                    f"fm.onnx row is {self.ctx.extero_sensor_dim} wide, not divisible by its "
+                    f"{channels} channel(s); the row is channels * H * W."
+                )
+            row_pixels = self.ctx.extero_sensor_dim // channels
             for cam in self._fm_depth_spec:
                 pixels = int(cam["width"]) * int(cam["height"])
-                if pixels != self.ctx.extero_sensor_dim:
+                if pixels != row_pixels:
                     raise ValueError(
                         f"camera '{cam.get('sensor')}' is {cam['width']}x{cam['height']} "
-                        f"= {pixels} pixels but fm.onnx's sensor row is "
-                        f"{self.ctx.extero_sensor_dim} wide."
+                        f"= {pixels} pixels but fm.onnx's sensor row holds {row_pixels} "
+                        f"({self.ctx.extero_sensor_dim} wide / {channels} channel(s))."
                     )
             # And when the graph folds those pixels into an IMAGE, the pixel count is no
             # longer enough: 30x26 and 26x30 pass the check above and are different images.
@@ -430,6 +444,57 @@ class GenTrackerPolicy:
                 "width."
             )
         return np.asarray(state["fm_depth"], dtype=np.float64)
+
+    def _fm_extero_row(self, state: dict) -> np.ndarray:
+        """The generator's exteroception reading, widened to the channels it was trained on.
+
+        A 1-channel graph gets the depth image as it always did. A multi-channel one gets each
+        pixel's position in the root's yaw-aligned frame beside it -- rebuilt HERE, from the
+        camera pose the runner supplies, because the generator has no joint angles and no root
+        orientation of its own and so cannot otherwise tell a waist turn from moving terrain.
+
+        The pose must be in that same yaw frame (see
+        :func:`~deploy.depth_obs.unproject_to_yaw_frame`): FK from the root to the camera, and
+        the root's roll/pitch from the IMU. No odometry, and a drifting yaw cannot corrupt it.
+
+        Args:
+            state: The runtime state dict. Needs ``fm_camera_pose`` -- one ``(pos, rot)`` per
+                camera in the generator's contract order -- once the graph wants channels.
+
+        Returns:
+            ``(T, channels * H * W)``, channel-major per camera.
+
+        Raises:
+            KeyError: If the graph wants channels and the runner supplied no camera pose.
+            ValueError: On a pose count that does not match the cameras.
+        """
+        image = self._fm_depth_reading(state)
+        channels = int(getattr(self.ctx, "extero_channels", 1))
+        if channels == 1:
+            return image
+        poses = state.get("fm_camera_pose")
+        if poses is None:
+            raise KeyError(
+                f"fm.onnx conditions on {channels} channels per pixel, so it needs each "
+                "camera's pose in the root's yaw-aligned frame in state['fm_camera_pose'] "
+                "(one (pos, rot) per camera, in contract order). Build it from FK to the "
+                "mount plus the IMU's roll/pitch -- never odometry."
+            )
+        if len(poses) != len(self._fm_depth_spec):
+            raise ValueError(
+                f"state['fm_camera_pose'] has {len(poses)} entries but the generator reads "
+                f"{len(self._fm_depth_spec)} camera(s)."
+            )
+        rows = []
+        for i, cam in enumerate(self._fm_depth_spec):
+            flat = np.asarray(image[i], dtype=np.float64).reshape(-1)
+            pos, rot = poses[i]
+            pts = unproject_to_yaw_frame(cam, flat, pos, rot)          # (3, K)
+            planes = [flat[None, :], pts]
+            if channels == 5:
+                planes.append((~invalid_depth_mask(cam, flat)).astype(np.float64)[None, :])
+            rows.append(np.concatenate(planes, axis=0).reshape(-1))
+        return np.stack(rows, axis=0)
 
     def depth_sampling_is_split(self) -> bool:
         """Whether the generator samples the cameras on a different grid than the tracker.
@@ -794,7 +859,7 @@ class GenTrackerPolicy:
         # (already normalised, matching mdp.depth_obs_stack); the height scan is one token
         # of per-ray clearance. Matches how each is recorded and used in the RL obs.
         if ctx.extero_source == "depth":
-            extero = build_extero_tokens(ctx, self._fm_depth_reading(state)[None])
+            extero = build_extero_tokens(ctx, self._fm_extero_row(state)[None])
         else:
             extero = build_extero_tokens(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
         if self._future_cmd_override is not None:

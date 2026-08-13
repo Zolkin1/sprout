@@ -165,6 +165,10 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # image rather than a reordered vector. ``tokens_per_sensor`` is the sequence
         # arithmetic, which nothing else in the metadata reveals.
         "extero_encoder": str(ctx.model.extero_encoder),
+        # Planes per pixel in one sensor row. Without it the deploy divides the row
+        # width by nothing and demands a camera N times too large -- the same trap
+        # read_fm_extero_meta was fixed for.
+        "extero_channels": int(getattr(ctx, "extero_channels", 1)),
         # Only for the CONVOLUTIONAL encoder. The dataset derives the geometry for any depth
         # recording, but a flat embedding is permutation-invariant over pixels, so stating
         # the fold there would have the deploy enforce a constraint that does not exist --

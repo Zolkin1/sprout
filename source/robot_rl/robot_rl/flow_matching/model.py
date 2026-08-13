@@ -153,6 +153,7 @@ class FlowMatchingTransformer(nn.Module):
             extero_fourier_bands=cfg.extero_fourier_bands,
             extero_miss_sentinel=cfg.extero_miss_sentinel,
             extero_channels=cfg.extero_channels,
+            extero_camera_intrinsics=cfg.extero_camera_intrinsics,
             attention_mode=cfg.attention_mode,
         )
 
@@ -181,6 +182,7 @@ class FlowMatchingTransformer(nn.Module):
         extero_fourier_bands: int = 4,
         extero_miss_sentinel: float | None = None,
         extero_channels: int = 1,
+        extero_camera_intrinsics: Sequence[Sequence[float]] | None = None,
         attention_mode: str = "full",
     ):
         super().__init__()
@@ -257,6 +259,7 @@ class FlowMatchingTransformer(nn.Module):
                 fourier_bands=int(extero_fourier_bands),
                 miss_sentinel=extero_miss_sentinel,
                 row_channels=int(extero_channels),
+                intrinsics=extero_camera_intrinsics,
             )
             self.tokens_per_sensor = int(self.extero_cnn.tokens_per_sensor)
         elif self.extero_encoder == "mlp":

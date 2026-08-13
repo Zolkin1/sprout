@@ -40,7 +40,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deploy.artifacts import resolve_fm_onnx  # noqa: E402
 from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
-from deploy.quat_math_np import quat_apply, quat_box_minus, quat_inv  # noqa: E402
+from deploy.quat_math_np import (  # noqa: E402
+    combine_frame_transforms,
+    matrix_from_quat,
+    quat_apply,
+    quat_box_minus,
+    quat_inv,
+    subtract_frame_transforms,
+    yaw_quat,
+)
 from deploy.tracker_session import convert_joint_order  # noqa: E402
 from deploy.window_np import window_block_slices  # noqa: E402
 
@@ -236,6 +244,27 @@ def build_state(
         # which was silently wrong the moment the FM's band became configurable.
         state["height_scan"] = np.where(np.isnan(clr), -np.inf, clr)
         state["height_scan_hits"] = hits
+    # The generator's camera POSES, when it conditions on more than depth. Same construction
+    # as the Isaac term: the MOUNT BODY's live pose composed with the contract's NOMINAL
+    # offset (never the jittered one -- a robot knows its calibration and nothing more),
+    # expressed in the root's yaw-aligned frame. The heading cancels out of that frame, which
+    # is what lets this run with no odometry.
+    if int(getattr(policy.ctx, "extero_channels", 1)) > 1:
+        fm_spec = policy.get_fm_depth_camera_spec() or policy.get_depth_camera_spec() or []
+        poses = []
+        for cam in fm_spec:
+            mount = robot.get_body_world_states([str(cam["mount_body"])])[0]
+            cam_p_w, cam_q_w = combine_frame_transforms(
+                mount[0:3], mount[3:7],
+                np.asarray(cam["offset_pos"], dtype=np.float64),
+                np.asarray(cam["offset_quat_xyzw"], dtype=np.float64),
+            )
+            p_rel, q_rel = subtract_frame_transforms(
+                state["root_pos"], yaw_quat(state["root_quat"]), cam_p_w, cam_q_w
+            )
+            poses.append((p_rel, matrix_from_quat(q_rel)))
+        state["fm_camera_pose"] = poses
+
     # Depth cameras: cast the policy's own pinhole grids against the terrain AND the
     # robot's visual meshes, normalised exactly as the observation term does. One cast
     # feeds BOTH consumers -- the tracker's depth obs terms (keyed by term name) and the

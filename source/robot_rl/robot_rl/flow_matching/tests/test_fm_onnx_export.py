@@ -79,20 +79,14 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto",
         **({} if attention_mode is None else {"attention_mode": attention_mode}),
     )
     train, _ = build_train_val(data, meta, cfg)
-    model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=f, num_history_states=n, history_dim=cfg.state_dim,
-        extero_sensor_dim=cfg.extero_sensor_dim, extero_sensor_count=cfg.extero_sensor_count,
-        cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
-        d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.num_layers,
-        dim_feedforward=cfg.dim_feedforward,
-        extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
-        extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
-        # From the CFG, not the ctor default. The two attention modes share one parameter
-        # set, so a model built "full" under a config saying "prefix" loads and runs without
-        # complaint -- the fixture would silently export a graph whose arithmetic is not the
-        # one its own config describes.
-        attention_mode=cfg.attention_mode,
-    ).eval()
+    # Through from_config, never a hand-written kwarg list. This fixture used to spell the
+    # arguments out and drifted exactly as that method's docstring warns: the dataset writes
+    # derived fields onto cfg (the image fold, the metric extent, the camera intrinsics, the
+    # channel count) and every one omitted here builds a DIFFERENT model than the reload does,
+    # which surfaces as missing state-dict keys rather than as anything about the omission.
+    # It also settles attention_mode, whose two modes share one parameter set and so load into
+    # each other without complaint.
+    model = FlowMatchingTransformer.from_config(cfg).eval()
     path = str(tmp_path / "ckpt.pt")
     torch.save({
         "config": cfg.to_dict(),

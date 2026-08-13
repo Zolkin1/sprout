@@ -115,6 +115,16 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "robot with cameras and no heightmap; the tracker it is paired "
                              "with must agree (checked at load in deploy/gen_tracker.py).")
     parser.add_argument(
+        "--extero_channels", type=int, default=FlowMatchingConfig().extero_channels,
+        help="Planes per exteroception PIXEL. 1 = depth alone. 4 adds the pixel's xyz in the "
+             "root's yaw-aligned frame, which is what tells the model a step edge is '0.8 m "
+             "ahead and 0.15 m up' rather than 'row 14, column 8, 2.1 m'. It matters because "
+             "the generator sees no joint angles and no root orientation, so without it a "
+             "waist turn or a pelvis pitch is indistinguishable from the terrain moving. "
+             "DERIVED at dataset build from the recorded root quaternion, joint angles and "
+             "the NOMINAL mount -- no re-record, and the same three inputs a robot has. "
+             "Depth only; a scan's rays are already ground points.")
+    parser.add_argument(
         "--extero_encoder", type=str, default=FlowMatchingConfig().extero_encoder,
         choices=["auto", *EXTERO_ENCODERS],
         help="How ONE exteroception reading becomes transformer tokens. 'cnn' = a 3-layer "
@@ -421,7 +431,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         num_epochs=args.num_epochs, grad_clip=args.grad_clip,
         lr_warmup_steps=args.lr_warmup_steps, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
-        extero_encoder=args.extero_encoder,
+        extero_encoder=args.extero_encoder, extero_channels=args.extero_channels,
         extero_cnn_channels=[int(c) for c in args.extero_cnn_channels.split(",") if c.strip()],
         extero_cnn_grid=([int(g) for g in args.extero_cnn_grid.split(",") if g.strip()]
                          or None),
@@ -899,8 +909,13 @@ def main() -> None:
 
     # Normalizers are fit on CPU; move their stats to the model device so
     # (de)normalization during evaluation/sampling stays on one device.
+    #
+    # NOT the exteroception one. It is applied inside ``Dataset.__getitem__``, on host-side
+    # rows in a DataLoader worker, and moving it in place made every fetch raise "at least two
+    # devices" -- while nothing on the device ever reads it, because exteroception is only an
+    # INPUT (the state and command stats are the ones the loss and the sampler denormalize
+    # with). The checkpoint is unaffected either way: ``state_dict`` stores stats on CPU.
     train_ds.state_normalizer.to(device)
-    train_ds.extero_normalizer.to(device)
     if train_ds.cmd_normalizer is not None:
         train_ds.cmd_normalizer.to(device)
 

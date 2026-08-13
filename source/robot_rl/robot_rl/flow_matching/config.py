@@ -289,6 +289,12 @@ class FlowMatchingConfig:
     #: against an image shape has to divide by this first -- see ``check_extero_encoder``.
     #: Meaningless for the MLP encoder and for the height scan.
     extero_channels: int = 1
+    #: Per-camera ``(fx, fy, cx, cy)``, DERIVED from the recording's ``depth_camera_spec``,
+    #: enabling the angular token position embedding. Per camera and not shared: the G1's two
+    #: are 100x70 deg and 70x42 deg, so one set would mislabel the narrower one's tokens by
+    #: 1.43x while every shape stayed correct. ``None`` for the height scan, whose pixels are
+    #: ground points and use ``extero_coord_extent_m`` instead.
+    extero_camera_intrinsics: list[list[float]] | None = None
     #: Names of those channels, in order, for diagnostics and the ONNX metadata. Purely
     #: descriptive: the ORDER that matters is the one the encoder folds, and that is fixed by
     #: ``extero_channels``.

@@ -834,16 +834,9 @@ def test_online_roundtrip_with_the_cnn_encoder():
     assert cfg.extero_image_hw == [[H, W], [H, W]]
     assert cfg.extero_sensor_count == 2 and cfg.extero_sensor_dim == H * W
     assert cfg.tokens_per_sensor == 16 and cfg.extero_seq_tokens == 32
-    model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=F, num_history_states=N, history_dim=cfg.state_dim,
-        extero_sensor_dim=cfg.extero_sensor_dim,
-        extero_sensor_count=cfg.extero_sensor_count,
-        cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
-        num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward,
-        extero_encoder=cfg.extero_encoder, extero_image_hw=cfg.extero_image_hw,
-        extero_cnn_channels=cfg.extero_cnn_channels, extero_cnn_grid=cfg.extero_cnn_grid,
-        attention_mode=cfg.attention_mode,
-    ).eval()
+    # Through from_config: the reload under test goes through it, so building the saved model
+    # any other way compares two different architectures and reports it as missing keys.
+    model = FlowMatchingTransformer.from_config(cfg).eval()
     ckpt = {
         "config": cfg.to_dict(),
         "meta": {"state_joint_names": meta.state_joint_names,

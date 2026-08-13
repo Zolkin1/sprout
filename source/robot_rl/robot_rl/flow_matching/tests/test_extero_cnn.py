@@ -539,3 +539,86 @@ def test_a_row_of_the_wrong_channel_count_is_refused():
     enc = ExteroImageEncoderSet([(_H, _W)], _D_MODEL, row_channels=4)
     with pytest.raises(ValueError, match="channel"):
         enc(torch.randn(2, 1, _H * _W))
+
+
+##
+# The angular position embedding: a camera's pixels are rays, not ground points
+##
+
+def test_pixel_angles_span_the_camera_fov():
+    """The half-angles the embedding normalises by must be the lens's actual half-angles."""
+    import math
+
+    from robot_rl.flow_matching.extero_encoder import pixel_angles_rad
+
+    # The shipped near camera: 100x70 deg, so 50 deg / 35 deg half-angles.
+    w, h, fx, fy = 30, 26, 12.58649, 18.56592
+    ang = pixel_angles_rad((h, w), fx, fy, w / 2, h / 2)
+    assert ang.shape == (2, h, w)
+    # Pixel CENTRES, so the extreme pixel sits half a pixel inside the nominal edge.
+    assert math.degrees(float(ang[0].abs().max())) == pytest.approx(50.0, abs=1.5)
+    assert math.degrees(float(ang[1].abs().max())) == pytest.approx(35.0, abs=1.5)
+    # Azimuth varies along the columns and elevation along the rows, not the other way round.
+    assert float(ang[0, 0, 0] - ang[0, 0, -1]) > 0.1
+    assert float(ang[1, 0, 0] - ang[1, -1, 0]) > 0.1
+
+
+def test_the_two_lenses_get_different_embeddings():
+    """The G1's cameras are 100x70 and 70x42 deg; one shared extent would mislabel the far one."""
+    from robot_rl.flow_matching.extero_encoder import ExteroImageEncoderSet
+
+    near, far = [12.58649, 18.56592, 15.0, 13.0], [21.42222, 33.86616, 15.0, 13.0]
+    enc = ExteroImageEncoderSet([(26, 30), (26, 30)], _D_MODEL, intrinsics=[near, far])
+    a, b = enc.encoders[0].token_angles_rad, enc.encoders[1].token_angles_rad
+    assert a.shape == b.shape
+    # The far camera is the narrower lens, so its tokens really do span fewer radians.
+    assert float(b.abs().max()) < float(a.abs().max())
+
+
+def test_the_angular_embedding_adds_no_input_channels():
+    """Token-level, deliberately: a ray's direction is constant per pixel, so it belongs on
+    the token rather than as a CoordConv plane restating it every step."""
+    from robot_rl.flow_matching.extero_encoder import ExteroImageEncoder
+
+    enc = ExteroImageEncoder((26, 30), _D_MODEL, intrinsics=[12.6, 18.6, 15.0, 13.0])
+    assert enc.in_channels == 1                      # depth alone, no coord planes
+    assert enc.pos_embed is not None                 # but it DOES carry a position embedding
+    out = enc(torch.randn(3, 26 * 30))
+    assert out.shape == (3, enc.tokens_per_sensor, _D_MODEL)
+
+
+def test_a_camera_cannot_also_be_a_metric_grid():
+    """Metres and radians parameterise position differently; a sensor is one or the other."""
+    from robot_rl.flow_matching.extero_encoder import ExteroImageEncoder
+
+    with pytest.raises(ValueError, match="not both"):
+        ExteroImageEncoder((26, 30), _D_MODEL, coord_extent_m=(3.0, 3.0),
+                           intrinsics=[12.6, 18.6, 15.0, 13.0])
+
+
+def test_intrinsics_are_per_sensor():
+    """Passing one set for two cameras is the mistake this argument exists to prevent."""
+    from robot_rl.flow_matching.extero_encoder import ExteroImageEncoderSet
+
+    with pytest.raises(ValueError, match="per sensor"):
+        ExteroImageEncoderSet([(26, 30), (26, 30)], _D_MODEL,
+                              intrinsics=[[12.6, 18.6, 15.0, 13.0]])
+
+
+def test_a_grid_larger_than_the_trunk_produces_is_refused():
+    """adaptive_avg_pool2d upsamples silently, so the token count would be a claim, not a fact."""
+    from robot_rl.flow_matching.extero_encoder import ExteroImageEncoder
+
+    with pytest.raises(ValueError, match="larger than the trunk's native grid"):
+        ExteroImageEncoder((26, 30), _D_MODEL, grid=(6, 8))       # native is 4x4 here
+    # The same grid is fine once a stride-1 first layer makes the native grid big enough.
+    enc = ExteroImageEncoder((26, 30), _D_MODEL, strides=(1, 2, 2), grid=(6, 8))
+    assert enc.tokens_per_sensor == 48
+
+
+def test_the_shipped_depth_trunk_lands_on_56_tokens():
+    """strides (1, 2, 2) on 26x30 gives the 7x8 native grid this plan asks for."""
+    from robot_rl.flow_matching.extero_encoder import conv_grid_shape
+
+    assert conv_grid_shape((26, 30), 3, (1, 2, 2)) == (7, 8)      # 56 tokens/camera
+    assert conv_grid_shape((26, 30), 3) == (4, 4)                 # the old all-stride-2 default

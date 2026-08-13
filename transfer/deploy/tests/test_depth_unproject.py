@@ -208,10 +208,23 @@ def test_parity_with_the_torch_unprojection():
     generator trains on one geometry and deploys against another.
     """
     torch = pytest.importorskip("torch")
-    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
-        pinhole_ray_directions as torch_dirs,
-        unproject_to_yaw_frame as torch_unproject,
+    # The torch half lives on the isaaclab side, so this test only runs where isaaclab does --
+    # SKIP rather than fail, since the numpy half above is the part transfer/ owns.
+    pytest.importorskip("isaaclab")
+    _depth = pytest.importorskip(
+        "robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth"
     )
+    if not hasattr(_depth, "pinhole_ray_directions"):
+        # Almost always the worktree trap: `source/robot_rl` is the editable install, so a
+        # checkout without PYTHONPATH resolves `robot_rl` to the MAIN tree and silently tests
+        # a different copy of the geometry than the one beside this file.
+        pytest.skip(
+            f"{_depth.__file__} has no pinhole_ray_directions -- this is a different "
+            "robot_rl than the one under test. Run with "
+            "PYTHONPATH=source/robot_rl:source/motion_gen."
+        )
+    torch_dirs = _depth.pinhole_ray_directions
+    torch_unproject = _depth.unproject_to_yaw_frame
 
     cam = _cam()
     rng = np.random.default_rng(4)

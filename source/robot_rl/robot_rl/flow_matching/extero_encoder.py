@@ -161,6 +161,41 @@ def pixel_coords_m(
     return torch.stack([x_grid, y_grid], dim=0).contiguous()
 
 
+def pixel_angles_rad(
+    image_hw: tuple[int, int], fx: float, fy: float, cx: float, cy: float
+) -> torch.Tensor:
+    """Each pixel's ``(azimuth, elevation)`` from the optical axis, in RADIANS.
+
+    The camera's answer to :func:`pixel_coords_m`. A depth pixel is a RAY, not a ground
+    point, so it has no planar coordinate to hand a convolution -- but it does have a
+    direction, and ``atan((u - cx) / fx)`` is that direction exactly, for the tangent-linear
+    pinhole the training sensor uses.
+
+    Why angles and not pixel indices, which carry the same information for a fixed lens: the
+    angle is a property of the LENS rather than of the sampling, so it is unchanged when the
+    generator re-samples the same camera on its own grid, and it is directly comparable
+    between the G1's two cameras -- which are 100x70 deg and 70x42 deg, so the same pixel
+    index means quite different directions in each.
+
+    Args:
+        image_hw: ``(height, width)`` of the folded image.
+        fx: Horizontal focal length in pixels.
+        fy: Vertical focal length in pixels.
+        cx: Horizontal principal point in pixels.
+        cy: Vertical principal point in pixels.
+
+    Returns:
+        ``(2, height, width)`` -- channel 0 is azimuth (+ toward image left, matching the
+        camera frame's +y), channel 1 elevation (+ toward the top row, matching +z).
+    """
+    h, w = int(image_hw[0]), int(image_hw[1])
+    u = torch.arange(w, dtype=torch.float32) + 0.5
+    v = torch.arange(h, dtype=torch.float32) + 0.5
+    az = torch.atan((float(cx) - u) / float(fx)).view(1, -1).expand(h, w)
+    el = torch.atan((float(cy) - v) / float(fy)).view(-1, 1).expand(h, w)
+    return torch.stack([az, el], dim=0).contiguous()
+
+
 def fourier_features(coords: torch.Tensor, bands: int) -> torch.Tensor:
     """Sinusoidal features of normalized coordinates, ``(..., 2 * axes * bands)``.
 
@@ -218,6 +253,10 @@ class ExteroImageEncoder(nn.Module):
             channel is appended: 1 where the pixel is real geometry, 0 where the reading was
             a miss or saturated at the band edge. Without it a hole and a real drop-off are
             the same number, and the convolution cannot tell them apart.
+        intrinsics: ``(fx, fy, cx, cy)`` of THIS camera, enabling the angular token position
+            embedding. Mutually exclusive with ``coord_extent_m``; per sensor, because the
+            G1's two cameras are different lenses and one shared extent would mislabel the
+            narrower one's tokens.
         row_channels: Planes per pixel carried by the ROW itself (``cfg.extero_channels``).
             1 = depth alone; 4 = depth plus the pixel's xyz in the root's yaw-aligned frame,
             which is what lets a kernel see where a step edge is in metres rather than in
@@ -238,6 +277,7 @@ class ExteroImageEncoder(nn.Module):
         fourier_bands: int = 4,
         miss_sentinel: float | None = None,
         row_channels: int = 1,
+        intrinsics: tuple[float, float, float, float] | None = None,
     ):
         super().__init__()
         channels = tuple(int(c) for c in channels)
@@ -254,6 +294,13 @@ class ExteroImageEncoder(nn.Module):
         self.miss_sentinel = None if miss_sentinel is None else float(miss_sentinel)
         self.coord_extent_m = (None if coord_extent_m is None
                                else (float(coord_extent_m[0]), float(coord_extent_m[1])))
+        self.intrinsics = (None if intrinsics is None
+                           else tuple(float(v) for v in intrinsics))
+        if self.coord_extent_m is not None and self.intrinsics is not None:
+            raise ValueError(
+                "a sensor is either a metric ground grid (coord_extent_m) or a camera "
+                "(intrinsics), not both; they parameterise position in different units."
+            )
 
         # TWO channel counts, and conflating them is a silent shape bug:
         #   row_channels -- what the ROW carries, so what ``cfg.extero_sensor_dim`` counts and
@@ -282,14 +329,43 @@ class ExteroImageEncoder(nn.Module):
 
         native = conv_grid_shape(self.image_hw, len(channels), self.strides)
         self.grid = None if grid is None else (int(grid[0]), int(grid[1]))
+        if self.grid is not None and (self.grid[0] > native[0] or self.grid[1] > native[1]):
+            # ``adaptive_avg_pool2d`` UPSAMPLES silently when asked for more cells than it
+            # has, so the run would report (and pay for) tokens carrying no more information
+            # than the smaller grid held -- a token count that is a claim, not a fact.
+            raise ValueError(
+                f"extero_cnn_grid {self.grid} is larger than the trunk's native grid "
+                f"{native} for a {self.image_hw} image under strides {self.strides}; "
+                "pooling up would invent tokens. Lower a stride to make the native grid "
+                "bigger, or ask for a grid no larger than it."
+            )
         out_grid = native if self.grid is None else self.grid
         self.native_grid = native
         self.out_grid = out_grid
         self.tokens_per_sensor = out_grid[0] * out_grid[1]
 
-        if self.coord_extent_m is None:
+        if self.coord_extent_m is None and self.intrinsics is None:
             self.pos_embed = None
             self.fourier_bands = 0
+        elif self.coord_extent_m is None:
+            # CAMERA path: the position embedding is TOKEN-LEVEL only -- no input channels.
+            # A ray has a direction rather than a planar coordinate, and the direction is
+            # constant per pixel, so stating it once per token is where it belongs; feeding it
+            # as a CoordConv plane would spend two input channels restating what the token
+            # embedding already says. (The metric grid below does add channels, because there
+            # a pixel IS a ground point and its coordinate is what the kernel localises.)
+            self.fourier_bands = int(fourier_bands)
+            ang = pixel_angles_rad(self.image_hw, *self.intrinsics)          # (2, H, W)
+            token_ang = F.adaptive_avg_pool2d(ang.unsqueeze(0), out_grid)
+            token_ang = token_ang.flatten(2).transpose(1, 2)                 # (1, tokens, 2)
+            self.register_buffer("token_angles_rad", token_ang, persistent=False)
+            # Normalised by this camera's OWN half-angles, so both cameras' embeddings span
+            # the same [-1, 1] whatever their field of view -- otherwise the narrow one would
+            # only ever excite the low-frequency bands.
+            half = ang.flatten(1).abs().amax(dim=1).clamp_min(1e-6)          # (2,)
+            feats = fourier_features(token_ang / half, self.fourier_bands)
+            self.register_buffer("token_pos_features", feats, persistent=False)
+            self.pos_embed = nn.Linear(feats.shape[-1], d_model)
         else:
             self.fourier_bands = int(fourier_bands)
             coords = pixel_coords_m(self.image_hw, self.coord_extent_m, ordering)
@@ -375,6 +451,10 @@ class ExteroImageEncoderSet(nn.Module):
         fourier_bands: Frequency bands per axis in the token position embedding.
         miss_sentinel: Normalized value a missed ray takes, enabling the validity channel.
         row_channels: Planes per pixel in the row; see :class:`ExteroImageEncoder`.
+        intrinsics: One ``(fx, fy, cx, cy)`` PER SENSOR, or ``None``. Per sensor rather than
+            shared: the G1's cameras are 100x70 deg and 70x42 deg, so a single extent would
+            label the far camera's tokens with angles 1.43x too wide -- silently, since every
+            shape stays correct.
 
     Raises:
         ValueError: If no sensors are given, or if the cameras do not agree on how many
@@ -395,19 +475,26 @@ class ExteroImageEncoderSet(nn.Module):
         fourier_bands: int = 4,
         miss_sentinel: float | None = None,
         row_channels: int = 1,
+        intrinsics: Sequence[Sequence[float]] | None = None,
     ):
         super().__init__()
         if not len(image_hw):
             raise ValueError("ExteroImageEncoderSet needs at least one sensor.")
         self.row_channels = int(row_channels)
+        if intrinsics is not None and len(intrinsics) != len(image_hw):
+            raise ValueError(
+                f"intrinsics names {len(intrinsics)} camera(s) but there are "
+                f"{len(image_hw)} sensor(s); they are per sensor, not shared."
+            )
         self.encoders = nn.ModuleList([
             ExteroImageEncoder(
                 hw, d_model, channels, grid, strides=strides,
                 coord_extent_m=coord_extent_m, ordering=ordering,
                 fourier_bands=fourier_bands, miss_sentinel=miss_sentinel,
                 row_channels=row_channels,
+                intrinsics=(None if intrinsics is None else intrinsics[i]),
             )
-            for hw in image_hw
+            for i, hw in enumerate(image_hw)
         ])
         counts = {int(enc.tokens_per_sensor) for enc in self.encoders}
         if len(counts) != 1:
