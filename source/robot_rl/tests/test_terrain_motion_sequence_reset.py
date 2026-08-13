@@ -19,7 +19,10 @@ from types import SimpleNamespace
 from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (
     MotionSequenceCommand,
 )
-from robot_rl.tasks.manager_based.robot_rl.mdp.events.resets import sample_terrain_clips
+from robot_rl.tasks.manager_based.robot_rl.mdp.events.resets import (
+    ClipCycler,
+    sample_terrain_clips,
+)
 from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
     clip_frame_origin,
     default_num_flat_tiles,
@@ -395,3 +398,66 @@ def test_tracked_frame_ori_bound_is_per_frame_and_none_disables_it():
     with pytest.raises(ValueError, match="max_ori_rad has 3 entries"):
         tracked_frame_error_termination(
             env, frame_names=frames, max_pos_dist=0.5, max_ori_rad=(0.8, 0.8, 0.8))
+
+
+# --- ClipCycler: without-replacement clip assignment ------------------------------------
+
+
+def test_cycler_uses_every_clip_before_repeating_any():
+    """A full pass over a group is a permutation -- no repeat until it completes."""
+    cycler = ClipCycler(_groups(), seed=0)
+    drawn = cycler.take(-1, 3).tolist()
+    assert sorted(drawn) == [0, 1, 2]
+
+
+def test_cycler_second_pass_covers_the_group_again():
+    """Wrapping re-shuffles rather than continuing off the end."""
+    cycler = ClipCycler(_groups(), seed=0)
+    two_passes = cycler.take(-1, 6).tolist()
+    assert sorted(two_passes[:3]) == [0, 1, 2]
+    assert sorted(two_passes[3:]) == [0, 1, 2]
+    assert cycler.coverage()[-1]["passes"] == 2
+
+
+def test_cycler_take_for_respects_group_membership():
+    """Every env still gets a clip belonging to its own terrain group."""
+    groups = _groups()
+    env_tid = torch.tensor([0, -1, 1, 1, -1, 0], dtype=torch.long)
+    clip_id = ClipCycler(groups, seed=1).take_for(env_tid)
+    for tid, cid in zip(env_tid.tolist(), clip_id.tolist()):
+        assert cid in groups[tid].tolist()
+
+
+def test_cycler_take_for_does_not_repeat_within_one_draw():
+    """Two envs on the same tile in one reset get DIFFERENT clips while the queue holds."""
+    groups = {0: torch.arange(8, dtype=torch.long)}
+    clip_id = ClipCycler(groups, seed=2).take_for(torch.zeros(8, dtype=torch.long))
+    assert sorted(clip_id.tolist()) == list(range(8))
+
+
+def test_cycler_coverage_tracks_partial_progress():
+    """Before a pass completes, coverage is the cursor -- not the whole group."""
+    cycler = ClipCycler({0: torch.arange(10, dtype=torch.long)}, seed=0)
+    cycler.take(0, 4)
+    cov = cycler.coverage()[0]
+    assert cov == {"clips": 10, "distinct_used": 4, "passes": 0}
+
+
+def test_cycler_is_deterministic_for_a_seed():
+    """Same seed, same order -- so a re-run of a recording draws the same clips."""
+    a = ClipCycler(_groups(), seed=7).take(-1, 6).tolist()
+    b = ClipCycler(_groups(), seed=7).take(-1, 6).tolist()
+    assert a == b
+    assert ClipCycler(_groups(), seed=8).take(-1, 6).tolist() != a
+
+
+def test_cycler_rejects_an_empty_group():
+    with pytest.raises(ValueError, match="no clips"):
+        ClipCycler({0: torch.arange(3), 1: torch.empty(0, dtype=torch.long)})
+
+
+def test_cycler_reports_a_tile_with_no_clips():
+    """The same fatal library/terrain mismatch sample_terrain_clips raises on."""
+    cycler = ClipCycler({0: torch.arange(3, dtype=torch.long)}, seed=0)
+    with pytest.raises(ValueError, match="NO clips in the library"):
+        cycler.take_for(torch.tensor([0, 5], dtype=torch.long))

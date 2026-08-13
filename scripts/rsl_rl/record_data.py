@@ -18,6 +18,12 @@ Specify the total number of pairs with ``--num_pairs``; every run writes a new,
 non-overwriting file under ``<log_dir>/recorded_data/`` (override with
 ``--output_dir``).
 
+Episodes start at clip frame 0 by default (``--start_step``), which is a RECORDING
+choice, not the training one: training draws a random start so every phase is an entry
+point, but a random start run to the clip end visits step ``t`` with probability
+``~t/clip_len``, so the recorded data would be a ramp toward late clip phases rather
+than the uniform coverage the downstream FM should train on.
+
 Example:
     python scripts/rsl_rl/record_data.py --task <Task> --num_envs 64 \
         --num_pairs 100000 --load_run <run> --headless
@@ -154,6 +160,28 @@ parser.add_argument(
          "clips/g1_recovery_v1.h5. Default: the task config's clip (clips/g1_flat_v1.h5 for the "
          "teacher tasks). The recorded distribution mirrors THIS clip, so point it at the library "
          "you generated.",
+)
+parser.add_argument(
+    "--start_step", type=int, default=0,
+    help="Clip step every episode starts at. 0 (the default) is what makes the recorded "
+         "window distribution UNIFORM in clip phase: each episode walks its clip once from "
+         "frame 0, so every frame is visited exactly once per visit to that clip. -1 "
+         "restores training's SAMPLED start (commands.traj_ref.random_start_phase), which is "
+         "not uniform -- a start drawn uniformly from [0, clip_len) and then run to the clip "
+         "end visits step t with probability ~t/clip_len, so late phases dominate (measured "
+         "on a 200k-window recording: 1.1%% of windows in the first phase decile against "
+         "18.1%% in the eighth). The cost of 0 is clip COVERAGE: episodes are ~2x longer, so "
+         "a fixed --num_windows budget spans ~half as many distinct clips.",
+)
+parser.add_argument(
+    "--clip_draw", type=str, default="cycle", choices=("cycle", "random"),
+    help="How each reset picks its clip. 'cycle' (the default) draws from a shuffled queue "
+         "per terrain group, so every clip in the library is used once before any repeats -- "
+         "clip coverage is then exactly min(episodes, clips). 'random' is training's "
+         "with-replacement sampling, which covers only 1-exp(-E/C) of a C-clip group in E "
+         "episodes (63%% when E == C), and the misses are a random third of the library. "
+         "Cycling costs nothing and is strictly better for a recording, whose clip coverage "
+         "IS the deliverable; 'random' is kept to reproduce an older recording.",
 )
 parser.add_argument(
     "--fm_depth_resolution", type=str, default="",
@@ -364,6 +392,36 @@ def _distractor_clip_mask(ref_cmd):
           f"{len(distractor_tids)} tiles -> recording per-step 'is_distractor' so "
           f"train.py --skip_distractors can drop them later.")
     return flags
+
+
+def _report_clip_coverage(ref_cmd) -> None:
+    """Print how much of the clip library the finished recording actually spanned.
+
+    Only meaningful under ``--clip_draw cycle``, which is the mode that makes coverage a
+    guarantee rather than a lottery; with-replacement sampling leaves no queue to read and
+    this quietly does nothing.  Per TERRAIN GROUP rather than one number, because groups
+    advance through their queues at different rates: an env consumes one clip per episode
+    and a group's clips may be 3x longer than another's, so the flat group is still on its
+    first pass while the stair groups are on their third.
+
+    Args:
+        ref_cmd: The resolved trajectory command term (holds the cycler, if any).
+    """
+    cycler = getattr(ref_cmd, "_clip_cycler", None)
+    if cycler is None:
+        return
+    cov = cycler.coverage()
+    total = sum(g["clips"] for g in cov.values())
+    seen = sum(g["distinct_used"] for g in cov.values())
+    full = sum(1 for g in cov.values() if g["passes"] > 0)
+    print(f"[INFO] clip coverage: {seen}/{total} distinct clips used "
+          f"({100.0 * seen / max(total, 1):.1f}%); {full}/{len(cov)} terrain groups completed "
+          f"at least one full pass.")
+    partial = {g: v for g, v in cov.items() if v["passes"] == 0 and v["distinct_used"] < v["clips"]}
+    if partial:
+        worst = sorted(partial.items(), key=lambda kv: kv[1]["distinct_used"] / kv[1]["clips"])[:5]
+        detail = ", ".join(f"tid {g}: {v['distinct_used']}/{v['clips']}" for g, v in worst)
+        print(f"[INFO]   least-covered groups -- {detail}. Record more windows to span them.")
 
 
 def _clip_family_codes(ref_cmd) -> tuple["torch.Tensor | None", list[str]]:
@@ -1190,6 +1248,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                       f"{terrain.clip_library_path} -> {args_cli.clip}")
                 terrain.clip_library_path = args_cli.clip
 
+        # Where inside its clip each episode starts. Training SAMPLES a start (so a policy
+        # sees every phase as an entry point); a recording wants uniform COVERAGE of clip
+        # phase, and only a start at frame 0 gives it -- a sampled start run to the clip end
+        # visits step t with probability ~t/clip_len, which is the ramp measured in the
+        # --start_step help. Set on the reset EVENT rather than by disabling
+        # ``random_start_phase``, so the value lands in the dumped provenance env.yaml.
+        if args_cli.start_step >= 0:
+            reset_ev = getattr(getattr(env_cfg, "events", None), "reset_on_clip", None)
+            if reset_ev is None or "pin_start_step" not in getattr(reset_ev, "params", {}):
+                raise ValueError(
+                    "--start_step given but the task has no events.reset_on_clip carrying a "
+                    "pin_start_step param. Pass --start_step -1 to leave the task's own "
+                    "(sampled) start alone."
+                )
+            reset_ev.params["pin_start_step"] = int(args_cli.start_step)
+            print(f"[INFO] Every episode starts at clip step {args_cli.start_step} -- windows "
+                  f"cover clip phase uniformly. Pass --start_step -1 to sample as training does.")
+
+        # And which clip each reset picks: without replacement, so the run spans the library
+        # rather than covering a random 63% of it (see --clip_draw).
+        reset_ev = getattr(getattr(env_cfg, "events", None), "reset_on_clip", None)
+        if reset_ev is None or "clip_draw" not in getattr(reset_ev, "params", {}):
+            raise ValueError(
+                "the task has no events.reset_on_clip carrying a clip_draw param; it is not a "
+                "clip-tracking task and cannot be recorded from."
+            )
+        reset_ev.params["clip_draw"] = args_cli.clip_draw
+
         # Give the GENERATOR its own camera pair when it should record at a resolution the
         # policy does not use. DECLARED here rather than derived, unlike play.py: there is no
         # FM artifact yet -- this run is what produces the data one will be trained on.
@@ -1467,6 +1553,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[INFO] Streamed {n_written} snap windows to: {out_path}")
             print(f"[INFO]   H={H} F={rf_len} node_dim={node_dim} K={K} cmd_dim={cmd_dim}; "
                   f"format=windowed_h5  provenance={prov_dir}")
+            _report_clip_coverage(ref_cmd)
             env.close()
             return
 

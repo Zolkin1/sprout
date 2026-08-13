@@ -31,6 +31,7 @@ def reset_on_motion_sequence(
     pin_clip_ids=None,
     pin_start_step: int | None = None,
     spawn_z_offset: float = 0.0,
+    clip_draw: str = "random",
 ):
     """Reset each env onto a randomly chosen pre-generated motion clip.
 
@@ -52,11 +53,17 @@ def reset_on_motion_sequence(
         asset_cfg: Robot asset config.
         pin_clip_ids: Evaluation only -- pin env ``i`` to a stated clip instead of sampling
             (see :func:`resolve_pinned_clips`).
-        pin_start_step: Evaluation only -- start every env at this clip step instead of
-            sampling one. Negative (the default) means sample; ``0`` matches a MuJoCo
-            ``--clip_start_time 0`` playback.
+        pin_start_step: Start every env at this clip step instead of sampling one. Negative
+            (the default) means sample; ``0`` matches a MuJoCo ``--clip_start_time 0``
+            playback, and is what ``record_data.py`` sets so recorded windows cover clip
+            phase uniformly (a sampled start run to the clip end is a ramp toward late
+            phases -- see that script's ``--start_step``).
         spawn_z_offset: Diagnostic -- metres to raise the robot's spawn height above the
             clip's own root height, without moving the clip. 0.0 (the default) is off.
+        clip_draw: How the clip is chosen. ``"random"`` (the default, and what training
+            wants) samples with replacement; ``"cycle"`` draws from a shuffled queue so
+            every clip in the library is used once before any repeats -- see
+            :class:`ClipCycler` for why a recording wants that and training does not.
     """
     asset: Articulation = env.scene[asset_cfg.name]
     cmd = env.command_manager.get_term(command_name)
@@ -67,9 +74,18 @@ def reset_on_motion_sequence(
     num_clips = cmd.manager.num_clips
 
     # 1. Sample a clip and a start step per env (or take the pinned evaluation set).
+    if clip_draw not in ("random", "cycle"):
+        raise ValueError(f"clip_draw must be 'random' or 'cycle'; got {clip_draw!r}.")
     clip_id = resolve_pinned_clips(env_ids, pin_clip_ids, device)
     if clip_id is None:
-        clip_id = torch.randint(0, num_clips, (k,), device=device)
+        if clip_draw == "cycle":
+            # One group: a flat teacher has no tiles, so every clip is drawable by every env.
+            cycler = _clip_cycler(
+                cmd, {0: torch.arange(num_clips)}, seed=int(getattr(env.cfg, "seed", 0) or 0)
+            )
+            clip_id = cycler.take_for(torch.zeros(k, dtype=torch.long, device=device))
+        else:
+            clip_id = torch.randint(0, num_clips, (k,), device=device)
     elif bool((clip_id >= num_clips).any()):
         raise ValueError(
             f"pin_clip_ids indexes clip {int(clip_id.max())} but the library has "
@@ -330,6 +346,157 @@ def sample_terrain_clips(env_tid: torch.Tensor, groups: dict[int, torch.Tensor])
     return clip_id
 
 
+class ClipCycler:
+    """Without-replacement clip draw: every clip of a group is used before any repeats.
+
+    :func:`sample_terrain_clips` draws with replacement, so ``E`` episodes over a
+    ``C``-clip group touch only ``C * (1 - exp(-E/C))`` distinct clips -- 63% at
+    ``E == C``, and the misses are a random 37% of the library.  That is harmless for
+    TRAINING (an unseen clip is just a clip the policy did not get that run) and wrong
+    for RECORDING, where the dataset's clip coverage IS the deliverable.  Drawing from a
+    shuffled permutation instead makes coverage exactly ``min(E, C)``, and a second pass
+    starts only once the first is complete.
+
+    One queue per terrain group, because an env may only be handed a clip matching its
+    tile; the flat teacher passes a single group holding every clip.  The env -> tile map
+    is fixed for a run (no task here has a terrain curriculum), so each group's queue is
+    consumed only by the envs sitting on that group's tiles -- and groups whose clips are
+    longer therefore advance through their queue more slowly in wall-clock, which is why
+    :meth:`coverage` reports per group rather than one number.
+
+    Args:
+        groups: ``{group_id: clip_indices}``, each a 1-D long tensor of clip indices.
+        seed: Seed for the per-group shuffles. Fixed by default so a re-run of the same
+            recording command draws the same clips in the same order.
+
+    Raises:
+        ValueError: If ``groups`` is empty or any group holds no clips.
+    """
+
+    def __init__(self, groups: dict[int, torch.Tensor], seed: int = 0) -> None:
+        if not groups:
+            raise ValueError("ClipCycler needs at least one group of clips.")
+        empty = sorted(int(g) for g, c in groups.items() if c.numel() == 0)
+        if empty:
+            raise ValueError(f"ClipCycler group(s) {empty} hold no clips.")
+        # Queues live on the CPU: they are drawn from a few times per reset and moved to
+        # the env device on the way out, which is cheaper than keeping a permutation of a
+        # 10k-clip library resident on the GPU.
+        self._clips = {int(g): c.detach().to("cpu").reshape(-1) for g, c in groups.items()}
+        self._gen = torch.Generator(device="cpu")
+        self._gen.manual_seed(int(seed))
+        self._order: dict[int, torch.Tensor] = {}
+        self._cursor: dict[int, int] = {}
+        self._passes: dict[int, int] = {g: 0 for g in self._clips}
+        for g in self._clips:
+            self._shuffle(g)
+
+    def _shuffle(self, group_id: int) -> None:
+        """Re-draw ``group_id``'s permutation and rewind its cursor."""
+        clips = self._clips[group_id]
+        self._order[group_id] = clips[torch.randperm(clips.numel(), generator=self._gen)]
+        self._cursor[group_id] = 0
+
+    def take(self, group_id: int, k: int) -> torch.Tensor:
+        """Take the next ``k`` clips from ``group_id``'s queue, refilling as needed.
+
+        Args:
+            group_id: The group to draw from.
+            k: How many clips to take (may exceed the group size; the queue re-shuffles
+                and the pass counter advances).
+
+        Returns:
+            ``[k]`` long tensor of clip indices, on the CPU.
+
+        Raises:
+            KeyError: If ``group_id`` has no queue (a tile whose terrain has no clips).
+        """
+        if group_id not in self._order:
+            raise KeyError(f"no clips for group {group_id}")
+        out: list[torch.Tensor] = []
+        while k > 0:
+            order, cur = self._order[group_id], self._cursor[group_id]
+            n = min(k, order.numel() - cur)
+            out.append(order[cur:cur + n])
+            self._cursor[group_id] = cur + n
+            k -= n
+            if self._cursor[group_id] >= order.numel():
+                self._passes[group_id] += 1
+                self._shuffle(group_id)
+        return torch.cat(out)
+
+    def take_for(self, group_id_per_env: torch.Tensor) -> torch.Tensor:
+        """Draw one clip per env, each from its own group's queue.
+
+        Args:
+            group_id_per_env: ``[k]`` long, the group (terrain id) of each resetting env.
+
+        Returns:
+            ``[k]`` long clip index per env, on ``group_id_per_env``'s device.
+
+        Raises:
+            ValueError: If any env's group has no clips -- the same fatal library /
+                terrain mismatch :func:`sample_terrain_clips` reports.
+        """
+        device = group_id_per_env.device
+        missing = sorted({int(t) for t in group_id_per_env.tolist() if int(t) not in self._order})
+        if missing:
+            raise ValueError(
+                f"terrain id(s) {missing} have an env tile but NO clips in the library -- "
+                "envs on those tiles cannot be assigned a matching clip. Regenerate the "
+                "terrain clip library so every terrain has clips."
+            )
+        clip_id = torch.empty(group_id_per_env.shape[0], dtype=torch.long, device=device)
+        for t in torch.unique(group_id_per_env).tolist():
+            mask = group_id_per_env == int(t)
+            clip_id[mask] = self.take(int(t), int(mask.sum())).to(device)
+        return clip_id
+
+    def coverage(self) -> dict[int, dict[str, int]]:
+        """Per-group progress through the library.
+
+        Returns:
+            ``{group_id: {"clips", "distinct_used", "passes"}}`` -- how many clips the
+            group holds, how many of them have been handed out at least once, and how
+            many complete passes have finished.  ``distinct_used == clips`` means the
+            recording has spanned that group.
+        """
+        return {
+            g: {
+                "clips": int(self._clips[g].numel()),
+                "distinct_used": (int(self._clips[g].numel()) if self._passes[g] > 0
+                                  else int(self._cursor[g])),
+                "passes": int(self._passes[g]),
+            }
+            for g in sorted(self._clips)
+        }
+
+
+def _clip_cycler(cmd, groups: dict[int, torch.Tensor], seed: int) -> ClipCycler:
+    """Fetch (or build once) the command's :class:`ClipCycler` over ``groups``.
+
+    Cached on the command term because the queue is run state, not config: it must
+    survive every reset for "no repeat before a full pass" to mean anything.
+
+    Args:
+        cmd: The :class:`MotionSequenceCommand` term.
+        groups: ``{group_id: clip_indices}`` to cycle over.
+        seed: Shuffle seed, used only on the first call.
+
+    Returns:
+        The cached cycler.
+    """
+    cycler = getattr(cmd, "_clip_cycler", None)
+    if cycler is None:
+        cycler = ClipCycler(groups, seed=seed)
+        cmd._clip_cycler = cycler
+        total = sum(int(c.numel()) for c in groups.values())
+        print(f"[INFO] clip_draw='cycle': drawing WITHOUT replacement from {len(groups)} "
+              f"group(s) / {total} clips (seed {seed}); every clip is used once before any "
+              "repeats.")
+    return cycler
+
+
 def reset_on_terrain_motion_sequence(
     env: ManagerBasedEnv,
     env_ids: torch.Tensor,
@@ -339,6 +506,7 @@ def reset_on_terrain_motion_sequence(
     pin_clip_ids=None,
     pin_start_step: int | None = None,
     spawn_z_offset: float = 0.0,
+    clip_draw: str = "random",
 ):
     """Reset each env onto a clip whose terrain matches the env's terrain tile.
 
@@ -367,8 +535,11 @@ def reset_on_terrain_motion_sequence(
         pin_clip_ids: Evaluation only -- pin env ``i`` to a stated clip instead of sampling
             (see :func:`resolve_pinned_clips`). Every pinned clip must sit on its env's
             tile, which a flat-only library guarantees.
-        pin_start_step: Evaluation only -- start every env at this clip step. Negative
-            (the default) means sample.
+        pin_start_step: Start every env at this clip step. Negative (the default) means
+            sample; see :func:`reset_on_motion_sequence` for why the recorder pins it to 0.
+        clip_draw: ``"random"`` (default) or ``"cycle"``; see :class:`ClipCycler`. Cycling
+            is PER TERRAIN GROUP here, since an env may only be handed a clip whose
+            terrain matches its tile.
     """
     from motion_gen.clips.clip_io import (
         group_clips_by_terrain,
@@ -410,9 +581,16 @@ def reset_on_terrain_motion_sequence(
 
     # 1. Per-env terrain id -> sample a matching clip + a start step.
     env_tid = importer.env_terrain_id[env_ids].to(torch.long)
+    if clip_draw not in ("random", "cycle"):
+        raise ValueError(f"clip_draw must be 'random' or 'cycle'; got {clip_draw!r}.")
     clip_id = resolve_pinned_clips(env_ids, pin_clip_ids, device)
     if clip_id is None:
-        clip_id = sample_terrain_clips(env_tid, groups)
+        if clip_draw == "cycle":
+            clip_id = _clip_cycler(
+                cmd, groups, seed=int(getattr(env.cfg, "seed", 0) or 0)
+            ).take_for(env_tid)
+        else:
+            clip_id = sample_terrain_clips(env_tid, groups)
     else:
         # A pinned clip still has to belong on the env's TILE: placement below puts it on
         # that tile's corner, so a terrain clip on the wrong tile would ride treads that are
