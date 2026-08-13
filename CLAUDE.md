@@ -168,6 +168,45 @@ the six `export_parameters` emits — with a floor so a sparse contract cannot a
   (identical on every finite input). Before that, a CNN extero model with a sentinel could train
   but not export.
 
+## The depth row carries CHANNELS, not just depth (`extero_channels`)
+The FM sees no joint angles and no root orientation, so a waist turn or a pelvis pitch is
+indistinguishable from the terrain moving (`fm_registration_probe`: the predicted stair
+segment slides 1.10 of a downrange displacement, where the anchor mask requires 0). So a
+pixel can carry more than depth: `1` = depth alone (every older checkpoint), `4` = `+ xyz` in
+the root's yaw-aligned frame, `5` = `+ validity`. `extero_sensor_dim` COUNTS channels (it is
+the row width), so everything comparing it against an image shape divides by
+`extero_channels` first — `check_extero_encoder`, the model ctor, `read_fm_extero_meta`,
+`_resolve_extero_image_hw` and `gen_tracker._resolve_depth_cameras`. The fold is
+CHANNEL-MAJOR; interleaving scrambles every kernel while the shapes stay right.
+- **The frame is LEVEL** — orientation `yaw_quat(root_quat_w)`, so its z is gravity and the
+  frame has zero roll/pitch. The robot's tilt survives as MOTION of the points within it,
+  which is the point. The heading cancels (`R_world_root = Rz(psi) @ R_rp`), so a deployment
+  needs only FK to the camera and the IMU's roll/pitch — **never odometry**, and a drifting
+  yaw cannot corrupt it.
+- **Nominal extrinsics, never the DR draw**: a robot knows its calibration and nothing more,
+  so the DR perturbs the IMAGE relative to the stated geometry (which is what calibration
+  error IS). Training on the randomised pose would teach a registration it never gets.
+- **No re-record.** The offline path (`dataset._camera_pose_yaw_frame`) rebuilds the pose
+  from the recorded root quaternion + joint angles + the contract's mount, via `motion_gen`'s
+  `FKChain` — validated against the limb frames the recording stores (0.67 mm).
+  `mdp.depth_xyz_stack` is the live twin; they must agree.
+- **Validity is found by RANGE, not sentinel equality.** `DepthNoiser`'s 3x3 blur leaves a
+  geometric miss NEAR the sentinel; only the 2.5% per-frame dropout lands exactly on it.
+  Measured over the full recording: 6.4% (near) / 8.9% (far) of pixels carry no reading. The
+  height scan keeps equality, where it is exact because that signal is noise-free.
+- **A camera's position embedding is ANGULAR and token-level** (`pixel_angles_rad`), and
+  **per sensor**: the two cameras are 100x70 and 70x42 deg, so one shared extent mislabels
+  the far one's tokens by 1.43x, silently. The metric ground grid (the scan) keeps its coord
+  CHANNELS; a ray has a direction, not a planar coordinate.
+- `extero_clip` at the shipped ±2.0 saturates at **4.75 m of range** while the far camera
+  sees 11.9 m (1.30% of pixels, 13.8% of windows, against a 99th percentile of 5.22 m).
+  Recordings store depth UNCLIPPED, so a wider band recovers signal already on disk;
+  ±5.575 measures 0.00% saturated. Set it PER RUN — the per-source default is what old
+  checkpoints resolve through.
+- `extero_cnn_grid` larger than the trunk's native grid used to upsample silently (a token
+  count that is a claim, not a fact); now refused. `strides 1,2,2` on 26x30 gives 7x8 = 56
+  tokens/camera.
+
 ## One exported generator per FM run (`transfer/deploy/artifacts.py`)
 Exports are named for the checkpoint they came from — `<fm run>_fm.onnx`, plus the checkpoint
 stem when it is not `best` — so a teacher's `exported/` holds every generator trained against
