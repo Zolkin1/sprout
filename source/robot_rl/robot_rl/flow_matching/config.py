@@ -620,6 +620,23 @@ class FlowMatchingConfig:
     weight_decay: float = 1e-4
     num_epochs: int = 100
     grad_clip: float = 1.0
+    # Optimizer steps over which the LR ramps LINEARLY from lr/warmup_steps to ``lr``
+    # (0 = off, the historical behaviour). Recorded in the config rather than left a bare
+    # CLI flag because it changes the optimization and two runs are only comparable if both
+    # state it.
+    #
+    # What it buys: every run so far spends its first few hundred steps at the
+    # predict-the-marginal-mean plateau (flow MSE ~1.8-2.4 -- the model outputs ~0, which IS
+    # a stationary point once the normalizer has centred the targets, since E[target_v] = 0).
+    # Escaping it needs the first useful gradient direction to survive; at full LR from step
+    # 0, Adam's second moment is still warming from ~nothing, so early updates are close to
+    # +-lr per COORDINATE regardless of gradient size, and a few hundred of those can drive
+    # the trunk into a configuration whose expected gradient really is zero -- after which
+    # ``m/sqrt(v)`` collapses to ~1e-7 and the run is frozen for good, at the plateau value.
+    # That is not hypothetical: the 2026-08-12 pinned-axis A/B lost its weight=1.0 arm this
+    # way while its weight=20 arm, identical in every other respect (same seed, same data
+    # sha, loss differing only by the reweighting), escaped at step ~300.
+    lr_warmup_steps: int = 0
     seed: int = 0
 
     @property
