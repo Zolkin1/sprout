@@ -83,6 +83,11 @@ bool PlanScheduler::TryAdopt(int64_t target_ctrl_step) {
 
   cursor_ = static_cast<int>(delta);
   plan_target_ = target_ctrl_step;
+  // Counted on ADOPTION, not on sampling: a plan the worker produced but that was superseded
+  // in the mailbox, or that arrived too stale to serve, never drove the robot. What a log or
+  // a bag wants to join on is which plan is LIVE, and incrementing here also makes "the id
+  // changed" the exact trigger for publishing one FmPlan per plan actually used.
+  ++plan_id_;
   has_plan_ = true;
   adopted_this_tick_ = true;
   adopted_late_ = (delta > 0);

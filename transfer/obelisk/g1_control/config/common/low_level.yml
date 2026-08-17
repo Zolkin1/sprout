@@ -200,17 +200,48 @@ joystick:
 # --------------------------------- #
 # -------------- Viz -------------- #
 # --------------------------------- #
-# Robot-state visualisation, off by default; an includer flips it on with `viz: {on: True}`.
+# Robot-state visualisation, off by default. `scripts/run_sim_low.sh --rviz` flips it on with
+# a temp overlay that sets ONLY the scalar `viz: {on: True}` -- see obk_viz_config.
+#
+# Turning it on launches THREE processes, all from obelisk's own bringup: the viz node below
+# (est_state -> joint_states + the odom_frame->pelvis transform), a robot_state_publisher fed
+# the URDF at `<robot_pkg>/urdf/<urdf>` (joint_states -> every link's TF), and rviz2 with the
+# config named here. Nothing needs a tmux pane of its own.
+#
+# Everything below `viz_nodes:` must stay HERE rather than in an overlay: the list entries
+# carry no name/id/key/ros_parameter/topic, so obelisk has no merge identity for them and an
+# includer that redeclares one APPENDS a second viz node instead of merging into this one.
+# Mappings (`on:`, `rviz_pkg:`, `rviz_config:`) do deep-merge, which is why the flag can flip
+# `on` and nothing else.
+#
+# The FM plan ribbon that the rviz config subscribes to is a SEPARATE node, not part of this
+# block: `ros2 run g1_control fm_plan_viz`. --rviz starts it too.
 viz:
   on: False
+  rviz_pkg: g1_control
+  rviz_config: g1_deploy.rviz
   viz_nodes:
+    # Upstream's, not the local robot_viz package -- which is an unreferenced fork of this
+    # header, identical except for one string: it parents the base transform to "odom_frame"
+    # where upstream uses "world". Upstream wins, so "world" is what g1_deploy.rviz's fixed
+    # frame and fm_plan_viz's frame_id parameter must both be. Switch the executable and all
+    # three have to move together, or the robot renders at the origin and the plan does not
+    # render at all -- with no error from anything.
     - pkg: obelisk_viz_cpp
       executable: default_robot_viz
       robot_pkg: g1_model
       urdf: g1_29j.urdf
       robot_topic: robot_description
+      # The ros_parameter names are NOT free-form: obelisk strips the `_setting` suffix to get
+      # a `key`, and matches it against the keys ObeliskVizRobot registers in its constructor
+      # -- `sub_est`, `pub_viz_joint`, `time_joints`. This block previously said
+      # `sub_viz_est_setting` and `timer_viz_joint_setting` (the pre-rewrite schema's names),
+      # which resolve to keys nothing registers, and the node died on configure with
+      # "Entry is missing required field 'topic'" -- an error about the entry it did NOT find,
+      # naming a field that was present in the one it should have. It went unnoticed because
+      # `on: False` meant this block had never been launched.
       subscribers:
-        - ros_parameter: sub_viz_est_setting
+        - ros_parameter: sub_est_setting
           topic: /obelisk/g1/est_state
           history_depth: 10
           callback_group: None
@@ -220,6 +251,6 @@ viz:
           history_depth: 10
           callback_group: None
       timers:
-        - ros_parameter: timer_viz_joint_setting
+        - ros_parameter: time_joints_setting
           timer_period_sec: 0.01
           callback_group: None

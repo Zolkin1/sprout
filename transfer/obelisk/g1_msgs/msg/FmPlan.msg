@@ -26,6 +26,12 @@ uint32 num_nodes             # F
 uint32 node_dim              # D
 string[] window_blocks       # block names, in order, that make up each node
 
+# The FK target frames the joint_pos block IMPLIES. The slim window predicts joint angles and
+# no ee_pos, so a viewer that wants the feet has to forward-kinematic them -- and it needs
+# these names to do it. Carried here because there is nowhere else on the graph to get them,
+# and a viewer with its own hardcoded list would be a second copy of a tracker contract.
+string[] ee_frame_names
+
 # ---- The frame the output lives in --------------------------------------------------
 float64[3] anchor_pos        # robot base position at the re-plan
 float64[4] anchor_quat       # xyzw

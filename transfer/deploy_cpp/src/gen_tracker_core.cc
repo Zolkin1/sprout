@@ -31,6 +31,10 @@ void GenTrackerCore::Reset() {
   has_served_ = false;
   anchor_pos_ = Vec3::Zero();
   anchor_quat_ = QuatXyzw(0.0, 0.0, 0.0, 1.0);
+  // Cleared for the same reason the stash is: these describe another episode. PlanScheduler's
+  // plan_id deliberately does NOT reset, so a bag can still tell a re-arm from a re-plan.
+  last_request_ = FmRequest{};
+  adopted_request_ = FmRequest{};
 }
 
 void GenTrackerCore::BuildRequest(FmRequest* req) const {
@@ -101,6 +105,10 @@ TickOutcome GenTrackerCore::Step(const CoreState& state, double* window_out) {
     FmRequest req;
     BuildRequest(&req);
     sampler_->Submit(req);
+    // Kept so the plan that eventually lands can be published with the conditioning it was
+    // built from. One slot is enough: only one request is ever in flight, since FmWorker drops
+    // rather than queues while busy and PlanScheduler asserts lead_ticks < K.
+    last_request_ = std::move(req);
   }
 
   // 3. Collect a finished plan, then adopt it once its boundary has arrived.
@@ -127,6 +135,19 @@ TickOutcome GenTrackerCore::Step(const CoreState& state, double* window_out) {
       // than the history, the anchor should move back with it.
       anchor_pos_ = state.root_pos;
       anchor_quat_ = state.root_quat;
+      // Promote the stashed request to "the one that produced the LIVE plan", but only if it
+      // is actually that one. Compared on target step rather than assumed: after a dropped or
+      // stale plan the newest request is for a LATER boundary than the plan being adopted, and
+      // publishing that as this plan's conditioning would be a confident lie in a field whose
+      // whole purpose is showing what the generator was asked.
+      //
+      // On a mismatch it is CLEARED rather than left alone. Keeping the previous value would
+      // be the same lie one plan further back, and silent -- the FmPlan would carry a new
+      // plan_id, a new trajectory and a new anchor beside a history from two cadence periods
+      // ago, with nothing marking the mismatch. Empty is legible: the consumer sees no
+      // conditioning and knows not to trust one.
+      adopted_request_ =
+          (last_request_.target_ctrl_step == pending_target_) ? last_request_ : FmRequest{};
     } else if (pending_target_ +
                    (cfg_.schedule.horizon - cfg_.schedule.max_offset - 1) < sched_.ctrl_step()) {
       // Refused because it is too STALE, not because it is early: adopting it would saturate

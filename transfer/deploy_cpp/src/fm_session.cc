@@ -170,8 +170,10 @@ void FmSession::Submit(const FmRequest& req) {
   std::vector<Ort::Value> result;
   const auto t0 = std::chrono::steady_clock::now();
   model_.Run(names, inputs, outputs, &result);
-  last_infer_ms_ =
-      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  last_infer_ms_.store(
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+      std::memory_order_relaxed);
+  infer_count_.fetch_add(1, std::memory_order_relaxed);
 
   const float* traj = result[0].GetTensorData<float>();
   for (size_t i = 0; i < ready_pred_.size(); ++i) {

@@ -6,6 +6,7 @@
 #include <obelisk_control_msgs/msg/velocity_command.hpp>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <filesystem>
@@ -20,6 +21,10 @@ using g1_deploy::Vec3;
 //: The execution FSM state in which low-level control is permitted. Anything else disarms.
 constexpr uint8_t kExecFsmLowLevelControl = 3;
 
+//: How often the timing line is emitted. Long enough that a healthy run is quiet, short
+//: enough to see a transient while it is still on screen.
+constexpr double kTimingReportSec = 5.0;
+
 bool AllFinite(const std::vector<double>& v) {
   for (double x : v) {
     if (!std::isfinite(x)) return false;
@@ -27,15 +32,16 @@ bool AllFinite(const std::vector<double>& v) {
   return true;
 }
 
-double Percentile(std::vector<double> v, double q) {
-  if (v.empty()) return 0.0;
-  std::sort(v.begin(), v.end());
-  const size_t i = std::min(v.size() - 1,
-                            static_cast<size_t>(q * static_cast<double>(v.size() - 1) + 0.5));
-  return v[i];
-}
-
 }  // namespace
+
+double RollingStat::Percentile(double q) {
+  if (samples.empty()) return 0.0;
+  std::sort(samples.begin(), samples.end());
+  const size_t i =
+      std::min(samples.size() - 1,
+               static_cast<size_t>(q * static_cast<double>(samples.size() - 1) + 0.5));
+  return samples[i];
+}
 
 G1Controller::G1Controller(const std::string& name)
     : obelisk::ObeliskController<ControlMsg, EstimatorMsg>(name) {
@@ -476,6 +482,12 @@ bool G1Controller::PublishTargets(std::vector<double>* targets, ControlMsg* msg)
 ControlMsg G1Controller::ComputeControl() {
   ControlMsg msg;
   if (!armed_.load() || !policy_) {
+    // The tick clock stops with the loop. Without this the first tick after a re-arm measures
+    // the whole DISARMED interval as one control period -- 60 s of standing in the FSM shows
+    // up as a 60000 ms sample in period_ms_ and in ControllerDebug.tick_period_ms, which on
+    // the health figure's linear axis flattens every real trace to the x-axis.
+    have_last_tick_ = false;
+    last_period_ms_ = 0.0;
     // Publish nothing while disarmed. The debug tick still goes out, so a bag can tell
     // "disarmed" from "the node died".
     PublishDebug({}, /*have_obs=*/false);
@@ -483,6 +495,16 @@ ControlMsg G1Controller::ComputeControl() {
   }
 
   const auto t0 = std::chrono::steady_clock::now();
+  // Sampled HERE, not in RecordTiming: several guards below return early, and those ticks
+  // still consumed a control period. Measuring the gap at the top counts them, so a loop that
+  // is running but bailing every tick shows as a healthy period rather than as no data.
+  if (have_last_tick_) {
+    last_period_ms_ = std::chrono::duration<double, std::milli>(t0 - last_tick_at_).count();
+    period_ms_.Add(last_period_ms_);
+  }
+  last_tick_at_ = t0;
+  have_last_tick_ = true;
+
   UpdateWatchdogs();
 
   EstimatorSample est;
@@ -553,31 +575,152 @@ ControlMsg G1Controller::ComputeControl() {
   std::vector<double> targets(targets_.begin(), targets_.end());
   PublishTargets(&targets, &msg);
 
-  // Latency AFTER publishing: a diagnostic must never delay the command.
-  const double ms = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - t0).count();
-  latency_ms_.push_back(ms);
-  if (latency_ms_.size() > 250) latency_ms_.pop_front();
-  const double now = this->now().seconds();
-  if (last_latency_report_ < 0.0) last_latency_report_ = now;
-  if (now - last_latency_report_ >= 5.0) {
-    const std::vector<double> v(latency_ms_.begin(), latency_ms_.end());
-    const double budget = policy_->dt() * 1e3;
-    const double p99 = Percentile(v, 0.99);
-    if (p99 > budget) {
-      RCLCPP_WARN(this->get_logger(),
-                  "OVER BUDGET: tick p50 %.2f p95 %.2f p99 %.2f ms vs %.2f ms; fm %.2f ms",
-                  Percentile(v, 0.5), Percentile(v, 0.95), p99, budget, diag.fm_infer_ms);
-    } else if (verbose_) {
-      RCLCPP_INFO(this->get_logger(),
-                  "tick p50 %.2f p95 %.2f p99 %.2f ms vs %.2f ms; fm %.2f ms",
-                  Percentile(v, 0.5), Percentile(v, 0.95), p99, budget, diag.fm_infer_ms);
-    }
-    last_latency_report_ = now;
-  }
+  // Timing AFTER publishing: a diagnostic must never delay the command.
+  RecordTiming(diag, std::chrono::duration<double, std::milli>(
+                         std::chrono::steady_clock::now() - t0).count());
 
+  // One message per plan the robot actually used. Gated on the id and not on `plan_adopted`
+  // alone so a re-arm, which resets the schedule but deliberately not the id, cannot
+  // re-publish a plan already on the bag under a second timestamp.
+  if (diag.plan_adopted && diag.plan_id != last_fm_plan_id_) {
+    last_fm_plan_id_ = diag.plan_id;
+    PublishFmPlan(diag);
+  }
   PublishDebug(diag, true);
   return msg;
+}
+
+void G1Controller::RecordTiming(const g1_deploy::TickDiagnostics& diag, double tick_ms) {
+  last_tick_ms_ = tick_ms;
+  tick_ms_.Add(tick_ms);
+  trk_ms_.Add(diag.trk_infer_ms);
+  // The generator runs at 1/K the control rate, so fm_infer_ms is the SAME number on the K-1
+  // ticks between inferences. Sampling it every tick would weight one slow plan K times and
+  // make the percentiles describe the cadence rather than the network.
+  if (diag.plans_produced != last_plans_produced_) {
+    fm_ms_.Add(diag.fm_infer_ms);
+    last_plans_produced_ = diag.plans_produced;
+  }
+
+  const double now = this->now().seconds();
+  if (last_report_at_ < 0.0) last_report_at_ = now;
+  if (now - last_report_at_ < kTimingReportSec) return;
+  const double elapsed = now - last_report_at_;
+  last_report_at_ = now;
+
+  const double dt_ms = policy_->dt() * 1e3;
+  // The generator's real deadline. It is asked for a plan lead_ticks BEFORE the boundary that
+  // plan is for and runs off the control thread, so it has the whole lead window -- not one
+  // tick. Judging it against dt would report a healthy generator as chronically over budget.
+  const double fm_budget_ms = std::max(1, diag.lead_ticks) * dt_ms;
+
+  // These counters are cumulative SINCE ARMING, and PlanScheduler::Reset() -- which
+  // PolicyRuntime::Reset() runs on every Arm() -- puts them back to zero. A plain subtraction
+  // across a re-arm therefore underflows an unsigned type: 0 - 3 prints as 4294967293 and, via
+  // `unhealthy`, fires the OVER-BUDGET warning on a perfectly healthy run. Treat a counter
+  // that went BACKWARD as "restarted", and take its current value as the window's delta.
+  auto window_delta = [](uint32_t now, uint32_t before) {
+    return now >= before ? now - before : now;
+  };
+  const uint32_t late = window_delta(diag.late_events, last_late_events_);
+  const uint32_t dropped = window_delta(diag.plans_dropped, last_plans_dropped_);
+  const uint32_t skipped = window_delta(diag.requests_skipped, last_requests_skipped_);
+  const uint32_t clamped = window_delta(diag.offsets_clamped, last_offsets_clamped_);
+  last_late_events_ = diag.late_events;
+  last_plans_dropped_ = diag.plans_dropped;
+  last_requests_skipped_ = diag.requests_skipped;
+  last_offsets_clamped_ = diag.offsets_clamped;
+
+  // Plans the cadence CALLED for over this window, which is what "is the generator keeping
+  // up" is measured against -- a shortfall is the generator falling behind its own schedule,
+  // and it shows here before it shows as lateness. From elapsed WALL time rather than a tick
+  // count, so a loop that is not running at 50 Hz does not also deflate its own target.
+  const int k = policy_->replan_period();
+  // Rounded, not truncated: the window is not a whole number of cadence periods, so 5.0 s at
+  // K=12 and dt=0.02 is 20.83 -- and truncating printed "21 plans, 20 expected" on a run that
+  // was keeping up exactly.
+  const int expected =
+      k > 0 ? static_cast<int>(std::lround(elapsed / (static_cast<double>(k) * policy_->dt())))
+            : 0;
+
+  const double tick_p99 = tick_ms_.Percentile(0.99);
+  const double fm_p99 = fm_ms_.Percentile(0.99);
+  const bool unhealthy = tick_p99 > dt_ms || fm_p99 > fm_budget_ms || late > 0 || dropped > 0 ||
+                         skipped > 0 || clamped > 0;
+
+  // Formatted once into a buffer and logged with a LITERAL "%s". Passing a `const char*`
+  // format to RCLCPP_WARN/_INFO would be a non-literal format string, which trips
+  // -Wformat-nonliteral / -Werror=format-security depending on the build flags -- and the two
+  // branches must not drift apart, which two copies of an 18-argument call invite.
+  char line[512];
+  std::snprintf(
+      line, sizeof(line),
+      "timing (%.1fs): tick p50 %.2f p95 %.2f p99 %.2f / %.1f ms | period p50 %.2f p99 %.2f ms"
+      " | trk p50 %.2f p99 %.2f ms | fm p50 %.2f p95 %.2f p99 %.2f / %.1f ms (%zu plans, %d"
+      " expected) | late %u dropped %u skipped %u clamped %u",
+      elapsed, tick_ms_.Percentile(0.5), tick_ms_.Percentile(0.95), tick_p99, dt_ms,
+      period_ms_.Percentile(0.5), period_ms_.Percentile(0.99), trk_ms_.Percentile(0.5),
+      trk_ms_.Percentile(0.99), fm_ms_.Percentile(0.5), fm_ms_.Percentile(0.95), fm_p99,
+      fm_budget_ms, fm_ms_.size(), expected, late, dropped, skipped, clamped);
+
+  // Deliberately NOT behind `verbose_`. One line per 5 s is the cheapest possible answer to
+  // "is the loop keeping up", and needing to know is exactly when you have not set the flag.
+  if (unhealthy) {
+    RCLCPP_WARN(this->get_logger(), "%s", line);
+  } else {
+    RCLCPP_INFO(this->get_logger(), "%s", line);
+  }
+
+  tick_ms_.Clear();
+  period_ms_.Clear();
+  trk_ms_.Clear();
+  fm_ms_.Clear();
+}
+
+void G1Controller::PublishFmPlan(const g1_deploy::TickDiagnostics& diag) {
+  if (!fm_plan_pub_ || !policy_) return;
+  // Wrapped like PublishDebug, and for the same reason: a diagnostics bug must not stop the
+  // robot. This one runs once per re-plan (~4 Hz at K=12), not per tick.
+  try {
+    g1_msgs::msg::FmPlan m;
+    m.header.stamp = this->now();
+    m.plan_id = diag.plan_id;
+    m.ctrl_step = static_cast<uint64_t>(std::max<int64_t>(diag.ctrl_step, 0));
+
+    const g1_deploy::FmMeta& fm = policy_->fm_meta();
+    m.trajectory = policy_->last_plan_window();
+    m.num_nodes = static_cast<uint32_t>(fm.f);
+    m.node_dim = static_cast<uint32_t>(fm.d);
+    for (g1_deploy::ReferenceBlock b : fm.window_blocks) {
+      m.window_blocks.push_back(g1_deploy::BlockName(b));
+    }
+    const auto& p = policy_->params();
+    if (p.reference_window.has_value()) m.ee_frame_names = p.reference_window->ee_frame_names;
+
+    m.anchor_pos = {diag.anchor_pos.x(), diag.anchor_pos.y(), diag.anchor_pos.z()};
+    m.anchor_quat = {diag.anchor_quat.x(), diag.anchor_quat.y(), diag.anchor_quat.z(),
+                     diag.anchor_quat.w()};
+
+    const g1_deploy::FmRequest& req = policy_->last_plan_request();
+    m.history_nodes = req.history_nodes;
+    m.history_cmd = req.history_cmd;
+    m.history_length = static_cast<uint32_t>(fm.n);
+    m.history_null = req.history_null;
+
+    m.extero_source = fm.extero_source;
+    m.cmd_dim = static_cast<uint32_t>(fm.cmd_dim);
+    // extero_tokens and cmd_tokens are deliberately EMPTY. PolicyRuntime::Step calls
+    // SetConditioning on EVERY tick, not only on request ticks, so what the session holds now
+    // is THIS tick's exteroception -- not the plan's. Publishing it would put a wrong depth
+    // stream under a field whose stated purpose is catching a normalisation or camera-ordering
+    // error, which is worse than publishing nothing. Filling them needs FmSession::Submit to
+    // snapshot its conditioning alongside the plan; until it does, they stay empty.
+    m.infer_ms = diag.fm_infer_ms;
+    fm_plan_pub_->publish(m);
+  } catch (const std::exception& e) {
+    RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+                          "fm_plan publish failed: %s", e.what());
+  }
 }
 
 void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool have_obs) {
@@ -587,7 +730,15 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
     g1_msgs::msg::ControllerDebug d;
     d.header.stamp = this->now();
     d.ctrl_step = static_cast<uint64_t>(std::max<int64_t>(diag.ctrl_step, 0));
-    d.latency_ms = latency_ms_.empty() ? 0.0 : latency_ms_.back();
+    d.latency_ms = last_tick_ms_;
+    d.fm_infer_ms = diag.fm_infer_ms;
+    d.trk_infer_ms = diag.trk_infer_ms;
+    d.tick_period_ms = last_period_ms_;
+    d.fm_late = diag.late;
+    d.fm_late_events = diag.late_events;
+    d.fm_plans_dropped = diag.plans_dropped;
+    d.fm_requests_skipped = diag.requests_skipped;
+    d.fm_offsets_clamped = diag.offsets_clamped;
     d.armed = armed_.load();
     d.depth_stale = depth_stale_;
     d.vel_cmd_stale = vel_cmd_stale_;
@@ -595,14 +746,55 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
     d.obs_checksum = have_obs ? diag.obs_checksum : 0;
     d.obs_size = have_obs && policy_ ? static_cast<uint32_t>(policy_->num_obs()) : 0;
     d.fm_cursor = diag.cursor;
+
+    // Input provenance. WHICH sample fed this tick, not its value -- the estimator runs at
+    // 1 kHz against a 50 Hz tick, so without these no offline reconstruction can say which of
+    // twenty candidate messages the observation was built from. Ages are on LOCAL receipt
+    // time, matching the watchdogs and needing no clock sync with the camera host.
+    const double now_s = this->now().seconds();
+    {
+      std::lock_guard<std::mutex> lock(est_mutex_);
+      d.est_state_stamp = est_.stamp;
+      d.est_state_age = est_time_ >= 0.0 ? now_s - est_time_ : -1.0;
+    }
+    {
+      std::lock_guard<std::mutex> lock(depth_mutex_);
+      d.depth_age.reserve(depth_time_.size());
+      for (double t : depth_time_) d.depth_age.push_back(t >= 0.0 ? now_s - t : -1.0);
+    }
+    Vec3 cmd{0.0, 0.0, 0.0};
+    {
+      // Under the lock, like every other read of these: the joystick callback runs on another
+      // executor thread.
+      std::lock_guard<std::mutex> lock(cmd_mutex_);
+      d.vel_cmd_age = vel_cmd_time_ >= 0.0 ? now_s - vel_cmd_time_ : -1.0;
+      if (!vel_cmd_stale_) cmd = vel_cmd_;
+    }
+    d.command_effective = {cmd.x(), cmd.y(), cmd.z()};
+
+    if (policy_) {
+      const auto& p = policy_->params();
+      d.joint_names_isaac = p.joint_names_isaac;
+      // The window's layout, so a reader never restates the tracker metadata. Published every
+      // tick even when nothing was served, because it describes the CONTRACT, not the sample.
+      if (p.reference_window.has_value()) {
+        for (const auto& b : p.reference_window->blocks) d.reference_blocks.push_back(b.first);
+        d.reference_offsets.assign(p.reference_window->offsets.begin(),
+                                   p.reference_window->offsets.end());
+        int node_dim = 0;
+        for (const auto& b : p.reference_window->blocks) node_dim += b.second;
+        d.reference_node_dim = static_cast<uint32_t>(node_dim);
+      }
+      d.fm_plan_id = diag.plan_id;
+      d.fm_anchor_pos = {diag.anchor_pos.x(), diag.anchor_pos.y(), diag.anchor_pos.z()};
+      d.fm_anchor_quat = {diag.anchor_quat.x(), diag.anchor_quat.y(), diag.anchor_quat.z(),
+                          diag.anchor_quat.w()};
+    }
     if (policy_ && have_obs) {
-      d.joint_names_isaac = policy_->params().joint_names_isaac;
       const auto& a = policy_->last_action();
       d.action_isaac.assign(a.begin(), a.end());
       d.reference_window = policy_->last_reference_window();
     }
-    const Vec3 cmd = vel_cmd_stale_ ? Vec3(0.0, 0.0, 0.0) : vel_cmd_;
-    d.command_effective = {cmd.x(), cmd.y(), cmd.z()};
     debug_pub_->publish(d);
   } catch (const std::exception& e) {
     RCLCPP_ERROR_THROTTLE(this->get_logger(), *this->get_clock(), 5000,

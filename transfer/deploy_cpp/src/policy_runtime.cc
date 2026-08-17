@@ -132,6 +132,25 @@ void PolicyRuntime::Load() {
   joint_vel_isaac_.assign(p.joint_names_isaac.size(), 0.0);
 }
 
+int PolicyRuntime::replan_period() const {
+  return core_ ? core_->scheduler().config().replan_period : 1;
+}
+
+const std::vector<double>& PolicyRuntime::last_plan_window() const {
+  static const std::vector<double> kEmpty;
+  return core_ ? core_->predicted_window() : kEmpty;
+}
+
+const FmRequest& PolicyRuntime::last_plan_request() const {
+  static const FmRequest kEmpty;
+  return core_ ? core_->adopted_request() : kEmpty;
+}
+
+const FmMeta& PolicyRuntime::fm_meta() const {
+  if (!fm_) throw std::runtime_error("no fm.onnx is loaded, so there is no generator metadata");
+  return fm_->meta();
+}
+
 void PolicyRuntime::Reset() {
   if (core_) core_->Reset();
   if (assembler_) assembler_->Reset();
@@ -322,7 +341,30 @@ void PolicyRuntime::Step(const HardwareReadings& readings,
     diag->offsets_clamped = s.offsets_clamped();
     diag->requests_skipped = worker_ ? worker_->requests_skipped() : 0;
     diag->plans_dropped = worker_ ? worker_->plans_dropped() : 0;
-    diag->fm_infer_ms = fm_ ? fm_->last_infer_ms() : 0.0;
+    // Read the pair CONSISTENTLY. The worker writes last_infer_ms_ and then increments
+    // infer_count_, so a naive read of one then the other can catch an inference landing
+    // between them and pair the OLD duration with the NEW count -- and the controller samples
+    // fm_ms_ precisely when the count moves, so that plan's real duration would never be
+    // recorded and the previous one would be recorded twice. Re-read the count and only
+    // publish the increment once it brackets a stable read; otherwise report the previous
+    // count, and the next tick (20 ms later, against a ~240 ms cadence) picks it up.
+    if (fm_) {
+      const uint64_t before = fm_->infer_count();
+      const double ms = fm_->last_infer_ms();
+      const uint64_t after = fm_->infer_count();
+      diag->fm_infer_ms = ms;
+      diag->plans_produced = (before == after) ? after : before;
+    } else {
+      diag->fm_infer_ms = 0.0;
+      diag->plans_produced = 0;
+    }
+    diag->trk_infer_ms = tracker_->last_infer_ms();
+    diag->plan_id = s.plan_id();
+    diag->anchor_pos = core_->anchor_pos();
+    diag->anchor_quat = core_->anchor_quat();
+    diag->plan_adopted =
+        outcome == TickOutcome::kAdoptedOnTime || outcome == TickOutcome::kAdoptedLate;
+    diag->lead_ticks = lead_ticks_;
   }
 }
 

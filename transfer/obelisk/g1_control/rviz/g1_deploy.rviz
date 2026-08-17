@@ -1,0 +1,207 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# RViz for a live deploy run: the robot as the estimator sees it, plus what the generator is
+# asking it to do.
+#
+# Launched by obelisk itself -- `viz: {on: True, rviz_pkg: g1_control, rviz_config:
+# g1_deploy.rviz}` in g1_control/config/common/low_level.yml, turned on for a run by
+# `scripts/run_sim_low.sh --rviz`. The same bringup starts default_robot_viz (est_state ->
+# joint_states + the base TF) and robot_state_publisher (joint_states + the URDF -> every
+# link's TF), so nothing here has to be launched by hand.
+#
+# FIXED FRAME: world. That string is HARDCODED in obelisk's default_robot_viz as the parent of
+# the base transform (obelisk_viz_robot_default.h, with a TODO next to it saying it must match
+# the rviz fixed frame), so changing it here alone leaves RViz with a fixed frame nothing
+# publishes and NOTHING renders. It is the frame the estimator's base pose is in -- MuJoCo's
+# world in sim, FAST-LIO's odometry origin on hardware.
+#
+# Note the local `robot_viz` package -- an unused fork of that upstream header -- says
+# "odom_frame" instead. If you ever switch the viz block to it, this line and fm_plan_viz's
+# `frame_id` parameter both have to move with it.
+#
+# TO RUN THIS FROM A LAPTOP instead of on the robot: same ROS_DOMAIN_ID (2) and
+# RMW_IMPLEMENTATION (rmw_cyclonedds_cpp), and g1_model on AMENT_PREFIX_PATH so the
+# package://g1_model/meshes/*.STL references resolve. See "Running the world on another
+# machine" in the README -- the discovery story is identical.
+Panels:
+  - Class: rviz_common/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Status1
+      Splitter Ratio: 0.5
+    Tree Height: 700
+  - Class: rviz_common/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Alpha: 0.5
+      Cell Size: 1
+      Class: rviz_default_plugins/Grid
+      Color: 160; 160; 164
+      Enabled: true
+      Line Style:
+        Line Width: 0.029999999329447746
+        Value: Lines
+      Name: Grid
+      Normal Cell Count: 0
+      Offset:
+        X: 0
+        Y: 0
+        Z: 0
+      Plane: XY
+      Plane Cell Count: 20
+      Reference Frame: <Fixed Frame>
+      Value: true
+    # The robot itself. Description Source: Topic, because obelisk's bringup publishes the
+    # URDF on /robot_description from robot_state_publisher rather than putting it in a
+    # parameter this process can read.
+    - Alpha: 1
+      Class: rviz_default_plugins/RobotModel
+      Collision Enabled: false
+      Description File: ""
+      Description Source: Topic
+      Description Topic:
+        Depth: 5
+        Durability Policy: Transient Local
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /robot_description
+      Enabled: true
+      Name: RobotModel
+      TF Prefix: ""
+      Update Interval: 0
+      Value: true
+      Visual Enabled: true
+    # The generator's plan: the orange root ribbon and the cyan FK'd foot paths, published by
+    # `ros2 run g1_control fm_plan_viz`. The colours match the MuJoCo sim2sim viewer's ribbon
+    # on purpose, so the two views are the same object and a disagreement is a real one.
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: FM plan
+      Namespaces: {}
+      Topic:
+        Depth: 20
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /obelisk/g1/viz/fm_plan
+      Value: true
+    # Off by default: 46 links of axis triads is unreadable. Turn it on and filter to
+    # pelvis / left_ankle_roll_link / right_ankle_roll_link when checking that the FK'd feet
+    # land where the robot's actual feet are.
+    - Class: rviz_default_plugins/TF
+      Enabled: false
+      Frame Timeout: 15
+      Frames:
+        All Enabled: false
+      Marker Scale: 0.30000001192092896
+      Name: TF
+      Show Arrows: true
+      Show Axes: true
+      Show Names: false
+      Update Interval: 0
+      Value: false
+    # Off by default: nothing subscribes to the lidar in sim, so leaving it enabled makes
+    # RViz the only subscriber and puts 3.5 MB/s of point cloud on the wire that no part of
+    # the stack otherwise sends -- which matters most on the split-machine setup.
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 255; 255
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: false
+      Name: Lidar
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 3
+      Size (m): 0.009999999776482582
+      Style: Flat Squares
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /livox/lidar
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: false
+    - Angle Tolerance: 0.10000000149011612
+      Class: rviz_default_plugins/Odometry
+      Covariance:
+        Value: false
+      Enabled: false
+      Keep: 100
+      Name: Odometry
+      Position Tolerance: 0.10000000149011612
+      Shape:
+        Alpha: 1
+        Axes Length: 0.20000000298023224
+        Axes Radius: 0.019999999552965164
+        Color: 255; 25; 0
+        Value: Axes
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /Odometry
+      Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: world
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+      Hide Inactive Objects: true
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+      Line color: 128; 128; 0
+  Transformation:
+    Current:
+      Class: rviz_default_plugins/TF
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 4.0
+      Enable Stereo Rendering:
+        Stereo Eye Separation: 0.05999999865889549
+        Stereo Focal Distance: 1
+        Swap Stereo Eyes: false
+        Value: false
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0.6
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
+      Invert Z Axis: false
+      Name: Current View
+      Near Clip Distance: 0.009999999776482582
+      Pitch: 0.25
+      Target Frame: pelvis
+      Value: Orbit (rviz)
+      Yaw: 2.3
+    Saved: ~
+Window Geometry:
+  Displays:
+    collapsed: false
+  Height: 1000
+  Hide Left Dock: false
+  Hide Right Dock: true
+  Width: 1600
+  X: 60
+  Y: 60

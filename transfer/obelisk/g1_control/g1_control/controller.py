@@ -175,6 +175,12 @@ class G1Controller(ObeliskController):
 
         self._infer_ms: list[float] = []
         self._last_report = 0.0
+        # Previous tick's clock and the gap it implies, for ControllerDebug.tick_period_ms --
+        # the ROS timer's own jitter, which _record_latency deliberately does not measure (it
+        # times the policy call, not the gap between calls). Advanced by compute_control, read
+        # by _build_debug_msg; see the note there for why the builder must not touch it.
+        self._last_tick_t: float | None = None
+        self._tick_period_ms = 0.0
 
         # LAST, because it dry-runs a diagnostic message against every attribute above.
         self._setup_debug()
@@ -523,6 +529,22 @@ class G1Controller(ObeliskController):
         m.ctrl_step = max(0, int(getattr(self.policy, "_ctrl_step", 0)))
         m.latency_ms = self._infer_ms[-1] if self._infer_ms else 0.0
 
+        # The two networks separately -- see the .msg comments for why one total will not do.
+        # Non-destructive, unlike pop_avg_infer_ms, which the 5 s report line drains.
+        split = self.policy.last_infer_ms()
+        m.fm_infer_ms = float(split["fm_ms"])
+        m.trk_infer_ms = float(split["trk_ms"])
+        # Read-only here on purpose. `_assert_debug_msg_current` dry-runs this whole builder
+        # during __init__ to prove the installed g1_msgs is current, so a `self._last_tick_t =
+        # self.t` side effect in here would be stamped at CONSTRUCTION time -- before the
+        # control timer exists -- and the first real tick would report the entire
+        # configure-to-activate gap as its control period. `compute_control` advances it.
+        m.tick_period_ms = self._tick_period_ms
+        # The schedule-health counters have no python equivalent: this runtime samples the
+        # generator SYNCHRONOUSLY inside the tick, so there is no mailbox to drop a plan, no
+        # busy worker to skip a request, and a plan cannot be late for its own boundary. They
+        # are left at zero rather than faked, and plot_from_bag reads them only when nonzero.
+
         # Provenance: WHICH sample, not its value. See the .msg comments.
         if self._est_stamp is not None:
             m.est_state_stamp = self._est_stamp
@@ -595,6 +617,8 @@ class G1Controller(ObeliskController):
         m.num_nodes = int(self.policy.ctx.F)
         m.node_dim = int(self.policy.ctx.D)
         m.window_blocks = [str(b) for b in self.policy.reference_blocks]
+        # So a viewer can FK the predicted joints without restating a tracker contract.
+        m.ee_frame_names = [str(n) for n in self.policy.ctx.target_frame_names]
         m.anchor_pos = flat(self.policy._anchor_pos)
         m.anchor_quat = flat(self.policy._anchor_quat)
         m.history_nodes = flat(plan["history_nodes"])
@@ -887,8 +911,19 @@ Stream health -- measured Hz, inter-arrival jitter, range and invalid-pixel frac
         # for the FSM" and "the node died" look identical in a bag -- both are simply an
         # absent topic -- and the first is the normal state of a stack nobody has armed yet.
         if not self.armed or not self.have_estimate:
+            # The tick clock stops with the loop, so a re-arm does not charge the whole
+            # disarmed interval to the first armed tick's control period.
+            self._last_tick_t = None
+            self._tick_period_ms = 0.0
             self._publish_debug(None, None)
             return None
+
+        # Sampled at the TOP, so the guards below that return early still count as ticks that
+        # consumed a period -- and here rather than in _build_debug_msg, which is dry-run once
+        # at construction and so must have no side effects.
+        self._tick_period_ms = ((self.t - self._last_tick_t) * 1e3
+                                if self._last_tick_t is not None else 0.0)
+        self._last_tick_t = self.t
         if self.depth_spec and any(d is None for d in self.depth_raw):
             self.get_logger().warn("Waiting for the first frame from every depth camera...",
                                    throttle_duration_sec=2.0)

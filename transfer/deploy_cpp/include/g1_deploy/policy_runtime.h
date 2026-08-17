@@ -81,7 +81,28 @@ struct TickDiagnostics {
   uint32_t offsets_clamped = 0;
   uint32_t requests_skipped = 0;
   uint32_t plans_dropped = 0;
+  //: Wall time of the generator's last inference. CUMULATIVE in the sense that it does not
+  //: change between plans -- sample it only when `plans_produced` moves, or the same number
+  //: is counted K times over.
   double fm_infer_ms = 0.0;
+  //: Wall time of the tracker's last inference. Fresh every tick, unlike fm_infer_ms.
+  double trk_infer_ms = 0.0;
+  //: Plans the generator has FINISHED, ever. Produced != adopted: the mailbox drops a plan
+  //: superseded before the tick read it, and the scheduler refuses one that arrived too stale.
+  uint64_t plans_produced = 0;
+  //: Id of the live plan, from PlanScheduler. Changes only on adoption.
+  uint64_t plan_id = 0;
+  //: The measured base pose the LIVE plan is expressed relative to, captured at its adoption.
+  //: Yaw-only in effect -- the window's base_pose block uses only the anchor's heading -- but
+  //: carried in full so a viewer can lift the plan back to world without restating that.
+  Vec3 anchor_pos = Vec3::Zero();
+  QuatXyzw anchor_quat{0.0, 0.0, 0.0, 1.0};
+  //: This tick adopted a new plan. The publish trigger for FmPlan.
+  bool plan_adopted = false;
+  //: The lead, in ticks. `lead_ticks * dt` is the generator's actual deadline: it is asked
+  //: that far before the boundary its plan is for, and being slower than that is what `late`
+  //: eventually reports.
+  int lead_ticks = 0;
 };
 
 class PolicyRuntime {
@@ -115,6 +136,14 @@ class PolicyRuntime {
   /// The raw network output, in the POLICY's joint order.
   const std::vector<float>& last_action() const { return tracker_->last_action(); }
   int lead_ticks() const { return lead_ticks_; }
+  /// K, the generator's re-plan period in control ticks. From tracker.onnx metadata only.
+  int replan_period() const;
+
+  /// The live plan (F x D) and the request it came from, for a logger. See GenTrackerCore.
+  const std::vector<double>& last_plan_window() const;
+  const FmRequest& last_plan_request() const;
+  /// The generator's own metadata: F, D, N, cmd_dim, extero_source. Throws with no fm.onnx.
+  const FmMeta& fm_meta() const;
 
  private:
   void BuildValues(const HardwareReadings& readings);

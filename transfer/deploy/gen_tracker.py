@@ -33,11 +33,11 @@ import numpy as np
 from .depth_obs import assert_depth_specs_agree
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
 from .history import BatchedHistory
-from .quat_math_np import quat_apply, quat_inv, quat_mul, yaw_quat
+from .quat_math_np import quat_apply, quat_inv
 from .tracker_session import TrackerSession
 from .window_np import (
+    base_pose_block_to_world,
     reanchor_window,
-    rot6d_to_quat,
     window_block_slices,
     window_dim,
     world_to_window,
@@ -147,6 +147,10 @@ class GenTrackerPolicy:
         self.providers = providers
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
+        # Set here rather than in _reset_timing, which drains the WINDOW: these are the last
+        # single call's cost and must survive a drain. See last_infer_ms.
+        self._last_fm_infer_ms = 0.0
+        self._last_trk_infer_ms = 0.0
         self._loaded = False
 
     # ------------------------------------------------------------------
@@ -238,11 +242,34 @@ class GenTrackerPolicy:
         self._loaded = True
 
     def _reset_timing(self) -> None:
-        """Zero the FM-generator + tracker inference-time accumulators."""
+        """Zero the FM-generator + tracker inference-time accumulators.
+
+        The ``_last_*`` singles are NOT reset here: they are the most recent call's cost, not
+        a window statistic, and a per-tick logger reads them every step while
+        :meth:`pop_avg_infer_ms` drains the window every few seconds. Clearing them alongside
+        the accumulators would blank one consumer whenever the other sampled.
+        """
         self._fm_infer_s = 0.0
         self._fm_infer_n = 0
         self._trk_infer_s = 0.0
         self._trk_infer_n = 0
+
+    def last_infer_ms(self) -> dict[str, float]:
+        """The most recent inference time of each network, in milliseconds.
+
+        Non-destructive, unlike :meth:`pop_avg_infer_ms` -- this is what a per-tick recorder
+        wants, and draining the window on every tick would leave the 5 s report line with a
+        single sample.
+
+        ``fm_ms`` holds the same value on the ``fm_update_every - 1`` ticks between re-plans,
+        since the generator does not run on them. Deduplicate on the plan id before taking
+        statistics over it. It is 0.0 until the generator has run at all (and forever in
+        debug-clip mode, where none is loaded).
+
+        Returns:
+            ``{"fm_ms": ..., "trk_ms": ...}``.
+        """
+        return {"fm_ms": self._last_fm_infer_ms, "trk_ms": self._last_trk_infer_ms}
 
     def _resolve_depth_cameras(self) -> None:
         """Settle on ONE depth-camera contract for the whole deployment.
@@ -649,6 +676,7 @@ class GenTrackerPolicy:
                                    history_null=np.array([bool(history_null)]))
         infer_s = time.perf_counter() - t0
         self._fm_infer_s += infer_s
+        self._last_fm_infer_ms = 1e3 * infer_s
         # Stash the conditioning alongside the output so a logger can record what the
         # generator was ASKED, not just what it answered -- the history in particular is the
         # runtime's own past output, so when it goes wrong it does so silently and compounds.
@@ -785,15 +813,9 @@ class GenTrackerPolicy:
         if sl is None:
             return None
         block = self._pred[0, :, sl]                                          # [F,9]
-        # YAW-only, matching how the block was built: the anchor contributes heading, so
-        # lifting through the full anchor rotation would tilt the whole ribbon by the robot's
-        # roll/pitch at the re-plan.
-        q = np.broadcast_to(yaw_quat(self._anchor_quat), (block.shape[0], 4))
-        ref_p = self._anchor_pos + quat_apply(q, block[:, 0:3])
-        # R_ref = R_yaw (R_yawT R_ref); the 6D pair has to become a matrix here, so this is
-        # where Gram-Schmidt runs (inside rot6d_to_quat).
-        ref_q = quat_mul(q, rot6d_to_quat(block[:, 3:9]))
-        return ref_p, ref_q
+        # The algebra lives in window_np, shared with the ROS marker node -- see
+        # base_pose_block_to_world for why the anchor is yaw-only.
+        return base_pose_block_to_world(block, self._anchor_pos, self._anchor_quat)
 
     def predicted_root_path_w(self) -> np.ndarray | None:
         """Just the position half of :meth:`predicted_base_pose_w` (``[F, 3]`` or ``None``)."""
@@ -1117,8 +1139,10 @@ class GenTrackerPolicy:
         """Run the tracker; return joint position targets in ``joint_names_out`` order."""
         t0 = time.perf_counter()
         action = self._trk.get_action(obs, joint_names_out)
-        self._trk_infer_s += time.perf_counter() - t0
+        elapsed_s = time.perf_counter() - t0
+        self._trk_infer_s += elapsed_s
         self._trk_infer_n += 1
+        self._last_trk_infer_ms = 1e3 * elapsed_s
         return action
 
     def pop_avg_infer_ms(self) -> dict[str, float]:

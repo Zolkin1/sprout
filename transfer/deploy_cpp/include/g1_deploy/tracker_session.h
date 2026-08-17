@@ -38,6 +38,11 @@ class TrackerSession {
   OrtModel& model() { return model_; }
   /// The raw action from the last Infer, in the POLICY's joint order.
   const std::vector<float>& last_action() const { return last_action_; }
+  /// Wall time of the last inference, milliseconds.
+  ///
+  /// Not atomic, unlike FmSession's: the tracker only ever runs on the control thread, so
+  /// writer and reader are the same thread.
+  double last_infer_ms() const { return last_infer_ms_; }
 
  private:
   OrtModel model_;
@@ -50,6 +55,7 @@ class TrackerSession {
   std::vector<int> out_permutation_;
   std::vector<std::string> cached_out_names_;
   std::vector<double> targets_isaac_;
+  double last_infer_ms_ = 0.0;
 };
 
 /// Refuse a generator and a tracker that do not describe the same window.

@@ -37,6 +37,9 @@ data_files = [
 # scripts/prefetch_policy.py), so a checkpoint swap needs no colcon rebuild and the repo
 # carries no binaries.
 data_files += config_files()
+# The RViz layout the `viz:` block names. Installed to share/g1_control/rviz/, which is where
+# obelisk's bringup looks it up (get_package_share_directory(rviz_pkg) / "rviz" / rviz_config).
+data_files += [("share/" + package_name + "/rviz", glob(os.path.join("rviz", "*.rviz")))]
 
 setup(
     name=package_name,
@@ -55,6 +58,7 @@ setup(
             "g1_controller = g1_control.controller:main",
             "g1_estimator = g1_control.estimator:main",
             "fsm_state_echo = g1_control.fsm_state_echo_node:main",
+            "fm_plan_viz = g1_control.fm_plan_viz_node:main",
         ],
     },
 )

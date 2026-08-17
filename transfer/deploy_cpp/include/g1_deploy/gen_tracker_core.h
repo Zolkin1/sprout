@@ -106,6 +106,21 @@ class GenTrackerCore {
   const Vec3& anchor_pos() const { return anchor_pos_; }
   const QuatXyzw& anchor_quat() const { return anchor_quat_; }
 
+  /// The LIVE plan, F x D row-major, in its own anchor frame. Port of
+  /// GenTrackerPolicy.predicted_window().
+  ///
+  /// FOR DIAGNOSTICS. The serving path never reads it whole -- it indexes the nodes the
+  /// tracker's offsets ask for and re-anchors those. Meaningful only while has_plan(), and
+  /// only between Step() calls: Step() swaps this buffer with the incoming one.
+  const std::vector<double>& predicted_window() const { return pred_; }
+
+  /// The request the LIVE plan was produced from: its history, command history and null mask.
+  ///
+  /// The generator's conditioning is its OWN past output, so when it goes wrong it does so
+  /// silently and compounds -- this is the only way to see what it was actually asked.
+  /// `target_ctrl_step` is 0 and the vectors are empty before the first adoption.
+  const FmRequest& adopted_request() const { return adopted_request_; }
+
  private:
   void BuildRequest(FmRequest* req) const;
 
@@ -123,6 +138,8 @@ class GenTrackerCore {
   bool has_pending_ = false;
   int64_t pending_target_ = 0;
   std::vector<double> prev_served_node_;  //: D, raw
+  FmRequest last_request_;                //: the newest request submitted, in flight or not
+  FmRequest adopted_request_;             //: the one that produced pred_
   //: Whether anything has actually been served. Until it has, the history rows are
   //: placeholders and the window must be reported as null.
   bool has_served_ = false;

@@ -22,6 +22,8 @@
 // over. The threaded worker wraps this rather than replacing it, so the same code path is
 // exercised by the single-threaded tests and on the robot.
 
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <random>
 #include <string>
@@ -108,7 +110,14 @@ class FmSession : public FmSampler {
   const FmMeta& meta() const { return meta_; }
   OrtModel& model() { return model_; }
   /// Wall time of the last inference, milliseconds.
-  double last_infer_ms() const { return last_infer_ms_; }
+  double last_infer_ms() const { return last_infer_ms_.load(std::memory_order_relaxed); }
+
+  /// Inferences run, ever.
+  ///
+  /// Counted HERE rather than taken from FmWorker::plans_produced() so it is the same number
+  /// in both modes: with `threaded_fm: false` there is no worker, and a timing report keyed
+  /// on the worker's counter would silently never sample.
+  uint64_t infer_count() const { return infer_count_.load(std::memory_order_relaxed); }
 
  private:
   OrtModel model_;
@@ -127,7 +136,12 @@ class FmSession : public FmSampler {
   bool ready_ = false;
   int64_t ready_target_ = 0;
   std::vector<double> ready_pred_;
-  double last_infer_ms_ = 0.0;
+  // ATOMIC because it crosses a thread: FmWorker runs Submit (the writer) on its own thread
+  // while the control tick reads this through PolicyRuntime::Step's diagnostics. A plain
+  // double here was a data race -- benign in practice on this hardware, but the timing report
+  // it now feeds makes it load-bearing.
+  std::atomic<double> last_infer_ms_{0.0};
+  std::atomic<uint64_t> infer_count_{0};
 };
 
 }  // namespace g1_deploy

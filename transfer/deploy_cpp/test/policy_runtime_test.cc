@@ -35,6 +35,19 @@ std::vector<Provider> Providers() {
   return {ProviderFromName(env ? env : "cpu")};
 }
 
+/// True when this run is on the CPU provider, where DEADLINES cannot be asserted.
+///
+/// The generator measures ~16 ms on this GPU and ~477 ms on this CPU, against a lead window of
+/// 3 ticks (60 ms). So on CPU every plan is late by construction: `late_events`,
+/// `offsets_clamped` and the adoption count are all reporting the provider, not the schedule.
+/// Asserting them there left two tests unconditionally red on a bare `ctest`, which is how a
+/// real regression gets ignored. Correctness -- finite targets, the permutation, the contract
+/// refusals, the checksum -- is still checked on both.
+bool CpuProvider() {
+  const char* env = std::getenv("G1_ORT_PROVIDER");
+  return ProviderFromName(env ? env : "cpu") == Provider::kCpu;
+}
+
 /// Readings for a robot standing still, in a deliberately DIFFERENT joint order from the
 /// policy's -- reversed, so a port that forgot to permute produces obvious nonsense rather than
 /// something plausible.
@@ -122,18 +135,39 @@ TEST_F(Runtime, StepsProduceFiniteTargetsAndAdoptAPlanPerCadencePeriod) {
     ASSERT_NE(diag.obs_checksum, 0u) << "tick " << t << ": the observation was never assembled";
     std::this_thread::sleep_until(tick_start + std::chrono::duration<double>(rt.dt()));
   }
+  std::cout << "    [runtime] " << 3 * k << " ticks, " << adoptions << " adoptions, fm "
+            << diag.fm_infer_ms << " ms, trk " << diag.trk_infer_ms << " ms, checksum "
+            << diag.obs_checksum << "\n";
+  // Timing is measured on both providers -- it is what says WHY the deadlines below hold or
+  // not -- but only asserted for plausibility, since it is a wall-clock number.
+  EXPECT_GT(diag.trk_infer_ms, 0.0) << "the tracker's inference was never timed";
+  EXPECT_GT(diag.fm_infer_ms, 0.0) << "the generator's inference was never timed";
+  EXPECT_GE(diag.plans_produced, 1u);
+
+  if (CpuProvider()) {
+    GTEST_SKIP() << "deadlines are not assertable on the CPU provider (fm "
+                 << diag.fm_infer_ms << " ms vs a " << rt.lead_ticks() * rt.dt() * 1e3
+                 << " ms lead window); re-run with G1_ORT_PROVIDER=cuda";
+  }
   EXPECT_GE(adoptions, 3) << "one plan per cadence period";
   EXPECT_EQ(diag.late_events, 0u) << "the generator met every deadline in this run";
   EXPECT_EQ(diag.offsets_clamped, 0u);
   EXPECT_EQ(diag.plans_dropped, 0u);
-  std::cout << "    [runtime] " << 3 * k << " ticks, " << adoptions << " adoptions, fm "
-            << diag.fm_infer_ms << " ms, checksum " << diag.obs_checksum << "\n";
+  // One id per adoption, and nothing else moves it.
+  EXPECT_EQ(diag.plan_id, static_cast<uint64_t>(adoptions));
 }
 
 TEST_F(Runtime, TheFirstTickAlreadyHasAReference) {
   // There is no PD warm-up, so a first tick without a plan would serve a zero window -- and
   // because the conditioning is autoregressive, that divergence propagates rather than staying
   // in the first tick. The runtime blocks once, internally, to avoid it.
+  //
+  // Asserted on BOTH providers. The property under test is that FirstPlanBlocker exists and
+  // works, which is not about speed -- but the shipped 0.2 s budget is set for a ~16 ms GPU
+  // sample and the CPU takes ~477 ms, so on CPU the timeout is widened to keep the invariant
+  // reachable. Skipping instead left the whole no-warm-up guarantee uncovered on a bare
+  // `ctest`, where a regression that dropped the blocker would pass green.
+  if (CpuProvider()) cfg.first_plan_timeout_sec = 5.0;
   PolicyRuntime rt(cfg);
   rt.Load();
   rt.Reset();

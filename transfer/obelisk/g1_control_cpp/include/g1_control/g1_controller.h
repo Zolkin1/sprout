@@ -29,7 +29,7 @@
 #include <g1_msgs/msg/fm_plan.hpp>
 
 #include <atomic>
-#include <deque>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,6 +41,29 @@ namespace g1_control {
 
 using ControlMsg = obelisk_control_msgs::msg::PDFeedForward;
 using EstimatorMsg = obelisk_estimator_msgs::msg::EstimatedState;
+
+/// Samples of one timing quantity over one report window.
+///
+/// Windowed, not a sliding ring: every report is over a disjoint interval, so two consecutive
+/// lines describe two consecutive stretches of the run rather than overlapping ones. That
+/// matters when chasing a transient -- a ring smears the bad five seconds into the next.
+struct RollingStat {
+  //: Hard cap on one window's samples. A report closes every few seconds at 50 Hz, so this is
+  //: never reached in normal operation -- it only bounds the pathological case where the tick
+  //: keeps sampling but never reaches the report (armed, but bailing out early every tick).
+  static constexpr size_t kMaxSamples = 4096;
+
+  std::vector<double> samples;
+
+  void Add(double v) {
+    if (samples.size() < kMaxSamples) samples.push_back(v);
+  }
+  void Clear() { samples.clear(); }
+  bool empty() const { return samples.empty(); }
+  size_t size() const { return samples.size(); }
+  /// Nearest-rank percentile, `q` in [0, 1]. Sorts in place; call after the window closes.
+  double Percentile(double q);
+};
 
 /// One estimator sample, latched as a UNIT.
 ///
@@ -92,7 +115,11 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   /// Publish, unless the command is not finite and there is no finite fallback.
   bool PublishTargets(std::vector<double>* targets, ControlMsg* msg);
   void PublishDebug(const g1_deploy::TickDiagnostics& diag, bool have_obs);
+  /// Publish the plan the tick just adopted, raw, with the conditioning it came from.
+  void PublishFmPlan(const g1_deploy::TickDiagnostics& diag);
   std::string DiagnoseNonFinite() const;
+  /// Fold this tick into the timing window, and emit the report line when it closes.
+  void RecordTiming(const g1_deploy::TickDiagnostics& diag, double tick_ms);
 
   // ---- policy -------------------------------------------------------------------------
   std::unique_ptr<g1_deploy::PolicyRuntime> policy_;
@@ -154,9 +181,36 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   rclcpp::Publisher<g1_msgs::msg::ControllerDebug>::SharedPtr debug_pub_;
   rclcpp::Publisher<g1_msgs::msg::FmPlan>::SharedPtr fm_plan_pub_;
   rclcpp::CallbackGroup::SharedPtr depth_cbg_;
-  std::deque<double> latency_ms_;
-  double last_latency_report_ = -1.0;
   int64_t fm_late_streak_ = 0;
+  //: Last plan id published, so exactly one FmPlan goes out per plan the robot actually used.
+  uint64_t last_fm_plan_id_ = 0;
+
+  // ---- timing -------------------------------------------------------------------------
+  //: Whole tick: t0 to after the command is published. Budget: the control period.
+  RollingStat tick_ms_;
+  //: Wall time between consecutive ticks -- the ROS timer's own jitter, which nothing else
+  //: measures. A control loop that is not actually running at 50 Hz makes every other number
+  //: on this line, and every reference the generator serves, mean something different.
+  RollingStat period_ms_;
+  //: tracker.onnx, every tick. Part of the tick budget.
+  RollingStat trk_ms_;
+  //: fm.onnx, ONE sample per inference. Budget: lead_ticks * dt, because the generator runs
+  //: off the control thread and is asked for its plan a whole lead window before the boundary.
+  RollingStat fm_ms_;
+  //: Last tick's entry time, for period_ms_. Zero-initialised means "no previous tick".
+  std::chrono::steady_clock::time_point last_tick_at_{};
+  bool have_last_tick_ = false;
+  //: Snapshots of the CUMULATIVE counters at the last report, so the line prints per-window
+  //: deltas. A cumulative count says a problem happened; a delta says it is happening.
+  double last_report_at_ = -1.0;
+  uint64_t last_plans_produced_ = 0;
+  uint32_t last_late_events_ = 0;
+  uint32_t last_plans_dropped_ = 0;
+  uint32_t last_requests_skipped_ = 0;
+  uint32_t last_offsets_clamped_ = 0;
+  //: The tick's own latency, for ControllerDebug.latency_ms.
+  double last_tick_ms_ = 0.0;
+  double last_period_ms_ = 0.0;
 };
 
 }  // namespace g1_control

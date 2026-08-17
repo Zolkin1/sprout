@@ -43,7 +43,9 @@ control:
       # GPU. The margin is deliberate: 16 ms fits a 20 ms period with ~5% to spare on an IDLE
       # GPU, and the ZED pipeline shares it. Off the control thread the same work has the
       # whole lead window instead, so contention can cost something without missing a
-      # deadline. Raise it if `fm_plan_late` ever appears in a bag; it is clamped to K-1.
+      # deadline. Raise it if the controller's 5 s timing line reports a nonzero `late` (or
+      # `dropped`/`skipped`), or if `fm_late_events` climbs in a bag's health figure; it is
+      # clamped to K-1.
       fm_lead_sec: 0.05
 
       # The generator on its own thread. false runs it inline, which is what the tests and the
@@ -53,7 +55,8 @@ control:
 
       # Ticks of continuous lateness before disarming. 0 = never, which is the deliberate
       # default: a late plan is survivable (the cursor keeps advancing and the far end of the
-      # reference window saturates, loudly), and disarming mid-stride is not obviously safer.
+      # reference window saturates, and the timing line says so), and disarming mid-stride is
+      # not obviously safer.
       # Consider ~25 (0.5 s) after the first hardware campaign, when there is data about how
       # often it happens.
       fm_late_disarm_ticks: 0

@@ -2,6 +2,7 @@
 
 #include "g1_deploy/tracker_session.h"
 
+#include <chrono>
 #include <stdexcept>
 
 #include "g1_deploy/window.h"
@@ -45,7 +46,12 @@ void TrackerSession::Infer(const float* obs, float* action_out) {
   const std::vector<const char*> in_names = {in_name_.c_str()};
   const std::vector<const char*> out_names = {out_name_.c_str()};
   std::vector<Ort::Value> outputs;
+  // Times the graph only, like FmSession does, so the two numbers on the controller's report
+  // line are comparable: neither includes the copy in or the permutation out.
+  const auto t0 = std::chrono::steady_clock::now();
   model_.Run(in_names, inputs, out_names, &outputs);
+  last_infer_ms_ =
+      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 
   const float* action = outputs[0].GetTensorData<float>();
   std::copy(action, action + params_.num_actions, last_action_.begin());

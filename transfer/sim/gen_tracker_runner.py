@@ -37,8 +37,9 @@ import yaml
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
-from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
+from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw  # noqa: E402
 from deploy.quat_math_np import quat_apply, quat_box_minus, quat_inv  # noqa: E402
+from deploy.fk_mujoco import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
 from deploy.tracker_session import convert_joint_order  # noqa: E402
 from deploy.window_np import window_block_slices  # noqa: E402
 
@@ -563,14 +564,13 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     # ------------------------------------------------------------------
     # Forward kinematics of the PREDICTED window (viewer ribbon + log columns).
     # ------------------------------------------------------------------
-    # A scratch MjData on the sim's own model, so FK of a hypothetical pose never disturbs
-    # the live one. `mj_kinematics` is the whole cost -- no dynamics, no collision.
-    _fk_data = mujoco.MjData(robot.mj_model)
-    _fk_body_ids = [mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, n)
-                    for n in policy.ctx.target_frame_names]
-    _fk_missing = [n for n, i in zip(policy.ctx.target_frame_names, _fk_body_ids) if i < 0]
-    if _fk_missing:
-        print(f"[WARN] FK frames absent from the MJCF, so no predicted-frame ribbon: {_fk_missing}")
+    # deploy.fk_mujoco, shared with the ROS marker node (g1_control fm_plan_viz), so the RViz
+    # ribbon and this viewer's ribbon are the same object by construction and a disagreement
+    # between the two views is a real one. It loads its own copy of the MJCF rather than
+    # borrowing robot.mj_model, so FK of a hypothetical pose cannot touch the live sim.
+    _fk = WindowFK(DEFAULT_FK_MODEL, policy.ctx.target_frame_names, isaac)
+    if _fk.missing:
+        print(f"[WARN] FK frames absent from the MJCF, so no predicted-frame ribbon: {_fk.missing}")
 
     def _fm_frame_paths_w(node_idxs) -> np.ndarray | None:
         """World positions of the FM target frames implied by the predicted window.
@@ -578,10 +578,10 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         The slim window predicts ``joint_pos`` but no ``ee_pos``, so the frames are not
         served -- they are IMPLIED, and forward kinematics recovers them: set the reference
         base pose + reference joints on a scratch ``MjData`` and read the body positions
-        back. MuJoCo is the right engine for it here because the sim is already holding the
-        very model the FM's FK losses are defined against
-        (``FlowMatchingConfig.fk_model_path`` is this MJCF), so nothing can drift between
-        the two.
+        back. The engine is ``deploy.fk_mujoco.WindowFK`` on
+        ``FlowMatchingConfig.fk_model_path`` -- the model the FM's FK losses are defined
+        against, so nothing can drift between the two -- and the SAME object the ROS marker
+        node draws with, so this ribbon and the RViz one cannot disagree.
 
         What this DOES mean: the frames are exactly where the predicted joints put them,
         given the predicted base. That is a stronger statement than the retired ``ee_pos``
@@ -605,21 +605,11 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         """
         lifted = policy.predicted_base_pose_w()
         jp_isaac = policy.predicted_joint_pos()
-        if lifted is None or jp_isaac is None or not any(i >= 0 for i in _fk_body_ids):
+        if lifted is None or jp_isaac is None or not _fk.resolved:
             return None
         ref_p, ref_q = lifted
         idxs = np.asarray(node_idxs, dtype=int)
-        out = np.full((idxs.size, len(_fk_body_ids), 3), np.nan)
-        for row, n in enumerate(idxs):
-            # qpos = [pos(3), quat(4, WXYZ), joints(nj in MUJOCO order)].
-            _fk_data.qpos[0:3] = ref_p[n]
-            _fk_data.qpos[3:7] = xyzw_to_wxyz(ref_q[n])
-            _fk_data.qpos[7:] = convert_joint_order(jp_isaac[n], isaac, robot.joint_names)
-            mujoco.mj_kinematics(robot.mj_model, _fk_data)
-            for f, bid in enumerate(_fk_body_ids):
-                if bid >= 0:
-                    out[row, f] = _fk_data.xpos[bid]
-        return out
+        return _fk.frame_positions(ref_p[idxs], ref_q[idxs], jp_isaac[idxs])
 
     # One-shot latch for the "--log FM branch has NaN columns" notice (a list so the
     # closure can append without a nonlocal).

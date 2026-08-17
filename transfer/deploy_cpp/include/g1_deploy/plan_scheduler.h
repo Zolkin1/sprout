@@ -104,6 +104,9 @@ class PlanScheduler {
   bool has_plan() const { return has_plan_; }
   int cursor() const { return cursor_; }
   int64_t ctrl_step() const { return ctrl_step_; }
+  /// Id of the LIVE plan; 0 before the first adoption. Monotonic across resets, so a bag can
+  /// tell a re-arm from a re-plan.
+  uint64_t plan_id() const { return plan_id_; }
   bool late() const { return late_; }
   uint32_t late_ticks() const { return late_ticks_; }
   uint32_t late_events() const { return late_events_; }
@@ -121,6 +124,8 @@ class PlanScheduler {
   bool adopted_late_ = false;
   int cursor_ = 0;
   int64_t plan_target_ = 0;
+  //: Deliberately NOT cleared by Reset() -- see its doc comment.
+  uint64_t plan_id_ = 0;
   bool late_ = false;
   uint32_t late_ticks_ = 0;
   uint32_t late_events_ = 0;

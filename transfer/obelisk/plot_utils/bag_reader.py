@@ -119,8 +119,10 @@ def _read_rosbag2(bag: str, topics: set[str] | None) -> dict[str, list]:
     except ImportError:
         sys.exit(
             "[ERROR] Neither mcap nor rosbag2_py is importable.\n"
-            "  Off-container (no ROS needed -- MCAP carries the schemas):\n"
-            "    pip install mcap mcap-ros2-support matplotlib numpy\n"
+            "  Off-container (no ROS needed -- MCAP carries the schemas): env_transfer already\n"
+            "  lists these in transfer/requirements.txt, so\n"
+            "    source env_transfer/bin/activate       # or rebuild: bash transfer/setup_venv.sh\n"
+            "  and if it predates them: pip install mcap mcap-ros2-support\n"
             "  In-container: source the workspace first (obk; source install/setup.bash)."
         )
     print(

@@ -140,7 +140,12 @@ class Run:
 
         self.clip_mode = bool(self.ticks[0].clip_mode)
         self.armed = np.array([m.armed for m in self.ticks], dtype=bool)
-        self.num_joints = len(self.ticks[0].action_isaac) or None
+        # An UNARMED tick publishes no action and no reference window (both empty), and a run
+        # normally opens with a stretch of them -- so tick 0 is not a representative sample of
+        # the per-tick widths. Take the joint count from the name list, which every tick
+        # carries, and fall back to the first tick that actually ran the policy.
+        self.num_joints = len(getattr(self.ticks[0], "joint_names_isaac", []) or []) or next(
+            (len(m.action_isaac) for m in self.ticks if len(m.action_isaac)), 0) or None
 
         # --- joint ordering ---
         # The policy's order is NOT the robot's (27 of 29 positions differ on the G1), so
@@ -204,7 +209,28 @@ class Run:
         self.latency = np.array([m.latency_ms for m in self.ticks])
         self.clip_step = np.array([m.clip_step for m in self.ticks])
         self.fm_cursor = np.array([m.fm_cursor for m in self.ticks])
-        self.action = np.array([list(m.action_isaac) or [np.nan] for m in self.ticks])
+        # NaN for the unarmed ticks, which carry no action at all -- a gap in the trace, not
+        # a commanded zero. Padding to a fixed width also keeps this a 2-D array: stacking the
+        # raw lists is ragged the moment a run opens unarmed.
+        self.action = np.full((len(self.t), self.num_joints or 0), np.nan)
+        for i, m in enumerate(self.ticks):
+            if len(m.action_isaac) == self.action.shape[1]:
+                self.action[i] = m.action_isaac
+
+        # Per-network timing and generator schedule health. `getattr` because the mcap reader
+        # deserialises with the BAG's own schema, so a bag recorded before these fields existed
+        # yields messages without them -- and refusing to plot an old bag is worse than a flat
+        # zero trace. NaN, not 0, so an absent field reads as "no data" rather than "0 ms".
+        col = lambda name, default=np.nan: np.array(  # noqa: E731
+            [float(getattr(m, name, default)) for m in self.ticks])
+        self.fm_infer_ms = col("fm_infer_ms")
+        self.trk_infer_ms = col("trk_infer_ms")
+        self.tick_period_ms = col("tick_period_ms")
+        self.fm_late = np.array([bool(getattr(m, "fm_late", False)) for m in self.ticks])
+        self.fm_late_events = col("fm_late_events", 0.0)
+        self.fm_plans_dropped = col("fm_plans_dropped", 0.0)
+        self.fm_requests_skipped = col("fm_requests_skipped", 0.0)
+        self.fm_offsets_clamped = col("fm_offsets_clamped", 0.0)
 
         self.joint_pos_isaac = self._as_isaac(self.joint_pos)
         self.joint_target_isaac = self._as_isaac(self.joint_target)

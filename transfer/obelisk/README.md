@@ -432,6 +432,42 @@ To open a new bash terminal for running container
 
 # Observability
 
+## Live, in RViz
+
+```bash
+scripts/run_sim_low.sh --cpp --rviz     # then run_sim_world.sh as usual
+```
+
+Shows the robot in its ESTIMATED pose (so it is a view of what the controller believes, not of
+MuJoCo's ground truth -- the two diverging is itself a finding), plus what the generator is
+asking it to do:
+
+| what | where it comes from |
+|---|---|
+| the robot's joint configuration and base pose | `default_robot_viz` + `robot_state_publisher`, off `/obelisk/g1/est_state` and the `g1_model` URDF |
+| **orange** root ribbon, the generator's whole F-node plan lifted to world | `/obelisk/g1/debug/fm_plan` -> `g1_control fm_plan_viz` |
+| **cyan** foot paths, forward-kinematic from each predicted node's joints | the same, FK'd on `FlowMatchingConfig.fk_model_path` |
+| orientation triads every few nodes, and the plan's anchor frame | the same. A yaw error is INVISIBLE in a bare path |
+| **green** the 13 window rows the tracker actually observed this tick | `/obelisk/g1/debug/tick` + `/obelisk/g1/est_state` |
+
+The colours match the MuJoCo sim2sim viewer's ribbon deliberately, and both now call the same
+FK (`deploy.fk_mujoco.WindowFK`) on the same model, so the two views cannot disagree by
+construction and a discrepancy between them is real.
+
+**The green-vs-orange overlay is the highest-value thing on this display.** The served window
+should lie on the plan at `cursor + offsets`. It is drawn by a different route -- lifted onto
+the MEASURED base rather than the plan's stored anchor -- so a systematic divergence between
+them is the re-anchoring, which is otherwise invisible.
+
+The feet are FK'd from the predicted JOINTS, so they are exactly where those joints put them
+rather than a second opinion about it; the joint error reaches them amplified by the link
+lengths, which is why a gait problem shows up there first.
+
+To view from a laptop instead, see "Running the world on another machine" -- everything RViz
+needs crosses DDS, and the requirements are the same.
+
+## Afterwards, from the bag
+
 **Every run is recorded to an MCAP bag**, by every launcher, by default (`--no-bag` opts
 out). Bags land in `transfer/obelisk/log/bags/<timestamp>_<tag>/`, under `$REPO_ROOT`
 because that is bind-mounted -- obelisk's own `ROS_LOG_DIR` is not, and `stop.sh --down`
@@ -450,6 +486,27 @@ budget, per-camera rate and invalid fraction), `command` (commanded vs achieved 
 subplot per joint -- reference, measured and PD target, by joint name), `reference` (how far
 the window reaches and whether it jumps between re-plans), `generator` (re-plan cadence,
 cursor, inference time).
+
+The `health` figure's timing panel splits the two networks, because they are judged against
+DIFFERENT budgets and a single total cannot say which one moved: the tracker runs inside the
+20 ms tick, while the generator runs on its own thread and is asked for a plan `lead_ticks`
+before the boundary it is for, so its deadline is `lead_ticks * dt` (60 ms at the shipped
+lead). Below it, the generator's cumulative schedule counters -- late events, plans dropped in
+the mailbox, requests skipped because the worker was still busy. A flat line there is a
+healthy stretch; any slope at all is the generator failing to keep its cadence, and dropped or
+skipped shows up before lateness does. The C++ controller prints the same numbers live, once
+every 5 s:
+
+```
+timing (5.0s): tick p50 0.74 p95 1.51 p99 1.86 / 20.0 ms | period p50 20.00 p99 20.46 ms
+  | trk p50 0.58 p99 1.70 ms | fm p50 17.55 p95 18.47 p99 18.54 / 60.0 ms (20 plans, 21
+  expected) | late 0 dropped 0 skipped 0 clamped 0
+```
+
+`period` is the ROS timer's own jitter, measured with `steady_clock` between ticks -- worth
+watching on its own, because the re-plan cadence is counted in TICKS, so a loop that is not
+actually at 50 Hz silently rescales it and every reference offset with it. The line goes to
+WARN if any budget is exceeded or any counter moves; otherwise INFO.
 
 `--interactive` opens a frame stepper: both depth images, the reference root path and joint
 trajectory, joints at the cursor, and the velocity trace. LEFT/RIGHT step one tick, UP/DOWN

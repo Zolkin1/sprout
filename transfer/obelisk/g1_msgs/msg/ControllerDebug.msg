@@ -20,6 +20,33 @@ std_msgs/Header header
 uint64 ctrl_step             # absolute tick counter since arming; the FM cadence is % K of it
 float64 latency_ms           # create_obs + get_action for this tick, against a 20 ms budget
 
+# The two networks separately, because they are judged against DIFFERENT budgets and a single
+# total cannot say which one moved. The tracker runs on the control thread inside the tick, so
+# its budget is the control period. The generator runs on its own thread and is asked for a
+# plan `lead_ticks` before the boundary it is for, so its budget is lead_ticks * dt -- several
+# times larger. `fm_infer_ms` holds the SAME value on the K-1 ticks between inferences; a
+# reader wanting per-plan statistics must deduplicate on `fm_plan_id`.
+float64 fm_infer_ms
+float64 trk_infer_ms
+# Wall time since the previous tick. The ROS timer's own jitter, which nothing else records:
+# a loop not actually running at 50 Hz rescales the FM cadence (counted in TICKS) and every
+# reference offset with it, and would otherwise be invisible in a bag.
+float64 tick_period_ms
+
+# ---- Generator schedule health --------------------------------------------------------
+# Whether the receding-horizon schedule is being met. `fm_late` is the instantaneous state --
+# no plan arrived for this boundary, so the cursor advanced anyway and the far end of the
+# window began repeating its last node. The rest are CUMULATIVE counters since arming; take
+# differences to see a rate. `plans_dropped` counts plans the generator finished but that were
+# superseded in the mailbox before a tick read them, and `requests_skipped` counts re-plan
+# requests refused because the worker was still busy -- both mean the generator is running
+# slower than its cadence, and both appear before lateness does.
+bool fm_late
+uint32 fm_late_events
+uint32 fm_plans_dropped
+uint32 fm_requests_skipped
+uint32 fm_offsets_clamped
+
 # ---- Input provenance ---------------------------------------------------------------
 # WHICH sample each input was, not its value. The estimator publishes at 1 kHz against a
 # 50 Hz tick, so without the consumed stamp there is no way to tell offline which of twenty

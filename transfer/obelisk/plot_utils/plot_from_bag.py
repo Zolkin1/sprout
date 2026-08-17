@@ -65,8 +65,8 @@ def find_latest_bag(root: pathlib.Path) -> str | None:
 # ---------------------------------------------------------------------------
 
 def fig_health(run: Run, plt):
-    """Arming, watchdogs, input ages, loop timing and depth health."""
-    fig, ax = plt.subplots(4, 1, figsize=(13, 12), sharex=True)
+    """Arming, watchdogs, input ages, loop timing, generator schedule and depth health."""
+    fig, ax = plt.subplots(5, 1, figsize=(13, 15), sharex=True)
     m = run.ticks
 
     ax[0].step(run.t, run.armed, where="post", label="armed")
@@ -82,17 +82,40 @@ def fig_health(run: Run, plt):
         ax[1].plot(run.t, age([x.depth_age[i] for x in m]), label=f"depth[{i}]")
     ax[1].set_ylabel("input age [ms]\n(gaps = never arrived)")
 
+    # The two networks separately: they are judged against different budgets (the tracker runs
+    # inside the tick, the generator gets its whole lead window off-thread), so a single total
+    # cannot say which one moved. `tick_period_ms` is the controller's own steady_clock gap and
+    # is the trustworthy one -- diff(run.t) is over HEADER stamps, which on a split-machine run
+    # come from a different box's clock.
     if len(run.t) > 1:
-        ax[2].plot(run.t[1:], np.diff(run.t) * 1e3, lw=0.8, label="loop period")
-    ax[2].plot(run.t, run.latency, lw=0.8, label="policy latency")
-    ax[2].axhline(20.0, color="r", ls="--", lw=0.8, label="20 ms budget")
+        ax[2].plot(run.t[1:], np.diff(run.t) * 1e3, lw=0.6, alpha=0.5,
+                   label="period (header stamps)")
+    ax[2].plot(run.t, run.tick_period_ms, lw=0.8, label="period (steady_clock)")
+    ax[2].plot(run.t, run.latency, lw=0.8, label="tick total")
+    ax[2].plot(run.t, run.trk_infer_ms, lw=0.8, label="tracker.onnx")
+    # The generator holds the same value between re-plans; drawn stepped so the flat stretches
+    # read as "did not run", not as a measurement.
+    ax[2].step(run.t, run.fm_infer_ms, where="post", lw=0.8, label="fm.onnx (per re-plan)")
+    ax[2].axhline(20.0, color="r", ls="--", lw=0.8, label="20 ms tick budget")
     ax[2].set_ylabel("[ms]")
 
+    # Generator schedule health. Cumulative counters, so a flat line is a healthy stretch and
+    # any slope at all is the generator failing to keep its cadence. `fm_late` is shaded
+    # because it is the state, not a count -- the ticks where the reference stopped refreshing.
+    ax[3].plot(run.t, run.fm_late_events, label="late events")
+    ax[3].plot(run.t, run.fm_plans_dropped, label="plans dropped")
+    ax[3].plot(run.t, run.fm_requests_skipped, label="requests skipped")
+    ax[3].plot(run.t, run.fm_offsets_clamped, ls=":", label="offsets clamped")
+    if run.fm_late.any():
+        ax[3].fill_between(run.t, 0, 1, where=run.fm_late, transform=ax[3].get_xaxis_transform(),
+                           color="r", alpha=0.15, label="late (state)")
+    ax[3].set_ylabel("generator schedule\n(cumulative)")
+
     for i in range(len(m[0].depth_hz)):
-        ax[3].plot(run.t, [x.depth_hz[i] for x in m], label=f"depth[{i}] Hz")
-        ax[3].plot(run.t, [100.0 * x.depth_invalid_fraction[i] for x in m], ls=":",
+        ax[4].plot(run.t, [x.depth_hz[i] for x in m], label=f"depth[{i}] Hz")
+        ax[4].plot(run.t, [100.0 * x.depth_invalid_fraction[i] for x in m], ls=":",
                    label=f"depth[{i}] % invalid")
-    ax[3].set_ylabel("depth health"); ax[3].set_xlabel("time [s]")
+    ax[4].set_ylabel("depth health"); ax[4].set_xlabel("time [s]")
     return fig, ax
 
 
@@ -421,7 +444,10 @@ class Stepper:
             f"tick {i}/{len(r.t) - 1}   t={r.t[i]:.2f}s   "
             f"{'ARMED' if m.armed else 'disarmed'}   "
             f"{'clip step ' + str(m.clip_step) if m.clip_mode else 'fm cursor ' + str(m.fm_cursor)}"
-            f"   latency {m.latency_ms:.1f} ms\n"
+            f"   tick {m.latency_ms:.1f} ms"
+            f" (trk {getattr(m, 'trk_infer_ms', float('nan')):.1f},"
+            f" fm {getattr(m, 'fm_infer_ms', float('nan')):.1f})"
+            f"{'   LATE' if getattr(m, 'fm_late', False) else ''}\n"
             "LEFT/RIGHT = 1 tick,  UP/DOWN = 10,  PAGEUP/PAGEDOWN = 100,  HOME/END = ends",
             fontsize="medium")
         self.fig.canvas.draw_idle()

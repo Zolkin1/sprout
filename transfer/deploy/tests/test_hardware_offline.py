@@ -148,6 +148,16 @@ def test_hardware_offline() -> None:
     # deploy. test_deploy_path_is_torch_free re-runs this file standalone, where it holds.
     if _STANDALONE:
         assert "torch" not in sys.modules, "deploy path must be torch-free"
+        # Same argument, different package. deploy.fk_mujoco exists for the RViz ribbon and
+        # the sim2sim viewer, and MuJoCo must stay off the ON-ROBOT import graph: it is tens
+        # of MB the control path never calls, and the robot is not required to have it. The
+        # import is deliberately inside that module; this is what stops a convenience
+        # `from .fk_mujoco import ...` at the top of hardware.py or gen_tracker.py from
+        # quietly dragging it in.
+        assert "mujoco" not in sys.modules, (
+            "the deploy control path must not import mujoco -- keep it inside "
+            "deploy/fk_mujoco.py, which only the viewers touch"
+        )
     print(f"obs {policy.get_num_obs()}  action {last.shape}  finite=True  "
           f"depth_cameras={len(depth_spec)}  height_scan={scan_dim}  "
           f"pred_valid={policy._pred_valid}")

@@ -215,6 +215,39 @@ TEST(PlanScheduler, ResetClearsTheScheduleButNotTheHistoryOfEvents) {
   EXPECT_TRUE(h.sched.ShouldRequest());
 }
 
+TEST(PlanScheduler, PlanIdCountsAdoptionsAndSurvivesReset) {
+  Harness h(LiveConfig());
+  EXPECT_EQ(h.sched.plan_id(), 0u) << "no plan has been adopted yet";
+
+  for (int i = 0; i < kK; ++i) h.Tick();
+  const uint64_t after_first = h.sched.plan_id();
+  EXPECT_GT(after_first, 0u);
+
+  // A plan offered before its boundary is refused, and a refusal must not consume an id --
+  // otherwise the id would count OFFERS, and a bag could not join a tick to the plan that
+  // actually drove it.
+  h.sched.BeginTick();
+  EXPECT_FALSE(h.sched.TryAdopt(h.sched.ctrl_step() + 5));
+  EXPECT_EQ(h.sched.plan_id(), after_first);
+
+  // Likewise a plan so stale it would saturate from its first tick.
+  EXPECT_FALSE(h.sched.TryAdopt(h.sched.ctrl_step() - (kF - kMaxOffset)));
+  EXPECT_EQ(h.sched.plan_id(), after_first);
+
+  // Exactly one increment per successful adoption.
+  EXPECT_TRUE(h.sched.TryAdopt(h.sched.ctrl_step()));
+  EXPECT_EQ(h.sched.plan_id(), after_first + 1);
+
+  // Monotonic across a re-arm: ids stay unique for the life of the process, so a bag can tell
+  // a re-arm from a re-plan. This is the property plan_scheduler.h's Reset() doc promises.
+  const uint64_t before_reset = h.sched.plan_id();
+  h.sched.Reset();
+  EXPECT_EQ(h.sched.plan_id(), before_reset);
+  h.sched.BeginTick();
+  EXPECT_TRUE(h.sched.TryAdopt(h.sched.ctrl_step()));
+  EXPECT_EQ(h.sched.plan_id(), before_reset + 1);
+}
+
 TEST(PlanScheduler, LatenessIsAboutTheScheduleNotTheHorizon) {
   // With a longer-horizon generator, being late and saturating stop coinciding. Lateness must
   // still be reported at cursor >= K, because that is when the reference stopped being

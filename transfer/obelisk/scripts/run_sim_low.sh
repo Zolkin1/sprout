@@ -17,10 +17,12 @@
 # recovering from a heap, which it was never trained to do.
 #
 #   window "main": controller (AUTO-RUN) | MCAP recorder (AUTO-RUN)
+#   window "viz" (--rviz only): FM plan markers (AUTO-RUN)
 #
 # Usage:
 #   scripts/run_sim_low.sh                       the brain, recorded to MCAP
 #   scripts/run_sim_low.sh --no-bag              ... without recording
+#   scripts/run_sim_low.sh --rviz                ... with RViz + the FM plan ribbon
 #   scripts/run_sim_low.sh --policy <hf_folder>  override the checkpoint for this run
 #   scripts/run_sim_low.sh --build               colcon build first (needed on first run)
 #
@@ -44,6 +46,16 @@ Options:
                    per re-plan against a 20 ms period. The C++ one runs it at ~16 ms,
                    on its own thread.
   --policy FOLDER  Override the controller's hf_policy_folder for this run.
+  --rviz           Turn the viz block on: RViz showing the robot in its estimated pose
+                   (default_robot_viz + robot_state_publisher + the g1_model URDF), plus
+                   the generator's predicted root path and FK'd foot paths as markers.
+                   The first three come from obelisk's own bringup; only the marker node
+                   (g1_control fm_plan_viz) gets a pane, in a second tmux window.
+                   To view from a LAPTOP instead, still pass this -- everything the remote
+                   RViz needs (/robot_description, /joint_states, TF, the markers) goes
+                   out over DDS, and the local rviz2 is simply one more window. Obelisk's
+                   bringup starts rviz2 unconditionally with the viz block, so there is no
+                   way to ask for the publishers without it.
   --no-bag         Do NOT record. Recording is ON by default -- a run you cannot
                    explain afterwards is a run you have to repeat. Bags go to
                    $REPO_ROOT/transfer/obelisk/log/bags/<timestamp>_fm/.
@@ -64,10 +76,11 @@ EOF
 }
 
 ORIG_ARGS=("$@")
-POLICY="" ; BUILD="" ; BAG=1 ; CPP=""
+POLICY="" ; BUILD="" ; BAG=1 ; CPP="" ; RVIZ=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --cpp)         CPP=1; shift ;;
+        --rviz)        RVIZ=1; shift ;;
         --policy)      POLICY="${2:-}"; shift 2 ;;
         --no-bag)      BAG=""; shift ;;
         --build)       BUILD=1; shift ;;
@@ -93,6 +106,9 @@ else
     CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1.yml"
 fi
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
+# After --policy: each overlay includes the previous one by absolute path, so the order here
+# is the include chain and both flags compose.
+[ -n "$RVIZ" ] && CTRL_CFG="$(obk_viz_config "$CTRL_CFG")"
 
 if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then
     exec tmux attach -t "$SESSION"
@@ -107,6 +123,13 @@ if [ -n "$BAG" ]; then
     tmux split-window -h -t "$SESSION":main.0 "$(obk_pane_run bag "$(obk_bag_cmd fm)")"
 else
     tmux split-window -h -t "$SESSION":main.0 "$(obk_pane dbg "$(obk_bag_cmd fm)")"
+fi
+
+# A SECOND window, so --rviz does not disturb the layout of `main`. Only the marker node
+# needs a pane: default_robot_viz, robot_state_publisher and rviz2 are all launched by
+# obelisk's bringup in the controller pane's launch, off the viz block.
+if [ -n "$RVIZ" ]; then
+    tmux new-window -t "$SESSION" -n viz "$(obk_pane_run fmviz "ros2 run g1_control fm_plan_viz")"
 fi
 
 tmux select-window -t "$SESSION":main
