@@ -735,7 +735,7 @@ Position and velocity actuators added. -->
     <framequat name="base_mocap_quat_sensor" objtype="site" objname="pelvis_mocap_site" noise="0.01"/>
 
     <!-- Pelvis Odometry: the sim's GROUND-TRUTH stand-in for FAST-LIO's /Odometry.
-         Obelisk's Odometry message is assembled from exactly this quartet -- framepos ->
+         Obelisk's Odometry message is assembled from exactly this quartet: framepos ->
          pose.position (world, since the framepos has no refid), framequat ->
          pose.orientation, velocimeter -> twist.linear, gyro -> twist.angular. The wiring
          and the TODO that governs it live in g1_control/config/g1_world.yml; that is the
@@ -772,7 +772,7 @@ Position and velocity actuators added. -->
          transfer/sim/depth_camera.py does not use these; it reads the mount body directly.
 
          ONE PER DEPTH CAMERA, named to match g1_world.yml. Both hang off the SAME site
-         because both cameras mount on torso_link -- the per-camera extrinsics live in
+         because both cameras mount on torso_link; the per-camera extrinsics live in
          pattern.offset inside the generated config/scan/depth_{near,far}.yml, not here.
          Obelisk's DepthImage callback happens to ignore sensor_names and take its site from
          the scan config, so a dangling name here would go unnoticed; its Odometry and Imu
