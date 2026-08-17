@@ -17,6 +17,12 @@ x-common: &common
     # scripts/lib/obk_launch.sh. Set in docker/.env.
     OBK_JETSON_HOST: $OBK_JETSON_HOST
     OBK_JETSON_CONTAINER: ${OBK_JETSON_CONTAINER:-zed_depth}
+    # Cyclone DDS discovery override, EMPTY BY DEFAULT so nothing changes for a single-box
+    # run. Set it in docker/.env to a file:// path when the world runs on another machine
+    # over a link that will not carry multicast (wifi with client isolation, a routed hop, a
+    # multi-homed box). See docker/cyclonedds.xml.example, and note that `obk` does not touch
+    # this variable, so it composes with the RMW/domain it does set.
+    CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
   security_opt:
     - seccomp=unconfined
   cap_add:

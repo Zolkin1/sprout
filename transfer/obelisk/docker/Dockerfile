@@ -110,6 +110,11 @@ RUN apt-get update && apt-get install -y \
     iputils-ping \
     evtest \
     net-tools \
+    # `ip`, for scripts/net_check.sh. net-tools' ifconfig can answer the same questions and
+    # the script falls back to it, but the container runs with host networking and every
+    # multi-machine question asked in here ("which interface, does it carry multicast, what
+    # is the route to the other box") is one iproute2 answers directly.
+    iproute2 \
     tmux \
     sudo && \
     rm -rf /var/lib/apt/lists/* && \

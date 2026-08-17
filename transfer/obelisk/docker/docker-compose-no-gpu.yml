@@ -26,6 +26,9 @@ x-common: &common
     REPO_ROOT: $REPO_ROOT
     OBK_JETSON_HOST: $OBK_JETSON_HOST
     OBK_JETSON_CONTAINER: ${OBK_JETSON_CONTAINER:-zed_depth}
+    # See the note in docker-compose.yml. Empty by default; docker/cyclonedds.xml.example
+    # explains when a split-machine run needs it.
+    CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
   security_opt:
     - seccomp=unconfined
   cap_add:

@@ -46,6 +46,68 @@ Up-arrow away, so a node you Ctrl-C is one keystroke from restarting.
 | `run_hardware_low.sh` | brain + real G1 driver + Jetson ZED depth (session `lowhw`) |
 | `build.sh` | colcon build inside the container |
 | `stop.sh` | kill the tmux server, reap orphaned launches (`--zed`, `--stop`, `--down`) |
+| `net_check.sh` | preflight for a two-machine run: domain/RMW, discovery, endpoint pairing, rates |
+
+## Running the world on another machine
+
+The brain and the world are already two processes with two configs and two obelisk `config:`
+identities (`rl_policy` vs `g1_world`), which is exactly what lets them share one ROS graph.
+Nothing about splitting them across two boxes needs a new launch path -- `run_sim_low.sh`
+launches the brain alone and `run_sim_world.sh` the world alone, unchanged:
+
+```bash
+# dev desktop
+scripts/run_sim_world.sh --scene g1_29j_basic_scene
+# the Thor
+scripts/run_sim_low.sh --cpp
+```
+
+Worth doing when the controller box is also paying for the sim. The world side is not cheap:
+1 kHz MuJoCo, two ray-cast depth cameras at 50 Hz, and a 21600-ray lidar scan at 10 Hz. Order
+still matters and for the same reason -- **brain first**, then the world.
+
+**What has to agree.** Discovery is stock Cyclone with no configuration anywhere in this repo,
+so the requirements are the ones DDS imposes:
+
+- `ROS_DOMAIN_ID` and `RMW_IMPLEMENTATION`. `obk` sets both (`2` and `rmw_cyclonedds_cpp`) and
+  every pane the launchers open runs `obk`, so this is automatic -- but only inside the
+  container. A laptop running `rviz2` outside one has to set them by hand.
+- **The same `OBELISK_REF` in both images.** A different pin means different generated message
+  definitions, and DDS then refuses to pair endpoints on type hash. There is no error for
+  this: both halves come up, both log normally, and no message ever crosses.
+- The repo checked out on the desktop with its own `docker/.env` (the world config resolves
+  `${ROBOT_RL_ROOT}/../sim/robots/g1/*.xml` from it), and `scripts/build.sh` run there --
+  `run_sim_world.sh` also launches `fsm_state_echo` out of `g1_control`.
+- `scripts/stop.sh` on **each** box. The orphan reaper is container-local.
+
+**When discovery does not cross.** Cyclone discovers over UDP multicast by default. That is
+fine on a wired switch and is why the Jetson depth camera has always just worked. It is *not*
+fine over wifi -- campus and guest APs routinely enable client isolation, which drops
+multicast between clients -- and it is ambiguous on a box with several interfaces up, where
+Cyclone picks one and it need not be the one that reaches the other machine. The fix is an
+explicit unicast peer list: copy `docker/cyclonedds.xml.example` to `docker/cyclonedds.xml`,
+list the OTHER box (**on both boxes** -- a peer list is not symmetric by itself), and set
+`CYCLONEDDS_URI` in `docker/.env`. Then `docker compose up -d --force-recreate`, since compose
+reads `.env` only when it creates a container.
+
+**Diagnosing it.** `scripts/net_check.sh`, run on both boxes while both halves are up. It
+reads the graph only -- it launches nothing and is safe against a live robot -- and separates
+the four ways this fails: an environment mismatch, discovery not crossing, a message-hash
+mismatch from differing obelisk pins (a topic with a publisher and a subscriber that never
+pair), and everything pairing but a rate being wrong.
+
+**What actually crosses, and what must not.** ~1.5 MB/s total, and depth is not the concern:
+the images are 30x26 float32, 3.1 kB a frame. The load is `/obelisk/g1/joint_encoders`
+(500 Hz) and `/obelisk/g1/pelvis_imu` (1 kHz), both reliable-QoS. `/obelisk/g1/est_state` is
+also 1 kHz but stays entirely on the brain box, because the estimator lives in the brain
+config -- which is also where it lives on hardware. If the link cannot carry the sensor
+streams, lower those two sensors' `dt` in the world config for split runs; do **not** move the
+estimator to the world side to make the split cheaper, because that is a topology hardware
+never has.
+
+Clocks need not be synchronised for the run to work -- every watchdog is deliberately on local
+receipt time -- but a bag records header stamps from both boxes, so run NTP/chrony if you
+intend to compare them.
 
 ## When the robot falls over, start here
 
