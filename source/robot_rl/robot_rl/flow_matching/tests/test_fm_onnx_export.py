@@ -75,6 +75,11 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto",
         num_history_states=n, future_len=f, cmd_array="target_vel", cmd_stride=4,
         target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
         d_model=32, nhead=4, num_layers=2, dim_feedforward=64,
+        # 1 channel, not the shipped 5: the fixture's robot is four fake joints, and the xyz
+        # channels rebuild the camera pose through real FK on the G1's MJCF. What the graph
+        # signature and the metadata contract pin here does not depend on the channel count,
+        # and ``test_depth_xyz_offline`` covers 5 channels on a real 29-joint recording.
+        extero_channels=1,
         extero_encoder=extero_encoder,
         **({} if attention_mode is None else {"attention_mode": attention_mode}),
     )
@@ -189,7 +194,10 @@ def test_only_a_convolutional_graph_states_its_image_fold(tmp_path, encoder, exp
     meta = export_fm_onnx(ckpt, str(tmp_path / "fm.onnx"), opset=18)
     assert meta["extero_encoder"] == encoder
     assert meta["extero_image_hw"] == expect_hw
-    assert meta["extero_tokens_per_sensor"] == (16 if encoder == "cnn" else 1)
+    # 56 = 7x8, the grid the DEFAULT strides (1, 2, 2) leave on a 26x30 image: the first stage
+    # convolves at native resolution, so only two halvings follow. Stride 2 everywhere gives
+    # 4x4 = 16, which is what this asserted before the default changed.
+    assert meta["extero_tokens_per_sensor"] == (56 if encoder == "cnn" else 1)
 
 
 def test_state_layout_guard_accepts_a_subset_but_not_an_incoherent_one():

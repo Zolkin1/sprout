@@ -39,6 +39,7 @@ history distributions. ``cfg.null_cond_prob`` and the per-channel history noise
 from __future__ import annotations
 
 import json
+import math
 from typing import Any, Sequence
 
 
@@ -267,41 +268,263 @@ def _resolve_extero_coord_extent(spec: list[dict] | None) -> list[float] | None:
     return [sx, sy]
 
 
-def _pool_extero_statistics(
+def _resolve_xyz_contract(
+    cfg: FlowMatchingConfig, spec: list[dict], joint_names: list[str]
+) -> tuple[list[list[float]], float]:
+    """Derive the declared xyz offsets and clamp from the camera contract. No data involved.
+
+    The offset for a camera is where its BORESIGHT meets the nominal ground plane, in the
+    root's yaw-aligned frame, with the robot at zero joints and upright. Every term of that is
+    a constant of the robot and the mount: FK from the pelvis to the mount body, the contract's
+    nominal offset, and a ground plane taken from the ankle at zero joints. Nothing consults
+    the recording, which is the point -- the same robot yields the same constants in every
+    dataset, so a checkpoint's notion of "one metre from the robot" does not depend on which
+    terrain happened to be under it the day the normalizer was fitted.
+
+    The boresight rather than the cloud's centroid, because the centroid is a fact about
+    terrain: a wide downward FOV maps the upper image rows much farther out than the lower
+    ones, so on flat ground the centroid already sits well past the boresight, and over a
+    drop-off it runs away entirely. The boresight intersection is the one point in the view
+    that is defined by the camera alone.
+
+    The clamp is sized to each camera's full max-range CONE post-offset, so it cannot bind on
+    a physically reachable point -- ``extero_clip`` already bounds range long before this does.
+
+    Args:
+        cfg: Training config; ``extero_xyz_scale``, ``extero_nominal_ground_z`` and
+            ``fk_model_path`` are read.
+        spec: The per-camera contract, in row order.
+        joint_names: The recording's joint order, for the FK chain.
+
+    Returns:
+        ``(offsets, clip)`` -- one ``[x, y, z]`` per camera in metres, and the symmetric bound
+        on the normalised xyz channels.
+
+    Raises:
+        ValueError: If a camera's boresight does not point downward, so no ground intersection
+            exists and the nominal offset is undefined.
+    """
+    from motion_gen.fk import FKChain  # noqa: PLC0415
+
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (  # noqa: PLC0415
+        pinhole_ray_directions,
+    )
+
+    nj = len(joint_names)
+    ground = cfg.extero_nominal_ground_z
+    if ground is None:
+        # The sole at zero joints: the ankle roll link, dropped by the collider half-height.
+        chain = FKChain(cfg.fk_model_path, list(joint_names), ["left_ankle_roll_link"],
+                        base_link="pelvis_link", dtype=torch.float32)
+        pos, _, _, _ = chain.pose_and_jacobian(torch.zeros(1, nj))
+        ground = float(pos[0, 0, 2]) - 0.03
+        cfg.extero_nominal_ground_z = round(ground, 4)
+
+    poses = FutureStateDataset._camera_pose_yaw_frame(
+        spec, torch.tensor([[0.0, 0.0, 0.0, 1.0]]), torch.zeros(1, nj), joint_names,
+        cfg.fk_model_path,
+    )
+    scale = float(cfg.extero_xyz_scale)
+    offsets, envelope = [], 0.0
+    for cam, (p, rot) in zip(spec, poses):
+        p, rot = p[0], rot[0]
+        boresight = rot[:, 0]                                   # camera +x is the optical axis
+        if float(boresight[2]) >= -1e-6:
+            raise ValueError(
+                f"camera {cam.get('sensor')!r} has a boresight of {boresight.tolist()}, which "
+                "does not point downward, so it never meets the nominal ground plane and has "
+                "no geometric offset. Set extero_xyz_offset explicitly."
+            )
+        hit = p + boresight * ((ground - float(p[2])) / float(boresight[2]))
+        offsets.append([round(float(v), 2) for v in hit])       # rounded: it is a declared datum
+        dirs = pinhole_ray_directions(
+            int(cam["width"]), int(cam["height"]), float(cam["fx"]), float(cam["fy"]),
+            float(cam["cx"]), float(cam["cy"]), p.device, p.dtype,
+        )                                                        # (K, 3) in the camera frame
+        # The furthest a pixel can REACH, which is not ``max_dist``. Two ways a ray gets long:
+        # an invalid pixel is placed at ``max_dist`` of ray length exactly, and a valid one
+        # carries a Z-DEPTH bounded by the clip band, which becomes a ray length once divided
+        # by the cosine to the optical axis -- so a frame CORNER reaches far past the band's
+        # nominal range. Sizing this from ``max_dist`` alone under-bounds the cone by that
+        # cosine and the clamp then bites real geometry. It also means the depth band and this
+        # envelope are coupled: widening ``extero_clip`` widens the reach.
+        band_m = float(cfg.resolve_extero_clip()) / float(cam["scale"]) + float(cam["offset"])
+        reach = torch.clamp(band_m / dirs[:, 0], min=float(cam["max_dist"]))
+        cone = p + (dirs @ rot.T) * reach[:, None]
+        envelope = max(envelope, float((cone - torch.tensor(offsets[-1])).abs().max()))
+    return offsets, math.ceil(envelope / scale * 2.0) / 2.0
+
+
+def _extero_contract_normalizer(
     normalizer: Normalizer, cfg: FlowMatchingConfig, n_sensors: int, sensor_dim: int
 ) -> Normalizer:
-    """Collapse a per-element exteroception normalizer to one statistic per SENSOR.
+    """Build the exteroception normalizer from DECLARED constants, discarding the fit entirely.
 
-    A no-op unless ``cfg.extero_norm_mode == "per_sensor"``. Motivation, in full, is on
-    :attr:`FlowMatchingConfig.extero_norm_mode`; the short version is that a per-pixel
-    affine is a spatially varying transform, and a convolution's weight sharing assumes the
-    transform is uniform.
+    ``d`` and ``v`` become identities and ``xyz`` gets the contract's per-camera offset over one
+    shared scale. See :attr:`FlowMatchingConfig.extero_norm_mode` for why each is what it is.
 
-    The pooled value is broadcast back over the sensor's elements, so the returned
-    normalizer has the SAME ``(T*K,)`` shape as the fitted one -- the checkpoint, the folded
-    ONNX normalization and the deploy path are all shape-identical either way.
+    Riding the ``Normalizer`` rather than transforming the rows is what keeps this free
+    downstream: it is still one ``(x - mean) / std`` of shape ``(T*K,)``, so the checkpoint, the
+    affine folded into ``fm.onnx`` and the whole deploy path are untouched -- the numbers are
+    simply declared instead of measured. Nothing new has to be plumbed to a robot.
 
-    The std is pooled as the RMS of the per-element stds rather than their mean, because
-    what should be preserved is the total variance the sensor carries, not the average
-    scale; the eps floor is re-applied afterwards so a near-constant sensor still cannot
-    blow the normalization up.
+    Args:
+        normalizer: The fitted normalizer, read only for dtype/device/shape.
+        cfg: Training config; the resolved xyz constants and channel names are read.
+        n_sensors: Cameras packed into the flat width.
+        sensor_dim: Elements per camera, channels included.
+
+    Returns:
+        A normalizer of identical shape carrying only declared constants.
+
+    Raises:
+        ValueError: If the declared offsets do not cover every sensor.
+    """
+    names = [str(n) for n in cfg.extero_channel_names]
+    channels = len(names)
+    n_px = sensor_dim // channels
+    offsets = cfg.extero_xyz_offset or []
+    if names != ["d"] and len(offsets) != n_sensors:
+        raise ValueError(
+            f"extero_xyz_offset has {len(offsets)} entry/entries for {n_sensors} sensor(s); "
+            "the contract normalization needs one per camera."
+        )
+    dtype, device = normalizer.mean.dtype, normalizer.mean.device
+    mean = torch.zeros(n_sensors, channels, n_px, dtype=dtype, device=device)
+    std = torch.ones(n_sensors, channels, n_px, dtype=dtype, device=device)
+    mask = torch.zeros(n_sensors, channels, n_px, dtype=torch.bool, device=device)
+    scale = float(cfg.extero_xyz_scale)
+    for axis, name in enumerate(names):
+        if name not in ("x", "y", "z"):
+            continue                                     # d and v are identities, by contract
+        for s in range(n_sensors):
+            mean[s, axis] = float(offsets[s]["xyz".index(name)])
+            std[s, axis] = scale
+            mask[s, axis] = True
+    print(f"[fm-data] extero_norm_mode=contract: d and v IDENTITY; xyz over one declared scale "
+          f"{scale:g} m with per-camera offsets {offsets} m (boresight on the nominal ground "
+          f"at z={cfg.extero_nominal_ground_z}). No statistic is fitted.")
+    return Normalizer(mean.reshape(-1).contiguous(), std.reshape(-1).contiguous(),
+                      mask.reshape(-1).contiguous())
+
+
+def _pool_extero_per_channel(
+    normalizer: Normalizer, cfg: FlowMatchingConfig, n_sensors: int, sensor_dim: int
+) -> Normalizer:
+    """One statistic per sensor per CHANNEL GROUP, uniform over pixels.
+
+    The mode that makes a multi-channel depth row coherent. A 5-channel pixel is three
+    different quantities -- normalised depth, metres of position, a 0/1 indicator -- so one
+    statistic per sensor (``per_sensor``) produces a std dominated by xyz that compresses
+    depth and squashes validity toward invisibility.
+
+    The grouping comes from :meth:`FlowMatchingConfig.extero_channel_groups` and is NOT simply
+    per channel: ``x, y, z`` share one SCALE so a metre stays a metre in every direction.
+    Fitting the scale separately would rescale the axes against each other -- lateral spread is
+    the largest and vertical the smallest -- and destroy exactly the metric comparability the
+    channels were added to provide. The OFFSET is still per axis, because subtracting one is a
+    rigid translation that preserves all of that while actually centring the channel.
+
+    ``v`` is left as an IDENTITY: it is already 0/1, and fitting it would map "valid" and
+    "invalid" onto two arbitrary values that move with the invalid RATE of whichever recording
+    was used, so a cleaner recording would hand the network a different number for the same
+    fact. This is the one place the ``standardize_mask`` is narrowed rather than inherited.
 
     Args:
         normalizer: The freshly fitted per-element normalizer.
-        cfg: Training config (``extero_norm_mode`` and ``extero_norm_eps`` are read).
+        cfg: Training config; the channel names and ``extero_norm_eps`` are read.
         n_sensors: Number of sensor rows packed into the flat width.
-        sensor_dim: Elements per sensor.
+        sensor_dim: Elements per sensor, channels included.
 
     Returns:
-        Either ``normalizer`` unchanged, or one with per-sensor-constant statistics.
+        A normalizer whose statistics are constant within each (sensor, group), same
+        ``(T*K,)`` shape as the input.
 
     Raises:
-        ValueError: On an unrecognised ``extero_norm_mode``.
+        ValueError: If the channel count does not divide ``sensor_dim``.
+    """
+    names = [str(n) for n in cfg.extero_channel_names]
+    channels = len(names)
+    if channels < 1 or sensor_dim % channels:
+        raise ValueError(
+            f"extero_channel_names {names} implies {channels} channel(s), which does not "
+            f"divide a sensor row of {sensor_dim}."
+        )
+    n_px = sensor_dim // channels
+    # (sensors, channels, pixels) -- CHANNEL-MAJOR, matching the row the encoder folds. Reading
+    # this as (pixels, channels) would pool across channels while looking correct.
+    mean = normalizer.mean.reshape(n_sensors, channels, n_px).clone()
+    std = normalizer.std.reshape(n_sensors, channels, n_px).clone()
+    mask = normalizer.standardize_mask.reshape(n_sensors, channels, n_px).clone()
+    eps = float(cfg.extero_norm_eps)
+
+    report: list[str] = []
+    for group in cfg.extero_channel_groups():
+        idx = [names.index(n) for n in group]
+        if group == ("v",):
+            mean[:, idx] = 0.0
+            std[:, idx] = 1.0
+            mask[:, idx] = False
+            report.append("v: identity (0/1 indicator, not standardized)")
+            continue
+        # The STD is pooled over the group; the MEAN is not, and the asymmetry is the point.
+        #
+        # Sharing the scale is what keeps the axes metrically comparable -- one divisor, so a
+        # metre reads the same in x, y and z. Sharing the OFFSET buys nothing and costs
+        # conditioning: subtracting a per-axis mean is a rigid TRANSLATION of the cloud, which
+        # preserves every relative distance exactly, while one shared offset leaves the axes
+        # sitting wherever their own means happened to fall. Measured on the far camera, x has
+        # mean +6.66 m and z -3.88 m against a pooled +0.79: a shared offset parks those two
+        # channels at +1.94 and -1.55 sigma instead of at zero, before the first convolution.
+        g_mean = mean[:, idx].mean(dim=2, keepdim=True)                       # per channel
+        g_std = std[:, idx].square().mean(dim=(1, 2), keepdim=True).sqrt().clamp_min(eps)
+        mean[:, idx] = g_mean.expand_as(mean[:, idx])
+        std[:, idx] = g_std.expand_as(std[:, idx])
+        report.append(
+            f"{''.join(group)}: mean {[round(float(v), 4) for v in g_mean.reshape(-1)]}, "
+            f"std(shared) {[round(float(v), 4) for v in g_std.reshape(-1)]}"
+        )
+    print(f"[fm-data] extero_norm_mode=per_channel: {n_sensors} sensor(s) x {channels} "
+          f"channel(s) in {len(cfg.extero_channel_groups())} group(s) -- " + "; ".join(report))
+    return Normalizer(
+        mean.reshape(-1).contiguous(), std.reshape(-1).contiguous(), mask.reshape(-1).contiguous()
+    )
+
+
+def _pool_extero_statistics(
+    normalizer: Normalizer, cfg: FlowMatchingConfig, n_sensors: int, sensor_dim: int
+) -> Normalizer:
+    """Collapse a per-element exteroception normalizer to one statistic per sensor or group.
+
+    Motivation, in full, is on :attr:`FlowMatchingConfig.extero_norm_mode`; the short version
+    is that a per-pixel affine is a spatially varying transform and a convolution's weight
+    sharing assumes the transform is uniform, so EVERY mode here is uniform over pixels.
+
+    The pooled value is broadcast back over the sensor's elements, so the returned normalizer
+    has the SAME ``(T*K,)`` shape as the fitted one -- the checkpoint, the folded ONNX
+    normalization and the deploy path are all shape-identical in every mode.
+
+    The std is pooled as the RMS of the per-element stds rather than their mean, because what
+    should be preserved is the total variance the sensor carries, not the average scale; the
+    eps floor is re-applied afterwards so a near-constant sensor still cannot blow the
+    normalization up.
+
+    Args:
+        normalizer: The freshly fitted per-element normalizer.
+        cfg: Training config (``extero_norm_mode``, ``extero_norm_eps``, and for
+            ``per_channel`` the channel names) are read.
+        n_sensors: Number of sensor rows packed into the flat width.
+        sensor_dim: Elements per sensor, CHANNELS INCLUDED (it is the row width).
+
+    Returns:
+        A normalizer with statistics constant over each sensor or channel group.
+
+    Raises:
+        ValueError: On an unrecognised ``extero_norm_mode``, or a channel layout that does not
+            divide the row width.
     """
     cfg.check_extero_norm_mode()
     mode = str(cfg.extero_norm_mode)
-    if mode == "per_element":
-        return normalizer
     if mode == "metric":
         # A FIXED declared affine, discarding the fit entirely. The stored statistics keep
         # their (T*K,) shape so the checkpoint, the folded ONNX normalization and the deploy
@@ -322,6 +545,11 @@ def _pool_extero_statistics(
                        device=normalizer.std.device),
             normalizer.standardize_mask.clone(),
         )
+    if mode == "contract":
+        return _extero_contract_normalizer(normalizer, cfg, n_sensors, sensor_dim)
+    if mode == "per_channel":
+        return _pool_extero_per_channel(normalizer, cfg, n_sensors, sensor_dim)
+
     mean = normalizer.mean.reshape(n_sensors, sensor_dim)
     std = normalizer.std.reshape(n_sensors, sensor_dim)
     pooled_mean = mean.mean(dim=1, keepdim=True).expand_as(mean)
@@ -581,36 +809,12 @@ class FutureStateDataset(Dataset):
                 "scripts/rsl_rl/record_data.py --num_windows (an absent field means the "
                 "recording predates the change, so it is per-step)."
             )
-        # Do NOT stack the sim's sensor DR with the train-time additive noise. When the
-        # recording already carries the noiser's corruption (structured: per-episode plane +
-        # blur + camera pose, per-step additive + dropout), adding a scalar on top over-noises
-        # the one signal the generator uses to place the reference on terrain. Same gating
-        # style as the block-tied loss weights below, and only depth is affected: the recorder
-        # captures height_scan through the raw obs FUNCTION, which bypasses the term's noise.
-        if getattr(meta, "extero_corrupted", False) and cfg.extero_source == "depth":
-            if cfg.noise_depth > 0.0:
-                print(f"[fm-data] noise_depth={cfg.noise_depth} -> 0.0: this recording already "
-                      "carries the sim's depth DR (extero_corrupted=True), so the train-time "
-                      "noise would double-count it.")
-                cfg.noise_depth = 0.0
-        # The complementary gate, and the one the depth-shaped flag above cannot cover: a
-        # recording whose exteroception is noise-free BY CONSTRUCTION must not have train-time
-        # noise added to it. Without this a privileged scan run silently keeps
-        # noise_height_scan=0.1 m -- four grid cells of vertical error on a 0.025 m grid, i.e.
-        # the vertical channel quantised coarser than the step edge being localised, which is
-        # incoherent next to a dense grid and quietly defeats the whole experiment.
-        #
-        # Written on the FIELD rather than through the `noise_extero` property, which is
-        # read-only, and printed either way so a run's log states the amplitude it used.
-        if getattr(meta, "extero_noise_free", False):
-            field = ("noise_height_scan" if cfg.extero_source == "height_scan"
-                     else "noise_depth")
-            if float(getattr(cfg, field)) > 0.0:
-                print(f"[fm-data] {field}={getattr(cfg, field)} -> 0.0: this recording's "
-                      "exteroception is noise-free BY CONSTRUCTION (extero_noise_free=True: no "
-                      "sensor drift, no DR event, read through the raw obs function), so adding "
-                      "noise would corrupt a signal recorded precisely to be exact.")
-                setattr(cfg, field, 0.0)
+        # NOTE: there is deliberately no train-time exteroception noise, and therefore no gate
+        # here reconciling it with the recording. The sensor model lives in the RL env (see
+        # FlowMatchingConfig, where noise_depth / noise_height_scan used to be): the cameras'
+        # DR is already baked into what was recorded, and the privileged scan is exact on
+        # purpose. ``meta.extero_corrupted`` / ``meta.extero_noise_free`` survive as statements
+        # about the recording; nothing on this side reacts to them any more.
         cfg.check_extero_source()
         cfg.check_extero_norm_mode()
         if data.get(cfg.extero_source) is None:
@@ -851,19 +1055,13 @@ class FutureStateDataset(Dataset):
         # orientation and the joint angles, and the mount is nominal, so an existing .h5 needs
         # no re-recording to train a 4-channel model. Done AFTER the clamp on purpose -- see
         # _depth_xyz_rows.
-        row_channels = int(cfg.extero_channels)
+        # Resolved from the source when the run did not say (5 for depth, 1 for a scan), and
+        # written BACK so the checkpoint records a number rather than "whatever the default
+        # meant on the day" -- the same contract ``extero_encoder="auto"`` follows.
+        row_channels = cfg.resolve_extero_channels()
+        cfg.extero_channels = row_channels
+        cfg.extero_channel_names = ["d", "x", "y", "z", "v"][:row_channels]
         if row_channels > 1:
-            if cfg.extero_source != "depth":
-                raise ValueError(
-                    f"extero_channels={row_channels} but extero_source="
-                    f"'{cfg.extero_source}'. The extra planes are a pixel's xyz from the "
-                    "pinhole model; a height scan's rays already ARE ground points."
-                )
-            if row_channels not in (4, 5):
-                raise ValueError(
-                    f"extero_channels={row_channels} is not supported; the depth path emits "
-                    "1 (depth alone), 4 (depth + xyz) or 5 (plus validity)."
-                )
             poses = self._camera_pose_yaw_frame(
                 self.extero_spec, _q(snap_meas), snap_meas[:, s_slc["joint_pos"][0]:
                                                            s_slc["joint_pos"][1]],
@@ -871,8 +1069,35 @@ class FutureStateDataset(Dataset):
             )
             hs = self._depth_xyz_rows(hs, self.extero_spec, poses, n_sensors, sensor_dim,
                                       channels=row_channels)
+            if cfg.extero_norm_mode == "contract":
+                # Derived from the contract, BEFORE the normalizer is built and independently
+                # of anything in `hs`. Reported against the data's own centroid because the
+                # declared offset centres the nominal FLAT-GROUND view: on stairs and drop-offs
+                # the real centroid sits some way off, and that residual is the honest price of
+                # a constant that does not move between recordings. Visible, not assumed.
+                if cfg.extero_xyz_offset is None:
+                    cfg.extero_xyz_offset, cfg.extero_xyz_clip = _resolve_xyz_contract(
+                        cfg, self.extero_spec, [str(j) for j in meta.state_joint_names]
+                    )
+                view = hs.reshape(hs.shape[0], n_sensors, row_channels, -1)
+                for s, cam in enumerate(self.extero_spec):
+                    got = view[:, s, 1:4].mean(dim=(0, 2))
+                    want = torch.tensor(cfg.extero_xyz_offset[s], dtype=got.dtype)
+                    print(f"[fm-data]   {cam.get('sensor')}: declared offset "
+                          f"{cfg.extero_xyz_offset[s]} m vs measured centroid "
+                          f"{[round(float(v), 2) for v in got]} m -- residual "
+                          f"{float((got - want).norm()):.2f} m "
+                          f"({float((got - want).norm()) / float(cfg.extero_xyz_scale):.2f} of "
+                          "the declared scale)")
+                reach = float((view[:, :, 1:4].abs().max()))
+                bound = float(cfg.extero_xyz_clip) * float(cfg.extero_xyz_scale)
+                if reach > bound:
+                    raise ValueError(
+                        f"an xyz channel reaches {reach:.2f} m but the declared clamp allows "
+                        f"{bound:.2f} m. The clamp is sized to the max-range cone and must not "
+                        "bind on real geometry -- the camera contract and the data disagree."
+                    )
             sensor_dim = row_channels * sensor_dim      # the ROW width the model receives
-            cfg.extero_channel_names = ["d", "x", "y", "z", "v"][:row_channels]
             print(f"[fm-data] extero_channels={row_channels}: each pixel carries "
                   f"{cfg.extero_channel_names}, so a sensor row is {sensor_dim} wide "
                   f"({row_channels} x {sensor_dim // row_channels} px), channel-major.")
@@ -1090,12 +1315,7 @@ class FutureStateDataset(Dataset):
         self.state_noise = (
             self._state_noise_std(state_normalizer) if self.add_noise else None
         )
-        # Height-scan noise (normalized space = raw m / std), per ray. The height token is a
-        # real (noisy) sensor at deploy, so it is noised in training like the history tokens.
-        self.extero_noise = (
-            (float(cfg.noise_extero) * float(cfg.noise_scale)) / extero_normalizer.std
-            if self.add_noise else None
-        )
+        # No exteroception noise: the sensor model is the RL env's DR, already in the recording.
 
     def _check_window_invariants(
         self,
@@ -1355,8 +1575,9 @@ class FutureStateDataset(Dataset):
             )
         mount = mounts.pop()
         # Roll/pitch only: the frame is level (its z IS gravity), so what survives here is the
-        # robot's tilt WITHIN that frame -- which is the whole point, since a pelvis pitch
-        # moves the points while the terrain did not move.
+        # robot's tilt WITHIN that frame -- which is the whole point. It moves the CAMERA, and
+        # moving the camera by exactly the tilt is what leaves static terrain sitting at the
+        # coordinates it already had.
         q_rp = quat_mul(quat_inv(yaw_quat(root_quat_w)), root_quat_w)
         r_rp = matrix_from_quat(q_rp)                                        # (Nw, 3, 3)
 
@@ -1452,12 +1673,14 @@ class FutureStateDataset(Dataset):
         # Normalized per item rather than held as a second full-width copy (see __init__).
         extero = self.extero_normalizer.normalize(self.extero[i])
         if self.add_noise:
+            # HISTORY only. This noise models the generator's own prediction error feeding back
+            # into its history at deploy (exposure bias); the exteroception is a real sensor
+            # whose noise the RL env already applied, so nothing is added to it here.
             history = history + (torch.rand(self.N, self.state_dim) * 2.0 - 1.0) * self.state_noise
-            extero = extero + (torch.rand(self.extero.shape[1]) * 2.0 - 1.0) * self.extero_noise
         item = {
             "state": self.state[i],          # (F, D) ego-anchored clip future target
             "history": history,              # (N, D) real-robot phase conditioning
-            "extero": extero,                # (T*K,) flat exteroception (noised in train)
+            "extero": extero,                # (T*K,) flat exteroception, normalized
             "p_ref": self.p_ref[i],
             "q_ref": self.q_ref[i],
         }

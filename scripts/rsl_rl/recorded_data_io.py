@@ -159,26 +159,26 @@ class RecordingMeta:
     additive scalar cannot reproduce.
 
     False for a recording made on a ``-play`` task, which strips those events: the depth is
-    clean at the nominal camera pose, and ``FlowMatchingConfig.noise_depth`` is then the only
-    corruption the generator ever sees.
+    clean at the nominal camera pose, and since the FM adds no noise of its own the generator
+    then trains on an uncorrupted image the robot will never get.
 
-    The FM dataset reads this and ZEROES ``noise_depth`` when it is True, so the two do not
-    stack. Nothing else consults it."""
+    INFORMATIONAL ONLY now. The FM used to zero ``noise_depth`` on this flag; that knob is gone
+    (exteroception noise belongs to the RL DR, see ``FlowMatchingConfig``), so nothing reacts to
+    this field -- it records which task a recording came from, and reading it is on you."""
     extero_noise_free: bool = False
     """Whether the recorded exteroception is noise-free BY CONSTRUCTION.
 
-    The complement of :attr:`extero_corrupted`, and needed because that flag is depth-shaped:
-    it says "the recorded depth already carries the sim's DR", and the dataset's gate on it is
-    explicitly ``and extero_source == "depth"``. A height-scan recording therefore falls
-    through both, and ``FlowMatchingConfig.noise_height_scan`` (0.1 m by default) stays live --
-    silently adding 4 grid cells of vertical error to a signal recorded precisely to be exact.
+    The complement of :attr:`extero_corrupted`, which is depth-shaped: it says "the recorded
+    depth already carries the sim's DR", so a height-scan recording fell through it entirely.
 
     True when every source of corruption is provably absent: the scanner has no drift ranges,
     no event term randomises it, and the reading goes through the raw obs function rather than
-    the observation manager's noise pipeline. The FM dataset zeroes the source's noise field
-    when this is set, so "noise-free" is a property of the ARTIFACT rather than of remembering
-    to pass a flag -- and it lands in ``params/fm_config.yaml`` and the checkpoint, where it
-    can be audited after the fact."""
+    the observation manager's noise pipeline. Set by the recorder, so "noise-free" is a property
+    of the ARTIFACT rather than of remembering to pass a flag -- and it lands in
+    ``params/fm_config.yaml`` and the checkpoint, where it can be audited after the fact.
+
+    INFORMATIONAL ONLY now, like :attr:`extero_corrupted`: it used to zero the FM's own noise
+    field, and that field is gone."""
     history_anchor: str = ""
     """Which frame each ``history_state`` row's root pose is, i.e. what the history is OBSERVED
     relative to.

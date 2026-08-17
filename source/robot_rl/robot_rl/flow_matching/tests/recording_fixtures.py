@@ -292,8 +292,13 @@ def camera_spec(n_cameras: int, height: int, width: int) -> list[dict]:
             "obs_term": f"depth_cam{i}",
             "sensor": f"cam{i}",
             "mount_body": "torso_link",
-            "offset_pos": [0.0, 0.0, 0.0],
-            "offset_quat_xyzw": [0.0, 0.0, 0.0, 1.0],
+            # Forward of and above the mount, pitched 45 deg DOWN -- not the identity pose it
+            # used to be. A camera whose boresight is horizontal never meets the ground, so it
+            # has no geometric xyz offset and the contract normalization refuses it; the real
+            # pair looks 65 and 35 deg down. The numbers are nominal, but the posture is not
+            # optional.
+            "offset_pos": [0.1, 0.0, 0.1],
+            "offset_quat_xyzw": [0.0, 0.3826834, 0.0, 0.9238795],
             "width": width,
             "height": height,
             "fx": 1.0,

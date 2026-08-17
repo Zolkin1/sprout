@@ -152,7 +152,10 @@ class FlowMatchingTransformer(nn.Module):
             extero_grid_ordering=cfg.extero_grid_ordering,
             extero_fourier_bands=cfg.extero_fourier_bands,
             extero_miss_sentinel=cfg.extero_miss_sentinel,
-            extero_channels=cfg.extero_channels,
+            # RESOLVED, not read: the field is None until the dataset settles it from the
+            # source, and a hand-built cfg (a test, a reload of a partial dict) still carries
+            # that None.
+            extero_channels=cfg.resolve_extero_channels(),
             extero_camera_intrinsics=cfg.extero_camera_intrinsics,
             attention_mode=cfg.attention_mode,
         )

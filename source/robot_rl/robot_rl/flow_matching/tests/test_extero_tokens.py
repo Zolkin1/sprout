@@ -72,8 +72,15 @@ def _synthetic_recording(n_ep=3, W_ep=5, nj=4, K=2, F=6, H=4, Ksc=7, depth=None,
 
 
 def _cfg(**kw) -> FlowMatchingConfig:
+    #: ``extero_channels=1`` rather than the shipped default of 5, because this module's robot
+    #: is four joints called ``j0..j3``: the xyz channels rebuild the camera pose with real FK
+    #: over the G1's MJCF, which cannot resolve a fake kinematic tree. The token, sanitize and
+    #: source-selection contracts these tests pin are channel-independent. The DEFAULT path is
+    #: covered on a real 29-joint recording by ``test_depth_xyz_offline``'s
+    #: ``test_the_shipped_default_widens_a_depth_row_to_five_channels``.
     base = dict(num_history_states=2, future_len=6, cmd_array="target_vel", cmd_stride=4,
-                target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0)
+                target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
+                extero_channels=1)
     base.update(kw)
     return FlowMatchingConfig(**base)
 
@@ -91,12 +98,17 @@ def test_default_source_is_depth():
     assert FlowMatchingConfig().extero_source == "depth"
 
 
-def test_noise_knob_follows_the_source():
-    """Each source has its own amplitude -- metres vs normalised depth units."""
-    assert _cfg(extero_source="height_scan").noise_extero == pytest.approx(
-        FlowMatchingConfig().noise_height_scan)
-    assert _cfg(extero_source="depth").noise_extero == pytest.approx(
-        FlowMatchingConfig().noise_depth)
+def test_there_is_no_train_time_exteroception_noise():
+    """The sensor model is the RL env's DR, and the FM must not add a second one.
+
+    Pinned as a test rather than left to the absence of a field: the knobs (``noise_depth``,
+    ``noise_height_scan``, the ``noise_extero`` property) were removed because a scalar uniform
+    term on top of the recording's structured DR over-noised the one signal the generator uses
+    to place a reference on terrain -- and re-adding one would look like a feature.
+    """
+    cfg = FlowMatchingConfig()
+    for gone in ("noise_depth", "noise_height_scan", "noise_extero"):
+        assert not hasattr(cfg, gone), f"{gone} is back; exteroception noise belongs to the RL DR."
 
 
 def test_unknown_source_is_rejected():
@@ -108,7 +120,7 @@ def test_unknown_source_is_rejected():
 def test_old_checkpoint_config_still_loads():
     """A config dict predating the selector resolves to the height-scan path."""
     d = FlowMatchingConfig().to_dict()
-    for k in ("extero_source", "extero_sensor_count", "noise_depth"):
+    for k in ("extero_source", "extero_sensor_count", "extero_channels"):
         d.pop(k, None)
     cfg = FlowMatchingConfig.from_dict(d)
     assert cfg.extero_source == "height_scan" and cfg.extero_sensor_count == 1

@@ -19,7 +19,12 @@ EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
 EXTERO_ENCODERS: tuple[str, ...] = ("mlp", "cnn")
 
 #: Recognised :attr:`FlowMatchingConfig.extero_norm_mode` values.
-EXTERO_NORM_MODES: tuple[str, ...] = ("per_element", "per_sensor", "metric")
+#:
+#: ``per_element`` (one fitted statistic per pixel) is GONE. A per-pixel affine is a spatially
+#: varying transform applied before a shared convolution kernel sees the image, which is
+#: exactly what weight sharing assumes away -- the same step edge at row 5 and row 15 arrives
+#: as two different patterns. It was the historical default and nothing wants it back.
+EXTERO_NORM_MODES: tuple[str, ...] = ("contract", "per_channel", "per_sensor", "metric")
 
 #: Default symmetric clip band per :data:`EXTERO_SOURCES` entry, applied by
 #: ``transforms.sanitize_extero`` before normalization.
@@ -28,7 +33,14 @@ EXTERO_NORM_MODES: tuple[str, ...] = ("per_element", "per_sensor", "metric")
 #: overridable per run via :attr:`FlowMatchingConfig.extero_clip`; ``transforms`` re-exports
 #: the two scalars under their historical names. Depth's band is in NORMALISED units (the obs
 #: term already applied ``(d - 0.75) * 0.5``), the scan's in metres -- which is why they differ.
-EXTERO_CLIP: dict[str, float] = {"height_scan": 1.0, "depth": 2.0}
+#:
+#: Depth's 5.575 is MEASURED, not a round number: at the old +-2.0 the band saturated at 4.75 m
+#: of range while the far camera sees 11.9 m, clipping 1.30% of its pixels and touching 13.8%
+#: of windows, against a 99th percentile of 5.22 m. Recordings store depth UNCLIPPED, so
+#: widening this recovers signal already on disk; 5.575 measures 0.00% saturated. Changing it
+#: re-resolves any checkpoint that stored ``extero_clip=None``, which is why ``train.py``
+#: prints the band it resolved.
+EXTERO_CLIP: dict[str, float] = {"height_scan": 1.0, "depth": 5.575}
 
 #: Recognised :attr:`FlowMatchingConfig.attention_mode` values.
 ATTENTION_MODES: tuple[str, ...] = ("full", "prefix")
@@ -288,7 +300,14 @@ class FlowMatchingConfig:
     #: the width of one sensor's row as the model receives it. Anything comparing that width
     #: against an image shape has to divide by this first -- see ``check_extero_encoder``.
     #: Meaningless for the MLP encoder and for the height scan.
-    extero_channels: int = 1
+    #:
+    #: ``None`` means RESOLVE FROM THE SOURCE (:meth:`resolve_extero_channels`): 5 for depth,
+    #: 1 for a height scan, whose rays already ARE ground points. Same idiom as
+    #: ``extero_encoder="auto"`` and ``extero_clip=None`` -- one default that is correct for
+    #: either sensor, rather than a number that is right for one and a hard error for the
+    #: other. The dataset resolves it and writes the int back, so a checkpoint always states
+    #: a number and every consumer downstream reads one.
+    extero_channels: int | None = None
     #: Per-camera ``(fx, fy, cx, cy)``, DERIVED from the recording's ``depth_camera_spec``,
     #: enabling the angular token position embedding. Per camera and not shared: the G1's two
     #: are 100x70 deg and 70x42 deg, so one set would mislabel the narrower one's tokens by
@@ -317,13 +336,17 @@ class FlowMatchingConfig:
     # "16 tokens beat 1", since ``[1, 1]`` gives the legacy token count through a conv trunk.
     extero_cnn_grid: list[int] | None = None
     # Per-layer convolution STRIDE, one entry per ``extero_cnn_channels`` entry. ``None`` means
-    # stride 2 everywhere, which is the shipped depth behaviour and leaves every existing
-    # checkpoint's architecture unchanged. A LEADING stride-1 layer is what lets a dense metric
-    # scan keep its full resolution through the first stage while the stack still lands on a
-    # small token grid: 121 -> 121 -> 61 -> 31 -> 16 under (1, 2, 2, 2). The grid target and
-    # this list are coupled -- changing one without the other silently changes the transformer's
-    # sequence length.
-    extero_cnn_strides: list[int] | None = None
+    # stride 2 everywhere. A LEADING stride-1 layer keeps full resolution through the first
+    # stage while the stack still lands on a small token grid: 121 -> 121 -> 61 -> 31 -> 16
+    # under (1, 2, 2, 2) for a dense scan, and 26x30 -> 26x30 -> 13x15 -> 7x8 for the cameras.
+    # The grid target and this list are coupled -- changing one without the other silently
+    # changes the transformer's sequence length.
+    #
+    # Default (1, 2, 2): 56 tokens per camera rather than the 16 that (2, 2, 2) gives, because
+    # the first stage convolves the image at its native 26x30 instead of throwing three
+    # quarters of it away before the first non-linearity. Sequence length 191 for the G1's two
+    # cameras.
+    extero_cnn_strides: list[int] | None = field(default_factory=lambda: [1, 2, 2])
     # ``[size_x, size_y]`` metric extents of a robot-centred exteroception grid, DERIVED from
     # the recording's ``height_scan_spec`` (never typed). When set, the encoder appends each
     # pixel's ``(x, y)`` offset in METRES as two input channels and adds a Fourier embedding of
@@ -345,22 +368,65 @@ class FlowMatchingConfig:
     # constant, so the raw std collapses toward the base Normalizer eps (1e-6) and blows up
     # normalization; a larger floor (~1e-2 m) keeps a near-flat scan well-scaled.
     extero_norm_eps: float = 1e-2
-    # How the exteroception normalizer is FIT.
-    #   "per_element" -- one (mean, std) per pixel/ray, the original behaviour.
-    #   "per_sensor"  -- one (mean, std) per sensor, broadcast back over its elements.
-    # This matters for the CNN and not at all for the MLP. A per-pixel affine is a
-    # spatially VARYING transform applied before the convolution sees the image, which is
-    # exactly what weight sharing assumes away: the same step edge at row 5 and row 15
-    # arrives as two different patterns. ``extero_norm_eps`` compounds it -- a pixel that
-    # almost always reads the far-clip sentinel gets a floored std, so its rare real
-    # readings become large outliers that one shared kernel then propagates across a whole
-    # feature map, where a per-pixel Linear just learned a small weight.
-    #
-    # The stored statistics keep their ``(T*K,)`` shape either way (the per-sensor value is
-    # broadcast into it), so the Normalizer, the checkpoint, the folded ONNX normalization
-    # and the whole deploy path are shape-identical -- only the numbers change.
+    # How the exteroception normalizer is FIT. Every mode is UNIFORM OVER PIXELS, which is the
+    # property a shared convolution kernel needs (see :data:`EXTERO_NORM_MODES` for why the old
+    # per-pixel mode is gone); they differ in how much else they pool over.
+    #   "contract"    -- NOTHING is fitted. The default for depth. Every constant is derived
+    #                    from the camera contract and the robot's nominal stance, so it is the
+    #                    same number in every recording of the same robot:
+    #                      * ``d`` -- IDENTITY. It arrives already declared-normalised,
+    #                        ``(depth - 0.75) * 0.5`` out of the contract, and clipped to
+    #                        ``extero_clip``. Fitting it again would make a contract constant
+    #                        a property of a dataset.
+    #                      * ``xyz`` -- ONE declared scale (``extero_xyz_scale``) shared by both
+    #                        cameras and all three axes, so a metre reads the same number
+    #                        everywhere -- including ACROSS cameras, which matters because both
+    #                        feed one transformer and the model has to compare them. The OFFSET
+    #                        is per camera and geometric: the boresight's intersection with the
+    #                        nominal ground plane (``extero_xyz_offset``, derived at dataset
+    #                        build, rounded, recorded). Per camera because the two look 65 and
+    #                        35 degrees down from different heights, so one shared offset
+    #                        cannot centre both.
+    #                      * ``v`` -- identity, as in every mode.
+    #                    The cost, stated plainly: the offsets centre the NOMINAL flat-ground
+    #                    view, not whatever terrain a recording happened to sample, so on
+    #                    stairs and drop-offs the empirical centroid sits some way off. The
+    #                    dataset PRINTS declared-vs-measured so that gap is visible rather than
+    #                    assumed; widen ``nominal_range_m`` if it matters.
+    #   "per_channel" -- one fitted (mean, std) per sensor per CHANNEL GROUP.
+    #   "per_sensor"  -- one (mean, std) per sensor, pooled across channels too.
     #   "metric"      -- a FIXED declared affine ``(x - extero_norm_offset) / extero_norm_scale``,
     #                    no fitting at all.
+    #
+    # ``per_channel`` exists because a 5-channel depth row is not one quantity: channel 0 is
+    # normalised depth (band +-5.575), channels 1-3 are metres out to ~11 m, channel 4 is an
+    # indicator in {0, 1}. ``per_sensor`` pools all of them into one statistic whose std is
+    # dominated by xyz, which compresses depth and squashes validity toward invisibility.
+    # The GROUPS are the fix, and they are not simply per channel:
+    #   * ``d``       -- its own statistic.
+    #   * ``x, y, z`` -- ONE SCALE across all three, so a metre stays a metre in every
+    #                    direction; a per-axis scale would rescale the axes against each other
+    #                    and destroy the metric comparability the channels exist to provide.
+    #                    The OFFSET stays per axis: subtracting one is a rigid translation of
+    #                    the cloud, so it preserves every relative distance, and it actually
+    #                    centres the channel. Sharing it does not -- measured on the far
+    #                    camera, x sits at +6.66 m and z at -3.88 m around a pooled +0.79, so
+    #                    one offset parks them at +1.94 and -1.55 sigma before the first conv.
+    #   * ``v``       -- NOT standardized at all (``standardize_mask`` False). It is already
+    #                    0/1; fitting it would map "valid" and "invalid" to two arbitrary
+    #                    values that drift with the invalid RATE of whatever recording was
+    #                    used, and a run on cleaner data would hand the network a different
+    #                    number for the same fact.
+    # For a 1-channel sensor (any height scan) ``per_channel`` is identical to ``per_sensor``.
+    #
+    # The stored statistics keep their ``(T*K,)`` shape in every mode (the pooled value is
+    # broadcast back into it), so the Normalizer, the checkpoint, the folded ONNX
+    # normalization and the whole deploy path are shape-identical -- only the numbers change.
+    #
+    # ``extero_norm_eps`` matters here: a pixel that almost always reads the far-clip sentinel
+    # would get a floored std under a per-pixel fit, so its rare real readings became large
+    # outliers that one shared kernel then propagated across a whole feature map. Pooling
+    # removes that failure mode rather than flooring it.
     #
     # "metric" is the mode for a privileged metric height map. Both fitted modes make the input
     # scale a property of the TRAINING SET rather than of the world: the same terrain maps to
@@ -368,7 +434,36 @@ class FlowMatchingConfig:
     # depends on what it happened to be trained on. A declared affine removes that, and brings
     # the scan to parity with depth -- whose first stage, ``(d - 0.75) * 0.5`` inside
     # ``mdp.depth_image``, has always been declared constants carried in the camera contract.
-    extero_norm_mode: str = "per_element"
+    #
+    # That critique applies to ``per_channel`` as well and is the known cost of the default: it
+    # is fitted, so the depth and xyz scales are properties of the recording. The trade is
+    # deliberate -- one declared scale cannot serve channels in three different unit systems,
+    # and the group structure is what keeps the axes mutually comparable. Declaring a scale PER
+    # GROUP would get both, and is the obvious next step if recording-to-recording drift ever
+    # shows up as a real effect.
+    extero_norm_mode: str = "contract"
+    #: Declared divisor for the xyz channels under ``extero_norm_mode="contract"``, in metres.
+    #: ONE constant for every camera and every axis -- that sharing is the whole point, since a
+    #: per-camera or per-axis divisor would make a metre mean different things in different
+    #: parts of the same input. 3.0 puts the far camera's full max-range cone inside ~3.2 and
+    #: the near camera's inside ~2.4.
+    extero_xyz_scale: float = 3.0
+    #: Per-camera xyz offset in metres, ``[[x, y, z], ...]`` in sensor order. DERIVED at dataset
+    #: build from the camera contract plus the robot's nominal stance (the boresight's
+    #: intersection with the nominal ground plane, rounded to 5 cm) and written back, so the
+    #: checkpoint carries the constants it trained under and ``fm.onnx`` folds them into its
+    #: normalization like any other affine. ``None`` until the dataset resolves it.
+    extero_xyz_offset: list[list[float]] | None = None
+    #: Nominal ground plane, metres below the pelvis at zero joints. DERIVED from FK on
+    #: ``fk_model_path`` (the ankle roll link, plus the sole) unless set. The one constant here
+    #: that answers to the ROBOT rather than to the camera, and it is equally declared.
+    extero_nominal_ground_z: float | None = None
+    #: Symmetric bound on the NORMALISED xyz channels, derived from each camera's own max-range
+    #: cone post-offset and rounded up. A safety net, not a band: because the depth channel is
+    #: already clipped to ``extero_clip``, no physically reachable point can reach it, and the
+    #: dataset asserts that. It exists so a numerical accident cannot reach a convolution --
+    #: sizing it to bind on real geometry would repeat the mistake the +-2.0 depth band made.
+    extero_xyz_clip: float | None = None
     # The declared affine for ``extero_norm_mode="metric"``. The default divides by 1.0, i.e.
     # the network input IS metres -- which is the point, and makes the value directly readable
     # in a diagnostic. Recorded into the checkpoint so the band a run trained under is auditable.
@@ -515,14 +610,22 @@ class FlowMatchingConfig:
     noise_scale: float = 1.0
     # Per-element exteroception noise. The token is a real sensor at deploy, so noise it
     # in training too. Applied independently per element, train split only.
-    # ``noise_height_scan`` is metres of ground clearance and matches the RL policy's
-    # height_scan Unoise(±0.1). ``noise_depth`` is in the depth obs's NORMALISED units
-    # -- ``mdp.depth_image`` already applies ``(d - 0.75) * 0.5``, so 0.05 here is 0.1 m
-    # of range, matching the scan. The depth cameras additionally carry their own sensor
-    # DR (plane tilt, blur, dropout, extrinsics/intrinsics jitter) from the RL env, which
-    # is baked into the recording -- this term is on top of that.
-    noise_height_scan: float = 0.1   # m                (RL match)
-    noise_depth: float = 0.05        # normalised units (= 0.1 m)
+    # NO train-time exteroception noise. There used to be ``noise_height_scan`` (0.1 m) and
+    # ``noise_depth`` (0.05 normalised = 0.1 m), added per element on top of whatever the
+    # recording already carried; both are gone, along with the two gates that tried to keep
+    # them from double-counting (``extero_corrupted``, ``extero_noise_free``).
+    #
+    # The sensor model belongs to the RL env and nowhere else. The cameras already carry
+    # structured DR -- per-episode plane tilt and blur sigma, extrinsics/intrinsics jitter,
+    # per-step additive noise and 2.5% dropout -- and that corruption is baked into the
+    # recording, so a scalar uniform term on top was over-noising the one signal the generator
+    # uses to place a reference on terrain. It was also incoherent for the privileged scan,
+    # where 0.1 m is four cells of a 0.025 m grid: the vertical channel quantised coarser than
+    # the step edge being localised, in a run whose entire point was an exact ground truth.
+    #
+    # This is deliberately NOT the history/reference-window noise (``noise_scale`` and
+    # ``window.REFERENCE_WINDOW_NOISE``), which models the generator's own prediction error
+    # feeding back into its history at deploy -- exposure bias, not a sensor.
 
     # -- flow --
     num_sampling_steps: int = 8
@@ -672,15 +775,60 @@ class FlowMatchingConfig:
             return 0
         return math.ceil(self.future_len / self.cmd_stride)
 
-    @property
-    def noise_extero(self) -> float:
-        """Per-element train-time noise for the selected exteroception source.
+    def resolve_extero_channels(self) -> int:
+        """Settle :attr:`extero_channels`, expanding ``None`` from the source.
+
+        A depth pixel is a ray, and the channels state where that ray landed; a height scan's
+        rays already ARE ground points, so widening one is meaningless and the dataset refuses
+        it. One default therefore cannot be a number -- it has to resolve per source, the same
+        way :meth:`resolve_extero_encoder` and :meth:`resolve_extero_clip` do.
 
         Returns:
-            ``noise_height_scan`` (metres) or ``noise_depth`` (normalised units).
+            5 for depth (``[d, x, y, z, v]``), 1 for a height scan, or the explicit value.
+
+        Raises:
+            ValueError: On an unknown ``extero_source``, or a channel count the depth path
+                does not emit.
         """
         self.check_extero_source()
-        return self.noise_height_scan if self.extero_source == "height_scan" else self.noise_depth
+        if self.extero_channels is None:
+            return 5 if self.extero_source == "depth" else 1
+        channels = int(self.extero_channels)
+        if channels not in (1, 4, 5):
+            raise ValueError(
+                f"extero_channels={channels} is not supported; the depth path emits 1 (depth "
+                "alone), 4 (depth + xyz) or 5 (plus validity)."
+            )
+        if channels > 1 and self.extero_source != "depth":
+            raise ValueError(
+                f"extero_channels={channels} but extero_source={self.extero_source!r}. The "
+                "extra planes are a pixel's xyz from the pinhole model; a height scan's rays "
+                "already are ground points."
+            )
+        return channels
+
+    def extero_channel_groups(self) -> tuple[tuple[str, ...], ...]:
+        """Channel names grouped as ``extero_norm_mode="per_channel"`` standardizes them.
+
+        The grouping is the whole content of that mode, so it lives here rather than inline in
+        the dataset: ``xyz`` share ONE statistic (a metre must stay a metre in every direction,
+        and per-axis fits would squeeze downrange hardest), while ``d`` gets its own and ``v``
+        is left alone as an indicator.
+
+        Returns:
+            One tuple of channel names per group, in row order. ``v`` is returned in its own
+            group; the caller is what knows it must not be standardized.
+        """
+        names = [str(n) for n in self.extero_channel_names]
+        groups: list[tuple[str, ...]] = []
+        xyz = tuple(n for n in ("x", "y", "z") if n in names)
+        for name in names:
+            if name in xyz:
+                if xyz not in groups:
+                    groups.append(xyz)
+            else:
+                groups.append((name,))
+        return tuple(groups)
 
     def check_extero_source(self) -> None:
         """Raise if :attr:`extero_source` is not a recognised source.
@@ -803,9 +951,7 @@ class FlowMatchingConfig:
                 f"extero_image_hw lists {len(self.extero_image_hw)} shape(s) but there are "
                 f"{self.extero_sensor_count} sensor(s)."
             )
-        channels = int(self.extero_channels)
-        if channels < 1:
-            raise ValueError(f"extero_channels must be >= 1, got {channels}.")
+        channels = self.resolve_extero_channels()
         if len(self.extero_channel_names) != channels:
             raise ValueError(
                 f"extero_channel_names {list(self.extero_channel_names)} has "

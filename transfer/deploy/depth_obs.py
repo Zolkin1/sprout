@@ -455,10 +455,21 @@ def unproject_to_yaw_frame(
     """A normalised depth image -> its 3-D points in the root's yaw-aligned frame.
 
     The frame is the FM's own anchor frame (``flow_matching.transforms``): origin at the
-    root link, axes yaw-aligned, the root's roll and pitch RETAINED in the coordinates --
-    so tilting the pelvis moves the points, which is correct, because the terrain did not
-    move.  Expressing the cloud there is what lets the generator compare "the step edge is
-    at x = 0.8" against its own predicted base position in the same numbers.
+    root link, axes yaw-aligned, so the frame's z IS gravity and the frame itself carries no
+    roll and no pitch.
+
+    **Static terrain therefore keeps its coordinates when the robot tilts**, and that
+    invariance is the whole reason these channels exist.  A pelvis pitch rewrites every
+    pixel of the image, but it moves the CAMERA by exactly the same amount, and the pose the
+    caller supplies moves with it -- so composing the two puts the step edge back at the
+    coordinate it already had.  The network sees neither joint angles nor root orientation,
+    so this is a registration it cannot perform for itself from depth alone.
+
+    What a tilt does move is the robot's own geometry within the level frame: the camera,
+    and the limbs the cameras can see.  The tilt therefore stays observable; it just stops
+    being confusable with the terrain moving.  Expressing the cloud here is also what lets
+    the generator compare "the step edge is at x = 0.8" against its own predicted base
+    position in the same numbers.
 
     **Nothing here needs a world pose.** The caller supplies the camera pose already in that
     frame, and the heading cancels out of it: writing ``R_world_root = Rz(psi) @ R_rp``, a
@@ -466,6 +477,11 @@ def unproject_to_yaw_frame(
     So a deployment needs only forward kinematics from the root to the camera and the root's
     roll/pitch (i.e. gravity, from the IMU) -- never odometry, and a drifting yaw estimate
     cannot corrupt the result.
+
+    That is a statement about the COMPUTATION, not an invariance: the frame turns with the
+    robot, so yawing in place does rotate a static point's coordinates by ``-psi``.  It is
+    the window the generator predicts turning with them that makes this consistent, not the
+    cloud standing still.
 
     Depth is converted to ray LENGTH before it is projected out
     (``distance_to_image_plane`` is the perpendicular z-depth, and

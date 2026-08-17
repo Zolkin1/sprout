@@ -223,12 +223,13 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument(
         "--extero_norm_mode", type=str, default=FlowMatchingConfig().extero_norm_mode,
         choices=list(EXTERO_NORM_MODES),
-        help="How the exteroception is scaled. 'per_element' is one fitted (mean, std) per "
-             "pixel -- the original behaviour, and a spatially VARYING transform, which is "
-             "what a convolution's weight sharing assumes away. 'per_sensor' pools one fitted "
-             "(mean, std) per sensor and broadcasts it, so the same edge looks the same "
-             "wherever it sits. 'metric' uses a DECLARED affine and no fit at all, so the "
-             "input is metres/scale and is identical across recordings -- both fitted modes "
+        help="How the exteroception is scaled. Every mode is uniform over PIXELS, which is "
+             "what a convolution's weight sharing needs. 'per_channel' (default) fits one "
+             "(mean, std) per sensor per channel group -- d alone, xyz together so a metre "
+             "stays a metre in every direction, and v left as an identity because it is "
+             "already 0/1. 'per_sensor' pools across channels too, which lets xyz dominate the "
+             "std and squashes validity. 'metric' uses a DECLARED affine and no fit at all, so "
+             "the input is metres/scale and is identical across recordings -- both fitted modes "
              "make a checkpoint's notion of '1 m' a property of its training set. Irrelevant "
              "to --extero_encoder mlp.")
     parser.add_argument(
@@ -245,18 +246,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "because the generator has its own scanner, so the teacher's clip=(-1,1) obs "
              "terms and the critic's input distribution are untouched. The dataset PRINTS the "
              "saturation and miss fractions it measured, so pick this from a run's own log.")
-    parser.add_argument(
-        "--noise_height_scan", type=float, default=None,
-        help="Train-time uniform noise amplitude on a height-scan reading, in metres "
-             "(default 0.1). Set 0 for a privileged noise-free scan -- and note a recording "
-             "stamped extero_noise_free already zeroes it, so this is only for deliberately "
-             "ADDING noise back as an ablation. Do NOT use --no-obs_noise for this: that also "
-             "kills the history noise and changes two variables at once.")
-    parser.add_argument(
-        "--noise_depth", type=float, default=None,
-        help="Train-time uniform noise amplitude on a depth reading, in normalised units "
-             "(default 0.05 = 0.1 m). Forced to 0 when the recording already carries the sim's "
-             "depth DR (extero_corrupted).")
+    # --noise_height_scan / --noise_depth are GONE: there is no train-time exteroception noise
+    # any more. The sensor model belongs to the RL env, whose DR is already in the recording.
     parser.add_argument(
         "--reference_blocks", type=str, default=None,
         help="Comma-separated reference-window blocks the generator predicts, out of "
@@ -455,10 +446,6 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     # with an argparse default.
     if args.extero_clip is not None:
         cfg.extero_clip = float(args.extero_clip)
-    if args.noise_height_scan is not None:
-        cfg.noise_height_scan = float(args.noise_height_scan)
-    if args.noise_depth is not None:
-        cfg.noise_depth = float(args.noise_depth)
     return cfg, args
 
 
@@ -816,13 +803,16 @@ def main() -> None:
                  if cfg.extero_miss_sentinel is not None else "")
               + ". A shared kernel is translation-equivariant, so without this it cannot "
                 "represent WHERE an edge is.")
-    # The noise that actually reaches the exteroception token, after every gate above.
-    print(f"[INFO] extero={cfg.extero_source} noise: {cfg.noise_extero:g} "
-          f"x noise_scale {cfg.noise_scale:g} "
-          f"(obs_noise={'on' if cfg.obs_noise else 'OFF'}) -> "
-          f"{'NO noise reaches the exteroception token' if not (cfg.obs_noise and cfg.noise_extero) else 'noise IS applied'}"
-          f"; recording extero_noise_free="
-          f"{bool(getattr(meta, 'extero_noise_free', False))}.")
+    # The band and the scaling, stated because BOTH are resolved rather than typed: the clip
+    # comes from the per-source default when a run does not name one, so a log line is the only
+    # place a checkpoint's band is attributable after the fact.
+    print(f"[INFO] extero={cfg.extero_source} clip=+-{cfg.resolve_extero_clip():g} "
+          f"({'declared' if cfg.extero_clip is not None else 'per-source default'}), "
+          f"norm_mode={cfg.extero_norm_mode}, channels={cfg.extero_channels} "
+          f"{list(cfg.extero_channel_names)}. NO train-time exteroception noise: the sensor "
+          f"model is the RL env's DR, already in the recording (extero_corrupted="
+          f"{bool(getattr(meta, 'extero_corrupted', False))}, extero_noise_free="
+          f"{bool(getattr(meta, 'extero_noise_free', False))}).")
     # Stated in the log because a checkpoint carries no structural evidence of it -- the two
     # attention modes share one parameter set, so this line is how a run's architecture stays
     # attributable after the fact.

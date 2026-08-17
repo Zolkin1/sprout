@@ -824,16 +824,19 @@ def test_online_roundtrip_with_the_cnn_encoder():
     H, W = 26, 30
     data, meta, nj, K, F, state_dim = _synthetic_recording(depth=(2, H, W))
     N = 2
+    # extero_channels=1: the fixture's robot has four fake joints and the xyz channels need
+    # real FK over the G1's MJCF. The fold/reload contract under test is channel-independent.
     cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel",
                              cmd_stride=4, extero_source="depth", extero_encoder="cnn",
-                             extero_norm_mode="per_sensor",
+                             extero_norm_mode="per_sensor", extero_channels=1,
                              target_source="ego_anchored_clip_future", val_fraction=0.2,
                              seed=0, d_model=32, nhead=4, num_layers=2, dim_feedforward=64)
     train, _ = build_train_val(data, meta, cfg)
     # The dataset must have DERIVED the geometry -- nothing above stated it.
     assert cfg.extero_image_hw == [[H, W], [H, W]]
     assert cfg.extero_sensor_count == 2 and cfg.extero_sensor_dim == H * W
-    assert cfg.tokens_per_sensor == 16 and cfg.extero_seq_tokens == 32
+    # 7x8 per camera under the default strides (1, 2, 2) on 26x30, two cameras -> 112 tokens.
+    assert cfg.tokens_per_sensor == 56 and cfg.extero_seq_tokens == 112
     # Through from_config: the reload under test goes through it, so building the saved model
     # any other way compares two different architectures and reports it as missing keys.
     model = FlowMatchingTransformer.from_config(cfg).eval()
