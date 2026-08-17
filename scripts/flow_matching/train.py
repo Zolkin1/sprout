@@ -144,7 +144,11 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "26x30 to 4x4; a fourth reaches 2x2 natively, which is the cheaper way to "
              "shrink the sequence (pooling pays for the resolution and then discards it).")
     parser.add_argument(
-        "--extero_cnn_grid", type=str, default="",
+        "--extero_cnn_grid", type=str,
+        # Rendered from the dataclass for the same reason --extero_cnn_strides is: a literal
+        # default here SHADOWS the field. It happens to agree today (both mean "no pooling"),
+        # which is exactly what would make the next divergence silent.
+        default=",".join(str(g) for g in (FlowMatchingConfig().extero_cnn_grid or [])),
         help="Optional 'gh,gw' to average-pool the conv trunk down to, i.e. tokens per "
              "camera. Empty keeps the trunk's native grid. This is the knob that separates "
              "'a CNN beats an MLP' from '16 tokens beat 1': '1,1' gives the legacy token "
@@ -229,6 +233,29 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "--extero_cnn_channels; a run that deepens the trunk states both. The grid "
              "target and this list are coupled, so changing one alone changes the "
              "transformer's sequence length.")
+    parser.add_argument(
+        "--extero_xyz_scale", type=float, default=FlowMatchingConfig().extero_xyz_scale,
+        help="Declared divisor for the xyz channels under --extero_norm_mode contract, in "
+             "metres. ONE constant for every camera and every axis -- that sharing is the "
+             "point, since a per-camera or per-axis divisor makes a metre mean different "
+             "things in different parts of the same input.")
+    parser.add_argument(
+        "--extero_nominal_ground_z", type=float,
+        default=FlowMatchingConfig().extero_nominal_ground_z,
+        help="Nominal ground plane, metres below the pelvis at zero joints, used to place "
+             "each camera's declared xyz offset where its boresight meets the ground. "
+             "Default: derived by FK from --fk_model_path (the ankle roll link, less the "
+             "sole). Lowering it pushes the offsets FARTHER along each boresight, so it is "
+             "one way to answer a large declared-vs-measured residual -- but it declares a "
+             "ground plane that is not the ground; prefer stating --extero_xyz_offset.")
+    parser.add_argument(
+        "--extero_xyz_offset", type=str, default="",
+        help="Declared per-camera xyz offsets in metres, overriding the derivation: "
+             "'x,y,z;x,y,z' in sensor order (semicolons between cameras). The escape hatch "
+             "when the boresight-on-nominal-ground default does not centre the data -- the "
+             "dataset prints declared-vs-measured per camera at build, so set this from that "
+             "line. Empty derives them. Stating them keeps the constant DECLARED and recorded "
+             "in the run's config, which fitting the normalizer would not.")
     parser.add_argument(
         "--extero_norm_mode", type=str, default=FlowMatchingConfig().extero_norm_mode,
         choices=list(EXTERO_NORM_MODES),
@@ -439,6 +466,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                             or None),
         extero_norm_mode=args.extero_norm_mode,
         extero_norm_scale=args.extero_norm_scale,
+        extero_xyz_scale=args.extero_xyz_scale,
+        extero_nominal_ground_z=args.extero_nominal_ground_z,
+        # ``None`` (not ``[]``) when unset: the dataset derives the offsets only when the
+        # field is None, and an empty list would read as "zero cameras stated" and trip the
+        # per-camera count check instead.
+        extero_xyz_offset=([[float(v) for v in cam.split(",")]
+                            for cam in args.extero_xyz_offset.split(";") if cam.strip()]
+                           or None),
         pinned_axis_loss_weight=args.pinned_axis_loss_weight,
         state_scale_base_pos=args.state_scale_base_pos,
         state_scale_base_lin_vel=args.state_scale_base_lin_vel,
