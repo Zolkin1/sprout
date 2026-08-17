@@ -540,6 +540,60 @@ def unproject_to_yaw_frame(
             + np.asarray(cam_pos, dtype=np.float64).reshape(3, 1))
 
 
+def depth_xyz_rows_np(
+    spec: list[dict], image: np.ndarray, poses: list[tuple], channels: int = 4
+) -> np.ndarray:
+    """Widen per-camera depth images to ``[d, x, y, z]`` (optionally ``+ v``) rows.
+
+    The deploy twin of ``FutureStateDataset._depth_xyz_rows`` and of the live Isaac term
+    ``mdp.depth_xyz_stack``: one flat row per camera, CHANNEL-MAJOR, which is the layout
+    ``flow_matching.extero_encoder.images_from_flat`` folds and every other producer emits.
+    Interleaving would scramble every convolution kernel while every shape stayed right.
+
+    Lives here rather than inside ``GenTrackerPolicy`` because it is a pure function of the
+    contract, the image and the pose -- and because a method on a class that needs two ONNX
+    artifacts to construct is a method nothing can test. This is the seam a train/deploy skew
+    hides in, so it is worth being able to compare against the training path directly.
+
+    Channel 0 is the image UNCHANGED, so the cloud has its wall at exactly the range the depth
+    channel claims; the xyz planes are derived from that same post-clip array rather than from
+    a fresh one.
+
+    Args:
+        spec: The per-camera contract, in row order.
+        image: ``(T, H*W)`` normalised depth, one row per camera.
+        poses: One ``(pos, rot)`` per camera in the root's yaw-aligned frame, contract order.
+        channels: 4 for ``[d, x, y, z]``, 5 to append the validity plane.
+
+    Returns:
+        ``(T, channels * H * W)``, float64.
+
+    Raises:
+        ValueError: On an unsupported channel count, or a pose/camera count mismatch.
+    """
+    if channels not in (4, 5):
+        raise ValueError(
+            f"depth_xyz_rows_np emits 4 ([d, x, y, z]) or 5 (plus validity) channels, got "
+            f"{channels}. 1 channel needs no widening."
+        )
+    if len(poses) != len(spec):
+        raise ValueError(
+            f"{len(poses)} camera pose(s) for {len(spec)} camera(s); one pose per camera, in "
+            "contract order."
+        )
+    rows = []
+    for i, cam in enumerate(spec):
+        flat = np.asarray(image[i], dtype=np.float64).reshape(-1)
+        pos, rot = poses[i]
+        planes = [flat[None, :], unproject_to_yaw_frame(cam, flat, pos, rot)]
+        if channels == 5:
+            # By RANGE, never by equality with the sentinel: the recording is noised and the
+            # noiser's blur leaves a missed pixel NEAR the sentinel rather than on it.
+            planes.append((~invalid_depth_mask(cam, flat)).astype(np.float64)[None, :])
+        rows.append(np.concatenate(planes, axis=0).reshape(-1))
+    return np.stack(rows, axis=0)
+
+
 def sanitize_extero_np(
     values: np.ndarray, source: str, clip: float | None = None
 ) -> np.ndarray:

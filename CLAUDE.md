@@ -247,7 +247,7 @@ meant that day". `extero_channels=None` -> 5 for depth / 1 for a scan
   - **It rides the existing `Normalizer`**, so it is still one `(x − mean)/std` of shape
     `(T*K,)`: the checkpoint, the affine folded into `fm.onnx` and the whole deploy path are
     untouched. Declared instead of measured costs no new plumbing to a robot.
-  - **`extero_xyz_clip` is a safety net, not a band.** Derived from each camera's own cone
+  - **`extero_xyz_envelope` is a safety net, not a band.** Derived from each camera's own cone
     (±5.0 at scale 3.0) and asserted never to bind — sizing it to bite real geometry would
     repeat the ±2.0 depth-band mistake. The envelope comes from the clip band divided by the
     **corner cosine**, NOT from `max_dist`: a valid pixel carries a z-DEPTH, which becomes a ray

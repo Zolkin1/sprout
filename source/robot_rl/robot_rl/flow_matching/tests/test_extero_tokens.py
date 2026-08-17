@@ -287,3 +287,24 @@ def test_dataset_sanitizes_the_selected_array():
     train, _ = build_train_val(data, meta, _cfg(extero_source="depth"))
     assert torch.isfinite(train.extero).all()
     assert torch.isfinite(train.extero_normalizer.mean).all()
+
+
+def test_the_renamed_xyz_envelope_still_loads_under_its_old_key():
+    """``extero_xyz_clip`` -> ``extero_xyz_envelope``, shimmed like every other rename.
+
+    Short-lived name, but a run trained under it exists, and ``from_dict`` drops unknown keys
+    SILENTLY -- so without the mapping the value would vanish and the envelope would look like
+    it had simply re-derived itself. Re-deriving happens to give the same number, which is what
+    would have made the loss invisible.
+    """
+    d = FlowMatchingConfig().to_dict()
+    d.pop("extero_xyz_envelope", None)
+    d["extero_xyz_clip"] = 4.5
+    assert FlowMatchingConfig.from_dict(d).extero_xyz_envelope == pytest.approx(4.5)
+
+
+def test_a_config_carrying_both_names_keeps_the_new_one():
+    """The rename is a shim, not a precedence puzzle: a live key always wins."""
+    d = FlowMatchingConfig().to_dict()
+    d["extero_xyz_envelope"], d["extero_xyz_clip"] = 5.0, 4.5
+    assert FlowMatchingConfig.from_dict(d).extero_xyz_envelope == pytest.approx(5.0)

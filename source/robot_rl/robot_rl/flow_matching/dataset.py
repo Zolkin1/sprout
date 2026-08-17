@@ -1084,7 +1084,7 @@ class FutureStateDataset(Dataset):
                 # the real centroid sits some way off, and that residual is the honest price of
                 # a constant that does not move between recordings. Visible, not assumed.
                 if cfg.extero_xyz_offset is None:
-                    cfg.extero_xyz_offset, cfg.extero_xyz_clip = _resolve_xyz_contract(
+                    cfg.extero_xyz_offset, cfg.extero_xyz_envelope = _resolve_xyz_contract(
                         cfg, self.extero_spec, [str(j) for j in meta.state_joint_names]
                     )
                 view = hs.reshape(hs.shape[0], n_sensors, row_channels, -1)
@@ -1098,7 +1098,7 @@ class FutureStateDataset(Dataset):
                           f"({float((got - want).norm()) / float(cfg.extero_xyz_scale):.2f} of "
                           "the declared scale)")
                 reach = float((view[:, :, 1:4].abs().max()))
-                bound = float(cfg.extero_xyz_clip) * float(cfg.extero_xyz_scale)
+                bound = float(cfg.extero_xyz_envelope) * float(cfg.extero_xyz_scale)
                 if reach > bound:
                     raise ValueError(
                         f"an xyz channel reaches {reach:.2f} m but the declared clamp allows "

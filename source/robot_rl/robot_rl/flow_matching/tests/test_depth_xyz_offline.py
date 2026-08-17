@@ -544,7 +544,7 @@ def test_the_xyz_clamp_cannot_bite_real_geometry():
     """
     train, cfg, n_cam, n_px = _default_channel_dataset()
     xyz = train.extero.reshape(-1, n_cam, 5, n_px)[:, :, 1:4]
-    bound = float(cfg.extero_xyz_clip) * float(cfg.extero_xyz_scale)
+    bound = float(cfg.extero_xyz_envelope) * float(cfg.extero_xyz_scale)
     assert float(xyz.abs().max()) < bound, "the clamp must not bind on real geometry"
 
 

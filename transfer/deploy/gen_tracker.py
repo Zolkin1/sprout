@@ -32,8 +32,7 @@ import numpy as np
 
 from .depth_obs import (
     assert_depth_specs_agree,
-    invalid_depth_mask,
-    unproject_to_yaw_frame,
+    depth_xyz_rows_np,
 )
 from .scan_obs import assert_scan_specs_agree, describe as describe_scan_spec, is_privileged
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
@@ -485,16 +484,9 @@ class GenTrackerPolicy:
                 f"state['fm_camera_pose'] has {len(poses)} entries but the generator reads "
                 f"{len(self._fm_depth_spec)} camera(s)."
             )
-        rows = []
-        for i, cam in enumerate(self._fm_depth_spec):
-            flat = np.asarray(image[i], dtype=np.float64).reshape(-1)
-            pos, rot = poses[i]
-            pts = unproject_to_yaw_frame(cam, flat, pos, rot)          # (3, K)
-            planes = [flat[None, :], pts]
-            if channels == 5:
-                planes.append((~invalid_depth_mask(cam, flat)).astype(np.float64)[None, :])
-            rows.append(np.concatenate(planes, axis=0).reshape(-1))
-        return np.stack(rows, axis=0)
+        # The assembly itself lives in depth_obs, next to the unprojection it uses and where a
+        # test can reach it without two ONNX artifacts -- see depth_xyz_rows_np.
+        return depth_xyz_rows_np(self._fm_depth_spec, image, poses, channels)
 
     def depth_sampling_is_split(self) -> bool:
         """Whether the generator samples the cameras on a different grid than the tracker.

@@ -56,6 +56,11 @@ _LEGACY_KEYS: dict[str, str] = {
     "extero_tokens": "extero_sensor_count",
     "height_dim": "extero_sensor_dim",
     "height_norm_eps": "extero_norm_eps",
+    # Renamed because the old name lied: it is a derived bound that is ASSERTED, never
+    # applied, and "clip" reads as a transform on the data. Short-lived, but a run trained
+    # under the old name exists, and ``from_dict`` drops unknown keys silently -- which would
+    # look like the envelope re-deriving itself rather than a value being lost.
+    "extero_xyz_clip": "extero_xyz_envelope",
 }
 
 
@@ -459,11 +464,19 @@ class FlowMatchingConfig:
     #: that answers to the ROBOT rather than to the camera, and it is equally declared.
     extero_nominal_ground_z: float | None = None
     #: Symmetric bound on the NORMALISED xyz channels, derived from each camera's own max-range
-    #: cone post-offset and rounded up. A safety net, not a band: because the depth channel is
-    #: already clipped to ``extero_clip``, no physically reachable point can reach it, and the
-    #: dataset asserts that. It exists so a numerical accident cannot reach a convolution --
-    #: sizing it to bind on real geometry would repeat the mistake the +-2.0 depth band made.
-    extero_xyz_clip: float | None = None
+    #: cone post-offset and rounded up.
+    #:
+    #: **ASSERTED, never applied**, which is why it is an envelope rather than a clip -- it was
+    #: called ``extero_xyz_clip`` and the name claimed a transform the code does not perform.
+    #: Nothing clamps against it on either path, and nothing should: because the depth channel
+    #: is already clipped to ``extero_clip`` and xyz is derived from that same post-clip array,
+    #: no physically reachable point can exceed it, so a value that does means the contract and
+    #: the data disagree. The dataset RAISES there rather than squashing, since a clamp sized to
+    #: bind on real geometry would repeat the mistake the +-2.0 depth band made.
+    #:
+    #: Being asserted rather than applied is also what keeps it off the deploy path entirely:
+    #: there is no runtime clamp to mirror, so no train/serve asymmetry to get wrong.
+    extero_xyz_envelope: float | None = None
     # The declared affine for ``extero_norm_mode="metric"``. The default divides by 1.0, i.e.
     # the network input IS metres -- which is the point, and makes the value directly readable
     # in a diagnostic. Recorded into the checkpoint so the band a run trained under is auditable.
