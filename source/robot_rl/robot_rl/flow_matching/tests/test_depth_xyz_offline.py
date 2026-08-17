@@ -546,3 +546,35 @@ def test_the_xyz_clamp_cannot_bite_real_geometry():
     xyz = train.extero.reshape(-1, n_cam, 5, n_px)[:, :, 1:4]
     bound = float(cfg.extero_xyz_clip) * float(cfg.extero_xyz_scale)
     assert float(xyz.abs().max()) < bound, "the clamp must not bind on real geometry"
+
+
+def test_the_trained_clip_band_is_stamped_rather_than_left_to_a_fallback():
+    """The artifact must STATE its band, because the two fallback tables no longer agree.
+
+    ``config.EXTERO_CLIP`` says 5.575 for depth; ``deploy.depth_obs.EXTERO_CLIP_NP`` says 2.0,
+    and each is correct for the artifacts of its own era. So a checkpoint that stored ``None``
+    resolved to a different band on each side of the fence: trained at 5.575, deployed at 2.0,
+    saturating range at 4.75 m and standing a false wall in the xyz cloud at exactly the
+    distance the far camera is for. Nothing would have raised.
+
+    Stamping the resolved value at dataset build removes the ambiguity for everything trained
+    from here, which is the same contract ``extero_encoder`` and ``extero_channels`` follow.
+    """
+    _train, cfg, _n_cam, _n_px = _default_channel_dataset()
+    assert cfg.extero_clip is not None, "the band must be recorded, not left to a fallback"
+    assert cfg.extero_clip == pytest.approx(cfg.resolve_extero_clip())
+
+    # And the two fallbacks really do differ, so the assertion above is load-bearing rather
+    # than belt-and-braces. If these are ever reconciled, say so here.
+    #
+    # ``transfer`` is put on the path HERE rather than relied on from another test module: a
+    # sibling happens to insert it, which would make this pass by collection order and fail
+    # when run alone -- the exact fragility test_train_cli_defaults exists to document.
+    import sys  # noqa: PLC0415
+
+    sys.path.insert(0, str(_REPO_ROOT / "transfer"))
+    from deploy.depth_obs import EXTERO_CLIP_NP  # noqa: PLC0415
+
+    from robot_rl.flow_matching.config import EXTERO_CLIP  # noqa: PLC0415
+
+    assert EXTERO_CLIP["depth"] != EXTERO_CLIP_NP["depth"]

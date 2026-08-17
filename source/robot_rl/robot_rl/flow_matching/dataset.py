@@ -998,6 +998,14 @@ class FutureStateDataset(Dataset):
         # is the config's, so a run can widen it past the per-source default -- a 1 m band
         # destroys ~11% of a 3 m scan on this terrain, concentrated downrange.
         band = cfg.resolve_extero_clip()
+        # STAMPED back, so the artifact states the band it trained under instead of leaving a
+        # None for two different fallback tables to resolve. They no longer agree:
+        # ``config.EXTERO_CLIP`` says 5.575 for depth while ``deploy.depth_obs.EXTERO_CLIP_NP``
+        # says 2.0, and each is right for the artifacts of its own era -- so a None reaching
+        # deploy trained at 5.575 and ran at 2.0, saturating range at 4.75 m and putting a
+        # false wall in the xyz cloud. Same contract ``extero_encoder`` and ``extero_channels``
+        # already follow: resolve once, write it down, and let every consumer read a number.
+        cfg.extero_clip = float(band)
         # MEASURE before clamping, and report. The band is the single most consequential
         # unmeasured constant on this path: at the scan's historical 1.0 m default a 3 m window
         # over stairs loses ~11% of its pixels, concentrated downrange where the planning
