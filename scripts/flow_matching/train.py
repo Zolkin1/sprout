@@ -213,13 +213,22 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "differs in one thing only. Needs the recorded clip index and the clip library "
              "(joined and hash-checked, as --transition_fraction is).")
     parser.add_argument(
-        "--extero_cnn_strides", type=str, default="",
+        "--extero_cnn_strides", type=str,
+        # Rendered from the dataclass, as --cmd_scale does, so the CLI cannot shadow the
+        # config's default with one of its own: a bare "" default here parsed to None and
+        # OVERRODE the (1, 2, 2) field, which is how a run meant to be 56 tokens/camera
+        # silently trained at 16 (sequence 111 rather than 191).
+        default=",".join(str(s) for s in (FlowMatchingConfig().extero_cnn_strides or [])),
         help="Comma-separated per-layer convolution stride, one per --extero_cnn_channels "
-             "entry. Empty means stride 2 everywhere (the shipped depth behaviour). A LEADING "
-             "stride-1 layer keeps the first stage at full resolution, which is how a dense "
-             "metric scan preserves 0.025 m detail and still lands on a small token grid: "
-             "'1,2,2,2' takes 121x121 -> 16x16 = 256 tokens. The grid target and this list are "
-             "coupled, so changing one alone changes the transformer's sequence length.")
+             "entry. A LEADING stride-1 layer keeps the first stage at full resolution "
+             "instead of throwing three quarters of the image away before the first "
+             "non-linearity: '1,2,2' takes the G1's 26x30 depth pair to 7x8 = 56 tokens per "
+             "camera, and '1,2,2,2' takes a dense 121x121 scan to 16x16 = 256. Pass '' for "
+             "stride 2 everywhere, which is what every checkpoint before this flag trained "
+             "under (16 tokens/camera on the depth pair). Must be as long as "
+             "--extero_cnn_channels; a run that deepens the trunk states both. The grid "
+             "target and this list are coupled, so changing one alone changes the "
+             "transformer's sequence length.")
     parser.add_argument(
         "--extero_norm_mode", type=str, default=FlowMatchingConfig().extero_norm_mode,
         choices=list(EXTERO_NORM_MODES),
