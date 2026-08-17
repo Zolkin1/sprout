@@ -152,9 +152,28 @@ RUN echo "Pulling Obelisk..."
 # Also picks up f97a2c9 (lidar per-direction occlusion mask), the only other change in
 # between; it touches the ObkScan/PointCloud2 path we use for /livox/lidar.
 #
+# Bumped abf37fe -> e8d4b7f for the MuJoCo sim's lock contention, which is why the world ran
+# at 0.066x REAL TIME on the Thor with the controller attached. The sensor timers shared one
+# REENTRANT callback group, so a MultiThreadedExecutor (hardware_concurrency() threads -- 14
+# here) dispatched them onto every free thread, where they all serialized on the one mutex
+# `mj_step` needs 1000 times a second. Sampled stacks caught the sim thread inside mj_step in
+# 1 of 25 samples. Three commits: serialize the group, snapshot `sensordata` so callbacks hold
+# no lock while publishing, and give the ray casters their own mjData so casts leave the sim
+# mutex. Measured 0.066x -> 0.999x, and the depth topics publish at their configured 50 Hz.
+#
+# This one MATTERS beyond speed: the controller ticks on a wall-clock 50 Hz timer and advances
+# the reference one node per tick, so a sim at 0.066x let the reference outrun the robot's
+# physics ~15x. That is indistinguishable from a policy that has stopped tracking, and is the
+# likeliest explanation for the generator "looking worse" since 2026-08-06 -- the date the
+# depth pair was wired into the world and pushed the sim over the edge.
+#
+# NOTE: this SHA is on the BRANCH perf/mujoco-sim-lock-contention, not main. `git clone`
+# fetches every ref, so `git checkout <sha>` below still resolves -- but repin to main once
+# the branch merges, so the pin does not depend on a branch that may be deleted.
+#
 # TODO(before hardware testing): replace this with an Obelisk RELEASE tag. Tracking a
 # moving ref is fine while developing against the sim; it is not fine on the robot.
-ARG OBELISK_REF=abf37fe71aa42db15266a12c5a7b9e9729c21d7a
+ARG OBELISK_REF=e8d4b7fa3187485072f0672742374fadd7bcc795
 ARG OBELISK_REFRESH=0
 RUN echo "obelisk refresh token: ${OBELISK_REFRESH}" && \
     git clone https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk && \
