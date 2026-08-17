@@ -16,6 +16,7 @@
 site_name: "head_lidar_site"
 geom_groups: [2]
 viz_decimation: 15
+viz: false
 frame: "body"
 # Beyond this a return is dropped rather than reported, matching the real unit's usable
 # range and keeping the cloud from stretching across an unbounded sim floor.

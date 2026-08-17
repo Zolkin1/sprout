@@ -112,7 +112,7 @@ control:
     pkg: obelisk_unitree_cpp
     executable: obelisk_unitree_joystick
     params:
-      v_x_scale: 1.0
+      v_x_scale: 2.0
       v_y_scale: 0.5
       w_z_scale: 0.7
       # Yaw on the RIGHT STICK HORIZONTAL (RX = 3 + AXIS_OFFSET). The upstream default is RY
