@@ -596,8 +596,12 @@ class DataLogger:
             try:
                 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
                     depth_obs_stack,
+                    rl_depth_groups,
                 )
-                step["depth_raw"] = depth_obs_stack(unwrapped).clone()
+                # The POLICY's cameras: this feeds the depth viewer, which shows what the
+                # policy saw. A generator sampling its own grid is not what is being drawn.
+                step["depth_raw"] = depth_obs_stack(
+                    unwrapped, rl_depth_groups(unwrapped)).clone()
             except Exception as exc:
                 self._warn("world_depth", f"Could not read the depth cameras: {exc}")
 
@@ -924,10 +928,12 @@ class DataLogger:
             try:
                 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
                     depth_camera_specs,
+                    rl_depth_groups,
                 )
                 # The whole camera contract, so the viewer can reshape the flat token axis
                 # back into images (and denormalise them) without restating any geometry.
-                self.metadata["depth_camera_spec"] = depth_camera_specs(unwrapped)
+                self.metadata["depth_camera_spec"] = depth_camera_specs(
+                    unwrapped, rl_depth_groups(unwrapped))
             except Exception as exc:
                 print(f"[WARN DataLogger] Could not read the depth camera spec: {exc}")
 

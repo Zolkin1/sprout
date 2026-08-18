@@ -58,10 +58,11 @@ python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-depth \
     --load_run <teacher-run> --clip <lib.h5> --clip_device cpu \
     --num_windows 200000 --history_len 8 --ref_future_len 51 --num_envs 256 --headless
 
-# 2. train the FM (no Isaac).  --skip_distractors while the distractor family still has
-#    anchor_mask == 0 clips (the recorder warns when it does).
-python scripts/flow_matching/train.py --data <windows.h5> \
-    --cmd_array target_vel --extero_source depth --skip_distractors --wandb
+# 2. train the FM (no Isaac).  Every exteroception and architecture knob now DEFAULTS to
+#    the shipped configuration (depth / cnn / 5 channels / contract norm / 27M), so a
+#    standard run states only its data.  Turn the distractor filter off with
+#    --no-skip_distractors.
+python scripts/flow_matching/train.py --data <windows.h5> --wandb
 
 # 3. deploy: the teacher tracks the FM
 python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play \
@@ -69,6 +70,148 @@ python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play \
 ```
 
 The sections below document the underlying scripts and their (now mostly optional) flags.
+
+---
+
+## Exteroception: how a depth image becomes tokens
+
+`--extero_encoder` picks the embedding, and it is the one architectural choice that is
+about TERRAIN rather than about capacity.
+
+* **`cnn`** (what `auto` picks for depth) — a 3-layer conv trunk **per camera**, every
+  surviving cell becoming one token with a learned spatial-slot embedding. At the DEFAULT
+  strides `(1, 2, 2)` the first stage runs at native resolution, so 26x30 lands on 7x8:
+  **56 tokens per camera, 112 total, sequence length 191**. Stride 2 everywhere (`2,2,2`)
+  gives the older 4x4 = 16 per camera, sequence 111.
+* **`mlp`** — the original: the whole 780-value frame through one `Linear`, one token per
+  camera, sequence length 81. What `auto` picks for `--extero_source height_scan`, and the
+  baseline the CNN is measured against. A scan CAN be convolved (a dense metric grid should
+  be), but it has to be asked for: on a grid above 1000 rays `auto` is refused outright,
+  because the flat path there is millions of parameters that cannot represent WHERE
+  anything is.
+
+Why it matters: a `Linear` over 780 pixels is **permutation-invariant over pixels**, so
+nothing in the flat model can attend to *where* in the frame a step edge is. That is the
+shape of the measured failure — displace the robot 0.10 / 0.20 m downrange and the predicted
+stair segment slides 0.098 / 0.168 m with it, where the anchor mask requires 0.000
+(`scripts/rsl_rl/fm_registration_probe.py`). The convolutional branch is also ~5x *smaller*
+than the `Linear` it replaces, so this re-allocates capacity toward structure rather than
+adding it.
+
+Two knobs that separate the variables when reading an A/B:
+
+```bash
+--extero_cnn_grid 1,1        # a conv trunk at the LEGACY token count: isolates
+                             # "CNN beats MLP" from "16 tokens beat 1"
+--extero_norm_mode per_sensor  # one (mean, std) per camera instead of per PIXEL
+```
+
+Normalization modes exist because a per-PIXEL affine is a spatially *varying* transform
+applied before the convolution sees the image — exactly what weight sharing assumes away.
+That mode (`per_element`) is **deleted**; every surviving mode is uniform over pixels. The
+default is `contract`, which fits nothing at all: `d` arrives already declared-normalised
+from the camera contract, `xyz` take one declared scale with a per-camera geometric offset,
+and validity is left alone. `per_channel` and `per_sensor` are the fitted alternatives, and
+`metric` is a single declared affine — the right one for a privileged metric scan.
+
+Pixel order is a **contract**, not a convention: the flat row is row-major over `(H, W)`
+with `v = 0` the top row, and the `(H, W)` to fold it with is derived from the recording's
+`depth_camera_spec` — never configured. `extero_sensor_dim` alone cannot tell a 30x26 camera
+from a 26x30 one, so the shape travels into `fm.onnx` and the deploy refuses a mismatch
+(`transfer/deploy/gen_tracker.py`).
+
+### Attention: one-way conditioning (`--attention_mode`)
+
+Which way the dependency between the conditioning and the denoised window runs.
+
+* **`prefix`** (default) — the conditioning (history + extero + cmd) attends only to
+  **itself**, and the future tokens attend to everything including themselves. The flow-time
+  embedding also stops reaching the conditioning.
+* **`full`** — every token attends to every other and the flow-time embedding lands on all of
+  them. What every checkpoint before this flag was trained under; pass it for a controlled
+  comparison against one.
+
+Under `full`, the conditioning attends to tokens carrying noise at level `tau`, so its own
+representation is a function of the noise level — when it should be a fixed statement about
+the robot's past, what it can see and what it was asked to do. That is the bug; the
+dependency should run one way.
+
+The consequence is that a representation which cannot depend on the future or on `tau` is
+computable **once per re-plan** and reusable by every Euler step, which is how
+`flow.sample_trajectory` and the exported graph run it.
+
+**Measured** (8 Euler steps, XL width, CUDA), because this is not where intuition lands:
+
+| path | model | batch | full | prefix | |
+|---|---|---|---|---|---|
+| torch | cnn extero (P=49, S=111) | 64 | 328 ms | 235 ms | **1.39x** |
+| torch | cnn extero | 1024 | 5176 ms | 3872 ms | **1.34x** |
+| torch | mlp extero (P=19, S=81) | 1024 | 3792 ms | 3361 ms | 1.13x |
+| onnx | mlp extero | 1 | 10.8 ms | 13.3 ms | **0.82x** |
+
+So the win lands on the **torch** path — Isaac play, training validation and all four FM
+diagnostics — and is largest for the CNN encoder, whose conditioning is the bigger share of
+the sequence. It roughly cancels the cost the CNN's 32 extero tokens added.
+
+The exported graph is **slower at the deploy batch of 1**: fewer FLOPs, but ~27% more nodes
+(one extra layer stack plus a `Concat` per layer per step), and onnxruntime at batch 1 is
+launch-bound, so time tracks node count rather than arithmetic. If that starts to matter, the
+fix is to export `prefix` mode as a masked full-sequence pass — identical semantics and node
+count to `full`, no speedup — and keep the cached form for torch only.
+
+⚠️ **The two modes share one parameter set.** A mislabelled checkpoint loads without complaint
+and runs under attention it was never trained with; `load_state_dict` cannot catch it the way
+it catches a wrong `--extero_encoder`. `FlowMatchingConfig.from_dict` defaults a pre-flag
+checkpoint to `full`, the resolved mode is printed at train and load time, and it is recorded
+in `fm_meta` — that is the whole defence.
+
+
+### Changing the generator's resolution without retraining the teacher
+
+The generator can sample the policy's lenses on **its own grid**, so the encoder's input can
+change on an FM retrain alone:
+
+```bash
+# 1. record: the policy keeps 30x26, the generator's array is 60x52
+python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-depth \
+    --load_run <teacher> --clip <lib>.h5 --clip_device cpu \
+    --num_windows 200000 --history_len 8 --ref_future_len 62 \
+    --fm_depth_resolution 60x52 --num_envs 256 --headless
+
+# 2. train: the dataset DERIVES 60x52 from the recording's camera contract
+python scripts/flow_matching/train.py --data <windows>.h5 --extero_encoder cnn ...
+
+# 3. play: the resolution is read off the checkpoint and the pair is built to match
+python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play \
+    --load_run <teacher> --fm_checkpoint <fm.pt> --clip <lib>.h5
+```
+
+Only the SAMPLING differs. Both pairs are built from the same `_CameraSpec`, so mount,
+apertures, range and normalization are shared by construction, and the three DR events draw
+ONCE for both — a mount cannot be in two places, and independent draws would make them two
+different physical cameras.
+
+Costs, which is why the resolution is worth choosing before recording rather than after: ray
+cost and the `depth` dataset both scale with `W*H`, so 60x52 is **4x** the 30x26 pair. A
+200k-window recording is 1.25 GB at 30x26 and 5.0 GB at 60x52 (29 GB at 128x112).
+
+**Raising the resolution raises the TOKEN COUNT unless you say otherwise**, which is the trap
+here: the grid is the image ceil-halved once per conv layer, so a bigger image leaves a bigger
+grid and the transformer's sequence grows with it. Measured:
+
+| cameras | flags | tokens/cam | extero tokens | sequence |
+|---|---|---|---|---|
+| 30x26 | — | 16 | 32 | 111 |
+| 60x52 | — | **56** | **112** | **191** |
+| 60x52 | `--extero_cnn_channels 16,32,64,128` | 16 | 32 | 111 |
+| 60x52 | `--extero_cnn_grid 4,4` | 16 | 32 | 111 |
+
+Prefer the 4th conv layer over pooling: it never computes the resolution it would then throw
+away, and the extra layer widens the receptive field, which is the point of the finer grid.
+
+MuJoCo casts both grids. **Hardware does not** — `export_sensor_configs.py` raises rather
+than emitting obelisk/ZED configs that cover only the tracker, so a split-sampling generator
+has to be retrained at the policy's resolution before it can go on the robot.
 
 ---
 
@@ -102,8 +245,6 @@ python scripts/flow_matching/train.py --data <run-dir-or-.npz> --wandb
   - `--cmd_array` → `target_vel` if that array was recorded, else no command (future-horizon conditioning: past command in the encoder, future in the decoder). Override with an array name or `none`.
 - **`--eval_data <run-or-.npz>`** — a *separate* held-out recording (never trained on); metrics logged under `eval/*`, distinct from the within-recording `val/*`. Must share the train layout. See "Held-out evaluation" below.
 - **`--run_name`** — run dir is `logs/flow_matching/<timestamp>_<run_name>` (defaults to just the timestamp).
-- **`--history_source`** — what the `N` history tokens are made of. `measured` (default) is the robot's actual state. `reference_partial` is **partially autoregressive**: measured root pose/twist, but joints and end-effector positions taken from the reference applied at those steps — the generator conditioning on its own recent output for posture while the root stays grounded in reality. Both train from the same recording (the applied-reference ring is always stored), so it is a free A/B.
-- Other knobs: `--num_epochs` (100), `--stride` (1; raise to cut RAM on huge datasets), `--num_history_states` (2), `--future_len` (65 — sized to the deploy look-ahead; see `FlowMatchingConfig.future_len`), `--lr`, `--cosine`.
 
 **Horizon and re-recording.** `--future_len` must equal the recording's `--ref_future_len`: windows are cut at record time and the dataset hard-errors on a mismatch. Both default to `FlowMatchingConfig.future_len`, so leaving them alone is correct.
 - **Output:** `logs/flow_matching/<ts>_<run_name>/{best.pt, ckpt_<N>.pt}`. wandb logs per epoch (val every `--val_every`=5); per-step loss → TensorBoard.

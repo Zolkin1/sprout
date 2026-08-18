@@ -148,7 +148,7 @@ def main() -> None:
             if i >= args.batches:
                 break
             pred = sample_trajectory(
-                ctx.model, batch["history"].to(device), batch["height"].to(device),
+                ctx.model, batch["history"].to(device), batch["extero"].to(device),
                 batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None,
                 cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
             )

@@ -295,6 +295,7 @@ class Robot:
         self, base_pos: np.ndarray, base_quat_xyzw: np.ndarray,
         resolution: float = 0.1, size=(1.5, 1.0), offset_fwd: float = 0.75,
         sensor_offset: float = 0.5, ray_start_h: float = 20.0, terrain_group: int = 2,
+        offset_lat: float = 0.0,
     ) -> tuple[np.ndarray, np.ndarray]:
         """Replicate IsaacLab ``mdp.height_scan`` via a MuJoCo grid raycast.
 
@@ -313,6 +314,10 @@ class Robot:
             ray_start_h: Height above the pelvis to start each (downward) ray.
             terrain_group: MuJoCo geom group of the raycast-able terrain. The robot must
                 NOT be in this group, so rays hit the ground and skip the robot's own body.
+            offset_lat: Grid centre LEFT of the pelvis (m), i.e. ``offset_pos[1]`` of the
+                scanner cfg. Zero for every scanner shipped so far -- taken as an argument
+                rather than assumed, because a silently dropped lateral mount would shift
+                the whole map sideways and still look like a plausible reading.
 
         Returns:
             ``(clearance (K,), hit_points_world (K, 3))``; no-hit rays -> ``nan``.
@@ -333,7 +338,7 @@ class Robot:
         k = 0
         for gy in ys:                               # y outer
             for gx in xs:                           # x inner (x varies fastest)
-                lx, ly = offset_fwd + gx, gy        # forward-offset grid, pelvis frame
+                lx, ly = offset_fwd + gx, offset_lat + gy   # mount-offset grid, pelvis frame
                 wx = bx + c * lx - s * ly           # yaw-rotate into world
                 wy = by + s * lx + c * ly
                 pnt = np.array([wx, wy, bz + ray_start_h])

@@ -117,6 +117,10 @@ def _cfg():
     # array; the config default is "depth" (the deployable signal). This file is about the
     # windowed writer matching the per-step path, not about exteroception.
     return FlowMatchingConfig(
+        # Unweighted, and distractors kept: both shipped defaults need a real recording
+        # (clip_id + the clip library for the anchor mask; an is_distractor tag), which
+        # a synthetic one has not got. Neither is what these tests exercise.
+        pinned_axis_loss_weight=1.0, skip_distractors=False,
         future_len=4, num_history_states=2, cmd_array="target_vel", cmd_stride=2,
         stride=1, val_fraction=0.25, seed=0, obs_noise=False,
         extero_source="height_scan",
@@ -183,7 +187,7 @@ def test_windowed_dataset_matches_per_step():
     assert tl.val_episode_ids == tw.val_episode_ids
 
     def _same(ds_a, ds_b):
-        for attr in ("state", "history", "height_norm_tokens", "cmd_tokens", "p_ref", "q_ref"):
+        for attr in ("state", "history", "extero", "cmd_tokens", "p_ref", "q_ref"):
             a, b = getattr(ds_a, attr), getattr(ds_b, attr)
             assert torch.allclose(a, b, atol=1e-5), f"{attr} differs (max {(a - b).abs().max():.2e})"
 

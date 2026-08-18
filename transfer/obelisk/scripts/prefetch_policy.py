@@ -69,7 +69,7 @@ def main() -> None:
     spec = policy.get_depth_camera_spec()
     extero = (", ".join(f"{c.get('sensor') or c['obs_term']} {int(c['width'])}x{int(c['height'])}"
                         for c in spec) if spec
-              else f"height scan ({policy.ctx.height_dim} rays)" if policy.needs_height_scan()
+              else f"height scan ({policy.ctx.extero_sensor_dim} rays)" if policy.needs_height_scan()
               else "none")
     print(f"[INFO] Loaded OK: obs={policy.get_num_obs()} act={policy.get_num_actions()} "
           f"dt={policy.get_dt():.4f}s")

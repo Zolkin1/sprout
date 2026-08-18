@@ -32,18 +32,25 @@ import sys
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
 sys.path.insert(0, os.path.join(_REPO_ROOT, "transfer"))
 
+from deploy.artifacts import DEPLOY_FM_NAME, resolve_fm_onnx  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 from deploy.hardware import DEFAULT_HF_REPO_ID  # noqa: E402
 
 #: What the robot downloads. Both are required: the tracker alone cannot walk.
-ARTIFACTS = ("tracker.onnx", "fm.onnx")
+#:
+#: The generator is uploaded UNDER THIS NAME whatever it is called locally. Local exports
+#: are named for their FM checkpoint so several can sit in one ``exported/`` without
+#: overwriting each other (``deploy.artifacts``); a robot installs exactly one pair and its
+#: controller reads a fixed filename, so the rename happens here, at the boundary.
+ARTIFACTS = ("tracker.onnx", DEPLOY_FM_NAME)
 
 
-def validate_pair(exported_dir: str) -> GenTrackerPolicy:
+def validate_pair(exported_dir: str, fm_onnx: str | None = None) -> GenTrackerPolicy:
     """Load the artifact pair and return the policy, so a bad pair never ships.
 
     Args:
-        exported_dir: Directory holding ``tracker.onnx`` and ``fm.onnx``.
+        exported_dir: Directory holding ``tracker.onnx`` and the generator.
+        fm_onnx: Which generator to ship, when the directory holds several.
 
     Returns:
         The loaded policy, for reporting what is about to be uploaded.
@@ -53,13 +60,13 @@ def validate_pair(exported_dir: str) -> GenTrackerPolicy:
         ValueError: Propagated from the load when the two disagree about the depth
             cameras, or the generator conditions on exteroception the contract lacks.
     """
-    missing = [n for n in ARTIFACTS if not os.path.exists(os.path.join(exported_dir, n))]
-    if missing:
+    tracker = os.path.join(exported_dir, "tracker.onnx")
+    if not os.path.exists(tracker):
         raise FileNotFoundError(
-            f"{exported_dir} is missing {missing}. Run play.py --fm_checkpoint <ckpt> "
-            "first; it writes both files into <run>/exported/."
+            f"{tracker} is missing. Run play.py --fm_checkpoint <ckpt> first; it writes "
+            "the tracker and the generator into <run>/exported/."
         )
-    policy = GenTrackerPolicy(*(os.path.join(exported_dir, n) for n in ARTIFACTS))
+    policy = GenTrackerPolicy(tracker, resolve_fm_onnx(exported_dir, fm_onnx))
     policy.load()
     return policy
 
@@ -81,7 +88,7 @@ def describe(policy: GenTrackerPolicy) -> str:
             f"on {c['mount_body']}" for c in spec
         )
     elif policy.needs_height_scan():
-        extero = f"height scan ({policy.ctx.height_dim} rays)"
+        extero = f"height scan ({policy.ctx.extero_sensor_dim} rays)"
     else:
         extero = "none (blind)"
     return (
@@ -109,6 +116,12 @@ def main() -> None:
                              "string and a deployed policy can be traced back to the run "
                              "that produced it without a lookup table. Override only to "
                              "publish under a different name deliberately.")
+    parser.add_argument("--fm_onnx", default=None,
+                        help="Which generator to ship: a path, or a bare filename inside "
+                             "the run's exported/. Local exports are named for their FM "
+                             "checkpoint, so this is REQUIRED when the directory holds "
+                             "several. It is uploaded as 'fm.onnx' whatever it is called "
+                             "here -- the robot installs one pair under a fixed name.")
     parser.add_argument("--dry_run", action="store_true",
                         help="Validate the pair and report, but upload nothing.")
     args = parser.parse_args()
@@ -117,7 +130,7 @@ def main() -> None:
     folder_name = args.folder_name or os.path.basename(run_dir)
     exported = os.path.join(run_dir, "exported")
     print(f"[INFO] Validating {exported}")
-    policy = validate_pair(exported)
+    policy = validate_pair(exported, args.fm_onnx)
     print(f"[INFO] Artifact pair is self-consistent:\n{describe(policy)}")
 
     if args.dry_run:
@@ -142,10 +155,14 @@ def main() -> None:
         sys.exit(1)
 
     api = HfApi()
-    for name in ARTIFACTS:
+    # (local path, name on the robot). The generator is renamed on the way up; see
+    # ARTIFACTS for why the fixed name lives only at this boundary.
+    uploads = ((os.path.join(exported, "tracker.onnx"), "tracker.onnx"),
+               (resolve_fm_onnx(exported, args.fm_onnx), DEPLOY_FM_NAME))
+    for local, name in uploads:
         repo_path = f"{folder_name}/{name}"
         api.upload_file(
-            path_or_fileobj=os.path.join(exported, name),
+            path_or_fileobj=local,
             path_in_repo=repo_path,
             repo_id=args.hf_repo_id,
             commit_message=f"Upload {name} to {folder_name}",

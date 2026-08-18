@@ -18,6 +18,12 @@ Specify the total number of pairs with ``--num_pairs``; every run writes a new,
 non-overwriting file under ``<log_dir>/recorded_data/`` (override with
 ``--output_dir``).
 
+Episodes start at clip frame 0 by default (``--start_step``), which is a RECORDING
+choice, not the training one: training draws a random start so every phase is an entry
+point, but a random start run to the clip end visits step ``t`` with probability
+``~t/clip_len``, so the recorded data would be a ramp toward late clip phases rather
+than the uniform coverage the downstream FM should train on.
+
 Example:
     python scripts/rsl_rl/record_data.py --task <Task> --num_envs 64 \
         --num_pairs 100000 --load_run <run> --headless
@@ -40,7 +46,6 @@ from packaging import version
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
-from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils.assets import retrieve_file_path
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
@@ -155,6 +160,58 @@ parser.add_argument(
          "clips/g1_recovery_v1.h5. Default: the task config's clip (clips/g1_flat_v1.h5 for the "
          "teacher tasks). The recorded distribution mirrors THIS clip, so point it at the library "
          "you generated.",
+)
+parser.add_argument(
+    "--start_step", type=int, default=0,
+    help="Clip step every episode starts at. 0 (the default) is what makes the recorded "
+         "window distribution UNIFORM in clip phase: each episode walks its clip once from "
+         "frame 0, so every frame is visited exactly once per visit to that clip. -1 "
+         "restores training's SAMPLED start (commands.traj_ref.random_start_phase), which is "
+         "not uniform -- a start drawn uniformly from [0, clip_len) and then run to the clip "
+         "end visits step t with probability ~t/clip_len, so late phases dominate (measured "
+         "on a 200k-window recording: 1.1%% of windows in the first phase decile against "
+         "18.1%% in the eighth). The cost of 0 is clip COVERAGE: episodes are ~2x longer, so "
+         "a fixed --num_windows budget spans ~half as many distinct clips.",
+)
+parser.add_argument(
+    "--clip_draw", type=str, default="cycle", choices=("cycle", "random"),
+    help="How each reset picks its clip. 'cycle' (the default) draws from a shuffled queue "
+         "per terrain group, so every clip in the library is used once before any repeats -- "
+         "clip coverage is then exactly min(episodes, clips). 'random' is training's "
+         "with-replacement sampling, which covers only 1-exp(-E/C) of a C-clip group in E "
+         "episodes (63%% when E == C), and the misses are a random third of the library. "
+         "Cycling costs nothing and is strictly better for a recording, whose clip coverage "
+         "IS the deliverable; 'random' is kept to reproduce an older recording.",
+)
+parser.add_argument(
+    "--fm_depth_resolution", type=str, default="",
+    help="'WxH' to record the GENERATOR's depth at, when it should differ from the policy's. "
+         "Adds a second camera pair on the SAME mounts and lenses, sampled on this grid, and "
+         "the recorded 'depth' array plus its camera contract then describe THAT pair -- so a "
+         "generator trained on this file conditions on this resolution while the teacher that "
+         "produced the file keeps its own. Empty (default) records the policy's cameras. "
+         "Costs rays: the pass is ~W*H/780 times the policy pair's per-step depth cost, and "
+         "the 'depth' dataset scales the same way (a 200k-window recording is 1.25 GB at "
+         "30x26 and 5 GB at 60x52), so pick this before recording rather than after.",
+)
+parser.add_argument(
+    "--fm_height_scan", type=str, default="",
+    help="'SXxSY@RES' to give the GENERATOR its own dense height scanner, e.g. '3.0x3.0@0.025'. "
+         "Adds a SECOND scanner on the same mount and alignment as the policy's, robot-centred, "
+         "sampled on this grid, and the recorded 'height_scan' array plus its geometry contract "
+         "then describe THAT scanner. The policy's 176-ray scanner is untouched -- it has to be, "
+         "since the depth teacher's critic observes it and a changed width makes the checkpoint "
+         "unloadable. PRIVILEGED: an exact noise-free ground-truth map that no deployment can "
+         "reproduce, so the ONNX/MuJoCo/hardware paths refuse a recording made with it. Costs "
+         "rays and disk: 3.0x3.0@0.025 is 14641 rays (83x the policy's) and 57 KiB/window f32, "
+         "so pair it with --fm_scan_float16.",
+)
+parser.add_argument(
+    "--fm_scan_float16", action="store_true", default=False,
+    help="Store the 'height_scan' array as float16. Halves the file and the training-time "
+         "dataset RAM; 1 mm quantisation is 25x finer than a 0.025 m grid cell, and lzf "
+         "compresses f16 sensor data far better than f32 (whose low mantissa bits are noise). "
+         "Recommended whenever --fm_height_scan is used at a dense grid.",
 )
 parser.add_argument(
     "--clip_device", type=str, default=None,
@@ -337,6 +394,36 @@ def _distractor_clip_mask(ref_cmd):
     return flags
 
 
+def _report_clip_coverage(ref_cmd) -> None:
+    """Print how much of the clip library the finished recording actually spanned.
+
+    Only meaningful under ``--clip_draw cycle``, which is the mode that makes coverage a
+    guarantee rather than a lottery; with-replacement sampling leaves no queue to read and
+    this quietly does nothing.  Per TERRAIN GROUP rather than one number, because groups
+    advance through their queues at different rates: an env consumes one clip per episode
+    and a group's clips may be 3x longer than another's, so the flat group is still on its
+    first pass while the stair groups are on their third.
+
+    Args:
+        ref_cmd: The resolved trajectory command term (holds the cycler, if any).
+    """
+    cycler = getattr(ref_cmd, "_clip_cycler", None)
+    if cycler is None:
+        return
+    cov = cycler.coverage()
+    total = sum(g["clips"] for g in cov.values())
+    seen = sum(g["distinct_used"] for g in cov.values())
+    full = sum(1 for g in cov.values() if g["passes"] > 0)
+    print(f"[INFO] clip coverage: {seen}/{total} distinct clips used "
+          f"({100.0 * seen / max(total, 1):.1f}%); {full}/{len(cov)} terrain groups completed "
+          f"at least one full pass.")
+    partial = {g: v for g, v in cov.items() if v["passes"] == 0 and v["distinct_used"] < v["clips"]}
+    if partial:
+        worst = sorted(partial.items(), key=lambda kv: kv[1]["distinct_used"] / kv[1]["clips"])[:5]
+        detail = ", ".join(f"tid {g}: {v['distinct_used']}/{v['clips']}" for g, v in worst)
+        print(f"[INFO]   least-covered groups -- {detail}. Record more windows to span them.")
+
+
 def _clip_family_codes(ref_cmd) -> tuple["torch.Tensor | None", list[str]]:
     """Per-clip family index plus the family names, from the library's ``terrain_manifest``.
 
@@ -410,7 +497,7 @@ def _extero_is_corrupted(env) -> bool:
         True when at least one depth observation term has a noiser installed.
     """
     from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.noise import get_depth_noiser
-    for sensor_name, _ in mdp.find_depth_obs_terms(env):
+    for sensor_name, _ in mdp.find_depth_obs_terms(env, mdp.fm_depth_groups(env)):
         if get_depth_noiser(env, sensor_name) is not None:
             return True
     return False
@@ -490,7 +577,11 @@ def _build_recording_meta(
         # Contract of the cameras behind the recorded ``depth`` array (None without them).
         # The same producer the tracker export uses, so an FM trained on this recording
         # and the tracker deployed beside it describe one physical camera pair.
-        depth_camera_spec=mdp.depth_camera_specs(env.unwrapped) or None,
+        # Scoped to the cameras the recorded array actually came from. Unscoped, a task
+        # carrying both pairs would describe FOUR cameras behind a two-row array, and the
+        # FM dataset's len(spec) == rows check is the only thing that would notice.
+        depth_camera_spec=mdp.depth_camera_specs(
+            env.unwrapped, mdp.fm_depth_groups(env.unwrapped)) or None,
         # Which reference-window blocks THIS teacher observes. The recorded arrays are
         # world-frame rows, so any selection can be packed from them -- but the generator
         # trained on this file has to predict what the policy consumes, so the teacher's
@@ -670,14 +761,17 @@ def collect_pairs(
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
     # Height scan (the FM's height-conditioning token), captured when the recording task
-    # has a height_scanner sensor active (e.g. G1-teacher-clf-terrain-play). Same mdp.height_scan
-    # used by the FM deploy + (later) the RL obs term, so record/train/deploy stay in sync.
-    has_scan = ("height_scanner" in env.unwrapped.scene.sensors
-                and not args_cli.skip_height_scan)
+    # has a height scanner active (e.g. G1-teacher-clf-terrain-play). Resolved through
+    # mdp.fm_scan_sensor, which prefers the GENERATOR's dense scanner when --fm_height_scan
+    # added one and otherwise returns the policy's -- i.e. exactly the sensor this line used to
+    # name, so a run that does not opt in is unchanged.
+    scan_sensor = None if args_cli.skip_height_scan else mdp.fm_scan_sensor(env.unwrapped)
+    has_scan = scan_sensor is not None
     # Depth cameras (the deployable FM exteroception signal). Recorded ALONGSIDE the scan
     # whenever the task has depth observation terms, so ONE recording can train either FM
     # and the choice is made at FM-train time via cfg.extero_source.
-    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped))
+    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped,
+                                              mdp.fm_depth_groups(env.unwrapped)))
 
     # Body indices for the extra frames appended to the state vector (in order).
     state_frames = list(state_frames or [])
@@ -765,12 +859,13 @@ def collect_pairs(
         # [N, K]); the dataset picks the snap-row scan as the FM height token.
         if has_scan:
             buf["height_scan"].append(
-                mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).detach().cpu().clone()
+                mdp.scan_obs_stack(env.unwrapped, scan_sensor)[:, 0].detach().cpu().clone()
             )
         # Depth at the same pre-step moment, one token row per camera ([N, T, H*W]),
         # normalised by each camera's own obs-term params.
         if has_depth:
-            buf["depth"].append(mdp.depth_obs_stack(env.unwrapped).detach().cpu().clone())
+            buf["depth"].append(mdp.depth_obs_stack(
+                env.unwrapped, mdp.fm_depth_groups(env.unwrapped)).detach().cpu().clone())
         # Desired reference at the same timestep, reconstructed to the world-frame
         # ``state`` layout. ``y_des``/``dy_des`` hold the value backing the current
         # obs (last computed during the previous env.step), so this stays aligned
@@ -907,9 +1002,11 @@ def collect_windows(
     device = env.unwrapped.device
     use_policy_reset = version.parse(installed_version) >= version.parse("4.0.0")
     robot = env.unwrapped.scene.articulations["robot"]
-    has_scan = ("height_scanner" in env.unwrapped.scene.sensors
-                and not args_cli.skip_height_scan)
-    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped))
+    # The generator's dense scanner when --fm_height_scan added one, else the policy's.
+    scan_sensor = None if args_cli.skip_height_scan else mdp.fm_scan_sensor(env.unwrapped)
+    has_scan = scan_sensor is not None
+    has_depth = bool(mdp.find_depth_obs_terms(env.unwrapped,
+                                              mdp.fm_depth_groups(env.unwrapped)))
 
     state_frames = list(state_frames or [])
     frame_body_idx = None
@@ -1033,11 +1130,22 @@ def collect_windows(
                 if family_codes is not None
                 else np.zeros(idx.numel(), dtype=np.uint8)
             )
+            # Where this window came FROM: clip, and the step its node 0 sits at. Lets any
+            # per-clip/per-step library column be joined offline -- notably anchor_mask_t,
+            # whose boundaries are the ground-truth terrain transitions. `_step` is the same
+            # counter the command uses to gather `ref_future`, so node 0 == this step.
+            batch["clip_id"] = cid.to(torch.int32).cpu().numpy()
+            batch["clip_step"] = ref_cmd._step[idx].to(torch.int32).cpu().numpy()
+            # The source ENV. Its tile instance and origin are what make the recorded WORLD
+            # poses interpretable off-line; clip_id fixes the tile TYPE but not which of the
+            # identical instances this window sat on.
+            batch["env_id"] = idx.to(torch.int32).cpu().numpy()
             if has_scan:
-                scan = mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner"))  # [N, K]
+                scan = mdp.scan_obs_stack(env.unwrapped, scan_sensor)[:, 0]  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()
             if has_depth:
-                dep = mdp.depth_obs_stack(env.unwrapped)                    # [N, T, H*W]
+                dep = mdp.depth_obs_stack(
+                    env.unwrapped, mdp.fm_depth_groups(env.unwrapped))      # [N, T, H*W]
                 batch["depth"] = dep[idx].detach().cpu().numpy()
             written += writer.write_batch(batch)
             if written >= num_windows:
@@ -1140,6 +1248,66 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                       f"{terrain.clip_library_path} -> {args_cli.clip}")
                 terrain.clip_library_path = args_cli.clip
 
+        # Where inside its clip each episode starts. Training SAMPLES a start (so a policy
+        # sees every phase as an entry point); a recording wants uniform COVERAGE of clip
+        # phase, and only a start at frame 0 gives it -- a sampled start run to the clip end
+        # visits step t with probability ~t/clip_len, which is the ramp measured in the
+        # --start_step help. Set on the reset EVENT rather than by disabling
+        # ``random_start_phase``, so the value lands in the dumped provenance env.yaml.
+        if args_cli.start_step >= 0:
+            reset_ev = getattr(getattr(env_cfg, "events", None), "reset_on_clip", None)
+            if reset_ev is None or "pin_start_step" not in getattr(reset_ev, "params", {}):
+                raise ValueError(
+                    "--start_step given but the task has no events.reset_on_clip carrying a "
+                    "pin_start_step param. Pass --start_step -1 to leave the task's own "
+                    "(sampled) start alone."
+                )
+            reset_ev.params["pin_start_step"] = int(args_cli.start_step)
+            print(f"[INFO] Every episode starts at clip step {args_cli.start_step} -- windows "
+                  f"cover clip phase uniformly. Pass --start_step -1 to sample as training does.")
+
+        # And which clip each reset picks: without replacement, so the run spans the library
+        # rather than covering a random 63% of it (see --clip_draw).
+        reset_ev = getattr(getattr(env_cfg, "events", None), "reset_on_clip", None)
+        if reset_ev is None or "clip_draw" not in getattr(reset_ev, "params", {}):
+            raise ValueError(
+                "the task has no events.reset_on_clip carrying a clip_draw param; it is not a "
+                "clip-tracking task and cannot be recorded from."
+            )
+        reset_ev.params["clip_draw"] = args_cli.clip_draw
+
+        # Give the GENERATOR its own camera pair when it should record at a resolution the
+        # policy does not use. DECLARED here rather than derived, unlike play.py: there is no
+        # FM artifact yet -- this run is what produces the data one will be trained on.
+        if args_cli.fm_depth_resolution.strip():
+            from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+                add_fm_depth_pair,
+            )
+            spec = args_cli.fm_depth_resolution.replace("x", ",").split(",")
+            if len(spec) != 2:
+                raise ValueError(
+                    f"--fm_depth_resolution={args_cli.fm_depth_resolution!r}; expected 'WxH'."
+                )
+            add_fm_depth_pair(env_cfg, int(spec[0]), int(spec[1]))
+
+        # Same story for the generator's own dense height scanner: DECLARED here, and for the
+        # same reason -- no FM artifact exists yet to derive it from.
+        if args_cli.fm_height_scan.strip():
+            from robot_rl.tasks.manager_based.robot_rl.g1.g1_fm_scan_env_cfg import (
+                add_fm_height_scan,
+            )
+            text = args_cli.fm_height_scan.strip()
+            try:
+                extents, _, res = text.partition("@")
+                sx, sy = (float(v) for v in extents.replace("x", ",").split(","))
+                resolution = float(res)
+            except ValueError as exc:
+                raise ValueError(
+                    f"--fm_height_scan={text!r}; expected 'SXxSY@RES' in metres, e.g. "
+                    "'3.0x3.0@0.025'."
+                ) from exc
+            add_fm_height_scan(env_cfg, size=(sx, sy), resolution=resolution)
+
         # Hold the clip library off-GPU when large (auto: cpu for >1 GB libs, which
         # OOM a small card at scene init). Explicit --clip_device overrides.
         auto_clip_device(env_cfg, args_cli.clip_device)
@@ -1219,6 +1387,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # it, so it travels in the recording rather than being reconstructed from a library
         # that may have moved on.
         meta.family_names = list(family_names)
+        # What the per-window clip_id / clip_step index INTO. The hash is the part that
+        # matters: libraries get regenerated in place under the same filename, and a join
+        # against the wrong one returns plausible garbage rather than an error.
+        clip_lib_path = getattr(getattr(ref_cmd, "cfg", None), "path", "") or ""
+        meta.clip_library_path = str(clip_lib_path)
+        meta.clip_library_sha256 = (
+            sha256_file(clip_lib_path) if clip_lib_path and os.path.exists(clip_lib_path) else ""
+        )
 
         # Ego-anchored clip-future target (robot-state-conditioned FM): recorded when the
         # command exposes the look-ahead accessors + a command velocity, unless disabled.
@@ -1279,24 +1455,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     "clip-tracking task exposing get_future_world_base + a command velocity, "
                     "and do not pass --no_ref_future."
                 )
-            if ("height_scanner" not in env.unwrapped.scene.sensors
-                    and not args_cli.skip_height_scan
-                    and not mdp.find_depth_obs_terms(env.unwrapped)):
+            # 0 makes RecordedWindowWriter omit the dataset entirely. This MUST agree with
+            # collect_windows' own `has_scan`, which is why both go through the same resolver:
+            # the writer accepts only keys it declared, so declaring height_scan while the loop
+            # never fills it is a KeyError on the first emitted batch.
+            _scan_sensor = (None if args_cli.skip_height_scan
+                            else mdp.fm_scan_sensor(env.unwrapped))
+            if _scan_sensor is None and not mdp.find_depth_obs_terms(
+                    env.unwrapped, mdp.fm_depth_groups(env.unwrapped)):
                 raise ValueError(
-                    "--num_windows needs SOME exteroception: a height_scanner sensor, depth obs "
+                    "--num_windows needs SOME exteroception: a height scanner, depth obs "
                     "terms, or --skip_height_scan on a depth task. Record on a task that has "
                     "one (e.g. G1-teacher-clf-terrain-depth)."
                 )
             H = int(args_cli.history_len)
             node_dim = int(sum(meta.state_term_dims))
-            # 0 makes RecordedWindowWriter omit the dataset entirely. This MUST agree with
-            # collect_windows' own `has_scan`, which is why both read the same two conditions:
-            # the writer accepts only keys it declared, so declaring height_scan while the loop
-            # never fills it is a KeyError on the first emitted batch.
-            _rec_scan = ("height_scanner" in env.unwrapped.scene.sensors
-                         and not args_cli.skip_height_scan)
-            K = (int(mdp.height_scan(env.unwrapped, SceneEntityCfg("height_scanner")).shape[1])
-                 if _rec_scan else 0)
+            K = (int(mdp.scan_obs_stack(env.unwrapped, _scan_sensor).shape[-1])
+                 if _scan_sensor is not None else 0)
             cmd_dim = int(
                 ref_cmd.get_future_command_velocity(
                     torch.arange(1, device=env.unwrapped.device)
@@ -1305,13 +1480,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # Depth (the deployable FM signal) is recorded alongside the scan whenever the
             # task exposes depth obs terms, so one session can train either FM.
             depth_shape = None
-            if mdp.find_depth_obs_terms(env.unwrapped):
-                dep = mdp.depth_obs_stack(env.unwrapped)          # [N, T, H*W]
+            if mdp.find_depth_obs_terms(env.unwrapped,
+                                        mdp.fm_depth_groups(env.unwrapped)):
+                dep = mdp.depth_obs_stack(
+                    env.unwrapped, mdp.fm_depth_groups(env.unwrapped))   # [N, T, H*W]
                 depth_shape = (int(dep.shape[1]), int(dep.shape[2]))
                 print(f"[INFO] recording depth alongside the height scan: {depth_shape} per window")
             meta.format = "windowed_h5"
             meta.history_len = H
             meta.height_scan_dim = K
+            # The scan's GEOMETRY, not just its ray count: a convolutional encoder needs the
+            # (height, width) fold, and num_rays cannot tell a grid from its transpose. Scoped
+            # to the sensor actually recorded, so a depth task's untouched 176-ray critic
+            # scanner is not described alongside the generator's dense one.
+            if _scan_sensor is not None:
+                meta.height_scan_spec = mdp.height_scan_specs(env.unwrapped, _scan_sensor)
+                _spec = meta.height_scan_spec[0]
+                print(f"[INFO] height scan from {_scan_sensor!r}: "
+                      f"{_spec['size'][0]}x{_spec['size'][1]} m @ {_spec['resolution']} m -> "
+                      f"fold ({_spec['height']}, {_spec['width']}) = {K} rays"
+                      + (" [PRIVILEGED: not deployable]" if _spec["privileged"] else ""))
+                # Noise-free BY CONSTRUCTION, and this records the fact so the FM dataset does
+                # not have to be told twice. Every corruption route is provably absent: the
+                # reading goes through the raw obs function (so the observation manager's noise
+                # and clip never run), height_scan_specs has already refused any drift range on
+                # a privileged sensor, and add_fm_height_scan has already refused an event term
+                # that names either scanner. Depth's own flag is the opposite polarity and is
+                # gated on extero_source == "depth", so a scan run falls through it entirely.
+                meta.extero_noise_free = True
             # content_sha256 stays empty for the streamed format (the whole dataset is
             # never in RAM to hash); sha256_file(<.h5>) identifies the file if needed.
             out_path = unique_output_path(out_dir, prefix="recorded", ext=".h5")
@@ -1326,10 +1522,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # the dataset, so the key record_data assembled was silently dropped and
                 # --skip_families could never match.
                 tag_families=True,
+                # And the index back into the library, which generalises BOTH: with
+                # clip_id + clip_step any per-clip/per-step column joins offline. The one
+                # that motivated it is anchor_mask_t, whose boundaries are the ground-truth
+                # terrain transitions -- previously only guessable from a height threshold.
+                tag_clip_index=True,
                 # Same reasoning for the applied-reference ring: recording it always makes
                 # `history_source=reference_partial` a train-time A/B, and its absence
                 # unambiguously means "this recording predates the mode".
                 record_history_ref=True,
+                # Opt-in f16 for the scan only. At a dense grid this halves both the file and
+                # the training-time dataset RAM, and 1 mm quantisation is far below the grid
+                # cell -- but it is never the default, so the depth baseline's arrays stay
+                # bit-identical and the A/B is not confounded by a storage change.
+                dtypes=({"height_scan": "float16"} if args_cli.fm_scan_float16 else None),
             ) as writer:
                 n_written = collect_windows(
                     env, policy, policy_nn, obs, num_records, H, args_cli.stochastic,
@@ -1347,6 +1553,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             print(f"[INFO] Streamed {n_written} snap windows to: {out_path}")
             print(f"[INFO]   H={H} F={rf_len} node_dim={node_dim} K={K} cmd_dim={cmd_dim}; "
                   f"format=windowed_h5  provenance={prov_dir}")
+            _report_clip_coverage(ref_cmd)
             env.close()
             return
 
@@ -1381,6 +1588,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         if data.get("height_scan") is not None:
             meta.height_scan_dim = int(data["height_scan"].shape[1])
+            _npz_scan = mdp.fm_scan_sensor(env.unwrapped)
+            if _npz_scan is not None:
+                meta.height_scan_spec = mdp.height_scan_specs(env.unwrapped, _npz_scan)
+                meta.extero_noise_free = True
             print(f"[INFO] Recorded height_scan: {data['height_scan'].shape} "
                   f"(K={meta.height_scan_dim} rays) -- the FM height-conditioning token.")
 

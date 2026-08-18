@@ -43,13 +43,44 @@ def _latest_export() -> str | None:
     ``DEPLOY_EXPORT_DIR`` picks one explicitly -- the artifacts under ``logs/`` are
     whatever was last exported there, which may predate the current exporter; point this
     at a fresh ``play.py`` export to test the artifacts you actually mean.
-    Otherwise the most recently modified ``exported`` dir holding a ``tracker.onnx``.
+    Otherwise the most recently modified ``exported`` dir holding a ``tracker.onnx`` --
+    skipping any pair whose generator conditions on a PRIVILEGED signal.  Such a pair is
+    sim-only by construction (``GenTrackerPolicy`` refuses it without an explicit opt-in, and
+    that refusal is what this test would otherwise be reporting as a hardware failure), so
+    "the newest DEPLOYABLE export" is the thing this test means by "the newest export".
     """
     override = os.environ.get("DEPLOY_EXPORT_DIR")
     if override:
         return override
     hits = glob.glob(os.path.join(ROOT, "logs", "rsl_rl", "*", "*", "exported", "tracker.onnx"))
+    hits = [h for h in hits if not _is_privileged_pair(os.path.dirname(h))]
     return os.path.dirname(max(hits, key=os.path.getmtime)) if hits else None
+
+
+def _is_privileged_pair(exported: str) -> bool:
+    """Whether ``exported`` holds a generator conditioned on a privileged signal.
+
+    Read from the ONNX metadata directly rather than by loading the pair, so this stays a
+    cheap filter and does not depend on the very refusal it is filtering for.
+
+    Args:
+        exported: An ``exported`` directory.
+
+    Returns:
+        True when its ``fm.onnx`` declares a privileged exteroception contract.
+    """
+    fm = os.path.join(exported, "fm.onnx")
+    if not os.path.exists(fm):
+        return False
+    import json
+
+    import onnxruntime as ort
+
+    meta = ort.InferenceSession(fm, providers=["CPUExecutionProvider"]) \
+        .get_modelmeta().custom_metadata_map.get("fm_meta")
+    if not meta:
+        return False
+    return any(bool(s.get("privileged")) for s in (json.loads(meta).get("extero_spec") or []))
 
 
 def test_hardware_offline() -> None:
@@ -65,12 +96,16 @@ def test_hardware_offline() -> None:
     try:
         policy.load()
     except ValueError as exc:
-        stale = ("base_pose_convention" in str(exc)) or ("window_blocks" in str(exc))
+        stale = any(marker in str(exc) for marker in
+                    ("base_pose_convention", "window_blocks", "pre-rename exteroception keys"))
         if not stale:
             raise
         # Refusing an artifact from before the reference-window representation (or before
-        # the base_pose sign fix) is the runtime doing its job -- the whole point of those
-        # guards. There is no policy here to drive until one is retrained and re-exported.
+        # the base_pose sign fix, or before the exteroception fields were renamed) is the
+        # runtime doing its job -- the whole point of those guards. Note the rename case is
+        # the CHEAP one: unlike the others it needs only a re-export, not a retrain, so if
+        # this skip fires re-run export_fm_onnx.py on the run's checkpoint rather than
+        # waiting for one.
         # NOTE: a K>1 artifact is no longer in this list -- the runtime serves any
         # fm_update_every whose horizon fits. A horizon that does NOT fit
         # ("needs F >= ...") is an unservable export rather than a stale one, so it is
@@ -83,11 +118,11 @@ def test_hardware_offline() -> None:
     nj = len(isaac)
     depth_spec = policy.get_depth_camera_spec()
     # Width of the height scan to synthesise, 0 when this policy does not read one. The
-    # tracker's own term is authoritative (a tracker-only ctx has no real height_dim).
+    # tracker's own term is authoritative (a tracker-only ctx has no real extero_sensor_dim).
     scan_dim = 0
     if policy.needs_height_scan():
         terms = {t["name"]: t["shape"] for t in policy.get_obs_terms()}
-        scan_dim = int(terms.get("height_scan", policy.ctx.height_dim))
+        scan_dim = int(terms.get("height_scan", policy.ctx.extero_sensor_dim))
 
     # Estimator joint order != isaac order (reversed) -> exercises convert_joint_order.
     enc_names = list(reversed(isaac))

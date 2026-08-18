@@ -17,6 +17,7 @@ import datetime
 import hashlib
 import json
 import os
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field, fields
 
 import numpy as np
@@ -102,6 +103,18 @@ class RecordingMeta:
     ref_future_term_names: list[str] = field(default_factory=list)
     ref_future_term_dims: list[int] = field(default_factory=list)
     height_scan_dim: int = 0
+    height_scan_spec: list[dict] | None = None
+    """Geometry of the scanner(s) the recorded ``height_scan`` came from
+    (``mdp.height_scan_specs``), or ``None`` for a recording written before the field existed.
+
+    :attr:`height_scan_dim` is a bare ray count, which cannot say what SHAPE the grid was --
+    and a convolutional encoder needs the ``(height, width)`` fold, which ``num_rays`` alone
+    cannot distinguish from its transpose. This carries the resolution, extents, ordering and
+    fold, so the FM dataset can recompute the fold from the physical fields and refuse a file
+    whose three statements of the grid disagree.
+
+    Also carries ``privileged``, which is what makes the dense generator-only scan refusable
+    at every off-sim exit: no deployment can reproduce an exact 14k-ray ground-truth map."""
     depth_camera_spec: list[dict] | None = None
     content_sha256: str = ""
     format: str = "per_step_npz"
@@ -115,6 +128,17 @@ class RecordingMeta:
 
     Empty for a recording written before the tag existed, or from a library with no terrain
     manifest -- in both cases every ``clip_family`` is 0 and no family filter can match."""
+    clip_library_path: str = ""
+    """Clip library the teacher tracked while recording, as passed to ``--clip``.
+
+    Identifies what the per-window ``clip_id`` / ``clip_step`` index INTO. Without it those
+    columns are unjoinable: clip ids are positions in one particular library, and a
+    regenerated library reuses them for different motions. Empty = not recorded."""
+    clip_library_sha256: str = ""
+    """SHA-256 of that library file, so a join can PROVE it read the right one.
+
+    The path alone is not enough -- libraries are regenerated in place under the same name,
+    which is exactly how a silent mismatch happens. Empty = not recorded."""
     reference_blocks: list[str] | None = None
     """Reference-window blocks the RECORDING TEACHER's policy observed
     (``mdp.reference_window_selection``), in packing order.
@@ -135,11 +159,26 @@ class RecordingMeta:
     additive scalar cannot reproduce.
 
     False for a recording made on a ``-play`` task, which strips those events: the depth is
-    clean at the nominal camera pose, and ``FlowMatchingConfig.noise_depth`` is then the only
-    corruption the generator ever sees.
+    clean at the nominal camera pose, and since the FM adds no noise of its own the generator
+    then trains on an uncorrupted image the robot will never get.
 
-    The FM dataset reads this and ZEROES ``noise_depth`` when it is True, so the two do not
-    stack. Nothing else consults it."""
+    INFORMATIONAL ONLY now. The FM used to zero ``noise_depth`` on this flag; that knob is gone
+    (exteroception noise belongs to the RL DR, see ``FlowMatchingConfig``), so nothing reacts to
+    this field -- it records which task a recording came from, and reading it is on you."""
+    extero_noise_free: bool = False
+    """Whether the recorded exteroception is noise-free BY CONSTRUCTION.
+
+    The complement of :attr:`extero_corrupted`, which is depth-shaped: it says "the recorded
+    depth already carries the sim's DR", so a height-scan recording fell through it entirely.
+
+    True when every source of corruption is provably absent: the scanner has no drift ranges,
+    no event term randomises it, and the reading goes through the raw obs function rather than
+    the observation manager's noise pipeline. Set by the recorder, so "noise-free" is a property
+    of the ARTIFACT rather than of remembering to pass a flag -- and it lands in
+    ``params/fm_config.yaml`` and the checkpoint, where it can be audited after the fact.
+
+    INFORMATIONAL ONLY now, like :attr:`extero_corrupted`: it used to zero the FM's own noise
+    field, and that field is gone."""
     history_anchor: str = ""
     """Which frame each ``history_state`` row's root pose is, i.e. what the history is OBSERVED
     relative to.
@@ -456,6 +495,25 @@ _WINDOW_DTYPES: dict[str, str] = {
     # train.py --skip_families, which is why this is recorded rather than re-derived from a
     # library that may have changed. 0 everywhere for a library with no terrain manifest.
     "clip_family": "uint8",
+    # Per-window index BACK INTO the clip library: which clip, and which step of it the
+    # window's node 0 sits at. The general form of clip_family in the same way clip_family
+    # is the general form of is_distractor -- with these two, ANY per-clip or per-step
+    # library column (anchor_mask_t, terrain_id, target_vel, contact) can be joined offline
+    # without a re-record. The motivating one is anchor_mask_t: a mask BOUNDARY inside
+    # [clip_step, clip_step + F] is the ground-truth "this window crosses a terrain
+    # transition", which otherwise has to be guessed from a height threshold.
+    #
+    # Only meaningful against the library that produced them -- join through
+    # RecordingMeta.clip_library_path / clip_library_sha256, never against "whichever
+    # library is on disk now".
+    "clip_id": "int32",
+    "clip_step": "int32",
+    # Which ENV produced the window. clip_id gives the tile TYPE (via terrain_id) but not
+    # WHICH INSTANCE of it -- several envs sit on identical tiles at different origins. Any
+    # attempt to recover the instance from the pose is a proximity guess that fails once the
+    # robot is far along its tile, which is exactly how an offline re-render ends up on a
+    # neighbouring tile and metres of depth error. Recorded, so it is never guessed.
+    "env_id": "int32",
 }
 
 
@@ -469,14 +527,36 @@ def fingerprint_windows(data: dict[str, np.ndarray]) -> str:
     return fingerprint_arrays(data)
 
 
-def _window_chunk(shape: tuple[int, ...], block: int = 256) -> tuple[int, ...]:
+_CHUNK_TARGET_BYTES: int = 4 << 20
+"""Chunk-size target. HDF5's own chunk cache defaults to 1 MB, so a chunk far above that is
+read straight through it every time."""
+
+
+def _window_chunk(
+    shape: tuple[int, ...], block: int = 256, itemsize: int = 4
+) -> tuple[int, ...]:
     """Chunk shape for a windowed dataset: block windows along the first axis.
 
-    Blocking many windows per chunk keeps the chunk count small (millions of
-    single-window chunks bloat the HDF5 B-tree), while a ~1-4 MB chunk stays
-    efficient for the sequential full-load reads the FM dataset does.
+    Blocking many windows per chunk keeps the chunk count small (millions of single-window
+    chunks bloat the HDF5 B-tree), while a few-MB chunk stays efficient for the sequential
+    full-load reads the FM dataset does.
+
+    The block is capped by BYTES, not just by the window count. A fixed 256 windows is fine
+    at the depth path's 6 KiB/window but becomes a 23 MB chunk on a 22801-ray scan -- far past
+    the default 1 MB chunk cache, so every read pushes the whole thing through uncached, and
+    any future random access is hopeless.
+
+    Args:
+        shape: Full dataset shape, windows along axis 0.
+        block: Upper bound on windows per chunk.
+        itemsize: Bytes per element, for the byte cap.
+
+    Returns:
+        The chunk shape, always at least one window.
     """
-    return (min(shape[0], block),) + shape[1:]
+    row_bytes = max(1, int(np.prod(shape[1:], dtype=np.int64)) * int(itemsize))
+    by_bytes = max(1, _CHUNK_TARGET_BYTES // row_bytes)
+    return (max(1, min(shape[0], block, by_bytes)),) + shape[1:]
 
 
 class RecordedWindowWriter:
@@ -495,7 +575,7 @@ class RecordedWindowWriter:
         history_len: ``H``, history-state rows per window.
         node_dim: Per-row raw state width (== ref_future node width).
         future_len: ``F``, future nodes per window.
-        height_dim: ``K`` rays (0 to omit the ``height_scan`` dataset).
+        height_scan_dim: ``K`` rays (0 to omit the ``height_scan`` dataset).
         depth_shape: ``(num_cameras, H*W)`` for the depth dataset, or ``None`` to omit it.
             Recorded alongside the height scan so one recording can train either FM.
         cmd_dim: Future-command width (0 to omit the ``cmd_future`` dataset).
@@ -504,21 +584,41 @@ class RecordedWindowWriter:
         tag_families: Also store the per-window clip-family code (``clip_family``), which
             ``FlowMatchingConfig.skip_families`` filters on. Opt-in for the same reason
             ``tag_distractors`` is.
+        tag_clip_index: Also store ``clip_id`` + ``clip_step`` + ``env_id`` -- where the
+            window came from, so any per-clip/per-step library column can be joined offline
+            and the exact source env (hence tile instance and origin) is known rather than
+            inferred.
         record_history_ref: Also store the applied-reference history ring (``history_ref``),
             which ``history_source="reference_partial"`` trains on.
+        dtypes: Per-key storage dtype overrides, e.g. ``{"height_scan": "float16"}``. Applies
+            to this writer only -- the module-level table is left alone so existing writers
+            keep their exact output.
     """
 
     def __init__(
         self, path: str, num_windows: int, history_len: int, node_dim: int,
-        future_len: int, height_dim: int, cmd_dim: int, meta: RecordingMeta,
+        future_len: int, height_scan_dim: int, cmd_dim: int, meta: RecordingMeta,
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
         tag_distractors: bool = False, tag_families: bool = False,
-        record_history_ref: bool = False,
+        tag_clip_index: bool = False, record_history_ref: bool = False,
+        dtypes: dict[str, str] | None = None,
     ) -> None:
         import h5py
 
         self.path = str(path)
         self.num_windows = int(num_windows)
+        # Per-key dtype override, NOT a change to the module-level _WINDOW_DTYPES: re-typing
+        # that table would silently change every existing writer's output. The motivating case
+        # is a dense height scan, where float16 halves both the file and the dataset's RAM and
+        # its 1 mm quantisation is 25x finer than the 0.025 m grid cell -- and, measured, lzf
+        # holds ~39x on f16 sensor data where it collapses to ~1.7x on f32 with mantissa jitter.
+        self._dtypes = dict(_WINDOW_DTYPES)
+        for key, dtype in (dtypes or {}).items():
+            if key not in self._dtypes:
+                raise KeyError(
+                    f"dtype override for unknown window array {key!r}; "
+                    f"known: {sorted(self._dtypes)}")
+            self._dtypes[key] = str(dtype)
         shapes: dict[str, tuple[int, ...]] = {
             "history_state": (num_windows, history_len, node_dim),
             "ref_future": (num_windows, future_len, node_dim),
@@ -540,8 +640,15 @@ class RecordedWindowWriter:
         # ``--skip_families`` could never find its tag.
         if tag_families:
             shapes["clip_family"] = (num_windows,)
-        if height_dim > 0:
-            shapes["height_scan"] = (num_windows, height_dim)
+        # Opt-in for the same reason: write_batch requires every DECLARED key to be supplied
+        # each batch, so declaring these unconditionally would break any caller that does not
+        # assemble them.
+        if tag_clip_index:
+            shapes["clip_id"] = (num_windows,)
+            shapes["clip_step"] = (num_windows,)
+            shapes["env_id"] = (num_windows,)
+        if height_scan_dim > 0:
+            shapes["height_scan"] = (num_windows, height_scan_dim)
         if depth_shape is not None:
             shapes["depth"] = (num_windows, int(depth_shape[0]), int(depth_shape[1]))
         if cmd_dim > 0:
@@ -549,9 +656,11 @@ class RecordedWindowWriter:
         self._keys = list(shapes)
         self._f = h5py.File(self.path, "w")
         for key, shape in shapes.items():
+            dtype = self._dtypes[key]
             self._f.create_dataset(
-                key, shape=shape, dtype=_WINDOW_DTYPES[key],
-                chunks=_window_chunk(shape), compression=compression,
+                key, shape=shape, dtype=dtype,
+                chunks=_window_chunk(shape, itemsize=np.dtype(dtype).itemsize),
+                compression=compression,
             )
         # RecordingMeta as JSON attrs (reconstructed by load_recorded_windows).
         for k, v in asdict(meta).items():
@@ -573,7 +682,7 @@ class RecordedWindowWriter:
         end = start + take
         for key in self._keys:
             arr = np.asarray(batch[key])[:take]
-            self._f[key][start:end] = arr.astype(_WINDOW_DTYPES[key], copy=False)
+            self._f[key][start:end] = arr.astype(self._dtypes[key], copy=False)
         self._written = end
         return take
 
@@ -597,22 +706,86 @@ class RecordedWindowWriter:
         self.close()
 
 
-def load_recorded_windows(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]:
+#: Every per-window array a recording can hold, in declaration order. The public name for
+#: ``_WINDOW_DTYPES``' keys, so a caller can name the subset it needs without reaching into
+#: the dtype table.
+WINDOW_ARRAY_KEYS: tuple[str, ...] = tuple(_WINDOW_DTYPES)
+
+#: Per-window arrays small enough to load in full just to DECIDE what else to load: the
+#: episode split, the family/distractor filters and the library join all read only these.
+#: Everything absent from this set is a per-node or per-pixel array whose cost is the reason
+#: the two-pass load exists.
+WINDOW_INDEX_KEYS: tuple[str, ...] = (
+    "episode_id", "clip_id", "clip_step", "env_id", "is_distractor", "clip_family",
+)
+
+
+def read_recording_meta(path: str) -> tuple[RecordingMeta, int]:
+    """The metadata and window count of a windowed recording, reading NO array data.
+
+    Args:
+        path: Recording ``.h5``.
+
+    Returns:
+        ``(meta, num_windows)``.
+    """
+    import h5py
+
+    with h5py.File(str(path), "r") as f:
+        n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+        raw_attrs = {k: json.loads(v) for k, v in f.attrs.items()
+                     if k not in ("num_windows", "num_windows_written")}
+    field_names = {fld.name for fld in fields(RecordingMeta)}
+    return RecordingMeta(**{k: v for k, v in raw_attrs.items() if k in field_names}), n
+
+
+def load_recorded_windows(
+    path: str, keys: Sequence[str] | None = None, rows: np.ndarray | None = None
+) -> tuple[dict[str, np.ndarray], RecordingMeta]:
     """Load a windowed recording written by :class:`RecordedWindowWriter`.
 
     Returns ``(data, meta)`` where ``data`` holds the pre-formed window arrays
     (``history_state``, ``ref_future``, and -- when present -- ``height_scan``,
     ``cmd_future``, plus ``episode_id``), each trimmed to ``num_windows_written``.
     ``meta`` is reconstructed from the JSON root attrs.
+
+    Args:
+        path: Recording ``.h5``.
+        keys: Only load these arrays (missing ones are skipped). ``None`` loads everything.
+            The motivating case is exteroception: a recording carries BOTH the height scan and
+            the depth images so one file can train either generator, but a given run reads
+            exactly one of them -- and on a dense scan the unused array is the largest thing in
+            the file.
+        rows: Only load these window indices. ``None`` loads all of them. Combined with
+            ``keys`` this is what lets a run hold just its own split of just its own arrays,
+            rather than every window of every array and then discarding most of it.
+
+    Returns:
+        ``(data, meta)``.
     """
     import h5py
 
     data: dict[str, np.ndarray] = {}
+    wanted = None if keys is None else set(keys)
     with h5py.File(str(path), "r") as f:
         n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+        if rows is not None:
+            # h5py fancy indexing requires STRICTLY increasing indices -- not merely sorted,
+            # so a repeated row is rejected too. Read the sorted unique set and expand it back
+            # through the inverse map, which restores the caller's order and any duplicates.
+            take = np.asarray(rows, dtype=np.int64)
+            if take.size and (take.min() < 0 or take.max() >= n):
+                raise IndexError(
+                    f"row index out of range for {path}: got [{take.min()}, {take.max()}] "
+                    f"with {n} windows written.")
+            sorted_take, inverse = np.unique(take, return_inverse=True)
         for key in _WINDOW_DTYPES:
-            if key in f:
+            if key not in f or (wanted is not None and key not in wanted):
+                continue
+            if rows is None:
                 data[key] = f[key][:n]
+            else:
+                data[key] = f[key][sorted_take][inverse]
         raw_attrs = {k: json.loads(v) for k, v in f.attrs.items()
                      if k not in ("num_windows", "num_windows_written")}
     field_names = {fld.name for fld in fields(RecordingMeta)}

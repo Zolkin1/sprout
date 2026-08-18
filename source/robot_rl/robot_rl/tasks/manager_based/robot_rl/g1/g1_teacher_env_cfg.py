@@ -389,9 +389,10 @@ class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
     reset_on_clip = EventTerm(
         func=mdp.reset_on_motion_sequence,
         mode="reset",
-        # ``pin_*`` are evaluation knobs and default to OFF (sample a clip + start step per
-        # reset, as training wants). Declared here rather than left to the function
-        # signature because hydra refuses to override a key absent from the config.
+        # ``pin_*`` default to OFF (sample a clip + start step per reset, as training
+        # wants); evaluation pins the clip, and ``record_data.py`` pins the start step to 0
+        # so its windows cover clip phase uniformly. Declared here rather than left to the
+        # function signature because hydra refuses to override a key absent from the config.
         #
         # The sentinels are typed, not None: Isaac Lab's configclass infers a param's type
         # from its default, so a ``None`` default makes the field NoneType and rejects the
@@ -405,8 +406,13 @@ class G1TeacherEventsCfg(G1ClfTrackingEventsCfg):
         #   measurably helps survival, so it stays on until clip GENERATION makes frame 0
         #   self-consistent -- then this goes back to 0. Survival numbers are only comparable
         #   across runs at the same value.
+        # ``clip_draw`` is "random" for training (sample with replacement -- an unseen clip
+        # is just a clip the policy did not get this run) and "cycle" for recording, where
+        # clip COVERAGE is the deliverable and with-replacement sampling misses a random
+        # 37% of the library in a full-library-sized run. See mdp.events.resets.ClipCycler.
         params={"command_name": "traj_ref", "base_frame_name": "pelvis_link",
-                "pin_clip_ids": "", "pin_start_step": -1, "spawn_z_offset": 0.005},
+                "pin_clip_ids": "", "pin_start_step": -1, "spawn_z_offset": 0.005,
+                "clip_draw": "random"},
     )
 
 

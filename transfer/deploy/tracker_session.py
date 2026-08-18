@@ -24,6 +24,11 @@ PROVIDER_ALIASES = {
     "tensorrt": "TensorrtExecutionProvider",
 }
 
+#: Provider request meaning "the GPU if this wheel has one, else the CPU".
+#: Not an alias (it resolves against what is installed, not to a fixed name) and not what
+#: ``None`` means -- see :func:`_expand_auto`.
+AUTO_PROVIDER = "auto"
+
 
 _GPU_DLLS_PRELOADED = False
 
@@ -51,14 +56,43 @@ def _preload_gpu_dlls() -> None:
                   "provider may fall back to CPU.")
 
 
+def _expand_auto(providers: list) -> list:
+    """Replace an ``"auto"`` element with the best provider this wheel actually offers.
+
+    ``auto`` exists for the SIMULATION runners, where the GPU is simply the right default:
+    the generator is ~99% of the step cost and CPU is not a degraded mode for it but an
+    unusable one (~100 ms against a 20 ms budget), so a CPU-by-default sim2sim run is a
+    5x-slower run nobody asked for.
+
+    It is deliberately NOT what ``None`` means. On hardware the provider is part of what a
+    run claims about itself, so it stays stated rather than discovered -- and a named
+    provider that is missing still raises below. ``auto`` is the one request that cannot
+    fail: "no CUDA on this box" is an answer to it, not an error.
+
+    Args:
+        providers: The requested provider list, possibly containing ``"auto"``.
+
+    Returns:
+        The list with every ``"auto"`` replaced by ``"cuda"`` or ``"cpu"``. Returned
+        unchanged (and without querying onnxruntime) when there is no ``"auto"`` in it.
+    """
+    if not any(isinstance(p, str) and p.lower() == AUTO_PROVIDER for p in providers):
+        return providers
+    best = ("cuda" if PROVIDER_ALIASES["cuda"] in set(ort.get_available_providers())
+            else "cpu")
+    return [best if isinstance(p, str) and p.lower() == AUTO_PROVIDER else p
+            for p in providers]
+
+
 def resolve_providers(providers=None) -> list:
     """Normalise a provider request into an onnxruntime provider list.
 
     Args:
         providers: ``None`` for CPU only (the deployment default -- a GPU is opt-in, so
             nothing silently starts using one); a list of names or short aliases
-            (``cpu`` / ``cuda`` / ``trt``); or a list of ``(name, options)`` tuples,
-            which pass through untouched.
+            (``cpu`` / ``cuda`` / ``trt``); ``["auto"]`` to take the GPU when the wheel
+            has one and the CPU otherwise (see :func:`_expand_auto`); or a list of
+            ``(name, options)`` tuples, which pass through untouched.
 
     Returns:
         A provider list suitable for :class:`onnxruntime.InferenceSession`. Aliases are
@@ -70,6 +104,7 @@ def resolve_providers(providers=None) -> list:
     """
     if providers is None:
         return ["CPUExecutionProvider"]
+    providers = _expand_auto(providers)
     names = [p[0] if isinstance(p, tuple) else PROVIDER_ALIASES.get(str(p).lower(), str(p))
              for p in providers]
     if any(n != "CPUExecutionProvider" for n in names):
