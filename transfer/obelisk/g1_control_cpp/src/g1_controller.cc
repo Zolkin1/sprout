@@ -5,6 +5,10 @@
 #include <obelisk_control_msgs/msg/execution_fsm.hpp>
 #include <obelisk_control_msgs/msg/velocity_command.hpp>
 
+// For rcl_timer_get_period: rclcpp::TimerBase exposes no accessor for the period itself,
+// only the rcl handle it wraps. See the note at the timer_ctrl check.
+#include <rcl/timer.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -203,14 +207,30 @@ void G1Controller::LoadPolicy() {
 
   // The control timer's period must match the policy's dt, or every cadence number here is
   // about a different clock than the one the policy trained on.
+  //
+  // rcl_timer_get_period, NOT TimerBase::time_until_trigger(). The latter is the time
+  // REMAINING until the next fire, which is a different quantity and never the right one
+  // here. Two ways it was wrong, and the first is the one that showed up:
+  //
+  //   * this runs in on_configure, where obelisk has CREATED the timer but not yet started
+  //     it, and rclcpp maps a cancelled timer to nanoseconds::max(). So the check fired on
+  //     every single bring-up reporting a period of 9223372036.8548 s (INT64_MAX ns) --
+  //     a warning about the control rate, on a stack whose control rate is the thing under
+  //     test, that was guaranteed to be noise.
+  //   * on a RUNNING timer it would have been no better, only less obviously broken: the
+  //     value is a random fraction of the period, so the check would pass or fail depending
+  //     on when it happened to sample.
   const auto timer = this->GetTimer("timer_ctrl");
   if (timer) {
-    const double period = std::chrono::duration<double>(timer->time_until_trigger()).count();
-    if (period > 0.0 && std::abs(period - p.dt) > 0.25 * p.dt) {
-      RCLCPP_WARN(this->get_logger(),
-                  "timer_ctrl period looks like %.4f s but the policy's dt is %.4f s; the "
-                  "re-plan cadence is counted in TICKS, so a mismatch silently rescales it",
-                  period, p.dt);
+    int64_t period_ns = 0;
+    if (rcl_timer_get_period(timer->get_timer_handle().get(), &period_ns) == RCL_RET_OK) {
+      const double period = static_cast<double>(period_ns) * 1e-9;
+      if (period > 0.0 && std::abs(period - p.dt) > 0.25 * p.dt) {
+        RCLCPP_WARN(this->get_logger(),
+                    "timer_ctrl period is %.4f s but the policy's dt is %.4f s; the "
+                    "re-plan cadence is counted in TICKS, so a mismatch silently rescales it",
+                    period, p.dt);
+      }
     }
   }
 }
