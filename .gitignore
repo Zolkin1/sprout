@@ -84,6 +84,11 @@ transfer/obelisk/g1_control/resource/hf_cache/
 # mounts only $REPO_ROOT and the robot has no clips/ directory.
 transfer/obelisk/g1_control/resource/debug_clips/
 transfer/obelisk/docker/.env
+# One machine's view of the split link: its own interface address and the OTHER box as a
+# peer. Committing it would hand every box the desktop's half of an asymmetric pair, which
+# is the "one box sees the other's topics and not the reverse" failure the example warns
+# about. Same reasoning as .env above; docker/cyclonedds.xml.example is what is tracked.
+transfer/obelisk/docker/cyclonedds.xml
 transfer/obelisk/MUJOCO_LOG.TXT
 g1_hardware_log/
 

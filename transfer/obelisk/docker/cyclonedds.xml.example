@@ -9,42 +9,74 @@ at it from docker/.env:
 
     CYCLONEDDS_URI=file:///home/zolkin/sprout/transfer/obelisk/docker/cyclonedds.xml
 
-then `docker compose up -d --force-recreate` (compose reads .env only when it CREATES a
-container). The path is the one INSIDE the container, which is the same as the host path --
-the whole repo is bind-mounted at $REPO_ROOT. Verify with `scripts/net_check.sh`, whose
-section 2 prints the parsed peer list.
+then recreate the container: compose reads .env only when it CREATES one, so `docker compose
+up -d` on its own is not enough and the force recreate flag is required. The path is the one
+INSIDE the container, which is the same as the host path, since the whole repo is bind
+mounted at $REPO_ROOT. Verify with `scripts/net_check.sh`, whose section 2 prints the parsed
+peer list.
 
-WHEN YOU NEED THIS
-------------------
+NO DOUBLE HYPHEN ANYWHERE IN A COMMENT IN THIS FILE. A double hyphen is illegal inside an
+XML comment, and an earlier version of this file was full of them: an underline rule, a
+command flag, and several prose dashes. Cyclone's own parser happens to tolerate them, which
+is why it went unnoticed, but ElementTree and every other conforming reader rejects the file
+outright. It is the same trap this repo has already hit in two MJCF comments and in a
+package.xml, so it is called out here rather than left to be rediscovered.
+
+REQUIRED HOST SETTING, ON BOTH BOXES
+====================================
+SocketReceiveBufferSize below asks for 10 MB, and a kernel that cannot give it is FATAL
+rather than a warning: the domain is never created, and every ROS node in the container dies
+at startup with
+
+    rmw_create_node: failed to create domain, error Error
+
+preceded by one line naming the real cause, "failed to increase socket receive buffer size
+to at least 10485760 bytes, current is 425984 bytes". Ubuntu ships net.core.rmem_max =
+212992 (the kernel then offers twice rmem_default), so this fails on a stock box until it is
+raised:
+
+    sudo sysctl -w net.core.rmem_max=16777216
+    echo 'net.core.rmem_max=16777216' | sudo tee /etc/sysctl.d/60-cyclonedds.conf
+
+The container runs with host networking, so the HOST value is the one that counts, and this
+has to be done on the brain box and the world box alike.
+
+WHEN YOU NEED THIS FILE
+=======================
 Cyclone's default discovery is UDP multicast, and it works on a wired switch with no
-configuration at all -- that is why nothing in this repo sets CYCLONEDDS_URI and why the
+configuration at all, which is why nothing in this repo sets CYCLONEDDS_URI and why the
 Jetson depth camera has always reached the control stack without one. Reach for this file
 only when discovery does not cross:
 
   * WIFI. Campus, guest and most enterprise APs enable client isolation, which drops
     multicast between clients. Two boxes on the same SSID then see nothing of each other
-    while both look perfectly healthy locally. This is the common case for a split
-    sim -- the Thor is on wifi.
-  * A MULTI-HOMED BOX. With several interfaces up, Cyclone picks one for discovery and it
-    is not necessarily the one that reaches the other machine. <NetworkInterface> below
-    settles it.
+    while both look perfectly healthy locally.
+  * A MULTI HOMED BOX. With several interfaces up, Cyclone picks one for discovery and it
+    is not necessarily the one that reaches the other machine. NetworkInterface below
+    settles it. This applies even on a clean wired link, because the box still has wifi up
+    for internet.
   * A ROUTED LINK. Multicast does not cross subnets without the switch being configured
     for it.
 
 `obk` sets RMW_IMPLEMENTATION and ROS_DOMAIN_ID and does NOT touch CYCLONEDDS_URI, so this
 composes with it rather than fighting it.
 
-BOTH BOXES NEED A COPY, each listing the OTHER. A peer list is not symmetric by magic;
-one-sided discovery gives you a graph where one box sees the other's topics and not the
-reverse, which reads as a QoS or type problem and is not one.
+BOTH BOXES NEED A COPY, each listing the OTHER. A peer list is not symmetric by magic; one
+sided discovery gives you a graph where one box sees the other's topics and not the reverse,
+which reads as a QoS or type problem and is not one.
 -->
 <CycloneDDS xmlns="https://cdds.io/config">
   <Domain id="any">
     <General>
-      <!-- Which interface to speak on. `*` lets Cyclone choose, which is wrong on a box with
-           wifi + wired + docker bridges all up. Name it explicitly: on the Thor the wifi is
-           wlP1p1s0 and the wired ports are mgbe0_0..2 (`ip -brief addr` to check).
-           An IP address works here too and is less fragile than a driver-assigned name. -->
+      <!-- Which interface to speak on. Autodetermine lets Cyclone choose, which is wrong on
+           a box with wifi, wired and docker bridges all up. Pin it: on the Thor the wifi is
+           wlP1p1s0 and the wired ports are mgbe0_0 through mgbe0_2 (`ip -brief addr` to
+           check). An IP ADDRESS is preferred over a name and is what the committed
+           cyclonedds.xml uses: a driver assigned name changes when the adapter does, and on
+           a private link the address is the thing you chose deliberately.
+
+             <NetworkInterface address="192.168.50.10" priority="default" multicast="default" />
+        -->
       <Interfaces>
         <NetworkInterface autodetermine="true" priority="default" multicast="default" />
       </Interfaces>
@@ -63,20 +95,26 @@ reverse, which reads as a QoS or type problem and is not one.
            and this file is left configured. -->
       <Peers>
         <Peer address="localhost" />
-        <!-- <Peer address="10.8.50.120" />  the Thor (brain) -->
-        <!-- <Peer address="10.8.50.???" />  the dev desktop (world) -->
+        <!-- <Peer address="192.168.50.20" />  the Thor (brain) -->
+        <!-- <Peer address="192.168.50.10" />  the dev desktop (world) -->
       </Peers>
-      <!-- Default is 30 s; participants that come and go during bring-up are noticed sooner
-           at 5 s, at the cost of a little more discovery traffic. -->
       <ParticipantIndex>auto</ParticipantIndex>
     </Discovery>
 
     <Internal>
       <!-- The 500 Hz encoder and 1 kHz IMU streams are the only ones that stress the link.
            Cyclone's default socket buffers are sized for far less, and the symptom of an
-           undersized receive buffer is not an error -- it is silently dropped samples that
-           read as a jittery estimator. -->
-      <MinimumSocketReceiveBufferSize>10MB</MinimumSocketReceiveBufferSize>
+           undersized receive buffer is not an error: it is silently dropped samples that
+           read as a jittery estimator.
+
+           SocketReceiveBufferSize[@min], NOT MinimumSocketReceiveBufferSize. The latter is
+           what this file shipped with and it is a MOVED setting on this Cyclone pin, which
+           logs "setting moved to ..." on every single launch.
+
+           The unit spelling is picky: "kB" and "MB" parse, "KB" does not, and an unparsable
+           value is fatal exactly like an unsatisfiable one. See the host setting note at the
+           top before assuming 10 MB is free. -->
+      <SocketReceiveBufferSize min="10 MB" />
     </Internal>
   </Domain>
 </CycloneDDS>
