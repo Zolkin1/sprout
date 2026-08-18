@@ -98,6 +98,14 @@ struct CameraGeom {
   size_t pixels() const { return static_cast<size_t>(width) * static_cast<size_t>(height); }
 };
 
+/// Fill a CameraGeom from a parsed contract entry.
+///
+/// Declared here and defined in policy_params.cc so depth_obs stays free of the metadata
+/// layer. The point is that no consumer ever restates a camera number: the contract is the
+/// single producer, and this is the one place it becomes geometry.
+struct DepthCameraSpec;
+CameraGeom GeomFromSpec(const DepthCameraSpec& spec);
+
 /// Unit ray directions in the camera frame, matching IsaacLab's pinhole pattern.
 ///
 /// Pixel CENTRES through the inverse intrinsic matrix, then into the robotics camera frame

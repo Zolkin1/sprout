@@ -23,6 +23,7 @@
 // a parity test against the real artifact rather than a synthetic one.
 
 #include <optional>
+#include <array>
 #include <string>
 #include <utility>
 #include <vector>
@@ -71,6 +72,19 @@ struct DepthCameraSpec {
   double max_dist = 9.0;
   double min_clip_val = 0.0;
   double max_clip_val = 0.0;
+  /// Pinhole intrinsics, in pixels. Needed to turn a reading into a DIRECTION, which is what
+  /// the generator's xyz channels are built from. Absent on a contract exported before the
+  /// channels existed, which is why they default rather than throw.
+  double fx = 1.0;
+  double fy = 1.0;
+  double cx = 0.0;
+  double cy = 0.0;
+  /// The camera's NOMINAL pose on its mount body: where a calibrated robot believes it is.
+  /// Never a per-episode jitter draw -- the training term used the nominal pose deliberately,
+  /// so that the domain randomisation perturbs the IMAGE relative to the stated geometry,
+  /// which is what calibration error actually is.
+  std::array<double, 3> offset_pos{{0.0, 0.0, 0.0}};
+  std::array<double, 4> offset_quat_xyzw{{0.0, 0.0, 0.0, 1.0}};
 
   int pixels() const { return width * height; }
 };

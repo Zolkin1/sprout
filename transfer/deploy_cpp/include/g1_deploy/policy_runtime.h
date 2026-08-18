@@ -14,6 +14,7 @@
 
 #include <map>
 #include <memory>
+#include <array>
 #include <optional>
 #include <string>
 #include <vector>
@@ -46,6 +47,17 @@ struct HardwareReadings {
   std::vector<std::vector<double>> depth_raw;
   //: Per-ray ground clearance, for a height-scan policy.
   std::vector<double> height_scan;
+  //: Each camera's pose in the ROOT'S YAW-ALIGNED frame, in CONTRACT order: position, then a
+  //: ROW-major 3x3. Required once the generator conditions on more than depth, because the
+  //: xyz channels are the image unprojected into that frame and this runtime cannot derive
+  //: the pose itself -- it has no kinematics.
+  //:
+  //: Build it from FK to the camera mount plus the IMU's roll/pitch, and NEVER from odometry:
+  //: the frame's yaw and the root position both cancel out of it, which is exactly why a
+  //: drifting yaw estimate cannot corrupt the cloud. The nominal mount offset from the
+  //: contract, not a calibration draw -- see DepthCameraSpec::offset_pos.
+  std::vector<std::array<double, 3>> fm_camera_pos;
+  std::vector<std::array<double, 9>> fm_camera_rot;
 };
 
 /// How to load the pair.

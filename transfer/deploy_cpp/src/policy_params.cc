@@ -2,6 +2,8 @@
 
 #include "g1_deploy/policy_params.h"
 
+#include "g1_deploy/depth_obs.h"
+
 #include <nlohmann/json.hpp>
 
 #include <cmath>
@@ -191,6 +193,23 @@ PolicyParams ParsePolicyParameters(const std::string& json) {
       d.max_dist = cam.at("max_dist").get<double>();
       d.min_clip_val = cam.at("min_clip_val").get<double>();
       d.max_clip_val = cam.at("max_clip_val").get<double>();
+      // Optional: a contract exported before the xyz channels carries no intrinsics, and a
+      // 1-channel generator never asks for them. A multi-channel one does, and is refused
+      // at the point of use rather than here, where the reason would be less obvious.
+      if (cam.contains("fx")) d.fx = cam.at("fx").get<double>();
+      if (cam.contains("fy")) d.fy = cam.at("fy").get<double>();
+      if (cam.contains("cx")) d.cx = cam.at("cx").get<double>();
+      if (cam.contains("cy")) d.cy = cam.at("cy").get<double>();
+      if (cam.contains("offset_pos")) {
+        for (size_t i = 0; i < 3 && i < cam.at("offset_pos").size(); ++i) {
+          d.offset_pos[i] = cam.at("offset_pos")[i].get<double>();
+        }
+      }
+      if (cam.contains("offset_quat_xyzw")) {
+        for (size_t i = 0; i < 4 && i < cam.at("offset_quat_xyzw").size(); ++i) {
+          d.offset_quat_xyzw[i] = cam.at("offset_quat_xyzw")[i].get<double>();
+        }
+      }
       p.depth_cameras.push_back(std::move(d));
     }
   }
@@ -205,6 +224,23 @@ PolicyParams ParsePolicyParameters(const std::string& json) {
                              " but the graph declares num_obs=" + std::to_string(p.num_obs));
   }
   return p;
+}
+
+CameraGeom GeomFromSpec(const DepthCameraSpec& spec) {
+  CameraGeom g;
+  g.width = spec.width;
+  g.height = spec.height;
+  g.fx = spec.fx;
+  g.fy = spec.fy;
+  g.cx = spec.cx;
+  g.cy = spec.cy;
+  g.norm.offset = spec.offset;
+  g.norm.scale = spec.scale;
+  g.norm.min_dist = spec.min_dist;
+  g.norm.max_dist = spec.max_dist;
+  g.norm.min_clip_val = spec.min_clip_val;
+  g.norm.max_clip_val = spec.max_clip_val;
+  return g;
 }
 
 }  // namespace g1_deploy

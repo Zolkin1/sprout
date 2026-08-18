@@ -14,6 +14,7 @@
 #include <sstream>
 #include <string>
 
+#include "g1_deploy/depth_obs.h"
 #include "g1_deploy/policy_params.h"
 
 namespace g1_deploy {
@@ -206,6 +207,42 @@ TEST(PolicyParams, FlattensMultiDimensionalTermShapes) {
   })";
   const PolicyParams p = ParsePolicyParameters(json);
   EXPECT_EQ(p.obs_terms[0].width, 20);
+}
+
+TEST_F(PolicyParamsFixture, TheCameraContractCarriesItsIntrinsicsAndNominalMount) {
+  // The generator's xyz channels turn a reading into a DIRECTION and then a position, so the
+  // pinhole intrinsics and the mount pose are as load-bearing as the range fields beside
+  // them. They travel in the same contract precisely so no consumer restates a camera number
+  // -- the failure that would cause is a cloud in the wrong place, which looks plausible.
+  const PolicyParams p = ParsePolicyParameters(raw_);
+  ASSERT_EQ(p.depth_cameras.size(), 2u);
+
+  const DepthCameraSpec& near = p.depth_cameras[0];
+  const DepthCameraSpec& far = p.depth_cameras[1];
+  EXPECT_EQ(near.sensor, "depth_camera_near");
+  EXPECT_EQ(near.mount_body, "torso_link");
+  EXPECT_EQ(far.mount_body, "torso_link");
+
+  // The two are different LENSES -- ~100x70 deg against ~70x42 -- which is why the angular
+  // position embedding is per sensor and why one shared set of intrinsics would mislabel the
+  // far camera while every shape stayed correct.
+  EXPECT_NEAR(near.fx, 12.586494467659199, 1e-12);
+  EXPECT_NEAR(far.fx, 21.42222010113172, 1e-12);
+  EXPECT_GT(far.fx, near.fx) << "the far camera is the narrower lens";
+  EXPECT_NEAR(near.cx, near.width / 2.0, 1e-12);
+
+  // Both mounted on the torso, the far one higher and pitched shallower.
+  EXPECT_NEAR(near.offset_pos[2], 0.099426, 1e-9);
+  EXPECT_NEAR(far.offset_pos[2], 0.38, 1e-9);
+  EXPECT_LT(far.offset_quat_xyzw[1], near.offset_quat_xyzw[1]) << "far looks less steeply down";
+
+  // And the contract becomes geometry in exactly one place.
+  const CameraGeom g = GeomFromSpec(far);
+  EXPECT_EQ(g.width, far.width);
+  EXPECT_EQ(g.pixels(), static_cast<size_t>(far.pixels()));
+  EXPECT_NEAR(g.fx, far.fx, 1e-12);
+  EXPECT_NEAR(g.norm.max_dist, far.max_dist, 1e-12);
+  EXPECT_NEAR(g.norm.offset, far.offset, 1e-12);
 }
 
 }  // namespace

@@ -292,19 +292,45 @@ void PolicyRuntime::Step(const HardwareReadings& readings,
   if (fm_) {
     FmConditioning cond;
     cond.extero.assign(static_cast<size_t>(fm_->meta().extero_dim()), 0.0);
+    const int channels = fm_->meta().extero_channels;
+    if (channels > 1) {
+      // The generator reads more than depth, so each pixel carries its position in the root's
+      // yaw-aligned frame. That needs the camera pose, which this runtime cannot derive --
+      // it has no kinematics and, deliberately, no odometry. Refused rather than defaulted:
+      // a wrong pose is a cloud in the wrong place, which looks entirely plausible.
+      if (readings.fm_camera_pos.size() != readings.depth_raw.size() ||
+          readings.fm_camera_rot.size() != readings.depth_raw.size()) {
+        throw std::runtime_error(
+            "fm.onnx conditions on " + std::to_string(channels) +
+            " channels per pixel, so it needs each camera's pose in the root's yaw-aligned "
+            "frame (fm_camera_pos / fm_camera_rot, one per camera in contract order). Build "
+            "it from FK to the mount plus the IMU's roll/pitch -- never odometry.");
+      }
+      std::vector<CameraGeom> geoms;
+      std::vector<std::vector<double>> normalised;
+      std::vector<const double*> images, positions, rotations;
+      for (size_t c = 0; c < readings.depth_raw.size(); ++c) {
+        const CameraGeom g = GeomFromSpec(tracker_->params().depth_cameras[c]);
+        geoms.push_back(g);
+        normalised.emplace_back(readings.depth_raw[c].size());
+        NormalizeDepthImage(readings.depth_raw[c].data(), readings.depth_raw[c].size(), g.norm,
+                            normalised.back().data());
+        positions.push_back(readings.fm_camera_pos[c].data());
+        rotations.push_back(readings.fm_camera_rot[c].data());
+      }
+      for (const auto& img : normalised) images.push_back(img.data());
+      // The band goes IN, so the image is clamped before the unprojection and the position
+      // channels are not clamped at all -- see DepthXyzRows.
+      DepthXyzRows(geoms, images, positions, rotations, channels, fm_->meta().extero_clip,
+                   cond.extero.data());
+    }
     size_t at = 0;
-    for (size_t c = 0; c < readings.depth_raw.size() && at < cond.extero.size(); ++c) {
-      const DepthCameraSpec& cam = tracker_->params().depth_cameras[c];
-      DepthNorm n;
-      n.offset = cam.offset;
-      n.scale = cam.scale;
-      n.min_dist = cam.min_dist;
-      n.max_dist = cam.max_dist;
-      n.min_clip_val = cam.min_clip_val;
-      n.max_clip_val = cam.max_clip_val;
+    for (size_t c = 0; channels == 1 && c < readings.depth_raw.size() && at < cond.extero.size();
+         ++c) {
+      const CameraGeom g = GeomFromSpec(tracker_->params().depth_cameras[c]);
       for (double v : readings.depth_raw[c]) {
         if (at >= cond.extero.size()) break;
-        cond.extero[at++] = NormalizeDepth(v, n);
+        cond.extero[at++] = NormalizeDepth(v, g.norm);
       }
     }
     if (!readings.height_scan.empty() && readings.depth_raw.empty()) {
@@ -313,10 +339,17 @@ void PolicyRuntime::Step(const HardwareReadings& readings,
       }
     }
     // The generator's own normalisation is folded into the graph, but the band clamp is not:
-    // one non-finite entry would poison the whole conditioning.
-    // The band from the GRAPH, not from the per-source table: see SanitizeExteroBand.
-    SanitizeExteroBand(cond.extero.data(), cond.extero.size(), fm_->meta().extero_clip,
-                       cond.extero.data());
+    // one non-finite entry would poison the whole conditioning. The band comes from the GRAPH
+    // rather than the per-source table (see SanitizeExteroBand).
+    //
+    // SKIPPED for a widened row, which DepthXyzRows has already clamped in the one place
+    // clamping belongs -- the depth image, before the unprojection. Applying it again here
+    // would clamp METRES of position with a normalised-depth band, which is the bug this
+    // ordering exists to prevent.
+    if (channels == 1) {
+      SanitizeExteroBand(cond.extero.data(), cond.extero.size(), fm_->meta().extero_clip,
+                         cond.extero.data());
+    }
     cond.future_cmd.assign(static_cast<size_t>(fm_->meta().f) * fm_->meta().cmd_dim, 0.0);
     for (int f = 0; f < fm_->meta().f; ++f) {
       cond.future_cmd[static_cast<size_t>(f) * 3 + 0] = readings.command.x();
