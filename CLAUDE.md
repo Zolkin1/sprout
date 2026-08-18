@@ -286,6 +286,34 @@ one (`gen_tracker_runner.py --fm_onnx`, `benchmark.py --fm`, `export_sensor_conf
   `extero_sensor_count`) are refused at load and need one `export_fm_onnx.py` call; the `.pt`
   is unaffected.
 
+## MVP: the depth-camera generator RUNS in sim2sim (2026-08-18)
+
+The first generator trained on the 5-channel depth row drives the tracker through MuJoCo
+sim2sim, and the architecture is **working** — this is the minimum viable product for
+camera-only exteroception, replacing the privileged height scan on the deploy path.
+
+Covered in MuJoCo, with the generator in the loop: **flat ground, stairs UP, jump-ups,
+jump-downs.** **Stairs DOWN still needs work** and is the open item — the one locomotion mode
+the pair does not yet handle.
+
+The pair, so the result is reproducible:
+- generator `logs/flow_matching/2026-08-17_12-53-18_depth_xyz5_contract_v1` (epoch 94 of 100,
+  EMA weights, 27M), exported as `<run>_best_banded_fm.onnx`
+- tracker `logs/rsl_rl/g1/2026-08-04_21-55-17_yaw_k12_v1` (`G1-teacher-clf-terrain-depth`),
+  trained + recorded on `clips/g1_mb_v5_body.h5`
+- `extero_channels=5`, `extero_norm_mode=contract`, `strides (1,2,2)` = 56 tok/camera
+  (sequence 191), band ±5.575, `attention_mode=prefix`, `fm_update_every=12` (from the
+  tracker's metadata, not K=1)
+- scenes: `--scene terrain_scene` (in-distribution playground) and `--scene tile0_scene` (ONE
+  real Isaac tile, manifest-identical to `g1_mb_v5_body.h5` tile 0 — verified, not assumed)
+
+**This checkpoint stores `extero_clip` only because it was stamped by hand.** It was trained
+inside the window between the depth band moving 2.0 → 5.575 and the stamping fix, so its own
+config carries `null`; the band was recovered forensically (the saved envelope of 5.0 is
+reachable only from 5.575, since 2.0 gives 3.5) and written into a `best_banded.pt` copy.
+Anything trained after that fix stamps itself. See the band note above for why a `null` is
+ambiguous rather than merely missing.
+
 ## sim2sim (MuJoCo)
 - `transfer/sim/depth_camera.py` — `mj_multiRay` re-implementation (~3.9 ms/frame for both cameras).
   Casts geom groups {1 = per-link visual meshes, 2 = terrain}: self-occlusion comes from group 1, and
