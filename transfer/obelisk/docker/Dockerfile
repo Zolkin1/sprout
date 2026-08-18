@@ -167,13 +167,31 @@ RUN echo "Pulling Obelisk..."
 # likeliest explanation for the generator "looking worse" since 2026-08-06 -- the date the
 # depth pair was wired into the world and pushed the sim over the edge.
 #
+# Bumped again e8d4b7f -> c6fc6ca, which reverts ONLY the first of those three commits: the
+# callback group goes back to Reentrant, keeping both snapshot commits. Serialising was
+# justified by "every sensor callback takes sensor_data_mut_ for its whole body", which the
+# two commits after it made false -- a callback now holds that mutex for a memcpy or a ~40 us
+# mj_copyData and does its publishing and its 5 ms depth / 15 ms lidar casts outside it. The
+# convoy is gone; the cost of one thread is not. Ray casting is ~650 ms of work per wall
+# second on this scene, and serialised it puts the 1 kHz IMU and 500 Hz encoder timers behind
+# all of it. Measured here (32-core x86, full 29-DoF stack, controller attached):
+#
+#   e8d4b7f  MutuallyExclusive   RTF 1.0000x   IMU  855 Hz   encoders 462 Hz
+#   c6fc6ca  Reentrant           RTF 1.0000x   IMU 1000 Hz   encoders 500 Hz
+#
+# CAVEAT, and it is the reason to re-measure rather than trust this: the convoy CANNOT be
+# reproduced on this x86 box. The pre-fix header also runs at 1.0000x here, even pinned to 6
+# cores, so this pair of numbers shows Reentrant costs nothing HERE -- not that it still
+# holds on a Thor, which is the only machine that ever showed 0.066x. Re-measure there before
+# the hardware campaign, and revert to e8d4b7f if the convoy returns.
+#
 # NOTE: this SHA is on the BRANCH perf/mujoco-sim-lock-contention, not main. `git clone`
 # fetches every ref, so `git checkout <sha>` below still resolves -- but repin to main once
 # the branch merges, so the pin does not depend on a branch that may be deleted.
 #
 # TODO(before hardware testing): replace this with an Obelisk RELEASE tag. Tracking a
 # moving ref is fine while developing against the sim; it is not fine on the robot.
-ARG OBELISK_REF=e8d4b7fa3187485072f0672742374fadd7bcc795
+ARG OBELISK_REF=c6fc6ca56c7171b8495533a0963226b726c4114b
 ARG OBELISK_REFRESH=0
 RUN echo "obelisk refresh token: ${OBELISK_REFRESH}" && \
     git clone https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk && \
