@@ -125,11 +125,23 @@ else
     tmux split-window -h -t "$SESSION":main.0 "$(obk_pane dbg "$(obk_bag_cmd fm)")"
 fi
 
-# A SECOND window, so --rviz does not disturb the layout of `main`. Only the marker node
-# needs a pane: default_robot_viz, robot_state_publisher and rviz2 are all launched by
-# obelisk's bringup in the controller pane's launch, off the viz block.
+# A SECOND window, so --rviz does not disturb the layout of `main`. Only the two marker /
+# cloud nodes need panes: default_robot_viz, robot_state_publisher and rviz2 are all
+# launched by obelisk's bringup in the controller pane's launch, off the viz block.
 if [ -n "$RVIZ" ]; then
-    tmux new-window -t "$SESSION" -n viz "$(obk_pane_run fmviz "ros2 run g1_control fm_plan_viz")"
+    # depth_cloud_viz resolves the camera contract from tracker.onnx, so it has to be told
+    # WHICH policy -- and the same one the controller runs, or it would draw a different
+    # camera than the one feeding the network. --policy wins; otherwise read the config's
+    # own default rather than restating it here, so the two cannot drift.
+    VIZ_POLICY="$POLICY"
+    if [ -z "$VIZ_POLICY" ]; then
+        VIZ_POLICY="$(awk '/^[[:space:]]*hf_policy_folder:/ {gsub(/"/, "", $2); print $2; exit}' \
+                      "$ROBOT_RL_ROOT/g1_control/config/common/low_level.yml")"
+    fi
+    tmux new-window   -t "$SESSION" -n viz \
+        "$(obk_pane_run fmviz "ros2 run g1_control fm_plan_viz")"
+    tmux split-window -h -t "$SESSION":viz.0 \
+        "$(obk_pane_run depthviz "ros2 run g1_control depth_cloud_viz --ros-args -p hf_policy_folder:=$VIZ_POLICY")"
 fi
 
 tmux select-window -t "$SESSION":main

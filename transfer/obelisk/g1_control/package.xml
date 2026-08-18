@@ -14,6 +14,8 @@
 
   <!-- fm_plan_viz only. Runtime-only: nothing here is built against them. -->
   <exec_depend>visualization_msgs</exec_depend>
+  <!-- depth_cloud_viz: PointCloud2 out, ObkImage in. -->
+  <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>geometry_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
   <exec_depend>builtin_interfaces</exec_depend>

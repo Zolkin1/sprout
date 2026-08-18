@@ -134,6 +134,61 @@ Visualization Manager:
       Use Fixed Frame: true
       Use rainbow: true
       Value: false
+    # The two depth cameras, unprojected by g1_control depth_cloud_viz. ON by default,
+    # unlike the lidar above: these are 780 points each at 50 Hz (~250 kB/s the pair) and
+    # they are the whole reason to open RViz on this stack -- the rate and invalid-fraction
+    # plots cannot tell you a camera is pointed somewhere useless, or that the obstacle in
+    # front of the robot never entered the frame.
+    #
+    # Published in torso_link, so they need robot_state_publisher, which the viz block
+    # already starts. Coloured by Intensity, which this node fills with range along the
+    # optical axis.
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 0; 255; 128
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: true
+      Name: Depth near
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 4
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /depth/near/points
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
+    - Alpha: 1
+      Autocompute Intensity Bounds: true
+      Class: rviz_default_plugins/PointCloud2
+      Color: 255; 170; 0
+      Color Transformer: Intensity
+      Decay Time: 0
+      Enabled: true
+      Name: Depth far
+      Position Transformer: XYZ
+      Selectable: true
+      Size (Pixels): 4
+      Size (m): 0.009999999776482582
+      Style: Points
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Best Effort
+        Value: /depth/far/points
+      Use Fixed Frame: true
+      Use rainbow: true
+      Value: true
     - Angle Tolerance: 0.10000000149011612
       Class: rviz_default_plugins/Odometry
       Covariance:
