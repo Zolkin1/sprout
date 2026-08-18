@@ -27,6 +27,14 @@ import trimesh
 from isaaclab.utils import configclass
 
 
+#: The values :attr:`OverlayVolumeCfg.kind` accepts, as data rather than only as a type
+#: annotation.  ``@configclass`` does not validate a ``Literal`` at runtime, so
+#: ``kind="wall"`` is accepted and silently drawn as a plain box -- which is exactly how a
+#: new shape would look correct in Isaac and be missing in MuJoCo.  Manifest readers check
+#: against this, mirroring the refusal :func:`overlay_sub_boxes` makes for ``variant``.
+OVERLAY_KINDS: frozenset[str] = frozenset(("box", "obstacle", "overhead"))
+
+
 @configclass
 class OverlayVolumeCfg:
     """One finite collision volume placed on a composite sub-terrain.

@@ -37,6 +37,9 @@ mujoco = pytest.importorskip("mujoco")
 trimesh = pytest.importorskip("trimesh")
 
 from generate_clip_tile_scene import (  # noqa: E402
+    OVERLAY_KINDS as emitter_kinds,
+)
+from generate_clip_tile_scene import (  # noqa: E402
     solid_overlays,
     spawn_point,
     terrain_top_at,
@@ -199,11 +202,67 @@ def test_the_spawn_lands_on_the_flight_not_the_tile_centre():
     assert sx == pytest.approx(6.11 - 0.11 - 2.0)       # 2 m before the leading tread's face
 
 
+#: The same tile with a railing post beside the flight -- narrow in x like a tread, but
+#: ``walkable_top=False``. This is the shape every planned wall / railing / clutter overlay
+#: has, and before the ``walkable`` filter it hijacked the whole geometry query path.
+TILE_WITH_RAILING = dict(
+    TILE,
+    overlays=TILE["overlays"] + [
+        {"kind": "obstacle", "pos_xy": [0.5, 0.3], "size_xyz": [0.1, 0.1, 1.1],
+         "base_z": 0.0, "walkable_top": False, "yaw": 0.0},
+    ],
+)
+
+
+def test_a_non_walkable_overlay_is_not_mistaken_for_the_first_riser():
+    """A railing post is tread-narrow in x; only ``walkable_top`` tells it apart.
+
+    Without the filter ``first_step`` picks the post, so ``spawn_point`` returns the post's
+    centreline minus the approach -- measured at 2.05 m OUTSIDE the tile, over the void --
+    and the emitter happily writes that scene.
+    """
+    ovs = solid_overlays(TILE_WITH_RAILING)
+    sx, sy, _why = spawn_point(TILE_WITH_RAILING, ovs, approach=2.0)
+    assert sy == pytest.approx(1.6)                     # the flight, not the post at y=0.3
+    assert sx == pytest.approx(6.11 - 0.11 - 2.0)       # unchanged by the post
+
+
+def test_terrain_top_ignores_non_walkable_volumes():
+    """Standing height comes from ground, not from the top of a 1.1 m post."""
+    ovs = solid_overlays(TILE_WITH_RAILING)
+    assert terrain_top_at(ovs, 0.5, 0.3) == pytest.approx(0.13)   # the approach platform
+    assert terrain_top_at(ovs, 6.11, 1.6) == pytest.approx(0.13)  # the leading tread
+
+
+def test_a_spawn_outside_the_tile_is_refused():
+    """The post-condition that pins ``first_step``'s predicate.
+
+    Derived from one overlay's geometry, so a misidentified riser puts the spawn where the
+    tile does not exist. An approach longer than the run-up triggers the same check.
+    """
+    with pytest.raises(ValueError, match="outside the tile footprint"):
+        spawn_point(TILE, solid_overlays(TILE), approach=99.0)
+
+
 def test_an_overlay_this_cannot_reproduce_is_refused():
     """A floating overlay is a slab on legs; its bounding box is not the same terrain."""
     entry = dict(TILE, overlays=[dict(TILE["overlays"][0], variant="floating")])
     with pytest.raises(ValueError, match=r"cannot reproduce exactly"):
         solid_overlays(entry)
+
+
+def test_an_unknown_overlay_kind_is_refused():
+    """A new shape name must not be silently flattened into a box."""
+    entry = dict(TILE, overlays=[dict(TILE["overlays"][0], kind="cylinder")])
+    with pytest.raises(ValueError, match="kind='cylinder'"):
+        solid_overlays(entry)
+
+
+def test_the_emitter_and_the_loader_agree_on_the_overlay_kinds():
+    """One vocabulary, two modules -- ``transfer/`` cannot import the IsaacLab-side one."""
+    from robot_rl.tasks.manager_based.robot_rl.terrains.blocks import OVERLAY_KINDS as isaac_kinds
+
+    assert set(emitter_kinds) == set(isaac_kinds)
 
 
 def test_the_manifest_is_the_shared_source():

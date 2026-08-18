@@ -34,6 +34,7 @@ import torch
 import trimesh
 
 from .blocks import (
+    OVERLAY_KINDS,
     CompositeSubTerrainCfg,
     FlatBlockCfg,
     OverlayVolumeCfg,
@@ -48,6 +49,8 @@ from .trimesh.stair_decor_cfg import StairDecorCfg, StairSideDecorCfg
 _TRIVIAL_SKILL = "standing"          # blocks need a valid skill; unused for baked clips
 _FLAT_TERRAIN_ID = -1
 _PAD_TOL = 1e-4
+#: Overlay yaw at or below this is treated as axis-aligned (every authored overlay is 0.0).
+_YAW_TOL = 1e-9
 
 
 @dataclass
@@ -179,12 +182,47 @@ def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
     Mirrors the ``overlays`` list the box-clip generator writes into the manifest
     (each ``{kind, pos_xy, size_xyz, base_z, walkable_top}`` in the clip's
     local-corner frame).
+
+    Two manifest fields are REFUSED rather than silently reinterpreted, because both
+    would make this side of the pipeline disagree with the MuJoCo emitters about what
+    the geometry is, with no error anywhere:
+
+    * ``yaw`` -- :class:`OverlayVolumeCfg` has no yaw field and :func:`build_overlay`
+      only translates, so a yawed box is axis-aligned here while
+      ``transfer/sim/generate_clip_tile_scene.py`` emits a rotation quaternion for it
+      (and ``compare_sim2sim`` emits neither).  Every overlay authored to date is
+      ``yaw == 0``, so this refusal costs nothing today and stops the divergence the
+      moment someone authors an angled wall.  Adding real yaw support means widening
+      ``overlay_sub_boxes``' ``(cx, cy, cz, sx, sy, sz)`` return contract, which every
+      renderer depends on -- a deliberate change, not a silent one.
+    * ``kind`` -- the field is a ``Literal`` that nothing validates at runtime, so a
+      typo or a new shape name is accepted and drawn as a plain box.  Mirror the
+      refusal :func:`overlay_sub_boxes` already makes for an unknown ``variant``.
+
+    Raises:
+        ValueError: On a non-zero ``yaw`` or an unrecognised ``kind``.
     """
     out: list[OverlayVolumeCfg] = []
-    for ov in entry.get("overlays", []):
+    for i, ov in enumerate(entry.get("overlays", [])):
+        yaw = float(ov.get("yaw", 0.0))
+        if abs(yaw) > _YAW_TOL:
+            raise ValueError(
+                f"terrain {entry.get('terrain_id')} overlay {i} has yaw={yaw!r}, which this "
+                "loader cannot represent: OverlayVolumeCfg is axis-aligned, so the box would be "
+                "built unrotated here while the MuJoCo tile emitter rotates it. Author the "
+                "overlay axis-aligned, or add yaw to OverlayVolumeCfg / overlay_sub_boxes / "
+                "build_overlay and every renderer that consumes them."
+            )
+        kind = str(ov.get("kind", "box"))
+        if kind not in OVERLAY_KINDS:
+            raise ValueError(
+                f"terrain {entry.get('terrain_id')} overlay {i} has kind={kind!r}; expected one "
+                f"of {sorted(OVERLAY_KINDS)}. An unknown kind is silently drawn as a box, which "
+                "is how a new shape would appear correct in Isaac and be missing in MuJoCo."
+            )
         leg_size = ov.get("leg_size", (0.1, 0.1))
         out.append(OverlayVolumeCfg(
-            kind=str(ov.get("kind", "box")),
+            kind=kind,
             size_xyz=tuple(float(v) for v in ov["size_xyz"]),
             pos_xy=tuple(float(v) for v in ov["pos_xy"]),
             base_z=float(ov.get("base_z", 0.0)),
@@ -195,6 +233,42 @@ def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
             leg_inset=float(ov.get("leg_inset", 0.05)),
         ))
     return out
+
+
+def assert_manifest_covers_clips(lib, manifest: list[dict]) -> None:
+    """Refuse a library whose clips reference a terrain the manifest does not describe.
+
+    The complement of the check :func:`...mdp.events.resets.sample_terrain_clips` already
+    makes ("this tile has an env but no clips").  That one fires; this direction did not,
+    and it fails SILENTLY: a clip tagged with an id no manifest entry claims simply never
+    gets a tile, so no env is ever placed on it, ``sample_terrain_clips`` never asks for
+    it, and the clip is dropped from training and from every recording with no message.
+    A tile-splitting or manifest-rewriting stage that renumbers ids is exactly how such an
+    orphan appears.
+
+    Flat clips (``terrain_id == -1``) are exempt: flat tiles are synthesised rather than
+    described by the manifest.
+
+    Args:
+        lib: A loaded ``ClipLibraryData`` carrying per-clip ``terrain_id``.
+        manifest: The library's terrain manifest.
+
+    Raises:
+        ValueError: If any non-flat ``terrain_id`` is absent from the manifest.
+    """
+    if getattr(lib, "terrain_id", None) is None or lib.terrain_id.numel() == 0:
+        return
+    described = {int(m["terrain_id"]) for m in manifest}
+    used = {int(t) for t in lib.terrain_id.tolist()} - {_FLAT_TERRAIN_ID}
+    orphans = sorted(used - described)
+    if orphans:
+        counts = {t: int((lib.terrain_id.to(torch.long) == t).sum()) for t in orphans}
+        raise ValueError(
+            f"clip library references terrain id(s) {orphans} that the terrain_manifest does "
+            f"not describe (clip counts {counts}). Those clips would be silently dropped from "
+            "training and from every recording -- no tile is built for them, so no env is ever "
+            "placed on them. Add the manifest entries, or retag the clips."
+        )
 
 
 def _tile_mesh(
@@ -327,6 +401,7 @@ def assemble_clip_terrain(
                 "generator_config.counts.flat > 0."
             )
     manifest = sorted(manifest, key=lambda m: int(m["terrain_id"]))
+    assert_manifest_covers_clips(lib, manifest)
     terr = [m for m in manifest if m["type"] == "terrain"]
     trans = [m for m in manifest if m["type"] == "transition"]
     slope = [m for m in manifest if m["type"] == "slope"]

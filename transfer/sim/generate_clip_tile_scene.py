@@ -107,8 +107,20 @@ def load_tile(clip_path: str, terrain_id: int | None) -> tuple[dict, dict]:
     return entry, info
 
 
+#: Overlay ``kind`` values, mirroring ``terrains/blocks/overlay.py``'s ``OVERLAY_KINDS``.
+#: Kept as a literal rather than imported because ``blocks/overlay.py`` pulls in IsaacLab and
+#: this file runs under ``env_transfer``; ``test_clip_tile_scene.py`` pins the two together.
+OVERLAY_KINDS = ("box", "obstacle", "overhead")
+
+
 def solid_overlays(entry: dict) -> list[dict]:
     """The tile's overlay volumes, refusing any this emitter cannot represent exactly.
+
+    ``kind`` does NOT restrict what is emitted: every kind is one axis-aligned box, and the
+    distinction (walkable ground vs. a hurdle vs. an overhead bar) is carried by
+    ``walkable_top`` and ``base_z``, which :func:`walkable` and :func:`tile_geoms` already
+    honour.  An unrecognised kind is still refused, because it is more likely a new shape
+    this emitter would silently flatten into a box than a typo.
 
     Args:
         entry: A manifest tile entry.
@@ -117,8 +129,8 @@ def solid_overlays(entry: dict) -> list[dict]:
         The overlay dicts, in manifest order.
 
     Raises:
-        ValueError: On a non-box kind or a non-solid variant. A ``floating`` overlay is a
-            slab on legs (``blocks/overlay.py``), which is several geoms and different
+        ValueError: On an unknown kind, or on a non-solid variant. A ``floating`` overlay is
+            a slab on legs (``blocks/overlay.py``), which is several geoms and different
             contact behaviour -- emitting its bounding box instead would look right in the
             viewer and be wrong under the foot, which is the failure mode this whole file
             exists to avoid.
@@ -126,19 +138,42 @@ def solid_overlays(entry: dict) -> list[dict]:
     out = []
     for i, ov in enumerate(entry.get("overlays", [])):
         kind, variant = str(ov.get("kind", "box")), str(ov.get("variant", "solid"))
-        if kind != "box" or variant != "solid":
+        if kind not in OVERLAY_KINDS:
             raise ValueError(
-                f"tile {entry.get('terrain_id')} overlay {i} is kind='{kind}' "
-                f"variant='{variant}', which this emitter cannot reproduce exactly (only "
-                "solid boxes). Extend it before using this tile, rather than accepting an "
-                "approximation of the geometry you came here to be exact about."
+                f"tile {entry.get('terrain_id')} overlay {i} has kind='{kind}'; expected one of "
+                f"{list(OVERLAY_KINDS)}. An unknown kind is most likely a new shape, which this "
+                "emitter would silently flatten into a box."
+            )
+        if variant != "solid":
+            raise ValueError(
+                f"tile {entry.get('terrain_id')} overlay {i} is variant='{variant}', which this "
+                "emitter cannot reproduce exactly (only solid boxes). Extend it before using this "
+                "tile, rather than accepting an approximation of the geometry you came here to be "
+                "exact about."
             )
         out.append(ov)
     return out
 
 
+def walkable(overlays: list[dict]) -> list[dict]:
+    """The overlays that are ground -- i.e. the ones a foot can be supported by.
+
+    ``walkable_top`` is advisory metadata that, until now, nothing in this file acted on:
+    every geometry query below treated a railing post or a wall as terrain.  Every overlay
+    any generator has authored to date is ``walkable_top=True``, so this is a no-op on the
+    shipped libraries and a guard on decorated ones.
+
+    Args:
+        overlays: Solid box overlays (see :func:`solid_overlays`).
+
+    Returns:
+        The subset whose top face is a landing surface.
+    """
+    return [ov for ov in overlays if bool(ov.get("walkable_top", True))]
+
+
 def terrain_top_at(overlays: list[dict], x: float, y: float) -> float:
-    """Height of the terrain at a point in tile-local coordinates.
+    """Height of the WALKABLE terrain at a point in tile-local coordinates.
 
     Args:
         overlays: Solid box overlays (see :func:`solid_overlays`).
@@ -146,14 +181,16 @@ def terrain_top_at(overlays: list[dict], x: float, y: float) -> float:
         y: Tile-local y (m).
 
     Returns:
-        The top z (m) of the highest overlay covering the point, or 0.0 (the tile floor).
+        The top z (m) of the highest walkable overlay covering the point, or 0.0 (the tile
+        floor).  Non-walkable volumes are ignored: standing the robot on top of a 1.1 m
+        railing post is not a spawn height.
 
     Raises:
         NotImplementedError: If a covering overlay is yawed, where "covers this point" is not
             an axis-aligned test.
     """
     top = 0.0
-    for ov in overlays:
+    for ov in walkable(overlays):
         if abs(float(ov.get("yaw", 0.0))) > 1e-9:
             raise NotImplementedError(
                 "terrain_top_at does not handle a yawed overlay; pass --spawn_xy explicitly."
@@ -167,14 +204,19 @@ def terrain_top_at(overlays: list[dict], x: float, y: float) -> float:
 def first_step(overlays: list[dict]) -> dict | None:
     """The lowest-x step-like overlay -- the first riser of the flight -- or ``None``.
 
+    "Step-like" is WALKABLE and at most :data:`_STEP_MAX_TREAD_M` deep.  The walkable half
+    matters: a railing post or a clutter box is also narrow in x, and picking one as the
+    flight's first riser sends :func:`spawn_point` to that post's centreline -- measured at
+    2.05 m outside the tile, over the void, on a probe tile.
+
     Args:
         overlays: Solid box overlays.
 
     Returns:
-        The overlay dict, or ``None`` when the tile has no tread-sized overlay (a box tile,
-        a bare platform).
+        The overlay dict, or ``None`` when the tile has no tread-sized walkable overlay (a
+        box tile, a bare platform).
     """
-    steps = [ov for ov in overlays if float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M]
+    steps = [ov for ov in walkable(overlays) if float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M]
     return min(steps, key=lambda ov: float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0) \
         if steps else None
 
@@ -194,15 +236,32 @@ def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[flo
 
     Returns:
         ``(x, y, why)`` -- the point and a one-line explanation for the log.
+
+    Raises:
+        ValueError: If the derived point falls outside the tile footprint. The spawn is
+            derived from one overlay's geometry, so a misidentified "first riser" puts it
+            somewhere the tile does not exist -- silently, since the emitter happily writes
+            a scene whose robot starts over the void. Cheap to check, and it is the
+            post-condition that pins :func:`first_step`'s predicate.
     """
     step = first_step(overlays)
     if step is None:
         return (float(entry["size_x"]) / 2.0, float(entry["size_y"]) / 2.0,
                 "tile centre (no step-like overlay to aim at)")
     front = float(step["pos_xy"][0]) - float(step["size_xyz"][0]) / 2.0
-    return (front - approach, float(step["pos_xy"][1]),
+    x, y = front - approach, float(step["pos_xy"][1])
+    size_x, size_y = float(entry["size_x"]), float(entry["size_y"])
+    if not (0.0 <= x <= size_x and 0.0 <= y <= size_y):
+        raise ValueError(
+            f"tile {entry.get('terrain_id')}: derived spawn ({x:.3f}, {y:.3f}) is outside the "
+            f"tile footprint (0..{size_x:.3f}, 0..{size_y:.3f}). The first riser was taken to be "
+            f"the overlay at {tuple(step['pos_xy'])} with size {tuple(step['size_xyz'])}; if that "
+            "is not a stair tread, first_step picked the wrong overlay. Pass --spawn_xy to "
+            "override, or reduce --approach."
+        )
+    return (x, y,
             f"{approach:.2f} m before the first riser (tile-local x={front:.3f}), "
-            f"on the flight's centreline (y={float(step['pos_xy'][1]):.3f})")
+            f"on the flight's centreline (y={y:.3f})")
 
 
 def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,

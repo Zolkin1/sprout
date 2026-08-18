@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from robot_rl.tasks.manager_based.robot_rl.terrains.blocks import (
+    OVERLAY_KINDS,
     CompositeSubTerrainCfg,
     FlatBlockCfg,
     OverlayVolumeCfg,
@@ -24,6 +25,7 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.blocks import (
 )
 from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.overlay import overlay_sub_boxes
 from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
+    _overlays_from_manifest,
     assemble_clip_terrain,
 )
 
@@ -258,3 +260,85 @@ def test_overlay_variant_round_trips_through_manifest():
     assert tuple(ov["leg_size"]) == pytest.approx((0.09, 0.09))
     assert ov["leg_inset"] == pytest.approx(0.04)
     assert ov["top_z"] == pytest.approx(0.4)
+
+
+##
+# The manifest contract: fields this loader cannot represent are REFUSED, not reinterpreted.
+##
+
+
+def _one_overlay_entry(**overrides):
+    """A minimal one-overlay manifest entry, with ``overrides`` applied to the overlay."""
+    ov = {"kind": "box", "pos_xy": [1.0, 2.0], "size_xyz": [1.0, 1.0, 1.0],
+          "base_z": 0.0, "walkable_top": True}
+    ov.update(overrides)
+    return {"terrain_id": 7, "type": "box", "size_x": 4.0, "size_y": 4.0, "overlays": [ov]}
+
+
+def test_overlay_yaw_zero_or_absent_is_accepted():
+    """The only yaw any generator authors today, in both spellings."""
+    assert len(_overlays_from_manifest(_one_overlay_entry(yaw=0.0))) == 1
+    entry = _one_overlay_entry()
+    entry["overlays"][0].pop("yaw", None)
+    assert len(_overlays_from_manifest(entry)) == 1
+
+
+def test_overlay_nonzero_yaw_is_refused():
+    """A yawed overlay must RAISE rather than be silently built axis-aligned.
+
+    ``OverlayVolumeCfg`` has no yaw field and ``build_overlay`` only translates, while
+    ``transfer/sim/generate_clip_tile_scene.py`` emits a rotation quaternion for the same
+    manifest entry -- so a yawed box would be a different box in each consumer, with no
+    error anywhere.  Supporting yaw properly means widening ``overlay_sub_boxes``' return
+    contract, which every renderer depends on.
+    """
+    with pytest.raises(ValueError, match="yaw"):
+        _overlays_from_manifest(_one_overlay_entry(yaw=0.7853981633974483))
+
+
+def test_overlay_unknown_kind_is_refused():
+    """``kind`` is a Literal that ``@configclass`` does not enforce at runtime.
+
+    Without this check ``kind="wall"`` is accepted and drawn as a plain box -- which is
+    how a new shape would look correct in Isaac and be missing in MuJoCo.
+    """
+    with pytest.raises(ValueError, match="kind"):
+        _overlays_from_manifest(_one_overlay_entry(kind="wall"))
+
+
+@pytest.mark.parametrize("kind", sorted(OVERLAY_KINDS))
+def test_every_declared_overlay_kind_is_accepted(kind):
+    """The refusal must be exactly the complement of the declared Literal."""
+    assert _overlays_from_manifest(_one_overlay_entry(kind=kind))[0].kind == kind
+
+
+##
+# Every clip must have a tile: the complement of resets.py's "tile has no clips" raise.
+##
+
+
+def _box_manifest(terrain_id=0):
+    return [{"terrain_id": terrain_id, "type": "box", "size_x": 4.0, "size_y": 4.0,
+             "overlays": [{"kind": "box", "pos_xy": [2.0, 2.0], "size_xyz": [0.6, 0.6, 0.4],
+                           "base_z": 0.0, "walkable_top": True}]}]
+
+
+def test_clip_on_an_undescribed_terrain_is_refused():
+    """A clip tagged with an id no manifest entry claims must RAISE at assembly.
+
+    It used to be dropped silently: no tile is built for the id, so no env lands on it,
+    ``sample_terrain_clips`` never asks for it, and the clip vanishes from training and
+    from every recording with no message. Renumbering ids in an offline rewrite stage is
+    exactly how that orphan appears.
+    """
+    lib = _fake_lib(_box_manifest(terrain_id=0), terrain_id=(0, 99))
+    with pytest.raises(ValueError, match=r"terrain id\(s\) \[99\]"):
+        assemble_clip_terrain(lib, num_flat_tiles=0)
+
+
+def test_flat_clips_are_exempt_from_the_coverage_check():
+    """``terrain_id == -1`` is flat ground, which the manifest deliberately never describes."""
+    lib = _fake_lib(_box_manifest(terrain_id=0), terrain_id=(0, -1))
+    mesh, _origins, layout = assemble_clip_terrain(lib, num_flat_tiles=1)
+    assert mesh is not None
+    assert -1 in layout.terrain_type_code
