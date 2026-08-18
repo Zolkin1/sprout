@@ -36,8 +36,28 @@ FmMeta ParseFmMeta(const std::string& json) {
   m.cmd_dim = root.at("cmd_dim").get<int>();
   m.cmd_steps = IntList(root.at("cmd_steps"));
   m.num_cmd_tokens = root.at("num_cmd_tokens").get<int>();
-  m.height_dim = root.at("height_dim").get<int>();
-  if (root.contains("extero_tokens")) m.extero_tokens = root.at("extero_tokens").get<int>();
+  // Exteroception shape, under EITHER key spelling. The exporter renamed these when the
+  // per-camera CNN encoder landed: one flat `extero_tokens` x `height_dim` row became
+  // `extero_sensor_count` sensors of `extero_sensor_dim` each. Only the NAMES moved -- the
+  // graph input is the same flat (V, count*dim) row of raw readings in camera order, because
+  // the encoder (MLP or CNN) and the attention mask both live INSIDE the graph. Verified by
+  // exporting the same tracker's CNN generator and diffing the two artifacts: identical input
+  // shapes, identical extero_spec, identical window_blocks; only these two keys differ.
+  //
+  // Both spellings are read because the deployed artifacts are a mix and an old fm.onnx must
+  // keep loading. `height_dim` was .at() -- a hard throw -- so a CNN export died here, before
+  // reaching anything that could explain why.
+  //
+  // A CNN checkpoint also carries `extero_tokens_per_sensor` (how many tokens the encoder
+  // emits into the transformer). That is internal to the graph; this runtime never sees it.
+  if (root.contains("extero_sensor_count")) {
+    m.extero_tokens = root.at("extero_sensor_count").get<int>();
+    m.height_dim = root.contains("extero_sensor_dim") ? root.at("extero_sensor_dim").get<int>()
+                                                      : root.at("height_dim").get<int>();
+  } else {
+    m.height_dim = root.at("height_dim").get<int>();
+    if (root.contains("extero_tokens")) m.extero_tokens = root.at("extero_tokens").get<int>();
+  }
   if (root.contains("extero_source")) {
     m.extero_source = root.at("extero_source").get<std::string>();
   }
@@ -93,6 +113,22 @@ FmSession::FmSession(const std::string& onnx_path, const std::vector<Provider>& 
                  "condition on a not-yet-full history window with no indication that it is "
                  "incomplete. Re-export with scripts/flow_matching/export_fm_onnx.py.\n",
                  onnx_path.c_str());
+  }
+
+  // The exteroception width, checked against the GRAPH rather than trusted from the metadata.
+  // This is what makes ParseFmMeta accepting two key spellings safe rather than a guess: if an
+  // export ever changes the actual contract instead of merely renaming its description, it is
+  // caught here, at load, instead of as an opaque onnxruntime shape error on the first Run --
+  // or, worse, not at all, if the widths happen to coincide.
+  {
+    const std::vector<int64_t> shape = model_.InputShape("extero");
+    if (!shape.empty() && shape.back() > 0 && shape.back() != meta_.extero_dim()) {
+      throw std::runtime_error(
+          "fm_meta describes exteroception as " + std::to_string(meta_.extero_tokens) + " x " +
+          std::to_string(meta_.height_dim) + " = " + std::to_string(meta_.extero_dim()) +
+          " values, but the graph's 'extero' input is " + std::to_string(shape.back()) +
+          " wide. The metadata does not describe this model.");
+    }
   }
 
   history_f_.assign(static_cast<size_t>(meta_.n) * meta_.d, 0.0f);

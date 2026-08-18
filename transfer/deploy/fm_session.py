@@ -150,6 +150,54 @@ def _check_state_layout(onnx_path: str, meta: dict) -> tuple[str, ...]:
     return names
 
 
+def _parse_extero_shape(onnx_path: str, m: dict, sess) -> tuple[int, int]:
+    """Resolve ``(extero_tokens, height_dim)`` from ``fm_meta``, under either key spelling.
+
+    The exporter renamed these when the per-camera CNN encoder landed: what used to be one
+    flat ``extero_tokens`` x ``height_dim`` row is now described as ``extero_sensor_count``
+    sensors of ``extero_sensor_dim`` each. Only the NAMES moved. The graph input is the same
+    flat ``(V, count*dim)`` row of raw readings in camera order, because the encoder -- MLP or
+    CNN -- and the attention mask are both INSIDE the graph. A CNN checkpoint additionally
+    reports ``extero_tokens_per_sensor`` (how many tokens the encoder emits into the
+    transformer), which is an internal detail this runtime neither sees nor needs.
+
+    Read both spellings rather than only the new one: the deployed artifacts are a mix, and an
+    old fm.onnx must keep loading.
+
+    The width is then checked against the GRAPH, which is what makes accepting the second
+    spelling safe rather than a guess -- if a future export ever changes the actual contract
+    instead of its description, this raises here rather than silently feeding the model a row
+    it will happily consume and misinterpret.
+
+    Args:
+        onnx_path: Path, for error messages.
+        m: The parsed ``fm_meta`` mapping.
+        sess: The live onnxruntime session, for the declared input width.
+
+    Returns:
+        ``(extero_tokens, height_dim)`` whose product is the graph's ``extero`` input width.
+
+    Raises:
+        ValueError: If the metadata's product disagrees with the graph's declared width.
+    """
+    if "extero_sensor_count" in m:
+        tokens = int(m["extero_sensor_count"])
+        dim = int(m.get("extero_sensor_dim", m.get("height_dim", 1)))
+    else:
+        tokens = int(m.get("extero_tokens", 1))
+        dim = int(m.get("height_dim", 1))
+
+    declared = next((i for i in sess.get_inputs() if i.name == "extero"), None)
+    if declared is not None and isinstance(declared.shape[-1], int):
+        if tokens * dim != declared.shape[-1]:
+            raise ValueError(
+                f"{onnx_path}: fm_meta describes exteroception as {tokens} x {dim} = "
+                f"{tokens * dim} values, but the graph's 'extero' input is "
+                f"{declared.shape[-1]} wide. The metadata does not describe this model."
+            )
+    return tokens, dim
+
+
 def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmContext:
     """Load ``fm.onnx`` and parse its ``fm_meta`` metadata into an :class:`FmContext`."""
     sess = make_session(onnx_path, num_threads, providers)
@@ -162,6 +210,7 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
     # because the history is the runtime's own last output rather than a measured state it
     # would have to estimate.
     blocks = _check_state_layout(onnx_path, m)
+    extero_tokens, height_dim = _parse_extero_shape(onnx_path, m, sess)
     return FmContext(
         sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
         reference_blocks=blocks,
@@ -169,8 +218,8 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
-        height_dim=int(m.get("height_dim", 1)),
-        extero_source=source, extero_tokens=int(m.get("extero_tokens", 1)),
+        height_dim=height_dim,
+        extero_source=source, extero_tokens=extero_tokens,
         extero_spec=parse_depth_spec(m.get("extero_spec"), source=f"{onnx_path} fm_meta"),
         fm_snap_every=(int(m["fm_snap_every"]) if m.get("fm_snap_every") else None),
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
