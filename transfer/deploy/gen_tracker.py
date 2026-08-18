@@ -33,6 +33,7 @@ import numpy as np
 from .depth_obs import (
     assert_depth_specs_agree,
     depth_xyz_rows_np,
+    sanitize_extero_np,
 )
 from .scan_obs import assert_scan_specs_agree, describe as describe_scan_spec, is_privileged
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
@@ -501,6 +502,19 @@ class GenTrackerPolicy:
         channels = int(getattr(self.ctx, "extero_channels", 1))
         if channels == 1:
             return image
+        # The band is applied to the DEPTH IMAGE, here, before the unprojection -- not to the
+        # assembled row afterwards. That ordering is the dataset's
+        # (``sanitize_extero`` then ``_depth_xyz_rows``) and it is the only one that means
+        # anything: ``extero_clip`` is stated in NORMALISED DEPTH units, so clamping METRES of
+        # position with it is a category error that only looks reasonable because the two
+        # happen to be similar numbers. Measured on the far camera at its real contract,
+        # sanitising the widened row instead clamped 21% of the position values and moved
+        # individual points by up to 6 m -- undoing, one layer later, exactly the range the
+        # band was widened to 5.575 to keep. It also restores the invariant this class states
+        # elsewhere: the cloud's wall sits where the DEPTH channel says it does, and nowhere
+        # else. build_extero_tokens still sanitises what it is given, which is now already
+        # clamped here and so a no-op on channel 0 and correctly untouched on the rest.
+        image = sanitize_extero_np(image, self.ctx.extero_source, clip=self.ctx.extero_clip)
         poses = state.get("fm_camera_pose")
         if poses is None:
             raise KeyError(

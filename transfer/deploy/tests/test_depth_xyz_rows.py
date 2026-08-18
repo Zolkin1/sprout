@@ -143,3 +143,38 @@ def test_the_deploy_row_matches_the_training_row():
         err_msg="the deploy and training row builders disagree -- a model would be trained on "
                 "one layout and served the other",
     )
+
+
+def test_the_band_clamps_depth_before_the_unprojection_not_the_row_after():
+    """`extero_clip` is normalised DEPTH units; clamping metres of position with it is wrong.
+
+    The dataset sanitises the depth row and THEN derives xyz, so the position channels are
+    never themselves clipped -- their bound is the depth band's equivalent RANGE, which is a
+    different number in different units. The deploy runtime used to sanitise the assembled
+    5-channel row instead, which clamped xyz at +-5.575 m: measured on the far camera at its
+    real contract, 21% of the position values, moving individual points by up to 6 m, and
+    undoing one layer later exactly the range the band was widened to keep.
+
+    Pinned here rather than left to the ordering of two statements, because the failure is
+    silent -- every shape stays right and the numbers stay plausible, they are just wrong past
+    5.575 m, which is where the far camera does its job.
+    """
+    from deploy.depth_obs import normalize_depth_np, sanitize_extero_np  # noqa: PLC0415
+
+    cam = dict(_cam("far"), fx=21.42222, fy=33.86616, max_dist=11.9, min_dist=0.15)
+    band = 5.575
+    metres = np.linspace(0.5, 11.5, _K)
+    img = normalize_depth_np(metres, **{k: cam[k] for k in
+          ("offset", "scale", "min_dist", "max_dist", "min_clip_val", "max_clip_val")})
+
+    # What the runtime now does: clamp the IMAGE, then unproject from it.
+    row = depth_xyz_rows_np([cam], sanitize_extero_np(img, "depth", clip=band)[None, :],
+                            [_pose()], channels=5)[0]
+    xyz = row.reshape(5, _K)[1:4]
+    # Positions reach past the band, because the band is not a bound on metres at all.
+    assert np.abs(xyz).max() > band, "xyz must not be limited by a normalised-depth band"
+
+    # And the WRONG order visibly destroys them, so this assertion is not vacuous.
+    wrong = sanitize_extero_np(row, "depth", clip=band).reshape(5, _K)[1:4]
+    assert np.abs(wrong).max() <= band + 1e-12
+    assert np.abs(wrong - xyz).max() > 1.0, "the two orders should differ by metres"

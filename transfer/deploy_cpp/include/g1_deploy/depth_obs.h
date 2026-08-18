@@ -166,11 +166,22 @@ void UnprojectToYawFrame(const CameraGeom& cam, const double* image, const doubl
 /// \param images    One normalised image per camera, each `pixels()` long.
 /// \param cam_pos   One 3-vector per camera, in the yaw frame.
 /// \param cam_rot   One row-major 3x3 per camera, in the yaw frame.
+/// The band is applied to the DEPTH IMAGE here, before the unprojection -- never to the
+/// assembled row afterwards. That ordering is the dataset's, and it is the only one that
+/// means anything: `clip` is stated in NORMALISED DEPTH units, so clamping METRES of position
+/// with it is a category error that merely looks reasonable because the two are similar
+/// numbers. Sanitising the widened row instead clamped 21% of the far camera's position
+/// values and moved points by up to 6 m, undoing one layer later exactly the range the band
+/// was widened to keep. Doing it inside this function means a caller cannot get the order
+/// wrong: what comes out is already clamped where clamping belongs.
+///
 /// \param channels  4 for `[d, x, y, z]`, 5 to append the validity plane.
+/// \param clip      The band this generator trained under (FmMeta::extero_clip).
 /// \param out       `cams.size() * channels * pixels()` values.
 void DepthXyzRows(const std::vector<CameraGeom>& cams,
                   const std::vector<const double*>& images,
                   const std::vector<const double*>& cam_pos,
-                  const std::vector<const double*>& cam_rot, int channels, double* out);
+                  const std::vector<const double*>& cam_rot, int channels, double clip,
+                  double* out);
 
 }  // namespace g1_deploy

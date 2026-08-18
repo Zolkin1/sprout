@@ -275,7 +275,7 @@ TEST(Depth, XyzRowsAreChannelMajorAndKeepTheDepthPlane) {
   const std::vector<const double*> rotations{rot, rot};
 
   std::vector<double> out(2 * 5 * k);
-  DepthXyzRows(cams, images, positions, rotations, 5, out.data());
+  DepthXyzRows(cams, images, positions, rotations, 5, /*clip=*/5.575, out.data());
 
   for (size_t c = 0; c < 2; ++c) {
     const double* row = out.data() + c * 5 * k;
@@ -292,10 +292,30 @@ TEST(Depth, XyzRowsAreChannelMajorAndKeepTheDepthPlane) {
     EXPECT_GT(n_invalid, 0);
     EXPECT_LT(n_invalid, static_cast<int>(k));
   }
-  EXPECT_THROW(DepthXyzRows(cams, images, positions, rotations, 1, out.data()),
+  EXPECT_THROW(DepthXyzRows(cams, images, positions, rotations, 1, 5.575, out.data()),
                std::invalid_argument);
-  EXPECT_THROW(DepthXyzRows(cams, {img.data()}, positions, rotations, 5, out.data()),
+  EXPECT_THROW(DepthXyzRows(cams, {img.data()}, positions, rotations, 5, 5.575, out.data()),
                std::invalid_argument);
+
+  // The band bounds the DEPTH plane and not the position planes: xyz are metres, the band is
+  // normalised depth units, and conflating them clamps the far camera's real reach.
+  CameraGeom far = g;
+  far.fx = 21.42222;
+  far.fy = 33.86616;
+  far.norm.max_dist = 11.9;
+  std::vector<double> reach(k);
+  for (size_t i = 0; i < k; ++i) {
+    reach[i] = NormalizeDepth(0.5 + 11.0 * static_cast<double>(i) / static_cast<double>(k),
+                              far.norm);
+  }
+  std::vector<double> one(5 * k);
+  DepthXyzRows({far}, {reach.data()}, {pos}, {rot}, 5, 5.575, one.data());
+  double worst_xyz = 0.0;
+  for (size_t i = k; i < 4 * k; ++i) worst_xyz = std::max(worst_xyz, std::abs(one[i]));
+  EXPECT_GT(worst_xyz, 5.575) << "xyz must not be limited by a normalised-depth band";
+  for (size_t i = 0; i < k; ++i) {
+    EXPECT_LE(std::abs(one[i]), 5.575 + 1e-12) << "the depth plane IS bounded by the band";
+  }
 }
 
 }  // namespace

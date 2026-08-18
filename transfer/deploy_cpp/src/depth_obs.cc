@@ -100,7 +100,8 @@ void UnprojectToYawFrame(const CameraGeom& cam, const double* image, const doubl
 void DepthXyzRows(const std::vector<CameraGeom>& cams,
                   const std::vector<const double*>& images,
                   const std::vector<const double*>& cam_pos,
-                  const std::vector<const double*>& cam_rot, int channels, double* out) {
+                  const std::vector<const double*>& cam_rot, int channels, double clip,
+                  double* out) {
   if (channels != 4 && channels != 5) {
     throw std::invalid_argument(
         "DepthXyzRows emits 4 ([d, x, y, z]) or 5 (plus validity) channels; 1 needs no widening");
@@ -113,14 +114,18 @@ void DepthXyzRows(const std::vector<CameraGeom>& cams,
   for (size_t c = 0; c < cams.size(); ++c) {
     const size_t k = cams[c].pixels();
     const std::vector<double> dirs = PinholeRayDirections(cams[c]);
-    // Channel 0 is the image itself, untouched: the cloud's wall then sits at exactly the
-    // range the depth channel claims.
-    std::copy(images[c], images[c] + k, out + at);
-    UnprojectToYawFrame(cams[c], images[c], cam_pos[c], cam_rot[c], dirs.data(),
+    // Clamp the IMAGE first (see the header): everything below reads `clamped`, so channel 0,
+    // the unprojection and the validity plane all describe one and the same reading.
+    std::vector<double> clamped(k);
+    SanitizeExteroBand(images[c], k, clip, clamped.data());
+    // Channel 0 is that image, untouched from here on: the cloud's wall then sits at exactly
+    // the range the depth channel claims.
+    std::copy(clamped.begin(), clamped.end(), out + at);
+    UnprojectToYawFrame(cams[c], clamped.data(), cam_pos[c], cam_rot[c], dirs.data(),
                         out + at + k);
     if (channels == 5) {
       std::unique_ptr<bool[]> invalid(new bool[k]);
-      InvalidDepthMask(images[c], k, cams[c].norm, invalid.get());
+      InvalidDepthMask(clamped.data(), k, cams[c].norm, invalid.get());
       double* v = out + at + 4 * k;
       for (size_t i = 0; i < k; ++i) v[i] = invalid[i] ? 0.0 : 1.0;
     }
