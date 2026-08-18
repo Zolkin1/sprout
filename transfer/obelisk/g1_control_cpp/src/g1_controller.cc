@@ -171,8 +171,16 @@ void G1Controller::LoadPolicy() {
 
   std::string repo = hf_repo_id_;
   std::replace(repo.begin(), repo.end(), '/', '_');
-  const std::filesystem::path base =
-      workspace / "g1_control" / "resource" / "hf_cache" / repo / hf_policy_folder_;
+  // "policies": the sub-directory of the HF repo every policy lives under, mirrored into the
+  // cache because that is where hf_hub_download puts a miss (local_dir/<repo-relative path>).
+  // hf_policy_folder_ is a BARE run name; the prefix is never part of the ROS param.
+  //
+  // Restated here because this is C++ and cannot import deploy.hardware.HF_POLICY_PREFIX,
+  // which is the definition. Restating a constant across the language boundary is how
+  // hf_repo_id already drifted once, so it is pinned rather than trusted:
+  // transfer/obelisk/tests/test_policy_cache_layout.py reads BOTH and fails on a mismatch.
+  const std::filesystem::path base = workspace / "g1_control" / "resource" / "hf_cache" /
+                                     repo / "policies" / hf_policy_folder_;
 
   g1_deploy::RuntimeConfig cfg;
   cfg.tracker_onnx = (base / "tracker.onnx").string();

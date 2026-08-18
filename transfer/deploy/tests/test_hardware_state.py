@@ -26,7 +26,9 @@ _TRANSFER = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, _TRANSFER)
 
 from deploy.depth_obs import invalid_depth_value, normalize_depth_np  # noqa: E402
-from deploy.hardware import ARTIFACT_NAMES, build_hardware_state, fetch_artifacts  # noqa: E402
+from deploy.hardware import (  # noqa: E402
+    ARTIFACT_NAMES, build_hardware_state, fetch_artifacts, policy_repo_dir,
+)
 
 JOINTS = ["hip", "knee", "ankle"]
 CAM = {
@@ -176,8 +178,13 @@ def test_scan_policy_accepts_its_reading():
 ##
 
 def _seed_cache(root, repo="user/repo", folder="run") -> list[str]:
-    """Write stand-in artifacts where fetch_artifacts expects to find them."""
-    base = os.path.join(root, repo.replace("/", "_"), folder)
+    """Write stand-in artifacts where fetch_artifacts expects to find them.
+
+    Built through ``policy_repo_dir`` rather than by spelling the layout again: the cache
+    mirrors the repo, and a test that hardcodes the mirrored path would keep passing if the
+    prefix changed on one side only -- which is the exact bug the layout has to rule out.
+    """
+    base = os.path.join(root, repo.replace("/", "_"), *policy_repo_dir(folder).split("/"))
     os.makedirs(base, exist_ok=True)
     paths = []
     for name in ARTIFACT_NAMES:
@@ -211,7 +218,7 @@ def test_refresh_forces_a_download_over_a_cache_hit(tmp_path, monkeypatch):
     monkeypatch.setattr("deploy.hardware._download",
                         lambda repo, filename, local_dir: calls.append(filename) or "/dev/null")
     fetch_artifacts("user/repo", "run", str(tmp_path), refresh=True)
-    assert calls == [f"run/{n}" for n in ARTIFACT_NAMES]
+    assert calls == [f"{policy_repo_dir('run')}/{n}" for n in ARTIFACT_NAMES]
 
 
 def test_missing_artifact_is_fetched(tmp_path, monkeypatch):
@@ -222,7 +229,9 @@ def test_missing_artifact_is_fetched(tmp_path, monkeypatch):
     monkeypatch.setattr("deploy.hardware._download",
                         lambda repo, filename, local_dir: calls.append(filename) or expected[1])
     fetch_artifacts("user/repo", "run", str(tmp_path))
-    assert calls == ["run/fm.onnx"]
+    # The prefixed repo path, not the bare folder: what is asserted here is the string
+    # handed to the downloader, i.e. exactly where on the Hub it will look.
+    assert calls == [f"{policy_repo_dir('run')}/fm.onnx"]
 
 
 if __name__ == "__main__":

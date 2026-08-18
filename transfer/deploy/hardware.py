@@ -46,6 +46,33 @@ ARTIFACT_NAMES = ("tracker.onnx", "fm.onnx")
 #: keep ``g1_control/config/common/low_level.yml`` in step by hand.
 DEFAULT_HF_REPO_ID = "zolkin/robot_rl"
 
+#: Sub-directory of the repo every policy lives under, so deployable artifacts do not sit
+#: loose in the repo root next to the trajectory library and the older per-skill folders.
+#: NOT part of ``hf_policy_folder``: callers name a policy by its run name alone and this is
+#: prepended for them, so the prefix appears in exactly one place and a config, a CLI flag or
+#: a ROS param can never disagree with it. That is the same reasoning as DEFAULT_HF_REPO_ID
+#: above, applied before rather than after the mistake.
+#:
+#: The C++ controller restates it (it cannot import this); ``transfer/obelisk/tests/
+#: test_policy_cache_layout.py`` fails the build if the two ever drift.
+HF_POLICY_PREFIX = "policies"
+
+
+def policy_repo_dir(hf_policy_folder: str) -> str:
+    """Repo-relative directory holding one policy's artifacts.
+
+    The local cache mirrors this path, so the remote layout and the on-disk layout can be
+    reasoned about as one thing -- ``hf_hub_download`` places a file at
+    ``local_dir/<repo-relative path>`` and there is nothing to keep in step by hand.
+
+    Args:
+        hf_policy_folder: The policy's own folder name (a run name), with no prefix.
+
+    Returns:
+        ``"<HF_POLICY_PREFIX>/<hf_policy_folder>"``.
+    """
+    return f"{HF_POLICY_PREFIX}/{hf_policy_folder}"
+
 #: Bounds on the online fetch. The download happens inside the controller's lifecycle
 #: ``on_configure``; an unbounded HTTP call there hangs BRING-UP, and the only cure is
 #: killing the launch. A robot LAN with no route out must fail in seconds, not block.
@@ -84,13 +111,18 @@ def fetch_artifacts(
     """
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     base = os.path.join(cache_root, hf_repo_id.replace("/", "_"))
+    rel = policy_repo_dir(hf_policy_folder)
     paths = []
     for name in ARTIFACT_NAMES:
-        local = os.path.join(base, hf_policy_folder, name)
+        # The cache mirrors the repo, prefix included, because that is what hf_hub_download
+        # does on a miss (local_dir/<repo-relative path>). Deriving the hit path any other
+        # way would make a cache hit and a cache miss land in different directories, so the
+        # first run after a fetch would re-download every time and never say why.
+        local = os.path.join(base, *rel.split("/"), name)
         if os.path.exists(local) and not refresh:
             paths.append(local)
             continue
-        paths.append(_download(hf_repo_id, f"{hf_policy_folder}/{name}", base))
+        paths.append(_download(hf_repo_id, f"{rel}/{name}", base))
     return tuple(paths)
 
 

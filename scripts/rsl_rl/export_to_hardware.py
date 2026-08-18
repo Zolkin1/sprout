@@ -33,7 +33,7 @@ _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, 
 sys.path.insert(0, os.path.join(_REPO_ROOT, "transfer"))
 
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
-from deploy.hardware import DEFAULT_HF_REPO_ID  # noqa: E402
+from deploy.hardware import DEFAULT_HF_REPO_ID, policy_repo_dir  # noqa: E402
 
 #: What the robot downloads. Both are required: the tracker alone cannot walk.
 ARTIFACTS = ("tracker.onnx", "fm.onnx")
@@ -115,6 +115,12 @@ def main() -> None:
 
     run_dir = os.path.abspath(args.run_dir.rstrip("/"))
     folder_name = args.folder_name or os.path.basename(run_dir)
+    # The `policies/` prefix is applied HERE and never typed by a caller: --folder_name and
+    # the controller's hf_policy_folder both name a policy by its run name alone. Imported
+    # from deploy.hardware rather than spelled again, so the uploader and the on-robot fetch
+    # cannot disagree about where a policy lives -- the failure that would otherwise show up
+    # as a successful upload the robot cannot find.
+    repo_dir = policy_repo_dir(folder_name)
     exported = os.path.join(run_dir, "exported")
     print(f"[INFO] Validating {exported}")
     policy = validate_pair(exported)
@@ -124,7 +130,7 @@ def main() -> None:
         # Name the destination even when uploading nothing: the folder is now DERIVED from
         # the run dir unless overridden, so a dry run has to show what it resolved to.
         print(f"[INFO] --dry_run: nothing uploaded. Would upload to "
-              f"{args.hf_repo_id}/{folder_name}/{{tracker.onnx,fm.onnx}}"
+              f"{args.hf_repo_id}/{repo_dir}/{{tracker.onnx,fm.onnx}}"
               f"{'' if args.folder_name else '  (folder derived from --run_dir)'}")
         return
 
@@ -143,17 +149,18 @@ def main() -> None:
 
     api = HfApi()
     for name in ARTIFACTS:
-        repo_path = f"{folder_name}/{name}"
+        repo_path = f"{repo_dir}/{name}"
         api.upload_file(
             path_or_fileobj=os.path.join(exported, name),
             path_in_repo=repo_path,
             repo_id=args.hf_repo_id,
-            commit_message=f"Upload {name} to {folder_name}",
+            commit_message=f"Upload {name} to {repo_dir}",
         )
         print(f"[INFO] Uploaded {repo_path}")
 
-    print(f"[INFO] Done: https://huggingface.co/{args.hf_repo_id}/tree/main/{folder_name}")
-    print(f"[INFO] On the robot, point the controller at folder '{folder_name}'.")
+    print(f"[INFO] Done: https://huggingface.co/{args.hf_repo_id}/tree/main/{repo_dir}")
+    print(f"[INFO] On the robot, point the controller at folder '{folder_name}' "
+          f"(bare, with no '{repo_dir.rsplit('/', 1)[0]}/' prefix -- the runtime adds it).")
 
 
 if __name__ == "__main__":
