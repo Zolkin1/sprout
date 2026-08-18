@@ -49,6 +49,7 @@ import h5py
 import numpy as np
 
 from generate_stairs_scene import scene_xml
+from overlay_geom import OVERLAY_VARIANTS, overlay_sub_boxes_from_manifest
 
 #: An overlay whose x extent is at most this is a STEP rather than a platform or a box.
 #: Trained treads top out at 0.28 m (``generate_stairs_scene.TRAINED_TREADS``); the platforms
@@ -113,14 +114,21 @@ def load_tile(clip_path: str, terrain_id: int | None) -> tuple[dict, dict]:
 OVERLAY_KINDS = ("box", "obstacle", "overhead")
 
 
-def solid_overlays(entry: dict) -> list[dict]:
+def emittable_overlays(entry: dict) -> list[dict]:
     """The tile's overlay volumes, refusing any this emitter cannot represent exactly.
 
-    ``kind`` does NOT restrict what is emitted: every kind is one axis-aligned box, and the
-    distinction (walkable ground vs. a hurdle vs. an overhead bar) is carried by
-    ``walkable_top`` and ``base_z``, which :func:`walkable` and :func:`tile_geoms` already
-    honour.  An unrecognised kind is still refused, because it is more likely a new shape
-    this emitter would silently flatten into a box than a typo.
+    Neither ``kind`` nor ``variant`` restricts what is emitted any more:
+
+    * every ``kind`` is one axis-aligned box, and the distinction (walkable ground vs. a
+      hurdle vs. an overhead bar) is carried by ``walkable_top`` and ``base_z``, which
+      :func:`walkable` and :func:`tile_geoms` honour;
+    * every ``variant`` is a fixed set of axis-aligned sub-boxes, which
+      :func:`overlay_geom.overlay_sub_boxes` produces -- the same decomposition the Isaac
+      importer meshes.  This used to be refused, which meant the 23 shipped tiles carrying a
+      ``floating`` overlay could not be emitted at all.
+
+    Both are still validated, because an unrecognised value is far more likely to be a new
+    shape this emitter would silently flatten than a typo.
 
     Args:
         entry: A manifest tile entry.
@@ -129,11 +137,7 @@ def solid_overlays(entry: dict) -> list[dict]:
         The overlay dicts, in manifest order.
 
     Raises:
-        ValueError: On an unknown kind, or on a non-solid variant. A ``floating`` overlay is
-            a slab on legs (``blocks/overlay.py``), which is several geoms and different
-            contact behaviour -- emitting its bounding box instead would look right in the
-            viewer and be wrong under the foot, which is the failure mode this whole file
-            exists to avoid.
+        ValueError: On an unknown kind or an unknown variant.
     """
     out = []
     for i, ov in enumerate(entry.get("overlays", [])):
@@ -144,12 +148,12 @@ def solid_overlays(entry: dict) -> list[dict]:
                 f"{list(OVERLAY_KINDS)}. An unknown kind is most likely a new shape, which this "
                 "emitter would silently flatten into a box."
             )
-        if variant != "solid":
+        if variant not in OVERLAY_VARIANTS:
             raise ValueError(
-                f"tile {entry.get('terrain_id')} overlay {i} is variant='{variant}', which this "
-                "emitter cannot reproduce exactly (only solid boxes). Extend it before using this "
-                "tile, rather than accepting an approximation of the geometry you came here to be "
-                "exact about."
+                f"tile {entry.get('terrain_id')} overlay {i} has variant='{variant}'; expected "
+                f"one of {list(OVERLAY_VARIANTS)}. Emitting its bounding box instead would look "
+                "right in the viewer and be wrong under the foot, which is the failure mode this "
+                "whole file exists to avoid."
             )
         out.append(ov)
     return out
@@ -164,7 +168,7 @@ def walkable(overlays: list[dict]) -> list[dict]:
     shipped libraries and a guard on decorated ones.
 
     Args:
-        overlays: Solid box overlays (see :func:`solid_overlays`).
+        overlays: Overlays this emitter can represent (see :func:`emittable_overlays`).
 
     Returns:
         The subset whose top face is a landing surface.
@@ -176,7 +180,7 @@ def terrain_top_at(overlays: list[dict], x: float, y: float) -> float:
     """Height of the WALKABLE terrain at a point in tile-local coordinates.
 
     Args:
-        overlays: Solid box overlays (see :func:`solid_overlays`).
+        overlays: Overlays this emitter can represent (see :func:`emittable_overlays`).
         x: Tile-local x (m).
         y: Tile-local y (m).
 
@@ -210,7 +214,7 @@ def first_step(overlays: list[dict]) -> dict | None:
     2.05 m outside the tile, over the void, on a probe tile.
 
     Args:
-        overlays: Solid box overlays.
+        overlays: Overlays this emitter can represent.
 
     Returns:
         The overlay dict, or ``None`` when the tile has no tread-sized walkable overlay (a
@@ -231,7 +235,7 @@ def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[flo
 
     Args:
         entry: The manifest tile entry.
-        overlays: Solid box overlays.
+        overlays: Overlays this emitter can represent.
         approach: Distance (m) from the spawn to the first riser's front face.
 
     Returns:
@@ -277,14 +281,16 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
                infinite_floor: bool) -> tuple[list[str], str]:
     """Emit the tile's geometry, translated so ``origin`` (tile-local) is the world origin.
 
-    Every overlay is a full-height pillar from its ``base_z``, which is how the training
-    tiles are built (step ``n`` spans ``z in [0, n*rise]``) and how the MuJoCo playground
-    builds them too -- so the tread tops and risers are clean and a foot cannot catch in a
-    seam.
+    A ``solid`` overlay is a full-height pillar from its ``base_z``, which is how the
+    training tiles are built (step ``n`` spans ``z in [0, n*rise]``) -- so the tread tops
+    and risers are clean and a foot cannot catch in a seam.  A ``floating*`` overlay is a
+    thin top slab with an open gap beneath it, plus optional support legs; those are emitted
+    as the same sub-boxes :func:`overlay_geom.overlay_sub_boxes` gives the Isaac importer,
+    so the two sims build the same structure rather than the same silhouette.
 
     Args:
         entry: The manifest tile entry.
-        overlays: Solid box overlays.
+        overlays: Overlays this emitter can represent (see :func:`emittable_overlays`).
         origin: ``(x, y, z)`` tile-local point to place at the world origin.
         infinite_floor: Emit the checkered infinite plane instead of the tile's own floor.
 
@@ -294,14 +300,16 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
     ox, oy, oz = origin
     lines = []
     for i, ov in enumerate(overlays):
-        (px, py), (sx, sy, sz) = ov["pos_xy"], ov["size_xyz"]
-        base_z = float(ov.get("base_z", 0.0))
-        step = float(sx) <= _STEP_MAX_TREAD_M
-        lines.append(_box_geom(
-            f"tile_{'step' if step else 'slab'}{i}",
-            float(px) - ox, float(py) - oy, base_z + float(sz) / 2.0 - oz,
-            float(sx), float(sy), float(sz), float(ov.get("yaw", 0.0)),
-        ))
+        step = float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M
+        base = f"tile_{'step' if step else 'slab'}{i}"
+        yaw = float(ov.get("yaw", 0.0))
+        # A solid overlay decomposes to exactly one sub-box with the overlay's own extents,
+        # so the emitted line -- and its name -- is unchanged from before this branch existed.
+        for j, (cx, cy, cz, bx, by, bz) in enumerate(overlay_sub_boxes_from_manifest(ov)):
+            lines.append(_box_geom(
+                base if j == 0 else f"{base}_p{j}",
+                cx - ox, cy - oy, cz - oz, bx, by, bz, yaw,
+            ))
 
     if infinite_floor or not bool(entry.get("has_floor", True)):
         # has_floor=False is an isolated structure (a floating staircase): Isaac gives it NO
@@ -342,7 +350,7 @@ def main() -> None:
     args = p.parse_args()
 
     entry, info = load_tile(args.clip, args.terrain_id)
-    overlays = solid_overlays(entry)
+    overlays = emittable_overlays(entry)
     if args.spawn_xy is not None:
         sx, sy = args.spawn_xy
         why = "--spawn_xy"
