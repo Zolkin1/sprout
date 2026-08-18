@@ -6,7 +6,7 @@
 site_name: "torso_link_origin_site"
 geom_groups: [1, 2]
 frame: "world"
-viz: false
+#viz: false
 pattern:
   type: "depth_camera"
   width: 30
