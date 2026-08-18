@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -151,9 +152,150 @@ TEST(Depth, SanitizeExteroClipsPerSourceBand) {
   SanitizeExtero(in, 5, "depth", out);
   EXPECT_EQ(out[0], 0.0);   // NaN -> 0, not -> clip
   EXPECT_EQ(out[1], 2.0);
-  EXPECT_EQ(out[2], -2.0);
+  // -inf -> +clip, NOT -clip: a missed ray is "no ground within range", i.e. ground far
+  // below, so it belongs at the drop-off end. -clip would encode a hole as a wall.
+  EXPECT_EQ(out[2], 2.0);
   EXPECT_EQ(out[3], 2.0);
   EXPECT_EQ(out[4], -2.0);
+}
+
+/// The camera geometry a fixture case was generated with, alongside its normalization.
+CameraGeom GeomOf(const Case& c) {
+  CameraGeom g;
+  g.width = c.ints.at("width");
+  g.height = c.ints.at("height");
+  g.fx = c.Double("fx");
+  g.fy = c.Double("fy");
+  g.cx = c.Double("cx");
+  g.cy = c.Double("cy");
+  g.norm = NormOf(c);
+  return g;
+}
+
+TEST(DepthParity, PinholeRayDirectionsMatchPython) {
+  for (const Case* c : Cases("pinhole_ray_directions")) {
+    const CameraGeom g = GeomOf(*c);
+    const Blob& want = c->Out("dirs");
+    const std::vector<double> got = PinholeRayDirections(g);
+    ASSERT_EQ(got.size(), want.data.size());
+
+    double worst = 0.0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      worst = std::max(worst, std::abs(got[i] - want.data[i]));
+    }
+    EXPECT_LE(worst, c->atol) << c->name << ": worst |d| " << worst;
+    // The ordering is the thing this can silently get wrong: a transposed loop gives the
+    // same SET of directions and the same norms, so only position-by-position agreement
+    // catches it. Pixel 0 must be the TOP-LEFT, i.e. +y (left) and +z (up) both positive.
+    EXPECT_GT(got[1], 0.0) << "pixel 0 is not the left column -- u/v loops transposed?";
+    EXPECT_GT(got[2], 0.0) << "pixel 0 is not the top row -- u/v loops transposed?";
+    std::cout << "    [margin] " << c->name << " worst " << worst << " vs atol " << c->atol
+              << "\n";
+  }
+}
+
+TEST(DepthParity, InvalidDepthMaskIsExact) {
+  for (const Case* c : Cases("invalid_depth_mask")) {
+    const CameraGeom g = GeomOf(*c);
+    const Blob& img = c->In("image");
+    const Blob& want = c->Out("mask");
+    ASSERT_EQ(img.data.size(), want.data.size());
+
+    std::vector<char> got(img.data.size());
+    InvalidDepthMask(img.data.data(), img.data.size(), g.norm,
+                     reinterpret_cast<bool*>(got.data()));
+    int mismatches = 0;
+    int n_invalid = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+      const double as_double = got[i] ? 1.0 : 0.0;
+      if (as_double != want.data[i]) ++mismatches;
+      n_invalid += got[i] ? 1 : 0;
+    }
+    EXPECT_EQ(mismatches, 0) << c->name << ": " << mismatches << " pixels classified differently";
+    // The fixture is built to contain both, so a mask that is all-true or all-false would
+    // agree with nothing real and must not pass by being uniform.
+    EXPECT_GT(n_invalid, 0) << "no invalid pixels -- the fixture should carry misses";
+    EXPECT_LT(n_invalid, static_cast<int>(got.size())) << "every pixel invalid";
+    std::cout << "    [margin] " << c->name << " exact over " << got.size() << " pixels ("
+              << n_invalid << " invalid)\n";
+  }
+}
+
+TEST(DepthParity, UnprojectToYawFrameMatchesPython) {
+  for (const Case* c : Cases("unproject_to_yaw_frame")) {
+    const CameraGeom g = GeomOf(*c);
+    const Blob& img = c->In("image");
+    const Blob& pos = c->In("cam_pos");
+    const Blob& rot = c->In("cam_rot");
+    const Blob& want = c->Out("points");
+    const std::vector<double> dirs = PinholeRayDirections(g);
+    const size_t k = g.pixels();
+    ASSERT_EQ(static_cast<size_t>(img.stride()), k);
+
+    double worst = 0.0;
+    std::vector<double> got(3 * k);
+    for (int r = 0; r < img.rows(); ++r) {
+      UnprojectToYawFrame(g, img.row(r), pos.row(r), rot.row(r), dirs.data(), got.data());
+      for (size_t i = 0; i < got.size(); ++i) {
+        worst = std::max(worst, std::abs(got[i] - want.row(r)[i]));
+      }
+    }
+    EXPECT_LE(worst, c->atol) << c->name << ": worst |d| " << worst << " m over " << img.rows()
+                              << " poses";
+    std::cout << "    [margin] " << c->name << " worst " << worst << " m vs atol " << c->atol
+              << " over " << img.rows() << " poses\n";
+  }
+}
+
+TEST(Depth, XyzRowsAreChannelMajorAndKeepTheDepthPlane) {
+  // Layout, not numerics -- the geometry is covered by the parity cases above. This is what
+  // an interleaved row would break while every shape stayed correct, scrambling the image
+  // the encoder folds and every convolution kernel with it.
+  CameraGeom g;
+  g.width = 5;
+  g.height = 4;
+  g.fx = 2.5;
+  g.fy = 2.2;
+  g.cx = 2.5;
+  g.cy = 2.0;
+  g.norm.min_dist = 0.1;
+  g.norm.max_dist = 7.9;
+  const size_t k = g.pixels();
+
+  std::vector<double> img(k);
+  for (size_t i = 0; i < k; ++i) {
+    // A spread of real readings with a few misses mixed in, normalised through the contract.
+    img[i] = NormalizeDepth(i % 4 == 0 ? 0.01 : 0.5 + 0.1 * static_cast<double>(i), g.norm);
+  }
+  const double pos[3] = {0.15, 0.0, 0.30};
+  const double rot[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  const std::vector<CameraGeom> cams{g, g};
+  const std::vector<const double*> images{img.data(), img.data()};
+  const std::vector<const double*> positions{pos, pos};
+  const std::vector<const double*> rotations{rot, rot};
+
+  std::vector<double> out(2 * 5 * k);
+  DepthXyzRows(cams, images, positions, rotations, 5, out.data());
+
+  for (size_t c = 0; c < 2; ++c) {
+    const double* row = out.data() + c * 5 * k;
+    for (size_t i = 0; i < k; ++i) {
+      EXPECT_EQ(row[i], img[i]) << "channel 0 must be the image itself, camera " << c;
+    }
+    std::vector<char> invalid(k);
+    InvalidDepthMask(img.data(), k, g.norm, reinterpret_cast<bool*>(invalid.data()));
+    int n_invalid = 0;
+    for (size_t i = 0; i < k; ++i) {
+      EXPECT_EQ(row[4 * k + i], invalid[i] ? 0.0 : 1.0) << "validity plane, pixel " << i;
+      n_invalid += invalid[i] ? 1 : 0;
+    }
+    EXPECT_GT(n_invalid, 0);
+    EXPECT_LT(n_invalid, static_cast<int>(k));
+  }
+  EXPECT_THROW(DepthXyzRows(cams, images, positions, rotations, 1, out.data()),
+               std::invalid_argument);
+  EXPECT_THROW(DepthXyzRows(cams, {img.data()}, positions, rotations, 5, out.data()),
+               std::invalid_argument);
 }
 
 }  // namespace

@@ -76,4 +76,101 @@ inline double InvalidDepthValue(const DepthNorm& n) {
 /// chain, so the habit is established here on purpose.
 void SanitizeExtero(const double* in, size_t count, const std::string& source, double* out);
 
+/// As above, with the band stated rather than looked up by source.
+///
+/// This is the overload every caller holding a loaded graph should use: the band belongs to
+/// the CHECKPOINT, and ExteroClip()'s per-source table is only correct for artifacts of the
+/// era it was written in (depth moved 2.0 -> 5.575 on the training side). FmMeta::extero_clip
+/// is that number, refused at parse rather than defaulted, so passing it here is what keeps
+/// the runtime clamping the way the model was trained.
+void SanitizeExteroBand(const double* in, size_t count, double clip, double* out);
+
+/// One camera's pinhole geometry, alongside its normalization contract.
+struct CameraGeom {
+  int width = 0;
+  int height = 0;
+  double fx = 1.0;
+  double fy = 1.0;
+  double cx = 0.0;
+  double cy = 0.0;
+  DepthNorm norm{};
+
+  size_t pixels() const { return static_cast<size_t>(width) * static_cast<size_t>(height); }
+};
+
+/// Unit ray directions in the camera frame, matching IsaacLab's pinhole pattern.
+///
+/// Pixel CENTRES through the inverse intrinsic matrix, then into the robotics camera frame
+/// (x = optical axis, y = left, z = up). Row-major flat order `k = v * width + u`, with
+/// `v = 0` the TOP row and `u = 0` the LEFT column. That ordering is a CONTRACT, not a
+/// convention: the encoder folds these rows into an image, so transposing it scrambles every
+/// convolution kernel while every shape stays correct.
+///
+/// Depends only on the contract, so it is constant for the life of a run -- compute it once
+/// and pass it to UnprojectToYawFrame rather than per frame.
+///
+/// \return `width * height` rows of 3, flattened.
+std::vector<double> PinholeRayDirections(const CameraGeom& cam);
+
+/// Which pixels of a NORMALISED image carry no usable range reading.
+///
+/// The test is `denormalised depth < min_dist` (or non-finite), NOT equality with the
+/// sentinel NormalizeDepth writes, and the difference is load-bearing. The sentinels are
+/// exact only in a CLEAN image; in training they are not, because the depth noiser runs
+/// AFTER normalisation and its 3x3 blur mixes a missed pixel with its neighbours, leaving it
+/// NEAR the sentinel rather than on it. An equality test would call those pixels valid and
+/// unproject them to ~0.1 m -- a fake surface on the robot itself.
+void InvalidDepthMask(const double* image, size_t count, const DepthNorm& n, bool* out);
+
+/// A normalised depth image -> its 3-D points in the root's yaw-aligned frame.
+///
+/// Port of transfer/deploy/depth_obs.py's unproject_to_yaw_frame. The frame is the
+/// generator's own anchor frame: origin at the root link, axes yaw-aligned, so its z IS
+/// gravity and STATIC TERRAIN KEEPS ITS COORDINATES WHEN THE ROBOT TILTS. A pelvis pitch
+/// rewrites every pixel but moves the camera by exactly as much, and composing the two puts
+/// the terrain back where it was.
+///
+/// Nothing here needs a world pose. The caller supplies the camera pose already in that
+/// frame, and the heading cancels out of it -- so a deployment needs forward kinematics to
+/// the camera and the IMU's roll/pitch, never odometry, and a drifting yaw estimate cannot
+/// corrupt the result.
+///
+/// Two range subtleties, both consequences of feeding the model's own input back through the
+/// pinhole model rather than reading the sensor:
+///   - `image` must be the SAME array the depth channel carries, post-clip. A valid pixel
+///     therefore saturates at the clip band's equivalent range and the cloud has a wall there.
+///   - an invalid pixel is placed at `max_dist` of RAY LENGTH -- a spherical shell at the
+///     sensor's reach -- rather than of z-depth, which would put the image corners far past
+///     it. Left alone they would denormalise to 0 m and pile a fake surface on the robot's
+///     own origin, the worst place for a convolution to find one.
+///
+/// \param cam       This camera's geometry and normalization contract.
+/// \param image     Normalised depth, `cam.pixels()` values.
+/// \param cam_pos   Camera origin in the yaw frame, 3 values.
+/// \param cam_rot   Camera-to-yaw-frame rotation, 9 values, ROW-major.
+/// \param dirs      Precomputed PinholeRayDirections for this camera.
+/// \param out       `3 * cam.pixels()` values, point-major (all x, then all y, then all z).
+void UnprojectToYawFrame(const CameraGeom& cam, const double* image, const double* cam_pos,
+                         const double* cam_rot, const double* dirs, double* out);
+
+/// Widen per-camera depth images to `[d, x, y, z]` (optionally `+ v`) rows, CHANNEL-MAJOR.
+///
+/// The layout the encoder folds: all of channel 0's pixels, then all of channel 1's, each
+/// row-major over (height, width). Interleaving folds into a scrambled image with every
+/// shape still correct.
+///
+/// Channel 0 is the image UNCHANGED, so the cloud has its wall at exactly the range the depth
+/// channel claims; the xyz planes are derived from that same post-clip array.
+///
+/// \param cams      Per-camera geometry, in the generator's sensor-row order.
+/// \param images    One normalised image per camera, each `pixels()` long.
+/// \param cam_pos   One 3-vector per camera, in the yaw frame.
+/// \param cam_rot   One row-major 3x3 per camera, in the yaw frame.
+/// \param channels  4 for `[d, x, y, z]`, 5 to append the validity plane.
+/// \param out       `cams.size() * channels * pixels()` values.
+void DepthXyzRows(const std::vector<CameraGeom>& cams,
+                  const std::vector<const double*>& images,
+                  const std::vector<const double*>& cam_pos,
+                  const std::vector<const double*>& cam_rot, int channels, double* out);
+
 }  // namespace g1_deploy

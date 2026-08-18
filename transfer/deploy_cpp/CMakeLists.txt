@@ -41,6 +41,7 @@ if(NOT nlohmann_json_FOUND)
 endif()
 
 add_library(g1_deploy STATIC
+  src/fm_meta.cc
   src/quat_math.cc
   src/window.cc
   src/depth_obs.cc
@@ -134,9 +135,23 @@ endif()
 # dev box both are there and `ctest` just works.
 include(CTest)
 if(BUILD_TESTING)
+  # Preferred from the system, FETCHED when absent -- the same treatment nlohmann_json gets
+  # above, and for the same reason: these are PARITY tests held to exact float equality
+  # against the python oracle, so "the tests silently did not build" is the one outcome that
+  # must not depend on what a particular box happens to have installed.
   find_package(GTest QUIET)
+  if(NOT GTest_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(googletest
+      GIT_REPOSITORY https://github.com/google/googletest.git
+      GIT_TAG v1.14.0
+      GIT_SHALLOW TRUE)
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+    set(GTest_FOUND TRUE)
+  endif()
   if(GTest_FOUND)
-    foreach(name quat_math_parity window_parity depth_obs_parity node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler)
+    foreach(name quat_math_parity window_parity depth_obs_parity fm_meta node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler)
       add_executable(${name}_test test/${name}_test.cc test/fixture.cc)
       target_include_directories(${name}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
       target_link_libraries(${name}_test

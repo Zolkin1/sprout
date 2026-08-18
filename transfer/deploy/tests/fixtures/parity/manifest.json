@@ -1,9 +1,9 @@
 {
   "format": 1,
   "generator": "transfer/deploy/tools/dump_parity_fixtures.py",
-  "numpy": "1.26.4",
-  "python": "3.12.3",
-  "platform": "Linux-aarch64",
+  "numpy": "2.4.6",
+  "python": "3.12.13",
+  "platform": "Linux-x86_64",
   "byteorder": "little",
   "seed": 0,
   "cases": [
@@ -1400,7 +1400,7 @@
             1
           ],
           "dtype": "float64",
-          "sha256": "f9f265e594daf80aa4284af603716c3f66d76625c552b128bf84b334b46e5f64"
+          "sha256": "1696cc8af80b3f1e0f93a58aa8fbe408da3d577920657807d3724f15a71d9c42"
         }
       ]
     },
@@ -1434,7 +1434,148 @@
             1
           ],
           "dtype": "float64",
-          "sha256": "4cb8c1dac61eee3a183d29caa4d38ebcd7fb20e05812d040612a0e04e62b28f0"
+          "sha256": "5c023b295f5fe3dac31c13b0044f1714496b919c934352ddbf91878d2a8cc151"
+        }
+      ]
+    },
+    {
+      "case": "pinhole_ray_directions",
+      "fn": "pinhole_ray_directions",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {
+        "width": 5,
+        "height": 4,
+        "fx": 2.5,
+        "fy": 2.2,
+        "cx": 2.5,
+        "cy": 2.0,
+        "offset": 0.75,
+        "scale": 0.5,
+        "min_dist": 0.1,
+        "max_dist": 7.9,
+        "min_clip_val": 0.0,
+        "max_clip_val": 0.0
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "dirs",
+          "file": "pinhole_ray_directions.out.dirs.bin",
+          "shape": [
+            1,
+            60
+          ],
+          "dtype": "float64",
+          "sha256": "01b002c0dd924700ba1691edd5b2d1d13f072467cd29a8eed955410c0278bdbc"
+        }
+      ]
+    },
+    {
+      "case": "invalid_depth_mask",
+      "fn": "invalid_depth_mask",
+      "atol": 0.0,
+      "compare": "elementwise",
+      "attrs": {
+        "width": 5,
+        "height": 4,
+        "fx": 2.5,
+        "fy": 2.2,
+        "cx": 2.5,
+        "cy": 2.0,
+        "offset": 0.75,
+        "scale": 0.5,
+        "min_dist": 0.1,
+        "max_dist": 7.9,
+        "min_clip_val": 0.0,
+        "max_clip_val": 0.0
+      },
+      "inputs": [
+        {
+          "name": "image",
+          "file": "invalid_depth_mask.in.image.bin",
+          "shape": [
+            64,
+            20
+          ],
+          "dtype": "float64",
+          "sha256": "a6176e0faee380da3037f9e2d66c80b352ec9121380eb0b45a2506696debcd0c"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mask",
+          "file": "invalid_depth_mask.out.mask.bin",
+          "shape": [
+            64,
+            20
+          ],
+          "dtype": "float64",
+          "sha256": "34e6e9a04a709bd6b71a6b0cfbff54efd44bff48c32068c813dd8477c910a76c"
+        }
+      ]
+    },
+    {
+      "case": "unproject_to_yaw_frame",
+      "fn": "unproject_to_yaw_frame",
+      "atol": 1e-12,
+      "compare": "elementwise",
+      "attrs": {
+        "width": 5,
+        "height": 4,
+        "fx": 2.5,
+        "fy": 2.2,
+        "cx": 2.5,
+        "cy": 2.0,
+        "offset": 0.75,
+        "scale": 0.5,
+        "min_dist": 0.1,
+        "max_dist": 7.9,
+        "min_clip_val": 0.0,
+        "max_clip_val": 0.0
+      },
+      "inputs": [
+        {
+          "name": "image",
+          "file": "unproject_to_yaw_frame.in.image.bin",
+          "shape": [
+            64,
+            20
+          ],
+          "dtype": "float64",
+          "sha256": "a6176e0faee380da3037f9e2d66c80b352ec9121380eb0b45a2506696debcd0c"
+        },
+        {
+          "name": "cam_pos",
+          "file": "unproject_to_yaw_frame.in.cam_pos.bin",
+          "shape": [
+            64,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "51bb0c7171de7586267e534fbcccc672e8c08883a03493e829620a7e7739ea20"
+        },
+        {
+          "name": "cam_rot",
+          "file": "unproject_to_yaw_frame.in.cam_rot.bin",
+          "shape": [
+            64,
+            9
+          ],
+          "dtype": "float64",
+          "sha256": "6739cd714c537a089ef3b47e126098cb5e804e665ab2baf02ed7b92a78760142"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "points",
+          "file": "unproject_to_yaw_frame.out.points.bin",
+          "shape": [
+            64,
+            60
+          ],
+          "dtype": "float64",
+          "sha256": "3c2e6f7c6c3c15b00e2d1e504437b0dd18147bd526bb6368a7b64ac87896c5bf"
         }
       ]
     }

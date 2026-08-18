@@ -314,8 +314,9 @@ void PolicyRuntime::Step(const HardwareReadings& readings,
     }
     // The generator's own normalisation is folded into the graph, but the band clamp is not:
     // one non-finite entry would poison the whole conditioning.
-    SanitizeExtero(cond.extero.data(), cond.extero.size(), fm_->meta().extero_source,
-                   cond.extero.data());
+    // The band from the GRAPH, not from the per-source table: see SanitizeExteroBand.
+    SanitizeExteroBand(cond.extero.data(), cond.extero.size(), fm_->meta().extero_clip,
+                       cond.extero.data());
     cond.future_cmd.assign(static_cast<size_t>(fm_->meta().f) * fm_->meta().cmd_dim, 0.0);
     for (int f = 0; f < fm_->meta().f; ++f) {
       cond.future_cmd[static_cast<size_t>(f) * 3 + 0] = readings.command.x();

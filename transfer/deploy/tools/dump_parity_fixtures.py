@@ -94,6 +94,14 @@ TOLERANCES: dict[str, tuple[float, str]] = {
     # original; this inherits that rather than loosening it.
     "normalize_depth": (0.0, "elementwise"),
     "sanitize_extero": (0.0, "elementwise"),
+    # The 5-channel exteroception row. NOT exact, unlike the two above: these DO have
+    # transcendentals (atan-free, but a normalise and a division by the ray cosine) and a
+    # 3x3 matrix product, so an ulp of difference is arithmetic rather than behaviour.
+    # Still tight -- the quantity is metres of terrain position, and 1e-12 m is far below
+    # anything the sensor or the model can distinguish.
+    "pinhole_ray_directions": (1e-14, "elementwise"),
+    "invalid_depth_mask": (0.0, "elementwise"),   # a 0/1 plane: exact or wrong
+    "unproject_to_yaw_frame": (1e-12, "elementwise"),
 }
 
 
@@ -371,6 +379,61 @@ def dump_depth(w: FixtureWriter, rng: np.random.Generator, n: int) -> None:
               attrs={"source": source, "clip": clip})
 
 
+def dump_depth_xyz(w: FixtureWriter, rng: np.random.Generator, n: int) -> None:
+    """Emit the fixtures for the 5-channel depth row's geometry.
+
+    The three numerical pieces the C++ has to reproduce before it can assemble a row at all:
+    where each pixel's ray points, which pixels carry no reading, and where a reading lands
+    in the root's yaw-aligned frame. The row ASSEMBLY on top of them (channel-major order,
+    the depth plane passed through untouched) is a layout property rather than a numerical
+    one, and is tested directly in C++ -- the same split the python side uses between
+    test_depth_unproject.py and test_depth_xyz_rows.py.
+
+    A small 4x5 grid on purpose: these blobs are committed, and the geometry is per-pixel, so
+    a bigger image would multiply the fixture size without testing anything new. The camera
+    is pitched steeply DOWN like the real pair -- with a horizontal boresight every ray would
+    have a near-identical cosine, which is exactly the factor a wrong z-depth-to-ray-length
+    conversion gets wrong.
+
+    Args:
+        w: The fixture writer.
+        rng: Source of randomness.
+        n: Number of independent cases for the pose-dependent functions.
+    """
+    h, wid = 4, 5
+    cam = {"width": wid, "height": h, "fx": 2.5, "fy": 2.2, "cx": wid / 2.0, "cy": h / 2.0,
+           "offset": 0.75, "scale": 0.5, "min_dist": 0.1, "max_dist": 7.9,
+           "min_clip_val": 0.0, "max_clip_val": 0.0}
+    k = h * wid
+
+    dirs = do.pinhole_ray_directions(wid, h, cam["fx"], cam["fy"], cam["cx"], cam["cy"])
+    w.add("pinhole_ray_directions", "pinhole_ray_directions", {},
+          {"dirs": dirs.reshape(1, -1)}, attrs=dict(cam))
+
+    # Images that carry both real readings and every class of miss, since validity is found
+    # by RANGE and the unprojection places a miss at max_dist of RAY LENGTH rather than of
+    # z-depth. Random depths in metres, then normalised through the contract.
+    metres = rng.uniform(0.05, 9.0, size=(n, k))
+    metres[:, ::5] = np.inf                                   # rays that hit nothing
+    metres[:, 1::7] = 0.02                                    # nearer than min_dist
+    img = np.stack([mdp_normalize(metres[i], cam) for i in range(n)])
+
+    w.add("invalid_depth_mask", "invalid_depth_mask", {"image": img},
+          {"mask": do.invalid_depth_mask(cam, img.reshape(-1)).reshape(n, k).astype(np.float64)},
+          attrs=dict(cam))
+
+    # One pose per case: a camera forward of and above the root, pitched down, with the
+    # rotation carried as a flat 3x3 so the C++ reads it without a quaternion convention in
+    # the middle (which is its own parity question, covered by quat_math).
+    pos = rng.uniform(-0.4, 0.6, size=(n, 3))
+    rot = np.stack([np.linalg.qr(rng.standard_normal((3, 3)))[0] for _ in range(n)])
+    rot *= np.sign(np.linalg.det(rot))[:, None, None]          # proper rotations only
+    pts = np.stack([do.unproject_to_yaw_frame(cam, img[i], pos[i], rot[i]) for i in range(n)])
+    w.add("unproject_to_yaw_frame", "unproject_to_yaw_frame",
+          {"image": img, "cam_pos": pos, "cam_rot": rot.reshape(n, 9)},
+          {"points": pts.reshape(n, -1)}, attrs=dict(cam))
+
+
 def mdp_normalize(d: np.ndarray, cam: dict) -> np.ndarray:
     """``normalize_depth_np`` with a camera contract dict, for brevity above."""
     return do.normalize_depth_np(
@@ -397,6 +460,7 @@ def main() -> int:
     dump_quat_math(w, rng, args.count)
     dump_window(w, rng, args.count)
     dump_depth(w, rng, args.count)
+    dump_depth_xyz(w, rng, min(args.count, 64))
     path = w.write_manifest(args.seed)
 
     total = sum(os.path.getsize(os.path.join(args.out, f)) for f in os.listdir(args.out))

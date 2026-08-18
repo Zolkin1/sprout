@@ -35,26 +35,8 @@
 
 namespace g1_deploy {
 
-/// The generator's contract, from fm.onnx's `fm_meta`.
-struct FmMeta {
-  int n = 0;  //: N, history length
-  int f = 0;  //: F, horizon
-  int d = 0;  //: D, node width
-  int num_joints = 0;
-  int cmd_dim = 0;
-  std::vector<int> cmd_steps;  //: which window steps the command tokens are sampled at
-  int num_cmd_tokens = 0;
-  int height_dim = 0;
-  int extero_tokens = 1;
-  std::string extero_source = "height_scan";
-  std::vector<ReferenceBlock> window_blocks;
-  bool has_history_null = false;  //: inferred from the GRAPH, not the metadata
+#include "g1_deploy/fm_meta.h"
 
-  int extero_dim() const { return extero_tokens * height_dim; }
-};
-
-/// Parse `fm_meta`. `has_history_null` is left false; the loader sets it from the graph.
-FmMeta ParseFmMeta(const std::string& json);
 
 /// The exteroception and command a plan is conditioned on, sampled at request time.
 struct FmConditioning {

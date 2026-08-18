@@ -2,6 +2,7 @@
 
 #include "g1_deploy/fm_session.h"
 
+
 #include <nlohmann/json.hpp>
 
 #include <chrono>
@@ -13,11 +14,6 @@ namespace {
 
 using OrderedJson = nlohmann::ordered_json;
 
-std::vector<int> IntList(const OrderedJson& node) {
-  std::vector<int> out;
-  for (const auto& v : node) out.push_back(v.get<int>());
-  return out;
-}
 
 }  // namespace
 
@@ -26,68 +22,7 @@ FmMeta ParseFmMeta(const std::string& json) {
   try {
     root = OrderedJson::parse(json);
   } catch (const std::exception& e) {
-    throw std::runtime_error(std::string("fm_meta is not valid JSON: ") + e.what());
-  }
-  FmMeta m;
-  m.n = root.at("N").get<int>();
-  m.f = root.at("F").get<int>();
-  m.d = root.at("D").get<int>();
-  m.num_joints = root.at("nj").get<int>();
-  m.cmd_dim = root.at("cmd_dim").get<int>();
-  m.cmd_steps = IntList(root.at("cmd_steps"));
-  m.num_cmd_tokens = root.at("num_cmd_tokens").get<int>();
-  // Exteroception shape, under EITHER key spelling. The exporter renamed these when the
-  // per-camera CNN encoder landed: one flat `extero_tokens` x `height_dim` row became
-  // `extero_sensor_count` sensors of `extero_sensor_dim` each. Only the NAMES moved -- the
-  // graph input is the same flat (V, count*dim) row of raw readings in camera order, because
-  // the encoder (MLP or CNN) and the attention mask both live INSIDE the graph. Verified by
-  // exporting the same tracker's CNN generator and diffing the two artifacts: identical input
-  // shapes, identical extero_spec, identical window_blocks; only these two keys differ.
-  //
-  // Both spellings are read because the deployed artifacts are a mix and an old fm.onnx must
-  // keep loading. `height_dim` was .at() -- a hard throw -- so a CNN export died here, before
-  // reaching anything that could explain why.
-  //
-  // A CNN checkpoint also carries `extero_tokens_per_sensor` (how many tokens the encoder
-  // emits into the transformer). That is internal to the graph; this runtime never sees it.
-  if (root.contains("extero_sensor_count")) {
-    m.extero_tokens = root.at("extero_sensor_count").get<int>();
-    m.height_dim = root.contains("extero_sensor_dim") ? root.at("extero_sensor_dim").get<int>()
-                                                      : root.at("height_dim").get<int>();
-  } else {
-    m.height_dim = root.at("height_dim").get<int>();
-    if (root.contains("extero_tokens")) m.extero_tokens = root.at("extero_tokens").get<int>();
-  }
-  if (root.contains("extero_source")) {
-    m.extero_source = root.at("extero_source").get<std::string>();
-  }
-  // REQUIRED. The generator's output IS the tracker's reference_window observation -- there
-  // is no translation layer between them -- so the two must name the same blocks in the same
-  // order. Dropping joint_vel on one side only is caught by the widths; swapping two
-  // same-width blocks is caught by nothing else at all.
-  if (!root.contains("window_blocks")) {
-    throw std::runtime_error(
-        "fm.onnx carries no window_blocks in its fm_meta, so its output layout cannot be "
-        "checked against the tracker's reference_window. Re-export with export_fm_onnx.py.");
-  }
-  for (const auto& b : root.at("window_blocks")) {
-    // Accept both ["name", width] pairs and bare names, matching the python's tolerance.
-    m.window_blocks.push_back(BlockFromName(b.is_array() ? b.at(0).get<std::string>()
-                                                         : b.get<std::string>()));
-  }
-  if (static_cast<int>(m.cmd_steps.size()) != m.num_cmd_tokens) {
-    throw std::runtime_error("fm_meta cmd_steps has " + std::to_string(m.cmd_steps.size()) +
-                             " entries but num_cmd_tokens is " +
-                             std::to_string(m.num_cmd_tokens));
-  }
-  return m;
-}
-
-void ZeroNoise::Fill(double* out, size_t count) {
-  for (size_t i = 0; i < count; ++i) out[i] = 0.0;
-}
-
-void GaussianNoise::Fill(double* out, size_t count) {
+ count) {
   for (size_t i = 0; i < count; ++i) out[i] = dist_(rng_);
 }
 
