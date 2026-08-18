@@ -146,7 +146,9 @@ python scripts/rsl_rl/play.py --task=G1-teacher-clf-terrain-play \
 ```
 
 `play.py` also writes the deploy artifacts: `exported/policy.pt`,
-`policy_parameters.yaml`, and (with `--fm_checkpoint`) `tracker.onnx` + `fm.onnx`. Pass
+`policy_parameters.yaml`, and (with `--fm_checkpoint`) `tracker.onnx` + the generator,
+named for the FM checkpoint it came from (`<fm run>_fm.onnx`) so a run's `exported/` can
+hold every generator trained against that teacher instead of overwriting one file. Pass
 `--no_deploy_onnx` to skip the ONNX pair. `tracker.onnx` is the ONLY ONNX form of the
 tracker — it is `policy.pt` re-exported self-contained, batch-dynamic and with the
 deployment parameters embedded, and it is what MuJoCo and the robot load.
@@ -164,6 +166,58 @@ python scripts/flow_matching/train.py --data <windows.h5> --wandb
 `--num_windows` streams only the FM snap windows to a chunked `.h5` (bounded RAM); omit it
 for the older buffered per-step `.npz`. `command_distribution_stats.py` reports the
 command-dynamics split of either format.
+
+**What a recording contains is a choice, not an accident.** Three knobs decide it, and the
+defaults are the ones a dataset wants rather than the ones training wants:
+
+* `--start_step 0` (default) starts every episode at its clip's first frame, so each clip
+  is walked once end to end and the windows cover clip PHASE uniformly. Training's sampled
+  start (`--start_step -1`) run to the clip end visits step `t` with probability `~t/len`,
+  which measured out as 1.1% of windows in the first phase decile against 18.1% in the
+  eighth.
+* `--clip_draw cycle` (default) draws clips from a shuffled queue per terrain group, so
+  every clip is used once before any repeats. With-replacement sampling covers only
+  `1-exp(-E/C)` of a group — a 200k-window recording spanned 6393 of 10000 clips.
+* the MIX across clip families is set afterwards, offline:
+
+```bash
+python scripts/flow_matching/compose_dataset.py <windows.h5> --list
+python scripts/flow_matching/compose_dataset.py <windows.h5> -o mix.h5 --by terrain \
+    --mix crossing=40000 --mix on_terrain=40000 --mix flat=40000
+```
+
+`compose_dataset.py` selects rows by quota, spreading each evenly over the bucket's clips
+and evenly along each clip's timeline. It decides from the recording's small index columns,
+so record ONCE broadly and compose as many mixes as are worth trying. `--by` picks what a
+bucket IS, and the choice matters because the useful questions live at two levels:
+
+| `--by` | buckets | describes |
+| --- | --- | --- |
+| `type` | flat / terrain / transition / box | the CLIP's terrain (library `terrain_type_code`) |
+| `family` | `family_stairs_up`, `family_jump_off`, … | the CLIP's family (recorded tag) |
+| `terrain` | flat / crossing / on_terrain | what the WINDOW's own span does |
+
+`terrain` is the one no clip-level axis can express: a transition clip is a flat approach,
+then the crossing, then the stair run, so `--by type --mix transition=40000` buys mostly
+ordinary flat walking — measured on a real recording, a transition clip's windows are 42%
+flat, 46% crossing, 12% on-terrain. It is classified from the library's authored per-frame
+anchor mask (`anchor_mask_is_pinned` = the reference is registered to terrain geometry
+rather than to the robot), not from a height threshold. Axes compose:
+`--by type,terrain --mix box/crossing=20000` asks for the box mounts specifically.
+
+Two things to size the recording against, both measured on `g1_mb_v5_body`:
+
+* **Its natural mix is set by TILE counts, not by anything you asked for** — 31% flat, 34%
+  box, 20% transition, 15% terrain, because every env emits a window at the same cadence
+  and envs are spread over the tiles. That is the distribution the quotas exist to override.
+* **Flat is the group that binds clip coverage.** Flat clips are 999 frames against a stair
+  clip's ~350, so a flat env gets through its 3000 clips far slower than a stair env gets
+  through its 50-clip group. At 200k windows the terrain/transition/box groups are already
+  fully covered and flat is at 57%; **~353k windows** is where every clip in the library has
+  been used at least once.
+
+The composer can only spread what the recording took, so phase uniformity comes from
+`--start_step 0` — composing an old random-start recording still yields the ramp.
 
 ### 4. Deploy the tracker, in Isaac and in MuJoCo
 
@@ -494,7 +548,8 @@ for a like-for-like comparison against a specific clip, or
 `transfer/sim/gen_tracker_runner.py` for a joystick playground on a generated scene.
 
 Both read the artifacts `play.py` exports (`exported/policy_parameters.yaml` +
-`tracker.onnx` / `fm.onnx`), so export before running either. To add a robot, drop its sim
+`tracker.onnx` + a `*_fm.onnx`), so export before running either. With several generators
+in one `exported/`, name the one you mean with `--fm_onnx`; the runners refuse to guess. To add a robot, drop its sim
 files in `transfer/sim/robots/` and add a runner.
 
 Neither needs Isaac: on a box without `env_isaaclab`, build the small downstream venv

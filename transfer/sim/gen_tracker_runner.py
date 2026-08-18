@@ -26,6 +26,7 @@ import csv
 import glob
 import math
 import os
+import signal
 import sys
 import time
 
@@ -36,9 +37,18 @@ import yaml
 
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from deploy.artifacts import resolve_fm_onnx  # noqa: E402
 from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
-from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw  # noqa: E402
-from deploy.quat_math_np import quat_apply, quat_box_minus, quat_inv  # noqa: E402
+from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
+from deploy.quat_math_np import (  # noqa: E402
+    combine_frame_transforms,
+    matrix_from_quat,
+    quat_apply,
+    quat_box_minus,
+    quat_inv,
+    subtract_frame_transforms,
+    yaw_quat,
+)
 from deploy.fk_mujoco import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
 from deploy.tracker_session import convert_joint_order  # noqa: E402
 from deploy.window_np import window_block_slices  # noqa: E402
@@ -126,6 +136,7 @@ class RealtimePacer:
 def build_state(
     robot: Robot, policy: GenTrackerPolicy, command: np.ndarray,
     depth_cams: MujocoDepthCameras | None = None, want_depth_hits: bool = False,
+    fm_depth_cams: MujocoDepthCameras | None = None,
 ) -> dict:
     """Assemble the world-state dict ``GenTrackerPolicy.create_obs`` expects.
 
@@ -137,8 +148,12 @@ def build_state(
         robot: The MuJoCo robot wrapper.
         policy: The loaded generator + tracker policy (for joint order + ctx).
         command: Velocity command ``(vx, vy, wz)``.
-        depth_cams: The depth cameras to cast, or ``None`` when the policy has none.
+        depth_cams: The TRACKER's depth cameras to cast, or ``None`` when the policy has
+            none.
         want_depth_hits: Also collect the depth rays' world hit points (viewer only).
+        fm_depth_cams: The GENERATOR's cameras, when it samples the same lenses on its own
+            grid. ``None`` when the two samplings match, in which case the generator reads
+            ``state["depth"]`` like it always did.
 
     Returns:
         State dict (numpy, FM/isaac joint order, world frame, xyzw quats).
@@ -169,28 +184,88 @@ def build_state(
     # tracker observes a scan (spec present) or the FM conditions on one -- NOT merely
     # because the FM has wide exteroception tokens, which a depth FM also has.
     spec = policy._trk.get_height_scan_spec() if hasattr(policy._trk, "get_height_scan_spec") else None
+    # Read the context DIRECTLY, not through getattr-with-a-default. Both context types
+    # (FmContext and _TrackerOnlyCtx) always define these, so the default was never doing
+    # any work -- but it would have silently absorbed the extero rename: a default of 1
+    # makes this False, and the runner would just stop computing state["height_scan"] for a
+    # height-scan FM. An AttributeError is the outcome to want here.
     fm_uses_scan = (
-        getattr(policy.ctx, "extero_source", "height_scan") == "height_scan"
-        and getattr(policy.ctx, "height_dim", 1) > 1
+        policy.ctx.extero_source == "height_scan" and policy.ctx.extero_sensor_dim > 1
     )
     if spec is not None or fm_uses_scan:
-        s = spec or {}
+        # PREFER the generator's own spec, then the tracker's, and REFUSE rather than default.
+        # The old `s.get(..., 0.1 / (1.5, 1.0))` fallback is the POLICY's historical grid and
+        # cannot be assumed for a generator: a 14641-ray FM would be handed 176 values and die
+        # inside a Normalizer broadcast -- or, at a coincidental width, be fed a completely
+        # different patch of ground at exactly the right shape.
+        fm_spec = next(iter(getattr(policy.ctx, "extero_spec", None) or []), None)
+        s = fm_spec if (fm_spec and "resolution" in fm_spec) else spec
+        if s is None:
+            raise ValueError(
+                "this generator conditions on a height scan but neither it nor the tracker "
+                "states the grid geometry (resolution/size/offset). There is no safe default: "
+                "the historical 0.1 m / 1.5x1.0 m grid is the POLICY's, and casting it for a "
+                "generator trained on another one silently substitutes the wrong signal. "
+                "Re-export the artifacts with a height_scan_spec."
+            )
+        if bool(s.get("privileged")) and not policy.allow_privileged_extero:
+            raise ValueError(
+                f"this generator conditions on the PRIVILEGED dense scan "
+                f"({s.get('size')} m @ {s.get('resolution')} m = {s.get('num_rays')} rays), "
+                "which is exact noise-free ground truth and not reproducible on a ROBOT. "
+                "MuJoCo can reproduce it -- it casts the same grid against the same terrain "
+                "-- so pass --allow_privileged_extero to run the pair here. Nothing measured "
+                "under it says anything about hardware."
+            )
         off = s.get("offset_pos", [0.75, 0.0, 20.0])
         clr, hits = robot.compute_height_scan(
             state["root_pos"], state["root_quat"],
-            resolution=float(s.get("resolution", 0.1)), size=tuple(s.get("size", (1.5, 1.0))),
-            offset_fwd=float(off[0]), ray_start_h=float(off[2]),
+            resolution=float(s["resolution"]), size=tuple(s["size"]),
+            offset_fwd=float(off[0]), offset_lat=float(off[1]), ray_start_h=float(off[2]),
             sensor_offset=float(s.get("sensor_offset", 0.5)),
         )
+        if fm_uses_scan and clr.shape[-1] != int(policy.ctx.extero_sensor_dim):
+            raise ValueError(
+                f"cast {clr.shape[-1]} rays but the generator conditions on "
+                f"{int(policy.ctx.extero_sensor_dim)}. The grid geometry and the checkpoint "
+                "disagree; a Normalizer broadcast would be the next thing to fail, further "
+                "from the cause."
+            )
         # Missed rays must match IsaacLab's encoding, NOT 0.0. Isaac's miss is ``pos_z - inf -
-        # offset`` = -inf, which sanitize_height_scan maps to -HEIGHT_SCAN_CLIP = -1.0; that is
-        # what both the teacher obs and the FM height token were trained on. Mapping a miss to
-        # 0.0 instead reads as "ground exactly at the nominal sensor plane" -- plausible flat
-        # ground where Isaac reports the band edge. Flat terrain never misses, so this was
+        # offset`` = -inf, and ``sanitize_height_scan`` maps a non-finite reading to the band
+        # edge; that is what both the teacher obs and the FM token were trained on. Mapping a
+        # miss to 0.0 instead reads as "ground exactly at the nominal sensor plane" -- plausible
+        # flat ground where Isaac reports the band edge. Flat terrain never misses, so this was
         # invisible until isolated (has_floor=False) stair/box tiles, where rays overshoot the
         # tile edge and ~2-3% of them miss right at the stair transition.
-        state["height_scan"] = np.nan_to_num(clr, nan=-1.0)
+        #
+        # Leave the miss as -inf rather than substituting here: each consumer then applies its
+        # OWN sanitize with its own band (the FM's comes from the checkpoint), exactly as in
+        # Isaac. Pre-substituting a number hard-codes one consumer's band for all of them --
+        # which was silently wrong the moment the FM's band became configurable.
+        state["height_scan"] = np.where(np.isnan(clr), -np.inf, clr)
         state["height_scan_hits"] = hits
+    # The generator's camera POSES, when it conditions on more than depth. Same construction
+    # as the Isaac term: the MOUNT BODY's live pose composed with the contract's NOMINAL
+    # offset (never the jittered one -- a robot knows its calibration and nothing more),
+    # expressed in the root's yaw-aligned frame. The heading cancels out of that frame, which
+    # is what lets this run with no odometry.
+    if int(getattr(policy.ctx, "extero_channels", 1)) > 1:
+        fm_spec = policy.get_fm_depth_camera_spec() or policy.get_depth_camera_spec() or []
+        poses = []
+        for cam in fm_spec:
+            mount = robot.get_body_world_states([str(cam["mount_body"])])[0]
+            cam_p_w, cam_q_w = combine_frame_transforms(
+                mount[0:3], mount[3:7],
+                np.asarray(cam["offset_pos"], dtype=np.float64),
+                np.asarray(cam["offset_quat_xyzw"], dtype=np.float64),
+            )
+            p_rel, q_rel = subtract_frame_transforms(
+                state["root_pos"], yaw_quat(state["root_quat"]), cam_p_w, cam_q_w
+            )
+            poses.append((p_rel, matrix_from_quat(q_rel)))
+        state["fm_camera_pose"] = poses
+
     # Depth cameras: cast the policy's own pinhole grids against the terrain AND the
     # robot's visual meshes, normalised exactly as the observation term does. One cast
     # feeds BOTH consumers -- the tracker's depth obs terms (keyed by term name) and the
@@ -203,6 +278,12 @@ def build_state(
             state["depth"], state["depth_hits"] = depth_cams.compute(robot.mj_data, want_hits=True)
         else:
             state["depth"] = depth_cams.compute(robot.mj_data)
+    # A SECOND cast, only when the generator samples the same lenses on a different grid.
+    # There is nothing to share: the arrays have different widths, and resizing the
+    # tracker's would either invent detail (up) or throw away exactly the detail the
+    # generator was trained to use (down). The viewer's hit cloud stays the tracker's.
+    if fm_depth_cams is not None:
+        state["fm_depth"] = fm_depth_cams.compute(robot.mj_data)
     return state
 
 
@@ -338,6 +419,54 @@ def _add_arrow(scn, base: np.ndarray, vec: np.ndarray, rgba: tuple, width: float
     scn.ngeom += 1
 
 
+class InterruptFlag:
+    """Make Ctrl-C end the run at the next control step instead of unwinding through it.
+
+    A bare ``KeyboardInterrupt`` fires wherever the interpreter happens to be -- typically
+    deep inside the observation build -- and propagates out through the viewer's context
+    manager. Two things go wrong there:
+
+    * the GL drawable is destroyed while the viewer thread still has a buffer swap in
+      flight, which the X server reports as ``GLXBadDrawable`` and Xlib treats as **fatal**,
+      so an interrupted run ends in what looks like a crash;
+    * **every artifact the run was going to write is lost** -- the metrics CSV, the scan
+      rows, the FM prediction windows and the plots are all written *after* the loop, and
+      the exception skips the lot.
+
+    Setting a flag instead lets the loop return normally, so an interrupted run finishes the
+    way a ``--total_time`` run does: the viewer is closed by its own context manager, the
+    artifacts are written, and the exit goes through the same ``os._exit(0)`` that already
+    exists to dodge the native GL teardown race. A SECOND Ctrl-C restores the default
+    handler, so a genuinely wedged run can still be killed.
+    """
+
+    def __init__(self) -> None:
+        self.hit = False
+        self._previous = None
+
+    def __enter__(self) -> "InterruptFlag":
+        """Install the handler, remembering whatever was there before."""
+        self._previous = signal.signal(signal.SIGINT, self._handle)
+        return self
+
+    def __exit__(self, *_exc) -> bool:
+        """Restore the previous handler."""
+        if self._previous is not None:
+            signal.signal(signal.SIGINT, self._previous)
+        return False
+
+    def _handle(self, _signum, _frame) -> None:
+        """Flag the interrupt; a second one goes back to the default (immediate) behaviour."""
+        if self.hit:
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            print("\n[WARN] second interrupt: the next one exits immediately, with no "
+                  "artifacts written.")
+            return
+        self.hit = True
+        print("\n[INFO] interrupt: stopping at the next control step and writing artifacts "
+              "(Ctrl-C again to skip that).")
+
+
 def box_top(robot: Robot, spec: str) -> tuple[float, float, float] | None:
     """Centre + top height of a named box geom in the loaded scene.
 
@@ -371,8 +500,13 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         cmd_max_acc: float, fm_traj_points: int, spawn_on_box: str | None = None,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
-        viz_geomgroup: list[int] | None = None, viz_contacts: bool = False) -> bool:
+        viz_geomgroup: list[int] | None = None, viz_contacts: bool = False,
+        fm_depth_cams: MujocoDepthCameras | None = None) -> bool | None:
     """Run the control loop; return True if the robot did not fall.
+
+    Returns ``None`` when the user interrupts with Ctrl-C, which is neither survival nor a
+    fall. The interrupt is taken at a control-step boundary so the artifacts below still get
+    written -- see :class:`InterruptFlag` for why that matters and what it replaced.
 
     The FM + tracker have control from the first step -- there is no warmup hold, and no
     way to fabricate a generator history. Playback is paced to real time (scaled by
@@ -417,14 +551,18 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         clip_handoff_time: In clip mode, sim time (s) at which to hand the reference off
             from the clip to the FM generator (the FM history is kept warm during the
             clip phase). ``< 0`` never hands off (clip-only playback).
-        depth_cams: Depth cameras to cast each control step, or ``None`` when the loaded
-            policy has none. Feeds the tracker's depth obs terms and the FM's
-            exteroception tokens from one cast.
+        depth_cams: The TRACKER's depth cameras to cast each control step, or ``None`` when
+            the loaded policy has none. Feeds the tracker's depth obs terms, and the FM's
+            exteroception tokens too when both sample the same grid.
+        fm_depth_cams: The GENERATOR's cameras, cast separately when it samples the same
+            lenses on its own grid (``policy.depth_sampling_is_split()``).
         depth_viz_stride: Draw every Nth depth pixel's hit point in the viewer. The two
             cameras produce 1560 hits per step, well past ``user_scn.maxgeom``, so the
             cloud is subsampled.
     """
     dt = policy.get_dt()
+    # Checked at every control-step boundary by all three loops (see InterruptFlag).
+    interrupt = InterruptFlag()
     decim = int(round(dt / robot.mj_model.opt.timestep))
     sync_every = max(1, math.ceil((1 / 50) / robot.mj_model.opt.timestep))
 
@@ -555,7 +693,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             vel_cmd = np.clip(desired, vel_cmd - lim, vel_cmd + lim)
         else:
             vel_cmd = desired
-        state = build_state(robot, policy, vel_cmd, depth_cams, want_depth_hits=viz)
+        state = build_state(robot, policy, vel_cmd, depth_cams, want_depth_hits=viz,
+                            fm_depth_cams=fm_depth_cams)
         obs = policy.create_obs(state)
         action = policy.get_action(obs, robot.joint_names)
         robot.apply_action(action)
@@ -808,8 +947,10 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         print(msg)
         _next_report_t[0] += report_every_s
 
-    def run_loop(viewer) -> bool:
+    def run_loop(viewer) -> bool | None:
         """Live FM + tracker control from the first step; return False if the robot fell.
+
+        Returns ``None`` if the user interrupted the run -- neither survival nor a fall.
 
         There is no warmup hold. The generator drives from step 0 with its learned
         null-history embedding covering the not-yet-full window, which is what the RL side
@@ -824,6 +965,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         handoff_time = robot.mj_data.time
         # Live: the FM + tracker have control from here.
         while True:
+            if interrupt.hit:
+                return None
             if viewer is not None and not viewer.is_running():
                 return True
             if total_time > 0 and robot.mj_data.time > total_time:
@@ -835,7 +978,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             advance_physics(state, viewer)
             maybe_report_timing()
 
-    def run_clip_loop(viewer) -> bool:
+    def run_clip_loop(viewer) -> bool | None:
         """Play the baked clip through the tracker; optionally hand off to the FM.
 
         Each step the command is the clip's ``target_vel`` (already ramped at
@@ -843,19 +986,23 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         (``observe()`` keeps the FM history warm). Once ``clip_handoff_time`` is
         reached the reference source switches to the live FM generator; the command
         keeps following the authored clip velocity profile. ``clip_handoff_time < 0``
-        never hands off (clip-only). Returns False if the robot fell.
+        never hands off (clip-only). Returns False if the robot fell, ``None`` if the
+        user interrupted the run.
         """
         nonlocal handoff_time
         clip_only = clip_handoff_time < 0
         handed_off = False
         clip_step = clip.start_step
         while True:
+            if interrupt.hit:
+                return None
             if viewer is not None and not viewer.is_running():
                 return True
             if total_time > 0 and robot.mj_data.time > total_time:
                 return True
             s = min(clip_step, clip.real_steps - 1)
             state = build_state(robot, policy, clip.command_at(s), depth_cams,
+                                fm_depth_cams=fm_depth_cams,
                                 want_depth_hits=viz)
             if (not clip_only) and robot.mj_data.time >= clip_handoff_time:
                 if not handed_off:
@@ -897,14 +1044,17 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         raise ValueError("Headless mode requires --total_time > 0.")
 
     pacer.reset(robot.mj_data.time)
-    if headless:
-        success = loop_fn(None)
-    else:
-        with mujoco.viewer.launch_passive(robot.mj_model, robot.mj_data) as viewer:
-            viewer.cam.trackbodyid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
-            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
-            _apply_viz_options(viewer, robot.mj_model, viz_geomgroup, viz_contacts)
-            success = loop_fn(viewer)
+    # The handler is installed only around the loop, so a Ctrl-C during setup or during the
+    # artifact writing below still behaves normally.
+    with interrupt:
+        if headless:
+            success = loop_fn(None)
+        else:
+            with mujoco.viewer.launch_passive(robot.mj_model, robot.mj_data) as viewer:
+                viewer.cam.trackbodyid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
+                viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
+                _apply_viz_options(viewer, robot.mj_model, viz_geomgroup, viz_contacts)
+                success = loop_fn(viewer)
 
     if log_file:
         log_file.close()
@@ -933,20 +1083,41 @@ def main() -> None:
     parser.add_argument("--experiment", type=str, default="g1")
     parser.add_argument("--load_run", type=str, default=None, help="Tracker run dir (default: latest).")
     parser.add_argument("--fm_onnx", type=str, default=None,
-                        help="Generator ONNX (default: <run>/exported/fm.onnx).")
+                        help="Which generator to load: a path, or a bare filename resolved "
+                             "inside <run>/exported/. Exports are named for the FM checkpoint "
+                             "(e.g. 2026-08-12_17-07-47_scan_pin1_fm.onnx), so one run dir "
+                             "holds every generator trained against that teacher. Optional "
+                             "when the dir holds exactly one; REQUIRED when it holds several "
+                             "-- defaulting to the newest is the ambiguity the naming exists "
+                             "to remove.")
     parser.add_argument("--mode", choices=["joystick", "eval"], default="joystick")
     parser.add_argument("--command", type=str, default="smooth_ramp_running",
                         help="Scripted velocity profile in experiments.velocity_commands (eval mode).")
     parser.add_argument("--scene", type=str, default="basic_scene")
     parser.add_argument("--robot_name", type=str, default="g1_21j")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
-    parser.add_argument("--providers", default="",
+    parser.add_argument("--providers", default="auto",
                         help="Comma-separated onnxruntime execution providers for BOTH nets, "
-                             "e.g. 'cuda' or 'cuda,cpu' (aliases: cpu/cuda/trt). Empty = CPU "
-                             "only, the deployment default -- a GPU is opt-in so nothing "
-                             "silently starts using one. CPU is always appended as a fallback "
-                             "for ops the accelerator lacks. Needs the onnxruntime-gpu wheel; "
-                             "resolve_providers raises naming it if the provider is absent.")
+                             "e.g. 'cuda' or 'cuda,cpu' (aliases: cpu/cuda/trt). Default "
+                             "'auto' = the GPU when the installed wheel has one, else the "
+                             "CPU. This is a SIM default, not the deployment one: the "
+                             "generator is ~99% of the step cost and runs it in ~100 ms on a "
+                             "CPU, so sim2sim defaults to the GPU while transfer/deploy still "
+                             "requires hardware to state its provider. 'cpu' forces the "
+                             "deployment-representative timing. CPU is always appended as a "
+                             "fallback for ops the accelerator lacks. A NAMED provider the "
+                             "wheel lacks raises; 'auto' never does. What a session actually "
+                             "registered is printed at load -- onnxruntime falls back to the "
+                             "CPU with a warning, not an error.")
+    parser.add_argument("--allow_privileged_extero", action="store_true", default=False,
+                        help="Run a generator conditioned on the PRIVILEGED dense height scan "
+                             "(exact, noise-free, 121x121 @ 0.025 m). Refused by default "
+                             "because no robot can produce that reading; MuJoCo can, by "
+                             "casting the same grid against the same terrain, so this makes "
+                             "the Isaac-only diagnostic testable in a second simulator. It "
+                             "costs ~20 ms/step of ray casting (measured, 14641 rays), and "
+                             "any survival number it produces is a statement about the model "
+                             "given perfect terrain -- never about deployment.")
     parser.add_argument("--fm_update_every", type=int, default=1,
                         help="Generator re-inference cadence K (control steps); 1 = every step, "
                              "which is the only cadence that pays the full FM cost every tick. "
@@ -1092,7 +1263,14 @@ def main() -> None:
     run_dir = os.path.join(log_root, run_name)
     exported = os.path.join(run_dir, "exported")
     tracker_onnx = os.path.join(exported, "tracker.onnx")
-    fm_onnx = args.fm_onnx or os.path.join(exported, "fm.onnx")
+    # Generators are named for the checkpoint they came from, so a run's exported/ can hold
+    # several; --fm_onnx names one (a bare filename resolves inside exported/). Ambiguity is
+    # refused rather than defaulted -- reported as a CLI error, since it is a configuration
+    # question for the caller and not a bug to hand back a traceback for.
+    try:
+        fm_onnx = resolve_fm_onnx(exported, args.fm_onnx, required=False)
+    except (ValueError, FileNotFoundError) as exc:
+        sys.exit(f"[ERROR] {exc}")
     # Clip-only playback (a clip with no FM handoff) drives the tracker straight from the
     # clip reference, so the generator is optional -- this is how a pure clip-tracking
     # teacher (which has no fm.onnx) is played in MuJoCo. Every other mode (joystick/eval,
@@ -1102,18 +1280,27 @@ def main() -> None:
         sys.exit(f"[ERROR] Missing {tracker_onnx}. Export with export_tracker_onnx.py first.")
     if clip_only:
         fm_onnx = None
-    elif not os.path.exists(fm_onnx):
-        sys.exit(f"[ERROR] Missing {fm_onnx}. Export with export_fm_onnx.py, or play clip-only "
-                 f"(--clip <h5> without --clip_handoff_time) to run the tracker with no FM.")
+    elif fm_onnx is None:
+        sys.exit(f"[ERROR] No generator in {exported}. Export one with play.py "
+                 "--fm_checkpoint or scripts/flow_matching/export_fm_onnx.py, or play "
+                 "clip-only (--clip <h5> without --clip_handoff_time) to run the tracker "
+                 "with no FM.")
     print(f"[INFO] Tracker run: {run_name}\n[INFO] tracker.onnx: {tracker_onnx}\n"
-          f"[INFO] fm.onnx: {fm_onnx if fm_onnx else '(none -- tracker-only clip playback)'}")
+          f"[INFO] generator: "
+          f"{fm_onnx if fm_onnx else '(none -- tracker-only clip playback)'}")
 
     policy = GenTrackerPolicy(
         tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
         zero_noise=args.zero_noise,
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
+        allow_privileged_extero=args.allow_privileged_extero,
     )
     policy.load()
+    # What each graph REGISTERED, not what was asked for. onnxruntime reports a failed CUDA
+    # session as a warning and carries on running on the CPU, so with the GPU now the
+    # default this line is the only thing standing between "the generator is on the GPU" and
+    # a 5x-slower run that never said so.
+    print(f"[INFO] onnxruntime providers: {policy.active_providers()}")
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
@@ -1205,6 +1392,24 @@ def main() -> None:
             print("[INFO] Depth sensor noise ON (plane bias, per-pixel noise, blur, dropout) "
                   "plus mount jitter -- the training distribution, not the play config.")
 
+    # A SECOND caster when the generator samples those same lenses on its own grid. Two
+    # instances rather than one: MujocoDepthCameras returns its cameras as ONE array, which
+    # cannot hold two widths -- and that refusal is still correct, since each artifact's own
+    # cameras do share a resolution.
+    fm_depth_cams = None
+    if policy.depth_sampling_is_split():
+        fm_spec = policy.get_fm_depth_camera_spec()
+        fm_depth_cams = MujocoDepthCameras(robot.mj_model, fm_spec)
+        print(f"[INFO] Generator samples the cameras separately at "
+              f"{fm_spec[0]['width']}x{fm_spec[0]['height']} "
+              f"(tracker: {depth_spec[0]['width']}x{depth_spec[0]['height']}); casting both.")
+        if args.depth_noise:
+            fm_depth_cams.enable_noise(np.random.default_rng(args.depth_noise_seed))
+            # The mount jitter is SHARED: one physical camera cannot be in two places, and
+            # the two casters are two samplings of it. (The per-frame noise draws stay
+            # independent -- they cannot be shared across differing pixel counts.)
+            fm_depth_cams.mirror_extrinsics_from(depth_cams)
+
     success = run(policy, robot, command_fn, total_time, args.headless, log_path,
                   args.rt_factor, standing_config, args.viz,
                   args.vel_arrow_scale, args.vel_arrow_height,
@@ -1215,8 +1420,14 @@ def main() -> None:
                   viz_contacts=args.viz_contacts,
                   spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time,
-                  depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride)
-    print(f"[INFO] Run finished. Survived: {success}")
+                  depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride,
+                  fm_depth_cams=fm_depth_cams)
+    # None = interrupted, which is neither survival nor a fall; saying "Survived: None"
+    # would put a non-result into the same line every sweep greps for.
+    if success is None:
+        print("[INFO] Run INTERRUPTED by the user; artifacts below are partial.")
+    else:
+        print(f"[INFO] Run finished. Survived: {success}")
 
     if log_path:
         import gen_tracker_metrics

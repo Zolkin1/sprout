@@ -50,6 +50,9 @@ if _FM_SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _FM_SCRIPT_DIR)
 from export_tracker_onnx import export_tracker_onnx  # isort: skip
 from export_fm_onnx import export_fm_onnx  # isort: skip
+# export_fm_onnx already puts transfer/ on the path (it shares the artifact NAMING rule with
+# the off-sim consumers that resolve these files); import from there rather than restate it.
+from deploy.artifacts import fm_artifact_name  # isort: skip
 
 # PLACEHOLDER: Extension template (do not remove this comment)
 with contextlib.suppress(ImportError):
@@ -149,6 +152,15 @@ parser.add_argument(
          "--fm_checkpoint, exported/fm.onnx). They are written by default because they must "
          "stay in sync with the policy.pt + policy_parameters.yaml this run exports.",
 )
+parser.add_argument(
+    "--allow_privileged_extero", action="store_true", default=False,
+    help="Export exported/fm.onnx even when the generator conditions on a PRIVILEGED "
+         "signal (the exact noise-free dense height scan). Without it the export refuses, "
+         "because no ROBOT can produce that reading -- but MuJoCo can cast the same grid "
+         "against the same terrain, so this is what makes the Isaac-only diagnostic "
+         "runnable in sim2sim (transfer/sim/gen_tracker_runner.py "
+         "--allow_privileged_extero). The hardware path still refuses the pair.",
+)
 parser.add_argument("--max_steps", type=int, default=None, help="Exit after this many steps (None = run forever).")
 parser.add_argument(
     "--train_mode",
@@ -197,7 +209,16 @@ parser.add_argument(
     "--fm_checkpoint", type=str, default=None,
     help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
          "command term exposing an fm_checkpoint field (the FmTrackingCommand), "
-         "overriding the cfg default.",
+         "overriding the cfg default. The generator's DEPTH RESOLUTION is read off this "
+         "checkpoint and a matching camera pair is built automatically, so nothing else "
+         "has to state it.",
+)
+parser.add_argument(
+    "--fm_depth_resolution", type=str, default="",
+    help="'WxH' to build the generator's depth cameras at, OVERRIDING what --fm_checkpoint "
+         "states. Only useful for deliberately feeding a generator the wrong sampling to "
+         "see what it does -- the command term's shape check refuses the mismatch, so this "
+         "is for experiments on that check, not a normal knob.",
 )
 parser.add_argument(
     "--no-logging", dest="no_logging", action="store_true", default=False,
@@ -348,6 +369,50 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if hasattr(term, "fm_checkpoint"):
                     term.fm_checkpoint = args_cli.fm_checkpoint
                     print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
+
+        # The generator may SAMPLE the depth cameras on its own grid (so its vision input
+        # can change without retraining the policy). Read that resolution off the checkpoint
+        # and build the matching camera pair here, BEFORE gym.make -- derived rather than
+        # declared, so a flag cannot disagree with the artifact. A checkpoint at the policy's
+        # own resolution adds nothing and reads the policy's cameras, as it always did.
+        if args_cli.fm_checkpoint is not None:
+            from robot_rl.flow_matching.online import fm_scan_geometry, read_fm_extero_meta
+            fm_extero = read_fm_extero_meta(args_cli.fm_checkpoint)
+            # Branch on the checkpoint's own SOURCE, so a depth generator can never be given
+            # a scanner and a scan generator can never be given a camera pair.
+            if fm_extero["extero_source"] == "depth":
+                from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+                    add_fm_depth_pair,
+                )
+                want = (args_cli.fm_depth_resolution or "").strip()
+                if want:
+                    w, h = (int(v) for v in want.replace("x", ",").split(","))
+                    print(f"[INFO] --fm_depth_resolution {w}x{h} OVERRIDES the checkpoint's "
+                          f"{fm_extero['width']}x{fm_extero['height']}; the command term's "
+                          "shape check will refuse the pair unless you meant this.")
+                elif fm_extero["width"] is not None:
+                    w, h = fm_extero["width"], fm_extero["height"]
+                else:
+                    w = h = None
+                if w is not None and getattr(env_cfg.scene, "depth_camera_near",
+                                             None) is not None:
+                    add_fm_depth_pair(env_cfg, w, h)
+            elif fm_extero["extero_source"] == "height_scan":
+                geom = fm_scan_geometry(fm_extero["extero_spec"])
+                # ``None`` = a checkpoint that states no scan geometry, i.e. every pre-field
+                # height-scan run. Building nothing then makes the readers fall back to the
+                # policy's scanner, which is exactly what those checkpoints trained on.
+                if geom is not None:
+                    from robot_rl.tasks.manager_based.robot_rl.g1.g1_fm_scan_env_cfg import (
+                        add_fm_height_scan,
+                    )
+                    print(f"[INFO] FM checkpoint conditions on a "
+                          f"{geom['size'][0]}x{geom['size'][1]} m @ {geom['resolution']} m "
+                          f"scan ({geom['height']}x{geom['width']})"
+                          + (" [PRIVILEGED]" if geom["privileged"] else ""))
+                    add_fm_height_scan(env_cfg, size=tuple(geom["size"]),
+                                       resolution=geom["resolution"],
+                                       offset_xy=geom["offset_xy"])
 
         # Apply video-recording knobs to the viewer cfg before env construction.
         # ``env_cfg.viewer.resolution`` is the offscreen-render product size the
@@ -606,11 +671,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # died there, so the one configuration that means "no FM" could not be exported
             # past -- which is what the clip-only survival cell needs.
             if args_cli.fm_checkpoint:
-                fm_out = os.path.join(export_model_dir, "fm.onnx")
-                export_fm_onnx(args_cli.fm_checkpoint, fm_out)
+                # Named for the FM checkpoint rather than a fixed "fm.onnx": a run's
+                # exported/ accumulates one generator per FM trained against that teacher,
+                # and the old fixed name meant each play.py silently replaced the last.
+                # deploy.artifacts.resolve_fm_onnx is how the runners find them again.
+                fm_out = os.path.join(export_model_dir,
+                                      fm_artifact_name(args_cli.fm_checkpoint))
+                export_fm_onnx(args_cli.fm_checkpoint, fm_out,
+                               allow_privileged_extero=args_cli.allow_privileged_extero)
                 print(f"[INFO] wrote {fm_out}")
             else:
-                print("[INFO] no --fm_checkpoint, so no fm.onnx (tracker only).")
+                print("[INFO] no --fm_checkpoint, so no generator exported (tracker only).")
 
         def _ph(name):
             """Phase context (no-op when profiling is off)."""

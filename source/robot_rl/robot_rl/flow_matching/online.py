@@ -127,7 +127,7 @@ class FmOnlineContext:
         model: The loaded :class:`FlowMatchingTransformer` (eval mode).
         state_norm: Normalizer for the state tokens (history conditioning + future).
         cmd_norm: Normalizer for the command tokens (``None`` if not conditioned).
-        height_norm: Normalizer for the height-scan token.
+        extero_norm: Normalizer for the height-scan token.
         N: Number of history (context) tokens -- the reference-window nodes this model
             emitted at the N previous control steps.
         F: Future window length (all F are predicted; node 0 = current step).
@@ -153,7 +153,7 @@ class FmOnlineContext:
     model: FlowMatchingTransformer
     state_norm: Normalizer
     cmd_norm: Normalizer | None
-    height_norm: Normalizer
+    extero_norm: Normalizer
     N: int
     F: int
     D: int
@@ -188,6 +188,29 @@ class FmOnlineContext:
     mismatch is both off-distribution and possibly short of horizon. ``None`` for a
     checkpoint recorded before the field existed.
     """
+    extero_sensor_count: int = 1
+    """How many exteroception SENSOR readings the checkpoint conditions on (rows).
+
+    1 for the height scan, 2 for the camera pair. Carried beside :attr:`extero_source` for
+    the same reason: a consumer checks what it is about to feed the model against the
+    checkpoint, not against what the task config happens to build. Defaults, with
+    :attr:`extero_sensor_dim`, to the legacy scan a pre-selector checkpoint resolves to.
+    """
+    extero_sensor_dim: int = 176
+    """Width of ONE exteroception reading, CHANNELS INCLUDED.
+
+    Rays for the scan; ``extero_channels * H * W`` for a camera. It is the row width the
+    model receives, so a consumer checking what it is about to feed compares against this
+    and divides by :attr:`extero_channels` only when it needs the image shape.
+    """
+    extero_channels: int = 1
+    """Planes per exteroception pixel: 1 = depth alone, 4 = depth plus the pixel's xyz.
+
+    Carried so a runtime knows whether it must UNPROJECT the depth image before feeding it
+    (``deploy.depth_obs.unproject_to_yaw_frame``) or pass it through. A checkpoint written
+    before the channels existed is unambiguously 1-channel, which is what
+    :meth:`FlowMatchingConfig.from_dict`'s default gives it.
+    """
     extero_spec: list[dict] | None = None
     """Camera contract behind the exteroception tokens, when :attr:`extero_source` is depth.
 
@@ -195,6 +218,22 @@ class FmOnlineContext:
     carried from the recording through the checkpoint.  A deployment can therefore check
     this generator against the tracker sharing the same physical cameras.  ``None`` for
     the height scan, whose grid travels in the tracker's ``height_scan_spec`` instead.
+    """
+    extero_clip: float | None = None
+    """Symmetric clip band this checkpoint was TRAINED under, or ``None`` for the default.
+
+    ``sanitize_extero`` must clamp the live reading exactly as the dataset clamped the
+    recorded one, so the band travels with the checkpoint rather than being re-derived. The
+    scan's 1.0 m default is too tight for a large grid, and a live reading clipped harder than
+    the training data is silently a different sensor.
+    """
+    extero_image_hw: list[tuple[int, int]] | None = None
+    """Per-sensor ``(height, width)`` the exteroception row folds into, or ``None``.
+
+    Only meaningful for the convolutional encoder, and only depth has it. Carried so the
+    exported ONNX can state the geometry it was traced with: the flat width alone cannot
+    distinguish a 30x26 camera from a 26x30 one, and a convolution folded with the axes
+    swapped reads scrambled neighbourhoods with every tensor the right size.
     """
     zero_noise: bool = False
     guidance_scale: float = 1.0
@@ -213,6 +252,201 @@ class FmOnlineContext:
     def num_extra_frames(self) -> int:
         """Alias for the predicted (target) extra-frame count."""
         return self.target_num_extra_frames
+
+
+def read_fm_extero_meta(checkpoint: str, map_location: str = "cpu") -> dict:
+    """Read a checkpoint's exteroception contract WITHOUT building the model.
+
+    For the callers that must know what a generator expects to be fed before the thing that
+    would feed it exists -- ``play.py`` has to size the env's camera pair before
+    ``gym.make``, and building the full context there would mean loading 400 MB of weights
+    to learn two integers.
+
+    DERIVED, never declared: the resolution comes from the artifact rather than a flag, so
+    a generator and the cameras built for it cannot disagree by a typo.
+
+    Args:
+        checkpoint: Path to an FM ``.pt``.
+        map_location: ``torch.load`` map location.
+
+    Returns:
+        ``{"extero_source", "extero_sensor_count", "extero_sensor_dim", "extero_encoder",
+        "extero_spec", "width", "height"}``. ``width``/``height`` are ``None`` unless the
+        checkpoint conditions on depth and states a per-camera geometry.
+
+    Raises:
+        ValueError: If a depth checkpoint's cameras disagree on resolution, or if the stated
+            geometry does not unfold its own sensor row -- both of which would otherwise
+            surface much later as a shape error inside the graph.
+    """
+    ckpt = torch.load(checkpoint, map_location=map_location, weights_only=False)
+    cfg = FlowMatchingConfig.from_dict(ckpt["config"])
+    spec = list((ckpt.get("meta") or {}).get("extero_spec") or [])
+    out = {
+        "extero_source": cfg.extero_source,
+        "extero_sensor_count": int(cfg.extero_sensor_count),
+        "extero_sensor_dim": int(cfg.extero_sensor_dim),
+        "extero_channels": int(cfg.extero_channels),
+        "extero_encoder": cfg.resolve_extero_encoder(),
+        "extero_spec": spec,
+        "width": None,
+        "height": None,
+    }
+    if cfg.extero_source != "depth" or not spec:
+        return out
+    sizes = {(int(c["width"]), int(c["height"])) for c in spec}
+    if len(sizes) != 1:
+        raise ValueError(
+            f"{checkpoint}: its cameras sample at {sorted(sizes)}; one generator's cameras "
+            "share one resolution (they are stacked into one array)."
+        )
+    width, height = sizes.pop()
+    # Against the PIXEL count: a multi-channel row is ``channels * H * W``, and this is the
+    # function play.py uses to SIZE the generator's cameras -- comparing the whole row width
+    # would demand a camera four times too large.
+    if width * height != out["extero_sensor_dim"] // out["extero_channels"]:
+        raise ValueError(
+            f"{checkpoint}: cameras are {width}x{height} = {width * height} px but the "
+            f"sensor row is {out['extero_sensor_dim']} wide over "
+            f"{out['extero_channels']} channel(s)."
+        )
+    out["width"], out["height"] = width, height
+    return out
+
+
+def fm_scan_geometry(spec: list[dict] | None) -> dict | None:
+    """The scan geometry a checkpoint was trained on, for building a matching sensor.
+
+    The scan counterpart of :func:`read_fm_extero_meta`'s ``width``/``height``: what
+    ``play.py`` needs to construct the generator's own scanner from the artifact rather than
+    from a flag, so the two cannot disagree by a typo.
+
+    Args:
+        spec: A checkpoint's ``meta["extero_spec"]``, or ``None``.
+
+    Returns:
+        ``{"size", "resolution", "offset_xy", "ordering", "height", "width", "privileged"}``,
+        or ``None`` when the checkpoint states no scan geometry -- which is the case for every
+        pre-field height-scan checkpoint, and correctly means "build nothing, use the
+        policy's scanner as before".
+
+    Raises:
+        ValueError: If several sensors disagree on the geometry; they would need one sensor.
+    """
+    if not spec or "resolution" not in spec[0]:
+        return None
+    keys = {(float(s["resolution"]), tuple(float(v) for v in s["size"]),
+             str(s.get("ordering", "xy"))) for s in spec}
+    if len(keys) != 1:
+        raise ValueError(
+            f"the checkpoint states {len(keys)} different scan geometries {sorted(keys)}; "
+            "one generator conditions on one grid."
+        )
+    resolution, size, ordering = keys.pop()
+    offset = [float(v) for v in (spec[0].get("offset_pos") or [0.0, 0.0, 0.0])]
+    return {
+        "size": list(size),
+        "resolution": resolution,
+        "offset_xy": (offset[0], offset[1]),
+        "ordering": ordering,
+        "height": int(spec[0]["height"]),
+        "width": int(spec[0]["width"]),
+        "privileged": bool(spec[0].get("privileged", False)),
+    }
+
+
+#: State-dict prefixes renamed with the exteroception contract: old -> new.
+_LEGACY_WEIGHT_PREFIXES: dict[str, str] = {
+    "height_in.": "extero_in.",
+    "height_type": "extero_type",
+}
+
+
+def _rename_legacy_extero_weights(weights: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Map pre-rename exteroception parameter names onto the current ones.
+
+    ``load_state_dict`` is strict, so without this every checkpoint trained before the
+    rename becomes unloadable -- including the ones any new encoder has to be A/B'd
+    against. One-time and narrow: only these prefixes, and only when the new name is
+    absent.
+
+    Args:
+        weights: A model or EMA state dict, as saved.
+
+    Returns:
+        The same dict with legacy exteroception keys renamed (a copy if anything changed).
+    """
+    hits = [k for k in weights if any(k.startswith(p) for p in _LEGACY_WEIGHT_PREFIXES)]
+    if not hits:
+        return weights
+    out = dict(weights)
+    for key in hits:
+        for old, new in _LEGACY_WEIGHT_PREFIXES.items():
+            if key.startswith(old):
+                out[new + key[len(old):]] = out.pop(key)
+                break
+    print(f"[INFO load_fm_context] remapped {len(hits)} pre-rename exteroception weight "
+          f"key(s) ({', '.join(sorted(hits))}) onto their current names.")
+    return out
+
+
+def _check_encoder_matches_weights(weights: dict[str, torch.Tensor], encoder: str) -> None:
+    """Fail with the flag to flip when a checkpoint's weights are the other encoder's.
+
+    ``load_state_dict`` is strict and would catch this on its own -- as a wall of
+    missing/unexpected keys that does not say which switch produced it. This says it.
+
+    Args:
+        weights: The state dict about to be loaded (already legacy-renamed).
+        encoder: The resolved encoder the model was built with.
+
+    Raises:
+        ValueError: On a config/weights encoder disagreement.
+    """
+    has_mlp = any(k.startswith("extero_in.") for k in weights)
+    has_cnn = any(k.startswith("extero_cnn.") for k in weights)
+    if encoder == "cnn" and has_mlp and not has_cnn:
+        raise ValueError(
+            "this checkpoint's exteroception weights are the FLAT MLP's (extero_in.*) but the "
+            "config says extero_encoder='cnn'. Train with --extero_encoder cnn, or load it "
+            "with --extero_encoder mlp -- the two are different architectures, not two "
+            "spellings of one."
+        )
+    if encoder == "mlp" and has_cnn and not has_mlp:
+        raise ValueError(
+            "this checkpoint's exteroception weights are the CONVOLUTIONAL encoder's "
+            "(extero_cnn.*) but the config says extero_encoder='mlp'. Load it with "
+            "--extero_encoder cnn."
+        )
+
+
+def _check_extero_image_hw(cfg: FlowMatchingConfig, meta: dict, encoder: str) -> None:
+    """Cross-check the config's per-sensor image shapes against the recorded camera contract.
+
+    ``cfg.extero_image_hw`` is derived from ``meta["extero_spec"]`` at dataset build, so at
+    load the two must still agree exactly -- ``(H, W)`` and not merely ``H*W``, because a
+    transposed camera has the same pixel count and would fold every convolution's
+    neighbourhood wrong while leaving all the shapes right.
+
+    Args:
+        cfg: The checkpoint's config.
+        meta: The checkpoint's ``meta`` dict (``extero_spec`` is read when present).
+        encoder: The resolved encoder name.
+
+    Raises:
+        ValueError: If the shapes disagree with the contract.
+    """
+    spec = list(meta.get("extero_spec") or [])
+    if encoder != "cnn" or not spec or not cfg.extero_image_hw:
+        return
+    contract = [(int(c["height"]), int(c["width"])) for c in spec]
+    stated = [(int(h), int(w)) for h, w in cfg.extero_image_hw]
+    if contract != stated:
+        raise ValueError(
+            f"config extero_image_hw={stated} disagrees with the recorded camera contract "
+            f"{contract}. These must match exactly, not just in pixel count -- a transposed "
+            "camera folds every convolution's neighbourhood wrong with every shape intact."
+        )
 
 
 def load_fm_context(
@@ -266,18 +500,36 @@ def load_fm_context(
         if ckpt.get("cmd_normalizer") is not None
         else None
     )
-    height_norm = Normalizer.from_state_dict(ckpt["height_normalizer"]).to(dev)
-
-    model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=cfg.future_len,
-        num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, extero_tokens=cfg.extero_tokens, cmd_dim=cfg.cmd_dim,
-        cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
-        num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
+    # ``extero_normalizer`` was ``height_normalizer`` before the rename; see _LEGACY_KEYS.
+    extero_norm = Normalizer.from_state_dict(
+        ckpt["extero_normalizer"] if "extero_normalizer" in ckpt else ckpt["height_normalizer"]
     ).to(dev)
+
+    # The exteroception architecture travels in the config, and is re-verified against the
+    # recording's camera contract here -- the same "derive once, check at every boundary"
+    # treatment window_dim/state_dim get below. A hand-edited config cannot misdescribe the
+    # image shape without this firing.
+    encoder = cfg.resolve_extero_encoder()
+    cfg.check_extero_encoder()
+    cfg.check_attention_mode()
+    _check_extero_image_hw(cfg, meta, encoder)
+    # Said out loud because nothing else can reveal it: the two attention modes share one
+    # parameter set, so a checkpoint carries no structural evidence of which it was trained
+    # under. If this line disagrees with what you expect, the config is what to look at.
+    print(f"[INFO load_fm_context] attention_mode={cfg.attention_mode} "
+          f"(extero_encoder={encoder})")
+    # ONE construction site, shared with the trainer. ``encoder`` is the resolved name and is
+    # already written back onto cfg by the dataset; assert rather than pass it separately, so
+    # there is no second path by which the two could describe different models. This is also
+    # what makes ``extero_channels`` reach the model here without being restated: it is a cfg
+    # field, and ``from_config`` is the only thing that reads them.
+    cfg.extero_encoder = encoder
+    model = FlowMatchingTransformer.from_config(cfg).to(dev)
     weights, which = ckpt["model"], "raw"
     if use_ema and ckpt.get("model_ema") is not None:
         weights, which = ckpt["model_ema"], "EMA"
+    weights = _rename_legacy_extero_weights(weights)
+    _check_encoder_matches_weights(weights, encoder)
     model.load_state_dict(weights)
     model.eval()
     if which == "EMA":
@@ -297,10 +549,36 @@ def load_fm_context(
         )
     if cfg.cmd_dim > 0 and cmd_norm is None:
         raise ValueError("Checkpoint is command-conditioned (cmd_dim>0) but has no cmd_normalizer.")
+    # A DEPTH checkpoint that does not state its clip band is REFUSED, because `None` no longer
+    # names one number. It means "use the per-source default", and there are two of those:
+    # config.EXTERO_CLIP says 5.575 while deploy.depth_obs.EXTERO_CLIP_NP says 2.0. They agreed
+    # until the depth band was widened, and each is now right for the artifacts of its own era --
+    # so a None resolves one way here and the other way at deploy, which is how a generator
+    # trained at +-5.575 came to run at +-2.0, saturating range at 4.75 m.
+    #
+    # Nothing in the artifact says which era it belongs to, so this cannot be inferred, only
+    # stated. Refusing follows the same rule the pre-rename fm.onnx does: say what to do rather
+    # than guess. Runs since the dataset started stamping the resolved band carry a float and
+    # never reach this. The scan is unaffected -- its default never moved.
+    if cfg.extero_source == "depth" and cfg.extero_clip is None:
+        raise ValueError(
+            "this depth checkpoint does not state its exteroception clip band "
+            "(extero_clip=None), and the per-source default it would fall back to differs "
+            "between training (+-5.575) and deploy (+-2.0), so the band is ambiguous rather "
+            "than merely absent.\n"
+            "  A run trained BEFORE the band was widened used +-2.0; one trained after the "
+            "dataset began stamping it carries its own value.\n"
+            "  State it in the checkpoint's config and reload, e.g.:\n"
+            "    ck = torch.load(<ckpt>, map_location='cpu', weights_only=False)\n"
+            "    ck['config']['extero_clip'] = 5.575   # or 2.0 for a pre-change run\n"
+            "    torch.save(ck, <ckpt-with-band>)\n"
+            "  Under extero_norm_mode='contract' the run's own extero_xyz_envelope decides it: "
+            "5.0 comes only from 5.575, 3.5 only from 2.0."
+        )
     cmd_steps = list(range(0, cfg.future_len, cfg.cmd_stride))
     return FmOnlineContext(
         model=model, state_norm=state_norm, cmd_norm=cmd_norm,
-        height_norm=height_norm,
+        extero_norm=extero_norm,
         N=cfg.num_history_states, F=cfg.future_len, D=target_d, nj=nj,
         target_num_extra_frames=target_k,
         num_steps=int(num_sampling_steps or cfg.num_sampling_steps),
@@ -312,7 +590,15 @@ def load_fm_context(
         guidance_scale=float(guidance_scale),
         fm_snap_every=(int(meta["fm_snap_every"]) or None) if meta.get("fm_snap_every") else None,
         extero_source=str(cfg.extero_source),
+        extero_sensor_count=int(cfg.extero_sensor_count),
+        extero_sensor_dim=int(cfg.extero_sensor_dim),
+        extero_channels=int(cfg.extero_channels),
         extero_spec=(meta.get("extero_spec") or None),
+        extero_image_hw=([(int(h), int(w)) for h, w in cfg.extero_image_hw]
+                         if cfg.extero_image_hw else None),
+        # The band this checkpoint was TRAINED under, so the live token builder clamps the way
+        # the dataset did. Never None for depth -- refused above.
+        extero_clip=cfg.extero_clip,
     )
 
 
@@ -367,7 +653,8 @@ def build_extero_tokens(ctx: FmOnlineContext, values: torch.Tensor) -> torch.Ten
         Normalized tokens, flattened to ``(V, T*dim)`` -- the model reshapes internally.
     """
     flat = values.reshape(values.shape[0], -1)
-    return ctx.height_norm.normalize(sanitize_extero(flat, ctx.extero_source))
+    return ctx.extero_norm.normalize(
+        sanitize_extero(flat, ctx.extero_source, clip=ctx.extero_clip))
 
 
 def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Tensor | None:
@@ -392,7 +679,7 @@ def build_cmd_tokens(ctx: FmOnlineContext, future_cmd: torch.Tensor) -> torch.Te
 def sample_window(
     ctx: FmOnlineContext,
     history: torch.Tensor,
-    height: torch.Tensor,
+    extero: torch.Tensor,
     cmd_tokens: torch.Tensor | None,
     history_null_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
@@ -408,7 +695,7 @@ def sample_window(
     Args:
         ctx: The loaded context.
         history: History tokens ``(V, N, D)`` (from :func:`build_history_tokens`).
-        height: Normalized exteroception tokens ``(V, T*height_dim)``.
+        extero: Normalized exteroception tokens ``(V, T*extero_sensor_dim)``.
         cmd_tokens: Normalized command tokens ``(V, num_cmd_tokens, cmd_dim)`` or None.
         history_null_mask: Optional ``(V,)`` bool; where True the history content is
             replaced by the model's learned ``null_history`` embedding. Pass
@@ -421,7 +708,7 @@ def sample_window(
     """
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
-    pred_std = sample_trajectory(ctx.model, history, height, cmd_tokens, ctx.F, ctx.D,
+    pred_std = sample_trajectory(ctx.model, history, extero, cmd_tokens, ctx.F, ctx.D,
                                  ctx.num_steps, history_null_mask=history_null_mask,
                                  zero_noise=ctx.zero_noise,
                                  guidance_scale=ctx.guidance_scale)

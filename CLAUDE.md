@@ -78,7 +78,32 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
   7.8, `reward` 7.6, `termination` 2.5. ~19 ms of `obs` is the two depth cameras. `TODO(perf)`
   notes sit on `mdp.observations.reference_window` and `MotionSequenceCommand._update_command`;
   neither is instrumented per-term yet, so a breakdown comes before any optimisation.
-- The FM selects depth OR height-scan exteroception tokens (`robot_rl/flow_matching/config.py`).
+- The FM's `attention_mode` decides which way the conditioning/future dependency runs.
+  `prefix` (DEFAULT) has history+extero+cmd attend only to THEMSELVES and keeps the flow-time
+  embedding off them, so their representation is a fixed statement rather than a function of
+  the noise level — and is therefore encoded ONCE per re-plan and reused by every Euler step
+  (`model.encode_prefix` / `decode_future`, hoisted in `flow.sample_trajectory` and in the
+  unrolled ONNX graph). `full` is what every checkpoint before the flag was trained under.
+  **The two modes share one parameter set**, so a mislabelled checkpoint runs silently under
+  the wrong attention — `load_state_dict` cannot catch it. `from_dict` defaults a pre-flag
+  checkpoint to `full`, the mode is printed at load, and it is in `fm_meta`; that is the whole
+  defence. Measured: torch gets 1.34–1.39x on the CNN model at Isaac batch sizes, but the
+  exported graph is ~0.82x at the deploy batch of 1 (fewer FLOPs, ~27% MORE nodes, and
+  onnxruntime is launch-bound there). `prefix` is implemented as the cached decomposition, not
+  as a mask: with a 2-D `attn_mask` the fused kernel materializes `(B, nhead, S, S)` inside
+  `merge_masks` — gigabytes at Isaac env counts — so the masked pass is test-reference only.
+- The FM selects depth OR height-scan exteroception (`extero_source`), and how one reading
+  becomes TOKENS (`extero_encoder`, `robot_rl/flow_matching/extero_encoder.py`): `cnn` gives
+  each camera its OWN 3-layer stride-2 trunk → a 4x4 grid of tokens with a learned spatial
+  slot (16/camera, sequence 111); `mlp` is the original one-token-per-reading flat path
+  (sequence 81), and the only option for the height scan. The flat path is
+  permutation-invariant over pixels, so nothing in it can attend to WHERE a step edge is —
+  which is the shape of the registration failure `fm_registration_probe.py` measures. The
+  per-camera `(H, W)` is DERIVED from the recording's `depth_camera_spec`, travels into
+  `fm.onnx`, and is checked at deploy: `extero_sensor_dim` cannot tell 30x26 from 26x30, and
+  under a convolution a transposed camera is scrambled input rather than a reordered vector.
+  `extero_norm_mode` decides how the normalizer is pooled; see "The DEFAULTS are the depth
+  training config" below (`per_channel` is the default, `per_element` is gone).
 - `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
 
 ## The camera contract (how depth reaches MuJoCo / hardware)
@@ -86,12 +111,208 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
 intrinsics, range, and the `(d - offset) * scale` normalization — from the sensor cfgs and obs terms.
 It is the single producer for all consumers, so nothing off-sim restates a camera number:
 - `tracker.onnx` metadata `policy_parameters.depth_camera_spec` (via `export_parameters.py`);
-- `fm.onnx` metadata `fm_meta.extero_spec` (+ `extero_source`, `extero_tokens`), plumbed env cfg ->
+- `fm.onnx` metadata `fm_meta.extero_spec` (+ `extero_source`, `extero_sensor_count`,
+  `extero_sensor_dim` — sensor-neutral names; the old `extero_tokens`/`height_dim` are shimmed
+  on `.pt` load but a stale `fm.onnx` is refused and must be re-exported), plumbed env cfg ->
   `RecordingMeta.depth_camera_spec` -> FM dataset -> checkpoint -> export;
 - `GenTrackerPolicy.load()` requires the two to AGREE (`transfer/deploy/depth_obs.py`) — there is one
   physical camera pair, so a tracker and generator running together cannot describe different ones.
+
+**The generator may SAMPLE that pair on its own grid** (so its vision input can change without
+retraining the teacher). `add_fm_depth_pair(env_cfg, W, H)` in `g1_depth_env_cfg.py` adds a second
+pair built from the SAME `_CameraSpec` — same mount, apertures, range and normalization, only the
+ray grid differs — in its own `fm_depth` obs group, and EXTENDS the three DR events to
+`sensor_cfgs` lists so one draw moves both samplings (extrinsics copy directly; intrinsics
+transfer as a ratio, which is why `operation="scale"` is now required for a list). It is a no-op
+when the resolutions match, and `mdp.fm_depth_groups(env)` then returns `None` = "all groups" =
+the old behaviour, which is what keeps every scoped call site free.
+- Who states the resolution: `record_data.py --fm_depth_resolution WxH` DECLARES it (no artifact
+  exists yet); `play.py` and `augment_registration.py` DERIVE it (from the checkpoint via
+  `online.read_fm_extero_meta`, and from the recording's own `depth_camera_spec`).
+- Relaxing the deploy agreement is NOT "drop width/height": `fx/fy/cx/cy` are linear in the
+  resolution, so they go free at the same time and a narrower cone on a bigger grid would pass.
+  `depth_obs.py` exchanges the sampling fields for a positive check on the four resolution-invariant
+  pinhole half-angles (all four, not their sum — a compensating principal-point shift preserves the
+  sum). `REQUIRE_SAME_DEPTH_RESOLUTION = False` carries the TODO to re-tighten.
+- MuJoCo casts BOTH grids (`gen_tracker_runner` builds a second `MujocoDepthCameras` from
+  `get_fm_depth_camera_spec()` → `state["fm_depth"]`, with `mirror_extrinsics_from` so the jittered
+  mount is shared). **Hardware is not wired for a split sampling** — `export_sensor_configs.py`
+  raises rather than emitting configs that cover only the tracker.
 Relatedly, `export_parameters.py` now emits each obs term's `clip`, so `_assemble` saturates every
 term the way training did instead of consulting a hardcoded table (kept only as a legacy fallback).
+
+## The height-scan contract, and running a PRIVILEGED generator in sim2sim
+`fm_meta.extero_spec` holds whichever sensor the checkpoint trained on, so it is a camera list
+for one FM and a ray grid for another. `transfer/deploy/scan_obs.py` is the scan half:
+`parse_extero_spec` picks the parser from the contract's own `extero_source` (parsing a scan as
+depth failed for a missing `fx`), and `assert_scan_specs_agree` compares the two artifacts over
+the fields they SHARE — `fm.onnx` embeds the full `mdp.height_scan_specs` dict, `tracker.onnx`
+the six `export_parameters` emits — with a floor so a sparse contract cannot agree by silence.
+- A **depth tracker + scan generator** is a legitimate pair (the robot has cameras, the generator
+  reads the ground). `_resolve_depth_cameras` only reconciles `extero_spec` against the tracker's
+  cameras when the FM's source IS depth.
+- The dense scan is marked `privileged`, and that gate is now **sim-only rather than absolute**:
+  `export_fm_onnx --allow_privileged_extero` (plumbed through `play.py`) emits the graph,
+  `gen_tracker_runner.py --allow_privileged_extero` runs it, and MuJoCo casts the same 121x121
+  grid via `Robot.compute_height_scan` (~20 ms/step for 14641 rays — the per-ray `mj_ray` loop is
+  fine at this size; `mj_multiRay` does NOT apply, since a scan's rays do not share an origin).
+  **Hardware still refuses**, because `GenTrackerPolicy` defaults the flag off and nothing on the
+  robot path passes it. Anything measured this way is a statement about the model given perfect
+  terrain.
+- The dense grid is SQUARE, so a transposed fold is shape-silent. `transfer/sim/tests/`
+  `test_height_scan_grid.py` pins it against the coarse 16x11 cast where the grids coincide (and
+  asserts the transpose would fail). Note an exact-equality check is a coin flip at yaw=0 on
+  stairs: the shared points land on a step edge to 1e-14 m and the two casts differ by one riser.
+- `torch.isclose` has no ONNX lowering, so the miss-sentinel channel in
+  `flow_matching/extero_encoder.py` is written out as `|img - sentinel| > atol + rtol*|sentinel|`
+  (identical on every finite input). Before that, a CNN extero model with a sentinel could train
+  but not export.
+
+## The depth row carries CHANNELS, not just depth (`extero_channels`)
+The FM sees no joint angles and no root orientation, so a waist turn or a pelvis pitch is
+indistinguishable from the terrain moving (`fm_registration_probe`: the predicted stair
+segment slides 1.10 of a downrange displacement, where the anchor mask requires 0). So a
+pixel can carry more than depth: `1` = depth alone (every older checkpoint), `4` = `+ xyz` in
+the root's yaw-aligned frame, `5` = `+ validity`. `extero_sensor_dim` COUNTS channels (it is
+the row width), so everything comparing it against an image shape divides by
+`extero_channels` first — `check_extero_encoder`, the model ctor, `read_fm_extero_meta`,
+`_resolve_extero_image_hw` and `gen_tracker._resolve_depth_cameras`. The fold is
+CHANNEL-MAJOR; interleaving scrambles every kernel while the shapes stay right.
+- **The frame is LEVEL** — orientation `yaw_quat(root_quat_w)`, so its z is gravity and the
+  frame has zero roll/pitch. **Static terrain therefore does NOT move when the robot tilts**,
+  and that invariance is what the channels buy: a pitch rewrites every pixel but moves the
+  CAMERA by the same amount, and the unprojection composes it back out. What moves within the
+  level frame is the robot's own geometry (the camera, and the limbs it sees), so the tilt
+  stays observable without being confusable with the ground moving. The heading cancels
+  (`R_world_root = Rz(psi) @ R_rp`), so a deployment needs only FK to the camera and the IMU's
+  roll/pitch — **never odometry**, and a drifting yaw cannot corrupt it. That is a claim about
+  the COMPUTATION, not a yaw invariance: the frame turns with the robot, so a yaw does rotate
+  a static point's coordinates — consistently with the predicted window, which turns too.
+- **Nominal extrinsics, never the DR draw**: a robot knows its calibration and nothing more,
+  so the DR perturbs the IMAGE relative to the stated geometry (which is what calibration
+  error IS). Training on the randomised pose would teach a registration it never gets.
+- **No re-record.** The offline path (`dataset._camera_pose_yaw_frame`) rebuilds the pose
+  from the recorded root quaternion + joint angles + the contract's mount, via `motion_gen`'s
+  `FKChain` — validated against the limb frames the recording stores (0.67 mm).
+  `mdp.depth_xyz_stack` is the live twin; they must agree.
+- **Validity is found by RANGE, not sentinel equality.** `DepthNoiser`'s 3x3 blur leaves a
+  geometric miss NEAR the sentinel; only the 2.5% per-frame dropout lands exactly on it.
+  Measured over the full recording: 6.4% (near) / 8.9% (far) of pixels carry no reading. The
+  height scan keeps equality, where it is exact because that signal is noise-free.
+- **A camera's position embedding is ANGULAR and token-level** (`pixel_angles_rad`), and
+  **per sensor**: the two cameras are 100x70 and 70x42 deg, so one shared extent mislabels
+  the far one's tokens by 1.43x, silently. The metric ground grid (the scan) keeps its coord
+  CHANNELS; a ray has a direction, not a planar coordinate.
+- `extero_cnn_grid` larger than the trunk's native grid used to upsample silently (a token
+  count that is a claim, not a fact); now refused.
+
+## The DEFAULTS are the depth training config (nothing to remember at the CLI)
+Every extero knob resolves per SOURCE, so one default set is correct for a camera run and a
+scan run alike, and a checkpoint records the resolved number rather than "whatever the default
+meant that day". `extero_channels=None` -> 5 for depth / 1 for a scan
+(`resolve_extero_channels`), joining `extero_encoder="auto"` (cnn / mlp) and
+`extero_clip=None` (±5.575 / ±1.0 m) in that idiom. Defaults now: `depth`, `cnn`, 5 channels,
+`strides (1,2,2)` = **7x8 = 56 tokens/camera** (sequence 191), `per_channel` normalization.
+- `EXTERO_CLIP["depth"]` is now **±5.575, measured**: at ±2.0 the band saturated at 4.75 m
+  while the far camera sees 11.9 m (1.30% of pixels, 13.8% of windows, 99th pct 5.22 m).
+  Recordings store depth UNCLIPPED, so widening recovers signal already on disk. Changing the
+  per-source default RE-RESOLVES any checkpoint that stored `extero_clip=None`, which is why
+  `train.py` prints the band and whether it was declared.
+- **There is NO train-time exteroception noise.** `noise_depth` / `noise_height_scan` and the
+  `noise_extero` property are gone, along with the two gates (`extero_corrupted`,
+  `extero_noise_free`) that kept them from double-counting; both meta flags survive as
+  statements about a recording that nothing reacts to. The sensor model belongs to the RL env,
+  whose structured DR (per-episode plane tilt + blur sigma, extrinsics/intrinsics jitter,
+  per-step additive, 2.5% dropout) is already baked into the recording — a scalar uniform term
+  on top over-noised the one signal the generator uses to place a reference, and 0.1 m on the
+  privileged scan was four cells of a 0.025 m grid. Pinned by
+  `test_there_is_no_train_time_exteroception_noise`. The history/reference-window noise
+  (`noise_scale`, `REFERENCE_WINDOW_NOISE`) is NOT this and stays: it models the generator's
+  own prediction error feeding back into its history at deploy — exposure bias, not a sensor.
+- **`contract` normalization is the default, and fits NOTHING.** Every constant answers to the
+  camera contract and the robot's nominal stance, so the same robot yields the same numbers in
+  every recording — a checkpoint's notion of "one metre from the robot" stops being a property
+  of whichever terrain was on disk the day the normalizer ran.
+  - `d` → **identity**. It already arrives declared-normalised, `(depth − 0.75) × 0.5` out of
+    the contract, and clipped to `extero_clip`. Fitting it again would demote a contract
+    constant to a dataset statistic.
+  - `xyz` → **one declared scale** (`extero_xyz_scale`, 3.0 m) shared by both cameras and all
+    three axes, so a metre reads the same number everywhere — across cameras too, which matters
+    because both feed one transformer and the model has to compare them. The **offset is per
+    camera and geometric**: the boresight's intersection with the nominal ground plane, derived
+    at dataset build, rounded to 5 cm, recorded. For the shipped pair that is
+    `[[0.55, 0.0, −0.79], [1.8, 0.0, −0.79]]` with ground z = −0.7869 (the ankle at zero joints,
+    less the sole). Per camera because the two look 65° and 35° down from different heights.
+  - `v` → identity, in every mode.
+  - **It rides the existing `Normalizer`**, so it is still one `(x − mean)/std` of shape
+    `(T*K,)`: the checkpoint, the affine folded into `fm.onnx` and the whole deploy path are
+    untouched. Declared instead of measured costs no new plumbing to a robot.
+  - **`extero_xyz_envelope` is a safety net, not a band.** Derived from each camera's own cone
+    (±5.0 at scale 3.0) and asserted never to bind — sizing it to bite real geometry would
+    repeat the ±2.0 depth-band mistake. The envelope comes from the clip band divided by the
+    **corner cosine**, NOT from `max_dist`: a valid pixel carries a z-DEPTH, which becomes a ray
+    length once divided by that cosine, so a frame corner reaches far past the band's nominal
+    range. `max_dist` under-bounds the cone by exactly that factor. Widening `extero_clip`
+    therefore widens this envelope too.
+  - **Known cost, and it is real**: the offsets centre the NOMINAL FLAT-GROUND view, not the
+    terrain a recording sampled. On one drop-off tile the far camera's empirical centroid sat
+    5.77 m away (1.9 of the scale) while the near camera's was 1.54 m (0.5). The dataset PRINTS
+    declared-vs-measured per camera at build so the residual is visible rather than assumed; if
+    it stays that large on the real recording, the fix is a larger declared nominal range, not
+    a fitted one.
+- Other modes: `per_channel` fits one (mean, std) per sensor per channel group (`d` alone;
+  `xyz` sharing one SCALE but keeping per-axis OFFSETS, since subtracting a per-axis mean is a
+  rigid translation that centres the channel while preserving every relative distance; `v`
+  identity). `per_sensor` pools across channels too, which lets xyz dominate the std and
+  squashes validity — fine for a 1-channel scan, wrong for a 5-channel depth row. `metric` is
+  one declared affine for everything, still right for a privileged metric scan. `per_element` is
+  DELETED: a per-pixel affine is a spatially varying transform, exactly what a shared
+  convolution kernel assumes away.
+
+## One exported generator per FM run (`transfer/deploy/artifacts.py`)
+Exports are named for the checkpoint they came from — `<fm run>_fm.onnx`, plus the checkpoint
+stem when it is not `best` — so a teacher's `exported/` holds every generator trained against
+it instead of each `play.py` silently replacing the last. `fm_artifact_name()` is the one rule
+(used by `play.py` and `export_fm_onnx.py`); `resolve_fm_onnx()` is how every consumer finds
+one (`gen_tracker_runner.py --fm_onnx`, `benchmark.py --fm`, `export_sensor_configs.py`,
+`export_to_hardware.py --fm_onnx`).
+- **With several in a directory the resolver RAISES and lists them.** Defaulting to the
+  newest would reinstate, as a silent default, the ambiguity the naming removed.
+- **`fm.onnx` is still the DEPLOYMENT name**: a robot installs one pair and the obelisk
+  controller reads a fixed filename, so `export_to_hardware.py` uploads whichever local
+  artifact it was given AS `fm.onnx`. The rename happens at that boundary and nowhere else;
+  the resolver still accepts a bare `fm.onnx` as input.
+- Pre-rename `fm.onnx` files (anything exported before `extero_tokens` ->
+  `extero_sensor_count`) are refused at load and need one `export_fm_onnx.py` call; the `.pt`
+  is unaffected.
+
+## MVP: the depth-camera generator RUNS in sim2sim (2026-08-18)
+
+The first generator trained on the 5-channel depth row drives the tracker through MuJoCo
+sim2sim, and the architecture is **working** — this is the minimum viable product for
+camera-only exteroception, replacing the privileged height scan on the deploy path.
+
+Covered in MuJoCo, with the generator in the loop: **flat ground, stairs UP, jump-ups,
+jump-downs.** **Stairs DOWN still needs work** and is the open item — the one locomotion mode
+the pair does not yet handle.
+
+The pair, so the result is reproducible:
+- generator `logs/flow_matching/2026-08-17_12-53-18_depth_xyz5_contract_v1` (epoch 94 of 100,
+  EMA weights, 27M), exported as `<run>_best_banded_fm.onnx`
+- tracker `logs/rsl_rl/g1/2026-08-04_21-55-17_yaw_k12_v1` (`G1-teacher-clf-terrain-depth`),
+  trained + recorded on `clips/g1_mb_v5_body.h5`
+- `extero_channels=5`, `extero_norm_mode=contract`, `strides (1,2,2)` = 56 tok/camera
+  (sequence 191), band ±5.575, `attention_mode=prefix`, `fm_update_every=12` (from the
+  tracker's metadata, not K=1)
+- scenes: `--scene terrain_scene` (in-distribution playground) and `--scene tile0_scene` (ONE
+  real Isaac tile, manifest-identical to `g1_mb_v5_body.h5` tile 0 — verified, not assumed)
+
+**This checkpoint stores `extero_clip` only because it was stamped by hand.** It was trained
+inside the window between the depth band moving 2.0 → 5.575 and the stamping fix, so its own
+config carries `null`; the band was recovered forensically (the saved envelope of 5.0 is
+reachable only from 5.575, since 2.0 gives 3.5) and written into a `best_banded.pt` copy.
+Anything trained after that fix stamps itself. See the band note above for why a `null` is
+ambiguous rather than merely missing.
 
 ## sim2sim (MuJoCo)
 - `transfer/sim/depth_camera.py` — `mj_multiRay` re-implementation (~3.9 ms/frame for both cameras).

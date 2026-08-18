@@ -4,7 +4,7 @@
 
 Three levels, cheapest first:
 
-1. :func:`pinhole_ray_directions` vs ``isaaclab...patterns.pinhole_camera_pattern`` --
+1. ``deploy.depth_obs.pinhole_ray_directions`` vs ``isaaclab...patterns.pinhole_camera_pattern`` --
    exact, and the check that the exported intrinsics mean the same thing on both sides.
 2. The cast against a flat MuJoCo scene vs the CLOSED-FORM ray/ground intersection --
    catches a wrong mount pose, a transposed rotation, or ray-length-vs-z-depth confusion,
@@ -32,13 +32,13 @@ for _path in (_SIM, os.path.dirname(_SIM)):     # transfer/sim, transfer/
 
 import mujoco  # noqa: E402
 
-from deploy.depth_obs import denormalize_depth_np, invalid_depth_value  # noqa: E402
-
-from depth_camera import (  # noqa: E402
-    MujocoDepthCameras,
+from deploy.depth_obs import (  # noqa: E402
+    denormalize_depth_np,
+    invalid_depth_value,
     pinhole_ray_directions,
-    quat_xyzw_to_matrix,
 )
+
+from depth_camera import MujocoDepthCameras, quat_xyzw_to_matrix  # noqa: E402
 
 WIDTH, HEIGHT = 30, 26
 SCENE = os.path.join(_SIM, "robots", "g1", "g1_21j_basic_scene.xml")

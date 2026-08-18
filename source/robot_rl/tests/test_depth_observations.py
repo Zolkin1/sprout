@@ -424,3 +424,52 @@ def test_camera_spec_is_empty_without_depth_terms():
     observations.policy.depth_near = None
     observations.policy.depth_far = None
     assert depth_camera_specs_from_cfg(observations=observations) == []
+
+
+##
+# The xyz channels' geometry: quaternion convention and the frame it lands in
+##
+
+def test_quat_from_matrix_round_trips_through_isaaclab():
+    """``_quat_from_matrix`` must be the exact inverse of ``matrix_from_quat``.
+
+    This is a CONVENTION guard as much as a numerical one. Isaac Lab 3.0 is scalar-LAST
+    everywhere -- the articulation buffers AND ``isaaclab.utils.math`` -- while
+    ``motion_gen`` is scalar-first, and ``world_lift_isaac`` exists because mixing them is a
+    silent ~180 deg roll about x that leaves every shape correct. The camera pose behind the
+    xyz channels crosses this boundary, so getting it wrong would hand the generator a
+    cloud rolled upside down and nothing downstream would notice.
+
+    All four Shepperd branches are exercised: the near-180 cases are where a naive
+    ``w``-branch loses its precision, and the trained mounts are pitched 35-65 deg.
+    """
+    from isaaclab.utils.math import matrix_from_quat
+
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import _quat_from_matrix
+
+    torch.manual_seed(0)
+    quat = torch.randn(2000, 4, dtype=torch.float64)
+    quat = quat / quat.norm(dim=-1, keepdim=True)
+    rot = matrix_from_quat(quat)
+    assert float((matrix_from_quat(_quat_from_matrix(rot)) - rot).abs().max()) < 1e-12
+
+    # The four 180 deg rotations, one per branch, as scalar-LAST quaternions.
+    hard = matrix_from_quat(torch.eye(4, dtype=torch.float64))
+    assert float((matrix_from_quat(_quat_from_matrix(hard)) - hard).abs().max()) == 0.0
+
+
+def test_identity_quaternion_is_scalar_last():
+    """``(0, 0, 0, 1)`` is the identity -- the one-line statement of the convention.
+
+    If this ever fails, ``_quat_from_matrix`` and the camera-pose composition have drifted
+    to scalar-first and the point cloud is rolled 180 deg about x.
+    """
+    from isaaclab.utils.math import matrix_from_quat
+
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import _quat_from_matrix
+
+    eye = torch.eye(3, dtype=torch.float64)[None]
+    assert torch.allclose(_quat_from_matrix(eye),
+                          torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=torch.float64))
+    assert torch.allclose(matrix_from_quat(torch.tensor([[0.0, 0.0, 0.0, 1.0]],
+                                                        dtype=torch.float64)), eye)

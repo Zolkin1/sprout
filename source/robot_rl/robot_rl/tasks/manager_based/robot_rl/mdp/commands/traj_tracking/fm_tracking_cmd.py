@@ -49,10 +49,18 @@ from contextlib import contextmanager
 import torch
 import warp as wp
 
-from isaaclab.envs.mdp import height_scan as mdp_height_scan
 from isaaclab.managers import SceneEntityCfg
 
-from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import depth_obs_stack
+from robot_rl.tasks.manager_based.robot_rl.mdp.observations.height_scan import (
+    fm_scan_sensor,
+    height_scan_specs,
+    scan_obs_stack,
+)
+from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+    depth_obs_stack,
+    depth_xyz_stack,
+    fm_depth_groups,
+)
 
 from robot_rl.flow_matching.online import (
     BatchedHistory,
@@ -198,6 +206,16 @@ class FmTrackingCommand(MotionSequenceCommand):
                 f"FM checkpoint extra frames {self.ctx.frame_names} != command ee output "
                 f"frames {ee_frames}; re-record/-train the FM with matching --state_frames."
             )
+
+        # The live exteroception must be the width this generator conditions on. Checked ONCE
+        # rather than per step -- the alternative is a shape error from inside the graph, at
+        # which point the useful information (which cameras, which group, which resolution)
+        # is gone. On the FIRST reading and not here, because the cameras are discovered by
+        # walking the observation manager and it does not exist yet: IsaacLab's
+        # ``ManagerBasedRLEnv.load_managers`` builds the COMMAND manager first (observations
+        # need to know the commands), so anything a command term asks about an obs group at
+        # construction time is asking too early.
+        self._extero_checked = False
 
         # Rolling per-env history of the N reference-window nodes this command last
         # SERVED -- the generator's own output, not the robot's state. That is the
@@ -699,23 +717,102 @@ class FmTrackingCommand(MotionSequenceCommand):
     def _read_extero(self) -> torch.Tensor:
         """Live exteroception reading for the sensor this FM checkpoint was trained on.
 
-        The source comes from the CHECKPOINT (``ctx.extero_source``), not the task config,
-        so a depth-trained FM cannot silently be fed a height scan (or vice versa) just
-        because the env happens to have both sensors.
+        Three things pick themselves rather than being configured here, which is what stops
+        a generator being fed something plausible and wrong:
+
+        * the SOURCE comes from the CHECKPOINT (``ctx.extero_source``), so a depth-trained
+          FM cannot be handed a height scan just because the env carries both sensors;
+        * the SENSORS come from the env: the generator's own sampling when the task built
+          one, else the policy's. For depth that is ``fm_depth_groups`` returning ``None``
+          = every group; for the scan it is ``fm_scan_sensor`` falling back to
+          ``height_scanner``. Either way a task that did not opt in is unchanged;
+        * the CHANNELS come from the checkpoint too (``ctx.extero_channels``): a generator
+          trained on depth alone gets the depth image, one trained on 4 channels gets it
+          with each pixel's xyz in the root's yaw frame beside it. Same reasoning as the
+          source -- the artifact says what it eats;
+        * the WIDTH is checked on the FIRST reading (:meth:`_check_extero_shape`), not
+          per step and not at construction -- see ``_post_init``.
 
         Returns:
-            ``(num_envs, K)`` for the height scan, or ``(num_envs, T, K)`` for depth --
-            :func:`build_extero_tokens` flattens either.
+            ``(num_envs, T, K)`` -- :func:`build_extero_tokens` flattens it.
 
         Raises:
             RuntimeError: If the scene lacks the sensor the checkpoint needs.
         """
         src = self.ctx.extero_source
         if src == "height_scan":
-            return mdp_height_scan(self.env, SceneEntityCfg("height_scanner"))
-        if src == "depth":
-            return depth_obs_stack(self.env)
-        raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")
+            reading = scan_obs_stack(self.env, fm_scan_sensor(self.env))
+        elif src == "depth":
+            groups = fm_depth_groups(self.env)
+            n_ch = int(getattr(self.ctx, "extero_channels", 1))
+            reading = (depth_xyz_stack(self.env, groups, channels=n_ch) if n_ch > 1
+                       else depth_obs_stack(self.env, groups))
+        else:
+            raise RuntimeError(f"unknown extero_source {src!r} on the FM checkpoint.")
+        if not self._extero_checked:
+            self._check_extero_shape(reading)
+            self._extero_checked = True
+        return reading
+
+    def _check_extero_shape(self, reading: torch.Tensor) -> None:
+        """Fail on the first exteroception reading if it is not what the generator expects.
+
+        A SHAPE check, deliberately: the full camera contract comparison lives on the deploy
+        side (``deploy.depth_obs.assert_depth_specs_agree``) and ``robot_rl`` must not import
+        ``transfer``. What this catches is the case that would otherwise reach the graph --
+        a live reading of the wrong width, or the right total width split over the wrong
+        number of cameras.
+
+        Args:
+            reading: The live reading from :meth:`_read_extero`, passed in rather than
+                fetched here so the two cannot recurse.
+
+        Raises:
+            RuntimeError: On a sensor-count or per-sensor-width disagreement.
+        """
+        if reading.ndim == 2:                      # the height scan: one sensor row
+            reading = reading.unsqueeze(1)
+        count, dim = int(reading.shape[1]), int(reading.shape[2])
+        want = (int(self.ctx.extero_sensor_count), int(self.ctx.extero_sensor_dim))
+        if (count, dim) != want:
+            if self.ctx.extero_source == "height_scan":
+                served = fm_scan_sensor(self.env)
+                fix = (f"this env reads scanner {served!r}. Build the generator's own dense "
+                       "scanner with g1_fm_scan_env_cfg.add_fm_height_scan(env_cfg, size=..., "
+                       "resolution=...) at the geometry the checkpoint states "
+                       "(robot_rl.flow_matching.online.fm_scan_geometry reads it), which is "
+                       "what play.py does from --fm_checkpoint.")
+            else:
+                fix = (f"obs group(s): {fm_depth_groups(self.env) or 'all'}. For depth that is "
+                       "a resolution mismatch: build the generator's own camera pair with "
+                       "g1_depth_env_cfg.add_fm_depth_pair(env_cfg, W, H) at the resolution "
+                       "the checkpoint states (read_fm_extero_meta reads it), which is what "
+                       "play.py does from --fm_checkpoint.")
+            raise RuntimeError(
+                f"the FM checkpoint conditions on {want[0]} sensor row(s) of {want[1]} "
+                f"values, but this env serves {count} of {dim}. {fix}"
+            )
+        # A width match is NOT a geometry match: two scans of the same ray count can differ in
+        # extent or resolution, which is invisible to every shape assertion and would hand the
+        # convolution a correctly-sized image of the wrong ground. Compare the spec when the
+        # env can produce one.
+        spec = self.ctx.extero_spec
+        if spec and self.ctx.extero_source == "height_scan":
+            served = fm_scan_sensor(self.env)
+            live = height_scan_specs(self.env, served) if served else []
+            if live:
+                keys = ("resolution", "size", "ordering", "height", "width", "offset_pos",
+                        "ray_alignment", "sensor_offset")
+                want_geom = {k: spec[0].get(k) for k in keys if k in spec[0]}
+                got_geom = {k: live[0].get(k) for k in keys if k in spec[0]}
+                if want_geom != got_geom:
+                    raise RuntimeError(
+                        f"scanner {served!r} has the right ray count but different geometry "
+                        f"from the one this checkpoint trained on:\n  checkpoint: {want_geom}\n"
+                        f"  env       : {got_geom}\n"
+                        "Same width, different ground -- the image would be built from the "
+                        "wrong geometry with every tensor the right size."
+                    )
 
     def _snapshot_and_infer(self) -> None:
         """Push the served node into history and re-run FM inference (once per step).

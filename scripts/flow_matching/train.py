@@ -26,7 +26,7 @@ from datetime import datetime
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 
 # Make the recording I/O module importable (it lives in scripts/rsl_rl).
@@ -34,6 +34,7 @@ _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.abspath(os.path.join(_THIS_DIR, os.pardir, os.pardir))
 sys.path.insert(0, os.path.join(_THIS_DIR, os.pardir, "rsl_rl"))
 from recorded_data_io import (  # noqa: E402  isort: skip
+    WINDOW_ARRAY_KEYS,
     load_recorded_data,
     load_recorded_windows,
     is_windowed_recording,
@@ -43,11 +44,16 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
     FlowMatchingConfig,
+    ATTENTION_MODES,
+    EXTERO_ENCODERS,
+    EXTERO_NORM_MODES,
     EXTERO_SOURCES,
     FlowMatchingTransformer,
     FutureStateDataset,
     build_train_val,
     flow_matching_loss,
+    pinned_axis_split,
+    sample_flow_batch,
     REFERENCE_WINDOW_BLOCK_NAMES,
     REFERENCE_WINDOW_NOISE,
     REFERENCE_BLOCK_KEYS,
@@ -63,7 +69,12 @@ from motion_gen.joint_names import G1_BODY_TRACK_FRAMES  # noqa: E402
 def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     """Parse CLI arguments into a config plus runtime options."""
     parser = argparse.ArgumentParser(description="Train a flow-matching future-state predictor.")
-    parser.add_argument("--data", type=str, required=True, help="Path to a recorded .npz dataset.")
+    parser.add_argument(
+        "--data", type=str, required=True,
+        help="Recorded dataset. Accepts SEVERAL comma-separated paths, concatenated "
+             "window-wise -- e.g. an original recording plus its registration-augmented "
+             "counterpart, without writing a merged copy to disk. Episode ids are offset per "
+             "file so the episode-wise train/val split cannot leak across them.")
     parser.add_argument(
         "--eval_data", type=str, default=None,
         help="Optional separate held-out recording (.npz) for eval metrics (logged under "
@@ -103,6 +114,176 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                              "A/B over one recording. 'depth' is the deployable choice on a "
                              "robot with cameras and no heightmap; the tracker it is paired "
                              "with must agree (checked at load in deploy/gen_tracker.py).")
+    parser.add_argument(
+        "--extero_channels", type=int, default=FlowMatchingConfig().extero_channels,
+        help="Planes per exteroception PIXEL. 1 = depth alone. 4 adds the pixel's xyz in the "
+             "root's yaw-aligned frame, which is what tells the model a step edge is '0.8 m "
+             "ahead and 0.15 m up' rather than 'row 14, column 8, 2.1 m'. It matters because "
+             "the generator sees no joint angles and no root orientation, so without it a "
+             "waist turn or a pelvis pitch is indistinguishable from the terrain moving. "
+             "DERIVED at dataset build from the recorded root quaternion, joint angles and "
+             "the NOMINAL mount -- no re-record, and the same three inputs a robot has. "
+             "Depth only; a scan's rays are already ground points.")
+    parser.add_argument(
+        "--extero_encoder", type=str, default=FlowMatchingConfig().extero_encoder,
+        choices=["auto", *EXTERO_ENCODERS],
+        help="How ONE exteroception reading becomes transformer tokens. 'cnn' = a 3-layer "
+             "stride-2 conv trunk PER CAMERA, so each camera contributes a grid of tokens "
+             "(16 on the 30x26 pair) each carrying a learned spatial slot -- the flat "
+             "alternative is permutation-invariant over pixels, so nothing in the model can "
+             "attend to WHERE in the frame a step edge is. 'mlp' = the original one token "
+             "per reading, and the A/B baseline. 'auto' picks by source (depth -> cnn, "
+             "scan -> mlp) -- 'auto' does NOT convolve a scan, because that would silently "
+             "re-architect every existing scan run; pass 'cnn' explicitly, on a recording "
+             "whose height_scan_spec states the grid's (H, W) fold.")
+    parser.add_argument(
+        "--extero_cnn_channels", type=str,
+        default=",".join(str(c) for c in FlowMatchingConfig().extero_cnn_channels),
+        help="Comma-separated output channels per stride-2 convolution; the COUNT sets the "
+             "depth, so it sets how many times the image is halved. Three entries take "
+             "26x30 to 4x4; a fourth reaches 2x2 natively, which is the cheaper way to "
+             "shrink the sequence (pooling pays for the resolution and then discards it).")
+    parser.add_argument(
+        "--extero_cnn_grid", type=str,
+        # Rendered from the dataclass for the same reason --extero_cnn_strides is: a literal
+        # default here SHADOWS the field. It happens to agree today (both mean "no pooling"),
+        # which is exactly what would make the next divergence silent.
+        default=",".join(str(g) for g in (FlowMatchingConfig().extero_cnn_grid or [])),
+        help="Optional 'gh,gw' to average-pool the conv trunk down to, i.e. tokens per "
+             "camera. Empty keeps the trunk's native grid. This is the knob that separates "
+             "'a CNN beats an MLP' from '16 tokens beat 1': '1,1' gives the legacy token "
+             "count through a conv trunk.")
+    parser.add_argument(
+        "--attention_mode", type=str, default=FlowMatchingConfig().attention_mode,
+        choices=list(ATTENTION_MODES),
+        help="Which way the conditioning/future dependency runs. 'prefix' (default) has the "
+             "conditioning attend only to ITSELF and keeps the flow-time embedding off it, so "
+             "its representation is a fixed statement rather than a function of the noise "
+             "level -- and is therefore computed once per re-plan instead of every Euler step. "
+             "'full' is what every checkpoint before this flag was trained under; pass it for "
+             "a controlled comparison against one.")
+    parser.add_argument(
+        "--state_scale_base_pos", type=float,
+        default=FlowMatchingConfig().state_scale_base_pos,
+        help="ONE declared scale (metres) for the base POSITION channels, replacing the fitted "
+             "per-axis std. Fitted, x/y/z get (0.500, 0.111, 0.145) -- x is 4.5x y -- so a "
+             "metre forward and a metre sideways reach the model as very different numbers. "
+             "One scale keeps a metre a metre, and makes zero displacement map to zero "
+             "(standardizing subtracts the ~0.354 m the robot advances over the horizon). "
+             "0.4 gives a pooled std of 0.87 on the shipped library. Pass 0 to fit this block per channel instead.")
+    parser.add_argument(
+        "--state_scale_base_lin_vel", type=float,
+        default=FlowMatchingConfig().state_scale_base_lin_vel,
+        help="ONE declared scale (m/s) for the base LINEAR velocity channels. Fitted per axis "
+             "gives (0.691, 0.228, 0.316); 0.5 gives a pooled std of 1.05. None = fit.")
+    parser.add_argument(
+        "--state_scale_base_ang_vel", type=float,
+        default=FlowMatchingConfig().state_scale_base_ang_vel,
+        help="ONE declared scale (rad/s) for the base ANGULAR velocity channels. Fitted per "
+             "axis gives (0.426, 0.354, 0.428); 0.4 gives a pooled std of 1.01. None = fit.")
+    parser.add_argument(
+        "--state_scale_joint_pos", type=float,
+        default=FlowMatchingConfig().state_scale_joint_pos,
+        help="ONE declared scale (rad) for the joint-position channels. Unlike the geometric "
+             "blocks there is no cross-channel metric to preserve -- different joints have "
+             "genuinely different ranges (fitted std spans 0.067 to 0.504) -- so fitting per "
+             "channel is usually right here. None = fit.")
+    parser.add_argument(
+        "--state_scale_joint_vel", type=float,
+        default=FlowMatchingConfig().state_scale_joint_vel,
+        help="ONE declared scale (rad/s) for the joint-velocity channels. None = fit.")
+    parser.add_argument(
+        "--state_scale_ee_pos", type=float,
+        default=FlowMatchingConfig().state_scale_ee_pos,
+        help="ONE declared scale (metres) for the end-effector position channels. None = fit.")
+    parser.add_argument(
+        "--cmd_scale", type=str,
+        default=",".join(str(v) for v in (FlowMatchingConfig().cmd_scale or [])),
+        help="Comma-separated per-channel DECLARED max for the command tokens "
+             "'vx,vy,wz', e.g. '3.5,1.0,0.8'. Divides by the designed maximum with mean 0, so "
+             "commands land in [-1, 1] by construction and a ZERO command stays zero -- "
+             "standardizing does not (the fitted vx mean is 1.25 m/s, so 'stand still' would "
+             "arrive as -1.29). Measured on clips/g1_mb_v5_body.h5, the library's actual "
+             "extremes are vx 3.4989, vy 0.9998, wz 0.7999. Pass '' or 'none' to fit instead.")
+    parser.add_argument(
+        "--pinned_axis_loss_weight", type=float,
+        default=FlowMatchingConfig().pinned_axis_loss_weight,
+        help="Relative flow-loss weight on root DOFs the anchor mask PINS to the terrain -- "
+             "height on flat nodes, downrange + height + yaw on stair/box nodes. 1.0 (default) "
+             "is off. These are exactly the axes the generator gets wrong: it slides its "
+             "predicted terrain segment along with a displaced robot instead of leaving it "
+             "where the terrain put it. Weights are RENORMALIZED to mean 1, so the loss scale "
+             "and the effective learning rate match an unweighted run and a with/without A/B "
+             "differs in one thing only. Needs the recorded clip index and the clip library "
+             "(joined and hash-checked, as --transition_fraction is).")
+    parser.add_argument(
+        "--extero_cnn_strides", type=str,
+        # Rendered from the dataclass, as --cmd_scale does, so the CLI cannot shadow the
+        # config's default with one of its own: a bare "" default here parsed to None and
+        # OVERRODE the (1, 2, 2) field, which is how a run meant to be 56 tokens/camera
+        # silently trained at 16 (sequence 111 rather than 191).
+        default=",".join(str(s) for s in (FlowMatchingConfig().extero_cnn_strides or [])),
+        help="Comma-separated per-layer convolution stride, one per --extero_cnn_channels "
+             "entry. A LEADING stride-1 layer keeps the first stage at full resolution "
+             "instead of throwing three quarters of the image away before the first "
+             "non-linearity: '1,2,2' takes the G1's 26x30 depth pair to 7x8 = 56 tokens per "
+             "camera, and '1,2,2,2' takes a dense 121x121 scan to 16x16 = 256. Pass '' for "
+             "stride 2 everywhere, which is what every checkpoint before this flag trained "
+             "under (16 tokens/camera on the depth pair). Must be as long as "
+             "--extero_cnn_channels; a run that deepens the trunk states both. The grid "
+             "target and this list are coupled, so changing one alone changes the "
+             "transformer's sequence length.")
+    parser.add_argument(
+        "--extero_xyz_scale", type=float, default=FlowMatchingConfig().extero_xyz_scale,
+        help="Declared divisor for the xyz channels under --extero_norm_mode contract, in "
+             "metres. ONE constant for every camera and every axis -- that sharing is the "
+             "point, since a per-camera or per-axis divisor makes a metre mean different "
+             "things in different parts of the same input.")
+    parser.add_argument(
+        "--extero_nominal_ground_z", type=float,
+        default=FlowMatchingConfig().extero_nominal_ground_z,
+        help="Nominal ground plane, metres below the pelvis at zero joints, used to place "
+             "each camera's declared xyz offset where its boresight meets the ground. "
+             "Default: derived by FK from --fk_model_path (the ankle roll link, less the "
+             "sole). Lowering it pushes the offsets FARTHER along each boresight, so it is "
+             "one way to answer a large declared-vs-measured residual -- but it declares a "
+             "ground plane that is not the ground; prefer stating --extero_xyz_offset.")
+    parser.add_argument(
+        "--extero_xyz_offset", type=str, default="",
+        help="Declared per-camera xyz offsets in metres, overriding the derivation: "
+             "'x,y,z;x,y,z' in sensor order (semicolons between cameras). The escape hatch "
+             "when the boresight-on-nominal-ground default does not centre the data -- the "
+             "dataset prints declared-vs-measured per camera at build, so set this from that "
+             "line. Empty derives them. Stating them keeps the constant DECLARED and recorded "
+             "in the run's config, which fitting the normalizer would not.")
+    parser.add_argument(
+        "--extero_norm_mode", type=str, default=FlowMatchingConfig().extero_norm_mode,
+        choices=list(EXTERO_NORM_MODES),
+        help="How the exteroception is scaled. Every mode is uniform over PIXELS, which is "
+             "what a convolution's weight sharing needs. 'per_channel' (default) fits one "
+             "(mean, std) per sensor per channel group -- d alone, xyz together so a metre "
+             "stays a metre in every direction, and v left as an identity because it is "
+             "already 0/1. 'per_sensor' pools across channels too, which lets xyz dominate the "
+             "std and squashes validity. 'metric' uses a DECLARED affine and no fit at all, so "
+             "the input is metres/scale and is identical across recordings -- both fitted modes "
+             "make a checkpoint's notion of '1 m' a property of its training set. Irrelevant "
+             "to --extero_encoder mlp.")
+    parser.add_argument(
+        "--extero_norm_scale", type=float, default=FlowMatchingConfig().extero_norm_scale,
+        help="Divisor for --extero_norm_mode metric. Default 1.0, i.e. the network input IS "
+             "metres.")
+    parser.add_argument(
+        "--extero_clip", type=float, default=None,
+        help="Symmetric clip band applied before normalization, in the source's units. "
+             "Default: 1.0 m for the scan, 2.0 (normalised) for depth. The scan default is "
+             "too tight for a large grid -- measured on the real recording, 33%% of "
+             "stairs_dn_pure rays already exceed +1 m at 176 rays, and a 3 m window destroys "
+             "~11%% of the image (42%% on descents). ~2.0 leaves 0.5%% clipped. Safe to widen "
+             "because the generator has its own scanner, so the teacher's clip=(-1,1) obs "
+             "terms and the critic's input distribution are untouched. The dataset PRINTS the "
+             "saturation and miss fractions it measured, so pick this from a run's own log.")
+    # --noise_height_scan / --noise_depth are GONE: there is no train-time exteroception noise
+    # any more. The sensor model belongs to the RL env, whose DR is already in the recording.
     parser.add_argument(
         "--reference_blocks", type=str, default=None,
         help="Comma-separated reference-window blocks the generator predicts, out of "
@@ -157,12 +338,16 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "the history may be perturbed (learn recovery refs from a bad-state history); 'all' uses "
              "every window. Recordings without 'perturb_active' always use all windows.",
     )
-    parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--dim_feedforward", type=int, default=512)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--num_sampling_steps", type=int, default=8)
+    # Rendered from the dataclass, never restated: these six sat here as literals and drifted
+    # the moment the shipped architecture grew to 27M, so the CLI silently built a 256-wide
+    # 4-layer model while config.py documented 512/8. Same rule as every other flag.
+    _arch = FlowMatchingConfig()
+    parser.add_argument("--d_model", type=int, default=_arch.d_model)
+    parser.add_argument("--nhead", type=int, default=_arch.nhead)
+    parser.add_argument("--num_layers", type=int, default=_arch.num_layers)
+    parser.add_argument("--dim_feedforward", type=int, default=_arch.dim_feedforward)
+    parser.add_argument("--dropout", type=float, default=_arch.dropout)
+    parser.add_argument("--num_sampling_steps", type=int, default=_arch.num_sampling_steps)
     # Loss-weight CLI flags default to the FlowMatchingConfig() values, so config.py is the
     # single source of truth -- editing a default there changes a plain `train.py` run (a
     # bare `default=0.0` here would silently override the config and disable the loss).
@@ -175,9 +360,6 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--vel_consistency_weight", type=float, default=_wc.vel_consistency_weight,
                         help="Weight on the frame velocity finite-difference consistency loss "
                              "(predicted pose d/dt vs predicted velocity).")
-    parser.add_argument("--accel_consistency_weight", type=float, default=_wc.accel_consistency_weight,
-                        help="Weight on the frame acceleration finite-difference consistency loss "
-                             "(predicted velocity d/dt vs data velocity d/dt). tau-gated.")
     parser.add_argument("--joint_vel_consistency_weight", type=float, default=_wc.joint_vel_consistency_weight,
                         help="Weight on the joint-velocity finite-difference consistency "
                              "(predicted joint_pos d/dt vs predicted joint_vel). Ungated.")
@@ -185,7 +367,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                         help="Weight on the FK position consistency (predicted ee position, "
                              "base-relative, vs FK of predicted joints). tau-gated.")
     parser.add_argument("--consistency_tau_min", type=float, default=FlowMatchingConfig().consistency_tau_min,
-                        help="Only score the acceleration + FK terms on samples with flow-time "
+                        help="Only score the FK + body-pose terms on samples with flow-time "
                              "tau >= this (velocity/joint-velocity stay ungated).")
     parser.add_argument("--fk_model_path", type=str, default=FlowMatchingConfig().fk_model_path,
                         help="MuJoCo MJCF defining the kinematics for the FK losses (repo-relative).")
@@ -198,7 +380,26 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "which the forward-facing depth cameras cannot observe at all. Errors if the "
              "recording predates the tag or a named family is not in it.",
     )
-    parser.add_argument("--skip_distractors", action="store_true", default=_wc.skip_distractors,
+    parser.add_argument(
+        "--transition_fraction", type=float, default=_wc.transition_fraction,
+        help="Oversample windows CROSSING a terrain transition until they are this fraction "
+             "of each training epoch (e.g. 0.5; natural rate on the v5 library is 0.178). A "
+             "sampler weight, not a filter: epoch size and per-window loss are unchanged, "
+             "only the draw rate. 'Crosses a transition' is an anchor_mask_t boundary inside "
+             "[clip_step, clip_step+F), joined via the recorded clip_id/clip_step -- ground "
+             "truth, not a height heuristic. Needs a recording carrying that index.",
+    )
+    parser.add_argument(
+        "--clip_library_path", type=str, default=_wc.clip_library_path,
+        help="Clip library to join clip_id/clip_step against for --transition_fraction. "
+             "Default: the path recorded in the .h5. Its sha256 is verified either way.",
+    )
+    # BooleanOptionalAction, not store_true: the default is now ON, and a store_true flag can
+    # only ever turn a knob on -- so the off position would be unreachable from the CLI, which
+    # is the same "the config says one thing and the command line cannot say the other" bug
+    # test_train_cli_defaults exists to catch.
+    parser.add_argument("--skip_distractors", action=argparse.BooleanOptionalAction,
+                        default=_wc.skip_distractors,
                         help="Drop DISTRACTOR-family windows (boxes the robot walks AROUND, not "
                              "onto). Train-time switch -- recordings tag every window with "
                              "'is_distractor', so A/B-ing needs no re-record. Errors if the "
@@ -227,6 +428,12 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=100)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument(
+        "--lr_warmup_steps", type=int, default=FlowMatchingConfig().lr_warmup_steps,
+        help="Ramp the LR linearly to --lr over this many optimizer steps (0 = off). Composes "
+             "with --cosine. Cheap insurance against the predict-the-mean plateau becoming "
+             "permanent -- see FlowMatchingConfig.lr_warmup_steps.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -245,7 +452,6 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         dim_feedforward=args.dim_feedforward, dropout=args.dropout,
         num_sampling_steps=args.num_sampling_steps,
         vel_consistency_weight=args.vel_consistency_weight,
-        accel_consistency_weight=args.accel_consistency_weight,
         joint_vel_consistency_weight=args.joint_vel_consistency_weight,
         fk_pose_weight=args.fk_pose_weight,
         body_pose_root_weight=args.body_pose_root_weight,
@@ -255,10 +461,44 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         skip_distractors=args.skip_distractors,
         skip_families=([f.strip() for f in args.skip_families.split(",") if f.strip()]
                        if args.skip_families else None),
+        transition_fraction=args.transition_fraction,
+        clip_library_path=args.clip_library_path,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
-        num_epochs=args.num_epochs, grad_clip=args.grad_clip, seed=args.seed,
+        num_epochs=args.num_epochs, grad_clip=args.grad_clip,
+        lr_warmup_steps=args.lr_warmup_steps, seed=args.seed,
         obs_noise=args.obs_noise, noise_scale=args.noise_scale,
+        extero_encoder=args.extero_encoder, extero_channels=args.extero_channels,
+        extero_cnn_channels=[int(c) for c in args.extero_cnn_channels.split(",") if c.strip()],
+        extero_cnn_grid=([int(g) for g in args.extero_cnn_grid.split(",") if g.strip()]
+                         or None),
+        extero_cnn_strides=([int(s) for s in args.extero_cnn_strides.split(",") if s.strip()]
+                            or None),
+        extero_norm_mode=args.extero_norm_mode,
+        extero_norm_scale=args.extero_norm_scale,
+        extero_xyz_scale=args.extero_xyz_scale,
+        extero_nominal_ground_z=args.extero_nominal_ground_z,
+        # ``None`` (not ``[]``) when unset: the dataset derives the offsets only when the
+        # field is None, and an empty list would read as "zero cameras stated" and trip the
+        # per-camera count check instead.
+        extero_xyz_offset=([[float(v) for v in cam.split(",")]
+                            for cam in args.extero_xyz_offset.split(";") if cam.strip()]
+                           or None),
+        pinned_axis_loss_weight=args.pinned_axis_loss_weight,
+        state_scale_base_pos=args.state_scale_base_pos,
+        state_scale_base_lin_vel=args.state_scale_base_lin_vel,
+        state_scale_base_ang_vel=args.state_scale_base_ang_vel,
+        state_scale_joint_pos=args.state_scale_joint_pos,
+        state_scale_joint_vel=args.state_scale_joint_vel,
+        state_scale_ee_pos=args.state_scale_ee_pos,
+        cmd_scale=([float(v) for v in args.cmd_scale.split(",") if v.strip()]
+                   if args.cmd_scale and args.cmd_scale.lower() != "none" else None),
+        attention_mode=args.attention_mode,
     )
+    # Noise amplitudes and the clip band keep their per-source defaults unless named, so an
+    # unspecified flag reproduces the previous behaviour exactly rather than overwriting it
+    # with an argparse default.
+    if args.extero_clip is not None:
+        cfg.extero_clip = float(args.extero_clip)
     return cfg, args
 
 
@@ -316,9 +556,72 @@ def channel_metrics(
     return out
 
 
-_CONS_KEYS = ("vel_consistency", "accel_consistency", "joint_vel_consistency", "fk_pose",
+_CONS_KEYS = ("vel_consistency", "joint_vel_consistency", "fk_pose",
               "body_pose_root", "body_pose_root_pos", "body_pose_root_ori",
               "body_pose_world", "body_pose_world_pos", "body_pose_world_ori")
+
+
+def scheduled_lr(base_lr: float, epoch: int, num_epochs: int, step: int,
+                 warmup_steps: int, cosine: bool) -> float:
+    """The learning rate for one optimizer step: cosine over epochs x linear warmup.
+
+    Both factors are CLOSED FORM in ``(epoch, step)`` rather than a stateful
+    ``lr_scheduler``, because the two have to compose at different granularities -- warmup
+    is per step, the cosine per epoch -- and ``CosineAnnealingLR.get_lr`` is recursive in
+    ``param_group["lr"]``. Mutating the group's LR mid-epoch for the warmup would therefore
+    corrupt the cosine's own state instead of scaling it. The cosine factor reproduces
+    ``CosineAnnealingLR(T_max=num_epochs, eta_min=0)`` exactly at epoch granularity, so
+    ``--cosine`` alone behaves as it always did.
+
+    Args:
+        base_lr: The configured peak LR (``cfg.lr``).
+        epoch: Current epoch index.
+        num_epochs: Total epochs (the cosine's ``T_max``).
+        step: Global optimizer-step index (0-based).
+        warmup_steps: Steps over which to ramp linearly to ``base_lr`` (0 = no warmup).
+        cosine: Whether cosine annealing is on.
+
+    Returns:
+        The LR to use for this step.
+    """
+    lr = base_lr
+    if cosine and num_epochs > 1:
+        lr *= 0.5 * (1.0 + math.cos(math.pi * epoch / num_epochs))
+    if warmup_steps > 0 and step < warmup_steps:
+        lr *= (step + 1) / warmup_steps
+    return lr
+
+
+@torch.no_grad()
+def adam_update_snr(opt: torch.optim.Optimizer) -> float:
+    """Median over parameter tensors of ``|exp_avg| / sqrt(exp_avg_sq)`` -- Adam's own SNR.
+
+    The direct "is this run still learning?" number, and the one the gradient norm cannot
+    give: a frozen run's gradient is not zero, it is zero-MEAN, so the norm stays small but
+    finite while the accumulated direction cancels. This ratio is what Adam actually
+    multiplies the LR by, so it separates the two cases outright.
+
+    MEDIAN, not mean, measured on the 2026-08-12 pinned-axis A/B: over the stalled arm's 131
+    parameter tensors the median read 3.8e-5 against the healthy arm's 7.5e-2 (2000x), while
+    the means were 7.0e-3 vs 7.7e-2 (11x) -- a handful of tensors (biases, LayerNorm gains)
+    keep a healthy ratio even in a frozen network and drag the mean up by 200x. The median
+    is what makes a threshold like 1e-3 mean anything.
+
+    Cheap enough to take every epoch (one pass over ~130 state tensors, no backward).
+
+    Args:
+        opt: An Adam/AdamW optimizer that has taken at least one step.
+
+    Returns:
+        The median ratio, or ``0.0`` before the first step (no state yet).
+    """
+    ratios = []
+    for state in opt.state.values():
+        m, v = state.get("exp_avg"), state.get("exp_avg_sq")
+        if m is None or v is None:
+            continue
+        ratios.append(float(m.abs().mean()) / max(float(v.mean()) ** 0.5, 1e-30))
+    return float(np.median(ratios)) if ratios else 0.0
 
 
 @torch.no_grad()
@@ -352,8 +655,7 @@ def consistency_kwargs(cfg, num_joints, num_extra_frames, fk, body_fk=None) -> d
     """Shared flow_matching_loss kwargs for the consistency + FK regularizers."""
     return dict(
         dt=cfg.dt, num_joints=num_joints, num_extra_frames=num_extra_frames,
-        vel_weight=cfg.vel_consistency_weight, accel_weight=cfg.accel_consistency_weight,
-        joint_vel_weight=cfg.joint_vel_consistency_weight,
+        vel_weight=cfg.vel_consistency_weight,        joint_vel_weight=cfg.joint_vel_consistency_weight,
         fk=fk, fk_pose_weight=cfg.fk_pose_weight,
         body_fk=body_fk, body_pose_root_weight=cfg.body_pose_root_weight,
         body_pose_world_weight=cfg.body_pose_world_weight,
@@ -364,36 +666,64 @@ def consistency_kwargs(cfg, num_joints, num_extra_frames, fk, body_fk=None) -> d
 
 @torch.no_grad()
 def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra_frames=0,
-             fk=None, body_fk=None) -> dict[str, float]:
+             fk=None, body_fk=None, rollout_metrics: bool = True) -> dict[str, float]:
     """Compute conditioned/null-history flow loss and per-channel sampling metrics.
 
     Metrics are over the full F-step prediction; ``flow_mse`` is the history-conditioned
     loss and ``flow_mse_null`` replaces the history with the learned null embedding.
+
+    Args:
+        rollout_metrics: Also compute the per-channel RMSEs, which need a full
+            ``sample_trajectory`` per batch and dominate the cost. ``False`` returns the flow
+            metrics alone, which is cheap enough to run every epoch.
     """
     model.eval()
     flow_sum, flow_null_sum, n_batches = 0.0, 0.0, 0
     cons_sums: dict[str, float] = {}
     metric_sums: dict[str, float] = {}
+    split_sums: dict[str, float] = {}
     ckw = consistency_kwargs(cfg, num_joints, num_extra_frames, fk, body_fk)
     for batch in loader:
         state = batch["state"].to(device)
         history = batch["history"].to(device)
-        height = batch["height"].to(device)
+        extero = batch["extero"].to(device)
         cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
         b = state.shape[0]
-        cond_out = flow_matching_loss(model, state, history, height, cmd_tokens,
-                                      state_norm=state_normalizer, **ckw)
+        cond_out = flow_matching_loss(model, state, history, extero, cmd_tokens,
+                                      state_norm=state_normalizer,
+                                      report_consistency=True, **ckw)
         flow_sum += cond_out["flow_mse"].item()
+        # Split the SAME flow error by whether the terrain pins that coordinate. A single
+        # flow_mse averages the two halves and hides the effect the whole experiment is
+        # chasing -- the generator is accurate on coordinates that follow the robot and
+        # wrong on the ones the terrain fixes. Recomputed from a fresh flow batch rather
+        # than threaded out of the loss, so it is independent of whether the loss is
+        # weighted and both A/B arms report the same quantity.
+        if "anchor_mask" in batch:
+            x_tau, tau, target_v = sample_flow_batch(state)
+            with torch.no_grad():
+                v = model(x_tau, tau, history, extero, cmd_tokens)
+            m, u = pinned_axis_split(
+                v - target_v, batch["anchor_mask"].to(device),
+                batch["mask_frame_yaw_rel"].to(device), state_normalizer,
+                num_joints, num_extra_frames, cfg.reference_blocks)
+            split_sums["flow_mse_masked"] = split_sums.get("flow_mse_masked", 0.0) + m
+            split_sums["flow_mse_unmasked"] = split_sums.get("flow_mse_unmasked", 0.0) + u
         for k in _CONS_KEYS:
             if k in cond_out:
                 cons_sums[k] = cons_sums.get(k, 0.0) + cond_out[k].item()
         null_mask = torch.ones(b, dtype=torch.bool, device=device)
         flow_null_sum += flow_matching_loss(
-            model, state, history, height, cmd_tokens, history_null_mask=null_mask
+            model, state, history, extero, cmd_tokens, history_null_mask=null_mask
         )["flow_mse"].item()
         n_batches += 1
+        if not rollout_metrics:
+            # The channel RMSEs below need a full 8-step sample_trajectory per batch, which
+            # is what makes validation expensive. The flow metrics above are 2-3 forward
+            # passes, so they can run every epoch while these stay on the slower cadence.
+            continue
         pred = sample_trajectory(
-            model, history, height, cmd_tokens, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
+            model, history, extero, cmd_tokens, cfg.future_len, cfg.state_dim, cfg.num_sampling_steps,
         )
         pred_full = state_normalizer.denormalize(pred)
         tgt_d = state_normalizer.denormalize(state)
@@ -407,6 +737,8 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
     for k, v in cons_sums.items():
         out[k] = v / max(n_batches, 1)
     for k, v in metric_sums.items():
+        out[k] = v / max(n_batches, 1)
+    for k, v in split_sums.items():
         out[k] = v / max(n_batches, 1)
     return out
 
@@ -423,12 +755,62 @@ def main() -> None:
     os.makedirs(out_dir, exist_ok=True)
     device = torch.device(args.device)
 
-    data_path = _resolve_data_path(args.data)
-    print(f"[INFO] Loading dataset: {data_path}")
-    if is_windowed_recording(data_path):
-        data, meta = load_recorded_windows(data_path)
-    else:
-        data, meta = load_recorded_data(data_path)
+    # --data accepts SEVERAL comma-separated recordings, concatenated window-wise. The case
+    # this exists for is registration augmentation: the augmented windows land in their own
+    # .h5 next to the original, and merging them on disk would mean a second full copy of a
+    # ~10 GB file just to train once.
+    data_paths = [_resolve_data_path(p) for p in str(args.data).split(",") if p.strip()]
+    parts = []
+    # Which arrays this run will actually READ. A recording carries both exteroception
+    # signals so one file can train either generator, and at a dense scan the unused one is
+    # the largest thing in the file -- so not loading it is the single biggest saving
+    # available, and it costs nothing to know in advance.
+    unused_extero = [s for s in EXTERO_SOURCES if s != cfg.extero_source]
+    load_keys = [k for k in WINDOW_ARRAY_KEYS if k not in unused_extero]
+    for dp in data_paths:
+        print(f"[INFO] Loading dataset: {dp}")
+        if is_windowed_recording(dp):
+            parts.append(load_recorded_windows(dp, keys=load_keys))
+        else:
+            parts.append(load_recorded_data(dp))
+    data, meta = parts[0]
+    if len(parts) > 1:
+        # episode_id must stay UNIQUE across files or the train/val split leaks: the split is
+        # by episode, and two files independently numbering from 0 would put the same id in
+        # both halves. Offset each subsequent file past the running maximum.
+        data = {k: v for k, v in data.items()}
+        ep_off = int(np.asarray(data["episode_id"]).max()) + 1
+        for extra, extra_meta in parts[1:]:
+            if set(extra) != set(data):
+                raise SystemExit(
+                    f"recordings carry different arrays and cannot be concatenated:\n"
+                    f"  {sorted(set(data) - set(extra))} missing from a later file\n"
+                    f"  {sorted(set(extra) - set(data))} missing from the first")
+            # Only the FIRST file's meta survives (see below), so a geometry difference would
+            # be invisible: two scans of the same WIDTH but different extent or resolution
+            # concatenate silently and train as if they were one sensor. Array widths already
+            # fail loudly in np.concatenate; this catches the case they cannot see.
+            for field in ("height_scan_spec", "depth_camera_spec"):
+                mine = getattr(meta, field, None)
+                theirs = getattr(extra_meta, field, None)
+                if _sensor_geometry_key(mine) != _sensor_geometry_key(theirs):
+                    raise SystemExit(
+                        f"recordings disagree on {field}:\n"
+                        f"  first : {_sensor_geometry_key(mine)}\n"
+                        f"  later : {_sensor_geometry_key(theirs)}\n"
+                        "Same-width sensors with different geometry would concatenate "
+                        "silently and train as one. Record them with matching geometry, or "
+                        "train them separately.")
+            for k in data:
+                if k == "episode_id":
+                    data[k] = np.concatenate([data[k], np.asarray(extra[k]) + ep_off])
+                else:
+                    data[k] = np.concatenate([data[k], np.asarray(extra[k])])
+            ep_off = int(np.asarray(data["episode_id"]).max()) + 1
+        n_each = [int(np.asarray(p[0]["episode_id"]).shape[0]) for p in parts]
+        print(f"[INFO] concatenated {len(parts)} recordings: {n_each} -> "
+              f"{int(np.asarray(data['episode_id']).shape[0])} windows "
+              "(episode ids offset per file so the val split cannot leak between them)")
     # Auto-config from the recording's content (only the 'auto' sentinel infers;
     # an explicit --cmd_array / --target_source always wins).
     cfg.cmd_array = _resolve_cmd_array(cfg.cmd_array, data)
@@ -443,10 +825,56 @@ def main() -> None:
           "must pack exactly these.")
     print(f"[INFO] target_source={cfg.target_source}, state_dim={cfg.state_dim}, "
           f"cmd_dim={cfg.cmd_dim}, num_cmd_tokens={cfg.num_cmd_tokens}, "
-          f"extero={cfg.extero_source} ({cfg.extero_tokens}x{cfg.height_dim}), "
+          f"extero={cfg.extero_source} ({cfg.extero_sensor_count}x{cfg.extero_sensor_dim}), "
           f"F={cfg.future_len}, N={cfg.num_history_states}, "
           f"null_cond_prob={cfg.null_cond_prob}, train_windows={len(train_ds)}, "
           f"val_windows={0 if val_ds is None else len(val_ds)}")
+    # The exteroception embedding and, from it, the SEQUENCE LENGTH -- which nothing printed
+    # before and which is what the transformer's cost actually scales with.
+    shapes = (", ".join(f"{h}x{w}" for h, w in (train_ds.extero_image_hw or []))
+              or "(no image shape)")
+    strides = (tuple(cfg.extero_cnn_strides) if cfg.extero_cnn_strides
+               else (2,) * len(cfg.extero_cnn_channels))
+    detail = (f"grid={tuple(cfg.extero_cnn_grid) if cfg.extero_cnn_grid else 'native'}, "
+              f"channels={list(cfg.extero_cnn_channels)}, strides={list(strides)}, "
+              f"images {shapes}, "
+              if cfg.extero_encoder == "cnn" else "")
+    print(f"[INFO] extero_encoder={cfg.extero_encoder} ({detail}"
+          f"{cfg.tokens_per_sensor} token(s)/sensor -> {cfg.extero_seq_tokens} extero "
+          f"tokens), extero_norm_mode={cfg.extero_norm_mode}; SEQUENCE LENGTH "
+          f"{cfg.sequence_len} = {cfg.num_history_states} history + {cfg.extero_seq_tokens} "
+          f"extero + {cfg.num_cmd_tokens} cmd + {cfg.future_len} future.")
+    # The positional information, stated explicitly because it is the point of the metric
+    # path and a checkpoint carries no obvious evidence of it: a convolution given coordinate
+    # channels is a structurally different model from one that is not.
+    if cfg.extero_coord_extent_m is not None:
+        print(f"[INFO] metric grid {cfg.extero_coord_extent_m[0]}x"
+              f"{cfg.extero_coord_extent_m[1]} m, ordering={cfg.extero_grid_ordering}: "
+              f"pixel (x, y) offsets in METRES as CoordConv channels + a "
+              f"{cfg.extero_fourier_bands}-band Fourier embedding of each token's cell centre"
+              + (f", validity channel on (miss -> {cfg.extero_miss_sentinel:+.3f})"
+                 if cfg.extero_miss_sentinel is not None else "")
+              + ". A shared kernel is translation-equivariant, so without this it cannot "
+                "represent WHERE an edge is.")
+    # The band and the scaling, stated because BOTH are resolved rather than typed: the clip
+    # comes from the per-source default when a run does not name one, so a log line is the only
+    # place a checkpoint's band is attributable after the fact.
+    print(f"[INFO] extero={cfg.extero_source} clip=+-{cfg.resolve_extero_clip():g} "
+          f"({'declared' if cfg.extero_clip is not None else 'per-source default'}), "
+          f"norm_mode={cfg.extero_norm_mode}, channels={cfg.extero_channels} "
+          f"{list(cfg.extero_channel_names)}. NO train-time exteroception noise: the sensor "
+          f"model is the RL env's DR, already in the recording (extero_corrupted="
+          f"{bool(getattr(meta, 'extero_corrupted', False))}, extero_noise_free="
+          f"{bool(getattr(meta, 'extero_noise_free', False))}).")
+    # Stated in the log because a checkpoint carries no structural evidence of it -- the two
+    # attention modes share one parameter set, so this line is how a run's architecture stays
+    # attributable after the fact.
+    cfg.check_attention_mode()
+    prefix_note = ("conditioning attends only to itself and is encoded once per re-plan"
+                   if cfg.attention_mode == "prefix"
+                   else "every token attends to every other (the pre-flag architecture)")
+    print(f"[INFO] attention_mode={cfg.attention_mode}: {prefix_note}; "
+          f"prefix {cfg.sequence_len - cfg.future_len} + future {cfg.future_len} tokens.")
     if cfg.obs_noise:
         # Only the keys feeding a SELECTED block -- the others are not in the window and
         # so are not applied, and printing them would suggest otherwise.
@@ -469,8 +897,11 @@ def main() -> None:
     # -- run provenance (parity with RL: git snapshot + params yaml + data identity) --
     # cfg dims (state_dim/cmd_dim) are resolved by build_train_val above,
     # so fm_config.yaml captures the *resolved* config.
-    data_path_abs = os.path.abspath(data_path)
-    data_sha256 = sha256_file(data_path)
+    # Provenance for ALL inputs, not just the first: a checkpoint trained on an original plus
+    # its augmented counterpart must name both, or the run cannot be reproduced from what it
+    # records. Comma-joined to match how --data took them.
+    data_path_abs = ",".join(os.path.abspath(p) for p in data_paths)
+    data_sha256 = ",".join(sha256_file(p) for p in data_paths)
     git_snapshot(out_dir)
     dump_params_yaml(os.path.join(out_dir, "params", "fm_config.yaml"), cfg.to_dict())
     dump_params_yaml(os.path.join(out_dir, "params", "data.yaml"), {
@@ -485,8 +916,20 @@ def main() -> None:
     })
     print(f"[INFO] Provenance -> {out_dir}/params/{{fm_config,data}}.yaml + git/  (data sha {data_sha256[:12]})")
 
+    # cfg.transition_fraction oversamples terrain-transition windows via sampler weights
+    # (see dataset.transition_sampler_weights). `sampler` and `shuffle` are mutually
+    # exclusive in torch, and a WeightedRandomSampler already shuffles. Epoch size is held
+    # at len(train_ds) so "epoch" means the same thing weighted or not, and replacement is
+    # required for a weight >1 to draw a window more than once.
+    _w = getattr(train_ds, "sampler_weights", None)
+    train_sampler = (
+        WeightedRandomSampler(torch.as_tensor(_w, dtype=torch.double),
+                              num_samples=len(train_ds), replacement=True)
+        if _w is not None else None
+    )
     train_loader = DataLoader(
-        train_ds, batch_size=cfg.batch_size, shuffle=True,
+        train_ds, batch_size=cfg.batch_size,
+        shuffle=(train_sampler is None), sampler=train_sampler,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"), drop_last=True,
     )
     val_loader = None
@@ -498,20 +941,24 @@ def main() -> None:
         eval_loader = DataLoader(eval_ds, batch_size=cfg.batch_size, shuffle=False,
                                  num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
 
-    model = FlowMatchingTransformer(
-        state_dim=cfg.state_dim, future_len=cfg.future_len,
-        num_history_states=cfg.num_history_states, history_dim=cfg.state_dim,
-        height_dim=cfg.height_dim, extero_tokens=cfg.extero_tokens, cmd_dim=cfg.cmd_dim,
-        cmd_stride=cfg.cmd_stride, d_model=cfg.d_model, nhead=cfg.nhead,
-        num_layers=cfg.num_layers, dim_feedforward=cfg.dim_feedforward, dropout=cfg.dropout,
-    ).to(device)
+    # ONE construction site, shared with ``online.load_fm_context`` -- see
+    # ``FlowMatchingTransformer.from_config`` for why spelling the arguments out here twice
+    # was a bug rather than a duplication.
+    model = FlowMatchingTransformer.from_config(cfg).to(device)
+    extero_params = sum(p.numel() for n, p in model.named_parameters() if "extero" in n)
     print(f"[INFO] Model parameters: {sum(p.numel() for p in model.parameters()):,}  "
-          f"(command conditioning: {'on' if cfg.cmd_dim > 0 else 'off'})")
+          f"(exteroception branch: {extero_params:,}; "
+          f"command conditioning: {'on' if cfg.cmd_dim > 0 else 'off'})")
 
     # Normalizers are fit on CPU; move their stats to the model device so
     # (de)normalization during evaluation/sampling stays on one device.
+    #
+    # NOT the exteroception one. It is applied inside ``Dataset.__getitem__``, on host-side
+    # rows in a DataLoader worker, and moving it in place made every fetch raise "at least two
+    # devices" -- while nothing on the device ever reads it, because exteroception is only an
+    # INPUT (the state and command stats are the ones the loss and the sampler denormalize
+    # with). The checkpoint is unaffected either way: ``state_dict`` stores stats on CPU.
     train_ds.state_normalizer.to(device)
-    train_ds.height_normalizer.to(device)
     if train_ds.cmd_normalizer is not None:
         train_ds.cmd_normalizer.to(device)
 
@@ -551,9 +998,9 @@ def main() -> None:
               f"step window, warmed in). best.pt will be selected on val_ema/flow_mse.")
 
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    scheduler = (
-        torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.num_epochs) if args.cosine else None
-    )
+    if cfg.lr_warmup_steps > 0:
+        print(f"[INFO] LR warmup: linear over the first {cfg.lr_warmup_steps} optimizer steps "
+              f"to lr={cfg.lr:g}" + (" (then cosine over epochs)." if args.cosine else "."))
 
     writer = SummaryWriter(log_dir=out_dir)
     wandb_run = None
@@ -577,46 +1024,84 @@ def main() -> None:
         model.train()
         epoch_start = time.perf_counter()
         epoch_loss, n = 0.0, 0
+        epoch_gnorm, n_clipped = 0.0, 0
+        lr_now = scheduled_lr(cfg.lr, epoch, cfg.num_epochs, global_step,
+                              cfg.lr_warmup_steps, args.cosine)   # also the empty-loader value
         for batch in train_loader:
+            # Closed-form schedule, set before the step it applies to. ``global_step`` is
+            # 0-based here (it is incremented after the step, below).
+            lr_now = scheduled_lr(cfg.lr, epoch, cfg.num_epochs, global_step,
+                                  cfg.lr_warmup_steps, args.cosine)
+            for group in opt.param_groups:
+                group["lr"] = lr_now
             state = batch["state"].to(device)
             history = batch["history"].to(device)
-            height = batch["height"].to(device)
+            extero = batch["extero"].to(device)
             cmd_tokens = batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None
             # Per-sample history null-out (classifier-free guidance / phase-agnostic).
             null_mask = torch.rand(state.shape[0], device=device) < cfg.null_cond_prob
             opt.zero_grad()
             out = flow_matching_loss(
-                model, state, history, height, cmd_tokens,
+                model, state, history, extero, cmd_tokens,
                 history_null_mask=null_mask,
                 state_norm=train_ds.state_normalizer,
+                # Present only when the pinned-axis weighting is on; the loss treats an
+                # absent mask as "every channel equal", which is the historical behaviour.
+                anchor_mask=(batch["anchor_mask"].to(device)
+                             if "anchor_mask" in batch else None),
+                mask_frame_yaw_rel=(batch["mask_frame_yaw_rel"].to(device)
+                                    if "mask_frame_yaw_rel" in batch else None),
+                pinned_axis_weight=cfg.pinned_axis_loss_weight,
                 **consistency_kwargs(cfg, num_joints, train_ds.num_extra_frames, fk, body_fk),
             )
             out["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+            # The PRE-clip total norm, which ``clip_grad_norm_`` returns and this used to
+            # throw away. Logged because it is the cheapest early warning there is: a run
+            # that has stalled at the plateau reads two orders of magnitude below a healthy
+            # one within the first epoch, while every loss curve still looks merely flat.
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
             opt.step()
             if ema is not None:
                 ema.update(model)
             epoch_loss += out["loss"].item()
+            epoch_gnorm += grad_norm
+            n_clipped += int(grad_norm > cfg.grad_clip)
             n += 1
             global_step += 1
             writer.add_scalar("train/loss_step", out["loss"].item(), global_step)
+            writer.add_scalar("train/grad_norm_step", grad_norm, global_step)
+            writer.add_scalar("train/lr_step", lr_now, global_step)
             for k in ("flow_mse", *_CONS_KEYS):
                 if k in out:
                     writer.add_scalar(f"train/{k}_step", out[k].item(), global_step)
-        if scheduler is not None:
-            scheduler.step()
 
         epoch_time = time.perf_counter() - epoch_start
         train_loss = epoch_loss / max(n, 1)
+        grad_norm_mean = epoch_gnorm / max(n, 1)
+        clipped_frac = n_clipped / max(n, 1)
+        # Adam's own signal-to-noise. Together with the norm this distinguishes "small
+        # gradients" from "gradients that cancel", which the norm alone cannot.
+        snr = adam_update_snr(opt)
         writer.add_scalar("train/loss_epoch", train_loss, epoch)
-        writer.add_scalar("train/lr", opt.param_groups[0]["lr"], epoch)
+        writer.add_scalar("train/grad_norm", grad_norm_mean, epoch)
+        writer.add_scalar("train/grad_clipped_frac", clipped_frac, epoch)
+        writer.add_scalar("train/adam_snr", snr, epoch)
+        writer.add_scalar("train/lr", lr_now, epoch)
         writer.add_scalar("train/epoch_time_s", epoch_time, epoch)
-        log_line = f"[epoch {epoch}] train_loss={train_loss:.4f}  train_time={epoch_time:.1f}s"
+        log_line = (f"[epoch {epoch}] train_loss={train_loss:.4f}  train_time={epoch_time:.1f}s"
+                    f"  grad_norm={grad_norm_mean:.3f} (clipped {clipped_frac:.0%})"
+                    f"  adam_snr={snr:.2e}  lr={lr_now:.2e}")
 
-        if val_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
+        # FLOW metrics every epoch, the sampled-rollout RMSEs on the slower cadence: the
+        # flow numbers cost 2-3 forward passes while each RMSE needs a full 8-step
+        # sample_trajectory per batch, so this buys a per-epoch curve for the cheap half
+        # without paying for the expensive one.
+        full_val = (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1)
+        if val_loader is not None:
             val = evaluate(
                 model, val_loader, cfg, train_ds.state_normalizer, num_joints, device,
                 num_extra_frames=train_ds.num_extra_frames, fk=fk, body_fk=body_fk,
+                rollout_metrics=full_val,
             )
             for k, v in val.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
@@ -629,6 +1114,7 @@ def main() -> None:
                     val_ema = evaluate(
                         model, val_loader, cfg, train_ds.state_normalizer, num_joints, device,
                         num_extra_frames=train_ds.num_extra_frames, fk=fk, body_fk=body_fk,
+                        rollout_metrics=full_val,
                     )
                 for k, v in val_ema.items():
                     writer.add_scalar(f"val_ema/{k}", v, epoch)
@@ -640,11 +1126,16 @@ def main() -> None:
                 _save_ckpt(os.path.join(out_dir, "best.pt"), model, opt, cfg, train_ds, meta, epoch,
                            data_path=data_path_abs, data_sha256=data_sha256, ema=ema)
             if wandb_run is not None:
+                # step=epoch on EVERY call. Without it wandb increments its own counter
+                # once per log() CALL, and there are up to three per epoch (val, eval,
+                # train) -- so a 100-epoch run with val_every=5 made 121 calls and the
+                # x-axis ran to 120. With an explicit step the calls merge into one row
+                # per epoch and the axis is the epoch.
                 wandb_run.log({**{f"val/{k}": v for k, v in val.items()},
                                **{f"val_ema/{k}": v for k, v in (val_ema or {}).items()},
-                               "epoch": epoch})
+                               "epoch": epoch}, step=epoch)
 
-        if eval_loader is not None and (epoch % args.val_every == 0 or epoch == cfg.num_epochs - 1):
+        if eval_loader is not None and full_val:
             ev = evaluate(
                 model, eval_loader, cfg, train_ds.state_normalizer, num_joints, device,
                 num_extra_frames=train_ds.num_extra_frames, fk=fk, body_fk=body_fk,
@@ -653,11 +1144,16 @@ def main() -> None:
                 writer.add_scalar(f"eval/{k}", v, epoch)
             log_line += "  " + "  ".join(f"eval_{k}={v:.4f}" for k, v in ev.items())
             if wandb_run is not None:
-                wandb_run.log({**{f"eval/{k}": v for k, v in ev.items()}, "epoch": epoch})
+                wandb_run.log({**{f"eval/{k}": v for k, v in ev.items()}, "epoch": epoch},
+                               step=epoch)
 
         print(log_line)
         if wandb_run is not None:
-            wandb_run.log({"train/loss_epoch": train_loss, "train/epoch_time_s": epoch_time, "epoch": epoch})
+            wandb_run.log({"train/loss_epoch": train_loss, "train/epoch_time_s": epoch_time,
+                           "train/grad_norm": grad_norm_mean,
+                           "train/grad_clipped_frac": clipped_frac,
+                           "train/adam_snr": snr, "train/lr": lr_now,
+                           "epoch": epoch}, step=epoch)
         if epoch % args.ckpt_every == 0 or epoch == cfg.num_epochs - 1:
             _save_ckpt(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg, train_ds, meta, epoch, ema=ema,
                        data_path=data_path_abs, data_sha256=data_sha256)
@@ -666,6 +1162,33 @@ def main() -> None:
     if wandb_run is not None:
         wandb_run.finish()
     print(f"[INFO] Done. Checkpoints in {out_dir}")
+
+
+def _sensor_geometry_key(spec: list[dict] | None) -> tuple | None:
+    """The geometry-identifying fields of a sensor contract, for cross-file comparison.
+
+    Deliberately a SUBSET: two recordings from different runs legitimately differ in
+    per-episode noise state or update period, but must agree on what the pixels MEAN. Missing
+    keys compare as ``None`` so an old contract and a new one differ only where they really do.
+
+    Args:
+        spec: A ``height_scan_spec`` / ``depth_camera_spec`` list, or ``None``.
+
+    Returns:
+        A hashable key, or ``None`` when there is no contract.
+    """
+    if not spec:
+        return None
+    keys = ("sensor", "resolution", "size", "ordering", "height", "width", "num_rays",
+            "offset_pos", "ray_alignment", "sensor_offset", "fx", "fy", "cx", "cy",
+            "offset", "scale")
+    out = []
+    for entry in spec:
+        out.append(tuple(
+            (k, tuple(entry[k]) if isinstance(entry.get(k), list) else entry.get(k))
+            for k in keys if k in entry
+        ))
+    return tuple(out)
 
 
 def _resolve_data_path(path: str) -> str:
@@ -744,7 +1267,7 @@ def _build_eval_dataset(eval_path: str, cfg, train_ds) -> FutureStateDataset:
         data, meta, cfg, windows,
         state_normalizer=train_ds.state_normalizer,
         cmd_normalizer=train_ds.cmd_normalizer,
-        height_normalizer=train_ds.height_normalizer,
+        extero_normalizer=train_ds.extero_normalizer,
     )
     got = (ds.state_dim, ds.cmd_dim, ds.num_extra_frames)
     want = (train_ds.state_dim, train_ds.cmd_dim, train_ds.num_extra_frames)
@@ -773,7 +1296,7 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
     """
     meta_dict = dict(asdict(meta) if hasattr(meta, "__dataclass_fields__") else vars(meta))
     meta_dict["target_frame_names"] = list(train_ds.target_frame_names)
-    # The contract of the sensor this model ACTUALLY conditions on (None for the height
+    # The contract of the sensor this model ACTUALLY conditions on (None for the extero
     # scan). Distinct from the recording's ``depth_camera_spec``, which is present
     # whenever the cameras were recorded even if this model trained on the scan instead.
     meta_dict["extero_spec"] = train_ds.extero_spec
@@ -782,7 +1305,7 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
         "optimizer": opt.state_dict(),
         "config": cfg.to_dict(),
         "state_normalizer": train_ds.state_normalizer.state_dict(),
-        "height_normalizer": train_ds.height_normalizer.state_dict(),
+        "extero_normalizer": train_ds.extero_normalizer.state_dict(),
         "num_joints": train_ds.num_joints,
         "meta": meta_dict,
         "data_path": data_path,

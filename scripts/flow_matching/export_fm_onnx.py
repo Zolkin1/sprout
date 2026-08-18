@@ -10,7 +10,7 @@ tokens + *raw* strided command tokens + sampling noise and gets the *denormalize
 relative-state future window back -- no torch, no separate normalizer stats.
 
   inputs : history     (V, N, D)          raw relative-state history (phase) tokens
-           extero      (V, T*extero_dim)  raw exteroception tokens, flattened: the
+           extero      (V, T*extero_flat_dim)  raw exteroception tokens, flattened: the
                                           176-ray height scan (T=1) or one 780-value
                                           depth image per camera (T=2)
            cmd_tokens  (V, n_cmd, cmd)    raw strided commanded-velocity tokens
@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 
 import onnx
 import torch
@@ -42,6 +43,13 @@ import torch.nn as nn
 
 from robot_rl.flow_matching.window import project_window_rotations, window_blocks
 from robot_rl.flow_matching.online import load_fm_context, FmOnlineContext
+
+# The artifact NAMING rule is shared with the off-sim consumers that have to find these
+# files again, so it lives on the torch-free side and is imported rather than restated.
+sys.path.insert(0, os.path.join(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir)), "transfer"))
+
+from deploy.artifacts import fm_artifact_name  # noqa: E402
 
 
 class _FmSamplerOnnx(nn.Module):
@@ -67,8 +75,8 @@ class _FmSamplerOnnx(nn.Module):
         self.register_buffer("s_std", ctx.state_norm.std.detach().clone())
         self.register_buffer("c_mean", ctx.cmd_norm.mean.detach().clone())
         self.register_buffer("c_std", ctx.cmd_norm.std.detach().clone())
-        self.register_buffer("h_mean", ctx.height_norm.mean.detach().clone())
-        self.register_buffer("h_std", ctx.height_norm.std.detach().clone())
+        self.register_buffer("h_mean", ctx.extero_norm.mean.detach().clone())
+        self.register_buffer("h_std", ctx.extero_norm.std.detach().clone())
 
     def forward(
         self,
@@ -86,16 +94,45 @@ class _FmSamplerOnnx(nn.Module):
         deployed generator sample before its history window has filled, matching the RL side.
         """
         hist_n = (history - self.s_mean) / self.s_std        # (V, N, D)
-        height_n = (extero - self.h_mean) / self.h_std       # (V, T*extero_dim)
+        height_n = (extero - self.h_mean) / self.h_std       # (V, T*extero_flat_dim)
         cmd_n = (cmd_tokens - self.c_mean) / self.c_std      # (V, n_cmd, cmd)
         null_m = (history_null.reshape(-1) > 0.5)            # (V,) bool
 
         x = noise                                            # (V, F, D) -- all F denoised
         dt = 1.0 / self.num_steps
+        # Under ``prefix`` attention the conditioning's representation does not depend on the
+        # noised tokens or on the flow time, so it is encoded ONCE rather than ``num_steps``
+        # times. Held as a local, never on ``self``: this module is TorchScript-traced, and a
+        # cache stashed as module state would be constant-folded into the exported weights.
+        #
+        # TODO(fm-onnx-prefix): this hoist makes the exported graph SLOWER at the deploy batch
+        # of 1, which is the opposite of its purpose here. MEASURED on the xl27M: 13.3 ms
+        # against 10.8 ms on CUDA, with 13.4k graph nodes against 10.6k. Fewer FLOPs but more
+        # kernels -- one extra layer stack for the conditioning plus a Concat per layer per
+        # step -- and at batch 1 onnxruntime is launch-bound, so time tracks node count. The
+        # saving is real where the kernels are big: the TORCH path at Isaac's batch sizes gets
+        # 1.34-1.39x on the CNN model, so this is an ORT/graph-shape problem rather than an
+        # arithmetic one.
+        #
+        # First thing to check: ORT has a FUSED Attention kernel that pattern-matches
+        # self-attention (q, k, v from ONE input). ``decode_future`` passes query=future,
+        # key=value=cat(prefix, future), which plausibly breaks that match -- so ``full`` may be
+        # getting a fused kernel that this path is not. Dump both graphs with
+        # ``sess_options.optimized_model_filepath`` and compare their Attention nodes.
+        #
+        # Fallback, already scoped and proven equivalent by
+        # ``test_prefix_attention_matches_a_masked_full_pass``: export ``prefix`` mode as a
+        # MASKED full-sequence pass -- same semantics and same node count as ``full``, no
+        # speedup but no regression -- and keep this cached form for the torch path only. Keep
+        # any such mask strictly 2-D ``(S, S)``, which broadcasts; a 3-D one bakes in a static
+        # batch and breaks the dynamic-batch contract the five graph inputs share.
+        cache = (self.model.encode_prefix(hist_n, height_n, cmd_n, null_m)
+                 if self.model.attention_mode == "prefix" else None)
         for i in range(self.num_steps):
             # Batch-derived tau (V,) so the graph stays dynamic in the batch axis.
             tau = noise[:, 0, 0] * 0.0 + (i * dt)
-            v = self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m)
+            v = (self.model.decode_future(x, tau, cache) if cache is not None
+                 else self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m))
             x = x + dt * v
         # Project the rotation block back onto SO(3), exactly as
         # ``flow_matching.online.sample_window`` does for simulation -- the model emits 6
@@ -114,13 +151,36 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "target_frame_names": list(ctx.target_frame_names),
         "N": ctx.N, "F": ctx.F, "D": ctx.D, "nj": ctx.nj, "num_steps": ctx.num_steps,
         "cmd_dim": ctx.cmd_dim, "cmd_steps": list(ctx.cmd_steps), "num_cmd_tokens": ctx.num_cmd_tokens,
-        "height_dim": int(ctx.model.height_dim),
+        "extero_sensor_dim": int(ctx.model.extero_sensor_dim),
         # Which sensor feeds the exteroception tokens, how many there are, and -- for the
         # depth cameras -- their full contract, so the deployment feeds the right reading
         # and can verify it describes the same physical sensor as the tracker's.
         "extero_source": str(ctx.extero_source),
-        "extero_tokens": int(ctx.model.extero_tokens),
+        "extero_sensor_count": int(ctx.model.extero_sensor_count),
         "extero_spec": ctx.extero_spec,
+        # WHICH exteroception embedding is baked into the graph, and the geometry it folds
+        # the flat row with. The runtime does not need these to run -- the reshape is inside
+        # the graph -- but it needs them to CHECK: ``extero_sensor_dim`` alone cannot tell a
+        # 30x26 camera from a 26x30 one, and a transposed camera at deploy is a scrambled
+        # image rather than a reordered vector. ``tokens_per_sensor`` is the sequence
+        # arithmetic, which nothing else in the metadata reveals.
+        "extero_encoder": str(ctx.model.extero_encoder),
+        # Planes per pixel in one sensor row. Without it the deploy divides the row
+        # width by nothing and demands a camera N times too large -- the same trap
+        # read_fm_extero_meta was fixed for.
+        "extero_channels": int(getattr(ctx, "extero_channels", 1)),
+        # Only for the CONVOLUTIONAL encoder. The dataset derives the geometry for any depth
+        # recording, but a flat embedding is permutation-invariant over pixels, so stating
+        # the fold there would have the deploy enforce a constraint that does not exist --
+        # refusing a transposed camera an MLP graph would consume perfectly well.
+        "extero_image_hw": ([[int(h), int(w)] for h, w in ctx.extero_image_hw]
+                            if (ctx.extero_image_hw
+                                and ctx.model.extero_encoder == "cnn") else None),
+        "extero_tokens_per_sensor": int(ctx.model.tokens_per_sensor),
+        # Which way the conditioning/future dependency runs. The deploy does not need it --
+        # the graph is opaque and folds the whole sampler in -- but a loaded artifact should
+        # be able to say which architecture it is, because nothing in the weights can.
+        "attention_mode": str(ctx.model.attention_mode),
         # What the history tokens must be built from, and the re-plan period the targets
         # were cut at. Both are contracts the runtime has to honour, not descriptions: a
         # deployment feeding a measured history to a partially autoregressive model, or
@@ -143,23 +203,86 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # sample with the learned null embedding before its history fills. Absent in graphs
         # exported before that input existed.
         "has_history_null": True,
+        # The clip band this checkpoint TRAINED under. The deploy port must clamp the same
+        # way or it is feeding a differently-bounded sensor; absent -> the per-source
+        # default, which is what a pre-field graph used.
+        "extero_clip": (None if ctx.extero_clip is None else float(ctx.extero_clip)),
     }
 
 
-def export_fm_onnx(checkpoint: str, out_path: str, opset: int = 18) -> dict:
-    """Export ``checkpoint`` to ``out_path`` and embed ``fm_meta``; return the meta."""
+def _refuse_privileged_extero(ctx, checkpoint: str, allow: bool) -> None:
+    """Refuse to export a generator conditioned on a signal no deployment can produce.
+
+    A dense noise-free height scan is exact ground truth over metres of terrain: there is no
+    sensor that yields it, MuJoCo's port is a per-ray Python loop, and the hardware config
+    exporter has no wiring for it. An ONNX graph exists to be run off-sim, so emitting one
+    here would produce an artifact whose only possible use is to fail later -- and to fail
+    *quietly*, because the deploy side would fall back to a coarse default grid and hand the
+    model a correctly-shaped array of the wrong signal.
+
+    Args:
+        ctx: The loaded FM context.
+        checkpoint: Path, for the message.
+        allow: Skip the refusal (``--allow_privileged_extero``).
+
+    Raises:
+        ValueError: When the checkpoint's exteroception is marked privileged and ``allow`` is
+            False.
+    """
+    spec = list(ctx.extero_spec or [])
+    if not any(bool(s.get("privileged")) for s in spec):
+        return
+    detail = ", ".join(
+        f"{s.get('sensor')} {s.get('size')} m @ {s.get('resolution')} m "
+        f"({s.get('height')}x{s.get('width')} = {s.get('num_rays')} rays)"
+        for s in spec if s.get("privileged")
+    )
+    if not allow:
+        raise ValueError(
+            f"{checkpoint} conditions on PRIVILEGED exteroception ({detail}), which no "
+            "deployment can reproduce -- it is an exact noise-free ground-truth map, and it "
+            "exists to bound what perception could buy, not to be run off-sim. Exporting it "
+            "would yield a graph whose deploy path substitutes a coarse fallback grid and "
+            "feeds the model the wrong signal at the right shape. Pass "
+            "--allow_privileged_extero if you have a use that is not deployment."
+        )
+    print(f"[WARN] exporting a PRIVILEGED-exteroception generator ({detail}). Nothing off-sim "
+          "can produce this input; the deploy path will refuse it.")
+
+
+def export_fm_onnx(
+    checkpoint: str, out_path: str, opset: int = 18, allow_privileged_extero: bool = False
+) -> dict:
+    """Export ``checkpoint`` to ``out_path`` and embed ``fm_meta``; return the meta.
+
+    Args:
+        checkpoint: Path to the FM ``.pt``.
+        out_path: Output ``.onnx`` path.
+        opset: ONNX opset.
+        allow_privileged_extero: Export even when the generator conditions on a privileged
+            signal no deployment can produce. Off by default, because the whole value of an
+            exported graph is that something off-sim can run it.
+
+    Returns:
+        The embedded ``fm_meta`` dict.
+
+    Raises:
+        ValueError: On a non-command-conditioned checkpoint, or on a privileged-exteroception
+            checkpoint without the override.
+    """
     ctx = load_fm_context(checkpoint, device="cpu")
     if ctx.cmd_dim <= 0:
         raise ValueError("export_fm_onnx expects a command-conditioned checkpoint (cmd_dim>0).")
+    _refuse_privileged_extero(ctx, checkpoint, allow_privileged_extero)
     wrapper = _FmSamplerOnnx(ctx).eval()
 
     v, n, f, d, n_cmd, cmd = 1, ctx.N, ctx.F, ctx.D, ctx.num_cmd_tokens, ctx.cmd_dim
     # FLAT exteroception width: one token per sensor (176-ray scan) or one per camera
-    # (2 x 780 depth). The model reshapes to (B, T, height_dim) internally.
-    edim = int(ctx.model.extero_tokens) * int(ctx.model.height_dim)
+    # (2 x 780 depth). The model reshapes to (B, T, extero_sensor_dim) internally.
+    edim = int(ctx.model.extero_sensor_count) * int(ctx.model.extero_sensor_dim)
     # One dummy per _FmSamplerOnnx.forward arg, in order:
     # (history, extero, cmd_tokens, noise, history_null). ``extero`` is the FLAT width, so a
-    # depth FM traces at 2*780 rather than the scan's 176 -- do NOT use height_dim alone here.
+    # depth FM traces at 2*780 rather than the scan's 176 -- do NOT use extero_sensor_dim alone here.
     dummy = (torch.randn(v, n, d), torch.randn(v, edim), torch.randn(v, n_cmd, cmd),
              torch.randn(v, f, d), torch.zeros(v, 1))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
@@ -189,9 +312,19 @@ def main() -> None:
     p.add_argument("--checkpoint", required=True, help="Path to the FM .pt checkpoint.")
     p.add_argument("--out", default=None, help="Output .onnx path (default: alongside the checkpoint).")
     p.add_argument("--opset", type=int, default=18)
+    p.add_argument(
+        "--allow_privileged_extero", action="store_true", default=False,
+        help="Export even when the generator conditions on a PRIVILEGED signal (an exact "
+             "noise-free dense height scan). Refused by default: no deployment can produce "
+             "it, so the graph could only fail later -- and would fail quietly, because the "
+             "deploy path substitutes a coarse fallback grid.")
     args = p.parse_args()
-    out = args.out or os.path.join(os.path.dirname(args.checkpoint), "fm.onnx")
-    export_fm_onnx(args.checkpoint, out, args.opset)
+    # Named for the checkpoint, so exporting a second generator beside the first does not
+    # overwrite it and the filename says which model it holds (deploy.artifacts).
+    out = args.out or os.path.join(os.path.dirname(args.checkpoint),
+                                   fm_artifact_name(args.checkpoint))
+    export_fm_onnx(args.checkpoint, out, args.opset,
+                   allow_privileged_extero=args.allow_privileged_extero)
 
 
 if __name__ == "__main__":

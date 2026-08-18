@@ -250,6 +250,29 @@ def generate(exported_dir: str) -> dict[str, str]:
     src = _describe_path(tracker)
 
     cams = parse_depth_spec(session.get_depth_camera_spec(), "tracker.onnx")
+    # These configs describe ONE stream per camera -- a ray-caster grid for the MuJoCo world
+    # node and a ZED target for the Jetson. A generator that samples the same lenses on its
+    # OWN grid needs a second stream that there is nowhere here to declare, so refuse rather
+    # than emit a set that silently covers only the tracker. (Hardware is not wired for a
+    # split sampling yet; sim2sim casts both because it can.)
+    # Exports are named for their FM checkpoint, so a run dir can hold several. Refusing an
+    # ambiguous one (resolve_fm_onnx raises) is right here: these are HARDWARE configs, and
+    # describing whichever generator happened to be newest is how they would go out wrong.
+    from deploy.artifacts import resolve_fm_onnx
+    fm_onnx = resolve_fm_onnx(exported_dir, None, required=False)
+    if cams and fm_onnx:
+        from deploy.fm_session import load_fm_context
+        fm_cams = parse_depth_spec(load_fm_context(fm_onnx).extero_spec, "fm.onnx")
+        trk_res = [(int(c["width"]), int(c["height"])) for c in cams]
+        fm_res = [(int(c["width"]), int(c["height"])) for c in fm_cams]
+        if fm_cams and trk_res != fm_res:
+            raise ValueError(
+                f"tracker.onnx samples the depth cameras at {trk_res} but fm.onnx uses "
+                f"{fm_res}. These configs carry one stream per camera, so there is nowhere to "
+                "declare the generator's -- the obelisk/ZED path has no split-sampling wiring "
+                "yet. Re-train the generator at the policy's resolution before deploying to "
+                "hardware; MuJoCo sim2sim handles the split and needs none of these files."
+            )
     if cams:
         files = {}
         for cam in cams:

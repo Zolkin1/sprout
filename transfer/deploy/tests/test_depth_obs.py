@@ -13,6 +13,7 @@ Run: ``python transfer/deploy/tests/test_depth_obs.py``  (or via pytest)
 from __future__ import annotations
 
 import os
+import math
 import sys
 
 import numpy as np
@@ -21,7 +22,9 @@ import pytest
 _TRANSFER = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _TRANSFER)
 
-from deploy.depth_obs import (  # noqa: E402
+from deploy.depth_obs import (
+    REQUIRE_SAME_DEPTH_RESOLUTION,
+    camera_half_angles_rad,  # noqa: E402
     EXTERO_CLIP_NP,
     assert_depth_specs_agree,
     denormalize_depth_np,
@@ -211,19 +214,38 @@ def test_differing_camera_count_is_refused():
 
 @pytest.mark.parametrize(
     "field, value",
-    [("offset_quat_xyzw", [0.0, 0.5, 0.0, 0.866]), ("fx", 21.42), ("mount_body", "pelvis_link"),
+    [("offset_quat_xyzw", [0.0, 0.5, 0.0, 0.866]), ("mount_body", "pelvis_link"),
      ("max_distance", 12.0), ("scale", 0.25), ("clip", [-1.0, 1.0])],
 )
-def test_any_disagreement_names_the_field(field, value):
-    """Every contract field is checked, and the error says which one differs.
+def test_any_physical_disagreement_names_the_field(field, value):
+    """Every PHYSICAL contract field is checked, and the error says which one differs.
 
-    A mismatched mount or FOV is otherwise silent -- both networks accept the wrong
-    image and just behave worse.
+    A mismatched mount or range is otherwise silent -- both networks accept the wrong
+    image and just behave worse. These are refused whether or not the two artifacts are
+    allowed to sample at different resolutions; the sampling fields have their own tests
+    below.
     """
     a = parse_depth_spec([_cam()])
     b = parse_depth_spec([_cam(**{field: value})])
-    with pytest.raises(ValueError, match=f"depth_camera_near.{field}"):
-        assert_depth_specs_agree(a, b)
+    for strict in (True, False):
+        with pytest.raises(ValueError, match=f"depth_camera_near.{field}"):
+            assert_depth_specs_agree(a, b, require_same_resolution=strict)
+
+
+def test_a_changed_focal_length_is_reported_as_a_different_lens():
+    """``fx`` alone is not comparable once resolutions may differ -- the CONE is.
+
+    With the sampling relaxed, fx is expected to move (it is linear in the width), so it
+    is not compared field-wise. Moving it WITHOUT the width is a different lens, and the
+    half-angle check is what still catches that -- reported as the fov it changes rather
+    than as the field.
+    """
+    a = parse_depth_spec([_cam()])
+    b = parse_depth_spec([_cam(fx=21.42)])
+    with pytest.raises(ValueError, match="depth_camera_near.fx"):
+        assert_depth_specs_agree(a, b, require_same_resolution=True)
+    with pytest.raises(ValueError, match="different lenses"):
+        assert_depth_specs_agree(a, b, require_same_resolution=False)
 
 
 def test_obs_term_naming_is_not_a_disagreement():
@@ -322,6 +344,166 @@ def test_ingestion_rejects_differing_resolutions():
 def test_ingestion_of_no_cameras_is_empty():
     """A height-scan policy resolves an empty contract and ingests nothing."""
     assert normalize_camera_images([], []).size == 0
+
+
+##
+# Splitting the sampling: the generator may resample the policy's lenses
+##
+
+def _resampled_cam(scale: int, **overrides) -> dict:
+    """``_cam()`` sampled on a ``scale``x finer grid -- the SAME lens, more rays.
+
+    Derived the way the producer does it (``fx = width * focal / aperture``,
+    ``cx = width / 2``), so this is what a real second camera pair at another resolution
+    exports, not an approximation of one.
+    """
+    base = _cam()
+    w, h = int(base["width"]) * scale, int(base["height"]) * scale
+    cam = _cam(sensor="fm_depth_camera_near", width=w, height=h,
+               fx=float(base["fx"]) * scale, fy=float(base["fy"]) * scale,
+               cx=w / 2.0, cy=h / 2.0)
+    cam.update(overrides)
+    return cam
+
+
+def test_resolution_split_is_opt_in():
+    """A canary on the deployment-wide default, so re-tightening is a deliberate edit.
+
+    The relaxation exists only because the FM's vision input is being changed without
+    retraining the policy. When those converge again this flips back, and this test is what
+    makes that a decision rather than a drift.
+    """
+    assert REQUIRE_SAME_DEPTH_RESOLUTION is False
+
+
+def test_a_finer_sampling_of_the_same_lens_agrees():
+    """The point of the whole exercise: 2x the rays through the same cone is allowed."""
+    a = parse_depth_spec([_cam()])
+    b = parse_depth_spec([_resampled_cam(2)])
+    assert_depth_specs_agree(a, b, require_same_resolution=False)
+
+
+def test_a_finer_sampling_is_refused_when_strict():
+    """...and refused when the two are required to sample identically."""
+    a = parse_depth_spec([_cam()])
+    b = parse_depth_spec([_resampled_cam(2)])
+    with pytest.raises(ValueError, match="depth_camera_near.(width|height)"):
+        assert_depth_specs_agree(a, b, require_same_resolution=True)
+
+
+def test_a_different_lens_at_a_new_resolution_is_still_refused():
+    """THE test that the relaxation is not a hole.
+
+    Resizing without rescaling fx/fy is a narrower cone on a bigger grid -- a different
+    lens wearing a resampling's clothes. Dropping width/height from the comparison and
+    stopping there would have accepted it.
+    """
+    a = parse_depth_spec([_cam()])
+    b = parse_depth_spec([_resampled_cam(2, fx=float(_cam()["fx"]))])   # width doubled, fx not
+    with pytest.raises(ValueError, match="different lenses"):
+        assert_depth_specs_agree(a, b, require_same_resolution=False)
+
+
+def test_an_off_centre_principal_point_is_refused_even_when_the_total_fov_matches():
+    """Half-angles, not their SUM: a camera can match the total FOV and still be wrong.
+
+    Comparing the summed horizontal FOV would be the obvious cheaper check, and this is the
+    camera it lets through: the principal point is pushed off-centre and the focal length
+    re-solved so the two half-angles trade off to the same total. Every pixel maps to a
+    different ray than the policy's camera, and a total-FOV check cannot see it.
+
+    ``fx`` has to be solved for numerically because ``atan`` is not linear -- at fixed
+    ``fx`` the sum is maximal at ``cx = W/2``, so no other principal point can match it.
+    """
+    base = _cam()
+    target = sum(camera_half_angles_rad(base)[:2])
+    shifted = _resampled_cam(2)
+    width = float(shifted["width"])
+    shifted["cx"] = width * 0.35                       # deliberately off-centre
+
+    def h_sum(fx: float) -> float:
+        return (math.atan(shifted["cx"] / fx)
+                + math.atan((width - shifted["cx"]) / fx))
+
+    lo, hi = 1e-3, 1e4                                  # h_sum decreases in fx
+    for _ in range(200):
+        mid = 0.5 * (lo + hi)
+        lo, hi = (mid, hi) if h_sum(mid) > target else (lo, mid)
+    shifted["fx"] = 0.5 * (lo + hi)
+
+    a, b = parse_depth_spec([base]), parse_depth_spec([shifted])
+    left, right, _, _ = camera_half_angles_rad(shifted)
+    assert (left + right) == pytest.approx(target, abs=1e-9), "fixture is not a wash"
+    assert abs(left - right) > 0.05, "fixture is not actually off-centre"
+    with pytest.raises(ValueError, match="hfov_(left|right)"):
+        assert_depth_specs_agree(a, b, require_same_resolution=False)
+
+
+def test_physical_fields_are_refused_across_a_split_sampling():
+    """Relaxing the grid must not relax the camera: a moved mount still fails."""
+    a = parse_depth_spec([_cam()])
+    b = parse_depth_spec([_resampled_cam(2, mount_body="pelvis_link")])
+    with pytest.raises(ValueError, match="depth_camera_near.mount_body"):
+        assert_depth_specs_agree(a, b, require_same_resolution=False)
+
+
+##
+# The convolutional fold: (H, W) is load-bearing, not just H*W
+##
+
+def _fm_ctx(**overrides):
+    """A minimal :class:`FmContext` stand-in for ``_resolve_depth_cameras``."""
+    from types import SimpleNamespace
+    base = dict(extero_source="depth", extero_sensor_count=2, extero_sensor_dim=30 * 26,
+                extero_spec=[],
+                extero_encoder="cnn", extero_image_hw=[(26, 30), (26, 30)],
+                extero_tokens_per_sensor=16)
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def _resolve(ctx, spec):
+    """Run ``GenTrackerPolicy._resolve_depth_cameras`` against a hand-built context."""
+    from types import SimpleNamespace
+    from deploy.gen_tracker import GenTrackerPolicy
+    policy = object.__new__(GenTrackerPolicy)
+    policy.ctx = ctx
+    policy._trk = SimpleNamespace(get_depth_camera_spec=lambda: list(spec))
+    GenTrackerPolicy._resolve_depth_cameras(policy)
+    return policy._depth_spec
+
+
+def test_matching_fold_is_accepted():
+    """The shipped pairing: contract HxW equals what the graph folds."""
+    spec = [_cam(), _far_cam()]
+    assert len(_resolve(_fm_ctx(), spec)) == 2
+
+
+def test_transposed_camera_is_refused_by_the_fold_check():
+    """30x26 and 26x30 are the SAME pixel count and different images.
+
+    The pixel-count check passes either way, so before the fold shape travelled this was
+    undetectable -- a convolution would read every kernel's neighbourhood off a transposed
+    frame with every tensor the right size. Only reachable for a convolutional graph, which
+    is the only one it can hurt.
+    """
+    spec = [_cam(width=26, height=30), _far_cam(width=26, height=30)]
+    with pytest.raises(ValueError, match="transposed image is scrambled"):
+        _resolve(_fm_ctx(), spec)
+
+
+def test_a_flat_graph_does_not_check_the_fold():
+    """An MLP graph carries no image shape, and genuinely does not care about pixel order."""
+    spec = [_cam(width=26, height=30), _far_cam(width=26, height=30)]
+    assert len(_resolve(_fm_ctx(extero_encoder="mlp", extero_image_hw=[],
+                                extero_tokens_per_sensor=1), spec)) == 2
+
+
+def test_pixel_count_mismatch_is_still_refused():
+    """The pre-existing width check must survive alongside the new fold check."""
+    spec = [_cam(width=10, height=6), _far_cam(width=10, height=6)]
+    with pytest.raises(ValueError, match="wide"):
+        _resolve(_fm_ctx(extero_image_hw=[(6, 10), (6, 10)]), spec)
 
 
 if __name__ == "__main__":

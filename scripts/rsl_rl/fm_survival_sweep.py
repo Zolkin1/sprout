@@ -130,7 +130,8 @@ only way back. Each step feeds the next.
    KNOWN GAP: the -play task strips resample_depth_noise + the camera extrinsics/intrinsics DR,
    so the recorded depth is CLEAN at the nominal camera pose -- while the teacher trained on
    noisy depth from randomized poses, and at deploy ONE image feeds both. Use the non-play task
-   (G1-teacher-clf-terrain-depth) to keep it, and then set noise_depth=0 or it double-counts.
+   (G1-teacher-clf-terrain-depth) to keep it -- the FM adds no noise of its own to make up for
+   a clean recording.
    Barely matters on flat (depth is near-constant); it matters a lot on terrain.
 
 4. GENERATOR (27.3M XL, 40 epochs, ~4 min/epoch, body-pose OFF):

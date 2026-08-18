@@ -58,11 +58,15 @@ class DepthNoiseCfg:
     dropout_val: float = 0.0
     """Pre-normalisation value assigned to dropped pixels."""
 
-    height: int = MISSING
-    """Image height in pixels (must match the depth camera)."""
+    height: int | None = None
+    """Image height in pixels. ``None`` = resolve from the camera (the default).
 
-    width: int = MISSING
-    """Image width in pixels (must match the depth camera)."""
+    Resolved by :func:`ensure_depth_noiser` off the sensor's own ``pattern_cfg``, so ONE
+    cfg can serve cameras of different resolutions and no task restates a number the
+    sensor already carries. An explicit value is still honoured, and still has to match."""
+
+    width: int | None = None
+    """Image width in pixels. ``None`` = resolve from the camera. See :attr:`height`."""
 
     offset: float = MISSING
     """``offset`` from the matching observation term, used to normalise the dropout value."""
@@ -100,8 +104,13 @@ class DepthNoiser:
         self.cfg = cfg
         self.device = device
         self.num_envs = num_envs
-        self._H = cfg.height
-        self._W = cfg.width
+        if cfg.height is None or cfg.width is None:
+            raise ValueError(
+                "DepthNoiser needs a concrete height/width; build it through "
+                "ensure_depth_noiser, which resolves them from the camera."
+            )
+        self._H = int(cfg.height)
+        self._W = int(cfg.width)
 
         self._sigma = torch.zeros((num_envs, 1), device=device)
 
@@ -120,31 +129,68 @@ class DepthNoiser:
 
         self.reset()
 
-    def reset(self, env_ids: Sequence[int] | torch.Tensor | None = None) -> None:
+    def reset(
+        self,
+        env_ids: Sequence[int] | torch.Tensor | None = None,
+        plane_coeffs: torch.Tensor | None = None,
+        sigma: torch.Tensor | None = None,
+    ) -> None:
         """Re-sample the per-episode blur kernel and plane bias.
+
+        ``plane_coeffs`` / ``sigma`` let a caller ADOPT another camera's draw instead of
+        making its own, which is what makes two sampled views of one physical camera share
+        a mis-calibration. The plane is then re-derived on THIS noiser's own grid: the bias
+        is ``a*x + b*y + c`` over a NORMALIZED grid, so identical coefficients are the same
+        physical tilted plane whatever the resolution. ``sigma`` is in pixels, so sharing it
+        means the same kernel width and therefore a slightly different angular blur extent
+        -- defensible (blur is a per-pixel sensor/ISP property) but a modelling choice.
 
         Args:
             env_ids: Environments to re-sample. ``None`` re-samples all.
+            plane_coeffs: ``(len(env_ids), 3)`` coefficients to adopt, or ``None`` to draw.
+            sigma: ``(len(env_ids), 1)`` blur sigma to adopt, or ``None`` to draw.
         """
         if env_ids is None:
             env_ids = slice(None)
 
         # Blur kernel.
-        self._sigma[env_ids] = self.cfg.sigma_noise_cfg.func(self._sigma[env_ids], self.cfg.sigma_noise_cfg)
+        if sigma is None:
+            self._sigma[env_ids] = self.cfg.sigma_noise_cfg.func(
+                self._sigma[env_ids], self.cfg.sigma_noise_cfg
+            )
+        else:
+            self._sigma[env_ids] = sigma.to(self.device)
         sigma_sq = (self._sigma[env_ids] ** 2).unsqueeze(1).clamp(min=1e-12)
         kernel = torch.exp(-self._dist_sq / (2 * sigma_sq))
         kernel = kernel / kernel.sum(dim=-1, keepdim=True)
         self._kernel[env_ids] = kernel
 
         # Plane coefficients, rescaled so the peak deviation matches the target.
-        n = self._plane[env_ids].shape[0]
-        coeffs = torch.randn(n, 3, device=self.device)
-        max_dev = coeffs.abs().sum(dim=-1, keepdim=True).clamp(min=1e-12)
-        target = torch.rand(n, 1, device=self.device) * self.cfg.max_plane_deviation
-        coeffs = coeffs * (target / max_dev)
+        if plane_coeffs is None:
+            n = self._plane[env_ids].shape[0]
+            coeffs = torch.randn(n, 3, device=self.device)
+            max_dev = coeffs.abs().sum(dim=-1, keepdim=True).clamp(min=1e-12)
+            target = torch.rand(n, 1, device=self.device) * self.cfg.max_plane_deviation
+            coeffs = coeffs * (target / max_dev)
+        else:
+            coeffs = plane_coeffs.to(self.device)
         self._plane_coeffs[env_ids] = coeffs
         a, b, c = coeffs[:, 0:1], coeffs[:, 1:2], coeffs[:, 2:3]
         self._plane[env_ids] = a * self._grid_x + b * self._grid_y + c
+
+    def episode_state(
+        self, env_ids: Sequence[int] | torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The per-episode draw, for another noiser to adopt via :meth:`reset`.
+
+        Args:
+            env_ids: Environments to read. ``None`` reads all.
+
+        Returns:
+            ``(plane_coeffs, sigma)`` clones for those environments.
+        """
+        idx = slice(None) if env_ids is None else env_ids
+        return self._plane_coeffs[idx].clone(), self._sigma[idx].clone()
 
     def __call__(self, data: torch.Tensor) -> torch.Tensor:
         """Apply the noise to a normalised depth image.
@@ -182,6 +228,10 @@ class DepthNoiser:
 def ensure_depth_noiser(env, name: str, cfg: DepthNoiseCfg) -> DepthNoiser:
     """Fetch the noiser registered for ``name``, constructing it on first use.
 
+    The image resolution is resolved from the CAMERA when ``cfg`` leaves it unset, so one
+    shared cfg can serve cameras that sample at different resolutions -- and so a task
+    cannot restate a resolution and have it silently disagree with the sensor it belongs to.
+
     Args:
         env: The environment instance.
         name: Scene name of the depth camera the noiser belongs to.
@@ -189,12 +239,25 @@ def ensure_depth_noiser(env, name: str, cfg: DepthNoiseCfg) -> DepthNoiser:
 
     Returns:
         The cached :class:`DepthNoiser`.
+
+    Raises:
+        ValueError: If ``cfg`` states a resolution that the camera contradicts.
     """
     registry = getattr(env, _ENV_ATTR, None)
     if registry is None:
         registry = {}
         setattr(env, _ENV_ATTR, registry)
     if name not in registry:
+        pattern = env.scene[name].cfg.pattern_cfg
+        cam_h, cam_w = int(pattern.height), int(pattern.width)
+        if cfg.height is not None and cfg.width is not None:
+            if (int(cfg.height), int(cfg.width)) != (cam_h, cam_w):
+                raise ValueError(
+                    f"DepthNoiseCfg for '{name}' says {cfg.height}x{cfg.width} but the camera "
+                    f"samples {cam_h}x{cam_w}. Leave height/width unset to take the camera's."
+                )
+        else:
+            cfg = cfg.replace(height=cam_h, width=cam_w)
         registry[name] = DepthNoiser(cfg, env.num_envs, env.device)
     return registry[name]
 

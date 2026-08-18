@@ -1,0 +1,349 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""Generate a MuJoCo scene holding EXACTLY ONE tile from a clip library, as Isaac builds it.
+
+``generate_stairs_scene.py`` emits an in-distribution *playground*: stairs whose rise, run
+and width are drawn from the training distribution, but which are not any particular trained
+tile.  That is the right thing for a joystick session and the wrong thing for a bisect --
+when the generator misreads a staircase you want the staircase it was trained on, not one
+like it.  This emits that: one manifest tile, geometry for geometry.
+
+**The geometry is not re-derived.**  The clip library's ``terrain_manifest`` is the artifact
+the generators EMIT and the RL side re-reads (``clip_terrain_loader._overlays_from_manifest``
+builds Isaac's tile from these same dicts), so reading it here is reading the one producer,
+not a second opinion.  ``source/robot_rl/tests/test_clip_tile_scene.py`` casts a height field
+over both this scene and the loader's own trimesh tile and requires them to agree.
+
+What a stairs_up TRANSITION tile actually is, which is the thing the playground gets wrong::
+
+    22.86 x 4.46 m floor
+    + 10.1 m platform at 0.13 m          <- the robot approaches ALREADY one step up
+    + 3 steps, 0.22 m tread, 0.955 m wide, at y = 1.87 of a 4.46 m tile   <- OFF-CENTRE
+    + 10.1 m platform at 0.39 m
+
+i.e. a 0.26 m climb over three narrow treads between two long platforms -- not a flight of
+six 0.15 m risers on open ground.
+
+Frame: the tile is translated so the SPAWN POINT is the world origin and the terrain under it
+is z = 0, so the robot spawns exactly as it does on flat ground (no ``--spawn_z_offset`` to
+remember, and nothing spawns inside a slab).  By default the spawn point is on the approach
+platform, ``--approach`` metres before the first riser and laterally centred **on the
+flight**, so driving straight ahead walks the stairs.
+
+Run from ``transfer/sim`` (so the output lands next to the other scenes)::
+
+    python generate_clip_tile_scene.py --clip ../../clips/_tile_stairs_up.h5 --robot g1_29j
+    python gen_tracker_runner.py --load_run <run> --robot_name g1_29j --scene tile0_scene ...
+
+No isaaclab and no torch: h5py + numpy only, like the rest of ``transfer/``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+
+import h5py
+import numpy as np
+
+from generate_stairs_scene import scene_xml
+
+#: An overlay whose x extent is at most this is a STEP rather than a platform or a box.
+#: Trained treads top out at 0.28 m (``generate_stairs_scene.TRAINED_TREADS``); the platforms
+#: they sit between are metres deep, so anything in between is neither and is not used to
+#: place the spawn.
+_STEP_MAX_TREAD_M = 0.60
+
+#: Thickness of the emitted tile floor slab (m). A finite box, not the infinite plane: the
+#: Isaac tile's floor spans its footprint and stops, and walking off the edge is a real
+#: property of the tile. ``--infinite_floor`` restores the plane when that gets in the way.
+_FLOOR_THICKNESS_M = 0.5
+
+
+def load_tile(clip_path: str, terrain_id: int | None) -> tuple[dict, dict]:
+    """Read one tile's manifest entry from a clip library.
+
+    Args:
+        clip_path: Path to the clip ``.h5``.
+        terrain_id: Which tile to take. ``None`` takes the only tile when the library has
+            one, and refuses otherwise rather than picking for you.
+
+    Returns:
+        ``(entry, info)`` -- the manifest entry, and provenance for the scene header.
+
+    Raises:
+        ValueError: When the library has no manifest, when ``terrain_id`` is absent from it,
+            or when it is ``None`` and the library describes more than one tile.
+    """
+    with h5py.File(clip_path, "r") as f:
+        raw = f.attrs.get("terrain_manifest")
+        if raw is None:
+            raise ValueError(f"{clip_path} carries no 'terrain_manifest'; it describes no "
+                             "terrain, so there is no tile to build.")
+        manifest = json.loads(raw)
+        info = {
+            "clip": os.path.basename(clip_path),
+            "fingerprint": str(f.attrs.get("clip_fingerprint", "?")),
+            "num_clips": int(f.attrs.get("num_clips", 0)),
+        }
+    by_id = {int(m["terrain_id"]): m for m in manifest}
+    if terrain_id is None:
+        if len(by_id) != 1:
+            raise ValueError(
+                f"{clip_path} describes {len(by_id)} tiles ({sorted(by_id)[:8]}...); pass "
+                "--terrain_id to say which one. Picking silently would put the robot on a "
+                "different staircase than the one you meant to bisect."
+            )
+        terrain_id = next(iter(by_id))
+    if terrain_id not in by_id:
+        raise ValueError(f"{clip_path} has no terrain_id {terrain_id}; it has "
+                         f"{sorted(by_id)[:12]}{'...' if len(by_id) > 12 else ''}.")
+    entry = by_id[terrain_id]
+    info["terrain_id"] = terrain_id
+    info["family"] = str(entry.get("family", "?"))
+    info["type"] = str(entry.get("type", "?"))
+    return entry, info
+
+
+def solid_overlays(entry: dict) -> list[dict]:
+    """The tile's overlay volumes, refusing any this emitter cannot represent exactly.
+
+    Args:
+        entry: A manifest tile entry.
+
+    Returns:
+        The overlay dicts, in manifest order.
+
+    Raises:
+        ValueError: On a non-box kind or a non-solid variant. A ``floating`` overlay is a
+            slab on legs (``blocks/overlay.py``), which is several geoms and different
+            contact behaviour -- emitting its bounding box instead would look right in the
+            viewer and be wrong under the foot, which is the failure mode this whole file
+            exists to avoid.
+    """
+    out = []
+    for i, ov in enumerate(entry.get("overlays", [])):
+        kind, variant = str(ov.get("kind", "box")), str(ov.get("variant", "solid"))
+        if kind != "box" or variant != "solid":
+            raise ValueError(
+                f"tile {entry.get('terrain_id')} overlay {i} is kind='{kind}' "
+                f"variant='{variant}', which this emitter cannot reproduce exactly (only "
+                "solid boxes). Extend it before using this tile, rather than accepting an "
+                "approximation of the geometry you came here to be exact about."
+            )
+        out.append(ov)
+    return out
+
+
+def terrain_top_at(overlays: list[dict], x: float, y: float) -> float:
+    """Height of the terrain at a point in tile-local coordinates.
+
+    Args:
+        overlays: Solid box overlays (see :func:`solid_overlays`).
+        x: Tile-local x (m).
+        y: Tile-local y (m).
+
+    Returns:
+        The top z (m) of the highest overlay covering the point, or 0.0 (the tile floor).
+
+    Raises:
+        NotImplementedError: If a covering overlay is yawed, where "covers this point" is not
+            an axis-aligned test.
+    """
+    top = 0.0
+    for ov in overlays:
+        if abs(float(ov.get("yaw", 0.0))) > 1e-9:
+            raise NotImplementedError(
+                "terrain_top_at does not handle a yawed overlay; pass --spawn_xy explicitly."
+            )
+        (px, py), (sx, sy, sz) = ov["pos_xy"], ov["size_xyz"]
+        if abs(x - px) <= sx / 2.0 and abs(y - py) <= sy / 2.0:
+            top = max(top, float(ov.get("base_z", 0.0)) + float(sz))
+    return top
+
+
+def first_step(overlays: list[dict]) -> dict | None:
+    """The lowest-x step-like overlay -- the first riser of the flight -- or ``None``.
+
+    Args:
+        overlays: Solid box overlays.
+
+    Returns:
+        The overlay dict, or ``None`` when the tile has no tread-sized overlay (a box tile,
+        a bare platform).
+    """
+    steps = [ov for ov in overlays if float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M]
+    return min(steps, key=lambda ov: float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0) \
+        if steps else None
+
+
+def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[float, float, str]:
+    """Where the robot should stand, in tile-local metres.
+
+    On the approach, ``approach`` metres before the first riser and laterally centred on the
+    flight -- so "walk straight ahead" is the experiment, with no steering to confound it.
+    The flight is often OFF the tile centreline (0.36 m on the shipped stairs_up tile), which
+    is exactly the offset a tile-centred spawn would silently introduce.
+
+    Args:
+        entry: The manifest tile entry.
+        overlays: Solid box overlays.
+        approach: Distance (m) from the spawn to the first riser's front face.
+
+    Returns:
+        ``(x, y, why)`` -- the point and a one-line explanation for the log.
+    """
+    step = first_step(overlays)
+    if step is None:
+        return (float(entry["size_x"]) / 2.0, float(entry["size_y"]) / 2.0,
+                "tile centre (no step-like overlay to aim at)")
+    front = float(step["pos_xy"][0]) - float(step["size_xyz"][0]) / 2.0
+    return (front - approach, float(step["pos_xy"][1]),
+            f"{approach:.2f} m before the first riser (tile-local x={front:.3f}), "
+            f"on the flight's centreline (y={float(step['pos_xy'][1]):.3f})")
+
+
+def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,
+              yaw: float, material: str = "box_material") -> str:
+    """One MuJoCo box geom line in the raycast/collision group."""
+    quat = f' quat="{math.cos(yaw / 2.0):.9f} 0 0 {math.sin(yaw / 2.0):.9f}"' if yaw else ""
+    return (f'        <geom name="{name}" type="box" material="{material}" group="2" '
+            f'size="{sx / 2.0:.6f} {sy / 2.0:.6f} {sz / 2.0:.6f}" '
+            f'pos="{cx:.6f} {cy:.6f} {cz:.6f}"{quat}/>')
+
+
+def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, float],
+               infinite_floor: bool) -> tuple[list[str], str]:
+    """Emit the tile's geometry, translated so ``origin`` (tile-local) is the world origin.
+
+    Every overlay is a full-height pillar from its ``base_z``, which is how the training
+    tiles are built (step ``n`` spans ``z in [0, n*rise]``) and how the MuJoCo playground
+    builds them too -- so the tread tops and risers are clean and a foot cannot catch in a
+    seam.
+
+    Args:
+        entry: The manifest tile entry.
+        overlays: Solid box overlays.
+        origin: ``(x, y, z)`` tile-local point to place at the world origin.
+        infinite_floor: Emit the checkered infinite plane instead of the tile's own floor.
+
+    Returns:
+        ``(geom_lines, floor_line)``.
+    """
+    ox, oy, oz = origin
+    lines = []
+    for i, ov in enumerate(overlays):
+        (px, py), (sx, sy, sz) = ov["pos_xy"], ov["size_xyz"]
+        base_z = float(ov.get("base_z", 0.0))
+        step = float(sx) <= _STEP_MAX_TREAD_M
+        lines.append(_box_geom(
+            f"tile_{'step' if step else 'slab'}{i}",
+            float(px) - ox, float(py) - oy, base_z + float(sz) / 2.0 - oz,
+            float(sx), float(sy), float(sz), float(ov.get("yaw", 0.0)),
+        ))
+
+    if infinite_floor or not bool(entry.get("has_floor", True)):
+        # has_floor=False is an isolated structure (a floating staircase): Isaac gives it NO
+        # ground plane, so a robot that steps off falls to infinity. Keep the plane there so
+        # a run ends on the floor rather than in the void.
+        return lines, ('        <geom name="floor" size="0 0 0.05" type="plane" '
+                       f'material="groundplane" group="2" pos="0 0 {-oz:.6f}"/>')
+    size_x, size_y = float(entry["size_x"]), float(entry["size_y"])
+    floor = _box_geom("tile_floor", size_x / 2.0 - ox, size_y / 2.0 - oy,
+                      -_FLOOR_THICKNESS_M / 2.0 - oz, size_x, size_y, _FLOOR_THICKNESS_M,
+                      0.0, material="groundplane")
+    return lines, floor
+
+
+def main() -> None:
+    """Parse CLI arguments and write the generated single-tile scene XML."""
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--clip", required=True, help="Clip library .h5 carrying the terrain_manifest.")
+    p.add_argument("--terrain_id", type=int, default=None,
+                   help="Tile to build (default: the only tile, else required).")
+    p.add_argument("--robot", default="g1_29j", help="Robot model to include; names the output.")
+    p.add_argument("--scene", default=None,
+                   help="Scene name; output is robots/g1/<robot>_<scene>.xml "
+                        "(default: tile<terrain_id>_scene).")
+    p.add_argument("--out", default=None, help="Explicit output path.")
+    p.add_argument("--approach", type=float, default=2.5,
+                   help="Metres of approach between the spawn and the first riser (default "
+                        "2.5, matching generate_stairs_scene's --x_start so the two scenes "
+                        "give the robot the same run-up).")
+    p.add_argument("--spawn_xy", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                   help="Spawn point in TILE-LOCAL metres, overriding --approach.")
+    p.add_argument("--infinite_floor", action="store_true", default=False,
+                   help="Use the checkered infinite plane instead of the tile's own finite "
+                        "floor. The tile floor stops at the footprint, as in Isaac, so the "
+                        "robot can walk off the edge; this trades that fidelity for runs "
+                        "that cannot end that way.")
+    args = p.parse_args()
+
+    entry, info = load_tile(args.clip, args.terrain_id)
+    overlays = solid_overlays(entry)
+    if args.spawn_xy is not None:
+        sx, sy = args.spawn_xy
+        why = "--spawn_xy"
+    else:
+        sx, sy, why = spawn_point(entry, overlays, args.approach)
+    sz = terrain_top_at(overlays, sx, sy)
+    geoms, floor = tile_geoms(entry, overlays, (sx, sy, sz), args.infinite_floor)
+
+    scene = args.scene or f"tile{info['terrain_id']}_scene"
+    header = (
+        f"Generated by generate_clip_tile_scene.py: terrain_id {info['terrain_id']} "
+        f"({info['type']}, {info['family']})\n"
+        f"         copied geometry for geometry out of {info['clip']} "
+        f"(fingerprint {info['fingerprint'][:16]}).\n"
+        f"         This is ONE Isaac tile, not an in-distribution lookalike; see that "
+        f"script's docstring for the difference.\n"
+        f"         Tile-local ({sx:.3f}, {sy:.3f}, {sz:.3f}) is the world origin: "
+        f"{why}.\n"
+        f"         Footprint {float(entry['size_x']):.2f} x {float(entry['size_y']):.2f} m, "
+        f"{len(overlays)} overlay(s), has_floor={bool(entry.get('has_floor', True))}."
+    )
+    xml = scene_xml(f"{args.robot}.xml", header, "\n".join(geoms), floor,
+                    model=f"g1_tile{info['terrain_id']}_scene")
+
+    out_path = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "robots", "g1", f"{args.robot}_{scene}.xml")
+    with open(out_path, "w") as f:
+        f.write(xml)
+
+    print(f"[INFO] Wrote {out_path}")
+    print(f"[INFO] tile {info['terrain_id']} ({info['type']}, {info['family']}) from "
+          f"{info['clip']}: {float(entry['size_x']):.2f} x {float(entry['size_y']):.2f} m, "
+          f"{len(overlays)} overlay(s)")
+    print(f"[INFO] spawn: tile-local ({sx:.3f}, {sy:.3f}) at terrain z={sz:.3f} m -> world "
+          f"origin ({why})")
+    for i, ov in enumerate(overlays):
+        (px, py), (osx, osy, osz) = ov["pos_xy"], ov["size_xyz"]
+        kind = "step " if float(osx) <= _STEP_MAX_TREAD_M else "slab "
+        print(f"       - {kind}{i}: {osx:.3f} x {osy:.3f} x {osz:.3f} m, top "
+              f"z={float(ov.get('base_z', 0.0)) + osz - sz:+.3f} m at world "
+              f"(x={px - sx:+.3f}, y={py - sy:+.3f})")
+    # The first RISER is the first overlay whose top is above the spawn, which is not
+    # necessarily the first step-like one: on the shipped stairs_up tile the leading tread is
+    # flush with the approach platform, so the tile climbs in 2 risers of 0.13 m and not the
+    # 3 that counting step overlays suggests.
+    ups = sorted(
+        ((float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0 - sx,
+          float(ov.get("base_z", 0.0)) + float(ov["size_xyz"][2]) - sz) for ov in overlays),
+        key=lambda t: t[0],
+    )
+    risers, last = [], 0.0
+    for front, top in ups:
+        if top > last + 1e-6:
+            risers.append((front, top - last))
+            last = top
+    if risers:
+        print("[INFO] climb from the spawn, drive +x: "
+              + ", ".join(f"+{d:.3f} m at x={x:+.3f}" for x, d in risers)
+              + f" (total {last:.3f} m over {len(risers)} riser(s))")
+
+
+if __name__ == "__main__":
+    main()

@@ -42,7 +42,11 @@ _TRANSFER = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _TRANSFER not in sys.path:
     sys.path.insert(0, _TRANSFER)
 
-from deploy.depth_obs import invalid_depth_value, normalize_depth_np  # noqa: E402
+from deploy.depth_obs import (  # noqa: E402
+    invalid_depth_value,
+    normalize_depth_np,
+    pinhole_ray_directions,
+)
 from deploy.quat_math_np import matrix_from_quat  # noqa: E402
 
 #: MuJoCo geom group holding the robot's per-link visual meshes (self-occlusion).
@@ -74,35 +78,6 @@ NOISE_SIGMA_MAX = 0.33
 NOISE_DROPOUT_PROB = 0.02
 #: Raw depth (metres) a dropped pixel is written as, before normalisation.
 NOISE_DROPOUT_VAL = 0.0
-
-
-def pinhole_ray_directions(width: int, height: int, fx: float, fy: float,
-                           cx: float, cy: float) -> np.ndarray:
-    """Unit ray directions in the camera frame, matching IsaacLab's pinhole pattern.
-
-    Reproduces ``isaaclab.sensors.ray_caster.patterns.pinhole_camera_pattern``: pixel
-    CENTRES through the inverse intrinsic matrix, then mapped into the robotics camera
-    frame (x = optical axis, y = left, z = up).  Row-major flat order ``k = v * width + u``
-    with ``v = 0`` the TOP image row (camera +z) and ``u = 0`` the LEFT column (camera +y).
-    The rays are tangent-linear (a true pinhole), not equiangular.
-
-    Args:
-        width: Image width in pixels.
-        height: Image height in pixels.
-        fx: Horizontal focal length in pixels.
-        fy: Vertical focal length in pixels.
-        cx: Horizontal principal point in pixels.
-        cy: Vertical principal point in pixels.
-
-    Returns:
-        Unit directions ``(width * height, 3)``, float64.
-    """
-    u, v = np.meshgrid(np.arange(width, dtype=np.float64),
-                       np.arange(height, dtype=np.float64), indexing="xy")
-    dirs = np.stack(
-        [np.ones_like(u), -(u + 0.5 - cx) / fx, -(v + 0.5 - cy) / fy], axis=-1
-    ).reshape(-1, 3)
-    return dirs / np.linalg.norm(dirs, axis=-1, keepdims=True)
 
 
 def quat_xyzw_to_matrix(quat_xyzw) -> np.ndarray:
@@ -333,6 +308,41 @@ class MujocoDepthCameras:
             )
             euler = rng.uniform(-1.0, 1.0, 3) * np.asarray(rot_range, dtype=np.float64)
             cam.offset_rot = cam.nominal_offset_rot @ _euler_xyz_to_matrix(euler)
+
+    def mirror_extrinsics_from(self, other: "MujocoDepthCameras") -> None:
+        """Adopt another instance's sampled mount poses, camera by camera.
+
+        For the case where the generator samples the same physical lenses on its own grid:
+        one camera cannot be in two places, so the two casters must share the mount
+        perturbation. Mirrors ``mdp.events.depth.randomize_camera_extrinsics`` with a
+        ``sensor_cfgs`` list on the IsaacLab side, so sim2sim reproduces the same coupling.
+
+        Only the mount is copied -- the per-frame noise draws stay independent, since they
+        cannot be shared across differing pixel counts anyway.
+
+        Args:
+            other: The caster whose sampled mounts to adopt (typically the tracker's).
+
+        Raises:
+            ValueError: On a camera-count mismatch, or if a corresponding pair does not
+                share a NOMINAL mount -- which would mean they are not one physical camera
+                and must not share a perturbation.
+        """
+        if len(self.cameras) != len(other.cameras):
+            raise ValueError(
+                f"cannot mirror mounts: {len(self.cameras)} camera(s) here against "
+                f"{len(other.cameras)} there."
+            )
+        for mine, theirs in zip(self.cameras, other.cameras):
+            if not (np.allclose(mine.nominal_offset_pos, theirs.nominal_offset_pos, atol=1e-9)
+                    and np.allclose(mine.nominal_offset_rot, theirs.nominal_offset_rot,
+                                    atol=1e-9)):
+                raise ValueError(
+                    f"'{mine.sensor}' and '{theirs.sensor}' do not share a nominal mount, so they "
+                    "are not two samplings of one physical camera."
+                )
+            mine.offset_pos = theirs.offset_pos.copy()
+            mine.offset_rot = theirs.offset_rot.copy()
 
     def compute(self, mj_data, want_hits: bool = False):
         """Cast every camera and return the normalised images (and optionally hit points).
