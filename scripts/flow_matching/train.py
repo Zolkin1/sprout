@@ -338,12 +338,16 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "the history may be perturbed (learn recovery refs from a bad-state history); 'all' uses "
              "every window. Recordings without 'perturb_active' always use all windows.",
     )
-    parser.add_argument("--d_model", type=int, default=256)
-    parser.add_argument("--nhead", type=int, default=8)
-    parser.add_argument("--num_layers", type=int, default=4)
-    parser.add_argument("--dim_feedforward", type=int, default=512)
-    parser.add_argument("--dropout", type=float, default=0.0)
-    parser.add_argument("--num_sampling_steps", type=int, default=8)
+    # Rendered from the dataclass, never restated: these six sat here as literals and drifted
+    # the moment the shipped architecture grew to 27M, so the CLI silently built a 256-wide
+    # 4-layer model while config.py documented 512/8. Same rule as every other flag.
+    _arch = FlowMatchingConfig()
+    parser.add_argument("--d_model", type=int, default=_arch.d_model)
+    parser.add_argument("--nhead", type=int, default=_arch.nhead)
+    parser.add_argument("--num_layers", type=int, default=_arch.num_layers)
+    parser.add_argument("--dim_feedforward", type=int, default=_arch.dim_feedforward)
+    parser.add_argument("--dropout", type=float, default=_arch.dropout)
+    parser.add_argument("--num_sampling_steps", type=int, default=_arch.num_sampling_steps)
     # Loss-weight CLI flags default to the FlowMatchingConfig() values, so config.py is the
     # single source of truth -- editing a default there changes a plain `train.py` run (a
     # bare `default=0.0` here would silently override the config and disable the loss).
@@ -390,7 +394,12 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         help="Clip library to join clip_id/clip_step against for --transition_fraction. "
              "Default: the path recorded in the .h5. Its sha256 is verified either way.",
     )
-    parser.add_argument("--skip_distractors", action="store_true", default=_wc.skip_distractors,
+    # BooleanOptionalAction, not store_true: the default is now ON, and a store_true flag can
+    # only ever turn a knob on -- so the off position would be unreachable from the CLI, which
+    # is the same "the config says one thing and the command line cannot say the other" bug
+    # test_train_cli_defaults exists to catch.
+    parser.add_argument("--skip_distractors", action=argparse.BooleanOptionalAction,
+                        default=_wc.skip_distractors,
                         help="Drop DISTRACTOR-family windows (boxes the robot walks AROUND, not "
                              "onto). Train-time switch -- recordings tag every window with "
                              "'is_distractor', so A/B-ing needs no re-record. Errors if the "

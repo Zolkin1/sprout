@@ -122,12 +122,24 @@ def test_the_shipped_depth_architecture_survives_the_command_line():
     values a run banner should print, so a failure here says what the architecture became.
     """
     cfg = _cfg_from_bare_cli()
+    # Exteroception.
     assert cfg.extero_source == "depth"
     assert cfg.resolve_extero_encoder() == "cnn"
     assert cfg.resolve_extero_channels() == 5
     assert list(cfg.extero_cnn_strides) == [1, 2, 2]
     assert cfg.extero_norm_mode == "contract"
     assert cfg.resolve_extero_clip() == pytest.approx(5.575)
+    assert cfg.extero_xyz_scale == pytest.approx(3.0)
+    # Architecture: the 27M "XL" transformer the working generator was built at.
+    assert (cfg.d_model, cfg.nhead, cfg.num_layers, cfg.dim_feedforward) == (512, 8, 8, 2048)
+    # Training recipe: the flags the MVP run passed, now defaults so no run has to recall them.
+    assert cfg.pinned_axis_loss_weight == pytest.approx(20.0)
+    assert cfg.lr_warmup_steps == 500
+    assert cfg.fk_pose_weight == pytest.approx(0.0)
+    assert cfg.joint_vel_consistency_weight == pytest.approx(0.0)
+    assert cfg.skip_distractors is True
+    assert cfg.attention_mode == "prefix"
+    assert cfg.num_epochs == 100
 
 
 def test_the_declared_xyz_constants_are_settable_from_the_command_line():

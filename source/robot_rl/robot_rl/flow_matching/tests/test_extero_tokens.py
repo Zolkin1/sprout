@@ -80,7 +80,9 @@ def _cfg(**kw) -> FlowMatchingConfig:
     #: ``test_the_shipped_default_widens_a_depth_row_to_five_channels``.
     base = dict(num_history_states=2, future_len=6, cmd_array="target_vel", cmd_stride=4,
                 target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
-                extero_channels=1)
+                # Unweighted: the shipped 20.0 needs clip_id + the clip library to resolve
+                # the anchor mask, which a synthetic recording cannot provide.
+                pinned_axis_loss_weight=1.0, extero_channels=1)
     base.update(kw)
     return FlowMatchingConfig(**base)
 
@@ -308,3 +310,33 @@ def test_a_config_carrying_both_names_keeps_the_new_one():
     d = FlowMatchingConfig().to_dict()
     d["extero_xyz_envelope"], d["extero_xyz_clip"] = 5.0, 4.5
     assert FlowMatchingConfig.from_dict(d).extero_xyz_envelope == pytest.approx(5.0)
+
+
+def test_auto_encoder_is_refused_on_a_dense_scan():
+    """'auto' gives a height scan the flat MLP, which on a metric grid is a trap.
+
+    Right for the validated 176-ray scan; on a dense one it is a multi-million-parameter
+    Linear that is permutation-invariant over the rays, so it structurally cannot say WHERE a
+    step edge is -- the failure the convolutional encoder was added to fix. Flipping the
+    default instead would silently re-architect every legacy scan run, so the AMBIGUOUS case
+    is what gets refused and either explicit answer is honoured.
+    """
+    data, meta, *_ = _synthetic_recording(Ksc=1200)
+    with pytest.raises(ValueError, match="ambiguous"):
+        build_train_val(data, meta, _cfg(extero_source="height_scan", extero_encoder="auto"))
+
+
+def test_an_explicit_encoder_on_a_dense_scan_is_honoured():
+    """Only 'auto' is refused: asking for the flat path on a dense scan is a choice."""
+    data, meta, *_ = _synthetic_recording(Ksc=1200)
+    train, _ = build_train_val(
+        data, meta, _cfg(extero_source="height_scan", extero_encoder="mlp"))
+    assert train.extero.shape[-1] == 1200
+
+
+def test_a_coarse_scan_still_resolves_auto():
+    """The validated grid must keep working with no flags at all."""
+    data, meta, *_ = _synthetic_recording(Ksc=176)
+    train, _ = build_train_val(
+        data, meta, _cfg(extero_source="height_scan", extero_encoder="auto"))
+    assert train.extero.shape[-1] == 176

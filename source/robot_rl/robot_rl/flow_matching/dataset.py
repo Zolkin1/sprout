@@ -268,6 +268,13 @@ def _resolve_extero_coord_extent(spec: list[dict] | None) -> list[float] | None:
     return [sx, sy]
 
 
+#: Ray count above which a height scan is "dense" and ``extero_encoder='auto'`` is refused.
+#: The validated coarse grid is 176 rays; a metric scan is 121x121 = 14641. Anything in
+#: between is closer to the metric case than to the coarse one, and the cost of guessing wrong
+#: is a hundred epochs.
+_DENSE_SCAN_RAYS: int = 1000
+
+
 def _resolve_xyz_contract(
     cfg: FlowMatchingConfig, spec: list[dict], joint_names: list[str]
 ) -> tuple[list[list[float]], float]:
@@ -1147,6 +1154,26 @@ class FutureStateDataset(Dataset):
         )
         # Resolve "auto" HERE, where the source is finally known, and write it back so the
         # checkpoint says which encoder it trained -- ``from_dict`` must never re-resolve it.
+        #
+        # But refuse to resolve it for a DENSE scan. "auto" gives a height scan the flat MLP,
+        # which is right for the validated 176-ray grid and a trap for a metric one: a
+        # 121x121 scan through one Linear is ~7.5M parameters that are permutation-invariant
+        # over the grid, i.e. structurally unable to say WHERE a step edge is -- the exact
+        # failure the convolutional encoder exists to fix. Flipping the default instead would
+        # silently re-architect every legacy scan run, whose recordings carry no grid at all.
+        # So the ambiguous case is the one that is refused, and stating either encoder works.
+        if (cfg.extero_encoder == "auto" and cfg.extero_source == "height_scan"
+                and sensor_dim >= _DENSE_SCAN_RAYS):
+            raise ValueError(
+                f"extero_encoder='auto' on a {sensor_dim}-ray height scan is ambiguous. "
+                f"'auto' means the flat MLP, which is correct for the coarse grid but on this "
+                f"one is a single Linear of ~{sensor_dim * cfg.d_model / 1e6:.1f}M parameters "
+                "that cannot represent WHERE anything is (it is permutation-invariant over "
+                "the rays), which is what the convolutional encoder was added to fix.\n"
+                "  State it: --extero_encoder cnn (with --extero_cnn_strides sized to the "
+                "grid, e.g. '1,2,2,2' for 121x121 -> 16x16 = 256 tokens), or --extero_encoder "
+                "mlp to take the flat path deliberately."
+            )
         cfg.extero_encoder = cfg.resolve_extero_encoder()
         cfg.check_extero_encoder()
         # Where a MISSED ray lands after sanitize + normalization, so the encoder can mark it

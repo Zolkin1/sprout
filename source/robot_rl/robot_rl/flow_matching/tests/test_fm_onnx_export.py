@@ -79,7 +79,7 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto",
         # channels rebuild the camera pose through real FK on the G1's MJCF. What the graph
         # signature and the metadata contract pin here does not depend on the channel count,
         # and ``test_depth_xyz_offline`` covers 5 channels on a real 29-joint recording.
-        extero_channels=1,
+        extero_channels=1, pinned_axis_loss_weight=1.0,
         extero_encoder=extero_encoder,
         **({} if attention_mode is None else {"attention_mode": attention_mode}),
     )
@@ -268,3 +268,70 @@ def test_fm_onnx_matches_torch(tmp_path, encoder):
     # history_null=1 must select the learned null embedding, i.e. change the output.
     null_feed = dict(feed, history_null=np.ones((v, 1), dtype=np.float32))
     assert not np.allclose(got, sess.run(["trajectory"], null_feed)[0], atol=1e-6)
+
+
+def test_a_depth_checkpoint_with_no_clip_band_is_refused(tmp_path):
+    """`extero_clip=None` on DEPTH is ambiguous, not absent, so it is refused rather than read.
+
+    It means "use the per-source default", and there are two of those: config.EXTERO_CLIP says
+    5.575, deploy.depth_obs.EXTERO_CLIP_NP says 2.0. They agreed until the depth band widened,
+    and each is now correct for the artifacts of its own era -- so a None resolved one way in
+    training and the other at deploy, which is how a generator trained at +-5.575 came to run
+    at +-2.0 and saturate range at 4.75 m. Nothing in the artifact says which era it is from,
+    so it can only be stated.
+    """
+    from robot_rl.flow_matching.online import load_fm_context  # noqa: PLC0415
+
+    ckpt, *_ = _tiny_checkpoint(tmp_path)
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    assert blob["config"]["extero_source"] == "depth"
+    assert blob["config"]["extero_clip"] is not None, "the dataset should have stamped it"
+    blob["config"]["extero_clip"] = None                      # a pre-stamping artifact
+    stale = str(tmp_path / "no_band.pt")
+    torch.save(blob, stale)
+
+    with pytest.raises(ValueError, match="ambiguous rather than"):
+        load_fm_context(stale, device="cpu")
+
+
+def test_a_height_scan_checkpoint_with_no_clip_band_still_loads(tmp_path):
+    """The scan's default never moved, so a None there names one number and stays legal."""
+    from robot_rl.flow_matching.online import load_fm_context  # noqa: PLC0415
+
+    ckpt, *_ = _tiny_checkpoint(tmp_path)
+    blob = torch.load(ckpt, map_location="cpu", weights_only=False)
+    blob["config"]["extero_source"] = "height_scan"
+    blob["config"]["extero_clip"] = None
+    blob["config"]["extero_channels"] = 1
+    scan = str(tmp_path / "scan_no_band.pt")
+    torch.save(blob, scan)
+
+    load_fm_context(scan, device="cpu")                       # must not raise
+
+
+def test_a_depth_graph_with_no_clip_band_is_refused(tmp_path):
+    """The same refusal on the ONNX side, for a graph exported before the band was stated.
+
+    Hand-edited metadata, because the exporter goes through ``load_fm_context`` and so can no
+    longer produce one -- which is the point, but it means the deploy guard needs a graph built
+    the way a legacy one was.
+    """
+    onnx_mod = pytest.importorskip("onnx")
+    from deploy.fm_session import load_fm_context as deploy_load  # noqa: PLC0415
+
+    ckpt, *_ = _tiny_checkpoint(tmp_path)
+    good = str(tmp_path / "fm.onnx")
+    export_fm_onnx(ckpt, good, opset=18)
+
+    model = onnx_mod.load(good)
+    for prop in model.metadata_props:
+        if prop.key == "fm_meta":
+            meta = json.loads(prop.value)
+            assert meta["extero_source"] == "depth"
+            meta["extero_clip"] = None                        # as a legacy graph carried it
+            prop.value = json.dumps(meta)
+    stale = str(tmp_path / "fm_no_band.onnx")
+    onnx_mod.save(model, stale)
+
+    with pytest.raises(ValueError, match="ambiguous rather than absent"):
+        deploy_load(stale)

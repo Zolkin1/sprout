@@ -178,7 +178,9 @@ class FlowMatchingConfig:
     # they help the generator or just add obstacle-shaped noise is unresolved. Recordings carry a
     # per-window ``is_distractor`` tag, so this is a train-time switch: no re-recording needed to
     # A/B it. Errors (rather than silently training on them) if the recording has no tag.
-    skip_distractors: bool = False
+    # True: the MVP trained without distractor windows, and the flag exists precisely so
+    # A/B-ing it needs no re-record (every window carries `is_distractor`).
+    skip_distractors: bool = True
 
     # Clip FAMILIES to drop, by name (see RecordingMeta.family_names; the ".h5" the composer
     # stamps is already stripped, so write "family_jump_off"). A train-time switch for the
@@ -556,7 +558,12 @@ class FlowMatchingConfig:
     # The weights are RENORMALIZED to mean 1 over each batch, so the loss magnitude (and hence
     # the effective learning rate) matches an unweighted run and a with/without A/B differs in
     # one thing only.
-    pinned_axis_loss_weight: float = 1.0
+    # 20.0 is what the working generator trained with, NOT a validated optimum: the A/B that
+    # would justify it was confounded (the weight=1 arm sat at a real stationary point --
+    # predict-the-mean -- while the weight=20 arm escaped, so the comparison says nothing
+    # about the weight). Recorded because it is the shipped architecture; re-run the
+    # baseline before treating it as tuned.
+    pinned_axis_loss_weight: float = 20.0
     # Compute the per-node anchor mask so validation can report ``flow_mse`` SPLIT by whether
     # the terrain pins that coordinate. On by default and independent of the loss weight,
     # because the split is only useful if BOTH arms of a with/without comparison report it --
@@ -568,10 +575,14 @@ class FlowMatchingConfig:
     cmd_dim: int = 0
 
     # -- model (single transformer; history/height/cmd are separate conditioning tokens) --
-    d_model: int = 256
+    # The 27M "XL" transformer the MVP uses (see CLAUDE.md's MVP section). Capacity kept
+    # paying on this task -- 2.74M -> 9.5M -> 27M each improved closed-loop survival -- so
+    # this is the size the working pair was built at, not a starting guess. Ablate later; for
+    # now the code holds it so no run has to remember four numbers.
+    d_model: int = 512
     nhead: int = 8
-    num_layers: int = 4
-    dim_feedforward: int = 512
+    num_layers: int = 8
+    dim_feedforward: int = 2048
     dropout: float = 0.0
     # Probability that a training sample's history (phase) tokens are replaced by the
     # model's learned null embedding -- classifier-free-guidance / phase-agnostic nominal.
@@ -735,8 +746,12 @@ class FlowMatchingConfig:
     # agreement with the predicted pose, and BOTH are served to the policy through
     # reference_window. It is still reported as a val metric so that drift stays visible.
     vel_consistency_weight: float = 0.0
-    joint_vel_consistency_weight: float = 0.01 #0.0
-    fk_pose_weight: float = 0.01 #0.0
+    # Both OFF in the shipped configuration. They are auxiliary consistency terms, and the
+    # generator that works was trained without either; leaving them on by default meant every
+    # run had to remember to zero them (nothing auto-corrects it, and fk_pose_weight silently
+    # does nothing when the dataset has no ee frames, which is its own trap).
+    joint_vel_consistency_weight: float = 0.0
+    fk_pose_weight: float = 0.0
     body_pose_root_weight: float = 0.0
     body_pose_world_weight: float = 0.0
     body_pose_ori_scale: float = 0.25
@@ -778,7 +793,9 @@ class FlowMatchingConfig:
     # That is not hypothetical: the 2026-08-12 pinned-axis A/B lost its weight=1.0 arm this
     # way while its weight=20 arm, identical in every other respect (same seed, same data
     # sha, loss differing only by the reweighting), escaped at step ~300.
-    lr_warmup_steps: int = 0
+    # 500: added with the grad-norm/Adam-SNR instrumentation after a run sat at a stationary
+    # point for hundreds of steps, and used by the generator that works.
+    lr_warmup_steps: int = 500
     seed: int = 0
 
     @property

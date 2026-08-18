@@ -103,6 +103,8 @@ def _default_channel_dataset(hw: tuple[int, int] = (6, 5), **cfg_kw):
         num_history_states=2, future_len=6, cmd_array="target_vel", cmd_stride=4,
         target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
         d_model=16, nhead=2, num_layers=1, dim_feedforward=32,
+        # Unweighted: the shipped 20.0 needs clip_id + the clip library.
+        pinned_axis_loss_weight=1.0,
         # Absolute, because the field's default is repo-relative and a test's cwd is not a
         # contract (see the module note on _REPO_ROOT).
         fk_model_path=_MJCF,

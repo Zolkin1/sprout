@@ -58,10 +58,11 @@ python scripts/rsl_rl/record_data.py --task G1-teacher-clf-terrain-depth \
     --load_run <teacher-run> --clip <lib.h5> --clip_device cpu \
     --num_windows 200000 --history_len 8 --ref_future_len 51 --num_envs 256 --headless
 
-# 2. train the FM (no Isaac).  --skip_distractors while the distractor family still has
-#    anchor_mask == 0 clips (the recorder warns when it does).
-python scripts/flow_matching/train.py --data <windows.h5> \
-    --cmd_array target_vel --extero_source depth --skip_distractors --wandb
+# 2. train the FM (no Isaac).  Every exteroception and architecture knob now DEFAULTS to
+#    the shipped configuration (depth / cnn / 5 channels / contract norm / 27M), so a
+#    standard run states only its data.  Turn the distractor filter off with
+#    --no-skip_distractors.
+python scripts/flow_matching/train.py --data <windows.h5> --wandb
 
 # 3. deploy: the teacher tracks the FM
 python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play \
@@ -77,12 +78,17 @@ The sections below document the underlying scripts and their (now mostly optiona
 `--extero_encoder` picks the embedding, and it is the one architectural choice that is
 about TERRAIN rather than about capacity.
 
-* **`cnn`** (what `auto` picks for depth) — a 3-layer stride-2 conv trunk **per camera**
-  takes each 30x26 frame to a 4x4 grid, and every cell becomes one token carrying a learned
-  spatial-slot embedding. 16 tokens per camera, 32 total, sequence length 111.
+* **`cnn`** (what `auto` picks for depth) — a 3-layer conv trunk **per camera**, every
+  surviving cell becoming one token with a learned spatial-slot embedding. At the DEFAULT
+  strides `(1, 2, 2)` the first stage runs at native resolution, so 26x30 lands on 7x8:
+  **56 tokens per camera, 112 total, sequence length 191**. Stride 2 everywhere (`2,2,2`)
+  gives the older 4x4 = 16 per camera, sequence 111.
 * **`mlp`** — the original: the whole 780-value frame through one `Linear`, one token per
-  camera, sequence length 81. The only option for `--extero_source height_scan`, and the
-  baseline the CNN is measured against.
+  camera, sequence length 81. What `auto` picks for `--extero_source height_scan`, and the
+  baseline the CNN is measured against. A scan CAN be convolved (a dense metric grid should
+  be), but it has to be asked for: on a grid above 1000 rays `auto` is refused outright,
+  because the flat path there is millions of parameters that cannot represent WHERE
+  anything is.
 
 Why it matters: a `Linear` over 780 pixels is **permutation-invariant over pixels**, so
 nothing in the flat model can attend to *where* in the frame a step edge is. That is the
@@ -100,10 +106,13 @@ Two knobs that separate the variables when reading an A/B:
 --extero_norm_mode per_sensor  # one (mean, std) per camera instead of per PIXEL
 ```
 
-`per_sensor` exists because the default per-pixel normalization is a spatially *varying*
-transform applied before the convolution sees the image — exactly what weight sharing
-assumes away. It is a separate flag so it can be ablated: if a CNN run disappoints, re-run
-with `--extero_norm_mode per_element` before blaming the encoder.
+Normalization modes exist because a per-PIXEL affine is a spatially *varying* transform
+applied before the convolution sees the image — exactly what weight sharing assumes away.
+That mode (`per_element`) is **deleted**; every surviving mode is uniform over pixels. The
+default is `contract`, which fits nothing at all: `d` arrives already declared-normalised
+from the camera contract, `xyz` take one declared scale with a per-camera geometric offset,
+and validity is left alone. `per_channel` and `per_sensor` are the fitted alternatives, and
+`metric` is a single declared affine — the right one for a privileged metric scan.
 
 Pixel order is a **contract**, not a convention: the flat row is row-major over `(H, W)`
 with `v = 0` the top row, and the `(H, W)` to fold it with is derived from the recording's
@@ -236,8 +245,6 @@ python scripts/flow_matching/train.py --data <run-dir-or-.npz> --wandb
   - `--cmd_array` → `target_vel` if that array was recorded, else no command (future-horizon conditioning: past command in the encoder, future in the decoder). Override with an array name or `none`.
 - **`--eval_data <run-or-.npz>`** — a *separate* held-out recording (never trained on); metrics logged under `eval/*`, distinct from the within-recording `val/*`. Must share the train layout. See "Held-out evaluation" below.
 - **`--run_name`** — run dir is `logs/flow_matching/<timestamp>_<run_name>` (defaults to just the timestamp).
-- **`--history_source`** — what the `N` history tokens are made of. `measured` (default) is the robot's actual state. `reference_partial` is **partially autoregressive**: measured root pose/twist, but joints and end-effector positions taken from the reference applied at those steps — the generator conditioning on its own recent output for posture while the root stays grounded in reality. Both train from the same recording (the applied-reference ring is always stored), so it is a free A/B.
-- Other knobs: `--num_epochs` (100), `--stride` (1; raise to cut RAM on huge datasets), `--num_history_states` (2), `--future_len` (65 — sized to the deploy look-ahead; see `FlowMatchingConfig.future_len`), `--lr`, `--cosine`.
 
 **Horizon and re-recording.** `--future_len` must equal the recording's `--ref_future_len`: windows are cut at record time and the dataset hard-errors on a mismatch. Both default to `FlowMatchingConfig.future_len`, so leaving them alone is correct.
 - **Output:** `logs/flow_matching/<ts>_<run_name>/{best.pt, ckpt_<N>.pt}`. wandb logs per epoch (val every `--val_every`=5); per-step loss → TensorBoard.

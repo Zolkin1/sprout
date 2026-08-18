@@ -549,6 +549,32 @@ def load_fm_context(
         )
     if cfg.cmd_dim > 0 and cmd_norm is None:
         raise ValueError("Checkpoint is command-conditioned (cmd_dim>0) but has no cmd_normalizer.")
+    # A DEPTH checkpoint that does not state its clip band is REFUSED, because `None` no longer
+    # names one number. It means "use the per-source default", and there are two of those:
+    # config.EXTERO_CLIP says 5.575 while deploy.depth_obs.EXTERO_CLIP_NP says 2.0. They agreed
+    # until the depth band was widened, and each is now right for the artifacts of its own era --
+    # so a None resolves one way here and the other way at deploy, which is how a generator
+    # trained at +-5.575 came to run at +-2.0, saturating range at 4.75 m.
+    #
+    # Nothing in the artifact says which era it belongs to, so this cannot be inferred, only
+    # stated. Refusing follows the same rule the pre-rename fm.onnx does: say what to do rather
+    # than guess. Runs since the dataset started stamping the resolved band carry a float and
+    # never reach this. The scan is unaffected -- its default never moved.
+    if cfg.extero_source == "depth" and cfg.extero_clip is None:
+        raise ValueError(
+            "this depth checkpoint does not state its exteroception clip band "
+            "(extero_clip=None), and the per-source default it would fall back to differs "
+            "between training (+-5.575) and deploy (+-2.0), so the band is ambiguous rather "
+            "than merely absent.\n"
+            "  A run trained BEFORE the band was widened used +-2.0; one trained after the "
+            "dataset began stamping it carries its own value.\n"
+            "  State it in the checkpoint's config and reload, e.g.:\n"
+            "    ck = torch.load(<ckpt>, map_location='cpu', weights_only=False)\n"
+            "    ck['config']['extero_clip'] = 5.575   # or 2.0 for a pre-change run\n"
+            "    torch.save(ck, <ckpt-with-band>)\n"
+            "  Under extero_norm_mode='contract' the run's own extero_xyz_envelope decides it: "
+            "5.0 comes only from 5.575, 3.5 only from 2.0."
+        )
     cmd_steps = list(range(0, cfg.future_len, cfg.cmd_stride))
     return FmOnlineContext(
         model=model, state_norm=state_norm, cmd_norm=cmd_norm,
@@ -571,8 +597,7 @@ def load_fm_context(
         extero_image_hw=([(int(h), int(w)) for h, w in cfg.extero_image_hw]
                          if cfg.extero_image_hw else None),
         # The band this checkpoint was TRAINED under, so the live token builder clamps the way
-        # the dataset did. Absent in an old checkpoint -> None -> the per-source default, which
-        # is what that checkpoint used.
+        # the dataset did. Never None for depth -- refused above.
         extero_clip=cfg.extero_clip,
     )
 

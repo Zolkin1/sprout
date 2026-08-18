@@ -666,7 +666,7 @@ def _synthetic_recording(n_ep=6, W_ep=6, nj=4, K=2, F=8, H=4, Ksc=6, depth=None,
 def test_dataset_snap_windows_build():
     torch.manual_seed(0)
     data, meta, nj, K, F, state_dim = _synthetic_recording()
-    cfg = FlowMatchingConfig(num_history_states=2, future_len=F, cmd_array="target_vel", cmd_stride=4,
+    cfg = FlowMatchingConfig(pinned_axis_loss_weight=1.0, num_history_states=2, future_len=F, cmd_array="target_vel", cmd_stride=4,
                              extero_source="height_scan", target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0)
     train, val = build_train_val(data, meta, cfg)
     it = train[0]
@@ -692,6 +692,10 @@ def test_dataset_snap_windows_build():
 def _slim_cfg(F, **kw):
     """A config for the three-block window the g1 teacher packs today."""
     return FlowMatchingConfig(
+        # Unweighted, and distractors kept: both shipped defaults need a real recording
+        # (clip_id + the clip library for the anchor mask; an is_distractor tag), which
+        # a synthetic one has not got. Neither is what these tests exercise.
+        pinned_axis_loss_weight=1.0, skip_distractors=False,
         num_history_states=2, future_len=F, cmd_array="target_vel", cmd_stride=4,
         extero_source="height_scan", target_source="ego_anchored_clip_future",
         val_fraction=0.34, seed=0, **kw,
@@ -772,7 +776,7 @@ def test_online_roundtrip():
     torch.manual_seed(0)
     data, meta, nj, K, F, state_dim = _synthetic_recording()
     N = 2
-    cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel", cmd_stride=4,
+    cfg = FlowMatchingConfig(pinned_axis_loss_weight=1.0, num_history_states=N, future_len=F, cmd_array="target_vel", cmd_stride=4,
                              extero_source="height_scan", target_source="ego_anchored_clip_future", val_fraction=0.2, seed=0,
                              d_model=32, nhead=4, num_layers=2, dim_feedforward=64)
     train, _ = build_train_val(data, meta, cfg)
@@ -826,7 +830,7 @@ def test_online_roundtrip_with_the_cnn_encoder():
     N = 2
     # extero_channels=1: the fixture's robot has four fake joints and the xyz channels need
     # real FK over the G1's MJCF. The fold/reload contract under test is channel-independent.
-    cfg = FlowMatchingConfig(num_history_states=N, future_len=F, cmd_array="target_vel",
+    cfg = FlowMatchingConfig(pinned_axis_loss_weight=1.0, num_history_states=N, future_len=F, cmd_array="target_vel",
                              cmd_stride=4, extero_source="depth", extero_encoder="cnn",
                              extero_norm_mode="per_sensor", extero_channels=1,
                              target_source="ego_anchored_clip_future", val_fraction=0.2,
@@ -884,6 +888,10 @@ def test_online_roundtrip_with_the_cnn_encoder():
 def _built(data, meta, F, N=2, **over):
     """Build a dataset over a synthetic recording and return ``(raw_history, dataset)``."""
     cfg = FlowMatchingConfig(
+        # Unweighted, and distractors kept: both shipped defaults need a real recording
+        # (clip_id + the clip library for the anchor mask; an is_distractor tag), which
+        # a synthetic one has not got. Neither is what these tests exercise.
+        pinned_axis_loss_weight=1.0, skip_distractors=False,
         num_history_states=N, future_len=F, cmd_array="target_vel", cmd_stride=4,
         extero_source="height_scan", target_source="ego_anchored_clip_future",
         val_fraction=0.34, seed=0, obs_noise=False, **over,

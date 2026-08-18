@@ -203,6 +203,21 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
             "their replacements (extero_sensor_dim / extero_sensor_count). Re-export with "
             "scripts/flow_matching/export_fm_onnx.py -- the checkpoint itself still loads."
         )
+    # Same rule for a DEPTH graph that does not state its clip band. `None` used to mean "use
+    # the per-source default", which was unambiguous only while the two tables agreed; since the
+    # depth band widened, robot_rl resolves 5.575 and EXTERO_CLIP_NP below resolves 2.0, so a
+    # None here silently ran a generator 3.5 of a band tighter than it trained. Nothing in the
+    # graph says which era it came from, so it is stated or it is refused -- and unlike the
+    # checkpoint, fixing a graph is one re-export.
+    if source == "depth" and m.get("extero_clip") is None:
+        raise ValueError(
+            f"{onnx_path}: fm_meta states no extero_clip for a DEPTH generator. That is "
+            "ambiguous rather than absent -- the training and deploy per-source defaults are "
+            "+-5.575 and +-2.0 respectively, so the graph would run a different band than it "
+            "trained on. Re-export with scripts/flow_matching/export_fm_onnx.py from a "
+            "checkpoint whose config states extero_clip (the exporter now refuses one that "
+            "does not)."
+        )
     # The old history_source refusal is gone: the deploy runtime CAN produce this history,
     # because the history is the runtime's own last output rather than a measured state it
     # would have to estimate.

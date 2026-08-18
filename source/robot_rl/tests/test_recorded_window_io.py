@@ -10,10 +10,20 @@ num_windows_written, optional-array omission, and metadata/content-hash round-tr
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 
 import numpy as np
 import pytest
+
+# ``recorded_data_io`` lives in scripts/rsl_rl, which is not a package on the path. Insert it
+# HERE rather than inheriting it from whichever other test module happened to be collected
+# first: without this the file passes inside the full suite and ERRORS when run alone, which
+# is the same collection-order fragility that made test_train_cli_defaults import the wrong
+# train.py. Off the repo root, never a count of ".." hops (see CLAUDE.md).
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          *[os.pardir] * 3))
+sys.path.insert(0, os.path.join(_REPO_ROOT, "scripts", "rsl_rl"))
 
 from recorded_data_io import (
     RecordedWindowWriter,

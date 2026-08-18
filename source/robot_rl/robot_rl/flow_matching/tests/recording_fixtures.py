@@ -260,6 +260,13 @@ def windowed_recording(
         "height_scan": rng.standard_normal((total, num_scan_rays)).astype(np.float32),
         # Per-WINDOW episode id (the snap row's), which is what the windowed split reads.
         "episode_id": np.repeat(np.arange(n_ep, dtype=np.int64), windows_per_ep),
+        # Every window tagged, as the current recorder does. Not all-False: skip_distractors
+        # is ON by default now, and the dataset refuses a filter that would drop nothing as
+        # readily as one that would drop everything -- a fixture of all-False would pass by
+        # being rejected for the wrong reason. One distractor per episode leaves the split
+        # non-empty either way.
+        "is_distractor": np.tile(
+            np.arange(windows_per_ep) == windows_per_ep - 1, n_ep).astype(bool),
     }
     if depth is not None:
         data["depth"] = depth_images(rng, total, depth).astype(np.float32)
