@@ -100,48 +100,54 @@ G1_CFG = ArticulationCfg(
                 ".*_hip_pitch_joint",
                 ".*_knee_joint",
             ],
+            # HIP PITCH is the 22.5 gear (mode_11), not the 14.3 -- effort, velocity AND the
+            # gain class move together.  Half the change is a trap: G1_ACTION_SCALE is
+            # 0.125 * effort / stiffness, so raising the effort limit alone would INFLATE the
+            # hip-pitch action range 1.58x (0.2738 -> 0.4324) instead of shrinking it to
+            # 0.1753.  Every field below is the mode_11 URDF's, checked against that file by
+            # tests/test_actuator_table.py.
             effort_limit_sim={
                 ".*_hip_yaw_joint": 88.0,
                 ".*_hip_roll_joint": 139.0,
-                ".*_hip_pitch_joint": 88.0,
+                ".*_hip_pitch_joint": 139.0,
                 ".*_knee_joint": 139.0,
             },
             velocity_limit_sim={
                 ".*_hip_yaw_joint": 32.0,
                 ".*_hip_roll_joint": 20.0,
-                ".*_hip_pitch_joint": 32.0,
+                ".*_hip_pitch_joint": 20.0,
                 ".*_knee_joint": 20.0,
             },
             stiffness={
                 ".*_hip_yaw_joint": STIFFNESS_7520_14,
                 ".*_hip_roll_joint": STIFFNESS_7520_22,
-                ".*_hip_pitch_joint": STIFFNESS_7520_14,
+                ".*_hip_pitch_joint": STIFFNESS_7520_22,
                 ".*_knee_joint": STIFFNESS_7520_22,
             },
             damping={
                 ".*_hip_yaw_joint": DAMPING_7520_14,
                 ".*_hip_roll_joint": DAMPING_7520_22,
-                ".*_hip_pitch_joint":DAMPING_7520_14,
+                ".*_hip_pitch_joint": DAMPING_7520_22,
                 ".*_knee_joint": DAMPING_7520_22,
             },
             armature={
-                ".*_hip_pitch_joint": ARMATURE_7520_14,
+                ".*_hip_pitch_joint": ARMATURE_7520_22,
                 ".*_hip_roll_joint": ARMATURE_7520_22,
                 ".*_hip_yaw_joint": ARMATURE_7520_14,
                 ".*_knee_joint": ARMATURE_7520_22,
             },
         ),
         "feet": ImplicitActuatorCfg(
-            effort_limit_sim=50,
-            velocity_limit_sim=37.0,
+            effort_limit_sim=35.0,
+            velocity_limit_sim=30.0,
             joint_names_expr=[".*_ankle_pitch_joint", ".*_ankle_roll_joint"],
             stiffness=2.0 * STIFFNESS_5020,
             damping=2.0 * DAMPING_5020,
             armature=2.0 * ARMATURE_5020,
         ),
         "waist": ImplicitActuatorCfg(
-            effort_limit_sim=88,
-            velocity_limit_sim=37.0,
+            effort_limit_sim=88.0,
+            velocity_limit_sim=32.0,
             joint_names_expr=["waist_yaw_joint"],
             stiffness=STIFFNESS_7520_14,
             damping=DAMPING_7520_14,
@@ -185,13 +191,13 @@ G1_CFG = ArticulationCfg(
                 ".*_elbow_joint": ARMATURE_5020,
             },
         ),
-        # Newly-unlocked DOFs.  waist roll/pitch: waist_yaw's 7520_14 class at the URDF's 50 N*m effort.
+        # Newly-unlocked DOFs.  waist roll/pitch: waist_yaw's 7520_14 class at the URDF's effort.
         # wrists: the arms' 5020 class (roll 25 N*m, pitch/yaw 5 N*m per the model).  Sensible defaults
         # from the sibling joints -- expected to be tuned before the real run.
         "waist_rp": ImplicitActuatorCfg(
             joint_names_expr=["waist_roll_joint", "waist_pitch_joint"],
-            effort_limit_sim=50.0,
-            velocity_limit_sim=37.0,
+            effort_limit_sim=35.0,
+            velocity_limit_sim=30.0,
             stiffness=STIFFNESS_7520_14,
             damping=DAMPING_7520_14,
             armature=ARMATURE_7520_14,
@@ -203,7 +209,13 @@ G1_CFG = ArticulationCfg(
                 ".*_wrist_pitch_joint": 5.0,
                 ".*_wrist_yaw_joint": 5.0,
             },
-            velocity_limit_sim=37.0,
+            # Roll is an arm-class motor; pitch and yaw are the light 5 N*m ones and turn
+            # slower.  One scalar here would have quietly given them roll's 37 rad/s.
+            velocity_limit_sim={
+                ".*_wrist_roll_joint": 37.0,
+                ".*_wrist_pitch_joint": 22.0,
+                ".*_wrist_yaw_joint": 22.0,
+            },
             stiffness=STIFFNESS_5020,
             damping=DAMPING_5020,
             armature=ARMATURE_5020,
@@ -224,6 +236,38 @@ for a in G1_CFG.actuators.values():
     for n in names:
         if n in e and n in s and s[n]:
             G1_ACTION_SCALE[n] = 0.125 * e[n] / s[n]
+
+def format_actuator_table(cfg: ArticulationCfg | None = None) -> str:
+    """The resolved motor table, one line per joint pattern, for printing at run start.
+
+    ``G1_ACTION_SCALE`` is DERIVED -- ``0.125 * effort / stiffness`` -- so a motor swap
+    silently rescales the policy's action range, and the DIRECTION depends on whether the
+    gain class moved with the effort limit. Putting hip pitch on the 22.5 gear shrinks it
+    0.2738 -> 0.1753; changing only the effort limit would have grown it to 0.4324. Nothing
+    at runtime shows either number, which is why this exists to be printed rather than
+    trusted.
+
+    Args:
+        cfg: Articulation to read; :data:`G1_CFG` when omitted.
+
+    Returns:
+        A formatted multi-line table.
+    """
+    cfg = G1_CFG if cfg is None else cfg
+    out = [f"  {'group':8s} {'joint':30s} {'effort':>8s} {'vel':>6s} {'kp':>9s} "
+           f"{'kd':>8s} {'armature':>9s} {'act.scale':>10s}"]
+    for group, act in cfg.actuators.items():
+        for pat in act.joint_names_expr:
+            def field(name: str, _act=act, _pat=pat):
+                v = getattr(_act, name)
+                return v.get(_pat) if isinstance(v, dict) else v
+            eff, vel = field("effort_limit_sim"), field("velocity_limit_sim")
+            stf, dmp, arm = field("stiffness"), field("damping"), field("armature")
+            scale = "-" if not (eff and stf) else f"{0.125 * eff / stf:.4f}"
+            out.append(f"  {group:8s} {pat:30s} {eff:8.1f} {vel:6.1f} {stf:9.4f} "
+                       f"{dmp:8.4f} {arm:9.6f} {scale:>10s}")
+    return "\n".join(out)
+
 
 G1_MINIMAL_CFG = G1_CFG.copy()
 

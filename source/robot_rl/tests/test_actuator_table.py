@@ -38,52 +38,53 @@ from robot_rl.assets.robots.g1_21j import (
 #: Stiffness/damping are quoted to 6 dp; they are exactly ``J w^2`` and ``2 z J w`` with
 #: ``w = 2 pi 10 Hz`` and ``z = 2``.
 ACTUATORS: dict[str, tuple[float, float, float, float, float]] = {
-    # legs: hip yaw/pitch on the 7520_14 class, hip roll and knee on 7520_22.
-    "left_hip_pitch_joint": (88.0, 32.0, 40.179238, 2.557890, ARMATURE_7520_14),
+    # legs: hip yaw alone on the 7520_14 class; hip pitch, hip roll and knee on 7520_22.
+    "left_hip_pitch_joint": (139.0, 20.0, 99.098428, 6.308802, ARMATURE_7520_22),
     "left_hip_roll_joint": (139.0, 20.0, 99.098428, 6.308802, ARMATURE_7520_22),
     "left_hip_yaw_joint": (88.0, 32.0, 40.179238, 2.557890, ARMATURE_7520_14),
     "left_knee_joint": (139.0, 20.0, 99.098428, 6.308802, ARMATURE_7520_22),
-    "right_hip_pitch_joint": (88.0, 32.0, 40.179238, 2.557890, ARMATURE_7520_14),
+    "right_hip_pitch_joint": (139.0, 20.0, 99.098428, 6.308802, ARMATURE_7520_22),
     "right_hip_roll_joint": (139.0, 20.0, 99.098428, 6.308802, ARMATURE_7520_22),
     "right_hip_yaw_joint": (88.0, 32.0, 40.179238, 2.557890, ARMATURE_7520_14),
     "right_knee_joint": (139.0, 20.0, 99.098428, 6.308802, ARMATURE_7520_22),
     # feet: twice the 5020 class.
-    "left_ankle_pitch_joint": (50, 37.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
-    "left_ankle_roll_joint": (50, 37.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
-    "right_ankle_pitch_joint": (50, 37.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
-    "right_ankle_roll_joint": (50, 37.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
+    "left_ankle_pitch_joint": (35.0, 30.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
+    "left_ankle_roll_joint": (35.0, 30.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
+    "right_ankle_pitch_joint": (35.0, 30.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
+    "right_ankle_roll_joint": (35.0, 30.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
     # waist.
-    "waist_yaw_joint": (88, 37.0, 40.179238, 2.557890, ARMATURE_7520_14),
-    "waist_roll_joint": (50.0, 37.0, 40.179238, 2.557890, ARMATURE_7520_14),
-    "waist_pitch_joint": (50.0, 37.0, 40.179238, 2.557890, ARMATURE_7520_14),
-    # arms + wrists: the 5020 class throughout; only the wrist pitch/yaw effort differs.
+    "waist_yaw_joint": (88.0, 32.0, 40.179238, 2.557890, ARMATURE_7520_14),
+    "waist_roll_joint": (35.0, 30.0, 40.179238, 2.557890, ARMATURE_7520_14),
+    "waist_pitch_joint": (35.0, 30.0, 40.179238, 2.557890, ARMATURE_7520_14),
+    # arms + wrists: the 5020 class throughout.  Wrist pitch/yaw are the light 5 N*m
+    # motors and also turn slower (22 rad/s) than everything else on that class.
     "left_shoulder_pitch_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
     "left_shoulder_roll_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
     "left_shoulder_yaw_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
     "left_elbow_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
     "left_wrist_roll_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
-    "left_wrist_pitch_joint": (5.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
-    "left_wrist_yaw_joint": (5.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
+    "left_wrist_pitch_joint": (5.0, 22.0, 14.250623, 0.907223, ARMATURE_5020),
+    "left_wrist_yaw_joint": (5.0, 22.0, 14.250623, 0.907223, ARMATURE_5020),
     "right_shoulder_pitch_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
     "right_shoulder_roll_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
     "right_shoulder_yaw_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
     "right_elbow_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
     "right_wrist_roll_joint": (25.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
-    "right_wrist_pitch_joint": (5.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
-    "right_wrist_yaw_joint": (5.0, 37.0, 14.250623, 0.907223, ARMATURE_5020),
+    "right_wrist_pitch_joint": (5.0, 22.0, 14.250623, 0.907223, ARMATURE_5020),
+    "right_wrist_yaw_joint": (5.0, 22.0, 14.250623, 0.907223, ARMATURE_5020),
 }
 
-URDF_PATH = _REPO_ROOT / "robot_assets" / "g1" / "g1_21j" / "g1_21j_box_merged_29j_hands.urdf"
+URDF_PATH = (_REPO_ROOT / "robot_assets" / "g1" / "g1_21j"
+             / "g1_21j_box_merged_29j_mode11.urdf")
 
-#: Joints where the cfg's effort limit deliberately disagrees with the URDF's, and why.
-#: The cfg is the one PhysX uses; the URDF value only reaches the sim through the USD's
-#: joint limits, which the actuator cfg overrides.
-EFFORT_OVERRIDES_URDF = {
-    # The URDF is the stale side: Unitree's own g1_29dof_rev_1_0 and g1_29dof_mode_11 both
-    # give hip roll 139 N*m. Reconciled when the URDF is regenerated.
-    "left_hip_roll_joint": (88.0, 139.0),
-    "right_hip_roll_joint": (88.0, 139.0),
-}
+#: Joints where the cfg deliberately disagrees with the URDF, and why.  The cfg is the one
+#: PhysX uses; the URDF value only reaches the sim through the USD's joint limits, which the
+#: actuator cfg overrides.
+#:
+#: EMPTY, and that is the point.  It used to carry hip roll, where our URDF said 88 N*m and
+#: the cfg 139 -- the URDF was the stale side.  ``apply_mode11_deltas.py`` reconciled it, so
+#: the cfg and the asset now agree on every joint with nothing recorded as an exception.
+EFFORT_OVERRIDES_URDF: dict[str, tuple[float, float]] = {}
 
 
 def _resolve(pattern_map, joint: str):
@@ -171,19 +172,27 @@ def test_effort_limits_track_the_urdf_except_where_recorded(resolved):
         )
 
 
-def test_velocity_limits_come_from_the_cfg_not_the_urdf(resolved):
-    """KNOWN GAP: the URDF carries a blanket 12 rad/s (22 on the wrists) that no motor has.
+def test_velocity_limits_track_the_urdf(resolved):
+    """The cfg's velocity limits are the URDF's, joint for joint.
 
-    Pinned so it is not mistaken for the real limit. The cfg's 20/32/37 are the values PhysX
-    enforces; the URDF's are vestigial and get corrected when the URDF is regenerated.
+    This check used to be a PIN rather than a comparison: our pre-mode_11 URDF carried a
+    blanket 12 rad/s (22 on the wrists) that no motor has, so the two could not be compared
+    and the test recorded the gap instead, saying to convert it if the URDF's values ever
+    became real. mode_11's are real -- 20 on the 22.5-gear legs, 32 on hip yaw and waist
+    yaw, 30 on the ankles and waist roll/pitch, 37 on the arms, 22 on the light wrists --
+    so it is now a comparison, and the third copy of these numbers has a guard.
     """
     root = ET.parse(URDF_PATH).getroot()
     urdf_vel = {
         j.get("name"): float(j.find("limit").get("velocity"))
         for j in root.findall("joint") if j.get("type") == "revolute"
     }
-    assert set(urdf_vel.values()) == {12.0, 22.0}, (
-        f"the URDF's velocity limits changed to {sorted(set(urdf_vel.values()))} -- if they are "
-        "now real, compare them against the cfg here instead of pinning them"
+    assert len(set(urdf_vel.values())) > 2, (
+        f"the URDF's velocity limits collapsed to {sorted(set(urdf_vel.values()))} -- that is "
+        "the pre-mode_11 blanket, so this file is the wrong asset"
     )
-    assert {v for _e, v, *_r in resolved.values()} == {20.0, 32.0, 37.0}
+    for joint, (_e, vel, *_rest) in sorted(resolved.items()):
+        assert vel == pytest.approx(urdf_vel[joint]), (
+            f"{joint}: the cfg says {vel} rad/s and {URDF_PATH.name} says {urdf_vel[joint]}. "
+            "PhysX uses the cfg, so this divergence would be silent."
+        )
