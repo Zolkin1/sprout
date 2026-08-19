@@ -237,6 +237,51 @@ def test_clip_library_identity_roundtrips():
         assert got.clip_library_sha256 == "deadbeef" * 8
 
 
+def test_robot_asset_roundtrips():
+    """The recording must say WHICH ROBOT produced its rows.
+
+    "No re-record" for the depth xyz channels holds only while the camera and the FK model
+    are fixed: the offline unprojection rebuilds the camera pose from the recorded joint
+    angles through motion_gen's FKChain, so a recording replayed against a changed model is
+    silently mis-registered. Every other identity here pins the data or the sensor.
+    """
+    W, H, F, node = 4, 2, 4, 22
+    meta = _meta(W, H, F, 0)
+    meta.robot_asset = {"hash": "f" * 64, "short": "ffffffffffff", "version": 1,
+                        "joint_names": ["j0", "j1", "j2"], "total_mass_kg": 36.1683}
+    rng = np.random.default_rng(11)
+    batch = {
+        "history_state": rng.standard_normal((W, H, node)).astype(np.float32),
+        "ref_future": rng.standard_normal((W, F, node)).astype(np.float32),
+        "episode_id": np.arange(W, dtype=np.int64),
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "recorded.h5")
+        with RecordedWindowWriter(p, W, H, node, F, 0, 0, meta) as wr:
+            wr.write_batch(batch)
+        _, got = load_recorded_windows(p)
+    assert got.robot_asset == meta.robot_asset
+
+
+def test_a_recording_without_a_robot_asset_still_loads():
+    """Every recording made before the field exists has none; that must not be an error."""
+    W, H, F, node = 2, 2, 4, 22
+    meta = _meta(W, H, F, 0)
+    assert meta.robot_asset is None
+    rng = np.random.default_rng(12)
+    batch = {
+        "history_state": rng.standard_normal((W, H, node)).astype(np.float32),
+        "ref_future": rng.standard_normal((W, F, node)).astype(np.float32),
+        "episode_id": np.arange(W, dtype=np.int64),
+    }
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "recorded.h5")
+        with RecordedWindowWriter(p, W, H, node, F, 0, 0, meta) as wr:
+            wr.write_batch(batch)
+        _, got = load_recorded_windows(p)
+    assert got.robot_asset is None
+
+
 def test_depth_roundtrips_alongside_the_height_scan():
     """Both exteroception arrays survive one recording, so either FM can train from it.
 

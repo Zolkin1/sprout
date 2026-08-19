@@ -116,6 +116,19 @@ class RecordingMeta:
     Also carries ``privileged``, which is what makes the dense generator-only scan refusable
     at every off-sim exit: no deployment can reproduce an exact 14k-ray ground-truth map."""
     depth_camera_spec: list[dict] | None = None
+    robot_asset: dict | None = None
+    """WHICH ROBOT produced these rows, or ``None`` for a recording predating the field.
+
+    Content hashes of the URDF / MJCF / USD plus joint names, body names and total mass
+    (``motion_gen.robot_asset.fingerprint_robot_asset``).
+
+    CLAUDE.md's "No re-record" property for the depth xyz channels is conditional on the
+    camera AND the FK model staying fixed: the offline unprojection rebuilds the camera pose
+    from the recorded joint angles through ``motion_gen``'s ``FKChain``, so a recording
+    replayed against a changed model yields silently mis-registered xyz -- surfacing, if at
+    all, only as a shifted declared-vs-measured centroid in the dataset's build print. Every
+    other identity this file carries (``checkpoint_sha256``, ``depth_camera_spec``,
+    ``clip_library_sha256``) pins the data or the sensor; none pinned the robot."""
     content_sha256: str = ""
     format: str = "per_step_npz"
     history_len: int = 0
@@ -365,6 +378,8 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         # Nested structure, so JSON rather than an array -- the file stays
         # ``allow_pickle=False`` loadable.
         depth_camera_spec=np.array(json.dumps(meta.depth_camera_spec)),
+        # Nested dict, so JSON for the same reason.
+        robot_asset=np.array(json.dumps(meta.robot_asset)),
         # Nullable list, so JSON for the same reason.
         reference_blocks=np.array(json.dumps(meta.reference_blocks)),
         family_names=np.array(json.dumps(meta.family_names)),
@@ -445,6 +460,9 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         height_scan_dim=int(z["height_scan_dim"]) if "height_scan_dim" in z.files else 0,
         depth_camera_spec=(
             json.loads(str(z["depth_camera_spec"])) if "depth_camera_spec" in z.files else None
+        ),
+        robot_asset=(
+            json.loads(str(z["robot_asset"])) if "robot_asset" in z.files else None
         ),
         reference_blocks=(
             json.loads(str(z["reference_blocks"])) if "reference_blocks" in z.files else None

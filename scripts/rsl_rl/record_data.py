@@ -59,7 +59,7 @@ from isaaclab_tasks.utils.hydra import hydra_task_config
 
 # local imports
 import cli_args  # isort: skip
-from export_parameters import export_policy_parameters  # isort: skip
+from export_parameters import export_policy_parameters, robot_asset_fingerprint_for  # isort: skip
 from recorded_data_io import (  # isort: skip
     RecordingMeta,
     RecordedWindowWriter,
@@ -582,6 +582,14 @@ def _build_recording_meta(
         # FM dataset's len(spec) == rows check is the only thing that would notice.
         depth_camera_spec=mdp.depth_camera_specs(
             env.unwrapped, mdp.fm_depth_groups(env.unwrapped)) or None,
+        # WHICH ROBOT produced these rows. CLAUDE.md's "No re-record" property for the depth
+        # xyz channels holds only while the camera AND the FK model are fixed: the offline
+        # unprojection rebuilds the camera pose from the recorded joint angles through
+        # motion_gen's FKChain, so a recording replayed against a changed model yields
+        # silently mis-registered xyz -- visible, if at all, only as a shifted
+        # declared-vs-measured centroid at dataset build. Same producer as the tracker
+        # export, so a recording and the policy that made it can be checked against each other.
+        robot_asset=robot_asset_fingerprint_for(env.unwrapped),
         # Which reference-window blocks THIS teacher observes. The recorded arrays are
         # world-frame rows, so any selection can be packed from them -- but the generator
         # trained on this file has to predict what the policy consumes, so the teacher's
