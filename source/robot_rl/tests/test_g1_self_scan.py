@@ -20,34 +20,40 @@ import re
 
 import pytest
 
+from robot_rl.assets.robots.g1_21j import G1_CFG
 from robot_rl.tasks.manager_based.robot_rl.g1 import g1_self_scan as ss
 
 
-def _project_root() -> pathlib.Path:
-    """Walk up until a directory containing ``robot_assets`` is found.
+# The USD the G1 articulation cfg actually spawns, DERIVED from the cfg rather than
+# restated. It used to be a hand-copied path guarded by a module-level
+# ``skipif(not _USD_DIR.is_dir())`` -- so renaming or moving the asset made the only
+# USD-vs-code guard in the repo silently PASS instead of fail, which is precisely the
+# rot these tests exist to catch. There is no skip now: a missing asset is a failure
+# (:func:`test_the_spawned_usd_asset_is_present`).
+#
+# The old comment claimed the cfg could not be imported here because it pulls in
+# IsaacLab and these tests run without a simulator. That is stale: importing it needs
+# isaaclab on the path, not IsaacSim running, which is already true of every other test
+# in this directory.
+_USD_PATH = pathlib.Path(G1_CFG.spawn.usd_path)
+_USD_DIR = _USD_PATH.parent / "payloads"
 
-    Returns:
-        The repository root.
+
+def test_the_spawned_usd_asset_is_present():
+    """The asset the cfg names must exist, and its absence must FAIL rather than skip.
+
+    Every other test here re-derives the link topology from these files. If they are
+    missing the derivation is vacuous, so skipping would report success for a guard that
+    never ran -- the failure mode that let the hand-written prim paths rot in the first
+    place.
     """
-    path = pathlib.Path(__file__).resolve().parent
-    while path != path.parent:
-        if (path / "robot_assets").is_dir():
-            return path
-        path = path.parent
-    raise FileNotFoundError("Could not find project root containing 'robot_assets'")
-
-
-# The USD the G1 articulation cfg actually spawns (see assets/robots/g1_21j.py).
-# Must match ``usd_path`` in assets/robots/g1_21j.py.  Not imported from there: that module
-# pulls in isaaclab, and these tests deliberately run without a simulator.
-_USD_DIR = (
-    _project_root() / "robot_assets" / "g1" / "g1_21j"
-    / "g1_21j_box_merged_29j_hands" / "payloads"
-)
-
-pytestmark = pytest.mark.skipif(
-    not _USD_DIR.is_dir(), reason=f"G1 USD payloads not present at {_USD_DIR}"
-)
+    assert _USD_PATH.is_file(), (
+        f"robot_rl.assets.robots.g1_21j.G1_CFG spawns {_USD_PATH}, which does not exist. "
+        "Regenerate it with robot_assets/g1/g1_21j/urdf_to_usd_conversion.py, or point the "
+        "cfg at the asset you meant."
+    )
+    for layer in ("base.usda", "instances.usda", pathlib.Path("Physics") / "physics.usda"):
+        assert (_USD_DIR / layer).is_file(), f"{_USD_DIR / layer} is missing from the payload set"
 
 
 def _joint_graph() -> dict[str, str]:
@@ -57,7 +63,10 @@ def _joint_graph() -> dict[str, str]:
         The authoritative link topology.
     """
     text = (_USD_DIR / "Physics" / "physics.usda").read_text()
-    tokens = re.findall(r"physics:(body0|body1) = </g1_21j/Geometry/([^>]+)>", text)
+    # The prim root is the URDF's ``<robot name=...>``, not the file stem, so match any
+    # single root rather than hard-coding one -- a renamed asset must still be parsed
+    # (and then compared), never silently yield an empty graph.
+    tokens = re.findall(r"physics:(body0|body1) = </[^/>]+/Geometry/([^>]+)>", text)
     graph, parent = {}, None
     for kind, path in tokens:
         leaf = path.split("/")[-1]
