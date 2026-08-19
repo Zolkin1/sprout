@@ -161,10 +161,10 @@ _LEAF_LINKS: frozenset[str] = frozenset(HAND_LINKS)
 #
 # The CAMERA MOUNTS are deliberately absent, and that is a decision rather than an omission:
 # a camera has no use for a picture of its own housing, and the two mounts are the highest
-# triangle-count meshes on the robot.  It leaves a known asymmetry -- MuJoCo's group 1 will
-# contain them once the MJCF is generated from this URDF -- so the mount geoms must be given
-# ``group="0"`` or excluded there.  TODO(mjcf-gen): close that when Part 3 lands; until then
-# nothing generates an MJCF with camera mounts in it.
+# triangle-count meshes on the robot.  MuJoCo agrees rather than diverging:
+# ``make_g1_mjcf.NO_RAYCAST_BODIES`` moves their visual geoms to group 3, out of the {1, 2}
+# the depth cameras cast, and ``tests/test_self_scan_matches_mujoco.py`` fails if either
+# side changes alone.
 SELF_SCAN_LINKS: tuple[str, ...] = LEG_LINKS + ARM_LINKS + HAND_LINKS + BACKPACK_LINKS
 
 # Every link that is deliberately NOT a ray-cast target, with the reason it is not.
