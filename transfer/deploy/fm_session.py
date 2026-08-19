@@ -83,6 +83,15 @@ class FmContext:
     rather than a reordered vector -- every tensor the right size, every kernel reading the
     wrong neighbourhood. Empty for a flat-MLP graph (where pixel order genuinely does not
     matter) or one exported before the field existed."""
+    robot_asset: dict | None = None
+    """WHICH ROBOT this generator was trained on, or ``None`` for a pre-fingerprint graph.
+
+    Content hashes of the URDF / MJCF / USD plus joint names, body names and total mass.
+    A deploy box has no "current robot" to check against -- it has whatever hardware it is
+    bolted to -- so the meaningful check here is that the tracker and the generator describe
+    the SAME one. ``GenTrackerPolicy.load`` is where the two meet, exactly as they do for the
+    depth-camera contract."""
+
     extero_clip: float | None = None
     """Clip band this graph was TRAINED under, or ``None`` for the per-source default.
 
@@ -247,6 +256,10 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         extero_image_hw=[(int(h), int(w)) for h, w in (m.get("extero_image_hw") or [])],
         extero_tokens_per_sensor=int(m.get("extero_tokens_per_sensor", 1)),
         extero_clip=(None if m.get("extero_clip") is None else float(m["extero_clip"])),
+        # ``.get``: absent in every graph exported before the fingerprint existed, and an
+        # absent one is not an error here -- GenTrackerPolicy decides what to do with a pair
+        # where only one side can say which robot it came from.
+        robot_asset=m.get("robot_asset"),
         fm_snap_every=(int(m["fm_snap_every"]) if m.get("fm_snap_every") else None),
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
         has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),

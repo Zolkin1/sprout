@@ -31,12 +31,16 @@ from deploy import gen_tracker as gt  # noqa: E402
 
 
 class _StubTrackerSession:
-    """Minimal stand-in exposing only the ``params`` dict the guard consults."""
+    """Minimal stand-in exposing the ``params`` dict the guard consults."""
 
     params: dict = {}
 
     def __init__(self, path, num_threads=0, providers=None):  # noqa: D107 - signature match
         self.path = path
+
+    def get_robot_asset(self) -> dict | None:
+        """No fingerprint: the robot-asset pair check is not what these tests exercise."""
+        return None
 
 
 class _StubCtx:
@@ -44,6 +48,7 @@ class _StubCtx:
 
     cmd_dim = 3
     N = 4
+    robot_asset = None
 
 
 def _policy(monkeypatch, params: dict, fm_onnx: str | None):

@@ -123,6 +123,59 @@ class _TrackerOnlyCtx:
         self.extero_tokens_per_sensor = 1
 
 
+#: Robot-fingerprint fields worth naming individually in a mismatch message.
+_ROBOT_ASSET_FIELDS = ("joint_names", "total_mass_kg", "body_names",
+                       "urdf_sha256", "mjcf_sha256", "usd_sha256")
+
+
+def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None,
+                               tracker_name: str, fm_name: str) -> None:
+    """Refuse a tracker/generator pair trained on DIFFERENT robots.
+
+    A deploy box has no "current robot" to check an artifact against -- it has whatever
+    hardware it is bolted to. What it can check is that the two halves of the pair agree,
+    exactly as :func:`depth_obs.assert_depth_specs_agree` does for the camera contract:
+    there is one physical robot, so a tracker and a generator running together cannot have
+    been trained on two.
+
+    Silent when either side carries no fingerprint. Every artifact exported before the
+    field existed has none, and refusing those would break every pair on disk; the
+    fingerprint is a guard against a NEW mismatch, not a migration gate.
+
+    Args:
+        tracker_asset: ``tracker.onnx``'s ``policy_parameters.robot_asset``.
+        fm_asset: ``fm.onnx``'s ``fm_meta.robot_asset``.
+        tracker_name: Path, for the message.
+        fm_name: Path, for the message.
+
+    Raises:
+        ValueError: If both carry a fingerprint and a shared field differs.
+    """
+    if not tracker_asset or not fm_asset:
+        return
+    diffs = [k for k in _ROBOT_ASSET_FIELDS
+             if k in tracker_asset and k in fm_asset and tracker_asset[k] != fm_asset[k]]
+    if not diffs:
+        return
+    lines = [
+        f"ROBOT ASSET MISMATCH between {tracker_name} ({tracker_asset.get('short', '?')}) and "
+        f"{fm_name} ({fm_asset.get('short', '?')}): they were trained on different robots, and "
+        "there is only one robot to run them on."
+    ]
+    for k in diffs:
+        t, f = tracker_asset[k], fm_asset[k]
+        if k == "body_names":
+            lines.append(f"  body_names: tracker-only {sorted(set(t) - set(f))}, "
+                         f"fm-only {sorted(set(f) - set(t))}")
+        elif k == "joint_names":
+            lines.append(f"  joint_names: {len(t)} vs {len(f)}")
+        else:
+            lines.append(f"  {k}: {str(t)[:16]} vs {str(f)[:16]}")
+    lines.append("Re-export both from one run, or point --fm_onnx at the generator trained "
+                 "against this tracker.")
+    raise ValueError("\n".join(lines))
+
+
 class GenTrackerPolicy:
     """Drive the RL tracker with the online flow-matching generator (numpy + ORT)."""
 
@@ -193,6 +246,8 @@ class GenTrackerPolicy:
             self.ctx = load_fm_context(self.fm_onnx, self.num_threads, self.providers)
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
+            _assert_robot_assets_agree(self._trk.get_robot_asset(), self.ctx.robot_asset,
+                                       self.tracker_onnx, self.fm_onnx)
         # Re-plan cadence: the tracker metadata (the value the tracker task trained with),
         # else the constructor/CLI default. The old middle tier -- falling back to the FM's
         # fm_snap_every -- existed only to satisfy the agreement rule that has since been
