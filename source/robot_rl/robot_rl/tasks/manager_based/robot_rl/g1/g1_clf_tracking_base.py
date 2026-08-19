@@ -103,6 +103,11 @@ class G1ClfTrackingSceneCfg(InteractiveSceneCfg):
     # arm chain nest UNDER torso_link -- on the old 21-DOF merged model they sat directly on
     # waist_yaw_link.  Match the body itself (no trailing ``/.*``) so a faceplant loads the torso, not its
     # arm descendants.
+    #
+    # This sensor was DEAD until 2026-08-19 and said nothing about it: the box it names sat on
+    # waist_yaw_link, so torso_link had no collider and nothing could ever report contact here.  The box
+    # now lives on torso_link (see the comment on it in g1_21j_29dof.urdf), which also means it finally
+    # rotates with the unlocked waist instead of staying upright under a 30-degree lean.
     torso_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/waist_yaw_link/waist_roll_link/torso_link")
     # The compute backpack, which torso_contact does NOT cover: that path matches the torso
     # body exactly, with no trailing ``/.*``, deliberately so a faceplant loads the torso and

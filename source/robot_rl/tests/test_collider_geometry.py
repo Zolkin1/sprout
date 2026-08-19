@@ -71,6 +71,24 @@ def _boxes() -> dict[str, tuple[np.ndarray, np.ndarray]]:
     return out
 
 
+def _links_with_any_collider() -> set[str]:
+    """Links carrying at least one ``<collision>``, whatever its geometry.
+
+    Separate from :func:`_boxes` on purpose: the overlap test is box-only because an AABB
+    test on boxes is EXACT, while "can this body report contact at all" does not care what
+    shape the collider is. Conflating the two claimed the knees had no collider, when what
+    they have is simply not a box.
+    """
+    return {link.get("name") for link in ET.parse(URDF_PATH).getroot().findall("link")
+            if link.findall("collision")}
+
+
+@pytest.fixture(scope="module")
+def any_collider() -> set[str]:
+    """Every link with a collider of any shape."""
+    return _links_with_any_collider()
+
+
 @pytest.fixture(scope="module")
 def boxes():
     """The robot's box colliders, in the pelvis frame."""
@@ -98,6 +116,66 @@ def test_colliders_do_not_interpenetrate(boxes):
     assert not bad, "\n".join(
         f"{a} and {b} are only {g * 1000:+.2f} mm apart at the rest pose "
         f"(need {MIN_CLEARANCE_M * 1000:.0f} mm)" for a, b, g in bad
+    )
+
+
+#: The contact sensors in ``g1_clf_tracking_base.ClfTrackingBaseEnvSceneCfg``, and whether
+#: each matches its link EXACTLY or matches that link's subtree with a trailing ``/.*``.
+#: The distinction is the whole point: an exact match needs a collider on that very body,
+#: while a subtree match is satisfied by any descendant. ``left_hip_pitch_link`` has no
+#: collider of its own and ``left_thigh_contact`` is fine, because it watches the subtree.
+CONTACT_SENSORS: tuple[tuple[str, str, bool], ...] = (
+    ("left_thigh_contact", "left_hip_pitch_link", True),
+    ("right_thigh_contact", "right_hip_pitch_link", True),
+    ("torso_contact", "torso_link", False),
+    ("backpack_contact", "backpack_shell_link", False),
+    ("left_elbow_contact", "left_shoulder_yaw_link", True),
+    ("right_elbow_contact", "right_shoulder_yaw_link", True),
+    ("left_foot_contact", "left_ankle_pitch_link", True),
+    ("right_foot_contact", "right_ankle_pitch_link", True),
+    ("left_shin_contact", "left_knee_link", False),
+    ("right_shin_contact", "right_knee_link", False),
+)
+
+
+def _descendants(link: str) -> set[str]:
+    """``link`` and everything below it in the URDF's joint tree."""
+    root = ET.parse(URDF_PATH).getroot()
+    children: dict[str, list[str]] = {}
+    for joint in root.findall("joint"):
+        children.setdefault(joint.find("parent").get("link"), []).append(
+            joint.find("child").get("link"))
+    out, stack = set(), [link]
+    while stack:
+        cur = stack.pop()
+        if cur in out:
+            continue
+        out.add(cur)
+        stack.extend(children.get(cur, []))
+    return out
+
+
+@pytest.mark.parametrize("sensor,link,subtree", CONTACT_SENSORS)
+def test_every_contact_sensor_watches_a_body_with_a_collider(sensor, link, subtree,
+                                                             any_collider):
+    """A contact sensor needs something to make contact WITH.
+
+    ``torso_contact`` was dead from the day the 29-DOF waist was un-merged until 2026-08-19:
+    it names ``torso_link`` exactly, the box was on ``waist_yaw_link``, and so one of the
+    five ``undesired_contacts`` sensors could never fire. Nothing said so -- a sensor
+    watching a collider-less body is not an error, it is just always quiet.
+
+    Read from the URDF rather than the env cfg so it needs no simulator. That means the
+    sensor list here is a transcription, and a sensor added to the cfg without being added
+    here is not covered -- worth the trade, because the alternative is importing IsaacLab
+    and building a scene to ask a question the URDF already answers.
+    """
+    covered = _descendants(link) if subtree else {link}
+    hits = covered & any_collider
+    assert hits, (
+        f"{sensor} watches {link}{'/.*' if subtree else ''}, and "
+        f"{'nothing in that subtree has' if subtree else 'that body has no'} a collider. "
+        "It will never fire, and it will never say so."
     )
 
 
