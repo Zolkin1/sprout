@@ -137,16 +137,42 @@ def test_self_scan_links_are_known_links():
         assert link in graph, f"{link} is not a link in the USD"
 
 
-def test_self_scan_covers_all_limbs():
-    """The scan set is exactly the limbs plus the hands -- no spine, nothing missed.
+def test_every_link_is_classified_as_scanned_or_not():
+    """Each link is either a ray-cast target or an explicitly excused exclusion.
 
-    The spine (``waist_*``, ``torso_link``) carries the cameras themselves, so it is
-    excluded; everything else that can occlude them should be present.
+    The point is the PARTITION, not either list: a link added to the robot must be
+    classified deliberately instead of defaulting to invisible. Defaulting to invisible is
+    exactly what happened to the hands, and it cost a debugging cycle because the renderer
+    looked perfect the whole time.
+
+    Stated against ``ss.UNSCANNED_LINKS`` rather than a literal here so the REASON each link
+    is excluded lives next to the exclusion, and so this test keeps working across a robot
+    change instead of being rewritten as a new list of names.
     """
     graph = _joint_graph()
-    spine = {"waist_yaw_link", "waist_roll_link", "torso_link"}
-    assert set(ss.SELF_SCAN_LINKS) == set(graph) - spine
-    assert len(ss.SELF_SCAN_LINKS) == 26 + 16
+    scanned, excused = set(ss.SELF_SCAN_LINKS), set(ss.UNSCANNED_LINKS)
+    assert not scanned & excused, (
+        f"{sorted(scanned & excused)} are both cast and excused from casting"
+    )
+    unclassified = set(graph) - scanned - excused
+    assert not unclassified, (
+        f"{sorted(unclassified)} are links in the USD that nobody classified. Add them to "
+        "SELF_SCAN_LINKS if a camera can see them, or to UNSCANNED_LINKS with the reason."
+    )
+    assert not (scanned | excused) - set(graph), (
+        f"{sorted((scanned | excused) - set(graph))} are named in the code but are not links "
+        "in the USD -- the asset was regenerated without them"
+    )
+
+
+def test_the_limbs_are_all_scanned():
+    """Nothing that can occlude a camera is quietly on the excused list.
+
+    The partition above is satisfiable by excusing everything, so this pins the part that
+    actually matters: every leg, arm and hand link casts.
+    """
+    for link in ss.LEG_LINKS + ss.ARM_LINKS + ss.HAND_LINKS:
+        assert link in ss.SELF_SCAN_LINKS, f"{link} is a limb and must be cast"
 
 
 def test_hands_are_fixed_joint_links_on_the_wrist():
@@ -154,15 +180,20 @@ def test_hands_are_fixed_joint_links_on_the_wrist():
 
     As bare visuals the importer gives them a NON-IDENTITY mesh->body offset, which
     ``MultiMeshRayCaster`` silently fails to intersect -- the depth cameras then see every
-    limb except the hands.  Regenerate with ``make_hand_links_urdf.py`` if this fails.
+    limb except the hands. The rubber hand is exposed to the same trap, which is why
+    ``merge_urdf_joints.py`` is told to ``--keep`` its palm joint instead of folding it into
+    the wrist; if this fails, that flag was dropped.
     """
     graph = _joint_graph()
     for link in ss.HAND_LINKS:
-        assert link in graph, f"{link} is not a link; re-run make_hand_links_urdf.py"
+        assert link in graph, f"{link} is not a link; check the --keep list on the merge"
         assert graph[link] == f"{link.split('_')[0]}_wrist_yaw_link"
     text = (_USD_DIR / "Physics" / "physics.usda").read_text()
     assert text.count('def PhysicsRevoluteJoint "') == 29, "the 29-DOF action space moved"
-    assert text.count('def PhysicsFixedJoint "') == len(ss.HAND_LINKS)
+    # Derived, not pinned: every link that is not driven by one of the 29 revolute joints is
+    # welded on by a fixed one. Pinning the count meant editing this line for each new
+    # bolt-on, which is churn that teaches nobody anything.
+    assert text.count('def PhysicsFixedJoint "') == len(graph) - 29
 
 
 def test_leaf_links_are_not_doubled():

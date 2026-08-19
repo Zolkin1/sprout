@@ -37,21 +37,33 @@ def _find_project_root() -> pathlib.Path:
 
 
 ROBOT_ASSETS = str(_find_project_root() / "robot_assets" / "g1")
+#: The perceptive G1 lives beside the stock one rather than inside it -- it deviates enough
+#: (mode_11 motors, rubber hands, camera mounts, compute backpack) to be its own asset.
+PERCEPTIVE_ASSETS = str(_find_project_root() / "robot_assets" / "g1_perceptive")
 # TODO: Fix warnings about waist_roll_link and yaw_link inertia and mass
 G1_CFG = ArticulationCfg(
     spawn=sim_utils.UsdFileCfg(
-        # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged/g1_21j_box_merged.usda",
-        # 29 DOF (waist roll/pitch + wrists unlocked), hands as FIXED-JOINT LINKS.
-        # The "_hands" variant exists because the stock URDF hangs the hand meshes off the
-        # wrist as bare <visual> elements: the importer then gives them a non-identity
-        # mesh->body offset, and MultiMeshRayCaster does not intersect meshes on that path,
-        # so the depth cameras saw every limb except the hands.  Regenerate both with
-        # robot_assets/g1/g1_21j/{make_hand_links_urdf,urdf_to_usd_conversion}.py.
-        # Joint count and ORDER are identical to the pre-hands asset (verified), so
-        # checkpoints trained on it load unchanged; only body_names grows (30 -> 46, the
-        # old list is an exact prefix).
-        usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_box_merged_29j_hands/g1_21j_box_merged_29j_hands.usda",
-        # usd_path=f"{ROBOT_ASSETS}/g1_21j/g1_21j_merged/g1_21j_merged.usda",
+        # THE PERCEPTIVE G1: mode_11 motors, passive rubber hands, two depth-camera mounts
+        # and the compute backpack.  29 DOF, waist roll/pitch and wrists unlocked.
+        #
+        # The hands are FIXED-JOINT LINKS rather than bare <visual> elements on the wrist,
+        # and must stay that way: the importer gives a bare visual a non-identity mesh->body
+        # offset, MultiMeshRayCaster does not intersect meshes on that path, and the depth
+        # cameras then see every limb except the hands while the renderer looks perfect.
+        #
+        # Regenerate the whole chain with, in order:
+        #   robot_assets/g1/g1_21j/apply_mode11_deltas.py
+        #   robot_assets/g1/g1_21j/merge_urdf_joints.py <src> <dst> \
+        #       --keep left_hand_palm_joint right_hand_palm_joint
+        #   robot_assets/g1_perceptive/make_perceptive_urdf.py
+        #   robot_assets/g1/g1_21j/urdf_to_usd_conversion.py --urdf <abs path to it>
+        #
+        # Joint count and ORDER are unchanged from every previous asset (29, same order), so
+        # nothing about the ACTION VECTOR moved -- but the motors did, and G1_ACTION_SCALE
+        # with them, so pre-mode_11 checkpoints are numerically meaningless here even though
+        # they load.  body_names changes in both directions this time (the 16 Dex3 links go,
+        # 2 hands + 4 camera + 3 backpack arrive), so it is no longer a prefix of the old.
+        usd_path=f"{PERCEPTIVE_ASSETS}/g1_perceptive/g1_perceptive.usda",
         activate_contact_sensors=True,
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             disable_gravity=False,
