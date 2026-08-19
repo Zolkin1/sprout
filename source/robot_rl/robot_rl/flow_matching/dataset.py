@@ -275,6 +275,13 @@ def _resolve_extero_coord_extent(spec: list[dict] | None) -> list[float] | None:
 _DENSE_SCAN_RAYS: int = 1000
 
 
+#: How far a DECLARED ``extero_xyz_offset`` may sit from the contract-derived one before the
+#: dataset build says so. Generous on purpose: this is a stale-geometry alarm, not a
+#: tolerance. The failure it exists for -- the far camera going 35 -> 15 deg -- moves the
+#: offset by ~2.4 m, so anything at this scale is a different camera, not a rounding.
+_XYZ_OFFSET_DRIFT_WARN_M = 0.25
+
+
 def _resolve_xyz_contract(
     cfg: FlowMatchingConfig, spec: list[dict], joint_names: list[str]
 ) -> tuple[list[list[float]], float]:
@@ -1090,10 +1097,27 @@ class FutureStateDataset(Dataset):
                 # declared offset centres the nominal FLAT-GROUND view: on stairs and drop-offs
                 # the real centroid sits some way off, and that residual is the honest price of
                 # a constant that does not move between recordings. Visible, not assumed.
+                # Derive ALWAYS, even when a value is already set, so the contract's own
+                # answer is on screen next to whatever is being used. A declared offset is
+                # legitimate (--extero_xyz_offset exists), but one carried over from a run
+                # whose CAMERA has since moved is not, and the two are indistinguishable in
+                # the config: moving the far camera 35 -> 15 deg walks its boresight ground
+                # intersection from 1.8 m to about 4.3 m while the stored number sits still.
+                derived, envelope = _resolve_xyz_contract(
+                    cfg, self.extero_spec, [str(j) for j in meta.state_joint_names]
+                )
                 if cfg.extero_xyz_offset is None:
-                    cfg.extero_xyz_offset, cfg.extero_xyz_envelope = _resolve_xyz_contract(
-                        cfg, self.extero_spec, [str(j) for j in meta.state_joint_names]
-                    )
+                    cfg.extero_xyz_offset, cfg.extero_xyz_envelope = derived, envelope
+                else:
+                    drift = max(
+                        (sum((a - b) ** 2 for a, b in zip(d, c)) ** 0.5
+                         for d, c in zip(derived, cfg.extero_xyz_offset)), default=0.0)
+                    if drift > _XYZ_OFFSET_DRIFT_WARN_M:
+                        print(f"[fm-data] WARNING: the declared extero_xyz_offset is "
+                              f"{drift:.2f} m from what this recording's camera contract "
+                              f"derives ({derived}). A declared offset is fine; one left over "
+                              "from a different camera geometry is not, and nothing else "
+                              "distinguishes them. Clear it to re-derive.")
                 view = hs.reshape(hs.shape[0], n_sensors, row_channels, -1)
                 for s, cam in enumerate(self.extero_spec):
                     got = view[:, s, 1:4].mean(dim=(0, 2))
