@@ -27,6 +27,7 @@ from typing_extensions import override
 import isaaclab.sim as sim_utils
 from isaaclab.terrains.terrain_importer import TerrainImporter
 
+from motion_gen.clips.clip_fingerprint import fingerprint_terrain_manifest
 from motion_gen.clips.clip_io import load_clip_library
 from .clip_terrain_loader import assemble_clip_terrain
 
@@ -82,6 +83,15 @@ class ClipTerrainImporter(TerrainImporter):
         # Base curriculum origin distribution: terrain_levels (rows) + terrain_types
         # (columns == tiles); env_origins = origins[level, type] = tile center.
         self.configure_env_origins(origins)
+
+        # WHICH TERRAIN this env is standing on, as a content hash of the manifest the mesh
+        # was just built from. The clip library's own `clip_fingerprint` does not cover the
+        # terrain (and in practice is never written at all), so an offline stage that
+        # rewrites tile geometry while leaving the motions alone -- terrain decoration --
+        # is otherwise invisible to every artifact downstream. Recorded into tracker.onnx
+        # by export_parameters; not enforced here, since the importer has nothing to
+        # compare against at env build.
+        self.terrain_fingerprint = fingerprint_terrain_manifest(lib.attrs.get("terrain_manifest"))
 
         self._layout = layout
         self._tile_terrain_id = layout.tile_terrain_id.to(self.device)

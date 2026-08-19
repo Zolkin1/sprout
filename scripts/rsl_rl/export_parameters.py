@@ -530,6 +530,14 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
     # rather than enforced here; the refusal belongs at load, in transfer/deploy.
     params["robot_asset"] = robot_asset_fingerprint_for(unwrapped_env)
 
+    # WHICH TERRAIN it trained on. The clip library's own fingerprint does not cover the
+    # manifest, so a library whose tile geometry was rewritten offline -- motions untouched
+    # -- is indistinguishable from the original to everything downstream. Absent for tasks
+    # whose terrain is not built from a clip manifest.
+    terrain_fp = getattr(getattr(unwrapped_env.scene, "terrain", None), "terrain_fingerprint", None)
+    if terrain_fp:
+        params["terrain_fingerprint"] = terrain_fp
+
     # Convert to serializable format
     params = convert_to_serializable(params)
 
