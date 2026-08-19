@@ -104,6 +104,39 @@ class TileReport:
     platform_after: list[float] = field(default_factory=list)
 
 
+def has_width_variation(manifest: list[dict], kind: str = "transition",
+                        tol: float = 1e-3) -> bool:
+    """Whether a manifest's platforms vary in width at all.
+
+    Straight out of generation they do not: ``mb_terrain_clips`` and ``mb_assemble_library``
+    both stretch every wide stair platform to exactly ``size_y``, as a safety net against a
+    drifting segment stepping off a landing. That is correct there and it is also why a
+    regenerated library silently returns to a uniform world unless this pass is re-run.
+
+    So the question "has this library been decorated?" has a structural answer as well as an
+    attribute one, and this is the structural half -- it still works on a manifest that has
+    been copied out of its file, and it cannot be fooled by an attribute somebody set by hand.
+
+    Args:
+        manifest: The tile list.
+        kind: Tile ``type`` to inspect.
+        tol: Two widths within this are the same width (m).
+
+    Returns:
+        ``True`` if any platform on any tile of that type is not its tile's full width.
+    """
+    for tile in manifest:
+        if tile.get("type") != kind:
+            continue
+        size_y = float(tile["size_y"])
+        for overlay, role in zip(tile["overlays"], classify_overlays(tile)):
+            if role != "platform":
+                continue
+            if abs(float(overlay["size_xyz"][1]) - size_y) > tol:
+                return True
+    return False
+
+
 def tile_rng(seed: int, terrain_id: int) -> np.random.Generator:
     """A generator whose stream depends only on the tile, not on iteration order.
 

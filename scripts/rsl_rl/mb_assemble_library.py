@@ -73,6 +73,13 @@ def _redatum_tile(recs: list[dict], boxes: list[dict], margin: float, geom: str)
     # overlays now (the jump box + its top platform), but its widths are authored deliberately -- stretching
     # the platform across the tile would lay a box-high slab over the whole footprint, margin included.
     if geom == "stairs" and len(overlays) > 1:
+        # NOTE: this makes every stair platform on every tile exactly size_y, so a library
+        # straight out of generation has ZERO platform-width variation and only 0.8-1.2 m of
+        # tread variation. That is deliberate here -- it is the safety net described above --
+        # and scripts/rsl_rl/decorate_terrain.py is what puts the variation back, by
+        # rewriting this same manifest afterwards. Regenerating WITHOUT re-running that pass
+        # silently returns the terrain to uniform;
+        # motion_gen.terrain.decorate.has_width_variation is how to tell which you have.
         min_sx = min(o["size_xyz"][0] for o in overlays)
         for o in overlays:
             if o["size_xyz"][0] > 1.5 * min_sx:

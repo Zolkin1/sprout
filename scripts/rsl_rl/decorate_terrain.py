@@ -43,7 +43,8 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source", "motion_gen"))
 
 from motion_gen.terrain.decorate import (ARMS, DecorateConfig,  # noqa: E402
-                                         decorate_transition_tile, span)
+                                         decorate_transition_tile,
+                                         has_width_variation, span)
 from motion_gen.terrain.footprint import foot_corners  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -117,6 +118,17 @@ def main() -> None:
 
     with h5py.File(args.clip, "r") as f:
         manifest = json.loads(f.attrs["terrain_manifest"])
+        # Refuse a second pass. The arms are seeded per tile, so re-running is not idempotent
+        # -- a narrowed platform would be narrowed again, this time relative to its already
+        # reduced width, and a widened tread would be re-classified as a platform. Structural
+        # rather than attribute-based, so copying a decorated manifest into a fresh file
+        # cannot get around it.
+        if has_width_variation(manifest):
+            raise ValueError(
+                f"{args.clip} already has platform-width variation, so it has been decorated. "
+                "Re-running would compound the edits rather than repeat them. Start from the "
+                "undecorated library."
+            )
         pos_names = json.loads(f.attrs["pos_output_names"])
         terrain_id = np.asarray(f["terrain_id"])
         clip_len = np.asarray(f["clip_len"])

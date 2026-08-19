@@ -22,7 +22,8 @@ import pytest
 
 from motion_gen.terrain.decorate import (ARMS, DecorateConfig, TREAD_WIDTH_FRAC,
                                          _resize_y, classify, classify_overlays,
-                                         decorate_transition_tile, span, tile_rng)
+                                         decorate_transition_tile, has_width_variation,
+                                         span, tile_rng)
 from motion_gen.terrain.footprint import TileFootprint
 
 
@@ -173,3 +174,34 @@ def test_every_arm_is_reachable():
     drawn = {decorate_transition_tile(_tile(terrain_id=t), _footprint(t), cfg).arm
              for t in range(60)}
     assert drawn == set(ARMS)
+
+
+def test_an_undecorated_manifest_reports_no_width_variation():
+    """The structural answer to "has this been decorated?".
+
+    Straight out of generation every stair platform is exactly its tile's width, because both
+    generator paths stretch it there as a safety net. That is what makes the absence of
+    variation a reliable signal, and why it is checked on the geometry rather than on an
+    attribute somebody could set by hand.
+    """
+    assert not has_width_variation([_tile(terrain_id=t) for t in range(5)])
+
+
+def test_a_decorated_manifest_reports_variation_and_cannot_be_decorated_twice():
+    """Re-running is not idempotent -- the arms are seeded per tile, so a second pass narrows
+    an already narrowed platform relative to its reduced width."""
+    tiles = [_tile(terrain_id=t) for t in range(30)]
+    for tile in tiles:
+        decorate_transition_tile(tile, _footprint(int(tile["terrain_id"])),
+                                 DecorateConfig(seed=4))
+    assert has_width_variation(tiles), (
+        "with 30 tiles across three arms at least one platform must have been narrowed"
+    )
+
+
+def test_variation_is_not_claimed_from_a_tile_of_another_type():
+    """Box and terrain tiles are not touched by this pass, so they must not answer for it."""
+    box = _tile(terrain_id=0)
+    box["type"] = "box"
+    box["overlays"][2]["size_xyz"][1] = 1.0        # narrow, but on a box tile
+    assert not has_width_variation([box])
