@@ -1,6 +1,17 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Build the perceptive-G1 URDF: the merged 29-DOF robot plus the two camera mounts.
+"""Build the perceptive-G1 URDF: our G1, as distinct from the stock one.
+
+Four differences from the merged 29-DOF base asset, all of them fixed-joint additions or
+substitutions that leave the 29 actuated joints untouched in name and order:
+
+* the Dex3-1 three-finger hands are replaced by passive RUBBER hands
+  (:func:`swap_rubber_hands`) -- what matters is that the depth cameras see the meshes the
+  hardware actually has;
+* two depth-camera mounts, with an optical frame each (:data:`MOUNTS`);
+* a compute backpack: two masses and one shell (:data:`PAYLOADS`, :data:`SHELLS`);
+* the base asset's 50 meshes are referenced where they live, not copied
+  (:func:`rebase_inherited_meshes`).
 
 Run from anywhere::
 
@@ -54,6 +65,7 @@ resolves ONE FK chain and refuses two different mount bodies.
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -65,6 +77,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_SRC = os.path.join(
     HERE, os.pardir, "g1", "g1_21j", "g1_21j_box_merged_29j_hands.urdf")
 DEFAULT_DST = os.path.join(HERE, "g1_perceptive.urdf")
+#: The UNMERGED datum, which still carries a bare ``wrist_yaw`` -- needed to undo the merge
+#: that folded the Dex3 hand into it. See :func:`swap_rubber_hands`.
+DEFAULT_BARE_SRC = os.path.join(HERE, os.pardir, "g1", "g1_21j", "g1_21j_29dof.urdf")
 
 #: The body the mounts bolt to.
 PARENT_LINK = "torso_link"
@@ -194,6 +209,75 @@ PAYLOADS = (
                 (0.05638, 0.11240, 0.24086), False),
     PayloadSpec("backpack_zed", (-0.177594, -0.0014421, 0.063861), 0.700,
                 (0.07100, 0.09200, 0.11750), False),
+)
+
+
+#: The Dex3-1 three-finger hand as the merged base asset carries it: eight links per side,
+#: welded to ``*_wrist_yaw_link``. Their MASS is not here -- the merge folded all of it into
+#: ``wrist_yaw``, and these carry a 1 ug token so the ray caster has something to hit.
+DEX3_LINKS: tuple[str, ...] = tuple(
+    f"{side}_hand_{part}_link"
+    for side in ("left", "right")
+    for part in ("palm", "thumb_0", "thumb_1", "thumb_2",
+                 "middle_0", "middle_1", "index_0", "index_1")
+)
+
+
+@dataclass(frozen=True)
+class HandSpec:
+    """A passive rubber hand, replacing the Dex3-1 on one wrist.
+
+    Attributes:
+        link: Link name. Upstream calls it ``<side>_rubber_hand`` with no ``_link`` suffix;
+            kept verbatim so a body-name comparison against upstream is meaningful.
+        parent: The wrist link it welds to.
+        joint: Fixed joint name -- the SAME ``<side>_hand_palm_joint`` the Dex3 used, at the
+            same origin, because the rubber hand bolts to the same face.
+        stl: Mesh filename, resolved against the BASE asset's mesh folder.
+        xyz: Joint origin in the parent frame (m).
+        com_xyz: Centre of mass in the link frame (m).
+        mass_kg: Mass.
+        inertia: ``(ixx, ixy, ixz, iyy, iyz, izz)`` about the centre of mass.
+    """
+
+    link: str
+    parent: str
+    joint: str
+    stl: str
+    xyz: tuple[float, float, float]
+    com_xyz: tuple[float, float, float]
+    mass_kg: float
+    inertia: tuple[float, float, float, float, float, float]
+
+
+#: The rubber hands, from upstream ``unitree_ros`` ``g1_description/g1_29dof_mode_11.urdf``
+#: -- the variant this robot IS, so the hand is read from the same file as the motor specs
+#: rather than from a neighbouring revision. (``g1_29dof_rev_1_0.urdf`` carries a
+#: byte-identical hand block, checked: the two differ in joint limits, not in this link. Do
+#: not let that tempt you into treating them as interchangeable elsewhere -- mode_11 is
+#: high-torque hip, revolute-35 waist, light wrists, and those DO differ.)
+#:
+#: Hard-coded because no local asset carries them: our own URDF predates the revision. Not
+#: unverified, though, and by three routes that would have to fail together:
+#:   * the same upstream file's ``left_wrist_yaw_link`` inertial is byte-identical to ours
+#:     in all eight fields, so it is describing our robot;
+#:   * the mount is the Dex3's own ``*_hand_palm_joint`` origin, which our source URDF
+#:     states independently -- the rubber hand bolts to the same face;
+#:   * the shipped ``left_rubber_hand.STL`` is watertight at 159.75 cm^3, so 0.170 kg
+#:     implies 1064 kg/m^3 -- a rubber density -- and that mesh's uniform-density tensor
+#:     reproduces every term below to within 6%.
+#: Upstream gives the hand no ``<collision>``, and neither did the Dex3 here; kept that way.
+HANDS = (
+    HandSpec("left_rubber_hand", "left_wrist_yaw_link", "left_hand_palm_joint",
+             "left_rubber_hand.STL", (0.0415, 0.003, 0.0),
+             (0.05361310808, -0.00295905240, 0.00215413091), 0.170,
+             (0.00010099485234748, 0.00003618590790516, -0.00000074301518642,
+              0.00028135871571621, 0.00000330189743286, 0.00021894770413514)),
+    HandSpec("right_rubber_hand", "right_wrist_yaw_link", "right_hand_palm_joint",
+             "right_rubber_hand.STL", (0.0415, -0.003, 0.0),
+             (0.05361310808, 0.00295905240, 0.00215413091), 0.170,
+             (0.00010099485234748, -0.00003618590790516, -0.00000074301518642,
+              0.00028135871571621, -0.00000330189743286, 0.00021894770413514)),
 )
 
 
@@ -461,6 +545,97 @@ def _report_imager_check(stl_abs: str, m: MountSpec, mpu: float) -> None:
           f"{baseline * 1000:.1f} mm\n")
 
 
+def swap_rubber_hands(root: ET.Element, bare_src: str, base_prefix: str,
+                      hands=HANDS, dex3=DEX3_LINKS) -> float:
+    """Replace the Dex3-1 hands with passive rubber ones. Returns the mass delta (kg).
+
+    The hardware has rubber hands, and the cameras must SEE the meshes the hardware has --
+    that is the whole reason this matters more than a cosmetic swap. Three edits per side:
+
+    1. delete the eight Dex3 links and their fixed joints;
+    2. restore ``wrist_yaw``'s inertial from the UNMERGED source. The merge folded the whole
+       hand into that link (0.084576 -> 0.781122 kg), so leaving it would double-count the
+       hand by 0.70 kg a side against a 0.170 kg replacement;
+    3. weld the rubber hand on at the Dex3's own ``*_hand_palm_joint`` origin.
+
+    Step 2 is checked rather than trusted: the mass the merge added must equal the Dex3
+    links' mass in the unmerged source, or this is not the asset it is assumed to be.
+
+    Args:
+        root: The URDF ``<robot>`` element, edited in place.
+        bare_src: The UNMERGED source URDF, which still has a bare ``wrist_yaw``.
+        base_prefix: Path prefix to the base asset's folder, from
+            :func:`rebase_inherited_meshes` -- the rubber hand meshes live there, not here.
+        hands: The :class:`HandSpec` list.
+        dex3: Link names to remove.
+
+    Returns:
+        Change in total robot mass, kg (negative: rubber is lighter than the Dex3).
+
+    Raises:
+        ValueError: If the base asset does not carry exactly the expected Dex3 links, or if
+            the merged and unmerged wrist masses do not reconcile.
+    """
+    bare = {l.get("name"): l for l in ET.parse(bare_src).getroot().findall("link")}
+    links = {l.get("name"): l for l in root.findall("link")}
+
+    absent = [n for n in dex3 if n not in links]
+    if absent:
+        raise ValueError(
+            f"{len(absent)} of the {len(dex3)} expected Dex3 links are missing from the base "
+            f"asset ({absent[:3]}...). It is not the merged-with-hands URDF this assumes."
+        )
+
+    before = sum(float(m.get("value", 0.0)) for m in root.iterfind("link/inertial/mass"))
+    doomed = set(dex3)
+    for link in [l for l in root.findall("link") if l.get("name") in doomed]:
+        root.remove(link)
+    for joint in [j for j in root.findall("joint")
+                  if j.find("child") is not None and j.find("child").get("link") in doomed]:
+        root.remove(joint)
+
+    for h in hands:
+        merged_link = links[h.parent]
+        merged_mass = float(merged_link.find("inertial/mass").get("value"))
+        bare_inertial = bare[h.parent].find("inertial")
+        bare_mass = float(bare_inertial.find("mass").get("value"))
+        # What the merge folded in must be the hand it folded in. If a future base asset
+        # merges something else into the wrist too, this is where it surfaces.
+        dex3_side = sum(float(bare[n].find("inertial/mass").get("value"))
+                        for n in dex3 if n.startswith(h.parent.split("_")[0]))
+        if abs((merged_mass - bare_mass) - dex3_side) > 1e-6:
+            raise ValueError(
+                f"{h.parent}: the merge added {merged_mass - bare_mass:.6f} kg but the Dex3 "
+                f"links weigh {dex3_side:.6f} kg in {os.path.basename(bare_src)}. Something "
+                "other than the hand was merged into this wrist; restoring the bare inertial "
+                "would silently delete that mass."
+            )
+        merged_link.remove(merged_link.find("inertial"))
+        merged_link.insert(0, copy.deepcopy(bare_inertial))
+        print(f"  {h.parent}: {merged_mass:.6f} -> {bare_mass:.6f} kg "
+              f"(un-merged the {dex3_side:.6f} kg Dex3 hand)")
+
+        link = ET.Element("link", {"name": h.link})
+        inertial = ET.SubElement(link, "inertial")
+        ET.SubElement(inertial, "origin", {"xyz": _xyz(h.com_xyz), "rpy": "0 0 0"})
+        ET.SubElement(inertial, "mass", {"value": f"{h.mass_kg:g}"})
+        ET.SubElement(inertial, "inertia", dict(zip(
+            ("ixx", "ixy", "ixz", "iyy", "iyz", "izz"),
+            (f"{v:.17g}" for v in h.inertia))))
+        visual = ET.SubElement(link, "visual")
+        ET.SubElement(visual, "origin", {"xyz": "0 0 0", "rpy": "0 0 0"})
+        ET.SubElement(ET.SubElement(visual, "geometry"), "mesh", {
+            "filename": os.path.normpath(os.path.join(base_prefix, "meshes", h.stl))})
+        mat = ET.SubElement(visual, "material", {"name": "rubber_hand_black"})
+        ET.SubElement(mat, "color", {"rgba": "0.15 0.15 0.15 1"})
+        root.append(link)
+        root.append(_fixed_joint(h.joint, h.parent, h.link, h.xyz))
+        print(f"    + {h.link}  {h.mass_kg * 1000:.0f} g at {_xyz(h.xyz)} on {h.parent}")
+
+    after = sum(float(m.get("value", 0.0)) for m in root.iterfind("link/inertial/mass"))
+    return after - before
+
+
 def rebase_inherited_meshes(root: ET.Element, src: str, dst: str) -> int:
     """Repoint the base robot's mesh paths at where they actually live.
 
@@ -479,7 +654,8 @@ def rebase_inherited_meshes(root: ET.Element, src: str, dst: str) -> int:
         dst: Where it is about to be written.
 
     Returns:
-        How many mesh references were repointed.
+        ``(count, prefix)`` -- how many references were repointed, and the prefix, which
+        anything added LATER from the base asset's mesh folder needs too.
     """
     prefix = os.path.relpath(os.path.dirname(src), os.path.dirname(dst))
     n = 0
@@ -488,7 +664,7 @@ def rebase_inherited_meshes(root: ET.Element, src: str, dst: str) -> int:
         if fn and not os.path.isabs(fn) and "://" not in fn:
             mesh.set("filename", os.path.normpath(os.path.join(prefix, fn)))
             n += 1
-    return n
+    return n, prefix
 
 
 def _add_payloads(root: ET.Element, payloads) -> float:
@@ -609,7 +785,8 @@ def urdf_total_mass(root: ET.Element) -> float:
                for m in root.iterfind("link/inertial/mass"))
 
 
-def build(src: str, dst: str, mounts=MOUNTS, payloads=PAYLOADS, shells=SHELLS) -> None:
+def build(src: str, dst: str, bare_src: str = DEFAULT_BARE_SRC, mounts=MOUNTS,
+          payloads=PAYLOADS, shells=SHELLS) -> None:
     """Write ``dst``: ``src`` plus one mesh link and one optical frame per mount."""
     tree = ET.parse(src)
     root = tree.getroot()
@@ -617,11 +794,17 @@ def build(src: str, dst: str, mounts=MOUNTS, payloads=PAYLOADS, shells=SHELLS) -
     if PARENT_LINK not in existing:
         raise ValueError(f"{src} has no '{PARENT_LINK}' to mount the cameras on.")
 
-    print(f"[perceptive] base {os.path.relpath(src, HERE)}")
+    base_mass = urdf_total_mass(root)
+    print(f"[perceptive] base {os.path.relpath(src, HERE)}  ({base_mass:.3f} kg)")
     # Before appending anything: this must see only the INHERITED meshes. The mount and
     # shell meshes are ours and are already relative to this file.
-    n = rebase_inherited_meshes(root, src, dst)
+    n, base_prefix = rebase_inherited_meshes(root, src, dst)
     print(f"[perceptive] repointed {n} inherited mesh paths at the base asset's own folder")
+
+    print(f"\n[perceptive] hands: Dex3-1 -> passive rubber\n")
+    d_hands = swap_rubber_hands(root, bare_src, base_prefix)
+    print(f"  net {d_hands:+.6f} kg\n")
+
     print(f"[perceptive] mounting on {PARENT_LINK}\n")
     for m in mounts:
         stl_abs = os.path.join(HERE, "meshes", m.stl)
@@ -668,12 +851,11 @@ def build(src: str, dst: str, mounts=MOUNTS, payloads=PAYLOADS, shells=SHELLS) -
         print(f"    boresight (mesh +z == optical +x): {np.round(mesh_bore, 4)}")
         _report_imager_check(stl_abs, m, mpu)
 
-    base_mass = urdf_total_mass(root)
     print(f"[perceptive] payloads on {PARENT_LINK}\n")
     added = _add_payloads(root, payloads)
     _add_shells(root, shells, payloads)
     print(f"[perceptive] mass {base_mass:.3f} -> {urdf_total_mass(root):.3f} kg "
-          f"(+{added:.3f} kg of payload)")
+          f"({d_hands:+.3f} kg hands, +{added:.3f} kg payload)")
 
     ET.indent(tree, space="  ")
     tree.write(dst, encoding="utf-8", xml_declaration=True)
@@ -686,8 +868,11 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--src", default=DEFAULT_SRC, help="Base 29-DOF URDF to extend.")
     p.add_argument("--dst", default=DEFAULT_DST, help="Output URDF.")
+    p.add_argument("--bare_src", default=DEFAULT_BARE_SRC,
+                   help="Unmerged 29-DOF URDF, the datum for un-merging the hand mass.")
     args = p.parse_args()
-    build(os.path.abspath(args.src), os.path.abspath(args.dst))
+    build(os.path.abspath(args.src), os.path.abspath(args.dst),
+          os.path.abspath(args.bare_src))
 
 
 if __name__ == "__main__":

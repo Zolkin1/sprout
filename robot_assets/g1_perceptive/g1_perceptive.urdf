@@ -591,6 +591,11 @@
     <limit effort="5" velocity="22" lower="-1.614429558" upper="1.614429558" />
   </joint>
   <link name="left_wrist_yaw_link">
+    <inertial>
+      <origin xyz="0.02200381568 0.00049485096 0.00053861123" rpy="0 0 0" />
+      <mass value="0.08457647" />
+      <inertia ixx="0.00004929128828" ixy="-0.00000045735494" ixz="0.00000445867591" iyy="0.00005973338134" iyz="0.00000043217198" izz="0.00003928083826" />
+    </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
@@ -606,11 +611,6 @@
         <sphere radius="0.055" />
       </geometry>
     </collision>
-    <inertial>
-      <origin xyz="0.08923379573 -0.0118252745 -8.919264166e-05" rpy="0 0 0" />
-      <mass value="0.78112246" />
-      <inertia ixx="0.000835849357" ixy="4.986191308e-06" ixz="8.892111821e-06" iyy="0.001431187274" iyz="1.761055072e-06" izz="0.001480713877" />
-    </inertial>
   </link>
   <link name="right_shoulder_pitch_link">
     <inertial>
@@ -764,6 +764,11 @@
     <limit effort="5" velocity="22" lower="-1.614429558" upper="1.614429558" />
   </joint>
   <link name="right_wrist_yaw_link">
+    <inertial>
+      <origin xyz="0.02200381568 -0.00049485096 0.00053861123" rpy="0 0 0" />
+      <mass value="0.08457647" />
+      <inertia ixx="0.00004929128828" ixy="0.00000045735494" ixz="0.00000445867591" iyy="0.00005973338134" iyz="-0.00000043217198" izz="0.00003928083826" />
+    </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
@@ -779,347 +784,48 @@
         <sphere radius="0.055" />
       </geometry>
     </collision>
-    <inertial>
-      <origin xyz="0.08923379573 0.0118252745 -8.919264166e-05" rpy="0 0 0" />
-      <mass value="0.78112246" />
-      <inertia ixx="0.000835849357" ixy="-4.986191308e-06" ixz="8.892111821e-06" iyy="0.001431187274" iyz="-1.761055072e-06" izz="0.001480713877" />
-    </inertial>
   </link>
-  <link name="left_hand_palm_link">
+  <link name="left_rubber_hand">
     <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
+      <origin xyz="0.0536131081 -0.0029590524 0.00215413091" rpy="0 0 0" />
+      <mass value="0.17" />
+      <inertia ixx="0.00010099485234748001" ixy="3.6185907905160002e-05" ixz="-7.4301518641999996e-07" iyy="0.00028135871571620998" iyz="3.3018974328599999e-06" izz="0.00021894770413514" />
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="../g1/g1_21j/meshes/left_hand_palm_link.STL" />
+        <mesh filename="../g1/g1_21j/meshes/left_rubber_hand.STL" />
       </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
+      <material name="rubber_hand_black">
+        <color rgba="0.15 0.15 0.15 1" />
       </material>
     </visual>
   </link>
-  <joint name="left_hand_palm_link_fixed_joint" type="fixed">
-    <origin xyz="0.0415 0.003 0" rpy="0 -0 0" />
+  <joint name="left_hand_palm_joint" type="fixed">
+    <origin xyz="0.0415 0.003 0" rpy="0 0 0" />
     <parent link="left_wrist_yaw_link" />
-    <child link="left_hand_palm_link" />
+    <child link="left_rubber_hand" />
   </joint>
-  <link name="left_hand_thumb_0_link">
+  <link name="right_rubber_hand">
     <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
+      <origin xyz="0.0536131081 0.0029590524 0.00215413091" rpy="0 0 0" />
+      <mass value="0.17" />
+      <inertia ixx="0.00010099485234748001" ixy="-3.6185907905160002e-05" ixz="-7.4301518641999996e-07" iyy="0.00028135871571620998" iyz="-3.3018974328599999e-06" izz="0.00021894770413514" />
     </inertial>
     <visual>
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
-        <mesh filename="../g1/g1_21j/meshes/left_hand_thumb_0_link.STL" />
+        <mesh filename="../g1/g1_21j/meshes/right_rubber_hand.STL" />
       </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
+      <material name="rubber_hand_black">
+        <color rgba="0.15 0.15 0.15 1" />
       </material>
     </visual>
   </link>
-  <joint name="left_hand_thumb_0_link_fixed_joint" type="fixed">
-    <origin xyz="0.067 0.003 0" rpy="0 -0 0" />
-    <parent link="left_wrist_yaw_link" />
-    <child link="left_hand_thumb_0_link" />
-  </joint>
-  <link name="left_hand_thumb_1_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/left_hand_thumb_1_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="left_hand_thumb_1_link_fixed_joint" type="fixed">
-    <origin xyz="0.0645 -0.0163 0" rpy="0 -0 0" />
-    <parent link="left_wrist_yaw_link" />
-    <child link="left_hand_thumb_1_link" />
-  </joint>
-  <link name="left_hand_thumb_2_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/left_hand_thumb_2_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="left_hand_thumb_2_link_fixed_joint" type="fixed">
-    <origin xyz="0.0645 -0.0621 0" rpy="0 -0 1.57" />
-    <parent link="left_wrist_yaw_link" />
-    <child link="left_hand_thumb_2_link" />
-  </joint>
-  <link name="left_hand_middle_0_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/left_hand_middle_0_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="left_hand_middle_0_link_fixed_joint" type="fixed">
-    <origin xyz="0.1192 0.0046 -0.0285" rpy="0 -0 -1.57" />
-    <parent link="left_wrist_yaw_link" />
-    <child link="left_hand_middle_0_link" />
-  </joint>
-  <link name="left_hand_middle_1_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/left_hand_middle_1_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="left_hand_middle_1_link_fixed_joint" type="fixed">
-    <origin xyz="0.1192364718 -0.04119998548 -0.0285" rpy="0 -0 -3.14" />
-    <parent link="left_wrist_yaw_link" />
-    <child link="left_hand_middle_1_link" />
-  </joint>
-  <link name="left_hand_index_0_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/left_hand_index_0_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="left_hand_index_0_link_fixed_joint" type="fixed">
-    <origin xyz="0.1192 0.0046 0.0285" rpy="0 -0 -1.57" />
-    <parent link="left_wrist_yaw_link" />
-    <child link="left_hand_index_0_link" />
-  </joint>
-  <link name="left_hand_index_1_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/left_hand_index_1_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="left_hand_index_1_link_fixed_joint" type="fixed">
-    <origin xyz="0.1192364718 -0.04119998548 0.0285" rpy="0 -0 -3.14" />
-    <parent link="left_wrist_yaw_link" />
-    <child link="left_hand_index_1_link" />
-  </joint>
-  <link name="right_hand_palm_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/right_hand_palm_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="right_hand_palm_link_fixed_joint" type="fixed">
-    <origin xyz="0.0415 -0.003 0" rpy="0 -0 0" />
+  <joint name="right_hand_palm_joint" type="fixed">
+    <origin xyz="0.0415 -0.003 0" rpy="0 0 0" />
     <parent link="right_wrist_yaw_link" />
-    <child link="right_hand_palm_link" />
-  </joint>
-  <link name="right_hand_thumb_0_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/right_hand_thumb_0_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="right_hand_thumb_0_link_fixed_joint" type="fixed">
-    <origin xyz="0.067 -0.003 0" rpy="0 -0 0" />
-    <parent link="right_wrist_yaw_link" />
-    <child link="right_hand_thumb_0_link" />
-  </joint>
-  <link name="right_hand_thumb_1_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/right_hand_thumb_1_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="right_hand_thumb_1_link_fixed_joint" type="fixed">
-    <origin xyz="0.0645 0.0163 0" rpy="0 -0 0" />
-    <parent link="right_wrist_yaw_link" />
-    <child link="right_hand_thumb_1_link" />
-  </joint>
-  <link name="right_hand_thumb_2_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/right_hand_thumb_2_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="right_hand_thumb_2_link_fixed_joint" type="fixed">
-    <origin xyz="0.0645 0.0621 0" rpy="0 -0 -1.57" />
-    <parent link="right_wrist_yaw_link" />
-    <child link="right_hand_thumb_2_link" />
-  </joint>
-  <link name="right_hand_middle_0_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/right_hand_middle_0_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="right_hand_middle_0_link_fixed_joint" type="fixed">
-    <origin xyz="0.1192 -0.0046 -0.0285" rpy="0 -0 1.57" />
-    <parent link="right_wrist_yaw_link" />
-    <child link="right_hand_middle_0_link" />
-  </joint>
-  <link name="right_hand_middle_1_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/right_hand_middle_1_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="right_hand_middle_1_link_fixed_joint" type="fixed">
-    <origin xyz="0.1192364718 0.04119998548 -0.0285" rpy="0 -0 3.14" />
-    <parent link="right_wrist_yaw_link" />
-    <child link="right_hand_middle_1_link" />
-  </joint>
-  <link name="right_hand_index_0_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/right_hand_index_0_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="right_hand_index_0_link_fixed_joint" type="fixed">
-    <origin xyz="0.1192 -0.0046 0.0285" rpy="0 -0 1.57" />
-    <parent link="right_wrist_yaw_link" />
-    <child link="right_hand_index_0_link" />
-  </joint>
-  <link name="right_hand_index_1_link">
-    <inertial>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <mass value="1e-06" />
-      <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
-    </inertial>
-    <visual>
-      <origin xyz="0 0 0" rpy="0 0 0" />
-      <geometry>
-        <mesh filename="../g1/g1_21j/meshes/right_hand_index_1_link.STL" />
-      </geometry>
-      <material name="white">
-        <color rgba="0.7 0.7 0.7 1" />
-      </material>
-    </visual>
-  </link>
-  <joint name="right_hand_index_1_link_fixed_joint" type="fixed">
-    <origin xyz="0.1192364718 0.04119998548 0.0285" rpy="0 -0 3.14" />
-    <parent link="right_wrist_yaw_link" />
-    <child link="right_hand_index_1_link" />
+    <child link="right_rubber_hand" />
   </joint>
   <link name="camera_lower_mount_link">
     <inertial>
