@@ -369,9 +369,10 @@ the same tests). `g1_deploy::CameraPoseFk` FKs the depth cameras every tick — 
 cameras are — and `deploy.fk` draws the RViz/viewer plan ribbon, which used to be MuJoCo on
 `FlowMatchingConfig.fk_model_path`. The "FK'ing the ROS URDF would be a SECOND OPINION"
 objection is measured, not argued: URDF vs MJCF is 4e-13 on the camera chain and 4.6e-7 m at
-the wrists (`deploy/tests/test_fk_parity.py`, MuJoCo kept as a test-only oracle), so the image
-carries no MuJoCo and the robot has one kinematic description. The URDF is a controller
-PARAMETER (`urdf_path`), not a constant.
+the wrists (`deploy/tests/test_fk_parity.py`, MuJoCo kept as a test-only oracle), so the
+deploy code has ONE kinematics library rather than two. It is not an image-size win — obelisk's own sim is a
+MuJoCo sim, so the image installs it regardless. The URDF is a controller PARAMETER
+(`urdf_path`), not a constant.
 - Two CMake traps, both of which fail pointing somewhere else: pinocchio 4.0's
   `pinocchio_parsers` reaches `coal::coal` and its own config does not `find_dependency` it, and
   an imported target is DIRECTORY-SCOPED — so `deploy_cpp` finds coal and promotes it

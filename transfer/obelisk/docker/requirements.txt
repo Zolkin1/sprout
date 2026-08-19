@@ -58,8 +58,12 @@ h5py
 # generator's FK loss is defined against -- so that the drawn feet could not become a SECOND
 # OPINION about where the feet are. Measured, that is not what the choice buys: over random
 # postures the MJCF and the ROS URDF place the four ribbon frames within 4.6e-7 m
-# (transfer/deploy/tests/test_fk_parity.py, MuJoCo kept as a test-only oracle). So the image
-# no longer carries MuJoCo for a drawing tool, and the robot has one kinematic description.
+# (transfer/deploy/tests/test_fk_parity.py, MuJoCo kept as a test-only oracle).
+#
+# NOT AN IMAGE-SIZE WIN, and do not read it as one: the image still installs MuJoCo, because
+# obelisk's own sim is a MuJoCo sim (setup.sh --downstream-setup --mujoco, in the Dockerfile).
+# Dropping the line removes a DECLARED dependency of the deploy code, so `transfer/deploy` has
+# one kinematics library and it is the same one the C++ controller FKs the cameras with.
 
 # Log plotting (plot_utils/); dev-box tooling, harmless on the robot.
 matplotlib

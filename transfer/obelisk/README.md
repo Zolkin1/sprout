@@ -465,7 +465,9 @@ and a discrepancy between them is real. That model is the ROS URDF rather than
 `FlowMatchingConfig.fk_model_path`, the MJCF the generator's own FK loss is defined against:
 the two agree on these four frames to 4.6e-7 m over random postures
 (`transfer/deploy/tests/test_fk_parity.py`, with MuJoCo kept as a test-only oracle), so the
-ribbon is not a second opinion, and the robot carries one kinematics library instead of two.
+ribbon is not a second opinion, and the deploy code carries one kinematics library instead of
+two -- the same one the C++ controller FKs the cameras with. The IMAGE still installs MuJoCo
+either way, since obelisk's own sim is a MuJoCo sim.
 
 **The green-vs-orange overlay is the highest-value thing on this display.** The served window
 should lie on the plan at `cursor + offsets`. It is drawn by a different route -- lifted onto

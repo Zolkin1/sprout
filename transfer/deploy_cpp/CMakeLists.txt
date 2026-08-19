@@ -121,6 +121,17 @@ if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
     PUBLIC g1_deploy onnxruntime::onnxruntime
     PRIVATE nlohmann_json::nlohmann_json)
   target_compile_options(g1_deploy_ort PRIVATE -Wall -Wextra -Wpedantic)
+  # The pre-ROS gate: does onnxruntime run THIS pair on THIS GPU inside the budget? It reads
+  # the shapes off the graph rather than restating them, so it also answers "is this artifact
+  # what I think it is" before a controller, a world and a joystick are in the picture.
+  #
+  # It shipped with the first C++ commit and was wired into NOTHING until now, which is why it
+  # answered that question for nobody. It links onnxruntime directly and none of this library:
+  # the point is to isolate the runtime, so a failure here cannot be our arithmetic.
+  add_executable(ort_smoke tools/ort_smoke.cc)
+  target_link_libraries(ort_smoke PRIVATE onnxruntime::onnxruntime)
+  target_compile_options(ort_smoke PRIVATE -Wall -Wextra -Wpedantic)
+
   set(G1_DEPLOY_HAVE_ORT TRUE)
 else()
   # WARNING, not STATUS. What is skipped is four source files -- ort_session, tracker_session,
