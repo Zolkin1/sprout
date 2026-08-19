@@ -271,3 +271,42 @@ def test_the_box_variant_stream_is_independent_of_the_arm_stream():
     arm_stream = [tile_rng(cfg.seed, t).random() for t in range(10)]
     box_stream = [tile_rng(cfg.seed ^ 0x5EED, t).random() for t in range(10)]
     assert arm_stream != box_stream
+
+
+def test_box_widening_only_ever_adds_surface():
+    """A recorded landing cannot be invalidated by making its target bigger."""
+    cfg = DecorateConfig(seed=2, box_widen_frac=1.0)
+    for tid in range(30):
+        tile = _box_tile(terrain_id=tid)
+        before = [span(o) for o in tile["overlays"]]
+        decorate_box_tile(tile, cfg, _footprint(tid, lo=1.6, hi=2.4))
+        for o, (old_lo, old_hi) in zip(tile["overlays"], before):
+            lo, hi = span(o)
+            assert lo <= old_lo + 1e-9 and hi >= old_hi - 1e-9, f"box shrank on tile {tid}"
+
+
+def test_boxes_are_left_alone_without_a_footprint():
+    """Widening needs the envelope; without it only the variant may be assigned.
+
+    Silently widening to the tile instead would be the one edit that CANNOT be checked
+    against where the feet go.
+    """
+    tile = _box_tile()
+    before = copy.deepcopy(tile["overlays"])
+    decorate_box_tile(tile, DecorateConfig(seed=0, box_widen_frac=1.0), None)
+    for old, new in zip(before, tile["overlays"]):
+        assert old["size_xyz"] == new["size_xyz"]
+        assert old["pos_xy"] == new["pos_xy"]
+
+
+def test_not_every_box_tile_is_widened():
+    """The narrow-target case must survive, or the variety is just moved rather than added."""
+    cfg = DecorateConfig(seed=1)
+    modes = []
+    for tid in range(60):
+        tile = _box_tile(terrain_id=tid)
+        modes.append(decorate_box_tile(tile, cfg, _footprint(tid, lo=1.6, hi=2.4)))
+    widened = sum(1 for m in modes if m.endswith("widened"))
+    assert 0 < widened < len(modes), (
+        f"{widened} of {len(modes)} widened; both cases must occur"
+    )

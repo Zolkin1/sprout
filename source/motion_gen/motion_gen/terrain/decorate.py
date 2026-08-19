@@ -85,6 +85,9 @@ class DecorateConfig:
         clearance_m: Slack left inside the tile edge when a surface is grown to it.
         box_variant_fracs: How the box tiles' overlays are split across
             :data:`BOX_VARIANTS`. Must sum to 1.
+        box_widen_frac: Fraction of BOX tiles whose overlays are widened at all. The rest
+            keep their authored width, so the narrow-target case does not disappear.
+        box_full_frac: Of those widened, the fraction taken all the way to the tile.
     """
 
     seed: int = 0
@@ -93,6 +96,8 @@ class DecorateConfig:
     min_tread_m: float = 0.80
     clearance_m: float = 0.02
     box_variant_fracs: tuple[float, float, float, float] = (0.40, 0.20, 0.20, 0.20)
+    box_widen_frac: float = 0.55
+    box_full_frac: float = 0.30
 
 
 @dataclass
@@ -232,23 +237,34 @@ def _resize_y(overlay: dict, lo: float, hi: float, *, must_contain: tuple[float,
     overlay["pos_xy"] = [float(overlay["pos_xy"][0]), float((lo + hi) / 2.0)]
 
 
-def decorate_box_tile(tile: dict, cfg: DecorateConfig) -> str:
-    """Give one box tile's overlays support variants. Returns a summary string.
+def decorate_box_tile(tile: dict, cfg: DecorateConfig,
+                     footprint: TileFootprint | None = None) -> str:
+    """Give one box tile's overlays a support variant and, sometimes, a wider top.
 
-    Geometry is NOT touched: only the ``variant`` field is written, and every variant shares
-    the same walkable top and the same footprint. That is what makes this safe to apply to a
-    library whose motion is already recorded -- the surface the feet meet is identical, and
-    only what is underneath it changes.
+    Two independent edits.
+
+    **Variant** touches no geometry at all: every variant puts its walkable top at exactly
+    ``base_z + size_z`` and keeps its legs inside the solid box's own footprint, so the
+    surface the feet meet is identical and only what is underneath changes.
+
+    **Width** is the same grow-in-place rule the stairs get, and it exists because the boxes
+    are all NARROW. Measured over the shipped library: 0.264 to 1.197 m, a median of 23% of
+    their tile and a maximum of 37%, with not one spanning its tile. So the robot only ever
+    jumps onto a narrow target -- there is no wide platform to land on anywhere in training.
+    Widening only ever ADDS surface, so a recorded landing cannot be invalidated; ``_resize_y``
+    asserts that rather than assuming it.
 
     Args:
-        tile: A manifest entry of type ``box``; its overlays gain a ``variant``.
-        cfg: Knobs; ``box_variant_fracs`` weights the draw.
+        tile: A manifest entry of type ``box``; its overlays are edited.
+        cfg: Knobs.
+        footprint: The tile's foot envelope. Required to widen; without it only the variant
+            is assigned, because a widened box must still be a superset of where the feet go.
 
     Returns:
-        The variants assigned, comma-joined, for the run log.
+        A summary for the run log.
 
     Raises:
-        ValueError: If the weights do not sum to 1.
+        ValueError: If the variant weights do not sum to 1.
     """
     if abs(sum(cfg.box_variant_fracs) - 1.0) > 1e-9:
         raise ValueError(
@@ -260,7 +276,26 @@ def decorate_box_tile(tile: dict, cfg: DecorateConfig) -> str:
         variant = str(rng.choice(BOX_VARIANTS, p=list(cfg.box_variant_fracs)))
         overlay["variant"] = variant
         chosen.append(variant)
-    return ",".join(chosen)
+
+    widened = "asis"
+    if footprint is not None and rng.random() < cfg.box_widen_frac:
+        size_y = float(tile["size_y"])
+        full_lo, full_hi = cfg.clearance_m, size_y - cfg.clearance_m
+        env_lo = max(full_lo, footprint.y_min_sized)
+        env_hi = min(full_hi, footprint.y_max_sized)
+        for overlay in tile["overlays"]:
+            old_lo, old_hi = span(overlay)
+            need_lo, need_hi = min(old_lo, env_lo), max(old_hi, env_hi)
+            if rng.random() < cfg.box_full_frac:
+                target_lo, target_hi = full_lo, full_hi
+            else:
+                t = float(rng.random())
+                target_lo = need_lo + (full_lo - need_lo) * t
+                target_hi = need_hi + (full_hi - need_hi) * t
+            _resize_y(overlay, min(target_lo, old_lo), max(target_hi, old_hi),
+                      must_contain=(need_lo, need_hi), widening=True)
+        widened = "widened"
+    return f"{','.join(chosen)}|{widened}"
 
 
 def decorate_transition_tile(tile: dict, footprint: TileFootprint,

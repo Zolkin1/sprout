@@ -145,11 +145,14 @@ def main() -> None:
             tid = int(tile["terrain_id"])
             reports[tid] = decorate_transition_tile(tile, prints[tid], cfg)
 
+        box_w_before = [float(o["size_xyz"][1]) for t in manifest if t.get("type") == "box"
+                        for o in t["overlays"]]
         box_variants = {}
         if not args.no_box_variants:
             for tile in manifest:
                 if tile.get("type") == "box":
-                    box_variants[int(tile["terrain_id"])] = decorate_box_tile(tile, cfg)
+                    tid = int(tile["terrain_id"])
+                    box_variants[tid] = decorate_box_tile(tile, cfg, prints.get(tid))
 
         print(f"\n[decor] {len(reports)} transition tiles rewritten, seed {args.seed}")
         counts = {a: sum(1 for r in reports.values() if r.arm == a) for a in ARMS}
@@ -167,15 +170,24 @@ def main() -> None:
 
         if box_variants:
             counts = {v: 0 for v in BOX_VARIANTS}
+            n_widened = 0
             for spec in box_variants.values():
-                for v in spec.split(","):
+                variants, _, mode = spec.partition("|")
+                for v in variants.split(","):
                     counts[v] += 1
+                n_widened += mode == "widened"
             total = sum(counts.values())
             print(f"[decor] box support variants over {len(box_variants)} tiles "
                   f"({total} overlays): "
                   + "  ".join(f"{v}={n}" for v, n in counts.items()))
             print("[decor]   walkable top and footprint are identical for every variant, so "
                   "no foot that was supported before is unsupported now")
+            bw = [float(o["size_xyz"][1]) for t in manifest if t.get("type") == "box"
+                  for o in t["overlays"]]
+            print(f"[decor] box widths: {min(box_w_before):.3f}..{max(box_w_before):.3f}"
+                  f" -> {min(bw):.3f}..{max(bw):.3f} m "
+                  f"(median {np.median(bw):.3f}); {n_widened} of {len(box_variants)} "
+                  "tiles widened")
 
         print("\n[decor] validating every rewritten tile against its own foot samples")
         failures = 0
