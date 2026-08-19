@@ -21,7 +21,8 @@ import numpy as np
 import pytest
 
 from motion_gen.terrain.decorate import (ARMS, DecorateConfig, TREAD_WIDTH_FRAC,
-                                         _resize_y, classify, classify_overlays,
+                                         BOX_VARIANTS, _resize_y, classify,
+                                         classify_overlays, decorate_box_tile,
                                          decorate_transition_tile, has_width_variation,
                                          span, tile_rng)
 from motion_gen.terrain.footprint import TileFootprint
@@ -205,3 +206,68 @@ def test_variation_is_not_claimed_from_a_tile_of_another_type():
     box["type"] = "box"
     box["overlays"][2]["size_xyz"][1] = 1.0        # narrow, but on a box tile
     assert not has_width_variation([box])
+
+
+def _box_tile(terrain_id: int = 0) -> dict:
+    """A box tile: a jump box and its landing platform, as the library has them."""
+    return {
+        "terrain_id": terrain_id, "type": "box", "size_x": 20.0, "size_y": 4.0,
+        "has_floor": True, "frame_yaw": 0.0, "family": "family_box.h5",
+        "overlays": [_overlay(2.0, 1.074, pos_x=13.5, size_x=0.463),
+                     _overlay(2.0, 1.074, pos_x=16.1, size_x=4.712)],
+    }
+
+
+def test_box_variants_change_only_the_variant_field():
+    """The walkable top and the footprint must survive untouched.
+
+    That invariant is the entire safety argument: every variant puts its top at
+    base_z + size_z and keeps the legs inside the solid box's own footprint, so no foot that
+    was supported before is unsupported after and the height scan reads the same surface.
+    Only what the DEPTH CAMERAS see changes.
+    """
+    tile = _box_tile()
+    before = copy.deepcopy(tile)
+    decorate_box_tile(tile, DecorateConfig(seed=0))
+    for old, new in zip(before["overlays"], tile["overlays"]):
+        assert new["variant"] in BOX_VARIANTS
+        assert old["size_xyz"] == new["size_xyz"]
+        assert old["pos_xy"] == new["pos_xy"]
+        assert old["base_z"] == new["base_z"]
+        assert old["walkable_top"] == new["walkable_top"]
+        assert "variant" not in old
+
+
+def test_box_variant_weights_must_sum_to_one():
+    """A typo'd distribution would silently starve a variant, or oversample one."""
+    cfg = DecorateConfig(box_variant_fracs=(0.5, 0.2, 0.2, 0.2))
+    with pytest.raises(ValueError, match="must sum to 1"):
+        decorate_box_tile(_box_tile(), cfg)
+
+
+def test_every_box_variant_is_reachable():
+    """All four, or the feature is narrower than it claims."""
+    cfg = DecorateConfig(seed=3)
+    seen = set()
+    for t in range(120):
+        tile = _box_tile(terrain_id=t)
+        decorate_box_tile(tile, cfg)
+        seen.update(o["variant"] for o in tile["overlays"])
+    assert seen == set(BOX_VARIANTS)
+
+
+def test_box_variants_are_seeded_per_tile():
+    """Same reason the arms are: adding a tile must not reshuffle the others."""
+    cfg = DecorateConfig(seed=9)
+    a = [decorate_box_tile(_box_tile(terrain_id=t), cfg) for t in range(15)]
+    b = [decorate_box_tile(_box_tile(terrain_id=t), cfg) for t in reversed(range(15))][::-1]
+    assert a == b
+
+
+def test_the_box_variant_stream_is_independent_of_the_arm_stream():
+    """Both are seeded from terrain_id; if they shared a stream, a tile's box variant would
+    be correlated with which arm a transition tile of the same id happened to draw."""
+    cfg = DecorateConfig(seed=0)
+    arm_stream = [tile_rng(cfg.seed, t).random() for t in range(10)]
+    box_stream = [tile_rng(cfg.seed ^ 0x5EED, t).random() for t in range(10)]
+    assert arm_stream != box_stream

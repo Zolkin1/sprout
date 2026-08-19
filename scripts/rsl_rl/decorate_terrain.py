@@ -42,7 +42,8 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source", "motion_gen"))
 
-from motion_gen.terrain.decorate import (ARMS, DecorateConfig,  # noqa: E402
+from motion_gen.terrain.decorate import (ARMS, BOX_VARIANTS,  # noqa: E402
+                                         DecorateConfig, decorate_box_tile,
                                          decorate_transition_tile,
                                          has_width_variation, span)
 from motion_gen.terrain.footprint import foot_corners  # noqa: E402
@@ -106,6 +107,9 @@ def main() -> None:
                    help="fraction of wide_stairs tiles taken to the full tile width")
     p.add_argument("--max_clips_per_tile", type=int, default=12,
                    help="clips sampled per tile for the envelope and the check")
+    p.add_argument("--no_box_variants", action="store_true",
+                   help="leave the box tiles solid (they are 100%% solid today only because "
+                        "the generator never passes variant_fracs)")
     p.add_argument("--dry_run", action="store_true",
                    help="report what would change without writing anything")
     args = p.parse_args()
@@ -141,6 +145,12 @@ def main() -> None:
             tid = int(tile["terrain_id"])
             reports[tid] = decorate_transition_tile(tile, prints[tid], cfg)
 
+        box_variants = {}
+        if not args.no_box_variants:
+            for tile in manifest:
+                if tile.get("type") == "box":
+                    box_variants[int(tile["terrain_id"])] = decorate_box_tile(tile, cfg)
+
         print(f"\n[decor] {len(reports)} transition tiles rewritten, seed {args.seed}")
         counts = {a: sum(1 for r in reports.values() if r.arm == a) for a in ARMS}
         print(f"[decor] arms: " + "  ".join(f"{a}={n}" for a, n in counts.items()))
@@ -154,6 +164,18 @@ def main() -> None:
             print(f"[decor] {label:9s} {b.min():.3f}..{b.max():.3f} m  ->  "
                   f"{a.min():.3f}..{a.max():.3f} m   (median {np.median(b):.3f} -> "
                   f"{np.median(a):.3f})")
+
+        if box_variants:
+            counts = {v: 0 for v in BOX_VARIANTS}
+            for spec in box_variants.values():
+                for v in spec.split(","):
+                    counts[v] += 1
+            total = sum(counts.values())
+            print(f"[decor] box support variants over {len(box_variants)} tiles "
+                  f"({total} overlays): "
+                  + "  ".join(f"{v}={n}" for v, n in counts.items()))
+            print("[decor]   walkable top and footprint are identical for every variant, so "
+                  "no foot that was supported before is unsupported now")
 
         print("\n[decor] validating every rewritten tile against its own foot samples")
         failures = 0
@@ -195,6 +217,7 @@ def main() -> None:
             "seed": args.seed,
             "tread_full_frac": args.tread_full_frac,
             "arms": {r.terrain_id: r.arm for r in reports.values()},
+            "box_variants": box_variants,
         })
     print(f"[decor] wrote {args.out}")
 

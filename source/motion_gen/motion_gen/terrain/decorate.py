@@ -48,6 +48,19 @@ from motion_gen.terrain.footprint import TileFootprint
 #: The three ways a transition tile can be rewritten.
 ARMS: tuple[str, ...] = ("wide_stairs", "narrow_landing", "matched")
 
+#: Support shapes a box overlay can take, in the order :attr:`DecorateConfig.box_variant_fracs`
+#: weights them. Mirrors ``overlay_geom.OVERLAY_VARIANTS``.
+#:
+#: The shipped library is 100% ``solid`` -- not by design, but because
+#: ``mb_plan_library.py`` passes ``variant_fracs=None`` and the machinery has simply never
+#: been switched on. Turning it on is safe in BOTH directions and that is worth being precise
+#: about: every variant puts its walkable top at exactly ``base_z + size_z``, and the legs sit
+#: strictly inside the solid box's own footprint. So no foot that was supported before is
+#: unsupported after, and the height scan reads the same top surface. What changes is what the
+#: DEPTH CAMERAS see -- a 0.4 m block becomes a slab on legs, with real void behind it.
+BOX_VARIANTS: tuple[str, ...] = ("solid", "floating", "floating_center_leg",
+                                 "floating_corner_legs")
+
 #: A box is a TREAD if it spans less than this fraction of the tile, else a PLATFORM.
 #: Only ever applied to the ORIGINAL manifest -- see :func:`classify_overlays`.
 #: The generators' own rule, inverted: they widen anything whose x-extent exceeds 1.5x the
@@ -70,6 +83,8 @@ class DecorateConfig:
             overfitting to thin flights.
         min_tread_m: A widened tread is never asked to be narrower than this.
         clearance_m: Slack left inside the tile edge when a surface is grown to it.
+        box_variant_fracs: How the box tiles' overlays are split across
+            :data:`BOX_VARIANTS`. Must sum to 1.
     """
 
     seed: int = 0
@@ -77,6 +92,7 @@ class DecorateConfig:
     tread_full_frac: float = 0.30
     min_tread_m: float = 0.80
     clearance_m: float = 0.02
+    box_variant_fracs: tuple[float, float, float, float] = (0.40, 0.20, 0.20, 0.20)
 
 
 @dataclass
@@ -214,6 +230,37 @@ def _resize_y(overlay: dict, lo: float, hi: float, *, must_contain: tuple[float,
     overlay["size_xyz"] = [float(overlay["size_xyz"][0]), float(hi - lo),
                            float(overlay["size_xyz"][2])]
     overlay["pos_xy"] = [float(overlay["pos_xy"][0]), float((lo + hi) / 2.0)]
+
+
+def decorate_box_tile(tile: dict, cfg: DecorateConfig) -> str:
+    """Give one box tile's overlays support variants. Returns a summary string.
+
+    Geometry is NOT touched: only the ``variant`` field is written, and every variant shares
+    the same walkable top and the same footprint. That is what makes this safe to apply to a
+    library whose motion is already recorded -- the surface the feet meet is identical, and
+    only what is underneath it changes.
+
+    Args:
+        tile: A manifest entry of type ``box``; its overlays gain a ``variant``.
+        cfg: Knobs; ``box_variant_fracs`` weights the draw.
+
+    Returns:
+        The variants assigned, comma-joined, for the run log.
+
+    Raises:
+        ValueError: If the weights do not sum to 1.
+    """
+    if abs(sum(cfg.box_variant_fracs) - 1.0) > 1e-9:
+        raise ValueError(
+            f"box_variant_fracs must sum to 1, got {sum(cfg.box_variant_fracs)}"
+        )
+    rng = tile_rng(cfg.seed ^ 0x5EED, int(tile["terrain_id"]))
+    chosen = []
+    for overlay in tile["overlays"]:
+        variant = str(rng.choice(BOX_VARIANTS, p=list(cfg.box_variant_fracs)))
+        overlay["variant"] = variant
+        chosen.append(variant)
+    return ",".join(chosen)
 
 
 def decorate_transition_tile(tile: dict, footprint: TileFootprint,
