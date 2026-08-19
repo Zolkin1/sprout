@@ -96,6 +96,10 @@ void G1Controller::DeclareParams() {
   this->declare_parameter<double>("fm_lead_sec", 0.05);
   this->declare_parameter<bool>("threaded_fm", true);
   this->declare_parameter<int>("fm_late_disarm_ticks", 0);
+  // The kinematic model the camera poses are FK'd on. A parameter and not a constant because
+  // the robot's models are on their way to being consolidated; when that lands this moves a
+  // config line instead of a recompile. Relative paths resolve against the workspace root.
+  this->declare_parameter<std::string>("urdf_path", "g1_model/urdf/g1_29j.urdf");
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
@@ -114,9 +118,11 @@ G1Controller::on_configure(const rclcpp_lifecycle::State& prev) {
   fm_lead_sec_ = this->get_parameter("fm_lead_sec").as_double();
   threaded_fm_ = this->get_parameter("threaded_fm").as_bool();
   fm_late_disarm_ticks_ = static_cast<int>(this->get_parameter("fm_late_disarm_ticks").as_int());
+  urdf_path_ = this->get_parameter("urdf_path").as_string();
 
   LoadPolicy();
   SetupDepth();
+  SetupCameraFk();
 
   if (debug_topics_) {
     // Plain rclcpp publishers, not obelisk-managed: these are diagnostics, and RELIABLE with a
@@ -138,6 +144,29 @@ G1Controller::on_cleanup(const rclcpp_lifecycle::State& prev) {
   return ObeliskController<ControlMsg, EstimatorMsg>::on_cleanup(prev);
 }
 
+namespace {
+
+/// The obelisk workspace root, from the environment the container exports.
+///
+/// From the SOURCE tree via ROBOT_RL_ROOT, never from an ament share directory: g1_control is
+/// ament_python and does not install resource/ at all, so its share tree has never held the
+/// artifacts. And never by counting ".." hops from the binary, which breaks the moment a file
+/// moves.
+std::filesystem::path Workspace() {
+  const char* ws = std::getenv("ROBOT_RL_ROOT");
+  if (ws != nullptr && *ws != '\0') return std::filesystem::path(ws);
+  const char* repo_root = std::getenv("REPO_ROOT");
+  if (repo_root != nullptr && *repo_root != '\0') {
+    return std::filesystem::path(repo_root) / "transfer" / "obelisk";
+  }
+  throw std::runtime_error(
+      "neither ROBOT_RL_ROOT nor REPO_ROOT is set, so the workspace cannot be located. Both "
+      "are exported by docker/docker-compose.yml from docker/.env; running this node outside "
+      "that container needs one of them pointing at transfer/obelisk.");
+}
+
+}  // namespace
+
 void G1Controller::LoadPolicy() {
   if (hf_policy_folder_.empty() || hf_policy_folder_ == "REPLACE_ME") {
     throw std::runtime_error(
@@ -155,19 +184,7 @@ void G1Controller::LoadPolicy() {
   // controller.py resolves the same path from its own __file__; this uses the environment
   // instead, because counting ".." hops from a binary's location is the thing that breaks the
   // moment a file moves.
-  const char* ws = std::getenv("ROBOT_RL_ROOT");
-  const char* repo_root = std::getenv("REPO_ROOT");
-  std::filesystem::path workspace;
-  if (ws != nullptr && *ws != '\0') {
-    workspace = ws;
-  } else if (repo_root != nullptr && *repo_root != '\0') {
-    workspace = std::filesystem::path(repo_root) / "transfer" / "obelisk";
-  } else {
-    throw std::runtime_error(
-        "neither ROBOT_RL_ROOT nor REPO_ROOT is set, so the policy cache cannot be located. "
-        "Both are exported by docker/docker-compose.yml from docker/.env; running this node "
-        "outside that container needs one of them pointing at transfer/obelisk.");
-  }
+  const std::filesystem::path workspace = Workspace();
 
   std::string repo = hf_repo_id_;
   std::replace(repo.begin(), repo.end(), '/', '_');
@@ -241,6 +258,43 @@ void G1Controller::LoadPolicy() {
       }
     }
   }
+}
+
+void G1Controller::SetupCameraFk() {
+  // Only a generator that reads MORE THAN DEPTH per pixel needs this. A 1-channel one gets a
+  // normalised image and nothing else, and building the FK for it would make a kinematic model
+  // a bring-up requirement for a policy that never consults one.
+  const int channels = policy_->fm_meta().extero_channels;
+  if (channels <= 1) {
+    RCLCPP_INFO(this->get_logger(),
+                "the generator reads depth alone (1 channel); no camera FK needed");
+    return;
+  }
+  const auto& cams = policy_->params().depth_cameras;
+  if (cams.empty()) {
+    // A scan generator on a camera-less tracker: the xyz channels are the SCAN's, and it
+    // carries its own metric coordinates. Nothing to FK.
+    return;
+  }
+
+  std::filesystem::path model = urdf_path_;
+  if (model.is_relative()) model = Workspace() / model;
+  if (!std::filesystem::exists(model)) {
+    throw std::runtime_error(
+        "the generator conditions on " + std::to_string(channels) +
+        " channels per pixel, so it needs camera kinematics, but urdf_path '" + model.string() +
+        "' does not exist. Point the urdf_path parameter at the robot's model.");
+  }
+
+  // Built against the POLICY's joint order -- the artifact's own -- rather than the robot's,
+  // which is not known until the first estimate arrives. That makes a bad model a BRING-UP
+  // failure instead of a refusal to arm, and it is the order the parity fixtures pin.
+  camera_fk_ = std::make_unique<g1_deploy::CameraPoseFk>(
+      model.string(), policy_->params().joint_names_isaac, cams);
+  fk_joint_pos_.assign(policy_->params().joint_names_isaac.size(), 0.0);
+  RCLCPP_INFO(this->get_logger(),
+              "camera FK ready: %zu camera(s) on %s (%d channels per pixel)",
+              camera_fk_->num_cameras(), model.c_str(), channels);
 }
 
 void G1Controller::SetupDepth() {
@@ -577,6 +631,32 @@ ControlMsg G1Controller::ComputeControl() {
       }
       r.depth_raw.push_back(img);
     }
+  }
+
+  if (camera_fk_) {
+    // Encoders and gravity, never odometry: the yaw and the root position both cancel out of
+    // the yaw-aligned frame, so a drifting estimate cannot move the cloud. Recomputed every
+    // tick because it is a function of the posture, and cheap (one FK pass).
+    //
+    // policy_to_hw_ was resolved at arming, against the joint names the estimate carried THEN.
+    // The runtime re-resolves its own permutation whenever the names change; this one does not,
+    // so a change is a disarm rather than a silently scrambled posture -- which would place the
+    // cameras plausibly and wrongly.
+    if (est.joint_names != hw_joint_names_) {
+      Disarm("the estimator's joint set changed while armed, so the camera FK permutation is "
+             "no longer valid");
+      PublishDebug({}, false);
+      return msg;
+    }
+    for (size_t i = 0; i < hw_joint_names_.size(); ++i) {
+      fk_joint_pos_[static_cast<size_t>(policy_to_hw_[i])] = est.joint_pos[i];
+    }
+    // `quat` is ALREADY xyzw (QuatXyzw is a Vector4d in that order), so this is a copy and not
+    // a re-ordering.
+    camera_fk_->Compute(fk_joint_pos_, {quat[0], quat[1], quat[2], quat[3]}, &fk_cam_pos_,
+                        &fk_cam_rot_);
+    r.fm_camera_pos = fk_cam_pos_;
+    r.fm_camera_rot = fk_cam_rot_;
   }
 
   g1_deploy::TickDiagnostics diag;

@@ -225,6 +225,7 @@ def build_hardware_state(
     depth: np.ndarray | None = None,
     depth_raw=None,
     height_scan: np.ndarray | None = None,
+    fm_camera_pose: list[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict:
     """Assemble the ``GenTrackerPolicy.create_obs`` state dict from robot readings.
 
@@ -247,6 +248,15 @@ def build_hardware_state(
             :func:`~deploy.depth_obs.normalize_camera_images`. This is the usual hardware
             path -- the ROS callback hands over what the camera published.
         height_scan: Per-ray ground clearance, for a height-scan policy.
+        fm_camera_pose: Each camera's pose in the root's YAW-ALIGNED frame -- ``(pos (3,),
+            rot (3, 3))`` per camera in contract order -- required only when the generator
+            conditions on more than depth per pixel. A PARAMETER rather than something
+            computed here: this module has no kinematics, and the caller that does (the C++
+            controller, via ``g1_deploy::CameraPoseFk``) already holds an FK model.
+
+            Build it from FK to the camera mount plus the IMU's roll/pitch, and never from
+            odometry -- the frame's yaw and the root position both cancel out of it, which is
+            precisely what makes a drifting yaw estimate unable to corrupt the cloud.
 
     Returns:
         State dict consumed by :meth:`GenTrackerPolicy.create_obs`.
@@ -307,6 +317,11 @@ def build_hardware_state(
         state["depth"] = np.asarray(depth, dtype=np.float64)
     elif depth is not None:
         raise ValueError("`depth` supplied but this policy has no depth cameras.")
+
+    # Carried through verbatim; gen_tracker validates the count against the contract and
+    # raises with the same explanation if a >1-channel generator finds it absent.
+    if fm_camera_pose is not None:
+        state["fm_camera_pose"] = list(fm_camera_pose)
 
     if policy.needs_height_scan():
         if height_scan is None:

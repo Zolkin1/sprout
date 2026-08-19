@@ -40,7 +40,7 @@ Up-arrow away, so a node you Ctrl-C is one keystroke from restarting.
 
 | script | what it launches |
 |---|---|
-| `run_sim_low.sh` | the BRAIN alone -- `g1.yml`, i.e. controller + estimator + joystick FSM (session `simlow`) |
+| `run_sim_low.sh` | the BRAIN alone -- `g1_cpp.yml`, i.e. controller + estimator + joystick FSM (session `simlow`) |
 | `run_sim_clip.sh` | the brain with the GENERATOR REMOVED, driven by a pre-made clip (session `simclip`) |
 | `run_sim_world.sh` | the sim ROBOT -- MuJoCo world + FSM echo (session `simworld`) |
 | `run_hardware_low.sh` | brain + real G1 driver + Jetson ZED depth (session `lowhw`) |
@@ -59,7 +59,7 @@ launches the brain alone and `run_sim_world.sh` the world alone, unchanged:
 # dev desktop
 scripts/run_sim_world.sh --scene g1_29j_basic_scene
 # the Thor
-scripts/run_sim_low.sh --cpp
+scripts/run_sim_low.sh
 ```
 
 Worth doing when the controller box is also paying for the sim. The world side is not cheap:
@@ -158,7 +158,7 @@ the teacher trained on, so the motions are in-distribution rather than invented 
 test. Cases are referred to by NAME (via the library's JSON sidecar) because indices move
 whenever the library is rebuilt.
 
-The sim is two launches, not one, for the same reason hardware is: `g1.yml` is robot-less
+The sim is two launches, not one, for the same reason hardware is: the brain config is robot-less
 and the robot comes from its own config, so the brain you test in sim is byte-identical to
 the one that runs on the robot. `run_sim_world.sh` stands in for `run_hardware_low.sh`'s
 robot half -- it publishes the same topics, including the FSM state (`fsm_state_echo` lives
@@ -269,7 +269,8 @@ obelisk `global_state`, so either can be restarted without cycling the other.
 ```
 g1_control/config/
   common/low_level.yml   fragment: controller + estimator + joystick FSM (no `config:`)
-  g1.yml                 THE BRAIN -- launched identically in sim and on hardware
+  g1_cpp.yml             THE BRAIN -- launched identically in sim and on hardware
+  g1.yml                 the same brain on the DEPRECATED python controller (see below)
   g1_debug_clip.yml      the same brain with the GENERATOR REMOVED, driven by a baked clip
   g1_robot_hw.yml        the real Unitree driver, alone
   g1_world.yml           the MuJoCo world, alone
@@ -278,15 +279,23 @@ g1_control/config/
 
 Sim (two terminals, or use the launch scripts):
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml
 obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_world.yml
 ```
 
 Hardware -- identical brain, different robot:
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml
 obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml
 ```
+
+**The python controller (`g1.yml`) is DEPRECATED.** `g1_cpp.yml` is what the run scripts
+launch and what the robot runs; `--python` selects the old one and prints a warning. Two
+things keep it alive: bisecting a regression against a known-good implementation, and CLIP
+PLAYBACK, which the C++ runtime cannot do at all (no HDF5 clip reader -- it refuses to load
+without an `fm.onnx` rather than pretending). On aarch64 the python node cannot reach the GPU
+in any case: rclpy is a cp310 C extension and the only onnxruntime GPU build for a Thor is
+cp312, so it runs the generator on the CPU at ~471 ms against a 20 ms period.
 
 Debug clip -- same robot half, brain with no generator:
 ```
@@ -345,7 +354,7 @@ Then, update the `network_interface_name` parameter in the robot section of
 
 Now we can launch the hardware stack -- the brain and the robot, as two separate launches:
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml
 obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml
 ```
 
@@ -435,7 +444,7 @@ To open a new bash terminal for running container
 ## Live, in RViz
 
 ```bash
-scripts/run_sim_low.sh --cpp --rviz     # then run_sim_world.sh as usual
+scripts/run_sim_low.sh --rviz           # then run_sim_world.sh as usual
 ```
 
 Shows the robot in its ESTIMATED pose (so it is a view of what the controller believes, not of
@@ -446,13 +455,17 @@ asking it to do:
 |---|---|
 | the robot's joint configuration and base pose | `default_robot_viz` + `robot_state_publisher`, off `/obelisk/g1/est_state` and the `g1_model` URDF |
 | **orange** root ribbon, the generator's whole F-node plan lifted to world | `/obelisk/g1/debug/fm_plan` -> `g1_control fm_plan_viz` |
-| **cyan** foot paths, forward-kinematic from each predicted node's joints | the same, FK'd on `FlowMatchingConfig.fk_model_path` |
+| **cyan** foot paths, forward-kinematic from each predicted node's joints | the same, FK'd on the robot's URDF with pinocchio |
 | orientation triads every few nodes, and the plan's anchor frame | the same. A yaw error is INVISIBLE in a bare path |
 | **green** the 13 window rows the tracker actually observed this tick | `/obelisk/g1/debug/tick` + `/obelisk/g1/est_state` |
 
 The colours match the MuJoCo sim2sim viewer's ribbon deliberately, and both now call the same
-FK (`deploy.fk_mujoco.WindowFK`) on the same model, so the two views cannot disagree by
-construction and a discrepancy between them is real.
+FK (`deploy.fk.WindowFK`) on the same model, so the two views cannot disagree by construction
+and a discrepancy between them is real. That model is the ROS URDF rather than
+`FlowMatchingConfig.fk_model_path`, the MJCF the generator's own FK loss is defined against:
+the two agree on these four frames to 4.6e-7 m over random postures
+(`transfer/deploy/tests/test_fk_parity.py`, with MuJoCo kept as a test-only oracle), so the
+ribbon is not a second opinion, and the robot carries one kinematics library instead of two.
 
 **The green-vs-orange overlay is the highest-value thing on this display.** The served window
 should lie on the plan at `cursor + offsets`. It is drawn by a different route -- lifted onto

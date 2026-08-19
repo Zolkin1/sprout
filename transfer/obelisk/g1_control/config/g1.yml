@@ -1,6 +1,11 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 #
-# The G1 BRAIN: the low-level generator+tracker controller, its estimator, and the joystick
+# The G1 BRAIN on the DEPRECATED python controller. g1_cpp.yml is the supported file and what
+# every run script launches by default; this one is kept for bisecting a regression against a
+# known-good implementation, and because clip playback (g1_debug_clip.yml, which includes the
+# same fragment) has no C++ equivalent yet. See g1_control/controller.py's module docstring.
+#
+# The low-level generator+tracker controller, its estimator, and the joystick
 # execution FSM. ROBOT-LESS on purpose -- the robot comes from a SEPARATELY launched config
 # on the same ROS graph:
 #

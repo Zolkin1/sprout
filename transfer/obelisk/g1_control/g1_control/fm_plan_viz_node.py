@@ -61,7 +61,7 @@ if not os.path.isdir(os.path.join(_TRANSFER, "deploy")):
 if _TRANSFER not in sys.path:
     sys.path.insert(0, _TRANSFER)
 
-from deploy.fk_mujoco import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
+from deploy.fk import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
 from deploy.quat_math_np import quat_apply  # noqa: E402
 from deploy.window_np import (  # noqa: E402
     base_pose_block_to_world,
@@ -151,7 +151,13 @@ class FmPlanViz(Node):
         # g1_deploy.rviz. Otherwise the ribbon lands in a frame RViz cannot relate to the
         # robot and simply does not appear, with no error anywhere.
         self.frame_id = self.declare_parameter("frame_id", "world").value
-        self.mjcf_path = self.declare_parameter("mjcf_path", DEFAULT_FK_MODEL).value
+        #: The kinematic model the ribbon is FK'd on -- the robot's URDF, the same one
+        #: the C++ controller's camera FK defaults to, so a bring-up carries exactly one
+        #: kinematic description. Was `mjcf_path`; renamed with the model, because a
+        #: parameter this node does not declare is silently ignored by rclpy rather than
+        #: rejected (see tests/test_params_are_live.py) and a stale name would leave the
+        #: default quietly in force.
+        self.urdf_path = self.declare_parameter("urdf_path", DEFAULT_FK_MODEL).value
         self.marker_topic = self.declare_parameter(
             "marker_topic", "/obelisk/g1/viz/fm_plan"
         ).value
@@ -183,7 +189,7 @@ class FmPlanViz(Node):
         self.create_subscription(EstimatedState, "/obelisk/g1/est_state", self._on_est, 10)
         self.get_logger().info(
             f"fm_plan_viz up: markers on {self.marker_topic} in frame '{self.frame_id}', "
-            f"FK from {self.mjcf_path}"
+            f"FK from {self.urdf_path}"
         )
 
     # ------------------------------------------------------------------ callbacks
@@ -294,7 +300,7 @@ class FmPlanViz(Node):
                 "g1_msgs and the controller", throttle_duration_sec=30.0)
             return None
         try:
-            self._fk = WindowFK(self.mjcf_path, frame_names, list(isaac_names))
+            self._fk = WindowFK(self.urdf_path, frame_names, list(isaac_names))
         except Exception as exc:                                      # noqa: BLE001
             # Not retried, and not fatal: the cached key holds the failure, so this logs once
             # per contract rather than at 4 Hz, and the root ribbon still draws without feet.
@@ -303,7 +309,7 @@ class FmPlanViz(Node):
             return None
         if self._fk.missing:
             self.get_logger().warn(
-                f"FK frames absent from {self.mjcf_path}: {self._fk.missing}")
+                f"FK frames absent from {self.urdf_path}: {self._fk.missing}")
         return self._fk
 
     def _marker(self, ns: str, mid: int, mtype: int, rgba, scale: float) -> Marker:

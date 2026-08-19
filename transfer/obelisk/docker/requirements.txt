@@ -32,26 +32,34 @@
 #
 # The rationale above is kept because it still governs the x86_64 pin.
 huggingface_hub      # policy artifact fetch, offline-first (deploy.hardware)
-numpy
+
+# numpy <2, and it is load-bearing rather than caution. The ROS pinocchio bindings
+# (ros-humble-pinocchio, installed in the Dockerfile) are compiled against the numpy 1.x C
+# ABI: under 2.x `import pinocchio` prints "AttributeError: _ARRAY_API not found" and then
+# SEGFAULTS the interpreter. Measured on this image -- 2.2.6 dies, 1.26.4 imports. The same
+# bound is on transfer/requirements.txt for the onnxruntime wheels' ABI, so the two
+# environments agree.
+numpy<2
 
 # Debug-clip playback ONLY (deploy.clip_reference reads a clip library .h5). Imported
 # lazily, so a normal generator run never touches it -- but the mode it enables is the one
 # that answers "is this stack wired up at all?", which is worth ~5 MB of image.
 h5py
 
-# Forward kinematics of the PREDICTED window, for the RViz ribbon (deploy.fk_mujoco, used by
-# g1_control's fm_plan_viz node). Imported ONLY there -- the control path never touches it,
-# pinned by test_hardware_offline.py's standalone `"mujoco" not in sys.modules` assertion,
-# which is the twin of the torch one beside it. It must be MuJoCo specifically, because the model it
-# FKs has to be the one FlowMatchingConfig.fk_model_path names
-# (transfer/sim/robots/g1/g1_29j.xml): that is what the generator's FK loss was defined
-# against, so FK'ing it makes the drawn feet exactly where the predicted joints put them.
-# FK'ing the ROS URDF with pinocchio instead would make them a second OPINION about where the
-# feet are, which is the one thing a display built to expose a discrepancy must not be.
+# NOT HERE: the kinematics library. Forward kinematics of the PREDICTED window, for the RViz
+# ribbon (deploy.fk, used by g1_control's fm_plan_viz node), is pinocchio -- and pinocchio
+# comes from APT (ros-humble-pinocchio, installed in the Dockerfile), not from pip, because
+# the C++ controller needs the same package's headers and libraries to FK the depth cameras
+# every tick. One install serves both languages; a pip wheel would serve only python and put
+# a second copy of the library in the image.
 #
-# Declared even though the image already resolves it transitively: an undeclared dependency
-# that a rebuild happens to drop takes the viewer out with an ImportError at launch.
-mujoco
+# This was `mujoco`, on the argument that the ribbon had to be FK'd on
+# FlowMatchingConfig.fk_model_path -- transfer/sim/robots/g1/g1_29j.xml, the model the
+# generator's FK loss is defined against -- so that the drawn feet could not become a SECOND
+# OPINION about where the feet are. Measured, that is not what the choice buys: over random
+# postures the MJCF and the ROS URDF place the four ribbon frames within 4.6e-7 m
+# (transfer/deploy/tests/test_fk_parity.py, MuJoCo kept as a test-only oracle). So the image
+# no longer carries MuJoCo for a drawing tool, and the robot has one kinematic description.
 
 # Log plotting (plot_utils/); dev-box tooling, harmless on the robot.
 matplotlib

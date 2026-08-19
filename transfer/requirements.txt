@@ -30,6 +30,12 @@ scipy>=1.11               # transfer/sim/robot.py -- Rotation, at module import
 h5py>=3.10                # transfer/sim/clip_reference.py -- the clip .h5 library
 pygame>=2.5               # transfer/sim/robot.py imports it at module level, so it is
                           # required even for --mode eval (only USED by --mode joystick)
+pin>=3.1                  # pinocchio: deploy/fk.py, the predicted-window ribbon both viewers
+                          # draw. FKs the ROS URDF, which agrees with the MJCF the generator's
+                          # FK loss uses to 4.6e-7 m (deploy/tests/test_fk_parity.py) -- one
+                          # kinematics library on the robot instead of two, since the C++
+                          # controller already FKs the cameras with it. `pin` is the PyPI name;
+                          # the module is `pinocchio`, and the container gets it from apt.
 
 # --- fetching a published policy pair --------------------------------------------------
 huggingface_hub>=0.24     # transfer/deploy/hardware.py, transfer/obelisk/scripts/prefetch_policy.py

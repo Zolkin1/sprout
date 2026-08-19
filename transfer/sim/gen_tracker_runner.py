@@ -49,7 +49,7 @@ from deploy.quat_math_np import (  # noqa: E402
     subtract_frame_transforms,
     yaw_quat,
 )
-from deploy.fk_mujoco import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
+from deploy.fk import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
 from deploy.tracker_session import convert_joint_order  # noqa: E402
 from deploy.window_np import window_block_slices  # noqa: E402
 
@@ -703,24 +703,27 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     # ------------------------------------------------------------------
     # Forward kinematics of the PREDICTED window (viewer ribbon + log columns).
     # ------------------------------------------------------------------
-    # deploy.fk_mujoco, shared with the ROS marker node (g1_control fm_plan_viz), so the RViz
-    # ribbon and this viewer's ribbon are the same object by construction and a disagreement
-    # between the two views is a real one. It loads its own copy of the MJCF rather than
-    # borrowing robot.mj_model, so FK of a hypothetical pose cannot touch the live sim.
+    # deploy.fk, shared with the ROS marker node (g1_control fm_plan_viz), so the RViz ribbon
+    # and this viewer's ribbon are the same object by construction and a disagreement between
+    # the two views is a real one. It builds its own pinocchio model rather than borrowing
+    # robot.mj_model, so FK of a hypothetical pose cannot touch the live sim -- and it is a
+    # DIFFERENT model from the one this file simulates, which deploy/tests/test_fk_parity.py
+    # measures at 4.6e-7 m over these frames.
     _fk = WindowFK(DEFAULT_FK_MODEL, policy.ctx.target_frame_names, isaac)
     if _fk.missing:
-        print(f"[WARN] FK frames absent from the MJCF, so no predicted-frame ribbon: {_fk.missing}")
+        print(f"[WARN] FK frames absent from the URDF, so no predicted-frame ribbon: {_fk.missing}")
 
     def _fm_frame_paths_w(node_idxs) -> np.ndarray | None:
         """World positions of the FM target frames implied by the predicted window.
 
         The slim window predicts ``joint_pos`` but no ``ee_pos``, so the frames are not
         served -- they are IMPLIED, and forward kinematics recovers them: set the reference
-        base pose + reference joints on a scratch ``MjData`` and read the body positions
-        back. The engine is ``deploy.fk_mujoco.WindowFK`` on
-        ``FlowMatchingConfig.fk_model_path`` -- the model the FM's FK losses are defined
-        against, so nothing can drift between the two -- and the SAME object the ROS marker
-        node draws with, so this ribbon and the RViz one cannot disagree.
+        base pose + reference joints on a scratch model and read the frame positions back.
+        The engine is ``deploy.fk.WindowFK`` on the robot's URDF -- which agrees with
+        ``FlowMatchingConfig.fk_model_path``, the model the FM's FK losses are defined
+        against, to 4.6e-7 m on these frames (``deploy/tests/test_fk_parity.py``) -- and the
+        SAME object the ROS marker node draws with, so this ribbon and the RViz one cannot
+        disagree.
 
         What this DOES mean: the frames are exactly where the predicted joints put them,
         given the predicted base. That is a stronger statement than the retired ``ee_pos``

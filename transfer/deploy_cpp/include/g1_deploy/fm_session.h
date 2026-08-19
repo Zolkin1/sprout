@@ -29,13 +29,12 @@
 #include <string>
 #include <vector>
 
+#include "g1_deploy/fm_meta.h"
 #include "g1_deploy/gen_tracker_core.h"
 #include "g1_deploy/ort_session.h"
 #include "g1_deploy/window.h"
 
 namespace g1_deploy {
-
-#include "g1_deploy/fm_meta.h"
 
 
 /// The exteroception and command a plan is conditioned on, sampled at request time.

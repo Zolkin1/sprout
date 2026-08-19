@@ -52,9 +52,21 @@ target_include_directories(g1_controller PRIVATE include)
 #     reads like a missing dependency rather than the wrong API.
 #
 # No other package in this workspace links g1_msgs from C++ yet, so this is the pattern.
+# G1Deploy::Fk is optional in deploy_cpp (the sim2sim runner and the parity tests do not need
+# pinocchio) but REQUIRED here: the shipped generator reads 5 channels per pixel, and four of
+# them are the camera's position in the root's yaw-aligned frame. Failing at CONFIGURE time
+# with the install line beats linking a controller that refuses every policy at bring-up.
+if(NOT TARGET G1Deploy::Fk)
+  message(FATAL_ERROR
+    "pinocchio was not found, so the camera FK is not built. The controller needs it for any "
+    "generator that conditions on more than depth. Install it (the container gets it from "
+    "docker/requirements.txt) or set CMAKE_PREFIX_PATH so find_package(pinocchio) resolves.")
+endif()
+
 target_link_libraries(g1_controller PRIVATE
   Obelisk::Core
   G1Deploy::Ort
+  G1Deploy::Fk
   rclcpp::rclcpp
   rclcpp_lifecycle::rclcpp_lifecycle
   ${sensor_msgs_TARGETS}

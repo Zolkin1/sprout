@@ -2,27 +2,20 @@
 
 #include "g1_deploy/fm_session.h"
 
-
-#include <nlohmann/json.hpp>
-
 #include <chrono>
 #include <cstdio>
 #include <stdexcept>
 
+// No JSON here any more: the fm_meta parse moved to fm_meta.cc, in the math core, so it can
+// be built and tested without onnxruntime.
+
 namespace g1_deploy {
-namespace {
 
-using OrderedJson = nlohmann::ordered_json;
+void ZeroNoise::Fill(double* out, size_t count) {
+  for (size_t i = 0; i < count; ++i) out[i] = 0.0;
+}
 
-
-}  // namespace
-
-FmMeta ParseFmMeta(const std::string& json) {
-  OrderedJson root;
-  try {
-    root = OrderedJson::parse(json);
-  } catch (const std::exception& e) {
- count) {
+void GaussianNoise::Fill(double* out, size_t count) {
   for (size_t i = 0; i < count; ++i) out[i] = dist_(rng_);
 }
 

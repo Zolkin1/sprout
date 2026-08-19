@@ -301,6 +301,28 @@ RUN sudo apt-get update && sudo apt-get install -y \
     ros-humble-rosbag2-storage-mcap && \
     sudo rm -rf /var/lib/apt/lists/*
 
+# Pinocchio: the robot's kinematics, for BOTH languages out of one package.
+#
+#   * C++ -- g1_deploy::CameraPoseFk FKs the depth cameras every control tick. A generator
+#     that reads more than depth per pixel (the shipped one reads five channels: depth plus
+#     the pixel's xyz in the root's yaw-aligned frame, plus validity) cannot build its own
+#     input without knowing where the cameras are, and the runtime deliberately has no
+#     kinematics and no odometry of its own. g1_control_cpp FAILS TO CONFIGURE without this.
+#   * python -- deploy.fk, the RViz plan ribbon. That was MuJoCo; see requirements.txt.
+#
+# From apt rather than pip because only the apt package ships the headers and the CMake
+# config the C++ side needs; the ROS distribution's build is the one that matches this
+# image's Ubuntu and its Eigen. Measured against the model the generator's FK loss is defined
+# against: identical kinematics (4e-13 on the camera chain, 4.6e-7 m at the wrists).
+RUN sudo apt-get update && sudo apt-get install -y \
+    ros-humble-pinocchio && \
+    sudo rm -rf /var/lib/apt/lists/* && \
+    echo "[image] verifying pinocchio is usable from both languages..." && \
+    source /opt/ros/humble/setup.bash && \
+    python3 -c "import pinocchio; print('[image] pinocchio', pinocchio.__version__)" && \
+    test -f /opt/ros/humble/include/pinocchio/algorithm/frames.hpp && \
+    ls /opt/ros/humble/lib/*/cmake/pinocchio/pinocchioConfig.cmake
+
 # ============================================
 # Stage 2: Hardware (adds lidar stack)
 # ============================================

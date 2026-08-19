@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Copyright 2026 Zachary Olkin. All rights reserved.
 #
-# The BRAIN in simulation: g1.yml (controller + estimator + joystick FSM), and nothing else.
+# The BRAIN in simulation: g1_cpp.yml (controller + estimator + joystick FSM), and nothing
+# else. The C++ controller is the default; --python selects the deprecated one.
 #
 # This is the SAME file, launched the SAME way, that run_hardware_low.sh runs on the robot.
 # The robot half comes from a separately launched config, so what you test in sim is
@@ -36,15 +37,18 @@ OBK_SESSION=simlow
 
 usage() {
     cat <<'EOF'
-run_sim_low.sh -- the BRAIN alone (g1.yml), in tmux session `simlow`.
+run_sim_low.sh -- the BRAIN alone (g1_cpp.yml), in tmux session `simlow`.
 
 Options:
-  --cpp            Use the C++ controller (g1_cpp.yml) instead of the python one.
-                   On aarch64 this is the only one that can reach the GPU: rclpy is a
-                   cp310 C extension and the only onnxruntime GPU build for a Thor is
-                   cp312, so the python node runs the generator on the CPU at ~471 ms
-                   per re-plan against a 20 ms period. The C++ one runs it at ~16 ms,
-                   on its own thread.
+  --python         Use the DEPRECATED python controller (g1.yml). The C++ one
+                   (g1_cpp.yml) is the default and the supported path; this is kept only
+                   for bisecting a regression against it, and it will be removed.
+                   On aarch64 it cannot reach the GPU at all: rclpy is a cp310 C
+                   extension and the only onnxruntime GPU build for a Thor is cp312, so
+                   the python node runs the generator on the CPU at ~471 ms per re-plan
+                   against a 20 ms period. The C++ one runs it at ~16 ms, on its own
+                   thread.
+  --cpp            Accepted and ignored: this is now the default.
   --policy FOLDER  Override the controller's hf_policy_folder for this run.
   --rviz           Turn the viz block on: RViz showing the robot in its estimated pose
                    (default_robot_viz + robot_state_publisher + the g1_model URDF), plus
@@ -76,10 +80,11 @@ EOF
 }
 
 ORIG_ARGS=("$@")
-POLICY="" ; BUILD="" ; BAG=1 ; CPP="" ; RVIZ=""
+POLICY="" ; BUILD="" ; BAG=1 ; PYTHON_CTRL="" ; RVIZ=""
 while [ $# -gt 0 ]; do
     case "$1" in
-        --cpp)         CPP=1; shift ;;
+        --cpp)         shift ;;   # the default now; kept so old commands still run
+        --python)      PYTHON_CTRL=1; shift ;;
         --rviz)        RVIZ=1; shift ;;
         --policy)      POLICY="${2:-}"; shift 2 ;;
         --no-bag)      BAG=""; shift ;;
@@ -100,10 +105,12 @@ fi
 SESSION="$OBK_SESSION"
 # One line apart, deliberately: the two controllers share every other part of the config, so
 # a difference between them cannot be a difference in what else was launched.
-if [ -n "$CPP" ]; then
-    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml"
-else
+if [ -n "$PYTHON_CTRL" ]; then
+    echo "[run_sim_low] WARNING: the python controller is DEPRECATED and will be removed." >&2
+    echo "[run_sim_low]          Drop --python to run the supported C++ one." >&2
     CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1.yml"
+else
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml"
 fi
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
 # After --policy: each overlay includes the previous one by absolute path, so the order here

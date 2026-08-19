@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # Copyright 2026 Zachary Olkin. All rights reserved.
 #
-# The full stack on HARDWARE: the brain (g1.yml) + the real G1 driver (g1_robot_hw.yml) +
+# The full stack on HARDWARE: the brain (g1_cpp.yml) + the real G1 driver (g1_robot_hw.yml) +
 # the Jetson ZED depth node.
 #
-# g1.yml is the SAME config run_sim_low.sh launches -- only the robot source differs (the
+# g1_cpp.yml is the SAME config run_sim_low.sh launches -- only the robot source differs (the
 # real driver here, the MuJoCo world there). No FSM echo: the G1 interface publishes its
 # real execution-FSM state, which is the ONLY thing that arms the controller.
 #
@@ -64,7 +64,7 @@ EOF
 }
 
 ORIG_ARGS=("$@")
-SENSORS=1 ; DEPTH=1 ; POLICY="" ; BUILD="" ; CLIP_CASE="" ; BAG=1
+SENSORS=1 ; DEPTH=1 ; POLICY="" ; BUILD="" ; CLIP_CASE="" ; BAG=1 ; PYTHON_CTRL=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --sim-test)    SENSORS=0; shift ;;
@@ -74,6 +74,11 @@ while [ $# -gt 0 ]; do
             if [ -n "${2:-}" ] && [ "${2#-}" = "${2:-}" ]; then CLIP_CASE="$2"; shift 2
             else CLIP_CASE=stand; shift; fi ;;
         --no-bag)      BAG=""; shift ;;
+        # The python controller is DEPRECATED. On this machine it is also the slow one --
+        # aarch64 rclpy is cp310 and the only Thor onnxruntime GPU wheel is cp312, so it
+        # cannot reach the GPU at all (~471 ms per re-plan against a 20 ms period).
+        --python)      PYTHON_CTRL=1; shift ;;
+        --cpp)         shift ;;   # the default now; kept so old commands still run
         --policy)      POLICY="${2:-}"; shift 2 ;;
         --build)       BUILD=1; shift ;;
         --build-clean) BUILD=clean; shift ;;
@@ -95,9 +100,16 @@ SESSION="$OBK_SESSION"
 # `stand` case asks it to hold still, so it exercises encoders, frames, joint order, gains
 # and PD output without the generator ever having a say.
 if [ -n "$CLIP_CASE" ]; then
+    # Clip playback is python-only: the C++ runtime has no HDF5 clip reader yet, and it
+    # refuses to load without an fm.onnx rather than pretending. This is the one path the
+    # deprecated controller is still REQUIRED for.
     CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_debug_clip.yml"
-else
+elif [ -n "$PYTHON_CTRL" ]; then
+    echo "[run_hardware_low] WARNING: the python controller is DEPRECATED and cannot reach" >&2
+    echo "[run_hardware_low]          this machine's GPU. Drop --python for the C++ one." >&2
     CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1.yml"
+else
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml"
 fi
 ROBOT_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml"
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"

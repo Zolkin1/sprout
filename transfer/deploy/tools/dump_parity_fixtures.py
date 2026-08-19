@@ -102,6 +102,10 @@ TOLERANCES: dict[str, tuple[float, str]] = {
     "pinhole_ray_directions": (1e-14, "elementwise"),
     "invalid_depth_mask": (0.0, "elementwise"),   # a 0/1 plane: exact or wrong
     "unproject_to_yaw_frame": (1e-12, "elementwise"),
+    # FK through a kinematic chain, so a few ulps accumulate per joint. 1e-11 m is ~10 pm --
+    # eleven orders below anything the cameras or the model can distinguish, and still tight
+    # enough that a wrong joint permutation or a scalar-first quaternion fails by kilometres.
+    "camera_pose_yaw_frame": (1e-11, "elementwise"),
 }
 
 
@@ -185,6 +189,71 @@ class FixtureWriter:
                 "cases": self.cases,
             }, fh, indent=2)
         return path
+
+
+#: The repo root, off this file's location rather than a count of ".." hops elsewhere.
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          os.pardir, os.pardir, os.pardir))
+
+#: The POLICY's joint order (interleaved), which is what a joint_pos block is in. Pinocchio's
+#: own order is per limb and differs from this on 27 of the 29, so the permutation is the
+#: thing the camera-pose fixtures exist to pin.
+_ISAAC_JOINTS: tuple[str, ...] = (
+    "left_hip_pitch_joint", "right_hip_pitch_joint", "waist_yaw_joint",
+    "left_hip_roll_joint", "right_hip_roll_joint", "waist_roll_joint",
+    "left_hip_yaw_joint", "right_hip_yaw_joint", "waist_pitch_joint",
+    "left_knee_joint", "right_knee_joint",
+    "left_shoulder_pitch_joint", "right_shoulder_pitch_joint",
+    "left_ankle_pitch_joint", "right_ankle_pitch_joint",
+    "left_shoulder_roll_joint", "right_shoulder_roll_joint",
+    "left_ankle_roll_joint", "right_ankle_roll_joint",
+    "left_shoulder_yaw_joint", "right_shoulder_yaw_joint",
+    "left_elbow_joint", "right_elbow_joint",
+    "left_wrist_roll_joint", "right_wrist_roll_joint",
+    "left_wrist_pitch_joint", "right_wrist_pitch_joint",
+    "left_wrist_yaw_joint", "right_wrist_yaw_joint",
+)
+
+#: The shipped pair's mounts and NOMINAL offsets, as tracker.onnx publishes them. Two
+#: different lenses on one mount body -- see the depth fixtures for why that matters.
+_CAMERAS: tuple[dict, ...] = (
+    {"mount_body": "torso_link", "offset_pos": [0.1107625, 0.0, 0.099426],
+     "offset_quat_xyzw": [0.0, 0.5372996083468239, 0.0, 0.8433914458128857]},
+    {"mount_body": "torso_link", "offset_pos": [0.06, 0.0, 0.38],
+     "offset_quat_xyzw": [0.0, 0.3007057995042731, 0.0, 0.9537169507482269]},
+)
+
+
+def _mat_from_quat_xyzw(q) -> np.ndarray:
+    """Rotation matrix from a scalar-LAST quaternion."""
+    x, y, z, w = (float(v) for v in q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)]])
+
+
+def _quat_from_rpy(roll: float, pitch: float, yaw: float) -> np.ndarray:
+    """Scalar-LAST quaternion for an intrinsic Z-Y-X rotation."""
+    cr, sr = np.cos(roll / 2), np.sin(roll / 2)
+    cp, sp = np.cos(pitch / 2), np.sin(pitch / 2)
+    cy, sy = np.cos(yaw / 2), np.sin(yaw / 2)
+    return np.array([sr * cp * cy - cr * sp * sy, cr * sp * cy + sr * cp * sy,
+                     cr * cp * sy - sr * sp * cy, cr * cp * cy + sr * sp * sy])
+
+
+def _roll_pitch_matrix(quat_xyzw) -> np.ndarray:
+    """The root's tilt with its HEADING divided out: R(yaw_quat(q)^-1 * q).
+
+    This is what carries a point from the root frame into the yaw-aligned one, and building it
+    from the orientation rather than from a yaw estimate is what makes the camera pose
+    independent of odometry.
+    """
+    q = np.asarray(quat_xyzw, dtype=np.float64)
+    yaw = np.arctan2(2 * (q[3] * q[2] + q[0] * q[1]), 1 - 2 * (q[1] ** 2 + q[2] ** 2))
+    q_yaw_inv = np.array([0.0, 0.0, -np.sin(yaw / 2), np.cos(yaw / 2)])
+    return _mat_from_quat_xyzw(q_yaw_inv) @ _mat_from_quat_xyzw(q)
+
 
 
 def _rand_quat(rng: np.random.Generator, n: int) -> np.ndarray:
@@ -434,6 +503,76 @@ def dump_depth_xyz(w: FixtureWriter, rng: np.random.Generator, n: int) -> None:
           {"points": pts.reshape(n, -1)}, attrs=dict(cam))
 
 
+def dump_camera_fk(w: FixtureWriter, rng: np.random.Generator, n: int) -> None:
+    """Emit the camera-pose fixtures the C++ FK is held to.
+
+    The oracle here is PINOCCHIO ON THE ROS URDF, which is itself checked against the
+    training-side ``dataset._camera_pose_yaw_frame`` -- exactly, to 0.000000 m and 4e-13 of
+    rotation, over zero and five random configurations. Two steps rather than one because
+    this generator must not import isaaclab: the chain is C++ -> python pinocchio ->
+    robot_rl, and the second link is asserted in robot_rl's own suite where isaaclab exists.
+
+    What the cases are built to catch, since a wrong camera pose is a plausible cloud in the
+    wrong place rather than a crash:
+
+    * the JOINT PERMUTATION. Pinocchio orders joints per limb, the policy interleaves them,
+      and 27 of the G1's 29 differ. Random angles on every joint make a mismatch enormous;
+      zeros would hide it completely.
+    * the YAW DIVIDING OUT. Cases share joint angles across different root headings, so an
+      implementation that leaves psi in disagrees on those alone.
+    * the quaternion CONVENTION. Scalar-last everywhere here; pinocchio's Eigen constructor
+      is scalar-first, and mixing them is a silent ~180 degree error.
+
+    Args:
+        w: The fixture writer.
+        rng: Source of randomness.
+        n: Independent robot configurations.
+    """
+    import pinocchio as pin  # noqa: PLC0415  -- only this case needs it
+
+    urdf = os.path.join(_REPO_ROOT, "transfer", "obelisk", "g1_model", "urdf", "g1_29j.urdf")
+    if not os.path.exists(urdf):
+        print(f"[fixtures] no URDF at {urdf}; skipping camera_pose_yaw_frame")
+        return
+    model = pin.buildModelFromUrdf(urdf)
+    data = model.createData()
+    qidx = [model.joints[model.getJointId(j)].idx_q for j in _ISAAC_JOINTS]
+    root = model.getFrameId(model.frames[1].name)
+
+    joints = np.zeros((n, len(_ISAAC_JOINTS)))
+    joints[1:] = rng.uniform(-0.5, 0.5, size=(n - 1, len(_ISAAC_JOINTS)))
+    rpy = np.zeros((n, 3))
+    rpy[1:] = rng.uniform(-0.4, 0.4, size=(n - 1, 3))
+    # The last case REPEATS the previous joints under a different heading: yaw must divide out,
+    # so those two rows have to agree, and an implementation that keeps psi fails on them alone.
+    joints[-1] = joints[-2]
+    rpy[-1] = [rpy[-2][0], rpy[-2][1], rpy[-2][2] + 1.7]
+
+    quats = np.stack([_quat_from_rpy(*r) for r in rpy])
+    pos_out, rot_out = [], []
+    for i in range(n):
+        q = np.zeros(model.nq)
+        q[qidx] = joints[i]
+        pin.framesForwardKinematics(model, data, q)
+        r_rp = _roll_pitch_matrix(quats[i])
+        ps, rs = [], []
+        for cam in _CAMERAS:
+            mount = data.oMf[root].inverse() * data.oMf[model.getFrameId(cam["mount_body"])]
+            cam_in_root = mount * pin.SE3(_mat_from_quat_xyzw(cam["offset_quat_xyzw"]),
+                                          np.asarray(cam["offset_pos"]))
+            ps.append(r_rp @ cam_in_root.translation)
+            rs.append((r_rp @ cam_in_root.rotation).reshape(-1))
+        pos_out.append(np.concatenate(ps))
+        rot_out.append(np.concatenate(rs))
+
+    w.add("camera_pose_yaw_frame", "camera_pose_yaw_frame",
+          {"joint_pos": joints, "base_quat_xyzw": quats},
+          {"cam_pos": np.stack(pos_out), "cam_rot": np.stack(rot_out)},
+          attrs={"urdf": os.path.relpath(urdf, _REPO_ROOT),
+                 "joint_names": list(_ISAAC_JOINTS),
+                 "mount_bodies": [c["mount_body"] for c in _CAMERAS]})
+
+
 def mdp_normalize(d: np.ndarray, cam: dict) -> np.ndarray:
     """``normalize_depth_np`` with a camera contract dict, for brevity above."""
     return do.normalize_depth_np(
@@ -461,6 +600,7 @@ def main() -> int:
     dump_window(w, rng, args.count)
     dump_depth(w, rng, args.count)
     dump_depth_xyz(w, rng, min(args.count, 64))
+    dump_camera_fk(w, rng, min(args.count, 32))
     path = w.write_manifest(args.seed)
 
     total = sum(os.path.getsize(os.path.join(args.out, f)) for f in os.listdir(args.out))

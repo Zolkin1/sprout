@@ -28,6 +28,7 @@
 #include <g1_msgs/msg/controller_debug.hpp>
 #include <g1_msgs/msg/fm_plan.hpp>
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <memory>
@@ -35,6 +36,7 @@
 #include <string>
 #include <vector>
 
+#include "g1_deploy/camera_fk.h"
 #include "g1_deploy/policy_runtime.h"
 
 namespace g1_control {
@@ -101,6 +103,8 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
  private:
   void DeclareParams();
   void LoadPolicy();
+  /// Build the camera FK, if this generator conditions on more than depth. No-op otherwise.
+  void SetupCameraFk();
   void SetupDepth();
   void DepthCallback(const sensor_msgs::msg::Image::SharedPtr msg, size_t index);
 
@@ -128,6 +132,15 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   std::vector<double> kp_hw_;
   std::vector<double> kd_hw_;
   std::vector<int> policy_to_hw_;   //: hardware index -> policy index, for the gains
+
+  // ---- camera kinematics --------------------------------------------------------------
+  //: Null unless the generator reads more than depth per pixel. See SetupCameraFk.
+  std::unique_ptr<g1_deploy::CameraPoseFk> camera_fk_;
+  //: Encoder angles in the POLICY's order, which is what CameraPoseFk was built against. The
+  //: estimator speaks the robot's, and the two differ on 27 of the 29.
+  std::vector<double> fk_joint_pos_;
+  std::vector<std::array<double, 3>> fk_cam_pos_;
+  std::vector<std::array<double, 9>> fk_cam_rot_;
 
   // ---- latched inputs -----------------------------------------------------------------
   std::mutex est_mutex_;
@@ -175,6 +188,7 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   double fm_lead_sec_ = 0.05;
   bool threaded_fm_ = true;
   int fm_late_disarm_ticks_ = 0;
+  std::string urdf_path_;
 
   // ---- diagnostics --------------------------------------------------------------------
   std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> depth_subs_;

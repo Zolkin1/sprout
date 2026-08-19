@@ -354,6 +354,33 @@ python plot_utils/plot_from_bag.py     # 3. PLOTS   -> <bag>/plots/*.png
 collapsed robot. `scripts/stop.sh` tears both down (and now SIGINTs the recorder first so
 the bag is finalised).
 
+**The brain is the C++ controller** (`g1_cpp.yml`, `g1_control_cpp`); the python one
+(`g1.yml`) is DEPRECATED, warns at startup, and is reachable only via `--python`. It survives
+for bisecting a regression and for CLIP PLAYBACK, which the C++ runtime cannot do at all (no
+HDF5 clip reader — it refuses to load without an `fm.onnx` rather than pretending;
+`TODO(cpp-clip)`). It also REFUSES a >1-channel generator outright, because that needs camera
+FK it does not have. Nothing new goes there: the numeric half belongs in `transfer/deploy_cpp`
+(tested against the python oracle with no ROS), the ROS half in `g1_control_cpp`.
+
+**Pinocchio is the robot's kinematics, in both languages, from one apt package**
+(`ros-humble-pinocchio`, 4.0 in the image; the dev box has 3.9 from pip and both are pinned by
+the same tests). `g1_deploy::CameraPoseFk` FKs the depth cameras every tick — a generator with
+`extero_channels > 1` unprojects its own image and cannot do that without knowing where the
+cameras are — and `deploy.fk` draws the RViz/viewer plan ribbon, which used to be MuJoCo on
+`FlowMatchingConfig.fk_model_path`. The "FK'ing the ROS URDF would be a SECOND OPINION"
+objection is measured, not argued: URDF vs MJCF is 4e-13 on the camera chain and 4.6e-7 m at
+the wrists (`deploy/tests/test_fk_parity.py`, MuJoCo kept as a test-only oracle), so the image
+carries no MuJoCo and the robot has one kinematic description. The URDF is a controller
+PARAMETER (`urdf_path`), not a constant.
+- Two CMake traps, both of which fail pointing somewhere else: pinocchio 4.0's
+  `pinocchio_parsers` reaches `coal::coal` and its own config does not `find_dependency` it, and
+  an imported target is DIRECTORY-SCOPED — so `deploy_cpp` finds coal and promotes it
+  (`IMPORTED_GLOBAL`), or the consumer's own `target_link_libraries` line is what errors.
+- **A green build on the dev box says nothing about four files.** `find_path(onnxruntime)`
+  fails there, so `ort_session` / `tracker_session` / `fm_session` / `policy_runtime` are NOT
+  COMPILED and a syntax error in them survives (it did: a botched extraction ate the head of
+  `GaussianNoise::Fill` and was committed). The configure now WARNS; compile in the container.
+
 **When it falls over, take the generator out of the loop first.** `scripts/run_sim_clip.sh
 --case stand` swaps in `g1_debug_clip.yml`, which loads the tracker ALONE (no `fm.onnx` at
 all) and drives it from a baked clip. Cases, easiest first: `stand` (reference never moves —

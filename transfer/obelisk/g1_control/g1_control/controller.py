@@ -2,6 +2,24 @@
 
 """G1 low-level controller: the flow-matching generator + RL tracker, on hardware.
 
+DEPRECATED. ``g1_control_cpp`` (``config/g1_cpp.yml``) is the supported controller and the
+default in every run script; this one is kept for two shrinking reasons and will be removed:
+
+  * bisecting a regression against a known-good implementation, by launching ``g1.yml``
+    instead of ``g1_cpp.yml`` and changing nothing else;
+  * CLIP PLAYBACK (``config/g1_debug_clip.yml``), the only mode the C++ runtime cannot run
+    at all -- it has no HDF5 clip reader and refuses to load without an ``fm.onnx`` rather
+    than pretending. TODO(cpp-clip): port ``deploy.clip_reference`` and delete this node.
+
+It is not merely unsupported on the robot, it is UNUSABLE there: aarch64 rclpy is a cp310 C
+extension and the only onnxruntime GPU build that runs on a Thor is cp312, so two C
+extensions built for different CPython ABIs cannot share a process and this node reaches the
+CPU only -- ~471 ms per generator tick against a 20 ms control period. That is the whole
+reason the C++ port exists.
+
+Do not add features here. Anything new belongs in ``transfer/deploy_cpp`` (the numeric half,
+tested against the python oracle with no ROS) or in ``g1_control_cpp`` (the ROS half).
+
 The policy itself is NOT implemented here. ``transfer/deploy.GenTrackerPolicy`` is the one
 runtime shared by the MuJoCo sim2sim runner and this node, so the observation assembly,
 the generator cadence and the action scaling are identical in sim and on the robot by
@@ -184,6 +202,14 @@ class G1Controller(ObeliskController):
 
         # LAST, because it dry-runs a diagnostic message against every attribute above.
         self._setup_debug()
+        # Loud, once, at bring-up: a config file is easy to launch out of habit, and the
+        # difference between the two controllers is otherwise invisible in the log until
+        # something is slow.
+        self.get_logger().warn(
+            "this is the DEPRECATED python controller. g1_control_cpp (config/g1_cpp.yml) is "
+            "the supported one and the default in every run script; on aarch64 this node "
+            "cannot reach the GPU at all. Clip playback is the only mode that still needs it."
+        )
         self.get_logger().info("g1_controller up, DISARMED (waiting for LOW_LEVEL_CONTROL).")
 
     # ------------------------------------------------------------------ setup
@@ -271,6 +297,21 @@ class G1Controller(ObeliskController):
             self.get_logger().info(
                 "Debug-clip mode: not requiring CUDA. The generator is not loaded, and the "
                 "tracker alone fits the control period on the CPU.")
+        # A >1-channel generator unprojects its own depth image, which needs each camera's
+        # pose in the root's yaw-aligned frame -- i.e. forward kinematics. This node has none
+        # and will not grow any: it is deprecated, and the C++ controller already FKs the
+        # cameras every tick (g1_deploy::CameraPoseFk). Refused HERE rather than one tick
+        # after arming, where the same missing key surfaces as a KeyError from deep inside
+        # the observation assembly.
+        channels = 1
+        if not clip_mode:
+            channels = int(getattr(policy.ctx, "extero_channels", 1) or 1)
+        if channels > 1:
+            raise RuntimeError(
+                f"this generator conditions on {channels} channels per pixel, so it needs "
+                "camera forward kinematics, which the DEPRECATED python controller does not "
+                "have. Launch config/g1_cpp.yml (the default in every run script) instead."
+            )
         self.get_logger().info(
             f"Policy {repo}/{folder}: obs={policy.get_num_obs()} act={policy.get_num_actions()} "
             f"dt={policy.get_dt():.4f}s cameras={len(policy.get_depth_camera_spec())} "

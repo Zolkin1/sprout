@@ -123,9 +123,60 @@ if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
   target_compile_options(g1_deploy_ort PRIVATE -Wall -Wextra -Wpedantic)
   set(G1_DEPLOY_HAVE_ORT TRUE)
 else()
-  message(STATUS "onnxruntime not found under ${ONNXRUNTIME_ROOT} -- session layer skipped "
-                 "(the math core and its parity tests still build)")
+  # WARNING, not STATUS. What is skipped is four source files -- ort_session, tracker_session,
+  # fm_session, policy_runtime -- which means a SYNTAX ERROR IN THEM SURVIVES A CLEAN BUILD
+  # here and is only found in the container. That is not hypothetical: an extraction that ate
+  # the head of GaussianNoise::Fill was committed and passed every local check, because
+  # nothing on the dev box ever compiled the file.
+  message(WARNING "onnxruntime not found under ${ONNXRUNTIME_ROOT}: the session layer is NOT "
+                  "COMPILED (ort_session, tracker_session, fm_session, policy_runtime). The "
+                  "math core and its parity tests still build, but a build that is green here "
+                  "says nothing about those four files -- check them in the container.")
   set(G1_DEPLOY_HAVE_ORT FALSE)
+endif()
+
+# --------------------------------------------------------------------------------------
+# Camera forward kinematics (optional: pinocchio)
+# --------------------------------------------------------------------------------------
+# Optional for the same reason the ORT layer is: the math core must build on a box that has
+# neither. A 1-channel generator never needs this, and a multi-channel one is refused at load
+# with a message naming what is missing rather than failing later with a wrong cloud.
+#
+# It lives HERE rather than in the ROS node so it builds and tests without ROS -- the camera
+# pose is the one input where a mistake is invisible (a plausible cloud in the wrong place),
+# so it needs to be checkable against the python oracle on any dev box.
+# coal (the collision library, ex-hpp-fcl) FIRST, and QUIET. pinocchio 4.0 -- what the ROS
+# image ships -- has pinocchio_parsers link pinocchio_collision, whose interface names
+# coal::coal, but pinocchioConfig does not find_dependency it. Without this the link fails at
+# CMake GENERATE time with "Target coal::coal not found", pointing at the CONSUMER's
+# target_link_libraries line rather than at anything to do with collision. A no-op under 3.9
+# (the pip/cmeel build), where the parsers target does not reach collision at all.
+find_package(coal QUIET)
+if(TARGET coal::coal)
+  # ...and PROMOTED, because an imported target is directory-scoped by default. This project
+  # is pulled into the ROS controller by FetchContent, so without this the target exists here
+  # and is invisible in the consumer's own target_link_libraries -- which is where the
+  # generator expression is evaluated, and where the "not found" error is then reported.
+  # CMake 3.24's `find_package(... GLOBAL)` would say this in one word; the image has 3.22.
+  set_target_properties(coal::coal PROPERTIES IMPORTED_GLOBAL TRUE)
+endif()
+find_package(pinocchio QUIET)
+if(pinocchio_FOUND)
+  add_library(g1_deploy_fk STATIC src/camera_fk.cc)
+  target_include_directories(g1_deploy_fk PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  # pinocchio_parsers, NOT the umbrella pinocchio::pinocchio. The umbrella drags in
+  # pinocchio::pinocchio_collision, whose interface names coal::coal (the collision library,
+  # ex-hpp-fcl) -- a target that is not defined unless the consumer also find_package(coal)s,
+  # so linking it fails at GENERATE time inside the ROS image with an error about a target
+  # nobody asked for. Nothing here collides: this is FK of an open chain. The parsers target
+  # carries the URDF reader and the core, which is the whole dependency, and it exists under
+  # both the ROS package (4.0) and the pip/cmeel one (3.9).
+  target_link_libraries(g1_deploy_fk PUBLIC g1_deploy pinocchio::pinocchio_parsers)
+  target_compile_options(g1_deploy_fk PRIVATE -Wall -Wextra -Wpedantic)
+  add_library(G1Deploy::Fk ALIAS g1_deploy_fk)
+  message(STATUS "pinocchio ${pinocchio_VERSION} -- camera FK enabled")
+else()
+  message(STATUS "pinocchio not found -- camera FK skipped (a >1-channel generator needs it)")
 endif()
 
 # --------------------------------------------------------------------------------------
@@ -149,6 +200,15 @@ if(BUILD_TESTING)
     set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
     FetchContent_MakeAvailable(googletest)
     set(GTest_FOUND TRUE)
+  endif()
+  if(GTest_FOUND AND TARGET g1_deploy_fk)
+    add_executable(camera_fk_parity_test test/camera_fk_parity_test.cc test/fixture.cc)
+    target_include_directories(camera_fk_parity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+    target_link_libraries(camera_fk_parity_test
+      PRIVATE g1_deploy_fk nlohmann_json::nlohmann_json GTest::gtest GTest::gtest_main)
+    target_compile_definitions(camera_fk_parity_test PRIVATE
+      G1_DEPLOY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/parity")
+    add_test(NAME camera_fk_parity COMMAND camera_fk_parity_test)
   endif()
   if(GTest_FOUND)
     foreach(name quat_math_parity window_parity depth_obs_parity fm_meta node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler)
