@@ -137,12 +137,17 @@ BACKPACK_LINKS: tuple[str, ...] = ("backpack_shell_link",)
 
 # Links whose Xform holds the visual mesh DIRECTLY, with no inner same-named Xform.
 #
-# The converter only emits the inner wrapper for a link that has CHILD links; a leaf gets
-# one Xform doing both jobs.  Both hands and the backpack shell are leaves, so their
-# ray-cast targets are undoubled -- see :func:`visual_prim_path`.  Verified against the
-# generated stage, not assumed: the paths really are
-# ``.../left_wrist_yaw_link/left_rubber_hand`` and ``.../torso_link/backpack_shell_link``.
-_LEAF_LINKS: frozenset[str] = frozenset(HAND_LINKS + BACKPACK_LINKS)
+# The converter emits the inner wrapper when a link needs its geometry split out -- because
+# it has child links, OR because it has a COLLISION as well as a visual, which is a separate
+# prim.  A link with neither gets one Xform doing both jobs, and its ray-cast target is
+# undoubled (see :func:`visual_prim_path`).
+#
+# So the hands are leaves and ``backpack_shell_link`` is NOT, despite both being childless
+# bolt-ons: the shell carries a box collider, so its geometry sits at
+# ``.../backpack_shell_link/backpack_shell_link`` beside a ``box`` Cube. Read off the
+# generated stage rather than reasoned about -- giving the shell a collider silently moved
+# it from one convention to the other.
+_LEAF_LINKS: frozenset[str] = frozenset(HAND_LINKS)
 
 # Links a torso-mounted, downward-looking camera can actually see.  The arms are in
 # frame as much as the legs are -- both cameras hang off the torso and look forward

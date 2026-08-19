@@ -829,7 +829,7 @@
       <mass value="1e-06" />
       <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
     </inertial>
-    <visual>
+    <visual name="camera_lower_mount_link">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
         <mesh filename="meshes/PART_lower_camera_assembly.STL" />
@@ -862,7 +862,7 @@
       <mass value="1e-06" />
       <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
     </inertial>
-    <visual>
+    <visual name="camera_upper_mount_link">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
         <mesh filename="meshes/PART_upper_camera_assembly.STL" />
@@ -919,7 +919,7 @@
       <mass value="1e-06" />
       <inertia ixx="1e-09" ixy="0" ixz="0" iyy="1e-09" iyz="0" izz="1e-09" />
     </inertial>
-    <visual>
+    <visual name="backpack_shell_link">
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
         <mesh filename="meshes/ASSY_backpack.STL" />
@@ -928,6 +928,12 @@
         <color rgba="0.25 0.25 0.28 1" />
       </material>
     </visual>
+    <collision>
+      <origin xyz="-0.040805 -7e-05 -0.006105" rpy="0 0 0" />
+      <geometry>
+        <box size="0.15401 0.18748 0.25307" />
+      </geometry>
+    </collision>
   </link>
   <joint name="backpack_shell_joint" type="fixed">
     <origin xyz="-0.102284 -0.0003727 0.1271" rpy="0 0 0" />

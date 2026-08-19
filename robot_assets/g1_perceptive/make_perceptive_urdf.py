@@ -221,12 +221,17 @@ class ShellSpec:
         stl: Mesh filename under ``meshes/``.
         xyz: Where the STL's OWN origin goes, in the ``PARENT_LINK`` frame (m).
         rpy: Orientation of the mesh in that frame (rad).
+        collision_size: Extents (m) of a box collider, in the LINK frame, or ``None`` for a
+            visual-only shell.
+        collision_origin: Centre of that box in the link frame (m).
     """
 
     name: str
     stl: str
     xyz: tuple[float, float, float]
     rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    collision_size: tuple[float, float, float] | None = None
+    collision_origin: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
 
 #: The backpack shell, placed at the Thor centre because that is where its datum now is:
@@ -241,8 +246,28 @@ class ShellSpec:
 #: normal. The pod is symmetric in y to 0.07 mm, so the yaw's y flip costs nothing. This is
 #: a placement correction, NOT a substitute for moving the pack in CAD: re-export with it on
 #: the back and the yaw goes to zero.
+#: The collider exists because ``backpack_contact`` needs something to fire on: a contact
+#: sensor watching a body with no collider is silently dead, which is the state
+#: ``torso_contact`` has been in (its box sits on ``waist_yaw_link``). It is also physically
+#: right -- 2.6 kg standing 0.2 m behind the torso is the first thing to touch a wall the
+#: robot backs into, and the first thing to hit the floor in a backwards fall.
+#:
+#: A box rather than the mesh: the shell is a plate plus a frame plus two blocks, the convex
+#: hull of that is nearly the box anyway, and a box is what every other collider here is.
+#:
+#: It is the mesh's bounding box with the FRONT FACE PULLED BACK 12.1 mm, which is not
+#: cosmetic. At the full bbox the pack overlapped the torso box by 2.09 mm across a
+#: 180 x 190 mm face, and since the two are rigidly welded PhysX cannot resolve it by moving
+#: them apart -- it just pushes. Measured: the robot drifted +0.38 m FORWARD in one second
+#: of settling, when the backpack's own mass should carry it backwards, and it did drift
+#: -0.19 m backwards before the collider existed. Welded bodies must not touch, and nothing
+#: filters this pair: PhysX only auto-filters ADJACENT links, and these are two joints
+#: apart. The pull-back leaves 10 mm of clearance; ``test_colliders_do_not_interpenetrate``
+#: fails if any pair closes up again.
 SHELLS = (
-    ShellSpec("backpack_shell", "ASSY_backpack.STL", PAYLOADS[0].com_xyz),
+    ShellSpec("backpack_shell", "ASSY_backpack.STL", PAYLOADS[0].com_xyz,
+              collision_size=(0.15401, 0.18748, 0.25307),
+              collision_origin=(-0.040805, -0.00007, -0.006105)),
 )
 
 
@@ -413,7 +438,14 @@ def _link_with_mesh(name: str, stl_rel: str, metres_per_unit: float,
     """
     link = ET.Element("link", {"name": name})
     link.append(_token_inertial() if inertial is None else inertial)
-    visual = ET.SubElement(link, "visual")
+    # NAME the visual after its link. The converter names the inner geometry Xform after the
+    # visual, falling back to the MESH FILENAME when unnamed -- and every stock G1 mesh
+    # happens to be called after its link, so that fallback looks like a rule until a mesh
+    # called ASSY_backpack.STL lands under backpack_shell_link and the prim comes out
+    # "ASSY_backpack". g1_self_scan builds ray-cast targets from LINK names, so the target
+    # would name a prim that does not exist -- and MultiMeshRayCaster answers that with a
+    # log line, not an error, leaving the body silently missing from every depth image.
+    visual = ET.SubElement(link, "visual", {"name": name})
     ET.SubElement(visual, "origin", {"xyz": "0 0 0", "rpy": "0 0 0"})
     geom = ET.SubElement(visual, "geometry")
     attrs = {"filename": stl_rel}
@@ -554,13 +586,38 @@ def _add_shells(root: ET.Element, shells, payloads) -> None:
             continue
         mesh = trimesh.load(stl_abs, force="mesh")
         mpu = detect_units(mesh)
-        root.append(_link_with_mesh(f"{sh.name}_link", f"meshes/{sh.stl}", mpu))
+        link = _link_with_mesh(f"{sh.name}_link", f"meshes/{sh.stl}", mpu)
+        if sh.collision_size is not None:
+            collision = ET.SubElement(link, "collision")
+            ET.SubElement(collision, "origin",
+                          {"xyz": _xyz(sh.collision_origin), "rpy": "0 0 0"})
+            ET.SubElement(ET.SubElement(collision, "geometry"), "box",
+                          {"size": _xyz(sh.collision_size)})
+        root.append(link)
         root.append(_fixed_joint(f"{sh.name}_joint", PARENT_LINK, f"{sh.name}_link",
                                  sh.xyz, sh.rpy))
         units = "metres" if mpu == 1.0 else f"MILLIMETRES (scale {mpu:g})"
-        print(f"  {sh.name}  ({sh.stl}, {units}, visual only)")
+        kind = "visual only" if sh.collision_size is None else "visual + box collider"
+        print(f"  {sh.name}  ({sh.stl}, {units}, {kind})")
         print(f"    STL origin goes at: {_xyz(sh.xyz)}  ({PARENT_LINK} frame), "
               f"rpy {' '.join(f'{np.degrees(v):.0f}' for v in sh.rpy)} deg")
+        if sh.collision_size is not None:
+            # The collider may be SMALLER than the mesh (clearance against a welded
+            # neighbour), never larger -- a box sticking out past the geometry it stands for
+            # would collide with things the robot visibly misses.
+            lo, hi = np.asarray(mesh.bounds) * mpu
+            c, h = np.asarray(sh.collision_origin), np.asarray(sh.collision_size) / 2.0
+            out = np.maximum(np.maximum(lo - (c - h), (c + h) - hi), 0.0) * 1000.0
+            shrink = ((hi - lo) - np.asarray(sh.collision_size)) * 1000.0
+            # 50 um: the declared extents are rounded to 5 dp, so an exact-zero test just
+            # reports the rounding as an overhang.
+            verdict = ("inside the mesh" if out.max() < 0.05 else
+                       f"STICKS OUT past the mesh by {np.round(out, 3)} mm")
+            print(f"    collider box      : "
+                  f"{' x '.join(f'{v * 1000:.0f}' for v in sh.collision_size)} mm at "
+                  f"{_xyz(sh.collision_origin)}")
+            print(f"                        {verdict}; "
+                  f"{np.round(shrink, 2)} mm smaller than the mesh bbox")
         _report_shell_datum(mesh, mpu, sh, payloads)
 
 
