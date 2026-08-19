@@ -213,6 +213,20 @@ def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
                 "overlay axis-aligned, or add yaw to OverlayVolumeCfg / overlay_sub_boxes / "
                 "build_overlay and every renderer that consumes them."
             )
+        # Reserved fields, refused rather than ignored. ``decor`` is Part 2.4's visual-only
+        # channel: a wall the cameras see, the height scan does not, and the robot cannot
+        # walk into. IsaacLab needs a SEPARATE prim for that -- the height scanner is a
+        # RayCaster and takes exactly one mesh prim, while the depth cameras take a list --
+        # so silently accepting the field here would put the decoration on /World/ground and
+        # make it both scannable and solid. Same reasoning as the yaw refusal above.
+        reserved = [k for k in ("decor",) if k in ov]
+        if reserved:
+            raise ValueError(
+                f"terrain {entry.get('terrain_id')} overlay {i} carries {reserved}, which "
+                "this loader does not implement. Decoration must be built on its own prim, "
+                "not merged into the ground mesh; ignoring the field would make it a solid "
+                "box that the height scan reads as terrain."
+            )
         kind = str(ov.get("kind", "box"))
         if kind not in OVERLAY_KINDS:
             raise ValueError(
