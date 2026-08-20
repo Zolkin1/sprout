@@ -149,6 +149,10 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
 
   std::vector<std::vector<double>> depth_;        //: per camera, metres
   std::vector<double> depth_time_;
+  //: The consumed frame's own CAPTURE stamp (header), seconds, or <0 if never published. Kept
+  //: beside the receipt time rather than replacing it: the watchdog wants receipt (a skewed
+  //: sender must not look alive), and the age-from-capture diagnostic wants this.
+  std::vector<double> depth_stamp_;
   std::mutex depth_mutex_;
 
   g1_deploy::Vec3 vel_cmd_{0.0, 0.0, 0.0};

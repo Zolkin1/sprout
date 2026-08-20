@@ -56,6 +56,17 @@ uint32 fm_offsets_clamped
 builtin_interfaces/Time est_state_stamp
 float64 est_state_age        # seconds between the estimate's receipt and this tick
 float64[] depth_age          # per camera, in the artifact's contract order
+# The same frames' age measured from CAPTURE -- the publisher's header stamp -- rather than
+# from local receipt, so it includes exposure, render and transport as well as the wait for a
+# tick. depth_age is the controller's own contribution; this is the whole pipeline.
+#
+# Only comparable when the two clocks are: in sim the world node stamps with the same ROS
+# clock the controller reads, so this is exact. On hardware the cameras run through a Jetson
+# whose clock is NOT synchronised, and this then carries the offset too -- which is why the
+# watchdog still uses receipt time and this field is diagnostic only. <0 if a camera has never
+# published, or published with an empty stamp.
+float64[] depth_capture_age
+builtin_interfaces/Time[] depth_stamp   # the consumed frame's own stamp, per camera
 float64 vel_cmd_age          # <0 if no velocity command has ever arrived
 
 # ---- Command ------------------------------------------------------------------------

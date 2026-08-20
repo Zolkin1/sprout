@@ -306,41 +306,59 @@ def fig_frame_age(runs, plt):
     control rate inside the same step that consumes them -- so it is annotated rather than
     plotted as a flat zero, which would look like a measurement.
     """
-    fig, ax = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+    fig, ax = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
     plotted = False
+
+    def _per_cam(ticks, field, n):
+        """``[ticks, cameras]`` of a per-camera float field, NaN where absent."""
+        out = np.full((n, max((len(getattr(m, field, ())) for m in ticks), default=0)), np.nan)
+        for i, m in enumerate(ticks):
+            a = np.asarray(getattr(m, field, ()), dtype=float)
+            if a.size == out.shape[1]:
+                out[i] = np.where(a < 0.0, np.nan, a)   # <0 means "never published"
+        return out
+
     for r, st in zip(runs, STYLES):
         t = _aligned_time(r)
         ticks = getattr(r, "ticks", None)
-        ages = None
-        if ticks and hasattr(ticks[0], "depth_age"):
-            n_cam = max((len(m.depth_age) for m in ticks), default=0)
-            if n_cam:
-                ages = np.full((len(t), n_cam), np.nan)
-                for i, m in enumerate(ticks):
-                    a = np.asarray(m.depth_age, dtype=float)
-                    if a.size == n_cam:
-                        ages[i] = a
-        if ages is None:
+        if not ticks or not hasattr(ticks[0], "depth_age"):
             ax[0].plot([], [], label=f"{r.label}: no depth age (0 by construction)", **st)
+            continue
+        ages = _per_cam(ticks, "depth_age", len(t))
+        cap = _per_cam(ticks, "depth_capture_age", len(t))
+        if not ages.shape[1]:
             continue
         plotted = True
         for cam in range(ages.shape[1]):
-            ax[0].plot(t, 1e3 * ages[:, cam], lw=0.9,
-                       ls="-" if cam == 0 else "--", color=st["color"],
+            ls = "-" if cam == 0 else "--"
+            ax[0].plot(t, 1e3 * ages[:, cam], lw=0.9, ls=ls, color=st["color"],
                        label=f"{r.label} cam{cam}")
-            print(f"[compare] {r.label} cam{cam} depth age: median "
-                  f"{1e3 * np.nanmedian(ages[:, cam]):.1f} ms, p99 "
-                  f"{1e3 * np.nanpercentile(ages[:, cam], 99):.1f} ms")
+            if cam < cap.shape[1] and np.isfinite(cap[:, cam]).any():
+                ax[1].plot(t, 1e3 * cap[:, cam], lw=0.9, ls=ls, color=st["color"],
+                           label=f"{r.label} cam{cam}")
+                print(f"[compare] {r.label} cam{cam}: in-controller "
+                      f"{1e3 * np.nanmedian(ages[:, cam]):.1f} ms median / "
+                      f"{1e3 * np.nanpercentile(ages[:, cam], 99):.1f} p99  |  "
+                      f"from CAPTURE {1e3 * np.nanmedian(cap[:, cam]):.1f} / "
+                      f"{1e3 * np.nanpercentile(cap[:, cam], 99):.1f}")
+            else:
+                print(f"[compare] {r.label} cam{cam} depth age: median "
+                      f"{1e3 * np.nanmedian(ages[:, cam]):.1f} ms, p99 "
+                      f"{1e3 * np.nanpercentile(ages[:, cam], 99):.1f} ms "
+                      "(no capture stamp in this bag -- recorded before depth_capture_age)")
         est = np.array([getattr(m, "est_state_age", np.nan) for m in ticks], dtype=float)
-        ax[1].plot(t, 1e3 * est, lw=0.9, label=f"{r.label} estimate", **st)
+        ax[2].plot(t, 1e3 * est, lw=0.9, label=f"{r.label} estimate", **st)
     if plotted:
         # 60 ms is the shipped nominal lead; 120 ms is where the emulated sweep lost a descent.
-        ax[0].axhline(60.0, color="k", ls=":", lw=1.0, label="nominal lead 60 ms")
-        ax[0].axhline(120.0, color="k", ls="-.", lw=1.0, label="120 ms (descent failed in sim)")
-    ax[0].set_ylabel("depth age [ms]")
-    ax[1].set_ylabel("estimate age [ms]")
-    ax[1].set_xlabel("time from arm [s]")
-    ax[0].set_title("input age at consumption -- what the generator actually saw")
+        # Drawn on the CAPTURE panel, because that is the number the lead adds to.
+        ax[1].axhline(60.0, color="k", ls=":", lw=1.0, label="nominal lead 60 ms")
+        ax[1].axhline(120.0, color="k", ls="-.", lw=1.0, label="120 ms (descent failed in sim)")
+    ax[0].set_ylabel("in-controller [ms]")
+    ax[1].set_ylabel("from capture [ms]")
+    ax[2].set_ylabel("estimate age [ms]")
+    ax[2].set_xlabel("time from arm [s]")
+    ax[0].set_title("depth age: receipt-to-tick (top) vs capture-to-tick (middle). The second "
+                    "includes exposure, render and transport; only the first is this node's.")
     return fig, ax
 
 

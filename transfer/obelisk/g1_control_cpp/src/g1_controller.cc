@@ -1,5 +1,7 @@
 // Copyright 2026 Zachary Olkin. All rights reserved.
 
+#include <builtin_interfaces/msg/time.hpp>
+
 #include "g1_control/g1_controller.h"
 
 #include <obelisk_control_msgs/msg/execution_fsm.hpp>
@@ -331,6 +333,7 @@ void G1Controller::SetupDepth() {
   }
   depth_.assign(cams.size(), {});
   depth_time_.assign(cams.size(), -1.0);
+  depth_stamp_.assign(cams.size(), -1.0);
 
   // One mutually-exclusive group for both cameras, so a frame cannot preempt its sibling but
   // neither is serialised behind the 50 Hz tick.
@@ -370,6 +373,11 @@ void G1Controller::DepthCallback(const sensor_msgs::msg::Image::SharedPtr msg, s
   // Stamped on LOCAL RECEIPT, not from the header: the watchdog is asking "is this camera still
   // talking to me", and a sender with a skewed clock would answer the wrong question.
   depth_time_[index] = this->now().seconds();
+  // The header stamp as well, for the age-from-CAPTURE diagnostic: receipt time measures only
+  // this node's own contribution, and the interesting number is how old the pixels are.
+  const double stamp = static_cast<double>(msg->header.stamp.sec) +
+                       1e-9 * static_cast<double>(msg->header.stamp.nanosec);
+  depth_stamp_[index] = stamp > 0.0 ? stamp : -1.0;
 }
 
 void G1Controller::UpdateXHat(const EstimatorMsg& msg) {
@@ -891,6 +899,17 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
       std::lock_guard<std::mutex> lock(depth_mutex_);
       d.depth_age.reserve(depth_time_.size());
       for (double t : depth_time_) d.depth_age.push_back(t >= 0.0 ? now_s - t : -1.0);
+      d.depth_capture_age.reserve(depth_stamp_.size());
+      d.depth_stamp.reserve(depth_stamp_.size());
+      for (double t : depth_stamp_) {
+        d.depth_capture_age.push_back(t >= 0.0 ? now_s - t : -1.0);
+        builtin_interfaces::msg::Time stamp;
+        if (t >= 0.0) {
+          stamp.sec = static_cast<int32_t>(t);
+          stamp.nanosec = static_cast<uint32_t>((t - static_cast<double>(stamp.sec)) * 1e9);
+        }
+        d.depth_stamp.push_back(stamp);
+      }
     }
     Vec3 cmd{0.0, 0.0, 0.0};
     {
