@@ -46,8 +46,7 @@ from isaaclab.utils import configclass
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.mdp.sensors import DepthNoiseCfg
-from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_importer import (
-    ClipTerrainImporter, create_decor_prim)
+from robot_rl.tasks.manager_based.robot_rl.terrains.decor import DECOR_PRIM_PATH
 
 from .g1_self_scan import link_prim_path, self_scan_prim_paths
 from .g1_teacher_env_cfg import G1TeacherEventsCfg, G1TeacherObservationsCfg
@@ -56,10 +55,6 @@ from .g1_teacher_terrain_env_cfg import (
     G1TeacherTerrainBodyEnvCfgPlay,
     G1TeacherTerrainSceneCfg,
 )
-
-#: The visual-only decoration prim the cameras cast against, re-exported from the importer
-#: that owns it so a scene without a ``ClipTerrainImporter`` still has one name to create.
-DECOR_PRIM_PATH = ClipTerrainImporter.DECOR_PRIM_PATH
 
 
 def ensure_decor_prim() -> None:
@@ -75,7 +70,14 @@ def ensure_decor_prim() -> None:
     Call before ``sim.reset()``, which is when the sensors initialise. Idempotent: a scene
     that already has real decoration is left alone.
     """
+    # Imported HERE, not at module scope: the importer transitively pulls in ``pxr``, and
+    # this cfg module is imported by hydra BEFORE ``AppLauncher`` runs.  See
+    # ``terrains/decor.py``.  By the time this function is called the app is up.
     import isaaclab.sim as sim_utils
+
+    from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_importer import (
+        create_decor_prim,
+    )
 
     if not sim_utils.is_prim_path_valid(DECOR_PRIM_PATH):
         create_decor_prim(None, DECOR_PRIM_PATH)

@@ -30,6 +30,7 @@ from isaaclab.terrains.terrain_importer import TerrainImporter
 from motion_gen.clips.clip_fingerprint import fingerprint_terrain_manifest
 from motion_gen.clips.clip_io import load_clip_library
 from .clip_terrain_loader import assemble_clip_terrain
+from .decor import DECOR_PRIM_PATH as _DECOR_PRIM_PATH
 
 
 #: One tiny triangle, 1 km below the world, standing in for "no decoration".
@@ -179,7 +180,7 @@ class ClipTerrainImporter(TerrainImporter):
     #: normal way would be scanned along with the terrain, which is the one thing the channel
     #: exists to prevent. The depth cameras take a LIST of prims and are given this one
     #: explicitly (``g1_depth_env_cfg``).
-    DECOR_PRIM_PATH = "/World/decor"
+    DECOR_PRIM_PATH = _DECOR_PRIM_PATH
 
     def _import_decor(self, decor_mesh) -> None:
         """Import the decoration mesh as a visual-only prim.
