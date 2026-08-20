@@ -40,6 +40,7 @@ from obelisk_control_msgs.msg import VelocityCommand
 from rclpy._rclpy_pybind11 import RCLError
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.qos import QoSProfile
 
 from g1_msgs.msg import ControllerDebug
@@ -74,12 +75,19 @@ class ScriptedVelCmd(Node):
         self.declare_parameter("profile", "constant_forward")
         self.declare_parameter("topic", "/obelisk/g1/vel_cmd")
         self.declare_parameter("tick_topic", "/obelisk/g1/debug/tick")
+        # DYNAMIC TYPING on the two numeric parameters, and it is not a nicety: rclpy takes a
+        # parameter's type from its DECLARED DEFAULT, so a default of 50.0 makes
+        # `-p rate:=50` an INTEGER override of a DOUBLE and the node dies at construction with
+        # InvalidParameterTypeException. Nobody writing `--duration 14` on a command line
+        # means "integer", and the failure lands in a tmux pane at launch, well away from the
+        # typo. Declared permissively and coerced with float() below.
+        numeric = ParameterDescriptor(dynamic_typing=True)
         #: Publish rate. 50 Hz matches the control tick, so the command is never the stale
         #: input; the profiles are continuous functions so the rate is not load-bearing.
-        self.declare_parameter("rate", 50.0)
+        self.declare_parameter("rate", 50.0, numeric)
         #: Stop publishing (and hold zeros) after this many seconds of profile time. <=0
         #: runs forever. A bounded run is what makes two recordings the same length.
-        self.declare_parameter("duration", 0.0)
+        self.declare_parameter("duration", 0.0, numeric)
         #: Start the profile clock at ARM (default) or at node start. The latter exists only
         #: for driving a stack with no controller attached, e.g. a bring-up smoke test.
         self.declare_parameter("start_on_arm", True)

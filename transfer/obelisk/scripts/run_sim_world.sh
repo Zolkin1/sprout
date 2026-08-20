@@ -105,7 +105,12 @@ tmux split-window -h -t "$SESSION":main.0  "$(obk_pane_run fsm "$FSM_CMD")"
 # so a scripted run and a driven run put the same controller under test.
 if [ -n "$VEL_PROFILE" ]; then
     VEL_CMD="ros2 run g1_control scripted_vel_cmd --ros-args -p profile:=$VEL_PROFILE"
-    [ -n "$VEL_DURATION" ] && VEL_CMD="$VEL_CMD -p duration:=$VEL_DURATION"
+    # Emitted as a FLOAT literal. `-p duration:=14` is an INTEGER to rclpy and the node
+    # declares a double; the node now accepts either, but sending the unambiguous form keeps
+    # the intent visible in the pane's command line.
+    if [ -n "$VEL_DURATION" ]; then
+        VEL_CMD="$VEL_CMD -p duration:=$(printf '%.3f' "$VEL_DURATION")"
+    fi
     tmux split-window -v -t "$SESSION":main.1  "$(obk_pane_run vel "$VEL_CMD")"
 fi
 tmux select-pane  -t "$SESSION":main.0
