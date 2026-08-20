@@ -8,6 +8,8 @@ import math
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
+from motion_gen.features import DEFAULT_MJCF
+
 from .extero_encoder import conv_grid_shape
 
 
@@ -756,7 +758,10 @@ class FlowMatchingConfig:
     body_pose_world_weight: float = 0.0
     body_pose_ori_scale: float = 0.25
     consistency_tau_min: float = 0.75
-    fk_model_path: str = "transfer/sim/robots/g1/g1_29j.xml"
+    # ABSOLUTE, derived from the package root -- it used to be a bare CWD-relative string,
+    # which CLAUDE.md's path rule forbids and which silently resolved to nothing whenever a
+    # training run was launched from anywhere but the repo root.
+    fk_model_path: str = DEFAULT_MJCF
     # Body frames the pose terms grade, as MJCF body names on ``fk_model_path``. ``None``
     # resolves to ``motion_gen.joint_names.G1_BODY_TRACK_FRAMES`` -- the same 13 the clip
     # library carries ``@root`` channels for and the body-mode CLF grades, so the loss and

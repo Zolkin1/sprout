@@ -2,18 +2,30 @@
 
 """The Isaac URDF and the MuJoCo MJCF must describe the same robot.
 
-There are two independent descriptions of the G1 in this repo and nothing kept them in
-step:
+There are two descriptions of the G1 in this repo:
 
-* ``robot_assets/g1/g1_21j/g1_21j_box_merged_29j_hands.urdf`` -> the USD Isaac spawns;
-* ``transfer/sim/robots/g1/g1_29j.xml`` -> MuJoCo sim2sim, and ALSO
+* ``robot_assets/g1_perceptive/g1_perceptive.urdf`` -> the USD Isaac spawns;
+* ``transfer/sim/robots/g1/g1_perceptive.xml`` -> MuJoCo sim2sim, and ALSO
   :data:`motion_gen.features.DEFAULT_MJCF`, i.e. the model every clip library's
   ``<body>@root`` and world end-effector channel is forward-kinematicked through.
 
 The second point is what makes this more than tidiness: a disagreement between the two is
-train/serve skew that shows up as a tracking error nobody can attribute. These tests pin
-the agreement, and pin the disagreements that are real and known so that closing one is a
-deliberate act rather than a surprise.
+train/serve skew that shows up as a tracking error nobody can attribute.
+
+**The MJCF is now GENERATED from the URDF** (``make_g1_mjcf.py``), so these are no longer
+two hand-maintained files that happen to agree -- and this file's job changed with them.
+It used to pin a table of known divergences: a 2.62 kg mass gap, a head counted twice
+across the two sims, the palms' density-derived mass, the URDF lumping the hand into the
+wrist while the MJCF spread it down 16 finger links, and one blanket ``armature="0.01"``
+against Isaac's four per-motor values. Every one of those is gone. What is left is the
+strict form: the same 39 bodies, the same masses to a milligram, and identical FK.
+
+Regenerate with::
+
+    python transfer/sim/robots/g1/make_g1_mjcf.py \\
+        --urdf robot_assets/g1_perceptive/g1_perceptive.urdf \\
+        --template transfer/sim/robots/g1/g1_29j.xml \\
+        --out transfer/sim/robots/g1/g1_perceptive.xml
 
 FK is compared by compiling the URDF with MuJoCo's own URDF front-end and running BOTH
 models through :class:`motion_gen.fk.FKChain` -- the same parser the clip generator uses.
@@ -23,6 +35,7 @@ mesh directory and takes milliseconds.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import tempfile
@@ -37,9 +50,7 @@ from motion_gen.joint_names import G1_BODY_TRACK_FRAMES, G1_JOINT_NAMES
 
 mujoco = pytest.importorskip("mujoco")
 
-URDF_PATH = str(
-    F._REPO_ROOT / "robot_assets" / "g1" / "g1_21j" / "g1_21j_box_merged_29j_hands.urdf"
-)
+URDF_PATH = str(F._REPO_ROOT / "robot_assets" / "g1_perceptive" / "g1_perceptive.urdf")
 
 #: Compiler flags that make MuJoCo's URDF front-end preserve the link tree.
 #: ``fusestatic="false"`` is load-bearing -- without it MuJoCo merges every fixed joint and
@@ -48,44 +59,17 @@ _URDF_MUJOCO_BLOCK = (
     '  <mujoco><compiler fusestatic="false" discardvisual="true" strippath="true"/></mujoco>\n'
 )
 
-#: MuJoCo names the palm ``*_palm_link``; the URDF/USD name it ``*_hand_palm_link``. Documented
-#: at ``motion_gen/joint_names.py``, and the reason the palms are excluded from
-#: ``G1_BODY_TRACK_FRAMES`` -- the trackable set is the INTERSECTION of the two models.
-PALM_RENAMES = {"left_hand_palm_link": "left_palm_link",
-                "right_hand_palm_link": "right_palm_link"}
-
-#: Links whose mass the two models deliberately distribute differently: the URDF lumps the
-#: whole hand into the wrist and gives the 14 finger links a token 1e-6 kg (see
-#: ``make_hand_links_urdf.py`` -- they exist only so the ray caster can see them), while the
-#: MJCF gives each finger a real mass. The TOTAL is what must agree, and
-#: :func:`test_the_hand_lumping_conserves_mass` checks exactly that.
-_HAND_LUMPED = {f"{side}_{part}" for side in ("left", "right") for part in (
-    "wrist_yaw_link", "hand_palm_link",
-    "hand_thumb_0_link", "hand_thumb_1_link", "hand_thumb_2_link",
-    "hand_middle_0_link", "hand_middle_1_link",
-    "hand_index_0_link", "hand_index_1_link",
-)}
-
-#: MEASURED mass the MJCF has and the URDF does not, in kg, per MuJoCo-resolved body.
+#: Per-joint reflected inertia the generator writes, keyed by joint-name substring.
 #:
-#: All three of these bodies carry NO ``<inertial>`` in the MJCF, so MuJoCo derives their
-#: mass from mesh volume times the default density of 1000 kg/m^3 -- which is a modelling
-#: accident for anything that is not solid water.
-#:
-#: * the two palms are known and deliberate (``g1_29j.xml`` documents that setting
-#:   ``density="0"`` there "would silently make the palms massless");
-#: * ``head_link`` is NOT. The URDF merged every fixed joint, folding the head into
-#:   ``torso_link``, so Isaac carries the head's mass in the torso while MuJoCo adds a
-#:   separate 1.80 kg head on top -- it is counted twice across the two sims.
-#:
-#: Together they make MuJoCo's G1 **2.62 kg (7.2%) heavier than Isaac's**. Recorded here
-#: rather than silently corrected: changing either model's mass changes every sim2sim
-#: number already measured, so it is a deliberate decision, not a test fix.
-KNOWN_MJCF_ONLY_MASS_KG = {
-    "head_link": 1.8025,
-    "left_palm_link": 0.41119,
-    "right_palm_link": 0.41119,
-}
+#: Imported from the generator rather than restated: the MJCF used to carry ONE blanket
+#: ``armature="0.01"`` against Isaac's four per-motor-class values -- up to a 2.5x sim2sim
+#: mismatch that nothing reported. ``assets/robots/g1_21j.py`` holds the Isaac side and
+#: ``source/robot_rl/tests/test_actuator_table.py`` pins it there.
+_MJCF_GEN = F._REPO_ROOT / "transfer" / "sim" / "robots" / "g1" / "make_g1_mjcf.py"
+_spec = importlib.util.spec_from_file_location("_make_g1_mjcf", _MJCF_GEN)
+_gen = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_gen)
+JOINT_ARMATURE = _gen.JOINT_ARMATURE
 
 
 def _urdf_as_mjcf_path(tmpdir: str) -> str:
@@ -209,12 +193,22 @@ def test_forward_kinematics_agree_exactly():
 
 
 def test_the_urdf_compiles_with_its_link_tree_intact():
-    """``fusestatic="false"`` is what keeps the hands; without it 46 links become 30."""
+    """``fusestatic="false"`` is what keeps the fixed-joint links from being welded away.
+
+    Everything bolted to this robot is a fixed joint -- both rubber hands, the two camera
+    mounts, the compute backpack and its two payload masses. Fuse them and the depth cameras
+    stop seeing the hands (and the ray caster has no prim to target), while the backpack's
+    2.64 kg silently moves into the torso's inertial. The hands are the canary because they
+    are leaves that the self-scan explicitly targets.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         model = mujoco.MjModel.from_xml_path(_urdf_as_mjcf_path(tmp))
     assert model.njnt == len(G1_JOINT_NAMES)
     names = {mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(model.nbody)}
-    assert len([n for n in names if "hand" in n]) == 16, "the hand links were fused away"
+    assert {"left_rubber_hand", "right_rubber_hand"} <= names, "the hands were fused away"
+    for bolted in ("camera_lower_mount_link", "camera_upper_mount_link",
+                   "backpack_shell_link", "backpack_thor_link", "backpack_zed_link"):
+        assert bolted in names, f"{bolted} was fused into its parent"
 
 
 ##
@@ -243,109 +237,75 @@ def test_joint_limits_agree(facts):
 
 
 ##
-# Mass. The distribution differs by design in one place; the total may not.
+# Mass. The two models are now the same file compiled twice; they must agree outright.
 ##
 
 
-def test_total_mass_agrees_once_the_known_divergences_are_removed(facts):
-    """Everything except the three density-derived bodies must add up."""
+def test_total_mass_agrees(facts):
+    """No exemption list. There used to be one worth 2.62 kg (7.2%)."""
     urdf_total = sum(facts["urdf_mass"].values())
-    mjcf_total = sum(facts["mjcf_mass"].values()) - sum(KNOWN_MJCF_ONLY_MASS_KG.values())
-    assert urdf_total == pytest.approx(mjcf_total, abs=5e-3), (
-        f"URDF {urdf_total:.4f} kg vs MJCF-minus-known {mjcf_total:.4f} kg"
+    mjcf_total = sum(facts["mjcf_mass"].values())
+    assert urdf_total == pytest.approx(mjcf_total, abs=1e-4), (
+        f"URDF {urdf_total:.6f} kg vs MJCF {mjcf_total:.6f} kg"
     )
 
 
-def test_the_mujoco_robot_is_still_exactly_2_62_kg_heavier(facts):
-    """KNOWN GAP, pinned with numbers so that closing it is deliberate.
-
-    MuJoCo's G1 weighs 38.79 kg; Isaac's weighs 36.17. The whole 2.62 kg is three bodies
-    with no ``<inertial>``, whose mass MuJoCo derives from mesh volume x 1000 kg/m^3:
-    both palms (documented in ``g1_29j.xml``) and ``head_link`` (not documented anywhere --
-    the URDF folded the head into ``torso_link`` when it merged fixed joints, so across the
-    two sims the head is counted twice).
-
-    7.2% of body mass is not a rounding error, and it sits on the torso and the hands --
-    exactly where an arm-swing or a payload change is felt. Fixing it changes every sim2sim
-    number measured so far, so it belongs in the robot-model pass, not in a test edit.
-    """
-    for name, expected in KNOWN_MJCF_ONLY_MASS_KG.items():
-        assert facts["mjcf_mass"][name] == pytest.approx(expected, abs=1e-4), name
-        assert facts["mjcf"][0].get(name) is None, (
-            f"{name} now has an explicit <inertial> -- good; drop it from "
-            "KNOWN_MJCF_ONLY_MASS_KG and re-check the totals"
-        )
-    delta = sum(facts["mjcf_mass"].values()) - sum(facts["urdf_mass"].values())
-    assert delta == pytest.approx(2.6219, abs=5e-3), (
-        f"the URDF/MJCF mass gap moved to {delta:+.4f} kg; if that was intended, update this "
-        "test and KNOWN_MJCF_ONLY_MASS_KG"
-    )
-
-
-def test_per_body_mass_agrees_outside_the_hand(facts):
-    """Everything the two models agree to model the same way, to 5 g."""
+def test_per_body_mass_agrees(facts):
+    """Every body, to a milligram -- the generator copies the inertial across verbatim."""
     for name, m in facts["urdf_mass"].items():
-        if name in _HAND_LUMPED:
-            continue
-        other = facts["mjcf_mass"].get(PALM_RENAMES.get(name, name))
-        if other is None:
-            continue
-        assert m == pytest.approx(other, abs=5e-3), f"{name}: URDF {m} vs MJCF {other}"
+        other = facts["mjcf_mass"][name]
+        assert m == pytest.approx(other, abs=1e-6), f"{name}: URDF {m} vs MJCF {other}"
 
 
-def test_the_hand_lumping_conserves_mass_apart_from_the_palm(facts):
-    """The URDF lumps the hand into the wrist; the MJCF distributes it along the fingers.
+def test_the_body_name_sets_are_IDENTICAL(facts):
+    """The trackable-frame ceiling used to be the INTERSECTION of two models. Now it is both.
 
-    Same total per side once the density-derived palm is set aside -- so Isaac carries the
-    hand's mass at the wrist and MuJoCo carries it out at the fingers. The mass agrees; the
-    arm's INERTIA does not. Small, real, and worth knowing before blaming a tracker.
+    The old divergence was three bodies: the two palms, which MuJoCo named ``*_palm_link``
+    while the URDF said ``*_hand_palm_link``, and ``head_link``, which existed only in the
+    MJCF because the URDF had folded the head into ``torso_link`` when it merged fixed
+    joints -- so the head's 1.80 kg was counted in the torso on one side and separately on
+    the other. Generating the MJCF from the URDF removes both by construction.
     """
-    for side in ("left", "right"):
-        urdf_side = sum(m for n, m in facts["urdf_mass"].items()
-                        if n in _HAND_LUMPED and n.startswith(side))
-        mjcf_side = sum(m for n, m in facts["mjcf_mass"].items()
-                        if n.startswith(side) and ("hand" in n or n.endswith("wrist_yaw_link")))
-        assert urdf_side == pytest.approx(mjcf_side, abs=1e-4), (
-            f"{side} wrist+fingers: URDF {urdf_side:.6f} kg vs MJCF {mjcf_side:.6f} kg"
-        )
-
-
-##
-# Known, deliberate divergences. Each is a tripwire: closing one must fail this file.
-##
-
-
-def test_the_body_name_divergence_is_exactly_the_palms_and_the_head(facts):
-    """The trackable-frame ceiling is the INTERSECTION of the two models' body names."""
     urdf_names, mjcf_names = set(facts["urdf_mass"]), set(facts["mjcf_mass"])
-    only_urdf = urdf_names - mjcf_names
-    only_mjcf = mjcf_names - urdf_names
-    assert only_urdf == set(PALM_RENAMES), f"new URDF-only body: {only_urdf}"
-    assert only_mjcf == set(PALM_RENAMES.values()) | {"head_link"}, (
-        f"new MJCF-only body: {only_mjcf - set(PALM_RENAMES.values()) - {'head_link'}}"
+    assert urdf_names == mjcf_names, (
+        f"only in the URDF: {sorted(urdf_names - mjcf_names)}; "
+        f"only in the MJCF: {sorted(mjcf_names - urdf_names)}"
     )
-    assert not ((set(PALM_RENAMES) | only_mjcf) & set(G1_BODY_TRACK_FRAMES)), (
-        "a body that exists in only one model must not be in the tracked set -- the clip "
-        "generator FKs it from the MJCF while the RL side resolves it through robot.body_names"
+    assert set(G1_BODY_TRACK_FRAMES) <= urdf_names, (
+        "a tracked frame is missing from the models: the clip generator FKs it from the "
+        "MJCF while the RL side resolves it through robot.body_names"
     )
 
 
-def test_the_mjcf_still_uses_one_blanket_armature():
-    """KNOWN GAP, pinned so that fixing it is deliberate.
+def test_no_body_derives_its_mass_from_mesh_volume(facts):
+    """A body with no ``<inertial>`` gets volume x 1000 kg/m^3 -- water, not aluminium.
 
-    Isaac gives each motor class its own reflected inertia (0.0036 - 0.0251 kg m^2, see
-    ``assets/robots/g1_21j.py``); the MJCF sets a single ``armature="0.01"`` on the ``g1``
-    default class and no per-joint override. That is up to a 2.5x mismatch on the joints
-    that matter most, and it is a sim2sim divergence nothing else reports.
+    Three did, worth 2.62 kg between them, and the number reached sim2sim unremarked. The
+    generator now carries an explicit inertial for every body, so an omission is a real
+    modelling gap rather than a silent default.
+    """
+    missing = [n for n in facts["mjcf_mass"] if facts["mjcf"][0].get(n) is None]
+    assert missing == [], f"no <inertial> on {missing}; MuJoCo will invent one from density"
 
-    When the MJCF learns per-joint armature, this test SHOULD fail -- update it then.
+
+##
+# Actuator dynamics -- the half MuJoCo needs and the URDF cannot express.
+##
+
+
+def test_the_mjcf_carries_per_joint_armature(facts):
+    """Isaac gives each motor class its own reflected inertia; the MJCF must match it.
+
+    It used to set a single ``armature="0.01"`` on the ``g1`` default class, against Isaac's
+    0.0036-0.0251 kg m^2 -- up to 2.5x on the joints that matter most, and a sim2sim
+    divergence nothing else reported.
     """
     root = ET.parse(F.DEFAULT_MJCF).getroot()
-    per_joint = [j.get("armature") for b in root.iter("body") for j in b.findall("joint")]
-    assert set(per_joint) == {None}, (
-        "the MJCF now sets armature per joint -- good; update this test and check the values "
-        "against assets/robots/g1_21j.py"
-    )
-    defaults = {d.get("class"): d.find("joint") for d in root.iter("default")}
-    g1 = defaults.get("g1")
-    assert g1 is not None and g1.get("armature") == "0.01"
+    seen = {j.get("name"): j.get("armature")
+            for b in root.iter("body") for j in b.findall("joint")}
+    for name in G1_JOINT_NAMES:
+        assert name in seen, f"{name} is not a hinge in the MJCF"
+        expected = next((v for k, v in JOINT_ARMATURE.items() if k in name), None)
+        assert expected is not None, f"the generator has no armature rule for {name}"
+        assert seen[name] is not None, f"{name} fell back to the blanket class armature"
+        assert float(seen[name]) == pytest.approx(expected, rel=1e-9), name
