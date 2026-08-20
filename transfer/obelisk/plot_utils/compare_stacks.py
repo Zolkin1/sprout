@@ -68,6 +68,24 @@ def _aligned_time(run) -> np.ndarray:
     return np.asarray(run.t) - run.t[int(np.argmax(armed))]
 
 
+def _common_span(runs) -> tuple[float, float]:
+    """The time range both runs actually cover, in arm-aligned seconds.
+
+    Overlaying a 6 s sim2sim run on a 50 s bag squeezes the interesting part into the first
+    eighth of the axis, so the figures trim to the intersection by default. It is the
+    INTERSECTION rather than the shorter run's own span because the two need not start at the
+    same offset from arm -- a bag begins several seconds BEFORE arming.
+
+    Args:
+        runs: The runs.
+
+    Returns:
+        ``(lo, hi)`` seconds from arm.
+    """
+    spans = [_aligned_time(r) for r in runs]
+    return float(max(t[0] for t in spans)), float(min(t[-1] for t in spans))
+
+
 def _load(bags: list[str], streams: list[str]) -> list:
     """Build the run objects, in the order they were given.
 
@@ -226,9 +244,15 @@ class CompareStepper:
         plt: The pyplot module (imported by the caller, after the backend is chosen).
     """
 
-    def __init__(self, runs: list, plt) -> None:
+    def __init__(self, runs: list, plt, trim: bool = True) -> None:
         self.runs = runs
         self.plt = plt
+        #: Trim the shared traces to the span both runs cover. The CURSOR was always confined
+        #: to the intersection, but the traces were drawn over each run's full extent -- so a
+        #: 14 s sim against a 33 s bag showed a cursor that stopped less than halfway across
+        #: the axis, which reads as the stepper being stuck rather than the runs being
+        #: different lengths.
+        self.trim = trim
         self.times = [_aligned_time(r) for r in runs]
         # The cursor is a TIME, not an index: the two runs need not have the same tick count
         # or the same start, and stepping by index would slide them apart.
@@ -335,6 +359,9 @@ class CompareStepper:
         self.ax_trace.set_ylabel("|pos err| [m]")
         self.ax_trace.legend(fontsize="xx-small")
         self.ax_trace.grid(alpha=0.3)
+        if self.trim:
+            for a in (*self.ax_err, self.ax_trace):
+                a.set_xlim(self.t_min, self.t_max)
         self.fig.suptitle(f"t = {self.t_now:+.3f} s from arm    "
                           "LEFT/RIGHT 1 tick, UP/DOWN 10, PAGEUP/PAGEDOWN 100, HOME/END ends",
                           fontsize="medium")
@@ -353,6 +380,11 @@ def main() -> int:
     ap.add_argument("--interactive", action="store_true",
                     help="Open the tick stepper instead of writing figures.")
     ap.add_argument("--save_dir", default=None, help="Where the PNGs go.")
+    ap.add_argument("--no_trim", action="store_true",
+                    help="Do NOT trim the figures OR the stepper to the time range both runs "
+                         "cover. The "
+                         "default trims, because a 6 s run overlaid on a 50 s one is squeezed "
+                         "into a corner of the axis.")
     ap.add_argument("--figures", default=None,
                     help=f"Comma-separated subset of {','.join(FIGURES)}.")
     args = ap.parse_args()
@@ -374,11 +406,16 @@ def main() -> int:
                      "window would open with dead arrow keys. Install a GUI backend "
                      "(`pip install PyQt5`) or set MPLBACKEND=TkAgg, and make sure DISPLAY is "
                      "set if you are over ssh.")
-        stepper = CompareStepper(runs, plt)     # keep the reference; see CompareStepper
+        stepper = CompareStepper(runs, plt, trim=not args.no_trim)   # keep the reference
         print(f"[compare] stepper on '{backend}': LEFT/RIGHT 1 tick, UP/DOWN 10, "
               "PAGEUP/PAGEDOWN 100, HOME/END ends")
         plt.show()
         return 0 if stepper else 0
+
+    span = _common_span(runs)
+    if not args.no_trim:
+        print(f"[compare] trimming the figures to the shared span "
+              f"{span[0]:+.2f}..{span[1]:+.2f} s from arm (--no_trim to keep both in full)")
 
     wanted = args.figures.split(",") if args.figures else list(FIGURES)
     save_dir = args.save_dir or os.path.join(os.getcwd(), "compare_plots")
@@ -389,6 +426,8 @@ def main() -> int:
         fig, axes = FIGURES[name](runs, plt)
         for a in np.atleast_1d(axes).ravel():
             a.grid(alpha=0.3)
+            if not args.no_trim:
+                a.set_xlim(*span)
             if a.get_legend_handles_labels()[0]:
                 a.legend(fontsize="x-small", ncol=2)
         fig.tight_layout()
