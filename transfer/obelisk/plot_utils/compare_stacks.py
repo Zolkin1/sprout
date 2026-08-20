@@ -307,12 +307,68 @@ class CompareStepper:
         # is usually z or downrange specifically.
         self.ax_err = [self.fig.add_subplot(gs[n, j]) for j in range(3)]
         self.ax_trace = self.fig.add_subplot(gs[n, 3])
+        # Fixed scales for the PATH and JOINTS panels, computed once and shared by both runs.
+        # Those two are cleared and redrawn per tick, so an autoscaled axis rescales on every
+        # keypress: the reference path appears to swing wildly when it is the AXIS moving, and
+        # two rows drawn to different limits cannot be compared down a column at all. Shared,
+        # so "the same length on screen" is the same length in metres in both stacks.
+        #
+        # The DEPTH images are left autoscaled per frame on purpose -- see the imshow call.
+        self._path_lim = self._path_limits()
+        self._joint_lim = self._joint_limits()
         self._cid = self.fig.canvas.mpl_connect("key_press_event", self._on_key)
         # Held so the connection is not garbage-collected -- the window would appear fully
         # drawn with dead arrow keys, which looks like a frozen plot rather than a lost
         # callback. Same reason plot_from_bag's Stepper keeps its own.
         self._keep_alive = self._cid
         self._draw()
+
+    def _in_span(self, run, t) -> np.ndarray:
+        """Boolean mask of the ticks inside the shared span (or all of them, untrimmed)."""
+        if not self.trim:
+            return np.ones(len(t), dtype=bool)
+        return (t >= self.t_min) & (t <= self.t_max)
+
+    def _path_limits(self) -> tuple[float, float, float, float]:
+        """SQUARE, shared limits for the reference-path panels.
+
+        Square and equal-aspect because this is a path in the ground plane: an axis-dependent
+        aspect makes a straight walk look like a curve, which is exactly the kind of thing
+        someone reads a path plot to check.
+
+        Returns:
+            ``(x0, x1, y0, y1)``.
+        """
+        xs, ys = [], []
+        for run, t in zip(self.runs, self.times):
+            if run.ref_pos_err is None:
+                continue
+            m = self._in_span(run, t)
+            xs.append(run.ref_pos_err[m, :, 0].ravel())
+            ys.append(run.ref_pos_err[m, :, 1].ravel())
+        if not xs:
+            return (-1.0, 1.0, -1.0, 1.0)
+        x, y = np.concatenate(xs), np.concatenate(ys)
+        cx, cy = float(np.nanmean(x)), float(np.nanmean(y))
+        half = max(float(np.nanmax(np.abs(x - cx))), float(np.nanmax(np.abs(y - cy))), 0.05)
+        half *= 1.1
+        return cx - half, cx + half, cy - half, cy + half
+
+    def _joint_limits(self) -> tuple[float, float]:
+        """Shared y-limits for the joints panel, over reference AND measured."""
+        vals = []
+        for run, t in zip(self.runs, self.times):
+            m = self._in_span(run, t)
+            if run.ref_joint is not None:
+                vals.append(run.ref_joint[m, 0, :].ravel())
+            if run.joint_pos_isaac is not None:
+                vals.append(np.asarray(run.joint_pos_isaac)[m].ravel())
+        if not vals:
+            return (-1.0, 1.0)
+        v = np.concatenate(vals)
+        lo, hi = float(np.nanmin(v)), float(np.nanmax(v))
+        pad = max(0.05 * (hi - lo), 1e-3)
+        return lo - pad, hi + pad
 
     def _on_key(self, event) -> None:
         """Move the cursor."""
@@ -342,6 +398,10 @@ class CompareStepper:
                     a.text(0.5, 0.5, f"no {name} depth", ha="center", va="center",
                            transform=a.transAxes, fontsize="small")
                 else:
+                    # Autoscaled per frame, deliberately: a fixed colour range washes out
+                    # the near field once anything far is in view, and reading the geometry in
+                    # front of the robot matters more here than comparing absolute distances
+                    # between frames -- the numbers for that are in the traces below.
                     a.imshow(img, aspect="auto")
                 a.set_title(f"{run.label} {name}", fontsize="small")
                 a.set_xticks([]); a.set_yticks([])
@@ -353,6 +413,9 @@ class CompareStepper:
                 a.plot(p[:, 0], p[:, 1], "o-", ms=3, lw=1.0, color=STYLES[row]["color"])
                 a.plot(0, 0, "k+", ms=8)
                 a.set_xlabel("x [m]", fontsize="small"); a.set_ylabel("y [m]", fontsize="small")
+            x0, x1, y0, y1 = self._path_lim
+            a.set_xlim(x0, x1); a.set_ylim(y0, y1)
+            a.set_aspect("equal", adjustable="box")
             a.set_title("reference path (offsets)", fontsize="small")
             a.grid(alpha=0.3)
             # Joints now: reference against measured, by index.
@@ -362,6 +425,7 @@ class CompareStepper:
                 a.plot(idx, run.ref_joint[i, 0, :], "o", ms=3, label="reference")
                 a.plot(idx, run.joint_pos_isaac[i], "x", ms=4, label="measured")
                 a.legend(fontsize="xx-small")
+            a.set_ylim(*self._joint_lim)
             a.set_title(f"joints @ t={t[i]:+.2f}s (tick {i})", fontsize="small")
             a.grid(alpha=0.3)
 
