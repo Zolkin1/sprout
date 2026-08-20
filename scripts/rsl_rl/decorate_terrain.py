@@ -44,6 +44,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source",
 
 from motion_gen.terrain.decorate import (ARMS, BOX_VARIANTS,  # noqa: E402
                                          DecorateConfig, add_walls,
+                                         class_footprints,
                                          decorate_box_tile,
                                          decorate_transition_tile,
                                          has_width_variation, span)
@@ -197,6 +198,14 @@ def main() -> None:
                   "tiles widened")
 
         n_wall_boxes, n_wall_tiles, wall_sides = 0, 0, {}
+        # Walls ring the RENDERED floor, which is the class footprint and not the tile's own
+        # size -- they differ by metres on transition and box tiles.
+        fps = class_footprints(manifest)
+        for kind, fp_xy in sorted(fps.items()):
+            biggest = max((float(m["size_x"]), float(m["size_y"])) for m in manifest
+                          if m.get("type") == kind)
+            print(f"[decor] {kind:11s} floor {fp_xy[0]:7.3f} x {fp_xy[1]:7.3f} m "
+                  f"(largest tile {biggest[0]:7.3f} x {biggest[1]:7.3f})")
         if not args.no_walls:
             for tile in manifest:
                 if tile.get("type") not in ("transition", "box", "terrain"):
@@ -205,7 +214,8 @@ def main() -> None:
                 fp = prints.get(tid)
                 if fp is None:
                     continue
-                n_sides, n_boxes = add_walls(tile, fp, cfg)
+                n_sides, n_boxes = add_walls(tile, fp, cfg,
+                                             fps.get(str(tile.get("type"))))
                 n_wall_boxes += n_boxes
                 n_wall_tiles += n_sides > 0
                 wall_sides[int(tile["terrain_id"])] = n_sides
@@ -264,6 +274,7 @@ def main() -> None:
             "box_variants": box_variants,
             "wall_boxes": n_wall_boxes,
             "wall_sides": wall_sides,
+            "wall_footprints": {k: list(v) for k, v in fps.items()},
         })
     print(f"[decor] wrote {args.out}")
 

@@ -257,6 +257,57 @@ def _resize_y(overlay: dict, lo: float, hi: float, *, must_contain: tuple[float,
     overlay["pos_xy"] = [float(overlay["pos_xy"][0]), float((lo + hi) / 2.0)]
 
 
+#: Loader defaults the class footprint is built from. Mirrored here, and CHECKED against
+#: the real loader by ``source/robot_rl/tests/test_wall_footprint.py`` -- see
+#: :func:`class_footprints` for why this duplication exists and what makes it safe.
+DEFAULT_SIZE_MARGIN = 1.0
+DEFAULT_TRANSITION_BACK_BUFFER = 1.0
+
+
+def class_footprints(manifest: list[dict], size_margin: float = DEFAULT_SIZE_MARGIN,
+                     transition_back_buffer: float = DEFAULT_TRANSITION_BACK_BUFFER,
+                     ) -> dict[str, tuple[float, float]]:
+    """The floor each tile CLASS is actually rendered at, by type.
+
+    A tile's ``size_x`` / ``size_y`` is not the ground the robot sees. The loader pads every
+    tile of a class to one common footprint -- ``max(size_x) + margin`` over the whole class
+    -- so IsaacLab can lay them out on a uniform grid. Measured on the shipped library, that
+    is about 1 m of slack for terrain tiles but 4.9 to 7.1 m in y for transition and box
+    tiles: a 3.6 m-wide box tile is rendered on a 10.7 m floor.
+
+    So anything meant to sit at the EDGE of what you can see has to use this, not the
+    manifest size. Walls placed at ``size_y`` end up metres inside the floor, which is
+    exactly how they first shipped.
+
+    The geometry stays corner-anchored at ``(0, 0)`` and the slack is all on the high side,
+    so the low edges coincide and only the high ones move.
+
+    This duplicates ``clip_terrain_loader._class_fp`` because the decoration pass resolves
+    positions offline and IsaacLab is not importable from ``motion_gen``. What makes that
+    safe is not care -- it is ``test_wall_footprint.py``, which builds the real layout and
+    fails if the two ever disagree.
+
+    Args:
+        manifest: The tile list.
+        size_margin: Extra flat added to every class footprint (m).
+        transition_back_buffer: Extra x on transition tiles, behind the spawn (m).
+
+    Returns:
+        Tile type -> ``(footprint_x, footprint_y)``. Types with no tiles are omitted.
+    """
+    out: dict[str, tuple[float, float]] = {}
+    for kind in {str(m.get("type")) for m in manifest}:
+        tiles = [m for m in manifest if m.get("type") == kind]
+        if not tiles:
+            continue
+        fx = max(float(m["size_x"]) for m in tiles) + size_margin
+        fy = max(float(m["size_y"]) for m in tiles) + size_margin
+        if kind == "transition":
+            fx += transition_back_buffer
+        out[kind] = (fx, fy)
+    return out
+
+
 def _wall_segments(axis: str, lo_y: float, hi_y: float, x0: float, x1: float,
                    height: float, base_z: float,
                    window: tuple[float, float, float, float] | None) -> list[dict]:
@@ -316,8 +367,8 @@ def _wall_segments(axis: str, lo_y: float, hi_y: float, x0: float, x1: float,
     return [b for b in pieces if b]
 
 
-def add_walls(tile: dict, footprint: TileFootprint,
-              cfg: DecorateConfig) -> tuple[int, int]:
+def add_walls(tile: dict, footprint: TileFootprint, cfg: DecorateConfig,
+              tile_fp: tuple[float, float] | None = None) -> tuple[int, int]:
     """Wall a tile's EDGES, up to all four, so it reads as a room.
 
     Returns ``(sides, boxes)``. The two differ: a wall with a window is up to FOUR boxes, so
@@ -334,9 +385,11 @@ def add_walls(tile: dict, footprint: TileFootprint,
     own ``[0, size_x] x [0, size_y]``, and the envelope is now only used to decide WHETHER a
     side can take a wall -- never where it goes.
 
-    Staying inside the tile matters for a non-obvious reason: IsaacLab's tile floor spans the
-    CLASS footprint while MuJoCo's spans the tile's own extents, so geometry past the edge
-    would sit over ground in one sim and over void in the other.
+    **The edge is the FLOOR's, not the manifest tile's.** Those differ by 4.9 to 7.1 m in y
+    on transition and box tiles, because the loader pads every tile of a class to one common
+    footprint (:func:`class_footprints`). Using ``size_y`` puts the wall metres inside the
+    visible ground -- which is how this first shipped, and reads as a slab standing in a
+    field rather than a room.
 
     A side is skipped when the motion reaches it. That is what stops a wall appearing across
     the mouth of a corridor: a transition tile is traversed along +x, so its x-extremes are
@@ -346,6 +399,8 @@ def add_walls(tile: dict, footprint: TileFootprint,
         tile: A manifest entry; walls are appended to its overlays.
         footprint: The tile's foot envelope, used only as a veto.
         cfg: Knobs.
+        tile_fp: The floor this tile is rendered at, from :func:`class_footprints`. Falls
+            back to the manifest size, which is only correct when the two coincide.
 
     Returns:
         ``(number of walled sides, number of overlay boxes)``.
@@ -353,7 +408,10 @@ def add_walls(tile: dict, footprint: TileFootprint,
     # Its own stream, like the box variants: a tile's walls must not be correlated with
     # which width arm it drew.
     rng = tile_rng(cfg.seed ^ 0x2A11, int(tile["terrain_id"]))
-    size_x, size_y = float(tile["size_x"]), float(tile["size_y"])
+    if tile_fp is None:
+        size_x, size_y = float(tile["size_x"]), float(tile["size_y"])
+    else:
+        size_x, size_y = float(tile_fp[0]), float(tile_fp[1])
     clear = cfg.wall_clearance_m
 
     # (axis, at the low edge?) -- y walls run along x, x walls run along y.
