@@ -27,6 +27,7 @@ tracker observation from the FM prediction + measured proprioception;
 from __future__ import annotations
 
 import time
+from collections import deque
 
 import numpy as np
 
@@ -127,6 +128,12 @@ class _TrackerOnlyCtx:
 class GenTrackerPolicy:
     """Drive the RL tracker with the online flow-matching generator (numpy + ORT)."""
 
+    #: Generator lead, in control ticks. At CLASS level so an instance built without running
+    #: __init__ -- which the test fakes do deliberately, to exercise the real serving path
+    #: around a stubbed network -- is synchronous rather than AttributeError. Instances that
+    #: opt in set it in __init__; see the ctor docstring for what it emulates.
+    fm_lead_ticks: int = 0
+
     def __init__(
         self,
         tracker_onnx: str,
@@ -138,6 +145,7 @@ class GenTrackerPolicy:
         zero_noise: bool = False,
         providers=None,
         allow_privileged_extero: bool = False,
+        fm_lead_ticks: int = 0,
     ):
         """Configure the generator + tracker pair from the ONNX artifacts.
 
@@ -172,6 +180,14 @@ class GenTrackerPolicy:
         contract -- MuJoCo casts the same grid against the same terrain -- and only the
         MuJoCo runner opts in, via ``--allow_privileged_extero``. The flag buys a sim2sim
         A/B of an Isaac-only diagnostic, never a deployment.
+
+        ``fm_lead_ticks`` reproduces the C++ runtime's generator LEAD in this synchronous one.
+        The async runtime asks for each plan `lead` ticks before the boundary it is for and
+        conditions it on the exteroception and velocity command AS THEY WERE THEN, while this
+        runtime samples both at the boundary. At the shipped ``fm_lead_sec=0.05`` and
+        dt=0.02 that is a 3-tick / 60 ms stale camera -- ~4.5 cm of egomotion at 0.75 m/s,
+        which on a stair edge is a different problem, not a rounding difference. Default 0
+        (unchanged behaviour); set it to compare the two stacks on equal terms.
         """
         self.tracker_onnx = tracker_onnx
         self.fm_onnx = fm_onnx
@@ -181,6 +197,20 @@ class GenTrackerPolicy:
         self.zero_noise = bool(zero_noise)
         self.providers = providers
         self.allow_privileged_extero = bool(allow_privileged_extero)
+        #: Emulate the C++ runtime's generator LEAD: it requests each plan `lead` ticks
+        #: before the boundary it is for, and conditions it on the exteroception and the
+        #: velocity command as they were AT REQUEST TIME (plan_scheduler.h). Its history is
+        #: NOT stale -- GenTrackerCore::BuildRequest projects the rows it will serve over the
+        #: lead window from the live plan, exactly -- so only these two inputs need delaying
+        #: to reproduce the difference.
+        #:
+        #: 0 (the default) is the synchronous behaviour: everything sampled at the boundary.
+        #: This exists to answer whether the lead ALONE accounts for the async stack tracking
+        #: worse than this one, without touching either runtime's real semantics.
+        self.fm_lead_ticks = max(int(fm_lead_ticks), 0)
+        #: The last `fm_lead_ticks + 1` ticks' generator inputs, oldest first, so entry 0 is
+        #: exactly `fm_lead_ticks` ticks old once full.
+        self._lead_buf: deque = deque(maxlen=self.fm_lead_ticks + 1)
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
         # Set here rather than in _reset_timing, which drains the WINDOW: these are the last
@@ -252,6 +282,7 @@ class GenTrackerPolicy:
         self._build_window()
         self._check_horizon()
         self._history = BatchedHistory(1, self.ctx.N)
+        self._lead_buf = deque(maxlen=self.fm_lead_ticks + 1)
         # ONE buffer: the F predicted reference-window nodes, which ARE the observation.
         self._pred = np.zeros((1, self.ctx.F, self.ctx.D))
         self._pred_valid = False
@@ -847,6 +878,8 @@ class GenTrackerPolicy:
         exact thereafter -- Isaac behaves the same way, so this is deliberate.
         """
         self._ctrl_step += 1
+        if self.fm_lead_ticks:
+            self._lead_buf.append(self._lead_sample(state))
         self._history.append(self._make_snapshot(state))
         if self._prev_served_node is None:
             # Nothing has been served yet, so that row is the zero placeholder, not a node
@@ -886,6 +919,55 @@ class GenTrackerPolicy:
             # still what feeds the POLICY.
             self._prev_served_node = self._pred[0, int(self._pred_idx)].copy()
 
+    def _lead_sample(self, state: dict) -> dict:
+        """COPIES of the generator inputs the C++ runtime samples early, for one tick.
+
+        Copied, not referenced: the runner rebuilds the state dict every step but the arrays
+        inside it can be reused buffers, and aliasing one would make the "stale" reading
+        silently identical to the current one -- an emulation that reports no difference
+        because it is not actually delaying anything.
+
+        Only the keys the generator's exteroception and held command are built from. The
+        tracker's own observation is NOT delayed: on the real robot it reads its sensors every
+        tick, and only the generator's request is early.
+
+        Args:
+            state: This tick's state dict.
+
+        Returns:
+            The subset, deep-copied.
+        """
+        keys = ("depth", "fm_depth", "height_scan", "command")
+        out = {k: np.array(state[k], dtype=np.float64, copy=True) for k in keys if k in state}
+        poses = state.get("fm_camera_pose")
+        if poses is not None:
+            out["fm_camera_pose"] = [(np.array(p, dtype=np.float64, copy=True),
+                                      np.array(r, dtype=np.float64, copy=True))
+                                     for p, r in poses]
+        return out
+
+    def _fm_conditioning_state(self, state: dict) -> tuple[dict, np.ndarray | None]:
+        """The state the generator should be conditioned on, and the command to hold.
+
+        With ``fm_lead_ticks == 0`` this is just ``state`` -- the synchronous behaviour. With a
+        lead it is the state from that many ticks ago, which is what the async runtime's early
+        request actually sees.
+
+        Returns ``(None, None)``-free: the command is None when nothing should override the
+        held one (either no lead, or the buffer has not filled yet, which is the same
+        situation the real runtime is in before it has a plan to project from).
+
+        Args:
+            state: This tick's state dict.
+
+        Returns:
+            ``(state_for_exteroception, held_command_or_None)``.
+        """
+        if not self.fm_lead_ticks or len(self._lead_buf) < self._lead_buf.maxlen:
+            return state, None
+        stale = self._lead_buf[0]
+        return stale, stale.get("command")
+
     def _run_fm(self, state: dict, history_null: bool = False) -> None:
         """Sample the F-node reference window for this control step.
 
@@ -904,10 +986,13 @@ class GenTrackerPolicy:
         # on -- the runner puts both readings in the state. Depth is one token per camera
         # (already normalised, matching mdp.depth_obs_stack); the height scan is one token
         # of per-ray clearance. Matches how each is recorded and used in the RL obs.
+        # `cond` is `state` unless a lead is being emulated, in which case it is the state
+        # from `fm_lead_ticks` ticks ago -- see _fm_conditioning_state.
+        cond, lead_cmd = self._fm_conditioning_state(state)
         if ctx.extero_source == "depth":
-            extero = build_extero_tokens(ctx, self._fm_extero_row(state)[None])
+            extero = build_extero_tokens(ctx, self._fm_extero_row(cond)[None])
         else:
-            extero = build_extero_tokens(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
+            extero = build_extero_tokens(ctx, np.asarray(cond["height_scan"], dtype=np.float64)[None])
         if self._future_cmd_override is not None:
             # Actual future-command horizon (clip->FM handoff) -- matches IsaacLab's
             # get_command_velocity_horizon. Without it the deploy holds the current
@@ -915,7 +1000,11 @@ class GenTrackerPolicy:
             # IsaacLab during command ramps.
             fut_cmd = np.asarray(self._future_cmd_override, dtype=np.float64).reshape(1, ctx.F, ctx.cmd_dim)
         else:
-            fut_cmd = np.broadcast_to(cmd[:, -1:], (1, ctx.F, ctx.cmd_dim)).copy()  # held command
+            # Held command. Under an emulated lead the command held is the one from REQUEST
+            # time, matching BuildRequest's "the future command is not knowable; hold the one
+            # at request time".
+            held = cmd[:, -1:] if lead_cmd is None else lead_cmd.reshape(1, 1, ctx.cmd_dim)
+            fut_cmd = np.broadcast_to(held, (1, ctx.F, ctx.cmd_dim)).copy()
         cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
         noise = self._sample_noise()
 
@@ -1431,6 +1520,7 @@ class GenTrackerPolicy:
             self._obs_history = {}
             self._pred_valid = False
             self._ctrl_step = -1
+            self._lead_buf = deque(maxlen=self.fm_lead_ticks + 1)
             self._future_cmd_override = None
             # Receding-horizon state. The stash in particular describes a pose from before
             # the reset, so keeping it would push a row from another episode into the

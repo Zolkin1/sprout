@@ -1152,7 +1152,19 @@ def main() -> None:
                              "The FM takes control immediately.")
     parser.add_argument("--rt_factor", type=float, default=1.0,
                         help="Viewer playback speed vs real time (1.0=real, 0.5=half; <=0 disables pacing).")
-    parser.add_argument("--headless", action="store_true", default=False)
+    parser.add_argument("--headless", action="store_true", default=False,
+                        help="No viewer window. NOT just a display choice: a headed run is a "
+                             "DIFFERENT TRAJECTORY from a headless one, measured. Two headless "
+                             "runs of the same command are bit-identical (max |dx| = 0), and so "
+                             "are runs differing in --rt_factor or in the depth hit-point "
+                             "gather -- but opening the viewer changes the outcome, "
+                             "deterministically and reproducibly (tile20 at constant 0.8: "
+                             "survives 16 s headless, falls at 6.04 s headed, the same 6.04 s "
+                             "every time). viewer.sync() is the only viewer-exclusive call in "
+                             "the loop; it perturbs mjData enough to redirect a contact-rich "
+                             "walk. NEVER COMPARE ACROSS MODES -- pick one for an A/B. Watching "
+                             "is still reproducible, just a different trajectory than the "
+                             "numbers a headless sweep produces.")
     parser.add_argument("--use_ic", action="store_true", default=False)
     parser.add_argument("--standing_config", type=str, default=None,
                         help="Standing config_solution.yaml to spawn + hold during warmup "
@@ -1220,6 +1232,14 @@ def main() -> None:
                              "fail a robot that merely turned around. This is what catches a "
                              "collapse on an UPPER terrain level, which stays far above the "
                              "scene-minimum height bound.")
+    parser.add_argument("--fm_lead_ticks", type=int, default=0,
+                        help="Emulate the C++ runtime's generator LEAD: condition the "
+                             "generator on the exteroception and velocity command from this "
+                             "many ticks ago, which is what the async stack's early request "
+                             "actually sees (its history is NOT stale -- it projects the rows "
+                             "it will serve, exactly). 0 = this runner's synchronous "
+                             "behaviour. The C++ default fm_lead_sec=0.05 at dt=0.02 is 3 "
+                             "ticks, so --fm_lead_ticks 3 is the matched comparison.")
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Where --log writes sim_log.csv + metrics (default: "
@@ -1310,8 +1330,14 @@ def main() -> None:
         zero_noise=args.zero_noise,
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
         allow_privileged_extero=args.allow_privileged_extero,
+        fm_lead_ticks=args.fm_lead_ticks,
     )
     policy.load()
+    if args.fm_lead_ticks:
+        print(f"[INFO] emulating the async runtime's generator lead: the generator sees the "
+              f"exteroception and command from {args.fm_lead_ticks} tick(s) ago "
+              f"({args.fm_lead_ticks * policy.get_dt() * 1e3:.0f} ms). The tracker's own "
+              f"observation is NOT delayed.")
     # What each graph REGISTERED, not what was asked for. onnxruntime reports a failed CUDA
     # session as a warning and carries on running on the CPU, so with the GPU now the
     # default this line is the only thing standing between "the generator is on the GPU" and
@@ -1448,6 +1474,31 @@ def main() -> None:
         print(f"[INFO] Run finished. Survived: {success}")
 
     if log_path:
+        # Stamp the loop's OWN verdict into sim_meta.yaml before the metrics run.
+        #
+        # The `fell` CSV column structurally cannot carry it: the row is written inside
+        # control_step() with robot.failed() evaluated BEFORE that step's physics, and when the
+        # fall is detected the loop returns immediately without writing another row. So the
+        # column stays 0 for a run that fell, and gen_tracker_metrics -- which inferred
+        # survival from that column -- reported `"survived": true, "time_to_fall_s": null`
+        # while the console printed `Survived: False`. A sweep reads the JSON, not the console,
+        # so falls were being counted as successes.
+        meta_path = os.path.join(os.path.dirname(log_path), "sim_meta.yaml")
+        try:
+            with open(meta_path) as mf:
+                meta = yaml.safe_load(mf) or {}
+            meta["survived"] = success
+            # Detection time, which is the last simulated instant either way. `None` when the
+            # user interrupted: that is neither survival nor a fall.
+            meta["time_to_fall_s"] = (None if success is not False
+                                      else float(robot.mj_data.time))
+            meta["sim_end_time_s"] = float(robot.mj_data.time)
+            with open(meta_path, "w") as mf:
+                yaml.dump(meta, mf, default_flow_style=False, sort_keys=False)
+        except FileNotFoundError:
+            print(f"[WARN] no sim_meta.yaml at {meta_path}; the metrics will infer survival "
+                  "from the `fell` column, which cannot see a fall on the final step.")
+
         import gen_tracker_metrics
         gen_tracker_metrics.create_metrics(os.path.dirname(log_path))
 

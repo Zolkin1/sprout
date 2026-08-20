@@ -148,9 +148,18 @@ def _plot_reference_tracking_legacy(cols, out_dir, meta) -> dict:
 def _plot_survival(cols, out_dir, meta) -> dict:
     """Base height + fall flag over time; returns survival summary."""
     t = cols["time"]
+    # The RUNNER'S verdict wins when it is present. The `fell` column cannot be trusted for
+    # this: it is written before each step's physics and the loop exits on the fall without
+    # writing a further row, so a run that fell logs a column of zeros. Inferring from it
+    # reported survival for runs the loop had already scored as falls.
+    survived_meta = meta.get("survived") if isinstance(meta, dict) else None
     fell = cols["fell"] > 0.5
     fell_idx = np.argmax(fell) if fell.any() else -1
     time_to_fall = float(t[fell_idx]) if fell_idx >= 0 else None
+    if survived_meta is False and time_to_fall is None:
+        time_to_fall = meta.get("time_to_fall_s")
+        if time_to_fall is not None:
+            time_to_fall = float(time_to_fall)
     fig, ax = plt.subplots(figsize=(9, 3.5))
     ax.plot(t, cols["base_z"], lw=1.5, label="base height")
     if time_to_fall is not None:
@@ -161,8 +170,12 @@ def _plot_survival(cols, out_dir, meta) -> dict:
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "survival.png"), dpi=120)
     plt.close(fig)
-    return {"survived": time_to_fall is None, "time_to_fall_s": time_to_fall,
-            "final_time_s": float(t[-1])}
+    # survived_meta is the loop's own answer and is authoritative when present; the
+    # time-derived form is the fallback for a run recorded before the verdict was stamped.
+    survived = (time_to_fall is None) if survived_meta is None else bool(survived_meta)
+    return {"survived": survived, "time_to_fall_s": time_to_fall,
+            "final_time_s": float(t[-1]),
+            "verdict_source": "runner" if survived_meta is not None else "fell_column"}
 
 
 def _plot_torques(cols, meta, out_dir) -> dict:
