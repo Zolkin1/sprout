@@ -103,7 +103,14 @@ OUTPUT_FIELDS = (
     # command. Pure arithmetic on both sides -- the encoder lives inside the graph -- so these
     # should be EXACT, and with history_null on they plus the noise are the whole input.
     "fm_extero",
-    "fm_future_cmd"
+    "fm_future_cmd",
+    # The history the generator was conditioned on: N nodes it previously SERVED, and the
+    # commands beside them. These are the runtime's own past output, so they diverge as soon
+    # as the two runtimes' plans do -- which is exactly why they are here. With the extero row
+    # and history_null agreeing, the first tick where the HISTORY disagrees separates "the
+    # conditioning differs" from "the inference differs", and there is nothing else left.
+    "fm_history_nodes",
+    "fm_history_cmd"
 )
 
 

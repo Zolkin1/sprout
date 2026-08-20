@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
     // What the generator was CONDITIONED on, per tick. Pure arithmetic on both sides, so a
     // difference here is a bug rather than a tolerance question -- and with history_null on,
     // the first plan is a function of nothing else.
-    std::vector<std::vector<double>> extero_rows, futcmd_rows;
+    std::vector<std::vector<double>> extero_rows, futcmd_rows, histn_rows, histc_rows;
     std::vector<double> targets(nj, 0.0);
 
     for (int t = 0; t < ticks; ++t) {
@@ -200,6 +200,10 @@ int main(int argc, char** argv) {
       const auto& cond = policy.last_conditioning();
       extero_rows.push_back(cond.extero);
       futcmd_rows.push_back(cond.future_cmd);
+      // The history the LIVE plan was requested with -- this runtime's own served nodes.
+      const auto& req = policy.last_plan_request();
+      histn_rows.push_back(req.history_nodes);
+      histc_rows.push_back(req.history_cmd);
       meta_rows.push_back({static_cast<double>(diag.ctrl_step),
                            diag.plan_adopted ? 1.0 : 0.0,
                            static_cast<double>(diag.plan_id),
@@ -230,6 +234,14 @@ int main(int argc, char** argv) {
     }
     if (!futcmd_rows.front().empty()) {
       WriteBlob(out_dir + "/cpp.fm_future_cmd.bin", futcmd_rows, futcmd_rows.front().size());
+    }
+    // Widths can be zero on the very first ticks, before a request has been built; the
+    // comparator skips a field the C++ did not write rather than comparing against nothing.
+    if (!histn_rows.back().empty()) {
+      WriteBlob(out_dir + "/cpp.fm_history_nodes.bin", histn_rows, histn_rows.back().size());
+    }
+    if (!histc_rows.back().empty()) {
+      WriteBlob(out_dir + "/cpp.fm_history_cmd.bin", histc_rows, histc_rows.back().size());
     }
     std::printf("[replay] wrote %zu ticks of obs/action/window/checksum/meta to %s\n",
                 obs_rows.size(), out_dir.c_str());

@@ -359,7 +359,12 @@ def _record_replay_tick(writer, policy, state: dict, obs: np.ndarray,
             "fm_extero": (np.zeros(0) if plan is None
                           else np.asarray(plan["extero_tokens"], dtype=np.float64).ravel()),
             "fm_future_cmd": (np.zeros(0) if plan is None
-                              else np.asarray(plan["cmd_tokens"], dtype=np.float64).ravel()),
+                              else np.asarray(plan["future_cmd"], dtype=np.float64).ravel()),
+            "fm_history_nodes": (np.zeros(0) if plan is None
+                                 else np.asarray(plan["history_nodes"],
+                                                 dtype=np.float64).ravel()),
+            "fm_history_cmd": (np.zeros(0) if plan is None
+                               else np.asarray(plan["history_cmd"], dtype=np.float64).ravel()),
         },
     )
 

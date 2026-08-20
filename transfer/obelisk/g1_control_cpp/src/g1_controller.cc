@@ -100,6 +100,18 @@ void G1Controller::DeclareParams() {
   // the robot's models are on their way to being consolidated; when that lands this moves a
   // config line instead of a recompile. Relative paths resolve against the workspace root.
   this->declare_parameter<std::string>("urdf_path", "g1_model/urdf/g1_29j.urdf");
+  // Integrate the generator's flow from x0 = 0 instead of x0 ~ N(0, I).
+  //
+  // TRUE for now, deliberately, and it is a debugging stance rather than the final one. The FM
+  // is a stochastic sampler: zero noise gives ONE deterministic trajectory per conditioning,
+  // which is not what it was trained as. What it buys is that this stack and the MuJoCo
+  // sim2sim runner (whose own default is already zero noise) draw the same plan from the same
+  // conditioning -- and they otherwise cannot, because the C++ NoiseSource is deliberately not
+  // a bit-port of numpy's PCG64+ziggurat, so the same seed yields DIFFERENT samples on the two
+  // sides. Comparing the two stacks while each samples its own x0 measures the draw.
+  //
+  // Set false to restore training-matched sampling.
+  this->declare_parameter<bool>("zero_noise", true);
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
@@ -119,6 +131,7 @@ G1Controller::on_configure(const rclcpp_lifecycle::State& prev) {
   threaded_fm_ = this->get_parameter("threaded_fm").as_bool();
   fm_late_disarm_ticks_ = static_cast<int>(this->get_parameter("fm_late_disarm_ticks").as_int());
   urdf_path_ = this->get_parameter("urdf_path").as_string();
+  zero_noise_ = this->get_parameter("zero_noise").as_bool();
 
   LoadPolicy();
   SetupDepth();
@@ -217,9 +230,12 @@ void G1Controller::LoadPolicy() {
   cfg.intra_threads = onnx_threads_;
   cfg.fm_lead_sec = fm_lead_sec_;
   cfg.threaded_fm = threaded_fm_;
+  cfg.zero_noise = zero_noise_;
 
-  RCLCPP_INFO(this->get_logger(), "loading the policy pair from %s (cuda=%d, threads=%d)",
-              base.c_str(), static_cast<int>(use_cuda_), onnx_threads_);
+  RCLCPP_INFO(this->get_logger(),
+              "loading the policy pair from %s (cuda=%d, threads=%d, zero_noise=%d)",
+              base.c_str(), static_cast<int>(use_cuda_), onnx_threads_,
+              static_cast<int>(zero_noise_));
   policy_ = std::make_unique<g1_deploy::PolicyRuntime>(cfg);
   policy_->Load();   // throws on a CPU fallback when cuda was asked for; see RequireCuda
 

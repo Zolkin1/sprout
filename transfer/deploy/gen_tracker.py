@@ -1037,6 +1037,11 @@ class GenTrackerPolicy:
             # which is why that one got renamed and this one did not.
             "extero_tokens": extero,
             "cmd_tokens": cmd_tokens,
+            # The command profile BEFORE the stride to cmd_steps. Recorded alongside the
+            # tokens because the C++ runtime's FmConditioning carries this form, and comparing
+            # a strided 13x3 against an unstrided 62x3 compares nothing -- it just has a
+            # different width and gets skipped.
+            "future_cmd": fut_cmd,
             "history_null": bool(history_null),
             "infer_s": infer_s,
         }

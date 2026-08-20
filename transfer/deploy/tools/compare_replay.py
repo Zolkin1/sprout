@@ -141,6 +141,47 @@ def main() -> int:
           + (f"DISAGREE on {len(disagree)} ticks, first at {disagree[0]}"
              if len(disagree) else "agree everywhere they are both defined"))
 
+    # The generator's CONDITIONING. Pure arithmetic, so it should be exact -- but the history
+    # is the runtime's own past output, so once the plans diverge the history follows. What
+    # matters is therefore the FIRST tick each field disagrees on: if the extero and the
+    # command agree and the history's first disagreement is AFTER the first plan divergence,
+    # the conditioning is not the cause and the inference is the only thing left.
+    print("[compare] the generator's conditioning:")
+    for name in ("fm_extero", "fm_future_cmd", "fm_history_nodes", "fm_history_cmd"):
+        if name not in py or not py[name].shape[1]:
+            print(f"  {name:17s} not recorded by python; skipped")
+            continue
+        path = os.path.join(args.stream, f"cpp.{name}.bin")
+        if not os.path.exists(path):
+            print(f"  {name:17s} not written by the C++ side; skipped")
+            continue
+        raw = np.fromfile(path, dtype=np.float64)
+        w = py[name].shape[1]
+        if raw.size != ticks * w:
+            # A width mismatch means the two sides are recording DIFFERENT QUANTITIES, which
+            # is worse than a numeric gap: it silently compares nothing. Say so.
+            print(f"  {name:17s} WIDTH MISMATCH: python {w}/tick, C++ {raw.size / ticks:.1f}"
+                  "/tick -- these are not the same quantity, so nothing was compared")
+            ok = False
+            continue
+        # ON RE-PLAN TICKS ONLY, and this is not a convenience. Python records the
+        # conditioning of the last RE-PLAN (it lives on the stashed plan and is held between
+        # them); the C++ rebuilds it every tick and holds nothing. Both are correct for their
+        # own runtime, and they describe the same instant only where a plan was actually
+        # requested. Comparing every tick reported the robot having moved, at tick 1, as
+        # though it were a code difference.
+        err_all = np.abs(py[name] - raw.reshape(ticks, w)).max(axis=1)
+        err = err_all[replanned]
+        over = np.flatnonzero(err > ATOL_EXACT)
+        print(f"  {name:17s} max={err.max():.3e}  median={np.median(err):.3e}"
+              f"  over {len(err)} re-plan ticks"
+              + (f"  FIRST DISAGREES at re-plan {over[0]}" if len(over)
+                 else "  agrees on every one"))
+        # Only the non-autoregressive inputs are a verdict. The history cannot be: it is
+        # downstream of the plans, so a divergence there is a consequence.
+        if name in ("fm_extero", "fm_future_cmd") and len(over):
+            ok = False
+
     cpp_sum = _read_cpp(args.stream, "checksum", ticks, 2)
     same = sum(join_checksum(cpp_sum[t][0], cpp_sum[t][1])
                == join_checksum(py["obs_checksum_hi"][t][0], py["obs_checksum_lo"][t][0])

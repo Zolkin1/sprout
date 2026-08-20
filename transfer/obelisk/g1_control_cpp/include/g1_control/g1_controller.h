@@ -189,6 +189,7 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   bool threaded_fm_ = true;
   int fm_late_disarm_ticks_ = 0;
   std::string urdf_path_;
+  bool zero_noise_ = true;
 
   // ---- diagnostics --------------------------------------------------------------------
   std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> depth_subs_;
