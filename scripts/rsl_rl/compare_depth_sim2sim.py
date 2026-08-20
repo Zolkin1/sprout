@@ -79,6 +79,7 @@ from robot_rl.assets.robots.g1_21j import G1_CFG  # noqa: E402
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (  # noqa: E402
     _FAR,
     _NEAR,
+    ensure_decor_prim,
     _make_depth_camera,
 )
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (  # noqa: E402
@@ -428,6 +429,10 @@ def main() -> int:
         sim_utils.SimulationCfg(dt=0.005, device=args.device, gravity=(0.0, 0.0, 0.0))
     )
     scene = InteractiveScene(_CompareSceneCfg(num_envs=1, env_spacing=2.5))
+    # Every camera from ``_make_depth_camera`` casts against /World/decor, and the caster
+    # RAISES on a target matching no prim. This flat-mesh scene has no ClipTerrainImporter to
+    # create it, so create it empty -- the cameras then log "No mesh prims found" and skip it.
+    ensure_decor_prim()
     sim.reset()
     for _ in range(5):
         scene.write_data_to_sim()

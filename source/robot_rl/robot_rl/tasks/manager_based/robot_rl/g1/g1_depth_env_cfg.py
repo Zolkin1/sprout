@@ -46,6 +46,8 @@ from isaaclab.utils import configclass
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.mdp.sensors import DepthNoiseCfg
+from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_importer import (
+    ClipTerrainImporter, create_decor_prim)
 
 from .g1_self_scan import link_prim_path, self_scan_prim_paths
 from .g1_teacher_env_cfg import G1TeacherEventsCfg, G1TeacherObservationsCfg
@@ -54,6 +56,29 @@ from .g1_teacher_terrain_env_cfg import (
     G1TeacherTerrainBodyEnvCfgPlay,
     G1TeacherTerrainSceneCfg,
 )
+
+#: The visual-only decoration prim the cameras cast against, re-exported from the importer
+#: that owns it so a scene without a ``ClipTerrainImporter`` still has one name to create.
+DECOR_PRIM_PATH = ClipTerrainImporter.DECOR_PRIM_PATH
+
+
+def ensure_decor_prim() -> None:
+    """Give a decoration-free scene the placeholder decoration prim.
+
+    Every camera built by :func:`_make_depth_camera` lists :data:`DECOR_PRIM_PATH` as a
+    ray-cast target, and ``MultiMeshRayCaster`` needs that target to resolve to at least one
+    real mesh -- it raises on a path matching nothing, and dies later on ``n_meshes = 0`` for a
+    path matching a mesh-less prim. A scene that uses these cameras over a plain
+    ``TerrainImporter`` -- the flat-mesh probe scenes in ``verify_depth_self_scan.py`` and
+    ``compare_depth_sim2sim.py`` -- therefore has to build one itself.
+
+    Call before ``sim.reset()``, which is when the sensors initialise. Idempotent: a scene
+    that already has real decoration is left alone.
+    """
+    import isaaclab.sim as sim_utils
+
+    if not sim_utils.is_prim_path_valid(DECOR_PRIM_PATH):
+        create_decor_prim(None, DECOR_PRIM_PATH)
 
 # ---------------------------------------------------------------------------
 # Camera geometry
@@ -295,11 +320,17 @@ def _make_depth_camera(
         # which is what we want for the static terrain mesh.
         # /World/decor is the VISUAL-ONLY decoration: walls and clutter the cameras must see
         # and the height scan must not. It is a sibling of /World/ground precisely so the
-        # scanner -- a RayCaster pointed at that one path -- cannot reach it. Listing it here
-        # is harmless on an undecorated library: the importer only creates the prim when the
-        # manifest carries decoration, and MultiMeshRayCaster tolerates a target that matches
-        # nothing (it logs "No mesh prims found").
-        mesh_prim_paths=["/World/ground", "/World/decor"] + _self_scan_targets(),
+        # scanner -- a RayCaster pointed at that one path -- cannot reach it.
+        #
+        # LISTING IT MAKES THE PRIM MANDATORY. MultiMeshRayCaster tolerates a target that
+        # exists but holds no meshes (it logs "No mesh prims found" and skips), and does NOT
+        # tolerate a target that matches nothing -- ``_initialize_warp_meshes`` raises
+        # "Failed to find a prim at path expression". So ``ClipTerrainImporter`` creates the
+        # Xform even for an undecorated library, and any scene that builds these cameras
+        # WITHOUT that importer must create it too: see :data:`DECOR_PRIM_PATH` and the
+        # flat-mesh probe scenes in ``verify_depth_self_scan.py`` /
+        # ``compare_depth_sim2sim.py``, both of which died on exactly this.
+        mesh_prim_paths=["/World/ground", DECOR_PRIM_PATH] + _self_scan_targets(),
         debug_vis=False,
     )
 

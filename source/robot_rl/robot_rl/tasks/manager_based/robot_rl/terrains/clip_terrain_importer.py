@@ -32,6 +32,64 @@ from motion_gen.clips.clip_io import load_clip_library
 from .clip_terrain_loader import assemble_clip_terrain
 
 
+#: One tiny triangle, 1 km below the world, standing in for "no decoration".
+#:
+#: The decoration prim cannot simply be omitted, and cannot be an empty Xform either.  Every
+#: depth camera lists it as a ray-cast target, and ``MultiMeshRayCaster`` fails BOTH ways: a
+#: target matching no prim raises ``"Failed to find a prim at path expression"``, and a target
+#: matching a prim that holds no meshes is warned about, skipped -- and then reaches the
+#: second pass with ``n_meshes = 0``, where ``pos_w.view(-1, 0, 3)`` raises
+#: ``"shape '[-1, 0, 3]' is invalid for input of size 3"``.  So the target must resolve to at
+#: least one real mesh.
+#:
+#: This one can never be hit: it sits 1 km down, so any ray reaching it has already passed
+#: the ground, and even through a ``has_floor=False`` void it is two orders of magnitude
+#: beyond ``max_dist`` and reads as the range sentinel exactly like a miss.  It is
+#: non-degenerate on purpose -- a zero-area triangle is a coin flip in a BVH build.
+_PLACEHOLDER_POINTS = ((0.0, 0.0, -1000.0), (0.001, 0.0, -1000.0), (0.0, 0.001, -1000.0))
+
+
+def create_decor_prim(decor_mesh, prim_path: str) -> int:
+    """Create the visual-only decoration prim, with a placeholder when there is nothing to show.
+
+    ``create_prim_from_mesh`` hardcodes ``collision_enabled=True``, so it cannot be used:
+    decoration that collides is a wall the robot walks into having never been trained to avoid
+    one.  This builds the same prim structure with the collider left off.
+
+    Shared with the flat-mesh probe scenes (``verify_depth_self_scan.py``,
+    ``compare_depth_sim2sim.py``) via ``g1_depth_env_cfg.ensure_decor_prim``, which build the
+    real cameras over a plain ``TerrainImporter`` and so have no decoration of their own.
+
+    Args:
+        decor_mesh: The assembled decoration, or ``None`` for none at all.
+        prim_path: Where to build it, normally :attr:`ClipTerrainImporter.DECOR_PRIM_PATH`.
+
+    Returns:
+        The face count actually imported; ``0`` when the placeholder was used.
+    """
+    import numpy as np
+    from pxr import UsdGeom
+
+    empty = decor_mesh is None or not len(decor_mesh.faces)
+    points = _PLACEHOLDER_POINTS if empty else decor_mesh.vertices
+    faces = np.asarray([[0, 1, 2]]) if empty else decor_mesh.faces
+
+    sim_utils.create_prim(prim_path, "Xform")
+    prim = sim_utils.create_prim(
+        f"{prim_path}/mesh", "Mesh",
+        attributes={
+            "points": points,
+            "faceVertexIndices": np.asarray(faces).flatten(),
+            "faceVertexCounts": np.asarray([3] * len(faces)),
+            "subdivisionScheme": "bilinear",
+        },
+    )
+    # Deliberately NO define_collision_properties: this geometry must not collide.
+    colour = UsdGeom.Primvar(prim.GetAttribute("primvars:displayColor"))
+    colour.Set([(0.45, 0.42, 0.50)])
+    return 0 if empty else len(faces)
+
+
 class ClipTerrainImporter(TerrainImporter):
     """Custom-mesh importer for clip-library terrains with per-env terrain id."""
 
@@ -124,35 +182,18 @@ class ClipTerrainImporter(TerrainImporter):
     DECOR_PRIM_PATH = "/World/decor"
 
     def _import_decor(self, decor_mesh) -> None:
-        """Import the decoration mesh as a visual-only prim, if there is any.
-
-        ``create_prim_from_mesh`` hardcodes ``collision_enabled=True``, so it cannot be used:
-        decoration that collides is a wall the robot walks into having never been trained to
-        avoid one. This builds the same prim structure with the collider left off.
+        """Import the decoration mesh as a visual-only prim.
 
         Args:
             decor_mesh: The assembled decoration, or ``None`` for an undecorated library.
         """
-        if decor_mesh is None or not len(decor_mesh.faces):
-            return
-        import numpy as np
-        from pxr import UsdGeom
-
-        sim_utils.create_prim(self.DECOR_PRIM_PATH, "Xform")
-        prim = sim_utils.create_prim(
-            f"{self.DECOR_PRIM_PATH}/mesh", "Mesh",
-            attributes={
-                "points": decor_mesh.vertices,
-                "faceVertexIndices": decor_mesh.faces.flatten(),
-                "faceVertexCounts": np.asarray([3] * len(decor_mesh.faces)),
-                "subdivisionScheme": "bilinear",
-            },
-        )
-        # Deliberately NO define_collision_properties: this geometry must not collide.
-        colour = UsdGeom.Primvar(prim.GetAttribute("primvars:displayColor"))
-        colour.Set([(0.45, 0.42, 0.50)])
-        print(f"[ClipTerrainImporter] decoration: {len(decor_mesh.faces)} faces at "
-              f"{self.DECOR_PRIM_PATH} (visual only -- no collider, not in the height scan)")
+        n = create_decor_prim(decor_mesh, self.DECOR_PRIM_PATH)
+        if n:
+            print(f"[ClipTerrainImporter] decoration: {n} faces at {self.DECOR_PRIM_PATH} "
+                  "(visual only -- no collider, not in the height scan)")
+        else:
+            print(f"[ClipTerrainImporter] no decoration in this library; "
+                  f"{self.DECOR_PRIM_PATH} carries the unhittable placeholder")
 
     @override
     def update_env_origins(self, env_ids: torch.Tensor, move_up: torch.Tensor, move_down: torch.Tensor):
