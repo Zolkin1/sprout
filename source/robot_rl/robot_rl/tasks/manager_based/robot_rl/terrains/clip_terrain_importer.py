@@ -80,6 +80,7 @@ class ClipTerrainImporter(TerrainImporter):
             flat_buffer=cfg.flat_buffer, transition_back_buffer=cfg.transition_back_buffer,
         )
         self.import_mesh("terrain", mesh)
+        self._import_decor(layout.decor_mesh)
         # Base curriculum origin distribution: terrain_levels (rows) + terrain_types
         # (columns == tiles); env_origins = origins[level, type] = tile center.
         self.configure_env_origins(origins)
@@ -112,6 +113,46 @@ class ClipTerrainImporter(TerrainImporter):
         self._refresh_env_arrays()
 
         self.set_debug_vis(cfg.debug_vis)
+
+    #: Where the visual-only decoration goes. A SIBLING of the ground, not a child.
+    #:
+    #: ``import_mesh`` builds under ``cfg.prim_path`` (``/World/ground``), and the height
+    #: scanner is a ``RayCaster`` pointed at exactly that path -- so a decor mesh imported the
+    #: normal way would be scanned along with the terrain, which is the one thing the channel
+    #: exists to prevent. The depth cameras take a LIST of prims and are given this one
+    #: explicitly (``g1_depth_env_cfg``).
+    DECOR_PRIM_PATH = "/World/decor"
+
+    def _import_decor(self, decor_mesh) -> None:
+        """Import the decoration mesh as a visual-only prim, if there is any.
+
+        ``create_prim_from_mesh`` hardcodes ``collision_enabled=True``, so it cannot be used:
+        decoration that collides is a wall the robot walks into having never been trained to
+        avoid one. This builds the same prim structure with the collider left off.
+
+        Args:
+            decor_mesh: The assembled decoration, or ``None`` for an undecorated library.
+        """
+        if decor_mesh is None or not len(decor_mesh.faces):
+            return
+        import numpy as np
+        from pxr import UsdGeom
+
+        sim_utils.create_prim(self.DECOR_PRIM_PATH, "Xform")
+        prim = sim_utils.create_prim(
+            f"{self.DECOR_PRIM_PATH}/mesh", "Mesh",
+            attributes={
+                "points": decor_mesh.vertices,
+                "faceVertexIndices": decor_mesh.faces.flatten(),
+                "faceVertexCounts": np.asarray([3] * len(decor_mesh.faces)),
+                "subdivisionScheme": "bilinear",
+            },
+        )
+        # Deliberately NO define_collision_properties: this geometry must not collide.
+        colour = UsdGeom.Primvar(prim.GetAttribute("primvars:displayColor"))
+        colour.Set([(0.45, 0.42, 0.50)])
+        print(f"[ClipTerrainImporter] decoration: {len(decor_mesh.faces)} faces at "
+              f"{self.DECOR_PRIM_PATH} (visual only -- no collider, not in the height scan)")
 
     @override
     def update_env_origins(self, env_ids: torch.Tensor, move_up: torch.Tensor, move_down: torch.Tensor):

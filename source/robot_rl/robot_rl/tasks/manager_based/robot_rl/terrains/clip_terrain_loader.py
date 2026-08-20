@@ -81,6 +81,10 @@ class ClipTerrainLayout:
     # emitted by ``composite_terrain``'s ``meta_data["overlays"]``.  The box world
     # (x, y) for a tile is ``tile_corner[:2] + overlay["pos_xy"]`` (Phase-3 reset).
     terrain_overlays: dict[int, list[dict]] = field(default_factory=dict)
+    # The VISUAL-ONLY decoration, assembled and centred exactly like the ground mesh but kept
+    # out of it. ``None`` for an undecorated library. Carried on the layout rather than added
+    # to ``assemble_clip_terrain``'s return tuple so every existing caller is unaffected.
+    decor_mesh: object | None = None
 
 
 def _stair_decor_from_manifest(decor: dict | None) -> StairDecorCfg | None:
@@ -213,20 +217,6 @@ def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
                 "overlay axis-aligned, or add yaw to OverlayVolumeCfg / overlay_sub_boxes / "
                 "build_overlay and every renderer that consumes them."
             )
-        # Reserved fields, refused rather than ignored. ``decor`` is Part 2.4's visual-only
-        # channel: a wall the cameras see, the height scan does not, and the robot cannot
-        # walk into. IsaacLab needs a SEPARATE prim for that -- the height scanner is a
-        # RayCaster and takes exactly one mesh prim, while the depth cameras take a list --
-        # so silently accepting the field here would put the decoration on /World/ground and
-        # make it both scannable and solid. Same reasoning as the yaw refusal above.
-        reserved = [k for k in ("decor",) if k in ov]
-        if reserved:
-            raise ValueError(
-                f"terrain {entry.get('terrain_id')} overlay {i} carries {reserved}, which "
-                "this loader does not implement. Decoration must be built on its own prim, "
-                "not merged into the ground mesh; ignoring the field would make it a solid "
-                "box that the height scan reads as terrain."
-            )
         kind = str(ov.get("kind", "box"))
         if kind not in OVERLAY_KINDS:
             raise ValueError(
@@ -241,6 +231,7 @@ def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
             pos_xy=tuple(float(v) for v in ov["pos_xy"]),
             base_z=float(ov.get("base_z", 0.0)),
             walkable_top=bool(ov.get("walkable_top", True)),
+            decor=bool(ov.get("decor", False)),
             variant=str(ov.get("variant", "solid")),
             slab_thickness=float(ov.get("slab_thickness", 0.1)),
             leg_size=(float(leg_size[0]), float(leg_size[1])),
@@ -289,11 +280,17 @@ def _tile_mesh(
     footprint: tuple[float, float],
     blocks: list[TerrainBlockCfg],
     overlays: list[OverlayVolumeCfg] | None = None,
-) -> tuple[trimesh.Trimesh, list[dict]]:
+) -> tuple[trimesh.Trimesh, list[dict], trimesh.Trimesh | None]:
     """Concatenated mesh of one tile (composite blocks + overlays) in local coords.
 
-    Returns the mesh plus the per-overlay metadata list emitted by
-    :func:`composite_terrain` (empty when the tile has no overlays).
+    Returns ``(ground_mesh, overlay_metadata, decor_mesh)``. The DECOR overlays are built
+    into a separate mesh and left out of the ground entirely -- see
+    :attr:`OverlayVolumeCfg.decor`. Splitting here rather than at the prim is what makes the
+    separation real: the height scanner ray-casts a single mesh prim, so anything merged into
+    the ground is scannable no matter how the prim is configured afterwards.
+
+    ``decor_mesh`` is ``None`` when the tile has no decoration, which is every tile in an
+    undecorated library.
 
     An empty ``blocks`` builds a NO-GROUND tile: only the overlay volumes are meshed (a
     self-supporting structure such as a floating staircase), with no flat ground plane filling the
@@ -301,6 +298,11 @@ def _tile_mesh(
     per-overlay metadata mirrors ``composite_terrain``'s so downstream consumers are unaffected.
     """
     overlays = list(overlays or [])
+    decor_cfgs = [o for o in overlays if getattr(o, "decor", False)]
+    overlays = [o for o in overlays if not getattr(o, "decor", False)]
+    decor_mesh = None
+    if decor_cfgs:
+        decor_mesh = trimesh.util.concatenate([build_overlay(o).mesh for o in decor_cfgs])
     if not blocks:
         meshes: list[trimesh.Trimesh] = []
         ov_meta: list[dict] = []
@@ -320,13 +322,13 @@ def _tile_mesh(
                 "leg_size": (float(ov_cfg.leg_size[0]), float(ov_cfg.leg_size[1])),
                 "leg_inset": float(ov_cfg.leg_inset),
             })
-        return trimesh.util.concatenate(meshes), ov_meta
+        return trimesh.util.concatenate(meshes), ov_meta, decor_mesh
     sub = CompositeSubTerrainCfg(
         size=footprint, blocks=blocks, overlays=overlays,
         origin_block_index=0, start_z=0.0,
     )
     meshes, _origin, meta = composite_terrain(0.0, sub)
-    return trimesh.util.concatenate(meshes), meta.get("overlays", [])
+    return trimesh.util.concatenate(meshes), meta.get("overlays", []), decor_mesh
 
 
 def default_num_flat_tiles(lib) -> int:
@@ -528,13 +530,17 @@ def assemble_clip_terrain(
     tile_fp = torch.zeros(num_rows, num_tiles, 2)
     tile_tid = torch.zeros(num_rows, num_tiles, dtype=torch.long)
     tile_cxoff = torch.zeros(num_rows, num_tiles)
+    decor_meshes: list[trimesh.Trimesh] = []
     for r in range(num_rows):
         xoff = r * rep_w                                    # replicas side-by-side in x
         for c, (tid, _tc, fp, blocks, cxoff, overlays) in enumerate(specs):
             x, y = xoff + base_xy[c][0], base_xy[c][1]
-            m, ov_meta = _tile_mesh(fp, blocks, overlays)
+            m, ov_meta, dm = _tile_mesh(fp, blocks, overlays)
             m.apply_translation((x, y, 0.0))
             meshes.append(m)
+            if dm is not None and len(dm.faces):
+                dm.apply_translation((x, y, 0.0))
+                decor_meshes.append(dm)
             tile_corner[r, c] = torch.tensor([x, y, 0.0])
             tile_fp[r, c] = torch.tensor(list(fp))
             tile_tid[r, c] = tid
@@ -547,6 +553,11 @@ def assemble_clip_terrain(
     bmin, bmax = mesh.bounds
     cx, cy = 0.5 * (bmin[0] + bmax[0]), 0.5 * (bmin[1] + bmax[1])
     mesh.apply_translation((-cx, -cy, 0.0))
+    # The SAME offset, from the ground mesh's bounds -- not the decor's own. Centring the two
+    # independently would slide the walls off the tiles by however much they differ.
+    decor_mesh = trimesh.util.concatenate(decor_meshes) if decor_meshes else None
+    if decor_mesh is not None:
+        decor_mesh.apply_translation((-cx, -cy, 0.0))
     tile_corner[:, :, 0] -= cx
     tile_corner[:, :, 1] -= cy
 
@@ -562,6 +573,7 @@ def assemble_clip_terrain(
         clip_size_y=clip_size_y, terrain_type_code=type_code,
         terrain_frame_yaw=terrain_frame_yaw,
         terrain_overlays=terrain_overlays,
+        decor_mesh=decor_mesh,
     )
     return mesh, origins, layout
 

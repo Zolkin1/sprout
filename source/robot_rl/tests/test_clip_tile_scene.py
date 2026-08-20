@@ -79,7 +79,7 @@ def _isaac_mesh(entry: dict):
     footprint = (float(entry["size_x"]), float(entry["size_y"]))
     blocks = ([_loader.FlatBlockCfg(size_x=footprint[0], skill_probs={"standing": 1.0})]
               if entry.get("has_floor", True) else [])
-    mesh, _meta = _loader._tile_mesh(footprint, blocks,
+    mesh, _meta, _decor = _loader._tile_mesh(footprint, blocks,
                                      _loader._overlays_from_manifest(entry))
     return mesh
 

@@ -93,39 +93,26 @@ def overlay_sub_boxes(
     return boxes
 
 
-#: Overlay fields that are RESERVED: parsed nowhere yet, and refused everywhere so they
-#: cannot be authored before every consumer understands them.
+#: Geom group for VISUAL-ONLY decoration, and the contact flags that go with it.
 #:
-#: ``decor`` is the visual-only channel Part 2.4 needs -- a wall the depth cameras see, the
-#: height scan does not, and the robot cannot walk into. Each of those is a different
-#: mechanism per simulator (a separate prim in IsaacLab, group 1 with contype=0 in MuJoCo),
-#: so a consumer that merely IGNORES the field renders a decoration as a solid collidable
-#: box. That is strictly worse than not having the feature: an invisible-to-the-scan wall
-#: becomes a wall the robot walks into and cannot see.
+#: ``transfer/sim/depth_camera.py`` casts groups {1 = per-link visual meshes, 2 = terrain}
+#: and ``Robot.compute_height_scan`` casts {2}. So decoration belongs in group 1: the depth
+#: cameras see it, the height scan does not. ``contype=0 conaffinity=0`` makes it
+#: non-colliding, which is the third property -- a wall the robot cannot walk into having
+#: never been trained to avoid one.
 #:
-#: Refusing now is the same move Part 0 made for overlay ``yaw``: state the gap loudly while
-#: it is still cheap, so the emitter cannot land before the consumers.
-RESERVED_OVERLAY_FIELDS = ("decor",)
+#: The IsaacLab side achieves the same three properties differently, with a separate prim
+#: (``ClipTerrainImporter.DECOR_PRIM_PATH``), because there the height scanner is a
+#: ``RayCaster`` bound to exactly one mesh prim. Two mechanisms, one meaning; the pair is
+#: checked by ``source/robot_rl/tests/test_self_scan_matches_mujoco.py``'s sibling for
+#: terrain, and by the emitter tests here.
+DECOR_GEOM_GROUP = 1
+DECOR_CONTACT_ATTRS = 'contype="0" conaffinity="0"'
 
 
-def refuse_reserved_fields(ov: dict, where: str) -> None:
-    """Raise if an overlay carries a field this consumer does not implement.
-
-    Args:
-        ov: One ``overlays`` entry.
-        where: Identifier for the message (terrain id, index).
-
-    Raises:
-        ValueError: If any of :data:`RESERVED_OVERLAY_FIELDS` is present.
-    """
-    present = [k for k in RESERVED_OVERLAY_FIELDS if k in ov]
-    if present:
-        raise ValueError(
-            f"{where}: overlay carries {present}, which this consumer does not implement. "
-            "The visual-only decoration channel needs a separate mechanism in each simulator; "
-            "ignoring the field here would build the decoration as a SOLID, COLLIDABLE box "
-            "that the height scan can see and the robot can walk into."
-        )
+def is_decor(ov: dict) -> bool:
+    """Whether an overlay is visual-only decoration."""
+    return bool(ov.get("decor", False))
 
 
 def overlay_sub_boxes_from_manifest(
@@ -142,7 +129,6 @@ def overlay_sub_boxes_from_manifest(
     Returns:
         List of sub-box ``(cx, cy, cz, sx, sy, sz)`` tuples.
     """
-    refuse_reserved_fields(ov, "overlay_sub_boxes_from_manifest")
     leg_size = ov.get("leg_size", (0.1, 0.1))
     return overlay_sub_boxes(
         str(ov.get("variant", "solid")),

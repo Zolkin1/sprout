@@ -293,7 +293,13 @@ def _make_depth_camera(
         ),
         # A plain string entry becomes a target with track_mesh_transforms disabled,
         # which is what we want for the static terrain mesh.
-        mesh_prim_paths=["/World/ground"] + _self_scan_targets(),
+        # /World/decor is the VISUAL-ONLY decoration: walls and clutter the cameras must see
+        # and the height scan must not. It is a sibling of /World/ground precisely so the
+        # scanner -- a RayCaster pointed at that one path -- cannot reach it. Listing it here
+        # is harmless on an undecorated library: the importer only creates the prim when the
+        # manifest carries decoration, and MultiMeshRayCaster tolerates a target that matches
+        # nothing (it logs "No mesh prims found").
+        mesh_prim_paths=["/World/ground", "/World/decor"] + _self_scan_targets(),
         debug_vis=False,
     )
 

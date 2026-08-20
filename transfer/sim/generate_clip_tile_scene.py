@@ -49,7 +49,9 @@ import h5py
 import numpy as np
 
 from generate_stairs_scene import scene_xml
-from overlay_geom import OVERLAY_VARIANTS, overlay_sub_boxes_from_manifest
+from overlay_geom import (DECOR_CONTACT_ATTRS, DECOR_GEOM_GROUP,
+                          OVERLAY_VARIANTS, is_decor,
+                          overlay_sub_boxes_from_manifest)
 
 #: An overlay whose x extent is at most this is a STEP rather than a platform or a box.
 #: Trained treads top out at 0.28 m (``generate_stairs_scene.TRAINED_TREADS``); the platforms
@@ -269,11 +271,27 @@ def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[flo
 
 
 def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,
-              yaw: float, material: str = "box_material") -> str:
-    """One MuJoCo box geom line in the raycast/collision group."""
+              yaw: float, material: str = "box_material", decor: bool = False) -> str:
+    """One MuJoCo box geom line.
+
+    Args:
+        name: Geom name.
+        cx, cy, cz: Centre.
+        sx, sy, sz: Full extents.
+        yaw: Rotation about z (rad).
+        material: Material name.
+        decor: Emit it as VISUAL-ONLY -- group 1 rather than 2, and non-colliding. The depth
+            cameras cast groups {1, 2} and the height scan casts {2}, so this is what makes a
+            wall visible to the cameras, invisible to the scan, and impossible to walk into.
+
+    Returns:
+        The geom line.
+    """
     quat = f' quat="{math.cos(yaw / 2.0):.9f} 0 0 {math.sin(yaw / 2.0):.9f}"' if yaw else ""
-    return (f'        <geom name="{name}" type="box" material="{material}" group="2" '
-            f'size="{sx / 2.0:.6f} {sy / 2.0:.6f} {sz / 2.0:.6f}" '
+    group = DECOR_GEOM_GROUP if decor else 2
+    flags = f" {DECOR_CONTACT_ATTRS}" if decor else ""
+    return (f'        <geom name="{name}" type="box" material="{material}" group="{group}"'
+            f'{flags} size="{sx / 2.0:.6f} {sy / 2.0:.6f} {sz / 2.0:.6f}" '
             f'pos="{cx:.6f} {cy:.6f} {cz:.6f}"{quat}/>')
 
 
@@ -300,15 +318,16 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
     ox, oy, oz = origin
     lines = []
     for i, ov in enumerate(overlays):
+        decor = is_decor(ov)
         step = float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M
-        base = f"tile_{'step' if step else 'slab'}{i}"
+        base = f"tile_decor{i}" if decor else f"tile_{'step' if step else 'slab'}{i}"
         yaw = float(ov.get("yaw", 0.0))
         # A solid overlay decomposes to exactly one sub-box with the overlay's own extents,
         # so the emitted line -- and its name -- is unchanged from before this branch existed.
         for j, (cx, cy, cz, bx, by, bz) in enumerate(overlay_sub_boxes_from_manifest(ov)):
             lines.append(_box_geom(
                 base if j == 0 else f"{base}_p{j}",
-                cx - ox, cy - oy, cz - oz, bx, by, bz, yaw,
+                cx - ox, cy - oy, cz - oz, bx, by, bz, yaw, decor=decor,
             ))
 
     if infinite_floor or not bool(entry.get("has_floor", True)):
