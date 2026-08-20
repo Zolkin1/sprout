@@ -21,7 +21,8 @@ import numpy as np
 import pytest
 
 from motion_gen.terrain.decorate import (ARMS, DecorateConfig, TREAD_WIDTH_FRAC,
-                                         BOX_VARIANTS, _resize_y, classify,
+                                         BOX_VARIANTS, _resize_y, _wall_boxes,
+                                         add_walls, classify,
                                          classify_overlays, decorate_box_tile,
                                          decorate_transition_tile, has_width_variation,
                                          span, tile_rng)
@@ -310,3 +311,77 @@ def test_not_every_box_tile_is_widened():
     assert 0 < widened < len(modes), (
         f"{widened} of {len(modes)} widened; both cases must occur"
     )
+
+
+def test_a_wall_with_no_window_is_one_box():
+    """The common case must not pay for the window machinery."""
+    boxes = _wall_boxes(0.1, 0.2, 0.0, 10.0, 2.0, 0.0, None)
+    assert len(boxes) == 1
+    assert boxes[0]["size_xyz"] == [10.0, pytest.approx(0.1), 2.0]
+    assert boxes[0]["decor"] is True
+    assert boxes[0]["walkable_top"] is False
+
+
+def test_a_window_becomes_the_four_boxes_around_it():
+    """Neither simulator does CSG, so a hole is the pieces AROUND it."""
+    boxes = _wall_boxes(0.0, 0.1, 0.0, 10.0, 3.0, 0.0, (4.0, 6.0, 1.0, 2.0))
+    assert len(boxes) == 4
+    # nothing may occupy the hole
+    for b in boxes:
+        x0 = b["pos_xy"][0] - b["size_xyz"][0] / 2
+        x1 = b["pos_xy"][0] + b["size_xyz"][0] / 2
+        z0, z1 = b["base_z"], b["base_z"] + b["size_xyz"][2]
+        overlaps_x = x0 < 6.0 - 1e-9 and x1 > 4.0 + 1e-9
+        overlaps_z = z0 < 2.0 - 1e-9 and z1 > 1.0 + 1e-9
+        assert not (overlaps_x and overlaps_z), f"piece {b} intrudes into the window"
+
+
+def test_a_window_flush_with_an_edge_drops_the_degenerate_piece():
+    """build_overlay raises on a zero extent, so an empty piece must never be emitted."""
+    boxes = _wall_boxes(0.0, 0.1, 0.0, 10.0, 3.0, 0.0, (0.0, 2.0, 0.0, 1.0))
+    assert all(b["size_xyz"][0] > 0 and b["size_xyz"][2] > 0 for b in boxes)
+    assert len(boxes) == 2, "the before-piece and the under-piece are both degenerate here"
+
+
+def test_walls_are_marked_decor_and_never_walkable():
+    """The three properties all hang off these two fields."""
+    tile = _tile(terrain_id=0, size_y=6.0)
+    fp = _footprint(0, lo=2.5, hi=3.5)
+    n = add_walls(tile, fp, DecorateConfig(seed=0, wall_frac=1.0))
+    assert n > 0
+    walls = [o for o in tile["overlays"] if o.get("decor")]
+    assert len(walls) == n
+    assert all(w["walkable_top"] is False for w in walls)
+
+
+def test_walls_stay_clear_of_the_foot_envelope_and_inside_the_tile():
+    """Outside the envelope so a wall never swallows the motion; inside the tile because
+    IsaacLab's floor spans the CLASS footprint and MuJoCo's spans the tile's own."""
+    cfg = DecorateConfig(seed=1, wall_frac=1.0)
+    for tid in range(40):
+        tile = _tile(terrain_id=tid, size_y=6.0)
+        fp = _footprint(tid, lo=2.5, hi=3.5)
+        add_walls(tile, fp, cfg)
+        for w in [o for o in tile["overlays"] if o.get("decor")]:
+            lo, hi = span(w)
+            assert lo >= -1e-9 and hi <= 6.0 + 1e-9, f"wall outside the tile on {tid}"
+            assert hi <= fp.y_min_sized + 1e-9 or lo >= fp.y_max_sized - 1e-9, (
+                f"wall overlaps the foot envelope on tile {tid}"
+            )
+
+
+def test_a_tile_with_no_clear_band_gets_no_wall():
+    """A tile whose motion fills it must not be given a wall on top of the feet."""
+    tile = _tile(terrain_id=0, size_y=4.0)
+    tight = TileFootprint(terrain_id=0, n_clips=1, y_min=0.1, y_max=3.9, x_min=0.0,
+                          x_max=20.0, y_min_sized=0.0, y_max_sized=4.0)
+    assert add_walls(tile, tight, DecorateConfig(seed=0, wall_frac=1.0)) == 0
+
+
+def test_walls_have_their_own_random_stream():
+    """A tile's walls must not be correlated with the width arm it drew."""
+    cfg = DecorateConfig(seed=0)
+    arm = [tile_rng(cfg.seed, t).random() for t in range(10)]
+    wall = [tile_rng(cfg.seed ^ 0x2A11, t).random() for t in range(10)]
+    box = [tile_rng(cfg.seed ^ 0x5EED, t).random() for t in range(10)]
+    assert len({tuple(arm), tuple(wall), tuple(box)}) == 3

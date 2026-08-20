@@ -88,6 +88,12 @@ class DecorateConfig:
         box_widen_frac: Fraction of BOX tiles whose overlays are widened at all. The rest
             keep their authored width, so the narrow-target case does not disappear.
         box_full_frac: Of those widened, the fraction taken all the way to the tile.
+        wall_frac: Probability a given tile SIDE gets a wall. Two sides per tile, so the
+            expected count is twice this.
+        wall_height_range: Wall height (m).
+        wall_thickness_range: Wall thickness (m).
+        wall_window_frac: Probability a wall carries a window hole.
+        wall_clearance_m: Gap left between a wall's inner face and the foot envelope.
     """
 
     seed: int = 0
@@ -98,6 +104,11 @@ class DecorateConfig:
     box_variant_fracs: tuple[float, float, float, float] = (0.40, 0.20, 0.20, 0.20)
     box_widen_frac: float = 0.55
     box_full_frac: float = 0.30
+    wall_frac: float = 0.45
+    wall_height_range: tuple[float, float] = (1.4, 3.0)
+    wall_thickness_range: tuple[float, float] = (0.08, 0.20)
+    wall_window_frac: float = 0.45
+    wall_clearance_m: float = 0.15
 
 
 @dataclass
@@ -235,6 +246,116 @@ def _resize_y(overlay: dict, lo: float, hi: float, *, must_contain: tuple[float,
     overlay["size_xyz"] = [float(overlay["size_xyz"][0]), float(hi - lo),
                            float(overlay["size_xyz"][2])]
     overlay["pos_xy"] = [float(overlay["pos_xy"][0]), float((lo + hi) / 2.0)]
+
+
+def _wall_boxes(lo_y: float, hi_y: float, x0: float, x1: float, height: float,
+                base_z: float, window: tuple[float, float, float, float] | None) -> list[dict]:
+    """One wall as axis-aligned boxes, with an optional rectangular window cut out.
+
+    MuJoCo and IsaacLab both build boxes and neither does CSG, so a hole is expressed as the
+    up-to-four boxes AROUND it rather than as a subtraction. Degenerate pieces are dropped
+    instead of emitted: ``build_overlay`` correctly raises on a zero extent, and a window
+    flush with an edge legitimately produces one.
+
+    Args:
+        lo_y: Wall's near y face (m).
+        hi_y: Wall's far y face (m).
+        x0: Downrange start (m).
+        x1: Downrange end (m).
+        height: Wall height above ``base_z`` (m).
+        base_z: Bottom of the wall (m).
+        window: ``(wx0, wx1, wz0, wz1)`` hole in tile-x and height, or ``None``.
+
+    Returns:
+        Overlay dicts, all marked ``decor``.
+    """
+    def box(bx0: float, bx1: float, bz0: float, bz1: float) -> dict | None:
+        if bx1 - bx0 < 1e-3 or bz1 - bz0 < 1e-3:
+            return None
+        return {
+            "kind": "box", "decor": True, "walkable_top": False, "yaw": 0.0,
+            "variant": "solid",
+            "size_xyz": [float(bx1 - bx0), float(hi_y - lo_y), float(bz1 - bz0)],
+            "pos_xy": [float((bx0 + bx1) / 2.0), float((lo_y + hi_y) / 2.0)],
+            "base_z": float(bz0),
+        }
+
+    top = base_z + height
+    if window is None:
+        return [b for b in (box(x0, x1, base_z, top),) if b]
+    wx0, wx1, wz0, wz1 = window
+    wx0, wx1 = max(x0, wx0), min(x1, wx1)
+    wz0, wz1 = max(base_z, wz0), min(top, wz1)
+    pieces = [
+        box(x0, wx0, base_z, top),       # before the hole, full height
+        box(wx1, x1, base_z, top),       # after it
+        box(wx0, wx1, base_z, wz0),      # under it
+        box(wx0, wx1, wz1, top),         # over it
+    ]
+    return [b for b in pieces if b]
+
+
+def add_walls(tile: dict, footprint: TileFootprint, cfg: DecorateConfig) -> int:
+    """Put up to two VISUAL-ONLY walls along a tile's long edges. Returns how many boxes.
+
+    Why walls at all: at the far camera's 15 degree pitch, 26.9% of its pixels return the
+    range sentinel on flat ground -- a quarter of the frame spent on nothing. Vertical
+    structure is what fills it, and a stairwell or corridor is what a real stair usually sits
+    in, so it is the honest thing to put there.
+
+    Why VISUAL-ONLY: the tracker follows a reference, it does not plan around obstacles. A
+    collidable wall the reference's arms sweep through would block a wrist, fire
+    ``ee_pose_error`` at 0.3 m and end the episode for a reason the policy cannot fix --
+    with ``undesired_contacts`` at -0.1 against ``clf_reward`` at 10 far too weak to teach
+    avoidance. It would also be useless to the height scan, which clips at +/-1 m and reads
+    a 1.5 m and a 5 m wall as the same number.
+
+    Placement is OUTSIDE the foot envelope by :attr:`DecorateConfig.wall_clearance_m` and
+    inside the tile's own footprint. Both matter: outside the envelope so a wall never
+    visually swallows the motion, and inside the tile because IsaacLab's tile floor spans the
+    CLASS footprint while MuJoCo's spans the tile's own extents -- geometry beyond the tile
+    would sit over ground in one sim and over void in the other.
+
+    Args:
+        tile: A manifest entry; walls are appended to its overlays.
+        footprint: The tile's foot envelope.
+        cfg: Knobs.
+
+    Returns:
+        Number of overlay boxes added.
+    """
+    # Its own stream, like the box variants: a tile's walls must not be correlated with
+    # which width arm it drew.
+    rng = tile_rng(cfg.seed ^ 0x2A11, int(tile["terrain_id"]))
+    size_x, size_y = float(tile["size_x"]), float(tile["size_y"])
+    added = 0
+    for side in (0, 1):
+        if rng.random() >= cfg.wall_frac:
+            continue
+        thickness = float(rng.uniform(*cfg.wall_thickness_range))
+        height = float(rng.uniform(*cfg.wall_height_range))
+        if side == 0:
+            hi_y = footprint.y_min_sized - cfg.wall_clearance_m
+            lo_y = hi_y - thickness
+            if lo_y < 0.0:
+                continue                      # no clear band on this side
+        else:
+            lo_y = footprint.y_max_sized + cfg.wall_clearance_m
+            hi_y = lo_y + thickness
+            if hi_y > size_y:
+                continue
+        x0 = float(rng.uniform(0.0, 0.25 * size_x))
+        x1 = float(rng.uniform(0.75 * size_x, size_x))
+        window = None
+        if rng.random() < cfg.wall_window_frac and (x1 - x0) > 2.0:
+            w = float(rng.uniform(0.8, min(2.5, (x1 - x0) * 0.4)))
+            cx = float(rng.uniform(x0 + w, x1 - w))
+            z0 = float(rng.uniform(0.6, max(0.7, height - 0.9)))
+            window = (cx - w / 2.0, cx + w / 2.0, z0, min(z0 + 1.0, height - 0.05))
+        boxes = _wall_boxes(lo_y, hi_y, x0, x1, height, 0.0, window)
+        tile["overlays"].extend(boxes)
+        added += len(boxes)
+    return added
 
 
 def decorate_box_tile(tile: dict, cfg: DecorateConfig,

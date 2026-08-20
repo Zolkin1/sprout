@@ -43,7 +43,8 @@ import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source", "motion_gen"))
 
 from motion_gen.terrain.decorate import (ARMS, BOX_VARIANTS,  # noqa: E402
-                                         DecorateConfig, decorate_box_tile,
+                                         DecorateConfig, add_walls,
+                                         decorate_box_tile,
                                          decorate_transition_tile,
                                          has_width_variation, span)
 from motion_gen.terrain.footprint import foot_corners  # noqa: E402
@@ -110,6 +111,8 @@ def main() -> None:
     p.add_argument("--no_box_variants", action="store_true",
                    help="leave the box tiles solid (they are 100%% solid today only because "
                         "the generator never passes variant_fracs)")
+    p.add_argument("--no_walls", action="store_true",
+                   help="skip the visual-only wall pass")
     p.add_argument("--dry_run", action="store_true",
                    help="report what would change without writing anything")
     args = p.parse_args()
@@ -189,6 +192,22 @@ def main() -> None:
                   f"(median {np.median(bw):.3f}); {n_widened} of {len(box_variants)} "
                   "tiles widened")
 
+        n_wall_boxes, n_wall_tiles = 0, 0
+        if not args.no_walls:
+            for tile in manifest:
+                if tile.get("type") not in ("transition", "box", "terrain"):
+                    continue
+                tid = int(tile["terrain_id"])
+                fp = prints.get(tid)
+                if fp is None:
+                    continue
+                n = add_walls(tile, fp, cfg)
+                n_wall_boxes += n
+                n_wall_tiles += n > 0
+            print(f"[decor] walls: {n_wall_boxes} boxes on {n_wall_tiles} tiles "
+                  "(VISUAL ONLY -- cameras see them, the height scan does not, "
+                  "nothing can walk into them)")
+
         print("\n[decor] validating every rewritten tile against its own foot samples")
         failures = 0
         for tile in manifest:
@@ -230,6 +249,7 @@ def main() -> None:
             "tread_full_frac": args.tread_full_frac,
             "arms": {r.terrain_id: r.arm for r in reports.values()},
             "box_variants": box_variants,
+            "wall_boxes": n_wall_boxes,
         })
     print(f"[decor] wrote {args.out}")
 

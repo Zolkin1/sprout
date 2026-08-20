@@ -217,6 +217,13 @@ def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
     lib = load_clip_library(lib_path, "cpu")
     mesh, _origins, layout = assemble_clip_terrain(lib, num_rows=num_rows)
     _add_mesh(server, "/terrain", mesh, _GROUND_COLOR)
+    # The VISUAL-ONLY decoration lives in its own mesh, out of the ground and out of the
+    # per-tile overlay metadata, so it has to be drawn explicitly -- otherwise walls that
+    # exist in both simulators would be invisible in the one tool used to check them.
+    # Translucent and a distinct colour, because "can the robot walk into this?" is the
+    # first question anyone looking at a wall will have. It cannot.
+    if getattr(layout, "decor_mesh", None) is not None:
+        _add_mesh(server, "/decor", layout.decor_mesh, (0.62, 0.55, 0.72), opacity=0.55)
     # Colour the overlay volumes on top (row 0 -- other rows are replicas).
     total_traj = 0
     for ti in range(layout.num_tiles):
