@@ -11,8 +11,15 @@
 // ============================ the schedule ================================================
 // The cadence is `ctrl_step % K` on an ABSOLUTE counter, mirroring Isaac's
 // `episode_length_buf % K`. The generator is asked for a plan `lead_ticks` BEFORE the
-// boundary that plan is for, so it has a whole lead window to do ~16 ms of work instead of
-// having to fit inside one 20 ms tick.
+// boundary that plan is for, so it has a lead window rather than having to return inside the
+// one tick that needs it.
+//
+// The lead is not free, and it is not latency the way inference time is: it is exteroception
+// STALENESS. What is sampled early is sampled EARLY -- a lead of n ticks conditions the plan
+// on a camera n*dt old. So the shipped `fm_lead_sec` is the MINIMUM this scheduler allows,
+// one tick, and the generator does not reliably fit inside it (med 13.7 / p99 22.3 ms
+// measured against 20 ms). Roughly 6% of plans are expected to land a tick late, by choice.
+// Absorbing that is what the lateness contract below is for.
 //
 // That is only sound because the conditioning can be built for the FUTURE boundary at
 // request time: the history rows are the nodes this runtime will SERVE between now and then,
@@ -30,10 +37,12 @@
 // cursor that keeps it time-correct, which is how late it is.
 //
 // Note the current artifact has F == max_offset + K exactly (62 == 50 + 12), so saturation
-// begins on precisely the tick a plan becomes late. That coincidence is NOT relied on: being
-// late is a property of the SCHEDULE (cursor >= K) and saturation is a property of the
-// HORIZON (cursor + offset > F-1). A generator retrained with more buffer separates them, and
-// the tests pin both independently.
+// begins on precisely the tick a plan becomes late -- but only just. At cursor K the only
+// offset that clamps is the FURTHEST, so a one-tick-late plan repeats the 1 s lookahead
+// sample and nothing nearer: the node the tracker is actually following is still a genuine
+// prediction. That coincidence is NOT relied on: being late is a property of the SCHEDULE
+// (cursor >= K) and saturation is a property of the HORIZON (cursor + offset > F-1). A
+// generator retrained with more buffer separates them, and the tests pin both independently.
 
 #include <cstdint>
 #include <vector>

@@ -290,14 +290,86 @@ def fig_velocity(runs, plt):
     return fig, ax
 
 
+def _achieved_frame_period_ms(ticks, cam: int) -> float | None:
+    """Median interval between the DISTINCT frames a camera actually delivered, in ms.
+
+    Measured from the consumed frames' own stamps (`depth_stamp`), deduplicated, so it needs
+    nothing but the tick topic. This is the check that the configured rate was MET: two depth
+    casts at 60 Hz is ~600 ms of work per wall second in the sim process, and a world that
+    cannot keep up stretches the period back toward the tick period -- silently undoing the
+    reason for choosing a rate off the control rate at all.
+
+    It is the period of frames the CONTROLLER SAW, which is the publish period only when the
+    two rates differ. A tick takes the newest frame, so a faster camera has some frames
+    skipped (a 2-frame gap) and a slower one has frames reused (a duplicate stamp, dropped
+    here) -- in both cases the MEDIAN gap is still one frame period, which is why the median
+    is taken rather than the mean. At exactly the control rate it degenerates and reads a few
+    percent high: measured 20.62 ms on a run whose stamps were published every 20.0018 ms,
+    because near-coincident timers occasionally land two frames inside one tick. Read a value
+    at the tick period as "not usefully measured" rather than as a slow camera.
+
+    Args:
+        ticks: ControllerDebug messages, in order.
+        cam: Camera index into the per-tick stamp array.
+
+    Returns:
+        Median period in ms, or None if this bag carries no usable stamps.
+    """
+    seen = []
+    for m in ticks:
+        stamps = getattr(m, "depth_stamp", None) or []
+        if cam >= len(stamps):
+            continue
+        t = float(stamps[cam].sec) + 1e-9 * float(stamps[cam].nanosec)
+        if t > 0.0 and (not seen or t != seen[-1]):
+            seen.append(t)
+    if len(seen) < 3:
+        return None
+    return float(np.median(np.diff(np.asarray(seen)))) * 1e3
+
+
+def _nominal_lead_ms(runs) -> float | None:
+    """The generator's lead in wall time, read from whichever run recorded it.
+
+    The lead reaches a bag only through ``FmPlan.lead_ticks``, so a sim2sim run (which has no
+    lead by construction) and any bag recorded before that field have nothing to report. None
+    means "draw no line": a hardcoded fallback would label every overridden run with the
+    default, which is exactly the sort of quietly-wrong annotation this plot exists to avoid.
+
+    Converted with the run's own MEASURED tick period rather than the nominal dt, so a loop
+    that is not really at 50 Hz is not silently rescaled -- the lead is counted in TICKS, and
+    a slow loop makes each of them longer.
+
+    Args:
+        runs: The runs being compared, in plot order.
+
+    Returns:
+        The lead in milliseconds, or None if no run recorded one.
+    """
+    for r in runs:
+        leads = [int(p.lead_ticks) for _t, p in (getattr(r, "plans", None) or [])
+                 if hasattr(p, "lead_ticks")]
+        periods = [t.tick_period_ms for t in (getattr(r, "ticks", None) or [])
+                   if getattr(t, "tick_period_ms", 0.0) > 0.0]
+        if leads and periods:
+            return float(np.median(leads)) * float(np.median(periods))
+    return None
+
+
 def fig_frame_age(runs, plt):
     """How stale the inputs were when each tick consumed them.
 
     THE measurement for the lead hypothesis. The generator is asked for a plan `lead` ticks
-    before the boundary it is for and conditioned on the exteroception as it was THEN -- 3
-    ticks, 60 ms, at the shipped ``fm_lead_sec: 0.05``. But that is the NOMINAL figure: camera
-    exposure, transport and callback scheduling add to it, and what the generator actually saw
-    is this.
+    before the boundary it is for and conditioned on the exteroception as it was THEN -- 1
+    tick, 20 ms, at the shipped ``fm_lead_sec: 0.02`` (it was 3 ticks, 60 ms). But that is
+    only the NOMINAL figure: the wait for a frame, transport and callback scheduling all add
+    to it, and what the generator actually saw is this.
+
+    The two depth panels are receipt-to-tick and stamp-to-tick, and in SIM they nearly
+    coincide (measured ~50 us apart) because obelisk stamps the header at PUBLISH, after the
+    ray cast -- so the ~5 ms of casting is charged to the frame's content, not its stamp, and
+    is invisible here. Expect them to separate on hardware, where the stamp comes from the
+    camera and the interval covers real transfer.
 
     The nominal lead is drawn as a reference, and 120 ms with it: that is where a descent
     stopped surviving in the emulated sweep, so it is the number worth knowing you are under.
@@ -341,6 +413,10 @@ def fig_frame_age(runs, plt):
                       f"{1e3 * np.nanpercentile(ages[:, cam], 99):.1f} p99  |  "
                       f"from CAPTURE {1e3 * np.nanmedian(cap[:, cam]):.1f} / "
                       f"{1e3 * np.nanpercentile(cap[:, cam], 99):.1f}")
+                period = _achieved_frame_period_ms(ticks, cam)
+                if period:
+                    print(f"[compare] {r.label} cam{cam}: delivered a frame every "
+                          f"{period:.2f} ms ({1e3 / period:.1f} Hz)")
             else:
                 print(f"[compare] {r.label} cam{cam} depth age: median "
                       f"{1e3 * np.nanmedian(ages[:, cam]):.1f} ms, p99 "
@@ -349,9 +425,14 @@ def fig_frame_age(runs, plt):
         est = np.array([getattr(m, "est_state_age", np.nan) for m in ticks], dtype=float)
         ax[2].plot(t, 1e3 * est, lw=0.9, label=f"{r.label} estimate", **st)
     if plotted:
-        # 60 ms is the shipped nominal lead; 120 ms is where the emulated sweep lost a descent.
-        # Drawn on the CAPTURE panel, because that is the number the lead adds to.
-        ax[1].axhline(60.0, color="k", ls=":", lw=1.0, label="nominal lead 60 ms")
+        # The nominal lead, read from whichever run recorded it rather than restated here --
+        # a hardcoded default silently mislabels every run that overrode it. 120 ms is where
+        # the emulated sweep lost a descent. Drawn on the CAPTURE panel, because the lead is
+        # what gets ADDED to the age below it.
+        lead_ms = _nominal_lead_ms(runs)
+        if lead_ms is not None:
+            ax[1].axhline(lead_ms, color="k", ls=":", lw=1.0,
+                          label=f"nominal lead {lead_ms:.0f} ms")
         ax[1].axhline(120.0, color="k", ls="-.", lw=1.0, label="120 ms (descent failed in sim)")
     ax[0].set_ylabel("in-controller [ms]")
     ax[1].set_ylabel("from capture [ms]")

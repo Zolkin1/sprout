@@ -13,7 +13,23 @@
 std_msgs/Header header
 
 uint64 plan_id               # increments once per re-plan; joins to ControllerDebug.fm_plan_id
-uint64 ctrl_step             # tick at which this plan was sampled
+
+# WHEN this plan happened, which needs three numbers rather than one: the generator is asked
+# for a plan BEFORE the boundary that plan is for, and may then arrive AFTER it.
+#   request_ctrl_step  the tick whose exteroception and velocity command CONDITIONED the plan
+#   ctrl_step          the tick that ADOPTED it -- the first tick it drove the robot
+#   lead_ticks         the schedule lead, so request + lead is the boundary it was built FOR
+# On time, ctrl_step == request_ctrl_step + lead_ticks; late, ctrl_step is larger by exactly
+# how late. Only `request_ctrl_step` can be joined against `depth_capture_age` to say how old
+# the image the model actually saw was.
+#
+# `ctrl_step` was documented here as the sample tick and is NOT: it is filled at publish, and
+# publish is triggered by ADOPTION. Reading it as the sample tick understates the age of the
+# exteroception by the entire lead, silently -- it cost a wrong answer once, which is why the
+# other two fields exist rather than being left derivable.
+uint64 ctrl_step
+uint64 request_ctrl_step
+uint32 lead_ticks
 
 # ---- Output -------------------------------------------------------------------------
 # The sampled reference window, flattened [node0(D), node1(D), ...]. This is the raw graph

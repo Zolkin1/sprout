@@ -184,9 +184,10 @@ class GenTrackerPolicy:
         ``fm_lead_ticks`` reproduces the C++ runtime's generator LEAD in this synchronous one.
         The async runtime asks for each plan `lead` ticks before the boundary it is for and
         conditions it on the exteroception and velocity command AS THEY WERE THEN, while this
-        runtime samples both at the boundary. At the shipped ``fm_lead_sec=0.05`` and
-        dt=0.02 that is a 3-tick / 60 ms stale camera -- ~4.5 cm of egomotion at 0.75 m/s,
-        which on a stair edge is a different problem, not a rounding difference. Default 0
+        runtime samples both at the boundary. At the shipped ``fm_lead_sec=0.02`` and
+        dt=0.02 that is a 1-tick / 20 ms stale camera, ~1.5 cm of egomotion at 0.75 m/s; it
+        was 0.05 (3 ticks, 60 ms, ~4.5 cm), which on a stair edge is a different problem
+        rather than a rounding difference, and is why the default moved. Default 0
         (unchanged behaviour); set it to compare the two stacks on equal terms.
         """
         self.tracker_onnx = tracker_onnx

@@ -1340,8 +1340,9 @@ def main() -> None:
                              "many ticks ago, which is what the async stack's early request "
                              "actually sees (its history is NOT stale -- it projects the rows "
                              "it will serve, exactly). 0 = this runner's synchronous "
-                             "behaviour. The C++ default fm_lead_sec=0.05 at dt=0.02 is 3 "
-                             "ticks, so --fm_lead_ticks 3 is the matched comparison.")
+                             "behaviour. The C++ default fm_lead_sec=0.02 at dt=0.02 is 1 "
+                             "tick, so --fm_lead_ticks 1 is the matched comparison; 3 "
+                             "reproduces the old 60 ms default.")
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Where --log writes sim_log.csv + metrics (default: "

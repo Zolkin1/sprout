@@ -39,14 +39,35 @@ control:
       # nowhere else, so a parameter for it would read as a live knob that can never take
       # effect (which is exactly what happened to fm_update_every once already).
       #
-      # 0.05 s is ~3 ticks at dt = 0.02, against a measured generator time of ~16 ms on this
-      # GPU. The margin is deliberate: 16 ms fits a 20 ms period with ~5% to spare on an IDLE
-      # GPU, and the ZED pipeline shares it. Off the control thread the same work has the
-      # whole lead window instead, so contention can cost something without missing a
-      # deadline. Raise it if the controller's 5 s timing line reports a nonzero `late` (or
-      # `dropped`/`skipped`), or if `fm_late_events` climbs in a bag's health figure; it is
-      # clamped to K-1.
-      fm_lead_sec: 0.05
+      # 0.02 s is ONE tick at dt = 0.02 -- the smallest lead PlanScheduler allows, and chosen
+      # that way because the lead is not latency the way inference time is. It is exteroception
+      # STALENESS: the plan is conditioned on the depth image and velocity command as they were
+      # at REQUEST time, so every tick of lead hands the generator a camera 20 ms older. At the
+      # previous 0.05 (3 ticks) the measured staleness of the image each plan was actually
+      # conditioned on was 66 ms mean / 79 ms max, of which 60 ms was the lead alone -- three
+      # times every other delay in the stack combined, and ~4.5 cm of egomotion at 0.75 m/s,
+      # which on a stair edge is a different problem rather than a rounding difference.
+      #
+      # The trade is that it no longer comfortably fits the generator. Measured per-plan
+      # inference on this GPU is med 13.6 ms with p99 16.2 / max 16.6 on an otherwise quiet
+      # box, but a busier run of the same pair reached p99 22.3 / max 22.8 -- so a 20 ms budget
+      # is met most of the time and missed under contention. That is priced in, not avoided: a
+      # late plan does not stall the reference, because the cursor keeps advancing and served
+      # node indices saturate at F-1, which at F=62 clamps ONLY the furthest window offset
+      # (the 1 s lookahead) while the node being tracked stays a real prediction. See
+      # deploy_cpp/include/g1_deploy/plan_scheduler.h's lateness section, and
+      # plan_scheduler_test.cc's OneTickOfLeadRepeatsOnlyTheFurthestOffsetWhenAPlanSlips.
+      #
+      # So a nonzero `fm_late_events` is now EXPECTED here rather than a fault, and raising
+      # this is the wrong first response: it trades a repeated far-horizon sample for 20 ms
+      # more blindness. Widen the generator's horizon F instead (retrain with --ref_future_len
+      # / --future_len above max_offset + K) and one-tick lateness costs nothing at all. It is
+      # clamped to [1, K-1].
+      #
+      # This value WINS over the C++ declared default, which is also 0.02. The lead a run
+      # actually used is in the bag as FmPlan.lead_ticks -- read it there rather than assuming
+      # this file was in effect, which is a mistake already made once.
+      fm_lead_sec: 0.02
 
       # The generator on its own thread. false runs it inline, which is what the tests and the
       # benchmark do and which is useful for isolating a threading question from a policy one

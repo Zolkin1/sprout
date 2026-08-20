@@ -25,7 +25,10 @@ ScheduleConfig LiveConfig(int lead = 3) {
   cfg.replan_period = kK;
   cfg.horizon = kF;
   cfg.max_offset = kMaxOffset;
-  cfg.lead_ticks = lead;  // 50 ms of lead at dt = 0.02 rounds to 3 ticks
+  // Defaults to 3, which is NOT the shipped lead (one tick) but the more general case: a
+  // multi-tick lead is still legal, and every property here is lead-independent. The shipped
+  // configuration gets its own test below.
+  cfg.lead_ticks = lead;
   return cfg;
 }
 
@@ -166,6 +169,41 @@ TEST(PlanScheduler, LateGeneratorAdvancesTheCursorAndSaturatesTheFarOffsets) {
   EXPECT_EQ(far_idx, kF - 1) << "the far end must repeat the last node";
   EXPECT_LT(near_idx, kF - 1) << "the near end must still be advancing";
   EXPECT_GT(h.sched.offsets_clamped(), 0u) << "saturation must be counted, not silent";
+}
+
+/// The SHIPPED configuration: one tick of lead, and a generator that misses it ~6% of runs.
+///
+/// `fm_lead_sec = 0.02` buys 40 ms less exteroception staleness in exchange for the occasional
+/// late plan, so the degradation that trade actually costs is pinned here rather than left to
+/// be discovered on a robot. The claim being pinned is narrow and worth stating exactly: at
+/// one tick late the ONLY offset that repeats is the furthest, because F == max_offset + K.
+TEST(PlanScheduler, OneTickOfLeadRepeatsOnlyTheFurthestOffsetWhenAPlanSlips) {
+  Harness h(LiveConfig(/*lead=*/1));
+  for (int i = 0; i < kK; ++i) h.Tick();
+  ASSERT_EQ(h.sched.late_events(), 0u);
+  ASSERT_EQ(h.sched.offsets_clamped(), 0u);
+
+  // The generator overruns its 20 ms budget, so no plan exists for this boundary.
+  h.Tick(/*deliver=*/false);
+  ASSERT_EQ(h.outcomes.back(), TickOutcome::kLate);
+  EXPECT_EQ(h.sched.cursor(), kK) << "the cursor advances; the reference must not stall";
+
+  // Walk out from the tracked node. Everything up to and including offset max-1 resolves to a
+  // real node of the live plan -- checked through the CLAMP COUNTER, since offset max-1 lands
+  // exactly on the last node and so is indistinguishable from a clamp by its return value.
+  EXPECT_EQ(h.sched.NodeIndex(0), kK) << "the node being tracked is a genuine prediction";
+  EXPECT_EQ(h.sched.offsets_clamped(), 0u);
+  EXPECT_EQ(h.sched.NodeIndex(kMaxOffset - 1), kF - 1);
+  EXPECT_EQ(h.sched.offsets_clamped(), 0u) << "offset max-1 lands ON the last node, unclamped";
+  EXPECT_EQ(h.sched.NodeIndex(kMaxOffset), kF - 1) << "the 1 s lookahead repeats";
+  EXPECT_EQ(h.sched.offsets_clamped(), 1u) << "exactly one offset, and it is counted";
+
+  // One tick later the plan lands and the cadence self-heals to a time-correct cursor.
+  h.Tick();
+  EXPECT_EQ(h.outcomes.back(), TickOutcome::kAdoptedLate);
+  EXPECT_EQ(h.sched.cursor(), 1);
+  EXPECT_FALSE(h.sched.late());
+  EXPECT_EQ(h.sched.late_events(), 1u);
 }
 
 TEST(PlanScheduler, ALatePlanIsAdoptedOnArrivalAtATimeCorrectCursor) {

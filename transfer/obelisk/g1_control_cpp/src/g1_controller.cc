@@ -95,7 +95,19 @@ void G1Controller::DeclareParams() {
   this->declare_parameter<bool>("debug_topics", true);
   // The generator's LEAD, not its cadence. The cadence comes from tracker.onnx metadata and
   // nowhere else -- a parameter for it would read as a live knob that can never take effect.
-  this->declare_parameter<double>("fm_lead_sec", 0.05);
+  //
+  // ONE tick at dt = 0.02, deliberately the smallest lead PlanScheduler allows, because the
+  // lead is not latency the way inference time is -- it is exteroception STALENESS. The plan
+  // is conditioned on the depth image and command as they were at REQUEST time, so every
+  // extra tick of lead hands the generator a camera 20 ms older. It was 0.05 (3 ticks,
+  // 60 ms), which was three times every other delay in the stack put together.
+  //
+  // It does NOT fit the generator, and that is priced in rather than avoided: measured
+  // per-plan inference is med 13.7 / p99 22.3 ms against this 20 ms budget, so ~6% of plans
+  // arrive one tick late (never two -- the worst seen was 22.8 ms). A late plan does not
+  // stall the reference; see plan_scheduler.h's lateness contract. Widen the generator's
+  // horizon F to buy the slack back.
+  this->declare_parameter<double>("fm_lead_sec", 0.02);
   this->declare_parameter<bool>("threaded_fm", true);
   this->declare_parameter<int>("fm_late_disarm_ticks", 0);
   // The kinematic model the camera poses are FK'd on. A parameter and not a constant because
@@ -244,9 +256,10 @@ void G1Controller::LoadPolicy() {
   const auto& p = policy_->params();
   targets_.assign(static_cast<size_t>(p.num_actions), 0.0);
   RCLCPP_INFO(this->get_logger(),
-              "policy ready: num_obs=%d num_actions=%d dt=%.3f K=%d lead=%d ticks",
+              "policy ready: num_obs=%d num_actions=%d dt=%.3f K=%d lead=%d ticks = %.0f ms "
+              "(the generator's budget AND its exteroception staleness -- the same number)",
               p.num_obs, p.num_actions, p.dt, p.fm_update_every.value_or(1),
-              policy_->lead_ticks());
+              policy_->lead_ticks(), policy_->lead_ticks() * p.dt * 1e3);
 
   // The control timer's period must match the policy's dt, or every cadence number here is
   // about a different clock than the one the policy trained on.
@@ -824,6 +837,13 @@ void G1Controller::PublishFmPlan(const g1_deploy::TickDiagnostics& diag) {
     m.header.stamp = this->now();
     m.plan_id = diag.plan_id;
     m.ctrl_step = static_cast<uint64_t>(std::max<int64_t>(diag.ctrl_step, 0));
+    // The tick that CONDITIONED this plan, which is not the tick adopting it. Node j of the
+    // plan is for step target + j, so target == ctrl_step - cursor, and the request went out
+    // lead_ticks before that. Derived from the diagnostics rather than plumbed separately:
+    // both terms come straight from PlanScheduler, so a second path could only disagree.
+    m.lead_ticks = static_cast<uint32_t>(std::max(diag.lead_ticks, 0));
+    m.request_ctrl_step = static_cast<uint64_t>(
+        std::max<int64_t>(diag.ctrl_step - diag.cursor - diag.lead_ticks, 0));
 
     const g1_deploy::FmMeta& fm = policy_->fm_meta();
     m.trajectory = policy_->last_plan_window();
