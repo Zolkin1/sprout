@@ -112,7 +112,10 @@ def main() -> None:
                    help="leave the box tiles solid (they are 100%% solid today only because "
                         "the generator never passes variant_fracs)")
     p.add_argument("--no_walls", action="store_true",
-                   help="skip the visual-only wall pass")
+                   help="skip the wall pass")
+    p.add_argument("--collidable_walls", action="store_true",
+                   help="emit the walls as ordinary collidable terrain rather than the "
+                        "visual-only channel (see DecorateConfig.wall_collidable)")
     p.add_argument("--dry_run", action="store_true",
                    help="report what would change without writing anything")
     args = p.parse_args()
@@ -120,7 +123,8 @@ def main() -> None:
     if os.path.exists(args.out) and not args.dry_run:
         raise FileExistsError(f"{args.out} exists; refusing to overwrite.")
 
-    cfg = DecorateConfig(seed=args.seed, tread_full_frac=args.tread_full_frac)
+    cfg = DecorateConfig(seed=args.seed, tread_full_frac=args.tread_full_frac,
+                         wall_collidable=args.collidable_walls)
     prints = {fp.terrain_id: fp for fp in measure(args.clip, args.max_clips_per_tile)}
 
     with h5py.File(args.clip, "r") as f:
@@ -192,7 +196,7 @@ def main() -> None:
                   f"(median {np.median(bw):.3f}); {n_widened} of {len(box_variants)} "
                   "tiles widened")
 
-        n_wall_boxes, n_wall_tiles = 0, 0
+        n_wall_boxes, n_wall_tiles, wall_sides = 0, 0, {}
         if not args.no_walls:
             for tile in manifest:
                 if tile.get("type") not in ("transition", "box", "terrain"):
@@ -201,12 +205,21 @@ def main() -> None:
                 fp = prints.get(tid)
                 if fp is None:
                     continue
-                n = add_walls(tile, fp, cfg)
-                n_wall_boxes += n
-                n_wall_tiles += n > 0
-            print(f"[decor] walls: {n_wall_boxes} boxes on {n_wall_tiles} tiles "
-                  "(VISUAL ONLY -- cameras see them, the height scan does not, "
-                  "nothing can walk into them)")
+                n_sides, n_boxes = add_walls(tile, fp, cfg)
+                n_wall_boxes += n_boxes
+                n_wall_tiles += n_sides > 0
+                wall_sides[int(tile["terrain_id"])] = n_sides
+            kind = ("COLLIDABLE terrain" if args.collidable_walls else
+                    "VISUAL ONLY -- cameras see them, the height scan does not, "
+                    "nothing can walk into them")
+            hist = {}
+            for n in wall_sides.values():
+                hist[n] = hist.get(n, 0) + 1
+            print(f"[decor] walls: {n_wall_boxes} boxes on {n_wall_tiles} of "
+                  f"{len(manifest)} tiles ({kind})")
+            print("[decor]   WALLS per tile: "
+                  + "  ".join(f"{k}->{v} tiles" for k, v in sorted(hist.items()))
+                  + "   (boxes differ: a windowed wall is up to 4)")
 
         print("\n[decor] validating every rewritten tile against its own foot samples")
         failures = 0
@@ -250,6 +263,7 @@ def main() -> None:
             "arms": {r.terrain_id: r.arm for r in reports.values()},
             "box_variants": box_variants,
             "wall_boxes": n_wall_boxes,
+            "wall_sides": wall_sides,
         })
     print(f"[decor] wrote {args.out}")
 

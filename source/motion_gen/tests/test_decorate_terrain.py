@@ -21,7 +21,7 @@ import numpy as np
 import pytest
 
 from motion_gen.terrain.decorate import (ARMS, DecorateConfig, TREAD_WIDTH_FRAC,
-                                         BOX_VARIANTS, _resize_y, _wall_boxes,
+                                         BOX_VARIANTS, _resize_y, _wall_segments,
                                          add_walls, classify,
                                          classify_overlays, decorate_box_tile,
                                          decorate_transition_tile, has_width_variation,
@@ -315,16 +315,17 @@ def test_not_every_box_tile_is_widened():
 
 def test_a_wall_with_no_window_is_one_box():
     """The common case must not pay for the window machinery."""
-    boxes = _wall_boxes(0.1, 0.2, 0.0, 10.0, 2.0, 0.0, None)
+    boxes = _wall_segments("y", 0.1, 0.2, 0.0, 10.0, 2.0, 0.0, None)
     assert len(boxes) == 1
     assert boxes[0]["size_xyz"] == [10.0, pytest.approx(0.1), 2.0]
-    assert boxes[0]["decor"] is True
     assert boxes[0]["walkable_top"] is False
+    # _wall_segments builds geometry; add_walls decides whether it is decor or collidable.
+    assert "decor" not in boxes[0]
 
 
 def test_a_window_becomes_the_four_boxes_around_it():
     """Neither simulator does CSG, so a hole is the pieces AROUND it."""
-    boxes = _wall_boxes(0.0, 0.1, 0.0, 10.0, 3.0, 0.0, (4.0, 6.0, 1.0, 2.0))
+    boxes = _wall_segments("y", 0.0, 0.1, 0.0, 10.0, 3.0, 0.0, (4.0, 6.0, 1.0, 2.0))
     assert len(boxes) == 4
     # nothing may occupy the hole
     for b in boxes:
@@ -338,7 +339,7 @@ def test_a_window_becomes_the_four_boxes_around_it():
 
 def test_a_window_flush_with_an_edge_drops_the_degenerate_piece():
     """build_overlay raises on a zero extent, so an empty piece must never be emitted."""
-    boxes = _wall_boxes(0.0, 0.1, 0.0, 10.0, 3.0, 0.0, (0.0, 2.0, 0.0, 1.0))
+    boxes = _wall_segments("y", 0.0, 0.1, 0.0, 10.0, 3.0, 0.0, (0.0, 2.0, 0.0, 1.0))
     assert all(b["size_xyz"][0] > 0 and b["size_xyz"][2] > 0 for b in boxes)
     assert len(boxes) == 2, "the before-piece and the under-piece are both degenerate here"
 
@@ -347,27 +348,72 @@ def test_walls_are_marked_decor_and_never_walkable():
     """The three properties all hang off these two fields."""
     tile = _tile(terrain_id=0, size_y=6.0)
     fp = _footprint(0, lo=2.5, hi=3.5)
-    n = add_walls(tile, fp, DecorateConfig(seed=0, wall_frac=1.0))
-    assert n > 0
+    n_sides, n = add_walls(tile, fp, DecorateConfig(seed=0, wall_frac=1.0))
+    assert n > 0 and n_sides > 0
     walls = [o for o in tile["overlays"] if o.get("decor")]
     assert len(walls) == n
     assert all(w["walkable_top"] is False for w in walls)
 
 
-def test_walls_stay_clear_of_the_foot_envelope_and_inside_the_tile():
-    """Outside the envelope so a wall never swallows the motion; inside the tile because
-    IsaacLab's floor spans the CLASS footprint and MuJoCo's spans the tile's own."""
+def test_every_wall_sits_ON_a_tile_edge():
+    """The fix for walls appearing mid-tile.
+
+    An earlier version placed each wall a fixed clearance outside the FOOT ENVELOPE, which
+    is the tile edge only when the motion fills the tile. On a pure-stair tile with 3.8 m of
+    unused width it put the wall through the middle instead. The rule is now the tile's own
+    boundary, and the envelope is only a veto on WHETHER a side is walled.
+    """
     cfg = DecorateConfig(seed=1, wall_frac=1.0)
     for tid in range(40):
         tile = _tile(terrain_id=tid, size_y=6.0)
-        fp = _footprint(tid, lo=2.5, hi=3.5)
-        add_walls(tile, fp, cfg)
+        add_walls(tile, _footprint(tid, lo=2.5, hi=3.5), cfg)
         for w in [o for o in tile["overlays"] if o.get("decor")]:
-            lo, hi = span(w)
-            assert lo >= -1e-9 and hi <= 6.0 + 1e-9, f"wall outside the tile on {tid}"
-            assert hi <= fp.y_min_sized + 1e-9 or lo >= fp.y_max_sized - 1e-9, (
-                f"wall overlaps the foot envelope on tile {tid}"
-            )
+            lo_y, hi_y = span(w)
+            lo_x = w["pos_xy"][0] - w["size_xyz"][0] / 2.0
+            hi_x = w["pos_xy"][0] + w["size_xyz"][0] / 2.0
+            on_edge = (abs(lo_y) < 1e-6 or abs(hi_y - 6.0) < 1e-6
+                       or abs(lo_x) < 1e-6 or abs(hi_x - 20.0) < 1e-6)
+            assert on_edge, f"tile {tid}: wall at y[{lo_y},{hi_y}] x[{lo_x},{hi_x}] is not on an edge"
+            assert lo_y >= -1e-9 and hi_y <= 6.0 + 1e-9, "wall outside the tile in y"
+            assert lo_x >= -1e-9 and hi_x <= 20.0 + 1e-9, "wall outside the tile in x"
+
+
+def test_a_tile_can_get_all_four_walls():
+    """A full room must be reachable, not just a pair of side walls."""
+    cfg = DecorateConfig(seed=0, wall_frac=1.0, wall_window_frac=0.0)
+    tile = _tile(terrain_id=0, size_y=6.0)
+    # motion well clear of every edge, so all four sides qualify
+    roomy = TileFootprint(terrain_id=0, n_clips=1, y_min=2.5, y_max=3.5, x_min=5.0,
+                          x_max=15.0, y_min_sized=2.2, y_max_sized=3.8)
+    n_sides, _ = add_walls(tile, roomy, cfg)
+    assert n_sides == 4, f"expected a full room, got {n_sides} walls"
+
+
+def test_a_side_the_motion_reaches_is_not_walled():
+    """What stops a wall across the mouth of a corridor.
+
+    A transition tile is traversed along +x, so its x-extremes are where the robot enters and
+    leaves; those sides must never be walled however high wall_frac is.
+    """
+    cfg = DecorateConfig(seed=0, wall_frac=1.0, wall_window_frac=0.0)
+    tile = _tile(terrain_id=0, size_y=6.0)
+    corridor = TileFootprint(terrain_id=0, n_clips=1, y_min=2.5, y_max=3.5, x_min=0.0,
+                             x_max=20.0, y_min_sized=2.2, y_max_sized=3.8)
+    add_walls(tile, corridor, cfg)
+    for w in [o for o in tile["overlays"] if o.get("decor")]:
+        assert w["size_xyz"][0] > 1.0, (
+            "an x-edge wall was built across the corridor the motion runs along"
+        )
+
+
+def test_walls_can_be_made_collidable_on_request():
+    """Off by default -- see DecorateConfig.wall_collidable for why -- but not hardwired."""
+    tile = _tile(terrain_id=0, size_y=6.0)
+    add_walls(tile, _footprint(0, lo=2.5, hi=3.5),
+              DecorateConfig(seed=0, wall_frac=1.0, wall_collidable=True))
+    walls = [o for o in tile["overlays"] if o.get("walkable_top") is False]
+    assert walls, "no walls were built"
+    assert all(w.get("decor") is False for w in walls)
 
 
 def test_a_tile_with_no_clear_band_gets_no_wall():
@@ -375,7 +421,7 @@ def test_a_tile_with_no_clear_band_gets_no_wall():
     tile = _tile(terrain_id=0, size_y=4.0)
     tight = TileFootprint(terrain_id=0, n_clips=1, y_min=0.1, y_max=3.9, x_min=0.0,
                           x_max=20.0, y_min_sized=0.0, y_max_sized=4.0)
-    assert add_walls(tile, tight, DecorateConfig(seed=0, wall_frac=1.0)) == 0
+    assert add_walls(tile, tight, DecorateConfig(seed=0, wall_frac=1.0)) == (0, 0)
 
 
 def test_walls_have_their_own_random_stream():
