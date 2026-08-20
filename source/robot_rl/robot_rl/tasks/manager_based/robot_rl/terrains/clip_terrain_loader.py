@@ -596,6 +596,31 @@ def clip_frame_origin(
     ``size_margin``), while each tile's mesh sits at the corner, so centring shifts the clip off its own
     geometry by half the class-vs-tile size difference -- metres for a class whose tiles vary in width.
 
+    TODO(tile-centring): the corner anchoring leaves every tile's content biased to one side of the
+    floor it is rendered on, and the bias is systematic rather than scattered. Measured on
+    ``g1_mb_v5_body_mode11``:
+
+        terrain     geometry y 0.00-5.16 on a  6.29 m floor  ->  gap 0.00 low, 1.13 high
+        transition  geometry y 0.00-3.94 on a  9.35 m floor  ->  gap 0.00 low, 5.41 high
+        box         geometry y 2.16-3.30 on a 10.70 m floor  ->  gap 2.16 low, 7.40 high
+
+    For terrain and transition tiles the offset from the floor centre is on the SAME side for every
+    tile (mean -2.71 m in y, -2.76 in x). It cost nothing while the apron was bare, but the decoration
+    pass now walls the floor edge, so a robot on a transition tile has a wall flush against one side
+    and another 5.4 m away in every episode -- a constant the depth policy can key on. The height scan
+    does not see it (it spans +/-0.5 m); the cameras do.
+
+    The fix is to centre each tile's CONTENT in its footprint, which means shifting the mesh AND the
+    clip by the same offset -- not the clip alone, which is the trap the paragraph above describes.
+    Concretely: a ``tile_clip_y_offset`` beside the existing x one, applied here and followed through
+    ``mdp/events/resets.py``, with the tile mesh shifted to match. Verify with
+    ``view_terrain_viser --traj N``: if the clip and its terrain come apart, the foot-contact dots
+    leave the treads immediately.
+
+    Deliberately deferred (2026-08-19): it changes where every clip sits on every tile for every
+    library, which is the most safety-critical geometry in the stack, and it is unrelated to the
+    decoration work that exposed it. Its own commit, please.
+
     Args:
         cell_corner: ``[N, 3]`` world position of each tile's local (0,0) corner.
         clip_x_offset: ``[N]`` (or scalar) x-shift of the clip within the tile
