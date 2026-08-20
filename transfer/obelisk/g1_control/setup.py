@@ -58,6 +58,7 @@ setup(
             "g1_controller = g1_control.controller:main",
             "g1_estimator = g1_control.estimator:main",
             "fsm_state_echo = g1_control.fsm_state_echo_node:main",
+            "scripted_vel_cmd = g1_control.scripted_vel_cmd_node:main",
             "fm_plan_viz = g1_control.fm_plan_viz_node:main",
             "depth_cloud_viz = g1_control.depth_cloud_viz_node:main",
         ],
