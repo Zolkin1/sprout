@@ -302,9 +302,18 @@ class G1ClfTrackingRewardCfg:
         func=mdp.multiple_undesired_contacts,
         weight=-0.1,
         params={
+            # backpack_contact is here because torso_contact CANNOT cover it: that path
+            # matches torso_link exactly, with no trailing ``/.*``, so the pack -- a child
+            # link -- is invisible to it. The pack's rear face sits at torso-frame
+            # x = -0.2201 against the torso box's -0.0560, so 0.164 m of a 2.64 kg payload
+            # protrudes behind everything else on the robot and a backwards fall reaches it
+            # first. Defining the sensor without listing it here left it reporting to
+            # nothing: no reward reads it, and the six DoneTerm sites read no contact
+            # sensor at all.
             "sensor_cfgs": [SceneEntityCfg("left_thigh_contact",),
                             SceneEntityCfg("right_thigh_contact",),
                             SceneEntityCfg("torso_contact",),
+                            SceneEntityCfg("backpack_contact",),
                             SceneEntityCfg("left_elbow_contact",),
                             SceneEntityCfg("right_elbow_contact",),],
             "threshold": 1.0,
