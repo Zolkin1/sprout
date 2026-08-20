@@ -1586,6 +1586,14 @@ def main() -> None:
         manifest = replay.write(extra_attrs={
             "scene": args.scene, "robot": args.robot_name, "command": args.command,
             "fm_lead_ticks": int(args.fm_lead_ticks), "survived": success,
+            "dt": float(policy.get_dt()),
+            # The POLICY's joint order. Every consumer that compares joints needs it: the
+            # robot's order differs on 27 of the 29, and subtracting one from the other gives
+            # a large, smooth, fictitious error.
+            "joint_names_isaac": list(policy.get_joint_names()),
+            "window_offsets": [int(o) for o in policy.window_offsets],
+            "reference_blocks": [str(b) for b in policy.reference_blocks],
+            "node_dim": int(policy.ctx.D),
         })
         print(f"[INFO] wrote the replay stream to {manifest}")
 

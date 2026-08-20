@@ -469,6 +469,35 @@ ribbon is not a second opinion, and the deploy code carries one kinematics libra
 two -- the same one the C++ controller FKs the cameras with. The IMAGE still installs MuJoCo
 either way, since obelisk's own sim is a MuJoCo sim.
 
+### Comparing an obelisk run against the MuJoCo sim2sim
+
+`plot_utils/compare_stacks.py` puts both stacks on one pair of axes -- statically, or as a
+tick stepper with a shared cursor:
+
+```bash
+# the sim2sim side needs a per-tick recording, which is one flag
+cd ../sim && python gen_tracker_runner.py ... --dump_replay /tmp/sim_run
+cd ../obelisk
+python plot_utils/compare_stacks.py --bag log/bags/<run> --stream /tmp/sim_run
+python plot_utils/compare_stacks.py --bag log/bags/<run> --stream /tmp/sim_run --interactive
+python plot_utils/compare_stacks.py --stream /tmp/a --stream /tmp/b   # sim vs sim
+```
+
+Both sources present the same interface (`bag_run.Run` / `sim_run.SimRun`), so every trace is
+computed once and drawn twice -- a comparison whose halves come from different code compares
+the code as much as the runs. Figures: `command` (the input both were given), `tracking`
+(base error, position and orientation separately), `error_norm` (against the 0.3 m / 0.8 rad
+bounds the policy was TRAINED under), `joints` (with the worst five named per run). The
+stepper's keys match the bag stepper's: LEFT/RIGHT one tick, UP/DOWN ten, PAGEUP/PAGEDOWN a
+hundred, HOME/END the ends.
+
+**Four things must hold or the comparison means nothing**, and each has been got wrong here:
+time is aligned on each run's own ARM instant (a bag's clock starts ~10 s earlier, at launch);
+joints are indexed in the POLICY's order and the names are checked, not assumed (the robot's
+differs on 27 of 29); both stacks must run the same sampler (`zero_noise`, since the C++ RNG is
+not a bit-port of numpy's, so otherwise they differ by the DRAW); and the sim2sim side must be
+headed or headless consistently, because opening the viewer changes its trajectory.
+
 **The green-vs-orange overlay is the highest-value thing on this display.** The served window
 should lie on the plan at `cursor + offsets`. It is drawn by a different route -- lifted onto
 the MEASURED base rather than the plan's stored anchor -- so a systematic divergence between
