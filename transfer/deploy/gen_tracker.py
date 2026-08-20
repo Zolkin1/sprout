@@ -211,6 +211,8 @@ class GenTrackerPolicy:
         #: The last `fm_lead_ticks + 1` ticks' generator inputs, oldest first, so entry 0 is
         #: exactly `fm_lead_ticks` ticks old once full.
         self._lead_buf: deque = deque(maxlen=self.fm_lead_ticks + 1)
+        #: The window the last create_obs served; see last_served_window.
+        self._last_served_window: np.ndarray | None = None
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
         # Set here rather than in _reset_timing, which drains the WINDOW: these are the last
@@ -543,8 +545,13 @@ class GenTrackerPolicy:
         # individual points by up to 6 m -- undoing, one layer later, exactly the range the
         # band was widened to 5.575 to keep. It also restores the invariant this class states
         # elsewhere: the cloud's wall sits where the DEPTH channel says it does, and nowhere
-        # else. build_extero_tokens still sanitises what it is given, which is now already
-        # clamped here and so a no-op on channel 0 and correctly untouched on the rest.
+        # else.
+        #
+        # This clamp alone was NOT enough, and the claim that used to sit here -- that
+        # build_extero_tokens leaves the other channels alone -- was false: it sanitised the
+        # whole flattened row and re-clamped x and y, undoing this one layer later. The
+        # cross-language replay harness found it by diffing the two runtimes' conditioning
+        # (the C++ never had the second clamp). build_extero_tokens is channel-aware now.
         image = sanitize_extero_np(image, self.ctx.extero_source, clip=self.ctx.extero_clip)
         poses = state.get("fm_camera_pose")
         if poses is None:
@@ -1277,6 +1284,38 @@ class GenTrackerPolicy:
             )
         return self._build_obs(state, reference=reference)
 
+    def _stash_window(self, served: np.ndarray) -> np.ndarray:
+        """Remember the window that went into THIS observation, and pass it through.
+
+        The served window is the most diagnostic quantity in the loop and it was previously
+        unrecoverable from outside: it is built inline while the observation is assembled, and
+        recomputing it afterwards would re-run the re-anchoring against a state that has since
+        moved on. A recorder that did that would be comparing its own arithmetic, not the
+        runtime's.
+
+        Args:
+            served: The window vector about to be assembled into the observation.
+
+        Returns:
+            ``served``, unchanged.
+        """
+        self._last_served_window = served
+        return served
+
+    def last_served_window(self) -> np.ndarray:
+        """The reference window the last :meth:`create_obs` actually served.
+
+        Returns:
+            A copy, so a caller stashing it cannot alias the next tick's buffer.
+
+        Raises:
+            RuntimeError: Before any observation has been built -- there is no window yet,
+                and returning zeros would be a plausible wrong answer.
+        """
+        if getattr(self, "_last_served_window", None) is None:
+            raise RuntimeError("no observation has been assembled yet, so no window was served")
+        return np.array(self._last_served_window, dtype=np.float64, copy=True)
+
     def _reference_window(self, window: list[dict], root_pos, root_quat) -> np.ndarray:
         """Pack the reference window, mirroring ``mdp.observations.reference_window``.
 
@@ -1353,8 +1392,9 @@ class GenTrackerPolicy:
             "joint_pos": f64(state["joint_pos"]) - default,
             "joint_vel": f64(state["joint_vel"]),
             "actions": np.asarray(self._trk.action_isaac, dtype=np.float64),
-            "reference_window": (self._fm_reference_window(state) if window is None
-                                 else self._reference_window(window, root_pos, root_quat)),
+            "reference_window": self._stash_window(
+                self._fm_reference_window(state) if window is None
+                else self._reference_window(window, root_pos, root_quat)),
             # The joystick-level command over the same offsets. Deliberately separate from
             # the reference window so it stays clean: at deploy it comes from the joystick
             # or a scripted profile, not the generator. A clip reference supplies each

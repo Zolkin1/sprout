@@ -41,12 +41,10 @@ _TRANSFER = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, _TRANSFER)
 
 from deploy import depth_obs as do  # noqa: E402
+from deploy.fixture_io import MANIFEST_FORMAT, FixtureWriter  # noqa: E402
 from deploy import quat_math_np as qn  # noqa: E402
 from deploy import window_np as wn  # noqa: E402
 
-#: Manifest format version. Bump when the on-disk layout changes so an old C++ reader
-#: refuses a new fixture set instead of misreading it.
-MANIFEST_FORMAT = 1
 
 #: Absolute tolerance per function, and how to compare. Lives HERE, travels in the
 #: manifest, and is read by the C++ side -- one number per function in one place, so the
@@ -109,86 +107,20 @@ TOLERANCES: dict[str, tuple[float, str]] = {
 }
 
 
-class FixtureWriter:
-    """Collects named arrays into blobs plus a manifest.
+class _ParityWriter(FixtureWriter):
+    """A :class:`FixtureWriter` that takes each case's tolerance from :data:`TOLERANCES`.
 
-    Args:
-        out_dir: Directory to write ``manifest.json`` and the ``.bin`` blobs into.
+    The table stays in this file, where the REASON for each number is written down, while the
+    format lives in ``deploy.fixture_io`` with the C++ reader on the other side of it. The
+    KeyError on an unknown ``fn`` is deliberate and preserved: a new comparison must be given
+    an explicit tolerance rather than inheriting a default nobody chose.
     """
 
-    def __init__(self, out_dir: str) -> None:
-        self.out_dir = out_dir
-        self.cases: list[dict[str, Any]] = []
-        os.makedirs(out_dir, exist_ok=True)
-
-    def _blob(self, case: str, role: str, name: str, value: np.ndarray) -> dict[str, Any]:
-        """Write one array and return its manifest entry.
-
-        Args:
-            case: Case name, used in the file name.
-            role: ``"in"`` or ``"out"``.
-            name: Argument or output name.
-            value: The array; cast to float64 unless already integral.
-
-        Returns:
-            The manifest entry describing the blob.
-        """
-        arr = np.ascontiguousarray(value, dtype=np.float64)
-        rel = f"{case}.{role}.{name}.bin"
-        raw = arr.tobytes(order="C")
-        with open(os.path.join(self.out_dir, rel), "wb") as fh:
-            fh.write(raw)
-        return {
-            "name": name,
-            "file": rel,
-            "shape": list(arr.shape),
-            "dtype": "float64",
-            "sha256": hashlib.sha256(raw).hexdigest(),
-        }
-
-    def add(self, case: str, fn: str, inputs: dict[str, np.ndarray],
-            outputs: dict[str, np.ndarray], attrs: dict[str, Any] | None = None) -> None:
-        """Record one function's inputs and the oracle's outputs.
-
-        Args:
-            case: Unique case name.
-            fn: The function under test, as the C++ side names it.
-            inputs: Argument name -> array, in the order the function takes them.
-            outputs: Output name -> array.
-            attrs: Scalar/structural parameters the C++ side needs (block lists, joint
-                counts). Carried verbatim in the manifest.
-
-        Raises:
-            KeyError: If ``fn`` has no entry in :data:`TOLERANCES`. Deliberate -- a new
-                function must be given an explicit tolerance rather than inheriting a
-                default that nobody chose.
-        """
+    def add(self, case: str, fn: str, inputs: dict[str, Any], outputs: dict[str, Any],
+            attrs: dict[str, Any] | None = None) -> None:
+        """Record one case, looking its tolerance up by ``fn``."""
         atol, compare = TOLERANCES[fn]
-        self.cases.append({
-            "case": case,
-            "fn": fn,
-            "atol": atol,
-            "compare": compare,
-            "attrs": attrs or {},
-            "inputs": [self._blob(case, "in", k, v) for k, v in inputs.items()],
-            "outputs": [self._blob(case, "out", k, v) for k, v in outputs.items()],
-        })
-
-    def write_manifest(self, seed: int) -> str:
-        """Write ``manifest.json`` and return its path."""
-        path = os.path.join(self.out_dir, "manifest.json")
-        with open(path, "w") as fh:
-            json.dump({
-                "format": MANIFEST_FORMAT,
-                "generator": "transfer/deploy/tools/dump_parity_fixtures.py",
-                "numpy": np.__version__,
-                "python": platform.python_version(),
-                "platform": f"{platform.system()}-{platform.machine()}",
-                "byteorder": sys.byteorder,
-                "seed": seed,
-                "cases": self.cases,
-            }, fh, indent=2)
-        return path
+        super().add(case, fn, inputs, outputs, atol=atol, compare=compare, attrs=attrs)
 
 
 #: The repo root, off this file's location rather than a count of ".." hops elsewhere.
@@ -595,7 +527,7 @@ def main() -> int:
         return 1
 
     rng = np.random.default_rng(args.seed)
-    w = FixtureWriter(args.out)
+    w = _ParityWriter(args.out, "transfer/deploy/tools/dump_parity_fixtures.py")
     dump_quat_math(w, rng, args.count)
     dump_window(w, rng, args.count)
     dump_depth(w, rng, args.count)

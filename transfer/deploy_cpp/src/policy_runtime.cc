@@ -99,7 +99,14 @@ void PolicyRuntime::Load() {
   // config means the same wall-clock lead if dt ever changes. Clamped to [1, K-1]: a request
   // issued before the previous plan was adopted would overwrite one still in flight.
   lead_ticks_ = static_cast<int>(std::ceil(cfg_.fm_lead_sec / p.dt));
-  lead_ticks_ = std::max(1, std::min(lead_ticks_, k - 1));
+  // The floor is 1 unless a caller explicitly asks for zero: a lead of 0 means the plan is
+  // requested at the instant it is needed, which no real deployment wants. PlanScheduler
+  // handles 0 correctly (ShouldRequest becomes ctrl_step % K == 0, the target is this step,
+  // and BuildRequest projects nothing), which is exactly the synchronous behaviour the python
+  // runtime has -- and the only configuration in which the two runtimes' PLANS can be
+  // compared numerically at all.
+  const int floor_ticks = cfg_.allow_zero_lead ? 0 : 1;
+  lead_ticks_ = std::max(floor_ticks, std::min(lead_ticks_, k - 1));
 
   CoreConfig core_cfg;
   core_cfg.num_joints = fm_->meta().num_joints;
@@ -209,14 +216,21 @@ void PolicyRuntime::BuildValues(const HardwareReadings& readings) {
   values_["joint_pos"] = std::move(jp);
   values_["joint_vel"] = joint_vel_isaac_;
 
-  // The previous tick's RAW network output, which is what the term means.
-  std::vector<double> actions(tracker_->last_action().size());
-  for (size_t i = 0; i < actions.size(); ++i) {
-    actions[i] = static_cast<double>(tracker_->last_action()[i]);
+  // The previous tick's RAW network output, which is what the term means -- unless a replay
+  // supplied it, in which case this tick stops depending on the last one. See
+  // HardwareReadings::forced_prev_action.
+  if (!readings.forced_prev_action.empty()) {
+    values_["actions"] = readings.forced_prev_action;
+  } else {
+    std::vector<double> actions(tracker_->last_action().size());
+    for (size_t i = 0; i < actions.size(); ++i) {
+      actions[i] = static_cast<double>(tracker_->last_action()[i]);
+    }
+    values_["actions"] = std::move(actions);
   }
-  values_["actions"] = std::move(actions);
 
-  values_["reference_window"] = window_;
+  values_["reference_window"] =
+      readings.forced_window.empty() ? window_ : readings.forced_window;
 
   // The joystick-level command over the same offsets. Deliberately separate from the reference
   // window so it stays clean: the generator has no per-step command, so the current one is
@@ -356,6 +370,7 @@ void PolicyRuntime::Step(const HardwareReadings& readings,
       cond.future_cmd[static_cast<size_t>(f) * 3 + 1] = readings.command.y();
       cond.future_cmd[static_cast<size_t>(f) * 3 + 2] = readings.command.z();
     }
+    last_cond_ = cond;  // for the replay harness; see last_conditioning()
     fm_->SetConditioning(cond);
   }
 

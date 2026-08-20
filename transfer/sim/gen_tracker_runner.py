@@ -50,6 +50,8 @@ from deploy.quat_math_np import (  # noqa: E402
     yaw_quat,
 )
 from deploy.fk import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
+from deploy.diagnostics import obs_checksum  # noqa: E402
+from deploy.replay_stream import split_checksum  # noqa: E402
 from deploy.tracker_session import convert_joint_order  # noqa: E402
 from deploy.window_np import window_block_slices  # noqa: E402
 
@@ -136,6 +138,7 @@ class RealtimePacer:
 def build_state(
     robot: Robot, policy: GenTrackerPolicy, command: np.ndarray,
     depth_cams: MujocoDepthCameras | None = None, want_depth_hits: bool = False,
+    want_raw_depth: bool = False,
     fm_depth_cams: MujocoDepthCameras | None = None,
 ) -> dict:
     """Assemble the world-state dict ``GenTrackerPolicy.create_obs`` expects.
@@ -151,6 +154,7 @@ def build_state(
         depth_cams: The TRACKER's depth cameras to cast, or ``None`` when the policy has
             none.
         want_depth_hits: Also collect the depth rays' world hit points (viewer only).
+        want_raw_depth: Also collect pre-normalisation depth in metres (replay dump only).
         fm_depth_cams: The GENERATOR's cameras, when it samples the same lenses on its own
             grid. ``None`` when the two samplings match, in which case the generator reads
             ``state["depth"]`` like it always did.
@@ -274,8 +278,16 @@ def build_state(
     # contract it loaded. Both cameras run at the control rate, so a single cast per step
     # is exact: no staleness to model.
     if depth_cams is not None:
-        if want_depth_hits:
+        # `depth_raw` is METRES along the optical axis, recorded only for --dump_replay: the
+        # C++ runtime is fed raw and normalises internally, and the normalisation clips and
+        # maps misses to a sentinel, so it cannot be inverted after the fact.
+        if want_depth_hits and want_raw_depth:
+            state["depth"], state["depth_hits"], state["depth_raw"] = depth_cams.compute(
+                robot.mj_data, want_hits=True, want_raw=True)
+        elif want_depth_hits:
             state["depth"], state["depth_hits"] = depth_cams.compute(robot.mj_data, want_hits=True)
+        elif want_raw_depth:
+            state["depth"], state["depth_raw"] = depth_cams.compute(robot.mj_data, want_raw=True)
         else:
             state["depth"] = depth_cams.compute(robot.mj_data)
     # A SECOND cast, only when the generator samples the same lenses on a different grid.
@@ -285,6 +297,71 @@ def build_state(
     if fm_depth_cams is not None:
         state["fm_depth"] = fm_depth_cams.compute(robot.mj_data)
     return state
+
+
+def _record_replay_tick(writer, policy, state: dict, obs: np.ndarray,
+                        prev_action: np.ndarray) -> None:
+    """Append one tick's inputs and this runtime's answers to the replay stream.
+
+    Called AFTER get_action, so `obs`, the action and the served window are this tick's, while
+    `prev_action` was captured before the call -- the ordering matters and is the reason this
+    is a function rather than an inline block.
+
+    The camera pose is flattened per camera in CONTRACT order, matching the C++
+    HardwareReadings layout, so the replay tool's mapping is one line per field.
+
+    Args:
+        writer: The :class:`deploy.replay_stream.ReplayWriter`.
+        policy: The live policy, for the served window and the raw action.
+        state: The state dict this tick was built from.
+        obs: The assembled observation.
+        prev_action: The previous tick's raw network output.
+    """
+    poses = state.get("fm_camera_pose") or []
+    cam_pos = np.concatenate([np.asarray(p, dtype=np.float64).ravel() for p, _ in poses]) \
+        if poses else np.zeros(0)
+    cam_rot = np.concatenate([np.asarray(r, dtype=np.float64).ravel() for _, r in poses]) \
+        if poses else np.zeros(0)
+    raw = state.get("depth_raw")
+    writer.append(
+        inputs={
+            "root_pos": state["root_pos"],
+            "base_quat_xyzw": state["root_quat"],
+            "base_ang_vel_b": state["base_ang_vel"],
+            "joint_pos": state["joint_pos"],
+            "joint_vel": state["joint_vel"],
+            "command": state["command"],
+            "depth_raw": None if raw is None else np.asarray(raw, dtype=np.float64).ravel(),
+            "fm_camera_pos": cam_pos,
+            "fm_camera_rot": cam_rot,
+            "height_scan": state.get("height_scan"),
+            "prev_action": prev_action,
+        },
+        outputs={
+            "obs": np.asarray(obs, dtype=np.float64).ravel(),
+            "action": np.asarray(policy._trk.action_isaac, dtype=np.float64).ravel(),
+            "window": policy.last_served_window(),
+            # Split, because a 64-bit digest does not fit a float64 exactly -- see
+            # replay_stream.split_checksum.
+            "obs_checksum_hi": split_checksum(
+                obs_checksum(np.asarray(obs, dtype=np.float32)))[0],
+            "obs_checksum_lo": split_checksum(
+                obs_checksum(np.asarray(obs, dtype=np.float32)))[1],
+            "ctrl_step": float(policy._ctrl_step),
+            # 1.0 on a tick the generator re-inferred. The comparator groups by this: a
+            # divergence confined to re-plan ticks points at the generator, one spread over
+            # every tick points at the observation assembly.
+            "replanned": float(policy._ctrl_step % max(policy.fm_update_every, 1) == 0),
+            "fm_history_null": (float(bool(plan["history_null"]))
+                                if (plan := policy.last_plan()) is not None else -1.0),
+            # The conditioning the LIVE plan came from. Held between re-plans, exactly as the
+            # C++'s last_conditioning() is, so the two line up tick for tick.
+            "fm_extero": (np.zeros(0) if plan is None
+                          else np.asarray(plan["extero_tokens"], dtype=np.float64).ravel()),
+            "fm_future_cmd": (np.zeros(0) if plan is None
+                              else np.asarray(plan["cmd_tokens"], dtype=np.float64).ravel()),
+        },
+    )
 
 
 def load_standing_pose(path: str, isaac_joint_names: list[str],
@@ -501,7 +578,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
         viz_geomgroup: list[int] | None = None, viz_contacts: bool = False,
-        fm_depth_cams: MujocoDepthCameras | None = None) -> bool | None:
+        fm_depth_cams: MujocoDepthCameras | None = None,
+        replay=None) -> bool | None:
     """Run the control loop; return True if the robot did not fall.
 
     Returns ``None`` when the user interrupts with Ctrl-C, which is neither survival nor a
@@ -693,11 +771,20 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             vel_cmd = np.clip(desired, vel_cmd - lim, vel_cmd + lim)
         else:
             vel_cmd = desired
+        # The PREVIOUS tick's raw network output, read before this tick overwrites it. This is
+        # what the `actions` observation term is, and recording it is what lets the C++ side be
+        # driven fully teacher-forced -- otherwise a replay is autoregressive through that one
+        # term and the ticks after the first divergence stop being independent samples.
+        prev_action = (np.asarray(policy._trk.action_isaac, dtype=np.float64).copy()
+                       if replay is not None else None)
         state = build_state(robot, policy, vel_cmd, depth_cams, want_depth_hits=viz,
+                            want_raw_depth=replay is not None,
                             fm_depth_cams=fm_depth_cams)
         obs = policy.create_obs(state)
         action = policy.get_action(obs, robot.joint_names)
         robot.apply_action(action)
+        if replay is not None:
+            _record_replay_tick(replay, policy, state, obs, prev_action)
         return action, state
 
     # ------------------------------------------------------------------
@@ -1232,6 +1319,15 @@ def main() -> None:
                              "fail a robot that merely turned around. This is what catches a "
                              "collapse on an UPPER terrain level, which stays far above the "
                              "scene-minimum height bound.")
+    parser.add_argument("--dump_replay", type=str, default=None, metavar="DIR",
+                        help="Record every tick's INPUTS and this runtime's answers to DIR, as "
+                             "the manifest+blob fixture format the C++ side already reads "
+                             "(deploy/replay_stream.py). Feeding that stream to "
+                             "deploy_cpp's replay tool -- synchronous, single-threaded, zero "
+                             "noise -- is what separates 'the C++ computes something "
+                             "different' from 'the C++ is fed something different'. Costs a "
+                             "second depth return (raw metres) and a few tens of MB per run; "
+                             "the control path is otherwise untouched.")
     parser.add_argument("--fm_lead_ticks", type=int, default=0,
                         help="Emulate the C++ runtime's generator LEAD: condition the "
                              "generator on the exteroception and velocity command from this "
@@ -1333,6 +1429,12 @@ def main() -> None:
         fm_lead_ticks=args.fm_lead_ticks,
     )
     policy.load()
+    replay = None
+    if args.dump_replay:
+        from deploy.replay_stream import ReplayWriter
+        replay = ReplayWriter(args.dump_replay, policy.get_num_actions(),
+                              {"tracker_onnx": tracker_onnx, "fm_onnx": fm_onnx or ""})
+        print(f"[INFO] recording a replay stream to {args.dump_replay}")
     if args.fm_lead_ticks:
         print(f"[INFO] emulating the async runtime's generator lead: the generator sees the "
               f"exteroception and command from {args.fm_lead_ticks} tick(s) ago "
@@ -1465,13 +1567,22 @@ def main() -> None:
                   spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride,
-                  fm_depth_cams=fm_depth_cams)
+                  fm_depth_cams=fm_depth_cams, replay=replay)
     # None = interrupted, which is neither survival nor a fall; saying "Survived: None"
     # would put a non-result into the same line every sweep greps for.
     if success is None:
         print("[INFO] Run INTERRUPTED by the user; artifacts below are partial.")
     else:
         print(f"[INFO] Run finished. Survived: {success}")
+
+    if replay is not None:
+        # Written after the loop, so a run that fell still yields every tick it managed --
+        # those ticks are exactly the interesting ones.
+        manifest = replay.write(extra_attrs={
+            "scene": args.scene, "robot": args.robot_name, "command": args.command,
+            "fm_lead_ticks": int(args.fm_lead_ticks), "survived": success,
+        })
+        print(f"[INFO] wrote the replay stream to {manifest}")
 
     if log_path:
         # Stamp the loop's OWN verdict into sim_meta.yaml before the metrics run.

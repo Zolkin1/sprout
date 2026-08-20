@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import onnxruntime as ort
 
-from .depth_obs import sanitize_extero_np
+from .depth_obs import sanitize_extero_np, sanitize_extero_row_np
 from .scan_obs import parse_extero_spec
 from .tracker_session import make_session
 from .window_np import REFERENCE_WINDOW_BLOCK_NAMES, window_blocks, window_dim
@@ -371,7 +371,11 @@ def build_extero_tokens(ctx: FmContext, values: np.ndarray) -> np.ndarray:
     # Missed rays / bad sensor reads arrive as +/-inf or NaN; the fm.onnx graph folds in
     # the normalization, so a non-finite value here would poison it. The band is
     # per-source: metres for the scan, normalised units for depth.
-    return sanitize_extero_np(flat, ctx.extero_source, clip=ctx.extero_clip)
+    # Channel-aware: the band binds the DEPTH channel only. Sanitising the whole row clamped
+    # the position channels to a depth band -- see sanitize_extero_row_np for what that cost.
+    return sanitize_extero_row_np(flat, ctx.extero_source, ctx.extero_clip,
+                                  max(int(getattr(ctx, "extero_sensor_count", 1) or 1), 1),
+                                  max(int(getattr(ctx, "extero_channels", 1) or 1), 1))
 
 
 def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:

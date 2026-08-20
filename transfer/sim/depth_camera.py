@@ -344,7 +344,7 @@ class MujocoDepthCameras:
             mine.offset_pos = theirs.offset_pos.copy()
             mine.offset_rot = theirs.offset_rot.copy()
 
-    def compute(self, mj_data, want_hits: bool = False):
+    def compute(self, mj_data, want_hits: bool = False, want_raw: bool = False):
         """Cast every camera and return the normalised images (and optionally hit points).
 
         Args:
@@ -352,6 +352,11 @@ class MujocoDepthCameras:
                 ``mj_forward``).
             want_hits: Also return the world-space hit point per pixel. Off by default:
                 the gather that builds it costs ~50 us/step and only the viewer wants it.
+            want_raw: Also return the depth in METRES along the optical axis, before
+                normalisation. This is what the C++ runtime is fed (it normalises
+                internally from raw), so a replay stream recorded for it has to carry the
+                raw reading -- the normalisation clips and maps misses to a sentinel, so it
+                is not invertible.
 
         Returns:
             ``images (T, H*W)``, or ``(images, hit_points_world (T, H*W, 3))`` when
@@ -363,6 +368,8 @@ class MujocoDepthCameras:
         images = np.empty((len(self.cameras), self._num_rays), dtype=np.float64)
         hits = (np.full((len(self.cameras), self._num_rays, 3), np.nan, dtype=np.float64)
                 if want_hits else None)
+        raw = (np.empty((len(self.cameras), self._num_rays), dtype=np.float64)
+               if want_raw else None)
         for i, cam in enumerate(self.cameras):
             pos, rot = cam.pose(mj_data)
             np.matmul(cam.dirs_cam, rot.T, out=cam._dirs_w)
@@ -384,13 +391,31 @@ class MujocoDepthCameras:
             depth_z = np.where(
                 hit, np.minimum(cam._dist * cam.cos_theta, cam.max_distance), cam.max_distance
             )
+            if raw is not None:
+                raw[i] = depth_z
             images[i] = normalize_depth_np(depth_z, **cam.norm)
             cam.hit = hit
             if want_hits:
                 hits[i][hit] = pos + cam._dist[hit, None] * cam._dirs_w[hit]
         if self.noiser is not None:
+            # The noise is applied in NORMALISED units, matching the training term, so the raw
+            # reading is pre-noise by construction. A replay fed the raw and re-normalised in
+            # C++ would therefore be noise-FREE while the python side saw noise -- so the raw
+            # return is only equivalent when no noiser is attached, which is asserted rather
+            # than assumed.
+            if raw is not None:
+                raise ValueError(
+                    "want_raw with a depth noiser attached: the noise is applied after "
+                    "normalisation, so the raw reading does not carry it and a consumer that "
+                    "re-normalises would silently get a different image. Record the "
+                    "normalised images instead, or drop --depth_noise.")
             images = self.noiser(images)
-        return (images, hits) if want_hits else images
+        out = (images,)
+        if want_hits:
+            out += (hits,)
+        if want_raw:
+            out += (raw,)
+        return out[0] if len(out) == 1 else out
 
 
 class DepthNoiserNp:

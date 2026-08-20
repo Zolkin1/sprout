@@ -35,6 +35,7 @@ import mujoco  # noqa: E402
 from deploy.depth_obs import (  # noqa: E402
     denormalize_depth_np,
     invalid_depth_value,
+    normalize_camera_images,
     pinhole_ray_directions,
 )
 
@@ -350,3 +351,41 @@ def test_extrinsics_jitter_does_not_compound(cams):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_raw_depth_renormalises_to_the_same_image(cams, flat_scene):
+    """``want_raw`` must be a faithful pre-image of the normalised reading.
+
+    The replay stream feeds the C++ runtime RAW METRES, because that is what
+    HardwareReadings carries and the C++ normalises internally. If the raw return and the
+    normalised return were not two views of the same cast, every replay comparison would be
+    measuring the recording rather than the runtime -- and it would look like a C++ bug.
+
+    This also checks the two normalisers against each other for free: the MuJoCo-side
+    ``normalize_depth_np`` in depth_camera.py, and ``deploy.depth_obs`` -- which is the port
+    hardware runs. They are separate implementations of one contract.
+    """
+    _model, data = flat_scene
+    images, raw = cams.compute(data, want_raw=True)
+    assert raw.shape == images.shape
+    # Metres along the optical axis, so bounded by the camera's own range.
+    assert np.all(raw > 0.0)
+    assert np.all(raw <= max(c["max_dist"] for c in _spec()) + 1e-9)
+    again = normalize_camera_images(_spec(), [raw[i] for i in range(raw.shape[0])])
+    assert np.allclose(np.asarray(again), images, atol=0.0, rtol=0.0), (
+        "deploy.depth_obs and depth_camera.py disagree on the SAME cast -- the replay stream "
+        "would be feeding the C++ a different image than python scored")
+
+
+def test_want_raw_refuses_to_lie_when_a_noiser_is_attached(flat_scene):
+    """Noise is applied AFTER normalisation, so the raw reading does not carry it.
+
+    Returning it anyway would hand a replay a noise-free image while the python run saw a
+    noisy one: a guaranteed, unexplainable parity failure. Refused instead.
+    """
+    model, data = flat_scene
+    noisy = MujocoDepthCameras(model, _spec())
+    noisy.enable_noise(np.random.default_rng(0))
+    assert noisy.noiser is not None
+    with pytest.raises(ValueError, match="raw"):
+        noisy.compute(data, want_raw=True)

@@ -132,6 +132,18 @@ if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
   target_link_libraries(ort_smoke PRIVATE onnxruntime::onnxruntime)
   target_compile_options(ort_smoke PRIVATE -Wall -Wextra -Wpedantic)
 
+  # The cross-language replay: this runtime over a stream the python one recorded. Links the
+  # FIXTURE READER from test/ deliberately -- the stream IS a fixture set, and a second reader
+  # for one format is how the format drifts.
+  add_executable(replay tools/replay.cc test/fixture.cc)
+  target_include_directories(replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+  target_link_libraries(replay PRIVATE g1_deploy_ort nlohmann_json::nlohmann_json)
+  target_compile_options(replay PRIVATE -Wall -Wextra -Wpedantic)
+  # fixture.cc's DefaultDir() bakes this in. The tool never calls it -- the stream directory is
+  # argv[1] -- but the translation unit still has to compile.
+  target_compile_definitions(replay PRIVATE
+    G1_DEPLOY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/parity")
+
   set(G1_DEPLOY_HAVE_ORT TRUE)
 else()
   # WARNING, not STATUS. What is skipped is four source files -- ort_session, tracker_session,

@@ -56,6 +56,23 @@ struct HardwareReadings {
   //: contract, not a calibration draw -- see DepthCameraSpec::offset_pos.
   std::vector<std::array<double, 3>> fm_camera_pos;
   std::vector<std::array<double, 9>> fm_camera_rot;
+
+  // ---- teacher forcing, for the replay harness (tools/replay.cc) --------------------
+  //
+  // Both empty in normal operation, and the runtime then behaves exactly as before.
+  //
+  // A replay fed only the sensor readings is AUTOREGRESSIVE through two values, however
+  // teacher-forced it looks: the served window is the generator's own output, and the
+  // `actions` observation term is the tracker's own previous output. With either coming from
+  // the runtime, a divergence at tick k makes every later tick a consequence rather than an
+  // independent sample -- so a parity report can only name the first failure, not a rate.
+  //
+  // Supplying both from a recording makes each tick independent, which is what lets the
+  // comparison report a distribution and localise a fault to (say) "only re-plan ticks".
+  //: The reference window to observe, instead of the one this runtime would serve.
+  std::vector<double> forced_window;
+  //: The previous raw action for the `actions` term, instead of tracker_->last_action().
+  std::vector<double> forced_prev_action;
 };
 
 /// How to load the pair.
@@ -72,6 +89,17 @@ struct RuntimeConfig {
   //: Run the generator on its own thread. False runs it inline, which is what the tests and
   //: the benchmark do; on this hardware the threaded path is what meets the control period.
   bool threaded_fm = true;
+  //: Allow fm_lead_sec = 0 to mean "request the plan AT its boundary", the way the
+  //: synchronous python runtime does.
+  //:
+  //: Off by default and deliberately not a tuning knob: the lead exists because the real
+  //: runtime needs a whole window to do ~16 ms of work in, and a robot running with zero lead
+  //: would be asking the generator for a plan it needs this instant. It is here so the replay
+  //: harness can compare the two runtimes' PLANS at all -- with any lead >= 1 the C++
+  //: conditions each plan on exteroception from earlier than python does, so the two are
+  //: different policies and a numeric diff of their plans measures the lead rather than the
+  //: code.
+  bool allow_zero_lead = false;
   //: How long the FIRST tick after arming may block waiting for a plan.
   //:
   //: There is no PD warm-up to hide behind, so the alternative is a tick with no reference at
@@ -152,6 +180,13 @@ class PolicyRuntime {
   /// The live plan (F x D) and the request it came from, for a logger. See GenTrackerCore.
   const std::vector<double>& last_plan_window() const;
   const FmRequest& last_plan_request() const;
+  /// The exteroception and future command the last request was conditioned on.
+  ///
+  /// For the replay harness. The plan is a function of the history, THESE, and the noise, so
+  /// when two runtimes' plans differ and their history and noise agree, this is where the
+  /// difference is -- and it is pure arithmetic on both sides, so it should be exact.
+  const FmConditioning& last_conditioning() const { return last_cond_; }
+
   /// The generator's own metadata: F, D, N, cmd_dim, extero_source. Throws with no fm.onnx.
   const FmMeta& fm_meta() const;
 
@@ -176,6 +211,7 @@ class PolicyRuntime {
   std::vector<double> joint_vel_isaac_;
   std::vector<int> joint_permutation_;         //: robot order -> policy order
   std::vector<std::string> cached_joint_names_;
+  FmConditioning last_cond_;              //: what the last request was conditioned on
 };
 
 }  // namespace g1_deploy
