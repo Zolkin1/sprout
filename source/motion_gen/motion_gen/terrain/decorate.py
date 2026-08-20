@@ -95,6 +95,10 @@ class DecorateConfig:
         wall_window_frac: Probability a wall carries a window hole.
         wall_clearance_m: Gap the motion must have from a tile edge before that edge can
             take a wall.
+        flat_room_standoff_range: How far a flat tile's room walls stand off the motion's
+            own bounding box, per side (m).
+        flat_room_frac: Fraction of flat-tile variants that get a room at all; the rest stay
+            open ground, so the FM still sees unbounded flat.
         wall_collidable: Emit the walls as ordinary collidable terrain instead of the
             visual-only channel. OFF by design: the tracker follows a reference and does not
             plan around obstacles, so a wall the reference's arm sweeps through blocks a
@@ -117,6 +121,8 @@ class DecorateConfig:
     wall_thickness_range: tuple[float, float] = (0.08, 0.20)
     wall_window_frac: float = 0.45
     wall_clearance_m: float = 0.15
+    flat_room_standoff_range: tuple[float, float] = (3.0, 8.0)
+    flat_room_frac: float = 0.75
     wall_collidable: bool = False
 
 
@@ -456,6 +462,72 @@ def add_walls(tile: dict, footprint: TileFootprint, cfg: DecorateConfig,
         added += len(boxes)
         n_sides += 1
     return n_sides, added
+
+
+def make_flat_rooms(n_variants: int, travel_xy: tuple[float, float],
+                    cfg: DecorateConfig) -> list[list[dict]]:
+    """Build room variants for the FLAT tiles. Returns one overlay list per variant.
+
+    Flat tiles are 30% of training and the only place the robot walks on open ground, so they
+    are where "deployed in a room" is actually learned -- and today they are a bare plane out
+    to a 20 m buffer, which gives the far camera nothing at all to look at.
+
+    **Positions are relative to the tile CENTRE, not its corner.** Flat tiles have no manifest
+    entry: the loader synthesises them, and sizes them ``motion travel + 2 * flat_buffer``
+    where ``flat_buffer`` is a RUNTIME argument (2.0 in the function, 20.0 in the importer
+    that training actually uses). So absolute coordinates resolved offline would land in the
+    wrong place the moment that argument moved. Anchoring to the centre and standing off the
+    MOTION's own extent makes a room independent of it.
+
+    Args:
+        n_variants: How many distinct rooms to author. The loader hands them to flat tiles
+            round-robin, which keeps the pooling property -- any flat clip may land on any
+            flat tile -- while still varying what the cameras see.
+        travel_xy: The flat clips' own ``(x, y)`` travel span (m); the room stands off this.
+        cfg: Knobs.
+
+    Returns:
+        One list of overlay dicts per variant, each already marked as decoration. An empty
+        list is a legitimate variant: open ground.
+    """
+    tx, ty = float(travel_xy[0]), float(travel_xy[1])
+    out: list[list[dict]] = []
+    for i in range(n_variants):
+        rng = tile_rng(cfg.seed ^ 0xF1A7, i)
+        if rng.random() >= cfg.flat_room_frac:
+            out.append([])
+            continue
+        pad_x = float(rng.uniform(*cfg.flat_room_standoff_range))
+        pad_y = float(rng.uniform(*cfg.flat_room_standoff_range))
+        half_x, half_y = tx / 2.0 + pad_x, ty / 2.0 + pad_y
+        thickness = float(rng.uniform(*cfg.wall_thickness_range))
+        height = float(rng.uniform(*cfg.wall_height_range))
+        overlays: list[dict] = []
+        for axis, sign in (("y", -1.0), ("y", 1.0), ("x", -1.0), ("x", 1.0)):
+            if rng.random() >= cfg.wall_frac:
+                continue
+            if axis == "y":
+                lo_y = sign * half_y - (thickness if sign > 0 else 0.0)
+                hi_y = lo_y + thickness
+                x0, x1 = -half_x, half_x
+            else:
+                lo_y, hi_y = -half_y, half_y
+                x0 = sign * half_x - (thickness if sign > 0 else 0.0)
+                x1 = x0 + thickness
+            length = (x1 - x0) if axis == "y" else (hi_y - lo_y)
+            window = None
+            if rng.random() < cfg.wall_window_frac and length > 3.0:
+                w = float(rng.uniform(1.0, min(3.0, length * 0.3)))
+                centre = float(rng.uniform(w, length - w))
+                z0 = float(rng.uniform(0.6, max(0.7, height - 1.2)))
+                window = (centre - w / 2.0, centre + w / 2.0, z0,
+                          min(z0 + 1.4, height - 0.05))
+            boxes = _wall_segments(axis, lo_y, hi_y, x0, x1, height, 0.0, window)
+            for b in boxes:
+                b["decor"] = not cfg.wall_collidable
+            overlays.extend(boxes)
+        out.append(overlays)
+    return out
 
 
 def decorate_box_tile(tile: dict, cfg: DecorateConfig,

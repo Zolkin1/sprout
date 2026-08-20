@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source",
 
 from motion_gen.terrain.decorate import (ARMS, BOX_VARIANTS,  # noqa: E402
                                          DecorateConfig, add_walls,
-                                         class_footprints,
+                                         class_footprints, make_flat_rooms,
                                          decorate_box_tile,
                                          decorate_transition_tile,
                                          has_width_variation, span)
@@ -114,6 +114,9 @@ def main() -> None:
                         "the generator never passes variant_fracs)")
     p.add_argument("--no_walls", action="store_true",
                    help="skip the wall pass")
+    p.add_argument("--flat_room_variants", type=int, default=12,
+                   help="distinct room layouts authored for the flat tiles, handed out "
+                        "round-robin (flat tiles all share terrain_id -1)")
     p.add_argument("--collidable_walls", action="store_true",
                    help="emit the walls as ordinary collidable terrain rather than the "
                         "visual-only channel (see DecorateConfig.wall_collidable)")
@@ -231,6 +234,28 @@ def main() -> None:
                   + "  ".join(f"{k}->{v} tiles" for k, v in sorted(hist.items()))
                   + "   (boxes differ: a windowed wall is up to 4)")
 
+        flat_rooms = []
+        if not args.no_walls:
+            flat = np.flatnonzero(terrain_id == -1)
+            if len(flat):
+                px = pos_names.index("pelvis_link:pos_x")
+                py = pos_names.index("pelvis_link:pos_y")
+                sample = flat[np.linspace(0, len(flat) - 1,
+                                          min(len(flat), 200)).astype(int)]
+                tx = ty = 0.0
+                for c in sample:
+                    n = int(clip_len[c])
+                    row = f["y_des"][int(c)][:n]
+                    tx = max(tx, float(row[:, px].max() - row[:, px].min()))
+                    ty = max(ty, float(row[:, py].max() - row[:, py].min()))
+                flat_rooms = make_flat_rooms(args.flat_room_variants, (tx, ty), cfg)
+                walled = sum(1 for r in flat_rooms if r)
+                print(f"[decor] flat tiles: {len(flat)} clips travel {tx:.2f} x {ty:.2f} m; "
+                      f"{args.flat_room_variants} room variants, {walled} walled "
+                      f"({sum(len(r) for r in flat_rooms)} boxes), handed out round-robin")
+                print("[decor]   authored about the tile CENTRE -- a flat tile's size is "
+                      "travel + 2*flat_buffer and flat_buffer is a runtime argument")
+
         print("\n[decor] validating every rewritten tile against its own foot samples")
         failures = 0
         for tile in manifest:
@@ -266,6 +291,8 @@ def main() -> None:
     shutil.copy2(args.clip, args.out)
     with h5py.File(args.out, "r+") as f:
         f.attrs["terrain_manifest"] = json.dumps(manifest)
+        if flat_rooms:
+            f.attrs["flat_tile_decor"] = json.dumps(flat_rooms)
         f.attrs["terrain_decoration"] = json.dumps({
             "source": os.path.basename(args.clip),
             "seed": args.seed,

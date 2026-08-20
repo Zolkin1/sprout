@@ -27,6 +27,7 @@ centerline (:func:`clip_frame_origin`).
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 
@@ -276,6 +277,47 @@ def assert_manifest_covers_clips(lib, manifest: list[dict]) -> None:
         )
 
 
+def _flat_decor_overlays(lib, flat_fp: tuple[float, float],
+                         index: int) -> list[OverlayVolumeCfg]:
+    """Room decor for one FLAT tile, or empty.
+
+    Flat tiles are the only class with no manifest entry -- they are synthesised here, all
+    sharing ``terrain_id = -1`` so any flat clip can land on any of them. So their decoration
+    cannot live in ``terrain_manifest``; it comes from a separate ``flat_tile_decor``
+    attribute, a list of room variants handed out round-robin by tile index. That keeps the
+    pooling property while still varying what the cameras see.
+
+    The variants are authored relative to the tile CENTRE, because a flat tile's size is
+    ``motion travel + 2 * flat_buffer`` and ``flat_buffer`` is a runtime argument -- 2.0 here,
+    20.0 in ``ClipTerrainImporterCfg``. Absolute coordinates resolved offline would land in
+    the wrong place the moment it moved. This adds the centre back.
+
+    Args:
+        lib: The loaded clip library.
+        flat_fp: The flat tile footprint, in metres.
+        index: Which flat tile this is, for the round-robin.
+
+    Returns:
+        Overlay configs in the tile's local-corner frame; empty when the library carries no
+        flat decor, which is every library predating it.
+    """
+    raw = lib.attrs.get("flat_tile_decor") if getattr(lib, "attrs", None) else None
+    if not raw:
+        return []
+    variants = json.loads(raw) if isinstance(raw, str) else raw
+    if not variants:
+        return []
+    chosen = variants[index % len(variants)]
+    cx, cy = flat_fp[0] / 2.0, flat_fp[1] / 2.0
+    out: list[OverlayVolumeCfg] = []
+    for ov in chosen:
+        shifted = dict(ov)
+        shifted["pos_xy"] = [float(ov["pos_xy"][0]) + cx, float(ov["pos_xy"][1]) + cy]
+        out.extend(_overlays_from_manifest({"terrain_id": _FLAT_TERRAIN_ID,
+                                            "overlays": [shifted]}))
+    return out
+
+
 def _tile_mesh(
     footprint: tuple[float, float],
     blocks: list[TerrainBlockCfg],
@@ -485,9 +527,10 @@ def assemble_clip_terrain(
         ground = [FlatBlockCfg(size_x=box_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})]
         specs.append((tid, 4, box_fp, ground, 0.0, _overlays_from_manifest(m)))
         clip_size_y[tid], type_code[tid] = float(m["size_y"]), 4
-    for _ in range(n_flat):
+    for _i_flat in range(n_flat):
         specs.append((_FLAT_TERRAIN_ID, 0, flat_fp,
-                      [FlatBlockCfg(size_x=flat_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})], 0.0, []))
+                      [FlatBlockCfg(size_x=flat_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})], 0.0,
+                      _flat_decor_overlays(lib, flat_fp, _i_flat)))
     clip_size_y[_FLAT_TERRAIN_ID], type_code[_FLAT_TERRAIN_ID] = flat_fp[1], 0
 
     # Terrain frame per terrain id (see ClipTerrainLayout.terrain_frame_yaw): AUTHORED in the

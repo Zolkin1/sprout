@@ -22,7 +22,7 @@ import pytest
 
 from motion_gen.terrain.decorate import (ARMS, DecorateConfig, TREAD_WIDTH_FRAC,
                                          BOX_VARIANTS, _resize_y, _wall_segments,
-                                         add_walls, classify,
+                                         add_walls, classify, make_flat_rooms,
                                          classify_overlays, decorate_box_tile,
                                          decorate_transition_tile, has_width_variation,
                                          span, tile_rng)
@@ -431,3 +431,52 @@ def test_walls_have_their_own_random_stream():
     wall = [tile_rng(cfg.seed ^ 0x2A11, t).random() for t in range(10)]
     box = [tile_rng(cfg.seed ^ 0x5EED, t).random() for t in range(10)]
     assert len({tuple(arm), tuple(wall), tuple(box)}) == 3
+
+
+def test_flat_rooms_are_authored_about_the_TILE_CENTRE():
+    """Flat tiles have no manifest entry and no fixed size.
+
+    The loader synthesises them at ``motion travel + 2 * flat_buffer``, and flat_buffer is a
+    RUNTIME argument -- 2.0 in assemble_clip_terrain, 20.0 in ClipTerrainImporterCfg, which is
+    what training uses. Absolute coordinates resolved offline would land somewhere else the
+    moment it changed, so a room is authored around zero and the loader adds the centre.
+    """
+    rooms = make_flat_rooms(12, (18.9, 16.8), DecorateConfig(seed=0, wall_frac=1.0,
+                                                             flat_room_frac=1.0))
+    for room in rooms:
+        xs = [o["pos_xy"][0] for o in room]
+        ys = [o["pos_xy"][1] for o in room]
+        assert min(xs) < 0 < max(xs), "a room should straddle x=0, not start at it"
+        assert min(ys) < 0 < max(ys), "a room should straddle y=0, not start at it"
+
+
+def test_a_flat_room_stands_off_the_motion_it_surrounds():
+    """A wall inside the travel would be a wall the robot walks through."""
+    travel = (18.9, 16.8)
+    cfg = DecorateConfig(seed=2, wall_frac=1.0, flat_room_frac=1.0,
+                         flat_room_standoff_range=(3.0, 8.0))
+    for room in make_flat_rooms(12, travel, cfg):
+        for o in room:
+            far_x = abs(o["pos_xy"][0]) + o["size_xyz"][0] / 2.0
+            far_y = abs(o["pos_xy"][1]) + o["size_xyz"][1] / 2.0
+            assert far_x >= travel[0] / 2.0 or far_y >= travel[1] / 2.0, (
+                f"wall {o} sits entirely inside the {travel} travel box"
+            )
+
+
+def test_some_flat_variants_are_open_ground():
+    """Not every flat tile should be a room, or the FM never sees unbounded flat."""
+    rooms = make_flat_rooms(24, (18.9, 16.8), DecorateConfig(seed=1, flat_room_frac=0.6))
+    assert any(not r for r in rooms) and any(r for r in rooms)
+
+
+def test_flat_rooms_are_decor_by_default():
+    """Same channel as the tile walls; the flag flips both together."""
+    rooms = make_flat_rooms(6, (18.9, 16.8),
+                            DecorateConfig(seed=0, wall_frac=1.0, flat_room_frac=1.0))
+    boxes = [o for r in rooms for o in r]
+    assert boxes and all(o["decor"] is True for o in boxes)
+    solid = make_flat_rooms(6, (18.9, 16.8),
+                            DecorateConfig(seed=0, wall_frac=1.0, flat_room_frac=1.0,
+                                           wall_collidable=True))
+    assert all(o["decor"] is False for r in solid for o in r)
