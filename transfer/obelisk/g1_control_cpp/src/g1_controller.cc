@@ -608,7 +608,13 @@ ControlMsg G1Controller::ComputeControl() {
   g1_deploy::HardwareReadings r;
   r.root_pos = Vec3(est.q_base[0], est.q_base[1], est.q_base[2]);
   r.base_quat_xyzw = quat;
-  r.base_lin_vel_w = Vec3(est.v_base[0], est.v_base[1], est.v_base[2]);
+  // Only the ANGULAR half of v_base reaches the policy. base_ang_vel is an observation term
+  // (root-link frame, straight off the gyro); base LINEAR velocity is not an observation of
+  // any policy this runtime loads, and the generator conditions on its own previous output
+  // rather than on measured velocity -- so the estimator's world-frame linear velocity is
+  // read by nothing here. It is still validated for finiteness below, and still published for
+  // the plotters. Do not reintroduce it as a field "for completeness": a reading nobody
+  // consumes is one more thing that can look wrong.
   r.base_ang_vel_b = Vec3(est.v_base[3], est.v_base[4], est.v_base[5]);
   r.joint_pos = est.joint_pos;
   r.joint_vel = est.joint_vel;

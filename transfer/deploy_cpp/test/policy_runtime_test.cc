@@ -55,7 +55,6 @@ HardwareReadings MakeReadings(const PolicyParams& p, int tick) {
   HardwareReadings r;
   r.root_pos = Vec3(0.01 * tick, 0.0, 0.78);
   r.base_quat_xyzw = QuatXyzw(0.0, 0.0, 0.0, 1.0);
-  r.base_lin_vel_w = Vec3(0.5, 0.0, 0.0);
   r.base_ang_vel_b = Vec3(0.0, 0.0, 0.05);
   r.command = Vec3(0.5, 0.0, 0.0);
 

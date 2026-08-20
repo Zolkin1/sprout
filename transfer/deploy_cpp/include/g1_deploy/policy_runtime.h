@@ -15,7 +15,6 @@
 #include <map>
 #include <memory>
 #include <array>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -32,12 +31,11 @@ namespace g1_deploy {
 struct HardwareReadings {
   Vec3 root_pos = Vec3::Zero();
   QuatXyzw base_quat_xyzw{0.0, 0.0, 0.0, 1.0};
-  Vec3 base_lin_vel_w = Vec3::Zero();
-  //: Body-frame angular velocity, from the IMU. This IS the `base_ang_vel` obs term.
+  //: Angular velocity in the ROOT LINK's frame -- what a gyro measures, and exactly the
+  //: `base_ang_vel` obs term (trained as isaaclab's root_ang_vel_b). It tilts with the torso:
+  //: not gravity-aligned and not heading-aligned, unlike the reference window's base_vel
+  //: block, which is in the anchor's YAW-ALIGNED frame. Two different frames, deliberately.
   Vec3 base_ang_vel_b = Vec3::Zero();
-  //: World-frame angular velocity. Derived as quat_apply(base_quat, base_ang_vel_b) when
-  //: absent -- the estimator does not always publish it, and deriving it is exact.
-  std::optional<Vec3> base_ang_vel_w;
   std::vector<double> joint_pos;   //: in joint_names order
   std::vector<double> joint_vel;
   std::vector<std::string> joint_names;
