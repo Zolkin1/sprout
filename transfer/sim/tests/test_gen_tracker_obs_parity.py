@@ -102,6 +102,16 @@ class _MockCmd:
         self.robot.data.root_quat_w = truth["root_quat"]
         self._t = truth
 
+    def window_anchor(self):
+        """The pose ``base_pose`` is measured against.
+
+        This parity test compares the deploy runtime against the ``"robot_now"`` arm, whose
+        anchor is the measured root -- the same tensors the real command reads. Mirrors
+        ``MotionSequenceCommand.window_anchor``; the mock has to carry it because the real
+        ``reference_window_obs`` is invoked against this object.
+        """
+        return self.robot.data.root_pos_w, self.robot.data.root_quat_w
+
     def resolve_ee_frames(self, frame_names=None):
         """The reference's ee frame names (all of them when ``frame_names`` is None)."""
         return list(frame_names) if frame_names is not None else list(self._ee_frames)

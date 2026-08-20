@@ -4,6 +4,8 @@
 
 from isaaclab.utils import configclass
 
+from robot_rl.flow_matching.window import DEFAULT_WINDOW_ANCHOR
+
 from .base_trajectory_cmd_cfg import BaseTrajectoryCommandCfg
 
 
@@ -110,6 +112,27 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     to nothing (node 0 always coincides with the robot, so the window would encode no
     placement decision -- the very thing the FM predicts).  Keep this at the value the FM
     checkpoint was recorded with; it must match ``fm_update_every`` on the tracker."""
+
+    window_anchor: str = DEFAULT_WINDOW_ANCHOR
+    """Which pose the reference window's ``base_pose`` POSITION is measured from.
+
+    * ``"robot_now"`` (default) -- ``p_ref - p_actual(t)``: the tracking error, measured
+      against the robot as it is this step. What every run before 2026-08-20 trained on.
+    * ``"plan"`` -- ``p_ref - p_plan``: the reference's position in the frame of the last
+      re-plan. A pure function of the reference, so nothing has to know where the robot is.
+
+    **Why "plan" exists: it removes odometry from deployment.** The generator already
+    predicts in the plan frame, so under ``"plan"`` its output IS the observation and the
+    deploy runtime serves it unchanged. Under ``"robot_now"`` the runtime must convert, which
+    means reading the robot's measured world position every control step -- real odometry on
+    hardware. See :data:`robot_rl.flow_matching.window.BASE_POSE_CONVENTIONS`.
+
+    The two are the same width and differ only in meaning, so the choice is stamped into the
+    run's ``params/`` and into ``tracker.onnx``, and refused on mismatch at load.
+
+    **The default must stay ``"robot_now"``**: runs trained before this field existed have no
+    ``window_anchor`` in their saved config, so they resolve to the default, and their
+    recorded convention string has to keep matching."""
 
     # --- Debug visualization (set ``debug_vis = True`` to enable) ---
     debug_vis_horizon_s: float = 3.0

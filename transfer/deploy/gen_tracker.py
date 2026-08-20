@@ -57,6 +57,23 @@ _LEGACY_TERM_CLIP = {"actions": 20.0, "height_scan": 1.0}
 # ``[R_yawT (p_ref - p_act), rot6d(R_yawT R_ref)]``, in the anchor's YAW frame. Worth pinning
 # because neither the yaw-vs-full frame nor the SIGN of the orientation half is visible in the
 # obs shape -- both change the observation's MEANING at identical width.
+#: The conventions this runtime can serve, mapped to the ``window_anchor`` arm each needs.
+#:
+#: Mirror of ``robot_rl.flow_matching.window.BASE_POSE_CONVENTIONS``, inverted: the artifact
+#: states a convention and the runtime picks the arm. Both are served by ONE build, so a
+#: tracker exported from either training arm plays without a rebuild.
+#:
+#: * ``..._ref_minus_actual...`` -> ``"robot_now"``: re-anchor the prediction onto the measured
+#:   root every control step (``reanchor_window``), which needs odometry.
+#: * ``..._ref_minus_plan...``   -> ``"plan"``: serve the prediction as made; no base position
+#:   is read on the generator path at all.
+_BASE_POSE_CONVENTION_ARMS: dict[str, str] = {
+    "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d": "robot_now",
+    "pose_in_plan_yaw_frame_pos_ref_minus_plan_ori_rot6d": "plan",
+}
+
+#: The legacy single-convention name, kept for the error messages and for any caller that
+#: still imports it.
 _BASE_POSE_CONVENTION = "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d"
 
 
@@ -178,6 +195,13 @@ def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None
 
 class GenTrackerPolicy:
     """Drive the RL tracker with the online flow-matching generator (numpy + ORT)."""
+
+    #: Which serve arm to use, overwritten from the artifact's own convention in
+    #: ``_build_window``. Defaulted at CLASS level, not just in ``__init__``, so any object
+    #: that skips construction -- the test doubles in ``transfer/deploy/tests`` do -- still
+    #: gets the LEGACY behaviour rather than an AttributeError, and so that a future field
+    #: reordering cannot leave it briefly unset while ``_serve_nodes`` is reachable.
+    _window_anchor: str = "robot_now"
 
     def __init__(
         self,
@@ -728,14 +752,17 @@ class GenTrackerPolicy:
                 f"{_BASE_POSE_CONVENTION!r}. Re-export from the training run if the policy "
                 "was trained under this runtime's convention; retrain if it was not."
             )
-        if convention != _BASE_POSE_CONVENTION:
+        if convention not in _BASE_POSE_CONVENTION_ARMS:
             raise ValueError(
-                f"tracker.onnx reference_window base_pose_convention is {convention!r}, but "
-                f"this runtime implements {_BASE_POSE_CONVENTION!r}. Tracker and runtime "
-                "disagree about what the observation MEANS, which no shape check can see. "
-                "Re-export if the policy was trained under this runtime's convention; "
-                "retrain if it was not."
+                f"tracker.onnx reference_window base_pose_convention is {convention!r}, which "
+                f"this runtime cannot serve. Known: {sorted(_BASE_POSE_CONVENTION_ARMS)}. "
+                "Tracker and runtime disagree about what the observation MEANS, which no "
+                "shape check can see. Re-export if the policy was trained under a convention "
+                "this runtime knows; retrain if it was not."
             )
+        # Which serve arm this tracker needs. Not a runtime-wide setting: it is a property of
+        # the artifact, so one build plays a tracker from either training arm.
+        self._window_anchor = _BASE_POSE_CONVENTION_ARMS[convention]
 
         # Which BLOCKS the term packs. A teacher can drop blocks it does not need, so this
         # is the tracker's own list rather than the full five, and it is what the clip path
@@ -1007,6 +1034,11 @@ class GenTrackerPolicy:
             ``[len(offsets), D]`` window nodes in the current robot frame.
         """
         idx = self._pred_idx + np.asarray(offsets, dtype=int)
+        if self._window_anchor == "plan":
+            # THE LINE THAT REMOVES ODOMETRY FROM DEPLOY. Under this convention the
+            # observation is the prediction's own frame, so the prediction is served as it
+            # was made and `state["root_pos"]` is never read on the generator path.
+            return self._pred[0, idx]
         return reanchor_window(
             self._pred[0, idx],
             self._anchor_pos[None, :], self._anchor_quat[None, :],

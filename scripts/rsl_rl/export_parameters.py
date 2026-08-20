@@ -11,7 +11,9 @@ import numpy as np
 
 from motion_gen import features as _F
 from motion_gen.robot_asset import fingerprint_robot_asset
-from robot_rl.flow_matching.window import BASE_POSE_CONVENTION
+from robot_rl.flow_matching.window import (BASE_POSE_CONVENTION,
+                                           DEFAULT_WINDOW_ANCHOR,
+                                           base_pose_convention)
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 
@@ -185,7 +187,10 @@ def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
             # policy trained under either convention loads clean against the other and
             # walks sideways. GenTrackerPolicy.load() requires this key and refuses
             # anything it does not know how to reproduce.
-            "base_pose_convention": BASE_POSE_CONVENTION,
+            # From the env cfg, not the module constant: the two window_anchor arms train
+            # concurrently and each artifact must carry its OWN convention.
+            "base_pose_convention": base_pose_convention(
+                getattr(cmd_term.cfg, "window_anchor", None) or DEFAULT_WINDOW_ANCHOR),
         }
 
     cmd_spec = None

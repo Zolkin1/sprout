@@ -95,13 +95,32 @@ class _StubCommand:
     current step is index ``step0``, so offset ``k`` reads ``step0 + k``.
     """
 
+    def window_anchor(self):
+        """The pose the base blocks are measured against.
+
+        Mirrors ``MotionSequenceCommand.window_anchor``, INCLUDING the branch: a stub that
+        always returned the measured root would make ``window_anchor="plan"`` look inert and
+        quietly pass any test comparing the two arms. Every expectation in this file assumes
+        ``"robot_now"``, which is the stub's default cfg.
+
+        Returns TORCH tensors, like the real one: the stub stores the root as warp arrays (as
+        the articulation does) and the caller indexes the result with ``[:, None, :]``, which
+        warp does not support.
+        """
+        if getattr(self.cfg, "window_anchor", "robot_now") == "plan":
+            return self._plan_anchor_pos, self._plan_anchor_quat
+        return (wp.to_torch(self.robot.data.root_pos_w),
+                wp.to_torch(self.robot.data.root_quat_w))
+
     def __init__(self, seed: int = 0) -> None:
         """Build a random but self-consistent reference trajectory."""
         torch.manual_seed(seed)
         self.device = "cpu"
         self.num_envs = N_ENVS
         self._step0 = torch.arange(N_ENVS) * 2  # different phase per env
-        self.cfg = SimpleNamespace(base_frame_name=BASE)
+        # ``window_anchor="robot_now"`` -- this file's expectations are written against the
+        # base blocks being relative to the MEASURED root, which is that arm.
+        self.cfg = SimpleNamespace(base_frame_name=BASE, window_anchor="robot_now")
         self.manager = SimpleNamespace(dt=0.02, num_steps=T)
 
         self.base_pos = torch.randn(N_ENVS, T, 3)
@@ -125,6 +144,12 @@ class _StubCommand:
                 joint_names=joint_names,
             ),
         )
+
+        # The plan anchor, for the ``window_anchor="plan"`` arm. Seeded ON the measured root,
+        # so an unmodified stub gives the two arms identical output -- a caller that wants
+        # them to differ has to move it, which is what makes the difference explicit.
+        self._plan_anchor_pos = wp.to_torch(self.robot.data.root_pos_w).clone()
+        self._plan_anchor_quat = wp.to_torch(self.robot.data.root_quat_w).clone()
 
         # Clip-output vectors for the current step, in CLIP-OUTPUT order: base pose/ori
         # first, then the ee frames, then the joints (reversed, so output order and robot

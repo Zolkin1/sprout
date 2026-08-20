@@ -127,10 +127,18 @@ def run_conventions(env_cfg: Any = None) -> dict:
     Returns:
         A YAML-serializable dict.
     """
-    from robot_rl.flow_matching.window import BASE_POSE_CONVENTION  # noqa: PLC0415
+    from robot_rl.flow_matching.window import (  # noqa: PLC0415
+        DEFAULT_WINDOW_ANCHOR, base_pose_convention)
 
-    out: dict = {"base_pose_convention": BASE_POSE_CONVENTION}
     traj = getattr(getattr(env_cfg, "commands", None), "traj_ref", None)
+    # Read the convention off the RUN's config, not off a module constant: two arms of the
+    # same branch now train under different ones simultaneously, so a global would stamp
+    # whichever the code happened to default to and hand the other arm a wrong record.
+    # A cfg with no ``window_anchor`` -- every run trained before the field existed -- falls
+    # back to the default, which reproduces the original string exactly.
+    anchor = getattr(traj, "window_anchor", None) or DEFAULT_WINDOW_ANCHOR
+    out: dict = {"base_pose_convention": base_pose_convention(anchor),
+                 "window_anchor": anchor}
     for field in ("fm_snap_every", "ego_anchor_every", "fm_update_every"):
         value = getattr(traj, field, None)
         if value is not None:
@@ -196,7 +204,8 @@ def check_run_conventions(log_dir: str, env_cfg: Any = None) -> None:
             "trained at (git tag pre-yaw-frame is the last full-rotation one), or retrain."
         )
     drift = {k: (got.get(k), v) for k, v in want.items()
-             if k != "base_pose_convention" and got.get(k) is not None and got.get(k) != v}
+             if k not in ("base_pose_convention", "window_anchor")
+             and got.get(k) is not None and got.get(k) != v}
     if drift:
         print("[WARN] re-plan cadences differ from the trained run (trained -> now): "
               + ", ".join(f"{k} {a} -> {b}" for k, (a, b) in drift.items())

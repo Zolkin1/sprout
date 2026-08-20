@@ -108,6 +108,64 @@ from .transforms import matrix_to_rot6d, quat_to_rot6d, rot6d_to_matrix, rot6d_t
 #: other and walks sideways. Bump it in the same commit as the maths.
 BASE_POSE_CONVENTION = "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d"
 
+#: Which pose the ``base_pose`` block's POSITION is measured from, per ``window_anchor``.
+#:
+#: Two conventions, identical in width and in every other block:
+#:
+#: * ``"robot_now"`` -- position is ``p_ref - p_actual(t)``, the robot as it is THIS step. A
+#:   feedback term: it is the tracking error, and it is what every run before 2026-08-20 was
+#:   trained on.
+#: * ``"plan"`` -- position is ``p_ref - p_plan``, measured from the robot's pose at the last
+#:   re-plan. A feedforward term: where the reference wants to be relative to where the plan
+#:   was made, which is a pure function of the reference.
+#:
+#: **The point of "plan" is that it removes odometry from the deploy path.** The generator
+#: already predicts in the plan frame -- ``dataset.py`` anchors both its conditioning history
+#: and its target on the measured root at the snap -- so under ``"plan"`` its output IS the
+#: observation and ``gen_tracker._serve_nodes`` gathers it directly. Under ``"robot_now"`` the
+#: runtime has to convert, and the only way to do that is to read the robot's measured world
+#: position every control step (``reanchor_window``), which on hardware means real odometry.
+#:
+#: The generator itself is INVARIANT to the choice: its history feedback is the raw prediction
+#: (``gen_tracker`` stores ``_pred``, never the re-anchored serve), so one ``fm.onnx`` is
+#: correct with a tracker of either convention. What must not be mixed is a TRACKER and the
+#: runtime arm serving it, which is what the stamped string guards.
+BASE_POSE_CONVENTIONS: dict[str, str] = {
+    "robot_now": "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d",
+    "plan": "pose_in_plan_yaw_frame_pos_ref_minus_plan_ori_rot6d",
+}
+
+#: The default, and it must stay ``"robot_now"``.
+#:
+#: Runs trained before the flag existed wrote ``base_pose_convention`` into their ``params/``
+#: from the bare module constant, and ``provenance.check_run_conventions`` refuses a mismatch.
+#: Their saved config carries no ``window_anchor`` field, so it resolves to this default --
+#: which therefore has to reproduce the old string exactly, or those runs stop being
+#: replayable.
+DEFAULT_WINDOW_ANCHOR = "robot_now"
+
+
+def base_pose_convention(window_anchor: str = DEFAULT_WINDOW_ANCHOR) -> str:
+    """The convention string for one ``window_anchor``.
+
+    Args:
+        window_anchor: ``"robot_now"`` or ``"plan"``; see :data:`BASE_POSE_CONVENTIONS`.
+
+    Returns:
+        The stamped convention string.
+
+    Raises:
+        ValueError: On an unknown anchor. Never defaults -- a silent fallback here is a policy
+            that loads clean and steers wrong, which is the failure this string exists for.
+    """
+    try:
+        return BASE_POSE_CONVENTIONS[window_anchor]
+    except KeyError:
+        raise ValueError(
+            f"unknown window_anchor {window_anchor!r}; expected one of "
+            f"{sorted(BASE_POSE_CONVENTIONS)}"
+        ) from None
+
 
 #: Per-block uniform-noise HALF-WIDTHS over one window node, in RAW units.
 #:

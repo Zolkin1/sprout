@@ -73,6 +73,7 @@ from robot_rl.flow_matching.online import (
 from isaaclab.utils.math import quat_apply
 
 from robot_rl.flow_matching.window import (
+    DEFAULT_WINDOW_ANCHOR,
     reanchor_window,
     resolve_reference_blocks,
     window_to_world,
@@ -922,6 +923,22 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._anchor_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids].clone()
         self._pred_valid[ids] = True
 
+    def window_anchor(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The FM command's plan anchor is the pose latched when the plan was drawn.
+
+        Overrides :meth:`MotionSequenceCommand.window_anchor`, whose plan anchor advances on
+        the ``fm_snap_every`` cadence. Here the authority is ``_anchor_pos`` / ``_anchor_quat``
+        -- the pose the CURRENT prediction was made against -- so the observation frame and
+        the prediction frame cannot drift apart even if the two cadences are configured
+        differently.
+
+        Returns:
+            ``([N, 3], [N, 4])`` world position and quaternion (xyzw).
+        """
+        if getattr(self.cfg, "window_anchor", DEFAULT_WINDOW_ANCHOR) == "plan":
+            return self._anchor_pos, self._anchor_quat
+        return super().window_anchor()
+
     def _pred_world(self, offsets: torch.Tensor) -> dict[str, torch.Tensor]:
         """Lift the served nodes at ``offsets`` to the world frame -- SIMULATION ONLY.
 
@@ -1078,6 +1095,13 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "the recording, so re-record with this teacher), or set the term's "
                 "`blocks` to the checkpoint's."
             )
+        if getattr(self.cfg, "window_anchor", DEFAULT_WINDOW_ANCHOR) == "plan":
+            # The prediction is ALREADY in the plan frame -- that is the frame the generator
+            # was trained to emit -- and under this convention the observation is that frame.
+            # So there is nothing to undo: serve the nodes as predicted. This is the whole
+            # odometry saving, and its deploy twin is GenTrackerPolicy._serve_nodes.
+            ar, idx = self._future_indices(offsets)
+            return self._pred[ar, idx]
         return self._reanchor_to_now(offsets)
 
     def get_future_world_base(
