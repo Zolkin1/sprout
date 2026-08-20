@@ -86,6 +86,39 @@ def _common_span(runs) -> tuple[float, float]:
     return float(max(t[0] for t in spans)), float(min(t[-1] for t in spans))
 
 
+def _autoscale_y_to_span(ax, span: tuple[float, float]) -> None:
+    """Rescale y to the data INSIDE ``span``, after x has been trimmed.
+
+    ``set_xlim`` changes the view, not the autoscale: matplotlib keeps sizing y from every
+    point in the artist, so trimming a 14 s run against a 33 s one left the height-error panel
+    spanning -0.6..0.8 for data that never leaves +-0.1 inside the visible window. The
+    interesting signal then occupies a tenth of the axis and looks flat.
+
+    Lines with two points are skipped: those are the axhline/axvline guides, whose x data is in
+    axes coordinates and would mask to nothing.
+
+    Args:
+        ax: The axis, already x-limited.
+        span: ``(lo, hi)`` in the same units as the x data.
+    """
+    lo, hi = span
+    vals = []
+    for line in ax.lines:
+        x = np.asarray(line.get_xdata(), dtype=float)
+        y = np.asarray(line.get_ydata(), dtype=float)
+        if x.size <= 2 or y.size != x.size:
+            continue
+        m = (x >= lo) & (x <= hi) & np.isfinite(y)
+        if m.any():
+            vals.append(y[m])
+    if not vals:
+        return
+    flat = np.concatenate(vals)
+    y0, y1 = float(flat.min()), float(flat.max())
+    pad = max(0.05 * (y1 - y0), 1e-3)
+    ax.set_ylim(y0 - pad, y1 + pad)
+
+
 def _load(bags: list[str], streams: list[str]) -> list:
     """Build the run objects, in the order they were given.
 
@@ -362,6 +395,7 @@ class CompareStepper:
         if self.trim:
             for a in (*self.ax_err, self.ax_trace):
                 a.set_xlim(self.t_min, self.t_max)
+                _autoscale_y_to_span(a, (self.t_min, self.t_max))
         self.fig.suptitle(f"t = {self.t_now:+.3f} s from arm    "
                           "LEFT/RIGHT 1 tick, UP/DOWN 10, PAGEUP/PAGEDOWN 100, HOME/END ends",
                           fontsize="medium")
@@ -428,6 +462,7 @@ def main() -> int:
             a.grid(alpha=0.3)
             if not args.no_trim:
                 a.set_xlim(*span)
+                _autoscale_y_to_span(a, span)
             if a.get_legend_handles_labels()[0]:
                 a.legend(fontsize="x-small", ncol=2)
         fig.tight_layout()
