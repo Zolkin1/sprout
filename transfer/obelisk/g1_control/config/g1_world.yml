@@ -116,9 +116,10 @@ robot:
               pelvis_imu_quat_sensor: framequat
         # ----- Depth camera ----- #
         # Same topic and same message the Jetson ZED node publishes on hardware, so the
-        # controller cannot tell them apart. `dt` and the whole scan_config come from the
-        # policy's exported contract via scripts/rsl_rl/export_sensor_configs.py -- do not
-        # hand-edit config/scan/depth_*.yml, regenerate it.
+        # controller cannot tell them apart. The whole scan_config comes from the policy's
+        # exported contract via scripts/rsl_rl/export_sensor_configs.py -- do not hand-edit
+        # config/scan/depth_*.yml, regenerate it. `dt` is NOT in that contract (a camera
+        # contract states geometry and normalization, not a rate) and is stated here.
         #
         # The path form is `config_path:` rather than an inline `scan_config:` because the
         # file is GENERATED: `include:` merges whole top-level sections and cannot splice a
@@ -132,13 +133,44 @@ robot:
         # The topic names are the convention for a TWO-camera policy; the older single
         # /depth/image_processed predates the pair. The Jetson ZED node must publish on these
         # same names on hardware -- see config/scan/zed_targets.yml for what it has to emit.
+        #
+        # `dt` IS DELIBERATELY NOT THE CONTROL RATE, and is currently 30 Hz. At 50 Hz -- one
+        # frame per tick, from an independent timer in this process -- the two loops drift at
+        # ~1 ms/s and the relative phase wraps every ~20 s, so frame age at the tick that
+        # consumes it is a per-run lottery over the whole 0-20 ms period. Measured across two
+        # runs: one sat at a stable 15 ms, the next sat ON the boundary and alternated between
+        # 0 and 21 ms as jitter tipped each frame to one side. Nothing in a 20 s run averages
+        # that out, and it is not noise a policy trained on fixed-rate Isaac data ever saw.
+        #
+        # Any rate off the control rate fixes that by making the beat fast: age still sweeps,
+        # but through a full cycle in ~100 ms instead of ~20 s, so a run of any length sees
+        # the whole distribution instead of one arbitrary phase. What the rate then decides is
+        # how BAD the top of that sweep is.
+        #
+        #   60 Hz  MEASURED: 60.3 Hz achieved, age mean 8.3 / max 19 ms. Frame period (16.6)
+        #          is under the tick, so every tick gets a fresh frame and none is reused.
+        #   30 Hz  the rate hardware is more likely to sustain, so it is what this should be
+        #          validated at. The HARDER case: 33.3 ms exceeds the 20 ms tick, so ticks
+        #          reuse frames -- over the 100 ms cycle (5 ticks, 3 frames) the ages are
+        #          0, 20, 6.7, 26.7, 13.3, i.e. mean ~13.3 and max ~26.7 ms. Roughly double
+        #          60 Hz, and the generator's total staleness becomes ~27 + the 20 ms lead.
+        #
+        # Read the achieved rate out of the bag rather than trusting this line -- compare_stacks
+        # prints "delivered a frame every N ms" per camera. A value near the 20 ms tick period
+        # means the measurement degenerated, not that the camera is slow; well above the
+        # configured period means the world could not keep up, which at 30 Hz it should
+        # (halving the rate halves the ~600 ms/s the two casts cost at 60 Hz).
+        #
+        # TODO(depth-rate): if 30 Hz is too stale for the descent cases, 60 Hz is the fallback
+        # -- but prefer shrinking the LEAD or widening the generator horizon F first, since
+        # both cost less than a rate the robot may not be able to deliver.
           - topic: /depth/near/image_processed
-            dt: 0.02
+            dt: 0.0333333
             msg_type: DepthImage
             config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/depth_near.yml
             sensor_names: {depth_near_pos_sensor: framepos}
           - topic: /depth/far/image_processed
-            dt: 0.02
+            dt: 0.0333333
             msg_type: DepthImage
             config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/depth_far.yml
             sensor_names: {depth_far_pos_sensor: framepos}
