@@ -44,7 +44,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "source",
 
 from motion_gen.terrain.decorate import (ARMS, BOX_VARIANTS,  # noqa: E402
                                          DecorateConfig, add_walls,
-                                         class_footprints, make_flat_rooms,
+                                         class_footprints, flat_tile_footprint,
+                                         make_flat_rooms,
                                          decorate_box_tile,
                                          decorate_transition_tile,
                                          has_width_variation, span)
@@ -240,21 +241,22 @@ def main() -> None:
             if len(flat):
                 px = pos_names.index("pelvis_link:pos_x")
                 py = pos_names.index("pelvis_link:pos_y")
-                sample = flat[np.linspace(0, len(flat) - 1,
-                                          min(len(flat), 200)).astype(int)]
+                # ALL of them, not a sample: this is a MAXIMUM, and sampling 200 of 3000
+                # under-reported it by 4 m -- which built the room inside the floor.
                 tx = ty = 0.0
-                for c in sample:
+                for c in flat:
                     n = int(clip_len[c])
                     row = f["y_des"][int(c)][:n]
                     tx = max(tx, float(row[:, px].max() - row[:, px].min()))
                     ty = max(ty, float(row[:, py].max() - row[:, py].min()))
                 flat_rooms = make_flat_rooms(args.flat_room_variants, (tx, ty), cfg)
+                ffx, ffy = flat_tile_footprint((tx, ty))
                 walled = sum(1 for r in flat_rooms if r)
-                print(f"[decor] flat tiles: {len(flat)} clips travel {tx:.2f} x {ty:.2f} m; "
-                      f"{args.flat_room_variants} room variants, {walled} walled "
-                      f"({sum(len(r) for r in flat_rooms)} boxes), handed out round-robin")
-                print("[decor]   authored about the tile CENTRE -- a flat tile's size is "
-                      "travel + 2*flat_buffer and flat_buffer is a runtime argument")
+                print(f"[decor] flat tiles: {len(flat)} clips travel {tx:.2f} x {ty:.2f} m "
+                      f"-> floor {ffx:.2f} x {ffy:.2f} m")
+                print(f"[decor]   {args.flat_room_variants} room variants, {walled} walled "
+                      f"({sum(len(r) for r in flat_rooms)} boxes), handed round-robin to the "
+                      "flat tiles at load; walls on the tile EDGE, authored about its centre")
 
         print("\n[decor] validating every rewritten tile against its own foot samples")
         failures = 0

@@ -43,6 +43,8 @@ from .blocks import (
     StairBlockCfg,
     build_overlay,
 )
+from motion_gen.terrain.decorate import DEFAULT_FLAT_BUFFER
+
 from .blocks.base import TerrainBlockCfg
 from .blocks.composite import composite_terrain
 from .trimesh.stair_decor_cfg import StairDecorCfg, StairSideDecorCfg
@@ -288,9 +290,10 @@ def _flat_decor_overlays(lib, flat_fp: tuple[float, float],
     pooling property while still varying what the cameras see.
 
     The variants are authored relative to the tile CENTRE, because a flat tile's size is
-    ``motion travel + 2 * flat_buffer`` and ``flat_buffer`` is a runtime argument -- 2.0 here,
-    20.0 in ``ClipTerrainImporterCfg``. Absolute coordinates resolved offline would land in
-    the wrong place the moment it moved. This adds the centre back.
+    ``motion travel + 2 * flat_buffer`` and ``flat_buffer`` is still an argument -- one shared
+    default now (:data:`DEFAULT_FLAT_BUFFER`), but it used to be two, and the viewers silently
+    got the 2.0 while training got the 20.0. Absolute coordinates resolved offline would land
+    in the wrong place the moment it moved. This adds the centre back.
 
     Args:
         lib: The loaded clip library.
@@ -404,7 +407,7 @@ def assemble_clip_terrain(
     col_gap: float = 1.0,
     row_gap: float = 2.0,
     size_margin: float = 1.0,
-    flat_buffer: float = 2.0,
+    flat_buffer: float = DEFAULT_FLAT_BUFFER,
     transition_back_buffer: float = 1.0,
 ) -> tuple[trimesh.Trimesh, torch.Tensor, ClipTerrainLayout]:
     """Build the whole terrain mesh + env origins from a clip library manifest.
@@ -427,7 +430,10 @@ def assemble_clip_terrain(
         row_gap: Void gap (m) between rows / class blocks along y.
         size_margin: Extra flat (m) added to the terrain / transition footprints.
         flat_buffer: Flat-tile margin (m) on EACH side beyond the flat clips' bbox
-            (so a wandering flat clip doesn't reach the tile edge).
+            (so a wandering flat clip doesn't reach the tile edge). Defaults to the SHARED
+            constant, not a local number: this used to default to 2.0 while
+            ``ClipTerrainImporterCfg`` said 20.0, so every viewer -- which calls this
+            directly -- drew flat tiles 36 m smaller than the ones training built.
         transition_back_buffer: Flat (m) prepended to each transition tile BEHIND
             the robot's start (the clip is shifted forward by this much).
 

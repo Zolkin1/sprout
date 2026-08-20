@@ -95,8 +95,6 @@ class DecorateConfig:
         wall_window_frac: Probability a wall carries a window hole.
         wall_clearance_m: Gap the motion must have from a tile edge before that edge can
             take a wall.
-        flat_room_standoff_range: How far a flat tile's room walls stand off the motion's
-            own bounding box, per side (m).
         flat_room_frac: Fraction of flat-tile variants that get a room at all; the rest stay
             open ground, so the FM still sees unbounded flat.
         wall_collidable: Emit the walls as ordinary collidable terrain instead of the
@@ -121,7 +119,6 @@ class DecorateConfig:
     wall_thickness_range: tuple[float, float] = (0.08, 0.20)
     wall_window_frac: float = 0.45
     wall_clearance_m: float = 0.15
-    flat_room_standoff_range: tuple[float, float] = (3.0, 8.0)
     flat_room_frac: float = 0.75
     wall_collidable: bool = False
 
@@ -268,6 +265,44 @@ def _resize_y(overlay: dict, lo: float, hi: float, *, must_contain: tuple[float,
 #: :func:`class_footprints` for why this duplication exists and what makes it safe.
 DEFAULT_SIZE_MARGIN = 1.0
 DEFAULT_TRANSITION_BACK_BUFFER = 1.0
+
+#: Flat-tile margin, per side, beyond the flat clips' own travel.
+#:
+#: THE one definition. It used to be two: ``assemble_clip_terrain`` defaulted to 2.0 while
+#: ``ClipTerrainImporterCfg`` said 20.0, so the viewers -- which call the function directly --
+#: drew flat tiles 36 m smaller than the ones training built. Nothing noticed until the flat
+#: rooms were sized against the real footprint and promptly hung off the edge of the viewer's
+#: smaller one, which reads as walls overlapping the neighbouring tiles.
+#:
+#: **Known consequence, measured and accepted (2026-08-19).** A flat tile is sized by the
+#: LONGEST flat clip (23.03 x 20.65 m of travel) but every clip is re-centred on it by its own
+#: bbox, and the median clip travels 5.06 m -- so the median clip sits 27.9 m from the nearest
+#: tile-edge wall (p1 23.2, min 23.2). The far camera reaches 11.13 m downrange, so at this
+#: buffer a flat room is NEVER in frame: 0.0% of the 3000 flat clips have a wall within reach
+#: (2.0 m would give 88.9%, 4.0 m gives 30.7%). The rooms are in the manifest and render in
+#: every viewer; they are simply out of sensor range. Zach chose to keep 20.0 rather than
+#: shrink the flat tiles. Walls on the stair and box tiles are unaffected -- those tiles are
+#: metres across, not tens of metres, so their edge walls are in frame throughout.
+DEFAULT_FLAT_BUFFER = 20.0
+
+
+def flat_tile_footprint(travel_xy: tuple[float, float],
+                        flat_buffer: float = DEFAULT_FLAT_BUFFER) -> tuple[float, float]:
+    """The floor a flat tile is rendered at, from the flat clips' travel.
+
+    Flat tiles carry no manifest entry, so unlike every other class their size is not written
+    down anywhere -- it is computed at load from the motion. This mirrors that computation so
+    the decoration pass can place walls on the tile's actual edge.
+
+    Args:
+        travel_xy: Max ``(x, y)`` span of any flat clip's pelvis (m).
+        flat_buffer: Margin per side (m).
+
+    Returns:
+        ``(footprint_x, footprint_y)``.
+    """
+    return (float(travel_xy[0]) + 2.0 * flat_buffer,
+            float(travel_xy[1]) + 2.0 * flat_buffer)
 
 
 def class_footprints(manifest: list[dict], size_margin: float = DEFAULT_SIZE_MARGIN,
@@ -465,41 +500,48 @@ def add_walls(tile: dict, footprint: TileFootprint, cfg: DecorateConfig,
 
 
 def make_flat_rooms(n_variants: int, travel_xy: tuple[float, float],
-                    cfg: DecorateConfig) -> list[list[dict]]:
+                    cfg: DecorateConfig,
+                    flat_buffer: float = DEFAULT_FLAT_BUFFER) -> list[list[dict]]:
     """Build room variants for the FLAT tiles. Returns one overlay list per variant.
 
     Flat tiles are 30% of training and the only place the robot walks on open ground, so they
-    are where "deployed in a room" is actually learned -- and today they are a bare plane out
-    to a 20 m buffer, which gives the far camera nothing at all to look at.
+    are where "deployed in a room" is actually learned -- and undecorated they are a bare
+    plane out to a 20 m buffer, which gives the far camera nothing at all to look at.
 
-    **Positions are relative to the tile CENTRE, not its corner.** Flat tiles have no manifest
-    entry: the loader synthesises them, and sizes them ``motion travel + 2 * flat_buffer``
-    where ``flat_buffer`` is a RUNTIME argument (2.0 in the function, 20.0 in the importer
-    that training actually uses). So absolute coordinates resolved offline would land in the
-    wrong place the moment that argument moved. Anchoring to the centre and standing off the
-    MOTION's own extent makes a room independent of it.
+    **Walls go on the tile EDGE**, the same rule every other tile type follows. An earlier
+    version stood them off the MOTION instead, at 3-8 m, which put a 29 x 31 m room inside a
+    63 x 61 m tile -- 16 m of bare floor outside the walls on every side, so the room read as
+    a fence in a field with the neighbouring tile visible past it.
+
+    At the shipped :data:`DEFAULT_FLAT_BUFFER` those walls are beyond the far camera's reach;
+    see that constant for the measurement and why it stands.
+
+    **Positions are relative to the tile CENTRE.** Flat tiles have no manifest entry: the
+    loader synthesises them and sizes them from the motion, so there is no authored corner to
+    anchor to. The loader adds the centre back.
 
     Args:
         n_variants: How many distinct rooms to author. The loader hands them to flat tiles
             round-robin, which keeps the pooling property -- any flat clip may land on any
             flat tile -- while still varying what the cameras see.
-        travel_xy: The flat clips' own ``(x, y)`` travel span (m); the room stands off this.
+        travel_xy: The flat clips' own ``(x, y)`` travel span (m). Must be the max over ALL
+            flat clips: it is a maximum, so a sample under-reports it (200 of 3000 clips
+            missed 4 m of it) and the room would then be built inside the floor again.
         cfg: Knobs.
+        flat_buffer: Margin per side; see :data:`DEFAULT_FLAT_BUFFER`.
 
     Returns:
         One list of overlay dicts per variant, each already marked as decoration. An empty
         list is a legitimate variant: open ground.
     """
-    tx, ty = float(travel_xy[0]), float(travel_xy[1])
+    fx, fy = flat_tile_footprint(travel_xy, flat_buffer)
+    half_x, half_y = fx / 2.0, fy / 2.0
     out: list[list[dict]] = []
     for i in range(n_variants):
         rng = tile_rng(cfg.seed ^ 0xF1A7, i)
         if rng.random() >= cfg.flat_room_frac:
             out.append([])
             continue
-        pad_x = float(rng.uniform(*cfg.flat_room_standoff_range))
-        pad_y = float(rng.uniform(*cfg.flat_room_standoff_range))
-        half_x, half_y = tx / 2.0 + pad_x, ty / 2.0 + pad_y
         thickness = float(rng.uniform(*cfg.wall_thickness_range))
         height = float(rng.uniform(*cfg.wall_height_range))
         overlays: list[dict] = []
@@ -507,12 +549,12 @@ def make_flat_rooms(n_variants: int, travel_xy: tuple[float, float],
             if rng.random() >= cfg.wall_frac:
                 continue
             if axis == "y":
-                lo_y = sign * half_y - (thickness if sign > 0 else 0.0)
+                lo_y = -half_y if sign < 0 else half_y - thickness
                 hi_y = lo_y + thickness
                 x0, x1 = -half_x, half_x
             else:
                 lo_y, hi_y = -half_y, half_y
-                x0 = sign * half_x - (thickness if sign > 0 else 0.0)
+                x0 = -half_x if sign < 0 else half_x - thickness
                 x1 = x0 + thickness
             length = (x1 - x0) if axis == "y" else (hi_y - lo_y)
             window = None

@@ -22,7 +22,8 @@ import pytest
 
 from motion_gen.terrain.decorate import (ARMS, DecorateConfig, TREAD_WIDTH_FRAC,
                                          BOX_VARIANTS, _resize_y, _wall_segments,
-                                         add_walls, classify, make_flat_rooms,
+                                         add_walls, classify,
+                                         flat_tile_footprint, make_flat_rooms,
                                          classify_overlays, decorate_box_tile,
                                          decorate_transition_tile, has_width_variation,
                                          span, tile_rng)
@@ -450,18 +451,46 @@ def test_flat_rooms_are_authored_about_the_TILE_CENTRE():
         assert min(ys) < 0 < max(ys), "a room should straddle y=0, not start at it"
 
 
-def test_a_flat_room_stands_off_the_motion_it_surrounds():
-    """A wall inside the travel would be a wall the robot walks through."""
-    travel = (18.9, 16.8)
-    cfg = DecorateConfig(seed=2, wall_frac=1.0, flat_room_frac=1.0,
-                         flat_room_standoff_range=(3.0, 8.0))
+def test_a_flat_room_walls_the_TILE_EDGE():
+    """Same rule as every other tile type, and the fix for rooms floating in a field.
+
+    A flat tile's floor is ``travel + 2 * flat_buffer`` = 63 x 61 m. Standing the walls off
+    the MOTION at 3-8 m instead built a 29 x 31 m room inside it, leaving 16 m of bare floor
+    outside the walls on every side -- which reads as a fence with the neighbouring tile
+    visible past it.
+    """
+    travel = (23.03, 20.65)
+    fx, fy = flat_tile_footprint(travel)
+    cfg = DecorateConfig(seed=2, wall_frac=1.0, flat_room_frac=1.0)
     for room in make_flat_rooms(12, travel, cfg):
         for o in room:
-            far_x = abs(o["pos_xy"][0]) + o["size_xyz"][0] / 2.0
-            far_y = abs(o["pos_xy"][1]) + o["size_xyz"][1] / 2.0
-            assert far_x >= travel[0] / 2.0 or far_y >= travel[1] / 2.0, (
-                f"wall {o} sits entirely inside the {travel} travel box"
-            )
+            lo_x = o["pos_xy"][0] - o["size_xyz"][0] / 2.0
+            hi_x = o["pos_xy"][0] + o["size_xyz"][0] / 2.0
+            lo_y = o["pos_xy"][1] - o["size_xyz"][1] / 2.0
+            hi_y = o["pos_xy"][1] + o["size_xyz"][1] / 2.0
+            on_edge = (abs(lo_x + fx / 2) < 1e-6 or abs(hi_x - fx / 2) < 1e-6
+                       or abs(lo_y + fy / 2) < 1e-6 or abs(hi_y - fy / 2) < 1e-6)
+            assert on_edge, f"{o} is not on the {fx:.2f} x {fy:.2f} floor's edge"
+            assert lo_x >= -fx / 2 - 1e-6 and hi_x <= fx / 2 + 1e-6, "outside the floor in x"
+            assert lo_y >= -fy / 2 - 1e-6 and hi_y <= fy / 2 + 1e-6, "outside the floor in y"
+
+
+def test_the_flat_buffer_has_exactly_one_definition():
+    """It used to have two, differing by 18 m, and the viewers silently got the small one."""
+    import inspect
+
+    from motion_gen.terrain.decorate import DEFAULT_FLAT_BUFFER
+    from robot_rl.tasks.manager_based.robot_rl.terrains import clip_terrain_loader as L
+    from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_importer_cfg import (
+        ClipTerrainImporterCfg)
+
+    fn = inspect.signature(L.assemble_clip_terrain).parameters["flat_buffer"].default
+    assert fn == DEFAULT_FLAT_BUFFER, (
+        f"assemble_clip_terrain defaults to {fn} but the shared constant is "
+        f"{DEFAULT_FLAT_BUFFER}; every viewer calls the function directly, so they would "
+        "draw flat tiles at a different size than training builds"
+    )
+    assert ClipTerrainImporterCfg().flat_buffer == DEFAULT_FLAT_BUFFER
 
 
 def test_some_flat_variants_are_open_ground():
