@@ -70,6 +70,10 @@ INPUT_FIELDS = (
     "root_pos",          # (3,)
     "base_quat_xyzw",    # (4,)
     "base_ang_vel_b",    # (3,) root-link frame, what the gyro measures
+    # (3,) WORLD frame. Not a policy input -- no artifact observes base linear velocity
+    # -- but the achieved-velocity comparison against a robot needs it, and the robot
+    # side has it from the estimator.
+    "base_lin_vel_w",
     "joint_pos",         # (nj,) POLICY order
     "joint_vel",         # (nj,)
     "command",           # (3,)

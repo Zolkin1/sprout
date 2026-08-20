@@ -256,8 +256,94 @@ def fig_joints(runs, plt):
     return fig, ax
 
 
-FIGURES = {"command": fig_command, "tracking": fig_tracking,
-           "error_norm": fig_error_norm, "joints": fig_joints}
+def fig_velocity(runs, plt):
+    """Commanded velocity against ACHIEVED, per axis, for both stacks.
+
+    ``fig_command`` shows only what each stack was ASKED for -- the check that the input was
+    the same. This shows whether the robot did it, which is the question a velocity command
+    exists to answer.
+
+    Achieved velocity is body-frame on both sides (``quat_rotate_inv`` of the world linear
+    velocity, and the gyro directly for yaw rate), so the two traces are the same quantity. A
+    run whose stream predates the linear-velocity field reports that rather than plotting
+    zeros, which would read as a robot standing still.
+    """
+    fig, ax = plt.subplots(3, 1, figsize=(11, 7), sharex=True)
+    for r, st in zip(runs, STYLES):
+        t = _aligned_time(r)
+        # Commanded: dashed-thin, so the pair reads as one trace against its target.
+        for i, name in enumerate(("v_x [m/s]", "v_y [m/s]", "w_z [rad/s]")):
+            ax[i].plot(t, r.command[:, i], lw=0.8, alpha=0.55, color=st["color"], ls=":")
+            ax[i].set_ylabel(name)
+        if r.base_lin_b is None:
+            print(f"[compare] {r.label}: no base linear velocity in this run, so only the "
+                  "command is drawn for v_x/v_y (re-dump the stream to get it)")
+        else:
+            ax[0].plot(t, r.base_lin_b[:, 0], lw=1.1, label=f"{r.label} achieved", **st)
+            ax[1].plot(t, r.base_lin_b[:, 1], lw=1.1, label=f"{r.label} achieved", **st)
+        if r.base_ang_b is not None:
+            ax[2].plot(t, r.base_ang_b[:, 2], lw=1.1, label=f"{r.label} achieved", **st)
+    ax[-1].set_xlabel("time from arm [s]")
+    ax[0].set_title("commanded (dotted) vs achieved (solid) base velocity, body frame")
+    return fig, ax
+
+
+def fig_frame_age(runs, plt):
+    """How stale the inputs were when each tick consumed them.
+
+    THE measurement for the lead hypothesis. The generator is asked for a plan `lead` ticks
+    before the boundary it is for and conditioned on the exteroception as it was THEN -- 3
+    ticks, 60 ms, at the shipped ``fm_lead_sec: 0.05``. But that is the NOMINAL figure: camera
+    exposure, transport and callback scheduling add to it, and what the generator actually saw
+    is this.
+
+    The nominal lead is drawn as a reference, and 120 ms with it: that is where a descent
+    stopped surviving in the emulated sweep, so it is the number worth knowing you are under.
+
+    A sim2sim run has no such staleness BY CONSTRUCTION -- both cameras are cast at the
+    control rate inside the same step that consumes them -- so it is annotated rather than
+    plotted as a flat zero, which would look like a measurement.
+    """
+    fig, ax = plt.subplots(2, 1, figsize=(11, 6), sharex=True)
+    plotted = False
+    for r, st in zip(runs, STYLES):
+        t = _aligned_time(r)
+        ticks = getattr(r, "ticks", None)
+        ages = None
+        if ticks and hasattr(ticks[0], "depth_age"):
+            n_cam = max((len(m.depth_age) for m in ticks), default=0)
+            if n_cam:
+                ages = np.full((len(t), n_cam), np.nan)
+                for i, m in enumerate(ticks):
+                    a = np.asarray(m.depth_age, dtype=float)
+                    if a.size == n_cam:
+                        ages[i] = a
+        if ages is None:
+            ax[0].plot([], [], label=f"{r.label}: no depth age (0 by construction)", **st)
+            continue
+        plotted = True
+        for cam in range(ages.shape[1]):
+            ax[0].plot(t, 1e3 * ages[:, cam], lw=0.9,
+                       ls="-" if cam == 0 else "--", color=st["color"],
+                       label=f"{r.label} cam{cam}")
+            print(f"[compare] {r.label} cam{cam} depth age: median "
+                  f"{1e3 * np.nanmedian(ages[:, cam]):.1f} ms, p99 "
+                  f"{1e3 * np.nanpercentile(ages[:, cam], 99):.1f} ms")
+        est = np.array([getattr(m, "est_state_age", np.nan) for m in ticks], dtype=float)
+        ax[1].plot(t, 1e3 * est, lw=0.9, label=f"{r.label} estimate", **st)
+    if plotted:
+        # 60 ms is the shipped nominal lead; 120 ms is where the emulated sweep lost a descent.
+        ax[0].axhline(60.0, color="k", ls=":", lw=1.0, label="nominal lead 60 ms")
+        ax[0].axhline(120.0, color="k", ls="-.", lw=1.0, label="120 ms (descent failed in sim)")
+    ax[0].set_ylabel("depth age [ms]")
+    ax[1].set_ylabel("estimate age [ms]")
+    ax[1].set_xlabel("time from arm [s]")
+    ax[0].set_title("input age at consumption -- what the generator actually saw")
+    return fig, ax
+
+
+FIGURES = {"command": fig_command, "velocity": fig_velocity, "tracking": fig_tracking,
+           "error_norm": fig_error_norm, "joints": fig_joints, "frame_age": fig_frame_age}
 
 
 class CompareStepper:

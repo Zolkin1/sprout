@@ -38,7 +38,7 @@ if _TRANSFER not in sys.path:
 
 from deploy.replay_stream import load as load_stream  # noqa: E402
 
-from bag_run import block_slices, rot6d_to_rpy  # noqa: E402
+from bag_run import block_slices, quat_rotate_inv, rot6d_to_rpy  # noqa: E402
 
 
 class SimRun:
@@ -84,7 +84,12 @@ class SimRun:
         self.command = arrays["command"]
         self.base_quat = arrays["base_quat_xyzw"]
         self.base_ang_b = arrays["base_ang_vel_b"]
-        self.base_lin_b = None
+        # Rotated into the BODY frame with the full quaternion, matching how bag_run derives
+        # the robot's -- otherwise the two "achieved velocity" traces would be in different
+        # frames and their difference would be the tilt. Empty on a stream dumped before the
+        # field existed, which the figures report rather than plot as zeros.
+        self.base_lin_b = (quat_rotate_inv(self.base_quat, arrays["base_lin_vel_w"])
+                           if arrays["base_lin_vel_w"].shape[1] == 3 else None)
         self.latency = None
         self.fm_infer_ms = None
         self.trk_infer_ms = None
