@@ -49,6 +49,11 @@ Options:
                    against a 20 ms period. The C++ one runs it at ~16 ms, on its own
                    thread.
   --cpp            Accepted and ignored: this is now the default.
+  --command NAME   Drive from a scripted velocity profile instead of the joystick sticks
+                   (experiments.velocity_commands -- the same names the sim2sim runner
+                   takes). The joystick still arms the robot; only its velocity command is
+                   relayed away. The profile's clock starts when the controller ARMS.
+  --duration S     Hold zeros after S seconds of profile time (0 = forever).
   --policy FOLDER  Override the controller's hf_policy_folder for this run.
   --rviz           Turn the viz block on: RViz showing the robot in its estimated pose
                    (default_robot_viz + robot_state_publisher + the g1_model URDF), plus
@@ -81,10 +86,18 @@ EOF
 
 ORIG_ARGS=("$@")
 POLICY="" ; BUILD="" ; BAG=1 ; PYTHON_CTRL="" ; RVIZ=""
+VEL_PROFILE="" ; VEL_DURATION=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --cpp)         shift ;;   # the default now; kept so old commands still run
         --python)      PYTHON_CTRL=1; shift ;;
+        # A SCRIPTED velocity profile instead of the joystick's sticks, by name from
+        # transfer/sim/experiments/velocity_commands.py -- the same names the MuJoCo sim2sim
+        # runner's --command takes, from the same file. Lives on the BRAIN side because the
+        # joystick does: its velocity publisher has to be relayed away from /vel_cmd or the
+        # two compete and the controller latches whichever arrived last.
+        --command)     VEL_PROFILE="${2:-}"; shift 2 ;;
+        --duration)    VEL_DURATION="${2:-}"; shift 2 ;;
         --rviz)        RVIZ=1; shift ;;
         --policy)      POLICY="${2:-}"; shift 2 ;;
         --no-bag)      BAG=""; shift ;;
@@ -112,6 +125,9 @@ if [ -n "$PYTHON_CTRL" ]; then
 else
     CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml"
 fi
+# BEFORE --policy and --rviz: each overlay includes the previous by absolute path, so this
+# order is the include chain and all three compose.
+[ -n "$VEL_PROFILE" ] && CTRL_CFG="$(obk_scripted_cmd_config "$CTRL_CFG")"
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
 # After --policy: each overlay includes the previous one by absolute path, so the order here
 # is the include chain and both flags compose.
@@ -130,6 +146,17 @@ if [ -n "$BAG" ]; then
     tmux split-window -h -t "$SESSION":main.0 "$(obk_pane_run bag "$(obk_bag_cmd fm)")"
 else
     tmux split-window -h -t "$SESSION":main.0 "$(obk_pane dbg "$(obk_bag_cmd fm)")"
+fi
+
+# The scripted command, in its own pane so a run can be read afterwards: the profile it used
+# and when its clock started are printed there.
+if [ -n "$VEL_PROFILE" ]; then
+    VEL_CMD="ros2 run g1_control scripted_vel_cmd --ros-args -p profile:=$VEL_PROFILE"
+    # A float literal: `-p duration:=14` is an INTEGER to rclpy against a double default.
+    if [ -n "$VEL_DURATION" ]; then
+        VEL_CMD="$VEL_CMD -p duration:=$(printf '%.3f' "$VEL_DURATION")"
+    fi
+    tmux split-window -v -t "$SESSION":main.1 "$(obk_pane_run vel "$VEL_CMD")"
 fi
 
 # A SECOND window, so --rviz does not disturb the layout of `main`. Only the two marker /

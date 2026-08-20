@@ -88,8 +88,13 @@ class SimRun:
         # the robot's -- otherwise the two "achieved velocity" traces would be in different
         # frames and their difference would be the tilt. Empty on a stream dumped before the
         # field existed, which the figures report rather than plot as zeros.
-        self.base_lin_b = (quat_rotate_inv(self.base_quat, arrays["base_lin_vel_w"])
-                           if arrays["base_lin_vel_w"].shape[1] == 3 else None)
+        # .get, not [...]: a stream dumped before the field existed does not carry the key at
+        # all -- load() returns only what the manifest lists -- so indexing it raised KeyError
+        # and took the whole comparison down rather than costing one trace.
+        lin_w = arrays.get("base_lin_vel_w")
+        self.base_lin_b = (quat_rotate_inv(self.base_quat, lin_w)
+                           if lin_w is not None and lin_w.ndim == 2 and lin_w.shape[1] == 3
+                           else None)
         self.latency = None
         self.fm_infer_ms = None
         self.trk_infer_ms = None

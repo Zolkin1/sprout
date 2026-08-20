@@ -29,6 +29,8 @@ before:
 Usage::
 
     python plot_utils/compare_stacks.py --bag <bag> --stream <replay dir>
+        -> PNGs in <bag>/compare_plots/ (or --save_dir); add --interactive for the stepper
+           instead, which saves nothing
     python plot_utils/compare_stacks.py --bag <bag> --stream <dir> --interactive
     python plot_utils/compare_stacks.py --stream <dir_a> --stream <dir_b>   # sim vs sim
 """
@@ -602,8 +604,19 @@ def main() -> int:
               f"{span[0]:+.2f}..{span[1]:+.2f} s from arm (--no_trim to keep both in full)")
 
     wanted = args.figures.split(",") if args.figures else list(FIGURES)
-    save_dir = args.save_dir or os.path.join(os.getcwd(), "compare_plots")
+    # Next to the BAG by default, matching plot_from_bag's `<bag>/plots` -- a comparison is
+    # about a specific run and belongs with it, and the previous default (the working
+    # directory) dropped PNGs into the repo tree. Falls back to the first stream for a
+    # sim-vs-sim comparison, which has no bag to sit beside.
+    if args.save_dir:
+        save_dir = args.save_dir
+    elif args.bag:
+        b = args.bag[0].rstrip("/")
+        save_dir = os.path.join(b if os.path.isdir(b) else os.path.dirname(b), "compare_plots")
+    else:
+        save_dir = os.path.join(args.stream[0].rstrip("/"), "compare_plots")
     os.makedirs(save_dir, exist_ok=True)
+    print(f"[compare] writing figures to {save_dir}")
     for name in wanted:
         if name not in FIGURES:
             sys.exit(f"[ERROR] unknown figure {name!r}; have {', '.join(FIGURES)}")

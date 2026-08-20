@@ -39,7 +39,6 @@ source "$HERE/lib/obk_launch.sh"
 OBK_SESSION=simworld
 
 ORIG_ARGS=("$@")
-VEL_PROFILE="" ; VEL_DURATION=""
 SCENE="" ; BUILD="" ; AUTO_ARM=1
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -48,8 +47,16 @@ while [ $# -gt 0 ]; do
         # transfer/sim/experiments/velocity_commands.py -- the same names the MuJoCo sim2sim
         # runner's --command takes, from the same file. This is what makes an
         # obelisk-vs-sim2sim comparison an input-for-input one.
-        --command)     VEL_PROFILE="${2:-}"; shift 2 ;;
-        --duration)    VEL_DURATION="${2:-}"; shift 2 ;;
+        # MOVED to run_sim_low.sh. It has to live with the joystick, which is in the BRAIN's
+        # config: launched from here the scripted node published alongside the joystick's own
+        # zeros and the controller latched whichever arrived last, zeroing about a quarter of
+        # the ticks. Refused rather than ignored, because the failure is invisible in a plot
+        # of the command until you look at the raw topic.
+        --command|--duration)
+            echo "run_sim_world.sh: $1 moved to run_sim_low.sh -- the joystick lives in the" >&2
+            echo "  brain config and has to be relayed off /vel_cmd, which only that side" >&2
+            echo "  can do. Use: scripts/run_sim_low.sh --command <profile>" >&2
+            exit 2 ;;
         --no-auto-arm) AUTO_ARM=""; shift ;;
         --build)       BUILD=1; shift ;;
         --build-clean) BUILD=clean; shift ;;
@@ -60,11 +67,8 @@ while [ $# -gt 0 ]; do
             echo "  The MuJoCo world + FSM echo, in tmux session 'simworld'."
             echo "  Launch scripts/run_sim_low.sh (the brain) FIRST -- it needs ~10 s to"
             echo "  load the policy, and the robot free-falls once this comes up."
-            echo "  --command NAME drives from a scripted velocity profile instead of the"
-            echo "                 joystick (experiments.velocity_commands, the same names"
-            echo "                 the sim2sim runner takes). Its clock starts when the"
-            echo "                 controller ARMS, not at launch."
-            echo "  --duration S   hold zeros after S seconds of profile time (0 = forever)."
+            echo "  --command/--duration MOVED to run_sim_low.sh (the joystick is in the"
+            echo "                 brain config, so only that side can relay it off /vel_cmd)."
             echo "  --scene NAME picks transfer/sim/robots/g1/<NAME>.xml; the config"
             echo "  default is the terrain scene. Available:"
             ls "$HERE/../../sim/robots/g1/"*.xml 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/^/    /'
@@ -99,19 +103,5 @@ tmux new-session  -d -s "$SESSION" -n main "$(obk_pane_run world "obk-launch con
 FSM_CMD="ros2 run g1_control fsm_state_echo"
 [ -n "$AUTO_ARM" ] && FSM_CMD="$FSM_CMD --ros-args -p initial_state:=3"
 tmux split-window -h -t "$SESSION":main.0  "$(obk_pane_run fsm "$FSM_CMD")"
-# The scripted command, when asked for. Its own pane so a run can be read afterwards: the
-# profile it used, and when its clock started, are printed there. Launched from the WORLD side
-# because it stands in for the joystick, which lives here -- the brain is unchanged either way,
-# so a scripted run and a driven run put the same controller under test.
-if [ -n "$VEL_PROFILE" ]; then
-    VEL_CMD="ros2 run g1_control scripted_vel_cmd --ros-args -p profile:=$VEL_PROFILE"
-    # Emitted as a FLOAT literal. `-p duration:=14` is an INTEGER to rclpy and the node
-    # declares a double; the node now accepts either, but sending the unambiguous form keeps
-    # the intent visible in the pane's command line.
-    if [ -n "$VEL_DURATION" ]; then
-        VEL_CMD="$VEL_CMD -p duration:=$(printf '%.3f' "$VEL_DURATION")"
-    fi
-    tmux split-window -v -t "$SESSION":main.1  "$(obk_pane_run vel "$VEL_CMD")"
-fi
 tmux select-pane  -t "$SESSION":main.0
 exec tmux attach  -t "$SESSION"
