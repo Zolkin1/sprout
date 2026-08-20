@@ -15,7 +15,8 @@ from scipy.spatial.transform import Rotation
 
 class Robot:
     def __init__(self, robot_name: str, scene_name: str, joystick_scaling: np.ndarray,
-                 input_function: Callable[[float], np.array] = None, use_pd: bool =False, gains: Dict[str, float]=None, rng=None):
+                 input_function: Callable[[float], np.array] = None, use_pd: bool =False, gains: Dict[str, float]=None, rng=None,
+                 fall_height: float = 0.2, fall_tilt_rad: float = np.deg2rad(70.0)):
         """Initialize the robot with its model and data."""
         # ``g1_29j`` is the 29-DOF robot (waist roll/pitch + 6 wrists unlocked); its scenes
         # are ``g1_29j_{basic,terrain}_scene.xml``.
@@ -43,6 +44,15 @@ class Robot:
         self.use_pd = use_pd
         self._policy_gains: tuple | None = None   # set by apply_policy_gains
 
+        # The fall datum. See failed() and terrain_min_surface_z().
+        self.terrain_min_z = self.terrain_min_surface_z()
+        self.fall_height = fall_height
+        self.fall_tilt_rad = fall_tilt_rad
+        print(f"[fall] terrain's lowest surface {self.terrain_min_z:+.3f} m -> pelvis must stay "
+              f"above {self.terrain_min_z + self.fall_height:+.3f} m "
+              f"({self.fall_height:.2f} m of margin), and within "
+              f"{np.rad2deg(self.fall_tilt_rad):.0f} deg of upright in roll and pitch")
+
         if self.input_function is None:
             # Initialize joystick
             pygame.init()
@@ -57,10 +67,17 @@ class Robot:
                 print(f"Using controller: {self.joystick.get_name()}")
 
     def _get_model_data(self):
-        """Create the mj model and data from the given robot."""
+        """Create the mj model and data from the given robot.
+
+        The scene is resolved against THIS FILE's directory, not the working directory. It
+        used to be os.getcwd(), which meant the class only worked when invoked from
+        transfer/sim -- run it from anywhere else and it reported a missing XML at a path that
+        does not exist rather than the one that does. That is the cwd flavour of the hop-counting
+        trap in CLAUDE.md: derive paths from the package, never from where someone happened
+        to stand.
+        """
         file_name = f"{self.robot_name}_{self.scene_name}.xml"
-        relative_path = f"robots/g1/{file_name}"
-        path = os.path.join(os.getcwd(), relative_path)
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "robots", "g1", file_name)
         print(f"Trying to load the xml at {path}")
         mj_model = mujoco.MjModel.from_xml_path(path)
         mj_data = mujoco.MjData(mj_model)
@@ -423,8 +440,108 @@ class Robot:
         """Step the robot simulation."""
         mujoco.mj_step(self.mj_model, self.mj_data)
 
+    def terrain_min_surface_z(self, terrain_group: int = 2) -> float:
+        """World z of the LOWEST terrain surface in the scene.
+
+        The datum :meth:`failed` measures the pelvis against. It exists because the old test
+        was ``qpos[2] < 0.2`` in WORLD coordinates, which silently assumed the ground is at
+        zero: on the descending tiles it is not. ``g1_29j_tile20_scene``'s bottom slab sits at
+        -0.777 m, so a perfectly healthy robot standing on it has a pelvis at ~0.0 and was
+        reported as fallen the moment it arrived. Every stairs-down run was scored as a
+        failure before it began.
+
+        Computed from the model rather than configured per scene, so a new tile needs no
+        entry anywhere. Planes contribute their own height (they are infinite and level in
+        these scenes); everything else contributes the top of its axis-aligned bounding box,
+        which is exact for the axis-aligned boxes the terrain is built from and conservative
+        (never too high) for anything rotated.
+
+        KNOWN LOOSENESS, and it is deliberate. This is ONE datum for the whole scene, so on
+        multi-level terrain the bound is weak: on tile20 it lands at -0.707 m, which a robot
+        collapsing on the UPPER slab (ground 0.0) would never reach -- it would be lying down
+        with the run still going. The tight version is a single downward ray under the pelvis
+        (see compute_height_scan, which already casts exactly this against the same geom
+        group) so that "ground" means the ground the robot is actually over. That was not
+        taken here because a per-step local datum steps discontinuously by one riser as the
+        pelvis crosses a step edge -- 0.13 m on tile20, against a 0.20 m margin -- and
+        deciding what that should do needs a measurement, not a guess. Meanwhile the scene
+        minimum cannot produce a FALSE failure, which is the error that was corrupting runs.
+
+        Args:
+            terrain_group: MuJoCo geom group the terrain is drawn in (2 in every scene here,
+                matching the depth cameras' cast).
+
+        Returns:
+            The lowest top-surface height, or 0.0 if the scene has no terrain geoms (which
+            keeps the historical 0.2 m threshold for a scene that declares no ground).
+        """
+        # Static world geoms: their model pose IS their world pose, so no kinematics call and
+        # nothing in mj_data is touched -- this must not perturb a live simulation.
+        lowest = None
+        for gid in range(self.mj_model.ngeom):
+            if int(self.mj_model.geom_group[gid]) != terrain_group:
+                continue
+            pos_z = float(self.mj_model.geom_pos[gid][2])
+            if int(self.mj_model.geom_type[gid]) == int(mujoco.mjtGeom.mjGEOM_PLANE):
+                top = pos_z
+            else:
+                # geom_aabb is [center(3), half-extent(3)] in the geom's own frame. Taking the
+                # half-extent's z alone assumes the geom is not rotated about x or y, which is
+                # true for every terrain box in these scenes; a rotated geom yields a slightly
+                # LOW top, which errs toward a looser bound rather than a false failure.
+                aabb = self.mj_model.geom_aabb[gid]
+                top = pos_z + float(aabb[2]) + float(aabb[5])
+            lowest = top if lowest is None else min(lowest, top)
+        return 0.0 if lowest is None else lowest
+
+    def tilt_from_upright(self) -> tuple[float, float]:
+        """How far the pelvis leans, as ``(roll, pitch)`` in radians. Yaw-independent.
+
+        Measured from the pelvis's own UP AXIS in world, not from Euler angles: the axis is
+        ``R[:, 2]``, and leaning it toward +x is pitch while leaning it toward +y is roll.
+        Yaw cannot appear in either, because spinning about world z leaves the up axis where
+        it was -- which is the point. A yaw bound would fail a robot that merely turned
+        around, and ``smooth_ramp_running`` turns deliberately.
+
+        Euler extraction is avoided because roll/pitch from a quaternion degenerates near
+        pitch = 90 deg, exactly where a falling robot ends up.
+
+        Returns:
+            ``(|roll|, |pitch|)``, both non-negative, in radians.
+        """
+        w, x, y, z = (float(v) for v in self.mj_data.qpos[3:7])   # MuJoCo stores wxyz
+        # Third column of the rotation matrix: the body's up axis, in world.
+        up_x = 2.0 * (x * z + w * y)
+        up_y = 2.0 * (y * z - w * x)
+        up_z = 1.0 - 2.0 * (x * x + y * y)
+        return float(abs(np.arctan2(up_y, up_z))), float(abs(np.arctan2(up_x, up_z)))
+
     def failed(self):
-        return self.mj_data.qpos[2] < 0.2
+        """True once the robot is down: too low over the terrain, or tipped too far.
+
+        Two independent conditions, because each misses cases the other catches:
+
+        * HEIGHT -- the pelvis within ``fall_height`` of the scene's lowest terrain surface.
+          Terrain-relative, not absolute (see :meth:`terrain_min_surface_z`). On a flat scene
+          the floor plane is at z = 0, so this reduces to the historical ``qpos[2] < 0.2`` and
+          flat results are unchanged. Its weakness is multi-level terrain, where one datum for
+          the whole scene is a loose bound.
+        * TILT -- more than ``fall_tilt_rad`` from upright in roll or pitch. This is what
+          covers the height check's blind spot: a robot that collapses on an UPPER level stays
+          far above the scene minimum, but it cannot do so while upright.
+
+        Roll and pitch are bounded SEPARATELY, as asked, which means the worst case admitted
+        is both at the limit -- 70 deg each is ~86 deg of total tilt. Bounding the combined
+        angle instead is one line (``arccos(up_z) > limit``); it was not done because the
+        separate form is the stated criterion and the difference only matters for a robot
+        falling exactly diagonally.
+        """
+        # bool(), not the numpy comparison's np.bool_: this is a public predicate, and a
+        # numpy bool fails `is True` / `is False` and serialises oddly. It leaked once already.
+        if bool(self.mj_data.qpos[2] < self.terrain_min_z + self.fall_height):
+            return True
+        roll, pitch = self.tilt_from_upright()
+        return bool(roll > self.fall_tilt_rad or pitch > self.fall_tilt_rad)
 
     def get_joint_names(self) -> list[str]:
         """Extract joint names from qpos in MuJoCo order.

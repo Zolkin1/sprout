@@ -1207,6 +1207,19 @@ def main() -> None:
     # sets of plots eyeballed side by side. Needs the `mcap` python lib plus schemas written
     # by hand (there is no ROS here to generate them), and gen_tracker_metrics.py currently
     # consumes the CSV, so it is a real change rather than a swap.
+    # ---- what counts as a fall (MuJoCo sim2sim only; nothing in transfer/deploy sees these)
+    parser.add_argument("--fall_height", type=float, default=0.2,
+                        help="Pelvis height above the scene's LOWEST terrain surface, below "
+                             "which the run is scored a fall (metres). Terrain-relative "
+                             "because the old absolute 0.2 m marked every descending tile as "
+                             "fallen on arrival: tile20's bottom slab is at -0.777 m, so a "
+                             "healthy robot standing there has a pelvis at ~0.0.")
+    parser.add_argument("--fall_tilt_deg", type=float, default=70.0,
+                        help="Maximum lean from upright, in ROLL and PITCH separately "
+                             "(degrees). Not yaw -- yaw is heading, and a yaw bound would "
+                             "fail a robot that merely turned around. This is what catches a "
+                             "collapse on an UPPER terrain level, which stays far above the "
+                             "scene-minimum height bound.")
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Where --log writes sim_log.csv + metrics (default: "
@@ -1306,7 +1319,9 @@ def main() -> None:
     print(f"[INFO] onnxruntime providers: {policy.active_providers()}")
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
-                  joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
+                  joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3),
+                  fall_height=args.fall_height,
+                  fall_tilt_rad=float(np.deg2rad(args.fall_tilt_deg)))
     # Drive the MuJoCo servos with the gains the policy actually TRAINED with (exported in
     # policy_parameters.yaml) rather than the MJCF's hand-written ones, so retuning gains in
     # training propagates to sim2sim with no XML edit. Skip with --keep_xml_gains.
