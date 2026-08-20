@@ -214,7 +214,9 @@ class CompareStepper:
 
     Rows are runs and columns are panels, so the eye compares down a column: the same camera
     at the same instant in both stacks, then the same predicted path, then the same joints.
-    The bottom axis is shared and carries the cursor.
+    The bottom row is shared: the base position error PER AXIS -- downrange, lateral, height
+    -- plus the norm, each carrying the cursor. Those axes are the anchor's YAW-ALIGNED frame,
+    so z is gravity and a torso pitch does not rotate them.
 
     Keys match ``plot_from_bag``'s stepper: LEFT/RIGHT one tick, UP/DOWN ten, PAGEUP/PAGEDOWN
     a hundred, HOME/END the ends.
@@ -239,7 +241,15 @@ class CompareStepper:
         self.fig = plt.figure(figsize=(15, 3.2 * n + 2.4))
         gs = self.fig.add_gridspec(n + 1, 4, height_ratios=[3] * n + [2])
         self.ax = [[self.fig.add_subplot(gs[i, j]) for j in range(4)] for i in range(n)]
-        self.ax_trace = self.fig.add_subplot(gs[n, :])
+        # Bottom row: the base position error SPLIT PER AXIS, plus the norm. The axes are the
+        # anchor's YAW-ALIGNED frame -- heading-relative with z along gravity -- because that
+        # is the frame the window's base_pose block is expressed in
+        # (`pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d`). So x is downrange, y is
+        # lateral and z is height, and none of them is the full body frame: a torso pitch does
+        # not rotate these. A norm alone hides which of the three moved, and on a staircase it
+        # is usually z or downrange specifically.
+        self.ax_err = [self.fig.add_subplot(gs[n, j]) for j in range(3)]
+        self.ax_trace = self.fig.add_subplot(gs[n, 3])
         self._cid = self.fig.canvas.mpl_connect("key_press_event", self._on_key)
         # Held so the connection is not garbage-collected -- the window would appear fully
         # drawn with dead arrow keys, which looks like a frozen plot rather than a lost
@@ -298,17 +308,32 @@ class CompareStepper:
             a.set_title(f"joints @ t={t[i]:+.2f}s (tick {i})", fontsize="small")
             a.grid(alpha=0.3)
 
-        # The shared trace, with the cursor.
+        # The shared traces, with the cursor on each.
+        for a in self.ax_err:
+            a.clear()
         self.ax_trace.clear()
+        axis_names = ("x downrange", "y lateral", "z height")
         for run, t, st in zip(self.runs, self.times, STYLES):
-            if run.ref_pos_err is not None:
-                self.ax_trace.plot(t, np.linalg.norm(run.ref_pos_err[:, 0, :], axis=1),
-                                   lw=1.0, label=run.label, **st)
-        self.ax_trace.axhline(0.3, color="k", ls=":", lw=0.8)
+            if run.ref_pos_err is None:
+                continue
+            for i in range(3):
+                self.ax_err[i].plot(t, run.ref_pos_err[:, 0, i], lw=1.0, label=run.label, **st)
+            self.ax_trace.plot(t, np.linalg.norm(run.ref_pos_err[:, 0, :], axis=1),
+                               lw=1.0, label=run.label, **st)
+        for i, name in enumerate(axis_names):
+            self.ax_err[i].axhline(0.0, color="k", lw=0.6, alpha=0.5)
+            self.ax_err[i].axvline(self.t_now, color="k", lw=1.2)
+            self.ax_err[i].set_xlabel("time from arm [s]")
+            self.ax_err[i].set_ylabel(f"{name} [m]")
+            self.ax_err[i].grid(alpha=0.3)
+        self.ax_err[0].legend(fontsize="xx-small", ncol=len(self.runs))
+        # The bound is on the NORM, so it is drawn only here -- putting 0.3 on a per-axis
+        # panel would imply a per-axis budget the termination does not define.
+        self.ax_trace.axhline(0.3, color="k", ls=":", lw=0.8, label="bound 0.3 m")
         self.ax_trace.axvline(self.t_now, color="k", lw=1.2)
         self.ax_trace.set_xlabel("time from arm [s]")
         self.ax_trace.set_ylabel("|pos err| [m]")
-        self.ax_trace.legend(fontsize="x-small", ncol=len(self.runs))
+        self.ax_trace.legend(fontsize="xx-small")
         self.ax_trace.grid(alpha=0.3)
         self.fig.suptitle(f"t = {self.t_now:+.3f} s from arm    "
                           "LEFT/RIGHT 1 tick, UP/DOWN 10, PAGEUP/PAGEDOWN 100, HOME/END ends",
