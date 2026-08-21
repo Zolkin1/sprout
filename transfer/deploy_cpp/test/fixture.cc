@@ -108,16 +108,43 @@ Fixtures Fixtures::Load(const std::string& dir) {
       parsed.outputs[b.at("name").get<std::string>()] = ParseBlob(b, base);
     }
     for (const auto& [key, value] : c.at("attrs").items()) {
-      if (value.is_number_integer()) {
+      // Dispatch on the ACTUAL type of every attr. Two of these branches exist because
+      // their absence was a silent or near-silent failure on the first real stream:
+      // attrs.window_offsets is a list of INTS and the array branch assumed strings, which
+      // threw a bare "type must be string, but is number" naming no key; and attrs.survived
+      // is a BOOL, which matched nothing and was dropped without a word.
+      if (value.is_boolean()) {
+        parsed.ints[key] = value.get<bool>() ? 1 : 0;
+      } else if (value.is_number_integer()) {
         parsed.ints[key] = value.get<int>();
       } else if (value.is_number_float()) {
         parsed.doubles[key] = value.get<double>();
       } else if (value.is_string()) {
         parsed.strings[key] = value.get<std::string>();
       } else if (value.is_array()) {
-        std::vector<std::string> items;
-        for (const auto& v : value) items.push_back(v.get<std::string>());
-        parsed.string_lists[key] = std::move(items);
+        // Homogeneous in practice, so the first element decides. An empty array carries no
+        // type and no information, so it is simply skipped.
+        if (value.empty()) continue;
+        if (value.front().is_string()) {
+          std::vector<std::string> items;
+          for (const auto& v : value) items.push_back(v.get<std::string>());
+          parsed.string_lists[key] = std::move(items);
+        } else if (value.front().is_number_integer()) {
+          std::vector<int> items;
+          for (const auto& v : value) items.push_back(v.get<int>());
+          parsed.int_lists[key] = std::move(items);
+        } else if (value.front().is_number()) {
+          std::vector<double> items;
+          for (const auto& v : value) items.push_back(v.get<double>());
+          parsed.double_lists[key] = std::move(items);
+        } else {
+          throw std::runtime_error("fixture: attrs." + key +
+                                   " is an array of an unsupported element type");
+        }
+      } else if (!value.is_null()) {
+        // Naming the key matters: the whole point of this branch is that the next new attr
+        // type fails with something diagnosable instead of a bare nlohmann type error.
+        throw std::runtime_error("fixture: attrs." + key + " has an unsupported type");
       }
     }
     out.cases_.push_back(std::move(parsed));

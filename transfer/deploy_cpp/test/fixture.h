@@ -41,6 +41,8 @@ struct Case {
   std::map<std::string, Blob> inputs;
   std::map<std::string, Blob> outputs;
   std::map<std::string, std::vector<std::string>> string_lists;  //: e.g. attrs.blocks
+  std::map<std::string, std::vector<int>> int_lists;              //: e.g. attrs.window_offsets
+  std::map<std::string, std::vector<double>> double_lists;        //: a float array attr
   std::map<std::string, int> ints;                               //: e.g. attrs.num_joints
   std::map<std::string, double> doubles;                         //: e.g. attrs.min_dist
   std::map<std::string, std::string> strings;                    //: e.g. attrs.source
