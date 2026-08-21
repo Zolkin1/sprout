@@ -23,6 +23,21 @@ x-common: &common
     # multi-homed box). See docker/cyclonedds.xml.example, and note that `obk` does not touch
     # this variable, so it composes with the RMW/domain it does set.
     CYCLONEDDS_URI: ${CYCLONEDDS_URI:-}
+    # TF32 off/on for every CUDA matmul in both networks. EMPTY BY DEFAULT, which leaves the
+    # driver default (TF32 ON for Ampere and later). Set it to 0 in docker/.env to disable.
+    #
+    # It is here because TF32 makes the generator's output GPU-ARCHITECTURE DEPENDENT, and by
+    # more than a rounding error. Measured on one recorded 540-tick stream, replayed through
+    # the same graph and the same onnxruntime on an x86 desktop and on a Jetson Thor: the
+    # sampled reference window differs by 1.37e-2 with TF32 on, and by 1.60e-5 with it off on
+    # both. Everything upstream of the network -- the observation vector, the depth row, the
+    # whole FM conditioning -- is bit-identical either way, so this is entirely inside the
+    # matmuls, compounded through 8 Euler steps of a 27M parameter model. Mixed settings
+    # across two machines measured 1.44e-2 (on/off) and 1.55e-2 (off/on).
+    #
+    # Cost, per plan at p99: 20.9 -> 34.3 ms on the Thor, 14.1 -> 14.8 on the x86 desktop.
+    # No behavioural effect of the 1.37e-2 has been measured either way.
+    NVIDIA_TF32_OVERRIDE: ${NVIDIA_TF32_OVERRIDE:-}
   security_opt:
     - seccomp=unconfined
   cap_add:
