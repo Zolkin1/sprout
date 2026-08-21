@@ -73,6 +73,19 @@ def fig_health(run: Run, plt):
     ax[0].step(run.t, [x.clip_mode for x in m], where="post", label="clip mode")
     ax[0].step(run.t, [x.depth_stale for x in m], where="post", label="depth stale")
     ax[0].step(run.t, [x.vel_cmd_stale for x in m], where="post", label="vel cmd stale")
+    # IMU hold. `getattr` because a bag recorded before these fields existed is still worth
+    # plotting -- the mcap reader decodes with the BAG's schema, so the attribute is genuinely
+    # absent there rather than zero.
+    if hasattr(m[0], "quat_held"):
+        ax[0].step(run.t, [x.quat_held for x in m], where="post", label="imu held")
+        bad = [getattr(x, "bad_quat_samples", 0) for x in m]
+        tot = [getattr(x, "quat_samples", 0) for x in m]
+        if tot and tot[-1] > 0:
+            # The cumulative rate, in the label rather than as a curve: what matters is
+            # whether the IMU misbehaved at all and how often, not its shape in time.
+            ax[0].plot([], [], " ",
+                       label=f"bad IMU samples: {bad[-1]}/{tot[-1]} "
+                             f"({100.0 * bad[-1] / tot[-1]:.2f}%)")
     ax[0].set_ylabel("state"); ax[0].set_ylim(-0.1, 1.5)
 
     # -1 is the "never arrived" sentinel; plotting it as -1000 ms swamps the axis.

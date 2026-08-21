@@ -51,6 +51,7 @@ add_library(g1_deploy STATIC
   src/gen_tracker_core.cc
   src/fm_worker.cc
   src/obs_assembler.cc
+  src/imu_hold.cc
 )
 add_library(G1Deploy::Core ALIAS g1_deploy)
 
@@ -234,7 +235,7 @@ if(BUILD_TESTING)
     add_test(NAME camera_fk_parity COMMAND camera_fk_parity_test)
   endif()
   if(GTest_FOUND)
-    foreach(name quat_math_parity window_parity depth_obs_parity fm_meta node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler)
+    foreach(name quat_math_parity window_parity depth_obs_parity fm_meta node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler imu_hold)
       add_executable(${name}_test test/${name}_test.cc test/fixture.cc)
       target_include_directories(${name}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
       target_link_libraries(${name}_test

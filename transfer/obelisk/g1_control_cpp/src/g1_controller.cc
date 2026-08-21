@@ -460,8 +460,9 @@ void G1Controller::Arm() {
   have_last_good_ = false;
   nonfinite_streak_ = 0;
   fm_late_streak_ = 0;
-  bad_quat_count_ = 0;
-  quat_samples_ = 0;
+  // Counters only; the held values survive on purpose (see ImuHold::ResetCounters).
+  imu_hold_.ResetCounters();
+  quat_held_ = false;
   armed_.store(true);
   RCLCPP_INFO(this->get_logger(), "ARMED: %zu joints, driving from the first tick",
               hw_joint_names_.size());
@@ -517,35 +518,45 @@ Vec3 G1Controller::EffectiveCommand() {
   return vel_cmd_;
 }
 
-bool G1Controller::BaseQuat(QuatXyzw* out) {
-  std::vector<double> q;
-  {
-    std::lock_guard<std::mutex> lock(est_mutex_);
-    q = est_.q_base;
-  }
-  if (q.size() < 7) return false;
+bool G1Controller::BaseImu(const EstimatorSample& est, QuatXyzw* quat_out, Vec3* ang_vel_out) {
+  if (est.q_base.size() < 7 || est.v_base.size() < 6) return false;
   // q_base is [pos(3), quat(4)]. The quaternion's order in this message is xyzw, matching the
-  // rest of the stack.
-  QuatXyzw quat(q[3], q[4], q[5], q[6]);
-  ++quat_samples_;
-  if (!std::isfinite(quat.norm()) || quat.norm() < 0.5) {
-    // A degenerate quaternion is an estimator that has not converged, not a robot that has
-    // folded in half. Reuse the last good one and say so -- throttled, with a running
-    // percentage, because one bad sample is noise and a steady stream is a broken estimator.
-    ++bad_quat_count_;
-    if (bad_quat_count_ % 50 == 1) {
+  // rest of the stack. v_base is [linear(3), angular(3)]; only the angular half is a policy
+  // observation (see the note where base_ang_vel_b is filled).
+  const QuatXyzw quat(est.q_base[3], est.q_base[4], est.q_base[5], est.q_base[6]);
+  const Vec3 gyro(est.v_base[3], est.v_base[4], est.v_base[5]);
+  const g1_deploy::ImuHold::Result held = imu_hold_.Update(quat, gyro);
+  quat_held_ = held.held;
+  *quat_out = held.quat;
+  *ang_vel_out = held.ang_vel;
+  if (held.held) {
+    // A degenerate quaternion is an estimator that has not converged, or -- on one robot with
+    // a failing IMU -- an ALL-ZERO estimator message roughly 1 sample in 10. Either way it is
+    // not a robot that has folded in half. Reuse the last good sample and say so, throttled,
+    // with a running percentage, because one bad sample is noise and a steady stream is broken
+    // hardware.
+    //
+    // The GYRO is held too, on this same test. That is the point of holding it here rather
+    // than guarding it separately: an all-zero message carries a zero angular velocity, which
+    // is a perfectly plausible reading (a robot standing still) that no test on the gyro alone
+    // can reject. The quaternion's norm is the only available detector for the dropout, so it
+    // has to gate everything the dropout corrupts. If instead only the quaternion were ever
+    // bad, holding a good gyro for one sample costs ~1 ms of staleness at the estimator's
+    // 1 kHz against a 50 Hz control tick -- far cheaper than telling a falling robot's policy
+    // that it is not rotating.
+    if (imu_hold_.bad_samples() % 50 == 1) {
       RCLCPP_WARN(this->get_logger(),
-                  "degenerate base quaternion (norm %.3f); reusing the last good one "
-                  "(%ld of %ld samples, %.1f%%)",
-                  quat.norm(), bad_quat_count_, quat_samples_,
-                  100.0 * static_cast<double>(bad_quat_count_) /
-                      static_cast<double>(quat_samples_));
+                  "degenerate base quaternion (norm %.3f); reusing the last good orientation "
+                  "and gyro (%ld of %ld samples, %.1f%%)%s",
+                  quat.norm(), imu_hold_.bad_samples(), imu_hold_.samples(),
+                  100.0 * static_cast<double>(imu_hold_.bad_samples()) /
+                      static_cast<double>(std::max<int64_t>(imu_hold_.samples(), 1)),
+                  imu_hold_.any_good()
+                      ? ""
+                      : " -- AND NO GOOD SAMPLE HAS ARRIVED YET, so this is the identity "
+                        "orientation and a zero gyro, not a measurement");
     }
-    *out = last_good_quat_;
-    return true;
   }
-  last_good_quat_ = quat / quat.norm();
-  *out = last_good_quat_;
   return true;
 }
 
@@ -640,7 +651,8 @@ ControlMsg G1Controller::ComputeControl() {
   }
 
   QuatXyzw quat;
-  if (!BaseQuat(&quat)) {
+  Vec3 base_ang_vel;
+  if (!BaseImu(est, &quat, &base_ang_vel)) {
     PublishDebug({}, false);
     return msg;
   }
@@ -655,7 +667,9 @@ ControlMsg G1Controller::ComputeControl() {
   // read by nothing here. It is still validated for finiteness below, and still published for
   // the plotters. Do not reintroduce it as a field "for completeness": a reading nobody
   // consumes is one more thing that can look wrong.
-  r.base_ang_vel_b = Vec3(est.v_base[3], est.v_base[4], est.v_base[5]);
+  // From BaseImu, not straight off the message: it is held with the quaternion when the
+  // estimator sample is degenerate.
+  r.base_ang_vel_b = base_ang_vel;
   r.joint_pos = est.joint_pos;
   r.joint_vel = est.joint_vel;
   r.joint_names = est.joint_names;
@@ -904,6 +918,9 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
     d.depth_stale = depth_stale_;
     d.vel_cmd_stale = vel_cmd_stale_;
     d.nonfinite_streak = static_cast<uint32_t>(std::max(nonfinite_streak_, 0));
+    d.quat_samples = static_cast<uint64_t>(std::max<int64_t>(imu_hold_.samples(), 0));
+    d.bad_quat_samples = static_cast<uint64_t>(std::max<int64_t>(imu_hold_.bad_samples(), 0));
+    d.quat_held = quat_held_;
     d.obs_checksum = have_obs ? diag.obs_checksum : 0;
     d.obs_size = have_obs && policy_ ? static_cast<uint32_t>(policy_->num_obs()) : 0;
     d.fm_cursor = diag.cursor;

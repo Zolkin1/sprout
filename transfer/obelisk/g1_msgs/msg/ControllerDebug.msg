@@ -127,6 +127,17 @@ bool depth_stale
 bool vel_cmd_stale
 uint32 nonfinite_streak
 
+# ---- IMU health ---------------------------------------------------------------------
+# A flaky IMU on one robot returns an ALL-ZERO estimator message perhaps 1 in 10 samples.
+# The controller detects it by the base quaternion's norm and reuses the last good
+# orientation AND angular velocity, which at 1 kHz against a 50 Hz tick is invisible to the
+# policy -- so without these counters a run on a failing IMU is indistinguishable from a
+# healthy one after the fact, which is the whole reason the patch is easy to forget about.
+# Cumulative since the last arm, so a rate is bad_quat_samples / quat_samples.
+uint64 quat_samples          # base quaternions examined
+uint64 bad_quat_samples      # of those, degenerate (norm below the threshold) and held
+bool quat_held               # true if THIS tick ran on a held orientation/gyro
+
 # ---- Depth health -------------------------------------------------------------------
 # Per camera, contract order. A silently degraded camera -- all-invalid frame, wrong
 # exposure, half the image saturated -- currently reads to this stack as perfectly healthy,

@@ -37,6 +37,7 @@
 #include <vector>
 
 #include "g1_deploy/camera_fk.h"
+#include "g1_deploy/imu_hold.h"
 #include "g1_deploy/policy_runtime.h"
 
 namespace g1_control {
@@ -114,8 +115,15 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   bool UpdateWatchdogs();
   /// The command after the watchdogs: zeros when the joystick has gone quiet.
   g1_deploy::Vec3 EffectiveCommand();
-  /// Base orientation with the degenerate-quaternion guard applied.
-  bool BaseQuat(g1_deploy::QuatXyzw* out);
+  /// Base orientation AND angular velocity from one estimator sample, with the
+  /// degenerate-quaternion guard applied to both.
+  ///
+  /// Takes the sample the tick already copied rather than re-reading `est_`: the two must be
+  /// the same sample or the guard is incoherent (it would test one message's quaternion and
+  /// hold another message's gyro), and EstimatorSample exists precisely to be copied as a
+  /// unit.
+  bool BaseImu(const EstimatorSample& est, g1_deploy::QuatXyzw* quat,
+               g1_deploy::Vec3* ang_vel);
   /// Publish, unless the command is not finite and there is no finite fallback.
   bool PublishTargets(std::vector<double>* targets, ControlMsg* msg);
   void PublishDebug(const g1_deploy::TickDiagnostics& diag, bool have_obs);
@@ -168,9 +176,13 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   std::vector<double> last_good_targets_;
   bool have_last_good_ = false;
   std::vector<double> hold_pose_;                 //: last-resort fallback, captured at arming
-  g1_deploy::QuatXyzw last_good_quat_{0.0, 0.0, 0.0, 1.0};
-  int64_t bad_quat_count_ = 0;
-  int64_t quat_samples_ = 0;
+  //: Hold-last-valid for the base orientation AND gyro, for a robot whose estimator
+  //: intermittently publishes an all-zero message. The logic and the reasoning live in
+  //: g1_deploy::ImuHold, where they are tested without ROS; this node owns only the logging
+  //: and the counters' lifetime. See imu_hold.h.
+  g1_deploy::ImuHold imu_hold_;
+  //: Whether the CURRENT tick ran on held values, for the debug tick.
+  bool quat_held_ = false;
   bool depth_stale_ = false;
   bool vel_cmd_stale_ = false;
   //: Set when a tick's inputs were non-finite, for DiagnoseNonFinite.
