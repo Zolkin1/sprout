@@ -2,6 +2,7 @@
 
 #include "g1_deploy/ort_session.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <stdexcept>
@@ -16,6 +17,54 @@ struct WarmupInput {
   std::vector<char> boolean;
   Ort::Value value{nullptr};
 };
+
+/// OrtCUDAProviderOptionsV2, owned so it is released on every exit path.
+///
+/// The V2 API rather than the legacy OrtCUDAProviderOptions struct because that struct has no
+/// field for `enable_cuda_graph`; it is reachable only as a string key/value.
+struct CudaOptions {
+  OrtCUDAProviderOptionsV2* p = nullptr;
+  CudaOptions() { Ort::ThrowOnError(Ort::GetApi().CreateCUDAProviderOptions(&p)); }
+  ~CudaOptions() {
+    if (p != nullptr) Ort::GetApi().ReleaseCUDAProviderOptions(p);
+  }
+  CudaOptions(const CudaOptions&) = delete;
+  CudaOptions& operator=(const CudaOptions&) = delete;
+};
+
+/// Give the process-wide Env a CUDA data-transfer implementation, once.
+///
+/// Ort::Env::CopyTensors resolves its host<->device copy from the execution providers
+/// registered on the ENV, which is a different registry from the one a SessionOptions appends
+/// to. So a process can hold a perfectly good CUDA session and still be told "Data transfer
+/// implementation between source and destination device was not found" -- an error about the
+/// Env, raised on the first copy, that reads like a broken GPU.
+///
+/// The bare soname rather than a path: the provider .so sits beside libonnxruntime.so, which
+/// the loader has already found by the time this runs, so the same lookup finds this. An
+/// absolute /opt prefix would be a second statement of where onnxruntime is installed, and
+/// the one the image is free to move.
+void EnsureCudaDataTransfer() {
+  static bool done = false;
+  if (done) return;
+  done = true;   // set FIRST: a second attempt would throw "already registered", not recover.
+  try {
+    GlobalOrtEnv().RegisterExecutionProviderLibrary("g1_cuda_ep",
+                                                    std::string("libonnxruntime_providers_cuda.so"));
+  } catch (const std::exception& e) {
+    throw std::runtime_error(
+        std::string("could not register the CUDA provider library on the onnxruntime Env, so "
+                    "CUDA Graph capture has no way to copy its inputs to the device: ") +
+        e.what());
+  }
+}
+
+/// Element count implied by a shape.
+size_t Elements(const std::vector<int64_t>& shape) {
+  size_t n = 1;
+  for (int64_t d : shape) n *= static_cast<size_t>(d);
+  return n;
+}
 
 }  // namespace
 
@@ -45,8 +94,8 @@ Ort::Env& GlobalOrtEnv() {
 }
 
 OrtModel::OrtModel(const std::string& path, const std::vector<Provider>& providers,
-                   int intra_threads)
-    : path_(path) {
+                   int intra_threads, bool capture_cuda_graph)
+    : path_(path), capture_cuda_graph_(capture_cuda_graph) {
   // Touch the Env FIRST. Registering the CUDA provider reaches for onnxruntime's default
   // logger, and that logger does not exist until an Ort::Env has been constructed -- so a
   // lazily-created Env means AppendExecutionProvider_CUDA throws
@@ -58,11 +107,21 @@ OrtModel::OrtModel(const std::string& path, const std::vector<Provider>& provide
   if (intra_threads > 0) options_.SetIntraOpNumThreads(intra_threads);
 
   // Offered in order; onnxruntime falls back through the list. CPU is implicit and last.
+  bool cuda_offered = false;
   for (Provider p : providers) {
     switch (p) {
       case Provider::kCuda: {
-        OrtCUDAProviderOptions cuda{};
-        options_.AppendExecutionProvider_CUDA(cuda);
+        CudaOptions cuda;
+        std::vector<const char*> keys{"device_id"};
+        std::vector<const char*> vals{"0"};
+        if (capture_cuda_graph_) {
+          keys.push_back("enable_cuda_graph");
+          vals.push_back("1");
+        }
+        Ort::ThrowOnError(Ort::GetApi().UpdateCUDAProviderOptions(cuda.p, keys.data(),
+                                                                  vals.data(), keys.size()));
+        options_.AppendExecutionProvider_CUDA_V2(*cuda.p);
+        cuda_offered = true;
         break;
       }
       case Provider::kTensorrt: {
@@ -74,15 +133,41 @@ OrtModel::OrtModel(const std::string& path, const std::vector<Provider>& provide
         break;  // always available; nothing to append
     }
   }
+  if (capture_cuda_graph_ && !cuda_offered) {
+    throw std::runtime_error("CUDA Graph capture was requested for " + path +
+                             " but no CUDA provider was offered. Capture is a CUDA feature; "
+                             "there is nothing to capture on the CPU.");
+  }
 
   // Profiling must be enabled BEFORE the session is created -- it cannot be turned on later.
   // WarmUpAndCheckPlacement then reads the trace to learn where nodes actually ran and calls
   // EndProfiling, which both writes the file and turns profiling OFF, so the hot loop pays
   // nothing. Without this the placement check has no trace to read, reports CPU, and
   // RequireCuda refuses to run a perfectly good GPU session.
-  options_.EnableProfiling("/tmp/g1_ort_profile");
-  profiling_enabled_ = true;
-  session_ = std::make_unique<Ort::Session>(GlobalOrtEnv(), path.c_str(), options_);
+  //
+  // Skipped entirely under capture, where the trace is not needed: a capture-enabled session
+  // that CREATES AT ALL has every node on CUDA, because onnxruntime refuses otherwise. So
+  // placement is established by construction rather than measured, and the hot path never has
+  // profiling switched on even briefly.
+  if (!capture_cuda_graph_) {
+    options_.EnableProfiling("/tmp/g1_ort_profile");
+    profiling_enabled_ = true;
+  }
+  try {
+    session_ = std::make_unique<Ort::Session>(GlobalOrtEnv(), path.c_str(), options_);
+  } catch (const Ort::Exception& e) {
+    if (!capture_cuda_graph_) throw;
+    // The one failure mode worth translating: ORT says "all compute graph nodes have not been
+    // partitioned to the CUDAExecutionProvider", which is true but says nothing about the
+    // cause. For this pair the cause is essentially always a generator exported with a
+    // symbolic batch axis, whose shape arithmetic lands on the host.
+    throw std::runtime_error(
+        std::string("CUDA Graph capture was refused for ") + path + ": " + e.what() +
+        "\nThis almost always means the graph does not run entirely on the GPU. An fm.onnx "
+        "exported with a SYMBOLIC batch axis leaves ~2700 shape-arithmetic nodes on the CPU, "
+        "which rules capture out. Re-export it (scripts/flow_matching/export_fm_onnx.py, "
+        "which now fixes the batch at 1 by default), or run with fm_cuda_graph:=false.");
+  }
   for (size_t i = 0; i < session_->GetInputCount(); ++i) {
     input_names_.push_back(session_->GetInputNameAllocated(i, alloc_).get());
   }
@@ -134,7 +219,104 @@ void OrtModel::Run(const std::vector<const char*>& input_names,
                            inputs.size(), output_names.data(), output_names.size());
 }
 
+void OrtModel::PreparePersistentIo(const std::vector<std::string>& input_names) {
+  if (binding_) throw std::runtime_error(path_ + ": PreparePersistentIo called twice");
+  if (!capture_cuda_graph_) {
+    throw std::runtime_error(path_ +
+                             ": the persistent-IO path exists for CUDA Graph capture and is "
+                             "only built for it. Without capture, use Run().");
+  }
+  if (output_names_.size() != 1) {
+    throw std::runtime_error(path_ + " has " + std::to_string(output_names_.size()) +
+                             " outputs; the persistent-IO path handles exactly one.");
+  }
+  EnsureCudaDataTransfer();
+  bound_input_names_ = input_names;
+  binding_ = std::make_unique<Ort::IoBinding>(*session_);
+  auto cpu_mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+
+  // The allocator must outlive every tensor it hands out, so it is a member. OrtMemTypeDefault
+  // on "Cuda" is device memory; the capture holds these exact addresses.
+  Ort::MemoryInfo cuda_mem("Cuda", OrtDeviceAllocator, 0, OrtMemTypeDefault);
+  device_alloc_ = std::make_unique<Ort::Allocator>(*session_, cuda_mem);
+
+  host_input_buf_.resize(input_names.size());
+  input_counts_.resize(input_names.size());
+  for (size_t i = 0; i < input_names.size(); ++i) {
+    // Shapes off the GRAPH, never restated here: the whole point of the artifact carrying its
+    // own contract is that this code does not have a second opinion about it.
+    const std::vector<int64_t> shape = InputShape(input_names[i]);
+    const size_t n = Elements(shape);
+    input_counts_[i] = n;
+    host_input_buf_[i].assign(n, 0.0f);
+    host_inputs_.push_back(Ort::Value::CreateTensor<float>(
+        cpu_mem, host_input_buf_[i].data(), n, shape.data(), shape.size()));
+    device_inputs_.push_back(Ort::Value::CreateTensor<float>(
+        static_cast<OrtAllocator*>(*device_alloc_), shape.data(), shape.size()));
+    binding_->BindInput(input_names[i].c_str(), device_inputs_.back());
+  }
+
+  Ort::TypeInfo out_info = session_->GetOutputTypeInfo(0);
+  std::vector<int64_t> out_shape = out_info.GetTensorTypeAndShapeInfo().GetShape();
+  for (int64_t& d : out_shape) {
+    if (d < 0) d = 1;
+  }
+  const size_t out_n = Elements(out_shape);
+  host_output_buf_.assign(out_n, 0.0f);
+  host_output_.push_back(Ort::Value::CreateTensor<float>(
+      cpu_mem, host_output_buf_.data(), out_n, out_shape.data(), out_shape.size()));
+  device_output_.push_back(Ort::Value::CreateTensor<float>(
+      static_cast<OrtAllocator*>(*device_alloc_), out_shape.data(), out_shape.size()));
+  binding_->BindOutput(output_names_[0].c_str(), device_output_[0]);
+}
+
+void OrtModel::RunPersistent(const std::vector<const float*>& input_data, float* output,
+                             size_t output_count) {
+  if (!binding_) throw std::runtime_error(path_ + ": call PreparePersistentIo first");
+  if (input_data.size() != bound_input_names_.size()) {
+    throw std::runtime_error(path_ + ": RunPersistent got " + std::to_string(input_data.size()) +
+                             " inputs but " + std::to_string(bound_input_names_.size()) +
+                             " were bound. The set and its order are fixed at bind time.");
+  }
+  if (output_count != host_output_buf_.size()) {
+    throw std::runtime_error(path_ + ": output is " + std::to_string(host_output_buf_.size()) +
+                            " values, not " + std::to_string(output_count));
+  }
+  for (size_t i = 0; i < input_data.size(); ++i) {
+    std::copy(input_data[i], input_data[i] + input_counts_[i], host_input_buf_[i].begin());
+  }
+  // Host -> device INTO the bound buffers. Not a rebind: a rebind would hand the replay a
+  // pointer it never captured, and it would then keep returning the first call's answer --
+  // measured, silently, with no error (see the note at the top of ort_session.h).
+  Ort::ThrowOnError(GlobalOrtEnv().CopyTensors(host_inputs_, device_inputs_, nullptr));
+  session_->Run(Ort::RunOptions{nullptr}, *binding_);
+  // CopyTensors on the default stream also serves as the synchronisation: the D2H cannot start
+  // before the replay it is queued behind has finished.
+  Ort::ThrowOnError(GlobalOrtEnv().CopyTensors(device_output_, host_output_, nullptr));
+  std::copy(host_output_buf_.begin(), host_output_buf_.end(), output);
+}
+
 void OrtModel::WarmUpAndCheckPlacement(int iters) {
+  if (capture_cuda_graph_) {
+    // Under capture the warm-up MUST go through the binding: a plain Run() on a
+    // capture-enabled session is exactly the unsupported path (it returns an empty output list
+    // from the second call on), so warming up the old way would both mis-warm the session and
+    // leave the first live tick to pay for the capture.
+    if (!binding_) {
+      throw std::runtime_error(path_ +
+                               ": PreparePersistentIo must run before the warm-up when CUDA "
+                               "Graph capture is on -- the capture records the bound addresses.");
+    }
+    std::vector<const float*> zeros;
+    zeros.reserve(host_input_buf_.size());
+    for (const std::vector<float>& buf : host_input_buf_) zeros.push_back(buf.data());
+    std::vector<float> out(host_output_buf_.size(), 0.0f);
+    for (int i = 0; i < iters; ++i) RunPersistent(zeros, out.data(), out.size());
+    // Established by construction: a capture-enabled session does not get created at all
+    // unless every node is on CUDA, so there is nothing left for the profile to tell us.
+    on_gpu_ = true;
+    return;
+  }
   std::vector<WarmupInput> holders(session_->GetInputCount());
   std::vector<Ort::Value> values;
   std::vector<const char*> in_names;

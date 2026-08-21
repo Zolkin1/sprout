@@ -250,8 +250,74 @@ def _refuse_privileged_extero(ctx, checkpoint: str, allow: bool) -> None:
           "can produce this input; the deploy path will refuse it.")
 
 
+#: Graph input/output names, in ``_FmSamplerOnnx.forward`` argument order.
+_IO_NAMES = ("history", "extero", "cmd_tokens", "noise", "history_null", "trajectory")
+
+
+def _export_graph(wrapper: nn.Module, dummy: tuple, out_path: str, opset: int,
+                  dynamic_batch: bool) -> None:
+    """Trace ``wrapper`` to ONNX with the batch axis either fixed at 1 or symbolic.
+
+    **The batch axis is fixed at 1 by default, and that is a performance decision, not a
+    limitation.** A symbolic batch means every head reshape inside the 71 traced attention
+    blocks has to compute its target shape at RUN time, so the graph carries a
+    ``Shape -> Gather -> Unsqueeze -> Concat`` chain of int64 scalar ops per block. Those are
+    shape arithmetic, which onnxruntime deliberately keeps on the HOST: measured on the
+    shipped 27M depth generator, 2687 of 6606 kernel nodes landed on the
+    ``CPUExecutionProvider``, and every scalar they produced then had to be copied back to
+    the device -- the 71 ``MemcpyFromHost`` nodes onnxruntime warns about at load
+    ("It might have negative impact on performance (including unable to run CUDA graph)").
+
+    Fixing the axis lets constant folding delete that arithmetic outright, which
+
+    * puts **every** node on CUDA (2687 -> 0 host nodes, 6606 -> 3052 kernel nodes),
+    * lets the fusion pass match patterns the shape ops were splitting
+      (``SkipLayerNormalization``, ``QuickGelu``, a fused QKV ``Split``), and
+    * makes the graph eligible for **CUDA Graph capture**, which onnxruntime refuses
+      outright while any node is on the host ("all compute graph nodes have not been
+      partitioned to the CUDAExecutionProvider").
+
+    Measured end to end on the shipped 27M pair, per re-plan (dynamic -> fixed -> fixed with
+    capture): 11.6 -> 9.8 -> 8.3 ms on an RTX 4070, and 22.4 -> 19.3 -> 14-15 ms on the
+    Jetson Thor. The Thor number is the one that matters -- the baseline sat ABOVE the 20 ms
+    control period, and a chronically late plan is what the two-box bring-up traced its falls
+    to. Quote Thor figures as a range: repeated passes on the same graph vary ~8% there
+    (clock/thermal), where the desktop is stable to ~1%.
+
+    Nothing on the deploy path wants a batch: ``GenTrackerPolicy`` drives one robot and
+    builds every input at ``V=1``, and the Isaac side runs the model in torch rather than
+    through this graph. ``dynamic_batch=True`` is kept for throughput experiments only.
+
+    Fixing the axis changes which shapes are known at trace time, not what is computed, so
+    the two graphs agree to ~1e-6 rather than exactly: with the batch known, torch folds a
+    few more constants at export and rounds them once instead of per run. That is three
+    orders below the ~2.6e-3 CPU-vs-CUDA spread this graph already has at fp32, and the
+    fixed-axis graph is marginally the CLOSER of the two to a CPU reference. Pinned by
+    ``test_fm_onnx_static_batch``.
+
+    Args:
+        wrapper: The traced :class:`_FmSamplerOnnx`.
+        dummy: One example input per ``forward`` argument, all at batch 1.
+        out_path: Output ``.onnx`` path.
+        opset: ONNX opset.
+        dynamic_batch: Declare the batch axis symbolic instead of fixing it at 1.
+    """
+    # Use the legacy (TorchScript) exporter: it honors dynamic_axes for the batch
+    # dim on TransformerEncoder, whereas the newer dynamo path baked a static batch
+    # into an internal reshape here.
+    torch.onnx.export(
+        wrapper, dummy, out_path,
+        export_params=True, opset_version=opset, dynamo=False,
+        input_names=list(_IO_NAMES[:-1]),
+        output_names=[_IO_NAMES[-1]],
+        dynamic_axes=({k: {0: "V"} for k in _IO_NAMES} if dynamic_batch else None),
+    )
+    print(f"[INFO] batch axis {'symbolic (V)' if dynamic_batch else 'fixed at 1'}")
+
+
 def export_fm_onnx(
-    checkpoint: str, out_path: str, opset: int = 18, allow_privileged_extero: bool = False
+    checkpoint: str, out_path: str, opset: int = 18, allow_privileged_extero: bool = False,
+    dynamic_batch: bool = False,
 ) -> dict:
     """Export ``checkpoint`` to ``out_path`` and embed ``fm_meta``; return the meta.
 
@@ -262,6 +328,9 @@ def export_fm_onnx(
         allow_privileged_extero: Export even when the generator conditions on a privileged
             signal no deployment can produce. Off by default, because the whole value of an
             exported graph is that something off-sim can run it.
+        dynamic_batch: Declare the batch axis symbolic (``"V"``) instead of fixing it at 1.
+            Off by default; see :func:`_export_graph` for why a symbolic batch is expensive
+            here and why nothing on the deploy path wants one.
 
     Returns:
         The embedded ``fm_meta`` dict.
@@ -286,16 +355,7 @@ def export_fm_onnx(
     dummy = (torch.randn(v, n, d), torch.randn(v, edim), torch.randn(v, n_cmd, cmd),
              torch.randn(v, f, d), torch.zeros(v, 1))
     os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    # Use the legacy (TorchScript) exporter: it honors dynamic_axes for the batch
-    # dim on TransformerEncoder, whereas the newer dynamo path baked a static batch
-    # into an internal reshape here.
-    torch.onnx.export(
-        wrapper, dummy, out_path,
-        export_params=True, opset_version=opset, dynamo=False,
-        input_names=["history", "extero", "cmd_tokens", "noise", "history_null"],
-        output_names=["trajectory"],
-        dynamic_axes={k: {0: "V"} for k in ("history", "extero", "cmd_tokens", "noise", "trajectory", "history_null")},
-    )
+    _export_graph(wrapper, dummy, out_path, opset, dynamic_batch)
 
     meta = _fm_meta(ctx)
     model = onnx.load(out_path)
@@ -313,6 +373,11 @@ def main() -> None:
     p.add_argument("--out", default=None, help="Output .onnx path (default: alongside the checkpoint).")
     p.add_argument("--opset", type=int, default=18)
     p.add_argument(
+        "--dynamic_batch", action="store_true", default=False,
+        help="Declare the batch axis symbolic instead of fixing it at 1. Costs ~2700 "
+             "host-side shape-arithmetic nodes and rules out CUDA Graph capture (see "
+             "_export_graph); nothing on the deploy path needs it.")
+    p.add_argument(
         "--allow_privileged_extero", action="store_true", default=False,
         help="Export even when the generator conditions on a PRIVILEGED signal (an exact "
              "noise-free dense height scan). Refused by default: no deployment can produce "
@@ -324,7 +389,8 @@ def main() -> None:
     out = args.out or os.path.join(os.path.dirname(args.checkpoint),
                                    fm_artifact_name(args.checkpoint))
     export_fm_onnx(args.checkpoint, out, args.opset,
-                   allow_privileged_extero=args.allow_privileged_extero)
+                   allow_privileged_extero=args.allow_privileged_extero,
+                   dynamic_batch=args.dynamic_batch)
 
 
 if __name__ == "__main__":

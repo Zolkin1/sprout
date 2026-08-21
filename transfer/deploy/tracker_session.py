@@ -129,22 +129,52 @@ def resolve_providers(providers=None) -> list:
     return out
 
 
-def make_session(onnx_path: str, num_threads: int = 0, providers=None) -> ort.InferenceSession:
+def make_session(onnx_path: str, num_threads: int = 0, providers=None,
+                 cuda_graph: bool = False) -> ort.InferenceSession:
     """Create an ORT session with full graph optimization.
 
     Args:
         onnx_path: Path to the ``.onnx`` file.
         num_threads: Intra-op threads (0 lets ORT choose). CPU-side only.
         providers: Execution providers; see :func:`resolve_providers`. ``None`` = CPU.
+        cuda_graph: Ask the CUDA provider to capture the launch sequence and replay it. The
+            session is then usable ONLY through an IoBinding over fixed device buffers --
+            ``sess.run()`` returns an empty output list from the second call on -- so the
+            caller has to be built for it (``fm_session.enable_cuda_graph``). Session creation
+            itself fails if any node landed on the CPU, which is what makes this safe to ask
+            for: it cannot half-apply.
 
     Returns:
         A configured :class:`onnxruntime.InferenceSession`.
+
+    Raises:
+        ValueError: If ``cuda_graph`` is set without a CUDA provider in the request.
     """
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     if num_threads > 0:
         so.intra_op_num_threads = num_threads
-    return ort.InferenceSession(onnx_path, so, providers=resolve_providers(providers))
+    resolved = resolve_providers(providers)
+    if not cuda_graph:
+        return ort.InferenceSession(onnx_path, so, providers=resolved)
+    names = [p[0] if isinstance(p, tuple) else p for p in resolved]
+    if PROVIDER_ALIASES["cuda"] not in names:
+        raise ValueError(
+            f"cuda_graph was requested for {onnx_path} but the resolved providers are "
+            f"{names}. Capture is a CUDA feature; there is nothing to capture on the CPU."
+        )
+    # Rebuilt rather than mutated: the option rides on the CUDA entry, and the resolved list
+    # may carry it as a bare name.
+    with_capture = []
+    for p in resolved:
+        name = p[0] if isinstance(p, tuple) else p
+        if name != PROVIDER_ALIASES["cuda"]:
+            with_capture.append(p)
+            continue
+        opts = dict(p[1]) if isinstance(p, tuple) else {}
+        opts["enable_cuda_graph"] = "1"
+        with_capture.append((name, opts))
+    return ort.InferenceSession(onnx_path, so, providers=with_capture)
 
 
 class TrackerSession:

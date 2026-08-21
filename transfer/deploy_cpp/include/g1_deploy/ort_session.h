@@ -6,6 +6,32 @@
 // Port of the session half of transfer/deploy/tracker_session.py. The metadata PARSING lives
 // in policy_params.h, deliberately separate, so it is testable without a model.
 //
+// ============================ CUDA Graph capture ==========================================
+// The generator's graph is ~3000 kernels for a 62-node plan at batch 1, so onnxruntime is
+// LAUNCH-bound rather than arithmetic-bound: wall time tracks the number of kernels, not the
+// FLOPs. CUDA Graph capture records the whole launch sequence once and replays it as a single
+// submission, which measured 19.3 -> 14-15 ms per re-plan on the Jetson Thor and 9.8 -> 8.3 ms
+// on an RTX 4070.
+//
+// It has three hard requirements, and violating any of them is SILENT:
+//
+//   1. Every node on CUDA. onnxruntime refuses session creation outright otherwise ("all
+//      compute graph nodes have not been partitioned to the CUDAExecutionProvider"), which is
+//      why this is only reachable with an fm.onnx exported at a FIXED batch -- a symbolic
+//      batch axis leaves ~2700 shape-arithmetic nodes on the host. See
+//      scripts/flow_matching/export_fm_onnx.py::_export_graph.
+//   2. Static shapes, for the same reason.
+//   3. **Fixed device addresses.** A captured graph holds raw device pointers, so feeding new
+//      data means copying into the SAME device buffers. This is the dangerous one, and it was
+//      measured rather than assumed (transfer/deploy/tests/test_fm_cuda_graph.py):
+//        - a plain Run() with host tensors returns an EMPTY output list from the second call on;
+//        - binding host memory, or rebinding fresh host buffers, returns the FIRST call's
+//          answer forever -- bit-identical to it, with no error;
+//        - even mutating the same host buffer in place is not picked up, because the
+//          host-to-device copy is itself inside the capture.
+//      So RunPersistent owns device tensors allocated once and copies into them through
+//      Ort::Env::CopyTensors (ORT >= 1.23), which needs no CUDA linkage of our own.
+//
 // ============================ the CUDA guard ==============================================
 // onnxruntime falls back to the CPU SILENTLY. For this policy pair that is not a degraded
 // mode, it is an unusable one -- the python measured 103.5 ms per generator tick on CPU
@@ -44,7 +70,11 @@ class OrtModel {
   ///   intra_threads: intra-op threads; 0 lets onnxruntime choose. Measured on this stack,
   ///     auto was ~3x slower than 4 on the generator, so it is worth setting explicitly and
   ///     re-measuring per box.
-  OrtModel(const std::string& path, const std::vector<Provider>& providers, int intra_threads);
+  ///   capture_cuda_graph: record the launch sequence once and replay it (see the note at the
+  ///     top of this header). Requires a CUDA provider, a fixed-batch graph, and that every
+  ///     call go through PreparePersistentIo + RunPersistent -- Run() is not capture-safe.
+  OrtModel(const std::string& path, const std::vector<Provider>& providers, int intra_threads,
+           bool capture_cuda_graph = false);
   ~OrtModel();
 
   /// A custom metadata entry, e.g. "policy_parameters" or "fm_meta". Throws if absent.
@@ -55,6 +85,25 @@ class OrtModel {
            const std::vector<Ort::Value>& inputs,
            const std::vector<const char*>& output_names,
            std::vector<Ort::Value>* outputs);
+
+  /// Allocate device-resident tensors for `input_names` (shapes read off the graph) and for
+  /// the single graph output, and bind them once.
+  ///
+  /// Capture-only, and throws without it: the addresses bound here are the ones the capture
+  /// bakes in, so this path exists to keep them fixed. A session without capture uses Run().
+  void PreparePersistentIo(const std::vector<std::string>& input_names);
+
+  /// One inference over those buffers: host -> device, run, device -> host.
+  ///
+  /// `input_data[i]` supplies the input named `input_names[i]` from PreparePersistentIo, with
+  /// exactly the element count that input's shape implies. The first call records the graph and
+  /// the rest replay it; the result is bit-identical to what Run() gives on a plain session,
+  /// which is what test/ort_sessions_test.cc checks.
+  void RunPersistent(const std::vector<const float*>& input_data, float* output,
+                     size_t output_count);
+
+  /// Whether this session was created with capture enabled.
+  bool cuda_graph() const { return capture_cuda_graph_; }
 
   /// Declared shape of an input, with dynamic dimensions resolved to 1.
   std::vector<int64_t> InputShape(const std::string& name) const;
@@ -93,6 +142,25 @@ class OrtModel {
   std::vector<std::string> output_names_;
   bool on_gpu_ = false;
   bool profiling_enabled_ = false;
+  bool capture_cuda_graph_ = false;
+
+  // ---- persistent IO (PreparePersistentIo / RunPersistent) --------------------------------
+  // Device tensors OWN their memory and must outlive every replay, hence members rather than
+  // locals. The host staging tensors are views over host_*_ and are re-used, so the hot path
+  // allocates nothing.
+  std::unique_ptr<Ort::Allocator> device_alloc_;
+  std::vector<std::string> bound_input_names_;
+  std::vector<Ort::Value> device_inputs_;
+  std::vector<Ort::Value> host_inputs_;
+  std::vector<std::vector<float>> host_input_buf_;
+  std::vector<size_t> input_counts_;
+  // One-element vectors, not bare Values: Ort::Env::CopyTensors takes vectors by const
+  // reference and Ort::Value is move-only, so wrapping a member in a temporary vector would
+  // move the buffer out from under the binding.
+  std::vector<Ort::Value> device_output_;
+  std::vector<Ort::Value> host_output_;
+  std::vector<float> host_output_buf_;
+  std::unique_ptr<Ort::IoBinding> binding_;
 };
 
 /// Refuse to run when CUDA was requested but the model is on the CPU.

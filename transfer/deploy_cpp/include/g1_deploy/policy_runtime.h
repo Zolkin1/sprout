@@ -89,6 +89,15 @@ struct RuntimeConfig {
   //: Run the generator on its own thread. False runs it inline, which is what the tests and
   //: the benchmark do; on this hardware the threaded path is what meets the control period.
   bool threaded_fm = true;
+  //: Replay a captured CUDA graph for the GENERATOR instead of launching its ~3000 kernels
+  //: individually. Measured 19.3 -> 14-15 ms per re-plan on the Thor, which is the difference
+  //: between a plan that misses its 20 ms control period and one that makes it.
+  //:
+  //: Off by default because it is not universally available: it needs a CUDA provider AND an
+  //: fm.onnx exported at a fixed batch. Both are checked at load and refused loudly rather
+  //: than degraded silently. The tracker is left alone -- it is 17 nodes and 0.2 ms, so there
+  //: is nothing to win and a second capture would only add a failure mode.
+  bool fm_cuda_graph = false;
   //: Allow fm_lead_sec = 0 to mean "request the plan AT its boundary", the way the
   //: synchronous python runtime does.
   //:

@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <string>
@@ -142,6 +143,96 @@ TEST_F(RealArtifacts, GeneratorProducesAFiniteWindowAndIsDeterministicUnderZeroN
     EXPECT_DOUBLE_EQ(a[i], b[i]) << "element " << i << " differs under zero noise";
   }
   std::cout << "    [fm] infer " << fm.last_infer_ms() << " ms\n";
+}
+
+// ---------------------------------------------------------------------------------------
+// CUDA Graph capture
+// ---------------------------------------------------------------------------------------
+// CUDA-only by construction, so these skip unless the suite was pointed at a GPU with
+// G1_ORT_PROVIDER=cuda. What they check is the one thing that fails SILENTLY: a captured
+// graph holds device pointers, so if the per-call host-to-device copy is missed the replay
+// returns the FIRST call's answer forever, bit-identical, with no error. That is
+// indistinguishable from a healthy generator whose conditioning happens not to have moved --
+// which on a walking robot is exactly the situation.
+
+/// A conditioning set that depends on `seed`, so two of them must give different plans.
+FmConditioning MakeConditioning(const FmMeta& meta, int seed) {
+  FmConditioning cond;
+  cond.extero.assign(static_cast<size_t>(meta.extero_dim()), 0.0);
+  cond.future_cmd.assign(static_cast<size_t>(meta.f) * meta.cmd_dim, 0.0);
+  for (size_t i = 0; i < cond.extero.size(); ++i) {
+    cond.extero[i] = 0.05 * static_cast<double>((i * 7 + seed * 13) % 20) - 0.5;
+  }
+  for (size_t i = 0; i < cond.future_cmd.size(); ++i) {
+    cond.future_cmd[i] = 0.1 * static_cast<double>((i + seed * 3) % 5);
+  }
+  return cond;
+}
+
+/// One plan for `seed`'s conditioning.
+std::vector<double> PlanFor(FmSession& fm, int seed) {
+  fm.SetConditioning(MakeConditioning(fm.meta(), seed));
+  FmRequest req;
+  req.target_ctrl_step = 1;
+  req.history_nodes.assign(static_cast<size_t>(fm.meta().n) * fm.meta().d, 0.0);
+  req.history_cmd.assign(static_cast<size_t>(fm.meta().n) * fm.meta().cmd_dim, 0.0);
+  req.history_null = true;
+  for (size_t i = 0; i < req.history_nodes.size(); ++i) {
+    req.history_nodes[i] = 0.01 * static_cast<double>((i + seed) % 11);
+  }
+  std::vector<double> out(static_cast<size_t>(fm.meta().f) * fm.meta().d, 0.0);
+  int64_t target = 0;
+  fm.Submit(req);
+  EXPECT_TRUE(fm.TryCollect(out.data(), &target));
+  return out;
+}
+
+double MaxAbsDiff(const std::vector<double>& a, const std::vector<double>& b) {
+  double worst = 0.0;
+  for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::fabs(a[i] - b[i]));
+  return worst;
+}
+
+TEST_F(RealArtifacts, CudaGraphReplayTracksItsInputRatherThanRepeatingTheFirstPlan) {
+  if (!Exists(fm_path)) GTEST_SKIP() << "no fm.onnx under " << PolicyDir();
+  const std::vector<Provider> provs = RequestedProviders();
+  if (provs.empty() || provs.front() != Provider::kCuda) {
+    GTEST_SKIP() << "capture is a CUDA feature; run with G1_ORT_PROVIDER=cuda";
+  }
+  FmSession plain(fm_path, provs, 2, std::make_shared<ZeroNoise>(), /*cuda_graph=*/false);
+  FmSession captured(fm_path, provs, 2, std::make_shared<ZeroNoise>(), /*cuda_graph=*/true);
+  captured.model().WarmUpAndCheckPlacement();   // this is what records the graph
+  ASSERT_TRUE(captured.model().cuda_graph());
+
+  const std::vector<double> want_a = PlanFor(plain, 1);
+  const std::vector<double> want_b = PlanFor(plain, 2);
+  // The premise: the two conditionings really do give different plans, so "replayed the old
+  // answer" and "computed the new one" are distinguishable at all.
+  ASSERT_GT(MaxAbsDiff(want_a, want_b), 1e-3) << "the two conditionings must differ";
+
+  const std::vector<double> got_a = PlanFor(captured, 1);
+  const std::vector<double> got_b = PlanFor(captured, 2);
+  // Replay must be EXACT against the plain session: same kernels in the same order, only
+  // submitted differently. Anything else means capture changed the arithmetic.
+  EXPECT_EQ(MaxAbsDiff(got_a, want_a), 0.0) << "capture must not change the result";
+  EXPECT_EQ(MaxAbsDiff(got_b, want_b), 0.0)
+      << "the replay returned something other than the plan for its own conditioning";
+  // The footgun, stated positively: got_b must NOT be the first plan.
+  EXPECT_GT(MaxAbsDiff(got_b, want_a), 1e-3)
+      << "the replay reproduced the FIRST plan, so the host-to-device copy is not reaching the "
+         "captured device buffers -- every later plan would be stale and nothing would error";
+  std::cout << "    [fm] plain " << plain.last_infer_ms() << " ms, captured "
+            << captured.last_infer_ms() << " ms\n";
+}
+
+TEST_F(RealArtifacts, CudaGraphCaptureIsRefusedOnTheCpu) {
+  if (!Exists(fm_path)) GTEST_SKIP() << "no fm.onnx under " << PolicyDir();
+  // Capture without a CUDA provider is not a degraded mode, it is a contradiction, and saying
+  // so at load is the difference between a clear error and a session that quietly never
+  // captured.
+  EXPECT_THROW(FmSession(fm_path, {Provider::kCpu}, 2, std::make_shared<ZeroNoise>(),
+                         /*cuda_graph=*/true),
+               std::runtime_error);
 }
 
 TEST_F(RealArtifacts, TheRealGeneratorDrivesTheRealScheduleEndToEnd) {

@@ -106,6 +106,9 @@ void G1Controller::DeclareParams() {
   // when nothing does.
   this->declare_parameter<double>("fm_lead_sec", 0.02);
   this->declare_parameter<bool>("threaded_fm", true);
+  // Generator-only, and OFF by default: it needs a CUDA provider and a fixed-batch
+  // fm.onnx, and both are refused loudly at load rather than degraded silently.
+  this->declare_parameter<bool>("fm_cuda_graph", false);
   this->declare_parameter<int>("fm_late_disarm_ticks", 0);
   // The kinematic model the camera poses are FK'd on. A parameter and not a constant because
   // the robot's models are on their way to being consolidated; when that lands this moves a
@@ -140,6 +143,7 @@ G1Controller::on_configure(const rclcpp_lifecycle::State& prev) {
   debug_topics_ = this->get_parameter("debug_topics").as_bool();
   fm_lead_sec_ = this->get_parameter("fm_lead_sec").as_double();
   threaded_fm_ = this->get_parameter("threaded_fm").as_bool();
+  fm_cuda_graph_ = this->get_parameter("fm_cuda_graph").as_bool();
   fm_late_disarm_ticks_ = static_cast<int>(this->get_parameter("fm_late_disarm_ticks").as_int());
   urdf_path_ = this->get_parameter("urdf_path").as_string();
   zero_noise_ = this->get_parameter("zero_noise").as_bool();
@@ -241,12 +245,14 @@ void G1Controller::LoadPolicy() {
   cfg.intra_threads = onnx_threads_;
   cfg.fm_lead_sec = fm_lead_sec_;
   cfg.threaded_fm = threaded_fm_;
+  cfg.fm_cuda_graph = fm_cuda_graph_;
   cfg.zero_noise = zero_noise_;
 
   RCLCPP_INFO(this->get_logger(),
-              "loading the policy pair from %s (cuda=%d, threads=%d, zero_noise=%d)",
+              "loading the policy pair from %s (cuda=%d, threads=%d, zero_noise=%d, "
+              "fm_cuda_graph=%d)",
               base.c_str(), static_cast<int>(use_cuda_), onnx_threads_,
-              static_cast<int>(zero_noise_));
+              static_cast<int>(zero_noise_), static_cast<int>(fm_cuda_graph_));
   policy_ = std::make_unique<g1_deploy::PolicyRuntime>(cfg);
   policy_->Load();   // throws on a CPU fallback when cuda was asked for; see RequireCuda
 

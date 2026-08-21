@@ -88,6 +88,11 @@ control:
       # benchmark do and which is useful for isolating a threading question from a policy one
       # -- but on this hardware inline means the 50 Hz tick pays 16 ms every twelfth tick.
       threaded_fm: true
+      # Replay a captured CUDA graph for the generator instead of launching its ~3000
+      # kernels one at a time: 19.3 -> 14-15 ms per re-plan on the Thor. Needs an
+      # fm.onnx exported at a fixed batch (the default since the static-batch export);
+      # a symbolic-batch graph leaves nodes on the host and is refused at load.
+      fm_cuda_graph: true
 
       # Ticks of continuous lateness before disarming. 0 = never, which is the deliberate
       # default: a late plan is survivable (the cursor keeps advancing and the far end of the

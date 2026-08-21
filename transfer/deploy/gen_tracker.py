@@ -144,6 +144,7 @@ class GenTrackerPolicy:
         seed: int | None = 0,
         zero_noise: bool = False,
         providers=None,
+        fm_cuda_graph: bool = False,
         allow_privileged_extero: bool = False,
         fm_lead_ticks: int = 0,
     ):
@@ -168,6 +169,12 @@ class GenTrackerPolicy:
         :meth:`_sample_noise`). It defaults to False here -- the training-matched
         stochastic sampling -- so hardware keeps that behaviour; the MuJoCo sim2sim
         runner opts in and defaults it on.
+
+        ``fm_cuda_graph=True`` replays a captured CUDA graph for the GENERATOR instead of
+        launching its ~3000 kernels one at a time (9.8 -> 8.3 ms per re-plan on an RTX 4070,
+        19.3 -> 14-15 ms on a Jetson Thor). It needs a CUDA provider and a fixed-batch
+        ``fm.onnx``, and refuses loudly rather than degrading if either is missing -- see
+        ``fm_session.enable_cuda_graph``. The tracker is left alone: 17 nodes and 0.2 ms.
 
         ``providers`` selects the onnxruntime execution providers for BOTH graphs (see
         ``tracker_session.resolve_providers``); ``None`` = CPU, which is the deployment
@@ -197,6 +204,7 @@ class GenTrackerPolicy:
         self.num_threads = num_threads
         self.zero_noise = bool(zero_noise)
         self.providers = providers
+        self.fm_cuda_graph = bool(fm_cuda_graph)
         self.allow_privileged_extero = bool(allow_privileged_extero)
         #: Emulate the C++ runtime's generator LEAD: it requests each plan `lead` ticks
         #: before the boundary it is for, and conditions it on the exteroception and the
@@ -231,7 +239,8 @@ class GenTrackerPolicy:
         self._trk = TrackerSession(self.tracker_onnx, self.num_threads, self.providers)
         self.fm_enabled = self.fm_onnx is not None
         if self.fm_enabled:
-            self.ctx = load_fm_context(self.fm_onnx, self.num_threads, self.providers)
+            self.ctx = load_fm_context(self.fm_onnx, self.num_threads, self.providers,
+                                       cuda_graph=self.fm_cuda_graph)
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
         # Re-plan cadence: the tracker metadata (the value the tracker task trained with),

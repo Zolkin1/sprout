@@ -191,6 +191,7 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   bool debug_topics_ = true;
   double fm_lead_sec_ = 0.05;
   bool threaded_fm_ = true;
+  bool fm_cuda_graph_ = false;
   int fm_late_disarm_ticks_ = 0;
   std::string urdf_path_;
   bool zero_noise_ = true;

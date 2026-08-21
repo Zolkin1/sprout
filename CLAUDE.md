@@ -407,6 +407,85 @@ there is a difference in the ROS stack. The clip library is built by
   `run_sim_world.sh`. The controller has no auto-arm and must not grow one
   (`tests/test_auto_arm_is_sim_only.py`).
 
+## The generator's ONNX graph runs entirely on the GPU (and is captured)
+
+The graph is ~3000 kernels for one 62-node plan at **batch 1**, so onnxruntime is
+LAUNCH-bound there: wall time tracks the kernel COUNT, not the FLOPs. Two changes follow
+from that, and the first is a precondition for the second.
+
+**1. The batch axis is FIXED at 1 in the export** (`export_fm_onnx._export_graph`;
+`--dynamic_batch` restores the old symbolic axis for throughput experiments). With a symbolic
+batch, every head reshape in the traced attention blocks computes its shape at RUN time, so
+the graph carried a `Shape -> Gather -> Unsqueeze -> Concat` chain of int64 scalars per block.
+onnxruntime keeps shape arithmetic on the HOST, so **2687 of 6606 kernel nodes ran on the
+CPU** with 71 `MemcpyFromHost` nodes between them — the "Memcpy nodes are added" warning at
+load. Fixing the axis lets constant folding delete all of it, which also lets the fusion pass
+match patterns the shape ops were splitting (`SkipLayerNormalization`, `QuickGelu`, a fused
+QKV `Split`). Result: **0 host nodes, 3052 kernel nodes.** `tracker.onnx` was never part of
+this — 17 nodes, already all-CUDA, 0.18 ms.
+- The GPU-free way to check it is ORT's OWN optimizer, not the file: the file keeps its
+  `Shape` nodes either way and folding them is the work being measured. 0 surviving `Shape`
+  against 358 lines up exactly with 3052 all-CUDA against 6606-with-2687-on-host
+  (`test_fm_onnx_static_batch`).
+- Numerics: ~1e-6 from the old graph (torch folds a few more constants once shapes are known),
+  three orders below the ~2.6e-3 CPU-vs-CUDA fp32 spread the graph already had. Freezing an
+  EXISTING graph instead (`onnxruntime.tools.make_dynamic_shape_fixed --dim_param V
+  --dim_value 1`) is bit-identical, if a forensic comparison is ever needed.
+
+**2. CUDA Graph capture, which the host nodes had been blocking.** onnxruntime refuses capture
+outright while any node is on the host ("all compute graph nodes have not been partitioned to
+the CUDAExecutionProvider") — it fails to CREATE the session, so it cannot half-apply. On:
+`fm_cuda_graph: true` in `g1_cpp.yml`, `--fm_cuda_graph` on `gen_tracker_runner.py`,
+`load_fm_context(cuda_graph=True)`. Generator only; the tracker has nothing to win.
+
+**Every wrong way of feeding a captured graph fails SILENTLY**, and that is why there are
+tests either side of the port (`deploy/tests/test_fm_cuda_graph.py`,
+`deploy_cpp/test/ort_sessions_test.cc`). A capture holds raw DEVICE POINTERS, so:
+- a plain `sess.run()` on a capture-enabled session returns an **empty output list** once the
+  capture is recorded — an `IndexError` far from the cause, or no plan at all;
+- binding host memory, or rebinding fresh host buffers, returns the **first** answer forever,
+  bit-identical, with no error;
+- even mutating one bound host buffer IN PLACE is not picked up, because the host-to-device
+  copy is itself inside the capture.
+That last shape is the dangerous one: "the plan stopped responding to the cameras" is
+indistinguishable on a walking robot from conditioning that has not moved. So the inputs live
+in device buffers written in place — `update_inplace` in python, `Ort::Env::CopyTensors` in
+C++ — and the tests assert the replay tracks its input, not merely that it is finite.
+- **`CopyTensors` resolves its copy from the providers registered on the `Ort::Env`, which is a
+  DIFFERENT registry from the one `SessionOptions` appends to.** A process can hold a perfectly
+  good CUDA session and still get "Data transfer implementation between source and destination
+  device was not found" on the first copy. `EnsureCudaDataTransfer()` registers the provider
+  library on the Env once, by bare soname (it sits beside `libonnxruntime.so`, so an absolute
+  `/opt` path would just be a second statement of where ORT is installed). Needs ORT >= 1.23;
+  the images ship 1.24.4.
+- Linking CUDA to do the copy ourselves was the alternative and was rejected: the images carry
+  `libcudart.so.13` but no CUDA headers, so it would mean growing them.
+- The C++ warm-up must go through the binding under capture (a plain warm-up would both
+  mis-warm the session and leave the capture cost on the first live tick), and profiling is
+  skipped there entirely — placement is established by construction.
+
+**Measured, per re-plan** (dynamic -> fixed batch -> fixed + capture):
+`11.6 -> 9.8 -> 8.3 ms` on an RTX 4070, `22.4 -> 19.3 -> 14-15 ms` on the Jetson Thor. Quote
+Thor numbers as a RANGE: repeated passes on one graph vary ~8% there (clock/thermal) where the
+desktop is stable to ~1%. **The Thor baseline sat ABOVE the 20 ms control period**, so this is
+aimed at the chronically-late plan the two-box bring-up traced its falls to, not just at
+throughput.
+
+**Two things this surfaced and did NOT fix:**
+- `G1_DEPLOY_POLICY_DIR` in `deploy_cpp/CMakeLists.txt` points at
+  `hf_cache/<repo>/<run>`, but the controller loads `hf_cache/<repo>/policies/<run>`. So the
+  C++ session tests SILENTLY SKIP on the dev box (that path does not exist) and on the Thor
+  they would read a stale 111 MB `fm.onnx`. `test_policy_cache_layout.py` already pins the
+  `policies/` prefix across the language boundary — this default escaped it.
+- Pointed at the real pair, `policy_runtime_test` fails because it feeds no camera poses for a
+  5-channel generator. Pre-existing; fixing the path above requires fixing this too.
+- The capture path is verified on the Thor through the PYTHON runtime on the host (3/3 tests,
+  19.33 -> 15.45 ms). The C++ half compiles clean on aarch64 and passes 12/12 on the CPU there,
+  but its GPU behaviour in the Thor CONTAINER is unverified: `docker run --runtime nvidia`
+  gives that container no working CUDA (`GPU=-1`, "driver version is insufficient"), and the
+  untouched `ort_smoke` fails identically, so it is the launch, not the change. Running the
+  brain for real is what closes it.
+
 ## Running the BRAIN on another machine (the Jetson Thor), over ssh
 
 The split needs no new launch path: `run_sim_low.sh` is the brain alone and `run_sim_world.sh`

@@ -78,7 +78,8 @@ void PolicyRuntime::Load() {
   } else {
     noise = std::make_shared<GaussianNoise>(cfg_.noise_seed);
   }
-  fm_ = std::make_shared<FmSession>(cfg_.fm_onnx, cfg_.providers, cfg_.intra_threads, noise);
+  fm_ = std::make_shared<FmSession>(cfg_.fm_onnx, cfg_.providers, cfg_.intra_threads, noise,
+                                   cfg_.fm_cuda_graph);
   fm_->model().WarmUpAndCheckPlacement();
   RequireCuda(fm_->model(), cfg_.providers);
 

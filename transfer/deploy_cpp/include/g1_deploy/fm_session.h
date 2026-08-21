@@ -78,8 +78,11 @@ class GaussianNoise : public NoiseSource {
 /// fm.onnx as an FmSampler.
 class FmSession : public FmSampler {
  public:
+  /// Args:
+  ///   cuda_graph: replay a captured CUDA graph instead of launching ~3000 kernels per plan.
+  ///     Needs a CUDA provider and a fixed-batch fm.onnx; see the note atop ort_session.h.
   FmSession(const std::string& onnx_path, const std::vector<Provider>& providers,
-            int intra_threads, std::shared_ptr<NoiseSource> noise);
+            int intra_threads, std::shared_ptr<NoiseSource> noise, bool cuda_graph = false);
 
   /// The conditioning for the NEXT Submit. Set by the caller each time it requests a plan;
   /// the history rides in the FmRequest itself.
@@ -105,6 +108,13 @@ class FmSession : public FmSampler {
   FmMeta meta_;
   std::shared_ptr<NoiseSource> noise_;
   FmConditioning cond_;
+
+  //: Graph input names in the order RunPersistent expects them, fixed at bind time. Empty
+  //: when capture is off, where the plain Run() path is used instead.
+  std::vector<std::string> bound_inputs_;
+  //: Reused across calls so the hot path allocates nothing.
+  std::vector<const float*> feed_ptrs_;
+  std::vector<float> pred_f_;
 
   // Preallocated feeds: this runs on a control-rate path, so nothing allocates per call.
   std::vector<float> history_f_;

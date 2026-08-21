@@ -20,8 +20,8 @@ void GaussianNoise::Fill(double* out, size_t count) {
 }
 
 FmSession::FmSession(const std::string& onnx_path, const std::vector<Provider>& providers,
-                     int intra_threads, std::shared_ptr<NoiseSource> noise)
-    : model_(onnx_path, providers, intra_threads),
+                     int intra_threads, std::shared_ptr<NoiseSource> noise, bool cuda_graph)
+    : model_(onnx_path, providers, intra_threads, cuda_graph),
       meta_(ParseFmMeta(model_.Metadata("fm_meta"))),
       noise_(std::move(noise)) {
   if (!noise_) throw std::runtime_error("FmSession needs a NoiseSource");
@@ -69,6 +69,18 @@ FmSession::FmSession(const std::string& onnx_path, const std::vector<Provider>& 
 
   cond_.extero.assign(static_cast<size_t>(meta_.extero_dim()), 0.0);
   cond_.future_cmd.assign(static_cast<size_t>(meta_.f) * meta_.cmd_dim, 0.0);
+
+  if (model_.cuda_graph()) {
+    // Bound HERE rather than on the first Submit, because the warm-up in PolicyRuntime::Load
+    // is what triggers the capture and it must find the buffers already in place. The order
+    // matters and is the reason has_history_null is resolved above: the bound set has to be
+    // the set every later call feeds, and a graph without that input must not bind it.
+    bound_inputs_ = {"history", "extero", "cmd_tokens", "noise"};
+    if (meta_.has_history_null) bound_inputs_.push_back("history_null");
+    model_.PreparePersistentIo(bound_inputs_);
+    feed_ptrs_.assign(bound_inputs_.size(), nullptr);
+    pred_f_.assign(ready_pred_.size(), 0.0f);
+  }
 }
 
 void FmSession::SetConditioning(const FmConditioning& cond) {
@@ -106,6 +118,28 @@ void FmSession::Submit(const FmRequest& req) {
   noise_->Fill(noise_d_.data(), noise_d_.size());
   for (size_t i = 0; i < noise_f_.size(); ++i) noise_f_[i] = static_cast<float>(noise_d_[i]);
   null_f_[0] = req.history_null ? 1.0f : 0.0f;
+
+  const auto t_start = std::chrono::steady_clock::now();
+  if (model_.cuda_graph()) {
+    // Same feeds, same order as bound_inputs_. The graph replay reads them out of the device
+    // buffers RunPersistent copies into.
+    feed_ptrs_[0] = history_f_.data();
+    feed_ptrs_[1] = extero_f_.data();
+    feed_ptrs_[2] = cmd_tokens_f_.data();
+    feed_ptrs_[3] = noise_f_.data();
+    if (meta_.has_history_null) feed_ptrs_[4] = null_f_.data();
+    model_.RunPersistent(feed_ptrs_, pred_f_.data(), pred_f_.size());
+    last_infer_ms_.store(std::chrono::duration<double, std::milli>(
+                             std::chrono::steady_clock::now() - t_start).count(),
+                         std::memory_order_relaxed);
+    infer_count_.fetch_add(1, std::memory_order_relaxed);
+    for (size_t i = 0; i < ready_pred_.size(); ++i) {
+      ready_pred_[i] = static_cast<double>(pred_f_[i]);
+    }
+    ready_ = true;
+    ready_target_ = req.target_ctrl_step;
+    return;
+  }
 
   auto mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
   const int64_t hist_shape[3] = {1, meta_.n, meta_.d};
