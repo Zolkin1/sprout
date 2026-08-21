@@ -24,7 +24,10 @@ BAGS=$(ssh -o BatchMode=yes -o ConnectTimeout=6 "$HOST" "ls -1dt $RDIR/*/ 2>/dev
 for b in $BAGS; do
     name=$(basename "$b")
     if [ -d "$DEST/$name" ]; then echo "  have $name"; continue; fi
-    if ssh -o BatchMode=yes "$HOST" "pgrep -f 'ros2 bag record' >/dev/null"; then
+    # The bracket keeps pgrep from matching its OWN command line, which arrives on the remote
+    # side containing the very pattern being searched for. Without it this always reported a
+    # live recorder and refused every bag.
+    if ssh -o BatchMode=yes "$HOST" "pgrep -f '[r]os2 bag record' >/dev/null"; then
         echo "  REFUSING $name: a recorder is running on $HOST, the bag would come back torn"; continue
     fi
     scp -qr -o BatchMode=yes "$HOST:$b" "$DEST/" && echo "  fetched $name"

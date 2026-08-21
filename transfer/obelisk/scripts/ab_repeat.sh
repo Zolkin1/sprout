@@ -58,12 +58,40 @@ while [ $# -gt 0 ]; do
 done
 [ "$BRAIN" = local ] || [ "$BRAIN" = thor ] || { echo "--brain must be local or thor" >&2; exit 2; }
 
+# --scene takes the FULL basename (g1_29j_tile1_scene), not the suffix the sim2sim runner uses
+# (tile1_scene + --robot_name). obk_scene_config only WARNS when the file is missing and then
+# launches a world with no robot, which yields a bag of zero armed ticks -- indistinguishable
+# from a policy failure until you open it. Fail here instead.
+if [ -n "$SCENE" ] && [ ! -f "$OBK_DIR/../sim/robots/g1/$SCENE.xml" ]; then
+    echo "ab_repeat.sh: no such scene: $OBK_DIR/../sim/robots/g1/$SCENE.xml" >&2
+    echo "  available:" >&2
+    ls "$OBK_DIR/../sim/robots/g1/"*_scene.xml 2>/dev/null | xargs -n1 basename | sed 's/\.xml$//;s/^/    /' >&2
+    exit 2
+fi
+
 thor() { ssh -o BatchMode=yes -o ConnectTimeout=6 "$THOR_HOST" "$@"; }
 
 stop_all() {
     (cd "$OBK_DIR" && timeout 90 scripts/stop.sh >/dev/null 2>&1) || true
-    [ "$BRAIN" = thor ] && timeout 90 thor "cd $THOR_DIR && scripts/stop.sh" >/dev/null 2>&1 || true
+    # `timeout` can only exec a BINARY, and thor() is a shell function -- `timeout 90 thor ...`
+    # failed instantly and silently, so the remote half was never stopped and every run after
+    # the first inherited a live session. Put the timeout on the far side of the ssh instead,
+    # where a real /usr/bin/timeout runs it.
+    if [ "$BRAIN" = thor ]; then
+        ssh -o BatchMode=yes -o ConnectTimeout=6 "$THOR_HOST" \
+            "cd $THOR_DIR && timeout 90 scripts/stop.sh" >/dev/null 2>&1 || true
+    fi
     sleep 3
+    # Verify rather than assume: a leftover session makes the next run silently reuse it.
+    local left
+    if [ "$BRAIN" = thor ]; then
+        left=$(ssh -o BatchMode=yes -o ConnectTimeout=6 "$THOR_HOST" \
+               "docker exec docker-sim-1 bash -c 'tmux ls 2>/dev/null' | wc -l" 2>/dev/null)
+    else
+        left=$(docker exec docker-sim-1 bash -c 'tmux ls 2>/dev/null' 2>/dev/null | wc -l)
+    fi
+    [ "${left:-0}" -gt 0 ] 2>/dev/null && echo "[ab] WARNING: $left tmux session(s) survived teardown"
+    return 0
 }
 
 # The brain's bags land on whichever box RECORDS them, which is the box the brain runs on.
@@ -78,11 +106,14 @@ wait_ready() {
     for i in $(seq 1 "$SETTLE"); do
         local pane
         if [ "$BRAIN" = thor ]; then
-            pane=$(thor "docker exec docker-sim-1 bash -c \"tmux capture-pane -p -S -200 -t simlow.0 2>/dev/null\"" 2>/dev/null)
+            pane=$(thor "docker exec docker-sim-1 bash -c \"tmux capture-pane -p -S -400 -t simlow.0 2>/dev/null\"" 2>/dev/null)
         else
-            pane=$(cd "$OBK_DIR" && docker exec docker-sim-1 bash -c "tmux capture-pane -p -S -200 -t simlow.0 2>/dev/null" 2>/dev/null)
+            pane=$(cd "$OBK_DIR" && docker exec docker-sim-1 bash -c "tmux capture-pane -p -S -400 -t simlow.0 2>/dev/null" 2>/dev/null)
         fi
-        case "$pane" in *"policy ready"*) return 0 ;; esac
+        # Match against the pane with NEWLINES REMOVED. tmux returns one line per display
+        # row, so a narrow pane wraps a log line mid-phrase and "policy ready" is split across
+        # two rows -- which silently made this never fire. Joining reconstructs the text.
+        case "$(printf '%s' "$pane" | tr -d '\n')" in *"policyready"*|*"policy ready"*) return 0 ;; esac
         sleep 1
     done
     return 1
@@ -96,8 +127,11 @@ for n in $(seq 1 "$RUNS"); do
     # Brain first: the world has nothing holding the robot up, so a world-first start begins
     # from a pose no training episode ever saw.
     if [ "$BRAIN" = thor ]; then
-        timeout 60 ssh -tt -o BatchMode=yes "$THOR_HOST" \
-            "cd $THOR_DIR && OBK_RESTART=1 scripts/run_sim_low.sh --command $CMD_PROFILE" >/dev/null 2>&1 &
+        # `script` on the FAR side, not `ssh -tt`: -tt needs a local tty to allocate a pty
+        # from, and this call is backgrounded inside a script that has none, so it failed
+        # silently from the second iteration onward and every later run produced no bag.
+        timeout 60 ssh -o BatchMode=yes "$THOR_HOST" \
+            "cd $THOR_DIR && script -qec 'OBK_RESTART=1 scripts/run_sim_low.sh --command $CMD_PROFILE' /dev/null" >/dev/null 2>&1 &
     else
         (cd "$OBK_DIR" && timeout 60 script -qec "OBK_RESTART=1 scripts/run_sim_low.sh --command $CMD_PROFILE" /dev/null) >/dev/null 2>&1 &
     fi
@@ -116,8 +150,26 @@ for n in $(seq 1 "$RUNS"); do
     stop_all
     AFTER="$(bag_dir)"
     if [ "$AFTER" != "$BEFORE" ] && [ -n "$AFTER" ]; then
-        echo "[ab] run $n/$RUNS -> $(basename "$AFTER")"
+        # OBK_PY must be an interpreter with `mcap` installed; the system python3 usually is
+        # not, and this check returning -1 must NOT kill a batch -- it is a diagnostic.
+        armed=$(ARMED_BAG="$AFTER" "${OBK_PY:-python3}" - <<'PYEOF' 2>/dev/null || echo -1
+import os, sys
+sys.path.insert(0, "plot_utils")
+try:
+    from bag_reader import read_bag
+    ticks = [m for _t, m in read_bag(os.environ["ARMED_BAG"]).get("/obelisk/g1/debug/tick", [])]
+    print(sum(1 for m in ticks if getattr(m, "armed", False)))
+except BaseException:
+    print(-1)
+PYEOF
+)
+        echo "[ab] run $n/$RUNS -> $(basename "$AFTER")  (armed ticks: $armed)"
         RESULTS+=("$(basename "$AFTER")")
+        if [ "$n" = 1 ] && [ "${armed:--1}" -ge 0 ] && [ "${armed:-0}" -lt 100 ] 2>/dev/null; then
+            echo "[ab] ABORTING: the first run never armed. The world did not come up (check"
+            echo "     the scene, and that nothing else holds the DDS participant slots)."
+            exit 1
+        fi
     else
         echo "[ab] run $n/$RUNS -> NO NEW BAG (the brain may not have recorded)"
     fi
