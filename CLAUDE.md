@@ -338,6 +338,58 @@ ambiguous rather than merely missing.
   `transforms_np.py` is now tested against the real `robot_rl.flow_matching.transforms`
   (`importorskip`-guarded, so that half skips without IsaacSim).
 
+# The evaluation harness (`scripts/rsl_rl/eval/`)
+
+`evaluate.py --stage plan|cell|grid` then `report.py <run> [<run> ...]`. Stages share one
+manifest so nothing is retyped; `plan` and `report` import no IsaacLab, and `report --stage
+reduce` imports no matplotlib. A cell is `(reference_mode, dr_preset, fm_label)`; the
+generator is a cell DIMENSION, so several generators share ONE clip arm and every cell is
+paired on clip id. See README "4b. Evaluate" for the runbook.
+
+Things here that are load-bearing and were each found by a failure:
+
+- **The tracker task has no `clip_end` termination**, so the harness ADDS one. Without it every
+  episode runs the padded 20 s: a 300-frame clip becomes 6 s of motion plus 14 s of a frozen
+  pose, and in the FM arm 14 s of being commanded the last frame's velocity off a finite tile.
+- **`terrain_columns` returns only the DERIVED terrain flags.** The caller owes
+  `terrain_start_step` / `terrain_end_step`; trusting it for the whole block zero-filled them,
+  which left the derived values correct but made the report's degeneracy gate read every family
+  as informative. Pinned by `test_terrain_columns_does_not_supply_the_primitives`.
+- **Terrain completion is degenerate on 4 of 9 families** (`flat` has no pinned frame;
+  `distractor` / `stairs_*_pure` are pinned to their last frame). The gate is
+  `terrain_end_step < last_usable_step`, per clip -- NOT `has_terrain_span`, which is true for
+  8 of 9. `terrain_progress` is the metric that still says something, and its denominator is
+  the REACHABLE span (`min(terrain_end, last_usable) - terrain_start`) so a success scores
+  exactly 1.0 on every family; the full span would score 0.83-0.91 on the terminal families and
+  smear the success point-mass.
+- **`*/none` is a NOISE FLOOR, not a determinism assertion.** With all DR and obs noise off and
+  the clip pinned, two envs on the same clip and tile still diverge (measured ~0.3 within-clip
+  relative spread of `steps_survived`). One env per tile gives the same spread, so it is not
+  tile sharing -- it is simulator-level. The DR-uniformity check ("every env is the same
+  robot") does hold and is asserted.
+- **Only 5 of 8 physical DR terms can re-draw per reset.** `add_joint_default_pos` adds to the
+  live `default_joint_pos` buffer (random walk), and `randomize_rigid_body_com` hands the FULL
+  CoM array to `set_coms_index` alongside a SUBSET of env ids, which raises on a partial reset.
+  `RESET_SAFE_PHYSICAL_TERMS` encodes the split and the manifest records it per term, because
+  the three that stay `startup` leave their draw confounded with whichever clips an env runs.
+- **`_widen` cannot be used for the OOD preset.** No clamping (turns `static_friction
+  (0.3, 1.6)` into `(-0.025, 1.925)`), and its `len(value) == 2` test silently passes the
+  camera extrinsics 3-tuples through UNTOUCHED, which would make `ood` identical to `train` on
+  that whole axis. The safeguard is not a floor but an assertion that a widened range is never
+  narrower -- a floor of 0.05 makes `viscous_friction`'s OOD low end higher than training's.
+- **Envs may share a tile.** `filter_collisions` is on and the depth raycasts are per-env, so a
+  dozen robots in one tile neither collide nor see each other -- confirmed empirically, not just
+  from the config default. That is what lets `num_envs` be smaller than the column count.
+- **Statistics are clip-averaged with a TILE-clustered bootstrap.** A binomial interval over
+  pooled episodes has an actual coverage of 14-70% against a nominal 95% here, and gets worse
+  with more draws per clip. Spend budget on tiles, not on `robots_per_clip`: 2x the robots
+  measured as buying nothing, while 2x the tiles at half the robots is free and 21% tighter.
+- `scripts/rsl_rl/eval/_paths.py` is the `sys.path` bootstrap that keeps `provenance`,
+  `cli_args`, `play_plots` and `plot_style` reachable by bare name from the subfolder.
+- `scripts/rsl_rl/plot_style.py` is the shared paper style (it lives in the PARENT because four
+  plotters outside the eval use it, and `import robot_rl.anything` drags in IsaacLab).
+  Importing it does not touch `rcParams`; only `apply_paper_style()` does.
+
 # obelisk (ROS2 deploy) — the default run pipeline
 
 Three commands, in this order, every time:

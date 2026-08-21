@@ -293,6 +293,91 @@ coincide. A constant offset or a yaw twist between them is a frame bug in
 re-enables training-time observation noise, which the play trims switch off, so the
 "observed" window variant shows how much of the reference the noise eats.
 
+### 4b. Evaluate: `scripts/rsl_rl/eval/`
+
+The measurement no training curve makes: how often the policy survives, how long failures
+take, how well it tracks the commanded velocity, and whether it gets through the terrain --
+split by terrain family, under three domain-randomization regimes, for the clip arm and the
+generator arm side by side.
+
+Three stages sharing one manifest, so nothing is retyped and no two stages can disagree:
+
+```bash
+# 1. PLAN (no simulator): pick tiles and clips, build a self-contained subset library
+python scripts/rsl_rl/eval/evaluate.py --stage plan \
+    --lib clips/g1_mb_v5_body_mode11_decor.h5 \
+    --load_run <teacher run> \
+    --fm_checkpoint gen_a=logs/flow_matching/<fm run>/best.pt \
+    --num_envs 256 --out logs/terrain_eval/<name>
+
+# 2. GRID: run every cell that is not already complete, one process each
+python scripts/rsl_rl/eval/evaluate.py --stage grid --out logs/terrain_eval/<name> --num_envs 256
+
+# 3. REPORT (no simulator, and `--stage reduce` needs no matplotlib either)
+python scripts/rsl_rl/eval/report.py logs/terrain_eval/<name>
+python scripts/rsl_rl/eval/report.py logs/terrain_eval/{a,b}   # comparison
+```
+
+`--quick` (3 tiles/family, 1 clip/tile) smoke-tests the whole pipeline in a couple of minutes.
+
+**A cell is `(reference_mode, dr_preset, fm_label)`.** `--fm_checkpoint` is repeatable, and the
+generator is a cell DIMENSION rather than a per-run constant: several generators are compared
+against one tracker with the clip arm run ONCE and shared, so every cell is paired on clip id
+by construction and the grid is `P + P*G` cells instead of `P*(1+G)`.
+
+**Both arms run on the tracker task**, the clip arm with `reference_source=clip`, so "success"
+means the same thing in each (survived the clip without falling). `--clip_task` runs the clip
+arm on a teacher task instead, where success additionally requires not tripping the
+clip-graded bounds; the report then prints the two as separate blocks rather than on one axis.
+
+Four things the harness does that are easy to get wrong by hand:
+
+* **It adds `clip_end` to the terminations.** The tracker task deliberately has none, so
+  without it every episode runs the full 20 s regardless of clip length -- a 300-frame
+  distractor clip becomes 6 s of motion plus 14 s of holding a frozen pose, and in the FM arm
+  14 s of being commanded the final frame's velocity, walking off a finite tile.
+* **It reallocates envs across tile columns and re-dispatches on demand.** An even split
+  leaves the 20 s flat lane setting the wall clock; work-conserving dispatch runs at 91-99% of
+  the perfectly-balanced time and works even with fewer envs than columns.
+* **DR presets are built from the canonical event configs**, not from the task flavour: the
+  `-play` trims are PARTIAL (they null the reset-mode friction, both corruption flags and the
+  camera terms, and leave all seven startup physical terms firing). `ood` widens each range
+  about its midpoint with a declared table, clamped at zero, and asserts the result is never
+  narrower than training's -- a blind widen turns `static_friction (0.3, 1.6)` into
+  `(-0.025, 1.925)`.
+* **Five of the eight physical DR terms re-draw every episode**, giving each episode an
+  independent draw so `robots_per_clip` really is the DR sample size. The other three cannot:
+  `add_joint_default_pos` adds to the live buffer and would random-walk, and the two CoM terms
+  raise on a partial reset. Which is which is recorded per term.
+
+**Read the report in this order.** `DEFINITIONS IN FORCE` (what "success" meant, which stratum,
+which interval), then `CELL INVENTORY`, then `HEADLINE`, then `BY FAMILY`, then the paired
+contrasts. Every rate is **clip-averaged with an interval bootstrapped over TILES**, and
+carries the level it came from: a binomial interval over pooled episodes has an actual coverage
+of 14-70% against a nominal 95% on this design, because 25 draws share a clip and two clips
+share a tile.
+
+Two readings the report will not let you take by accident:
+
+* **Terrain completion is degenerate on four of the nine families.** `flat` has no
+  terrain-pinned frame at all; `distractor`, `stairs_up_pure` and `stairs_dn_pure` are pinned
+  to their clip's last frame, so "got through the terrain" IS "survived". Those print `--`, and
+  `terrain_progress` -- how far along the pinned span the robot got, denominated by the
+  REACHABLE span so a success scores exactly 1.0 -- carries the information instead.
+* **`*/none` is the noise floor, not a determinism check.** Measured: with every randomization
+  term nulled, the observation noise off and the clip pinned, two envs on the same clip and the
+  same tile still diverge. It is not tile sharing (one env per tile gives the same spread), so
+  it is simulator-level. That cell is the resolution below which no difference between any two
+  other cells means anything.
+
+Artifacts, per run: `plan.json`, `manifest.json` (git state, checkpoint sha256s, generator
+contracts, both library fingerprints, resolved DR ranges), `eval_clips.h5` (the subset, so the
+run is self-contained), `git/`, and per cell `episodes.h5` (one row per episode, 57 columns)
+plus `cell.json` (resolved DR, coverage proof, throughput). `report/` holds `report.txt`,
+`report.json` -- the text is rendered FROM the json, so nothing downstream ever parses prose --
+`summary_by_family.csv`, and `figures/` as png + svg + a caption sidecar carrying that figure's
+definitions.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.

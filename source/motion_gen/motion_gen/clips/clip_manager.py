@@ -59,23 +59,30 @@ class MotionClipManager(ManagerBase):
         # clips without a per-step schedule this broadcasts the per-clip mask across T, so
         # re-anchoring reads one uniform [N, T] regardless of clip type.
         self.anchor_mask_t: torch.Tensor = lib.anchor_mask_per_step(self.device)  # [num_clips, T] uint8
-        # Last frame of each clip's terrain-PINNED run -- the end of its terrain sequence.
-        self.terrain_end_step: torch.Tensor = self._compute_terrain_end_step()    # [num_clips] long
+        # First and last frame of each clip's terrain-PINNED run -- the extent of its terrain
+        # sequence.  Computed from ONE ``pinned`` mask so the two can never disagree.
+        span = self._compute_terrain_span()
+        self.terrain_start_step: torch.Tensor = span[0]                           # [num_clips] long
+        self.terrain_end_step: torch.Tensor = span[1]                             # [num_clips] long
 
         # Per-env phase carrier (set by the owning command each step so the
         # base ``_update_command`` can read ``manager.phase``).  Allocated by
         # the command via :meth:`ensure_state`.
         self.phase: torch.Tensor | None = None
 
-    def _compute_terrain_end_step(self) -> torch.Tensor:
-        """Last frame index of each clip's terrain-PINNED run.
+    def _compute_terrain_span(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """First and last frame index of each clip's terrain-PINNED run.
 
         A transition or box clip is a sandwich -- ego approach, a pinned run over the
         terrain (the stair climb, the box mount or dismount), then ego walking on the raised
         top or away from it.  Only the middle run is registered to the terrain geometry, so
-        its last frame is the end of the clip's terrain sequence.  Clips with no pinned frame
-        at all (flat, distractors) report ``clip_len - 1``, which makes every consumer a
-        no-op for them rather than needing a special case.
+        its first and last frames bracket the clip's terrain sequence.
+
+        Clips with no pinned frame at all (flat) report ``(-1, clip_len - 1)``.  The ``-1``
+        start is what distinguishes "no terrain span" from "pinned from frame 0" -- which
+        the end alone cannot, because a clip pinned to its last frame and a clip with no
+        pinned frame both report ``clip_len - 1``.  The ``clip_len - 1`` end keeps every
+        existing consumer a no-op for such clips rather than needing a special case.
 
         Two things this must get right, both of which have a wrong-but-plausible shortcut:
 
@@ -88,7 +95,7 @@ class MotionClipManager(ManagerBase):
           pinned all the way out to ``num_steps - 1``.
 
         Returns:
-            ``[num_clips]`` long tensor on the library device.
+            ``(start, end)``, each ``[num_clips]`` long on the library device.
         """
         from ..world_lift import anchor_mask_is_pinned
 
@@ -96,9 +103,15 @@ class MotionClipManager(ManagerBase):
         t = self.anchor_mask_t.shape[1]
         valid = torch.arange(t, device=dev).unsqueeze(0) < self.clip_len.to(dev).unsqueeze(1)
         pinned = anchor_mask_is_pinned(self.anchor_mask_t) & valid   # [N, T]
+        any_pinned = pinned.any(dim=1)
+        as_u8 = pinned.to(torch.uint8)
+        first = torch.argmax(as_u8, dim=1)
         # Reverse argmax = index of the LAST True; flip the index back into forward order.
-        last = (t - 1) - torch.argmax(pinned.flip(1).to(torch.uint8), dim=1)
-        return torch.where(pinned.any(dim=1), last, self.clip_len.to(dev) - 1).long()
+        last = (t - 1) - torch.argmax(as_u8.flip(1), dim=1)
+        fallback_end = self.clip_len.to(dev) - 1
+        start = torch.where(any_pinned, first, torch.full_like(first, -1)).long()
+        end = torch.where(any_pinned, last, fallback_end).long()
+        return start, end
 
     # ------------------------------------------------------------------
     # ManagerBase surface used at command construction
@@ -218,9 +231,17 @@ class MotionClipManager(ManagerBase):
         """Return the last terrain-PINNED frame ``[N]`` long for each env's clip.
 
         Step-invariant, so this takes only ``clip_id``.  Follows the same CPU-lib / CUDA-env
-        device shuttle as :meth:`gather`.  See :meth:`_compute_terrain_end_step`.
+        device shuttle as :meth:`gather`.  See :meth:`_compute_terrain_span`.
         """
         return self.terrain_end_step[clip_id.to(self.terrain_end_step.device)].to(clip_id.device)
+
+    def gather_terrain_start_step(self, clip_id: torch.Tensor) -> torch.Tensor:
+        """Return the FIRST terrain-pinned frame ``[N]`` long for each env's clip.
+
+        ``-1`` where the clip has no pinned frame at all.  Step-invariant, so this takes
+        only ``clip_id``.  See :meth:`_compute_terrain_span`.
+        """
+        return self.terrain_start_step[clip_id.to(self.terrain_start_step.device)].to(clip_id.device)
 
     # ------------------------------------------------------------------
     # ManagerBase abstract methods (trivial for fixed clips; the command's

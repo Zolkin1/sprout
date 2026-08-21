@@ -334,7 +334,8 @@ def load_clip_library(
     return ClipLibraryData(meta=meta, attrs=attrs, **tensors)
 
 
-def write_clip_subset(src: str, dst: str, clip_indices: Sequence[int]) -> list[dict]:
+def write_clip_subset(src: str, dst: str, clip_indices: Sequence[int],
+                      compression: str | None = None) -> list[dict]:
     """Copy a clip library keeping only ``clip_indices`` (and only their manifest tiles).
 
     The point of a subset library is REPRODUCIBILITY: with a handful of clips in the file
@@ -359,6 +360,10 @@ def write_clip_subset(src: str, dst: str, clip_indices: Sequence[int]) -> list[d
         src: Source library ``.h5``.
         dst: Output ``.h5`` (overwritten).
         clip_indices: Clip indices to keep, in output order. Must be non-empty and unique.
+        compression: h5py filter for the copied datasets. ``None`` (the default) keeps the
+            historical behaviour of writing them uncompressed; ``"lzf"`` matches what the
+            generators write and is worth ~1.8x on these arrays, which matters once a subset
+            is shipped as part of an artifact rather than used as a scratch file.
 
     Returns:
         The filtered terrain manifest (one entry per kept non-flat tile).
@@ -379,7 +384,9 @@ def write_clip_subset(src: str, dst: str, clip_indices: Sequence[int]) -> list[d
             # h5py fancy indexing needs the selection sorted+unique, so gather per clip and
             # restack in the requested order. The libraries here are per-clip-chunked, so
             # this is a handful of reads, not a full-file scan.
-            fo.create_dataset(key, data=np.stack([np.asarray(d[i]) for i in idx]), dtype=d.dtype)
+            arr = np.stack([np.asarray(d[i]) for i in idx])
+            fo.create_dataset(key, data=arr, dtype=d.dtype, compression=compression,
+                              chunks=((1,) + arr.shape[1:]) if compression else None)
         for key, value in fi.attrs.items():
             fo.attrs[key] = value
         keep_tiles = {int(t) for t in tid if int(t) != _FLAT_TERRAIN_ID}
@@ -398,6 +405,43 @@ def write_clip_subset(src: str, dst: str, clip_indices: Sequence[int]) -> list[d
         gcfg["subset_of"] = {"path": str(src), "clip_indices": idx}
         fo.attrs["generator_config"] = json.dumps(gcfg)
     return manifest
+
+
+def set_flat_tile_count(path: str, tiles: int) -> int:
+    """Set a library's flat-TILE count, overriding what :func:`write_clip_subset` left.
+
+    ``generator_config.counts.flat`` is a TILE count -- the importer's
+    ``default_num_flat_tiles`` reads it as one, and its docstring is explicit that flat
+    tiles are not one-per-clip: every flat tile hosts many flat clips, because the reset
+    samples any flat clip onto any flat tile (they all share ``terrain_id == -1``).
+
+    :func:`write_clip_subset` cannot know the intended tile count, so it writes the kept
+    flat CLIP count and leaves the caller to correct it.  Getting that wrong is quiet and
+    expensive in both directions: too few tiles and the terrain reset aborts with
+    "terrain id(s) [-1] have an env tile but NO clips"; too many and the importer builds
+    one large flat tile per clip, so a 3000-clip flat library asks for a 3000-tile mesh.
+
+    Args:
+        path: Library ``.h5`` to edit in place.
+        tiles: Flat tile count to record.  Must be >= 1.
+
+    Returns:
+        The value written.
+
+    Raises:
+        ValueError: If ``tiles`` is less than 1.
+    """
+    if int(tiles) < 1:
+        raise ValueError(f"flat tile count must be >= 1, got {tiles}")
+    with h5py.File(str(path), "r+") as f:
+        raw = f.attrs.get("generator_config")
+        gcfg = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        if not isinstance(gcfg, dict):
+            gcfg = {}
+        gcfg.setdefault("counts", {})
+        gcfg["counts"]["flat"] = int(tiles)
+        f.attrs["generator_config"] = json.dumps(gcfg)
+    return int(tiles)
 
 
 def group_clips_by_terrain(lib: ClipLibraryData) -> dict[int, torch.Tensor]:
