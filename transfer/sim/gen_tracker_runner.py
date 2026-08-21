@@ -1192,6 +1192,11 @@ def main() -> None:
     parser.add_argument("--scene", type=str, default="basic_scene")
     parser.add_argument("--robot_name", type=str, default="g1_21j")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
+    parser.add_argument("--tracker_on_cpu", action="store_true", default=False,
+                        help="Run the tracker on the CPU while the generator keeps the GPU. "
+                             "Costs the tracker nothing and keeps it out of the generator's "
+                             "captured submission; this is what the hardware controller does "
+                             "by default.")
     parser.add_argument("--fm_cuda_graph", action="store_true", default=False,
                         help="Replay a captured CUDA graph for the generator instead of "
                              "launching its ~3000 kernels individually (9.8 -> 8.3 ms per "
@@ -1437,6 +1442,7 @@ def main() -> None:
         tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
         zero_noise=args.zero_noise,
         fm_cuda_graph=args.fm_cuda_graph,
+        tracker_on_cpu=args.tracker_on_cpu,
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
         allow_privileged_extero=args.allow_privileged_extero,
         fm_lead_ticks=args.fm_lead_ticks,

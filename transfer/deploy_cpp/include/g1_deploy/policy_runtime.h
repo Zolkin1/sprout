@@ -81,6 +81,27 @@ struct RuntimeConfig {
   std::string fm_onnx;                //: empty for tracker-only (clip) playback
   std::vector<Provider> providers{Provider::kCpu};
   int intra_threads = 0;
+  //: Providers for the TRACKER alone, and its own thread count.
+  //:
+  //: Separate from `providers` so the tracker can run on the CPU while the generator keeps the
+  //: GPU. That is not a fallback, it is the preferred arrangement: measured on a Jetson Thor
+  //: the tracker is 0.24 ms on 4 CPU threads against 0.24 ms on CUDA, so the GPU buys it
+  //: nothing -- while sharing the GPU costs it a great deal. With CUDA Graph capture the
+  //: generator's whole replay is ONE submission, so a tracker inference landing during it
+  //: waits for all ~12 ms of it: measured tracker p99 went 0.62 -> 12.18 ms and the control
+  //: tick's p99 0.85 -> 12.38 ms when capture was turned on.
+  //:
+  //: Putting the tracker on the CPU makes that collision impossible rather than unlikely, and
+  //: splits the failure domains: a slow or wedged GPU can no longer stall the path that
+  //: commands motors. The cost is 1.7e-6 rad of joint target (CPU vs CUDA over 200 random
+  //: observations), which is three orders below encoder resolution.
+  std::vector<Provider> tracker_providers{Provider::kCpu};
+  //: Kept SMALL on purpose. 2 threads is 0.38 ms on the Thor and 8 threads is 0.16 ms, and the
+  //: difference is irrelevant against a 20 ms period -- while the cores are not, because the
+  //: same CPU runs the estimator, the ROS messaging and the motor comms. onnxruntime's CPU
+  //: thread pool also spins, so extra threads buy latency nobody needs and add jitter to the
+  //: loop that does.
+  int tracker_intra_threads = 2;
   bool zero_noise = false;
   uint64_t noise_seed = 0;
   //: How far before its cadence boundary a plan is requested, in SECONDS. Converted to ticks

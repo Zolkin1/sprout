@@ -145,6 +145,7 @@ class GenTrackerPolicy:
         zero_noise: bool = False,
         providers=None,
         fm_cuda_graph: bool = False,
+        tracker_on_cpu: bool = False,
         allow_privileged_extero: bool = False,
         fm_lead_ticks: int = 0,
     ):
@@ -176,7 +177,11 @@ class GenTrackerPolicy:
         ``fm.onnx``, and refuses loudly rather than degrading if either is missing -- see
         ``fm_session.enable_cuda_graph``. The tracker is left alone: 17 nodes and 0.2 ms.
 
-        ``providers`` selects the onnxruntime execution providers for BOTH graphs (see
+        ``tracker_on_cpu=True`` puts the TRACKER on the CPU while the generator keeps
+        ``providers``. See :meth:`load`.
+
+        ``providers`` selects the onnxruntime execution providers for the generator (and for
+        the tracker unless ``tracker_on_cpu``) (see
         ``tracker_session.resolve_providers``); ``None`` = CPU, which is the deployment
         default. Both sessions get the same list -- a split would be measurable only as
         an inexplicable latency difference between the two nets.
@@ -205,6 +210,7 @@ class GenTrackerPolicy:
         self.zero_noise = bool(zero_noise)
         self.providers = providers
         self.fm_cuda_graph = bool(fm_cuda_graph)
+        self.tracker_on_cpu = bool(tracker_on_cpu)
         self.allow_privileged_extero = bool(allow_privileged_extero)
         #: Emulate the C++ runtime's generator LEAD: it requests each plan `lead` ticks
         #: before the boundary it is for, and conditions it on the exteroception and the
@@ -236,7 +242,15 @@ class GenTrackerPolicy:
     # ------------------------------------------------------------------
     def load(self) -> None:
         """Load the tracker + FM ONNX sessions and build the orderings/buffers."""
-        self._trk = TrackerSession(self.tracker_onnx, self.num_threads, self.providers)
+        # The tracker can sit on the CPU while the generator keeps the GPU. It costs the
+        # tracker nothing (0.24 ms on 4 CPU threads vs 0.24 ms on CUDA, measured on a Jetson
+        # Thor) and it keeps it out of the generator's way: under CUDA Graph capture the
+        # generator's replay is ONE submission, so a tracker inference landing inside it waits
+        # out the whole ~12 ms. The C++ runtime defaults this ON; here it is opt-in, because
+        # this path is also the parity oracle and its provider should stay whatever the caller
+        # asked for unless told otherwise.
+        trk_providers = ["cpu"] if self.tracker_on_cpu else self.providers
+        self._trk = TrackerSession(self.tracker_onnx, self.num_threads, trk_providers)
         self.fm_enabled = self.fm_onnx is not None
         if self.fm_enabled:
             self.ctx = load_fm_context(self.fm_onnx, self.num_threads, self.providers,

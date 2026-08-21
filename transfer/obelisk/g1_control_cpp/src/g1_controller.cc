@@ -109,6 +109,11 @@ void G1Controller::DeclareParams() {
   // Generator-only, and OFF by default: it needs a CUDA provider and a fixed-batch
   // fm.onnx, and both are refused loudly at load rather than degraded silently.
   this->declare_parameter<bool>("fm_cuda_graph", false);
+  // The TRACKER's placement, independent of use_cuda (which now means the generator). On by
+  // default: it costs the tracker nothing and it is what keeps the control tick off the
+  // generator's GPU submission. See RuntimeConfig::tracker_providers.
+  this->declare_parameter<bool>("tracker_on_cpu", true);
+  this->declare_parameter<int>("tracker_threads", 2);
   this->declare_parameter<int>("fm_late_disarm_ticks", 0);
   // The kinematic model the camera poses are FK'd on. A parameter and not a constant because
   // the robot's models are on their way to being consolidated; when that lands this moves a
@@ -144,6 +149,8 @@ G1Controller::on_configure(const rclcpp_lifecycle::State& prev) {
   fm_lead_sec_ = this->get_parameter("fm_lead_sec").as_double();
   threaded_fm_ = this->get_parameter("threaded_fm").as_bool();
   fm_cuda_graph_ = this->get_parameter("fm_cuda_graph").as_bool();
+  tracker_on_cpu_ = this->get_parameter("tracker_on_cpu").as_bool();
+  tracker_threads_ = static_cast<int>(this->get_parameter("tracker_threads").as_int());
   fm_late_disarm_ticks_ = static_cast<int>(this->get_parameter("fm_late_disarm_ticks").as_int());
   urdf_path_ = this->get_parameter("urdf_path").as_string();
   zero_noise_ = this->get_parameter("zero_noise").as_bool();
@@ -246,13 +253,18 @@ void G1Controller::LoadPolicy() {
   cfg.fm_lead_sec = fm_lead_sec_;
   cfg.threaded_fm = threaded_fm_;
   cfg.fm_cuda_graph = fm_cuda_graph_;
+  cfg.tracker_providers = tracker_on_cpu_
+                              ? std::vector<g1_deploy::Provider>{g1_deploy::Provider::kCpu}
+                              : cfg.providers;
+  cfg.tracker_intra_threads = tracker_threads_;
   cfg.zero_noise = zero_noise_;
 
   RCLCPP_INFO(this->get_logger(),
               "loading the policy pair from %s (cuda=%d, threads=%d, zero_noise=%d, "
-              "fm_cuda_graph=%d)",
+              "fm_cuda_graph=%d, tracker_on_cpu=%d/%d threads)",
               base.c_str(), static_cast<int>(use_cuda_), onnx_threads_,
-              static_cast<int>(zero_noise_), static_cast<int>(fm_cuda_graph_));
+              static_cast<int>(zero_noise_), static_cast<int>(fm_cuda_graph_),
+              static_cast<int>(tracker_on_cpu_), tracker_threads_);
   policy_ = std::make_unique<g1_deploy::PolicyRuntime>(cfg);
   policy_->Load();   // throws on a CPU fallback when cuda was asked for; see RequireCuda
 

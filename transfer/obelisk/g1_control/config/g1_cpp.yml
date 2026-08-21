@@ -103,6 +103,22 @@ control:
       # a symbolic-batch graph leaves nodes on the host and is refused at load.
       fm_cuda_graph: true
 
+      # Run the TRACKER on the CPU while the generator keeps the GPU. Not a fallback -- the
+      # preferred arrangement. On a Jetson Thor the tracker is 0.24 ms on 4 CPU threads and
+      # 0.24 ms on CUDA, so the GPU buys it nothing, while SHARING the GPU costs it plenty:
+      # a captured generator replay is one submission, so a tracker inference landing inside
+      # it waits out all ~12 ms. Measured with both on CUDA: tracker p99 0.62 -> 12.18 ms and
+      # tick p99 0.85 -> 12.38 ms once capture was on. On the CPU that collision cannot
+      # happen at all, and a wedged GPU can no longer stall the motor command path.
+      #
+      # Costs 1.7e-6 rad of joint target (CPU vs CUDA over 200 random observations).
+      #
+      # 2 threads, deliberately small: 8 threads would be 0.16 ms instead of 0.38, which is
+      # irrelevant against a 20 ms period, while the cores are not -- the estimator, the ROS
+      # messaging and the motor comms are on the same CPU, and onnxruntime's pool spins.
+      tracker_on_cpu: true
+      tracker_threads: 2
+
       # Ticks of continuous lateness before disarming. 0 = never, which is the deliberate
       # default: a late plan is survivable (the cursor keeps advancing and the far end of the
       # reference window saturates, and the timing line says so), and disarming mid-stride is

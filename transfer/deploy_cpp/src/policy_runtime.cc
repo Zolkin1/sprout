@@ -53,8 +53,8 @@ PolicyRuntime::PolicyRuntime(const RuntimeConfig& cfg) : cfg_(cfg) {}
 PolicyRuntime::~PolicyRuntime() = default;
 
 void PolicyRuntime::Load() {
-  tracker_ = std::make_unique<TrackerSession>(cfg_.tracker_onnx, cfg_.providers,
-                                              cfg_.intra_threads);
+  tracker_ = std::make_unique<TrackerSession>(cfg_.tracker_onnx, cfg_.tracker_providers,
+                                              cfg_.tracker_intra_threads);
   const PolicyParams& p = tracker_->params();
   if (!p.reference_window.has_value()) {
     throw std::runtime_error(
@@ -64,7 +64,10 @@ void PolicyRuntime::Load() {
   const ReferenceWindowSpec& rw = *p.reference_window;
 
   tracker_->model().WarmUpAndCheckPlacement();
-  RequireCuda(tracker_->model(), cfg_.providers);
+  // Against the TRACKER's own request, so a deliberate CPU tracker is not refused while a
+  // tracker that asked for CUDA and silently did not get it still is. RequireCuda is a no-op
+  // when nothing in the list is an accelerator.
+  RequireCuda(tracker_->model(), cfg_.tracker_providers);
 
   if (cfg_.fm_onnx.empty()) {
     throw std::runtime_error(
