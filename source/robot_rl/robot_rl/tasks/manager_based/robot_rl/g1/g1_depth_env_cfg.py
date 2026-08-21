@@ -48,6 +48,7 @@ from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.mdp.sensors import DepthNoiseCfg
 from robot_rl.tasks.manager_based.robot_rl.terrains.decor import DECOR_PRIM_PATH
 
+from .g1_flat_blind_env_cfg import ACTION_RATE_WEIGHT
 from .g1_self_scan import link_prim_path, self_scan_prim_paths
 from .g1_teacher_env_cfg import G1TeacherEventsCfg, G1TeacherObservationsCfg
 from .g1_teacher_terrain_env_cfg import (
@@ -523,6 +524,14 @@ class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainBodyEnvCfg):
     )
     observations: G1TeacherTerrainDepthObservationsCfg = G1TeacherTerrainDepthObservationsCfg()
     events: G1TeacherTerrainDepthEventsCfg = G1TeacherTerrainDepthEventsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # 10x the -0.01 every teacher inherits. Shared with the blind flat teacher through
+        # one constant, because a different smoothness cost on each would confound the
+        # blind-vs-camera comparison. Raised for the runs queued 2026-08-21; the number is
+        # a starting point, not a tuned value.
+        self.rewards.action_rate_l2.weight = ACTION_RATE_WEIGHT
 
 
 @configclass

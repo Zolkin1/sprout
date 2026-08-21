@@ -149,6 +149,33 @@ if not _registered:
         },
     )
 
+    ## =========================================
+    # The DEPLOY-ISOLATION teacher: no exteroception at all, on flat ground.
+    # Everything the depth teacher has except the cameras and the terrain, so a
+    # hardware failure can be attributed to perception or to tracking rather than
+    # to "the policy". Pair with a flat-only clip library.
+    ## =========================================
+    gym.register(
+        id="G1-teacher-clf-flat-blind",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_flat_blind_env_cfg:G1TeacherFlatBlindEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
+    gym.register(
+        id="G1-teacher-clf-flat-blind-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point":
+                f"{__name__}.g1_flat_blind_env_cfg:G1TeacherFlatBlindEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
     gym.register(
         id="G1-teacher-clf-terrain-depth-image",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
