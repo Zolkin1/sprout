@@ -14,12 +14,11 @@
 // boundary that plan is for, so it has a lead window rather than having to return inside the
 // one tick that needs it.
 //
-// The lead is not free, and it is not latency the way inference time is: it is exteroception
-// STALENESS. What is sampled early is sampled EARLY -- a lead of n ticks conditions the plan
-// on a camera n*dt old. So the shipped `fm_lead_sec` is the MINIMUM this scheduler allows,
-// one tick, and the generator does not reliably fit inside it (med 13.7 / p99 22.3 ms
-// measured against 20 ms). Roughly 6% of plans are expected to land a tick late, by choice.
-// Absorbing that is what the lateness contract below is for.
+// The lead is not free, and it is not latency the way inference time is: it is also
+// exteroception STALENESS. What is sampled early is sampled EARLY -- a lead of n ticks
+// conditions the plan on a camera n*dt old, while giving the generator n*dt to answer. Where
+// to sit on that trade is a configuration question (obelisk config/g1_cpp.yml); whatever is
+// chosen, a plan that misses its boundary is absorbed by the lateness contract below.
 //
 // That is only sound because the conditioning can be built for the FUTURE boundary at
 // request time: the history rows are the nodes this runtime will SERVE between now and then,

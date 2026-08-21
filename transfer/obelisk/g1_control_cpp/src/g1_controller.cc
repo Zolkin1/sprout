@@ -96,17 +96,14 @@ void G1Controller::DeclareParams() {
   // The generator's LEAD, not its cadence. The cadence comes from tracker.onnx metadata and
   // nowhere else -- a parameter for it would read as a live knob that can never take effect.
   //
-  // ONE tick at dt = 0.02, deliberately the smallest lead PlanScheduler allows, because the
-  // lead is not latency the way inference time is -- it is exteroception STALENESS. The plan
-  // is conditioned on the depth image and command as they were at REQUEST time, so every
-  // extra tick of lead hands the generator a camera 20 ms older. It was 0.05 (3 ticks,
-  // 60 ms), which was three times every other delay in the stack put together.
+  // The lead is the generator's deadline AND its exteroception staleness: the plan is
+  // conditioned on the depth image and command as they were at REQUEST time, so each tick of
+  // lead gives the generator another dt to answer and hands it an image dt older. Clamped to
+  // [1, K-1]. A plan that misses its boundary does not stall the reference; see
+  // plan_scheduler.h's lateness contract, and `fm_late_events` in a bag for how often.
   //
-  // It does NOT fit the generator, and that is priced in rather than avoided: measured
-  // per-plan inference is med 13.7 / p99 22.3 ms against this 20 ms budget, so ~6% of plans
-  // arrive one tick late (never two -- the worst seen was 22.8 ms). A late plan does not
-  // stall the reference; see plan_scheduler.h's lateness contract. Widen the generator's
-  // horizon F to buy the slack back.
+  // The config file is what actually sets this per deployment; this default only applies
+  // when nothing does.
   this->declare_parameter<double>("fm_lead_sec", 0.02);
   this->declare_parameter<bool>("threaded_fm", true);
   this->declare_parameter<int>("fm_late_disarm_ticks", 0);

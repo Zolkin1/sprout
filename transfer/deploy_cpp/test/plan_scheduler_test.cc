@@ -171,12 +171,11 @@ TEST(PlanScheduler, LateGeneratorAdvancesTheCursorAndSaturatesTheFarOffsets) {
   EXPECT_GT(h.sched.offsets_clamped(), 0u) << "saturation must be counted, not silent";
 }
 
-/// The SHIPPED configuration: one tick of lead, and a generator that misses it ~6% of runs.
+/// What one tick of lateness actually costs, at the current artifact's horizon.
 ///
-/// `fm_lead_sec = 0.02` buys 40 ms less exteroception staleness in exchange for the occasional
-/// late plan, so the degradation that trade actually costs is pinned here rather than left to
-/// be discovered on a robot. The claim being pinned is narrow and worth stating exactly: at
-/// one tick late the ONLY offset that repeats is the furthest, because F == max_offset + K.
+/// Pinned because the cost is easy to overestimate or underestimate from the code alone, and
+/// it decides whether a given lead is usable. The claim is narrow: at one tick late the ONLY
+/// offset that repeats is the furthest, because F == max_offset + K.
 TEST(PlanScheduler, OneTickOfLeadRepeatsOnlyTheFurthestOffsetWhenAPlanSlips) {
   Harness h(LiveConfig(/*lead=*/1));
   for (int i = 0; i < kK; ++i) h.Tick();
