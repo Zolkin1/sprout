@@ -39,20 +39,29 @@ control:
       # nowhere else, so a parameter for it would read as a live knob that can never take
       # effect (which is exactly what happened to fm_update_every once already).
       #
-      # This is two ticks at dt = 0.02. The lead sets TWO things at once, in opposite
-      # directions: it is the generator's deadline (n * dt to return a plan) and it is
-      # exteroception staleness (the plan is conditioned on the depth image and velocity
-      # command as they were at REQUEST time, so n * dt older). Clamped to [1, K-1].
+      # BACK TO ONE TICK, because the generator got faster rather than because the trade
+      # changed. The lead sets TWO things at once, in opposite directions: it is the
+      # generator's deadline (n * dt to return a plan) and it is exteroception staleness (the
+      # plan is conditioned on the depth image and velocity command as they were at REQUEST
+      # time, so n * dt older). Clamped to [1, K-1].
+      #
+      # This was 0.04 for exactly one reason: per-plan cost on the Thor was 21 ms against the
+      # 20 ms budget one tick gives, so every plan arrived late and clamped. Fixing the ONNX
+      # export's batch axis and capturing the CUDA graph took that to ~12 ms in the loop, so
+      # one tick fits with ~8 ms of margin and the second tick was buying nothing but 20 ms of
+      # extra blindness.
       #
       # Size it against the generator's cost on the box that will run it, measured from
-      # `fm_infer_ms` in a bag rather than from an isolated benchmark -- the two differed by
-      # ~5 ms here. Per-plan medians measured so far: 14 ms on the x86 desktop, 21 ms on a
-      # Jetson Thor, 35 ms on that Thor with TF32 disabled.
+      # `fm_infer_ms` IN A BAG rather than from an isolated benchmark -- the two differed by
+      # ~5 ms here, and the benchmark was the optimistic one. Per-plan medians measured so far:
+      # 14 ms on the x86 desktop and 21 ms on a Jetson Thor before the capture work, 35 ms on
+      # that Thor with TF32 disabled, ~12 ms on the Thor after it.
       #
       # A plan that misses its boundary is not dropped: the cursor advances and the far window
       # offsets saturate (see deploy_cpp/include/g1_deploy/plan_scheduler.h). `fm_late_events`
       # and `fm_offsets_clamped` in the bag count how often, which is the number to look at
-      # when changing this.
+      # when changing this -- and the number to check after this change, since one tick has
+      # less headroom under contention than two.
       #
       # 0.02 s (ONE tick) is the smallest lead PlanScheduler allows, and was chosen
       # that way because the lead is not latency the way inference time is. It is exteroception
@@ -82,7 +91,7 @@ control:
       # This value WINS over the C++ declared default, which is also 0.02. The lead a run
       # actually used is in the bag as FmPlan.lead_ticks -- read it there rather than assuming
       # this file was in effect, which is a mistake already made once.
-      fm_lead_sec: 0.04
+      fm_lead_sec: 0.02
 
       # The generator on its own thread. false runs it inline, which is what the tests and the
       # benchmark do and which is useful for isolating a threading question from a policy one
