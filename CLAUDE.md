@@ -407,6 +407,58 @@ there is a difference in the ROS stack. The clip library is built by
   `run_sim_world.sh`. The controller has no auto-arm and must not grow one
   (`tests/test_auto_arm_is_sim_only.py`).
 
+## Running the BRAIN on another machine (the Jetson Thor), over ssh
+
+The split needs no new launch path: `run_sim_low.sh` is the brain alone and `run_sim_world.sh`
+the world alone, so the brain runs on the Thor and the MuJoCo world on the dev desktop. Both
+halves must agree on `ROS_DOMAIN_ID` and `RMW_IMPLEMENTATION` (obk sets them) and each box
+needs its OWN `docker/cyclonedds.xml` with the addresses swapped. That file is GITIGNORED, so
+the link is described here rather than in it: `192.168.50.10` desktop (world),
+`192.168.50.20` Thor (brain), `zolkin@`, direct cable on a private subnet chosen to collide
+with nothing else on the desktop. `scripts/net_check.sh` on BOTH boxes while both halves are
+up is the preflight, and it names the four ways discovery fails.
+
+Host prerequisites, both boxes, and neither is optional:
+- `net.core.rmem_max=16777216`. Cyclone treats a smaller kernel as FATAL and every ROS node
+  dies at startup with `rmw_create_node: failed to create domain`.
+- `<MaxAutoParticipantIndex>32</MaxAutoParticipantIndex>` in the cyclone config. Unicast peers
+  require `ParticipantIndex auto`, which caps participants at 9 by default, and the world's
+  bringup exceeds that. Cyclone's own default is `none`, which has no cap but needs multicast.
+
+Then, in order, and the ORDER IS LOAD-BEARING (the world has no `user_pose` holding the robot
+up, so a world-first start hands the policy an already-collapsed robot):
+
+```bash
+ssh -t zolkin@192.168.50.20 'cd ~/sprout/transfer/obelisk && scripts/run_sim_low.sh'  # brain
+scripts/run_sim_world.sh --scene g1_29j_tile1_scene                                   # world, here
+scripts/fetch_brain_bags.sh          # bags are recorded ON THE BRAIN's box
+```
+
+**Traps, each of which cost a debugging cycle:**
+- **`stop.sh` is LOCAL ONLY** -- there is no ssh in it. Tearing down here leaves the remote
+  brain running and still recording. Stop both.
+- **`run_sim_low.sh` RE-ATTACHES** when its tmux session exists, so a config change is ignored
+  until `OBK_RESTART=1`.
+- **The Thor cannot reach GitHub** (the key needs a passphrase, so non-interactive ssh fails).
+  Move commits with a bundle over the private link, and FETCH BEFORE reverting anything local:
+  `git bundle create /tmp/x.bundle <their-head>..<branch>`, scp, then
+  `git fetch /tmp/x.bundle <branch> && git merge --ff-only FETCH_HEAD`.
+- **`ssh -tt` needs a LOCAL tty** to allocate a pty from, so it fails when backgrounded inside
+  a script. Run `script -qec '<cmd>' /dev/null` on the far side instead.
+- **There is no tmux on the Thor HOST** (only inside the container).
+- **`timeout` cannot exec a shell function.** `timeout N my_ssh_fn ...` fails instantly and
+  silently; put the timeout on the far side of the ssh.
+- **`pgrep -f <pattern>` matches its own command line**, and over ssh that line arrives
+  containing the pattern. Bracket it (`'[r]os2 bag record'`) and keep the literal out of any
+  echo in the same command -- this produced four separate false conclusions in one session.
+- **Never copy a bag from a live run**: it comes back torn at message ~0. Stop first.
+- **Remote bags go to `log/bags_thor/`**, never `log/bags/`. Bags are named by timestamp only,
+  so mixing two machines in one directory makes their origin unrecoverable.
+- **The clocks are not synchronised** (chrony here, systemd-timesyncd there, ~8 ms apart).
+  Cross-box `depth_capture_age` is offset by that and can read SMALLER than `depth_age`, which
+  is impossible. Rate matches to 1 ppm, so only the absolute value is affected. Nothing in the
+  control path uses a remote stamp; the watchdog deliberately uses receipt time.
+
 ## Logging: MCAP, and what is deliberately NOT in it
 
 Bags land in `transfer/obelisk/log/bags/<timestamp>_<tag>/`; figures next to them. The
