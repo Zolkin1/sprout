@@ -13,6 +13,22 @@ from motion_gen.features import DEFAULT_MJCF
 from .extero_encoder import conv_grid_shape
 
 
+#: The camera-latency distribution to train the depth generator under.
+#:
+#: Index is the lag in CONTROL STEPS and the step is 20 ms (camera 50 Hz, control 50 Hz), so
+#: this is P(0 ms), P(20 ms), P(40 ms), P(60 ms). Mean 2.40 steps = **48 ms**, matching the
+#: ~50 ms Zach measured for depth compute plus the ROS hop, with the 60 ms peak represented.
+#:
+#: **Lag 0 is zero and stays zero.** A frame cannot arrive in the step it was captured in, so
+#: weight there trains the model on a case the robot never sees -- and it is the easiest case,
+#: which makes it optimistic about a signal that is always late. The recorder still stores the
+#: frame, so a no-latency ablation costs nothing.
+#:
+#: An earlier draft was 0/40/35/25 (37 ms), from a first estimate of 20-40 ms. The measurement
+#: came in nearer 50, so the mass moved off 20 ms and onto 40 and 60.
+DEPTH_LATENCY_PROBS: tuple[float, float, float, float] = (0.0, 0.10, 0.40, 0.50)
+
+
 #: Recognised :attr:`FlowMatchingConfig.extero_source` values.  These are also the keys
 #: ``record_data.py`` writes, so the dataset looks the array up by this name directly.
 EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")

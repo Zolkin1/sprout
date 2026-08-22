@@ -1188,6 +1188,15 @@ class FutureStateDataset(Dataset):
                 if cfg.extero_xyz_offset is None:
                     cfg.extero_xyz_offset, cfg.extero_xyz_envelope = derived, envelope
                 else:
+                    # The envelope is derived from the camera CONE, not from the offset, so a
+                    # declared offset does not imply a declared envelope -- and it used to be
+                    # assigned only on the branch above. Declaring an offset therefore left it
+                    # None and the ``float(...)`` below raised a bare TypeError, immediately
+                    # after a warning saying a declared offset is fine. There is no
+                    # ``--extero_xyz_envelope`` flag to set it by hand either, so the
+                    # documented escape hatch from a stale offset could not be used at all.
+                    if cfg.extero_xyz_envelope is None:
+                        cfg.extero_xyz_envelope = envelope
                     drift = max(
                         (sum((a - b) ** 2 for a, b in zip(d, c)) ** 0.5
                          for d, c in zip(derived, cfg.extero_xyz_offset)), default=0.0)
