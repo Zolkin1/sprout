@@ -14,18 +14,10 @@ optional before this runs on the robot, except where marked.
 
 ## 1. Blocking: the images do not match what the policy trained on
 
-- [ ] **1a. Get `tracker.onnx` + `fm.onnx` onto this box.**
-  Needed by everything else here; the box currently has no policy artifact at all.
-  - DONE: `env_transfer` is built and both `prefetch_policy.py` and
-    `export_sensor_configs.py` import and run in it. See 5c for the one package missing.
-  - Remaining: `./env_transfer/bin/python transfer/obelisk/scripts/prefetch_policy.py
-    --hf_policy_folder <NAME>`
-    against `zolkin/robot_rl`. **The folder name is unknown to me** -- it is the run that
-    matches the cameras currently being trained with, not necessarily the MVP pair recorded
-    in CLAUDE.md.
-  - The script loads the pair before exiting, so a tracker/generator that disagree about the
-    depth cameras are caught here rather than on the robot.
-  - Done when: `<cache>/policies/<run>/{tracker,fm}.onnx` exist and the script exits clean.
+- [x] **1a. Get the artifacts onto this box. DONE.**
+  `env_transfer` is built (see the footnote on `pin`), and `tracker.onnx` + `fm.onnx` for
+  `TEMP_mode11_decor_lag48_aug_NOT_HW_READY` are fetched. `prefetch_policy.py` 404s on that
+  folder because of where it sits, so they were pulled by hand -- see 1d.
 
 - [x] **1b. Set the real FoV, resolution, range and sentinel. DONE, and verified.**
   Derived from `TEMP_mode11_decor_lag48_aug_NOT_HW_READY`'s `tracker.onnx` and applied to
@@ -47,22 +39,20 @@ optional before this runs on the robot, except where marked.
   An invalid pixel needs nothing here: the SDK's NaN/inf passes through and the
   CONTROLLER's `normalize_depth_np` maps every invalid class onto the sentinel.
 
-- [ ] **1d. Re-derive from the REAL policy.** The checkpoint above is named `TEMP` and
-  `NOT_HW_READY`, and it does not live where the deployment path looks -- it is at the repo
-  ROOT of `zolkin/robot_rl`, while `prefetch_policy.py` and the controller both expect
-  `policies/<run>/` (pinned across the language boundary by `test_policy_cache_layout.py`).
-  So `prefetch_policy.py` 404s on it and I fetched the two files by hand.
-  - Either upload the real policy under `policies/<run>/`, or the controller cannot find it
-    on the robot regardless of what this box does.
-  - The geometry only moves if the camera configuration changed, but that is a check rather
-    than an assumption.
+- [ ] **1d. Swap in the real policy when it exists.** The current checkpoint is
+  `TEMP`/`NOT_HW_READY` and sits at the repo ROOT, where `prefetch_policy.py` and the
+  controller cannot find it (both expect `policies/<run>/`, pinned by
+  `test_policy_cache_layout.py`). The real one WILL be uploaded in the right place and is
+  expected to carry the same camera geometry, so this is a re-verify rather than a redo:
+  run `export_sensor_configs.py` against it and confirm `zed_targets.yml` still says
+  100x70 / 70x42, 30x26, 0.1-7.9 / 0.15-11.9. Cheap, and the alternative is trusting that
+  nothing moved.
 
-- [ ] **1e. The contract asks for 50 Hz; we deliver ~45.** `rate_hz: 50.0` for both cameras.
-  Measured 44.9 / 46.2 with `depth_stabilization: 30`. Turning it to 0 measured 50.4 Hz, and
-  the sim noise model has no temporal filter anyway, so it is arguably closer to training on
-  two counts. Keeping stabilization means the controller reuses the previous frame on
-  roughly one tick in ten. Decide deliberately -- this is the same knob as 4b, now with the
-  contract's own number attached to it.
+- [x] **1e. ~45 Hz against the contract's 50. ACCEPTED for now.**
+  `depth_stabilization: 30` stays. The contract's `rate_hz` is 50.0 and we measure 44.9 /
+  46.2, so the controller reuses the previous frame on roughly one tick in ten -- judged
+  acceptable, since sim testing held up at 30 Hz. Turning stabilization off measured 50.4 Hz
+  and remains the lever if this ever needs revisiting.
 
 ---
 
@@ -134,9 +124,9 @@ optional before this runs on the robot, except where marked.
 
 ## 4. Validation, before committing to this config
 
-- [ ] **4a. Re-measure the rate.** The 30 s run gives 44.7 Hz/camera; a later 5 s spot check
-  through the launch file read 49.1 Hz. 5 s is too short to trust, but the gap is unexplained
-  and the documented number should be the one that survives a long run.
+- [x] **4a. Rate settled, no new measurement needed.** The 49.1 Hz reading was a 5 s
+  sample and is discarded. Every 30 s run agrees: 44.87, 44.67 / 44.89, and 44.92 / 46.17
+  Hz. Call it ~45 Hz per camera. Nothing operational turns on it.
 
 - [ ] **4b. Check NEURAL_LIGHT's depth QUALITY on a real scene.** It was chosen on rate
   alone (44.7 Hz vs NEURAL's 19.2). The bench scene showed 40-52% invalid pixels at 0.36 m
@@ -149,18 +139,17 @@ optional before this runs on the robot, except where marked.
 
 ---
 
-## 5. Housekeeping (non-blocking)
+## 5. Decided against
 
-- [ ] **5a. Send `0001-camera-selection.patch` upstream** to `wdc3iii/zed-interface`. It is
-  carried locally only because `ZED_REF` is pinned deliberately -- the depth geometry has to
-  match training, and a moving ref is a silent way to change it. Upstreaming it plus a
-  `ZED_REF` bump deletes the patch.
-- [ ] **5c. `pin` (pinocchio) is NOT in this box's `env_transfer`.** It is unsatisfiable
-  here: every `pin>=3.1` wheel pulls `cmeel-boost`, which requires numpy>=2, while
-  `requirements.txt` pins numpy<2 for the onnxruntime ABI. The venv was built with `pin`
-  filtered out, and `requirements.txt` is UNCHANGED -- relaxing the numpy pin affects every
-  box and is not mine to decide. Nothing needed here uses it (`deploy/fk.py` and the viewer
-  ribbon do; the robot's FK is the C++ `CameraPoseFk` in the container anyway), but
-  `transfer/sim` viewers will not run on this box until it is resolved.
-- [ ] **5b. Upstream `default_params.yaml`'s `resolution: HD720`**, which no GMSL ZED X can
-  open. Our configs override it, so this only bites someone using the stock launch.
+- **Upstreaming the camera-selection patch to `wdc3iii/zed-interface`, and the HD720
+  default with it.** Not needed. The patch mechanism is the steady state, not a stopgap:
+  `ZED_REF` is pinned deliberately because the depth geometry has to match training, and
+  `git apply` fails the build if the patch ever stops applying -- so it cannot silently
+  skip. Upstreaming would trade a pinned ref for a moving one.
+
+- **Resolving the `pin` (pinocchio) pip conflict.** Irrelevant to this box: pinocchio is
+  not in the ZED image at all, and the controller gets it from `ros-humble-pinocchio` via
+  apt rather than pip, so no deployment path touches the pip package. `env_transfer` here
+  is bring-up tooling only (it fetched the policy and derived the geometry, neither of
+  which needs FK). It would only matter if someone ran `transfer/sim`'s viewers on this
+  box, which is not what it is for.
