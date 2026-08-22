@@ -21,6 +21,25 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     itself, not even during warmup. See :attr:`strict_fm_only`.
     """
 
+    fm_depth_lag_steps: int | None = None
+    """Synthetic camera lag for the GENERATOR, in control steps of 20 ms.
+
+    The generator trains on depth frames 20-60 ms old (compute plus the ROS hop), so feeding
+    it the live frame here is off-distribution in exactly the variable that model was fitted
+    to. ``None`` derives the lag from the loaded checkpoint's own
+    ``depth_latency_probs`` (rounded mean: the shipped distribution gives 2 steps = 40 ms);
+    an int forces it; ``0`` disables it.
+
+    **Only the generator is delayed.** The teacher's own depth observation stays live -- it
+    was trained on fresh frames, and delaying that is a separate question.
+
+    COST: a non-zero lag makes the generator's exteroception read EVERY control step instead
+    of once per re-plan, because a 2-step-old frame has to have been captured to be served.
+    That is the unprojection running 12x more often on the ``fm_snap_every=12`` cadence. At
+    the default of 0 nothing extra runs at all, so a checkpoint without a latency
+    distribution costs exactly what it did before.
+    """
+
     class_type: type | str = (
         "robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking"
         ".fm_tracking_cmd:FmTrackingCommand"

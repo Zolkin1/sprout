@@ -38,6 +38,7 @@ import yaml
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deploy.artifacts import resolve_fm_onnx  # noqa: E402
+from deploy.fm_session import default_depth_lag_steps
 from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
 from deploy.quat_math_np import (  # noqa: E402
@@ -132,10 +133,78 @@ class RealtimePacer:
             time.sleep(slack)
 
 
+class FmDepthLag:
+    """Hands the GENERATOR a depth frame `steps` control steps old, with its own pose.
+
+    The generator trains on frames delayed 20-60 ms (the depth pipeline's compute plus the
+    ROS hop), so feeding it a fresh one in simulation is off-distribution in exactly the
+    variable that model was fitted to. Hardware needs none of this -- its lag is physical and
+    already in the frames -- which is why this lives in the sim runner and not in
+    ``transfer/deploy``.
+
+    The POSE travels with the image. The 5-channel row's xyz planes are unprojected from the
+    camera pose, so a lagged image unprojected with the CURRENT pose is displaced by the
+    egomotion -- precisely the registration error those channels exist to remove. Buffering
+    the pair keeps them consistent, matching what ``dataset._select_depth_lag`` does offline.
+
+    Only the generator is delayed. The tracker's own ``state["depth"]`` observation stays
+    live: it was trained on fresh frames, and delaying it is a separate question.
+    """
+
+    def __init__(self, steps: int, why: str = "") -> None:
+        """Set up the ring buffer.
+
+        Args:
+            steps: Lag in control steps (20 ms each). ``<= 0`` disables it entirely, leaving
+                the state dict byte-identical to what it was before this existed.
+            why: Where the value came from, for the one-time announcement.
+        """
+        self.steps = max(int(steps), 0)
+        self._buf: list[tuple] = []
+        if self.steps:
+            print(f"[INFO] FM camera lag: {self.steps} step(s) = {20 * self.steps} ms "
+                  f"({why}). The generator sees a frame that old, with the camera pose it "
+                  "was captured at; the tracker's own depth obs stays live.")
+        else:
+            print(f"[INFO] FM camera lag: OFF ({why}). The generator sees the live frame, "
+                  "which is off-distribution if it trained with latency.")
+
+    def apply(self, state: dict) -> dict:
+        """Replace the generator's depth + pose in ``state`` with the lagged pair.
+
+        Args:
+            state: The state dict just built for this step; mutated in place.
+
+        Returns:
+            The same dict, for chaining.
+        """
+        if not self.steps:
+            return state
+        # `fm_depth` when the generator samples its own grid, else a COPY of the tracker's --
+        # `_fm_depth_reading` treats `fm_depth` as authoritative whenever it is present, so
+        # this reaches the generator without touching what the tracker observes.
+        img = state.get("fm_depth")
+        if img is None:
+            img = state.get("depth")
+        if img is None:
+            return state
+        self._buf.append((np.array(img, copy=True), state.get("fm_camera_pose")))
+        del self._buf[:-(self.steps + 1)]
+        # Early in an episode the buffer is short: repeat the OLDEST frame held rather than
+        # zero-filling. A zero depth row is a valid reading -- a surface at the near plane --
+        # so a zero-filled warm-up would condition the generator on a wall that is not there.
+        img_lag, pose_lag = self._buf[max(len(self._buf) - 1 - self.steps, 0)]
+        state["fm_depth"] = img_lag
+        if pose_lag is not None:
+            state["fm_camera_pose"] = pose_lag
+        return state
+
+
 def build_state(
     robot: Robot, policy: GenTrackerPolicy, command: np.ndarray,
     depth_cams: MujocoDepthCameras | None = None, want_depth_hits: bool = False,
     fm_depth_cams: MujocoDepthCameras | None = None,
+    fm_lag: "FmDepthLag | None" = None,
 ) -> dict:
     """Assemble the world-state dict ``GenTrackerPolicy.create_obs`` expects.
 
@@ -283,6 +352,9 @@ def build_state(
     # generator was trained to use (down). The viewer's hit cloud stays the tracker's.
     if fm_depth_cams is not None:
         state["fm_depth"] = fm_depth_cams.compute(robot.mj_data)
+    # LAST, so it sees the finished pair and can substitute both. A no-op at lag 0.
+    if fm_lag is not None:
+        fm_lag.apply(state)
     return state
 
 
@@ -500,7 +572,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
         viz_geomgroup: list[int] | None = None, viz_contacts: bool = False,
-        fm_depth_cams: MujocoDepthCameras | None = None) -> bool | None:
+        fm_depth_cams: MujocoDepthCameras | None = None,
+        fm_lag: FmDepthLag | None = None) -> bool | None:
     """Run the warmup + control loop; return True if the robot did not fall.
 
     Returns ``None`` when the user interrupts with Ctrl-C, which is neither survival nor a
@@ -646,7 +719,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         if warmup_steps == 0:
             # No hold: fall back to a static warm-start fill so the FM is valid at step 0.
             policy.warm_start(build_state(robot, policy, np.zeros(3), depth_cams,
-                                          fm_depth_cams=fm_depth_cams))
+                                          fm_depth_cams=fm_depth_cams, fm_lag=fm_lag))
 
     # Predicted extra-frame indices that are feet (for the FM viz spheres).
     foot_idx = [i for i, n in enumerate(policy.ctx.target_frame_names)
@@ -721,7 +794,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         else:
             vel_cmd = desired
         state = build_state(robot, policy, vel_cmd, depth_cams, want_depth_hits=viz,
-                            fm_depth_cams=fm_depth_cams)
+                            fm_depth_cams=fm_depth_cams, fm_lag=fm_lag)
         obs = policy.create_obs(state)
         action = policy.get_action(obs, robot.joint_names)
         robot.apply_action(action)
@@ -1007,7 +1080,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             if total_time > 0 and robot.mj_data.time > total_time:
                 return True
             state = build_state(robot, policy, np.zeros(3), depth_cams,
-                                fm_depth_cams=fm_depth_cams)
+                                fm_depth_cams=fm_depth_cams, fm_lag=fm_lag)
             policy.observe(state)
             robot.apply_action(hold_target)
             draw_viz(viewer, state)
@@ -1166,6 +1239,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the G1 generator+tracker pair in MuJoCo.")
     parser.add_argument("--experiment", type=str, default="g1")
     parser.add_argument("--load_run", type=str, default=None, help="Tracker run dir (default: latest).")
+    parser.add_argument("--fm_depth_lag_steps", type=int, default=None,
+                        help="Synthetic camera lag for the GENERATOR, in control steps of "
+                             "20 ms (camera and control both run at 50 Hz). Omit to derive "
+                             "it from the loaded fm.onnx: the rounded mean of the "
+                             "depth_latency_probs it trained under, so the shipped "
+                             "(0, .10, .40, .50) gives 2 steps = 40 ms against a 48 ms mean. "
+                             "0 disables it. A graph exported before the latency model "
+                             "carries no distribution and derives 0. Only the generator is "
+                             "delayed -- the tracker's own depth observation stays live, and "
+                             "hardware adds nothing, its lag being physical already.")
     parser.add_argument("--fm_onnx", type=str, default=None,
                         help="Which generator to load: a path, or a bare filename resolved "
                              "inside <run>/exported/. Exports are named for the FM checkpoint "
@@ -1546,6 +1629,15 @@ def main() -> None:
             # independent -- they cannot be shared across differing pixel counts.)
             fm_depth_cams.mirror_extrinsics_from(depth_cams)
 
+    # From the CLI when given, else from the graph's own trained distribution. Derived
+    # rather than hard-coded so a checkpoint trained at a different latency brings its own
+    # number, and a pre-latency graph correctly gets none.
+    _probs = getattr(policy.ctx, "depth_latency_probs", None)
+    if args.fm_depth_lag_steps is not None:
+        fm_lag = FmDepthLag(args.fm_depth_lag_steps, "--fm_depth_lag_steps")
+    else:
+        fm_lag = FmDepthLag(default_depth_lag_steps(_probs),
+                            f"derived from fm.onnx depth_latency_probs={_probs}")
     success = run(policy, robot, command_fn, total_time, args.headless, log_path,
                   args.warmup_time, args.rt_factor, standing_config, args.viz,
                   args.vel_arrow_scale, args.vel_arrow_height, args.hold_kp_scale,
@@ -1557,7 +1649,7 @@ def main() -> None:
                   spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride,
-                  fm_depth_cams=fm_depth_cams)
+                  fm_depth_cams=fm_depth_cams, fm_lag=fm_lag)
     # None = interrupted, which is neither survival nor a fall; saying "Survived: None"
     # would put a non-result into the same line every sweep greps for.
     if success is None:

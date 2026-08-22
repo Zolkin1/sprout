@@ -501,6 +501,13 @@ class GenTrackerPolicy:
         widths, so there is nothing to reuse and nothing to resize (upsampling would invent
         detail the grid never had).
 
+        ``fm_depth`` is AUTHORITATIVE whenever the runner supplies it, split or not. It used
+        to be consulted only on a split, which left a caller no way to feed the generator a
+        different reading at a shared resolution -- the case a simulator needs to reproduce
+        camera latency, where the generator must see an older frame while the tracker's own
+        observation stays live. Nothing on the robot sets it at a shared resolution, so the
+        hardware path is unchanged.
+
         Args:
             state: The runtime state dict the runner built this step.
 
@@ -510,18 +517,18 @@ class GenTrackerPolicy:
         Raises:
             KeyError: If the samplings are split and the runner supplied no ``fm_depth``.
         """
+        if "fm_depth" in state:
+            return np.asarray(state["fm_depth"], dtype=np.float64)
         if not self.depth_sampling_is_split():
             return np.asarray(state["depth"], dtype=np.float64)
-        if "fm_depth" not in state:
-            raise KeyError(
-                "the generator samples the depth cameras at "
-                f"{self._fm_depth_spec[0]['width']}x{self._fm_depth_spec[0]['height']} while "
-                f"the tracker uses {self._depth_spec[0]['width']}x{self._depth_spec[0]['height']}, "
-                "so it needs its own reading in state['fm_depth'] -- cast a second grid from "
-                "get_fm_depth_camera_spec(). state['depth'] is the TRACKER's and is the wrong "
-                "width."
-            )
-        return np.asarray(state["fm_depth"], dtype=np.float64)
+        raise KeyError(
+            "the generator samples the depth cameras at "
+            f"{self._fm_depth_spec[0]['width']}x{self._fm_depth_spec[0]['height']} while "
+            f"the tracker uses {self._depth_spec[0]['width']}x{self._depth_spec[0]['height']}, "
+            "so it needs its own reading in state['fm_depth'] -- cast a second grid from "
+            "get_fm_depth_camera_spec(). state['depth'] is the TRACKER's and is the wrong "
+            "width."
+        )
 
     def _fm_extero_row(self, state: dict) -> np.ndarray:
         """The generator's exteroception reading, widened to the channels it was trained on.

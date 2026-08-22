@@ -227,6 +227,13 @@ class FmOnlineContext:
     scan's 1.0 m default is too tight for a large grid, and a live reading clipped harder than
     the training data is silently a different sensor.
     """
+    depth_latency_probs: tuple[float, ...] | None = None
+    """Camera-latency distribution this checkpoint TRAINED under, or ``None`` for none.
+
+    Index is the lag in control steps (20 ms each). Carried so a SIMULATOR can reproduce the
+    latency the generator expects instead of feeding it a fresh frame it never saw in
+    training. Hardware must ignore it -- the lag there is physical and already in the frames.
+    """
     extero_image_hw: list[tuple[int, int]] | None = None
     """Per-sensor ``(height, width)`` the exteroception row folds into, or ``None``.
 
@@ -599,6 +606,8 @@ def load_fm_context(
         # The band this checkpoint was TRAINED under, so the live token builder clamps the way
         # the dataset did. Never None for depth -- refused above.
         extero_clip=cfg.extero_clip,
+        depth_latency_probs=(tuple(float(p) for p in cfg.depth_latency_probs)
+                             if cfg.depth_latency_probs else None),
     )
 
 

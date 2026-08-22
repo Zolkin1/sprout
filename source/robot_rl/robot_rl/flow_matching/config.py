@@ -29,6 +29,35 @@ from .extero_encoder import conv_grid_shape
 DEPTH_LATENCY_PROBS: tuple[float, float, float, float] = (0.0, 0.10, 0.40, 0.50)
 
 
+def default_depth_lag_steps(probs) -> int:
+    """How many control steps of camera lag to SIMULATE, given the trained distribution.
+
+    Training samples a fresh lag per window; a simulator replaying one rollout wants a single
+    representative value, and the rounded mean is the one that puts the run in the middle of
+    the distribution rather than at an end. For the shipped ``(0, .10, .40, .50)`` that is
+    ``0.10*1 + 0.40*2 + 0.50*3 = 2.4 -> 2`` steps = 40 ms, against a 48 ms mean.
+
+    This is a SIM-ONLY number. Hardware's lag is physical and already in the frames, so a
+    deployment must never add it -- doing so would double-count.
+
+    Mirrored torch-free in ``transfer/deploy/fm_session.default_depth_lag_steps`` for the
+    deploy runtime, which cannot import ``robot_rl``.
+
+    Args:
+        probs: Per-lag probabilities, index = lag in control steps, or ``None``.
+
+    Returns:
+        The rounded mean lag in steps; ``0`` when ``probs`` is ``None`` or empty, which is
+        also what a checkpoint trained before the latency model gives.
+    """
+    if not probs:
+        return 0
+    total = float(sum(probs))
+    if total <= 0.0:
+        return 0
+    return int(round(sum(i * float(p) for i, p in enumerate(probs)) / total))
+
+
 #: Recognised :attr:`FlowMatchingConfig.extero_source` values.  These are also the keys
 #: ``record_data.py`` writes, so the dataset looks the array up by this name directly.
 EXTERO_SOURCES: tuple[str, ...] = ("height_scan", "depth")
