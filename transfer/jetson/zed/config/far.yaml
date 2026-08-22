@@ -1,0 +1,71 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+# The far depth camera: ZED X Mini, serial 59249806.
+#
+# `/**` and not the node name: both cameras run the same executable under remapped names
+# (zed_near / zed_far), and a params file keyed by node name applies to NOTHING once the node
+# is renamed -- silently, with every default left in place.
+#
+# Topics are the deployment contract, not a choice: g1_world.yml subscribes to
+# /depth/{near,far}/image_processed and the controller refuses to arm when the topic count
+# disagrees with tracker.onnx.
+#
+# MEASURED on zed-box-2 (Orin NX, SDK 5.2.3), both cameras concurrent, through this node:
+#   44.7 Hz/camera, capture->subscriber median 41.9 ms, p90 48.3, p99 53.8.
+# SVGA because HD720 is a USB-camera mode no GMSL ZED X can open, and HD1200 halves to
+# 15.7 Hz with both cameras running. NEURAL_LIGHT because NEURAL is 19.2 Hz concurrent.
+# fps 120 is worth 13.4 ms of LATENCY at unchanged rate: the GPU still makes only ~45 depth
+# maps/s, but the frame it picks up is much younger. Pipeline depth scales with the frame
+# PERIOD, which is why fps 30 is 21 ms worse rather than better.
+# depth_stabilization stays at 30 for now; 0 would give 50.4 Hz and ~1.4 ms less, and is
+# arguably closer to training (the sim noise model has no temporal filter). Revisit.
+#
+# TODO(fov): clip_fov / downsample / range below are the UPSTREAM DEFAULTS and do not match
+# any policy. The real numbers come from tracker.onnx:
+#     python scripts/rsl_rl/export_sensor_configs.py --run_dir logs/rsl_rl/g1/<run>
+#     # -> zed_targets.yml: width, height, hfov_deg, vfov_deg,
+#     #    min_range_m, max_range_m, invalid_range_m, rate_hz
+# Map those onto clip_fov/downsample/depth_{min,max}_distance here. The native cone at SVGA
+# is 106.2 x 79.5 deg on BOTH cameras (fx=fy=360), and clip_fov can only CROP -- asking for
+# more than the native cone silently clamps to the image bounds.
+/**:
+  ros__parameters:
+    depth_topic: "depth/far/image_raw"
+    camera_info_topic: "depth/far/camera_info"
+    processed_depth_topic: "depth/far/image_processed"
+    processed_camera_info_topic: "depth/far/camera_info_processed"
+    frame_id: "zed_far_frame"
+
+    # Which camera. A serial names a DEVICE; gmsl_port names a MOUNTING POSITION and so
+    # survives a camera swap -- prefer the port once the pair is physically fixed, since
+    # near/far are positions. Without either, the SDK opens the first available camera and
+    # which one is 'near' is a coin flip across restarts.
+    serial_number: 59249806
+
+    resolution: "SVGA"
+    fps: 120
+    depth_mode: "NEURAL_LIGHT"
+    depth_min_distance: -1.0       # TODO(fov): min_range_m from zed_targets.yml
+    depth_max_distance: -1.0       # TODO(fov): max_range_m from zed_targets.yml
+    coordinate_units: "METER"
+    depth_stabilization: 30
+    depth_encoding: "32FC1"
+
+    confidence_threshold: 95
+    texture_confidence_threshold: 100
+    publish_raw: false
+
+    gaussian_blur:
+      enabled: false
+      kernel_radius: 4
+
+    clip_fov:                      # TODO(fov): hfov_deg / vfov_deg from zed_targets.yml
+      enabled: true
+      horizontal_fov_deg: 60.0
+      vertical_fov_deg: 50.0
+
+    downsample:                    # TODO(fov): width / height from zed_targets.yml
+      enabled: true
+      width: 30
+      height: 26
+      method: "mean"
+      alpha: 0.5

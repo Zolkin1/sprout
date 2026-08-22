@@ -93,6 +93,55 @@ and the next launch just re-attaches.
 
 ## Troubleshooting
 
+## What it actually delivers (measured, not specified)
+
+Both cameras concurrently on zed-box-2 (Orin NX, GPU pinned at its 918 MHz ceiling), through
+this node, 30 s per config. `tools/zed_sdk_timing.py` measures the camera and SDK alone;
+`tools/zed_ros_timing.py` measures capture -> subscriber end to end.
+
+| config | rate/camera | capture->recv median | p90 | p99 |
+|---|---|---|---|---|
+| SVGA NEURAL_LIGHT fps 120 stab 30 **(shipped)** | **44.7 Hz** | **41.9 ms** | 48.3 | 53.8 |
+| SVGA NEURAL_LIGHT fps 120 stab 0 | 50.5 Hz | 40.5 ms | 44.8 | 49.8 |
+| SVGA NEURAL_LIGHT fps 60 stab 30 | 44.9 Hz | 55.4 ms | 62.5 | 69.0 |
+| SVGA NEURAL fps 60 stab 30 | 19.2 Hz | -- | | |
+| HD1200 NEURAL fps 60 stab 30 | 15.7 Hz | -- | | |
+
+Four things that are not obvious from the numbers:
+
+* **`fps: 120` buys LATENCY, not rate** -- 13.4 ms off the median with the rate unchanged. The
+  GPU makes only ~45 depth maps/s per camera either way; the sensor running faster just means
+  the frame it picks up is younger. Pipeline depth scales with the frame PERIOD, which is why
+  `fps: 30` is 21 ms WORSE rather than better.
+* **`retrieve_measure` is the wait on the depth network, not a memory copy.** `--retrieve gpu`
+  does no host transfer and costs the same as `cpu`; the cost tracks the depth MODE (17 ms
+  light / 46 ms neural), not the pixel count.
+* **The node itself costs ~2 ms** of the total -- FoV clip, downsample, message build and DDS
+  combined. The latency is the camera and the network; there is nothing to win in the node.
+* **The controller does not see the median.** At 44.7 Hz the frame period is 22.4 ms against a
+  20 ms tick, so some ticks reuse the previous frame: age at the tick is the 41.9 ms plus up to
+  one period, ~53 ms typical and ~76 ms worst case. That is what `depth_capture_age` reports.
+
+Exposure is not a lever (pinning it to 2 ms moved capture->grab by 0.6 ms) and neither are the
+GPU clocks (an Orin NX tops out at the 918 MHz it already runs at). Contention is worth 17.3 ms
+-- one camera alone totals 33.7 ms -- but that run was fps-limited while the pair does 2 x 45
+depth maps/s, i.e. more total GPU work, so merging the two nodes into one process would recover
+only the two-CUDA-context overhead and not the cost of computing two depth maps.
+
+## Running the pair
+
+```bash
+docker exec -d zed_depth bash -c 'source /opt/ros/humble/setup.bash &&
+  source ~/ws_zed/install/setup.bash && exec ros2 run zed_depth_publisher zed_depth_node \
+  --ros-args -r __node:=zed_near --params-file /opt/zed_config/near.yaml'
+# ...and again with far/far.yaml
+```
+
+Not `run_node.sh zed`: that launches the stock `default_params.yaml`, which asks for HD720 and
+therefore cannot open a GMSL camera at all, and it launches ONE node with no camera selector.
+
+## Troubleshooting
+
 | symptom | cause |
 |---|---|
 | no `/dev/video*` and `ZED_Diagnostic` finds no camera | the cameras were not plugged in AT BOOT. GMSL is not USB: the deserializer probes once, and `sl_max96712_probe: No Camera connected to this deserializer` in `journalctl -b` is the proof. You do NOT need a reboot -- `sudo systemctl restart driver_zed_loader.service` re-runs `/usr/sbin/ZEDX_Driver`, which rmmods and reloads the `sl_*` modules and restarts nvargus |

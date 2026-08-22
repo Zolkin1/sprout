@@ -72,6 +72,10 @@ services:
       # edited between runs, and rebuilding a multi-GB image to change a percentile is not a
       # loop anyone will actually use. Read-only -- nothing in here writes to the repo.
       - ../tools:/opt/zed_tools:ro
+      # The per-camera node params. Bind-mounted for the same reason as the tools, and
+      # because the FoV/range numbers in them answer to a policy artifact rather than to
+      # this image -- they change when the tracker does, not when the container does.
+      - ../config:/opt/zed_config:ro
       # Persist the SDK's optimised NEURAL engines, so they are not rebuilt (minutes) on
       # every container start.
       - zed_resources:/usr/local/zed/resources
