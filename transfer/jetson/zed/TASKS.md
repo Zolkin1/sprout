@@ -78,17 +78,35 @@ optional before this runs on the robot, except where marked.
     cabled, and confirm pubkey auth works FROM INSIDE the controller container.
   - Untested end to end: nothing has yet driven this path from the Thor.
 
-- [ ] **2c. Switch camera selection from serial to `gmsl_port` -- BLOCKED, and not on
-  the mounts.** The SDK does not report the port on this box: `get_device_list()` returns
-  `gmsl_port: -1` for both cameras (and `i2c_port: 0`), so the only thing distinguishing
-  them in the enumeration is `path` -- `/dev/i2c-9` and `/dev/i2c-10`. There is therefore
-  no way to LOOK UP which port a camera is on; it would have to be found by trying
-  `gmsl_port: 0` / `1` and seeing which camera opens.
-  - Worth doing only if the ports turn out to be stable and discoverable by trial. The
-    motive is unchanged -- a port names a MOUNTING POSITION, so replacing a camera cannot
-    silently transpose near and far, where a serial has to be hand-edited.
-  - Until then `serial_number` is correct and unambiguous. This is an ergonomic
-    improvement, not a correctness one.
+- [ ] **2c. `gmsl_port` WORKS -- but decide whether we want it.** Tested through the node
+  on all four ports:
+
+  | GMSL port | camera | role |
+  |---|---|---|
+  | 0 | ZED X, 44889004 | far / upper |
+  | 1 | not detected | -- |
+  | 2 | ZED X Mini, 59249806 | near / lower |
+  | 3 | not detected | -- |
+
+  Two separable things, and only one was ever broken. SELECTION works: the C++
+  `setFromGMSLPort` exists and opens the right camera (the PYTHON binding lacks it, which is
+  why `pyzed` could not test it -- `sl.InputType` has no `set_from_gmsl_port`). DISCOVERY is
+  what is missing: `get_device_list()` reports `gmsl_port: -1`, so nothing can look the
+  mapping up. The trial above replaces that permanently -- the ports are physical connectors,
+  so the numbers do not move unless a cable does.
+
+  **The tradeoff runs the other way from what task 2c assumed**, because our two cameras are
+  DIFFERENT MODELS:
+  - `serial_number` (today): a swapped pair of cables changes nothing -- each role opens its
+    own camera wherever it is plugged. A REPLACED camera needs a one-line config edit, and
+    until it gets one the node fails loudly at `open()`.
+  - `gmsl_port`: a replaced camera needs no edit. But a swapped pair of cables SILENTLY
+    transposes near and far, and since both cameras share a native cone (106.2 x 79.5 deg)
+    nothing in the imagery reveals it -- it surfaces as a policy that misjudges the ground.
+
+  Serial fails loudly, port fails silently. Recommendation: **keep `serial_number`**, and
+  keep the mapping above recorded so switching stays a one-line change if that calculus
+  changes (e.g. if cameras start getting swapped often).
 
 - [ ] **2d. DDS across the three boxes.** The Thor, this box and the robot share one
   ethernet network, so they share a DDS graph. Three things must line up:
@@ -103,23 +121,21 @@ optional before this runs on the robot, except where marked.
     because they are on a direct cable. On a real shared LAN with working multicast, the
     default may be fine -- decide deliberately rather than by inheriting one.
 
-- [ ] **2e. (BRAIN, not this box) Check the URDF's camera mounts against the real robot.**
+- [ ] **2e. (BRAIN, not this box) Merge the updated URDF before any hardware testing.**
   `CameraPoseFk` FKs the cameras from `urdf_path` plus the contract's mount body and offset,
-  every tick, to unproject the depth image into the root's yaw-aligned frame. This policy's
-  contract puts both cameras on `torso_link_origin_site`:
+  every tick, to unproject the depth image. This policy's contract puts both cameras on
+  `torso_link_origin_site`:
 
   | camera | offset (m) | tilt about Y |
   |---|---|---|
   | near | `[0.107, 0.025, 0.045]` | 65 deg |
   | far  | `[0.085, 0.06, 0.285]`  | 15 deg |
 
-  Far sits 24 cm above near, which independently confirms the upper/lower binding in 1c.
-
-  The task is to confirm the real robot matches: the URDF must define
-  `torso_link_origin_site` where the physical torso frame is, and the cameras must be bolted
-  at those offsets and angles. If either disagrees, every xyz channel is mis-registered --
-  and the DEPTH channel still looks perfect, so no image inspection and nothing on the ZED
-  box can reveal it. The symptom is a policy that misjudges where the ground is.
+  The PHYSICAL mounts were designed to match these numbers exactly, and the matching URDF
+  exists on another branch. So the remaining work is the merge, not a measurement -- but it
+  is a hard prerequisite for hardware testing, because a URDF that does not describe the
+  real mounts mis-registers every xyz channel while the DEPTH channel still looks perfect.
+  Nothing on the ZED box, and no image inspection, can reveal that.
 
 ## 3. Robustness
 
