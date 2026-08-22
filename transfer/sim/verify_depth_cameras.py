@@ -23,7 +23,7 @@ isaaclab importable, but no simulator).
 (``G1TeacherTerrainDepthObservationsCfg`` policy group + ``G1TeacherTerrainDepthSceneCfg``,
 i.e. ``g1_depth_env_cfg``'s ``_NEAR`` / ``_FAR``), so it always reflects what the task
 currently declares.  The robot geometry is separate and comes from the MuJoCo model
-(``--robot_name`` / ``--scene``, default ``robots/g1/g1_29j_basic_scene.xml``).
+(``--robot_name`` / ``--scene``, default ``robots/g1/g1_perceptive_basic_scene.xml``).
 
 ``--viewer`` opens the MuJoCo viewer with the live hit cloud (yellow = near, cyan-green =
 far) plus each camera's mount frame as RGB axes -- red is +x, the optical axis, which is
@@ -291,7 +291,7 @@ def main() -> None:
                         help="Take the contract straight from the training env cfg "
                              "(needs isaaclab importable; no simulator, no export).")
     parser.add_argument("--experiment", default="g1")
-    parser.add_argument("--robot_name", default="g1_29j")
+    parser.add_argument("--robot_name", default="g1_perceptive")
     parser.add_argument("--scene", default="basic_scene",
                         help="MuJoCo scene; the geometry check needs a flat one.")
     parser.add_argument("--knee_angle", type=float, default=1.2,

@@ -26,7 +26,7 @@ robot:
         # as-is). Not a copy under g1_model/: a second MJCF is a second set of masses,
         # collision geometry and geom groups to keep in sync, and the whole point of this
         # stack is that the two simulators agree. ROBOT_RL_ROOT is transfer/obelisk.
-        model_xml_path: ${ROBOT_RL_ROOT}/../sim/robots/g1/g1_29j_terrain_scene.xml
+        model_xml_path: ${ROBOT_RL_ROOT}/../sim/robots/g1/g1_perceptive_terrain_scene.xml
         time_step: 0.001
         num_steps_per_viz: 10
         sensor_settings:

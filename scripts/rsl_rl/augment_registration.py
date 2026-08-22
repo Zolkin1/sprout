@@ -61,12 +61,16 @@ parser = argparse.ArgumentParser(description=__doc__,
 parser.add_argument("--task", default="G1-teacher-clf-terrain-depth")
 parser.add_argument("--data", required=True, help="Recording to augment (needs clip_id).")
 parser.add_argument("--out", default=None, help="Output .h5 (omit with --check_only).")
-parser.add_argument("--num_augments", type=int, default=2,
-                    help="New points generated per SOURCE point. Default 2 to match the MVP "
-                         "pair: its augmented_20260812.h5 holds 277878 windows against a "
-                         "200000-window source, and 277878 / 2 = 138939 = the 69.4% of that "
-                         "recording which is NOT flat -- i.e. two augments of every terrain "
-                         "window, flat left alone (see --augment_flat).")
+parser.add_argument("--num_augments", type=int, default=3,
+                    help="New points generated per SOURCE point. Default 3 to match the MVP "
+                         "pair, recovered arithmetically because neither file records the "
+                         "flag: its augmented_20260812.h5 holds 277878 windows against a "
+                         "200000-window source, and 277878 = 3 x 92626 = 3 x 46.31%% of the "
+                         "source. That 46.31%% is the TERRAIN-IN-HORIZON survival rate, which "
+                         "a comparable recording measures at 45.2%% -- the two agree to about "
+                         "a point. Note 277878 also factors as 2 x 138939 (69.47%%), which is "
+                         "what you get by mistaking the filter for 'not flat'; the filter is "
+                         "stricter than that, so 3 is the reading the measurement supports.")
 parser.add_argument("--downrange", type=float, default=0.15,
                     help="Symmetric +- bound (m) along the terrain's traversal axis. Keep "
                          "SMALL: past roughly a stride the correct behaviour stops being "

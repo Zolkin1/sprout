@@ -366,7 +366,7 @@ def _parse_box(spec: str, index: int) -> Box:
 def main() -> None:
     """Parse CLI arguments and write the generated scene XML."""
     parser = argparse.ArgumentParser(description="Generate a MuJoCo G1 sim2sim staircase scene.")
-    parser.add_argument("--robot", default="g1_21j",
+    parser.add_argument("--robot", default="g1_perceptive",
                         help="Robot model to include (e.g. g1_21j, g1_21j_compute). Names the output.")
     parser.add_argument("--scene", default="terrain_scene",
                         help="Scene name; output is robots/g1/<robot>_<scene>.xml.")

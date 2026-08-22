@@ -17,12 +17,17 @@ class Robot:
     def __init__(self, robot_name: str, scene_name: str, joystick_scaling: np.ndarray,
                  input_function: Callable[[float], np.array] = None, use_pd: bool =False, gains: Dict[str, float]=None, rng=None):
         """Initialize the robot with its model and data."""
-        # ``g1_29j`` is the 29-DOF robot (waist roll/pitch + 6 wrists unlocked); its scenes
-        # are ``g1_29j_{basic,terrain}_scene.xml``.
-        if robot_name not in ("g1_21j", "g1_21j_M4", "g1_21j_compute", "g1_29j"):
+        # ``g1_perceptive`` is the CURRENT robot and the default everywhere: mode_11 motors,
+        # passive rubber hands, a compute backpack and two camera mounts, generated from the
+        # URDF by ``make_g1_mjcf.py``. Its scenes are ``g1_perceptive_{basic,terrain,tile*}
+        # _scene.xml``. ``g1_29j`` is the pre-mode_11 29-DOF model, kept because it is still
+        # the FK reference in some older provenance -- its SCENES are gone, so naming it here
+        # gets a missing-file error rather than a silently different robot.
+        if robot_name not in ("g1_21j", "g1_21j_M4", "g1_21j_compute", "g1_29j",
+                              "g1_perceptive"):
             raise ValueError(
                 f"Invalid robot name {robot_name!r}! Supported: g1_21j, g1_21j_M4, "
-                f"g1_21j_compute, g1_29j."
+                f"g1_21j_compute, g1_29j, g1_perceptive."
             )
 
         self.robot_name = robot_name

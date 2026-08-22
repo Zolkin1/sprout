@@ -1152,7 +1152,7 @@ def main() -> None:
     parser.add_argument("--command", type=str, default="smooth_ramp_running",
                         help="Scripted velocity profile in experiments.velocity_commands (eval mode).")
     parser.add_argument("--scene", type=str, default="basic_scene")
-    parser.add_argument("--robot_name", type=str, default="g1_21j")
+    parser.add_argument("--robot_name", type=str, default="g1_perceptive")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
     parser.add_argument("--providers", default="auto",
                         help="Comma-separated onnxruntime execution providers for BOTH nets, "

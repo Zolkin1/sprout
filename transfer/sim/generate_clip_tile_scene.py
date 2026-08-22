@@ -350,7 +350,8 @@ def main() -> None:
     p.add_argument("--clip", required=True, help="Clip library .h5 carrying the terrain_manifest.")
     p.add_argument("--terrain_id", type=int, default=None,
                    help="Tile to build (default: the only tile, else required).")
-    p.add_argument("--robot", default="g1_29j", help="Robot model to include; names the output.")
+    p.add_argument("--robot", default="g1_perceptive",
+               help="Robot model to include; names the output.")
     p.add_argument("--scene", default=None,
                    help="Scene name; output is robots/g1/<robot>_<scene>.xml "
                         "(default: tile<terrain_id>_scene).")
@@ -405,9 +406,17 @@ def main() -> None:
           f"{len(overlays)} overlay(s)")
     print(f"[INFO] spawn: tile-local ({sx:.3f}, {sy:.3f}) at terrain z={sz:.3f} m -> world "
           f"origin ({why})")
+    # Decoration is VISUAL ONLY -- emitted non-colliding (contype=0 conaffinity=0), so the
+    # robot cannot stand on it or walk into it. It must therefore stay out of the walkable
+    # geometry summary below: a 2.6 m room wall read as a riser reported "climb 2.508 m over
+    # 1 riser" on a tile whose real climb is 3 risers of 0.13 m, which is a made-up number
+    # pointing at a nonexistent obstacle.
+    walkable = [ov for ov in overlays if not ov.get("decor")]
+    n_decor = len(overlays) - len(walkable)
     for i, ov in enumerate(overlays):
         (px, py), (osx, osy, osz) = ov["pos_xy"], ov["size_xyz"]
-        kind = "step " if float(osx) <= _STEP_MAX_TREAD_M else "slab "
+        kind = ("decor" if ov.get("decor")
+                else "step " if float(osx) <= _STEP_MAX_TREAD_M else "slab ")
         print(f"       - {kind}{i}: {osx:.3f} x {osy:.3f} x {osz:.3f} m, top "
               f"z={float(ov.get('base_z', 0.0)) + osz - sz:+.3f} m at world "
               f"(x={px - sx:+.3f}, y={py - sy:+.3f})")
@@ -417,7 +426,7 @@ def main() -> None:
     # 3 that counting step overlays suggests.
     ups = sorted(
         ((float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0 - sx,
-          float(ov.get("base_z", 0.0)) + float(ov["size_xyz"][2]) - sz) for ov in overlays),
+          float(ov.get("base_z", 0.0)) + float(ov["size_xyz"][2]) - sz) for ov in walkable),
         key=lambda t: t[0],
     )
     risers, last = [], 0.0
@@ -425,6 +434,9 @@ def main() -> None:
         if top > last + 1e-6:
             risers.append((front, top - last))
             last = top
+    if n_decor:
+        print(f"[INFO] {n_decor} visual-only decor overlay(s) excluded from the climb summary "
+              "(non-colliding: the robot can neither stand on them nor hit them)")
     if risers:
         print("[INFO] climb from the spawn, drive +x: "
               + ", ".join(f"+{d:.3f} m at x={x:+.3f}" for x, d in risers)

@@ -45,7 +45,11 @@ parser.add_argument("--joint_noise", type=float, default=0.25,
                     help="Random joint perturbation (rad) for the non-nominal postures.")
 parser.add_argument("--tol", type=float, default=0.01,
                     help="Pass threshold on the 99th-percentile |depth difference|, in metres.")
-parser.add_argument("--robot_name", default="g1_29j", help="MuJoCo robot model to compare against.")
+parser.add_argument("--robot_name", default="g1_perceptive",
+                    help="MuJoCo robot model to compare against. The PERCEPTIVE robot is "
+                         "the default: g1_29j is pre-mode_11 and has no backpack, rubber "
+                         "hands or camera mounts, so comparing against it measures the "
+                         "wrong robot -- silently, since the joints are unchanged.")
 parser.add_argument("--scene", default="basic_scene", help="MuJoCo (flat) scene name.")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--save_dir", default=None, help="Write side-by-side difference PNGs here.")

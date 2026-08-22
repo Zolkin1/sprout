@@ -686,7 +686,8 @@ def main() -> int:
     p.add_argument("--out-dir", default="logs/sim2sim", help="Where cases + traces + PNGs live.")
     p.add_argument("--case", default="flat", choices=_CASES)
     p.add_argument("--lib", default="clips/g1_mb_v1_nodistract.h5", help="[prep] source library.")
-    p.add_argument("--robot", default="g1_29j", help="MuJoCo robot name (scene prefix).")
+    p.add_argument("--robot", default="g1_perceptive",
+               help="MuJoCo robot name (scene prefix).")
     p.add_argument("--checkpoint", default=None, help="[isaac] RL policy .pt (absolute).")
     p.add_argument("--fm_checkpoint", default=None, help="[isaac] FM .pt (absolute).")
     p.add_argument("--run-name", default=None, help="[mujoco] RL run dir NAME holding exported/.")
