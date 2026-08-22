@@ -19,14 +19,21 @@
 # depth_stabilization stays at 30 for now; 0 would give 50.4 Hz and ~1.4 ms less, and is
 # arguably closer to training (the sim noise model has no temporal filter). Revisit.
 #
-# TODO(fov): clip_fov / downsample / range below are the UPSTREAM DEFAULTS and do not match
-# any policy. The real numbers come from tracker.onnx:
-#     python scripts/rsl_rl/export_sensor_configs.py --run_dir logs/rsl_rl/g1/<run>
-#     # -> zed_targets.yml: width, height, hfov_deg, vfov_deg,
-#     #    min_range_m, max_range_m, invalid_range_m, rate_hz
-# Map those onto clip_fov/downsample/depth_{min,max}_distance here. The native cone at SVGA
-# is 106.2 x 79.5 deg on BOTH cameras (fx=fy=360), and clip_fov can only CROP -- asking for
-# more than the native cone silently clamps to the image bounds.
+# GEOMETRY comes from the policy, not from this camera. Derived by
+#   export_sensor_configs.py --run_dir <run>   ->  zed_targets.yml
+# from tracker.onnx of `TEMP_mode11_decor_lag48_aug_NOT_HW_READY`:
+#   far: 70 x 42 deg, 30x26, range 0.15-11.9 m, 50 Hz.
+# The native cone at SVGA is 106.2 x 79.5 deg, so this crops to a 505x277
+# px ROI with room to spare. clip_fov only CROPS -- a target wider than the native cone
+# silently clamps to the image bounds instead of failing.
+#
+# TODO(policy): that checkpoint is named TEMP and NOT_HW_READY. Re-derive from the real one
+# before flying; the numbers move only if the camera configuration changed, but that is a
+# check, not an assumption.
+#
+# An invalid pixel needs NO handling here: the SDK's NaN/inf passes straight through and the
+# CONTROLLER's normalize_depth_np maps every invalid class -- too near, beyond range,
+# non-finite, dropped -- onto the contract's sentinel (0 m for both cameras).
 /**:
   ros__parameters:
     depth_topic: "depth/far/image_raw"
@@ -53,8 +60,8 @@
     resolution: "SVGA"
     fps: 120
     depth_mode: "NEURAL_LIGHT"
-    depth_min_distance: -1.0       # TODO(fov): min_range_m from zed_targets.yml
-    depth_max_distance: -1.0       # TODO(fov): max_range_m from zed_targets.yml
+    depth_min_distance: 0.15       # contract min_range_m
+    depth_max_distance: 11.9       # contract max_range_m
     coordinate_units: "METER"
     depth_stabilization: 30
     depth_encoding: "32FC1"
@@ -67,12 +74,12 @@
       enabled: false
       kernel_radius: 4
 
-    clip_fov:                      # TODO(fov): hfov_deg / vfov_deg from zed_targets.yml
+    clip_fov:                      # contract hfov_deg / vfov_deg
       enabled: true
-      horizontal_fov_deg: 60.0
-      vertical_fov_deg: 50.0
+      horizontal_fov_deg: 70.0
+      vertical_fov_deg: 42.0
 
-    downsample:                    # TODO(fov): width / height from zed_targets.yml
+    downsample:                    # contract width / height
       enabled: true
       width: 30
       height: 26

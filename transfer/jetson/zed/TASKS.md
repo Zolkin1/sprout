@@ -27,38 +27,42 @@ optional before this runs on the robot, except where marked.
     depth cameras are caught here rather than on the robot.
   - Done when: `<cache>/policies/<run>/{tracker,fm}.onnx` exist and the script exits clean.
 
-- [ ] **1b. Set the real FoV, resolution, range and sentinel.**
-  `config/{near,far}.yaml` carry `clip_fov: 60x50`, `downsample: 30x26` and
-  `depth_{min,max}_distance: -1.0`. Those are UPSTREAM DEFAULTS and match no policy; both
-  files are currently identical, so at least one is certainly wrong.
-  - `python scripts/rsl_rl/export_sensor_configs.py --run_dir <run>` -> `zed_targets.yml`,
-    which gives `width, height, hfov_deg, vfov_deg, min_range_m, max_range_m,
-    invalid_range_m, rate_hz` per camera. It imports only the torch-free `deploy` runtime,
-    so it runs here in `env_transfer` -- no IsaacLab, no training box needed.
-  - Map those onto the node's params. Field names differ; the numbers must not.
-  - `invalid_range_m` matters as much as the FoV: a miss has to arrive as the same sentinel
-    a missed ray produces in sim.
-  - Ceiling: the native cone is **106.2 x 79.5 deg on BOTH cameras** at SVGA (fx = fy ~ 360).
-    `clip_fov` only CROPS -- asking for more silently clamps to the image bounds. A 100 deg
-    horizontal target leaves only ~3 deg of margin per side for mount tolerance.
-  - Done when: the published images match `zed_targets.yml` in shape and FoV, and
-    `rate_hz` from the contract is reconciled against the measured rate (see 4a).
+- [x] **1b. Set the real FoV, resolution, range and sentinel. DONE, and verified.**
+  Derived from `TEMP_mode11_decor_lag48_aug_NOT_HW_READY`'s `tracker.onnx` and applied to
+  `config/{near,far}.yaml`:
 
-- [x] **1c. Which physical camera is `near`. DONE.**
-  `near` = ZED X Mini (59249806, LOWER mount, looking 65 deg down), `far` = ZED X (44889004,
-  UPPER) -- confirmed by the operator and consistent with the contract geometry.
+  | | near | far |
+  |---|---|---|
+  | FoV | 100 x 70 deg | 70 x 42 deg |
+  | output | 30 x 26 | 30 x 26 |
+  | range | 0.1 - 7.9 m | 0.15 - 11.9 m |
 
-  **The mount OFFSETS are not this box's problem**, contrary to an earlier note here. This
-  node knows no mount geometry: it publishes a clipped, downsampled depth image and nothing
-  else. The extrinsics are consumed by `g1_deploy::CameraPoseFk` in the CONTROLLER, which
-  FKs the cameras from the URDF plus the encoders and the IMU's roll/pitch, on the Thor.
-  `zed_targets()` emits no extrinsics for exactly this reason -- only shape, FoV, range,
-  sentinel and rate cross the boundary. The controller does not even read the message's
-  `frame_id`. What this box must get right is the ROLE binding above, plus 1b.
-  - This is worth care: both cameras have the same native cone, so a swap is invisible in
-    the imagery. The controller cross-checks the topic COUNT against `tracker.onnx` and
-    cannot notice that the two are transposed. The failure mode is a policy that walks
-    confidently into things.
+  Verified at the camera, not just in the file: the node crops to 859x505 and 504x276 px
+  (the sizes those angles imply at fx=fy=360), and its own processed `CameraInfo` matches
+  the contract's intrinsics to within 0.2% -- near 12.60/18.57 against 12.586/18.566, far
+  21.44/33.93 against 21.422/33.866. The residual is integer ROI rounding; you cannot crop
+  a fractional pixel. Timing is unchanged by the wider FoV (44.9 / 46.2 Hz, 41.8 / 41.5 ms
+  median), and the published minima now sit at the contract floors (0.100 / 0.176 m).
+
+  An invalid pixel needs nothing here: the SDK's NaN/inf passes through and the
+  CONTROLLER's `normalize_depth_np` maps every invalid class onto the sentinel.
+
+- [ ] **1d. Re-derive from the REAL policy.** The checkpoint above is named `TEMP` and
+  `NOT_HW_READY`, and it does not live where the deployment path looks -- it is at the repo
+  ROOT of `zolkin/robot_rl`, while `prefetch_policy.py` and the controller both expect
+  `policies/<run>/` (pinned across the language boundary by `test_policy_cache_layout.py`).
+  So `prefetch_policy.py` 404s on it and I fetched the two files by hand.
+  - Either upload the real policy under `policies/<run>/`, or the controller cannot find it
+    on the robot regardless of what this box does.
+  - The geometry only moves if the camera configuration changed, but that is a check rather
+    than an assumption.
+
+- [ ] **1e. The contract asks for 50 Hz; we deliver ~45.** `rate_hz: 50.0` for both cameras.
+  Measured 44.9 / 46.2 with `depth_stabilization: 30`. Turning it to 0 measured 50.4 Hz, and
+  the sim noise model has no temporal filter anyway, so it is arguably closer to training on
+  two counts. Keeping stabilization means the controller reuses the previous frame on
+  roughly one tick in ten. Decide deliberately -- this is the same knob as 4b, now with the
+  contract's own number attached to it.
 
 ---
 
