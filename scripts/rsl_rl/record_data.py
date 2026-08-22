@@ -1571,6 +1571,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             with RecordedWindowWriter(
                 out_path, num_records, H, node_dim, rf_len, K, cmd_dim, meta,
                 depth_shape=depth_shape,
+                depth_lag_steps=(DEPTH_LAG_STEPS if depth_shape is not None
+                                 else 0),
                 # Always tag, even for a library with no distractor family (then all-zero): the
                 # tag's PRESENCE is what lets `train.py --skip_distractors` distinguish "none to
                 # drop" from "this recording predates the tag" and refuse the latter.

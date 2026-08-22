@@ -9,6 +9,7 @@ commanded-velocity profile, generating a future trajectory in the current root f
 """
 
 from .config import (
+    DEPTH_LATENCY_PROBS,
     ATTENTION_MODES,
     EXTERO_CLIP,
     EXTERO_ENCODERS,
@@ -80,6 +81,7 @@ from .window import (
 )
 
 __all__ = [
+    "DEPTH_LATENCY_PROBS",
     "FlowMatchingConfig",
     "WeightEMA",
     "EXTERO_SOURCES",
