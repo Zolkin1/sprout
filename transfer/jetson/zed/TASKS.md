@@ -78,12 +78,17 @@ optional before this runs on the robot, except where marked.
     cabled, and confirm pubkey auth works FROM INSIDE the controller container.
   - Untested end to end: nothing has yet driven this path from the Thor.
 
-- [ ] **2c. Switch camera selection from serial to `gmsl_port`.** (after the mounts are final)
-  A serial names a DEVICE; a port names a MOUNTING POSITION, and near/far are positions.
-  Replacing a camera then cannot silently transpose the pair. The parameter already exists
-  (`docker/patches/0001-camera-selection.patch`); only the config changes.
-
----
+- [ ] **2c. Switch camera selection from serial to `gmsl_port` -- BLOCKED, and not on
+  the mounts.** The SDK does not report the port on this box: `get_device_list()` returns
+  `gmsl_port: -1` for both cameras (and `i2c_port: 0`), so the only thing distinguishing
+  them in the enumeration is `path` -- `/dev/i2c-9` and `/dev/i2c-10`. There is therefore
+  no way to LOOK UP which port a camera is on; it would have to be found by trying
+  `gmsl_port: 0` / `1` and seeing which camera opens.
+  - Worth doing only if the ports turn out to be stable and discoverable by trial. The
+    motive is unchanged -- a port names a MOUNTING POSITION, so replacing a camera cannot
+    silently transpose near and far, where a serial has to be hand-edited.
+  - Until then `serial_number` is correct and unambiguous. This is an ergonomic
+    improvement, not a correctness one.
 
 - [ ] **2d. DDS across the three boxes.** The Thor, this box and the robot share one
   ethernet network, so they share a DDS graph. Three things must line up:
@@ -98,11 +103,23 @@ optional before this runs on the robot, except where marked.
     because they are on a direct cable. On a real shared LAN with working multicast, the
     default may be fine -- decide deliberately rather than by inheriting one.
 
-- [ ] **2e. (BRAIN, not this box) The URDF's camera mounts must match the real ones.**
-  Listed here only so it is not lost: `CameraPoseFk` FKs the cameras from `urdf_path` and
-  the contract, so if the URDF's mount frames disagree with where the cameras are physically
-  bolted, every xyz channel is mis-registered while the depth channel still looks perfect.
-  Nothing on the ZED box can detect that.
+- [ ] **2e. (BRAIN, not this box) Check the URDF's camera mounts against the real robot.**
+  `CameraPoseFk` FKs the cameras from `urdf_path` plus the contract's mount body and offset,
+  every tick, to unproject the depth image into the root's yaw-aligned frame. This policy's
+  contract puts both cameras on `torso_link_origin_site`:
+
+  | camera | offset (m) | tilt about Y |
+  |---|---|---|
+  | near | `[0.107, 0.025, 0.045]` | 65 deg |
+  | far  | `[0.085, 0.06, 0.285]`  | 15 deg |
+
+  Far sits 24 cm above near, which independently confirms the upper/lower binding in 1c.
+
+  The task is to confirm the real robot matches: the URDF must define
+  `torso_link_origin_site` where the physical torso frame is, and the cameras must be bolted
+  at those offsets and angles. If either disagrees, every xyz channel is mis-registered --
+  and the DEPTH channel still looks perfect, so no image inspection and nothing on the ZED
+  box can reveal it. The symptom is a policy that misjudges where the ground is.
 
 ## 3. Robustness
 
