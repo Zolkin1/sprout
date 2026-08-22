@@ -282,6 +282,65 @@ _DENSE_SCAN_RAYS: int = 1000
 _XYZ_OFFSET_DRIFT_WARN_M = 0.25
 
 
+def _select_depth_lag(cfg, data, rows, hs, n_sensors, sensor_dim, snap_meas, ds):
+    """Draw a camera-latency lag per window and swap in that frame and its capture state.
+
+    Writes ``ds._lagged_hs`` / ``ds._lagged_pose`` and returns the resolved, normalised
+    probability tuple for the checkpoint to record.
+
+    Args:
+        cfg: The run config; ``depth_latency_probs`` indexes lag in control steps.
+        data: The opened recording.
+        rows: Window row indices into the recording.
+        hs: The extero rows already selected at the snap, ``[Nw, n_sensors * sensor_dim]``.
+        n_sensors: Number of sensors.
+        sensor_dim: Width of one sensor reading.
+        snap_meas: State rows at the snap, the fallback pose source.
+        ds: The dataset, written through.
+
+    Raises:
+        ValueError: If the recording predates the lagged arrays, or holds fewer lags than the
+            distribution asks for. Never silently truncates: a latency model that quietly
+            became a no-op would be indistinguishable from one that worked.
+    """
+    probs = [float(p) for p in cfg.depth_latency_probs]
+    if min(probs) < 0.0 or sum(probs) <= 0.0:
+        raise ValueError(f"depth_latency_probs must be non-negative and sum > 0, got {probs}")
+    probs = [p / sum(probs) for p in probs]
+    if data.get("depth_lag") is None:
+        raise ValueError(
+            "depth_latency_probs is set but this recording has no 'depth_lag' array, so the "
+            "older frames it would sample were never stored. Re-record with the current "
+            "record_data.py (it keeps DEPTH_LAG_STEPS frames), or clear depth_latency_probs."
+        )
+    n_lags = int(data["depth_lag"].shape[1])
+    if len(probs) > n_lags:
+        raise ValueError(
+            f"depth_latency_probs asks for {len(probs)} lags but the recording holds "
+            f"{n_lags}. Re-record with a larger DEPTH_LAG_STEPS or shorten the distribution."
+        )
+    idx = rows.numpy() if torch.is_tensor(rows) else rows
+    gen = np.random.default_rng(int(cfg.seed))
+    lag = gen.choice(len(probs), size=len(idx), p=probs)
+    lagged = torch.from_numpy(
+        np.ascontiguousarray(data["depth_lag"][idx][np.arange(len(idx)), lag])).float()
+    ds._lagged_hs = lagged.reshape(lagged.shape[0], n_sensors * sensor_dim)
+    state = data.get("depth_lag_state")
+    if state is None:
+        raise ValueError(
+            "'depth_lag' is present but 'depth_lag_state' is not, so a lagged frame has no "
+            "capture pose to unproject with. Re-record."
+        )
+    ds._lagged_pose = torch.from_numpy(
+        np.ascontiguousarray(state[idx][np.arange(len(idx)), lag])).float()
+    hist = [int((lag == k).sum()) for k in range(len(probs))]
+    mean_ms = 20.0 * float((lag * 1.0).mean())
+    print(f"[fm-data] camera latency: lags {hist} of {len(idx)} windows "
+          f"(target {[round(p, 3) for p in probs]}), mean {mean_ms:.1f} ms at 20 ms/step. "
+          "Each lagged frame is unprojected with its own capture pose and left in that frame.")
+    return tuple(probs)
+
+
 def _resolve_xyz_contract(
     cfg: FlowMatchingConfig, spec: list[dict], joint_names: list[str]
 ) -> tuple[list[list[float]], float]:
@@ -1007,6 +1066,24 @@ class FutureStateDataset(Dataset):
             np.ascontiguousarray(raw_extero[rows.numpy() if torch.is_tensor(rows) else rows])
         ).float()
         hs = hs.reshape(hs.shape[0], n_sensors * sensor_dim)
+        # CAMERA LATENCY. Swap in a frame captured a few control steps earlier, per window,
+        # drawn from cfg.depth_latency_probs (index = lag in control steps). ``pose_meas``
+        # follows it: the xyz channels below are unprojected from the camera pose, so a lagged
+        # frame has to be unprojected with the pose it was CAPTURED with or every pixel is
+        # displaced by the egomotion -- the registration error the channels exist to remove.
+        # It is then left in that capture-time frame: re-expressing it at the re-plan would
+        # need the root displacement over the lag, and this robot has no base-velocity
+        # estimate to integrate.
+        #
+        # Drawn ONCE per window at build, not per epoch -- the extero array is materialised
+        # here. With a recording of this size every lag is thoroughly represented across
+        # windows; what it does not do is show the same window at two different lags.
+        pose_meas = snap_meas
+        self.depth_latency_probs = None
+        if cfg.depth_latency_probs is not None:
+            self.depth_latency_probs = _select_depth_lag(
+                cfg, data, rows, hs, n_sensors, sensor_dim, snap_meas, self)
+            hs, pose_meas = self._lagged_hs, self._lagged_pose
         # Sanitize before the normalizer fit so a non-finite entry cannot poison the
         # per-dimension mean and yield a NaN loss (matches the deploy token builder). The band
         # is the config's, so a run can widen it past the per-source default -- a 1 m band
@@ -1084,8 +1161,10 @@ class FutureStateDataset(Dataset):
         cfg.extero_channels = row_channels
         cfg.extero_channel_names = ["d", "x", "y", "z", "v"][:row_channels]
         if row_channels > 1:
+            # ``pose_meas`` is ``snap_meas`` unless camera latency swapped in an older
+            # frame, in which case it is the state that frame was captured with.
             poses = self._camera_pose_yaw_frame(
-                self.extero_spec, _q(snap_meas), snap_meas[:, s_slc["joint_pos"][0]:
+                self.extero_spec, _q(pose_meas), pose_meas[:, s_slc["joint_pos"][0]:
                                                            s_slc["joint_pos"][1]],
                 [str(j) for j in meta.state_joint_names], cfg.fk_model_path,
             )

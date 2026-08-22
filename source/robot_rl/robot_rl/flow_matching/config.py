@@ -265,6 +265,35 @@ class FlowMatchingConfig:
     # that lacks the selected array fails loudly at dataset build (see dataset.py), which
     # is what a cameraless task now gets by default.
     extero_source: str = "depth"
+    # CAMERA LATENCY. Probability of each depth LAG, index = lag in control steps, so
+    # ``(0.0, 0.40, 0.35, 0.25)`` never serves a fresh frame and serves 20 / 40 / 60 ms old
+    # ones at those rates. ``None`` disables the model and always uses the frame captured at
+    # the re-plan, which is what every recording before 2026-08-21 supports.
+    #
+    # The depth pipeline is not instantaneous on the robot -- the image is computed and shipped
+    # over ROS, measured at 20-40 ms typically and peaking near 60. The camera runs at 50 Hz and
+    # so does control, so one lag step is exactly 20 ms and lags 1..3 span that range exactly.
+    #
+    # **Lag 0 gets zero weight on purpose.** A frame cannot arrive in the step it was captured
+    # in, so training on it spends capacity on a case the robot never sees -- and it is the
+    # EASIEST case, which makes the model optimistic about a signal it will always get late.
+    # It stays reachable only as a no-latency ablation, since the recorder keeps the frame.
+    #
+    # Drawn once per WINDOW at dataset build (the extero array is materialised there), seeded
+    # off ``seed``. With a full recording every lag is thoroughly represented across windows;
+    # what it does not do is show the same window at two lags. Recording all the frames and
+    # choosing here still means the distribution can change without re-recording, and a
+    # no-latency ablation is free. It models pure JITTER -- real latency also has a persistent
+    # pipeline component, which a per-episode base would capture and this does not.
+    #
+    # The lagged frame is unprojected with the pose it was CAPTURED with, and expressed in that
+    # capture-time frame. Using the re-plan pose instead would displace every pixel by the
+    # egomotion, which is the registration error the xyz channels exist to remove; re-expressing
+    # it in the re-plan FRAME would need the root displacement over the lag, and this robot has
+    # no base-velocity estimate to integrate. So the terrain arrives correctly registered to
+    # where the robot WAS, and the model compensates from its history.
+    depth_latency_probs: tuple[float, ...] | None = None
+
     # How many exteroception SENSOR readings there are, and how wide ONE of them is. Both
     # resolved from the recorded array's shape at dataset build time: 1 x 176 rays for the
     # scan, 2 x (H*W) pixels for the cameras.
