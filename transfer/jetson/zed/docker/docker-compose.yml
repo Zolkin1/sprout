@@ -76,6 +76,7 @@ services:
       # because the FoV/range numbers in them answer to a policy artifact rather than to
       # this image -- they change when the tracker does, not when the container does.
       - ../config:/opt/zed_config:ro
+      - ../launch:/opt/zed_launch:ro
       # Persist the SDK's optimised NEURAL engines, so they are not rebuilt (minutes) on
       # every container start.
       - zed_resources:/usr/local/zed/resources

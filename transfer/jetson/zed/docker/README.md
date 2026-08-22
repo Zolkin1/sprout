@@ -8,6 +8,10 @@ the same topic and the same 32FC1 flat-float32 layout the Obelisk MuJoCo ray-cas
 publishes in sim. That is the whole sim2real trick: the controller cannot tell them apart,
 so what you tested in simulation is what runs on the robot.
 
+**What is left to do lives in [`../TASKS.md`](../TASKS.md)**, including the one thing that
+blocks everything: the published images are still the upstream default shape and match no
+policy.
+
 ## What the camera must be configured to produce
 
 Not a free choice. The resolution, field of view and range have to match what the policy

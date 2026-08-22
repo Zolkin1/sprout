@@ -12,15 +12,19 @@
 # Inside the session: Ctrl-C -> container prompt with the command one Up-arrow away;
 # Ctrl-b Ctrl-b d detaches (nested tmux).
 #
-#   run_node.sh zed        launch the ZED depth node
+#   run_node.sh pair       launch BOTH depth nodes (near + far) -- the deployment case
+#   run_node.sh zed        launch ONE node from the upstream defaults. Kept for isolating a
+#                          single camera; it cannot open a GMSL ZED X as shipped, because
+#                          default_params.yaml asks for HD720.
 #   run_node.sh optimize   build the TensorRT engines (no camera needed)
 set -euo pipefail
 
 node="${1:-}"
 case "$node" in
+    pair)     cmd="ros2 launch /opt/zed_launch/zed_depth_pair.launch.py ${*:2}" ;;
     zed)      cmd="ros2 launch zed_depth_publisher zed_depth.launch.py" ;;
     optimize) cmd="optimize_ai_models.sh ${*:2}" ;;
-    *) echo "run_node.sh: usage: run_node.sh <zed|optimize> [args...]" >&2; exit 2 ;;
+    *) echo "run_node.sh: usage: run_node.sh <pair|zed|optimize> [args...]" >&2; exit 2 ;;
 esac
 
 sess="obk_${node}"

@@ -1,5 +1,5 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
-# The far depth camera: ZED X Mini, serial 59249806.
+# The far depth camera: ZED X, serial 44889004 -- the UPPER of the two mounts.
 #
 # `/**` and not the node name: both cameras run the same executable under remapped names
 # (zed_near / zed_far), and a params file keyed by node name applies to NOTHING once the node
@@ -39,7 +39,13 @@
     # survives a camera swap -- prefer the port once the pair is physically fixed, since
     # near/far are positions. Without either, the SDK opens the first available camera and
     # which one is 'near' is a coin flip across restarts.
-    serial_number: 59249806
+    serial_number: 44889004
+    # TODO(near-far): CONFIRM against tracker.onnx's depth_camera_spec when the
+    # artifact lands. This binding is the physical mounting (mini low, ZED X high)
+    # read against the contract's geometry, where near looks 65 deg down onto ground
+    # 0.55 m ahead and far 35 deg onto 1.8 m -- putting far ~8 cm higher. Both cameras
+    # have the SAME native cone here (106.2 x 79.5 deg), so a swap is invisible in the
+    # imagery and would only show up as a policy that walks into things.
 
     resolution: "SVGA"
     fps: 120
