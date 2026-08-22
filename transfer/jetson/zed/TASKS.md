@@ -16,9 +16,10 @@ optional before this runs on the robot, except where marked.
 
 - [ ] **1a. Get `tracker.onnx` + `fm.onnx` onto this box.**
   Needed by everything else here; the box currently has no policy artifact at all.
-  - This box has NO python venv. Build one first: `bash transfer/setup_venv.sh` (creates
-    `env_transfer`; IsaacLab is not needed for any of this).
-  - Then `python3 transfer/obelisk/scripts/prefetch_policy.py --hf_policy_folder <NAME>`
+  - DONE: `env_transfer` is built and both `prefetch_policy.py` and
+    `export_sensor_configs.py` import and run in it. See 5c for the one package missing.
+  - Remaining: `./env_transfer/bin/python transfer/obelisk/scripts/prefetch_policy.py
+    --hf_policy_folder <NAME>`
     against `zolkin/robot_rl`. **The folder name is unknown to me** -- it is the run that
     matches the cameras currently being trained with, not necessarily the MVP pair recorded
     in CLAUDE.md.
@@ -43,13 +44,14 @@ optional before this runs on the robot, except where marked.
   - Done when: the published images match `zed_targets.yml` in shape and FoV, and
     `rate_hz` from the contract is reconciled against the measured rate (see 4a).
 
-- [ ] **1c. Confirm which physical camera is `near`.**
-  Currently `near` = ZED X Mini (59249806, the LOWER mount) and `far` = ZED X (44889004,
-  UPPER). That binding is the physical mounting read against the contract's geometry -- near
-  looks 65 deg down onto ground 0.55 m ahead, far 35 deg onto 1.8 m, putting far ~8 cm
-  higher -- and it is an INFERENCE, not a reading.
-  - Check it against `tracker.onnx`'s `depth_camera_spec` (mount body + offset per camera)
-    once 1a lands.
+- [ ] **1c. Read the camera EXTRINSICS off the contract.**
+  The role binding is settled: `near` = ZED X Mini (59249806, LOWER mount, looking 65 deg
+  down), `far` = ZED X (44889004, UPPER) -- confirmed by the operator and consistent with the
+  contract geometry.
+  - Still to read from `tracker.onnx`'s `depth_camera_spec` once 1a lands: the exact mount
+    body and offset per camera. That is not cosmetic -- the 5-channel depth row unprojects
+    each pixel against the NOMINAL mount, so a wrong offset silently mis-registers every
+    xyz channel while the depth channel still looks perfect.
   - This is worth care: both cameras have the same native cone, so a swap is invisible in
     the imagery. The controller cross-checks the topic COUNT against `tracker.onnx` and
     cannot notice that the two are transposed. The failure mode is a policy that walks
@@ -68,9 +70,16 @@ optional before this runs on the robot, except where marked.
     threshold that explicitly absorbs the skew.
   - Done when: cross-box `depth_capture_age` is never less than `depth_age`.
 
-- [ ] **2b. Decide how the pair is started on the robot.**
-  `run_node.sh pair` works by hand. The onboard stack needs to invoke it (or the launch file)
-  as part of bringup, in the right order relative to the controller.
+- [ ] **2b. Finish wiring `run_hardware_low.sh` to this box.**
+  DONE: `obk_jetson_zed_cmd` now runs `run_node.sh pair` (was the single stock `zed` node),
+  and `obk_jetson_stop_cmd` matches `zed_depth_pair.launch.py` and kills the launch tree --
+  the old pattern matched neither, so teardown would have left both cameras held, and the
+  new respawn would have restarted any node killed on its own.
+  - Remaining: `OBK_JETSON_HOST` still defaults to `unitree@192.168.123.164`. This box is
+    `zed-box-2`, the login is `zolkin`, and its ethernet NIC (`enP8p1s0`) is NO-CARRIER --
+    it has no address on the shared network yet. Pin the default once the three boxes are
+    cabled, and confirm pubkey auth works FROM INSIDE the controller container.
+  - Untested end to end: nothing has yet driven this path from the Thor.
 
 - [ ] **2c. Switch camera selection from serial to `gmsl_port`.** (after the mounts are final)
   A serial names a DEVICE; a port names a MOUNTING POSITION, and near/far are positions.
@@ -78,6 +87,19 @@ optional before this runs on the robot, except where marked.
   (`docker/patches/0001-camera-selection.patch`); only the config changes.
 
 ---
+
+- [ ] **2d. DDS across the three boxes.** The Thor, this box and the robot share one
+  ethernet network, so they share a DDS graph. Three things must line up:
+  - `ROS_DOMAIN_ID` -- this container has 2, from `.env` via `env_file`. It must equal the
+    onboard graph's, or the controller simply never sees a depth frame.
+  - `net.core.rmem_max` is **1048576 here**, 16x under the 16777216 the other boxes require.
+    It is not biting yet ONLY because this box has no `cyclonedds.xml` and Cyclone's defaults
+    fit. The moment this box gets a config like the others', every ROS node dies at startup
+    with `rmw_create_node: failed to create domain`. Raise it in `/etc/sysctl.d/` (a live
+    `sysctl -w` is lost on reboot) at the same time as adding the config.
+  - whether a `cyclonedds.xml` is needed at all: the desktop/Thor pair uses unicast peers
+    because they are on a direct cable. On a real shared LAN with working multicast, the
+    default may be fine -- decide deliberately rather than by inheriting one.
 
 ## 3. Robustness
 
@@ -120,5 +142,12 @@ optional before this runs on the robot, except where marked.
   carried locally only because `ZED_REF` is pinned deliberately -- the depth geometry has to
   match training, and a moving ref is a silent way to change it. Upstreaming it plus a
   `ZED_REF` bump deletes the patch.
+- [ ] **5c. `pin` (pinocchio) is NOT in this box's `env_transfer`.** It is unsatisfiable
+  here: every `pin>=3.1` wheel pulls `cmeel-boost`, which requires numpy>=2, while
+  `requirements.txt` pins numpy<2 for the onnxruntime ABI. The venv was built with `pin`
+  filtered out, and `requirements.txt` is UNCHANGED -- relaxing the numpy pin affects every
+  box and is not mine to decide. Nothing needed here uses it (`deploy/fk.py` and the viewer
+  ribbon do; the robot's FK is the C++ `CameraPoseFk` in the container anyway), but
+  `transfer/sim` viewers will not run on this box until it is resolved.
 - [ ] **5b. Upstream `default_params.yaml`'s `resolution: HD720`**, which no GMSL ZED X can
   open. Our configs override it, so this only bites someone using the stock launch.

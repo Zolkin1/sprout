@@ -417,13 +417,23 @@ EOF
 # `docker start` first is a no-op when already running and covers a manual `compose stop`;
 # a container that was never created fails with a clear "No such container", and you bring
 # it up once with `docker compose up -d` in transfer/jetson/zed/docker.
+# `run_node.sh pair` launches BOTH cameras from the bind-mounted per-camera configs. The
+# stock `zed` case starts ONE node from default_params.yaml, which asks for HD720 -- a mode
+# no GMSL ZED X can open -- and has no camera selector, so it is not the deployment path.
+#
+# TODO(jetson-host): the default below is STALE. The ZED box is `zed-box-2` and its login is
+# `zolkin`, not `unitree`, and its address on the shared robot network is not assigned yet --
+# its ethernet NIC (enP8p1s0) is still NO-CARRIER. Pin this once the three boxes are cabled;
+# until then export OBK_JETSON_HOST. A wrong default here fails as an ssh timeout in the
+# depth pane while everything else comes up, which reads as a camera problem.
+#
 # Requires minipc->jetson pubkey auth reachable from INSIDE this container.
 # Overrides: OBK_JETSON_HOST, OBK_JETSON_CONTAINER.
 obk_jetson_zed_cmd() {
     local host="${OBK_JETSON_HOST:-unitree@192.168.123.164}"
     local container="${OBK_JETSON_CONTAINER:-zed_depth}"
     local opts="-o StrictHostKeyChecking=accept-new"
-    printf 'ssh -t %s %q "docker start %s >/dev/null 2>&1; docker exec -it %s run_node.sh zed"' \
+    printf 'ssh -t %s %q "docker start %s >/dev/null 2>&1; docker exec -it %s run_node.sh pair"' \
         "$opts" "$host" "$container" "$container"
 }
 
@@ -453,7 +463,15 @@ obk_mark_jetson() {
 # on the HOST, where the variable is unset (compose sets it only inside the container).
 # Expanding here would bake in the wrong default.
 obk_jetson_stop_cmd() {
-    local reap='set -f; tmux kill-session -t obk_zed >/dev/null 2>&1 || true; pkill -f zed_depth[.]launch[.]py >/dev/null 2>&1 || true; sleep 2; pkill -9 -f zed_depth[.]launch[.]py >/dev/null 2>&1 || true'
+    # `zed_depth.*[.]launch[.]py`, not `zed_depth[.]launch[.]py`: the deployment launch file
+    # is zed_depth_PAIR.launch.py and the old pattern does not match it, so teardown would
+    # silently leave both cameras held. The session name follows run_node.sh's `obk_<node>`,
+    # so the pair is obk_pair; obk_zed is still killed for a single-camera debug run.
+    #
+    # Killing the LAUNCH process is what stops the pair, and it matters more than it used to:
+    # the launch file respawns a died node after 10 s, so pkill'ing the nodes alone would just
+    # have them come back. The launch tree goes first, then any stragglers.
+    local reap='set -f; tmux kill-session -t obk_pair >/dev/null 2>&1 || true; tmux kill-session -t obk_zed >/dev/null 2>&1 || true; pkill -f zed_depth.*[.]launch[.]py >/dev/null 2>&1 || true; sleep 2; pkill -9 -f zed_depth.*[.]launch[.]py >/dev/null 2>&1 || true; pkill -9 -f [z]ed_depth_node >/dev/null 2>&1 || true'
     printf 'host="${OBK_JETSON_HOST:-unitree@192.168.123.164}"; container="${OBK_JETSON_CONTAINER:-zed_depth}"; ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" "docker exec $container bash -c '\''%s'\''"' \
         "$reap"
 }
