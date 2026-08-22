@@ -29,10 +29,10 @@ ARG ZED_IMAGE=stereolabs/zed:4.2-devel-jetson-jp6.2
 FROM ${ZED_IMAGE} AS base
 SHELL ["/bin/bash", "-c"]
 
-ARG USER=user
+ARG ZED_USER=unitree
 ARG UID=1000
 ARG GID=1000
-ENV USER=$USER UID=$UID GID=$GID
+ENV USER=$ZED_USER UID=$UID GID=$GID
 ENV TZ=America/Los_Angeles
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8

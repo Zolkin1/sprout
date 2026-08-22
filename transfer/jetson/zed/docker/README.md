@@ -24,14 +24,40 @@ The field names differ; the numbers must not.
 
 ## First-time setup, on the Jetson
 
+Three host prerequisites, none of them optional and each of which fails somewhere else:
+
 ```bash
-# once per device: make the nvidia runtime the default in /etc/docker/daemon.json
-#   { "default-runtime": "nvidia", "runtimes": { "nvidia": { "path": "nvidia-container-runtime" } } }
+# 1. the nvidia runtime as the DEFAULT. nvidia-ctk writes daemon.json correctly; hand-editing
+#    it is how you end up with a container that starts and has no GPU.
+sudo nvidia-ctk runtime configure --runtime=docker --set-as-default && sudo systemctl restart docker
+
+# 2. the `raw` iptables table. Docker >= 29 installs a direct-access-filtering DROP rule into
+#    it, and on an L4T kernel iptable_raw.ko SHIPS but is missing from modules.dep (which is
+#    older than the .ko), so modprobe cannot find it until depmod runs. Without this every
+#    build dies at the FIRST RUN step with "can't initialize iptables table `raw'" -- an error
+#    that names iptables and looks nothing like a missing kernel module.
+sudo depmod -a && sudo modprobe iptable_raw
+echo iptable_raw | sudo tee /etc/modules-load.d/docker-iptables.conf   # or it is gone on reboot
+
+# 3. ONLY if you also want the host-side ZED tools (ZED_Explorer, ZED_Depth_Viewer, the
+#    tools/ scripts). The container runs privileged as root and needs none of this.
+sudo usermod -aG zed,imu $USER      # then log out and back in
+```
+
+Then:
+
+```bash
 cd transfer/jetson/zed/docker
-cp .env_example .env && $EDITOR .env        # USER/UID/GID, ZED_IMAGE, ROS_DOMAIN_ID
+cp .env_example .env && $EDITOR .env        # ZED_USER/UID/GID, ZED_IMAGE, ROS_DOMAIN_ID
 docker compose build
 docker compose up -d                         # idle container; the node is launched into it
 ```
+
+`ZED_IMAGE` must name **the SDK version installed on the host**, not merely a version that
+exists. The GMSL ZED X path is split across the container boundary -- the kernel driver and
+`nvargus-daemon` are the host's, only the SDK is the container's -- so the two have to agree.
+Read the host's with `cat /usr/local/zed/zed-config-version.cmake` and its L4T revision with
+`cat /etc/nv_tegra_release`.
 
 Then, **while the machine still has internet**, from the dev box:
 
@@ -69,6 +95,14 @@ and the next launch just re-attaches.
 
 | symptom | cause |
 |---|---|
+| no `/dev/video*` and `ZED_Diagnostic` finds no camera | the cameras were not plugged in AT BOOT. GMSL is not USB: the deserializer probes once, and `sl_max96712_probe: No Camera connected to this deserializer` in `journalctl -b` is the proof. You do NOT need a reboot -- `sudo systemctl restart driver_zed_loader.service` re-runs `/usr/sbin/ZEDX_Driver`, which rmmods and reloads the `sl_*` modules and restarts nvargus |
+| `Cannot open device /dev/spsc_bmi0: Permission denied`, then `CAMERA MOTION SENSORS NOT DETECTED` | that is the ZED X's onboard IMU, which `/etc/udev/rules.d/99-imu.rules` gives to group `imu`. The SDK treats a missing IMU as a FATAL open failure, not a degraded one. Host tools need the group; the container does not |
+| `ZED_Depth_Viewer: command not found` right after `usermod` | the symlink in `/usr/local/bin` points into `/usr/local/zed`, which is mode 770 `user:zed`. A shell started before the group change cannot traverse it, and bash reports the EACCES as "command not found". Log out and back in |
+| `docker compose build` fails at the first `RUN` with an iptables error | `iptable_raw` -- see prerequisite 2 above |
+| `Connecting to nvargus-daemon failed: Connection refused` inside the container, and it never recovers | the container is pinned to a DELETED socket inode. nvargus recreates `/tmp/argus_socket` on every restart, so bind-mounting the socket FILE breaks permanently the first time the daemon restarts (it took a SIGBUS here during bring-up). The compose file mounts the DIRECTORY for this reason; if you see this, compare `stat -c %i /tmp/argus_socket` inside and out |
+| the node will not reopen the camera right after being stopped | `sl::Camera::close()` takes **~25-30 s** to release a ZED X. The process outlives its own "Grab loop exited" log line by that much, and prints "ZED camera closed." only at the end. Wait for that line before relaunching |
+| a camera reads `NOT AVAILABLE` with nothing holding `/dev/video*` | it is wedged below the SDK -- every open returns an Argus socket timeout. Same recovery as the hot-plug row: `sudo systemctl restart driver_zed_loader.service` |
+| first camera open sits for ~6 min per depth mode | the TensorRT engine for that mode is not built. `ZED_Diagnostic -nrlo` / `-nrlo_light` / `-nrlo_plus` build them on the HOST; `run_node.sh optimize` does it in the container. They are per mode, and building one does not build the others |
 | controller reports a depth dropout, no error here | `ROS_DOMAIN_ID` mismatch -- it must come from `.env` via `env_file`, since a shell `export` beats `${}` interpolation |
 | camera open hangs ~20 s then fails | missing `SN<serial>.conf`; run `seed_zed_calib.sh` |
 | first open takes minutes | TensorRT engine not built; run `run_node.sh optimize` |

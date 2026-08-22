@@ -84,6 +84,9 @@ transfer/obelisk/g1_control/resource/hf_cache/
 # mounts only $REPO_ROOT and the robot has no clips/ directory.
 transfer/obelisk/g1_control/resource/debug_clips/
 transfer/obelisk/docker/.env
+# The Jetson ZED container's env, same reasoning: per-box (ZED_IMAGE has to name the SDK
+# installed on THAT host), and .env_example is what is tracked.
+transfer/jetson/zed/docker/.env
 # One machine's view of the split link: its own interface address and the OTHER box as a
 # peer. Committing it would hand every box the desktop's half of an asymmetric pair, which
 # is the "one box sees the other's topics and not the reverse" failure the example warns
