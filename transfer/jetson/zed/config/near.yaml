@@ -43,8 +43,10 @@
     # CONFIRMED by the operator: the ZED X Mini is the NEAR camera and looks 65 deg
     # down; the ZED X is the upper/FAR mount. Consistent with the contract geometry
     # (near's boresight meets the ground 0.55 m ahead, far's at 1.8 m, putting far
-    # ~8 cm higher). Still to read off tracker.onnx's depth_camera_spec: the exact
-    # mount body and offset, which is what the xyz channels unproject against.
+    # ~8 cm higher). This box needs the ROLE and nothing more: the mount offsets are
+    # consumed by g1_deploy::CameraPoseFk in the CONTROLLER, which FKs them from the URDF
+    # and the encoders. This node knows no mount geometry, and zed_targets() deliberately
+    # emits no extrinsics -- only shape, FoV, range, sentinel and rate reach here.
     # Both cameras share a native cone here (106.2 x 79.5 deg), so a transposed pair
     # is invisible in the imagery and the topic-count check cannot see it either.
 

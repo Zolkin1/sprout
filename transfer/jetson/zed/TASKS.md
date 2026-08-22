@@ -44,14 +44,17 @@ optional before this runs on the robot, except where marked.
   - Done when: the published images match `zed_targets.yml` in shape and FoV, and
     `rate_hz` from the contract is reconciled against the measured rate (see 4a).
 
-- [ ] **1c. Read the camera EXTRINSICS off the contract.**
-  The role binding is settled: `near` = ZED X Mini (59249806, LOWER mount, looking 65 deg
-  down), `far` = ZED X (44889004, UPPER) -- confirmed by the operator and consistent with the
-  contract geometry.
-  - Still to read from `tracker.onnx`'s `depth_camera_spec` once 1a lands: the exact mount
-    body and offset per camera. That is not cosmetic -- the 5-channel depth row unprojects
-    each pixel against the NOMINAL mount, so a wrong offset silently mis-registers every
-    xyz channel while the depth channel still looks perfect.
+- [x] **1c. Which physical camera is `near`. DONE.**
+  `near` = ZED X Mini (59249806, LOWER mount, looking 65 deg down), `far` = ZED X (44889004,
+  UPPER) -- confirmed by the operator and consistent with the contract geometry.
+
+  **The mount OFFSETS are not this box's problem**, contrary to an earlier note here. This
+  node knows no mount geometry: it publishes a clipped, downsampled depth image and nothing
+  else. The extrinsics are consumed by `g1_deploy::CameraPoseFk` in the CONTROLLER, which
+  FKs the cameras from the URDF plus the encoders and the IMU's roll/pitch, on the Thor.
+  `zed_targets()` emits no extrinsics for exactly this reason -- only shape, FoV, range,
+  sentinel and rate cross the boundary. The controller does not even read the message's
+  `frame_id`. What this box must get right is the ROLE binding above, plus 1b.
   - This is worth care: both cameras have the same native cone, so a swap is invisible in
     the imagery. The controller cross-checks the topic COUNT against `tracker.onnx` and
     cannot notice that the two are transposed. The failure mode is a policy that walks
@@ -100,6 +103,12 @@ optional before this runs on the robot, except where marked.
   - whether a `cyclonedds.xml` is needed at all: the desktop/Thor pair uses unicast peers
     because they are on a direct cable. On a real shared LAN with working multicast, the
     default may be fine -- decide deliberately rather than by inheriting one.
+
+- [ ] **2e. (BRAIN, not this box) The URDF's camera mounts must match the real ones.**
+  Listed here only so it is not lost: `CameraPoseFk` FKs the cameras from `urdf_path` and
+  the contract, so if the URDF's mount frames disagree with where the cameras are physically
+  bolted, every xyz channel is mis-registered while the depth channel still looks perfect.
+  Nothing on the ZED box can detect that.
 
 ## 3. Robustness
 
