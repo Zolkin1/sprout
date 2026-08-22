@@ -1267,14 +1267,20 @@ def main() -> None:
                              "default, matching the -play task the policy was exported from.")
     parser.add_argument("--depth_noise_seed", type=int, default=0,
                         help="Seed for --depth_noise.")
-    parser.add_argument("--viz_geomgroup", type=str, default=None, metavar="LIST",
-                        help="Comma-separated geom GROUPS to render: 0 = collision geoms, "
-                             "1 = visual meshes, 2 = terrain. MuJoCo's default renders 0, 1 "
-                             "and 2 TOGETHER, which is why a collider and the visual mesh it "
-                             "duplicates are indistinguishable, and why disabling a geom's "
-                             "contact changes nothing on screen. Use '0,2' to see only what "
-                             "can actually collide, or '1,2' for only what the depth cameras "
-                             "ray-cast.")
+    parser.add_argument("--viz_geomgroup", type=str, default="1,2,3", metavar="LIST",
+                        help="Comma-separated geom GROUPS to render. 0 = collision geoms, "
+                             "1 = visual meshes, 2 = terrain, 3 = the camera mounts. "
+                             "DEFAULT '1,2,3' = the robot as it looks, on its terrain. "
+                             "MuJoCo's own default is 0,1,2, which draws every collider on "
+                             "top of the visual mesh it duplicates -- so the two are "
+                             "indistinguishable and disabling a geom's contact changes "
+                             "nothing on screen. Pass '' for MuJoCo's default, '0,2' to see "
+                             "only what can actually collide, or '1,2' for exactly what the "
+                             "depth cameras ray-cast. Group 3 is separate precisely BECAUSE "
+                             "the cameras must not cast it: the mounts are solid CAD "
+                             "assemblies whose origin sits inside them, so casting one "
+                             "returns 780/780 pixels at 7-24 mm -- under min_distance, hence "
+                             "all invalid, i.e. that camera goes silently blind.")
     parser.add_argument("--viz_contacts", action="store_true", default=False,
                         help="Show contact points + forces and make geoms transparent. An "
                              "empty view means nothing is touching -- which for a "
