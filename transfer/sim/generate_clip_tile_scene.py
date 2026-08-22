@@ -393,6 +393,7 @@ def main() -> None:
         f"{len(overlays)} overlay(s), has_floor={bool(entry.get('has_floor', True))}."
     )
     xml = scene_xml(f"{args.robot}.xml", header, "\n".join(geoms), floor,
+                    tile_local_origin=(sx, sy, sz),
                     model=f"g1_tile{info['terrain_id']}_scene")
 
     out_path = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)),

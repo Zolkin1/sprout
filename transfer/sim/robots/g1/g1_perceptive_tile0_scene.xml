@@ -6,6 +6,10 @@
          Footprint 22.86 x 4.46 m, 7 overlay(s), has_floor=True. -->
     <include file="g1_perceptive.xml"/>
 
+    <custom>
+        <numeric name="tile_local_origin" data="8.600000 1.866226 0.130000"/>
+    </custom>
+
     <statistic center="1.0 0.7 1.0" extent="0.8"/>
 
     <visual>

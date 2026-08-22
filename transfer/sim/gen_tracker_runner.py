@@ -1135,6 +1135,32 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     return success
 
 
+def _scene_tile_local_origin(mj_model):
+    """The tile-local point this scene put at its world origin, or ``None``.
+
+    ``generate_clip_tile_scene.py`` emits it as a ``<custom><numeric>`` precisely so this does
+    not have to be passed by hand: a wrong value silently mis-places the robot instead of
+    raising, which is the failure it exists to prevent. A scene without the field (the flat
+    ``basic_scene``, or any tile scene generated before it existed) returns ``None`` and the
+    clip is used in its own frame, unchanged.
+
+    Args:
+        mj_model: The compiled MuJoCo model.
+
+    Returns:
+        ``[3]`` float array, or ``None``.
+    """
+    import mujoco
+    import numpy as np
+
+    for i in range(int(mj_model.nnumeric)):
+        if mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_NUMERIC, i) != "tile_local_origin":
+            continue
+        adr = int(mj_model.numeric_adr[i])
+        return np.asarray(mj_model.numeric_data[adr:adr + 3], dtype=np.float64)
+    return None
+
+
 def main() -> None:
     """Parse arguments, build the policy + robot, and run the control loop."""
     parser = argparse.ArgumentParser(description="Run the G1 generator+tracker pair in MuJoCo.")
@@ -1445,6 +1471,20 @@ def main() -> None:
                 sys.exit("[ERROR] Pass either --clip_case or --clip_id, not both.")
             clip_id = resolve_case(clip_path, args.clip_case)
             print(f"[INFO] Clip case '{args.clip_case}' -> clip {clip_id}.")
+        # A TILE scene re-centres its tile so a chosen tile-local point sits at the world
+        # origin, while a clip's poses stay in the library's tile-local frame. Nothing
+        # reconciled the two, so a world-anchored clip spawned the robot by the whole offset
+        # -- 8.6 m downrange and 0.13 m high on tile 0, onto the far platform instead of the
+        # approach, which reads as the tracker instantly falling.
+        #
+        # ClipReference already has the mechanism: _lift_pos is `anchor_pos + p_rel`, so an
+        # anchor of MINUS the origin expresses every clip pose in scene coordinates. Nothing
+        # in ClipReference changes.
+        #
+        # Ego anchoring (--clip_ego_anchor) overrides the placement from the robot's measured
+        # pose, which is already in scene coordinates, so it self-corrects and this is a no-op
+        # for it -- it is the world-anchored default that needs the shift.
+        tile_origin = _scene_tile_local_origin(robot.mj_model)
         clip = ClipReference(clip_path, policy.get_joint_names(),
                              list(policy.ctx.target_frame_names), policy.base_frame_name,
                              clip_id=clip_id,
@@ -1452,6 +1492,10 @@ def main() -> None:
                              ego_anchor=args.clip_ego_anchor,
                              ego_anchor_every=args.clip_ego_anchor_every,
                              root_frame_bodies=policy._trk.get_root_frame_bodies())
+        if tile_origin is not None:
+            clip.set_placement(-tile_origin, np.array([0.0, 0.0, 0.0, 1.0]))
+            print("[INFO] Clip placed into the tile scene: subtracting its "
+                  f"tile-local origin {tile_origin.tolist()} m from every pose.")
         if abs(clip.dt - policy.get_dt()) > 1e-6:
             print(f"[WARN] Clip dt {clip.dt} != policy dt {policy.get_dt()}; "
                   "regenerate the clip at the control dt.")
