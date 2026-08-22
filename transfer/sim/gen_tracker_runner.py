@@ -1564,6 +1564,23 @@ def main() -> None:
         print("[INFO] Run INTERRUPTED by the user; artifacts below are partial.")
     else:
         print(f"[INFO] Run finished. Survived: {success}")
+    # Record the LOOP's verdict beside the log, because the metrics module cannot recover it
+    # from the CSV. The per-row ``fell`` flag is evaluated before the row is written and the
+    # loop returns on the step after, so the row where the fall happens is never written --
+    # every fall scored as `"survived": true` in the JSON while the console said False, and
+    # the JSON is what a sweep greps.
+    if log_path:
+        meta_path = os.path.join(os.path.dirname(log_path), "sim_meta.yaml")
+        try:
+            with open(meta_path) as mf:
+                _m = yaml.safe_load(mf) or {}
+            _m["survived"] = None if success is None else bool(success)
+            _m["failure_reason"] = ("" if success in (True, None)
+                                    else robot.failure_reason() or "unknown")
+            with open(meta_path, "w") as mf:
+                yaml.dump(_m, mf, default_flow_style=False, sort_keys=False)
+        except FileNotFoundError:
+            pass
 
     if log_path:
         import gen_tracker_metrics

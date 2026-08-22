@@ -161,7 +161,16 @@ def _plot_survival(cols, out_dir, meta) -> dict:
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "survival.png"), dpi=120)
     plt.close(fig)
-    return {"survived": time_to_fall is None, "time_to_fall_s": time_to_fall,
+    # The RUN's own verdict wins when it recorded one. Inferring survival from the `fell`
+    # column cannot be right: that flag is written before the loop's fall check and the loop
+    # returns on the next step, so the row where the fall happens is never written and every
+    # fall reads as a survival here. `time_to_fall_s` stays column-derived -- it is a
+    # timestamp, and None simply means the flag never made it to disk.
+    survived = meta.get("survived") if isinstance(meta, dict) else None
+    if survived is None:
+        survived = time_to_fall is None
+    return {"survived": bool(survived), "time_to_fall_s": time_to_fall,
+            "failure_reason": (meta.get("failure_reason", "") if isinstance(meta, dict) else ""),
             "final_time_s": float(t[-1])}
 
 
