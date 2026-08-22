@@ -421,16 +421,15 @@ EOF
 # stock `zed` case starts ONE node from default_params.yaml, which asks for HD720 -- a mode
 # no GMSL ZED X can open -- and has no camera selector, so it is not the deployment path.
 #
-# TODO(jetson-host): the default below is STALE. The ZED box is `zed-box-2` and its login is
-# `zolkin`, not `unitree`, and its address on the shared robot network is not assigned yet --
-# its ethernet NIC (enP8p1s0) is still NO-CARRIER. Pin this once the three boxes are cabled;
-# until then export OBK_JETSON_HOST. A wrong default here fails as an ssh timeout in the
-# depth pane while everything else comes up, which reads as a camera problem.
+# The ZED box on the robot network. All Thor<->ZED traffic goes over that wired link: the
+# box is multi homed (wifi for internet, plus docker and l4t bridges) and Cyclone would
+# otherwise pick an interface "arbitrarily" in its own words, so config/cyclonedds.xml pins
+# it to this address on the ZED side.
 #
 # Requires minipc->jetson pubkey auth reachable from INSIDE this container.
 # Overrides: OBK_JETSON_HOST, OBK_JETSON_CONTAINER.
 obk_jetson_zed_cmd() {
-    local host="${OBK_JETSON_HOST:-unitree@192.168.123.164}"
+    local host="${OBK_JETSON_HOST:-zolkin@192.168.123.221}"
     local container="${OBK_JETSON_CONTAINER:-zed_depth}"
     local opts="-o StrictHostKeyChecking=accept-new"
     printf 'ssh -t %s %q "docker start %s >/dev/null 2>&1; docker exec -it %s run_node.sh pair"' \
@@ -472,7 +471,7 @@ obk_jetson_stop_cmd() {
     # the launch file respawns a died node after 10 s, so pkill'ing the nodes alone would just
     # have them come back. The launch tree goes first, then any stragglers.
     local reap='set -f; tmux kill-session -t obk_pair >/dev/null 2>&1 || true; tmux kill-session -t obk_zed >/dev/null 2>&1 || true; pkill -f zed_depth.*[.]launch[.]py >/dev/null 2>&1 || true; sleep 2; pkill -9 -f zed_depth.*[.]launch[.]py >/dev/null 2>&1 || true; pkill -9 -f [z]ed_depth_node >/dev/null 2>&1 || true'
-    printf 'host="${OBK_JETSON_HOST:-unitree@192.168.123.164}"; container="${OBK_JETSON_CONTAINER:-zed_depth}"; ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" "docker exec $container bash -c '\''%s'\''"' \
+    printf 'host="${OBK_JETSON_HOST:-zolkin@192.168.123.221}"; container="${OBK_JETSON_CONTAINER:-zed_depth}"; ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new "$host" "docker exec $container bash -c '\''%s'\''"' \
         "$reap"
 }
 

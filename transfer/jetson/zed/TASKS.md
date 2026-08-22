@@ -59,23 +59,25 @@ optional before this runs on the robot, except where marked.
 ## 2. Blocking: deployment plumbing
 
 - [ ] **2a. Synchronise this box's clock with the brain's.**
-  `depth_capture_age` subtracts a stamp made HERE from a receipt time made THERE. CLAUDE.md
-  already records ~8 ms of skew between the desktop and the Thor, enough that the age reads
-  SMALLER than `depth_age`, which is impossible. Against a 42 ms median and 54 ms p99, 8 ms
-  is a fifth of the margin.
-  - chrony or PTP between the ZED box and whichever box runs the controller, or a watchdog
-    threshold that explicitly absorbs the skew.
+  `depth_capture_age` subtracts a stamp made HERE from a receipt time made THERE, so skew
+  shows up directly in the number the watchdog reads -- CLAUDE.md already records ~8 ms
+  between the desktop and the Thor, enough to make the age read SMALLER than `depth_age`,
+  which is impossible. Against a 42 ms median that is a fifth of the margin.
+  - This box runs **chrony** and is synchronised (it has internet over wifi). The Thor runs
+    systemd-timesyncd and may have no route out on the robot LAN, so the simplest fix is to
+    make this box the time source for the subnet: `allow 192.168.123.0/24` in
+    `/etc/chrony/chrony.conf`, restart chrony, then point the Thor at `192.168.123.221`.
   - Done when: cross-box `depth_capture_age` is never less than `depth_age`.
 
-- [ ] **2b. Finish wiring `run_hardware_low.sh` to this box.**
-  DONE: `obk_jetson_zed_cmd` now runs `run_node.sh pair` (was the single stock `zed` node),
-  and `obk_jetson_stop_cmd` matches `zed_depth_pair.launch.py` and kills the launch tree --
-  the old pattern matched neither, so teardown would have left both cameras held, and the
-  new respawn would have restarted any node killed on its own.
-  - Remaining: `OBK_JETSON_HOST` still defaults to `unitree@192.168.123.164`. This box is
-    `zed-box-2`, the login is `zolkin`, and its ethernet NIC (`enP8p1s0`) is NO-CARRIER --
-    it has no address on the shared network yet. Pin the default once the three boxes are
-    cabled, and confirm pubkey auth works FROM INSIDE the controller container.
+- [ ] **2b. `run_hardware_low.sh` -> this box: one step left (ssh keys).**
+  DONE: `obk_jetson_zed_cmd` runs `run_node.sh pair`, `obk_jetson_stop_cmd` matches the pair's
+  launch file and kills the launch tree, and `OBK_JETSON_HOST` is pinned to
+  `zolkin@192.168.123.221` now that the box has an address.
+  - Remaining: **pubkey auth from INSIDE the controller container on the Thor** to
+    `zolkin@192.168.123.221`. This box has no `~/.ssh/authorized_keys` at all today, so the
+    depth pane would fail as an ssh timeout while everything else comes up -- which reads as
+    a camera fault. From the Thor's controller container:
+    `ssh-keygen -t ed25519` (if it has no key) then `ssh-copy-id zolkin@192.168.123.221`.
   - Untested end to end: nothing has yet driven this path from the Thor.
 
 - [ ] **2c. `gmsl_port` WORKS -- but decide whether we want it.** Tested through the node
@@ -108,18 +110,25 @@ optional before this runs on the robot, except where marked.
   keep the mapping above recorded so switching stays a one-line change if that calculus
   changes (e.g. if cameras start getting swapped often).
 
-- [ ] **2d. DDS across the three boxes.** The Thor, this box and the robot share one
-  ethernet network, so they share a DDS graph. Three things must line up:
-  - `ROS_DOMAIN_ID` -- this container has 2, from `.env` via `env_file`. It must equal the
-    onboard graph's, or the controller simply never sees a depth frame.
-  - `net.core.rmem_max` is **1048576 here**, 16x under the 16777216 the other boxes require.
-    It is not biting yet ONLY because this box has no `cyclonedds.xml` and Cyclone's defaults
-    fit. The moment this box gets a config like the others', every ROS node dies at startup
-    with `rmw_create_node: failed to create domain`. Raise it in `/etc/sysctl.d/` (a live
-    `sysctl -w` is lost on reboot) at the same time as adding the config.
-  - whether a `cyclonedds.xml` is needed at all: the desktop/Thor pair uses unicast peers
-    because they are on a direct cable. On a real shared LAN with working multicast, the
-    default may be fine -- decide deliberately rather than by inheriting one.
+- [ ] **2d. DDS across the three boxes: mostly DONE.**
+  Addresses are set and all three reachable: robot `.161`, Thor `.220`, this box `.221`,
+  on `192.168.123.0/24`. The default route deliberately stays on wifi
+  (`ipv4.never-default`), so the box keeps internet without the robot link claiming it.
+  - DONE, and it was a real trap: this box is MULTI HOMED (wifi, robot link, l4tbr0,
+    docker0) and Cyclone reported `using network interface enP8p1s0 ... selected
+    ARBITRARILY from: enP8p1s0, wlP7p1s0, l4tbr0, docker0`. All four rank equally, so the
+    choice could have landed on wifi or a docker bridge on any restart, and the brain would
+    then see no depth frame while this box looked perfectly healthy.
+    `config/cyclonedds.xml` pins it to `192.168.123.221`; Cyclone now reports
+    `selected interfaces: enP8p1s0` with no "arbitrarily". Per box, so gitignored, with
+    `cyclonedds.xml.example` tracked.
+  - Deliberately NOT unicast peers: we are on a wired switch that carries multicast, and
+    `AllowMulticast=false` would oblige every box to list every other one.
+  - `net.core.rmem_max` is still 1 MB here. Nothing depends on it, because this box's config
+    does not request a big receive buffer (it receives nothing and publishes two 30x26 float
+    images). Raising it to 16 MB remains worthwhile for fleet consistency, so that copying
+    the obelisk config here later does not kill every ROS node at startup.
+  - `ROS_DOMAIN_ID=2` here. Still to confirm it matches the onboard graph.
 
 - [ ] **2e. (BRAIN, not this box) Merge the updated URDF before any hardware testing.**
   `CameraPoseFk` FKs the cameras from `urdf_path` plus the contract's mount body and offset,
