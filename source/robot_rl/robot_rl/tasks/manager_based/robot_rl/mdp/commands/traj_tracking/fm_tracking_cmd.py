@@ -1156,7 +1156,12 @@ class FmTrackingCommand(MotionSequenceCommand):
             # So there is nothing to undo: serve the nodes as predicted. This is the whole
             # odometry saving, and its deploy twin is GenTrackerPolicy._serve_nodes.
             ar, idx = self._future_indices(offsets)
-            return self._pred[ar, idx]
+            # `_pred_window`, NOT `_pred`. The deploy twin (GenTrackerPolicy._serve_nodes)
+            # calls its buffer `_pred`, and this line was written from it -- but on this class
+            # no such attribute exists, so the plan arm raised AttributeError the first time
+            # the observation manager sized the term. It went unnoticed because the anchor A/B
+            # ran on the TEACHER (MotionSequenceCommand), which does not take this branch.
+            return self._pred_window[ar, idx]
         return self._reanchor_to_now(offsets)
 
     def get_future_world_base(

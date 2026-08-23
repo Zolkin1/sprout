@@ -932,10 +932,21 @@ class GenTrackerPolicy:
                 f"sample is read). Lower fm_update_every, or re-record with "
                 f"--ref_future_len {need} and retrain with --future_len {need}."
             )
-        if self.fm_update_every > 1:
-            print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every}: served "
-                  "nodes are re-anchored onto the measured base each step, so the base pose "
-                  f"in `state` must be good over {self.fm_update_every - 1} steps "
+        # Announce the SERVE ARM, because the two have opposite requirements of the caller and
+        # this is the line someone reads to decide whether odometry matters. It used to state
+        # the re-anchoring one unconditionally, so a plan-arm run was told it needed a good
+        # base pose over K-1 steps of egomotion -- the exact opposite of that arm's whole
+        # point, and a claim nothing else on screen would contradict.
+        if self._window_anchor == "plan":
+            print(f"[INFO GenTrackerPolicy] window_anchor=plan: served nodes are the "
+                  "prediction in its OWN frame, so no base position is read on the generator "
+                  "path at any K. This is the odometry-free arm -- `state['root_pos']` is "
+                  "used only for diagnostics and the viewer's world lift.")
+        elif self.fm_update_every > 1:
+            print(f"[INFO GenTrackerPolicy] window_anchor=robot_now, "
+                  f"fm_update_every={self.fm_update_every}: served nodes are re-anchored onto "
+                  "the measured base each step, so the base pose in `state` must be good over "
+                  f"{self.fm_update_every - 1} steps "
                   f"({(self.fm_update_every - 1) * self.get_dt():.2f} s) of egomotion. Only "
                   "the RELATIVE motion since the re-plan matters, not a global pose.")
 
