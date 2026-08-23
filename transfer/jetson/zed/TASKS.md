@@ -58,27 +58,82 @@ optional before this runs on the robot, except where marked.
 
 ## 2. Blocking: deployment plumbing
 
-- [ ] **2a. Synchronise this box's clock with the brain's.**
-  `depth_capture_age` subtracts a stamp made HERE from a receipt time made THERE, so skew
-  shows up directly in the number the watchdog reads -- CLAUDE.md already records ~8 ms
-  between the desktop and the Thor, enough to make the age read SMALLER than `depth_age`,
-  which is impossible. Against a 42 ms median that is a fifth of the margin.
-  - This box runs **chrony** and is synchronised (it has internet over wifi). The Thor runs
-    systemd-timesyncd and may have no route out on the robot LAN, so the simplest fix is to
-    make this box the time source for the subnet: `allow 192.168.123.0/24` in
-    `/etc/chrony/chrony.conf`, restart chrony, then point the Thor at `192.168.123.221`.
-  - Done when: cross-box `depth_capture_age` is never less than `depth_age`.
+- [x] **2a. Synchronise this box's clock with the brain's. DONE, both halves, 2026-08-22.**
+  The BRAIN serves and this box follows: `chronyc tracking` here now reports
+  `Reference ID C0A87BDC (192.168.123.220)`, stratum 4, with offsets settling in the tens of
+  microseconds to ~2 ms while chrony converges (RMS 0.64 ms after the first few polls).
+  Before this it followed `time-usw6.crimpac.net` -- close to the brain by luck, through two
+  separate wifi uplinks.
+  - Brain: chrony 4.5, `allow 192.168.123.0/24` + `local stratum 10 orphan`. A query to
+    192.168.123.220 is answered `stratum 3`; the same query to 127.0.0.1 is refused, so
+    serving is scoped to the robot LAN.
+  - Here: `server 192.168.123.220 iburst minpoll 4 maxpoll 6 prefer trust`, written by
+    `setup_clock_sync.sh --client`, on top of the Ubuntu pools which stay as a fallback.
+  - **VERIFIED on the robot, 2026-08-22**: with the full stack up, the controller reports
+    `depth_capture_age` 53.7 / 36.9 ms (near / far) against `depth_age` 1.7 / 0.6 ms. Both
+    capture ages exceed both receipt ages, which is this task's done-when: before the sync
+    that comparison could come out impossible.
+  - **`trust` has a real consequence worth knowing**: the pool sources now read `^?` in
+    `chronyc sources` -- excluded for not agreeing with the trusted one -- so this box will
+    NOT use the internet to sanity-check the brain. That is the intent (the two agreeing with
+    each other matters more than either agreeing with UTC), and the pool is still polled, so
+    it takes over if the brain goes away.
+  That writes `/etc/chrony/conf.d/obk-robot-lan.conf` with
+  `server 192.168.123.220 iburst minpoll 4 maxpoll 6 prefer trust` and restarts chrony. The
+  brain runs the `--master` half (chrony there, `allow 192.168.123.0/24`, `local stratum 10
+  orphan`). `prefer trust` is the point: being close to the BRAIN matters more here than
+  being close to UTC, so the internet pool this box still has stays a fallback and cannot
+  outvote the brain.
+  - **The direction runs the other way from this file's earlier suggestion**, and not because
+    this box's clock is worse. `depth_capture_age` is a receipt time made THERE minus a
+    capture stamp made HERE, bags are recorded there, and every other stamp in them is that
+    box's -- so making the brain the reference turns a difference between two independently
+    steered clocks into one client's offset, which this box reports in one line
+    (`chronyc tracking`). And this box's UTC comes over WIFI, while the robot has to work with
+    no AP at all; `local stratum 10 orphan` on the brain keeps one self-consistent base either
+    way. The cost is a package: `systemd-timesyncd` cannot serve time, so the brain installs
+    chrony and apt removes timesyncd. Pointing timesyncd here would have been zero-install.
+  - **Correction to what this task claimed.** The watchdog does NOT read this number. The
+    controller times depth frames by LOCAL RECEIPT, deliberately (`g1_controller.cc`, and the
+    `ControllerDebug.msg` comment says so), so skew here can never stale-latch a healthy
+    camera. What it corrupts is `depth_capture_age` -- the only number that says how old a
+    frame was when the policy used it -- and every cross-box comparison in a bag. A
+    diagnostic, then, not a safety gate: worth doing before any latency claim, not before
+    powering the robot.
+  - Done when: `scripts/setup_clock_sync.sh --check` on the brain reports this box following
+    `192.168.123.220` with a sub-millisecond offset, and cross-box `depth_capture_age` is
+    never less than `depth_age`.
 
-- [ ] **2b. `run_hardware_low.sh` -> this box: one step left (ssh keys).**
-  DONE: `obk_jetson_zed_cmd` runs `run_node.sh pair`, `obk_jetson_stop_cmd` matches the pair's
-  launch file and kills the launch tree, and `OBK_JETSON_HOST` is pinned to
-  `zolkin@192.168.123.221` now that the box has an address.
-  - Remaining: **pubkey auth from INSIDE the controller container on the Thor** to
-    `zolkin@192.168.123.221`. This box has no `~/.ssh/authorized_keys` at all today, so the
-    depth pane would fail as an ssh timeout while everything else comes up -- which reads as
-    a camera fault. From the Thor's controller container:
-    `ssh-keygen -t ed25519` (if it has no key) then `ssh-copy-id zolkin@192.168.123.221`.
-  - Untested end to end: nothing has yet driven this path from the Thor.
+- [x] **2b. `run_hardware_low.sh` -> this box: the brain half is DONE (untested end to end).**
+  `obk_jetson_zed_cmd` runs `run_node.sh pair`, `obk_jetson_stop_cmd` matches the pair's launch
+  file and kills the launch tree, and the address is pinned to `zolkin@192.168.123.221`.
+  - **ssh keys: done from the brain side, one command there** --
+    `transfer/obelisk/scripts/setup_zed_link.sh`. It makes a DEDICATED passphrase-free key
+    (`~/.ssh/id_obk_zed`) plus an `~/.ssh/config` block with `IdentitiesOnly yes`, then
+    `ssh-copy-id`s it here (the one interactive step: this box's password, once). Reusing the
+    brain's `~/.ssh/id_ed25519` would not have worked -- it has a passphrase, and a tmux pane
+    cannot answer a prompt, so the pane would hang forever showing nothing.
+  - Two brain-side traps found while wiring it, both of which produce exactly the "camera
+    fault" this task warned about: `docker/.env` still named the onboard minipc
+    (`unitree@192.168.123.164`) and that value OVERRIDES the built-in default because compose
+    puts it in the container's environment; and a long-running container keeps the value it was
+    CREATED with, so editing the file changes nothing until compose recreates it. Both are now
+    pinned by `transfer/obelisk/tests/test_zed_link_target.py`, and `setup_zed_link.sh --check`
+    prints the container's own value next to the file's.
+  - `run_hardware_low.sh` now PREFLIGHTS the link before opening any pane and refuses to start
+    with the cause named (no route / no pubkey / host key changed / no `zed_depth` container),
+    so a missing key can no longer present as a camera problem. `--no-depth` skips it.
+  - Also fixed on the way: nothing ever called `obk_mark_jetson`, so `stop.sh --zed` silently
+    skipped the remote teardown and left the pair holding the cameras.
+  - **DONE END TO END, 2026-08-22.** `run_hardware_low.sh` on the Thor preflighted the link,
+    opened the depth pane, ssh'd here, launched `run_node.sh pair` in the `zed_depth`
+    container, and both cameras came up (`960x600 -> 30x26`, "Grab loop started"). The brain
+    subscribed and measured 47.2 / 47.7 Hz -- slightly BETTER than the 44.9 / 46.2 measured
+    locally on this box -- with the controller ticking at 50.0 Hz and `camera FK ready:
+    2 camera(s) ... (5 channels per pixel)`. Unarmed, so nothing was commanded.
+  - Nothing on the ZED box had to change for that. What blocked it was three defects in the
+    BRAIN's robot-driver config (a stale DDS interface pin, `AllowMulticast` off, obelisk's
+    `target_ip` default, and a missing `timers:` block) -- see CLAUDE.md.
 
 - [ ] **2c. `gmsl_port` WORKS -- but decide whether we want it.** Tested through the node
   on all four ports:

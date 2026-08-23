@@ -421,19 +421,131 @@ EOF
 # stock `zed` case starts ONE node from default_params.yaml, which asks for HD720 -- a mode
 # no GMSL ZED X can open -- and has no camera selector, so it is not the deployment path.
 #
+# The ssh target when docker/.env does not set OBK_JETSON_HOST -- which it normally does,
+# and compose's value WINS inside the container. So this is the fallback, not the authority;
+# tests/test_zed_link_target.py pins the two to the same address so a stale .env cannot
+# quietly aim the depth pane at a box that no longer has the cameras.
+OBK_JETSON_HOST_FALLBACK="${OBK_JETSON_HOST_FALLBACK:-zolkin@192.168.123.221}"
+
+# The brain's own address on the robot LAN, and therefore the time master (see
+# scripts/setup_clock_sync.sh). Only ever read to check a clock, never to move a control
+# packet, so it stays a plain default rather than another required .env line.
+OBK_TIME_MASTER="${OBK_TIME_MASTER:-192.168.123.220}"
+
 # The ZED box on the robot network. All Thor<->ZED traffic goes over that wired link: the
 # box is multi homed (wifi for internet, plus docker and l4t bridges) and Cyclone would
 # otherwise pick an interface "arbitrarily" in its own words, so config/cyclonedds.xml pins
 # it to this address on the ZED side.
 #
-# Requires minipc->jetson pubkey auth reachable from INSIDE this container.
+# Requires pubkey auth to that host reachable from INSIDE this container --
+# scripts/setup_zed_link.sh sets it up and obk_jetson_preflight checks it.
 # Overrides: OBK_JETSON_HOST, OBK_JETSON_CONTAINER.
 obk_jetson_zed_cmd() {
-    local host="${OBK_JETSON_HOST:-zolkin@192.168.123.221}"
+    local host="${OBK_JETSON_HOST:-$OBK_JETSON_HOST_FALLBACK}"
     local container="${OBK_JETSON_CONTAINER:-zed_depth}"
     local opts="-o StrictHostKeyChecking=accept-new"
     printf 'ssh -t %s %q "docker start %s >/dev/null 2>&1; docker exec -it %s run_node.sh pair"' \
         "$opts" "$host" "$container" "$container"
+}
+
+# obk_jetson_preflight: say whether the depth pane can actually reach the ZED box, BEFORE
+# any pane is opened. Run it where the pane's ssh runs -- inside the container.
+#
+# Every failure of this link presents the same way: a pane that sits there, or dies, with no
+# depth arriving. On a robot that reads as a CAMERA fault and sends you to the cameras. So
+# name the cause here instead. Four of them, with four different fixes:
+#
+#   1. the box is not answering               -- off, cable out, or OBK_JETSON_HOST is stale
+#   2. no pubkey auth from in here            -- scripts/setup_zed_link.sh (the usual one)
+#   3. the offered identity has a passphrase  -- ssh blocks on a prompt in a pane, forever
+#   4. the zed_depth container does not exist -- the cameras are fine, the image is not up
+#
+# (3) is why setup_zed_link.sh makes a DEDICATED passphrase-free key instead of reusing
+# ~/.ssh/id_ed25519, which on this box has one: BatchMode turns that block into a clean
+# "Permission denied" here, but an interactive pane would just hang at a prompt.
+#
+# Returns 0 only when a `docker exec` on the far side would work.
+obk_jetson_preflight() {
+    local host="${OBK_JETSON_HOST:-$OBK_JETSON_HOST_FALLBACK}"
+    local container="${OBK_JETSON_CONTAINER:-zed_depth}"
+    local addr="${host#*@}"
+    local out rc=0
+
+    # BatchMode: never prompt. A prompt IS the failure being looked for, not a question.
+    out="$(ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+              "$host" 'echo obk_ssh_ok' 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ] || [ "${out#*obk_ssh_ok}" = "$out" ]; then
+        echo "[obk] the depth pane cannot ssh to the ZED box ($host)." >&2
+        echo "[obk]   ssh: ${out##*$'\n'}" >&2
+        case "$out" in
+            *"Permission denied"*)
+                echo "[obk]   CAUSE: no pubkey auth from in here (the box may have no" >&2
+                echo "[obk]          authorized_keys at all, or our key is not in it)." >&2
+                echo "[obk]   FIX:   scripts/setup_zed_link.sh   -- once, needs that box's password" >&2 ;;
+            *"timed out"*|*"No route to host"*|*"Connection refused"*|*"Network is unreachable"*)
+                echo "[obk]   CAUSE: $addr is not answering." >&2
+                echo "[obk]   FIX:   ping $addr; if that works, OBK_JETSON_HOST in docker/.env" >&2
+                echo "[obk]          is aimed at the wrong box (it named the onboard minipc" >&2
+                echo "[obk]          for a while after the cameras moved to their own)." >&2 ;;
+            *"Host key verification failed"*|*"REMOTE HOST IDENTIFICATION"*)
+                echo "[obk]   CAUSE: the box's host key changed -- reinstalled, or a new box." >&2
+                echo "[obk]   FIX:   ssh-keygen -R $addr, then scripts/setup_zed_link.sh" >&2 ;;
+            *)
+                echo "[obk]   FIX:   scripts/setup_zed_link.sh --check   for the full diagnosis" >&2 ;;
+        esac
+        echo "[obk]   This is NOT a camera fault. --no-depth skips the pane entirely." >&2
+        return 1
+    fi
+
+    rc=0
+    out="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+              "docker inspect -f '{{.State.Status}}' $container" 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "[obk] ssh to $host works, but '$container' is not usable there:" >&2
+        echo "[obk]   ${out##*$'\n'}" >&2
+        echo "[obk]   CAUSE: the container was never created (or this user cannot reach" >&2
+        echo "[obk]          docker). The cameras are fine either way." >&2
+        echo "[obk]   FIX:   on $addr: cd ~/sprout/transfer/jetson/zed/docker && docker compose up -d" >&2
+        return 1
+    fi
+    echo "[obk] ZED box $addr: ssh ok, container '$container' is ${out##*$'\n'}."
+    return 0
+}
+
+# obk_jetson_clock_report: print how far the ZED box's clock sits from this one's, reading
+# the FAR SIDE's own chrony rather than timing a round trip.
+#
+# Not `date` over ssh: an ssh round trip is a few hundred ms of process startup and the
+# remote reading lands at an unknown point inside it, so that method's own error is ~100x
+# the offset it would be measuring. chrony's number is an NTP measurement against this box.
+#
+# Diagnostic only, and deliberately never fatal: the controller's depth watchdog uses LOCAL
+# RECEIPT time (g1_controller.cc), so a skewed camera clock cannot stale-latch a good camera.
+# What it does corrupt is `depth_capture_age` -- the only number that says how old a frame
+# was when the policy used it -- and every cross-box comparison in the bag.
+obk_jetson_clock_report() {
+    local host="${OBK_JETSON_HOST:-$OBK_JETSON_HOST_FALLBACK}"
+    local out rc=0 ref off
+    out="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$host" \
+              'command -v chronyc >/dev/null && chronyc tracking' 2>&1)" || rc=$?
+    if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
+        echo "[obk] clock: cannot read chrony on $host -- clocks are UNSYNCHRONISED unless"
+        echo "[obk]        something else keeps them together. See scripts/setup_clock_sync.sh."
+        return 1
+    fi
+    ref="$(printf '%s\n' "$out" | sed -n 's/^Reference ID *: *//p')"
+    off="$(printf '%s\n' "$out" | sed -n 's/^Last offset *: *\([-+0-9.]*\).*/\1/p')"
+    if [ -z "$off" ]; then off=0; fi
+    printf '[obk] clock: ZED box is %s ms off its source (%s)\n' \
+        "$(awk -v o="$off" 'BEGIN{printf "%+.2f", o*1000}')" "${ref:-unknown}"
+    case "$ref" in
+        *"$OBK_TIME_MASTER"*) ;;
+        *)  echo "[obk]        WARNING: its source is NOT this box ($OBK_TIME_MASTER), so the two"
+            echo "[obk]        clocks agree only as far as their separate uplinks do." ;;
+    esac
+    awk -v o="$off" 'BEGIN{exit !(o*1000 > 5 || o*1000 < -5)}' \
+        && echo "[obk]        WARNING: >5 ms is an eighth of the depth pipeline's ~42 ms latency."
+    return 0
 }
 
 # obk_mark_jetson <0|1>: record whether THIS launch put a node on the Jetson, so stop.sh
@@ -513,15 +625,21 @@ obk_stop() {
         # good .mcap that `ros2 bag` refuses to open ("read failed"), recoverable only via
         # `ros2 bag reindex`. Every bag this stack recorded before this was in that state.
         # 3 s is generous -- finalising is a summary write, not a flush of the whole file.
-        if "${dc[@]}" exec -T "$OBK_SERVICE" bash -c 'pgrep -f "ros2 bag record" >/dev/null'; then
+        #
+        # `[r]os2 bag record`, NOT the plain string: `pgrep -f` matches against every process's
+        # full command line INCLUDING THIS `bash -c` ITSELF, which contains the pattern. Spelled
+        # plainly, the test was true on every teardown -- so a run with no recorder still printed
+        # "stopping the bag recorder", waited its 3 s, and then warned that a bag which never
+        # existed would need reindexing. The bracket makes the pattern not match its own text.
+        if "${dc[@]}" exec -T "$OBK_SERVICE" bash -c 'pgrep -f "[r]os2 bag record" >/dev/null'; then
             echo "[obk] stopping the bag recorder gracefully (so metadata.yaml is written)..."
             "${dc[@]}" exec -T "$OBK_SERVICE" bash -c '
-                pkill -INT -f "ros2 bag record" 2>/dev/null || true
+                pkill -INT -f "[r]os2 bag record" 2>/dev/null || true
                 for _ in $(seq 30); do
-                    pgrep -f "ros2 bag record" >/dev/null || break
+                    pgrep -f "[r]os2 bag record" >/dev/null || break
                     sleep 0.1
                 done
-                pgrep -f "ros2 bag record" >/dev/null \
+                pgrep -f "[r]os2 bag record" >/dev/null \
                     && echo "[obk] recorder still running after 3s; it will be killed -- the bag will need \`ros2 bag reindex\`" \
                     || true' || true
         fi

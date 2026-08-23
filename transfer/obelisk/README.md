@@ -384,6 +384,48 @@ E-STOP is right trigger.
 > From low-level control the only exits are DAMPING and E-STOP -- you can no longer step back
 > to the held pose, so plan aborts around damping.
 
+## The ZED box: one ssh link and one clock
+
+The depth cameras are not on this box. `run_hardware_low.sh`'s depth pane ssh's to the ZED
+box (`zolkin@192.168.123.221`, `OBK_JETSON_HOST` in `docker/.env`) and starts the pair inside
+the container there, so the brain's container needs pubkey auth to it and the two boxes need
+one time base. Both are one-time, per box:
+
+```bash
+scripts/setup_zed_link.sh                     # dedicated passphrase-free key -> ssh-copy-id
+sudo scripts/setup_clock_sync.sh --master      # this box serves time to 192.168.123.0/24
+# then, on the ZED box, from its own checkout:
+sudo transfer/obelisk/scripts/setup_clock_sync.sh --client
+scripts/setup_clock_sync.sh --check            # back here: is it following us, and by how much
+```
+
+**The key is deliberately NOT `~/.ssh/id_ed25519`**, which on this box has a passphrase (it is
+the GitHub key). A tmux pane cannot answer a passphrase prompt, so it would hang there
+forever showing nothing -- and a depth pane that prints no frames reads as a camera fault.
+`setup_zed_link.sh` makes `~/.ssh/id_obk_zed` with no passphrase and an `~/.ssh/config` block
+with `IdentitiesOnly yes` so ssh cannot fall back to the other key. `~/.ssh` is bind-mounted
+into the container, so the key made on the host IS the one the pane uses.
+
+`run_hardware_low.sh` now preflights that link before it opens any pane and refuses to start
+with the cause named (no route / no pubkey / no container) rather than leaving you a silent
+pane. `--no-depth` is the way past it, and also the right flag when the far side is already up
+and you only want to stop supervising it.
+
+**Why the BRAIN is the time master**, and not the ZED box (which is the one with internet):
+`depth_capture_age` is a receipt time made here minus a capture stamp made there, and every
+other stamp in the bag is this box's, so making this box the reference turns a difference
+between two steered clocks into one client's reported offset. The ZED box's UTC arrives over
+wifi, and the robot has to work with no wifi; `local stratum 10 orphan` here keeps ONE
+self-consistent base either way while still tracking real UTC whenever the uplink is there.
+The cost is honest: `systemd-timesyncd` is an SNTP client and cannot serve time, so chrony
+gets installed here and apt removes timesyncd -- pointing timesyncd at the ZED box instead
+would have needed no package at all.
+
+None of this is a safety gate. The depth watchdog times frames by LOCAL RECEIPT on purpose
+(`g1_controller.cc`), so a skewed camera clock cannot stale-latch a healthy camera. Skew
+corrupts `depth_capture_age` -- the only number that says how old a frame was when the policy
+used it -- and every cross-box comparison in a bag.
+
 # Setting up the Xbox remote
 You can now run the script:
 ```

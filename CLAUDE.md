@@ -533,10 +533,111 @@ scripts/fetch_brain_bags.sh          # bags are recorded ON THE BRAIN's box
 - **Never copy a bag from a live run**: it comes back torn at message ~0. Stop first.
 - **Remote bags go to `log/bags_thor/`**, never `log/bags/`. Bags are named by timestamp only,
   so mixing two machines in one directory makes their origin unrecoverable.
-- **The clocks are not synchronised** (chrony here, systemd-timesyncd there, ~8 ms apart).
-  Cross-box `depth_capture_age` is offset by that and can read SMALLER than `depth_age`, which
-  is impossible. Rate matches to 1 ppm, so only the absolute value is affected. Nothing in the
-  control path uses a remote stamp; the watchdog deliberately uses receipt time.
+- **The clocks are not synchronised** on this desktop/Thor pair (chrony here,
+  systemd-timesyncd there, ~8 ms apart). Cross-box `depth_capture_age` is offset by that and
+  can read SMALLER than `depth_age`, which is impossible. Rate matches to 1 ppm, so only the
+  absolute value is affected. Nothing in the control path uses a remote stamp; the watchdog
+  deliberately uses receipt time. On the ROBOT LAN this is fixed rather than tolerated -- the
+  brain serves time there (see the ZED box section) -- and the same
+  `setup_clock_sync.sh --client` would make this desktop follow it if a split sim run ever
+  needs comparable stamps.
+
+## The ZED box: the depth cameras arrive over an ssh link, and one clock
+
+On hardware the cameras are NOT on the brain. `run_hardware_low.sh`'s depth pane ssh's to the
+ZED box (`zolkin@192.168.123.221`, `OBK_JETSON_HOST` in `docker/.env`) and runs `run_node.sh
+pair` in the container there, so the link is part of the control path. Robot LAN, all three
+boxes: robot `.161`, brain `.220`, ZED `.221`. Two one-time setups, both idempotent:
+`scripts/setup_zed_link.sh` (ssh) and `scripts/setup_clock_sync.sh --master` here plus
+`--client` there (time).
+
+**Every failure of this link presents as a depth pane that prints nothing, which on a robot
+reads as a CAMERA fault.** So `obk_jetson_preflight` runs before any pane is built and names
+the cause instead: no route, no pubkey, changed host key, or no `zed_depth` container.
+`run_hardware_low.sh` refuses to start on it (every policy here is a depth policy, `--clip`
+included -- only the generator is absent there); `--no-depth` is the deliberate way past.
+
+- **The key is NOT `~/.ssh/id_ed25519`**, which has a passphrase on both these boxes. A tmux
+  pane cannot answer a prompt, so it would hang forever showing nothing. `setup_zed_link.sh`
+  makes `~/.ssh/id_obk_zed` with no passphrase plus an `~/.ssh/config` block with
+  `IdentitiesOnly yes` (without which ssh still tries the default identity first). `~/.ssh` is
+  bind-mounted, so the key made on the host IS the key the pane uses.
+- **`docker/.env` OVERRIDES the fallback in `obk_launch.sh`**, because compose puts it in the
+  container's environment -- and it named the onboard minipc (`unitree@192.168.123.164`) long
+  after the cameras moved, which answers ssh and would have been a wrong-box success. Worse, a
+  RUNNING container keeps the value it was CREATED with, so editing the file changes nothing
+  until compose recreates it. `test_zed_link_target.py` pins the tracked pair; `--check` prints
+  the container's own value beside the file's.
+- **The BRAIN is the time master**, not the ZED box, even though the ZED box is the one with
+  internet: `depth_capture_age` is a receipt time made here minus a capture stamp made there,
+  the bags are here, and every other stamp in them is this box's -- so one client's reported
+  offset replaces a difference between two independently steered clocks. The ZED box's UTC
+  comes over WIFI and the robot must work with no AP, which `local stratum 10 orphan` here
+  covers. The cost, stated because the other direction was free: `systemd-timesyncd` is an
+  SNTP client and cannot serve, so chrony replaces it here.
+- **Live since 2026-08-22**: the ZED box tracks `192.168.123.220` (stratum 4 off the brain's
+  3) at tens of microseconds. `trust` on the client means the internet pool there is excluded
+  for disagreeing with the brain (`^?` in `chronyc sources`) -- deliberate, since the two
+  boxes agreeing with each other matters more than either agreeing with UTC, and the pool is
+  still polled so it takes over if the brain goes away.
+- **Clock skew is a DIAGNOSTIC problem, not a safety one.** The depth watchdog times frames by
+  local receipt on purpose (`g1_controller.cc`), so a skewed camera clock cannot stale-latch a
+  healthy camera. It corrupts `depth_capture_age` -- the only number saying how old a frame was
+  when the policy used it -- and every cross-box comparison in a bag.
+- `obk_mark_jetson` had never been CALLED, so `stop.sh --zed` skipped the remote teardown
+  silently and left the pair holding the cameras. `run_hardware_low.sh` sets it now.
+- **`chronyc tracking` on the master is NOT what clients get.** While the `local` reference is
+  active -- from startup until a real source's root distance falls under the 1 s `distance`
+  threshold, and again if every upstream is lost -- tracking reports `7F7F0101`
+  (127.127.1.1) / stratum 10 / zero root delay, so the master reads as unsynchronised for the
+  first couple of minutes while it is already serving the real upstream. Measured here:
+  tracking said stratum 10 while a query to `192.168.123.220` was answered stratum 3,
+  ref 51.81.226.229, 108 ms root delay. `setup_clock_sync.sh` therefore probes the server over
+  the wire (`served`), which also proves `allow` is scoped -- the same query to 127.0.0.1 must
+  time out.
+
+## The first REAL hardware run: three config defects, all in the robot driver
+
+`run_hardware_low.sh` came up end to end on the robot on 2026-08-22 (brain + driver + ZED
+pair + recorder, unarmed). Everything that blocked it was in the DRIVER path -- the sim path
+had been exercised for months and the hardware one never had -- and each failure named
+something other than its cause:
+
+- **`docker/cyclonedds.xml` was still pinned to `192.168.50.20`**, the desktop split-sim
+  cable, which this box no longer has. Cyclone treats an absent pinned interface as FATAL, so
+  EVERY ros node died at `rmw_create_node: failed to create domain` with the real reason one
+  line earlier ("does not match an available interface"). The file is gitignored per box, so
+  nothing in the repo could catch it. It now lists BOTH roles' addresses with
+  `presence_required="false"`, so the same file works plugged into the robot, the desktop, or
+  both, and the absent one is a warning.
+- **`AllowMulticast` must be ON for the robot LAN.** It was false (correct for the desktop
+  cable, where unicast peers are safer). The ZED box cannot be reached that way: its config
+  uses multicast and lists no peers, so its participants keep Cyclone's DEFAULT ephemeral
+  ports -- and a portless `<Peer>` is resolved by probing participant INDEXES, which an
+  unindexed participant never answers. Brain and cameras would simply never see each other,
+  both looking healthy alone. The peers stay for the desktop role.
+- **`target_ip` is THIS box's address, not the robot's.** obelisk uses it only to pick the
+  local interface (`GetInterfaceName(target_ip, ...)`) and defaults to `192.168.123.222`,
+  Unitree's user-PC convention. The brain is `.220`, so the node aborted with "No interface
+  found with IP: 192.168.123.222" -- which reads as a robot connection fault. Set by ADDRESS
+  rather than `network_interface_name` on purpose: an interface name changes when the cable
+  moves between an onboard NIC and a USB adapter.
+- **`g1_robot_hw.yml` had no `timers:` block**, so `timer_ctrl` -- the passive-hold timer
+  `G1Interface` registers in `on_configure`, which drives the motors while the FSM sits in
+  USER_POSE or DAMPING -- had no period, and the configure transition threw "Timer entry is
+  missing required field 'timer_period_sec'". A missing entry only WARNS; it is a registered
+  timer with no entry that throws.
+
+Measured, unarmed, with the real cameras (tick 50.0 Hz, depth 47.2 / 47.7 Hz):
+`depth_age` 1.7 / 0.6 ms (the controller's own contribution) and `depth_capture_age`
+53.7 / 36.9 ms (whole pipeline from the ZED's own capture stamp). Both capture ages exceed
+both receipt ages, which is TASKS 2a's done-when for the clock sync -- the number that used to
+be able to read impossibly small. `fm_plan` and `ctrl` are silent while `armed: False`.
+
+**Do not measure a stamp age with `ros2 topic echo --once` + `date`.** That method carries
+~250 ms of its own process startup: a topic stamped on THIS box read +249 ms through it while
+the depth topic read +273 ms. Only the difference means anything. The controller's own
+`depth_capture_age` is the number, and it is in the bag.
 
 ## Logging: MCAP, and what is deliberately NOT in it
 
