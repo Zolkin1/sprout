@@ -24,8 +24,19 @@ robot:
     pkg: obelisk_unitree_cpp
     executable: obelisk_unitree_g1_hardware
     params:
-      # Set to the interface facing the robot (192.168.123.161); find it with `ifconfig`.
-      # network_interface_name: enx6c1ff724e92e
+      # THIS BOX's own address on the robot LAN -- not the robot's, despite the name. The
+      # obelisk interface uses it only to find which local interface to put the unitree SDK
+      # on (`GetInterfaceName(target_ip, ...)`), and its default is 192.168.123.222, the
+      # Unitree convention for the user PC. This brain is .220, so the default fails at
+      # startup with "No interface found with IP: 192.168.123.222" and the node aborts --
+      # which reads as a robot connection problem rather than a local address mismatch.
+      #
+      # By ADDRESS rather than by interface name on purpose: the name changes when the cable
+      # moves between an onboard NIC and a USB adapter, and the address does not (the same
+      # reasoning as docker/cyclonedds.xml). Setting network_interface_name instead skips
+      # this lookup entirely and is the fallback if a box ever has the address twice.
+      target_ip: "192.168.123.220"
+      # network_interface_name: enP2p1s0
 
       # 29 DoF: the 27-DoF set plus waist roll and pitch. Our clips and the trained policy
       # use the full 29 (see the 29-DoF migration), and the G1 interface only exposes the two
@@ -99,6 +110,19 @@ robot:
         0.47, -0.24, 0.0, 0.8, 0.0, 0.0, 0.0,
         0.0, 0.0,
       ]
+    # The interface's PASSIVE-HOLD timer, and it is not optional: G1Interface registers
+    # `timer_ctrl` in on_configure and it is what drives the motors autonomously while the
+    # FSM sits in USER_POSE or DAMPING (the gains above are the ones it uses). With no entry
+    # here the configure transition fails outright --
+    #   "Timer entry is missing required field 'timer_period_sec'"
+    # -- which reads as a malformed config rather than a missing one.
+    #
+    # 50 Hz, matching the controller's own tick in common/low_level.yml. This is the rate the
+    # HOLD is refreshed at, not a control period the policy sees.
+    timers:
+      - ros_parameter: timer_ctrl_setting
+        timer_period_sec: 0.02
+        callback_group: None
     publishers:
       - ros_parameter: pub_sensor_setting
         topic: /obelisk/g1/joint_encoders

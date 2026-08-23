@@ -4,6 +4,32 @@ Copyright 2026 Zachary Olkin. All rights reserved.
 
 Cyclone DDS discovery over a link that will not carry multicast.
 
+ONE BOX, TWO LINKS: put BOTH in the live file
+=============================================
+A box that is sometimes on the robot LAN and sometimes on a private cable to another
+dev machine needs both addresses in `cyclonedds.xml`, not one address that gets edited:
+
+    <NetworkInterface address="192.168.123.220" priority="10" multicast="default" presence_required="false" />
+    <NetworkInterface address="192.168.50.20"   priority="0"  multicast="default" presence_required="false" />
+
+`presence_required="false"` downgrades an absent address from FATAL to a warning, and the
+priority decides which link wins when both are up. Without it, a pinned address that this box
+does not currently have kills the domain and EVERY ros node dies at
+`rmw_create_node: failed to create domain`, with the actual reason ("does not match an
+available interface") one line above it. This exact stale pin blocked the first hardware
+bring-up: the file still named the other machine's cable weeks after the robot arrived, and
+because it is gitignored per box, nothing in the repo could notice.
+
+AllowMulticast is a PER LINK decision, and the file only has one
+================================================================
+`false` is right for a private cable and for campus or guest wifi, which routinely drop
+multicast between clients. It is WRONG if any peer on any of the listed links relies on
+multicast: a peer that keeps Cyclone's default ephemeral participant ports cannot be reached
+by a portless `<Peer>` entry at all (unicast discovery resolves those by probing participant
+INDEXES, which `ParticipantIndex auto` is what grants). The two sides then never see each
+other while each looks perfectly healthy alone. Multicast on plus the peer list below is the
+safe combination when the links differ.
+
 Copy to `cyclonedds.xml` in this directory, edit the peer addresses, and point the container
 at it from docker/.env:
 

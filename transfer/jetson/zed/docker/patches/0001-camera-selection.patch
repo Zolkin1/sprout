@@ -1,0 +1,85 @@
+Add serial_number / gmsl_port camera selection to zed_depth_publisher.
+
+Upstream (github.com/wdc3iii/zed-interface) opens `zed_.open(init_params_)` without ever
+setting `init_params_.input`, and declares no parameter that could. The SDK therefore takes
+the first AVAILABLE device. That is fine with one camera and a race with two: whichever node
+instance calls open() first gets camera 0, so which physical camera feeds
+/depth/near/image_processed versus /depth/far/image_processed is nondeterministic across
+restarts. The obelisk controller cross-checks the topic COUNT against tracker.onnx but has no
+way to notice that the two are swapped.
+
+Adds two read-only parameters:
+  serial_number  unambiguous, names a device
+  gmsl_port      names a MOUNTING POSITION, so it survives a camera swap -- preferred for a
+                 fixed installation, since near/far are positions and not devices
+
+Carried here rather than in the image because ZED_REF is pinned deliberately: the depth
+geometry has to match what the policy trained on, and a moving ref is a silent way to change
+it. Send this upstream and the patch goes away with a ZED_REF bump.
+
+diff --git a/README.md b/README.md
+index f930b59..3bce764 100644
+--- a/README.md
++++ b/README.md
+@@ -81,6 +81,8 @@ Each stage can be independently enabled/disabled. When disabled, data passes thr
+ | `coordinate_units` | string | `MILLIMETER` | MILLIMETER or METER |
+ | `depth_stabilization` | int | `30` | 0=off, 1-100=smoothness level |
+ | `depth_encoding` | string | `32FC1` | 32FC1 (float) or 16UC1 (uint16, always millimeters) |
++| `serial_number` | int | `0` | Serial of the camera to open. `0` = first available, which is a **race** when more than one camera is attached |
++| `gmsl_port` | int | `-1` | GMSL port of the camera to open (Jetson GMSL only). Names a mounting position rather than a device, so it survives a camera swap. Ignored if `serial_number` is set |
+ | `depth_topic` | string | `depth/image_raw` | Published raw depth image topic |
+ | `camera_info_topic` | string | `depth/camera_info` | Published raw camera info topic |
+ | `frame_id` | string | `zed_depth_frame` | TF frame ID |
+diff --git a/zed_depth_publisher/src/zed_depth_node.cpp b/zed_depth_publisher/src/zed_depth_node.cpp
+index b4857a2..7950e76 100644
+--- a/zed_depth_publisher/src/zed_depth_node.cpp
++++ b/zed_depth_publisher/src/zed_depth_node.cpp
+@@ -109,6 +109,19 @@ void ZedDepthNode::declareParameters()
+     desc.description = "Depth image encoding: 32FC1 (float) or 16UC1 (uint16 mm)";
+     this->declare_parameter("depth_encoding", "32FC1", desc);
+ 
++    // WHICH camera to open. Without a selector the SDK takes the first AVAILABLE device, so
++    // on a multi-camera box two node instances race for it and the assignment of camera to
++    // topic is nondeterministic across restarts.
++    desc.description = "Serial number of the camera to open (0 = first available)";
++    this->declare_parameter("serial_number", 0, desc);
++
++    // Prefer this on a fixed installation: a serial names a specific physical device, a port
++    // names a MOUNTING POSITION, and it is the position that decides whether a camera is the
++    // 'near' or the 'far' one. Surviving a camera swap is the point.
++    desc.description = "GMSL port of the camera to open (-1 = unused). Jetson GMSL only. "
++                       "Ignored when serial_number is set";
++    this->declare_parameter("gmsl_port", -1, desc);
++
+     // Runtime parameters (dynamically reconfigurable)
+     desc.read_only = false;
+ 
+@@ -244,6 +257,28 @@ void ZedDepthNode::loadInitParameters()
+     // Depth stabilization
+     init_params_.depth_stabilization = this->get_parameter("depth_stabilization").as_int();
+ 
++    // Camera selection. Serial wins when both are given, since it is unambiguous; the warning
++    // exists because "no selector" is a silent race on this hardware rather than a default.
++    const long long serial = this->get_parameter("serial_number").as_int();
++    const long long gmsl_port = this->get_parameter("gmsl_port").as_int();
++    if (serial > 0) {
++        init_params_.input.setFromSerialNumber(static_cast<unsigned int>(serial));
++        RCLCPP_INFO(get_logger(), "Camera selected by serial number: %lld", serial);
++        if (gmsl_port >= 0) {
++            RCLCPP_WARN(get_logger(),
++                        "both serial_number and gmsl_port are set; ignoring gmsl_port %lld",
++                        gmsl_port);
++        }
++    } else if (gmsl_port >= 0) {
++        init_params_.input.setFromGMSLPort(static_cast<int>(gmsl_port));
++        RCLCPP_INFO(get_logger(), "Camera selected by GMSL port: %lld", gmsl_port);
++    } else {
++        RCLCPP_WARN(get_logger(),
++                    "Neither serial_number nor gmsl_port is set: opening the first AVAILABLE "
++                    "camera. With more than one camera attached, which one this is depends on "
++                    "which process calls open() first.");
++    }
++
+     init_params_.sdk_verbose = 0;
+ }
+ 

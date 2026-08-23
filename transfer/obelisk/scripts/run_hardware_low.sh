@@ -60,6 +60,12 @@ Options:
 BEFORE THE FIRST RUN ON A ROBOT WITH NO INTERNET:
   python3 scripts/prefetch_policy.py --hf_policy_folder <name>
 The controller fetches offline-first, so a cold cache is a bring-up failure.
+
+BEFORE THE FIRST RUN ON A NEW ZED BOX (or a reinstalled one):
+  scripts/setup_zed_link.sh              pubkey auth to it, from inside this container
+  sudo scripts/setup_clock_sync.sh --master     then --client over there
+The depth pane is an ssh to that box, so with no key it hangs -- looking like a camera
+fault. This script now checks the link before opening the pane and says which it is.
 EOF
 }
 
@@ -115,6 +121,23 @@ ROBOT_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml"
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
 [ -n "$CLIP_CASE" ] && CTRL_CFG="$(obk_clip_config "$CTRL_CFG" "$CLIP_CASE" "" "" "")"
 
+# The depth pane is an ssh to the ZED box (obk_jetson_zed_cmd), so check the link BEFORE
+# building a session around it. A missing key or a stale OBK_JETSON_HOST otherwise shows up
+# as a pane that never prints a frame, which on a robot reads as a camera fault and sends
+# you to the cameras. obk_jetson_preflight names the actual cause and the fix for it.
+#
+# Fatal on purpose: every policy this stack runs is a DEPTH policy -- the tracker takes depth
+# images even in --clip mode, where only the generator is absent -- so a run with no camera
+# is not a degraded run, it is a robot acting on a stale image. --no-depth is the deliberate
+# way past this, and is also the right flag when the far side is already up and you only
+# want to skip supervising it.
+if [ "$SENSORS" = 1 ] && [ "$DEPTH" = 1 ]; then
+    if ! obk_jetson_preflight; then
+        echo "[run_hardware_low] refusing to start: the depth pane cannot come up." >&2
+        exit 1
+    fi
+fi
+
 if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then
     exec tmux attach -t "$SESSION"
 fi
@@ -137,7 +160,15 @@ if [ "$SENSORS" = 1 ]; then
         # The ZED node runs in the Jetson's own container tmux, so a flaky ssh link is
         # just Up+Enter here and never takes the camera down with it.
         tmux split-window -v -t "$SESSION":main.2 "$(obk_pane_run depth "$(obk_jetson_zed_cmd)")"
+        # Record that a node went onto the ZED box. Without this marker `stop.sh --zed`
+        # skips the remote teardown silently -- it tests for the marker before spending an
+        # ssh -- and the pair stays holding the cameras after the stack is down.
+        obk_mark_jetson 1
+    else
+        obk_mark_jetson 0
     fi
+else
+    obk_mark_jetson 0
 fi
 
 tmux select-window -t "$SESSION":main

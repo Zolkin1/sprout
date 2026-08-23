@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+Copyright 2026 Zachary Olkin. All rights reserved.
+
+Cyclone DDS interface pinning for the ZED depth box.
+
+Copy to `cyclonedds.xml` in this directory, set the address to THIS box's robot network
+address, and point the container at it from docker/.env:
+
+    CYCLONEDDS_URI=file:///opt/zed_config/cyclonedds.xml
+
+then recreate the container: compose reads .env only when it CREATES one, so the force
+recreate flag is required. The path is the one INSIDE the container; this directory is bind mounted there
+read only, which is why the file lives beside the node params rather than next to .env.
+
+NO DOUBLE HYPHEN ANYWHERE IN A COMMENT IN THIS FILE. A double hyphen is illegal inside an
+XML comment and conforming parsers reject the whole file, even though Cyclone's own parser
+tolerates it. The obelisk example carries the same warning for the same reason.
+
+WHY THIS BOX NEEDS ONE AT ALL
+=============================
+Not for the usual reason. Discovery here is plain multicast on a wired switch and works
+without any of this. The problem is that the box is MULTI HOMED: wifi for internet, the
+robot network for DDS, plus the l4tbr0 and docker0 bridges. Cyclone picks ONE interface and
+says so in its own log:
+
+    using network interface enP8p1s0 (udp/192.168.123.221) selected arbitrarily from:
+        enP8p1s0, wlP7p1s0, l4tbr0, docker0
+
+"Selected arbitrarily" is the whole issue. All four rank equally, so the choice can land on
+wifi or on a docker bridge, and then the brain never sees a depth frame while this box looks
+perfectly healthy and the node logs nothing wrong. That is the silent failure
+`scripts/net_check.sh` exists to name.
+
+An ADDRESS rather than an interface name: a driver assigned name changes when the adapter
+does, and the address is the thing that was chosen deliberately.
+
+WHAT IS DELIBERATELY NOT HERE
+=============================
+* AllowMulticast is left at its default (on). The unicast Peers list in the obelisk example
+  exists for links that will not carry multicast, such as wifi or a routed hop. A wired
+  switch carries it, and turning multicast off would then oblige every box to list every
+  other one, which is a maintenance burden and an asymmetry bug waiting to happen.
+* SocketReceiveBufferSize is not set. The obelisk boxes ask for 10 MB because they RECEIVE
+  the 500 Hz encoder and 1 kHz IMU streams. This box receives nothing and publishes two
+  30x26 float images at about 45 Hz, so the default is ample. That also keeps the file from
+  being fatal on a stock kernel: a buffer request the kernel cannot satisfy kills every ROS
+  node at startup with "rmw_create_node: failed to create domain", and this box ships with
+  net.core.rmem_max at 1 MB. Raising it to 16 MB is still worth doing for fleet consistency,
+  but nothing here depends on it.
+-->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface address="192.168.123.221" priority="default" multicast="default" />
+      </Interfaces>
+    </General>
+  </Domain>
+</CycloneDDS>
