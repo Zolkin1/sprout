@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "g1_deploy/depth_obs.h"
+#include "robot_asset_json.h"
 
 namespace g1_deploy {
 
@@ -35,6 +36,10 @@ FmMeta ParseFmMeta(const std::string& json) {
     throw std::runtime_error(std::string("fm_meta is not valid JSON: ") + e.what());
   }
   FmMeta m;
+  // Optional and tolerated when absent: a graph exported before the key existed has none, and
+  // AssertRobotAssetsAgree stays silent on a missing side rather than refusing every pair on
+  // disk. See robot_asset.h for why the fingerprint is needed at all.
+  m.robot_asset = ParseRobotAsset(root);
   m.n = root.at("N").get<int>();
   m.f = root.at("F").get<int>();
   m.d = root.at("D").get<int>();

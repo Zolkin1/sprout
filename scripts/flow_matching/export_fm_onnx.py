@@ -158,6 +158,13 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         "extero_source": str(ctx.extero_source),
         "extero_sensor_count": int(ctx.model.extero_sensor_count),
         "extero_spec": ctx.extero_spec,
+        # WHICH ROBOT the recording behind this generator was made with. The tracker stamps the
+        # same fingerprint (export_parameters), and GenTrackerPolicy.load refuses a pair that
+        # disagrees -- joint names and their order survive a payload change, a hand swap and a
+        # gear-ratio change, so `joint_names_isaac` (the only field that came close) matches
+        # across all of them and cannot catch this. Until this key was written the check
+        # short-circuited on the absent FM side and never fired at all.
+        "robot_asset": ctx.robot_asset,
         # WHICH exteroception embedding is baked into the graph, and the geometry it folds
         # the flat row with. The runtime does not need these to run -- the reshape is inside
         # the graph -- but it needs them to CHECK: ``extero_sensor_dim`` alone cannot tell a

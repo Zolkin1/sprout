@@ -292,6 +292,21 @@ class TrackerSession:
         A content hash of the clip library's ``terrain_manifest``. The library's own
         fingerprint does not cover the terrain, so a library whose tile geometry was
         rewritten offline -- motions untouched -- is otherwise indistinguishable.
+
+        NOTHING ON THIS PATH COMPARES IT, deliberately, and the two obvious comparisons are
+        both wrong rather than merely unimplemented:
+
+        * against the GENERATOR, the way ``robot_asset`` is compared. The generator has no
+          terrain -- it conditions on depth, which is a measurement of whatever ground is
+          actually there -- so there is no second value to disagree with.
+        * against the deploy box. It has no terrain either; it has real ground, and a hash of
+          a training manifest cannot say anything about it.
+
+        Where it WOULD bite is the sim side, checking a tracker against the scene or clip
+        library a run is replaying -- a tile whose geometry was rewritten offline plays a
+        reference the policy was not trained for. That belongs in ``gen_tracker_runner`` /
+        ``play.py``, which know what they loaded; this runtime does not. Kept here because it
+        is cheap to carry and the alternative is re-deriving it from the artifact later.
         """
         return self.params.get("terrain_fingerprint")
 

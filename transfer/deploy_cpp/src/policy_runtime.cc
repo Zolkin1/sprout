@@ -128,6 +128,13 @@ void PolicyRuntime::Load() {
   // than by quietly serving a window whose base_pose means something else. The two arms have
   // identical widths, so nothing downstream could ever catch this.
   core_cfg.window_anchor = AnchorFromConvention(rw.base_pose_convention);
+  // WHICH ROBOT each half was trained on. There is one physical robot, so a tracker and a
+  // generator running together cannot have been trained on two -- the same argument as the
+  // camera-contract check. Nothing else can catch this: all 29 joint names and their order
+  // survive a payload change, a hand swap and a gear-ratio change, so the pair loads clean and
+  // the only symptom is a robot that tracks slightly wrong.
+  AssertRobotAssetsAgree(p.robot_asset, fm_->meta().robot_asset, cfg_.tracker_onnx,
+                         cfg_.fm_onnx);
 
   if (cfg_.threaded_fm) {
     worker_ = std::make_shared<FmWorker>(fm_, static_cast<size_t>(fm_->meta().f) * node_dim_);

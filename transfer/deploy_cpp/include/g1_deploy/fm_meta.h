@@ -13,12 +13,17 @@
 #include <utility>
 #include <vector>
 
+#include "g1_deploy/robot_asset.h"
 #include "g1_deploy/window.h"
 
 namespace g1_deploy {
 
 /// The generator's contract, from fm.onnx's `fm_meta`.
 struct FmMeta {
+  //: WHICH ROBOT the recording behind this generator was made with. Compared against the
+  //: tracker's at load; see AssertRobotAssetsAgree. Absent on any graph exported before the
+  //: key existed, which is tolerated rather than refused.
+  RobotAsset robot_asset;
   int n = 0;  //: N, history length
   int f = 0;  //: F, horizon
   int d = 0;  //: D, node width

@@ -28,6 +28,8 @@
 #include <utility>
 #include <vector>
 
+#include "g1_deploy/robot_asset.h"
+
 namespace g1_deploy {
 
 /// One policy observation term, resolved.
@@ -119,6 +121,11 @@ struct PolicyParams {
   std::vector<DepthCameraSpec> depth_cameras;
   //: True if the policy observes a height scan instead of (or as well as) depth.
   bool needs_height_scan = false;
+  //: WHICH ROBOT this policy was trained on. Nothing else in the exported set says: joint
+  //: names and their order are unchanged by a payload, a hand swap or a gear ratio, so
+  //: `joint_names_isaac` -- the only field that came close -- matches across all of them.
+  //: Compared against the generator's at load.
+  RobotAsset robot_asset;
 
   /// Sum of the term widths. Must equal num_obs; a mismatch means the layout and the graph
   /// disagree, which no downstream check would catch in time.

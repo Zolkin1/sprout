@@ -42,6 +42,7 @@ endif()
 
 add_library(g1_deploy STATIC
   src/fm_meta.cc
+  src/robot_asset.cc
   src/quat_math.cc
   src/window.cc
   src/depth_obs.cc
@@ -236,9 +237,14 @@ if(BUILD_TESTING)
     add_test(NAME camera_fk_parity COMMAND camera_fk_parity_test)
   endif()
   if(GTest_FOUND)
-    foreach(name quat_math_parity window_parity depth_obs_parity fm_meta node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler imu_hold pose_history)
+    foreach(name quat_math_parity window_parity depth_obs_parity fm_meta node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler imu_hold pose_history robot_asset)
       add_executable(${name}_test test/${name}_test.cc test/fixture.cc)
-      target_include_directories(${name}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
+      # test/ for the fixture reader, and src/ for the INTERNAL headers a test may need --
+      # robot_asset_json.h lives there rather than in include/ because it takes an nlohmann
+      # type, and nlohmann is PRIVATE to this library (a public header would leak it into the
+      # ROS node that consumes us).
+      target_include_directories(${name}_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/test ${CMAKE_CURRENT_SOURCE_DIR}/src)
       target_link_libraries(${name}_test
         PRIVATE g1_deploy nlohmann_json::nlohmann_json GTest::gtest GTest::gtest_main)
       target_compile_options(${name}_test PRIVATE -Wall -Wextra -Wpedantic)

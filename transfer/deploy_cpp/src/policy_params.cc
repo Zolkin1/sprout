@@ -3,6 +3,7 @@
 #include "g1_deploy/policy_params.h"
 
 #include "g1_deploy/depth_obs.h"
+#include "robot_asset_json.h"
 
 #include <nlohmann/json.hpp>
 
@@ -223,6 +224,9 @@ PolicyParams ParsePolicyParameters(const std::string& json) {
     throw std::runtime_error("observation terms sum to " + std::to_string(p.TotalObsWidth()) +
                              " but the graph declares num_obs=" + std::to_string(p.num_obs));
   }
+  // Same treatment as the fm side: optional, tolerated when absent. The comparison against
+  // the generator's happens in PolicyRuntime::Load, where both artifacts are in hand.
+  p.robot_asset = ParseRobotAsset(root);
   return p;
 }
 

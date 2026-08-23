@@ -101,6 +101,13 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto",
         "meta": {"state_joint_names": meta.state_joint_names,
                  "target_frame_names": meta.state_frame_names,
                  "extero_spec": train.extero_spec,
+                 # RecordingMeta carries this and train.py's asdict() puts it in the
+                 # checkpoint, so it is present in every real .pt. Mirrored here because the
+                 # bug being guarded against was the export DROPPING it, which is invisible
+                 # when the test's own checkpoint never had one.
+                 "robot_asset": {"short": "deadbeefcafe", "version": 1,
+                                 "covers": ["joint_names"],
+                                 "joint_names": list(meta.state_joint_names)},
                  "fm_snap_every": 12},
         "num_joints": nj,
         "state_normalizer": train.state_normalizer.state_dict(),
@@ -173,6 +180,11 @@ def test_fm_meta_contract(tmp_path, encoder):
         "cmd_steps", "num_cmd_tokens", "extero_sensor_dim", "extero_source",
         "extero_sensor_count", "extero_spec", "fm_snap_every",
         "window_blocks", "has_history_null",
+        # WHICH ROBOT. transfer/deploy/fm_session reads it into FmContext.robot_asset and
+        # GenTrackerPolicy._assert_robot_assets_agree refuses a tracker/generator pair that
+        # disagrees. That check short-circuits on a missing FM side, so for a long time the
+        # absent key made it dead code rather than a failing test -- hence pinning it here.
+        "robot_asset",
     }
     assert required <= set(meta), f"fm_meta is missing {sorted(required - set(meta))}"
     assert (meta["N"], meta["F"], meta["nj"]) == (n, f, nj)
@@ -180,6 +192,9 @@ def test_fm_meta_contract(tmp_path, encoder):
     assert len(meta["joint_names"]) == nj
     assert len(meta["cmd_steps"]) == meta["num_cmd_tokens"]
     assert meta["fm_snap_every"] == 12
+    assert meta["robot_asset"]["short"] == "deadbeefcafe", (
+        "the checkpoint's robot fingerprint did not reach fm_meta; the deploy-side pair check "
+        "silently passes on a missing FM side, so this is the only thing that would notice")
     # The state-layout guard. The generator's output goes straight into the tracker's
     # observation, so the block table has to travel: D alone does not identify the layout.
     assert [tuple(b) for b in meta["window_blocks"]] == window_blocks(nj, k)

@@ -219,6 +219,19 @@ class FmOnlineContext:
     this generator against the tracker sharing the same physical cameras.  ``None`` for
     the height scan, whose grid travels in the tracker's ``height_scan_spec`` instead.
     """
+    robot_asset: dict | None = None
+    """WHICH ROBOT the recording that trained this generator was produced with.
+
+    ``motion_gen.robot_asset.fingerprint_robot_asset``, carried from the recording through the
+    checkpoint exactly as :attr:`extero_spec` is. Nothing here reads it -- it exists so the
+    exported ``fm_meta`` can carry it and ``transfer/deploy``'s
+    ``GenTrackerPolicy._assert_robot_assets_agree`` can refuse a tracker/generator pair trained
+    on different robots. Without it that check short-circuits on ``if not fm_asset: return``
+    and is dead code, which is what it was.
+
+    ``None`` for a checkpoint recorded before the fingerprint existed; the comparison treats a
+    missing side as "cannot compare" and stays silent rather than guessing.
+    """
     extero_clip: float | None = None
     """Symmetric clip band this checkpoint was TRAINED under, or ``None`` for the default.
 
@@ -601,6 +614,10 @@ def load_fm_context(
         extero_sensor_dim=int(cfg.extero_sensor_dim),
         extero_channels=int(cfg.extero_channels),
         extero_spec=(meta.get("extero_spec") or None),
+        # Straight off the recording's meta, like extero_spec above: RecordingMeta carries it
+        # and train.py's asdict() puts it in the checkpoint, so nothing new has to be plumbed
+        # through training -- only READ, here, and written into fm_meta at export.
+        robot_asset=(meta.get("robot_asset") or None),
         extero_image_hw=([(int(h), int(w)) for h, w in cfg.extero_image_hw]
                          if cfg.extero_image_hw else None),
         # The band this checkpoint was TRAINED under, so the live token builder clamps the way
