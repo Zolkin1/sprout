@@ -84,8 +84,9 @@ class FakeSampler : public FmSampler {
   std::vector<Pending> pending_;
 };
 
-CoreConfig MakeConfig(int k, int lead) {
+CoreConfig MakeConfig(int k, int lead, WindowAnchor anchor = WindowAnchor::kPlan) {
   CoreConfig cfg;
+  cfg.window_anchor = anchor;
   cfg.num_joints = kNJ;
   cfg.num_ee_frames = kEE;
   cfg.blocks = kSlim;
@@ -116,8 +117,9 @@ void DecodeTag(double v, int* plan, int* node) {
 }
 
 struct Harness {
-  explicit Harness(int k, int lead = 3, int delay = 0)
-      : cfg(MakeConfig(k, lead)),
+  explicit Harness(int k, int lead = 3, int delay = 0,
+                   WindowAnchor anchor = WindowAnchor::kPlan)
+      : cfg(MakeConfig(k, lead, anchor)),
         sampler(std::make_shared<FakeSampler>(
             WindowDim(kNJ, kEE, kSlim), kF, delay)),
         core(cfg, sampler),
@@ -214,10 +216,16 @@ TEST(GenTrackerCore, TheStashIsRawNotReAnchored) {
 // ---------------------------------------------------------------------------------------
 
 TEST(GenTrackerCore, AStaleAnchorIsCorrectedWhenTheRobotHasMoved) {
-  // The core of K>1: serving must not shear the window by the distance travelled since the
-  // plan was adopted. joint_pos is anchor-invariant and must be untouched; base_pose is not
-  // and must change.
-  Harness h(12, /*lead=*/1);
+  // The core of K>1 UNDER kRobotNow: serving must not shear the window by the distance
+  // travelled since the plan was adopted. joint_pos is anchor-invariant and must be untouched;
+  // base_pose is not and must change.
+  //
+  // kRobotNow is asked for explicitly because it is no longer what a CoreConfig defaults to,
+  // and PolicyRuntime::Load refuses to build it at all -- that arm needs a measured base
+  // position, i.e. odometry, which this deploy path does not have. The mechanism is kept and
+  // kept under test because it is ReanchorWindow's only integration test, and because the
+  // refusal is a policy decision that could be revisited without the maths having rotted.
+  Harness h(12, /*lead=*/1, /*delay=*/0, WindowAnchor::kRobotNow);
   h.Step(MakeState());  // adopt at the origin, identity orientation
   const auto slices = WindowBlockSlices(kNJ, kEE, kSlim);
   const int dim = WindowDim(kNJ, kEE, kSlim);
@@ -240,6 +248,59 @@ TEST(GenTrackerCore, AStaleAnchorIsCorrectedWhenTheRobotHasMoved) {
   int plan = 0, node = 0;
   DecodeTag(h.window[joint_off], &plan, &node);
   EXPECT_EQ(node, 1);
+}
+
+TEST(GenTrackerCore, ThePlanArmServesThePredictionUntouchedEvenAfterTheRobotMoves) {
+  // The whole point of window_anchor="plan": the generator already predicts in the frame of
+  // the root at the re-plan, which IS the frame the observation is defined against, so the
+  // prediction is the observation and is served exactly as it was made.
+  //
+  // The second Step moves the robot 5 m and turns it, i.e. the state that would make a
+  // re-anchor rewrite base_pose completely. Every element must still be the plain plan/node
+  // tag: nothing derived from state.root_pos may reach the window. That is the negative
+  // control, and it is the one that matters -- rtr's own commit records that a test double
+  // which returned the measured root made this arm look inert and pass.
+  Harness h(12, /*lead=*/1);
+  h.Step(MakeState());  // adopt at the origin
+  h.Step(MakeState(Vec3(5.0, -3.0, 0.7), QuatFromAxisAngle(Vec3(0.0, 0.0, 1.1))));
+
+  const int dim = WindowDim(kNJ, kEE, kSlim);
+  for (size_t r = 0; r < kOffsets.size(); ++r) {
+    // Plan 1, node = cursor(1) + offset. FakeSampler tags every element identically.
+    const double want = 1.0 + (1 + kOffsets[r]) / 1000.0;
+    for (int d = 0; d < dim; ++d) {
+      EXPECT_DOUBLE_EQ(h.window[r * dim + d], want)
+          << "row " << r << " element " << d
+          << ": the plan arm must serve the prediction byte-identically, and must not read "
+             "the measured base pose at all";
+    }
+  }
+}
+
+TEST(GenTrackerCore, TheTwoArmsDisagreeOnceTheRobotHasMoved) {
+  // Same plan, same states, one field different -- and the served windows differ. This is
+  // what makes a mislabelled artifact dangerous: the two arms have identical widths and
+  // identical blocks, so nothing downstream can tell them apart, which is why the convention
+  // is checked at load instead of inferred.
+  Harness plan_arm(12, /*lead=*/1);
+  Harness now_arm(12, /*lead=*/1, /*delay=*/0, WindowAnchor::kRobotNow);
+  const CoreState adopt = MakeState();
+  const CoreState moved = MakeState(Vec3(1.0, 2.0, 0.0), QuatFromAxisAngle(Vec3(0.0, 0.0, 0.6)));
+  for (Harness* h : {&plan_arm, &now_arm}) {
+    h->Step(adopt);
+    h->Step(moved);
+  }
+  const auto slices = WindowBlockSlices(kNJ, kEE, kSlim);
+  int base_off = 0;
+  for (const auto& s : slices) {
+    if (s.block == ReferenceBlock::kBasePose) base_off = s.offset;
+  }
+  double delta = 0.0;
+  for (int i = 0; i < 9; ++i) {
+    delta = std::max(delta, std::abs(plan_arm.window[base_off + i] - now_arm.window[base_off + i]));
+  }
+  EXPECT_GT(delta, 0.5) << "the two arms produced the same base_pose for a robot that moved; "
+                           "one of them is not doing what it says";
 }
 
 TEST(GenTrackerCore, ReanchorOnTheAdoptionTickIsAnIdentity) {

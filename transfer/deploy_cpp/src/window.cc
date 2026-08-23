@@ -34,6 +34,44 @@ int BlockWidth(ReferenceBlock block, int num_joints, int num_ee_frames) {
 
 }  // namespace
 
+namespace {
+
+//: The two strings robot_rl.flow_matching.window.BASE_POSE_CONVENTIONS can stamp. Restated
+//: here rather than parsed out of a shared file because there is no shared file across the
+//: language boundary -- the artifact is. Both are named so the refusal below can say which of
+//: the two it got and what that means, instead of echoing a hex-looking string back.
+constexpr const char* kConventionRobotNow =
+    "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d";
+constexpr const char* kConventionPlan =
+    "pose_in_plan_yaw_frame_pos_ref_minus_plan_ori_rot6d";
+
+}  // namespace
+
+WindowAnchor AnchorFromConvention(const std::string& convention) {
+  if (convention == kConventionPlan) return WindowAnchor::kPlan;
+  if (convention == kConventionRobotNow) {
+    throw std::runtime_error(
+        std::string("tracker.onnx reference_window base_pose_convention is '") + convention +
+        "' (window_anchor=\"robot_now\"), which this runtime refuses BY DESIGN rather than "
+        "cannot serve. That arm measures the reference from the robot's base position every "
+        "control step, so serving it needs odometry -- and this deploy path has none: the "
+        "controller reads encoders and the IMU, and a base position it does not trust would "
+        "move the whole reference window. Train or export with window_anchor=\"plan\", whose "
+        "prediction IS the observation. For a robot_now A/B use the python runtime "
+        "(transfer/sim/gen_tracker_runner.py), where MuJoCo supplies a true base pose.");
+  }
+  throw std::runtime_error(
+      std::string("tracker.onnx reference_window base_pose_convention is '") + convention +
+      "', which this runtime does not recognise. Known: '" + kConventionPlan +
+      "' (served) and '" + kConventionRobotNow +
+      "' (refused: needs odometry). Tracker and runtime disagree about what the observation "
+      "MEANS, which no shape check can see.");
+}
+
+const char* ConventionForAnchor(WindowAnchor anchor) {
+  return anchor == WindowAnchor::kPlan ? kConventionPlan : kConventionRobotNow;
+}
+
 std::string BlockName(ReferenceBlock block) {
   switch (block) {
     case ReferenceBlock::kBasePose:

@@ -77,6 +77,12 @@ struct CoreConfig {
   int history_length = 0;    //: N
   int cmd_dim = 3;
   ScheduleConfig schedule;
+  //: Which serve arm the ARTIFACT asks for -- a property of the tracker, not of this build,
+  //: so one binary plays whatever it is handed (subject to AnchorFromConvention refusing the
+  //: odometry-dependent one). Defaulted to kPlan, the only arm PolicyRuntime::Load can
+  //: actually produce, so a config assembled without setting it serves the prediction as made
+  //: rather than silently re-anchoring on a base position this runtime does not trust.
+  WindowAnchor window_anchor = WindowAnchor::kPlan;
 };
 
 /// The algorithm. Single-threaded by construction: the FM seam is what crosses a thread in

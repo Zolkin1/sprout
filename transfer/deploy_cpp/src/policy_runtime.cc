@@ -123,6 +123,11 @@ void PolicyRuntime::Load() {
   core_cfg.schedule.horizon = fm_->meta().f;
   core_cfg.schedule.max_offset = *std::max_element(rw.offsets.begin(), rw.offsets.end());
   core_cfg.schedule.lead_ticks = lead_ticks_;
+  // Which serve arm, from the artifact's own convention string. Throws on the odometry-
+  // dependent arm and on anything unrecognised -- at LOAD, where it can be reported, rather
+  // than by quietly serving a window whose base_pose means something else. The two arms have
+  // identical widths, so nothing downstream could ever catch this.
+  core_cfg.window_anchor = AnchorFromConvention(rw.base_pose_convention);
 
   if (cfg_.threaded_fm) {
     worker_ = std::make_shared<FmWorker>(fm_, static_cast<size_t>(fm_->meta().f) * node_dim_);

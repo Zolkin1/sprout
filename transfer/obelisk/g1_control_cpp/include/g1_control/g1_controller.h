@@ -214,7 +214,10 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   bool depth_stale_ = false;
   bool vel_cmd_stale_ = false;
   //: Set when a tick's inputs were non-finite, for DiagnoseNonFinite.
-  bool bad_q_base_ = false;
+  //: Split, because the halves differ in consequence -- see DiagnoseNonFinite. The
+  //: orientation is an observation; the position is not read by the policy on the plan arm.
+  bool bad_base_quat_ = false;
+  bool bad_base_pos_ = false;
   bool bad_v_base_ = false;
   bool bad_joints_ = false;
   bool bad_depth_ = false;

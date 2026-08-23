@@ -158,11 +158,21 @@ TickOutcome GenTrackerCore::Step(const CoreState& state, double* window_out) {
   }
   const TickOutcome outcome = sched_.ResolveTick();
 
-  // 4. Serve the window at the tracker's offsets, re-anchored onto the measured base NOW.
-  //    The prediction is anchored where the robot was at adoption; the observation's contract
-  //    is "relative to the robot's current actual base". Those coincide only on the adoption
-  //    tick, and serving the stale frame would hand the policy a window wrong by exactly the
-  //    distance travelled since.
+  // 4. Serve the window at the tracker's offsets. WHICH pose the base_pose block is measured
+  //    from is the artifact's choice, and the two arms differ only in meaning -- same widths,
+  //    same blocks -- so this branch is the whole difference between them.
+  //
+  //    kPlan: the generator already predicts in the frame of the root at the re-plan, which
+  //    IS what the observation is defined against, so the prediction is served exactly as it
+  //    was made. `state.root_pos` is never read here. That is what makes this deploy path
+  //    odometry-free, and it is the only arm PolicyRuntime::Load will build (see
+  //    AnchorFromConvention).
+  //
+  //    kRobotNow: the observation is defined against the robot's base RIGHT NOW, so the
+  //    prediction -- anchored where the robot was at adoption -- has to be re-expressed, or
+  //    the policy gets a window wrong by exactly the distance travelled since. Reachable only
+  //    from a hand-built CoreConfig; a robot_now artifact is refused at load, because doing
+  //    this on hardware means trusting a measured base position.
   const int rows = window_rows();
   if (!sched_.has_plan()) {
     std::fill(window_out, window_out + static_cast<size_t>(rows) * node_dim_, 0.0);
@@ -172,8 +182,12 @@ TickOutcome GenTrackerCore::Step(const CoreState& state, double* window_out) {
     const int idx = sched_.NodeIndex(cfg_.offsets[static_cast<size_t>(r)]);
     const double* src = pred_.data() + static_cast<size_t>(idx) * node_dim_;
     double* dst = window_out + static_cast<size_t>(r) * node_dim_;
-    ReanchorWindow(src, 1, anchor_pos_, anchor_quat_, state.root_pos, state.root_quat,
-                   cfg_.num_joints, cfg_.num_ee_frames, cfg_.blocks, dst);
+    if (cfg_.window_anchor == WindowAnchor::kPlan) {
+      std::copy(src, src + node_dim_, dst);
+    } else {
+      ReanchorWindow(src, 1, anchor_pos_, anchor_quat_, state.root_pos, state.root_quat,
+                     cfg_.num_joints, cfg_.num_ee_frames, cfg_.blocks, dst);
+    }
   }
 
   // 5. Stash the node served THIS step -- RAW, in its plan's own frame, never re-anchored.

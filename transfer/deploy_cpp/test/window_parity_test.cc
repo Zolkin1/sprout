@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -250,6 +251,56 @@ TEST(Window, ReanchorSupportsInPlaceAliasing) {
   double worst = 0.0;
   for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, std::abs(separate[i] - b[i]));
   EXPECT_LT(worst, 1e-15) << "in-place re-anchor differs from out-of-place by " << worst;
+}
+
+// ---------------------------------------------------------------------------------------
+// Which serve arm the artifact asks for
+// ---------------------------------------------------------------------------------------
+
+TEST(Window, ThePlanConventionSelectsThePlanArm) {
+  EXPECT_EQ(AnchorFromConvention("pose_in_plan_yaw_frame_pos_ref_minus_plan_ori_rot6d"),
+            WindowAnchor::kPlan);
+}
+
+TEST(Window, TheRobotNowConventionIsRefusedBecauseItNeedsOdometry) {
+  // Not "unsupported" -- REFUSED. The maths for that arm is right here in ReanchorWindow and
+  // is tested above; what this runtime does not have is a base position it can trust, and
+  // serving robot_now means re-anchoring on one every control step. The two conventions have
+  // identical widths and identical blocks, so accepting it would load clean and steer wrong.
+  //
+  // The message has to say WHICH arm and WHY, because "convention mismatch" sends the reader
+  // to look for a shape bug that does not exist.
+  try {
+    AnchorFromConvention("pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d");
+    FAIL() << "the robot_now convention was accepted; this runtime has no odometry";
+  } catch (const std::runtime_error& e) {
+    const std::string msg = e.what();
+    EXPECT_NE(msg.find("robot_now"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("odometry"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("plan"), std::string::npos) << msg;
+  }
+}
+
+TEST(Window, AnUnknownConventionThrowsAndNamesWhatItKnows) {
+  try {
+    AnchorFromConvention("pose_in_some_frame_nobody_trained");
+    FAIL() << "an unrecognised convention was accepted";
+  } catch (const std::runtime_error& e) {
+    const std::string msg = e.what();
+    // Echo the offending string AND the alternatives: a bare "unknown convention" leaves the
+    // reader unable to tell a typo from a genuinely new arm.
+    EXPECT_NE(msg.find("pose_in_some_frame_nobody_trained"), std::string::npos) << msg;
+    EXPECT_NE(msg.find("pose_in_plan_yaw_frame"), std::string::npos) << msg;
+  }
+}
+
+TEST(Window, ConventionForAnchorRoundTripsThePlanArm) {
+  // The half that is served must survive the round trip, so a diagnostic can print the arm
+  // it resolved and mean the same string the artifact carried.
+  EXPECT_EQ(AnchorFromConvention(ConventionForAnchor(WindowAnchor::kPlan)),
+            WindowAnchor::kPlan);
+  EXPECT_STREQ(ConventionForAnchor(WindowAnchor::kRobotNow),
+               "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d");
 }
 
 }  // namespace

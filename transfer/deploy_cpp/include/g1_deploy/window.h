@@ -33,6 +33,36 @@
 
 namespace g1_deploy {
 
+/// Which pose the ``base_pose`` block's POSITION is measured from.
+///
+/// Mirrors robot_rl.flow_matching.window.BASE_POSE_CONVENTIONS, and the arm the python
+/// runtime selects in GenTrackerPolicy._build_window. The two arms are IDENTICAL in width and
+/// in every other block, so a tracker trained under one loads clean against the other and
+/// merely steers wrong -- which is why the convention travels in the artifact and is checked
+/// rather than assumed.
+///
+///   * kRobotNow -- position is `p_ref - p_actual(t)`, the tracking error against the robot as
+///     it is THIS step. Serving it means re-anchoring the prediction onto the measured base
+///     every control step, which needs the base POSITION, which on a robot means odometry.
+///   * kPlan -- position is `p_ref - p_plan`, measured from the root at the last re-plan. The
+///     generator already predicts in that frame, so its output IS the observation: it is
+///     served as made and no base position is read on the generator path at all.
+///
+/// This runtime implements kPlan ONLY; see AnchorFromConvention.
+enum class WindowAnchor { kRobotNow, kPlan };
+
+/// The arm a `base_pose_convention` string selects.
+///
+/// Throws std::runtime_error on a string this runtime cannot serve -- including the
+/// well-known kRobotNow one, which it deliberately refuses. That refusal is the point: the
+/// deploy path is odometry-free by construction, and a robot_now tracker would load with the
+/// right widths and be served a window re-anchored on a base position the robot cannot
+/// measure. The python runtime serves both arms and is what a sim2sim A/B should use.
+WindowAnchor AnchorFromConvention(const std::string& convention);
+
+/// The convention string for an arm, for error messages and diagnostics.
+const char* ConventionForAnchor(WindowAnchor anchor);
+
 /// The blocks a window node can pack, in canonical packing order.
 enum class ReferenceBlock { kBasePose, kBaseVel, kJointPos, kJointVel, kEePos };
 

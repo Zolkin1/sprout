@@ -44,6 +44,19 @@ bool AllFinite(const std::vector<double>& v) {
   return true;
 }
 
+/// Finiteness of `[first, last)` within `v`, allocation-free.
+///
+/// Exists so q_base can be checked in halves on the control path without building a temporary
+/// every tick. Out-of-range is reported as NOT finite: a message too short to contain the
+/// field is not a healthy reading of it.
+bool AllFiniteRange(const std::vector<double>& v, size_t first, size_t last) {
+  if (v.size() < last) return false;
+  for (size_t i = first; i < last; ++i) {
+    if (!std::isfinite(v[i])) return false;
+  }
+  return true;
+}
+
 }  // namespace
 
 double RollingStat::Percentile(double q) {
@@ -615,7 +628,10 @@ std::string G1Controller::DiagnoseNonFinite() const {
     if (!which.empty()) which += ", ";
     which += s;
   };
-  if (bad_q_base_) add("q_base");
+  if (bad_base_quat_) add("q_base orientation (an observation)");
+  // Listed but qualified: it cannot be the cause of a non-finite TARGET on the plan arm, and
+  // saying so is what stops the next person bisecting odometry for an IMU fault.
+  if (bad_base_pos_) add("q_base position (diagnostics only, not read by the policy)");
   if (bad_v_base_) add("v_base");
   if (bad_joints_) add("joint_pos/joint_vel");
   if (bad_depth_) add("depth (an all-invalid frame)");
@@ -707,6 +723,14 @@ ControlMsg G1Controller::ComputeControl() {
   }
 
   g1_deploy::HardwareReadings r;
+  // DIAGNOSTICS ONLY on the plan arm, which is the only arm this runtime will load. The core
+  // latches it as the plan anchor and publishes it in TickDiagnostics so the FmPlan ribbon can
+  // be drawn in the world; the served reference window is the prediction in its own frame and
+  // never touches it (GenTrackerCore::Step step 4, and
+  // GenTrackerCore.ThePlanArmServesThePredictionUntouchedEvenAfterTheRobotMoves, which moves
+  // the robot 5 m and asserts the window does not budge). That is what "this deploy path has
+  // no odometry" means concretely -- the estimator's FAST-LIO plumbing is still here, and a
+  // drifting or absent base position costs the RViz ribbon and nothing else.
   r.root_pos = Vec3(est.q_base[0], est.q_base[1], est.q_base[2]);
   r.base_quat_xyzw = quat;
   // Only the ANGULAR half of v_base reaches the policy. base_ang_vel is an observation term
@@ -724,7 +748,14 @@ ControlMsg G1Controller::ComputeControl() {
   r.joint_names = est.joint_names;
   r.command = EffectiveCommand();
 
-  bad_q_base_ = !AllFinite(est.q_base);
+  // q_base is [pos(3), quat(4)], and the two halves no longer have the same consequence, so
+  // reporting them together points the reader at the wrong field. The QUATERNION is an
+  // observation (projected_gravity; ImuHold holds a degenerate one rather than passing it on).
+  // The POSITION is read by nothing on the policy path: the plan arm serves the generator's
+  // prediction in its own frame, so a garbage base position cannot reach a joint target -- it
+  // reaches only the anchor latch, and from there the FmPlan ribbon in RViz.
+  bad_base_quat_ = !AllFiniteRange(est.q_base, 3, 7);
+  bad_base_pos_ = !AllFiniteRange(est.q_base, 0, 3);
   bad_v_base_ = !AllFinite(est.v_base);
   bad_joints_ = !AllFinite(est.joint_pos) || !AllFinite(est.joint_vel);
   bad_depth_ = false;
