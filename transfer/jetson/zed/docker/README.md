@@ -126,6 +126,27 @@ Four things that are not obvious from the numbers:
   20 ms tick, so some ticks reuse the previous frame: age at the tick is the 41.9 ms plus up to
   one period, ~53 ms typical and ~76 ms worst case. That is what `depth_capture_age` reports.
 
+The knob sweep behind those bullets, all SVGA NEURAL_LIGHT with both cameras concurrent,
+measured with `tools/measure_pair.sh`:
+
+| knob | rate/cam | capture->grab | retrieve | in-process total |
+|---|---|---|---|---|
+| fps 120, stab 30 (shipped) | 43.7 Hz | 24.36 ms | 17.50 ms | 41.9 ms |
+| fps 120, stab 0 | 49.8 Hz | 23.19 ms | 15.88 ms | 39.1 ms |
+| fps 60, stab 30 | 43.9 Hz | 36.67 ms | 17.47 ms | 54.1 ms |
+| fps 60, stab 0 | 50.2 Hz | 34.85 ms | 16.19 ms | 51.0 ms |
+| fps 30, stab 0 | 30.0 Hz | 41.68 ms | 18.33 ms | 60.0 ms |
+| fps 60, stab 0, exposure pinned 2 ms | 51.1 Hz | 34.25 ms | 15.80 ms | 50.1 ms |
+| fps 60, stab 0, retrieve=none | 50.5 Hz | 50.06 ms | -- (grab blocks 19.4) | -- |
+| fps 60, stab 0, ONE camera | 60.0 Hz | 24.07 ms | 9.65 ms | 33.7 ms |
+
+The last two are the ones that explain the rest. With no retrieve the cost moves INTO grab
+(blocking 4.6 -> 19.4 ms), so grab and retrieve share one wait and which of them blocks is a
+loop artefact rather than a property of either. And one camera alone reaches 33.7 ms against
+the pair's 51.0, so contention is 17.3 ms -- though that run was fps-limited while the pair
+does 2 x 45 depth maps/s, i.e. MORE total GPU work, so merging the two nodes into one process
+would recover only the two-CUDA-context overhead and not the cost of two depth maps.
+
 Exposure is not a lever (pinning it to 2 ms moved capture->grab by 0.6 ms) and neither are the
 GPU clocks (an Orin NX tops out at the 918 MHz it already runs at). Contention is worth 17.3 ms
 -- one camera alone totals 33.7 ms -- but that run was fps-limited while the pair does 2 x 45
