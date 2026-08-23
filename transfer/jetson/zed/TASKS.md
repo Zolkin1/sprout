@@ -204,7 +204,23 @@ optional before this runs on the robot, except where marked.
 ## 3. Robustness
 
 - [ ] **3a. Survive an nvargus crash.** `nvargus-daemon` crashed 3 times in one session
-  (`NRestarts=3`), taking a node pair down with it. Partly handled: the launch file now
+  (`NRestarts=3`), taking a node pair down with it. **Now `NRestarts=6`**, last active
+  2026-08-22 17:24:41 PDT, measured after the first hardware run.
+  - **Untested hypothesis worth one experiment: our own teardown may be causing some of
+    these.** `obk_jetson_stop_cmd` ends with `pkill -9` on the launch tree and the node, and
+    a process killed with SIGKILL while it holds a camera cannot close it, which is exactly
+    the state nvargus handles worst. The 17:24 restart sits close to a `stop.sh --zed`, and
+    close is not caused-by: nothing recorded which came first. Settle it by reading
+    `systemctl show nvargus-daemon -p NRestarts` on this box immediately before and after a
+    `stop.sh --zed`, twice. If the teardown is the trigger, the fix is to let SIGTERM finish
+    (`close()` takes 25-30 s here) before escalating, rather than to harden the crash path.
+  - Verified separately: a DETACHED session does survive the brain's tmux being killed, as
+    `run_node.sh` claims -- the pair kept running after a plain `stop.sh`. What ends it is
+    the launch TREE exiting, whether reaped deliberately by `--zed` or by nodes dying and
+    respawns being exhausted; the session is the only one, so the tmux server goes with it,
+    and the container never restarts (`RestartCount 0`), leaving no record inside it. The
+    consequence either way is that the depth pane's "re-running re-attaches to the SAME
+    node" quietly becomes a cold start. Partly handled: the launch file now
   respawns a died node after 10 s, and the `/tmp` directory mount lets the container follow
   the recreated socket without being recreated (verified). Still open:
   - the node has NO retry around `open()`, so a camera that is briefly unavailable is a
