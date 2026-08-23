@@ -65,6 +65,15 @@ Options:
                    out over DDS, and the local rviz2 is simply one more window. Obelisk's
                    bringup starts rviz2 unconditionally with the viz block, so there is no
                    way to ask for the publishers without it.
+  --depth-delay S  TEST ONLY. Hold every depth frame S seconds before the controller sees
+                   it, with its header stamp untouched, and point the controller at the
+                   delayed topics. This manufactures the latency MuJoCo does not have (~50 ms
+                   on the real ZED path) so that capture-time pose matching has something to
+                   correct: without it the matching code runs but every lookup resolves to
+                   ~now, and a bug in it is invisible. Pair with depth_pose_match:=false for
+                   the A/B -- with matching off the terrain should visibly swing as the torso
+                   pitches. Run it single-box first, where the world and brain share a clock;
+                   the two-box difference is what the clock skew costs.
   --no-bag         Do NOT record. Recording is ON by default -- a run you cannot
                    explain afterwards is a run you have to repeat. Bags go to
                    $REPO_ROOT/transfer/obelisk/log/bags/<timestamp>_fm/.
@@ -85,7 +94,7 @@ EOF
 }
 
 ORIG_ARGS=("$@")
-POLICY="" ; BUILD="" ; BAG=1 ; PYTHON_CTRL="" ; RVIZ=""
+POLICY="" ; BUILD="" ; BAG=1 ; PYTHON_CTRL="" ; RVIZ="" ; DEPTH_DELAY=""
 VEL_PROFILE="" ; VEL_DURATION=""
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -101,6 +110,7 @@ while [ $# -gt 0 ]; do
         --rviz)        RVIZ=1; shift ;;
         --policy)      POLICY="${2:-}"; shift 2 ;;
         --no-bag)      BAG=""; shift ;;
+        --depth-delay) DEPTH_DELAY="${2:-}"; shift 2 ;;
         --build)       BUILD=1; shift ;;
         --build-clean) BUILD=clean; shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -132,6 +142,7 @@ fi
 # After --policy: each overlay includes the previous one by absolute path, so the order here
 # is the include chain and both flags compose.
 [ -n "$RVIZ" ] && CTRL_CFG="$(obk_viz_config "$CTRL_CFG")"
+[ -n "$DEPTH_DELAY" ] && CTRL_CFG="$(obk_depth_delay_config "$CTRL_CFG" "$DEPTH_DELAY")"
 
 if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then
     exec tmux attach -t "$SESSION"
@@ -157,6 +168,18 @@ if [ -n "$VEL_PROFILE" ]; then
         VEL_CMD="$VEL_CMD -p duration:=$(printf '%.3f' "$VEL_DURATION")"
     fi
     tmux split-window -v -t "$SESSION":main.1 "$(obk_pane_run vel "$VEL_CMD")"
+fi
+
+# The delay relay, in the same window as the controller it feeds. Started AFTER the controller
+# pane so the ordering matches everything else here; it is a pure republisher, so a frame that
+# arrives before it is up is simply not relayed and the controller waits, which is the same
+# thing that happens while the world is still coming up.
+if [ -n "$DEPTH_DELAY" ]; then
+    tmux split-window -v -t "$SESSION":main.0 "$(obk_pane_run delay \
+        "ros2 run g1_control depth_delay_relay --ros-args \
+           -p in_topics:='[/depth/near/image_processed,/depth/far/image_processed]' \
+           -p out_topics:='[/depth/near/image_delayed,/depth/far/image_delayed]' \
+           -p delay_sec:=$DEPTH_DELAY")"
 fi
 
 # A SECOND window, so --rviz does not disturb the layout of `main`. Only the two marker /

@@ -61,6 +61,7 @@ setup(
             "scripted_vel_cmd = g1_control.scripted_vel_cmd_node:main",
             "fm_plan_viz = g1_control.fm_plan_viz_node:main",
             "depth_cloud_viz = g1_control.depth_cloud_viz_node:main",
+            "depth_delay_relay = g1_control.depth_delay_relay_node:main",
         ],
     },
 )
