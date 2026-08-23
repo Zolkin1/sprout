@@ -518,9 +518,15 @@ scripts/fetch_brain_bags.sh          # bags are recorded ON THE BRAIN's box
   brain running and still recording. Stop both.
 - **`run_sim_low.sh` RE-ATTACHES** when its tmux session exists, so a config change is ignored
   until `OBK_RESTART=1`.
-- **The Thor cannot reach GitHub** (the key needs a passphrase, so non-interactive ssh fails).
-  Move commits with a bundle over the private link, and FETCH BEFORE reverting anything local:
-  `git bundle create /tmp/x.bundle <their-head>..<branch>`, scp, then
+- **The Thor reaches GitHub only through a running ssh AGENT.** The key has a passphrase, so
+  whether `git push` works is a property of the CONTEXT, not the box: from a desktop session
+  the gnome-keyring agent (`SSH_AUTH_SOCK=/run/user/1001/keyring/ssh`) holds it unlocked and a
+  push just works, while the same command with the agent stripped fails with "make sure you
+  have the correct access rights" -- which is what a cron job, a detached script, or the obk
+  container (no agent socket mounted, only `~/.ssh`) all get. That last one is why the ZED
+  depth link needs its own passphrase-free key rather than this one.
+  Where there is no agent, move commits with a bundle over the private link, and FETCH BEFORE
+  reverting anything local: `git bundle create /tmp/x.bundle <their-head>..<branch>`, scp, then
   `git fetch /tmp/x.bundle <branch> && git merge --ff-only FETCH_HEAD`.
 - **`ssh -tt` needs a LOCAL tty** to allocate a pty from, so it fails when backgrounded inside
   a script. Run `script -qec '<cmd>' /dev/null` on the far side instead.
