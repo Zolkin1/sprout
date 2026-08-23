@@ -54,7 +54,75 @@ generator predicted.
 torch-free ONNX runtime), `transfer/torch_math` (isaaclab-free torch quaternion math, the
 test-only oracle for the numpy ports), `transfer/obelisk` (ROS2 hardware).
 
-# Depth Cameras (this branch)
+# The robot is `g1_perceptive`, and FOUR files describe it
+
+`robot_assets/g1_perceptive/` is the trained robot: mode_11 motors, a 2.64 kg compute backpack
+(Thor + ZED), passive rubber hands in place of the Dex3-1s, the torso collider on the torso, and
+the depth-camera mounts on their as-built CAD pose. Everything else is DERIVED from its URDF, and
+that is the point -- the same robot used to be described by hand in several places at once.
+
+| file | derived by | read by |
+|---|---|---|
+| `robot_assets/g1_perceptive/g1_perceptive.urdf` | authored (`make_perceptive_urdf.py`) | the source of truth |
+| `robot_assets/g1_perceptive/g1_perceptive/` (USD) | `urdf_to_usd_conversion.py` | IsaacLab |
+| `transfer/sim/robots/g1/g1_perceptive.xml` | `make_g1_mjcf.py` | MuJoCo sim2sim + `motion_gen` FK |
+| `transfer/obelisk/g1_model/urdf/g1_perceptive.urdf` | `make_ros_urdf.py` | the deploy camera FK + RViz |
+
+**The fourth one is the cautionary tale.** It was a hand-kept copy called `g1_29j.urdf`, and it
+was byte-identical on main, the deploy branch and the training-refresh branch -- so while
+training moved to the perceptive robot, `g1_deploy::CameraPoseFk` went on FK'ing the old one.
+Nothing errored: `torso_link` and all 29 joints exist in both, so every name it looks up
+resolved, and it placed both depth cameras **exactly 10.0 mm high on every unprojected xyz
+channel**. A wrong camera pose is a plausible cloud in the wrong place, so no image inspection
+would ever have found it. `test_ros_urdf_is_generated.py` now fails if the generated file drifts
+from its source, and `test_fk_parity.py` imports both models from where they are DEFINED rather
+than restating paths, so the URDF and the MJCF cannot name different robots.
+
+**Joint count and order are UNCHANGED -- 29, identical -- and that is what makes a stale model
+dangerous.** `joint_names_isaac` is the only exported field that came close to identifying a
+robot, and it matches across a payload change, a hand swap and a gear-ratio change. So:
+- `robot_asset` (`motion_gen/robot_asset.py`) fingerprints urdf/mjcf/usd hashes + joint names +
+  sorted body names + total mass. `export_parameters` stamps it into `tracker.onnx`,
+  `export_fm_onnx` into `fm.onnx`, and BOTH runtimes refuse a pair that disagrees
+  (`_assert_robot_assets_agree`, `AssertRobotAssetsAgree`). A missing side is silent -- it is a
+  guard against a new mismatch, not a migration gate -- but "absent" and "empty" are
+  deliberately different things, since an empty fingerprint would compare equal to anything.
+- `terrain_fingerprint` is stamped and **deliberately compared nowhere on the deploy path**; see
+  `TrackerSession.get_terrain_fingerprint` for why both obvious comparisons are wrong rather
+  than merely unimplemented.
+- **Pre-mode_11 checkpoints load and are numerically meaningless**: `G1_ACTION_SCALE` is
+  `0.125 * effort / stiffness`, and hip pitch moved from the 14.3 to the 22.5 gear, so its action
+  scale went 0.2738 -> 0.1753. Same width, different meaning. `test_actuator_table.py` pins the
+  whole table.
+- Body names changed in BOTH directions (39 bodies; the 16 Dex3 links per side went, the hands,
+  camera mounts and backpack arrived), so `body_names` is no longer a prefix of the old list and
+  anything indexing it positionally shifts silently.
+
+# The reference window has TWO conventions, and deploy serves only one
+
+`window_anchor` decides what the `base_pose` block's POSITION is measured from
+(`robot_rl/flow_matching/window.py`). The two arms are **identical in width and in every other
+block**, so a tracker trained under one loads clean against the other and merely steers wrong --
+which is why the convention travels in the artifact and is checked rather than inferred.
+
+- `robot_now` -- `p_ref - p_actual(t)`, the tracking error against the robot as it is this step.
+  Serving it means re-anchoring the prediction onto the measured base every control step, which
+  needs a base POSITION, which on a robot means odometry.
+- `plan` -- `p_ref - p_plan`, measured from the root at the last re-plan. The generator already
+  predicts in that frame, so its output IS the observation: served as made, no base position read.
+
+**The C++ deploy runtime serves `plan` ONLY, and refuses `robot_now` by design rather than by
+omission** (`AnchorFromConvention`). That is what makes the deploy path odometry-free: under
+`plan`, `root_pos` reaches only the anchor latch and from there only `TickDiagnostics` and the
+FmPlan ribbon in RViz. The FAST-LIO plumbing stays in the repo, unused, and a drifting or absent
+base position costs a debug ribbon rather than the robot. The PYTHON runtime serves both arms --
+it is the MuJoCo driver and the parity oracle, and MuJoCo has a true base pose, so a `robot_now`
+A/B belongs there.
+
+**One `fm.onnx` serves either arm.** The generator is invariant to the choice: `_run_fm` latches
+the anchor on both, and the history stash is the raw served node on both. Only the serve differs.
+
+# Depth Cameras
 Two self-scanning depth cameras on the terrain teacher, as an alternative exteroception to the height scan.
 - `g1/g1_depth_env_cfg.py` + `g1/g1_self_scan.py` - camera cfgs and the generated `MultiMeshRayCaster`
   target prim paths. For the robot to appear in its own depth image every moving link must be its OWN
@@ -105,6 +173,38 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
   `extero_norm_mode` decides how the normalizer is pooled; see "The DEFAULTS are the depth
   training config" below (`per_channel` is the default, `per_element` is gone).
 - `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
+
+## The generator's depth is DELAYED, in training and in both simulators
+
+The real depth pipeline puts tens of milliseconds between capture and the frame reaching the
+network (~42 ms median measured on the ZED pair, 48 ms modelled), and a generator fed a fresh
+frame in simulation is off-distribution in exactly the variable it was fitted to. So the
+generator's conditioning carries a lag on purpose:
+
+- TRAINING: `depth_latency_probs` is a distribution over whole control steps, sampled per window
+  by `dataset._select_depth_lag`, and it rides `fm_meta` end to end so a checkpoint brings its
+  own number rather than inheriting whatever the runner defaults to.
+- SIM: `FmDepthLag` in `gen_tracker_runner.py`, derived from the graph's own
+  `depth_latency_probs` unless `--fm_depth_lag_steps` overrides it. **Only the GENERATOR is
+  delayed**; the tracker's own `depth` observation stays live, because it was trained on fresh
+  frames.
+- **The POSE travels with the image.** The 5-channel row's xyz planes are unprojected from the
+  camera pose, so a lagged image unprojected with the CURRENT pose is displaced by the egomotion
+  -- precisely the registration error those channels exist to remove.
+- HARDWARE adds none of this: its lag is physical and already in the frames. What the controller
+  does instead is match the camera POSE to the frame's capture stamp (`g1_deploy::PoseHistory`,
+  `depth_pose_match`), which is the same consistency requirement solved from the other end.
+  `depth_delay_relay` manufactures the missing latency in MuJoCo so that matching code is
+  actually exercised rather than merely present.
+
+**`--fm_lead_ticks` and `--fm_depth_lag_steps` do NOT compose.** Both exist to line the sim
+runner up against the C++ runtime, which applies no synthetic lag, so leaving both on stacks two
+delays and silently makes the documented matched comparison (`--fm_lead_ticks 1`) a 3-tick one.
+The lag is forced off for `--fm_lead_ticks` / `--dump_replay`, and asking for both explicitly is
+a hard exit. That also keeps `--dump_replay` streams coherent: the replay records the tracker's
+LIVE `depth_raw`, so a lagged `fm_camera_pose` beside it would make the C++ rebuild the extero
+row from live pixels and a stale pose, and `compare_replay.py` would report a divergence that is
+the harness's fault.
 
 ## The camera contract (how depth reaches MuJoCo / hardware)
 `mdp.depth_camera_specs(env)` derives ONE contract per camera — mount body + offset, pinhole
@@ -313,6 +413,34 @@ config carries `null`; the band was recovered forensically (the saved envelope o
 reachable only from 5.575, since 2.0 gives 3.5) and written into a `best_banded.pt` copy.
 Anything trained after that fix stamps itself. See the band note above for why a `null` is
 ambiguous rather than merely missing.
+
+## The terrain is rebuilt from the manifest, so the GROUND can change without regenerating motion
+
+A clip's only tie to its tile is an integer `terrain_id` plus a corner translation. The library
+carries a `terrain_manifest` attribute -- per-tile lists of explicit boxes -- and the RL importer,
+both MuJoCo emitters and every viewer rebuild the world from it at load. So terrain can be
+rewritten offline while the motion stays exactly as recorded, which is what the passes in
+`source/motion_gen/motion_gen/terrain/` exist for.
+
+- `decorate.py` varies STAIR WIDTHS by rewriting the manifest. The shipped library had
+  effectively none -- treads 0.801-1.156 m and approach/landing platforms ALWAYS exactly
+  `size_y`, because all three generators forced it -- so against a 16x11 scan spanning ±0.5 m an
+  0.8 m flight straddles both edges in every frame. Three arms per transition tile:
+  `wide_stairs`, `narrow_landing`, `matched`. **Grow in place, never re-centre**: `size_y` is the
+  bounding box of the tile's CLIPS' lateral travel, not of its flight, so `size_y / 2` is where
+  the motion wandered and the flight sits off it by a median 0.149 m.
+- The **decoration channel is VISUAL ONLY** and lives on its own prim (`decor.DECOR_PRIM_PATH`
+  = `/World/decor`), which the depth cameras cast against and physics ignores. It is the one
+  thing that changes what the robot SEES without changing what it stands on.
+- Walls ring the RENDERED FLOOR rather than the manifest tile, up to four per tile, and the flat
+  tiles get rooms. `test_wall_footprint.py` and `test_decor_prim_is_mandatory.py` pin both.
+- `decor.py` imports NOTHING on purpose. The depth camera cfgs need the prim path at module
+  scope, and importing the importer to read one string drags in `pxr` -- which, because hydra
+  composes the env cfg BEFORE `AppLauncher` runs, binds pip's `usd-core` instead of Kit's and
+  then segfaults when Kit boots a mismatched core. `test_no_pre_app_pxr_import.py` fails the
+  build if it comes back.
+- **Overlay fields that would diverge between simulators are REFUSED, not best-efforted**, and
+  floating overlays render as floating in every MuJoCo/viser path rather than as solid.
 
 ## sim2sim (MuJoCo)
 - `transfer/sim/depth_camera.py` — `mj_multiRay` re-implementation (~3.9 ms/frame for both cameras).
@@ -678,6 +806,60 @@ Also pinned by tests: a config parameter the node never declares is silently ign
 rclpy, so `tests/test_params_are_live.py` fails the build on one (this bit `log`,
 `log_decimation`, `config_name` and `fm_update_every`). The generator's re-plan cadence
 comes from `tracker.onnx` metadata and nowhere else.
+
+# STATE: the training refresh and the deploy stack are MERGED (2026-08-23)
+
+`worktree-robot-terrain-refresh` (the perceptive robot, terrain decoration, the `plan` anchor,
+the camera-lag model) and `cpp-deploy-port` (the C++ deploy runtime, the obelisk C++ controller,
+the two-box split, the ZED bring-up) are one tree. 12 files were touched by both; the four that
+conflicted were `gen_tracker.py`, `gen_tracker_metrics.py`, `robot.py` and `gen_tracker_runner.py`.
+
+Two resolutions worth knowing, because both branches had independently invented the same thing:
+- `robot.py` -- terrain-relative fall detection plus a tilt cone, twice, with different APIs. The
+  merged form keeps the ctor/CLI-driven one and exposes rtr's string verdict as
+  `failure_reason()`, with `failed()` as its predicate half. The two datums were measured equal on
+  all five scenes first (0.0 / 0.0 / −0.130 / −0.450 / −0.907), so no measurement moved.
+- `gen_tracker_metrics.py` -- the same "the `fell` column is written before the fall check, so
+  every fall read as a survival" bug, fixed twice. Both keys survive: `verdict_source` says which
+  answer was used, `failure_reason` says what the runner saw.
+
+**The warm-up paths stay deleted.** rtr still had them and threaded `fm_lag` through them, but
+cpp had removed `GenTrackerPolicy.warm_start` / `.observe` entirely, so keeping the hold would
+`AttributeError` on the first non-clip run.
+
+## What is BLOCKED on exporting the `plan` teacher
+
+`logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1` is trained to 19999 -- as complete as
+the `robot_now` run beside it -- but has no `exported/`. The C++ runtime is now `plan`-only, so
+**the currently exported pair cannot run on it at all**: `PolicyRuntime::Load` refuses
+`2026-08-20_09-04-12_mode11_decor_v1`'s tracker by name. Verified against the real artifact, not
+just a synthetic string. The generator does NOT need retraining --
+`2026-08-22_12-26-34_mode11_decor_lag48_aug`'s recording meta says `history_anchor: plan`, so it
+is genuinely anchor-agnostic even though it was recorded from the `robot_now` teacher.
+
+Once that export exists, three things follow and none of them can be done before it:
+1. `scripts/rsl_rl/export_sensor_configs.py --run_dir <it>`, then commit
+   `config/scan/depth_{near,far}.yml` + `zed_targets.yml`. **They still carry the placeholder far
+   camera at 35 deg**, so the obelisk MuJoCo world casts depth from mounts the networks do not
+   unproject with -- a pure registration error, invisible to every shape check.
+2. `low_level.yml`'s `hf_policy_folder`, still `2026-08-04_21-55-17_yaw_k12_v1`: a pre-perceptive
+   policy with the wrong action scale, placeholder cameras and no backpack, which loads clean.
+3. `dump_metadata_fixtures.py` then `dump_obs_fixtures.py` (in that order -- the second consumes
+   the first). Today's are valid but pinned to a pre-rtr run, so nothing exercises the new keys.
+
+## Still open, and deliberately not done here
+
+- **`transfer/obelisk/g1_model/mujoco/`** is a FOURTH, unreferenced copy of the robot
+  (`g1_27dof.xml` + 4 scenes). Nothing in the launch path reads it. It only adds ways to be wrong.
+- The `plan` arm has **no torch-vs-numpy parity test** on either side:
+  `test_gen_tracker_obs_parity.py`'s `_MockCmd.window_anchor()` returns the measured root, so it
+  covers `robot_now` only. The C++ side has the arm under test; the python-vs-torch seam does not.
+- `refresh_fk_channels.py` left the 24 world-frame EE VELOCITY channels on the old model (not
+  recoverable -- the source `.npz` are gone), so post-refresh the two wrist world-velocity blocks
+  are consistent with the old robot while their positions are consistent with the new one.
+  Libraries record this in an `fk_refresh` attr.
+- `d66420e7`'s local scene tuning (jump-up boxes near spawn, `depth_near.yml viz` re-enabled) was
+  lost in an earlier merge and has not been restored.
 
 # General Guidelines
 - Don't care for backwards compatibility.
