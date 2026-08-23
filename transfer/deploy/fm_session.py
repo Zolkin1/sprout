@@ -83,6 +83,25 @@ class FmContext:
     rather than a reordered vector -- every tensor the right size, every kernel reading the
     wrong neighbourhood. Empty for a flat-MLP graph (where pixel order genuinely does not
     matter) or one exported before the field existed."""
+    robot_asset: dict | None = None
+    """WHICH ROBOT this generator was trained on, or ``None`` for a pre-fingerprint graph.
+
+    Content hashes of the URDF / MJCF / USD plus joint names, body names and total mass.
+    A deploy box has no "current robot" to check against -- it has whatever hardware it is
+    bolted to -- so the meaningful check here is that the tracker and the generator describe
+    the SAME one. ``GenTrackerPolicy.load`` is where the two meet, exactly as they do for the
+    depth-camera contract."""
+
+    depth_latency_probs: tuple[float, ...] | None = None
+    """Camera-latency distribution this graph TRAINED under, or ``None`` for none.
+
+    Index is the lag in control steps (20 ms each). Read by the SIMULATORS, which otherwise
+    hand the generator a fresh frame it never saw in training. The hardware path must ignore
+    it: the robot's lag is physical and already in the frames, so adding a synthetic one on
+    top would double-count. Absent in every graph exported before the latency model, where
+    ``None`` is the right answer rather than a guess.
+    """
+
     extero_clip: float | None = None
     """Clip band this graph was TRAINED under, or ``None`` for the per-source default.
 
@@ -322,6 +341,12 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None,
         extero_image_hw=[(int(h), int(w)) for h, w in (m.get("extero_image_hw") or [])],
         extero_tokens_per_sensor=int(m.get("extero_tokens_per_sensor", 1)),
         extero_clip=(None if m.get("extero_clip") is None else float(m["extero_clip"])),
+        depth_latency_probs=(tuple(float(p) for p in m["depth_latency_probs"])
+                             if m.get("depth_latency_probs") else None),
+        # ``.get``: absent in every graph exported before the fingerprint existed, and an
+        # absent one is not an error here -- GenTrackerPolicy decides what to do with a pair
+        # where only one side can say which robot it came from.
+        robot_asset=m.get("robot_asset"),
         fm_snap_every=(int(m["fm_snap_every"]) if m.get("fm_snap_every") else None),
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
         has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),
@@ -417,6 +442,27 @@ def build_history_tokens(ctx: FmContext, nodes: np.ndarray) -> np.ndarray:
             f"got {arr.shape}."
         )
     return arr
+
+
+def default_depth_lag_steps(probs) -> int:
+    """How many control steps of camera lag a SIMULATOR should apply, from the trained probs.
+
+    Torch-free mirror of ``robot_rl.flow_matching.config.default_depth_lag_steps``; the deploy
+    runtime cannot import ``robot_rl``. Rounded mean, so a single-value replay sits in the
+    middle of the distribution: the shipped ``(0, .10, .40, .50)`` gives 2 steps = 40 ms.
+
+    Args:
+        probs: Per-lag probabilities, index = lag in control steps, or ``None``.
+
+    Returns:
+        The rounded mean lag in steps; ``0`` for ``None``/empty.
+    """
+    if not probs:
+        return 0
+    total = float(sum(probs))
+    if total <= 0.0:
+        return 0
+    return int(round(sum(i * float(p) for i, p in enumerate(probs)) / total))
 
 
 def build_extero_tokens(ctx: FmContext, values: np.ndarray) -> np.ndarray:

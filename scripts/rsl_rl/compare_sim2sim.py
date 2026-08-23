@@ -109,8 +109,19 @@ def _mujoco_scene_from_tile(man: list[dict], tid: int, robot_xml: str, out_path:
     means falling into the void. Adding MuJoCo's infinite floor to such a tile would give the
     robot support Isaac never had -- a silent sim2sim divergence.
 
+    So is the overlay ``variant``. This used to emit one solid box per overlay, but 348 of the
+    1260 overlays in ``clips/g1_mb_v5_body.h5`` are ``variant="floating"`` -- a thin top slab
+    with an OPEN GAP beneath -- and ``--case stairs`` resolves to tile 13, where 6 of 8 are
+    5 cm slabs over void. MuJoCo therefore built solid pillars where Isaac built floating
+    slats. A top-down height field cannot see it (the top face is variant-invariant by
+    design), which is why the agreement test could not catch it; the depth cameras can.
+    ``overlay_sub_boxes`` is the same decomposition the Isaac importer meshes, imported rather
+    than reimplemented so the two cannot drift.
+
     Returns ``(n_box_geoms, has_floor)``.
     """
+    from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.overlay import overlay_sub_boxes
+
     geoms = []
     has_floor = True
     for e in man:
@@ -118,13 +129,23 @@ def _mujoco_scene_from_tile(man: list[dict], tid: int, robot_xml: str, out_path:
             continue
         has_floor = bool(e.get("has_floor", True))
         for i, ov in enumerate(e.get("overlays", [])):
-            (px, py), (sx, sy, sz) = ov["pos_xy"], ov["size_xyz"]
-            bz = float(ov.get("base_z", 0.0))
-            geoms.append(
-                f'        <geom name="tile{tid}_{i}" type="box" material="box_material" '
-                f'group="2" size="{sx / 2:.5f} {sy / 2:.5f} {sz / 2:.5f}" '
-                f'pos="{px:.5f} {py:.5f} {bz + sz / 2:.5f}"/>'
+            leg_size = ov.get("leg_size", (0.1, 0.1))
+            subs = overlay_sub_boxes(
+                str(ov.get("variant", "solid")),
+                tuple(float(v) for v in ov["size_xyz"]),
+                (float(ov["pos_xy"][0]), float(ov["pos_xy"][1])),
+                float(ov.get("base_z", 0.0)),
+                float(ov.get("slab_thickness", 0.1)),
+                (float(leg_size[0]), float(leg_size[1])),
+                float(ov.get("leg_inset", 0.05)),
             )
+            for j, (cx, cy, cz, sx, sy, sz) in enumerate(subs):
+                name = f"tile{tid}_{i}" if j == 0 else f"tile{tid}_{i}_p{j}"
+                geoms.append(
+                    f'        <geom name="{name}" type="box" material="box_material" '
+                    f'group="2" size="{sx / 2:.5f} {sy / 2:.5f} {sz / 2:.5f}" '
+                    f'pos="{cx:.5f} {cy:.5f} {cz:.5f}"/>'
+                )
     body = "\n".join(geoms)
     floor = ('        <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" '
              'group="2"/>\n') if has_floor else (
@@ -665,7 +686,8 @@ def main() -> int:
     p.add_argument("--out-dir", default="logs/sim2sim", help="Where cases + traces + PNGs live.")
     p.add_argument("--case", default="flat", choices=_CASES)
     p.add_argument("--lib", default="clips/g1_mb_v1_nodistract.h5", help="[prep] source library.")
-    p.add_argument("--robot", default="g1_29j", help="MuJoCo robot name (scene prefix).")
+    p.add_argument("--robot", default="g1_perceptive",
+               help="MuJoCo robot name (scene prefix).")
     p.add_argument("--checkpoint", default=None, help="[isaac] RL policy .pt (absolute).")
     p.add_argument("--fm_checkpoint", default=None, help="[isaac] FM .pt (absolute).")
     p.add_argument("--run-name", default=None, help="[mujoco] RL run dir NAME holding exported/.")

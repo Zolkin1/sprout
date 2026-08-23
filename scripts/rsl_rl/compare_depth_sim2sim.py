@@ -45,7 +45,11 @@ parser.add_argument("--joint_noise", type=float, default=0.25,
                     help="Random joint perturbation (rad) for the non-nominal postures.")
 parser.add_argument("--tol", type=float, default=0.01,
                     help="Pass threshold on the 99th-percentile |depth difference|, in metres.")
-parser.add_argument("--robot_name", default="g1_29j", help="MuJoCo robot model to compare against.")
+parser.add_argument("--robot_name", default="g1_perceptive",
+                    help="MuJoCo robot model to compare against. The PERCEPTIVE robot is "
+                         "the default: g1_29j is pre-mode_11 and has no backpack, rubber "
+                         "hands or camera mounts, so comparing against it measures the "
+                         "wrong robot -- silently, since the joints are unchanged.")
 parser.add_argument("--scene", default="basic_scene", help="MuJoCo (flat) scene name.")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--save_dir", default=None, help="Write side-by-side difference PNGs here.")
@@ -79,6 +83,7 @@ from robot_rl.assets.robots.g1_21j import G1_CFG  # noqa: E402
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (  # noqa: E402
     _FAR,
     _NEAR,
+    ensure_decor_prim,
     _make_depth_camera,
 )
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (  # noqa: E402
@@ -428,6 +433,10 @@ def main() -> int:
         sim_utils.SimulationCfg(dt=0.005, device=args.device, gravity=(0.0, 0.0, 0.0))
     )
     scene = InteractiveScene(_CompareSceneCfg(num_envs=1, env_spacing=2.5))
+    # Every camera from ``_make_depth_camera`` casts against /World/decor, and the caster
+    # RAISES on a target matching no prim. This flat-mesh scene has no ClipTerrainImporter to
+    # create it, so create it empty -- the cameras then log "No mesh prims found" and skip it.
+    ensure_decor_prim()
     sim.reset()
     for _ in range(5):
         scene.write_data_to_sim()

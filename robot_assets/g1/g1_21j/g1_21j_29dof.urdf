@@ -489,12 +489,6 @@
         <color rgba="0.7 0.7 0.7 1" />
       </material>
     </visual>
-    <collision>
-      <origin xyz="0.0 0.0 0.3" rpy="0 0 0" />
-      <geometry>
-        <box size="0.12 0.175 0.4" />
-      </geometry>
-    </collision>
   </link>
   <joint name="waist_yaw_joint" type="revolute">
     <origin xyz="0 0 0" rpy="0 0 0" />
@@ -541,12 +535,24 @@
         <color rgba="0.7 0.7 0.7 1" />
       </material>
     </visual>
-
-
-
-
-
-
+    <!-- The torso shell, MOVED here from waist_yaw_link (2026-08-19).  Same box in the same
+         place at zero joints: torso_link sits (-0.0039635, 0, 0.054) below waist_yaw_link,
+         so the origin goes 0.3 to 0.246, and 0 to 0.0039635 in x.
+         Two reasons it belongs on this body.  Waist roll and pitch are UNLOCKED on the
+         29-DOF robot (plus or minus 0.52 rad), and on waist_yaw_link the shell only yawed:
+         lean the torso 30 degrees and its collider stayed upright.  And torso_contact
+         watches torso_link, which had no collision element at all, so one of the five
+         undesired_contacts sensors could never fire.
+         It also removes spurious self-collisions rather than adding them: the arms and the
+         backpack are CHILDREN of torso_link, so PhysX filters them against this box, where
+         against waist_yaw_link they were two joints away and unfiltered.
+         (No double hyphen anywhere above: XML forbids it inside a comment.) -->
+    <collision>
+      <origin xyz="0.0039635 0.0 0.246" rpy="0 0 0" />
+      <geometry>
+        <box size="0.12 0.175 0.4" />
+      </geometry>
+    </collision>
   </link>
   <joint name="waist_pitch_joint" type="revolute">
     <origin xyz="0 0 0.019" rpy="0 0 0" />

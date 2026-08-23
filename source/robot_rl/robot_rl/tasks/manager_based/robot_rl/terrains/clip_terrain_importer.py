@@ -27,8 +27,68 @@ from typing_extensions import override
 import isaaclab.sim as sim_utils
 from isaaclab.terrains.terrain_importer import TerrainImporter
 
+from motion_gen.clips.clip_fingerprint import fingerprint_terrain_manifest
 from motion_gen.clips.clip_io import load_clip_library
 from .clip_terrain_loader import assemble_clip_terrain
+from .decor import DECOR_PRIM_PATH as _DECOR_PRIM_PATH
+
+
+#: One tiny triangle, 1 km below the world, standing in for "no decoration".
+#:
+#: The decoration prim cannot simply be omitted, and cannot be an empty Xform either.  Every
+#: depth camera lists it as a ray-cast target, and ``MultiMeshRayCaster`` fails BOTH ways: a
+#: target matching no prim raises ``"Failed to find a prim at path expression"``, and a target
+#: matching a prim that holds no meshes is warned about, skipped -- and then reaches the
+#: second pass with ``n_meshes = 0``, where ``pos_w.view(-1, 0, 3)`` raises
+#: ``"shape '[-1, 0, 3]' is invalid for input of size 3"``.  So the target must resolve to at
+#: least one real mesh.
+#:
+#: This one can never be hit: it sits 1 km down, so any ray reaching it has already passed
+#: the ground, and even through a ``has_floor=False`` void it is two orders of magnitude
+#: beyond ``max_dist`` and reads as the range sentinel exactly like a miss.  It is
+#: non-degenerate on purpose -- a zero-area triangle is a coin flip in a BVH build.
+_PLACEHOLDER_POINTS = ((0.0, 0.0, -1000.0), (0.001, 0.0, -1000.0), (0.0, 0.001, -1000.0))
+
+
+def create_decor_prim(decor_mesh, prim_path: str) -> int:
+    """Create the visual-only decoration prim, with a placeholder when there is nothing to show.
+
+    ``create_prim_from_mesh`` hardcodes ``collision_enabled=True``, so it cannot be used:
+    decoration that collides is a wall the robot walks into having never been trained to avoid
+    one.  This builds the same prim structure with the collider left off.
+
+    Shared with the flat-mesh probe scenes (``verify_depth_self_scan.py``,
+    ``compare_depth_sim2sim.py``) via ``g1_depth_env_cfg.ensure_decor_prim``, which build the
+    real cameras over a plain ``TerrainImporter`` and so have no decoration of their own.
+
+    Args:
+        decor_mesh: The assembled decoration, or ``None`` for none at all.
+        prim_path: Where to build it, normally :attr:`ClipTerrainImporter.DECOR_PRIM_PATH`.
+
+    Returns:
+        The face count actually imported; ``0`` when the placeholder was used.
+    """
+    import numpy as np
+    from pxr import UsdGeom
+
+    empty = decor_mesh is None or not len(decor_mesh.faces)
+    points = _PLACEHOLDER_POINTS if empty else decor_mesh.vertices
+    faces = np.asarray([[0, 1, 2]]) if empty else decor_mesh.faces
+
+    sim_utils.create_prim(prim_path, "Xform")
+    prim = sim_utils.create_prim(
+        f"{prim_path}/mesh", "Mesh",
+        attributes={
+            "points": points,
+            "faceVertexIndices": np.asarray(faces).flatten(),
+            "faceVertexCounts": np.asarray([3] * len(faces)),
+            "subdivisionScheme": "bilinear",
+        },
+    )
+    # Deliberately NO define_collision_properties: this geometry must not collide.
+    colour = UsdGeom.Primvar(prim.GetAttribute("primvars:displayColor"))
+    colour.Set([(0.45, 0.42, 0.50)])
+    return 0 if empty else len(faces)
 
 
 class ClipTerrainImporter(TerrainImporter):
@@ -79,9 +139,19 @@ class ClipTerrainImporter(TerrainImporter):
             flat_buffer=cfg.flat_buffer, transition_back_buffer=cfg.transition_back_buffer,
         )
         self.import_mesh("terrain", mesh)
+        self._import_decor(layout.decor_mesh)
         # Base curriculum origin distribution: terrain_levels (rows) + terrain_types
         # (columns == tiles); env_origins = origins[level, type] = tile center.
         self.configure_env_origins(origins)
+
+        # WHICH TERRAIN this env is standing on, as a content hash of the manifest the mesh
+        # was just built from. The clip library's own `clip_fingerprint` does not cover the
+        # terrain (and in practice is never written at all), so an offline stage that
+        # rewrites tile geometry while leaving the motions alone -- terrain decoration --
+        # is otherwise invisible to every artifact downstream. Recorded into tracker.onnx
+        # by export_parameters; not enforced here, since the importer has nothing to
+        # compare against at env build.
+        self.terrain_fingerprint = fingerprint_terrain_manifest(lib.attrs.get("terrain_manifest"))
 
         self._layout = layout
         self._tile_terrain_id = layout.tile_terrain_id.to(self.device)
@@ -102,6 +172,29 @@ class ClipTerrainImporter(TerrainImporter):
         self._refresh_env_arrays()
 
         self.set_debug_vis(cfg.debug_vis)
+
+    #: Where the visual-only decoration goes. A SIBLING of the ground, not a child.
+    #:
+    #: ``import_mesh`` builds under ``cfg.prim_path`` (``/World/ground``), and the height
+    #: scanner is a ``RayCaster`` pointed at exactly that path -- so a decor mesh imported the
+    #: normal way would be scanned along with the terrain, which is the one thing the channel
+    #: exists to prevent. The depth cameras take a LIST of prims and are given this one
+    #: explicitly (``g1_depth_env_cfg``).
+    DECOR_PRIM_PATH = _DECOR_PRIM_PATH
+
+    def _import_decor(self, decor_mesh) -> None:
+        """Import the decoration mesh as a visual-only prim.
+
+        Args:
+            decor_mesh: The assembled decoration, or ``None`` for an undecorated library.
+        """
+        n = create_decor_prim(decor_mesh, self.DECOR_PRIM_PATH)
+        if n:
+            print(f"[ClipTerrainImporter] decoration: {n} faces at {self.DECOR_PRIM_PATH} "
+                  "(visual only -- no collider, not in the height scan)")
+        else:
+            print(f"[ClipTerrainImporter] no decoration in this library; "
+                  f"{self.DECOR_PRIM_PATH} carries the unhittable placeholder")
 
     @override
     def update_env_origins(self, env_ids: torch.Tensor, move_up: torch.Tensor, move_down: torch.Tensor):

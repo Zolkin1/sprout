@@ -215,6 +215,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
         log_root_path = os.path.abspath(log_root_path)
         print(f"[INFO] Logging experiment in directory: {log_root_path}")
+
+        # The action scale is DERIVED from the motor table (0.125 * effort / stiffness), so a
+        # gear or gain change silently rescales the policy's action range -- and every
+        # checkpoint trained before it becomes unloadable in the only way that matters, by
+        # meaning something different. Print what actually resolved, the same reason the FM
+        # trainer prints its exteroception band.
+        try:
+            from robot_rl.assets.robots import format_actuator_table
+            print(f"[INFO] Resolved actuator table:\n{format_actuator_table()}")
+        except Exception as exc:  # noqa: BLE001 - a diagnostic must never fail a run
+            print(f"[INFO] actuator table unavailable: {exc}")
         # specify directory for logging runs: {time-stamp}_{run_name}
         log_dir = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         # The Ray Tune workflow extracts experiment name using the logging line below, hence, do not

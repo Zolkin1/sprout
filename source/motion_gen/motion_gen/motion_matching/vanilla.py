@@ -32,8 +32,11 @@ from ..ingest import ingest_common as IC
 from .graph import STEADY, VARIED
 from ..playback import play_frame_path
 
-_FOOT = ["left_ankle_roll_link", "right_ankle_roll_link"]
-_HAND = ["left_palm_link", "right_palm_link"]
+# Taken from ``features`` rather than restated: the hand bodies were renamed when the Dex3
+# palms became one passive rubber hand per side, and a second copy of the old names here kept
+# this whole (deprecated) module raising "end-effector frame not a body" after the rename.
+_FOOT = list(F.FOOT_FRAMES)
+_HAND = list(F.HAND_FRAMES)
 _EE = _FOOT + _HAND   # FK order: feet (0,1), hands (2,3)
 
 # Indices WITHIN the pose block (feat[:, traj_dim:]) that are POSITIONS (feet + hands), used

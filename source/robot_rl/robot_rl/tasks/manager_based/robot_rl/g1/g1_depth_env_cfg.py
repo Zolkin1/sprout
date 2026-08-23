@@ -46,7 +46,9 @@ from isaaclab.utils import configclass
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.mdp.sensors import DepthNoiseCfg
+from robot_rl.tasks.manager_based.robot_rl.terrains.decor import DECOR_PRIM_PATH
 
+from .g1_flat_blind_env_cfg import ACTION_RATE_WEIGHT
 from .g1_self_scan import link_prim_path, self_scan_prim_paths
 from .g1_teacher_env_cfg import G1TeacherEventsCfg, G1TeacherObservationsCfg
 from .g1_teacher_terrain_env_cfg import (
@@ -54,6 +56,32 @@ from .g1_teacher_terrain_env_cfg import (
     G1TeacherTerrainBodyEnvCfgPlay,
     G1TeacherTerrainSceneCfg,
 )
+
+
+def ensure_decor_prim() -> None:
+    """Give a decoration-free scene the placeholder decoration prim.
+
+    Every camera built by :func:`_make_depth_camera` lists :data:`DECOR_PRIM_PATH` as a
+    ray-cast target, and ``MultiMeshRayCaster`` needs that target to resolve to at least one
+    real mesh -- it raises on a path matching nothing, and dies later on ``n_meshes = 0`` for a
+    path matching a mesh-less prim. A scene that uses these cameras over a plain
+    ``TerrainImporter`` -- the flat-mesh probe scenes in ``verify_depth_self_scan.py`` and
+    ``compare_depth_sim2sim.py`` -- therefore has to build one itself.
+
+    Call before ``sim.reset()``, which is when the sensors initialise. Idempotent: a scene
+    that already has real decoration is left alone.
+    """
+    # Imported HERE, not at module scope: the importer transitively pulls in ``pxr``, and
+    # this cfg module is imported by hydra BEFORE ``AppLauncher`` runs.  See
+    # ``terrains/decor.py``.  By the time this function is called the app is up.
+    import isaaclab.sim as sim_utils
+
+    from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_importer import (
+        create_decor_prim,
+    )
+
+    if not sim_utils.is_prim_path_valid(DECOR_PRIM_PATH):
+        create_decor_prim(None, DECOR_PRIM_PATH)
 
 # ---------------------------------------------------------------------------
 # Camera geometry
@@ -164,11 +192,27 @@ class _CameraSpec(NamedTuple):
 # (30x26, fx 25.9928, fy 27.8703, cx 14.9936, cy 12.9966) describe a ~60 x 50 deg frustum,
 # i.e. a much narrower lens than the wide module below.  Only the MOUNT transfers.
 #
-# _FAR is still a PLACEHOLDER -- no calibrated pose exists for the top camera yet, so its
-# offset and pitch need visual confirmation against a rendered frame
-# (scripts/rsl_rl/verify_depth_self_scan.py --viz kit).
+# SUPERSEDED, 2026-08-19: both poses below are now taken from the AS-BUILT CAD of the real
+# mount, so nothing above is doing arithmetic on a published number any more.  The frame
+# chain is kept because it says what ``torso_link`` is, and mode_11 moved it: waist_roll
+# z 0.035 -> 0.044 and waist_pitch z 0.019 -> 0, so ``torso_link`` now sits at
+# (-0.0039635, 0, 0.044) from the pelvis rather than (-0.0039635, 0, 0.054) -- 10 mm lower.
+#
+# That 10 mm does NOT get added back here, and the plan said it should.  The correction was
+# specified when these numbers were assumed to be in the OLD torso frame; they are not.
+# mode_11 does not move the torso MESH within its own frame, only where that frame sits on
+# the pelvis, so a torso-relative CAD measurement of the real robot is already right in the
+# new frame.  Adding 10 mm would put the cameras 10 mm too high.  What legitimately changes
+# is the physical height above ground, which drops 10 mm because the old model had the
+# torso 10 mm too high.
+#
+# The pose is the LEFT IMAGER, not the mount centre: a stereo depth camera reports depth in
+# its left camera's frame.  Hence the non-zero y (+25 mm near, +60 mm far, i.e. half of each
+# 50/120 mm baseline).  ``robot_assets/g1_perceptive/`` carries the same two numbers as the
+# mounts' ``*_optical_link``, pinned there against the STL datum, and
+# tests/test_camera_mount_matches_urdf.py fails if the two ever disagree.
 _NEAR = _CameraSpec(
-    pos=(0.1107625, 0.0, 0.0994260),
+    pos=(0.107, 0.025, 0.045),
     pitch_deg=65.0,
     focal_length_mm=2.2,
     fov_h_deg=110.0,     # physical 110 x 80 -> 117.8 deg diagonal
@@ -178,8 +222,8 @@ _NEAR = _CameraSpec(
     max_distance_m=8.0,
 )
 _FAR = _CameraSpec(
-    pos=(0.06, 0.0, 0.38),
-    pitch_deg=35.0,
+    pos=(0.085, 0.060, 0.285),
+    pitch_deg=15.0,
     focal_length_mm=4.0,
     fov_h_deg=80.0,      # physical 80 x 52 -> 88.3 deg diagonal
     fov_v_deg=52.0,
@@ -277,7 +321,19 @@ def _make_depth_camera(
         ),
         # A plain string entry becomes a target with track_mesh_transforms disabled,
         # which is what we want for the static terrain mesh.
-        mesh_prim_paths=["/World/ground"] + _self_scan_targets(),
+        # /World/decor is the VISUAL-ONLY decoration: walls and clutter the cameras must see
+        # and the height scan must not. It is a sibling of /World/ground precisely so the
+        # scanner -- a RayCaster pointed at that one path -- cannot reach it.
+        #
+        # LISTING IT MAKES THE PRIM MANDATORY. MultiMeshRayCaster tolerates a target that
+        # exists but holds no meshes (it logs "No mesh prims found" and skips), and does NOT
+        # tolerate a target that matches nothing -- ``_initialize_warp_meshes`` raises
+        # "Failed to find a prim at path expression". So ``ClipTerrainImporter`` creates the
+        # Xform even for an undecorated library, and any scene that builds these cameras
+        # WITHOUT that importer must create it too: see :data:`DECOR_PRIM_PATH` and the
+        # flat-mesh probe scenes in ``verify_depth_self_scan.py`` /
+        # ``compare_depth_sim2sim.py``, both of which died on exactly this.
+        mesh_prim_paths=["/World/ground", DECOR_PRIM_PATH] + _self_scan_targets(),
         debug_vis=False,
     )
 
@@ -468,6 +524,14 @@ class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainBodyEnvCfg):
     )
     observations: G1TeacherTerrainDepthObservationsCfg = G1TeacherTerrainDepthObservationsCfg()
     events: G1TeacherTerrainDepthEventsCfg = G1TeacherTerrainDepthEventsCfg()
+
+    def __post_init__(self):
+        super().__post_init__()
+        # 10x the -0.01 every teacher inherits. Shared with the blind flat teacher through
+        # one constant, because a different smoothness cost on each would confound the
+        # blind-vs-camera comparison. Raised for the runs queued 2026-08-21; the number is
+        # a starting point, not a tuned value.
+        self.rewards.action_rate_l2.weight = ACTION_RATE_WEIGHT
 
 
 @configclass

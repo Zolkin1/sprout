@@ -460,6 +460,20 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
     if plan.meta.get("geom") == "stairs":
         # Widen the WIDE approach / recovery platforms to the tile width so a laterally drifting MB segment
         # cannot walk off them onto the ground a riser below (the treads keep their authored width).
+        # NOTE: this makes every stair platform on every tile exactly size_y, so a library
+        # straight out of generation has ZERO platform-width variation and only 0.8-1.2 m of
+        # tread variation. That is deliberate here -- it is the safety net above -- and it is
+        # scripts/rsl_rl/decorate_terrain.py that puts the variation back, by rewriting this
+        # same manifest afterwards. Regenerating WITHOUT re-running that pass silently
+        # returns the terrain to uniform; motion_gen.terrain.decorate.has_width_variation
+        # is how to tell which you have.
+        # NOTE: this makes every stair platform on every tile exactly size_y, so a library
+        # straight out of generation has ZERO platform-width variation and only 0.8-1.2 m of
+        # tread variation. That is deliberate here -- it is the safety net described above --
+        # and scripts/rsl_rl/decorate_terrain.py is what puts the variation back, by
+        # rewriting this same manifest afterwards. Regenerating WITHOUT re-running that pass
+        # silently returns the terrain to uniform;
+        # motion_gen.terrain.decorate.has_width_variation is how to tell which you have.
         min_sx = min(o["size_xyz"][0] for o in overlays)
         for o in overlays:
             if o["size_xyz"][0] > 1.5 * min_sx:

@@ -116,6 +116,19 @@ class RecordingMeta:
     Also carries ``privileged``, which is what makes the dense generator-only scan refusable
     at every off-sim exit: no deployment can reproduce an exact 14k-ray ground-truth map."""
     depth_camera_spec: list[dict] | None = None
+    robot_asset: dict | None = None
+    """WHICH ROBOT produced these rows, or ``None`` for a recording predating the field.
+
+    Content hashes of the URDF / MJCF / USD plus joint names, body names and total mass
+    (``motion_gen.robot_asset.fingerprint_robot_asset``).
+
+    CLAUDE.md's "No re-record" property for the depth xyz channels is conditional on the
+    camera AND the FK model staying fixed: the offline unprojection rebuilds the camera pose
+    from the recorded joint angles through ``motion_gen``'s ``FKChain``, so a recording
+    replayed against a changed model yields silently mis-registered xyz -- surfacing, if at
+    all, only as a shifted declared-vs-measured centroid in the dataset's build print. Every
+    other identity this file carries (``checkpoint_sha256``, ``depth_camera_spec``,
+    ``clip_library_sha256``) pins the data or the sensor; none pinned the robot."""
     content_sha256: str = ""
     format: str = "per_step_npz"
     history_len: int = 0
@@ -365,6 +378,8 @@ def save_recorded_data(path: str, data: dict[str, np.ndarray], meta: RecordingMe
         # Nested structure, so JSON rather than an array -- the file stays
         # ``allow_pickle=False`` loadable.
         depth_camera_spec=np.array(json.dumps(meta.depth_camera_spec)),
+        # Nested dict, so JSON for the same reason.
+        robot_asset=np.array(json.dumps(meta.robot_asset)),
         # Nullable list, so JSON for the same reason.
         reference_blocks=np.array(json.dumps(meta.reference_blocks)),
         family_names=np.array(json.dumps(meta.family_names)),
@@ -446,6 +461,9 @@ def load_recorded_data(path: str) -> tuple[dict[str, np.ndarray], RecordingMeta]
         depth_camera_spec=(
             json.loads(str(z["depth_camera_spec"])) if "depth_camera_spec" in z.files else None
         ),
+        robot_asset=(
+            json.loads(str(z["robot_asset"])) if "robot_asset" in z.files else None
+        ),
         reference_blocks=(
             json.loads(str(z["reference_blocks"])) if "reference_blocks" in z.files else None
         ),
@@ -484,6 +502,19 @@ _WINDOW_DTYPES: dict[str, str] = {
     "ref_future": "float32",
     "height_scan": "float32",
     "depth": "float32",
+    # CAMERA LATENCY. The last DEPTH_LAG_STEPS+1 depth frames, newest first, so index k is a
+    # lag of k control steps (20 ms each: camera 50 Hz, control 50 Hz). ``depth`` stays the
+    # fresh frame, so every existing reader is unaffected and index 0 duplicates it.
+    #
+    # ``depth_lag_state`` is the state row each frame was CAPTURED with, and it is the reason
+    # this is recorded rather than derived: the xyz channels are unprojected at dataset build
+    # from the camera pose, so a lagged frame unprojected with the pose at the re-plan is
+    # displaced by the egomotion -- the registration error those channels exist to remove.
+    # Both are absent in recordings before 2026-08-21; the dataset raises rather than falling
+    # back, because a latency model that silently became a no-op reads exactly like one that
+    # worked.
+    "depth_lag": "float32",
+    "depth_lag_state": "float32",
     "cmd_future": "float32",
     "episode_id": "int64",
     # Per-window: 1 if the window's clip belongs to the DISTRACTOR family (a box the robot walks
@@ -588,6 +619,9 @@ class RecordedWindowWriter:
             window came from, so any per-clip/per-step library column can be joined offline
             and the exact source env (hence tile instance and origin) is known rather than
             inferred.
+        depth_lag_steps: How many EXTRA older depth frames to store per window, giving a
+            ``depth_lag`` of ``depth_lag_steps + 1`` frames (index k = a lag of k control
+            steps, 20 ms each) plus the state each was captured with. 0 omits both.
         record_history_ref: Also store the applied-reference history ring (``history_ref``),
             which ``history_source="reference_partial"`` trains on.
         dtypes: Per-key storage dtype overrides, e.g. ``{"height_scan": "float16"}``. Applies
@@ -601,6 +635,7 @@ class RecordedWindowWriter:
         compression: str | None = "lzf", depth_shape: tuple[int, int] | None = None,
         tag_distractors: bool = False, tag_families: bool = False,
         tag_clip_index: bool = False, record_history_ref: bool = False,
+        depth_lag_steps: int = 0,
         dtypes: dict[str, str] | None = None,
     ) -> None:
         import h5py
@@ -651,6 +686,14 @@ class RecordedWindowWriter:
             shapes["height_scan"] = (num_windows, height_scan_dim)
         if depth_shape is not None:
             shapes["depth"] = (num_windows, int(depth_shape[0]), int(depth_shape[1]))
+            # The lagged stack, for the camera-latency model. Declared with the depth itself
+            # rather than opt-in: a recording that has cameras and no lagged frames cannot
+            # train a latency model at all, and the caller always assembles both.
+            if depth_lag_steps > 0:
+                n_lag = int(depth_lag_steps) + 1
+                shapes["depth_lag"] = (num_windows, n_lag, int(depth_shape[0]),
+                                       int(depth_shape[1]))
+                shapes["depth_lag_state"] = (num_windows, n_lag, node_dim)
         if cmd_dim > 0:
             shapes["cmd_future"] = (num_windows, future_len, cmd_dim)
         self._keys = list(shapes)

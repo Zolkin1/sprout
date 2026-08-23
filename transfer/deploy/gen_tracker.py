@@ -59,6 +59,23 @@ _LEGACY_TERM_CLIP = {"actions": 20.0, "height_scan": 1.0}
 # ``[R_yawT (p_ref - p_act), rot6d(R_yawT R_ref)]``, in the anchor's YAW frame. Worth pinning
 # because neither the yaw-vs-full frame nor the SIGN of the orientation half is visible in the
 # obs shape -- both change the observation's MEANING at identical width.
+#: The conventions this runtime can serve, mapped to the ``window_anchor`` arm each needs.
+#:
+#: Mirror of ``robot_rl.flow_matching.window.BASE_POSE_CONVENTIONS``, inverted: the artifact
+#: states a convention and the runtime picks the arm. Both are served by ONE build, so a
+#: tracker exported from either training arm plays without a rebuild.
+#:
+#: * ``..._ref_minus_actual...`` -> ``"robot_now"``: re-anchor the prediction onto the measured
+#:   root every control step (``reanchor_window``), which needs odometry.
+#: * ``..._ref_minus_plan...``   -> ``"plan"``: serve the prediction as made; no base position
+#:   is read on the generator path at all.
+_BASE_POSE_CONVENTION_ARMS: dict[str, str] = {
+    "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d": "robot_now",
+    "pose_in_plan_yaw_frame_pos_ref_minus_plan_ori_rot6d": "plan",
+}
+
+#: The legacy single-convention name, kept for the error messages and for any caller that
+#: still imports it.
 _BASE_POSE_CONVENTION = "pose_in_anchor_yaw_frame_pos_ref_minus_actual_ori_rot6d"
 
 
@@ -125,6 +142,59 @@ class _TrackerOnlyCtx:
         self.extero_tokens_per_sensor = 1
 
 
+#: Robot-fingerprint fields worth naming individually in a mismatch message.
+_ROBOT_ASSET_FIELDS = ("joint_names", "total_mass_kg", "body_names",
+                       "urdf_sha256", "mjcf_sha256", "usd_sha256")
+
+
+def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None,
+                               tracker_name: str, fm_name: str) -> None:
+    """Refuse a tracker/generator pair trained on DIFFERENT robots.
+
+    A deploy box has no "current robot" to check an artifact against -- it has whatever
+    hardware it is bolted to. What it can check is that the two halves of the pair agree,
+    exactly as :func:`depth_obs.assert_depth_specs_agree` does for the camera contract:
+    there is one physical robot, so a tracker and a generator running together cannot have
+    been trained on two.
+
+    Silent when either side carries no fingerprint. Every artifact exported before the
+    field existed has none, and refusing those would break every pair on disk; the
+    fingerprint is a guard against a NEW mismatch, not a migration gate.
+
+    Args:
+        tracker_asset: ``tracker.onnx``'s ``policy_parameters.robot_asset``.
+        fm_asset: ``fm.onnx``'s ``fm_meta.robot_asset``.
+        tracker_name: Path, for the message.
+        fm_name: Path, for the message.
+
+    Raises:
+        ValueError: If both carry a fingerprint and a shared field differs.
+    """
+    if not tracker_asset or not fm_asset:
+        return
+    diffs = [k for k in _ROBOT_ASSET_FIELDS
+             if k in tracker_asset and k in fm_asset and tracker_asset[k] != fm_asset[k]]
+    if not diffs:
+        return
+    lines = [
+        f"ROBOT ASSET MISMATCH between {tracker_name} ({tracker_asset.get('short', '?')}) and "
+        f"{fm_name} ({fm_asset.get('short', '?')}): they were trained on different robots, and "
+        "there is only one robot to run them on."
+    ]
+    for k in diffs:
+        t, f = tracker_asset[k], fm_asset[k]
+        if k == "body_names":
+            lines.append(f"  body_names: tracker-only {sorted(set(t) - set(f))}, "
+                         f"fm-only {sorted(set(f) - set(t))}")
+        elif k == "joint_names":
+            lines.append(f"  joint_names: {len(t)} vs {len(f)}")
+        else:
+            lines.append(f"  {k}: {str(t)[:16]} vs {str(f)[:16]}")
+    lines.append("Re-export both from one run, or point --fm_onnx at the generator trained "
+                 "against this tracker.")
+    raise ValueError("\n".join(lines))
+
+
 class GenTrackerPolicy:
     """Drive the RL tracker with the online flow-matching generator (numpy + ORT)."""
 
@@ -133,6 +203,13 @@ class GenTrackerPolicy:
     #: around a stubbed network -- is synchronous rather than AttributeError. Instances that
     #: opt in set it in __init__; see the ctor docstring for what it emulates.
     fm_lead_ticks: int = 0
+
+    #: Which serve arm to use, overwritten from the artifact's own convention in
+    #: ``_build_window``. Defaulted at CLASS level, not just in ``__init__``, so any object
+    #: that skips construction -- the test doubles in ``transfer/deploy/tests`` do -- still
+    #: gets the LEGACY behaviour rather than an AttributeError, and so that a future field
+    #: reordering cannot leave it briefly unset while ``_serve_nodes`` is reachable.
+    _window_anchor: str = "robot_now"
 
     def __init__(
         self,
@@ -257,6 +334,8 @@ class GenTrackerPolicy:
                                        cuda_graph=self.fm_cuda_graph)
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
+            _assert_robot_assets_agree(self._trk.get_robot_asset(), self.ctx.robot_asset,
+                                       self.tracker_onnx, self.fm_onnx)
         # Re-plan cadence: the tracker metadata (the value the tracker task trained with),
         # else the constructor/CLI default. The old middle tier -- falling back to the FM's
         # fm_snap_every -- existed only to satisfy the agreement rule that has since been
@@ -510,6 +589,13 @@ class GenTrackerPolicy:
         widths, so there is nothing to reuse and nothing to resize (upsampling would invent
         detail the grid never had).
 
+        ``fm_depth`` is AUTHORITATIVE whenever the runner supplies it, split or not. It used
+        to be consulted only on a split, which left a caller no way to feed the generator a
+        different reading at a shared resolution -- the case a simulator needs to reproduce
+        camera latency, where the generator must see an older frame while the tracker's own
+        observation stays live. Nothing on the robot sets it at a shared resolution, so the
+        hardware path is unchanged.
+
         Args:
             state: The runtime state dict the runner built this step.
 
@@ -519,18 +605,18 @@ class GenTrackerPolicy:
         Raises:
             KeyError: If the samplings are split and the runner supplied no ``fm_depth``.
         """
+        if "fm_depth" in state:
+            return np.asarray(state["fm_depth"], dtype=np.float64)
         if not self.depth_sampling_is_split():
             return np.asarray(state["depth"], dtype=np.float64)
-        if "fm_depth" not in state:
-            raise KeyError(
-                "the generator samples the depth cameras at "
-                f"{self._fm_depth_spec[0]['width']}x{self._fm_depth_spec[0]['height']} while "
-                f"the tracker uses {self._depth_spec[0]['width']}x{self._depth_spec[0]['height']}, "
-                "so it needs its own reading in state['fm_depth'] -- cast a second grid from "
-                "get_fm_depth_camera_spec(). state['depth'] is the TRACKER's and is the wrong "
-                "width."
-            )
-        return np.asarray(state["fm_depth"], dtype=np.float64)
+        raise KeyError(
+            "the generator samples the depth cameras at "
+            f"{self._fm_depth_spec[0]['width']}x{self._fm_depth_spec[0]['height']} while "
+            f"the tracker uses {self._depth_spec[0]['width']}x{self._depth_spec[0]['height']}, "
+            "so it needs its own reading in state['fm_depth'] -- cast a second grid from "
+            "get_fm_depth_camera_spec(). state['depth'] is the TRACKER's and is the wrong "
+            "width."
+        )
 
     def _fm_extero_row(self, state: dict) -> np.ndarray:
         """The generator's exteroception reading, widened to the channels it was trained on.
@@ -787,14 +873,17 @@ class GenTrackerPolicy:
                 f"{_BASE_POSE_CONVENTION!r}. Re-export from the training run if the policy "
                 "was trained under this runtime's convention; retrain if it was not."
             )
-        if convention != _BASE_POSE_CONVENTION:
+        if convention not in _BASE_POSE_CONVENTION_ARMS:
             raise ValueError(
-                f"tracker.onnx reference_window base_pose_convention is {convention!r}, but "
-                f"this runtime implements {_BASE_POSE_CONVENTION!r}. Tracker and runtime "
-                "disagree about what the observation MEANS, which no shape check can see. "
-                "Re-export if the policy was trained under this runtime's convention; "
-                "retrain if it was not."
+                f"tracker.onnx reference_window base_pose_convention is {convention!r}, which "
+                f"this runtime cannot serve. Known: {sorted(_BASE_POSE_CONVENTION_ARMS)}. "
+                "Tracker and runtime disagree about what the observation MEANS, which no "
+                "shape check can see. Re-export if the policy was trained under a convention "
+                "this runtime knows; retrain if it was not."
             )
+        # Which serve arm this tracker needs. Not a runtime-wide setting: it is a property of
+        # the artifact, so one build plays a tracker from either training arm.
+        self._window_anchor = _BASE_POSE_CONVENTION_ARMS[convention]
 
         # Which BLOCKS the term packs. A teacher can drop blocks it does not need, so this
         # is the tracker's own list rather than the full five, and it is what the clip path
@@ -1132,6 +1221,11 @@ class GenTrackerPolicy:
             ``[len(offsets), D]`` window nodes in the current robot frame.
         """
         idx = self._pred_idx + np.asarray(offsets, dtype=int)
+        if self._window_anchor == "plan":
+            # THE LINE THAT REMOVES ODOMETRY FROM DEPLOY. Under this convention the
+            # observation is the prediction's own frame, so the prediction is served as it
+            # was made and `state["root_pos"]` is never read on the generator path.
+            return self._pred[0, idx]
         return reanchor_window(
             self._pred[0, idx],
             self._anchor_pos[None, :], self._anchor_quat[None, :],

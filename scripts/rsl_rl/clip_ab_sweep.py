@@ -547,7 +547,7 @@ def main() -> int:
                         "purely to discard it, and its RNG draws perturb the obs noise.")
     p.add_argument("--mj_run", default=DEFAULT_MJ_RUN,
                    help="Run dir holding exported/tracker.onnx for MuJoCo.")
-    p.add_argument("--robot", default="g1_29j")
+    p.add_argument("--robot", default="g1_perceptive")
     p.add_argument("--scene", default="basic_scene")
     p.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 3),
                    help="Concurrent MuJoCo runs. Each uses --mj_threads ORT threads.")

@@ -7,7 +7,7 @@ scripts/build.sh                 # once, after a clone or image rebuild
 python3 scripts/prefetch_policy.py --hf_policy_folder <name>   # once per policy
 
 scripts/run_sim_low.sh                                # 1. the BRAIN  (terminal A)
-scripts/run_sim_world.sh --scene g1_29j_basic_scene   # 2. the WORLD  (terminal B)
+scripts/run_sim_world.sh --scene g1_perceptive_basic_scene   # 2. the WORLD  (terminal B)
 python plot_utils/plot_from_bag.py                    # 3. the PLOTS  -> <bag>/plots/
 
 scripts/stop.sh                  # tear both down

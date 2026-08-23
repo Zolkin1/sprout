@@ -47,9 +47,12 @@ docker/artifacts/
 **/generated/*
 
 # Python virtual environments (e.g. the uv-managed IsaacLab venv, and the small
-# Isaac-free downstream env built by transfer/setup_venv.sh)
-env_isaaclab/
-env_transfer/
+# Isaac-free downstream env built by transfer/setup_venv.sh).
+# No trailing slash: a git worktree SYMLINKS the venv rather than copying it, and a
+# "name/" pattern matches only a real directory -- so the symlink was not ignored and
+# `git add -A` staged it. `/clips`, `/hf` and `/logs` already use this form.
+/env_isaaclab
+/env_transfer
 *.venv/
 
 # Isaac-Sim packman

@@ -28,6 +28,7 @@ Run under the full-stack env (viser + isaaclab):
 from __future__ import annotations
 
 import argparse
+import json
 import importlib
 import time
 
@@ -94,20 +95,150 @@ def _add_overlay_boxes(server: viser.ViserServer, prefix: str,
             _add_mesh(server, f"{prefix}/overlay_{j}_{k}", box, color)
 
 
-def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int) -> trimesh.Trimesh:
-    """Render the terrain a clip library's manifest assembles into."""
+#: Channels drawn per trajectory, and the colour each gets.
+_TRAJ_BODIES: tuple[tuple[str, tuple[int, int, int]], ...] = (
+    ("pelvis_link", (250, 220, 60)),
+    ("left_ankle_roll_link", (80, 220, 120)),
+    ("right_ankle_roll_link", (240, 110, 200)),
+)
+
+#: Foot-contact dots, drawn where the ``contact`` flag is set.
+_CONTACT_COLOR = (255, 60, 60)
+
+
+def _body_cols(pos_names: list[str], body: str) -> list[int] | None:
+    """Column indices of ``body``'s world xyz, or ``None`` if the library lacks it."""
+    idx = {n: i for i, n in enumerate(pos_names)}
+    try:
+        return [idx[f"{body}:pos_{a}"] for a in "xyz"]
+    except KeyError:
+        return None
+
+
+def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int,
+                           corner: tuple[float, float], n_traj: int, seed: int) -> int:
+    """Draw a few of this tile's clips on top of it. Returns how many were drawn.
+
+    The clip is baked in the tile's LOCAL-CORNER frame -- ``view_clip_viser`` overlays it on
+    the mesh with no transform -- so placing it is a pure translation by the tile corner.
+    Getting that wrong is the kind of error this overlay exists to reveal, so it is done in
+    one place and stated here rather than inferred at each call.
+
+    Feet are drawn as separate paths from the pelvis, and the CONTACT samples as dots,
+    because the question this answers is "do the feet land on the treads?" -- which a pelvis
+    path alone cannot show.
+
+    Args:
+        server: The viser server.
+        prefix: Scene-node prefix for this tile.
+        lib: A loaded ``ClipLibraryData``.
+        tid: The tile's ``terrain_id``.
+        corner: The tile's world ``(x, y)`` corner.
+        n_traj: How many clips to draw.
+        seed: Chooses WHICH clips, so a re-run shows the same ones.
+
+    Returns:
+        Number of trajectories drawn.
+    """
+    import numpy as np
+
+    if lib.terrain_id.numel() == 0:
+        return 0
+    members = np.flatnonzero(lib.terrain_id.cpu().numpy() == tid)
+    if len(members) == 0:
+        return 0
+    take = members[np.linspace(0, len(members) - 1, min(n_traj, len(members))).astype(int)]
+
+    pos_names = lib.meta.get("pos_output_names") or json.loads(
+        lib.attrs["pos_output_names"])
+    cols = {b: _body_cols(pos_names, b) for b, _ in _TRAJ_BODIES}
+    lens = lib.clip_len.cpu().numpy() if lib.clip_len.numel() else None
+    ox, oy = float(corner[0]), float(corner[1])
+
+    drawn = 0
+    for k, ci in enumerate(take):
+        n = int(lens[ci]) if lens is not None else lib.num_steps
+        row = lib.y_des[int(ci), :n].cpu().numpy()
+        for body, colour in _TRAJ_BODIES:
+            c = cols.get(body)
+            if c is None:
+                continue
+            pts = row[:, c].astype(np.float32).copy()
+            pts[:, 0] += ox
+            pts[:, 1] += oy
+            segs = np.stack([pts[:-1], pts[1:]], axis=1)
+            server.scene.add_line_segments(
+                f"{prefix}/traj_{k}/{body}", points=segs,
+                colors=np.full((len(segs), 2, 3), colour, np.uint8),
+                line_width=3.0 if body == "pelvis_link" else 2.0,
+            )
+        # Where the feet actually touch down.
+        if lib.contact.numel():
+            flags = lib.contact[int(ci), :n].cpu().numpy()
+            hits = []
+            for j, (body, _c) in enumerate(zip(("left_ankle_roll_link",
+                                                "right_ankle_roll_link"), range(2))):
+                c = cols.get(body)
+                if c is None or j >= flags.shape[-1]:
+                    continue
+                on = flags[:, j].astype(bool)
+                if on.any():
+                    p = row[on][:, c].astype(np.float32).copy()
+                    p[:, 0] += ox
+                    p[:, 1] += oy
+                    hits.append(p)
+            if hits:
+                allp = np.concatenate(hits)
+                server.scene.add_point_cloud(
+                    f"{prefix}/traj_{k}/contacts", points=allp,
+                    colors=np.full((len(allp), 3), _CONTACT_COLOR, np.uint8),
+                    point_size=0.03,
+                )
+        drawn += 1
+    return drawn
+
+
+def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
+                    n_traj: int = 0, traj_seed: int = 0) -> trimesh.Trimesh:
+    """Render the terrain a clip library's manifest assembles into.
+
+    Args:
+        server: The viser server.
+        lib_path: The clip library.
+        num_rows: Tile-set replicas.
+        n_traj: Sampled clips to overlay per tile (0 = none).
+        traj_seed: Which clips, so a re-run shows the same ones.
+
+    Returns:
+        The assembled ground mesh.
+    """
     from motion_gen.clips.clip_io import load_clip_library
 
     lib = load_clip_library(lib_path, "cpu")
     mesh, _origins, layout = assemble_clip_terrain(lib, num_rows=num_rows)
     _add_mesh(server, "/terrain", mesh, _GROUND_COLOR)
+    # The VISUAL-ONLY decoration lives in its own mesh, out of the ground and out of the
+    # per-tile overlay metadata, so it has to be drawn explicitly -- otherwise walls that
+    # exist in both simulators would be invisible in the one tool used to check them.
+    # Translucent and a distinct colour, because "can the robot walk into this?" is the
+    # first question anyone looking at a wall will have. It cannot.
+    if getattr(layout, "decor_mesh", None) is not None:
+        _add_mesh(server, "/decor", layout.decor_mesh, (0.62, 0.55, 0.72), opacity=0.55)
     # Colour the overlay volumes on top (row 0 -- other rows are replicas).
+    total_traj = 0
     for ti in range(layout.num_tiles):
         tid = int(layout.tile_terrain_id[0, ti])
         corner = layout.tile_corner[0, ti].numpy()
         overlays = layout.terrain_overlays.get(tid, [])
         _add_overlay_boxes(server, f"/lib_tile_{ti}", overlays, (float(corner[0]), float(corner[1])))
+        if n_traj > 0 and tid >= 0:
+            total_traj += _add_tile_trajectories(
+                server, f"/lib_tile_{ti}", lib, tid,
+                (float(corner[0]), float(corner[1])), n_traj, traj_seed)
     print(f"[view_terrain_viser] library '{lib_path}': {layout.num_tiles} tiles x {num_rows} rows")
+    if n_traj > 0:
+        print(f"[view_terrain_viser] overlaid {total_traj} trajectories "
+              f"(yellow = pelvis, green/pink = ankles, red dots = foot contacts)")
     return mesh
 
 
@@ -175,13 +306,20 @@ def main() -> None:
     src.add_argument("--cfg", help="'demo' or 'module:attr' -> list[CompositeSubTerrainCfg].")
     p.add_argument("--num-rows", type=int, default=1, help="Tile-set replicas for --lib.")
     p.add_argument("--port", type=int, default=8080, help="Viser server port.")
+    p.add_argument("--traj", type=int, default=0, metavar="N",
+                   help="Overlay N sampled clips per tile: pelvis and ankle paths plus "
+                        "foot-contact dots. The point is to see whether the feet land ON "
+                        "the treads after a width edit, which the mesh alone cannot show.")
+    p.add_argument("--traj-seed", type=int, default=0,
+                   help="Which clips are sampled, so a re-run shows the same ones.")
     args = p.parse_args()
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("+z")
 
     if args.lib:
-        mesh = _render_library(server, args.lib, args.num_rows)
+        mesh = _render_library(server, args.lib, args.num_rows,
+                               n_traj=args.traj, traj_seed=args.traj_seed)
     else:
         mesh = _render_subterrains(server, _load_cfg(args.cfg or "demo"))
 

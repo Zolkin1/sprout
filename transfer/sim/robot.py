@@ -18,12 +18,17 @@ class Robot:
                  input_function: Callable[[float], np.array] = None, use_pd: bool =False, gains: Dict[str, float]=None, rng=None,
                  fall_height: float = 0.2, fall_tilt_rad: float = np.deg2rad(70.0)):
         """Initialize the robot with its model and data."""
-        # ``g1_29j`` is the 29-DOF robot (waist roll/pitch + 6 wrists unlocked); its scenes
-        # are ``g1_29j_{basic,terrain}_scene.xml``.
-        if robot_name not in ("g1_21j", "g1_21j_M4", "g1_21j_compute", "g1_29j"):
+        # ``g1_perceptive`` is the CURRENT robot and the default everywhere: mode_11 motors,
+        # passive rubber hands, a compute backpack and two camera mounts, generated from the
+        # URDF by ``make_g1_mjcf.py``. Its scenes are ``g1_perceptive_{basic,terrain,tile*}
+        # _scene.xml``. ``g1_29j`` is the pre-mode_11 29-DOF model, kept because it is still
+        # the FK reference in some older provenance -- its SCENES are gone, so naming it here
+        # gets a missing-file error rather than a silently different robot.
+        if robot_name not in ("g1_21j", "g1_21j_M4", "g1_21j_compute", "g1_29j",
+                              "g1_perceptive"):
             raise ValueError(
                 f"Invalid robot name {robot_name!r}! Supported: g1_21j, g1_21j_M4, "
-                f"g1_21j_compute, g1_29j."
+                f"g1_21j_compute, g1_29j, g1_perceptive."
             )
 
         self.robot_name = robot_name
@@ -445,8 +450,8 @@ class Robot:
 
         The datum :meth:`failed` measures the pelvis against. It exists because the old test
         was ``qpos[2] < 0.2`` in WORLD coordinates, which silently assumed the ground is at
-        zero: on the descending tiles it is not. ``g1_29j_tile20_scene``'s bottom slab sits at
-        -0.777 m, so a perfectly healthy robot standing on it has a pelvis at ~0.0 and was
+        zero: on the descending tiles it is not. ``g1_perceptive_tile20_scene``'s bottom
+        slab sits at -0.777 m, so a healthy robot standing on it has a pelvis at ~0.0 and was
         reported as fallen the moment it arrived. Every stairs-down run was scored as a
         failure before it began.
 
@@ -516,32 +521,49 @@ class Robot:
         up_z = 1.0 - 2.0 * (x * x + y * y)
         return float(abs(np.arctan2(up_y, up_z))), float(abs(np.arctan2(up_x, up_z)))
 
-    def failed(self):
-        """True once the robot is down: too low over the terrain, or tipped too far.
+    def failure_reason(self) -> str:
+        """Why the run is over, or ``""`` while it is still going.
 
         Two independent conditions, because each misses cases the other catches:
 
-        * HEIGHT -- the pelvis within ``fall_height`` of the scene's lowest terrain surface.
-          Terrain-relative, not absolute (see :meth:`terrain_min_surface_z`). On a flat scene
-          the floor plane is at z = 0, so this reduces to the historical ``qpos[2] < 0.2`` and
-          flat results are unchanged. Its weakness is multi-level terrain, where one datum for
-          the whole scene is a loose bound.
-        * TILT -- more than ``fall_tilt_rad`` from upright in roll or pitch. This is what
+        * ``"height"`` -- the pelvis within ``fall_height`` of the scene's lowest terrain
+          surface. Terrain-relative, not absolute (see :meth:`terrain_min_surface_z`). On a
+          flat scene the floor plane is at z = 0, so this reduces to the historical
+          ``qpos[2] < 0.2`` and flat results are unchanged. Its weakness is multi-level
+          terrain, where one datum for the whole scene is a loose bound.
+        * ``"tilt"`` -- more than ``fall_tilt_rad`` from upright in roll or pitch. This is what
           covers the height check's blind spot: a robot that collapses on an UPPER level stays
           far above the scene minimum, but it cannot do so while upright.
 
-        Roll and pitch are bounded SEPARATELY, as asked, which means the worst case admitted
-        is both at the limit -- 70 deg each is ~86 deg of total tilt. Bounding the combined
-        angle instead is one line (``arccos(up_z) > limit``); it was not done because the
-        separate form is the stated criterion and the difference only matters for a robot
-        falling exactly diagonally.
+        Roll and pitch are bounded SEPARATELY, as asked, which means the worst case admitted is
+        both at the limit -- 70 deg each is 75.6 deg of total tilt, not the ~86 deg an earlier
+        version of this docstring claimed (the two do not add: ``arccos(cos70 * cos70)``).
+        Bounding the combined angle instead is one line (``arccos(up_z) > limit``); it was not
+        done because the separate form is the stated criterion and the difference only matters
+        for a robot falling exactly diagonally.
+
+        A STRING rather than a bool because the runner stamps it into ``sim_meta.yaml`` and
+        ``gen_tracker_metrics`` reports it: "it fell" and "it fell face-first off a step while
+        still tall" are different findings, and the CSV cannot tell them apart afterwards.
+
+        Returns:
+            ``"height"``, ``"tilt"``, or ``""``.
         """
-        # bool(), not the numpy comparison's np.bool_: this is a public predicate, and a
+        # bool(), not the numpy comparison's np.bool_: this feeds a public predicate, and a
         # numpy bool fails `is True` / `is False` and serialises oddly. It leaked once already.
         if bool(self.mj_data.qpos[2] < self.terrain_min_z + self.fall_height):
-            return True
+            return "height"
         roll, pitch = self.tilt_from_upright()
-        return bool(roll > self.fall_tilt_rad or pitch > self.fall_tilt_rad)
+        if bool(roll > self.fall_tilt_rad or pitch > self.fall_tilt_rad):
+            return "tilt"
+        return ""
+
+    def failed(self):
+        """True once the robot is down: too low over the terrain, or tipped too far.
+
+        The predicate half of :meth:`failure_reason`, which is where the criteria live.
+        """
+        return self.failure_reason() != ""
 
     def get_joint_names(self) -> list[str]:
         """Extract joint names from qpos in MuJoCo order.

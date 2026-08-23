@@ -66,7 +66,7 @@ def robot() -> Robot:
     cwd = os.getcwd()
     os.chdir(_SIM)
     try:
-        r = Robot(robot_name="g1_29j", scene_name="terrain_scene",
+        r = Robot(robot_name="g1_perceptive", scene_name="terrain_scene",
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
     finally:
         os.chdir(cwd)

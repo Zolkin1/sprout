@@ -27,6 +27,14 @@ import trimesh
 from isaaclab.utils import configclass
 
 
+#: The values :attr:`OverlayVolumeCfg.kind` accepts, as data rather than only as a type
+#: annotation.  ``@configclass`` does not validate a ``Literal`` at runtime, so
+#: ``kind="wall"`` is accepted and silently drawn as a plain box -- which is exactly how a
+#: new shape would look correct in Isaac and be missing in MuJoCo.  Manifest readers check
+#: against this, mirroring the refusal :func:`overlay_sub_boxes` makes for ``variant``.
+OVERLAY_KINDS: frozenset[str] = frozenset(("box", "obstacle", "overhead"))
+
+
 @configclass
 class OverlayVolumeCfg:
     """One finite collision volume placed on a composite sub-terrain.
@@ -55,6 +63,25 @@ class OverlayVolumeCfg:
     """Whether the volume's top face is a landing surface (a box the feet land
     on). ``False`` marks a pure collision obstacle. Advisory metadata -- the mesh
     is identical either way; consumers use it to decide projection / sensing."""
+
+    decor: bool = False
+    """VISUAL ONLY: the depth cameras see it, the height scan does not, and it does
+    not collide.
+
+    Unlike :attr:`walkable_top` this is NOT advisory -- it changes which mesh the
+    volume is built into. Decoration exists so the far camera has vertical structure
+    to look at (at 15 deg pitch, 26.9% of its pixels return the range sentinel on
+    flat ground), and the whole point is that it costs nothing else: the robot cannot
+    walk into a wall it was never trained to avoid, and the height scan -- which
+    clips at +/-1 m and would read a 1.5 m and a 5 m wall identically -- never sees
+    one.
+
+    Each simulator needs a different mechanism, which is why this is a schema field
+    rather than something a renderer can infer. IsaacLab needs a SEPARATE PRIM: the
+    height scanner is a ``RayCaster`` and takes exactly one mesh prim, while the
+    depth cameras are ``MultiMeshRayCasterCamera`` and take a list. MuJoCo needs geom
+    group 1 with ``contype=0 conaffinity=0``, because depth casts groups {1, 2} and
+    the scan casts {2}."""
 
     variant: Literal[
         "solid", "floating", "floating_center_leg", "floating_corner_legs"

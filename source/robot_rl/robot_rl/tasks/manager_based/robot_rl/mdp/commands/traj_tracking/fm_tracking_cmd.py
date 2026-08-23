@@ -56,6 +56,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.height_scan import (
     height_scan_specs,
     scan_obs_stack,
 )
+from robot_rl.flow_matching.config import default_depth_lag_steps
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
     depth_obs_stack,
     depth_xyz_stack,
@@ -73,6 +74,7 @@ from robot_rl.flow_matching.online import (
 from isaaclab.utils.math import quat_apply
 
 from robot_rl.flow_matching.window import (
+    DEFAULT_WINDOW_ANCHOR,
     reanchor_window,
     resolve_reference_blocks,
     window_to_world,
@@ -84,6 +86,15 @@ from .fm_tracking_cmd_cfg import FmTrackingCommandCfg
 
 class FmTrackingCommand(MotionSequenceCommand):
     """Track a robot-state-conditioned flow-matching generator in the world frame."""
+
+    #: Synthetic camera lag for the GENERATOR, in control steps. Defaulted at CLASS level so
+    #: an object that skips construction -- the test doubles in tests/ do -- still reads as
+    #: "no lag" rather than raising AttributeError deep in the re-plan path.
+    _depth_lag_steps: int = 0
+    #: Ring buffer behind that lag. Immutable at class level on purpose: it is only ever
+    #: appended to after __init__ rebinds it per instance, and a shared mutable default would
+    #: leak frames between environments.
+    _extero_buf: tuple = ()
 
     cfg: FmTrackingCommandCfg
 
@@ -216,6 +227,19 @@ class FmTrackingCommand(MotionSequenceCommand):
         # need to know the commands), so anything a command term asks about an obs group at
         # construction time is asking too early.
         self._extero_checked = False
+        # Synthetic camera lag for the GENERATOR. Resolved once: explicit cfg wins, else the
+        # checkpoint's own trained distribution, else none (a pre-latency graph).
+        _lag_cfg = getattr(self.cfg, "fm_depth_lag_steps", None)
+        self._depth_lag_steps = (int(_lag_cfg) if _lag_cfg is not None
+                                 else default_depth_lag_steps(
+                                     getattr(self.ctx, "depth_latency_probs", None)))
+        self._depth_lag_steps = max(self._depth_lag_steps, 0)
+        self._extero_buf: list[torch.Tensor] = []
+        if self._depth_lag_steps:
+            print(f"[INFO FmTrackingCommand] FM camera lag {self._depth_lag_steps} step(s) = "
+                  f"{20 * self._depth_lag_steps} ms; the generator is conditioned on a frame "
+                  "that old, with the camera pose it was captured at. The teacher's own depth "
+                  "observation is untouched.")
 
         # Rolling per-env history of the N reference-window nodes this command last
         # SERVED -- the generator's own output, not the robot's state. That is the
@@ -437,6 +461,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         """
         self._build_clip_reference()
         if self.fm_enabled:
+            # BEFORE the generator runs, and every step -- a frame can only be served `lag`
+            # steps late if it was captured. Skipped entirely at lag 0, so the default costs
+            # nothing.
+            self._push_extero_lag()
             self._build_fm_reference()
         self._apply_source(self.cfg.reference_source)
 
@@ -754,6 +782,34 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._extero_checked = True
         return reading
 
+    def _push_extero_lag(self) -> None:
+        """Record this step's exteroception so a later step can be served an older one.
+
+        Buffers the FUSED reading (:meth:`_read_extero`), not the raw image: for a multi-
+        channel row the xyz planes are already unprojected with the pose that was live when
+        it was taken, so image and pose cannot come apart. Unprojecting an old image with the
+        CURRENT pose would displace every pixel by the egomotion -- the registration error
+        those channels exist to remove.
+        """
+        if not self._depth_lag_steps:
+            return
+        self._extero_buf.append(self._read_extero().clone())
+        del self._extero_buf[:-(self._depth_lag_steps + 1)]
+
+    def _lagged_extero(self) -> torch.Tensor:
+        """The reading the generator conditions on: ``_depth_lag_steps`` old, or live.
+
+        Early in an episode the buffer is short and the OLDEST held frame is repeated. Not
+        zero-filled: a zero depth row is a valid reading -- a surface at the near plane --
+        so zeros would condition the generator on a wall that is not there.
+
+        Returns:
+            ``(num_envs, T, K)``, as :meth:`_read_extero`.
+        """
+        if not self._depth_lag_steps or not self._extero_buf:
+            return self._read_extero()
+        return self._extero_buf[max(len(self._extero_buf) - 1 - self._depth_lag_steps, 0)]
+
     def _check_extero_shape(self, reading: torch.Tensor) -> None:
         """Fail on the first exteroception reading if it is not what the generator expects.
 
@@ -907,7 +963,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         # Exteroception tokens = the live reading at "now", from whichever sensor this FM
         # checkpoint was TRAINED on -- the same mdp functions the teacher obs uses, so
         # deployment conditions on exactly the training signal.
-        height = build_extero_tokens(self.ctx, self._read_extero()[ids])
+        height = build_extero_tokens(self.ctx, self._lagged_extero()[ids])
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
         self._pred_window[ids] = sample_window(
@@ -921,6 +977,22 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._anchor_pos[ids] = wp.to_torch(self.robot.data.root_pos_w)[ids].clone()
         self._anchor_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids].clone()
         self._pred_valid[ids] = True
+
+    def window_anchor(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The FM command's plan anchor is the pose latched when the plan was drawn.
+
+        Overrides :meth:`MotionSequenceCommand.window_anchor`, whose plan anchor advances on
+        the ``fm_snap_every`` cadence. Here the authority is ``_anchor_pos`` / ``_anchor_quat``
+        -- the pose the CURRENT prediction was made against -- so the observation frame and
+        the prediction frame cannot drift apart even if the two cadences are configured
+        differently.
+
+        Returns:
+            ``([N, 3], [N, 4])`` world position and quaternion (xyzw).
+        """
+        if getattr(self.cfg, "window_anchor", DEFAULT_WINDOW_ANCHOR) == "plan":
+            return self._anchor_pos, self._anchor_quat
+        return super().window_anchor()
 
     def _pred_world(self, offsets: torch.Tensor) -> dict[str, torch.Tensor]:
         """Lift the served nodes at ``offsets`` to the world frame -- SIMULATION ONLY.
@@ -1078,6 +1150,13 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "the recording, so re-record with this teacher), or set the term's "
                 "`blocks` to the checkpoint's."
             )
+        if getattr(self.cfg, "window_anchor", DEFAULT_WINDOW_ANCHOR) == "plan":
+            # The prediction is ALREADY in the plan frame -- that is the frame the generator
+            # was trained to emit -- and under this convention the observation is that frame.
+            # So there is nothing to undo: serve the nodes as predicted. This is the whole
+            # odometry saving, and its deploy twin is GenTrackerPolicy._serve_nodes.
+            ar, idx = self._future_indices(offsets)
+            return self._pred[ar, idx]
         return self._reanchor_to_now(offsets)
 
     def get_future_world_base(

@@ -103,7 +103,17 @@ class G1ClfTrackingSceneCfg(InteractiveSceneCfg):
     # arm chain nest UNDER torso_link -- on the old 21-DOF merged model they sat directly on
     # waist_yaw_link.  Match the body itself (no trailing ``/.*``) so a faceplant loads the torso, not its
     # arm descendants.
+    #
+    # This sensor was DEAD until 2026-08-19 and said nothing about it: the box it names sat on
+    # waist_yaw_link, so torso_link had no collider and nothing could ever report contact here.  The box
+    # now lives on torso_link (see the comment on it in g1_21j_29dof.urdf), which also means it finally
+    # rotates with the unlocked waist instead of staying upright under a 30-degree lean.
     torso_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/waist_yaw_link/waist_roll_link/torso_link")
+    # The compute backpack, which torso_contact does NOT cover: that path matches the torso
+    # body exactly, with no trailing ``/.*``, deliberately so a faceplant loads the torso and
+    # not its arm descendants.  The pack is a child of torso_link and 2.64 kg standing ~0.2 m
+    # behind it, so a backwards fall lands on this before anything else.
+    backpack_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/waist_yaw_link/waist_roll_link/torso_link/backpack_shell_link")
     left_elbow_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/waist_yaw_link/waist_roll_link/torso_link/left_shoulder_pitch_link/left_shoulder_roll_link/left_shoulder_yaw_link/.*")
     right_elbow_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/waist_yaw_link/waist_roll_link/torso_link/right_shoulder_pitch_link/right_shoulder_roll_link/right_shoulder_yaw_link/.*")
     left_foot_contact = ClfTrackingBaseEnvContactSensorCfg("{ENV_REGEX_NS}/Robot/Geometry/pelvis_link/left_hip_pitch_link/left_hip_roll_link/left_hip_yaw_link/left_knee_link/left_ankle_pitch_link/.*")
@@ -170,7 +180,15 @@ class G1ClfTrackingEventsCfg:
         func=mdp.randomize_rigid_body_mass,
         mode="startup",
         params={
-            "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),   # 29-DOF: torso is its own link now
+            # 29-DOF: torso is its own link.  The two backpack masses are included because
+            # they are 2.64 kg of payload -- the single largest thing bolted to this robot --
+            # and scoping this to torso_link alone gave the biggest new mass NO
+            # randomisation at all.  Their real values are also the least certain numbers on
+            # the robot (weighed, with "everything else" lumped into the Thor), so they are
+            # exactly what a mass DR is for.  backpack_shell_link is the mesh and carries a
+            # token mass; scaling it would randomise nothing.
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["torso_link", "backpack_thor_link", "backpack_zed_link"]),
             "mass_distribution_params": (0.85, 1.15),  # (-5.0, 5.0),
             "operation": "scale",
         },
@@ -215,6 +233,21 @@ class G1ClfTrackingEventsCfg:
         params={
             "asset_cfg": SceneEntityCfg("robot", body_names="torso_link"),
             "com_range": {"x": (-0.05, 0.05), "y": (-0.05, 0.05), "z": (-0.01, 0.01)},
+        },
+    )
+
+    # The backpack's CoM, separately from the torso's because the uncertainty is a different
+    # shape. The torso's is a manufacturing/loading spread about a well-known centroid; the
+    # pack's is where a bolt-on assembly actually ended up, plus the fact that its 1.940 kg
+    # lumps the Thor together with a mounting plate and cabling whose spread is not modelled
+    # (the inertia tensor is the Thor BLOCK alone). +/-2 cm is roughly the plate's own depth.
+    backpack_com = EventTerm(
+        func=mdp.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg(
+                "robot", body_names=["backpack_thor_link", "backpack_zed_link"]),
+            "com_range": {"x": (-0.02, 0.02), "y": (-0.02, 0.02), "z": (-0.02, 0.02)},
         },
     )
 
@@ -269,9 +302,18 @@ class G1ClfTrackingRewardCfg:
         func=mdp.multiple_undesired_contacts,
         weight=-0.1,
         params={
+            # backpack_contact is here because torso_contact CANNOT cover it: that path
+            # matches torso_link exactly, with no trailing ``/.*``, so the pack -- a child
+            # link -- is invisible to it. The pack's rear face sits at torso-frame
+            # x = -0.2201 against the torso box's -0.0560, so 0.164 m of a 2.64 kg payload
+            # protrudes behind everything else on the robot and a backwards fall reaches it
+            # first. Defining the sensor without listing it here left it reporting to
+            # nothing: no reward reads it, and the six DoneTerm sites read no contact
+            # sensor at all.
             "sensor_cfgs": [SceneEntityCfg("left_thigh_contact",),
                             SceneEntityCfg("right_thigh_contact",),
                             SceneEntityCfg("torso_contact",),
+                            SceneEntityCfg("backpack_contact",),
                             SceneEntityCfg("left_elbow_contact",),
                             SceneEntityCfg("right_elbow_contact",),],
             "threshold": 1.0,

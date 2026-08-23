@@ -43,7 +43,7 @@ def main():
                        help="Specific run directory to load (e.g., '2025-11-17_16-15-56_running_testA'). If not specified, uses latest run.")
     parser.add_argument("--scene", type=str, default="basic_scene",
                        help="Scene name for MuJoCo simulation")
-    parser.add_argument("--robot_name", type=str, default="g1_21j",
+    parser.add_argument("--robot_name", type=str, default="g1_perceptive",
                        help="Robot name")
     parser.add_argument("--use_ic", action="store_true", default=False,
                        help="Use the valid initial condition from the policy YAML")

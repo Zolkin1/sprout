@@ -49,6 +49,9 @@ import h5py
 import numpy as np
 
 from generate_stairs_scene import scene_xml
+from overlay_geom import (DECOR_CONTACT_ATTRS, DECOR_GEOM_GROUP,
+                          OVERLAY_VARIANTS, is_decor,
+                          overlay_sub_boxes_from_manifest)
 
 #: An overlay whose x extent is at most this is a STEP rather than a platform or a box.
 #: Trained treads top out at 0.28 m (``generate_stairs_scene.TRAINED_TREADS``); the platforms
@@ -107,8 +110,27 @@ def load_tile(clip_path: str, terrain_id: int | None) -> tuple[dict, dict]:
     return entry, info
 
 
-def solid_overlays(entry: dict) -> list[dict]:
+#: Overlay ``kind`` values, mirroring ``terrains/blocks/overlay.py``'s ``OVERLAY_KINDS``.
+#: Kept as a literal rather than imported because ``blocks/overlay.py`` pulls in IsaacLab and
+#: this file runs under ``env_transfer``; ``test_clip_tile_scene.py`` pins the two together.
+OVERLAY_KINDS = ("box", "obstacle", "overhead")
+
+
+def emittable_overlays(entry: dict) -> list[dict]:
     """The tile's overlay volumes, refusing any this emitter cannot represent exactly.
+
+    Neither ``kind`` nor ``variant`` restricts what is emitted any more:
+
+    * every ``kind`` is one axis-aligned box, and the distinction (walkable ground vs. a
+      hurdle vs. an overhead bar) is carried by ``walkable_top`` and ``base_z``, which
+      :func:`walkable` and :func:`tile_geoms` honour;
+    * every ``variant`` is a fixed set of axis-aligned sub-boxes, which
+      :func:`overlay_geom.overlay_sub_boxes` produces -- the same decomposition the Isaac
+      importer meshes.  This used to be refused, which meant the 23 shipped tiles carrying a
+      ``floating`` overlay could not be emitted at all.
+
+    Both are still validated, because an unrecognised value is far more likely to be a new
+    shape this emitter would silently flatten than a typo.
 
     Args:
         entry: A manifest tile entry.
@@ -117,43 +139,64 @@ def solid_overlays(entry: dict) -> list[dict]:
         The overlay dicts, in manifest order.
 
     Raises:
-        ValueError: On a non-box kind or a non-solid variant. A ``floating`` overlay is a
-            slab on legs (``blocks/overlay.py``), which is several geoms and different
-            contact behaviour -- emitting its bounding box instead would look right in the
-            viewer and be wrong under the foot, which is the failure mode this whole file
-            exists to avoid.
+        ValueError: On an unknown kind or an unknown variant.
     """
     out = []
     for i, ov in enumerate(entry.get("overlays", [])):
         kind, variant = str(ov.get("kind", "box")), str(ov.get("variant", "solid"))
-        if kind != "box" or variant != "solid":
+        if kind not in OVERLAY_KINDS:
             raise ValueError(
-                f"tile {entry.get('terrain_id')} overlay {i} is kind='{kind}' "
-                f"variant='{variant}', which this emitter cannot reproduce exactly (only "
-                "solid boxes). Extend it before using this tile, rather than accepting an "
-                "approximation of the geometry you came here to be exact about."
+                f"tile {entry.get('terrain_id')} overlay {i} has kind='{kind}'; expected one of "
+                f"{list(OVERLAY_KINDS)}. An unknown kind is most likely a new shape, which this "
+                "emitter would silently flatten into a box."
+            )
+        if variant not in OVERLAY_VARIANTS:
+            raise ValueError(
+                f"tile {entry.get('terrain_id')} overlay {i} has variant='{variant}'; expected "
+                f"one of {list(OVERLAY_VARIANTS)}. Emitting its bounding box instead would look "
+                "right in the viewer and be wrong under the foot, which is the failure mode this "
+                "whole file exists to avoid."
             )
         out.append(ov)
     return out
 
 
-def terrain_top_at(overlays: list[dict], x: float, y: float) -> float:
-    """Height of the terrain at a point in tile-local coordinates.
+def walkable(overlays: list[dict]) -> list[dict]:
+    """The overlays that are ground -- i.e. the ones a foot can be supported by.
+
+    ``walkable_top`` is advisory metadata that, until now, nothing in this file acted on:
+    every geometry query below treated a railing post or a wall as terrain.  Every overlay
+    any generator has authored to date is ``walkable_top=True``, so this is a no-op on the
+    shipped libraries and a guard on decorated ones.
 
     Args:
-        overlays: Solid box overlays (see :func:`solid_overlays`).
+        overlays: Overlays this emitter can represent (see :func:`emittable_overlays`).
+
+    Returns:
+        The subset whose top face is a landing surface.
+    """
+    return [ov for ov in overlays if bool(ov.get("walkable_top", True))]
+
+
+def terrain_top_at(overlays: list[dict], x: float, y: float) -> float:
+    """Height of the WALKABLE terrain at a point in tile-local coordinates.
+
+    Args:
+        overlays: Overlays this emitter can represent (see :func:`emittable_overlays`).
         x: Tile-local x (m).
         y: Tile-local y (m).
 
     Returns:
-        The top z (m) of the highest overlay covering the point, or 0.0 (the tile floor).
+        The top z (m) of the highest walkable overlay covering the point, or 0.0 (the tile
+        floor).  Non-walkable volumes are ignored: standing the robot on top of a 1.1 m
+        railing post is not a spawn height.
 
     Raises:
         NotImplementedError: If a covering overlay is yawed, where "covers this point" is not
             an axis-aligned test.
     """
     top = 0.0
-    for ov in overlays:
+    for ov in walkable(overlays):
         if abs(float(ov.get("yaw", 0.0))) > 1e-9:
             raise NotImplementedError(
                 "terrain_top_at does not handle a yawed overlay; pass --spawn_xy explicitly."
@@ -167,14 +210,19 @@ def terrain_top_at(overlays: list[dict], x: float, y: float) -> float:
 def first_step(overlays: list[dict]) -> dict | None:
     """The lowest-x step-like overlay -- the first riser of the flight -- or ``None``.
 
+    "Step-like" is WALKABLE and at most :data:`_STEP_MAX_TREAD_M` deep.  The walkable half
+    matters: a railing post or a clutter box is also narrow in x, and picking one as the
+    flight's first riser sends :func:`spawn_point` to that post's centreline -- measured at
+    2.05 m outside the tile, over the void, on a probe tile.
+
     Args:
-        overlays: Solid box overlays.
+        overlays: Overlays this emitter can represent.
 
     Returns:
-        The overlay dict, or ``None`` when the tile has no tread-sized overlay (a box tile,
-        a bare platform).
+        The overlay dict, or ``None`` when the tile has no tread-sized walkable overlay (a
+        box tile, a bare platform).
     """
-    steps = [ov for ov in overlays if float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M]
+    steps = [ov for ov in walkable(overlays) if float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M]
     return min(steps, key=lambda ov: float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0) \
         if steps else None
 
@@ -189,28 +237,61 @@ def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[flo
 
     Args:
         entry: The manifest tile entry.
-        overlays: Solid box overlays.
+        overlays: Overlays this emitter can represent.
         approach: Distance (m) from the spawn to the first riser's front face.
 
     Returns:
         ``(x, y, why)`` -- the point and a one-line explanation for the log.
+
+    Raises:
+        ValueError: If the derived point falls outside the tile footprint. The spawn is
+            derived from one overlay's geometry, so a misidentified "first riser" puts it
+            somewhere the tile does not exist -- silently, since the emitter happily writes
+            a scene whose robot starts over the void. Cheap to check, and it is the
+            post-condition that pins :func:`first_step`'s predicate.
     """
     step = first_step(overlays)
     if step is None:
         return (float(entry["size_x"]) / 2.0, float(entry["size_y"]) / 2.0,
                 "tile centre (no step-like overlay to aim at)")
     front = float(step["pos_xy"][0]) - float(step["size_xyz"][0]) / 2.0
-    return (front - approach, float(step["pos_xy"][1]),
+    x, y = front - approach, float(step["pos_xy"][1])
+    size_x, size_y = float(entry["size_x"]), float(entry["size_y"])
+    if not (0.0 <= x <= size_x and 0.0 <= y <= size_y):
+        raise ValueError(
+            f"tile {entry.get('terrain_id')}: derived spawn ({x:.3f}, {y:.3f}) is outside the "
+            f"tile footprint (0..{size_x:.3f}, 0..{size_y:.3f}). The first riser was taken to be "
+            f"the overlay at {tuple(step['pos_xy'])} with size {tuple(step['size_xyz'])}; if that "
+            "is not a stair tread, first_step picked the wrong overlay. Pass --spawn_xy to "
+            "override, or reduce --approach."
+        )
+    return (x, y,
             f"{approach:.2f} m before the first riser (tile-local x={front:.3f}), "
-            f"on the flight's centreline (y={float(step['pos_xy'][1]):.3f})")
+            f"on the flight's centreline (y={y:.3f})")
 
 
 def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,
-              yaw: float, material: str = "box_material") -> str:
-    """One MuJoCo box geom line in the raycast/collision group."""
+              yaw: float, material: str = "box_material", decor: bool = False) -> str:
+    """One MuJoCo box geom line.
+
+    Args:
+        name: Geom name.
+        cx, cy, cz: Centre.
+        sx, sy, sz: Full extents.
+        yaw: Rotation about z (rad).
+        material: Material name.
+        decor: Emit it as VISUAL-ONLY -- group 1 rather than 2, and non-colliding. The depth
+            cameras cast groups {1, 2} and the height scan casts {2}, so this is what makes a
+            wall visible to the cameras, invisible to the scan, and impossible to walk into.
+
+    Returns:
+        The geom line.
+    """
     quat = f' quat="{math.cos(yaw / 2.0):.9f} 0 0 {math.sin(yaw / 2.0):.9f}"' if yaw else ""
-    return (f'        <geom name="{name}" type="box" material="{material}" group="2" '
-            f'size="{sx / 2.0:.6f} {sy / 2.0:.6f} {sz / 2.0:.6f}" '
+    group = DECOR_GEOM_GROUP if decor else 2
+    flags = f" {DECOR_CONTACT_ATTRS}" if decor else ""
+    return (f'        <geom name="{name}" type="box" material="{material}" group="{group}"'
+            f'{flags} size="{sx / 2.0:.6f} {sy / 2.0:.6f} {sz / 2.0:.6f}" '
             f'pos="{cx:.6f} {cy:.6f} {cz:.6f}"{quat}/>')
 
 
@@ -218,14 +299,16 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
                infinite_floor: bool) -> tuple[list[str], str]:
     """Emit the tile's geometry, translated so ``origin`` (tile-local) is the world origin.
 
-    Every overlay is a full-height pillar from its ``base_z``, which is how the training
-    tiles are built (step ``n`` spans ``z in [0, n*rise]``) and how the MuJoCo playground
-    builds them too -- so the tread tops and risers are clean and a foot cannot catch in a
-    seam.
+    A ``solid`` overlay is a full-height pillar from its ``base_z``, which is how the
+    training tiles are built (step ``n`` spans ``z in [0, n*rise]``) -- so the tread tops
+    and risers are clean and a foot cannot catch in a seam.  A ``floating*`` overlay is a
+    thin top slab with an open gap beneath it, plus optional support legs; those are emitted
+    as the same sub-boxes :func:`overlay_geom.overlay_sub_boxes` gives the Isaac importer,
+    so the two sims build the same structure rather than the same silhouette.
 
     Args:
         entry: The manifest tile entry.
-        overlays: Solid box overlays.
+        overlays: Overlays this emitter can represent (see :func:`emittable_overlays`).
         origin: ``(x, y, z)`` tile-local point to place at the world origin.
         infinite_floor: Emit the checkered infinite plane instead of the tile's own floor.
 
@@ -235,14 +318,17 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
     ox, oy, oz = origin
     lines = []
     for i, ov in enumerate(overlays):
-        (px, py), (sx, sy, sz) = ov["pos_xy"], ov["size_xyz"]
-        base_z = float(ov.get("base_z", 0.0))
-        step = float(sx) <= _STEP_MAX_TREAD_M
-        lines.append(_box_geom(
-            f"tile_{'step' if step else 'slab'}{i}",
-            float(px) - ox, float(py) - oy, base_z + float(sz) / 2.0 - oz,
-            float(sx), float(sy), float(sz), float(ov.get("yaw", 0.0)),
-        ))
+        decor = is_decor(ov)
+        step = float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M
+        base = f"tile_decor{i}" if decor else f"tile_{'step' if step else 'slab'}{i}"
+        yaw = float(ov.get("yaw", 0.0))
+        # A solid overlay decomposes to exactly one sub-box with the overlay's own extents,
+        # so the emitted line -- and its name -- is unchanged from before this branch existed.
+        for j, (cx, cy, cz, bx, by, bz) in enumerate(overlay_sub_boxes_from_manifest(ov)):
+            lines.append(_box_geom(
+                base if j == 0 else f"{base}_p{j}",
+                cx - ox, cy - oy, cz - oz, bx, by, bz, yaw, decor=decor,
+            ))
 
     if infinite_floor or not bool(entry.get("has_floor", True)):
         # has_floor=False is an isolated structure (a floating staircase): Isaac gives it NO
@@ -264,7 +350,8 @@ def main() -> None:
     p.add_argument("--clip", required=True, help="Clip library .h5 carrying the terrain_manifest.")
     p.add_argument("--terrain_id", type=int, default=None,
                    help="Tile to build (default: the only tile, else required).")
-    p.add_argument("--robot", default="g1_29j", help="Robot model to include; names the output.")
+    p.add_argument("--robot", default="g1_perceptive",
+               help="Robot model to include; names the output.")
     p.add_argument("--scene", default=None,
                    help="Scene name; output is robots/g1/<robot>_<scene>.xml "
                         "(default: tile<terrain_id>_scene).")
@@ -283,7 +370,7 @@ def main() -> None:
     args = p.parse_args()
 
     entry, info = load_tile(args.clip, args.terrain_id)
-    overlays = solid_overlays(entry)
+    overlays = emittable_overlays(entry)
     if args.spawn_xy is not None:
         sx, sy = args.spawn_xy
         why = "--spawn_xy"
@@ -306,6 +393,7 @@ def main() -> None:
         f"{len(overlays)} overlay(s), has_floor={bool(entry.get('has_floor', True))}."
     )
     xml = scene_xml(f"{args.robot}.xml", header, "\n".join(geoms), floor,
+                    tile_local_origin=(sx, sy, sz),
                     model=f"g1_tile{info['terrain_id']}_scene")
 
     out_path = args.out or os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -319,9 +407,17 @@ def main() -> None:
           f"{len(overlays)} overlay(s)")
     print(f"[INFO] spawn: tile-local ({sx:.3f}, {sy:.3f}) at terrain z={sz:.3f} m -> world "
           f"origin ({why})")
+    # Decoration is VISUAL ONLY -- emitted non-colliding (contype=0 conaffinity=0), so the
+    # robot cannot stand on it or walk into it. It must therefore stay out of the walkable
+    # geometry summary below: a 2.6 m room wall read as a riser reported "climb 2.508 m over
+    # 1 riser" on a tile whose real climb is 3 risers of 0.13 m, which is a made-up number
+    # pointing at a nonexistent obstacle.
+    walkable = [ov for ov in overlays if not ov.get("decor")]
+    n_decor = len(overlays) - len(walkable)
     for i, ov in enumerate(overlays):
         (px, py), (osx, osy, osz) = ov["pos_xy"], ov["size_xyz"]
-        kind = "step " if float(osx) <= _STEP_MAX_TREAD_M else "slab "
+        kind = ("decor" if ov.get("decor")
+                else "step " if float(osx) <= _STEP_MAX_TREAD_M else "slab ")
         print(f"       - {kind}{i}: {osx:.3f} x {osy:.3f} x {osz:.3f} m, top "
               f"z={float(ov.get('base_z', 0.0)) + osz - sz:+.3f} m at world "
               f"(x={px - sx:+.3f}, y={py - sy:+.3f})")
@@ -331,7 +427,7 @@ def main() -> None:
     # 3 that counting step overlays suggests.
     ups = sorted(
         ((float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0 - sx,
-          float(ov.get("base_z", 0.0)) + float(ov["size_xyz"][2]) - sz) for ov in overlays),
+          float(ov.get("base_z", 0.0)) + float(ov["size_xyz"][2]) - sz) for ov in walkable),
         key=lambda t: t[0],
     )
     risers, last = [], 0.0
@@ -339,6 +435,9 @@ def main() -> None:
         if top > last + 1e-6:
             risers.append((front, top - last))
             last = top
+    if n_decor:
+        print(f"[INFO] {n_decor} visual-only decor overlay(s) excluded from the climb summary "
+              "(non-colliding: the robot can neither stand on them nor hit them)")
     if risers:
         print("[INFO] climb from the spawn, drive +x: "
               + ", ".join(f"+{d:.3f} m at x={x:+.3f}" for x, d in risers)

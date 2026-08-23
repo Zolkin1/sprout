@@ -207,6 +207,13 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # way or it is feeding a differently-bounded sensor; absent -> the per-source
         # default, which is what a pre-field graph used.
         "extero_clip": (None if ctx.extero_clip is None else float(ctx.extero_clip)),
+        # The camera-latency distribution this checkpoint trained under, index = lag in
+        # control steps. A SIMULATOR reads it to reproduce that latency instead of feeding a
+        # fresh frame the generator never saw; hardware ignores it, because its lag is
+        # physical and already in the frames. ``None`` in a graph exported before the
+        # latency model, and the correct reading for one is "no synthetic lag".
+        "depth_latency_probs": (list(ctx.depth_latency_probs)
+                                if getattr(ctx, "depth_latency_probs", None) else None),
     }
 
 

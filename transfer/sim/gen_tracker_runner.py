@@ -38,6 +38,7 @@ import yaml
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deploy.artifacts import resolve_fm_onnx  # noqa: E402
+from deploy.fm_session import default_depth_lag_steps
 from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
 from deploy.quat_math_np import (  # noqa: E402
@@ -135,11 +136,79 @@ class RealtimePacer:
             time.sleep(slack)
 
 
+class FmDepthLag:
+    """Hands the GENERATOR a depth frame `steps` control steps old, with its own pose.
+
+    The generator trains on frames delayed 20-60 ms (the depth pipeline's compute plus the
+    ROS hop), so feeding it a fresh one in simulation is off-distribution in exactly the
+    variable that model was fitted to. Hardware needs none of this -- its lag is physical and
+    already in the frames -- which is why this lives in the sim runner and not in
+    ``transfer/deploy``.
+
+    The POSE travels with the image. The 5-channel row's xyz planes are unprojected from the
+    camera pose, so a lagged image unprojected with the CURRENT pose is displaced by the
+    egomotion -- precisely the registration error those channels exist to remove. Buffering
+    the pair keeps them consistent, matching what ``dataset._select_depth_lag`` does offline.
+
+    Only the generator is delayed. The tracker's own ``state["depth"]`` observation stays
+    live: it was trained on fresh frames, and delaying it is a separate question.
+    """
+
+    def __init__(self, steps: int, why: str = "") -> None:
+        """Set up the ring buffer.
+
+        Args:
+            steps: Lag in control steps (20 ms each). ``<= 0`` disables it entirely, leaving
+                the state dict byte-identical to what it was before this existed.
+            why: Where the value came from, for the one-time announcement.
+        """
+        self.steps = max(int(steps), 0)
+        self._buf: list[tuple] = []
+        if self.steps:
+            print(f"[INFO] FM camera lag: {self.steps} step(s) = {20 * self.steps} ms "
+                  f"({why}). The generator sees a frame that old, with the camera pose it "
+                  "was captured at; the tracker's own depth obs stays live.")
+        else:
+            print(f"[INFO] FM camera lag: OFF ({why}). The generator sees the live frame, "
+                  "which is off-distribution if it trained with latency.")
+
+    def apply(self, state: dict) -> dict:
+        """Replace the generator's depth + pose in ``state`` with the lagged pair.
+
+        Args:
+            state: The state dict just built for this step; mutated in place.
+
+        Returns:
+            The same dict, for chaining.
+        """
+        if not self.steps:
+            return state
+        # `fm_depth` when the generator samples its own grid, else a COPY of the tracker's --
+        # `_fm_depth_reading` treats `fm_depth` as authoritative whenever it is present, so
+        # this reaches the generator without touching what the tracker observes.
+        img = state.get("fm_depth")
+        if img is None:
+            img = state.get("depth")
+        if img is None:
+            return state
+        self._buf.append((np.array(img, copy=True), state.get("fm_camera_pose")))
+        del self._buf[:-(self.steps + 1)]
+        # Early in an episode the buffer is short: repeat the OLDEST frame held rather than
+        # zero-filling. A zero depth row is a valid reading -- a surface at the near plane --
+        # so a zero-filled warm-up would condition the generator on a wall that is not there.
+        img_lag, pose_lag = self._buf[max(len(self._buf) - 1 - self.steps, 0)]
+        state["fm_depth"] = img_lag
+        if pose_lag is not None:
+            state["fm_camera_pose"] = pose_lag
+        return state
+
+
 def build_state(
     robot: Robot, policy: GenTrackerPolicy, command: np.ndarray,
     depth_cams: MujocoDepthCameras | None = None, want_depth_hits: bool = False,
     want_raw_depth: bool = False,
     fm_depth_cams: MujocoDepthCameras | None = None,
+    fm_lag: "FmDepthLag | None" = None,
 ) -> dict:
     """Assemble the world-state dict ``GenTrackerPolicy.create_obs`` expects.
 
@@ -296,6 +365,9 @@ def build_state(
     # generator was trained to use (down). The viewer's hit cloud stays the tracker's.
     if fm_depth_cams is not None:
         state["fm_depth"] = fm_depth_cams.compute(robot.mj_data)
+    # LAST, so it sees the finished pair and can substitute both. A no-op at lag 0.
+    if fm_lag is not None:
+        fm_lag.apply(state)
     return state
 
 
@@ -585,7 +657,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
         viz_geomgroup: list[int] | None = None, viz_contacts: bool = False,
         fm_depth_cams: MujocoDepthCameras | None = None,
-        replay=None) -> bool | None:
+        replay=None, fm_lag: FmDepthLag | None = None) -> bool | None:
     """Run the control loop; return True if the robot did not fall.
 
     Returns ``None`` when the user interrupts with Ctrl-C, which is neither survival nor a
@@ -785,7 +857,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                        if replay is not None else None)
         state = build_state(robot, policy, vel_cmd, depth_cams, want_depth_hits=viz,
                             want_raw_depth=replay is not None,
-                            fm_depth_cams=fm_depth_cams)
+                            fm_depth_cams=fm_depth_cams, fm_lag=fm_lag)
         obs = policy.create_obs(state)
         action = policy.get_action(obs, robot.joint_names)
         robot.apply_action(action)
@@ -1173,11 +1245,47 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
     return success
 
 
+def _scene_tile_local_origin(mj_model):
+    """The tile-local point this scene put at its world origin, or ``None``.
+
+    ``generate_clip_tile_scene.py`` emits it as a ``<custom><numeric>`` precisely so this does
+    not have to be passed by hand: a wrong value silently mis-places the robot instead of
+    raising, which is the failure it exists to prevent. A scene without the field (the flat
+    ``basic_scene``, or any tile scene generated before it existed) returns ``None`` and the
+    clip is used in its own frame, unchanged.
+
+    Args:
+        mj_model: The compiled MuJoCo model.
+
+    Returns:
+        ``[3]`` float array, or ``None``.
+    """
+    import mujoco
+    import numpy as np
+
+    for i in range(int(mj_model.nnumeric)):
+        if mujoco.mj_id2name(mj_model, mujoco.mjtObj.mjOBJ_NUMERIC, i) != "tile_local_origin":
+            continue
+        adr = int(mj_model.numeric_adr[i])
+        return np.asarray(mj_model.numeric_data[adr:adr + 3], dtype=np.float64)
+    return None
+
+
 def main() -> None:
     """Parse arguments, build the policy + robot, and run the control loop."""
     parser = argparse.ArgumentParser(description="Run the G1 generator+tracker pair in MuJoCo.")
     parser.add_argument("--experiment", type=str, default="g1")
     parser.add_argument("--load_run", type=str, default=None, help="Tracker run dir (default: latest).")
+    parser.add_argument("--fm_depth_lag_steps", type=int, default=None,
+                        help="Synthetic camera lag for the GENERATOR, in control steps of "
+                             "20 ms (camera and control both run at 50 Hz). Omit to derive "
+                             "it from the loaded fm.onnx: the rounded mean of the "
+                             "depth_latency_probs it trained under, so the shipped "
+                             "(0, .10, .40, .50) gives 2 steps = 40 ms against a 48 ms mean. "
+                             "0 disables it. A graph exported before the latency model "
+                             "carries no distribution and derives 0. Only the generator is "
+                             "delayed -- the tracker's own depth observation stays live, and "
+                             "hardware adds nothing, its lag being physical already.")
     parser.add_argument("--fm_onnx", type=str, default=None,
                         help="Which generator to load: a path, or a bare filename resolved "
                              "inside <run>/exported/. Exports are named for the FM checkpoint "
@@ -1190,7 +1298,7 @@ def main() -> None:
     parser.add_argument("--command", type=str, default="smooth_ramp_running",
                         help="Scripted velocity profile in experiments.velocity_commands (eval mode).")
     parser.add_argument("--scene", type=str, default="basic_scene")
-    parser.add_argument("--robot_name", type=str, default="g1_21j")
+    parser.add_argument("--robot_name", type=str, default="g1_perceptive")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
     parser.add_argument("--tracker_on_cpu", action="store_true", default=False,
                         help="Run the tracker on the CPU while the generator keeps the GPU. "
@@ -1300,14 +1408,20 @@ def main() -> None:
                              "default, matching the -play task the policy was exported from.")
     parser.add_argument("--depth_noise_seed", type=int, default=0,
                         help="Seed for --depth_noise.")
-    parser.add_argument("--viz_geomgroup", type=str, default=None, metavar="LIST",
-                        help="Comma-separated geom GROUPS to render: 0 = collision geoms, "
-                             "1 = visual meshes, 2 = terrain. MuJoCo's default renders 0, 1 "
-                             "and 2 TOGETHER, which is why a collider and the visual mesh it "
-                             "duplicates are indistinguishable, and why disabling a geom's "
-                             "contact changes nothing on screen. Use '0,2' to see only what "
-                             "can actually collide, or '1,2' for only what the depth cameras "
-                             "ray-cast.")
+    parser.add_argument("--viz_geomgroup", type=str, default="1,2,3", metavar="LIST",
+                        help="Comma-separated geom GROUPS to render. 0 = collision geoms, "
+                             "1 = visual meshes, 2 = terrain, 3 = the camera mounts. "
+                             "DEFAULT '1,2,3' = the robot as it looks, on its terrain. "
+                             "MuJoCo's own default is 0,1,2, which draws every collider on "
+                             "top of the visual mesh it duplicates -- so the two are "
+                             "indistinguishable and disabling a geom's contact changes "
+                             "nothing on screen. Pass '' for MuJoCo's default, '0,2' to see "
+                             "only what can actually collide, or '1,2' for exactly what the "
+                             "depth cameras ray-cast. Group 3 is separate precisely BECAUSE "
+                             "the cameras must not cast it: the mounts are solid CAD "
+                             "assemblies whose origin sits inside them, so casting one "
+                             "returns 780/780 pixels at 7-24 mm -- under min_distance, hence "
+                             "all invalid, i.e. that camera goes silently blind.")
     parser.add_argument("--viz_contacts", action="store_true", default=False,
                         help="Show contact points + forces and make geoms transparent. An "
                              "empty view means nothing is touching -- which for a "
@@ -1518,6 +1632,20 @@ def main() -> None:
                 sys.exit("[ERROR] Pass either --clip_case or --clip_id, not both.")
             clip_id = resolve_case(clip_path, args.clip_case)
             print(f"[INFO] Clip case '{args.clip_case}' -> clip {clip_id}.")
+        # A TILE scene re-centres its tile so a chosen tile-local point sits at the world
+        # origin, while a clip's poses stay in the library's tile-local frame. Nothing
+        # reconciled the two, so a world-anchored clip spawned the robot by the whole offset
+        # -- 8.6 m downrange and 0.13 m high on tile 0, onto the far platform instead of the
+        # approach, which reads as the tracker instantly falling.
+        #
+        # ClipReference already has the mechanism: _lift_pos is `anchor_pos + p_rel`, so an
+        # anchor of MINUS the origin expresses every clip pose in scene coordinates. Nothing
+        # in ClipReference changes.
+        #
+        # Ego anchoring (--clip_ego_anchor) overrides the placement from the robot's measured
+        # pose, which is already in scene coordinates, so it self-corrects and this is a no-op
+        # for it -- it is the world-anchored default that needs the shift.
+        tile_origin = _scene_tile_local_origin(robot.mj_model)
         clip = ClipReference(clip_path, policy.get_joint_names(),
                              list(policy.ctx.target_frame_names), policy.base_frame_name,
                              clip_id=clip_id,
@@ -1525,6 +1653,10 @@ def main() -> None:
                              ego_anchor=args.clip_ego_anchor,
                              ego_anchor_every=args.clip_ego_anchor_every,
                              root_frame_bodies=policy._trk.get_root_frame_bodies())
+        if tile_origin is not None:
+            clip.set_placement(-tile_origin, np.array([0.0, 0.0, 0.0, 1.0]))
+            print("[INFO] Clip placed into the tile scene: subtracting its "
+                  f"tile-local origin {tile_origin.tolist()} m from every pose.")
         if abs(clip.dt - policy.get_dt()) > 1e-6:
             print(f"[WARN] Clip dt {clip.dt} != policy dt {policy.get_dt()}; "
                   "regenerate the clip at the control dt.")
@@ -1575,6 +1707,15 @@ def main() -> None:
             # independent -- they cannot be shared across differing pixel counts.)
             fm_depth_cams.mirror_extrinsics_from(depth_cams)
 
+    # From the CLI when given, else from the graph's own trained distribution. Derived
+    # rather than hard-coded so a checkpoint trained at a different latency brings its own
+    # number, and a pre-latency graph correctly gets none.
+    _probs = getattr(policy.ctx, "depth_latency_probs", None)
+    if args.fm_depth_lag_steps is not None:
+        fm_lag = FmDepthLag(args.fm_depth_lag_steps, "--fm_depth_lag_steps")
+    else:
+        fm_lag = FmDepthLag(default_depth_lag_steps(_probs),
+                            f"derived from fm.onnx depth_latency_probs={_probs}")
     success = run(policy, robot, command_fn, total_time, args.headless, log_path,
                   args.rt_factor, standing_config, args.viz,
                   args.vel_arrow_scale, args.vel_arrow_height,
@@ -1586,13 +1727,30 @@ def main() -> None:
                   spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride,
-                  fm_depth_cams=fm_depth_cams, replay=replay)
+                  fm_depth_cams=fm_depth_cams, replay=replay, fm_lag=fm_lag)
     # None = interrupted, which is neither survival nor a fall; saying "Survived: None"
     # would put a non-result into the same line every sweep greps for.
     if success is None:
         print("[INFO] Run INTERRUPTED by the user; artifacts below are partial.")
     else:
         print(f"[INFO] Run finished. Survived: {success}")
+    # Record the LOOP's verdict beside the log, because the metrics module cannot recover it
+    # from the CSV. The per-row ``fell`` flag is evaluated before the row is written and the
+    # loop returns on the step after, so the row where the fall happens is never written --
+    # every fall scored as `"survived": true` in the JSON while the console said False, and
+    # the JSON is what a sweep greps.
+    if log_path:
+        meta_path = os.path.join(os.path.dirname(log_path), "sim_meta.yaml")
+        try:
+            with open(meta_path) as mf:
+                _m = yaml.safe_load(mf) or {}
+            _m["survived"] = None if success is None else bool(success)
+            _m["failure_reason"] = ("" if success in (True, None)
+                                    else robot.failure_reason() or "unknown")
+            with open(meta_path, "w") as mf:
+                yaml.dump(_m, mf, default_flow_style=False, sort_keys=False)
+        except FileNotFoundError:
+            pass
 
     if replay is not None:
         # Written after the loop, so a run that fell still yields every tick it managed --

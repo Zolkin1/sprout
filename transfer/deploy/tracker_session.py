@@ -275,6 +275,26 @@ class TrackerSession:
         spec = self.params.get("depth_camera_spec")
         return list(spec) if spec else None
 
+    def get_robot_asset(self) -> dict | None:
+        """WHICH ROBOT this policy was trained on, or None for a pre-fingerprint export.
+
+        Content hashes of the URDF / MJCF / USD plus the joint names, body names and total
+        mass. Nothing else in this metadata identifies the robot: ``joint_names_isaac`` is
+        unchanged by a payload, a hand swap or a gear ratio, so before this field a
+        checkpoint trained on a different robot loaded silently. Produced by
+        ``motion_gen.robot_asset.fingerprint_robot_asset`` at export time.
+        """
+        return self.params.get("robot_asset")
+
+    def get_terrain_fingerprint(self) -> dict | None:
+        """WHICH TERRAIN this policy trained on, or None for a pre-fingerprint export.
+
+        A content hash of the clip library's ``terrain_manifest``. The library's own
+        fingerprint does not cover the terrain, so a library whose tile geometry was
+        rewritten offline -- motions untouched -- is otherwise indistinguishable.
+        """
+        return self.params.get("terrain_fingerprint")
+
     def get_valid_ic_pos(self) -> np.ndarray | None:
         """Valid initial pose [base_pos(3), base_quat(4), joint_pos(N)] or None."""
         ic = self.params.get("valid_ic_pos")

@@ -51,7 +51,15 @@ from .joint_names import (  # noqa: F401  (re-exported for callers)
 )
 
 FOOT_FRAMES: list[str] = ["left_ankle_roll_link", "right_ankle_roll_link"]
-HAND_FRAMES: list[str] = ["left_palm_link", "right_palm_link"]
+#: The hand bodies on :data:`DEFAULT_MJCF`.
+#:
+#: These were ``left_palm_link`` / ``right_palm_link``, the Dex3 palms. The perceptive robot
+#: replaces the 16 articulated finger links per side with ONE passive rubber hand, so the palm
+#: body no longer exists and ``FKChain`` refuses the name outright ("end-effector frame
+#: 'left_palm_link' not a body") rather than silently resolving something near it. Renaming
+#: here is the whole migration: nothing downstream keys on the old string, and the frames are
+#: the same physical thing -- the far end of the wrist.
+HAND_FRAMES: list[str] = ["left_rubber_hand", "right_rubber_hand"]
 
 # Default location of the FK MJCF within the repo (transfer/ ships the isaaclab-free model).
 # Anchored on the repo root derived from THIS package's location rather than a hard-coded
@@ -60,8 +68,15 @@ HAND_FRAMES: list[str] = ["left_palm_link", "right_palm_link"]
 # <repo>/source/motion_gen/motion_gen/features.py -> parents[3] == <repo>.
 _REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 DEFAULT_MJCF = str(
-    # 29-DOF FK model (waist roll/pitch + wrists)
-    _REPO_ROOT / "transfer" / "sim" / "robots" / "g1" / "g1_29j.xml"
+    # The PERCEPTIVE 29-DOF FK model: mode_11 motors, rubber hands, camera mounts, compute
+    # backpack.  It is the robot that is trained, recorded and deployed, so it has to be the
+    # one FK runs on.  ``g1_29j.xml`` is the pre-mode_11 model and differs where it matters:
+    # the waist frame offsets move ``torso_link`` up to 12 mm and the shoulder chain up to
+    # 7 mm (the legs are byte-identical).  Leaving this pointed at the old file made
+    # ``check_depth_xyz_agreement.py`` fail at 10.4 mm against a 5 mm tolerance -- offline FK
+    # placing the camera 10 mm from where the live sensor is -- which is precisely the
+    # registration error the xyz channels exist to remove.
+    _REPO_ROOT / "transfer" / "sim" / "robots" / "g1" / "g1_perceptive.xml"
 )
 
 

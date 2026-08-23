@@ -84,10 +84,20 @@ _PARENT: dict[str, str] = {
     "right_wrist_pitch_link": "right_wrist_roll_link",
     "right_wrist_yaw_link": "right_wrist_pitch_link",
     # hands -- FIXED joints onto the wrist (see HAND_LINKS)
-    **{f"{side}_hand_{part}_link": f"{side}_wrist_yaw_link"
-       for side in ("left", "right")
-       for part in ("palm", "thumb_0", "thumb_1", "thumb_2",
-                    "middle_0", "middle_1", "index_0", "index_1")},
+    **{f"{side}_rubber_hand": f"{side}_wrist_yaw_link" for side in ("left", "right")},
+    # bolted to the torso: the compute backpack's shell, and the two camera mounts.  All
+    # FIXED joints, all leaves.  Only the shell is a ray-cast target -- see BACKPACK_LINKS
+    # and the note on the cameras in SELF_SCAN_LINKS.
+    "backpack_shell_link": "torso_link",
+    "camera_lower_mount_link": "torso_link",
+    "camera_upper_mount_link": "torso_link",
+    # Bodies with no geometry of their own: the two payload masses, and the two optical
+    # frames the rays are cast FROM.  They are in the joint graph because the USD has them,
+    # and out of SELF_SCAN_LINKS because there is nothing to hit -- see UNSCANNED_LINKS.
+    "backpack_thor_link": "torso_link",
+    "backpack_zed_link": "torso_link",
+    "camera_lower_optical_link": "torso_link",
+    "camera_upper_optical_link": "torso_link",
 }
 
 LEG_LINKS: tuple[str, ...] = tuple(
@@ -103,28 +113,40 @@ ARM_LINKS: tuple[str, ...] = tuple(
                   "wrist_roll", "wrist_pitch", "wrist_yaw")
 )
 
-# The hand: eight links per side, welded to ``*_wrist_yaw_link`` by FIXED joints.  They are
-# real links in the joint graph (see ``_PARENT`` above) and therefore real rigid bodies.
+# The hand: ONE passive rubber hand per side, welded to ``*_wrist_yaw_link`` by a fixed
+# joint.  It is a real link in the joint graph (see ``_PARENT`` above) and therefore a real
+# rigid body.
 #
-# They were not always.  The stock URDF hung all eight meshes off the wrist as extra
-# ``<visual>`` elements, which the importer turned into bare Xforms carrying a NON-IDENTITY
-# mesh->body offset -- the only such meshes in the robot.  ``MultiMeshRayCaster`` does not
-# intersect meshes on that path, so the depth cameras saw every limb except the hands while
-# the renderer showed them correctly.  ``robot_assets/g1/g1_21j/make_hand_links_urdf.py``
-# promotes them to fixed-joint links, which restores an identity offset and makes them cast
-# like everything else.
-HAND_LINKS: tuple[str, ...] = tuple(
-    f"{side}_hand_{part}_link"
-    for side in ("left", "right")
-    for part in ("palm", "thumb_0", "thumb_1", "thumb_2",
-                 "middle_0", "middle_1", "index_0", "index_1")
-)
+# It has to be.  The stock URDF hung the Dex3-1's eight meshes per side off the wrist as
+# extra ``<visual>`` elements, which the importer turned into bare Xforms carrying a
+# NON-IDENTITY mesh->body offset -- the only such meshes in the robot.
+# ``MultiMeshRayCaster`` does not intersect meshes on that path, so the depth cameras saw
+# every limb except the hands while the renderer showed them correctly.  The same trap
+# applies to the rubber hand, which is why ``apply_mode11_deltas.py`` makes it a link and
+# ``merge_urdf_joints.py`` is told to ``--keep`` its palm joint rather than folding it into
+# the wrist.
+HAND_LINKS: tuple[str, ...] = tuple(f"{side}_rubber_hand" for side in ("left", "right"))
+
+# The compute backpack's shell.  A torso-mounted camera looking forward and down cannot see
+# something bolted behind the torso, so this earns its place by SYMMETRY rather than by
+# being in frame: MuJoCo casts geom group 1 unconditionally, which is every per-link visual
+# mesh, so a body present in one caster and absent from the other is a pixel-level
+# divergence waiting for a pose that does put it in view.  Cheap to include, and it removes
+# a question rather than answering it.
+BACKPACK_LINKS: tuple[str, ...] = ("backpack_shell_link",)
 
 # Links whose Xform holds the visual mesh DIRECTLY, with no inner same-named Xform.
 #
-# The converter only emits the inner wrapper for a link that has CHILD links; a leaf gets
-# one Xform doing both jobs.  Every hand link is a leaf, so their ray-cast targets are
-# undoubled -- see :func:`visual_prim_path`.
+# The converter emits the inner wrapper when a link needs its geometry split out -- because
+# it has child links, OR because it has a COLLISION as well as a visual, which is a separate
+# prim.  A link with neither gets one Xform doing both jobs, and its ray-cast target is
+# undoubled (see :func:`visual_prim_path`).
+#
+# So the hands are leaves and ``backpack_shell_link`` is NOT, despite both being childless
+# bolt-ons: the shell carries a box collider, so its geometry sits at
+# ``.../backpack_shell_link/backpack_shell_link`` beside a ``box`` Cube. Read off the
+# generated stage rather than reasoned about -- giving the shell a collider silently moved
+# it from one convention to the other.
 _LEAF_LINKS: frozenset[str] = frozenset(HAND_LINKS)
 
 # Links a torso-mounted, downward-looking camera can actually see.  The arms are in
@@ -136,7 +158,35 @@ _LEAF_LINKS: frozenset[str] = frozenset(HAND_LINKS)
 # them: with them absent here the two disagreed by ~60/780 near-camera pixels
 # (``transfer/sim/depth_camera.py``).  They are real occluders in front of a
 # downward-looking chest camera, so the agreeing answer is to cast them on both sides.
-SELF_SCAN_LINKS: tuple[str, ...] = LEG_LINKS + ARM_LINKS + HAND_LINKS
+#
+# The CAMERA MOUNTS are deliberately absent, and that is a decision rather than an omission:
+# a camera has no use for a picture of its own housing, and the two mounts are the highest
+# triangle-count meshes on the robot.  MuJoCo agrees rather than diverging:
+# ``make_g1_mjcf.NO_RAYCAST_BODIES`` moves their visual geoms to group 3, out of the {1, 2}
+# the depth cameras cast, and ``tests/test_self_scan_matches_mujoco.py`` fails if either
+# side changes alone.
+SELF_SCAN_LINKS: tuple[str, ...] = LEG_LINKS + ARM_LINKS + HAND_LINKS + BACKPACK_LINKS
+
+# Every link that is deliberately NOT a ray-cast target, with the reason it is not.
+#
+# Stated so that ``SELF_SCAN_LINKS`` and this together must account for every link in the
+# USD (``tests/test_g1_self_scan.py``). A link added to the robot then fails the build until
+# somebody classifies it, rather than defaulting to invisible -- which is the failure this
+# whole module exists to prevent, and the one the hands hit.
+UNSCANNED_LINKS: dict[str, str] = {
+    # The mount itself. A camera cannot usefully occlude its own view.
+    "waist_yaw_link": "spine, carries the cameras",
+    "waist_roll_link": "spine, carries the cameras",
+    "torso_link": "spine, carries the cameras",
+    # No geometry to intersect: payload masses and the ray origins themselves.
+    "backpack_thor_link": "mass only, no visual mesh",
+    "backpack_zed_link": "mass only, no visual mesh",
+    "camera_lower_optical_link": "frame only, this IS the ray origin",
+    "camera_upper_optical_link": "frame only, this IS the ray origin",
+    # Has geometry, deliberately not cast -- see the note on SELF_SCAN_LINKS.
+    "camera_lower_mount_link": "own housing, and the heaviest mesh on the robot",
+    "camera_upper_mount_link": "own housing, and the heaviest mesh on the robot",
+}
 
 
 def link_chain(link: str) -> tuple[str, ...]:

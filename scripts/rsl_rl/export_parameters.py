@@ -9,8 +9,57 @@ import torch
 import warp as wp
 import numpy as np
 
-from robot_rl.flow_matching.window import BASE_POSE_CONVENTION
+from motion_gen import features as _F
+from motion_gen.robot_asset import fingerprint_robot_asset
+from robot_rl.flow_matching.window import (BASE_POSE_CONVENTION,
+                                           DEFAULT_WINDOW_ANCHOR,
+                                           base_pose_convention)
 from robot_rl.tasks.manager_based.robot_rl import mdp
+
+
+def robot_asset_fingerprint_for(unwrapped_env) -> dict:
+    """Identify the robot model behind a live env, for the exported artifact.
+
+    Reads the spawned USD off the articulation cfg, the URDF beside it (the converter names
+    the USD directory after the URDF, so the sibling ``<stem>.urdf`` is the source), the FK
+    MJCF ``motion_gen`` uses, and the live joint/body names and total mass.
+
+    Every input is best-effort: a missing file contributes an empty hash and an
+    introspection that fails is simply omitted, because a fingerprint is a guard and must
+    never be the reason an export dies. What it does NOT do is silently produce an empty
+    fingerprint -- :func:`motion_gen.robot_asset.verify_robot_asset` treats "no comparable
+    field" as a mismatch.
+
+    Args:
+        unwrapped_env: The unwrapped manager-based env.
+
+    Returns:
+        The fingerprint dict (see :func:`~motion_gen.robot_asset.fingerprint_robot_asset`).
+    """
+    robot = unwrapped_env.scene["robot"]
+    usd_path = getattr(getattr(robot.cfg, "spawn", None), "usd_path", None)
+    urdf_path = None
+    if usd_path:
+        # <...>/g1_21j/<stem>/<stem>.usda  ->  <...>/g1_21j/<stem>.urdf
+        stem_dir = os.path.dirname(usd_path)
+        urdf_path = os.path.join(os.path.dirname(stem_dir), os.path.basename(stem_dir) + ".urdf")
+        if not os.path.isfile(urdf_path):
+            urdf_path = None
+
+    total_mass = None
+    try:                                        # per-body masses live on the PhysX view
+        total_mass = float(robot.root_physx_view.get_masses()[0].sum())
+    except Exception:                           # noqa: BLE001 - a guard must not break an export
+        pass
+
+    return fingerprint_robot_asset(
+        urdf_path=urdf_path,
+        mjcf_path=_F.DEFAULT_MJCF,
+        usd_path=usd_path,
+        joint_names=list(robot.data.joint_names),
+        body_names=list(robot.data.body_names),
+        total_mass_kg=total_mass,
+    )
 
 
 def convert_to_serializable(obj):
@@ -138,7 +187,10 @@ def _window_specs(unwrapped_env, obs_manager, obs_group_names, term_table):
             # policy trained under either convention loads clean against the other and
             # walks sideways. GenTrackerPolicy.load() requires this key and refuses
             # anything it does not know how to reproduce.
-            "base_pose_convention": BASE_POSE_CONVENTION,
+            # From the env cfg, not the module constant: the two window_anchor arms train
+            # concurrently and each artifact must carry its OWN convention.
+            "base_pose_convention": base_pose_convention(
+                getattr(cmd_term.cfg, "window_anchor", None) or DEFAULT_WINDOW_ANCHOR),
         }
 
     cmd_spec = None
@@ -475,6 +527,21 @@ def export_policy_parameters(env, obs, actions, save_dir, actor_obs_groups=None)
     # never reads would have the deploy cast it every step and silently discard the result
     # (which is exactly what the `-depth-image` variant's separate obs groups would do).
     params["depth_camera_spec"] = mdp.depth_camera_specs(unwrapped_env, obs_group_names) or None
+
+    # WHICH ROBOT this policy was trained on. Nothing else in the exported set says: joint
+    # names and their order are unchanged by a payload, a hand swap or a gear ratio, so
+    # `joint_names_isaac` -- the only field that came close -- matches across all of them.
+    # Without this a stale checkpoint loads cleanly against a different robot. Recorded
+    # rather than enforced here; the refusal belongs at load, in transfer/deploy.
+    params["robot_asset"] = robot_asset_fingerprint_for(unwrapped_env)
+
+    # WHICH TERRAIN it trained on. The clip library's own fingerprint does not cover the
+    # manifest, so a library whose tile geometry was rewritten offline -- motions untouched
+    # -- is indistinguishable from the original to everything downstream. Absent for tasks
+    # whose terrain is not built from a clip manifest.
+    terrain_fp = getattr(getattr(unwrapped_env.scene, "terrain", None), "terrain_fingerprint", None)
+    if terrain_fp:
+        params["terrain_fingerprint"] = terrain_fp
 
     # Convert to serializable format
     params = convert_to_serializable(params)

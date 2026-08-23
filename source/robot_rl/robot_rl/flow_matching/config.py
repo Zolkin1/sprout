@@ -8,7 +8,54 @@ import math
 from dataclasses import asdict, dataclass, field, fields
 from typing import Any
 
+from motion_gen.features import DEFAULT_MJCF
+
 from .extero_encoder import conv_grid_shape
+
+
+#: The camera-latency distribution to train the depth generator under.
+#:
+#: Index is the lag in CONTROL STEPS and the step is 20 ms (camera 50 Hz, control 50 Hz), so
+#: this is P(0 ms), P(20 ms), P(40 ms), P(60 ms). Mean 2.40 steps = **48 ms**, matching the
+#: ~50 ms Zach measured for depth compute plus the ROS hop, with the 60 ms peak represented.
+#:
+#: **Lag 0 is zero and stays zero.** A frame cannot arrive in the step it was captured in, so
+#: weight there trains the model on a case the robot never sees -- and it is the easiest case,
+#: which makes it optimistic about a signal that is always late. The recorder still stores the
+#: frame, so a no-latency ablation costs nothing.
+#:
+#: An earlier draft was 0/40/35/25 (37 ms), from a first estimate of 20-40 ms. The measurement
+#: came in nearer 50, so the mass moved off 20 ms and onto 40 and 60.
+DEPTH_LATENCY_PROBS: tuple[float, float, float, float] = (0.0, 0.10, 0.40, 0.50)
+
+
+def default_depth_lag_steps(probs) -> int:
+    """How many control steps of camera lag to SIMULATE, given the trained distribution.
+
+    Training samples a fresh lag per window; a simulator replaying one rollout wants a single
+    representative value, and the rounded mean is the one that puts the run in the middle of
+    the distribution rather than at an end. For the shipped ``(0, .10, .40, .50)`` that is
+    ``0.10*1 + 0.40*2 + 0.50*3 = 2.4 -> 2`` steps = 40 ms, against a 48 ms mean.
+
+    This is a SIM-ONLY number. Hardware's lag is physical and already in the frames, so a
+    deployment must never add it -- doing so would double-count.
+
+    Mirrored torch-free in ``transfer/deploy/fm_session.default_depth_lag_steps`` for the
+    deploy runtime, which cannot import ``robot_rl``.
+
+    Args:
+        probs: Per-lag probabilities, index = lag in control steps, or ``None``.
+
+    Returns:
+        The rounded mean lag in steps; ``0`` when ``probs`` is ``None`` or empty, which is
+        also what a checkpoint trained before the latency model gives.
+    """
+    if not probs:
+        return 0
+    total = float(sum(probs))
+    if total <= 0.0:
+        return 0
+    return int(round(sum(i * float(p) for i, p in enumerate(probs)) / total))
 
 
 #: Recognised :attr:`FlowMatchingConfig.extero_source` values.  These are also the keys
@@ -263,6 +310,35 @@ class FlowMatchingConfig:
     # that lacks the selected array fails loudly at dataset build (see dataset.py), which
     # is what a cameraless task now gets by default.
     extero_source: str = "depth"
+    # CAMERA LATENCY. Probability of each depth LAG, index = lag in control steps, so
+    # ``(0.0, 0.40, 0.35, 0.25)`` never serves a fresh frame and serves 20 / 40 / 60 ms old
+    # ones at those rates. ``None`` disables the model and always uses the frame captured at
+    # the re-plan, which is what every recording before 2026-08-21 supports.
+    #
+    # The depth pipeline is not instantaneous on the robot -- the image is computed and shipped
+    # over ROS, measured at 20-40 ms typically and peaking near 60. The camera runs at 50 Hz and
+    # so does control, so one lag step is exactly 20 ms and lags 1..3 span that range exactly.
+    #
+    # **Lag 0 gets zero weight on purpose.** A frame cannot arrive in the step it was captured
+    # in, so training on it spends capacity on a case the robot never sees -- and it is the
+    # EASIEST case, which makes the model optimistic about a signal it will always get late.
+    # It stays reachable only as a no-latency ablation, since the recorder keeps the frame.
+    #
+    # Drawn once per WINDOW at dataset build (the extero array is materialised there), seeded
+    # off ``seed``. With a full recording every lag is thoroughly represented across windows;
+    # what it does not do is show the same window at two lags. Recording all the frames and
+    # choosing here still means the distribution can change without re-recording, and a
+    # no-latency ablation is free. It models pure JITTER -- real latency also has a persistent
+    # pipeline component, which a per-episode base would capture and this does not.
+    #
+    # The lagged frame is unprojected with the pose it was CAPTURED with, and expressed in that
+    # capture-time frame. Using the re-plan pose instead would displace every pixel by the
+    # egomotion, which is the registration error the xyz channels exist to remove; re-expressing
+    # it in the re-plan FRAME would need the root displacement over the lag, and this robot has
+    # no base-velocity estimate to integrate. So the terrain arrives correctly registered to
+    # where the robot WAS, and the model compensates from its history.
+    depth_latency_probs: tuple[float, ...] | None = None
+
     # How many exteroception SENSOR readings there are, and how wide ONE of them is. Both
     # resolved from the recorded array's shape at dataset build time: 1 x 176 rays for the
     # scan, 2 x (H*W) pixels for the cameras.
@@ -756,7 +832,10 @@ class FlowMatchingConfig:
     body_pose_world_weight: float = 0.0
     body_pose_ori_scale: float = 0.25
     consistency_tau_min: float = 0.75
-    fk_model_path: str = "transfer/sim/robots/g1/g1_29j.xml"
+    # ABSOLUTE, derived from the package root -- it used to be a bare CWD-relative string,
+    # which CLAUDE.md's path rule forbids and which silently resolved to nothing whenever a
+    # training run was launched from anywhere but the repo root.
+    fk_model_path: str = DEFAULT_MJCF
     # Body frames the pose terms grade, as MJCF body names on ``fk_model_path``. ``None``
     # resolves to ``motion_gen.joint_names.G1_BODY_TRACK_FRAMES`` -- the same 13 the clip
     # library carries ``@root`` channels for and the body-mode CLF grades, so the loss and

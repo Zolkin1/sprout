@@ -28,7 +28,9 @@ import torch
 import warp as wp
 from isaaclab.utils.math import quat_apply, quat_from_angle_axis, quat_mul
 
-from robot_rl.flow_matching.window import resolve_reference_blocks, world_to_window
+from robot_rl.flow_matching.window import (DEFAULT_WINDOW_ANCHOR,
+                                            resolve_reference_blocks,
+                                            world_to_window)
 
 from .base_trajectory_cmd import BaseTrajectoryCommand
 from motion_gen.joint_names import is_root_frame, root_frame_name
@@ -207,6 +209,15 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._snap_target_pos = torch.zeros(n, 3, device=dev)    # robot root world pos at the snapshot
         self._snap_target_quat = torch.zeros(n, 4, device=dev)   # robot root world ori (xyzw)
         self._snap_target_quat[:, 3] = 1.0
+        # The PLAN ANCHOR: the robot's root pose at the last re-plan, which is the frame the
+        # generator predicts in and the frame ``window_anchor="plan"`` reports the reference
+        # against. Deliberately NOT ``_snap_target_*``, which looks identical but is written
+        # only for envs whose clip is ego-anchored (``_reanchor_active`` is masked by
+        # ``_snap_mask``, and the tracker env sets ``ego_anchor_fraction=0.0``); the plan
+        # anchor has to exist for every env regardless of how its clip is placed.
+        self._plan_anchor_pos = torch.zeros(n, 3, device=dev)
+        self._plan_anchor_quat = torch.zeros(n, 4, device=dev)
+        self._plan_anchor_quat[:, 3] = 1.0
         # Per-env ego-centric re-anchor assignment (re-rolled per reset in
         # reset_on_motion_sequence): True => this env's clip placement is
         # periodically snapped onto the robot root (receding-horizon reference).
@@ -456,6 +467,20 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         ego_period = max(int(self.cfg.ego_anchor_every), 1)
         snap_period = max(int(getattr(self.cfg, "fm_snap_every", ego_period)), 1)
         self._reanchor_active = self._snap_mask & (self.env.episode_length_buf % snap_period == 0)
+        # Latch the plan anchor for EVERY env on the snap cadence, not just the ego-anchored
+        # ones: it is the frame the observation is reported in, so it has to advance even for
+        # an env whose clip placement never moves. Idempotent within a step via the
+        # ``_last_reanchor_step`` guard above.
+        #
+        # Gated on the arm rather than run unconditionally, so that under "robot_now" this
+        # method reads NOTHING it did not read before -- that arm has to stay bit-identical
+        # for the runs already training against it.
+        if getattr(self.cfg, "window_anchor", DEFAULT_WINDOW_ANCHOR) == "plan":
+            plan_due = self.env.episode_length_buf % snap_period == 0
+            if bool(plan_due.any()):
+                ids = torch.nonzero(plan_due, as_tuple=False).squeeze(-1)
+                self._plan_anchor_pos[ids] = wp.to_torch(self.robot.data.root_pos_w)[ids]
+                self._plan_anchor_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids]
         ego_due = self._ego_mask & (self.env.episode_length_buf % ego_period == 0)
         self._reanchor_clip_ids(torch.nonzero(ego_due, as_tuple=False).squeeze(-1))
 
@@ -502,6 +527,12 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         self._snap_base_quat[env_ids] = y[:, self._base_idx["ori"]]
         self._snap_target_pos[env_ids] = spawn_pose[:, 0:3]
         self._snap_target_quat[env_ids] = spawn_pose[:, 3:7]
+        # The plan anchor starts at the spawn pose too. Note the robot is then raised by
+        # ``spawn_z_offset`` (5 mm) before the first step, so on step 0 of an episode the plan
+        # anchor is that much below the robot -- one step of exposure, and far inside the
+        # 0.03 m base_pos noise the block already carries.
+        self._plan_anchor_pos[env_ids] = spawn_pose[:, 0:3]
+        self._plan_anchor_quat[env_ids] = spawn_pose[:, 3:7]
 
     def _segment_placement(self, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """Placement ``([N, 3], [N, 4])`` for one anchor ``mask`` per env, from the stored snapshot."""
@@ -937,12 +968,31 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             ee_w = self.get_future_world_frames(self.resolve_ee_frames(None), offsets)
         else:
             ee_w = pos_w.new_zeros(pos_w.shape[:2] + (0, 13))
-        root_pos_w = wp.to_torch(self.robot.data.root_pos_w)[:, None, :]    # [N,1,3]
-        root_quat_w = wp.to_torch(self.robot.data.root_quat_w)[:, None, :]  # [N,1,4] xyzw
+        anchor_pos, anchor_quat = self.window_anchor()
+        root_pos_w = anchor_pos[:, None, :]                                 # [N,1,3]
+        root_quat_w = anchor_quat[:, None, :]                               # [N,1,4] xyzw
         return world_to_window(
             root_pos_w, root_quat_w, pos_w, quat_w, lin_w, ang_w,
             joint_pos, joint_vel, ee_w[..., 0:3], blocks=selected,
         )
+
+    def window_anchor(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """The pose the reference window's ``base_pose`` block is measured against.
+
+        ``"robot_now"`` returns the robot's measured root this step, making the block a
+        tracking ERROR. ``"plan"`` returns the robot's root as it was at the last re-plan,
+        making the block the reference's position in the plan frame -- a pure function of the
+        reference, which is what lets the deploy runtime serve the generator's output without
+        knowing where the robot is.
+
+        Returns:
+            ``([N, 3], [N, 4])`` world position and quaternion (xyzw). ``world_to_window``
+            reduces the quaternion to yaw internally, so the full rotation is safe to pass.
+        """
+        if getattr(self.cfg, "window_anchor", DEFAULT_WINDOW_ANCHOR) == "plan":
+            return self._plan_anchor_pos, self._plan_anchor_quat
+        return (wp.to_torch(self.robot.data.root_pos_w),
+                wp.to_torch(self.robot.data.root_quat_w))
 
     # ------------------------------------------------------------------
     # World-frame reference (for reset placement, obs, termination)

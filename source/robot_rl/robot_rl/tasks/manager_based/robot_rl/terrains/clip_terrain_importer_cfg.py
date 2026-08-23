@@ -12,6 +12,8 @@ from dataclasses import MISSING
 from isaaclab.terrains.terrain_importer_cfg import TerrainImporterCfg
 from isaaclab.utils import configclass
 
+from motion_gen.terrain.decorate import DEFAULT_FLAT_BUFFER
+
 
 @configclass
 class ClipTerrainImporterCfg(TerrainImporterCfg):
@@ -47,7 +49,7 @@ class ClipTerrainImporterCfg(TerrainImporterCfg):
     size_margin: float = 1.0
     """Extra flat (m) added to the terrain / transition footprints."""
 
-    flat_buffer: float = 20.0
+    flat_buffer: float = DEFAULT_FLAT_BUFFER
     """Flat-tile margin (m) on each side beyond the flat clips' bbox.
 
     20 m purely to be safe. The concern is that a small margin silently bounds the survival

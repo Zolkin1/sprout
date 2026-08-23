@@ -128,6 +128,7 @@ from robot_rl.assets.robots.g1_21j import G1_CFG
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
     _FAR,
     _NEAR,
+    ensure_decor_prim,
     _make_depth_camera,
 )
 from robot_rl.tasks.manager_based.robot_rl.g1.g1_teacher_env_cfg import (
@@ -486,11 +487,23 @@ def main() -> int:
         print(
             "[depth] NOTE: no Kit viewer (pass '--viz kit' for one); markers are disabled."
         )
+    # Every camera from ``_make_depth_camera`` casts against /World/decor, and that target
+    # must resolve to a real mesh: the caster raises on a path matching nothing, and dies on
+    # `n_meshes = 0` for a path matching a mesh-less Xform. This flat-mesh scene has no
+    # ClipTerrainImporter to build one, so it gets the unhittable placeholder.
+    ensure_decor_prim()
     sim.reset()
 
     labels = {cam: _target_labels(getattr(scene_cfg, cam)) for cam in CAMERAS}
     n_targets = len(labels[CAMERAS[0]])
-    print(f"[depth] {n_targets} ray-cast targets per camera (1 terrain + {n_targets - 1} robot)")
+    # World targets are the ones outside the robot: the ground mesh and the decoration prim.
+    # Counting them as one made the robot-link total read one too high. Taken off the cfg,
+    # because ``_target_labels`` keeps only the last path component.
+    _paths = getattr(scene_cfg, CAMERAS[0]).mesh_prim_paths
+    n_world = sum(1 for e in _paths
+                  if (e if isinstance(e, str) else e.prim_expr).startswith("/World/"))
+    print(f"[depth] {n_targets} ray-cast targets per camera "
+          f"({n_world} world + {n_targets - n_world} robot)")
 
     frame_markers = _make_camera_frame_markers()
     if frame_markers is not None:
