@@ -31,6 +31,12 @@ constexpr uint8_t kExecFsmLowLevelControl = 3;
 //: enough to see a transient while it is still on screen.
 constexpr double kTimingReportSec = 5.0;
 
+//: Upper bound on the estimator's publish rate, used only to size the pose history in samples
+//: from a duration in seconds. Generous on purpose: undersizing it would silently shorten the
+//: window the camera pose can be matched within, which is the one thing that history exists to
+//: guarantee. The G1's estimator runs at 1 kHz.
+constexpr double kMaxEstimatorHz = 2000.0;
+
 bool AllFinite(const std::vector<double>& v) {
   for (double x : v) {
     if (!std::isfinite(x)) return false;
@@ -114,6 +120,9 @@ void G1Controller::DeclareParams() {
   // generator's GPU submission. See RuntimeConfig::tracker_providers.
   this->declare_parameter<bool>("tracker_on_cpu", true);
   this->declare_parameter<int>("tracker_threads", 2);
+  // How far back the camera pose can be matched. See g1_deploy::PoseHistory.
+  this->declare_parameter<double>("depth_pose_history_sec", 0.2);
+  this->declare_parameter<bool>("depth_pose_match", true);
   this->declare_parameter<int>("fm_late_disarm_ticks", 0);
   // The kinematic model the camera poses are FK'd on. A parameter and not a constant because
   // the robot's models are on their way to being consolidated; when that lands this moves a
@@ -151,6 +160,17 @@ G1Controller::on_configure(const rclcpp_lifecycle::State& prev) {
   fm_cuda_graph_ = this->get_parameter("fm_cuda_graph").as_bool();
   tracker_on_cpu_ = this->get_parameter("tracker_on_cpu").as_bool();
   tracker_threads_ = static_cast<int>(this->get_parameter("tracker_threads").as_int());
+  pose_history_sec_ = this->get_parameter("depth_pose_history_sec").as_double();
+  depth_pose_match_ = this->get_parameter("depth_pose_match").as_bool();
+  {
+    // Sized from a duration and an upper bound on the estimator's rate, so the span this can
+    // match within is the stated one rather than whatever a hardcoded sample count happens to
+    // buy at today's rate.
+    const size_t cap = static_cast<size_t>(
+        std::max(1.0, std::ceil(pose_history_sec_ * kMaxEstimatorHz)));
+    std::lock_guard<std::mutex> lock(est_mutex_);
+    pose_hist_ = std::make_unique<g1_deploy::PoseHistory>(cap);
+  }
   fm_late_disarm_ticks_ = static_cast<int>(this->get_parameter("fm_late_disarm_ticks").as_int());
   urdf_path_ = this->get_parameter("urdf_path").as_string();
   zero_noise_ = this->get_parameter("zero_noise").as_bool();
@@ -418,6 +438,7 @@ void G1Controller::UpdateXHat(const EstimatorMsg& msg) {
   est_.stamp = msg.header.stamp;
   est_.valid = true;
   est_time_ = this->now().seconds();
+  PushPoseSample(est_);
 }
 
 void G1Controller::Arm() {
@@ -475,6 +496,16 @@ void G1Controller::Arm() {
   // Counters only; the held values survive on purpose (see ImuHold::ResetCounters).
   imu_hold_.ResetCounters();
   quat_held_ = false;
+  depth_pose_fallbacks_ = 0;
+  depth_pose_clamped_ = 0;
+  {
+    // The history is DROPPED, not kept: hw_joint_names_ is being resolved right now, and a
+    // sample from before this arm may carry a different joint set, which FK would happily
+    // permute into a plausible and wrong posture. It refills in a few hundred milliseconds,
+    // and until it does the lookups clamp and say so.
+    std::lock_guard<std::mutex> lock(est_mutex_);
+    if (pose_hist_) pose_hist_->Clear();
+  }
   armed_.store(true);
   RCLCPP_INFO(this->get_logger(), "ARMED: %zu joints, driving from the first tick",
               hw_joint_names_.size());
@@ -528,6 +559,12 @@ Vec3 G1Controller::EffectiveCommand() {
   if (vel_cmd_stale_) return Vec3(0.0, 0.0, 0.0);
   std::lock_guard<std::mutex> lock(cmd_mutex_);
   return vel_cmd_;
+}
+
+void G1Controller::PushPoseSample(const EstimatorSample& est) {
+  if (!pose_hist_ || est.q_base.size() < 7) return;
+  pose_hist_->Push(static_cast<double>(est.stamp.seconds()), est.joint_pos,
+                   QuatXyzw(est.q_base[3], est.q_base[4], est.q_base[5], est.q_base[6]));
 }
 
 bool G1Controller::BaseImu(const EstimatorSample& est, QuatXyzw* quat_out, Vec3* ang_vel_out) {
@@ -691,8 +728,16 @@ ControlMsg G1Controller::ComputeControl() {
   bad_v_base_ = !AllFinite(est.v_base);
   bad_joints_ = !AllFinite(est.joint_pos) || !AllFinite(est.joint_vel);
   bad_depth_ = false;
+  std::vector<double> depth_stamp_now;
+  std::vector<double> depth_recv_now;
   {
     std::lock_guard<std::mutex> lock(depth_mutex_);
+    // Snapshotted WITH the images, under the same lock: the pose is matched to the frame this
+    // tick actually consumed, and a frame landing between the two reads would match the pose
+    // to an image nobody used.
+    depth_stamp_now = depth_stamp_;
+    depth_recv_now = depth_time_;
+    depth_stamp_used_ = depth_stamp_;
     for (const auto& img : depth_) {
       if (img.empty()) {
         // A camera that has not published yet cannot be run blind past: the policy reads it.
@@ -707,8 +752,7 @@ ControlMsg G1Controller::ComputeControl() {
 
   if (camera_fk_) {
     // Encoders and gravity, never odometry: the yaw and the root position both cancel out of
-    // the yaw-aligned frame, so a drifting estimate cannot move the cloud. Recomputed every
-    // tick because it is a function of the posture, and cheap (one FK pass).
+    // the yaw-aligned frame, so a drifting estimate cannot move the cloud.
     //
     // policy_to_hw_ was resolved at arming, against the joint names the estimate carried THEN.
     // The runtime re-resolves its own permutation whenever the names change; this one does not,
@@ -720,15 +764,81 @@ ControlMsg G1Controller::ComputeControl() {
       PublishDebug({}, false);
       return msg;
     }
-    for (size_t i = 0; i < hw_joint_names_.size(); ++i) {
-      fk_joint_pos_[static_cast<size_t>(policy_to_hw_[i])] = est.joint_pos[i];
+
+    // The pose is matched PER CAMERA to that camera's own capture stamp, because the frame is
+    // older than this tick and the unprojection is only correct when pose and pixels are the
+    // same instant (see g1_deploy::PoseHistory). The two cameras usually resolve to the same
+    // sample, so the FK pass is done once per DISTINCT sample rather than once per camera --
+    // keyed on the sample's STAMP, not on a pointer, because the match is copied into one
+    // reused local and every camera's pointer would compare equal.
+    const size_t ncam = r.depth_raw.size();
+    r.fm_camera_pos.resize(ncam);
+    r.fm_camera_rot.resize(ncam);
+    depth_pose_stamp_.assign(ncam, -1.0);
+    g1_deploy::PoseHistory::Sample matched;
+    bool computed = false;
+    bool last_was_live = false;
+    double last_stamp = 0.0;
+    for (size_t c = 0; c < ncam; ++c) {
+      bool have_match = false;
+      if (depth_pose_match_ && c < depth_stamp_now.size()) {
+        const double stamp = depth_stamp_now[c];
+        const double recv = c < depth_recv_now.size() ? depth_recv_now[c] : -1.0;
+        // Accept the stamp only if it describes a frame captured within the history, in THIS
+        // node's clock. That single bound rejects every way the camera box's clock can be
+        // wrong: no stamp at all; a stamp in the future (skew one way, which shows up as a
+        // capture age SMALLER than the receipt age -- impossible, and already seen on the
+        // two-box split); and a stamp implausibly far in the past (skew the other way, or a
+        // clock nobody synchronised). Each falls back to the live pose, which is exactly the
+        // old behaviour, and is counted -- this failure is a plausible cloud in the wrong
+        // place, so it has to be visible rather than absorbed.
+        const double age = (recv > 0.0 && stamp > 0.0) ? recv - stamp : -1.0;
+        if (age >= 0.0 && age <= pose_history_sec_) {
+          bool clamped = false;
+          {
+            std::lock_guard<std::mutex> lock(est_mutex_);
+            const g1_deploy::PoseHistory::Sample* found =
+                pose_hist_ ? pose_hist_->Nearest(stamp, &clamped) : nullptr;
+            if (found != nullptr) {
+              // Copied out UNDER the lock: the 1 kHz callback can overwrite the entry this
+              // points at the moment the lock drops, and FK would then read a sample being
+              // rewritten underneath it.
+              matched = *found;
+              have_match = true;
+            }
+          }
+          if (clamped) ++depth_pose_clamped_;
+        }
+      }
+      if (!have_match) ++depth_pose_fallbacks_;
+
+      const bool same_as_last = computed && (have_match != last_was_live) &&
+                                (!have_match || matched.stamp == last_stamp);
+      if (!same_as_last) {
+        if (have_match) {
+          for (size_t i = 0; i < hw_joint_names_.size(); ++i) {
+            fk_joint_pos_[static_cast<size_t>(policy_to_hw_[i])] = matched.joint_pos[i];
+          }
+          const QuatXyzw& q = matched.quat;
+          camera_fk_->Compute(fk_joint_pos_, {q[0], q[1], q[2], q[3]}, &fk_cam_pos_,
+                              &fk_cam_rot_);
+        } else {
+          for (size_t i = 0; i < hw_joint_names_.size(); ++i) {
+            fk_joint_pos_[static_cast<size_t>(policy_to_hw_[i])] = est.joint_pos[i];
+          }
+          // `quat` is ALREADY xyzw (QuatXyzw is a Vector4d in that order), so this is a copy
+          // and not a re-ordering.
+          camera_fk_->Compute(fk_joint_pos_, {quat[0], quat[1], quat[2], quat[3]}, &fk_cam_pos_,
+                              &fk_cam_rot_);
+        }
+        last_was_live = !have_match;
+        last_stamp = have_match ? matched.stamp : 0.0;
+        computed = true;
+      }
+      r.fm_camera_pos[c] = fk_cam_pos_[c];
+      r.fm_camera_rot[c] = fk_cam_rot_[c];
+      if (have_match) depth_pose_stamp_[c] = matched.stamp;
     }
-    // `quat` is ALREADY xyzw (QuatXyzw is a Vector4d in that order), so this is a copy and not
-    // a re-ordering.
-    camera_fk_->Compute(fk_joint_pos_, {quat[0], quat[1], quat[2], quat[3]}, &fk_cam_pos_,
-                        &fk_cam_rot_);
-    r.fm_camera_pos = fk_cam_pos_;
-    r.fm_camera_rot = fk_cam_rot_;
   }
 
   g1_deploy::TickDiagnostics diag;
@@ -933,6 +1043,8 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
     d.quat_samples = static_cast<uint64_t>(std::max<int64_t>(imu_hold_.samples(), 0));
     d.bad_quat_samples = static_cast<uint64_t>(std::max<int64_t>(imu_hold_.bad_samples(), 0));
     d.quat_held = quat_held_;
+    d.depth_pose_fallbacks = depth_pose_fallbacks_;
+    d.depth_pose_clamped = depth_pose_clamped_;
     d.obs_checksum = have_obs ? diag.obs_checksum : 0;
     d.obs_size = have_obs && policy_ ? static_cast<uint32_t>(policy_->num_obs()) : 0;
     d.fm_cursor = diag.cursor;
@@ -951,9 +1063,13 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
       std::lock_guard<std::mutex> lock(depth_mutex_);
       d.depth_age.reserve(depth_time_.size());
       for (double t : depth_time_) d.depth_age.push_back(t >= 0.0 ? now_s - t : -1.0);
-      d.depth_capture_age.reserve(depth_stamp_.size());
-      d.depth_stamp.reserve(depth_stamp_.size());
-      for (double t : depth_stamp_) {
+      // The frames the TICK consumed when there was an observation; the live member otherwise
+      // (nothing was consumed, so the newest is the honest answer).
+      const std::vector<double>& stamps =
+          (have_obs && !depth_stamp_used_.empty()) ? depth_stamp_used_ : depth_stamp_;
+      d.depth_capture_age.reserve(stamps.size());
+      d.depth_stamp.reserve(stamps.size());
+      for (double t : stamps) {
         d.depth_capture_age.push_back(t >= 0.0 ? now_s - t : -1.0);
         builtin_interfaces::msg::Time stamp;
         if (t >= 0.0) {
@@ -961,6 +1077,15 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
           stamp.nanosec = static_cast<uint32_t>((t - static_cast<double>(stamp.sec)) * 1e9);
         }
         d.depth_stamp.push_back(stamp);
+      }
+      // Aged against the SAME now_s as depth_capture_age, from the same snapshot of frames, so
+      // the two are directly comparable -- which is the whole point of recording them. They
+      // should agree to well under a millisecond; a systematic gap means the matching is not
+      // finding the sample it should. Computing them a millisecond and a frame apart put a
+      // 30 ms tail on a difference that is really sub-millisecond.
+      d.depth_pose_age.reserve(depth_pose_stamp_.size());
+      for (double t : depth_pose_stamp_) {
+        d.depth_pose_age.push_back(t >= 0.0 ? now_s - t : -1.0);
       }
     }
     Vec3 cmd{0.0, 0.0, 0.0};

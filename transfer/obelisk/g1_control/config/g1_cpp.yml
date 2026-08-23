@@ -119,6 +119,31 @@ control:
       tracker_on_cpu: true
       tracker_threads: 2
 
+      # Match the camera pose to the depth image's CAPTURE time rather than to this tick.
+      #
+      # The generator's xyz channels unproject each image into the root's yaw-aligned frame,
+      # and that only works because pose and pixels describe one instant: a torso pitch
+      # rewrites every pixel and moves the camera by the same amount, and the unprojection
+      # composes it back out. The ZED path puts ~50 ms between capture and the frame reaching
+      # the network, so composing it out against the CURRENT pose removes the wrong rotation
+      # and static terrain swings by whatever the robot did in between -- 2.9 deg at 1 rad/s,
+      # which at 3 m of range is ~15 cm, a stair riser. Training has no latency at all.
+      #
+      # So the pose comes from a history of estimator samples, looked up at the frame's own
+      # header stamp. That REQUIRES the camera box's clock to be the brain's: a stamp that is
+      # absent, in the future, or older than the history is rejected and the live pose used
+      # instead, which is the old behaviour -- counted in the bag as depth_pose_fallbacks, and
+      # a steady stream of them means the clocks are not synchronised rather than that the
+      # feature is off. depth_pose_age (per camera) should track depth_capture_age closely.
+      #
+      # Set false to go back to the tick's own pose, which is what an A/B wants.
+      depth_pose_match: true
+      # How far back a pose can be matched. Sized by TIME, and generously: a frame delayed by
+      # a stall on the camera box must still find its sample, because the alternative is a
+      # pose from the wrong moment and no indication of it. 200 ms is 4x the expected delay
+      # and ~100 KB of history at the estimator's 1 kHz.
+      depth_pose_history_sec: 0.2
+
       # Ticks of continuous lateness before disarming. 0 = never, which is the deliberate
       # default: a late plan is survivable (the cursor keeps advancing and the far end of the
       # reference window saturates, and the timing line says so), and disarming mid-stride is

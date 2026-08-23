@@ -93,7 +93,25 @@ def fig_health(run: Run, plt):
     ax[1].plot(run.t, age([x.est_state_age for x in m]), label="est_state")
     for i in range(len(m[0].depth_age)):
         ax[1].plot(run.t, age([x.depth_age[i] for x in m]), label=f"depth[{i}]")
+    # Capture-time pose matching. Plotted as capture age (how old the pixels are) and the
+    # RESIDUAL pose_age - capture_age (how far the pose used sits from the moment they were
+    # taken). The residual is the diagnostic: flat at ~0 means the pose came from the capture
+    # instant, and anything else is the unprojection composing out a rotation the robot was not
+    # in. Drawn as a difference rather than as two overlapping curves because the two agree to
+    # a fraction of a millisecond when it works, which is invisible on a 100 ms axis.
+    if hasattr(m[0], "depth_pose_age"):
+        for i in range(len(m[0].depth_capture_age)):
+            ax[1].plot(run.t, age([x.depth_capture_age[i] for x in m]), ls="--", lw=0.8,
+                       label=f"capture[{i}]")
+            # -1 is "the live pose was used" -- matching off, or the stamp was rejected as
+            # unusable. Left as a gap: there is no residual to report, and drawing it as a
+            # number would invent one.
+            resid = [(x.depth_pose_age[i] - x.depth_capture_age[i]) * 1e3
+                     if (i < len(x.depth_pose_age) and x.depth_pose_age[i] >= 0) else np.nan
+                     for x in m]
+            ax[1].plot(run.t, resid, lw=0.9, label=f"pose - capture[{i}]")
     ax[1].set_ylabel("input age [ms]\n(gaps = never arrived)")
+    ax[1].legend(fontsize="xx-small", ncol=4)
 
     # The two networks separately: they are judged against different budgets (the tracker runs
     # inside the tick, the generator gets its whole lead window off-thread), so a single total

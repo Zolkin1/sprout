@@ -38,6 +38,7 @@
 
 #include "g1_deploy/camera_fk.h"
 #include "g1_deploy/imu_hold.h"
+#include "g1_deploy/pose_history.h"
 #include "g1_deploy/policy_runtime.h"
 
 namespace g1_control {
@@ -124,6 +125,8 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   /// unit.
   bool BaseImu(const EstimatorSample& est, g1_deploy::QuatXyzw* quat,
                g1_deploy::Vec3* ang_vel);
+  /// Append one estimator sample to the pose history. Call with `est_mutex_` held.
+  void PushPoseSample(const EstimatorSample& est);
   /// Publish, unless the command is not finite and there is no finite fallback.
   bool PublishTargets(std::vector<double>* targets, ControlMsg* msg);
   void PublishDebug(const g1_deploy::TickDiagnostics& diag, bool have_obs);
@@ -183,6 +186,31 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   g1_deploy::ImuHold imu_hold_;
   //: Whether the CURRENT tick ran on held values, for the debug tick.
   bool quat_held_ = false;
+
+  // ---- pose history, for matching the camera pose to the image's capture time -------------
+  //: Recent base poses, so the depth image can be unprojected with the pose it was CAPTURED
+  //: with rather than the one from the tick that consumes it. The ring and its lookup live in
+  //: g1_deploy::PoseHistory, where they are tested without ROS -- every failure mode there is
+  //: a plausible cloud in the wrong place, so none of it is visible in the output.
+  //:
+  //: Guarded by `est_mutex_`, which the 1 kHz estimator callback already holds.
+  std::unique_ptr<g1_deploy::PoseHistory> pose_hist_;
+  double pose_history_sec_ = 0.2;
+  bool depth_pose_match_ = true;
+  //: Frames that used the LIVE pose because their stamp was unusable (absent, in the future,
+  //: or older than the history -- all of which mean the camera box's clock is not the brain's).
+  uint64_t depth_pose_fallbacks_ = 0;
+  //: Lookups that ran off the end of the history and took its closest end instead.
+  uint64_t depth_pose_clamped_ = 0;
+  //: Per camera, the STAMP of the pose sample actually used, or <0 for the live-pose fallback.
+  //: A stamp rather than an age, so the debug tick can age it against the same instant it ages
+  //: the capture stamp -- the two are compared to each other, and computing them a millisecond
+  //: apart put a 30 ms tail on a difference that is really sub-millisecond.
+  std::vector<double> depth_pose_stamp_;
+  //: The capture stamps the TICK consumed, snapshotted with the images. The live member can
+  //: have moved on to a newer frame by the time the debug message is built, and reporting that
+  //: one would describe a frame the pose was never matched to.
+  std::vector<double> depth_stamp_used_;
   bool depth_stale_ = false;
   bool vel_cmd_stale_ = false;
   //: Set when a tick's inputs were non-finite, for DiagnoseNonFinite.

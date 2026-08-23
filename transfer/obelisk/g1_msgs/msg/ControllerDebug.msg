@@ -67,6 +67,20 @@ float64[] depth_age          # per camera, in the artifact's contract order
 # published, or published with an empty stamp.
 float64[] depth_capture_age
 builtin_interfaces/Time[] depth_stamp   # the consumed frame's own stamp, per camera
+
+# ---- camera-pose / image time matching ----------------------------------------------
+# The generator's xyz channels unproject each depth image with the camera's pose, and that
+# is only correct when the two describe the same instant. The image is tens of ms old, so
+# the pose is looked up from a history of estimator samples at the frame's capture stamp
+# rather than taken from the current tick. These say whether that actually happened.
+#
+# `depth_pose_age` is how far back the pose used for each camera was measured; it should
+# track depth_capture_age closely. -1 means the live pose was used instead, which is the
+# pre-matching behaviour and means the stamp was unusable -- absent, in the future, or
+# older than the history, all of which say the camera box's clock is not this one's.
+float64[] depth_pose_age
+uint64 depth_pose_fallbacks   # cumulative frames that fell back to the live pose
+uint64 depth_pose_clamped     # cumulative lookups that ran off the end of the history
 float64 vel_cmd_age          # <0 if no velocity command has ever arrived
 
 # ---- Command ------------------------------------------------------------------------
