@@ -104,7 +104,7 @@ optional before this runs on the robot, except where marked.
     `192.168.123.220` with a sub-millisecond offset, and cross-box `depth_capture_age` is
     never less than `depth_age`.
 
-- [x] **2b. `run_hardware_low.sh` -> this box: the brain half is DONE (untested end to end).**
+- [x] **2b. `run_hardware_low.sh` -> this box. DONE, and exercised end to end 2026-08-22.**
   `obk_jetson_zed_cmd` runs `run_node.sh pair`, `obk_jetson_stop_cmd` matches the pair's launch
   file and kills the launch tree, and the address is pinned to `zolkin@192.168.123.221`.
   - **ssh keys: done from the brain side, one command there** --
@@ -123,6 +123,9 @@ optional before this runs on the robot, except where marked.
   - `run_hardware_low.sh` now PREFLIGHTS the link before opening any pane and refuses to start
     with the cause named (no route / no pubkey / host key changed / no `zed_depth` container),
     so a missing key can no longer present as a camera problem. `--no-depth` skips it.
+  - **Verified**: a full smoke test driven from the brain brought the cameras and the pair up
+    here, over the ssh link and the wired DDS graph. That was the last path nothing had
+    exercised from end to end.
   - Also fixed on the way: nothing ever called `obk_mark_jetson`, so `stop.sh --zed` silently
     skipped the remote teardown and left the pair holding the cameras.
   - **DONE END TO END, 2026-08-22.** `run_hardware_low.sh` on the Thor preflighted the link,
@@ -165,7 +168,7 @@ optional before this runs on the robot, except where marked.
   keep the mapping above recorded so switching stays a one-line change if that calculus
   changes (e.g. if cameras start getting swapped often).
 
-- [ ] **2d. DDS across the three boxes: mostly DONE.**
+- [x] **2d. DDS across the three boxes. DONE.**
   Addresses are set and all three reachable: robot `.161`, Thor `.220`, this box `.221`,
   on `192.168.123.0/24`. The default route deliberately stays on wifi
   (`ipv4.never-default`), so the box keeps internet without the robot link claiming it.
@@ -183,7 +186,9 @@ optional before this runs on the robot, except where marked.
     does not request a big receive buffer (it receives nothing and publishes two 30x26 float
     images). Raising it to 16 MB remains worthwhile for fleet consistency, so that copying
     the obelisk config here later does not kill every ROS node at startup.
-  - `ROS_DOMAIN_ID=2` here. Still to confirm it matches the onboard graph.
+  - `ROS_DOMAIN_ID=2` here, and CONFIRMED against the onboard graph by the 2026-08-22 smoke
+    test: the brain subscribed to this box's depth topics, which a domain mismatch makes
+    impossible (it presents as silence on both sides, not an error).
 
 - [ ] **2e. (BRAIN, not this box) Merge the updated URDF before any hardware testing.**
   `CameraPoseFk` FKs the cameras from `urdf_path` plus the contract's mount body and offset,
