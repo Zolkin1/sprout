@@ -272,7 +272,7 @@ GROUND_PLANE = ('        <geom name="floor" size="0 0 0.05" type="plane" '
 
 
 def scene_xml(robot_xml: str, header: str, body_geoms: str, floor_geom: str = GROUND_PLANE,
-              model: str = "g1_terrain_scene") -> str:
+              model: str = "g1_terrain_scene", tile_local_origin: tuple = None) -> str:
     """The scene boilerplate every generated sim2sim scene shares.
 
     Mirrors ``g1_21j_basic_scene.xml`` -- visual settings, assets, ankle-site sensors, light
@@ -288,14 +288,25 @@ def scene_xml(robot_xml: str, header: str, body_geoms: str, floor_geom: str = GR
         body_geoms: Pre-formatted ``<geom .../>`` lines for the worldbody.
         floor_geom: The ground geom line; a finite tile floor replaces the infinite plane.
         model: MuJoCo model name.
+        tile_local_origin: ``(x, y, z)`` in the CLIP LIBRARY's tile-local frame that this
+            scene put at its world origin, or ``None`` for a scene with no such shift.
+            Emitted as a ``<custom><numeric>`` so a consumer can read it off the compiled
+            model instead of parsing the provenance comment -- clip playback needs it to
+            place a clip's world-frame poses in the scene, and getting it by hand means
+            being 8.6 m wrong with no error.
 
     Returns:
         The complete scene XML as a string.
     """
+    origin = ""
+    if tile_local_origin is not None:
+        origin = ('\n    <custom>\n        <numeric name="tile_local_origin" data="'
+                  + " ".join(f"{float(v):.6f}" for v in tile_local_origin)
+                  + '"/>\n    </custom>\n')
     return f"""<mujoco model="{model}">
     <!-- {header} -->
     <include file="{robot_xml}"/>
-
+{origin}
     <statistic center="1.0 0.7 1.0" extent="0.8"/>
 
     <visual>
@@ -366,7 +377,7 @@ def _parse_box(spec: str, index: int) -> Box:
 def main() -> None:
     """Parse CLI arguments and write the generated scene XML."""
     parser = argparse.ArgumentParser(description="Generate a MuJoCo G1 sim2sim staircase scene.")
-    parser.add_argument("--robot", default="g1_21j",
+    parser.add_argument("--robot", default="g1_perceptive",
                         help="Robot model to include (e.g. g1_21j, g1_21j_compute). Names the output.")
     parser.add_argument("--scene", default="terrain_scene",
                         help="Scene name; output is robots/g1/<robot>_<scene>.xml.")

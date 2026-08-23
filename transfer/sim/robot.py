@@ -17,12 +17,17 @@ class Robot:
     def __init__(self, robot_name: str, scene_name: str, joystick_scaling: np.ndarray,
                  input_function: Callable[[float], np.array] = None, use_pd: bool =False, gains: Dict[str, float]=None, rng=None):
         """Initialize the robot with its model and data."""
-        # ``g1_29j`` is the 29-DOF robot (waist roll/pitch + 6 wrists unlocked); its scenes
-        # are ``g1_29j_{basic,terrain}_scene.xml``.
-        if robot_name not in ("g1_21j", "g1_21j_M4", "g1_21j_compute", "g1_29j"):
+        # ``g1_perceptive`` is the CURRENT robot and the default everywhere: mode_11 motors,
+        # passive rubber hands, a compute backpack and two camera mounts, generated from the
+        # URDF by ``make_g1_mjcf.py``. Its scenes are ``g1_perceptive_{basic,terrain,tile*}
+        # _scene.xml``. ``g1_29j`` is the pre-mode_11 29-DOF model, kept because it is still
+        # the FK reference in some older provenance -- its SCENES are gone, so naming it here
+        # gets a missing-file error rather than a silently different robot.
+        if robot_name not in ("g1_21j", "g1_21j_M4", "g1_21j_compute", "g1_29j",
+                              "g1_perceptive"):
             raise ValueError(
                 f"Invalid robot name {robot_name!r}! Supported: g1_21j, g1_21j_M4, "
-                f"g1_21j_compute, g1_29j."
+                f"g1_21j_compute, g1_29j, g1_perceptive."
             )
 
         self.robot_name = robot_name
@@ -423,8 +428,65 @@ class Robot:
         """Step the robot simulation."""
         mujoco.mj_step(self.mj_model, self.mj_data)
 
+    #: Pelvis clearance (m) above the LOWEST ground in the scene, below which the run is a
+    #: fall. Relative, not absolute: the old ``qpos[2] < 0.2`` was a world-z test, so a tile
+    #: whose stairs descend 0.777 m reported a fall the moment the robot walked DOWN them
+    #: correctly. Tile 20 was tracking fine and scored False for going downstairs.
+    FALL_CLEARANCE_M = 0.2
+
+    #: Half-angle (deg) of the upright cone the pelvis must stay inside. Outside it the robot
+    #: is on its way over even if it is still tall -- height alone cannot see a robot that
+    #: pitches face-first off a step while its pelvis is still high above the floor below.
+    FALL_TILT_DEG = 70.0
+
+    def _lowest_ground_z(self) -> float:
+        """Top of the LOWEST terrain geom in the scene, in world z.
+
+        Terrain is geom group 2 (the depth cameras cast {1, 2}, the height scan casts {2}).
+        A plane's top is its origin; a box's is ``pos_z + size_z``. Computed once: the scenes
+        are static, and doing it per step would put a model scan in the control loop.
+
+        Returns:
+            The lowest walkable/ground height, or 0.0 if the scene declares no terrain group.
+        """
+        if getattr(self, "_ground_z_cache", None) is not None:
+            return self._ground_z_cache
+        import mujoco as _mj
+
+        tops = []
+        for g in range(int(self.mj_model.ngeom)):
+            if int(self.mj_model.geom_group[g]) != 2:
+                continue
+            gt = int(self.mj_model.geom_type[g])
+            z = float(self.mj_model.geom_pos[g][2])
+            if gt == _mj.mjtGeom.mjGEOM_BOX:
+                z += float(self.mj_model.geom_size[g][2])
+            tops.append(z)
+        self._ground_z_cache = min(tops) if tops else 0.0
+        return self._ground_z_cache
+
+    def failure_reason(self) -> str:
+        """Why the run is over, or ``""`` while it is still going.
+
+        Two independent triggers -- see :data:`FALL_CLEARANCE_M` and :data:`FALL_TILT_DEG`.
+
+        Returns:
+            ``"height"``, ``"tilt"``, or ``""``.
+        """
+        import math
+
+        if float(self.mj_data.qpos[2]) < self._lowest_ground_z() + self.FALL_CLEARANCE_M:
+            return "height"
+        # qpos[3:7] is wxyz. The body z-axis's world z IS R[2][2] = 1 - 2(x^2 + y^2), so the
+        # angle from vertical needs no matrix: roll and pitch together, yaw correctly ignored.
+        w, x, y, z = (float(v) for v in self.mj_data.qpos[3:7])
+        if (1.0 - 2.0 * (x * x + y * y)) < math.cos(math.radians(self.FALL_TILT_DEG)):
+            return "tilt"
+        return ""
+
     def failed(self):
-        return self.mj_data.qpos[2] < 0.2
+        """True once the robot has fallen: too low over its own terrain, or tipped over."""
+        return self.failure_reason() != ""
 
     def get_joint_names(self) -> list[str]:
         """Extract joint names from qpos in MuJoCo order.

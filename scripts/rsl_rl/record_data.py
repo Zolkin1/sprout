@@ -671,6 +671,25 @@ def _assemble_ref_state(ref_cmd, ref_base_frame: str, state_frames, n_envs) -> t
     return ref_state
 
 
+#: How many control steps of camera latency the recorder keeps frames for.
+#:
+#: The depth pipeline is not instantaneous on hardware: the image has to be computed and
+#: shipped over ROS, which Zach measures at 20-40 ms typically and up to 60 ms. The camera runs
+#: at ``_DEPTH_FPS = 50`` and the control step is ``decimation 4 * sim.dt 0.005`` = 50 Hz, so
+#: ONE lag step is exactly 20 ms and lags 1..3 cover that range with nothing left over.
+#:
+#: The recorder stores all of lags 0..3 and lets TRAINING pick: a fresh draw every epoch, a
+#: distribution that can change without re-recording, and a free no-latency ablation on the
+#: same data. Lag 0 is kept for that ablation only -- it is physically unreachable on the
+#: robot, since a frame cannot arrive in the step it was captured in, so the shipped
+#: distribution gives it zero weight (see ``FlowMatchingConfig.depth_latency_probs``).
+#:
+#: Costs 4x the depth array: it is recorded as ONE channel (``[N, T, H*W]``, 2 x 780 = 1560
+#: floats/window; the xyz and validity channels are derived at dataset build), so a
+#: 200k-window recording goes from about 1.25 GB to 5 GB.
+DEPTH_LAG_STEPS: int = 3
+
+
 def _future_fits_fn(ref_cmd, max_offset: int):
     """Per-env predicate: is the whole F-node future window inside the clip's REAL frames?
 
@@ -1039,6 +1058,9 @@ def collect_windows(
     # history rows belong to. Per-step also makes a window that straddles a re-plan correct by
     # construction instead of by argument.
     hist_anchor: torch.Tensor | None = None
+    # Newest LAST, so index -(k+1) is the frame k control steps ago.
+    lag_frames: list[torch.Tensor] = []
+    lag_states: list[torch.Tensor] = []
     valid = torch.zeros(n_envs, dtype=torch.long, device=device)
     # Distinct episode ids per env so the FM's by-episode train/val split has no leakage.
     episode_id = torch.arange(n_envs, dtype=torch.int64, device=device)
@@ -1061,6 +1083,21 @@ def collect_windows(
 
         # Pre-step snapshot (aligned with obs), matching collect_pairs' snap timing.
         state_t = _assemble_state(robot, state_frames, frame_body_idx, n_envs)  # [N, node]
+        if has_depth:
+            # Rolling window of the last DEPTH_LAG_STEPS+1 frames AND the state each was
+            # captured with. The state is what makes a lagged frame usable: the xyz channels
+            # are unprojected at dataset build from the camera pose, and that pose comes from
+            # the root quaternion and joint angles. Unproject a 40 ms-old image with the
+            # pose at the re-plan and every pixel is displaced by the egomotion -- which is
+            # exactly the registration error the xyz channels were added to remove. There is
+            # no base-velocity estimate on this robot, so a lagged frame is expressed in the
+            # frame it was CAPTURED in and the residual is accepted.
+            dep_now = mdp.depth_obs_stack(
+                env.unwrapped, mdp.fm_depth_groups(env.unwrapped))           # [N, T, H*W]
+            lag_frames.append(dep_now.clone())
+            lag_states.append(state_t.clone())
+            del lag_frames[:-(DEPTH_LAG_STEPS + 1)]
+            del lag_states[:-(DEPTH_LAG_STEPS + 1)]
         # The reference the policy was tracking when it chose this step's action. ``y_des``
         # was last written during the PREVIOUS env.step, so a pre-step read gives the
         # reference applied at step t-1 -- which is exactly the convention the runtime
@@ -1152,9 +1189,21 @@ def collect_windows(
                 scan = mdp.scan_obs_stack(env.unwrapped, scan_sensor)[:, 0]  # [N, K]
                 batch["height_scan"] = scan[idx].detach().cpu().numpy()
             if has_depth:
-                dep = mdp.depth_obs_stack(
-                    env.unwrapped, mdp.fm_depth_groups(env.unwrapped))      # [N, T, H*W]
+                # ``depth`` stays the CURRENT frame, unchanged, so every existing reader and
+                # every no-latency run keeps working untouched.
+                dep = lag_frames[-1]                                        # [N, T, H*W]
                 batch["depth"] = dep[idx].detach().cpu().numpy()
+                # ``depth_lag``/``depth_lag_state`` are lags 0..DEPTH_LAG_STEPS, newest first,
+                # so index k IS a lag of k steps. Early in an episode the buffer is short; the
+                # oldest available frame is repeated rather than zero-filled, because a zero
+                # depth row is a VALID reading (a surface at the near plane) and would train
+                # the model on a wall that is not there.
+                lag_d = [lag_frames[-1 - min(k, len(lag_frames) - 1)]
+                         for k in range(DEPTH_LAG_STEPS + 1)]
+                lag_s = [lag_states[-1 - min(k, len(lag_states) - 1)]
+                         for k in range(DEPTH_LAG_STEPS + 1)]
+                batch["depth_lag"] = torch.stack(lag_d, 1)[idx].detach().cpu().numpy()
+                batch["depth_lag_state"] = torch.stack(lag_s, 1)[idx].detach().cpu().numpy()
             written += writer.write_batch(batch)
             if written >= num_windows:
                 break
@@ -1522,6 +1571,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             with RecordedWindowWriter(
                 out_path, num_records, H, node_dim, rf_len, K, cmd_dim, meta,
                 depth_shape=depth_shape,
+                depth_lag_steps=(DEPTH_LAG_STEPS if depth_shape is not None
+                                 else 0),
                 # Always tag, even for a library with no distractor family (then all-zero): the
                 # tag's PRESENCE is what lets `train.py --skip_distractors` distinguish "none to
                 # drop" from "this recording predates the tag" and refuse the latter.

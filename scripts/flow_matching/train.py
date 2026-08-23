@@ -43,6 +43,7 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 
 from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
+    DEPTH_LATENCY_PROBS,
     FlowMatchingConfig,
     ATTENTION_MODES,
     EXTERO_ENCODERS,
@@ -282,6 +283,17 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "because the generator has its own scanner, so the teacher's clip=(-1,1) obs "
              "terms and the critic's input distribution are untouched. The dataset PRINTS the "
              "saturation and miss fractions it measured, so pick this from a run's own log.")
+    parser.add_argument(
+        "--depth_latency_probs", type=str, default=None,
+        help="Camera-latency distribution: comma-separated probabilities, index = lag in "
+             "CONTROL STEPS, so '0,0.10,0.40,0.50' is P(0 ms), P(20 ms), P(40 ms), P(60 ms) "
+             "-- the camera and control both run at 50 Hz, so a step is exactly 20 ms. "
+             "'shipped' uses DEPTH_LATENCY_PROBS (that same tuple, mean 48 ms, matching the "
+             "measured depth-compute-plus-ROS lag). Omit for NO latency: the frame captured "
+             "at the re-plan, which is what every recording before 2026-08-21 supports. "
+             "Needs a recording that carries 'depth_lag'; it raises rather than silently "
+             "falling back. Keep lag 0 at zero -- a frame cannot arrive in the step it was "
+             "captured in, and it is the easiest case.")
     # --noise_height_scan / --noise_depth are GONE: there is no train-time exteroception noise
     # any more. The sensor model belongs to the RL env, whose DR is already in the recording.
     parser.add_argument(
@@ -499,6 +511,10 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     # with an argparse default.
     if args.extero_clip is not None:
         cfg.extero_clip = float(args.extero_clip)
+    if args.depth_latency_probs is not None:
+        cfg.depth_latency_probs = (
+            DEPTH_LATENCY_PROBS if args.depth_latency_probs == "shipped"
+            else tuple(float(x) for x in args.depth_latency_probs.split(",") if x.strip()))
     return cfg, args
 
 
