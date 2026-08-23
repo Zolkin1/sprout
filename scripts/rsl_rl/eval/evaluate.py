@@ -58,6 +58,12 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 #: 25 for the DR cells because robots-per-clip resolves only the within-clip term, which is
 #: already small against tile-to-tile spread -- doubling it measured as buying nothing, while
 #: adding tiles pays.
+#: ``fm_tf`` mirrors ``fm`` exactly.  It is a KEY here rather than a fallback because the
+#: lookup is ``robots[f"{mode}/{preset}"]`` with a default of 25: a missing key does not
+#: fail, it silently gives the teacher-forced arm a different R from the closed-loop arm it
+#: exists to be compared against.  Measured in a ``--quick`` smoke run before this line
+#: existed: ``fm/none`` R=8 against ``fm_tf/none`` R=25, because ``--quick`` caps the keys it
+#: can see and could not see that one.
 DEFAULT_ROBOTS = {
     "clip/none": 25,
     "clip/train": 25,
@@ -65,6 +71,9 @@ DEFAULT_ROBOTS = {
     "fm/none": 25,
     "fm/train": 25,
     "fm/ood": 25,
+    "fm_tf/none": 25,
+    "fm_tf/train": 25,
+    "fm_tf/ood": 25,
 }
 
 #: Tasks the harness defaults to.  The tracker task is used for BOTH arms so that "success"
@@ -75,6 +84,27 @@ DEFAULT_TASK = "G1-tracker-clf-fm-terrain-depth-play"
 #: ``max(REFERENCE_OFFSETS)``.  Read off the env config in the cell stage; this is the plan
 #: stage's Isaac-free default, checked against the live value later.
 DEFAULT_MAX_OFFSET = 50
+
+#: What can drive the tracker's reference.  A cell DIMENSION rather than a CLI flag, and
+#: deliberately so: a mode travels in ``plan.json``, lands in the cell key, is covered by
+#: ``plan_hash``, and is looked up by the cell stage from the plan.  A flag would have to be
+#: forwarded across the grid -> cell subprocess boundary, which is exactly where ``num_envs``
+#: is silently dropped today (``stage_grid`` forwards the GRID invocation's value, so a flag
+#: not retyped there reverts to its argparse default with no warning).
+#:
+#: * ``clip``   -- the recorded clip drives the tracker; the generator is not loaded at all.
+#: * ``fm``     -- the generator drives it, conditioned on its OWN last N served nodes.
+#:                 The real closed loop, and the only deployable one.
+#: * ``fm_tf``  -- the generator drives it, but its history comes from the CLIP
+#:                 (``history_from='clip'``): teacher forcing.  It still predicts the future
+#:                 and the tracker still follows, but the context is always correct.  Pairs
+#:                 with ``fm`` on clip id, and the DIFFERENCE between them is the exposure
+#:                 bias -- the measurement that says whether to attack the loop or the model.
+#:                 Not deployable: there is no clip on the robot.
+REFERENCE_MODES = ("clip", "fm", "fm_tf")
+
+#: Modes that need a generator loaded.
+FM_MODES = ("fm", "fm_tf")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -124,8 +154,16 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--experiment_name", default="g1")
     g.add_argument("--fm_checkpoint", action="append", default=[],
                    help="LABEL=PATH (repeatable); a bare PATH labels itself from its run dir")
-    g.add_argument("--reference_modes", default="clip,fm")
-    g.add_argument("--dr_presets", default="none,train,ood")
+    g.add_argument("--reference_modes", default="clip,fm",
+                   help=f"comma list from {','.join(REFERENCE_MODES)}. 'fm_tf' is the "
+                        "generator TEACHER-FORCED (history from the clip); see "
+                        "REFERENCE_MODES for why it is a mode and not a flag")
+    g.add_argument("--dr_presets", default="none,train",
+                   help="comma list from none,train,ood. 'ood' is NOT a default: it is "
+                        "measured to move this generator less than the interval it is "
+                        "quoted with (fm/none 0.495 -> fm/train 0.468), so it costs a "
+                        "third of the grid to re-confirm that DR is not the limit. Ask "
+                        "for it when robustness is the question.")
     g.add_argument("--robots_per_clip", default="",
                    help="comma list of KEY=N, e.g. 'clip/train=50,fm/ood=10'; keys not "
                         "given fall back to the built-in defaults")
@@ -460,15 +498,23 @@ def _cell_list(args, contracts: dict[str, dict], robots: dict[str, int]) -> list
     """
     modes = [m.strip() for m in args.reference_modes.split(",") if m.strip()]
     presets = [d.strip() for d in args.dr_presets.split(",") if d.strip()]
-    if "fm" in modes and not contracts:
+    unknown = [m for m in modes if m not in REFERENCE_MODES]
+    if unknown:
+        # Refused rather than ignored: an unknown mode reaches _apply_env_overrides, fails
+        # every `== "clip"` test, and would run as a plain closed-loop FM cell under a name
+        # claiming otherwise -- a wrong number wearing the right label.
         raise SystemExit(
-            "reference_modes includes 'fm' but no --fm_checkpoint was given. Pass at least "
-            "one generator, or use --reference_modes clip."
+            f"unknown reference_mode(s) {unknown}; choose from {list(REFERENCE_MODES)}")
+    if any(m in FM_MODES for m in modes) and not contracts:
+        raise SystemExit(
+            f"reference_modes includes {[m for m in modes if m in FM_MODES]} but no "
+            "--fm_checkpoint was given. Pass at least one generator, or use "
+            "--reference_modes clip."
         )
     cells: list[dict] = []
     for preset in presets:
         for mode in modes:
-            labels = list(contracts) if mode == "fm" else ["-"]
+            labels = list(contracts) if mode in FM_MODES else ["-"]
             for label in labels:
                 key = schema.cell_key(mode, preset, label)
                 r = robots.get(f"{mode}/{preset}", robots.get(mode, 25))

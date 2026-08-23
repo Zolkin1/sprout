@@ -284,10 +284,66 @@ class EpisodeAccumulator:
             self.contact_steps += contact.sum(dim=-1) * mf
 
     def _tilt(self, d) -> torch.Tensor:
-        """Angle between the robot's up-axis and world up, in radians."""
-        grav = d.projected_gravity_b
-        cos = (-grav[:, 2]).clamp(-1.0, 1.0)
+        """Angle between the robot's up-axis and world up, in radians.
+
+        Derived from ``root_quat_w`` rather than ``projected_gravity_b``, and that is a
+        CORRECTNESS fix, not a preference.  ``_reset_idx`` writes the new root state to sim,
+        which refreshes the pose buffers, but ``projected_gravity_b`` lagged one step -- so
+        the first fold of a new episode read the PREVIOUS episode's orientation.  Height,
+        read straight off ``root_pos_w``, was always fresh, which is why the corruption
+        appeared only in the tilt channel.
+
+        Measured on the runs that found it (fm__none__lag48 / clip__none__-): episodes flagged
+        as fallen that never fired the ``base_fallen`` termination were 635 and 64
+        respectively, of which 98.7% and 100% had ``first_fall_step == 1``, ALL tripping on
+        tilt and NONE on height, at a normal median height of 0.685 m and a median 333 steps
+        survived.  The leak was a fixed fraction of the PRECEDING episode's fall rate --
+        0.0962/0.513 = 0.188 for the generator arm against 0.0097/0.0533 = 0.182 for the clip
+        arm -- which is what identified it as carry-over rather than a physical transient.
+
+        The two agree to floating-point on any settled step; only the step after a reset
+        differed.  ``cos(tilt)`` is the world-z component of the body's up-axis, which for a
+        ``(w, x, y, z)`` quaternion is ``1 - 2 (x^2 + y^2)``.
+
+        Args:
+            d: The converting view over ``robot.data``.
+
+        Returns:
+            ``[num_envs]`` tilt angle in radians.
+        """
+        q = d.root_quat_w
+        cos = (1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])).clamp(-1.0, 1.0)
         return torch.acos(cos)
+
+    def _tilt_terminal(self, d) -> torch.Tensor:
+        """Tilt for the TERMINAL fold, where the two buffers disagree on purpose.
+
+        :meth:`fold_terminal` runs inside the clip-reset hook, and by then the buffers have
+        come apart: ``scene.reset`` has already written the new spawn pose into
+        ``root_pos_w`` / ``root_quat_w``, while ``projected_gravity_b`` still holds the
+        orientation the episode ENDED at.  So at this one call site the lagging buffer is the
+        correct one, and the fresh buffer describes an episode that has not started.
+
+        Taking the MAXIMUM of the two is what makes this robust to the ordering rather than
+        dependent on it: whichever buffer holds the terminal pose, a fall is beyond the
+        threshold in that one, and the other reads an upright spawn that cannot mask it.  If
+        IsaacLab ever refreshes both before the hook, this degrades to the fresh value and
+        :meth:`EvalResetHook._check_terminal_state` reports ``post_reset`` rather than
+        silently under-counting.
+
+        The asymmetry with :meth:`_tilt` is the whole fix: per-step folds must use ONLY the
+        fresh buffer, or the first fold of a new episode inherits the previous episode's
+        orientation.
+
+        Args:
+            d: The converting view over ``robot.data``.
+
+        Returns:
+            ``[num_envs]`` tilt angle in radians.
+        """
+        grav = d.projected_gravity_b
+        from_grav = torch.acos((-grav[:, 2]).clamp(-1.0, 1.0))
+        return torch.maximum(self._tilt(d), from_grav)
 
     def _processed_action(self) -> torch.Tensor | None:
         """The action actually sent to the PD targets (``data_logger``'s accessor)."""
@@ -331,7 +387,9 @@ class EpisodeAccumulator:
         d = self.rd
         ids = env_ids.to(self.device)
         height = d.root_pos_w[:, 2][ids]
-        tilt = self._tilt(d)[ids]
+        # The TERMINAL variant: inside the reset hook the pose buffers already describe the
+        # new spawn while projected_gravity_b still holds the ending orientation.
+        tilt = self._tilt_terminal(d)[ids]
         self.min_h[ids] = torch.minimum(self.min_h[ids], height)
         self.max_tilt[ids] = torch.maximum(self.max_tilt[ids], tilt)
         crossed = (self.first_fall[ids] < 0) & (

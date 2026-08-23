@@ -472,15 +472,25 @@ CONFIGS: dict[str, Config] = {
                  "verified byte-identical at ego_anchor_fraction 0.0 and 1.0.",
     ),
     "teacher_forced": Config(
-        # BROKEN for a PLAN-FRAME generator, and not by anything this config can fix.
-        # FmTrackingCommand._clip_history_node builds its row via reference_window_obs, which
-        # anchors on the MEASURED ROBOT AT THAT STEP. Its docstring still claims that is
-        # "byte-for-byte the row the DATASET builds a history from" -- true until 3b3af11, which
-        # moved the recorder to substitute the PLAN anchor into history rows 0..H-2. So this cell
-        # now feeds per-step-anchored history to a generator trained on plan-anchored history,
-        # while closed_loop (which pushes _prev_served_node raw, already in its plan's frame) is
-        # correct. Measured consequence: teacher_forced 158/200 BELOW closed_loop 176/200 -- not
-        # a ceiling at all. Fix belongs in _clip_history_node, not here.
+        # ANOMALOUS, cause OPEN. This cell is supposed to be a CEILING -- the context is always
+        # correct -- and it measures ~20 envs BELOW closed_loop instead. Do not quote a
+        # teacher-forced-vs-closed-loop gap for a plan-frame generator without re-checking this.
+        #
+        # The frame explanation was tried and DISPROVEN, so do not re-diagnose it: 3b3af11 moved
+        # the recorder to substitute the PLAN anchor into history rows 0..H-2, while
+        # _clip_history_node still anchored on the measured robot at that step. cc605194f
+        # re-expressed it onto the plan anchor (the exact inverse of _reanchor_to_now, a no-op at
+        # K=1). Measured across both fixes: 163 (stale cadence) -> 158 (cadence) -> 156 (frame),
+        # against closed_loop 176/200 throughout. closed_loop reproduces bit-identically at a
+        # fixed seed, so the ~20 envs are not run-to-run spread.
+        #
+        # A hypothesis nobody has tested: teacher forcing in CLOSED-LOOP CONTROL is not the
+        # sequence-modelling kind. The history says "you were following the clip" while the robot
+        # actually followed the generator and has drifted, so the history contradicts the
+        # exteroception and proprioception the model sees alongside it -- a conflict the closed
+        # loop never presents. ego_anchor_fraction=1.0 below shrinks that mismatch but does not
+        # remove it. If that is the cause, this cell is not a ceiling by construction and the
+        # whole clip-good/generator-bad decision table needs restating.
         #
         # The ego_anchor_every="1" pin was also removed (same staleness as clip_control below:
         # match the TEACHER's cadence, do not hardcode). That is correct on principle but was

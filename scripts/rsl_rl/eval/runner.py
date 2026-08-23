@@ -371,6 +371,60 @@ class EvalResetHook:
         return {k: rows[k] for k in schema.EPISODE_COLUMN_NAMES}
 
 
+def reference_overrides(mode: str) -> dict:
+    """The command-term fields that DEFINE a reference mode.
+
+    Pure, so the mapping can be tested without a simulator -- and named, so "what makes an
+    ``fm_tf`` cell different from an ``fm`` cell" has exactly one answer in the codebase
+    instead of being spread across conditionals.
+
+    Every field is stated for every mode rather than left alone where it "should already be
+    right".  These are cfg fields with task-level defaults: a task shipping
+    ``history_from='clip'`` would otherwise turn every ``fm`` cell into a teacher-forced one
+    while the cell key still said ``fm``, which is a wrong number wearing the right label.
+
+    ``ego_anchor_fraction`` is the exception and is ``None`` (leave alone) for ``fm``:
+
+    * ``clip`` -- 1.0.  Only meaningful on the FM TRACKER task, which defaults it to 0:
+      clip tracking is off-distribution there unless the reference is ego-anchored.  A
+      teacher task already carries what it trained with, and overriding that would evaluate
+      it under anchoring it never saw.
+    * ``fm_tf`` -- 1.0, for the SAME reason, and this one is easy to miss.  Under teacher
+      forcing the history rows are the CLIP's nodes, and the FM trained on ego-anchored
+      history where node 0's base offset is centimetres.  At 0.0 the clip drifts off the
+      robot and the "correct" context is itself off-distribution -- handicapping the very
+      arm meant to show what the model can do.  ``fm_survival_sweep.py`` records the measured
+      cost of getting this wrong: 18/24 instead of 22/24.
+    * ``fm`` -- ``None``.  The generator's plan is the reference; the clip placement does not
+      feed it, so the task's deploy default (0.0) is what should run.
+
+    The CADENCE (``ego_anchor_every``) is never pinned here -- pinning it to 1 is what made
+    base-position error identically zero in earlier sweeps.
+
+    Args:
+        mode: One of ``evaluate.REFERENCE_MODES``.
+
+    Returns:
+        Field name -> value, where ``None`` means "leave the task's value alone".
+
+    Raises:
+        ValueError: On an unknown mode, rather than silently returning the ``fm`` mapping.
+    """
+    if mode == "clip":
+        # The generator is not loaded at all, so history_from is inert -- stated anyway so
+        # the recorded cell manifest says what ran.
+        return {"reference_source": "clip", "history_from": "generator",
+                "ego_anchor_fraction": 1.0}
+    if mode == "fm":
+        return {"reference_source": "fm", "history_from": "generator",
+                "ego_anchor_fraction": None}
+    if mode == "fm_tf":
+        # Same generator, same reference SOURCE -- only the autoregressive context differs.
+        return {"reference_source": "fm", "history_from": "clip",
+                "ego_anchor_fraction": 1.0}
+    raise ValueError(f"unknown reference mode {mode!r}")
+
+
 def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) -> dict:
     """Everything the cell needs set on the config, before ``gym.make``.
 
@@ -396,19 +450,13 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
 
     # --- the reference the policy tracks --------------------------------------------------
     traj = env_cfg.commands.traj_ref
-    if hasattr(traj, "reference_source"):
-        traj.reference_source = cell["reference_mode"]
+    for field, value in reference_overrides(cell["reference_mode"]).items():
+        if value is not None and hasattr(traj, field):
+            setattr(traj, field, value)
     if cell["fm_checkpoint"] and hasattr(traj, "fm_checkpoint"):
         traj.fm_checkpoint = cell["fm_checkpoint"]
     elif hasattr(traj, "fm_checkpoint"):
         traj.fm_checkpoint = ""
-    if cell["reference_mode"] == "clip" and hasattr(traj, "reference_source"):
-        # Only on the FM TRACKER task, which defaults the fraction to 0: clip tracking is
-        # off-distribution there unless the reference is ego-anchored. A teacher task already
-        # carries whatever it trained with, and overriding that would silently evaluate it
-        # under anchoring it never saw. The CADENCE is left alone either way -- pinning it to
-        # 1 is what made base-position error identically zero in earlier sweeps.
-        traj.ego_anchor_fraction = 1.0
     # Adopt the checkpoint's OBSERVATION CONVENTION, not the task's default.
     #
     # ``window_anchor`` decides the frame the reference window's base_pose block is expressed
@@ -426,6 +474,9 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
     notes["window_anchor"] = getattr(traj, "window_anchor", None)
     notes["trained_window_anchor"] = want_anchor
     notes["reference_source"] = getattr(traj, "reference_source", None)
+    # Recorded because ``reference_source`` alone cannot distinguish fm from fm_tf: both run
+    # the generator, and the whole point of the pair is the difference between them.
+    notes["history_from"] = getattr(traj, "history_from", None)
     notes["ego_anchor_fraction"] = getattr(traj, "ego_anchor_fraction", None)
     notes["ego_anchor_every"] = getattr(traj, "ego_anchor_every", None)
     notes["tracking_mode"] = getattr(traj, "tracking_mode", None)

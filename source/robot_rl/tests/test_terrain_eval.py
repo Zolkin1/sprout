@@ -1149,5 +1149,163 @@ def test_fell_is_documented_as_a_superset_of_base_fallen():
         "...while neither axis exceeds the per-axis limit"
 
 
+# ---------------------------------------------------------------------------
+# Teacher forcing as a reference MODE (fm_tf).
+#
+# The pair (fm, fm_tf) is the measurement that says whether to attack the closed loop or
+# the model, so the thing that must not break is the DIFFERENCE between them: same
+# generator, same reference source, different history -- and the anchoring that makes the
+# teacher-forced context in-distribution.
+# ---------------------------------------------------------------------------
+import runner as rn  # noqa: E402
+
+
+class _Args:
+    """Just the fields ``_cell_list`` reads."""
+
+    def __init__(self, modes, presets="train"):
+        self.reference_modes = modes
+        self.dr_presets = presets
+        self.task = "T"
+        self.clip_task = ""
+
+
+def _contracts(*labels):
+    return {l: {"path": f"/ckpt/{l}.pt"} for l in labels}
+
+
+def test_fm_tf_is_a_cell_dimension_not_a_flag():
+    """It has to ride in plan.json, or the grid drops it at the subprocess boundary.
+
+    ``stage_grid`` forwards the GRID invocation's argparse values to each cell, so a flag
+    that is not retyped there silently reverts to its default -- which is exactly how a
+    1024-env run was recorded in the manifest while 256 envs actually ran. A MODE cannot
+    fail that way: it is looked up from the plan by cell key.
+    """
+    cells = ev._cell_list(_Args("clip,fm,fm_tf"), _contracts("g"), {})
+    keys = sorted(c["key"] for c in cells)
+    assert keys == ["clip__train__-", "fm__train__g", "fm_tf__train__g"]
+    # The mode is carried IN the cell, so the cell stage needs no extra argument.
+    tf = next(c for c in cells if c["reference_mode"] == "fm_tf")
+    assert tf["fm_checkpoint"] == "/ckpt/g.pt", "fm_tf needs the generator, like fm"
+
+
+def test_fm_tf_pairs_one_to_one_with_fm_across_generators():
+    """Both arms must expand over the same generator labels, or nothing pairs."""
+    cells = ev._cell_list(_Args("fm,fm_tf"), _contracts("a", "b"), {})
+    by_mode = {}
+    for c in cells:
+        by_mode.setdefault(c["reference_mode"], []).append(c["fm_label"])
+    assert sorted(by_mode["fm"]) == sorted(by_mode["fm_tf"]) == ["a", "b"]
+
+
+def test_fm_tf_without_a_generator_is_refused():
+    """There is nothing to teacher-force without a checkpoint."""
+    with pytest.raises(SystemExit, match="fm_tf"):
+        ev._cell_list(_Args("fm_tf"), {}, {})
+
+
+def test_an_unknown_reference_mode_is_refused_not_ignored():
+    """A typo must not run as a plain FM cell under a name claiming otherwise."""
+    with pytest.raises(SystemExit, match="unknown reference_mode"):
+        ev._cell_list(_Args("clip,fm_teacher"), _contracts("g"), {})
+
+
+def test_teacher_forcing_differs_from_the_closed_loop_in_exactly_one_field():
+    """Same generator, same reference source -- only the history moves.
+
+    If ``reference_source`` also differed, ``fm_tf`` would not be measuring the same
+    generator and the difference would not be the exposure bias.
+    """
+    fm, tf = rn.reference_overrides("fm"), rn.reference_overrides("fm_tf")
+    assert fm["reference_source"] == tf["reference_source"] == "fm"
+    assert fm["history_from"] == "generator"
+    assert tf["history_from"] == "clip"
+
+
+def test_teacher_forcing_ego_anchors_the_clip_it_reads_history_from():
+    """The 18/24-vs-22/24 trap: unanchored, the "correct" context is off-distribution.
+
+    The FM trained on ego-anchored history where node 0's base offset is centimetres. At a
+    fraction of 0.0 the clip drifts off the robot, so the arm meant to show what the model
+    can do gets quietly handicapped -- biasing the comparison toward "the model is weak".
+    """
+    assert rn.reference_overrides("fm_tf")["ego_anchor_fraction"] == 1.0
+    assert rn.reference_overrides("clip")["ego_anchor_fraction"] == 1.0
+    # The closed loop is left at the task's deploy default: its reference is the plan, and
+    # the clip placement does not feed it.
+    assert rn.reference_overrides("fm")["ego_anchor_fraction"] is None
+
+
+def test_every_mode_states_history_from_rather_than_inheriting_it():
+    """A task default must not be able to turn an `fm` cell into a teacher-forced one."""
+    for mode in ev.REFERENCE_MODES:
+        assert rn.reference_overrides(mode)["history_from"] in ("generator", "clip")
+
+
+def test_reference_overrides_refuses_an_unknown_mode():
+    """Silently returning the `fm` mapping would mislabel a whole cell."""
+    with pytest.raises(ValueError, match="unknown reference mode"):
+        rn.reference_overrides("fm_tf_v2")
+
+
+def test_the_cell_manifest_records_history_from():
+    """`reference_source` alone cannot tell fm from fm_tf -- both run the generator."""
+    src = pathlib.Path(_EVAL / "runner.py").read_text()
+    assert 'notes["history_from"]' in src,         "without this the artifact cannot say which arm it was"
+
+
+def test_fm_tf_gets_the_same_robots_per_clip_as_fm():
+    """A missing key does not fail -- it silently unbalances the pair.
+
+    ``_cell_list`` looks up ``robots[f"{mode}/{preset}"]`` with a default of 25, so before
+    ``fm_tf`` was a real key a ``--quick`` run produced fm/none at R=8 against fm_tf/none at
+    R=25: the two arms of one comparison drawn at different sample sizes, with nothing said.
+    """
+    for preset in ("none", "train", "ood"):
+        assert f"fm_tf/{preset}" in ev.DEFAULT_ROBOTS, "fm_tf must be a key, not a fallback"
+        assert ev.DEFAULT_ROBOTS[f"fm_tf/{preset}"] == ev.DEFAULT_ROBOTS[f"fm/{preset}"]
+    # ...and the --quick cap has to reach it, which it only does via the key.
+    quick = {k: min(v, 8) for k, v in ev.DEFAULT_ROBOTS.items()}
+    cells = ev._cell_list(_Args("fm,fm_tf", presets="none"), _contracts("g"), quick)
+    r = {c["reference_mode"]: c["robots_per_clip"] for c in cells}
+    assert r["fm"] == r["fm_tf"] == 8
+
+
+def test_tilt_from_the_quaternion_equals_the_projected_gravity_form():
+    """The fix must be a pure re-derivation, not a new definition.
+
+    ``projected_gravity_b`` is ``R_wb^T @ (0,0,-1)``, so ``-grav[2] == R[2,2]``, which for a
+    ``(w,x,y,z)`` quaternion is ``1 - 2(x^2+y^2)``. If these ever disagreed the fix would be
+    silently changing what "fell" MEANS across every run, on top of removing the stale read.
+    """
+    torch = pytest.importorskip("torch", exc_type=ImportError)
+    g = torch.Generator().manual_seed(0)
+    q = torch.randn(512, 4, generator=g)
+    q = q / torch.linalg.vector_norm(q, dim=-1, keepdim=True)
+    w, x, y, z = q.unbind(-1)
+    # R^T @ (0,0,-1): the body-frame gravity direction, as IsaacLab stores it.
+    grav = torch.stack([-2.0 * (x * z - w * y),
+                        -2.0 * (y * z + w * x),
+                        -(1.0 - 2.0 * (x * x + y * y))], dim=-1)
+    from_grav = torch.acos((-grav[:, 2]).clamp(-1.0, 1.0))
+    from_quat = torch.acos((1.0 - 2.0 * (x * x + y * y)).clamp(-1.0, 1.0))
+    assert torch.allclose(from_grav, from_quat, atol=1e-6)
+
+
+def test_tilt_does_not_read_the_lagging_gravity_buffer():
+    """Pinned so nobody 'simplifies' it back to projected_gravity_b.
+
+    That buffer lagged one step behind a reset, so the first fold of a new episode saw the
+    PREVIOUS episode's orientation -- inflating the derived fall flag by a fixed ~18.5% of the
+    preceding fall rate (measured 0.188 on the generator arm, 0.182 on the clip arm).
+    """
+    src = pathlib.Path(_EVAL / "accumulate.py").read_text()
+    tilt = src.split("def _tilt(")[1].split("def ")[0]
+    assert "root_quat_w" in tilt, "tilt must come from the pose buffer the reset writes"
+    assert "projected_gravity_b" not in tilt.split('"""')[2], \
+        "the lagging buffer must not be read in the body of _tilt"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
