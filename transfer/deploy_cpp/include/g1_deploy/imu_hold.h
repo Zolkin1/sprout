@@ -28,6 +28,15 @@
 
 namespace g1_deploy {
 
+/// Is this base quaternion a reading at all?
+///
+/// The one definition of the test, because two callers need it and a second copy is how they
+/// drift: ImuHold applies it per control tick, and the controller's pose history applies it
+/// per estimator message so a degenerate sample never enters the buffer that back-dates the
+/// camera pose. A unit quaternion has norm 1 and the fault being caught is an all-zero
+/// message, so anything between is a threshold.
+bool IsUsableQuat(const QuatXyzw& quat, double min_norm = 0.5);
+
 /// Last-valid hold for base orientation + angular velocity.
 class ImuHold {
  public:

@@ -6,10 +6,15 @@
 
 namespace g1_deploy {
 
+bool IsUsableQuat(const QuatXyzw& quat, double min_norm) {
+  const double n = quat.norm();
+  return std::isfinite(n) && n >= min_norm;
+}
+
 ImuHold::Result ImuHold::Update(const QuatXyzw& quat, const Vec3& ang_vel) {
   ++samples_;
   const double n = quat.norm();
-  if (!std::isfinite(n) || n < min_norm_) {
+  if (!IsUsableQuat(quat, min_norm_)) {
     ++bad_samples_;
     // Both, from the same test. See the header: the gyro is corrupted by the same dropout and
     // is undetectable on its own.
