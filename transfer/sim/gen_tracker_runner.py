@@ -38,7 +38,7 @@ import yaml
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deploy.artifacts import resolve_fm_onnx  # noqa: E402
-from deploy.fm_session import default_depth_lag_steps
+from deploy.fm_session import default_depth_lag_steps  # noqa: E402
 from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
 from deploy.quat_math_np import (  # noqa: E402
@@ -70,13 +70,12 @@ def find_latest_run(log_root_path: str) -> str | None:
 class JoystickCommand:
     """Read ``(vx, vy, wz)`` from a gamepad, scaled by per-axis maxima."""
 
-    def __init__(self, max_vx: float, max_vy: float, max_wz: float, start_button: int = 0):
+    def __init__(self, max_vx: float, max_vy: float, max_wz: float):
         """Initialise pygame and open joystick 0 (falls back to a constant command)."""
         import pygame
 
-        self._pygame = pygame
+        self._pygame = pygame            # __call__ pumps the event queue through it
         self.scale = np.array([max_vx, max_vy, max_wz])
-        self.start_button = start_button
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() < 1:
@@ -86,14 +85,6 @@ class JoystickCommand:
             self.joystick = pygame.joystick.Joystick(0)
             self.joystick.init()
             print(f"Using controller: {self.joystick.get_name()}")
-
-    def button_pressed(self, idx: int | None = None) -> bool:
-        """Return True if a gamepad button (default the start/A button) is currently pressed."""
-        if self.joystick is None:
-            return False
-        for _ in self._pygame.event.get():
-            pass
-        return bool(self.joystick.get_button(self.start_button if idx is None else idx))
 
     def __call__(self, sim_time: float) -> np.ndarray:
         """Return the current command ``(vx, vy, wz)``."""
@@ -1315,7 +1306,7 @@ def main() -> None:
                              "e.g. 'cuda' or 'cuda,cpu' (aliases: cpu/cuda/trt). Default "
                              "'auto' = the GPU when the installed wheel has one, else the "
                              "CPU. This is a SIM default, not the deployment one: the "
-                             "generator is ~99% of the step cost and runs it in ~100 ms on a "
+                             "generator is ~99%% of the step cost and runs it in ~100 ms on a "
                              "CPU, so sim2sim defaults to the GPU while transfer/deploy still "
                              "requires hardware to state its provider. 'cpu' forces the "
                              "deployment-representative timing. CPU is always appended as a "
@@ -1476,9 +1467,6 @@ def main() -> None:
     parser.add_argument("--max_vx", type=float, default=1.0)
     parser.add_argument("--max_vy", type=float, default=0.5)
     parser.add_argument("--max_wz", type=float, default=1.0)
-    parser.add_argument("--start_button", type=int, default=0,
-                        help="Gamepad button index to end the standing hold and start the RL "
-                             "tracker (default 0 = A on an Xbox pad).")
     parser.add_argument("--clip", type=str, default=None,
                         help="Baked clip-library .h5 (e.g. clips/g1_parity_v1.h5). Spawns on the "
                              "clip's step-0 pose and drives the tracker from the clip reference "
@@ -1599,7 +1587,7 @@ def main() -> None:
         # produces a benign-but-ugly shutdown segfault.
         command_fn = lambda _t: np.zeros(3)
     elif args.mode == "joystick":
-        command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz, args.start_button)
+        command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz)
     else:
         if not hasattr(vc, args.command):
             sys.exit(f"[ERROR] No velocity profile '{args.command}' in experiments.velocity_commands.")
@@ -1711,8 +1699,35 @@ def main() -> None:
     # rather than hard-coded so a checkpoint trained at a different latency brings its own
     # number, and a pre-latency graph correctly gets none.
     _probs = getattr(policy.ctx, "depth_latency_probs", None)
+    # --fm_lead_ticks and --dump_replay both exist to line this runner up against the C++
+    # runtime, and the C++ applies NO synthetic camera lag. Left alone the two STACK: the
+    # generator would see `fm_lead_ticks + fm_depth_lag_steps` ticks while the C++ sees
+    # `fm_lead_ticks`, so the documented matched comparison (--fm_lead_ticks 1) would silently
+    # become 3 ticks / 60 ms against 1. The lag default is DERIVED and non-zero, so that
+    # happens without anyone asking for it, and every C++-parity conclusion drawn from the run
+    # would be wrong with nothing on screen to say so.
+    #
+    # --dump_replay is worse than a mismatch. `_record_replay_tick` records `depth_raw` from
+    # the tracker's LIVE cast beside the `fm_camera_pose` the lag has already replaced with a
+    # stale one, so the stream is internally inconsistent: the C++ rebuilds the generator's
+    # extero row from live pixels unprojected with an old pose -- exactly the egomotion
+    # displacement the xyz channels exist to remove. compare_replay.py then reports an
+    # `fm_extero` divergence that is the harness's fault, which is the one thing that harness
+    # promises to rule out.
+    _cpp_parity = bool(args.fm_lead_ticks) or bool(args.dump_replay)
     if args.fm_depth_lag_steps is not None:
+        if _cpp_parity and args.fm_depth_lag_steps > 0:
+            sys.exit(
+                f"[FATAL] --fm_depth_lag_steps {args.fm_depth_lag_steps} cannot be combined "
+                "with --fm_lead_ticks / --dump_replay. Those emulate the C++ runtime, which "
+                "applies no synthetic camera lag, so the two delays would stack and the "
+                "comparison would not be the one you asked for. Drop one, or pass "
+                "--fm_depth_lag_steps 0 to state that you want the lag off.")
         fm_lag = FmDepthLag(args.fm_depth_lag_steps, "--fm_depth_lag_steps")
+    elif _cpp_parity:
+        fm_lag = FmDepthLag(0, "forced off: --fm_lead_ticks/--dump_replay emulate the C++ "
+                               "runtime, which applies none. Pass --fm_depth_lag_steps to "
+                               "override, and read the note above first")
     else:
         fm_lag = FmDepthLag(default_depth_lag_steps(_probs),
                             f"derived from fm.onnx depth_latency_probs={_probs}")
@@ -1734,24 +1749,6 @@ def main() -> None:
         print("[INFO] Run INTERRUPTED by the user; artifacts below are partial.")
     else:
         print(f"[INFO] Run finished. Survived: {success}")
-    # Record the LOOP's verdict beside the log, because the metrics module cannot recover it
-    # from the CSV. The per-row ``fell`` flag is evaluated before the row is written and the
-    # loop returns on the step after, so the row where the fall happens is never written --
-    # every fall scored as `"survived": true` in the JSON while the console said False, and
-    # the JSON is what a sweep greps.
-    if log_path:
-        meta_path = os.path.join(os.path.dirname(log_path), "sim_meta.yaml")
-        try:
-            with open(meta_path) as mf:
-                _m = yaml.safe_load(mf) or {}
-            _m["survived"] = None if success is None else bool(success)
-            _m["failure_reason"] = ("" if success in (True, None)
-                                    else robot.failure_reason() or "unknown")
-            with open(meta_path, "w") as mf:
-                yaml.dump(_m, mf, default_flow_style=False, sort_keys=False)
-        except FileNotFoundError:
-            pass
-
     if replay is not None:
         # Written after the loop, so a run that fell still yields every tick it managed --
         # those ticks are exactly the interesting ones.
@@ -1789,6 +1786,11 @@ def main() -> None:
             meta["time_to_fall_s"] = (None if success is not False
                                       else float(robot.mj_data.time))
             meta["sim_end_time_s"] = float(robot.mj_data.time)
+            # WHICH trigger fired, which the CSV cannot say either: "it fell" and "it pitched
+            # face-first off a step while its pelvis was still high" are different findings.
+            # "unknown" only if the predicate has gone quiet since the loop returned.
+            meta["failure_reason"] = ("" if success is not False
+                                      else robot.failure_reason() or "unknown")
             with open(meta_path, "w") as mf:
                 yaml.dump(meta, mf, default_flow_style=False, sort_keys=False)
         except FileNotFoundError:

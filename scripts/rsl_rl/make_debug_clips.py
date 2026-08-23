@@ -38,7 +38,7 @@ git". Both sims read that one file, so they cannot diverge.
 Consumers refer to cases by NAME (indices move when the library is rebuilt):
 
     # MuJoCo sim2sim (--clip resolves against the REPO ROOT, not the cwd)
-    cd transfer/sim && python gen_tracker_runner.py --load_run <run> --robot_name g1_29j \\
+    cd transfer/sim && python gen_tracker_runner.py --load_run <run> \\
         --clip transfer/obelisk/g1_control/resource/debug_clips/g1_debug_v1.h5 \\
         --clip_case stand --clip_ego_anchor
 

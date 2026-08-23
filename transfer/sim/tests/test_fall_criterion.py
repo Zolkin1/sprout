@@ -5,7 +5,7 @@
 This is scoring code, and wrong scoring is the quietest kind of wrong: it does not crash, it
 publishes a number. The bug it exists to prevent already happened -- ``Robot.failed()`` was
 ``qpos[2] < 0.2`` in WORLD coordinates, which assumes the ground is at zero. On
-``g1_29j_tile20_scene`` the bottom slab is at -0.777 m, so a healthy robot standing there has
+``g1_perceptive_tile20_scene`` the bottom slab is at -0.777 m, so a healthy robot standing there has
 a pelvis at ~0.0 and was scored as fallen the instant it arrived. Every stairs-down run was a
 failure before it started, and the conclusion drawn from those runs ("stairs down does not
 work") was measuring the scoring, not the policy.
@@ -51,7 +51,7 @@ def _robot(scene: str) -> Robot:
     Returns:
         The constructed :class:`Robot`.
     """
-    return Robot(robot_name="g1_29j", scene_name=scene, joystick_scaling=np.ones(3),
+    return Robot(robot_name="g1_perceptive", scene_name=scene, joystick_scaling=np.ones(3),
                  input_function=lambda t: np.zeros(3))
 
 

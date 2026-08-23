@@ -32,8 +32,8 @@ flight**, so driving straight ahead walks the stairs.
 
 Run from ``transfer/sim`` (so the output lands next to the other scenes)::
 
-    python generate_clip_tile_scene.py --clip ../../clips/_tile_stairs_up.h5 --robot g1_29j
-    python gen_tracker_runner.py --load_run <run> --robot_name g1_29j --scene tile0_scene ...
+    python generate_clip_tile_scene.py --clip ../../clips/_tile_stairs_up.h5
+    python gen_tracker_runner.py --load_run <run> --scene tile0_scene ...
 
 No isaaclab and no torch: h5py + numpy only, like the rest of ``transfer/``.
 """

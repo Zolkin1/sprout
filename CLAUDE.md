@@ -509,7 +509,7 @@ up, so a world-first start hands the policy an already-collapsed robot):
 
 ```bash
 ssh -t zolkin@192.168.50.20 'cd ~/sprout/transfer/obelisk && scripts/run_sim_low.sh'  # brain
-scripts/run_sim_world.sh --scene g1_29j_tile1_scene                                   # world, here
+scripts/run_sim_world.sh --scene g1_perceptive_tile0_scene                            # world, here
 scripts/fetch_brain_bags.sh          # bags are recorded ON THE BRAIN's box
 ```
 

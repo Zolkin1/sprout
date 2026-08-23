@@ -243,7 +243,7 @@ For a free-roaming joystick playground instead of one clip, generate a standalon
 drive it directly:
 
 ```bash
-python transfer/sim/generate_stairs_scene.py --robot g1_29j   # symmetric up/platform/down lanes
+python transfer/sim/generate_stairs_scene.py   # symmetric up/platform/down lanes
 cd transfer/sim && python gen_tracker_runner.py --load_run <run_dir> ...
 ```
 
@@ -564,7 +564,7 @@ mkdir -p logs/rsl_rl/g1/$RUN
 ln -s "$PWD/transfer/obelisk/g1_control/resource/hf_cache/zolkin_robot_rl/$RUN" \
       logs/rsl_rl/g1/$RUN/exported
 cd transfer/sim && python gen_tracker_runner.py --mode eval --command smooth_ramp_running \
-    --load_run $RUN --robot_name g1_29j --scene basic_scene --headless --total_time 20
+    --load_run $RUN --scene basic_scene --headless --total_time 20
 ```
 
 The run prints mean FM and tracker inference times every 5 sim seconds. For the numbers

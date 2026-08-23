@@ -151,9 +151,9 @@ only way back. Each step feeds the next.
 6. LOOK AT IT -- MuJoCo (reads exported/{tracker,fm}.onnx, which step 5 writes):
      cd transfer/sim && python gen_tracker_runner.py \
          --load_run 2026-08-04_21-55-17_yaw_k12_v1 \
-         --robot_name g1_29j --scene basic_scene --mode joystick --command smooth_ramp_running
-   --robot_name g1_29j is REQUIRED (the default g1_21j is a 21-DoF model under a 29-DoF policy),
-   and you must cd first. --fm_update_every is DEAD here: the tracker.onnx metadata wins, which
+         --scene basic_scene --mode joystick --command smooth_ramp_running
+   --robot_name now DEFAULTS to g1_perceptive, so it no longer has to be passed (it used to,
+   because the old default g1_21j was a 21-DoF model under a 29-DoF policy). You must cd first. --fm_update_every is DEAD here: the tracker.onnx metadata wins, which
    is why step 5's K ends up governing this run. Verified both contracts carry a camera spec
    (tracker policy_parameters.depth_camera_spec + fm_meta.extero_spec), which is what
    GenTrackerPolicy.load() cross-checks. CPU-only, ~100 ms/step.

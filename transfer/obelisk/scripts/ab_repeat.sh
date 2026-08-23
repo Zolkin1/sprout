@@ -16,7 +16,7 @@
 # want to bias it deliberately, and is OFF by default because the asynchrony samples it.
 #
 #   scripts/ab_repeat.sh --runs 5 --brain thor  --tag thor_tf32on
-#   scripts/ab_repeat.sh --runs 5 --brain local --tag local_tf32on --scene tile1_scene
+#   scripts/ab_repeat.sh --runs 5 --brain local --tag local_tf32on --scene g1_perceptive_tile0_scene
 #
 # TODO(ab-stats): the comparison this was built for is DEFERRED, not done. The open question
 # is whether the Thor is actually worse than the desktop, or whether both fail some fraction
@@ -58,10 +58,10 @@ while [ $# -gt 0 ]; do
 done
 [ "$BRAIN" = local ] || [ "$BRAIN" = thor ] || { echo "--brain must be local or thor" >&2; exit 2; }
 
-# --scene takes the FULL basename (g1_29j_tile1_scene), not the suffix the sim2sim runner uses
-# (tile1_scene + --robot_name). obk_scene_config only WARNS when the file is missing and then
-# launches a world with no robot, which yields a bag of zero armed ticks -- indistinguishable
-# from a policy failure until you open it. Fail here instead.
+# --scene takes the FULL basename (g1_perceptive_tile0_scene), not the suffix the sim2sim
+# runner uses (tile0_scene + --robot_name). obk_scene_config only WARNS when the file is
+# missing and then launches a world with no robot, which yields a bag of zero armed ticks
+# -- indistinguishable from a policy failure until you open it. Fail here instead.
 if [ -n "$SCENE" ] && [ ! -f "$OBK_DIR/../sim/robots/g1/$SCENE.xml" ]; then
     echo "ab_repeat.sh: no such scene: $OBK_DIR/../sim/robots/g1/$SCENE.xml" >&2
     echo "  available:" >&2

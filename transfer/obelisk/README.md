@@ -57,7 +57,7 @@ launches the brain alone and `run_sim_world.sh` the world alone, unchanged:
 
 ```bash
 # dev desktop
-scripts/run_sim_world.sh --scene g1_29j_basic_scene
+scripts/run_sim_world.sh --scene g1_perceptive_basic_scene
 # the Thor
 scripts/run_sim_low.sh
 ```
@@ -142,7 +142,7 @@ so a robot that cannot hold it has a problem that has nothing to do with any pol
 All three are known to survive in MuJoCo through the same `transfer/deploy` runtime:
 
 ```bash
-cd ../sim && python gen_tracker_runner.py --load_run <run> --robot_name g1_29j \
+cd ../sim && python gen_tracker_runner.py --load_run <run> \
     --clip transfer/obelisk/g1_control/resource/debug_clips/g1_debug_v1.h5 \\
     --clip_case stand --clip_ego_anchor --log
 ```
