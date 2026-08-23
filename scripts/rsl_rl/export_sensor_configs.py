@@ -84,6 +84,12 @@ def depth_scan_config(cam: dict) -> dict:
         "site_name": f"{cam['mount_body']}_origin_site",
         "geom_groups": list(DEPTH_GEOM_GROUPS),
         "frame": "world",
+        # Ray drawing OFF, emitted rather than left to obelisk's default. Both generated files
+        # carried `viz: false` by hand, and regenerating them silently dropped it -- which is
+        # the trap a generated config that still needs hand-editing always is. There are
+        # 30x26 rays per camera and two cameras, so this is not a free setting. Flip it here
+        # (or in a local edit you expect to lose) when you want to see the cones.
+        "viz": False,
         "pattern": {
             "type": "depth_camera",
             "width": int(cam["width"]),
