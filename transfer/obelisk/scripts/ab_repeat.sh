@@ -59,9 +59,9 @@ done
 [ "$BRAIN" = local ] || [ "$BRAIN" = thor ] || { echo "--brain must be local or thor" >&2; exit 2; }
 
 # --scene takes the FULL basename (g1_perceptive_tile0_scene), not the suffix the sim2sim
-# runner uses (tile0_scene + --robot_name). obk_scene_config only WARNS when the file is
-# missing and then launches a world with no robot, which yields a bag of zero armed ticks
-# -- indistinguishable from a policy failure until you open it. Fail here instead.
+# runner uses (tile0_scene + --robot_name). obk_scene_config is now fatal on a missing file
+# too; this check stays because it fires BEFORE any ssh or tmux work, and a run of N repeats
+# should not get one world up before noticing the scene does not exist.
 if [ -n "$SCENE" ] && [ ! -f "$OBK_DIR/../sim/robots/g1/$SCENE.xml" ]; then
     echo "ab_repeat.sh: no such scene: $OBK_DIR/../sim/robots/g1/$SCENE.xml" >&2
     echo "  available:" >&2

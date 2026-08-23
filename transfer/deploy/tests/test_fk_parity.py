@@ -3,10 +3,16 @@
 """The ribbon's FK moved from MuJoCo to pinocchio; this is the claim that let it.
 
 ``deploy.fk`` FKs the ROS URDF, but the generator's own FK consistency loss is defined against
-``FlowMatchingConfig.fk_model_path`` -- the MJCF at ``transfer/sim/robots/g1/g1_29j.xml``. The
+``FlowMatchingConfig.fk_model_path``, which is ``motion_gen.features.DEFAULT_MJCF``. The
 standing objection to using anything else is that the drawn feet would become a SECOND OPINION
 about where the feet are, and a display whose purpose is to expose a discrepancy must not be
 able to manufacture one.
+
+Both sides are now taken from the code that DEFINES them rather than restated as paths, which
+is what turns this test into the guard that they point at the same robot. It was restating
+``g1_29j.xml`` while the generator's default had moved to ``g1_perceptive.xml`` -- and because
+the old MJCF survived the scene rename, the test went on comparing two models nothing uses,
+passing, while the live pair differed by the 10 mm the mode_11 waist moved.
 
 This measures the objection instead of arguing about it: the two models, the four frames the
 ribbon actually draws, random configurations. MuJoCo appears ONLY here, as a test-only oracle,
@@ -18,7 +24,6 @@ generator does not agree with -- fix the models, do not raise the tolerance.
 
 from __future__ import annotations
 
-import pathlib
 
 import numpy as np
 import pytest
@@ -28,12 +33,12 @@ mujoco = pytest.importorskip("mujoco")
 
 from deploy.fk import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
 
-#: The MJCF the generator's FK loss is defined against. Off this file's package root rather
-#: than a count of ".." hops.
-_MJCF = str(
-    pathlib.Path(__file__).resolve().parent.parent.parent
-    / "sim" / "robots" / "g1" / "g1_29j.xml"
-)
+_features = pytest.importorskip("motion_gen.features")
+
+#: The MJCF the generator's FK loss is defined against -- IMPORTED, not restated, so this test
+#: cannot end up measuring a pair that nothing runs. ``motion_gen`` is importable without
+#: isaaclab, which is why the whole of ``transfer/`` can read it.
+_MJCF = str(_features.DEFAULT_MJCF)
 
 #: What the tracker's `ee_frame_names` holds, and therefore what the ribbon draws.
 _FRAMES = [

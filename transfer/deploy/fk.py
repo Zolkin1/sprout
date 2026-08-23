@@ -44,12 +44,17 @@ from .quat_math_np import quat_apply
 #: default, so a bring-up has exactly one kinematic description on it. Derived from this
 #: package's own location rather than counted in ``..`` hops, so moving the package does not
 #: silently produce a path that no longer exists.
+#:
+#: It must name the robot that was TRAINED. This pointed at ``g1_29j.urdf`` while training had
+#: moved to the perceptive G1, which put the viewer's plan ribbon 10 mm off the robot it was
+#: drawn on -- and the C++ camera FK, sharing this default, 10 mm off on every xyz channel.
+#: The file is generated from the training URDF by ``g1_model/urdf/make_ros_urdf.py``.
 DEFAULT_FK_MODEL = str(
     pathlib.Path(__file__).resolve().parent.parent
     / "obelisk"
     / "g1_model"
     / "urdf"
-    / "g1_29j.urdf"
+    / "g1_perceptive.urdf"
 )
 
 

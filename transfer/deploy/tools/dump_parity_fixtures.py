@@ -148,11 +148,20 @@ _ISAAC_JOINTS: tuple[str, ...] = (
 
 #: The shipped pair's mounts and NOMINAL offsets, as tracker.onnx publishes them. Two
 #: different lenses on one mount body -- see the depth fixtures for why that matters.
+#:
+#: These are the AS-BUILT CAD poses (the left imager of each stereo pair, hence the non-zero y
+#: -- half of a 50 mm and a 120 mm baseline), and they must track
+#: ``g1_depth_env_cfg._NEAR`` / ``_FAR``, which
+#: ``source/robot_rl/tests/test_camera_mount_matches_urdf.py`` pins against the URDF. They
+#: previously held the PLACEHOLDER pair -- near at z = 0.0994 and far at z = 0.38 pitched 35
+#: deg -- and because the C++ test restated the same wrong numbers, the camera-FK parity case
+#: passed while describing a robot and a mount pair that ship nowhere. The offsets now travel
+#: in the fixture's own attrs so the two languages cannot disagree about them again.
 _CAMERAS: tuple[dict, ...] = (
-    {"mount_body": "torso_link", "offset_pos": [0.1107625, 0.0, 0.099426],
+    {"mount_body": "torso_link", "offset_pos": [0.107, 0.025, 0.045],
      "offset_quat_xyzw": [0.0, 0.5372996083468239, 0.0, 0.8433914458128857]},
-    {"mount_body": "torso_link", "offset_pos": [0.06, 0.0, 0.38],
-     "offset_quat_xyzw": [0.0, 0.3007057995042731, 0.0, 0.9537169507482269]},
+    {"mount_body": "torso_link", "offset_pos": [0.085, 0.06, 0.285],
+     "offset_quat_xyzw": [0.0, 0.13052619222005157, 0.0, 0.9914448613738104]},
 )
 
 
@@ -462,7 +471,11 @@ def dump_camera_fk(w: FixtureWriter, rng: np.random.Generator, n: int) -> None:
     """
     import pinocchio as pin  # noqa: PLC0415  -- only this case needs it
 
-    urdf = os.path.join(_REPO_ROOT, "transfer", "obelisk", "g1_model", "urdf", "g1_29j.urdf")
+    # The robot that was TRAINED -- generated from its URDF by g1_model/urdf/make_ros_urdf.py.
+    # This said g1_29j.urdf, which is the pre-mode_11 robot: `torso_link` sits 10.0 mm higher
+    # on it, so the oracle was computing camera poses for a machine nothing runs.
+    urdf = os.path.join(_REPO_ROOT, "transfer", "obelisk", "g1_model", "urdf",
+                        "g1_perceptive.urdf")
     if not os.path.exists(urdf):
         print(f"[fixtures] no URDF at {urdf}; skipping camera_pose_yaw_frame")
         return
@@ -502,7 +515,12 @@ def dump_camera_fk(w: FixtureWriter, rng: np.random.Generator, n: int) -> None:
           {"cam_pos": np.stack(pos_out), "cam_rot": np.stack(rot_out)},
           attrs={"urdf": os.path.relpath(urdf, _REPO_ROOT),
                  "joint_names": list(_ISAAC_JOINTS),
-                 "mount_bodies": [c["mount_body"] for c in _CAMERAS]})
+                 "mount_bodies": [c["mount_body"] for c in _CAMERAS],
+                 # FLAT, camera-major, because the manifest carries lists and not matrices.
+                 # The C++ reshapes by len(mount_bodies). Restating them there is what let the
+                 # placeholder pair survive a contract change unnoticed.
+                 "offset_pos": [v for c in _CAMERAS for v in c["offset_pos"]],
+                 "offset_quat_xyzw": [v for c in _CAMERAS for v in c["offset_quat_xyzw"]]})
 
 
 def mdp_normalize(d: np.ndarray, cam: dict) -> np.ndarray:

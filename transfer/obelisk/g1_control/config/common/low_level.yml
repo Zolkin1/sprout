@@ -230,7 +230,11 @@ viz:
     - pkg: obelisk_viz_cpp
       executable: default_robot_viz
       robot_pkg: g1_model
-      urdf: g1_29j.urdf
+      # The TRAINED robot, generated from its URDF by g1_model/urdf/make_ros_urdf.py. It said
+      # g1_29j.urdf until the training refresh landed, which drew a robot with Dex3 hands, no
+      # backpack, no camera mounts and its torso 10 mm high -- and depth_cloud_viz publishes in
+      # the torso_link frame, so its cloud inherited that 10 mm relative to the drawn robot.
+      urdf: g1_perceptive.urdf
       robot_topic: robot_description
       # The ros_parameter names are NOT free-form: obelisk strips the `_setting` suffix to get
       # a `key`, and matches it against the keys ObeliskVizRobot registers in its constructor

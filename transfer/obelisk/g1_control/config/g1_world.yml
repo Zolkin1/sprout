@@ -43,7 +43,7 @@ robot:
             # ORDER IS LOAD-BEARING and is not checked anywhere: obelisk fills joint_names
             # from the jointpos entries in this order and appends the jointvel readings in
             # theirs, so mismatched orders silently pair each joint's position with another
-            # joint's velocity. Generated from g1_29j.xml's sensor block; regenerate both
+            # joint's velocity. Generated from g1_perceptive.xml's sensor block; regenerate both
             # together. All 29 joints must appear or the controller refuses to arm.
             sensor_names:
             # ---------- Joint positions (order defines joint_names) ---------- #

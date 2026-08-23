@@ -699,7 +699,7 @@ def main() -> int:
                         "rather than by an RNG draw per re-plan. Whichever is chosen, this flag "
                         "sets Isaac and MuJoCo together -- their own defaults disagree.")
     p.add_argument("--port", type=int, default=8091, help="[viser] server port.")
-    p.add_argument("--urdf", default="transfer/obelisk/g1_model/urdf/g1_29j.urdf",
+    p.add_argument("--urdf", default="transfer/obelisk/g1_model/urdf/g1_perceptive.urdf",
                    help="[viser] URDF to pose (29-DOF).")
     p.add_argument("--clip_handoff_time", type=float, default=0.0,
                    help="[mujoco] sim time to hand the reference from the clip to the FM. "

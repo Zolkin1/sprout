@@ -54,20 +54,22 @@ TEST(CameraFkParity, MatchesThePythonPose) {
 
     std::vector<std::string> names = c->string_lists.at("joint_names");
     std::vector<std::string> mounts = c->string_lists.at("mount_bodies");
-    // The contract the fixture used: the mounts and the NOMINAL offsets. Read from the
-    // fixture's own attrs so the test cannot quietly describe a different camera pair than
-    // the oracle did.
+    // The contract the fixture used: the mounts AND the nominal offsets, both read from the
+    // fixture's own attrs so the test cannot quietly describe a different camera pair than the
+    // oracle did. That claim used to be false -- the offsets were restated here as literals,
+    // and when the mount poses moved from the placeholder pair to the as-built CAD ones this
+    // test and its fixture went on agreeing with each other about a robot that ships nowhere.
+    // A parity test that pins its own inputs is not a parity test.
+    const std::vector<double>& off_flat = c->double_lists.at("offset_pos");
+    const std::vector<double>& quat_flat = c->double_lists.at("offset_quat_xyzw");
+    ASSERT_EQ(off_flat.size(), mounts.size() * 3);
+    ASSERT_EQ(quat_flat.size(), mounts.size() * 4);
     std::vector<DepthCameraSpec> cams(mounts.size());
-    const std::array<std::array<double, 3>, 2> offs{{{0.1107625, 0.0, 0.099426},
-                                                     {0.06, 0.0, 0.38}}};
-    const std::array<std::array<double, 4>, 2> quat{
-        {{0.0, 0.5372996083468239, 0.0, 0.8433914458128857},
-         {0.0, 0.3007057995042731, 0.0, 0.9537169507482269}}};
     for (size_t i = 0; i < cams.size(); ++i) {
       cams[i].sensor = "cam" + std::to_string(i);
       cams[i].mount_body = mounts[i];
-      cams[i].offset_pos = offs[i];
-      cams[i].offset_quat_xyzw = quat[i];
+      for (size_t k = 0; k < 3; ++k) cams[i].offset_pos[k] = off_flat[i * 3 + k];
+      for (size_t k = 0; k < 4; ++k) cams[i].offset_quat_xyzw[k] = quat_flat[i * 4 + k];
     }
 
     CameraPoseFk fk(ModelPath(*c), names, cams);
@@ -110,10 +112,16 @@ TEST(CameraFk, TheHeadingDividesOut) {
   ASSERT_FALSE(cases.empty());
   const Case& c = *cases.front();
   std::vector<std::string> names = c.string_lists.at("joint_names");
+  // From the fixture, like the parity case above: the yaw property holds for ANY offset, so
+  // the literal was harmless -- but a stale literal beside a live one is how the pair drifts.
   std::vector<DepthCameraSpec> cams(1);
   cams[0].mount_body = c.string_lists.at("mount_bodies").front();
-  cams[0].offset_pos = {0.1107625, 0.0, 0.099426};
-  cams[0].offset_quat_xyzw = {0.0, 0.5372996083468239, 0.0, 0.8433914458128857};
+  const std::vector<double>& off0 = c.double_lists.at("offset_pos");
+  const std::vector<double>& quat0 = c.double_lists.at("offset_quat_xyzw");
+  ASSERT_GE(off0.size(), 3u);
+  ASSERT_GE(quat0.size(), 4u);
+  for (size_t k = 0; k < 3; ++k) cams[0].offset_pos[k] = off0[k];
+  for (size_t k = 0; k < 4; ++k) cams[0].offset_quat_xyzw[k] = quat0[k];
   CameraPoseFk fk(ModelPath(c), names, cams);
 
   std::vector<double> q(names.size(), 0.0);

@@ -140,7 +140,14 @@ void G1Controller::DeclareParams() {
   // The kinematic model the camera poses are FK'd on. A parameter and not a constant because
   // the robot's models are on their way to being consolidated; when that lands this moves a
   // config line instead of a recompile. Relative paths resolve against the workspace root.
-  this->declare_parameter<std::string>("urdf_path", "g1_model/urdf/g1_29j.urdf");
+  //
+  // This default MUST name the robot that was trained. It used to say g1_29j.urdf while
+  // training had moved to the perceptive G1, and nothing caught it: `torso_link` and all 29
+  // joints exist in both files, so CameraPoseFk resolved every name it looks up and placed
+  // both cameras exactly 10.0 mm high, on every unprojected xyz channel, silently. The ROS
+  // copy is now GENERATED from the training URDF (g1_model/urdf/make_ros_urdf.py) so the two
+  // cannot drift apart again.
+  this->declare_parameter<std::string>("urdf_path", "g1_model/urdf/g1_perceptive.urdf");
   // Integrate the generator's flow from x0 = 0 instead of x0 ~ N(0, I).
   //
   // TRUE for now, deliberately, and it is a debugging stance rather than the final one. The FM

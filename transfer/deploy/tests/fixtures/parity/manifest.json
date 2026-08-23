@@ -1585,7 +1585,7 @@
       "atol": 1e-11,
       "compare": "elementwise",
       "attrs": {
-        "urdf": "transfer/obelisk/g1_model/urdf/g1_29j.urdf",
+        "urdf": "transfer/obelisk/g1_model/urdf/g1_perceptive.urdf",
         "joint_names": [
           "left_hip_pitch_joint",
           "right_hip_pitch_joint",
@@ -1620,6 +1620,24 @@
         "mount_bodies": [
           "torso_link",
           "torso_link"
+        ],
+        "offset_pos": [
+          0.107,
+          0.025,
+          0.045,
+          0.085,
+          0.06,
+          0.285
+        ],
+        "offset_quat_xyzw": [
+          0.0,
+          0.5372996083468239,
+          0.0,
+          0.8433914458128857,
+          0.0,
+          0.13052619222005157,
+          0.0,
+          0.9914448613738104
         ]
       },
       "inputs": [
@@ -1653,7 +1671,7 @@
             6
           ],
           "dtype": "float64",
-          "sha256": "269315716238ebad061a5caa7fa04fb80de61ed46c35aa01a8668e85dba0d06f"
+          "sha256": "326add58397e7bb346f433d1ef41a7a2d2fad88881478e4bd292d06618d94768"
         },
         {
           "name": "cam_rot",
@@ -1663,7 +1681,7 @@
             18
           ],
           "dtype": "float64",
-          "sha256": "c37b325f2b959c4be900349d57ae121fb8d3083216d126356e0417479fc45520"
+          "sha256": "fe201552ba4555c549ca8b7a9024c8c2a87ce09c833bab68106c148335b23f0b"
         }
       ]
     }

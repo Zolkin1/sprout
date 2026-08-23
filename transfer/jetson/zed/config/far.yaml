@@ -49,7 +49,7 @@
     serial_number: 44889004
     # CONFIRMED by the operator: the ZED X Mini is the NEAR camera and looks 65 deg
     # down; the ZED X is the upper/FAR mount. Consistent with the contract geometry
-    # -- this policy's contract mounts both on torso_link_origin_site with near at
+    # -- this policy's contract mounts both on the torso_link BODY with near at
     # z=0.045 tilted 65 deg and far at z=0.285 tilted 15 deg, i.e. far sits 24 cm HIGHER.
     # This box needs the ROLE and nothing more: the mount offsets are
     # consumed by g1_deploy::CameraPoseFk in the CONTROLLER, which FKs them from the URDF

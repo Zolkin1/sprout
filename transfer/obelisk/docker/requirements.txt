@@ -54,7 +54,7 @@ h5py
 # a second copy of the library in the image.
 #
 # This was `mujoco`, on the argument that the ribbon had to be FK'd on
-# FlowMatchingConfig.fk_model_path -- transfer/sim/robots/g1/g1_29j.xml, the model the
+# FlowMatchingConfig.fk_model_path -- transfer/sim/robots/g1/g1_perceptive.xml, the model the
 # generator's FK loss is defined against -- so that the drawn feet could not become a SECOND
 # OPINION about where the feet are. Measured, that is not what the choice buys: over random
 # postures the MJCF and the ROS URDF place the four ribbon frames within 4.6e-7 m

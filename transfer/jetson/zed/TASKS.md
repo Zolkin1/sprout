@@ -190,21 +190,30 @@ optional before this runs on the robot, except where marked.
     test: the brain subscribed to this box's depth topics, which a domain mismatch makes
     impossible (it presents as silence on both sides, not an error).
 
-- [ ] **2e. (BRAIN, not this box) Merge the updated URDF before any hardware testing.**
+- [x] **2e. (BRAIN, not this box) Merge the updated URDF before any hardware testing.** DONE.
   `CameraPoseFk` FKs the cameras from `urdf_path` plus the contract's mount body and offset,
-  every tick, to unproject the depth image. This policy's contract puts both cameras on
-  `torso_link_origin_site`:
+  every tick, to unproject the depth image. This policy's contract puts both cameras on the
+  `torso_link` BODY (`torso_link_origin_site` is a MuJoCo `<site>` that
+  `export_sensor_configs.py` derives for the ray-caster as `f"{mount_body}_origin_site"`; no
+  URDF has such a frame):
 
   | camera | offset (m) | tilt about Y |
   |---|---|---|
   | near | `[0.107, 0.025, 0.045]` | 65 deg |
   | far  | `[0.085, 0.06, 0.285]`  | 15 deg |
 
-  The PHYSICAL mounts were designed to match these numbers exactly, and the matching URDF
-  exists on another branch. So the remaining work is the merge, not a measurement -- but it
-  is a hard prerequisite for hardware testing, because a URDF that does not describe the
-  real mounts mis-registers every xyz channel while the DEPTH channel still looks perfect.
-  Nothing on the ZED box, and no image inspection, can reveal that.
+  The PHYSICAL mounts were designed to match these numbers exactly. The merge has landed, and
+  the ROS URDF is no longer a hand-kept copy: `g1_model/urdf/g1_perceptive.urdf` is GENERATED
+  from the training URDF by `g1_model/urdf/make_ros_urdf.py`, and `urdf_path` now defaults to
+  it (`deploy/fk.py` and the rviz `robot_state_publisher` follow).
+
+  MEASURED, since the whole risk here is that it looks fine either way: the generated ROS copy
+  places both cameras identically to the training URDF (0.000000 mm -- it is a mesh-path
+  rewrite and nothing else), and the model it REPLACED placed them exactly 10.0000 mm high, on
+  both cameras, at zero joints. That is the mode_11 waist offset, and it is the error that was
+  being applied to every xyz channel: a URDF that does not describe the real mounts
+  mis-registers them while the DEPTH channel still looks perfect, so nothing on the ZED box and
+  no image inspection could have revealed it.
 
 ## 3. Robustness
 

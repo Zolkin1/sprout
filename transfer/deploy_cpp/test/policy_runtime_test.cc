@@ -73,6 +73,30 @@ HardwareReadings MakeReadings(const PolicyParams& p, int tick) {
   return r;
 }
 
+/// Why this runtime will not serve the artifact at all, or "" if it will.
+///
+/// Some refusals are the runtime working: a tracker exported under window_anchor="robot_now"
+/// is rejected on purpose, because serving that arm needs a base position this deploy path
+/// does not have (see AnchorFromConvention). Pointing G1_POLICY_DIR at one is then a statement
+/// about the FILE, and reporting it as five identical exceptions reads like a broken build.
+///
+/// Probed ONCE: creating an ORT session for these graphs is ~4 s, and the answer cannot change
+/// between tests in a run. Only the deliberate refusals become skips -- anything else is a
+/// real failure and must surface as one.
+const std::string& RefusalReason(const RuntimeConfig& cfg) {
+  static const std::string reason = [&cfg]() -> std::string {
+    try {
+      PolicyRuntime probe(cfg);
+      probe.Load();
+    } catch (const std::exception& e) {
+      const std::string msg = e.what();
+      if (msg.find("base_pose_convention") != std::string::npos) return msg;
+    }
+    return {};
+  }();
+  return reason;
+}
+
 class Runtime : public ::testing::Test {
  protected:
   void SetUp() override {
@@ -87,6 +111,10 @@ class Runtime : public ::testing::Test {
     cfg.intra_threads = 2;
     cfg.zero_noise = true;   // deterministic, so a re-run is comparable
     cfg.threaded_fm = true;
+    const std::string& refused = RefusalReason(cfg);
+    if (!refused.empty()) {
+      GTEST_SKIP() << "this runtime does not serve that artifact, by design: " << refused;
+    }
   }
   RuntimeConfig cfg;
 };
