@@ -249,6 +249,13 @@ class EvalResetHook:
         clip_ids = cmd.clip_id.detach().to("cpu").numpy().astype(np.int64)[ids_np]
         start_steps = cmd.start_step.detach().to("cpu").numpy().astype(np.int64)[ids_np]
 
+        # Fold the TERMINAL frame into the running extremes before reducing. The per-step
+        # fold masks out envs that reset, so without this the one frame that crossed a
+        # threshold -- the frame that ENDED the episode -- is the one frame missing from
+        # min_base_height_w / max_tilt_rad / first_fall_step. Measured cost of omitting it:
+        # 289 of 469 base_fallen episodes read as upright, sitting just inside both bounds
+        # (median 0.514 m and 45.9 deg against limits of 0.5 m and 70 deg).
+        self.accum.fold_terminal(env_ids)
         red = self.accum.snapshot(env_ids)
         bits = np.zeros(ids_np.size, dtype=np.uint16)
         for b, name in enumerate(self._term_names):
@@ -395,12 +402,29 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
         traj.fm_checkpoint = cell["fm_checkpoint"]
     elif hasattr(traj, "fm_checkpoint"):
         traj.fm_checkpoint = ""
-    if cell["reference_mode"] == "clip":
-        # Clip tracking is only in-distribution when the reference is ego-anchored; the
-        # tracker task defaults the fraction to 0. The CADENCE is left at whatever the task
-        # sets, which is the teacher's re-plan period -- pinning it to 1 is what made the
-        # base-position error identically zero in earlier sweeps.
+    if cell["reference_mode"] == "clip" and hasattr(traj, "reference_source"):
+        # Only on the FM TRACKER task, which defaults the fraction to 0: clip tracking is
+        # off-distribution there unless the reference is ego-anchored. A teacher task already
+        # carries whatever it trained with, and overriding that would silently evaluate it
+        # under anchoring it never saw. The CADENCE is left alone either way -- pinning it to
+        # 1 is what made base-position error identically zero in earlier sweeps.
         traj.ego_anchor_fraction = 1.0
+    # Adopt the checkpoint's OBSERVATION CONVENTION, not the task's default.
+    #
+    # ``window_anchor`` decides the frame the reference window's base_pose block is expressed
+    # in ("robot_now" = anchored on the robot, "plan" = the no-odometry variant anchored on the
+    # plan draw). The block has the SAME WIDTH either way, so a mismatch loads clean and steers
+    # wrong with no visible symptom -- which is exactly what ``check_run_conventions`` refuses,
+    # and it would refuse every plan-anchored checkpoint on a robot_now task. Reading it off
+    # the trained run makes the eval follow the policy instead of the task.
+    trained_conv = (manifest.get("policy") or {}).get("conventions") or {}
+    want_anchor = trained_conv.get("window_anchor")
+    if want_anchor and hasattr(traj, "window_anchor") and traj.window_anchor != want_anchor:
+        print(f"[cell] window_anchor: task default {traj.window_anchor!r} -> trained "
+              f"{want_anchor!r} (from the run's params/conventions.yaml)")
+        traj.window_anchor = want_anchor
+    notes["window_anchor"] = getattr(traj, "window_anchor", None)
+    notes["trained_window_anchor"] = want_anchor
     notes["reference_source"] = getattr(traj, "reference_source", None)
     notes["ego_anchor_fraction"] = getattr(traj, "ego_anchor_fraction", None)
     notes["ego_anchor_every"] = getattr(traj, "ego_anchor_every", None)

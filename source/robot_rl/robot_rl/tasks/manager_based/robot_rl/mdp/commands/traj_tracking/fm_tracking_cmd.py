@@ -932,10 +932,19 @@ class FmTrackingCommand(MotionSequenceCommand):
         the prediction frame cannot drift apart even if the two cadences are configured
         differently.
 
+        **Only when a generator is loaded.** In the pure-clip control
+        (``reference_source='clip'`` with no ``fm_checkpoint``) ``_post_init`` returns before
+        allocating those buffers, because there is no prediction to anchor -- so reaching for
+        them raised ``AttributeError: no attribute '_anchor_pos'``, and a ``window_anchor='plan'``
+        checkpoint could not run clip control on this task at all. With no prediction there is
+        no prediction frame to stay aligned with, so the base class's plan anchor is the
+        correct authority.
+
         Returns:
             ``([N, 3], [N, 4])`` world position and quaternion (xyzw).
         """
-        if getattr(self.cfg, "window_anchor", DEFAULT_WINDOW_ANCHOR) == "plan":
+        if (getattr(self.cfg, "window_anchor", DEFAULT_WINDOW_ANCHOR) == "plan"
+                and self.fm_enabled):
             return self._anchor_pos, self._anchor_quat
         return super().window_anchor()
 

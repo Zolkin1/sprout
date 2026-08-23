@@ -59,6 +59,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-clusters", type=int, default=3, dest="min_clusters",
                    help="below this many tiles a family's interval is reported as NaN rather "
                         "than as a misleadingly narrow one")
+    p.add_argument("--baseline", default="",
+                   help="series every contrast is taken against, as '<run label>:<cell key>'; "
+                        "default is the first run's clip__train__- cell")
     p.add_argument("--figures", default="default")
     p.add_argument("--no-svg", action="store_true")
     p.add_argument("--allow-plan-mismatch", action="store_true", dest="allow_plan_mismatch")
@@ -111,6 +114,17 @@ def derive_labels(runs: list[dict], explicit: str) -> list[str]:
     return out
 
 
+def _clip_identity(plan: dict) -> str:
+    """The hash that decides whether two runs may be paired on clip id.
+
+    Prefers the plan's own ``clip_plan_hash``; falls back to ``plan_hash`` for plans written
+    before that field existed. The distinction matters because ``plan_hash`` also covers the
+    creation timestamp and the subset's output path, so two runs over an identical clip set
+    carry different ``plan_hash`` values and would be refused.
+    """
+    return str(plan.get("clip_plan_hash") or plan.get("plan_hash", ""))
+
+
 def align_runs(runs: list[dict], labels: list[str], *, allow_mismatch: bool) -> list[str]:
     """Refuse comparisons whose clip plans or libraries differ. Returns collected warnings.
 
@@ -125,7 +139,7 @@ def align_runs(runs: list[dict], labels: list[str], *, allow_mismatch: bool) -> 
     warnings: list[str] = []
     refusals: list[str] = []
     base_lib = runs[0]["plan"]["source_library"]["sha256"]
-    base_plan = runs[0]["plan"]["plan_hash"]
+    base_plan = _clip_identity(runs[0]["plan"])
     # The cross-run checks below need two runs; the per-run tracking_mode check does not, and
     # applies to a single-run report just as much.
     for lab, r in zip(labels[1:], runs[1:]):
@@ -135,9 +149,9 @@ def align_runs(runs: list[dict], labels: list[str], *, allow_mismatch: bool) -> 
                 "different motion in the two runs, so pairing is not narrower but wrong, and "
                 "there is no correct intersection."
             )
-        elif r["plan"]["plan_hash"] != base_plan:
+        elif _clip_identity(r["plan"]) != base_plan:
             msg = (f"{lab}: clip plan differs from {labels[0]} "
-                   f"({r['plan']['plan_hash'][:12]} vs {base_plan[:12]})")
+                   f"({_clip_identity(r['plan'])[:12]} vs {base_plan[:12]})")
             (warnings if allow_mismatch else refusals).append(msg)
     for lab, r in zip(labels, runs):
         pol = r["manifest"]["policy"]
@@ -316,6 +330,8 @@ def paired_contrasts(runs: list[dict], labels: list[str], baseline: str, args) -
             series[f"{lab}:{key}"] = (d["clip_id"], d["scene_tile_id"],
                                       derived_columns(cell, r["plan"]))
     if baseline not in series:
+        print(f"[report] baseline series {baseline!r} not found; no paired contrasts. "
+              f"Available: {sorted(series)}")
         return []
     ca, ta, da = series[baseline]
     out = []
@@ -547,15 +563,23 @@ def main() -> int:
         for key in sorted(r["cells"]):
             red = reduce_cell(r["cells"][key], r["plan"], args)
             red["run_label"] = lab
+            # Keep the RAW cell key alongside the display key: ``paired_contrasts`` indexes
+            # its series by "<run label>:<raw cell key>", so building the baseline from the
+            # display key double-prefixes it and silently matches no series at all.
+            red["cell_key"] = key
             red["key"] = f"{lab}:{key}" if len(runs) > 1 else key
             reduced["cells"].append(red)
     if not reduced["cells"]:
         raise SystemExit(f"no complete cells found under {args.run_dirs}")
 
-    baseline = next((c["key"] for c in reduced["cells"] if "clip__train" in c["key"]),
-                    reduced["cells"][0]["key"])
-    base_series = (f"{reduced['cells'][0]['run_label']}:{baseline}" if len(runs) > 1
-                   else f"{labels[0]}:{baseline.split(':')[-1]}")
+    # The reference every contrast is taken against. Default: the first run's clip/train
+    # cell, which is the in-distribution baseline; --baseline names another explicitly.
+    if args.baseline:
+        base_series = args.baseline
+    else:
+        pick = next((c for c in reduced["cells"] if "clip__train" in c["cell_key"]),
+                    reduced["cells"][0])
+        base_series = f"{pick['run_label']}:{pick['cell_key']}"
     reduced["contrasts"] = paired_contrasts(runs, labels, base_series, args)
 
     (out / "report.json").write_text(json.dumps(reduced, indent=2, default=str))

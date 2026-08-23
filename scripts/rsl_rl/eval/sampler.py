@@ -241,6 +241,7 @@ def select_clips(
     flat_clips: int | None = None,
     min_clip_len: int = 52,
     families: tuple[str, ...] | None = None,
+    exclude_families: tuple[str, ...] = (),
     tile_pick: str = "spread",
     clip_pick: str = "spread",
     seed: int = 20260820,
@@ -269,6 +270,9 @@ def select_clips(
             ``max(REFERENCE_OFFSETS) + 2``: at or below the observation window a clip has no
             unsaturated step and ``clip_end_reached`` would truncate it at step 0.
         families: Restrict to these families (normalised names); ``None`` takes all.
+        exclude_families: Drop these families after the ``families`` filter.  Applies to the
+            TERRAIN families only -- flat is not one of them, and is controlled by
+            ``flat_tiles``.
         tile_pick: One of :data:`TILE_PICKS`.
         clip_pick: One of :data:`CLIP_PICKS`.
         seed: Seed for the ``random`` pick modes.
@@ -302,6 +306,17 @@ def select_clips(
                 f"{sorted(by_family)}"
             )
         by_family = {f: by_family[f] for f in sorted(wanted)}
+    if exclude_families:
+        drop = {normalize_family(f) for f in exclude_families}
+        unknown = drop - set(by_family)
+        if unknown:
+            raise ValueError(
+                f"cannot exclude family/families {sorted(unknown)}: the library has "
+                f"{sorted(by_family)}. (Flat is excluded with --flat_tiles 0, not here.)"
+            )
+        by_family = {f: v for f, v in by_family.items() if f not in drop}
+        if not by_family:
+            raise ValueError("every terrain family was excluded; nothing to evaluate")
 
     # --- choose tiles, family by family -------------------------------------------------
     chosen_tiles: dict[str, list[int]] = {}

@@ -1064,5 +1064,90 @@ def test_reported_metrics_do_not_mix_linear_and_angular_units():
     assert not any(n in names for n in ("vel_rmse", "vel_rmse_all", "vel_rmse_mean"))
 
 
+# ---------------------------------------------------------------------------
+# 10. Identity and pairing across runs.
+# ---------------------------------------------------------------------------
+import evaluate as ev  # noqa: E402
+
+
+def _plan(created="2026-01-01T00:00:00+00:00", out="/a/eval_clips.h5", robots=25):
+    return {
+        "created": created,
+        "source_library": {"sha256": "abc", "path": "src.h5", "num_clips": 9},
+        "subset_library": {"sha256": "def", "path": out, "num_clips": 2, "flat_tiles": 1},
+        "selection": {"clips_per_tile": 2, "flat_tiles": 1, "seed": 1},
+        "tile_columns": [0, 1, -1],
+        "dt": 0.02, "max_offset": 50,
+        "clips": [{"clip_id": 0, "source_clip_id": 7, "terrain_id": 0, "column": 0,
+                   "clip_len": 300, "terrain_start_step": 10, "terrain_end_step": 200},
+                  {"clip_id": 1, "source_clip_id": 9, "terrain_id": 1, "column": 1,
+                   "clip_len": 400, "terrain_start_step": 20, "terrain_end_step": 300}],
+        "cells": [{"key": "clip__train__-", "robots_per_clip": robots}],
+        "generators": {},
+    }
+
+
+def test_clip_plan_hash_ignores_when_and_where_the_plan_was_written():
+    """Two runs over the same clips must be pairable.
+
+    ``plan_hash`` covers the creation timestamp and the subset's output path, both of which
+    differ by construction between two run directories -- so using it for the cross-run
+    alignment check refused every legitimate comparison, including two runs over an identical
+    264-clip plan.
+    """
+    a, b = _plan(), _plan(created="2026-09-09T12:00:00+00:00", out="/b/eval_clips.h5")
+    assert ev._clip_plan_hash(a) == ev._clip_plan_hash(b)
+    assert ev._plan_hash(a) == ev._plan_hash(b), \
+        "the resume hash must also ignore the volatile fields"
+
+
+def test_clip_plan_hash_changes_when_the_clips_do():
+    a = _plan()
+    b = _plan()
+    b["clips"][0]["source_clip_id"] = 8
+    assert ev._clip_plan_hash(a) != ev._clip_plan_hash(b)
+    c = _plan()
+    c["source_library"]["sha256"] = "different"
+    assert ev._clip_plan_hash(a) != ev._clip_plan_hash(c)
+
+
+def test_resume_hash_still_reacts_to_episode_counts():
+    """Changing R must invalidate a completed cell, even though the CLIP plan is unchanged."""
+    a, b = _plan(robots=25), _plan(robots=50)
+    assert ev._clip_plan_hash(a) == ev._clip_plan_hash(b), "same clips"
+    assert ev._plan_hash(a) != ev._plan_hash(b), "different work"
+
+
+def test_baseline_series_key_is_not_double_prefixed():
+    """The contrast table indexes series by '<run label>:<raw cell key>'.
+
+    Building the baseline from the DISPLAY key (already 'label:cell') prefixes it twice, which
+    matches no series and silently produced an empty contrast table rather than an error.
+    """
+    src = pathlib.Path(_EVAL / "report.py").read_text()
+    assert 'red["cell_key"] = key' in src, "the raw cell key must be kept alongside the display key"
+    assert "f\"{pick['run_label']}:{pick['cell_key']}\"" in src, \
+        "the baseline must be built from the RAW cell key"
+    assert "not found; no paired contrasts" in src, \
+        "a missing baseline must say so rather than return an empty list"
+
+
+def test_fell_is_documented_as_a_superset_of_base_fallen():
+    """The derived flag uses TOTAL tilt; base_fallen checks roll and pitch separately.
+
+    Roll 50 / pitch 50 is ~70 deg total with neither axis over its 70 deg limit, so the derived
+    flag fires first. That is the safe direction -- it never misses a real fall -- but the
+    docstring must not claim the two are identical.
+    """
+    src = pathlib.Path(_EVAL / "schema.py").read_text()
+    assert "SEPARATELY" in src and "superset" in src.lower(), \
+        "the tilt-definition mismatch must be documented at the constant"
+    roll = pitch = np.deg2rad(55.0)
+    total = np.arccos(np.cos(roll) * np.cos(pitch))       # tilt of a roll-then-pitch pose
+    assert total > schema.FALL_TILT_RAD, "70.8 deg total: the derived flag fires"
+    assert roll < schema.FALL_TILT_RAD and pitch < schema.FALL_TILT_RAD, \
+        "...while neither axis exceeds the per-axis limit"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

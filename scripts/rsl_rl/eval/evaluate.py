@@ -102,6 +102,9 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--flat_clips", type=int, default=0,
                    help="0 = flat_tiles * clips_per_tile")
     g.add_argument("--families", default="", help="comma list; empty = all")
+    g.add_argument("--exclude_families", default="",
+                   help="comma list of terrain families to drop (flat is controlled by "
+                        "--flat_tiles, not here)")
     g.add_argument("--tile_pick", default="spread", choices=sampler.TILE_PICKS)
     g.add_argument("--clip_pick", default="spread", choices=sampler.CLIP_PICKS)
     g.add_argument("--min_clip_len", type=int, default=0,
@@ -336,6 +339,7 @@ def stage_plan(args) -> dict:
         index, tiles_per_family=tiles_per_family, clips_per_tile=clips_per_tile,
         flat_tiles=flat_tiles,
         flat_clips=args.flat_clips or None, min_clip_len=min_clip_len, families=families,
+        exclude_families=tuple(f for f in args.exclude_families.split(",") if f.strip()),
         tile_pick=args.tile_pick, clip_pick=args.clip_pick, seed=args.plan_seed)
     print(f"[plan] selected {len(clips)} clips over {len(columns)} tile columns "
           f"({len(columns) - flat_tiles} terrain + {flat_tiles} flat)")
@@ -370,6 +374,8 @@ def stage_plan(args) -> dict:
         "selection": {"tiles_per_family": tiles_per_family, "clips_per_tile": clips_per_tile,
                       "flat_tiles": flat_tiles, "flat_clips": args.flat_clips or None,
                       "min_clip_len": min_clip_len, "families": list(families or []),
+                      "exclude_families": [f for f in args.exclude_families.split(",")
+                                           if f.strip()],
                       "tile_pick": args.tile_pick, "clip_pick": args.clip_pick,
                       "seed": args.plan_seed},
         "tile_columns": [int(c) for c in columns],
@@ -389,6 +395,7 @@ def stage_plan(args) -> dict:
         "generators": contracts,
         "cells": cells,
     }
+    plan["clip_plan_hash"] = _clip_plan_hash(plan)
     plan["plan_hash"] = _plan_hash(plan)
     (out_dir / "plan.json").write_text(json.dumps(plan, indent=2, default=str))
     _write_manifest(args, out_dir, plan)
@@ -474,11 +481,48 @@ def _cell_list(args, contracts: dict[str, dict], robots: dict[str, int]) -> list
     return cells
 
 
-def _plan_hash(plan: dict) -> str:
-    """Content hash of the plan, excluding the hash field itself."""
+#: Plan fields that say nothing about WHAT is being evaluated: a timestamp, and the output
+#: path of the subset library (which is per run directory by construction).  Hashing them
+#: makes two identical plans look different, which is precisely what the cross-run alignment
+#: check must not do -- measured: two runs over the same 264 clips, same columns, same
+#: selection and same source library still produced different hashes and would have been
+#: refused as "different clip plans".
+_VOLATILE_PLAN_FIELDS = ("plan_hash", "clip_plan_hash", "created", "subset_library")
+
+
+def _clip_plan_hash(plan: dict) -> str:
+    """Hash of the CLIP PLAN alone: which clips, on which columns, from which library.
+
+    This is the identity two runs must share for their cells to be paired on clip id. It
+    deliberately excludes the policy, the generators, the per-cell episode counts and the
+    run's own paths, because none of those change what ``clip_id`` MEANS.
+    """
     import hashlib  # noqa: PLC0415
 
-    body = {k: v for k, v in plan.items() if k != "plan_hash"}
+    body = {
+        "source_sha256": plan["source_library"]["sha256"],
+        "selection": plan["selection"],
+        "tile_columns": plan["tile_columns"],
+        "dt": plan["dt"],
+        "max_offset": plan["max_offset"],
+        "clips": [[c["clip_id"], c["source_clip_id"], c["terrain_id"], c["column"],
+                   c["clip_len"], c["terrain_start_step"], c["terrain_end_step"]]
+                  for c in plan["clips"]],
+    }
+    blob = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()
+
+
+def _plan_hash(plan: dict) -> str:
+    """Content hash of the whole plan, for RESUME.
+
+    Covers the per-cell episode counts and the generators, so changing either invalidates a
+    completed cell. Excludes :data:`_VOLATILE_PLAN_FIELDS` so re-planning the same thing in
+    the same directory does not force a re-run.
+    """
+    import hashlib  # noqa: PLC0415
+
+    body = {k: v for k, v in plan.items() if k not in _VOLATILE_PLAN_FIELDS}
     blob = json.dumps(body, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(blob.encode()).hexdigest()
 

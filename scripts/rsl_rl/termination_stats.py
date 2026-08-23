@@ -30,6 +30,8 @@ from __future__ import annotations
 import argparse
 import os
 
+import numpy as np
+
 from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description=__doc__)
@@ -149,16 +151,69 @@ def load_policy(env):
     return act
 
 
+def _resolve_env_families(env) -> "np.ndarray":
+    """Terrain family per env, from the importer's tile ids and the library manifest.
+
+    ``flat`` for the synthesised flat tiles (``terrain_id == -1``), which have no manifest
+    entry by design. Falls back to the tile's coarse ``type`` when an entry predates the
+    ``family`` field, and to ``"?"`` if the terrain is not a clip terrain at all.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    importer = getattr(env.scene, "terrain", None)
+    tid = getattr(importer, "env_terrain_id", None)
+    if tid is None:
+        return np.full(env.num_envs, "?", dtype=object)
+    ids = tid.detach().to("cpu").numpy().astype(int)
+    manifest = []
+    try:
+        import json  # noqa: PLC0415
+
+        import h5py  # noqa: PLC0415
+        with h5py.File(env.cfg.scene.terrain.clip_library_path, "r") as f:
+            raw = f.attrs.get("terrain_manifest")
+            manifest = json.loads(raw) if isinstance(raw, str) else (raw or [])
+    except Exception as exc:  # noqa: BLE001 - a missing manifest costs labels, not the run
+        print(f"[termination_stats] could not read the terrain manifest ({exc}); "
+              "families will be reported by terrain id.")
+    fam = {}
+    for m in manifest:
+        name = str(m.get("family") or m.get("type") or "?")
+        if name.startswith("family_"):
+            name = name[len("family_"):]
+        if name.endswith(".h5"):
+            name = name[: -len(".h5")]
+        fam[int(m["terrain_id"])] = name
+    return np.array([("flat" if i < 0 else fam.get(i, f"terrain_{i}")) for i in ids],
+                    dtype=object)
+
+
 def main() -> None:
     """Roll out and report the per-termination episode shares."""
     env, _ = build_env()
     policy = load_policy(env)
     obs, _ = env.reset()
 
-    # Weighted accumulation of extras["log"]: each entry is a mean over the envs that reset
-    # on that step, so it has to be weighted by how many did.
-    totals: dict[str, float] = {}
+    # DIRECT per-episode-end counts, not a step-mean of ``extras["log"]``.
+    #
+    # ``TerminationManager.reset`` logs ``_last_episode_dones.float().mean(dim=0)`` -- the mean
+    # over ALL envs of a persistent buffer holding each env's LAST COMPLETED episode, ignoring
+    # the ``env_ids`` it was handed. An env that has not finished an episode yet contributes a
+    # row of zeros, so weighting that population statistic by the number of envs resetting on
+    # a step mixes two denominators and undercounts every term: measured, the shares summed to
+    # 0.901 instead of 1.0, and the missing 9.9% was the cold-start window. Counting the terms
+    # that actually fired on each ending episode has no such bias and sums to >= 1 by
+    # construction (> 1 only when several terms fire on one step). Same fix
+    # ``episode_stats.EpisodeStatsAccumulator`` already applies, for the same reason.
+    term_counts: dict[str, int] = {}
+    fam_term_counts: dict[str, dict[str, int]] = {}
+    fam_episodes: dict[str, int] = {}
+    length_total = 0.0
     episodes = 0
+
+    # Which terrain family each env stands on. Static here: nothing moves an env between
+    # tiles (no curriculum term), so it is resolved once.
+    family_of_env = _resolve_env_families(env)
 
     # Per-frame attribution for ee_pose_error: knowing it fires is not actionable, knowing
     # it is one wrist on a long kinematic chain (rather than a foot) is.  Read the same
@@ -308,13 +363,23 @@ def main() -> None:
             fire["maxfrm"] += float(pe[fired].max(dim=-1).values.sum())
             fire["nframes"] += float((pe[fired] > pos_lim).sum(dim=-1).float().sum())
         episodes += n
+        done_np = (terminated | truncated).detach().to("cpu").numpy().astype(bool)
+        tm = env.termination_manager
+        for name in tm.active_terms:
+            fired = tm.get_term(name).detach().to("cpu").numpy().astype(bool) & done_np
+            term_counts[name] = term_counts.get(name, 0) + int(fired.sum())
+            for fam in set(family_of_env.tolist()):
+                m = (family_of_env == fam) & fired
+                fam_term_counts.setdefault(fam, {})
+                fam_term_counts[fam][name] = fam_term_counts[fam].get(name, 0) + int(m.sum())
+        for fam in set(family_of_env.tolist()):
+            fam_episodes[fam] = fam_episodes.get(fam, 0) + int(
+                ((family_of_env == fam) & done_np).sum())
         log = extras.get("log") or extras.get("episode") or {}
-        for key, value in log.items():
-            if key.startswith("Episode_Termination/") or key == "Episode_Length":
-                totals[key] = totals.get(key, 0.0) + float(value) * n
+        if "Episode_Length" in log:
+            length_total += float(log["Episode_Length"]) * n
 
-    rows = sorted(((k.split("/")[-1], v / max(episodes, 1))
-                   for k, v in totals.items() if k.startswith("Episode_Termination/")),
+    rows = sorted(((name, c / max(episodes, 1)) for name, c in term_counts.items()),
                   key=lambda kv: -kv[1])
     factors = (f"obs_noise={'OFF' if NO_OBS_NOISE else 'ON'}  "
                f"events={'OFF' if NO_EVENTS else 'ON'}  "
@@ -330,9 +395,29 @@ def main() -> None:
         "",
         f"  {'termination':28} {'share of episodes':>18}",
     ]
-    lines += [f"  {name:28} {share:17.3f}" for name, share in rows]
-    if "Episode_Length" in totals:
-        lines += ["", f"mean episode length: {totals['Episode_Length'] / max(episodes,1):.1f}"]
+    lines += [f"  {name:28} {share:17.3f}  [{term_counts[name]:>6} of {episodes}]"
+              for name, share in rows]
+    total_share = sum(term_counts.values()) / max(episodes, 1)
+    lines += [f"  {'(sum)':28} {total_share:17.3f}  "
+              f"{'-- > 1 means several terms fired on one step' if total_share > 1.001 else ''}"]
+    if length_total:
+        lines += ["", f"mean episode length: {length_total / max(episodes, 1):.1f}"]
+
+    # Per-family breakdown: which terrain a term fires on is the actionable half. A bound
+    # that trips only on stairs is a different problem from one that trips everywhere.
+    fams = sorted(fam_episodes, key=lambda f: -fam_episodes[f])
+    term_names = [name for name, _ in rows]
+    lines += ["", "termination share BY TILE FAMILY (share of that family's episode-ends)",
+              f"  {'family':<18} {'eps':>6} " + " ".join(f"{n[:14]:>15}" for n in term_names)]
+    for fam in fams:
+        ne = fam_episodes[fam]
+        if not ne:
+            continue
+        cells = " ".join(f"{fam_term_counts.get(fam, {}).get(n, 0) / ne:>15.3f}"
+                         for n in term_names)
+        lines.append(f"  {fam:<18} {ne:>6} {cells}")
+    lines += ["  (counts per family are in the same order; a family with few envs has a"
+              "  correspondingly coarse share)"]
     lines += [
         "",
         f"ee_pose_error attribution  (limits: {pos_lim} m / {ori_lim} rad)",

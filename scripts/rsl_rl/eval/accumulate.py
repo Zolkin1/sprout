@@ -317,6 +317,27 @@ class EpisodeAccumulator:
         return out
 
     # ------------------------------------------------------------------
+    def fold_terminal(self, env_ids: torch.Tensor) -> None:
+        """Fold the terminal frame's height/tilt into the extremes for ``env_ids``.
+
+        Called from the clip reset, which is the only place the state of the episode that
+        just ended is still readable.  Only the extremes and the fall crossing are updated --
+        the running SUMS deliberately are not, because their divisor is the folded step count
+        and adding a step to one without the other would bias every mean.
+
+        Without this the accumulator's ``~dones`` mask excludes exactly the frame that ended
+        the episode, which for a fall is exactly the frame that crossed the threshold.
+        """
+        d = self.rd
+        ids = env_ids.to(self.device)
+        height = d.root_pos_w[:, 2][ids]
+        tilt = self._tilt(d)[ids]
+        self.min_h[ids] = torch.minimum(self.min_h[ids], height)
+        self.max_tilt[ids] = torch.maximum(self.max_tilt[ids], tilt)
+        crossed = (self.first_fall[ids] < 0) & (
+            (height < self.fall_min_height) | (tilt > self.fall_tilt_rad))
+        self.first_fall[ids] = torch.where(crossed, self.steps[ids], self.first_fall[ids])
+
     def snapshot(self, env_ids: torch.Tensor) -> dict[str, np.ndarray]:
         """Reduce the running sums for ``env_ids`` into per-episode values.
 

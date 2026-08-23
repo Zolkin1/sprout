@@ -132,10 +132,21 @@ COLUMN_UNITS: dict[str, str] = {
     "foot_slip_dist_m": "m",
 }
 
-#: The fall predicate, matching ``mdp.base_fallen``'s defaults so the derived column and the
-#: tracker task's own termination agree.  MuJoCo uses a different rule (``qpos[2] < 0.2``,
-#: patched with ``|roll| > 1.0`` in ``compare_sim2sim``), which is exactly why the table
-#: stores the height and tilt extremes instead of only a flag.
+#: The fall predicate applied to the recorded extremes.
+#:
+#: The height limb matches ``mdp.base_fallen`` exactly. The tilt limb does NOT: ``base_fallen``
+#: checks ``|roll|`` and ``|pitch|`` SEPARATELY against 70 deg, while the stored
+#: ``max_tilt_rad`` is the total angle from upright, so a pose at roll 50 / pitch 50 is ~70 deg
+#: total with neither axis over its limit. The derived flag therefore fires slightly EARLIER
+#: than the termination -- measured at 0.054 against 0.045 on the same rollout.
+#:
+#: The direction is the safe one: derived falls are a SUPERSET of the termination's, so the
+#: column never misses a real fall. Quote the ``base_fallen`` share when the exact repo
+#: predicate is wanted. Making them identical would mean storing max |roll| and max |pitch|
+#: separately rather than one total-tilt column.
+#:
+#: MuJoCo uses a third rule (``qpos[2] < 0.2``, patched with ``|roll| > 1.0`` in
+#: ``compare_sim2sim``), which is why the table stores the extremes rather than only a flag.
 FALL_MIN_HEIGHT_M: float = 0.5
 FALL_TILT_RAD: float = np.deg2rad(70.0)
 
