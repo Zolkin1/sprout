@@ -365,6 +365,10 @@ class GenTrackerPolicy:
                 "carries no cadence (the field lives on FmTrackingCommandCfg, not on the clip "
                 "command), and a tracker-only deploy re-plans nothing."
             )
+        #: Whether the cadence is the ARTIFACT's or merely the caller's. The clip path needs
+        #: to know: under the ``plan`` anchor it latches on this cadence, and a latch of the
+        #: wrong period is a wrong observation that no width check can see (_check_clip_anchor).
+        self._fm_update_every_from_meta = meta_every is not None
         if meta_every is not None:
             self.fm_update_every, src = max(int(meta_every), 1), "tracker metadata"
         else:
@@ -385,6 +389,7 @@ class GenTrackerPolicy:
         self._resolve_depth_cameras()
         self._build_orderings()
         self._build_window()
+        self._check_clip_anchor()
         self._check_horizon()
         self._history = BatchedHistory(1, self.ctx.N)
         self._lead_buf = deque(maxlen=self.fm_lead_ticks + 1)
@@ -401,6 +406,14 @@ class GenTrackerPolicy:
         # pose and the re-anchor is an identity to ~2e-15.
         self._anchor_pos = np.zeros(3)
         self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
+        # -- clip-path serving state (the counterpart of the three above) --
+        # The clip path has no re-plan to hang a cadence on, so it counts its own steps and
+        # latches its own anchor. Separate from _ctrl_step because the two advance on
+        # different calls: _ctrl_step moves in _update_generator (and advance_dormant_step),
+        # which the obelisk clip tick never reaches.
+        self._clip_step = -1
+        self._clip_anchor_pos: np.ndarray | None = None
+        self._clip_anchor_quat: np.ndarray | None = None
         # Node served on the PREVIOUS step, already re-anchored onto the robot as it was
         # then -- the frame the dataset's history rows use. None until the first serve.
         self._prev_served_node: np.ndarray | None = None
@@ -908,6 +921,135 @@ class GenTrackerPolicy:
                 "with a generator trained for it."
             )
 
+    @property
+    def window_anchor(self) -> str:
+        """What the window's ``base_pose`` POSITION is measured from: ``plan`` or ``robot_now``.
+
+        Read off the tracker's own ``base_pose_convention`` metadata (see :meth:`_build_window`),
+        never inferred. The two arms are identical in width and in every other block, so a
+        tracker trained under one loads clean against the other and merely steers wrong --
+        which is why the convention travels in the artifact and consumers ask rather than assume.
+        """
+        return self._window_anchor
+
+    def _check_clip_anchor(self) -> None:
+        """Refuse a ``plan`` tracker whose re-anchor cadence is not the ARTIFACT's.
+
+        Under ``plan`` the clip path has to latch its window anchor on the same cadence the
+        teacher latched it on (``MotionSequenceCommand._reanchor_ego_envs`` does it every
+        ``fm_snap_every`` steps for every env). That number lives in ``tracker.onnx``
+        metadata and nowhere else, so falling back to the constructor default would serve a
+        sawtooth of the wrong PERIOD -- and since the two anchor arms have identical widths,
+        nothing downstream can see it. The generator path raises the same way at
+        :meth:`load`; this is the tracker-only half of that guard.
+
+        Raises:
+            ValueError: If the tracker declares ``plan`` but carries no ``fm_update_every``.
+        """
+        if self._window_anchor != "plan" or self._fm_update_every_from_meta:
+            return
+        raise ValueError(
+            f"{self.tracker_onnx} declares base_pose_convention -> window_anchor='plan', but "
+            "carries no 'fm_update_every'. Under that convention the reference window's "
+            "base_pose position is measured from the robot as it was at the LAST LATCH, so "
+            "the latch period is part of the observation contract -- and it would fall back "
+            f"to the caller's default of {self.fm_update_every}. Re-export the tracker with "
+            "play.py --fm_checkpoint so the cadence travels with it."
+        )
+
+    def assert_clip_reference_compatible(self, clip) -> None:
+        """Refuse a clip whose re-anchor cadence cannot produce the window this tracker wants.
+
+        ONE statement of the rule, called by both clip consumers (``gen_tracker_runner.py``
+        and the obelisk controller) so the two cannot drift.
+
+        Under ``plan`` the anchor is the robot's root at the last latch, and the clip's own
+        placement is re-solved from the robot on its own cadence. Three cases:
+
+        * **ego-anchored on the SAME cadence** -- placement and anchor are solved from the
+          robot at the same instant, so the robot's position and heading cancel exactly and
+          ``base_pose`` reduces to ``Rz(-yaw_latch) (p_clip(s+o) - p_clip(s_latch))``. A pure
+          function of the clip: no odometry anywhere, which is what makes this arm the one
+          the C++ deploy runtime can serve.
+        * **ego-anchored on a DIFFERENT cadence** -- refused. Up to ``every - 1`` steps of the
+          robot's egomotion leak into the block, matching neither training nor an odometry-free
+          serve, and it looks exactly like a healthy window.
+        * **world-anchored** -- allowed and training-matched (it is what a non-ego env sees),
+          but the block is then a real world-frame difference, so it is only as good as the
+          base POSITION estimate. Warned about rather than refused, because MuJoCo has a true
+          base pose and the A/B is worth keeping.
+
+        Under ``robot_now`` the anchor is the measured root every step and the cadence is
+        free, so nothing is checked.
+
+        Args:
+            clip: A :class:`~deploy.clip_reference.ClipReference` (anything carrying
+                ``ego_anchor`` and ``ego_anchor_every``).
+
+        Raises:
+            ValueError: On an ego cadence that disagrees with the tracker's.
+        """
+        if self._window_anchor != "plan":
+            return
+        if not bool(getattr(clip, "ego_anchor", False)):
+            print("[WARN GenTrackerPolicy] window_anchor='plan' with a WORLD-anchored clip: "
+                  "the base_pose block is measured from the robot's world root at each latch, "
+                  "so it is only as good as the base position estimate. Fine in MuJoCo; on a "
+                  "robot use ego anchoring, which cancels the world frame out entirely.")
+            return
+        every = int(getattr(clip, "ego_anchor_every", 0))
+        if every != self.fm_update_every:
+            raise ValueError(
+                f"clip ego_anchor_every={every} but the tracker latches its window anchor "
+                f"every fm_update_every={self.fm_update_every} steps. Under window_anchor="
+                "'plan' the two must fire on the same step or the robot's egomotion between "
+                "them leaks into base_pose -- a window that matches neither training nor an "
+                "odometry-free serve, and that is indistinguishable from a healthy one by "
+                f"shape. Set the clip cadence to {self.fm_update_every}."
+            )
+
+    def _clip_window_anchor(self, state: dict,
+                            clip_tick: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Advance the clip tick and return the pose its ``base_pose`` block is measured from.
+
+        The clip counterpart of the generator's ``_anchor_pos`` / ``_anchor_quat`` latch, and
+        of Isaac's ``MotionSequenceCommand.window_anchor``. Called once per served step from
+        :meth:`create_obs_from_reference`, which is the ONE call every clip consumer makes --
+        so the cadence cannot be missed by a caller that forgets to tick something else.
+        (``advance_dormant_step`` was the obvious place and is the wrong one: the obelisk
+        controller's clip tick never calls it, so the latch would silently never fire on the
+        robot while working in MuJoCo.)
+
+        **The cadence is counted on the CALLER's clip tick, not on this method's own calls.**
+        The consumer decides re-placement with the same number, and the two have to fire on
+        the same step or the robot's egomotion between them leaks into ``base_pose``. They
+        would drift apart in two ways otherwise, both silent: playback that starts partway
+        into a clip puts the phase origin at ``start_step`` rather than at zero, and the
+        obelisk depth watchdog FREEZES the clip step while control ticks keep arriving --
+        after which every latch is off by however long the freeze lasted. Keying both off the
+        clip's own tick also makes the frozen case coherent: the reference is not moving, so
+        neither the placement nor the anchor should.
+
+        Args:
+            state: The step's state dict, supplying the measured base pose.
+            clip_tick: Steps of playback elapsed, i.e. the consumer's own
+                ``clip_step - clip.start_step``. None falls back to counting calls, which is
+                the same thing for a caller that starts at the clip's beginning and never
+                stalls -- synthetic references and tests.
+
+        Returns:
+            ``(anchor_pos, anchor_quat_xyzw)`` -- the latch under ``plan``, the measured root
+            under ``robot_now``.
+        """
+        f64 = lambda x: np.asarray(x, dtype=np.float64)
+        self._clip_step = self._clip_step + 1 if clip_tick is None else int(clip_tick)
+        if self._window_anchor != "plan":
+            return f64(state["root_pos"]), f64(state["root_quat"])
+        if self._clip_anchor_pos is None or self._clip_step % self.fm_update_every == 0:
+            self._clip_anchor_pos = f64(state["root_pos"]).copy()
+            self._clip_anchor_quat = f64(state["root_quat"]).copy()
+        return self._clip_anchor_pos, self._clip_anchor_quat
+
     def _check_horizon(self) -> None:
         """Refuse a generator whose horizon cannot cover the tracker's window.
 
@@ -1386,7 +1528,8 @@ class GenTrackerPolicy:
         """
         return self._pred[0].copy() if self._pred_valid else None
 
-    def create_obs_from_reference(self, state: dict, reference: dict) -> np.ndarray:
+    def create_obs_from_reference(self, state: dict, reference: dict,
+                                  clip_tick: int | None = None) -> np.ndarray:
         """Build the tracker observation from an EXTERNAL reference, bypassing the generator.
 
         The baked-clip counterpart of :meth:`create_obs`: the caller supplies the world-frame
@@ -1403,6 +1546,11 @@ class GenTrackerPolicy:
             reference: ``{"window": [...]}``, one world-frame entry per
                 :attr:`window_offsets` value, offset 0 first, each optionally carrying its
                 own ``"command"``. See :meth:`deploy.clip_reference.ClipReference.reference_at`.
+            clip_tick: Steps of playback elapsed (``clip_step - clip.start_step``). Under
+                ``window_anchor='plan'`` this is what the anchor latch is counted on, and it
+                must be the SAME number the caller re-places the clip on -- see
+                :meth:`_clip_window_anchor`. Both real consumers pass it; omit it only for a
+                synthetic reference that starts at zero and never stalls.
 
         Returns:
             The tracker observation ``[1, num_obs]``.
@@ -1416,7 +1564,8 @@ class GenTrackerPolicy:
                 f"offsets {list(self.window_offsets)}. Build it with "
                 "ClipReference.reference_at(step, policy.window_offsets)."
             )
-        return self._build_obs(state, reference=reference)
+        return self._build_obs(state, reference=reference,
+                               window_anchor=self._clip_window_anchor(state, clip_tick))
 
     def _stash_window(self, served: np.ndarray) -> np.ndarray:
         """Remember the window that went into THIS observation, and pass it through.
@@ -1450,13 +1599,13 @@ class GenTrackerPolicy:
             raise RuntimeError("no observation has been assembled yet, so no window was served")
         return np.array(self._last_served_window, dtype=np.float64, copy=True)
 
-    def _reference_window(self, window: list[dict], root_pos, root_quat) -> np.ndarray:
+    def _reference_window(self, window: list[dict], anchor_pos, anchor_quat) -> np.ndarray:
         """Pack the reference window, mirroring ``mdp.observations.reference_window``.
 
         Per step, in ``reference_window_layout`` order: ``base_pose`` (9) -- the reference
-        base pose in the robot's CURRENT YAW frame, position ``ref - actual`` (3) plus
+        base pose in the ANCHOR's yaw frame, position ``ref - anchor`` (3) plus
         ``R_yawT R_ref`` as a 6D rotation (6); ``base_vel``
-        (6) -- reference base lin+ang velocity rotated into that same current base frame;
+        (6) -- reference base lin+ang velocity rotated into that same anchor frame;
         ``joint_pos`` / ``joint_vel`` (nj each) -- **in the robot's own joint order**, so
         they line up elementwise with the proprioception terms; ``ee_pos`` (3 per frame)
         -- reference end-effector positions in *that step's* reference base frame.
@@ -1467,10 +1616,18 @@ class GenTrackerPolicy:
 
         Every block is relative, so no world coordinate reaches the policy.
 
+        WHAT the anchor is depends on the tracker's own convention and is decided by the
+        caller (:meth:`_clip_window_anchor`), not here: ``robot_now`` measures against the
+        robot this step, making ``base_pose``'s position a tracking ERROR; ``plan`` measures
+        against the root at the last latch, making it the reference's position in the plan
+        frame -- a sawtooth that ramps over ``fm_update_every`` ticks with the robot's own
+        commanded displacement and resets. Serving one to a tracker trained on the other is
+        undetectable by shape, which is why this takes an anchor rather than a robot pose.
+
         Args:
             window: One reference state per window offset, offset 0 first.
-            root_pos: The robot's measured base position, world frame.
-            root_quat: The robot's measured base orientation, world xyzw.
+            anchor_pos: World position the block is measured from.
+            anchor_quat: World orientation (xyzw) whose YAW defines the frame.
 
         Returns:
             The flat window, ``[num_steps * D]`` for the selected blocks.
@@ -1486,25 +1643,45 @@ class GenTrackerPolicy:
         ref_quat = np.stack([f64(r["root_quat"]) for r in window])               # [K,4]
         ref_lin = np.stack([f64(r["root_lin"]) for r in window])                 # [K,3]
         ref_ang = np.stack([f64(r["root_ang"]) for r in window])                 # [K,3]
-        jp = np.stack([f64(r["jp"])[self._fm_to_isaac] for r in window])         # [K,nj]
-        jv = np.stack([f64(r["jv"])[self._fm_to_isaac] for r in window])         # [K,nj]
+        # NOT permuted. ClipReference is constructed with policy.get_joint_names(), so these
+        # arrive in the isaac order the window wants already -- both call sites do it
+        # (gen_tracker_runner.py, the obelisk controller). The old `[self._fm_to_isaac]` here
+        # was a SECOND permutation that happened to be an identity only because both shipped
+        # artifacts have fm_meta.joint_names == joint_names_isaac; against a generator trained
+        # in the clip-library order it would have scrambled 29 joints silently.
+        jp = np.stack([f64(r["jp"]) for r in window])                            # [K,nj]
+        jv = np.stack([f64(r["jv"]) for r in window])                            # [K,nj]
+        if jp.shape[1] != nj or jv.shape[1] != nj:
+            raise ValueError(
+                f"clip reference carries {jp.shape[1]} joint positions / {jv.shape[1]} "
+                f"velocities but the tracker observes {nj}. Build the ClipReference with "
+                "policy.get_joint_names()."
+            )
         ee = (np.stack([f64(r["frame_pos"])[:n_ee] for r in window]) if n_ee > 0
               else np.zeros((k, 0, 3)))                                          # [K,E,3]
         nodes = world_to_window(
-            f64(root_pos)[None, :], f64(root_quat)[None, :],
+            f64(anchor_pos)[None, :], f64(anchor_quat)[None, :],
             ref_pos, ref_quat, ref_lin, ref_ang, jp, jv, ee,
             blocks=self.reference_blocks,
         )                                                                        # [K,D]
         assert nodes.shape == (k, window_dim(nj, n_ee, self.reference_blocks)), nodes.shape
         return nodes.reshape(-1)
 
-    def _build_obs(self, state: dict, reference: dict | None) -> np.ndarray:
+    def _build_obs(self, state: dict, reference: dict | None,
+                   window_anchor: tuple[np.ndarray, np.ndarray] | None = None) -> np.ndarray:
         """Build the policy obs from proprioception + the world reference (numpy).
 
         Mirrors ``mdp/observations/observations.py`` exactly. The reference half is the
         merged ``reference_window`` + ``command_window`` pair; the proprioception half is
         the raw current step, which :meth:`_assemble` then stacks into each term's
         history window.
+
+        Args:
+            state: The step's state dict.
+            reference: The clip's world-frame window, or None for the generator path.
+            window_anchor: ``(pos, quat_xyzw)`` the reference window is measured from. Only
+                read on the clip path, where :meth:`_clip_window_anchor` supplies it; the
+                generator path carries its anchor inside :meth:`_serve_nodes` instead.
         """
         # The FM branch has no world-frame window to pack: its prediction IS the term.
         window = None if reference is None else reference["window"]
@@ -1528,7 +1705,8 @@ class GenTrackerPolicy:
             "actions": np.asarray(self._trk.action_isaac, dtype=np.float64),
             "reference_window": self._stash_window(
                 self._fm_reference_window(state) if window is None
-                else self._reference_window(window, root_pos, root_quat)),
+                else self._reference_window(window, *(window_anchor
+                                                      or (root_pos, root_quat)))),
             # The joystick-level command over the same offsets. Deliberately separate from
             # the reference window so it stays clean: at deploy it comes from the joystick
             # or a scripted profile, not the generator. A clip reference supplies each
@@ -1703,6 +1881,11 @@ class GenTrackerPolicy:
             self._pred_idx = 0
             self._anchor_pos = np.zeros(3)
             self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
+            # The clip latch, for the same reason: it describes a pose from before the reset,
+            # and -1 puts the next served step back on the cadence's first tick.
+            self._clip_step = -1
+            self._clip_anchor_pos = None
+            self._clip_anchor_quat = None
             self._prev_served_node = None
             # NOT _plan_id: it identifies a sample, and restarting it at 0 would make two
             # plans from different episodes share an id in one recording.

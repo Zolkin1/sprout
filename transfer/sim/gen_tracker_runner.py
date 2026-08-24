@@ -1160,9 +1160,15 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             if total_time > 0 and robot.mj_data.time > total_time:
                 return True
             s = min(clip_step, clip.real_steps - 1)
+            # Same teacher-forcing hook the FM loop uses: the `actions` observation term is
+            # the runtime's own previous output, so a replay that did not record it would be
+            # autoregressive through that one term and its ticks would stop being independent.
+            prev_action = (np.asarray(policy._trk.action_isaac, dtype=np.float64).copy()
+                           if replay is not None else None)
             state = build_state(robot, policy, clip.command_at(s), depth_cams,
                                 fm_depth_cams=fm_depth_cams,
-                                want_depth_hits=viz)
+                                want_depth_hits=viz,
+                                want_raw_depth=replay is not None)
             if (not clip_only) and robot.mj_data.time >= clip_handoff_time:
                 if not handed_off:
                     handoff_time = robot.mj_data.time
@@ -1180,15 +1186,24 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 # reference recedes ahead of the robot, mirroring the teacher's
                 # training-time ego re-anchoring. World-anchored mode (default) leaves
                 # the fixed placement untouched.
-                if clip.ego_anchor and (clip_step - clip.start_step) % max(clip.ego_anchor_every, 1) == 0:
+                # ONE number for both decisions: the clip's own elapsed tick. The policy
+                # latches its window anchor on it too (create_obs_from_reference below), and
+                # under window_anchor='plan' the two must fire on the same step.
+                clip_tick = clip_step - clip.start_step
+                if clip.ego_anchor and clip_tick % max(clip.ego_anchor_every, 1) == 0:
                     clip.reanchor_ego(s, state["root_pos"], state["root_quat"])
                 # Keep the generator's cadence counter moving while the clip drives, so the
                 # first re-plan after the handoff lands on the phase it would have.
                 policy.advance_dormant_step()
                 ref = clip.reference_at(s, policy.window_offsets)
-                obs = policy.create_obs_from_reference(state, ref)
+                obs = policy.create_obs_from_reference(state, ref, clip_tick=clip_tick)
             action = policy.get_action(obs, robot.joint_names)
             robot.apply_action(action)
+            # Recorded on the CLIP path too, so --dump_replay means the same thing in both
+            # modes. Without this the flag silently produced an empty stream here, and the
+            # comparison built on it died at write() rather than at the missing call.
+            if replay is not None:
+                _record_replay_tick(replay, policy, state, obs, prev_action)
             if robot.failed():
                 return False
             draw_viz(viewer, state)
@@ -1499,9 +1514,13 @@ def main() -> None:
                         help="Keep the MJCF's hand-written actuator kp/kv instead of the gains "
                              "the policy exported. Default OFF: the trained gains win, so a "
                              "retune in training reaches sim2sim without editing the XML.")
-    parser.add_argument("--clip_ego_anchor_every", type=int, default=10,
-                        help="Re-anchor cadence (control steps) for --clip_ego_anchor; should match "
-                             "the teacher's ego_anchor_every (default 10, ~0.2s at dt=0.02).")
+    parser.add_argument("--clip_ego_anchor_every", type=int, default=0,
+                        help="Re-anchor cadence (control steps) for --clip_ego_anchor. 0 (the "
+                             "default) DERIVES it from the tracker's own fm_update_every, which "
+                             "under window_anchor='plan' is not a preference but a requirement: "
+                             "the clip placement and the window anchor have to be solved from the "
+                             "robot at the same instant or the egomotion between them leaks into "
+                             "base_pose. Set it explicitly only to reproduce an older run.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1639,12 +1658,14 @@ def main() -> None:
                              clip_id=clip_id,
                              start_time=args.clip_start_time,
                              ego_anchor=args.clip_ego_anchor,
-                             ego_anchor_every=args.clip_ego_anchor_every,
+                             ego_anchor_every=(args.clip_ego_anchor_every
+                                               or policy.fm_update_every),
                              root_frame_bodies=policy._trk.get_root_frame_bodies())
         if tile_origin is not None:
             clip.set_placement(-tile_origin, np.array([0.0, 0.0, 0.0, 1.0]))
             print("[INFO] Clip placed into the tile scene: subtracting its "
                   f"tile-local origin {tile_origin.tolist()} m from every pose.")
+        policy.assert_clip_reference_compatible(clip)
         if abs(clip.dt - policy.get_dt()) > 1e-6:
             print(f"[WARN] Clip dt {clip.dt} != policy dt {policy.get_dt()}; "
                   "regenerate the clip at the control dt.")
@@ -1660,7 +1681,8 @@ def main() -> None:
               f"{clip.real_length_s:.2f}s @ dt={clip.dt}; "
               f"start={clip.start_step * clip.dt:.2f}s (step {clip.start_step}); "
               f"handoff={'clip-only' if clip_handoff_time < 0 else f'{clip_handoff_time:.2f}s'}; "
-              f"anchor={f'ego/every {args.clip_ego_anchor_every}' if args.clip_ego_anchor else 'world'}; "
+              f"anchor={f'ego/every {clip.ego_anchor_every}' if args.clip_ego_anchor else 'world'}"
+              f" ({policy.window_anchor}); "
               f"total_time={total_time:.2f}s")
 
     # Depth cameras, if the loaded artifacts use them. The contract comes from the ONNX
