@@ -162,7 +162,17 @@ class G1Estimator(ObeliskEstimator):
         msg.q_joints = self.joint_pos
         msg.v_joints = self.joint_vel
         msg.joint_names = self.joint_names
-        msg.base_link_name = "pelvis"
+        # MUST be the ROOT LINK of the URDF robot_state_publisher loads (low_level.yml's
+        # `urdf:`), because obelisk's viz node parents the base transform to exactly this
+        # string: `child_frame_id = tf_prefix + msg.base_link_name`. Get it wrong and the TF
+        # tree splits in two -- world->this, and the URDF's own root->every link -- with
+        # nothing joining them. RViz then reports "No transform from [<every link>]" and draws
+        # nothing, while the URDF itself parses fine, so the error points at the model rather
+        # than at this string.
+        #
+        # It said "pelvis" until the perceptive robot landed, whose root is `pelvis_link`.
+        # Pinned by tests/test_base_link_name_matches_the_urdf.py.
+        msg.base_link_name = "pelvis_link"
         msg.q_base = np.concatenate([self.base_pos, self.base_quat]).tolist()
         msg.v_base = np.concatenate([self.base_lin_vel, self.base_ang_vel_b]).tolist()
         msg.header.stamp = self.get_clock().now().to_msg()
