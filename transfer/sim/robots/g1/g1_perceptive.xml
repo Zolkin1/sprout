@@ -7,7 +7,7 @@
       <joint damping="1" armature="0.01" frictionloss="0.1" />
     </default>
     <default class="hip_pitch_pos">
-      <position kp="40.18" kv="2.56" ctrllimited="false" />
+      <position kp="99.0984" kv="6.3088" ctrllimited="false" />
     </default>
     <default class="hip_roll_pos">
       <position kp="99.1" kv="6.31" ctrllimited="false" />
