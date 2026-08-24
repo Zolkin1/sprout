@@ -100,15 +100,26 @@ robot:
         10., 10., 10.,        # R wrist
         10., 10.,             # waist roll, pitch
       ]
-      # The pose the robot snaps to and holds before low-level control. Carried over from the
-      # tuned hardware config, with the two new waist joints at zero (upright torso).
+      # The pose the robot snaps to and holds before low-level control.
+      #
+      # ORDER, as everywhere in this block, is default_joint_names above -- which is NOT the
+      # policy's (interleaved) nor MuJoCo's (the three waist joints consecutive). The two waist
+      # joints the 27-DoF interface did not have go LAST, so waist roll and pitch are the final
+      # two entries and not the ones next to waist yaw. Render it before you send it:
+      #   python transfer/sim/view_user_pose.py --pose-file <candidate>.yml
+      # which resolves that permutation by name against the list above.
+      #
+      # Nearer the posture the tracker starts from than the previous squat: knees close to
+      # straight (0.07 rad against 0.45) and arms hanging with the hands beside the thighs
+      # rather than held forward. Largest single change from the old pose is 0.61 rad on
+      # right_shoulder_yaw.
       user_pose: [
-        -0.25,  0.01, -0.005, 0.45, -0.25, 0.0,
-        -0.25, -0.01, -0.005, 0.45, -0.25, 0.0,
-        0.0,
-        0.47,  0.24, 0.0, 0.8, 0.0, 0.0, 0.0,
-        0.47, -0.24, 0.0, 0.8, 0.0, 0.0, 0.0,
-        0.0, 0.0,
+         0.101,  0.047,  0.207,  0.075, -0.124, -0.028,           # L leg
+         0.073, -0.053, -0.161,  0.066, -0.117,  0.031,           # R leg
+        -0.007,                                                   # waist yaw
+         0.004,  0.251, -0.447,  1.055,  0.040,  0.033, -0.016,   # L arm
+        -0.055, -0.218,  0.606,  1.113, -0.118,  0.011, -0.008,   # R arm
+        -0.014,  0.154,                                           # waist roll, pitch
       ]
     # The interface's PASSIVE-HOLD timer, and it is not optional: G1Interface registers
     # `timer_ctrl` in on_configure and it is what drives the motors autonomously while the
