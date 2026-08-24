@@ -46,8 +46,13 @@ run_hardware_low.sh -- brain + real G1 driver + Jetson ZED depth (tmux session l
 
 Options:
   --clip [CASE]    Drive the tracker from a pre-made clip with the GENERATOR NOT LOADED.
-                   CASE is stand (default) | stand_walk_stand | terrain. This is the
-                   bring-up mode: run `stand` before anything else.
+                   CASE is stand (default) | stand_walk_stand | walk_backward | terrain.
+                   This is the bring-up mode: run `stand` before anything else. Runs the
+                   C++ controller like every other path; add --python for the deprecated one.
+                   Needs the clip PACK on this machine -- build it with
+                   scripts/rsl_rl/make_debug_clips.py then
+                   transfer/deploy/tools/dump_clip_pack.py (neither the .h5 nor the pack is
+                   committed; they come from a clip library the robot does not carry).
   --sim-test       Do NOT launch the robot driver or the Jetson ZED node.
   --policy FOLDER  Override the controller's hf_policy_folder for this run.
   --no-depth       Skip the Jetson ZED pane (for a height-scan or blind policy).
@@ -71,6 +76,10 @@ EOF
 
 ORIG_ARGS=("$@")
 SENSORS=1 ; DEPTH=1 ; POLICY="" ; BUILD="" ; CLIP_CASE="" ; BAG=1 ; PYTHON_CTRL=""
+# Which controller a clip run uses. Only read when CLIP_CASE is set, but initialised here
+# anyway: this script runs under `set -u`, so a future edit that reads it on another path
+# would abort the launch rather than default.
+CLIP_LANG=cpp
 while [ $# -gt 0 ]; do
     case "$1" in
         --sim-test)    SENSORS=0; shift ;;
@@ -105,11 +114,17 @@ SESSION="$OBK_SESSION"
 # (no fm.onnx) and drives it from a baked motion. On a robot that is the safe way in: the
 # `stand` case asks it to hold still, so it exercises encoders, frames, joint order, gains
 # and PD output without the generator ever having a say.
-if [ -n "$CLIP_CASE" ]; then
-    # Clip playback is python-only: the C++ runtime has no HDF5 clip reader yet, and it
-    # refuses to load without an fm.onnx rather than pretending. This is the one path the
-    # deprecated controller is still REQUIRED for.
+if [ -n "$CLIP_CASE" ] && [ -z "$PYTHON_CTRL" ]; then
+    # C++, like every other path here. The runtime plays clips from a binary PACK
+    # (transfer/deploy/tools/dump_clip_pack.py) rather than the .h5, because the image ships
+    # no HDF5 -- so nothing about clip mode needs the deprecated controller any more.
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_cpp_clip.yml"
+    CLIP_LANG=cpp
+elif [ -n "$CLIP_CASE" ]; then
+    echo "[run_hardware_low] WARNING: --clip --python is the DEPRECATED controller. It reads" >&2
+    echo "[run_hardware_low]          the .h5 directly and cannot reach this machine's GPU." >&2
     CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_debug_clip.yml"
+    CLIP_LANG=python
 elif [ -n "$PYTHON_CTRL" ]; then
     echo "[run_hardware_low] WARNING: the python controller is DEPRECATED and cannot reach" >&2
     echo "[run_hardware_low]          this machine's GPU. Drop --python for the C++ one." >&2
@@ -119,7 +134,10 @@ else
 fi
 ROBOT_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml"
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
-[ -n "$CLIP_CASE" ] && CTRL_CFG="$(obk_clip_config "$CTRL_CFG" "$CLIP_CASE" "" "" "")"
+# The LANGUAGE decides which clip parameters the overlay emits -- the C++ node takes a pack
+# directory, the python one an .h5 -- and an override for a parameter the node never declares
+# is silently ignored. See obk_clip_config.
+[ -n "$CLIP_CASE" ] && CTRL_CFG="$(obk_clip_config "$CTRL_CFG" "$CLIP_CASE" "" "" "" "" "$CLIP_LANG")"
 
 # The depth pane is an ssh to the ZED box (obk_jetson_zed_cmd), so check the link BEFORE
 # building a session around it. A missing key or a stale OBK_JETSON_HOST otherwise shows up

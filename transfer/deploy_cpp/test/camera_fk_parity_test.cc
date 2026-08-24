@@ -29,7 +29,7 @@ using test::Case;
 using test::Fixtures;
 
 const Fixtures& Loaded() {
-  static const Fixtures fixtures = Fixtures::Load(Fixtures::DefaultDir());
+  static const Fixtures fixtures = Fixtures::Load(DefaultFixtureDir());
   return fixtures;
 }
 
@@ -37,7 +37,7 @@ const Fixtures& Loaded() {
 /// two cannot drift onto different models.
 std::string ModelPath(const Case& c) {
   const std::string rel = c.strings.at("urdf");
-  const std::string dir = Fixtures::DefaultDir();
+  const std::string dir = DefaultFixtureDir();
   // fixtures live at <repo>/transfer/deploy/tests/fixtures/parity
   return dir + "/../../../../../" + rel;
 }

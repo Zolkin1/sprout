@@ -290,12 +290,19 @@ obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml
 ```
 
 **The python controller (`g1.yml`) is DEPRECATED.** `g1_cpp.yml` is what the run scripts
-launch and what the robot runs; `--python` selects the old one and prints a warning. Two
-things keep it alive: bisecting a regression against a known-good implementation, and CLIP
-PLAYBACK, which the C++ runtime cannot do at all (no HDF5 clip reader -- it refuses to load
-without an `fm.onnx` rather than pretending). On aarch64 the python node cannot reach the GPU
-in any case: rclpy is a cp310 C extension and the only onnxruntime GPU build for a Thor is
-cp312, so it runs the generator on the CPU at ~471 ms against a 20 ms period.
+launch and what the robot runs; `--python` selects the old one and prints a warning. EVERY
+default is C++, clip playback included (`g1_cpp_clip.yml`) -- the one thing that still keeps
+the python node alive is bisecting a regression against a known-good implementation. On
+aarch64 it cannot reach the GPU in any case: rclpy is a cp310 C extension and the only
+onnxruntime GPU build for a Thor is cp312, so it runs the generator on the CPU at ~471 ms
+against a 20 ms period.
+
+The C++ runtime plays clips from a binary PACK rather than the `.h5`
+(`transfer/deploy/tools/dump_clip_pack.py`): the image ships no HDF5, and the library is
+lzf-compressed, which the plain HDF5 C library cannot decode. The pack carries the channel
+NAMES, so one built for a different robot fails loudly instead of reading the right columns
+of the wrong motion, and the port is held to the python oracle at 1e-11
+(`deploy_cpp/test/clip_reference_parity_test.cc`).
 
 Debug clip -- same robot half, brain with no generator:
 ```

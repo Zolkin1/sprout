@@ -286,12 +286,19 @@ EOF
     printf '%s' "$f"
 }
 
-# obk_clip_config <base_abs_config> <case> <clip> <start_time> <ego>: write a temp controller
-# config overriding only the debug-clip selection. Empty arguments are omitted, so the base
-# config's value survives -- which is why every field is emitted conditionally rather than
-# with a default restated here (a default in two places is a default that will disagree).
+# obk_clip_config <base> <case> <clip> <start_time> <ego> <duration> <lang>: write a temp
+# controller config overriding only the debug-clip selection. Empty arguments are omitted, so
+# the base config's value survives -- which is why every field is emitted conditionally rather
+# than with a default restated here (a default in two places is a default that will disagree).
+#
+# <lang> is `cpp` or `python`, and it is NOT cosmetic: the two controllers take different clip
+# parameters. The C++ one reads a PACK DIRECTORY (`debug_clip_pack`) because the image ships no
+# HDF5; the python one reads the `.h5` (`debug_clip`) and has its own `debug_clip_ego_anchor`
+# switch, which the C++ side does not -- it derives the cadence from the artifact instead.
+# Emitting the wrong key is silent on both sides (an override for an undeclared parameter is
+# simply ignored), so the language decides the keys rather than the caller remembering.
 obk_clip_config() {
-    local base="$1" case="$2" clip="$3" start="$4" ego="$5"
+    local base="$1" case="$2" clip="$3" start="$4" ego="$5" duration="$6" lang="${7:-python}"
     local f="/tmp/obk_clip_$(basename "$base")"
     local cfgname
     cfgname="$(grep -m1 '^config:' "$base" | awk '{print $2}')"
@@ -306,9 +313,14 @@ obk_clip_config() {
         echo "  - name: low_level"
         echo "    params:"
         [ -n "$case" ]  && echo "      debug_clip_case: \"${case}\""
-        [ -n "$clip" ]  && echo "      debug_clip: \"${clip}\""
         [ -n "$start" ] && echo "      debug_clip_start_time: ${start}"
-        [ -n "$ego" ]   && echo "      debug_clip_ego_anchor: ${ego}"
+        [ -n "$duration" ] && echo "      debug_clip_duration: ${duration}"
+        if [ "$lang" = cpp ]; then
+            [ -n "$clip" ] && echo "      debug_clip_pack: \"${clip}\""
+        else
+            [ -n "$clip" ] && echo "      debug_clip: \"${clip}\""
+            [ -n "$ego" ] && echo "      debug_clip_ego_anchor: ${ego}"
+        fi
     } >"$f"
     printf '%s' "$f"
 }

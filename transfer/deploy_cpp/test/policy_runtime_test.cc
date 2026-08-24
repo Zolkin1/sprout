@@ -8,6 +8,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <string>
@@ -16,6 +17,7 @@
 #include <vector>
 
 #include "g1_deploy/policy_runtime.h"
+#include "g1_deploy/quat_math.h"
 
 namespace g1_deploy {
 namespace {
@@ -68,6 +70,20 @@ HardwareReadings MakeReadings(const PolicyParams& p, int tick) {
   }
   for (const DepthCameraSpec& cam : p.depth_cameras) {
     r.depth_raw.emplace_back(static_cast<size_t>(cam.pixels()), 2.0);  // 2 m of flat wall
+    // A camera POSE per camera, in the root's yaw-aligned frame. A generator with more than
+    // one channel per pixel unprojects its own image and refuses to run without these -- and
+    // it refuses by DESIGN, so leaving them out is not a lighter test, it is no test at all.
+    // Taken from the contract's nominal mount offset, which is what a robot would use: it
+    // knows its calibration and nothing more.
+    r.fm_camera_pos.push_back({cam.offset_pos[0], cam.offset_pos[1], cam.offset_pos[2]});
+    const QuatXyzw q(cam.offset_quat_xyzw[0], cam.offset_quat_xyzw[1], cam.offset_quat_xyzw[2],
+                     cam.offset_quat_xyzw[3]);
+    const Mat3 m = MatrixFromQuat(q);
+    std::array<double, 9> rot{};
+    for (int a = 0; a < 3; ++a) {
+      for (int b = 0; b < 3; ++b) rot[a * 3 + b] = m(a, b);   // row-major
+    }
+    r.fm_camera_rot.push_back(rot);
   }
   if (p.needs_height_scan) r.height_scan.assign(64, 0.0);
   return r;
@@ -269,6 +285,145 @@ TEST_F(Runtime, RefusesReadingsThatDoNotMatchTheContract) {
   missing_joint.joint_names[0] = "not_a_joint";
   EXPECT_THROW(rt.Step(missing_joint, p.joint_names_isaac, targets.data(), &diag),
                std::runtime_error);
+}
+
+// ---------------------------------------------------------------------------------------
+// Clip playback: the same runtime, the generator not loaded at all.
+// ---------------------------------------------------------------------------------------
+//
+// This is what a bring-up runs when something is wrong and it needs the generator out of the
+// picture. Until it existed the only way to play a clip was the deprecated python controller,
+// which swapped the controller LANGUAGE at the same time -- so a case that fell told you the
+// policy pair and the stack disagreed, and nothing about which.
+
+class ClipRuntime : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    const std::string tracker = PolicyDir() + "/tracker.onnx";
+    if (!Exists(tracker)) GTEST_SKIP() << "no tracker under " << PolicyDir();
+    if (!Exists(std::string(G1_DEPLOY_CLIP_PACK) + "/manifest.json")) {
+      GTEST_SKIP() << "no clip pack at " << G1_DEPLOY_CLIP_PACK
+                   << "; build it with transfer/deploy/tools/dump_clip_pack.py";
+    }
+    cfg.tracker_onnx = tracker;
+    cfg.fm_onnx.clear();                       // <- the whole point: no generator
+    cfg.clip_pack = G1_DEPLOY_CLIP_PACK;
+    cfg.clip_case = "walk_backward";
+    cfg.tracker_providers = {Provider::kCpu};
+  }
+  RuntimeConfig cfg;
+};
+
+TEST_F(ClipRuntime, PlaysAClipWithNoGeneratorLoaded) {
+  PolicyRuntime rt(cfg);
+  rt.Load();
+  rt.Reset();
+  ASSERT_TRUE(rt.clip_mode());
+  const PolicyParams& p = rt.params();
+  std::vector<double> targets(p.num_actions);
+  TickDiagnostics diag;
+
+  double moved = 0.0;
+  std::vector<double> first_window;
+  for (int tick = 0; tick < 40; ++tick) {
+    HardwareReadings r = MakeReadings(p, tick);
+    rt.Step(r, p.joint_names_isaac, targets.data(), &diag);
+    for (double v : targets) ASSERT_TRUE(std::isfinite(v)) << "tick " << tick;
+    EXPECT_TRUE(diag.clip_mode);
+    // start_time is 0 here, so the clip step and the playback tick coincide. Recorded per
+    // tick because a bag otherwise cannot say WHERE in the motion a fall happened.
+    EXPECT_EQ(diag.clip_step, tick);
+    if (tick == 0) {
+      first_window = rt.last_reference_window();
+    } else {
+      double d = 0.0;
+      for (size_t i = 0; i < first_window.size(); ++i) {
+        d = std::max(d, std::abs(first_window[i] - rt.last_reference_window()[i]));
+      }
+      moved = std::max(moved, d);
+    }
+  }
+  // The reference has to MOVE. A window that never changes is what a runtime serving zeros
+  // (or the same frame forever) looks like, and the robot would hold a pose while every
+  // finiteness check passed.
+  EXPECT_GT(moved, 1e-3) << "the served clip window never changed";
+}
+
+TEST_F(ClipRuntime, TheCommandComesFromTheClipNotTheJoystick) {
+  PolicyRuntime rt(cfg);
+  rt.Load();
+  rt.Reset();
+  const PolicyParams& p = rt.params();
+  std::vector<double> targets(p.num_actions);
+
+  // MakeReadings commands +0.5 m/s forward. The clip walks BACKWARD, so if the observation's
+  // command_window came from the readings the two would agree in sign -- and the policy would
+  // be told to walk the other way from the motion it is tracking.
+  double most_negative = 0.0;
+  for (int tick = 0; tick < 400; ++tick) {
+    HardwareReadings r = MakeReadings(p, tick);
+    rt.Step(r, p.joint_names_isaac, targets.data(), nullptr);
+    const std::vector<float>& obs = rt.last_obs();
+    // command_window is the LAST term in this artifact's layout.
+    const int n = static_cast<int>(p.reference_window->offsets.size()) * 3;
+    for (int i = 0; i < n; i += 3) {
+      most_negative = std::min(most_negative, static_cast<double>(obs[obs.size() - n + i]));
+    }
+  }
+  EXPECT_LT(most_negative, -0.3)
+      << "command_window never went negative over a backward-walking clip, so it is being fed "
+         "the joystick's +0.5 rather than the clip's own authored command";
+}
+
+TEST_F(ClipRuntime, TheServedWindowDoesNotDependOnWhereTheRobotIs) {
+  // The same property the parity test pins on ClipReference, asserted through the whole
+  // runtime -- because it is what makes clip playback deployable at all. This runtime has no
+  // odometry; on the robot `root_pos` reaches only the diagnostics.
+  PolicyRuntime a(cfg), b(cfg);
+  a.Load(); a.Reset();
+  b.Load(); b.Reset();
+  const PolicyParams& p = a.params();
+  std::vector<double> ta(p.num_actions), tb(p.num_actions);
+  double worst = 0.0;
+  for (int tick = 0; tick < 30; ++tick) {
+    HardwareReadings ra = MakeReadings(p, tick);
+    HardwareReadings rb = MakeReadings(p, tick);
+    rb.root_pos = Vec3(137.0, -42.0, 0.91);            // somewhere else entirely
+    rb.base_quat_xyzw = QuatXyzw(0.0, 0.0, 0.3826834323650898, 0.9238795325112867);  // +45 deg
+    a.Step(ra, p.joint_names_isaac, ta.data(), nullptr);
+    b.Step(rb, p.joint_names_isaac, tb.data(), nullptr);
+    for (size_t i = 0; i < a.last_reference_window().size(); ++i) {
+      worst = std::max(worst, std::abs(a.last_reference_window()[i] -
+                                       b.last_reference_window()[i]));
+    }
+  }
+  EXPECT_LT(worst, 1e-12) << "clip playback read the robot's world pose (worst " << worst << ")";
+}
+
+TEST_F(ClipRuntime, AnUnknownCaseIsRefusedAtLoad) {
+  RuntimeConfig bad = cfg;
+  bad.clip_case = "no_such_case";
+  PolicyRuntime rt(bad);
+  EXPECT_THROW(rt.Load(), std::runtime_error);
+}
+
+TEST_F(ClipRuntime, NeitherAGeneratorNorAClipIsRefused) {
+  // Not a degraded mode: a tracker served zeros holds a pose that looks like a policy which
+  // has given up, so this has to fail at load rather than run.
+  RuntimeConfig bad = cfg;
+  bad.clip_pack.clear();
+  PolicyRuntime rt(bad);
+  EXPECT_THROW(rt.Load(), std::runtime_error);
+}
+
+TEST_F(ClipRuntime, AMismatchedReanchorCadenceIsRefused) {
+  // Under window_anchor="plan" the clip's placement and the window's anchor must be solved
+  // from the robot on the same step. Anything else leaks the robot's egomotion into base_pose
+  // -- a window the tracker never trained on, and exactly the same width as a correct one.
+  RuntimeConfig bad = cfg;
+  bad.clip_ego_anchor_every = 1;    // the shipped python config's old value, against K=12
+  PolicyRuntime rt(bad);
+  EXPECT_THROW(rt.Load(), std::runtime_error);
 }
 
 }  // namespace

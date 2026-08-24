@@ -19,7 +19,7 @@ using test::Case;
 using test::Fixtures;
 
 const Fixtures& Loaded() {
-  static const Fixtures fixtures = Fixtures::Load(Fixtures::DefaultDir());
+  static const Fixtures fixtures = Fixtures::Load(DefaultFixtureDir());
   return fixtures;
 }
 

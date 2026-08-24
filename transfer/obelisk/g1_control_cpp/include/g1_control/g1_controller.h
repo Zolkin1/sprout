@@ -234,6 +234,9 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   bool debug_topics_ = true;
   double fm_lead_sec_ = 0.05;
   bool threaded_fm_ = true;
+  //: A baked clip drives the tracker and no generator is loaded. Set in LoadPolicy from
+  //: debug_clip_pack; the tick reads it only to decide what to publish, never what to compute.
+  bool clip_mode_ = false;
   bool fm_cuda_graph_ = false;
   bool tracker_on_cpu_ = true;
   int tracker_threads_ = 2;

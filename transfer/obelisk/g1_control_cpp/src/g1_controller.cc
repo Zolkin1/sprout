@@ -160,6 +160,30 @@ void G1Controller::DeclareParams() {
   //
   // Set false to restore training-matched sampling.
   this->declare_parameter<bool>("zero_noise", true);
+
+  // ---- debug-clip playback ----------------------------------------------------------
+  // Drive the tracker from a BAKED MOTION with the generator not loaded at all, so a failure
+  // is unambiguously this stack rather than the generator. Set debug_clip_pack (and a case) to
+  // turn it on; fm.onnx is then not opened.
+  //
+  // The pack is a directory built by transfer/deploy/tools/dump_clip_pack.py, relative to the
+  // workspace. NOT the .h5 the python controller reads: the image ships no HDF5, and the
+  // library is lzf-compressed, which the plain HDF5 C library cannot decode.
+  this->declare_parameter<std::string>("debug_clip_pack", "");
+  this->declare_parameter<std::string>("debug_clip_case", "");
+  this->declare_parameter<double>("debug_clip_start_time", 0.0);
+  // Seconds to PLAY before holding the last played frame with a ZERO command. 0 = the whole
+  // clip. Playback saturates rather than stopping, so a case ending mid-walk would otherwise
+  // hold a walk command against a stationary reference and put the robot down for reasons that
+  // are the harness's rather than the policy's.
+  this->declare_parameter<double>("debug_clip_duration", 0.0);
+  // 0 DERIVES the re-anchor cadence from the tracker's own fm_update_every. Under
+  // window_anchor="plan" that is not a preference: the clip's placement and the reference
+  // window's anchor have to be solved from the robot on the SAME step, or up to K-1 steps of
+  // the robot's own egomotion leak into base_pose -- a window matching neither training nor an
+  // odometry-free serve, and exactly as wide as a correct one. PolicyRuntime refuses a
+  // mismatch rather than serving it.
+  this->declare_parameter<int>("debug_clip_ego_anchor_every", 0);
 }
 
 rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn
@@ -276,16 +300,39 @@ void G1Controller::LoadPolicy() {
 
   g1_deploy::RuntimeConfig cfg;
   cfg.tracker_onnx = (base / "tracker.onnx").string();
-  cfg.fm_onnx = (base / "fm.onnx").string();
   if (!std::filesystem::exists(cfg.tracker_onnx)) {
     throw std::runtime_error("no tracker.onnx at " + cfg.tracker_onnx +
                              "; run scripts/prefetch_policy.py");
   }
-  if (!std::filesystem::exists(cfg.fm_onnx)) {
-    throw std::runtime_error(
-        "no fm.onnx at " + cfg.fm_onnx +
-        ". Tracker-only (clip) playback is not implemented in the C++ runtime yet -- it needs "
-        "the HDF5 clip reader. Use the generator pair.");
+
+  const std::string clip_pack = this->get_parameter("debug_clip_pack").as_string();
+  const std::string clip_case = this->get_parameter("debug_clip_case").as_string();
+  clip_mode_ = !clip_pack.empty();
+  if (clip_mode_) {
+    // The generator is not opened AT ALL -- not loaded and refused, not loaded and idle. That
+    // is what makes a clip case evidence: whatever happens, the generator was not in it.
+    cfg.fm_onnx.clear();
+    cfg.clip_pack = (workspace / clip_pack).string();
+    if (!std::filesystem::exists(cfg.clip_pack)) {
+      cfg.clip_pack = clip_pack;      // an absolute path is legitimate too
+    }
+    cfg.clip_case = clip_case;
+    cfg.clip_start_time = this->get_parameter("debug_clip_start_time").as_double();
+    cfg.clip_duration = this->get_parameter("debug_clip_duration").as_double();
+    cfg.clip_ego_anchor_every =
+        static_cast<int>(this->get_parameter("debug_clip_ego_anchor_every").as_int());
+    RCLCPP_WARN(this->get_logger(),
+                "DEBUG CLIP MODE: case '%s' from %s drives the tracker; NO generator is "
+                "loaded. A failure here is this stack, not the generator.",
+                clip_case.c_str(), cfg.clip_pack.c_str());
+  } else {
+    cfg.fm_onnx = (base / "fm.onnx").string();
+    if (!std::filesystem::exists(cfg.fm_onnx)) {
+      throw std::runtime_error(
+          "no fm.onnx at " + cfg.fm_onnx +
+          ". For clip playback set debug_clip_pack + debug_clip_case (built with "
+          "transfer/deploy/tools/dump_clip_pack.py); otherwise run scripts/prefetch_policy.py.");
+    }
   }
   cfg.providers = use_cuda_ ? std::vector<g1_deploy::Provider>{g1_deploy::Provider::kCuda}
                             : std::vector<g1_deploy::Provider>{g1_deploy::Provider::kCpu};
@@ -347,6 +394,14 @@ void G1Controller::LoadPolicy() {
 }
 
 void G1Controller::SetupCameraFk() {
+  // No generator at all (clip playback): nothing unprojects anything, so there is no camera
+  // pose to compute. Checked FIRST because fm_meta() throws in that mode by design -- there is
+  // no honest empty answer for a metadata block, and returning a defaulted one would make a
+  // clip run silently claim the generator's contract.
+  if (clip_mode_) {
+    RCLCPP_INFO(this->get_logger(), "clip playback: no generator, so no camera FK needed");
+    return;
+  }
   // Only a generator that reads MORE THAN DEPTH per pixel needs this. A 1-channel one gets a
   // normalised image and nothing else, and building the FK for it would make a kinematic model
   // a bring-up requirement for a policy that never consults one.
@@ -938,7 +993,9 @@ ControlMsg G1Controller::ComputeControl() {
   // One message per plan the robot actually used. Gated on the id and not on `plan_adopted`
   // alone so a re-arm, which resets the schedule but deliberately not the id, cannot
   // re-publish a plan already on the bag under a second timestamp.
-  if (diag.plan_adopted && diag.plan_id != last_fm_plan_id_) {
+  // No generator, no plan to publish. Not merely empty: PublishFmPlan reads fm_meta(), which
+  // throws in clip mode by design -- there is no honest empty answer for a metadata block.
+  if (!clip_mode_ && diag.plan_adopted && diag.plan_id != last_fm_plan_id_) {
     last_fm_plan_id_ = diag.plan_id;
     PublishFmPlan(diag);
   }
@@ -1114,6 +1171,12 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
     d.obs_checksum = have_obs ? diag.obs_checksum : 0;
     d.obs_size = have_obs && policy_ ? static_cast<uint32_t>(policy_->num_obs()) : 0;
     d.fm_cursor = diag.cursor;
+    // Which reference drove this tick, and where in it. Written from the DIAGNOSTICS rather
+    // than from clip_mode_, so the message reports what the runtime actually served rather
+    // than what the config asked for. -1 outside clip mode, so a bag can tell "step 0" from
+    // "not a clip run".
+    d.clip_mode = diag.clip_mode;
+    d.clip_step = diag.clip_mode ? diag.clip_step : -1;
 
     // Input provenance. WHICH sample fed this tick, not its value -- the estimator runs at
     // 1 kHz against a 50 Hz tick, so without these no offline reconstruction can say which of
@@ -1162,7 +1225,14 @@ void G1Controller::PublishDebug(const g1_deploy::TickDiagnostics& diag, bool hav
       d.vel_cmd_age = vel_cmd_time_ >= 0.0 ? now_s - vel_cmd_time_ : -1.0;
       if (!vel_cmd_stale_) cmd = vel_cmd_;
     }
-    d.command_effective = {cmd.x(), cmd.y(), cmd.z()};
+    // What the POLICY was given, not what the joystick said: they differ whenever a watchdog
+    // latches, and in clip mode the command comes from the clip while nothing publishes one at
+    // all. Falls back to the joystick's value on a tick that ran no policy (disarmed), where
+    // there is no observation to have read it from.
+    d.command_effective = have_obs ? std::array<double, 3>{diag.command_effective.x(),
+                                                           diag.command_effective.y(),
+                                                           diag.command_effective.z()}
+                                   : std::array<double, 3>{cmd.x(), cmd.y(), cmd.z()};
 
     if (policy_) {
       const auto& p = policy_->params();

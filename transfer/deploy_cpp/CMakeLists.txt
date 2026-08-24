@@ -41,6 +41,8 @@ if(NOT nlohmann_json_FOUND)
 endif()
 
 add_library(g1_deploy STATIC
+  src/blob_pack.cc
+  src/clip_reference.cc
   src/fm_meta.cc
   src/robot_asset.cc
   src/quat_math.cc
@@ -60,9 +62,15 @@ add_library(G1Deploy::Core ALIAS g1_deploy)
 target_include_directories(g1_deploy PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
 target_link_libraries(g1_deploy PUBLIC Eigen3::Eigen Threads::Threads)
-# PRIVATE: json appears only in policy_params.cc, never in a public header, so consumers do
-# not inherit the dependency.
+# PRIVATE: json appears only in policy_params.cc and blob_pack.cc, never in a public header,
+# so consumers do not inherit the dependency.
 target_link_libraries(g1_deploy PRIVATE nlohmann_json::nlohmann_json)
+# Where the committed parity fixtures live. PRIVATE and optional: blob_pack.cc bakes it in as
+# the default for DefaultFixtureDir() when it is defined, and throws a diagnosable error when
+# it is not -- which is the deploy image, where the source tree is absent and every pack is
+# named explicitly anyway.
+target_compile_definitions(g1_deploy PRIVATE
+  G1_DEPLOY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/parity")
 target_compile_options(g1_deploy PRIVATE -Wall -Wextra -Wpedantic)
 
 # -ffp-contract=off is a PARITY requirement, not a style preference. GCC defaults to
@@ -114,6 +122,7 @@ if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
   endif()
 
   add_library(g1_deploy_ort STATIC
+    src/reference_source.cc
     src/ort_session.cc
     src/tracker_session.cc
     src/fm_session.cc
@@ -138,7 +147,7 @@ if(ORT_INCLUDE_DIR AND ORT_LIBRARY)
   # The cross-language replay: this runtime over a stream the python one recorded. Links the
   # FIXTURE READER from test/ deliberately -- the stream IS a fixture set, and a second reader
   # for one format is how the format drifts.
-  add_executable(replay tools/replay.cc test/fixture.cc)
+  add_executable(replay tools/replay.cc)
   target_include_directories(replay PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
   target_link_libraries(replay PRIVATE g1_deploy_ort nlohmann_json::nlohmann_json)
   target_compile_options(replay PRIVATE -Wall -Wextra -Wpedantic)
@@ -228,7 +237,7 @@ if(BUILD_TESTING)
     set(GTest_FOUND TRUE)
   endif()
   if(GTest_FOUND AND TARGET g1_deploy_fk)
-    add_executable(camera_fk_parity_test test/camera_fk_parity_test.cc test/fixture.cc)
+    add_executable(camera_fk_parity_test test/camera_fk_parity_test.cc)
     target_include_directories(camera_fk_parity_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/test)
     target_link_libraries(camera_fk_parity_test
       PRIVATE g1_deploy_fk nlohmann_json::nlohmann_json GTest::gtest GTest::gtest_main)
@@ -237,8 +246,8 @@ if(BUILD_TESTING)
     add_test(NAME camera_fk_parity COMMAND camera_fk_parity_test)
   endif()
   if(GTest_FOUND)
-    foreach(name quat_math_parity window_parity depth_obs_parity fm_meta node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler imu_hold pose_history robot_asset)
-      add_executable(${name}_test test/${name}_test.cc test/fixture.cc)
+    foreach(name quat_math_parity window_parity clip_reference_parity depth_obs_parity fm_meta node_history policy_params plan_scheduler gen_tracker_core fm_worker obs_assembler imu_hold pose_history robot_asset)
+      add_executable(${name}_test test/${name}_test.cc)
       # test/ for the fixture reader, and src/ for the INTERNAL headers a test may need --
       # robot_asset_json.h lives there rather than in include/ because it takes an nlohmann
       # type, and nlohmann is PRIVATE to this library (a public header would leak it into the
@@ -252,6 +261,10 @@ if(BUILD_TESTING)
       # a freshly dumped set can be checked without rebuilding.
       target_compile_definitions(${name}_test PRIVATE
         G1_DEPLOY_FIXTURE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/parity"
+        # transfer/, so a clip pack recorded relative to it resolves. Relative because the
+        # pack is a RUNTIME artifact that ships with the controller, not a fixture -- an
+        # absolute path in the manifest would be one machine's.
+        G1_DEPLOY_TRANSFER_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
         G1_DEPLOY_METADATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/metadata"
         G1_DEPLOY_OBS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../deploy/tests/fixtures/obs")
       add_test(NAME ${name} COMMAND ${name}_test)
@@ -265,8 +278,16 @@ if(BUILD_TESTING)
         target_link_libraries(${ortname}_test
           PRIVATE g1_deploy_ort GTest::gtest GTest::gtest_main)
         target_compile_options(${ortname}_test PRIVATE -Wall -Wextra -Wpedantic)
+        # NOTE the `policies/` element. The controller loads
+        # hf_cache/<repo>/policies/<run> (hardware.HF_POLICY_PREFIX), and this default was
+        # missing it -- so these two tests SILENTLY SKIPPED on every dev box, which is exactly
+        # the outcome test_policy_cache_layout.py exists to prevent across the language
+        # boundary and could not see here. Overridable at runtime with G1_POLICY_DIR.
         target_compile_definitions(${ortname}_test PRIVATE
-          G1_DEPLOY_POLICY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../obelisk/g1_control/resource/hf_cache/zolkin_robot_rl/2026-08-04_21-55-17_yaw_k12_v1")
+          G1_DEPLOY_POLICY_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../obelisk/g1_control/resource/hf_cache/zolkin_robot_rl/policies/2026-08-20_16-36-10_mode11_decor_plan_v1"
+          # The clip pack the runtime plays when no generator is loaded. A RUNTIME artifact
+          # that ships with the controller, not a fixture -- the parity tests read the same one.
+          G1_DEPLOY_CLIP_PACK="${CMAKE_CURRENT_SOURCE_DIR}/../obelisk/g1_control/resource/debug_clips/g1_debug_v1_pack")
         add_test(NAME ${ortname} COMMAND ${ortname}_test)
       endforeach()
     endif()

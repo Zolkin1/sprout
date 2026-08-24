@@ -1,6 +1,6 @@
 // Copyright 2026 Zachary Olkin. All rights reserved.
 
-#include "fixture.h"
+#include "g1_deploy/blob_pack.h"
 
 #include <nlohmann/json.hpp>
 
@@ -9,24 +9,24 @@
 #include <fstream>
 #include <stdexcept>
 
-namespace g1_deploy::test {
+namespace g1_deploy {
 namespace {
 
 constexpr int kExpectedFormat = 1;
 
 std::vector<double> ReadBlob(const std::filesystem::path& path, size_t count) {
   std::ifstream in(path, std::ios::binary);
-  if (!in) throw std::runtime_error("cannot open fixture blob: " + path.string());
+  if (!in) throw std::runtime_error("cannot open blob: " + path.string());
   const auto bytes = std::filesystem::file_size(path);
   if (bytes != count * sizeof(double)) {
-    throw std::runtime_error("fixture blob " + path.string() + " is " + std::to_string(bytes) +
+    throw std::runtime_error("blob " + path.string() + " is " + std::to_string(bytes) +
                              " bytes, but its declared shape needs " +
                              std::to_string(count * sizeof(double)) +
                              ". Re-run dump_parity_fixtures.py.");
   }
   std::vector<double> data(count);
   in.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(bytes));
-  if (!in) throw std::runtime_error("short read on fixture blob: " + path.string());
+  if (!in) throw std::runtime_error("short read on blob: " + path.string());
   return data;
 }
 
@@ -67,12 +67,19 @@ const Blob& Case::Out(const std::string& key) const {
   return it->second;
 }
 
-std::string Fixtures::DefaultDir() {
+std::string DefaultFixtureDir() {
+#ifdef G1_DEPLOY_FIXTURE_DIR
   if (const char* env = std::getenv("G1_PARITY_FIXTURES")) return env;
   return G1_DEPLOY_FIXTURE_DIR;  // baked in by CMake from the source tree layout
+#else
+  // The library is buildable without the source tree around it (that is the point of the
+  // deploy image), so this is a real configuration rather than an impossible one.
+  throw std::runtime_error(
+      "no fixture directory was baked in at build time; pass one to BlobPack::Load");
+#endif
 }
 
-Fixtures Fixtures::Load(const std::string& dir) {
+BlobPack BlobPack::Load(const std::string& dir) {
   const std::filesystem::path base(dir);
   std::ifstream in(base / "manifest.json");
   if (!in) {
@@ -84,17 +91,17 @@ Fixtures Fixtures::Load(const std::string& dir) {
   in >> manifest;
 
   if (manifest.at("format").get<int>() != kExpectedFormat) {
-    throw std::runtime_error("fixture manifest format " +
+    throw std::runtime_error("pack manifest format " +
                              std::to_string(manifest.at("format").get<int>()) + ", expected " +
-                             std::to_string(kExpectedFormat) + ": regenerate the fixtures.");
+                             std::to_string(kExpectedFormat) + ": regenerate the pack.");
   }
   // The blobs are raw doubles with no byte-order marker, so a big-endian producer would be
   // read as garbage rather than rejected. Both target arches are little-endian; check it.
   if (manifest.at("byteorder").get<std::string>() != "little") {
-    throw std::runtime_error("fixtures were produced big-endian; the reader assumes little.");
+    throw std::runtime_error("pack was produced big-endian; the reader assumes little.");
   }
 
-  Fixtures out;
+  BlobPack out;
   for (const auto& c : manifest.at("cases")) {
     Case parsed;
     parsed.name = c.at("case").get<std::string>();
@@ -138,13 +145,13 @@ Fixtures Fixtures::Load(const std::string& dir) {
           for (const auto& v : value) items.push_back(v.get<double>());
           parsed.double_lists[key] = std::move(items);
         } else {
-          throw std::runtime_error("fixture: attrs." + key +
+          throw std::runtime_error("pack: attrs." + key +
                                    " is an array of an unsupported element type");
         }
       } else if (!value.is_null()) {
         // Naming the key matters: the whole point of this branch is that the next new attr
         // type fails with something diagnosable instead of a bare nlohmann type error.
-        throw std::runtime_error("fixture: attrs." + key + " has an unsupported type");
+        throw std::runtime_error("pack: attrs." + key + " has an unsupported type");
       }
     }
     out.cases_.push_back(std::move(parsed));
@@ -152,7 +159,7 @@ Fixtures Fixtures::Load(const std::string& dir) {
   return out;
 }
 
-std::vector<const Case*> Fixtures::ForFunction(const std::string& fn) const {
+std::vector<const Case*> BlobPack::ForFunction(const std::string& fn) const {
   std::vector<const Case*> out;
   for (const auto& c : cases_) {
     if (c.fn == fn) out.push_back(&c);
@@ -160,4 +167,4 @@ std::vector<const Case*> Fixtures::ForFunction(const std::string& fn) const {
   return out;
 }
 
-}  // namespace g1_deploy::test
+}  // namespace g1_deploy

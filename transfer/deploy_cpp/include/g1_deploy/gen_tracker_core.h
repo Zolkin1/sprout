@@ -66,6 +66,13 @@ class FmSampler {
   /// If a plan is ready, write its F x D nodes (row-major) into `pred_out`, set
   /// `target_ctrl_step`, and return true. Called once per tick.
   virtual bool TryCollect(double* pred_out, int64_t* target_ctrl_step) = 0;
+
+  /// Prepare to serve a FIRST plan again, on the next arming.
+  ///
+  /// A no-op for a sampler that has no first-plan behaviour, which is most of them. Virtual
+  /// rather than a downcast at the one call site: the caller holds an FmSampler and knowing
+  /// which concrete kind it is was a fact about construction order, not about the type.
+  virtual void Rearm() {}
 };
 
 /// Sizes and layout, all from artifact metadata.

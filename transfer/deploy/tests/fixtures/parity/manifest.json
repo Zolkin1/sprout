@@ -1684,6 +1684,230 @@
           "sha256": "fe201552ba4555c549ca8b7a9024c8c2a87ce09c833bab68106c148335b23f0b"
         }
       ]
+    },
+    {
+      "case": "clip_reference_window_stand_walk_stand",
+      "fn": "clip_reference_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "pack_dir": "obelisk/g1_control/resource/debug_clips/g1_debug_v1_pack",
+        "case": "stand_walk_stand",
+        "base_frame_name": "pelvis_link",
+        "dt": 0.02,
+        "joint_names": [
+          "left_hip_pitch_joint",
+          "left_hip_roll_joint",
+          "left_hip_yaw_joint",
+          "left_knee_joint",
+          "left_ankle_pitch_joint",
+          "left_ankle_roll_joint",
+          "right_hip_pitch_joint",
+          "right_hip_roll_joint",
+          "right_hip_yaw_joint",
+          "right_knee_joint",
+          "right_ankle_pitch_joint",
+          "right_ankle_roll_joint",
+          "waist_yaw_joint",
+          "waist_roll_joint",
+          "waist_pitch_joint",
+          "left_shoulder_pitch_joint",
+          "left_shoulder_roll_joint",
+          "left_shoulder_yaw_joint",
+          "left_elbow_joint",
+          "left_wrist_roll_joint",
+          "left_wrist_pitch_joint",
+          "left_wrist_yaw_joint",
+          "right_shoulder_pitch_joint",
+          "right_shoulder_roll_joint",
+          "right_shoulder_yaw_joint",
+          "right_elbow_joint",
+          "right_wrist_roll_joint",
+          "right_wrist_pitch_joint",
+          "right_wrist_yaw_joint"
+        ],
+        "offsets": [
+          0,
+          1,
+          2,
+          5,
+          10,
+          15,
+          20,
+          25,
+          30,
+          35,
+          40,
+          45,
+          50
+        ],
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos"
+        ],
+        "num_joints": 29,
+        "num_ee_frames": 0,
+        "ego_anchor_every": 12,
+        "start_step": 767,
+        "num_ticks": 36
+      },
+      "inputs": [
+        {
+          "name": "robot_pos",
+          "file": "clip_reference_window_stand_walk_stand.in.robot_pos.bin",
+          "shape": [
+            36,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "35af3fdd00d28a20ad624e77cf077acb726ee637096a0318c2d51cc4c4a4d35c"
+        },
+        {
+          "name": "robot_quat",
+          "file": "clip_reference_window_stand_walk_stand.in.robot_quat.bin",
+          "shape": [
+            36,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "80b4c25e1af96a132d71ad67ca9a0c7d8a63e9e7af9e08528f3b68552a3c1389"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "clip_reference_window_stand_walk_stand.out.window.bin",
+          "shape": [
+            36,
+            572
+          ],
+          "dtype": "float64",
+          "sha256": "ed260e9a7e26955d406f996c020422649f7b26ea5056807b855077c0e68d652a"
+        },
+        {
+          "name": "command_window",
+          "file": "clip_reference_window_stand_walk_stand.out.command_window.bin",
+          "shape": [
+            36,
+            39
+          ],
+          "dtype": "float64",
+          "sha256": "b86098b213097b29a052c7f43b9d0269a7381727fa142b0a1c4aeddcda336015"
+        }
+      ]
+    },
+    {
+      "case": "clip_reference_window_walk_backward",
+      "fn": "clip_reference_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "pack_dir": "obelisk/g1_control/resource/debug_clips/g1_debug_v1_pack",
+        "case": "walk_backward",
+        "base_frame_name": "pelvis_link",
+        "dt": 0.02,
+        "joint_names": [
+          "left_hip_pitch_joint",
+          "left_hip_roll_joint",
+          "left_hip_yaw_joint",
+          "left_knee_joint",
+          "left_ankle_pitch_joint",
+          "left_ankle_roll_joint",
+          "right_hip_pitch_joint",
+          "right_hip_roll_joint",
+          "right_hip_yaw_joint",
+          "right_knee_joint",
+          "right_ankle_pitch_joint",
+          "right_ankle_roll_joint",
+          "waist_yaw_joint",
+          "waist_roll_joint",
+          "waist_pitch_joint",
+          "left_shoulder_pitch_joint",
+          "left_shoulder_roll_joint",
+          "left_shoulder_yaw_joint",
+          "left_elbow_joint",
+          "left_wrist_roll_joint",
+          "left_wrist_pitch_joint",
+          "left_wrist_yaw_joint",
+          "right_shoulder_pitch_joint",
+          "right_shoulder_roll_joint",
+          "right_shoulder_yaw_joint",
+          "right_elbow_joint",
+          "right_wrist_roll_joint",
+          "right_wrist_pitch_joint",
+          "right_wrist_yaw_joint"
+        ],
+        "offsets": [
+          0,
+          1,
+          2,
+          5,
+          10,
+          15,
+          20,
+          25,
+          30,
+          35,
+          40,
+          45,
+          50
+        ],
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos"
+        ],
+        "num_joints": 29,
+        "num_ee_frames": 0,
+        "ego_anchor_every": 12,
+        "start_step": 355,
+        "num_ticks": 36
+      },
+      "inputs": [
+        {
+          "name": "robot_pos",
+          "file": "clip_reference_window_walk_backward.in.robot_pos.bin",
+          "shape": [
+            36,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "35af3fdd00d28a20ad624e77cf077acb726ee637096a0318c2d51cc4c4a4d35c"
+        },
+        {
+          "name": "robot_quat",
+          "file": "clip_reference_window_walk_backward.in.robot_quat.bin",
+          "shape": [
+            36,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "80b4c25e1af96a132d71ad67ca9a0c7d8a63e9e7af9e08528f3b68552a3c1389"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "clip_reference_window_walk_backward.out.window.bin",
+          "shape": [
+            36,
+            572
+          ],
+          "dtype": "float64",
+          "sha256": "1aa9a7985f630d821dcad2d3c4eedbcdb20abd08a5c5aac342330491686fa866"
+        },
+        {
+          "name": "command_window",
+          "file": "clip_reference_window_walk_backward.out.command_window.bin",
+          "shape": [
+            36,
+            39
+          ],
+          "dtype": "float64",
+          "sha256": "b5d85d1463aa04367fa1623e8080ed23717c2b22b39f87247fcd2d4a0d3dc16d"
+        }
+      ]
     }
   ]
 }

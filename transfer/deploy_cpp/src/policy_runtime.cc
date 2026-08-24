@@ -39,7 +39,7 @@ class FirstPlanBlocker : public FmSampler {
   }
 
   /// Re-arm the blocking behaviour for the next arming.
-  void Rearm() { first_done_ = false; }
+  void Rearm() override { first_done_ = false; }
 
  private:
   std::shared_ptr<FmWorker> worker_;
@@ -69,20 +69,104 @@ void PolicyRuntime::Load() {
   // when nothing in the list is an accelerator.
   RequireCuda(tracker_->model(), cfg_.tracker_providers);
 
-  if (cfg_.fm_onnx.empty()) {
-    throw std::runtime_error(
-        "tracker-only (clip) playback is not implemented in the C++ runtime yet: it needs the "
-        "HDF5 clip reference reader. Supply an fm.onnx.");
-  }
+  std::vector<ReferenceBlock> blocks;
+  for (const auto& b : rw.blocks) blocks.push_back(BlockFromName(b.first));
+  const int num_joints = static_cast<int>(p.joint_names_isaac.size());
+  const int num_ee = static_cast<int>(rw.ee_frame_names.size());
 
+  if (cfg_.fm_onnx.empty()) {
+    LoadClipSource(rw, blocks, num_joints, num_ee);
+  } else {
+    LoadFmSource(rw, blocks, num_ee);
+  }
+  assembler_ = std::make_unique<ObsAssembler>(p.obs_terms, p.num_obs);
+  window_.assign(static_cast<size_t>(rw.offsets.size()) * node_dim_, 0.0);
+  obs_.assign(static_cast<size_t>(p.num_obs), 0.0f);
+  joint_pos_isaac_.assign(p.joint_names_isaac.size(), 0.0);
+  joint_vel_isaac_.assign(p.joint_names_isaac.size(), 0.0);
+}
+
+void PolicyRuntime::LoadClipSource(const ReferenceWindowSpec& rw,
+                                   const std::vector<ReferenceBlock>& blocks, int num_joints,
+                                   int num_ee) {
+  const PolicyParams& p = tracker_->params();
+  if (cfg_.clip_pack.empty() || cfg_.clip_case.empty()) {
+    throw std::runtime_error(
+        "no fm.onnx and no clip_pack: there would be no reference at all, and a tracker served "
+        "zeros holds a pose that looks like a policy which has given up rather than like a "
+        "configuration error. Supply an fm.onnx, or a clip_pack + clip_case (built with "
+        "transfer/deploy/tools/dump_clip_pack.py).");
+  }
+  // The cadence is the ARTIFACT's, not a tuning knob. Under window_anchor="plan" the clip's
+  // placement and the window's anchor must be solved from the robot on the same step, or up to
+  // K-1 steps of the robot's own egomotion leak into base_pose -- a window matching neither
+  // training nor an odometry-free serve, and identical in width to a correct one.
+  const WindowAnchor anchor = AnchorFromConvention(rw.base_pose_convention);
+  int every = cfg_.clip_ego_anchor_every;
+  if (anchor == WindowAnchor::kPlan) {
+    if (!p.fm_update_every.has_value()) {
+      throw std::runtime_error(
+          "tracker.onnx declares window_anchor='plan' but carries no fm_update_every, so the "
+          "clip's re-anchor cadence -- which IS the latch period, and therefore part of the "
+          "observation contract -- would have to be guessed. Re-export with "
+          "scripts/rsl_rl/export_parameters.py from a run that had the generator.");
+    }
+    if (every != 0 && every != *p.fm_update_every) {
+      throw std::runtime_error(
+          "clip_ego_anchor_every=" + std::to_string(every) + " but this tracker latches its "
+          "window anchor every " + std::to_string(*p.fm_update_every) + " steps. Under "
+          "window_anchor='plan' the two must fire on the same step. Leave it 0 to derive it.");
+    }
+    every = *p.fm_update_every;
+  }
+  if (every < 1) every = 1;
+
+  ClipReference::Config ccfg;
+  ccfg.pack_dir = cfg_.clip_pack;
+  ccfg.case_name = cfg_.clip_case;
+  ccfg.joint_names = p.joint_names_isaac;
+  ccfg.ee_frame_names = rw.ee_frame_names;
+  // The base frame is the CLIP's own ref_frame, read from the pack -- the two libraries on
+  // disk genuinely differ ("pelvis_link" vs "right_ankle_roll_link"), and restating it here
+  // would be a second place for it to be wrong.
+  ccfg.base_frame_name.clear();
+  ccfg.start_time = cfg_.clip_start_time;
+  ccfg.ego_anchor_every = every;
+  // A tracking_mode="body" tracker observes body_pos_ref / body_vel_ref, which the clip path
+  // does not serve. Detected from the OBS TERMS rather than from a metadata flag, because that
+  // is what actually decides it -- ObsAssembler would otherwise fail much later, naming a term
+  // rather than the configuration.
+  for (const ObsTerm& term : p.obs_terms) {
+    if (term.name == "body_pos_ref" || term.name == "body_vel_ref") {
+      throw std::runtime_error(
+          "this tracker observes '" + term.name + "' (tracking_mode=\"body\"), which the C++ "
+          "clip path does not serve. Play it through the python controller "
+          "(scripts/run_sim_clip.sh --python), or use a joint-tracking tracker.");
+    }
+  }
+  ClipReference clip = ClipReference::Load(ccfg);
+  if (std::abs(clip.dt() - p.dt) > 1e-6) {
+    throw std::runtime_error("clip dt " + std::to_string(clip.dt()) + " != policy dt " +
+                             std::to_string(p.dt) + ": the motion would play at the wrong rate.");
+  }
+  node_dim_ = WindowDim(num_joints, num_ee, blocks);
+  auto src = std::make_unique<ClipReferenceSource>(std::move(clip), rw.offsets, num_joints,
+                                                   num_ee, blocks, cfg_.clip_duration);
+  clip_source_ = src.get();
+  source_ = std::move(src);
+}
+
+void PolicyRuntime::LoadFmSource(const ReferenceWindowSpec& rw,
+                                 const std::vector<ReferenceBlock>& blocks, int num_ee) {
+  const PolicyParams& p = tracker_->params();
   std::shared_ptr<NoiseSource> noise;
   if (cfg_.zero_noise) {
     noise = std::make_shared<ZeroNoise>();
   } else {
     noise = std::make_shared<GaussianNoise>(cfg_.noise_seed);
   }
-  fm_ = std::make_shared<FmSession>(cfg_.fm_onnx, cfg_.providers, cfg_.intra_threads, noise,
-                                   cfg_.fm_cuda_graph);
+  auto fm_ = std::make_shared<FmSession>(cfg_.fm_onnx, cfg_.providers, cfg_.intra_threads,
+                                         noise, cfg_.fm_cuda_graph);
   fm_->model().WarmUpAndCheckPlacement();
   RequireCuda(fm_->model(), cfg_.providers);
 
@@ -102,7 +186,7 @@ void PolicyRuntime::Load() {
   // Lead time is configured in seconds and resolved against the artifact's dt, so the same
   // config means the same wall-clock lead if dt ever changes. Clamped to [1, K-1]: a request
   // issued before the previous plan was adopted would overwrite one still in flight.
-  lead_ticks_ = static_cast<int>(std::ceil(cfg_.fm_lead_sec / p.dt));
+  int lead_ticks = static_cast<int>(std::ceil(cfg_.fm_lead_sec / p.dt));
   // The floor is 1 unless a caller explicitly asks for zero: a lead of 0 means the plan is
   // requested at the instant it is needed, which no real deployment wants. PlanScheduler
   // handles 0 correctly (ShouldRequest becomes ctrl_step % K == 0, the target is this step,
@@ -110,19 +194,19 @@ void PolicyRuntime::Load() {
   // runtime has -- and the only configuration in which the two runtimes' PLANS can be
   // compared numerically at all.
   const int floor_ticks = cfg_.allow_zero_lead ? 0 : 1;
-  lead_ticks_ = std::max(floor_ticks, std::min(lead_ticks_, k - 1));
+  lead_ticks = std::max(floor_ticks, std::min(lead_ticks, k - 1));
 
   CoreConfig core_cfg;
   core_cfg.num_joints = fm_->meta().num_joints;
-  core_cfg.num_ee_frames = static_cast<int>(rw.ee_frame_names.size());
-  for (const auto& b : rw.blocks) core_cfg.blocks.push_back(BlockFromName(b.first));
+  core_cfg.num_ee_frames = num_ee;
+  core_cfg.blocks = blocks;
   core_cfg.offsets = rw.offsets;
   core_cfg.history_length = fm_->meta().n;
   core_cfg.cmd_dim = fm_->meta().cmd_dim;
   core_cfg.schedule.replan_period = k;
   core_cfg.schedule.horizon = fm_->meta().f;
   core_cfg.schedule.max_offset = *std::max_element(rw.offsets.begin(), rw.offsets.end());
-  core_cfg.schedule.lead_ticks = lead_ticks_;
+  core_cfg.schedule.lead_ticks = lead_ticks;
   // Which serve arm, from the artifact's own convention string. Throws on the odometry-
   // dependent arm and on anything unrecognised -- at LOAD, where it can be reported, rather
   // than by quietly serving a window whose base_pose means something else. The two arms have
@@ -136,50 +220,62 @@ void PolicyRuntime::Load() {
   AssertRobotAssetsAgree(p.robot_asset, fm_->meta().robot_asset, cfg_.tracker_onnx,
                          cfg_.fm_onnx);
 
+  std::shared_ptr<FmWorker> worker;
+  std::shared_ptr<FmSampler> blocker, sampler;
   if (cfg_.threaded_fm) {
-    worker_ = std::make_shared<FmWorker>(fm_, static_cast<size_t>(fm_->meta().f) * node_dim_);
-    worker_->Start();
-    blocker_ = std::make_shared<FirstPlanBlocker>(worker_, cfg_.first_plan_timeout_sec);
-    sampler_ = blocker_;
+    worker = std::make_shared<FmWorker>(fm_, static_cast<size_t>(fm_->meta().f) * node_dim_);
+    worker->Start();
+    blocker = std::make_shared<FirstPlanBlocker>(worker, cfg_.first_plan_timeout_sec);
+    sampler = blocker;
   } else {
     // Inline: Submit runs the graph, so a plan is ready within the same Step and no wait is
     // needed. Same code path otherwise.
-    sampler_ = fm_;
+    sampler = fm_;
   }
-  core_ = std::make_unique<GenTrackerCore>(core_cfg, sampler_);
-  assembler_ = std::make_unique<ObsAssembler>(p.obs_terms, p.num_obs);
-
-  window_.assign(static_cast<size_t>(rw.offsets.size()) * node_dim_, 0.0);
-  obs_.assign(static_cast<size_t>(p.num_obs), 0.0f);
-  joint_pos_isaac_.assign(p.joint_names_isaac.size(), 0.0);
-  joint_vel_isaac_.assign(p.joint_names_isaac.size(), 0.0);
+  auto core = std::make_unique<GenTrackerCore>(core_cfg, sampler);
+  auto src = std::make_unique<FmReferenceSource>(fm_, worker, sampler, std::move(core), p,
+                                                 lead_ticks);
+  src->set_blocker(blocker);
+  fm_source_ = src.get();
+  source_ = std::move(src);
 }
 
+// The generator-shaped accessors all answer for the CLIP arm too rather than assuming a plan
+// exists: a logger runs the same code either way, and "there is no plan" is a fact about the
+// run rather than an error to throw at a publisher. fm_meta is the exception -- there is no
+// honest empty answer for a metadata block, so it throws.
 int PolicyRuntime::replan_period() const {
-  return core_ ? core_->scheduler().config().replan_period : 1;
+  return fm_source_ ? fm_source_->replan_period() : 1;
 }
+
+int PolicyRuntime::lead_ticks() const { return fm_source_ ? fm_source_->lead_ticks() : 0; }
 
 const std::vector<double>& PolicyRuntime::last_plan_window() const {
   static const std::vector<double> kEmpty;
-  return core_ ? core_->predicted_window() : kEmpty;
+  return fm_source_ ? fm_source_->plan_window() : kEmpty;
 }
 
 const FmRequest& PolicyRuntime::last_plan_request() const {
   static const FmRequest kEmpty;
-  return core_ ? core_->adopted_request() : kEmpty;
+  return fm_source_ ? fm_source_->plan_request() : kEmpty;
+}
+
+const FmConditioning& PolicyRuntime::last_conditioning() const {
+  static const FmConditioning kEmpty;
+  return fm_source_ ? fm_source_->conditioning() : kEmpty;
 }
 
 const FmMeta& PolicyRuntime::fm_meta() const {
-  if (!fm_) throw std::runtime_error("no fm.onnx is loaded, so there is no generator metadata");
-  return fm_->meta();
+  if (!fm_source_) {
+    throw std::runtime_error("no fm.onnx is loaded (this is clip playback), so there is no "
+                             "generator metadata");
+  }
+  return fm_source_->meta();
 }
 
 void PolicyRuntime::Reset() {
-  if (core_) core_->Reset();
+  if (source_) source_->Reset();
   if (assembler_) assembler_->Reset();
-  // Re-arming means the next tick again has no plan, so the blocking first collect has to come
-  // back with it.
-  if (blocker_) static_cast<FirstPlanBlocker*>(blocker_.get())->Rearm();
 }
 
 void PolicyRuntime::BuildValues(const HardwareReadings& readings) {
@@ -250,16 +346,27 @@ void PolicyRuntime::BuildValues(const HardwareReadings& readings) {
 
   // The joystick-level command over the same offsets. Deliberately separate from the reference
   // window so it stays clean: the generator has no per-step command, so the current one is
-  // held -- which is what the deployed joystick does anyway.
+  // held -- which is what the deployed joystick does anyway. A CLIP authored one per step and
+  // supplies them, and holding the current command instead would drive this term with a number
+  // the motion never asked for.
   const auto& offsets = tracker_->params().reference_window->offsets;
-  std::vector<double> cmd_window;
-  cmd_window.reserve(offsets.size() * 3);
-  for (size_t i = 0; i < offsets.size(); ++i) {
-    cmd_window.push_back(readings.command.x());
-    cmd_window.push_back(readings.command.y());
-    cmd_window.push_back(readings.command.z());
+  if (const std::vector<double>* served = source_->CommandWindow()) {
+    if (served->size() != offsets.size() * 3) {
+      throw std::runtime_error("the reference source served " + std::to_string(served->size()) +
+                               " command values for " + std::to_string(offsets.size()) +
+                               " offsets");
+    }
+    values_["command_window"] = *served;
+  } else {
+    std::vector<double> cmd_window;
+    cmd_window.reserve(offsets.size() * 3);
+    for (size_t i = 0; i < offsets.size(); ++i) {
+      cmd_window.push_back(readings.command.x());
+      cmd_window.push_back(readings.command.y());
+      cmd_window.push_back(readings.command.z());
+    }
+    values_["command_window"] = std::move(cmd_window);
   }
-  values_["command_window"] = std::move(cmd_window);
 
   // Exteroception. Required-ness comes from the ARTIFACTS, not from the caller: a policy that
   // reads terrain and is handed none would otherwise fail deep inside the observation assembly.
@@ -305,7 +412,7 @@ void PolicyRuntime::BuildValues(const HardwareReadings& readings) {
 void PolicyRuntime::Step(const HardwareReadings& readings,
                          const std::vector<std::string>& joint_names_out, double* targets_out,
                          TickDiagnostics* diag) {
-  if (!core_) throw std::runtime_error("PolicyRuntime::Load() has not been called");
+  if (!source_) throw std::runtime_error("PolicyRuntime::Load() has not been called");
   if (readings.joint_pos.size() != readings.joint_names.size() ||
       readings.joint_vel.size() != readings.joint_names.size()) {
     throw std::runtime_error("joint_pos / joint_vel / joint_names lengths disagree");
@@ -316,120 +423,22 @@ void PolicyRuntime::Step(const HardwareReadings& readings,
   cs.root_quat = readings.base_quat_xyzw;
   cs.command = {readings.command.x(), readings.command.y(), readings.command.z()};
 
-  // The exteroception and future command the generator will be conditioned on. Sampled HERE,
-  // i.e. at the request tick, which is what makes them the one thing that is genuinely `lead`
-  // ticks old by the time the plan is adopted -- see gen_tracker_core.h.
-  if (fm_) {
-    FmConditioning cond;
-    cond.extero.assign(static_cast<size_t>(fm_->meta().extero_dim()), 0.0);
-    const int channels = fm_->meta().extero_channels;
-    if (channels > 1) {
-      // The generator reads more than depth, so each pixel carries its position in the root's
-      // yaw-aligned frame. That needs the camera pose, which this runtime cannot derive --
-      // it has no kinematics and, deliberately, no odometry. Refused rather than defaulted:
-      // a wrong pose is a cloud in the wrong place, which looks entirely plausible.
-      if (readings.fm_camera_pos.size() != readings.depth_raw.size() ||
-          readings.fm_camera_rot.size() != readings.depth_raw.size()) {
-        throw std::runtime_error(
-            "fm.onnx conditions on " + std::to_string(channels) +
-            " channels per pixel, so it needs each camera's pose in the root's yaw-aligned "
-            "frame (fm_camera_pos / fm_camera_rot, one per camera in contract order). Build "
-            "it from FK to the mount plus the IMU's roll/pitch -- never odometry.");
-      }
-      std::vector<CameraGeom> geoms;
-      std::vector<std::vector<double>> normalised;
-      std::vector<const double*> images, positions, rotations;
-      for (size_t c = 0; c < readings.depth_raw.size(); ++c) {
-        const CameraGeom g = GeomFromSpec(tracker_->params().depth_cameras[c]);
-        geoms.push_back(g);
-        normalised.emplace_back(readings.depth_raw[c].size());
-        NormalizeDepthImage(readings.depth_raw[c].data(), readings.depth_raw[c].size(), g.norm,
-                            normalised.back().data());
-        positions.push_back(readings.fm_camera_pos[c].data());
-        rotations.push_back(readings.fm_camera_rot[c].data());
-      }
-      for (const auto& img : normalised) images.push_back(img.data());
-      // The band goes IN, so the image is clamped before the unprojection and the position
-      // channels are not clamped at all -- see DepthXyzRows.
-      DepthXyzRows(geoms, images, positions, rotations, channels, fm_->meta().extero_clip,
-                   cond.extero.data());
-    }
-    size_t at = 0;
-    for (size_t c = 0; channels == 1 && c < readings.depth_raw.size() && at < cond.extero.size();
-         ++c) {
-      const CameraGeom g = GeomFromSpec(tracker_->params().depth_cameras[c]);
-      for (double v : readings.depth_raw[c]) {
-        if (at >= cond.extero.size()) break;
-        cond.extero[at++] = NormalizeDepth(v, g.norm);
-      }
-    }
-    if (!readings.height_scan.empty() && readings.depth_raw.empty()) {
-      for (size_t i = 0; i < readings.height_scan.size() && i < cond.extero.size(); ++i) {
-        cond.extero[i] = readings.height_scan[i];
-      }
-    }
-    // The generator's own normalisation is folded into the graph, but the band clamp is not:
-    // one non-finite entry would poison the whole conditioning. The band comes from the GRAPH
-    // rather than the per-source table (see SanitizeExteroBand).
-    //
-    // SKIPPED for a widened row, which DepthXyzRows has already clamped in the one place
-    // clamping belongs -- the depth image, before the unprojection. Applying it again here
-    // would clamp METRES of position with a normalised-depth band, which is the bug this
-    // ordering exists to prevent.
-    if (channels == 1) {
-      SanitizeExteroBand(cond.extero.data(), cond.extero.size(), fm_->meta().extero_clip,
-                         cond.extero.data());
-    }
-    cond.future_cmd.assign(static_cast<size_t>(fm_->meta().f) * fm_->meta().cmd_dim, 0.0);
-    for (int f = 0; f < fm_->meta().f; ++f) {
-      cond.future_cmd[static_cast<size_t>(f) * 3 + 0] = readings.command.x();
-      cond.future_cmd[static_cast<size_t>(f) * 3 + 1] = readings.command.y();
-      cond.future_cmd[static_cast<size_t>(f) * 3 + 2] = readings.command.z();
-    }
-    last_cond_ = cond;  // for the replay harness; see last_conditioning()
-    fm_->SetConditioning(cond);
-  }
 
-  const TickOutcome outcome = core_->Step(cs, window_.data());
+  source_->Step(readings, cs, window_.data());
   BuildValues(readings);
   assembler_->Assemble(values_, obs_.data());
   tracker_->GetAction(obs_.data(), joint_names_out, targets_out);
 
   if (diag != nullptr) {
-    const PlanScheduler& s = core_->scheduler();
-    diag->outcome = outcome;
+    *diag = TickDiagnostics{};
+    source_->FillDiagnostics(diag);
     diag->obs_checksum = ObsChecksum(obs_.data(), obs_.size());
-    diag->cursor = s.cursor();
-    diag->ctrl_step = s.ctrl_step();
-    diag->late = s.late();
-    diag->late_events = s.late_events();
-    diag->offsets_clamped = s.offsets_clamped();
-    diag->requests_skipped = worker_ ? worker_->requests_skipped() : 0;
-    diag->plans_dropped = worker_ ? worker_->plans_dropped() : 0;
-    // Read the pair CONSISTENTLY. The worker writes last_infer_ms_ and then increments
-    // infer_count_, so a naive read of one then the other can catch an inference landing
-    // between them and pair the OLD duration with the NEW count -- and the controller samples
-    // fm_ms_ precisely when the count moves, so that plan's real duration would never be
-    // recorded and the previous one would be recorded twice. Re-read the count and only
-    // publish the increment once it brackets a stable read; otherwise report the previous
-    // count, and the next tick (20 ms later, against a ~240 ms cadence) picks it up.
-    if (fm_) {
-      const uint64_t before = fm_->infer_count();
-      const double ms = fm_->last_infer_ms();
-      const uint64_t after = fm_->infer_count();
-      diag->fm_infer_ms = ms;
-      diag->plans_produced = (before == after) ? after : before;
-    } else {
-      diag->fm_infer_ms = 0.0;
-      diag->plans_produced = 0;
-    }
     diag->trk_infer_ms = tracker_->last_infer_ms();
-    diag->plan_id = s.plan_id();
-    diag->anchor_pos = core_->anchor_pos();
-    diag->anchor_quat = core_->anchor_quat();
-    diag->plan_adopted =
-        outcome == TickOutcome::kAdoptedOnTime || outcome == TickOutcome::kAdoptedLate;
-    diag->lead_ticks = lead_ticks_;
+    // Offset 0 of the command block the observation was actually assembled from, whichever
+    // source supplied it. Read BACK rather than re-derived, so it cannot disagree with what
+    // the network saw.
+    const std::vector<double>& cw = values_["command_window"];
+    if (cw.size() >= 3) diag->command_effective = Vec3(cw[0], cw[1], cw[2]);
   }
 }
 

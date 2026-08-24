@@ -22,6 +22,7 @@
 #include "g1_deploy/fm_worker.h"
 #include "g1_deploy/gen_tracker_core.h"
 #include "g1_deploy/obs_assembler.h"
+#include "g1_deploy/reference_source.h"
 #include "g1_deploy/tracker_session.h"
 #include "g1_deploy/types.h"
 
@@ -78,7 +79,24 @@ struct HardwareReadings {
 /// How to load the pair.
 struct RuntimeConfig {
   std::string tracker_onnx;
-  std::string fm_onnx;                //: empty for tracker-only (clip) playback
+  //: Empty selects CLIP playback, which needs clip_pack -- see Load. Empty with no clip_pack
+  //: is refused: there would be no reference at all, and a tracker served zeros holds a pose
+  //: that looks like a policy that has given up.
+  std::string fm_onnx;
+  //: A clip pack directory (transfer/deploy/tools/dump_clip_pack.py) and the case in it. Set
+  //: BOTH, with fm_onnx empty, to drive the tracker from a baked motion with the generator not
+  //: loaded at all -- so a failure is unambiguously this stack rather than the generator.
+  std::string clip_pack;
+  std::string clip_case;
+  //: Seconds into the clip to begin, and seconds to PLAY before holding the last played frame
+  //: with a zero command. 0 duration = the whole clip.
+  double clip_start_time = 0.0;
+  double clip_duration = 0.0;
+  //: Clip re-anchor cadence in control steps. 0 DERIVES it from the tracker's own
+  //: fm_update_every, which under window_anchor="plan" is not a preference: the clip's
+  //: placement and the window's anchor have to be solved from the robot on the same step or
+  //: the egomotion between them leaks into base_pose. Load refuses a mismatch.
+  int clip_ego_anchor_every = 0;
   std::vector<Provider> providers{Provider::kCpu};
   int intra_threads = 0;
   //: Providers for the TRACKER alone, and its own thread count.
@@ -143,6 +161,15 @@ struct TickDiagnostics {
   TickOutcome outcome = TickOutcome::kNoPlan;
   uint64_t obs_checksum = 0;
   int cursor = 0;
+  //: Clip playback: whether it is on, and which clip step is being served. -1 outside it, so
+  //: a bag can tell "step 0" from "not a clip run" without consulting the config.
+  bool clip_mode = false;
+  int clip_step = -1;
+  //: The command the OBSERVATION was actually built with, at offset 0. The joystick's on the
+  //: generator path; the CLIP's authored target_vel on the clip path, where nothing publishes
+  //: a velocity command at all. Recorded because it is otherwise unrecoverable: a bag of a
+  //: clip run would show a zero command beside a robot walking backward.
+  Vec3 command_effective{0.0, 0.0, 0.0};
   int64_t ctrl_step = -1;
   bool late = false;
   uint32_t late_events = 0;
@@ -203,7 +230,7 @@ class PolicyRuntime {
   const std::vector<float>& last_obs() const { return assembler_->last_obs(); }
   /// The raw network output, in the POLICY's joint order.
   const std::vector<float>& last_action() const { return tracker_->last_action(); }
-  int lead_ticks() const { return lead_ticks_; }
+  int lead_ticks() const;
   /// K, the generator's re-plan period in control ticks. From tracker.onnx metadata only.
   int replan_period() const;
 
@@ -215,24 +242,34 @@ class PolicyRuntime {
   /// For the replay harness. The plan is a function of the history, THESE, and the noise, so
   /// when two runtimes' plans differ and their history and noise agree, this is where the
   /// difference is -- and it is pure arithmetic on both sides, so it should be exact.
-  const FmConditioning& last_conditioning() const { return last_cond_; }
+  const FmConditioning& last_conditioning() const;
+
+  /// Whether a baked clip is driving, and whether it has reached its last played frame.
+  bool clip_mode() const { return clip_source_ != nullptr; }
+  bool clip_exhausted() const { return clip_source_ != nullptr && clip_source_->exhausted(); }
 
   /// The generator's own metadata: F, D, N, cmd_dim, extero_source. Throws with no fm.onnx.
   const FmMeta& fm_meta() const;
 
  private:
   void BuildValues(const HardwareReadings& readings);
+  /// Build the clip source. Refuses a cadence that disagrees with the tracker's latch period.
+  void LoadClipSource(const ReferenceWindowSpec& rw, const std::vector<ReferenceBlock>& blocks,
+                      int num_joints, int num_ee);
+  /// Build the generator source: session, schedule, worker and the pair checks.
+  void LoadFmSource(const ReferenceWindowSpec& rw, const std::vector<ReferenceBlock>& blocks,
+                    int num_ee);
 
   RuntimeConfig cfg_;
   std::unique_ptr<TrackerSession> tracker_;
-  std::shared_ptr<FmSession> fm_;
-  std::shared_ptr<FmWorker> worker_;
-  std::shared_ptr<FmSampler> blocker_;   //: wraps the worker to block the first collect
-  std::shared_ptr<FmSampler> sampler_;   //: what the core calls: blocker_, or fm_ inline
-  std::unique_ptr<GenTrackerCore> core_;
+  //: Where reference_window comes from. Chosen ONCE, at load; the tick does not branch on it.
+  std::unique_ptr<ReferenceSource> source_;
+  //: The same object, typed, for the accessors a logger needs. Non-owning; null on the other
+  //: arm, which is what makes "is there a plan" answerable instead of assumed.
+  FmReferenceSource* fm_source_ = nullptr;
+  ClipReferenceSource* clip_source_ = nullptr;
   std::unique_ptr<ObsAssembler> assembler_;
 
-  int lead_ticks_ = 1;
   int node_dim_ = 0;
   std::vector<double> window_;                 //: offsets x node_dim, re-anchored
   std::map<std::string, std::vector<double>> values_;
@@ -241,7 +278,6 @@ class PolicyRuntime {
   std::vector<double> joint_vel_isaac_;
   std::vector<int> joint_permutation_;         //: robot order -> policy order
   std::vector<std::string> cached_joint_names_;
-  FmConditioning last_cond_;              //: what the last request was conditioned on
 };
 
 }  // namespace g1_deploy
