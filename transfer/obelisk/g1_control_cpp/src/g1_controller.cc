@@ -475,6 +475,34 @@ void G1Controller::Arm() {
     RCLCPP_ERROR(this->get_logger(), "refusing to arm: the estimate carries no joint names");
     return;
   }
+  // EVERY depth camera must have delivered a frame. The policy reads them, so ComputeControl
+  // cannot run without them -- and its only option once armed is to return an EMPTY ControlMsg
+  // and warn. In MuJoCo nothing holds the robot up, so a run that arms into that state
+  // collapses on the spot and looks exactly like a policy that cannot stand: no commands go
+  // out at all, which is the one failure mode that tells you nothing about the policy.
+  //
+  // Refusing here instead turns a race into a diagnosable stall: the FSM keeps holding the
+  // robot, this message names the camera that is missing, and arming succeeds as soon as the
+  // world's publishers come up. It is a RACE and not a fault -- the brain is started first on
+  // purpose (it needs ~10 s to load the pair), so on a fast arm the world's 30 Hz depth
+  // publishers may not have produced a frame yet.
+  {
+    std::lock_guard<std::mutex> lock(depth_mutex_);
+    for (size_t c = 0; c < depth_.size(); ++c) {
+      if (depth_[c].empty()) {
+        RCLCPP_ERROR_THROTTLE(
+            this->get_logger(), *this->get_clock(), 1000,
+            "refusing to arm: depth camera %zu of %zu ('%s') has not published yet. Arming now "
+            "would publish empty commands until it does, and the robot would fall while the "
+            "policy was never asked for anything.",
+            c, depth_.size(),
+            (policy_ && c < policy_->params().depth_cameras.size()
+                 ? policy_->params().depth_cameras[c].obs_term.c_str()
+                 : "?"));
+        return;
+      }
+    }
+  }
 
   hw_joint_names_ = snapshot.joint_names;
   // Gains come from the metadata in the POLICY's joint order; the robot wants its own.

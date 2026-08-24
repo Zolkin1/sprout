@@ -25,6 +25,35 @@ def constant_forward(sim_time):
     return np.array([CONSTANT_FORWARD_SPEED, 0.0, 0.0])
 
 
+#: Commanded BACKWARD speed for :func:`constant_backward`, in m/s. Negative by construction.
+#: Obelisk's joystick tops out at v_x_scale = 0.8, so this matches what a full-stick reverse
+#: actually asks for there -- the point of the profile is to compare the two stacks, and a
+#: different magnitude would be one more reason they could differ.
+CONSTANT_BACKWARD_SPEED = -0.8
+
+
+def constant_backward(sim_time):
+    """Full REVERSE speed from t=0. No ramp, no lateral, no yaw.
+
+    Exists because walking backwards is the one gait the obelisk stack stumbles on while the
+    sim2sim runner does not, and reproducing that needs a scripted command: the comparison has
+    to be repeatable, and a human on a stick is not.
+
+    Note the robot cannot SEE where it is going in this profile. Both depth cameras look
+    forward and down, so in reverse the generator is conditioned on terrain the robot is
+    walking away from. That is true of both simulators equally, which is what makes it a fair
+    comparison rather than a confound.
+
+    Args:
+        sim_time: Simulation time, unused -- the command is constant by construction.
+
+    Returns:
+        ``(vx, vy, wz)``.
+    """
+    del sim_time
+    return np.array([CONSTANT_BACKWARD_SPEED, 0.0, 0.0])
+
+
 def step_to_max(sim_time):
     """Pass a given input as a function of time."""
     if sim_time > 1.:
