@@ -27,6 +27,12 @@ TOPICS = {TICK, FM_PLAN, EST, CTRL, VEL_CMD, *DEPTH}
 #: count, and ``ee_pos`` is whatever remains -- see :func:`block_slices`.
 _FIXED_BLOCK_WIDTH = {"base_pose": 9, "base_vel": 6}
 
+#: Body frames drawn as "the feet". This teacher's window carries NO ``ee_pos`` block, so
+#: foot positions are not served -- they are implied by ``joint_pos`` and recovered with
+#: FK (:class:`deploy.fk.WindowFK`), which is the same route the RViz plan ribbon takes.
+#: A frame absent from the URDF comes back NaN rather than raising.
+FOOT_FRAMES = ("left_ankle_roll_link", "right_ankle_roll_link")
+
 
 def block_slices(blocks: list[str], node_dim: int, num_joints: int) -> dict[str, slice]:
     """Where each block sits within one reference-window node.
@@ -171,12 +177,14 @@ class Run:
             q_base = np.array([list(m.q_base) for _, m in est])[idx]
             v_base = np.array([list(m.v_base) for _, m in est])[idx]
             self.joint_pos = np.array([list(m.q_joints) for _, m in est])[idx]
+            self.base_pos = q_base[:, 0:3]                        # world, DIAGNOSTIC ONLY
             self.base_quat = q_base[:, 3:7]                       # xyzw
             self.base_lin_b = quat_rotate_inv(self.base_quat, v_base[:, 0:3])
             self.base_ang_b = v_base[:, 3:6]
         else:
             n = len(self.t)
             self.joint_pos = np.zeros((n, 0))
+            self.base_pos = np.zeros((n, 3))
             self.base_quat = np.tile([0.0, 0.0, 0.0, 1.0], (n, 1))
             self.base_lin_b = np.zeros((n, 3))
             self.base_ang_b = np.zeros((n, 3))
@@ -254,9 +262,26 @@ class Run:
     def _decode_reference(self) -> None:
         """Unpack the flat reference window into per-block arrays.
 
-        Every block is expressed relative to the robot AT THAT TICK, so no world frame and
-        no re-anchoring is needed to read it -- ``base_pose``'s position half IS the
-        tracking error, in the robot's yaw frame.
+        No world frame and no re-anchoring is needed to read any of it. What the
+        ``base_pose`` POSITION half is measured from, however, depends on the artifact's
+        ``window_anchor``, and the two arms are indistinguishable by shape:
+
+        * ``robot_now`` -- ``p_ref - p_actual(t)``. This IS the tracking error, in the
+          robot's yaw frame, and it is what the name ``ref_pos_err`` means.
+        * ``plan`` -- ``p_ref - p_plan``, measured from the root as it was at the LAST
+          RE-PLAN. It is NOT a tracking error: between re-plans it grows as the robot's own
+          commanded displacement carries the reference away from a frozen anchor, then
+          resets when the anchor re-latches. Measured on a backward walk it is a clean
+          sawtooth, 0.002 -> 0.102 m over exactly ``fm_update_every`` = 12 ticks, which is
+          0.42 m/s -- the commanded speed, not an error.
+
+        **The C++ deploy runtime serves ``plan`` only** and refuses ``robot_now``, so any
+        bag from it is the second case; reading its origin as "where the robot is" makes
+        the robot's intended motion look like drift. The residual at cursor 0 is the part
+        that IS a tracking error (0.005 m on that run). The tick message does not carry the
+        convention, so nothing here can assert which arm produced a given bag -- hence
+        :meth:`robot_in_anchor_frame`, which puts the robot on the same axes rather than
+        assuming it sits at the origin.
         """
         first = self.ticks[0]
         self.offsets = np.array(list(first.reference_offsets))
@@ -278,6 +303,88 @@ class Run:
                             if "base_pose" in self.slices else None)
         self.ref_joint = (win[:, :, self.slices["joint_pos"]]
                           if "joint_pos" in self.slices else None)
+
+    def robot_in_anchor_frame(self, tick: int) -> np.ndarray | None:
+        """Where the ROBOT is, in the frame the reference window is drawn in.
+
+        Under the ``plan`` anchor the window's origin is the latched anchor, not the robot,
+        so the robot has to be placed on those axes explicitly or the gap between the two --
+        the thing a tracking failure actually looks like -- is invisible.
+
+        Args:
+            tick: Tick index.
+
+        Returns:
+            ``(3,)`` robot position in the anchor's yaw frame, or None when no anchor was
+            latched (clip playback runs no generator, so ``fm_anchor_pos`` stays zero).
+        """
+        m = self.ticks[tick]
+        anchor = np.asarray(m.fm_anchor_pos, dtype=np.float64)
+        quat = np.asarray(m.fm_anchor_quat, dtype=np.float64)
+        if anchor.size != 3 or quat.size != 4 or not np.isfinite(anchor).all():
+            return None
+        if not np.any(anchor) and not np.any(quat[:3]):
+            return None                     # never latched: clip playback
+        d = np.asarray(self.base_pos[tick], dtype=np.float64) - anchor
+        # Yaw only: the window's frame is yaw-aligned, so roll/pitch must not rotate it.
+        yaw = np.arctan2(2.0 * (quat[3] * quat[2] + quat[0] * quat[1]),
+                         1.0 - 2.0 * (quat[1] ** 2 + quat[2] ** 2))
+        c, s = np.cos(-yaw), np.sin(-yaw)
+        return np.array([c * d[0] - s * d[1], s * d[0] + c * d[1], d[2]])
+
+    def feet_at(self, tick: int) -> tuple[np.ndarray, np.ndarray] | None:
+        """FK'd foot positions, reference over the window and measured now.
+
+        Both are expressed in the BASE's own frame -- the base pose is deliberately NOT
+        applied. That is what makes the two comparable in every mode: the ``plan`` anchor
+        means the reference base and the measured base are not in a common frame without
+        odometry, while the joint configuration alone is exactly what the tracker is being
+        asked to reproduce. So this shows the GAIT -- stride reach, lift, lateral placement
+        -- and any difference in it is a joint-tracking difference, with no frame convention
+        able to contaminate it.
+
+        Args:
+            tick: Tick index.
+
+        Returns:
+            ``(reference [K, 2, 3], measured [2, 3])`` in metres, ordered as
+            :data:`FOOT_FRAMES`, or None if FK is unavailable (no pinocchio, no URDF, or no
+            ``joint_pos`` block).
+        """
+        fk = self._foot_fk()
+        if fk is None or self.ref_joint is None:
+            return None
+        zero = np.zeros(3)
+        ident = np.array([0.0, 0.0, 0.0, 1.0])
+        k = self.ref_joint.shape[1]
+        ref = fk.frame_positions(np.tile(zero, (k, 1)), np.tile(ident, (k, 1)),
+                                 self.ref_joint[tick])
+        meas = self.joint_pos_isaac
+        if meas is None or meas.shape[1] < len(self.joint_names_isaac):
+            return ref, np.full((len(FOOT_FRAMES), 3), np.nan)
+        act = fk.frame_positions(zero[None, :], ident[None, :], meas[tick][None, :])[0]
+        return ref, act
+
+    def _foot_fk(self):
+        """Build the FK helper once, or None if it cannot be built.
+
+        Cached including the failure, so a missing pinocchio costs one import attempt rather
+        than one per redraw in the stepper.
+        """
+        if not hasattr(self, "_foot_fk_cache"):
+            self._foot_fk_cache = None
+            try:
+                import os
+                import sys
+                sys.path.insert(0, os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".."))
+                from deploy.fk import DEFAULT_FK_MODEL, WindowFK
+                if self.joint_names_isaac:
+                    self._foot_fk_cache = WindowFK(
+                        DEFAULT_FK_MODEL, list(FOOT_FRAMES), self.joint_names_isaac)
+            except Exception as exc:                       # noqa: BLE001 -- a drawing tool
+                self._foot_fk_note = str(exc)
+        return self._foot_fk_cache
 
     def nearest_tick(self, t: float) -> int:
         """Index of the tick closest to time ``t``."""

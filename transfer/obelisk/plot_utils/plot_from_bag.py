@@ -49,7 +49,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from bag_reader import read_bag  # noqa: E402
-from bag_run import TOPICS, Run  # noqa: E402
+from bag_run import FOOT_FRAMES, TOPICS, Run  # noqa: E402
 
 _HERE = pathlib.Path(__file__).resolve().parent
 DEFAULT_BAG_ROOT = _HERE.parent / "log" / "bags"
@@ -272,9 +272,59 @@ def fig_generator(run: Run, plt):
     return fig, ax
 
 
+def fig_feet(run: Run, plt):
+    """Foot position over the run: what the reference asked for, and where the foot was.
+
+    The window carries no ``ee_pos`` block, so both sides are FK'd from joint angles in the
+    BASE's frame -- see :meth:`bag_run.Run.feet_at` for why that frame and not a world one.
+    A base-frame foot position is the gait itself: stride reach in x, stance width in y,
+    swing height in z. Reading it against the reference is how a "tracks joints but walks
+    badly" failure becomes visible, because the joint plot shows 29 small errors while this
+    shows the one thing they add up to.
+    """
+    fig, ax = plt.subplots(3, 2, figsize=(14, 9), sharex=True)
+    probe = run.feet_at(0)
+    if probe is None:
+        for a in ax.ravel():
+            a.text(0.5, 0.5, "no FK available (pinocchio / URDF)",
+                   ha="center", va="center", transform=a.transAxes)
+        return fig, ax.ravel()
+
+    n = len(run.t)
+    ref = np.full((n, len(FOOT_FRAMES), 3), np.nan)
+    act = np.full((n, len(FOOT_FRAMES), 3), np.nan)
+    for i in range(n):
+        got = run.feet_at(i)
+        if got is not None:
+            ref[i] = got[0][0]          # offset 0 == the reference for THIS tick
+            act[i] = got[1]
+
+    for f, foot in enumerate(FOOT_FRAMES):
+        for c, name in enumerate("xyz"):
+            a = ax[c, f]
+            a.plot(run.t, ref[:, f, c], lw=1.0, label="reference")
+            a.plot(run.t, act[:, f, c], lw=0.8, ls="--", label="measured")
+            a.set_ylabel(f"{name} [m]")
+            a.grid(alpha=0.3)
+            if c == 0:
+                a.set_title(foot, fontsize="small")
+                a.legend(fontsize="x-small", ncol=2)
+    err = np.linalg.norm(ref - act, axis=-1)
+    for f in range(len(FOOT_FRAMES)):
+        ax[2, f].set_xlabel("time [s]")
+        finite = err[np.isfinite(err[:, f]), f]
+        if finite.size:
+            ax[0, f].set_title(f"{FOOT_FRAMES[f]}   |err| mean {finite.mean()*1e3:.0f} mm, "
+                               f"p95 {np.percentile(finite, 95)*1e3:.0f} mm",
+                               fontsize="small")
+    # Flat: main() iterates the returned axes to apply shared styling, and a 2-D array
+    # yields ROWS there rather than axes.
+    return fig, ax.ravel()
+
+
 FIGURES = {"health": fig_health, "command": fig_command, "tracking": fig_tracking,
            "joints": fig_joints, "reference": fig_reference,
-           "generator": fig_generator}
+           "generator": fig_generator, "feet": fig_feet}
 
 
 # ---------------------------------------------------------------------------
@@ -296,16 +346,30 @@ class Stepper:
     def __init__(self, run: Run, plt) -> None:
         self.run = run
         self.i = int(np.argmax(run.armed)) if run.armed.any() else 0
-        self.fig = plt.figure(figsize=(15, 10))
-        gs = self.fig.add_gridspec(3, 4, height_ratios=[1.1, 1.0, 1.0])
+        # constrained layout, because four rows of titled panels overlap their neighbours'
+        # x-labels otherwise -- and the panels most worth reading here are the small ones.
+        self.fig = plt.figure(figsize=(16, 12), layout="constrained")
+        gs = self.fig.add_gridspec(4, 4, height_ratios=[1.05, 0.95, 0.95, 0.7])
 
         self.ax_near = self.fig.add_subplot(gs[0, 0])
         self.ax_far = self.fig.add_subplot(gs[0, 1])
         self.ax_path = self.fig.add_subplot(gs[0, 2])
         self.ax_z = self.fig.add_subplot(gs[0, 3])
-        self.ax_jwin = self.fig.add_subplot(gs[1, :2])
-        self.ax_jnow = self.fig.add_subplot(gs[1, 2:])
-        self.ax_vel = self.fig.add_subplot(gs[2, :])
+        # Row 1: the base_pose block SPLIT PER AXIS. A single x-y path hides which axis a
+        # divergence is in, and z never appeared on it at all -- so a height error and a
+        # downrange error looked the same.
+        self.ax_ex = self.fig.add_subplot(gs[1, 0])
+        self.ax_ey = self.fig.add_subplot(gs[1, 1])
+        self.ax_ez = self.fig.add_subplot(gs[1, 2])
+        self.ax_rpy = self.fig.add_subplot(gs[1, 3])
+        # Row 2: the feet, FK'd (the window carries no ee_pos block), then the joints.
+        self.ax_fl = self.fig.add_subplot(gs[2, 0])
+        self.ax_fr = self.fig.add_subplot(gs[2, 1])
+        self.ax_jnow = self.fig.add_subplot(gs[2, 2:])
+        self.ax_vel = self.fig.add_subplot(gs[3, :])
+        self._axes_dyn = (self.ax_near, self.ax_far, self.ax_path, self.ax_z,
+                          self.ax_ex, self.ax_ey, self.ax_ez, self.ax_rpy,
+                          self.ax_fl, self.ax_fr, self.ax_jnow)
 
         self._limits = self._compute_limits()
         self._init_static()
@@ -345,8 +409,16 @@ class Stepper:
             z = r.ref_pos_err[:, :, 2]
             out["z"] = pad(float(np.nanmin(z)), float(np.nanmax(z)))
 
+        if r.ref_pos_err is not None and np.isfinite(r.ref_pos_err).any():
+            # Per-axis limits, each over its OWN axis: sharing one scale across x/y/z lets
+            # the largest axis flatten the other two into a straight line.
+            for ax_i, key in enumerate(("ex", "ey", "ez")):
+                v = r.ref_pos_err[:, :, ax_i]
+                out[key] = pad(float(np.nanmin(v)), float(np.nanmax(v)))
+        if r.ref_rpy_err is not None and np.isfinite(r.ref_rpy_err).any():
+            out["rpy"] = pad(float(np.nanmin(r.ref_rpy_err)), float(np.nanmax(r.ref_rpy_err)))
+
         if r.ref_joint is not None and np.isfinite(r.ref_joint).any():
-            out["jwin"] = pad(float(np.nanmin(r.ref_joint)), float(np.nanmax(r.ref_joint)))
             stack = [r.ref_joint]
             nj = r.ref_joint.shape[2]
             for arr in (r.joint_pos_isaac, r.joint_target_isaac):
@@ -355,6 +427,18 @@ class Stepper:
             lo = min(float(np.nanmin(a)) for a in stack)
             hi = max(float(np.nanmax(a)) for a in stack)
             out["jnow"] = pad(lo, hi)
+
+        # Feet: one scale shared by BOTH feet and by reference and measured alike, so the
+        # left and right panels can be read against each other and a swing height can be
+        # compared to its own reference rather than to a rescaled axis.
+        probe = r.feet_at(int(np.argmax(r.armed)) if r.armed.any() else 0)
+        if probe is not None:
+            every = [r.feet_at(i) for i in range(0, len(r.t), max(1, len(r.t) // 200))]
+            vals = np.concatenate([np.concatenate([a.ravel(), b.ravel()])
+                                   for a, b in every if a is not None])
+            vals = vals[np.isfinite(vals)]
+            if vals.size:
+                out["feet"] = pad(float(vals.min()), float(vals.max()))
 
         # One colour scale per camera, over every frame: stepping should show the scene
         # changing, not the colormap re-normalising to it.
@@ -400,8 +484,7 @@ class Stepper:
     def _draw(self) -> None:
         """Redraw everything that depends on the cursor."""
         r, i = self.run, self.i
-        for ax in (self.ax_near, self.ax_far, self.ax_path, self.ax_z,
-                   self.ax_jwin, self.ax_jnow):
+        for ax in self._axes_dyn:
             ax.clear()
 
         for cam, (ax, name) in enumerate(((self.ax_near, "near"), (self.ax_far, "far"))):
@@ -424,10 +507,19 @@ class Stepper:
             ax.set_xticks([]); ax.set_yticks([])
 
         if r.ref_pos_err is not None:
-            p = r.ref_pos_err[i]                       # [K, 3], robot yaw frame, ref-actual
-            self.ax_path.plot(p[:, 0], p[:, 1], "-o", ms=3)
-            self.ax_path.plot(0, 0, "r*", ms=12, label="robot")
-            self.ax_path.set_title("reference root path\n(robot yaw frame)", fontsize="small")
+            p = r.ref_pos_err[i]                       # [K, 3] in the ANCHOR's yaw frame
+            self.ax_path.plot(p[:, 0], p[:, 1], "-o", ms=3, label="reference")
+            # The origin is the WINDOW's anchor, which under `plan` is the root at the last
+            # re-plan -- NOT the robot. Labelling it "robot" made the robot's own commanded
+            # displacement (0.42 m/s of it, resetting every 12 ticks) read as drift.
+            self.ax_path.plot(0, 0, "k+", ms=12, mew=2, label="anchor")
+            robot = r.robot_in_anchor_frame(i)
+            if robot is not None:
+                self.ax_path.plot(robot[0], robot[1], "r*", ms=12, label="robot")
+            self.ax_path.set_title(
+                "reference root path (anchor yaw frame)\n"
+                + ("robot drawn from odometry -- DIAGNOSTIC" if robot is not None
+                   else "no anchor latched (clip playback)"), fontsize="small")
             self.ax_path.set_xlabel("x [m]"); self.ax_path.set_ylabel("y [m]")
             self.ax_path.legend(fontsize="x-small")
             if "path" in self._limits:
@@ -443,15 +535,54 @@ class Stepper:
             if "z" in self._limits:
                 self.ax_z.set_ylim(*self._limits["z"])
 
-        if r.ref_joint is not None:
-            for j in range(r.ref_joint.shape[2]):
-                self.ax_jwin.plot(r.offsets, r.ref_joint[i, :, j], lw=0.7)
-            self.ax_jwin.set_title("reference joint trajectory over the window "
-                                   "(all joints)", fontsize="small")
-            self.ax_jwin.set_xlabel("offset [steps]"); self.ax_jwin.set_ylabel("[rad]")
-            if "jwin" in self._limits:
-                self.ax_jwin.set_ylim(*self._limits["jwin"])
+            # ---- per-axis, which is what a single x-y path cannot show ----
+            for ax, comp, name in ((self.ax_ex, 0, "x"), (self.ax_ey, 1, "y"),
+                                   (self.ax_ez, 2, "z")):
+                ax.plot(r.offsets, p[:, comp], "-o", ms=3)
+                ax.axhline(0.0, color="r", lw=0.8)
+                if robot is not None:
+                    ax.axhline(robot[comp], color="tab:green", lw=0.9, ls=":",
+                               label="robot")
+                    ax.legend(fontsize="x-small")
+                ax.set_title(f"base {name}: reference - anchor", fontsize="small")
+                ax.set_xlabel("offset [steps]"); ax.set_ylabel(f"{name} [m]")
+                key = ("ex", "ey", "ez")[comp]
+                if key in self._limits:
+                    ax.set_ylim(*self._limits[key])
 
+        if r.ref_rpy_err is not None:
+            rpy = r.ref_rpy_err[i]
+            for c, name in enumerate(("roll", "pitch", "yaw")):
+                self.ax_rpy.plot(r.offsets, np.degrees(rpy[:, c]), "-o", ms=3, label=name)
+            self.ax_rpy.axhline(0.0, color="r", lw=0.8)
+            self.ax_rpy.set_title("base orientation: reference - anchor", fontsize="small")
+            self.ax_rpy.set_xlabel("offset [steps]"); self.ax_rpy.set_ylabel("[deg]")
+            self.ax_rpy.legend(fontsize="x-small")
+            if "rpy" in self._limits:
+                lo, hi = self._limits["rpy"]
+                self.ax_rpy.set_ylim(np.degrees(lo), np.degrees(hi))
+
+        feet = r.feet_at(i)
+        for f, (ax, label) in enumerate(((self.ax_fl, "left foot"),
+                                         (self.ax_fr, "right foot"))):
+            if feet is None:
+                ax.text(0.5, 0.5, "no FK\n(pinocchio / URDF)", ha="center", va="center",
+                        transform=ax.transAxes, fontsize="small")
+                continue
+            ref_f, act_f = feet
+            for c, (name, colour) in enumerate((("x", "tab:blue"), ("y", "tab:orange"),
+                                                ("z", "tab:green"))):
+                ax.plot(r.offsets, ref_f[:, f, c], "-", color=colour, lw=1.2,
+                        label=f"ref {name}")
+                ax.plot(0, act_f[f, c], "o", color=colour, ms=7, mfc="none", mew=1.8)
+            ax.set_title(f"{label} (base frame)\nline = reference, ring = measured",
+                         fontsize="small")
+            ax.set_xlabel("offset [steps]"); ax.set_ylabel("[m]")
+            ax.legend(fontsize="x-small", ncol=3)
+            if "feet" in self._limits:
+                ax.set_ylim(*self._limits["feet"])
+
+        if r.ref_joint is not None:
             nj = r.ref_joint.shape[2]
             idx = np.arange(nj)
             self.ax_jnow.plot(idx, r.ref_joint[i, 0, :], "o-", ms=3, label="reference @0")
@@ -466,7 +597,7 @@ class Stepper:
             if "jnow" in self._limits:
                 self.ax_jnow.set_ylim(*self._limits["jnow"])
 
-        for ax in (self.ax_path, self.ax_z, self.ax_jwin, self.ax_jnow):
+        for ax in self._axes_dyn[2:]:
             ax.grid(alpha=0.3)
         self._cursor.set_xdata([r.t[i], r.t[i]])
 
