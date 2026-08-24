@@ -484,11 +484,25 @@ the bag is finalised).
 
 **The brain is the C++ controller** (`g1_cpp.yml`, `g1_control_cpp`); the python one
 (`g1.yml`) is DEPRECATED, warns at startup, and is reachable only via `--python`. It survives
-for bisecting a regression and for CLIP PLAYBACK, which the C++ runtime cannot do at all (no
-HDF5 clip reader — it refuses to load without an `fm.onnx` rather than pretending;
-`TODO(cpp-clip)`). It also REFUSES a >1-channel generator outright, because that needs camera
-FK it does not have. Nothing new goes there: the numeric half belongs in `transfer/deploy_cpp`
-(tested against the python oracle with no ROS), the ROS half in `g1_control_cpp`.
+for bisecting a regression and nothing else. **CLIP PLAYBACK IS NOW C++ TOO** (`g1_cpp_clip.yml`,
+the default for `scripts/run_sim_clip.sh`; `--python` reaches the old one). Nothing new goes
+there: the numeric half belongs in `transfer/deploy_cpp` (tested against the python oracle with
+no ROS), the ROS half in `g1_control_cpp`.
+
+**The clip reaches C++ as a PACK, never as HDF5.** `transfer/deploy/tools/dump_clip_pack.py`
+writes the library into the `manifest.json` + raw-float64-blob format `deploy/fixture_io.py`
+already writes and `g1_deploy::BlobPack` reads (promoted out of `test/fixture.h` when this
+became its second consumer). The image ships no HDF5, and the library is `lzf`-compressed,
+which the plain HDF5 C library cannot decode without h5py's filter plugin. The pack carries the
+channel NAMES, so a pack built for another robot fails loudly instead of reading the right
+columns of the wrong motion, and it is committed beside the `.h5`.
+`clip_reference_parity_test.cc` holds the port to the python oracle at 1e-11 over the real pack.
+
+**Where the reference comes from is chosen ONCE, at load** (`ReferenceSource` in
+`policy_runtime.h`: `FmReferenceSource` or `ClipReferenceSource`), so the tick does not branch
+on it. The clip supplies its own per-offset `command_window`; the generator holds the current
+command, as the deployed joystick does. A >1-channel generator still needs camera FK, which
+clip mode never builds because it loads no generator at all.
 
 **Pinocchio is the robot's kinematics, in both languages, from one apt package**
 (`ros-humble-pinocchio`, 4.0 in the image; the dev box has 3.9 from pip and both are pinned by
@@ -511,13 +525,30 @@ MuJoCo sim, so the image installs it regardless. The URDF is a controller PARAME
   `GaussianNoise::Fill` and was committed). The configure now WARNS; compile in the container.
 
 **When it falls over, take the generator out of the loop first.** `scripts/run_sim_clip.sh
---case stand` swaps in `g1_debug_clip.yml`, which loads the tracker ALONE (no `fm.onnx` at
-all) and drives it from a baked clip. Cases, easiest first: `stand` (reference never moves —
-if this falls the fault is this stack, not any policy), `stand_walk_stand` (the SAME clip
-untruncated, so a failure isolates the walk transition), `terrain`. Each is known to survive
-in MuJoCo through the same `transfer/deploy` runtime, so a case that falls here and not
-there is a difference in the ROS stack. The clip library is built by
-`scripts/rsl_rl/make_debug_clips.py` out of the library the teacher trained on.
+--case stand` swaps in `g1_cpp_clip.yml`, which loads the tracker ALONE (no `fm.onnx` at all)
+and drives it from a baked clip through the SAME C++ runtime the generator path uses — so a
+case changes exactly one thing against a normal run: where the reference comes from. Cases,
+easiest first: `stand` (reference never moves — if this falls the fault is this stack, not
+any policy), `stand_walk_stand` (the SAME clip untruncated, so a failure isolates the walk
+transition), `walk_backward`, `terrain`. Each is known to survive in MuJoCo through the same
+`transfer/deploy` runtime, so a case that falls here and not there is a difference in the ROS
+stack. `--python` reaches the deprecated controller for a bisect; the two implementations are
+held to 1e-11 (`deploy_cpp/test/clip_reference_parity_test.cc`), so a BEHAVIOURAL difference
+between them is not in the reference construction.
+
+**Two artifacts, neither committed** (both come from a clip library the robot does not
+carry): `scripts/rsl_rl/make_debug_clips.py` writes the `.h5` the python controller reads,
+then `transfer/deploy/tools/dump_clip_pack.py` writes the binary PACK the C++ one reads. The
+pack exists because the image ships no HDF5 and the library is lzf-compressed, which the
+plain HDF5 C library cannot decode. Build both before a clip run on a fresh machine.
+
+**The cadence is not a knob.** Under `window_anchor="plan"` the clip's ego re-anchor and the
+reference window's anchor latch must fire on the SAME step, or up to `K-1` steps of the
+robot's own egomotion leak into `base_pose` — a window matching neither training nor an
+odometry-free serve, and exactly as wide as a correct one. Both configs DERIVE it from the
+tracker's `fm_update_every` (`0` = derive) and both runtimes refuse a mismatch. That
+cancellation is what makes C++ clip playback odometry-free: measured 8.3e-17 m between a
+walking and a stalled robot, against 0.132 m at a mismatched cadence.
 
 - **No PD warm-up, and no way to add one.** Whatever feeds the tracker drives it from the
   first tick, matching `gen_tracker_runner.py`. The warm-up paths are GONE — the stand hold,
@@ -599,14 +630,15 @@ desktop is stable to ~1%. **The Thor baseline sat ABOVE the 20 ms control period
 aimed at the chronically-late plan the two-box bring-up traced its falls to, not just at
 throughput.
 
-**Two things this surfaced and did NOT fix:**
-- `G1_DEPLOY_POLICY_DIR` in `deploy_cpp/CMakeLists.txt` points at
-  `hf_cache/<repo>/<run>`, but the controller loads `hf_cache/<repo>/policies/<run>`. So the
-  C++ session tests SILENTLY SKIP on the dev box (that path does not exist) and on the Thor
-  they would read a stale 111 MB `fm.onnx`. `test_policy_cache_layout.py` already pins the
-  `policies/` prefix across the language boundary — this default escaped it.
-- Pointed at the real pair, `policy_runtime_test` fails because it feeds no camera poses for a
-  5-channel generator. Pre-existing; fixing the path above requires fixing this too.
+**Two things this surfaced, both FIXED 2026-08-24:**
+- `G1_DEPLOY_POLICY_DIR` in `deploy_cpp/CMakeLists.txt` was missing the `policies/` element the
+  controller loads under, so the C++ session tests SILENTLY SKIPPED on every dev box.
+  `test_policy_cache_layout.py` pins that prefix across the language boundary and could not see
+  this default. It now points at the live `plan` run.
+- With the path fixed, `policy_runtime_test` failed for real: it fed no camera poses to a
+  5-channel generator, which the runtime refuses BY DESIGN. `MakeReadings` now supplies each
+  camera's nominal mount pose, and the test runs against the live pair (4 passed, 1 skipped on
+  the CPU provider, where deadlines are not assertable).
 - The capture path is verified on the Thor through the PYTHON runtime on the host (3/3 tests,
   19.33 -> 15.45 ms). The C++ half compiles clean on aarch64 and passes 12/12 on the CPU there,
   but its GPU behaviour in the Thor CONTAINER is unverified: `docker run --runtime nvidia`
@@ -773,6 +805,40 @@ be able to read impossibly small. `fm_plan` and `ctrl` are silent while `armed: 
 the depth topic read +273 ms. Only the difference means anything. The controller's own
 `depth_capture_age` is the number, and it is in the bag.
 
+## The obelisk SIM applies the MJCF's PD gains, and they were STALE (fixed 2026-08-24)
+
+The tracker fell in the obelisk sim on motions MuJoCo sim2sim walked through cleanly, and the
+cause was neither policy nor stack: **both hip pitches were 2.46x too soft there**, kp 40.18
+against the 99.10 the policy exports. Same tracker, same clip, same world -- `walk_backward`
+went from 3/5 falls to 0/5, and travel tightened from a 1.99-3.75 m spread to 2.48-2.50 m.
+
+**Three consumers, and only ONE reads the MJCF's gains**, which is why this was invisible:
+
+| consumer | gain source |
+|---|---|
+| `transfer/sim` sim2sim | the policy's, via `Robot.set_pd_gains_from_policy` -- **overwrites the MJCF** |
+| the hardware driver | the policy's, via `msg.kp` / `msg.kd` on the wire |
+| **the obelisk MuJoCo sim** | **the MJCF** |
+
+Obelisk's sim is `void ApplyControl(const ControlMessageT& msg) { SetSharedData(msg.u_mujoco); }`
+-- straight into `data.ctrl`. It never reads the published gains, so the MJCF alone decides how
+stiff the robot is there, and both controllers publish `kp`/`kd` that only the robot consumes.
+
+**Cause:** `make_g1_mjcf.py`'s `TEMPLATE_SECTIONS` copies `default` and `actuator` VERBATIM
+from its template, `g1_29j.xml` -- the pre-mode_11 robot. mode_11 moved hip pitch from the
+14.3 gear to the 22.5 (`STIFFNESS_7520_22`), and hip pitch is the only joint whose gear
+changed, so it was the only mismatch. The generator already had the right armature in
+`JOINT_ARMATURE` and was using it for `<joint armature=...>` while the ACTUATOR gains came
+from the old robot.
+
+**Fix:** `apply_actuator_gains` derives them from that same table via the same law the RL side
+uses (`kp = J w^2`, `kd = 2 z J w`), so no number is duplicated and a future gear change moves
+both. It refuses rather than guesses on an actuated joint with no armature, a `<position>`
+with no default class, and a class shared by joints whose gains differ.
+`test_actuator_table.py::test_mjcf_actuator_gains_match_the_cfg` pins the result -- it
+resolves gains the way MuJoCo does (element attribute wins, else the named class) and fails
+naming the joint, both numbers and the regeneration command.
+
 ## Logging: MCAP, and what is deliberately NOT in it
 
 Bags land in `transfer/obelisk/log/bags/<timestamp>_<tag>/`; figures next to them. The
@@ -838,10 +904,9 @@ just a synthetic string. The generator does NOT need retraining --
 is genuinely anchor-agnostic even though it was recorded from the `robot_now` teacher.
 
 Once that export exists, three things follow and none of them can be done before it:
-1. `scripts/rsl_rl/export_sensor_configs.py --run_dir <it>`, then commit
-   `config/scan/depth_{near,far}.yml` + `zed_targets.yml`. **They still carry the placeholder far
-   camera at 35 deg**, so the obelisk MuJoCo world casts depth from mounts the networks do not
-   unproject with -- a pure registration error, invisible to every shape check.
+1. ~~`export_sensor_configs.py`~~ DONE: `config/scan/depth_{near,far}.yml` are regenerated from
+   `2026-08-20_16-36-10_mode11_decor_plan_v1` and carry the far camera at 15 deg
+   (`rot: [0.99144, 0, 0.13053, 0]`), not the 35 deg placeholder.
 2. `low_level.yml`'s `hf_policy_folder`, still `2026-08-04_21-55-17_yaw_k12_v1`: a pre-perceptive
    policy with the wrong action scale, placeholder cameras and no backpack, which loads clean.
 3. `dump_metadata_fixtures.py` then `dump_obs_fixtures.py` (in that order -- the second consumes
@@ -851,9 +916,12 @@ Once that export exists, three things follow and none of them can be done before
 
 - **`transfer/obelisk/g1_model/mujoco/`** is a FOURTH, unreferenced copy of the robot
   (`g1_27dof.xml` + 4 scenes). Nothing in the launch path reads it. It only adds ways to be wrong.
-- The `plan` arm has **no torch-vs-numpy parity test** on either side:
-  `test_gen_tracker_obs_parity.py`'s `_MockCmd.window_anchor()` returns the measured root, so it
-  covers `robot_now` only. The C++ side has the arm under test; the python-vs-torch seam does not.
+- The `plan` arm has no torch-vs-numpy parity test at the `_MockCmd` seam
+  (`test_gen_tracker_obs_parity.py`'s `window_anchor()` still returns the measured root, so it
+  covers `robot_now` only). The CLIP half of that gap is closed --
+  `deploy/tests/test_clip_window_anchor.py` and `deploy_cpp/test/clip_reference_parity_test.cc`
+  pin the `plan` arm on both sides -- but the generator's Isaac-vs-numpy seam is still
+  `robot_now`-only.
 - `refresh_fk_channels.py` left the 24 world-frame EE VELOCITY channels on the old model (not
   recoverable -- the source `.npz` are gone), so post-refresh the two wrist world-velocity blocks
   are consistent with the old robot while their positions are consistent with the new one.
