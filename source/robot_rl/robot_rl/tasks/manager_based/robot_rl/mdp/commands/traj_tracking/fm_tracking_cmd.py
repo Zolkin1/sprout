@@ -793,7 +793,25 @@ class FmTrackingCommand(MotionSequenceCommand):
         """
         if not self._depth_lag_steps:
             return
-        self._extero_buf.append(self._read_extero().clone())
+        reading = self._read_extero().clone()
+        # An env that just reset has nothing to be LATE FROM: every frame still in the ring
+        # was taken during its previous episode, before the robot was teleported -- in the
+        # eval, onto a different tile entirely. Serving one conditions the generator on
+        # terrain that is not in front of it.
+        #
+        # This is not a small window. The reset also clears ``_pred_valid``, which forces an
+        # immediate re-plan, so the FIRST plan of every episode was built from the stale
+        # frame and then walked for ``fm_update_every`` steps before anything re-planned.
+        # The families that start ON terrain are the ones with no room to absorb that.
+        #
+        # Refilling with the CURRENT reading (rather than dropping the ring) reproduces, per
+        # env, exactly the semantics :meth:`_lagged_extero` documents for the start of a run:
+        # the oldest held frame is repeated until real history exists. ``_pending_reset`` is
+        # still set here -- ``_snapshot_and_infer`` consumes it later in the same step.
+        if self._extero_buf and bool(self._pending_reset.any()):
+            for frame in self._extero_buf:
+                frame[self._pending_reset] = reading[self._pending_reset]
+        self._extero_buf.append(reading)
         del self._extero_buf[:-(self._depth_lag_steps + 1)]
 
     def _lagged_extero(self) -> torch.Tensor:

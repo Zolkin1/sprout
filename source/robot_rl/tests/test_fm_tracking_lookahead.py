@@ -822,3 +822,86 @@ def test_full_window_lift_is_independent_of_the_serving_horizon():
     # ...while SERVING still refuses an offset the horizon cannot cover at this K.
     with pytest.raises(ValueError, match="needs F >="):
         FmTrackingCommand._check_horizon(cmd, torch.tensor([F - 1]))
+
+# ---------------------------------------------------------------------------
+# The camera-lag ring must not survive an episode reset.
+# ---------------------------------------------------------------------------
+class _LagCmd(_BareFmCommand):
+    """Bare command exercising only the lag ring.
+
+    ``_read_extero`` is stubbed to return a per-step constant so a served frame can be
+    identified by its value -- which is the whole question: WHICH step's frame came back.
+    """
+
+    def __init__(self, lag: int) -> None:  # noqa: D107 - deliberately skips the real ctor
+        self._depth_lag_steps = lag
+        self._extero_buf = []
+        self._pending_reset = torch.zeros(N_ENVS, dtype=torch.bool)
+        self._value = 0.0
+
+    def _read_extero(self):
+        return torch.full((N_ENVS, 1, 4), self._value)
+
+    def step(self, value: float):
+        """Advance one control step: a new frame arrives, then the ring is read.
+
+        Clearing ``_pending_reset`` after the push mirrors the real order -- the push runs in
+        ``_update_command`` and ``_snapshot_and_infer`` consumes the latch later in the same
+        step -- so the refill fires exactly once per reset, as it does in the sim.
+        """
+        self._value = value
+        self._push_extero_lag()
+        out = self._lagged_extero()
+        self._pending_reset[:] = False
+        return out
+
+
+def test_lag_ring_serves_a_frame_of_the_requested_age():
+    """The baseline the reset behaviour is measured against."""
+    c = _LagCmd(lag=2)
+    for v in (1.0, 2.0, 3.0, 4.0, 5.0):
+        out = c.step(v)
+    assert out[0, 0, 0].item() == 3.0, "lag 2 at step 5 must serve the step-3 frame"
+
+
+def test_a_reset_env_is_never_served_a_frame_from_its_previous_episode():
+    """The bug: the ring held full-batch tensors and nothing cleared them per env.
+
+    A reset teleports the robot -- in the eval, onto a different tile -- and the reset also
+    clears ``_pred_valid``, forcing an immediate re-plan. So the FIRST plan of every episode
+    was conditioned on depth captured ``lag`` steps BEFORE the teleport, then walked for
+    ``fm_update_every`` steps. Families whose clips start ON terrain have no room to absorb
+    that, which is the shape of the measured failure.
+    """
+    c = _LagCmd(lag=2)
+    for v in (1.0, 2.0, 3.0):
+        c.step(v)
+    c._pending_reset[:] = True            # env reset; the next frame is a new episode
+    out = c.step(99.0)
+    assert out[0, 0, 0].item() == 99.0, (
+        "a just-reset env must be served its OWN first frame, not a pre-reset one")
+    # And it must stay clean while the ring refills.
+    assert c.step(100.0)[0, 0, 0].item() == 99.0
+    assert c.step(101.0)[0, 0, 0].item() == 99.0
+    # Only once `lag` real frames exist does the lag re-engage.
+    assert c.step(102.0)[0, 0, 0].item() == 100.0
+
+
+def test_only_the_envs_that_reset_are_refilled():
+    """A partial reset must not blank the ring for envs that are still running."""
+    c = _LagCmd(lag=2)
+    for v in (1.0, 2.0, 3.0, 4.0):
+        c.step(v)
+    c._pending_reset[0] = True            # env 0 alone resets
+    out = c.step(50.0)
+    assert out[0, 0, 0].item() == 50.0, "env 0 gets its own fresh frame"
+    assert out[1, 0, 0].item() == 3.0, "env 1 keeps its genuine 2-step lag"
+
+
+def test_lag_zero_still_touches_nothing():
+    """The default path must stay free: no ring, no per-reset work."""
+    c = _LagCmd(lag=0)
+    c._pending_reset[:] = True
+    assert c.step(7.0)[0, 0, 0].item() == 7.0
+    assert c._extero_buf == []
+
