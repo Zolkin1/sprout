@@ -92,6 +92,71 @@ obk_build() {
     ' || { echo "[obk] build FAILED"; return 1; }
 }
 
+# obk_require_rmem_max: refuse to launch when the kernel's receive-buffer ceiling is below
+# what Cyclone asks for. Runs on the HOST, before the container is even brought up.
+#
+# The failure this replaces is one of the worst in the stack, because it names nothing that
+# is wrong. cyclonedds.xml asks for a SocketReceiveBufferSize minimum, Cyclone treats a
+# kernel that cannot grant it as FATAL, and EVERY ros node then dies with
+#
+#     rmw_create_node: failed to create domain, error Error
+#     rcl node's rmw handle is invalid
+#
+# The one line that says why -- "failed to increase socket receive buffer size to at least
+# N bytes, current is M" -- is a Cyclone info line several lines ABOVE the first ERROR, and
+# it scrolls past in a two-pane tmux launch. What it looks like instead is a broken ROS
+# install, a bad config, or a DDS/interface problem, which is where the time goes.
+#
+# It is also NOT a one-time setup step that stays done, which is why this is a launch-time
+# check and not a line in a setup script. `sysctl -w` does not survive a reboot, and on this
+# box the only PERSISTENT setting of rmem_max is /etc/sysctl.d/60-zed-buffers.conf, written
+# to RAISE the buffer for ZED streaming -- to 1 MB, an order of magnitude under what Cyclone
+# needs. So the value silently reverts to a breaking one on every boot, and the box that
+# worked yesterday does not today.
+#
+# The requirement is PARSED from cyclonedds.xml rather than restated here. That file is
+# gitignored and per-box, so a hardcoded 10 MB would be this script's opinion about someone
+# else's config -- and would go stale in the direction that matters (a raised min with an
+# unchanged check passes and then dies).
+obk_require_rmem_max() {
+    local xml="$OBK_DOCKER_DIR/cyclonedds.xml" want unit need have
+    [ -r "$xml" ] || return 0          # no config, no requirement to enforce
+
+    # min="10 MB" -- the unit spelling is picky in Cyclone itself ("kB"/"MB", and the space
+    # is optional), so accept what it accepts rather than one fixed spelling.
+    want="$(sed -n 's/.*SocketReceiveBufferSize[^>]*min="\([^"]*\)".*/\1/p' "$xml" | head -1)"
+    [ -n "$want" ] || return 0
+
+    unit="$(printf '%s' "$want" | tr -d '0-9 \t')"
+    want="$(printf '%s' "$want" | tr -cd '0-9')"
+    [ -n "$want" ] || return 0
+    case "$unit" in
+        MB|mB) need=$((want * 1024 * 1024)) ;;
+        kB|KB) need=$((want * 1024)) ;;
+        B|'')  need=$want ;;
+        *) return 0 ;;                 # a unit we do not understand is not ours to judge
+    esac
+
+    have="$(sysctl -n net.core.rmem_max 2>/dev/null)"
+    [ -n "$have" ] || return 0
+    [ "$have" -ge "$need" ] && return 0
+
+    echo "[obk] REFUSING TO LAUNCH: net.core.rmem_max is $have, but $(basename "$xml") asks" >&2
+    echo "[obk] for at least $need. Cyclone treats that as fatal, so every ROS node would die" >&2
+    echo "[obk] at 'rmw_create_node: failed to create domain' -- an error that names neither" >&2
+    echo "[obk] this sysctl nor the file that lowered it." >&2
+    echo "[obk]" >&2
+    echo "[obk] Fix it persistently (a plain 'sysctl -w' is gone on the next reboot):" >&2
+    echo "[obk]   echo 'net.core.rmem_max=16777216' | sudo tee /etc/sysctl.d/99-obk-dds.conf" >&2
+    echo "[obk]   sudo sysctl --system" >&2
+    echo "[obk]" >&2
+    grep -rl "rmem_max" /etc/sysctl.conf /etc/sysctl.d/ 2>/dev/null | while read -r f; do
+        echo "[obk] note: $f already sets rmem_max ($(sed -n 's/^net\.core\.rmem_max=//p' "$f" | head -1))." >&2
+        echo "[obk]       Use a HIGHER-numbered file so yours is applied last." >&2
+    done
+    return 1
+}
+
 # obk_host_launch <abs path of the calling variant script> [args...]
 # Brings the container up, then re-execs the variant inside it (the repo is bind-mounted at
 # the same path), forwarding any extra args. Does NOT build; pass --build to the variant.
@@ -100,6 +165,11 @@ obk_host_launch() {
     self="$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"
     name="$(basename "$self")"
     shift
+
+    # Before the container, before the build, before anything: a kernel that cannot grant
+    # Cyclone its receive buffer makes every launch below fail for reasons that point
+    # elsewhere. See obk_require_rmem_max.
+    obk_require_rmem_max || return 1
 
     cd "$OBK_DOCKER_DIR" || return 1
     local dc=(docker compose -f "$OBK_COMPOSE_FILE")
