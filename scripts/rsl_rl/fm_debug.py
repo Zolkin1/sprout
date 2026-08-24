@@ -219,16 +219,62 @@ def select_case_clips(lib_path: str, cases: list[dict], overrides: dict[str, int
     return out
 
 
+def family_case_clips(lib_path: str, family: str, limit: int) -> list[dict]:
+    """One case per TILE of ``family``: the longest clip standing on each.
+
+    The three :data:`DEFAULT_CASES` are one clip per terrain FAMILY, which is the right
+    sampling when the question is "does the generator work at all". It is the wrong one when
+    the question is about a single family -- there one clip is an anecdote, and the tiles
+    within a family differ (tread width, riser, decoration) by more than two clips on one
+    tile do. So this takes the family and spreads over its TILES.
+
+    One clip per tile, never two: :func:`case_env_ids` resolves a case to its envs through
+    the tile id, so two cases sharing a tile would silently be given each other's envs.
+
+    Args:
+        lib_path: Source clip library ``.h5``.
+        family: The manifest ``family`` string, e.g. ``"family_stairs_dn_pure.h5"``.
+        limit: Keep at most this many tiles (the longest clip first). ``0`` = all.
+
+    Returns:
+        One case dict per kept tile, named ``<short family>_t<tile>``.
+
+    Raises:
+        SystemExit: If the family matches no clip in the library.
+    """
+    c = _clip_candidates(lib_path)
+    match = np.nonzero(c["family"] == family)[0]
+    if match.size == 0:
+        raise SystemExit(
+            f"--case_family {family!r} matches no clip in {lib_path}. Present: "
+            f"{sorted(set(f for f in c['family'].tolist() if f))}."
+        )
+    best: dict[int, int] = {}
+    for i in match[np.argsort(-c["clip_len"][match], kind="stable")]:
+        best.setdefault(int(c["terrain_id"][i]), int(i))
+    picked = sorted(best.values(), key=lambda i: (-int(c["clip_len"][i]), int(i)))
+    if limit > 0:
+        picked = picked[:limit]
+    short = family.removeprefix("family_").removesuffix(".h5")
+    return [{"name": f"{short}_t{int(c['terrain_id'][i])}", "clip_index": int(i),
+             "terrain_id": int(c["terrain_id"][i]), "clip_len": int(c["clip_len"][i]),
+             "family": family, "type": c["type_names"][int(c["type_code"][i])]}
+            for i in picked]
+
+
 def stage_prep(args) -> dict:
     """Pick the case clips, write the subset library, and record both in the manifest."""
     from motion_gen.clips.clip_io import write_clip_subset
 
-    cases = [c for c in DEFAULT_CASES if args.cases is None or c["name"] in args.cases]
-    if not cases:
-        raise SystemExit(f"--cases {args.cases} matched none of "
-                         f"{[c['name'] for c in DEFAULT_CASES]}.")
-    overrides = dict(_parse_kv_ints(args.clip_index))
-    chosen = select_case_clips(args.lib, cases, overrides)
+    if args.case_family:
+        chosen = family_case_clips(args.lib, args.case_family, int(args.case_limit))
+    else:
+        cases = [c for c in DEFAULT_CASES if args.cases is None or c["name"] in args.cases]
+        if not cases:
+            raise SystemExit(f"--cases {args.cases} matched none of "
+                             f"{[c['name'] for c in DEFAULT_CASES]}.")
+        overrides = dict(_parse_kv_ints(args.clip_index))
+        chosen = select_case_clips(args.lib, cases, overrides)
 
     clip_lib = os.path.abspath(args.clip_out)
     os.makedirs(os.path.dirname(clip_lib) or ".", exist_ok=True)
@@ -290,7 +336,10 @@ def stage_run(args, manifest: dict) -> int:
         # make it look hung.
         cmd = [sys.executable, "-u", os.path.abspath(__file__), "--stage", "run_one",
                "--mode", mode, "--out", args.out, "--task", args.task,
-               "--checkpoint", args.checkpoint, "--num_repeats", str(args.num_repeats)]
+               "--checkpoint", args.checkpoint, "--num_repeats", str(args.num_repeats),
+               "--history_from", args.history_from,
+               "--ego_anchor_every", str(args.ego_anchor_every),
+               "--dr_preset", args.dr_preset]
         if args.fm_checkpoint:
             cmd += ["--fm_checkpoint", args.fm_checkpoint]
         if args.no_passive_fm:
@@ -488,15 +537,34 @@ def _apply_env_overrides(env_cfg, args, manifest: dict) -> None:
             term.reference_source = args.mode
             term.fm_checkpoint = "" if args.no_passive_fm else (args.fm_checkpoint or "")
             term.fm_zero_noise = bool(args.fm_zero_noise)
+            term.history_from = args.history_from
             if args.mode == "clip":
                 # The teacher's anchoring, which is what the clip reference was trained
                 # against. The deploy default (0.0) never re-anchors, so leaving it would
                 # make the "baseline" a reference the policy has never seen.
                 term.ego_anchor_fraction = 1.0
-                term.ego_anchor_every = 1
+                # The CADENCE decides what the clip's base_pose block even MEANS. At 1 the
+                # clip placement is snapped onto the robot every step, so the block is
+                # identically zero at offset 0 and a clip-vs-FM difference is really just
+                # "the FM re-plans every K and the clip re-plans every step". Default here
+                # is the trained value (params/conventions.yaml: ego_anchor_every), which
+                # is also K -- so both references carry the same accumulated egomotion.
+                term.ego_anchor_every = int(args.ego_anchor_every)
         term.debug_vis = not args.headless
         print(f"[run_one] commands.{name}: source={getattr(term, 'reference_source', 'clip')} "
               f"clip={clip_lib}")
+
+    # The tracker task ships only in a ``-play`` flavour whose trims are PARTIAL: they null
+    # the reset-mode ground friction, both actor groups' corruption and the six camera terms,
+    # and leave all seven mode="startup" physical terms firing. So "the play cfg" is NOT
+    # DR-free, and with DR live two --num_repeats replicas of one clip are two different
+    # robots rather than two generator draws at the same state.
+    if args.dr_preset:
+        from eval.dr_presets import apply_dr_preset
+        spec = apply_dr_preset(env_cfg, args.dr_preset)
+        print(f"[run_one] dr_preset={args.dr_preset!r}: "
+              f"{len(spec.get('changed', []))} term(s) changed, "
+              f"obs_corruption={spec.get('obs_corruption')}")
 
     if args.corrupt_obs:
         for group in ("policy", "reference"):
@@ -872,6 +940,12 @@ def build_parser() -> argparse.ArgumentParser:
                            f"{[c['name'] for c in DEFAULT_CASES]}.")
     prep.add_argument("--clip_index", action="append", default=None, metavar="NAME=I",
                       help="Force a case onto a specific source-library clip index. Repeatable.")
+    prep.add_argument("--case_family", default=None, metavar="FAMILY",
+                      help="Ignore DEFAULT_CASES and build one case per TILE of this "
+                           "manifest family (e.g. family_stairs_dn_pure.h5), longest clip "
+                           "per tile. The way to point the tool at ONE terrain family.")
+    prep.add_argument("--case_limit", type=int, default=0,
+                      help="With --case_family, keep at most this many tiles (0 = all).")
     prep.add_argument("--reprep", action="store_true",
                       help="Re-run prep even if the run directory already has a manifest.")
 
@@ -907,6 +981,23 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Run without a viewport (default). --no_headless opens the Isaac "
                           "GUI with the reference ribbons drawn.")
     run.add_argument("--no_headless", dest="headless", action="store_false")
+    run.add_argument("--history_from", default="generator", choices=["generator", "clip"],
+                     help="What the generator's autoregressive history holds: its own last "
+                          "served nodes ('generator', the closed loop) or the clip's nodes "
+                          "('clip', teacher forcing). Running both at identical robot "
+                          "states is what separates the model's per-plan error from its "
+                          "own history drift.")
+    run.add_argument("--ego_anchor_every", type=int, default=12,
+                     help="Clip-mode re-anchor cadence, in control steps. Default 12 = the "
+                          "trained value (params/conventions.yaml) and the generator's K, so "
+                          "both references carry the same accumulated egomotion. 1 snaps the "
+                          "clip onto the robot every step and zeroes its base_pose block.")
+    run.add_argument("--dr_preset", default="none",
+                     choices=["none", "train", "ood", "ood_push", ""],
+                     help="Domain randomization, applied through the eval harness's "
+                          "authoritative preset. Default 'none' -- the -play trims leave "
+                          "seven startup DR terms live, so without this the replicas of one "
+                          "case are different robots. '' leaves the cfg alone.")
     run.add_argument("--seed", type=int, default=None)
     run.add_argument("--device", default=None, help="Sim device, e.g. cuda:0 or cpu.")
 
