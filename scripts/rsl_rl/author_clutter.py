@@ -115,13 +115,67 @@ def nearest_pose_distance(b: dict, occ: TileOccupancy) -> float:
     return float(np.min(np.hypot(dx, dy)))
 
 
+def verify(clip: str, occupancy: str, sidecar: str, show: int = 15) -> int:
+    """Report how close an authored sidecar comes to the paths, and any true intersections.
+
+    Placement already vets and re-checks, so this is for AFTER the fact -- to settle whether
+    something seen in a 3-D view is a real overlap or a projection, and to say which tile it
+    is on so the question can be answered rather than argued.
+
+    Args:
+        clip: The library the sidecar was authored against.
+        occupancy: The occupancy the veto used.
+        sidecar: The sidecar to check.
+        show: How many of the closest volumes to list.
+
+    Returns:
+        ``0`` if nothing intersects, ``1`` otherwise.
+    """
+    occ, sizes, raw = load_occupancy(occupancy)
+    doc = json.load(open(sidecar))
+    pad = BODY_RADIUS_M + CLEARANCE_M
+    with h5py.File(clip, "r") as f:
+        man = json.loads(f.attrs["terrain_manifest"])
+        fam = {int(m["terrain_id"]): str(m.get("family", "?")).replace(".h5", "") for m in man}
+        rows, bad = [], 0
+        for t, boxes in doc["per_terrain_id"].items():
+            k = int(t)
+            pts = raw.get(k)
+            if pts is None or not len(pts):
+                continue
+            for b in boxes:
+                x0, y0, x1, y1 = aabb(b)
+                dx = np.maximum(np.maximum(x0 - pts[:, 0], pts[:, 0] - x1), 0.0)
+                dy = np.maximum(np.maximum(y0 - pts[:, 1], pts[:, 1] - y1), 0.0)
+                d = float(np.min(np.hypot(dx, dy)))
+                rows.append((d, fam.get(k, "?"), k, b["clutter_class"], b["kind"]))
+                bad += d < pad
+    rows.sort()
+    print(f"[verify] {sidecar}: {len(rows)} terrain volumes, veto distance {pad:.2f} m")
+    print(f"  {'dist':>7s} {'family':<22s} {'tid':>5s} {'class':<12s} kind")
+    for d, fm, k, c, kd in rows[:show]:
+        flag = "  <-- INSIDE THE VETO" if d < pad else ""
+        print(f"  {d:7.3f} {fm:<22s} {k:5d} {c:<12s} {kd}{flag}")
+    print(f"[verify] {bad} volume(s) inside the veto distance")
+    return 1 if bad else 0
+
+
 def main() -> int:
     """Author one clutter variant and write it as a sidecar."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--clip", required=True, help="Clip library (read only, never written).")
     p.add_argument("--occupancy", required=True, help=".npz from build_clutter_occupancy.py")
-    p.add_argument("--out", required=True, help="Sidecar .json to write.")
+    p.add_argument("--out", default=None,
+                   help="Sidecar .json to write. Not needed with --verify, which "
+                        "writes nothing.")
+    p.add_argument("--verify", default=None, metavar="SIDECAR.json",
+                   help="Re-check an existing sidecar instead of authoring one: report every "
+                        "volume that comes within the veto distance of a recorded pose or a "
+                        "clip path, and list the closest ones by tile. For settling whether "
+                        "something seen in the viewer is a real intersection or a projection "
+                        "-- a 2.5 m pillar a metre to the side reads as 'on the path' from "
+                        "most angles.")
     p.add_argument("--seed", type=int, default=1,
                    help="Variant id. Every tile draws from its own stream seeded by this, so "
                         "two variants share no placement and either is reproducible alone.")
@@ -138,6 +192,11 @@ def main() -> int:
                         "the failure this repo already made once, with the flat rooms at a "
                         "20 m buffer.")
     a = p.parse_args()
+
+    if a.verify:
+        return verify(a.clip, a.occupancy, a.verify)
+    if not a.out:
+        p.error("--out is required when authoring (omit it only with --verify)")
 
     with h5py.File(a.clip, "r") as f:
         manifest = json.loads(f.attrs["terrain_manifest"])

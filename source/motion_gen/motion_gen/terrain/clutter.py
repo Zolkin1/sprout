@@ -84,11 +84,13 @@ BODY_RADIUS_M: float = 0.50
 
 #: Extra clearance on every veto (m), beyond the body itself.
 #:
-#: Bought cheaply: the robot occupies well under 1% of a tile, so a generous margin costs
-#: placement opportunities that were never scarce. It also absorbs the gap between recorded
-#: samples -- windows are emitted on the re-plan cadence, so consecutive poses are ~0.3 m
-#: apart along the path and a box in between is nearer the path than to either sample.
-CLEARANCE_M: float = 0.30
+#: Deliberately modest. The body radius above already covers the robot's own widest reach,
+#: so this is margin on top of that, and margin is not free here: clutter exists to be SEEN,
+#: and pushing it further out moves it away from the band where the far camera resolves
+#: anything. The sample-gap argument that once justified a larger value no longer applies --
+#: the occupancy interpolates along each episode rather than binning isolated windows, so
+#: there is no hole between consecutive poses for a box to sit in.
+CLEARANCE_M: float = 0.15
 
 #: Classes the robot must never act on. Named in the overlay as ``clutter_class`` so the
 #: re-render can tell new clutter from the walls the decoration pass already placed.
