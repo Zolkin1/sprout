@@ -173,10 +173,38 @@ def main() -> int:
         dd = np.abs(depth.reshape(rep, n_cond, -1)[:, j, :] - d_ctrl)
         seen[c] = {"mean_abs_delta": float(dd.mean()),
                    "frac_pixels_changed": float((dd > 1e-6).mean())}
+    # Split PER CAMERA and per channel. A whole-row mean hides the thing that matters: the
+    # near lens looks 65 deg down and reaches ~2.4 m of ground, so it can only ever see very
+    # close geometry, while the far lens at 15 deg is the one that should register a wall at
+    # range. Reporting them together made a wall at 1.5 m look "stronger" than an enclosure at
+    # 2.5 m, which is an artefact of averaging over a camera that cannot see either.
+    cams = mdp.depth_camera_specs(u, groups)
+    ch = int(depth.shape[1] // sum(int(c["width"]) * int(c["height"]) for c in cams))
+    per_cam, at = [], 0
+    for cspec in cams:
+        n_px = int(cspec["width"]) * int(cspec["height"])
+        # Name it from the SENSOR list rather than the contract dict, which carries mount and
+        # intrinsics but no name -- "cam0" in a table is exactly the ambiguity this is about.
+        nm = sensors[len(per_cam)] if len(per_cam) < len(sensors) else f"cam{len(per_cam)}"
+        per_cam.append((nm.replace("depth_camera_", ""), slice(at, at + ch * n_px), n_px))
+        at += ch * n_px
+    d3 = depth.reshape(rep, n_cond, -1)
     print("\n=== stimulus check: does each condition actually reach the cameras? ===")
-    print(f"  {'condition':<22s}{'mean |d-delta|':>16s}{'pixels changed':>16s}")
-    for c in conds:
-        print(f"  {c:<22s}{seen[c]['mean_abs_delta']:16.5f}{seen[c]['frac_pixels_changed']:16.3f}")
+    print("  (delta is normalised depth; sentinel->surface is ~4.7, ground shortening is ~0.1-1)")
+    head = "".join(f"{n[:11]:>13s}" for n, _, _ in per_cam)
+    print(f"  {'condition':<22s}{head}{'all mean':>11s}{'px changed':>12s}")
+    for j, c in enumerate(conds):
+        dd = np.abs(d3[:, j, :] - d3[:, 0, :])
+        cells = ""
+        seen[c]["per_camera"] = {}
+        for name, sl, n_px in per_cam:
+            # Channel 0 of the channel-major row is the DEPTH plane; the rest are xyz+validity.
+            dch = dd[:, sl].reshape(rep, ch, n_px)[:, 0, :]
+            seen[c]["per_camera"][name] = {"mean_abs_delta": float(dch.mean()),
+                                           "frac_pixels_changed": float((dch > 1e-6).mean())}
+            cells += f"{dch.mean():13.4f}"
+        print(f"  {c:<22s}{cells}{seen[c]['mean_abs_delta']:11.4f}"
+              f"{seen[c]['frac_pixels_changed']:12.3f}")
     blind = [c for c in conds[1:] if seen[c]["frac_pixels_changed"] < 1e-4]
     if blind:
         print(f"  !! {blind} changed no pixels -- their rows below mean nothing.")
