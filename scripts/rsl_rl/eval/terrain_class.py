@@ -54,8 +54,16 @@ COARSE_CLASSES: tuple[str, ...] = ("flat", "jump", "stairs")
 
 #: Manifest family -> coarse class.  ``unknown`` is the recorder's label for a window with no
 #: terrain, which is flat by construction.
+#:
+#: ``family_distractor`` is FLAT, and it is the most useful member of that class rather than an
+#: awkward one: the robot walks past a box it never touches, so the motion is ordinary walking
+#: while terrain-shaped geometry sits in frame.  That is exactly the discrimination the
+#: stairs->jump measurement is about, so a reference built without it is missing the negative
+#: examples that matter most.  It was absent here only because the first reference was built
+#: from a recording with ``skip_distractors`` already applied, so those windows never appeared
+#: -- ``dump_reference_windows.py`` deliberately applies no filter and surfaced the gap.
 FAMILY_TO_COARSE: dict[str, str] = {
-    "unknown": "flat", "flat": "flat", "family_flat": "flat",
+    "unknown": "flat", "flat": "flat", "family_flat": "flat", "family_distractor": "flat",
     "family_stairs_up": "stairs", "family_stairs_down": "stairs",
     "family_stairs_up_pure": "stairs", "family_stairs_dn_pure": "stairs",
     "family_jump_on": "jump", "family_jump_off": "jump", "family_jump_off_front": "jump",
