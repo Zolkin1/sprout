@@ -221,7 +221,15 @@ def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
                 "build_overlay and every renderer that consumes them."
             )
         kind = str(ov.get("kind", "box"))
-        if kind not in OVERLAY_KINDS:
+        # A cylinder is a DECORATION-ONLY kind. Its whole value is a depth silhouette a box
+        # cannot make -- curved returns instead of flat faces -- and it is only ever visual,
+        # so it never has to be walked on, collided with, or decomposed into the sub-boxes
+        # every walkable variant is built from. Allowing it on the walkable path would mean
+        # a top surface that disagrees with the mesh, which is the substitution the check
+        # below exists to prevent.
+        if kind == "cylinder" and bool(ov.get("decor", False)):
+            pass
+        elif kind not in OVERLAY_KINDS:
             raise ValueError(
                 f"terrain {entry.get('terrain_id')} overlay {i} has kind={kind!r}; expected one "
                 f"of {sorted(OVERLAY_KINDS)}. An unknown kind is silently drawn as a box, which "
@@ -321,6 +329,31 @@ def _flat_decor_overlays(lib, flat_fp: tuple[float, float],
     return out
 
 
+def _decor_mesh(ov) -> "trimesh.Trimesh":
+    """One decoration overlay as a mesh, cylinders included.
+
+    Everything except a cylinder goes through ``build_overlay`` exactly as the walkable path
+    does, so decoration and terrain cannot drift apart in how a box is meshed.
+
+    Args:
+        ov: The overlay cfg.
+
+    Returns:
+        The mesh, positioned in the tile frame.
+    """
+    if getattr(ov, "kind", "box") != "cylinder":
+        return build_overlay(ov).mesh
+    sx, sy, sz = ov.size_xyz
+    # Radius from the mean of the two footprint extents, so an author who writes a square
+    # footprint gets the obvious cylinder and one who writes a rectangle gets its inscribed
+    # circle rather than a silent stretch (trimesh cylinders are circular, not elliptical).
+    m = trimesh.creation.cylinder(radius=float(min(sx, sy)) / 2.0, height=float(sz),
+                                  sections=16)
+    m.apply_translation((float(ov.pos_xy[0]), float(ov.pos_xy[1]),
+                         float(ov.base_z) + float(sz) / 2.0))
+    return m
+
+
 def _tile_mesh(
     footprint: tuple[float, float],
     blocks: list[TerrainBlockCfg],
@@ -347,7 +380,7 @@ def _tile_mesh(
     overlays = [o for o in overlays if not getattr(o, "decor", False)]
     decor_mesh = None
     if decor_cfgs:
-        decor_mesh = trimesh.util.concatenate([build_overlay(o).mesh for o in decor_cfgs])
+        decor_mesh = trimesh.util.concatenate([_decor_mesh(o) for o in decor_cfgs])
     if not blocks:
         meshes: list[trimesh.Trimesh] = []
         ov_meta: list[dict] = []

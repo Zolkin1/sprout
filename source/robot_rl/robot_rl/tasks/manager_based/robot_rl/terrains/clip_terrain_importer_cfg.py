@@ -34,6 +34,19 @@ class ClipTerrainImporterCfg(TerrainImporterCfg):
     num_rows: int = 1
     """Replicas of the tile set (each a strip in y) -> more distinct env spawns."""
 
+    decor_overlay_path: str = ""
+    """Optional clutter sidecar (``scripts/rsl_rl/author_clutter.py``) merged into the
+    manifest at load.
+
+    Visual-only geometry authored against a closed-loop recording, kept out of the library
+    because the point is to have SEVERAL variants of it and only the decoration differs
+    between them. Empty means the library as it stands, which is itself a variant -- the one
+    every existing recording was made under.
+
+    It cannot move the ground: everything it adds is ``decor``, which ``_tile_mesh`` splits
+    out before the walkable mesh is built, so the tile layout and every recorded world pose
+    stay valid. That is what lets a recording be re-rendered against it."""
+
     num_flat_tiles: int | None = None
     """Number of flat patches. ``None`` derives it from the library's generation
     metadata (``generator_config.counts.flat``) so flat/terrain/transition tile counts

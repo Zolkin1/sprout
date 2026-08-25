@@ -144,7 +144,11 @@ def emittable_overlays(entry: dict) -> list[dict]:
     out = []
     for i, ov in enumerate(entry.get("overlays", [])):
         kind, variant = str(ov.get("kind", "box")), str(ov.get("variant", "solid"))
-        if kind not in OVERLAY_KINDS:
+        # A cylinder is decoration-only, here for the same reason as on the Isaac side: it
+        # exists for its depth silhouette and never for a surface anything stands on.
+        if kind == "cylinder" and is_decor(ov):
+            pass
+        elif kind not in OVERLAY_KINDS:
             raise ValueError(
                 f"tile {entry.get('terrain_id')} overlay {i} has kind='{kind}'; expected one of "
                 f"{list(OVERLAY_KINDS)}. An unknown kind is most likely a new shape, which this "
@@ -271,8 +275,9 @@ def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[flo
 
 
 def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,
-              yaw: float, material: str = "box_material", decor: bool = False) -> str:
-    """One MuJoCo box geom line.
+              yaw: float, material: str = "box_material", decor: bool = False,
+              kind: str = "box") -> str:
+    """One MuJoCo geom line: a box, or a decoration cylinder.
 
     Args:
         name: Geom name.
@@ -283,6 +288,9 @@ def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, 
         decor: Emit it as VISUAL-ONLY -- group 1 rather than 2, and non-colliding. The depth
             cameras cast groups {1, 2} and the height scan casts {2}, so this is what makes a
             wall visible to the cameras, invisible to the scan, and impossible to walk into.
+        kind: ``"cylinder"`` emits a cylinder; anything else emits a box. Only reachable for
+            decoration -- a walkable cylinder is refused upstream, since nothing decomposes
+            one into the sub-boxes the walkable variants are built from.
 
     Returns:
         The geom line.
@@ -290,6 +298,13 @@ def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, 
     quat = f' quat="{math.cos(yaw / 2.0):.9f} 0 0 {math.sin(yaw / 2.0):.9f}"' if yaw else ""
     group = DECOR_GEOM_GROUP if decor else 2
     flags = f" {DECOR_CONTACT_ATTRS}" if decor else ""
+    if kind == "cylinder":
+        # MuJoCo sizes a cylinder as (radius, half-height), not as three half-extents, and
+        # the radius must match what the Isaac side inscribes or the two simulators disagree
+        # on a surface the cameras can see.
+        return (f'        <geom name="{name}" type="cylinder" material="{material}" '
+                f'group="{group}"{flags} size="{min(sx, sy) / 2.0:.6f} {sz / 2.0:.6f}" '
+                f'pos="{cx:.6f} {cy:.6f} {cz:.6f}"{quat}/>')
     return (f'        <geom name="{name}" type="box" material="{material}" group="{group}"'
             f'{flags} size="{sx / 2.0:.6f} {sy / 2.0:.6f} {sz / 2.0:.6f}" '
             f'pos="{cx:.6f} {cy:.6f} {cz:.6f}"{quat}/>')
@@ -317,6 +332,7 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
     """
     ox, oy, oz = origin
     lines = []
+    kind_of = [str(o.get("kind", "box")) for o in overlays]
     for i, ov in enumerate(overlays):
         decor = is_decor(ov)
         step = float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M
@@ -327,7 +343,7 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
         for j, (cx, cy, cz, bx, by, bz) in enumerate(overlay_sub_boxes_from_manifest(ov)):
             lines.append(_box_geom(
                 base if j == 0 else f"{base}_p{j}",
-                cx - ox, cy - oy, cz - oz, bx, by, bz, yaw, decor=decor,
+                cx - ox, cy - oy, cz - oz, bx, by, bz, yaw, decor=decor, kind=kind_of[i],
             ))
 
     if infinite_floor or not bool(entry.get("has_floor", True)):

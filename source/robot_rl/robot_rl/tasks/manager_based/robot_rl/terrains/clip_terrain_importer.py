@@ -21,6 +21,8 @@ the base curriculum sets up):
 
 from __future__ import annotations
 
+import os
+
 import torch
 from typing_extensions import override
 
@@ -133,6 +135,36 @@ class ClipTerrainImporter(TerrainImporter):
                 "command's commands.traj_ref.path to the same file."
             )
         lib = load_clip_library(cfg.clip_library_path, device="cpu")
+        self._clutter: dict | None = None
+        if getattr(cfg, "decor_overlay_path", ""):
+            # Merged before the mesh is assembled, so the clutter goes through exactly the
+            # same decor split, translation and prim as the library's own decoration -- a
+            # second path would be a second thing to keep in step.
+            import json as _json
+
+            from motion_gen.terrain.clutter import merge_flat_decor, merge_into_manifest
+            with open(cfg.decor_overlay_path) as _fh:
+                self._clutter = _json.load(_fh)
+            _man = lib.attrs.get("terrain_manifest")
+            _man = _json.loads(_man) if isinstance(_man, str) else list(_man or [])
+            _n = merge_into_manifest(_man, self._clutter,
+                                     source=os.path.basename(cfg.clip_library_path))
+            # Written back as a LIST, not as JSON: the attribute arrives as a string from
+            # h5py but assemble_clip_terrain indexes it directly, so re-serialising here
+            # fails inside the loader rather than at this line.
+            lib.attrs["terrain_manifest"] = _man
+            # Flat tiles have no manifest entry, so their share arrives separately and is
+            # PAIRED onto the library's own room variants rather than replacing them: the
+            # rooms sit outside camera range at the shipped buffer, so they cost nothing to
+            # keep, and the combined list keeps the round-robin's period.
+            _flat = self._clutter.get("flat_variants") or []
+            if _flat:
+                _raw = lib.attrs.get("flat_tile_decor")
+                _cur = (_json.loads(_raw) if isinstance(_raw, str) else list(_raw or [])) \
+                    if _raw is not None else []
+                lib.attrs["flat_tile_decor"] = merge_flat_decor(_cur, _flat)
+            print(f"[ClipTerrainImporter] clutter '{os.path.basename(cfg.decor_overlay_path)}'"
+                  f" (seed {self._clutter.get('seed')}): +{_n} visual-only boxes")
         mesh, origins, layout = assemble_clip_terrain(
             lib, num_rows=cfg.num_rows, num_flat_tiles=cfg.num_flat_tiles,
             col_gap=cfg.col_gap, row_gap=cfg.row_gap, size_margin=cfg.size_margin,
