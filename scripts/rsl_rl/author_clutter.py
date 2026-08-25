@@ -213,7 +213,7 @@ def main() -> int:
         tid = int(tile["terrain_id"])
         if tid not in occ:
             continue                      # no recorded pose on this tile: nothing to vet against
-        boxes = clutter_for_tile(tile, occ[tid], cfg)
+        boxes = clutter_for_tile(tile, occ[tid], cfg, footprint=sizes.get(tid))
         if not boxes:
             continue
         per_tile[str(tid)] = boxes

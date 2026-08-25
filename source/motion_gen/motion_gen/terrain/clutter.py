@@ -72,15 +72,18 @@ APPROACH_ZONE_M: float = 2.5
 
 #: Half-width of the robot in plan, for the "never walk into it" veto (m).
 #:
-#: MEASURED, not assumed: forward kinematics of the recorded joint configurations puts the
-#: furthest link from the pelvis at p50 0.28, p90 0.35, p99 0.46 and max 0.48 m -- the arms
-#: and hands, which swing well outside the torso. An earlier 0.35 was the p90, so it cleared
-#: the body on only 9 poses in 10 and left ~2 cm to the robot's skin at the worst of them.
-#: Rounded up past the measured max.
+#: MEASURED, and measured against the right thing. The occupancy holds EVERY tracked body --
+#: pelvis, both ankles, both wrists -- so this only has to cover the gap from those to the
+#: rest of the robot, not the robot's whole reach. Forward kinematics over recorded
+#: configurations puts the furthest link from the nearest tracked body at max 0.280 m on
+#: stairs_up, 0.214 on jump_off and 0.232 on flat; rounded up past all of them.
 #:
-#: The occupancy this is applied to holds the PELVIS position, which is why the radius has to
-#: cover the whole body rather than the base.
-BODY_RADIUS_M: float = 0.50
+#: It was 0.50 when the occupancy held the ROOT alone, which is what the reach from the
+#: pelvis demands (max 0.492 m on jump_off). Tracking the limbs instead is both stricter --
+#: a swing foot reaching 0.27 m past the pelvis toward a box is now seen rather than covered
+#: by a margin -- and less conservative, which is the point: clutter exists to be seen, and
+#: the pelvis-only veto was pushing it a needless 0.2 m further away everywhere.
+BODY_RADIUS_M: float = 0.30
 
 #: Extra clearance on every veto (m), beyond the body itself.
 #:
@@ -146,7 +149,7 @@ class ClutterConfig:
     cylinder_frac_pillar: float = 0.5
     cylinder_frac_other: float = 0.15
     flat_repeats: int = 6
-    background_range_m: tuple[float, float] = (10.0, 22.0)
+    background_range_m: tuple[float, float] = (6.0, 16.0)
 
 
 def tile_rng(seed: int, terrain_id: int, salt: int = 0) -> np.random.Generator:
@@ -359,14 +362,53 @@ def sample_in_band(occ: TileOccupancy, size_x: float, size_y: float, lo: float, 
         ``(x, y)`` in the tile frame, or ``None`` if the band is unreachable on this tile.
     """
     for _ in range(tries):
-        x = float(rng.uniform(-hi, size_x + hi))
-        y = float(rng.uniform(-hi, size_y + hi))
+        # Sampled INSIDE the tile. Reaching outside it only produces candidates that
+        # ``within_tile`` then rejects, and on a narrow tile that is most of them.
+        x = float(rng.uniform(0.0, size_x))
+        y = float(rng.uniform(0.0, size_y))
         if lo <= distance_to_path(x, y, occ) <= hi:
             return x, y
     return None
 
 
-def clutter_for_tile(tile: dict, occ: TileOccupancy, cfg: ClutterConfig) -> list[dict]:
+def within_tile(b: dict, footprint: tuple[float, float],
+                margin: float = BODY_RADIUS_M + CLEARANCE_M) -> bool:
+    """Whether a box lies wholly inside its own tile's footprint.
+
+    **Clutter belongs to exactly one tile and must stay in it.** A box is authored in
+    tile-LOCAL coordinates and rendered by translating it onto that tile's corner, so one
+    placed outside the footprint lands physically on a NEIGHBOUR -- where it was never vetted
+    against anything, because every check here is per tile. That is not a near miss: a
+    background volume placed twenty metres out for a narrow transition tile arrives on top of
+    the next tile's staircase, and the per-tile verification calls it clean because it only
+    ever compares a box to its own tile's motion.
+
+    The footprint, not the manifest ``size_x`` / ``size_y``: the footprint is the ground the
+    layout actually reserves for this tile (it includes the size margin and the transition
+    back-buffer), and the gap between tiles is not this tile's to fill either.
+
+    Args:
+        b: The overlay box.
+        footprint: The tile's ``(fx, fy)`` reserved extent (m).
+        margin: Keep this far inside the edge (m). Defaults to the VETO distance, not to a
+            token gap, and that is what makes the neighbour safe by construction rather than
+            by inspection: a box that clears its own boundary by the veto distance is at
+            least that far from anything in the next tile, whose own path lies inside its own
+            footprint on the far side of the inter-tile gap. With a token margin the check
+            still let a handful through per variant -- boxes legally inside their tile, near
+            the edge, with a neighbour's motion just across the gap.
+
+    Returns:
+        True if the whole box is inside.
+    """
+    x0, y0, x1, y1 = aabb(b)
+    fx, fy = footprint
+    return (x0 >= margin and y0 >= margin
+            and x1 <= float(fx) - margin and y1 <= float(fy) - margin)
+
+
+def clutter_for_tile(tile: dict, occ: TileOccupancy, cfg: ClutterConfig,
+                     footprint: tuple[float, float] | None = None) -> list[dict]:
     """Author one tile's clutter, vetted against its own motion.
 
     Placement is REJECTION-SAMPLED rather than solved: a candidate is drawn, checked against
@@ -377,12 +419,16 @@ def clutter_for_tile(tile: dict, occ: TileOccupancy, cfg: ClutterConfig) -> list
     Args:
         tile: The manifest tile (read for ``size_x`` / ``size_y`` / ``terrain_id``).
         occ: Where the robot actually went on this tile, from the recording.
+        footprint: The tile's reserved ``(fx, fy)`` extent. Placements outside it are
+            rejected -- see :func:`within_tile`. Defaults to the manifest size, which is
+            smaller and therefore stricter.
         cfg: Knobs.
 
     Returns:
         Overlay dicts to append to the tile, all marked ``decor``.
     """
     sx, sy = float(tile["size_x"]), float(tile["size_y"])
+    fp = (float(footprint[0]), float(footprint[1])) if footprint else (sx, sy)
     rng = tile_rng(cfg.seed, int(tile["terrain_id"]), salt=0xC17E)
     out: list[dict] = []
 
@@ -395,6 +441,8 @@ def clutter_for_tile(tile: dict, occ: TileOccupancy, cfg: ClutterConfig) -> list
             return
         kind = "cylinder" if (round_frac and rng.random() < round_frac) else "box"
         b = box(pos[0], pos[1], z0, sxx, syy, szz, cls, kind=kind)
+        if not within_tile(b, fp):
+            return
         ok = approach_zone_clear(b, occ) if interactable else clears_occupancy(b, occ)
         if ok:
             out.append(b)
@@ -484,7 +532,7 @@ def clutter_for_flat(occ: TileOccupancy, size_x: float, size_y: float,
     try:
         for rep in range(max(1, int(cfg.flat_repeats))):
             cfg.seed = saved * 100000 + int(variant) * 100 + rep
-            boxes.extend(clutter_for_tile(tile, occ, cfg))
+            boxes.extend(clutter_for_tile(tile, occ, cfg, footprint=(size_x, size_y)))
     finally:
         cfg.seed = saved
     half_x, half_y = float(size_x) / 2.0, float(size_y) / 2.0

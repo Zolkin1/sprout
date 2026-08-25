@@ -31,6 +31,7 @@ consumes this does not.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -49,26 +50,37 @@ from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
 )
 
 
-def recorded_root_xy(data: dict, meta) -> np.ndarray:
-    """World ``(N, 2)`` robot positions, one per recorded window.
+def recorded_body_xy(data: dict, meta) -> tuple[np.ndarray, list[str]]:
+    """World xy of EVERY tracked body, per recorded window: ``(N, B, 2)``.
+
+    Not just the root. The recording stores the ankles and wrists in world alongside it, and
+    they are the parts that reach: on a staircase the swing foot gets a quarter of a metre
+    ahead of the pelvis, so a root-only grid has to be padded by the robot's whole reach and
+    still cannot tell a foot swinging toward a box from one swinging away.
 
     The SNAP row -- the last history row -- is the pose the window was anchored at, which is
-    the pose the re-render places the robot at. Earlier history rows are the same trajectory
-    a few steps back and would only blur the grid.
+    the pose the re-render places the robot at. Earlier rows are the same trajectory a few
+    steps back and would only blur the grid.
 
     Args:
         data: The loaded recording arrays.
-        meta: Layout metadata; ``state_term_names`` / ``state_term_dims`` locate the root.
+        meta: Layout metadata; ``state_term_names`` / ``state_term_dims`` locate each body.
 
     Returns:
-        ``(N, 2)`` world xy.
+        ``((N, B, 2) world xy, body names)``.
     """
     names = list(meta.state_term_names)
     dims = list(meta.state_term_dims)
-    if "root_pos_w" not in names:
+    wanted = [n for n in names if n == "root_pos_w" or n.endswith(":pos_w")]
+    if "root_pos_w" not in wanted:
         raise SystemExit(f"recording has no root_pos_w in its state layout: {names}")
-    start = int(sum(dims[: names.index("root_pos_w")]))
-    return np.asarray(data["history_state"])[:, -1, start:start + 2]
+    rows = np.asarray(data["history_state"])[:, -1, :]
+    out = []
+    for n in wanted:
+        st = int(sum(dims[: names.index(n)]))
+        out.append(rows[:, st:st + 2])
+    return np.stack(out, axis=1), [n.replace(":pos_w", "").replace("root_pos_w", "root")
+                                   for n in wanted]
 
 
 def densify_by_episode(xy: np.ndarray, episode: np.ndarray, step: np.ndarray,
@@ -144,7 +156,8 @@ def main() -> int:
 
     data, meta = load_recorded_windows(
         a.data, keys=["history_state", "clip_id", "episode_id", "clip_step"])
-    xy = recorded_root_xy(data, meta)
+    xyb, body_names = recorded_body_xy(data, meta)
+    xy = xyb[:, 0, :]                                   # the root drives episode ordering
     if a.max_windows and len(xy) > a.max_windows:
         xy = xy[np.linspace(0, len(xy) - 1, a.max_windows).astype(int)]
     else:
@@ -155,10 +168,13 @@ def main() -> int:
         # gap), which is how intersecting clutter first appeared. Interpolating turns the
         # samples back into the continuous path they came from, and makes the result
         # independent of the recording's cadence.
-        xy = densify_by_episode(xy, np.asarray(data["episode_id"]).reshape(-1),
-                                np.asarray(data["clip_step"]).reshape(-1), a.cell / 2.0)
-        print(f"[occupancy] densified along {len(np.unique(data['episode_id']))} episodes "
-              f"-> {len(xy)} points")
+        ep = np.asarray(data["episode_id"]).reshape(-1)
+        stp = np.asarray(data["clip_step"]).reshape(-1)
+        parts = [densify_by_episode(xyb[:, b, :], ep, stp, a.cell / 2.0)
+                 for b in range(xyb.shape[1])]
+        xy = np.concatenate(parts)
+        print(f"[occupancy] densified along {len(np.unique(ep))} episodes x "
+              f"{len(body_names)} tracked bodies {body_names} -> {len(xy)} points")
     lib_path = a.clip or meta.clip_library_path
     print(f"[occupancy] {len(xy)} recorded poses; tiles from {lib_path}")
 
@@ -222,7 +238,25 @@ def main() -> int:
     # lacks. Their union is the only set that is safe in both directions.
     if not a.no_clip_paths:
         y_des, clip_tid, clip_len = lib.y_des, lib.terrain_id.numpy(), lib.clip_len.numpy()
-        base_idx = 0                                   # pelvis xy leads the y_des layout
+        # Every WORLD body the clip stores. The ``@root`` channels are body-relative and
+        # would be meaningless here -- comparing them against tile coordinates puts a wrist
+        # twenty metres away.
+        # ``lib.meta`` first, ``lib.attrs`` second -- the loader promotes some root
+        # attributes into meta and this is one of them, so reaching straight for attrs raises
+        # a KeyError. It did, and the failure was quiet in the worst way: the union block
+        # died AFTER the recorded half had been binned, so the previous occupancy file stayed
+        # on disk and everything downstream kept using it, one revision stale.
+        raw_names = lib.meta.get("pos_output_names") if getattr(lib, "meta", None) else None
+        if raw_names is None:
+            raw_names = lib.attrs.get("pos_output_names")
+        if raw_names is None:
+            raise SystemExit(
+                "clip library carries no 'pos_output_names', so the per-body columns cannot "
+                "be located. Pass --no_clip_paths to veto against the recording alone.")
+        pos_names = json.loads(raw_names) if isinstance(raw_names, str) else list(raw_names)
+        body_cols = [[pos_names.index(f"{b}:pos_{ax}") for ax in "xy"]
+                     for b in sorted({n.split(":")[0] for n in pos_names if ":pos_x" in n})
+                     if "@root" not in b]
         added = 0
         for k in list(per):
             members = np.flatnonzero(clip_tid == k)
@@ -234,12 +268,15 @@ def main() -> int:
             chunks = []
             for c in members:
                 n = int(clip_len[c])
-                xyc = np.asarray(y_des[int(c), :n, base_idx:base_idx + 2])
+                xyc = np.concatenate([np.asarray(y_des[int(c), :n, cc]) for cc in body_cols])
                 if k == -1:
                     # Flat clips are re-centred on their tile by BBOX at reset, so their
                     # baked coordinates are not where the robot stands; the same rule the
                     # reset applies has to be applied here or the union is in the wrong place.
-                    bb = 0.5 * (xyc.max(axis=0) + xyc.min(axis=0))
+                    # Re-centred on the PELVIS bbox, the rule the reset applies -- every
+                    # body shifts by the same offset, so it is computed once from the root.
+                    pel = np.asarray(y_des[int(c), :n, body_cols[0]])
+                    bb = 0.5 * (pel.max(axis=0) + pel.min(axis=0))
                     xyc = xyc - bb + np.array(sizes[k]) / 2.0
                 chunks.append(xyc)
             pts_c = np.concatenate(chunks)
@@ -265,7 +302,14 @@ def main() -> int:
                 else pts[np.linspace(0, len(pts) - 1, cap).astype(int)])
         out[f"pts_{k}"] = keep.astype(np.float32)
         print(f"  {k:10d} {len(pts):8d} {occ.grid.size:8d} {occ.grid.mean():9.4f}")
-    np.savez_compressed(a.out, terrain_ids=np.asarray(sorted(per)), **out)
+    # Written via a temp and moved into place. The union block once died midway and left the
+    # PREVIOUS occupancy on disk, which every downstream step then used as if it were current
+    # -- a stale artifact that looks exactly like a fresh one is worse than no artifact.
+    # ``.npz`` on the temp too: numpy APPENDS the extension when it is absent, so a
+    # bare ".partial" is written as ".partial.npz" and the move then fails.
+    tmp = a.out + ".partial.npz"
+    np.savez_compressed(tmp, terrain_ids=np.asarray(sorted(per)), **out)
+    os.replace(tmp, a.out)
     print(f"[occupancy] wrote {a.out}")
     return 0
 

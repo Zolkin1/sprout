@@ -106,6 +106,13 @@ _TRAJ_BODIES: tuple[tuple[str, tuple[int, int, int]], ...] = (
 #: Foot-contact dots, drawn where the ``contact`` flag is set.
 _CONTACT_COLOR = (255, 60, 60)
 
+#: ``terrain_id`` -> family name, filled from the manifest when a library is rendered.
+#:
+#: Module scope because the label is drawn deep in the per-tile loop and the manifest is read
+#: once, at the top. It is a cache, not state: rendering a second library overwrites it, and
+#: nothing renders two.
+_FAMILY: dict[int, str] = {}
+
 
 def _body_cols(pos_names: list[str], body: str) -> list[int] | None:
     """Column indices of ``body``'s world xyz, or ``None`` if the library lacks it."""
@@ -254,7 +261,7 @@ def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int
 def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
                     n_traj: int = 0, traj_seed: int = 0,
                     mark_step: int | None = None,
-                    clutter: str | None = None) -> trimesh.Trimesh:
+                    clutter: str | None = None, labels: bool = True) -> trimesh.Trimesh:
     """Render the terrain a clip library's manifest assembles into.
 
     Args:
@@ -270,6 +277,10 @@ def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
     from motion_gen.clips.clip_io import load_clip_library
 
     lib = load_clip_library(lib_path, "cpu")
+    _raw_man = lib.attrs.get("terrain_manifest")
+    for _m in (json.loads(_raw_man) if isinstance(_raw_man, str) else list(_raw_man or [])):
+        if "terrain_id" in _m:
+            _FAMILY[int(_m["terrain_id"])] = str(_m.get("family", "?")).replace(".h5", "")
     if clutter:
         from motion_gen.terrain.clutter import merge_flat_decor, merge_into_manifest
 
@@ -304,6 +315,20 @@ def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
     for ti in range(layout.num_tiles):
         tid = int(layout.tile_terrain_id[0, ti])
         corner = layout.tile_corner[0, ti].numpy()
+        if labels:
+            # The TERRAIN_ID, not the tile index. Everything downstream -- the manifest, the
+            # occupancy, the clutter sidecar, author_clutter --verify -- is keyed by
+            # terrain_id, while the scene node is named by position in the layout. Reading
+            # one for the other is how a question about a tile gets answered about a
+            # different tile. The family comes along because it is what the eye is actually
+            # sorting by.
+            fp_l = layout.tile_footprint[0, ti].numpy()
+            server.scene.add_label(
+                f"/lib_tile_{ti}/label",
+                text=(f"tid {tid} · {_FAMILY.get(tid, 'flat')}" if tid >= 0
+                      else f"flat (tile {ti})"),
+                position=(float(corner[0]) + float(fp_l[0]) / 2.0,
+                          float(corner[1]) + float(fp_l[1]) / 2.0, 3.0))
         overlays = layout.terrain_overlays.get(tid, [])
         _add_overlay_boxes(server, f"/lib_tile_{ti}", overlays, (float(corner[0]), float(corner[1])))
         if n_traj > 0:
@@ -394,6 +419,10 @@ def main() -> None:
                         "the treads after a width edit, which the mesh alone cannot show.")
     p.add_argument("--traj-seed", type=int, default=0,
                    help="Which clips are sampled, so a re-run shows the same ones.")
+    p.add_argument("--no-labels", action="store_true",
+                   help="Hide the per-tile label. Labels carry the TERRAIN_ID, which is what "
+                        "every other tool keys on -- the scene-node names carry the tile's "
+                        "position in the layout instead, and the two are different numbers.")
     p.add_argument("--clutter", default=None, metavar="SIDECAR.json",
                    help="Overlay a clutter variant from author_clutter.py. It is drawn "
                         "through the same decor channel as the library's own decoration, so "
@@ -419,7 +448,8 @@ def main() -> None:
                     print(f"[view_terrain_viser] terrain-probe library: marking step {mark}")
         mesh = _render_library(server, args.lib, args.num_rows,
                                n_traj=args.traj, traj_seed=args.traj_seed,
-                               mark_step=mark, clutter=args.clutter)
+                               mark_step=mark, clutter=args.clutter,
+                               labels=not args.no_labels)
     else:
         mesh = _render_subterrains(server, _load_cfg(args.cfg or "demo"))
 
