@@ -116,8 +116,34 @@ def conditions() -> list[tuple[str, list[dict]]]:
     return out
 
 
-def clip_geometry(path: str, clip_id: int, start_step: int) -> tuple[np.ndarray, float, float]:
-    """Where the robot is, relative to its tile's centre, and which way it faces.
+def _qmul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """Hamilton product of two wxyz quaternions."""
+    w1, x1, y1, z1 = a
+    w2, x2, y2, z2 = b
+    return np.array([w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+                     w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                     w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                     w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
+
+
+def _rot(q: np.ndarray) -> np.ndarray:
+    """Rotation matrix from a wxyz quaternion."""
+    w, x, y, z = q
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                     [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
+def clip_geometry(path: str, clip_id: int, start_step: int) -> tuple[np.ndarray, float, float, float]:
+    """Where the robot is relative to its tile centre, which way it faces, and its torso pitch.
+
+    The torso pitch is not a diagnostic extra -- it decides what the probe can see at all.
+    BOTH cameras mount on ``torso_link``, so the far lens's nominal 15 deg down is measured
+    from a torso that is never level: median +10 deg nose-down on flat and +16 on stairs_up.
+    That drags its boresight to 25-31 deg and its ground intersection to 2.3-3.2 m against a
+    nominal 4.1 m, and at the p95 nose-down instant a 2 m wall at 4 m falls entirely above
+    the top of the frame. Choosing the probe step without looking at this silently decides
+    which conditions are visible.
 
     Args:
         path: Source clip library.
@@ -125,18 +151,36 @@ def clip_geometry(path: str, clip_id: int, start_step: int) -> tuple[np.ndarray,
         start_step: The step the probe fires on.
 
     Returns:
-        ``(offset_xy, yaw_rad, speed)`` -- the robot's position relative to the tile centre
-        under the flat re-centring rule, its heading, and its planar speed at that step.
+        ``(offset_xy, yaw_rad, speed, torso_pitch_deg, pose)`` -- position relative to the
+        tile centre under the flat re-centring rule, heading, planar speed, world torso pitch
+        (positive = nose down), and the joint configuration plus yaw-removed root rotation
+        needed to draw the robot in the probe's own frame.
     """
     with h5py.File(path, "r") as f:
         n = int(f["clip_len"][clip_id])
         row = f["y_des"][clip_id][:n]
+        names = json.loads(f.attrs["pos_output_names"])
     pel, quat = row[:, 0:3], row[:, 3:7]
     bbox_center = 0.5 * (pel[:, :2].max(axis=0) + pel[:, :2].min(axis=0))
     w, x, y, z = quat[start_step]
     yaw = float(np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z)))
     spd = float(np.linalg.norm(pel[min(start_step + 1, n - 1), :2] - pel[start_step, :2]) / 0.02)
-    return pel[start_step, :2] - bbox_center, yaw, spd
+    q_t = np.array([row[start_step, names.index(f"torso_link@root:ori_{a}")] for a in "wxyz"])
+    r_w = _rot(quat[start_step]) @ _rot(q_t)
+    pitch = float(np.degrees(np.arcsin(np.clip(-r_w[2, 0], -1.0, 1.0))))
+
+    # The robot's pose IN THE ROBOT FRAME the conditions are authored in. That frame is
+    # yaw-aligned, so the heading cancels and what is left is the roll/pitch -- which must be
+    # kept, not zeroed: the torso lean is the thing that decides what the cameras see, so a
+    # viewer that draws the robot bolt upright would show a scene the cameras never had.
+    c, s_ = np.cos(-yaw / 2.0), np.sin(-yaw / 2.0)
+    q_local = _qmul(np.array([c, 0.0, 0.0, s_]), quat[start_step])
+    jn = [n[len("joint:"):] for n in names if n.startswith("joint:")]
+    jp = [float(row[start_step, names.index(f"joint:{n}")]) for n in jn]
+    pose = {"joint_names": jn, "joint_pos": jp,
+            "root_quat_wxyz": [float(v) for v in q_local],
+            "root_z": float(pel[start_step, 2])}
+    return pel[start_step, :2] - bbox_center, yaw, spd, pitch, pose
 
 
 def scan(path: str, max_yaw: float, min_speed: float, horizon: int, n_try: int) -> None:
@@ -200,8 +244,10 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--clip", required=True, help="Source clip library .h5.")
     p.add_argument("--out", default="clips/_terrain_probe.h5")
-    p.add_argument("--clip_id", type=int, default=8869)
-    p.add_argument("--start_step", type=int, default=380)
+    # Defaults sit at the flat family's MEDIAN torso pitch (10.3 deg). The first pair used
+    # here was the p95 nose-down instant, which put every condition beyond 3 m out of frame.
+    p.add_argument("--clip_id", type=int, default=9073)
+    p.add_argument("--start_step", type=int, default=190)
     p.add_argument("--scan", action="store_true", help="List usable (clip, step) pairs and exit.")
     p.add_argument("--max_yaw", type=float, default=0.15,
                    help="Refuse a clip whose heading strays further than this (rad) from a "
@@ -217,7 +263,7 @@ def main() -> int:
         return 0
 
     conds = conditions()
-    off, yaw, spd = clip_geometry(a.clip, a.clip_id, a.start_step)
+    off, yaw, spd, pitch, pose = clip_geometry(a.clip, a.clip_id, a.start_step)
     if abs(yaw) > a.max_yaw:
         raise SystemExit(
             f"clip {a.clip_id} step {a.start_step} has yaw {yaw:+.3f} rad, beyond --max_yaw "
@@ -225,8 +271,13 @@ def main() -> int:
             "so a rotated heading would put every condition off to one side of the path "
             "instead of across it. Run --scan to find a segment that qualifies."
         )
+    ground = 1.1 / np.tan(np.radians(max(1.0, pitch + 15.0)))
     print(f"[probe-lib] clip {a.clip_id} step {a.start_step}: yaw {yaw:+.3f} rad, "
           f"{spd:.2f} m/s, offset from tile centre [{off[0]:+.2f}, {off[1]:+.2f}] m")
+    print(f"[probe-lib] torso pitch {pitch:+.2f} deg nose-down -> far camera boresight "
+          f"{pitch + 15.0:.1f} deg down, meeting the ground near {ground:.1f} m "
+          f"(nominal, torso level, is 4.1 m). Conditions beyond that are seen only by the "
+          f"UPPER half of the frame, and a tall one can sit above it entirely.")
 
     # One copy of the clip per condition: flat tiles are sized from the FLAT CLIP COUNT, so N
     # tiles need N clips. They are identical, which is the point -- the motion is the control.
@@ -248,8 +299,15 @@ def main() -> int:
         f.attrs["terrain_probe"] = json.dumps({
             "source": os.path.basename(a.clip), "clip_id": a.clip_id,
             "start_step": a.start_step, "yaw": yaw, "speed": spd,
+            "torso_pitch_deg": pitch, "far_cam_ground_m": float(ground),
+            "pose": pose,
             "offset_xy": [float(off[0]), float(off[1])],
             "conditions": [n for n, _ in conds],
+            # The boxes in the ROBOT's own frame at the probe instant, before placement.
+            # The viewer draws every condition at the origin so they can be flipped between
+            # without the camera moving, and re-deriving these from world coordinates would
+            # mean inverting the placement it is supposed to be checking.
+            "conditions_local": [boxes for _n, boxes in conds],
         })
     print(f"[probe-lib] wrote {a.out}: {len(conds)} tiles / conditions")
     for i, (name, boxes) in enumerate(conds):

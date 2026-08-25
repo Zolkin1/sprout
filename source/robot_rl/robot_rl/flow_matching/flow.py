@@ -690,6 +690,7 @@ def sample_trajectory(
     generator: torch.Generator | None = None,
     zero_noise: bool = False,
     guidance_scale: float = 1.0,
+    noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Generate the F-step future window by Euler-integrating the learned flow.
 
@@ -735,9 +736,15 @@ def sample_trajectory(
     """
     b = history.shape[0]
     device = history.device
-    x = (torch.zeros(b, future_len, state_dim, device=device, dtype=history.dtype) if zero_noise
-         else torch.randn(b, future_len, state_dim, device=device, dtype=history.dtype,
-                          generator=generator))
+    if noise is not None:
+        if tuple(noise.shape) != (b, future_len, state_dim):
+            raise ValueError(f"noise must be {(b, future_len, state_dim)}, got {tuple(noise.shape)}")
+        x = noise.to(device=device, dtype=history.dtype)
+    elif zero_noise:
+        x = torch.zeros(b, future_len, state_dim, device=device, dtype=history.dtype)
+    else:
+        x = torch.randn(b, future_len, state_dim, device=device, dtype=history.dtype,
+                        generator=generator)
     dt = 1.0 / num_steps
     guided = float(guidance_scale) != 1.0
     if guided:

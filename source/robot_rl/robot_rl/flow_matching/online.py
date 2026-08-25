@@ -708,6 +708,7 @@ def sample_window(
     extero: torch.Tensor,
     cmd_tokens: torch.Tensor | None,
     history_null_mask: torch.Tensor | None = None,
+    noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample the ``F``-node future window, denormalized.
 
@@ -737,7 +738,7 @@ def sample_window(
     pred_std = sample_trajectory(ctx.model, history, extero, cmd_tokens, ctx.F, ctx.D,
                                  ctx.num_steps, history_null_mask=history_null_mask,
                                  zero_noise=ctx.zero_noise,
-                                 guidance_scale=ctx.guidance_scale)
+                                 guidance_scale=ctx.guidance_scale, noise=noise)
     # Project the rotation block back onto SO(3): the model emits 6 free numbers, and the
     # served window is both a reference pose and the next step's history token. The exported
     # ONNX module does the same, so sim and deploy agree.
