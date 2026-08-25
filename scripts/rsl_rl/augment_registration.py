@@ -83,7 +83,8 @@ parser.add_argument("--yaw", type=float, default=0.15,
                     help="Symmetric +- bound (rad) on heading. The mask PINS yaw on terrain, "
                          "so a yaw offset is a correction the generator must undo.")
 parser.add_argument("--max_source", type=int, default=0,
-                    help="Cap source windows processed (0 = all). Augmented output is this "
+                    help="Cap source windows processed (0 = all), sampled EVENLY across the "
+                         "recording rather than as a prefix. Augmented output is this "
                          "times --num_augments.")
 parser.add_argument("--batch", type=int, default=0,
                     help="Windows per render pass (0 = use num_envs).")
@@ -103,6 +104,19 @@ parser.add_argument("--quat_wxyz", action="store_true",
                     help="Write the root quaternion permuted to wxyz. A/B for the convention: "
                          "the recording states xyzw, the sim API's expectation is what this "
                          "settles empirically against a DR-free delta-0 check.")
+parser.add_argument("--clutter", default=None, metavar="SIDECAR.json",
+                    help="Re-render against a visual-clutter variant "
+                         "(scripts/rsl_rl/author_clutter.py) instead of displacing the robot. "
+                         "Implies --visual_only. The sidecar is merged into the SAME library "
+                         "the recording names, and adds only ``decor`` overlays, so the "
+                         "ground mesh and every tile corner are unchanged and the recorded "
+                         "world poses stay exactly as valid as they were -- which is the "
+                         "whole reason a recording can be re-rendered at all.")
+parser.add_argument("--visual_only", action="store_true",
+                    help="Change ONLY what the cameras see: re-render every window at its own "
+                         "recorded pose, with no displacement and no reference arithmetic. "
+                         "The output differs from the input in depth alone, which is what "
+                         "makes the pair a controlled A/B rather than two different datasets.")
 parser.add_argument("--augment_flat", action="store_true",
                     help="Also augment windows with NO terrain in their horizon. OFF by "
                          "default and it should stay off: a flat segment is anchor-mask 35 "
@@ -118,6 +132,24 @@ parser.add_argument("--seed", type=int, default=0)
 AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
+
+if args_cli.clutter:
+    args_cli.visual_only = True
+if args_cli.visual_only:
+    if args_cli.check_only:
+        raise SystemExit("--visual_only and --check_only are the same pass with and without a "
+                         "writer; pick one. --check_only reports the delta and writes "
+                         "nothing, --visual_only writes the re-rendered recording.")
+    # The displacement bounds DEFAULT to non-zero, so the test is whether they were asked
+    # for, not whether they are set. Inheriting a default is not intent; typing the flag is.
+    _asked = [n for n in ("downrange", "lateral", "yaw") if f"--{n}" in sys.argv]
+    if _asked:
+        raise SystemExit(
+            f"--visual_only was given {_asked} explicitly. Displacing the robot AND changing "
+            "the scene is a legitimate pass, but the two together make an augmented pair that "
+            "differs in two variables, so neither can be attributed -- ask for it in a "
+            "separate run rather than by combining flags here.")
+    args_cli.downrange = args_cli.lateral = args_cli.yaw = 0.0
 
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
@@ -280,6 +312,12 @@ def main() -> int:
     terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
     if terrain is not None and hasattr(terrain, "clip_library_path"):
         terrain.clip_library_path = lib
+        if args_cli.clutter:
+            # The importer merges the sidecar itself, and verifies it was authored against
+            # this library. Nothing about the ground changes, so the sha check above -- which
+            # exists because the recorded poses are absolute world -- still holds and still
+            # means what it says.
+            terrain.decor_overlay_path = args_cli.clutter
     if args_cli.no_depth_dr:
         # DERIVED from the event functions rather than a name list. An earlier hardcoded guess
         # ("randomize_depth_mount_*") matched nothing, so camera EXTRINSICS/INTRINSICS
@@ -459,8 +497,13 @@ def main() -> int:
     s_pos, s_quat = term_slice(names, dims, "root_pos_w"), term_slice(names, dims, "root_quat_w")
     s_jp = term_slice(names, dims, "joint_pos")
 
-    src = np.arange(W if not args_cli.max_source else min(W, args_cli.max_source))
-    if not args_cli.check_only and not args_cli.augment_flat:
+    # SPREAD, never a prefix. The recording is written env-batch by env-batch, so the first
+    # N windows are the OPENINGS of episodes -- taking a prefix samples one narrow band of
+    # clip_step and silently answers a different question than the one asked (it read the
+    # first 36 steps of a 2-6 s clip here, which made every downrange obstacle look far away).
+    src = (np.arange(W) if not args_cli.max_source or args_cli.max_source >= W
+           else np.linspace(0, W - 1, args_cli.max_source).astype(np.int64))
+    if not args_cli.check_only and not args_cli.visual_only and not args_cli.augment_flat:
         # Keep only windows whose horizon CONTAINS terrain (>=1 anchor-mask-pinned node):
         # terrain-only segments and transitions. Pure-flat windows are ego-anchored and must
         # not be given a world-fixed correction -- see --augment_flat. A transition window
@@ -483,7 +526,7 @@ def main() -> int:
               "are skipped (they are ego-anchored and must move WITH the robot).")
         if len(src) == 0:
             raise SystemExit("no windows contain terrain; nothing to augment.")
-    reps = 1 if args_cli.check_only else int(args_cli.num_augments)
+    reps = 1 if (args_cli.check_only or args_cli.visual_only) else int(args_cli.num_augments)
     hs_all = data["history_state"]
 
     # CAMERA LATENCY. A recording made after 2026-08-21 carries the last few depth frames
@@ -555,7 +598,11 @@ def main() -> int:
             quat = snap[:, s_quat].copy()
             jp = snap[:, s_jp].copy()
 
-            if args_cli.check_only:
+            if args_cli.check_only or args_cli.visual_only:
+                # Exactly zero, and never drawn: under --visual_only the whole point is that
+                # the robot is where the recording put it, so the pair differs in depth
+                # alone. Drawing and then adding zero would still run the reference
+                # arithmetic below, which is an f64 round trip that need not be bit-exact.
                 d_dr = d_lat = d_yaw = np.zeros(k)
             else:
                 d_dr = rng.uniform(-args_cli.downrange, args_cli.downrange, k)

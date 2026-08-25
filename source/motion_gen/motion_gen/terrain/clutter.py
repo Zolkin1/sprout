@@ -111,11 +111,27 @@ class ClutterConfig:
     Attributes:
         seed: Base seed; every tile draws from its own stream.
         wall_frac: Probability a tile gets a free-standing wall across its far approach.
+            DEFAULT 1: a wall is the class the terrain probe measures as moving the plan
+            most, and per object it is the only class that reliably fills the frame (median
+            10.4% of far-camera pixels when seen, against 1.6% for a crate and 0.8% for a
+            pillar). Geometry still rejects it on the narrowest tiles, so 1.0 lands on
+            roughly 60% of them rather than all.
         wall_size_range: ``(height_lo, height_hi)`` for walls (m). Height is barely
             observable -- the frame's top edge cuts a nearby wall well below its top -- so
             this varies mostly for the sake of the MuJoCo and viser views.
+        wall_gap_range: How far past the end of the motion a wall stands (m). Small, because
+            the far camera's reach is short once the torso pitches nose-down while walking,
+            and a wall beyond that is scenery rather than a distractor.
         pillar_count_range: Pillars per tile, placed beside the corridor.
         overhang_frac: Probability of a soffit spanning the corridor above head height.
+            DEFAULT 0: an overhang high enough to clear the head is never in frame. The far
+            camera has a 42 deg vertical FOV and rides the torso, which pitches ~10-16 deg
+            nose-down while walking, so it looks at the ground a few metres out. Measured
+            over a rendered variant, an overhang at 2.1-2.6 m changed ZERO pixels in ZERO
+            windows -- it is render cost that teaches nothing. The class stays implemented:
+            if the camera pitch or mount ever changes, raise this and re-measure. Making it
+            visible by lowering it is not the fix -- that walks it into the robot's head,
+            and on a stairs tile the head is already several risers up.
         overhang_z_range: Underside height (m). Must clear the tallest recorded body point.
         crate_count_range: Large masses per tile, beside the corridor.
         step_decoy_frac: Probability of a step-height ledge beside the corridor. Kept small:
@@ -124,7 +140,10 @@ class ClutterConfig:
         decoy_frac: Probability of an interactable-looking decoy, subject to the approach-zone
             veto (which will reject most placements on a narrow tile).
         background_count_range: Distant masses, purely to give the far camera content.
-        background_range_m: How far out they go (m).
+        background_range_m: How far out they go (m). Pulled in from 6-16 m, where the class
+            reached only 1.0% of windows: at 10 m a 2 m mass is under two pixels wide, so
+            "distant scenery" costs a render and delivers nothing. It still sits beyond every
+            other band, which is all the class is for.
         cylinder_frac_pillar: Fraction of pillars emitted as cylinders. High, because a
             pillar is the one class that is round in the real world as often as not.
         cylinder_frac_other: Fraction of crates and background masses emitted as cylinders.
@@ -137,10 +156,11 @@ class ClutterConfig:
     """
 
     seed: int = 0
-    wall_frac: float = 0.55
+    wall_frac: float = 1.0
     wall_size_range: tuple[float, float] = (1.2, 3.0)
+    wall_gap_range: tuple[float, float] = (0.6, 2.5)
     pillar_count_range: tuple[int, int] = (0, 3)
-    overhang_frac: float = 0.25
+    overhang_frac: float = 0.0
     overhang_z_range: tuple[float, float] = (2.1, 2.6)
     crate_count_range: tuple[int, int] = (0, 3)
     step_decoy_frac: float = 0.20
@@ -149,7 +169,7 @@ class ClutterConfig:
     cylinder_frac_pillar: float = 0.5
     cylinder_frac_other: float = 0.15
     flat_repeats: int = 6
-    background_range_m: tuple[float, float] = (6.0, 16.0)
+    background_range_m: tuple[float, float] = (4.0, 10.0)
 
 
 def tile_rng(seed: int, terrain_id: int, salt: int = 0) -> np.random.Generator:
@@ -407,6 +427,16 @@ def within_tile(b: dict, footprint: tuple[float, float],
             and x1 <= float(fx) - margin and y1 <= float(fy) - margin)
 
 
+def path_extent(occ: TileOccupancy) -> tuple[float, float, float, float]:
+    """``(x_min, x_max, y_min, y_max)`` of the occupied cells, in tile coordinates."""
+    ij = np.argwhere(occ.grid)
+    if not len(ij):
+        return (0.0, 0.0, 0.0, 0.0)
+    ox, oy = occ.origin
+    return (ox + ij[:, 0].min() * occ.cell, ox + (ij[:, 0].max() + 1) * occ.cell,
+            oy + ij[:, 1].min() * occ.cell, oy + (ij[:, 1].max() + 1) * occ.cell)
+
+
 def clutter_for_tile(tile: dict, occ: TileOccupancy, cfg: ClutterConfig,
                      footprint: tuple[float, float] | None = None) -> list[dict]:
     """Author one tile's clutter, vetted against its own motion.
@@ -450,11 +480,29 @@ def clutter_for_tile(tile: dict, occ: TileOccupancy, cfg: ClutterConfig,
     # Bands are in metres from the recorded path, and are the whole reason placement is not
     # uniform. The far camera resolves a few metres ahead (less than its nominal reach, since
     # the torso pitches nose-down while walking), so a box beyond that is scenery.
+    # A wall goes across the END of the traversal, not beside it. Placing it by distance
+    # band like everything else asks for a spot 1.5-5 m from the path, and on a corridor tile
+    # a few metres wide the only such spots are OUTSIDE the tile -- so the wall was rejected
+    # on all but the widest tiles, and this is the class the probe measures as mattering most.
+    # Downrange of where the motion stops there is room, and it is also the case the robot
+    # has never seen: a vertical surface it is walking toward.
     if rng.random() < cfg.wall_frac:
         h = float(rng.uniform(*cfg.wall_size_range))
-        place("wall", (1.5, 5.0), 0.15, _span(rng, min(3.0, sy), sy), h)
+        px0, px1, py0, py1 = path_extent(occ)
+        for _ in range(8):
+            gap = float(rng.uniform(*cfg.wall_gap_range))
+            ahead = rng.random() < 0.75          # mostly ahead; sometimes behind the start
+            x = (px1 + gap) if ahead else (px0 - gap)
+            b = box(x, (py0 + py1) / 2.0, 0.0, 0.15, _span(rng, min(3.0, sy), sy), h, "wall")
+            if within_tile(b, fp) and clears_occupancy(b, occ):
+                out.append(b)
+                break
+    # Pillar sections start at 0.35 m, not 0.15. A 0.29 m median section at the 1.6 m median
+    # placement distance is under four pixels wide in the far camera -- measured 0.8% of the
+    # frame when visible at all, against a wall's 10.4% from FURTHER away. What limits this
+    # clutter is angular size, not range.
     for _ in range(int(rng.integers(*_incl(cfg.pillar_count_range)))):
-        w = float(rng.uniform(0.15, 0.45))
+        w = float(rng.uniform(0.35, 0.9))
         place("pillar", (1.0, 4.0), w, w, float(rng.uniform(1.5, 3.0)),
               round_frac=cfg.cylinder_frac_pillar)
     if rng.random() < cfg.overhang_frac:

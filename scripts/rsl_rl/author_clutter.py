@@ -185,6 +185,19 @@ def main() -> int:
                         "30%% of training and carry no manifest entry, so they are authored "
                         "separately -- and they are the case that most needs it: at the "
                         "shipped buffer NO flat clip has a wall within camera reach.")
+    p.add_argument("--wall_frac", type=float, default=None,
+                   help="Override the per-tile wall probability. Walls are the class the "
+                        "terrain probe measures as moving the plan most, and the class "
+                        "geometry rejects most often, so this is the knob worth having "
+                        "separately from the rest.")
+    p.add_argument("--wall_gap_range", type=float, nargs=2, default=None, metavar=("LO", "HI"),
+                   help="How far past the end of the motion a wall stands (m).")
+    p.add_argument("--only_classes", default="",
+                   help="Comma-separated clutter classes to keep, dropping the rest. For "
+                        "ATTRIBUTION: render one class at a time and diff, and which pixels "
+                        "each class produced is unambiguous. Doing it geometrically instead "
+                        "-- frustum tests against box corners -- has several ways to be "
+                        "quietly wrong and no ground truth to catch any of them.")
     p.add_argument("--min_visible_frac", type=float, default=0.25,
                    help="Refuse to write if fewer than this fraction of boxes land within "
                         "the far camera's reach of the recorded path. A variant the cameras "
@@ -204,7 +217,15 @@ def main() -> int:
     existing_flat = (json.loads(raw_flat) if isinstance(raw_flat, str)
                      else list(raw_flat or [])) if raw_flat is not None else []
     occ, sizes, raw = load_occupancy(a.occupancy)
+    # Filtered AFTER authoring, never before: the draw order is what makes two variants
+    # differ, so dropping a class up front would re-roll every later placement and the
+    # single-class render would no longer be a subset of the full one.
+    keep_classes = {c.strip() for c in a.only_classes.split(",") if c.strip()}
     cfg = ClutterConfig(seed=a.seed)
+    if a.wall_frac is not None:
+        cfg.wall_frac = float(a.wall_frac)
+    if a.wall_gap_range is not None:
+        cfg.wall_gap_range = (float(a.wall_gap_range[0]), float(a.wall_gap_range[1]))
 
     per_tile: dict[str, list[dict]] = {}
     stats: dict[str, int] = {}
@@ -214,6 +235,8 @@ def main() -> int:
         if tid not in occ:
             continue                      # no recorded pose on this tile: nothing to vet against
         boxes = clutter_for_tile(tile, occ[tid], cfg, footprint=sizes.get(tid))
+        if keep_classes:
+            boxes = [b for b in boxes if b["clutter_class"] in keep_classes]
         if not boxes:
             continue
         per_tile[str(tid)] = boxes
@@ -256,6 +279,8 @@ def main() -> int:
         fsx, fsy = sizes[_FLAT_ID]
         for v in range(n_var):
             boxes = clutter_for_flat(occ[_FLAT_ID], fsx, fsy, cfg, v)
+            if keep_classes:
+                boxes = [b for b in boxes if b["clutter_class"] in keep_classes]
             flat_variants.append(boxes)
             for b in boxes:
                 stats[b["clutter_class"]] = stats.get(b["clutter_class"], 0) + 1
@@ -294,7 +319,7 @@ def main() -> int:
               f"median {np.median(d):.2f} m, p90 {np.percentile(d, 90):.2f} m")
         print(f"[clutter] within the far camera's {FAR_CAMERA_REACH_M:.0f} m reach: "
               f"{visible:.1%} of boxes")
-    if visible < a.min_visible_frac:
+    if visible < a.min_visible_frac and not keep_classes:
         raise SystemExit(
             f"only {visible:.1%} of boxes are within {FAR_CAMERA_REACH_M:.0f} m of the "
             f"recorded path, under --min_visible_frac {a.min_visible_frac:.0%}. Re-rendering "
