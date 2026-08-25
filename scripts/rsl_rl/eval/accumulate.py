@@ -169,6 +169,10 @@ class EpisodeAccumulator:
         self.min_h = torch.full((self.n,), float("inf"), device=self.device)
         self.max_tilt = z()
         self.first_fall = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
+        # Per-episode tally of what KIND of motion each re-plan produced. Stays all-zero
+        # unless a classifier is attached (the clip arm loads no generator).
+        self.plan_counts = torch.zeros(self.n, 3, device=self.device, dtype=torch.long)
+        self.plan_clf = None
         self.act_rate = z()
         self.act_rate_max = z()
         self.torque_util = z()
@@ -253,6 +257,23 @@ class EpisodeAccumulator:
         crossed = m & (self.first_fall < 0) & (
             (height < self.fall_min_height) | (tilt > self.fall_tilt_rad))
         self.first_fall = torch.where(crossed, self.steps, self.first_fall)
+
+        # -- what kind of motion did the generator just plan? -----------------------------
+        # Gated on a FRESH plan (`_pred_idx == 0`, set on re-plan and advanced one node per
+        # step), so each plan is counted exactly once per env rather than 12 times.
+        if self.plan_clf is not None:
+            idx = getattr(self.cmd, "_pred_idx", None)
+            win = getattr(self.cmd, "_pred_window", None)
+            valid = getattr(self.cmd, "_pred_valid", None)
+            if idx is not None and win is not None:
+                fresh = m & (idx == 0)
+                if valid is not None:
+                    fresh = fresh & valid
+                ids = torch.nonzero(fresh).flatten()
+                if ids.numel():
+                    codes = self.plan_clf.classify(win[ids])
+                    codes = torch.as_tensor(codes, device=self.device, dtype=torch.long)
+                    self.plan_counts[ids, codes] += 1
 
         # -- effort / smoothness ----------------------------------------------------------
         action = self._processed_action()
@@ -406,9 +427,14 @@ class EpisodeAccumulator:
         steps = self.steps[ids].clamp(min=1).to(torch.float32)
         cpu = lambda t: t.detach().to("cpu").numpy()  # noqa: E731
 
+        pc = cpu(self.plan_counts[ids]).astype(np.int64)
         out: dict[str, np.ndarray] = {
             "steps_survived": cpu(self.steps[ids]).astype(np.int64),
             "n_steps_scored": cpu(self.steps[ids]).astype(np.int64),
+            "n_plans": pc.sum(1),
+            "n_plans_flat": pc[:, 0],
+            "n_plans_jump": pc[:, 1],
+            "n_plans_stairs": pc[:, 2],
             "cmd_speed_mean": cpu(self.cmd_speed[ids] / steps),
             "ref_base_ori_mse_rad": cpu(self.ori_sq[ids] / steps),
             "ref_base_ori_max_rad": cpu(self.ori_max[ids]),
@@ -464,6 +490,7 @@ class EpisodeAccumulator:
         self.min_h[ids] = float("inf")
         self.max_tilt[ids] = 0.0
         self.first_fall[ids] = -1
+        self.plan_counts[ids] = 0
         self.act_rate[ids] = 0.0
         self.act_rate_max[ids] = 0.0
         self.torque_util[ids] = 0.0

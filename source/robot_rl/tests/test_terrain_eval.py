@@ -20,6 +20,7 @@ are the seams between them, which is where a silent mistake survives:
 from __future__ import annotations
 
 import pathlib
+import re
 import sys
 
 import numpy as np
@@ -1305,6 +1306,33 @@ def test_tilt_does_not_read_the_lagging_gravity_buffer():
     assert "root_quat_w" in tilt, "tilt must come from the pose buffer the reset writes"
     assert "projected_gravity_b" not in tilt.split('"""')[2], \
         "the lagging buffer must not be read in the body of _tilt"
+
+
+def test_stage_grid_forwards_every_flag_the_cell_stage_reads():
+    """The grid -> cell subprocess boundary silently drops anything not restated.
+
+    ``stage_grid`` builds an explicit argv for each cell, so a flag added to the parser and
+    read by ``stage_cell`` but forgotten here reverts to its argparse DEFAULT in the child,
+    with no error. That has now happened twice: ``--num_envs`` ran a grid at 256 while the
+    manifest recorded 1024, and ``--terrain_ref`` produced 3950 episodes with ``n_plans == 0``.
+    It is also the reason ``fm_tf`` is a reference MODE rather than a flag -- a mode rides in
+    plan.json and cannot be dropped.
+    """
+    src = pathlib.Path(_EVAL / "runner.py").read_text()
+    grid = src.split("def stage_grid")[1]
+    cell = src.split("def stage_cell")[1].split("def stage_grid")[0]
+    forwarded = set(re.findall(r'"--([a-z_]+)"', grid))
+    # Flags the cell stage actually consumes off `args`, minus the ones the grid sets itself.
+    read = set(re.findall(r"args\.([a-z_]+)", cell)) - {"out", "cell", "stage", "force",
+                                                        "dry_run", "cells"}
+    # ``headless`` is an AppLauncher argument the child parses for itself, not a cell
+    # parameter. A heuristic, not a proof: a flag read through getattr() rather than
+    # ``args.x`` is invisible here, so this catches the common shape and not every one.
+    exempt = {"checkpoint", "load_run", "task", "headless"}
+    missing = sorted(r for r in read if r not in forwarded and r not in exempt)
+    assert not missing, (
+        f"stage_cell reads {missing} but stage_grid does not forward them; they will "
+        "silently take their argparse defaults in the subprocess")
 
 
 if __name__ == "__main__":

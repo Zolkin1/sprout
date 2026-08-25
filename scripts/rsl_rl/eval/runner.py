@@ -618,6 +618,16 @@ def stage_cell(args) -> int:
                              cell=cell, env_ref=u, importer=u.scene.terrain, levels=levels)
         u.event_manager.get_term_cfg("reset_on_clip").func = hook
 
+        # Attach the plan classifier, when one was given and a generator is loaded. Never on
+        # the clip arm: there is no plan to classify, and a zero count there is the honest
+        # record rather than a missing column.
+        if getattr(args, "terrain_ref", "") and cell["fm_checkpoint"]:
+            import terrain_class  # noqa: PLC0415
+            accum.plan_clf = terrain_class.TerrainClassifier.load(args.terrain_ref)
+            print(f"[cell] plan classifier: {accum.plan_clf.feats.shape[0]} reference "
+                  f"windows from {args.terrain_ref}. Counts are per RE-PLAN; compare against "
+                  "the open-loop control stairs->jump 0.059 [0.047, 0.071].")
+
         max_steps = int(args.max_steps) or _derived_max_steps(clips, queue, args.num_envs)
         print(f"[cell {key}] rolling: {len(clips)} clips x R={cell['robots_per_clip']} "
               f"= {len(clips) * cell['robots_per_clip']} episodes, {args.num_envs} envs, "
@@ -739,6 +749,13 @@ def stage_grid(args) -> int:
                "--spawn_z_offset", str(args.spawn_z_offset)]
         if args.clip_device:
             cmd += ["--clip_device", args.clip_device]
+        # Forward EVERY flag the cell stage reads. This list is the whole reason `fm_tf` is a
+        # reference MODE and not a flag: anything added here and forgotten reverts silently to
+        # its argparse default in the subprocess. Measured, twice: --num_envs ran a grid at 256
+        # while the manifest recorded 1024, and --terrain_ref produced 3950 episodes with
+        # n_plans == 0 and no error anywhere.
+        if getattr(args, "terrain_ref", ""):
+            cmd += ["--terrain_ref", args.terrain_ref]
         if not args.ood_depth_noise:
             cmd += ["--no-ood_depth_noise"]
         if args.max_steps:

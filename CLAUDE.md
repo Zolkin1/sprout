@@ -389,6 +389,80 @@ Things here that are load-bearing and were each found by a failure:
 - `scripts/rsl_rl/plot_style.py` is the shared paper style (it lives in the PARENT because four
   plotters outside the eval use it, and `import robot_rl.anything` drags in IsaacLab).
   Importing it does not touch `rcParams`; only `apply_paper_style()` does.
+- **A flag added to the parser is NOT forwarded to the cell subprocess unless `stage_grid`
+  restates it.** It reverts to its argparse default in the child, silently. Measured twice:
+  `--num_envs` ran a grid at 256 while the manifest recorded 1024, and `--terrain_ref`
+  produced 3950 episodes with `n_plans == 0` and no error. This is the whole reason `fm_tf`
+  is a reference MODE and not a flag -- a mode rides in `plan.json` and cannot be dropped.
+  Pinned by `test_stage_grid_forwards_every_flag_the_cell_stage_reads` (a heuristic: a flag
+  read via `getattr` is invisible to it).
+- **The derived fall flag once inherited the PREVIOUS episode's orientation.** `_reset_idx`
+  refreshes `root_pos_w`/`root_quat_w` but `projected_gravity_b` lagged, so the first fold of
+  a new episode read the old tilt while reading the new height -- inflating `fell` by a fixed
+  ~18.5% of the PRECEDING fall rate (0.188 generator arm / 0.182 clip arm). Per-step folds now
+  use `root_quat_w`; `fold_terminal` takes `max(quat, gravity)` because inside the reset hook
+  the LAGGING buffer is the correct one. Success rates were never affected -- they come from
+  termination terms, never the accumulator.
+
+## What the harness has established about the depth generator (2026-08-24)
+
+Tracker `2026-08-20_09-04-12_mode11_decor_v1`, generator
+`2026-08-22_12-26-34_mode11_decor_lag48_aug` (epoch 39/100). Clip-averaged, tile-clustered.
+
+- **The generator, not the tracker, is the limit**: fm/train 0.468 against clip/train 0.930,
+  paired delta -0.462 [-0.513, -0.411], p<0.001 over 264 clips.
+- **Exposure bias is largely RULED OUT.** Teacher forcing (`fm_tf`) buys +0.078 overall, but
+  removing `jump_off` drops that to +0.026 and removing both jump_off families to +0.006, with
+  4 of 7 remaining families NEGATIVE. `jump_off` jumps BACKWARDS, which no forward-facing
+  camera can see, so teacher forcing there smuggles in an unobservable -- that family is to be
+  dropped from the eval AND from FM training.
+- **DR is irrelevant**: fm/none 0.495 -> fm/train 0.468, inside the interval. And `dr_preset=none`
+  sets `enable_corruption=False`, so the headline gap was measured with the tracker's
+  reference-window noise OFF; turning on ALL DR costs at most 2.7 points. The tracker is already
+  near-indifferent to i.i.d. jitter, so adding MORE of it is not the lever.
+- **The FM error is structured, and differently per family.** Fraction of window-error energy in
+  {const, const+ramp} over the 13 observed offsets (i.i.d. baseline 1/13=0.077, 2/13=0.154):
+  base_pos 0.49/0.87 on the transition families vs 0.93/0.99 on the `*_pure` ones; `ang_vel` is
+  0.04/0.11, i.e. SUB-white, nothing to model there. Growth from node 0 to node 50 is 5.1x, so
+  the band over-covers the near node and under-covers the far one. The rigid component is
+  under-covered 3.2-4.5x. Any perturbation built for the tracker should ramp with look-ahead and
+  be drawn per re-plan, not per step.
+- **`stairs_dn_pure` is the outlier and is NOT explained by any of the above**: 0.048 closed
+  loop, 0.073 teacher-forced, 0.087 after the lag-ring fix, against a clip ceiling of 0.939.
+  Normalised per tread all four stair families share an ~8-14%/tread hazard, so its 0.048 is
+  25.4 treads of exposure rather than a unique defect. Deprioritised in favour of the four
+  families that matter on hardware: `stairs_up`, `stairs_down`, `jump_on`, `jump_off_front`.
+- **~48% of FM-attributable falls on the transition families happen on FLAT ground**, before the
+  terrain is reached.
+- **The augmentation was VERIFIED SOUND**, not a suspect: the delta-0 self-check's scan residual
+  is exactly 0.0 (the script states a non-zero scan diff at zero offset is what would mean bad
+  placement), and displaced poses were achieved to 0.35 mm / 0.24 deg median. The alarming
+  `frac_gt_1mm = 0.515` is the depth DR being re-drawn.
+
+## Terrain misidentification: real, and CLOSED-LOOP ONLY (`terrain_class.py`)
+
+Field observation: the robot sometimes reads a staircase as a box and plans to jump onto it.
+`terrain_class.py` turns that into a number -- k-NN over a reference set of real clip windows,
+in the generator's own output space, classifying each re-plan flat/jump/stairs. Matched to
+`stairs_up`+`stairs_down`, matched classifier:
+
+| | stairs->jump |
+|---|---|
+| open loop, true clip window (the control) | 0.103 [0.089, 0.121] |
+| open loop, FM prediction | 0.104 [0.084, 0.131] |
+| **closed loop, FM prediction** | **0.174 [0.146, 0.205]** |
+
+So given in-distribution conditioning the generator reads stairs exactly as well as the ground
+truth does; drive it with its own drifted history and depth from a drifted pose and the
+confusion appears. **The fix is on the loop/conditioning side, not "the model cannot see
+stairs".** NEXT: dump the depth image alongside the flagged plans to separate a perception
+failure (the image genuinely looks box-like) from a generation failure (image fine, plan wrong)
+-- the one split this number cannot make.
+
+Build the reference with `terrain_class.py --windows <pred_tgt.npz> --holdout 0 --out ...`;
+pass it to the eval with `--terrain_ref`. **Always read the rate against the control**, never
+as an absolute: the classifier's own stairs->jump confusion is ~0.10 on these families and was
+unstable (0.010 to 0.116) until the reference reached ~12k windows.
 
 # obelisk (ROS2 deploy) — the default run pipeline
 

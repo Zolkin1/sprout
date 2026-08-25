@@ -37,7 +37,7 @@ import numpy as np
 
 #: Bump on any column removal, rename or change of meaning.  The grid refuses to reuse a
 #: cell written under a different major, and the reducer refuses a file it does not know.
-SCHEMA_VERSION: int = 1
+SCHEMA_VERSION: int = 2
 #: Bump on a purely additive column.  A reader may ignore columns it does not know.
 SCHEMA_MINOR: int = 0
 
@@ -113,6 +113,16 @@ EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("cost_of_transport", _F),
     ("foot_slip_dist_m", _F),
     ("foot_contact_frac", _F),
+    # --- what KIND of motion the generator planned (terrain_class.py) -------------------
+    #
+    # One classification per RE-PLAN, counted over the episode. Zero on the clip arm, which
+    # loads no generator. Read as a RATE against the open-loop control measured over 5
+    # by-clip splits -- stairs->jump 0.059 [0.047, 0.071] -- not as an absolute: the
+    # classifier's own confusion is most of any small number here.
+    ("n_plans", _I),             # re-plans classified; the denominator
+    ("n_plans_flat", _I),
+    ("n_plans_jump", _I),
+    ("n_plans_stairs", _I),
 )
 
 EPISODE_COLUMN_NAMES: tuple[str, ...] = tuple(n for n, _ in EPISODE_COLUMNS)

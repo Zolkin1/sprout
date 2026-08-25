@@ -169,6 +169,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "given fall back to the built-in defaults")
 
     g = p.add_argument_group("env")
+    g.add_argument("--terrain_ref", default="",
+                   help="terrain_class.py reference .npz; classifies every FM re-plan as "
+                        "flat/jump/stairs and counts them per episode. Ignored on the clip "
+                        "arm. Empty = off.")
     g.add_argument("--num_envs", type=int, default=256)
     g.add_argument("--num_rows", type=int, default=1)
     g.add_argument("--seed", type=int, default=42)
