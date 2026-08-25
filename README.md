@@ -167,6 +167,24 @@ python scripts/flow_matching/train.py --data <windows.h5> --wandb
 for the older buffered per-step `.npz`. `command_distribution_stats.py` reports the
 command-dynamics split of either format.
 
+**Two families are excluded from FM training by default**, both because the generator cannot
+be asked to predict what it cannot see:
+
+* `--skip_distractors` (on) drops the distractor windows;
+* `--skip_families family_jump_off` (on) drops the BACKWARDS jump-off-a-box family. The robot
+  has two forward-facing depth cameras and nothing behind, so the drop it steps off is not
+  observable. `family_jump_off_FRONT` is the forward dismount, is observable, and is kept.
+
+Both are train-time switches — every window carries its family and its distractor tag, so
+A/B-ing either costs no re-record. `--skip_families ""` trains on everything. A family you
+NAME must exist in the recording (a typo would otherwise drop nothing, which reads as
+success); a family carried only by the default is skipped where absent with a printed line,
+because a flat-only library has no terrain manifest and therefore no family table at all.
+
+Note the two flags spell the same family differently and deliberately: `--skip_families`
+wants the recording's own `family_names` entry (`family_jump_off`), while the eval harness's
+`--exclude_families` normalizes (`jump_off`). The raw names are what the recording records.
+
 **What a recording contains is a choice, not an accident.** Three knobs decide it, and the
 defaults are the ones a dataset wants rather than the ones training wants:
 

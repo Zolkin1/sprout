@@ -9,6 +9,7 @@ commanded-velocity profile, generating a future trajectory in the current root f
 """
 
 from .config import (
+    DEFAULT_SKIP_FAMILIES,
     DEPTH_LATENCY_PROBS,
     ATTENTION_MODES,
     EXTERO_CLIP,
@@ -27,6 +28,7 @@ from .extero_encoder import (
 from .dataset import (
     FutureStateDataset,
     build_train_val,
+    resolve_skip_families,
     resolve_term_slice,
     snap_windows,
 )
@@ -81,6 +83,7 @@ from .window import (
 )
 
 __all__ = [
+    "DEFAULT_SKIP_FAMILIES",
     "DEPTH_LATENCY_PROBS",
     "FlowMatchingConfig",
     "WeightEMA",
@@ -98,6 +101,7 @@ __all__ = [
     "snap_windows",
     "Normalizer",
     "build_train_val",
+    "resolve_skip_families",
     "resolve_term_slice",
     "FKChain",
     "flow_matching_loss",

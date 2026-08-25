@@ -43,6 +43,7 @@ from provenance import dump_params_yaml, git_snapshot, sha256_file  # noqa: E402
 
 from robot_rl.flow_matching import (  # noqa: E402
     FKChain,
+    DEFAULT_SKIP_FAMILIES,
     DEPTH_LATENCY_PROBS,
     FlowMatchingConfig,
     ATTENTION_MODES,
@@ -52,6 +53,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     FlowMatchingTransformer,
     FutureStateDataset,
     build_train_val,
+    resolve_skip_families,
     flow_matching_loss,
     pinned_axis_split,
     sample_flow_batch,
@@ -384,13 +386,19 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--fk_model_path", type=str, default=FlowMatchingConfig().fk_model_path,
                         help="MuJoCo MJCF defining the kinematics for the FK losses (repo-relative).")
     parser.add_argument(
-        "--skip_families", type=str, default=None,
+        # Rendered from the constant, never restated: a default declared in two places is a
+        # default that drifts, and test_train_cli_defaults pins that this parser does not
+        # shadow any config default.
+        "--skip_families", type=str, default=",".join(DEFAULT_SKIP_FAMILIES),
         help="Comma-separated clip FAMILIES to drop (see the recording's family_names, e.g. "
              "'family_jump_off'). A train-time switch like --skip_distractors: the recording "
-             "tags every window with its family, so A/B-ing one costs no re-record. The case "
-             "this exists for is family_jump_off -- the BACKWARDS jump-off-a-box family, "
-             "which the forward-facing depth cameras cannot observe at all. Errors if the "
-             "recording predates the tag or a named family is not in it.",
+             "tags every window with its family, so A/B-ing one costs no re-record. DEFAULTS "
+             f"to '{','.join(DEFAULT_SKIP_FAMILIES)}' -- the BACKWARDS jump-off-a-box family, "
+             "which the two forward-facing depth cameras cannot observe at all (jump_off_FRONT "
+             "is observable and is NOT dropped). Pass '' to train on everything. A family you "
+             "NAME here must exist in the recording (a typo would otherwise read as success); "
+             "a family carried only by the default is skipped where absent, with a printed "
+             "line, because a flat-only recording has no family table at all.",
     )
     parser.add_argument(
         "--transition_fraction", type=float, default=_wc.transition_fraction,
@@ -471,8 +479,9 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         body_pose_ori_scale=args.body_pose_ori_scale,
         consistency_tau_min=args.consistency_tau_min, fk_model_path=args.fk_model_path,
         skip_distractors=args.skip_distractors,
-        skip_families=([f.strip() for f in args.skip_families.split(",") if f.strip()]
-                       if args.skip_families else None),
+        # "" is an explicit EMPTY selection ("train on everything"), not "unset" -- so it
+        # must not fall through to the dataclass default, which is why this is [] and not None.
+        skip_families=[f.strip() for f in (args.skip_families or "").split(",") if f.strip()],
         transition_fraction=args.transition_fraction,
         clip_library_path=args.clip_library_path,
         batch_size=args.batch_size, lr=args.lr, weight_decay=args.weight_decay,
@@ -831,9 +840,11 @@ def main() -> None:
     # an explicit --cmd_array / --target_source always wins).
     cfg.cmd_array = _resolve_cmd_array(cfg.cmd_array, data)
     cfg.target_source = _resolve_target_source(cfg.target_source, data)
+    cfg.skip_families = _resolve_skip_families(cfg.skip_families, meta)
     # Control dt for the consistency finite differences: --dt wins, else the recording's.
     cfg.dt = float(args.dt) if args.dt is not None else float(meta.dt)
-    print(f"[auto] target_source={cfg.target_source}, cmd_array={cfg.cmd_array or 'none'}")
+    print(f"[auto] target_source={cfg.target_source}, cmd_array={cfg.cmd_array or 'none'}, "
+          f"skip_families={cfg.skip_families or 'none'}")
     train_ds, val_ds = build_train_val(data, meta, cfg)
     num_joints = train_ds.num_joints
     print(f"[INFO] window blocks={list(train_ds.blocks)} -> {cfg.state_dim}/node "
@@ -1224,6 +1235,34 @@ def _resolve_data_path(path: str) -> str:
             raise FileNotFoundError(f"No recorded_*.npz/.h5 found under directory: {path}")
         return max(cands, key=os.path.getmtime)
     raise FileNotFoundError(f"--data not found: {path}")
+
+
+def _resolve_skip_families(value: list[str], meta) -> list[str]:
+    """Cut the requested family-exclusion list down to what this recording actually carries.
+
+    The rule itself lives in :func:`~robot_rl.flow_matching.dataset.resolve_skip_families`,
+    because ``build_train_val`` is a library entry point that the probes, the composer and
+    the tests all reach without coming through here. This wrapper exists for two things the
+    mask cannot do: it PRINTS the absent names once at startup rather than deep in a data
+    pass, and it writes the resolved list back onto the config -- so the run's saved
+    ``fm_config.yaml`` records what was actually dropped rather than what was asked for.
+
+    Args:
+        value: The requested family names (already parsed from the CLI).
+        meta: Recording layout metadata; ``family_names`` is read.
+
+    Returns:
+        The subset of ``value`` present in the recording, in the requested order.
+
+    Raises:
+        ValueError: If a name outside the default set is absent from the recording.
+    """
+    kept, absent = resolve_skip_families(value, list(getattr(meta, "family_names", []) or []))
+    if absent:
+        print(f"[auto] --skip_families {absent}: not in this recording "
+              f"({list(getattr(meta, 'family_names', []) or []) or 'no family table'}); "
+              "nothing to drop for them.")
+    return kept
 
 
 def _resolve_cmd_array(value, data) -> str | None:

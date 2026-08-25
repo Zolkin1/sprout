@@ -89,6 +89,23 @@ EXTERO_NORM_MODES: tuple[str, ...] = ("contract", "per_channel", "per_sensor", "
 #: prints the band it resolved.
 EXTERO_CLIP: dict[str, float] = {"height_scan": 1.0, "depth": 5.575}
 
+#: Clip families dropped from FM training unless the caller says otherwise
+#: (:attr:`FlowMatchingConfig.skip_families`).
+#:
+#: ``family_jump_off`` is the BACKWARDS jump-off-a-box family. The robot has two
+#: FORWARD-facing depth cameras and nothing behind, so the drop it is stepping off is not
+#: observable at all -- those windows ask the generator to predict something it cannot see.
+#: The eval harness measured them contaminating the exposure-bias diagnostic as well: teacher
+#: forcing buys +0.078 overall, +0.026 with ``jump_off`` removed and +0.006 with both jump
+#: families removed.
+#:
+#: ``family_jump_off_front`` is the FORWARD dismount and IS observable. Do not add it here.
+#:
+#: A name in this default is a REQUEST -- drop it where it exists, say so where it does not.
+#: A name the caller typed is an ASSERTION and is enforced; see ``train.py``'s
+#: ``_resolve_skip_families``.
+DEFAULT_SKIP_FAMILIES: tuple[str, ...] = ("family_jump_off",)
+
 #: Recognised :attr:`FlowMatchingConfig.attention_mode` values.
 ATTENTION_MODES: tuple[str, ...] = ("full", "prefix")
 
@@ -234,12 +251,18 @@ class FlowMatchingConfig:
     # same reason skip_distractors is one: the recording tags every window with its family,
     # so A/B-ing a family costs no re-record.
     #
-    # The case this exists for: "family_jump_off" is the BACKWARDS jump-off-a-box family, and
-    # the depth cameras face forward -- the drop behind the robot is not observable, so those
-    # windows ask the generator to predict something it cannot see. Errors (rather than
-    # silently training on them) if the recording predates the tag, or if a named family is
-    # not in the recording at all -- a typo would otherwise read as "nothing to drop".
-    skip_families: list[str] | None = None
+    # Defaults to DEFAULT_SKIP_FAMILIES -- see there for why jump_off is unobservable. A
+    # CONCRETE list rather than None, so the saved config states exactly what was dropped and
+    # a later change to the default cannot silently re-resolve an old checkpoint (the trap
+    # ``extero_clip=None`` already walked into once).
+    #
+    # Strictness is asymmetric, and train.py's ``_resolve_skip_families`` is where it lives:
+    # a DEFAULTED name that the recording does not carry prints a line and drops nothing (a
+    # flat-only library has no family table at all, and refusing to train on one would be
+    # wrong); a name the caller TYPED must be present, because a typo would otherwise read as
+    # "nothing to drop", i.e. as success. Dropping every window is an error either way.
+    # ``--skip_families ""`` is the off switch.
+    skip_families: list[str] = field(default_factory=lambda: list(DEFAULT_SKIP_FAMILIES))
 
     # Oversample windows that CROSS a terrain transition until they are this fraction of each
     # training epoch (e.g. 0.5). ``None`` = natural distribution, which on the v5 library is
@@ -1163,4 +1186,14 @@ class FlowMatchingConfig:
         # full-attention, so an absent key must resolve to "full" and never to the current
         # default -- which is exactly the mistake this file has now recorded three times.
         kwargs.setdefault("attention_mode", "full")
+        # A FOURTH instance of the same trap, and the reason it is spelled out again: a
+        # checkpoint written before jump_off became a default exclusion carries
+        # ``skip_families: null``, which MEANT "drop nothing". Letting that resolve to the
+        # current default would restate, as a property of that checkpoint, a decision taken
+        # after it was trained -- and its saved config is the only record of what its data
+        # actually contained. An ABSENT key gets the same reading for the same reason.
+        # Unlike the three above this cannot corrupt inference (nothing off-line reads it),
+        # but it is the sole provenance of a training set, so it must not drift.
+        if kwargs.get("skip_families") is None:
+            kwargs["skip_families"] = [] if "skip_families" in renamed else list(DEFAULT_SKIP_FAMILIES)
         return cls(**kwargs)

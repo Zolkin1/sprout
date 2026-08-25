@@ -466,6 +466,66 @@ rewritten offline while the motion stays exactly as recorded, which is what the 
   `transforms_np.py` is now tested against the real `robot_rl.flow_matching.transforms`
   (`importorskip`-guarded, so that half skips without IsaacSim).
 
+# NOTHING IN THIS STACK AVOIDS OBSTACLES, and that is deliberate
+
+There is no obstacle term anywhere in the MDP -- no reward, no observation, no termination.
+The tracker follows a reference; the generator predicts a reference from depth and a command.
+Neither plans around anything. `decorate.py`'s `wall_collidable: bool = False` records the
+measured reason a wall is visual-only: a collidable wall the reference's arm sweeps through
+blocks a wrist, fires `ee_pose_error` at 0.3 m and ends the episode for a reason the policy
+cannot fix, and `undesired_contacts` at -0.1 against `clf_reward` at 10 is far too weak to
+teach avoidance.
+
+So "the robot walked at a wall" is partly CORRECT behaviour and is not a bug to fix here.
+What is a real fault is the robot planning a JUMP or a CLIMB at one -- that is a
+classification failure, and `scripts/rsl_rl/eval/terrain_class.py` is the instrument for it.
+Keep the two apart: obstacle avoidance is an operator-level or planner-level concern that
+this stack does not have and should not grow by accident.
+
+# Two families are excluded from FM training BY DEFAULT
+
+Both because the generator cannot be asked to predict what it cannot see, and both are
+train-time switches, so A/B-ing either costs no re-record:
+
+- `skip_distractors` (True) -- the distractor windows.
+- `skip_families` (`DEFAULT_SKIP_FAMILIES` = `["family_jump_off"]`) -- the BACKWARDS
+  jump-off-a-box family. Two forward-facing cameras and nothing behind. `family_jump_off_FRONT`
+  is the forward dismount, IS observable, and is NOT dropped -- do not add it by reflex.
+  The eval harness measured those windows contaminating the exposure-bias diagnostic as well:
+  teacher forcing buys +0.078 overall, +0.026 with `jump_off` removed, +0.006 with both jump
+  families removed.
+
+**Strictness is asymmetric BY NAME, and the rule lives in
+`dataset.resolve_skip_families`** -- not in `train.py` -- because `build_train_val` is a
+library entry point the probes, the composer and the tests all reach directly, and a default
+that hard-failed every table-less recording would break all of them. A name in the DEFAULT set
+is a standing REQUEST (drop it where it exists, print a line where it does not); any other name
+was TYPED and its absence is a typo, which raises, because dropping nothing would read as
+success. Dropping every window raises either way. `--skip_families ""` is the off switch, and
+`test_the_family_exclusion_is_reachable_in_both_directions` pins that it is reachable.
+
+The absent case is NOT only stale recordings: a flat-only library has no terrain manifest, so
+`record_data._clip_family_codes` writes no family table at all, and a perfectly current flat
+recording legitimately carries no families to name.
+
+**`from_dict` maps a stored `skip_families: null` to `[]`, never to the default.** That value
+MEANT "drop nothing", and a checkpoint's saved config is the only record of what its training
+set contained -- letting it re-resolve would restate a later decision as a property of an
+earlier run. This is the FOURTH instance of that trap in this file (`extero_source`,
+`extero_encoder`, `attention_mode`, now this), and the only one that cannot corrupt inference.
+
+The legacy per-step `.npz` path applies NEITHER filter, and needs no guard saying so:
+`_build_train_val_windowed` already refuses any recording whose `history_anchor` is not
+`"plan"`, and a per-step recording has none, so the format is rejected outright and for a
+stronger reason.
+
+**The two exclusion flags spell the same family differently, deliberately.**
+`train.py --skip_families` wants the recording's own `family_names` entry
+(`family_jump_off`); the eval harness's `evaluate.py --exclude_families` normalizes
+(`jump_off`, via `sampler.normalize_family`). Do not unify them -- the raw names are what the
+recording records. The harness's exclusion is a FLAG rather than a hardcode on purpose: a
+family you can no longer measure is a family you can no longer make a decision about.
+
 # The evaluation harness (`scripts/rsl_rl/eval/`)
 
 `evaluate.py --stage plan|cell|grid` then `report.py <run> [<run> ...]`. Stages share one

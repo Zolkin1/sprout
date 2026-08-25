@@ -1862,6 +1862,12 @@ def build_train_val(
     # Pre-formed windowed (.h5) recordings skip the snap_windows pass entirely.
     if "history_state" in data:
         return _build_train_val_windowed(data, meta, cfg)
+    # No window-filter guard is needed on this legacy per-step path, though it looks like it
+    # wants one: both filters live in the WINDOWED branch, so a per-step recording would
+    # silently ignore skip_distractors / skip_families. It cannot get that far --
+    # _build_train_val_windowed refuses any recording whose history_anchor is not "plan", and
+    # a per-step recording has no history_anchor at all, so the format is already rejected
+    # outright and for a stronger reason. A second gate here would only shadow that message.
     reanchor = data.get("reanchor_active")
     if reanchor is None:
         raise ValueError(
@@ -1954,6 +1960,46 @@ def _distractor_keep_mask(
     return ~tag
 
 
+def resolve_skip_families(wanted: list[str], have: list[str]) -> tuple[list[str], list[str]]:
+    """Split a requested family-exclusion list into (present, absent), raising on a typo.
+
+    Strictness is asymmetric BY NAME, which is what lets the rule live here rather than in
+    whichever caller happens to know how the list was spelled. A name in
+    :data:`~robot_rl.flow_matching.config.DEFAULT_SKIP_FAMILIES` is a standing REQUEST --
+    "drop the backwards jump-off windows wherever they exist" -- and a recording that has
+    none of them is not an error. Any OTHER name was typed by a caller who believes it is
+    there, so its absence is a typo, and silently dropping nothing would read as success.
+
+    The absent case is not just stale recordings. A flat-only library has no terrain
+    manifest, so ``record_data._clip_family_codes`` writes no family table at all -- a
+    perfectly current flat recording legitimately carries no families to name.
+
+    Args:
+        wanted: Requested family names.
+        have: The recording's own ``family_names`` (empty when it carries no table).
+
+    Returns:
+        ``(present, absent)``, both in the requested order.
+
+    Raises:
+        ValueError: If a name outside the default set is absent from the recording.
+    """
+    from .config import DEFAULT_SKIP_FAMILIES
+
+    wanted = [f for f in (wanted or []) if f]
+    have = list(have or [])
+    absent = [f for f in wanted if f not in have]
+    typo = [f for f in absent if f not in DEFAULT_SKIP_FAMILIES]
+    if typo:
+        listing = have or "(none -- no family table, which is what a flat-only library gives)"
+        raise ValueError(
+            f"--skip_families named {typo}, which this recording does not contain. Its "
+            f"families are {listing}. A typo here would silently drop nothing, which reads "
+            "as success."
+        )
+    return [f for f in wanted if f in have], absent
+
+
 def _family_keep_mask(
     data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig, num_windows: int
 ) -> np.ndarray | None:
@@ -1970,31 +2016,31 @@ def _family_keep_mask(
         num_windows: ``W``, for validating the tag's length.
 
     Returns:
-        ``(W,)`` bool array (True = keep), or ``None`` when nothing is requested.
+        ``(W,)`` bool array (True = keep), or ``None`` when nothing is requested and when
+        nothing requested is present (a flat-only recording under the default).
 
     Raises:
-        ValueError: If the recording predates the tag, a named family is absent from it, or
-            the filter would drop every window. Each of those would otherwise look like a
-            successful no-op.
+        ValueError: If a family the caller NAMED is absent (see
+            :func:`resolve_skip_families` for why a defaulted name is not), if the tag's
+            length disagrees with ``num_windows``, or if the filter would drop every window.
+            Each of those would otherwise look like a successful no-op.
     """
-    wanted = [f for f in (cfg.skip_families or []) if f]
-    if not wanted:
+    requested = [f for f in (cfg.skip_families or []) if f]
+    if not requested:
         return None
     codes = data.get("clip_family")
     names = list(getattr(meta, "family_names", []) or [])
-    if codes is None or not names:
-        raise ValueError(
-            f"--skip_families {wanted} needs the per-window 'clip_family' tag and the "
-            "recording's family_names; this recording predates them. Re-record with the "
-            "current record_data.py (it writes both unconditionally), or drop the flag -- "
-            "silently training on those families would misreport what was excluded."
-        )
-    unknown = [f for f in wanted if f not in names]
-    if unknown:
-        raise ValueError(
-            f"--skip_families named {unknown}, which this recording does not contain. Its "
-            f"families are {names}. A typo here would silently drop nothing."
-        )
+    # A name only the DEFAULT asks for is dropped where it exists and reported where it does
+    # not; a name a caller typed must be there. Applied here rather than only in train.py
+    # because build_train_val is a library entry point -- the probes, the composer and the
+    # tests all reach it directly, and a default that hard-failed every table-less recording
+    # would break all of them.
+    wanted, absent = resolve_skip_families(requested, names if codes is not None else [])
+    if absent:
+        print(f"[fm-data] --skip_families {absent}: not in this recording "
+              f"({names or 'no family table'}); nothing to drop for them.")
+    if not wanted:
+        return None
     codes = np.asarray(codes).reshape(-1).astype(np.int64)
     if codes.shape[0] != num_windows:
         raise ValueError(

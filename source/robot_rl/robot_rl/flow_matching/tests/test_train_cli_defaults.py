@@ -138,8 +138,27 @@ def test_the_shipped_depth_architecture_survives_the_command_line():
     assert cfg.fk_pose_weight == pytest.approx(0.0)
     assert cfg.joint_vel_consistency_weight == pytest.approx(0.0)
     assert cfg.skip_distractors is True
+    assert cfg.skip_families == ["family_jump_off"]      # backwards dismount, unobservable
     assert cfg.attention_mode == "prefix"
     assert cfg.num_epochs == 100
+
+
+def test_the_family_exclusion_is_reachable_in_both_directions():
+    """The default drops jump_off, and ``--skip_families ""`` gets everything back.
+
+    An off position that cannot be typed is not a default, it is a hardcode -- the same
+    reason ``--skip_distractors`` is a ``BooleanOptionalAction``. Empty string rather than
+    omitting the flag, because omitting it IS the default.
+    """
+    train = _train_module()
+    with mock.patch.object(sys, "argv", ["train.py", "--data", "x.h5"]):
+        assert train.parse_args()[0].skip_families == ["family_jump_off"]
+    with mock.patch.object(sys, "argv", ["train.py", "--data", "x.h5", "--skip_families", ""]):
+        assert train.parse_args()[0].skip_families == []
+    with mock.patch.object(
+        sys, "argv", ["train.py", "--data", "x.h5", "--skip_families", "a, b"]
+    ):
+        assert train.parse_args()[0].skip_families == ["a", "b"]
 
 
 def test_the_declared_xyz_constants_are_settable_from_the_command_line():
