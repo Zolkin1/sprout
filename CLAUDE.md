@@ -805,6 +805,38 @@ be able to read impossibly small. `fm_plan` and `ctrl` are silent while `armed: 
 the depth topic read +273 ms. Only the difference means anything. The controller's own
 `depth_capture_age` is the number, and it is in the bag.
 
+## THE PAIR DROVE THE ROBOT (2026-08-25) — first armed hardware run, and it worked
+
+The whole stack ran end to end on the real G1, on the first attempt: ZED pair over the ssh
+link, the perceptive generator and the tracker on the brain, the C++ controller commanding the
+motors. Everything above this line is bring-up; this is the first time any of it was ARMED.
+
+What was actually tested, and nothing beyond it:
+- **Flat ground: standing, and walking forwards, backwards and turning.** All fine.
+- **A box jump-up: it got onto the box but stumbled at the top.**
+- **Stairs: NOT tested.** Neither up nor down.
+
+So the claim this supports is "the deployed pair walks on flat ground and can climb a box",
+and specifically not that terrain works. The stumble at the top of the box is the first real
+hardware finding and is unexplained.
+
+It is worth being clear about what this does and does not vindicate. The stack had been run in
+the obelisk sim for weeks; what had never been exercised was the ROBOT half -- the driver, the
+motors, the real cameras, the real IMU -- and that is the part that worked first time. The
+three defects in "The first REAL hardware run" above were all in that half and were all found
+unarmed, which is why this run had none left to find.
+
+The 3-DoF waist rode along untested-in-anger and was fine: this is also the first policy
+deployed with `fixed_waist: false`, i.e. with `waist_roll` and `waist_pitch` actually driven.
+The driver's own ordering (`joint_names_` = the 27-DoF set then the two extra waist joints)
+matches `default_joint_names` exactly, and every command path is matched BY NAME, so nothing
+here depended on the two orders agreeing -- but the `user_pose` array does, and it is indexed
+by position in `default_joint_names` (`user_pose_[def_ind]` in `g1_interface.h`), which is why
+waist roll and pitch are its LAST two entries.
+
+The pair that did it: tracker `2026-08-20_16-36-10_mode11_decor_plan_v1`, generator
+`2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx`.
+
 ## The obelisk SIM applies the MJCF's PD gains, and they were STALE (fixed 2026-08-24)
 
 The tracker fell in the obelisk sim on motions MuJoCo sim2sim walked through cleanly, and the
