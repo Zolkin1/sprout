@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 import numpy as np
 import onnxruntime as ort
 
-from .depth_obs import sanitize_extero_np
+from .depth_obs import sanitize_extero_np, sanitize_extero_row_np
 from .scan_obs import parse_extero_spec
 from .tracker_session import make_session
 from .window_np import REFERENCE_WINDOW_BLOCK_NAMES, window_blocks, window_dim
@@ -117,6 +117,16 @@ class FmContext:
     ``GenTrackerPolicy`` must use the same ``fm_update_every``: the horizon ``F`` is sized
     from this period. ``None`` for a graph exported before the field existed."""
 
+    binding: object | None = None
+    """IoBinding holding the captured graph's fixed device buffers, or None when capture is off.
+
+    Its presence is what :func:`sample_window` switches on. See :func:`enable_cuda_graph`.
+    """
+    device_inputs: dict = field(default_factory=dict)
+    """Name -> device ``OrtValue`` bound as an input. Written IN PLACE, never rebound."""
+    device_output: object | None = None
+    """Device ``OrtValue`` bound as the output."""
+
     @property
     def extero_flat_dim(self) -> int:
         """Flat width of the exteroception input, ``extero_sensor_count * extero_sensor_dim``."""
@@ -199,9 +209,67 @@ def _check_state_layout(onnx_path: str, meta: dict) -> tuple[str, ...]:
     return names
 
 
-def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmContext:
-    """Load ``fm.onnx`` and parse its ``fm_meta`` metadata into an :class:`FmContext`."""
-    sess = make_session(onnx_path, num_threads, providers)
+def _parse_extero_shape(onnx_path: str, m: dict, sess) -> tuple[int, int]:
+    """Resolve ``(extero_tokens, height_dim)`` from ``fm_meta``, under either key spelling.
+
+    The exporter renamed these when the per-camera CNN encoder landed: what used to be one
+    flat ``extero_tokens`` x ``height_dim`` row is now described as ``extero_sensor_count``
+    sensors of ``extero_sensor_dim`` each. Only the NAMES moved. The graph input is the same
+    flat ``(V, count*dim)`` row of raw readings in camera order, because the encoder -- MLP or
+    CNN -- and the attention mask are both INSIDE the graph. A CNN checkpoint additionally
+    reports ``extero_tokens_per_sensor`` (how many tokens the encoder emits into the
+    transformer), which is an internal detail this runtime neither sees nor needs.
+
+    Read both spellings rather than only the new one: the deployed artifacts are a mix, and an
+    old fm.onnx must keep loading.
+
+    The width is then checked against the GRAPH, which is what makes accepting the second
+    spelling safe rather than a guess -- if a future export ever changes the actual contract
+    instead of its description, this raises here rather than silently feeding the model a row
+    it will happily consume and misinterpret.
+
+    Args:
+        onnx_path: Path, for error messages.
+        m: The parsed ``fm_meta`` mapping.
+        sess: The live onnxruntime session, for the declared input width.
+
+    Returns:
+        ``(extero_tokens, height_dim)`` whose product is the graph's ``extero`` input width.
+
+    Raises:
+        ValueError: If the metadata's product disagrees with the graph's declared width.
+    """
+    if "extero_sensor_count" in m:
+        tokens = int(m["extero_sensor_count"])
+        dim = int(m.get("extero_sensor_dim", m.get("height_dim", 1)))
+    else:
+        tokens = int(m.get("extero_tokens", 1))
+        dim = int(m.get("height_dim", 1))
+
+    declared = next((i for i in sess.get_inputs() if i.name == "extero"), None)
+    if declared is not None and isinstance(declared.shape[-1], int):
+        if tokens * dim != declared.shape[-1]:
+            raise ValueError(
+                f"{onnx_path}: fm_meta describes exteroception as {tokens} x {dim} = "
+                f"{tokens * dim} values, but the graph's 'extero' input is "
+                f"{declared.shape[-1]} wide. The metadata does not describe this model."
+            )
+    return tokens, dim
+
+
+def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None,
+                    cuda_graph: bool = False) -> FmContext:
+    """Load ``fm.onnx`` and parse its ``fm_meta`` metadata into an :class:`FmContext`.
+
+    Args:
+        onnx_path: Path to the exported generator.
+        num_threads: Intra-op threads (CPU side only).
+        providers: Execution providers; see ``tracker_session.resolve_providers``.
+        cuda_graph: Capture the generator's launch sequence once and replay it. Needs a CUDA
+            provider and a fixed-batch graph; see :func:`enable_cuda_graph` for what it buys
+            and what it refuses.
+    """
+    sess = make_session(onnx_path, num_threads, providers, cuda_graph=cuda_graph)
     raw = sess.get_modelmeta().custom_metadata_map
     if "fm_meta" not in raw:
         raise ValueError(f"{onnx_path} has no 'fm_meta' metadata; re-export with metadata.")
@@ -241,15 +309,22 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
     # because the history is the runtime's own last output rather than a measured state it
     # would have to estimate.
     blocks = _check_state_layout(onnx_path, m)
-    return FmContext(
+    extero_tokens, height_dim = _parse_extero_shape(onnx_path, m, sess)
+    ctx = FmContext(
         sess=sess, N=m["N"], F=m["F"], D=m["D"], nj=m["nj"],
         reference_blocks=blocks,
         target_num_extra_frames=len(m["target_frame_names"]),
         num_steps=m["num_steps"], cmd_dim=m["cmd_dim"],
         cmd_steps=list(m["cmd_steps"]), num_cmd_tokens=m["num_cmd_tokens"],
         joint_names=list(m["joint_names"]), target_frame_names=list(m["target_frame_names"]),
-        extero_sensor_dim=int(m["extero_sensor_dim"]),
-        extero_source=source, extero_sensor_count=int(m["extero_sensor_count"]),
+        # From _parse_extero_shape, not read off ``m`` directly. The stale-key refusal above
+        # already rejects a pre-rename graph, so the either-spelling branch is unreachable --
+        # what this keeps is that helper's WIDTH CROSS-CHECK against the graph's declared
+        # 'extero' input, which is the one thing here that catches metadata not describing the
+        # model it ships with. Reading ``m`` directly would also KeyError, rather than say so,
+        # on a graph carrying neither spelling.
+        extero_sensor_dim=height_dim,
+        extero_source=source, extero_sensor_count=extero_tokens,
         # Parsed by the contract's OWN source: the same field holds a camera pair for one
         # checkpoint and a ray grid for another. It used to go through the depth parser
         # unconditionally, so a scan-conditioned graph was refused at load for "missing
@@ -276,6 +351,67 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None) -> FmC
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
         has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),
     )
+    if cuda_graph:
+        enable_cuda_graph(ctx, onnx_path)
+    return ctx
+
+
+def enable_cuda_graph(ctx: FmContext, onnx_path: str = "fm.onnx") -> None:
+    """Bind fixed device buffers for ``ctx``'s graph and record the launch sequence.
+
+    **Why.** At the deploy batch of 1 the generator is ~3000 kernels for one plan and
+    onnxruntime is LAUNCH-bound, so wall time tracks the kernel count rather than the FLOPs.
+    Replaying the whole sequence as one submission measured 9.8 -> 8.3 ms per re-plan on an
+    RTX 4070 and 19.3 -> 14-15 ms on a Jetson Thor.
+
+    **The part that bites.** A captured graph holds raw DEVICE POINTERS, and every way of
+    getting new data to it except "copy into the same buffers" fails SILENTLY. Measured, not
+    assumed (``tests/test_fm_cuda_graph.py``):
+
+    * ``sess.run()`` on a capture-enabled session returns an EMPTY output list from the second
+      call onward;
+    * ``bind_cpu_input`` with fresh arrays each call returns garbage;
+    * even mutating one bound host array in place returns the FIRST call's answer forever,
+      bit-identical to it, because the host-to-device copy is itself inside the capture.
+
+    That last one is the dangerous shape: on a walking robot, "the plan stopped responding to
+    the cameras" looks exactly like a generator whose conditioning has not moved. So the
+    inputs live in device ``OrtValue``s written through ``update_inplace``, and this is the
+    only supported way to feed the graph once it is on.
+
+    Args:
+        ctx: Context whose ``sess`` was created with ``cuda_graph=True``.
+        onnx_path: Only for the error message.
+
+    Raises:
+        RuntimeError: If the session is not actually on CUDA, which would make the capture
+            either absent or a lie.
+    """
+    import onnxruntime as ort                                          # noqa: PLC0415
+
+    if "CUDAExecutionProvider" not in ctx.sess.get_providers():
+        raise RuntimeError(
+            f"{onnx_path}: CUDA Graph capture was requested but the session is running on "
+            f"{ctx.sess.get_providers()}. Capture is a CUDA feature; there is nothing to "
+            "capture on the CPU."
+        )
+    names = [i.name for i in ctx.sess.get_inputs()]
+    ctx.binding = ctx.sess.io_binding()
+    for i in ctx.sess.get_inputs():
+        shape = [1 if not isinstance(d, int) or d < 0 else d for d in i.shape]
+        val = ort.OrtValue.ortvalue_from_numpy(np.zeros(shape, np.float32), "cuda", 0)
+        ctx.device_inputs[i.name] = val
+        ctx.binding.bind_ortvalue_input(i.name, val)
+    out = ctx.sess.get_outputs()[0]
+    out_shape = [1 if not isinstance(d, int) or d < 0 else d for d in out.shape]
+    ctx.device_output = ort.OrtValue.ortvalue_from_numpy(np.zeros(out_shape, np.float32),
+                                                         "cuda", 0)
+    ctx.binding.bind_ortvalue_output(out.name, ctx.device_output)
+    # Record now, on zeros, rather than on the first live plan: the capture run is far more
+    # expensive than a replay and must not land on a control tick.
+    ctx.sess.run_with_iobinding(ctx.binding)
+    print(f"[INFO fm_session] CUDA Graph captured for {onnx_path} "
+          f"({len(names)} inputs bound to fixed device buffers)")
 
 
 def build_history_tokens(ctx: FmContext, nodes: np.ndarray) -> np.ndarray:
@@ -362,7 +498,11 @@ def build_extero_tokens(ctx: FmContext, values: np.ndarray) -> np.ndarray:
     # Missed rays / bad sensor reads arrive as +/-inf or NaN; the fm.onnx graph folds in
     # the normalization, so a non-finite value here would poison it. The band is
     # per-source: metres for the scan, normalised units for depth.
-    return sanitize_extero_np(flat, ctx.extero_source, clip=ctx.extero_clip)
+    # Channel-aware: the band binds the DEPTH channel only. Sanitising the whole row clamped
+    # the position channels to a depth band -- see sanitize_extero_row_np for what that cost.
+    return sanitize_extero_row_np(flat, ctx.extero_source, ctx.extero_clip,
+                                  max(int(getattr(ctx, "extero_sensor_count", 1) or 1), 1),
+                                  max(int(getattr(ctx, "extero_channels", 1) or 1), 1))
 
 
 def build_cmd_tokens(ctx: FmContext, future_cmd: np.ndarray) -> np.ndarray:
@@ -418,4 +558,12 @@ def sample_window(ctx: FmContext, history, extero, cmd_tokens, noise, history_nu
                   "null-history embedding cannot be used; the generator will condition on a "
                   "not-yet-full history window. Re-export with export_fm_onnx.py.")
             _WARNED_NO_NULL = True
-    return ctx.sess.run(["trajectory"], feed)[0].astype(np.float64)  # (V, F, D)
+    if ctx.binding is None:
+        return ctx.sess.run(["trajectory"], feed)[0].astype(np.float64)  # (V, F, D)
+    # Capture path: copy INTO the bound device buffers, never rebind. `update_inplace` keeps
+    # the device address the capture recorded; binding a fresh OrtValue would leave the replay
+    # reading the old one and returning the previous plan forever, with no error.
+    for name, arr in feed.items():
+        ctx.device_inputs[name].update_inplace(np.ascontiguousarray(arr))
+    ctx.sess.run_with_iobinding(ctx.binding)
+    return ctx.device_output.numpy().astype(np.float64)                 # (V, F, D)

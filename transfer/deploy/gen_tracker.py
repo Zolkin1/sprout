@@ -27,21 +27,23 @@ tracker observation from the FM prediction + measured proprioception;
 from __future__ import annotations
 
 import time
+from collections import deque
 
 import numpy as np
 
 from .depth_obs import (
     assert_depth_specs_agree,
     depth_xyz_rows_np,
+    sanitize_extero_np,
 )
 from .scan_obs import assert_scan_specs_agree, describe as describe_scan_spec, is_privileged
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
 from .history import BatchedHistory
-from .quat_math_np import quat_apply, quat_inv, quat_mul, yaw_quat
+from .quat_math_np import quat_apply, quat_inv
 from .tracker_session import TrackerSession
 from .window_np import (
+    base_pose_block_to_world,
     reanchor_window,
-    rot6d_to_quat,
     window_block_slices,
     window_dim,
     world_to_window,
@@ -196,6 +198,12 @@ def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None
 class GenTrackerPolicy:
     """Drive the RL tracker with the online flow-matching generator (numpy + ORT)."""
 
+    #: Generator lead, in control ticks. At CLASS level so an instance built without running
+    #: __init__ -- which the test fakes do deliberately, to exercise the real serving path
+    #: around a stubbed network -- is synchronous rather than AttributeError. Instances that
+    #: opt in set it in __init__; see the ctor docstring for what it emulates.
+    fm_lead_ticks: int = 0
+
     #: Which serve arm to use, overwritten from the artifact's own convention in
     #: ``_build_window``. Defaulted at CLASS level, not just in ``__init__``, so any object
     #: that skips construction -- the test doubles in ``transfer/deploy/tests`` do -- still
@@ -212,28 +220,45 @@ class GenTrackerPolicy:
         num_threads: int = 0,
         seed: int | None = 0,
         zero_noise: bool = False,
-        null_history_warmup: bool = True,
         providers=None,
+        fm_cuda_graph: bool = False,
+        tracker_on_cpu: bool = False,
         allow_privileged_extero: bool = False,
+        fm_lead_ticks: int = 0,
     ):
         """Configure the generator + tracker pair from the ONNX artifacts.
 
         ``fm_onnx`` may be ``None`` for tracker-only (no-FM) clip playback: the
         clip reference then drives the tracker directly (see :class:`_TrackerOnlyCtx`).
 
-        ``null_history_warmup=True`` (default) samples the generator from control step 0 using
-        the model's learned ``null_history`` embedding while the N-step history window fills.
-        The RL side (``FmTrackingCommand``) does the same unconditionally -- it has no clip
-        fallback either -- so the two agree from step 0. It needs an
-        ``fm.onnx`` exported with the ``history_null`` input; without one the policy falls back to
-        withholding the generator until the window is full (and warns once).
+        The generator is sampled from control step 0 using the model's learned
+        ``null_history`` embedding while the N-step history window fills with real served
+        nodes. The RL side (``FmTrackingCommand``) does the same unconditionally, so the two
+        agree from step 0. This needs an ``fm.onnx`` exported with the ``history_null`` input;
+        without one there is no way to tell the model its history is incomplete, and
+        :func:`fm_session.sample_window` warns once.
+
+        There is deliberately no warm-up alternative. The previous options -- a stiffened PD
+        hold that filled the window first, or a static fill that repeated one snapshot into all
+        N slots -- both fabricated a history that never occurs in training, and the static one
+        did it while telling the model the history was real.
 
         ``zero_noise=True`` replaces the Gaussian ``x0`` with zeros (see
         :meth:`_sample_noise`). It defaults to False here -- the training-matched
         stochastic sampling -- so hardware keeps that behaviour; the MuJoCo sim2sim
         runner opts in and defaults it on.
 
-        ``providers`` selects the onnxruntime execution providers for BOTH graphs (see
+        ``fm_cuda_graph=True`` replays a captured CUDA graph for the GENERATOR instead of
+        launching its ~3000 kernels one at a time (9.8 -> 8.3 ms per re-plan on an RTX 4070,
+        19.3 -> 14-15 ms on a Jetson Thor). It needs a CUDA provider and a fixed-batch
+        ``fm.onnx``, and refuses loudly rather than degrading if either is missing -- see
+        ``fm_session.enable_cuda_graph``. The tracker is left alone: 17 nodes and 0.2 ms.
+
+        ``tracker_on_cpu=True`` puts the TRACKER on the CPU while the generator keeps
+        ``providers``. See :meth:`load`.
+
+        ``providers`` selects the onnxruntime execution providers for the generator (and for
+        the tracker unless ``tracker_on_cpu``) (see
         ``tracker_session.resolve_providers``); ``None`` = CPU, which is the deployment
         default. Both sessions get the same list -- a split would be measurable only as
         an inexplicable latency difference between the two nets.
@@ -244,6 +269,15 @@ class GenTrackerPolicy:
         contract -- MuJoCo casts the same grid against the same terrain -- and only the
         MuJoCo runner opts in, via ``--allow_privileged_extero``. The flag buys a sim2sim
         A/B of an Isaac-only diagnostic, never a deployment.
+
+        ``fm_lead_ticks`` reproduces the C++ runtime's generator LEAD in this synchronous one.
+        The async runtime asks for each plan `lead` ticks before the boundary it is for and
+        conditions it on the exteroception and velocity command AS THEY WERE THEN, while this
+        runtime samples both at the boundary. At the shipped ``fm_lead_sec=0.02`` and
+        dt=0.02 that is a 1-tick / 20 ms stale camera, ~1.5 cm of egomotion at 0.75 m/s; it
+        was 0.05 (3 ticks, 60 ms, ~4.5 cm), which on a stair edge is a different problem
+        rather than a rounding difference, and is why the default moved. Default 0
+        (unchanged behaviour); set it to compare the two stacks on equal terms.
         """
         self.tracker_onnx = tracker_onnx
         self.fm_onnx = fm_onnx
@@ -251,11 +285,32 @@ class GenTrackerPolicy:
         self.base_frame_name = base_frame_name
         self.num_threads = num_threads
         self.zero_noise = bool(zero_noise)
-        self.null_history_warmup = bool(null_history_warmup)
         self.providers = providers
+        self.fm_cuda_graph = bool(fm_cuda_graph)
+        self.tracker_on_cpu = bool(tracker_on_cpu)
         self.allow_privileged_extero = bool(allow_privileged_extero)
+        #: Emulate the C++ runtime's generator LEAD: it requests each plan `lead` ticks
+        #: before the boundary it is for, and conditions it on the exteroception and the
+        #: velocity command as they were AT REQUEST TIME (plan_scheduler.h). Its history is
+        #: NOT stale -- GenTrackerCore::BuildRequest projects the rows it will serve over the
+        #: lead window from the live plan, exactly -- so only these two inputs need delaying
+        #: to reproduce the difference.
+        #:
+        #: 0 (the default) is the synchronous behaviour: everything sampled at the boundary.
+        #: This exists to answer whether the lead ALONE accounts for the async stack tracking
+        #: worse than this one, without touching either runtime's real semantics.
+        self.fm_lead_ticks = max(int(fm_lead_ticks), 0)
+        #: The last `fm_lead_ticks + 1` ticks' generator inputs, oldest first, so entry 0 is
+        #: exactly `fm_lead_ticks` ticks old once full.
+        self._lead_buf: deque = deque(maxlen=self.fm_lead_ticks + 1)
+        #: The window the last create_obs served; see last_served_window.
+        self._last_served_window: np.ndarray | None = None
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
+        # Set here rather than in _reset_timing, which drains the WINDOW: these are the last
+        # single call's cost and must survive a drain. See last_infer_ms.
+        self._last_fm_infer_ms = 0.0
+        self._last_trk_infer_ms = 0.0
         self._fm_depth_spec: list[dict] = []
         self._loaded = False
 
@@ -264,10 +319,19 @@ class GenTrackerPolicy:
     # ------------------------------------------------------------------
     def load(self) -> None:
         """Load the tracker + FM ONNX sessions and build the orderings/buffers."""
-        self._trk = TrackerSession(self.tracker_onnx, self.num_threads, self.providers)
+        # The tracker can sit on the CPU while the generator keeps the GPU. It costs the
+        # tracker nothing (0.24 ms on 4 CPU threads vs 0.24 ms on CUDA, measured on a Jetson
+        # Thor) and it keeps it out of the generator's way: under CUDA Graph capture the
+        # generator's replay is ONE submission, so a tracker inference landing inside it waits
+        # out the whole ~12 ms. The C++ runtime defaults this ON; here it is opt-in, because
+        # this path is also the parity oracle and its provider should stay whatever the caller
+        # asked for unless told otherwise.
+        trk_providers = ["cpu"] if self.tracker_on_cpu else self.providers
+        self._trk = TrackerSession(self.tracker_onnx, self.num_threads, trk_providers)
         self.fm_enabled = self.fm_onnx is not None
         if self.fm_enabled:
-            self.ctx = load_fm_context(self.fm_onnx, self.num_threads, self.providers)
+            self.ctx = load_fm_context(self.fm_onnx, self.num_threads, self.providers,
+                                       cuda_graph=self.fm_cuda_graph)
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
             _assert_robot_assets_agree(self._trk.get_robot_asset(), self.ctx.robot_asset,
@@ -301,6 +365,10 @@ class GenTrackerPolicy:
                 "carries no cadence (the field lives on FmTrackingCommandCfg, not on the clip "
                 "command), and a tracker-only deploy re-plans nothing."
             )
+        #: Whether the cadence is the ARTIFACT's or merely the caller's. The clip path needs
+        #: to know: under the ``plan`` anchor it latches on this cadence, and a latch of the
+        #: wrong period is a wrong observation that no width check can see (_check_clip_anchor).
+        self._fm_update_every_from_meta = meta_every is not None
         if meta_every is not None:
             self.fm_update_every, src = max(int(meta_every), 1), "tracker metadata"
         else:
@@ -321,8 +389,10 @@ class GenTrackerPolicy:
         self._resolve_depth_cameras()
         self._build_orderings()
         self._build_window()
+        self._check_clip_anchor()
         self._check_horizon()
         self._history = BatchedHistory(1, self.ctx.N)
+        self._lead_buf = deque(maxlen=self.fm_lead_ticks + 1)
         # ONE buffer: the F predicted reference-window nodes, which ARE the observation.
         self._pred = np.zeros((1, self.ctx.F, self.ctx.D))
         self._pred_valid = False
@@ -336,6 +406,14 @@ class GenTrackerPolicy:
         # pose and the re-anchor is an identity to ~2e-15.
         self._anchor_pos = np.zeros(3)
         self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
+        # -- clip-path serving state (the counterpart of the three above) --
+        # The clip path has no re-plan to hang a cadence on, so it counts its own steps and
+        # latches its own anchor. Separate from _ctrl_step because the two advance on
+        # different calls: _ctrl_step moves in _update_generator (and advance_dormant_step),
+        # which the obelisk clip tick never reaches.
+        self._clip_step = -1
+        self._clip_anchor_pos: np.ndarray | None = None
+        self._clip_anchor_quat: np.ndarray | None = None
         # Node served on the PREVIOUS step, already re-anchored onto the robot as it was
         # then -- the frame the dataset's history rows use. None until the first serve.
         self._prev_served_node: np.ndarray | None = None
@@ -350,11 +428,34 @@ class GenTrackerPolicy:
         self._loaded = True
 
     def _reset_timing(self) -> None:
-        """Zero the FM-generator + tracker inference-time accumulators."""
+        """Zero the FM-generator + tracker inference-time accumulators.
+
+        The ``_last_*`` singles are NOT reset here: they are the most recent call's cost, not
+        a window statistic, and a per-tick logger reads them every step while
+        :meth:`pop_avg_infer_ms` drains the window every few seconds. Clearing them alongside
+        the accumulators would blank one consumer whenever the other sampled.
+        """
         self._fm_infer_s = 0.0
         self._fm_infer_n = 0
         self._trk_infer_s = 0.0
         self._trk_infer_n = 0
+
+    def last_infer_ms(self) -> dict[str, float]:
+        """The most recent inference time of each network, in milliseconds.
+
+        Non-destructive, unlike :meth:`pop_avg_infer_ms` -- this is what a per-tick recorder
+        wants, and draining the window on every tick would leave the 5 s report line with a
+        single sample.
+
+        ``fm_ms`` holds the same value on the ``fm_update_every - 1`` ticks between re-plans,
+        since the generator does not run on them. Deduplicate on the plan id before taking
+        statistics over it. It is 0.0 until the generator has run at all (and forever in
+        debug-clip mode, where none is loaded).
+
+        Returns:
+            ``{"fm_ms": ..., "trk_ms": ...}``.
+        """
+        return {"fm_ms": self._last_fm_infer_ms, "trk_ms": self._last_trk_infer_ms}
 
     def _resolve_depth_cameras(self) -> None:
         """Settle the depth-camera contract(s) for the whole deployment.
@@ -557,6 +658,24 @@ class GenTrackerPolicy:
         channels = int(getattr(self.ctx, "extero_channels", 1))
         if channels == 1:
             return image
+        # The band is applied to the DEPTH IMAGE, here, before the unprojection -- not to the
+        # assembled row afterwards. That ordering is the dataset's
+        # (``sanitize_extero`` then ``_depth_xyz_rows``) and it is the only one that means
+        # anything: ``extero_clip`` is stated in NORMALISED DEPTH units, so clamping METRES of
+        # position with it is a category error that only looks reasonable because the two
+        # happen to be similar numbers. Measured on the far camera at its real contract,
+        # sanitising the widened row instead clamped 21% of the position values and moved
+        # individual points by up to 6 m -- undoing, one layer later, exactly the range the
+        # band was widened to 5.575 to keep. It also restores the invariant this class states
+        # elsewhere: the cloud's wall sits where the DEPTH channel says it does, and nowhere
+        # else.
+        #
+        # This clamp alone was NOT enough, and the claim that used to sit here -- that
+        # build_extero_tokens leaves the other channels alone -- was false: it sanitised the
+        # whole flattened row and re-clamped x and y, undoing this one layer later. The
+        # cross-language replay harness found it by diffing the two runtimes' conditioning
+        # (the C++ never had the second clamp). build_extero_tokens is channel-aware now.
+        image = sanitize_extero_np(image, self.ctx.extero_source, clip=self.ctx.extero_clip)
         poses = state.get("fm_camera_pose")
         if poses is None:
             raise KeyError(
@@ -576,6 +695,14 @@ class GenTrackerPolicy:
 
     def depth_sampling_is_split(self) -> bool:
         """Whether the generator samples the cameras on a different grid than the tracker.
+
+        TODO(one-sampling): remove the split path once the generator and tracker are trained
+        at one resolution. It exists so a generator can be retrained at a different grid
+        WITHOUT retraining the teacher, which is a development convenience rather than a
+        deployment need -- and it is not free: sim2sim casts the scene twice, and every
+        consumer has to decide which reading it wants. The long-term intent is that the two
+        match, at which point this predicate is always False and the second cast, the
+        ``fm_depth`` state key and ``add_fm_depth_pair`` all go.
 
         The runner reads this to decide whether it needs a SECOND ray caster, and the
         hardware path reads it to refuse: there is one real camera stream per lens, so a
@@ -794,6 +921,135 @@ class GenTrackerPolicy:
                 "with a generator trained for it."
             )
 
+    @property
+    def window_anchor(self) -> str:
+        """What the window's ``base_pose`` POSITION is measured from: ``plan`` or ``robot_now``.
+
+        Read off the tracker's own ``base_pose_convention`` metadata (see :meth:`_build_window`),
+        never inferred. The two arms are identical in width and in every other block, so a
+        tracker trained under one loads clean against the other and merely steers wrong --
+        which is why the convention travels in the artifact and consumers ask rather than assume.
+        """
+        return self._window_anchor
+
+    def _check_clip_anchor(self) -> None:
+        """Refuse a ``plan`` tracker whose re-anchor cadence is not the ARTIFACT's.
+
+        Under ``plan`` the clip path has to latch its window anchor on the same cadence the
+        teacher latched it on (``MotionSequenceCommand._reanchor_ego_envs`` does it every
+        ``fm_snap_every`` steps for every env). That number lives in ``tracker.onnx``
+        metadata and nowhere else, so falling back to the constructor default would serve a
+        sawtooth of the wrong PERIOD -- and since the two anchor arms have identical widths,
+        nothing downstream can see it. The generator path raises the same way at
+        :meth:`load`; this is the tracker-only half of that guard.
+
+        Raises:
+            ValueError: If the tracker declares ``plan`` but carries no ``fm_update_every``.
+        """
+        if self._window_anchor != "plan" or self._fm_update_every_from_meta:
+            return
+        raise ValueError(
+            f"{self.tracker_onnx} declares base_pose_convention -> window_anchor='plan', but "
+            "carries no 'fm_update_every'. Under that convention the reference window's "
+            "base_pose position is measured from the robot as it was at the LAST LATCH, so "
+            "the latch period is part of the observation contract -- and it would fall back "
+            f"to the caller's default of {self.fm_update_every}. Re-export the tracker with "
+            "play.py --fm_checkpoint so the cadence travels with it."
+        )
+
+    def assert_clip_reference_compatible(self, clip) -> None:
+        """Refuse a clip whose re-anchor cadence cannot produce the window this tracker wants.
+
+        ONE statement of the rule, called by both clip consumers (``gen_tracker_runner.py``
+        and the obelisk controller) so the two cannot drift.
+
+        Under ``plan`` the anchor is the robot's root at the last latch, and the clip's own
+        placement is re-solved from the robot on its own cadence. Three cases:
+
+        * **ego-anchored on the SAME cadence** -- placement and anchor are solved from the
+          robot at the same instant, so the robot's position and heading cancel exactly and
+          ``base_pose`` reduces to ``Rz(-yaw_latch) (p_clip(s+o) - p_clip(s_latch))``. A pure
+          function of the clip: no odometry anywhere, which is what makes this arm the one
+          the C++ deploy runtime can serve.
+        * **ego-anchored on a DIFFERENT cadence** -- refused. Up to ``every - 1`` steps of the
+          robot's egomotion leak into the block, matching neither training nor an odometry-free
+          serve, and it looks exactly like a healthy window.
+        * **world-anchored** -- allowed and training-matched (it is what a non-ego env sees),
+          but the block is then a real world-frame difference, so it is only as good as the
+          base POSITION estimate. Warned about rather than refused, because MuJoCo has a true
+          base pose and the A/B is worth keeping.
+
+        Under ``robot_now`` the anchor is the measured root every step and the cadence is
+        free, so nothing is checked.
+
+        Args:
+            clip: A :class:`~deploy.clip_reference.ClipReference` (anything carrying
+                ``ego_anchor`` and ``ego_anchor_every``).
+
+        Raises:
+            ValueError: On an ego cadence that disagrees with the tracker's.
+        """
+        if self._window_anchor != "plan":
+            return
+        if not bool(getattr(clip, "ego_anchor", False)):
+            print("[WARN GenTrackerPolicy] window_anchor='plan' with a WORLD-anchored clip: "
+                  "the base_pose block is measured from the robot's world root at each latch, "
+                  "so it is only as good as the base position estimate. Fine in MuJoCo; on a "
+                  "robot use ego anchoring, which cancels the world frame out entirely.")
+            return
+        every = int(getattr(clip, "ego_anchor_every", 0))
+        if every != self.fm_update_every:
+            raise ValueError(
+                f"clip ego_anchor_every={every} but the tracker latches its window anchor "
+                f"every fm_update_every={self.fm_update_every} steps. Under window_anchor="
+                "'plan' the two must fire on the same step or the robot's egomotion between "
+                "them leaks into base_pose -- a window that matches neither training nor an "
+                "odometry-free serve, and that is indistinguishable from a healthy one by "
+                f"shape. Set the clip cadence to {self.fm_update_every}."
+            )
+
+    def _clip_window_anchor(self, state: dict,
+                            clip_tick: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Advance the clip tick and return the pose its ``base_pose`` block is measured from.
+
+        The clip counterpart of the generator's ``_anchor_pos`` / ``_anchor_quat`` latch, and
+        of Isaac's ``MotionSequenceCommand.window_anchor``. Called once per served step from
+        :meth:`create_obs_from_reference`, which is the ONE call every clip consumer makes --
+        so the cadence cannot be missed by a caller that forgets to tick something else.
+        (``advance_dormant_step`` was the obvious place and is the wrong one: the obelisk
+        controller's clip tick never calls it, so the latch would silently never fire on the
+        robot while working in MuJoCo.)
+
+        **The cadence is counted on the CALLER's clip tick, not on this method's own calls.**
+        The consumer decides re-placement with the same number, and the two have to fire on
+        the same step or the robot's egomotion between them leaks into ``base_pose``. They
+        would drift apart in two ways otherwise, both silent: playback that starts partway
+        into a clip puts the phase origin at ``start_step`` rather than at zero, and the
+        obelisk depth watchdog FREEZES the clip step while control ticks keep arriving --
+        after which every latch is off by however long the freeze lasted. Keying both off the
+        clip's own tick also makes the frozen case coherent: the reference is not moving, so
+        neither the placement nor the anchor should.
+
+        Args:
+            state: The step's state dict, supplying the measured base pose.
+            clip_tick: Steps of playback elapsed, i.e. the consumer's own
+                ``clip_step - clip.start_step``. None falls back to counting calls, which is
+                the same thing for a caller that starts at the clip's beginning and never
+                stalls -- synthetic references and tests.
+
+        Returns:
+            ``(anchor_pos, anchor_quat_xyzw)`` -- the latch under ``plan``, the measured root
+            under ``robot_now``.
+        """
+        f64 = lambda x: np.asarray(x, dtype=np.float64)
+        self._clip_step = self._clip_step + 1 if clip_tick is None else int(clip_tick)
+        if self._window_anchor != "plan":
+            return f64(state["root_pos"]), f64(state["root_quat"])
+        if self._clip_anchor_pos is None or self._clip_step % self.fm_update_every == 0:
+            self._clip_anchor_pos = f64(state["root_pos"]).copy()
+            self._clip_anchor_quat = f64(state["root_quat"]).copy()
+        return self._clip_anchor_pos, self._clip_anchor_quat
+
     def _check_horizon(self) -> None:
         """Refuse a generator whose horizon cannot cover the tracker's window.
 
@@ -818,10 +1074,21 @@ class GenTrackerPolicy:
                 f"sample is read). Lower fm_update_every, or re-record with "
                 f"--ref_future_len {need} and retrain with --future_len {need}."
             )
-        if self.fm_update_every > 1:
-            print(f"[INFO GenTrackerPolicy] fm_update_every={self.fm_update_every}: served "
-                  "nodes are re-anchored onto the measured base each step, so the base pose "
-                  f"in `state` must be good over {self.fm_update_every - 1} steps "
+        # Announce the SERVE ARM, because the two have opposite requirements of the caller and
+        # this is the line someone reads to decide whether odometry matters. It used to state
+        # the re-anchoring one unconditionally, so a plan-arm run was told it needed a good
+        # base pose over K-1 steps of egomotion -- the exact opposite of that arm's whole
+        # point, and a claim nothing else on screen would contradict.
+        if self._window_anchor == "plan":
+            print(f"[INFO GenTrackerPolicy] window_anchor=plan: served nodes are the "
+                  "prediction in its OWN frame, so no base position is read on the generator "
+                  "path at any K. This is the odometry-free arm -- `state['root_pos']` is "
+                  "used only for diagnostics and the viewer's world lift.")
+        elif self.fm_update_every > 1:
+            print(f"[INFO GenTrackerPolicy] window_anchor=robot_now, "
+                  f"fm_update_every={self.fm_update_every}: served nodes are re-anchored onto "
+                  "the measured base each step, so the base pose in `state` must be good over "
+                  f"{self.fm_update_every - 1} steps "
                   f"({(self.fm_update_every - 1) * self.get_dt():.2f} s) of egomotion. Only "
                   "the RELATIVE motion since the re-plan matters, not a global pose.")
 
@@ -844,35 +1111,26 @@ class GenTrackerPolicy:
                 else self._prev_served_node.reshape(1, self.ctx.D).copy())
         return {"node": node, "cmd": np.array(state["command"], dtype=np.float64, copy=True)[None]}
 
-    def warm_start(self, state: dict) -> None:
-        """Make the generator usable at step 0.
+    def advance_dormant_step(self) -> None:
+        """Advance the control-step counter while the generator is dormant.
 
-        With ``null_history_warmup`` and a graph that accepts ``history_null`` this is a no-op
-        beyond resetting the cadence: the first steps are sampled with the learned null-history
-        embedding, which is what the model was trained for. Only the legacy path fabricates a
-        history by repeating this snapshot into all N slots -- a static window that never occurs
-        in training (real history always has motion between its steps).
-        """
-        if self.null_history_warmup and getattr(self.ctx, "has_history_null", False):
-            self._history.invalidate(np.ones(1, dtype=bool))
-        else:
-            self._history.fill(self._make_snapshot(state))
-        self._pred_valid = False
+        The clip path uses this before the clip->FM handoff: the clip is driving, the generator
+        has produced nothing, and the counter has to keep moving so the first re-plan after the
+        handoff lands on the same cadence phase it would have.
 
-    def observe(self, state: dict) -> None:
-        """Append a real snapshot to the history without running the generator.
+        It deliberately touches NOTHING else. It used to also push a row into the generator's
+        conditioning history, which was worse than useless: a history row is a reference-window
+        node this runtime SERVED, nothing is served while the generator is dormant, so every row
+        it pushed was a zero placeholder. Accumulating those into a window that then declared
+        itself complete handed the generator an all-zero history with ``history_null`` OFF --
+        an input training never produced. There is now no path anywhere that puts a placeholder
+        into the history and lets it count as real.
 
-        Used during the stable-stand warmup: the window fills with measured frames
-        while the FM stays dormant (``_pred_valid`` False), so the first live
-        ``create_obs`` cleanly triggers the first FM sample anchored on a settled
-        stand rather than on a static repeated snapshot.
-
-        No-op in tracker-only (no-FM) mode: there is no generator history to keep.
+        No-op in tracker-only (no-FM) mode: there is no generator cadence to keep.
         """
         if not self.fm_enabled:
             return
         self._ctrl_step += 1
-        self._history.append(self._make_snapshot(state))
 
     def _update_generator(self, state: dict) -> None:
         """Advance the receding horizon by one control step.
@@ -893,9 +1151,22 @@ class GenTrackerPolicy:
         exact thereafter -- Isaac behaves the same way, so this is deliberate.
         """
         self._ctrl_step += 1
+        if self.fm_lead_ticks:
+            self._lead_buf.append(self._lead_sample(state))
         self._history.append(self._make_snapshot(state))
+        if self._prev_served_node is None:
+            # Nothing has been served yet, so that row is the zero placeholder, not a node
+            # this runtime produced. Keep the window INVALID so the learned null-history
+            # embedding covers it: a zero row counted as real history is off-distribution --
+            # training never presented one -- and it would go in with `history_null` off,
+            # silently, for exactly the steps the embedding exists to handle.
+            #
+            # Without this the window went valid at step N-1 with its OLDEST row still the
+            # placeholder, and on the warmup path (`observe`) it went valid with EVERY row a
+            # placeholder.
+            self._history.invalidate(np.ones(1, dtype=bool))
         null_hist = bool(self._history.null_mask()[0])
-        use_null = (self.null_history_warmup and getattr(self.ctx, "has_history_null", False))
+        use_null = bool(getattr(self.ctx, "has_history_null", False))
 
         reinfer = (self._ctrl_step % max(self.fm_update_every, 1)) == 0
         infer = reinfer or not self._pred_valid
@@ -921,6 +1192,55 @@ class GenTrackerPolicy:
             # still what feeds the POLICY.
             self._prev_served_node = self._pred[0, int(self._pred_idx)].copy()
 
+    def _lead_sample(self, state: dict) -> dict:
+        """COPIES of the generator inputs the C++ runtime samples early, for one tick.
+
+        Copied, not referenced: the runner rebuilds the state dict every step but the arrays
+        inside it can be reused buffers, and aliasing one would make the "stale" reading
+        silently identical to the current one -- an emulation that reports no difference
+        because it is not actually delaying anything.
+
+        Only the keys the generator's exteroception and held command are built from. The
+        tracker's own observation is NOT delayed: on the real robot it reads its sensors every
+        tick, and only the generator's request is early.
+
+        Args:
+            state: This tick's state dict.
+
+        Returns:
+            The subset, deep-copied.
+        """
+        keys = ("depth", "fm_depth", "height_scan", "command")
+        out = {k: np.array(state[k], dtype=np.float64, copy=True) for k in keys if k in state}
+        poses = state.get("fm_camera_pose")
+        if poses is not None:
+            out["fm_camera_pose"] = [(np.array(p, dtype=np.float64, copy=True),
+                                      np.array(r, dtype=np.float64, copy=True))
+                                     for p, r in poses]
+        return out
+
+    def _fm_conditioning_state(self, state: dict) -> tuple[dict, np.ndarray | None]:
+        """The state the generator should be conditioned on, and the command to hold.
+
+        With ``fm_lead_ticks == 0`` this is just ``state`` -- the synchronous behaviour. With a
+        lead it is the state from that many ticks ago, which is what the async runtime's early
+        request actually sees.
+
+        Returns ``(None, None)``-free: the command is None when nothing should override the
+        held one (either no lead, or the buffer has not filled yet, which is the same
+        situation the real runtime is in before it has a plan to project from).
+
+        Args:
+            state: This tick's state dict.
+
+        Returns:
+            ``(state_for_exteroception, held_command_or_None)``.
+        """
+        if not self.fm_lead_ticks or len(self._lead_buf) < self._lead_buf.maxlen:
+            return state, None
+        stale = self._lead_buf[0]
+        return stale, stale.get("command")
+
     def _run_fm(self, state: dict, history_null: bool = False) -> None:
         """Sample the F-node reference window for this control step.
 
@@ -939,10 +1259,13 @@ class GenTrackerPolicy:
         # on -- the runner puts both readings in the state. Depth is one token per camera
         # (already normalised, matching mdp.depth_obs_stack); the height scan is one token
         # of per-ray clearance. Matches how each is recorded and used in the RL obs.
+        # `cond` is `state` unless a lead is being emulated, in which case it is the state
+        # from `fm_lead_ticks` ticks ago -- see _fm_conditioning_state.
+        cond, lead_cmd = self._fm_conditioning_state(state)
         if ctx.extero_source == "depth":
-            extero = build_extero_tokens(ctx, self._fm_extero_row(state)[None])
+            extero = build_extero_tokens(ctx, self._fm_extero_row(cond)[None])
         else:
-            extero = build_extero_tokens(ctx, np.asarray(state["height_scan"], dtype=np.float64)[None])
+            extero = build_extero_tokens(ctx, np.asarray(cond["height_scan"], dtype=np.float64)[None])
         if self._future_cmd_override is not None:
             # Actual future-command horizon (clip->FM handoff) -- matches IsaacLab's
             # get_command_velocity_horizon. Without it the deploy holds the current
@@ -950,7 +1273,11 @@ class GenTrackerPolicy:
             # IsaacLab during command ramps.
             fut_cmd = np.asarray(self._future_cmd_override, dtype=np.float64).reshape(1, ctx.F, ctx.cmd_dim)
         else:
-            fut_cmd = np.broadcast_to(cmd[:, -1:], (1, ctx.F, ctx.cmd_dim)).copy()  # held command
+            # Held command. Under an emulated lead the command held is the one from REQUEST
+            # time, matching BuildRequest's "the future command is not knowable; hold the one
+            # at request time".
+            held = cmd[:, -1:] if lead_cmd is None else lead_cmd.reshape(1, 1, ctx.cmd_dim)
+            fut_cmd = np.broadcast_to(held, (1, ctx.F, ctx.cmd_dim)).copy()
         cmd_tokens = build_cmd_tokens(ctx, fut_cmd)
         noise = self._sample_noise()
 
@@ -959,6 +1286,7 @@ class GenTrackerPolicy:
                                    history_null=np.array([bool(history_null)]))
         infer_s = time.perf_counter() - t0
         self._fm_infer_s += infer_s
+        self._last_fm_infer_ms = 1e3 * infer_s
         # Stash the conditioning alongside the output so a logger can record what the
         # generator was ASKED, not just what it answered -- the history in particular is the
         # runtime's own past output, so when it goes wrong it does so silently and compounds.
@@ -975,6 +1303,11 @@ class GenTrackerPolicy:
             # which is why that one got renamed and this one did not.
             "extero_tokens": extero,
             "cmd_tokens": cmd_tokens,
+            # The command profile BEFORE the stride to cmd_steps. Recorded alongside the
+            # tokens because the C++ runtime's FmConditioning carries this form, and comparing
+            # a strided 13x3 against an unstrided 62x3 compares nothing -- it just has a
+            # different width and gets skipped.
+            "future_cmd": fut_cmd,
             "history_null": bool(history_null),
             "infer_s": infer_s,
         }
@@ -1103,15 +1436,9 @@ class GenTrackerPolicy:
         if sl is None:
             return None
         block = self._pred[0, :, sl]                                          # [F,9]
-        # YAW-only, matching how the block was built: the anchor contributes heading, so
-        # lifting through the full anchor rotation would tilt the whole ribbon by the robot's
-        # roll/pitch at the re-plan.
-        q = np.broadcast_to(yaw_quat(self._anchor_quat), (block.shape[0], 4))
-        ref_p = self._anchor_pos + quat_apply(q, block[:, 0:3])
-        # R_ref = R_yaw (R_yawT R_ref); the 6D pair has to become a matrix here, so this is
-        # where Gram-Schmidt runs (inside rot6d_to_quat).
-        ref_q = quat_mul(q, rot6d_to_quat(block[:, 3:9]))
-        return ref_p, ref_q
+        # The algebra lives in window_np, shared with the ROS marker node -- see
+        # base_pose_block_to_world for why the anchor is yaw-only.
+        return base_pose_block_to_world(block, self._anchor_pos, self._anchor_quat)
 
     def predicted_root_path_w(self) -> np.ndarray | None:
         """Just the position half of :meth:`predicted_base_pose_w` (``[F, 3]`` or ``None``)."""
@@ -1201,7 +1528,8 @@ class GenTrackerPolicy:
         """
         return self._pred[0].copy() if self._pred_valid else None
 
-    def create_obs_from_reference(self, state: dict, reference: dict) -> np.ndarray:
+    def create_obs_from_reference(self, state: dict, reference: dict,
+                                  clip_tick: int | None = None) -> np.ndarray:
         """Build the tracker observation from an EXTERNAL reference, bypassing the generator.
 
         The baked-clip counterpart of :meth:`create_obs`: the caller supplies the world-frame
@@ -1218,6 +1546,11 @@ class GenTrackerPolicy:
             reference: ``{"window": [...]}``, one world-frame entry per
                 :attr:`window_offsets` value, offset 0 first, each optionally carrying its
                 own ``"command"``. See :meth:`deploy.clip_reference.ClipReference.reference_at`.
+            clip_tick: Steps of playback elapsed (``clip_step - clip.start_step``). Under
+                ``window_anchor='plan'`` this is what the anchor latch is counted on, and it
+                must be the SAME number the caller re-places the clip on -- see
+                :meth:`_clip_window_anchor`. Both real consumers pass it; omit it only for a
+                synthetic reference that starts at zero and never stalls.
 
         Returns:
             The tracker observation ``[1, num_obs]``.
@@ -1231,15 +1564,48 @@ class GenTrackerPolicy:
                 f"offsets {list(self.window_offsets)}. Build it with "
                 "ClipReference.reference_at(step, policy.window_offsets)."
             )
-        return self._build_obs(state, reference=reference)
+        return self._build_obs(state, reference=reference,
+                               window_anchor=self._clip_window_anchor(state, clip_tick))
 
-    def _reference_window(self, window: list[dict], root_pos, root_quat) -> np.ndarray:
+    def _stash_window(self, served: np.ndarray) -> np.ndarray:
+        """Remember the window that went into THIS observation, and pass it through.
+
+        The served window is the most diagnostic quantity in the loop and it was previously
+        unrecoverable from outside: it is built inline while the observation is assembled, and
+        recomputing it afterwards would re-run the re-anchoring against a state that has since
+        moved on. A recorder that did that would be comparing its own arithmetic, not the
+        runtime's.
+
+        Args:
+            served: The window vector about to be assembled into the observation.
+
+        Returns:
+            ``served``, unchanged.
+        """
+        self._last_served_window = served
+        return served
+
+    def last_served_window(self) -> np.ndarray:
+        """The reference window the last :meth:`create_obs` actually served.
+
+        Returns:
+            A copy, so a caller stashing it cannot alias the next tick's buffer.
+
+        Raises:
+            RuntimeError: Before any observation has been built -- there is no window yet,
+                and returning zeros would be a plausible wrong answer.
+        """
+        if getattr(self, "_last_served_window", None) is None:
+            raise RuntimeError("no observation has been assembled yet, so no window was served")
+        return np.array(self._last_served_window, dtype=np.float64, copy=True)
+
+    def _reference_window(self, window: list[dict], anchor_pos, anchor_quat) -> np.ndarray:
         """Pack the reference window, mirroring ``mdp.observations.reference_window``.
 
         Per step, in ``reference_window_layout`` order: ``base_pose`` (9) -- the reference
-        base pose in the robot's CURRENT YAW frame, position ``ref - actual`` (3) plus
+        base pose in the ANCHOR's yaw frame, position ``ref - anchor`` (3) plus
         ``R_yawT R_ref`` as a 6D rotation (6); ``base_vel``
-        (6) -- reference base lin+ang velocity rotated into that same current base frame;
+        (6) -- reference base lin+ang velocity rotated into that same anchor frame;
         ``joint_pos`` / ``joint_vel`` (nj each) -- **in the robot's own joint order**, so
         they line up elementwise with the proprioception terms; ``ee_pos`` (3 per frame)
         -- reference end-effector positions in *that step's* reference base frame.
@@ -1250,10 +1616,18 @@ class GenTrackerPolicy:
 
         Every block is relative, so no world coordinate reaches the policy.
 
+        WHAT the anchor is depends on the tracker's own convention and is decided by the
+        caller (:meth:`_clip_window_anchor`), not here: ``robot_now`` measures against the
+        robot this step, making ``base_pose``'s position a tracking ERROR; ``plan`` measures
+        against the root at the last latch, making it the reference's position in the plan
+        frame -- a sawtooth that ramps over ``fm_update_every`` ticks with the robot's own
+        commanded displacement and resets. Serving one to a tracker trained on the other is
+        undetectable by shape, which is why this takes an anchor rather than a robot pose.
+
         Args:
             window: One reference state per window offset, offset 0 first.
-            root_pos: The robot's measured base position, world frame.
-            root_quat: The robot's measured base orientation, world xyzw.
+            anchor_pos: World position the block is measured from.
+            anchor_quat: World orientation (xyzw) whose YAW defines the frame.
 
         Returns:
             The flat window, ``[num_steps * D]`` for the selected blocks.
@@ -1269,25 +1643,45 @@ class GenTrackerPolicy:
         ref_quat = np.stack([f64(r["root_quat"]) for r in window])               # [K,4]
         ref_lin = np.stack([f64(r["root_lin"]) for r in window])                 # [K,3]
         ref_ang = np.stack([f64(r["root_ang"]) for r in window])                 # [K,3]
-        jp = np.stack([f64(r["jp"])[self._fm_to_isaac] for r in window])         # [K,nj]
-        jv = np.stack([f64(r["jv"])[self._fm_to_isaac] for r in window])         # [K,nj]
+        # NOT permuted. ClipReference is constructed with policy.get_joint_names(), so these
+        # arrive in the isaac order the window wants already -- both call sites do it
+        # (gen_tracker_runner.py, the obelisk controller). The old `[self._fm_to_isaac]` here
+        # was a SECOND permutation that happened to be an identity only because both shipped
+        # artifacts have fm_meta.joint_names == joint_names_isaac; against a generator trained
+        # in the clip-library order it would have scrambled 29 joints silently.
+        jp = np.stack([f64(r["jp"]) for r in window])                            # [K,nj]
+        jv = np.stack([f64(r["jv"]) for r in window])                            # [K,nj]
+        if jp.shape[1] != nj or jv.shape[1] != nj:
+            raise ValueError(
+                f"clip reference carries {jp.shape[1]} joint positions / {jv.shape[1]} "
+                f"velocities but the tracker observes {nj}. Build the ClipReference with "
+                "policy.get_joint_names()."
+            )
         ee = (np.stack([f64(r["frame_pos"])[:n_ee] for r in window]) if n_ee > 0
               else np.zeros((k, 0, 3)))                                          # [K,E,3]
         nodes = world_to_window(
-            f64(root_pos)[None, :], f64(root_quat)[None, :],
+            f64(anchor_pos)[None, :], f64(anchor_quat)[None, :],
             ref_pos, ref_quat, ref_lin, ref_ang, jp, jv, ee,
             blocks=self.reference_blocks,
         )                                                                        # [K,D]
         assert nodes.shape == (k, window_dim(nj, n_ee, self.reference_blocks)), nodes.shape
         return nodes.reshape(-1)
 
-    def _build_obs(self, state: dict, reference: dict | None) -> np.ndarray:
+    def _build_obs(self, state: dict, reference: dict | None,
+                   window_anchor: tuple[np.ndarray, np.ndarray] | None = None) -> np.ndarray:
         """Build the policy obs from proprioception + the world reference (numpy).
 
         Mirrors ``mdp/observations/observations.py`` exactly. The reference half is the
         merged ``reference_window`` + ``command_window`` pair; the proprioception half is
         the raw current step, which :meth:`_assemble` then stacks into each term's
         history window.
+
+        Args:
+            state: The step's state dict.
+            reference: The clip's world-frame window, or None for the generator path.
+            window_anchor: ``(pos, quat_xyzw)`` the reference window is measured from. Only
+                read on the clip path, where :meth:`_clip_window_anchor` supplies it; the
+                generator path carries its anchor inside :meth:`_serve_nodes` instead.
         """
         # The FM branch has no world-frame window to pack: its prediction IS the term.
         window = None if reference is None else reference["window"]
@@ -1309,8 +1703,10 @@ class GenTrackerPolicy:
             "joint_pos": f64(state["joint_pos"]) - default,
             "joint_vel": f64(state["joint_vel"]),
             "actions": np.asarray(self._trk.action_isaac, dtype=np.float64),
-            "reference_window": (self._fm_reference_window(state) if window is None
-                                 else self._reference_window(window, root_pos, root_quat)),
+            "reference_window": self._stash_window(
+                self._fm_reference_window(state) if window is None
+                else self._reference_window(window, *(window_anchor
+                                                      or (root_pos, root_quat)))),
             # The joystick-level command over the same offsets. Deliberately separate from
             # the reference window so it stays clean: at deploy it comes from the joystick
             # or a scripted profile, not the generator. A clip reference supplies each
@@ -1435,8 +1831,10 @@ class GenTrackerPolicy:
         """Run the tracker; return joint position targets in ``joint_names_out`` order."""
         t0 = time.perf_counter()
         action = self._trk.get_action(obs, joint_names_out)
-        self._trk_infer_s += time.perf_counter() - t0
+        elapsed_s = time.perf_counter() - t0
+        self._trk_infer_s += elapsed_s
         self._trk_infer_n += 1
+        self._last_trk_infer_ms = 1e3 * elapsed_s
         return action
 
     def pop_avg_infer_ms(self) -> dict[str, float]:
@@ -1474,6 +1872,7 @@ class GenTrackerPolicy:
             self._obs_history = {}
             self._pred_valid = False
             self._ctrl_step = -1
+            self._lead_buf = deque(maxlen=self.fm_lead_ticks + 1)
             self._future_cmd_override = None
             # Receding-horizon state. The stash in particular describes a pose from before
             # the reset, so keeping it would push a row from another episode into the
@@ -1482,6 +1881,11 @@ class GenTrackerPolicy:
             self._pred_idx = 0
             self._anchor_pos = np.zeros(3)
             self._anchor_quat = np.array([0.0, 0.0, 0.0, 1.0])
+            # The clip latch, for the same reason: it describes a pose from before the reset,
+            # and -1 puts the next served step back on the cadence's first tick.
+            self._clip_step = -1
+            self._clip_anchor_pos = None
+            self._clip_anchor_quat = None
             self._prev_served_node = None
             # NOT _plan_id: it identifies a sample, and restarting it at 0 would make two
             # plans from different episodes share an id in one recording.

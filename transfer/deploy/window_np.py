@@ -234,6 +234,47 @@ def world_to_window(
     return np.concatenate([built[b]() for b in selected], axis=-1)
 
 
+def base_pose_block_to_world(
+    block9: np.ndarray, anchor_pos: np.ndarray, anchor_quat: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Lift a window's ``base_pose`` block back to world coordinates.
+
+    The inverse of :func:`world_to_window`'s ``base_pose`` case, and the only place off-sim
+    that turns a window back into a world coordinate. Two callers -- the MuJoCo runner's
+    viewer ribbon via :meth:`GenTrackerPolicy.predicted_base_pose_w`, and the ROS marker node
+    reading ``/obelisk/g1/debug/fm_plan`` -- so a second copy of this algebra would be a
+    second place for the yaw-only convention to be got wrong, in a drawing whose whole job is
+    to make such a mistake visible.
+
+    YAW-ONLY, matching how the block was built: the anchor contributes heading, so lifting
+    through the full anchor rotation would tilt the whole ribbon by the robot's roll and pitch
+    at the re-plan. Forward is ``quat_apply_inverse(q_yaw, p_ref - p_a)`` and
+    ``rot6d(R_yawT R_ref)``, so the return leg is::
+
+        ref_p = p_a + quat_apply(q_yaw, block[..., 0:3])
+        ref_q = q_yaw * rot6d_to_quat(block[..., 3:9])
+
+    The full inverse of a whole node is deliberately NOT ported (see the module docstring);
+    this is the one block a viewer has ever needed.
+
+    Args:
+        block9: ``[..., 9]`` -- position(3) then rot6d(6).
+        anchor_pos: ``[3]``, or anything broadcastable, the re-plan anchor position in world.
+        anchor_quat: ``[4]`` xyzw re-plan anchor orientation. Only its yaw is used.
+
+    Returns:
+        ``([..., 3] world positions, [..., 4] xyzw world orientations)``. The quaternions come
+        back sign-normalised (see :func:`quat_from_matrix`).
+    """
+    block9 = np.asarray(block9, dtype=np.float64)
+    q = np.broadcast_to(yaw_quat(np.asarray(anchor_quat, dtype=np.float64)), block9.shape[:-1] + (4,))
+    ref_p = np.asarray(anchor_pos, dtype=np.float64) + quat_apply(q, block9[..., 0:3])
+    # R_ref = R_yaw (R_yawT R_ref); the 6D pair has to become a matrix here, so this is where
+    # Gram-Schmidt runs (inside rot6d_to_quat).
+    ref_q = quat_mul(q, rot6d_to_quat(block9[..., 3:9]))
+    return ref_p, ref_q
+
+
 def reanchor_window(
     window: np.ndarray,
     old_pos_w: np.ndarray,

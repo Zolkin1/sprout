@@ -87,6 +87,22 @@ transfer/obelisk/g1_control/resource/hf_cache/
 # mounts only $REPO_ROOT and the robot has no clips/ directory.
 transfer/obelisk/g1_control/resource/debug_clips/
 transfer/obelisk/docker/.env
+# The Jetson ZED container's env, same reasoning: per-box (ZED_IMAGE has to name the SDK
+# installed on THAT host), and .env_example is what is tracked.
+transfer/jetson/zed/docker/.env
+# The ZED box's own Cyclone config: it names THIS box's interface address, so committing it
+# would hand every box one machine's addressing. config/cyclonedds.xml.example is tracked.
+transfer/jetson/zed/config/cyclonedds.xml
+# One machine's view of the split link: its own interface address and the OTHER box as a
+# peer. Committing it would hand every box the desktop's half of an asymmetric pair, which
+# is the "one box sees the other's topics and not the reverse" failure the example warns
+# about. Same reasoning as .env above; docker/cyclonedds.xml.example is what is tracked.
+transfer/obelisk/docker/cyclonedds.xml
+# The staged copy of ANOTHER box's half of the same asymmetric pair (the Thor's, for the
+# split-sim brain). It is one machine's view for exactly the reason above, and it does
+# nothing where it sits -- it is written here, copied to that box, and pointed at by that
+# box's CYCLONEDDS_URI.
+transfer/obelisk/docker/cyclonedds.*.xml
 transfer/obelisk/MUJOCO_LOG.TXT
 g1_hardware_log/
 

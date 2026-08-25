@@ -699,13 +699,13 @@ def main() -> int:
                         "rather than by an RNG draw per re-plan. Whichever is chosen, this flag "
                         "sets Isaac and MuJoCo together -- their own defaults disagree.")
     p.add_argument("--port", type=int, default=8091, help="[viser] server port.")
-    p.add_argument("--urdf", default="transfer/obelisk/g1_model/urdf/g1_29j.urdf",
+    p.add_argument("--urdf", default="transfer/obelisk/g1_model/urdf/g1_perceptive.urdf",
                    help="[viser] URDF to pose (29-DOF).")
     p.add_argument("--clip_handoff_time", type=float, default=0.0,
                    help="[mujoco] sim time to hand the reference from the clip to the FM. "
                         "Defaults to 0 = the FM drives from step 0, matching the Isaac side: "
                         "both sample the generator with its learned null-history embedding while "
-                        "the N-step window fills (--null_history_warmup, on by default). Before "
+                        "the N-step window fills, which is what the RL side does too. Before "
                         "that existed, 0 asked the FM to predict from an empty buffer and MuJoCo "
                         "reported 'Nan, Inf or huge value in CTRL ... Time = 0.0000', so this had "
                         "to be >= N steps; raise it again only to deliberately give MuJoCo a clip "

@@ -294,7 +294,7 @@ def _bench_steps(tracker_path, fm_path, providers, threads, iters, rng) -> dict:
     every = policy.fm_update_every
     state = _synthetic_state(policy, rng)
     names = policy.get_joint_names()
-    policy.warm_start(state)
+    policy.reset()
 
     warm = max(WARMUP.get(p, 20) for p in policy._trk.sess.get_providers())
     # Enough steps to see many FM ticks even at a slow cadence.

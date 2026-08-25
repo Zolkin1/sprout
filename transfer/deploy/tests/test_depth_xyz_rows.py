@@ -143,3 +143,93 @@ def test_the_deploy_row_matches_the_training_row():
         err_msg="the deploy and training row builders disagree -- a model would be trained on "
                 "one layout and served the other",
     )
+
+
+def test_the_band_clamps_depth_before_the_unprojection_not_the_row_after():
+    """`extero_clip` is normalised DEPTH units; clamping metres of position with it is wrong.
+
+    The dataset sanitises the depth row and THEN derives xyz, so the position channels are
+    never themselves clipped -- their bound is the depth band's equivalent RANGE, which is a
+    different number in different units. The deploy runtime used to sanitise the assembled
+    5-channel row instead, which clamped xyz at +-5.575 m: measured on the far camera at its
+    real contract, 21% of the position values, moving individual points by up to 6 m, and
+    undoing one layer later exactly the range the band was widened to keep.
+
+    Pinned here rather than left to the ordering of two statements, because the failure is
+    silent -- every shape stays right and the numbers stay plausible, they are just wrong past
+    5.575 m, which is where the far camera does its job.
+    """
+    from deploy.depth_obs import normalize_depth_np, sanitize_extero_np  # noqa: PLC0415
+
+    cam = dict(_cam("far"), fx=21.42222, fy=33.86616, max_dist=11.9, min_dist=0.15)
+    band = 5.575
+    metres = np.linspace(0.5, 11.5, _K)
+    img = normalize_depth_np(metres, **{k: cam[k] for k in
+          ("offset", "scale", "min_dist", "max_dist", "min_clip_val", "max_clip_val")})
+
+    # What the runtime now does: clamp the IMAGE, then unproject from it.
+    row = depth_xyz_rows_np([cam], sanitize_extero_np(img, "depth", clip=band)[None, :],
+                            [_pose()], channels=5)[0]
+    xyz = row.reshape(5, _K)[1:4]
+    # Positions reach past the band, because the band is not a bound on metres at all.
+    assert np.abs(xyz).max() > band, "xyz must not be limited by a normalised-depth band"
+
+    # And the WRONG order visibly destroys them, so this assertion is not vacuous.
+    wrong = sanitize_extero_np(row, "depth", clip=band).reshape(5, _K)[1:4]
+    assert np.abs(wrong).max() <= band + 1e-12
+    assert np.abs(wrong - xyz).max() > 1.0, "the two orders should differ by metres"
+
+
+def test_the_band_binds_the_depth_channel_only():
+    """``extero_clip`` is in NORMALISED DEPTH units; the xyz channels are metres of position.
+
+    Clamping position with a depth band destroyed real geometry: on the shipped pair the far
+    camera's entire x channel saturated at +5.575 while the true values spanned 9.5-12.0 m, so
+    the generator was told the world ends 5.575 units away in every direction. It survived
+    review because the two quantities have similar magnitudes and the shapes never change.
+
+    The dataset is the authority and it clamps BEFORE widening (``dataset.py``: "Done AFTER
+    the clamp on purpose"), so a band-clamped position is something the model never trained on.
+    """
+    from deploy.depth_obs import sanitize_extero_row_np
+
+    band, sensors, channels, px = 5.575, 2, 5, 4
+    row = np.zeros((1, sensors * channels * px))
+    view = row.reshape(1, sensors, channels, px)
+    view[0, :, 0, :] = 9.0     # depth, far over the band -> must be clamped
+    view[0, :, 1, :] = 11.96   # x, metres -> must SURVIVE
+    view[0, :, 2, :] = -6.67   # y
+    view[0, :, 3, :] = -4.53   # z, inside the band anyway
+    view[0, :, 4, :] = 1.0     # validity
+
+    out = sanitize_extero_row_np(row, "depth", band, sensors, channels).reshape(
+        1, sensors, channels, px)
+    assert np.allclose(out[0, :, 0, :], band), "the depth channel must be clamped to the band"
+    assert np.allclose(out[0, :, 1, :], 11.96), "x was clamped; the band does not apply to it"
+    assert np.allclose(out[0, :, 2, :], -6.67)
+    assert np.allclose(out[0, :, 3, :], -4.53)
+    assert np.allclose(out[0, :, 4, :], 1.0), "validity is a flag, not a distance"
+
+
+def test_non_finite_positions_are_still_replaced():
+    """Unclamped is not unguarded: the graph folds in a normalisation a NaN would poison."""
+    from deploy.depth_obs import sanitize_extero_row_np
+
+    row = np.zeros((1, 1 * 5 * 2))
+    view = row.reshape(1, 1, 5, 2)
+    view[0, 0, 0, :] = [np.inf, np.nan]     # depth: +inf -> +band (a hole, not a wall)
+    view[0, 0, 1, :] = [np.nan, np.inf]     # x
+    out = sanitize_extero_row_np(row, "depth", 5.575, 1, 5).reshape(1, 1, 5, 2)
+    assert np.isfinite(out).all()
+    assert out[0, 0, 0, 0] == pytest.approx(5.575)
+    assert np.allclose(out[0, 0, 1, :], 0.0), "a bad position goes to the frame origin"
+
+
+def test_a_single_channel_row_is_unchanged_by_the_channel_aware_path():
+    """A scan, or a 1-channel depth graph, must behave exactly as before."""
+    from deploy.depth_obs import sanitize_extero_np, sanitize_extero_row_np
+
+    rng = np.random.default_rng(3)
+    row = rng.uniform(-9.0, 9.0, size=(4, 16))
+    assert np.array_equal(sanitize_extero_row_np(row, "depth", 5.575, 2, 1),
+                          sanitize_extero_np(row, "depth", clip=5.575))

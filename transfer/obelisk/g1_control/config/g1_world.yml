@@ -43,7 +43,7 @@ robot:
             # ORDER IS LOAD-BEARING and is not checked anywhere: obelisk fills joint_names
             # from the jointpos entries in this order and appends the jointvel readings in
             # theirs, so mismatched orders silently pair each joint's position with another
-            # joint's velocity. Generated from g1_29j.xml's sensor block; regenerate both
+            # joint's velocity. Generated from g1_perceptive.xml's sensor block; regenerate both
             # together. All 29 joints must appear or the controller refuses to arm.
             sensor_names:
             # ---------- Joint positions (order defines joint_names) ---------- #
@@ -116,9 +116,10 @@ robot:
               pelvis_imu_quat_sensor: framequat
         # ----- Depth camera ----- #
         # Same topic and same message the Jetson ZED node publishes on hardware, so the
-        # controller cannot tell them apart. `dt` and the whole scan_config come from the
-        # policy's exported contract via scripts/rsl_rl/export_sensor_configs.py -- do not
-        # hand-edit config/scan/depth_*.yml, regenerate it.
+        # controller cannot tell them apart. The whole scan_config comes from the policy's
+        # exported contract via scripts/rsl_rl/export_sensor_configs.py -- do not hand-edit
+        # config/scan/depth_*.yml, regenerate it. `dt` is NOT in that contract (a camera
+        # contract states geometry and normalization, not a rate) and is stated here.
         #
         # The path form is `config_path:` rather than an inline `scan_config:` because the
         # file is GENERATED: `include:` merges whole top-level sections and cannot splice a
@@ -132,13 +133,42 @@ robot:
         # The topic names are the convention for a TWO-camera policy; the older single
         # /depth/image_processed predates the pair. The Jetson ZED node must publish on these
         # same names on hardware -- see config/scan/zed_targets.yml for what it has to emit.
+        #
+        # `dt` IS DELIBERATELY NOT THE CONTROL RATE, and is currently 30 Hz. At 50 Hz -- one
+        # frame per tick, from an independent timer in this process -- the two loops drift at
+        # ~1 ms/s and the relative phase wraps every ~20 s, so frame age at the tick that
+        # consumes it is a per-run lottery over the whole 0-20 ms period. Measured across two
+        # runs: one sat at a stable 15 ms, the next sat ON the boundary and alternated between
+        # 0 and 21 ms as jitter tipped each frame to one side. Nothing in a 20 s run averages
+        # that out, and it is not noise a policy trained on fixed-rate Isaac data ever saw.
+        #
+        # A rate off the control rate makes the beat fast instead: the age still sweeps, but
+        # through a full cycle in ~100 ms rather than ~20 s, so a run of any length sees the
+        # whole distribution rather than one arbitrary phase.
+        #
+        #   60 Hz  measured 60.3 Hz achieved, age mean 8.3 / max 19 ms. The 16.6 ms frame
+        #          period is under the tick, so no frame is reused.
+        #   45 Hz  WHAT IS SET BELOW. 22.2 ms is just over the 20 ms tick, so a frame is
+        #          occasionally reused, and the 5 Hz beat against the control rate sweeps the
+        #          whole age distribution every 200 ms -- a 20 s run sees ~100 cycles of it.
+        #          Chosen to match the rate the real ZED pair sustains: 47.2 / 47.7 Hz
+        #          measured on the robot, unarmed, with both cameras live.
+        #   30 Hz  33.3 ms exceeds the 20 ms tick, so some ticks reuse a frame. Over the
+        #          100 ms cycle (5 ticks, 3 frames) the ages are 0, 20, 6.7, 26.7, 13.3;
+        #          measured mean 16 / p99 33 ms.
+        #
+        # Read the ACHIEVED rate out of a bag rather than trusting this line -- compare_stacks
+        # prints "delivered a frame every N ms" per camera. A value near the 20 ms tick period
+        # means the estimator degenerated (it needs the two rates to differ), not that the
+        # camera is slow; well above the configured period means the world did not keep up.
+        # Two casts at 60 Hz is ~600 ms of work per wall second in the sim process.
           - topic: /depth/near/image_processed
-            dt: 0.02
+            dt: 0.0222222
             msg_type: DepthImage
             config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/depth_near.yml
             sensor_names: {depth_near_pos_sensor: framepos}
           - topic: /depth/far/image_processed
-            dt: 0.02
+            dt: 0.0222222
             msg_type: DepthImage
             config_path: ${ROBOT_RL_ROOT}/g1_control/config/scan/depth_far.yml
             sensor_names: {depth_far_pos_sensor: framepos}

@@ -2,6 +2,27 @@
 
 """G1 low-level controller: the flow-matching generator + RL tracker, on hardware.
 
+DEPRECATED. ``g1_control_cpp`` (``config/g1_cpp.yml``) is the supported controller and the
+default in EVERY run script and every mode, clip playback included; this one is kept for one
+shrinking reason and will be removed: bisecting a regression against a known-good
+implementation, by launching ``g1.yml`` (or ``g1_debug_clip.yml``) instead of its C++ twin
+and changing nothing else.
+
+Clip playback is no longer a reason. ``deploy.clip_reference`` is ported --
+``g1_deploy::ClipReference``, fed by a binary pack rather than the ``.h5`` the image has no
+HDF5 to read -- and the two implementations are held to 1e-11 by
+``deploy_cpp/test/clip_reference_parity_test.cc``, which is what makes running one against
+the other a bisect rather than a guess.
+
+It is not merely unsupported on the robot, it is UNUSABLE there: aarch64 rclpy is a cp310 C
+extension and the only onnxruntime GPU build that runs on a Thor is cp312, so two C
+extensions built for different CPython ABIs cannot share a process and this node reaches the
+CPU only -- ~471 ms per generator tick against a 20 ms control period. That is the whole
+reason the C++ port exists.
+
+Do not add features here. Anything new belongs in ``transfer/deploy_cpp`` (the numeric half,
+tested against the python oracle with no ROS) or in ``g1_control_cpp`` (the ROS half).
+
 The policy itself is NOT implemented here. ``transfer/deploy.GenTrackerPolicy`` is the one
 runtime shared by the MuJoCo sim2sim runner and this node, so the observation assembly,
 the generator cadence and the action scaling are identical in sim and on the robot by
@@ -175,9 +196,23 @@ class G1Controller(ObeliskController):
 
         self._infer_ms: list[float] = []
         self._last_report = 0.0
+        # Previous tick's clock and the gap it implies, for ControllerDebug.tick_period_ms --
+        # the ROS timer's own jitter, which _record_latency deliberately does not measure (it
+        # times the policy call, not the gap between calls). Advanced by compute_control, read
+        # by _build_debug_msg; see the note there for why the builder must not touch it.
+        self._last_tick_t: float | None = None
+        self._tick_period_ms = 0.0
 
         # LAST, because it dry-runs a diagnostic message against every attribute above.
         self._setup_debug()
+        # Loud, once, at bring-up: a config file is easy to launch out of habit, and the
+        # difference between the two controllers is otherwise invisible in the log until
+        # something is slow.
+        self.get_logger().warn(
+            "this is the DEPRECATED python controller. g1_control_cpp (config/g1_cpp.yml) is "
+            "the supported one and the default in every run script; on aarch64 this node "
+            "cannot reach the GPU at all. Clip playback is the only mode that still needs it."
+        )
         self.get_logger().info("g1_controller up, DISARMED (waiting for LOW_LEVEL_CONTROL).")
 
     # ------------------------------------------------------------------ setup
@@ -203,8 +238,12 @@ class G1Controller(ObeliskController):
         # ON by default, unlike the MuJoCo runner. MuJoCo spawns the robot on the clip's
         # own step-0 pose; a real robot is wherever it is standing, so the clip has to be
         # re-placed onto it instead. Without this the reference starts metres away.
+        # Seconds of clip to play before holding, 0 = the whole clip. The clip is the
+        # command source here, so `run_sim_low.sh --duration` (which bounds the velocity
+        # PROFILE node) does not reach this mode at all.
+        self.declare_parameter("debug_clip_duration", 0.0)
         self.declare_parameter("debug_clip_ego_anchor", True)
-        self.declare_parameter("debug_clip_ego_anchor_every", 1)
+        self.declare_parameter("debug_clip_ego_anchor_every", 0)
 
         # ---- Diagnostics ----
         # On by default: ~330 kB/s is nothing next to being unable to explain a fall, and a
@@ -217,9 +256,14 @@ class G1Controller(ObeliskController):
         self.verbose = bool(self.get_parameter("verbose").value)
         self.debug_topics = bool(self.get_parameter("debug_topics").value)
         self.debug_clip_path = str(self.get_parameter("debug_clip").value)
+        self.clip_duration = float(self.get_parameter("debug_clip_duration").value)
         self.clip_ego_anchor = bool(self.get_parameter("debug_clip_ego_anchor").value)
+        # 0 = DERIVE from the tracker's own fm_update_every, resolved in _setup_clip once the
+        # artifact is loaded. Under window_anchor='plan' the clip placement and the window
+        # anchor must be solved from the robot on the same step, so this is a property of the
+        # policy rather than a tuning knob -- see GenTrackerPolicy.assert_clip_reference_compatible.
         self.clip_ego_anchor_every = max(
-            1, int(self.get_parameter("debug_clip_ego_anchor_every").value))
+            0, int(self.get_parameter("debug_clip_ego_anchor_every").value))
 
     def _load_policy(self):
         """Fetch and load the ONNX pair.
@@ -265,6 +309,21 @@ class G1Controller(ObeliskController):
             self.get_logger().info(
                 "Debug-clip mode: not requiring CUDA. The generator is not loaded, and the "
                 "tracker alone fits the control period on the CPU.")
+        # A >1-channel generator unprojects its own depth image, which needs each camera's
+        # pose in the root's yaw-aligned frame -- i.e. forward kinematics. This node has none
+        # and will not grow any: it is deprecated, and the C++ controller already FKs the
+        # cameras every tick (g1_deploy::CameraPoseFk). Refused HERE rather than one tick
+        # after arming, where the same missing key surfaces as a KeyError from deep inside
+        # the observation assembly.
+        channels = 1
+        if not clip_mode:
+            channels = int(getattr(policy.ctx, "extero_channels", 1) or 1)
+        if channels > 1:
+            raise RuntimeError(
+                f"this generator conditions on {channels} channels per pixel, so it needs "
+                "camera forward kinematics, which the DEPRECATED python controller does not "
+                "have. Launch config/g1_cpp.yml (the default in every run script) instead."
+            )
         self.get_logger().info(
             f"Policy {repo}/{folder}: obs={policy.get_num_obs()} act={policy.get_num_actions()} "
             f"dt={policy.get_dt():.4f}s cameras={len(policy.get_depth_camera_spec())} "
@@ -419,9 +478,21 @@ class G1Controller(ObeliskController):
             clip_id=clip_id,
             start_time=float(self.get_parameter("debug_clip_start_time").value),
             ego_anchor=self.clip_ego_anchor,
-            ego_anchor_every=self.clip_ego_anchor_every,
+            ego_anchor_every=self.clip_ego_anchor_every or self.policy.fm_update_every,
             root_frame_bodies=self.policy._trk.get_root_frame_bodies(),
         )
+        # Whatever the cadence resolved to, it is the clip's now -- read it back rather than
+        # keeping a second copy that could disagree with what is actually being served.
+        self.clip_ego_anchor_every = self._clip.ego_anchor_every
+        self.policy.assert_clip_reference_compatible(self._clip)
+        # Last step the clip will PLAY. Beyond it the reference holds and the command is
+        # zeroed -- see _tick_clip. Bounded by the clip's own length, so a --duration longer
+        # than the clip is a no-op rather than an error.
+        self._clip_stop_step = self._clip.real_steps - 1
+        if self.clip_duration > 0.0:
+            self._clip_stop_step = min(
+                self._clip_stop_step,
+                self._clip.start_step + int(round(self.clip_duration / self._clip.dt)))
         if abs(self._clip.dt - self.policy.get_dt()) > 1e-6:
             raise RuntimeError(
                 f"clip dt {self._clip.dt} != policy dt {self.policy.get_dt()}: the motion "
@@ -432,7 +503,8 @@ class G1Controller(ObeliskController):
             f"{'case ' + case + ' -> ' if case else ''}clip {clip_id}: "
             f"{self._clip.real_steps} steps ({self._clip.real_length_s:.2f}s), "
             f"start={self._clip.start_step * self._clip.dt:.2f}s, "
-            f"anchor={'ego/every %d' % self.clip_ego_anchor_every if self.clip_ego_anchor else 'world'}. "
+            f"anchor={'ego/every %d' % self.clip_ego_anchor_every if self.clip_ego_anchor else 'world'}"
+            f" ({self.policy.window_anchor}). "
             "The generator is NOT in this loop."
         )
 
@@ -523,6 +595,22 @@ class G1Controller(ObeliskController):
         m.ctrl_step = max(0, int(getattr(self.policy, "_ctrl_step", 0)))
         m.latency_ms = self._infer_ms[-1] if self._infer_ms else 0.0
 
+        # The two networks separately -- see the .msg comments for why one total will not do.
+        # Non-destructive, unlike pop_avg_infer_ms, which the 5 s report line drains.
+        split = self.policy.last_infer_ms()
+        m.fm_infer_ms = float(split["fm_ms"])
+        m.trk_infer_ms = float(split["trk_ms"])
+        # Read-only here on purpose. `_assert_debug_msg_current` dry-runs this whole builder
+        # during __init__ to prove the installed g1_msgs is current, so a `self._last_tick_t =
+        # self.t` side effect in here would be stamped at CONSTRUCTION time -- before the
+        # control timer exists -- and the first real tick would report the entire
+        # configure-to-activate gap as its control period. `compute_control` advances it.
+        m.tick_period_ms = self._tick_period_ms
+        # The schedule-health counters have no python equivalent: this runtime samples the
+        # generator SYNCHRONOUSLY inside the tick, so there is no mailbox to drop a plan, no
+        # busy worker to skip a request, and a plan cannot be late for its own boundary. They
+        # are left at zero rather than faked, and plot_from_bag reads them only when nonzero.
+
         # Provenance: WHICH sample, not its value. See the .msg comments.
         if self._est_stamp is not None:
             m.est_state_stamp = self._est_stamp
@@ -595,6 +683,8 @@ class G1Controller(ObeliskController):
         m.num_nodes = int(self.policy.ctx.F)
         m.node_dim = int(self.policy.ctx.D)
         m.window_blocks = [str(b) for b in self.policy.reference_blocks]
+        # So a viewer can FK the predicted joints without restating a tracker contract.
+        m.ee_frame_names = [str(n) for n in self.policy.ctx.target_frame_names]
         m.anchor_pos = flat(self.policy._anchor_pos)
         m.anchor_quat = flat(self.policy._anchor_quat)
         m.history_nodes = flat(plan["history_nodes"])
@@ -887,8 +977,19 @@ Stream health -- measured Hz, inter-arrival jitter, range and invalid-pixel frac
         # for the FSM" and "the node died" look identical in a bag -- both are simply an
         # absent topic -- and the first is the normal state of a stack nobody has armed yet.
         if not self.armed or not self.have_estimate:
+            # The tick clock stops with the loop, so a re-arm does not charge the whole
+            # disarmed interval to the first armed tick's control period.
+            self._last_tick_t = None
+            self._tick_period_ms = 0.0
             self._publish_debug(None, None)
             return None
+
+        # Sampled at the TOP, so the guards below that return early still count as ticks that
+        # consumed a period -- and here rather than in _build_debug_msg, which is dry-run once
+        # at construction and so must have no side effects.
+        self._tick_period_ms = ((self.t - self._last_tick_t) * 1e3
+                                if self._last_tick_t is not None else 0.0)
+        self._last_tick_t = self.t
         if self.depth_spec and any(d is None for d in self.depth_raw):
             self.get_logger().warn("Waiting for the first frame from every depth camera...",
                                    throttle_duration_sec=2.0)
@@ -923,17 +1024,32 @@ Stream health -- measured Hz, inter-arrival jitter, range and invalid-pixel frac
         Returns:
             The published command, or None (see :meth:`_publish`).
         """
-        s = min(self._clip_step, self._clip.real_steps - 1)
-        state = self._build_state(command=self._clip.command_at(s))
+        s = min(self._clip_step, self._clip_stop_step)
+        # Once the reference stops advancing the command must go to ZERO. Playback saturates
+        # on its last played frame, and `command_at` there returns whatever that frame was
+        # authored with -- so a clip that ends mid-walk otherwise holds a walk command
+        # against a stationary reference. Measured: a backward clip held -0.94 m/s for 16 s
+        # after its last frame and put the robot down, which reads as a policy failure and
+        # is not one.
+        held = self._clip_step >= self._clip_stop_step
+        command = ([0.0, 0.0, 0.0] if held else self._clip.command_at(s))
+        state = self._build_state(command=command)
         if not self._clip_started:
             self._clip_started = True
             self._start_clip(state)
 
         t0 = time.perf_counter()
-        if self.clip_ego_anchor and (self._clip_step - self._clip.start_step) % self.clip_ego_anchor_every == 0:
+        # ONE number for both decisions: the clip's own elapsed tick, which the depth
+        # watchdog freezes along with the reference. The policy latches its window anchor on
+        # the same number, so under window_anchor='plan' the placement and the anchor are
+        # always solved from the robot at the same instant -- which is what keeps the served
+        # window a pure function of the clip. A separate counter here drifted by exactly the
+        # length of any freeze, silently.
+        clip_tick = self._clip_step - self._clip.start_step
+        if self.clip_ego_anchor and clip_tick % self.clip_ego_anchor_every == 0:
             self._clip.reanchor_ego(s, state["root_pos"], state["root_quat"])
         obs = self.policy.create_obs_from_reference(
-            state, self._clip.reference_at(s, self.policy.window_offsets))
+            state, self._clip.reference_at(s, self.policy.window_offsets), clip_tick=clip_tick)
         action = self.policy.get_action(obs, self.hw_joint_names)
         self._record_latency((time.perf_counter() - t0) * 1e3)
 
@@ -941,7 +1057,7 @@ Stream health -- measured Hz, inter-arrival jitter, range and invalid-pixel frac
         # the command and nothing has to publish one -- and honouring it would let an absent
         # joystick freeze the reference forever.
         frozen = self._update_watchdogs(check_vel_cmd=False)
-        if self._clip_step >= self._clip.real_steps - 1:
+        if self._clip_step >= self._clip_stop_step:
             if not self._clip_exhausted:
                 self._clip_exhausted = True
                 self._report_clip_exhausted(s)

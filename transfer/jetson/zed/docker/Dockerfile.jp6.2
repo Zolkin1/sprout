@@ -29,10 +29,10 @@ ARG ZED_IMAGE=stereolabs/zed:4.2-devel-jetson-jp6.2
 FROM ${ZED_IMAGE} AS base
 SHELL ["/bin/bash", "-c"]
 
-ARG USER=user
+ARG ZED_USER=unitree
 ARG UID=1000
 ARG GID=1000
-ENV USER=$USER UID=$UID GID=$GID
+ENV USER=$ZED_USER UID=$UID GID=$GID
 ENV TZ=America/Los_Angeles
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=en_US.UTF-8
@@ -90,6 +90,16 @@ WORKDIR /home/${USER}
 ARG ZED_REF=23ef4fa709652614d385daa355e917c2ca9ea34f
 RUN git clone https://github.com/wdc3iii/zed-interface.git /home/${USER}/zed-interface_src && \
     cd /home/${USER}/zed-interface_src && git checkout ${ZED_REF}
+
+# Local patches on top of the pinned ref, applied in name order. Currently one: the node has
+# no way to say WHICH camera to open, which is a race on a two-camera box (see the patch
+# header). `git apply` fails the build on a patch that no longer applies, which is the point --
+# a silently-skipped patch here would mean two nodes fighting over camera 0 on the robot.
+COPY --chown=${UID}:${GID} patches /home/${USER}/zed-interface_patches
+RUN cd /home/${USER}/zed-interface_src && \
+    for p in /home/${USER}/zed-interface_patches/*.patch; do \
+        echo "[patch] $(basename "$p")" && git apply --verbose "$p"; \
+    done
 
 # obelisk_control_msgs, sparse-checked-out. Kept because the reference deployment of this
 # node builds against it and the dependency cannot be checked from here; it is one small

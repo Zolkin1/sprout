@@ -43,7 +43,7 @@ import importlib
 import sys
 
 mods = ["numpy", "mujoco", "onnxruntime", "yaml", "scipy", "h5py", "pygame",
-        "huggingface_hub", "matplotlib"]
+        "huggingface_hub", "matplotlib", "mcap", "mcap_ros2"]
 missing = []
 for name in mods:
     try:

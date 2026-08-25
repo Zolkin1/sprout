@@ -43,6 +43,20 @@ SCENE="" ; BUILD="" ; AUTO_ARM=1
 while [ $# -gt 0 ]; do
     case "$1" in
         --scene)       SCENE="${2:-}"; shift 2 ;;
+        # A SCRIPTED velocity profile instead of the joystick, by name from
+        # transfer/sim/experiments/velocity_commands.py -- the same names the MuJoCo sim2sim
+        # runner's --command takes, from the same file. This is what makes an
+        # obelisk-vs-sim2sim comparison an input-for-input one.
+        # MOVED to run_sim_low.sh. It has to live with the joystick, which is in the BRAIN's
+        # config: launched from here the scripted node published alongside the joystick's own
+        # zeros and the controller latched whichever arrived last, zeroing about a quarter of
+        # the ticks. Refused rather than ignored, because the failure is invisible in a plot
+        # of the command until you look at the raw topic.
+        --command|--duration)
+            echo "run_sim_world.sh: $1 moved to run_sim_low.sh -- the joystick lives in the" >&2
+            echo "  brain config and has to be relayed off /vel_cmd, which only that side" >&2
+            echo "  can do. Use: scripts/run_sim_low.sh --command <profile>" >&2
+            exit 2 ;;
         --no-auto-arm) AUTO_ARM=""; shift ;;
         --build)       BUILD=1; shift ;;
         --build-clean) BUILD=clean; shift ;;
@@ -53,6 +67,8 @@ while [ $# -gt 0 ]; do
             echo "  The MuJoCo world + FSM echo, in tmux session 'simworld'."
             echo "  Launch scripts/run_sim_low.sh (the brain) FIRST -- it needs ~10 s to"
             echo "  load the policy, and the robot free-falls once this comes up."
+            echo "  --command/--duration MOVED to run_sim_low.sh (the joystick is in the"
+            echo "                 brain config, so only that side can relay it off /vel_cmd)."
             echo "  --scene NAME picks transfer/sim/robots/g1/<NAME>.xml; the config"
             echo "  default is the terrain scene. Available:"
             ls "$HERE/../../sim/robots/g1/"*.xml 2>/dev/null | xargs -n1 basename 2>/dev/null | sed 's/^/    /'

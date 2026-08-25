@@ -45,6 +45,9 @@ control:
       #   stand_walk_stand  -- the same clip untruncated: stand, walk, stand. Shares a
       #                        bit-identical prefix with `stand`, so a failure here isolates
       #                        the walk transition and nothing else.
+      #   walk_backward     -- a stand, then a sustained straight-backward walk. The one
+      #                        direction `stand_walk_stand` never tests. No generator is
+      #                        loaded, so a stumble here is the TRACKER, not the generator.
       #   terrain           -- a stairs transition; adds the depth cameras and terrain
       #                        anchoring. Needs a matching world (--scene terrain_scene).
       # scripts/run_sim_clip.sh --case overrides this per run.
@@ -53,14 +56,24 @@ control:
       # Seconds into the clip to begin. The stand cases open with ~12.5 s of standing;
       # skip most of it with e.g. 11.0 when you want to reach the walk quickly.
       debug_clip_start_time: 0.0
+      # Seconds of clip to PLAY before holding the last played frame with a ZERO command.
+      # 0 = the whole clip. `run_sim_low.sh --duration` bounds the velocity-PROFILE node and
+      # does not reach this mode -- here the clip itself is the command source.
+      # scripts/run_sim_clip.sh --duration overrides this per run.
+      debug_clip_duration: 0.0
       # ON, unlike the MuJoCo runner's default. MuJoCo spawns the robot on the clip's own
       # step-0 pose; a real robot is wherever it is standing, so the clip must be re-placed
       # onto IT instead (planar position, heading and height). Without this the reference
       # starts metres away and the first command is a lunge.
       debug_clip_ego_anchor: true
-      # Every control step. Matches what the teacher trained with and keeps the reference
-      # receding from the robot rather than running away from it.
-      debug_clip_ego_anchor_every: 1
+      # 0 = DERIVE from the tracker's own `fm_update_every`, which is the only correct
+      # source. Under `window_anchor: plan` -- what every tracker since the mode_11 refresh
+      # declares -- the clip's placement and the reference window's anchor have to be solved
+      # from the robot on the SAME step, or up to K-1 steps of the robot's own egomotion leak
+      # into the base_pose block. That is a window matching neither training nor an
+      # odometry-free serve, and it is the same width as a correct one, so nothing downstream
+      # can see it. This was 1 (i.e. every step) against a K=12 tracker.
+      debug_clip_ego_anchor_every: 0
 
       # The generator is absent, so the CUDA requirement does not apply: the tracker alone
       # is ~0.3 ms. Left true so the run matches g1.yml when a GPU is present; the

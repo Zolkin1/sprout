@@ -40,12 +40,74 @@ Up-arrow away, so a node you Ctrl-C is one keystroke from restarting.
 
 | script | what it launches |
 |---|---|
-| `run_sim_low.sh` | the BRAIN alone -- `g1.yml`, i.e. controller + estimator + joystick FSM (session `simlow`) |
+| `run_sim_low.sh` | the BRAIN alone -- `g1_cpp.yml`, i.e. controller + estimator + joystick FSM (session `simlow`) |
 | `run_sim_clip.sh` | the brain with the GENERATOR REMOVED, driven by a pre-made clip (session `simclip`) |
 | `run_sim_world.sh` | the sim ROBOT -- MuJoCo world + FSM echo (session `simworld`) |
 | `run_hardware_low.sh` | brain + real G1 driver + Jetson ZED depth (session `lowhw`) |
 | `build.sh` | colcon build inside the container |
 | `stop.sh` | kill the tmux server, reap orphaned launches (`--zed`, `--stop`, `--down`) |
+| `net_check.sh` | preflight for a two-machine run: domain/RMW, discovery, endpoint pairing, rates |
+
+## Running the world on another machine
+
+The brain and the world are already two processes with two configs and two obelisk `config:`
+identities (`rl_policy` vs `g1_world`), which is exactly what lets them share one ROS graph.
+Nothing about splitting them across two boxes needs a new launch path -- `run_sim_low.sh`
+launches the brain alone and `run_sim_world.sh` the world alone, unchanged:
+
+```bash
+# dev desktop
+scripts/run_sim_world.sh --scene g1_perceptive_basic_scene
+# the Thor
+scripts/run_sim_low.sh
+```
+
+Worth doing when the controller box is also paying for the sim. The world side is not cheap:
+1 kHz MuJoCo, two ray-cast depth cameras at 50 Hz, and a 21600-ray lidar scan at 10 Hz. Order
+still matters and for the same reason -- **brain first**, then the world.
+
+**What has to agree.** Discovery is stock Cyclone with no configuration anywhere in this repo,
+so the requirements are the ones DDS imposes:
+
+- `ROS_DOMAIN_ID` and `RMW_IMPLEMENTATION`. `obk` sets both (`2` and `rmw_cyclonedds_cpp`) and
+  every pane the launchers open runs `obk`, so this is automatic -- but only inside the
+  container. A laptop running `rviz2` outside one has to set them by hand.
+- **The same `OBELISK_REF` in both images.** A different pin means different generated message
+  definitions, and DDS then refuses to pair endpoints on type hash. There is no error for
+  this: both halves come up, both log normally, and no message ever crosses.
+- The repo checked out on the desktop with its own `docker/.env` (the world config resolves
+  `${ROBOT_RL_ROOT}/../sim/robots/g1/*.xml` from it), and `scripts/build.sh` run there --
+  `run_sim_world.sh` also launches `fsm_state_echo` out of `g1_control`.
+- `scripts/stop.sh` on **each** box. The orphan reaper is container-local.
+
+**When discovery does not cross.** Cyclone discovers over UDP multicast by default. That is
+fine on a wired switch and is why the Jetson depth camera has always just worked. It is *not*
+fine over wifi -- campus and guest APs routinely enable client isolation, which drops
+multicast between clients -- and it is ambiguous on a box with several interfaces up, where
+Cyclone picks one and it need not be the one that reaches the other machine. The fix is an
+explicit unicast peer list: copy `docker/cyclonedds.xml.example` to `docker/cyclonedds.xml`,
+list the OTHER box (**on both boxes** -- a peer list is not symmetric by itself), and set
+`CYCLONEDDS_URI` in `docker/.env`. Then `docker compose up -d --force-recreate`, since compose
+reads `.env` only when it creates a container.
+
+**Diagnosing it.** `scripts/net_check.sh`, run on both boxes while both halves are up. It
+reads the graph only -- it launches nothing and is safe against a live robot -- and separates
+the four ways this fails: an environment mismatch, discovery not crossing, a message-hash
+mismatch from differing obelisk pins (a topic with a publisher and a subscriber that never
+pair), and everything pairing but a rate being wrong.
+
+**What actually crosses, and what must not.** ~1.5 MB/s total, and depth is not the concern:
+the images are 30x26 float32, 3.1 kB a frame. The load is `/obelisk/g1/joint_encoders`
+(500 Hz) and `/obelisk/g1/pelvis_imu` (1 kHz), both reliable-QoS. `/obelisk/g1/est_state` is
+also 1 kHz but stays entirely on the brain box, because the estimator lives in the brain
+config -- which is also where it lives on hardware. If the link cannot carry the sensor
+streams, lower those two sensors' `dt` in the world config for split runs; do **not** move the
+estimator to the world side to make the split cheaper, because that is a topology hardware
+never has.
+
+Clocks need not be synchronised for the run to work -- every watchdog is deliberately on local
+receipt time -- but a bag records header stamps from both boxes, so run NTP/chrony if you
+intend to compare them.
 
 ## When the robot falls over, start here
 
@@ -80,7 +142,7 @@ so a robot that cannot hold it has a problem that has nothing to do with any pol
 All three are known to survive in MuJoCo through the same `transfer/deploy` runtime:
 
 ```bash
-cd ../sim && python gen_tracker_runner.py --load_run <run> --robot_name g1_29j \
+cd ../sim && python gen_tracker_runner.py --load_run <run> \
     --clip transfer/obelisk/g1_control/resource/debug_clips/g1_debug_v1.h5 \\
     --clip_case stand --clip_ego_anchor --log
 ```
@@ -96,7 +158,7 @@ the teacher trained on, so the motions are in-distribution rather than invented 
 test. Cases are referred to by NAME (via the library's JSON sidecar) because indices move
 whenever the library is rebuilt.
 
-The sim is two launches, not one, for the same reason hardware is: `g1.yml` is robot-less
+The sim is two launches, not one, for the same reason hardware is: the brain config is robot-less
 and the robot comes from its own config, so the brain you test in sim is byte-identical to
 the one that runs on the robot. `run_sim_world.sh` stands in for `run_hardware_low.sh`'s
 robot half -- it publishes the same topics, including the FSM state (`fsm_state_echo` lives
@@ -207,7 +269,8 @@ obelisk `global_state`, so either can be restarted without cycling the other.
 ```
 g1_control/config/
   common/low_level.yml   fragment: controller + estimator + joystick FSM (no `config:`)
-  g1.yml                 THE BRAIN -- launched identically in sim and on hardware
+  g1_cpp.yml             THE BRAIN -- launched identically in sim and on hardware
+  g1.yml                 the same brain on the DEPRECATED python controller (see below)
   g1_debug_clip.yml      the same brain with the GENERATOR REMOVED, driven by a baked clip
   g1_robot_hw.yml        the real Unitree driver, alone
   g1_world.yml           the MuJoCo world, alone
@@ -216,15 +279,30 @@ g1_control/config/
 
 Sim (two terminals, or use the launch scripts):
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml
 obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_world.yml
 ```
 
 Hardware -- identical brain, different robot:
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml
 obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml
 ```
+
+**The python controller (`g1.yml`) is DEPRECATED.** `g1_cpp.yml` is what the run scripts
+launch and what the robot runs; `--python` selects the old one and prints a warning. EVERY
+default is C++, clip playback included (`g1_cpp_clip.yml`) -- the one thing that still keeps
+the python node alive is bisecting a regression against a known-good implementation. On
+aarch64 it cannot reach the GPU in any case: rclpy is a cp310 C extension and the only
+onnxruntime GPU build for a Thor is cp312, so it runs the generator on the CPU at ~471 ms
+against a 20 ms period.
+
+The C++ runtime plays clips from a binary PACK rather than the `.h5`
+(`transfer/deploy/tools/dump_clip_pack.py`): the image ships no HDF5, and the library is
+lzf-compressed, which the plain HDF5 C library cannot decode. The pack carries the channel
+NAMES, so one built for a different robot fails loudly instead of reading the right columns
+of the wrong motion, and the port is held to the python oracle at 1e-11
+(`deploy_cpp/test/clip_reference_parity_test.cc`).
 
 Debug clip -- same robot half, brain with no generator:
 ```
@@ -283,7 +361,7 @@ Then, update the `network_interface_name` parameter in the robot section of
 
 Now we can launch the hardware stack -- the brain and the robot, as two separate launches:
 ```
-obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1.yml
+obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml
 obk-launch config=$ROBOT_RL_ROOT/g1_control/config/g1_robot_hw.yml
 ```
 
@@ -312,6 +390,48 @@ E-STOP is right trigger.
 > **Changed in obelisk `9f52216`:** the `low_level_ctrl -> user_pose` transition was removed.
 > From low-level control the only exits are DAMPING and E-STOP -- you can no longer step back
 > to the held pose, so plan aborts around damping.
+
+## The ZED box: one ssh link and one clock
+
+The depth cameras are not on this box. `run_hardware_low.sh`'s depth pane ssh's to the ZED
+box (`zolkin@192.168.123.221`, `OBK_JETSON_HOST` in `docker/.env`) and starts the pair inside
+the container there, so the brain's container needs pubkey auth to it and the two boxes need
+one time base. Both are one-time, per box:
+
+```bash
+scripts/setup_zed_link.sh                     # dedicated passphrase-free key -> ssh-copy-id
+sudo scripts/setup_clock_sync.sh --master      # this box serves time to 192.168.123.0/24
+# then, on the ZED box, from its own checkout:
+sudo transfer/obelisk/scripts/setup_clock_sync.sh --client
+scripts/setup_clock_sync.sh --check            # back here: is it following us, and by how much
+```
+
+**The key is deliberately NOT `~/.ssh/id_ed25519`**, which on this box has a passphrase (it is
+the GitHub key). A tmux pane cannot answer a passphrase prompt, so it would hang there
+forever showing nothing -- and a depth pane that prints no frames reads as a camera fault.
+`setup_zed_link.sh` makes `~/.ssh/id_obk_zed` with no passphrase and an `~/.ssh/config` block
+with `IdentitiesOnly yes` so ssh cannot fall back to the other key. `~/.ssh` is bind-mounted
+into the container, so the key made on the host IS the one the pane uses.
+
+`run_hardware_low.sh` now preflights that link before it opens any pane and refuses to start
+with the cause named (no route / no pubkey / no container) rather than leaving you a silent
+pane. `--no-depth` is the way past it, and also the right flag when the far side is already up
+and you only want to stop supervising it.
+
+**Why the BRAIN is the time master**, and not the ZED box (which is the one with internet):
+`depth_capture_age` is a receipt time made here minus a capture stamp made there, and every
+other stamp in the bag is this box's, so making this box the reference turns a difference
+between two steered clocks into one client's reported offset. The ZED box's UTC arrives over
+wifi, and the robot has to work with no wifi; `local stratum 10 orphan` here keeps ONE
+self-consistent base either way while still tracking real UTC whenever the uplink is there.
+The cost is honest: `systemd-timesyncd` is an SNTP client and cannot serve time, so chrony
+gets installed here and apt removes timesyncd -- pointing timesyncd at the ZED box instead
+would have needed no package at all.
+
+None of this is a safety gate. The depth watchdog times frames by LOCAL RECEIPT on purpose
+(`g1_controller.cc`), so a skewed camera clock cannot stale-latch a healthy camera. Skew
+corrupts `depth_capture_age` -- the only number that says how old a frame was when the policy
+used it -- and every cross-box comparison in a bag.
 
 # Setting up the Xbox remote
 You can now run the script:
@@ -370,6 +490,77 @@ To open a new bash terminal for running container
 
 # Observability
 
+## Live, in RViz
+
+```bash
+scripts/run_sim_low.sh --rviz           # then run_sim_world.sh as usual
+```
+
+Shows the robot in its ESTIMATED pose (so it is a view of what the controller believes, not of
+MuJoCo's ground truth -- the two diverging is itself a finding), plus what the generator is
+asking it to do:
+
+| what | where it comes from |
+|---|---|
+| the robot's joint configuration and base pose | `default_robot_viz` + `robot_state_publisher`, off `/obelisk/g1/est_state` and the `g1_model` URDF |
+| **orange** root ribbon, the generator's whole F-node plan lifted to world | `/obelisk/g1/debug/fm_plan` -> `g1_control fm_plan_viz` |
+| **cyan** foot paths, forward-kinematic from each predicted node's joints | the same, FK'd on the robot's URDF with pinocchio |
+| orientation triads every few nodes, and the plan's anchor frame | the same. A yaw error is INVISIBLE in a bare path |
+| **green** the 13 window rows the tracker actually observed this tick | `/obelisk/g1/debug/tick` + `/obelisk/g1/est_state` |
+
+The colours match the MuJoCo sim2sim viewer's ribbon deliberately, and both now call the same
+FK (`deploy.fk.WindowFK`) on the same model, so the two views cannot disagree by construction
+and a discrepancy between them is real. That model is the ROS URDF rather than
+`FlowMatchingConfig.fk_model_path`, the MJCF the generator's own FK loss is defined against:
+the two agree on these four frames to 4.6e-7 m over random postures
+(`transfer/deploy/tests/test_fk_parity.py`, with MuJoCo kept as a test-only oracle), so the
+ribbon is not a second opinion, and the deploy code carries one kinematics library instead of
+two -- the same one the C++ controller FKs the cameras with. The IMAGE still installs MuJoCo
+either way, since obelisk's own sim is a MuJoCo sim.
+
+### Comparing an obelisk run against the MuJoCo sim2sim
+
+`plot_utils/compare_stacks.py` puts both stacks on one pair of axes -- statically, or as a
+tick stepper with a shared cursor:
+
+```bash
+# the sim2sim side needs a per-tick recording, which is one flag
+cd ../sim && python gen_tracker_runner.py ... --dump_replay /tmp/sim_run
+cd ../obelisk
+python plot_utils/compare_stacks.py --bag log/bags/<run> --stream /tmp/sim_run
+python plot_utils/compare_stacks.py --bag log/bags/<run> --stream /tmp/sim_run --interactive
+python plot_utils/compare_stacks.py --stream /tmp/a --stream /tmp/b   # sim vs sim
+```
+
+Both sources present the same interface (`bag_run.Run` / `sim_run.SimRun`), so every trace is
+computed once and drawn twice -- a comparison whose halves come from different code compares
+the code as much as the runs. Figures: `command` (the input both were given), `tracking`
+(base error, position and orientation separately), `error_norm` (against the 0.3 m / 0.8 rad
+bounds the policy was TRAINED under), `joints` (with the worst five named per run). The
+stepper's keys match the bag stepper's: LEFT/RIGHT one tick, UP/DOWN ten, PAGEUP/PAGEDOWN a
+hundred, HOME/END the ends.
+
+**Four things must hold or the comparison means nothing**, and each has been got wrong here:
+time is aligned on each run's own ARM instant (a bag's clock starts ~10 s earlier, at launch);
+joints are indexed in the POLICY's order and the names are checked, not assumed (the robot's
+differs on 27 of 29); both stacks must run the same sampler (`zero_noise`, since the C++ RNG is
+not a bit-port of numpy's, so otherwise they differ by the DRAW); and the sim2sim side must be
+headed or headless consistently, because opening the viewer changes its trajectory.
+
+**The green-vs-orange overlay is the highest-value thing on this display.** The served window
+should lie on the plan at `cursor + offsets`. It is drawn by a different route -- lifted onto
+the MEASURED base rather than the plan's stored anchor -- so a systematic divergence between
+them is the re-anchoring, which is otherwise invisible.
+
+The feet are FK'd from the predicted JOINTS, so they are exactly where those joints put them
+rather than a second opinion about it; the joint error reaches them amplified by the link
+lengths, which is why a gait problem shows up there first.
+
+To view from a laptop instead, see "Running the world on another machine" -- everything RViz
+needs crosses DDS, and the requirements are the same.
+
+## Afterwards, from the bag
+
 **Every run is recorded to an MCAP bag**, by every launcher, by default (`--no-bag` opts
 out). Bags land in `transfer/obelisk/log/bags/<timestamp>_<tag>/`, under `$REPO_ROOT`
 because that is bind-mounted -- obelisk's own `ROS_LOG_DIR` is not, and `stop.sh --down`
@@ -388,6 +579,27 @@ budget, per-camera rate and invalid fraction), `command` (commanded vs achieved 
 subplot per joint -- reference, measured and PD target, by joint name), `reference` (how far
 the window reaches and whether it jumps between re-plans), `generator` (re-plan cadence,
 cursor, inference time).
+
+The `health` figure's timing panel splits the two networks, because they are judged against
+DIFFERENT budgets and a single total cannot say which one moved: the tracker runs inside the
+20 ms tick, while the generator runs on its own thread and is asked for a plan `lead_ticks`
+before the boundary it is for, so its deadline is `lead_ticks * dt` (60 ms at the shipped
+lead). Below it, the generator's cumulative schedule counters -- late events, plans dropped in
+the mailbox, requests skipped because the worker was still busy. A flat line there is a
+healthy stretch; any slope at all is the generator failing to keep its cadence, and dropped or
+skipped shows up before lateness does. The C++ controller prints the same numbers live, once
+every 5 s:
+
+```
+timing (5.0s): tick p50 0.74 p95 1.51 p99 1.86 / 20.0 ms | period p50 20.00 p99 20.46 ms
+  | trk p50 0.58 p99 1.70 ms | fm p50 17.55 p95 18.47 p99 18.54 / 60.0 ms (20 plans, 21
+  expected) | late 0 dropped 0 skipped 0 clamped 0
+```
+
+`period` is the ROS timer's own jitter, measured with `steady_clock` between ticks -- worth
+watching on its own, because the re-plan cadence is counted in TICKS, so a loop that is not
+actually at 50 Hz silently rescales it and every reference offset with it. The line goes to
+WARN if any budget is exceeded or any counter moves; otherwise INFO.
 
 `--interactive` opens a frame stepper: both depth images, the reference root path and joint
 trajectory, joints at the cursor, and the velocity trace. LEFT/RIGHT step one tick, UP/DOWN

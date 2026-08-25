@@ -12,7 +12,7 @@ Thin glue for the obelisk controller to use the shared
   exteroception the policy was trained on.
 
 The ROS2 control loop lives in the obelisk ``g1_control`` controller node; it calls
-``policy.warm_start(build_hardware_state(...))`` on entering low-level control, then each
+``policy.reset()`` on entering low-level control, then each
 50 Hz cycle ``policy.get_action(policy.create_obs(build_hardware_state(...)), hw_names)``.
 
 One frame convention to get right on the estimator side: the FM history needs the base
@@ -45,6 +45,33 @@ ARTIFACT_NAMES = ("tracker.onnx", "fm.onnx")
 #: The obelisk controller config restates it as a ROS param and so cannot import this;
 #: keep ``g1_control/config/common/low_level.yml`` in step by hand.
 DEFAULT_HF_REPO_ID = "zolkin/robot_rl"
+
+#: Sub-directory of the repo every policy lives under, so deployable artifacts do not sit
+#: loose in the repo root next to the trajectory library and the older per-skill folders.
+#: NOT part of ``hf_policy_folder``: callers name a policy by its run name alone and this is
+#: prepended for them, so the prefix appears in exactly one place and a config, a CLI flag or
+#: a ROS param can never disagree with it. That is the same reasoning as DEFAULT_HF_REPO_ID
+#: above, applied before rather than after the mistake.
+#:
+#: The C++ controller restates it (it cannot import this); ``transfer/obelisk/tests/
+#: test_policy_cache_layout.py`` fails the build if the two ever drift.
+HF_POLICY_PREFIX = "policies"
+
+
+def policy_repo_dir(hf_policy_folder: str) -> str:
+    """Repo-relative directory holding one policy's artifacts.
+
+    The local cache mirrors this path, so the remote layout and the on-disk layout can be
+    reasoned about as one thing -- ``hf_hub_download`` places a file at
+    ``local_dir/<repo-relative path>`` and there is nothing to keep in step by hand.
+
+    Args:
+        hf_policy_folder: The policy's own folder name (a run name), with no prefix.
+
+    Returns:
+        ``"<HF_POLICY_PREFIX>/<hf_policy_folder>"``.
+    """
+    return f"{HF_POLICY_PREFIX}/{hf_policy_folder}"
 
 #: Bounds on the online fetch. The download happens inside the controller's lifecycle
 #: ``on_configure``; an unbounded HTTP call there hangs BRING-UP, and the only cure is
@@ -84,13 +111,18 @@ def fetch_artifacts(
     """
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     base = os.path.join(cache_root, hf_repo_id.replace("/", "_"))
+    rel = policy_repo_dir(hf_policy_folder)
     paths = []
     for name in ARTIFACT_NAMES:
-        local = os.path.join(base, hf_policy_folder, name)
+        # The cache mirrors the repo, prefix included, because that is what hf_hub_download
+        # does on a miss (local_dir/<repo-relative path>). Deriving the hit path any other
+        # way would make a cache hit and a cache miss land in different directories, so the
+        # first run after a fetch would re-download every time and never say why.
+        local = os.path.join(base, *rel.split("/"), name)
         if os.path.exists(local) and not refresh:
             paths.append(local)
             continue
-        paths.append(_download(hf_repo_id, f"{hf_policy_folder}/{name}", base))
+        paths.append(_download(hf_repo_id, f"{rel}/{name}", base))
     return tuple(paths)
 
 
@@ -193,6 +225,7 @@ def build_hardware_state(
     depth: np.ndarray | None = None,
     depth_raw=None,
     height_scan: np.ndarray | None = None,
+    fm_camera_pose: list[tuple[np.ndarray, np.ndarray]] | None = None,
 ) -> dict:
     """Assemble the ``GenTrackerPolicy.create_obs`` state dict from robot readings.
 
@@ -215,6 +248,15 @@ def build_hardware_state(
             :func:`~deploy.depth_obs.normalize_camera_images`. This is the usual hardware
             path -- the ROS callback hands over what the camera published.
         height_scan: Per-ray ground clearance, for a height-scan policy.
+        fm_camera_pose: Each camera's pose in the root's YAW-ALIGNED frame -- ``(pos (3,),
+            rot (3, 3))`` per camera in contract order -- required only when the generator
+            conditions on more than depth per pixel. A PARAMETER rather than something
+            computed here: this module has no kinematics, and the caller that does (the C++
+            controller, via ``g1_deploy::CameraPoseFk``) already holds an FK model.
+
+            Build it from FK to the camera mount plus the IMU's roll/pitch, and never from
+            odometry -- the frame's yaw and the root position both cancel out of it, which is
+            precisely what makes a drifting yaw estimate unable to corrupt the cloud.
 
     Returns:
         State dict consumed by :meth:`GenTrackerPolicy.create_obs`.
@@ -275,6 +317,11 @@ def build_hardware_state(
         state["depth"] = np.asarray(depth, dtype=np.float64)
     elif depth is not None:
         raise ValueError("`depth` supplied but this policy has no depth cameras.")
+
+    # Carried through verbatim; gen_tracker validates the count against the contract and
+    # raises with the same explanation if a >1-channel generator finds it absent.
+    if fm_camera_pose is not None:
+        state["fm_camera_pose"] = list(fm_camera_pose)
 
     if policy.needs_height_scan():
         if height_scan is None:

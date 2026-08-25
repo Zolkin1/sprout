@@ -1,0 +1,81 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# The G1 BRAIN driven by a BAKED CLIP instead of the generator, through the C++ controller.
+#
+# What this is for: when the deployed pair falls over, take the generator out of the loop and
+# ask whether anything downstream of the observation works at all. The tracker is driven by a
+# pre-made motion, and no fm.onnx is loaded -- not loaded and idle, not loaded and refused.
+# Whatever happens, the generator was not in it.
+#
+# ============================ why this is not g1_debug_clip.yml ===========================
+# g1_debug_clip.yml does the same thing through the PYTHON controller, which is deprecated. So
+# a case run there swapped the controller LANGUAGE at the same time as it removed the
+# generator, and isolated neither: a fall told you the policy pair and the stack disagreed and
+# nothing about which. This config changes ONE thing against g1_cpp.yml -- where the reference
+# comes from -- so a case that falls here and survives in MuJoCo sim2sim through the same
+# transfer/deploy runtime is a difference in this stack.
+#
+# The two remain worth running against each other: identical case, identical clip, two
+# implementations of the same arithmetic held to 1e-11 by
+# deploy_cpp/test/clip_reference_parity_test.cc. A behavioural difference between them is
+# therefore NOT in the reference construction, which is the point of having both.
+#
+# Launch:
+#   scripts/run_sim_clip.sh --case walk_backward         (this file)
+#   scripts/run_sim_clip.sh --case walk_backward --python (the deprecated python one)
+config: rl_debug_clip_cpp
+
+include:
+  - common/low_level.yml
+
+# Keyed merge, exactly as g1_cpp.yml does it: the fragment's `low_level` entry with its
+# executable swapped and the clip parameters added. Everything else -- hf_repo_id,
+# hf_policy_folder, depth_topics, the timeouts -- comes from the fragment and is not restated,
+# because restating it is how two configs drift apart.
+control:
+  - name: low_level
+    pkg: g1_control_cpp
+    executable: g1_controller
+    params:
+      # The clip pack: a DIRECTORY built by transfer/deploy/tools/dump_clip_pack.py, relative
+      # to the workspace. Not the .h5 the python controller reads -- the image ships no HDF5,
+      # and the library is lzf-compressed, which the plain HDF5 C library cannot decode. The
+      # pack is committed beside the .h5 and carries the channel NAMES, so a pack built for a
+      # different robot fails loudly instead of reading the right columns of the wrong motion.
+      debug_clip_pack: "g1_control/resource/debug_clips/g1_debug_v1_pack"
+      # Which case, BY NAME. The pack is addressed by name rather than by index because an
+      # index moves whenever the library is rebuilt. Cases, easiest first:
+      #   stand             -- the reference never moves. If this falls, the fault is this
+      #                        stack: no policy is being asked to do anything.
+      #   stand_walk_stand  -- the same clip untruncated. Shares a bit-identical prefix with
+      #                        `stand`, so a failure here isolates the walk transition.
+      #   walk_backward     -- a stand, then a straight-backward walk. The one direction
+      #                        stand_walk_stand never tests.
+      #   terrain           -- a stairs transition; adds the depth cameras and terrain
+      #                        anchoring. Pair with `run_sim_world.sh --scene terrain_scene`.
+      # scripts/run_sim_clip.sh --case overrides this per run.
+      debug_clip_case: "stand"
+      # Seconds into the clip to begin, and seconds to PLAY before holding the last played
+      # frame with a ZERO command (0 = the whole clip). Playback SATURATES rather than
+      # stopping, and the padding repeats the last frame's authored command -- so a case ending
+      # mid-walk would otherwise hold a walk command against a stationary reference and put the
+      # robot down for reasons that are the harness's rather than the policy's.
+      debug_clip_start_time: 0.0
+      debug_clip_duration: 0.0
+      # 0 DERIVES the re-anchor cadence from the tracker's own fm_update_every, which is the
+      # only correct source. Under window_anchor="plan" -- what every tracker since the mode_11
+      # refresh declares -- the clip's placement and the reference window's anchor have to be
+      # solved from the robot on the SAME step, or up to K-1 steps of the robot's own egomotion
+      # leak into base_pose. That is a window matching neither training nor an odometry-free
+      # serve, and it is exactly as wide as a correct one, so nothing downstream can see it.
+      # PolicyRuntime refuses a mismatch rather than serving it.
+      debug_clip_ego_anchor_every: 0
+
+      # The generator is absent, so the tracker is the only network and it runs on the CPU in
+      # ~0.3 ms. Left as g1_cpp.yml has it so the rest of the stack is unchanged; the runtime
+      # simply never opens a CUDA session for a generator it does not load.
+      tracker_on_cpu: true
+      tracker_threads: 2
+      # Always on for a debug run: the point is to come away with a recording.
+      debug_topics: true
+      verbose: true

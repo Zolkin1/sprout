@@ -16,8 +16,20 @@
 #                            bit-identical prefix with `stand`, so if that one held and this
 #                            one falls, the difference is the walk transition and nothing
 #                            else.
+#   --case walk_backward     a stand, then a straight-backward walk (-0.90 m/s), then a
+#                            frozen stand, so the case is safe to hold indefinitely.
+#                            The one direction `stand_walk_stand` never tests, and the mode
+#                            the deployed pair has been seen to stumble in. With no
+#                            generator loaded, a stumble here is the TRACKER.
 #   --case terrain           a stairs transition. Adds the depth cameras and terrain
 #                            anchoring; pair with `run_sim_world.sh --scene terrain_scene`.
+#
+# The clip runs through the SAME C++ controller the generator path uses (g1_cpp_clip.yml), so
+# a case changes exactly one thing against a normal run: where the reference comes from.
+# `--python` runs the deprecated python controller instead, which is worth doing as an A/B --
+# the two implementations of the reference are held to 1e-11 by
+# deploy_cpp/test/clip_reference_parity_test.cc, so a BEHAVIOURAL difference between them is
+# not in the reference construction.
 #
 # Each case is known to survive in MuJoCo through the SAME deploy runtime
 # (transfer/sim/gen_tracker_runner.py --clip --clip_case <case>), so a case that falls here
@@ -29,6 +41,7 @@
 # Usage:
 #   scripts/run_sim_clip.sh                            stand, recorded
 #   scripts/run_sim_clip.sh --case stand_walk_stand    then this
+#   scripts/run_sim_clip.sh --case walk_backward       ... backward, generator out
 #   scripts/run_sim_clip.sh --case terrain             ... with --scene terrain_scene
 #   scripts/run_sim_clip.sh --start_time 11.0          skip most of the standing prefix
 #   scripts/run_sim_clip.sh --no-bag                   do not record
@@ -50,9 +63,16 @@ usage() {
 run_sim_clip.sh -- the brain with a baked clip instead of the generator, in tmux `simclip`.
 
 Options:
-  --case NAME      stand (default) | stand_walk_stand | terrain. Resolved through the clip
-                   library's JSON sidecar, so names survive a library rebuild.
-  --clip PATH      Clip library .h5, relative to the repo root
+  --duration S     Play only the first S seconds of the clip, then HOLD the last played
+                   frame with a ZERO command. 0/unset = the whole clip. Use it to stop a
+                   case at the part you care about instead of letting the tail run.
+  --python         Run the DEPRECATED python controller (g1_debug_clip.yml) instead of the
+                   C++ one. Kept for bisecting a regression between the two.
+  --case NAME      stand (default) | stand_walk_stand | walk_backward | terrain. Resolved
+                   through the pack (C++) or the library's JSON sidecar (python), so names
+                   survive a rebuild.
+  --clip PATH      Clip source, relative to the workspace: a PACK DIRECTORY for the C++
+                   controller, the library .h5 for --python
                    (default: the config's
                    transfer/obelisk/g1_control/resource/debug_clips/g1_debug_v1.h5).
                    It must be INSIDE the repo: the container mounts only $REPO_ROOT,
@@ -77,13 +97,15 @@ EOF
 }
 
 ORIG_ARGS=("$@")
-CASE="" ; CLIP="" ; START="" ; POLICY="" ; BUILD="" ; BAG=1 ; EGO=""
+CASE="" ; CLIP="" ; START="" ; POLICY="" ; BUILD="" ; BAG=1 ; EGO="" ; DURATION="" ; LANG=cpp
 while [ $# -gt 0 ]; do
     case "$1" in
         --case)         CASE="${2:-}"; shift 2 ;;
         --clip)         CLIP="${2:-}"; shift 2 ;;
         --start_time)   START="${2:-}"; shift 2 ;;
+        --duration)     DURATION="${2:-}"; shift 2 ;;
         --world-anchor) EGO=false; shift ;;
+        --python)       LANG=python; shift ;;
         --policy)       POLICY="${2:-}"; shift 2 ;;
         --no-bag)       BAG=""; shift ;;
         --build)        BUILD=1; shift ;;
@@ -101,10 +123,16 @@ if [ -z "${OBK_IN_CONTAINER:-}" ]; then
 fi
 
 SESSION="$OBK_SESSION"
-CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_debug_clip.yml"
+if [ "$LANG" = cpp ]; then
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_cpp_clip.yml"
+else
+    echo "[obk] --python: the DEPRECATED python controller. Use it to bisect a regression"
+    echo "[obk]           against the C++ one, not as the default clip path."
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_debug_clip.yml"
+fi
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
-if [ -n "$CASE$CLIP$START$EGO" ]; then
-    CTRL_CFG="$(obk_clip_config "$CTRL_CFG" "$CASE" "$CLIP" "$START" "$EGO")"
+if [ -n "$CASE$CLIP$START$EGO$DURATION" ]; then
+    CTRL_CFG="$(obk_clip_config "$CTRL_CFG" "$CASE" "$CLIP" "$START" "$EGO" "$DURATION" "$LANG")"
 fi
 
 if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then
@@ -112,7 +140,7 @@ if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then
 fi
 tmux kill-session -t "$SESSION" 2>/dev/null || true
 
-BAG_CMD="$(obk_bag_cmd "clip${CASE:+_$CASE}")"
+BAG_CMD="$(obk_bag_cmd "clip${CASE:+_$CASE}${LANG:+_$LANG}")"
 tmux new-session  -d -s "$SESSION" -n main "$(obk_pane_run ctrl "obk-launch config=$CTRL_CFG")"
 if [ -n "$BAG" ]; then
     tmux split-window -h -t "$SESSION":main.0 "$(obk_pane_run bag "$BAG_CMD")"

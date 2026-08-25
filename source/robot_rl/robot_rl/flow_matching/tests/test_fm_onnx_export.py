@@ -13,6 +13,7 @@ Runs on CPU with a tiny model; no checkpoint or recording on disk is needed.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import sys
@@ -100,6 +101,13 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto",
         "meta": {"state_joint_names": meta.state_joint_names,
                  "target_frame_names": meta.state_frame_names,
                  "extero_spec": train.extero_spec,
+                 # RecordingMeta carries this and train.py's asdict() puts it in the
+                 # checkpoint, so it is present in every real .pt. Mirrored here because the
+                 # bug being guarded against was the export DROPPING it, which is invisible
+                 # when the test's own checkpoint never had one.
+                 "robot_asset": {"short": "deadbeefcafe", "version": 1,
+                                 "covers": ["joint_names"],
+                                 "joint_names": list(meta.state_joint_names)},
                  "fm_snap_every": 12},
         "num_joints": nj,
         "state_normalizer": train.state_normalizer.state_dict(),
@@ -112,24 +120,31 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto",
 
 
 @pytest.mark.parametrize("encoder", ["mlp", "cnn"])
-def test_fm_onnx_graph_signature(tmp_path, encoder):
+@pytest.mark.parametrize("dynamic_batch", [False, True])
+def test_fm_onnx_graph_signature(tmp_path, encoder, dynamic_batch):
     """The graph must expose exactly the five inputs the deploy runtime feeds by name.
 
     Both encoders, because the input SIGNATURE must not depend on which one is inside:
     ``extero`` stays the flat ``T * sensor_dim`` the deploy runtime already feeds, and the
     convolution folds it internally. If that ever stops holding, every off-sim consumer
     (MuJoCo, hardware) needs changing with it.
+
+    Both batch declarations, because the DEFAULT changed: the batch axis is now fixed at 1
+    (see ``export_fm_onnx._export_graph`` -- a symbolic batch put 2687 of 6606 kernel nodes
+    on the host and ruled out CUDA Graph capture). A fixed axis has to be a concrete 1 in
+    the file, not a symbol that happens to be bound to 1 at run time, because it is the
+    declaration that constant folding acts on.
     """
     ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path, encoder)
     out = str(tmp_path / "fm.onnx")
-    export_fm_onnx(ckpt, out, opset=18)
+    export_fm_onnx(ckpt, out, opset=18, dynamic_batch=dynamic_batch)
     model = onnx.load(out, load_external_data=False)
 
     d = window_dim(nj, k)
     got_in = {i.name: [dd.dim_value or dd.dim_param for dd in i.type.tensor_type.shape.dim]
               for i in model.graph.input}
     assert set(got_in) == {"history", "extero", "cmd_tokens", "noise", "history_null"}, got_in
-    # Batch is dynamic; every other axis is fixed by the checkpoint.
+    # Every non-batch axis is fixed by the checkpoint, under either declaration.
     assert got_in["history"][1:] == [n, d]
     assert got_in["noise"][1:] == [f, d]
     assert got_in["history_null"][1:] == [1]
@@ -137,9 +152,14 @@ def test_fm_onnx_graph_signature(tmp_path, encoder):
     out_shape = [dd.dim_value or dd.dim_param
                  for dd in model.graph.output[0].type.tensor_type.shape.dim]
     assert out_shape[1:] == [f, d]
-    # All five inputs must share ONE dynamic batch symbol, or a multi-env caller silently
-    # binds mismatched batches.
-    assert len({got_in[k_][0] for k_ in got_in} | {out_shape[0]}) == 1
+
+    batch = {got_in[k_][0] for k_ in got_in} | {out_shape[0]}
+    if dynamic_batch:
+        # All five inputs must share ONE dynamic batch symbol, or a multi-env caller
+        # silently binds mismatched batches.
+        assert batch == {"V"}, batch
+    else:
+        assert batch == {1}, batch
 
 
 @pytest.mark.parametrize("encoder", ["mlp", "cnn"])
@@ -160,6 +180,11 @@ def test_fm_meta_contract(tmp_path, encoder):
         "cmd_steps", "num_cmd_tokens", "extero_sensor_dim", "extero_source",
         "extero_sensor_count", "extero_spec", "fm_snap_every",
         "window_blocks", "has_history_null",
+        # WHICH ROBOT. transfer/deploy/fm_session reads it into FmContext.robot_asset and
+        # GenTrackerPolicy._assert_robot_assets_agree refuses a tracker/generator pair that
+        # disagrees. That check short-circuits on a missing FM side, so for a long time the
+        # absent key made it dead code rather than a failing test -- hence pinning it here.
+        "robot_asset",
     }
     assert required <= set(meta), f"fm_meta is missing {sorted(required - set(meta))}"
     assert (meta["N"], meta["F"], meta["nj"]) == (n, f, nj)
@@ -167,6 +192,9 @@ def test_fm_meta_contract(tmp_path, encoder):
     assert len(meta["joint_names"]) == nj
     assert len(meta["cmd_steps"]) == meta["num_cmd_tokens"]
     assert meta["fm_snap_every"] == 12
+    assert meta["robot_asset"]["short"] == "deadbeefcafe", (
+        "the checkpoint's robot fingerprint did not reach fm_meta; the deploy-side pair check "
+        "silently passes on a missing FM side, so this is the only thing that would notice")
     # The state-layout guard. The generator's output goes straight into the tracker's
     # observation, so the block table has to travel: D alone does not identify the layout.
     assert [tuple(b) for b in meta["window_blocks"]] == window_blocks(nj, k)
@@ -237,11 +265,18 @@ def test_fm_onnx_matches_torch(tmp_path, encoder):
     Run at ``v=3`` on purpose: it is the check that the convolutional reshapes kept the
     graph's batch axis DYNAMIC. A reshape traced against a concrete batch would pass at
     v=1 and fail here.
+
+    That is why this one exports with ``dynamic_batch=True`` rather than taking the default.
+    Deployment fixes the axis at 1 now, but the tracer property this test guards -- that the
+    convolutional path does not bake the batch into a reshape -- is only observable in the
+    symbolic export, and it is what makes ``dynamic_batch=True`` still work when someone
+    reaches for it. The fixed-axis graph gets its own parity check in
+    ``test_fm_onnx_static_batch``.
     """
     ort = pytest.importorskip("onnxruntime", exc_type=ImportError)
     ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path, encoder)
     out = str(tmp_path / "fm.onnx")
-    meta = export_fm_onnx(ckpt, out, opset=18)
+    meta = export_fm_onnx(ckpt, out, opset=18, dynamic_batch=True)
     d, v = meta["D"], 3
 
     rng = np.random.default_rng(0)
@@ -268,6 +303,87 @@ def test_fm_onnx_matches_torch(tmp_path, encoder):
     # history_null=1 must select the learned null embedding, i.e. change the output.
     null_feed = dict(feed, history_null=np.ones((v, 1), dtype=np.float32))
     assert not np.allclose(got, sess.run(["trajectory"], null_feed)[0], atol=1e-6)
+
+
+@pytest.mark.parametrize("encoder", ["mlp", "cnn"])
+def test_fm_onnx_static_batch(tmp_path, encoder):
+    """Fixing the batch axis must remove the host-side shape arithmetic, not change the answer.
+
+    The two halves of the claim in ``export_fm_onnx._export_graph``:
+
+    * **Mechanism.** With a symbolic batch, every head reshape in the traced attention
+      blocks computes its target shape at run time, so the graph carries ``Shape`` nodes and
+      the ``Gather``/``Unsqueeze``/``Concat`` int64 chain hanging off them. onnxruntime keeps
+      shape arithmetic on the HOST, so those became 2687 of 6606 kernel nodes on the
+      ``CPUExecutionProvider`` for the shipped 27M generator, plus 71 ``MemcpyFromHost``
+      nodes -- and any host node makes onnxruntime refuse CUDA Graph capture outright.
+      The graph-level statement of that, and it needs no GPU: run onnxruntime's own
+      optimizer and count what survives. Constant folding can only delete the shape
+      arithmetic if the shapes are known, so ``Shape`` nodes surviving optimization ARE the
+      nodes that get placed on the host. Measured on the shipped generator, the counts line
+      up exactly -- 0 surviving ``Shape`` against 3052 all-CUDA nodes, 358 against 6606 with
+      2687 on the host. Note the assertion is on the OPTIMIZED graph, not the file: the file
+      still contains ``Shape`` nodes either way, and folding them is precisely the work being
+      checked.
+    * **Numerics.** Same answer to ~1e-6, not bit-exact: with the batch known, torch folds a
+      few more constants at export. Three orders below the fp32 CPU-vs-CUDA spread the graph
+      already has, so it is a rounding difference rather than a behaviour change.
+
+    Both encoders, because the convolutional path is where the batch-dependent reshapes
+    actually live -- the flat MLP path has far fewer of them, so ``cnn`` is the case that
+    would regress.
+    """
+    ort = pytest.importorskip("onnxruntime", exc_type=ImportError)
+    ckpt, n, f, nj, k = _tiny_checkpoint(tmp_path, encoder)
+    static, dynamic = str(tmp_path / "fm_static.onnx"), str(tmp_path / "fm_dyn.onnx")
+    meta = export_fm_onnx(ckpt, static, opset=18)
+    export_fm_onnx(ckpt, dynamic, opset=18, dynamic_batch=True)
+    d = meta["D"]
+
+    def optimized_ops(path: str, tag: str) -> collections.Counter:
+        """Op-type histogram of what onnxruntime is left with after it optimizes ``path``."""
+        opt = str(tmp_path / f"opt_{tag}.onnx")
+        so = ort.SessionOptions()
+        # ORT_ENABLE_ALL, matching deploy (``deploy.tracker_session.make_session``): the
+        # constant folding under test is what a deployed session actually runs.
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        so.optimized_model_filepath = opt
+        ort.InferenceSession(path, so, providers=["CPUExecutionProvider"])
+        return collections.Counter(nd.op_type for nd in
+                                   onnx.load(opt, load_external_data=False).graph.node)
+
+    ops_static = optimized_ops(static, f"static_{encoder}")
+    ops_dynamic = optimized_ops(dynamic, f"dyn_{encoder}")
+    assert ops_dynamic["Shape"] > 0, "the symbolic export should need run-time shapes"
+    assert ops_static["Shape"] == 0, (
+        f"the fixed-batch graph still computes {ops_static['Shape']} shapes at run time "
+        "after optimization. Those subgraphs are int64 scalar arithmetic, which onnxruntime "
+        "places on the host -- the whole cost this export exists to remove, and any host "
+        "node also makes it refuse CUDA Graph capture."
+    )
+    assert sum(ops_static.values()) < sum(ops_dynamic.values())
+
+    rng = np.random.default_rng(0)
+    feed = {
+        "history": rng.standard_normal((1, n, d)).astype(np.float32),
+        "extero": rng.standard_normal(
+            (1, meta["extero_sensor_count"] * meta["extero_sensor_dim"])).astype(np.float32),
+        "cmd_tokens": rng.standard_normal(
+            (1, meta["num_cmd_tokens"], meta["cmd_dim"])).astype(np.float32),
+        "noise": rng.standard_normal((1, f, d)).astype(np.float32),
+        "history_null": np.zeros((1, 1), dtype=np.float32),
+    }
+    got = [ort.InferenceSession(pth, providers=["CPUExecutionProvider"]).run(["trajectory"], feed)[0]
+           for pth in (static, dynamic)]
+    assert got[0].shape == (1, f, d)
+    assert np.isfinite(got[0]).all()
+    assert np.abs(got[0] - got[1]).max() < 1e-4
+
+    # A fixed axis must REFUSE a batch, rather than quietly reading the first row: the
+    # graph's declared 1 is what constant folding acted on, so a v=2 feed has no meaning.
+    sess = ort.InferenceSession(static, providers=["CPUExecutionProvider"])
+    with pytest.raises(Exception):
+        sess.run(["trajectory"], {kk: np.concatenate([vv, vv], 0) for kk, vv in feed.items()})
 
 
 def test_a_depth_checkpoint_with_no_clip_band_is_refused(tmp_path):

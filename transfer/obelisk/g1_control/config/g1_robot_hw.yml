@@ -24,8 +24,19 @@ robot:
     pkg: obelisk_unitree_cpp
     executable: obelisk_unitree_g1_hardware
     params:
-      # Set to the interface facing the robot (192.168.123.161); find it with `ifconfig`.
-      # network_interface_name: enx6c1ff724e92e
+      # THIS BOX's own address on the robot LAN -- not the robot's, despite the name. The
+      # obelisk interface uses it only to find which local interface to put the unitree SDK
+      # on (`GetInterfaceName(target_ip, ...)`), and its default is 192.168.123.222, the
+      # Unitree convention for the user PC. This brain is .220, so the default fails at
+      # startup with "No interface found with IP: 192.168.123.222" and the node aborts --
+      # which reads as a robot connection problem rather than a local address mismatch.
+      #
+      # By ADDRESS rather than by interface name on purpose: the name changes when the cable
+      # moves between an onboard NIC and a USB adapter, and the address does not (the same
+      # reasoning as docker/cyclonedds.xml). Setting network_interface_name instead skips
+      # this lookup entirely and is the fallback if a box ever has the address twice.
+      target_ip: "192.168.123.220"
+      # network_interface_name: enP2p1s0
 
       # 29 DoF: the 27-DoF set plus waist roll and pitch. Our clips and the trained policy
       # use the full 29 (see the 29-DoF migration), and the G1 interface only exposes the two
@@ -89,16 +100,40 @@ robot:
         10., 10., 10.,        # R wrist
         10., 10.,             # waist roll, pitch
       ]
-      # The pose the robot snaps to and holds before low-level control. Carried over from the
-      # tuned hardware config, with the two new waist joints at zero (upright torso).
+      # The pose the robot snaps to and holds before low-level control.
+      #
+      # ORDER, as everywhere in this block, is default_joint_names above -- which is NOT the
+      # policy's (interleaved) nor MuJoCo's (the three waist joints consecutive). The two waist
+      # joints the 27-DoF interface did not have go LAST, so waist roll and pitch are the final
+      # two entries and not the ones next to waist yaw. Render it before you send it:
+      #   python transfer/sim/view_user_pose.py --pose-file <candidate>.yml
+      # which resolves that permutation by name against the list above.
+      #
+      # Nearer the posture the tracker starts from than the previous squat: knees close to
+      # straight (0.07 rad against 0.45) and arms hanging with the hands beside the thighs
+      # rather than held forward. Largest single change from the old pose is 0.61 rad on
+      # right_shoulder_yaw.
       user_pose: [
-        -0.25,  0.01, -0.005, 0.45, -0.25, 0.0,
-        -0.25, -0.01, -0.005, 0.45, -0.25, 0.0,
-        0.0,
-        0.47,  0.24, 0.0, 0.8, 0.0, 0.0, 0.0,
-        0.47, -0.24, 0.0, 0.8, 0.0, 0.0, 0.0,
-        0.0, 0.0,
+         0.101,  0.047,  0.207,  0.075, -0.124, -0.028,           # L leg
+         0.073, -0.053, -0.161,  0.066, -0.117,  0.031,           # R leg
+        -0.007,                                                   # waist yaw
+         0.004,  0.251, -0.447,  1.055,  0.040,  0.033, -0.016,   # L arm
+        -0.055, -0.218,  0.606,  1.113, -0.118,  0.011, -0.008,   # R arm
+        -0.014,  0.154,                                           # waist roll, pitch
       ]
+    # The interface's PASSIVE-HOLD timer, and it is not optional: G1Interface registers
+    # `timer_ctrl` in on_configure and it is what drives the motors autonomously while the
+    # FSM sits in USER_POSE or DAMPING (the gains above are the ones it uses). With no entry
+    # here the configure transition fails outright --
+    #   "Timer entry is missing required field 'timer_period_sec'"
+    # -- which reads as a malformed config rather than a missing one.
+    #
+    # 50 Hz, matching the controller's own tick in common/low_level.yml. This is the rate the
+    # HOLD is refreshed at, not a control period the policy sees.
+    timers:
+      - ros_parameter: timer_ctrl_setting
+        timer_period_sec: 0.02
+        callback_group: None
     publishers:
       - ros_parameter: pub_sensor_setting
         topic: /obelisk/g1/joint_encoders

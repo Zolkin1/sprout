@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import rclpy
 from obelisk_control_msgs.msg import ExecutionFSM
+from rclpy._rclpy_pybind11 import RCLError
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
 #: ``ExecFSMState::INIT``. The state a real robot powers up in, and the historical default
@@ -105,11 +107,17 @@ def main(args: list | None = None) -> None:
     node = FsmStateEcho()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
+        # SIGINT gives KeyboardInterrupt; SIGTERM -- which is what tmux and stop.sh send --
+        # invalidates the context under spin, which surfaces as ExternalShutdownException or,
+        # depending on where the wait set was, an RCLError about an invalid context. None of
+        # the three is a failure, and a traceback in the pane reads as one.
+        pass
+    except RCLError:
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        rclpy.try_shutdown()
 
 
 if __name__ == "__main__":

@@ -77,6 +77,11 @@ ACTUATORS: dict[str, tuple[float, float, float, float, float]] = {
 URDF_PATH = (_REPO_ROOT / "robot_assets" / "g1" / "g1_21j"
              / "g1_21j_box_merged_29j_mode11.urdf")
 
+#: The MuJoCo model the OBELISK sim drives the robot with. Its actuator gains are checked
+#: below because they are the one copy of the PD gains nothing else overrides -- see
+#: test_mjcf_actuator_gains_match_the_cfg.
+MJCF_PATH = _REPO_ROOT / "transfer" / "sim" / "robots" / "g1" / "g1_perceptive.xml"
+
 #: Joints where the cfg deliberately disagrees with the URDF, and why.  The cfg is the one
 #: PhysX uses; the URDF value only reaches the sim through the USD's joint limits, which the
 #: actuator cfg overrides.
@@ -196,3 +201,60 @@ def test_velocity_limits_track_the_urdf(resolved):
             f"{joint}: the cfg says {vel} rad/s and {URDF_PATH.name} says {urdf_vel[joint]}. "
             "PhysX uses the cfg, so this divergence would be silent."
         )
+
+
+def _mjcf_actuator_gains() -> dict[str, tuple[float, float]]:
+    """``{joint: (kp, kv)}`` as ``g1_perceptive.xml`` will actually apply them.
+
+    Resolved the way MuJoCo resolves them: an attribute on the ``<position>`` element wins,
+    otherwise the ``<default class=...>`` it names supplies it.
+    """
+    root = ET.parse(MJCF_PATH).getroot()
+    classes = {
+        d.get("class"): (p.get("kp"), p.get("kv"))
+        for d in root.iter("default") if d.get("class")
+        for p in d.findall("position")
+    }
+    out: dict[str, tuple[float, float]] = {}
+    for actuator in root.iter("actuator"):
+        for position in actuator.findall("position"):
+            kp, kv = classes.get(position.get("class"), (None, None))
+            kp = position.get("kp", kp)
+            kv = position.get("kv", kv)
+            assert kp is not None and kv is not None, (
+                f"{position.get('joint')} has no resolvable kp/kv in {MJCF_PATH.name}")
+            out[position.get("joint")] = (float(kp), float(kv))
+    return out
+
+
+def test_mjcf_actuator_gains_match_the_cfg(resolved):
+    """The obelisk sim's PD gains must be the ones the policy was trained with.
+
+    This is the ONE copy of the gains nothing else overrides. ``transfer/sim`` replaces them
+    from the policy (``Robot.set_pd_gains_from_policy``) and the hardware driver takes
+    ``kp``/``kd`` off the wire, but obelisk's MuJoCo sim writes ``u_mujoco`` straight into
+    ``data.ctrl`` and never reads the published gains -- so the MJCF alone decides how stiff
+    the robot is there.
+
+    It went stale exactly the way this test now prevents. ``make_g1_mjcf.py`` copies
+    ``<default>`` verbatim from its template (``g1_29j.xml``, the PREVIOUS robot), so when
+    mode_11 moved hip pitch from the 14.3 gear to the 22.5 the armature was updated and the
+    actuator gains were not: kp 40.18 against the 99.10 the policy exports, a hip pitch 2.46x
+    too soft on the joint that drives fore/aft leg swing. Every shape check passed, sim2sim
+    was unaffected, and it presented only as obelisk tracking worse than sim2sim.
+
+    Tolerance is 0.5%: the MJCF stores the gains to 6 significant figures.
+    """
+    mjcf = _mjcf_actuator_gains()
+    assert set(mjcf) == set(resolved), (
+        "the MJCF actuates a different joint set than the cfg: "
+        f"only in MJCF {sorted(set(mjcf) - set(resolved))}, "
+        f"only in cfg {sorted(set(resolved) - set(mjcf))}")
+    for joint, (_e, _v, stiffness, damping, _a) in sorted(resolved.items()):
+        kp, kv = mjcf[joint]
+        assert kp == pytest.approx(stiffness, rel=5e-3), (
+            f"{joint}: {MJCF_PATH.name} has kp={kp} but the cfg trained at {stiffness}. "
+            "Regenerate with transfer/sim/robots/g1/make_g1_mjcf.py, which derives the gains "
+            "from JOINT_ARMATURE rather than copying them from the template.")
+        assert kv == pytest.approx(damping, rel=5e-3), (
+            f"{joint}: {MJCF_PATH.name} has kv={kv} but the cfg trained at {damping}.")

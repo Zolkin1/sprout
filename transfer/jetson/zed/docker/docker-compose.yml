@@ -12,6 +12,11 @@
 #   docker compose build && docker compose up -d
 #   docker exec -it zed_depth run_node.sh zed        # or let the onboard launcher do it
 
+# Explicit project name. Without one compose derives it from the DIRECTORY, which is
+# `docker` -- and transfer/obelisk/docker is also `docker`, so the two projects would share
+# a namespace and a `docker compose down` in either could reap the other's containers.
+name: zed_depth
+
 services:
   zed_depth:
     image: jetson_zed_depth:${IMAGE_TAG:-jp6.2}
@@ -19,7 +24,7 @@ services:
       context: .
       dockerfile: ${DOCKERFILE:-Dockerfile.jp6.2}
       args:
-        USER: ${USER}
+        ZED_USER: ${ZED_USER:-unitree}
         UID: ${UID:-1000}
         GID: ${GID:-1000}
         ZED_IMAGE: ${ZED_IMAGE:-stereolabs/zed:4.2-devel-jetson-jp6.2}
@@ -31,6 +36,8 @@ services:
     privileged: true                   # ZED USB + tegra device access
     # Run as root: the Jetson GPU/nvmap device nodes are root:video 660, so a non-root user
     # cannot initialise CUDA (NvRmMemInit / cuInit fail). HOME keeps ~ on the built workspace.
+    # Root also covers /dev/spsc_bmi* (the ZED X IMU), which udev gives to group `imu` -- the
+    # SDK treats a missing IMU as a FATAL open failure, not a degraded one.
     user: root
     # ROS_DOMAIN_ID / RMW_IMPLEMENTATION come from .env via env_file -- read VERBATIM --
     # NOT via ${} interpolation under `environment:`. Compose precedence is shell > .env, so
@@ -41,12 +48,35 @@ services:
     env_file:
       - .env
     environment:
-      HOME: /home/${USER}
+      HOME: /home/${ZED_USER:-unitree}
     volumes:
       - /dev:/dev                       # ZED USB enumeration
       # GMSL ZED X only: the SDK opens the camera through Argus, which talks to the host's
-      # nvargus-daemon over this socket. Not needed for a USB ZED 2i / Mini.
-      - /tmp/argus_socket:/tmp/argus_socket
+      # nvargus-daemon over a socket at the hardcoded path /tmp/argus_socket. Not needed for a
+      # USB ZED 2i / Mini.
+      #
+      # The HOST'S WHOLE /tmp, deliberately, and not `- /tmp/argus_socket:/tmp/argus_socket`
+      # as NVIDIA's own examples show. Bind-mounting the socket FILE pins the container to
+      # that inode, and nvargus-daemon deletes and recreates the socket every time it
+      # restarts -- so one daemon restart leaves the container talking to a deleted inode
+      # FOREVER. It fails as `Connecting to nvargus-daemon failed: Connection refused`, which
+      # names Argus and never mentions the mount, and it does not heal: only recreating the
+      # container does. That is not hypothetical here -- nvargus took a SIGBUS
+      # (`code=killed, status=7/BUS`) during bring-up on this box. Mounting the directory
+      # lets the container follow the new inode on its own.
+      #
+      # The blast radius is unchanged in practice: this container is already privileged, on
+      # host networking and host IPC, with all of /dev.
+      - /tmp:/tmp
+      # The timing tools, bind-mounted rather than baked in: they are diagnostics that get
+      # edited between runs, and rebuilding a multi-GB image to change a percentile is not a
+      # loop anyone will actually use. Read-only -- nothing in here writes to the repo.
+      - ../tools:/opt/zed_tools:ro
+      # The per-camera node params. Bind-mounted for the same reason as the tools, and
+      # because the FoV/range numbers in them answer to a policy artifact rather than to
+      # this image -- they change when the tracker does, not when the container does.
+      - ../config:/opt/zed_config:ro
+      - ../launch:/opt/zed_launch:ro
       # Persist the SDK's optimised NEURAL engines, so they are not rebuilt (minutes) on
       # every container start.
       - zed_resources:/usr/local/zed/resources

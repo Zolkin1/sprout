@@ -105,6 +105,14 @@ JOINT_ARMATURE: dict[str, float] = {
                  "wrist_roll", "wrist_pitch", "wrist_yaw")},
 }
 
+#: The PD gain law, matching ``robot_rl.assets.robots.g1_21j``: ``kp = J w^2`` and
+#: ``kd = 2 z J w`` with ``w = 2 pi 10 Hz`` and ``z = 2``. One number per motor class --
+#: :data:`JOINT_ARMATURE` -- decides both, which is why the gains are DERIVED here rather
+#: than carried as their own table. ``test_actuator_table.py`` pins the result against the
+#: RL side, which is the definition.
+NATURAL_FREQ = 10 * 2.0 * 3.1415926535
+DAMPING_RATIO = 2.0
+
 #: Bodies whose visual mesh must NOT be ray-cast, and the group to park it in.
 #:
 #: ``transfer/sim/depth_camera.py`` casts geom groups {1 = per-link visual meshes,
@@ -300,6 +308,82 @@ def exclude_from_raycast(worldbody: ET.Element, bodies=NO_RAYCAST_BODIES,
     return moved
 
 
+def apply_actuator_gains(root: ET.Element, armature=JOINT_ARMATURE) -> dict[str, tuple]:
+    """Rewrite the position actuators' PD gains from the armature table.
+
+    THE GAINS MUST NOT BE COPIED FROM THE TEMPLATE. The template is the PREVIOUS robot
+    (``g1_29j.xml``), and ``<default>`` is in :data:`TEMPLATE_SECTIONS` -- so when mode_11
+    moved hip pitch from the 14.3 gear to the 22.5, its armature was updated here (it feeds
+    ``<joint armature=...>``) while its ACTUATOR gains kept the old class's numbers. The
+    result was a hip pitch 2.46x too soft: kp 40.18 where the policy exports 99.10.
+
+    That was invisible almost everywhere. ``transfer/sim`` overwrites these gains from the
+    policy (``Robot.set_pd_gains_from_policy``) and the hardware driver takes ``kp``/``kd``
+    off the wire, so the ONE consumer of this block is the obelisk MuJoCo sim -- whose
+    ``ApplyControl`` writes ``u_mujoco`` straight into ``data.ctrl`` and never reads the
+    published gains. A stale number here therefore shows up only as a robot that tracks
+    slightly worse in obelisk than in sim2sim, which is exactly how it presented.
+
+    Args:
+        root: The assembled MJCF root, edited in place.
+        armature: Joint name -> rotor inertia; the same table :func:`apply_joint_dynamics`
+            stamps onto the hinges, so the two cannot describe different motors.
+
+    Returns:
+        ``{default class: (kp, kv)}`` as written.
+
+    Raises:
+        ValueError: If an actuated joint has no armature, if a position actuator declares no
+            default class, or if one class is shared by joints whose gains differ -- that
+            last one means the class needs splitting, and silently writing one joint's gains
+            over another's is the failure this function exists to prevent.
+    """
+    per_class: dict[str, dict[str, tuple]] = {}
+    missing: list[str] = []
+    for actuator in root.iter("actuator"):
+        for position in actuator.findall("position"):
+            joint = position.get("joint")
+            cls = position.get("class")
+            if joint not in armature:
+                missing.append(str(joint))
+                continue
+            if cls is None:
+                raise ValueError(
+                    f"position actuator for {joint} declares no default class, so there is "
+                    "nowhere to write its gains.")
+            kp = armature[joint] * NATURAL_FREQ ** 2
+            kv = 2.0 * DAMPING_RATIO * armature[joint] * NATURAL_FREQ
+            per_class.setdefault(cls, {})[joint] = (kp, kv)
+    if missing:
+        raise ValueError(
+            f"no armature declared for actuated joint(s) {sorted(set(missing))}, so their PD "
+            "gains cannot be derived. Add them to JOINT_ARMATURE.")
+
+    written: dict[str, tuple] = {}
+    for cls, joints in per_class.items():
+        gains = set(joints.values())
+        if len(gains) > 1:
+            raise ValueError(
+                f"default class {cls!r} is shared by joints with different gains: "
+                f"{joints}. Split the class -- writing one joint's gains over another's is "
+                "silent and is exactly what this check is for.")
+        kp, kv = next(iter(gains))
+        found = False
+        for default in root.iter("default"):
+            if default.get("class") != cls:
+                continue
+            for position in default.findall("position"):
+                position.set("kp", f"{kp:.6g}")
+                position.set("kv", f"{kv:.6g}")
+                found = True
+        if not found:
+            raise ValueError(
+                f"no <default class={cls!r}> with a <position> in the template, so the gains "
+                f"for {sorted(joints)} would fall back to MuJoCo's defaults.")
+        written[cls] = (kp, kv)
+    return written
+
+
 def apply_joint_dynamics(worldbody: ET.Element, armature=JOINT_ARMATURE) -> list[str]:
     """Stamp each hinge with its own armature. Returns the joints that had none declared.
 
@@ -371,6 +455,9 @@ def build(urdf: str, template: str, out: str) -> None:
     for tag in TEMPLATE_SECTIONS:
         for element in template_root.findall(tag):
             root.append(copy.deepcopy(element))
+    gains = apply_actuator_gains(root)
+    print(f"[mjcf] PD gains derived from JOINT_ARMATURE for {len(gains)} actuator class(es): "
+          + ", ".join(f"{c} kp={kp:.4g}" for c, (kp, _kv) in sorted(gains.items())))
     _point_meshdir_at_the_urdf(root, urdf, out)
     for element in generated.findall("asset"):
         root.append(element)

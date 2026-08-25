@@ -1,0 +1,793 @@
+{
+  "format": 1,
+  "generator": "transfer/deploy/tools/dump_obs_fixtures.py",
+  "numpy": "2.4.6",
+  "byteorder": "little",
+  "num_obs": 3101,
+  "steps": [
+    {
+      "step": 0,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step00.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step00.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step00.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step00.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step00.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step00.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step00.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step00.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step00.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "7134715257799381042",
+      "obs": {
+        "file": "step00.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 1,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step01.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step01.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step01.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step01.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step01.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step01.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step01.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step01.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step01.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "8728651954611897015",
+      "obs": {
+        "file": "step01.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 2,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step02.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step02.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step02.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step02.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step02.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step02.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step02.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step02.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step02.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "2893509137765036892",
+      "obs": {
+        "file": "step02.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 3,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step03.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step03.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step03.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step03.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step03.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step03.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step03.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step03.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step03.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "15608737632045367935",
+      "obs": {
+        "file": "step03.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 4,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step04.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step04.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step04.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step04.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step04.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step04.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step04.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step04.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step04.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "1181386936336485808",
+      "obs": {
+        "file": "step04.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 5,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step05.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step05.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step05.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step05.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step05.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step05.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step05.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step05.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step05.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "11318378198785673292",
+      "obs": {
+        "file": "step05.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 6,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step06.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step06.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step06.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step06.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step06.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step06.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step06.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step06.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step06.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "9848117882806449284",
+      "obs": {
+        "file": "step06.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 7,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step07.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step07.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step07.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step07.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step07.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step07.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step07.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step07.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step07.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "17937495764065121593",
+      "obs": {
+        "file": "step07.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 8,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step08.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step08.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step08.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step08.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step08.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step08.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step08.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step08.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step08.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "5196017406150442050",
+      "obs": {
+        "file": "step08.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 9,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step09.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step09.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step09.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step09.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step09.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step09.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step09.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step09.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step09.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "8314702742931508822",
+      "obs": {
+        "file": "step09.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 10,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step10.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step10.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step10.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step10.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step10.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step10.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step10.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step10.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step10.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "12534009764998755652",
+      "obs": {
+        "file": "step10.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 11,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step11.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step11.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step11.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step11.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step11.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step11.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step11.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step11.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step11.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "1814225969743964302",
+      "obs": {
+        "file": "step11.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 12,
+      "poison": false,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step12.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step12.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step12.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step12.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step12.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step12.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step12.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step12.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step12.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "6351126035740501718",
+      "obs": {
+        "file": "step12.out.obs.bin",
+        "size": 3101
+      }
+    },
+    {
+      "step": 13,
+      "poison": true,
+      "terms": [
+        {
+          "name": "base_ang_vel",
+          "file": "step13.in.base_ang_vel.bin",
+          "size": 3
+        },
+        {
+          "name": "projected_gravity",
+          "file": "step13.in.projected_gravity.bin",
+          "size": 3
+        },
+        {
+          "name": "joint_pos",
+          "file": "step13.in.joint_pos.bin",
+          "size": 29
+        },
+        {
+          "name": "joint_vel",
+          "file": "step13.in.joint_vel.bin",
+          "size": 29
+        },
+        {
+          "name": "actions",
+          "file": "step13.in.actions.bin",
+          "size": 29
+        },
+        {
+          "name": "depth_near",
+          "file": "step13.in.depth_near.bin",
+          "size": 780
+        },
+        {
+          "name": "depth_far",
+          "file": "step13.in.depth_far.bin",
+          "size": 780
+        },
+        {
+          "name": "reference_window",
+          "file": "step13.in.reference_window.bin",
+          "size": 572
+        },
+        {
+          "name": "command_window",
+          "file": "step13.in.command_window.bin",
+          "size": 39
+        }
+      ],
+      "checksum": "729830411571488194",
+      "obs": {
+        "file": "step13.out.obs.bin",
+        "size": 3101
+      }
+    }
+  ]
+}

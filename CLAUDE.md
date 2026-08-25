@@ -54,7 +54,75 @@ generator predicted.
 torch-free ONNX runtime), `transfer/torch_math` (isaaclab-free torch quaternion math, the
 test-only oracle for the numpy ports), `transfer/obelisk` (ROS2 hardware).
 
-# Depth Cameras (this branch)
+# The robot is `g1_perceptive`, and FOUR files describe it
+
+`robot_assets/g1_perceptive/` is the trained robot: mode_11 motors, a 2.64 kg compute backpack
+(Thor + ZED), passive rubber hands in place of the Dex3-1s, the torso collider on the torso, and
+the depth-camera mounts on their as-built CAD pose. Everything else is DERIVED from its URDF, and
+that is the point -- the same robot used to be described by hand in several places at once.
+
+| file | derived by | read by |
+|---|---|---|
+| `robot_assets/g1_perceptive/g1_perceptive.urdf` | authored (`make_perceptive_urdf.py`) | the source of truth |
+| `robot_assets/g1_perceptive/g1_perceptive/` (USD) | `urdf_to_usd_conversion.py` | IsaacLab |
+| `transfer/sim/robots/g1/g1_perceptive.xml` | `make_g1_mjcf.py` | MuJoCo sim2sim + `motion_gen` FK |
+| `transfer/obelisk/g1_model/urdf/g1_perceptive.urdf` | `make_ros_urdf.py` | the deploy camera FK + RViz |
+
+**The fourth one is the cautionary tale.** It was a hand-kept copy called `g1_29j.urdf`, and it
+was byte-identical on main, the deploy branch and the training-refresh branch -- so while
+training moved to the perceptive robot, `g1_deploy::CameraPoseFk` went on FK'ing the old one.
+Nothing errored: `torso_link` and all 29 joints exist in both, so every name it looks up
+resolved, and it placed both depth cameras **exactly 10.0 mm high on every unprojected xyz
+channel**. A wrong camera pose is a plausible cloud in the wrong place, so no image inspection
+would ever have found it. `test_ros_urdf_is_generated.py` now fails if the generated file drifts
+from its source, and `test_fk_parity.py` imports both models from where they are DEFINED rather
+than restating paths, so the URDF and the MJCF cannot name different robots.
+
+**Joint count and order are UNCHANGED -- 29, identical -- and that is what makes a stale model
+dangerous.** `joint_names_isaac` is the only exported field that came close to identifying a
+robot, and it matches across a payload change, a hand swap and a gear-ratio change. So:
+- `robot_asset` (`motion_gen/robot_asset.py`) fingerprints urdf/mjcf/usd hashes + joint names +
+  sorted body names + total mass. `export_parameters` stamps it into `tracker.onnx`,
+  `export_fm_onnx` into `fm.onnx`, and BOTH runtimes refuse a pair that disagrees
+  (`_assert_robot_assets_agree`, `AssertRobotAssetsAgree`). A missing side is silent -- it is a
+  guard against a new mismatch, not a migration gate -- but "absent" and "empty" are
+  deliberately different things, since an empty fingerprint would compare equal to anything.
+- `terrain_fingerprint` is stamped and **deliberately compared nowhere on the deploy path**; see
+  `TrackerSession.get_terrain_fingerprint` for why both obvious comparisons are wrong rather
+  than merely unimplemented.
+- **Pre-mode_11 checkpoints load and are numerically meaningless**: `G1_ACTION_SCALE` is
+  `0.125 * effort / stiffness`, and hip pitch moved from the 14.3 to the 22.5 gear, so its action
+  scale went 0.2738 -> 0.1753. Same width, different meaning. `test_actuator_table.py` pins the
+  whole table.
+- Body names changed in BOTH directions (39 bodies; the 16 Dex3 links per side went, the hands,
+  camera mounts and backpack arrived), so `body_names` is no longer a prefix of the old list and
+  anything indexing it positionally shifts silently.
+
+# The reference window has TWO conventions, and deploy serves only one
+
+`window_anchor` decides what the `base_pose` block's POSITION is measured from
+(`robot_rl/flow_matching/window.py`). The two arms are **identical in width and in every other
+block**, so a tracker trained under one loads clean against the other and merely steers wrong --
+which is why the convention travels in the artifact and is checked rather than inferred.
+
+- `robot_now` -- `p_ref - p_actual(t)`, the tracking error against the robot as it is this step.
+  Serving it means re-anchoring the prediction onto the measured base every control step, which
+  needs a base POSITION, which on a robot means odometry.
+- `plan` -- `p_ref - p_plan`, measured from the root at the last re-plan. The generator already
+  predicts in that frame, so its output IS the observation: served as made, no base position read.
+
+**The C++ deploy runtime serves `plan` ONLY, and refuses `robot_now` by design rather than by
+omission** (`AnchorFromConvention`). That is what makes the deploy path odometry-free: under
+`plan`, `root_pos` reaches only the anchor latch and from there only `TickDiagnostics` and the
+FmPlan ribbon in RViz. The FAST-LIO plumbing stays in the repo, unused, and a drifting or absent
+base position costs a debug ribbon rather than the robot. The PYTHON runtime serves both arms --
+it is the MuJoCo driver and the parity oracle, and MuJoCo has a true base pose, so a `robot_now`
+A/B belongs there.
+
+**One `fm.onnx` serves either arm.** The generator is invariant to the choice: `_run_fm` latches
+the anchor on both, and the history stash is the raw served node on both. Only the serve differs.
+
+# Depth Cameras
 Two self-scanning depth cameras on the terrain teacher, as an alternative exteroception to the height scan.
 - `g1/g1_depth_env_cfg.py` + `g1/g1_self_scan.py` - camera cfgs and the generated `MultiMeshRayCaster`
   target prim paths. For the robot to appear in its own depth image every moving link must be its OWN
@@ -105,6 +173,38 @@ Two self-scanning depth cameras on the terrain teacher, as an alternative extero
   `extero_norm_mode` decides how the normalizer is pooled; see "The DEFAULTS are the depth
   training config" below (`per_channel` is the default, `per_element` is gone).
 - `scripts/rsl_rl/verify_depth_self_scan.py` verifies self-scanning at the sim level.
+
+## The generator's depth is DELAYED, in training and in both simulators
+
+The real depth pipeline puts tens of milliseconds between capture and the frame reaching the
+network (~42 ms median measured on the ZED pair, 48 ms modelled), and a generator fed a fresh
+frame in simulation is off-distribution in exactly the variable it was fitted to. So the
+generator's conditioning carries a lag on purpose:
+
+- TRAINING: `depth_latency_probs` is a distribution over whole control steps, sampled per window
+  by `dataset._select_depth_lag`, and it rides `fm_meta` end to end so a checkpoint brings its
+  own number rather than inheriting whatever the runner defaults to.
+- SIM: `FmDepthLag` in `gen_tracker_runner.py`, derived from the graph's own
+  `depth_latency_probs` unless `--fm_depth_lag_steps` overrides it. **Only the GENERATOR is
+  delayed**; the tracker's own `depth` observation stays live, because it was trained on fresh
+  frames.
+- **The POSE travels with the image.** The 5-channel row's xyz planes are unprojected from the
+  camera pose, so a lagged image unprojected with the CURRENT pose is displaced by the egomotion
+  -- precisely the registration error those channels exist to remove.
+- HARDWARE adds none of this: its lag is physical and already in the frames. What the controller
+  does instead is match the camera POSE to the frame's capture stamp (`g1_deploy::PoseHistory`,
+  `depth_pose_match`), which is the same consistency requirement solved from the other end.
+  `depth_delay_relay` manufactures the missing latency in MuJoCo so that matching code is
+  actually exercised rather than merely present.
+
+**`--fm_lead_ticks` and `--fm_depth_lag_steps` do NOT compose.** Both exist to line the sim
+runner up against the C++ runtime, which applies no synthetic lag, so leaving both on stacks two
+delays and silently makes the documented matched comparison (`--fm_lead_ticks 1`) a 3-tick one.
+The lag is forced off for `--fm_lead_ticks` / `--dump_replay`, and asking for both explicitly is
+a hard exit. That also keeps `--dump_replay` streams coherent: the replay records the tracker's
+LIVE `depth_raw`, so a lagged `fm_camera_pose` beside it would make the C++ rebuild the extero
+row from live pixels and a stale pose, and `compare_replay.py` would report a divergence that is
+the harness's fault.
 
 ## The camera contract (how depth reaches MuJoCo / hardware)
 `mdp.depth_camera_specs(env)` derives ONE contract per camera — mount body + offset, pinhole
@@ -314,6 +414,34 @@ reachable only from 5.575, since 2.0 gives 3.5) and written into a `best_banded.
 Anything trained after that fix stamps itself. See the band note above for why a `null` is
 ambiguous rather than merely missing.
 
+## The terrain is rebuilt from the manifest, so the GROUND can change without regenerating motion
+
+A clip's only tie to its tile is an integer `terrain_id` plus a corner translation. The library
+carries a `terrain_manifest` attribute -- per-tile lists of explicit boxes -- and the RL importer,
+both MuJoCo emitters and every viewer rebuild the world from it at load. So terrain can be
+rewritten offline while the motion stays exactly as recorded, which is what the passes in
+`source/motion_gen/motion_gen/terrain/` exist for.
+
+- `decorate.py` varies STAIR WIDTHS by rewriting the manifest. The shipped library had
+  effectively none -- treads 0.801-1.156 m and approach/landing platforms ALWAYS exactly
+  `size_y`, because all three generators forced it -- so against a 16x11 scan spanning ±0.5 m an
+  0.8 m flight straddles both edges in every frame. Three arms per transition tile:
+  `wide_stairs`, `narrow_landing`, `matched`. **Grow in place, never re-centre**: `size_y` is the
+  bounding box of the tile's CLIPS' lateral travel, not of its flight, so `size_y / 2` is where
+  the motion wandered and the flight sits off it by a median 0.149 m.
+- The **decoration channel is VISUAL ONLY** and lives on its own prim (`decor.DECOR_PRIM_PATH`
+  = `/World/decor`), which the depth cameras cast against and physics ignores. It is the one
+  thing that changes what the robot SEES without changing what it stands on.
+- Walls ring the RENDERED FLOOR rather than the manifest tile, up to four per tile, and the flat
+  tiles get rooms. `test_wall_footprint.py` and `test_decor_prim_is_mandatory.py` pin both.
+- `decor.py` imports NOTHING on purpose. The depth camera cfgs need the prim path at module
+  scope, and importing the importer to read one string drags in `pxr` -- which, because hydra
+  composes the env cfg BEFORE `AppLauncher` runs, binds pip's `usd-core` instead of Kit's and
+  then segfaults when Kit boots a mismatched core. `test_no_pre_app_pxr_import.py` fails the
+  build if it comes back.
+- **Overlay fields that would diverge between simulators are REFUSED, not best-efforted**, and
+  floating overlays render as floating in every MuJoCo/viser path rather than as solid.
+
 ## sim2sim (MuJoCo)
 - `transfer/sim/depth_camera.py` — `mj_multiRay` re-implementation (~3.9 ms/frame for both cameras).
   Casts geom groups {1 = per-link visual meshes, 2 = terrain}: self-occlusion comes from group 1, and
@@ -480,25 +608,394 @@ python plot_utils/plot_from_bag.py     # 3. PLOTS   -> <bag>/plots/*.png
 collapsed robot. `scripts/stop.sh` tears both down (and now SIGINTs the recorder first so
 the bag is finalised).
 
-**When it falls over, take the generator out of the loop first.** `scripts/run_sim_clip.sh
---case stand` swaps in `g1_debug_clip.yml`, which loads the tracker ALONE (no `fm.onnx` at
-all) and drives it from a baked clip. Cases, easiest first: `stand` (reference never moves —
-if this falls the fault is this stack, not any policy), `stand_walk_stand` (the SAME clip
-untruncated, so a failure isolates the walk transition), `terrain`. Each is known to survive
-in MuJoCo through the same `transfer/deploy` runtime, so a case that falls here and not
-there is a difference in the ROS stack. The clip library is built by
-`scripts/rsl_rl/make_debug_clips.py` out of the library the teacher trained on.
+**The brain is the C++ controller** (`g1_cpp.yml`, `g1_control_cpp`); the python one
+(`g1.yml`) is DEPRECATED, warns at startup, and is reachable only via `--python`. It survives
+for bisecting a regression and nothing else. **CLIP PLAYBACK IS NOW C++ TOO** (`g1_cpp_clip.yml`,
+the default for `scripts/run_sim_clip.sh`; `--python` reaches the old one). Nothing new goes
+there: the numeric half belongs in `transfer/deploy_cpp` (tested against the python oracle with
+no ROS), the ROS half in `g1_control_cpp`.
 
-- **No PD warm-up.** Whatever feeds the tracker drives it from the first tick, matching
-  `gen_tracker_runner.py` (`--warmup_time 0`, ignored outright in clip mode). A stiffened
-  hold put the robot in a state no training episode started from, and fed the generator's
-  history rows of ZEROS — `_make_snapshot` reads the runtime's own previously-served node,
-  which does not exist yet — which flipped `null_mask` off and denied the model the learned
-  null-history embedding meant to cover exactly those steps.
+**The clip reaches C++ as a PACK, never as HDF5.** `transfer/deploy/tools/dump_clip_pack.py`
+writes the library into the `manifest.json` + raw-float64-blob format `deploy/fixture_io.py`
+already writes and `g1_deploy::BlobPack` reads (promoted out of `test/fixture.h` when this
+became its second consumer). The image ships no HDF5, and the library is `lzf`-compressed,
+which the plain HDF5 C library cannot decode without h5py's filter plugin. The pack carries the
+channel NAMES, so a pack built for another robot fails loudly instead of reading the right
+columns of the wrong motion, and it is committed beside the `.h5`.
+`clip_reference_parity_test.cc` holds the port to the python oracle at 1e-11 over the real pack.
+
+**Where the reference comes from is chosen ONCE, at load** (`ReferenceSource` in
+`policy_runtime.h`: `FmReferenceSource` or `ClipReferenceSource`), so the tick does not branch
+on it. The clip supplies its own per-offset `command_window`; the generator holds the current
+command, as the deployed joystick does. A >1-channel generator still needs camera FK, which
+clip mode never builds because it loads no generator at all.
+
+**Pinocchio is the robot's kinematics, in both languages, from one apt package**
+(`ros-humble-pinocchio`, 4.0 in the image; the dev box has 3.9 from pip and both are pinned by
+the same tests). `g1_deploy::CameraPoseFk` FKs the depth cameras every tick — a generator with
+`extero_channels > 1` unprojects its own image and cannot do that without knowing where the
+cameras are — and `deploy.fk` draws the RViz/viewer plan ribbon, which used to be MuJoCo on
+`FlowMatchingConfig.fk_model_path`. The "FK'ing the ROS URDF would be a SECOND OPINION"
+objection is measured, not argued: URDF vs MJCF is 4e-13 on the camera chain and 4.6e-7 m at
+the wrists (`deploy/tests/test_fk_parity.py`, MuJoCo kept as a test-only oracle), so the
+deploy code has ONE kinematics library rather than two. It is not an image-size win — obelisk's own sim is a
+MuJoCo sim, so the image installs it regardless. The URDF is a controller PARAMETER
+(`urdf_path`), not a constant.
+- Two CMake traps, both of which fail pointing somewhere else: pinocchio 4.0's
+  `pinocchio_parsers` reaches `coal::coal` and its own config does not `find_dependency` it, and
+  an imported target is DIRECTORY-SCOPED — so `deploy_cpp` finds coal and promotes it
+  (`IMPORTED_GLOBAL`), or the consumer's own `target_link_libraries` line is what errors.
+- **A green build on the dev box says nothing about four files.** `find_path(onnxruntime)`
+  fails there, so `ort_session` / `tracker_session` / `fm_session` / `policy_runtime` are NOT
+  COMPILED and a syntax error in them survives (it did: a botched extraction ate the head of
+  `GaussianNoise::Fill` and was committed). The configure now WARNS; compile in the container.
+
+**When it falls over, take the generator out of the loop first.** `scripts/run_sim_clip.sh
+--case stand` swaps in `g1_cpp_clip.yml`, which loads the tracker ALONE (no `fm.onnx` at all)
+and drives it from a baked clip through the SAME C++ runtime the generator path uses — so a
+case changes exactly one thing against a normal run: where the reference comes from. Cases,
+easiest first: `stand` (reference never moves — if this falls the fault is this stack, not
+any policy), `stand_walk_stand` (the SAME clip untruncated, so a failure isolates the walk
+transition), `walk_backward`, `terrain`. Each is known to survive in MuJoCo through the same
+`transfer/deploy` runtime, so a case that falls here and not there is a difference in the ROS
+stack. `--python` reaches the deprecated controller for a bisect; the two implementations are
+held to 1e-11 (`deploy_cpp/test/clip_reference_parity_test.cc`), so a BEHAVIOURAL difference
+between them is not in the reference construction.
+
+**Two artifacts, neither committed** (both come from a clip library the robot does not
+carry): `scripts/rsl_rl/make_debug_clips.py` writes the `.h5` the python controller reads,
+then `transfer/deploy/tools/dump_clip_pack.py` writes the binary PACK the C++ one reads. The
+pack exists because the image ships no HDF5 and the library is lzf-compressed, which the
+plain HDF5 C library cannot decode. Build both before a clip run on a fresh machine.
+
+**The cadence is not a knob.** Under `window_anchor="plan"` the clip's ego re-anchor and the
+reference window's anchor latch must fire on the SAME step, or up to `K-1` steps of the
+robot's own egomotion leak into `base_pose` — a window matching neither training nor an
+odometry-free serve, and exactly as wide as a correct one. Both configs DERIVE it from the
+tracker's `fm_update_every` (`0` = derive) and both runtimes refuse a mismatch. That
+cancellation is what makes C++ clip playback odometry-free: measured 8.3e-17 m between a
+walking and a stalled robot, against 0.132 m at a mismatched cadence.
+
+- **No PD warm-up, and no way to add one.** Whatever feeds the tracker drives it from the
+  first tick, matching `gen_tracker_runner.py`. The warm-up paths are GONE — the stand hold,
+  its stiffened gains, the start-button gate, `warm_start()` and `BatchedHistory.fill()` were
+  all deleted, so nothing can fabricate a generator history any more. Every one of them put
+  the robot in a state no training episode started from and fed the generator history rows of
+  ZEROS: `_make_snapshot` reads the runtime's own previously-served node, which does not exist
+  yet, which flipped `null_mask` off and denied the model the learned null-history embedding
+  meant to cover exactly those steps. What survives is `advance_dormant_step()`, which moves
+  the cadence counter and touches nothing else — the clip path needs it so the first re-plan
+  after a clip→FM handoff lands on the right phase. Pinned by
+  `transfer/deploy/tests/test_history_null.py` on both sides of the port.
 - **Auto-arm is SIM ONLY and structurally so**: it is a parameter of `fsm_state_echo`, a
   node that exists only because MuJoCo has no execution FSM and is launched only by
   `run_sim_world.sh`. The controller has no auto-arm and must not grow one
   (`tests/test_auto_arm_is_sim_only.py`).
+
+## The generator's ONNX graph runs entirely on the GPU (and is captured)
+
+The graph is ~3000 kernels for one 62-node plan at **batch 1**, so onnxruntime is
+LAUNCH-bound there: wall time tracks the kernel COUNT, not the FLOPs. Two changes follow
+from that, and the first is a precondition for the second.
+
+**1. The batch axis is FIXED at 1 in the export** (`export_fm_onnx._export_graph`;
+`--dynamic_batch` restores the old symbolic axis for throughput experiments). With a symbolic
+batch, every head reshape in the traced attention blocks computes its shape at RUN time, so
+the graph carried a `Shape -> Gather -> Unsqueeze -> Concat` chain of int64 scalars per block.
+onnxruntime keeps shape arithmetic on the HOST, so **2687 of 6606 kernel nodes ran on the
+CPU** with 71 `MemcpyFromHost` nodes between them — the "Memcpy nodes are added" warning at
+load. Fixing the axis lets constant folding delete all of it, which also lets the fusion pass
+match patterns the shape ops were splitting (`SkipLayerNormalization`, `QuickGelu`, a fused
+QKV `Split`). Result: **0 host nodes, 3052 kernel nodes.** `tracker.onnx` was never part of
+this — 17 nodes, already all-CUDA, 0.18 ms.
+- The GPU-free way to check it is ORT's OWN optimizer, not the file: the file keeps its
+  `Shape` nodes either way and folding them is the work being measured. 0 surviving `Shape`
+  against 358 lines up exactly with 3052 all-CUDA against 6606-with-2687-on-host
+  (`test_fm_onnx_static_batch`).
+- Numerics: ~1e-6 from the old graph (torch folds a few more constants once shapes are known),
+  three orders below the ~2.6e-3 CPU-vs-CUDA fp32 spread the graph already had. Freezing an
+  EXISTING graph instead (`onnxruntime.tools.make_dynamic_shape_fixed --dim_param V
+  --dim_value 1`) is bit-identical, if a forensic comparison is ever needed.
+
+**2. CUDA Graph capture, which the host nodes had been blocking.** onnxruntime refuses capture
+outright while any node is on the host ("all compute graph nodes have not been partitioned to
+the CUDAExecutionProvider") — it fails to CREATE the session, so it cannot half-apply. On:
+`fm_cuda_graph: true` in `g1_cpp.yml`, `--fm_cuda_graph` on `gen_tracker_runner.py`,
+`load_fm_context(cuda_graph=True)`. Generator only; the tracker has nothing to win.
+
+**Every wrong way of feeding a captured graph fails SILENTLY**, and that is why there are
+tests either side of the port (`deploy/tests/test_fm_cuda_graph.py`,
+`deploy_cpp/test/ort_sessions_test.cc`). A capture holds raw DEVICE POINTERS, so:
+- a plain `sess.run()` on a capture-enabled session returns an **empty output list** once the
+  capture is recorded — an `IndexError` far from the cause, or no plan at all;
+- binding host memory, or rebinding fresh host buffers, returns the **first** answer forever,
+  bit-identical, with no error;
+- even mutating one bound host buffer IN PLACE is not picked up, because the host-to-device
+  copy is itself inside the capture.
+That last shape is the dangerous one: "the plan stopped responding to the cameras" is
+indistinguishable on a walking robot from conditioning that has not moved. So the inputs live
+in device buffers written in place — `update_inplace` in python, `Ort::Env::CopyTensors` in
+C++ — and the tests assert the replay tracks its input, not merely that it is finite.
+- **`CopyTensors` resolves its copy from the providers registered on the `Ort::Env`, which is a
+  DIFFERENT registry from the one `SessionOptions` appends to.** A process can hold a perfectly
+  good CUDA session and still get "Data transfer implementation between source and destination
+  device was not found" on the first copy. `EnsureCudaDataTransfer()` registers the provider
+  library on the Env once, by bare soname (it sits beside `libonnxruntime.so`, so an absolute
+  `/opt` path would just be a second statement of where ORT is installed). Needs ORT >= 1.23;
+  the images ship 1.24.4.
+- Linking CUDA to do the copy ourselves was the alternative and was rejected: the images carry
+  `libcudart.so.13` but no CUDA headers, so it would mean growing them.
+- The C++ warm-up must go through the binding under capture (a plain warm-up would both
+  mis-warm the session and leave the capture cost on the first live tick), and profiling is
+  skipped there entirely — placement is established by construction.
+
+**Measured, per re-plan** (dynamic -> fixed batch -> fixed + capture):
+`11.6 -> 9.8 -> 8.3 ms` on an RTX 4070, `22.4 -> 19.3 -> 14-15 ms` on the Jetson Thor. Quote
+Thor numbers as a RANGE: repeated passes on one graph vary ~8% there (clock/thermal) where the
+desktop is stable to ~1%. **The Thor baseline sat ABOVE the 20 ms control period**, so this is
+aimed at the chronically-late plan the two-box bring-up traced its falls to, not just at
+throughput.
+
+**Two things this surfaced, both FIXED 2026-08-24:**
+- `G1_DEPLOY_POLICY_DIR` in `deploy_cpp/CMakeLists.txt` was missing the `policies/` element the
+  controller loads under, so the C++ session tests SILENTLY SKIPPED on every dev box.
+  `test_policy_cache_layout.py` pins that prefix across the language boundary and could not see
+  this default. It now points at the live `plan` run.
+- With the path fixed, `policy_runtime_test` failed for real: it fed no camera poses to a
+  5-channel generator, which the runtime refuses BY DESIGN. `MakeReadings` now supplies each
+  camera's nominal mount pose, and the test runs against the live pair (4 passed, 1 skipped on
+  the CPU provider, where deadlines are not assertable).
+- The capture path is verified on the Thor through the PYTHON runtime on the host (3/3 tests,
+  19.33 -> 15.45 ms). The C++ half compiles clean on aarch64 and passes 12/12 on the CPU there,
+  but its GPU behaviour in the Thor CONTAINER is unverified: `docker run --runtime nvidia`
+  gives that container no working CUDA (`GPU=-1`, "driver version is insufficient"), and the
+  untouched `ort_smoke` fails identically, so it is the launch, not the change. Running the
+  brain for real is what closes it.
+
+## Running the BRAIN on another machine (the Jetson Thor), over ssh
+
+The split needs no new launch path: `run_sim_low.sh` is the brain alone and `run_sim_world.sh`
+the world alone, so the brain runs on the Thor and the MuJoCo world on the dev desktop. Both
+halves must agree on `ROS_DOMAIN_ID` and `RMW_IMPLEMENTATION` (obk sets them) and each box
+needs its OWN `docker/cyclonedds.xml` with the addresses swapped. That file is GITIGNORED, so
+the link is described here rather than in it: `192.168.50.10` desktop (world),
+`192.168.50.20` Thor (brain), `zolkin@`, direct cable on a private subnet chosen to collide
+with nothing else on the desktop. `scripts/net_check.sh` on BOTH boxes while both halves are
+up is the preflight, and it names the four ways discovery fails.
+
+Host prerequisites, both boxes, and neither is optional:
+- `net.core.rmem_max=16777216`. Cyclone treats a smaller kernel as FATAL and every ROS node
+  dies at startup with `rmw_create_node: failed to create domain`.
+- `<MaxAutoParticipantIndex>32</MaxAutoParticipantIndex>` in the cyclone config. Unicast peers
+  require `ParticipantIndex auto`, which caps participants at 9 by default, and the world's
+  bringup exceeds that. Cyclone's own default is `none`, which has no cap but needs multicast.
+
+Then, in order, and the ORDER IS LOAD-BEARING (the world has no `user_pose` holding the robot
+up, so a world-first start hands the policy an already-collapsed robot):
+
+```bash
+ssh -t zolkin@192.168.50.20 'cd ~/sprout/transfer/obelisk && scripts/run_sim_low.sh'  # brain
+scripts/run_sim_world.sh --scene g1_perceptive_tile0_scene                            # world, here
+scripts/fetch_brain_bags.sh          # bags are recorded ON THE BRAIN's box
+```
+
+**Traps, each of which cost a debugging cycle:**
+- **`stop.sh` is LOCAL ONLY** -- there is no ssh in it. Tearing down here leaves the remote
+  brain running and still recording. Stop both.
+- **`run_sim_low.sh` RE-ATTACHES** when its tmux session exists, so a config change is ignored
+  until `OBK_RESTART=1`.
+- **The Thor reaches GitHub only through a running ssh AGENT.** The key has a passphrase, so
+  whether `git push` works is a property of the CONTEXT, not the box: from a desktop session
+  the gnome-keyring agent (`SSH_AUTH_SOCK=/run/user/1001/keyring/ssh`) holds it unlocked and a
+  push just works, while the same command with the agent stripped fails with "make sure you
+  have the correct access rights" -- which is what a cron job, a detached script, or the obk
+  container (no agent socket mounted, only `~/.ssh`) all get. That last one is why the ZED
+  depth link needs its own passphrase-free key rather than this one.
+  Where there is no agent, move commits with a bundle over the private link, and FETCH BEFORE
+  reverting anything local: `git bundle create /tmp/x.bundle <their-head>..<branch>`, scp, then
+  `git fetch /tmp/x.bundle <branch> && git merge --ff-only FETCH_HEAD`.
+- **`ssh -tt` needs a LOCAL tty** to allocate a pty from, so it fails when backgrounded inside
+  a script. Run `script -qec '<cmd>' /dev/null` on the far side instead.
+- **There is no tmux on the Thor HOST** (only inside the container).
+- **`timeout` cannot exec a shell function.** `timeout N my_ssh_fn ...` fails instantly and
+  silently; put the timeout on the far side of the ssh.
+- **`pgrep -f <pattern>` matches its own command line**, and over ssh that line arrives
+  containing the pattern. Bracket it (`'[r]os2 bag record'`) and keep the literal out of any
+  echo in the same command -- this produced four separate false conclusions in one session.
+- **Never copy a bag from a live run**: it comes back torn at message ~0. Stop first.
+- **Remote bags go to `log/bags_thor/`**, never `log/bags/`. Bags are named by timestamp only,
+  so mixing two machines in one directory makes their origin unrecoverable.
+- **The clocks are not synchronised** on this desktop/Thor pair (chrony here,
+  systemd-timesyncd there, ~8 ms apart). Cross-box `depth_capture_age` is offset by that and
+  can read SMALLER than `depth_age`, which is impossible. Rate matches to 1 ppm, so only the
+  absolute value is affected. Nothing in the control path uses a remote stamp; the watchdog
+  deliberately uses receipt time. On the ROBOT LAN this is fixed rather than tolerated -- the
+  brain serves time there (see the ZED box section) -- and the same
+  `setup_clock_sync.sh --client` would make this desktop follow it if a split sim run ever
+  needs comparable stamps.
+
+## The ZED box: the depth cameras arrive over an ssh link, and one clock
+
+On hardware the cameras are NOT on the brain. `run_hardware_low.sh`'s depth pane ssh's to the
+ZED box (`zolkin@192.168.123.221`, `OBK_JETSON_HOST` in `docker/.env`) and runs `run_node.sh
+pair` in the container there, so the link is part of the control path. Robot LAN, all three
+boxes: robot `.161`, brain `.220`, ZED `.221`. Two one-time setups, both idempotent:
+`scripts/setup_zed_link.sh` (ssh) and `scripts/setup_clock_sync.sh --master` here plus
+`--client` there (time).
+
+**Every failure of this link presents as a depth pane that prints nothing, which on a robot
+reads as a CAMERA fault.** So `obk_jetson_preflight` runs before any pane is built and names
+the cause instead: no route, no pubkey, changed host key, or no `zed_depth` container.
+`run_hardware_low.sh` refuses to start on it (every policy here is a depth policy, `--clip`
+included -- only the generator is absent there); `--no-depth` is the deliberate way past.
+
+- **The key is NOT `~/.ssh/id_ed25519`**, which has a passphrase on both these boxes. A tmux
+  pane cannot answer a prompt, so it would hang forever showing nothing. `setup_zed_link.sh`
+  makes `~/.ssh/id_obk_zed` with no passphrase plus an `~/.ssh/config` block with
+  `IdentitiesOnly yes` (without which ssh still tries the default identity first). `~/.ssh` is
+  bind-mounted, so the key made on the host IS the key the pane uses.
+- **`docker/.env` OVERRIDES the fallback in `obk_launch.sh`**, because compose puts it in the
+  container's environment -- and it named the onboard minipc (`unitree@192.168.123.164`) long
+  after the cameras moved, which answers ssh and would have been a wrong-box success. Worse, a
+  RUNNING container keeps the value it was CREATED with, so editing the file changes nothing
+  until compose recreates it. `test_zed_link_target.py` pins the tracked pair; `--check` prints
+  the container's own value beside the file's.
+- **The BRAIN is the time master**, not the ZED box, even though the ZED box is the one with
+  internet: `depth_capture_age` is a receipt time made here minus a capture stamp made there,
+  the bags are here, and every other stamp in them is this box's -- so one client's reported
+  offset replaces a difference between two independently steered clocks. The ZED box's UTC
+  comes over WIFI and the robot must work with no AP, which `local stratum 10 orphan` here
+  covers. The cost, stated because the other direction was free: `systemd-timesyncd` is an
+  SNTP client and cannot serve, so chrony replaces it here.
+- **Live since 2026-08-22**: the ZED box tracks `192.168.123.220` (stratum 4 off the brain's
+  3) at tens of microseconds. `trust` on the client means the internet pool there is excluded
+  for disagreeing with the brain (`^?` in `chronyc sources`) -- deliberate, since the two
+  boxes agreeing with each other matters more than either agreeing with UTC, and the pool is
+  still polled so it takes over if the brain goes away.
+- **Clock skew is a DIAGNOSTIC problem, not a safety one.** The depth watchdog times frames by
+  local receipt on purpose (`g1_controller.cc`), so a skewed camera clock cannot stale-latch a
+  healthy camera. It corrupts `depth_capture_age` -- the only number saying how old a frame was
+  when the policy used it -- and every cross-box comparison in a bag.
+- `obk_mark_jetson` had never been CALLED, so `stop.sh --zed` skipped the remote teardown
+  silently and left the pair holding the cameras. `run_hardware_low.sh` sets it now.
+- **`chronyc tracking` on the master is NOT what clients get.** While the `local` reference is
+  active -- from startup until a real source's root distance falls under the 1 s `distance`
+  threshold, and again if every upstream is lost -- tracking reports `7F7F0101`
+  (127.127.1.1) / stratum 10 / zero root delay, so the master reads as unsynchronised for the
+  first couple of minutes while it is already serving the real upstream. Measured here:
+  tracking said stratum 10 while a query to `192.168.123.220` was answered stratum 3,
+  ref 51.81.226.229, 108 ms root delay. `setup_clock_sync.sh` therefore probes the server over
+  the wire (`served`), which also proves `allow` is scoped -- the same query to 127.0.0.1 must
+  time out.
+
+## The first REAL hardware run: three config defects, all in the robot driver
+
+`run_hardware_low.sh` came up end to end on the robot on 2026-08-22 (brain + driver + ZED
+pair + recorder, unarmed). Everything that blocked it was in the DRIVER path -- the sim path
+had been exercised for months and the hardware one never had -- and each failure named
+something other than its cause:
+
+- **`docker/cyclonedds.xml` was still pinned to `192.168.50.20`**, the desktop split-sim
+  cable, which this box no longer has. Cyclone treats an absent pinned interface as FATAL, so
+  EVERY ros node died at `rmw_create_node: failed to create domain` with the real reason one
+  line earlier ("does not match an available interface"). The file is gitignored per box, so
+  nothing in the repo could catch it. It now lists BOTH roles' addresses with
+  `presence_required="false"`, so the same file works plugged into the robot, the desktop, or
+  both, and the absent one is a warning.
+- **`AllowMulticast` must be ON for the robot LAN.** It was false (correct for the desktop
+  cable, where unicast peers are safer). The ZED box cannot be reached that way: its config
+  uses multicast and lists no peers, so its participants keep Cyclone's DEFAULT ephemeral
+  ports -- and a portless `<Peer>` is resolved by probing participant INDEXES, which an
+  unindexed participant never answers. Brain and cameras would simply never see each other,
+  both looking healthy alone. The peers stay for the desktop role.
+- **`target_ip` is THIS box's address, not the robot's.** obelisk uses it only to pick the
+  local interface (`GetInterfaceName(target_ip, ...)`) and defaults to `192.168.123.222`,
+  Unitree's user-PC convention. The brain is `.220`, so the node aborted with "No interface
+  found with IP: 192.168.123.222" -- which reads as a robot connection fault. Set by ADDRESS
+  rather than `network_interface_name` on purpose: an interface name changes when the cable
+  moves between an onboard NIC and a USB adapter.
+- **`g1_robot_hw.yml` had no `timers:` block**, so `timer_ctrl` -- the passive-hold timer
+  `G1Interface` registers in `on_configure`, which drives the motors while the FSM sits in
+  USER_POSE or DAMPING -- had no period, and the configure transition threw "Timer entry is
+  missing required field 'timer_period_sec'". A missing entry only WARNS; it is a registered
+  timer with no entry that throws.
+
+Measured, unarmed, with the real cameras (tick 50.0 Hz, depth 47.2 / 47.7 Hz):
+`depth_age` 1.7 / 0.6 ms (the controller's own contribution) and `depth_capture_age`
+53.7 / 36.9 ms (whole pipeline from the ZED's own capture stamp). Both capture ages exceed
+both receipt ages, which is TASKS 2a's done-when for the clock sync -- the number that used to
+be able to read impossibly small. `fm_plan` and `ctrl` are silent while `armed: False`.
+
+**Do not measure a stamp age with `ros2 topic echo --once` + `date`.** That method carries
+~250 ms of its own process startup: a topic stamped on THIS box read +249 ms through it while
+the depth topic read +273 ms. Only the difference means anything. The controller's own
+`depth_capture_age` is the number, and it is in the bag.
+
+## THE PAIR DROVE THE ROBOT (2026-08-25) — first armed hardware run, and it worked
+
+The whole stack ran end to end on the real G1, on the first attempt: ZED pair over the ssh
+link, the perceptive generator and the tracker on the brain, the C++ controller commanding the
+motors. Everything above this line is bring-up; this is the first time any of it was ARMED.
+
+What was actually tested, and nothing beyond it:
+- **Flat ground: standing, and walking forwards, backwards and turning.** All fine.
+- **A box jump-up: it got onto the box but stumbled at the top.**
+- **Stairs: NOT tested.** Neither up nor down.
+
+So the claim this supports is "the deployed pair walks on flat ground and can climb a box",
+and specifically not that terrain works. The stumble at the top of the box is the first real
+hardware finding and is unexplained.
+
+It is worth being clear about what this does and does not vindicate. The stack had been run in
+the obelisk sim for weeks; what had never been exercised was the ROBOT half -- the driver, the
+motors, the real cameras, the real IMU -- and that is the part that worked first time. The
+three defects in "The first REAL hardware run" above were all in that half and were all found
+unarmed, which is why this run had none left to find.
+
+The 3-DoF waist rode along untested-in-anger and was fine: this is also the first policy
+deployed with `fixed_waist: false`, i.e. with `waist_roll` and `waist_pitch` actually driven.
+The driver's own ordering (`joint_names_` = the 27-DoF set then the two extra waist joints)
+matches `default_joint_names` exactly, and every command path is matched BY NAME, so nothing
+here depended on the two orders agreeing -- but the `user_pose` array does, and it is indexed
+by position in `default_joint_names` (`user_pose_[def_ind]` in `g1_interface.h`), which is why
+waist roll and pitch are its LAST two entries.
+
+The pair that did it: tracker `2026-08-20_16-36-10_mode11_decor_plan_v1`, generator
+`2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx`.
+
+## The obelisk SIM applies the MJCF's PD gains, and they were STALE (fixed 2026-08-24)
+
+The tracker fell in the obelisk sim on motions MuJoCo sim2sim walked through cleanly, and the
+cause was neither policy nor stack: **both hip pitches were 2.46x too soft there**, kp 40.18
+against the 99.10 the policy exports. Same tracker, same clip, same world -- `walk_backward`
+went from 3/5 falls to 0/5, and travel tightened from a 1.99-3.75 m spread to 2.48-2.50 m.
+
+**Three consumers, and only ONE reads the MJCF's gains**, which is why this was invisible:
+
+| consumer | gain source |
+|---|---|
+| `transfer/sim` sim2sim | the policy's, via `Robot.set_pd_gains_from_policy` -- **overwrites the MJCF** |
+| the hardware driver | the policy's, via `msg.kp` / `msg.kd` on the wire |
+| **the obelisk MuJoCo sim** | **the MJCF** |
+
+Obelisk's sim is `void ApplyControl(const ControlMessageT& msg) { SetSharedData(msg.u_mujoco); }`
+-- straight into `data.ctrl`. It never reads the published gains, so the MJCF alone decides how
+stiff the robot is there, and both controllers publish `kp`/`kd` that only the robot consumes.
+
+**Cause:** `make_g1_mjcf.py`'s `TEMPLATE_SECTIONS` copies `default` and `actuator` VERBATIM
+from its template, `g1_29j.xml` -- the pre-mode_11 robot. mode_11 moved hip pitch from the
+14.3 gear to the 22.5 (`STIFFNESS_7520_22`), and hip pitch is the only joint whose gear
+changed, so it was the only mismatch. The generator already had the right armature in
+`JOINT_ARMATURE` and was using it for `<joint armature=...>` while the ACTUATOR gains came
+from the old robot.
+
+**Fix:** `apply_actuator_gains` derives them from that same table via the same law the RL side
+uses (`kp = J w^2`, `kd = 2 z J w`), so no number is duplicated and a future gear change moves
+both. It refuses rather than guesses on an actuated joint with no armature, a `<position>`
+with no default class, and a class shared by joints whose gains differ.
+`test_actuator_table.py::test_mjcf_actuator_gains_match_the_cfg` pins the result -- it
+resolves gains the way MuJoCo does (element attribute wins, else the named class) and fails
+naming the joint, both numbers and the regeneration command.
 
 ## Logging: MCAP, and what is deliberately NOT in it
 
@@ -533,6 +1030,77 @@ Also pinned by tests: a config parameter the node never declares is silently ign
 rclpy, so `tests/test_params_are_live.py` fails the build on one (this bit `log`,
 `log_decimation`, `config_name` and `fm_update_every`). The generator's re-plan cadence
 comes from `tracker.onnx` metadata and nowhere else.
+
+# STATE: the training refresh and the deploy stack are MERGED (2026-08-23)
+
+`worktree-robot-terrain-refresh` (the perceptive robot, terrain decoration, the `plan` anchor,
+the camera-lag model) and `cpp-deploy-port` (the C++ deploy runtime, the obelisk C++ controller,
+the two-box split, the ZED bring-up) are one tree. 12 files were touched by both; the four that
+conflicted were `gen_tracker.py`, `gen_tracker_metrics.py`, `robot.py` and `gen_tracker_runner.py`.
+
+Two resolutions worth knowing, because both branches had independently invented the same thing:
+- `robot.py` -- terrain-relative fall detection plus a tilt cone, twice, with different APIs. The
+  merged form keeps the ctor/CLI-driven one and exposes rtr's string verdict as
+  `failure_reason()`, with `failed()` as its predicate half. The two datums were measured equal on
+  all five scenes first (0.0 / 0.0 / −0.130 / −0.450 / −0.907), so no measurement moved.
+- `gen_tracker_metrics.py` -- the same "the `fell` column is written before the fall check, so
+  every fall read as a survival" bug, fixed twice. Both keys survive: `verdict_source` says which
+  answer was used, `failure_reason` says what the runner saw.
+
+**The warm-up paths stay deleted.** rtr still had them and threaded `fm_lag` through them, but
+cpp had removed `GenTrackerPolicy.warm_start` / `.observe` entirely, so keeping the hold would
+`AttributeError` on the first non-clip run.
+
+## The `plan` teacher is exported and DEPLOYED (was: blocked on it)
+
+`logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1` has its `exported/` --
+`tracker.onnx`, `policy_parameters.yaml`, and `2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx`
+-- and that is the pair that drove the robot. All three follow-ons are done:
+
+1. `config/scan/depth_{near,far}.yml` are regenerated from that run and carry the far camera at
+   15 deg (`rot: [0.99144, 0, 0.13053, 0]`), not the 35 deg placeholder.
+2. `low_level.yml`'s `hf_policy_folder` names it.
+3. `dump_metadata_fixtures.py` then `dump_obs_fixtures.py` re-run against it. The metadata
+   fixture now agrees with the deployed `tracker.onnx` on all 530 keys, where before it
+   differed on 89 and was missing 93 (the whole `robot_asset` block).
+
+**The two halves had come apart very differently, and only one of them mattered.** Every obs
+`.bin` regenerated BYTE-IDENTICAL -- the observation contract (term names, widths, history
+lengths, clips, scales) had not moved between the two artifacts at all, so the assembled
+vector was the same and `obs_assembler_test` had been testing exactly the right thing all
+along. Only the manifest's recorded numpy version changed, 1.26.4 -> 2.4.6, which is itself a
+small free result: the assembly is bit-stable across that major version.
+
+**The METADATA half is where the rot was, and re-running it found a real bug.**
+`policy_params_test.cc` asserted the PLACEHOLDER camera mounts -- near z 0.099426, far 0.38,
+against the as-built 0.045 / 0.285 -- and had been passing for weeks because the fixture it
+read described the same stale robot. That is precisely the failure the camera contract exists
+to prevent: a wrong mount is a plausible cloud in the wrong place, invisible to every shape
+check, sitting inside the one test meant to catch it. The intrinsics were unaffected (`fx`
+12.586 / 21.422 both matched); only the mount pose had moved.
+
+**Both stale-fixture and stale-artifact paths had the same root cause**, and it is worth
+recognising a third time: `_DEFAULT_RUN_DIR` in `dump_metadata_fixtures.py` was missing the
+`policies/` element AND naming a pre-refresh run -- the identical defect to
+`G1_DEPLOY_POLICY_DIR` in `deploy_cpp/CMakeLists.txt`, which silently skipped two whole test
+binaries. A default path to an artifact is a thing that rots quietly.
+
+## Still open, and deliberately not done here
+
+- **`transfer/obelisk/g1_model/mujoco/`** is a FOURTH, unreferenced copy of the robot
+  (`g1_27dof.xml` + 4 scenes). Nothing in the launch path reads it. It only adds ways to be wrong.
+- The `plan` arm has no torch-vs-numpy parity test at the `_MockCmd` seam
+  (`test_gen_tracker_obs_parity.py`'s `window_anchor()` still returns the measured root, so it
+  covers `robot_now` only). The CLIP half of that gap is closed --
+  `deploy/tests/test_clip_window_anchor.py` and `deploy_cpp/test/clip_reference_parity_test.cc`
+  pin the `plan` arm on both sides -- but the generator's Isaac-vs-numpy seam is still
+  `robot_now`-only.
+- `refresh_fk_channels.py` left the 24 world-frame EE VELOCITY channels on the old model (not
+  recoverable -- the source `.npz` are gone), so post-refresh the two wrist world-velocity blocks
+  are consistent with the old robot while their positions are consistent with the new one.
+  Libraries record this in an `fk_refresh` attr.
+- `d66420e7`'s local scene tuning (jump-up boxes near spawn, `depth_near.yml viz` re-enabled) was
+  lost in an earlier merge and has not been restored.
 
 # General Guidelines
 - Don't care for backwards compatibility.

@@ -594,6 +594,61 @@ def depth_xyz_rows_np(
     return np.stack(rows, axis=0)
 
 
+def sanitize_extero_row_np(
+    values: np.ndarray, source: str, clip: float | None, sensors: int, channels: int
+) -> np.ndarray:
+    """Sanitise a MULTI-CHANNEL exteroception row: the band binds only the DEPTH channel.
+
+    ``extero_clip`` is stated in NORMALISED DEPTH units. The xyz channels are METRES of
+    position in the root's yaw-aligned frame, so clamping them with the same number is a
+    category error that only looks reasonable because the two happen to be similar
+    magnitudes -- and it is what the dataset deliberately avoids: the widening there is
+    "Done AFTER the clamp on purpose" (``dataset.py``), so the model was never trained on a
+    band-clamped position.
+
+    Measured on the shipped pair before this existed: the far camera's ENTIRE x channel
+    saturated -- all 780 pixels pinned at +5.575 while the true values spanned 9.5 to 12.0 m
+    -- and the near camera's clipped from 8.0. The generator was being told the world ends
+    5.575 units away in every direction, on every tick, for the one signal it uses to place a
+    reference. The C++ runtime never had this bug, which is why the two stacks disagreed about
+    what the generator sees.
+
+    Channel 0 keeps the full :func:`sanitize_extero_np` treatment. The rest get non-finite
+    replacement only: a finite depth and a finite pose cannot unproject to a non-finite
+    position, so that branch is a guard rather than a transform.
+
+    Args:
+        values: ``(V, sensors * channels * pixels)``.
+        source: An :data:`EXTERO_CLIP_NP` key.
+        clip: Band override, or ``None`` for the per-source default.
+        sensors: How many sensors the row concatenates.
+        channels: Values per pixel. ``1`` defers to :func:`sanitize_extero_np` entirely.
+
+    Returns:
+        The row, same shape, finite.
+
+    Raises:
+        ValueError: If the row width is not divisible by ``sensors * channels`` -- which
+            would mean the layout is not what the caller believes, and silently reshaping it
+            would scramble every channel while the shape stayed right.
+    """
+    arr = np.asarray(values, dtype=np.float64)
+    if channels <= 1:
+        return sanitize_extero_np(arr, source, clip=clip)
+    width = arr.shape[-1]
+    if width % (sensors * channels):
+        raise ValueError(
+            f"extero row width {width} is not divisible by {sensors} sensors x {channels} "
+            "channels; the row layout is not what this believes it is")
+    px = width // (sensors * channels)
+    out = arr.reshape(*arr.shape[:-1], sensors, channels, px).copy()
+    out[..., 0, :] = sanitize_extero_np(out[..., 0, :], source, clip=clip)
+    # Everything else: finite, unclamped. nan -> 0 keeps a bad pixel at the frame origin
+    # rather than at a plausible-looking distance, and the validity channel already marks it.
+    out[..., 1:, :] = np.nan_to_num(out[..., 1:, :], nan=0.0, posinf=0.0, neginf=0.0)
+    return out.reshape(arr.shape)
+
+
 def sanitize_extero_np(
     values: np.ndarray, source: str, clip: float | None = None
 ) -> np.ndarray:

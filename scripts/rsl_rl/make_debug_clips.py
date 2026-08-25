@@ -8,7 +8,7 @@ before that, on a new deployment stack, "is anything downstream of the observati
 at all?". Driving the tracker from a pre-made clip removes the flow-matching generator from
 the loop entirely (it is not even loaded), so a failure is unambiguously the stack.
 
-Three cases, deliberately ordered easiest-first, so a bring-up walks up them:
+Four cases, deliberately ordered easiest-first, so a bring-up walks up them:
 
 ``stand``
     A settled stand held for the whole clip. The reference never moves, so if the robot
@@ -18,9 +18,25 @@ Three cases, deliberately ordered easiest-first, so a bring-up walks up them:
     The SAME source clip untruncated: the same stand, then a walk, then a stand again.
     Sharing the prefix is the point -- if ``stand`` holds and this one falls, the
     difference is the walk transition and nothing else.
+``walk_backward``
+    A stand, then a sustained STRAIGHT-BACKWARD walk. Backward locomotion is the mode the
+    deployed pair has been seen to stumble in while forward walking looks clean, and it is
+    the one direction ``stand_walk_stand`` never exercises (its walk is forward). Because
+    the generator is not loaded, a stumble here is the TRACKER; a clean run here that
+    stumbles with the generator in the loop is the GENERATOR.
 ``terrain``
     A stairs-transition clip from the library, which additionally exercises the depth
     cameras and the terrain-pinned anchoring.
+
+.. note::
+   ``run_sim_clip.sh`` runs the **C++** controller (``g1_cpp_clip.yml``), the same one the
+   deployed generator path uses, so a clip case changes exactly one thing against a normal
+   run: where the reference comes from. ``--python`` selects the deprecated controller for a
+   bisect; the two are held to 1e-11 by ``deploy_cpp/test/clip_reference_parity_test.cc``,
+   so a BEHAVIOURAL difference between them is not in the reference construction.
+
+   The C++ side reads a binary PACK, not this ``.h5``: build it with
+   ``transfer/deploy/tools/dump_clip_pack.py`` after running this script.
 
 The cases are SEARCHED for, not hardcoded, so regenerating against a new library keeps
 working; the chosen source indices and the source fingerprint are written into the output
@@ -38,7 +54,7 @@ git". Both sims read that one file, so they cannot diverge.
 Consumers refer to cases by NAME (indices move when the library is rebuilt):
 
     # MuJoCo sim2sim (--clip resolves against the REPO ROOT, not the cwd)
-    cd transfer/sim && python gen_tracker_runner.py --load_run <run> --robot_name g1_29j \\
+    cd transfer/sim && python gen_tracker_runner.py --load_run <run> \\
         --clip transfer/obelisk/g1_control/resource/debug_clips/g1_debug_v1.h5 \\
         --clip_case stand --clip_ego_anchor
 
@@ -88,6 +104,29 @@ TERRAIN_TYPE_TRANSITION = 2
 
 #: Flat sentinel, mirroring ``clip_io._FLAT_TERRAIN_ID``.
 FLAT_TERRAIN_ID = -1
+
+#: Commanded ``vx`` (m/s) at or below which a step counts as walking backward. Well clear
+#: of :data:`STILL_V` so a clip that merely drifts backward inside a turn cannot qualify.
+BACKWARD_VX = -0.35
+
+#: Largest lateral speed / yaw rate (m/s, rad/s) a backward step may carry. The case exists
+#: to test ONE direction; a backward-and-turning clip would confound it with a turn.
+BACKWARD_LATERAL_TOL = 0.15
+
+#: Settled-stand steps the backward case needs before its walk. The obelisk arm-to-walk
+#: handover transient decays within ~0.4 s (measured off the debug bags), so 1 s of stand
+#: puts the backward walk unambiguously after it rather than on top of it.
+MIN_SETTLE_STEPS = 50
+
+#: Steps the command may take to ramp into the backward walk once the stand ends. Beyond
+#: this the clip did something else first, so it is no longer "stand, then straight back".
+MAX_RAMP_STEPS = 25
+
+#: Shortest backward run (steps) worth calling a walk. Above this floor the case is scored
+#: on SPEED rather than duration: the point is to stress backward locomotion near the
+#: command a pilot actually holds, and a long slow reverse is an easier test than a short
+#: brisk one. 150 steps is 3 s at dt=0.02 -- several full gait cycles.
+MIN_BACKWARD_RUN_STEPS = 150
 
 
 # ---------------------------------------------------------------------------
@@ -167,6 +206,148 @@ def select_stand_clip(f: h5py.File, min_walk_speed: float) -> tuple[int, int]:
     return int(best), int(lead[best])
 
 
+def backward_mask(target_vel: np.ndarray, clip_len: np.ndarray) -> np.ndarray:
+    """Per-step "commanded straight backward" mask, with padding excluded.
+
+    Args:
+        target_vel: ``[N, T, 3]`` commanded ``(vx, vy, wz)``.
+        clip_len: ``[N]`` real length of each clip (the rest is repeat-last padding).
+
+    Returns:
+        ``[N, T]`` boolean, True where the clip is real AND commanded straight backward.
+    """
+    vx, vy, wz = target_vel[..., 0], target_vel[..., 1], target_vel[..., 2]
+    real = np.arange(target_vel.shape[1])[None, :] < np.asarray(clip_len)[:, None]
+    return ((vx <= BACKWARD_VX) & (np.abs(vy) <= BACKWARD_LATERAL_TOL)
+            & (np.abs(wz) <= BACKWARD_LATERAL_TOL) & real)
+
+
+def base_speed(f: h5py.File) -> np.ndarray:
+    """Per-step reference base SPEED for every clip.
+
+    Args:
+        f: The open source library.
+
+    Returns:
+        ``[N, T]`` speed of the reference root in m/s.
+    """
+    vel_names = json.loads(f.attrs["vel_output_names"])
+    base = [vel_names.index(f"pelvis_link:pos_{a}") for a in ("x", "y", "z")]
+    return np.linalg.norm(f["dy_des"][:, :, base], axis=-1)
+
+
+def settled_step(speed_row: np.ndarray, start: int, stop: int) -> int:
+    """First step in ``[start, stop)`` where the reference is actually AT REST.
+
+    A zero COMMAND is not rest. The authored command leads the motion by design, so a clip
+    stops being commanded to walk while its root is still coasting -- measured on the shipped
+    library, 0.50 m/s six steps after the command reached zero. Freezing there writes an
+    instantaneous 0.50 -> 0.00 m/s step into the reference, which is not a motion any robot
+    can be asked to follow: it toppled the tracker ~2 s later, and read as a policy failure.
+
+    Args:
+        speed_row: ``[T]`` reference base speed for one clip, from :func:`base_speed`.
+        start: First step to consider.
+        stop: One past the last step to consider.
+
+    The DEEPEST rest in the range wins, not the first frame under tolerance. Both satisfy
+    the assertion, but the residual is what gets written into the reference as a step, so
+    there is no reason to keep 0.045 m/s of it when 0.000 is available a few frames later.
+
+    Returns:
+        The FREEZE step -- one past the settled frame -- or ``-1`` if the reference never
+        settles in the range. One past, because ``_frozen_row`` overwrites from the cut
+        onward with frame ``cut - 1``, so it is ``cut - 1`` that has to be at rest.
+    """
+    lo, hi = max(start, 0), max(min(stop, speed_row.shape[0]), 0)
+    if hi <= lo:
+        return -1
+    k = lo + int(np.argmin(speed_row[lo:hi]))
+    return k + 1 if speed_row[k] <= FROZEN_SPEED_TOL else -1
+
+
+def select_backward_clip(f: h5py.File, exclude: tuple[int, ...] = ()) -> tuple[int, int, int]:
+    """Pick the flat clip that stands, walks straight backward, then stands again.
+
+    "Stands first" is required, not merely preferred: the case has to start from the same
+    settled posture the other cases do, so that a stumble is attributable to the backward
+    walk and not to whatever the clip happened to be doing at handover.
+
+    "Stands AFTER" is required for a different reason, and it is a deployment property
+    rather than an experimental one. Playback SATURATES on the final real frame rather
+    than stopping, and the padding repeats the last real command -- so a case whose last
+    real step is still commanding a walk holds that command forever against a reference
+    that has stopped moving. The robot is then told to walk while its target stays put,
+    and it falls; the fall says nothing about the policy. Freezing the tail onto a
+    settled stand (as the ``stand`` case does) makes the case safe to hold indefinitely,
+    which matters because obelisk runs until it is stopped while the MuJoCo runner exits
+    at the clip's end and never sees the difference.
+
+    Args:
+        f: The open source library.
+        exclude: Source indices already claimed by another case. ``write_clip_subset``
+            rejects duplicates, so a collision would fail the build rather than silently
+            reuse a clip.
+
+    Returns:
+        ``(clip_index, backward_run_steps, freeze_step)``.
+
+    Raises:
+        SystemExit: If no clip qualifies.
+    """
+    tv = f["target_vel"][:]
+    clip_len = f["clip_len"][:]
+    terrain_id = f["terrain_id"][:]
+    back = backward_mask(tv, clip_len)
+    lead = leading_still_steps(still_mask(tv, clip_len), clip_len)
+
+    still = still_mask(tv, clip_len)
+    speed = base_speed(f)
+    best, best_run, best_cut, best_speed = -1, 0, 0, 0.0
+    eligible = (terrain_id == FLAT_TERRAIN_ID) & (lead >= MIN_SETTLE_STEPS)
+    for i in np.where(eligible)[0]:
+        if int(i) in exclude:
+            continue
+        start = int(lead[i])
+        ramp = back[i, start:start + MAX_RAMP_STEPS + 1]
+        if not ramp.any():
+            continue          # the first thing after the stand was not a backward walk
+        j = start + int(ramp.argmax())
+        run = 0
+        while j + run < int(clip_len[i]) and back[i, j + run]:
+            run += 1
+        # A settled stand after the walk, long enough to freeze onto with the usual margin.
+        tail = still[i, j + run:int(clip_len[i])]
+        if not tail.any():
+            continue
+        k = j + run + int(tail.argmax())
+        hold = 0
+        while k + hold < int(clip_len[i]) and still[i, k + hold]:
+            hold += 1
+        if hold < FREEZE_MARGIN_STEPS * 2:
+            continue          # too short to settle before the freeze
+        if run < MIN_BACKWARD_RUN_STEPS:
+            continue          # a few reverse steps, not a walk
+        # Freeze where the REFERENCE IS AT REST, not merely where the command is: see
+        # settled_step. Search the whole still window, not a fixed margin into it.
+        # Search only the part of the still window that leaves a real hold behind it, so
+        # "deepest rest" cannot pick a frame at the very end and freeze onto nothing.
+        cut = settled_step(speed[i], k, k + hold - FREEZE_MARGIN_STEPS)
+        if cut < 0:
+            continue          # never comes to rest early enough in its own stand
+        back_speed = -float(tv[i, j:j + run, 0].min())
+        if back_speed > best_speed:
+            best, best_run, best_cut, best_speed = int(i), run, cut, back_speed
+    if best < 0:
+        sys.exit(
+            "[ERROR] No flat clip stands for >= "
+            f"{MIN_SETTLE_STEPS} steps, walks straight backward (vx <= {BACKWARD_VX}) for "
+            f">= {MIN_BACKWARD_RUN_STEPS} steps, and then settles into a stand long enough "
+            "to freeze onto; pass --backward_clip to choose one by hand."
+        )
+    return best, best_run, best_cut
+
+
 def select_terrain_clip(f: h5py.File) -> int:
     """Pick the lowest-indexed stairs-transition clip.
 
@@ -225,8 +406,8 @@ def _frozen_row(name: str, data: np.ndarray, cut: int) -> np.ndarray:
 
 
 def build_library(src: str, dst: str, stand_clip: int, terrain_clip: int,
-                  cut: int) -> dict:
-    """Write the 3-case debug library.
+                  backward_clip: int, cut: int, backward_cut: int) -> dict:
+    """Write the 4-case debug library.
 
     Built as [stand (truncated copy), stand_walk_stand (the same clip whole), terrain] so
     the first two share a bit-identical prefix and differ only in whether the walk happens.
@@ -241,7 +422,10 @@ def build_library(src: str, dst: str, stand_clip: int, terrain_clip: int,
         dst: Output ``.h5`` (overwritten).
         stand_clip: Source index of the stand / stand-walk-stand clip.
         terrain_clip: Source index of the terrain clip.
+        backward_clip: Source index of the backward-walk clip.
         cut: Step at which to freeze the stand case.
+        backward_cut: Step at which to freeze the backward case's trailing stand, so the
+            case is safe to hold once playback saturates on its last frame.
 
     Returns:
         The case map written to the JSON sidecar.
@@ -249,33 +433,38 @@ def build_library(src: str, dst: str, stand_clip: int, terrain_clip: int,
     from motion_gen.clips.clip_io import write_clip_subset
 
     tmp = dst + ".subset.tmp"
-    # Order here is [stand_walk_stand, terrain]; the truncated stand is prepended below.
-    write_clip_subset(src, tmp, [stand_clip, terrain_clip])
+    # Order here is [stand_walk_stand, terrain, walk_backward]; the truncated stand is
+    # prepended below, so the two pre-existing cases keep the indices consumers already
+    # recorded and the new one lands last.
+    write_clip_subset(src, tmp, [stand_clip, terrain_clip, backward_clip])
 
     try:
         with h5py.File(tmp, "r") as fi, h5py.File(dst, "w") as fo:
             for key in fi.keys():
                 d = fi[key]
                 whole = np.asarray(d[0])                       # stand_walk_stand
-                rows = [_frozen_row(key, whole, cut), whole, np.asarray(d[1])]
+                rows = [_frozen_row(key, whole, cut), whole, np.asarray(d[1]),
+                        _frozen_row(key, np.asarray(d[2]), backward_cut)]
                 fo.create_dataset(key, data=np.stack(rows), dtype=d.dtype)
             for key, value in fi.attrs.items():
                 fo.attrs[key] = value
             # The added clip is flat, so the manifest is unchanged; only the counts move.
-            fo.attrs["num_clips"] = 3
-            fo.attrs["num_clips_written"] = 3
+            fo.attrs["num_clips"] = 4
+            fo.attrs["num_clips_written"] = 4
             gcfg = json.loads(fo.attrs["generator_config"])
             gcfg.setdefault("counts", {})
             gcfg["counts"]["flat"] = int(gcfg["counts"].get("flat", 0)) + 1
             fo.attrs["generator_config"] = json.dumps(gcfg)
-            # The stand's frozen tail IS its intended motion, so none of it is padding.
+            # A frozen tail IS the intended motion, so none of it is padding.
             clip_len = fo["clip_len"][:]
-            clip_len[0] = int(json.loads(fo.attrs["num_steps"]))
+            clip_len[[0, 3]] = int(json.loads(fo.attrs["num_steps"]))
             fo["clip_len"][...] = clip_len
             fo.attrs["debug_clip_source"] = json.dumps({
                 "library": os.path.basename(src),
                 "stand_clip": int(stand_clip),
                 "terrain_clip": int(terrain_clip),
+                "backward_clip": int(backward_clip),
+                "backward_freeze_step": int(backward_cut),
                 "freeze_step": int(cut),
             })
     finally:
@@ -289,6 +478,9 @@ def build_library(src: str, dst: str, stand_clip: int, terrain_clip: int,
                              "note": "the same clip untruncated"},
         "terrain": {"clip_index": 2, "source_clip": int(terrain_clip),
                     "note": "stairs transition; exercises depth + terrain anchoring"},
+        "walk_backward": {"clip_index": 3, "source_clip": int(backward_clip),
+                          "note": f"stand, then a straight-backward walk; frozen at "
+                                  f"step {backward_cut} so it is safe to hold"},
     }
 
 
@@ -310,6 +502,8 @@ def verify(dst: str, cut: int) -> None:
         vel_names = json.loads(f.attrs["vel_output_names"])
         base = [vel_names.index(f"pelvis_link:pos_{a}") for a in ("x", "y", "z")]
         tv, dy, y = f["target_vel"][:], f["dy_des"][:], f["y_des"][:]
+        clip_len = f["clip_len"][:]
+        f_attrs = dict(f.attrs)
 
     stand_cmd = np.abs(tv[0]).max()
     assert stand_cmd <= STILL_V, (
@@ -322,8 +516,35 @@ def verify(dst: str, cut: int) -> None:
     assert np.array_equal(y[0, :cut], y[1, :cut]), \
         "stand and stand_walk_stand must share a bit-identical prefix"
     assert np.abs(dy[0, cut:]).max() == 0.0, "the frozen tail must have zero velocity"
+
+    # The backward case has to actually go backward, and go there straight: a clip that
+    # only dips past the threshold for a few steps, or that turns while reversing, would
+    # not isolate the direction this case exists to test.
+    back_vx = float(tv[3, :, 0].min())
+    assert back_vx <= BACKWARD_VX, (
+        f"the walk_backward case only reaches vx = {back_vx:.3f} "
+        f"(needs <= {BACKWARD_VX}) -- it is not a backward walk")
+    back_steps = int(backward_mask(tv[3:4], clip_len[3:4])[0].sum())
+    turn = float(np.abs(tv[3, backward_mask(tv[3:4], clip_len[3:4])[0], 2]).max())
+    # The tail has to be holdable: zero command and zero reference velocity, or obelisk
+    # (which saturates on the last frame and runs until stopped) walks against a static
+    # target and falls for reasons that have nothing to do with the policy.
+    bcut = int(json.loads(f_attrs["debug_clip_source"])["backward_freeze_step"])
+    vel_names2 = json.loads(f_attrs["vel_output_names"])
+    base2 = [vel_names2.index(f"pelvis_link:pos_{a}") for a in ("x", "y", "z")]
+    back_frozen_speed = float(np.linalg.norm(dy[3, bcut - 1, base2]))
+    assert back_frozen_speed <= FROZEN_SPEED_TOL, (
+        f"walk_backward froze onto a frame moving at {back_frozen_speed:.3f} m/s "
+        f"(tol {FROZEN_SPEED_TOL}) -- the reference would stop instantaneously")
+    assert np.abs(tv[3, bcut:]).max() <= STILL_V, (
+        f"the walk_backward tail still commands {np.abs(tv[3, bcut:]).max():.3f} after its "
+        f"freeze at step {bcut} -- it would be unsafe to hold")
+    assert np.abs(dy[3, bcut:]).max() == 0.0, "the walk_backward frozen tail must be at rest"
     print(f"[OK] stand max |command| = {stand_cmd:.4f}, frozen-frame speed = "
           f"{frozen_speed:.4f} m/s, prefix identical through step {cut}")
+    print(f"[OK] walk_backward frozen-frame speed = {back_frozen_speed:.4f} m/s")
+    print(f"[OK] walk_backward peak vx = {back_vx:.2f} m/s, {back_steps} backward steps "
+          f"in total, max |wz| = {turn:.2f} rad/s while reversing")
 
 
 def main() -> int:
@@ -341,6 +562,8 @@ def main() -> int:
                    help="Override the searched stand / stand-walk-stand source clip.")
     p.add_argument("--terrain_clip", type=int, default=None,
                    help="Override the searched terrain source clip.")
+    p.add_argument("--backward_clip", type=int, default=None,
+                   help="Override the searched backward-walk source clip.")
     p.add_argument("--min_walk_speed", type=float, default=0.5,
                    help="Commanded speed (m/s) the stand clip must reach after its stand.")
     args = p.parse_args()
@@ -365,6 +588,25 @@ def main() -> int:
             stand_clip, lead = select_stand_clip(f, args.min_walk_speed)
         terrain_clip = (args.terrain_clip if args.terrain_clip is not None
                         else select_terrain_clip(f))
+        if args.backward_clip is not None:
+            backward_clip = args.backward_clip
+            back_run = int(backward_mask(f["target_vel"][backward_clip:backward_clip + 1],
+                                         f["clip_len"][backward_clip:backward_clip + 1]).sum())
+            _s = still_mask(f["target_vel"][backward_clip:backward_clip + 1],
+                            f["clip_len"][backward_clip:backward_clip + 1])[0]
+            _tail = np.where(_s)[0]
+            _tail = _tail[_tail > back_run]
+            if not len(_tail):
+                sys.exit(f"[ERROR] Clip {backward_clip} never settles after its walk, so "
+                         "its tail cannot be frozen and it is unsafe to hold.")
+            backward_cut = settled_step(base_speed(f)[backward_clip], int(_tail[0]),
+                                        int(f["clip_len"][backward_clip]))
+            if backward_cut < 0:
+                sys.exit(f"[ERROR] Clip {backward_clip}'s root never comes to rest after its "
+                         "walk, so freezing it would write an instantaneous stop.")
+        else:
+            backward_clip, back_run, backward_cut = select_backward_clip(
+                f, exclude=(stand_clip, terrain_clip))
 
     cut = lead - FREEZE_MARGIN_STEPS
     if cut < 2:
@@ -373,8 +615,12 @@ def main() -> int:
     print(f"[INFO] stand clip  {stand_clip}: {lead} still steps ({lead * dt:.2f}s), "
           f"freezing at step {cut} ({cut * dt:.2f}s)")
     print(f"[INFO] terrain clip {terrain_clip}")
+    print(f"[INFO] backward clip {backward_clip}: {back_run} backward steps "
+          f"({back_run * dt:.2f}s), freezing its trailing stand at step {backward_cut} "
+          f"({backward_cut * dt:.2f}s)")
 
-    cases = build_library(src, dst, stand_clip, terrain_clip, cut)
+    cases = build_library(src, dst, stand_clip, terrain_clip, backward_clip, cut,
+                          backward_cut)
     verify(dst, cut)
 
     sidecar = dst.rsplit(".h5", 1)[0] + ".json"

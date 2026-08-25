@@ -34,22 +34,42 @@ import yaml
 
 OBELISK = pathlib.Path(__file__).resolve().parent.parent
 CONTROLLER = OBELISK / "g1_control" / "g1_control" / "controller.py"
+CONTROLLER_CPP = OBELISK / "g1_control_cpp" / "src" / "g1_controller.cc"
 ESTIMATOR = OBELISK / "g1_control" / "g1_control" / "estimator.py"
 CONFIG_DIR = OBELISK / "g1_control" / "config"
 
-#: Node name in the configs -> the module that implements it. Only first-party nodes: an
-#: obelisk or upstream node declares its parameters in C++ or in another package.
-FIRST_PARTY = {"low_level": CONTROLLER, "g1_estimator": ESTIMATOR}
+#: Node name in the configs -> the source(s) that may implement it. Only first-party nodes: an
+#: obelisk or upstream node declares its parameters in another package.
+#:
+#: `low_level` has TWO implementations -- the python controller and the C++ one -- selected by
+#: which config is launched (g1.yml vs g1_cpp.yml). A parameter is live if EITHER declares it,
+#: and each config is checked against the pair rather than against one of them, because the
+#: alternative is a test that fails whenever a knob exists on only one side.
+FIRST_PARTY = {"low_level": (CONTROLLER, CONTROLLER_CPP), "g1_estimator": (ESTIMATOR,)}
+
+#: Matches both `declare_parameter("x"` and the C++ `declare_parameter<double>("x"`. Without the
+#: optional template argument this silently matches nothing in the C++ source, and the test then
+#: passes VACUOUSLY against it -- which is worse than failing, because it looks like coverage.
+_DECLARE = re.compile(r'declare_parameter(?:<[^>]*>)?\(\s*"([^"]+)"')
+_GET = re.compile(r'get_parameter\(\s*"([^"]+)"')
 
 
-def _declared(path: pathlib.Path) -> set[str]:
-    """Parameter names a node declares."""
-    return set(re.findall(r'declare_parameter\(\s*"([^"]+)"', path.read_text()))
+def _declared(paths) -> set[str]:
+    """Parameter names any of `paths` declares."""
+    out: set[str] = set()
+    for path in paths:
+        if path.exists():
+            out |= set(_DECLARE.findall(path.read_text()))
+    return out
 
 
-def _read(path: pathlib.Path) -> set[str]:
-    """Parameter names a node reads back."""
-    return set(re.findall(r'get_parameter\(\s*"([^"]+)"', path.read_text()))
+def _read(paths) -> set[str]:
+    """Parameter names any of `paths` reads back."""
+    out: set[str] = set()
+    for path in paths:
+        if path.exists():
+            out |= set(_GET.findall(path.read_text()))
+    return out
 
 
 def _config_params(cfg: pathlib.Path) -> dict[str, dict]:
@@ -72,17 +92,23 @@ def test_every_configured_parameter_is_declared(cfg: pathlib.Path):
         declared = _declared(FIRST_PARTY[node])
         undeclared = sorted(set(params) - declared)
         assert not undeclared, (
-            f"{cfg.name} sets {undeclared} on '{node}', which "
-            f"{FIRST_PARTY[node].name} never declares. rclpy ignores overrides for "
+            f"{cfg.name} sets {undeclared} on '{node}', which none of "
+            f"{[p.name for p in FIRST_PARTY[node]]} declares. rclpy ignores overrides for "
             "undeclared parameters WITHOUT WARNING, so these read as live settings and do "
             "nothing. Either declare and use them, or delete them from the config."
         )
 
 
-@pytest.mark.parametrize("node,path", sorted(FIRST_PARTY.items()), ids=lambda v: getattr(v, "name", v))
-def test_every_declared_parameter_is_read(node: str, path: pathlib.Path):
+#: One entry per SOURCE file, not per node: an unread parameter is a property of the file that
+#: declares it, and checking a node's files as a set would let one implementation cover for a
+#: dead knob in the other.
+_SOURCES = sorted({p for paths in FIRST_PARTY.values() for p in paths if p.exists()})
+
+
+@pytest.mark.parametrize("path", _SOURCES, ids=lambda p: p.name)
+def test_every_declared_parameter_is_read(path: pathlib.Path):
     """A declared-but-unread parameter appears in `ros2 param list` and does nothing."""
-    unread = sorted(_declared(path) - _read(path))
+    unread = sorted(_declared([path]) - _read([path]))
     assert not unread, (
         f"{path.name} declares {unread} and never calls get_parameter on them. They show up "
         "in `ros2 param list` and in the config as though they were live. Delete them, or "

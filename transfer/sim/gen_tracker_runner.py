@@ -38,7 +38,7 @@ import yaml
 # Torch-free deployment runtime (numpy + onnxruntime); transfer/ on sys.path.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from deploy.artifacts import resolve_fm_onnx  # noqa: E402
-from deploy.fm_session import default_depth_lag_steps
+from deploy.fm_session import default_depth_lag_steps  # noqa: E402
 from deploy.clip_reference import ClipReference, resolve_case  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy, wxyz_to_xyzw, xyzw_to_wxyz  # noqa: E402
 from deploy.quat_math_np import (  # noqa: E402
@@ -50,6 +50,9 @@ from deploy.quat_math_np import (  # noqa: E402
     subtract_frame_transforms,
     yaw_quat,
 )
+from deploy.fk import DEFAULT_FK_MODEL, WindowFK  # noqa: E402
+from deploy.diagnostics import obs_checksum  # noqa: E402
+from deploy.replay_stream import split_checksum  # noqa: E402
 from deploy.tracker_session import convert_joint_order  # noqa: E402
 from deploy.window_np import window_block_slices  # noqa: E402
 
@@ -67,13 +70,12 @@ def find_latest_run(log_root_path: str) -> str | None:
 class JoystickCommand:
     """Read ``(vx, vy, wz)`` from a gamepad, scaled by per-axis maxima."""
 
-    def __init__(self, max_vx: float, max_vy: float, max_wz: float, start_button: int = 0):
+    def __init__(self, max_vx: float, max_vy: float, max_wz: float):
         """Initialise pygame and open joystick 0 (falls back to a constant command)."""
         import pygame
 
-        self._pygame = pygame
+        self._pygame = pygame            # __call__ pumps the event queue through it
         self.scale = np.array([max_vx, max_vy, max_wz])
-        self.start_button = start_button
         pygame.init()
         pygame.joystick.init()
         if pygame.joystick.get_count() < 1:
@@ -83,14 +85,6 @@ class JoystickCommand:
             self.joystick = pygame.joystick.Joystick(0)
             self.joystick.init()
             print(f"Using controller: {self.joystick.get_name()}")
-
-    def button_pressed(self, idx: int | None = None) -> bool:
-        """Return True if a gamepad button (default the start/A button) is currently pressed."""
-        if self.joystick is None:
-            return False
-        for _ in self._pygame.event.get():
-            pass
-        return bool(self.joystick.get_button(self.start_button if idx is None else idx))
 
     def __call__(self, sim_time: float) -> np.ndarray:
         """Return the current command ``(vx, vy, wz)``."""
@@ -203,6 +197,7 @@ class FmDepthLag:
 def build_state(
     robot: Robot, policy: GenTrackerPolicy, command: np.ndarray,
     depth_cams: MujocoDepthCameras | None = None, want_depth_hits: bool = False,
+    want_raw_depth: bool = False,
     fm_depth_cams: MujocoDepthCameras | None = None,
     fm_lag: "FmDepthLag | None" = None,
 ) -> dict:
@@ -219,6 +214,7 @@ def build_state(
         depth_cams: The TRACKER's depth cameras to cast, or ``None`` when the policy has
             none.
         want_depth_hits: Also collect the depth rays' world hit points (viewer only).
+        want_raw_depth: Also collect pre-normalisation depth in metres (replay dump only).
         fm_depth_cams: The GENERATOR's cameras, when it samples the same lenses on its own
             grid. ``None`` when the two samplings match, in which case the generator reads
             ``state["depth"]`` like it always did.
@@ -342,8 +338,16 @@ def build_state(
     # contract it loaded. Both cameras run at the control rate, so a single cast per step
     # is exact: no staleness to model.
     if depth_cams is not None:
-        if want_depth_hits:
+        # `depth_raw` is METRES along the optical axis, recorded only for --dump_replay: the
+        # C++ runtime is fed raw and normalises internally, and the normalisation clips and
+        # maps misses to a sentinel, so it cannot be inverted after the fact.
+        if want_depth_hits and want_raw_depth:
+            state["depth"], state["depth_hits"], state["depth_raw"] = depth_cams.compute(
+                robot.mj_data, want_hits=True, want_raw=True)
+        elif want_depth_hits:
             state["depth"], state["depth_hits"] = depth_cams.compute(robot.mj_data, want_hits=True)
+        elif want_raw_depth:
+            state["depth"], state["depth_raw"] = depth_cams.compute(robot.mj_data, want_raw=True)
         else:
             state["depth"] = depth_cams.compute(robot.mj_data)
     # A SECOND cast, only when the generator samples the same lenses on a different grid.
@@ -356,6 +360,77 @@ def build_state(
     if fm_lag is not None:
         fm_lag.apply(state)
     return state
+
+
+def _record_replay_tick(writer, policy, state: dict, obs: np.ndarray,
+                        prev_action: np.ndarray) -> None:
+    """Append one tick's inputs and this runtime's answers to the replay stream.
+
+    Called AFTER get_action, so `obs`, the action and the served window are this tick's, while
+    `prev_action` was captured before the call -- the ordering matters and is the reason this
+    is a function rather than an inline block.
+
+    The camera pose is flattened per camera in CONTRACT order, matching the C++
+    HardwareReadings layout, so the replay tool's mapping is one line per field.
+
+    Args:
+        writer: The :class:`deploy.replay_stream.ReplayWriter`.
+        policy: The live policy, for the served window and the raw action.
+        state: The state dict this tick was built from.
+        obs: The assembled observation.
+        prev_action: The previous tick's raw network output.
+    """
+    poses = state.get("fm_camera_pose") or []
+    cam_pos = np.concatenate([np.asarray(p, dtype=np.float64).ravel() for p, _ in poses]) \
+        if poses else np.zeros(0)
+    cam_rot = np.concatenate([np.asarray(r, dtype=np.float64).ravel() for _, r in poses]) \
+        if poses else np.zeros(0)
+    raw = state.get("depth_raw")
+    writer.append(
+        inputs={
+            "root_pos": state["root_pos"],
+            "base_quat_xyzw": state["root_quat"],
+            "base_ang_vel_b": state["base_ang_vel"],
+            "base_lin_vel_w": state["root_lin_vel_w"],
+            "joint_pos": state["joint_pos"],
+            "joint_vel": state["joint_vel"],
+            "command": state["command"],
+            "depth_raw": None if raw is None else np.asarray(raw, dtype=np.float64).ravel(),
+            "fm_camera_pos": cam_pos,
+            "fm_camera_rot": cam_rot,
+            "height_scan": state.get("height_scan"),
+            "prev_action": prev_action,
+        },
+        outputs={
+            "obs": np.asarray(obs, dtype=np.float64).ravel(),
+            "action": np.asarray(policy._trk.action_isaac, dtype=np.float64).ravel(),
+            "window": policy.last_served_window(),
+            # Split, because a 64-bit digest does not fit a float64 exactly -- see
+            # replay_stream.split_checksum.
+            "obs_checksum_hi": split_checksum(
+                obs_checksum(np.asarray(obs, dtype=np.float32)))[0],
+            "obs_checksum_lo": split_checksum(
+                obs_checksum(np.asarray(obs, dtype=np.float32)))[1],
+            "ctrl_step": float(policy._ctrl_step),
+            # 1.0 on a tick the generator re-inferred. The comparator groups by this: a
+            # divergence confined to re-plan ticks points at the generator, one spread over
+            # every tick points at the observation assembly.
+            "replanned": float(policy._ctrl_step % max(policy.fm_update_every, 1) == 0),
+            "fm_history_null": (float(bool(plan["history_null"]))
+                                if (plan := policy.last_plan()) is not None else -1.0),
+            # The conditioning the LIVE plan came from. Held between re-plans, exactly as the
+            # C++'s last_conditioning() is, so the two line up tick for tick.
+            "fm_extero": (np.zeros(0) if plan is None
+                          else np.asarray(plan["extero_tokens"], dtype=np.float64).ravel()),
+            "fm_future_cmd": (np.zeros(0) if plan is None
+                              else np.asarray(plan["future_cmd"], dtype=np.float64).ravel()),
+            "fm_history_nodes": (np.zeros(0) if plan is None
+                                 else np.asarray(plan["history_nodes"],
+                                                 dtype=np.float64).ravel()),
+            "fm_history_cmd": (np.zeros(0) if plan is None
+                               else np.asarray(plan["history_cmd"], dtype=np.float64).ravel()),
+        },
+    )
 
 
 def load_standing_pose(path: str, isaac_joint_names: list[str],
@@ -564,25 +639,24 @@ def box_top(robot: Robot, spec: str) -> tuple[float, float, float] | None:
 
 
 def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
-        headless: bool, log_path: str | None, warmup_time: float, rt_factor: float,
+        headless: bool, log_path: str | None, rt_factor: float,
         standing_config: str | None, viz: bool, vel_arrow_scale: float, vel_arrow_height: float,
-        hold_kp_scale: float, hold_kv_scale: float, spawn_z_offset: float,
+        spawn_z_offset: float,
         clip_spawn_z_offset: float,
         cmd_max_acc: float, fm_traj_points: int, spawn_on_box: str | None = None,
         clip: ClipReference | None = None, clip_handoff_time: float = -1.0,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
         viz_geomgroup: list[int] | None = None, viz_contacts: bool = False,
         fm_depth_cams: MujocoDepthCameras | None = None,
-        fm_lag: FmDepthLag | None = None) -> bool | None:
-    """Run the warmup + control loop; return True if the robot did not fall.
+        replay=None, fm_lag: FmDepthLag | None = None) -> bool | None:
+    """Run the control loop; return True if the robot did not fall.
 
     Returns ``None`` when the user interrupts with Ctrl-C, which is neither survival nor a
     fall. The interrupt is taken at a control-step boundary so the artifacts below still get
     written -- see :class:`InterruptFlag` for why that matters and what it replaced.
 
-    The robot first PD-holds a stable stand for ``warmup_time`` seconds (at least the
-    FM history length) while the generator history fills with real snapshots, then
-    hands control to the FM + tracker. Playback is paced to real time (scaled by
+    The FM + tracker have control from the first step -- there is no warmup hold, and no
+    way to fabricate a generator history. Playback is paced to real time (scaled by
     ``rt_factor``) in viewer mode; headless/eval runs are never throttled.
 
     Args:
@@ -592,11 +666,6 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         total_time: Stop after this many seconds (``<= 0`` runs until the viewer closes).
         headless: Run without the viewer.
         log_path: CSV path for per-step metrics, or ``None`` to skip logging.
-        warmup_time: Seconds to PD-hold the stand before live control. DEFAULTS TO 0 (skip the
-            hold; fall back to a static warm-start fill), because ``null_history_warmup``
-            makes the FM valid at step 0 without needing real snapshots in the window, so the
-            hold only delays the thing you launched the runner to see. A positive value also
-            arms the joystick start-button gate in viewer runs.
         rt_factor: Real-time speed multiple for viewer playback (``1.0`` = real time,
             ``0.5`` = half speed; ``<= 0`` disables pacing).
         standing_config: Path to a standing ``config_solution.yaml`` to spawn + hold; if
@@ -604,10 +673,6 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         viz: Draw FM root/feet spheres + velocity arrows in the viewer (viewer mode only).
         vel_arrow_scale: Arrow length in metres per (m/s) of planar speed.
         vel_arrow_height: Height (m) above the pelvis to draw the velocity arrows.
-        hold_kp_scale: Leg (hip/knee/ankle) kp multiplier during the hold. Fixed-joint PD
-            at the XML gains cannot balance the robot; a stiff, well-damped hold keeps it
-            standing while the buffer fills. Wiped by the RL gains at handoff.
-        hold_kv_scale: Leg kv (damping) multiplier during the hold.
         clip_spawn_z_offset: Metres to raise the pelvis in CLIP mode. Default 0: a clip frame is
             authored with the feet already on the terrain, and IsaacLab's reset spawns it
             verbatim, so any lift here is a pure sim2sim mismatch -- and an expensive one. It
@@ -676,7 +741,6 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                                   joint_vel_mujoco=convert_joint_order(c_jv, isaac,
                                                                        robot.joint_names))
         robot.set_pd_gains_from_policy(policy)
-        warmup_steps = 0
         print(f"[INFO] Clip mode: spawned on clip step {clip.start_step} state "
               f"(t={clip.start_step * clip.dt:.2f}s, z+{clip_spawn_z_offset}, "
               f"|v|={np.linalg.norm(c_vel_w[:3]):.2f} m/s); RL gains set.")
@@ -705,36 +769,19 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         if standing_config:
             print(f"[WARN] standing_config not found ({standing_config}); holding default_joint_angles.")
         hold_target = convert_joint_order(policy._trk.default_joint_angles, isaac, robot.joint_names)
-    # Stiffen the legs for the hold: fixed-joint PD at the XML gains tips over (the ankles
-    # alone can't balance the inverted pendulum), so a stiff, well-damped leg holds a stand.
-    if clip is None and warmup_time > 0 and (hold_kp_scale != 1.0 or hold_kv_scale != 1.0):
-        robot.scale_gains(hold_kp_scale, hold_kv_scale, name_filter=["hip", "knee", "ankle"])
-        print(f"[INFO] Hold gains: leg kp x{hold_kp_scale}, kv x{hold_kv_scale} "
-              "(reverts to RL gains at handoff).")
-    elif clip is None and warmup_time <= 0:
-        print("[INFO] warmup_time<=0: spawning straight into FM+tracker control "
-              "(no standing hold, no stiffened hold gains, no start-button gate).")
+    # RL tracker gains from the first step. The clip branch above has already done this; this
+    # is the non-clip path, which used to spawn on the XML gains and switch at a handoff that
+    # no longer exists.
     if clip is None:
-        warmup_steps = max(policy.ctx.N, int(math.ceil(warmup_time / dt))) if warmup_time > 0 else 0
-        if warmup_steps == 0:
-            # No hold: fall back to a static warm-start fill so the FM is valid at step 0.
-            policy.warm_start(build_state(robot, policy, np.zeros(3), depth_cams,
-                                          fm_depth_cams=fm_depth_cams, fm_lag=fm_lag))
+        robot.set_pd_gains_from_policy(policy)
+        print("[INFO] Spawning straight into FM+tracker control on the RL gains (no standing "
+              "hold: the generator runs from step 0 on its learned null-history embedding).")
 
     # Predicted extra-frame indices that are feet (for the FM viz spheres).
     foot_idx = [i for i, n in enumerate(policy.ctx.target_frame_names)
                 if "ankle" in n.lower() or "foot" in n.lower()]
     if viz and not headless:
         print(f"[INFO] FM target frames: {policy.ctx.target_frame_names}; feet -> {foot_idx}")
-
-    # Manual handoff gate: in interactive (joystick) viewer runs, hold the stand until the
-    # operator presses the start button, so standing can be verified before going live.
-    # ``warmup_time <= 0`` is an explicit request to spawn straight into FM control, so it
-    # disables the gate too -- otherwise a joystick run would still wait for a button press
-    # and "no warmup" would silently mean "hold forever until pressed".
-    gate = ((not headless) and warmup_time > 0
-            and isinstance(command_fn, JoystickCommand) and command_fn.joystick is not None)
-    min_hold = max(warmup_steps, policy.ctx.N) if gate else warmup_steps
 
     # Velocity-command rate limit. Prefer the value embedded in the tracker metadata (the rate
     # the policy trained with, so sim2sim can't silently drift from training); otherwise use
@@ -793,35 +840,46 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             vel_cmd = np.clip(desired, vel_cmd - lim, vel_cmd + lim)
         else:
             vel_cmd = desired
+        # The PREVIOUS tick's raw network output, read before this tick overwrites it. This is
+        # what the `actions` observation term is, and recording it is what lets the C++ side be
+        # driven fully teacher-forced -- otherwise a replay is autoregressive through that one
+        # term and the ticks after the first divergence stop being independent samples.
+        prev_action = (np.asarray(policy._trk.action_isaac, dtype=np.float64).copy()
+                       if replay is not None else None)
         state = build_state(robot, policy, vel_cmd, depth_cams, want_depth_hits=viz,
+                            want_raw_depth=replay is not None,
                             fm_depth_cams=fm_depth_cams, fm_lag=fm_lag)
         obs = policy.create_obs(state)
         action = policy.get_action(obs, robot.joint_names)
         robot.apply_action(action)
+        if replay is not None:
+            _record_replay_tick(replay, policy, state, obs, prev_action)
         return action, state
 
     # ------------------------------------------------------------------
     # Forward kinematics of the PREDICTED window (viewer ribbon + log columns).
     # ------------------------------------------------------------------
-    # A scratch MjData on the sim's own model, so FK of a hypothetical pose never disturbs
-    # the live one. `mj_kinematics` is the whole cost -- no dynamics, no collision.
-    _fk_data = mujoco.MjData(robot.mj_model)
-    _fk_body_ids = [mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, n)
-                    for n in policy.ctx.target_frame_names]
-    _fk_missing = [n for n, i in zip(policy.ctx.target_frame_names, _fk_body_ids) if i < 0]
-    if _fk_missing:
-        print(f"[WARN] FK frames absent from the MJCF, so no predicted-frame ribbon: {_fk_missing}")
+    # deploy.fk, shared with the ROS marker node (g1_control fm_plan_viz), so the RViz ribbon
+    # and this viewer's ribbon are the same object by construction and a disagreement between
+    # the two views is a real one. It builds its own pinocchio model rather than borrowing
+    # robot.mj_model, so FK of a hypothetical pose cannot touch the live sim -- and it is a
+    # DIFFERENT model from the one this file simulates, which deploy/tests/test_fk_parity.py
+    # measures at 4.6e-7 m over these frames.
+    _fk = WindowFK(DEFAULT_FK_MODEL, policy.ctx.target_frame_names, isaac)
+    if _fk.missing:
+        print(f"[WARN] FK frames absent from the URDF, so no predicted-frame ribbon: {_fk.missing}")
 
     def _fm_frame_paths_w(node_idxs) -> np.ndarray | None:
         """World positions of the FM target frames implied by the predicted window.
 
         The slim window predicts ``joint_pos`` but no ``ee_pos``, so the frames are not
         served -- they are IMPLIED, and forward kinematics recovers them: set the reference
-        base pose + reference joints on a scratch ``MjData`` and read the body positions
-        back. MuJoCo is the right engine for it here because the sim is already holding the
-        very model the FM's FK losses are defined against
-        (``FlowMatchingConfig.fk_model_path`` is this MJCF), so nothing can drift between
-        the two.
+        base pose + reference joints on a scratch model and read the frame positions back.
+        The engine is ``deploy.fk.WindowFK`` on the robot's URDF -- which agrees with
+        ``FlowMatchingConfig.fk_model_path``, the model the FM's FK losses are defined
+        against, to 4.6e-7 m on these frames (``deploy/tests/test_fk_parity.py``) -- and the
+        SAME object the ROS marker node draws with, so this ribbon and the RViz one cannot
+        disagree.
 
         What this DOES mean: the frames are exactly where the predicted joints put them,
         given the predicted base. That is a stronger statement than the retired ``ee_pos``
@@ -845,21 +903,11 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         """
         lifted = policy.predicted_base_pose_w()
         jp_isaac = policy.predicted_joint_pos()
-        if lifted is None or jp_isaac is None or not any(i >= 0 for i in _fk_body_ids):
+        if lifted is None or jp_isaac is None or not _fk.resolved:
             return None
         ref_p, ref_q = lifted
         idxs = np.asarray(node_idxs, dtype=int)
-        out = np.full((idxs.size, len(_fk_body_ids), 3), np.nan)
-        for row, n in enumerate(idxs):
-            # qpos = [pos(3), quat(4, WXYZ), joints(nj in MUJOCO order)].
-            _fk_data.qpos[0:3] = ref_p[n]
-            _fk_data.qpos[3:7] = xyzw_to_wxyz(ref_q[n])
-            _fk_data.qpos[7:] = convert_joint_order(jp_isaac[n], isaac, robot.joint_names)
-            mujoco.mj_kinematics(robot.mj_model, _fk_data)
-            for f, bid in enumerate(_fk_body_ids):
-                if bid >= 0:
-                    out[row, f] = _fk_data.xpos[bid]
-        return out
+        return _fk.frame_positions(ref_p[idxs], ref_q[idxs], jp_isaac[idxs])
 
     # One-shot latch for the "--log FM branch has NaN columns" notice (a list so the
     # closure can append without a nonlocal).
@@ -1059,44 +1107,22 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         _next_report_t[0] += report_every_s
 
     def run_loop(viewer) -> bool | None:
-        """Warmup hold then live FM + tracker control.
+        """Live FM + tracker control from the first step; return False if the robot fell.
 
-        Returns:
-            True if the robot did not fall, False if it did, ``None`` if the user
-            interrupted the run (neither outcome -- see :class:`InterruptFlag`).
+        Returns ``None`` if the user interrupted the run -- neither survival nor a fall.
+
+        There is no warmup hold. The generator drives from step 0 with its learned
+        null-history embedding covering the not-yet-full window, which is what the RL side
+        does and therefore what the pair was trained for. Every alternative that existed here
+        fabricated a history -- a stiffened PD hold that filled the window with standing
+        snapshots, or a static fill that repeated one snapshot into all N slots -- and a
+        fabricated history is off-distribution: real history always has motion between its
+        steps. The hold additionally put the robot in a state no training episode started
+        from.
         """
         nonlocal handoff_time
-        # Warmup: PD-hold the stand (cmd = 0, XML default gains) while the history fills.
-        # When gated, hold until the start button is pressed (after the buffer is full).
-        if gate:
-            print(f"[INFO] Holding standing pose -- press gamepad button {command_fn.start_button} "
-                  "(A) to hand control to the RL tracker.")
-        held = 0
-        while True:
-            if interrupt.hit:
-                return None
-            if viewer is not None and not viewer.is_running():
-                return True
-            if total_time > 0 and robot.mj_data.time > total_time:
-                return True
-            state = build_state(robot, policy, np.zeros(3), depth_cams,
-                                fm_depth_cams=fm_depth_cams, fm_lag=fm_lag)
-            policy.observe(state)
-            robot.apply_action(hold_target)
-            draw_viz(viewer, state)
-            advance_physics(state, viewer)
-            if robot.failed():
-                print("[WARN] Robot fell during the warmup hold (check PD gains / spawn pose).")
-                return False
-            held += 1
-            if held >= min_hold and (not gate or command_fn.button_pressed()):
-                break
-        # Switch from the XML default gains to the RL tracker gains for live control.
-        robot.set_pd_gains_from_policy(policy)
         handoff_time = robot.mj_data.time
-        print(f"[INFO] Handoff: switched to RL PD gains, handing control to the FM + tracker "
-              f"(t={handoff_time:.2f}s).")
-        # Live: hand control to the FM + tracker.
+        # Live: the FM + tracker have control from here.
         while True:
             if interrupt.hit:
                 return None
@@ -1134,9 +1160,15 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             if total_time > 0 and robot.mj_data.time > total_time:
                 return True
             s = min(clip_step, clip.real_steps - 1)
+            # Same teacher-forcing hook the FM loop uses: the `actions` observation term is
+            # the runtime's own previous output, so a replay that did not record it would be
+            # autoregressive through that one term and its ticks would stop being independent.
+            prev_action = (np.asarray(policy._trk.action_isaac, dtype=np.float64).copy()
+                           if replay is not None else None)
             state = build_state(robot, policy, clip.command_at(s), depth_cams,
                                 fm_depth_cams=fm_depth_cams,
-                                want_depth_hits=viz)
+                                want_depth_hits=viz,
+                                want_raw_depth=replay is not None)
             if (not clip_only) and robot.mj_data.time >= clip_handoff_time:
                 if not handed_off:
                     handoff_time = robot.mj_data.time
@@ -1154,13 +1186,24 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 # reference recedes ahead of the robot, mirroring the teacher's
                 # training-time ego re-anchoring. World-anchored mode (default) leaves
                 # the fixed placement untouched.
-                if clip.ego_anchor and (clip_step - clip.start_step) % max(clip.ego_anchor_every, 1) == 0:
+                # ONE number for both decisions: the clip's own elapsed tick. The policy
+                # latches its window anchor on it too (create_obs_from_reference below), and
+                # under window_anchor='plan' the two must fire on the same step.
+                clip_tick = clip_step - clip.start_step
+                if clip.ego_anchor and clip_tick % max(clip.ego_anchor_every, 1) == 0:
                     clip.reanchor_ego(s, state["root_pos"], state["root_quat"])
-                policy.observe(state)            # keep the FM history warm for handoff
+                # Keep the generator's cadence counter moving while the clip drives, so the
+                # first re-plan after the handoff lands on the phase it would have.
+                policy.advance_dormant_step()
                 ref = clip.reference_at(s, policy.window_offsets)
-                obs = policy.create_obs_from_reference(state, ref)
+                obs = policy.create_obs_from_reference(state, ref, clip_tick=clip_tick)
             action = policy.get_action(obs, robot.joint_names)
             robot.apply_action(action)
+            # Recorded on the CLIP path too, so --dump_replay means the same thing in both
+            # modes. Without this the flag silently produced an empty stream here, and the
+            # comparison built on it died at write() rather than at the missing call.
+            if replay is not None:
+                _record_replay_tick(replay, policy, state, obs, prev_action)
             if robot.failed():
                 return False
             draw_viz(viewer, state)
@@ -1263,12 +1306,22 @@ def main() -> None:
     parser.add_argument("--scene", type=str, default="basic_scene")
     parser.add_argument("--robot_name", type=str, default="g1_perceptive")
     parser.add_argument("--num_threads", type=int, default=0, help="onnxruntime intra-op threads (0=auto).")
+    parser.add_argument("--tracker_on_cpu", action="store_true", default=False,
+                        help="Run the tracker on the CPU while the generator keeps the GPU. "
+                             "Costs the tracker nothing and keeps it out of the generator's "
+                             "captured submission; this is what the hardware controller does "
+                             "by default.")
+    parser.add_argument("--fm_cuda_graph", action="store_true", default=False,
+                        help="Replay a captured CUDA graph for the generator instead of "
+                             "launching its ~3000 kernels individually (9.8 -> 8.3 ms per "
+                             "re-plan on an RTX 4070). Needs a CUDA provider and a "
+                             "fixed-batch fm.onnx; refused loudly if either is missing.")
     parser.add_argument("--providers", default="auto",
                         help="Comma-separated onnxruntime execution providers for BOTH nets, "
                              "e.g. 'cuda' or 'cuda,cpu' (aliases: cpu/cuda/trt). Default "
                              "'auto' = the GPU when the installed wheel has one, else the "
                              "CPU. This is a SIM default, not the deployment one: the "
-                             "generator is ~99% of the step cost and runs it in ~100 ms on a "
+                             "generator is ~99%% of the step cost and runs it in ~100 ms on a "
                              "CPU, so sim2sim defaults to the GPU while transfer/deploy still "
                              "requires hardware to state its provider. 'cpu' forces the "
                              "deployment-representative timing. CPU is always appended as a "
@@ -1313,21 +1366,22 @@ def main() -> None:
                              "'--spawn_on_box 2' or '--spawn_on_box box2' (the generated "
                              "terrain scene has box0..box3 at 0.25/0.40/0.55/0.70 m). The "
                              "standing joint pose is kept; only the support height changes. "
-                             "Pair with --warmup_time 0 to hand straight to the FM on the box.")
-    parser.add_argument("--warmup_time", type=float, default=0.0,
-                        help="Seconds to PD-hold a stand before live control. DEFAULT 0 = spawn "
-                             "DIRECTLY into FM+tracker control: the FM history is warm-started "
-                             "from the spawn state, the leg hold-gain stiffening is skipped, and "
-                             "the joystick start-button gate is disabled. The FM is valid at step "
-                             "0 regardless, because --null_history_warmup (also default on) "
-                             "samples it through the learned null-history embedding. Pass a "
-                             "POSITIVE value (e.g. 1.0, the old default) to get the stand hold "
-                             "back -- and, in a joystick viewer run, the start-button gate that "
-                             "holds until you press start. Ignored in --clip mode, which always "
-                             "spawns on the clip pose with RL gains.")
+                             "The FM takes control immediately.")
     parser.add_argument("--rt_factor", type=float, default=1.0,
                         help="Viewer playback speed vs real time (1.0=real, 0.5=half; <=0 disables pacing).")
-    parser.add_argument("--headless", action="store_true", default=False)
+    parser.add_argument("--headless", action="store_true", default=False,
+                        help="No viewer window. NOT just a display choice: a headed run is a "
+                             "DIFFERENT TRAJECTORY from a headless one, measured. Two headless "
+                             "runs of the same command are bit-identical (max |dx| = 0), and so "
+                             "are runs differing in --rt_factor or in the depth hit-point "
+                             "gather -- but opening the viewer changes the outcome, "
+                             "deterministically and reproducibly (tile20 at constant 0.8: "
+                             "survives 16 s headless, falls at 6.04 s headed, the same 6.04 s "
+                             "every time). viewer.sync() is the only viewer-exclusive call in "
+                             "the loop; it perturbs mjData enough to redirect a contact-rich "
+                             "walk. NEVER COMPARE ACROSS MODES -- pick one for an A/B. Watching "
+                             "is still reproducible, just a different trajectory than the "
+                             "numbers a headless sweep produces.")
     parser.add_argument("--use_ic", action="store_true", default=False)
     parser.add_argument("--standing_config", type=str, default=None,
                         help="Standing config_solution.yaml to spawn + hold during warmup "
@@ -1338,11 +1392,6 @@ def main() -> None:
                         help="Velocity-arrow length in metres per (m/s).")
     parser.add_argument("--vel_arrow_height", type=float, default=0.6,
                         help="Height (m) above the pelvis to draw the velocity arrows.")
-    parser.add_argument("--hold_kp_scale", type=float, default=6.0,
-                        help="Leg kp multiplier during the standing hold (XML gains can't "
-                             "balance the robot); reverts to RL gains at handoff.")
-    parser.add_argument("--hold_kv_scale", type=float, default=8.0,
-                        help="Leg kv (damping) multiplier during the standing hold.")
     parser.add_argument("--clip_spawn_z_offset", type=float, default=0.0,
                         help="Pelvis lift in clip mode (default 0 = spawn exactly on the clip "
                              "frame, matching IsaacLab). Non-zero desynchronises the two sims' "
@@ -1356,17 +1405,6 @@ def main() -> None:
                              "straight through (chosen empirically -- it looks better in MuJoCo). "
                              "Pass 2.0 to match the clip library's training ramp rate. Overridden "
                              "by tracker metadata 'max_acc' when that key is present.")
-    nh = parser.add_mutually_exclusive_group()
-    nh.add_argument("--null_history_warmup", dest="null_history_warmup", action="store_true",
-                    default=True,
-                    help="Sample the FM from step 0 using its learned null-history embedding "
-                         "while the N-step window fills (default; the RL side does the "
-                         "same unconditionally). Needs an fm.onnx exported with the "
-                         "history_null input.")
-    nh.add_argument("--no_null_history_warmup", dest="null_history_warmup",
-                    action="store_false",
-                    help="Legacy: withhold the FM until the history window is full, fabricating "
-                         "a repeated static history at spawn.")
     parser.add_argument("--fm_traj_points", type=int, default=0,
                         help="Number of spheres drawn along the FM predicted root/feet trajectory; "
                              "<=0 draws every predicted node (dense ribbon, like IsaacLab).")
@@ -1404,6 +1442,37 @@ def main() -> None:
     # sets of plots eyeballed side by side. Needs the `mcap` python lib plus schemas written
     # by hand (there is no ROS here to generate them), and gen_tracker_metrics.py currently
     # consumes the CSV, so it is a real change rather than a swap.
+    # ---- what counts as a fall (MuJoCo sim2sim only; nothing in transfer/deploy sees these)
+    parser.add_argument("--fall_height", type=float, default=0.2,
+                        help="Pelvis height above the scene's LOWEST terrain surface, below "
+                             "which the run is scored a fall (metres). Terrain-relative "
+                             "because the old absolute 0.2 m marked every descending tile as "
+                             "fallen on arrival: tile20's bottom slab is at -0.777 m, so a "
+                             "healthy robot standing there has a pelvis at ~0.0.")
+    parser.add_argument("--fall_tilt_deg", type=float, default=70.0,
+                        help="Maximum lean from upright, in ROLL and PITCH separately "
+                             "(degrees). Not yaw -- yaw is heading, and a yaw bound would "
+                             "fail a robot that merely turned around. This is what catches a "
+                             "collapse on an UPPER terrain level, which stays far above the "
+                             "scene-minimum height bound.")
+    parser.add_argument("--dump_replay", type=str, default=None, metavar="DIR",
+                        help="Record every tick's INPUTS and this runtime's answers to DIR, as "
+                             "the manifest+blob fixture format the C++ side already reads "
+                             "(deploy/replay_stream.py). Feeding that stream to "
+                             "deploy_cpp's replay tool -- synchronous, single-threaded, zero "
+                             "noise -- is what separates 'the C++ computes something "
+                             "different' from 'the C++ is fed something different'. Costs a "
+                             "second depth return (raw metres) and a few tens of MB per run; "
+                             "the control path is otherwise untouched.")
+    parser.add_argument("--fm_lead_ticks", type=int, default=0,
+                        help="Emulate the C++ runtime's generator LEAD: condition the "
+                             "generator on the exteroception and velocity command from this "
+                             "many ticks ago, which is what the async stack's early request "
+                             "actually sees (its history is NOT stale -- it projects the rows "
+                             "it will serve, exactly). 0 = this runner's synchronous "
+                             "behaviour. The C++ default fm_lead_sec=0.02 at dt=0.02 is 1 "
+                             "tick, so --fm_lead_ticks 1 is the matched comparison; 3 "
+                             "reproduces the old 60 ms default.")
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Where --log writes sim_log.csv + metrics (default: "
@@ -1413,9 +1482,6 @@ def main() -> None:
     parser.add_argument("--max_vx", type=float, default=1.0)
     parser.add_argument("--max_vy", type=float, default=0.5)
     parser.add_argument("--max_wz", type=float, default=1.0)
-    parser.add_argument("--start_button", type=int, default=0,
-                        help="Gamepad button index to end the standing hold and start the RL "
-                             "tracker (default 0 = A on an Xbox pad).")
     parser.add_argument("--clip", type=str, default=None,
                         help="Baked clip-library .h5 (e.g. clips/g1_parity_v1.h5). Spawns on the "
                              "clip's step-0 pose and drives the tracker from the clip reference "
@@ -1448,9 +1514,13 @@ def main() -> None:
                         help="Keep the MJCF's hand-written actuator kp/kv instead of the gains "
                              "the policy exported. Default OFF: the trained gains win, so a "
                              "retune in training reaches sim2sim without editing the XML.")
-    parser.add_argument("--clip_ego_anchor_every", type=int, default=10,
-                        help="Re-anchor cadence (control steps) for --clip_ego_anchor; should match "
-                             "the teacher's ego_anchor_every (default 10, ~0.2s at dt=0.02).")
+    parser.add_argument("--clip_ego_anchor_every", type=int, default=0,
+                        help="Re-anchor cadence (control steps) for --clip_ego_anchor. 0 (the "
+                             "default) DERIVES it from the tracker's own fm_update_every, which "
+                             "under window_anchor='plan' is not a preference but a requirement: "
+                             "the clip placement and the window anchor have to be solved from the "
+                             "robot at the same instant or the egomotion between them leaks into "
+                             "base_pose. Set it explicitly only to reproduce an older run.")
     args = parser.parse_args()
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1492,11 +1562,24 @@ def main() -> None:
     policy = GenTrackerPolicy(
         tracker_onnx, fm_onnx, fm_update_every=args.fm_update_every, num_threads=args.num_threads,
         zero_noise=args.zero_noise,
-        null_history_warmup=args.null_history_warmup,
+        fm_cuda_graph=args.fm_cuda_graph,
+        tracker_on_cpu=args.tracker_on_cpu,
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
         allow_privileged_extero=args.allow_privileged_extero,
+        fm_lead_ticks=args.fm_lead_ticks,
     )
     policy.load()
+    replay = None
+    if args.dump_replay:
+        from deploy.replay_stream import ReplayWriter
+        replay = ReplayWriter(args.dump_replay, policy.get_num_actions(),
+                              {"tracker_onnx": tracker_onnx, "fm_onnx": fm_onnx or ""})
+        print(f"[INFO] recording a replay stream to {args.dump_replay}")
+    if args.fm_lead_ticks:
+        print(f"[INFO] emulating the async runtime's generator lead: the generator sees the "
+              f"exteroception and command from {args.fm_lead_ticks} tick(s) ago "
+              f"({args.fm_lead_ticks * policy.get_dt() * 1e3:.0f} ms). The tracker's own "
+              f"observation is NOT delayed.")
     # What each graph REGISTERED, not what was asked for. onnxruntime reports a failed CUDA
     # session as a warning and carries on running on the CPU, so with the GPU now the
     # default this line is the only thing standing between "the generator is on the GPU" and
@@ -1504,7 +1587,9 @@ def main() -> None:
     print(f"[INFO] onnxruntime providers: {policy.active_providers()}")
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
-                  joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3))
+                  joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3),
+                  fall_height=args.fall_height,
+                  fall_tilt_rad=float(np.deg2rad(args.fall_tilt_deg)))
     # Drive the MuJoCo servos with the gains the policy actually TRAINED with (exported in
     # policy_parameters.yaml) rather than the MJCF's hand-written ones, so retuning gains in
     # training propagates to sim2sim with no XML edit. Skip with --keep_xml_gains.
@@ -1521,7 +1606,7 @@ def main() -> None:
         # produces a benign-but-ugly shutdown segfault.
         command_fn = lambda _t: np.zeros(3)
     elif args.mode == "joystick":
-        command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz, args.start_button)
+        command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz)
     else:
         if not hasattr(vc, args.command):
             sys.exit(f"[ERROR] No velocity profile '{args.command}' in experiments.velocity_commands.")
@@ -1573,12 +1658,14 @@ def main() -> None:
                              clip_id=clip_id,
                              start_time=args.clip_start_time,
                              ego_anchor=args.clip_ego_anchor,
-                             ego_anchor_every=args.clip_ego_anchor_every,
+                             ego_anchor_every=(args.clip_ego_anchor_every
+                                               or policy.fm_update_every),
                              root_frame_bodies=policy._trk.get_root_frame_bodies())
         if tile_origin is not None:
             clip.set_placement(-tile_origin, np.array([0.0, 0.0, 0.0, 1.0]))
             print("[INFO] Clip placed into the tile scene: subtracting its "
                   f"tile-local origin {tile_origin.tolist()} m from every pose.")
+        policy.assert_clip_reference_compatible(clip)
         if abs(clip.dt - policy.get_dt()) > 1e-6:
             print(f"[WARN] Clip dt {clip.dt} != policy dt {policy.get_dt()}; "
                   "regenerate the clip at the control dt.")
@@ -1594,7 +1681,8 @@ def main() -> None:
               f"{clip.real_length_s:.2f}s @ dt={clip.dt}; "
               f"start={clip.start_step * clip.dt:.2f}s (step {clip.start_step}); "
               f"handoff={'clip-only' if clip_handoff_time < 0 else f'{clip_handoff_time:.2f}s'}; "
-              f"anchor={f'ego/every {args.clip_ego_anchor_every}' if args.clip_ego_anchor else 'world'}; "
+              f"anchor={f'ego/every {clip.ego_anchor_every}' if args.clip_ego_anchor else 'world'}"
+              f" ({policy.window_anchor}); "
               f"total_time={total_time:.2f}s")
 
     # Depth cameras, if the loaded artifacts use them. The contract comes from the ONNX
@@ -1633,15 +1721,42 @@ def main() -> None:
     # rather than hard-coded so a checkpoint trained at a different latency brings its own
     # number, and a pre-latency graph correctly gets none.
     _probs = getattr(policy.ctx, "depth_latency_probs", None)
+    # --fm_lead_ticks and --dump_replay both exist to line this runner up against the C++
+    # runtime, and the C++ applies NO synthetic camera lag. Left alone the two STACK: the
+    # generator would see `fm_lead_ticks + fm_depth_lag_steps` ticks while the C++ sees
+    # `fm_lead_ticks`, so the documented matched comparison (--fm_lead_ticks 1) would silently
+    # become 3 ticks / 60 ms against 1. The lag default is DERIVED and non-zero, so that
+    # happens without anyone asking for it, and every C++-parity conclusion drawn from the run
+    # would be wrong with nothing on screen to say so.
+    #
+    # --dump_replay is worse than a mismatch. `_record_replay_tick` records `depth_raw` from
+    # the tracker's LIVE cast beside the `fm_camera_pose` the lag has already replaced with a
+    # stale one, so the stream is internally inconsistent: the C++ rebuilds the generator's
+    # extero row from live pixels unprojected with an old pose -- exactly the egomotion
+    # displacement the xyz channels exist to remove. compare_replay.py then reports an
+    # `fm_extero` divergence that is the harness's fault, which is the one thing that harness
+    # promises to rule out.
+    _cpp_parity = bool(args.fm_lead_ticks) or bool(args.dump_replay)
     if args.fm_depth_lag_steps is not None:
+        if _cpp_parity and args.fm_depth_lag_steps > 0:
+            sys.exit(
+                f"[FATAL] --fm_depth_lag_steps {args.fm_depth_lag_steps} cannot be combined "
+                "with --fm_lead_ticks / --dump_replay. Those emulate the C++ runtime, which "
+                "applies no synthetic camera lag, so the two delays would stack and the "
+                "comparison would not be the one you asked for. Drop one, or pass "
+                "--fm_depth_lag_steps 0 to state that you want the lag off.")
         fm_lag = FmDepthLag(args.fm_depth_lag_steps, "--fm_depth_lag_steps")
+    elif _cpp_parity:
+        fm_lag = FmDepthLag(0, "forced off: --fm_lead_ticks/--dump_replay emulate the C++ "
+                               "runtime, which applies none. Pass --fm_depth_lag_steps to "
+                               "override, and read the note above first")
     else:
         fm_lag = FmDepthLag(default_depth_lag_steps(_probs),
                             f"derived from fm.onnx depth_latency_probs={_probs}")
     success = run(policy, robot, command_fn, total_time, args.headless, log_path,
-                  args.warmup_time, args.rt_factor, standing_config, args.viz,
-                  args.vel_arrow_scale, args.vel_arrow_height, args.hold_kp_scale,
-                  args.hold_kv_scale, args.spawn_z_offset, args.clip_spawn_z_offset,
+                  args.rt_factor, standing_config, args.viz,
+                  args.vel_arrow_scale, args.vel_arrow_height,
+                  args.spawn_z_offset, args.clip_spawn_z_offset,
                   args.cmd_max_acc, args.fm_traj_points,
                   viz_geomgroup=([int(g) for g in args.viz_geomgroup.split(",") if g.strip() != ""]
                                  if args.viz_geomgroup else None),
@@ -1649,32 +1764,61 @@ def main() -> None:
                   spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride,
-                  fm_depth_cams=fm_depth_cams, fm_lag=fm_lag)
+                  fm_depth_cams=fm_depth_cams, replay=replay, fm_lag=fm_lag)
     # None = interrupted, which is neither survival nor a fall; saying "Survived: None"
     # would put a non-result into the same line every sweep greps for.
     if success is None:
         print("[INFO] Run INTERRUPTED by the user; artifacts below are partial.")
     else:
         print(f"[INFO] Run finished. Survived: {success}")
-    # Record the LOOP's verdict beside the log, because the metrics module cannot recover it
-    # from the CSV. The per-row ``fell`` flag is evaluated before the row is written and the
-    # loop returns on the step after, so the row where the fall happens is never written --
-    # every fall scored as `"survived": true` in the JSON while the console said False, and
-    # the JSON is what a sweep greps.
+    if replay is not None:
+        # Written after the loop, so a run that fell still yields every tick it managed --
+        # those ticks are exactly the interesting ones.
+        manifest = replay.write(extra_attrs={
+            "scene": args.scene, "robot": args.robot_name, "command": args.command,
+            "fm_lead_ticks": int(args.fm_lead_ticks), "survived": success,
+            "dt": float(policy.get_dt()),
+            # The POLICY's joint order. Every consumer that compares joints needs it: the
+            # robot's order differs on 27 of the 29, and subtracting one from the other gives
+            # a large, smooth, fictitious error.
+            "joint_names_isaac": list(policy.get_joint_names()),
+            "window_offsets": [int(o) for o in policy.window_offsets],
+            "reference_blocks": [str(b) for b in policy.reference_blocks],
+            "node_dim": int(policy.ctx.D),
+        })
+        print(f"[INFO] wrote the replay stream to {manifest}")
+
     if log_path:
+        # Stamp the loop's OWN verdict into sim_meta.yaml before the metrics run.
+        #
+        # The `fell` CSV column structurally cannot carry it: the row is written inside
+        # control_step() with robot.failed() evaluated BEFORE that step's physics, and when the
+        # fall is detected the loop returns immediately without writing another row. So the
+        # column stays 0 for a run that fell, and gen_tracker_metrics -- which inferred
+        # survival from that column -- reported `"survived": true, "time_to_fall_s": null`
+        # while the console printed `Survived: False`. A sweep reads the JSON, not the console,
+        # so falls were being counted as successes.
         meta_path = os.path.join(os.path.dirname(log_path), "sim_meta.yaml")
         try:
             with open(meta_path) as mf:
-                _m = yaml.safe_load(mf) or {}
-            _m["survived"] = None if success is None else bool(success)
-            _m["failure_reason"] = ("" if success in (True, None)
-                                    else robot.failure_reason() or "unknown")
+                meta = yaml.safe_load(mf) or {}
+            meta["survived"] = success
+            # Detection time, which is the last simulated instant either way. `None` when the
+            # user interrupted: that is neither survival nor a fall.
+            meta["time_to_fall_s"] = (None if success is not False
+                                      else float(robot.mj_data.time))
+            meta["sim_end_time_s"] = float(robot.mj_data.time)
+            # WHICH trigger fired, which the CSV cannot say either: "it fell" and "it pitched
+            # face-first off a step while its pelvis was still high" are different findings.
+            # "unknown" only if the predicate has gone quiet since the loop returned.
+            meta["failure_reason"] = ("" if success is not False
+                                      else robot.failure_reason() or "unknown")
             with open(meta_path, "w") as mf:
-                yaml.dump(_m, mf, default_flow_style=False, sort_keys=False)
+                yaml.dump(meta, mf, default_flow_style=False, sort_keys=False)
         except FileNotFoundError:
-            pass
+            print(f"[WARN] no sim_meta.yaml at {meta_path}; the metrics will infer survival "
+                  "from the `fell` column, which cannot see a fall on the final step.")
 
-    if log_path:
         import gen_tracker_metrics
         gen_tracker_metrics.create_metrics(os.path.dirname(log_path))
 

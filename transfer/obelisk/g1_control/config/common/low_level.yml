@@ -34,7 +34,13 @@ control:
       # (scripts/rsl_rl/export_to_hardware.py) and prefetch_policy.py both read. A ROS
       # param cannot import it, so this one restatement is by hand -- change both together.
       hf_repo_id: "zolkin/robot_rl"
-      hf_policy_folder: "2026-08-04_21-55-17_yaw_k12_v1"
+      # The PLAN-anchored perceptive pair. It had to move off 2026-08-04_21-55-17_yaw_k12_v1,
+      # which is a pre-mode_11 policy: wrong action scale (hip pitch 0.2738 against this
+      # robot's 0.1753), placeholder camera mounts, no backpack -- and it LOADS CLEAN, because
+      # all 29 joints and their order are unchanged. The C++ runtime additionally refuses that
+      # one outright now, since it is robot_now-anchored and this deploy path has no odometry.
+      # Override per run with `run_sim_low.sh --policy <folder>` rather than editing this.
+      hf_policy_folder: "2026-08-20_16-36-10_mode11_decor_plan_v1"
       use_cuda: true
       # 4, not the onnxruntime default of 0 (auto): auto measured ~3x SLOWER here (the FM at
       # 251 ms vs 87 ms on the 27M). Revisit per machine -- this is a measured local optimum,
@@ -56,12 +62,13 @@ control:
       vel_cmd_timeout: 1.0
 
       # ---- Bring-up ----
-      # There is no PD warm-up. On entering low-level control whatever feeds the tracker --
-      # the generator or a debug clip -- drives it from the first tick, which is what the
-      # MuJoCo sim2sim runner does (`--warmup_time 0`, and it is ignored outright in clip
-      # mode) and what the policy was trained for. A stiffened hold put the robot in a state
-      # no training episode started from, and fed the generator's history rows of zeros
-      # instead of letting the learned null-history embedding cover the first N steps.
+      # There is no PD warm-up, and the runtime no longer has a way to add one. On entering
+      # low-level control whatever feeds the tracker -- the generator or a debug clip --
+      # drives it from the first tick, which is what the MuJoCo sim2sim runner does and what
+      # the policy was trained for. The warm-up paths were deleted outright: every one of
+      # them put the robot in a state no training episode started from, and fed the
+      # generator's history rows of zeros instead of letting the learned null-history
+      # embedding cover the first N steps.
 
       # ---- Logging ----
       # Diagnostic topics: /obelisk/g1/debug/tick every control step and
@@ -111,7 +118,7 @@ control:
     pkg: obelisk_unitree_cpp
     executable: obelisk_unitree_joystick
     params:
-      v_x_scale: 1.0
+      v_x_scale: 0.8
       v_y_scale: 0.5
       w_z_scale: 0.7
       # Yaw on the RIGHT STICK HORIZONTAL (RX = 3 + AXIS_OFFSET). The upstream default is RY
@@ -199,17 +206,52 @@ joystick:
 # --------------------------------- #
 # -------------- Viz -------------- #
 # --------------------------------- #
-# Robot-state visualisation, off by default; an includer flips it on with `viz: {on: True}`.
+# Robot-state visualisation, off by default. `scripts/run_sim_low.sh --rviz` flips it on with
+# a temp overlay that sets ONLY the scalar `viz: {on: True}` -- see obk_viz_config.
+#
+# Turning it on launches THREE processes, all from obelisk's own bringup: the viz node below
+# (est_state -> joint_states + the odom_frame->pelvis transform), a robot_state_publisher fed
+# the URDF at `<robot_pkg>/urdf/<urdf>` (joint_states -> every link's TF), and rviz2 with the
+# config named here. Nothing needs a tmux pane of its own.
+#
+# Everything below `viz_nodes:` must stay HERE rather than in an overlay: the list entries
+# carry no name/id/key/ros_parameter/topic, so obelisk has no merge identity for them and an
+# includer that redeclares one APPENDS a second viz node instead of merging into this one.
+# Mappings (`on:`, `rviz_pkg:`, `rviz_config:`) do deep-merge, which is why the flag can flip
+# `on` and nothing else.
+#
+# The FM plan ribbon that the rviz config subscribes to is a SEPARATE node, not part of this
+# block: `ros2 run g1_control fm_plan_viz`. --rviz starts it too.
 viz:
   on: False
+  rviz_pkg: g1_control
+  rviz_config: g1_deploy.rviz
   viz_nodes:
+    # Upstream's, not the local robot_viz package -- which is an unreferenced fork of this
+    # header, identical except for one string: it parents the base transform to "odom_frame"
+    # where upstream uses "world". Upstream wins, so "world" is what g1_deploy.rviz's fixed
+    # frame and fm_plan_viz's frame_id parameter must both be. Switch the executable and all
+    # three have to move together, or the robot renders at the origin and the plan does not
+    # render at all -- with no error from anything.
     - pkg: obelisk_viz_cpp
       executable: default_robot_viz
       robot_pkg: g1_model
-      urdf: g1_29j.urdf
+      # The TRAINED robot, generated from its URDF by g1_model/urdf/make_ros_urdf.py. It said
+      # g1_29j.urdf until the training refresh landed, which drew a robot with Dex3 hands, no
+      # backpack, no camera mounts and its torso 10 mm high -- and depth_cloud_viz publishes in
+      # the torso_link frame, so its cloud inherited that 10 mm relative to the drawn robot.
+      urdf: g1_perceptive.urdf
       robot_topic: robot_description
+      # The ros_parameter names are NOT free-form: obelisk strips the `_setting` suffix to get
+      # a `key`, and matches it against the keys ObeliskVizRobot registers in its constructor
+      # -- `sub_est`, `pub_viz_joint`, `time_joints`. This block previously said
+      # `sub_viz_est_setting` and `timer_viz_joint_setting` (the pre-rewrite schema's names),
+      # which resolve to keys nothing registers, and the node died on configure with
+      # "Entry is missing required field 'topic'" -- an error about the entry it did NOT find,
+      # naming a field that was present in the one it should have. It went unnoticed because
+      # `on: False` meant this block had never been launched.
       subscribers:
-        - ros_parameter: sub_viz_est_setting
+        - ros_parameter: sub_est_setting
           topic: /obelisk/g1/est_state
           history_depth: 10
           callback_group: None
@@ -219,6 +261,6 @@ viz:
           history_depth: 10
           callback_group: None
       timers:
-        - ros_parameter: timer_viz_joint_setting
+        - ros_parameter: time_joints_setting
           timer_period_sec: 0.01
           callback_group: None

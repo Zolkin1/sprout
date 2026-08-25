@@ -698,6 +698,13 @@ def add_fm_depth_pair(cfg, width: int, height: int) -> str | None:
 
     Raises:
         ValueError: If ``cfg`` carries no policy depth cameras to mirror.
+    
+    TODO(one-sampling): this whole second pair is a DEVELOPMENT feature -- it lets the
+    generator's grid change without retraining the teacher. The long-term intent is that the
+    two match, and then this function, the ``fm_depth`` obs group, MuJoCo's second cast and
+    ``GenTrackerPolicy.depth_sampling_is_split`` all go. Hardware never supported it:
+    ``export_sensor_configs.py`` raises on a split rather than emit configs covering only the
+    tracker, so a split pair cannot reach a robot.
     """
     missing = [name for name, _ in _RL_CAMERAS if getattr(cfg.scene, name, None) is None]
     if missing:

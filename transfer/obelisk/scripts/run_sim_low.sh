@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Copyright 2026 Zachary Olkin. All rights reserved.
 #
-# The BRAIN in simulation: g1.yml (controller + estimator + joystick FSM), and nothing else.
+# The BRAIN in simulation: g1_cpp.yml (controller + estimator + joystick FSM), and nothing
+# else. The C++ controller is the default; --python selects the deprecated one.
 #
 # This is the SAME file, launched the SAME way, that run_hardware_low.sh runs on the robot.
 # The robot half comes from a separately launched config, so what you test in sim is
@@ -17,10 +18,12 @@
 # recovering from a heap, which it was never trained to do.
 #
 #   window "main": controller (AUTO-RUN) | MCAP recorder (AUTO-RUN)
+#   window "viz" (--rviz only): FM plan markers (AUTO-RUN)
 #
 # Usage:
 #   scripts/run_sim_low.sh                       the brain, recorded to MCAP
 #   scripts/run_sim_low.sh --no-bag              ... without recording
+#   scripts/run_sim_low.sh --rviz                ... with RViz + the FM plan ribbon
 #   scripts/run_sim_low.sh --policy <hf_folder>  override the checkpoint for this run
 #   scripts/run_sim_low.sh --build               colcon build first (needed on first run)
 #
@@ -34,10 +37,43 @@ OBK_SESSION=simlow
 
 usage() {
     cat <<'EOF'
-run_sim_low.sh -- the BRAIN alone (g1.yml), in tmux session `simlow`.
+run_sim_low.sh -- the BRAIN alone (g1_cpp.yml), in tmux session `simlow`.
 
 Options:
+  --python         Use the DEPRECATED python controller (g1.yml). The C++ one
+                   (g1_cpp.yml) is the default and the supported path; this is kept only
+                   for bisecting a regression against it, and it will be removed.
+                   On aarch64 it cannot reach the GPU at all: rclpy is a cp310 C
+                   extension and the only onnxruntime GPU build for a Thor is cp312, so
+                   the python node runs the generator on the CPU at ~471 ms per re-plan
+                   against a 20 ms period. The C++ one runs it at ~16 ms, on its own
+                   thread.
+  --cpp            Accepted and ignored: this is now the default.
+  --command NAME   Drive from a scripted velocity profile instead of the joystick sticks
+                   (experiments.velocity_commands -- the same names the sim2sim runner
+                   takes). The joystick still arms the robot; only its velocity command is
+                   relayed away. The profile's clock starts when the controller ARMS.
+  --duration S     Hold zeros after S seconds of profile time (0 = forever).
   --policy FOLDER  Override the controller's hf_policy_folder for this run.
+  --rviz           Turn the viz block on: RViz showing the robot in its estimated pose
+                   (default_robot_viz + robot_state_publisher + the g1_model URDF), plus
+                   the generator's predicted root path and FK'd foot paths as markers.
+                   The first three come from obelisk's own bringup; only the marker node
+                   (g1_control fm_plan_viz) gets a pane, in a second tmux window.
+                   To view from a LAPTOP instead, still pass this -- everything the remote
+                   RViz needs (/robot_description, /joint_states, TF, the markers) goes
+                   out over DDS, and the local rviz2 is simply one more window. Obelisk's
+                   bringup starts rviz2 unconditionally with the viz block, so there is no
+                   way to ask for the publishers without it.
+  --depth-delay S  TEST ONLY. Hold every depth frame S seconds before the controller sees
+                   it, with its header stamp untouched, and point the controller at the
+                   delayed topics. This manufactures the latency MuJoCo does not have (~50 ms
+                   on the real ZED path) so that capture-time pose matching has something to
+                   correct: without it the matching code runs but every lookup resolves to
+                   ~now, and a bug in it is invisible. Pair with depth_pose_match:=false for
+                   the A/B -- with matching off the terrain should visibly swing as the torso
+                   pitches. Run it single-box first, where the world and brain share a clock;
+                   the two-box difference is what the clock skew costs.
   --no-bag         Do NOT record. Recording is ON by default -- a run you cannot
                    explain afterwards is a run you have to repeat. Bags go to
                    $REPO_ROOT/transfer/obelisk/log/bags/<timestamp>_fm/.
@@ -58,11 +94,23 @@ EOF
 }
 
 ORIG_ARGS=("$@")
-POLICY="" ; BUILD="" ; BAG=1
+POLICY="" ; BUILD="" ; BAG=1 ; PYTHON_CTRL="" ; RVIZ="" ; DEPTH_DELAY=""
+VEL_PROFILE="" ; VEL_DURATION=""
 while [ $# -gt 0 ]; do
     case "$1" in
+        --cpp)         shift ;;   # the default now; kept so old commands still run
+        --python)      PYTHON_CTRL=1; shift ;;
+        # A SCRIPTED velocity profile instead of the joystick's sticks, by name from
+        # transfer/sim/experiments/velocity_commands.py -- the same names the MuJoCo sim2sim
+        # runner's --command takes, from the same file. Lives on the BRAIN side because the
+        # joystick does: its velocity publisher has to be relayed away from /vel_cmd or the
+        # two compete and the controller latches whichever arrived last.
+        --command)     VEL_PROFILE="${2:-}"; shift 2 ;;
+        --duration)    VEL_DURATION="${2:-}"; shift 2 ;;
+        --rviz)        RVIZ=1; shift ;;
         --policy)      POLICY="${2:-}"; shift 2 ;;
         --no-bag)      BAG=""; shift ;;
+        --depth-delay) DEPTH_DELAY="${2:-}"; shift 2 ;;
         --build)       BUILD=1; shift ;;
         --build-clean) BUILD=clean; shift ;;
         -h|--help)     usage; exit 0 ;;
@@ -78,8 +126,23 @@ if [ -z "${OBK_IN_CONTAINER:-}" ]; then
 fi
 
 SESSION="$OBK_SESSION"
-CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1.yml"
+# One line apart, deliberately: the two controllers share every other part of the config, so
+# a difference between them cannot be a difference in what else was launched.
+if [ -n "$PYTHON_CTRL" ]; then
+    echo "[run_sim_low] WARNING: the python controller is DEPRECATED and will be removed." >&2
+    echo "[run_sim_low]          Drop --python to run the supported C++ one." >&2
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1.yml"
+else
+    CTRL_CFG="$ROBOT_RL_ROOT/g1_control/config/g1_cpp.yml"
+fi
+# BEFORE --policy and --rviz: each overlay includes the previous by absolute path, so this
+# order is the include chain and all three compose.
+[ -n "$VEL_PROFILE" ] && CTRL_CFG="$(obk_scripted_cmd_config "$CTRL_CFG")"
 [ -n "$POLICY" ] && CTRL_CFG="$(obk_policy_config "$CTRL_CFG" "$POLICY")"
+# After --policy: each overlay includes the previous one by absolute path, so the order here
+# is the include chain and both flags compose.
+[ -n "$RVIZ" ] && CTRL_CFG="$(obk_viz_config "$CTRL_CFG")"
+[ -n "$DEPTH_DELAY" ] && CTRL_CFG="$(obk_depth_delay_config "$CTRL_CFG" "$DEPTH_DELAY")"
 
 if tmux has-session -t "$SESSION" 2>/dev/null && [ -z "${OBK_RESTART:-}" ]; then
     exec tmux attach -t "$SESSION"
@@ -94,6 +157,48 @@ if [ -n "$BAG" ]; then
     tmux split-window -h -t "$SESSION":main.0 "$(obk_pane_run bag "$(obk_bag_cmd fm)")"
 else
     tmux split-window -h -t "$SESSION":main.0 "$(obk_pane dbg "$(obk_bag_cmd fm)")"
+fi
+
+# The scripted command, in its own pane so a run can be read afterwards: the profile it used
+# and when its clock started are printed there.
+if [ -n "$VEL_PROFILE" ]; then
+    VEL_CMD="ros2 run g1_control scripted_vel_cmd --ros-args -p profile:=$VEL_PROFILE"
+    # A float literal: `-p duration:=14` is an INTEGER to rclpy against a double default.
+    if [ -n "$VEL_DURATION" ]; then
+        VEL_CMD="$VEL_CMD -p duration:=$(printf '%.3f' "$VEL_DURATION")"
+    fi
+    tmux split-window -v -t "$SESSION":main.1 "$(obk_pane_run vel "$VEL_CMD")"
+fi
+
+# The delay relay, in the same window as the controller it feeds. Started AFTER the controller
+# pane so the ordering matches everything else here; it is a pure republisher, so a frame that
+# arrives before it is up is simply not relayed and the controller waits, which is the same
+# thing that happens while the world is still coming up.
+if [ -n "$DEPTH_DELAY" ]; then
+    tmux split-window -v -t "$SESSION":main.0 "$(obk_pane_run delay \
+        "ros2 run g1_control depth_delay_relay --ros-args \
+           -p in_topics:='[/depth/near/image_processed,/depth/far/image_processed]' \
+           -p out_topics:='[/depth/near/image_delayed,/depth/far/image_delayed]' \
+           -p delay_sec:=$DEPTH_DELAY")"
+fi
+
+# A SECOND window, so --rviz does not disturb the layout of `main`. Only the two marker /
+# cloud nodes need panes: default_robot_viz, robot_state_publisher and rviz2 are all
+# launched by obelisk's bringup in the controller pane's launch, off the viz block.
+if [ -n "$RVIZ" ]; then
+    # depth_cloud_viz resolves the camera contract from tracker.onnx, so it has to be told
+    # WHICH policy -- and the same one the controller runs, or it would draw a different
+    # camera than the one feeding the network. --policy wins; otherwise read the config's
+    # own default rather than restating it here, so the two cannot drift.
+    VIZ_POLICY="$POLICY"
+    if [ -z "$VIZ_POLICY" ]; then
+        VIZ_POLICY="$(awk '/^[[:space:]]*hf_policy_folder:/ {gsub(/"/, "", $2); print $2; exit}' \
+                      "$ROBOT_RL_ROOT/g1_control/config/common/low_level.yml")"
+    fi
+    tmux new-window   -t "$SESSION" -n viz \
+        "$(obk_pane_run fmviz "ros2 run g1_control fm_plan_viz")"
+    tmux split-window -h -t "$SESSION":viz.0 \
+        "$(obk_pane_run depthviz "ros2 run g1_control depth_cloud_viz --ros-args -p hf_policy_folder:=$VIZ_POLICY")"
 fi
 
 tmux select-window -t "$SESSION":main

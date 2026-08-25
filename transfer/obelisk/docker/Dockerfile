@@ -1,11 +1,83 @@
 # syntax=docker/dockerfile:1
 
+# The prebuilt onnxruntime C++ install tree. An ARG used in a FROM must be declared before
+# the first FROM (global scope). Built separately, once per pin bump per architecture, by
+# docker/Dockerfile.ort -- see that file for why it is not built here. If the tag is missing
+# this fails immediately with a pull error rather than silently starting a ~50 min compile.
+ARG ORT_DIST_IMAGE=g1-ort:1.24.4-cu130
+FROM ${ORT_DIST_IMAGE} AS ortdist
+
+
+# ============================================
+# Stage 0: CUDA runtime
+# ============================================
+# The C++ deploy runtime does its inference on the GPU, so the image needs a CUDA userspace.
+# On JetPack 7 that is not optional and not inherited: the nvidia container runtime mounts
+# only devices.csv and drivers.csv here (checked on the Thor -- there is no cuda.csv or
+# cudnn.csv as there was on JetPack 6), so the HOST supplies libcuda.so.1 and everything
+# above it must be in the image.
+#
+# Its own stage, and the FIRST one, so these heavy rarely-changing layers sit below
+# OBELISK_REF and are not invalidated by an obelisk bump.
+#
+# Measured cost: ~3.5 GB. That is a visible jump for an image that shipped no CUDA at all.
+# The lever if it ever matters is onnxruntime_CUDA_MINIMAL, which drops cuDNN and cuBLAS in
+# favour of ORT's own kernels -- not taken here because the effect on a transformer is
+# unmeasured.
+FROM ubuntu:22.04 AS cuda-base
+SHELL ["/bin/bash", "-c"]
+
+# RUNTIME CUDA only -- no nvcc, no -dev packages; nothing in this image compiles CUDA.
+# NEVER `cuda`, `cuda-drivers` or `nvidia-open`: a driver package would either fail to
+# install or shadow the host's with a mismatched libcuda.
+#
+# aarch64 -> sbsa. JetPack 7 ships the arm64-SBSA CUDA packaging, so Thor is served by the
+# same repo as Grace; there is no ubuntu2204/tegra repo. This `case` is the ONLY place in the
+# whole build that branches on architecture -- the install prefix is identical on both, so no
+# CMakeLists ever has to know. That is the direct lesson of obelisk's hardcoded
+# COMP_ARCH "x86_64" (see the MuJoCo patch below).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates curl gnupg && \
+    case "$(uname -m)" in \
+      aarch64) REPO_ARCH=sbsa ;; \
+      x86_64)  REPO_ARCH=x86_64 ;; \
+      *) echo "unsupported arch $(uname -m)" && false ;; \
+    esac && \
+    curl -fsSLO "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/${REPO_ARCH}/cuda-keyring_1.1-1_all.deb" && \
+    dpkg -i cuda-keyring_1.1-1_all.deb && rm cuda-keyring_1.1-1_all.deb && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        cuda-cudart-13-0 cuda-nvrtc-13-0 \
+        libcublas-13-0 libcufft-13-0 libcurand-13-0 libcusparse-13-0 libcusolver-13-0 \
+        libcudnn9-cuda-13 && \
+    rm -rf /var/lib/apt/lists/* && \
+    echo "/usr/local/cuda-13.0/lib64" > /etc/ld.so.conf.d/000_cuda13.conf && ldconfig && \
+    ldconfig -p | grep -q 'libcudart\.so\.13' && \
+    ldconfig -p | grep -q 'libcudnn\.so\.9'
+# The two ldconfig greps are the assert: the CUDA debs do not reliably drop an ld.so.conf.d
+# entry for every sub-package, and a missing one does not fail here -- it surfaces much later
+# as onnxruntime silently falling back to the CPU, which for this pair is not a degraded mode
+# but an unusable one (~103 ms per generator tick against a 20 ms period).
+
 
 # ============================================
 # Stage 1: Base / Simulation
 # ============================================
-FROM ubuntu:22.04 as sim
+FROM cuda-base AS sim
 SHELL ["/bin/bash", "-c"]
+
+# The onnxruntime C++ runtime, built by Dockerfile.ort. Only the install tree comes across --
+# none of the toolchain, CUDA dev packages or ORT sources that produced it.
+COPY --from=ortdist /opt/onnxruntime /opt/onnxruntime
+RUN echo "/opt/onnxruntime/lib" > /etc/ld.so.conf.d/001_onnxruntime.conf && ldconfig && \
+    ldconfig -p | grep -q 'libonnxruntime\.so' && \
+    ldd /opt/onnxruntime/lib/libonnxruntime_providers_cuda.so > /tmp/ldd.txt && \
+    ! grep -q 'not found' /tmp/ldd.txt && rm /tmp/ldd.txt && \
+    echo "[image] onnxruntime CUDA provider resolves against the runtime-only CUDA set"
+# That ldd is not redundant with the one in Dockerfile.ort. There the provider was checked
+# against the BUILDER's package set, which had every -dev package; here it is checked against
+# the runtime-only set this image actually ships. A library that exists only in the builder is
+# exactly the "libcublasLt.so.13: cannot open shared object file" failure that cost us the
+# ==1.22.0 pin in requirements.txt, and this catches it at build time.
 
 # username, uid, gid
 ARG USER=user
@@ -38,6 +110,11 @@ RUN apt-get update && apt-get install -y \
     iputils-ping \
     evtest \
     net-tools \
+    # `ip`, for scripts/net_check.sh. net-tools' ifconfig can answer the same questions and
+    # the script falls back to it, but the container runs with host networking and every
+    # multi-machine question asked in here ("which interface, does it carry multicast, what
+    # is the route to the other box") is one iproute2 answers directly.
+    iproute2 \
     tmux \
     sudo && \
     rm -rf /var/lib/apt/lists/* && \
@@ -75,14 +152,75 @@ RUN echo "Pulling Obelisk..."
 # Also picks up f97a2c9 (lidar per-direction occlusion mask), the only other change in
 # between; it touches the ObkScan/PointCloud2 path we use for /livox/lidar.
 #
+# Bumped abf37fe -> e8d4b7f for the MuJoCo sim's lock contention, which is why the world ran
+# at 0.066x REAL TIME on the Thor with the controller attached. The sensor timers shared one
+# REENTRANT callback group, so a MultiThreadedExecutor (hardware_concurrency() threads -- 14
+# here) dispatched them onto every free thread, where they all serialized on the one mutex
+# `mj_step` needs 1000 times a second. Sampled stacks caught the sim thread inside mj_step in
+# 1 of 25 samples. Three commits: serialize the group, snapshot `sensordata` so callbacks hold
+# no lock while publishing, and give the ray casters their own mjData so casts leave the sim
+# mutex. Measured 0.066x -> 0.999x, and the depth topics publish at their configured 50 Hz.
+#
+# This one MATTERS beyond speed: the controller ticks on a wall-clock 50 Hz timer and advances
+# the reference one node per tick, so a sim at 0.066x let the reference outrun the robot's
+# physics ~15x. That is indistinguishable from a policy that has stopped tracking, and is the
+# likeliest explanation for the generator "looking worse" since 2026-08-06 -- the date the
+# depth pair was wired into the world and pushed the sim over the edge.
+#
+# Bumped again e8d4b7f -> c6fc6ca, which reverts ONLY the first of those three commits: the
+# callback group goes back to Reentrant, keeping both snapshot commits. Serialising was
+# justified by "every sensor callback takes sensor_data_mut_ for its whole body", which the
+# two commits after it made false -- a callback now holds that mutex for a memcpy or a ~40 us
+# mj_copyData and does its publishing and its 5 ms depth / 15 ms lidar casts outside it. The
+# convoy is gone; the cost of one thread is not. Ray casting is ~650 ms of work per wall
+# second on this scene, and serialised it puts the 1 kHz IMU and 500 Hz encoder timers behind
+# all of it. Measured here (32-core x86, full 29-DoF stack, controller attached):
+#
+#   e8d4b7f  MutuallyExclusive   RTF 1.0000x   IMU  855 Hz   encoders 462 Hz
+#   c6fc6ca  Reentrant           RTF 1.0000x   IMU 1000 Hz   encoders 500 Hz
+#
+# CAVEAT, and it is the reason to re-measure rather than trust this: the convoy CANNOT be
+# reproduced on this x86 box. The pre-fix header also runs at 1.0000x here, even pinned to 6
+# cores, so this pair of numbers shows Reentrant costs nothing HERE -- not that it still
+# holds on a Thor, which is the only machine that ever showed 0.066x. Re-measure there before
+# the hardware campaign, and revert to e8d4b7f if the convoy returns.
+#
+# NOTE: this SHA is on the BRANCH perf/mujoco-sim-lock-contention, not main. `git clone`
+# fetches every ref, so `git checkout <sha>` below still resolves -- but repin to main once
+# the branch merges, so the pin does not depend on a branch that may be deleted.
+#
 # TODO(before hardware testing): replace this with an Obelisk RELEASE tag. Tracking a
 # moving ref is fine while developing against the sim; it is not fine on the robot.
-ARG OBELISK_REF=abf37fe71aa42db15266a12c5a7b9e9729c21d7a
+ARG OBELISK_REF=c6fc6ca56c7171b8495533a0963226b726c4114b
 ARG OBELISK_REFRESH=0
 RUN echo "obelisk refresh token: ${OBELISK_REFRESH}" && \
     git clone https://github.com/Caltech-AMBER/obelisk.git /home/${USER}/obelisk && \
     cd /home/${USER}/obelisk && git checkout ${OBELISK_REF}
 ENV OBELISK_ROOT=/home/${USER}/obelisk
+
+# Point obelisk's MuJoCo fetch at the arch this image is being BUILT for.
+#
+# obelisk_cpp/CMakeLists.txt hardcodes `set(COMP_ARCH "x86_64" ...)` and interpolates it
+# into the MuJoCo release URL, so on aarch64 (a Jetson) FetchContent happily downloads the
+# x86_64 tarball and the failure surfaces ~40 s later, deep in colcon, as
+#
+#   /usr/bin/ld: _deps/mujoco-src/lib/libmujoco.so: error adding symbols: file in wrong format
+#
+# which then aborts obelisk_unitree_cpp and everything else that links ObkCore. MuJoCo does
+# publish mujoco-${VERSION}-linux-aarch64.tar.gz, so the arch is the only thing wrong.
+# COMP_ARCH is a CACHE variable, i.e. overridable with -D, but the obelisk_ws build runs
+# through obelisk's own build script and there is no seam to pass cmake args in -- patching
+# the default is the smaller change.
+#
+# `$(uname -m)` prints exactly MuJoCo's asset spelling on both platforms (x86_64 / aarch64),
+# so this is a no-op on the x86 dev box rather than a Jetson-only branch. Do NOT write it as
+# \$(uname -m): docker leaves that backslash in place and bash then treats it as a literal.
+# The grep first is the assert -- if obelisk ever fixes this upstream the pattern stops
+# matching, and failing here is better than silently building the wrong MuJoCo again.
+RUN grep -q 'set(COMP_ARCH "x86_64"' /home/${USER}/obelisk/obelisk/cpp/obelisk_cpp/CMakeLists.txt && \
+    sed -i "/set(COMP_ARCH/s/x86_64/$(uname -m)/" \
+        /home/${USER}/obelisk/obelisk/cpp/obelisk_cpp/CMakeLists.txt && \
+    grep -n 'set(COMP_ARCH' /home/${USER}/obelisk/obelisk/cpp/obelisk_cpp/CMakeLists.txt
 
 # Install other dependencies here...
 
@@ -108,10 +246,28 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN rm requirements.txt
 
-# Assert the installed wheel is the GPU one. This is the only CUDA question answerable at
-# BUILD time, and it is worth asserting because it is the regression that actually happens:
-# someone edits requirements.txt back to plain `onnxruntime` and the failure then surfaces
-# on the robot as resolve_providers raising during bring-up.
+# The python onnxruntime, installed SEPARATELY from requirements.txt because which wheel is
+# correct depends on the architecture, and on aarch64 on what the python side is even for.
+#
+#   x86_64  -- the GPU wheel, pinned. The dev box runs the python runtime against a GPU.
+#   aarch64 -- the CPU wheel. There is NO aarch64 onnxruntime-gpu wheel on PyPI at any
+#              version, and the only one that works on Thor is cp312 while ROS Humble pins
+#              this image to cp310. That is the whole reason the deploy runtime is being
+#              ported to C++: on this architecture THE GPU BELONGS TO THE C++ PATH
+#              (/opt/onnxruntime, installed above), and python here is the sim2sim driver and
+#              the parity oracle only. A CPU wheel is the right answer, not a fallback.
+#
+# Keep the pin in step with transfer/deploy/docker/Dockerfile.bench and the rationale block
+# in requirements.txt when bumping either.
+RUN case "$(uname -m)" in \
+      x86_64)  pip install --no-cache-dir "onnxruntime-gpu[cuda,cudnn]==1.22.0" ;; \
+      aarch64) pip install --no-cache-dir "onnxruntime==1.22.0" ;; \
+      *) echo "unsupported arch $(uname -m)" && false ;; \
+    esac
+
+# Assert the installed wheel is the one this architecture expects. The regression this
+# catches is real: someone edits the line above and the failure otherwise surfaces on the
+# robot as resolve_providers raising during bring-up.
 #
 # get_available_providers() reports what the wheel was COMPILED with -- a static list. It
 # cannot tell you the provider will LOAD, which is the other half (the "libcublasLt.so.13
@@ -121,13 +277,18 @@ RUN rm requirements.txt
 # libonnxruntime_providers_cuda.so SEGFAULTS (exit 139) without a GPU, and `docker build`
 # has no GPU -- measured both ways on this image. The .so does not LINK libcuda.so.1, but
 # loading it still reaches the driver. The check therefore lives at runtime, where a GPU
-# exists and where it matters: G1Controller._require_cuda compares the requested provider
-# against what each ONNX session actually registered, and refuses to run on a fallback.
+# exists and where it matters, and on aarch64 it lives in the C++ controller rather than
+# here: it compares the requested provider against what each ONNX session actually
+# registered, and refuses to run on a fallback.
 RUN python3 -c "\
-import onnxruntime as ort; \
+import platform, onnxruntime as ort; \
 p = ort.get_available_providers(); \
-assert 'CUDAExecutionProvider' in p, 'CPU-only onnxruntime wheel installed: %s' % p; \
-print('[image] onnxruntime', ort.__version__, 'providers:', p)"
+want_gpu = platform.machine() == 'x86_64'; \
+assert (not want_gpu) or 'CUDAExecutionProvider' in p, \
+    'x86_64 expects the GPU wheel, got: %s' % p; \
+assert want_gpu or 'CUDAExecutionProvider' not in p, \
+    'aarch64 expects the CPU wheel (the GPU belongs to the C++ path), got: %s' % p; \
+print('[image] python onnxruntime', ort.__version__, platform.machine(), 'providers:', p)"
 
 # MCAP bag storage. rosbag2's default plugin is sqlite3, whose .db3 stores only message
 # TYPE NAMES -- reading one back needs obelisk_control_msgs/obelisk_estimator_msgs/g1_msgs
@@ -139,6 +300,28 @@ print('[image] onnxruntime', ort.__version__, 'providers:', p)"
 RUN sudo apt-get update && sudo apt-get install -y \
     ros-humble-rosbag2-storage-mcap && \
     sudo rm -rf /var/lib/apt/lists/*
+
+# Pinocchio: the robot's kinematics, for BOTH languages out of one package.
+#
+#   * C++ -- g1_deploy::CameraPoseFk FKs the depth cameras every control tick. A generator
+#     that reads more than depth per pixel (the shipped one reads five channels: depth plus
+#     the pixel's xyz in the root's yaw-aligned frame, plus validity) cannot build its own
+#     input without knowing where the cameras are, and the runtime deliberately has no
+#     kinematics and no odometry of its own. g1_control_cpp FAILS TO CONFIGURE without this.
+#   * python -- deploy.fk, the RViz plan ribbon. That was MuJoCo; see requirements.txt.
+#
+# From apt rather than pip because only the apt package ships the headers and the CMake
+# config the C++ side needs; the ROS distribution's build is the one that matches this
+# image's Ubuntu and its Eigen. Measured against the model the generator's FK loss is defined
+# against: identical kinematics (4e-13 on the camera chain, 4.6e-7 m at the wrists).
+RUN sudo apt-get update && sudo apt-get install -y \
+    ros-humble-pinocchio && \
+    sudo rm -rf /var/lib/apt/lists/* && \
+    echo "[image] verifying pinocchio is usable from both languages..." && \
+    source /opt/ros/humble/setup.bash && \
+    python3 -c "import pinocchio; print('[image] pinocchio', pinocchio.__version__)" && \
+    test -f /opt/ros/humble/include/pinocchio/algorithm/frames.hpp && \
+    ls /opt/ros/humble/lib/*/cmake/pinocchio/pinocchioConfig.cmake
 
 # ============================================
 # Stage 2: Hardware (adds lidar stack)

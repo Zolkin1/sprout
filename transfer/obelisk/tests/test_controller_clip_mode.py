@@ -99,6 +99,9 @@ class _Fake:
     def __init__(self, ego_anchor: bool = True, depth_stale: bool = False):
         self._clip = _Clip()
         self._clip_step = 0
+        # Last step the clip PLAYS. The real controller derives this in _setup_clip from
+        # debug_clip_duration; the whole-clip default is the last real frame.
+        self._clip_stop_step = self._clip.real_steps - 1
         self._clip_started = False
         self._clip_exhausted = False
         self.clip_ego_anchor = ego_anchor
@@ -123,10 +126,15 @@ class _Fake:
         self.hw_joint_names = [f"j{i}" for i in range(NJ)]
         self.last_reference = None
         self.debug_records: list[tuple] = []
+        #: Every clip_tick the policy was handed. Under window_anchor='plan' the policy
+        #: latches its window anchor on this number and the controller re-places the clip on
+        #: it, so the two cannot fire on different steps -- pinned below.
+        self.clip_ticks: list[int] = []
 
     # --- collaborators the tick calls into ---
-    def _create_obs(self, state, reference):
+    def _create_obs(self, state, reference, clip_tick=None):
         self.last_reference = reference
+        self.clip_ticks.append(clip_tick)
         return np.zeros((1, 4))
 
     def _build_state(self, command=None):
@@ -193,6 +201,47 @@ def test_velocity_command_watchdog_is_not_consulted():
         f._clip_tick()
     assert not f.vel_cmd_asked
     assert f._clip.served == [0, 1, 2]
+
+
+def test_the_anchor_tick_freezes_with_the_clip():
+    """The window-anchor latch is counted on the CLIP's tick, not on control ticks.
+
+    Under ``window_anchor='plan'`` the reference window's ``base_pose`` is measured from the
+    robot as it was at the last latch, and the clip's placement is solved from the robot at
+    the same instant -- which is the only reason the served window is a pure function of the
+    clip and needs no odometry. A depth dropout freezes the clip step but not the control
+    loop, so a latch counted on control ticks would slide by exactly the length of the freeze
+    and quietly put the robot's egomotion back into the observation.
+    """
+    f = _Fake(depth_stale=True)
+    for _ in range(6):
+        G1Controller._clip_tick(f)
+    assert f.clip_ticks == [0, 0, 0, 0, 0, 0], (
+        f"a frozen clip must hand the policy a frozen tick, got {f.clip_ticks}")
+
+    g = _Fake()
+    for _ in range(6):
+        G1Controller._clip_tick(g)
+    assert g.clip_ticks == [0, 1, 2, 3, 4, 5], \
+        f"a running clip must advance it one per tick, got {g.clip_ticks}"
+
+
+def test_the_anchor_tick_is_relative_to_the_start_step():
+    """Starting partway into a clip must not shift the latch phase.
+
+    ``--start_time`` puts ``start_step`` anywhere, and the cadence origin has to move with it:
+    keyed off the raw clip index instead, a start_step that is not a multiple of the cadence
+    would latch on different steps than the clip is re-placed on, for the whole run.
+    """
+    f = _Fake()
+    f._clip.real_steps = 20                 # room to run past the start step
+    f._clip_stop_step = f._clip.real_steps - 1
+    f._clip.start_step = 7
+    f._clip_step = 7
+    for _ in range(4):
+        G1Controller._clip_tick(f)
+    assert f.clip_ticks == [0, 1, 2, 3], \
+        f"the tick must be measured from start_step, got {f.clip_ticks}"
 
 
 def test_depth_dropout_freezes_the_clip():

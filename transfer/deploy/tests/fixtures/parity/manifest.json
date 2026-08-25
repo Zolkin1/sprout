@@ -1,0 +1,1913 @@
+{
+  "format": 1,
+  "generator": "transfer/deploy/tools/dump_parity_fixtures.py",
+  "numpy": "2.4.6",
+  "python": "3.12.13",
+  "platform": "Linux-x86_64",
+  "byteorder": "little",
+  "seed": 0,
+  "cases": [
+    {
+      "case": "quat_conjugate",
+      "fn": "quat_conjugate",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "quat_conjugate.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_conjugate.out.result.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "dfe20ccb72fb1b9bb0de5e3fd460b50005e3b204a09a2185222295d8cf5d4dcb"
+        }
+      ]
+    },
+    {
+      "case": "quat_inv",
+      "fn": "quat_inv",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "quat_inv.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_inv.out.result.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "cf460a008c3679941f155ba7a424750cd41316ed00c330b8c43eb947a3f9ead5"
+        }
+      ]
+    },
+    {
+      "case": "yaw_quat",
+      "fn": "yaw_quat",
+      "atol": 1e-12,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "yaw_quat.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "yaw_quat.out.result.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "23545346f5959ed09e58857d8811c144778d98ef487aaed4ce8f0769f44cca26"
+        }
+      ]
+    },
+    {
+      "case": "quat_unique",
+      "fn": "quat_unique",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "quat_unique.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_unique.out.result.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "c587c2140a74aa7424c98ae27a7bfffe11e7b59c0bedd38c2c2a3aee1e0beb13"
+        }
+      ]
+    },
+    {
+      "case": "matrix_from_quat",
+      "fn": "matrix_from_quat",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "matrix_from_quat.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "matrix_from_quat.out.result.bin",
+          "shape": [
+            522,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "86168a093ee393797ace3436800c2667993f09d965a06860b4c2ef89ced1671d"
+        }
+      ]
+    },
+    {
+      "case": "axis_angle_from_quat",
+      "fn": "axis_angle_from_quat",
+      "atol": 1e-12,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "axis_angle_from_quat.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "axis_angle_from_quat.out.result.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "538d81028f168eef12e6ca3551cb0a506462fa35794af602b1fa5410a3cdd9e9"
+        }
+      ]
+    },
+    {
+      "case": "quat_mul",
+      "fn": "quat_mul",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "a",
+          "file": "quat_mul.in.a.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        },
+        {
+          "name": "b",
+          "file": "quat_mul.in.b.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "8ba0a6754926286d1759b20670d738e8b5bee1c3d9767ec35dcd1759a3318b84"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_mul.out.result.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "c968e60a1e10c751f5e0ecb82dbf001f2caf70db068ea5c824def4052c331694"
+        }
+      ]
+    },
+    {
+      "case": "quat_apply",
+      "fn": "quat_apply",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "quat_apply.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        },
+        {
+          "name": "v",
+          "file": "quat_apply.in.v.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "e9f04189859834a3a3bbc11f0ea4e1984b512806017b770143b5151156bf4d07"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_apply.out.result.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "95aba44065c15b50c7d178269f37b1262e5a3e8cf76a6861714d51a840497d48"
+        }
+      ]
+    },
+    {
+      "case": "quat_apply_inverse",
+      "fn": "quat_apply_inverse",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "quat_apply_inverse.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        },
+        {
+          "name": "v",
+          "file": "quat_apply_inverse.in.v.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "e9f04189859834a3a3bbc11f0ea4e1984b512806017b770143b5151156bf4d07"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_apply_inverse.out.result.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "3ff57e25ab6d9d96475f4039b38702ddcc843ca6e899cd2549a82a58d1953f74"
+        }
+      ]
+    },
+    {
+      "case": "quat_box_minus",
+      "fn": "quat_box_minus",
+      "atol": 1e-12,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "a",
+          "file": "quat_box_minus.in.a.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        },
+        {
+          "name": "b",
+          "file": "quat_box_minus.in.b.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "8ba0a6754926286d1759b20670d738e8b5bee1c3d9767ec35dcd1759a3318b84"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_box_minus.out.result.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "54fbb6e2b06dc5c5ed914e9f0bf62e0ceed0e052047ad3f1b6550172bb6944ac"
+        }
+      ]
+    },
+    {
+      "case": "quat_box_plus",
+      "fn": "quat_box_plus",
+      "atol": 1e-12,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "quat_box_plus.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        },
+        {
+          "name": "delta",
+          "file": "quat_box_plus.in.delta.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "e9f04189859834a3a3bbc11f0ea4e1984b512806017b770143b5151156bf4d07"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_box_plus.out.result.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "bb6d6358cc68ffd3e0711c2c5bf772dbbd39522ee343b2cdb5b719bb11e4c33a"
+        }
+      ]
+    },
+    {
+      "case": "quat_from_axis_angle",
+      "fn": "quat_from_axis_angle",
+      "atol": 1e-12,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "delta",
+          "file": "quat_from_axis_angle.in.delta.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "e9f04189859834a3a3bbc11f0ea4e1984b512806017b770143b5151156bf4d07"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_from_axis_angle.out.result.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "a28dc5a5556a8fe7121a07574442969a885c3a1fc59d910c7420b871809abe2c"
+        }
+      ]
+    },
+    {
+      "case": "quat_from_matrix",
+      "fn": "quat_from_matrix",
+      "atol": 1e-09,
+      "compare": "quat_rotation",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "matrix",
+          "file": "quat_from_matrix.in.matrix.bin",
+          "shape": [
+            522,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "86168a093ee393797ace3436800c2667993f09d965a06860b4c2ef89ced1671d"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_from_matrix.out.result.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "ad44cd564297b093159814bdbaf006ab25ec527ecf75e5f1f6ec07f9a86652a0"
+        }
+      ]
+    },
+    {
+      "case": "combine_frame_transforms",
+      "fn": "combine_frame_transforms",
+      "atol": 1e-13,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "p01",
+          "file": "combine_frame_transforms.in.p01.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "9725a06bdae50155f9cdf0fd35afc7ecc787fb859f9eb8414cec352590018410"
+        },
+        {
+          "name": "q01",
+          "file": "combine_frame_transforms.in.q01.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        },
+        {
+          "name": "p12",
+          "file": "combine_frame_transforms.in.p12.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "e9f04189859834a3a3bbc11f0ea4e1984b512806017b770143b5151156bf4d07"
+        },
+        {
+          "name": "q12",
+          "file": "combine_frame_transforms.in.q12.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "8ba0a6754926286d1759b20670d738e8b5bee1c3d9767ec35dcd1759a3318b84"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "pos",
+          "file": "combine_frame_transforms.out.pos.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "f03d4d050167fe45cb40d650014054e3ba2aa39942386e4f16a7464da17e4fef"
+        },
+        {
+          "name": "quat",
+          "file": "combine_frame_transforms.out.quat.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "c968e60a1e10c751f5e0ecb82dbf001f2caf70db068ea5c824def4052c331694"
+        }
+      ]
+    },
+    {
+      "case": "subtract_frame_transforms",
+      "fn": "subtract_frame_transforms",
+      "atol": 1e-13,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "p01",
+          "file": "subtract_frame_transforms.in.p01.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "9725a06bdae50155f9cdf0fd35afc7ecc787fb859f9eb8414cec352590018410"
+        },
+        {
+          "name": "q01",
+          "file": "subtract_frame_transforms.in.q01.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "9c150dd89a385c2274c3fd7a879f75385f7fd55d12c6f4aed1b78400ff010fa8"
+        },
+        {
+          "name": "p02",
+          "file": "subtract_frame_transforms.in.p02.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "171631bdde86ea141a4658c56d3d88aff0184105ccdd0383567a7a36a0ca4971"
+        },
+        {
+          "name": "q02",
+          "file": "subtract_frame_transforms.in.q02.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "8ba0a6754926286d1759b20670d738e8b5bee1c3d9767ec35dcd1759a3318b84"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "pos",
+          "file": "subtract_frame_transforms.out.pos.bin",
+          "shape": [
+            522,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "5d291a0f5b9080c647a168ecc86025d445cf65c9f47f98e53c39c1bb90ebb650"
+        },
+        {
+          "name": "quat",
+          "file": "subtract_frame_transforms.out.quat.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "fe4aea9a4d79380c7e375f1618babacb9071e560481403653afb189bc92a5ed4"
+        }
+      ]
+    },
+    {
+      "case": "matrix_to_rot6d",
+      "fn": "matrix_to_rot6d",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "matrix",
+          "file": "matrix_to_rot6d.in.matrix.bin",
+          "shape": [
+            522,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "8b05faa50db1013731b760cb70788e00a5804aad4ee655d416c4b51f196ca50e"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "matrix_to_rot6d.out.result.bin",
+          "shape": [
+            522,
+            6
+          ],
+          "dtype": "float64",
+          "sha256": "0a969b6f1ca7a921d01e0d74a9dcfc7a566d215da0387d101bc14a3d341a2633"
+        }
+      ]
+    },
+    {
+      "case": "quat_to_rot6d",
+      "fn": "quat_to_rot6d",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "q",
+          "file": "quat_to_rot6d.in.q.bin",
+          "shape": [
+            522,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "84f3e4e3585fa040b27b8c48cbb091ad0e2ebfe067c7c51008aa20f3f2cf2403"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "quat_to_rot6d.out.result.bin",
+          "shape": [
+            522,
+            6
+          ],
+          "dtype": "float64",
+          "sha256": "0a969b6f1ca7a921d01e0d74a9dcfc7a566d215da0387d101bc14a3d341a2633"
+        }
+      ]
+    },
+    {
+      "case": "rot6d_to_matrix",
+      "fn": "rot6d_to_matrix",
+      "atol": 1e-13,
+      "compare": "elementwise",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "d6",
+          "file": "rot6d_to_matrix.in.d6.bin",
+          "shape": [
+            523,
+            6
+          ],
+          "dtype": "float64",
+          "sha256": "8732ca981062c3ccaf8cd5f78e1fa7c40b4d4b5f604d70a39465eef0fda59b1e"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "rot6d_to_matrix.out.result.bin",
+          "shape": [
+            523,
+            3,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "c3574ffaed0bcb3a50567be19539ab1c7b1218b48bfee524e09d09c9d9288b7c"
+        }
+      ]
+    },
+    {
+      "case": "rot6d_to_quat",
+      "fn": "rot6d_to_quat",
+      "atol": 1e-09,
+      "compare": "quat_rotation",
+      "attrs": {},
+      "inputs": [
+        {
+          "name": "d6",
+          "file": "rot6d_to_quat.in.d6.bin",
+          "shape": [
+            523,
+            6
+          ],
+          "dtype": "float64",
+          "sha256": "8732ca981062c3ccaf8cd5f78e1fa7c40b4d4b5f604d70a39465eef0fda59b1e"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "rot6d_to_quat.out.result.bin",
+          "shape": [
+            523,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "c84194ccc2c943927005794eb8fb5acef3c15f0f16969159432fe8b9607c7d45"
+        }
+      ]
+    },
+    {
+      "case": "world_to_window_slim",
+      "fn": "world_to_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos"
+        ],
+        "num_joints": 29,
+        "num_ee_frames": 0,
+        "num_nodes": 13
+      },
+      "inputs": [
+        {
+          "name": "root_pos_w",
+          "file": "world_to_window_slim.in.root_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "6d6f7052047724535d4e75455794e4c8af8030ce63eafeb72397b838660eddeb"
+        },
+        {
+          "name": "root_quat_w",
+          "file": "world_to_window_slim.in.root_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "5eb3093af883b05cae70557515c5be9fda60c396b2e8ce5b1db225262f4f421c"
+        },
+        {
+          "name": "ref_pos_w",
+          "file": "world_to_window_slim.in.ref_pos_w.bin",
+          "shape": [
+            13,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "32d9d85adab0c1a989f9eebce1eb48fe951ad80d927f2130ed84fc40b9f8123b"
+        },
+        {
+          "name": "ref_quat_w",
+          "file": "world_to_window_slim.in.ref_quat_w.bin",
+          "shape": [
+            13,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "3f55eb6372c820350f99a48385efb7ad40d573f7d94fadb084e5896f6198f5d1"
+        },
+        {
+          "name": "ref_lin_w",
+          "file": "world_to_window_slim.in.ref_lin_w.bin",
+          "shape": [
+            13,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "13fd94d7a0e68db43aef964b373379d8ecf2246bf67cd793fbd26ec4defa22d8"
+        },
+        {
+          "name": "ref_ang_w",
+          "file": "world_to_window_slim.in.ref_ang_w.bin",
+          "shape": [
+            13,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "ab02e1b947d1c3b17a20dd58e473e8d1765821d1866b3bb24dee960b200c2866"
+        },
+        {
+          "name": "joint_pos",
+          "file": "world_to_window_slim.in.joint_pos.bin",
+          "shape": [
+            13,
+            29
+          ],
+          "dtype": "float64",
+          "sha256": "7ade3952a4564bb6aa1cb2f4b2cf2004cbec40722c2c9824c57e115ac37381b6"
+        },
+        {
+          "name": "joint_vel",
+          "file": "world_to_window_slim.in.joint_vel.bin",
+          "shape": [
+            13,
+            29
+          ],
+          "dtype": "float64",
+          "sha256": "69acc5bf7885ba55488e701b7d673d64e831d7dc864677e590fb2e3949c235ea"
+        },
+        {
+          "name": "ee_pos_w",
+          "file": "world_to_window_slim.in.ee_pos_w.bin",
+          "shape": [
+            13,
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "f55e6eefa8c3b54e05ea1c060050a2629271574d32a60cd3ffb08ad4cc229d90"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "world_to_window_slim.out.window.bin",
+          "shape": [
+            13,
+            44
+          ],
+          "dtype": "float64",
+          "sha256": "18042af4c4bb62d996767792c6060bcf19c265acfb6f607f47438509fd0cb5bb"
+        }
+      ]
+    },
+    {
+      "case": "reanchor_window_slim",
+      "fn": "reanchor_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos"
+        ],
+        "num_joints": 29,
+        "num_ee_frames": 0
+      },
+      "inputs": [
+        {
+          "name": "window",
+          "file": "reanchor_window_slim.in.window.bin",
+          "shape": [
+            13,
+            44
+          ],
+          "dtype": "float64",
+          "sha256": "18042af4c4bb62d996767792c6060bcf19c265acfb6f607f47438509fd0cb5bb"
+        },
+        {
+          "name": "old_pos_w",
+          "file": "reanchor_window_slim.in.old_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "6d6f7052047724535d4e75455794e4c8af8030ce63eafeb72397b838660eddeb"
+        },
+        {
+          "name": "old_quat_w",
+          "file": "reanchor_window_slim.in.old_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "5eb3093af883b05cae70557515c5be9fda60c396b2e8ce5b1db225262f4f421c"
+        },
+        {
+          "name": "new_pos_w",
+          "file": "reanchor_window_slim.in.new_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "b734eeb81bcf626b191cc78ce62d51296b51b97a98b9d6e9d6458ac32f76f839"
+        },
+        {
+          "name": "new_quat_w",
+          "file": "reanchor_window_slim.in.new_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "6da7f907d926e8e4d85629ec0836955c8f0256ff1b2c8e6e9ca3dc27acf82e27"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "reanchor_window_slim.out.window.bin",
+          "shape": [
+            13,
+            44
+          ],
+          "dtype": "float64",
+          "sha256": "ee2455ff7ee7ad531f56f6b3f9ef823509d1f8cbb52f318428c6cb17731a46e6"
+        }
+      ]
+    },
+    {
+      "case": "reanchor_window_identity_slim",
+      "fn": "reanchor_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos"
+        ],
+        "num_joints": 29,
+        "num_ee_frames": 0
+      },
+      "inputs": [
+        {
+          "name": "window",
+          "file": "reanchor_window_identity_slim.in.window.bin",
+          "shape": [
+            13,
+            44
+          ],
+          "dtype": "float64",
+          "sha256": "18042af4c4bb62d996767792c6060bcf19c265acfb6f607f47438509fd0cb5bb"
+        },
+        {
+          "name": "old_pos_w",
+          "file": "reanchor_window_identity_slim.in.old_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "6d6f7052047724535d4e75455794e4c8af8030ce63eafeb72397b838660eddeb"
+        },
+        {
+          "name": "old_quat_w",
+          "file": "reanchor_window_identity_slim.in.old_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "5eb3093af883b05cae70557515c5be9fda60c396b2e8ce5b1db225262f4f421c"
+        },
+        {
+          "name": "new_pos_w",
+          "file": "reanchor_window_identity_slim.in.new_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "6d6f7052047724535d4e75455794e4c8af8030ce63eafeb72397b838660eddeb"
+        },
+        {
+          "name": "new_quat_w",
+          "file": "reanchor_window_identity_slim.in.new_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "5eb3093af883b05cae70557515c5be9fda60c396b2e8ce5b1db225262f4f421c"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "reanchor_window_identity_slim.out.window.bin",
+          "shape": [
+            13,
+            44
+          ],
+          "dtype": "float64",
+          "sha256": "29c8e4e4be61e6dd1725a3aaa32d4fa8e79271a5527507483c4451b48488747a"
+        }
+      ]
+    },
+    {
+      "case": "world_to_window_full",
+      "fn": "world_to_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos",
+          "joint_vel",
+          "ee_pos"
+        ],
+        "num_joints": 21,
+        "num_ee_frames": 4,
+        "num_nodes": 13
+      },
+      "inputs": [
+        {
+          "name": "root_pos_w",
+          "file": "world_to_window_full.in.root_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "5740c9259473e92e0ef1c2cde22470832917afd97d89b8c116c9642c70c7896a"
+        },
+        {
+          "name": "root_quat_w",
+          "file": "world_to_window_full.in.root_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "ce1a68c0e14bc68bc7cc7e3e43a6641aa9184e6748ab578c9edb0d11006312a5"
+        },
+        {
+          "name": "ref_pos_w",
+          "file": "world_to_window_full.in.ref_pos_w.bin",
+          "shape": [
+            13,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "8fc7bbbd7ca096902337d36353faa6cf44854a790a1041c08f9ac07fc293485d"
+        },
+        {
+          "name": "ref_quat_w",
+          "file": "world_to_window_full.in.ref_quat_w.bin",
+          "shape": [
+            13,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "252d1ee0df2fd17c775cfbb3c594ca25b460f8a9337416e292dd6bde2823aa9e"
+        },
+        {
+          "name": "ref_lin_w",
+          "file": "world_to_window_full.in.ref_lin_w.bin",
+          "shape": [
+            13,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "d66106c9a3ac58bf43ccfbd570bf1e77e01e9c4735086a7c18191b7caf32ef5b"
+        },
+        {
+          "name": "ref_ang_w",
+          "file": "world_to_window_full.in.ref_ang_w.bin",
+          "shape": [
+            13,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "96abf874b817e84a8a655ed1905a724d76df9b8947d02654d45a6076ac87e694"
+        },
+        {
+          "name": "joint_pos",
+          "file": "world_to_window_full.in.joint_pos.bin",
+          "shape": [
+            13,
+            21
+          ],
+          "dtype": "float64",
+          "sha256": "e4b8a6f6c60275a8e61e8fa664cb01d529b90da74dc8cd8317b95a2b829df09f"
+        },
+        {
+          "name": "joint_vel",
+          "file": "world_to_window_full.in.joint_vel.bin",
+          "shape": [
+            13,
+            21
+          ],
+          "dtype": "float64",
+          "sha256": "59134cd819a04490eb2952c877d0e02a2b3ac6f059ae021177fb9059415634fc"
+        },
+        {
+          "name": "ee_pos_w",
+          "file": "world_to_window_full.in.ee_pos_w.bin",
+          "shape": [
+            13,
+            4,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "56a9699dd3f3636ad407225c53fa9f990001e6cdccdf7c216f654296f1b23284"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "world_to_window_full.out.window.bin",
+          "shape": [
+            13,
+            69
+          ],
+          "dtype": "float64",
+          "sha256": "6d7d386d2f1d4de3725320bca636b031e5302fb95381ce34d9441e849d7b78a2"
+        }
+      ]
+    },
+    {
+      "case": "reanchor_window_full",
+      "fn": "reanchor_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos",
+          "joint_vel",
+          "ee_pos"
+        ],
+        "num_joints": 21,
+        "num_ee_frames": 4
+      },
+      "inputs": [
+        {
+          "name": "window",
+          "file": "reanchor_window_full.in.window.bin",
+          "shape": [
+            13,
+            69
+          ],
+          "dtype": "float64",
+          "sha256": "6d7d386d2f1d4de3725320bca636b031e5302fb95381ce34d9441e849d7b78a2"
+        },
+        {
+          "name": "old_pos_w",
+          "file": "reanchor_window_full.in.old_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "5740c9259473e92e0ef1c2cde22470832917afd97d89b8c116c9642c70c7896a"
+        },
+        {
+          "name": "old_quat_w",
+          "file": "reanchor_window_full.in.old_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "ce1a68c0e14bc68bc7cc7e3e43a6641aa9184e6748ab578c9edb0d11006312a5"
+        },
+        {
+          "name": "new_pos_w",
+          "file": "reanchor_window_full.in.new_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "a83f22f8bc888a40677a4a91c70b38e8d243f73aa370ee5fcbfd85b513efcf28"
+        },
+        {
+          "name": "new_quat_w",
+          "file": "reanchor_window_full.in.new_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "cd0c9531e5323ce8f05e386a4ec29c71893193a8bbb8481c7727e2017361a338"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "reanchor_window_full.out.window.bin",
+          "shape": [
+            13,
+            69
+          ],
+          "dtype": "float64",
+          "sha256": "bf1ca417cce0071a418063ea09818374180a35238de2b36710557d42d7066e0a"
+        }
+      ]
+    },
+    {
+      "case": "reanchor_window_identity_full",
+      "fn": "reanchor_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos",
+          "joint_vel",
+          "ee_pos"
+        ],
+        "num_joints": 21,
+        "num_ee_frames": 4
+      },
+      "inputs": [
+        {
+          "name": "window",
+          "file": "reanchor_window_identity_full.in.window.bin",
+          "shape": [
+            13,
+            69
+          ],
+          "dtype": "float64",
+          "sha256": "6d7d386d2f1d4de3725320bca636b031e5302fb95381ce34d9441e849d7b78a2"
+        },
+        {
+          "name": "old_pos_w",
+          "file": "reanchor_window_identity_full.in.old_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "5740c9259473e92e0ef1c2cde22470832917afd97d89b8c116c9642c70c7896a"
+        },
+        {
+          "name": "old_quat_w",
+          "file": "reanchor_window_identity_full.in.old_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "ce1a68c0e14bc68bc7cc7e3e43a6641aa9184e6748ab578c9edb0d11006312a5"
+        },
+        {
+          "name": "new_pos_w",
+          "file": "reanchor_window_identity_full.in.new_pos_w.bin",
+          "shape": [
+            1,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "5740c9259473e92e0ef1c2cde22470832917afd97d89b8c116c9642c70c7896a"
+        },
+        {
+          "name": "new_quat_w",
+          "file": "reanchor_window_identity_full.in.new_quat_w.bin",
+          "shape": [
+            1,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "ce1a68c0e14bc68bc7cc7e3e43a6641aa9184e6748ab578c9edb0d11006312a5"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "reanchor_window_identity_full.out.window.bin",
+          "shape": [
+            13,
+            69
+          ],
+          "dtype": "float64",
+          "sha256": "9f94c951ded4cf4fed3027a0e33af4513f320254da4a0fc28ade823429019fa3"
+        }
+      ]
+    },
+    {
+      "case": "normalize_depth",
+      "fn": "normalize_depth",
+      "atol": 0.0,
+      "compare": "elementwise",
+      "attrs": {
+        "offset": 0.75,
+        "scale": 0.5,
+        "min_dist": 0.2,
+        "max_dist": 9.0,
+        "min_clip_val": 0.0,
+        "max_clip_val": 0.0
+      },
+      "inputs": [
+        {
+          "name": "d",
+          "file": "normalize_depth.in.d.bin",
+          "shape": [
+            524,
+            1
+          ],
+          "dtype": "float64",
+          "sha256": "bd0017e545a9026afbe3c3782d89e4f5d7dc7348969bb1933c189b306f221500"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "normalize_depth.out.result.bin",
+          "shape": [
+            524,
+            1
+          ],
+          "dtype": "float64",
+          "sha256": "1a84b75f424a993bef98b2513aeb57ca01c48cd672d4d888d551c07550f59438"
+        }
+      ]
+    },
+    {
+      "case": "normalize_depth_nonzero_clips",
+      "fn": "normalize_depth",
+      "atol": 0.0,
+      "compare": "elementwise",
+      "attrs": {
+        "offset": 1.0,
+        "scale": 0.4,
+        "min_dist": 0.3,
+        "max_dist": 6.0,
+        "min_clip_val": 0.25,
+        "max_clip_val": 7.5
+      },
+      "inputs": [
+        {
+          "name": "d",
+          "file": "normalize_depth_nonzero_clips.in.d.bin",
+          "shape": [
+            524,
+            1
+          ],
+          "dtype": "float64",
+          "sha256": "bd0017e545a9026afbe3c3782d89e4f5d7dc7348969bb1933c189b306f221500"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "normalize_depth_nonzero_clips.out.result.bin",
+          "shape": [
+            524,
+            1
+          ],
+          "dtype": "float64",
+          "sha256": "dc879e61c517335656f37cd9a719127bad9ae6cc188d18f1b25f32a192b06032"
+        }
+      ]
+    },
+    {
+      "case": "sanitize_extero_height_scan",
+      "fn": "sanitize_extero",
+      "atol": 0.0,
+      "compare": "elementwise",
+      "attrs": {
+        "source": "height_scan",
+        "clip": 1.0
+      },
+      "inputs": [
+        {
+          "name": "values",
+          "file": "sanitize_extero_height_scan.in.values.bin",
+          "shape": [
+            518,
+            1
+          ],
+          "dtype": "float64",
+          "sha256": "ad2ec5086bfe65008429feb1857d8d2684e53560e1da38e14860e365991d35ec"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "sanitize_extero_height_scan.out.result.bin",
+          "shape": [
+            518,
+            1
+          ],
+          "dtype": "float64",
+          "sha256": "1696cc8af80b3f1e0f93a58aa8fbe408da3d577920657807d3724f15a71d9c42"
+        }
+      ]
+    },
+    {
+      "case": "sanitize_extero_depth",
+      "fn": "sanitize_extero",
+      "atol": 0.0,
+      "compare": "elementwise",
+      "attrs": {
+        "source": "depth",
+        "clip": 2.0
+      },
+      "inputs": [
+        {
+          "name": "values",
+          "file": "sanitize_extero_depth.in.values.bin",
+          "shape": [
+            518,
+            1
+          ],
+          "dtype": "float64",
+          "sha256": "9029cc5534439055b0106aed99378643d32c917aa443c0076058e4ef14f677c2"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "result",
+          "file": "sanitize_extero_depth.out.result.bin",
+          "shape": [
+            518,
+            1
+          ],
+          "dtype": "float64",
+          "sha256": "5c023b295f5fe3dac31c13b0044f1714496b919c934352ddbf91878d2a8cc151"
+        }
+      ]
+    },
+    {
+      "case": "pinhole_ray_directions",
+      "fn": "pinhole_ray_directions",
+      "atol": 1e-14,
+      "compare": "elementwise",
+      "attrs": {
+        "width": 5,
+        "height": 4,
+        "fx": 2.5,
+        "fy": 2.2,
+        "cx": 2.5,
+        "cy": 2.0,
+        "offset": 0.75,
+        "scale": 0.5,
+        "min_dist": 0.1,
+        "max_dist": 7.9,
+        "min_clip_val": 0.0,
+        "max_clip_val": 0.0
+      },
+      "inputs": [],
+      "outputs": [
+        {
+          "name": "dirs",
+          "file": "pinhole_ray_directions.out.dirs.bin",
+          "shape": [
+            1,
+            60
+          ],
+          "dtype": "float64",
+          "sha256": "01b002c0dd924700ba1691edd5b2d1d13f072467cd29a8eed955410c0278bdbc"
+        }
+      ]
+    },
+    {
+      "case": "invalid_depth_mask",
+      "fn": "invalid_depth_mask",
+      "atol": 0.0,
+      "compare": "elementwise",
+      "attrs": {
+        "width": 5,
+        "height": 4,
+        "fx": 2.5,
+        "fy": 2.2,
+        "cx": 2.5,
+        "cy": 2.0,
+        "offset": 0.75,
+        "scale": 0.5,
+        "min_dist": 0.1,
+        "max_dist": 7.9,
+        "min_clip_val": 0.0,
+        "max_clip_val": 0.0
+      },
+      "inputs": [
+        {
+          "name": "image",
+          "file": "invalid_depth_mask.in.image.bin",
+          "shape": [
+            64,
+            20
+          ],
+          "dtype": "float64",
+          "sha256": "a6176e0faee380da3037f9e2d66c80b352ec9121380eb0b45a2506696debcd0c"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "mask",
+          "file": "invalid_depth_mask.out.mask.bin",
+          "shape": [
+            64,
+            20
+          ],
+          "dtype": "float64",
+          "sha256": "34e6e9a04a709bd6b71a6b0cfbff54efd44bff48c32068c813dd8477c910a76c"
+        }
+      ]
+    },
+    {
+      "case": "unproject_to_yaw_frame",
+      "fn": "unproject_to_yaw_frame",
+      "atol": 1e-12,
+      "compare": "elementwise",
+      "attrs": {
+        "width": 5,
+        "height": 4,
+        "fx": 2.5,
+        "fy": 2.2,
+        "cx": 2.5,
+        "cy": 2.0,
+        "offset": 0.75,
+        "scale": 0.5,
+        "min_dist": 0.1,
+        "max_dist": 7.9,
+        "min_clip_val": 0.0,
+        "max_clip_val": 0.0
+      },
+      "inputs": [
+        {
+          "name": "image",
+          "file": "unproject_to_yaw_frame.in.image.bin",
+          "shape": [
+            64,
+            20
+          ],
+          "dtype": "float64",
+          "sha256": "a6176e0faee380da3037f9e2d66c80b352ec9121380eb0b45a2506696debcd0c"
+        },
+        {
+          "name": "cam_pos",
+          "file": "unproject_to_yaw_frame.in.cam_pos.bin",
+          "shape": [
+            64,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "51bb0c7171de7586267e534fbcccc672e8c08883a03493e829620a7e7739ea20"
+        },
+        {
+          "name": "cam_rot",
+          "file": "unproject_to_yaw_frame.in.cam_rot.bin",
+          "shape": [
+            64,
+            9
+          ],
+          "dtype": "float64",
+          "sha256": "6739cd714c537a089ef3b47e126098cb5e804e665ab2baf02ed7b92a78760142"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "points",
+          "file": "unproject_to_yaw_frame.out.points.bin",
+          "shape": [
+            64,
+            60
+          ],
+          "dtype": "float64",
+          "sha256": "3c2e6f7c6c3c15b00e2d1e504437b0dd18147bd526bb6368a7b64ac87896c5bf"
+        }
+      ]
+    },
+    {
+      "case": "camera_pose_yaw_frame",
+      "fn": "camera_pose_yaw_frame",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "urdf": "transfer/obelisk/g1_model/urdf/g1_perceptive.urdf",
+        "joint_names": [
+          "left_hip_pitch_joint",
+          "right_hip_pitch_joint",
+          "waist_yaw_joint",
+          "left_hip_roll_joint",
+          "right_hip_roll_joint",
+          "waist_roll_joint",
+          "left_hip_yaw_joint",
+          "right_hip_yaw_joint",
+          "waist_pitch_joint",
+          "left_knee_joint",
+          "right_knee_joint",
+          "left_shoulder_pitch_joint",
+          "right_shoulder_pitch_joint",
+          "left_ankle_pitch_joint",
+          "right_ankle_pitch_joint",
+          "left_shoulder_roll_joint",
+          "right_shoulder_roll_joint",
+          "left_ankle_roll_joint",
+          "right_ankle_roll_joint",
+          "left_shoulder_yaw_joint",
+          "right_shoulder_yaw_joint",
+          "left_elbow_joint",
+          "right_elbow_joint",
+          "left_wrist_roll_joint",
+          "right_wrist_roll_joint",
+          "left_wrist_pitch_joint",
+          "right_wrist_pitch_joint",
+          "left_wrist_yaw_joint",
+          "right_wrist_yaw_joint"
+        ],
+        "mount_bodies": [
+          "torso_link",
+          "torso_link"
+        ],
+        "offset_pos": [
+          0.107,
+          0.025,
+          0.045,
+          0.085,
+          0.06,
+          0.285
+        ],
+        "offset_quat_xyzw": [
+          0.0,
+          0.5372996083468239,
+          0.0,
+          0.8433914458128857,
+          0.0,
+          0.13052619222005157,
+          0.0,
+          0.9914448613738104
+        ]
+      },
+      "inputs": [
+        {
+          "name": "joint_pos",
+          "file": "camera_pose_yaw_frame.in.joint_pos.bin",
+          "shape": [
+            32,
+            29
+          ],
+          "dtype": "float64",
+          "sha256": "de73aeb7e6f48382dbb5847acfb7af300ce71c91255784a200d00709a1d13b56"
+        },
+        {
+          "name": "base_quat_xyzw",
+          "file": "camera_pose_yaw_frame.in.base_quat_xyzw.bin",
+          "shape": [
+            32,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "5aa2a2060166b33d20435c972cb00a80d9db775edd803dfd1d5b9102e7e10930"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "cam_pos",
+          "file": "camera_pose_yaw_frame.out.cam_pos.bin",
+          "shape": [
+            32,
+            6
+          ],
+          "dtype": "float64",
+          "sha256": "326add58397e7bb346f433d1ef41a7a2d2fad88881478e4bd292d06618d94768"
+        },
+        {
+          "name": "cam_rot",
+          "file": "camera_pose_yaw_frame.out.cam_rot.bin",
+          "shape": [
+            32,
+            18
+          ],
+          "dtype": "float64",
+          "sha256": "fe201552ba4555c549ca8b7a9024c8c2a87ce09c833bab68106c148335b23f0b"
+        }
+      ]
+    },
+    {
+      "case": "clip_reference_window_stand_walk_stand",
+      "fn": "clip_reference_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "pack_dir": "obelisk/g1_control/resource/debug_clips/g1_debug_v1_pack",
+        "case": "stand_walk_stand",
+        "base_frame_name": "pelvis_link",
+        "dt": 0.02,
+        "joint_names": [
+          "left_hip_pitch_joint",
+          "left_hip_roll_joint",
+          "left_hip_yaw_joint",
+          "left_knee_joint",
+          "left_ankle_pitch_joint",
+          "left_ankle_roll_joint",
+          "right_hip_pitch_joint",
+          "right_hip_roll_joint",
+          "right_hip_yaw_joint",
+          "right_knee_joint",
+          "right_ankle_pitch_joint",
+          "right_ankle_roll_joint",
+          "waist_yaw_joint",
+          "waist_roll_joint",
+          "waist_pitch_joint",
+          "left_shoulder_pitch_joint",
+          "left_shoulder_roll_joint",
+          "left_shoulder_yaw_joint",
+          "left_elbow_joint",
+          "left_wrist_roll_joint",
+          "left_wrist_pitch_joint",
+          "left_wrist_yaw_joint",
+          "right_shoulder_pitch_joint",
+          "right_shoulder_roll_joint",
+          "right_shoulder_yaw_joint",
+          "right_elbow_joint",
+          "right_wrist_roll_joint",
+          "right_wrist_pitch_joint",
+          "right_wrist_yaw_joint"
+        ],
+        "offsets": [
+          0,
+          1,
+          2,
+          5,
+          10,
+          15,
+          20,
+          25,
+          30,
+          35,
+          40,
+          45,
+          50
+        ],
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos"
+        ],
+        "num_joints": 29,
+        "num_ee_frames": 0,
+        "ego_anchor_every": 12,
+        "start_step": 767,
+        "num_ticks": 36
+      },
+      "inputs": [
+        {
+          "name": "robot_pos",
+          "file": "clip_reference_window_stand_walk_stand.in.robot_pos.bin",
+          "shape": [
+            36,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "35af3fdd00d28a20ad624e77cf077acb726ee637096a0318c2d51cc4c4a4d35c"
+        },
+        {
+          "name": "robot_quat",
+          "file": "clip_reference_window_stand_walk_stand.in.robot_quat.bin",
+          "shape": [
+            36,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "80b4c25e1af96a132d71ad67ca9a0c7d8a63e9e7af9e08528f3b68552a3c1389"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "clip_reference_window_stand_walk_stand.out.window.bin",
+          "shape": [
+            36,
+            572
+          ],
+          "dtype": "float64",
+          "sha256": "ed260e9a7e26955d406f996c020422649f7b26ea5056807b855077c0e68d652a"
+        },
+        {
+          "name": "command_window",
+          "file": "clip_reference_window_stand_walk_stand.out.command_window.bin",
+          "shape": [
+            36,
+            39
+          ],
+          "dtype": "float64",
+          "sha256": "b86098b213097b29a052c7f43b9d0269a7381727fa142b0a1c4aeddcda336015"
+        }
+      ]
+    },
+    {
+      "case": "clip_reference_window_walk_backward",
+      "fn": "clip_reference_window",
+      "atol": 1e-11,
+      "compare": "elementwise",
+      "attrs": {
+        "pack_dir": "obelisk/g1_control/resource/debug_clips/g1_debug_v1_pack",
+        "case": "walk_backward",
+        "base_frame_name": "pelvis_link",
+        "dt": 0.02,
+        "joint_names": [
+          "left_hip_pitch_joint",
+          "left_hip_roll_joint",
+          "left_hip_yaw_joint",
+          "left_knee_joint",
+          "left_ankle_pitch_joint",
+          "left_ankle_roll_joint",
+          "right_hip_pitch_joint",
+          "right_hip_roll_joint",
+          "right_hip_yaw_joint",
+          "right_knee_joint",
+          "right_ankle_pitch_joint",
+          "right_ankle_roll_joint",
+          "waist_yaw_joint",
+          "waist_roll_joint",
+          "waist_pitch_joint",
+          "left_shoulder_pitch_joint",
+          "left_shoulder_roll_joint",
+          "left_shoulder_yaw_joint",
+          "left_elbow_joint",
+          "left_wrist_roll_joint",
+          "left_wrist_pitch_joint",
+          "left_wrist_yaw_joint",
+          "right_shoulder_pitch_joint",
+          "right_shoulder_roll_joint",
+          "right_shoulder_yaw_joint",
+          "right_elbow_joint",
+          "right_wrist_roll_joint",
+          "right_wrist_pitch_joint",
+          "right_wrist_yaw_joint"
+        ],
+        "offsets": [
+          0,
+          1,
+          2,
+          5,
+          10,
+          15,
+          20,
+          25,
+          30,
+          35,
+          40,
+          45,
+          50
+        ],
+        "blocks": [
+          "base_pose",
+          "base_vel",
+          "joint_pos"
+        ],
+        "num_joints": 29,
+        "num_ee_frames": 0,
+        "ego_anchor_every": 12,
+        "start_step": 355,
+        "num_ticks": 36
+      },
+      "inputs": [
+        {
+          "name": "robot_pos",
+          "file": "clip_reference_window_walk_backward.in.robot_pos.bin",
+          "shape": [
+            36,
+            3
+          ],
+          "dtype": "float64",
+          "sha256": "35af3fdd00d28a20ad624e77cf077acb726ee637096a0318c2d51cc4c4a4d35c"
+        },
+        {
+          "name": "robot_quat",
+          "file": "clip_reference_window_walk_backward.in.robot_quat.bin",
+          "shape": [
+            36,
+            4
+          ],
+          "dtype": "float64",
+          "sha256": "80b4c25e1af96a132d71ad67ca9a0c7d8a63e9e7af9e08528f3b68552a3c1389"
+        }
+      ],
+      "outputs": [
+        {
+          "name": "window",
+          "file": "clip_reference_window_walk_backward.out.window.bin",
+          "shape": [
+            36,
+            572
+          ],
+          "dtype": "float64",
+          "sha256": "1aa9a7985f630d821dcad2d3c4eedbcdb20abd08a5c5aac342330491686fa866"
+        },
+        {
+          "name": "command_window",
+          "file": "clip_reference_window_walk_backward.out.command_window.bin",
+          "shape": [
+            36,
+            39
+          ],
+          "dtype": "float64",
+          "sha256": "b5d85d1463aa04367fa1623e8080ed23717c2b22b39f87247fcd2d4a0d3dc16d"
+        }
+      ]
+    }
+  ]
+}

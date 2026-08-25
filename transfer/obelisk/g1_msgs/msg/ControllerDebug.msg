@@ -20,6 +20,33 @@ std_msgs/Header header
 uint64 ctrl_step             # absolute tick counter since arming; the FM cadence is % K of it
 float64 latency_ms           # create_obs + get_action for this tick, against a 20 ms budget
 
+# The two networks separately, because they are judged against DIFFERENT budgets and a single
+# total cannot say which one moved. The tracker runs on the control thread inside the tick, so
+# its budget is the control period. The generator runs on its own thread and is asked for a
+# plan `lead_ticks` before the boundary it is for, so its budget is lead_ticks * dt -- several
+# times larger. `fm_infer_ms` holds the SAME value on the K-1 ticks between inferences; a
+# reader wanting per-plan statistics must deduplicate on `fm_plan_id`.
+float64 fm_infer_ms
+float64 trk_infer_ms
+# Wall time since the previous tick. The ROS timer's own jitter, which nothing else records:
+# a loop not actually running at 50 Hz rescales the FM cadence (counted in TICKS) and every
+# reference offset with it, and would otherwise be invisible in a bag.
+float64 tick_period_ms
+
+# ---- Generator schedule health --------------------------------------------------------
+# Whether the receding-horizon schedule is being met. `fm_late` is the instantaneous state --
+# no plan arrived for this boundary, so the cursor advanced anyway and the far end of the
+# window began repeating its last node. The rest are CUMULATIVE counters since arming; take
+# differences to see a rate. `plans_dropped` counts plans the generator finished but that were
+# superseded in the mailbox before a tick read them, and `requests_skipped` counts re-plan
+# requests refused because the worker was still busy -- both mean the generator is running
+# slower than its cadence, and both appear before lateness does.
+bool fm_late
+uint32 fm_late_events
+uint32 fm_plans_dropped
+uint32 fm_requests_skipped
+uint32 fm_offsets_clamped
+
 # ---- Input provenance ---------------------------------------------------------------
 # WHICH sample each input was, not its value. The estimator publishes at 1 kHz against a
 # 50 Hz tick, so without the consumed stamp there is no way to tell offline which of twenty
@@ -29,6 +56,31 @@ float64 latency_ms           # create_obs + get_action for this tick, against a 
 builtin_interfaces/Time est_state_stamp
 float64 est_state_age        # seconds between the estimate's receipt and this tick
 float64[] depth_age          # per camera, in the artifact's contract order
+# The same frames' age measured from CAPTURE -- the publisher's header stamp -- rather than
+# from local receipt, so it includes exposure, render and transport as well as the wait for a
+# tick. depth_age is the controller's own contribution; this is the whole pipeline.
+#
+# Only comparable when the two clocks are: in sim the world node stamps with the same ROS
+# clock the controller reads, so this is exact. On hardware the cameras run through a Jetson
+# whose clock is NOT synchronised, and this then carries the offset too -- which is why the
+# watchdog still uses receipt time and this field is diagnostic only. <0 if a camera has never
+# published, or published with an empty stamp.
+float64[] depth_capture_age
+builtin_interfaces/Time[] depth_stamp   # the consumed frame's own stamp, per camera
+
+# ---- camera-pose / image time matching ----------------------------------------------
+# The generator's xyz channels unproject each depth image with the camera's pose, and that
+# is only correct when the two describe the same instant. The image is tens of ms old, so
+# the pose is looked up from a history of estimator samples at the frame's capture stamp
+# rather than taken from the current tick. These say whether that actually happened.
+#
+# `depth_pose_age` is how far back the pose used for each camera was measured; it should
+# track depth_capture_age closely. -1 means the live pose was used instead, which is the
+# pre-matching behaviour and means the stamp was unusable -- absent, in the future, or
+# older than the history, all of which say the camera box's clock is not this one's.
+float64[] depth_pose_age
+uint64 depth_pose_fallbacks   # cumulative frames that fell back to the live pose
+uint64 depth_pose_clamped     # cumulative lookups that ran off the end of the history
 float64 vel_cmd_age          # <0 if no velocity command has ever arrived
 
 # ---- Command ------------------------------------------------------------------------
@@ -88,6 +140,17 @@ bool armed
 bool depth_stale
 bool vel_cmd_stale
 uint32 nonfinite_streak
+
+# ---- IMU health ---------------------------------------------------------------------
+# A flaky IMU on one robot returns an ALL-ZERO estimator message perhaps 1 in 10 samples.
+# The controller detects it by the base quaternion's norm and reuses the last good
+# orientation AND angular velocity, which at 1 kHz against a 50 Hz tick is invisible to the
+# policy -- so without these counters a run on a failing IMU is indistinguishable from a
+# healthy one after the fact, which is the whole reason the patch is easy to forget about.
+# Cumulative since the last arm, so a rate is bad_quat_samples / quat_samples.
+uint64 quat_samples          # base quaternions examined
+uint64 bad_quat_samples      # of those, degenerate (norm below the threshold) and held
+bool quat_held               # true if THIS tick ran on a held orientation/gyro
 
 # ---- Depth health -------------------------------------------------------------------
 # Per camera, contract order. A silently degraded camera -- all-invalid frame, wrong

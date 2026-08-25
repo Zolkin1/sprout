@@ -29,6 +29,7 @@ sys.path.insert(0, os.path.join(ROOT, "transfer"))
 
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 from deploy.hardware import build_hardware_state  # noqa: E402
+from deploy.quat_math_np import matrix_from_quat  # noqa: E402
 
 #: True only when this file is executed directly, which is the one context where
 #: ``"torch" not in sys.modules`` says anything about the DEPLOY path rather than about
@@ -148,6 +149,20 @@ def test_hardware_offline() -> None:
                 px[rng.random(px.size) < 0.05] = np.nan       # dropouts
                 depth_raw.append(px)
         height_scan = rng.uniform(-0.3, 0.3, scan_dim) if scan_dim else None
+        # Camera poses in the root's yaw-aligned frame, which a >1-channel generator needs to
+        # unproject its own input. On the robot these come from FK to the mount (the C++
+        # controller's g1_deploy::CameraPoseFk); here they are the contract's NOMINAL mount
+        # offsets with no FK applied, because this file must not import a kinematics library
+        # -- the assertion at the bottom is that neither one reaches the control path. That is
+        # enough to exercise the row assembly, which is what this test covers; the FK itself is
+        # covered by deploy/tests/test_fk_parity.py and the C++ camera_fk_parity test.
+        poses = None
+        if depth_spec:
+            poses = [
+                (np.asarray(cam["offset_pos"], dtype=np.float64),
+                 matrix_from_quat(np.asarray(cam["offset_quat_xyzw"], dtype=np.float64)))
+                for cam in depth_spec
+            ]
         return build_hardware_state(
             policy,
             root_pos=np.array([0.0, 0.0, 0.78]),
@@ -160,9 +175,10 @@ def test_hardware_offline() -> None:
             command=np.asarray(cmd, dtype=np.float64),
             depth_raw=depth_raw,
             height_scan=height_scan,
+            fm_camera_pose=poses,
         )
 
-    policy.warm_start(reading(np.zeros(3)))
+    policy.reset()
     last = None
     for _ in range(8):
         state = reading(np.array([0.4, 0.0, 0.1]))
@@ -183,6 +199,20 @@ def test_hardware_offline() -> None:
     # deploy. test_deploy_path_is_torch_free re-runs this file standalone, where it holds.
     if _STANDALONE:
         assert "torch" not in sys.modules, "deploy path must be torch-free"
+        # Same argument, one package per line. deploy.fk exists for the RViz ribbon and the
+        # sim2sim viewer, and its kinematics library must stay off the ON-ROBOT python import
+        # graph: it is tens of MB the control path never calls. The import is deliberately
+        # inside that module; this is what stops a convenience `from .fk import ...` at the
+        # top of hardware.py or gen_tracker.py from quietly dragging it in.
+        #
+        # mujoco is now only a TEST oracle (deploy/tests/test_fk_parity.py) and is not
+        # imported by any deploy module at all -- kept here because the assertion costs
+        # nothing and the day someone reaches for MjData in a hurry is the day it earns back.
+        for pkg in ("mujoco", "pinocchio"):
+            assert pkg not in sys.modules, (
+                f"the deploy control path must not import {pkg} -- keep it inside "
+                "deploy/fk.py, which only the viewers touch"
+            )
     print(f"obs {policy.get_num_obs()}  action {last.shape}  finite=True  "
           f"depth_cameras={len(depth_spec)}  height_scan={scan_dim}  "
           f"pred_valid={policy._pred_valid}")

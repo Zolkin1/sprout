@@ -3,8 +3,12 @@
 """Numpy rolling history buffer for the deployment generator inference.
 
 Numpy port of ``robot_rl.flow_matching.online.BatchedHistory`` (reset-aware, fixed length).
-A window becomes valid once an env has ``maxlen`` uninterrupted steps since its
-last reset; ``fill`` warm-starts every slot for deployment (no clip warmup).
+A window becomes valid once an env has ``maxlen`` uninterrupted steps since its last
+reset. There is deliberately no way to pre-fill it: every row is a reference-window node
+the runtime SERVED, so a fabricated one is off-distribution -- a repeated static snapshot
+is a history with no motion between its steps, which training never produces. Until the
+window holds ``maxlen`` real rows, :meth:`null_mask` says so and the generator's learned
+null-history embedding covers it.
 """
 
 from __future__ import annotations
@@ -37,13 +41,6 @@ class BatchedHistory:
         if len(self._steps) < self.maxlen:
             return np.zeros_like(self._steps_since_reset, dtype=bool)
         return self._steps_since_reset >= self.maxlen
-
-    def fill(self, step: dict[str, np.ndarray]) -> None:
-        """Warm-start: fill every slot with ``step`` and mark all windows valid."""
-        self._steps.clear()
-        for _ in range(self.maxlen):
-            self._steps.append({k: np.array(v, copy=True) for k, v in step.items()})
-        self._steps_since_reset[:] = self.maxlen
 
     def stack(self, key: str) -> np.ndarray:
         """Stack a tracked quantity over the window into ``(N, maxlen, ·)``."""
