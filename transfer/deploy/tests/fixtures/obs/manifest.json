@@ -1,7 +1,7 @@
 {
   "format": 1,
   "generator": "transfer/deploy/tools/dump_obs_fixtures.py",
-  "numpy": "1.26.4",
+  "numpy": "2.4.6",
   "byteorder": "little",
   "num_obs": 3101,
   "steps": [

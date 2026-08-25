@@ -35,9 +35,17 @@ _TRANSFER = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__fi
 sys.path.insert(0, _TRANSFER)
 
 #: Where the obelisk stack keeps its prefetched policy pair.
+#: The DEPLOYED pair, so a regeneration freezes the metadata the robot actually runs.
+#:
+#: Note the ``policies/`` element: that is where ``hardware.HF_POLICY_PREFIX`` puts a cache
+#: miss and where the controller loads from. This default was missing it AND naming a
+#: pre-refresh run, which is how the fixtures came to describe a robot with different action
+#: scales and no ``robot_asset`` block at all. The C++ side had the identical defect in
+#: ``deploy_cpp/CMakeLists.txt``'s ``G1_DEPLOY_POLICY_DIR``, where it silently skipped two
+#: whole test binaries.
 _DEFAULT_RUN_DIR = os.path.join(
-    _TRANSFER, "obelisk", "g1_control", "resource", "hf_cache", "zolkin_robot_rl",
-    "2026-08-04_21-55-17_yaw_k12_v1")
+    _TRANSFER, "obelisk", "g1_control", "resource", "hf_cache", "zolkin_robot_rl", "policies",
+    "2026-08-20_16-36-10_mode11_decor_plan_v1")
 
 
 def resolve_expected(tracker_path: str) -> tuple[str, dict]:

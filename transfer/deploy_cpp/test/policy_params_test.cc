@@ -232,8 +232,15 @@ TEST_F(PolicyParamsFixture, TheCameraContractCarriesItsIntrinsicsAndNominalMount
   EXPECT_NEAR(near.cx, near.width / 2.0, 1e-12);
 
   // Both mounted on the torso, the far one higher and pitched shallower.
-  EXPECT_NEAR(near.offset_pos[2], 0.099426, 1e-9);
-  EXPECT_NEAR(far.offset_pos[2], 0.38, 1e-9);
+  //
+  // These are the AS-BUILT mounts, and they are stated explicitly rather than re-read from the
+  // contract on purpose -- a test that re-derives a number the same way the code does cannot
+  // catch a wrong number, only a crash. They were 0.099426 / 0.38 while the trained cameras
+  // were still placeholders; when the mount pose legitimately moves again this SHOULD fail,
+  // and the numbers get updated in the same commit.
+  EXPECT_NEAR(near.offset_pos[2], 0.045, 1e-9);
+  EXPECT_NEAR(far.offset_pos[2], 0.285, 1e-9);
+  EXPECT_GT(far.offset_pos[2], near.offset_pos[2]) << "the far camera is the higher mount";
   EXPECT_LT(far.offset_quat_xyzw[1], near.offset_quat_xyzw[1]) << "far looks less steeply down";
 
   // And the contract becomes geometry in exactly one place.
