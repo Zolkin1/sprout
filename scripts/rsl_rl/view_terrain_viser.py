@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import importlib
 import time
 
@@ -143,7 +144,9 @@ def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int
         tid: The tile's ``terrain_id``.
         corner: The tile's world ``(x, y)`` corner.
         n_traj: How many clips to draw.
-        seed: Chooses WHICH clips, so a re-run shows the same ones.
+        seed: Chooses WHICH clips, so a re-run shows the same ones. Combined with the tile
+            so that two tiles sharing a ``terrain_id`` -- every flat tile does -- do not both
+            draw the same clip.
         center: The tile's world ``(x, y)`` CENTRE. Required for a flat tile
             (``tid == -1``); ignored otherwise.
         mark_step: Draw a marker at this clip step. Used by the terrain probe, where the
@@ -160,7 +163,16 @@ def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int
     members = np.flatnonzero(lib.terrain_id.cpu().numpy() == tid)
     if len(members) == 0:
         return 0
-    take = members[np.linspace(0, len(members) - 1, min(n_traj, len(members))).astype(int)]
+    # Seeded PER TILE, which is what makes flat tiles show different motions. They all share
+    # ``terrain_id = -1``, so ``members`` is the same list of thousands of clips for every one
+    # of them; an unseeded pick returns the same clip on all 60 and the flat half of the world
+    # looks like one trajectory stamped out repeatedly. Also honours what ``seed`` has always
+    # been documented to do -- the previous evenly-spaced pick ignored it entirely.
+    # ``tid`` is -1 on a flat tile and a seed sequence rejects negatives, so it is offset
+    # rather than passed through; the prefix carries the tile's own index, which is what
+    # separates two flat tiles that share the id.
+    pick = np.random.default_rng((int(seed) & 0xFFFF, int(tid) + 2, hash(prefix) & 0xFFFF))
+    take = pick.choice(members, size=min(n_traj, len(members)), replace=False)
 
     pos_names = lib.meta.get("pos_output_names") or json.loads(
         lib.attrs["pos_output_names"])
@@ -218,6 +230,16 @@ def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int
                     colors=np.full((len(allp), 3), _CONTACT_COLOR, np.uint8),
                     point_size=0.03,
                 )
+        if base is not None:
+            # The START, so the direction of travel is readable. A trajectory drawn as a bare
+            # ribbon is ambiguous end-to-end, and on a flat tile -- where the path wanders
+            # and the terrain gives no cue -- there is nothing else to read it from.
+            st = row[0][base].astype(np.float32).copy()
+            st[0] += ox
+            st[1] += oy
+            server.scene.add_icosphere(
+                f"{prefix}/traj_{k}/start", radius=0.14, color=(60, 220, 90),
+                position=(float(st[0]), float(st[1]), float(st[2])))
         if mark_step is not None and 0 <= int(mark_step) < n and base is not None:
             here = row[int(mark_step)][base].astype(np.float32).copy()
             here[0] += ox
@@ -231,7 +253,8 @@ def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int
 
 def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
                     n_traj: int = 0, traj_seed: int = 0,
-                    mark_step: int | None = None) -> trimesh.Trimesh:
+                    mark_step: int | None = None,
+                    clutter: str | None = None) -> trimesh.Trimesh:
     """Render the terrain a clip library's manifest assembles into.
 
     Args:
@@ -247,6 +270,26 @@ def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
     from motion_gen.clips.clip_io import load_clip_library
 
     lib = load_clip_library(lib_path, "cpu")
+    if clutter:
+        from motion_gen.terrain.clutter import merge_flat_decor, merge_into_manifest
+
+        with open(clutter) as fh:
+            doc = json.load(fh)
+        raw = lib.attrs.get("terrain_manifest")
+        man = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+        n = merge_into_manifest(man, doc, source=os.path.basename(lib_path))
+        lib.attrs["terrain_manifest"] = man
+        # Flat tiles have no manifest entry, so their share arrives separately and is
+        # PAIRED onto the library's own room variants rather than replacing them: the
+        # rooms sit outside camera range at the shipped buffer, so they cost nothing to
+        # keep, and the combined list keeps the round-robin's period.
+        _flat = doc.get("flat_variants") or []
+        if _flat:
+            _raw = lib.attrs.get("flat_tile_decor")
+            _cur = (json.loads(_raw) if isinstance(_raw, str) else list(_raw or [])) \
+                if _raw is not None else []
+            lib.attrs["flat_tile_decor"] = merge_flat_decor(_cur, _flat)
+        print(f"[view_terrain_viser] clutter seed {doc.get('seed')}: +{n} visual-only boxes")
     mesh, _origins, layout = assemble_clip_terrain(lib, num_rows=num_rows)
     _add_mesh(server, "/terrain", mesh, _GROUND_COLOR)
     # The VISUAL-ONLY decoration lives in its own mesh, out of the ground and out of the
@@ -351,6 +394,10 @@ def main() -> None:
                         "the treads after a width edit, which the mesh alone cannot show.")
     p.add_argument("--traj-seed", type=int, default=0,
                    help="Which clips are sampled, so a re-run shows the same ones.")
+    p.add_argument("--clutter", default=None, metavar="SIDECAR.json",
+                   help="Overlay a clutter variant from author_clutter.py. It is drawn "
+                        "through the same decor channel as the library's own decoration, so "
+                        "what appears here is what the cameras get.")
     p.add_argument("--mark-step", type=int, default=None, metavar="STEP",
                    help="Red sphere on the pelvis at this clip step. Defaults to the probe "
                         "step when the library is a terrain-probe one, because there the "
@@ -372,7 +419,7 @@ def main() -> None:
                     print(f"[view_terrain_viser] terrain-probe library: marking step {mark}")
         mesh = _render_library(server, args.lib, args.num_rows,
                                n_traj=args.traj, traj_seed=args.traj_seed,
-                               mark_step=mark)
+                               mark_step=mark, clutter=args.clutter)
     else:
         mesh = _render_subterrains(server, _load_cfg(args.cfg or "demo"))
 
