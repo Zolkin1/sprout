@@ -41,12 +41,12 @@ import numpy as np
 import viser
 from viser.extras import ViserUrdf
 
-from robot_rl.flow_matching.viz.robot import load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
+from robot_rl.flow_matching.viz.robot import DEFAULT_URDF, load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
 
 #: The hand links are REAL fixed-joint links in this asset, which is what the depth cameras
 #: see (see CLAUDE.md: as bare <visual> elements the ray caster misses them entirely). Using
 #: a hand-less URDF here would draw a robot that does not match its own self-scan.
-_DEFAULT_URDF = "robot_assets/g1/g1_21j/g1_21j_box_merged_29j_hands.urdf"
+_DEFAULT_URDF = DEFAULT_URDF
 
 #: One colour per pose, ordered as ``_POSES`` in the check script. Chosen to stay distinct
 #: when several clouds are overlaid on top of each other.

@@ -45,9 +45,9 @@ import numpy as np
 import viser
 from viser.extras import ViserUrdf
 
-from robot_rl.flow_matching.viz.robot import load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
+from robot_rl.flow_matching.viz.robot import DEFAULT_URDF, load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
 
-_DEFAULT_URDF = "robot_assets/g1/g1_21j/g1_21j_29dof.urdf"
+_DEFAULT_URDF = DEFAULT_URDF
 
 # One hue per simulator, one shade per camera, so sim identity survives a screenshot.
 _ISAAC_NEAR = (70, 220, 110)
