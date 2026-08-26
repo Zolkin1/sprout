@@ -37,14 +37,28 @@ Verified end to end on the seven-file clutter set (1,071,014 windows): counts, e
 array's shape/dtype, byte-equality of sampled rows per source segment, and disjoint
 increasing episode-id ranges.
 
-NOTE what merging does NOT fix: variants of the SAME rollout (e.g. one recording
-re-rendered with different visual clutter) share ``clip_id``/``clip_step`` but get
-distinct offset ``episode_id``s, so the by-episode val split will put one variant of a
-trajectory in train and another in val.  That is a property of the data, not of the join.
+VARIANTS OF ONE ROLLOUT NEED ``--variant_groups``.  A recording re-rendered with different
+visual clutter shares ``clip_id``/``clip_step`` with its source, and offsetting gives each
+copy a distinct ``episode_id`` -- so ``build_train_val``, which splits BY EPISODE precisely
+"to avoid leakage", sees N unrelated episodes where there is one trajectory, and puts one
+variant in train and another in val.  With k re-renders the chance a val episode has no
+counterpart in train is ``val_fraction ** (k - 1)``: at seven files and a 5% split that is
+2e-8, i.e. the held-out set is not held out at all.  It matters beyond the reported number,
+because ``best.pt`` is selected on the val metric.
+
+Label those inputs into one group and they keep a single episode numbering, so every
+variant of a trajectory lands on the same side of the split::
+
+    --variant_groups r,r,r,r,r,r,r          # seven re-renders of one rollout
+    --variant_groups a,a,b                  # two variants of A, then a separate rollout B
+
+The default remains one group per file.
 
 Usage::
 
     python scripts/rsl_rl/merge_recordings.py --out merged.h5 original.h5 augmented.h5
+    python scripts/rsl_rl/merge_recordings.py --out merged.h5 --variant_groups r,r,r \
+        original.h5 clutter_v1.h5 clutter_v2.h5
     python scripts/flow_matching/train.py --data merged.h5 ...
 """
 
@@ -86,7 +100,8 @@ def _window_keys(f) -> list[str]:
     return [k for k in _WINDOW_DTYPES if k in f]
 
 
-def merge(paths: list[str], out_path: str, compression: str | None = "lzf") -> None:
+def merge(paths: list[str], out_path: str, compression: str | None = "lzf",
+          groups: list[str] | None = None) -> None:
     """Stream-merge windowed recordings into one file.
 
     Args:
@@ -95,6 +110,10 @@ def merge(paths: list[str], out_path: str, compression: str | None = "lzf") -> N
         out_path: Output ``.h5`` path. Must not already exist.
         compression: h5py filter for the output datasets ("lzf" fast, "gzip" smaller,
             None off). Defaults to the writer's own "lzf".
+        groups: One label per input. Inputs sharing a label are RE-RENDERS OF ONE ROLLOUT
+            and keep a single episode numbering, so a window and its variants carry the
+            same ``episode_id``. ``None`` gives every input its own group, which is the
+            old behaviour. See the module docstring for why this is not cosmetic.
 
     Raises:
         SystemExit: If an input is missing, holds no windows, the inputs disagree on which
@@ -124,6 +143,21 @@ def merge(paths: list[str], out_path: str, compression: str | None = "lzf") -> N
                     f"  {sorted(set(keys) - set(other))} missing from {p}\n"
                     f"  {sorted(set(other) - set(keys))} missing from {paths[0]}"
                 )
+        # Matching NAMES are not matching arrays. h5py BROADCASTS on write, so a (n, 1, px)
+        # block lands in a (n, 2, px) slice without complaint and duplicates one camera into
+        # both planes -- a plausible depth image of the wrong thing, which no shape check
+        # downstream can see. Verified: h5py accepts it and reports success.
+        for key in keys:
+            ref = handles[0][key]
+            for p, f in zip(paths[1:], handles[1:]):
+                if f[key].shape[1:] != ref.shape[1:] or f[key].dtype != ref.dtype:
+                    raise SystemExit(
+                        f"'{key}' does not have the same per-window shape in every input:\n"
+                        f"  {paths[0]}: {ref.shape[1:]} {ref.dtype}\n"
+                        f"  {p}: {f[key].shape[1:]} {f[key].dtype}\n"
+                        "These describe different sensors or a different robot; merging them "
+                        "would broadcast rather than fail.")
+
         if "episode_id" not in keys:
             raise SystemExit("inputs carry no 'episode_id'; cannot offset episodes safely.")
 
@@ -148,8 +182,14 @@ def merge(paths: list[str], out_path: str, compression: str | None = "lzf") -> N
                     out.attrs[k] = v
 
             dst = 0
-            ep_off = 0
-            for p, f, n in zip(paths, handles, counts):
+            next_free = 0
+            group_off: dict[str, int] = {}
+            labels = groups or [str(i) for i in range(len(paths))]
+            for p, f, n, lab in zip(paths, handles, counts, labels):
+                # A group's SECOND and later files reuse the FIRST one's offset, so the same
+                # source episode maps to the same merged id in every variant. A new group
+                # starts past every id used so far.
+                ep_off = group_off.setdefault(lab, next_free)
                 ep_max = -1
                 for key in keys:
                     src = f[key]
@@ -161,10 +201,9 @@ def merge(paths: list[str], out_path: str, compression: str | None = "lzf") -> N
                             ep_max = max(ep_max, int(block.max()))
                         out[key][dst + i:dst + j] = block
                 print(f"[merge]   {os.path.basename(p)}: {n} windows at offset {dst}, "
-                      f"episode ids +{ep_off} (max now {ep_max})")
+                      f"group '{lab}' episode ids +{ep_off} (max now {ep_max})")
                 dst += n
-                # Next file starts past every id used so far, so the val split cannot leak.
-                ep_off = ep_max + 1
+                next_free = max(next_free, ep_max + 1)
 
             out.attrs["num_windows"] = total
             out.attrs["num_windows_written"] = total
@@ -210,6 +249,11 @@ def main() -> None:
     ap.add_argument("--out", required=True, help="Output .h5 path (must not exist).")
     ap.add_argument("--compression", default="lzf", choices=["lzf", "gzip", "none"],
                     help="Output compression filter. 'lzf' matches the recorder.")
+    ap.add_argument("--variant_groups", default="",
+                    help="Comma-separated label per input; inputs sharing a label are "
+                         "re-renders of ONE rollout and keep a single episode numbering, so "
+                         "the by-episode val split cannot put one variant in train and "
+                         "another in val. Default: every input its own group.")
     ap.add_argument("--no_verify", action="store_true",
                     help="Skip the post-merge reload check (it re-reads the whole file).")
     args = ap.parse_args()
@@ -217,8 +261,12 @@ def main() -> None:
     if len(args.inputs) < 2:
         raise SystemExit("give at least two recordings to merge.")
 
+    labels = [t.strip() for t in args.variant_groups.split(",") if t.strip()] or None
+    if labels is not None and len(labels) != len(args.inputs):
+        raise SystemExit(f"--variant_groups has {len(labels)} labels for "
+                         f"{len(args.inputs)} inputs; give exactly one per input.")
     comp = None if args.compression == "none" else args.compression
-    merge(args.inputs, args.out, compression=comp)
+    merge(args.inputs, args.out, compression=comp, groups=labels)
     if not args.no_verify:
         with __import__("h5py").File(args.out, "r") as f:
             total = _effective_len(f)
