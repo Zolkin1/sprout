@@ -215,6 +215,48 @@ class TerrainClassifier:
                          for r in nn], dtype=np.int64)
 
 
+def clip_coarse_codes(lib_path: str) -> np.ndarray:
+    """True coarse class per clip id, for labelling a plan the classifier just read.
+
+    The classifier answers "what does this plan look like"; this answers "what should it
+    have looked like", and the pair is what makes a misread identifiable at all.
+
+    Family is a property of the TILE, not of the clip manager: the library gives each clip a
+    ``terrain_id`` and the terrain manifest names that tile's family. Flat clips carry
+    ``terrain_id = -1`` and have no manifest entry, which is the ``flat`` class rather than a
+    missing one.
+
+    Args:
+        lib_path: The clip library ``.h5`` the run is using.
+
+    Returns:
+        ``(num_clips,)`` int codes into :data:`COARSE_CLASSES`; ``-1`` where the tile's
+        family has no coarse class, rather than guessing one.
+    """
+    import h5py  # noqa: PLC0415
+
+    from sampler import normalize_family  # noqa: PLC0415
+
+    with h5py.File(lib_path, "r") as f:
+        tid = np.asarray(f["terrain_id"][:]).astype(np.int64)
+        raw = f.attrs.get("terrain_manifest")
+    entries = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+    fam_of_tile = {int(m["terrain_id"]): normalize_family(m.get("family", m.get("type", "?")))
+                   for m in entries}
+    # FAMILY_TO_COARSE is keyed with the "family_" prefix the recording uses; the manifest
+    # stores it stripped, so put it back rather than duplicating the table.
+    flat = COARSE_CLASSES.index("flat")
+    out = np.full(tid.shape[0], -1, dtype=np.int64)
+    for i, t in enumerate(tid.tolist()):
+        if t < 0:
+            out[i] = flat
+            continue
+        key = f"family_{fam_of_tile.get(int(t), '?')}"
+        if key in FAMILY_TO_COARSE:
+            out[i] = COARSE_CLASSES.index(FAMILY_TO_COARSE[key])
+    return out
+
+
 def main() -> int:
     """Build a reference set from a saved ``(windows, families)`` bundle."""
     p = argparse.ArgumentParser(prog="terrain_class.py", description=__doc__,

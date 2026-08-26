@@ -173,6 +173,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="terrain_class.py reference .npz; classifies every FM re-plan as "
                         "flat/jump/stairs and counts them per episode. Ignored on the clip "
                         "arm. Empty = off.")
+    g.add_argument("--dump_flagged", type=int, default=0, metavar="N",
+                   help="Keep N re-plans per (true class, predicted class) bucket, with the "
+                        "depth row each was drawn from, to <out>/<cell>/flagged_plans.npz. "
+                        "Needs --terrain_ref. The bucket key collects a misread and its own "
+                        "control together -- stairs->jump beside stairs->stairs -- because a "
+                        "folder of flagged images alone shows whatever the reader expects. "
+                        "0 = off.")
     g.add_argument("--num_envs", type=int, default=256)
     g.add_argument("--num_rows", type=int, default=1)
     g.add_argument("--seed", type=int, default=42)

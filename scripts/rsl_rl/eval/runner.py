@@ -627,6 +627,17 @@ def stage_cell(args) -> int:
             print(f"[cell] plan classifier: {accum.plan_clf.feats.shape[0]} reference "
                   f"windows from {args.terrain_ref}. Counts are per RE-PLAN; compare against "
                   "the open-loop control stairs->jump 0.059 [0.047, 0.071].")
+            if int(getattr(args, "dump_flagged", 0)):
+                from plan_dump import FlaggedPlanDump  # noqa: PLC0415
+                # The SUBSET library: cell clip ids index that one, not the source.
+                coarse = terrain_class.clip_coarse_codes(
+                    plan['subset_library']['path'])
+                accum.cmd.enable_extero_stash()
+                accum.plan_dump = FlaggedPlanDump(coarse,
+                                                  per_bucket=int(args.dump_flagged),
+                                                  seed=int(args.seed))
+                print(f"[cell] flagged-plan dump: {args.dump_flagged} per (true, pred) "
+                      "bucket, with the exteroception row each plan was drawn from.")
 
         max_steps = int(args.max_steps) or _derived_max_steps(clips, queue, args.num_envs)
         print(f"[cell {key}] rolling: {len(clips)} clips x R={cell['robots_per_clip']} "
@@ -651,6 +662,13 @@ def stage_cell(args) -> int:
             # them inference tensors, and those cannot be updated in place outside the block.
             censored = _flush_inflight(u, accum, writer, hook, queue)
         writer.close()
+        if accum.plan_dump is not None:
+            path = accum.plan_dump.save(
+                str(out_cell / "flagged_plans.npz"),
+                extra=dict(cell=key, fm_checkpoint=cell["fm_checkpoint"],
+                           terrain_ref=args.terrain_ref))
+            print(accum.plan_dump.summary())
+            print(f"[cell] flagged plans -> {path}")
         table.rename(out_cell / "episodes.h5")
 
         wall = time.time() - t0
@@ -756,6 +774,8 @@ def stage_grid(args) -> int:
         # n_plans == 0 and no error anywhere.
         if getattr(args, "terrain_ref", ""):
             cmd += ["--terrain_ref", args.terrain_ref]
+        if getattr(args, "dump_flagged", 0):
+            cmd += ["--dump_flagged", str(args.dump_flagged)]
         if not args.ood_depth_noise:
             cmd += ["--no-ood_depth_noise"]
         if args.max_steps:

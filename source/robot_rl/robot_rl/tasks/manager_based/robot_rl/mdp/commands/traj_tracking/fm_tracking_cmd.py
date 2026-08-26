@@ -339,6 +339,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         # then -- which is the frame the dataset's history rows use.
         self._prev_served_node: torch.Tensor | None = None
         self._pred_valid = torch.zeros(n, dtype=torch.bool, device=dev)
+        #: Per-env copy of the exteroception row each plan was drawn from, or ``None``.
+        #: Allocated only by :meth:`enable_extero_stash`, because it is one depth row per
+        #: env and nothing in training would ever read it.
+        self._extero_stash: torch.Tensor | None = None
         self._fm_reinfer_mask = torch.zeros(n, dtype=torch.bool, device=dev)
         self._last_step_seen = -1
         self._arange_n = torch.arange(n, device=dev)
@@ -981,7 +985,14 @@ class FmTrackingCommand(MotionSequenceCommand):
         # Exteroception tokens = the live reading at "now", from whichever sensor this FM
         # checkpoint was TRAINED on -- the same mdp functions the teacher obs uses, so
         # deployment conditions on exactly the training signal.
-        height = build_extero_tokens(self.ctx, self._lagged_extero()[ids])
+        extero_row = self._lagged_extero()[ids]
+        if self._extero_stash is not None:
+            # The row the generator ACTUALLY conditioned on, kept per env for diagnostics.
+            # Re-reading the sensor afterwards is not the same thing: this is the LAGGED
+            # frame, and by the time anything downstream looks, the live one has moved on.
+            # Opt-in (see enable_extero_stash) so training allocates nothing.
+            self._extero_stash[ids] = extero_row.detach()
+        height = build_extero_tokens(self.ctx, extero_row)
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
         self._pred_window[ids] = sample_window(
@@ -995,6 +1006,22 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._anchor_pos[ids] = wp.to_torch(self.robot.data.root_pos_w)[ids].clone()
         self._anchor_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids].clone()
         self._pred_valid[ids] = True
+
+    def enable_extero_stash(self) -> None:
+        """Start keeping the exteroception row each plan was drawn from.
+
+        A diagnostic hook, off by default: it holds one depth row per env, which is the
+        widest array in the observation, and only the evaluation harness's flagged-plan dump
+        ever reads it. Calling it twice is harmless.
+
+        What it buys is the ability to answer "did the image look like a box, or did the
+        image look fine and the plan go wrong" -- the one split a plan-space classifier
+        cannot make on its own, because by the time a plan is classified the frame that
+        produced it is two lags stale and no longer recoverable from the sensor.
+        """
+        if self._extero_stash is None:
+            row = self._lagged_extero()
+            self._extero_stash = torch.zeros_like(row)
 
     def window_anchor(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The FM command's plan anchor is the pose latched when the plan was drawn.

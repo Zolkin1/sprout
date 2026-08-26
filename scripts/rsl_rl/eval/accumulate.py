@@ -173,6 +173,12 @@ class EpisodeAccumulator:
         # unless a classifier is attached (the clip arm loads no generator).
         self.plan_counts = torch.zeros(self.n, 3, device=self.device, dtype=torch.long)
         self.plan_clf = None
+        #: Optional :class:`FlaggedPlanDump`. Off unless the harness asks for it.
+        self.plan_dump = None
+        #: Running |served - clip| since each env's last re-plan, for the dump's selection.
+        self._div_sum = torch.zeros(self.n, device=self.device)
+        self._div_n = torch.zeros(self.n, device=self.device, dtype=torch.long)
+        self._arange = torch.arange(self.n, device=self.device)
         self.act_rate = z()
         self.act_rate_max = z()
         self.torque_util = z()
@@ -274,6 +280,36 @@ class EpisodeAccumulator:
                     codes = self.plan_clf.classify(win[ids])
                     codes = torch.as_tensor(codes, device=self.device, dtype=torch.long)
                     self.plan_counts[ids, codes] += 1
+                    if self.plan_dump is not None:
+                        # Close out the plan that just ENDED (its divergence is complete
+                        # only now) before opening the new one.
+                        self.plan_dump.finalize(ids, self._div_sum, self._div_n)
+                        self.plan_dump.offer(ids, codes, win, self.cmd)
+                        self._div_sum[ids] = 0.0
+                        self._div_n[ids] = 0
+
+        # -- served-vs-clip divergence, the ground-truth half of the plan dump -------------
+        # The classifier says what a plan LOOKS like; this says how far it is from what the
+        # clip actually does, with no learned label in the way. _clip_history_node returns
+        # the clip's node in the PLAN's frame -- the same frame the served node is in -- so
+        # the difference is meaningful without any re-anchoring here.
+        if self.plan_dump is not None:
+            try:
+                served = self.cmd._pred_window[self._arange, self.cmd._pred_idx]
+                clip_node = self.cmd._clip_history_node()
+                # Base POSITION only (window channels 0:3). The node mixes position, rot6d
+                # and 29 joint angles; an unweighted norm over all of them is dominated by
+                # whichever block happens to have the largest units, which is not a claim
+                # about the plan.
+                # NOT `d`: that name is the _Data wrapper further down this method, and
+                # shadowing it makes fold() die on `d.applied_torque` several branches later.
+                div_step = torch.linalg.norm(served[:, :3] - clip_node[:, :3], dim=-1)
+                div_ok = m & self.cmd._pred_valid
+                self._div_sum = self._div_sum + torch.where(
+                    div_ok, div_step, torch.zeros_like(div_step))
+                self._div_n = self._div_n + div_ok.long()
+            except (AttributeError, RuntimeError):
+                pass
 
         # -- effort / smoothness ----------------------------------------------------------
         action = self._processed_action()
