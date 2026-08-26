@@ -311,7 +311,7 @@ def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, 
 
 
 def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, float],
-               infinite_floor: bool) -> tuple[list[str], str]:
+               infinite_floor: bool, no_floor: bool = False) -> tuple[list[str], str]:
     """Emit the tile's geometry, translated so ``origin`` (tile-local) is the world origin.
 
     A ``solid`` overlay is a full-height pillar from its ``base_z``, which is how the
@@ -326,9 +326,12 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
         overlays: Overlays this emitter can represent (see :func:`emittable_overlays`).
         origin: ``(x, y, z)`` tile-local point to place at the world origin.
         infinite_floor: Emit the checkered infinite plane instead of the tile's own floor.
+        no_floor: On a ``has_floor=False`` tile, emit NO ground at all -- what Isaac
+            actually builds. Refused on a tile that has its own floor, where there is no
+            substitute plane to withhold.
 
     Returns:
-        ``(geom_lines, floor_line)``.
+        ``(geom_lines, floor_line)``; ``floor_line`` is ``""`` under ``no_floor``.
     """
     ox, oy, oz = origin
     lines = []
@@ -348,8 +351,12 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
 
     if infinite_floor or not bool(entry.get("has_floor", True)):
         # has_floor=False is an isolated structure (a floating staircase): Isaac gives it NO
-        # ground plane, so a robot that steps off falls to infinity. Keep the plane there so
-        # a run ends on the floor rather than in the void.
+        # ground plane, so a robot that steps off falls to infinity. The plane is kept by
+        # DEFAULT so a run ends on the floor rather than in the void -- but that substitute
+        # is the one thing in this scene Isaac does not have, so --no_floor withholds it and
+        # the tile is then faithful to the training world, edge included.
+        if no_floor:
+            return lines, ""
         return lines, ('        <geom name="floor" size="0 0 0.05" type="plane" '
                        f'material="groundplane" group="2" pos="0 0 {-oz:.6f}"/>')
     size_x, size_y = float(entry["size_x"]), float(entry["size_y"])
@@ -421,6 +428,12 @@ def main() -> None:
                         "floor. The tile floor stops at the footprint, as in Isaac, so the "
                         "robot can walk off the edge; this trades that fidelity for runs "
                         "that cannot end that way.")
+    p.add_argument("--no_floor", action="store_true", default=False,
+                   help="On a has_floor=False tile, emit NO ground plane -- exactly what "
+                        "Isaac builds. The substitute plane this script normally adds is the "
+                        "one piece of geometry the training world does not have, so it is "
+                        "also the one that makes a step off the edge survivable here and "
+                        "fatal there. Refused on a tile that has its own floor.")
     p.add_argument("--wall", nargs="?", type=float, const=3.0, default=None, metavar="DIST",
                    help="Add two walls meeting at 90 deg, DIST metres ahead of spawn "
                         "(default 3.0 when the flag is given bare). VISUAL ONLY unless "
@@ -442,7 +455,14 @@ def main() -> None:
     else:
         sx, sy, why = spawn_point(entry, overlays, args.approach)
     sz = terrain_top_at(overlays, sx, sy)
-    geoms, floor = tile_geoms(entry, overlays, (sx, sy, sz), args.infinite_floor)
+    if args.no_floor and bool(entry.get("has_floor", True)):
+        raise SystemExit(
+            f"--no_floor on terrain_id {info['terrain_id']}, which HAS its own floor "
+            "(has_floor=True). There is no substitute plane to withhold: the ground here is "
+            "the tile's own slab and removing it would build a tile Isaac never had. "
+            "--no_floor applies to has_floor=False tiles only.")
+    geoms, floor = tile_geoms(entry, overlays, (sx, sy, sz), args.infinite_floor,
+                              no_floor=args.no_floor)
     if args.wall is not None:
         geoms = geoms + corner_wall_geoms(args.wall, args.wall_height, args.wall_length,
                                           solid=args.wall_solid)

@@ -53,8 +53,12 @@ from dataclasses import dataclass
 # The defaults below are the MODAL pair. The previous defaults (0.135 / 0.233) came from the
 # older DP library clips/g1_terrain_v2.h5 and sat BETWEEN grid points, i.e. slightly
 # out-of-distribution for every trained tile.
-TRAINED_RISERS = (0.13, 0.15, 0.17)
-TRAINED_TREADS = (0.22, 0.25, 0.28)
+TRAINED_RISERS = (0.13, 0.131, 0.15, 0.17)
+#: 0.209 was MISSING here and is not a rounding of 0.22: four stairs_up transition tiles
+#: (1, 3, 8, 15) carry it, and it is the tread the clip library walks at HALF speed --
+#: 0.32 m/s against 0.61-0.69 on every other tread. So the one geometry whose reference
+#: behaves differently was the one the playground could not build.
+TRAINED_TREADS = (0.209, 0.22, 0.25, 0.28)
 
 # Lateral step WIDTH, measured from the same manifest (clips/g1_mb_v5_body.h5, 2026-08-13),
 # over every box overlay with a tread-sized x extent. Two disjoint clusters, per family:
@@ -116,6 +120,13 @@ DEFAULT_LANES: tuple[Lane, ...] = (
     # a foot could land anywhere across it, so nothing made the robot stay on the treads.
     Lane(name="center", y=0.0, width=TRAINED_TRANSITION_WIDTH, steps=6, rise=0.15, run=0.25),
     Lane(name="narrow", y=-3.5, width=1.5, steps=4, rise=0.17, run=0.22),
+    # The SLOW-GAIT geometry, which the other three lanes cannot express. Measured over the
+    # library: tread 0.209 / riser 0.131 is walked at 0.32 m/s, while every tread of 0.22 and
+    # above is walked at 0.61-0.69 -- a 2x split with nothing in between, across a geometry
+    # sweep that is otherwise continuous. Width and step count are tile 15's, the narrowest
+    # flight carrying it, so this lane is that tile's stairs rather than an average of the
+    # four. Without it the playground samples only the fast half of the library.
+    Lane(name="slow_tread", y=8.0, width=0.86, steps=6, rise=0.131, run=0.209),
 )
 
 

@@ -83,6 +83,34 @@ def recorded_body_xy(data: dict, meta) -> tuple[np.ndarray, list[str]]:
                                    for n in wanted]
 
 
+def recorded_foot_xyz(data: dict, meta) -> np.ndarray:
+    """World xyz of the two ANKLES, per recorded window: ``(N, 2, 3)``.
+
+    The clutter grid is xy and body-wide, because "could a box be here" is a plan question.
+    Editing the GROUND asks a different one -- "is there still something under this foot" --
+    which needs the height and needs the feet specifically: a wrist at z = 0.9 m says nothing
+    about whether the floor beneath it may be removed.
+
+    Args:
+        data: The loaded recording arrays.
+        meta: Layout metadata; ``state_term_names`` / ``state_term_dims`` locate each body.
+
+    Returns:
+        ``(N, 2, 3)`` world xyz, left ankle then right.
+
+    Raises:
+        SystemExit: If the recording's state layout carries no ankle positions.
+    """
+    names = list(meta.state_term_names)
+    dims = list(meta.state_term_dims)
+    feet = [n for n in names if "ankle" in n and n.endswith(":pos_w")]
+    if len(feet) != 2:
+        raise SystemExit(f"expected two ankle pos_w terms, found {feet}")
+    rows = np.asarray(data["history_state"])[:, -1, :]
+    return np.stack([rows[:, int(sum(dims[: names.index(n)])):
+                          int(sum(dims[: names.index(n)])) + 3] for n in feet], axis=1)
+
+
 def densify_by_episode(xy: np.ndarray, episode: np.ndarray, step: np.ndarray,
                        spacing: float, max_gap_m: float = 3.0) -> np.ndarray:
     """Interpolate between consecutive samples of the same episode, at ``spacing`` metres.
@@ -225,6 +253,27 @@ def main() -> int:
     sizes = {int(tid[r, t]): (float(fp[r, t, 0]), float(fp[r, t, 1]))
              for r in range(corner.shape[0]) for t in range(corner.shape[1])}
 
+    # FEET, with their height, assigned through the same layout. Kept separate from the
+    # occupancy grid on purpose: that grid answers "could a box go here", is xy, and includes
+    # the wrists. Editing the GROUND asks "is there still something under this foot", which
+    # needs z and must not be told about a wrist at 0.9 m. Same corners, so the two cannot
+    # disagree about where a tile is.
+    feet_w = recorded_foot_xyz(data, meta).reshape(-1, 3)
+    feet_per: dict[int, list[np.ndarray]] = {}
+    for r in range(corner.shape[0]):
+        for k in range(corner.shape[1]):
+            cx, cy = float(corner[r, k, 0]), float(corner[r, k, 1])
+            fx, fy = float(fp[r, k, 0]), float(fp[r, k, 1])
+            ins = ((feet_w[:, 0] >= cx) & (feet_w[:, 0] < cx + fx)
+                   & (feet_w[:, 1] >= cy) & (feet_w[:, 1] < cy + fy))
+            if ins.any():
+                loc = feet_w[ins].copy()
+                loc[:, 0] -= cx
+                loc[:, 1] -= cy
+                feet_per.setdefault(int(tid[r, k]), []).append(loc)
+    print(f"[occupancy] feet: {sum(len(v) for vv in feet_per.values() for v in vv)} samples "
+          f"over {len(feet_per)} tile(s)")
+
     # UNION IN THE CLIP PATHS. The recording is where the robot went; the clips are where it
     # is ever ASKED to go, and the first is a subset of the second -- measured, a clip on one
     # tile spans 3.1 m of downrange while the recording covered only the last 1.4 m of it,
@@ -301,6 +350,8 @@ def main() -> int:
         keep = (pts if len(pts) <= cap
                 else pts[np.linspace(0, len(pts) - 1, cap).astype(int)])
         out[f"pts_{k}"] = keep.astype(np.float32)
+        if k in feet_per:
+            out[f"feet_{k}"] = np.concatenate(feet_per[k]).astype(np.float32)
         print(f"  {k:10d} {len(pts):8d} {occ.grid.size:8d} {occ.grid.mean():9.4f}")
     # Written via a temp and moved into place. The union block once died midway and left the
     # PREVIOUS occupancy on disk, which every downstream step then used as if it were current

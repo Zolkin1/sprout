@@ -105,6 +105,22 @@ parser.add_argument("--quat_wxyz", action="store_true",
                     help="Write the root quaternion permuted to wxyz. A/B for the convention: "
                          "the recording states xyzw, the sim API's expectation is what this "
                          "settles empirically against a DR-free delta-0 check.")
+parser.add_argument("--source_rows", default="", metavar="i,j,k",
+                    help="Render ONLY these source window indices, in this order. For "
+                         "looking at a handful of hand-picked frames: --max_source spreads "
+                         "over the whole recording, so getting a few frames that show a "
+                         "particular thing means rendering thousands that do not. Rows can "
+                         "be chosen offline against the source recording's own depth, with "
+                         "no simulator.")
+parser.add_argument("--render_resolution", default="", metavar="WxH",
+                    help="Re-render the generator's depth at a DIFFERENT resolution from the "
+                         "recording's. This deliberately breaks the reproduce-the-source "
+                         "rule every other mode obeys, so it is opt-in and the output is a "
+                         "new contract rather than a copy: the written "
+                         "depth_camera_spec and depth shape are the ones actually rendered. "
+                         "For choosing a resolution by looking at the images; a generator "
+                         "sampling a different grid from the tracker CANNOT ship (the ZEDs "
+                         "publish one resolution and export_sensor_configs refuses a split).")
 parser.add_argument("--clutter", default=None, metavar="SIDECAR.json",
                     help="Re-render against a visual-clutter variant "
                          "(scripts/rsl_rl/author_clutter.py) instead of displacing the robot. "
@@ -161,6 +177,7 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
+from dataclasses import replace  # noqa: E402
 import torch  # noqa: E402
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
@@ -345,15 +362,22 @@ def main() -> int:
     # happens to default to. When the recording was made at the generator's own resolution
     # (record_data.py --fm_depth_resolution), that means building the same second pair here.
     _rec_cams = list(getattr(meta, "depth_camera_spec", None) or [])
-    if _rec_cams:
+    _want_res = None
+    if args_cli.render_resolution:
+        try:
+            _w, _h = (int(v) for v in args_cli.render_resolution.lower().split("x"))
+        except ValueError:
+            raise SystemExit(f"--render_resolution {args_cli.render_resolution!r} must be WxH")
+        _want_res = (_w, _h)
+    if _rec_cams or _want_res:
         _res = {(int(c["width"]), int(c["height"])) for c in _rec_cams}
-        if len(_res) != 1:
+        if not _want_res and len(_res) != 1:
             raise SystemExit(f"the recording's cameras sample at {sorted(_res)}; one "
                              "recording's cameras share one resolution.")
         from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
             add_fm_depth_pair,
         )
-        add_fm_depth_pair(env_cfg, *_res.pop())
+        add_fm_depth_pair(env_cfg, *(_want_res or _res.pop()))
 
     # Same for the generator's own dense scanner, and for the same reason: the recording was
     # made on a task PLUS `record_data.py --fm_height_scan`, so the bare task carries only the
@@ -404,7 +428,10 @@ def main() -> int:
         _live = mdp.depth_camera_specs(u, _render_groups)
         _live_res = [(int(c["width"]), int(c["height"])) for c in _live]
         _rec_res = [(int(c["width"]), int(c["height"])) for c in _rec_spec]
-        if _live_res != _rec_res:
+        if _live_res != _rec_res and args_cli.render_resolution:
+            print(f"[augment] rendering at {_live_res}, NOT the recording's {_rec_res}. The "
+                  "output is a new camera contract, not a reproduction of the source.")
+        elif _live_res != _rec_res:
             raise SystemExit(
                 f"this task samples depth at {_live_res} but the recording was made at "
                 f"{_rec_res}. A re-render must reproduce the source EXACTLY -- pass "
@@ -525,8 +552,16 @@ def main() -> int:
     # N windows are the OPENINGS of episodes -- taking a prefix samples one narrow band of
     # clip_step and silently answers a different question than the one asked (it read the
     # first 36 steps of a 2-6 s clip here, which made every downrange obstacle look far away).
-    src = (np.arange(W) if not args_cli.max_source or args_cli.max_source >= W
-           else np.linspace(0, W - 1, args_cli.max_source).astype(np.int64))
+    if args_cli.source_rows:
+        src = np.array([int(v) for v in args_cli.source_rows.split(",") if v.strip()],
+                       dtype=np.int64)
+        if src.min() < 0 or src.max() >= W:
+            raise SystemExit(f"--source_rows out of range for a {W}-window recording: "
+                             f"{src.min()}..{src.max()}")
+        print(f"[augment] rendering {len(src)} hand-picked row(s), not a spread")
+    else:
+        src = (np.arange(W) if not args_cli.max_source or args_cli.max_source >= W
+               else np.linspace(0, W - 1, args_cli.max_source).astype(np.int64))
     if not args_cli.check_only and not args_cli.visual_only and not args_cli.augment_flat:
         # Keep only windows whose horizon CONTAINS terrain (>=1 anchor-mask-pinned node):
         # terrain-only segments and transitions. Pure-flat windows are ego-anchored and must
@@ -573,6 +608,17 @@ def main() -> int:
         if not args_cli.out:
             raise SystemExit("--out is required unless --check_only.")
         depth_shape = (int(data["depth"].shape[1]), int(data["depth"].shape[2]))
+        if args_cli.render_resolution:
+            # The output must describe ITSELF. Inheriting the source's spec and shape here
+            # would write a file whose depth is one resolution and whose contract claims
+            # another -- and every consumer downstream (the FM dataset, the export, the
+            # deploy agreement) reads the contract, not the array.
+            _live_spec = mdp.depth_camera_specs(u, _render_groups)
+            depth_shape = (len(_live_spec),
+                           int(_live_spec[0]["width"]) * int(_live_spec[0]["height"]))
+            meta = replace(meta, depth_camera_spec=_live_spec)
+            print(f"[augment] output contract: {depth_shape[0]} camera(s) x "
+                  f"{depth_shape[1]} px ({_live_spec[0]['width']}x{_live_spec[0]['height']})")
         writer = RecordedWindowWriter(
             args_cli.out, len(src) * reps, H, int(hs_all.shape[2]),
             int(data["ref_future"].shape[1]),

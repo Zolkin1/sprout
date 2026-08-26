@@ -147,8 +147,20 @@ class ClipTerrainImporter(TerrainImporter):
                 self._clutter = _json.load(_fh)
             _man = lib.attrs.get("terrain_manifest")
             _man = _json.loads(_man) if isinstance(_man, str) else list(_man or [])
-            _n = merge_into_manifest(_man, self._clutter,
-                                     source=os.path.basename(cfg.clip_library_path))
+            # Two sidecar kinds arrive on this one path. Schema 1 is the clutter pass and
+            # only ADDS visual-only boxes; schema 2 is the terrain-variant pass and edits the
+            # ground itself. Dispatch on the document rather than on a second config field:
+            # the field says "here is a sidecar", and what a sidecar does is the sidecar's
+            # business to declare.
+            if int(self._clutter.get("schema", 1)) == 2:
+                from motion_gen.terrain.ground_variants import merge_variants
+                _n = merge_variants(_man, self._clutter,
+                                    source=os.path.basename(cfg.clip_library_path))
+                print(f"[ClipTerrainImporter] terrain variant seed "
+                      f"{self._clutter.get('seed')}: {_n} tile(s) edited")
+            else:
+                _n = merge_into_manifest(_man, self._clutter,
+                                         source=os.path.basename(cfg.clip_library_path))
             # Written back as a LIST, not as JSON: the attribute arrives as a string from
             # h5py but assemble_clip_terrain indexes it directly, so re-serialising here
             # fails inside the loader rather than at this line.

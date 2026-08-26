@@ -283,12 +283,22 @@ def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
             _FAMILY[int(_m["terrain_id"])] = str(_m.get("family", "?")).replace(".h5", "")
     if clutter:
         from motion_gen.terrain.clutter import merge_flat_decor, merge_into_manifest
+        from motion_gen.terrain.ground_variants import merge_variants
 
         with open(clutter) as fh:
             doc = json.load(fh)
         raw = lib.attrs.get("terrain_manifest")
         man = json.loads(raw) if isinstance(raw, str) else list(raw or [])
-        n = merge_into_manifest(man, doc, source=os.path.basename(lib_path))
+        # Two sidecar kinds reach this flag. Schema 1 is the clutter pass, which only ever
+        # ADDS visual-only boxes; schema 2 is the terrain-variant pass, which edits the
+        # ground itself. Dispatching on the document rather than on a second flag keeps the
+        # viewer's job "show me what that file does".
+        if int(doc.get("schema", 1)) == 2:
+            n = merge_variants(man, doc, source=os.path.basename(lib_path))
+            print(f"[view_terrain_viser] TERRAIN VARIANT seed {doc.get('seed')}: "
+                  f"{n} tile(s) edited (floor / width / platform / walls)")
+        else:
+            n = merge_into_manifest(man, doc, source=os.path.basename(lib_path))
         lib.attrs["terrain_manifest"] = man
         # Flat tiles have no manifest entry, so their share arrives separately and is
         # PAIRED onto the library's own room variants rather than replacing them: the
@@ -300,7 +310,9 @@ def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
             _cur = (json.loads(_raw) if isinstance(_raw, str) else list(_raw or [])) \
                 if _raw is not None else []
             lib.attrs["flat_tile_decor"] = merge_flat_decor(_cur, _flat)
-        print(f"[view_terrain_viser] clutter seed {doc.get('seed')}: +{n} visual-only boxes")
+        if int(doc.get("schema", 1)) != 2:
+            print(f"[view_terrain_viser] clutter seed {doc.get('seed')}: "
+                  f"+{n} visual-only boxes")
     mesh, _origins, layout = assemble_clip_terrain(lib, num_rows=num_rows)
     _add_mesh(server, "/terrain", mesh, _GROUND_COLOR)
     # The VISUAL-ONLY decoration lives in its own mesh, out of the ground and out of the
