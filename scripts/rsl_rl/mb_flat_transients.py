@@ -17,6 +17,10 @@ segment per transient, given full freedom over position and timing:
   flat path used re-issued the same relative problem every 16 frames and re-quantized the duration each
   time, which is what turned a one-off timing choice into a sustained velocity bias.
 
+The generation itself lives in :mod:`mb_transient`, shared with the terrain driver -- a terrain
+clip's lead-up contains ordinary loop-to-loop transitions too, and a second implementation of
+them would silently lack the multi-hop chaining that keeps a large change trackable.
+
 Runs ~6 model calls per clip instead of ~37. Emits the same ``RawMotion`` contract as every other
 Stage-1 driver, keyed by the plan's transient ``key`` so pass C can find it::
 
@@ -33,134 +37,55 @@ import os
 import sys
 
 import numpy as np
-import torch as t
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mb_env  # noqa: E402
-
-# How many leading frames to consider when locating the end of the re-predicted seed.  Motion Bricks
-# opens a context-seeded generation by re-predicting its seed (the pre-filter blends the first frames
-# back toward the supplied history), so those frames replay the loop we just left; concatenating from
-# frame 0 would repeat a step.  Structurally that is ``nfpt`` frames, but the terrain exit measured the
-# best match one frame later, so the index is FOUND within this window and reported -- a wrong constant
-# here is a seam spike, and it is cheap to just look.
-_SEED_SEARCH = 8
+import mb_transient  # noqa: E402
 
 
-def _seed_overlap(frames: np.ndarray, seed_last: np.ndarray, nfpt: int) -> int:
-    """Index of the last frame that still replays the seed: drop ``[0, idx]``, keep from ``idx + 1``."""
-    k = min(_SEED_SEARCH, frames.shape[0] - 1)
-    if k < 1:
-        return 0
-    d = np.linalg.norm(frames[:k, 7:] - seed_last[None, 7:], axis=1)
-    return int(np.argmin(d))
+# The generation knobs a cached flat transient is keyed on. Mirrors ``mb_terrain_segments._GEN_KNOBS``
+# and exists for the same reason, found the same way: this stage was a bare ``os.path.exists`` skip, so
+# a change to what the generator PRODUCES left every already-generated segment in place. Measured on the
+# quick build's 47 cached transients -- 38 of them differ in SHAPE from what the same command produces
+# today, and nothing said so. A silently stale segment is worse than a slow rebuild: the plan, the clip
+# and every QC number are consistent with motion that no current code path would generate.
+_GEN_KNOBS = ("gen_version", "stride_bank", "a_max", "alpha_max", "min_transient_s", "ramp_dv",
+              "hop_slack")
+
+# Bump when the GENERATOR changes what it produces for identical knobs -- a CLI flag is comparable, code
+# is not. Compared like any other knob, so an invalidation is one greppable line.
+#   1: the first version to record any of this. Everything cached before it has no ``gen_version`` and
+#      is therefore stale by construction, which is correct: those files predate the token UPPER bound
+#      (``hop_tokens``' ``n_max`` / ``--hop-slack``), so they are longer than anything generated now.
+_GEN_VERSION = 1
 
 
-def _min_tokens_for(mb, v0, v1, a_max: float, alpha_max: float, floor_s: float) -> tuple[int, float]:
-    """Fewest tokens that give the transition enough TIME to be physically trackable.
-
-    Motion Bricks picks its own horizon and -- measured over 16 real transients -- that choice is
-    essentially uncorrelated with the size of the velocity change it is bridging (r = -0.03). Left free it
-    produced a 3.62 -> 0.80 m/s change in 0.53 s, i.e. **5.3 m/s^2**, which nothing can track. So bound the
-    duration from below by the change itself: ``T >= |dv| / a_max`` and ``T >= |dwz| / alpha_max``, never
-    below ``floor_s``.  The model keeps every choice ABOVE the floor, which is where it already sits most
-    of the time (median 12-14 tokens), so this trims the infeasible tail rather than dictating a duration.
-
-    Frames survive as ``4N`` minus the seed overlap and the target window, so the floor has to be set on
-    the KEPT duration, not the raw horizon.  Returns ``(n_min, t_min_s)``.
-    """
-    dv = float(np.linalg.norm(np.asarray(v1)[:2] - np.asarray(v0)[:2]))
-    dw = float(abs(float(v1[2]) - float(v0[2])))
-    t_min = max(float(floor_s), dv / max(a_max, 1e-6), dw / max(alpha_max, 1e-6))
-    trim = 2 * mb.nfpt                                     # seed overlap + target window, both discarded
-    n = int(np.ceil((t_min * mb.fps + trim) / mb.nfpt))
-    return int(np.clip(n, mb.min_tokens, mb.max_tokens)), t_min
+def _gen_params(args) -> dict:
+    """The generation knobs this run would use. ``stride_bank`` by BASENAME, as on the terrain side:
+    the driver absolutizes the path, so comparing the full one would invalidate everything after a
+    work-dir move while the basename still catches the case that matters (a different bank)."""
+    return {"gen_version": _GEN_VERSION, "stride_bank": os.path.basename(args.stride_bank),
+            "a_max": float(args.a_max), "alpha_max": float(args.alpha_max),
+            "min_transient_s": float(args.min_transient_s), "ramp_dv": float(args.ramp_dv),
+            "hop_slack": float(args.hop_slack)}
 
 
-def _ramp_waypoints(v0, v1, ramp_dv: float, achieved) -> list:
-    """Split a big velocity change into hops, none changing speed by more than ``ramp_dv``.
-
-    Motion Bricks pins only the ENDPOINT of a generation, so nothing asks it for a smooth ramp: measured,
-    it coasts near the initial velocity and then converges hard, and the peak acceleration correlates with
-    the SIZE of the change (r = +0.50) far more than with the duration it is given (r = +0.26).  Giving it
-    more time therefore does not help -- it fills the extra frames by coasting.
-
-    So bound the size instead.  Each hop is a normal 8-frame in-betweening of a small change, which is the
-    regime the model already handles well (measured peak 1.70 m/s^2 max for |dv| < 0.8, against 5.08 for
-    |dv| in 0.8-1.5).  Intermediate waypoints are velocities, NOT dwells: the robot passes through them
-    without ever holding one, so a stand -> run stays a single continuous transition rather than being
-    forced to spend time walking.
-
-    Returns ``[(velocity, stride_idx)]``, the last entry being the true destination.
-    """
-    v0, v1 = np.asarray(v0, np.float32), np.asarray(v1, np.float32)
-    dv = float(np.linalg.norm(v1[:2] - v0[:2]))
-    k = max(1, int(np.ceil(dv / max(ramp_dv, 1e-6))))
-    out = []
-    for i in range(1, k + 1):
-        w = v0 + (v1 - v0) * (i / k)
-        # Nearest bank stride, only to supply a plausible POSE for the waypoint; the velocity is the point.
-        j = int(np.argmin(np.linalg.norm(achieved - w[None], axis=1)))
-        out.append((w, j))
-    return out
-
-
-def _generate(mb, sb, flat_plan, strides, achieved, bank_dt: float, tr, seed: int, *,
-              a_max: float, alpha_max: float, floor_s: float, ramp_dv: float, slack: float):
-    """One transient -> ``(qpos[T,36], diag)`` at the MODEL's frame rate, trimmed at both ends.
-
-    A large velocity change is generated as several chained hops (see :func:`_ramp_waypoints`), each
-    context-seeded from the previous one's tail so the gait is continuous across them.
-    """
-    step = mb.dt / bank_dt
-    cmd = np.asarray(achieved[tr.stride_in], np.float32)          # where we are going
-    v0 = np.asarray(achieved[tr.stride_out] if tr.stride_out >= 0 else np.zeros(3), np.float32)
-    way = _ramp_waypoints(v0, cmd, ramp_dv, achieved)
-
-    mb.reset(seed)
-    kept_all, toks, mins = [], [], []
-    ctx_qpos, v_prev = None, v0
-    for j, (w, s_j) in enumerate(way):
-        last = (j == len(way) - 1)
-        s_use, ph_use = (tr.stride_in, tr.phase_in) if last else (s_j, 0)
-        mb.set_target_pose(sb.phase_window(strides[s_use], ph_use, mb.nfpt, step), kind="stride")
-        mb.set_regime(1.0, 0.0)                                   # the pose pin stays ON: it is the point
-        # A standing start needs real gait initiation (~1 s measured), so it keeps a larger floor than a
-        # hop that is already moving.
-        f_s = max(floor_s, 1.0) if (j == 0 and tr.stride_out < 0) else floor_s
-        n_min, n_max, t_min = mb_env.hop_tokens(mb, v_prev, w, a_max=a_max, alpha_max=alpha_max,
-                                               floor_s=f_s, slack=slack)
-        allowed = mb_env.allowed_tokens_mask(n_min, mb.min_tokens, mb.max_tokens, n_max=n_max)
-        if j == 0 and tr.stride_out < 0:
-            # The clip's opening transient: no outgoing loop, so start from the agent's own standing reset.
-            n = mb.prime(mb_env.walk_control(mb.context(), w, mb.lookahead_times, standing=True,
-                                             allowed_tokens=allowed))
-            seed_last = None
-        else:
-            ctx = (sb.phase_window(strides[tr.stride_out],
-                                   flat_plan.transient_context_phase(tr.phase_out, mb.nfpt, step),
-                                   mb.nfpt, step) if j == 0 else ctx_qpos)
-            seed_ctx = t.as_tensor(np.asarray(ctx, np.float32), dtype=t.float32,
-                                   device=mb.agent._device)[None]
-            n = mb.prime(mb_env.walk_control(seed_ctx, w, mb.lookahead_times, allowed_tokens=allowed))
-            seed_last = np.asarray(ctx[-1], np.float32)
-        frames = np.stack([mb.next_frame() for _ in range(int(n))], 0)
-        lead = 0 if seed_last is None else _seed_overlap(frames, seed_last, mb.nfpt) + 1
-        # The pinned target occupies the LAST nfpt frames.  On the final hop its first frame is the
-        # incoming stride's phase_in, which the exact loop supplies itself; on an intermediate hop the
-        # next hop re-predicts them from the seed.  Either way, drop them.
-        end = frames.shape[0] - mb.nfpt
-        if end - lead < 2:
-            raise RuntimeError(f"transient {tr.key} hop {j}: horizon {n} leaves {end - lead} frames")
-        keep = frames[lead:end]
-        kept_all.append(keep)
-        ctx_qpos, v_prev = keep[-mb.nfpt:], w
-        toks.append(int(n) // mb.nfpt); mins.append(int(n_min))
-    out = np.concatenate(kept_all, 0)
-    return out, {"tokens": int(np.median(toks)), "horizon": int(sum(toks) * mb.nfpt),
-                 "seed_overlap": lead, "hops": len(way), "kept": int(out.shape[0]),
-                 "cmd": [float(x) for x in cmd], "n_min": int(min(mins)), "t_min": float(t_min),
-                 "accel": float(np.linalg.norm(cmd[:2] - v0[:2]) / max(out.shape[0] / mb.fps, 1e-6))}
+def _is_stale(path: str, want: dict, raw_schema) -> str | None:
+    """``None`` if the transient on disk was generated with ``want``; else the first differing knob."""
+    try:
+        prov = dict(raw_schema.load_raw_motion(path).provenance or {})
+    except Exception:
+        return "unreadable"
+    for k in _GEN_KNOBS:
+        if k not in prov:
+            return f"{k} (not recorded)"
+        a, b = prov[k], want[k]
+        if isinstance(b, float) and isinstance(a, (int, float)):
+            if abs(float(a) - b) > 1e-9:
+                return f"{k}: {a} != {b}"
+        elif a != b:
+            return f"{k}: {a!r} != {b!r}"
+    return None
 
 
 def main() -> int:
@@ -204,18 +129,27 @@ def main() -> int:
     print(f"[flat_tr] bank {len(bank)} strides (dt={bank.dt}); {len(plans)} plans; {mb.describe()}")
 
     todo = [(pl, tr) for pl in plans for tr in pl.transients]
-    done = skipped = 0
+    want = _gen_params(args)
+    done = skipped = regen = 0
+    stale_why: dict[str, int] = {}
     tok, kept, overlaps, accels, bound, hops = [], [], [], [], [], []
     for i, (pl, tr) in enumerate(todo):
         out = os.path.join(args.out_dir, f"{tr.key}.npz")
         if os.path.exists(out):
-            skipped += 1
-            continue
-        qpos, diag = _generate(mb, sb, flat_plan, bank.strides, bank.achieved_vel, bank.dt, tr,
-                               seed=(args.seed * 2654435761 + i) % (2 ** 31),
-                               a_max=args.a_max, alpha_max=args.alpha_max,
-                               floor_s=args.min_transient_s, ramp_dv=args.ramp_dv,
-                               slack=args.hop_slack)
+            why = _is_stale(out, want, raw_schema)
+            if why is None:
+                skipped += 1
+                continue
+            # Named rather than counted: "38 stale" says a rebuild happened, "gen_version (not
+            # recorded)" says WHY, which is the difference between a knob you moved on purpose and a
+            # cache you did not know was old.
+            stale_why[why.split(":")[0]] = stale_why.get(why.split(":")[0], 0) + 1
+            regen += 1
+        qpos, diag = mb_transient.generate(
+            mb, sb, flat_plan, bank.strides, bank.achieved_vel, bank.dt, tr,
+            seed=(args.seed * 2654435761 + i) % (2 ** 31),
+            a_max=args.a_max, alpha_max=args.alpha_max,
+            floor_s=args.min_transient_s, ramp_dv=args.ramp_dv, slack=args.hop_slack)
         tvel = np.tile(np.asarray(diag["cmd"], np.float32), (qpos.shape[0], 1))
         raw_schema.save_raw_motion(out, raw_schema.RawMotion(
             mujoco_qpos=qpos.astype(np.float32), fps=mb.fps, joint_names=list(mb_env.G1_JOINT_NAMES),
@@ -223,14 +157,18 @@ def main() -> int:
             provenance={"backend": "motionbricks", "mode": "flat_transient", "clip": pl.name,
                         "key": tr.key, "stride_out": int(tr.stride_out), "phase_out": int(tr.phase_out),
                         "stride_in": int(tr.stride_in), "phase_in": int(tr.phase_in),
-                        "stride_bank": os.path.basename(args.stride_bank), **diag}))
+                        **want, **diag}))
         tok.append(diag["tokens"]); kept.append(diag["kept"]); overlaps.append(diag["seed_overlap"])
         accels.append(diag["accel"]); bound.append(diag["tokens"] <= diag["n_min"])
         hops.append(diag["hops"])
         done += 1
         if done % 50 == 0:
             print(f"[flat_tr]   {done}/{len(todo) - skipped} generated")
-    print(f"[flat_tr] done: {done} generated, {skipped} already present -> {args.out_dir}")
+    print(f"[flat_tr] done: {done} generated ({regen} of them REGENERATED as stale), "
+          f"{skipped} reused -> {args.out_dir}")
+    if stale_why:
+        print("[flat_tr]   stale because: "
+              + ", ".join(f"{k} x{n}" for k, n in sorted(stale_why.items())))
     if tok:
         u, c = np.unique(overlaps, return_counts=True)
         print(f"[flat_tr]   tokens chosen: p50={np.median(tok):.0f} min={min(tok)} max={max(tok)}"
