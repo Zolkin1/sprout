@@ -264,6 +264,34 @@ def _budget_loop(bank, budget: float, prov: dict, dt: float, dev: str, travelled
     return Piece(seg=(lrp, lrq, ljt), kind="loop", rigid=True, stride_idx=s_idx), n * speed * dt
 
 
+def apply_platform_trim(head: int, tail: int, arrays: list, bounds: list, per_frame: dict) -> tuple:
+    """Apply a ``_platform_trim`` cut to the motion, the segment bounds AND every per-frame channel.
+
+    Split out of :func:`clip_from_plan` because the per-frame half was missed once and the miss was
+    silent: ``stride_idx_t`` kept its pre-trim length, so on any clip the trim fired on the loop mask
+    was shifted by ``head`` and ran ``head + (n - tail)`` frames too long. Nothing downstream checks a
+    per-frame channel's length against the clip's, so the only symptom was mb_qc scoring the wrong
+    frames -- on exactly the clips the trim exists to salvage, i.e. the ones already in trouble.
+
+    Args:
+        head / tail: the cut, as returned by :func:`_platform_trim` (keep ``[head, tail)``).
+        arrays: per-frame tensors to slice (``Wp``, ``Wq``, ``Wj``).
+        bounds: ``[(start, end), ...]`` segment spans, re-based onto the cut.
+        per_frame: name -> per-frame tensor (or ``None``), sliced the same way.
+
+    Returns:
+        ``(arrays, bounds, per_frame)``, all cut.
+    """
+    n = int(arrays[0].shape[0])
+    head, tail = int(head), int(tail)
+    if head <= 0 and tail >= n:
+        return arrays, bounds, per_frame
+    arrays = [a[head:tail] for a in arrays]
+    bounds = [(max(0, a - head), max(0, min(b, tail) - head)) for a, b in bounds]
+    per_frame = {k: (None if v is None else v[head:tail]) for k, v in per_frame.items()}
+    return arrays, bounds, per_frame
+
+
 def _platform_trim(Wp: torch.Tensor, overlays: list[dict], bounds, plan) -> tuple[int, int]:
     """``(head, tail)`` slice keeping only frames where an ELEVATED segment is over a walkable box.
 
@@ -672,8 +700,9 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
     head, tail = _platform_trim(Wp, overlays, bounds, plan)
     if head > 0 or tail < Wp.shape[0]:
         diag["platform_trim"] = (int(head), int(Wp.shape[0] - tail))
-        Wp, Wq, Wj = Wp[head:tail], Wq[head:tail], Wj[head:tail]
-        bounds = [(max(0, a - head), max(0, min(b, tail) - head)) for a, b in bounds]
+        (Wp, Wq, Wj), bounds, _pf = apply_platform_trim(
+            head, tail, [Wp, Wq, Wj], bounds, {"stride_idx_t": diag.get("stride_idx_t")})
+        diag["stride_idx_t"] = _pf["stride_idx_t"]
 
     y, dy, contact = builder.build(Wp, Wq, Wj, dt)
     ta, tb = bounds[1]
@@ -722,8 +751,16 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                 for (a, b), surf in ((bounds[0], plan.approach_surf_z), (bounds[2], plan.exit_surf_z))
                 if b > a and (surf > 1e-3 or not has_floor))
     diag["off_surface_frames"] = n_off
+    # Every per-FRAME channel must be the clip's length. Cheap, and it is the check that would have
+    # caught stride_idx_t surviving _platform_trim at its pre-trim length -- a silent off-by-``head``
+    # that only mb_qc would ever have noticed, and only as slightly-wrong statistics.
+    _sidx = diag.get("stride_idx_t")
+    assert _sidx is None or int(_sidx.shape[0]) == T, (
+        f"stride_idx_t is {tuple(_sidx.shape)} for a {T}-frame clip; a per-frame channel was not "
+        f"sliced alongside the motion (see _platform_trim)")
+    assert int(amt.shape[0]) == T and int(tvel.shape[0]) == T, "anchor_mask_t / target_vel length"
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
-            "stride_idx_t": diag.get("stride_idx_t"),
+            "stride_idx_t": _sidx,
             "manifest": manifest, "bounds": bounds, "diag": diag, "overlays": overlays,
             "off_surface": n_off,
             "size_x": float(size_x), "size_y": float(size_y), "Wp": Wp, "n": T,
@@ -819,7 +856,14 @@ def _splice_clip(args, dev) -> int:
     writer.write_batch(0, {
         "y_des": y.unsqueeze(0), "dy_des": dy.unsqueeze(0), "contact": contact.unsqueeze(0),
         "skill_id": torch.zeros(1, T, dtype=torch.uint8),
-        "stride_idx": torch.full((1, T), -1, dtype=torch.int32),
+        # The clip's own loop mask, not a blanket -1. Writing -1 here discarded what the splice
+        # had just computed, so a one-clip debug library could not be QC'd the same way the batch
+        # one can: mb_qc saw no exact-loop frames, so the loop-exactness check and the internal
+        # loop<->transient seam detection both went quiet on precisely the library someone builds
+        # when they are already suspicious of a clip.
+        "stride_idx": (rec["stride_idx_t"].unsqueeze(0).to(torch.int32)
+                       if rec.get("stride_idx_t") is not None
+                       else torch.full((1, T), -1, dtype=torch.int32)),
         "target_vel": tvel.unsqueeze(0),
         "terrain_id": torch.tensor([int(plan.meta.get("terrain_id", 0))], dtype=torch.int32),
         "terrain_type": manifest["type"],

@@ -581,14 +581,21 @@ def main() -> int:
     with open(os.path.join(work, "requests.json"), "w") as f:
         json.dump({"config": cfg, "requests": list(requests.values())}, f, indent=1)
 
-    n_seg_naive = 2 * len(jobs)
+    # Segment references the jobs ACTUALLY make -- not 2 x clips. A one-sided box tile emits only
+    # the ground side, so the naive doubling counts sides that were never requested and then reports
+    # the difference as "reuse". Measured on the quick recipe it claimed 1.2x reuse where the true
+    # sharing was ZERO (52 references, 52 distinct keys), which is exactly backwards: it would mask
+    # a real reuse regression, and it invites the reader to conclude segment_reuse is leaking.
+    n_seg_refs = sum(1 for j in jobs for side in ("approach", "exit") if j.get(f"{side}_key"))
     tiles_with_clips = len({j["terrain_id"] for j in jobs})
     print(f"\n[mb_plan] {len(jobs)} clips over {tiles_with_clips}/{next_tid} tiles"
           + (f" ({skipped} clips SKIPPED)" if skipped else ""))
     for reason, n in sorted(skip_reasons.items(), key=lambda kv: -kv[1]):
         print(f"[mb_plan]   skipped {n:5d}: {reason}")
-    print(f"[mb_plan] MB segments: {len(requests)} unique of {n_seg_naive} requested "
-          f"({n_seg_naive / max(1, len(requests)):.1f}x reuse)")
+    _shared = n_seg_refs - len(requests)
+    print(f"[mb_plan] MB segments: {len(requests)} unique of {n_seg_refs} referenced"
+          + (f" ({n_seg_refs / max(1, len(requests)):.2f}x reuse)" if _shared
+             else " (no sharing -- one segment per clip side, as segment_reuse=false intends)"))
     for side in ("approach", "exit"):
         n = sum(1 for r in requests.values() if r["side"] == side)
         print(f"[mb_plan]   {side}: {n} unique")

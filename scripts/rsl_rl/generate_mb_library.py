@@ -94,14 +94,25 @@ def _resolve_mb_root(arg: str) -> str:
                      f"{tail} was found above {_REPO}. Pass --mb-root explicitly.")
 
 
-def _segments_pending(work: str) -> int:
-    """How many unique segments are still missing (0 = stage b's terrain half is done)."""
+def _segments_planned(work: str) -> int:
+    """How many unique segments stage a asked for (-1 = stage a has not run).
+
+    Deliberately NOT "how many are missing". This used to count absent files and skip the whole
+    segment stage when none were, which silently defeated ``mb_terrain_segments._is_stale``: that
+    check compares each segment's recorded generation knobs (and ``_GEN_VERSION``) against the
+    current ones and regenerates on a mismatch, and it can only do that if it RUNS. Gating on
+    existence meant a knob change -- or a bump of the very version counter that exists to force
+    regeneration -- reused every cached segment without a word. Measured: bumping _GEN_VERSION
+    4 -> 5 regenerated nothing.
+
+    So the stage is now always invoked when stage a has run, and the batch decides for itself
+    what to reuse. A pass with nothing to do costs one model load (~5 s), which is the price of
+    the staleness guard being real."""
     req = os.path.join(work, "requests.json")
     if not os.path.exists(req):
         return -1
     with open(req) as f:
-        reqs = json.load(f)["requests"]
-    return sum(0 if os.path.exists(os.path.join(work, r["out"])) else 1 for r in reqs)
+        return len(json.load(f)["requests"])
 
 
 def main() -> int:
@@ -173,7 +184,19 @@ def main() -> int:
             "--stair-floor-frac", str(cfg.stair_floor_frac),
             "--stair-float-frac", str(cfg.stair_float_frac),
             "--stair-float-thick-range", *(str(v) for v in cfg.stair_float_thick_range),
-            "--steady-approach-frac", str(cfg.steady_approach_frac)])
+            "--steady-approach-frac", str(cfg.steady_approach_frac),
+            "--approach-s-range", *(str(v) for v in cfg.approach_s_range),
+            "--exit-s-range", *(str(v) for v in cfg.exit_s_range),
+            "--duration-step", str(cfg.duration_step),
+            "--n-steps-range", *(str(int(v)) for v in cfg.n_steps_range),
+            "--tile-width-range", *(str(v) for v in cfg.tile_width_range),
+            "--entry-pick", cfg.entry_pick, "--exit-pick", cfg.exit_pick,
+            "--contact-tol", str(cfg.contact_tol),
+            "--footprint-margin", str(cfg.footprint_margin),
+            # null means "derive from the riser", which is the argparse default -- so pass the flag
+            # only when the recipe states a number. Sending "None" would be a parse error.
+            *([] if cfg.swing_clear is None else ["--swing-clear", str(cfg.swing_clear)]),
+            *([] if cfg.swing_band is None else ["--swing-band", str(cfg.swing_band)])])
     if stage in ("all", "a") and cfg.distractor_tiles > 0 \
             and not os.path.exists(os.path.join(_REPO, dis_sched)):
         _run("distract-plan", "mb_distractor_clips.py", dis_argv + ["--dump-schedules", dis_sched])
@@ -183,24 +206,17 @@ def main() -> int:
         mb_root = _resolve_mb_root(args.mb_root)
         args.mb_root = mb_root
         print(f"[mb] motionbricks root: {mb_root}")
-        pending = _segments_pending(os.path.join(_REPO, work))
-        if pending < 0:
+        planned = _segments_planned(os.path.join(_REPO, work))
+        if planned < 0:
             raise SystemExit(f"[segments] no requests.json in {work}; run stage a first")
-        if pending:
-            _run("segments", "mb_terrain_segments.py", [
-                "--mb-root", args.mb_root, "--stride-bank", bank,
-                "--requests", os.path.join(work, "requests.json"), "--work-dir", work,
-                "--pin-lead", str(cfg.pin_lead),
-                # Neither of these was reachable through this driver, so the ramp that decelerates
-                # an approach into the terrain could only be changed by editing
-                # mb_terrain_segments' defaults -- and its default ('hold') switches the ramp OFF.
-                "--pin-cmd", cfg.pin_cmd, "--ramp-s", str(cfg.ramp_s)]
-                + (["--bounded-approach", "--a-max", str(cfg.approach_a_max),
-                    "--min-transient-s", str(cfg.approach_min_transient_s),
-                    "--hop-slack", str(cfg.approach_hop_slack)] if cfg.bounded_approach else []),
-                conda_env=args.conda_env)
-        else:
-            print(f"\n===== [segments] all present, skipping")
+        _run("segments", "mb_terrain_segments.py", [
+            "--mb-root", args.mb_root, "--stride-bank", bank,
+            "--requests", os.path.join(work, "requests.json"), "--work-dir", work,
+            "--a-max", str(cfg.approach_a_max),
+            "--min-transient-s", str(cfg.approach_min_transient_s),
+            "--hop-slack", str(cfg.approach_hop_slack),
+            "--pin-future", cfg.pin_future],
+            conda_env=args.conda_env)
         flat_plans = os.path.join(work, "flat_plans.json")
         flat_tr = os.path.join(work, "flat_transients")
         if cfg.flat_loops:
@@ -265,9 +281,12 @@ def main() -> int:
         if not glob.glob(os.path.join(_REPO, fam_dir, "family_stairs_*.h5")):
             _run("assemble", "mb_assemble_library.py", [
                 "--work-dir", work, "--source", args.source, "--out-dir", fam_dir,
-                "--device", args.device, "--workers", str(args.workers)]
-                # The bank is how pass C replays the loop that covers a bounded approach's budget.
-                + (["--stride-bank", bank] if cfg.bounded_approach else []))
+                "--device", args.device, "--workers", str(args.workers),
+                # The bank is how pass C replays the loop that covers the approach's travel budget.
+                "--stride-bank", bank,
+                "--seams", cfg.seams, "--seam-blend-s", str(cfg.seam_blend_s),
+                "--weld-search", str(cfg.weld_search),
+                "--arrival-search", str(cfg.arrival_search)])
         # PURE stair tiles: no approach or exit, so Motion Bricks has nothing to in-between and
         # mb_plan_library hardcodes n_pure=0. They used to come from the DEPRECATED
         # generate_box_clips.py and be stapled on by hand with --extra-mix, which is how the first
@@ -286,7 +305,11 @@ def main() -> int:
                     "--stair-floor-frac", str(cfg.stair_floor_frac),
                     "--stair-float-frac", str(cfg.stair_float_frac),
                     "--stair-float-thick-range", *(str(v) for v in cfg.stair_float_thick_range),
-                    "--tile-seed", str(cfg.seed), "--device", args.device])
+                    "--tile-seed", str(cfg.seed), "--device", args.device,
+                    "--end-buffer", str(cfg.pure_end_buffer),
+                    "--tile-width-range", *(str(v) for v in cfg.pure_tile_width_range),
+                    "--n-steps-range", *(str(int(v)) for v in cfg.pure_n_steps_range),
+                    "--footprint-margin", str(cfg.pure_footprint_margin)])
         if cfg.flat_loops and not os.path.exists(os.path.join(_REPO, flat_h5)):
             _run("flat-clips", "mb_flat_clips.py", [
                 "--assemble", "--stride-bank", bank,
@@ -294,7 +317,9 @@ def main() -> int:
                 "--transient-dir", os.path.join(work, "flat_transients"),
                 "--source", args.source, "--out", flat_h5,
                 "--clip-length", str(cfg.flat_clip_length),
-                "--device", args.device, "--seed", str(cfg.seed)])
+                "--device", args.device, "--seed", str(cfg.seed),
+                "--seam-blend-s", str(cfg.flat_seam_blend_s),
+                "--flat-anchor", cfg.flat_anchor])
         elif not os.path.exists(os.path.join(_REPO, flat_h5)):
             _run("flat-clips", "generate_mb_clips.py", [
                 "--raw-dir", raw_flat, "--source", args.source, "--out", flat_h5,

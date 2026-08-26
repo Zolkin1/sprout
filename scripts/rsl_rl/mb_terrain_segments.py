@@ -8,18 +8,24 @@ written by ``mb_terrain_clips.py --dump-plan`` (which already placed the replay 
 entry / exit frames) and generates the two flat segments that bracket it -- the terrain half of the
 keyframe in-betweening:
 
-* **approach** -- steady locomotion (or a standing settle, on a box) that ramps to the replay's speed at the
-  entry frame.  With ``--approach-pin hard`` the target keyframe is switched from our optimized steady
-  stride to the REPLAY'S OWN FRAMES once the end of the approach comes inside Motion Bricks' planning
-  horizon, so the generated motion in-betweens into the entry pose (and, on stairs, starts rising with it)
-  and its last frame can be welded to the entry with no ease.  With ``soft`` the approach stays a free
-  steady walk and the seam is eased when the clip is spliced.
-* **exit** -- with ``--exit-pin hard``, Motion Bricks is CONTEXT-SEEDED with the replay's last frames, so
-  the walk-away starts ON the terrain and is continuous with it by construction; the command ramps from the
-  replay's exit speed back up to the steady walk-away.  With ``soft`` it is a free steady walk, eased in.
+Each side is ``[exact looped stride][bounded transient]``: the loop covers the plan's travel budget at
+the commanded speed and Motion Bricks in-betweens only the last stretch.  That is the ONLY path.
 
-Both segments are written as ordinary :class:`~motion_gen.motionbricks.raw_schema.RawMotion` files (with the
-pin mode in their provenance, so pass 2 splices them the way they were generated).  Runs in the
+* **approach** -- the loop walks the budget, then one bounded transient in-betweens from wherever the
+  gait is into the replay's entry pose, with the target keyframe switched from our optimized stride to
+  the REPLAY'S OWN FRAMES so the motion arrives moving (and, on stairs, already rising).
+* **exit** -- Motion Bricks is CONTEXT-SEEDED with the replay's last frames, so the walk-away starts ON
+  the terrain and is continuous with it by construction; then a loop at the commanded speed.  This is
+  functionally an ordinary flat transition whose initial condition happens to be a replay.
+
+There used to be a second, unbounded generator per side, selected by ``--approach-pin`` / ``--exit-pin``
+plus ``--bounded-approach``, with ``--ramp-s`` / ``--pin-cmd`` / ``--pin-lead`` / ``--pin-tail`` /
+``--pin-place`` / ``--pin-dist`` shaping it.  Every one of those was DEAD on any driver run (see
+``_emit_segment``) and they are gone.  ``pin`` survives only as a provenance/staleness field recording
+what a segment was generated as; it selects nothing.  TODO(pin-vestigial): drop it when the segment
+keying is restructured.
+
+Both segments are written as ordinary :class:`~motion_gen.motionbricks.raw_schema.RawMotion` files.  Runs in the
 ``motionbricks`` conda env; paths may be repo-relative (the harness resolves them before it has to ``chdir``
 into the Motion Bricks root, whose configs reference assets relatively)::
 
@@ -44,16 +50,6 @@ import mb_env  # noqa: E402
 from motion_gen.command_schedule import cmd_at, from_json  # noqa: E402
 
 
-# Width (m) over which the stride pose pin relaxes as the boundary comes into range, so the hand-over
-# to the terrain pin is a blend rather than a switch.
-_PIN_BLEND_M = 1.0
-
-# Seconds a STAND start spends getting into gait before it covers meaningful ground (measured on a
-# jump_on run-up: 0.30 m in the first 1.57 s).  Discounted from the anchor distance so the boundary is
-# placed somewhere the robot can actually reach.
-_ACCEL_TAX_S = 1.1
-
-
 def _schedule_of(plan):
     """The clip's command schedule, or ``None`` for a plan that predates it.
 
@@ -72,158 +68,6 @@ def _interaction_s(plan) -> float:
 def _sched_cmd(schedule, t_clip: float, fallback: float) -> float:
     """Forward command from ``schedule`` at CLIP time ``t_clip`` (``fallback`` when there is none)."""
     return float(fallback) if schedule is None else float(cmd_at(schedule, t_clip)[0])
-
-
-def _ramp(v0: float, v1: float, frac: float) -> float:
-    """Linear blend ``v0 -> v1`` at ``frac`` in ``[0, 1]`` (clamped)."""
-    a = min(max(float(frac), 0.0), 1.0)
-    return float(v0 + (v1 - v0) * a)
-
-
-def _generate_approach(mb: mb_env.MBAgent, targeter: mb_env.StrideTargeter, plan, *,
-                       pin: str, pin_future: bool, ramp_s: float, secs: float, seed: int,
-                       pin_lead: float | None = None, pin_tail: float = 0.5,
-                       start: str = "stand", place_pin: bool = True, hold_cmd: bool = False,
-                       pin_dist: float = 2.0):
-    """The approach segment: steady locomotion into the terrain entry pose.
-
-    The command holds ``plan.approach_vx`` and ramps to ``plan.entry_vx`` over the last ``ramp_s`` seconds
-    (the replay's own entry speed), so the hand-off is not a velocity step.  Under a HARD pin the target
-    pose switches from our steady stride to the REPLAY ITSELF for the last ``pin_lead`` seconds
-    (:meth:`TerrainPlan.approach_pin_window` reads the replay at the model's lookahead times), so the model
-    in-betweens toward the entry pose instead of walking flat into it.  Two details matter:
-
-    * The pin is a target at a ~1 s LOOKAHEAD, so it asks "be at the terrain pose one second from now".
-      Once the approach's end is inside that horizon the target walks forward into the replay's own future
-      (``pin_future``) -- which is what keeps the arrival MOVING at the entry velocity rather than settling
-      onto a frozen keyframe, and what an ASCENT wants.  Otherwise the target is HELD at the entry pose,
-      which is what a DESCENT (whose future drops below the platform) and an episodic boundary (whose future
-      is the takeoff itself) want -- see ``terrain_families.pin_future`` for the measured comparison.
-    * The model passes NEAR the pinned pose rather than landing on it at an exact frame, so ``pin_tail``
-      extra seconds are generated past the nominal arrival and the splice picks the best-matching frame
-      (:func:`~motion_gen.motionbricks.terrain_splice.match_arrival`).
-
-    ``start`` picks what the approach BEGINS from:
-
-    * ``"stand"`` -- the agent's reset (standing) state, so the clip opens with an acceleration run-up.
-    * ``"steady"`` -- CONTEXT-SEEDED from the matched steady stride (the same priming the exit uses), so the
-      robot is already travelling at the approach command on frame 0. This is the deployment case -- the
-      robot reaches terrain while walking -- and it stops the run-up from eating the clip at high speed.
-
-    Both are wanted in a library: a stand start teaches the approach-from-rest, a steady start teaches the
-    arrival at speed. The caller decides per clip (``mb_plan_library --steady-approach-frac``).
-
-    Returns ``(qpos[T,36], cmd[T,3])``.
-    """
-    mb.reset(seed)
-    targeter.reset_phase()                                 # gait phase is per-segment, not per stride index
-    horizon = float(mb.lookahead_times[0])
-    lead = horizon if pin_lead is None else float(pin_lead)
-    n_steps = max(2, int(round((secs + max(0.0, pin_tail)) * mb.fps)))
-    standing = plan.approach_mode == "stand"
-    # STEADY start: prime the buffer from a stride already moving at the approach command, so frame 0 is
-    # mid-gait rather than a stand.  The bank's strides are feet-at-zero at the MB frame rate, which is the
-    # frame every MB segment is generated in, so the seed needs no shifting (unlike the exit's, which comes
-    # off the terrain and is lowered by its surface height).  A STANDING approach (settling on a box top)
-    # has no steady state to seed from.
-    if start == "steady" and not standing:
-        cmd0 = np.array([float(plan.approach_vx), 0.0, 0.0], np.float32)
-        win = targeter.window(targeter.nearest(cmd0), advance=1)
-        mb.set_target_pose(win)
-        mb.set_regime(1.0, 0.0)
-        seed_ctx = t.as_tensor(np.asarray(win, np.float32), dtype=t.float32,
-                               device=mb.agent._device)[None]
-        mb.prime(mb_env.walk_control(seed_ctx, cmd0, mb.lookahead_times))
-    # WHERE the entry is, fixed once from the plan: this clip's share of the run-up the tile reserves, so
-    # the boundary sits that far ahead of wherever the segment starts.  A place, not a moving carrot.
-    #
-    # A STAND start spends its first ~_ACCEL_TAX_S seconds getting into gait and covers almost no ground
-    # (measured: 0.30 m of the first 1.57 s), so the nominal ``vx * secs`` is further than the robot can
-    # reach and it just sprints at an anchor it never arrives at -- which is how a 3 m/s jump_on run-up
-    # produced a 3.97 m/s seam.  Discount it.  A steady start is already at speed on frame 0 and needs no
-    # discount (measured: 3.15-3.18 m travelled against a 3.21 m anchor).
-    cx0, cy0, _cz0, cyaw0 = mb_env.cur_pose(mb.context())
-    reach_s = float(secs) - (_ACCEL_TAX_S if start == "stand" and not standing else 0.0)
-    d0 = float(plan.approach_vx) * max(0.2, reach_s)
-    entry_world = (cx0 + math.cos(cyaw0) * d0, cy0 + math.sin(cyaw0) * d0, cyaw0)
-    e_xy = plan.terrain_qpos[plan.entry_frame, 0:2]          # the entry in TILE coords, for the offsets below
-    c0, s0 = math.cos(cyaw0), math.sin(cyaw0)
-
-    def _target_at(t_offset: float):
-        """The boundary as a world pose, advanced ``t_offset`` s into the replay for a pin_future family.
-
-        A ``pin_future`` approach tracks the replay's FUTURE frames as its target POSE, so its target PLACE
-        has to advance with them -- otherwise the two disagree ("be at a frame further up the stairs, at
-        the entry's position"), which collapses stairs_up onto its measured "hold" behaviour (1.04 rad vs
-        0.66 for a proper future pin).  For a HOLD family the offset is 0 and this is just ``entry_world``.
-        """
-        if t_offset <= 0.0:
-            return entry_world
-        idx = np.array([plan.entry_frame + t_offset / float(plan.dt)])
-        r = mb_env.load_schema_module('terrain_plan').sample_qpos(plan.terrain_qpos, idx)[0]
-        dx, dy = float(r[0] - e_xy[0]), float(r[1] - e_xy[1])
-        return (entry_world[0] + c0 * dx - s0 * dy, entry_world[1] + s0 * dx + c0 * dy, cyaw0)
-
-    schedule = _schedule_of(plan)
-    qpos_stream, cmd_stream = [], []
-    pin_on = False
-    for step in range(n_steps):
-        t_now = step * mb.dt
-        t_left = secs - t_now
-        # With the boundary pinned as a PLACE, the ramp is the redundant half: the target no longer
-        # travels with the robot, so the gap -- and with it the speed -- closes because the robot
-        # arrives.  ``hold_cmd`` drops the ramp and lets the geometry do it.
-        # Track the COMMAND the RL will see, and let the terrain override it only for the last
-        # ``ramp_s`` before the boundary -- outside that window there is no terrain reason for the
-        # motion to deviate, and a motion that ignores the command on flat ground teaches the policy
-        # that the command is noise exactly where it should be followed exactly.
-        sched_vx = _sched_cmd(schedule, t_now, plan.approach_vx)
-        if standing:
-            vx = 0.0
-        elif hold_cmd:
-            vx = sched_vx
-        elif t_left > ramp_s:
-            vx = sched_vx                                     # outside the override window
-        else:
-            vx = _ramp(sched_vx, plan.entry_vx, 1.0 - t_left / max(1e-6, ramp_s))
-        cmd = np.array([vx, 0.0, 0.0], np.float32)
-        # Hand over to the terrain pin on PROXIMITY, not on a stopwatch: the run-up should be driven by our
-        # steady stride until the boundary is actually close.  ``pin_lead`` stays as a floor so the pin
-        # always engages for the last stretch even if the robot never closes the distance (it stalls, or
-        # the placement over-reached).  Latched -- once handed over, never hand back.
-        cx, cy, _cz, _cyaw = mb_env.cur_pose(mb.context())
-        dist = math.hypot(entry_world[0] - cx, entry_world[1] - cy)
-        pin_on = pin_on or (dist <= pin_dist) or (t_left <= lead)
-        if pin == "hard" and pin_on:
-            # ``t_offset`` is where the FIRST lookahead frame falls relative to the entry: negative while
-            # the arrival is still beyond the horizon (clamped to the entry pose), then walking forward into
-            # the replay once it is inside.
-            t_offset = horizon - t_left
-            if not pin_future:
-                t_offset = min(0.0, t_offset)
-            # ``pin_future=False`` means HOLD the entry, so pin exactly that one keyframe -- clamping
-            # t_offset alone left the window's tail sliding forward into the replay (see
-            # TerrainPlan.approach_pin_window).
-            mb.set_target_pose(plan.approach_pin_window(t_offset, mb.nfpt, mb.dt, hold=not pin_future),
-                               kind="terrain")
-            mb.set_regime(1.0, t_now)                      # keep the pose pin ON through the hand-off
-        else:
-            mb.set_target_pose(targeter.window(targeter.nearest(cmd), advance=1))
-            # Relax the stride pose pin as the boundary comes within reach, so the model blends into the
-            # terrain pin instead of switching to it cold.  Same smoothstep as before, just measured in
-            # METRES now that the hand-over is a distance -- full pin a blend-width out, released at the
-            # switch.
-            mb.set_regime(mb_env.regime_weight([pin_dist], dist, ramp_s=_PIN_BLEND_M), t_now)
-        qpos = mb.next_frame()
-        # Under the pin, aim at the boundary's PLACE; before it, the ordinary command rollout.
-        tgt = _target_at(t_offset if (pin == 'hard' and pin_on and pin_future) else 0.0) \
-            if (pin == "hard" and pin_on and place_pin) else None
-        mb.step(mb_env.walk_control(mb.context(), cmd, mb.lookahead_times,
-                                    standing=standing or None, target=tgt))
-        qpos_stream.append(qpos)
-        cmd_stream.append(cmd)
-    return np.stack(qpos_stream, 0), np.stack(cmd_stream, 0)
-
 
 
 def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: float, alpha_max: float,
@@ -378,104 +222,36 @@ def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float
                        "tokens": int(n) // mb.nfpt, "travel": travel, "bounded": True}
 
 
-def _generate_exit(mb: mb_env.MBAgent, targeter: mb_env.StrideTargeter, plan, *,
-                   pin: str, ramp_s: float, secs: float, seed: int):
-    """The exit segment: locomotion away from the terrain exit pose (or a standing hold, on a box top).
-
-    Under a HARD pin the agent is CONTEXT-SEEDED with the replay's last frames
-    (:meth:`TerrainPlan.exit_seed_window`), so the walk-away continues FROM the terrain rather than being
-    stitched onto it.  The seed is translated so the exit SURFACE sits at z = 0 (see below), which is also
-    the frame every other Motion Bricks segment lives in, so the splice grounds / welds it the same way.
-    Under a SOFT pin there is no seed at all -- an ordinary steady flat segment, placed and eased.
-
-    Motion Bricks' height prior is ABSOLUTE (it generates for a floor at z = 0), so seeding it with a pose
-    1.2 m up on a box makes the model walk back DOWN to its ~0.78 m pelvis height -- the walk-away sinks
-    through the platform (measured: -0.12 m over 2.5 s on a stair top platform).  Shifting the seed down by
-    the surface height is a rigid translation of the history, so continuity with the replay is untouched,
-    but the prior is now correct and the segment stays on its (virtual) ground.
-
-    The command ramps from the replay's signed exit speed up to ``plan.exit_vx`` over ``ramp_s`` seconds
-    (the mirror of the approach ramp), so the walk-away ends up tracking the steady command the RL sees.
-
-    Returns ``(qpos[T,36], cmd[T,3])``.
-    """
-    mb.reset(seed)
-    targeter.reset_phase()                                 # gait phase is per-segment, not per stride index
-    schedule = _schedule_of(plan)
-    n_steps = max(2, int(round(secs * mb.fps)))
-    standing = plan.exit_mode == "stand"
-
-    def _cmd_at(t_now: float) -> np.ndarray:
-        # No ramp on the exit: the walk-away should follow the command from its first frame. The
-        # old exit_speed -> exit_vx ramp made a slow command look like a deceleration bleeding out
-        # of the terrain, which reads as "the robot is still reacting to the stairs" when it is
-        # simply being asked to walk slowly. The replay's terminal velocity still has to be
-        # absorbed, so the motion lags the command briefly -- that is a real tracking transient,
-        # not a commanded slowdown.
-        t_clip = float(plan.approach_s) + _interaction_s(plan) + t_now
-        vx = 0.0 if standing else _sched_cmd(schedule, t_clip, plan.exit_vx)
-        return np.array([vx, 0.0, 0.0], np.float32)
-
-    def _pose_for(cmd: np.ndarray) -> np.ndarray:
-        return targeter.window(targeter.nearest(cmd), advance=1)
-
-    if pin == "hard":
-        # PRIME: force one generation whose context IS the replay's exit window (surface -> z=0) -> the
-        # buffer becomes the walk-away continuing from the terrain (``next_frame`` then pops those frames).
-        win = plan.exit_seed_window(mb.nfpt, mb.dt)
-        win[:, 2] -= float(plan.exit_surf_z)
-        seed_ctx = t.as_tensor(win, dtype=t.float32, device=mb.agent._device)[None]
-        cmd0 = _cmd_at(0.0)
-        mb.set_target_pose(_pose_for(cmd0), kind="stride")
-        mb.set_regime(1.0, 0.0)
-        mb.prime(mb_env.walk_control(seed_ctx, cmd0, mb.lookahead_times, standing=standing or None))
-
-    qpos_stream, cmd_stream = [], []
-    for step in range(n_steps):
-        t_now = step * mb.dt
-        cmd = _cmd_at(t_now)
-        # ALWAYS the stride: unlike the approach, the exit never pins a terrain pose -- it is
-        # context-SEEDED from the replay instead, so continuity is in the history, not the target.
-        mb.set_target_pose(_pose_for(cmd), kind="stride")
-        mb.set_regime(mb_env.regime_weight([ramp_s], t_now), t_now)
-        qpos = mb.next_frame()
-        mb.step(mb_env.walk_control(mb.context(), cmd, mb.lookahead_times, standing=standing or None))
-        qpos_stream.append(qpos)
-        cmd_stream.append(cmd)
-    return np.stack(qpos_stream, 0), np.stack(cmd_stream, 0)
-
-
 def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, out: str,
                   args, raw_schema, quiet: bool = False, plan_path: str | None = None,
                   start: str = "stand") -> str:
     """Generate ONE segment (``side`` of ``plan``) and write it as a ``RawMotion``; returns the path."""
     seed = (args.seed * (1 + (side == "exit")) * 2333) % (2 ** 32 - 1)
     extra: dict = {}
-    if side == "approach" and args.bounded_approach and float(getattr(plan, "approach_dist", 0.0)) > 0.0 \
-            and plan.approach_mode != "stand":
-        # BOUNDED: an exact looped stride covers the distance and Motion Bricks only bridges the last
-        # stretch.  Needs a travel budget in the plan (pass A) and a moving approach to seed from.
+    # BOUNDED is the only path. An exact looped stride covers the travel budget and Motion Bricks
+    # only bridges the last stretch, so a segment is [exact loop][transient] on either side.
+    #
+    # There used to be a second, unbounded pair of generators here, selected by --bounded-approach
+    # plus a per-plan mode/distance test. They were DEAD on every driver run and had been for some
+    # time: every family in FAMILIES is approach_mode == exit_mode == "walk", approach_dist and
+    # exit_dist are both positive by construction (duration x speed), --exit-pin defaults to "hard",
+    # and both shipped recipes set bounded_approach: true. So the guards always passed and the
+    # legacy arms were unreachable -- which means --ramp-s, --pin-cmd, --pin-lead, --pin-tail,
+    # --pin-place and --pin-dist did NOTHING, including the recipe's `pin_cmd: ramp`. The measured
+    # -6.8 -> -2.7 m/s^2 entry-deceleration improvement that knob is credited with came from the
+    # bounded rewrite itself, not from the knob. Deleting them is what makes the recipe's central
+    # claim -- that a stated parameter is a parameter that acts -- true again.
+    if side == "approach":
         pin_future = family.pin_future if args.pin_future == "auto" else (args.pin_future == "on")
         qpos, cmd, extra = _generate_approach_bounded(
             mb, targeter, plan, pin_future=pin_future, a_max=args.a_max, alpha_max=args.alpha_max,
             floor_s=args.min_transient_s, slack=args.hop_slack, seed=seed)
-    elif side == "approach":
-        pin_future = family.pin_future if args.pin_future == "auto" else (args.pin_future == "on")
-        qpos, cmd = _generate_approach(mb, targeter, plan, pin=pin, pin_future=pin_future,
-                                       ramp_s=args.ramp_s, secs=secs, seed=seed,
-                                       pin_lead=args.pin_lead, pin_tail=args.pin_tail, start=start,
-                                       place_pin=(not family.periodic if args.pin_place == 'auto'
-                                                  else args.pin_place == 'terrain'),
-                                       hold_cmd=(args.pin_cmd == 'hold'),
-                                       pin_dist=args.pin_dist)
-    elif args.bounded_approach and float(getattr(plan, "exit_dist", 0.0)) > 0.0 \
-            and plan.exit_mode != "stand" and pin == "hard":
-        # Bounded exit needs a context to seed from, which only the hard (context-seeded) pin provides.
+    else:
+        # The exit is context-SEEDED from the terrain, which is what makes it an ordinary flat
+        # transition whose initial condition happens to be a replay.
         qpos, cmd, extra = _generate_exit_bounded(
             mb, targeter, plan, a_max=args.a_max, alpha_max=args.alpha_max,
             floor_s=args.min_transient_s, slack=args.hop_slack, seed=seed)
-    else:
-        qpos, cmd = _generate_exit(mb, targeter, plan, pin=pin, ramp_s=args.ramp_s, secs=secs, seed=seed)
     motion = raw_schema.RawMotion(
         mujoco_qpos=qpos, fps=mb.fps, joint_names=list(mb_env.G1_JOINT_NAMES),
         target_vel=cmd, kind="terrain",
@@ -484,7 +260,15 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, 
                     # splice grounds / welds both sides identically; ``seeded`` says whether Motion
                     # Bricks was context-seeded from the terrain (its output then opens by re-predicting
                     # the seed frames, which the splice skips).
-                    "frame": "flat", "seeded": bool(side == "exit" and pin == "hard"),
+                    # ``seeded`` is a fact about the GENERATOR, not a knob: _generate_exit_bounded
+                    # always context-seeds from the terrain, so every exit re-predicts its seed
+                    # frames and the splice must skip that overlap. It used to read
+                    # ``side == "exit" and pin == "hard"``, which was equivalent only because the
+                    # pin ALSO selected the generator. With the bounded path now unconditional,
+                    # deriving it from the pin would let --exit-pin soft produce a seeded exit
+                    # labelled unseeded -- the splice would then keep the re-predicted frames and
+                    # the exit would open by replaying the terrain's last stride.
+                    "frame": "flat", "seeded": bool(side == "exit"),
                     "start": start if side == "approach" else "",
                     "skill": plan.skill, "seed": int(seed),
                     "plan": os.path.abspath(plan_path) if plan_path else "",
@@ -492,13 +276,10 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, 
                     # resume so a settings change regenerates instead of silently reusing a stale segment
                     # (they are NOT in the request key, which only describes WHAT to reach, not HOW).
                     "gen_version": _GEN_VERSION,
-                    "bounded_approach": bool(args.bounded_approach), "a_max": float(args.a_max),
+                    "a_max": float(args.a_max),
                     "alpha_max": float(args.alpha_max),
                     "min_transient_s": float(args.min_transient_s), "hop_slack": float(args.hop_slack),
-                    "secs": secs, "ramp_s": args.ramp_s, "pin_future": args.pin_future,
-                    "pin_lead": args.pin_lead, "pin_tail": args.pin_tail,
-                    "pin_place": args.pin_place, "pin_cmd": args.pin_cmd,
-                    "pin_dist": args.pin_dist,
+                    "secs": secs, "pin_future": args.pin_future,
                     # BASENAME, because that is what ``_gen_params`` compares -- the driver absolutizes the
                     # path, so comparing the full one would mark every segment stale after a work-dir move.
                     # The resolved path is kept alongside for provenance only.
@@ -520,8 +301,7 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, 
 
 # Generation knobs that change the MOTION for the same request. The key deliberately does not include
 # them (it says which boundary pose to reach and at what command), so resume compares them explicitly.
-_GEN_KNOBS = ("gen_version", "stride_bank", "ramp_s", "pin_future", "pin_lead", "pin_tail", "start",
-              "secs", "pin", "pin_place", "pin_cmd", "pin_dist", "bounded_approach", "a_max",
+_GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "secs", "pin", "a_max",
               "alpha_max", "min_transient_s", "hop_slack")
 
 # Bump when the GENERATOR changes what it produces for identical knobs -- a CLI flag is comparable, code
@@ -529,9 +309,14 @@ _GEN_KNOBS = ("gen_version", "stride_bank", "ramp_s", "pin_future", "pin_lead", 
 # knob, so the invalidation is one greppable line rather than a manual ``rm -rf segments/``.
 #   2: StrideTargeter walks the pinned stride at the MB frame rate (was 0.6x) and wraps on the true
 #      period F-1 (was F-nfpt, skipping nfpt-1 frames per cycle).
-#   3: the approach can be a BOUNDED transient seeded from an exact stride (--bounded-approach), so the
-#      same request no longer describes the same motion.
-_GEN_VERSION = 4
+#   3: the approach can be a BOUNDED transient seeded from an exact stride, so the same request no
+#      longer describes the same motion.
+#   4: (superseded)
+#   5: the bounded path is the ONLY path. The unbounded generators and the --ramp-s / --pin-cmd /
+#      --pin-lead / --pin-tail / --pin-place / --pin-dist knobs are gone -- they were dead on every
+#      driver run, so no segment on disk was ever produced by them, but the knob set they were
+#      compared against changed and a stale dict must not compare equal to the new one.
+_GEN_VERSION = 5
 
 
 def _gen_params(args, side: str, pin: str, secs: float, start: str) -> dict:
@@ -542,13 +327,10 @@ def _gen_params(args, side: str, pin: str, secs: float, start: str) -> dict:
     that matters (a different bank).
     """
     return {"gen_version": _GEN_VERSION, "stride_bank": os.path.basename(args.stride_bank),
-            "bounded_approach": bool(args.bounded_approach), "a_max": float(args.a_max),
-            "alpha_max": float(args.alpha_max), "min_transient_s": float(args.min_transient_s),
-            "hop_slack": float(args.hop_slack),
-            "ramp_s": args.ramp_s, "pin_future": args.pin_future, "pin_lead": args.pin_lead,
-            "pin_tail": args.pin_tail, "start": start if side == "approach" else "",
-            "secs": float(secs), "pin": pin, "pin_place": args.pin_place,
-            "pin_cmd": args.pin_cmd, "pin_dist": args.pin_dist}
+            "a_max": float(args.a_max), "alpha_max": float(args.alpha_max),
+            "min_transient_s": float(args.min_transient_s), "hop_slack": float(args.hop_slack),
+            "pin_future": args.pin_future, "start": start if side == "approach" else "",
+            "secs": float(secs), "pin": pin}
 
 
 def _is_stale(path: str, want: dict, raw_schema) -> str | None:
@@ -639,11 +421,6 @@ def main() -> int:
                         "soft: free steady walk (placed + eased at splice time).")
     p.add_argument("--approach-s", type=float, default=None, help="Override the plan's approach duration (s).")
     p.add_argument("--exit-s", type=float, default=None, help="Override the plan's exit duration (s).")
-    p.add_argument("--ramp-s", type=float, default=0.8,
-                   help="Command ramp between the steady command and the terrain boundary speed (s).")
-    p.add_argument("--pin-lead", type=float, default=None,
-                   help="[hard approach] how long before the arrival the terrain pose pin engages (s); "
-                        "default = the model's planning horizon (~1 s). Longer = more replans under the pin.")
     p.add_argument("--pin-future", default="auto", choices=["auto", "on", "off"],
                    help="[hard approach] once the arrival is inside the planning horizon, track the replay's "
                         "own FUTURE frames (on) or hold the entry pose (off). auto = the family's own "
@@ -653,24 +430,6 @@ def main() -> int:
                    help="[single-plan] what the approach begins from: 'stand' (reset, run-up) or 'steady' "
                         "(context-seeded from the matched stride, already at the command). In batch mode "
                         "this comes per request from mb_plan_library --steady-approach-frac.")
-    p.add_argument("--pin-place", default="auto", choices=["auto", "terrain", "command"],
-                   help="[hard approach] WHERE the model is told the boundary is. 'terrain' pins the "
-                        "entry as a fixed world pose taken from the plan (the boundary is a place). "
-                        "'command' is the legacy behaviour: the target is re-derived every replan as "
-                        "robot_pose + command * lookahead_horizon, so it slides along with the robot and "
-                        "the terrain's real location never reaches the model. 'auto' (default) picks per "
-                        "family -- EPISODIC interactions get 'terrain' because a box has one takeoff point "
-                        "the approach must hit, PERIODIC ones get 'command' because a stair traversal "
-                        "re-anchors onto whichever tread its entry frame lands on (boundary_candidates "
-                        "picks that frame from several equally good ones), so a fixed position "
-                        "over-constrains it. Measured on one clip per family, approach joint_res: "
-                        "stairs_up 0.709 cmd / 0.846 terrain, stairs_down 0.563 / 0.945, "
-                        "jump_on 0.496 terrain (2.198 before the reachable-anchor fix).")
-    p.add_argument("--bounded-approach", action="store_true",
-                   help="Generate the approach as a BOUNDED transient seeded from an exact steady stride, "
-                        "with pass C prepending the loop that covers the plan's travel budget. The old "
-                        "duration-driven run-up did not track its command (measured 78%% overspeed), which "
-                        "is how 41%% of jump_on walked off its platform.")
     p.add_argument("--a-max", type=float, default=2.0,
                    help="Max planar acceleration (m/s^2) a bounded transient may demand.")
     p.add_argument("--alpha-max", type=float, default=2.0, help="Max yaw acceleration (rad/s^2).")
@@ -678,25 +437,6 @@ def main() -> int:
                    help="Absolute floor on a bounded transient's kept duration (s).")
     p.add_argument("--hop-slack", type=float, default=1.3,
                    help="How much longer than the acceleration bound requires a transient may take.")
-    p.add_argument("--pin-dist", type=float, default=2.0,
-                   help="[hard approach] hand over from the steady stride to the terrain pin once the "
-                        "boundary is within this many metres. Proximity rather than a stopwatch: the "
-                        "run-up should be driven by our optimized stride until the terrain is actually "
-                        "close. --pin-lead remains a FLOOR, so the pin still engages for the last "
-                        "stretch if the robot never closes the distance. Only meaningful with "
-                        "--pin-place terrain, which is what makes the boundary a known location.")
-    p.add_argument("--pin-cmd", default="hold", choices=["ramp", "hold"],
-                   help="[hard approach] the command under the pin. 'ramp' decelerates to the entry "
-                        "speed; 'hold' keeps the steady approach command and lets --pin-place terrain "
-                        "supply the deceleration (the gap to a FIXED boundary closes on arrival).")
-    p.add_argument("--pin-tail", type=float, default=1.0,
-                   help="[hard approach] extra seconds generated past the nominal arrival, so pass 2 can pick "
-                        "the frame that actually matches the entry pose. With --pin-place terrain the arrival "
-                        "time is EMERGENT (the robot gets there when it gets there), so it needs room to land "
-                        "and settle into the boundary pose: measured on a jump_on approach, 0.5 s arrives still "
-                        "moving at 0.38 m/s against an entry speed of 0.10, while 1.0 s lands at 0.15. 2.0 s is "
-                        "identical to 1.0, so it has converged. The extra frames cost generation time only -- "
-                        "the splice cuts them at the matched arrival.")
     p.add_argument("--tag", default="", help="Suffix for the output filenames (e.g. the pin combination).")
     p.add_argument("--side", default="both", choices=["both", "approach", "exit"],
                    help="Generate only one side (e.g. to re-roll a seam without redoing the other).")

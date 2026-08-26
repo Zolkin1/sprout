@@ -27,8 +27,12 @@ from types import SimpleNamespace
 
 import yaml
 
-# key -> (kind, arity). kind: "float" | "int" | "bool" | "str" | "range" | "ints" | "choice".
-# A "range" is a 2-list validated as lo <= hi; "ints" is a fixed-length int list.
+# key -> (kind, arity). kind: "float" | "int" | "bool" | "str" | "range" | "int_range" | "ints"
+# | "choice" | "float_or_null".
+# A "range" is a 2-list of floats validated as lo <= hi; "int_range" is the same for ints (a
+# transposed step-count range is exactly the silent error this loader exists to catch); "ints" is a
+# fixed-length int list with no ordering; "float_or_null" is a number or an explicit null, for a
+# knob whose None means "derive it" rather than "unset".
 _SCHEMA: dict[str, tuple] = {
     "seed": ("int", 1),
     # scale
@@ -53,6 +57,38 @@ _SCHEMA: dict[str, tuple] = {
     "stair_float_frac": ("float", 1),
     "stair_float_thick_range": ("range", 2),
     "pure_seconds": ("float", 1),
+    # ---- pass A: terrain tile geometry + boundary-frame selection.
+    # These shape the tile POPULATION and the gait phase every clip hands off at, so they are
+    # distribution parameters in the same sense the velocity bands are. They reached a build only
+    # through mb_plan_library's own argparse defaults, which is what this file exists to prevent.
+    "approach_s_range": ("range", 2),
+    "exit_s_range": ("range", 2),
+    "duration_step": ("float", 1),
+    "n_steps_range": ("int_range", 2),
+    "tile_width_range": ("range", 2),
+    "entry_pick": ("choice", ("first", "middle", "last", "sample")),
+    "exit_pick": ("choice", ("first", "middle", "last")),
+    "contact_tol": ("float", 1),
+    "swing_clear": ("float_or_null", 1),
+    "swing_band": ("float_or_null", 1),
+    "footprint_margin": ("float", 1),
+    # ---- pass C: the splice
+    "seams": ("choice", ("ease", "weld", "auto")),
+    "seam_blend_s": ("float", 1),
+    "weld_search": ("int", 1),
+    "arrival_search": ("int", 1),
+    # ---- pure stair tiles. SEPARATE keys, because the matcher-free path ships DIFFERENT
+    # geometry defaults from the transition path -- width (1.0, 1.6) against (0.8, 1.2) and
+    # (4, 10) steps against (3, 7). One shared key would have silently changed one of them.
+    "pure_end_buffer": ("int", 1),
+    "pure_tile_width_range": ("range", 2),
+    "pure_n_steps_range": ("int_range", 2),
+    "pure_footprint_margin": ("float", 1),
+    # ---- flat family assembly
+    "flat_seam_blend_s": ("float", 1),
+    "flat_anchor": ("str", 1),
+    # ---- segment generation
+    "pin_future": ("choice", ("auto", "on", "off")),
     # box families
     "box_vel_range": ("range", 2),
     "box_approach_s_range": ("range", 2),
@@ -64,13 +100,9 @@ _SCHEMA: dict[str, tuple] = {
     "backward_vx_max": ("float", 1),
     # shared terrain
     "steady_approach_frac": ("float", 1),
-    "pin_lead": ("float", 1),
-    "pin_cmd": ("choice", ("ramp", "hold")),
-    "ramp_s": ("float", 1),
     # BOUNDED approach: an exact looped stride covers the tile's travel budget and Motion Bricks only
     # bridges the last stretch. The duration-driven run-up it replaces did not track its command
     # (measured 78% overspeed), which is how 41% of jump_on walked off its platform.
-    "bounded_approach": ("bool", 1),
     # FLAT via exact looped strides + bounded Motion Bricks transients. The old path had Motion Bricks
     # generate the whole clip, which tracked the commanded speed to ~0.10 m/s; the loops make steady
     # state exact and leave the model only the transitions.
@@ -126,6 +158,21 @@ def _check(key: str, kind: str, arity, val):
         if any(isinstance(v, bool) or not isinstance(v, int) for v in val):
             raise ValueError(f"{where}: expected integers, got {val!r}")
         return [int(v) for v in val]
+    if kind == "float_or_null":
+        if val is None:
+            return None
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            raise ValueError(f"{where}: expected a number or null, got {val!r}")
+        return float(val)
+    if kind == "int_range":
+        if not isinstance(val, (list, tuple)) or len(val) != 2:
+            raise ValueError(f"{where}: expected a [min, max] pair, got {val!r}")
+        if any(isinstance(v, bool) or not isinstance(v, int) for v in val):
+            raise ValueError(f"{where}: expected two integers, got {val!r}")
+        lo, hi = int(val[0]), int(val[1])
+        if lo > hi:
+            raise ValueError(f"{where}: min {lo} > max {hi} -- bounds transposed?")
+        return [lo, hi]
     if kind == "range":
         if not isinstance(val, (list, tuple)) or len(val) != 2:
             raise ValueError(f"{where}: expected a [min, max] pair, got {val!r}")

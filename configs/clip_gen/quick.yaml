@@ -58,19 +58,12 @@ backward_vx_max: 1.0
 
 # ---------------------------------------------------------------- shared terrain knobs
 steady_approach_frac: 0.5
-pin_lead: 1.0
-pin_cmd: ramp                   # 'ramp' decelerates the approach command to the terrain's entry
-                                # speed; 'hold' keeps the steady command and assumes arriving at a
-                                # fixed boundary sheds the speed by itself. MEASURED false: under
-                                # 'hold' the approach reaches the stairs at 2.4 m/s against a replay
-                                # starting near 0.7, a -12 m/s^2 velocity discontinuity at the splice
-bounded_approach: true      # exact loop + bounded transient approach
+# The approach/exit are always [exact loop][bounded transient]; there is no other
+# path, so there is no bounded_approach switch. The --ramp-s / --pin-cmd / --pin-lead
+# knobs that used to sit here were inert on every driver run and are deleted.
 approach_a_max: 2.0
 approach_min_transient_s: 0.35
 approach_hop_slack: 1.3
-ramp_s: 1.5                     # seconds to bleed the approach command down to the entry speed. 0.8
-                                # cannot shed ~2 m/s at any rate a walking robot achieves; the
-                                # measured speed-change response is ~1.5 s
 
 # ---------------------------------------------------------------- RL-visible command
 rl_cmd_vary: false
@@ -80,6 +73,51 @@ segment_reuse: false            # share a generated MB segment between clips wit
                                 # interchangeable if their whole schedules match, and ~1.5x the
                                 # segment cost buys "every clip's motion was generated for it"
 rl_vels: raw
+
+# ---------------------------------------------------------------- terrain tile geometry (pass A)
+# The tile POPULATION and the gait phase each clip hands off at. Distribution parameters in the
+# same sense the velocity bands are -- these used to reach a build only through mb_plan_library's
+# argparse defaults, i.e. from a second place, which is the thing this file exists to prevent.
+approach_s_range: [1.5, 3.5]     # s of approach per tile, quantized to duration_step
+exit_s_range: [1.5, 3.5]
+duration_step: 0.5               # quantization, so segments can be shared between clips
+n_steps_range: [3, 7]            # treads per TRANSITION stair tile
+tile_width_range: [0.8, 1.2]     # corridor width (m) per transition tile
+entry_pick: sample               # which boundary-gate candidate the terrain entry hands off at.
+                                 # 'sample' varies the gait phase per clip; a fixed preference
+                                 # gives every clip sharing a reference the identical hand-off pose
+exit_pick: first                 # stop as soon as a foot lands on the far surface -- never onto a
+                                 # phantom tread past the end of the tile
+contact_tol: 0.02                # m; sole-to-surface tolerance for a boundary candidate
+swing_clear: null                # m; null derives it from the riser (min(0.05, 0.5*riser))
+swing_band: null                 # m; null derives it from the riser (max(0.5*riser, clear+0.05))
+footprint_margin: 1.0            # m added on all four sides of a tile's footprint
+
+# ---------------------------------------------------------------- the splice (pass C)
+seams: ease                      # 'ease' inertializes the seam residual, 'weld' takes it rigidly,
+                                 # 'auto' follows whatever stage 1 pinned for. A PINNED segment
+                                 # spliced EASED is the measured best of the three
+seam_blend_s: 0.25               # ease window (s) for terrain seams
+weld_search: 12                  # frames searched for the best weld frame
+arrival_search: 60               # trailing approach frames searched for the in-betweened arrival
+
+# ---------------------------------------------------------------- pure stair tiles
+# SEPARATE keys from the transition ones on purpose: the matcher-free path ships DIFFERENT
+# geometry -- width (1.0, 1.6) against (0.8, 1.2), and (4, 10) treads against (3, 7). Sharing one
+# key would have silently changed one of the two populations.
+pure_end_buffer: 3               # treads of run-off kept past the traversal's end
+pure_tile_width_range: [1.0, 1.6]
+pure_n_steps_range: [4, 10]
+pure_footprint_margin: 1.0
+
+# ---------------------------------------------------------------- flat family assembly
+flat_seam_blend_s: 0.24          # ease window (s) at loop<->transient seams. A loop's own period
+                                 # seams need nothing -- the strides close bit-exactly
+flat_anchor: "x,y,yaw"           # which DOFs the flat clips' ego anchor frees
+
+# ---------------------------------------------------------------- segment generation
+pin_future: auto                 # 'auto' follows each family's own pin_future (an ASCENT tracks the
+                                 # replay's future so it arrives moving; a DESCENT holds the entry)
 
 # ---------------------------------------------------------------- composition
 extra_mix: ""
