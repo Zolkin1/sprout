@@ -359,6 +359,44 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
     return lines, floor
 
 
+def corner_wall_geoms(distance: float, height: float, length: float,
+                      thickness: float = 0.15, solid: bool = False) -> list[str]:
+    """Two walls meeting at 90 deg, ahead of the spawn point.
+
+    A hand-placed obstacle for driving at in sim2sim. The robot spawns at the world origin
+    facing +x, so the pair sits ``distance`` metres downrange: one leg ACROSS the path and
+    one running back along +y from its end, which is the corner an indoor space actually
+    presents and is harder than a single flat face -- two surfaces at different ranges in
+    one frame.
+
+    **Visual only by default**, matching every other decoration in this stack and matching
+    Isaac: ``/World/decor`` carries no collider, so nothing in training has ever pushed back
+    on the robot, and a solid wall here would test a contact response that does not exist.
+    The robot walks through it and what is being watched is the PLAN. ``solid=True`` makes it
+    collide, which is a different experiment and not the trained one.
+
+    Args:
+        distance: Downrange distance from spawn to the across-path leg (m).
+        height: Wall height (m). Barely observable -- the far camera's frame cuts a nearby
+            wall around waist height -- but it changes what a viewer sees.
+        length: Length of each leg (m).
+        thickness: Wall thickness (m).
+        solid: Emit colliding geometry instead of decoration.
+
+    Returns:
+        MuJoCo geom lines, already in the scene's world frame (spawn = origin).
+    """
+    half = length / 2.0
+    return [
+        # Across the path, centred on the spawn line.
+        _box_geom("play_wall_across", distance, 0.0, height / 2.0,
+                  thickness, length, height, 0.0, decor=not solid),
+        # Down one side, meeting it at a right angle and running back toward the robot.
+        _box_geom("play_wall_side", distance - half, half, height / 2.0,
+                  length, thickness, height, 0.0, decor=not solid),
+    ]
+
+
 def main() -> None:
     """Parse CLI arguments and write the generated single-tile scene XML."""
     p = argparse.ArgumentParser(description=__doc__,
@@ -383,6 +421,17 @@ def main() -> None:
                         "floor. The tile floor stops at the footprint, as in Isaac, so the "
                         "robot can walk off the edge; this trades that fidelity for runs "
                         "that cannot end that way.")
+    p.add_argument("--wall", nargs="?", type=float, const=3.0, default=None, metavar="DIST",
+                   help="Add two walls meeting at 90 deg, DIST metres ahead of spawn "
+                        "(default 3.0 when the flag is given bare). VISUAL ONLY unless "
+                        "--wall_solid: decoration never collides in Isaac either, so a "
+                        "solid one here would test a contact response the robot was never "
+                        "trained to have. What this is for is watching the PLAN.")
+    p.add_argument("--wall_height", type=float, default=2.0, help="Wall height (m).")
+    p.add_argument("--wall_length", type=float, default=4.0, help="Length of each leg (m).")
+    p.add_argument("--wall_solid", action="store_true",
+                   help="Make the walls collide. A different experiment from the trained "
+                        "one -- see --wall.")
     args = p.parse_args()
 
     entry, info = load_tile(args.clip, args.terrain_id)
@@ -394,6 +443,9 @@ def main() -> None:
         sx, sy, why = spawn_point(entry, overlays, args.approach)
     sz = terrain_top_at(overlays, sx, sy)
     geoms, floor = tile_geoms(entry, overlays, (sx, sy, sz), args.infinite_floor)
+    if args.wall is not None:
+        geoms = geoms + corner_wall_geoms(args.wall, args.wall_height, args.wall_length,
+                                          solid=args.wall_solid)
 
     scene = args.scene or f"tile{info['terrain_id']}_scene"
     header = (

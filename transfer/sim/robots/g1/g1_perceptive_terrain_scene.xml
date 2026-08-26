@@ -72,5 +72,7 @@
         <geom name="box1" type="box" material="box_material" group="2" size="0.3750 0.2200 0.2000" pos="6.0000 -6.5000 0.2000"/>
         <geom name="box2" type="box" material="box_material" group="2" size="0.3750 0.2200 0.2750" pos="9.0000 -6.5000 0.2750"/>
         <geom name="box3" type="box" material="box_material" group="2" size="0.3750 0.2200 0.3500" pos="12.0000 -6.5000 0.3500"/>
+        <geom name="play_wall_across" type="box" material="box_material" group="1" contype="0" conaffinity="0" size="0.0750 2.0000 1.0000" pos="-5.0000 0.0000 1.0000"/>
+        <geom name="play_wall_side" type="box" material="box_material" group="1" contype="0" conaffinity="0" size="2.0000 0.0750 1.0000" pos="-7.0000 2.0000 1.0000"/>
     </worldbody>
 </mujoco>
