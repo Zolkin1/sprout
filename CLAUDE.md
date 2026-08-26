@@ -647,10 +647,71 @@ stairs".** NEXT: dump the depth image alongside the flagged plans to separate a 
 failure (the image genuinely looks box-like) from a generation failure (image fine, plan wrong)
 -- the one split this number cannot make.
 
+**The classifier is a POPULATION statistic and NOT a per-plan label.** It was only ever
+validated against real CLIP windows (control accuracy 0.859) and is then applied to GENERATOR
+output, which lives elsewhere in that space -- so its accuracy where it is actually used had
+never been measured. Measured now, against |served - clip| as a label-free ground truth:
+within matched `clip_step` bands a flagged plan is no more divergent from the clip than an
+unflagged one (~1.0x; 0.62/1.36/1.05/1.07 over four bands). It separates only at the extreme
+tail (2-4x). So the rate above is usable -- the population really has shifted -- but "this
+plan is a misread" is not a claim the label supports, and selecting plans to eyeball by it
+gives a sample that says nothing about whether anything was wrong. `--dump_flagged` therefore
+selects on |served - clip| and keeps BOTH ends within a step band, since prediction difficulty
+rises through an episode (rank correlation 0.29). That metric has the mirror-image limit: a
+plan 5 m from the clip is a robot already lost, so its extreme end selects consequences rather
+than causes. Neither proxy isolates the cause alone.
+
+**The wall-as-box behaviour REPRODUCES in MuJoCo sim2sim, on a joystick** (2026-08-26).
+`generate_stairs_scene.py --wall` puts a visual-only 90-degree corner behind the spawn;
+driving at it, the policy reads the wall as a box and tries to jump onto it. That takes the
+hardware observation out of a one-off field report and into a local loop that costs nothing to
+re-run -- and it is the sharpest confirmation that this failure lives on the exteroception
+side rather than the loop/conditioning one.
+
 Build the reference with `terrain_class.py --windows <pred_tgt.npz> --holdout 0 --out ...`;
 pass it to the eval with `--terrain_ref`. **Always read the rate against the control**, never
 as an absolute: the classifier's own stairs->jump confusion is ~0.10 on these families and was
 unstable (0.010 to 0.116) until the reference reached ~12k windows.
+
+## Visual clutter: re-render a recording's pixels, don't re-record (2026-08-26)
+
+The generator had essentially never seen a vertical surface within camera range -- 0.0% of
+flat clips have a wall in reach, terrain tiles' walls sit a median 9.6 m past where the motion
+stops, and `family_distractor` is skipped by default. A wall at 2 m is therefore out of
+distribution in the direction that most resembles a box, which is what the robot does with it.
+
+The fix needs no re-record and no teacher retrain. `augment_registration.py --visual_only
+--clutter <sidecar>` re-renders an existing recording's depth at every recorded pose with
+scenery added; the sidecar carries only `decor` overlays, so the ground mesh and every tile
+corner are bit-identical and the recorded world poses stay valid. Verified: `ref_future` comes
+back bit-identical, and two different clutter variants give bit-identical height scans.
+
+- `motion_gen/terrain/clutter.py` authors a variant, vetted against the CLOSED-LOOP recording
+  (`build_clutter_occupancy.py`) rather than the open-loop clip -- the robot is where it
+  actually went, not where the clip said. `author_clutter.py` writes a ~200 kB sidecar, not a
+  6 GB library copy; `ClipTerrainImporter.decor_overlay_path` merges it at load.
+- **What limits exposure is ANGULAR SIZE, not range.** Pillars sit closer than walls (1.64 m
+  vs 2.24 m median) and are 13x less visible, and every class realises only 6-10% of the frame
+  it would fill if centred. The far camera is 30x26 px over 70x42 deg, rides the torso, and
+  pitches 10-16 deg nose-down while walking, so it stares at the ground 2-3 m out. Overhangs
+  at 2.1-2.6 m changed ZERO pixels in ZERO windows and are off by default.
+- **Wall HEIGHT is unobservable.** At 3 m the frame's top edge cuts a wall at z = 0.87 m, so
+  1.0 m and 3.0 m walls are byte-identical images. Vary it for the viewer, not the model.
+- Displacing the robot AND adding clutter needs the penetration filter: the veto is one body
+  radius plus clearance and the displacement spends most of it, so `--num_augments` together
+  with `--clutter` drops windows whose displaced reference enters a volume.
+- `fm_clutter_sensitivity.py` is the before/after number: one checkpoint over the clean and
+  cluttered halves with ONE shared noise draw, so conditioning is the only difference. Windows
+  whose depth did not change are a control that must return ~0 -- and it refuses to report
+  anything when that group is empty, which is what running it against DR-ON files looks like.
+  Its threshold is the control's **p99.9, never its max**: across two clutter draws of one
+  checkpoint the max moved 0.0066 -> 0.0241 m and swung the headline 47% -> 13%, where p99.9
+  held and the two draws agreed to five points.
+- `merge_recordings.py --variant_groups`: re-renders of ONE rollout must share an episode
+  numbering, or `build_train_val`'s by-episode split puts one variant in train and another in
+  val. With k re-renders the chance a val episode has no counterpart in train is
+  `val_fraction ** (k-1)` -- at seven files and a 5% split, 2e-8. Not only a reported number:
+  `best.pt` is selected on the val metric.
 
 # obelisk (ROS2 deploy) — the default run pipeline
 
