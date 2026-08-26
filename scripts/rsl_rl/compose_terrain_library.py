@@ -249,6 +249,15 @@ def main() -> int:
     writer.set_attr("generator", "composed")
     writer.set_attr("terrain_manifest", manifests)
     writer.set_attr("generator_config", {"counts": {"flat": flat_tiles}})
+    # Carry the REGIME declaration through. ``stride_idx >= 0`` marks the exact looped-replay frames, and
+    # QC needs an explicit attr to trust it because the dataset's h5py fill is 0 -- a library that never
+    # wrote it would otherwise read as "stride 0 everywhere", i.e. 100% steady. Propagated when ANY source
+    # declares it: every other family writes -1, so their frames are already correctly marked "not a loop".
+    # ``--flat-from`` is a separate input from ``--mix`` and is the family that actually carries the
+    # regime, so it has to be checked too -- missing it left the composed library unscoreable.
+    _sources = [pth for pth, _n in specs] + ([args.flat_from] if args.flat_from else [])
+    if any(bool(_get_lib(pth).attrs.get("has_regime", False)) for pth in _sources):
+        writer.set_attr("has_regime", True)
     for i, b in enumerate(records):
         writer.write_batch(i, b)
     writer.close()

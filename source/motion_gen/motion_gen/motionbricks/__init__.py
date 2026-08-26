@@ -46,6 +46,8 @@ from .terrain_splice import (
     footprint_recenter,
     match_overlap,
     overlays_for,
+    Piece,
+    splice_pieces,
     splice_terrain,
 )
 
@@ -82,5 +84,7 @@ __all__ = [
     "footprint_recenter",
     "match_overlap",
     "overlays_for",
+    "Piece",
+    "splice_pieces",
     "splice_terrain",
 ]

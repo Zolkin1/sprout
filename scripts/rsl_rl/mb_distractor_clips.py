@@ -41,7 +41,10 @@ from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library   # no
 from motion_gen.clip_output import ClipOutputBuilder        # noqa: E402
 from motion_gen.gen_parallel import default_workers, unit_pool  # noqa: E402
 from motion_gen.motionbricks import load_raw_motion, raw_to_world           # noqa: E402
-from motion_gen.motionbricks.distractor_plan import profile_segs, request_key  # noqa: E402
+from motion_gen.motionbricks.distractor_plan import profile_holds, request_key  # noqa: E402
+from motion_gen.motionbricks import flat_plan as fp                       # noqa: E402
+from motion_gen.motionbricks.stride_bank import load_stride_bank          # noqa: E402
+from mb_flat_clips import assemble_world                                  # noqa: E402
 from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import _ANCHOR_MASK_FLAT                          # noqa: E402
 
@@ -66,16 +69,36 @@ def _pool(args) -> list[tuple]:
     return _box_pool(args, int(args.num_tiles), np.random.default_rng(args.seed))
 
 
+def _clip_name(tid: int, spec: dict, i: int) -> str:
+    """The plan / transient key for clip ``i`` of tile ``tid`` -- shared by both passes."""
+    return f"t{tid:04d}_{request_key(spec, i)}"
+
+
 def _dump_schedules(args) -> int:
-    """Pass 1: write one MB schedule per clip of every tile."""
-    scheds = []
-    for tid, (kind, _sz, specs) in enumerate(_pool(args)):
+    """Pass 1: one loops-and-in-betweening PLAN per clip of every tile.
+
+    Distractors used to be generated the way everything else was before the redesign -- Motion Bricks
+    tracking a piecewise-constant command schedule for the whole six seconds.  They are now built like
+    the flat family: exact looped bank strides for the steady phases, Motion Bricks only for the
+    changes between them.  The velocities are not sampled here, they come from the clip's command
+    profile (:func:`~motion_gen.motionbricks.distractor_plan.profile_holds`), because the box is fitted
+    to the motion that profile produces.
+    """
+    bank = load_stride_bank(args.stride_bank)
+    n_frames = int(round(args.short_s / args.dt))
+    plans = []
+    for tid, (_kind, _sz, specs) in enumerate(_pool(args)):
         for i, spec in enumerate(specs):
-            scheds.append({"name": f"t{tid:04d}_{request_key(spec, i)}", "segs": profile_segs(spec)})
-    with open(args.dump_schedules, "w") as f:
-        json.dump(scheds, f, indent=1)
-    secs = sum(sum(d for d, *_ in s["segs"]) for s in scheds)
-    print(f"[mb_distract] {len(scheds)} schedules ({secs:.0f}s of motion) -> {args.dump_schedules}")
+            name = _clip_name(tid, spec, i)
+            seed = (int(args.seed) * 1000003 + tid * 1009 + i) % (2 ** 31)
+            plans.append(fp.plan_from_holds(
+                name, profile_holds(spec), np.random.default_rng(seed),
+                bank_periods=bank.period_frames, bank_vel=bank.achieved_vel,
+                n_frames=n_frames, dt=args.dt, seed=seed))
+    fp.to_json(plans, args.dump_schedules)
+    n_tr = sum(len(pl.transients) for pl in plans)
+    print(f"[mb_distract] {len(plans)} plans, {n_tr} transients "
+          f"({len(plans) * args.short_s:.0f}s of motion) -> {args.dump_schedules}")
     return 0
 
 
@@ -87,16 +110,14 @@ def _tile_worker(tid: int):
     T = int(round(args.short_s / args.dt))
 
     def gen(spec, _cmd, T_, i):
-        """The MOTION for clip ``i`` of this tile: the Motion Bricks clip generated for its profile."""
-        path = os.path.join(args.mb_raw_dir, f"t{tid:04d}_{request_key(spec, i)}.npz")
-        Wp, Wq, Wj, _tvel = raw_to_world(load_raw_motion(path), args.dt, device=dev)
-        n = Wp.shape[0]
-        if n < T_:                                   # repeat-last if MB produced a hair less than asked
-            pad = T_ - n
-            Wp = torch.cat([Wp, Wp[-1:].expand(pad, 3)])
-            Wq = torch.cat([Wq, Wq[-1:].expand(pad, 4)])
-            Wj = torch.cat([Wj, Wj[-1:].expand(pad, Wj.shape[1])])
-        return Wp[:T_], Wq[:T_], Wj[:T_]
+        """The MOTION for clip ``i`` of this tile: its plan's loops spliced with its MB in-betweenings."""
+        name = _clip_name(tid, spec, i)
+        world, diag = assemble_world(S["bank"], S["plans"][name], args.transient_dir, args.dt, T_,
+                                     dev, _DISTRACTOR_MASK, S["blend_n"])
+        if world is None:
+            raise RuntimeError(f"{name}: {diag.get('skip')}")
+        wp, wq, wj, tv, _sidx = world
+        return wp, wq, wj, tv
 
     try:
         recs, manifest = _make_tile(None, builder, kind, box_xyz, specs, tid, T, args, dev, gen=gen)
@@ -116,7 +137,9 @@ def _assemble(args) -> int:
     builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
                                 contact_frames=_CONTACT, device=args.device)
     tiles = _pool(args)
-    _SHARED.update(args=args, builder=builder, dev=args.device, tiles=tiles)
+    plans = {pl.name: pl for pl in fp.from_json(args.plans)}
+    _SHARED.update(args=args, builder=builder, dev=args.device, tiles=tiles,
+                   bank=load_stride_bank(args.stride_bank), plans=plans, blend_n=args.blend_n)
     n_workers = default_workers(len(tiles), args.workers)
     print(f"[mb_distract] {len(tiles)} tiles x {args.clips_per_tile} clips, workers={n_workers}")
     recs = unit_pool(_tile_worker, range(len(tiles)), n_workers)
@@ -154,7 +177,11 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True, help="Traj-opt library root (channel layout).")
     p.add_argument("--dump-schedules", default=None, help="PASS 1: write MB schedules here and exit.")
-    p.add_argument("--mb-raw-dir", default=None, help="PASS 2: dir of the MB motions (mb_encode --schedules).")
+    p.add_argument("--transient-dir", default=None,
+                   help="PASS 2: dir of the generated in-betweenings (mb_flat_transients --plans).")
+    p.add_argument("--plans", default=None, help="PASS 2: the plan file pass 1 wrote.")
+    p.add_argument("--stride-bank", required=True, help="Exact periodic strides (export_stride_bank.py).")
+    p.add_argument("--blend-n", type=int, default=12, help="Seam blend length, in frames.")
     p.add_argument("--out", default=None, help="PASS 2: output .h5.")
     p.add_argument("--num-tiles", type=int, default=20)
     p.add_argument("--clips-per-tile", type=int, default=50)
@@ -173,10 +200,10 @@ def main() -> int:
     p.add_argument("--footprint-margin", type=float, default=2.0, help="Ground margin around the tile (m).")
     p.add_argument("--stand-start", action="store_true", help="Unused here (MB clips start from a stand).")
     args = p.parse_args()
-    if bool(args.dump_schedules) == bool(args.mb_raw_dir):
-        raise SystemExit("pass exactly one of --dump-schedules (pass 1) or --mb-raw-dir (pass 2)")
-    if args.mb_raw_dir and not args.out:
-        raise SystemExit("--mb-raw-dir (pass 2) needs --out")
+    if bool(args.dump_schedules) == bool(args.transient_dir):
+        raise SystemExit("pass exactly one of --dump-schedules (pass 1) or --transient-dir (pass 2)")
+    if args.transient_dir and not (args.out and args.plans):
+        raise SystemExit("--transient-dir (pass 2) needs --out and --plans")
     for path in (args.dump_schedules, args.out):
         if path and os.path.dirname(path):
             os.makedirs(os.path.dirname(path), exist_ok=True)

@@ -199,7 +199,7 @@ def _make_tile(matcher, builder, kind, box_xyz, specs, tid, T, args, dev, gen=No
     """Generate a tile's motions, align each by its box-relevant frame, fit the box per type ->
     (records, manifest). All motions in the tile share the one box, placed coherently.
 
-    ``gen(spec, cmd, T, i) -> (root_pos, root_quat, joints)`` supplies the MOTION. It defaults to the DP
+    ``gen(spec, cmd, T, i) -> (root_pos, root_quat, joints[, target_vel])`` supplies the MOTION. It defaults to the DP
     matcher; the Motion Bricks distractor path passes a loader for its pre-generated flat motions instead.
     Everything after that call -- alignment, the swept-footprint occupancy grid, per-type box fitting, the
     push-clear, the tile footprint and the manifest -- is independent of where the motion came from.
@@ -216,8 +216,15 @@ def _make_tile(matcher, builder, kind, box_xyz, specs, tid, T, args, dev, gen=No
     clips, tvels, foot_pts, turn_x = [], [], [], []
     for i, spec in enumerate(specs):
         cmd = profile_cmd(spec)
+        tv_gen = None
         if gen is not None:
-            rp, rq, jt = gen(spec, cmd, T, i)
+            out = gen(spec, cmd, T, i)
+            # A generator may return its OWN per-frame command.  The loops-and-in-betweening path does:
+            # its steady stretches are exact bank strides and its deceleration is however long Motion
+            # Bricks made it, so the honest command is the one the assembled motion actually holds --
+            # not the profile's nominal ramp, which would say "still walking" after the robot stopped.
+            rp, rq, jt = out[:3]
+            tv_gen = out[3] if len(out) > 3 else None
         else:
             sf = None if args.stand_start else _start_frame(matcher, cmd(0.0))
             rp, rq, jt = matcher.generate(cmd, T, start_frame=sf,
@@ -235,7 +242,8 @@ def _make_tile(matcher, builder, kind, box_xyz, specs, tid, T, args, dev, gen=No
                 turn_x.append(float(rp2[k, 0]))
         y, dy, contact = builder.build(rp2, rq2, jt, args.dt)
         clips.append((y, dy, contact))
-        tvels.append(torch.tensor([cmd(t * args.dt) for t in range(T)], dtype=torch.float32, device=dev))
+        tvels.append(tv_gen if tv_gen is not None else
+                     torch.tensor([cmd(t * args.dt) for t in range(T)], dtype=torch.float32, device=dev))
         pel = y[:, pxy].cpu().numpy()
         ft = np.concatenate([y[:, ix].cpu().numpy() for ix in fxy], axis=0)
         foot_pts.append(np.concatenate([pel, ft], axis=0))

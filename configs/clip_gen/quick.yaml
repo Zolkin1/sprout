@@ -1,0 +1,85 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# SMOKE recipe for scripts/rsl_rl/generate_mb_library.py: the full chain end to end at ~1 minute,
+# for checking that a generation change actually lands before spending hours on it.
+#
+# Deliberately a complete standalone file rather than a diff against g1_mb_v6.yaml. This used to be
+# a --quick FLAG that mutated a handful of values in code, which silently missed every knob added
+# after it was written -- --pure-stair-tiles among them, so a "quick" run built 15 pure tiles per
+# direction. A recipe that is a tracked file cannot fall out of step with itself that way.
+#
+# ONLY the scale differs from g1_mb_v6.yaml. Every distribution parameter is identical, so what this
+# measures is what the full run will produce.
+
+# ---------------------------------------------------------------- reproducibility
+seed: 0
+
+# ---------------------------------------------------------------- scale (the only difference)
+clips_per_tile: 4
+stair_tiles: 2
+pure_stair_tiles: 2
+box_tiles: [2, 1, 1]
+flat_tiles: 4
+distractor_tiles: 3
+distractor_s: 6.0
+
+# ---------------------------------------------------------------- flat family
+flat_loops: true              # exact looped strides + bounded MB transients
+flat_hold_s_range: [1.5, 4.0]  # s of STEADY loop per segment, before rounding to a gait phase
+flat_stand_frac: 0.08          # chance a flat segment is a standing hold (entered via a transient)
+flat_ramp_dv: 1.4              # max speed change per single in-betweening; bigger is split
+flat_a_max: 1.15               # m/s^2; peak accel measures ~1.75x this
+flat_min_transient_s: 0.35
+flat_hop_slack: 1.15
+flat_clip_length: 20.0
+flat_seg_dur_range: [1.5, 5.5]
+flat_walk_vx_range: [0.1, 1.0]
+flat_run_vx_range: [1.0, 3.0]
+flat_back_vx_range: [0.1, 1.5]
+flat_side_vy: 1.0
+flat_turn_max: 0.8
+
+# ---------------------------------------------------------------- stair families
+stair_vel_range: [0.2, 2.6]
+stair_floor_frac: 0.5
+stair_float_frac: 0.3
+stair_float_thick_range: [0.03, 0.06]
+pure_seconds: 6.0
+
+# ---------------------------------------------------------------- box families
+box_vel_range: [0.2, 3.5]
+box_approach_s_range: [2.5, 4.0]
+box_exit_s_range: [2.5, 6.0]
+box_top_vx_range: [0.2, 0.7]
+box_two_sided_frac: 0.5
+box_platform_buffer: 1.0
+box_nav_width: -1.0
+backward_vx_max: 1.0
+
+# ---------------------------------------------------------------- shared terrain knobs
+steady_approach_frac: 0.5
+pin_lead: 1.0
+pin_cmd: ramp                   # 'ramp' decelerates the approach command to the terrain's entry
+                                # speed; 'hold' keeps the steady command and assumes arriving at a
+                                # fixed boundary sheds the speed by itself. MEASURED false: under
+                                # 'hold' the approach reaches the stairs at 2.4 m/s against a replay
+                                # starting near 0.7, a -12 m/s^2 velocity discontinuity at the splice
+bounded_approach: true      # exact loop + bounded transient approach
+approach_a_max: 2.0
+approach_min_transient_s: 0.35
+approach_hop_slack: 1.3
+ramp_s: 1.5                     # seconds to bleed the approach command down to the entry speed. 0.8
+                                # cannot shed ~2 m/s at any rate a walking robot achieves; the
+                                # measured speed-change response is ~1.5 s
+
+# ---------------------------------------------------------------- RL-visible command
+rl_cmd_vary: false
+rl_cmd_seg_dur_range: [2.5, 5.5]
+segment_reuse: false            # share a generated MB segment between clips with identical
+                                # conditioning. OFF: with per-clip schedules two clips are only
+                                # interchangeable if their whole schedules match, and ~1.5x the
+                                # segment cost buys "every clip's motion was generated for it"
+rl_vels: raw
+
+# ---------------------------------------------------------------- composition
+extra_mix: ""

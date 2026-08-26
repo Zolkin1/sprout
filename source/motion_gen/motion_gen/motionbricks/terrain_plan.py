@@ -81,6 +81,16 @@ class TerrainPlan:
     exit_mode: str                    # "walk" | "stand"
     approach_s: float                 # requested approach duration (s)
     exit_s: float                     # requested exit duration (s)
+    # TRAVEL BUDGET (m) each side has on its walkable surface, i.e. the same ``duration x speed`` product
+    # the tile's platforms were sized from -- reinterpreted as a DISTANCE.  The approach is
+    # ``[exact loop][bounded transient][replay]``: the transient covers only the last stretch, whatever
+    # Motion Bricks needs to reach the entry pose, and an exact looped stride covers the rest.  Making the
+    # distance the authored quantity and the duration emergent is what lets the transient be bounded by
+    # what the robot can actually accelerate through without the platform having to be resized -- the tile
+    # geometry is authored in pass A, long before any segment exists.  0.0 means a legacy plan with no
+    # budget, which the assembler treats as "no loop, the segment covers everything".
+    approach_dist: float = 0.0
+    exit_dist: float = 0.0
     # Candidate frames the boundary gates accepted, kept so an alternative can be tried without re-deriving.
     # NOTE the two index spaces: ``exit_candidates`` index ``terrain_qpos`` (same space as ``exit_frame``),
     # but ``entry_candidates`` index the SOURCE PERIOD of the pre-placement traversal -- choosing one
@@ -130,7 +140,7 @@ class TerrainPlan:
 
     # ---- windows for the Motion Bricks side ---------------------------------------------------
     def approach_pin_window(self, t_offset: float, n: int, dt_mb: float,
-                            hold: bool = False) -> np.ndarray:
+                            hold: bool = False, hold_z: bool = False) -> np.ndarray:
         """Target-pose window ``[n, 36]`` for an approach that is ``-t_offset`` seconds from the entry.
 
         The window is the replay itself, read at the Motion Bricks frame spacing ``dt_mb`` starting
@@ -151,11 +161,21 @@ class TerrainPlan:
         root z is made RELATIVE to :attr:`approach_surf_z`, because the MB approach is generated on its own
         flat ground and only grounded onto the real surface when the clip is spliced.
         """
+        # ``hold_z`` is the middle ground ``hold`` should always have been, and the one to reach for.
+        # Collapsing the window to a frozen frame does stop the approach from generating the interaction,
+        # but it also freezes the LEGS, and four frames of a static stance reads to Motion Bricks as
+        # "stop walking": measured across the segment bank, held approaches arrive at 0.28x the replay's
+        # entry speed against 0.54x for future-pinned ones, and that velocity step IS the entry seam pop.
+        # Taking the future's joints while freezing root z keeps the gait moving without asking the
+        # approach to start descending (or jumping) early, which is the only thing ``hold`` was for.
         if hold:
             idx = np.full(int(n), float(self.entry_frame))
         else:
             idx = self.entry_frame + (float(t_offset) + np.arange(int(n)) * float(dt_mb)) / float(self.dt)
         win = sample_qpos(self.terrain_qpos, idx)
+        if hold_z and not hold:
+            win[:, 2] = float(sample_qpos(self.terrain_qpos,
+                                          np.full(1, float(self.entry_frame)))[0, 2])
         win[:, 0:2] = 0.0
         win[:, 2] -= float(self.approach_surf_z)
         return win
@@ -183,6 +203,7 @@ def save_terrain_plan(path: str, plan: TerrainPlan) -> None:
         "entry_vx": plan.entry_vx, "exit_speed": plan.exit_speed,
         "approach_mode": plan.approach_mode, "exit_mode": plan.exit_mode,
         "approach_s": plan.approach_s, "exit_s": plan.exit_s,
+        "approach_dist": plan.approach_dist, "exit_dist": plan.exit_dist,
         "meta": plan.meta,
     }
     np.savez_compressed(
@@ -206,6 +227,9 @@ def load_terrain_plan(path: str) -> TerrainPlan:
             entry_vx=float(s["entry_vx"]), exit_speed=float(s["exit_speed"]),
             approach_mode=s["approach_mode"], exit_mode=s["exit_mode"],
             approach_s=float(s["approach_s"]), exit_s=float(s["exit_s"]),
+            # Absent on plans written before the travel budget existed; 0.0 means "no loop".
+            approach_dist=float(s.get("approach_dist", 0.0)),
+            exit_dist=float(s.get("exit_dist", 0.0)),
             entry_candidates=d["entry_candidates"], exit_candidates=d["exit_candidates"],
             meta=s.get("meta", {}),
         )

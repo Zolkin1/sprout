@@ -44,6 +44,8 @@ import os
 import numpy as np
 import torch
 
+from motion_gen.command_schedule import from_json, rasterize
+
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.terrain.box_clip import box_tile_boxes, build_anchor_mask_t, stair_tile_boxes
 from motion_gen.clip_output import ClipOutputBuilder
@@ -64,13 +66,19 @@ from motion_gen.motionbricks import (
     footprint_recenter,
     load_raw_motion,
     load_terrain_plan,
+    match_overlap,
     overlays_for,
     pick_boundary,
     raw_to_world,
     save_terrain_plan,
+    Piece,
     sole_heights,
+    splice_pieces,
     splice_terrain,
 )
+from motion_gen.motionbricks import flat_plan as fp
+from motion_gen.motionbricks.stride_bank import load_stride_bank
+from motion_gen.terrain.box_clip import loop_frames
 from motion_gen.library_metadata import read_library_metadata
 from motion_gen.world_lift import _ANCHOR_MASK_BOX, _ANCHOR_MASK_FLAT
 
@@ -223,6 +231,65 @@ def _place(family, ts, tile, boxes, dev, k: int):
     return place_episodic_on_tile(ts, boxes[0], dev, k=k, align="facing")
 
 
+
+def _budget_loop(bank, budget: float, prov: dict, dt: float, dev: str, travelled: float,
+                 *, stride_key: str, phase_key: str, at_end: bool):
+    """The exact looped stride that covers the approach's travel budget ahead of the bounded transient.
+
+    The transient only bridges the last stretch (whatever Motion Bricks needs to reach the entry pose);
+    this covers the rest of ``plan.approach_dist`` at exactly the commanded speed, because a looped
+    optimized stride travels ``command x duration`` by construction.  That is the whole point: the old
+    duration-driven run-up overshot its command by ~78%, which is how a jump_on exit walked 6.5 m across
+    a 4.7 m platform.
+
+    The loop must hand off at the SAME stride and gait phase the transient was seeded from, or the two
+    would not be continuous -- both come from the segment's provenance.  Returns ``None`` when there is no
+    budget left to cover (the transient already spans it).
+    """
+    s_idx, phase = int(prov[stride_key]), int(prov[phase_key])
+    period = int(bank.period_frames[s_idx])
+    speed = float(np.linalg.norm(bank.achieved_vel[s_idx][:2]))
+    remain = float(budget) - float(travelled)
+    if speed < 1e-3 or remain <= speed * dt:
+        return None, 0.0
+    want = int(round(remain / (speed * dt)))
+    # Land the loop's last frame exactly on the phase the transient was seeded from.
+    n = fp.loop_frames_for(phase, phase, period, want, min_frames=period)
+    q = torch.as_tensor(np.asarray(bank.strides[s_idx], np.float32), dtype=torch.float32, device=dev)
+    # One frame of lead-in pays for the weld align_and_concat drops, so every surviving frame is an exact
+    # stride frame -- on both sides: an approach loop must END on the hand-off phase, an exit loop must
+    # BEGIN on it.
+    lead = (phase - 1) % period
+    lrp, lrq, ljt, _ = loop_frames(q[:, 0:3], q[:, 3:7], q[:, 7:36], None, n + 1, start=lead)
+    return Piece(seg=(lrp, lrq, ljt), kind="loop", rigid=True, stride_idx=s_idx), n * speed * dt
+
+
+def _platform_trim(Wp: torch.Tensor, overlays: list[dict], bounds, plan) -> tuple[int, int]:
+    """``(head, tail)`` slice keeping only frames where an ELEVATED segment is over a walkable box.
+
+    Which END to trim depends on which side is elevated, and getting it backwards destroys the clip.  An
+    elevated EXIT (a mount's walk-away) runs out of platform at the END, so the clip is cut there.  An
+    elevated APPROACH (a dismount's run-up, which starts up on the box) runs out at the START -- cutting
+    its tail would delete the replay and the exit, which is exactly how 11 jump_off clips got dropped.
+
+    Only elevated segments can fall: a ground-level one on a floored tile is carried by the floor, and the
+    replay is world-pinned and partly airborne by design.
+    """
+    has_floor = bool(plan.meta.get("has_floor", True))
+    off = _off_surface(Wp, overlays)
+    head, tail = 0, int(Wp.shape[0])
+    (a0, b0), (a2, b2) = bounds[0], bounds[2]
+    if b0 > a0 and (plan.approach_surf_z > 1e-3 or not has_floor):
+        idx = np.nonzero(off[a0:b0])[0]
+        if idx.size:                                  # start after the last frame that is off the platform
+            head = a0 + int(idx[-1]) + 1
+    if b2 > a2 and (plan.exit_surf_z > 1e-3 or not has_floor):
+        idx = np.nonzero(off[a2:b2])[0]
+        if idx.size:
+            tail = a2 + int(idx[0])
+    return head, max(head, tail)
+
+
 def _soles(builder, Wp, Wq, Wj, dt) -> np.ndarray:
     """Per-frame sole heights ``[T,2]`` of a placed segment (FK through the clip-output builder)."""
     y, _dy, _c = builder.build(Wp, Wq, Wj, dt)
@@ -292,7 +359,8 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
         entry_gate = boundary_candidates(_soles(builder, Wp, Wq, Wj, args.dt), contact, levels,
                                          tol=args.contact_tol, swing_clear=swing_clear,
                                          swing_band=swing_band, window=(0, int(ts.n)))
-        k = pick_boundary(entry_gate, prefer=args.entry_pick)
+        k = pick_boundary(entry_gate, prefer=args.entry_pick,
+                          rng=np.random.default_rng([int(getattr(args, "clip_seed", 0)), 0xE471]))
         print(f"[mb_terrain]   entry gate: {entry_gate.reason} -> frame {k} (source period {ts.n} frames, "
               f"{'strict' if entry_gate.strict else 'FALLBACK'})")
         if k != 0:
@@ -342,6 +410,12 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
                    "pos": [float(v) for v in b["pos"]], "size": [float(v) for v in b["size"]],
                    "yaw": float(b.get("yaw", 0.0))} for b in boxes],
         "reference": ts.name, "reference_speed": ref_speed, "rl_vx": float(rl_vx),
+        # The band rl_vx was drawn from; _rl_command_track samples the varied command from it.
+        "rl_vel_range": [float(v) for v in getattr(args, "rl_vel_range", RL_CMD_VEL_RANGE)],
+        # The per-clip command schedule, authored in pass A. Pass B generated the approach and exit
+        # motion by TRACKING this, so writing it verbatim as target_vel is what makes the command the
+        # RL sees and the motion it sees agree outside the terrain override.
+        "rl_cmd_schedule": getattr(args, "rl_cmd_schedule", None),
         "terrain_id": int(args.terrain_id), "footprint_margin": float(args.footprint_margin),
         "family_blurb": family.blurb, "exit_sign": float(family.exit_sign),
         "lower_z": float(lower_z), "upper_z": float(upper_z),
@@ -358,6 +432,12 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
         entry_vx=float(entry_vx), exit_speed=float(exit_speed),
         approach_mode=family.approach_mode, exit_mode=family.exit_mode,
         approach_s=float(args.approach_s), exit_s=float(args.exit_s),
+        # The SAME product the tile's platforms were sized from, reinterpreted as a travel budget: the
+        # approach gets this many metres of walkable surface, an exact loop covers whatever the bounded
+        # transient does not.  Authoring the distance rather than the duration is what lets the transient
+        # be as long as the acceleration bound needs without resizing geometry that pass A already fixed.
+        approach_dist=float(args.approach_s) * abs(float(approach_vx)),
+        exit_dist=float(args.exit_s) * abs(float(exit_vx)),
         entry_candidates=(entry_gate.frames if entry_gate else np.zeros(0, np.int64)),
         exit_candidates=(exit_gate.frames if exit_gate else np.zeros(0, np.int64)),
         meta=meta,
@@ -405,6 +485,39 @@ def _load_segment(path: str | None, dt: float, dev):
     return (Wp, Wq, Wj), dict(raw.provenance or {})
 
 
+# RL-command variation defaults, defined ONCE here and used both as the CLI defaults and as the
+# fallbacks in _rl_command_track. ``clip_from_plan`` is called with a hand-built namespace by
+# ``mb_assemble_library`` (the real library-build path) as well as from this file's own CLI, so a
+# fallback of "off" would mean the feature silently does nothing in the pipeline that matters.
+# Fallback band, used only when a plan predates ``rl_vel_range`` in its meta. Live plans carry the
+# band their own family drew from, which is what a varied command is sampled from.
+RL_CMD_VEL_RANGE = (0.2, 3.5)
+
+
+def _rl_command_track(T: int, plan, dt: float) -> np.ndarray:
+    """Per-step RL forward command ``[T]``, read from the schedule pass A authored.
+
+    NOT sampled here. Pass B GENERATED this clip's approach and exit motion by tracking this same
+    schedule, so writing it verbatim is what makes the command the RL sees and the motion it sees
+    agree -- everywhere except the terrain override (the last ``ramp_s`` of the approach and the
+    interaction itself), which is the only place the motion is allowed to disregard it.
+
+    An earlier version sampled a fresh random command HERE, in pass C. That could not possibly
+    align: the motion already existed by then, generated at a single constant speed, so the command
+    and the motion disagreed across the whole approach and exit -- the two phases where they must
+    match -- while agreeing only through the interaction, where divergence is expected. Exactly
+    inverted.
+
+    Falls back to the clip's steady ``rl_vx`` for a plan that predates the schedule, which is at
+    least aligned: the approach and exit were generated at that speed.
+    """
+    raw = plan.meta.get("rl_cmd_schedule")
+    if not raw:
+        return np.full(int(T), float(plan.meta["rl_vx"]), dtype=np.float32)
+    sign = -1.0 if float(plan.meta["rl_vx"]) < 0 else 1.0
+    return (sign * rasterize(from_json(raw), int(T), float(dt))[:, 0]).astype(np.float32)
+
+
 def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
     """Pass-2 CORE: splice ``args.approach_raw`` / ``args.exit_raw`` around the plan's replay.
 
@@ -438,7 +551,75 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
           f"{'/seeded' if e_seeded else ''})")
 
     blend_n = int(round(args.seam_blend_s / dt))
-    Wp, Wq, Wj, bounds, diag = splice_terrain(
+    # BOUNDED approach: the segment is only the last stretch, so an exact looped stride covers the rest of
+    # the plan's travel budget.  Spliced as 4 pieces [loop, transient, replay, exit] and then reported as
+    # the usual 3 slots, with the loop folded into "approach" -- everything downstream (anchor mask, sole
+    # report, keyframe sidecar) indexes those three and does not care that the first one has two parts.
+    loop_piece = None
+    if bool(a_prov.get("bounded")) and getattr(args, "stride_bank", None) and approach is not None:
+        bank = load_stride_bank(args.stride_bank)
+        loop_piece, loop_travel = _budget_loop(
+            bank, plan.approach_dist, a_prov, dt, dev, travelled=float(a_prov.get("travel", 0.0)),
+            stride_key="seed_stride", phase_key="seed_phase", at_end=False)
+        if loop_piece is not None:
+            pieces = [loop_piece,
+                      Piece(seg=approach, kind="transient",
+                            ground_z=(None if a_seam == "weld"
+                                      else (0.0 if a_frame == "tile" else float(plan.approach_surf_z)))),
+                      Piece(seg=terrain, kind="replay", rigid=True, anchored=True)]
+            e_skip = 0
+            if exit_seg is not None:
+                if e_seeded:
+                    # A context-seeded exit opens by RE-PREDICTING its seed, so those frames replay the end
+                    # of the traversal; splice_terrain skips them and the bounded path must too, or the
+                    # clip repeats the landing.
+                    tgt_p = terrain[0][-1].clone()
+                    if e_frame == "flat":
+                        tgt_p[2] = tgt_p[2] - float(plan.exit_surf_z)
+                    e_skip = match_overlap(exit_seg, tgt_p, terrain[1][-1], terrain[2][-1],
+                                           search=args.weld_search)
+                pieces.append(Piece(seg=exit_seg, kind="transient", trim=(e_skip, 0),
+                                    ground_z=(None if e_seam == "weld"
+                                              else (0.0 if e_frame == "tile"
+                                                    else float(plan.exit_surf_z)))))
+            # BOUNDED exit: the transient hands off to an exact loop that covers the rest of its budget,
+            # the mirror of the approach.  Appended after the exit transient so the walk-away runs at the
+            # commanded speed by construction rather than at whatever Motion Bricks drifted to.
+            x_loop_travel = 0.0
+            if exit_seg is not None and bool(e_prov.get("bounded")) and \
+                    float(getattr(plan, "exit_dist", 0.0)) > 0.0:
+                x_loop, x_loop_travel = _budget_loop(
+                    bank, plan.exit_dist, e_prov, dt, dev, travelled=float(e_prov.get("travel", 0.0)),
+                    stride_key="loop_stride", phase_key="loop_phase", at_end=True)
+                if x_loop is not None:
+                    pieces.append(x_loop)
+            Wp, Wq, Wj, pb, seams, pdiag = splice_pieces(pieces, blend_n=blend_n, dt=dt)
+            # Mark the LOOP frames, the same way the flat path does.  Without this a terrain clip reports
+            # stride_idx = -1 throughout, which hides its approach/exit loops from the loop-exactness
+            # check and from seam detection -- the internal loop<->transient seams become invisible and
+            # only the two terrain boundaries get scored.
+            sidx_t = torch.full((Wp.shape[0],), -1, dtype=torch.int32, device=dev)
+            for (s_, e_), pc_ in zip(pb, pieces):
+                if pc_.stride_idx >= 0:
+                    sidx_t[s_:e_] = int(pc_.stride_idx)
+            n_a = pb[1][1]                                   # loop + transient together
+            n_t = pb[2][1] - pb[2][0]
+            bounds = [(0, n_a), (n_a, n_a + n_t), (n_a + n_t, Wp.shape[0])]
+            diag = {"approach_seam": a_seam, "exit_seam": e_seam, "approach_frame": a_frame,
+                    "exit_frame": e_frame, "approach_loop_travel": float(loop_travel),
+                    "approach_transient_travel": float(a_prov.get("travel", 0.0)),
+                    "exit_loop_travel": float(x_loop_travel),
+                    "approach_joint_res": float(pdiag["placements"]["before"]["joint_res"]),
+                    "stride_idx_t": sidx_t,
+                    "approach_surface_err": 0.0, "exit_surface_err": 0.0,
+                    "approach_arrival_cut": 0, "exit_overlap_skip": int(e_skip),
+                    "seam_accel": [s.get("seam_speed", 0.0) for s in seams]}
+            if exit_seg is not None:
+                diag["exit_joint_res"] = float(pdiag["placements"]["after"]["joint_res"])
+            print(f"[mb_terrain] {plan.skill}: BOUNDED approach -- loop {loop_travel:.2f} m + transient "
+                  f"{a_prov.get('travel', 0.0):.2f} m of a {plan.approach_dist:.2f} m budget")
+    if loop_piece is None:
+        Wp, Wq, Wj, bounds, diag = splice_terrain(
         terrain, approach, exit_seg,
         approach_surf_z=plan.approach_surf_z, exit_surf_z=plan.exit_surf_z, blend_n=blend_n,
         approach_seam=a_seam, exit_seam=e_seam, approach_frame=a_frame, exit_frame=e_frame,
@@ -448,7 +629,8 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
             continue
         extra = (f" arrival_cut={diag['approach_arrival_cut']}f" if side == "approach"
                  and "approach_arrival_cut" in diag else "")
-        extra += f" overlap_skip={diag['exit_overlap_skip']}" if side == "exit" else ""
+        if side == "exit" and "exit_overlap_skip" in diag:
+            extra += f" overlap_skip={diag['exit_overlap_skip']}"
         print(f"[mb_terrain]   {side} seam: {diag[side + '_frame']}/{diag[side + '_seam']} "
               f"surface_err={diag[side + '_surface_err']:+.3f} m "
               f"joint_res={diag[side + '_joint_res']:.3f} rad "
@@ -480,6 +662,19 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                 o["size_xyz"][1] = size_y
                 o["pos_xy"][1] = size_y / 2.0
 
+    # TRUNCATE AT THE PLATFORM EDGE.  The elevated segment is commanded at the box-top speed the platform
+    # was sized from, but Motion Bricks does not track that command -- measured on jump_on, an exit
+    # commanded 0.67 m/s averages ~1.19 and travels 6.5 m across a 4.7 m platform, so 41% of the family
+    # walked off the end into thin air.  Until the exit is an exact looped stride (whose travel is its
+    # command times its duration, by construction), cut the clip where it leaves the surface: a shorter
+    # reference is honest, a reference standing on nothing is not.  ``clip_len`` already carries per-clip
+    # length, so a short clip costs nothing downstream.
+    head, tail = _platform_trim(Wp, overlays, bounds, plan)
+    if head > 0 or tail < Wp.shape[0]:
+        diag["platform_trim"] = (int(head), int(Wp.shape[0] - tail))
+        Wp, Wq, Wj = Wp[head:tail], Wq[head:tail], Wj[head:tail]
+        bounds = [(max(0, a - head), max(0, min(b, tail) - head)) for a, b in bounds]
+
     y, dy, contact = builder.build(Wp, Wq, Wj, dt)
     ta, tb = bounds[1]
     contact[ta:tb] = torch.as_tensor(plan.replay_contact, dtype=contact.dtype, device=contact.device)
@@ -501,7 +696,7 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
             f"plan for {plan.skill} predates the RL-command split: it has "
             f"{'terrain_vx' if 'terrain_vx' in plan.meta else 'neither rl_vx nor terrain_vx'}, not 'rl_vx'. "
             f"Re-run pass 1 (mb_terrain_clips --dump-plan / mb_plan_library) to regenerate the plans.")
-    tvel[:, 0] = float(plan.meta["rl_vx"])
+    tvel[:, 0] = torch.as_tensor(_rl_command_track(T, plan, dt), dtype=tvel.dtype, device=dev)
 
     # ``frame_yaw``: the heading of the TERRAIN's own frame within the tile -- the axis the traversal
     # crosses it along.  The RL anchor mask resolves its downrange / lateral bits in this frame
@@ -515,8 +710,22 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                 "size_x": float(size_x), "size_y": float(size_y), "overlays": overlays,
                 "has_floor": bool(plan.meta.get("has_floor", True)),
                 "frame_yaw": 0.0}
+    # A segment that outgrew the platform it walks on lands inside the tile footprint but with nothing
+    # underneath.  The single-clip CLI has always printed this; computing it HERE means the batch path
+    # sees it too, which is where a library-scale overrun would otherwise be completely invisible.
+    # Only ELEVATED segments (or any segment on a floorless tile) can actually fall: a ground-level one is
+    # carried by the tile's flat floor, so being "off every box" is normal there, and the replay is
+    # world-pinned and partly airborne by design.  Counting those was a 100%-false-positive rate.
+    off = _off_surface(Wp, overlays)
+    has_floor = bool(manifest["has_floor"])
+    n_off = sum(int(off[a:b].sum())
+                for (a, b), surf in ((bounds[0], plan.approach_surf_z), (bounds[2], plan.exit_surf_z))
+                if b > a and (surf > 1e-3 or not has_floor))
+    diag["off_surface_frames"] = n_off
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
+            "stride_idx_t": diag.get("stride_idx_t"),
             "manifest": manifest, "bounds": bounds, "diag": diag, "overlays": overlays,
+            "off_surface": n_off,
             "size_x": float(size_x), "size_y": float(size_y), "Wp": Wp, "n": T,
             # The tile-local origin this clip was recentred onto. Returned because it depends on the CLIP's
             # own extent (``footprint_recenter`` takes the min of motion and geometry), so a batch driver
@@ -733,6 +942,9 @@ def main() -> int:
                         "mb_assemble_library --seams, whose default is likewise ease.")
     p.add_argument("--exit-pin", default="soft", choices=["hard", "soft", "auto"],
                    help="PASS 2: seam treatment for the exit (see --approach-pin).")
+    p.add_argument("--stride-bank", default=None,
+                   help="Stride bank .npz; required to assemble a BOUNDED approach (the exact loop that "
+                        "covers its travel budget is replayed from it).")
     p.add_argument("--seam-blend-s", type=float, default=0.25,
                    help="PASS 2: seam inertialization window (s); only used by SOFT seams.")
     p.add_argument("--weld-search", type=int, default=12,

@@ -213,13 +213,17 @@ def main(env_cfg, agent_cfg) -> int:
     agent_cfg = handle_deprecated_rsl_rl_cfg(agent_cfg, _md.version("rsl-rl-lib"))
     env = RslRlVecEnvWrapper(gym.make(args_cli.task, cfg=env_cfg), clip_actions=agent_cfg.clip_actions)
     runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    # Actor-only for a play runner, exactly as play.py does. The tracker task builds a WIDER
-    # critic than the teacher checkpoint carries (2490 vs 1961 here), so a strict load dies on
-    # a tensor nothing in this script uses -- only the inference policy is read below. The
-    # actor is still loaded strictly, so a genuine policy mismatch fails loudly.
+    # Actor-only for a play runner, exactly as play.py does. A runner cfg can opt out of
+    # restoring the value function (``load_critic = False``), and the FM TRACKER does: it has
+    # no privileged observation group, so the critic the task builds does not match the one the
+    # teacher trained. Loading strictly dies on a bare size mismatch on mlp.0 -- measured at
+    # both 2490 vs 1961 and 1834 vs 2490 depending on the pair -- which reads like a
+    # policy/env mismatch and is not one: the ACTOR matches exactly, and only the inference
+    # policy is read below. Actor weights stay strict, so a real mismatch still fails loudly.
     if getattr(agent_cfg, "load_critic", True):
         runner.load(args_cli.checkpoint)
     else:
+        print("[INFO] Skipping the critic (play-only runner): loading actor weights only.")
         runner.load(args_cli.checkpoint, load_cfg={"actor": True, "critic": False,
                                                    "optimizer": False, "iteration": True,
                                                    "rnd": True})
@@ -229,6 +233,11 @@ def main(env_cfg, agent_cfg) -> int:
     robot = u.scene["robot"]
     cmd = u.command_manager.get_term("traj_ref")
     has_scan = "height_scanner" in u.scene.sensors
+    # Depth is this policy's exteroception, and it was the one signal no trace recorded on
+    # either side -- so a sim2sim divergence could never be attributed to what the two
+    # policies SAW. Captured normalised (mdp.depth_obs_stack), i.e. exactly the observation,
+    # so it lines up with the MuJoCo runner's <log>.depth.npy without a unit conversion.
+    has_depth = any(n.startswith("depth_camera") for n in u.scene.sensors)
     scan_sl = _obs_term_slice(u, "policy", "height_scan") if has_scan else None
     cmd_sl = _obs_term_slice(u, "policy", "command_vel")
     body_idx = [robot.body_names.index(f) for f in _FRAMES if f in robot.body_names]
@@ -246,7 +255,7 @@ def main(env_cfg, agent_cfg) -> int:
     # index is applied to the NUMPY result: several sources (joint_pos, body_pos_w) are warp
     # arrays that reject a fancy index, so _np() has to run first.
     print(f"[INFO] capturing {ncap} envs {cap_idx} x {args_cli.steps} steps; frames={frames}; "
-          f"scan={'yes' if has_scan else 'no'}")
+          f"scan={'yes' if has_scan else 'no'} depth={'yes' if has_depth else 'no'}")
 
     # Reference: the world state the CLF tracks, in the clip's output layout.
     pos_names = list(cmd.ordered_pos_output_names)
@@ -261,9 +270,11 @@ def main(env_cfg, agent_cfg) -> int:
     depth_cams = [c for c in ("depth_camera_near", "depth_camera_far") if c in u.scene.sensors]
     buf: dict[str, list] = {k: [] for k in
                             ("cmd_vel", "ach_vel", "scan_obs", "scan_raw", "scan_hits",
+                             "depth", "ctrl", "torque",
                              "root_pos", "root_quat", "joint_pos", "body_pos", "ref_pos",
-                             "done", "time_out", "fm_pred", "fm_pred_frames", "fm_pred_idx",
-                             "depth_hits", "depth_img")}
+                             "done", "time_out", "depth_hits", "depth_img",
+                             "fm_pred", "fm_pred_quat", "fm_pred_frames", "fm_pred_idx",
+                             "fm_anchor_pos", "fm_anchor_quat")}
     obs = env.get_observations()
     if isinstance(obs, tuple):          # rsl-rl returns (obs, extras) in some versions
         obs = obs[0]
@@ -278,6 +289,8 @@ def main(env_cfg, agent_cfg) -> int:
         else:
             raw = np.zeros((ncap, 1), "float32")
         buf["scan_raw"].append(raw)
+        if has_depth:
+            buf["depth"].append(_np(mdp.depth_obs_stack(u))[:ncap].astype("float32"))
         if has_scan:
             # World-frame ray HIT POINTS, so the viewer can draw the scan as 3D dots without
             # re-deriving the pattern geometry. Missed rays come back non-finite; the viewer
@@ -307,6 +320,21 @@ def main(env_cfg, agent_cfg) -> int:
         buf["ach_vel"].append(np.concatenate(
             [_yaw_rotate_inv(lin, rq), _yaw_rotate_inv(ang, rq)[:, 2:3]], axis=-1))  # vx, vy, vz, wz
         buf["joint_pos"].append(_np(robot.data.joint_pos)[cap_idx])
+        # The COMMANDED joint target and the torque the actuators actually applied -- the two
+        # signals that make a cross-simulator comparison possible at all. Without them a
+        # divergence can only be seen in the OUTCOME, never attributed to the policy asking for
+        # something different or to the actuator delivering something different.
+        # ``processed_actions`` is the action after scale + default-pose offset, i.e. the same
+        # quantity MuJoCo logs as ``ctrl_<joint>``.
+        try:
+            term = u.action_manager.get_term(u.action_manager.active_terms[0])
+            buf["ctrl"].append(_np(term.processed_actions)[cap_idx].astype("float32"))
+        except Exception:                                                 # noqa: BLE001
+            pass
+        try:
+            buf["torque"].append(_np(robot.data.applied_torque)[cap_idx].astype("float32"))
+        except Exception:                                                 # noqa: BLE001
+            pass
         buf["body_pos"].append(_np(robot.data.body_pos_w)[cap_idx][:, body_idx])
         y = _np(cmd.y_des)[cap_idx]
         buf["ref_pos"].append(np.stack([y[:, ref_idx[f]] for f in frames if f in ref_idx], axis=1))
@@ -316,11 +344,21 @@ def main(env_cfg, agent_cfg) -> int:
             # re-plan) so a viewer can show exactly what the FM emitted at any step; the window
             # is only refreshed every ``fm_update_every`` steps, so consecutive steps repeat it
             # while ``fm_pred_idx`` walks forward through it.
-            # There is no world-frame mirror of the prediction on the command: the window is
-            # relative by construction and ``window_to_world`` derives the world frame on
-            # demand. So do exactly what the in-sim ribbon does
-            # (``FmTrackingCommand._draw_fm_prediction_ribbon``) -- same buffers, same call --
-            # rather than reading an attribute that would have to be maintained in parallel.
+            # Lift the WHOLE window through its OWN stored re-plan anchor, exactly as the
+            # in-sim ribbon does (``FmTrackingCommand._draw_fm_prediction_ribbon``) -- same
+            # buffers, same call -- rather than reading an attribute that would have to be
+            # maintained in parallel. There is no world-frame mirror of the prediction on the
+            # command: the window is relative by construction and ``window_to_world`` derives
+            # the world frame on demand. The anchor is the robot's FULL orientation at the
+            # re-plan, so the window it encodes pitches and rolls with the torso; using the
+            # CURRENT pose would shear the result by the egomotion since that re-plan whenever
+            # fm_update_every > 1.
+            #
+            # This used to read ``_pred_root_pos``/``_pred_frame_pos``, which the
+            # reference-window refactor deleted. Both were fetched with a defaulting
+            # ``getattr``, so the capture silently degraded to a zero-filled [ncap, 1, 3] that
+            # still LOOKED like a prediction. Reach for the live attributes and let a rename
+            # fail loudly.
             world = window_to_world(cmd._pred_window, cmd._anchor_pos[:, None, :],
                                     cmd._anchor_quat[:, None, :], cmd.ctx.nj,
                                     cmd.ctx.num_extra_frames, cmd._fm_blocks)
@@ -332,8 +370,13 @@ def main(env_cfg, agent_cfg) -> int:
             if ee is None:
                 ee = cmd._fk_ee_positions(world)
             buf["fm_pred"].append(_np(world["base_pos_w"])[cap_idx])          # [ncap, F, 3]
+            buf["fm_pred_quat"].append(_np(world["base_quat_w"])[cap_idx]
+                                       if "base_quat_w" in world
+                                       else np.zeros((ncap, cmd.ctx.F, 4), "float32"))
             buf["fm_pred_frames"].append(_np(ee)[cap_idx])                    # [ncap, F, K, 3]
             buf["fm_pred_idx"].append(_np(cmd._pred_idx)[cap_idx].astype("int32"))
+            buf["fm_anchor_pos"].append(_np(cmd._anchor_pos)[cap_idx])
+            buf["fm_anchor_quat"].append(_np(cmd._anchor_quat)[cap_idx])
 
         with torch.inference_mode():
             obs, _, dones, _ = env.step(act)
