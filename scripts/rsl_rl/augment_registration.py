@@ -51,6 +51,7 @@ recording's, because env origins enter the tile layout.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -133,7 +134,11 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
 
-if args_cli.clutter:
+if args_cli.clutter and "--num_augments" not in sys.argv:
+    # Clutter alone is the controlled A/B: the pair differs in pixels and nothing else.
+    # Asking for --num_augments explicitly is the opt-in to ALSO displace the robot, which
+    # is a training pass rather than a measurement -- and it brings the penetration filter
+    # with it, since the clutter was vetted against the RECORDED path, not a displaced one.
     args_cli.visual_only = True
 if args_cli.visual_only:
     if args_cli.check_only:
@@ -174,6 +179,7 @@ from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: E402
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 from motion_gen.clips.clip_io import load_clip_library  # noqa: E402
+from motion_gen.terrain.clutter import windows_that_penetrate  # noqa: E402
 from recorded_data_io import (  # noqa: E402
     RecordedWindowWriter,
     load_recorded_windows,
@@ -484,6 +490,24 @@ def main() -> int:
     with h5py.File(lib, "r") as _lf:
         clip_tid = _lf["terrain_id"][:]
     env_tyaw = to_torch(terr.env_terrain_yaw).detach().cpu().numpy().reshape(-1)
+    # Tile-local origin per env, for the clutter penetration filter. Tile meshes are emitted
+    # AXIS-ALIGNED and translated onto their corner, so tile-local xy is world xy minus this
+    # -- there is no rotation to undo, and env_terrain_yaw is the anchor mask's frame, not
+    # the mesh's.
+    env_corner = to_torch(terr.env_cell_corner).detach().cpu().numpy().reshape(-1, 3)
+    sizes_by_tid: dict[int, tuple[float, float]] = {}
+    _fpt = to_torch(terr._tile_footprint).detach().cpu().numpy().reshape(-1, 2)
+    _tid_flat = to_torch(terr._tile_terrain_id).detach().cpu().numpy().reshape(-1)
+    for _i, _t in enumerate(_tid_flat):
+        sizes_by_tid.setdefault(int(_t), (float(_fpt[_i, 0]), float(_fpt[_i, 1])))
+    clutter_boxes: dict[int, list] = {}
+    if args_cli.clutter and not args_cli.visual_only:
+        with open(args_cli.clutter) as _cf:
+            _side = json.load(_cf)
+        clutter_boxes = {int(k): v for k, v in _side["per_terrain_id"].items()}
+        print(f"[augment] displacing INTO clutter: {sum(len(v) for v in clutter_boxes.values())} "
+              f"volumes over {len(clutter_boxes)} tiles; windows whose displaced reference "
+              f"enters one will be dropped.")
     _libm = load_clip_library(lib, device="cpu",
                               keys=["anchor_mask", "anchor_mask_t", "clip_len"])
     amt_np = _libm.anchor_mask_per_step().numpy()          # (num_clips, T) uint8, 255 resolved
@@ -574,6 +598,8 @@ def main() -> int:
     allren = []
     allsrc = []
     n_done = 0
+    n_dropped = 0
+    _diag_done = [False]
     # Schedule passes so NO window is dropped. Only one window per env can be placed per
     # render pass (they share the env's robot), and after the terrain filter the surviving
     # windows are NOT evenly spread across envs -- so slicing the list into fixed batches
@@ -873,7 +899,55 @@ def main() -> int:
                 # history_ref stay put so the offset cannot leak in through them.
                 out["history_state"][:, H - 1, s_pos] = place_pos.astype(np.float32)
                 out["history_state"][:, H - 1, s_quat] = new_quat[keep].astype(np.float32)
-                writer.write_batch(out)
+                # DROP windows whose DISPLACED reference walks into a clutter volume. The
+                # clutter was vetted against the recorded path with a 0.45 m veto, and the
+                # displacement spends up to hypot(downrange, lateral) of that, so the worst
+                # case reaches inside the body radius. Nothing collides -- decor has no
+                # collider -- so the cost is a depth image of the robot inside a box and a
+                # target that walks through it, which is precisely the lesson not to teach.
+                if clutter_boxes:
+                    _tids = env_tid[tgt_env]
+                    _rxy = out["ref_future"][:, :, s_pos][..., :2].astype(np.float64)
+                    _rxy = _rxy - env_corner[tgt_env][:, None, :2]      # -> tile-local
+                    _bad = np.zeros(len(_rxy), dtype=bool)
+                    for _t in np.unique(_tids):
+                        _bx = clutter_boxes.get(int(_t))
+                        if not _bx:
+                            continue
+                        _m = _tids == _t
+                        _bad[_m] = windows_that_penetrate(_rxy[_m], _bx)
+                    if not _diag_done[0]:
+                        # ONE-TIME frame check. A wrong tile transform makes this filter
+                        # silently inert -- _bad comes back all-False and reads as "no
+                        # penetrations" rather than "the filter is not looking anywhere".
+                        # Tile-local coordinates must land inside the tile footprint.
+                        _fp = np.array([sizes_by_tid.get(int(t), (np.nan, np.nan))
+                                        for t in _tids], dtype=float)
+                        _in = ((_rxy[..., 0] >= -1.0) & (_rxy[..., 0] <= _fp[:, None, 0] + 1.0)
+                               & (_rxy[..., 1] >= -1.0) & (_rxy[..., 1] <= _fp[:, None, 1] + 1.0))
+                        _frac = float(np.nanmean(_in))
+                        # REFUSE, do not warn. IsaacSim's exit path discards buffered Python
+                        # stdout, so a printed warning here routinely vanishes from a
+                        # redirected log -- and an inert safety filter that logs nothing is
+                        # indistinguishable from one that found nothing to drop.
+                        if _frac < 0.90:
+                            raise SystemExit(
+                                f"clutter penetration filter is looking in the wrong frame: "
+                                f"only {100.0 * _frac:.1f}% of reference nodes land inside "
+                                f"their own tile footprint. Tile-local xy is world xy minus "
+                                f"env_cell_corner; if the tile layout or that mapping has "
+                                f"changed, the filter silently drops nothing.")
+                        print(f"[augment] clutter-filter frame check: {100.0 * _frac:.1f}% "
+                              "of reference nodes inside their tile footprint")
+                        _diag_done[0] = True
+                    if _bad.any():
+                        # keep is an INDEX array, so filtering it keeps len(keep) equal to
+                        # the number of surviving windows and the counter below stays honest.
+                        out = {kk: vv[~_bad] for kk, vv in out.items()}
+                        keep = keep[~_bad]
+                        n_dropped += int(_bad.sum())
+                if len(keep):
+                    writer.write_batch(out)
             n_done += len(keep)
             if n_done % (batch * 8) < batch:
                 print(f"[augment] {n_done}/{len(src) * reps}")
@@ -928,6 +1002,9 @@ def main() -> int:
         print("  (near-zero => placement, tile alignment and sensor refresh are all correct)")
     else:
         writer.close()
+        if n_dropped:
+            print(f"[augment] dropped {n_dropped} window(s) whose displaced reference entered "
+                  f"a clutter volume ({100.0 * n_dropped / max(n_done + n_dropped, 1):.2f}%).")
         print(f"[augment] wrote {args_cli.out}: {n_done} windows "
               f"({len(src)} source x {reps})")
     env.close()
