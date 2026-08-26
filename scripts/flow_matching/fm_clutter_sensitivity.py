@@ -183,27 +183,33 @@ def main() -> int:
           + f"   n={int(unseen.sum())}")
     print(f"  {'RESPONSE (clutter seen)':28s}" + "".join(f"{v:9.4f}" for v in r)
           + f"   n={int(seen.sum())}")
-    # The HEADLINE, and it is an exceedance rather than a ratio. The control is ~0 over most
-    # of its range, so a percentile ratio divides by zero and reports millions; and comparing
-    # the response's MEDIAN against the control's MAX -- the obvious next move -- understates
-    # the effect badly, because the control's max is its own extreme tail.
-    thr = float(moved[unseen].max())
+    # The HEADLINE is an exceedance, not a ratio: the control is ~0 over most of its range,
+    # so a percentile ratio divides by near-zero and reports millions.
+    #
+    # The threshold is the control's p99.9 and NOT its max. The max is one window, so the
+    # statistic inherits that window's luck -- measured across two clutter draws of the same
+    # checkpoint the max moved 0.0066 -> 0.0241 and dragged the headline 47% -> 13%, while
+    # p99.9 held at 0.0050 / 0.0045 and the two agreed to five points. A threshold that
+    # unstable cannot compare two checkpoints, which is the entire job here.
+    thr = float(np.percentile(moved[unseen], 99.9))
     big = frac_px > 0.02
-    print(f"\n  Windows whose plan moved further than the control EVER did ({thr:.4f} m):")
+    print(f"\n  Windows whose plan moved further than the control's p99.9 ({thr:.4f} m):")
     print(f"    of all clutter-visible windows      : {100 * (moved[seen] > thr).mean():5.1f}% "
           f"({int((moved[seen] > thr).sum())} of {int(seen.sum())})")
     if big.any():
         print(f"    of windows with >2% of frame changed: "
               f"{100 * (moved[big] > thr).mean():5.1f}% "
-              f"({int((moved[big] > thr).sum())} of {int(big.sum())})")
+              f"({int((moved[big] > thr).sum())} of {int(big.sum())})   <-- the headline")
     print(f"\n    sensitivity (plan m per unit of frame changed): "
           f"p50 {np.median(moved[seen] / frac_px[seen]):.4f}")
     res = dict(checkpoint=a.checkpoint, clean=a.clean, clutter=a.clutter,
                n_windows=int(len(moved)), frac_seen=float(seen.mean()),
                control_max_m=float(moved[unseen].max()) if unseen.any() else None,
                control_p99_m=float(np.percentile(moved[unseen], 99)) if unseen.any() else None,
-               exceed_control_frac=float((moved[seen] > moved[unseen].max()).mean())
-               if (unseen.any() and seen.any()) else None,
+               control_p999_m=float(np.percentile(moved[unseen], 99.9)) if unseen.any() else None,
+               exceed_control_frac=float(
+                   (moved[frac_px > 0.02] > np.percentile(moved[unseen], 99.9)).mean())
+               if (unseen.any() and (frac_px > 0.02).any()) else None,
                response_p50_m=float(np.median(moved[seen])) if seen.any() else None,
                response_p90_m=float(np.percentile(moved[seen], 90)) if seen.any() else None,
                moved_m=moved.tolist(), frac_pixels=frac_px.tolist())
