@@ -71,8 +71,6 @@ approach_min_transient_s: 0.35
 approach_hop_slack: 1.3
 
 # ---------------------------------------------------------------- RL-visible command
-rl_cmd_vary: false
-rl_cmd_seg_dur_range: [2.5, 5.5]
 segment_reuse: false            # share a generated MB segment between clips with identical
                                 # conditioning. OFF: with per-clip schedules two clips are only
                                 # interchangeable if their whole schedules match, and ~1.5x the

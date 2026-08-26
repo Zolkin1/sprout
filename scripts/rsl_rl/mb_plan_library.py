@@ -47,8 +47,6 @@ from mb_terrain_clips import (                                            # noqa
     plan_from_spec,
 )
 
-from motion_gen.command_schedule import (as_json, hold_constant,  # noqa: E402
-                                        sample_command_schedule, total_duration)
 from motion_gen.motionbricks.approach_zone import APPROACH_ZONE_M  # noqa: E402
 from motion_gen.terrain.terrain_sampler import sample_box_tiles, sample_stair_tiles  # noqa: E402
 from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   # noqa: E402
@@ -58,9 +56,6 @@ from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   #
 # frame (its planning horizon / context), so a window this long covers everything the model can see.
 _KEY_WINDOW = 64
 _STAIR_SKILLS = ("stairs_up", "stairs_down")
-# Slack added to a clip's schedule duration to cover the terrain interaction, whose length is
-# only known once the replay is placed. cmd_at saturates past the end, so over-long is safe.
-_INTERACTION_BUDGET_S = 12.0
 
 
 def _quantize(v: float, step: float) -> float:
@@ -104,7 +99,7 @@ def _round_key(*vals) -> str:
 
 
 def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = "stand",
-                  schedule=None, unique_salt: str | None = None) -> tuple[str, str]:
+                  holds=None, unique_salt: str | None = None) -> tuple[str, str]:
     """``(approach_key, exit_key)`` -- identical keys iff Motion Bricks would see identical input.
 
     Keyed on exactly what ``mb_terrain_segments`` feeds the model, no more:
@@ -130,11 +125,14 @@ def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = 
     # different motions for the same command, so they must not share a generated segment.
     a_parts = [f"{plan.skill}|{plan.approach_mode}|{approach_pin}|{approach_start}|approach", a_scalars]
     x_parts = [f"{plan.skill}|{plan.exit_mode}|{exit_pin}|exit", x_scalars]
-    # The SCHEDULE is part of what Motion Bricks is conditioned on now: pass B tracks it to generate
-    # both segments, so two clips whose schedules differ are two different motions and must not share
-    # a cached segment. Sampled per clip, so in practice this alone drops reuse to ~0.
-    if schedule is not None:
-        flat = [v for seg in schedule for v in seg]
+    # The HOLDS are part of what Motion Bricks is conditioned on: pass B tracks them to generate
+    # both segments, so two clips whose holds differ are two different motions and must not share a
+    # cached segment. Drawn per clip, so in practice this alone drops reuse to ~0.
+    if holds is not None:
+        # The HOLD LIST, flattened. Pass B generates both segments by tracking these commands, so
+        # two clips whose holds differ are two different motions and must not share a segment.
+        flat = [v for side in ("approach", "exit") for d, c in holds[side] for v in (d, c)]
+        flat.append(float(holds["interaction"]))
         a_parts.append(flat)
         x_parts.append(flat)
     # ``unique_salt`` forces a segment per clip even if two schedules DID collide -- an explicit
@@ -279,44 +277,36 @@ def _cmd_mag(vx: float, sign: float, args) -> float:
     return min(abs(float(vx)), float(args.backward_vx_max)) if float(sign) < 0.0 else abs(float(vx))
 
 
-def _clip_schedule(rng, family_kind: str, approach_s: float, exit_s: float,
-                   steady_vx: float, args):
-    """Per-clip command schedule for a terrain clip, spanning approach + interaction + exit.
+def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
+              steady_vx: float, args) -> dict:
+    """The RL-visible command as a list of HOLDS, one per steady stretch, plus the interaction's.
 
-    Forward-only: a traversal is authored along the tile's +x, so a lateral or yaw command would walk
-    the robot off it. Everything else comes from the SHARED sampler every family uses -- the flat
-    family calls it with the full command space, this calls it with one band.
+    Replaces a time-indexed schedule, and that is the point rather than a tidy-up. The schedule was
+    sampled over an absolute clip timeline and then had to be held constant across the approach and
+    the exit, which meant knowing where those windows were -- so ``_clip_schedule`` reserved a fixed
+    ``_INTERACTION_BUDGET_S = 12.0`` for the traversal. The real replay is 2-6 s, so the exit's hold
+    window began 6-10 s LATE and usually did nothing at all, and could even start past the end of
+    the clip. It was inert only because the shipped recipe held the whole clip at one value; it
+    would have fired the moment command variation was turned on, which is the next step.
 
-    The duration covers the whole clip generously; the interaction's own length is not known until
-    the replay is placed, and ``cmd_at`` saturates past the end, so an over-long schedule is
-    harmless while a short one would leave the tail uncommanded.
+    A hold list has no time axis to be wrong about. Each entry is ``(distance_m, vx)`` -- distance,
+    because that is what the approach and exit budgets are in and what an exact loop covers by
+    construction -- and pass C lays them onto the spliced piece boundaries, so the command is
+    piecewise-constant on those boundaries BY CONSTRUCTION rather than by a rasterise-and-hold
+    round trip that only approximated it.
+
+    Forward-only: a traversal is authored along the tile's +x, so a lateral or yaw command would
+    walk the robot off it.
+
+    Returns:
+        ``{"approach": [(dist, vx)], "interaction": vx, "exit": [(dist, vx)]}``.
     """
-    band = tuple(args.stair_vel_range) if family_kind == "stairs" else tuple(args.box_vel_range)
-    total = float(approach_s) + float(exit_s) + _INTERACTION_BUDGET_S
-    if not args.rl_cmd_vary:
-        # Ablation: ONE held value for the whole clip. Still aligned -- pass B generates both
-        # segments by tracking it, so a constant schedule reproduces the old behaviour exactly
-        # rather than approximately.
-        return [(total, float(steady_vx), 0.0, 0.0)]
-    sched = sample_command_schedule(
-        rng, duration=total, seg_dur_range=tuple(args.rl_cmd_seg_dur_range), vx_range=band)
-    # HOLD the command across the approach and the exit.  Both are stretches of steady walking that are
-    # generated to track it -- the approach is an exact looped stride AT the commanded speed -- so a change
-    # inside one of them asks for a velocity the segment cannot express, and the clip then shows the RL one
-    # velocity while commanding another.  The interaction is where a change belongs: the terrain overrides
-    # the command there anyway, so the clip still carries a varied command without ever contradicting
-    # itself.  The exit window is left open-ended because the interaction's true length is not known until
-    # the replay is placed, and holding slightly too much is harmless.
-    #
-    # TODO(approach-vel-change): support a command that DOES change during the approach/exit, by building
-    # them as [loop@v0][transient][loop@v1][transient][replay] instead of a single loop + transient. Every
-    # piece already exists -- ``splice_pieces`` is N-ary, ``loop_frames`` takes any entry phase, and
-    # ``flat_plan.sample_plan`` builds exactly this alternation for flat clips. What is missing is pass A
-    # emitting the approach as a PIECE LIST rather than one ``approach_dist``, and pass B generating one
-    # bounded transient per command change instead of one per side. Until then this hold is what keeps the
-    # command and the motion consistent.
-    return hold_constant(sched, [(0.0, float(approach_s)),
-                                 (float(approach_s) + _INTERACTION_BUDGET_S, total)])
+    # ONE hold per side for now, at the clip's steady command -- byte-for-byte what the constant
+    # schedule produced. Several holds per side is the next step; the representation is what had to
+    # come first, because the thing blocking it was the time axis rather than the sampling.
+    return {"approach": [(float(approach_dist), float(steady_vx))],
+            "interaction": float(steady_vx),
+            "exit": [(float(exit_dist), float(steady_vx))]}
 
 
 def _clip_speeds(rng, family_kind: str, args, cpt: int, vx_max: float | None = None) -> list[float]:
@@ -361,14 +351,6 @@ def main() -> int:
     p.add_argument("--stair-tiles", type=int, default=20, help="TRANSITION tiles per stair direction.")
     p.add_argument("--box-tiles", default="20,15,15", help="jump_on,jump_off,jump_off_front tile counts.")
     p.add_argument("--clips-per-tile", type=int, default=50)
-    p.add_argument("--rl-cmd-vary", action=argparse.BooleanOptionalAction, default=True,
-                   help="Sample a varying command schedule per terrain clip. --no-rl-cmd-vary gives "
-                        "ONE held value, which is the pre-schedule behaviour and a clean ablation.")
-    p.add_argument("--rl-cmd-seg-dur-range", type=float, nargs=2, default=(1.0, 3.0),
-                   metavar=("MIN", "MAX"),
-                   help="Seconds per segment of a terrain clip's command schedule. Sampled HERE "
-                        "(pass A) because pass B generates the motion by tracking the schedule, so "
-                        "it must exist before the motion does.")
     p.add_argument("--segment-reuse", action=argparse.BooleanOptionalAction, default=False,
                    help="Share a generated MB segment between clips whose conditioning is identical. "
                         "OFF by default: with per-clip command schedules two clips are only "
@@ -562,16 +544,15 @@ def main() -> int:
                     # stair clip is ever generated.
                     rl_vel_range=(tuple(args.stair_vel_range) if kind == "stairs"
                                   else tuple(args.box_vel_range)),
-                    # The per-clip command SCHEDULE, sampled here in pass A rather than when the clip
-                    # is written in pass C. It has to exist before pass B, because Motion Bricks
-                    # GENERATES the approach and exit motion by tracking it -- a schedule invented
-                    # afterwards would be a command the motion never followed. The terrain overrides
-                    # it only near the interaction (mb_terrain_segments); everywhere else the motion
-                    # tracks it, which is the whole point.
-                    rl_cmd_schedule=as_json(_clip_schedule(
+                    # The per-clip RL command, as a list of HOLDS, decided here in pass A rather
+                    # than when the clip is written in pass C. It has to exist before pass B,
+                    # because Motion Bricks GENERATES the approach and exit motion by tracking these
+                    # commands -- a command invented afterwards would be one the motion never
+                    # followed. The terrain overrides it only near the interaction
+                    # (mb_terrain_segments); everywhere else the motion tracks it.
+                    rl_holds=_rl_holds(
                         np.random.default_rng([args.seed + 7, _skill_seed(skill), int(tid), ci]),
-                        kind, a_dist / max(0.2, abs(g_mag)), x_dist / max(0.2, abs(g_mag)),
-                        float(family.exit_sign) * abs(float(vx)), args)),
+                        kind, a_dist, x_dist, float(family.exit_sign) * abs(float(vx)), args),
                     # Metres, not seconds. platform_* are TILE-level maxima; approach/exit_dist are
                     # this clip's own budget.
                     platform_ground_dist=plat_ground_dist, platform_top_dist=plat_top_dist,
@@ -602,7 +583,7 @@ def main() -> int:
                 save_terrain_plan(os.path.join(work, rel), plan)
                 a_key, x_key = _segment_keys(
                     plan, args.approach_pin, args.exit_pin, a_start,
-                    schedule=job_args.rl_cmd_schedule,
+                    holds=job_args.rl_holds,
                     unique_salt=(None if args.segment_reuse else f"{skill}|{tid}|{ci}"))
                 # A one-sided box tile has no ELEVATED segment: don't request it and don't record its key,
                 # so pass B never generates it and pass C knows to splice that side as None.

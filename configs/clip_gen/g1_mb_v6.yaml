@@ -85,8 +85,6 @@ approach_hop_slack: 1.3
 # The command written into the clip is TERRAIN-AGNOSTIC by design -- what a user or planner asked
 # for, with no knowledge of the terrain -- while the reference motion is terrain-aware. Bridging
 # that gap is what the flow model is for, so this is never derived from the motion.
-rl_cmd_vary: false              # ONE held command per clip: a change mid-clip reads as a conflicting signal
-rl_cmd_seg_dur_range: [2.5, 5.5]  # s per command segment; shorter than flat's, terrain clips are shorter
 segment_reuse: false            # share a generated MB segment between clips with identical
                                 # conditioning. OFF: with per-clip schedules two clips are only
                                 # interchangeable if their whole schedules match, and ~1.5x the

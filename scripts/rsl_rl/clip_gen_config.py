@@ -127,8 +127,6 @@ _SCHEMA: dict[str, tuple] = {
     "approach_min_transient_s": ("float", 2),
     "approach_hop_slack": ("float", 2),
     # RL-visible command
-    "rl_cmd_vary": ("bool", 1),
-    "rl_cmd_seg_dur_range": ("range", 2),
     "segment_reuse": ("bool", 1),
     "rl_vels": ("choice", ("raw", "snapped")),
     # composition

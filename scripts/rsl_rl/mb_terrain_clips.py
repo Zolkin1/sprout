@@ -44,8 +44,6 @@ import os
 import numpy as np
 import torch
 
-from motion_gen.command_schedule import from_json, rasterize
-
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 from motion_gen.terrain.box_clip import box_tile_boxes, build_anchor_mask_t, stair_tile_boxes
 from motion_gen.clip_output import ClipOutputBuilder
@@ -272,6 +270,27 @@ def _budget_loop(bank, budget: float, prov: dict, dt: float, dev: str, travelled
     return Piece(seg=(lrp, lrq, ljt), kind="loop", rigid=True, stride_idx=s_idx), n * speed * dt
 
 
+def _cmd_track_from_bounds(bounds, cmds: list, n: int) -> "torch.Tensor":
+    """Per-frame RL command ``[n]`` from the spliced pieces' own ``(start, end)`` bounds.
+
+    One value per PIECE, laid onto that piece's frames. That is the whole mechanism, and it is why
+    the command can no longer disagree with the motion about where a change happens: a piece is a
+    loop or a transient, so a boundary here IS a boundary in the reference.
+
+    What it replaces rasterised a time-indexed schedule at ``dt`` and re-coalesced it, which could
+    place a change INSIDE an exact looped stride -- a command the loop provably cannot follow,
+    because a loop travels command x duration by construction. That is the shape of the failure
+    that gave g1_mb_v7 a box-exit tracking error of 1.619 m/s against v5's 0.797.
+    """
+    out = torch.zeros(int(n), dtype=torch.float32)
+    for (a, b), c in zip(bounds, cmds):
+        if b > a:
+            out[a:b] = float(c)
+    if bounds and int(bounds[-1][1]) < n:                 # trailing frames keep the last command
+        out[int(bounds[-1][1]):] = float(cmds[-1])
+    return out
+
+
 def apply_platform_trim(head: int, tail: int, arrays: list, bounds: list, per_frame: dict) -> tuple:
     """Apply a ``_platform_trim`` cut to the motion, the segment bounds AND every per-frame channel.
 
@@ -446,12 +465,17 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
                    "pos": [float(v) for v in b["pos"]], "size": [float(v) for v in b["size"]],
                    "yaw": float(b.get("yaw", 0.0))} for b in boxes],
         "reference": ts.name, "reference_speed": ref_speed, "rl_vx": float(rl_vx),
-        # The band rl_vx was drawn from; _rl_command_track samples the varied command from it.
+        # The band rl_vx was drawn from; pass A draws the per-side holds within it.
         "rl_vel_range": [float(v) for v in getattr(args, "rl_vel_range", RL_CMD_VEL_RANGE)],
-        # The per-clip command schedule, authored in pass A. Pass B generated the approach and exit
-        # motion by TRACKING this, so writing it verbatim as target_vel is what makes the command the
-        # RL sees and the motion it sees agree outside the terrain override.
-        "rl_cmd_schedule": getattr(args, "rl_cmd_schedule", None),
+        # The per-clip RL command as HOLDS -- {"approach": [(dist, vx)], "interaction": vx,
+        # "exit": [(dist, vx)]} -- authored in pass A. Pass B generated the approach and exit motion
+        # by TRACKING these, so laying them onto the spliced piece bounds is what makes the command
+        # the RL sees and the motion it sees agree outside the terrain override.
+        #
+        # DISTANCE-indexed, not time-indexed. The schedule this replaces was laid out on an absolute
+        # clip timeline, which forced pass A to guess the traversal's length (a fixed 12 s against a
+        # real 2-6 s) so it could hold the command steady across the approach and the exit.
+        "rl_holds": getattr(args, "rl_holds", None),
         "terrain_id": int(args.terrain_id), "footprint_margin": float(args.footprint_margin),
         "family_blurb": family.blurb, "exit_sign": float(family.exit_sign),
         "lower_z": float(lower_z), "upper_z": float(upper_z),
@@ -523,36 +547,12 @@ def _load_segment(path: str | None, dt: float, dev):
 
 
 # RL-command variation defaults, defined ONCE here and used both as the CLI defaults and as the
-# fallbacks in _rl_command_track. ``clip_from_plan`` is called with a hand-built namespace by
+# fallbacks for a plan with no holds. ``clip_from_plan`` is called with a hand-built namespace by
 # ``mb_assemble_library`` (the real library-build path) as well as from this file's own CLI, so a
 # fallback of "off" would mean the feature silently does nothing in the pipeline that matters.
 # Fallback band, used only when a plan predates ``rl_vel_range`` in its meta. Live plans carry the
 # band their own family drew from, which is what a varied command is sampled from.
 RL_CMD_VEL_RANGE = (0.2, 3.5)
-
-
-def _rl_command_track(T: int, plan, dt: float) -> np.ndarray:
-    """Per-step RL forward command ``[T]``, read from the schedule pass A authored.
-
-    NOT sampled here. Pass B GENERATED this clip's approach and exit motion by tracking this same
-    schedule, so writing it verbatim is what makes the command the RL sees and the motion it sees
-    agree -- everywhere except the terrain override (the last ``ramp_s`` of the approach and the
-    interaction itself), which is the only place the motion is allowed to disregard it.
-
-    An earlier version sampled a fresh random command HERE, in pass C. That could not possibly
-    align: the motion already existed by then, generated at a single constant speed, so the command
-    and the motion disagreed across the whole approach and exit -- the two phases where they must
-    match -- while agreeing only through the interaction, where divergence is expected. Exactly
-    inverted.
-
-    Falls back to the clip's steady ``rl_vx`` for a plan that predates the schedule, which is at
-    least aligned: the approach and exit were generated at that speed.
-    """
-    raw = plan.meta.get("rl_cmd_schedule")
-    if not raw:
-        return np.full(int(T), float(plan.meta["rl_vx"]), dtype=np.float32)
-    sign = -1.0 if float(plan.meta["rl_vx"]) < 0 else 1.0
-    return (sign * rasterize(from_json(raw), int(T), float(dt))[:, 0]).astype(np.float32)
 
 
 def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
@@ -598,7 +598,20 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
         loop_piece, loop_travel = _budget_loop(
             bank, plan.approach_dist, a_prov, dt, dev, travelled=float(a_prov.get("travel", 0.0)),
             stride_key="seed_stride", phase_key="seed_phase", at_end=False)
+        # The RL command PER PIECE, in the same order the pieces are built. Laid onto the splice's
+        # own bounds below, which is what makes the command piecewise-constant on piece boundaries
+        # BY CONSTRUCTION -- the schedule it replaces was rasterised onto a clip timeline and then
+        # re-coalesced, which only approximated that, and could put a change INSIDE an exact loop
+        # where the motion provably cannot follow it.
+        _holds = (plan.meta or {}).get("rl_holds") or {}
+        _a_cmds = [c for _d, c in (_holds.get("approach") or [])] or [float(plan.meta["rl_vx"])]
+        _x_cmds = [c for _d, c in (_holds.get("exit") or [])] or [float(plan.meta["rl_vx"])]
+        _inter = float(_holds.get("interaction", plan.meta["rl_vx"]))
+        # A TRANSIENT carries the command it is heading TO -- flat_plan.Transient.cmd_vel's own
+        # convention, kept so the two paths read the same way.
+        piece_cmds: list[float] = []
         if loop_piece is not None:
+            piece_cmds = [_a_cmds[0], _inter, _inter]      # loop, entry transient, replay
             pieces = [loop_piece,
                       Piece(seg=approach, kind="transient",
                             ground_z=(None if a_seam == "weld"
@@ -619,6 +632,7 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                                     ground_z=(None if e_seam == "weld"
                                               else (0.0 if e_frame == "tile"
                                                     else float(plan.exit_surf_z)))))
+                piece_cmds.append(_x_cmds[0])             # heading TO the exit command
             # BOUNDED exit: the transient hands off to an exact loop that covers the rest of its budget,
             # the mirror of the approach.  Appended after the exit transient so the walk-away runs at the
             # commanded speed by construction rather than at whatever Motion Bricks drifted to.
@@ -630,7 +644,9 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                     stride_key="loop_stride", phase_key="loop_phase", at_end=True)
                 if x_loop is not None:
                     pieces.append(x_loop)
+                    piece_cmds.append(_x_cmds[-1])        # the steady walk-away
             Wp, Wq, Wj, pb, seams, pdiag = splice_pieces(pieces, blend_n=blend_n, dt=dt)
+            assert len(piece_cmds) == len(pieces), (len(piece_cmds), len(pieces))
             # Mark the LOOP frames, the same way the flat path does.  Without this a terrain clip reports
             # stride_idx = -1 throughout, which hides its approach/exit loops from the loop-exactness
             # check and from seam detection -- the internal loop<->transient seams become invisible and
@@ -657,6 +673,9 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                     # "seam_speed=nan" -- the print falls back to nan when the key is absent -- and
                     # the entry/exit seam, which is the number this whole stage is judged on, became
                     # unreadable in the log. The per-seam data was in ``seam_accel`` all along.
+                    # The RL command laid onto the splice's own per-piece bounds. Trimmed with the
+                    # motion below, like any other per-frame channel.
+                    "rl_cmd_t": _cmd_track_from_bounds(pb, piece_cmds, int(Wp.shape[0])),
                     "approach_seam_speed": float(
                         torch.linalg.norm(Wp[n_a] - Wp[n_a - 1]) / dt) if n_a > 0 else 0.0,
                     "exit_seam_speed": float(
@@ -721,8 +740,10 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
     if head > 0 or tail < Wp.shape[0]:
         diag["platform_trim"] = (int(head), int(Wp.shape[0] - tail))
         (Wp, Wq, Wj), bounds, _pf = apply_platform_trim(
-            head, tail, [Wp, Wq, Wj], bounds, {"stride_idx_t": diag.get("stride_idx_t")})
+            head, tail, [Wp, Wq, Wj], bounds,
+            {"stride_idx_t": diag.get("stride_idx_t"), "rl_cmd_t": diag.get("rl_cmd_t")})
         diag["stride_idx_t"] = _pf["stride_idx_t"]
+        diag["rl_cmd_t"] = _pf["rl_cmd_t"]
 
     y, dy, contact = builder.build(Wp, Wq, Wj, dt)
     ta, tb = bounds[1]
@@ -745,7 +766,13 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
             f"plan for {plan.skill} predates the RL-command split: it has "
             f"{'terrain_vx' if 'terrain_vx' in plan.meta else 'neither rl_vx nor terrain_vx'}, not 'rl_vx'. "
             f"Re-run pass 1 (mb_terrain_clips --dump-plan / mb_plan_library) to regenerate the plans.")
-    tvel[:, 0] = torch.as_tensor(_rl_command_track(T, plan, dt), dtype=tvel.dtype, device=dev)
+    _cmd_t = diag.get("rl_cmd_t")
+    if _cmd_t is None:
+        # The legacy splice path (non-bounded) does not build piece bounds, so it keeps the clip's
+        # single steady command. Every driver run takes the bounded path.
+        tvel[:, 0] = float(plan.meta["rl_vx"])
+    else:
+        tvel[:, 0] = _cmd_t.to(device=dev, dtype=tvel.dtype)
 
     # ``frame_yaw``: the heading of the TERRAIN's own frame within the tile -- the axis the traversal
     # crosses it along.  The RL anchor mask resolves its downrange / lateral bits in this frame
@@ -774,6 +801,10 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
     # Every per-FRAME channel must be the clip's length. Cheap, and it is the check that would have
     # caught stride_idx_t surviving _platform_trim at its pre-trim length -- a silent off-by-``head``
     # that only mb_qc would ever have noticed, and only as slightly-wrong statistics.
+    _cmdt = diag.get("rl_cmd_t")
+    assert _cmdt is None or int(_cmdt.shape[0]) == T, (
+        f"rl_cmd_t is {tuple(_cmdt.shape)} for a {T}-frame clip; a per-frame channel was not sliced "
+        f"alongside the motion (see _platform_trim)")
     _sidx = diag.get("stride_idx_t")
     assert _sidx is None or int(_sidx.shape[0]) == T, (
         f"stride_idx_t is {tuple(_sidx.shape)} for a {T}-frame clip; a per-frame channel was not "

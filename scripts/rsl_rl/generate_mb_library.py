@@ -171,8 +171,6 @@ def main() -> int:
             "--work-dir", work, "--source", args.source, "--library", args.library,
             "--stair-tiles", str(cfg.stair_tiles), "--box-tiles", ",".join(str(x) for x in cfg.box_tiles),
             "--clips-per-tile", str(cpt), "--seed", str(cfg.seed), "--device", args.device,
-            "--rl-cmd-seg-dur-range", *(str(v) for v in cfg.rl_cmd_seg_dur_range),
-            *([] if cfg.rl_cmd_vary else ["--no-rl-cmd-vary"]),
             *([] if cfg.segment_reuse else ["--no-segment-reuse"]),
             "--stair-vel-range", *(str(v) for v in cfg.stair_vel_range),
             "--box-vel-range", *(str(v) for v in cfg.box_vel_range),
