@@ -19,12 +19,20 @@ seed: 0
 
 # ---------------------------------------------------------------- scale (tiles x clips)
 clips_per_tile: 50
-stair_tiles: 20                 # TRANSITION stair tiles per direction (up/down)
+stair_tiles: 26                 # TRANSITION stair tiles per direction (up/down)
 pure_stair_tiles: 15            # PURE stair tiles per direction (one long staircase, no approach)
-box_tiles: [20, 15, 15]         # jump_on, jump_off, jump_off_front
+box_tiles: [24, 15, 19]         # jump_on, jump_off, jump_off_front
+# The 20 tiles the distractor family used to hold went to TERRAIN, because a tile is how the RL and
+# the FM see geometry: each one carries its own corridor width, platform widths, step count,
+# floor-or-void and box height, and the importer round-robins envs over tiles. That is independent of
+# how many solved MOTION cells exist -- 26 stair tiles replaying 8 (riser, tread) cells still present
+# 26 different staircases to the camera. Transition stairs +6 per direction, jump_on +4,
+# jump_off_front +4; flat, pure stairs and jump_off unchanged. Still 200 tiles x 50 clips.
+#
+# jump_off is NOT grown: it is in DEFAULT_SKIP_FAMILIES (it drops BACKWARDS off a box and no
+# forward-facing camera sees it), so the generator never trains on it. It is not cut either -- the
+# teacher does train on it and C++ clip playback keeps the family.
 flat_tiles: 60
-distractor_tiles: 20
-distractor_s: 6.0               # distractor clip duration (s)
 
 # ---------------------------------------------------------------- flat family
 # The command schedule the flat clips are GENERATED with (mb_encode). Bands are explicit (min, max)

@@ -24,6 +24,14 @@ Every stage is skip-if-done, so a killed run resumes where it stopped, and ``--s
 two scripts loads the model ONCE and then generates everything it owns, which is the difference between one
 checkpoint load and thousands.
 
+The DISTRACTOR family is reachable from no recipe and no stage here. Its 20 tiles went to terrain
+(see configs/clip_gen/g1_mb_v6.yaml): the visual-clutter pass now delivers "a box you see but do
+not touch" on every tile rather than on 10% of them, at higher diversity and with no motion
+generation at all, and the family's clips were anchor_mask = 0 (fully world-pinned) besides.
+``mb_distractor_clips.py`` / ``motionbricks/distractor_plan.py`` / ``generate_distractor_clips.py``
+stay on disk: the first is the second consumer of ``flat_plan.plan_from_holds``, so deleting it
+would take that function's only non-flat test coverage with it.
+
 PURE stair tiles need no Motion Bricks -- a pure tile is one long platform-less staircase with no approach
 or exit, so there is nothing to in-between and ``mb_plan_library`` hardcodes ``n_pure=0``. They are built in
 stage c by ``mb_pure_stair_clips.py`` (matcher-free, reusing the same ``place_periodic_on_tile`` the
@@ -141,19 +149,13 @@ def main() -> int:
     fam_dir = args.families_dir or os.path.join(work, "families")
     bank = args.stride_bank or os.path.join(work, "stride_bank.npz")
     raw_flat = os.path.join(work, "raw_flat")
-    raw_dis = os.path.join(work, "raw_distractor")
-    dis_sched = os.path.join(work, "distractor_schedules.json")
     flat_h5 = os.path.join(fam_dir, "family_flat.h5")
-    dis_h5 = os.path.join(fam_dir, "family_distractor.h5")
     os.makedirs(os.path.join(_REPO, work), exist_ok=True)
     # Copy the recipe next to the artifacts it produced. A work dir is resumable and long-lived, so
     # "which parameters built this" has to travel with it rather than living only in a shell history.
     shutil.copyfile(cfg.config_path, os.path.join(_REPO, work, "clip_gen_config.yaml"))
     os.makedirs(os.path.join(_REPO, fam_dir), exist_ok=True)
     stage, cpt = args.stage, int(cfg.clips_per_tile)
-    dis_argv = ["--source", args.source, "--num-tiles", str(cfg.distractor_tiles),
-                "--clips-per-tile", str(cpt), "--short-s", str(cfg.distractor_s),
-                "--seed", str(cfg.seed), "--device", args.device, "--stride-bank", bank]
     box_on, box_off, box_off_front = (int(x) for x in cfg.box_tiles)
     n_flat_clips = cfg.flat_tiles * cpt
     t0 = time.time()
@@ -197,9 +199,6 @@ def main() -> int:
             # only when the recipe states a number. Sending "None" would be a parse error.
             *([] if cfg.swing_clear is None else ["--swing-clear", str(cfg.swing_clear)]),
             *([] if cfg.swing_band is None else ["--swing-band", str(cfg.swing_band)])])
-    if stage in ("all", "a") and cfg.distractor_tiles > 0 \
-            and not os.path.exists(os.path.join(_REPO, dis_sched)):
-        _run("distract-plan", "mb_distractor_clips.py", dis_argv + ["--dump-schedules", dis_sched])
 
     # --- stage b: EVERYTHING that needs the model, one load per script (motionbricks env) -----------
     if stage in ("all", "b"):
@@ -263,19 +262,6 @@ def main() -> int:
                 "--seed", str(cfg.seed)], conda_env=args.conda_env)
         else:
             print(f"\n===== [flat-gen] {n_have} raw flat motions present, skipping")
-        if cfg.distractor_tiles > 0:
-            # The distractor family is built from the same loops + in-betweenings as the flat one, so
-            # its transients come from the same generator.  It used to run mb_encode.py, i.e. Motion
-            # Bricks tracking a command schedule for the whole clip -- which left 10% of the library
-            # on the pre-redesign path, with that path's steady-velocity error and foot slide.
-            _run("distract-gen", "mb_flat_transients.py", [
-                "--mb-root", args.mb_root, "--stride-bank", bank, "--plans", dis_sched,
-                "--out-dir", raw_dis, "--ramp-dv", str(cfg.flat_ramp_dv),
-                "--a-max", str(cfg.flat_a_max), "--alpha-max", str(cfg.flat_a_max),
-                "--min-transient-s", str(cfg.flat_min_transient_s),
-                "--hop-slack", str(cfg.flat_hop_slack),
-                "--seed", str(cfg.seed)], conda_env=args.conda_env)
-
     # --- stage c: splice / ingest into per-family libraries (env_isaaclab) --------------------------
     if stage in ("all", "c"):
         if not glob.glob(os.path.join(_REPO, fam_dir, "family_stairs_*.h5")):
@@ -325,16 +311,10 @@ def main() -> int:
                 "--raw-dir", raw_flat, "--source", args.source, "--out", flat_h5,
                 "--clip-length", str(cfg.flat_clip_length), "--device", args.device,
                 "--rl-vels", cfg.rl_vels, "--workers", str(args.workers)])
-        if cfg.distractor_tiles > 0 and not os.path.exists(os.path.join(_REPO, dis_h5)):
-            _run("distract-clips", "mb_distractor_clips.py",
-                 dis_argv + ["--transient-dir", raw_dis, "--plans", dis_sched, "--out", dis_h5,
-                             "--workers", str(args.workers)])
-
     # --- stage d: one training library at the requested tile proportions ---------------------------
     if stage in ("all", "d"):
         counts = {"stairs_up": cfg.stair_tiles, "stairs_down": cfg.stair_tiles,
                   "jump_on": box_on, "jump_off": box_off, "jump_off_front": box_off_front,
-                  "distractor": cfg.distractor_tiles,
                   # PURE stair tiles, from mb_pure_stair_clips in stage c. Folded in HERE rather
                   # than left to --extra-mix: a whole terrain class silently missing from the
                   # library is not something a caller should have to remember to prevent.

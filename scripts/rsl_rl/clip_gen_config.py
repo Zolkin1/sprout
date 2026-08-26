@@ -41,8 +41,6 @@ _SCHEMA: dict[str, tuple] = {
     "pure_stair_tiles": ("int", 1),
     "box_tiles": ("ints", 3),
     "flat_tiles": ("int", 1),
-    "distractor_tiles": ("int", 1),
-    "distractor_s": ("float", 1),
     # flat family
     "flat_clip_length": ("float", 1),
     "flat_seg_dur_range": ("range", 2),
