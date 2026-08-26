@@ -158,7 +158,35 @@ def _stair_tile_specs(rng, skill: str, sources, args) -> list[dict]:
     approach or exit, so it needs no Motion Bricks at all and is generated directly by the DP generator's
     matcher-free path. The ``(riser, tread)`` grid is the set actually SOLVED in the reference library --
     feet only land on treads whose geometry the played stride was solved for.
+
+    CONVERGED cells only. The grid used to come from every ingested source, including solves the
+    optimizer gave up on -- measured on ``library_v2``, 6 of the 8 ``(riser, tread)`` cells that
+    ``stairs_down`` tiles were sampled from are non-converged. A tile authored around one of those is
+    a staircase whose reference cannot walk it, and since the tile geometry is what the RL and the
+    depth cameras SEE, the defect outlives the clip.
+
+    This is the one place convergence is filtered on rather than reported; the flat families keep
+    their non-converged cells deliberately (see ``clean_ingest.solve_converged``). Expect it to
+    NARROW the descent population until the solver delivers more cells -- that is the honest state,
+    not a regression.
     """
+    ok = [s for s in sources if (s.terrain_meta or {}).get("converged", True)]
+    if not ok:
+        raise SystemExit(
+            f"[mb_plan] {skill}: every reference in the library is a non-converged solve, so there "
+            f"is no (riser, tread) cell a tile could honestly be authored around. Re-solve, or pass "
+            f"a library that has converged {skill} entries.")
+    if len(ok) < len(sources):
+        # IDENTITY, not `s not in ok`: MotionSource is a dataclass, so `in` invokes __eq__, which
+        # compares its tensor fields elementwise and raises on two clips of different lengths
+        # ("The size of tensor a (69) must match the size of tensor b (73)").
+        _ok_ids = {id(s) for s in ok}
+        dropped = sorted({(round(float(s.terrain_meta["terrain"]["riser"]), 4),
+                           round(float(s.terrain_meta["terrain"]["tread"]), 4))
+                          for s in sources if id(s) not in _ok_ids})
+        print(f"[mb_plan] {skill}: {len(sources) - len(ok)}/{len(sources)} references did NOT "
+              f"converge; their geometry is excluded from the tile grid. Cells lost: {dropped}")
+    sources = ok
     hd_grid = sorted({(round(float(s.terrain_meta["terrain"]["riser"]), 4),
                        round(float(s.terrain_meta["terrain"]["tread"]), 4)) for s in sources})
     tiles = sample_stair_tiles(

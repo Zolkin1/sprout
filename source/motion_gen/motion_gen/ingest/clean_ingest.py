@@ -60,6 +60,47 @@ def _read_manifest(lib_dir: Path) -> list[dict]:
         return list(_csv.DictReader(f))
 
 
+
+#: Substrings IPOPT reports on a run that actually converged. Everything else -- "Maximum number
+#: of iterations exceeded", "Restoration phase failed" -- is a solve that did NOT.
+_CONVERGED_MARKERS = ("locally optimal", "optimal solution found")
+
+
+def solve_converged(row: dict) -> bool:
+    """Did the solver converge for this manifest row?
+
+    NOTHING in this repo read the ``status`` column until now, so every non-converged solve was
+    ingested identically to a converged one. Measured on ``library_v2``: 60 of 302 rows (19.9%)
+    did not converge, and the failures are concentrated rather than spread -- ``run_turn`` 28/42,
+    ``stairs_down`` 6/8, ``jump_off_front`` 4/7, ``jog_turn`` 10/35.
+
+    What to DO about it differs by consumer, which is why this returns a fact rather than
+    filtering here:
+
+    * stair TILE geometry must use converged cells only -- a tile authored around a reference
+      whose solve failed is a staircase nothing in the library can walk;
+    * the flat families must NOT be filtered -- dropping 28 of 42 ``run_turn`` cells would open a
+      hole across the whole fast-turn corner, which is worse than a locally-suboptimal solve, and
+      nearest-neighbour selection copes with the latter.
+
+    An absent or empty ``status`` counts as converged: older manifests do not carry the column,
+    and treating "unknown" as failure would silently empty them.
+    """
+    st = (row.get("status") or "").strip().lower()
+    return (not st) or any(m in st for m in _CONVERGED_MARKERS)
+
+
+def summarize_convergence(rows: list[dict]) -> dict[str, tuple[int, int]]:
+    """``skill -> (converged, total)`` over manifest rows, for reporting."""
+    out: dict[str, list[int]] = {}
+    for r in rows:
+        k = (r.get("skill") or "?").strip()
+        c = out.setdefault(k, [0, 0])
+        c[0] += int(solve_converged(r))
+        c[1] += 1
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
 def _truthy(v) -> bool:
     return str(v).strip().lower() in ("true", "1", "yes", "y", "t")
 
