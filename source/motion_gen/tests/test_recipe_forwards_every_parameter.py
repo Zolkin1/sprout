@@ -65,8 +65,8 @@ _ARGPARSE_DEFAULT_IS_FINE: dict[str, str] = {
     "--plan": "single-clip path; the driver runs the batch (--requests)",
     "--side": "single-clip path",
     "--tag": "single-clip path output naming",
-    "--approach-s": "single-clip override of the plan's own duration",
-    "--exit-s": "single-clip override of the plan's own duration",
+    "--approach-dist": "single-clip override of the plan's own travel budget",
+    "--exit-dist": "single-clip override of the plan's own travel budget",
     "--approach-start": "per-clip in batch mode: the request carries it, drawn from "
                         "steady_approach_frac",
     "--types": "compose-time filter for building a subset library by hand",

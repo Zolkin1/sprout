@@ -139,21 +139,34 @@ def _author_tile(family, ts, args):
     ``lower_z`` / ``upper_z`` are the two walkable levels the family's approach / exit run on: bottom and
     top platform for stairs, ground and box top for a box.
 
-    A walking surface is sized to hold its segment's seconds of travel, i.e. it depends on SPEED -- so a
-    tile shared by clips of different speeds MUST be authored with ``args.platform_vx`` (the fastest
-    GROUND-level speed on that tile) and ``args.platform_top_vx`` (its single box-top speed). Without them
-    each clip authors its own platform length, the geometry stops being fixed per tile, and every clip but
-    the longest ends up standing somewhere else than the meshed tile.
+    A walking surface is sized to hold its segment's TRAVEL BUDGET, in metres -- so a tile shared by
+    clips with different budgets MUST be authored with ``args.platform_ground_dist`` and
+    ``args.platform_top_dist`` (the longest on that tile, per surface). Without them each clip
+    authors its own platform length, the geometry stops being fixed per tile, and every clip but the
+    longest ends up standing somewhere other than the meshed tile.
+
+    This used to be sized in SECONDS times the tile's fastest clip, which made the geometry a
+    function of the speed band: a 3.5 s budget on a 2.6 m/s stair tile authored a 10.1 m platform on
+    both ends of every transition tile, and it is why the box families needed their own duration
+    ranges (a 6 s box duration applied to a stair would have authored ~17 m).
     """
     tm = ts.terrain_meta["terrain"]
-    plat_vx = getattr(args, "platform_vx", None)      # tile-level speed: one geometry for all its clips
+    # TILE-level travel budgets, in metres: the longest ground-side and elevated-side budget over
+    # this tile's clips. One geometry for all of them, which is the reuse invariant the RL importer
+    # relies on -- without it each clip authors its own platform, the tile meshes some other clip's
+    # geometry, and the short clips stand metres from the staircase.
+    buf = float(getattr(args, "platform_buffer_m", 1.0) or 0.0)
+    plat_ground = float(getattr(args, "platform_ground_dist", 0.0) or 0.0)
+    plat_top = float(getattr(args, "platform_top_dist", 0.0) or 0.0)
     if family.geom == "stairs":
         riser, tread = float(tm["riser"]), float(tm["tread"])
         n_steps = int(args.n_steps)
-        ground_s = max(args.approach_s, args.exit_s)
-        plat_speed = (abs(float(plat_vx)) if plat_vx is not None else
-                      max(0.3, abs(args.terrain_speed), abs(args.approach_vx or 0.0), abs(args.exit_vx)))
-        plat = float(ground_s) * max(0.3, plat_speed) + 1.0
+        # No speed term. This used to be max(approach_s, exit_s) x the tile's FASTEST clip, which
+        # is why a 3.5 s budget on a 2.6 m/s stair tile authored a 10.1 m platform on BOTH ends of
+        # every transition tile -- and why the TODO(steady-approach) note above ("platforms are long
+        # because the approach accelerates from a stand") existed at all. Under a distance budget
+        # the run-up is paid in TIME, not in geometry.
+        plat = max(plat_ground, plat_top) + buf
         tile = TerrainSpec(
             terrain_id=int(args.terrain_id), ttype="transition",
             step_height=riser, step_depth=tread, width=float(args.width), lead_in=0.0,
@@ -184,13 +197,9 @@ def _author_tile(family, ts, args):
     # Which SIDE of the interaction is on the ground and which is on the box top comes from the family's
     # levels (both ends walk now, so the old "which one is a standing hold" test is gone).
     ground_on_approach = family.approach_level == "lower"
-    ground_s = args.approach_s if ground_on_approach else args.exit_s
-    top_s = args.exit_s if ground_on_approach else args.approach_s
-    # Tile-level speeds when a batch driver supplies them (so every clip on the tile authors byte-identical
-    # geometry), else this clip's own per-side command.
-    top_vx = getattr(args, "platform_top_vx", None) or (args.exit_vx if ground_on_approach
-                                                        else args.approach_vx)
-    ground_vx = plat_vx or ((args.approach_vx if ground_on_approach else args.exit_vx) or 1.0)
+    # No per-side SPEEDS here any more: the box's approach run-up and its top platform are both
+    # sized from the tile's travel budgets in metres (plat_ground / plat_top above), so the geometry
+    # no longer depends on how fast any clip happens to walk.
     plat_sign = box_platform_sign(family)
     # A ONE-SIDED tile has no elevated segment, so it needs no platform to walk on: it is the bare jump
     # box -- exactly the geometry this family had before the platform existed.  ``box_tile_boxes``
@@ -203,10 +212,9 @@ def _author_tile(family, ts, args):
     # vx * (s - 1.1) (gait initiation eats the first ~1.1 s, so usually LESS), but the exit ramp was
     # measured overshooting its command by ~12%, so it can also be MORE.  The ground side needs no such
     # margin -- a box tile keeps its floor, so running long there is flat ground, not a hole.
-    buf = float(getattr(args, "box_platform_buffer", 1.0) or 0.0)
-    plat_len = (max(buf, float(top_s) * max(0.2, abs(float(top_vx or 1.0))) + buf) if two_sided else 0.0)
+    plat_len = (max(buf, plat_top + buf) if two_sided else 0.0)
     boxes = box_tile_boxes(box_size=box_size, platform_len=plat_len, platform_sign=plat_sign,
-                           approach_len=max(1.0, float(ground_s) * max(0.3, abs(float(ground_vx))) + 1.0),
+                           approach_len=max(1.0, plat_ground + buf),
                            nav_width=(getattr(args, "box_nav_width", None) or None))
     lower_z = 0.0
     upper_z = float(boxes[0]["pos"][2]) + float(boxes[0]["size"][2]) / 2.0
@@ -459,13 +467,14 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
         approach_vx=float(approach_vx), exit_vx=float(exit_vx),
         entry_vx=float(entry_vx), exit_speed=float(exit_speed),
         approach_mode=family.approach_mode, exit_mode=family.exit_mode,
-        approach_s=float(args.approach_s), exit_s=float(args.exit_s),
         # The SAME product the tile's platforms were sized from, reinterpreted as a travel budget: the
         # approach gets this many metres of walkable surface, an exact loop covers whatever the bounded
         # transient does not.  Authoring the distance rather than the duration is what lets the transient
         # be as long as the acceleration bound needs without resizing geometry that pass A already fixed.
-        approach_dist=float(args.approach_s) * abs(float(approach_vx)),
-        exit_dist=float(args.exit_s) * abs(float(exit_vx)),
+        # Metres, straight from pass A. It used to be duration x speed here, which made the budget
+        # a function of the speed rather than a statement about where the terrain is.
+        approach_dist=float(args.approach_dist),
+        exit_dist=float(args.exit_dist),
         entry_candidates=(entry_gate.frames if entry_gate else np.zeros(0, np.int64)),
         exit_candidates=(exit_gate.frames if exit_gate else np.zeros(0, np.int64)),
         meta=meta,
@@ -641,7 +650,18 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                     "stride_idx_t": sidx_t,
                     "approach_surface_err": 0.0, "exit_surface_err": 0.0,
                     "approach_arrival_cut": 0, "exit_overlap_skip": int(e_skip),
-                    "seam_accel": [s.get("seam_speed", 0.0) for s in seams]}
+                    "seam_accel": [s.get("seam_speed", 0.0) for s in seams],
+                    # The two seams that bracket the REPLAY, by the same one-frame definition the
+                    # legacy splice used (|Wp[i] - Wp[i-1]| / dt). Only that path ever set these, so
+                    # once the bounded splice became the only path every build printed
+                    # "seam_speed=nan" -- the print falls back to nan when the key is absent -- and
+                    # the entry/exit seam, which is the number this whole stage is judged on, became
+                    # unreadable in the log. The per-seam data was in ``seam_accel`` all along.
+                    "approach_seam_speed": float(
+                        torch.linalg.norm(Wp[n_a] - Wp[n_a - 1]) / dt) if n_a > 0 else 0.0,
+                    "exit_seam_speed": float(
+                        torch.linalg.norm(Wp[n_a + n_t] - Wp[n_a + n_t - 1]) / dt)
+                    if 0 < n_a + n_t < Wp.shape[0] else 0.0}
             if exit_seg is not None:
                 diag["exit_joint_res"] = float(pdiag["placements"]["after"]["joint_res"])
             print(f"[mb_terrain] {plan.skill}: BOUNDED approach -- loop {loop_travel:.2f} m + transient "

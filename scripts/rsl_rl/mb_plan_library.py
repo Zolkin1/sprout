@@ -49,6 +49,7 @@ from mb_terrain_clips import (                                            # noqa
 
 from motion_gen.command_schedule import (as_json, hold_constant,  # noqa: E402
                                         sample_command_schedule, total_duration)
+from motion_gen.motionbricks.approach_zone import APPROACH_ZONE_M  # noqa: E402
 from motion_gen.terrain.terrain_sampler import sample_box_tiles, sample_stair_tiles  # noqa: E402
 from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   # noqa: E402
                                     save_terrain_plan)
@@ -120,8 +121,11 @@ def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = 
     placement -- is absent from both keys by construction.
     """
     rep, ef, xf = plan.terrain_qpos, plan.entry_frame, plan.exit_frame
-    a_scalars = [plan.approach_vx, plan.entry_vx, plan.approach_s, plan.approach_dist]
-    x_scalars = [plan.exit_vx, plan.exit_speed, plan.exit_s]
+    # DISTANCE, not duration: the budget is what the generator reaches for, and the duration
+    # is now emergent from it and the speed. Keying on both would invalidate every segment
+    # whenever the (now-derived) duration moved by a rounding step.
+    a_scalars = [plan.approach_vx, plan.entry_vx, plan.approach_dist]
+    x_scalars = [plan.exit_vx, plan.exit_speed, plan.exit_dist]
     # ``approach_start`` is part of the key: a run-up from a stand and an arrival already at speed are
     # different motions for the same command, so they must not share a generated segment.
     a_parts = [f"{plan.skill}|{plan.approach_mode}|{approach_pin}|{approach_start}|approach", a_scalars]
@@ -252,9 +256,11 @@ def _box_tile_specs(rng, skill: str, sources, args, n_tiles: int) -> list[dict]:
                     "box_nav_width": (float(s.nav_width) if args.box_nav_width < 0.0
                                       else float(args.box_nav_width)) or None,
                     "two_sided": two_sided,
-                    "box_approach_s": _quantize(t_rng.uniform(*args.box_approach_s_range),
-                                                args.duration_step),
-                    "box_exit_s": _quantize(t_rng.uniform(*args.box_exit_s_range), args.duration_step),
+                    # No per-tile durations any more: the travel budget is per CLIP and in metres,
+                    # drawn in the clip loop from one band that serves stairs and boxes alike. The
+                    # box family needed its own duration ranges only because a platform was
+                    # duration x speed, so a 6 s box duration on a 2.6 m/s stair would have authored
+                    # a ~17 m platform.
                     "box_top_vx": float(t_rng.uniform(*args.box_top_vx_range))})
     print(f"[mb_plan] {skill}: {n_two} two-sided (box + platform) / {len(specs) - n_two} one-sided "
           f"(bare box, terrain + ground side only)")
@@ -377,15 +383,6 @@ def main() -> int:
                    help="GROUND-level speed band for the box families (the run-up / walk-away). "
                         "Floor lowered 0.5 -> 0.2 to match the stair band, so no family is missing "
                         "slow traversal.")
-    p.add_argument("--box-approach-s-range", type=float, nargs=2, default=(2.5, 4.0),
-                   metavar=("MIN", "MAX"),
-                   help="Duration (s) of a box clip's LEAD-IN -- the segment before the interaction, "
-                        "sampled per tile. Whichever LEVEL that runs on depends on the family (jump_on "
-                        "leads in on the ground, the dismounts lead in along the box top), and when it is "
-                        "the elevated one it also sizes the top platform.")
-    p.add_argument("--box-exit-s-range", type=float, nargs=2, default=(2.5, 6.0), metavar=("MIN", "MAX"),
-                   help="Duration (s) of a box clip's TRAIL-AWAY -- the segment after the interaction "
-                        "(see --box-approach-s-range).")
     p.add_argument("--box-top-vx-range", type=float, nargs=2, default=(0.3, 0.7), metavar=("MIN", "MAX"),
                    help="Speed band (m/s) of the ELEVATED segment on a box tile, sampled per tile. Modest "
                         "on purpose: the top platform is sized from this times the elevated duration, so a "
@@ -396,10 +393,6 @@ def main() -> int:
                         "GROUND side only -- run up and mount, or drop off and walk away -- which teaches "
                         "the interaction without also demanding the on-box walk. Per TILE, not per clip: "
                         "every clip on a terrain_id must emit byte-identical geometry.")
-    p.add_argument("--box-platform-buffer", type=float, default=1.0,
-                   help="Extra metres of top platform beyond the elevated segment's nominal travel, so the "
-                        "reference cannot walk off the far edge (the ground side needs none -- the tile "
-                        "keeps its floor there).")
     p.add_argument("--box-nav-width", type=float, default=-1.0,
                    help="y-width (m) the box AND its top platform are widened to. -1 (default) uses the "
                         "tile's sampled corridor width, 0 keeps the reference box's own narrow extents. "
@@ -408,12 +401,6 @@ def main() -> int:
     p.add_argument("--backward-vx-max", type=float, default=1.0,
                    help="Cap (m/s) on any BACKWARD command (the jump_off dismount). The clean library's "
                         "walk_backwards strides stop near 1 m/s, so a larger command is unreachable.")
-    p.add_argument("--approach-s-range", type=float, nargs=2, default=(1.5, 3.5), metavar=("MIN", "MAX"),
-                   help="MB approach duration (s), sampled PER TILE (see --help note on geometry).")
-    p.add_argument("--exit-s-range", type=float, nargs=2, default=(1.5, 3.5), metavar=("MIN", "MAX"))
-    p.add_argument("--duration-step", type=float, default=0.5,
-                   help="Quantize sampled segment durations onto this grid (s) so tiles can SHARE MB "
-                        "segments; 0 disables (every tile then needs its own segments).")
     p.add_argument("--n-steps-range", type=int, nargs=2, default=(3, 7), metavar=("MIN", "MAX"))
     p.add_argument("--tile-width-range", type=float, nargs=2, default=(0.8, 1.2), metavar=("MIN", "MAX"))
     p.add_argument("--stair-floor-frac", type=float, default=0.5,
@@ -442,6 +429,22 @@ def main() -> int:
     p.add_argument("--contact-tol", type=float, default=0.02)
     p.add_argument("--swing-clear", type=float, default=None)
     p.add_argument("--swing-band", type=float, default=None)
+    p.add_argument("--approach-flat-s-range", type=float, nargs=2, default=(1.5, 4.0),
+                   metavar=("MIN", "MAX"),
+                   help="Seconds of flat lead-in before the approach zone, converted to a DISTANCE "
+                        "at each clip's own speed and clamped by --flat-dist-clamp.")
+    p.add_argument("--exit-flat-s-range", type=float, nargs=2, default=(1.5, 4.0),
+                   metavar=("MIN", "MAX"), help="As --approach-flat-s-range, for the trail-away.")
+    p.add_argument("--flat-dist-clamp", type=float, nargs=2, default=(1.0, 4.0),
+                   metavar=("MIN", "MAX"),
+                   help="Metre bounds on the converted flat distance, so neither end of the speed "
+                        "band degenerates (0.2 m/s would walk 6 m over 30 s; 3.5 m/s would cross "
+                        "the tile in 1.5 s).")
+    p.add_argument("--dist-step", type=float, default=0.25,
+                   help="Quantization (m) of the travel budget, so segments can still be shared.")
+    p.add_argument("--platform-buffer-m", type=float, default=1.0,
+                   help="Walkable surface (m) past the nominal travel, so the reference cannot walk "
+                        "off the far edge.")
     p.add_argument("--footprint-margin", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
@@ -475,24 +478,17 @@ def main() -> int:
 
         for spec in tile_specs:
             tid = next_tid; next_tid += 1
-            # Durations are fixed PER TILE, not per clip: the tile author sizes its platforms from them, and
-            # every clip on a tile must emit byte-identical geometry (the reuse invariant the RL importer
-            # relies on).  Speed is what varies per clip; duration variety lives across tiles.
+            # The travel budget is PER CLIP and in METRES, drawn below from each clip's own speed.
+            # It used to be a duration fixed per TILE, and the tile author then sized its platforms
+            # as duration x the tile's FASTEST clip -- which is why a 3.5 s budget on a 2.6 m/s
+            # stair tile authored a 10.1 m platform on both ends of every transition tile, and why
+            # the box families needed their OWN duration ranges (a 6 s box duration applied to a
+            # 2.6 m/s stair would have authored a ~17 m platform). In metres that whole coupling
+            # goes: one band serves both families, and the tile takes the MAX over its clips, which
+            # is the same discipline ``plat_vx`` already used for speed.
             d_rng = np.random.default_rng([args.seed + 1, tid])
-            a_s = _quantize(d_rng.uniform(*args.approach_s_range), args.duration_step)
-            x_s = _quantize(d_rng.uniform(*args.exit_s_range), args.duration_step)
-            # A box family's two ends get their own BOX-SPECIFIC durations, keyed by ORDER (the lead-in
-            # into the interaction vs the trail-away from it) rather than by level.  Order is what a caller
-            # actually reasons about, and level cannot express it: jump_on leads in on the GROUND while the
-            # dismounts lead in on the BOX TOP, so one shared "ground" range would have to be both the
-            # lead-in bound and the trail-away bound at once.  Box-specific because the shared
-            # --approach-s-range / --exit-s-range also drive STAIRS, whose platform is duration x speed with
-            # speeds to 2.6 m/s -- a 6 s box duration there would author a ~17 m stair platform.
-            # Whichever end is ELEVATED still sizes the top platform; _author_tile reads that off the family.
             top_vx = spec.get("box_top_vx")
             two_sided = bool(spec.get("two_sided", True))
-            if kind == "box":
-                a_s, x_s = spec.get("box_approach_s"), spec.get("box_exit_s")
             v_rng = np.random.default_rng([args.seed + 2, tid])
             s_rng = np.random.default_rng([args.seed + 3, tid])
             speeds = _clip_speeds(v_rng, kind, args, cpt,
@@ -512,7 +508,34 @@ def main() -> int:
             ground_mags = [_cmd_mag(v, ground_sign, args) for v in speeds]
             plat_vx = max(ground_mags) if ground_mags else 1.0
             top_mag = _cmd_mag(top_vx, top_sign, args) if kind == "box" else None
-            for ci, (vx, g_mag, a_start) in enumerate(zip(speeds, ground_mags, starts)):
+
+            # Travel budget per clip, in metres: seconds of flat lead-in at THIS clip's own speed,
+            # clamped in metres so neither end of the speed band degenerates (a 0.2 m/s clip would
+            # otherwise walk 6 m over 30 s, and a 3.5 m/s clip would cover the whole tile in 1.5 s),
+            # then the approach zone on top. APPROACH_ZONE_M is the shared constant the clutter pass
+            # vetoes decoys against, so the distance a clip stops tracking the command at and the
+            # distance a decoy may not sit inside are the same number by construction.
+            lo_d, hi_d = args.flat_dist_clamp
+
+            def _budget(mag: float, s_range) -> float:
+                flat = min(max(abs(float(mag)) * float(d_rng.uniform(*s_range)), lo_d), hi_d)
+                return _quantize(flat + APPROACH_ZONE_M, args.dist_step)
+
+            a_dists = [_budget(m if kind != "box" else
+                               (top_mag if elevated_side(family) == "approach" else m),
+                               args.approach_flat_s_range) for m in ground_mags]
+            x_dists = [_budget(m if kind != "box" else
+                               (top_mag if elevated_side(family) == "exit" else m),
+                               args.exit_flat_s_range) for m in ground_mags]
+            # The tile's walking surfaces are sized for the LONGEST budget on it, and every clip
+            # authors the geometry with that same number -- otherwise a short clip authors a short
+            # platform, the tile meshes some other clip's geometry, and the short clip stands metres
+            # away from the staircase. Split ground vs elevated, because they are different surfaces.
+            _ground_is_approach = ground_side(family) == "approach"
+            plat_ground_dist = max((a_dists if _ground_is_approach else x_dists), default=1.0)
+            plat_top_dist = max((x_dists if _ground_is_approach else a_dists), default=1.0)
+            for ci, (vx, g_mag, a_start, a_dist, x_dist) in enumerate(
+                    zip(speeds, ground_mags, starts, a_dists, x_dists)):
                 if kind != "box":
                     a_mag = x_mag = g_mag
                 else:
@@ -526,7 +549,6 @@ def main() -> int:
                     nav_width=spec.get("nav_width"), box_height=spec.get("box_height", 0.45),
                     has_floor=spec.get("has_floor", True), box_nav_width=spec.get("box_nav_width"),
                     stair_float_thickness=spec.get("float_thickness", 0.0),
-                    box_platform_buffer=args.box_platform_buffer,
                     two_sided=two_sided,
                     # The commanded GROUND-level speed varies per clip (the DP path's --transition-vels
                     # role), so a tile's clips differ in how fast the robot arrives at / leaves the terrain,
@@ -548,9 +570,13 @@ def main() -> int:
                     # tracks it, which is the whole point.
                     rl_cmd_schedule=as_json(_clip_schedule(
                         np.random.default_rng([args.seed + 7, _skill_seed(skill), int(tid), ci]),
-                        kind, a_s, x_s, float(family.exit_sign) * abs(float(vx)), args)),
-                    platform_vx=plat_vx, platform_top_vx=top_mag,
-                    approach_s=a_s, exit_s=x_s,
+                        kind, a_dist / max(0.2, abs(g_mag)), x_dist / max(0.2, abs(g_mag)),
+                        float(family.exit_sign) * abs(float(vx)), args)),
+                    # Metres, not seconds. platform_* are TILE-level maxima; approach/exit_dist are
+                    # this clip's own budget.
+                    platform_ground_dist=plat_ground_dist, platform_top_dist=plat_top_dist,
+                    platform_buffer_m=args.platform_buffer_m,
+                    approach_dist=a_dist, exit_dist=x_dist,
                     entry_pick=args.entry_pick, exit_pick=args.exit_pick,
                     clip_seed=int(np.random.default_rng(
                         [args.seed + 11, _skill_seed(skill), int(tid), ci]).integers(0, 2 ** 31)),
@@ -597,7 +623,7 @@ def main() -> int:
                 jobs.append({"family": skill, "kind": kind, "terrain_id": tid, "clip": ci,
                              "plan": rel, "approach_key": a_key, "exit_key": x_key,
                              "approach_start": a_start, "two_sided": two_sided,
-                             "vx": float(vx), "approach_s": a_s, "exit_s": x_s,
+                             "vx": float(vx), "approach_dist": a_dist, "exit_dist": x_dist,
                              "approach_vx": float(a_mag), "exit_vx": float(x_mag),
                              "top_vx": (None if top_mag is None else float(top_mag)),
                              "approach_pin": args.approach_pin, "exit_pin": args.exit_pin,

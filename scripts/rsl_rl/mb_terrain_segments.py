@@ -191,7 +191,13 @@ def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float
     step = mb.dt / targeter.bank_dt
     schedule = _schedule_of(plan)
     # ONE command for the whole exit (pass A holds the schedule constant across it).
-    v_ex = _sched_cmd(schedule, float(plan.approach_s) + _interaction_s(plan), plan.exit_vx)
+    # The clip time the exit begins at. approach_s is gone, so it is ESTIMATED from the travel
+    # budget and the commanded speed -- which is exactly the weakness of reading a time-indexed
+    # schedule here at all: the true duration is emergent, and _INTERACTION_BUDGET_S already
+    # assumes a 12 s interaction against a real 2-6 s replay. TODO(no-time-axis): Step 7 builds
+    # target_vel from splice_pieces' own bounds and deletes the schedule from the terrain path.
+    _approach_s_est = float(plan.approach_dist) / max(0.2, abs(float(plan.approach_vx)))
+    v_ex = _sched_cmd(schedule, _approach_s_est + _interaction_s(plan), plan.exit_vx)
     v0 = np.array([float(plan.exit_speed), 0.0, 0.0], np.float32)     # the replay's speed at hand-off
     v1 = np.array([float(v_ex), 0.0, 0.0], np.float32)
     s_idx = targeter.nearest(v1)
@@ -222,7 +228,7 @@ def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float
                        "tokens": int(n) // mb.nfpt, "travel": travel, "bounded": True}
 
 
-def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, out: str,
+def _emit_segment(mb, targeter, plan, family, side: str, pin: str, dist: float, out: str,
                   args, raw_schema, quiet: bool = False, plan_path: str | None = None,
                   start: str = "stand") -> str:
     """Generate ONE segment (``side`` of ``plan``) and write it as a ``RawMotion``; returns the path."""
@@ -279,7 +285,7 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, 
                     "a_max": float(args.a_max),
                     "alpha_max": float(args.alpha_max),
                     "min_transient_s": float(args.min_transient_s), "hop_slack": float(args.hop_slack),
-                    "secs": secs, "pin_future": args.pin_future,
+                    "dist": dist, "pin_future": args.pin_future,
                     # BASENAME, because that is what ``_gen_params`` compares -- the driver absolutizes the
                     # path, so comparing the full one would mark every segment stale after a work-dir move.
                     # The resolved path is kept alongside for provenance only.
@@ -293,7 +299,7 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, 
         z = qpos[:, 2]
         boundary = "last" if side == "approach" else "first"
         bz = float(z[-1] if side == "approach" else z[0])
-        print(f"[mb_seg]   {side:8s} pin={pin:4s} {qpos.shape[0]}f ({secs:.1f}s) cmd "
+        print(f"[mb_seg]   {side:8s} pin={pin:4s} {qpos.shape[0]}f ({dist:.2f} m budget) cmd "
               f"{cmd[0, 0]:+.2f} -> {cmd[-1, 0]:+.2f} m/s  pelvis_z {z[0]:.2f} -> {z[-1]:.2f} "
               f"({boundary} frame z={bz:.2f})  -> {os.path.basename(out)}")
     return out
@@ -301,7 +307,7 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, secs: float, 
 
 # Generation knobs that change the MOTION for the same request. The key deliberately does not include
 # them (it says which boundary pose to reach and at what command), so resume compares them explicitly.
-_GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "secs", "pin", "a_max",
+_GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "dist", "pin", "a_max",
               "alpha_max", "min_transient_s", "hop_slack")
 
 # Bump when the GENERATOR changes what it produces for identical knobs -- a CLI flag is comparable, code
@@ -312,14 +318,16 @@ _GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "secs", "pin"
 #   3: the approach can be a BOUNDED transient seeded from an exact stride, so the same request no
 #      longer describes the same motion.
 #   4: (superseded)
+#   6: the travel budget is a DISTANCE, so the knob the segment is keyed on changed name and unit
+#      ("secs" -> "dist"); a stale dict must not compare equal to the new one.
 #   5: the bounded path is the ONLY path. The unbounded generators and the --ramp-s / --pin-cmd /
 #      --pin-lead / --pin-tail / --pin-place / --pin-dist knobs are gone -- they were dead on every
 #      driver run, so no segment on disk was ever produced by them, but the knob set they were
 #      compared against changed and a stale dict must not compare equal to the new one.
-_GEN_VERSION = 5
+_GEN_VERSION = 6
 
 
-def _gen_params(args, side: str, pin: str, secs: float, start: str) -> dict:
+def _gen_params(args, side: str, pin: str, dist: float, start: str) -> dict:
     """The generation knobs this run would use for one segment.
 
     ``stride_bank`` is compared by BASENAME: the driver absolutizes the path, so comparing the full path
@@ -330,7 +338,7 @@ def _gen_params(args, side: str, pin: str, secs: float, start: str) -> dict:
             "a_max": float(args.a_max), "alpha_max": float(args.alpha_max),
             "min_transient_s": float(args.min_transient_s), "hop_slack": float(args.hop_slack),
             "pin_future": args.pin_future, "start": start if side == "approach" else "",
-            "secs": float(secs), "pin": pin}
+            "dist": float(dist), "pin": pin}
 
 
 def _is_stale(path: str, want: dict, raw_schema) -> str | None:
@@ -376,9 +384,11 @@ def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
                 plans[ppath] = plan_mod.load_terrain_plan(ppath)
             plan = plans[ppath]
             family = families.family_for(plan.skill)
-            secs = float(plan.approach_s if r["side"] == "approach" else plan.exit_s)
+            # The TRAVEL BUDGET, which is what defines the segment now. It used to be a duration,
+            # and the duration is emergent from the budget and the speed.
+            dist = float(plan.approach_dist if r["side"] == "approach" else plan.exit_dist)
             if os.path.exists(out):
-                why = _is_stale(out, _gen_params(args, r["side"], r["pin"], secs,
+                why = _is_stale(out, _gen_params(args, r["side"], r["pin"], dist,
                                                  r.get("start", "stand")), raw_schema)
                 if why is None:
                     skipped += 1
@@ -386,7 +396,7 @@ def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
                 if stale == 0:
                     print(f"[mb_seg] regenerating: on-disk segments differ ({why})", flush=True)
                 stale += 1
-            _emit_segment(mb, targeter, plan, family, r["side"], r["pin"], secs, out, args,
+            _emit_segment(mb, targeter, plan, family, r["side"], r["pin"], dist, out, args,
                           raw_schema, quiet=True, plan_path=ppath, start=r.get("start", "stand"))
             done += 1
         except (Exception, SystemExit) as e:     # one bad segment costs one clip, not the library
@@ -419,8 +429,10 @@ def main() -> int:
     p.add_argument("--exit-pin", default="hard", choices=["hard", "soft"],
                    help="hard: context-seed from the terrain exit pose (weld, no ease). "
                         "soft: free steady walk (placed + eased at splice time).")
-    p.add_argument("--approach-s", type=float, default=None, help="Override the plan's approach duration (s).")
-    p.add_argument("--exit-s", type=float, default=None, help="Override the plan's exit duration (s).")
+    p.add_argument("--approach-dist", type=float, default=None,
+                   help="Override the plan's approach travel budget (m).")
+    p.add_argument("--exit-dist", type=float, default=None,
+                   help="Override the plan's exit travel budget (m).")
     p.add_argument("--pin-future", default="auto", choices=["auto", "on", "off"],
                    help="[hard approach] once the arrival is inside the planning horizon, track the replay's "
                         "own FUTURE frames (on) or hold the entry pose (off). auto = the family's own "
@@ -472,14 +484,14 @@ def main() -> int:
     print(f"[mb_seg]   plan: replay {plan.replay.shape[0]}f, entry {plan.entry_frame} exit {plan.exit_frame}, "
           f"surfaces approach z={plan.approach_surf_z:.2f} exit z={plan.exit_surf_z:.2f}")
 
-    approach_s = float(args.approach_s if args.approach_s is not None else plan.approach_s)
-    exit_s = float(args.exit_s if args.exit_s is not None else plan.exit_s)
+    approach_d = float(args.approach_dist if args.approach_dist is not None else plan.approach_dist)
+    exit_d = float(args.exit_dist if args.exit_dist is not None else plan.exit_dist)
     tag = f"_{args.tag}" if args.tag else ""
     written = []
     for side in (["approach", "exit"] if args.side == "both" else [args.side]):
         pin = args.approach_pin if side == "approach" else args.exit_pin
-        secs = approach_s if side == "approach" else exit_s
-        written.append(_emit_segment(mb, targeter, plan, family, side, pin, secs,
+        dist = approach_d if side == "approach" else exit_d
+        written.append(_emit_segment(mb, targeter, plan, family, side, pin, dist,
                                      os.path.join(args.out_dir, f"{side}{tag}.npz"), args, raw_schema,
                                      plan_path=args.plan, start=args.approach_start))
 

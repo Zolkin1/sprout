@@ -56,11 +56,8 @@ pure_seconds: 6.0
 
 # ---------------------------------------------------------------- box families
 box_vel_range: [0.2, 3.5]
-box_approach_s_range: [2.5, 4.0]
-box_exit_s_range: [2.5, 6.0]
 box_top_vx_range: [0.2, 0.7]
 box_two_sided_frac: 0.5
-box_platform_buffer: 1.0
 box_nav_width: -1.0
 backward_vx_max: 1.0
 
@@ -86,9 +83,6 @@ rl_vels: raw
 # The tile POPULATION and the gait phase each clip hands off at. Distribution parameters in the
 # same sense the velocity bands are -- these used to reach a build only through mb_plan_library's
 # argparse defaults, i.e. from a second place, which is the thing this file exists to prevent.
-approach_s_range: [1.5, 3.5]     # s of approach per tile, quantized to duration_step
-exit_s_range: [1.5, 3.5]
-duration_step: 0.5               # quantization, so segments can be shared between clips
 n_steps_range: [3, 7]            # treads per TRANSITION stair tile
 tile_width_range: [0.8, 1.2]     # corridor width (m) per transition tile
 entry_pick: sample               # which boundary-gate candidate the terrain entry hands off at.
@@ -100,6 +94,19 @@ contact_tol: 0.02                # m; sole-to-surface tolerance for a boundary c
 swing_clear: null                # m; null derives it from the riser (min(0.05, 0.5*riser))
 swing_band: null                 # m; null derives it from the riser (max(0.5*riser, clear+0.05))
 footprint_margin: 1.0            # m added on all four sides of a tile's footprint
+
+# ---------------------------------------------------------------- approach/exit travel budget (m)
+# Stated in seconds and converted to a DISTANCE at each clip's own speed, then clamped in metres.
+# A fixed distance makes a slow clip take proportionally longer (6 m at 0.2 m/s is 30 s); a fixed
+# duration is what made the tile geometry speed-dependent -- platforms were duration x the tile's
+# fastest clip, so a 3.5 s budget at 2.6 m/s authored a 10.1 m platform on BOTH ends of every
+# transition tile. The clip keeps a duration; the tile only ever sees metres.
+approach_flat_s_range: [1.5, 4.0]   # s of flat lead-in before the approach zone
+exit_flat_s_range: [1.5, 4.0]       # s of flat trail-away after the terrain
+flat_dist_clamp: [1.0, 4.0]         # m; bounds the converted distance at both ends of the band
+dist_step: 0.25                     # m quantization, so segments can still be shared
+platform_buffer_m: 1.0              # m of walkable surface past the nominal travel, so the
+                                    # reference cannot walk off the far edge
 
 # ---------------------------------------------------------------- the splice (pass C)
 seams: ease                      # 'ease' inertializes the seam residual, 'weld' takes it rigidly,

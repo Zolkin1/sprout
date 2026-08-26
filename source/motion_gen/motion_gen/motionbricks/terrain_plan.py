@@ -79,8 +79,10 @@ class TerrainPlan:
     exit_speed: float                 # replay's signed speed AT ``exit_frame`` (exit ramp start)
     approach_mode: str                # "walk" | "stand"
     exit_mode: str                    # "walk" | "stand"
-    approach_s: float                 # requested approach duration (s)
-    exit_s: float                     # requested exit duration (s)
+    # The travel budget, in METRES, and the only form there is. It used to be a duration here and
+    # a duration x speed product below, which made "where is the terrain" a function of how fast
+    # this clip happens to walk. The duration is now emergent: the exact loop covers whatever the
+    # bounded transient does not, so the segment takes as long as the budget divided by the speed.
     # TRAVEL BUDGET (m) each side has on its walkable surface, i.e. the same ``duration x speed`` product
     # the tile's platforms were sized from -- reinterpreted as a DISTANCE.  The approach is
     # ``[exact loop][bounded transient][replay]``: the transient covers only the last stretch, whatever
@@ -89,8 +91,8 @@ class TerrainPlan:
     # what the robot can actually accelerate through without the platform having to be resized -- the tile
     # geometry is authored in pass A, long before any segment exists.  0.0 means a legacy plan with no
     # budget, which the assembler treats as "no loop, the segment covers everything".
-    approach_dist: float = 0.0
-    exit_dist: float = 0.0
+    approach_dist: float              # metres of walkable surface the approach gets
+    exit_dist: float                  # metres of walkable surface the exit gets
     # Candidate frames the boundary gates accepted, kept so an alternative can be tried without re-deriving.
     # NOTE the two index spaces: ``exit_candidates`` index ``terrain_qpos`` (same space as ``exit_frame``),
     # but ``entry_candidates`` index the SOURCE PERIOD of the pre-placement traversal -- choosing one
@@ -202,7 +204,6 @@ def save_terrain_plan(path: str, plan: TerrainPlan) -> None:
         "approach_vx": plan.approach_vx, "exit_vx": plan.exit_vx,
         "entry_vx": plan.entry_vx, "exit_speed": plan.exit_speed,
         "approach_mode": plan.approach_mode, "exit_mode": plan.exit_mode,
-        "approach_s": plan.approach_s, "exit_s": plan.exit_s,
         "approach_dist": plan.approach_dist, "exit_dist": plan.exit_dist,
         "meta": plan.meta,
     }
@@ -226,10 +227,11 @@ def load_terrain_plan(path: str) -> TerrainPlan:
             approach_vx=float(s["approach_vx"]), exit_vx=float(s["exit_vx"]),
             entry_vx=float(s["entry_vx"]), exit_speed=float(s["exit_speed"]),
             approach_mode=s["approach_mode"], exit_mode=s["exit_mode"],
-            approach_s=float(s["approach_s"]), exit_s=float(s["exit_s"]),
             # Absent on plans written before the travel budget existed; 0.0 means "no loop".
-            approach_dist=float(s.get("approach_dist", 0.0)),
-            exit_dist=float(s.get("exit_dist", 0.0)),
+            # Required, not defaulted: a plan written before the distance budget carries no budget
+            # at all, and defaulting it to 0 would silently produce a zero-length approach.
+            approach_dist=float(s["approach_dist"]),
+            exit_dist=float(s["exit_dist"]),
             entry_candidates=d["entry_candidates"], exit_candidates=d["exit_candidates"],
             meta=s.get("meta", {}),
         )

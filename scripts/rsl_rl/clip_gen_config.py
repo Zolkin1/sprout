@@ -59,9 +59,6 @@ _SCHEMA: dict[str, tuple] = {
     # These shape the tile POPULATION and the gait phase every clip hands off at, so they are
     # distribution parameters in the same sense the velocity bands are. They reached a build only
     # through mb_plan_library's own argparse defaults, which is what this file exists to prevent.
-    "approach_s_range": ("range", 2),
-    "exit_s_range": ("range", 2),
-    "duration_step": ("float", 1),
     "n_steps_range": ("int_range", 2),
     "tile_width_range": ("range", 2),
     "entry_pick": ("choice", ("first", "middle", "last", "sample")),
@@ -70,6 +67,21 @@ _SCHEMA: dict[str, tuple] = {
     "swing_clear": ("float_or_null", 1),
     "swing_band": ("float_or_null", 1),
     "footprint_margin": ("float", 1),
+    # ---- the approach/exit TRAVEL budget, in metres.
+    # It used to be a duration per TILE, and the tile's platforms were then sized as
+    # duration x the tile's FASTEST clip -- so a 3.5 s budget on a 2.6 m/s stair tile authored a
+    # 10.1 m platform on both ends of every transition tile, and the seam sat wherever that
+    # happened to put it. Distance is the quantity the geometry and the approach zone are both in.
+    #
+    # The band is still stated in SECONDS and converted at each clip's own speed, then clamped in
+    # metres: a fixed distance would make a slow clip take proportionally longer (6 m at 0.2 m/s is
+    # 30 s), and a fixed duration is what produced the speed-dependent geometry. This is the one
+    # place a duration is still the natural unit, and it never reaches the tile.
+    "approach_flat_s_range": ("range", 2),
+    "exit_flat_s_range": ("range", 2),
+    "flat_dist_clamp": ("range", 2),
+    "dist_step": ("float", 1),
+    "platform_buffer_m": ("float", 1),
     # ---- pass C: the splice
     "seams": ("choice", ("ease", "weld", "auto")),
     "seam_blend_s": ("float", 1),
@@ -89,11 +101,8 @@ _SCHEMA: dict[str, tuple] = {
     "pin_future": ("choice", ("auto", "on", "off")),
     # box families
     "box_vel_range": ("range", 2),
-    "box_approach_s_range": ("range", 2),
-    "box_exit_s_range": ("range", 2),
     "box_top_vx_range": ("range", 2),
     "box_two_sided_frac": ("float", 1),
-    "box_platform_buffer": ("float", 1),
     "box_nav_width": ("float", 1),
     "backward_vx_max": ("float", 1),
     # shared terrain
