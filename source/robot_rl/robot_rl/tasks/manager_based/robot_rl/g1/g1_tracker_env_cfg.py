@@ -148,6 +148,17 @@ class G1FmTrackerCommandsCfg:
     """Robot-state-conditioned FM tracking command (live robot history, world-frame CLF)."""
 
     traj_ref = FmTrackingCommandCfg(
+        # ODOMETRY-FREE BY DEFAULT. Under "plan" the window's base_pose is measured from
+        # the root at the last re-plan, so the generator's output IS the observation and the
+        # deploy runtime serves it without ever reading the robot's world position. Under
+        # "robot_now" it must convert every control step, which on hardware is real odometry
+        # -- and the C++ runtime refuses that arm by design rather than by omission.
+        #
+        # Set HERE, on the task, not on window.DEFAULT_WINDOW_ANCHOR: runs predating the
+        # field carry no window_anchor in their saved config and resolve to that constant,
+        # so moving it would change what their recorded convention string means and
+        # provenance.check_run_conventions would start refusing them.
+        window_anchor="plan",
         contact_bodies=[".*_ankle_roll_link"],
         # No default library -- ``--clip`` sets this and scene.terrain.clip_library_path
         # together (see g1_teacher_terrain_env_cfg).
