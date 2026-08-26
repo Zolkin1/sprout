@@ -30,9 +30,12 @@ Runs with NO IsaacLab.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 
 import torch
 
+from motion_gen.clips.clip_fingerprint import fingerprint_clip_config, fingerprint_solved_library
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library
 
 _PERSTEP = ["y_des", "dy_des", "contact", "target_vel", "anchor_mask_t"]
@@ -181,6 +184,22 @@ def main() -> int:
                         "terrain_type_names (flat/terrain/transition/slope/box). Default = keep all. Use "
                         "with --flat-tiles 0 to build a single-family library from an already-composed one.")
     p.add_argument("--device", default="cpu")
+    # --- provenance. A composed library is the artifact everything downstream trains on, and until
+    # now it recorded nothing about WHAT it was built from: only the deprecated motion-matching
+    # generators ever wrote a source fingerprint, so the live Motion Bricks chain produced libraries
+    # that could not answer "which solved library is this?". That matters now rather than in
+    # principle -- the solved library is being replaced, and hf_cache never re-checks its local copy
+    # against the remote, so two machines can hold different libraries under one name.
+    p.add_argument("--library", default=None,
+                   help="Solved traj-opt library this was stitched from (e.g. "
+                        "trajectories/skills/library_v2). Fingerprinted into the output.")
+    p.add_argument("--hf-repo", default="zolkin/robot_rl",
+                   help="HuggingFace repo for --library; '' for a purely local path.")
+    p.add_argument("--recipe", default=None,
+                   help="clip-gen recipe YAML. Recorded VERBATIM as generator_config -- it is "
+                        "already validated (no missing and no unknown keys), which is what makes it "
+                        "worth recording rather than a hand-picked subset.")
+    p.add_argument("--seed", type=int, default=None, help="Recipe seed, for the clip fingerprint.")
     args = p.parse_args()
     dev = args.device
     keep_types = {t.strip() for t in args.types.split(",")} if args.types else None
@@ -248,14 +267,58 @@ def main() -> int:
     writer = ClipLibraryWriter(args.out, len(records), meta)
     writer.set_attr("generator", "composed")
     writer.set_attr("terrain_manifest", manifests)
-    writer.set_attr("generator_config", {"counts": {"flat": flat_tiles}})
+    _sources = [pth for pth, _n in specs] + ([args.flat_from] if args.flat_from else [])
+
+    # generator_config is the WHOLE recipe when one was given, with the flat-tile count folded in
+    # (the loader reads counts.flat, so it cannot move). The recipe is a validated dict by the time
+    # it gets here -- clip_gen_config guarantees no missing and no unknown keys -- so recording it
+    # verbatim is strictly better than a curated subset that drifts from what was actually used.
+    gen_cfg: dict = {"counts": {"flat": flat_tiles}}
+    if args.recipe:
+        import yaml
+        with open(args.recipe) as f:
+            gen_cfg["recipe"] = yaml.safe_load(f)
+        gen_cfg["recipe_path"] = os.path.basename(args.recipe)
+    writer.set_attr("generator_config", gen_cfg)
+
+    # If a SOURCE family records its own solved-library fingerprint, it must agree with the one
+    # being stamped here. Nothing does yet -- the family writers are not plumbed for it -- so this
+    # is inert today and is written for the case it exists to catch: `--extra-mix`, which folds in
+    # families built by a separate invocation, possibly weeks apart and possibly against a
+    # different solved library. Composing those silently would produce a library whose recorded
+    # provenance is true of only some of its clips.
+    # TODO(family-provenance): have mb_assemble_library / mb_pure_stair_clips / mb_flat_clips
+    # record source_library_fingerprint so this check has something to compare.
+    _src_fps = {pth: (_get_lib(pth).attrs or {}).get("source_library_fingerprint")
+                for pth in _sources}
+    _seen = {json.dumps(v, sort_keys=True) for v in _src_fps.values() if v}
+    if len(_seen) > 1:
+        print("[compose][WARN] sources disagree about which solved library they came from:")
+        for pth, v in _src_fps.items():
+            if v:
+                print(f"[compose][WARN]   {os.path.basename(pth)}: {v.get('short', '?')} "
+                      f"({v.get('source', '?')})")
+
+    src_fp: dict = {}
+    if args.library:
+        src_fp = fingerprint_solved_library(args.library, args.hf_repo or None)
+        writer.set_attr("source_library_fingerprint", src_fp)
+        print(f"[compose] solved library: {src_fp['source']} {src_fp['short']} "
+              f"({src_fp['num_clips']} clips)")
+    else:
+        print("[compose][WARN] no --library given: the output will not record which solved library "
+              "it was built from, so 'is this the library I think it is?' becomes unanswerable.")
+    # The one fingerprint that ties all three together. fingerprint_clip_config has existed since
+    # the clip machinery was written and was, in its own words, "imported in one place and called in
+    # none, so the existing check has never had anything to compare".
+    writer.set_attr("clip_fingerprint",
+                    fingerprint_clip_config(src_fp, gen_cfg, args.seed))
     # Carry the REGIME declaration through. ``stride_idx >= 0`` marks the exact looped-replay frames, and
     # QC needs an explicit attr to trust it because the dataset's h5py fill is 0 -- a library that never
     # wrote it would otherwise read as "stride 0 everywhere", i.e. 100% steady. Propagated when ANY source
     # declares it: every other family writes -1, so their frames are already correctly marked "not a loop".
     # ``--flat-from`` is a separate input from ``--mix`` and is the family that actually carries the
     # regime, so it has to be checked too -- missing it left the composed library unscoreable.
-    _sources = [pth for pth, _n in specs] + ([args.flat_from] if args.flat_from else [])
     if any(bool(_get_lib(pth).attrs.get("has_regime", False)) for pth in _sources):
         writer.set_attr("has_regime", True)
     for i, b in enumerate(records):

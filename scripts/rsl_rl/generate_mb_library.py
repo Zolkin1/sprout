@@ -352,7 +352,12 @@ def main() -> int:
         if not mix:
             raise SystemExit("[compose] no family libraries found; run stage c first")
         compose = ["--mix", ", ".join(mix), "--max-clips-per-tile", str(cpt),
-                   "--out", args.out, "--device", args.device]
+                   "--out", args.out, "--device", args.device,
+                   # Provenance: which solved library, which recipe, which seed. Without these the
+                   # finished .h5 cannot say what produced it, and the local hf/ cache is never
+                   # re-checked against the remote.
+                   "--library", args.library, "--recipe", cfg.config_path,
+                   "--seed", str(cfg.seed)]
         if os.path.exists(os.path.join(_REPO, flat_h5)):
             compose += ["--flat-from", flat_h5, "--flat-tiles", str(cfg.flat_tiles),
                         "--flat-clips", str(n_flat_clips)]

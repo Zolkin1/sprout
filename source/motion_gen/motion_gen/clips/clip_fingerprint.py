@@ -77,6 +77,76 @@ def fingerprint_clip_config(
 
 
 #: Bump when the canonicalisation in :func:`fingerprint_terrain_manifest` changes.
+
+_SOLVED_FINGERPRINT_VERSION = 1
+
+
+def fingerprint_solved_library(source: str, hf_repo: str | None = "zolkin/robot_rl") -> dict:
+    """Content fingerprint of the SOLVED traj-opt library a clip library was stitched from.
+
+    Moved here out of ``motion_matching.locomotion_db``, which is the DEPRECATED matcher package.
+    Only the deprecated generators ever called it, so the LIVE Motion Bricks chain recorded no
+    statement at all of which solved library produced a given clip library -- ``mb_flat_clips``,
+    ``mb_assemble_library``, ``mb_pure_stair_clips`` and ``compose_terrain_library`` between them
+    write ``generator``, ``terrain_manifest``, ``has_regime`` and a flat-tile count, and stop.
+
+    That is a problem now rather than in principle: the solved library is being replaced, and
+    ``hf_cache.download_from_hf`` REUSES whatever is already in the local ``hf/`` cache without
+    re-checking the remote -- so two machines can hold different libraries under one name and a
+    finished ``.h5`` would have no way to say which one it came from.
+
+    The library is npz + ``manifest.csv`` (not the traj-opt yaml layout ``fingerprint_library``
+    expects), so hash the manifest bytes plus the sorted per-clip relative paths and sizes. Sizes
+    rather than contents: hashing several hundred npz bodies costs seconds per call for a check
+    whose job is to catch "a different library", not "a bit-flip in one clip".
+
+    Args:
+        source: library path, repo-relative or absolute (e.g. ``trajectories/skills/library_v2``).
+        hf_repo: HuggingFace repo to fall back to; ``None`` for a purely local path.
+
+    Returns:
+        ``{version, hash, short, num_clips, source}``.
+    """
+    from ..hf_cache import resolve_library_path                     # stdlib-only, lazy HF import
+
+    root = resolve_library_path(source, hf_repo)
+    h = hashlib.sha256()
+    h.update(f"v{_SOLVED_FINGERPRINT_VERSION}".encode())
+    manifest = root / "manifest.csv"
+    if manifest.is_file():
+        h.update(manifest.read_bytes())
+    npzs = sorted(root.rglob("*.npz"))
+    for f in npzs:
+        h.update(str(f.relative_to(root)).encode())
+        h.update(str(f.stat().st_size).encode())
+    digest = h.hexdigest()
+    return {"version": _SOLVED_FINGERPRINT_VERSION, "hash": digest, "short": digest[:12],
+            "num_clips": len(npzs), "source": str(source)}
+
+
+def verify_solved_fingerprint(recorded: dict | None, current: dict | None) -> tuple[bool, str]:
+    """``(ok, message)`` for a recorded solved-library fingerprint against a freshly computed one.
+
+    A MISSING recorded fingerprint is not a failure -- libraries built before this was wired carry
+    none, and refusing them would be a migration gate rather than a drift check. An empty dict is
+    also treated as absent, deliberately: "absent" and "empty" must not be the same thing, because
+    an empty fingerprint would otherwise compare equal to anything.
+    """
+    if not recorded:
+        return True, "no solved-library fingerprint recorded (library predates it)"
+    if not current:
+        return True, "no current solved library to compare against"
+    if recorded.get("hash") == current.get("hash"):
+        return True, f"solved library matches ({recorded.get('short', '?')})"
+    return False, (
+        f"solved library MISMATCH: library was built from {recorded.get('source', '?')} "
+        f"({recorded.get('short', '?')}, {recorded.get('num_clips', '?')} clips) but the current "
+        f"{current.get('source', '?')} hashes {current.get('short', '?')} "
+        f"({current.get('num_clips', '?')} clips). The local hf/ cache is never re-checked against "
+        f"the remote, so two machines can hold different libraries under one name."
+    )
+
+
 _TERRAIN_FINGERPRINT_VERSION = 1
 
 
