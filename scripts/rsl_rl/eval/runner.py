@@ -496,7 +496,10 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
 
     # --- the clip reset's own knobs -------------------------------------------------------
     reset = env_cfg.events.reset_on_clip
-    reset.params["pin_start_step"] = 0
+    # -1 = do not pin; the command's own random_start_phase draws (and its min_start_step
+    # reserve applies, so a clip-seeded history still has steps to read).
+    reset.params["pin_start_step"] = None if int(args.start_step) < 0 else int(args.start_step)
+    notes["pin_start_step"] = reset.params["pin_start_step"]
     reset.params["spawn_z_offset"] = float(args.spawn_z_offset)
     notes["spawn_z_offset"] = float(args.spawn_z_offset)
 
@@ -764,7 +767,8 @@ def stage_grid(args) -> int:
                "--num_envs", str(args.num_envs), "--num_rows", str(args.num_rows),
                "--seed", str(args.seed), "--ood_scale", str(args.ood_scale),
                "--dr_resample", args.dr_resample,
-               "--spawn_z_offset", str(args.spawn_z_offset)]
+               "--spawn_z_offset", str(args.spawn_z_offset),
+               "--start_step", str(args.start_step)]
         if args.clip_device:
             cmd += ["--clip_device", args.clip_device]
         # Forward EVERY flag the cell stage reads. This list is the whole reason `fm_tf` is a

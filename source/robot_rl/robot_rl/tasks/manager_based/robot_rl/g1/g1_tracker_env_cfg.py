@@ -247,6 +247,28 @@ def _apply_tracker_play_trims(cfg) -> None:
     cfg.observations.reference.enable_corruption = False
     cfg.events.push_robot = None
     cfg.events.randomize_ground_contact_friction = None
+    # End with the CLIP, not on the 20 s wall. Without this every episode runs the full
+    # padded 20 s: a 285-frame clip is 5.7 s of motion and then 14 s of the robot being
+    # commanded the last frame's velocity (the look-ahead gather clamps, so `target_vel`
+    # saturates) straight off a finite tile. Falls in that tail say nothing about the
+    # policy, and they dominate what a viewer sees.
+    #
+    # This is NOT the clip-grading the task drops on purpose. `clip_end_reached` is wired
+    # `time_out=True` -- a TRUNCATION, so rsl-rl bootstraps the value from the final state
+    # rather than scoring it as a failure -- and it reads only the clip's LENGTH, never its
+    # pose. The terms this task refuses (`base_pose_error`, `ee_pose_error`) are the ones
+    # that measure the robot against a clip the generator is free to depart from.
+    #
+    # Same term and the same parameters the eval harness installs (eval/runner.py), so a
+    # run watched here and a cell measured there share their episode boundaries instead of
+    # agreeing only by whoever retyped them. `reserve_lookahead` ends one reference window
+    # (50 steps) early, since the last window of every clip is a clamp artefact.
+    cfg.terminations.clip_end = DoneTerm(
+        func=mdp.clip_end_reached,
+        params={"command_name": "traj_ref", "reserve_lookahead": True},
+        time_out=True,
+    )
+
     # Draw the FM reference markers + the height-scan ray hits on the treads.
     cfg.commands.traj_ref.debug_vis = True
     cfg.scene.height_scanner.debug_vis = True

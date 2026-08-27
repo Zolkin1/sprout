@@ -1338,6 +1338,13 @@ def main() -> None:
                              "costs ~20 ms/step of ray casting (measured, 14641 rays), and "
                              "any survival number it produces is a statement about the model "
                              "given perfect terrain -- never about deployment.")
+    parser.add_argument("--allow_robot_asset_mismatch", action="store_true", default=False,
+                        help="run a tracker/generator pair whose robot fingerprints disagree. "
+                             "SIM ONLY. The fingerprint hashes whole files, so an edit to a "
+                             "part of the MJCF neither model reads -- the actuator PD gains, "
+                             "which sim2sim overwrites from the policy anyway -- trips it "
+                             "without any model being stale. Read the reported fields first: "
+                             "joint_names, body_names or total_mass differing is never benign.")
     parser.add_argument("--fm_update_every", type=int, default=1,
                         help="Generator re-inference cadence K (control steps); 1 = every step, "
                              "which is the only cadence that pays the full FM cost every tick. "
@@ -1566,6 +1573,7 @@ def main() -> None:
         tracker_on_cpu=args.tracker_on_cpu,
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
         allow_privileged_extero=args.allow_privileged_extero,
+        allow_robot_asset_mismatch=args.allow_robot_asset_mismatch,
         fm_lead_ticks=args.fm_lead_ticks,
     )
     policy.load()

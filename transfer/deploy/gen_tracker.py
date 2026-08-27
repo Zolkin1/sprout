@@ -148,7 +148,8 @@ _ROBOT_ASSET_FIELDS = ("joint_names", "total_mass_kg", "body_names",
 
 
 def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None,
-                               tracker_name: str, fm_name: str) -> None:
+                               tracker_name: str, fm_name: str,
+                               allow_mismatch: bool = False) -> None:
     """Refuse a tracker/generator pair trained on DIFFERENT robots.
 
     A deploy box has no "current robot" to check an artifact against -- it has whatever
@@ -166,9 +167,20 @@ def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None
         fm_asset: ``fm.onnx``'s ``fm_meta.robot_asset``.
         tracker_name: Path, for the message.
         fm_name: Path, for the message.
+        allow_mismatch: Report the differing fields and continue instead of refusing.
+            SIM ONLY -- ``GenTrackerPolicy`` defaults it off and nothing on the hardware path
+            passes it, exactly as ``allow_privileged_extero`` is scoped. It exists because the
+            fingerprint hashes whole FILES: an edit to a part of the MJCF that neither model
+            reads -- the actuator PD gains are the case that prompted this, since sim2sim
+            overwrites them from the policy anyway -- moves the hash without moving anything
+            either artifact depends on. Whether a given difference is of that kind is a
+            judgement only the operator can make, which is why this is a flag and not a
+            softened rule. A differing ``joint_names``, ``body_names`` or ``total_mass`` is
+            never benign.
 
     Raises:
-        ValueError: If both carry a fingerprint and a shared field differs.
+        ValueError: If both carry a fingerprint and a shared field differs, unless
+            ``allow_mismatch``.
     """
     if not tracker_asset or not fm_asset:
         return
@@ -190,8 +202,15 @@ def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None
             lines.append(f"  joint_names: {len(t)} vs {len(f)}")
         else:
             lines.append(f"  {k}: {str(t)[:16]} vs {str(f)[:16]}")
+    if allow_mismatch:
+        print("[WARN] " + "\n[WARN] ".join(lines))
+        print("[WARN] --allow_robot_asset_mismatch was passed: continuing anyway. Anything "
+              "measured from this run is a statement about a pair the fingerprint says is "
+              "not matched.")
+        return
     lines.append("Re-export both from one run, or point --fm_onnx at the generator trained "
-                 "against this tracker.")
+                 "against this tracker. If the differing field is one neither model reads, "
+                 "the MuJoCo runner takes --allow_robot_asset_mismatch (sim only).")
     raise ValueError("\n".join(lines))
 
 
@@ -224,6 +243,7 @@ class GenTrackerPolicy:
         fm_cuda_graph: bool = False,
         tracker_on_cpu: bool = False,
         allow_privileged_extero: bool = False,
+        allow_robot_asset_mismatch: bool = False,
         fm_lead_ticks: int = 0,
     ):
         """Configure the generator + tracker pair from the ONNX artifacts.
@@ -289,6 +309,8 @@ class GenTrackerPolicy:
         self.fm_cuda_graph = bool(fm_cuda_graph)
         self.tracker_on_cpu = bool(tracker_on_cpu)
         self.allow_privileged_extero = bool(allow_privileged_extero)
+        #: SIM ONLY, like allow_privileged_extero: nothing on the robot path sets it.
+        self.allow_robot_asset_mismatch = bool(allow_robot_asset_mismatch)
         #: Emulate the C++ runtime's generator LEAD: it requests each plan `lead` ticks
         #: before the boundary it is for, and conditions it on the exteroception and the
         #: velocity command as they were AT REQUEST TIME (plan_scheduler.h). Its history is
@@ -335,7 +357,8 @@ class GenTrackerPolicy:
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
             _assert_robot_assets_agree(self._trk.get_robot_asset(), self.ctx.robot_asset,
-                                       self.tracker_onnx, self.fm_onnx)
+                                       self.tracker_onnx, self.fm_onnx,
+                                       allow_mismatch=self.allow_robot_asset_mismatch)
         # Re-plan cadence: the tracker metadata (the value the tracker task trained with),
         # else the constructor/CLI default. The old middle tier -- falling back to the FM's
         # fm_snap_every -- existed only to satisfy the agreement rule that has since been

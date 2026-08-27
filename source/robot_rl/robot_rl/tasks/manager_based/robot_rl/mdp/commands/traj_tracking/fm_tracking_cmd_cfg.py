@@ -126,6 +126,29 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     Turn it off only to debug what a clip-sourced channel *would* have contained."""
 
+    seed_history_from_clip: str = "auto"
+    """When to fill a resetting env's generator history from the CLIP's preceding steps.
+
+    The generator's first inference of an episode otherwise runs on the learned
+    ``null_history`` embedding, which is phase-agnostic by construction and -- because the
+    recordings it was fitted on start on flat -- effectively a FLAT-GROUND prior. Both are
+    fine when the episode opens on flat, which is how the robot starts on hardware. Neither is
+    fine when it opens on terrain.
+
+    * ``"auto"`` (default) -- seed exactly when ``history_from="clip"``. Teacher forcing is
+      meant to hold the prediction in phase with the clip, and it cannot do that on the first
+      inference unless the history is there.
+    * ``"on_terrain_start"`` -- seed only the envs whose start lands at or after the clip's
+      ``terrain_start_step``, i.e. the ones with no flat lead-in to open on. Everything else
+      keeps the null embedding, which is what deploy gets. This is the setting that lets the
+      ``*_pure`` stair families be trained on at all without giving every other episode an
+      opening it will never see on a robot.
+    * ``"always"`` / ``"never"`` -- unconditional.
+
+    Seeding needs ``N`` real steps before the start; :attr:`FmTrackingCommand.min_start_step`
+    reserves them, and the clip-step gather clamps only at the TOP, so without that reserve a
+    start inside it would read the clip's END as its history."""
+
     history_from: str = "generator"
     """Where the FM's ``N`` autoregressive context tokens come from. A DIAGNOSTIC switch.
 

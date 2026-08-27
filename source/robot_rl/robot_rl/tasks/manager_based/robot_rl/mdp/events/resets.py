@@ -305,6 +305,28 @@ def sample_start_step(
     if cap_at_terrain_end and getattr(cmd.cfg, "random_start_before_terrain_end", False):
         terrain_end = cmd.manager.gather_terrain_end_step(clip_id).to(device)
         hi = torch.minimum(hi, terrain_end + 1).clamp(min=1)
+    if getattr(cmd.cfg, "random_start_before_terrain_start", False):
+        # Open on flat. terrain_start is -1 on a flat clip (no terrain at all), which must not
+        # cap anything -- hence the where() rather than a plain minimum.
+        t_start = cmd.manager.gather_terrain_start_step(clip_id).to(device)
+        hi = torch.where(t_start >= 0, torch.minimum(hi, t_start), hi)
+    # A command that seeds its generator history from the clip needs that history to exist,
+    # so it reserves the first few steps. The clip-step gather clamps only at the TOP
+    # (`_future_step_indices`), so a start inside the reserve would index backwards and read
+    # the clip's END as history -- silently. The pad is what makes the seed safe.
+    lo = int(getattr(cmd, "min_start_step", 0))
+    if lo:
+        # The reserve is what lets a clip-seeded history exist: the clip-step gather clamps
+        # only at the TOP, so a start inside it would index backwards and read the clip's END
+        # as its history, silently.
+        #
+        # When the caps leave no room above the reserve -- a clip whose terrain starts at step
+        # 0, which is exactly the case seeding exists for -- start AT the reserve rather than
+        # falling back to 0. Those episodes open on terrain by necessity; opening them without
+        # a history as well would combine the two things this is trying to avoid.
+        hi = torch.maximum(hi, torch.full_like(hi, lo + 1))
+        lo_t = torch.full_like(hi, lo)
+        return (lo_t + (torch.rand(k, device=device) * (hi - lo_t).float()).long()).long()
     return (torch.rand(k, device=device) * hi.float()).long()
 
 

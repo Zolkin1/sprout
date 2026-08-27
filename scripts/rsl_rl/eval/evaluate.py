@@ -164,6 +164,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "quoted with (fm/none 0.495 -> fm/train 0.468), so it costs a "
                         "third of the grid to re-confirm that DR is not the limit. Ask "
                         "for it when robustness is the question.")
+    g.add_argument("--start_step", type=int, default=0,
+                   help="clip step every episode starts on. 0 (default) plays each clip from "
+                        "its beginning, which is what makes terrain_start_step / "
+                        "terrain_end_step describe the episode and keeps cells paired at the "
+                        "same difficulty. A POSITIVE value is needed to exercise a generator "
+                        "history seeded from the clip (it needs N preceding steps to exist). "
+                        "-1 draws a random start per episode: that exercises gait-phase "
+                        "diversity, but an episode can then begin PAST terrain_start, which "
+                        "biases 'terrain done' and 'terrain_progress', and the draws differ "
+                        "between cells so arms no longer pair at equal difficulty. Success is "
+                        "termination-derived and stays meaningful either way.")
     g.add_argument("--robots_per_clip", default="",
                    help="comma list of KEY=N, e.g. 'clip/train=50,fm/ood=10'; keys not "
                         "given fall back to the built-in defaults")

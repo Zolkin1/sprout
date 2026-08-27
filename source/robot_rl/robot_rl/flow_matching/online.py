@@ -83,6 +83,58 @@ class BatchedHistory:
             self._steps.append({k: v.clone() for k, v in step.items()})
         self._steps_since_reset[:] = self.maxlen
 
+    def seed(self, env_ids: torch.Tensor, rows: dict[str, torch.Tensor]) -> None:
+        """Install a REAL history for ``env_ids`` and mark their windows valid immediately.
+
+        This is not :meth:`fill`.  ``fill`` fabricates a history by repeating one snapshot,
+        which is what the deleted warm-up paths did and why they were deleted: it puts the
+        generator in a state no training sample contains while telling it, via the cleared
+        mask, to believe it.  ``seed`` installs rows that actually happened -- the CLIP's own
+        preceding steps, under ``history_from="clip"`` -- so the mask is cleared over ground
+        truth rather than over an invention.
+
+        The point is the OPENING PLAN.  A null-history first inference is phase-agnostic by
+        construction, and an env that spawns mid-clip has a definite gait phase that the
+        reward follows, so the two disagree for the whole first re-plan period.  Seeding
+        removes that disagreement in the teacher-forced arm; the closed loop keeps the null
+        embedding, because on a robot there is no clip to seed from.
+
+        Args:
+            env_ids: Long indices of the envs to seed.
+            rows: Per tracked key, ``(len(env_ids), maxlen, ·)`` -- OLDEST FIRST, matching
+                the deque order that :meth:`stack` reads.
+
+        Raises:
+            ValueError: If a row block is not ``maxlen`` long, or names a key the deque does
+                not already track (which would make :meth:`stack` ragged).
+        """
+        if env_ids.numel() == 0:
+            return
+        for key, block in rows.items():
+            if block.shape[1] != self.maxlen:
+                raise ValueError(
+                    f"seed({key!r}) got {block.shape[1]} rows, expected maxlen={self.maxlen}."
+                )
+        # The deque underfills only at the very start of a run. Pad it to maxlen with zeros
+        # so the seeded envs have slots to be written into; every other env stays masked by
+        # its own counter, so the zeros they receive here are never read.
+        # (num_envs, ...) per slot -- NOT zeros_like(block[0]), which is (maxlen, ...) and
+        # blows up as an out-of-bounds index the moment an env id exceeds maxlen.
+        num_envs = self._steps_since_reset.shape[0]
+        while len(self._steps) < self.maxlen:
+            self._steps.appendleft(
+                {k: v.new_zeros((num_envs, *v.shape[2:])) for k, v in rows.items()}
+            )
+        for key, block in rows.items():
+            if key not in self._steps[0]:
+                raise ValueError(
+                    f"seed({key!r}) names a key the history does not track "
+                    f"({sorted(self._steps[0])}); stack() would be ragged."
+                )
+            for i in range(self.maxlen):
+                self._steps[i][key][env_ids] = block[:, i]
+        self._steps_since_reset[env_ids] = self.maxlen
+
     def stack(self, key: str) -> torch.Tensor:
         """Stack a tracked quantity over the window into ``(N, maxlen, ·)``."""
         return torch.stack([s[key] for s in self._steps], dim=1)

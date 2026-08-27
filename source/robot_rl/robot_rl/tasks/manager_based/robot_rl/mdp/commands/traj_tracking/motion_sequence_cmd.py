@@ -848,6 +848,16 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         cid = self.clip_id[:, None].expand_as(steps)
         return cid, steps
 
+    @property
+    def min_start_step(self) -> int:
+        """Earliest clip step a random start may land on. ``0`` -- the whole clip is fair game.
+
+        A subclass raises this when it needs clip history to EXIST before the episode opens;
+        see :attr:`~.fm_tracking_cmd.FmTrackingCommand.min_start_step`. Derived rather than
+        configured so it cannot disagree with the number of history rows it exists to cover.
+        """
+        return 0
+
     def get_future_command_velocity(self, offsets: torch.Tensor) -> torch.Tensor:
         """Commanded base velocity ``[N, K, 3]`` = (vx, vy, wz) at the future ``offsets``.
 

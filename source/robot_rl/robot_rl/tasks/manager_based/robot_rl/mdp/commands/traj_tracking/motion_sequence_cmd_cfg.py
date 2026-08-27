@@ -53,6 +53,21 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     immediately hit ``clip_end_reached``). Ignored when ``random_start_phase``
     is False."""
 
+    random_start_before_terrain_start: bool = False
+    """Draw the random start BEFORE the terrain begins, so every episode opens on flat.
+
+    For a generator-driven run this is about the learned ``null_history`` embedding, which
+    covers the first N steps of every episode and is fitted overwhelmingly on flat ground --
+    which is also how the robot starts on hardware. Opening already on terrain asks it for the
+    one case it never saw.
+
+    A clip with no flat lead-in (``terrain_start_step`` at or near 0, i.e. the ``*_pure``
+    stair families and a few ``jump_off*`` clips) cannot satisfy this; those start as early as
+    the history allows instead, and are the ones
+    :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.seed_history_from_clip` covers.
+
+    Independent of :attr:`random_start_before_terrain_end`, which bounds the other end."""
+
     random_start_before_terrain_end: bool = True
     """Cap the random start at the last frame of the clip's terrain-PINNED run.
 

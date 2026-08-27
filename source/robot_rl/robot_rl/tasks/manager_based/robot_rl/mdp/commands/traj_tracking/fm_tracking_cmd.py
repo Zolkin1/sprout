@@ -667,6 +667,128 @@ class FmTrackingCommand(MotionSequenceCommand):
             return
         super()._write_global_base_des()
 
+    @property
+    def min_start_step(self) -> int:
+        """Reserve the first ``N`` clip steps when the history is seeded from the clip.
+
+        Under ``history_from="clip"`` a resetting env has its generator history written from
+        the clip's OWN preceding steps (:meth:`_seed_clip_history`), which requires those
+        steps to exist. The clip-step gather clamps only at the top, so a start inside the
+        reserve would index backwards and quietly read the clip's END as history.
+
+        Zero when nothing is seeded, which leaves the whole clip available to start on.
+        """
+        return self.ctx.N if self._seeding_enabled else 0
+
+    @property
+    def _seeding_enabled(self) -> bool:
+        """Whether ANY env may have its history seeded from the clip this run.
+
+        Resolves the ``"auto"`` default, under which seeding tracks teacher forcing.
+
+        Raises:
+            ValueError: On an unknown mode -- a typo must not silently disable the seed.
+        """
+        mode = self.cfg.seed_history_from_clip
+        if mode not in ("auto", "never", "always", "on_terrain_start"):
+            raise ValueError(
+                f"seed_history_from_clip={mode!r} must be one of "
+                "'auto', 'never', 'always', 'on_terrain_start'."
+            )
+        if mode == "never":
+            return False
+        if mode == "auto":
+            return self.cfg.history_from == "clip"
+        return True
+
+    def _envs_needing_seed(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """Narrow just-reset envs to the ones this run's mode says to seed.
+
+        Under ``"on_terrain_start"`` that is the envs with no flat lead-in -- those whose
+        start lands at or after the clip's ``terrain_start_step``. A flat clip carries
+        ``terrain_start_step = -1`` (no terrain at all) and is never in this set, so it keeps
+        the null embedding exactly as deploy does.
+
+        Args:
+            env_ids: Long indices of the envs that just reset.
+
+        Returns:
+            The subset to seed.
+        """
+        if self.cfg.seed_history_from_clip != "on_terrain_start":
+            return env_ids
+        t_start = self.manager.gather_terrain_start_step(self.clip_id[env_ids]).to(self.device)
+        on_terrain = (t_start >= 0) & (self._step[env_ids] >= t_start)
+        return env_ids[on_terrain]
+
+    def _seed_clip_history(self, env_ids: torch.Tensor) -> None:
+        """Fill the generator history of just-reset envs from the clip's preceding steps.
+
+        Teacher forcing is supposed to hold the prediction in phase with the motion the
+        reward grades. It cannot do that on the FIRST inference of an episode, because there
+        is no history yet and the model falls back to the learned ``null_history`` embedding,
+        which is phase-agnostic by construction. With ``random_start_phase`` the robot spawns
+        at a definite gait phase, so that opening plan disagrees with both the robot and the
+        reward for a whole re-plan period -- every episode.
+
+        The rows are the clip's nodes for steps ``s0-N .. s0-1``, all expressed against the
+        SPAWN pose. That is not an approximation of the recorded convention, it IS it: the
+        recorder substitutes the plan anchor into history rows ``0..H-2``, and at a reset the
+        plan anchor is the spawn pose, so a freshly re-planned history is exactly one anchor
+        repeated across its rows.
+
+        Closed-loop runs never reach this: on a robot there is no clip to read, so that arm
+        keeps the null embedding and the two are deliberately allowed to differ here.
+
+        Args:
+            env_ids: Long indices of the envs that just reset.
+        """
+        if not self._seeding_enabled or env_ids.numel() == 0:
+            return
+        env_ids = self._envs_needing_seed(env_ids)
+        if env_ids.numel() == 0:
+            return
+        n = self.ctx.N
+        offsets = torch.arange(-n, 0, device=self.device, dtype=torch.long)
+        # Seed only the envs that HAVE n preceding steps; the rest keep the null embedding.
+        #
+        # `min_start_step` reserves those steps whenever the start is drawn, but a start can
+        # also be PINNED, and the eval harness pins every episode to clip step 0 on purpose
+        # (reproducibility, and it is what makes cells pair on clip id). There is no history
+        # before step 0 and nothing to invent, so those envs fall through to null -- which is
+        # the honest answer for them and leaves the harness's existing numbers comparable.
+        #
+        # Filtering rather than raising: the clip-step gather clamps only at the TOP, so a
+        # negative index would silently read the clip's END as its history. That is what must
+        # not happen; a pinned start is not itself an error.
+        seedable = self._step[env_ids] >= n
+        if not bool(seedable.any()):
+            return
+        env_ids = env_ids[seedable]
+        prev = self._serve_override
+        self._serve_override = "clip"
+        try:
+            rows = super().reference_window_obs(offsets, self._fm_blocks)  # [N_env, n, D]
+        finally:
+            self._serve_override = prev
+        rows = rows[env_ids]
+        # robot-now -> plan anchor, exactly as _clip_history_node does it for the live path.
+        # `reference_window_obs` anchors on the MEASURED robot, and the history ring holds
+        # plan-anchored rows; at a reset the two normally coincide, but deriving the
+        # transform instead of assuming it means this stays correct if the reset ordering
+        # ever puts the anchor latch after the seed.
+        src_p = wp.to_torch(self.robot.data.root_pos_w)[env_ids][:, None, :]
+        src_q = wp.to_torch(self.robot.data.root_quat_w)[env_ids][:, None, :]
+        rep = lambda t, d: t.expand(-1, n, -1).reshape(-1, 1, d)  # noqa: E731
+        seeded = reanchor_window(
+            rows.reshape(-1, rows.shape[-1])[:, None, :],
+            rep(src_p, 3), rep(src_q, 4),
+            rep(self._anchor_pos[env_ids][:, None, :], 3),
+            rep(self._anchor_quat[env_ids][:, None, :], 4),
+            self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks,
+        )[:, 0].reshape(rows.shape)
+        self._history.seed(env_ids, {"node": seeded})
+
     def _clip_history_node(self) -> torch.Tensor:
         """The CLIP's window node for the current step, anchored on the robot now.
 
@@ -921,6 +1043,11 @@ class FmTrackingCommand(MotionSequenceCommand):
 
         self._history.invalidate(just_reset)
         self._push_served_node()
+        # AFTER the push: it appends a row (zeros for a reset env, whose stash was just
+        # cleared), so seeding first would have that row shift the oldest seeded one out.
+        # Seeding last overwrites the whole ring for those envs and clears their mask.
+        if bool(just_reset.any()):
+            self._seed_clip_history(torch.nonzero(just_reset, as_tuple=False).squeeze(-1))
 
         # Re-plan on cadence, or wherever there is no live prediction to walk (post-reset).
         reinfer = (self.env.episode_length_buf % max(int(self.cfg.fm_update_every), 1)) == 0
