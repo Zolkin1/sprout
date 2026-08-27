@@ -71,7 +71,7 @@ from robot_rl.flow_matching.online import (
     load_fm_context,
     sample_window,
 )
-from isaaclab.utils.math import quat_apply
+from isaaclab.utils.math import quat_apply, quat_from_matrix
 
 from robot_rl.flow_matching.window import (
     DEFAULT_WINDOW_ANCHOR,
@@ -126,6 +126,9 @@ class FmTrackingCommand(MotionSequenceCommand):
         # Offset of the node being served within the live plan: 0 on a re-plan, +1 per step
         # kept as a tensor so the look-ahead helpers take one code path.
         self._zero_offset = torch.zeros(1, dtype=torch.long, device=dev)
+        #: Nodes 0 and 1 of the prediction, for the finite-difference joint velocity
+        #: the body FK Jacobian needs (see _write_fm_root_body_frames).
+        self._first_two_offsets = torch.arange(2, dtype=torch.long, device=dev)
 
         if not self.command_velocity_available:
             raise RuntimeError(
@@ -191,21 +194,6 @@ class FmTrackingCommand(MotionSequenceCommand):
                   "off the training distribution).")
         if self.ctx.cmd_dim <= 0:
             raise ValueError("FmTrackingCommand expects a command-conditioned FM checkpoint (cmd_dim>0).")
-        if self.cfg.tracking_mode == "body" and self.cfg.reference_source == "fm":
-            raise ValueError(
-                "FmTrackingCommand does not support tracking_mode='body'. The body CLF grades "
-                "13 '@root' body links, but the generator predicts only the base, the joints "
-                "and its end-effector POSITIONS -- so those channels would be NaN under "
-                "strict_fm_only. Enabling it needs an FM recorded with --state_frames "
-                "covering G1_BODY_TRACK_FRAMES, which also widens the state vector.\n"
-                "Note this is about THIS task's CLF, which here is diagnostic only (no "
-                "reward reads it). It says nothing about the teacher you are loading: a "
-                "body-mode teacher runs fine on the default joint-mode tracker, because the "
-                "actor's observation groups are identical in both modes.\n"
-                "With reference_source='clip' this is allowed: the APPLIED reference is the "
-                "clip, which does carry those links -- only the passive FM cache is short of "
-                "them, and nothing grades it."
-            )
         # NOTE: the re-plan cadence is deliberately NOT checked against the recording's
         # fm_snap_every any more -- see FmTrackingCommandCfg.fm_update_every. What still
         # guards the horizon is _check_horizon, which is lazy (first look-ahead call).
@@ -288,6 +276,18 @@ class FmTrackingCommand(MotionSequenceCommand):
         # (velocities, ee frames, joints) then becomes an unwritten y_des channel; see
         # :meth:`_build_strict_masks`.
         self._fm_blocks = tuple(self.ctx.reference_blocks)
+
+        if getattr(self.cfg, "tracking_mode", "joint") == "body" and self.cfg.reference_source == "fm":
+            # Allowed, but only because the body links are DERIVED -- see _body_fk.
+            # Everything the body CLF grades has to be written, or strict_fm_only NaNs it
+            # and v goes NaN, so this is a hard dependency rather than a nicety.
+            if "joint_pos" not in self._fm_blocks:
+                raise ValueError(
+                    "tracking_mode='body' with reference_source='fm' derives the 13 '@root' "
+                    "body links by FK from the generator's predicted joint angles, but this "
+                    "checkpoint does not predict joint_pos (blocks: "
+                    f"{sorted(self._fm_blocks)}). There is no posture to run FK on."
+                )
         if "base_pose" not in self._fm_blocks:
             raise ValueError(
                 f"the FM checkpoint predicts {list(self._fm_blocks)}, with no 'base_pose'. "
@@ -422,6 +422,12 @@ class FmTrackingCommand(MotionSequenceCommand):
         pos_written = [_frames(self._wf_pos_flat, 3), _frames(self._wf_ori_flat, 4)]
         if "joint_pos" in blocks:
             pos_written.append(self._joint_slots_pos)
+        # The '@root' body links are FK of base+joints (_write_fm_root_body_frames), so in
+        # body mode they ARE written -- by us rather than by the generator. Registering them
+        # here is what stops strict_fm_only NaN-ing the channels the body CLF then grades.
+        rf_maps = self._root_frame_maps()
+        if getattr(self.cfg, "tracking_mode", "joint") == "body" and rf_maps is not None:
+            pos_written += [rf_maps[0], rf_maps[1]]
         # The base's twist comes from base_vel; the ee twists are the zero placeholders,
         # written whenever the frames themselves are.
         vel_written: list[torch.Tensor] = []
@@ -431,6 +437,8 @@ class FmTrackingCommand(MotionSequenceCommand):
             vel_written += [self._wf_lin_flat[3:], self._wf_ang_flat[3:]]
         if "joint_vel" in blocks:
             vel_written.append(self._joint_slots_vel)
+        if getattr(self.cfg, "tracking_mode", "joint") == "body" and rf_maps is not None:
+            vel_written += [rf_maps[2], rf_maps[3]]
 
         self._unwritten_pos = _complement(self.y_des.shape[1], pos_written)
         self._unwritten_vel = _complement(self.dy_des.shape[1], vel_written)
@@ -517,6 +525,12 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._building = "fm"
         try:
             fm_base, fm_ee, fm_joints = self._fm_current_outputs()
+            # BEFORE _write_world_des, which is what lifts the '@root' bodies through the
+            # anchored base (_lift_root_frames_to_world). Writing them after would leave
+            # pelvis-relative values in channels the CLF reads as world -- finite, enormous,
+            # and visible only as a reward pinned at 0.
+            if getattr(self.cfg, "tracking_mode", "joint") == "body":
+                self._write_fm_root_body_frames()
             self._write_world_des(torch.cat([fm_base[:, None, :], fm_ee], dim=1))   # [N, nf, 13]
             if "joint_pos" in fm_joints:
                 self.y_des[:, self._joint_slots_pos] = fm_joints["joint_pos"][:, self._fm_jperm]
@@ -1231,6 +1245,82 @@ class FmTrackingCommand(MotionSequenceCommand):
             wp.to_torch(self.robot.data.root_quat_w)[:, None, :],
             self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks,
         )
+
+    @property
+    def _body_fk(self):
+        """Batched FK over the 13 tracked ``@root`` body frames, built on first use.
+
+        The body CLF grades ``<body>@root:*`` -- each tracked link's pose and twist relative
+        to the base -- and the generator does not predict them. It does not need to: those
+        poses are pure forward kinematics of the base and joint angles it DOES predict, so
+        deriving them adds no information, it only moves a computation that the clip did
+        offline into the loop.
+
+        ``FKChain`` reports base-frame poses, which is exactly what ``@root`` means, so
+        nothing has to be composed or rotated on the way in. It is built lazily because the
+        parse is CPU work and only body mode needs it.
+        """
+        if getattr(self, "_body_fk_chain", None) is None:
+            from motion_gen.features import DEFAULT_MJCF  # noqa: PLC0415
+            from motion_gen.fk import FKChain  # noqa: PLC0415
+            from motion_gen.joint_names import (  # noqa: PLC0415
+                G1_BODY_TRACK_FRAMES, strip_root_marker,
+            )
+            frames = [strip_root_marker(f) for f in (self.root_body_frames or ())]
+            if not frames:
+                frames = list(G1_BODY_TRACK_FRAMES)
+            self._body_fk_chain = FKChain(
+                DEFAULT_MJCF, list(self.ctx.joint_names), frames,
+                base_link=self.cfg.base_frame_name,
+            ).to(self.device)
+        return self._body_fk_chain
+
+    def _write_fm_root_body_frames(self) -> None:
+        """Fill the ``@root`` body channels by FK from the generator's own prediction.
+
+        Pose comes straight from :attr:`_body_fk`. The TWIST needs joint velocities, and this
+        generator predicts only ``joint_pos`` -- so they are finite-differenced across the
+        predicted window, ``qdot ~ (q[1] - q[0]) / dt``, and pushed through the same FK
+        Jacobian. That is the same standing the poses have: a quantity the generator implies
+        rather than one it states. It inherits the difference's noise, which is the honest
+        cost of not having ``joint_vel`` in the block selection.
+
+        Writes BASE-FRAME values into the ``@root`` slots. The lift to world is done for us
+        by :meth:`~.motion_sequence_cmd.MotionSequenceCommand._write_world_des`, which calls
+        ``_lift_root_frames_to_world`` through the anchored base -- so this MUST run before
+        it. Called after, the CLF reads pelvis-relative poses as world ones: finite,
+        enormous, and visible only as ``clf_reward`` pinned at 0.
+        """
+        maps = self._root_frame_maps()
+        if maps is None:
+            return
+        pos_idx, ori_idx, vlin_idx, vang_idx = maps
+        w = self._pred_world(self._first_two_offsets)
+        q = w["joint_pos"]                                  # [N, 2, nj] in FM joint order
+        # pose_and_jacobian returns a ROTATION MATRIX, not a quaternion.
+        #
+        # The component order is WXYZ, and that is measured rather than reasoned: the '@root'
+        # ori slots are gathered by the names ori_x/y/z/w, which reads as xyzw, but FK'ing a
+        # clip's own joint angles and comparing against its stored channels matches to 0.0
+        # under wxyz and to 1.13 under xyzw. Getting this wrong is not a crash -- it is a
+        # plausible wrong attitude, worth ~100 in v_root_body_ori while the positions stay
+        # exact, which is precisely how it presented.
+        pose_pos, pose_rot, jac_lin, jac_ang = self._body_fk.pose_and_jacobian(q[:, 0])
+        n, nb = pose_pos.shape[0], pose_pos.shape[1]
+        pose_quat = quat_from_matrix(pose_rot.reshape(-1, 3, 3)).reshape(n, nb, 4)
+
+        # Jacobian x joint velocity reproduces the clip's own stored '@root' twists exactly
+        # (validated offline to 0.0), so the convention is right; the finite difference is
+        # the only approximation, and it is there because this checkpoint predicts no
+        # joint_vel.
+        qdot = (q[:, 1] - q[:, 0]) / self.manager.dt        # [N, nj]
+        lin = torch.einsum("nbij,nj->nbi", jac_lin, qdot)
+        ang = torch.einsum("nbij,nj->nbi", jac_ang, qdot)
+
+        self.y_des[:, pos_idx] = pose_pos.reshape(n, -1)
+        self.y_des[:, ori_idx] = pose_quat.reshape(n, -1)
+        self.dy_des[:, vlin_idx] = lin.reshape(n, -1)
+        self.dy_des[:, vang_idx] = ang.reshape(n, -1)
 
     def _fm_current_outputs(self) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """The served node lifted to the world frame, for ``y_des`` (diagnostic CLF + viz).
