@@ -110,8 +110,15 @@ def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: f
                           flat_plan.transient_context_phase(phase_out, mb.nfpt, step), mb.nfpt, step)
 
     mb.reset(seed)
+    # SPAN THE ZONE. Without the travel floor this transient's length is set by the velocity change
+    # alone, so the distance at which the gait starts changing tracks SPEED: measured 0.14 m at
+    # 0.2 m/s against 3.06 m at 3.5, a 22x spread against a zone that is one declared number. The
+    # zone exists so the feature is IN THE CAMERA when the transition begins (approach_zone.py has
+    # the pixel table), and a latch that moves with speed makes that true at one speed only.
+    zone = mb_env.load_schema_module("approach_zone").APPROACH_ZONE_M
     n_min, n_max, _t_min = mb_env.hop_tokens(mb, v0, v1, a_max=a_max, alpha_max=alpha_max,
-                                             floor_s=floor_s, slack=slack)
+                                             floor_s=floor_s, slack=slack, min_travel_m=zone,
+                                             label=f"{plan.skill} approach")
     allowed = mb_env.allowed_tokens_mask(n_min, mb.min_tokens, mb.max_tokens, n_max=n_max)
     # Pin the terrain boundary as the target POSE.  Every family now tracks the replay's future joints,
     # so the arrival keeps stepping; ``terrain_families.pin_future`` survives as the narrower question of
@@ -157,8 +164,13 @@ def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: f
     qpos = frames[lead:end]
     cmd = np.tile(v1, (qpos.shape[0], 1))
     travel = float(np.linalg.norm(qpos[-1, :2] - qpos[0, :2]))
+    # n_min / n_max / t_min are recorded because the LATCH DISTANCE (``travel``) is the number this
+    # stage is judged on, and without them a latch that is too long is indistinguishable between "the
+    # deceleration physically needs that far" and "the token band never bound the model".
     return qpos, cmd, {"seed_stride": int(s_idx), "seed_phase": int(phase_out),
-                       "sched_vx": float(v_app),
+                       "sched_vx": float(v_app), "entry_vx": float(plan.entry_vx),
+                       "n_min": int(n_min), "n_max": int(n_max), "t_min": float(_t_min),
+                       "zone_m": float(zone),
                        "tokens": int(n) // mb.nfpt, "travel": travel, "bounded": True}
 
 
@@ -317,11 +329,18 @@ _GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "dist", "pin"
 #   4: (superseded)
 #   6: the travel budget is a DISTANCE, so the knob the segment is keyed on changed name and unit
 #      ("secs" -> "dist"); a stale dict must not compare equal to the new one.
+#   9: a travel-floored hop gets a token band of exactly one (no --hop-slack), so the
+#      latch is the distance asked for rather than whatever horizon the model preferred.
+#   8: the approach segment records its token band (n_min/n_max/t_min), so a stale file
+#      without them cannot be read by the latch diagnostic.
+#   7: the approach transient carries a TRAVEL floor (approach_zone.APPROACH_ZONE_M), so it is
+#      longer at low speed than the same request used to produce -- the whole point being that the
+#      latch distance stops tracking speed.
 #   5: the bounded path is the ONLY path. The unbounded generators and the --ramp-s / --pin-cmd /
 #      --pin-lead / --pin-tail / --pin-place / --pin-dist knobs are gone -- they were dead on every
 #      driver run, so no segment on disk was ever produced by them, but the knob set they were
 #      compared against changed and a stale dict must not compare equal to the new one.
-_GEN_VERSION = 6
+_GEN_VERSION = 9
 
 
 def _gen_params(args, side: str, pin: str, dist: float, start: str) -> dict:

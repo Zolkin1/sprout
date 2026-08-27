@@ -201,7 +201,15 @@ def hop_tokens(mb, v0, v1, *, a_max: float, alpha_max: float, floor_s: float,
         t_min = max(t_min, float(min_travel_m) / max(v_mean, 1e-3))
     trim = 2 * mb.nfpt
     n_want = int(np.ceil((t_min * mb.fps + trim) / mb.nfpt))
-    n_max = int(np.ceil((t_min * max(slack, 1.0) * mb.fps + trim) / mb.nfpt))
+    # ``slack`` is the model's freedom to pick a LONGER horizon than the floor demands, and it is right
+    # for a flat transient (the extra frames are coasting, which costs clip length and nothing else).
+    # It is wrong the moment a TRAVEL target is what is being asked for, because the whole quantity
+    # being controlled is the distance -- measured: with slack on, every approach ran to the 16-token
+    # ceiling and the latch came out at 1.87 s x speed, i.e. proportional to speed, which is the defect
+    # the floor exists to remove. So a travel-floored hop gets a band of exactly one.
+    n_hi = n_want if float(min_travel_m) > 0.0 else int(
+        np.ceil((t_min * max(slack, 1.0) * mb.fps + trim) / mb.nfpt))
+    n_max = n_hi
     n_min = int(np.clip(n_want, mb.min_tokens, mb.max_tokens))
     if float(min_travel_m) > 0.0 and n_min < n_want:
         kept_s = (n_min * mb.nfpt - trim) / mb.fps

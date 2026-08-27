@@ -158,3 +158,44 @@ def test_min_travel_is_capped_rather_than_raising():
     assert n_min == _MB.max_tokens and n_max == _MB.max_tokens
     assert t_min > (n_min * _MB.nfpt - 2 * _MB.nfpt) / _MB.fps, (
         "this case is supposed to be the capped one, or the test is not testing the cap")
+
+
+def test_a_travel_floored_hop_gets_a_band_of_ONE():
+    """``slack`` and a travel target are incompatible, and the measurement says so.
+
+    ``slack`` lets the model pick a LONGER horizon than the floor demands, which is right for a flat
+    transient -- the extra frames are coasting, costing clip length and nothing else. With a travel
+    target the distance IS the controlled quantity, so that freedom is the defect: measured on the
+    quick build, leaving slack on ran every approach to the 16-token ceiling and the latch came out at
+    1.87 s x speed, i.e. proportional to speed. Pinning the band collapsed the latch of the 15
+    approaches the ceiling does not bind from a 40.8x spread to 1.5x (1.635 - 2.519 m against a
+    declared 2.0 m zone).
+    """
+    import mb_env
+
+    n_min, n_max, _ = mb_env.hop_tokens(_MB(), (2.6, 0, 0), (0.36, 0, 0), a_max=2.0, alpha_max=2.0,
+                                        floor_s=0.35, slack=1.3, min_travel_m=2.0)
+    assert n_min == n_max, "a travel-floored hop must not be free to overshoot the target distance"
+
+    # ...and slack still applies where there is no travel target, or every flat transient changes.
+    f_min, f_max, _ = mb_env.hop_tokens(_MB(), (2.6, 0, 0), (0.36, 0, 0), a_max=2.0, alpha_max=2.0,
+                                        floor_s=0.35, slack=1.3)
+    assert f_max > f_min
+
+
+def test_the_slow_end_is_bounded_by_the_TOKEN_CEILING_and_that_is_named():
+    """The residual latch spread is Motion Bricks' 16-token horizon, not a missing bound.
+
+    At 0.2 m/s a 2 m zone wants 7.9 s against the 1.87 s the model can produce, so the transient
+    covers 0.45 m and the preceding EXACT LOOP covers the remaining 1.55 m -- at precisely the
+    commanded speed, which is better motion than an in-betweening at the same velocity would be.
+    Pinned so that a future ``max_tokens`` change is recognised as the thing that moves this.
+    """
+    import mb_env
+
+    n_min, n_max, t_min = mb_env.hop_tokens(_MB(), (0.2, 0, 0), (0.3, 0, 0), a_max=2.0, alpha_max=2.0,
+                                            floor_s=0.35, min_travel_m=2.0)
+    assert n_min == n_max == _MB.max_tokens
+    kept_s = (n_min * _MB.nfpt - 2 * _MB.nfpt) / _MB.fps
+    assert t_min > kept_s, "this is supposed to be the ceiling-bound case"
+    assert kept_s * 0.5 * (0.2 + 0.3) < 2.0, "the ceiling really does leave the zone unspanned here"
