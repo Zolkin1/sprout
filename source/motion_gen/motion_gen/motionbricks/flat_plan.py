@@ -39,6 +39,11 @@ class Loop:
     phase0: int
     phase_out: int                 # the phase its LAST frame must land on (the next transient's context)
     hold_s: float                  # requested duration; pass C rounds to land on phase_out
+    # The TERRAIN side budgets in metres, not seconds (a tile is sized in metres and an exact loop
+    # travels command x duration by construction, so a distance is the quantity that is actually
+    # honoured). ``hold_s`` is then derived from it at the stride's own achieved speed and kept only
+    # so both paths read the same. 0.0 means "this loop was budgeted in time", i.e. a flat clip.
+    hold_m: float = 0.0
     # The CONTINUOUS commanded velocity this loop serves, which is NOT the stride's own achieved
     # velocity: the stride is the nearest one the bank has, so the two differ by the snap error.  The
     # clip records THIS as target_vel.  Recording the achieved velocity instead makes tracking error
@@ -120,11 +125,32 @@ def transient_context_phase(phase_out: int, n: int, step: float) -> float:
     return float(phase_out) - (int(n) - 1) * float(step)
 
 
+def plan_to_dict(plan: FlatClipPlan) -> dict:
+    """One plan as a plain JSON-able dict.
+
+    Split out of :func:`to_json` because a terrain clip carries TWO of these (its approach and its
+    exit) inside its own plan's ``meta``, rather than in a file of its own.
+    """
+    return {**asdict(plan), "pieces": [asdict(x) for x in plan.pieces]}
+
+
+def plan_from_dict(d: dict) -> FlatClipPlan:
+    """Inverse of :func:`plan_to_dict`."""
+    pieces = []
+    for x in d["pieces"]:
+        x = dict(x)
+        k = x.pop("kind")
+        if "cmd_vel" in x:
+            x["cmd_vel"] = tuple(float(c) for c in x["cmd_vel"])
+        pieces.append(Loop(**x, kind=k) if k == "loop" else Transient(**x, kind=k))
+    return FlatClipPlan(name=d["name"], n_frames=int(d["n_frames"]), dt=float(d["dt"]),
+                        seed=int(d["seed"]), pieces=pieces)
+
+
 def to_json(plans: list, path: str) -> None:
     """Write a list of :class:`FlatClipPlan` (piece types tagged by their ``kind`` field)."""
-    out = [{**asdict(p), "pieces": [asdict(x) for x in p.pieces]} for p in plans]
     with open(path, "w") as f:
-        json.dump({"version": 1, "plans": out}, f, indent=1)
+        json.dump({"version": 1, "plans": [plan_to_dict(p) for p in plans]}, f, indent=1)
 
 
 def from_json(path: str) -> list:
@@ -133,17 +159,7 @@ def from_json(path: str) -> list:
         d = json.load(f)
     if int(d.get("version", 0)) != 1:
         raise ValueError(f"{path}: unsupported flat-plan version {d.get('version')}")
-    plans = []
-    for p in d["plans"]:
-        pieces = []
-        for x in p["pieces"]:
-            k = x.pop("kind")
-            if "cmd_vel" in x:
-                x["cmd_vel"] = tuple(float(c) for c in x["cmd_vel"])
-            pieces.append(Loop(**x, kind=k) if k == "loop" else Transient(**x, kind=k))
-        plans.append(FlatClipPlan(name=p["name"], n_frames=int(p["n_frames"]), dt=float(p["dt"]),
-                                  seed=int(p["seed"]), pieces=pieces))
-    return plans
+    return [plan_from_dict(p) for p in d["plans"]]
 
 
 def sample_plan(name: str, rng, *, bank_periods, bank_vel, schedule, n_frames: int, dt: float,
@@ -239,6 +255,108 @@ def plan_from_holds(name: str, holds, rng, *, bank_periods, bank_vel, n_frames: 
         pieces.append(Loop(stride=s_in, phase0=p_in, phase_out=p_out, hold_s=n_loop * dt, cmd_vel=cmd))
         prev_stride, prev_phase = s_in, p_out
     return FlatClipPlan(name=name, n_frames=int(n_frames), dt=float(dt), seed=int(seed), pieces=pieces)
+
+
+
+# Motion Bricks' own horizon limits, at the shipped configuration: it emits 6..16 tokens of 4 frames
+# at 30 fps and the seed overlap plus the pinned target window (``2 * nfpt``) are discarded, so a KEPT
+# transient lasts between these. Stated here because pass A has to predict a transient's travel before
+# pass B generates it, and pass A cannot import the model.
+_KEPT_S_MIN = (6 * 4 - 2 * 4) / 30.0        # 0.533 s
+_KEPT_S_MAX = (16 * 4 - 2 * 4) / 30.0       # 1.867 s
+
+
+def transient_travel_bound(v0, v1, *, a_max: float, floor_s: float, slack: float) -> float:
+    """Upper bound on the metres one in-betweening between ``v0`` and ``v1`` will cover.
+
+    Mirrors ``mb_env.hop_tokens``' arithmetic, which is the thing that actually decides: the duration
+    is bounded below by the velocity change (``|dv| / a_max``, never under ``floor_s``) and above by
+    ``slack`` times that, then clipped to the model's own 6..16 token horizon. Travel is that duration
+    at the mean of the two speeds, since the transient IS the acceleration and neither endpoint
+    describes it.
+
+    Pass A needs this to size a command hold: an interior hold has to fund its incoming transient
+    BEFORE it can fund an exact loop, and a flat reserve is wrong by an order of magnitude across the
+    band -- a 0.2 m/s change covers 0.37 m where a 3.5 m/s one covers 6.5.
+
+    A BOUND rather than an estimate: over-reserving costs a shorter loop, under-reserving costs the
+    loop entirely (``_loop_piece`` refuses to round a sub-cycle loop up to a whole one), and those two
+    failures are not equally bad.
+    """
+    import numpy as _np
+
+    a = _np.asarray(v0, _np.float64).reshape(-1)
+    b = _np.asarray(v1, _np.float64).reshape(-1)
+    dv = float(_np.linalg.norm(b[:2] - a[:2]))
+    t = max(float(floor_s), dv / max(float(a_max), 1e-6)) * max(float(slack), 1.0)
+    t = min(max(t, _KEPT_S_MIN), _KEPT_S_MAX)
+    v_mean = 0.5 * (float(_np.linalg.norm(a[:2])) + float(_np.linalg.norm(b[:2])))
+    return float(t * v_mean)
+
+
+def plan_from_distance_holds(name: str, holds, rng, *, bank_periods, bank_vel, dt: float, seed: int,
+                             blend_n: int = 12, phase_in0: int | None = None,
+                             phase_out_last: int | None = None) -> FlatClipPlan:
+    """A plan whose steady phases are prescribed in METRES -- the terrain side's :func:`sample_plan`.
+
+    A terrain clip's lead-up is ordinary flat machinery: an exact loop per commanded speed, a Motion
+    Bricks in-betweening between consecutive speeds. The only thing that differs from a flat clip is
+    the budget's UNIT. A flat clip must hit an exact frame count, so its holds are seconds; a terrain
+    clip must hand off to the terrain after a given TRAVEL, so its holds are metres -- and a loop
+    travels ``command x duration`` by construction, which is what makes a distance budget exact in a
+    way a duration budget never was (the old duration-driven run-up overshot its command by ~78%).
+
+    ``hold_s`` is filled in from the SELECTED stride's achieved speed, so pass C can read either. The
+    distance is the statement; the duration is the consequence.
+
+    Both ends can be pinned, because on the terrain side they are hand-offs to something already
+    decided rather than free choices:
+
+    * ``phase_in0`` -- the gait phase the FIRST loop is entered at. The exit side passes the phase the
+      terrain exit transient lands on, so the walk-away continues that gait rather than jumping.
+    * ``phase_out_last`` -- the phase the LAST loop hands off at. The approach side passes the phase
+      its terrain entry transient is context-seeded from, which is the one thing that has to agree
+      between pass A's plan and pass B's generation.
+
+    Args:
+        holds: ordered ``[(distance_m, (vx, vy, wz))]``, at least one.
+        bank_periods: ``[N]`` period (frames) per stride.
+        bank_vel: ``[N,3]`` achieved velocity per stride.
+        rng: numpy Generator, used only for the hand-off phases that are not pinned.
+
+    Returns a plan whose pieces alternate Loop / Transient and both begin and end on a Loop.
+    """
+    import numpy as _np
+
+    if not holds:
+        raise ValueError(f"{name}: a distance-hold plan needs at least one hold")
+    min_hold = max(int(2 * blend_n + 1), 1)
+    bank_vel = _np.asarray(bank_vel, _np.float64)
+    pieces: list = []
+    prev_stride, prev_phase = -1, 0
+    for j, (dist_m, v) in enumerate(holds):
+        cmd = (float(v[0]), float(v[1]), float(v[2]))
+        s_in = nearest_stride(bank_vel, cmd)
+        period = int(bank_periods[s_in])
+        first, last = (j == 0), (j == len(holds) - 1)
+        p_in = int(phase_in0 % period) if (first and phase_in0 is not None)             else int(rng.integers(0, max(1, period)))
+        p_out = int(phase_out_last % period) if (last and phase_out_last is not None)             else int(rng.integers(0, max(1, period)))
+        # Duration DERIVED from the distance at the stride's own achieved speed. A standing stride
+        # travels nothing, so a distance cannot be converted -- fall back to one period, which is the
+        # shortest thing that is still a steady stretch.
+        speed = float(_np.linalg.norm(bank_vel[s_in][:2]))
+        want = int(round(float(dist_m) / (speed * float(dt)))) if speed > 1e-3 else period
+        n_loop = loop_frames_for(p_in, p_out, period, want, min_frames=max(min_hold, period))
+        if not first:                                 # every loop but the first is entered via one
+            pieces.append(Transient(stride_out=prev_stride, phase_out=prev_phase, stride_in=s_in,
+                                    phase_in=p_in, key=f"{name}_t{len(pieces)}", cmd_vel=cmd))
+        pieces.append(Loop(stride=s_in, phase0=p_in, phase_out=p_out, hold_s=n_loop * float(dt),
+                           hold_m=float(dist_m), cmd_vel=cmd))
+        prev_stride, prev_phase = s_in, p_out
+    # n_frames is not a constraint on this path: the clip's length is whatever the tile's travel
+    # budget plus the replay comes to. Recorded as the plan's own nominal so nothing reads it as 0.
+    n_nom = int(sum(int(round(p.hold_s / float(dt))) for p in pieces if isinstance(p, Loop)))
+    return FlatClipPlan(name=name, n_frames=n_nom, dt=float(dt), seed=int(seed), pieces=pieces)
 
 
 # Motion Bricks predicts at most 16 tokens of 4 frames at 30 fps = 2.13 s, which is 107 frames at the

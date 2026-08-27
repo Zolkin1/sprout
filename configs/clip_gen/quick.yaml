@@ -71,6 +71,13 @@ approach_min_transient_s: 0.35
 approach_hop_slack: 1.3
 
 # ---------------------------------------------------------------- RL-visible command
+terrain_cmd_changes_per_side: 2   # command changes during the lead-up / trail-away. 0 = the
+                                  # pre-step-8 single hold. A CEILING: the travel budget decides how
+                                  # many steady stretches actually fit. Each change is one extra MB
+                                  # generation per clip, so 2 is ~3x the stage-b cost of 0.
+min_hold_m: 1.5                   # shortest steady stretch (m) a hold may be. Below a gait cycle a
+                                  # "hold" is not steady, and loop_frames_for rounds it UP -- which
+                                  # overruns the travel budget and pushes terrain past the platform.
 segment_reuse: false            # share a generated MB segment between clips with identical
                                 # conditioning. OFF: with per-clip schedules two clips are only
                                 # interchangeable if their whole schedules match, and ~1.5x the
@@ -101,7 +108,15 @@ footprint_margin: 1.0            # m added on all four sides of a tile's footpri
 # transition tile. The clip keeps a duration; the tile only ever sees metres.
 approach_flat_s_range: [1.5, 4.0]   # s of flat lead-in before the approach zone
 exit_flat_s_range: [1.5, 4.0]       # s of flat trail-away after the terrain
-flat_dist_clamp: [1.0, 4.0]         # m; bounds the converted distance at both ends of the band
+flat_dist_clamp: [1.0, 6.0]         # m; bounds the converted distance at both ends of the band.
+                                    # Widened 4.0 -> 6.0 for the command variation: after the 2 m
+                                    # approach zone a 4 m flat lead-in can rarely fund a SECOND
+                                    # steady stretch (one gait cycle plus the in-betweening that
+                                    # reaches it), so only 8 of 32 quick-build plans got a command
+                                    # change. At 6.0 that is 17 of 32. Measured cost: terrain tile
+                                    # size_x p50 7.98 -> 9.07 m (+14%), max 18.13 -> 22.30. Step 6
+                                    # had already taken 30-40% off the fast stair tiles by dropping
+                                    # the speed term, so this spends part of that back deliberately.
 dist_step: 0.25                     # m quantization, so segments can still be shared
 platform_buffer_m: 1.0              # m of walkable surface past the nominal travel, so the
                                     # reference cannot walk off the far edge

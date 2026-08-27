@@ -127,6 +127,10 @@ def _tile_worker(i: int):
                 arrival_search=args.arrival_search, approach_pin=pin, exit_pin=pin,
                 approach_keyframes=None, exit_keyframes=None,
                 approach_raw=_raw(j.get("approach_key")), exit_raw=_raw(j.get("exit_key")),
+                # Where the INTERIOR lead-up / trail-away transients live. Stated rather than derived
+                # from ``approach_raw``'s directory, because a one-sided box clip has no approach
+                # segment at all and would then have nowhere to look.
+                segment_dir=os.path.join(work, "segments"),
             )
             if job_args.approach_raw is None and job_args.exit_raw is None:
                 raise ValueError("clip has neither an approach nor an exit segment")

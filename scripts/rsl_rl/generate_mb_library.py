@@ -169,6 +169,16 @@ def main() -> int:
     if stage in ("all", "a") and not os.path.exists(os.path.join(_REPO, work, "jobs.json")):
         _run("plan", "mb_plan_library.py", [
             "--work-dir", work, "--source", args.source, "--library", args.library,
+            # Pass A needs the BANK now: a terrain clip's lead-up is a loop-per-command alternation,
+            # and choosing each loop's stride and gait phase is a pass-A decision.
+            "--stride-bank", bank,
+            "--terrain-cmd-changes-per-side", str(cfg.terrain_cmd_changes_per_side),
+            "--min-hold-m", str(cfg.min_hold_m),
+            # The SAME three the segment stage gets: pass A predicts a transient's travel with them,
+            # pass B generates with them, and one recipe key feeds both.
+            "--approach-a-max", str(cfg.approach_a_max),
+            "--approach-min-transient-s", str(cfg.approach_min_transient_s),
+            "--approach-hop-slack", str(cfg.approach_hop_slack),
             "--stair-tiles", str(cfg.stair_tiles), "--box-tiles", ",".join(str(x) for x in cfg.box_tiles),
             "--clips-per-tile", str(cpt), "--seed", str(cfg.seed), "--device", args.device,
             *([] if cfg.segment_reuse else ["--no-segment-reuse"]),
@@ -211,6 +221,9 @@ def main() -> int:
             "--a-max", str(cfg.approach_a_max),
             "--min-transient-s", str(cfg.approach_min_transient_s),
             "--hop-slack", str(cfg.approach_hop_slack),
+            # The INTERIOR lead-up transients are ordinary loop-to-loop hops and take the FLAT
+            # family's chaining bound, not the terrain boundary's -- same generator, same knob.
+            "--ramp-dv", str(cfg.flat_ramp_dv),
             "--pin-future", cfg.pin_future],
             conda_env=args.conda_env)
         flat_plans = os.path.join(work, "flat_plans.json")

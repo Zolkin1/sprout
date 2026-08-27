@@ -126,6 +126,8 @@ _SCHEMA: dict[str, tuple] = {
     "approach_a_max": ("float", 2),
     "approach_min_transient_s": ("float", 2),
     "approach_hop_slack": ("float", 2),
+    "terrain_cmd_changes_per_side": ("int", 1),
+    "min_hold_m": ("float", 2),
     # RL-visible command
     "segment_reuse": ("bool", 1),
     "rl_vels": ("choice", ("raw", "snapped")),

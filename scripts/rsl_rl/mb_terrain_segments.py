@@ -47,6 +47,7 @@ import torch as t
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mb_env  # noqa: E402
+import mb_transient  # noqa: E402
 
 
 def _hold_cmd(plan, side: str, which: int = 0) -> float | None:
@@ -67,6 +68,30 @@ def _hold_cmd(plan, side: str, which: int = 0) -> float | None:
         return None
     seq = holds.get(side) or []
     return float(seq[which][1]) if which < len(seq) else None
+
+
+def _side_plan(plan, side: str):
+    """The ``flat_plan.FlatClipPlan`` for one side, or ``None`` on a single-hold plan.
+
+    Pass A authors it: a loop per commanded speed, an in-betweening between consecutive speeds. Pass B
+    generates those in-betweenings and reads the terminal loop's stride and gait phase, which is the
+    one thing the two passes MUST agree on -- pass B used to choose both itself, and with several
+    loops on a side the last one has to hand off at exactly the stride and phase the terrain transient
+    is seeded from.
+    """
+    d = (getattr(plan, "meta", None) or {}).get(f"{side}_plan")
+    return None if not d else mb_env.load_schema_module("flat_plan").plan_from_dict(d)
+
+
+def _terminal_loop(plan, side: str):
+    """The loop that ADJOINS the terrain: the approach's last, the exit's first. ``None`` if absent."""
+    sp = _side_plan(plan, side)
+    if sp is None:
+        return None
+    loops = [pc for pc in sp.pieces if pc.kind == "loop"]
+    if not loops:
+        return None
+    return loops[-1] if side == "approach" else loops[0]
 
 
 def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: float, alpha_max: float,
@@ -99,13 +124,25 @@ def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: f
     # now, so this is the whole approach's command rather than just its opening -- a single exact
     # loop can only express one speed. Several holds per side is the next step, and it needs the
     # approach built as a piece LIST here rather than one loop + one transient.
-    v_app = _hold_cmd(plan, "approach")
+    # The LAST approach hold -- the one this transient departs from. With several holds the earlier
+    # ones are ordinary flat stretches that have already happened.
+    v_app = _hold_cmd(plan, "approach", -1)
     v_app = float(plan.approach_vx) if v_app is None else v_app
     v0 = np.array([float(v_app), 0.0, 0.0], np.float32)
     v1 = np.array([float(plan.entry_vx), 0.0, 0.0], np.float32)
-    s_idx = targeter.nearest(v0)
-    period = int(targeter.periods[s_idx])
-    phase_out = int(seed % period)                 # which gait phase the loop hands off at; pass C matches
+    # The stride and hand-off phase come from the PLAN where pass A authored one. Choosing them here
+    # (``targeter.nearest(v0)`` and ``seed % period``) worked only while the approach was a single
+    # loop that pass C rebuilt from this segment's own provenance; with a loop/transient alternation
+    # the last loop is authored in pass A and this must match it, and two independent 'nearest'
+    # implementations agreeing is not something to rely on when they need not both exist.
+    _loop = _terminal_loop(plan, "approach")
+    if _loop is not None:
+        s_idx, period = int(_loop.stride), int(targeter.periods[int(_loop.stride)])
+        phase_out = int(_loop.phase_out) % period
+    else:
+        s_idx = targeter.nearest(v0)
+        period = int(targeter.periods[s_idx])
+        phase_out = int(seed % period)             # which gait phase the loop hands off at; pass C matches
     ctx = sb.phase_window(targeter.strides[s_idx],
                           flat_plan.transient_context_phase(phase_out, mb.nfpt, step), mb.nfpt, step)
 
@@ -209,9 +246,14 @@ def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float
     v_ex = float(plan.exit_vx) if v_ex is None else v_ex
     v0 = np.array([float(plan.exit_speed), 0.0, 0.0], np.float32)     # the replay's speed at hand-off
     v1 = np.array([float(v_ex), 0.0, 0.0], np.float32)
-    s_idx = targeter.nearest(v1)
-    period = int(targeter.periods[s_idx])
-    phase_in = int(seed % period)              # gait phase the loop is ENTERED at; pass C matches it
+    _loop = _terminal_loop(plan, "exit")
+    if _loop is not None:                      # authored in pass A; see _generate_approach_bounded
+        s_idx, period = int(_loop.stride), int(targeter.periods[int(_loop.stride)])
+        phase_in = int(_loop.phase0) % period
+    else:
+        s_idx = targeter.nearest(v1)
+        period = int(targeter.periods[s_idx])
+        phase_in = int(seed % period)          # gait phase the loop is ENTERED at; pass C matches it
     target = sb.phase_window(targeter.strides[s_idx], phase_in, mb.nfpt, step)
 
     mb.reset(seed)
@@ -235,6 +277,46 @@ def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float
     travel = float(np.linalg.norm(qpos[-1, :2] - qpos[0, :2]))
     return qpos, cmd, {"loop_stride": int(s_idx), "loop_phase": int(phase_in), "sched_vx": float(v_ex),
                        "tokens": int(n) // mb.nfpt, "travel": travel, "bounded": True}
+
+
+def _emit_interior(mb, targeter, plan, side: str, piece_key: str, out: str, args, raw_schema) -> str:
+    """Generate ONE interior lead-up / trail-away transient and write it as a ``RawMotion``.
+
+    This is an ORDINARY loop-to-loop in-betweening -- the same job the flat family's transients are --
+    so it goes through the SAME generator (``mb_transient.generate``). That matters beyond tidiness:
+    the shared one chains multiple hops through velocity waypoints for a large change, which is the
+    difference between 1.70 and 5.08 m/s^2 of peak acceleration, and the terrain driver's own
+    single-hop generators do not.
+    """
+    sb = mb_env.load_schema_module("stride_bank")
+    flat_plan = mb_env.load_schema_module("flat_plan")
+    sp = _side_plan(plan, side)
+    if sp is None:
+        raise RuntimeError(f"{piece_key}: plan carries no {side}_plan")
+    tr = next((pc for pc in sp.pieces if pc.kind == "transient" and pc.key == piece_key), None)
+    if tr is None:
+        raise RuntimeError(f"{piece_key}: not a transient of the {side} plan")
+    qpos, diag = mb_transient.generate(
+        mb, sb, flat_plan, targeter.strides, targeter.steady_vel, targeter.bank_dt, tr,
+        seed=(args.seed * 2654435761 + (hash(piece_key) & 0xFFFF)) % (2 ** 31),
+        a_max=args.a_max, alpha_max=args.alpha_max, floor_s=args.min_transient_s,
+        ramp_dv=args.ramp_dv, slack=args.hop_slack)
+    tvel = np.tile(np.asarray(diag["cmd"], np.float32), (qpos.shape[0], 1))
+    motion = raw_schema.RawMotion(
+        mujoco_qpos=qpos.astype(np.float32), fps=mb.fps, joint_names=list(mb_env.G1_JOINT_NAMES),
+        target_vel=tvel, kind="terrain_interior",
+        provenance={"backend": "motionbricks", "mode": f"{side}_interior", "skill": plan.skill,
+                    "key": piece_key, "stride_out": int(tr.stride_out), "phase_out": int(tr.phase_out),
+                    "stride_in": int(tr.stride_in), "phase_in": int(tr.phase_in),
+                    "gen_version": _GEN_VERSION,
+                    "stride_bank": os.path.basename(args.stride_bank),
+                    "a_max": float(args.a_max), "alpha_max": float(args.alpha_max),
+                    "min_transient_s": float(args.min_transient_s),
+                    "hop_slack": float(args.hop_slack), "ramp_dv": float(args.ramp_dv),
+                    **diag})
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    raw_schema.save_raw_motion(out, motion)
+    return out
 
 
 def _emit_segment(mb, targeter, plan, family, side: str, pin: str, dist: float, out: str,
@@ -379,6 +461,37 @@ def _is_stale(path: str, want: dict, raw_schema) -> str | None:
     return None
 
 
+_INTERIOR_KNOBS = ("gen_version", "stride_bank", "a_max", "alpha_max", "min_transient_s",
+                   "hop_slack", "ramp_dv")
+
+
+def _is_stale_interior(path: str, args, raw_schema) -> str | None:
+    """``None`` if the interior transient on disk was generated with today's knobs.
+
+    A narrower key than ``_GEN_KNOBS``: an interior transient has no ``side``/``pin``/``dist``/``start``
+    -- those describe a TERRAIN boundary, and this is a plain loop-to-loop hop. What it does share is
+    ``gen_version``, so a change to what the generator produces invalidates both kinds together.
+    """
+    want = {"gen_version": _GEN_VERSION, "stride_bank": os.path.basename(args.stride_bank),
+            "a_max": float(args.a_max), "alpha_max": float(args.alpha_max),
+            "min_transient_s": float(args.min_transient_s), "hop_slack": float(args.hop_slack),
+            "ramp_dv": float(args.ramp_dv)}
+    try:
+        prov = dict(raw_schema.load_raw_motion(path).provenance or {})
+    except Exception:
+        return "unreadable"
+    for k in _INTERIOR_KNOBS:
+        if k not in prov:
+            return f"{k} (not recorded)"
+        a, b = prov[k], want[k]
+        if isinstance(b, float) and isinstance(a, (int, float)):
+            if abs(float(a) - b) > 1e-9:
+                return f"{k}: {a} != {b}"
+        elif a != b:
+            return f"{k}: {a!r} != {b!r}"
+    return None
+
+
 def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
     """BATCH mode: generate every unique segment in ``requests.json``, in this one process.
 
@@ -402,6 +515,16 @@ def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
             family = families.family_for(plan.skill)
             # The TRAVEL BUDGET, which is what defines the segment now. It used to be a duration,
             # and the duration is emergent from the budget and the speed.
+            if r["side"].endswith("_interior"):
+                # Keyed per clip and never shared, so an existing file is either this run's or a
+                # previous attempt at the same plan; the knob comparison below still applies.
+                if os.path.exists(out) and _is_stale_interior(out, args, raw_schema) is None:
+                    skipped += 1
+                    continue
+                _emit_interior(mb, targeter, plan, r["side"].rsplit("_", 1)[0], r["piece_key"],
+                               out, args, raw_schema)
+                done += 1
+                continue
             dist = float(plan.approach_dist if r["side"] == "approach" else plan.exit_dist)
             if os.path.exists(out):
                 why = _is_stale(out, _gen_params(args, r["side"], r["pin"], dist,
@@ -463,6 +586,15 @@ def main() -> int:
     p.add_argument("--alpha-max", type=float, default=2.0, help="Max yaw acceleration (rad/s^2).")
     p.add_argument("--min-transient-s", type=float, default=0.35,
                    help="Absolute floor on a bounded transient's kept duration (s).")
+    p.add_argument("--ramp-dv", type=float, default=1.0,
+                   help="Max planar speed change (m/s) any ONE generation may be asked for, for the "
+                        "INTERIOR lead-up / trail-away transients. A bigger change is split into "
+                        "chained hops through intermediate velocity waypoints, because peak "
+                        "acceleration tracks the size of the change, not the time allowed for it. "
+                        "Does not apply to the two terrain-boundary transients: those are pinned to a "
+                        "terrain POSE rather than to a stride, so a chain has nowhere to put its "
+                        "intermediate targets. Same flag, same default, same meaning as "
+                        "mb_flat_transients.")
     p.add_argument("--hop-slack", type=float, default=1.3,
                    help="How much longer than the acceleration bound requires a transient may take.")
     p.add_argument("--tag", default="", help="Suffix for the output filenames (e.g. the pin combination).")

@@ -48,6 +48,8 @@ from mb_terrain_clips import (                                            # noqa
 )
 
 from motion_gen.motionbricks.approach_zone import APPROACH_ZONE_M  # noqa: E402
+from motion_gen.motionbricks import flat_plan as fp  # noqa: E402
+from motion_gen.motionbricks.stride_bank import load_stride_bank  # noqa: E402
 from motion_gen.terrain.terrain_sampler import sample_box_tiles, sample_stair_tiles  # noqa: E402
 from motion_gen.motionbricks import (elevated_side, family_for, ground_side,   # noqa: E402
                                     save_terrain_plan)
@@ -99,7 +101,7 @@ def _round_key(*vals) -> str:
 
 
 def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = "stand",
-                  holds=None, unique_salt: str | None = None) -> tuple[str, str]:
+                  holds=None, side_plans=None, unique_salt: str | None = None) -> tuple[str, str]:
     """``(approach_key, exit_key)`` -- identical keys iff Motion Bricks would see identical input.
 
     Keyed on exactly what ``mb_terrain_segments`` feeds the model, no more:
@@ -135,6 +137,15 @@ def _segment_keys(plan, approach_pin: str, exit_pin: str, approach_start: str = 
         flat.append(float(holds["interaction"]))
         a_parts.append(flat)
         x_parts.append(flat)
+    if side_plans:
+        # The STRIDES and PHASES too. Pass A now chooses them and pass B is told them, so two clips
+        # whose plans differ are seeded from different gait phases and are different motions -- even
+        # if their holds happen to match.
+        for side, parts in (("approach", a_parts), ("exit", x_parts)):
+            pl = side_plans.get(f"{side}_plan")
+            if pl:
+                parts.append([(pc.get("stride", -1), pc.get("phase0", pc.get("phase_in", -1)),
+                               pc.get("phase_out", -1)) for pc in pl["pieces"]])
     # ``unique_salt`` forces a segment per clip even if two schedules DID collide -- an explicit
     # guarantee rather than one inferred from the sampler's variety.
     if unique_salt is not None:
@@ -277,36 +288,178 @@ def _cmd_mag(vx: float, sign: float, args) -> float:
     return min(abs(float(vx)), float(args.backward_vx_max)) if float(sign) < 0.0 else abs(float(vx))
 
 
+def _split_dist(rng, total: float, mins: list) -> list:
+    """Split ``total`` metres into ``len(mins)`` stretches, each at least its own minimum.
+
+    Dirichlet-ish rather than equal, so a tile's clips do not all change command at the same place --
+    a fixed split would put every command change at the same distance from the terrain, which is a
+    landmark the model could key on instead of the depth image.
+    """
+    n = len(mins)
+    if n == 1:
+        return [float(total)]
+    free = float(total) - float(sum(mins))
+    if free <= 0.0:                                    # caller should have reduced n; be safe anyway
+        return [float(total) / n] * n
+    w = rng.dirichlet([2.0] * n)                       # alpha=2 avoids the near-zero shares alpha=1 gives
+    return [float(m) + float(free) * float(wi) for m, wi in zip(mins, w)]
+
+
+def _cycle_travel(bank, cmd: float, dt: float) -> float:
+    """Metres one full gait cycle of the stride nearest ``cmd`` covers.
+
+    This is the real floor on a loop, and it is not a constant: ``loop_frames_for`` will not emit
+    fewer than one period, so a budget below this buys a WHOLE cycle it cannot pay for -- or, once
+    ``_loop_piece`` refuses to do that, buys no loop at all. It ranges 0.1 m at 0.2 m/s to ~3 m at
+    3.5, so the flat ``min_hold_m`` that preceded it was simultaneously too strict at the slow end and
+    too lax at the fast one (measured: one transition clip still lost every loop at ``min_hold_m``
+    1.5 m, because a cycle at 3 m/s is 1.8 m).
+    """
+    if bank is None:
+        return 0.0
+    i = fp.nearest_stride(bank.achieved_vel, (float(cmd), 0.0, 0.0))
+    return float(bank.period_frames[i]) * float(dt) * float(
+        np.linalg.norm(bank.achieved_vel[i][:2]))
+
+
+def _hold_minimums(cmds: list, min_hold: float, args, bank,
+                   lead_in_from: float | None = None) -> list:
+    """Per-hold minimum travel: enough for one exact gait cycle, plus its incoming transient.
+
+    Measured when the lead-up became an alternation: with a flat ``min_hold_m`` floor, four of the
+    quick build's 24 transition clips ended up with NO exact loop anywhere -- every hold's budget was
+    eaten by its incoming transient and ``_loop_piece`` correctly refused to round a sub-cycle loop up
+    to a whole one. A lead-up made entirely of in-betweenings is exactly the motion this pipeline
+    exists to avoid, so the budget has to fund the loop and not merely the hold.
+
+    Both terms are per hold and derived rather than declared:
+
+    * the LOOP floor is one gait cycle of the stride this command selects (:func:`_cycle_travel`),
+      which is what ``loop_frames_for`` will not go below;
+    * the TRANSIENT reserve comes from ``flat_plan.transient_travel_bound``, mirroring the arithmetic
+      ``mb_env.hop_tokens`` applies in pass B -- ONE definition, so pass A's prediction and pass B's
+      choice cannot drift.
+
+    ``min_hold_m`` survives as a floor under the first term, for a recipe that wants steadier stretches
+    than the bare minimum.
+
+    ``lead_in_from`` is the speed the FIRST hold is entered from, and it is what makes the two sides
+    symmetric. An approach's first hold opens the clip and has no incoming transient, so it is
+    ``None``. An exit's first hold is entered from the TERRAIN, via the exit transient -- and forgetting
+    that cost one clip every exact loop on its trail-away: its first hold was budgeted 0.1 m, the exit
+    transient travelled 0.5 m, and ``_loop_piece`` was left with nothing. The approach's mirror of this
+    is the approach zone, which is added to its last hold for exactly the same reason.
+    """
+    out = [max(float(min_hold), _cycle_travel(bank, cmds[0], args.dt))]
+    if lead_in_from is not None:
+        out[0] += fp.transient_travel_bound(
+            (float(lead_in_from), 0.0, 0.0), (cmds[0], 0.0, 0.0),
+            a_max=float(args.approach_a_max), floor_s=float(args.approach_min_transient_s),
+            slack=float(args.approach_hop_slack))
+    for j in range(1, len(cmds)):
+        out.append(max(float(min_hold), _cycle_travel(bank, cmds[j], args.dt))
+                   + fp.transient_travel_bound(
+                       (cmds[j - 1], 0.0, 0.0), (cmds[j], 0.0, 0.0),
+                       a_max=float(args.approach_a_max),
+                       floor_s=float(args.approach_min_transient_s),
+                       slack=float(args.approach_hop_slack)))
+    return out
+
+
 def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
-              steady_vx: float, args) -> dict:
+              steady_vx: float, args, bank) -> dict:
     """The RL-visible command as a list of HOLDS, one per steady stretch, plus the interaction's.
 
-    Replaces a time-indexed schedule, and that is the point rather than a tidy-up. The schedule was
-    sampled over an absolute clip timeline and then had to be held constant across the approach and
-    the exit, which meant knowing where those windows were -- so ``_clip_schedule`` reserved a fixed
-    ``_INTERACTION_BUDGET_S = 12.0`` for the traversal. The real replay is 2-6 s, so the exit's hold
-    window began 6-10 s LATE and usually did nothing at all, and could even start past the end of
-    the clip. It was inert only because the shipped recipe held the whole clip at one value; it
-    would have fired the moment command variation was turned on, which is the next step.
+    Distance-indexed, and that is the point rather than a tidy-up. This replaced a schedule sampled
+    over an absolute clip timeline, which had to be held flat across the approach and the exit --
+    which meant knowing where those windows were, so pass A reserved a fixed 12 s for a traversal
+    that is really 2-6 s. A hold list has no time axis to be wrong about.
 
-    A hold list has no time axis to be wrong about. Each entry is ``(distance_m, vx)`` -- distance,
-    because that is what the approach and exit budgets are in and what an exact loop covers by
-    construction -- and pass C lays them onto the spliced piece boundaries, so the command is
-    piecewise-constant on those boundaries BY CONSTRUCTION rather than by a rasterise-and-hold
-    round trip that only approximated it.
+    **The command varies along the lead-up and the trail-away**, which is what this whole branch
+    exists for: nothing in the shipped library has ever shown the generator a speed change while a
+    terrain feature was in view. The hold ADJOINING the terrain is pinned to the clip's own steady
+    command on both sides -- the entry transient departs from it and the exit transient lands on it,
+    and the tile's entry/exit candidates were selected for it -- so the variation lives strictly in
+    the outer stretches and the terrain interface is untouched.
 
-    Forward-only: a traversal is authored along the tile's +x, so a lateral or yaw command would
-    walk the robot off it.
+    The commands are drawn CONTINUOUSLY from the family's band and are not tailored to the strides
+    that exist: the motion is whichever stride is nearest (``flat_plan.nearest_stride``), and the
+    resulting disagreement is exactly what teaches a generator to SELECT rather than to memorise.
+
+    Forward-only: a traversal is authored along the tile's +x, so a lateral or yaw command would walk
+    the robot off it.
 
     Returns:
-        ``{"approach": [(dist, vx)], "interaction": vx, "exit": [(dist, vx)]}``.
+        ``{"approach": [(dist, vx)], "interaction": vx, "exit": [(dist, vx)]}``, outermost hold
+        first on the approach and innermost first on the exit -- i.e. both lists run in CLIP ORDER.
     """
-    # ONE hold per side for now, at the clip's steady command -- byte-for-byte what the constant
-    # schedule produced. Several holds per side is the next step; the representation is what had to
-    # come first, because the thing blocking it was the time axis rather than the sampling.
-    return {"approach": [(float(approach_dist), float(steady_vx))],
+    band = tuple(args.stair_vel_range) if family_kind == "stairs" else tuple(args.box_vel_range)
+    sign = -1.0 if float(steady_vx) < 0 else 1.0
+    lo, hi = min(abs(band[0]), abs(band[1])), max(abs(band[0]), abs(band[1]))
+    req = int(getattr(args, "terrain_cmd_changes_per_side", 0))
+    min_hold = float(getattr(args, "min_hold_m", 0.0))
+
+    def _side(total: float, is_approach: bool) -> list:
+        # The zone belongs to the hold that adjoins the terrain, and is NOT available for splitting:
+        # it is the stretch the entry transient consumes.
+        zone = APPROACH_ZONE_M if is_approach else 0.0
+        flat = max(0.0, float(total) - zone)
+        # How many holds the travel can actually FUND -- each interior one has to pay for its own
+        # in-betweening before it can pay for a loop. The requested count is a ceiling; drop one at a
+        # time until the minimums fit. Reducing rather than shrinking the holds is deliberate: a hold
+        # too short to contain an exact loop is not a steady stretch, and planning one produces a
+        # lead-up made entirely of in-betweenings.
+        n = max(1, 1 + int(req))
+        while n > 1:
+            cmds = [sign * float(rng.uniform(lo, hi)) for _ in range(n)]
+            if is_approach:
+                cmds[-1] = float(steady_vx)
+            else:
+                cmds[0] = float(steady_vx)
+            mins = _hold_minimums(cmds, min_hold, args, bank,
+                                  lead_in_from=(None if is_approach else 0.0))
+            if sum(mins) <= flat:
+                break
+            n -= 1
+        else:
+            cmds = [float(steady_vx)]
+            mins = [min(_hold_minimums(cmds, min_hold, args, bank,
+                                       lead_in_from=(None if is_approach else 0.0))[0], flat)]
+        shares = _split_dist(rng, flat, mins)
+        # Give the zone to the hold that touches the terrain.
+        if is_approach:
+            shares[-1] += zone
+        return [(float(d), float(c)) for d, c in zip(shares, cmds)]
+
+    return {"approach": _side(float(approach_dist), True),
             "interaction": float(steady_vx),
-            "exit": [(float(exit_dist), float(steady_vx))]}
+            "exit": _side(float(exit_dist), False)}
+
+
+def _side_plans(name: str, holds: dict, rng, bank, dt: float, seed: int) -> dict:
+    """The approach and exit as ordinary flat plans -- a loop per hold, an in-betweening between.
+
+    This is the whole of step 8's structural claim: **a terrain clip's lead-up is not a special
+    case.** It is `flat_plan`'s alternation, budgeted in metres instead of seconds, with a Motion
+    Bricks transient welded to each end that happens to target the terrain rather than a stride.
+
+    Pass A owns every discrete choice, which is the property `flat_plan` is built on: the strides and
+    the hand-off phases are decided HERE and pass B is told them. Pass B used to pick the entry
+    transient's seed stride itself (``targeter.nearest(v0)``) and its phase from the RNG seed
+    (``seed % period``); with several loops on the approach the LAST one has to hand off at exactly
+    that stride and phase, and two independent 'nearest' implementations agreeing is not something to
+    rely on when they can simply not both exist.
+    """
+    out = {}
+    for side in ("approach", "exit"):
+        seq = holds.get(side) or []
+        if not seq:
+            continue
+        out[f"{side}_plan"] = fp.plan_to_dict(fp.plan_from_distance_holds(
+            f"{name}_{side}", [(d, (c, 0.0, 0.0)) for d, c in seq], rng,
+            bank_periods=bank.period_frames, bank_vel=bank.achieved_vel, dt=float(dt),
+            seed=int(seed)))
+    return out
 
 
 def _clip_speeds(rng, family_kind: str, args, cpt: int, vx_max: float | None = None) -> list[float]:
@@ -351,6 +504,34 @@ def main() -> int:
     p.add_argument("--stair-tiles", type=int, default=20, help="TRANSITION tiles per stair direction.")
     p.add_argument("--box-tiles", default="20,15,15", help="jump_on,jump_off,jump_off_front tile counts.")
     p.add_argument("--clips-per-tile", type=int, default=50)
+    p.add_argument("--stride-bank", default=None,
+                   help="Stride bank .npz. Pass A needs it now: the approach and the exit are ordinary "
+                        "flat plans (a loop per commanded speed, an in-betweening between), and "
+                        "choosing a loop's stride and gait phase requires the bank's periods and "
+                        "achieved velocities. Without it a clip gets ONE hold per side, which is the "
+                        "pre-step-8 structure.")
+    p.add_argument("--terrain-cmd-changes-per-side", type=int, default=0,
+                   help="Command changes during a terrain clip's lead-up and trail-away. 0 reproduces "
+                        "the single-hold structure. A CEILING, not a promise -- the travel budget "
+                        "decides how many steady stretches actually fit (--min-hold-m). Each change "
+                        "costs one extra Motion Bricks generation per clip in pass B, so 2 is roughly "
+                        "3x the stage-b cost of 0.")
+    p.add_argument("--min-hold-m", type=float, default=1.5,
+                   help="Shortest steady stretch (m) a command hold may be. A hold shorter than a gait "
+                        "cycle is not steady in any measurable sense, and loop_frames_for rounds it UP "
+                        "-- silently overrunning the travel budget and pushing the terrain past the "
+                        "platform edge.")
+    # The three knobs that decide how long an in-betweening lasts. Pass B applies them; pass A has to
+    # PREDICT them, because a command hold must fund its incoming transient before it can fund a loop.
+    # Same names and same recipe keys on both sides, so the two cannot be given different values.
+    p.add_argument("--approach-a-max", type=float, default=2.0,
+                   help="Max planar acceleration (m/s^2) a transition may demand; sets a FLOOR on its "
+                        "duration. Must match mb_terrain_segments --a-max.")
+    p.add_argument("--approach-min-transient-s", type=float, default=0.35,
+                   help="Floor on a transient's duration (s). Must match --min-transient-s in pass B.")
+    p.add_argument("--approach-hop-slack", type=float, default=1.3,
+                   help="How much longer than its floor a transient may run. Must match --hop-slack "
+                        "in pass B.")
     p.add_argument("--segment-reuse", action=argparse.BooleanOptionalAction, default=False,
                    help="Share a generated MB segment between clips whose conditioning is identical. "
                         "OFF by default: with per-clip command schedules two clips are only "
@@ -439,6 +620,16 @@ def main() -> int:
     cpt = int(args.clips_per_tile)
     builder = make_builder(args, args.device)                 # ONE builder for the whole run
     jobs: list[dict] = []
+    # Pass A now makes the discrete choices the approach and exit plans are built from -- which
+    # stride each hold replays and which gait phase it hands off at -- so it needs the bank. Optional
+    # so a plan-only debug run still works; without it every side gets ONE hold, the pre-step-8
+    # structure.
+    bank = load_stride_bank(args.stride_bank) if args.stride_bank else None
+    if bank is None and int(args.terrain_cmd_changes_per_side) > 0:
+        raise SystemExit(
+            "--terrain-cmd-changes-per-side > 0 needs --stride-bank: a command change IS a loop "
+            "boundary, and choosing a loop's stride and gait phase requires the bank. Asking for "
+            "changes without it would silently produce none.")
     requests: dict[str, dict] = {}
     next_tid = 0
     skipped = 0
@@ -523,6 +714,16 @@ def main() -> int:
                 else:
                     mag = {elevated_side(family): top_mag, ground_side(family): g_mag}
                     a_mag, x_mag = mag["approach"], mag["exit"]
+                _holds_ci = _rl_holds(
+                    np.random.default_rng([args.seed + 7, _skill_seed(skill), int(tid), ci]),
+                    kind, a_dist, x_dist, float(family.exit_sign) * abs(float(vx)), args, bank)
+                _sides_ci = _side_plans(
+                    f"{skill}_t{tid:04d}_c{ci:03d}", _holds_ci,
+                    np.random.default_rng([args.seed + 13, _skill_seed(skill), int(tid), ci]),
+                    bank, args.dt,
+                    int(np.random.default_rng(
+                        [args.seed + 17, _skill_seed(skill), int(tid), ci]).integers(0, 2 ** 31))
+                ) if bank is not None else {}
                 job_args = SimpleNamespace(
                     skill=skill, source=args.source, library=args.library, hf_repo=args.hf_repo,
                     dt=args.dt, device=args.device, terrain_id=tid,
@@ -550,9 +751,11 @@ def main() -> int:
                     # commands -- a command invented afterwards would be one the motion never
                     # followed. The terrain overrides it only near the interaction
                     # (mb_terrain_segments); everywhere else the motion tracks it.
-                    rl_holds=_rl_holds(
-                        np.random.default_rng([args.seed + 7, _skill_seed(skill), int(tid), ci]),
-                        kind, a_dist, x_dist, float(family.exit_sign) * abs(float(vx)), args),
+                    rl_holds=_holds_ci,
+                    # The approach and the exit as ordinary FLAT plans -- a loop per hold, an
+                    # in-betweening between. Pass B generates those in-betweenings and pass C splices
+                    # them, so both read this rather than re-deriving anything.
+                    side_plans=_sides_ci,
                     # Metres, not seconds. platform_* are TILE-level maxima; approach/exit_dist are
                     # this clip's own budget.
                     platform_ground_dist=plat_ground_dist, platform_top_dist=plat_top_dist,
@@ -583,7 +786,7 @@ def main() -> int:
                 save_terrain_plan(os.path.join(work, rel), plan)
                 a_key, x_key = _segment_keys(
                     plan, args.approach_pin, args.exit_pin, a_start,
-                    holds=job_args.rl_holds,
+                    holds=job_args.rl_holds, side_plans=job_args.side_plans,
                     unique_salt=(None if args.segment_reuse else f"{skill}|{tid}|{ci}"))
                 # A one-sided box tile has no ELEVATED segment: don't request it and don't record its key,
                 # so pass B never generates it and pass C knows to splice that side as None.
@@ -601,6 +804,24 @@ def main() -> int:
                                               "start": a_start if side == "approach" else "stand",
                                               "n_uses": 0})
                     requests[key]["n_uses"] += 1
+                # The INTERIOR transients: one per command change on each side. Ordinary
+                # loop-to-loop in-betweenings -- the same job the flat family's transients are, and
+                # generated by the same code (``mb_transient.generate``). Keyed by the plan's own
+                # piece key, which is unique per clip because ``plan_from_distance_holds`` names them
+                # after the clip. NOT deduped across clips: two transients are interchangeable only
+                # if they start and end at the EXACT same frame of the same stride, and the phases
+                # are drawn per clip, so a match would be both rare and unverifiable.
+                for _side in ("approach", "exit"):
+                    if (_side == "approach" and a_key is None) or (_side == "exit" and x_key is None):
+                        continue                      # a side with no terrain segment has no lead-up
+                    _pl = (job_args.side_plans or {}).get(f"{_side}_plan")
+                    for _pc in ((_pl or {}).get("pieces") or []):
+                        if _pc.get("kind") != "transient":
+                            continue
+                        _k = _pc["key"]
+                        requests[_k] = {"key": _k, "side": f"{_side}_interior", "pin": "stride",
+                                        "plan": rel, "piece_key": _k,
+                                        "out": os.path.join("segments", f"{_k}.npz"), "n_uses": 1}
                 jobs.append({"family": skill, "kind": kind, "terrain_id": tid, "clip": ci,
                              "plan": rel, "approach_key": a_key, "exit_key": x_key,
                              "approach_start": a_start, "two_sided": two_sided,

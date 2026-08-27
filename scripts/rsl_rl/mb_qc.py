@@ -178,12 +178,20 @@ def _clip_metrics(y: np.ndarray, dy: np.ndarray, contact: np.ndarray, cmd: np.nd
         # this branch there would mark the whole clip "not steady" and report no tracking at all.
         steady = stride_idx >= 0
     elif amt is not None and amt.size == cmd.shape[0] and np.unique(amt).size > 1:
-        # TERRAIN.  Its command is a deliberate per-clip CONSTANT (one terrain-agnostic user command for
-        # the whole clip), so change-point inference calls the entire clip steady and the tracking error
-        # comes out meaningless -- the traversal is exactly where command and motion are SUPPOSED to
-        # diverge, because the terrain overrides the command.  Score only the ego-anchored approach and
-        # exit, which is where the contract says they must agree.
-        steady = amt == _ANCHOR_MASK_FLAT
+        # TERRAIN, and specifically terrain with NO exact loops -- the pure-stair and one-sided box
+        # families, which are a replay plus in-betweenings and nothing else.  The traversal is exactly
+        # where command and motion are SUPPOSED to diverge (the terrain overrides the command), so
+        # score only the ego-anchored approach and exit, where the contract says they must agree.
+        #
+        # AND intersect with the command's own regime.  This branch used to be the anchor mask alone,
+        # on the stated grounds that "its command is a deliberate per-clip CONSTANT" -- true when it
+        # was written, false since a terrain clip's lead-up got a varying command.  With a constant
+        # command the mask was harmless; with a varying one it scores every in-betweening frame as
+        # steady, and an in-betweening is a deliberate acceleration between two commanded speeds.
+        # Measured on the quick build: clips scored this way report cyc_err ~1.2 m/s against ~0.03 for
+        # loop-scored clips, so a family moving into this bucket looks like a large regression that is
+        # entirely the metric's.
+        steady = (amt == _ANCHOR_MASK_FLAT) & _regime_mask(cmd, dt, ramp_s)
     else:
         steady = _regime_mask(cmd, dt, ramp_s)
 
