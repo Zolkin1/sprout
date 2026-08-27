@@ -224,6 +224,72 @@ def clip_end_reached(env, command_name: str = "traj_ref", reserve_lookahead: boo
             last_step = (last_step - int(offsets.max().item())).clamp_min(0)
     return (cmd.start_step + env.episode_length_buf) >= last_step
 
+def base_height_below_termination(
+    env, min_height: float = 0.3, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base world height drops below ``min_height``: the fall detector.
+
+    The height half of :func:`base_fallen` with the attitude half left out, because a
+    generator-driven run grades attitude against the REFERENCE instead
+    (:func:`fm_base_tilt_error_termination`) and the two would otherwise double-count.
+
+    **Absolute, deliberately, and it is the reference-relative version that fails here.**
+    Height error against the served reference looks like the consistent choice, but under
+    ``ego_anchor_fraction=1.0`` the reference is re-datumed onto the robot at every re-plan,
+    so that error collapses toward zero every ``fm_update_every`` steps -- a slow sink walks
+    straight through it. World z has no such hole.
+
+    The cost is that this assumes the terrain never goes below world zero: if it did, a
+    healthy robot descending far enough would trip it. That holds for the shipped libraries
+    (every tile builds upward from the ground plane) and is why the bound can sit as low as
+    0.3 m -- deep under any standing pose, so it fires on a collapse rather than on a stoop.
+
+    Args:
+        env: IsaacLab environment.
+        min_height: Base world height below which the episode ends (m).
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    robot = env.scene[asset_cfg.name]
+    return wp.to_torch(robot.data.root_pos_w)[:, 2] < min_height
+
+
+def fm_base_tilt_error_termination(
+    env, command_name: str = "traj_ref", max_tilt_rad: float = 1.047,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base tilts too far from the REFERENCE's attitude (yaw ignored).
+
+    :func:`base_orientation_from_upright` measures against world upright, which is the wrong
+    datum once the reference itself leans -- climbing and jumping both pitch the base on
+    purpose, so a fixed cone around vertical either fires on healthy motion or has to be
+    slackened until it catches nothing.  This measures the angle between the robot's own up
+    axis and the REFERENCE's, so the allowance travels with the motion.
+
+    Yaw drops out by construction: comparing up axes says nothing about heading, which is the
+    same reason :func:`base_orientation_from_upright` ignores it.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The tracking command term.
+        max_tilt_rad: Maximum angle between the two up axes (rad); 1.047 = 60 deg.
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    robot = env.scene[asset_cfg.name]
+    up = torch.zeros(env.num_envs, 3, device=env.device)
+    up[:, 2] = 1.0
+    ref_up = quat_apply(cmd.reference_world_state()[:, 3:7], up)
+    act_up = quat_apply(wp.to_torch(robot.data.root_quat_w), up)
+    cos = (ref_up * act_up).sum(-1).clamp(-1.0, 1.0)
+    return torch.arccos(cos) > max_tilt_rad
+
+
 def base_orientation_from_upright(
     env,
     roll_limit_deg: float = 70.0,

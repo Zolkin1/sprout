@@ -827,51 +827,6 @@ def fm_reference_window(
         return reference_window(env, command_name, offsets=offsets, blocks=blocks)
 
 
-def fm_reference_residual(
-    env: ManagerBasedRLEnv, command_name: str = "traj_ref", *,
-    offsets: Sequence[int], blocks: Sequence[str] | None = None,
-) -> torch.Tensor:
-    """The generator's window MINUS the clip's, for the privileged critic.
-
-    The fine-tune breaks an invariant the critic was built on.  Its ``reference_window`` term
-    is documented as "the same reference window the actor's encoder sees, uncorrupted" -- but
-    once the actor is served by the generator and the critic is not, the value function can no
-    longer see the input the policy is acting on.  It then cannot tell a policy error from the
-    generator having asked for something wrong, and that difference is pure variance in the
-    value target.
-
-    This closes it from the critic's side.  The critic keeps its clip window and gains the
-    residual, which is exactly the information it was missing: what the actor was told, versus
-    what it will be graded against.
-
-    **Residual rather than the raw generator window, on purpose.**  The critic's first layer is
-    linear and already receives the clip window, so ``(clip, residual)`` and ``(clip, fm)`` span
-    the same space -- the choice is one of conditioning, not information.  The residual is
-    centred near zero and is small wherever the generator is right, which is where a zero-init
-    column wants to start.  It is also the quantity with the meaning: "how wrong is the
-    reference this step".
-
-    Privileged, and it must stay that way -- it is built from the clip, which no robot has.
-
-    Args:
-        env: The environment.
-        command_name: The tracking command term; must be an ``FmTrackingCommand``.
-        offsets: Look-ahead offsets, as :func:`reference_window` takes them.
-        blocks: Reference blocks, as :func:`reference_window` takes them.
-
-    Returns:
-        ``[N, len(offsets) * D]``, the same width as either window.
-
-    Raises:
-        RuntimeError: If the command has no generator loaded.
-    """
-    cmd = env.command_manager.get_term(command_name)
-    clip = reference_window(env, command_name, offsets=offsets, blocks=blocks)
-    with cmd.as_fm_reference():
-        served = reference_window(env, command_name, offsets=offsets, blocks=blocks)
-    return served - clip
-
-
 def command_window(
     env: ManagerBasedRLEnv, command_name: str = "traj_ref", *, offsets: Sequence[int],
 ) -> torch.Tensor:
