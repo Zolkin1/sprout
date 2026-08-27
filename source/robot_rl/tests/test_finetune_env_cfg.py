@@ -48,16 +48,48 @@ def test_the_graded_managers_are_the_teachers(cfgs, attr):
     assert getattr(finetune, attr).to_dict() == getattr(teacher, attr).to_dict()
 
 
-@pytest.mark.parametrize("group", ["policy", "critic"])
-def test_the_non_reference_obs_groups_are_the_teachers(cfgs, group):
-    """Proprioception/exteroception and the privileged critic are untouched.
+def test_the_policy_obs_group_is_the_teachers(cfgs):
+    """Proprioception and exteroception are untouched -- only the reference moved."""
+    finetune, teacher = cfgs
+    assert finetune.observations.policy.to_dict() == teacher.observations.policy.to_dict()
 
-    The reference lives in its own group, which is what makes swapping it a local change --
-    if it did not, this test would be the one to notice.
+
+def _terms(group) -> list[str]:
+    """Observation term names of a group, in DECLARATION order (= concatenation order)."""
+    return [k for k, v in vars(group).items()
+            if not k.startswith("_") and v is not None and hasattr(v, "func")]
+
+
+def test_the_critic_is_the_teachers_plus_the_residual_APPENDED(cfgs):
+    """The critic gains exactly one term, and it must come LAST.
+
+    It gains one because a value function that cannot see the input the actor acted on cannot
+    separate a policy error from a bad reference, and eats the difference as variance.
+
+    It must be last because terms concatenate in declaration order: appending leaves every
+    existing input at its original index, which is what lets a resumed critic be zero-PADDED
+    (``scripts/rsl_rl/pad_critic_for_finetune.py``) rather than permuted. Inserting the new
+    term anywhere else still loads, and is nonsense.
     """
     finetune, teacher = cfgs
-    assert (getattr(finetune.observations, group).to_dict()
-            == getattr(teacher.observations, group).to_dict())
+    ft_terms, te_terms = _terms(finetune.observations.critic), _terms(teacher.observations.critic)
+    assert ft_terms == te_terms + ["reference_residual"]
+    assert finetune.observations.critic.reference_residual.func.__name__ == "fm_reference_residual"
+
+    # Every inherited term is carried over unchanged, so only the appended columns are new.
+    ft_dict, te_dict = finetune.observations.critic.to_dict(), teacher.observations.critic.to_dict()
+    for name in te_terms:
+        assert ft_dict[name] == te_dict[name], f"critic term {name} changed"
+
+
+def test_the_critic_still_sees_the_clip_window(cfgs):
+    """The clip window STAYS -- it is what the return is graded against.
+
+    The residual is the generator MINUS the clip, so dropping the clip window would leave the
+    critic unable to reconstruct either one.
+    """
+    finetune, _ = cfgs
+    assert finetune.observations.critic.reference_window.func.__name__ == "reference_window"
 
 
 def test_the_reference_window_is_served_by_the_generator(cfgs):

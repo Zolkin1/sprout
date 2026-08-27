@@ -61,6 +61,14 @@ class AuxPpoAlgorithmCfg(RslRlPpoAlgorithmCfg):
     reference_reconstruction_coeff: float = 0.0
     """Weight of the reconstruction loss.  Non-zero requires ``actor.reconstruction=True``."""
 
+    critic_warmup_iterations: int = 0
+    """Fit the value function alone for this many iterations before the actor may move.
+
+    ``0`` is stock PPO.  Non-zero is for RESUMING into a changed observation, where the value
+    target moves before the policy has done anything wrong; see
+    :attr:`robot_rl.rl.aux_ppo.AuxPPO._in_critic_warmup`.  Counted from the start of THIS run,
+    not from the resumed iteration number."""
+
 # Shared PPO hyperparameters. Declared once so the symmetric variant differs from the
 # baseline in exactly one field (``symmetry_cfg``) rather than by a copied literal.
 _PPO_KWARGS = dict(
@@ -129,6 +137,43 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         "actor": ["policy", "reference"],
         "critic": ["critic"],
     }
+
+
+@configclass
+class FinetunePPORunnerCfg(PPORunnerCfg):
+    """PPO for resuming a trained teacher into the generator-served observation.
+
+    Three departures from :class:`PPORunnerCfg`, all of them about the RESUME rather than
+    about the task being harder:
+
+    * ``critic_warmup_iterations`` -- the value target moves the moment the observation does
+      (different states, and shorter episodes so different returns), and until the critic has
+      caught up the advantages are noise. Fit it first.
+    * ``desired_kl`` cut from the pre-training 0.01 -- a converged policy released into a new
+      observation can take a very large step before anything registers as wrong, and the
+      adaptive controller only reacts AFTER the KL is measured. A tighter target makes it
+      react sooner.
+    * ``entropy_coef`` cut from 0.008 -- the bonus is there to keep a policy exploring while
+      it is still learning a task. This one already has the task; leaving the bonus at full
+      strength lets it win against a weak surrogate signal and inflate the action std, which
+      is the "entropy goes up during fine-tuning" failure.
+
+    These live HERE, on the agent config the task names, rather than as CLI overrides. A flag
+    that has to be retyped is a flag that eventually is not -- the eval harness lost a whole
+    grid to exactly that (see the eval README on ``stage_grid`` forwarding).
+    """
+
+    algorithm = AuxPpoAlgorithmCfg(**{
+        **_PPO_KWARGS,
+        # Critic-only iterations before the actor is released. Long enough for the value loss
+        # to come off its spike, short enough that the frozen policy is still collecting data
+        # worth fitting to.
+        "critic_warmup_iterations": 30,
+        # 3x tighter than pre-training's 0.01.
+        "desired_kl": 0.0033,
+        # 4x below pre-training's 0.008.
+        "entropy_coef": 0.002,
+    })
 
 
 @configclass

@@ -94,6 +94,14 @@ def main(env_cfg, agent_cfg) -> None:
     print(f"[verify] reference_source={cmd.cfg.reference_source!r}  "
           f"history_from={cmd.cfg.history_from!r}  fm_enabled={cmd.fm_enabled}")
 
+    # The width the critic-padding step needs. Printed from the live manager rather than
+    # computed by hand, because getting it wrong pads to the wrong size and the mismatch only
+    # shows up as a load error much later.
+    for group, dim in unwrapped.observation_manager.group_obs_dim.items():
+        width = int(dim[0]) if not isinstance(dim, int) else int(dim)
+        print(f"[verify] obs group {group:12s} width {width}")
+    print("[verify] pass the 'critic' width to pad_critic_for_finetune.py --new_width")
+
     env.reset()
     zero_action = torch.zeros(
         unwrapped.num_envs, unwrapped.action_manager.total_action_dim, device=unwrapped.device

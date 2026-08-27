@@ -142,7 +142,36 @@ class G1FinetuneObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
             ),
         )
 
+    @configclass
+    class CriticCfg(G1TeacherTerrainDepthObservationsCfg.CriticCfg):
+        """The teacher's privileged critic, plus the generator-vs-clip residual.
+
+        The critic's own ``reference_window`` is documented as "the same reference window the
+        actor's encoder sees, uncorrupted".  Serving the actor from the generator breaks that,
+        and a value function that cannot see the input the policy acted on cannot separate a
+        policy error from a bad reference -- it just eats the difference as variance.  That is
+        the likeliest source of the value-loss spike this task shows on resume.
+
+        The clip window STAYS (it is what the return is graded against) and the residual is
+        added, so the critic sees both halves.  Appended LAST on purpose: observation terms
+        concatenate in declaration order, so the teacher's 1961 inputs keep their positions and
+        a resumed critic's first layer is padded rather than permuted -- see
+        ``scripts/rsl_rl/pad_critic_for_finetune.py``, which is what makes the resumed value
+        function start on the same function it left off on, instead of scrambled.
+        """
+
+        reference_residual = ObsTerm(
+            func=mdp.fm_reference_residual,
+            params={
+                "command_name": "traj_ref",
+                "offsets": REFERENCE_OFFSETS,
+                "blocks": REFERENCE_WINDOW_BLOCKS,
+            },
+            clip=(-20.0, 20.0),
+        )
+
     reference: ReferenceCfg = ReferenceCfg()
+    critic: CriticCfg = CriticCfg()
 
 
 ##

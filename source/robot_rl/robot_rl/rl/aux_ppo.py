@@ -36,22 +36,35 @@ from rsl_rl.algorithms import PPO
 class AuxPPO(PPO):
     """PPO plus an optional reference-reconstruction auxiliary loss."""
 
-    def __init__(self, *args, reference_reconstruction_coeff: float = 0.0, **kwargs) -> None:
-        """Initialize PPO and record the auxiliary-loss weight.
+    def __init__(self, *args, reference_reconstruction_coeff: float = 0.0,
+                 critic_warmup_iterations: int = 0, **kwargs) -> None:
+        """Initialize PPO and record the auxiliary-loss weight and the critic warm-up.
 
         Args:
             *args: Positional arguments forwarded to :class:`~rsl_rl.algorithms.PPO`.
             reference_reconstruction_coeff: Weight of the actor's reference
                 reconstruction loss in the total loss. ``0.0`` (the default) disables the
                 term entirely, leaving stock PPO behaviour.
+            critic_warmup_iterations: Fit the value function ALONE for this many iterations
+                before the actor is allowed to move. ``0`` (the default) is stock PPO. See
+                :meth:`_in_critic_warmup` for why this exists and what it freezes.
             **kwargs: Keyword arguments forwarded to :class:`~rsl_rl.algorithms.PPO`.
 
         Raises:
             ValueError: If a non-zero coefficient is requested but the actor was built
-                without a reconstruction decoder.
+                without a reconstruction decoder, or the warm-up length is negative.
         """
         super().__init__(*args, **kwargs)
         self.reference_reconstruction_coeff = float(reference_reconstruction_coeff)
+        self.critic_warmup_iterations = int(critic_warmup_iterations)
+        if self.critic_warmup_iterations < 0:
+            raise ValueError(
+                f"critic_warmup_iterations={self.critic_warmup_iterations} must be >= 0."
+            )
+        #: Counts calls to :meth:`update`, i.e. iterations. Deliberately NOT the runner's
+        #: ``current_learning_iteration``: on a resume that starts at the teacher's 20000 and
+        #: the warm-up would be skipped entirely, silently.
+        self._updates_done = 0
         if self.reference_reconstruction_coeff != 0.0 and getattr(self.actor, "decoder", None) is None:
             raise ValueError(
                 "reference_reconstruction_coeff="
@@ -59,6 +72,36 @@ class AuxPPO(PPO):
                 "actor. Set agent.actor.reconstruction=true (RefEncoderModelCfg.reconstruction), "
                 "or set the coefficient to 0 to disable the auxiliary loss."
             )
+
+    @property
+    def _in_critic_warmup(self) -> bool:
+        """Whether the value function is still being fitted with the actor held still.
+
+        **Why.** Resuming a converged policy into a changed observation moves the value
+        target twice over: the states visited change, and so do the returns (episodes end
+        sooner). The critic's error then flows into the advantages, the surrogate gradient
+        becomes mostly noise, and the entropy bonus -- which has no such problem -- wins,
+        so the policy diffuses instead of adapting. Fitting the critic first removes the
+        noise source before the actor is allowed to react to it.
+
+        **How the actor is frozen, and why not ``lr = 0``.** During warm-up the total loss is
+        the value term ALONE. The actor and critic are separate modules, so nothing backprops
+        into the actor and its ``.grad`` stays ``None`` -- and Adam SKIPS parameters with a
+        ``None`` gradient, so they cannot drift on stale momentum either. Zeroing the
+        gradients instead would not be equivalent: Adam would still step them from the
+        moments the teacher's run left behind.
+
+        The obvious alternative, an actor parameter group at ``lr = 0``, was rejected because
+        rsl-rl builds ONE Adam over ``chain(actor, critic)``, and re-grouping it makes the
+        checkpoint's ``optimizer_state_dict`` unloadable -- ``--resume`` would break, which is
+        the one thing a fine-tune cannot do without.
+
+        **The adaptive learning rate is also suspended** while this is true (see
+        :meth:`update`): with the actor still, the measured KL is ~0, which reads to the
+        controller as "far below target" and would ratchet the shared learning rate up toward
+        its 1e-2 cap -- applying it to the critic, which is the one thing training here.
+        """
+        return self._updates_done < self.critic_warmup_iterations
 
     @property
     def _use_reconstruction(self) -> bool:
@@ -125,7 +168,11 @@ class AuxPPO(PPO):
             entropy = self.actor.output_entropy[:original_batch_size]
 
             # Compute KL divergence and adapt the learning rate
-            if self.desired_kl is not None and self.schedule == "adaptive":
+            # Suspended during the critic warm-up: a still actor measures KL ~ 0, which
+            # the controller reads as "far below target" and answers by ratcheting the
+            # SHARED learning rate toward its 1e-2 cap -- onto the critic.
+            if (self.desired_kl is not None and self.schedule == "adaptive"
+                    and not self._in_critic_warmup):
                 with torch.inference_mode():
                     kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
                     kl_mean = torch.mean(kl)
@@ -169,7 +216,13 @@ class AuxPPO(PPO):
             else:
                 value_loss = (batch.returns - values).pow(2).mean()
 
-            loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            if self._in_critic_warmup:
+                # Value term ALONE. Nothing here touches the actor, so its grads stay
+                # None and Adam leaves it exactly where the checkpoint put it.
+                loss = self.value_loss_coef * value_loss
+            else:
+                loss = (surrogate_loss + self.value_loss_coef * value_loss
+                        - self.entropy_coef * entropy.mean())
 
             # [robot_rl] Auxiliary reference-reconstruction loss on the actor's encoder.
             # Sliced to the original batch so a revived symmetry path does not weight the
@@ -237,7 +290,10 @@ class AuxPPO(PPO):
                 self.reduce_parameters()
 
             # Apply the gradients for PPO
-            nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
+            # The actor has no gradients at all during warm-up, and clipping an empty set
+            # is an error rather than a no-op.
+            if not self._in_critic_warmup:
+                nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
             # Apply the gradients for RND
@@ -287,5 +343,16 @@ class AuxPPO(PPO):
         # [robot_rl] Reference-reconstruction loss
         if mean_recon_loss is not None:
             loss_dict["reference_recon"] = mean_recon_loss
+
+        # [robot_rl] Critic warm-up: logged as a series rather than printed once, so a run's
+        # own metrics say when the actor was released. Read `Loss/surrogate` against it -- the
+        # surrogate is computed and reported throughout, it just is not optimized while this
+        # is 1, and a reader who does not know that would call the flat stretch a plateau.
+        if self.critic_warmup_iterations:
+            loss_dict["critic_warmup"] = float(self._in_critic_warmup)
+
+        # AFTER the flag is read, so iteration `critic_warmup_iterations` is the first one the
+        # actor moves on, and a warm-up of N means exactly N frozen iterations.
+        self._updates_done += 1
 
         return loss_dict
