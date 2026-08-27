@@ -105,6 +105,17 @@ parser.add_argument("--quat_wxyz", action="store_true",
                     help="Write the root quaternion permuted to wxyz. A/B for the convention: "
                          "the recording states xyzw, the sim API's expectation is what this "
                          "settles empirically against a DR-free delta-0 check.")
+parser.add_argument("--source_slice", default="", metavar="K/N",
+                    help="Render slice K of N: every Nth source window, starting at K. The "
+                         "N slices PARTITION the recording, so rendering each under a "
+                         "different variant buys N visual conditions for the size of one "
+                         "pass. Strided rather than chunked on purpose -- the recording is "
+                         "written env-batch by env-batch, so a contiguous fifth would hand "
+                         "one variant the openings of episodes and another their ends. "
+                         "Note what this does NOT give: a window appears under ONE variant, "
+                         "so there is no same-window-different-scenery pair. What makes it "
+                         "work is that every TILE still appears under every variant, which "
+                         "is what stops scenery predicting terrain.")
 parser.add_argument("--source_rows", default="", metavar="i,j,k",
                     help="Render ONLY these source window indices, in this order. For "
                          "looking at a handful of hand-picked frames: --max_source spreads "
@@ -531,7 +542,17 @@ def main() -> int:
     if args_cli.clutter and not args_cli.visual_only:
         with open(args_cli.clutter) as _cf:
             _side = json.load(_cf)
-        clutter_boxes = {int(k): v for k, v in _side["per_terrain_id"].items()}
+        # Two sidecar schemas reach here and they carry the per-tile payload differently:
+        # schema 1 maps a tile to a LIST of boxes, schema 2 to an edit BLOCK. What this
+        # filter wants either way is the volumes a displaced robot must not be put inside,
+        # which for a ground variant is its added DECORATION -- the walkable edits are
+        # ground, and displacing onto ground is the normal case, not a penetration.
+        if int(_side.get("schema", 1)) == 2:
+            clutter_boxes = {int(k): [o for o in (blk.get("add") or []) if o.get("decor")]
+                             for k, blk in _side["per_terrain_id"].items()}
+            clutter_boxes = {k: v for k, v in clutter_boxes.items() if v}
+        else:
+            clutter_boxes = {int(k): v for k, v in _side["per_terrain_id"].items()}
         print(f"[augment] displacing INTO clutter: {sum(len(v) for v in clutter_boxes.values())} "
               f"volumes over {len(clutter_boxes)} tiles; windows whose displaced reference "
               f"enters one will be dropped.")
@@ -552,7 +573,19 @@ def main() -> int:
     # N windows are the OPENINGS of episodes -- taking a prefix samples one narrow band of
     # clip_step and silently answers a different question than the one asked (it read the
     # first 36 steps of a 2-6 s clip here, which made every downrange obstacle look far away).
-    if args_cli.source_rows:
+    if args_cli.source_slice:
+        try:
+            _k, _n = (int(v) for v in args_cli.source_slice.split("/"))
+        except ValueError:
+            raise SystemExit(f"--source_slice {args_cli.source_slice!r} must be K/N")
+        if not 0 <= _k < _n:
+            raise SystemExit(f"--source_slice {_k}/{_n}: need 0 <= K < N")
+        if args_cli.source_rows:
+            raise SystemExit("--source_slice and --source_rows both select rows; pick one.")
+        src = np.arange(_k, W, _n, dtype=np.int64)
+        print(f"[augment] slice {_k} of {_n}: {len(src)} of {W} source windows "
+              f"(every {_n}th from {_k})")
+    elif args_cli.source_rows:
         src = np.array([int(v) for v in args_cli.source_rows.split(",") if v.strip()],
                        dtype=np.int64)
         if src.min() < 0 or src.max() >= W:
