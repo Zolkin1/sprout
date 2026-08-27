@@ -778,6 +778,55 @@ def reference_window_to_world(
     )
 
 
+def fm_reference_window(
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", *,
+    offsets: Sequence[int], blocks: Sequence[str] | None = None,
+) -> torch.Tensor:
+    """:func:`reference_window`, served from the GENERATOR while everything else stays on the clip.
+
+    This is the RL fine-tuning seam.  The teacher trains against the clip -- reward, critic
+    and terminations all grade it -- but at deploy the policy is handed the generator's
+    prediction, and the two differ by more than the synthetic reference noise models.  This
+    term closes that gap from the observation side ALONE: the actor sees what it will see on
+    the robot, and nothing about what it is graded against moves.
+
+    That separation is what makes the fine-tune well-posed, and it is bought by ORDERING
+    rather than by a second copy of the reference.  ``FmTrackingCommand._update_command``
+    builds both references every step, applies the configured one, and computes the CLF
+    (``v`` / ``vdot``) there and then -- storing scalars.  ``clf_reward`` reads those stored
+    scalars, so a swap performed later, at observation time, cannot reach the reward however
+    long it lasts.  :meth:`~.fm_tracking_cmd.FmTrackingCommand.as_fm_reference` restores the
+    configured source on the way out, so the swap does not leak into the next term either.
+
+    Pair it with ``reference_source="clip"`` (so the graded reference IS the clip) and a
+    non-empty ``fm_checkpoint`` (so ``fm_enabled`` is true and the generator runs passively
+    beside it).  ``history_from`` then chooses the arm: ``"clip"`` is teacher forcing, which
+    keeps the prediction phase-locked to the motion the reward grades; ``"generator"`` is the
+    closed loop, where the two can drift apart and the reward stops describing what the
+    policy was shown.
+
+    Deliberately NOT applied to :func:`command_window`: that term is the joystick command,
+    which at deploy comes from the operator rather than the generator, and it is noise-free
+    for the same reason.
+
+    Args:
+        env: The environment.
+        command_name: The tracking command term; must be an ``FmTrackingCommand``.
+        offsets: Look-ahead offsets, as :func:`reference_window` takes them.
+        blocks: Reference blocks, as :func:`reference_window` takes them.
+
+    Returns:
+        ``[N, len(offsets) * D]`` -- the same layout the clip-served term produces, so a
+        checkpoint moves between the two without a shape change.
+
+    Raises:
+        RuntimeError: If the command has no generator loaded (``fm_checkpoint`` empty).
+    """
+    cmd = env.command_manager.get_term(command_name)
+    with cmd.as_fm_reference():
+        return reference_window(env, command_name, offsets=offsets, blocks=blocks)
+
+
 def command_window(
     env: ManagerBasedRLEnv, command_name: str = "traj_ref", *, offsets: Sequence[int],
 ) -> torch.Tensor:

@@ -130,6 +130,51 @@ def bodies_from_window(win: np.ndarray, ctx, chain: FKChain,
     return np.einsum("nfij,nfbj->nfbi", rot, pos) + root[:, :, None, :]
 
 
+def fit_time_shift(pred: np.ndarray, targ: np.ndarray, max_nodes: float = 8.0,
+                   step: float = 0.25) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Best per-window time shift, and the error it leaves behind.
+
+    The trajectories say the generator produces the right gait slightly LATE, not a
+    displaced one. A small lag on a periodic signal looks exactly like a ramp in the error,
+    because the further out you look the more of it has accumulated -- so const-plus-ramp
+    fits it without the error being spatial at all. Those want opposite corrections: a
+    spatial offset says "the target is over there", a lag says "the target will be here,
+    later". This measures which it is.
+
+    Scans a scalar shift per window and reports how much of the error it removes. The
+    comparison is on an interior region only, so shifting cannot win by truncating the
+    hardest part of the horizon.
+
+    Args:
+        pred: ``(N, F, C)`` prediction.
+        targ: ``(N, F, C)`` target.
+        max_nodes: Largest shift considered, in nodes.
+        step: Shift resolution, in nodes.
+
+    Returns:
+        ``(best_lag_nodes, err_before, err_after)``; the errors are per window, RMS over the
+        interior region and the channels.
+    """
+    n, f, _ = pred.shape
+    m = int(np.ceil(max_nodes))
+    t = np.arange(m, f - m)                       # interior, so every shift is defined
+    lags = np.arange(-max_nodes, max_nodes + 1e-9, step)
+    best = np.full(n, np.nan)
+    err_a = np.full(n, np.inf)
+    src = np.arange(f)
+    for lag in lags:
+        # pred(t) against targ(t - lag): a POSITIVE lag means the generator is late.
+        shifted = np.stack([np.interp(t - lag, src, targ[i, :, c])
+                            for i in range(n) for c in range(targ.shape[2])], axis=0)
+        shifted = shifted.reshape(n, targ.shape[2], len(t)).transpose(0, 2, 1)
+        e = np.sqrt(((pred[:, t, :] - shifted) ** 2).mean(axis=(1, 2)))
+        take = e < err_a
+        err_a[take] = e[take]
+        best[take] = lag
+    err_b = np.sqrt(((pred[:, t, :] - targ[:, t, :]) ** 2).mean(axis=(1, 2)))
+    return best, err_b, err_a
+
+
 @torch.no_grad()
 def main() -> int:
     """Measure and report the generator's body-position error against the clip."""
@@ -143,7 +188,11 @@ def main() -> int:
     p.add_argument("--out", default=None)
     p.add_argument("--dump_traj", type=int, default=0, metavar="N",
                    help="Also save N whole predicted/target trajectories, for eyeballing "
-                        "the metrics against something concrete.")
+                        "the metrics against something concrete. Written as a .npz beside "
+                        "--out: a table of medians is not a motion, and a perturbation "
+                        "designed off one should be checked against the other.")
+    p.add_argument("--dump_family", default="family_stairs_up",
+                   help="Which family the dumped trajectories come from.")
     a = p.parse_args()
 
     dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -294,6 +343,26 @@ def main() -> int:
         print(f"  within stairs_up, window-to-family-mean: p10 {np.percentile(cos,10):.2f} "
               f"p50 {np.median(cos):.2f} p90 {np.percentile(cos,90):.2f}")
 
+    # IS IT A LAG? Fitted on the joint angles, which are the periodic signal.
+    print("\n--- is the error a TIME SHIFT rather than an offset? ---")
+    print("%-20s %8s %10s %10s %9s" % ("family", "lag(ms)", "err before", "err after",
+                                       "explained"))
+    for i, name in enumerate(fam_names):
+        m = fam == i
+        if m.sum() < 30:
+            continue
+        jp_pred = pred[m][:, :, bp["joint_pos"]]
+        jp_targ = targ[m][:, :, bp["joint_pos"]]
+        lag, eb, ea = fit_time_shift(jp_pred, jp_targ)
+        dt_ms = 1000.0 * float(getattr(meta, "dt", 0.02))
+        res["per_family"][name]["lag_ms"] = float(np.median(lag) * dt_ms)
+        res["per_family"][name]["lag_explained"] = float(1.0 - np.median(ea) / max(
+            float(np.median(eb)), 1e-12))
+        print("%-20s %8.1f %10.4f %10.4f %8.0f%%"
+              % (name.replace("family_", ""), np.median(lag) * dt_ms,
+                 np.median(eb), np.median(ea),
+                 100 * (1 - np.median(ea) / max(float(np.median(eb)), 1e-12))))
+
     print("\n--- JOINT space (rad) vs END-EFFECTOR space (m): same shape? ---")
     print("%-20s %-24s %-24s" % ("", "foot / EE  (m)", "joints  (rad)"))
     print("%-20s %8s %8s %8s %8s %8s %8s" % ("family", "p50", "+ramp", "resid",
@@ -315,9 +384,24 @@ def main() -> int:
                  row["foot"]["const_plus_ramp_frac"], row["foot"]["residual_frac"], g))
 
     if a.dump_traj:
-        k = np.linspace(0, len(sel) - 1, a.dump_traj).astype(int)
-        res["traj"] = {"pred_bodies": P[k].tolist(), "targ_bodies": T[k].tolist(),
-                       "rows": k.tolist(), "family": fam[k].tolist()}
+        pool = (np.flatnonzero(fam == fam_names.index(a.dump_family))
+                if a.dump_family in fam_names else np.arange(len(sel)))
+        if pool.size == 0:
+            pool = np.arange(len(sel))
+        k = pool[np.linspace(0, pool.size - 1, min(a.dump_traj, pool.size)).astype(int)]
+        npz = os.path.splitext(a.out or "fm_foot_error.json")[0] + "_traj.npz"
+        np.savez_compressed(
+            npz,
+            pred=pred[k], targ=targ[k],                 # whole windows, denormalized
+            pred_bodies=P[k], targ_bodies=T[k],          # FK'd, base applied
+            rows=k, family=fam[k],
+            joint_names=np.array(json.dumps(list(ctx.joint_names))),
+            family_names=np.array(json.dumps(list(fam_names))),
+            blocks=np.array(json.dumps({b: [bp[b].start, bp[b].stop] for b in bp})),
+            bodies=np.array(json.dumps(list(BODIES))),
+            dt=float(getattr(meta, "dt", 0.02)),
+        )
+        print(f"[foot-err] wrote {npz} ({len(k)} trajectories from {a.dump_family})")
     out = a.out or os.path.join(os.path.dirname(a.checkpoint), "fm_foot_error.json")
     with open(out, "w") as fh:
         json.dump(res, fh)

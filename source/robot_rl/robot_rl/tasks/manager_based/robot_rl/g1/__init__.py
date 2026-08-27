@@ -139,6 +139,23 @@ if not _registered:
         },
     )
 
+    ## =========================================
+    # RL FINE-TUNE: the depth teacher, shown its own generator's reference window while
+    # every graded quantity stays the clip's. Resume a trained teacher into it and pass
+    # --fm_checkpoint. See g1_finetune_env_cfg for why the reward needs no re-pointing.
+    ## =========================================
+    gym.register(
+        id="G1-teacher-clf-terrain-depth-finetune",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": (
+                f"{__name__}.g1_finetune_env_cfg:G1FinetuneTerrainDepthEnvCfg"
+            ),
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+
     gym.register(
         id="G1-teacher-clf-terrain-depth-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
