@@ -9,14 +9,18 @@ command sources:
   gamepad (left stick = vx/vy, right stick x = wz), scaled by ``--max_*``.
 * ``--mode eval``: a scripted velocity profile from ``experiments.velocity_commands``
   (``--command``), logging tracking metrics to CSV.
+* ``--const_cmd VX VY WZ``: hold one velocity command for the whole run, overriding both.
+  Every terrain clip in the training library was generated under exactly that -- a per-clip
+  CONSTANT command -- so it is the in-distribution way to drive at a piece of terrain.
 
 Run from ``transfer/sim/`` (the MuJoCo assets are resolved relative to cwd):
 
     python gen_tracker_runner.py --mode joystick --load_run <tracker_run>
     python gen_tracker_runner.py --mode eval --command smooth_ramp_running --log
 
-The flow-matching checkpoint defaults to the one the tracker was trained against
-(read from the run's ``params/env.yaml``); override with ``--fm_checkpoint``.
+The flow-matching graph defaults to the one exported beside the tracker; override with
+``--fm_onnx`` (required when the run's ``exported/`` holds more than one, which the
+resolver refuses to disambiguate).
 """
 
 from __future__ import annotations
@@ -1301,6 +1305,15 @@ def main() -> None:
                              "-- defaulting to the newest is the ambiguity the naming exists "
                              "to remove.")
     parser.add_argument("--mode", choices=["joystick", "eval"], default="joystick")
+    parser.add_argument("--const_cmd", type=float, nargs=3, default=None,
+                        metavar=("VX", "VY", "WZ"),
+                        help="Hold a CONSTANT velocity command for the whole run, in m/s and "
+                             "rad/s. Overrides --mode / --command. This is the shape every "
+                             "terrain clip in the library was generated under -- the command "
+                             "is a per-clip constant on all seven terrain families -- so it is "
+                             "what an in-distribution approach looks like, and it is what "
+                             "stair_probe.py drives. Ignored under --clip, whose reference "
+                             "carries its own command.")
     parser.add_argument("--command", type=str, default="smooth_ramp_running",
                         help="Scripted velocity profile in experiments.velocity_commands (eval mode).")
     parser.add_argument("--scene", type=str, default="basic_scene")
@@ -1481,6 +1494,13 @@ def main() -> None:
                              "tick, so --fm_lead_ticks 1 is the matched comparison; 3 "
                              "reproduces the old 60 ms default.")
     parser.add_argument("--log", action="store_true", default=False)
+    parser.add_argument("--no_metrics", dest="metrics", action="store_false", default=True,
+                        help="With --log, still write sim_log.csv and stamp the verdict into "
+                             "sim_meta.yaml, but skip gen_tracker_metrics: six figures and a "
+                             "summary JSON dumped to stdout. The two are otherwise coupled -- "
+                             "the verdict a sweep reads only exists when --log is on -- so a "
+                             "sweep that wants the verdict and not the plots had to take both, "
+                             "at a few seconds and a screenful of JSON per run.")
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Where --log writes sim_log.csv + metrics (default: "
                              "<run_dir>/mujoco_gen_tracker_logs). That default is ONE fixed "
@@ -1613,6 +1633,13 @@ def main() -> None:
         # conflicts with the MuJoCo viewer's GLFW context at interpreter teardown and
         # produces a benign-but-ugly shutdown segfault.
         command_fn = lambda _t: np.zeros(3)
+    elif args.const_cmd is not None:
+        # Bound before the pygame path, so a constant-command run never opens a joystick and
+        # never inherits the "[WARN] no joystick -> [0.5, 0, 0]" fallback, which is a silent
+        # way to run a sweep at a speed nobody chose.
+        const = np.asarray(args.const_cmd, dtype=np.float64)
+        print(f"[INFO] constant command ({const[0]:+.3f}, {const[1]:+.3f}, {const[2]:+.3f})")
+        command_fn = lambda _t, _c=const: _c
     elif args.mode == "joystick":
         command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz)
     else:
@@ -1783,7 +1810,14 @@ def main() -> None:
         # Written after the loop, so a run that fell still yields every tick it managed --
         # those ticks are exactly the interesting ones.
         manifest = replay.write(extra_attrs={
-            "scene": args.scene, "robot": args.robot_name, "command": args.command,
+            # What ACTUALLY drove the stream. `args.command` keeps its argparse default under
+            # --const_cmd (and under --mode joystick), so recording it unconditionally stamped
+            # a replay with the name of a scripted profile that was never evaluated -- and one
+            # that need not even exist, since the hasattr check is on the other branch.
+            "scene": args.scene, "robot": args.robot_name,
+            "command": (f"const:{args.const_cmd[0]},{args.const_cmd[1]},{args.const_cmd[2]}"
+                        if args.const_cmd is not None else
+                        "joystick" if args.mode == "joystick" else args.command),
             "fm_lead_ticks": int(args.fm_lead_ticks), "survived": success,
             "dt": float(policy.get_dt()),
             # The POLICY's joint order. Every consumer that compares joints needs it: the
@@ -1827,8 +1861,9 @@ def main() -> None:
             print(f"[WARN] no sim_meta.yaml at {meta_path}; the metrics will infer survival "
                   "from the `fell` column, which cannot see a fall on the final step.")
 
-        import gen_tracker_metrics
-        gen_tracker_metrics.create_metrics(os.path.dirname(log_path))
+        if args.metrics:
+            import gen_tracker_metrics
+            gen_tracker_metrics.create_metrics(os.path.dirname(log_path))
 
     # Hard-exit to skip the native GL teardown. At interpreter exit the MuJoCo viewer's
     # GLFW context and pygame/SDL (joystick) race destroying their GLX contexts on the X
