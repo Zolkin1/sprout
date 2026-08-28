@@ -42,6 +42,24 @@ control:
       # Override per run with `run_sim_low.sh --policy <folder>` rather than editing this.
       hf_policy_folder: "2026-08-20_16-36-10_mode11_decor_plan_v1"
       use_cuda: true
+      # Arm a pair whose robot_asset fingerprints disagree, warning on every load instead of
+      # refusing. ON, for one specific and understood delta:
+      #
+      #   tracker mjcf_sha256 245672ef...  vs  generator 0078e0d0...
+      #
+      # Commit 3ddab280 (2026-08-24) changed ONE line of g1_perceptive.xml -- the hip-pitch
+      # position gains, 40.18/2.56 -> 99.0984/6.3088 -- and nothing else. The generators in use
+      # were trained before it. `robot_asset` is baked into an FM CHECKPOINT at training time
+      # and is NOT recomputed at export, so re-exporting the generator does not clear this; only
+      # retraining would. Actuator gains are never read by the generator, and reach the robot
+      # from the TRACKER's metadata over the wire, so the pair is compatible.
+      #
+      # TURN THIS BACK OFF once the generators are retrained on a tree that carries 3ddab280.
+      # It is not a general permission: it also suppresses a joint-order, body-set or link
+      # geometry mismatch, which is exactly what the guard exists to catch. The C++ prints
+      # every differing field on every load -- read it, and if it is not the gains line above,
+      # stop.
+      allow_robot_asset_mismatch: true
       # 4, not the onnxruntime default of 0 (auto): auto measured ~3x SLOWER here (the FM at
       # 251 ms vs 87 ms on the 27M). Revisit per machine -- this is a measured local optimum,
       # not a portable constant.

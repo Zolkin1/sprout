@@ -3,6 +3,7 @@
 #include "g1_deploy/robot_asset.h"
 
 #include <algorithm>
+#include <iostream>
 #include <sstream>
 #include <stdexcept>
 
@@ -29,7 +30,8 @@ std::string Head(const std::string& s) { return s.substr(0, 16); }
 }  // namespace
 
 void AssertRobotAssetsAgree(const RobotAsset& tracker, const RobotAsset& fm,
-                            const std::string& tracker_name, const std::string& fm_name) {
+                            const std::string& tracker_name, const std::string& fm_name,
+                            bool allow_mismatch) {
   if (!tracker.present || !fm.present) return;
 
   std::vector<std::string> diffs;
@@ -71,8 +73,24 @@ void AssertRobotAssetsAgree(const RobotAsset& tracker, const RobotAsset& fm,
       << "): they were trained on different robots, and there is only one robot to run them "
          "on.";
   for (const std::string& d : diffs) msg << "\n" << d;
+  if (allow_mismatch) {
+    // Every line, every load, on stderr. An override that prints once and quietly at INFO is
+    // an override nobody sees in the log they are scrolling after a fall -- and the whole
+    // point of allowing it is that the reader can check the delta is still the one they
+    // approved, not merely that some delta was approved once.
+    std::cerr << "\n=============== ROBOT ASSET MISMATCH -- OVERRIDDEN ===============\n"
+              << msg.str() << "\n"
+              << "allow_robot_asset_mismatch=true, so this pair is loading ANYWAY.\n"
+              << "Anything measured here is a statement about a pair the fingerprint says\n"
+              << "is not matched. Re-export both from one robot to clear it.\n"
+              << "=================================================================\n"
+              << std::endl;
+    return;
+  }
   msg << "\nRe-export both from one run, or point the generator at the one trained against "
-         "this tracker.";
+         "this tracker."
+      << "\nIf the delta is one you have read and understood, set "
+         "allow_robot_asset_mismatch=true.";
   throw std::runtime_error(msg.str());
 }
 

@@ -160,6 +160,7 @@ void G1Controller::DeclareParams() {
   //
   // Set false to restore training-matched sampling.
   this->declare_parameter<bool>("zero_noise", true);
+  this->declare_parameter<bool>("allow_robot_asset_mismatch", false);
 
   // ---- debug-clip playback ----------------------------------------------------------
   // Drive the tracker from a BAKED MOTION with the generator not loaded at all, so a failure
@@ -218,6 +219,8 @@ G1Controller::on_configure(const rclcpp_lifecycle::State& prev) {
   fm_late_disarm_ticks_ = static_cast<int>(this->get_parameter("fm_late_disarm_ticks").as_int());
   urdf_path_ = this->get_parameter("urdf_path").as_string();
   zero_noise_ = this->get_parameter("zero_noise").as_bool();
+  allow_robot_asset_mismatch_ =
+      this->get_parameter("allow_robot_asset_mismatch").as_bool();
 
   LoadPolicy();
   SetupDepth();
@@ -345,6 +348,7 @@ void G1Controller::LoadPolicy() {
                               : cfg.providers;
   cfg.tracker_intra_threads = tracker_threads_;
   cfg.zero_noise = zero_noise_;
+  cfg.allow_robot_asset_mismatch = allow_robot_asset_mismatch_;
 
   RCLCPP_INFO(this->get_logger(),
               "loading the policy pair from %s (cuda=%d, threads=%d, zero_noise=%d, "

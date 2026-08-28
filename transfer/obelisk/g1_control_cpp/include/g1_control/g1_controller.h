@@ -243,6 +243,9 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   int fm_late_disarm_ticks_ = 0;
   std::string urdf_path_;
   bool zero_noise_ = true;
+  //: Arm a pair whose robot_asset fingerprints disagree. Off by default; see
+  //: PolicyRuntime::Config::allow_robot_asset_mismatch for what it is and is not for.
+  bool allow_robot_asset_mismatch_ = false;
 
   // ---- diagnostics --------------------------------------------------------------------
   std::vector<rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr> depth_subs_;

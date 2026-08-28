@@ -218,7 +218,7 @@ void PolicyRuntime::LoadFmSource(const ReferenceWindowSpec& rw,
   // survive a payload change, a hand swap and a gear-ratio change, so the pair loads clean and
   // the only symptom is a robot that tracks slightly wrong.
   AssertRobotAssetsAgree(p.robot_asset, fm_->meta().robot_asset, cfg_.tracker_onnx,
-                         cfg_.fm_onnx);
+                         cfg_.fm_onnx, cfg_.allow_robot_asset_mismatch);
 
   std::shared_ptr<FmWorker> worker;
   std::shared_ptr<FmSampler> blocker, sampler;

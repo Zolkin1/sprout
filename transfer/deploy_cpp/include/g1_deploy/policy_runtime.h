@@ -148,6 +148,22 @@ struct RuntimeConfig {
   //: different policies and a numeric diff of their plans measures the lead rather than the
   //: code.
   bool allow_zero_lead = false;
+  //: Load a tracker/generator pair whose ``robot_asset`` fingerprints disagree, warning loudly
+  //: rather than refusing.
+  //:
+  //: This is the HARDWARE path, so it is off by default and the bar for turning it on is that
+  //: someone has read the printed diff and knows why it is harmless. The case it exists for is
+  //: a generator whose checkpoint stamps an older ``mjcf_sha256``: ``robot_asset`` is baked into
+  //: the FM checkpoint at TRAINING time and is not recomputed at export, so an MJCF change made
+  //: after the generator was trained cannot be cleared by re-exporting it. Where that change is
+  //: confined to actuator gains -- which the generator never reads, and which reach the robot
+  //: from the TRACKER's metadata over the wire -- the pair is compatible though the hashes are
+  //: not.
+  //:
+  //: What it is NOT for is a joint-order, body-set or link-geometry difference. Those are what
+  //: this guard exists to catch, they are invisible to every shape check, and the warning names
+  //: the differing field precisely so the two cases can be told apart before arming.
+  bool allow_robot_asset_mismatch = false;
   //: How long the FIRST tick after arming may block waiting for a plan.
   //:
   //: There is no PD warm-up to hide behind, so the alternative is a tick with no reference at
