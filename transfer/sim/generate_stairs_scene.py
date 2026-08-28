@@ -315,6 +315,76 @@ def _lane_geoms(lane: Lane, rise: float, run: float, x_start: float, platform_de
 DECOR_GROUP_ATTRS = 'group="1" contype="0" conaffinity="0"'
 
 
+#: Lateral gap from a flight's edge to a flanking wall face (m).  A real stairwell wall is
+#: essentially at the edge of the treads, which is the case this exists to test.
+#:
+#: For comparison, measured on the decorated library's 40 stairs transition tiles: the walls
+#: ring a RENDERED FLOOR 9.35 m wide while the walkable tile is a median 3.82 m, so there are
+#: two populations and only one of them is realistic. The FAR-side wall is 4.98-7.05 m from
+#: the flight (median 6.36) -- effectively absent. The NEAR-side wall, where a tile has one,
+#: sits 0.0-1.52 m away (median 0.59), which IS stairwell-like -- but only 18 of the 40 tiles
+#: have a near-side wall at all. So the trained distribution is roughly half "wall beside the
+#: stairs" and half "nothing within five metres", and the value below is deliberately at the
+#: tight end of the realistic half rather than at its median.
+DEFAULT_LANE_WALL_GAP = 0.15
+#: Wall height (m). Above roughly 0.9 m this is a VIEWER choice, not a model one: at 3 m the
+#: depth frame's top edge already cuts the wall, so taller walls are byte-identical images.
+DEFAULT_LANE_WALL_HEIGHT = 2.0
+#: How far before the first riser the wall starts (m), so it is in frame during the approach
+#: -- which is when the plan that decides stairs-or-box is made.
+DEFAULT_LANE_WALL_LEAD = 1.0
+
+
+def lane_wall_geoms(lane: Lane, rise: float, run: float, x_start: float,
+                    platform_depth: float, descend: bool,
+                    gap: float = DEFAULT_LANE_WALL_GAP,
+                    height: float = DEFAULT_LANE_WALL_HEIGHT,
+                    lead: float = DEFAULT_LANE_WALL_LEAD,
+                    thickness: float = 0.15) -> list[str]:
+    """Two walls flanking one staircase, the way a real stairwell does.
+
+    **Visual only, with no option to make them solid.**  Isaac's decoration carries no
+    collider, so nothing in training has ever pushed back on the robot, and there is no
+    obstacle term anywhere in the MDP.  Worse than merely untrained: a collidable wall this
+    close would be swept by the reference's own arm swing, which blocks a wrist, fires
+    ``ee_pose_error`` and ends the episode for a reason the policy cannot fix.  What this is
+    for is watching what the generator PLANS with a wall in frame, which needs no contact.
+
+    The walls span the whole lane -- lead-in, ascent, platform and descent -- because a
+    stairwell does, and because the approach is when the deciding plan is made.
+
+    Args:
+        lane: The staircase to flank.
+        rise: Scene-wide per-step height (m); overridden by ``lane.rise``.
+        run: Scene-wide tread run (m); overridden by ``lane.run``.
+        x_start: World x of the first riser.
+        platform_depth: Depth of the platform between the flights.
+        descend: Whether the lane carries a descending flight (it is longer if so).
+        gap: Lateral clearance from the tread edge to the wall face (m).
+        height: Wall height (m).
+        lead: How far before the first riser the wall begins (m).
+        thickness: Wall thickness (m).
+
+    Returns:
+        MuJoCo geom lines for the two walls.
+    """
+    rn = lane.run if lane.run is not None else run
+    span = lane.steps * rn * (2 if descend else 1) + platform_depth
+    x0, x1 = x_start - lead, x_start + span
+    cx, half_len = 0.5 * (x0 + x1), 0.5 * (x1 - x0)
+    # Face at lane edge + gap, so `gap` is the clearance a foot sees, not a centre distance.
+    off = lane.width / 2.0 + gap + thickness / 2.0
+    return [
+        f'        <!-- {lane.name} stairwell wall, {gap} m clearance, visual only -->'
+    ] + [
+        f'        <geom name="{lane.name}_wall_{side}" type="box" material="box_material" '
+        f'{DECOR_GROUP_ATTRS} '
+        f'size="{half_len:.4f} {thickness / 2:.4f} {height / 2:.4f}" '
+        f'pos="{cx:.4f} {lane.y + sign * off:.4f} {height / 2:.4f}"/>'
+        for side, sign in (("left", 1.0), ("right", -1.0))
+    ]
+
+
 def corner_wall_geoms(x: float, y: float, height: float, length: float,
                       thickness: float = 0.15, solid: bool = False) -> list[str]:
     """Two walls meeting at 90 deg, for driving at in the playground.
@@ -356,7 +426,10 @@ def corner_wall_geoms(x: float, y: float, height: float, length: float,
 def build_scene_xml(robot_xml: str, lanes: tuple[Lane, ...], rise: float, run: float,
                     x_start: float, platform_depth: float,
                     boxes: tuple[Box, ...] = (), descend: bool = True,
-                    walls: list[str] | None = None) -> str:
+                    walls: list[str] | None = None,
+                    wall_lanes: tuple[str, ...] = (),
+                    wall_gap: float = DEFAULT_LANE_WALL_GAP,
+                    wall_height: float = DEFAULT_LANE_WALL_HEIGHT) -> str:
     """Assemble the full MuJoCo scene XML string.
 
     Mirrors ``g1_21j_basic_scene.xml`` (visual / asset / ankle sensors / lights +
@@ -373,6 +446,10 @@ def build_scene_xml(robot_xml: str, lanes: tuple[Lane, ...], rise: float, run: f
         boxes: Free-standing jump-on/off boxes to add (see :data:`DEFAULT_BOXES`).
         descend: Give every lane a mirrored descending flight past its platform.
         walls: Extra geom lines (see :func:`corner_wall_geoms`), or ``None``.
+        wall_lanes: Names of lanes to flank with stairwell walls. Leaving some lanes bare
+            makes one scene a within-scene A/B rather than needing two.
+        wall_gap: Lateral clearance from tread edge to wall face (m).
+        wall_height: Wall height (m).
 
     Returns:
         The complete scene XML as a string.
@@ -380,6 +457,9 @@ def build_scene_xml(robot_xml: str, lanes: tuple[Lane, ...], rise: float, run: f
     stair_lines: list[str] = []
     for lane in lanes:
         stair_lines.extend(_lane_geoms(lane, rise, run, x_start, platform_depth, descend))
+        if lane.name in wall_lanes:
+            stair_lines.extend(lane_wall_geoms(lane, rise, run, x_start, platform_depth,
+                                               descend, gap=wall_gap, height=wall_height))
     for box in boxes:
         stair_lines.extend(_box_geoms(box))
     stair_lines.extend(walls or [])
@@ -530,6 +610,20 @@ def main() -> None:
                         help="Add a jump box 'height[:x][:y]' in metres (repeatable). Omit for the "
                              f"default row at heights {(0.25, 0.40, 0.55, 0.70)} spanning the "
                              f"trained grid {TRAINED_BOX_HEIGHTS}. Use --no_boxes for none.")
+    parser.add_argument("--wall_lanes", type=str, default="center,indoor",
+                        help="Comma-separated lane names to flank with STAIRWELL walls, or "
+                             "'' for none. Real staircases have walls right at the treads and "
+                             "the trained library only half does -- its far-side wall sits "
+                             "5-7 m away and fewer than half the tiles carry a near-side one. "
+                             "The default walls two lanes and leaves the others bare, so one "
+                             "scene is a within-scene A/B instead of two scenes. Visual only, "
+                             "always: see lane_wall_geoms for why a solid one would test the "
+                             "wrong thing.")
+    parser.add_argument("--wall_gap", type=float, default=DEFAULT_LANE_WALL_GAP,
+                        help="Clearance from the tread edge to the wall face (m).")
+    parser.add_argument("--lane_wall_height", type=float, default=DEFAULT_LANE_WALL_HEIGHT,
+                        help="Stairwell wall height (m). Above ~0.9 m this is a viewer choice: "
+                             "the depth frame's top edge already cuts the wall at 3 m.")
     parser.add_argument("--wall", action="store_true", default=False,
                         help="Add two walls meeting at 90 deg, for driving at. VISUAL ONLY "
                              "unless --wall_solid: Isaac's decoration never collides and "
@@ -588,9 +682,16 @@ def main() -> None:
               f"from y={wy + args.wall_length / 2:.2f}; {args.wall_length:.1f} m legs, "
               f"{args.wall_height:.1f} m tall, "
               f"{'SOLID' if args.wall_solid else 'visual only (non-colliding)'}")
+    wall_lanes = tuple(n.strip() for n in args.wall_lanes.split(",") if n.strip())
+    unknown = [n for n in wall_lanes if n not in {ln.name for ln in lanes}]
+    if unknown:
+        # Silently walling nothing would look exactly like walls that do not matter.
+        raise SystemExit(f"[ERROR] --wall_lanes names {unknown}, which are not lanes in this "
+                         f"scene: {sorted(ln.name for ln in lanes)}")
     xml = build_scene_xml(f"{args.robot}.xml", lanes, args.rise, args.run,
                           args.x_start, args.platform_depth, boxes, args.descend,
-                          walls=walls)
+                          walls=walls, wall_lanes=wall_lanes, wall_gap=args.wall_gap,
+                          wall_height=args.lane_wall_height)
 
     if args.out is not None:
         out_path = args.out
@@ -616,11 +717,13 @@ def main() -> None:
         span = lane.steps * rn * (2 if args.descend else 1) + args.platform_depth
         band = next((f"trained band {lo}-{hi} m" for lo, hi in TRAINED_STAIR_WIDTHS
                      if lo <= lane.width <= hi), "OFF the trained grid")
+        walled = ("  WALLED both sides at "
+                  f"{args.wall_gap} m" if lane.name in wall_lanes else "  (no walls)")
         print(f"       - {lane.name}: width {lane.width} m ({lane.width / 0.3048:.2f} ft, "
               f"{band}), {lane.steps} steps"
               f"{' up + ' + str(lane.steps) + ' down' if args.descend else ''}, "
               f"rise {r} m / run {rn} m (top {lane.steps * r:.3f} m) at y={lane.y}; "
-              f"x span {args.x_start:.2f}-{args.x_start + span:.2f} m")
+              f"x span {args.x_start:.2f}-{args.x_start + span:.2f} m{walled}")
     narrowest = min(ln.width for ln in lanes) if lanes else 0.0
     if narrowest < REAL_STAIR_WIDTHS["min"]:
         print(f"[WARN] the narrowest lane is {narrowest:.2f} m "

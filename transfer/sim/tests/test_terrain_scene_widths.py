@@ -109,3 +109,83 @@ def test_the_box_lane_is_clear_of_every_staircase():
     for blo, bhi in boxes:
         for name, (lo, hi) in _lane_extents(_SCENE).items():
             assert bhi < lo or blo > hi, f"a box overlaps lane {name!r} laterally"
+
+
+# --- stairwell walls ------------------------------------------------------------------------
+# Real staircases have walls at the treads. The trained library only half does: its far-side
+# wall sits 5-7 m from the flight and fewer than half the tiles carry a near-side one, so
+# "wall right beside the stairs" is a case the generator has seen on under half its stair
+# tiles. Two lanes are walled and two are left bare, which makes one scene an A/B.
+
+_WALLED = ("center", "indoor")
+
+
+def _wall_geoms(path: str) -> dict[str, tuple[float, float, float, float, int, int, int]]:
+    """Named wall geoms -> ``(y_min, y_max, x_min, x_max, group, contype, conaffinity)``."""
+    model = mujoco.MjModel.from_xml_path(path)
+    out = {}
+    for i in range(model.ngeom):
+        name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, i)
+        if not name or "_wall_" not in name:
+            continue
+        p, sz = model.geom_pos[i], model.geom_size[i]
+        out[name] = (float(p[1] - sz[1]), float(p[1] + sz[1]),
+                     float(p[0] - sz[0]), float(p[0] + sz[0]),
+                     int(model.geom_group[i]), int(model.geom_contype[i]),
+                     int(model.geom_conaffinity[i]))
+    return out
+
+
+def test_exactly_the_named_lanes_are_walled():
+    """Two walled, two bare -- otherwise the scene answers no question about walls."""
+    walls = _wall_geoms(_SCENE)
+    walled = {n.split("_wall_")[0] for n in walls}
+    assert walled == set(_WALLED), f"walled lanes {sorted(walled)} != {sorted(_WALLED)}"
+    for lane in _WALLED:
+        sides = {n for n in walls if n.startswith(f"{lane}_wall_")}
+        assert len(sides) == 2, f"lane {lane!r} should be walled on both sides, got {sides}"
+
+
+def test_stairwell_walls_are_visual_only():
+    """A solid wall here would test a contact response the robot does not have.
+
+    Isaac's decoration carries no collider and there is no obstacle term in the MDP, so a
+    collidable wall at this clearance would be swept by the reference's own arm swing --
+    blocking a wrist, firing ee_pose_error and ending the episode for a reason the policy
+    cannot fix. Group 1 so the depth cameras still cast against it, which is the whole point.
+    """
+    for name, (_, _, _, _, group, contype, conaff) in _wall_geoms(_SCENE).items():
+        assert group == 1, f"{name} is in group {group}; the cameras cast 1 and 2"
+        assert contype == 0 and conaff == 0, (
+            f"{name} collides (contype={contype}, conaffinity={conaff}) -- it must not")
+
+
+def test_the_walls_stand_clear_of_every_staircase_including_their_own():
+    """A wall must flank a flight, never intersect one -- its own or a neighbour's."""
+    walls = _wall_geoms(_SCENE)
+    lanes = _lane_extents(_SCENE)
+    for name, (wlo, whi, _, _, _, _, _) in walls.items():
+        for lane, (llo, lhi) in lanes.items():
+            assert whi <= llo or wlo >= lhi, f"{name} overlaps lane {lane!r} laterally"
+
+
+def test_the_wall_clearance_is_the_one_the_generator_was_asked_for():
+    """`gap` is the clearance a foot sees -- tread edge to wall FACE, not centre to centre."""
+    walls = _wall_geoms(_SCENE)
+    lanes = _lane_extents(_SCENE)
+    for lane in _WALLED:
+        llo, lhi = lanes[lane]
+        for side in ("left", "right"):
+            wlo, whi, _, _, _, _, _ = walls[f"{lane}_wall_{side}"]
+            clearance = (wlo - lhi) if wlo >= lhi else (llo - whi)
+            assert clearance == pytest.approx(gss.DEFAULT_LANE_WALL_GAP, abs=1e-3), (
+                f"{lane}_wall_{side} clearance {clearance:.3f} m, "
+                f"expected {gss.DEFAULT_LANE_WALL_GAP}")
+
+
+def test_the_walls_are_in_frame_before_the_first_riser():
+    """A stairwell wall that starts at the treads is late: the deciding plan is made earlier."""
+    for name, (_, _, wx0, _, _, _, _) in _wall_geoms(_SCENE).items():
+        assert wx0 < gss.DEFAULT_X_START, (
+            f"{name} starts at x={wx0:.2f}, at or past the first riser "
+            f"({gss.DEFAULT_X_START}) -- it should lead in")
