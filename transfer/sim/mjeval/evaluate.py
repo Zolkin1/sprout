@@ -105,6 +105,12 @@ ARMS: tuple[Arm, ...] = (
         "the deployed plan-anchor tracker -- the pair that drove the robot"),
     Arm(1, "finetune", "2026-08-26_23-27-58_ft_lr1e4",
         "the same tracker fine-tuned on the generator's own window (lr 1e-4)"),
+    Arm(2, "ft_v3", "2026-08-27_14-17-38_ft_v3",
+        "second fine-tune off the SAME base at the same lr: adds a privileged critic term "
+        "(fm_reference_residual, critic group only -- the actor's 9-term observation is "
+        "unchanged at 3101) and trains on the narrower nojo_nodist clip library. Exported "
+        "with tracking_mode='body', which shapes the CLF reward and not the observation, so "
+        "the FM path serves it exactly as it serves the other two"),
 )
 
 

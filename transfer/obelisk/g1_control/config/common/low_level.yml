@@ -137,7 +137,7 @@ control:
     executable: obelisk_unitree_joystick
     params:
       v_x_scale: 0.8
-      v_y_scale: 0.5
+      v_y_scale: 0.0
       w_z_scale: 0.7
       # Yaw on the RIGHT STICK HORIZONTAL (RX = 3 + AXIS_OFFSET). The upstream default is RY
       # -- right stick VERTICAL -- which reads as "yaw does nothing" to anyone who pushes the
