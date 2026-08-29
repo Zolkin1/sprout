@@ -45,12 +45,23 @@ from deploy.hardware import DEFAULT_HF_REPO_ID, policy_repo_dir  # noqa: E402
 ARTIFACTS = ("tracker.onnx", DEPLOY_FM_NAME)
 
 
-def validate_pair(exported_dir: str, fm_onnx: str | None = None) -> GenTrackerPolicy:
+def validate_pair(exported_dir: str, fm_onnx: str | None = None,
+                  allow_robot_asset_mismatch: bool = False) -> GenTrackerPolicy:
     """Load the artifact pair and return the policy, so a bad pair never ships.
 
     Args:
         exported_dir: Directory holding ``tracker.onnx`` and the generator.
         fm_onnx: Which generator to ship, when the directory holds several.
+        allow_robot_asset_mismatch: Upload a pair whose ``robot_asset`` fingerprints
+            disagree. Off by default. This is the UPLOAD path, so the bar is the same as
+            the controller's: someone has read the printed diff and knows why it is
+            harmless. It exists because ``robot_asset`` is baked into an FM checkpoint at
+            TRAINING time and is not recomputed at export, so a change to the robot
+            description made after a generator was trained cannot be cleared by
+            re-exporting it -- and where that change is confined to fields neither model
+            reads (actuator gains, say), the pair is compatible though the hashes are not.
+            The controller has the matching ``allow_robot_asset_mismatch`` parameter, and
+            BOTH must be set: this one only gets the pair uploaded.
 
     Returns:
         The loaded policy, for reporting what is about to be uploaded.
@@ -66,7 +77,8 @@ def validate_pair(exported_dir: str, fm_onnx: str | None = None) -> GenTrackerPo
             f"{tracker} is missing. Run play.py --fm_checkpoint <ckpt> first; it writes "
             "the tracker and the generator into <run>/exported/."
         )
-    policy = GenTrackerPolicy(tracker, resolve_fm_onnx(exported_dir, fm_onnx))
+    policy = GenTrackerPolicy(tracker, resolve_fm_onnx(exported_dir, fm_onnx),
+                              allow_robot_asset_mismatch=allow_robot_asset_mismatch)
     policy.load()
     return policy
 
@@ -124,6 +136,13 @@ def main() -> None:
                              "here -- the robot installs one pair under a fixed name.")
     parser.add_argument("--dry_run", action="store_true",
                         help="Validate the pair and report, but upload nothing.")
+    parser.add_argument("--allow_robot_asset_mismatch", action="store_true",
+                        help="Upload a pair whose robot_asset fingerprints disagree, warning "
+                             "instead of refusing. The guard exists because a tracker and a "
+                             "generator describing different robots is invisible to every "
+                             "shape check, so read the printed diff before reaching for this. "
+                             "It only gets the pair UPLOADED -- the controller has its own "
+                             "allow_robot_asset_mismatch parameter and both must be set.")
     args = parser.parse_args()
 
     run_dir = os.path.abspath(args.run_dir.rstrip("/"))
@@ -136,7 +155,7 @@ def main() -> None:
     repo_dir = policy_repo_dir(folder_name)
     exported = os.path.join(run_dir, "exported")
     print(f"[INFO] Validating {exported}")
-    policy = validate_pair(exported, args.fm_onnx)
+    policy = validate_pair(exported, args.fm_onnx, args.allow_robot_asset_mismatch)
     print(f"[INFO] Artifact pair is self-consistent:\n{describe(policy)}")
 
     if args.dry_run:
