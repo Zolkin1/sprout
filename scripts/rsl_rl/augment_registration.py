@@ -193,6 +193,7 @@ import torch  # noqa: E402
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 from isaaclab.managers import SceneEntityCfg  # noqa: E402
+from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg  # noqa: E402
 
 # After the SimulationApp, or the per-link contact sensors find no bodies (same as play.py).
 import robot_rl.sensors._recursive_contact_sensor_impl  # noqa: F401,E402
@@ -368,10 +369,19 @@ def main() -> int:
             raise SystemExit("--no_depth_dr: this task declares no depth DR events at all; "
                              "either it is not a depth task or the events moved module.")
         print(f"[augment] depth DR OFF: {killed}")
-    # A re-render must reproduce the SOURCE exactly, so the resolution comes from the
-    # recording's own camera contract -- not from a flag, and not from whatever the task
-    # happens to default to. When the recording was made at the generator's own resolution
-    # (record_data.py --fm_depth_resolution), that means building the same second pair here.
+    # A re-render must reproduce the SOURCE exactly, and that includes the visual-only
+    # decoration. The teacher's TRAINING scene renders none of it while the -play chain does,
+    # and record_data.py forces it on for every recording -- so re-rendering on the bare
+    # train task would replace walls with sky in an image the FM was fitted on, at the exact
+    # displaced poses this script exists to measure.
+    _terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
+    if _terrain is not None and hasattr(_terrain, "render_decor"):
+        _terrain.render_decor = True
+
+    # The resolution comes from the recording's own camera contract -- not from a flag, and
+    # not from whatever the task happens to default to. When the recording was made at the
+    # generator's own resolution (record_data.py --fm_depth_resolution), that means building
+    # the same second pair here.
     _rec_cams = list(getattr(meta, "depth_camera_spec", None) or [])
     _want_res = None
     if args_cli.render_resolution:
@@ -380,15 +390,23 @@ def main() -> int:
         except ValueError:
             raise SystemExit(f"--render_resolution {args_cli.render_resolution!r} must be WxH")
         _want_res = (_w, _h)
-    if _rec_cams or _want_res:
+    # The group goes on UNCONDITIONALLY, resolution or not. A recording is made from the
+    # GENERATOR's cameras and the policy now reads only the near one, so without the group
+    # ``mdp.fm_depth_groups`` below falls back to "every group" and this would re-render one
+    # camera into a two-camera recording. That is caught by the resolution comparison a few
+    # lines down, but only because the LIST lengths differ -- and it is not a difference the
+    # re-render should ever be asked to notice.
+    if any(isinstance(_s, MultiMeshRayCasterCameraCfg) for _s in vars(env_cfg.scene).values()):
         _res = {(int(c["width"]), int(c["height"])) for c in _rec_cams}
-        if not _want_res and len(_res) != 1:
+        if not _want_res and len(_res) > 1:
             raise SystemExit(f"the recording's cameras sample at {sorted(_res)}; one "
                              "recording's cameras share one resolution.")
         from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
-            add_fm_depth_pair,
+            install_fm_depth_group,
         )
-        add_fm_depth_pair(env_cfg, *(_want_res or _res.pop()))
+        # No stated resolution (a scan-only recording re-rendered on a depth task) means
+        # the scene's own grid, which is the only thing that could reproduce it.
+        install_fm_depth_group(env_cfg, *(_want_res or (_res.pop() if _res else (None, None))))
 
     # Same for the generator's own dense scanner, and for the same reason: the recording was
     # made on a task PLUS `record_data.py --fm_height_scan`, so the bare task carries only the

@@ -15,7 +15,7 @@ objective, not the input.
 exact ground truth, which is why the spec it emits carries ``privileged: True`` and why the
 ONNX / MuJoCo / hardware paths refuse it rather than substituting a coarser grid.
 
-The design mirrors ``add_fm_depth_pair`` in :mod:`.g1_depth_env_cfg`, with one structural
+The design mirrors ``install_fm_depth_group`` in :mod:`.g1_depth_env_cfg`, with one structural
 simplification: a height scan is read from the SENSOR, not from an observation term (see
 :mod:`..mdp.observations.height_scan`), so this adds **no observation term and no
 observation group**.  That keeps the sagittal-reflection augmentation, ``export_parameters``
@@ -171,9 +171,9 @@ def add_fm_height_scan(
         )
 
     # No DR may touch either scanner. There is none today, so this is a tripwire for the day
-    # someone copies a camera-randomisation term: the inverse of add_fm_depth_pair, which has
-    # to EXTEND its DR events to cover both samplings, because here the whole value is that
-    # the reading is exact.
+    # someone copies a camera-randomisation term: the inverse of install_fm_depth_group, which
+    # has to EXTEND its DR events to cover both samplings, because here the whole value is
+    # that the reading is exact.
     events = getattr(cfg, "events", None)
     if events is not None:
         for term_name, term in vars(events).items():

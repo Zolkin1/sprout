@@ -58,6 +58,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.height_scan import (
 )
 from robot_rl.flow_matching.config import default_depth_lag_steps
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+    FM_DEPTH_OBS_GROUP,
     depth_obs_stack,
     depth_xyz_stack,
     fm_depth_groups,
@@ -876,10 +877,15 @@ class FmTrackingCommand(MotionSequenceCommand):
 
         * the SOURCE comes from the CHECKPOINT (``ctx.extero_source``), so a depth-trained
           FM cannot be handed a height scan just because the env carries both sensors;
-        * the SENSORS come from the env: the generator's own sampling when the task built
-          one, else the policy's. For depth that is ``fm_depth_groups`` returning ``None``
-          = every group; for the scan it is ``fm_scan_sensor`` falling back to
-          ``height_scanner``. Either way a task that did not opt in is unchanged;
+        * the SENSORS come from the env, and for DEPTH that is no longer an opt-in: the
+          policy reads the NEAR camera alone, so ``fm_depth_groups`` returning ``None``
+          = "every group" would serve the generator one camera row where its checkpoint
+          states two. Every path that runs or records the generator therefore installs
+          ``g1_depth_env_cfg.install_fm_depth_group`` unconditionally, and a depth task
+          that reaches the ``None`` arm is a FAULT rather than an unchanged task --
+          :meth:`_check_extero_shape` is what names it. The SCAN is unaffected:
+          ``fm_scan_sensor`` still falls back to ``height_scanner``, because there is one
+          scanner and the policy and the generator read the same one;
         * the CHANNELS come from the checkpoint too (``ctx.extero_channels``): a generator
           trained on depth alone gets the depth image, one trained on 4 channels gets it
           with each pixel's xyz in the root's yaw frame beside it. Same reasoning as the
@@ -982,12 +988,28 @@ class FmTrackingCommand(MotionSequenceCommand):
                        "resolution=...) at the geometry the checkpoint states "
                        "(robot_rl.flow_matching.online.fm_scan_geometry reads it), which is "
                        "what play.py does from --fm_checkpoint.")
+            elif fm_depth_groups(self.env) is None:
+                # The common cause, and the one this env cannot distinguish from a
+                # deliberate one-camera checkpoint: no generator group at all. The policy
+                # reads the NEAR camera alone, so the fallback to "every group" serves ONE
+                # row against a checkpoint that states two.
+                fix = (f"this env has no {FM_DEPTH_OBS_GROUP!r} obs group, so every group was "
+                       "searched and the generator was served the POLICY's cameras -- and the "
+                       "policy reads the near camera ALONE. Install the generator's own group "
+                       "with g1_depth_env_cfg.install_fm_depth_group(env_cfg) before gym.make "
+                       "(record_data.py / play.py / augment_registration.py do); it covers "
+                       "every camera on the scene, and at the policy's own resolution it "
+                       "re-observes them rather than casting a second pair. If the resolutions "
+                       "differ, pass it: install_fm_depth_group(env_cfg, W, H) at what the "
+                       "checkpoint states (read_fm_extero_meta reads it).")
             else:
-                fix = (f"obs group(s): {fm_depth_groups(self.env) or 'all'}. For depth that is "
-                       "a resolution mismatch: build the generator's own camera pair with "
-                       "g1_depth_env_cfg.add_fm_depth_pair(env_cfg, W, H) at the resolution "
-                       "the checkpoint states (read_fm_extero_meta reads it), which is what "
-                       "play.py does from --fm_checkpoint.")
+                fix = (f"obs group(s): {fm_depth_groups(self.env)} -- the generator's own group "
+                       "IS installed, so this is a per-camera RESOLUTION mismatch (or a "
+                       "checkpoint trained on a different number of cameras). Re-install it at "
+                       "the resolution the checkpoint states with "
+                       "g1_depth_env_cfg.install_fm_depth_group(env_cfg, W, H) "
+                       "(read_fm_extero_meta reads it), which is what play.py does from "
+                       "--fm_checkpoint.")
             raise RuntimeError(
                 f"the FM checkpoint conditions on {want[0]} sensor row(s) of {want[1]} "
                 f"values, but this env serves {count} of {dim}. {fix}"

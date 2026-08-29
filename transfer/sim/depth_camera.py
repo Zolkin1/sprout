@@ -43,6 +43,7 @@ if _TRANSFER not in sys.path:
     sys.path.insert(0, _TRANSFER)
 
 from deploy.depth_obs import (  # noqa: E402
+    camera_key,
     invalid_depth_value,
     normalize_depth_np,
     pinhole_ray_directions,
@@ -127,6 +128,11 @@ class _Camera:
         """
         self.obs_term = str(spec["obs_term"])
         self.sensor = str(spec.get("sensor", self.obs_term))
+        # WHICH PHYSICAL LENS this is, independent of which artifact named it -- the
+        # generator's own sampling of a camera carries an `fm_` prefix, and the tracker's
+        # camera list is a subset of the generator's, so two casters cannot be lined up by
+        # position. See deploy.depth_obs.camera_key.
+        self.key = camera_key(spec)
         self.width, self.height = int(spec["width"]), int(spec["height"])
         self.max_distance = float(spec["max_distance"])
         self.norm = {
@@ -184,11 +190,16 @@ class _Camera:
 
 
 class MujocoDepthCameras:
-    """The policy's depth cameras, cast against a MuJoCo scene.
+    """The deployment's depth cameras, cast against a MuJoCo scene.
 
     Built once from the camera contract carried in the ONNX artifacts, then called every
-    control step.  Both IsaacLab cameras update at the control rate (50 Hz), so there is
+    control step.  Every IsaacLab camera updates at the control rate (50 Hz), so there is
     no staleness or latency model to reproduce -- one cast per step is exact.
+
+    One instance casts ONE grid, so it holds the UNION of the tracker's and the generator's
+    cameras (they read the same lenses, the policy just reads fewer of them) and each
+    consumer selects its own rows by name.  A second instance exists only when the two
+    sample a shared lens on different GRIDS, which one array cannot hold.
     """
 
     def __init__(
@@ -202,7 +213,8 @@ class MujocoDepthCameras:
 
         Args:
             mj_model: The loaded MuJoCo model.
-            spec: The depth-camera contract (``policy.get_depth_camera_spec()``).
+            spec: The depth-camera contract to cast -- ``policy.get_depth_camera_spec()``,
+                which is the union of both artifacts' cameras.
             self_scan_group: Geom group of the robot's visual meshes, so the robot
                 occludes itself as it does in training.
             terrain_group: Geom group of the terrain.
@@ -310,12 +322,19 @@ class MujocoDepthCameras:
             cam.offset_rot = cam.nominal_offset_rot @ _euler_xyz_to_matrix(euler)
 
     def mirror_extrinsics_from(self, other: "MujocoDepthCameras") -> None:
-        """Adopt another instance's sampled mount poses, camera by camera.
+        """Adopt another instance's sampled mount poses, camera BY CAMERA NAME.
 
         For the case where the generator samples the same physical lenses on its own grid:
         one camera cannot be in two places, so the two casters must share the mount
         perturbation. Mirrors ``mdp.events.depth.randomize_camera_extrinsics`` with a
         ``sensor_cfgs`` list on the IsaacLab side, so sim2sim reproduces the same coupling.
+
+        ``other`` may hold FEWER cameras than this one: the tracker reads the near camera
+        alone while the generator reads both, so the shared camera takes the tracker's draw
+        and a camera only this caster has keeps whatever mount it already carries (its own
+        draw, if the caller jittered it first). Matching by name is what makes that safe --
+        by position, a one-camera tracker would hand its near mount to the generator's near
+        camera or its far one depending only on list order.
 
         Only the mount is copied -- the per-frame noise draws stay independent, since they
         cannot be shared across differing pixel counts anyway.
@@ -324,16 +343,17 @@ class MujocoDepthCameras:
             other: The caster whose sampled mounts to adopt (typically the tracker's).
 
         Raises:
-            ValueError: On a camera-count mismatch, or if a corresponding pair does not
-                share a NOMINAL mount -- which would mean they are not one physical camera
-                and must not share a perturbation.
+            ValueError: If no camera here is also in ``other`` (two casters describing
+                disjoint cameras are not two samplings of one rig), or if a matched pair does
+                not share a NOMINAL mount -- which would mean they are not one physical
+                camera and must not share a perturbation.
         """
-        if len(self.cameras) != len(other.cameras):
-            raise ValueError(
-                f"cannot mirror mounts: {len(self.cameras)} camera(s) here against "
-                f"{len(other.cameras)} there."
-            )
-        for mine, theirs in zip(self.cameras, other.cameras):
+        theirs_by_key = {cam.key: cam for cam in other.cameras}
+        matched = 0
+        for mine in self.cameras:
+            theirs = theirs_by_key.get(mine.key)
+            if theirs is None:
+                continue                     # only this caster has it; it keeps its own draw
             if not (np.allclose(mine.nominal_offset_pos, theirs.nominal_offset_pos, atol=1e-9)
                     and np.allclose(mine.nominal_offset_rot, theirs.nominal_offset_rot,
                                     atol=1e-9)):
@@ -343,6 +363,13 @@ class MujocoDepthCameras:
                 )
             mine.offset_pos = theirs.offset_pos.copy()
             mine.offset_rot = theirs.offset_rot.copy()
+            matched += 1
+        if not matched:
+            raise ValueError(
+                f"cannot mirror mounts: none of {[c.key for c in self.cameras]} is also in "
+                f"{[c.key for c in other.cameras]}, so these are not two samplings of one "
+                "camera rig."
+            )
 
     def compute(self, mj_data, want_hits: bool = False, want_raw: bool = False):
         """Cast every camera and return the normalised images (and optionally hit points).

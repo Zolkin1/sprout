@@ -56,6 +56,7 @@ from .clf_weights import WALKING_Q_weights, WALKING_R_weights
 from .g1_depth_env_cfg import (
     G1TeacherTerrainDepthEnvCfg,
     G1TeacherTerrainDepthObservationsCfg,
+    install_fm_depth_group,
 )
 from .g1_teacher_env_cfg import (
     REFERENCE_NUM_EE_FRAMES,
@@ -239,3 +240,18 @@ class G1FinetuneTerrainDepthEnvCfg(G1TeacherTerrainDepthEnvCfg):
 
     observations: G1FinetuneObservationsCfg = G1FinetuneObservationsCfg()
     commands: G1FinetuneCommandsCfg = G1FinetuneCommandsCfg()
+
+    def __post_init__(self):
+        """The depth teacher's setup, then the two things running a GENERATOR requires."""
+        super().__post_init__()
+        # The generator runs every step here (teacher-forced, but still conditioned on the
+        # cameras), and it reads BOTH of them where the inherited policy group reads the near
+        # one alone -- see g1_depth_env_cfg. Installing the group at the policy's resolution
+        # points its terms at the EXISTING scene sensors, so the far camera starts being cast
+        # (which is the cost of having a generator in the loop) and the near one is not cast
+        # twice. Without this the generator would silently condition on one camera.
+        install_fm_depth_group(self)
+        # And the world it reads must be the world it was recorded in: the teacher's training
+        # scene renders no decoration, the recordings the generator was fitted on did, and a
+        # vertical surface it has never seen is what it misreads as a box.
+        self.scene.terrain.render_decor = True

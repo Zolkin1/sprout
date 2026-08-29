@@ -665,15 +665,28 @@ def _tracker_cfgs():
 
 @pytest.mark.parametrize("index", [0, 1], ids=["height_scan", "depth"])
 def test_tracker_env_has_no_rewards_and_no_clip_graded_termination(index):
+    """Both tracker envs carry no reward, no clip-graded termination and no critic group."""
     pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+
+    from robot_rl.tasks.manager_based.robot_rl import mdp
 
     cfg = _tracker_cfgs()[index]()
     assert [k for k in vars(cfg.rewards) if not k.startswith("_")] == []
     terms = {k for k in vars(cfg.terminations) if not k.startswith("_")}
     assert terms == {"time_out", "base_fallen"}, terms
-    # Only the two ACTOR groups: the privileged critic group is where the last clip-derived
-    # observation lived (tracking_error_global), and nothing here trains.
-    assert [k for k in vars(cfg.observations) if not k.startswith("_")] == ["policy", "reference"]
+    # The two ACTOR groups -- the privileged critic group is where the last clip-derived
+    # observation lived (tracking_error_global), and nothing here trains -- plus, on the
+    # depth variant, the GENERATOR's own camera group. ``fm_depth`` is NOT a third actor
+    # group: ``mdp.rl_depth_groups`` excludes it, so nothing the policy sees reads it; it
+    # exists because the policy is conditioned on the near camera alone and the generator
+    # still needs both (see test_depth_tracker_carries_the_cameras_its_generator_needs).
+    groups = [k for k in vars(cfg.observations) if not k.startswith("_")]
+    expected = ["policy", "reference"]
+    # Keyed on the SCENE, not on the parametrisation index: the generator group exists
+    # exactly where there are cameras for it to cover.
+    if hasattr(cfg.scene, "depth_camera_near"):
+        expected.append(mdp.FM_DEPTH_OBS_GROUP)
+    assert groups == expected, groups
     assert cfg.commands.traj_ref.strict_fm_only is True
     # Nothing re-anchors the clip: no env reads its reference.
     assert cfg.commands.traj_ref.ego_anchor_fraction == 0.0
@@ -685,29 +698,75 @@ def test_tracker_env_has_no_rewards_and_no_clip_graded_termination(index):
 
 
 def test_depth_tracker_carries_the_cameras_its_generator_needs():
-    """The reason this variant exists: a depth FM reads cameras off the SCENE.
+    """The GENERATOR reads EVERY camera on the scene; the POLICY reads a strict subset.
 
+    The reason this variant exists at all: a depth FM reads cameras off the SCENE.
     ``FmTrackingCommand._read_extero`` picks the sensor from the CHECKPOINT, so a
     depth-trained generator in the height-scan task raises looking for terms that are not
     there. Depth is ``FlowMatchingConfig``'s default, so without this env a default-trained
     FM had no task to run in at all.
+
+    Since the policy is conditioned on the NEAR camera alone, "the cameras its generator
+    needs" is no longer "the cameras the policy observes", and three things are pinned here
+    because each fails silently:
+
+    * **Coverage.** The generator's group must name every depth camera the scene carries.
+      Miss one and ``mdp.fm_depth_groups`` still resolves, the recorder stamps a one-camera
+      ``depth_camera_spec``, the FM trains on it, ``export_fm_onnx`` emits a matching graph
+      and the deploy-time agreement check PASSES -- every artifact self-consistent about a
+      half-blind generator, indistinguishable from a deliberate one-camera design.
+    * **Subset direction.** There is ONE physical pair; the policy reads part of it. A
+      policy camera the generator lacks is a tracker reading a lens its reference was never
+      placed from, and ``GenTrackerPolicy._resolve_depth_cameras`` refuses that pair at
+      load -- a failure this env cfg can create and only deploy would find.
+    * **Order.** Near-then-far in both contracts. The FM builds one CNN trunk per camera
+      bound BY INDEX, each with its own angular position embedding (the cones are 100x70
+      and 70x42 deg), so a swapped order is shape-clean and silently wrong.
     """
     pytest.importorskip("isaaclab.envs", exc_type=ImportError)
+    from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg
+
+    from robot_rl.tasks.manager_based.robot_rl import mdp
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+        assert_fm_depth_group_covers_every_camera,
+        depth_camera_specs_from_cfg,
+    )
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_tracker_env_cfg import (
         G1FmTrackerTerrainDepthEnvCfg, G1FmTrackerTerrainEnvCfg,
     )
 
     depth = G1FmTrackerTerrainDepthEnvCfg()
-    assert depth.scene.depth_camera_near is not None
-    assert depth.scene.depth_camera_far is not None
-    assert depth.observations.policy.depth_near is not None
-    assert depth.observations.policy.depth_far is not None
+
+    def _cameras(group: str) -> list[str]:
+        """The sensors one observation group's depth terms name, in observation order."""
+        return [spec["sensor"] for spec in depth_camera_specs_from_cfg(
+            observations=depth.observations, scene=depth.scene, group=group)]
+
+    # Read off the SCENE rather than restated, so a third camera is covered by the same
+    # assertion instead of needing this list edited.
+    on_scene = [name for name, sensor in vars(depth.scene).items()
+                if isinstance(sensor, MultiMeshRayCasterCameraCfg)]
+    assert on_scene == ["depth_camera_near", "depth_camera_far"], on_scene
+
+    generator = _cameras(mdp.FM_DEPTH_OBS_GROUP)
+    policy = _cameras("policy")
+    assert generator == on_scene, "the generator must see every camera the robot has"
+    assert policy == ["depth_camera_near"]
+    assert set(policy) < set(generator), "the policy reads part of one physical pair"
+    # Subset ORDER too: the shared cameras appear in the same order in both contracts.
+    assert [c for c in generator if c in set(policy)] == policy
+
+    # The production guard agrees with the assertions above, run over the real cfg.
+    assert_fm_depth_group_covers_every_camera(depth)
+
     # Depth REPLACES the scan in the policy branch, as on the depth teacher.
     assert depth.observations.policy.height_scan is None
 
     scan = G1FmTrackerTerrainEnvCfg()
     assert not hasattr(scan.scene, "depth_camera_near")
     assert scan.observations.policy.height_scan is not None
+    # ...and with no cameras there is no generator group to install.
+    assert not hasattr(scan.observations, mdp.FM_DEPTH_OBS_GROUP)
 
 
 def test_tracker_runner_does_not_load_a_critic():

@@ -85,8 +85,9 @@ class ClipTerrainLayout:
     # (x, y) for a tile is ``tile_corner[:2] + overlay["pos_xy"]`` (Phase-3 reset).
     terrain_overlays: dict[int, list[dict]] = field(default_factory=dict)
     # The VISUAL-ONLY decoration, assembled and centred exactly like the ground mesh but kept
-    # out of it. ``None`` for an undecorated library. Carried on the layout rather than added
-    # to ``assemble_clip_terrain``'s return tuple so every existing caller is unaffected.
+    # out of it. ``None`` for an undecorated library, and for ``render_decor=False``. Carried
+    # on the layout rather than added to ``assemble_clip_terrain``'s return tuple so every
+    # existing caller is unaffected.
     decor_mesh: object | None = None
 
 
@@ -303,6 +304,20 @@ def _flat_decor_overlays(lib, flat_fp: tuple[float, float],
     got the 2.0 while training got the 20.0. Absolute coordinates resolved offline would land
     in the wrong place the moment it moved. This adds the centre back.
 
+    **There is no ``render_decor`` argument, deliberately.** This used to take one and return
+    early on it, which put the ONLY validation of ``flat_tile_decor`` content
+    (:func:`_overlays_from_manifest`, which refuses an unknown ``kind`` and a non-zero ``yaw``)
+    behind the flag: a malformed room was accepted by a decor-off teacher and then raised
+    hours later on the recorder or the eval, which run with decoration on. Manifest-borne
+    decor never had that asymmetry -- it is validated in the specs loop whatever the flag says
+    -- so the rooms are built and validated here unconditionally and :func:`_tile_mesh` drops
+    them, which is the single suppression point it claims to be. It costs a few boxes per flat
+    tile that are then discarded.
+
+    That is also why the flag cannot be applied here: a room overlay with ``decor=False``
+    (``DecorateConfig.wall_collidable``) is WALKABLE, so dropping it under ``render_decor=False``
+    would move the ground mesh -- the one thing the flag must never do.
+
     Args:
         lib: The loaded clip library.
         flat_fp: The flat tile footprint, in metres.
@@ -310,7 +325,7 @@ def _flat_decor_overlays(lib, flat_fp: tuple[float, float],
 
     Returns:
         Overlay configs in the tile's local-corner frame; empty when the library carries no
-        flat decor, which is every library predating it.
+        flat decor (every library predating it).
     """
     raw = lib.attrs.get("flat_tile_decor") if getattr(lib, "attrs", None) else None
     if not raw:
@@ -358,6 +373,7 @@ def _tile_mesh(
     footprint: tuple[float, float],
     blocks: list[TerrainBlockCfg],
     overlays: list[OverlayVolumeCfg] | None = None,
+    render_decor: bool = True,
 ) -> tuple[trimesh.Trimesh, list[dict], trimesh.Trimesh | None]:
     """Concatenated mesh of one tile (composite blocks + overlays) in local coords.
 
@@ -370,13 +386,18 @@ def _tile_mesh(
     ``decor_mesh`` is ``None`` when the tile has no decoration, which is every tile in an
     undecorated library.
 
+    ``render_decor=False`` is the SINGLE suppression point for the decoration channel: the
+    decor overlays are dropped here, after the split and before anything is meshed, so no
+    caller can add a decor source that escapes it. The walkable half of the split is untouched
+    by the flag, which is what makes the ground mesh byte-identical either way.
+
     An empty ``blocks`` builds a NO-GROUND tile: only the overlay volumes are meshed (a
     self-supporting structure such as a floating staircase), with no flat ground plane filling the
     footprint. ``composite_terrain`` requires a base block, so that path is built directly here; the
     per-overlay metadata mirrors ``composite_terrain``'s so downstream consumers are unaffected.
     """
     overlays = list(overlays or [])
-    decor_cfgs = [o for o in overlays if getattr(o, "decor", False)]
+    decor_cfgs = ([o for o in overlays if getattr(o, "decor", False)] if render_decor else [])
     overlays = [o for o in overlays if not getattr(o, "decor", False)]
     decor_mesh = None
     if decor_cfgs:
@@ -442,6 +463,7 @@ def assemble_clip_terrain(
     size_margin: float = 1.0,
     flat_buffer: float = DEFAULT_FLAT_BUFFER,
     transition_back_buffer: float = 1.0,
+    render_decor: bool = True,
 ) -> tuple[trimesh.Trimesh, torch.Tensor, ClipTerrainLayout]:
     """Build the whole terrain mesh + env origins from a clip library manifest.
 
@@ -469,6 +491,10 @@ def assemble_clip_terrain(
             directly -- drew flat tiles 36 m smaller than the ones training built.
         transition_back_buffer: Flat (m) prepended to each transition tile BEHIND
             the robot's start (the clip is shifted forward by this much).
+        render_decor: Build the VISUAL-ONLY decoration (``decor=True`` overlays -- tile walls,
+            flat-tile rooms, clutter). ``False`` returns ``layout.decor_mesh is None`` and
+            leaves the ground mesh, the tile corners and the origins byte-identical; see
+            :func:`_tile_mesh`, which is where the suppression happens.
 
     Returns:
         ``(mesh, origins[num_rows, num_tiles, 3], layout)`` -- the concatenated
@@ -567,6 +593,7 @@ def assemble_clip_terrain(
         specs.append((tid, 4, box_fp, ground, 0.0, _overlays_from_manifest(m)))
         clip_size_y[tid], type_code[tid] = float(m["size_y"]), 4
     for _i_flat in range(n_flat):
+        # Built (and VALIDATED) whatever ``render_decor`` says; _tile_mesh does the dropping.
         specs.append((_FLAT_TERRAIN_ID, 0, flat_fp,
                       [FlatBlockCfg(size_x=flat_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})], 0.0,
                       _flat_decor_overlays(lib, flat_fp, _i_flat)))
@@ -617,7 +644,7 @@ def assemble_clip_terrain(
         xoff = r * rep_w                                    # replicas side-by-side in x
         for c, (tid, _tc, fp, blocks, cxoff, overlays) in enumerate(specs):
             x, y = xoff + base_xy[c][0], base_xy[c][1]
-            m, ov_meta, dm = _tile_mesh(fp, blocks, overlays)
+            m, ov_meta, dm = _tile_mesh(fp, blocks, overlays, render_decor)
             m.apply_translation((x, y, 0.0))
             meshes.append(m)
             if dm is not None and len(dm.faces):

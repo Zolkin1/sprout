@@ -69,6 +69,7 @@ from .g1_depth_env_cfg import (
     G1TeacherTerrainDepthEnvCfg,
     G1TeacherTerrainDepthObservationsCfg,
     apply_depth_play_trims,
+    install_fm_depth_group,
 )
 from .g1_teacher_env_cfg import REPLAN_PERIOD_K, G1TeacherObservationsCfg
 from .g1_teacher_terrain_env_cfg import G1TeacherTerrainEnvCfg
@@ -225,6 +226,11 @@ class G1FmTrackerTerrainEnvCfg(G1TeacherTerrainEnvCfg):
         """
         super().__post_init__()
         self.rewards = G1TrackerRewardCfg()
+        # ``scene.terrain.render_decor`` is deliberately left at the teacher's (off) here,
+        # unlike the DEPTH tracker below. Decoration is visual-only and lives on the
+        # collider-less ``/World/decor`` prim, which a height scan -- a ray cast at
+        # ``/World/ground`` alone -- cannot reach. Both this task's policy and its generator
+        # read that scan, so rendering the walls would change nothing either of them sees.
 
 
 def _apply_tracker_play_trims(cfg) -> None:
@@ -326,6 +332,24 @@ class G1FmTrackerTerrainDepthEnvCfg(G1TeacherTerrainDepthEnvCfg):
         """Run the depth teacher's setup, then re-impose the generator/clip barrier."""
         super().__post_init__()
         self.rewards = G1TrackerRewardCfg()
+        # THE GENERATOR READS BOTH CAMERAS; the inherited policy group reads the near one
+        # alone (g1_depth_env_cfg). This is what puts the far camera back in front of an
+        # observation term -- without it ``mdp.fm_depth_groups`` returns None = "every
+        # group", ``FmTrackingCommand._read_extero`` would hand a two-camera generator ONE
+        # camera, and the resulting shape mismatch is the good case; a one-camera checkpoint
+        # would simply run half blind. At the policy's own resolution the group's terms point
+        # at the EXISTING scene sensors, so nothing is cast twice and the DR is untouched;
+        # ``play.py`` re-installs it at the checkpoint's resolution when the generator
+        # samples its own grid.
+        install_fm_depth_group(self)
+        # DECORATION BACK ON. The teacher's training scene renders none of it (the tile
+        # walls, the flat-tile rooms, a clutter sidecar) because nothing in this stack avoids
+        # obstacles and it only costs depth pixels over a 12k-iteration run. The generator is
+        # the opposite case: it reads terrain from the cameras and was recorded with the
+        # decoration visible, so driving it against a bare world is off-distribution in the
+        # one variable it conditions on -- and a vertical surface it has never seen is what
+        # it misreads as a box.
+        self.scene.terrain.render_decor = True
         # The depth teacher is a BODY-tracking env, and FmTrackingCommand refuses body mode:
         # the body CLF grades 13 '@root' links the generator does not predict, so under
         # strict_fm_only they would all be NaN. Nothing is lost here -- this task's CLF is
