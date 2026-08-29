@@ -134,7 +134,7 @@ def main() -> int:
     p.add_argument("--library", default="trajectories/skills/library_v2")
     p.add_argument("--stride-bank", default=None, help="Stride bank .npz (default <work-dir>/stride_bank.npz).")
     p.add_argument("--families-dir", default=None, help="Where the per-family .h5 go (default <work-dir>/families).")
-    p.add_argument("--stage", default="all", choices=["all", "0", "a", "b", "c", "d"])
+    p.add_argument("--stage", default="all", choices=["all", "0", "a", "b", "c", "d", "e"])
     p.add_argument("--device", default="cpu")
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--config", required=True,
@@ -350,6 +350,15 @@ def main() -> int:
             compose += ["--flat-from", flat_h5, "--flat-tiles", str(cfg.flat_tiles),
                         "--flat-clips", str(n_flat_clips)]
         _run("compose", "compose_terrain_library.py", compose)
+
+    # --- stage e: the LIBRARY GATE ------------------------------------------------------------------
+    # Last, and it fails the build rather than printing. Everything before this is a report a human
+    # reads; a 9.8% flat root-speed blow-up shipped in g1_mb_v8 and was found only by watching a clip
+    # render, which is not a process. The thresholds check what is unambiguous -- a speed nothing
+    # correct reaches, and a pelvis outside the range a standing robot can occupy -- because a gate
+    # that argues about quality gets switched off.
+    if stage in ("all", "e"):
+        _run("gate", "mb_qc.py", ["--lib", args.out, "--gate"])
 
     print(f"\n===== MB library: {args.out}  (total {time.time() - t0:.0f}s) =====")
     return 0

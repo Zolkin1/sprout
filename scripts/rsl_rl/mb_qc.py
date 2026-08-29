@@ -317,6 +317,24 @@ def _speed_buckets(rows: list[dict], edges: list[float]) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--lib", required=True, help="Clip library .h5 to report on.")
+    p.add_argument("--gate", action="store_true",
+                   help="Exit non-zero if the library fails the quality thresholds below. The build "
+                        "driver runs this as its last stage, so a bad library fails the build instead "
+                        "of being written and looked at later -- which is how a 9.8%% flat root-speed "
+                        "blow-up shipped in g1_mb_v8 and was only found by watching a clip.")
+    p.add_argument("--gate-max-root-speed", type=float, default=6.0,
+                   help="No clip may contain a frame faster than this (m/s). The library's own exact "
+                        "looped replays peak at 3.82 and the worst sound in-betweening at 4.84, so "
+                        "6.0 sits above everything correct with margin; the blow-ups it exists to "
+                        "catch ran 19-31.")
+    p.add_argument("--gate-pelvis-band", type=float, nargs=2, default=(0.40, 0.95),
+                   metavar=("MIN", "MAX"),
+                   help="Pelvis height above the LOWER FOOT (m), not above the world. Absolute height "
+                        "is wrong on terrain -- a pure-stairs clip legitimately reaches 3.10 m as it "
+                        "climbs -- while the pelvis-to-foot distance is a property of the ROBOT and "
+                        "needs no terrain knowledge at all. Measured over the whole library it spans "
+                        "0.511-0.757 m (p01 0.614, p99 0.753), so this band clears everything correct "
+                        "and still catches a robot collapsed on the floor or launched into the air.")
     p.add_argument("--top", type=int, default=10, help="List this many worst clips per ranking key.")
     p.add_argument("--ramp-s", type=float, default=0.4,
                    help="Regime window (s) around a command change; matches mb_env.regime_weight's default.")
@@ -454,6 +472,44 @@ def main() -> int:
               f"{plan.get('approach')} -> {plan.get('exit')}) ---")
         for k, v in plan["seam"].items():
             print(f"    {k:24s} {v}")
+    if args.gate:
+        _names = list(lib.meta["pos_output_names"])
+        try:
+            _LZ = _names.index("left_ankle_roll_link:pos_z")
+            _RZ = _names.index("right_ankle_roll_link:pos_z")
+        except ValueError:
+            raise SystemExit("--gate needs the ankle position channels; this library has none")
+        # THE BACKSTOP. Everything above is a report a human reads; this is the number that fails a
+        # build. It deliberately checks only what is unambiguous -- a speed nothing correct reaches,
+        # and a pelvis outside the range a standing robot can occupy -- because a gate that argues
+        # about quality gets turned off, and one that catches broken motion does not.
+        fails = []
+        for i in idx:
+            n = int(lib.clip_len[i])
+            p_xy = np.asarray(lib.y_des[i, :n, 0:2])
+            sp = float((np.linalg.norm(np.diff(p_xy, axis=0), axis=1) / dt).max()) if n > 1 else 0.0
+            # SURFACE-RELATIVE by construction: the lower foot IS the surface, whatever height it
+            # is at, so this needs nothing from the terrain manifest and cannot be fooled by a clip
+            # that climbs.
+            h = (np.asarray(lib.y_des[i, :n, 2])
+                 - np.minimum(np.asarray(lib.y_des[i, :n, _LZ]), np.asarray(lib.y_des[i, :n, _RZ])))
+            lo_b, hi_b = float(min(args.gate_pelvis_band)), float(max(args.gate_pelvis_band))
+            if sp > args.gate_max_root_speed:
+                fails.append(f"clip {i}: root speed {sp:.2f} > {args.gate_max_root_speed} m/s")
+            if float(h.max()) > hi_b:
+                fails.append(f"clip {i}: pelvis {float(h.max()):.2f} m above its lower foot > {hi_b}")
+            if float(h.min()) < lo_b:
+                fails.append(f"clip {i}: pelvis {float(h.min()):.2f} m above its lower foot < {lo_b}")
+        if fails:
+            print(f"\n[mb_qc] GATE FAILED: {len(fails)} problem(s) in {len(idx)} clips")
+            for line in fails[:20]:
+                print(f"  {line}")
+            if len(fails) > 20:
+                print(f"  ... and {len(fails) - 20} more")
+            return 1
+        print(f"\n[mb_qc] gate PASSED over {len(idx)} clips (root speed <= "
+              f"{args.gate_max_root_speed} m/s, pelvis above its lower foot in "
+              f"{tuple(args.gate_pelvis_band)} m)")
     return 0
 
 

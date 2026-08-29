@@ -93,6 +93,43 @@ class FlatClipPlan:
         return [p for p in self.pieces if isinstance(p, Loop)]
 
 
+# The smallest gait phase a loop may HAND OFF at, in bank frames.
+#
+# A transient is context-seeded from the outgoing loop via ``transient_context_phase``, which walks
+# BACK ``(nfpt - 1) * step`` frames from the hand-off phase to find the window's start -- nfpt = 4
+# frames at the model's 30 fps against the bank's 50 Hz, so ``step = 5/3`` and the window spans
+# exactly 5.0 bank frames. Hand off below that and the start phase goes NEGATIVE: the sampled context
+# wraps around the stride's closure seam and stops describing the motion the loop was actually
+# doing -- the root barely advances, or advances backwards -- so Motion Bricks is handed a history of
+# a near-stationary robot and asked to continue at speed. It reconciles the two by sprinting.
+#
+# Measured over the quick build's 46 flat transients, and the separation is total:
+#
+#     phase_out <  5   n= 7   peak root speed p50  9.80  max 19.51   5 of 7 over 6 m/s
+#     phase_out >= 5   n=39   peak root speed p50  1.95  max  4.39   0 of 39
+#
+# Every blow-up in the library had a hand-off phase below 5, and none above it did. It is not the
+# velocity change: |dv| correlates +0.05 with the peak, phase_out/period correlates -0.42.
+#
+# Forbidding it costs 10.9% of the phase circle on average (periods run 28-106 frames), and nothing
+# else: ``loop_frames_for`` honours any hand-off phase, so a floor here only removes choices that
+# were producing unusable motion. PREVENTED rather than gated, which matters because the generator is
+# deterministic given its inputs -- a retry reproduces the same blow-up exactly (verified: three
+# seeds, byte-identical output), so a rejected transient could never be recovered, only lost.
+MIN_HANDOFF_PHASE = 5
+
+
+def draw_handoff_phase(rng, period: int) -> int:
+    """A gait phase a loop may hand off at: uniform over the period, minus the wrapping band.
+
+    See :data:`MIN_HANDOFF_PHASE`. Falls back to the whole circle for a period too short to have a
+    safe band, which no stride in the shipped bank is (the shortest is 28 frames).
+    """
+    period = max(1, int(period))
+    lo = MIN_HANDOFF_PHASE if period > MIN_HANDOFF_PHASE + 1 else 0
+    return int(rng.integers(lo, period))
+
+
 def loop_frames_for(phase0: int, phase_out: int, period: int, want: int, *, min_frames: int) -> int:
     """Frame count for a loop entered at ``phase0`` whose LAST frame must sit on ``phase_out``.
 
@@ -193,7 +230,7 @@ def sample_plan(name: str, rng, *, bank_periods, bank_vel, schedule, n_frames: i
         s_in = nearest_stride(bank_vel, cmd)
         period = int(bank_periods[s_in])
         p_in = int(rng.integers(0, max(1, period)))
-        p_out = int(rng.integers(0, max(1, period)))
+        p_out = draw_handoff_phase(rng, period)
         n_loop = loop_frames_for(p_in, p_out, period, int(round(float(dur) / dt)),
                                  min_frames=max(min_hold, period))
         # A transient's own length is Motion Bricks' choice and is not known yet, so reserve its WORST
@@ -246,7 +283,7 @@ def plan_from_holds(name: str, holds, rng, *, bank_periods, bank_vel, n_frames: 
         s_in = nearest_stride(bank_vel, cmd)
         period = int(bank_periods[s_in])
         p_in = int(rng.integers(0, max(1, period)))
-        p_out = int(rng.integers(0, max(1, period)))
+        p_out = draw_handoff_phase(rng, period)
         if pieces:                                    # opens on a loop, like the flat plans
             pieces.append(Transient(stride_out=prev_stride, phase_out=prev_phase, stride_in=s_in,
                                     phase_in=p_in, key=f"{name}_t{j}", cmd_vel=cmd))
@@ -379,7 +416,8 @@ def plan_from_distance_holds(name: str, holds, rng, *, bank_periods, bank_vel, d
         period = int(bank_periods[s_in])
         first, last = (j == 0), (j == len(holds) - 1)
         p_in = int(phase_in0 % period) if (first and phase_in0 is not None)             else int(rng.integers(0, max(1, period)))
-        p_out = int(phase_out_last % period) if (last and phase_out_last is not None)             else int(rng.integers(0, max(1, period)))
+        p_out = int(phase_out_last % period) if (last and phase_out_last is not None) \
+            else draw_handoff_phase(rng, period)
         # Duration DERIVED from the distance at the stride's own achieved speed. A standing stride
         # travels nothing, so a distance cannot be converted -- fall back to one period, which is the
         # shortest thing that is still a steady stretch.
