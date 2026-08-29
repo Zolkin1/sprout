@@ -247,14 +247,15 @@ def main() -> int:
                     "--stride-bank", bank, "--dump-plan", flat_plans,
                     "--n-clips", str(n_flat_clips), "--clip-length", str(cfg.flat_clip_length),
                     "--hold-s-range", *(str(v) for v in cfg.flat_hold_s_range),
-                    # The CONTINUOUS command space the clips record. Same bands the old flat path used,
-                    # so the command distribution is unchanged by the loop redesign -- what changed is
-                    # that the motion snaps to the nearest bank stride while the command does not.
-                    "--walk-vx-range", *(str(v) for v in cfg.flat_walk_vx_range),
-                    "--run-vx-range", *(str(v) for v in cfg.flat_run_vx_range),
-                    "--back-vx-range", *(str(v) for v in cfg.flat_back_vx_range),
-                    "--side-vy", str(cfg.flat_side_vy), "--turn-max", str(cfg.flat_turn_max),
-                    "--stand-frac", str(cfg.flat_stand_frac),
+                    # The DRIVER'S ENVELOPE, sampled continuously -- one range per channel, not a set
+                    # of mode bands. The motion snaps to the nearest bank stride; the command does not.
+                    "--vx-range", *(str(v) for v in cfg.flat_vx_range),
+                    "--vy-range", *(str(v) for v in cfg.flat_vy_range),
+                    "--wz-range", *(str(v) for v in cfg.flat_wz_range),
+                    "--mass-stand", str(cfg.flat_mass_stand),
+                    "--mass-sidestep", str(cfg.flat_mass_sidestep),
+                    "--strata-width", str(cfg.flat_strata_width),
+                    "--speed-quota", cfg.flat_speed_quota,
                     "--seed", str(cfg.seed)])
             _run("flat-transients", "mb_flat_transients.py", [
                 "--mb-root", args.mb_root, "--stride-bank", bank, "--plans", flat_plans,
@@ -263,25 +264,16 @@ def main() -> int:
                 "--min-transient-s", str(cfg.flat_min_transient_s),
                 "--hop-slack", str(cfg.flat_hop_slack), "--seed", str(cfg.seed)],
                 conda_env=args.conda_env)
-        n_have = len(glob.glob(os.path.join(_REPO, raw_flat, "*.npz")))
-        if cfg.flat_loops:
-            pass
-        elif n_have < n_flat_clips:
-            # The flat velocity bands are forwarded EXPLICITLY. They are mb_encode's own args and
-            # this driver never passed them, so the only way to change the flat family's speed
-            # distribution was to edit that file's defaults -- i.e. a library was not reproducible
-            # from the command that built it. The recipe owns them now.
-            _run("flat-gen", "mb_encode.py", [
-                "--mb-root", args.mb_root, "--stride-bank", bank, "--out-dir", raw_flat,
-                "--n-clips", str(n_flat_clips), "--clip-length", str(cfg.flat_clip_length),
-                "--seg-dur-range", *(str(v) for v in cfg.flat_seg_dur_range),
-                "--walk-vx-range", *(str(v) for v in cfg.flat_walk_vx_range),
-                "--run-vx-range", *(str(v) for v in cfg.flat_run_vx_range),
-                "--back-vx-range", *(str(v) for v in cfg.flat_back_vx_range),
-                "--side-vy", str(cfg.flat_side_vy), "--turn-max", str(cfg.flat_turn_max),
-                "--seed", str(cfg.seed)], conda_env=args.conda_env)
-        else:
-            print(f"\n===== [flat-gen] {n_have} raw flat motions present, skipping")
+        if not cfg.flat_loops:
+            # The free-running mb_encode path is GONE, not merely off. It generated the flat family
+            # as one long Motion Bricks rollout instead of exact looped strides plus bounded
+            # transients, and its own knobs (flat_seg_dur_range, rl_vels) went with the command
+            # envelope rewrite -- the schema no longer accepts them, so a recipe that asked for this
+            # path would fail on a missing attribute somewhere far from the cause. Say so here.
+            raise SystemExit(
+                "flat_loops: false selects the mb_encode rollout path, which no longer exists. The "
+                "flat family is exact looped strides plus bounded in-betweenings; there is no other "
+                "arm. Remove the key or set it true.")
     # --- stage c: splice / ingest into per-family libraries (env_isaaclab) --------------------------
     if stage in ("all", "c"):
         if not glob.glob(os.path.join(_REPO, fam_dir, "family_stairs_*.h5")):
@@ -326,11 +318,7 @@ def main() -> int:
                 "--device", args.device, "--seed", str(cfg.seed),
                 "--seam-blend-s", str(cfg.flat_seam_blend_s),
                 "--flat-anchor", cfg.flat_anchor])
-        elif not os.path.exists(os.path.join(_REPO, flat_h5)):
-            _run("flat-clips", "generate_mb_clips.py", [
-                "--raw-dir", raw_flat, "--source", args.source, "--out", flat_h5,
-                "--clip-length", str(cfg.flat_clip_length), "--device", args.device,
-                "--rl-vels", cfg.rl_vels, "--workers", str(args.workers)])
+        # (the non-loop arm is refused in stage b, above -- there is no second flat path)
     # --- stage d: one training library at the requested tile proportions ---------------------------
     if stage in ("all", "d"):
         counts = {"stairs_up": cfg.stair_tiles, "stairs_down": cfg.stair_tiles,

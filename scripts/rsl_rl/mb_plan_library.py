@@ -441,6 +441,20 @@ def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
     pin_a = float(steady_vx if pin_approach is None else pin_approach)
     pin_x = float(steady_vx if pin_exit is None else pin_exit)
 
+    # TODO(lead-in-turning): the LEAD-UP commands are forward-only (no vy, no wz). Diagonal and
+    # yawing approaches to terrain are wanted, and the geometry objection is weaker than it looks:
+    # ``align_boundary`` rigidly rotates the ENTIRE pre-anchor run so its LAST frame matches the
+    # terrain entry pose, so arrival is guaranteed by construction rather than by the approach
+    # happening to aim well -- a lead-in that turned 30 deg during its cruise arrives correctly headed
+    # and merely enters at -30 deg. And arc length >= chord, so a curved approach covers LESS
+    # downrange x than a straight one: a platform sized for the straight case always contains it.
+    # What it does cost is lateral WIDTH, which stair tiles already stretch to full ``size_y``.
+    #
+    # Deferred, not dismissed. Two parts need work first: box TOP-side segments (that platform is not
+    # widened, so ``_platform_trim`` would start firing and cutting clips), and the approach ZONE
+    # itself must stay straight -- a turn inside it changes what the camera sees mid-latch and makes
+    # the observability argument untestable. The traversal already carries vy/wz (step 9); this is
+    # the lead-up.
     def _side(total: float, is_approach: bool) -> list:
         # The zone belongs to the hold that adjoins the terrain, and is NOT available for splitting:
         # it is the stretch the entry transient consumes.

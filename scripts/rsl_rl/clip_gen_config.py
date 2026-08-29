@@ -43,12 +43,6 @@ _SCHEMA: dict[str, tuple] = {
     "flat_tiles": ("int", 1),
     # flat family
     "flat_clip_length": ("float", 1),
-    "flat_seg_dur_range": ("range", 2),
-    "flat_walk_vx_range": ("range", 2),
-    "flat_run_vx_range": ("range", 2),
-    "flat_back_vx_range": ("range", 2),
-    "flat_side_vy": ("float", 1),
-    "flat_turn_max": ("float", 1),
     # stair families
     "stair_vel_range": ("range", 2),
     "stair_floor_frac": ("float", 1),
@@ -116,17 +110,26 @@ _SCHEMA: dict[str, tuple] = {
     # state exact and leave the model only the transitions.
     "flat_loops": ("bool", 1),
     "flat_hold_s_range": ("range", 2),
+    # The driver's ENVELOPE: one continuous range per channel. Replaces the six mode/band knobs
+    # (walk/run/back vx, side_vy, turn_max, run_frac) whose structure showed up in the output as
+    # cliffs at 0.73 and 0.82 m/s and a 3.3x density step at 1.0.
+    "flat_vx_range": ("range", 2),
+    "flat_vy_range": ("range", 2),
+    "flat_wz_range": ("range", 2),
+    "flat_mass_stand": ("float", 2),
+    "flat_mass_sidestep": ("float", 2),
+    "flat_strata_width": ("float", 2),
+    "flat_speed_quota": ("choice", ("stratified", "iid")),
     # Probability a flat command segment is a full stop.  A standing HOLD (the bank has true
     # zero-velocity strides), entered via an ordinary in-betweening -- NOT the standing reset a clip
     # used to open from.
-    "flat_stand_frac": ("float", 1),
     "flat_ramp_dv": ("float", 1),
     "flat_a_max": ("float", 1),
     "flat_min_transient_s": ("float", 1),
     "flat_hop_slack": ("float", 1),
-    "approach_a_max": ("float", 2),
-    "approach_min_transient_s": ("float", 2),
-    "approach_hop_slack": ("float", 2),
+    "approach_a_max": ("float", 1),
+    "approach_min_transient_s": ("float", 1),
+    "approach_hop_slack": ("float", 1),
     "gen_attempts": ("int", 1),
     "terrain_cmd_changes_per_side": ("int", 1),
     "terrain_cmd_segments": ("int", 1),
@@ -135,7 +138,6 @@ _SCHEMA: dict[str, tuple] = {
     "min_hold_m": ("float", 2),
     # RL-visible command
     "segment_reuse": ("bool", 1),
-    "rl_vels": ("choice", ("raw", "snapped")),
     # composition
     "extra_mix": ("str", 1),
 }

@@ -43,6 +43,7 @@ from motion_gen.motionbricks import flat_plan as fp
 from motion_gen.motionbricks.mb_ingest import raw_to_world
 from motion_gen.motionbricks.raw_schema import load_raw_motion
 from motion_gen.motionbricks.stride_bank import load_stride_bank
+from motion_gen import command_schedule as cs
 from motion_gen.command_schedule import sample_command_schedule
 from motion_gen.motionbricks.terrain_splice import Piece, splice_pieces
 from motion_gen.terrain.box_clip import loop_frames
@@ -179,6 +180,25 @@ def main() -> int:
     p.add_argument("--n-clips", type=int, default=64, help="Clips to plan (pass A).")
     p.add_argument("--clip-length", type=float, default=20.0)
     p.add_argument("--dt", type=float, default=0.02)
+    p.add_argument("--vx-range", type=float, nargs=2, default=(-1.0, 3.6), metavar=("MIN", "MAX"),
+                   help="The forward command ENVELOPE -- one continuous range, what a driver will ever "
+                        "ask for, NOT what the solved library can serve. The motion is whichever stride "
+                        "is nearest; the command recorded is the continuous value. A generator only "
+                        "ever commanded speeds it had motions for cannot learn to select.")
+    p.add_argument("--vy-range", type=float, nargs=2, default=(-0.6, 0.6), metavar=("MIN", "MAX"))
+    p.add_argument("--wz-range", type=float, nargs=2, default=(-0.8, 0.8), metavar=("MIN", "MAX"))
+    p.add_argument("--mass-stand", type=float, default=0.08,
+                   help="Declared probability of an exact stop.")
+    p.add_argument("--mass-sidestep", type=float, default=0.10,
+                   help="Declared probability of a pure lateral segment at vx = 0. DECLARED, because "
+                        "it used to be an emergent 12.8%% of flat time -- the old sidestep mode set "
+                        "vx = 0 as a side effect, so nobody had chosen how much mass sat at zero.")
+    p.add_argument("--strata-width", type=float, default=0.2,
+                   help="Bookkeeping only: it QUANTIZES NOTHING, since a draw is uniform within its "
+                        "stratum. It sets how tightly a finite library realises the uniform target.")
+    p.add_argument("--speed-quota", choices=["stratified", "iid"], default="stratified",
+                   help="stratified: tile the vx axis so the empirical marginal is flat at finite "
+                        "sample size. iid: the same distribution, worse realisation -- the ablation.")
     p.add_argument("--hold-s-range", type=float, nargs=2, default=(1.5, 4.0), metavar=("MIN", "MAX"),
                    help="Requested STEADY duration per loop, before rounding to the hand-off phase. The "
                         "old flat sampler drew 1.5-3.0 s COMMAND segments, which after a ~1 s transient "
@@ -191,14 +211,6 @@ def main() -> int:
     # The command space, passed straight to command_schedule.sample_command_schedule -- the ONE sampler
     # every clip family uses.  These are the CONTINUOUS commands the clip records; each is snapped to the
     # nearest bank stride only for the motion.
-    p.add_argument("--walk-vx-range", type=float, nargs=2, default=(0.1, 1.0), metavar=("MIN", "MAX"))
-    p.add_argument("--run-vx-range", type=float, nargs=2, default=(1.0, 3.0), metavar=("MIN", "MAX"))
-    p.add_argument("--back-vx-range", type=float, nargs=2, default=(0.1, 1.5), metavar=("MIN", "MAX"))
-    p.add_argument("--side-vy", type=float, default=1.0)
-    p.add_argument("--turn-max", type=float, default=0.8)
-    p.add_argument("--stand-frac", type=float, default=0.08,
-                   help="Probability a segment is a full stop. A standing HOLD, entered via an ordinary "
-                        "in-betweening -- not the standing RESET a clip used to open from.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     args = p.parse_args()
@@ -213,13 +225,19 @@ def main() -> int:
         # per-command range the old path used: a hold has to be long enough to be worth looping (~1.5-4 s
         # against a ~1.1 s transient), or the clip is nearly all in-betweening.  lead_in_s=0 because the
         # clip now opens on a loop rather than from rest.
+        # One stratified queue for the whole batch: a clip has ~4 moving segments against 23 strata,
+        # so a per-clip queue would be all refill and no better than i.i.d. Over 3000 clips it is
+        # ~480 draws per stratum. `iid` is the honest ablation -- the same distribution, a worse
+        # realisation -- and the report will show the difference.
+        vx_draw = (cs.StratifiedSpeeds(rng, tuple(args.vx_range), args.strata_width)
+                   if args.speed_quota == "stratified" else None)
         plans = []
         for i in range(args.n_clips):
             sched = sample_command_schedule(
                 rng, duration=args.clip_length, seg_dur_range=tuple(args.hold_s_range),
-                vx_range=tuple(args.walk_vx_range), run_vx_range=tuple(args.run_vx_range),
-                back_vx_range=tuple(args.back_vx_range), side_vy=args.side_vy,
-                turn_max=args.turn_max, stand_frac=args.stand_frac, lead_in_s=0.0)
+                vx_range=tuple(args.vx_range), vy_range=tuple(args.vy_range),
+                wz_range=tuple(args.wz_range), mass_stand=args.mass_stand,
+                mass_sidestep=args.mass_sidestep, lead_in_s=0.0, vx_draw=vx_draw)
             plans.append(fp.sample_plan(f"flat{i:05d}", rng, bank_periods=bank.period_frames,
                                         bank_vel=bank.achieved_vel, schedule=sched,
                                         n_frames=t_frames, dt=args.dt, seed=args.seed + i,

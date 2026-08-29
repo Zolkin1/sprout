@@ -41,18 +41,24 @@ flat_tiles: 60
 # while keeping the 60/40 walk/run weighting.
 flat_loops: true              # exact looped strides + bounded MB transients
 flat_hold_s_range: [1.5, 4.0]  # s of STEADY loop per segment, before rounding to a gait phase
-flat_stand_frac: 0.08          # chance a flat segment is a standing hold (entered via a transient)
+flat_vx_range:  [-1.0, 3.6]    # THE DRIVER'S ENVELOPE, sampled continuously and uniformly. Not
+flat_vy_range:  [-0.6, 0.6]    # what the solved library can serve -- the motion is whichever stride
+flat_wz_range:  [-0.8, 0.8]    # is nearest, and the recorded command is the continuous value. A
+                               # generator only ever commanded speeds it had motions for cannot learn
+                               # to SELECT, and driving it then needs exactly those velocities, which
+                               # no real driver produces. At most one of vy / wz is non-zero.
+flat_mass_stand:    0.08       # declared probability of an exact stop
+flat_mass_sidestep: 0.10       # declared pure-lateral mass at vx = 0. DECLARED, because it used to be
+                               # an emergent 12.8% of flat time: the old sidestep mode set vx = 0 as a
+                               # side effect, so nobody had chosen how much mass sat at zero.
+flat_strata_width:  0.2        # variance-reduction bookkeeping ONLY -- it quantizes nothing, since a
+                               # draw is uniform WITHIN its stratum. 23 strata over [-1.0, 3.6].
+flat_speed_quota:   stratified # stratified | iid. Same distribution; iid is the honest ablation.
 flat_ramp_dv: 1.4              # max speed change per single in-betweening; bigger is split
 flat_a_max: 1.15               # m/s^2; peak accel measures ~1.75x this
 flat_min_transient_s: 0.35
 flat_hop_slack: 1.15
 flat_clip_length: 20.0          # s; every flat clip is this long, all real motion
-flat_seg_dur_range: [1.5, 5.5]  # s per command segment
-flat_walk_vx_range: [0.1, 1.0]  # also the base band for turn / diagonal segments
-flat_run_vx_range: [1.0, 3.0]   # used on the 40% of forward segments that run
-flat_back_vx_range: [0.1, 1.5]  # magnitudes; emitted as negative vx
-flat_side_vy: 1.0               # lateral (sidestep) scale
-flat_turn_max: 0.8              # yaw-rate scale (rad/s)
 
 # ---------------------------------------------------------------- stair families
 # vel_range feeds BOTH stair families: the transition tiles (mb_plan_library, via Motion Bricks) and
@@ -116,7 +122,6 @@ segment_reuse: false            # share a generated MB segment between clips wit
                                 # conditioning. OFF: with per-clip schedules two clips are only
                                 # interchangeable if their whole schedules match, and ~1.5x the
                                 # segment cost buys "every clip's motion was generated for it"
-rl_vels: raw                    # raw | snapped -- which velocity channel the flat clips carry
 
 # ---------------------------------------------------------------- terrain tile geometry (pass A)
 # The tile POPULATION and the gait phase each clip hands off at. Distribution parameters in the

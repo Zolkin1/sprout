@@ -644,7 +644,12 @@ def _run_batch(args, mb, targeter, raw_schema, plan_mod, families) -> int:
                   flush=True)
     print(f"[mb_seg] batch done: {done} generated ({stale} of them stale + regenerated), "
           f"{skipped} reused, {fail} FAILED")
-    return 1 if (fail and not done) else 0
+    # A failure costs its CLIP, not the run -- pass C already skips a clip whose segment is missing.
+    # The stage fails only when nothing at all came out of it, and REUSED counts: on a resume every
+    # good segment is cached, so ``done`` is 0 and the handful that legitimately cannot be generated
+    # would otherwise abort a build whose library is complete. Measured: with 56 cached and the 4
+    # known-divergent requests failing again, the whole build stopped.
+    return 1 if (fail and not done and not skipped) else 0
 
 
 def main() -> int:

@@ -38,46 +38,90 @@ import numpy as np
 
 # Mode weights matching the historical flat distribution: forward over-weighted 3:1 against each of
 # the other four. Passing ``vx_range`` alone (terrain) collapses to "forward" regardless.
-FLAT_MODE_WEIGHTS: dict[str, float] = {
-    "forward": 3.0, "backward": 1.0, "sidestep": 1.0, "turn": 1.0, "diagonal": 1.0,
-}
-FORWARD_ONLY: dict[str, float] = {"forward": 1.0}
-
 Schedule = list[tuple[float, float, float, float]]
 
 
-def _seg_command(rng: np.random.Generator, *, vx_range, back_vx_range, side_vy: float,
-                 turn_max: float, run_vx_range, run_frac: float, mode_weights: dict[str, float],
-                 turn_while_forward_frac: float) -> tuple[float, float, float]:
-    """One MOVING segment's ``(vx, vy, wz)``.
+class StratifiedSpeeds:
+    """A queue of forward-speed draws whose union tiles ``vx_range`` evenly at FINITE sample size.
 
-    Speeds come from explicit bands, never from a scale times a fraction: the old form could not
-    express a floor (which is why the flat family had nothing below 0.45 m/s) and it left a hole
-    between the walk and run bands. A mode whose band is degenerate is skipped by giving it zero
-    weight, so "terrain has no sidestep" needs no branch.
+    The distribution being sampled is uniform either way -- a draw is uniform WITHIN its stratum, so
+    nothing here quantizes a command and every value is a distinct real. Stratification only fixes how
+    a finite library REALISES that uniform: with i.i.d. draws a 3000-clip flat family still leaves
+    visible ripples across 23 bins, and the whole point of this step is a flat empirical marginal.
+
+    It is the same device ``_clip_speeds`` already uses for stairs ("evenly spaced ... so a tile's
+    clips tile the speed axis"), applied to the flat family's forward command.
+
+    The queue is shared across the whole flat batch rather than per clip: a clip has ~4 moving
+    segments and there are 23 strata, so a per-clip queue would be mostly refills and no better than
+    i.i.d. Over a batch it is ~480 draws per stratum.
     """
-    modes = [m for m, w in mode_weights.items() if w > 0.0]
-    weights = np.array([mode_weights[m] for m in modes], dtype=np.float64)
-    mode = str(rng.choice(modes, p=weights / weights.sum()))
-    lo, hi = float(vx_range[0]), float(vx_range[1])
-    vx = vy = wz = 0.0
-    if mode == "forward":
-        band = (run_vx_range if (run_vx_range is not None and rng.random() < run_frac) else (lo, hi))
-        vx = float(rng.uniform(float(band[0]), float(band[1])))
-        if turn_max > 0.0 and rng.random() < turn_while_forward_frac:
-            wz = float(rng.uniform(-1.0, 1.0)) * turn_max
-    elif mode == "backward":
-        b_lo, b_hi = (float(v) for v in back_vx_range)
-        vx = -float(rng.uniform(b_lo, b_hi))
-    elif mode == "sidestep":
-        vy = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.4, 1.0)) * side_vy
-    elif mode == "turn":
-        vx = float(rng.uniform(lo, lo + 0.7 * (hi - lo)))
-        wz = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.5, 1.0)) * turn_max
-    elif mode == "diagonal":
-        vx = float(rng.uniform(lo, lo + 0.8 * (hi - lo)))
-        vy = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.3, 0.7)) * side_vy
-    return vx, vy, wz
+
+    def __init__(self, rng, vx_range, width: float):
+        lo, hi = float(min(vx_range)), float(max(vx_range))
+        n = max(1, int(np.ceil((hi - lo) / max(float(width), 1e-6))))
+        self._edges = np.linspace(lo, hi, n + 1)
+        self._rng = rng
+        self._q: list[int] = []
+
+    @property
+    def n_strata(self) -> int:
+        return len(self._edges) - 1
+
+    def _refill(self) -> None:
+        order = np.arange(self.n_strata)
+        self._rng.shuffle(order)
+        self._q = [int(i) for i in order]
+
+    def __call__(self) -> float:
+        if not self._q:
+            self._refill()
+        i = self._q.pop()
+        return float(self._rng.uniform(self._edges[i], self._edges[i + 1]))
+
+
+def _seg_command(rng: np.random.Generator, *, vx_range, vy_range, wz_range,
+                 mass_stand: float, mass_sidestep: float, vx_draw=None) -> tuple:
+    """One segment's ``(vx, vy, wz)``, drawn CONTINUOUSLY over the driver's whole envelope.
+
+    **The support is what a driver or high-level policy will ever send, not what the solved library
+    can serve.** The motion is then whichever solved stride is nearest (``flat_plan.nearest_stride``)
+    and the command recorded is the continuous value, never the stride's. A generator only ever
+    commanded speeds it had motions for cannot learn to SELECT; drive it and it needs exactly those
+    velocities, which no real driver produces.
+
+    This replaced a mode/band sampler whose structure was visible in the output as cliffs, because
+    each mode drew its forward speed from a DIFFERENT sub-band:
+
+    * ``turn`` drew ``vx = U(lo, lo + 0.7*(hi-lo))`` and ``diagonal`` ``U(lo, lo + 0.8*(hi-lo))``,
+      putting hard edges at 0.73 and 0.82 m/s and confining every turn and every diagonal to walk
+      speed -- so ``jog_turn``, ``run_turn`` and ``run_forward x vy`` were solved and never commanded;
+    * ``run_frac = 0.4`` mixed a 0.9-wide walk band at density 0.67/(m/s) against a 2.0-wide run band
+      at 0.20, a 3.3x step at exactly vx = 1.0;
+    * ``sidestep`` set ``vx = 0``, so of the 21.3% of flat time at zero only 8.5% was a true stand and
+      the other 12.8% was a mass nobody chose.
+
+    Measured, the marginal came out 10.3 : 1 max/min over 0.1 m/s bins with 3.0-3.6 entirely empty.
+
+    So: draw the SUPPORT by declared mass, then the speed continuously over ONE range, then the
+    channel. ``forward`` / ``turn`` / ``diagonal`` stop being speed-selectors and become channel
+    selectors, which is the whole fix.
+
+    At most ONE of ``vy`` / ``wz`` is non-zero -- the user's constraint, and it costs nothing: zero of
+    the solved library's 233 cells carry both.
+    """
+    r = float(rng.random())
+    if r < mass_stand:
+        return 0.0, 0.0, 0.0                                  # an exact stop
+    if r < mass_stand + mass_sidestep:
+        return 0.0, float(rng.uniform(*vy_range)), 0.0        # pure lateral, the vx = 0 lateral case
+    vx = float(vx_draw()) if vx_draw is not None else float(rng.uniform(*vx_range))
+    pick = int(rng.integers(0, 3))                            # straight / lateral / yaw
+    if pick == 1:
+        return vx, float(rng.uniform(*vy_range)), 0.0
+    if pick == 2:
+        return vx, 0.0, float(rng.uniform(*wz_range))
+    return vx, 0.0, 0.0
 
 
 def sample_command_schedule(
@@ -86,33 +130,31 @@ def sample_command_schedule(
     duration: float,
     seg_dur_range,
     vx_range,
-    back_vx_range=None,
-    run_vx_range=None,
-    run_frac: float = 0.4,
-    side_vy: float = 0.0,
-    turn_max: float = 0.0,
-    stand_frac: float = 0.0,
+    vy_range=(0.0, 0.0),
+    wz_range=(0.0, 0.0),
+    mass_stand: float = 0.0,
+    mass_sidestep: float = 0.0,
     lead_in_s: float = 0.0,
-    turn_while_forward_frac: float = 0.3,
-    mode_weights: dict[str, float] | None = None,
+    vx_draw=None,
 ) -> Schedule:
     """Sample a schedule totalling EXACTLY ``duration`` seconds.
 
     Args:
         rng: Seeded generator; the schedule is a pure function of it and these arguments.
         duration: Total schedule length (s).
-        seg_dur_range: ``(min, max)`` seconds per moving segment.
-        vx_range: Forward band ``(min, max)`` m/s. Also the base band for turn / diagonal.
-        back_vx_range: Backward SPEED band (magnitudes). ``None`` disables the backward mode.
-        run_vx_range: Optional second forward band, used on ``run_frac`` of forward segments.
-            Make it contiguous with ``vx_range`` to cover a wide range with no hole.
-        run_frac: Fraction of forward segments drawn from ``run_vx_range``.
-        side_vy / turn_max: Lateral and yaw scales. ``0`` disables their modes.
-        stand_frac: Probability that a segment is a full stop instead of a move.
+        seg_dur_range: ``(min, max)`` seconds per segment.
+        vx_range: The forward envelope, ONE continuous range -- what a driver will ever ask for, not
+            what the solved library can serve.
+        vy_range / wz_range: The lateral and yaw envelopes. ``(0, 0)`` disables that channel, which is
+            how the terrain families stay forward-only without a branch.
+        mass_stand: Declared probability of an exact stop (``vx == vy == wz == 0``).
+        mass_sidestep: Declared probability of a pure lateral segment at ``vx = 0``. Declared, because
+            it used to be an EMERGENT 12.8% of flat time -- the old ``sidestep`` mode set ``vx = 0``
+            as a side effect, so nobody had chosen how much mass sat at zero.
         lead_in_s: A standing segment prepended, so a clip starts from a settled stand.
-        turn_while_forward_frac: Chance of a yaw command superimposed on a forward segment.
-        mode_weights: Relative mode weights; defaults to forward-only when no lateral/yaw/backward
-            band is given, else the flat distribution.
+        vx_draw: Optional zero-arg callable returning one forward speed, for variance reduction (see
+            :class:`StratifiedSpeeds`). It must sample the same distribution as ``vx_range``; it
+            changes the REALISATION, never the target.
 
     Returns:
         ``[(duration_s, vx, vy, wz), ...]`` summing to ``duration``.
@@ -123,17 +165,11 @@ def sample_command_schedule(
     bounded by the segment band, so the last segment can land anywhere in ``(0.5, max)`` s -- wider
     than the band itself -- but never zero or negative: the loop exits with at least 0.5 s left.
     """
-    if mode_weights is None:
-        rich = (back_vx_range is not None) or side_vy > 0.0 or turn_max > 0.0
-        mode_weights = dict(FLAT_MODE_WEIGHTS) if rich else dict(FORWARD_ONLY)
-    mode_weights = {m: w for m, w in mode_weights.items()
-                    if not (m == "backward" and back_vx_range is None)
-                    and not (m == "sidestep" and side_vy <= 0.0)
-                    and not (m == "turn" and turn_max <= 0.0)
-                    and not (m == "diagonal" and side_vy <= 0.0)}
-    if not any(w > 0 for w in mode_weights.values()):
-        raise ValueError("no command mode is enabled: give at least a forward vx_range")
+    if float(max(vx_range)) <= float(min(vx_range)) and not (mass_stand > 0 or mass_sidestep > 0):
+        raise ValueError("vx_range is degenerate and no stand / sidestep mass is declared")
 
+    kw = dict(vx_range=vx_range, vy_range=vy_range, wz_range=wz_range,
+              mass_stand=float(mass_stand), mass_sidestep=float(mass_sidestep), vx_draw=vx_draw)
     duration = float(duration)
     lo_s, hi_s = (float(v) for v in seg_dur_range)
     segs: Schedule = []
@@ -142,27 +178,16 @@ def sample_command_schedule(
         segs.append((float(lead_in_s), 0.0, 0.0, 0.0))
         t = float(lead_in_s)
     while t < duration - 0.5:
-        if stand_frac > 0.0 and rng.random() < stand_frac:
-            vx, vy, wz = 0.0, 0.0, 0.0
-        else:
-            vx, vy, wz = _seg_command(
-                rng, vx_range=vx_range, back_vx_range=back_vx_range, side_vy=side_vy,
-                turn_max=turn_max, run_vx_range=run_vx_range, run_frac=run_frac,
-                mode_weights=mode_weights, turn_while_forward_frac=turn_while_forward_frac)
+        vx, vy, wz = _seg_command(rng, **kw)
         dur = float(rng.uniform(lo_s, hi_s))
         segs.append((dur, vx, vy, wz))
         t += dur
     if not segs:                                        # duration <= 0.5 s: one segment covers it
-        segs.append((duration, *_seg_command(
-            rng, vx_range=vx_range, back_vx_range=back_vx_range, side_vy=side_vy,
-            turn_max=turn_max, run_vx_range=run_vx_range, run_frac=run_frac,
-            mode_weights=mode_weights, turn_while_forward_frac=turn_while_forward_frac)))
-        return segs
-    d, vx, vy, wz = segs[-1]
-    segs[-1] = (d + (duration - t), vx, vy, wz)
+        return [(duration, *_seg_command(rng, **kw))]
+    drift = duration - sum(d for d, *_ in segs)
+    d0, vx, vy, wz = segs[-1]
+    segs[-1] = (max(0.5, d0 + drift), vx, vy, wz)
     return segs
-
-
 
 
 def cmd_at(schedule: Schedule, t_now: float) -> np.ndarray:
