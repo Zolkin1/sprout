@@ -19,6 +19,7 @@ from packaging import version
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
+from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg
 from isaaclab.utils.assets import retrieve_file_path
 from isaaclab.utils.dict import print_dict
 
@@ -209,9 +210,10 @@ parser.add_argument(
     "--fm_checkpoint", type=str, default=None,
     help="Path to the flow-matching generator checkpoint (.pt) to track. Applied to any "
          "command term exposing an fm_checkpoint field (the FmTrackingCommand), "
-         "overriding the cfg default. The generator's DEPTH RESOLUTION is read off this "
-         "checkpoint and a matching camera pair is built automatically, so nothing else "
-         "has to state it.",
+         "overriding the cfg default. Passing this also installs the generator's own "
+         "observation group over EVERY depth camera on the scene -- the policy reads the "
+         "near one alone -- at whatever DEPTH RESOLUTION the checkpoint states, so nothing "
+         "else has to state either.",
 )
 parser.add_argument(
     "--fm_depth_resolution", type=str, default="",
@@ -370,11 +372,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     term.fm_checkpoint = args_cli.fm_checkpoint
                     print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
 
-        # The generator may SAMPLE the depth cameras on its own grid (so its vision input
-        # can change without retraining the policy). Read that resolution off the checkpoint
-        # and build the matching camera pair here, BEFORE gym.make -- derived rather than
-        # declared, so a flag cannot disagree with the artifact. A checkpoint at the policy's
-        # own resolution adds nothing and reads the policy's cameras, as it always did.
+        # Give the GENERATOR its observation group, covering EVERY depth camera on the
+        # scene. UNCONDITIONAL whenever a generator is loaded: the policy reads the NEAR
+        # camera alone, so a missing group makes ``mdp.fm_depth_groups`` fall back to
+        # "every group" = that one camera, and the generator would be conditioned on half
+        # the robot's cameras with every shape check satisfied.
+        #
+        # The generator may also SAMPLE those cameras on its own grid (so its vision input
+        # can change without retraining the policy). That resolution is read off the
+        # checkpoint -- derived rather than declared, so a flag cannot disagree with the
+        # artifact. A checkpoint stating none (or stating the policy's own) reads the
+        # scene's cameras directly: no second sampling, no second ray cast.
         if args_cli.fm_checkpoint is not None:
             from robot_rl.flow_matching.online import fm_scan_geometry, read_fm_extero_meta
             fm_extero = read_fm_extero_meta(args_cli.fm_checkpoint)
@@ -382,7 +390,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # a scanner and a scan generator can never be given a camera pair.
             if fm_extero["extero_source"] == "depth":
                 from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
-                    add_fm_depth_pair,
+                    install_fm_depth_group,
                 )
                 want = (args_cli.fm_depth_resolution or "").strip()
                 if want:
@@ -390,13 +398,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     print(f"[INFO] --fm_depth_resolution {w}x{h} OVERRIDES the checkpoint's "
                           f"{fm_extero['width']}x{fm_extero['height']}; the command term's "
                           "shape check will refuse the pair unless you meant this.")
-                elif fm_extero["width"] is not None:
-                    w, h = fm_extero["width"], fm_extero["height"]
                 else:
-                    w = h = None
-                if w is not None and getattr(env_cfg.scene, "depth_camera_near",
-                                             None) is not None:
-                    add_fm_depth_pair(env_cfg, w, h)
+                    # ``None`` = a checkpoint that states no resolution. That now means "the
+                    # scene's own grid", not "install nothing": the group is what makes the
+                    # generator see both cameras, and it is owed either way.
+                    w, h = fm_extero["width"], fm_extero["height"]
+                if any(isinstance(sensor, MultiMeshRayCasterCameraCfg)
+                       for sensor in vars(env_cfg.scene).values()):
+                    install_fm_depth_group(env_cfg, w, h)
             elif fm_extero["extero_source"] == "height_scan":
                 geom = fm_scan_geometry(fm_extero["extero_spec"])
                 # ``None`` = a checkpoint that states no scan geometry, i.e. every pre-field

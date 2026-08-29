@@ -265,6 +265,40 @@ python transfer/sim/generate_stairs_scene.py   # symmetric up/platform/down lane
 cd transfer/sim && python gen_tracker_runner.py --load_run <run_dir> ...
 ```
 
+##### Stairs or a jump? `stair_probe.py`
+
+The playground has four lanes and four jump boxes, which is the wrong scene for asking whether
+the generator reads a staircase as a box — a box in frame is the alternative explanation. The
+probe puts ONE staircase in front of the robot, holds a constant velocity command
+(`gen_tracker_runner.py --const_cmd VX VY WZ`, which is the shape every terrain clip in the
+library was generated under), and asks you to label what the pair did:
+
+```bash
+cd transfer/sim && python stair_probe.py --load_run <tracker_run> --fm_onnx <run>_fm.onnx
+#   sweeps 4 flight widths x 6 approach speeds, one viewer trial each, ~15 min
+#   -> logs/stair_probe/<stamp>/{labels.jsonl, summary.json, label_grid.png}
+python stair_probe.py ... --resume        # continue the latest session (a plain rerun does NOT)
+python stair_probe.py --plot_only --out <stamp>       # redraw; --out is relative to logs/stair_probe
+
+python stair_probe.py --joystick --repeats 3 ...      # YOU drive; width is the only sweep
+```
+
+`--joystick` swaps the constant command for your gamepad and turns the approach from a setting
+into a MEASUREMENT: the runner already logs `cmd_vx`/`cmd_vy`/`cmd_wz` every step, so each row
+gets medians and signed extremes of all three over the approach (every step before the first
+riser), and the figure plots every trial in the `(|v_y|, |ω_z|)` plane where the entire training
+library sits at the origin. It refuses to start without a pad — the runner's own fallback is a
+silent constant `[0.5, 0, 0]`, which would label itself as your approach.
+
+```bash
+```
+
+The two swept axes are the ones the library couples: `stairs_up` covers a 50-level command
+grid from **0.600 to 2.600 m/s and stops**, while `jump_on` runs to 3.498 — so above 2.6 m/s
+the only fast-forward-approach motion the generator was ever shown is a jump. Trained flight
+widths run 0.81–4.14 m (transition, after terrain decoration) and 5.00–5.29 m (pure).
+`scripts/rsl_rl/plot_family_command_coverage.py --clip <lib>.h5` draws that coverage.
+
 Deeper Isaac-side debugging (height-scan depth images, reference ribbons):
 
 ```bash

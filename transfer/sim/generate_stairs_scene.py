@@ -16,12 +16,12 @@ pelvis height scan ride the treads.
 Geometry is pinned to the training terrain library (see the measured constants below).
 What varies between staircases is the lateral tread **width** and the step **count**.
 
-**Width is not a continuum.**  The current library's stair steps fall into two clusters and
-nothing in between: the TRANSITION families (``stairs_up`` / ``stairs_down``, a narrow flight
-between two platforms) are 0.80-1.16 m wide, and the PURE families are 5.00-5.29 m -- the
-full tile.  The old defaults here (1.5 / 2.2 / 3.0 m) sat in the gap, matching no trained
-tile, because they came from ``clips/g1_terrain_v2.h5``'s ``width_range == [1.0, 3.0]`` and
-that library is long gone.
+**Width comes in THREE clusters with two wide holes between them.**  The TRANSITION families
+(``stairs_up`` / ``stairs_down``, a flight set between two platforms) split into 12 tiles at
+0.81-1.10 m and 28 at 1.72-4.14 m -- ``motion_gen.terrain.decorate`` widened the latter -- and
+the PURE families are 5.00-5.29 m, the full tile.  A lane at 1.4 m or at 4.5 m matches no
+trained tile.  The constants below say so, and they described the pre-decoration library until
+2026-08-27; see :data:`TRAINED_STAIR_WIDTHS` for the measurement.
 
 Each staircase is built from full-height box "pillars" (step ``n`` spans ``z in
 [0, n*rise]``), so the assembled solid has clean tread tops and vertical risers with
@@ -58,32 +58,92 @@ TRAINED_RISERS = (0.13, 0.131, 0.15, 0.17)
 #: (1, 3, 8, 15) carry it, and it is the tread the clip library walks at HALF speed --
 #: 0.32 m/s against 0.61-0.69 on every other tread. So the one geometry whose reference
 #: behaves differently was the one the playground could not build.
-TRAINED_TREADS = (0.209, 0.22, 0.25, 0.28)
+#: UP and DOWN staircases use DIFFERENT tread sets, and the old constant listed only the UP
+#: one.  Measured identically on g1_mb_v5_body.h5, g1_mb_v5_body_mode11.h5 and the decorated
+#: library -- so 0.178 / 0.19 did not arrive with any of those passes, they were always there
+#: and were simply never written down:
+#:
+#:     stairs_up, stairs_up_pure     0.209  0.22  0.221  0.25  0.28
+#:     stairs_down, stairs_dn_pure   0.178  0.19  0.22   0.25
+#:
+#: A descending flight is therefore steeper per tread than any ascending one the robot has
+#: seen, which a probe sweeping ``--run`` should know before calling 0.19 out-of-distribution.
+TRAINED_TREADS = (0.178, 0.19, 0.209, 0.22, 0.221, 0.25, 0.28)
+#: The ascending half of that split, for a probe that only builds up-staircases.
+TRAINED_TREADS_UP = (0.209, 0.22, 0.221, 0.25, 0.28)
 
-# Lateral step WIDTH, measured from the same manifest (clips/g1_mb_v5_body.h5, 2026-08-13),
-# over every box overlay with a tread-sized x extent. Two disjoint clusters, per family:
+# Lateral step WIDTH, measured from the manifest of the library the deployed pair trains on
+# (clips/g1_mb_v5_body_mode11_decor.h5, 2026-08-27), as the narrowest flight in each tile:
 #
-#     stairs_up      109 steps   0.80 - 1.04 m   (p50 0.89)
-#     stairs_down    105 steps   0.80 - 1.16 m   (p50 0.86)
-#     stairs_up_pure 383 steps   5.00 - 5.29 m   (p50 5.11)
-#     stairs_dn_pure 483 steps   5.10 - 5.28 m   (p50 5.20)
+#     stairs_up       20 tiles   0.825 - 4.141 m   (p50 1.961)
+#     stairs_down     20 tiles   0.809 - 3.918 m   (p50 2.070)
+#     stairs_up_pure  15 tiles   4.998 - 5.286 m   (p50 5.115)
+#     stairs_dn_pure  15 tiles   5.097 - 5.282 m   (p50 5.200)
 #
-# The transition flights are the narrow ones because they are a staircase set INTO a tile
-# between two platforms, which is the case a robot crossing a terrain transition sees; the
-# pure tiles are stairs spanning the whole tile. A lane between the two clusters is
-# out-of-distribution for every trained tile, which is what _warn_off_grid reports.
-TRAINED_STAIR_WIDTHS: tuple[tuple[float, float], ...] = ((0.80, 1.16), (5.00, 5.29))
-#: Median transition-flight width -- the default for the lane the robot faces at spawn.
-TRAINED_TRANSITION_WIDTH = 0.90
+# STILL THREE CLUSTERS, not the two the old constants named and not the continuum the first
+# correction of them claimed.  Over the 40 transition tiles the sorted widths are
+#
+#     0.809 .. 1.102   (12 tiles)   <- 0.621 m HOLE ->   1.723 .. 4.141   (28 tiles)
+#
+# and the pure staircases sit alone above 4.998, past a second 0.857 m hole.  `decorate.py`
+# widened the flight on 28 of the 40, not on the 13 `wide_stairs` alone: the `matched` arm
+# (15 tiles) widens it too, and only `narrow_landing` (12) leaves it where the generator put
+# it.  Those 12 ARE the lower cluster -- verified tile by tile against the pre-decoration
+# library, where every transition flight was 0.801-1.156 m (p50 0.863).
+#
+# The old constants here read 0.80-1.16 m, which is that pre-decoration library to three
+# decimals.  They were a hand-kept copy of a measurement the decoration pass then moved:
+# everything from 1.72 to 4.14 m was being flagged as matching no trained tile while sitting
+# in the larger of the two transition clusters.  Same defect shape as the stale ROS URDF and
+# the stale metadata fixture.
+TRAINED_STAIR_WIDTHS: tuple[tuple[float, float], ...] = ((0.80, 1.11), (1.72, 4.15),
+                                                         (5.00, 5.29))
+#: Median of the WIDENED transition cluster -- the middle of what a decorated flight looks like.
+TRAINED_TRANSITION_WIDTH = 1.96
+#: REAL staircase widths, tape-measured off buildings on 2026-08-27 -- not from any library.
+#: This is the playground's authority, because the playground exists to be driven at things
+#: the robot will actually meet:
+#:
+#:     4 ft (1.22 m)   the narrowest found anywhere
+#:     5 ft (1.52 m)   the common indoor case
+#:     7 ft (2.13 m)   outdoor, and upward from there
+#:
+#: **The narrowest REAL staircase is 40% wider than the library's narrowest trained flight**
+#: (0.81 m), and 4-5 ft lands squarely inside the library's 0.62 m hole (1.10 - 1.72 m), where
+#: no stair tile exists at all. So the two most common real widths are extrapolation for this
+#: generator, and `_warn_off_grid` will say so on every lane below -- correctly, and on
+#: purpose. That is the finding, not a misconfiguration.
+REAL_STAIR_WIDTHS: dict[str, float] = {"min": 1.22, "indoor": 1.52, "outdoor": 2.44}
+
+#: Median of the NARROW transition cluster (the 12 `narrow_landing` tiles, 0.809-1.102 m).
+#: The median rather than the minimum on purpose: 0.809 is one tile, and a probe wants the
+#: shape the robot met repeatedly. This is the end where a flight is barely wider than the
+#: robot, which is the interesting end for a stairs-read-as-box question.
+TRAINED_NARROW_FLIGHT_WIDTH = 0.86
+
 DEFAULT_RISE = 0.15  # step height (m) -- modal riser
 DEFAULT_RUN = 0.25   # step depth / tread run (m) -- modal tread
 
-# Box (jump-on / jump-off) geometry, measured from the same manifest (50 box tiles):
-#     height in {0.25, 0.30, 0.35, 0.40, 0.45, 0.55, 0.60, 0.65, 0.70}
-#     footprint  depth_x 0.73-0.80 m, width_y 0.43-0.45 m  (one box per tile)
-TRAINED_BOX_HEIGHTS = (0.25, 0.30, 0.35, 0.40, 0.45, 0.55, 0.60, 0.65, 0.70)
-TRAINED_BOX_DEPTH = 0.75   # x extent (m)
-TRAINED_BOX_WIDTH = 0.44   # y extent (m)
+# Box (jump-on / jump-off) geometry, re-measured on clips/g1_mb_v5_body_mode11_decor.h5
+# (2026-08-27), over the leading walkable overlay of each box tile:
+#
+#     jump_on         20 tiles   depth_x 0.46      width_y 0.90-4.90   height 0.25-0.75
+#     jump_off        15 tiles   depth_x 0.48      width_y 0.95-3.63   height 0.25-0.75
+#     jump_off_front  15 tiles   depth_x 0.48-3.79 width_y 0.81-7.30   height 0.25-0.75
+#
+# The previous constants (0.75 x 0.44 m footprint) were measured on a different library AND
+# had the two axes the other way round: the trained box presents a SHALLOW face across a WIDE
+# span, not a deep narrow block.  That matters here specifically -- the depth of the face is
+# what a forward camera sees as the obstacle, and a 0.75 m one is nothing the robot met.
+# Changing these numbers moves nothing on disk; ``robots/g1/g1_perceptive_terrain_scene.xml``
+# keeps the geometry it was generated with until someone reruns this script.
+#: A 0.05 m grid from 0.25 to 0.75.  Three tiles sit off it -- 0.453 (jump_off), 0.459
+#: (jump_off_front), 0.469 (jump_on), one each -- and they are NOT folded in: rounding them
+#: to a shared 0.47 would invent a grid point no tile has and make the off-grid warning below
+#: pass for a height nothing was trained on.
+TRAINED_BOX_HEIGHTS = (0.25, 0.30, 0.35, 0.40, 0.45, 0.55, 0.60, 0.65, 0.70, 0.75)
+TRAINED_BOX_DEPTH = 0.46   # x extent (m), the face the robot approaches
+TRAINED_BOX_WIDTH = 2.59   # y extent (m), the jump_on median
 
 # Default playground: three staircases spanning the training width range, with the
 # medium one straight ahead of the spawn (y = 0) and the wide / narrow ones off to
@@ -111,22 +171,35 @@ class Lane:
     run: float | None = None    # None -> the scene-wide --run
 
 
-# One lane per corner of the trained (riser, tread) grid plus the modal pair straight ahead,
-# so a single scene exercises shallow-deep, modal and steep-shallow treads.
+# One lane per corner of the trained (riser, tread) grid, at REAL widths.
+#
+# Every lane is now at least 4 ft, because the playground had drifted into measuring a robot
+# against staircases that do not exist: the lane straight ahead of spawn was 0.90 m (2.95 ft)
+# and `slow_tread` 0.86 m (2.82 ft), both NARROWER than the narrowest real staircase found,
+# and the one realistic lane was called `narrow` while being the second widest of the four.
+# Hand-labelled probe trials (`stair_probe.py`) put the cost of that plainly: at 0.86 m the
+# generator planned a JUMP on 3 of 3 approaches, and across 1.22 / 1.52 / 2.13 / 2.44 m it
+# planned stairs on 11 of 12. Driving the old centre lane was driving the one width where the
+# training library says a raised thing is more likely a box than a staircase.
+#
+# The four (riser, tread) pairs are unchanged -- shallow-deep, modal, steep-shallow and the
+# slow-gait tread -- so the scene still spans that grid; only the widths and the names moved.
 DEFAULT_LANES: tuple[Lane, ...] = (
-    Lane(name="wide", y=4.0, width=3.0, steps=8, rise=0.13, run=0.28),
-    # The lane the robot faces at spawn, at the trained TRANSITION width. It was 2.2 m,
-    # which is roughly two and a half times the flight the policy ever climbed in Isaac --
-    # a foot could land anywhere across it, so nothing made the robot stay on the treads.
-    Lane(name="center", y=0.0, width=TRAINED_TRANSITION_WIDTH, steps=6, rise=0.15, run=0.25),
-    Lane(name="narrow", y=-3.5, width=1.5, steps=4, rise=0.17, run=0.22),
+    # Straight ahead of spawn: the NARROWEST staircase that actually exists. This is the hard
+    # case now, and unlike 0.86 m it is a hard case the robot will meet.
+    Lane(name="center", y=0.0, width=REAL_STAIR_WIDTHS["min"], steps=6,
+         rise=0.15, run=0.25),
+    Lane(name="indoor", y=-3.5, width=REAL_STAIR_WIDTHS["indoor"], steps=4,
+         rise=0.17, run=0.22),
+    Lane(name="outdoor", y=4.0, width=REAL_STAIR_WIDTHS["outdoor"], steps=8,
+         rise=0.13, run=0.28),
     # The SLOW-GAIT geometry, which the other three lanes cannot express. Measured over the
     # library: tread 0.209 / riser 0.131 is walked at 0.32 m/s, while every tread of 0.22 and
     # above is walked at 0.61-0.69 -- a 2x split with nothing in between, across a geometry
-    # sweep that is otherwise continuous. Width and step count are tile 15's, the narrowest
-    # flight carrying it, so this lane is that tile's stairs rather than an average of the
-    # four. Without it the playground samples only the fast half of the library.
-    Lane(name="slow_tread", y=8.0, width=0.86, steps=6, rise=0.131, run=0.209),
+    # sweep that is otherwise continuous. Its width used to be tile 15's 0.86 m; at a real
+    # width the tread is the only thing that makes it special, which is the point of it.
+    Lane(name="slow_tread", y=8.0, width=REAL_STAIR_WIDTHS["indoor"], steps=6,
+         rise=0.131, run=0.209),
 )
 
 
@@ -242,6 +315,76 @@ def _lane_geoms(lane: Lane, rise: float, run: float, x_start: float, platform_de
 DECOR_GROUP_ATTRS = 'group="1" contype="0" conaffinity="0"'
 
 
+#: Lateral gap from a flight's edge to a flanking wall face (m).  A real stairwell wall is
+#: essentially at the edge of the treads, which is the case this exists to test.
+#:
+#: For comparison, measured on the decorated library's 40 stairs transition tiles: the walls
+#: ring a RENDERED FLOOR 9.35 m wide while the walkable tile is a median 3.82 m, so there are
+#: two populations and only one of them is realistic. The FAR-side wall is 4.98-7.05 m from
+#: the flight (median 6.36) -- effectively absent. The NEAR-side wall, where a tile has one,
+#: sits 0.0-1.52 m away (median 0.59), which IS stairwell-like -- but only 18 of the 40 tiles
+#: have a near-side wall at all. So the trained distribution is roughly half "wall beside the
+#: stairs" and half "nothing within five metres", and the value below is deliberately at the
+#: tight end of the realistic half rather than at its median.
+DEFAULT_LANE_WALL_GAP = 0.15
+#: Wall height (m). Above roughly 0.9 m this is a VIEWER choice, not a model one: at 3 m the
+#: depth frame's top edge already cuts the wall, so taller walls are byte-identical images.
+DEFAULT_LANE_WALL_HEIGHT = 2.0
+#: How far before the first riser the wall starts (m), so it is in frame during the approach
+#: -- which is when the plan that decides stairs-or-box is made.
+DEFAULT_LANE_WALL_LEAD = 1.0
+
+
+def lane_wall_geoms(lane: Lane, rise: float, run: float, x_start: float,
+                    platform_depth: float, descend: bool,
+                    gap: float = DEFAULT_LANE_WALL_GAP,
+                    height: float = DEFAULT_LANE_WALL_HEIGHT,
+                    lead: float = DEFAULT_LANE_WALL_LEAD,
+                    thickness: float = 0.15) -> list[str]:
+    """Two walls flanking one staircase, the way a real stairwell does.
+
+    **Visual only, with no option to make them solid.**  Isaac's decoration carries no
+    collider, so nothing in training has ever pushed back on the robot, and there is no
+    obstacle term anywhere in the MDP.  Worse than merely untrained: a collidable wall this
+    close would be swept by the reference's own arm swing, which blocks a wrist, fires
+    ``ee_pose_error`` and ends the episode for a reason the policy cannot fix.  What this is
+    for is watching what the generator PLANS with a wall in frame, which needs no contact.
+
+    The walls span the whole lane -- lead-in, ascent, platform and descent -- because a
+    stairwell does, and because the approach is when the deciding plan is made.
+
+    Args:
+        lane: The staircase to flank.
+        rise: Scene-wide per-step height (m); overridden by ``lane.rise``.
+        run: Scene-wide tread run (m); overridden by ``lane.run``.
+        x_start: World x of the first riser.
+        platform_depth: Depth of the platform between the flights.
+        descend: Whether the lane carries a descending flight (it is longer if so).
+        gap: Lateral clearance from the tread edge to the wall face (m).
+        height: Wall height (m).
+        lead: How far before the first riser the wall begins (m).
+        thickness: Wall thickness (m).
+
+    Returns:
+        MuJoCo geom lines for the two walls.
+    """
+    rn = lane.run if lane.run is not None else run
+    span = lane.steps * rn * (2 if descend else 1) + platform_depth
+    x0, x1 = x_start - lead, x_start + span
+    cx, half_len = 0.5 * (x0 + x1), 0.5 * (x1 - x0)
+    # Face at lane edge + gap, so `gap` is the clearance a foot sees, not a centre distance.
+    off = lane.width / 2.0 + gap + thickness / 2.0
+    return [
+        f'        <!-- {lane.name} stairwell wall, {gap} m clearance, visual only -->'
+    ] + [
+        f'        <geom name="{lane.name}_wall_{side}" type="box" material="box_material" '
+        f'{DECOR_GROUP_ATTRS} '
+        f'size="{half_len:.4f} {thickness / 2:.4f} {height / 2:.4f}" '
+        f'pos="{cx:.4f} {lane.y + sign * off:.4f} {height / 2:.4f}"/>'
+        for side, sign in (("left", 1.0), ("right", -1.0))
+    ]
+
+
 def corner_wall_geoms(x: float, y: float, height: float, length: float,
                       thickness: float = 0.15, solid: bool = False) -> list[str]:
     """Two walls meeting at 90 deg, for driving at in the playground.
@@ -283,7 +426,10 @@ def corner_wall_geoms(x: float, y: float, height: float, length: float,
 def build_scene_xml(robot_xml: str, lanes: tuple[Lane, ...], rise: float, run: float,
                     x_start: float, platform_depth: float,
                     boxes: tuple[Box, ...] = (), descend: bool = True,
-                    walls: list[str] | None = None) -> str:
+                    walls: list[str] | None = None,
+                    wall_lanes: tuple[str, ...] = (),
+                    wall_gap: float = DEFAULT_LANE_WALL_GAP,
+                    wall_height: float = DEFAULT_LANE_WALL_HEIGHT) -> str:
     """Assemble the full MuJoCo scene XML string.
 
     Mirrors ``g1_21j_basic_scene.xml`` (visual / asset / ankle sensors / lights +
@@ -300,6 +446,10 @@ def build_scene_xml(robot_xml: str, lanes: tuple[Lane, ...], rise: float, run: f
         boxes: Free-standing jump-on/off boxes to add (see :data:`DEFAULT_BOXES`).
         descend: Give every lane a mirrored descending flight past its platform.
         walls: Extra geom lines (see :func:`corner_wall_geoms`), or ``None``.
+        wall_lanes: Names of lanes to flank with stairwell walls. Leaving some lanes bare
+            makes one scene a within-scene A/B rather than needing two.
+        wall_gap: Lateral clearance from tread edge to wall face (m).
+        wall_height: Wall height (m).
 
     Returns:
         The complete scene XML as a string.
@@ -307,6 +457,9 @@ def build_scene_xml(robot_xml: str, lanes: tuple[Lane, ...], rise: float, run: f
     stair_lines: list[str] = []
     for lane in lanes:
         stair_lines.extend(_lane_geoms(lane, rise, run, x_start, platform_depth, descend))
+        if lane.name in wall_lanes:
+            stair_lines.extend(lane_wall_geoms(lane, rise, run, x_start, platform_depth,
+                                               descend, gap=wall_gap, height=wall_height))
     for box in boxes:
         stair_lines.extend(_box_geoms(box))
     stair_lines.extend(walls or [])
@@ -457,6 +610,20 @@ def main() -> None:
                         help="Add a jump box 'height[:x][:y]' in metres (repeatable). Omit for the "
                              f"default row at heights {(0.25, 0.40, 0.55, 0.70)} spanning the "
                              f"trained grid {TRAINED_BOX_HEIGHTS}. Use --no_boxes for none.")
+    parser.add_argument("--wall_lanes", type=str, default="center,indoor",
+                        help="Comma-separated lane names to flank with STAIRWELL walls, or "
+                             "'' for none. Real staircases have walls right at the treads and "
+                             "the trained library only half does -- its far-side wall sits "
+                             "5-7 m away and fewer than half the tiles carry a near-side one. "
+                             "The default walls two lanes and leaves the others bare, so one "
+                             "scene is a within-scene A/B instead of two scenes. Visual only, "
+                             "always: see lane_wall_geoms for why a solid one would test the "
+                             "wrong thing.")
+    parser.add_argument("--wall_gap", type=float, default=DEFAULT_LANE_WALL_GAP,
+                        help="Clearance from the tread edge to the wall face (m).")
+    parser.add_argument("--lane_wall_height", type=float, default=DEFAULT_LANE_WALL_HEIGHT,
+                        help="Stairwell wall height (m). Above ~0.9 m this is a viewer choice: "
+                             "the depth frame's top edge already cuts the wall at 3 m.")
     parser.add_argument("--wall", action="store_true", default=False,
                         help="Add two walls meeting at 90 deg, for driving at. VISUAL ONLY "
                              "unless --wall_solid: Isaac's decoration never collides and "
@@ -502,9 +669,9 @@ def main() -> None:
         # Width had no check at all, which is how a 2.2 m centre lane -- wider than any
         # trained flight and narrower than any trained pure staircase -- went unremarked.
         if not any(lo <= ln.width <= hi for lo, hi in TRAINED_STAIR_WIDTHS):
-            print(f"[WARN] lane '{ln.name}' width {ln.width} m falls BETWEEN the trained "
-                  f"clusters {TRAINED_STAIR_WIDTHS} m (narrow transition flights vs "
-                  "full-tile pure staircases) -- no trained tile looks like this.")
+            print(f"[WARN] lane '{ln.name}' width {ln.width} m is OUTSIDE the trained bands "
+                  f"{TRAINED_STAIR_WIDTHS} m (decorated transition flights vs full-tile pure "
+                  "staircases) -- deliberate OOD test?")
 
     walls = None
     if args.wall:
@@ -515,9 +682,16 @@ def main() -> None:
               f"from y={wy + args.wall_length / 2:.2f}; {args.wall_length:.1f} m legs, "
               f"{args.wall_height:.1f} m tall, "
               f"{'SOLID' if args.wall_solid else 'visual only (non-colliding)'}")
+    wall_lanes = tuple(n.strip() for n in args.wall_lanes.split(",") if n.strip())
+    unknown = [n for n in wall_lanes if n not in {ln.name for ln in lanes}]
+    if unknown:
+        # Silently walling nothing would look exactly like walls that do not matter.
+        raise SystemExit(f"[ERROR] --wall_lanes names {unknown}, which are not lanes in this "
+                         f"scene: {sorted(ln.name for ln in lanes)}")
     xml = build_scene_xml(f"{args.robot}.xml", lanes, args.rise, args.run,
                           args.x_start, args.platform_depth, boxes, args.descend,
-                          walls=walls)
+                          walls=walls, wall_lanes=wall_lanes, wall_gap=args.wall_gap,
+                          wall_height=args.lane_wall_height)
 
     if args.out is not None:
         out_path = args.out
@@ -541,10 +715,20 @@ def main() -> None:
         r = lane.rise if lane.rise is not None else args.rise
         rn = lane.run if lane.run is not None else args.run
         span = lane.steps * rn * (2 if args.descend else 1) + args.platform_depth
-        print(f"       - {lane.name}: width {lane.width} m, {lane.steps} steps"
+        band = next((f"trained band {lo}-{hi} m" for lo, hi in TRAINED_STAIR_WIDTHS
+                     if lo <= lane.width <= hi), "OFF the trained grid")
+        walled = ("  WALLED both sides at "
+                  f"{args.wall_gap} m" if lane.name in wall_lanes else "  (no walls)")
+        print(f"       - {lane.name}: width {lane.width} m ({lane.width / 0.3048:.2f} ft, "
+              f"{band}), {lane.steps} steps"
               f"{' up + ' + str(lane.steps) + ' down' if args.descend else ''}, "
               f"rise {r} m / run {rn} m (top {lane.steps * r:.3f} m) at y={lane.y}; "
-              f"x span {args.x_start:.2f}-{args.x_start + span:.2f} m")
+              f"x span {args.x_start:.2f}-{args.x_start + span:.2f} m{walled}")
+    narrowest = min(ln.width for ln in lanes) if lanes else 0.0
+    if narrowest < REAL_STAIR_WIDTHS["min"]:
+        print(f"[WARN] the narrowest lane is {narrowest:.2f} m "
+              f"({narrowest / 0.3048:.2f} ft) -- under the {REAL_STAIR_WIDTHS['min']} m "
+              "(4 ft) narrowest REAL staircase measured. Deliberate probe, or a leftover?")
     for b in boxes:
         print(f"       - {b.name}: height {b.height} m, {b.depth}x{b.width} m at "
               f"(x={b.x}, y={b.y})")

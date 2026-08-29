@@ -160,3 +160,15 @@ claude_plans/
 # library passed in -- regenerate them, don't track them. (The hand-authored scenes next to
 # them, e.g. g1_29j_terrain_scene.xml, ARE tracked.)
 transfer/sim/robots/g1/*_s2s_*_scene.xml
+
+# Per-trial scenes written by transfer/sim/stair_probe.py. One file per flight geometry,
+# regenerated deterministically from the CLI on every run, so they are build output rather
+# than assets -- unlike the hand-invoked scenes beside them, which ARE tracked.
+transfer/sim/robots/g1/*_stair_probe_*.xml
+
+# Eval courses written by transfer/sim/mjeval/terrains.py. Twenty files, regenerated
+# deterministically from the catalogue on every `evaluate.py --stage scenes`, so they are
+# build output rather than assets. The catalogue IS tracked, and it is the authority: a run's
+# manifest.json records the geometry each course was emitted with, so a result stays readable
+# without the XML.
+transfer/sim/robots/g1/*_mjeval_*.xml

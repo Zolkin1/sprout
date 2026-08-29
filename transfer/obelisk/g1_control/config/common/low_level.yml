@@ -42,6 +42,24 @@ control:
       # Override per run with `run_sim_low.sh --policy <folder>` rather than editing this.
       hf_policy_folder: "2026-08-20_16-36-10_mode11_decor_plan_v1"
       use_cuda: true
+      # Arm a pair whose robot_asset fingerprints disagree, warning on every load instead of
+      # refusing. ON, for one specific and understood delta:
+      #
+      #   tracker mjcf_sha256 245672ef...  vs  generator 0078e0d0...
+      #
+      # Commit 3ddab280 (2026-08-24) changed ONE line of g1_perceptive.xml -- the hip-pitch
+      # position gains, 40.18/2.56 -> 99.0984/6.3088 -- and nothing else. The generators in use
+      # were trained before it. `robot_asset` is baked into an FM CHECKPOINT at training time
+      # and is NOT recomputed at export, so re-exporting the generator does not clear this; only
+      # retraining would. Actuator gains are never read by the generator, and reach the robot
+      # from the TRACKER's metadata over the wire, so the pair is compatible.
+      #
+      # TURN THIS BACK OFF once the generators are retrained on a tree that carries 3ddab280.
+      # It is not a general permission: it also suppresses a joint-order, body-set or link
+      # geometry mismatch, which is exactly what the guard exists to catch. The C++ prints
+      # every differing field on every load -- read it, and if it is not the gains line above,
+      # stop.
+      allow_robot_asset_mismatch: true
       # 4, not the onnxruntime default of 0 (auto): auto measured ~3x SLOWER here (the FM at
       # 251 ms vs 87 ms on the 27M). Revisit per machine -- this is a measured local optimum,
       # not a portable constant.
@@ -56,7 +74,28 @@ control:
       # Zero the velocity command if no depth frame arrives within this many seconds
       # (<=0 disables). Judged on LOCAL RECEIPT time, not the header stamp: the camera
       # clock is not synchronised to this machine.
-      depth_timeout: 0.25
+      #
+      # What this does NOT do, because it cannot: the policy keeps reading the LAST frame,
+      # so the robot is still planning and tracking against an image that has stopped
+      # describing the world. Zeroing asks it to come to a stop; it is not a recovery. The
+      # camera buffer is only ever overwritten by a new frame, so a dead camera stays frozen
+      # for as long as it is dead -- on the ZED pair that is a respawn_delay of 10 s plus the
+      # 25-30 s sl::Camera::close() takes to release the device.
+      #
+      # 0.15 = 7.5 ticks at the 0.02 s control period. Chosen against what the GENERATOR was
+      # trained on, not against the camera's frame interval: `depth_latency_probs` gives the
+      # deployed checkpoint support over {20, 40, 60} ms of lag, capped at 3 steps by
+      # DEPTH_LAG_STEPS, so 60 ms is the oldest frame it has ever seen. Everything past that
+      # is out of distribution however healthy the camera looks, and a prior measurement on
+      # the two-box split put a failure cliff between 20 and 40 ms of staleness.
+      #
+      # It is a compromise and not a bound: 0.15 still trips at 2.5x the largest trained lag.
+      # The floor is set by the ARRIVAL GAP, since this is judged on receipt -- the ZED pair
+      # runs at 47.2 / 47.7 Hz, so 0.15 tolerates about seven consecutive dropped frames
+      # before firing, and a threshold near 60 ms would fire on ordinary jitter. Note the
+      # measured `depth_capture_age` of 53.7 / 36.9 ms does NOT enter this test: that is
+      # pipeline latency, a roughly constant offset on every frame, not a gap between them.
+      depth_timeout: 0.15
       # Likewise if no velocity command arrives -- a dead high level must not leave the
       # robot walking at the last commanded speed.
       vel_cmd_timeout: 1.0
@@ -119,7 +158,7 @@ control:
     executable: obelisk_unitree_joystick
     params:
       v_x_scale: 0.8
-      v_y_scale: 0.5
+      v_y_scale: 0.0
       w_z_scale: 0.7
       # Yaw on the RIGHT STICK HORIZONTAL (RX = 3 + AXIS_OFFSET). The upstream default is RY
       # -- right stick VERTICAL -- which reads as "yaw does nothing" to anyone who pushes the

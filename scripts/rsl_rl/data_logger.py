@@ -30,6 +30,38 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import 
 _TRAJ_TERM_NAMES = ("traj_ref", "hlip_ref")
 
 
+def _depth_obs_groups(unwrapped) -> list[str]:
+    """Which observation groups' depth cameras a dump records: the GENERATOR's when it has any.
+
+    The policy is conditioned on the NEAR camera alone while the generator reads both, so
+    scoping this to the policy records half the rig -- consistently, in both the per-step
+    ``depth_raw`` and the ``depth_camera_spec`` metadata, so nothing errors and the far
+    camera simply is not in the file. That is the wrong half for what these dumps are FOR:
+    the open question on the generator is whether a misread staircase is a perception failure
+    (the image genuinely looks box-like) or a generation one (image fine, plan wrong), and the
+    far camera is the instrument that reads terrain ahead. A dump without it cannot make that
+    split.
+
+    ``mdp.fm_depth_groups`` returns ``None`` for "every group" when the task has no
+    generator group at all; that is NOT what a dump wants (it mixes the policy's and the
+    generator's samplings of one lens, which ``depth_obs_stack`` then refuses when their grids
+    differ), so this never passes ``None`` on -- it falls back to the policy's groups by name.
+
+    Args:
+        unwrapped: The unwrapped Isaac Lab env.
+
+    Returns:
+        Group names to read the depth terms from -- the generator's group when installed,
+        else the policy's.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+        fm_depth_groups,
+        rl_depth_groups,
+    )
+
+    return fm_depth_groups(unwrapped) or rl_depth_groups(unwrapped)
+
+
 def _obs_term_slice(unwrapped, term: str) -> tuple[str, slice] | None:
     """Locate ``term`` inside whichever concatenated observation group carries it.
 
@@ -595,13 +627,12 @@ class DataLogger:
         if self._has_depth:
             try:
                 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
-                    depth_obs_stack,
-                    rl_depth_groups,
-                )
-                # The POLICY's cameras: this feeds the depth viewer, which shows what the
-                # policy saw. A generator sampling its own grid is not what is being drawn.
+                    depth_obs_stack)
+                # The GENERATOR's cameras when it has a group -- every camera the robot
+                # carries. Same scope as the ``depth_camera_spec`` metadata, so the viewer's
+                # per-camera reshape matches these rows.
                 step["depth_raw"] = depth_obs_stack(
-                    unwrapped, rl_depth_groups(unwrapped)).clone()
+                    unwrapped, _depth_obs_groups(unwrapped)).clone()
             except Exception as exc:
                 self._warn("world_depth", f"Could not read the depth cameras: {exc}")
 
@@ -920,20 +951,30 @@ class DataLogger:
         except Exception as exc:
             print(f"[WARN DataLogger] Could not resolve world body frames: {exc}")
 
-        obs_names = set()
-        for names in unwrapped.observation_manager.active_terms.values():
-            obs_names.update(names)
-        self._has_depth = bool({"depth_near", "depth_far"} & obs_names)
+        # Whether there is depth to record, asked of the SAME groups the rows come from
+        # rather than by naming terms. A term-name test went stale twice over: "depth_far"
+        # left the policy group when the policy narrowed to the near camera, and the -image
+        # task calls its term "depth_near_image" -- both of which read as "no cameras" on a
+        # robot that has two.
+        try:
+            from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+                find_depth_obs_terms)
+            self._has_depth = bool(
+                find_depth_obs_terms(unwrapped, _depth_obs_groups(unwrapped))
+            )
+        except Exception as exc:
+            print(f"[WARN DataLogger] Could not look for depth observation terms: {exc}")
         if self._has_depth:
             try:
                 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
-                    depth_camera_specs,
-                    rl_depth_groups,
-                )
+                    depth_camera_specs)
                 # The whole camera contract, so the viewer can reshape the flat token axis
                 # back into images (and denormalise them) without restating any geometry.
+                # Scoped exactly as ``depth_raw`` is (:func:`_depth_obs_groups`): a spec
+                # describing a different camera set than the rows would reshape the wrong
+                # pixels into the right shape, or drop a camera the rows carry.
                 self.metadata["depth_camera_spec"] = depth_camera_specs(
-                    unwrapped, rl_depth_groups(unwrapped))
+                    unwrapped, _depth_obs_groups(unwrapped))
             except Exception as exc:
                 print(f"[WARN DataLogger] Could not read the depth camera spec: {exc}")
 

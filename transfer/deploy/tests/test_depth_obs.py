@@ -206,10 +206,66 @@ def test_identical_specs_agree():
     assert_depth_specs_agree(a, [dict(c) for c in a])
 
 
-def test_differing_camera_count_is_refused():
-    """Two artifacts cannot be reading the same pair if they count cameras differently."""
-    with pytest.raises(ValueError, match="cannot be reading the same physical pair"):
-        assert_depth_specs_agree(parse_depth_spec([_cam()]), parse_depth_spec([_cam(), _cam()]))
+def _near_far() -> list[dict]:
+    """The shipped pair, near then far -- two lenses, matched by NAME not by position."""
+    return parse_depth_spec([
+        _cam(),
+        _cam(obs_term="depth_far", sensor="depth_camera_far", max_distance=12.0),
+    ])
+
+
+def test_a_tracker_reading_fewer_cameras_agrees():
+    """The shipped configuration: the policy reads the near camera, the generator both.
+
+    The policy tracks a reference and does not need to read terrain ahead, so the far camera
+    is the generator's instrument alone and the two contracts legitimately differ in length.
+    """
+    both = _near_far()
+    assert_depth_specs_agree(both[:1], both)
+
+
+def test_the_shared_camera_is_still_compared_across_a_subset():
+    """Dropping the far camera must not stop the near one being checked."""
+    both = _near_far()
+    with pytest.raises(ValueError, match="depth_camera_near.mount_body"):
+        assert_depth_specs_agree(parse_depth_spec([_cam(mount_body="pelvis_link")]), both)
+
+
+def test_cameras_are_matched_by_name_not_by_position():
+    """THE test that the subset relaxation did not become an index pairing.
+
+    Tracker = [far], generator = [near, far]. Matched by name these agree; matched by index
+    the far camera would be compared against the near one, whose range and optics differ --
+    so a pass here is only possible if the match is by name.
+    """
+    both = _near_far()
+    assert_depth_specs_agree(both[1:], both)
+
+
+def test_a_tracker_camera_the_generator_lacks_is_refused():
+    """The other direction is still an error, and the message says so."""
+    both = _near_far()
+    with pytest.raises(ValueError, match=r"does not have.*depth_camera_far|"
+                                         r"depth_camera_far.*does not have"):
+        assert_depth_specs_agree(both, both[:1])
+
+
+def test_the_generators_own_sampling_prefix_is_not_a_different_camera():
+    """``install_fm_depth_group`` names the generator's second grid ``fm_depth_camera_near``.
+
+    That is one lens sampled twice, not two cameras, so the prefix is stripped before the
+    match -- otherwise a split sampling would read as two artifacts with disjoint cameras.
+    """
+    a = parse_depth_spec([_cam()])
+    b = parse_depth_spec([_cam(sensor="fm_depth_camera_near", obs_term="fm_depth_near")])
+    assert_depth_specs_agree(a, b)
+
+
+def test_a_duplicated_camera_identity_is_refused():
+    """Two entries resolving to one lens make every by-name match ambiguous."""
+    with pytest.raises(ValueError, match="both resolve to"):
+        assert_depth_specs_agree(parse_depth_spec([_cam()]),
+                                 parse_depth_spec([_cam(), _cam()]))
 
 
 @pytest.mark.parametrize(

@@ -101,6 +101,25 @@ PRESETS: tuple[str, ...] = ("none", "train", "ood", "ood_push")
 
 #: Observation groups whose corruption the presets drive.  The critic group is always clean
 #: and is absent from the tracker task altogether.
+#:
+#: The GENERATOR's own depth group (``mdp.FM_DEPTH_OBS_GROUP`` = ``fm_depth``) is deliberately
+#: ABSENT, and listing it would be worse than a no-op.  ``enable_corruption`` does exactly one
+#: thing in IsaacLab's ``ObservationManager._prepare_terms``: ``term_cfg.noise = None``.  The
+#: two ``fm_depth`` terms have no ``noise`` field to null -- depth sensor noise is applied
+#: INSIDE ``mdp.depth_image``, from the ``DepthNoiser`` the ``resample_depth_noise_*`` events
+#: register (``mdp/sensors/noise.py``; the policy's own depth term says the same), which the
+#: flag cannot reach.  So the entry would change nothing while writing ``fm_depth`` into the
+#: manifest's ``obs_corruption_groups`` -- a RECORDED CLAIM that the preset controlled the
+#: generator's cameras when it did not.
+#:
+#: What actually controls them is the camera DR (:data:`DEPTH_DR_TERMS`): ``preset='none'``
+#: nulls ``resample_depth_noise_*``, so no noiser is ever registered and ``depth_image``
+#: returns the clean reading, and the ``ood`` presets widen the sensor model
+#: (``ood_depth_noise``).  Either way the generator and the policy get the SAME treatment of
+#: a lens: reading the scene's own cameras, ``DepthNoiser`` shares one frame's draw between
+#: every term that reads them, and when the generator samples on its own grid
+#: ``install_fm_depth_group`` extends those events to ``sensor_cfgs`` lists so one draw moves
+#: both samplings.
 CORRUPTED_OBS_GROUPS: tuple[str, ...] = ("policy", "reference")
 
 

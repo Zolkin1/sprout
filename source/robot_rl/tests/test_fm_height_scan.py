@@ -247,7 +247,7 @@ def test_privileged_sensor_with_drift_is_refused():
 
 
 def test_a_scanner_dr_event_is_refused():
-    """The inverse of ``add_fm_depth_pair``: nothing may randomise either scanner.
+    """The inverse of ``install_fm_depth_group``: nothing may randomise either scanner.
 
     There is no such event today. This exists so that the day someone copies a
     camera-randomisation term onto a scanner, the dense-scan path refuses to be built rather

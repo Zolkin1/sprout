@@ -408,6 +408,46 @@ def _wall_segments(axis: str, lo_y: float, hi_y: float, x0: float, x1: float,
     return [b for b in pieces if b]
 
 
+# TODO(stairwell-walls): a real staircase has walls AT the treads, and these do not.
+#
+# `add_walls` walls the rendered FLOOR's edge, which is correct for the "room" it is trying
+# to build and wrong for the case a robot climbing stairs actually meets. Measured on the 40
+# stairs transition tiles of clips/g1_mb_v5_body_mode11_decor.h5, as lateral distance from
+# the flight's edge to the wall face:
+#
+#     far-side wall    4.98 - 7.05 m  (median 6.36)   always there, never relevant
+#     near-side wall   0.00 - 1.52 m  (median 0.59)   stairwell-like -- but only 18 of 40
+#                                                     tiles carry one at all
+#
+# So over half the stair tiles have nothing within five metres of the flight, and the
+# generator's exposure to "wall beside the stairs" is correspondingly thin. That is the same
+# shape of coverage hole as the stair-WIDTH one: not a perception failure, a gap in what the
+# library contains. Hand-labelled probe sessions (`transfer/sim/stair_probe.py`) are the
+# instrument for whether it costs anything.
+#
+# DO NOT fix this by re-deriving the wall position from the foot envelope. That is what the
+# docstring below records as the version that shipped and was wrong: on a pure-stair tile
+# with metres of unused width it put a wall through the middle of the tile, reading as a
+# random slab rather than a room. The two placements answer different questions and both are
+# wanted -- keep the edge walls as the room, and ADD a stairwell wall keyed to the FLIGHT:
+#
+#   * derive the lateral extent from the tile's own stair overlays (the walkable, non-decor
+#     boxes with a tread-sized x extent), not from the tile, the floor or the envelope;
+#   * flank both sides at a small clearance -- the MuJoCo playground uses 0.15 m, at the
+#     tight end of the realistic half of the distribution above;
+#   * span the flight in x with a lead-in, so the wall is in frame during the approach, which
+#     is when the plan that decides stairs-or-box is made;
+#   * skip a side when a room wall is already close enough to serve, or the two stack;
+#   * its own `stairwell_wall_*` knobs and its own `tile_rng` stream, so it is not correlated
+#     with the width arm or with which sides drew a room wall.
+#
+# `transfer/sim/generate_stairs_scene.lane_wall_geoms` already does exactly this for the
+# MuJoCo playground and is the reference for the geometry; the two must not drift, since the
+# point of the playground is to be the same case off-sim.
+#
+# Visual only, like every other decor overlay, and for a stronger reason at this clearance: a
+# collidable wall beside a flight is swept by the reference's own arm swing, which blocks a
+# wrist, fires `ee_pose_error` and ends the episode for a reason the policy cannot fix.
 def add_walls(tile: dict, footprint: TileFootprint, cfg: DecorateConfig,
               tile_fp: tuple[float, float] | None = None) -> tuple[int, int]:
     """Wall a tile's EDGES, up to all four, so it reads as a room.

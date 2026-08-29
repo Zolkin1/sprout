@@ -108,7 +108,7 @@ void G1Controller::DeclareParams() {
   this->declare_parameter<int>("onnx_threads", 2);
   this->declare_parameter<std::vector<std::string>>("depth_topics",
                                                   std::vector<std::string>{});
-  this->declare_parameter<double>("depth_timeout", 0.25);
+  this->declare_parameter<double>("depth_timeout", 0.15);
   this->declare_parameter<double>("vel_cmd_timeout", 1.0);
   this->declare_parameter<bool>("verbose", false);
   this->declare_parameter<bool>("debug_topics", true);
@@ -160,6 +160,7 @@ void G1Controller::DeclareParams() {
   //
   // Set false to restore training-matched sampling.
   this->declare_parameter<bool>("zero_noise", true);
+  this->declare_parameter<bool>("allow_robot_asset_mismatch", false);
 
   // ---- debug-clip playback ----------------------------------------------------------
   // Drive the tracker from a BAKED MOTION with the generator not loaded at all, so a failure
@@ -218,6 +219,8 @@ G1Controller::on_configure(const rclcpp_lifecycle::State& prev) {
   fm_late_disarm_ticks_ = static_cast<int>(this->get_parameter("fm_late_disarm_ticks").as_int());
   urdf_path_ = this->get_parameter("urdf_path").as_string();
   zero_noise_ = this->get_parameter("zero_noise").as_bool();
+  allow_robot_asset_mismatch_ =
+      this->get_parameter("allow_robot_asset_mismatch").as_bool();
 
   LoadPolicy();
   SetupDepth();
@@ -345,6 +348,7 @@ void G1Controller::LoadPolicy() {
                               : cfg.providers;
   cfg.tracker_intra_threads = tracker_threads_;
   cfg.zero_noise = zero_noise_;
+  cfg.allow_robot_asset_mismatch = allow_robot_asset_mismatch_;
 
   RCLCPP_INFO(this->get_logger(),
               "loading the policy pair from %s (cuda=%d, threads=%d, zero_noise=%d, "
@@ -619,9 +623,8 @@ void G1Controller::Disarm(const std::string& why) {
   RCLCPP_WARN(this->get_logger(), "DISARMED: %s", why.c_str());
 }
 
-bool G1Controller::UpdateWatchdogs() {
+void G1Controller::UpdateWatchdogs() {
   const double now = this->now().seconds();
-  bool stale = false;
 
   if (!policy_->params().depth_cameras.empty() && depth_timeout_ > 0.0) {
     bool any_stale = false;
@@ -635,12 +638,13 @@ bool G1Controller::UpdateWatchdogs() {
     }
     if (any_stale && !depth_stale_) {
       RCLCPP_WARN(this->get_logger(),
-                  "DEPTH DROPOUT: the policy is running on a frozen image.");
+                  "DEPTH DROPOUT: commanding zero. The policy is still running on the frozen "
+                  "image -- zeroing the command asks the robot to stop, it does not make it "
+                  "see.");
     } else if (!any_stale && depth_stale_) {
       RCLCPP_INFO(this->get_logger(), "depth recovered");
     }
     depth_stale_ = any_stale;
-    stale = stale || any_stale;
   }
 
   bool cmd_stale = false;
@@ -655,11 +659,24 @@ bool G1Controller::UpdateWatchdogs() {
     RCLCPP_INFO(this->get_logger(), "velocity command recovered");
   }
   vel_cmd_stale_ = cmd_stale;
-  return stale || cmd_stale;
 }
 
 Vec3 G1Controller::EffectiveCommand() {
-  if (vel_cmd_stale_) return Vec3(0.0, 0.0, 0.0);
+  // EITHER watchdog zeroes it, and they say different things. A stale joystick means nobody
+  // is steering. A stale camera means the generator is planning against an image that has
+  // stopped describing the world -- and the command is the only part of that conditioning
+  // this node can still make honest, so it stops asking for travel the robot cannot see.
+  //
+  // This does NOT unfreeze the image: the policy reads the last frame either way, and the
+  // tracker reads it too (depth replaced the height scan in the policy observation). Zeroing
+  // is a request to stop, not a recovery, which is why the dropout warning says so.
+  //
+  // The latches are read directly, and UpdateWatchdogs now returns nothing: it used to hand
+  // back "anything is stale", the one call site dropped it, and this function consulted only
+  // half the latches -- which is how a depth dropout came to log a warning and change no
+  // motor command at all. They are refreshed at the top of this tick, so they describe THIS
+  // tick's staleness.
+  if (depth_stale_ || vel_cmd_stale_) return Vec3(0.0, 0.0, 0.0);
   std::lock_guard<std::mutex> lock(cmd_mutex_);
   return vel_cmd_;
 }
