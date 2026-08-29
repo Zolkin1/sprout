@@ -166,8 +166,7 @@ class StrideTargeter:
 
 
 def hop_tokens(mb, v0, v1, *, a_max: float, alpha_max: float, floor_s: float,
-               slack: float = 1.3, min_travel_m: float = 0.0,
-               label: str = "") -> tuple[int, int, float]:
+               slack: float = 1.3) -> tuple[int, int, float]:
     """Token BAND for one in-betweening: long enough to be feasible, short enough not to dawdle.
 
     Motion Bricks picks its own horizon, and measured over real transients that choice is essentially
@@ -176,18 +175,14 @@ def hop_tokens(mb, v0, v1, *, a_max: float, alpha_max: float, floor_s: float,
     ``T >= |dv| / a_max``, never below ``floor_s``.  Bound it from ABOVE too (``slack``), because extra
     frames are spent coasting rather than ramping, which lengthens a clip without improving it.
 
-    ``min_travel_m`` adds a DISTANCE floor, and it exists for one caller: the terrain entry transient,
-    which must begin a fixed distance out from the feature so the feature is in the camera when the gait
-    starts changing.  Bounding that transient by the velocity change alone made the latch distance a
-    function of SPEED -- measured 0.14 m at 0.2 m/s rising to 3.06 m at 3.5 m/s, a 22x spread against a
-    zone declared as one number.  Converted at the hop's MEAN speed, since the transient IS the
-    deceleration and neither endpoint describes it.
-
-    The distance floor can exceed what ``max_tokens`` allows (at 0.9 m/s mean a 2 m zone wants 2.22 s
-    against the 1.867 s ceiling), and that is accepted rather than an error: the transient covers what it
-    can and the preceding exact loop covers the rest, which still collapses the spread.  But it WARNS
-    rather than truncating silently, because "the zone was not spanned" is otherwise indistinguishable
-    from "the zone was spanned" in every number downstream.
+    Within that band the DURATION IS THE MODEL'S OWN CHOICE, and that is deliberate: the transition
+    should take as long as it naturally takes.  A ``min_travel_m`` floor briefly lived here, to force
+    the terrain entry transient to span the 2 m approach zone; it was removed because it inverted the
+    property above.  A clip commanded 0.2 m/s entering a 0.30 m/s stair traversal has |dv| = 0.1 m/s
+    and nothing to transition, so making it cover 2 m bought 1.87 s of coasting against a pinned pose --
+    and it drove every approach to the 16-token ceiling, so the latch came out at 1.87 s x speed.  The
+    approach zone is a PLANNING quantity (pass A reserves it; the clutter pass vetoes decoys inside it),
+    not a transient length, and what covers it is the exact loop in front of the transient.
 
     Frames survive as ``4N`` minus the seed overlap and the target window, so the bound is set on the KEPT
     duration, not the raw horizon.  Returns ``(n_min, n_max, t_min_s)``.
@@ -195,27 +190,10 @@ def hop_tokens(mb, v0, v1, *, a_max: float, alpha_max: float, floor_s: float,
     dv = float(np.linalg.norm(np.asarray(v1, np.float64)[:2] - np.asarray(v0, np.float64)[:2]))
     dw = float(abs(float(v1[2]) - float(v0[2])))
     t_min = max(float(floor_s), dv / max(a_max, 1e-6), dw / max(alpha_max, 1e-6))
-    if float(min_travel_m) > 0.0:
-        v_mean = 0.5 * (float(np.linalg.norm(np.asarray(v0, np.float64)[:2]))
-                        + float(np.linalg.norm(np.asarray(v1, np.float64)[:2])))
-        t_min = max(t_min, float(min_travel_m) / max(v_mean, 1e-3))
     trim = 2 * mb.nfpt
-    n_want = int(np.ceil((t_min * mb.fps + trim) / mb.nfpt))
-    # ``slack`` is the model's freedom to pick a LONGER horizon than the floor demands, and it is right
-    # for a flat transient (the extra frames are coasting, which costs clip length and nothing else).
-    # It is wrong the moment a TRAVEL target is what is being asked for, because the whole quantity
-    # being controlled is the distance -- measured: with slack on, every approach ran to the 16-token
-    # ceiling and the latch came out at 1.87 s x speed, i.e. proportional to speed, which is the defect
-    # the floor exists to remove. So a travel-floored hop gets a band of exactly one.
-    n_hi = n_want if float(min_travel_m) > 0.0 else int(
-        np.ceil((t_min * max(slack, 1.0) * mb.fps + trim) / mb.nfpt))
-    n_max = n_hi
-    n_min = int(np.clip(n_want, mb.min_tokens, mb.max_tokens))
-    if float(min_travel_m) > 0.0 and n_min < n_want:
-        kept_s = (n_min * mb.nfpt - trim) / mb.fps
-        print(f"[hop_tokens] {label or 'transient'}: a {float(min_travel_m):.2f} m travel floor wants "
-              f"{n_want} tokens ({t_min:.2f} s), capped at {mb.max_tokens} "
-              f"({kept_s:.2f} s kept). The preceding loop covers the remainder.")
+    n_min = int(np.ceil((t_min * mb.fps + trim) / mb.nfpt))
+    n_max = int(np.ceil((t_min * max(slack, 1.0) * mb.fps + trim) / mb.nfpt))
+    n_min = int(np.clip(n_min, mb.min_tokens, mb.max_tokens))
     return n_min, int(np.clip(max(n_max, n_min), mb.min_tokens, mb.max_tokens)), t_min
 
 # ---- pose / command helpers ----------------------------------------------------------------------

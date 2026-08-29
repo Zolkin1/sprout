@@ -108,7 +108,7 @@ def test_a_cache_with_no_gen_version_is_stale():
     assert why is not None and "gen_version" in why
 
 
-# --------------------------------------------------------------------------- hop_tokens' travel floor
+# --------------------------------------------------------------- hop_tokens: the horizon is the MODEL's
 class _MB:
     """The four fields ``hop_tokens`` reads, at the shipped Motion Bricks values."""
 
@@ -118,84 +118,52 @@ class _MB:
     max_tokens = 16
 
 
-def test_min_travel_is_a_no_op_at_zero():
-    """Every flat transient passes 0, so the default must not move a single token."""
-    import mb_env
+def test_the_band_leaves_the_model_a_choice():
+    """``slack`` is what makes the duration Motion Bricks' own, and it must stay a real band.
 
-    for v0, v1 in [((0.4, 0, 0), (1.2, 0, 0)), ((2.6, 0, 0), (0.69, 0, 0)), ((0.2, 0, 0), (0.2, 0, 0))]:
-        base = mb_env.hop_tokens(_MB(), v0, v1, a_max=2.0, alpha_max=2.0, floor_s=0.35)
-        explicit = mb_env.hop_tokens(_MB(), v0, v1, a_max=2.0, alpha_max=2.0, floor_s=0.35,
-                                     min_travel_m=0.0)
-        assert base == explicit
-
-
-def test_min_travel_collapses_the_latch_spread():
-    """The defect: without a travel floor the entry transient's length tracks SPEED, 22x across the band.
-
-    Measured on the shipped recipe -- 0.14 m of travel at 0.2 m/s against 3.06 m at 3.5 m/s. With a
-    2 m floor every speed asks for at least the tokens that cover 2 m, so the slow end stops being
-    an order of magnitude short.
-    """
-    import mb_env
-
-    entry = 0.69                                              # a solved stairs_up traversal speed
-    slow = mb_env.hop_tokens(_MB(), (0.2, 0, 0), (entry, 0, 0), a_max=2.0, alpha_max=2.0,
-                             floor_s=0.35, min_travel_m=2.0)
-    slow_free = mb_env.hop_tokens(_MB(), (0.2, 0, 0), (entry, 0, 0), a_max=2.0, alpha_max=2.0,
-                                  floor_s=0.35)
-    assert slow[0] > slow_free[0], "a 2 m floor must lengthen a slow approach"
-    # t_min is the honest number: 2 m at a 0.445 m/s mean is 4.49 s, far past the 0.35 s floor.
-    assert slow[2] == pytest.approx(2.0 / (0.5 * (0.2 + entry)), rel=1e-6)
-
-
-def test_min_travel_is_capped_rather_than_raising():
-    """A floor the model's horizon cannot reach is ACCEPTED, not an error -- the preceding loop covers
-    the rest. Silently truncating is what the warning in ``hop_tokens`` exists to prevent."""
-    import mb_env
-
-    n_min, n_max, t_min = mb_env.hop_tokens(_MB(), (0.2, 0, 0), (0.2, 0, 0), a_max=2.0,
-                                            alpha_max=2.0, floor_s=0.35, min_travel_m=2.0)
-    assert n_min == _MB.max_tokens and n_max == _MB.max_tokens
-    assert t_min > (n_min * _MB.nfpt - 2 * _MB.nfpt) / _MB.fps, (
-        "this case is supposed to be the capped one, or the test is not testing the cap")
-
-
-def test_a_travel_floored_hop_gets_a_band_of_ONE():
-    """``slack`` and a travel target are incompatible, and the measurement says so.
-
-    ``slack`` lets the model pick a LONGER horizon than the floor demands, which is right for a flat
-    transient -- the extra frames are coasting, costing clip length and nothing else. With a travel
-    target the distance IS the controlled quantity, so that freedom is the defect: measured on the
-    quick build, leaving slack on ran every approach to the 16-token ceiling and the latch came out at
-    1.87 s x speed, i.e. proportional to speed. Pinning the band collapsed the latch of the 15
-    approaches the ceiling does not bind from a 40.8x spread to 1.5x (1.635 - 2.519 m against a
-    declared 2.0 m zone).
+    A ``min_travel_m`` floor briefly forced the terrain entry transient to span the 2 m approach zone,
+    and to make that bite it also collapsed the band to one token count. Both are gone: a clip
+    commanded 0.2 m/s into a 0.30 m/s stair entry has |dv| = 0.1 m/s and nothing to transition, so
+    covering 2 m bought 1.87 s of coasting against a pinned pose -- the exact failure ``slack`` exists
+    to prevent -- and it drove every approach to the 16-token ceiling, making the latch 1.87 s x speed.
     """
     import mb_env
 
     n_min, n_max, _ = mb_env.hop_tokens(_MB(), (2.6, 0, 0), (0.36, 0, 0), a_max=2.0, alpha_max=2.0,
-                                        floor_s=0.35, slack=1.3, min_travel_m=2.0)
-    assert n_min == n_max, "a travel-floored hop must not be free to overshoot the target distance"
-
-    # ...and slack still applies where there is no travel target, or every flat transient changes.
-    f_min, f_max, _ = mb_env.hop_tokens(_MB(), (2.6, 0, 0), (0.36, 0, 0), a_max=2.0, alpha_max=2.0,
                                         floor_s=0.35, slack=1.3)
-    assert f_max > f_min
+    assert n_max > n_min, "the model must be left a range of horizons to choose from"
+    assert n_min >= _MB.min_tokens and n_max <= _MB.max_tokens
 
 
-def test_the_slow_end_is_bounded_by_the_TOKEN_CEILING_and_that_is_named():
-    """The residual latch spread is Motion Bricks' 16-token horizon, not a missing bound.
-
-    At 0.2 m/s a 2 m zone wants 7.9 s against the 1.87 s the model can produce, so the transient
-    covers 0.45 m and the preceding EXACT LOOP covers the remaining 1.55 m -- at precisely the
-    commanded speed, which is better motion than an in-betweening at the same velocity would be.
-    Pinned so that a future ``max_tokens`` change is recognised as the thing that moves this.
-    """
+def test_a_small_change_gets_a_SHORT_transient():
+    """The slow-stair case that the travel floor got wrong: |dv| = 0.1 m/s needs almost no time."""
     import mb_env
 
-    n_min, n_max, t_min = mb_env.hop_tokens(_MB(), (0.2, 0, 0), (0.3, 0, 0), a_max=2.0, alpha_max=2.0,
-                                            floor_s=0.35, min_travel_m=2.0)
-    assert n_min == n_max == _MB.max_tokens
-    kept_s = (n_min * _MB.nfpt - 2 * _MB.nfpt) / _MB.fps
-    assert t_min > kept_s, "this is supposed to be the ceiling-bound case"
-    assert kept_s * 0.5 * (0.2 + 0.3) < 2.0, "the ceiling really does leave the zone unspanned here"
+    n_min, _n_max, t_min = mb_env.hop_tokens(_MB(), (0.2, 0, 0), (0.3, 0, 0), a_max=2.0, alpha_max=2.0,
+                                             floor_s=0.35, slack=1.3)
+    assert n_min == _MB.min_tokens, "nothing to transition, so ask for the fewest tokens"
+    assert t_min == pytest.approx(0.35), "the floor binds, not the velocity change"
+
+
+def test_a_large_deceleration_is_bounded_by_the_change_not_by_a_distance():
+    """``T >= |dv| / a_max`` is the only lower bound; the exact loop covers the travel budget."""
+    import mb_env
+
+    n_min, _n, t_min = mb_env.hop_tokens(_MB(), (3.3, 0, 0), (0.1, 0, 0), a_max=2.0, alpha_max=2.0,
+                                         floor_s=0.35, slack=1.3)
+    assert t_min == pytest.approx(3.2 / 2.0)
+    assert n_min > _MB.min_tokens
+
+
+def test_hop_tokens_takes_no_distance_argument():
+    """Pinned so the travel floor is not reintroduced without reading why it went.
+
+    The approach zone is a PLANNING quantity -- pass A reserves it beside the terrain and the clutter
+    pass vetoes decoys inside it -- not a length to force on one generation.
+    """
+    import inspect
+
+    import mb_env
+
+    params = set(inspect.signature(mb_env.hop_tokens).parameters)
+    assert not (params & {"min_travel_m", "min_travel", "travel_m"}), sorted(params)

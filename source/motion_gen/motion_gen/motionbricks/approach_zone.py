@@ -1,11 +1,11 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""How far ahead of a terrain feature a clip stops tracking the command and starts transitioning.
+"""How much walkable surface a clip RESERVES next to a terrain feature.
 
 ONE constant, shared by the two consumers that must agree about it:
 
-* the CLIP GENERATOR -- where the approach stops being steady locomotion and the in-betweening into
-  the terrain entry begins;
+* the CLIP GENERATOR -- pass A adds it to the hold that adjoins the terrain, so the in-betweening
+  into the terrain entry always has surface to happen on;
 * the VISUAL-CLUTTER pass (``terrain.clutter``) -- an interactable-looking decoy is vetoed if the
   robot's path enters its zone at all, because walking past a staircase is a lesson and walking into
   its approach zone without latching is the opposite one.
@@ -20,6 +20,36 @@ It lives in ``motionbricks/`` rather than ``terrain/`` because ``mb_env.load_sch
 modules by path out of this directory, which is how the Motion Bricks conda env -- a separate process
 that cannot import the package normally -- reads the generation contracts. numpy + stdlib only, no
 intra-package imports, same as its siblings.
+
+IT IS A PLANNING QUANTITY, NOT A TRANSIENT LENGTH
+-------------------------------------------------
+This is the one thing to get right about it, and it was got wrong once. The zone is how much surface
+is RESERVED beside the terrain; it is not how long the in-betweening into the terrain lasts. That
+duration is Motion Bricks' own choice, bounded only by the velocity change (``mb_env.hop_tokens``),
+and whatever the transient does not use is covered by the exact loop in front of it, at a constant
+commanded speed. The transition takes as long as it naturally takes and no longer.
+
+Forcing the transient to SPAN the zone was tried and reverted, and the measurements say why:
+
+* a clip commanded 0.2 m/s entering a 0.30 m/s stair traversal has |dv| = 0.1 m/s and essentially
+  nothing to transition. Making it cover 2 m bought 1.87 s of coasting against a pinned pose --
+  exactly the "extra frames are spent coasting rather than ramping" failure the ``slack`` bound
+  exists to prevent;
+* it drove 24 of 24 approaches to the model's 16-token ceiling (against 2 of 24 when free), so the
+  latch came out at 1.87 s x speed -- still proportional to speed, which was the very thing the
+  floor was meant to remove;
+* it made the entry SEAM worse: pooled seam-accel ratio p50 2.42 / p95 6.77 forced, against
+  1.71 / 5.17 free. A transient given only the time it needs converges cleanly; one made to coast
+  arrives with a mismatched gait phase.
+
+So the latch distance is a deterministic function of the deceleration -- 0.10 m at 0.2 m/s where
+there is nothing to shed, 4.29 m at 3.3 m/s where there is. That is not an unlearnable spread: both
+the current speed and the distance to the terrain are observable, so where the transition begins is
+predictable from what the generator can see. A FIXED latch would be the arbitrary one.
+
+Where a deceleration genuinely exceeds one horizon (3.5 -> 0.1 m/s wants 2.21 s against a 1.867 s
+ceiling), the answer is the lead-up's own loop/transient alternation shedding speed on the FLAT
+first, so the terrain transient bridges only what is left.
 
 WHY 2.0 m, and why it is hard-coded
 -----------------------------------

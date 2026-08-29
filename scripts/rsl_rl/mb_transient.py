@@ -78,8 +78,7 @@ def ramp_waypoints(v0, v1, ramp_dv: float, achieved) -> list:
 
 
 def generate(mb, sb, flat_plan, strides, achieved, bank_dt: float, tr, seed: int, *,
-             a_max: float, alpha_max: float, floor_s: float, ramp_dv: float, slack: float,
-             min_travel_m: float = 0.0):
+             a_max: float, alpha_max: float, floor_s: float, ramp_dv: float, slack: float):
     """One transient -> ``(qpos[T,36], diag)`` at the MODEL's frame rate, trimmed at both ends.
 
     A large velocity change is generated as several chained hops (see :func:`ramp_waypoints`), each
@@ -87,9 +86,6 @@ def generate(mb, sb, flat_plan, strides, achieved, bank_dt: float, tr, seed: int
 
     Args:
         tr: a :class:`flat_plan.Transient` -- ``(stride_out, phase_out, stride_in, phase_in, key)``.
-        min_travel_m: floor on the DISTANCE the transient covers, passed through to
-            :func:`mb_env.hop_tokens`. Zero (the default, and what every flat transient uses) leaves
-            the duration bounded by the velocity change alone.
     """
     step = mb.dt / bank_dt
     cmd = np.asarray(achieved[tr.stride_in], np.float32)          # where we are going
@@ -107,11 +103,8 @@ def generate(mb, sb, flat_plan, strides, achieved, bank_dt: float, tr, seed: int
         # A standing start needs real gait initiation (~1 s measured), so it keeps a larger floor than a
         # hop that is already moving.
         f_s = max(floor_s, 1.0) if (j == 0 and tr.stride_out < 0) else floor_s
-        # The travel floor rides on the LAST hop only: it exists to make an entry transient span the
-        # approach zone, and that is a property of the whole chain's endpoint, not of each hop.
-        n_min, n_max, t_min = mb_env.hop_tokens(
-            mb, v_prev, w, a_max=a_max, alpha_max=alpha_max, floor_s=f_s, slack=slack,
-            min_travel_m=(float(min_travel_m) if last else 0.0), label=f"{tr.key} hop {j}")
+        n_min, n_max, t_min = mb_env.hop_tokens(mb, v_prev, w, a_max=a_max, alpha_max=alpha_max,
+                                                floor_s=f_s, slack=slack)
         allowed = mb_env.allowed_tokens_mask(n_min, mb.min_tokens, mb.max_tokens, n_max=n_max)
         if j == 0 and tr.stride_out < 0:
             # The clip's opening transient: no outgoing loop, so start from the agent's own standing reset.
