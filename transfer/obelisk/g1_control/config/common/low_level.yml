@@ -74,7 +74,28 @@ control:
       # Zero the velocity command if no depth frame arrives within this many seconds
       # (<=0 disables). Judged on LOCAL RECEIPT time, not the header stamp: the camera
       # clock is not synchronised to this machine.
-      depth_timeout: 0.25
+      #
+      # What this does NOT do, because it cannot: the policy keeps reading the LAST frame,
+      # so the robot is still planning and tracking against an image that has stopped
+      # describing the world. Zeroing asks it to come to a stop; it is not a recovery. The
+      # camera buffer is only ever overwritten by a new frame, so a dead camera stays frozen
+      # for as long as it is dead -- on the ZED pair that is a respawn_delay of 10 s plus the
+      # 25-30 s sl::Camera::close() takes to release the device.
+      #
+      # 0.15 = 7.5 ticks at the 0.02 s control period. Chosen against what the GENERATOR was
+      # trained on, not against the camera's frame interval: `depth_latency_probs` gives the
+      # deployed checkpoint support over {20, 40, 60} ms of lag, capped at 3 steps by
+      # DEPTH_LAG_STEPS, so 60 ms is the oldest frame it has ever seen. Everything past that
+      # is out of distribution however healthy the camera looks, and a prior measurement on
+      # the two-box split put a failure cliff between 20 and 40 ms of staleness.
+      #
+      # It is a compromise and not a bound: 0.15 still trips at 2.5x the largest trained lag.
+      # The floor is set by the ARRIVAL GAP, since this is judged on receipt -- the ZED pair
+      # runs at 47.2 / 47.7 Hz, so 0.15 tolerates about seven consecutive dropped frames
+      # before firing, and a threshold near 60 ms would fire on ordinary jitter. Note the
+      # measured `depth_capture_age` of 53.7 / 36.9 ms does NOT enter this test: that is
+      # pipeline latency, a roughly constant offset on every frame, not a gap between them.
+      depth_timeout: 0.15
       # Likewise if no velocity command arrives -- a dead high level must not leave the
       # robot walking at the last commanded speed.
       vel_cmd_timeout: 1.0

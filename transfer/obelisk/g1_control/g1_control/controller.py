@@ -224,7 +224,7 @@ class G1Controller(ObeliskController):
         self.declare_parameter("use_cuda", False)
         self.declare_parameter("onnx_threads", 2)
         self.declare_parameter("depth_topics", [""])
-        self.declare_parameter("depth_timeout", 0.25)
+        self.declare_parameter("depth_timeout", 0.15)
         self.declare_parameter("vel_cmd_timeout", 1.0)
         self.declare_parameter("verbose", False)
 

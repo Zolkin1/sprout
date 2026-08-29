@@ -112,9 +112,15 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
 
   void Arm();
   void Disarm(const std::string& why);
-  /// Refresh the staleness latches, logging only the EDGES. Returns true if anything is stale.
-  bool UpdateWatchdogs();
-  /// The command after the watchdogs: zeros when the joystick has gone quiet.
+  /// Refresh the staleness latches, logging only the EDGES.
+  ///
+  /// Returns nothing on purpose. The LATCHES are the interface: this used to return
+  /// "anything is stale", the one call site discarded it, and `EffectiveCommand` consulted
+  /// only `vel_cmd_stale_` -- so a depth dropout logged a warning, set a diagnostic field,
+  /// and left the robot walking at the last commanded velocity on a frozen image. A return
+  /// value that looks consumed and is not is what made that invisible.
+  void UpdateWatchdogs();
+  /// The command after the watchdogs: zeros when the joystick has gone quiet OR the depth has.
   g1_deploy::Vec3 EffectiveCommand();
   /// Base orientation AND angular velocity from one estimator sample, with the
   /// degenerate-quaternion guard applied to both.
@@ -228,7 +234,7 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   bool use_cuda_ = false;
   int onnx_threads_ = 2;
   std::vector<std::string> depth_topics_;
-  double depth_timeout_ = 0.25;
+  double depth_timeout_ = 0.15;
   double vel_cmd_timeout_ = 1.0;
   bool verbose_ = false;
   bool debug_topics_ = true;
