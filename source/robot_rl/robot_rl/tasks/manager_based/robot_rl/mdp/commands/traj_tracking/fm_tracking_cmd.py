@@ -21,6 +21,26 @@ clip library still supplies is exactly two things, both unavoidable in simulatio
 2. the **``target_vel`` command** -- the joystick stand-in that conditions the FM and feeds
    the policy's ``command_window``. On hardware this is a real joystick.
 
+**On the FREE-FORM terrain sections neither of those exists**, because that library carries a
+manifest and no clips at all. ``cfg.freeform_command`` (off by default, so every clip task is
+untouched) replaces the second: the command is generated here -- a per-episode forward speed
+after a standing hold, ``vy`` pinned to 0, and a yaw rate from a P controller on the bearing to
+a point down the section's centreline -- and it is HELD across every window offset and across
+the generator's whole horizon, which is what both deploy runtimes do. See
+:func:`freeform_yaw_rate` for the law and for the distribution change steering on a staircase
+is. The spawn is the reset event's problem
+(``mdp.events.resets.reset_on_freeform_section``).
+
+**And the CLIP HALF of every step is skipped there.** This class builds BOTH references every
+step and applies one, which needs a clip to build the first from; with none, ``has_clips`` is
+False and :meth:`FmTrackingCommand._advance_without_a_clip` runs in place of
+:meth:`FmTrackingCommand._build_clip_reference`, keeping only the plan-anchor latch. The clip
+step therefore never advances, ``as_clip_reference()`` is refused, and every manager gather
+raises by name -- so a clip-consuming term left wired on that task fails loudly instead of
+tracking a reference nobody wrote. The permission is per configuration
+(:attr:`FmTrackingCommand.accepts_clip_free_library`): under ``reference_source="clip"`` a
+library with no clips is refused at construction, here as on the base class.
+
 Everything else is generated. ``strict_fm_only`` fills every output channel the FM does not
 write with NaN each step, so an accidental read of clip-derived data fails loudly instead of
 quietly tracking the wrong thing.
@@ -81,8 +101,102 @@ from robot_rl.flow_matching.window import (
     window_to_world,
 )
 
+from .world_lift_isaac import yaw_from_quat
+
 from .motion_sequence_cmd import MotionSequenceCommand
 from .fm_tracking_cmd_cfg import FmTrackingCommandCfg
+
+
+#: Body-frame lateral velocity on the free-form sections, always exactly this. The deployed
+#: controller ships ``v_y_scale: 0.0`` and the training library measures ``|vy| max = 0.0000``
+#: over all 3500 stair clips, so a non-zero channel here would train something the deployed
+#: pair cannot ask for.
+FREEFORM_VY: float = 0.0
+
+
+def wrap_to_pi(angle: torch.Tensor) -> torch.Tensor:
+    """Wrap an angle (rad) to ``[-pi, pi]``, elementwise.
+
+    Via ``atan2(sin, cos)`` rather than a modulo, matching
+    ``transfer/sim/mjeval/runner.steer_yaw_rate``: that is what makes a heading either side of
+    the target turn the SHORT way, and the two forms disagree at the branch.
+
+    **Which sign an exactly-antiparallel input comes back with is not defined here** and
+    nothing may depend on it: it follows the sign of the floating-point ``sin``, and
+    ``float32(pi)`` rounds ABOVE pi, so ``wrap_to_pi(pi)`` measures -3.1415925 rather than
+    +pi. Only the magnitude is meaningful there, and a robot pointed exactly backwards is a
+    measure-zero case the controller resolves on the next step either way.
+
+    Args:
+        angle: Any shape.
+
+    Returns:
+        The same shape, every entry in ``[-pi, pi]``.
+    """
+    return torch.atan2(torch.sin(angle), torch.cos(angle))
+
+
+def freeform_yaw_rate(
+    pos_xy: torch.Tensor,
+    yaw: torch.Tensor,
+    origin_xy: torch.Tensor,
+    heading: torch.Tensor,
+    lookahead: float,
+    kp: float,
+    wz_max: float,
+) -> torch.Tensor:
+    """Proportional yaw rate aiming the robot at a point ``lookahead`` metres down the section.
+
+    The vectorised twin of ``transfer/sim/mjeval/runner.steer_yaw_rate`` -- same law, same
+    wrap, same clip -- differing only in that the section is an infinite straight CENTRELINE
+    rather than a goal point, so the aim point recedes with the robot instead of being reached.
+    Project the root onto the centreline, step ``lookahead`` further along it, take the bearing
+    to that point, and drive the heading error to zero.
+
+    **The effective CROSS-TRACK gain is ``kp / lookahead``, not ``kp``.** With the robot already
+    pointing down the section and a signed lateral offset ``e``, the bearing error is
+    ``atan2(-e, lookahead) ~= -e / lookahead``, so ``wz ~= -(kp / lookahead) * e``. The two
+    knobs are therefore coupled: at the shipped 1.0 and 5.0 m that is 0.2 1/s, which is a weak
+    restoring gain across a 1.219 m flight. Shorten the look-ahead before raising ``kp``.
+
+    **This runs EVERYWHERE, the flight included, and that is a deliberate distribution change.**
+    The generator was commanded ``|wz| max = 0.0000`` over all 3500 stair clips of the training
+    library (measured; see ``mjeval/runner.steer_yaw_rate``, which states the same number and is
+    opt-in there for this reason), and the generator is FROZEN during the fine-tune. So on a
+    staircase this asks it to extrapolate in wz. It is on anyway because the free-form sections
+    are metres long and nothing else in the loop steers: without it, a few degrees of
+    accumulated heading error walks the robot off the side of the flight, and what gets measured
+    is the drift rather than the terrain.
+
+    Args:
+        pos_xy: ``[N, 2]`` root world position.
+        yaw: ``[N]`` root heading (rad), world frame.
+        origin_xy: ``[N, 2]`` any point on the section's centreline, world frame.
+        heading: ``[N]`` centreline direction (rad), world frame -- the sense the robot
+            traverses in, so the aim point is always ahead.
+        lookahead: Metres along the centreline past the robot's projection. Must be ``> 0``.
+        kp: Proportional gain (1/s). ``0`` returns exactly zero.
+        wz_max: Symmetric clip (rad/s).
+
+    Returns:
+        ``[N]`` commanded yaw rate (rad/s).
+
+    Raises:
+        ValueError: If ``lookahead <= 0``, where the aim point would sit on or behind the
+            robot's own projection and the bearing would stop meaning anything.
+    """
+    if lookahead <= 0.0:
+        raise ValueError(
+            f"freeform_yaw_rate needs a positive look-ahead, got {lookahead}. At 0 the aim "
+            "point is the robot's own projection onto the centreline and the bearing is "
+            "undefined; negative aims it backwards."
+        )
+    direction = torch.stack([torch.cos(heading), torch.sin(heading)], dim=-1)   # [N, 2]
+    along = ((pos_xy - origin_xy) * direction).sum(dim=-1)                      # [N] downrange
+    target = origin_xy + (along + lookahead)[:, None] * direction               # [N, 2]
+    delta = target - pos_xy
+    bearing = torch.atan2(delta[:, 1], delta[:, 0])
+    return torch.clamp(kp * wrap_to_pi(bearing - yaw), min=-wz_max, max=wz_max)
 
 
 class FmTrackingCommand(MotionSequenceCommand):
@@ -112,6 +226,22 @@ class FmTrackingCommand(MotionSequenceCommand):
                 f"FmTrackingCommandCfg.reference_source must be 'fm' or 'clip', got "
                 f"{self.cfg.reference_source!r}."
             )
+        if not self.has_clips:
+            # Reached only under reference_source="fm" -- ``super()._post_init()`` above has
+            # already refused every other configuration via ``accepts_clip_free_library``.
+            # Printed because a library with no motion in it is the single most surprising
+            # thing about this run, and it is otherwise invisible: the file loads, the terrain
+            # meshes and the task starts.
+            print(
+                "[INFO FmTrackingCommand] the clip library carries a terrain manifest and ZERO "
+                f"CLIPS ({self.cfg.path}). The clip half of every step is SKIPPED -- no clip "
+                "reference is built, the clip step never advances, as_clip_reference() is "
+                "refused and every manager gather raises. The generator is the only reference. "
+                "This is the free-form fine-tune; the spawn, the velocity command and the "
+                "episode bound must all come from somewhere other than a clip (see "
+                "G1FinetuneFreeformEnvCfg)."
+            )
+            self._refuse_clip_phase_knobs()
         # Reference caches + the "which half is being built / served" flags. Set before any
         # early return so the accessors below are always safe to call.
         self._building: str | None = None
@@ -130,6 +260,17 @@ class FmTrackingCommand(MotionSequenceCommand):
         #: Nodes 0 and 1 of the prediction, for the finite-difference joint velocity
         #: the body FK Jacobian needs (see _write_fm_root_body_frames).
         self._first_two_offsets = torch.arange(2, dtype=torch.long, device=dev)
+
+        # The free-form velocity command. Allocated BEFORE the early returns below, for the
+        # same reason the reference caches are: the four command-velocity accessors are public
+        # and must never reach an attribute that a skipped construction path never wrote.
+        self._ff_cmd = torch.zeros(n, 3, device=dev)
+        self._ff_speed = torch.zeros(n, device=dev)
+        self._ff_origin_w = torch.zeros(n, 2, device=dev)
+        self._ff_heading_w = torch.zeros(n, device=dev)
+        self._ff_hold_steps = 0
+        if self.freeform_command:
+            self._init_freeform_command()
 
         if not self.command_velocity_available:
             raise RuntimeError(
@@ -457,7 +598,363 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._pending_reset[:] = True
         else:
             self._pending_reset[env_ids] = True
-        return super().reset(env_ids)
+        out = super().reset(env_ids)
+        if self.freeform_command:
+            ids = (torch.arange(self.num_envs, device=self.device) if env_ids is None
+                   else env_ids)
+            self._reset_freeform_command(ids)
+        return out
+
+    # ------------------------------------------------------------------
+    # The free-form velocity command (cfg.freeform_command; off by default)
+    #
+    # The clip tasks read the command the library recorded, because the clip WAS generated
+    # from it. The free-form terrain sections have no clips, so the command is manufactured
+    # the way the deployed joystick supplies one: a per-episode forward speed, no lateral
+    # channel, and a yaw rate that keeps the robot pointed down the section.
+    #
+    # Every accessor below is a view of ONE per-step buffer that :meth:`_update_freeform_command`
+    # rewrites IN PLACE, matching how ``_apply_source`` keeps ``y_des`` a single stable tensor.
+    # Clone before holding one across a step -- ``mdp.command_velocity`` already does.
+    # ------------------------------------------------------------------
+    #: Config fields that only mean something with a clip, as ``(field, forbidden value, why)``.
+    #: Each one is checked at construction on a clip-free library rather than left to fail at
+    #: the gather it eventually reaches: three of the four are read only at a RESET, so the
+    #: failure would otherwise land after a simulator launch and a first episode, and one
+    #: (``random_start_phase``) is read only by the clip reset event the free-form task
+    #: disables -- so it would never fail at all, and would sit in ``params/env.yaml`` as a
+    #: false statement about how the run started.
+    #:
+    #: **This list is NOT every clip-only field on the cfg, and must not be read as one.**
+    #: Four more are likewise read only by the disabled clip reset and are deliberately left
+    #: out, because the shipped free-form cfg inherits them at values a refusal would reject:
+    #: ``ego_anchor_fraction`` (1.0 -- with no clip reset ``_ego_mask`` stays all-False, so
+    #: the ego re-anchor is inert rather than wrong, and ``_reanchor_clip_ids`` returns on the
+    #: empty id set before it can gather), ``random_start_before_terrain_end`` (True),
+    #: ``random_start_min_remaining_s`` and ``randomize_heading`` -- the last three read only
+    #: inside ``resets.sample_start_step`` / the clip placement. The line drawn is therefore
+    #: "would refusing reject the shipped cfg", not "is this field about a clip": the four
+    #: above are inert, and like ``random_start_phase`` they too sit in ``params/env.yaml``
+    #: describing a start that never happens. Verified by walking the constructed cfg, not by
+    #: reading the class.
+    _CLIP_PHASE_KNOBS: tuple[tuple[str, object, str], ...] = (
+        ("history_from", "generator",
+         "the only other value is 'clip' -- teacher forcing, which feeds the generator the "
+         "CLIP's window as history (_clip_history_node) and is a per-step clip gather"),
+        ("seed_history_from_clip", "never",
+         "seeding reads the clip's steps BEFORE the episode start; with no clip every episode "
+         "opens on the learned null-history embedding, which is the deploy condition anyway"),
+        ("random_start_phase", False,
+         "there is no clip phase to start at"),
+        ("random_start_before_terrain_start", False,
+         "there is no clip whose terrain-pinned run a start could be placed before"),
+    )
+
+    def _refuse_clip_phase_knobs(self) -> None:
+        """Refuse any clip-phase knob left on against a library with no clips.
+
+        Every one of these is a claim about a motion that does not exist. Checked together and
+        reported together, so a misconfigured run is fixed in one pass rather than one field per
+        launch.
+
+        Raises:
+            ValueError: If any knob in :data:`_CLIP_PHASE_KNOBS` is not at its required value.
+        """
+        wrong = [(name, getattr(self.cfg, name, want), want, why)
+                 for name, want, why in self._CLIP_PHASE_KNOBS
+                 if getattr(self.cfg, name, want) != want]
+        if not wrong:
+            return
+        lines = "\n".join(
+            f"    commands.traj_ref.{name} = {got!r}  (must be {want!r}: {why})"
+            for name, got, want, why in wrong
+        )
+        raise ValueError(
+            "these clip-phase settings cannot be honoured against a CLIP-FREE library "
+            f"({self.cfg.path}), which carries a terrain manifest and zero clips:\n"
+            f"{lines}\n"
+            "G1FinetuneFreeformEnvCfg sets all four; a run overriding one of them back on is "
+            "asking for a clip that is not in the file."
+        )
+
+    @property
+    def accepts_clip_free_library(self) -> bool:
+        """A generator-driven run needs no clips: it needs the library's TERRAIN.
+
+        Overrides :attr:`MotionSequenceCommand.accepts_clip_free_library`. True exactly when
+        the generator IS the reference -- under ``reference_source="clip"`` this term serves
+        the clip, so a library with none is as useless here as it is on the base class, and the
+        pure-clip control run (``fm_checkpoint=""``) is that case.
+
+        Note this permits the combination but does not make the whole TASK work on its own: a
+        clip-free library also removes the spawn, the velocity command and the episode bound,
+        and each of those has its own replacement wired in ``G1FinetuneFreeformEnvCfg``. What
+        it does guarantee is that anything still reaching for a clip fails by name.
+        """
+        return getattr(self.cfg, "reference_source", None) == "fm"
+
+    @property
+    def freeform_command(self) -> bool:
+        """Is the velocity command generated here rather than read from the clip library?
+
+        Read through ``getattr`` so the bare instances the unit tests build (``object.__new__``
+        with a ``SimpleNamespace`` cfg) answer False instead of raising -- the same idiom the
+        ``tracking_mode`` reads in this file use.
+        """
+        return bool(getattr(self.cfg, "freeform_command", False))
+
+    def _init_freeform_command(self) -> None:
+        """Validate the free-form knobs and derive the opening hold in whole control steps.
+
+        Called from :meth:`_post_init` only when the flag is set, so a clip task pays nothing
+        and cannot be failed by a validation rule over fields it never touches.
+
+        The hold rounds against ``env.step_dt``: at the shipped 0.5 s and a 0.02 s control step
+        that is 25 held steps, the same count ``mjeval``'s ``time < hold_until`` produces.
+        """
+        lo = float(self.cfg.freeform_speed_min)
+        hi = float(self.cfg.freeform_speed_max)
+        if hi < lo:
+            raise ValueError(
+                f"freeform_speed_max ({hi}) is below freeform_speed_min ({lo}); the per-episode "
+                "draw is uniform on [min, max] and an inverted band would silently give every "
+                "episode the same speed."
+            )
+        if float(self.cfg.freeform_lookahead_m) <= 0.0:
+            raise ValueError(
+                f"freeform_lookahead_m must be > 0, got {self.cfg.freeform_lookahead_m}. "
+                "See freeform_yaw_rate: at 0 the aim point is the robot's own projection."
+            )
+        if float(self.cfg.freeform_steer_kp) < 0.0:
+            raise ValueError(
+                f"freeform_steer_kp must be >= 0, got {self.cfg.freeform_steer_kp}. A negative "
+                "gain steers AWAY from the centreline, which looks like a drifting policy."
+            )
+        if float(self.cfg.freeform_wz_max) < 0.0:
+            raise ValueError(
+                f"freeform_wz_max must be >= 0, got {self.cfg.freeform_wz_max}; it is a "
+                "symmetric clip."
+            )
+        hold_s = float(self.cfg.freeform_cmd_hold_s)
+        if hold_s < 0.0:
+            raise ValueError(f"freeform_cmd_hold_s must be >= 0, got {hold_s}.")
+        self._ff_hold_steps = int(round(hold_s / float(self.env.step_dt)))
+        print(
+            f"[INFO FmTrackingCommand] free-form velocity command: vx ~ U[{lo:.3f}, {hi:.3f}] "
+            f"m/s held for the whole episode, vy = {FREEFORM_VY}, "
+            f"wz = clip({self.cfg.freeform_steer_kp} * heading_err, "
+            f"+/-{self.cfg.freeform_wz_max}) at a {self.cfg.freeform_lookahead_m} m look-ahead "
+            f"(cross-track gain "
+            f"{float(self.cfg.freeform_steer_kp) / float(self.cfg.freeform_lookahead_m):.3f} "
+            f"1/s), after {self._ff_hold_steps} steps ({hold_s} s) of zero command. The "
+            "library's target_vel is NOT read. STEERING ON A STAIRCASE IS OFF-DISTRIBUTION: "
+            "the generator was commanded |wz| max = 0.0000 over all 3500 stair clips and is "
+            "frozen during this fine-tune."
+        )
+
+    def _reset_freeform_command(self, env_ids: torch.Tensor) -> None:
+        """Draw the episode's forward speed and resolve the section centreline.
+
+        Reached from :meth:`reset`, which ``ManagerBasedRLEnv._reset_idx`` calls AFTER the
+        event manager's reset terms -- so the robot has already been placed on its section by
+        ``mdp.events.resets.reset_on_freeform_section``, which deliberately touches no command
+        state and leaves exactly this to run here.
+
+        The command is zeroed here as well as drawn: ``episode_length_buf`` is not cleared
+        until every manager has been reset, so anything reading the command between now and
+        the next :meth:`_update_command` would otherwise see the PREVIOUS episode's speed
+        rather than the opening hold.
+
+        Args:
+            env_ids: ``[k]`` env indices being reset.
+        """
+        k = int(env_ids.numel())
+        lo = float(self.cfg.freeform_speed_min)
+        hi = float(self.cfg.freeform_speed_max)
+        self._ff_speed[env_ids] = torch.empty(k, device=self.device).uniform_(lo, hi)
+        origin_w, heading_w = self._default_freeform_section(env_ids)
+        self._ff_origin_w[env_ids] = origin_w
+        self._ff_heading_w[env_ids] = heading_w
+        self._ff_cmd[env_ids] = 0.0
+
+    def set_freeform_section(
+        self, env_ids: torch.Tensor, origin_w: torch.Tensor, heading_w: torch.Tensor
+    ) -> None:
+        """Declare the straight centreline the steering controller aims down, per env.
+
+        THE INTERFACE for the free-form terrain generator: a reset event that knows a
+        section's own centreline calls this instead of leaving
+        :meth:`_default_freeform_section` to guess one from the tile. Safe to call at any
+        point after the env's reset; the controller reads these buffers fresh every step.
+
+        Args:
+            env_ids: ``[k]`` env indices.
+            origin_w: ``[k, 2]`` ANY point on the centreline, world frame -- the controller
+                projects onto the infinite line, so a section's start point and its midpoint
+                give identical commands.
+            heading_w: ``[k]`` centreline direction (rad), world frame, pointing the way the
+                robot traverses. Sections run along their tile's +x, so this is the tile's
+                ``frame_yaw`` lifted by the placement, and 0.0 on an axis-aligned manifest.
+
+        Raises:
+            RuntimeError: If the free-form command is off, where the buffers exist but nothing
+                reads them -- a silent no-op is the wrong answer to a caller that meant it.
+        """
+        if not self.freeform_command:
+            raise RuntimeError(
+                "set_freeform_section() needs cfg.freeform_command=True; with the clip "
+                "command in force nothing reads the centreline and this would be a no-op."
+            )
+        self._ff_origin_w[env_ids] = origin_w[..., :2].to(self._ff_origin_w.dtype)
+        self._ff_heading_w[env_ids] = heading_w.to(self._ff_heading_w.dtype)
+
+    def _default_freeform_section(
+        self, env_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve each env's centreline from the tile's own manifest route.
+
+        **The centreline is the ray the GENERATOR authored**: tile-local ``(start_x, start_y)``
+        at heading ``start_yaw``, lifted into the world by the tile's ``corner`` and
+        ``frame_yaw``. That is the definition ``motion_gen.terrain.freeform``'s own
+        ``route_project`` / ``route_lookahead`` use, and those docstrings name this function as
+        the consumer -- so the two must state one line or the terrain means something different
+        to the thing that built it than to the thing that drives over it.
+
+        ``start_yaw`` is NOT decoration. It is how the boxes family produces an angled approach
+        to an axis-aligned box (``OverlayVolumeCfg`` has no yaw and the loader refuses a
+        non-zero one, so the APPROACH is the only place an angle can live), and how the flat
+        family gets a 3-18 deg walk instead of a straight one. Measured over 18 sections at the
+        default config, an earlier version of this function that read
+        ``(start_x, goal_y)`` at ``frame_yaw`` put the 5 m aim point up to 3.94 m (flat) /
+        2.57 m (boxes) from the authored one -- i.e. it steered the angle straight back out,
+        silently, and stairs (``start_yaw == 0``) was the one family where the bug was invisible.
+
+        The spawn is jittered off this line on purpose
+        (``mdp.events.resets.reset_on_freeform_section``'s ``pos_jitter_m``); the controller
+        projects onto the infinite ray, so the jitter is an initial cross-track error to be
+        driven out rather than a datum to be defended.
+
+        ``reset_on_freeform_section`` deliberately leaves the command alone ("anything the
+        clip-free command needs at reset belongs in that command's reset"), and it also never
+        calls ``_commit_clip_reset``, so ``_mask_frame_yaw`` is NOT written on this path and
+        the tile's heading has to come from the importer directly.
+
+        The route lookup is imported HERE rather than at module scope: ``mdp.events.resets``
+        already imports from this package (``world_lift_isaac``), and a module-scope import
+        back the other way would make the pair order-dependent for the sake of one call per
+        reset.
+
+        Falls back to the env origin at heading 0 where the scene carries no route at all --
+        a flat scene, a clip library, or a unit-test double. That is a placeholder, not a
+        centreline: :meth:`set_freeform_section` is how a caller states a real one.
+
+        Args:
+            env_ids: ``[k]`` env indices being reset.
+
+        Returns:
+            ``(origin_w [k, 2], heading_w [k])``, world frame.
+        """
+        scene = getattr(self.env, "scene", None)
+        importer = getattr(scene, "terrain", None) if scene is not None else None
+        if not getattr(importer, "terrain_route", None):
+            origin_w = (scene.env_origins[env_ids][:, :2] if scene is not None
+                        else self._ff_origin_w[env_ids])
+            return (origin_w.to(self._ff_origin_w.dtype),
+                    torch.zeros_like(self._ff_heading_w[env_ids]))
+
+        # THREE dots: this module sits at mdp.commands.traj_tracking, so ``..`` is
+        # mdp.commands and ``..events`` does not exist. It was two, and because nothing
+        # exercised the route branch (the tests reach the centreline through
+        # set_freeform_section or through the no-route fallback) it would have raised
+        # ModuleNotFoundError on the first reset of the first free-form run.
+        from ...events.resets import freeform_route
+
+        route = freeform_route(importer, env_ids)
+        frame_yaw = route["frame_yaw"].to(self.device)
+        local_x = route["start_x"].to(self.device)
+        local_y = route["start_y"].to(self.device)
+        cos_y, sin_y = torch.cos(frame_yaw), torch.sin(frame_yaw)
+        corner = route["corner"].to(self.device)
+        origin_w = torch.stack(
+            [corner[:, 0] + cos_y * local_x - sin_y * local_y,
+             corner[:, 1] + sin_y * local_x + cos_y * local_y], dim=-1)
+        heading_w = frame_yaw + route["start_yaw"].to(self.device)
+        return (origin_w.to(self._ff_origin_w.dtype),
+                heading_w.to(self._ff_heading_w.dtype))
+
+    def _update_freeform_command(self) -> None:
+        """Rebuild ``(vx, 0, wz)`` for every env from its pose and its section centreline.
+
+        Runs at the top of :meth:`_update_command`, before the clip half advances the step and
+        before the generator reads its command horizon, so everything in one control step sees
+        one command.
+
+        During the opening hold the WHOLE triple is zero, not just ``vx``: the robot spawns at
+        rest from a standing pose, and a yaw rate applied to a standing robot is as much a step
+        input as a forward speed is. Matches ``mjeval``'s ``live_cmd = _ZERO_CMD``.
+        """
+        held = self.env.episode_length_buf < self._ff_hold_steps                # [N] bool
+        root_xy = wp.to_torch(self.robot.data.root_pos_w)[:, :2]
+        yaw = yaw_from_quat(wp.to_torch(self.robot.data.root_quat_w))
+        wz = freeform_yaw_rate(
+            root_xy, yaw, self._ff_origin_w, self._ff_heading_w,
+            float(self.cfg.freeform_lookahead_m),
+            float(self.cfg.freeform_steer_kp),
+            float(self.cfg.freeform_wz_max),
+        )
+        zero = torch.zeros((), device=self._ff_cmd.device, dtype=self._ff_cmd.dtype)
+        self._ff_cmd[:, 0] = torch.where(held, zero, self._ff_speed)
+        self._ff_cmd[:, 1] = FREEFORM_VY
+        self._ff_cmd[:, 2] = torch.where(held, zero, wz)
+
+    # --- the four command-velocity accessors, overridden as one set -----------------
+    #
+    # All four are HELD: one command broadcast across every window offset and across the
+    # generator's F-step horizon. The clip path instead serves target_vel sampled per offset,
+    # which is a future no deployed runtime has -- both transfer/deploy/gen_tracker.py and the
+    # C++ runtime hold the command from request time over the whole horizon. So this removes a
+    # train/deploy mismatch, at the cost of the tracker's reference-group encoder seeing 13
+    # copies of one row where it used to see 13 distinct ones.
+
+    @property
+    def command_velocity_available(self) -> bool:
+        """True when a velocity command exists -- generated here, or carried by the library.
+
+        Overriding the inherited property is what lets the free-form task run against a
+        MANIFEST-ONLY ``.h5`` (terrain and nothing else): the command it needs is manufactured,
+        so a library ``target_vel`` stops being a prerequisite. With the flag off this is
+        exactly the inherited answer.
+        """
+        if self.freeform_command:
+            return True
+        return super().command_velocity_available
+
+    def get_command_velocity(self) -> torch.Tensor:
+        """Per-env commanded base velocity ``[N, 3]`` = ``(vx, 0, wz)`` at the current step."""
+        if self.freeform_command:
+            return self._ff_cmd
+        return super().get_command_velocity()
+
+    def get_command_velocity_horizon(self, num_future: int) -> torch.Tensor:
+        """Commanded velocity over the next ``num_future`` steps, ``[N, num_future, 3]``.
+
+        The generator's conditioning. Held: a broadcast VIEW of the current command, which is
+        what the deployed runtimes supply ("the future command is not knowable; hold the one
+        from request time").
+        """
+        if self.freeform_command:
+            return self._ff_cmd[:, None, :].expand(-1, int(num_future), -1)
+        return super().get_command_velocity_horizon(num_future)
+
+    def get_future_command_velocity(self, offsets: torch.Tensor) -> torch.Tensor:
+        """Commanded base velocity ``[N, K, 3]`` at the window ``offsets``.
+
+        The policy's ``command_window`` observation. Held across the offsets, for the reason
+        above -- so this returns ``len(offsets)`` copies of one row rather than a trajectory.
+        """
+        if self.freeform_command:
+            return self._ff_cmd[:, None, :].expand(-1, int(offsets.numel()), -1)
+        return super().get_future_command_velocity(offsets)
 
     # ------------------------------------------------------------------
     # Per-step update
@@ -471,8 +968,21 @@ class FmTrackingCommand(MotionSequenceCommand):
         ``reference_source="fm"`` to be byte-identical to the FM-only implementation -- which
         it is, because every channel the generator does not write is NaN-filled by
         ``strict_fm_only``.
+
+        The free-form command is rebuilt FIRST when it is in force, so the clip half, the
+        generator's conditioning horizon and every observation in this step read one command.
+
+        **The clip half is SKIPPED outright on a clip-free library**, and gated on
+        :attr:`~.motion_sequence_cmd.MotionSequenceCommand.has_clips` rather than on
+        ``freeform_command``: what makes the clip unreadable is the LIBRARY having none, not
+        the command being manufactured, and the two are independent flags.
         """
-        self._build_clip_reference()
+        if self.freeform_command:
+            self._update_freeform_command()
+        if self.has_clips:
+            self._build_clip_reference()
+        else:
+            self._advance_without_a_clip()
         if self.fm_enabled:
             # BEFORE the generator runs, and every step -- a frame can only be served `lag`
             # steps late if it was captured. Skipped entirely at lag 0, so the default costs
@@ -510,6 +1020,39 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._y_des_clip = self.y_des.clone()
         self._dy_des_clip = self.dy_des.clone()
         self._clip_wf_frames = self._wf_world_frames
+
+    def _advance_without_a_clip(self) -> None:
+        """The part of :meth:`_build_clip_reference` that is not about a clip, and only that.
+
+        Runs in its place on a clip-free library. Exactly ONE of that method's five statements
+        survives, and it survives because it is not clip machinery at all:
+        :meth:`~.motion_sequence_cmd.MotionSequenceCommand._reanchor_ego_envs` is the step that
+        latches ``_plan_anchor_pos`` / ``_plan_anchor_quat`` onto the robot's root on the snap
+        cadence and publishes ``_reanchor_active``. It is the ONLY writer of the plan anchor on
+        a running episode (the other is ``seed_reanchor_snapshot``, which the clip reset calls
+        and which never runs here), so dropping it would silently leave that anchor at the
+        origin for the whole run. Its own clip half -- ``_reanchor_clip_ids`` -- is masked by
+        ``_ego_mask``, which nothing sets without a clip reset, so it is a no-op; and if a
+        future config did set it, the manager's gather refuses by name rather than indexing an
+        empty table.
+
+        What is deliberately NOT run, and what each would have cost:
+
+        * ``_advance_step`` -- it is what marches ``self._step``, and there is no clip for the
+          step to index. Left un-run, ``_step`` stays at its reset value of 0 rather than
+          walking to ``num_steps - 1``; with ``--like`` copying a real library's layout that
+          bound is the other library's length, so a marching step would be a real number
+          pointing at nothing.
+        * ``_refresh_current_placement`` -- gathers the current frame's anchor mask per clip.
+        * ``get_desired_outputs`` -- gathers ``y_des`` / ``dy_des`` per clip.
+        * ``_write_world_des(self._clip_world_frames())`` -- lifts those through the placement.
+
+        The three clip CACHES (``_y_des_clip``, ``_dy_des_clip``, ``_clip_wf_frames``) are
+        therefore never written after ``_post_init`` and keep their zero-filled allocation.
+        Nothing reads them: ``_apply_source`` only installs them for ``source="clip"``, which
+        :meth:`_serve` now refuses here and which ``reference_source`` cannot be.
+        """
+        self._reanchor_ego_envs()
 
     def _build_fm_reference(self) -> None:
         """Run generator inference and cache its world-frame outputs."""
@@ -590,6 +1133,18 @@ class FmTrackingCommand(MotionSequenceCommand):
             raise RuntimeError(
                 "as_fm_reference() needs a generator, but this command was built with "
                 "reference_source='clip' and no fm_checkpoint (the pure-clip control)."
+            )
+        if source == "clip" and not self.has_clips:
+            # The caches this would install were allocated and never written (see
+            # :meth:`_advance_without_a_clip`), so serving them would hand a diagnostic a
+            # zero-filled reference that looks like a robot standing at the world origin. That
+            # is precisely the silent answer this whole path is arranged to avoid.
+            raise RuntimeError(
+                "as_clip_reference() was asked of a CLIP-FREE library: it carries a terrain "
+                "manifest and zero clips, so no clip reference is ever built and there is "
+                "nothing to serve. The clip-vs-generator A/B (scripts/rsl_rl/fm_debug.py) "
+                "needs a real clip library; on free-form terrain there is no clip to compare "
+                "against by construction."
             )
         prev_override, prev_source = self._serve_override, self._serving()
         self._serve_override = source

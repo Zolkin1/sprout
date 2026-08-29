@@ -13,6 +13,14 @@ list, fingerprints, generator config) lives in JSON-encoded root attributes.
 The writer is streaming -- datasets are pre-sized to ``N`` clips and each
 generated batch is written into its slice -- so generating a large library
 never holds more than one batch in memory at once.
+
+``N = 0`` is a SUPPORTED, well-defined library: a terrain manifest carrying no motion at all,
+written by ``scripts/rsl_rl/make_freeform_terrain.py`` for the free-form fine-tune, whose
+reference is predicted from the depth cameras rather than read off disk. Such a file still
+carries the full channel layout and still writes every clip dataset -- at zero extent but with
+the right RANK -- because ``num_steps`` and every per-step buffer size are read off those
+shapes. What it does NOT support is being indexed: see :attr:`ClipLibraryData.has_clips`, and
+:class:`~motion_gen.clips.clip_manager.MotionClipManager`, which refuses every gather by name.
 """
 
 from __future__ import annotations
@@ -114,13 +122,25 @@ class ClipLibraryWriter:
             "target_vel": (num_clips, T, 3),
         }
         self._compression = compression
+        # A CLIP-FREE library is a legitimate thing to write: the free-form terrain generator
+        # (``scripts/rsl_rl/make_freeform_terrain.py``) emits a manifest and no motion at all,
+        # because its reference is predicted from the cameras instead of read off disk. h5py
+        # refuses a chunk larger than the dataset in any dimension, so the per-clip ``(1, ...)``
+        # chunk is illegal against a zero-extent clip axis -- and there is nothing to chunk or
+        # compress anyway. Those datasets are written contiguous instead.
+        #
+        # They are still CREATED, with their full RANK, and that is the point: a library's
+        # ``num_steps`` is read off ``y_des.shape[1]``, so a file that simply omits the clip
+        # datasets loads them as rank-1 placeholders and turns every downstream shape question
+        # into an ``IndexError`` three frames inside ``MotionClipManager``.
+        self._chunked = num_clips > 0
         self._f = h5py.File(self.path, "w")
         for key, shape in shapes.items():
             # Chunk per-clip so reads of a single clip touch one chunk.
-            chunk = (1,) + shape[1:]
+            chunk = ((1,) + shape[1:]) if self._chunked else None
             self._f.create_dataset(
                 key, shape=shape, dtype=_DENSE_DTYPES[key],
-                chunks=chunk, compression=compression,
+                chunks=chunk, compression=compression if self._chunked else None,
             )
         # Per-clip terrain tags (1-D).  Default flat: id -1, code 0.
         self._f.create_dataset("terrain_id", shape=(num_clips,), dtype="int32")
@@ -178,7 +198,8 @@ class ClipLibraryWriter:
             if "anchor_mask_t" not in self._f:
                 ds = self._f.create_dataset(
                     "anchor_mask_t", shape=(self.num_clips,) + amt.shape[1:], dtype="uint8",
-                    chunks=(1,) + amt.shape[1:], compression=self._compression)
+                    chunks=((1,) + amt.shape[1:]) if self._chunked else None,
+                    compression=self._compression if self._chunked else None)
                 # Sentinel 255 = "unset" so clips NOT carrying a per-step mask fall back to their
                 # per-clip ``anchor_mask`` (0 is a VALID mask -- fully pinned -- so we can't 0-fill).
                 ds[...] = _ANCHOR_MASK_T_UNSET
@@ -193,7 +214,8 @@ class ClipLibraryWriter:
                 shape = (self.num_clips,) + arr.shape[1:]   # per-step [.,T] or [.,T,P]
                 self._f.create_dataset(
                     key, shape=shape, dtype=dt,
-                    chunks=(1,) + arr.shape[1:], compression=self._compression,
+                    chunks=((1,) + arr.shape[1:]) if self._chunked else None,
+                    compression=self._compression if self._chunked else None,
                 )
             self._f[key][start_idx:end] = arr.astype(dt, copy=False)
         self._written = max(self._written, end)
@@ -233,11 +255,50 @@ class ClipLibraryData:
 
     @property
     def num_clips(self) -> int:
+        """Number of clips ``N``. ``0`` for a terrain-only library (see :attr:`has_clips`)."""
         return self.y_des.shape[0]
 
     @property
     def num_steps(self) -> int:
-        return self.y_des.shape[1]
+        """Clip length ``T`` in control steps.
+
+        Read off ``y_des``'s own shape wherever the dataset is there to state it, so a library
+        with motion in it answers exactly as it always has.
+
+        **A CLIP-FREE library is not a broken one** -- the free-form terrain generator writes a
+        manifest and zero clips on purpose, and a ``keys=`` subset load leaves un-requested
+        datasets as rank-1 placeholders. Either way ``y_des`` has no step axis, and ``T`` is
+        still a real, declared property of the file: it is what the writer stamped into the
+        metadata, and it is what sizes every per-step buffer the RL allocates. Reading it from
+        there is why ``MotionClipManager`` can be built at all on such a file -- before this,
+        ``shape[1]`` raised ``IndexError`` three frames deep in ``clip_len_or_full``, with
+        nothing in the traceback naming the library.
+
+        Raises:
+            ValueError: If the library carries neither a step axis nor a ``num_steps``
+                attribute, i.e. it is not a clip library at all.
+        """
+        if self.y_des.ndim >= 2:
+            return self.y_des.shape[1]
+        if "num_steps" in self.meta:
+            return int(self.meta["num_steps"])
+        raise ValueError(
+            "clip library has no per-step y_des axis AND no 'num_steps' attribute, so its "
+            "clip length is unknown. A clip-free library (terrain manifest only) must still "
+            "declare one -- ClipLibraryWriter stamps it from meta['num_steps']."
+        )
+
+    @property
+    def has_clips(self) -> bool:
+        """Does this library carry any motion?
+
+        ``False`` for a TERRAIN-ONLY library -- a manifest with zero clips, written by
+        ``scripts/rsl_rl/make_freeform_terrain.py`` for the free-form fine-tune, whose
+        reference is predicted from the cameras rather than read off disk. Every clip-indexing
+        consumer must branch on this or refuse; :class:`~..clip_manager.MotionClipManager`
+        refuses, naming the task.
+        """
+        return self.num_clips > 0
 
     def anchor_mask_or_legacy(self, device: str | torch.device | None = None) -> torch.Tensor:
         """Per-clip anchor bitmask ``[N]`` uint8; a full legacy-filled tensor if absent.
@@ -463,6 +524,20 @@ def group_clips_by_terrain(lib: ClipLibraryData) -> dict[int, torch.Tensor]:
         ValueError: If the library carries no per-clip ``terrain_id`` (a
             pre-terrain library); such libraries cannot be terrain-assigned.
     """
+    if not lib.has_clips:
+        # Distinguished from the pre-terrain case below because BOTH present as an empty
+        # ``terrain_id``, and the fixes are opposite: one library needs regenerating, the other
+        # is correct and simply has no clips to group. Reached if a clip reset is left wired on
+        # the free-form task -- ``G1FinetuneFreeformEnvCfg`` disables ``events.reset_on_clip``
+        # for exactly this reason.
+        raise ValueError(
+            "clip library carries a terrain manifest and ZERO clips, so there is nothing to "
+            "group by terrain. This is a free-form terrain library "
+            "(scripts/rsl_rl/make_freeform_terrain.py): its reference is generated from the "
+            "cameras, and the spawn comes from the manifest's route block "
+            "(mdp.reset_on_freeform_section), not from sampling a clip. Use the clip-free "
+            "task G1-teacher-clf-terrain-depth-finetune-freeform, or pass a real clip library."
+        )
     if lib.terrain_id.numel() == 0:
         raise ValueError(
             "clip library has no per-clip terrain_id (pre-terrain library); "

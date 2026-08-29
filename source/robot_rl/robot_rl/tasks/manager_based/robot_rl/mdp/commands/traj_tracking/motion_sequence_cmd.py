@@ -165,10 +165,50 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """
         return
 
+    @property
+    def has_clips(self) -> bool:
+        """Does the loaded library carry motion at all?
+
+        ``False`` for a TERRAIN-ONLY library -- a manifest with zero clips, from
+        ``scripts/rsl_rl/make_freeform_terrain.py``. Every clip-indexing step in this class must
+        be either skipped or refused on such a library; the manager refuses each gather by name
+        (``MotionClipManager._require_clips``), and :meth:`_post_init` refuses the whole command
+        unless the subclass declares it can run clip-free.
+        """
+        return self.manager.has_clips
+
+    @property
+    def accepts_clip_free_library(self) -> bool:
+        """May this command term run against a library with zero clips?
+
+        **No**, on this class, and that is a statement rather than an omission: this command
+        exists to TRACK a clip open-loop, so with no clip there is no reference for it to serve
+        and every per-step gather would be indexing an empty table.
+
+        :class:`~.fm_tracking_cmd.FmTrackingCommand` overrides this to ``True`` under
+        ``reference_source="fm"``, where the reference is predicted from the cameras and the
+        library is being passed for its terrain manifest alone.
+        """
+        return False
+
     def _post_init(self) -> None:
         """Allocate clip state, validate dt, map contacts, record fingerprint."""
         n, dev = self.num_envs, self.device
         T = self.manager.num_steps
+
+        # BEFORE anything is allocated: a clip-free library is legitimate for exactly one
+        # configuration (see :attr:`accepts_clip_free_library`), and everywhere else the useful
+        # message is here, naming the library and the flag, rather than a gather refusal from
+        # inside the first step.
+        if not self.has_clips and not self.accepts_clip_free_library:
+            raise ValueError(
+                f"{type(self).__name__} was given a CLIP-FREE library "
+                f"({self.cfg.path}): it carries a terrain manifest and zero clips, and this "
+                "command term tracks clips. Only the free-form fine-tune runs clip-free "
+                "(task G1-teacher-clf-terrain-depth-finetune-freeform), and only because its "
+                "reference_source='fm' predicts the reference from the depth cameras. Pass a "
+                "real clip library with --clip, or use that task."
+            )
 
         # The clip must be sampled at the control dt so step == step counter.
         step_dt = float(self.env.step_dt)

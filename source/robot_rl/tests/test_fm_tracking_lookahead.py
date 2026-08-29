@@ -433,6 +433,10 @@ def _update_stub(reference_source: str = "fm") -> FmTrackingCommand:
     cmd._building = None
     cmd._serve_override = None
     cmd.fm_enabled = True
+    # ``_update_command`` and ``_serve`` both gate the CLIP half on the library carrying any
+    # motion, so this double has to say which kind of library it stands for -- a clip one. The
+    # clip-free arm is driven against a real manager in ``test_freeform_clipless_command.py``.
+    cmd.manager = SimpleNamespace(has_clips=True)
     cmd.y_des = torch.zeros(N_ENVS, POS_W)
     cmd.dy_des = torch.zeros(N_ENVS, VEL_W)
     cmd.y_act = torch.zeros(N_ENVS, POS_W)

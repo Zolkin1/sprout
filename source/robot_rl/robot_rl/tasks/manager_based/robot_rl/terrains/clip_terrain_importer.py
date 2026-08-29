@@ -236,6 +236,12 @@ class ClipTerrainImporter(TerrainImporter):
         self.clip_size_y = layout.clip_size_y
         self.terrain_type_code = layout.terrain_type_code
         self.terrain_frame_yaw = layout.terrain_frame_yaw
+        # Per-terrain-id free-form section route; an EMPTY dict on every clip library. The
+        # clip-free runtime (``mdp.events.resets.freeform_route``) both reads it and reads its
+        # ABSENCE as "this is not a free-form terrain", so it is exposed unconditionally
+        # rather than only when non-empty -- an attribute that appears on some libraries and
+        # not others would make the check a getattr default instead of a value.
+        self.terrain_route = layout.terrain_route
         # Per-tile terrain-frame heading, tabled for the per-env gather below. The tile's mesh is
         # emitted axis-aligned and translated onto its corner, so a terrain's world frame yaw IS its
         # authored tile-local frame yaw.

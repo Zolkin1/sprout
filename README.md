@@ -430,6 +430,84 @@ plus `cell.json` (resolved DR, coverage proof, throughput). `report/` holds `rep
 `summary_by_family.csv`, and `figures/` as png + svg + a caption sidecar carrying that figure's
 definitions.
 
+### 4c. Fine-tune on FREE-FORM terrain
+
+`G1-teacher-clf-terrain-depth-finetune-freeform` runs the generator-graded fine-tune on
+terrain that **no clip was ever generated for**. Every other library here exists to match one
+recorded motion per tile; under `reference_source="fm"` the reference is predicted from the
+cameras, so that constraint is gone and the ground can be free-form -- larger flat extents,
+boxes met off-square, and straight staircases with 1-15 steps per flight, four flights per
+section, each independently up or down.
+
+The terrain ships as a **manifest-only `.h5`** -- terrain and zero clips -- and is still
+passed with `--clip`, which points the importer and the command at one file as always.
+
+```bash
+# 1. Author the terrain (no simulator, seconds). Half the stair tiles are sampled from the
+#    building-code box (IBC / IRC / OSHA, Blondel-coupled) and half from the grid the shipped
+#    library actually used; the manifest records WHICH per tile, so the two can be reported
+#    apart. --like copies an existing library's channel layout.
+python scripts/rsl_rl/make_freeform_terrain.py \
+    --out clips/freeform_v1.h5 --seed 0 --flat 8 --boxes 16 --stairs 24
+
+# 2. Fine-tune a trained depth teacher on it, against a FROZEN generator.
+python scripts/rsl_rl/train.py --task G1-teacher-clf-terrain-depth-finetune-freeform \
+    --clip clips/freeform_v1.h5 \
+    --load_run <teacher run> --resume \
+    --fm_checkpoint logs/flow_matching/<fm run>/best.pt \
+    --num_envs 1024 --headless
+```
+
+What the clip stops supplying, and what replaces it:
+
+| the clip supplied | the free-form task uses |
+|---|---|
+| the terrain mesh | the same `ClipTerrainImporter`, on the manifest-only library |
+| the spawn pose | `mdp.reset_on_freeform_section` -- each section's `route` block |
+| `target_vel` | `FmTrackingCommandCfg.freeform_command` -- a per-episode speed draw after a 0.5 s standing hold, `vy = 0`, and a yaw-rate P controller aiming down the section |
+| `clip_end` | `mdp.freeform_goal_reached` -- the section's goal band, a truncation |
+| the critic's global drift | `tracking_error_global(datum="plan_anchor")` -- same width, so a teacher checkpoint still resumes with no surgery |
+
+**Three distribution changes ride along. None is free, and each is deliberate:**
+
+* **Steering is off-distribution on a staircase.** The generator was commanded `|wz| max =
+  0.0000` over all 3500 stair clips of the library it was fitted on, and it is frozen here, so
+  on a flight it is extrapolating in yaw rate. It is on anyway because nothing else in the loop
+  steers and these sections are tens of metres long -- without it, accumulated heading error
+  walks the robot off the side of the flight and what gets measured is the drift.
+* **The command is held across the window offsets**, where the clip path served a per-offset
+  future. That direction removes a train/deploy mismatch (both deploy runtimes hold one command
+  over the whole horizon), but the tracker's reference encoder now sees 13 copies of one row.
+* **The stairwell walls collide** -- they join the ground mesh and appear in the height scan,
+  where the decoration the generator was fitted on did neither. Nothing in this stack avoids
+  obstacles, so a scan-conditioned number measured here is not comparable to one measured on a
+  clip library.
+
+**A zero-clip library is a defined thing, in three places.** `FmTrackingCommand` inherits
+`MotionSequenceCommand`, which builds a `MotionClipManager` at construction and used to raise
+on such a library (`clip_len_or_full` -> `num_steps` -> `y_des.shape[1]`, IndexError). What
+makes it work is not a special case in the task cfg:
+
+* the WRITER emits the clip datasets at zero extent but full RANK (`ClipLibraryWriter` at
+  `num_clips=0`; it drops the per-clip chunking, which h5py refuses on a zero-extent axis, and
+  keeps the shapes), so `num_steps` is a real number and the manager constructs;
+* the MANAGER answers every layout question and REFUSES every gather by name
+  (`MotionClipManager._require_clips`), so a clip-consuming term left wired on this task fails
+  saying so rather than indexing an empty table or returning an empty tensor;
+* the COMMAND skips the clip half of the step (`_advance_without_a_clip`), keeping only the
+  plan-anchor latch, so `self._step` never marches and `as_clip_reference()` is refused.
+
+The permission is per configuration (`accepts_clip_free_library`, true only under
+`reference_source="fm"`), and the four clip-phase knobs -- `history_from`,
+`seed_history_from_clip`, `random_start_phase`, `random_start_before_terrain_start` -- are
+refused at construction if left on, because three of them would otherwise fail only at the
+first reset and one would never fail at all.
+
+**Pass `--like <a real clip library>` when generating it.** The FM checkpoint's `frame_names`
+are checked against the ee frames resolved from the library's OWN channel names, so the
+minimal 7-channel layout admits only a generator with no extra frames. `--like
+clips/g1_mb_v5_body_mode11_decor.h5` gives the shipped 155/137-channel, 29-joint layout.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.

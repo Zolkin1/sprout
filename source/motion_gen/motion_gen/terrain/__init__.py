@@ -13,4 +13,7 @@ numbers, so nothing is recomputed (or allowed to drift) between generation and t
 * :mod:`terrain_sampler` / :mod:`terrain_variants` -- tile sampling and per-tile
   geometry variation.
 * :mod:`distractor` -- occupancy bookkeeping for distractor boxes the robot must ignore.
+* :mod:`freeform` -- sections authored for their own sake, with no clip behind them: the
+  FM-driven fine-tune predicts its reference from the cameras, so the ground no longer has to
+  be built under a recorded motion.  Each tile carries the ``route`` the RL steering follows.
 """

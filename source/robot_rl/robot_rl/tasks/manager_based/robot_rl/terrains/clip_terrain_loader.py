@@ -80,6 +80,16 @@ class ClipTerrainLayout:
     # generators author geometry travel-along-tile-+x) and for any manifest predating the field, which
     # reproduces world-axis masking exactly.
     terrain_frame_yaw: dict[int, float] = field(default_factory=dict)
+    # terrain id -> the free-form section's ROUTE block, copied verbatim from the manifest:
+    # spawn pose, goal line and goal band, in the TILE-LOCAL CORNER frame (the frame
+    # ``clip_frame_origin`` places geometry in, so the route and the mesh it describes share
+    # one datum and cannot drift).  EMPTY for every clip library, and that emptiness is what
+    # the clip-free runtime keys on: a free-form library carries a manifest and no clips at
+    # all, so nothing places a reference on a tile and the spawn/goal are AUTHORED with the
+    # terrain instead.  Read by ``mdp.events.resets.freeform_route``; the required field names
+    # are its ``FREEFORM_ROUTE_FIELDS``, which the generator's
+    # ``motion_gen.terrain.freeform.ROUTE_FIELDS`` is pinned equal to by test.
+    terrain_route: dict[int, dict] = field(default_factory=dict)
     # terrain id -> overlay volumes (boxes) in the tile's local-corner frame, as
     # emitted by ``composite_terrain``'s ``meta_data["overlays"]``.  The box world
     # (x, y) for a tile is ``tile_corner[:2] + overlay["pos_xy"]`` (Phase-3 reset).
@@ -606,6 +616,13 @@ def assemble_clip_terrain(
         int(m["terrain_id"]): float(m.get("frame_yaw", 0.0)) for m in manifest
     }
     terrain_frame_yaw[_FLAT_TERRAIN_ID] = 0.0
+    # The free-form section routes (see ClipTerrainLayout.terrain_route).  Only tiles that
+    # declare one appear -- a clip library declares none, and the FLAT FILLER tile never does
+    # (it is synthesised here rather than authored, so it has no start pose and no goal).  A
+    # free-form library asks for zero filler tiles, so no env can land on one.
+    terrain_route: dict[int, dict] = {
+        int(m["terrain_id"]): dict(m["route"]) for m in manifest if m.get("route")
+    }
 
     num_tiles = len(specs)
     if num_tiles == 0:
@@ -681,6 +698,7 @@ def assemble_clip_terrain(
         tile_corner=tile_corner, tile_footprint=tile_fp, tile_clip_x_offset=tile_cxoff,
         clip_size_y=clip_size_y, terrain_type_code=type_code,
         terrain_frame_yaw=terrain_frame_yaw,
+        terrain_route=terrain_route,
         terrain_overlays=terrain_overlays,
         decor_mesh=decor_mesh,
     )

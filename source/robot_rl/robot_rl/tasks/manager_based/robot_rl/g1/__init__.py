@@ -12,6 +12,12 @@ stair cases through the same task with different single-clip libraries.
 
 The clip library is REQUIRED from the CLI (``--clip``); there is deliberately no default,
 because a stale one silently trains on the wrong terrain.
+
+**One task breaks the "a clip per tile" rule**, and it is the last one registered:
+``G1-teacher-clf-terrain-depth-finetune-freeform`` takes a MANIFEST-ONLY library -- terrain
+and no clips at all -- because its reference is predicted from the cameras rather than read
+off disk. ``--clip`` still states it, and still states it for both the importer and the
+command, so nothing about how a library is passed changes.
 """
 
 import gymnasium as gym
@@ -151,6 +157,30 @@ if not _registered:
         kwargs={
             "env_cfg_entry_point": (
                 f"{__name__}.g1_finetune_env_cfg:G1FinetuneTerrainDepthEnvCfg"
+            ),
+            "rsl_rl_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_ppo_cfg:FinetunePPORunnerCfg"
+            ),
+        },
+    )
+
+    ## =========================================
+    # The SAME fine-tune on FREE-FORM terrain: flat extents, scattered boxes and straight
+    # staircases that no clip was ever generated for. Under ``reference_source="fm"`` the
+    # reference is predicted from the cameras, so the tile-matches-one-motion constraint that
+    # shapes every other library here is gone. ``--clip`` therefore takes a MANIFEST-ONLY
+    # ``.h5`` (zero clip datasets) from ``scripts/rsl_rl/make_freeform_terrain.py``: the spawn
+    # comes from each section's route block, the velocity command is generated with a steering
+    # controller, and the episode is bounded by the section's goal band instead of by a clip
+    # running out. See g1_finetune_env_cfg for the three distribution changes that buys.
+    ## =========================================
+    gym.register(
+        id="G1-teacher-clf-terrain-depth-finetune-freeform",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": (
+                f"{__name__}.g1_finetune_env_cfg:G1FinetuneFreeformEnvCfg"
             ),
             "rsl_rl_cfg_entry_point": (
                 f"{agents.__name__}.rsl_rl_ppo_cfg:FinetunePPORunnerCfg"

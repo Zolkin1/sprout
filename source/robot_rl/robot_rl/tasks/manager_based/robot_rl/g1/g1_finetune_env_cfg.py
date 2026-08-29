@@ -31,17 +31,37 @@ axes -- see that class.
 **The generator runs autoregressively** (``history_from="generator"``), which is the deploy
 condition. Teacher forcing is gone: it kept the prediction phase-locked to a clip that is no
 longer what the reward grades, so it would now be answering a question nobody is asking.
+
+----
+
+This module holds TWO tasks. :class:`G1FinetuneTerrainDepthEnvCfg` is the above, on a normal
+clip library. :class:`G1FinetuneFreeformEnvCfg` is the same fine-tune with the clip removed
+from the other three roles as well -- spawn, command and episode bound -- so it can run on
+FREE-FORM terrain that no motion was ever generated for. That library is manifest-only (zero
+clip datasets) and comes from ``scripts/rsl_rl/make_freeform_terrain.py``; see the banner above
+:class:`G1FinetuneFreeformEnvCfg` for the four-way swap and what each one costs.
 """
 
 from __future__ import annotations
 
+from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
+
+# The generator's own floor on a section's goal band, imported so the free-form task's
+# termination and the terrain that declares the band cannot disagree about it. motion_gen is
+# IsaacLab-free and this module (numpy + math only) imports nothing heavier, so this costs the
+# env cfg nothing at import time.
+from motion_gen.terrain.freeform import GOAL_HALF_WIDTH_FLOOR_M
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
 from .clf_weights import WALKING_Q_weights, WALKING_R_weights
-from .g1_depth_env_cfg import G1TeacherTerrainDepthEnvCfg, install_fm_depth_group
+from .g1_depth_env_cfg import (
+    G1TeacherTerrainDepthEnvCfg,
+    G1TeacherTerrainDepthEventsCfg,
+    install_fm_depth_group,
+)
 from .g1_teacher_env_cfg import REPLAN_PERIOD_K
 from ..mdp.commands.traj_tracking.fm_tracking_cmd_cfg import FmTrackingCommandCfg
 
@@ -174,3 +194,226 @@ class G1FinetuneTerrainDepthEnvCfg(G1TeacherTerrainDepthEnvCfg):
         # scene renders no decoration, the recordings the generator was fitted on did, and a
         # vertical surface it has never seen is what it misreads as a box.
         self.scene.terrain.render_decor = True
+
+
+##
+# ==========================================================================================
+# THE FREE-FORM VARIANT: the same fine-tune, on terrain that no clip was ever made for
+# ==========================================================================================
+##
+#
+# The clip-graded fine-tune above still needs a clip library for five things, listed below,
+# and the terrain is the expensive one: every tile in the shipped libraries exists to MATCH
+# one recorded motion, tile by tile. Under
+# ``reference_source="fm"`` the reference is generated perceptively from the cameras, so that
+# constraint is gone and the ground can be free-form. What replaces the clip:
+#
+# | the clip supplied  | the free-form task uses                                            |
+# |--------------------|--------------------------------------------------------------------|
+# | the terrain mesh   | the same ``ClipTerrainImporter``, on a MANIFEST-ONLY ``.h5``        |
+# | the spawn pose     | ``mdp.reset_on_freeform_section`` (the manifest's ``route`` block)  |
+# | ``target_vel``     | ``FmTrackingCommandCfg.freeform_command`` -- speed draw + steering  |
+# | ``clip_end``       | ``mdp.freeform_goal_reached`` -- the section's goal band            |
+# | the critic's drift | ``tracking_error_global(datum="plan_anchor")``                      |
+#
+# Everything else -- the reward, the CLF, both windows, the depth groups, the DR -- is the
+# clip fine-tune's, unchanged, which is what keeps this an ablation of the TERRAIN rather
+# than of the task.
+
+#: Floor on the goal band's half-extent (m), passed to :func:`mdp.freeform_goal_reached`.
+#:
+#: IMPORTED, not restated, and deliberately NOT that function's own 2.5 m default. 2.5 m is
+#: mjeval's floor and mjeval's reason: nothing in that stack steers, so a band narrower than
+#: the accumulated heading error measures the absence of a controller. Here the steering
+#: controller runs (:func:`...fm_tracking_cmd.freeform_yaw_rate`), and the generator floors
+#: every section's declared ``goal_half_width`` at this same number -- so passing it makes the
+#: clamp a NO-OP and the manifest's own band is what is measured. At 2.5 m a 1.219 m staircase
+#: would be scored through a 5 m-wide gate, which a robot that fell off the side and drifted
+#: laterally past the goal line can pass.
+FREEFORM_GOAL_MIN_HALF_WIDTH_M: float = GOAL_HALF_WIDTH_FLOOR_M
+
+
+##
+# Terminations
+##
+@configclass
+class G1FinetuneFreeformTerminationCfg(G1FinetuneTerminationCfg):
+    """The fine-tune's terminations with the clip-keyed bound swapped for a spatial one.
+
+    Both FAILURE terms are inherited verbatim -- absolute-z height and reference-relative
+    tilt -- because neither ever referred to a clip; they are stated against the world and
+    against the generator's own prediction. Only the truncation changes.
+
+    ``clip_end`` is disabled in :meth:`G1FinetuneFreeformEnvCfg.__post_init__` rather than
+    here: :meth:`G1TeacherTerrainEnvCfg.__post_init__` reaches into ``events.reset_on_clip``
+    and the ancestors assume the clip terms exist while they run, so the clip wiring is torn
+    out AFTER the inherited setup rather than declared away before it.
+
+    **Why the goal is a truncation and not a reward.** Reaching it ends the episode with the
+    value bootstrapped from the final state (``time_out=True``), so walking the section is
+    neither punished nor paid -- the CLF keeps grading how the robot tracked the generator
+    the whole way there. A terminal bonus would make the return depend on section LENGTH,
+    which varies 10-38 m across this terrain set.
+    """
+
+    goal_reached = DoneTerm(
+        func=mdp.freeform_goal_reached,
+        params={"min_half_width": FREEFORM_GOAL_MIN_HALF_WIDTH_M},
+        time_out=True,
+    )
+
+
+##
+# Events
+##
+@configclass
+class G1FinetuneFreeformEventsCfg(G1TeacherTerrainDepthEventsCfg):
+    """The depth teacher's DR, plus a spawn read off the manifest instead of off a clip.
+
+    ``reset_on_clip`` is inherited and then disabled in the env's ``__post_init__`` (the
+    ancestors write to it while they run), so what this class adds is only the replacement.
+    It is declared as a SEPARATE term rather than by re-pointing ``reset_on_clip.func``
+    because the two take different parameters -- there is no clip to pin, no start step to
+    sample and no ``clip_draw`` -- and a term whose name says "clip" while its params say
+    otherwise is the shape of config bug this pipeline has paid for twice.
+
+    Term ORDER puts it after the camera DR, which is inherited and declared earlier. That is
+    fine and worth stating: the camera terms move the CAMERAS relative to the robot, not the
+    robot, so the spawn cannot invalidate a draw or vice versa, and every reset term runs
+    before the first observation either way.
+    """
+
+    reset_on_section = EventTerm(
+        func=mdp.reset_on_freeform_section,
+        mode="reset",
+        # ``spawn_z_offset`` matches the clip resets': with the soles exactly on the declared
+        # surface PhysX ejects the robot and every episode opens with a kick. Here it is the
+        # real fix rather than the clip path's workaround -- the manifest declares the surface
+        # exactly, so 5 mm is clearance, not a correction for an inconsistent frame 0.
+        #
+        # The jitter is what keeps the set from being degenerate in the one variable this
+        # fine-tune exists to broaden: without it every episode on a tile starts from ONE pose,
+        # so the generator's first plan is conditioned on one image per tile. The box must sit
+        # inside the start platform, which the 1.219 m platform minimum affords; at the 1.219 m
+        # narrowest flight the lateral half-width leaves 0.36 m of apron either side of the
+        # robot, so widening it needs the apron widened too.
+        params={"spawn_z_offset": 0.005, "pos_jitter_m": (0.25, 0.25),
+                "yaw_jitter_rad": 0.2},
+    )
+
+
+##
+# Env
+##
+@configclass
+class G1FinetuneFreeformEnvCfg(G1FinetuneTerrainDepthEnvCfg):
+    """The generator-graded fine-tune on free-form sections, driven by a joystick command.
+
+    Pass the terrain with ``--clip`` (a manifest-only library from
+    ``scripts/rsl_rl/make_freeform_terrain.py``) and the frozen generator with
+    ``--fm_checkpoint``; resume a trained depth teacher with ``--load_run --resume``. There is
+    no default library path here for the reason there is none anywhere in this pipeline: a
+    stale one trains on the wrong terrain and nothing downstream can tell.
+
+    **Three distribution changes ride along, all deliberate, none of them free:**
+
+    1. **The command is STEERED**, and steering is off the generator's training distribution.
+       It was commanded ``|wz| max = 0.0000`` over all 3500 stair clips of the library it was
+       fitted on, and it is FROZEN here -- so on a flight it is extrapolating in yaw rate.
+       Documented at :func:`...fm_tracking_cmd.freeform_yaw_rate`, which also carries the
+       measurement. It is on anyway because nothing else in the loop steers and these sections
+       are tens of metres long.
+    2. **The command is HELD across the window offsets**, where the clip path served a
+       per-offset future. That direction is a mismatch being REMOVED -- both deploy runtimes
+       hold one command over the whole horizon -- but the tracker's reference-group encoder
+       still goes from 13 distinct ``command_window`` rows to 13 copies of one.
+    3. **The stairwell walls COLLIDE.** They are authored ``decor=False``, so they join the
+       ground mesh, take a collider and appear in the height scan -- where the decoration the
+       generator was fitted on did none of those things. Nothing in the MDP teaches obstacle
+       avoidance: ``undesired_contacts`` is **-0.5** against ``clf_reward`` at 10 -- the
+       weight THIS cfg carries, which is not the -0.1 declared beside the term in
+       ``g1_clf_tracking_base``: ``G1TeacherEnvCfg.__post_init__`` overwrites it and every
+       terrain cfg down to this one inherits that. Read it off a constructed cfg, never off
+       the declaration -- and its six sensors are the thighs, torso, backpack and elbows,
+       with no wrists or hands. So a wall is something to be walked into rather than around, and a
+       scan-conditioned number measured here is not comparable to one measured on a clip
+       library.
+
+    **A CLIP-FREE LIBRARY IS NOW A DEFINED THING**, and this is the one task that takes one.
+    ``FmTrackingCommand`` inherits ``MotionSequenceCommand``, which builds a
+    ``MotionClipManager`` in ``_post_init`` and rebuilt the clip reference every step. Neither
+    used to survive a library with no clips -- ``MotionClipManager.__init__`` reached
+    ``clip_len_or_full`` -> ``num_steps`` -> ``y_des.shape[1]``, which raised ``IndexError``
+    on a rank-1 placeholder before anything here ran. What changed, in three places rather
+    than by special-casing this cfg:
+
+    * the WRITER emits the clip datasets at zero extent but full rank, so ``num_steps`` is a
+      real number and the manager constructs (``ClipLibraryWriter`` at ``num_clips=0``);
+    * the MANAGER answers every layout question and REFUSES every gather by name
+      (``MotionClipManager._require_clips``), so a clip-consuming term left wired on this task
+      fails saying so instead of indexing an empty table;
+    * the COMMAND skips the clip half of the step (``_advance_without_a_clip``), keeping only
+      the plan-anchor latch, so ``self._step`` never marches and ``as_clip_reference()`` is
+      refused.
+
+    ``accepts_clip_free_library`` is what permits the combination, and it is True only under
+    ``reference_source="fm"`` -- every other command/config pair still refuses at construction.
+    ``--like <a real library>`` is worth passing: the FM checkpoint's ``frame_names`` are
+    checked against the ee frames resolved from the library's OWN channel names, so the
+    minimal seven-channel layout admits only a generator with no extra frames.
+
+    **The critic's global-drift channel changes MEANING, not width** (see
+    :func:`mdp.tracking_error_global`): plan-anchor drift resets toward zero at every re-plan
+    and is bounded by roughly ``K * dt * speed``, where the clip datum grew without bound.
+    A resumed critic therefore loads with no surgery and reads a differently-distributed six
+    channels -- expect a value transient early in the fine-tune, and read it as that rather
+    than as the policy collapsing.
+    """
+
+    terminations: G1FinetuneFreeformTerminationCfg = G1FinetuneFreeformTerminationCfg()
+    events: G1FinetuneFreeformEventsCfg = G1FinetuneFreeformEventsCfg()
+
+    def __post_init__(self):
+        """The clip fine-tune's setup, then the clip torn out of it.
+
+        Order is load-bearing: every ancestor's ``__post_init__`` assumes the clip wiring is
+        present while it runs -- :class:`G1TeacherTerrainEnvCfg` assigns
+        ``events.reset_on_clip.func``, which is an ``AttributeError`` against a ``None``. So
+        the terms are disabled here, after ``super()``, not declared away above it.
+        """
+        super().__post_init__()
+
+        cmd = self.commands.traj_ref
+        # The velocity command is MANUFACTURED, not read from the library: a per-episode
+        # forward speed after a standing hold, vy pinned to 0, and a P controller on the
+        # bearing down the section. This is also what makes a clip-free library admissible --
+        # ``command_velocity_available`` stops depending on a ``target_vel`` dataset.
+        cmd.freeform_command = True
+        # Every clip-phase knob is now meaningless, and each one would otherwise be a claim
+        # about a library that has no clips. Off explicitly rather than left at the teacher's
+        # value, so a reader of this cfg is not left inferring which of them still apply.
+        cmd.random_start_phase = False                  # no phase to start at
+        cmd.random_start_min_remaining_s = 0.0          # nothing runs out
+        cmd.random_start_before_terrain_start = False   # sections open on their own start
+        # ...including the history seeding, whose whole mechanism is reading the clip's steps
+        # BEFORE the start. Every free-form episode therefore opens on the learned
+        # null-history embedding -- which is the deploy condition, and is why the sections are
+        # authored with a flat approach apron in front of the terrain rather than starting on
+        # it.
+        cmd.seed_history_from_clip = "never"
+
+        # The reset reads the spawn off the manifest's route block. Disabled rather than
+        # re-pointed: ``reset_on_motion_sequence`` and its terrain twin both SAMPLE A CLIP,
+        # and on a manifest-only library that raises the moment a tile's terrain id has no
+        # clips -- correct for a clip library, fatal here.
+        self.events.reset_on_clip = None
+        # Nothing bounds the episode by a motion any more; the section's goal band does.
+        self.terminations.clip_end = None
+
+        # The critic's global datum. Zero-filling it would keep the width (which is what lets
+        # a teacher checkpoint resume unchanged) while handing the value function a constant,
+        # and the clip branch is worse than useless here -- it keeps indexing a clip by step
+        # under ``reference_source="fm"``, so it marches away from the robot on its own.
+        self.observations.critic.tracking_error_global.params = {
+            "command_name": "traj_ref", "datum": "plan_anchor",
+        }
