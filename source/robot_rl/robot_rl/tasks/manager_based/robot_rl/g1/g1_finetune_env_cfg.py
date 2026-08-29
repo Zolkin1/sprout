@@ -46,6 +46,7 @@ number quoted here; it moves with every pair.
 from __future__ import annotations
 
 from isaaclab.managers import ObservationTermCfg as ObsTerm
+from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
 from motion_gen.joint_names import G1_JOINT_NAMES
@@ -239,3 +240,42 @@ class G1FinetuneTerrainDepthEnvCfg(G1TeacherTerrainDepthEnvCfg):
 
     observations: G1FinetuneObservationsCfg = G1FinetuneObservationsCfg()
     commands: G1FinetuneCommandsCfg = G1FinetuneCommandsCfg()
+
+
+@configclass
+class G1FinetuneFallOnlyTerminationsCfg:
+    """Terminations with the CLIP-TRACKING pair replaced by a fall detector.
+
+    The fine-tune shows the actor the generator's window while the clip stays the graded
+    reference, and two of the teacher's terminations measure the robot against that clip:
+    ``base_pose_error`` (0.25 m / 0.8 rad on the anchor mask's pinned DOFs) and
+    ``ee_pose_error``. Under the generator those end episodes for tracking the clip poorly --
+    which is the very thing being fine-tuned, so the policy is cut off exactly where it has
+    most to learn, and the shortened episodes bias what it sees.
+
+    What is left is the reason an episode should really end: the robot fell, or the clip ran
+    out. ``base_fallen`` is trajectory-INDEPENDENT (base below ``min_height``, or roll/pitch
+    past 70 deg from upright), so it fires on a collapsed robot wherever the reference is --
+    the same reasoning, and the same numbers, as the tracker task's termination set.
+
+    ``time_out`` stays: it is an episode-length cap rather than a judgement about the motion,
+    and PPO bootstraps a truncated episode differently from a terminated one.
+
+    NOTE this changes what the run's numbers MEAN. ``Episode_Termination/ee_pose_error``
+    disappears, mean episode length rises because failures no longer cut episodes short, and
+    neither is comparable with a fine-tune that kept the clip-tracking pair.
+    """
+
+    time_out = DoneTerm(func=mdp.time_out, time_out=True)
+    clip_end = DoneTerm(func=mdp.clip_end_reached, params={"command_name": "traj_ref"})
+    base_fallen = DoneTerm(
+        func=mdp.base_fallen,
+        params={"min_height": 0.5, "roll_limit_deg": 70.0, "pitch_limit_deg": 70.0},
+    )
+
+
+@configclass
+class G1FinetuneFallOnlyEnvCfg(G1FinetuneTerrainDepthEnvCfg):
+    """:class:`G1FinetuneTerrainDepthEnvCfg` with the clip-tracking terminations removed."""
+
+    terminations: G1FinetuneFallOnlyTerminationsCfg = G1FinetuneFallOnlyTerminationsCfg()
