@@ -863,3 +863,92 @@ def manifest_rows() -> list[dict]:
             "note": c.note, "params": c.params,
         })
     return rows
+
+
+def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, ...],
+                      approach: float = 2.5, name: str | None = None,
+                      klass: str | None = None) -> Course:
+    """A :class:`Course` that IS one tile of a clip library, geometry for geometry.
+
+    Every other course in this module is deliberately NOT a trained tile -- authored to vary
+    one parameter so a failure names a geometry rather than a tile id.  This one is the
+    opposite, and it exists for a different question: when you want to know what the
+    generator's own sampling variance does, the terrain has to be IN distribution, or the
+    variance you measure is confounded with perceptive distribution shift.
+
+    Nothing here re-derives geometry.  ``generate_clip_tile_scene`` reads the library's
+    ``terrain_manifest`` -- the artifact the clip generators emit and the RL importer re-reads
+    -- so this is the one producer rather than a second opinion, and
+    ``test_clip_tile_scene.py`` already pins that scene against the Isaac loader's own tile.
+
+    Args:
+        clip_path: Clip library ``.h5`` carrying the ``terrain_manifest``.
+        terrain_id: Which tile.  ``None`` is not accepted here: a course must name its tile.
+        speeds: The commanded forward speeds to run on it.
+        approach: Metres before the first riser to spawn, laterally centred on the flight, so
+            driving ``+x`` walks the feature.
+        name: Scene name; defaults to ``tile<id>``.
+        klass: One of :data:`CLASS_CODES`; inferred from the manifest family when omitted.
+
+    Returns:
+        The course, with an infinite floor plane so ``floor_z`` means what it means for every
+        other course here.
+
+    Raises:
+        ValueError: If the tile has no walkable step to aim at, or its family maps to no
+            known class -- either would make the traversal gate and the fall datum meaningless.
+    """
+    import generate_clip_tile_scene as gcts  # noqa: PLC0415
+
+    entry, _info = gcts.load_tile(clip_path, terrain_id)
+    overlays = gcts.emittable_overlays(entry)
+    sx, sy, _why = gcts.spawn_point(entry, overlays, approach)
+    sz = gcts.terrain_top_at(gcts.walkable(overlays), sx, sy)
+    lines, floor = gcts.tile_geoms(entry, overlays, (sx, sy, sz), infinite_floor=True)
+
+    step = gcts.first_step(overlays)
+    if step is None:
+        raise ValueError(f"tile {terrain_id} has no walkable step; it is not a feature course")
+    obstacle_x = float(step["pos_xy"][0]) - float(step["size_xyz"][0]) / 2.0 - sx
+
+    if klass is None:
+        fam = str(entry.get("family", ""))
+        klass = next((k for k in ("stairs_up", "stairs_down", "box") if k in fam), None)
+        if klass is None:
+            raise ValueError(f"tile {terrain_id} family {fam!r} maps to no CLASS_CODES key; "
+                             "pass klass= explicitly")
+
+    # The far platform: walk the walkable tops downrange of the flight and take the farthest
+    # one's centre as the goal, so "traversed" means "got off the feature and onto the far
+    # side" rather than a distance guessed from the tile size.
+    tops = [ov for ov in gcts.walkable(overlays)
+            if float(ov["pos_xy"][0]) - sx > obstacle_x]
+    if not tops:
+        raise ValueError(f"tile {terrain_id} has nothing downrange of its first step")
+    far = max(tops, key=lambda ov: float(ov["pos_xy"][0]))
+    target_x = float(far["pos_xy"][0]) - sx
+    target_z = gcts.terrain_top_at(gcts.walkable(overlays),
+                                   float(far["pos_xy"][0]), float(far["pos_xy"][1]))
+
+    # The floor plane's z, read back out of the emitted geom rather than recomputed, so this
+    # cannot disagree with the scene it describes.
+    floor_z = float(floor.split('pos="0 0 ')[1].split('"')[0])
+    return Course(
+        name=name or f"tile{terrain_id}",
+        klass=klass,
+        variant=int(terrain_id),
+        geoms=tuple(lines),
+        floor_z=floor_z,
+        target_xy=(target_x, 0.0),
+        course_length_m=float(target_x),
+        flight_height_m=float(target_z - sz),
+        obstacle_x_m=float(obstacle_x),
+        speeds=tuple(speeds),
+        note=(f"REAL clip-library tile {terrain_id} ({entry.get('family', '?')}), "
+              f"{entry['size_x']:.2f} x {entry['size_y']:.2f} m, first riser at "
+              f"x={obstacle_x:+.2f} m, net {target_z - sz:+.3f} m over the feature; "
+              "in-distribution terrain, so a variance measured here is not confounded with "
+              "perceptive distribution shift"),
+        params={"clip_path": clip_path, "terrain_id": int(terrain_id),
+                "approach": float(approach), "spawn_tile_xy": [sx, sy], "spawn_tile_z": sz},
+    )

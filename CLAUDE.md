@@ -592,6 +592,67 @@ Things here that are load-bearing and were each found by a failure:
   the LAGGING buffer is the correct one. Success rates were never affected -- they come from
   termination terms, never the accumulator.
 
+## The generator's OWN sampling variance decides ~1 in 5 outcomes (2026-08-29)
+
+`transfer/sim/fm_variance_probe.py`. One initial condition, one constant velocity command, one
+REAL clip-library tile, N repeats, and **the only difference between repeats is the
+flow-matching noise draw** -- no DR, no depth noise, no clip, same standing spawn, and MuJoCo
+is deterministic. `terrains.isaac_tile_course` makes a library tile a first-class mjeval
+`Course` (reading the manifest, the same producer `generate_clip_tile_scene` reads), because
+terrain the generator never saw contributes its own failures and they would be
+indistinguishable from sampling variance.
+
+Deployed pair (`2026-08-20_16-36-10_mode11_decor_plan_v1` + `2026-08-22_19-14-39_plan_v1_lag48_aug`),
+tile 6 = stairs_up 5 risers +0.850 m, tile 20 = stairs_down 7 steps -0.777 m, spawn 2.5 m
+before the first riser on the flight's centreline:
+
+| approach | speed | stairs_up success | stairs_down success |
+|---|---|---|---|
+| 2.50 m | 0.8 m/s | 0.798 (n=500) | 0.816 (n=500) |
+| 2.25 m | 0.8 m/s | 0.836 (n=250) | 0.852 (n=250) |
+| 2.50 m | **1.6 m/s** | **0.624** (n=250) | **0.668** (n=250) |
+
+- **The outcome is bimodal, not a graded spread**: on stairs_up `progress_x_m` is p50 = p90 =
+  8.06 m against a falls-only p50 of 3.61 m. A trial either walks the whole flight or dies on
+  it, so distance-before-failure is mostly reporting that split.
+- **Speed ~doubles the failure rate** (1.8x on both tiles independently). The variance is far
+  from saturated at walking speed.
+- **Start position does NOT matter**: 0.25 m closer moves success by +0.038 / +0.036 on n=250,
+  inside binomial noise. That rules out a spawn-gait-phase artifact -- a third of a step
+  length should have moved it if failures were phase-aligned.
+- **Where it fails differs by family and moves with speed.** stairs_up always fails on the
+  UPPER risers (r3 + r5 carry 80%+; r1 never fails). stairs_down at 0.8 m/s fails mostly OFF
+  the flight (62% past it, 29% before it, ~8% on it); at 1.6 m/s that inverts (pre-flight
+  29% -> 4%, on-flight 8% -> 42%). Falls are ~100% the TILT bound, not height.
+- **The deterministic `x0 = 0` draw -- what the hardware controller runs -- is not a neutral
+  sample.** It succeeds in 5 of the 6 cells, including `down_fast` where a third of Gaussian
+  draws fail, consistent with it sitting at the conditional's mode. The exception is
+  **stairs_up at 1.6 m/s, where it falls on riser 2 -- and riser 2 carries only 9% of the
+  Gaussian failures**, so there the shipped configuration fails deterministically every time
+  while 62% of alternative draws would have made it.
+- **`--zero_noise_control` is the blocking check and it passes EXACTLY**: sd = 0.000e+00 on
+  both progress and distance across repeats, so nothing other than the draw varies. That is
+  the check an Isaac state-restore harness cannot pass, and it is why this instrument is
+  trusted where the per-window one was not (see below).
+- **`--scene_tag` is required when two of these run concurrently on one tile.** `CourseRig`
+  writes `robots/g1/<robot>_<course>.xml` from the course before loading it, and for a speed
+  sweep the geometry is identical, so the race tears the file silently rather than failing to
+  load. The generated scenes are derived and deliberately NOT committed.
+
+**The Isaac per-state best-of-K harness was ABANDONED, and why matters.** It branched K
+generator samples from one state by copying an env's state onto K others. The copy is exact in
+every buffer the controller reads (verified: root pose/vel and joint pos/vel all 0.000e+00
+immediately after) but cannot restore PhysX's contact manifolds, friction anchors or solver
+warm start. A same-noise control -- every candidate handed ONE draw, so zero signal by
+construction -- produced a best-of-K rise of +0.005 to +0.031 per family, matching or exceeding
+the real arm's at every horizon from 0.24 s to 1.20 s (ratio 0.80-0.93). Independent
+per-candidate noise MANUFACTURES a best-of-K rise of about its own flip probability, and two
+estimates of that agreed: candidate-0-vs-parent survival disagreement 0.0157 against the
+control's rise 0.0151. So the instrument had no resolving power and its "the gap is
+bias-limited" reading was not supported. A second defect compounded it: the first action after
+a restore was computed from the PRE-restore observation. The MuJoCo probe has no restore at
+all, which is why it replaced it.
+
 ## What the harness has established about the depth generator (2026-08-24)
 
 Tracker `2026-08-20_09-04-12_mode11_decor_v1`, generator

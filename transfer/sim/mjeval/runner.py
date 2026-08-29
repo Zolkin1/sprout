@@ -126,6 +126,14 @@ class ArmRun:
             the flight, so up top only the tilt cone is guarding -- see
             :attr:`terrains.Course.fall_datum_z`.
         fall_tilt_deg: Roll/pitch bound from upright, degrees.
+        zero_noise: Integrate the flow from ``x0 = 0``.  True is what the hardware controller
+            runs and what makes a repeat at fixed ``(course, speed)`` bit-identical, which is
+            why the sweep has one trial per cell.  Set False to put the generator back on its
+            TRAINING distribution -- an ordinary Gaussian draw -- which is the only way to ask
+            what the flow's own sampling variance does to an outcome.  Then ``fm_seed``
+            selects which draw, and repeats at one cell stop being redundant.
+        fm_seed: Seed for the generator's noise draws.  Only meaningful when ``zero_noise`` is
+            False; recorded in the table's ``seed`` column either way.
         spawn_z_offset: Metres the spawn pelvis is lifted above the standing config's value.
             The optimizer's pelvis frame sits ~3 cm below MuJoCo's foot-contact height, so
             without it every episode opens with the feet through the floor.
@@ -169,6 +177,8 @@ class ArmRun:
     steer_kp: float = 0.0
     steer_wz_max: float = STEER_WZ_MAX
     cmd_hold_s: float = terrains.CMD_HOLD_S
+    zero_noise: bool = True
+    fm_seed: int = 0
     shards: int = 1
     shard: int = 0
     max_courses: int = 0
@@ -289,7 +299,8 @@ def load_arm(cfg: ArmRun) -> tuple[GenTrackerPolicy, FmDepthLag, Spawn]:
             raise FileNotFoundError(f"arm {cfg.label!r}: no {role} at {path}")
     policy = GenTrackerPolicy(
         cfg.tracker_onnx, cfg.fm_onnx,
-        zero_noise=True,
+        zero_noise=bool(cfg.zero_noise),
+        seed=int(cfg.fm_seed),
         providers=list(cfg.providers) or None,
         # One generator against two trackers exported at different times, which is the A/B's
         # whole premise.  The field that can disagree is `mjcf_sha256`, and it reaches nothing

@@ -430,6 +430,44 @@ plus `cell.json` (resolved DR, coverage proof, throughput). `report/` holds `rep
 `summary_by_family.csv`, and `figures/` as png + svg + a caption sidecar carrying that figure's
 definitions.
 
+### 4c. What does the generator's own sampling variance do? `transfer/sim/fm_variance_probe.py`
+
+The eval says the generator arm sits well below the clip ceiling. This asks whether the flow's
+OWN draw decides the outcome -- which is what decides whether a method that sharpens the
+output distribution has any mass to select.
+
+One initial condition, one constant command, one REAL clip-library tile, N repeats, and the
+only difference between repeats is the flow-matching noise. No DR, no depth noise, no clip,
+and MuJoCo is deterministic, so a fixed seed reproduces bit-exactly. No GPU and no isaaclab --
+`env_transfer` is enough.
+
+```bash
+cd transfer/sim
+python fm_variance_probe.py \
+    --clip ../../logs/headroom/v1/eval_clips.h5 --terrain_id 6 --terrain_id 20 \
+    --tracker_onnx <run>/exported/tracker.onnx --fm_onnx <run>/exported/<fm>.onnx \
+    --speed 0.8 --trials 500 --out ../../logs/fm_variance/v1
+
+# the blocking control: x0 = 0 every trial, so the spread must be EXACTLY zero
+python fm_variance_probe.py ... --trials 5 --zero_noise_control --out .../ctrl
+```
+
+`terrains.isaac_tile_course` turns one library tile into an mjeval `Course` by reading the
+`terrain_manifest` -- the artifact the clip generators emit and the Isaac importer re-reads --
+so the terrain is IN distribution and the variance measured is not confounded with perceptive
+distribution shift. Every other course in that module is deliberately not a trained tile,
+which is right for a bisect and wrong here.
+
+**Measured on the deployed pair: ~20% of draws fall at 0.8 m/s and ~35% at 1.6 m/s, from a
+state where the rest walk through.** The outcome is bimodal rather than a graded spread, start
+position does not matter, and the deterministic `x0 = 0` draw the hardware runs sits at the
+good end except on stairs-up at 1.6 m/s. See CLAUDE.md for the full table and the fall-location
+breakdown.
+
+**`--scene_tag` is mandatory when running two of these concurrently on one tile**: `CourseRig`
+rewrites `robots/g1/<robot>_<course>.xml` before loading it, and a speed sweep shares geometry,
+so the race tears the file silently. The generated scenes are derived and not committed.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.
