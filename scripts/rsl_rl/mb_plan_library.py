@@ -380,14 +380,20 @@ def _hold_minimums(cmds: list, min_hold: float, args, bank,
     def _steady(c):
         return max(float(min_hold), _HOLD_CYCLES * _cycle_travel(bank, c, args.dt))
 
-    out = [_steady(cmds[0]) + (0.0 if lead_in_from is None else _bound(lead_in_from, cmds[0]))]
+    # The exit's incoming transient is a TERRAIN BOUNDARY one, which Motion Bricks aims at a pinned
+    # target: its travel is the pin distance |v1| * 1.0 s, not duration x mean speed. Reserving the
+    # duration bound instead under-counted a box-top exit 3x (0.20 m predicted, 0.64 measured) and let
+    # pass A plan a hold whose loop then would not fit.
+    out = [_steady(cmds[0]) + (0.0 if lead_in_from is None
+                               else max(_bound(lead_in_from, cmds[0]), fp.pin_travel(cmds[0])))]
     for j in range(1, len(cmds)):
         out.append(_steady(cmds[j]) + _bound(cmds[j - 1], cmds[j]))
     return out
 
 
 def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
-              steady_vx: float, args, bank) -> dict:
+              steady_vx: float, args, bank, pin_approach: float | None = None,
+              pin_exit: float | None = None) -> dict:
     """The RL-visible command as a list of HOLDS, one per steady stretch, plus the interaction's.
 
     Distance-indexed, and that is the point rather than a tidy-up. This replaced a schedule sampled
@@ -397,10 +403,23 @@ def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
 
     **The command varies along the lead-up and the trail-away**, which is what this whole branch
     exists for: nothing in the shipped library has ever shown the generator a speed change while a
-    terrain feature was in view. The hold ADJOINING the terrain is pinned to the clip's own steady
-    command on both sides -- the entry transient departs from it and the exit transient lands on it,
-    and the tile's entry/exit candidates were selected for it -- so the variation lives strictly in
-    the outer stretches and the terrain interface is untouched.
+    terrain feature was in view. The hold ADJOINING the terrain is pinned on both sides -- the entry
+    transient departs from it and the exit transient lands on it, and the tile's entry/exit
+    candidates were selected for it -- so the variation lives strictly in the outer stretches and the
+    terrain interface is untouched.
+
+    **The two pins are PER SIDE, because on a box the two sides are different surfaces.** A jump_on
+    clip approaches along the ground and walks away on top of the box, and those have separate speed
+    bands (``box_vel_range`` [0.2, 3.5] against ``box_top_vx_range`` [0.2, 0.7]). Pinning both sides
+    to one scalar made ``box_top_vx_range`` DEAD on the command path: the box-top draw was computed,
+    written into ``plan.exit_vx``, and then silently shadowed by the ground draw, which is the value
+    generation actually reads (``mb_terrain_segments._hold_cmd``). Measured over the box families,
+    the elevated side was commanded 4.09x its declared speed with 15 of 16 too fast -- a robot asked
+    to walk away at 1.28 m/s across the top of a 0.45 m box it had just landed on at 0.13.
+
+    It is invisible on stairs and always was: there ``a_mag == x_mag == g_mag``, so 32 of 32 stair
+    sides already agreed with their declaration to 0.000. Only a family whose two sides sit on
+    different surfaces can show it.
 
     The commands are drawn CONTINUOUSLY from the family's band and are not tailored to the strides
     that exist: the motion is whichever stride is nearest (``flat_plan.nearest_stride``), and the
@@ -419,6 +438,9 @@ def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
     req = int(getattr(args, "terrain_cmd_changes_per_side", 0))
     min_hold = float(getattr(args, "min_hold_m", 0.0))
 
+    pin_a = float(steady_vx if pin_approach is None else pin_approach)
+    pin_x = float(steady_vx if pin_exit is None else pin_exit)
+
     def _side(total: float, is_approach: bool) -> list:
         # The zone belongs to the hold that adjoins the terrain, and is NOT available for splitting:
         # it is the stretch the entry transient consumes.
@@ -433,16 +455,16 @@ def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
         while n > 1:
             cmds = [sign * float(rng.uniform(lo, hi)) for _ in range(n)]
             if is_approach:
-                cmds[-1] = float(steady_vx)
+                cmds[-1] = pin_a
             else:
-                cmds[0] = float(steady_vx)
+                cmds[0] = pin_x
             mins = _hold_minimums(cmds, min_hold, args, bank,
                                   lead_in_from=(None if is_approach else 0.0))
             if sum(mins) <= flat:
                 break
             n -= 1
         else:
-            cmds = [float(steady_vx)]
+            cmds = [pin_a if is_approach else pin_x]
             mins = [min(_hold_minimums(cmds, min_hold, args, bank,
                                        lead_in_from=(None if is_approach else 0.0))[0], flat)]
         shares = _split_dist(rng, flat, mins)
@@ -625,6 +647,9 @@ def main() -> int:
                    help="Metre bounds on the converted flat distance, so neither end of the speed "
                         "band degenerates (0.2 m/s would walk 6 m over 30 s; 3.5 m/s would cross "
                         "the tile in 1.5 s).")
+    p.add_argument("--box-top-dist-clamp", type=float, nargs=2, default=(0.75, 2.0),
+                   metavar=("MIN", "MAX"),
+                   help="Metres of walking on a box TOP, clamped separately from the ground. A box top is the solved reference's own footprint, not a lead-in: budgeting it like flat ground authored 3-4 m up there, which at the bottom of --box-top-vx-range is 21 s against a 20 s clip ceiling.")
     p.add_argument("--dist-step", type=float, default=0.25,
                    help="Quantization (m) of the travel budget, so segments can still be shared.")
     p.add_argument("--platform-buffer-m", type=float, default=1.0,
@@ -711,17 +736,30 @@ def main() -> int:
             # vetoes decoys against, so the distance a clip stops tracking the command at and the
             # distance a decoy may not sit inside are the same number by construction.
             lo_d, hi_d = args.flat_dist_clamp
+            # A BOX TOP IS NOT GROUND, and it does not get the ground's travel budget. The elevated
+            # surface of a box family is a metre or two of walkable top -- the solved reference's own
+            # footprint -- so budgeting it like a flat lead-in authored 3-4 m of walking up there and,
+            # at the bottom of ``box_top_vx_range``, up to 21 s of it against a 20 s clip ceiling.
+            # Its own clamp, because the two surfaces have nothing to do with each other.
+            lo_t, hi_t = args.box_top_dist_clamp
 
-            def _budget(mag: float, s_range) -> float:
-                flat = min(max(abs(float(mag)) * float(d_rng.uniform(*s_range)), lo_d), hi_d)
-                return _quantize(flat + APPROACH_ZONE_M, args.dist_step)
+            def _budget(mag: float, s_range, elevated: bool = False, zone: bool = True) -> float:
+                lo, hi = (lo_t, hi_t) if elevated else (lo_d, hi_d)
+                flat = min(max(abs(float(mag)) * float(d_rng.uniform(*s_range)), lo), hi)
+                return _quantize(flat + (APPROACH_ZONE_M if zone else 0.0), args.dist_step)
 
-            a_dists = [_budget(m if kind != "box" else
-                               (top_mag if elevated_side(family) == "approach" else m),
-                               args.approach_flat_s_range) for m in ground_mags]
-            x_dists = [_budget(m if kind != "box" else
-                               (top_mag if elevated_side(family) == "exit" else m),
-                               args.exit_flat_s_range) for m in ground_mags]
+            _elev = elevated_side(family) if kind == "box" else None
+            a_dists = [_budget(m if _elev != "approach" else top_mag,
+                               args.approach_flat_s_range, elevated=(_elev == "approach"))
+                       for m in ground_mags]
+            # An elevated EXIT gets no approach zone: the robot is walking AWAY along a box top and
+            # there is nothing ahead to reach, so the 2 m would be pure extra box-top walking. An
+            # elevated APPROACH keeps it -- there the box top IS the run-up to the drop-off. Ground
+            # sides keep it on both, unchanged.
+            x_dists = [_budget(m if _elev != "exit" else top_mag,
+                               args.exit_flat_s_range, elevated=(_elev == "exit"),
+                               zone=(_elev != "exit"))
+                       for m in ground_mags]
             # The tile's walking surfaces are sized for the LONGEST budget on it, and every clip
             # authors the geometry with that same number -- otherwise a short clip authors a short
             # platform, the tile meshes some other clip's geometry, and the short clip stands metres
@@ -736,9 +774,15 @@ def main() -> int:
                 else:
                     mag = {elevated_side(family): top_mag, ground_side(family): g_mag}
                     a_mag, x_mag = mag["approach"], mag["exit"]
+                # The terrain-adjoining hold on each side takes THAT side's own magnitude, which
+                # is what a_mag / x_mag above already are: on a box they are the ground draw and the
+                # box-top draw, on stairs they are the same number. Passing one scalar for both is
+                # what made box_top_vx_range dead on the command path.
                 _holds_ci = _rl_holds(
                     np.random.default_rng([args.seed + 7, _skill_seed(skill), int(tid), ci]),
-                    kind, a_dist, x_dist, float(family.exit_sign) * abs(float(vx)), args, bank)
+                    kind, a_dist, x_dist, float(family.exit_sign) * abs(float(vx)), args, bank,
+                    pin_approach=float(family.exit_sign) * abs(float(a_mag)),
+                    pin_exit=float(family.exit_sign) * abs(float(x_mag)))
                 _sides_ci = _side_plans(
                     f"{skill}_t{tid:04d}_c{ci:03d}", _holds_ci,
                     np.random.default_rng([args.seed + 13, _skill_seed(skill), int(tid), ci]),
@@ -805,6 +849,20 @@ def main() -> int:
                     skip_reasons[f"{skill}:{type(e).__name__}"] = \
                         skip_reasons.get(f"{skill}:{type(e).__name__}", 0) + 1
                     continue
+                # THE CHECK THAT WOULD HAVE CAUGHT IT. Both numbers are written into every plan --
+                # ``<side>_vx`` is what the tile was authored from, the terrain-adjoining hold is what
+                # generation actually reads -- and nothing compared them, so ``box_top_vx_range`` was
+                # drawn, stored and silently shadowed by the ground draw on every box clip.
+                for _sd, _decl in (("approach", plan.approach_vx), ("exit", plan.exit_vx)):
+                    _seq = (plan.meta or {}).get("rl_holds", {}).get(_sd) or []
+                    if not _seq:
+                        continue
+                    _got = abs(float(_seq[-1 if _sd == "approach" else 0][1]))
+                    if abs(_got - abs(float(_decl))) > 1e-6:
+                        raise AssertionError(
+                            f"{skill} tile {tid} clip {ci}: the {_sd} hold adjoining the terrain "
+                            f"commands {_got:.4f} m/s but the plan declares {abs(float(_decl)):.4f} "
+                            f"-- the side's own speed band is not reaching generation.")
                 save_terrain_plan(os.path.join(work, rel), plan)
                 a_key, x_key = _segment_keys(
                     plan, args.approach_pin, args.exit_pin, a_start,

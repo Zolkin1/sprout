@@ -266,6 +266,28 @@ _KEPT_S_MIN = (6 * 4 - 2 * 4) / 30.0        # 0.533 s
 _KEPT_S_MAX = (16 * 4 - 2 * 4) / 30.0       # 1.867 s
 
 
+# Motion Bricks pins its target token a fixed TIME of travel ahead -- DEFAULT_PLANING_HORIZON, 1.0 s
+# -- regardless of how many tokens it then chooses for the transition. So a boundary transient's
+# TRAVEL is set by that pin at ``|v1| * H`` metres, not by its duration. Fitted over all 28 terrain
+# exit segments of the quick build, measured/predicted mean speed = 1.033 (range 0.961-1.071) across
+# |v1| 0.20-3.33 m/s and 6-15 tokens, so the law holds across the whole band.
+MB_PLANNING_HORIZON_S = 1.0
+
+
+def pin_travel(v1) -> float:
+    """Metres a PIN-TARGETED in-betweening covers, whatever duration it is given.
+
+    Use this, not :func:`transient_travel_bound`, wherever the transient is one Motion Bricks aims at
+    a pinned target -- the two terrain boundary transients. The duration-based bound under-reserves
+    them badly at low speed: for a 0.13 -> 0.75 m/s box-top exit it predicts 0.20 m against a measured
+    0.64, which is enough to convince pass A that a 1.5 m box top can hold a steady stretch when it
+    cannot.
+    """
+    import numpy as _np
+
+    return float(_np.linalg.norm(_np.asarray(v1, _np.float64).reshape(-1)[:2])) * MB_PLANNING_HORIZON_S
+
+
 def transient_travel_bound(v0, v1, *, a_max: float, floor_s: float, slack: float,
                            ramp_dv: float = 1.0) -> float:
     """Upper bound on the metres one in-betweening between ``v0`` and ``v1`` will cover.

@@ -80,6 +80,7 @@ _SCHEMA: dict[str, tuple] = {
     "approach_flat_s_range": ("range", 2),
     "exit_flat_s_range": ("range", 2),
     "flat_dist_clamp": ("range", 2),
+    "box_top_dist_clamp": ("range", 2),
     "dist_step": ("float", 1),
     "platform_buffer_m": ("float", 1),
     # ---- pass C: the splice

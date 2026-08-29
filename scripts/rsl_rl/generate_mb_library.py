@@ -196,6 +196,7 @@ def main() -> int:
             "--approach-flat-s-range", *(str(v) for v in cfg.approach_flat_s_range),
             "--exit-flat-s-range", *(str(v) for v in cfg.exit_flat_s_range),
             "--flat-dist-clamp", *(str(v) for v in cfg.flat_dist_clamp),
+            "--box-top-dist-clamp", *(str(v) for v in cfg.box_top_dist_clamp),
             "--dist-step", str(cfg.dist_step),
             "--platform-buffer-m", str(cfg.platform_buffer_m),
             "--n-steps-range", *(str(int(v)) for v in cfg.n_steps_range),

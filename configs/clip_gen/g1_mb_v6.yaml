@@ -67,7 +67,7 @@ pure_seconds: 6.0               # pure-tile length in s at the stride's horizont
 
 # ---------------------------------------------------------------- box families
 box_vel_range: [0.2, 3.5]       # GROUND-level run-up / walk-away band
-box_top_vx_range: [0.2, 0.7]    # speed ON the box top
+box_top_vx_range: [0.2, 1.0]    # speed ON the box top
 box_two_sided_frac: 0.5
 box_nav_width: -1.0             # -1 = derive from the tile width
 backward_vx_max: 1.0            # caps the band top for a BACKWARD family (jump_off)
@@ -128,6 +128,15 @@ footprint_margin: 1.0            # m added on all four sides of a tile's footpri
 approach_flat_s_range: [1.5, 4.0]   # s of flat lead-in before the approach zone
 exit_flat_s_range: [1.5, 4.0]       # s of flat trail-away after the terrain
 flat_dist_clamp: [1.0, 6.0]         # m; bounds the converted distance at both ends of the band.
+box_top_dist_clamp: [2.25, 3.5]     # m of walking on a box TOP, clamped separately from the ground.
+                                    # A box top is the solved reference's own footprint, not a lead-in:
+                                    # budgeting it like flat ground authored 3-4 m up there, which at
+                                    # 0.2 m/s is 21 s against a 20 s clip ceiling.
+                                    # The FLOOR is not free: an elevated exit gets no approach zone, so
+                                    # this is the whole surface, and it must clear the exit transient
+                                    # (~0.5 m) plus one gait cycle (~0.7 m) or the clip ends with no
+                                    # steady stretch on the box at all. At 0.75 m three jump_on clips
+                                    # did exactly that.
                                     # Widened 4.0 -> 6.0 for the command variation: after the 2 m
                                     # approach zone a 4 m flat lead-in can rarely fund a SECOND
                                     # steady stretch (one gait cycle plus the in-betweening that
