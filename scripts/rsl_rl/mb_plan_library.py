@@ -558,6 +558,15 @@ def main() -> int:
                         "decides how many steady stretches actually fit (--min-hold-m). Each change "
                         "costs one extra Motion Bricks generation per clip in pass B, so 2 is roughly "
                         "3x the stage-b cost of 0.")
+    p.add_argument("--terrain-cmd-segments", type=int, default=2,
+                   metavar="N",
+                   help="Command segments ACROSS the terrain traversal itself. The motion is one fixed replay and this changes none of it -- only target_vel -- but a generator only ever commanded its reference's own speed cannot learn that a command SELECTS a reference. Every value is drawn inside the played reference's Voronoi cell, so the command may disagree with the motion but never points at a different one. 1 reproduces the old constant.")
+    p.add_argument("--terrain-cmd-vy-range", type=float, nargs=2, default=(-0.6, 0.6),
+                   metavar=("MIN", "MAX"),
+                   help="Lateral command range ON a terrain traversal. It moves nothing -- the replay is world-pinned -- and that is the point: the generator has to SEE a lateral command while a staircase is under it to learn that the answer is to keep climbing. Zero everywhere before this.")
+    p.add_argument("--terrain-cmd-wz-range", type=float, nargs=2, default=(-0.8, 0.8),
+                   metavar=("MIN", "MAX"),
+                   help="Yaw-rate command range ON a terrain traversal; same reasoning as --terrain-cmd-vy-range. At most one of the two is non-zero per segment.")
     p.add_argument("--min-hold-m", type=float, default=1.5,
                    help="Shortest steady stretch (m) a command hold may be. A hold shorter than a gait "
                         "cycle is not steady in any measurable sense, and loop_frames_for rounds it UP "
@@ -827,6 +836,9 @@ def main() -> int:
                     platform_ground_dist=plat_ground_dist, platform_top_dist=plat_top_dist,
                     platform_buffer_m=args.platform_buffer_m,
                     approach_dist=a_dist, exit_dist=x_dist,
+                    terrain_cmd_segments=args.terrain_cmd_segments,
+                    terrain_cmd_vy_range=tuple(args.terrain_cmd_vy_range),
+                    terrain_cmd_wz_range=tuple(args.terrain_cmd_wz_range),
                     entry_pick=args.entry_pick, exit_pick=args.exit_pick,
                     clip_seed=int(np.random.default_rng(
                         [args.seed + 11, _skill_seed(skill), int(tid), ci]).integers(0, 2 ** 31)),

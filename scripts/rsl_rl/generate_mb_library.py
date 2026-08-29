@@ -173,6 +173,9 @@ def main() -> int:
             # and choosing each loop's stride and gait phase is a pass-A decision.
             "--stride-bank", bank,
             "--terrain-cmd-changes-per-side", str(cfg.terrain_cmd_changes_per_side),
+            "--terrain-cmd-segments", str(cfg.terrain_cmd_segments),
+            "--terrain-cmd-vy-range", *(str(v) for v in cfg.terrain_cmd_vy_range),
+            "--terrain-cmd-wz-range", *(str(v) for v in cfg.terrain_cmd_wz_range),
             "--min-hold-m", str(cfg.min_hold_m),
             # The SAME three the segment stage gets: pass A predicts a transient's travel with them,
             # pass B generates with them, and one recipe key feeds both.

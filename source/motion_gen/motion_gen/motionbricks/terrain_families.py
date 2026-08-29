@@ -23,12 +23,27 @@ SEES, and they are deliberately different:
   walks the robot into the box at full speed (measured: arrives at 1.14 m/s where the replay's entry
   frame is at 0.11).  Releasing that root pin near the boundary does not fix it; the deceleration has to
   be prescribed.  It is derived per clip from the chosen reference, and never leaves the generator.
-* The RL / flow-matching command is what a USER or PLANNER would ask for: one steady velocity, ignorant
-  of the terrain.  Adapting it to the terrain is the flow model's job, and the FM can only learn that if
-  the clips pair a terrain-agnostic command with a terrain-aware motion.
+* The RL / flow-matching command is what a USER or PLANNER would ask for, ignorant of the terrain.
+  Adapting it to the terrain is the flow model's job, and the FM can only learn that if the clips pair
+  a terrain-agnostic command with a terrain-aware motion.
 
-So a family carries no "what does the RL see over the replay" knob -- that is one constant per clip,
-written by :mod:`scripts.rsl_rl.mb_terrain_clips`.
+That second command is a SCHEDULE, not a constant, and the traversal is where it matters most. The
+motion there is one fixed solved replay, so a clip that only ever commands that replay's own speed
+shows the generator a command and a motion that always agree -- from which it cannot learn that a
+command SELECTS a reference, which is most of what it has to do on terrain. So several commands play
+over one replay, and none of them changes the motion.
+
+The constraint is CONSISTENCY, not agreement: every command must be one for which
+``terrain_place.select_terrain_reference`` would return THIS reference -- inside its Voronoi cell,
+computed by ``terrain_place.terrain_speed_cell`` from the selector's own two stages. Outside it the
+command points at a different solved motion, which teaches the opposite lesson. On a stair tile whose
+solved speeds are {0.31, 0.69} the cells split at 0.50, so a clip playing 0.69 may legitimately be
+commanded 2.6; where a geometry has only one solved speed the cell is unbounded and only the family's
+band binds. The cell narrows as the solved library gains speeds, which is the right direction -- the
+freedom to disagree shrinks exactly as the reason for it does.
+
+So a family still carries no "what does the RL see over the replay" knob: the schedule is authored by
+:mod:`scripts.rsl_rl.mb_terrain_clips`, where the reference -- and therefore the cell -- is chosen.
 
 This module is numpy-only (no torch, no Motion Bricks, no IsaacLab imports) so it loads in the Motion
 Bricks conda env as well as in ``env_isaaclab`` -- the terrain plan (:mod:`.terrain_plan`) is built on one

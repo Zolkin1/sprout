@@ -53,6 +53,7 @@ from motion_gen.terrain.terrain_place import (
     place_episodic_on_tile,
     place_periodic_on_tile,
     select_terrain_reference,
+    terrain_speed_cell,
 )
 from motion_gen.terrain.terrain_sampler import TerrainSpec
 from motion_gen.motionbricks import (
@@ -379,6 +380,66 @@ def _side_alternation(bank, side_plan, seg_dir: str, dt: float, dev: str, *,
     return pieces, cmds, travel, interior
 
 
+def _interaction_schedule(rng, cell: tuple, band: tuple, ref_speed: float, n_seg: int,
+                          sign: float, vy_range=(0.0, 0.0), wz_range=(0.0, 0.0)) -> list:
+    """``[(fraction_of_replay, vx, vy, wz)]`` -- the command while the terrain traversal plays.
+
+    The motion is a single fixed replay and nothing here changes it; this is ``target_vel`` only. What
+    it buys is the one thing a constant command cannot: the generator sees the SAME motion asked for
+    at several commands, which is what teaches it that a command selects a reference rather than
+    describing one.
+
+    **vx is constrained; vy and wz are not, and that asymmetry is the whole design.**
+
+    ``vx`` is drawn from the intersection of the played reference's VORONOI CELL
+    (:func:`terrain_place.terrain_speed_cell`) with the family's own band. Outside the cell the command
+    would point at a DIFFERENT solved motion, which teaches the opposite of the intended lesson; the
+    band keeps a stair clip from being commanded faster than any stair clip is ever generated.
+
+    ``vy`` and ``wz`` are free, because on a traversal they are unconstrained BY CONSTRUCTION: the
+    replay is world-pinned (``anchor_mask == 2``), so a lateral or yaw command cannot move the robot
+    off the tile no matter what it says. Before this they were identically zero on every terrain clip
+    -- ``tvel[:, 1:]`` was never written -- so the generator had never once been asked to turn while a
+    staircase was under it, and could not have learned that the answer is to keep climbing. It has to
+    see them to learn to ignore them.
+
+    The selector compares FORWARD speed only, so vy and wz cannot move which reference is nearest and
+    need no cell. And when a diagonal or turning stair gait is eventually solved, it slots in here
+    without changing this contract: it arrives as another candidate reference, ``terrain_speed_cell``
+    starts splitting on it, and the command that used to be ignorable starts selecting.
+
+    At most ONE of ``vy`` / ``wz`` is non-zero per segment -- the same rule the flat sampler follows,
+    and it matches the solved library exactly (zero of its cells carry both).
+
+    Segment boundaries are drawn uniformly over the replay: the motion is identical throughout, so no
+    frame is a better place for a change than any other, and a fixed fraction would be a landmark.
+    """
+    lo = max(float(cell[0]), float(min(band)))
+    hi = min(float(cell[1]), float(max(band)))
+    n = max(1, int(n_seg))
+    degenerate = not (hi > lo)
+
+    def _lat():
+        """At most one of (vy, wz), drawn from its own range; either may be zero."""
+        pick = rng.integers(0, 3)                     # 0 = straight, 1 = lateral, 2 = yaw
+        if pick == 1 and max(map(abs, vy_range)) > 0:
+            return float(rng.uniform(*vy_range)), 0.0
+        if pick == 2 and max(map(abs, wz_range)) > 0:
+            return 0.0, float(rng.uniform(*wz_range))
+        return 0.0, 0.0
+
+    cuts = sorted(float(x) for x in rng.uniform(0.0, 1.0, size=n - 1)) if n > 1 else []
+    out, prev = [], 0.0
+    for c in list(cuts) + [1.0]:
+        vx = (float(sign) * abs(float(ref_speed)) if degenerate
+              else float(sign) * float(rng.uniform(lo, hi)))
+        vy, wz = _lat()
+        out.append((float(c) - prev, vx, vy, wz))
+        prev = float(c)
+    out = [r for r in out if r[0] > 1e-6]
+    return out or [(1.0, float(sign) * abs(float(ref_speed)), 0.0, 0.0)]
+
+
 def _cmd_track_from_bounds(bounds, cmds: list, n: int) -> "torch.Tensor":
     """Per-frame RL command ``[n]`` from the spliced pieces' own ``(start, end)`` bounds.
 
@@ -397,6 +458,42 @@ def _cmd_track_from_bounds(bounds, cmds: list, n: int) -> "torch.Tensor":
             out[a:b] = float(c)
     if bounds and int(bounds[-1][1]) < n:                 # trailing frames keep the last command
         out[int(bounds[-1][1]):] = float(cmds[-1])
+    return out
+
+
+def _apply_interaction_schedule(track, span, sched):
+    """Overwrite the REPLAY's frames with its own ``(vx, vy, wz)`` schedule.
+
+    ``_cmd_track_from_bounds`` gives one forward command per spliced piece, and the replay is one
+    piece -- so without this the whole traversal carries a single value, which is what the library did
+    before and is exactly what stops a generator learning to select. The motion is untouched; only
+    ``target_vel`` moves.
+
+    ``span`` is the replay's ``(start, end)`` from the splice's own bounds, so the schedule lands on
+    precisely the anchored frames and cannot leak into the transients either side.
+
+    Returns ``[T, 3]``: the forward channel is the incoming track with the replay's span overwritten,
+    and the lateral / yaw channels are zero everywhere EXCEPT the replay.
+    """
+    out = torch.zeros((int(track.shape[0]), 3), dtype=torch.float32)
+    out[:, 0] = track
+    if not sched:
+        return out
+    a, b = int(span[0]), int(span[1])
+    n = b - a
+    if n <= 0:
+        return out
+    t = a
+    for k, seg in enumerate(sched):
+        frac, vx = float(seg[0]), float(seg[1])
+        vy = float(seg[2]) if len(seg) > 2 else 0.0
+        wz = float(seg[3]) if len(seg) > 3 else 0.0
+        e = b if k == len(sched) - 1 else min(b, t + int(round(frac * n)))
+        if e > t:
+            out[t:e, 0] = vx
+            out[t:e, 1] = vy
+            out[t:e, 2] = wz
+        t = e
     return out
 
 
@@ -498,6 +595,22 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
     ts = sources[ri]
     tm = ts.terrain_meta["terrain"]
     ref_speed = float(ts.steady_vel[0]) if ts.steady_vel is not None else 0.0
+    # THE COMMAND VARIES ACROSS THE TRAVERSAL, even though the motion is one fixed replay. That is the
+    # point: a generator only ever commanded the speed its reference happens to walk at cannot learn to
+    # SELECT a reference, and selecting is most of what it has to do on terrain. The constraint is
+    # CONSISTENCY, not agreement -- every command must be one for which this same reference is the
+    # nearest, i.e. inside its Voronoi cell under the selector's own metric.
+    _cell = terrain_speed_cell(
+        sources, ri,
+        riser=(args.riser if family.geom == "stairs" else None),
+        tread=(args.tread if family.geom == "stairs" else None),
+        box_height=(args.box_height if family.geom == "box" else None))
+    inter_sched = _interaction_schedule(
+        np.random.default_rng([int(getattr(args, "clip_seed", 0)) % (2 ** 31), 991]),
+        _cell, tuple(getattr(args, "rl_vel_range", RL_CMD_VEL_RANGE)), abs(ref_speed),
+        int(getattr(args, "terrain_cmd_segments", 1)), float(family.exit_sign),
+        vy_range=tuple(getattr(args, "terrain_cmd_vy_range", (0.0, 0.0))),
+        wz_range=tuple(getattr(args, "terrain_cmd_wz_range", (0.0, 0.0))))
     print(f"[mb_terrain] {family.skill}: {family.blurb}")
     print(f"[mb_terrain]   reference {ri}/{len(sources)} '{ts.name}' "
           + (f"riser={tm.get('riser', 0):.3f} tread={tm.get('tread', 0):.3f} "
@@ -585,6 +698,11 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
         # clip timeline, which forced pass A to guess the traversal's length (a fixed 12 s against a
         # real 2-6 s) so it could hold the command steady across the approach and the exit.
         "rl_holds": getattr(args, "rl_holds", None),
+        # The command across the TRAVERSAL: [(fraction_of_replay, vx)], every value inside the played
+        # reference's Voronoi cell. Authored here rather than in pass A because the cell is a property
+        # of which reference was selected, which is decided here.
+        "interaction_schedule": [[float(x) for x in seg] for seg in inter_sched],
+        "interaction_cell": [float(_cell[0]), float(_cell[1])],
         # The approach and the exit as ordinary flat plans (``flat_plan.plan_to_dict``): a loop per
         # hold, a Motion Bricks in-betweening between consecutive holds. Absent = the single-hold
         # structure, where the whole approach is one loop plus the terrain entry transient.
@@ -733,7 +851,10 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
         _holds = (plan.meta or {}).get("rl_holds") or {}
         _a_cmds = [c for _d, c in (_holds.get("approach") or [])] or [float(plan.meta["rl_vx"])]
         _x_cmds = [c for _d, c in (_holds.get("exit") or [])] or [float(plan.meta["rl_vx"])]
-        _inter = float(_holds.get("interaction", plan.meta["rl_vx"]))
+        _sched = (plan.meta or {}).get("interaction_schedule") or []
+        # The entry transient heads TO the traversal's first command; the replay piece carries it too
+        # and is then overwritten frame by frame with the full schedule below.
+        _inter = float(_sched[0][1]) if _sched else float(_holds.get("interaction", plan.meta["rl_vx"]))
         # A TRANSIENT carries the command it is heading TO -- flat_plan.Transient.cmd_vel's own
         # convention, kept so the two paths read the same way.
         piece_cmds: list[float] = []
@@ -821,7 +942,9 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                     # unreadable in the log. The per-seam data was in ``seam_accel`` all along.
                     # The RL command laid onto the splice's own per-piece bounds. Trimmed with the
                     # motion below, like any other per-frame channel.
-                    "rl_cmd_t": _cmd_track_from_bounds(pb, piece_cmds, int(Wp.shape[0])),
+                    "rl_cmd_t": _apply_interaction_schedule(
+                        _cmd_track_from_bounds(pb, piece_cmds, int(Wp.shape[0])),
+                        pb[n_lead + 1], (plan.meta or {}).get("interaction_schedule")),
                     "approach_seam_speed": float(
                         torch.linalg.norm(Wp[n_a] - Wp[n_a - 1]) / dt) if n_a > 0 else 0.0,
                     "exit_seam_speed": float(
@@ -920,7 +1043,10 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
         # single steady command. Every driver run takes the bounded path.
         tvel[:, 0] = float(plan.meta["rl_vx"])
     else:
-        tvel[:, 0] = _cmd_t.to(device=dev, dtype=tvel.dtype)
+        # [T, 3] now: the traversal carries lateral and yaw commands too, which are zero everywhere
+        # else. They cannot move the robot there (the replay is world-pinned), and the generator has
+        # to see them to learn that the answer to "turn" while on a staircase is to keep climbing.
+        tvel[:] = _cmd_t.to(device=dev, dtype=tvel.dtype)
 
     # ``frame_yaw``: the heading of the TERRAIN's own frame within the tile -- the axis the traversal
     # crosses it along.  The RL anchor mask resolves its downrange / lateral bits in this frame

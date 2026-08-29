@@ -88,6 +88,21 @@ gen_attempts: 6                 # seeds to try before giving up on one in-betwee
 
 # ---------------------------------------------------------------- RL-visible command
 terrain_cmd_changes_per_side: 2   # command changes during the lead-up / trail-away. 0 = the
+terrain_cmd_segments: 2           # command segments ACROSS the traversal itself. The motion is one
+terrain_cmd_vy_range: [-0.6, 0.6] # lateral / yaw commands ON a traversal. They move NOTHING -- the
+terrain_cmd_wz_range: [-0.8, 0.8] # replay is world-pinned -- and that is exactly why they belong
+                                  # there: both channels were identically zero on every terrain clip,
+                                  # so the generator had never been asked to turn while a staircase
+                                  # was under it and could not learn that the answer is to keep
+                                  # climbing. At most one of the two is non-zero per segment. When a
+                                  # diagonal or turning stair gait is solved it slots in without
+                                  # changing this: it arrives as another candidate reference and the
+                                  # Voronoi cell starts splitting on it.
+                                  # fixed replay and this changes none of it -- only target_vel -- but
+                                  # a generator only ever commanded its reference's own speed cannot
+                                  # learn that a command SELECTS a reference. Every value is drawn
+                                  # inside that reference's Voronoi cell, so the command may disagree
+                                  # with the motion but never points at a different one.
                                   # pre-step-8 single hold. A CEILING: the travel budget decides how
                                   # many steady stretches actually fit. Each change is one extra MB
                                   # generation per clip, so 2 is ~3x the stage-b cost of 0.
