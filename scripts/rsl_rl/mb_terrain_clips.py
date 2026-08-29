@@ -357,6 +357,25 @@ def _side_alternation(bank, side_plan, seg_dir: str, dt: float, dev: str, *,
         pieces.append(lp)
         cmds.append(float(pc.cmd_vel[0]))
         travel += float(tv)
+    # NO TWO IN-BETWEENINGS MAY TOUCH. A dropped loop leaves the transient that fed it welded
+    # directly to the one that follows -- an acceleration running straight into a deceleration with
+    # no steady motion between them, which on screen is the robot sprinting into the terrain from a
+    # long way out. It was silent because the COMMAND is still piecewise-constant on piece boundaries
+    # (``rl_cmd_t`` is built from those bounds), so every command-tracking number stayed clean while
+    # the motion did not; it took looking at the clip to see it.
+    #
+    # This is a PLANNING failure, not something pass C can repair: the two segments were generated
+    # independently and there is no steady stride to put between them. So it costs one clip and says
+    # why -- ``mb_assemble_library._tile_worker`` turns the raise into a counted per-clip skip.
+    # ``_hold_minimums`` is what prevents it, by sizing a hold to fund its own loop AND the transient
+    # that reaches it.
+    for a, b in zip(pieces, pieces[1:]):
+        if a.kind == "transient" and b.kind == "transient":
+            raise RuntimeError(
+                f"{side_plan.name}: two in-betweenings spliced back to back -- a hold's exact loop "
+                f"was dropped because its travel budget could not fund one gait cycle after the "
+                f"transient reaching it. Widen the lead-up budget (flat_dist_clamp) or lower "
+                f"terrain_cmd_changes_per_side.")
     return pieces, cmds, travel, interior
 
 

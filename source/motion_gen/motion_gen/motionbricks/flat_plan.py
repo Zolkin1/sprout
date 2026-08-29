@@ -266,32 +266,49 @@ _KEPT_S_MIN = (6 * 4 - 2 * 4) / 30.0        # 0.533 s
 _KEPT_S_MAX = (16 * 4 - 2 * 4) / 30.0       # 1.867 s
 
 
-def transient_travel_bound(v0, v1, *, a_max: float, floor_s: float, slack: float) -> float:
+def transient_travel_bound(v0, v1, *, a_max: float, floor_s: float, slack: float,
+                           ramp_dv: float = 1.0) -> float:
     """Upper bound on the metres one in-betweening between ``v0`` and ``v1`` will cover.
 
-    Mirrors ``mb_env.hop_tokens``' arithmetic, which is the thing that actually decides: the duration
-    is bounded below by the velocity change (``|dv| / a_max``, never under ``floor_s``) and above by
-    ``slack`` times that, then clipped to the model's own 6..16 token horizon. Travel is that duration
-    at the mean of the two speeds, since the transient IS the acceleration and neither endpoint
-    describes it.
+    Mirrors what ``mb_transient.generate`` actually does, which is TWO things:
+
+    1. it splits a change larger than ``ramp_dv`` into ``ceil(|dv| / ramp_dv)`` chained hops through
+       intermediate velocity waypoints (``ramp_waypoints``), each a full generation of its own;
+    2. each hop's duration is bounded below by that hop's own change (``|dv_hop| / a_max``, never under
+       ``floor_s``) and above by ``slack`` times it, then clipped to Motion Bricks' 6..16 token
+       horizon -- and the model may pick anywhere in that band, so the BOUND is the top of it.
+
+    Both were missed at first, and the omission is what produced the defect this function exists to
+    prevent. Modelling a single hop at ``t_min`` predicted 1.89 m for a 0.97 -> 2.60 m/s change; the
+    real chained pair covered far more, the hold that was supposed to follow it could not fund a gait
+    cycle, ``_loop_piece`` correctly refused to emit a sub-cycle loop -- and pass C then spliced two
+    in-betweenings back to back. That reads as the robot sprinting into the terrain from a long way
+    out, with no steady stretch anywhere, which is exactly what it is.
 
     Pass A needs this to size a command hold: an interior hold has to fund its incoming transient
-    BEFORE it can fund an exact loop, and a flat reserve is wrong by an order of magnitude across the
-    band -- a 0.2 m/s change covers 0.37 m where a 3.5 m/s one covers 6.5.
+    BEFORE it can fund an exact loop.
 
     A BOUND rather than an estimate: over-reserving costs a shorter loop, under-reserving costs the
-    loop entirely (``_loop_piece`` refuses to round a sub-cycle loop up to a whole one), and those two
-    failures are not equally bad.
+    loop entirely, and those two failures are not equally bad.
     """
+    import math as _math
+
     import numpy as _np
 
     a = _np.asarray(v0, _np.float64).reshape(-1)
     b = _np.asarray(v1, _np.float64).reshape(-1)
     dv = float(_np.linalg.norm(b[:2] - a[:2]))
-    t = max(float(floor_s), dv / max(float(a_max), 1e-6)) * max(float(slack), 1.0)
-    t = min(max(t, _KEPT_S_MIN), _KEPT_S_MAX)
-    v_mean = 0.5 * (float(_np.linalg.norm(a[:2])) + float(_np.linalg.norm(b[:2])))
-    return float(t * v_mean)
+    k = max(1, int(_math.ceil(dv / max(float(ramp_dv), 1e-6))))
+    sa, sb = float(_np.linalg.norm(a[:2])), float(_np.linalg.norm(b[:2]))
+    total = 0.0
+    for j in range(k):
+        # The chain ramps linearly through the waypoints, so hop j runs between these two speeds.
+        s0 = sa + (sb - sa) * (j / k)
+        s1 = sa + (sb - sa) * ((j + 1) / k)
+        t = max(float(floor_s), (dv / k) / max(float(a_max), 1e-6)) * max(float(slack), 1.0)
+        t = min(max(t, _KEPT_S_MIN), _KEPT_S_MAX)
+        total += t * 0.5 * (s0 + s1)
+    return float(total)
 
 
 def plan_from_distance_holds(name: str, holds, rng, *, bank_periods, bank_vel, dt: float, seed: int,

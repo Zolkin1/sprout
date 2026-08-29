@@ -80,6 +80,11 @@ steady_approach_frac: 0.5       # fraction of terrain clips entered already walk
 approach_a_max: 2.0
 approach_min_transient_s: 0.35
 approach_hop_slack: 1.3
+gen_attempts: 6                 # seeds to try before giving up on one in-betweening. The pose-pinned
+                                # terrain generation occasionally diverges on a particular draw --
+                                # neighbours with identical endpoints come out clean -- so a retry is
+                                # the cheap fix. Every approach used to share ONE seed, so a diverged
+                                # request diverged permanently and shipped a 30 m/s segment.
 
 # ---------------------------------------------------------------- RL-visible command
 terrain_cmd_changes_per_side: 2   # command changes during the lead-up / trail-away. 0 = the

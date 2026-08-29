@@ -70,6 +70,31 @@ def _hold_cmd(plan, side: str, which: int = 0) -> float | None:
     return float(seq[which][1]) if which < len(seq) else None
 
 
+def peak_root_speed(qpos: np.ndarray, fps: float) -> float:
+    """Fastest planar root speed anywhere in a generated segment (m/s)."""
+    if qpos.shape[0] < 2:
+        return 0.0
+    return float((np.linalg.norm(np.diff(qpos[:, :2], axis=0), axis=1) * float(fps)).max())
+
+
+def speed_ceiling(v0, v1) -> float:
+    """The most a sane in-betweening between ``v0`` and ``v1`` may peak at.
+
+    ``2.0 * max(|v0|, |v1|) + 1.5``, and it is deliberately loose: this is a BLOW-UP detector, not a
+    tracking metric. The separation it has to resolve was measured on the quick build and is enormous
+    -- sound in-betweenings peak at up to 4.0 m/s while broken ones peak at 24-31 while travelling
+    8-15 m, looping several metres out and back to cover a 2 m gap.
+
+    A tighter ``1.3 * max + 1.0`` was tried first and rejected: it fired on an interior hop peaking at
+    3.9 m/s against a 3.9 ceiling, costing a clip for 0.05 m/s of ordinary gait oscillation. A real
+    pelvis accelerates and decelerates within every step -- the flat family's own exact looped replays
+    reach 1.66x their commanded speed below 0.5 m/s -- so a gate set near the command cannot tell a
+    brisk transient from a broken one. Set it where nothing sound has ever been, and let the
+    quality metrics (``mb_qc``) judge the rest.
+    """
+    return 2.0 * max(abs(float(v0)), abs(float(v1))) + 1.5
+
+
 def _side_plan(plan, side: str):
     """The ``flat_plan.FlatClipPlan`` for one side, or ``None`` on a single-hold plan.
 
@@ -95,6 +120,7 @@ def _terminal_loop(plan, side: str):
 
 
 def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: float, alpha_max: float,
+                               token_floor: int = 0,
                                floor_s: float, slack: float, seed: int):
     """The approach as a BOUNDED transient: an exact steady stride hands off to a short in-betweening.
 
@@ -165,6 +191,11 @@ def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: f
     # ordinary loop/transient alternation, and let this transient bridge only what is left.
     n_min, n_max, _t_min = mb_env.hop_tokens(mb, v0, v1, a_max=a_max, alpha_max=alpha_max,
                                              floor_s=floor_s, slack=slack)
+    # ``token_floor`` raises the BOTTOM of the band on a retry. See ``_emit_segment``: the pose-pinned
+    # generation diverges when it takes the fewest tokens it is allowed, and the same request comes
+    # out clean given more.
+    n_min = int(min(mb.max_tokens, n_min + max(0, int(token_floor))))
+    n_max = int(max(n_min, n_max))
     allowed = mb_env.allowed_tokens_mask(n_min, mb.min_tokens, mb.max_tokens, n_max=n_max)
     # Pin the terrain boundary as the target POSE.  Every family now tracks the replay's future joints,
     # so the arrival keeps stepping; ``terrain_families.pin_future`` survives as the narrower question of
@@ -228,7 +259,8 @@ def _seed_overlap_idx(frames: np.ndarray, seed_last: np.ndarray, search: int = 8
 
 
 
-def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float, floor_s: float,
+def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float,
+                           token_floor: int = 0, floor_s: float,
                            slack: float, seed: int):
     """The exit as a BOUNDED transient: the replay hands off to a short in-betweening, then an exact loop.
 
@@ -269,6 +301,8 @@ def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float
     mb.set_regime(1.0, 0.0)
     n_min, n_max, _t = mb_env.hop_tokens(mb, v0, v1, a_max=a_max, alpha_max=alpha_max,
                                          floor_s=floor_s, slack=slack)
+    n_min = int(min(mb.max_tokens, n_min + max(0, int(token_floor))))
+    n_max = int(max(n_min, n_max))
     allowed = mb_env.allowed_tokens_mask(n_min, mb.min_tokens, mb.max_tokens, n_max=n_max)
     win = plan.exit_seed_window(mb.nfpt, mb.dt)
     win[:, 2] -= float(plan.exit_surf_z)                              # generate on virtual flat ground
@@ -304,11 +338,29 @@ def _emit_interior(mb, targeter, plan, side: str, piece_key: str, out: str, args
     tr = next((pc for pc in sp.pieces if pc.kind == "transient" and pc.key == piece_key), None)
     if tr is None:
         raise RuntimeError(f"{piece_key}: not a transient of the {side} plan")
-    qpos, diag = mb_transient.generate(
-        mb, sb, flat_plan, targeter.strides, targeter.steady_vel, targeter.bank_dt, tr,
-        seed=(args.seed * 2654435761 + (hash(piece_key) & 0xFFFF)) % (2 ** 31),
-        a_max=args.a_max, alpha_max=args.alpha_max, floor_s=args.min_transient_s,
-        ramp_dv=args.ramp_dv, slack=args.hop_slack)
+    a_max = float(args.flat_a_max if args.flat_a_max is not None else args.a_max)
+    ceil_ = speed_ceiling(targeter.steady_vel[tr.stride_out][0] if tr.stride_out >= 0 else 0.0,
+                          targeter.steady_vel[tr.stride_in][0])
+    # Keyed off the piece name so two transients of one clip get different streams, and off the
+    # attempt so a diverged draw is not simply repeated. ``hash`` is per-process randomized, which
+    # would make a rebuild irreproducible, so the key is folded deterministically instead.
+    base = sum((i + 1) * ord(ch) for i, ch in enumerate(piece_key))
+    qpos = None
+    for attempt in range(max(1, int(args.gen_attempts))):
+        qpos, diag = mb_transient.generate(
+            mb, sb, flat_plan, targeter.strides, targeter.steady_vel, targeter.bank_dt, tr,
+            seed=(args.seed * 2654435761 + base * 1000003 + attempt * 7919) % (2 ** 31),
+            a_max=a_max, alpha_max=args.alpha_max, floor_s=args.min_transient_s,
+            ramp_dv=args.ramp_dv, slack=args.hop_slack)
+        pk = peak_root_speed(qpos, mb.fps)
+        diag["peak_speed"], diag["speed_ceiling"], diag["attempts"] = float(pk), float(ceil_), attempt + 1
+        if pk <= ceil_:
+            break
+        print(f"[mb_seg][retry] {piece_key} interior: peak {pk:.1f} m/s over a {ceil_:.1f} ceiling "
+              f"(attempt {attempt + 1})", flush=True)
+    else:
+        raise RuntimeError(f"{piece_key}: interior in-betweening diverged on every seed "
+                           f"(peak {peak_root_speed(qpos, mb.fps):.1f} m/s > {ceil_:.1f})")
     tvel = np.tile(np.asarray(diag["cmd"], np.float32), (qpos.shape[0], 1))
     motion = raw_schema.RawMotion(
         mujoco_qpos=qpos.astype(np.float32), fps=mb.fps, joint_names=list(mb_env.G1_JOINT_NAMES),
@@ -318,7 +370,7 @@ def _emit_interior(mb, targeter, plan, side: str, piece_key: str, out: str, args
                     "stride_in": int(tr.stride_in), "phase_in": int(tr.phase_in),
                     "gen_version": _GEN_VERSION,
                     "stride_bank": os.path.basename(args.stride_bank),
-                    "a_max": float(args.a_max), "alpha_max": float(args.alpha_max),
+                    "a_max": float(a_max), "alpha_max": float(args.alpha_max),
                     "min_transient_s": float(args.min_transient_s),
                     "hop_slack": float(args.hop_slack), "ramp_dv": float(args.ramp_dv),
                     **diag})
@@ -331,7 +383,7 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, dist: float, 
                   args, raw_schema, quiet: bool = False, plan_path: str | None = None,
                   start: str = "stand") -> str:
     """Generate ONE segment (``side`` of ``plan``) and write it as a ``RawMotion``; returns the path."""
-    seed = (args.seed * (1 + (side == "exit")) * 2333) % (2 ** 32 - 1)
+    seed0 = (args.seed * (1 + (side == "exit")) * 2333) % (2 ** 32 - 1)
     extra: dict = {}
     # BOUNDED is the only path. An exact looped stride covers the travel budget and Motion Bricks
     # only bridges the last stretch, so a segment is [exact loop][transient] on either side.
@@ -346,17 +398,48 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, dist: float, 
     # -6.8 -> -2.7 m/s^2 entry-deceleration improvement that knob is credited with came from the
     # bounded rewrite itself, not from the knob. Deleting them is what makes the recipe's central
     # claim -- that a stated parameter is a parameter that acts -- true again.
-    if side == "approach":
-        pin_future = family.pin_future if args.pin_future == "auto" else (args.pin_future == "on")
-        qpos, cmd, extra = _generate_approach_bounded(
-            mb, targeter, plan, pin_future=pin_future, a_max=args.a_max, alpha_max=args.alpha_max,
-            floor_s=args.min_transient_s, slack=args.hop_slack, seed=seed)
+    # GENERATE, CHECK, RETRY ON THE HORIZON. The pose-pinned terrain generation diverges when it takes
+    # the FEWEST tokens it is allowed: measured on the quick build, a 2.60 -> 0.36 m/s request peaked at
+    # 30.6 m/s at 11 tokens and 3.0 at 13, and a 2.91 -> 0.10 peaked at 24.0 at 13 and 4.0 at 16 --
+    # identical endpoints, opposite outcomes, the horizon the only difference. So each attempt raises
+    # the floor of the allowed band by one token.
+    #
+    # A SEEDED retry was tried first and does nothing: three attempts on the same request returned
+    # "peak 24.7 m/s" three times, bit-identical. Motion Bricks is deterministic given the same context
+    # and target, so ``mb.reset(seed)`` moves no sampling that matters here. The seed still varies per
+    # attempt (it costs nothing and the flat path does sample), but the horizon is what actually works.
+    v_hi = (_hold_cmd(plan, "approach", -1) if side == "approach" else _hold_cmd(plan, "exit", 0))
+    v_hi = (plan.approach_vx if side == "approach" else plan.exit_vx) if v_hi is None else v_hi
+    v_lo = plan.entry_vx if side == "approach" else plan.exit_speed
+    ceil_ = speed_ceiling(v_hi, v_lo)
+    qpos = cmd = None
+    for attempt in range(max(1, int(args.gen_attempts))):
+        seed = (seed0 + attempt * 2654435761) % (2 ** 32 - 1)
+        if side == "approach":
+            pin_future = family.pin_future if args.pin_future == "auto" else (args.pin_future == "on")
+            qpos, cmd, extra = _generate_approach_bounded(
+                mb, targeter, plan, pin_future=pin_future, a_max=args.a_max,
+                alpha_max=args.alpha_max, floor_s=args.min_transient_s, slack=args.hop_slack,
+                token_floor=attempt, seed=seed)
+        else:
+            qpos, cmd, extra = _generate_exit_bounded(
+                mb, targeter, plan, a_max=args.a_max, alpha_max=args.alpha_max,
+                floor_s=args.min_transient_s, slack=args.hop_slack, token_floor=attempt, seed=seed)
+        pk = peak_root_speed(qpos, mb.fps)
+        extra["peak_speed"] = float(pk)
+        extra["speed_ceiling"] = float(ceil_)
+        extra["attempts"] = attempt + 1
+        if pk <= ceil_:
+            break
+        print(f"[mb_seg][retry] {plan.skill} {side}: peak {pk:.1f} m/s over a {ceil_:.1f} "
+              f"ceiling at {extra.get('tokens')} tokens; raising the floor "
+              f"(attempt {attempt + 1})", flush=True)
     else:
-        # The exit is context-SEEDED from the terrain, which is what makes it an ordinary flat
-        # transition whose initial condition happens to be a replay.
-        qpos, cmd, extra = _generate_exit_bounded(
-            mb, targeter, plan, a_max=args.a_max, alpha_max=args.alpha_max,
-            floor_s=args.min_transient_s, slack=args.hop_slack, seed=seed)
+        raise RuntimeError(
+            f"{plan.skill} {side}: the in-betweening diverged on every one of "
+            f"{args.gen_attempts} seeds -- peak {peak_root_speed(qpos, mb.fps):.1f} m/s against a "
+            f"{ceil_:.1f} m/s ceiling for a {v_hi:+.2f} -> {v_lo:+.2f} transition.")
+
     motion = raw_schema.RawMotion(
         mujoco_qpos=qpos, fps=mb.fps, joint_names=list(mb_env.G1_JOINT_NAMES),
         target_vel=cmd, kind="terrain",
@@ -419,6 +502,10 @@ _GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "dist", "pin"
 #   4: (superseded)
 #   6: the travel budget is a DISTANCE, so the knob the segment is keyed on changed name and unit
 #      ("secs" -> "dist"); a stale dict must not compare equal to the new one.
+#  12: the speed gate retries on the HORIZON (a seeded retry is a no-op -- the generator is
+#      deterministic given the same context and target), and the ceiling is loosened.
+#  11: every in-betweening is speed-gated with a seeded retry, and the interior ones take
+#      the FLAT acceleration bound. Both change what a given request produces.
 #  10: the approach transient's horizon is Motion Bricks' own choice again -- the travel
 #      floor added at 7/9 forced it to span the zone, which at the slow end meant coasting
 #      against a pinned pose with nothing to transition. The exact loop covers the rest.
@@ -432,7 +519,7 @@ _GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "dist", "pin"
 #      --pin-lead / --pin-tail / --pin-place / --pin-dist knobs are gone -- they were dead on every
 #      driver run, so no segment on disk was ever produced by them, but the knob set they were
 #      compared against changed and a stale dict must not compare equal to the new one.
-_GEN_VERSION = 10
+_GEN_VERSION = 12
 
 
 def _gen_params(args, side: str, pin: str, dist: float, start: str) -> dict:
@@ -483,7 +570,8 @@ def _is_stale_interior(path: str, args, raw_schema) -> str | None:
     ``gen_version``, so a change to what the generator produces invalidates both kinds together.
     """
     want = {"gen_version": _GEN_VERSION, "stride_bank": os.path.basename(args.stride_bank),
-            "a_max": float(args.a_max), "alpha_max": float(args.alpha_max),
+            "a_max": float(args.flat_a_max if args.flat_a_max is not None else args.a_max),
+            "alpha_max": float(args.alpha_max),
             "min_transient_s": float(args.min_transient_s), "hop_slack": float(args.hop_slack),
             "ramp_dv": float(args.ramp_dv)}
     try:
@@ -596,6 +684,16 @@ def main() -> int:
     p.add_argument("--alpha-max", type=float, default=2.0, help="Max yaw acceleration (rad/s^2).")
     p.add_argument("--min-transient-s", type=float, default=0.35,
                    help="Absolute floor on a bounded transient's kept duration (s).")
+    p.add_argument("--gen-attempts", type=int, default=3,
+                   help="Seeds to try before giving up on one in-betweening. The pose-pinned terrain "
+                        "generation occasionally diverges on a particular draw -- neighbours with "
+                        "identical endpoints come out clean -- so a retry is the cheap fix. Exhausting "
+                        "them costs ONE clip, loudly, instead of shipping a 30 m/s segment.")
+    p.add_argument("--flat-a-max", type=float, default=None,
+                   help="Acceleration bound for the INTERIOR lead-up transients, which are ordinary "
+                        "loop-to-loop hops rather than terrain-boundary ones. Defaults to --a-max; the "
+                        "driver passes the FLAT family's value, since it is the flat generator they "
+                        "use and it is measurably cleaner there.")
     p.add_argument("--ramp-dv", type=float, default=1.0,
                    help="Max planar speed change (m/s) any ONE generation may be asked for, for the "
                         "INTERIOR lead-up / trail-away transients. A bigger change is split into "

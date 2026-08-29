@@ -179,6 +179,7 @@ def main() -> int:
             "--approach-a-max", str(cfg.approach_a_max),
             "--approach-min-transient-s", str(cfg.approach_min_transient_s),
             "--approach-hop-slack", str(cfg.approach_hop_slack),
+            "--flat-ramp-dv", str(cfg.flat_ramp_dv),
             "--stair-tiles", str(cfg.stair_tiles), "--box-tiles", ",".join(str(x) for x in cfg.box_tiles),
             "--clips-per-tile", str(cpt), "--seed", str(cfg.seed), "--device", args.device,
             *([] if cfg.segment_reuse else ["--no-segment-reuse"]),
@@ -224,6 +225,11 @@ def main() -> int:
             # The INTERIOR lead-up transients are ordinary loop-to-loop hops and take the FLAT
             # family's chaining bound, not the terrain boundary's -- same generator, same knob.
             "--ramp-dv", str(cfg.flat_ramp_dv),
+            # The interior lead-up transients are flat-style hops, so they take the FLAT family's
+            # acceleration bound rather than the terrain boundary's -- measured cleaner there
+            # (interior peak max 10.87 -> 3.88 m/s, one blow-up -> none).
+            "--flat-a-max", str(cfg.flat_a_max),
+            "--gen-attempts", str(cfg.gen_attempts),
             "--pin-future", cfg.pin_future],
             conda_env=args.conda_env)
         flat_plans = os.path.join(work, "flat_plans.json")

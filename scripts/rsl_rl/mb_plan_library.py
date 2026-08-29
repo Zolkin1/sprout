@@ -322,47 +322,67 @@ def _cycle_travel(bank, cmd: float, dt: float) -> float:
         np.linalg.norm(bank.achieved_vel[i][:2]))
 
 
+# A planned hold must be worth planning. ONE gait cycle is the arithmetic floor (``loop_frames_for``
+# will not emit less), but sizing a hold to exactly that leaves no margin at all: the transient reserve
+# is a bound on what Motion Bricks MAY take and it can legitimately take all of it, at which point the
+# loop misses by centimetres and vanishes -- which is how two in-betweenings ended up spliced back to
+# back.
+#
+# 1.5 is chosen against the budget rather than by taste. Fraction of random command pairs from the
+# stair band that fit in a given flat lead-in, measured over 4000 draws:
+#
+#     flat      1.0x    1.5x    2.0x
+#      4 m       50%     18%      6%
+#      6 m      100%     84%     41%
+#      8 m      100%    100%     95%
+#
+# At the shipped 6 m, 2.0 would refuse 59% of command changes and 1.0 is the zero-margin case that
+# produced the defect. A pair that does not fit costs VARIATION, not correctness -- ``_side`` simply
+# plans one hold -- so the tighter number would buy nothing but bigger tiles.
+_HOLD_CYCLES = 1.5
+
+
 def _hold_minimums(cmds: list, min_hold: float, args, bank,
                    lead_in_from: float | None = None) -> list:
-    """Per-hold minimum travel: enough for one exact gait cycle, plus its incoming transient.
+    """Per-hold minimum travel: enough for a real steady stretch, plus its incoming transient.
 
-    Measured when the lead-up became an alternation: with a flat ``min_hold_m`` floor, four of the
-    quick build's 24 transition clips ended up with NO exact loop anywhere -- every hold's budget was
-    eaten by its incoming transient and ``_loop_piece`` correctly refused to round a sub-cycle loop up
-    to a whole one. A lead-up made entirely of in-betweenings is exactly the motion this pipeline
-    exists to avoid, so the budget has to fund the loop and not merely the hold.
+    Measured when the lead-up became an alternation: sized any smaller, holds lose their loop and pass
+    C is left splicing two in-betweenings back to back -- an acceleration running straight into a
+    deceleration with no steady motion between them. On screen that is the robot sprinting into the
+    terrain from a long way out, and it is what this function exists to prevent.
 
     Both terms are per hold and derived rather than declared:
 
-    * the LOOP floor is one gait cycle of the stride this command selects (:func:`_cycle_travel`),
-      which is what ``loop_frames_for`` will not go below;
-    * the TRANSIENT reserve comes from ``flat_plan.transient_travel_bound``, mirroring the arithmetic
-      ``mb_env.hop_tokens`` applies in pass B -- ONE definition, so pass A's prediction and pass B's
-      choice cannot drift.
+    * the LOOP floor is ``_HOLD_CYCLES`` gait cycles of the stride this command selects
+      (:func:`_cycle_travel`) -- one cycle is what ``loop_frames_for`` will not go below, and the
+      second is the margin that keeps a tight transient reserve from erasing the loop;
+    * the TRANSIENT reserve comes from ``flat_plan.transient_travel_bound``, which mirrors what
+      ``mb_transient.generate`` actually does, chained hops included -- ONE definition, so pass A's
+      prediction and pass B's generation cannot drift.
 
-    ``min_hold_m`` survives as a floor under the first term, for a recipe that wants steadier stretches
-    than the bare minimum.
+    ``min_hold_m`` survives as an extra floor, for a recipe that wants steadier stretches than the
+    bare minimum.
 
     ``lead_in_from`` is the speed the FIRST hold is entered from, and it is what makes the two sides
     symmetric. An approach's first hold opens the clip and has no incoming transient, so it is
-    ``None``. An exit's first hold is entered from the TERRAIN, via the exit transient -- and forgetting
-    that cost one clip every exact loop on its trail-away: its first hold was budgeted 0.1 m, the exit
-    transient travelled 0.5 m, and ``_loop_piece`` was left with nothing. The approach's mirror of this
-    is the approach zone, which is added to its last hold for exactly the same reason.
+    ``None``. An exit's first hold is entered from the TERRAIN via the exit transient -- and forgetting
+    that cost one clip every exact loop on its trail-away. The approach's mirror is the approach zone,
+    added to its last hold for the same reason.
     """
-    out = [max(float(min_hold), _cycle_travel(bank, cmds[0], args.dt))]
-    if lead_in_from is not None:
-        out[0] += fp.transient_travel_bound(
-            (float(lead_in_from), 0.0, 0.0), (cmds[0], 0.0, 0.0),
-            a_max=float(args.approach_a_max), floor_s=float(args.approach_min_transient_s),
-            slack=float(args.approach_hop_slack))
+    ramp = float(getattr(args, "flat_ramp_dv", 1.0))
+
+    def _bound(a, b):
+        return fp.transient_travel_bound(
+            (a, 0.0, 0.0), (b, 0.0, 0.0), a_max=float(args.approach_a_max),
+            floor_s=float(args.approach_min_transient_s), slack=float(args.approach_hop_slack),
+            ramp_dv=ramp)
+
+    def _steady(c):
+        return max(float(min_hold), _HOLD_CYCLES * _cycle_travel(bank, c, args.dt))
+
+    out = [_steady(cmds[0]) + (0.0 if lead_in_from is None else _bound(lead_in_from, cmds[0]))]
     for j in range(1, len(cmds)):
-        out.append(max(float(min_hold), _cycle_travel(bank, cmds[j], args.dt))
-                   + fp.transient_travel_bound(
-                       (cmds[j - 1], 0.0, 0.0), (cmds[j], 0.0, 0.0),
-                       a_max=float(args.approach_a_max),
-                       floor_s=float(args.approach_min_transient_s),
-                       slack=float(args.approach_hop_slack)))
+        out.append(_steady(cmds[j]) + _bound(cmds[j - 1], cmds[j]))
     return out
 
 
@@ -532,6 +552,8 @@ def main() -> int:
     p.add_argument("--approach-hop-slack", type=float, default=1.3,
                    help="How much longer than its floor a transient may run. Must match --hop-slack "
                         "in pass B.")
+    p.add_argument("--flat-ramp-dv", type=float, default=1.0,
+                   help="Max speed change one in-betweening is asked for; a bigger change is split into chained hops. Pass A predicts the resulting TRAVEL with it, so it must match --ramp-dv in pass B.")
     p.add_argument("--segment-reuse", action=argparse.BooleanOptionalAction, default=False,
                    help="Share a generated MB segment between clips whose conditioning is identical. "
                         "OFF by default: with per-clip command schedules two clips are only "

@@ -48,20 +48,44 @@ def test_the_transient_reserve_is_not_a_constant():
     not cover remotely the same distance, and reserving one number for both either starves the slow
     end or forbids variation at the fast one.
     """
-    slow = fp.transient_travel_bound((0.2, 0, 0), (0.4, 0, 0), a_max=2.0, floor_s=0.35, slack=1.3)
-    fast = fp.transient_travel_bound((3.5, 0, 0), (2.0, 0, 0), a_max=2.0, floor_s=0.35, slack=1.3)
+    slow = fp.transient_travel_bound((0.2,0,0), (0.4,0,0), a_max=2.0, floor_s=0.35, slack=1.3)
+    fast = fp.transient_travel_bound((3.5,0,0), (2.0,0,0), a_max=2.0, floor_s=0.35, slack=1.3)
     assert fast > 5 * slow, (slow, fast)
     # 0.2 -> 0.4 m/s: the token FLOOR binds (0.533 s) at a 0.3 m/s mean -> 0.16 m.
-    # 3.5 -> 2.0 m/s: |dv|/a_max binds (0.75 s x 1.3 slack) at a 2.75 m/s mean -> 2.68 m.
-    assert slow == pytest.approx(0.16, abs=0.01), slow
-    assert fast == pytest.approx(2.68, abs=0.01), fast
+    # 3.5 -> 2.0 m/s: |dv|/a_max binds (0.75 s x 1.3 slack), and at ramp_dv 1.0 it is TWO hops.
+    assert slow == pytest.approx(0.160, abs=0.005), slow
+    assert fast == pytest.approx(2.933, abs=0.005), fast
+
+
+def test_the_bound_counts_the_CHAINED_hops():
+    """``mb_transient.generate`` splits a big change into ``ceil(|dv|/ramp_dv)`` separate generations.
+
+    Missing that is what produced the defect this function exists to prevent: modelling one hop
+    under-reserved, the hold that followed could not fund a gait cycle, ``_loop_piece`` correctly
+    refused a sub-cycle loop, and pass C was left splicing two in-betweenings back to back -- which
+    reads as the robot sprinting into the terrain from a long way out.
+    """
+    kw = dict(a_max=2.0, floor_s=0.35, slack=1.3)
+    one = fp.transient_travel_bound((0.0,0,0), (3.0,0,0), ramp_dv=99.0, **kw)
+    many = fp.transient_travel_bound((0.0,0,0), (3.0,0,0), ramp_dv=0.5, **kw)
+    # Six hops of 0.5 m/s each: every one falls to the 0.533 s token floor, so the chain runs 3.2 s
+    # against the single hop's 1.867 s ceiling -- 4.80 m against 2.80.
+    assert many == pytest.approx(4.80, abs=0.05) and one == pytest.approx(2.80, abs=0.05), (one, many)
+    assert many > 1.5 * one, (one, many)
+    # A change that fits in ONE hop must not be inflated by the split logic.
+    a = fp.transient_travel_bound((1.0,0,0), (1.4,0,0), ramp_dv=1.0, **kw)
+    b = fp.transient_travel_bound((1.0,0,0), (1.4,0,0), ramp_dv=99.0, **kw)
+    assert a == pytest.approx(b)
 
 
 def test_the_transient_bound_respects_the_models_own_horizon():
-    """Clipped to Motion Bricks' 6..16 tokens, because that is what actually limits it."""
-    tiny = fp.transient_travel_bound((1.0, 0, 0), (1.0, 0, 0), a_max=2.0, floor_s=0.0, slack=1.0)
-    huge = fp.transient_travel_bound((3.6, 0, 0), (-1.0, 0, 0), a_max=0.01, floor_s=0.0, slack=99.0)
+    """Each hop is clipped to Motion Bricks' 6..16 tokens, because that is what actually limits it."""
+    tiny = fp.transient_travel_bound((1.0,0,0), (1.0,0,0), a_max=2.0, floor_s=0.0, slack=1.0,
+                                     ramp_dv=99.0)
     assert tiny == pytest.approx(fp._KEPT_S_MIN * 1.0, rel=1e-9)
+    # A huge change at a tiny a_max saturates EVERY hop at the ceiling.
+    huge = fp.transient_travel_bound((3.6,0,0), (-1.0,0,0), a_max=0.01, floor_s=0.0, slack=99.0,
+                                     ramp_dv=99.0)
     assert huge == pytest.approx(fp._KEPT_S_MAX * 0.5 * (3.6 + 1.0), rel=1e-9)
 
 
