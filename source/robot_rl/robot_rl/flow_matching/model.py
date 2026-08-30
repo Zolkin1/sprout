@@ -48,6 +48,7 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
+from .advantage import LABEL_NULL
 from .extero_encoder import ExteroImageEncoderSet
 
 
@@ -158,6 +159,7 @@ class FlowMatchingTransformer(nn.Module):
             extero_channels=cfg.resolve_extero_channels(),
             extero_camera_intrinsics=cfg.extero_camera_intrinsics,
             attention_mode=cfg.attention_mode,
+            advantage_cond=getattr(cfg, "advantage_cond", False),
         )
 
     def __init__(
@@ -187,6 +189,7 @@ class FlowMatchingTransformer(nn.Module):
         extero_channels: int = 1,
         extero_camera_intrinsics: Sequence[Sequence[float]] | None = None,
         attention_mode: str = "full",
+        advantage_cond: bool = False,
     ):
         super().__init__()
         if attention_mode not in ("full", "prefix"):
@@ -296,6 +299,45 @@ class FlowMatchingTransformer(nn.Module):
         self.time_mlp = nn.Sequential(
             nn.Linear(d_model, d_model), nn.SiLU(), nn.Linear(d_model, d_model)
         )
+        # ADVANTAGE CONDITIONING: a label in {negative, positive, null}, added to the
+        # flow-time embedding -- the same path `tau` takes, which is how a diffusion model
+        # conventionally takes a class label.
+        #
+        # ZERO-INITIALISED, so a freshly-converted checkpoint is BIT-IDENTICAL to the
+        # generator it came from under every label. That is what lets the change be verified
+        # rather than argued: sample with each label and compare against the original.
+        #
+        # Added to the FUTURE tokens only, and deliberately not as a new prefix token. A
+        # prefix token would change the attention softmax (an extra key is not a no-op at any
+        # initialisation) and would move `prefix_len`, hence the ONNX graph's shapes. Adding
+        # to the flow-time embedding keeps `encode_prefix` untouched -- so the prefix cache is
+        # SHARED across label values, and classifier-free guidance over the label costs one
+        # extra decode rather than a second full encode.
+        # TODO(advantage-prefix-token): if the fine-tune turns out to UNDER-USE the label --
+        # the negative arm performing close to the positive one while the label demonstrably
+        # carries signal (the G2 gate passes) -- the next thing to try is a dedicated PREFIX
+        # TOKEN instead of this addition. A token gets its own attention weights and can be
+        # read differently by every layer, where an addition to the flow-time embedding is one
+        # shared shift; if the model needs the label to modulate WHICH conditioning it attends
+        # to rather than just to bias the output, the token is the form that can express it.
+        # It costs what this form was chosen to avoid: `prefix_len` moves (so the ONNX shapes
+        # and the deploy contract move with it), the prefix cache stops being shared across
+        # label values, and the conversion is no longer a no-op at any initialisation -- so it
+        # is a deliberate second experiment, not a drop-in.
+        self.advantage_cond = bool(advantage_cond)
+        self.advantage_emb = (nn.Embedding(3, d_model) if self.advantage_cond else None)
+        if self.advantage_emb is not None:
+            nn.init.zeros_(self.advantage_emb.weight)
+            # `null` is a REAL row, not the absence of one. Without this the unconditional
+            # pass would take a structurally different code path from the conditional one --
+            # they would differ by a whole term rather than by an embedding VALUE -- so any
+            # asymmetry between them would show up in a guidance direction as an artifact, and
+            # an unlabelled fine-tune would never send gradient to the embedding at all.
+            # Non-persistent, so it stays out of `state_dict` and the conversion still adds
+            # exactly one key.
+            self.register_buffer("advantage_null_idx",
+                                 torch.tensor([LABEL_NULL], dtype=torch.long),
+                                 persistent=False)
         # Timeline of length N + F: history at 0..N-1, future at N..N+F-1, each cmd
         # token at N + (its future step). The extero tokens carry no TIMELINE position (the
         # reading is "now"); under the CNN they do carry a learned SPATIAL one, inside the
@@ -412,9 +454,36 @@ class FlowMatchingTransformer(nn.Module):
         n, f = self.num_history_states, self.future_len
         return self.state_in(x_tau) + self.pos[:, n:n + f, :]
 
-    def _time_embedding(self, tau: torch.Tensor) -> torch.Tensor:
-        """Flow-time embedding, ``(B, 1, d_model)``, broadcastable over a token axis."""
-        return self.time_mlp(_timestep_embedding(tau, self.d_model)).unsqueeze(1)
+    def _time_embedding(self, tau: torch.Tensor,
+                        advantage: torch.Tensor | None = None) -> torch.Tensor:
+        """Flow-time embedding, ``(B, 1, d_model)``, broadcastable over a token axis.
+
+        Args:
+            tau: Flow time in ``[0, 1]``, ``(B,)``.
+            advantage: ``(B,)`` or ``(1,)`` long in ``{0, 1, 2}`` = {negative, positive,
+                null}.  Added here rather than anywhere else so it rides the one signal that
+                already reaches every denoised token and nothing else.  ``None`` on a
+                conditioned model means ``null`` -- the embedding is ALWAYS added, so the
+                unconditional pass differs from a conditional one by an embedding VALUE and
+                never by a missing term.
+
+        Returns:
+            ``(B, 1, d_model)``.
+
+        Raises:
+            ValueError: If a label is supplied to a model built without the embedding. Silently
+                dropping it would train a conditioned run that was never conditioned.
+        """
+        emb = self.time_mlp(_timestep_embedding(tau, self.d_model))
+        if self.advantage_emb is not None:
+            idx = self.advantage_null_idx if advantage is None else advantage.to(torch.long)
+            emb = emb + self.advantage_emb(idx)
+        elif advantage is not None:
+            raise ValueError(
+                "an advantage label was supplied but this model was built with "
+                "advantage_cond=False, so there is no embedding to route it through. "
+                "Dropping it would leave a 'conditioned' run that never saw the label.")
+        return emb.unsqueeze(1)
 
     @staticmethod
     def _run_layer(layer: nn.Module, x: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
@@ -496,6 +565,7 @@ class FlowMatchingTransformer(nn.Module):
     def decode_future(
         self, x_tau: torch.Tensor, tau: torch.Tensor,
         prefix_cache: Sequence[torch.Tensor],
+        advantage: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict the flow field for the future window against a cached conditioning prefix.
 
@@ -523,7 +593,7 @@ class FlowMatchingTransformer(nn.Module):
                 f"prefix_cache has {len(prefix_cache)} entries but the encoder has "
                 f"{len(self.encoder.layers)} layers; it must carry one per layer."
             )
-        x = self._embed_future(x_tau) + self._time_embedding(tau)
+        x = self._embed_future(x_tau) + self._time_embedding(tau, advantage)
         for layer, prefix in zip(self.encoder.layers, prefix_cache):
             x = self._run_layer(layer, x, torch.cat([prefix, x], dim=1))
         return self.output_head(x)
@@ -536,6 +606,7 @@ class FlowMatchingTransformer(nn.Module):
         extero: torch.Tensor,
         cmd_tokens: torch.Tensor | None = None,
         history_null_mask: torch.Tensor | None = None,
+        advantage: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Predict the flow vector field for the future state window.
 
@@ -568,13 +639,13 @@ class FlowMatchingTransformer(nn.Module):
             for layer in self.encoder.layers:
                 cache.append(x)
                 x = self._run_layer(layer, x, x)
-            return self.decode_future(x_tau, tau, cache)
+            return self.decode_future(x_tau, tau, cache, advantage)
 
         # ``full``: every token attends to every other, and the flow-time embedding lands on
         # all of them. Kept byte-identical -- this is what every checkpoint trained before
         # attention_mode existed was trained under, and the mask adds no parameters, so the
         # config is the ONLY thing that distinguishes such a checkpoint from a prefix one.
         tokens = torch.cat([prefix, self._embed_future(x_tau)], dim=1)  # (B, S, d_model)
-        tokens = tokens + self._time_embedding(tau)
+        tokens = tokens + self._time_embedding(tau, advantage)
         tokens = self.encoder(tokens)  # full self-attention over all tokens
         return self.output_head(tokens[:, -f:, :])  # trailing F future-token outputs

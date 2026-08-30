@@ -559,6 +559,7 @@ def flow_matching_loss(
     anchor_mask: torch.Tensor | None = None,
     mask_frame_yaw_rel: torch.Tensor | None = None,
     pinned_axis_weight: float = 1.0,
+    advantage: torch.Tensor | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute the flow-matching loss (+ optional consistency / FK terms).
 
@@ -598,7 +599,8 @@ def flow_matching_loss(
         ``fk_pose``.
     """
     x_tau, tau, target_v = sample_flow_batch(x1)
-    v = model(x_tau, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
+    v = model(x_tau, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask,
+              advantage=advantage)
     err = v - target_v
     sq = err ** 2
     # Reported UNWEIGHTED whatever the weighting, so a weighted run's curves stay directly
@@ -691,6 +693,7 @@ def sample_trajectory(
     zero_noise: bool = False,
     guidance_scale: float = 1.0,
     noise: torch.Tensor | None = None,
+    advantage: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Generate the F-step future window by Euler-integrating the learned flow.
 
@@ -774,17 +777,20 @@ def sample_trajectory(
         tau = torch.full((b,), i * dt, device=device, dtype=history.dtype)
         if guided:
             x2, tau2 = torch.cat([x, x], 0), torch.cat([tau, tau], 0)
-            v2 = (model.decode_future(x2, tau2, cache) if cache is not None
-                  else model(x2, tau2, hist2, extero2, cmd2, history_null_mask=mask2))
+            adv2 = None if advantage is None else torch.cat([advantage, advantage], 0)
+            v2 = (model.decode_future(x2, tau2, cache, adv2) if cache is not None
+                  else model(x2, tau2, hist2, extero2, cmd2, history_null_mask=mask2,
+                             advantage=adv2))
             v_cond, v_null = v2[:b], v2[b:]
             # v_null + w (v_cond - v_null): extrapolate along the direction the HISTORY
             # contributes. Envs already null-masked have v_cond == v_null, so guidance is a
             # no-op for them -- which is what you want for the first N steps after a reset.
             v = v_null + guidance_scale * (v_cond - v_null)
         elif cache is not None:
-            v = model.decode_future(x, tau, cache)
+            v = model.decode_future(x, tau, cache, advantage)
         else:
-            v = model(x, tau, history, extero, cmd_tokens, history_null_mask=history_null_mask)
+            v = model(x, tau, history, extero, cmd_tokens,
+                      history_null_mask=history_null_mask, advantage=advantage)
         x = x + dt * v
     return x
 

@@ -1,0 +1,189 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""The advantage label: what it is, how it is computed, and how it is binarized.
+
+The generator emits one chunk per re-plan.  A critic scores the state it emitted from and
+the state it arrived at ``n`` re-plans later; the difference is what that chunk BOUGHT::
+
+    A(s_t, a_t) = P(fail | s_t) - P(fail | s_{t+n})
+
+**The sign is easy to read backwards, so state it twice.**  The n-step advantage is
+``V(s_{t+n}) - V(s_t)``, and with ``gamma = 1`` and a terminal-only reward of ``-1`` on
+failure, ``V(s) = -P(fail | s)`` -- a Bernoulli failure classifier with a MINUS in front,
+because a higher chance of falling is a lower value.  Substituting the minus twice flips the
+order of the two terms, which is why ``P(fail|s_t)`` comes first above.  So::
+
+    A > 0   the failure probability FELL over those n re-plans -- the chunk helped
+    A < 0   it ROSE -- the chunk hurt
+
+and ``binarize`` below labels high ``A`` positive.  The terminal cases are the quick check
+that this is right, and they need no critic at all:
+
+* the episode FAILED within ``n`` re-plans -> ``V(s_{t+n}) = -1``, so ``A = P(fail|s_t) - 1``,
+  which is NEGATIVE (``-0.7`` from a state the critic scored at 0.3) -- a chunk followed by a
+  fall;
+* it REACHED THE GOAL within ``n`` -> ``V(s_{t+n}) = 0``, so ``A = P(fail|s_t)``, which is
+  POSITIVE (``+0.3`` from that same state) -- a chunk that carried a risky state to the goal.
+
+Both are the realized outcome, not a prediction, which is the point: near a terminal the
+advantage stops depending on the critic at all.
+
+**The binarization is per family, and that is not a detail.**  A global percentile would
+label nearly every ``flat`` chunk negative (the family barely ever fails, so its advantages
+are a tight cluster of near-zeros that sit below any threshold set by the stair families)
+and nearly every ``jump_off_front`` chunk positive.  The threshold has to be a statement
+about a chunk relative to OTHER CHUNKS FACING THE SAME PROBLEM.
+
+**A third label, ``null``, is for data with no signal -- not for bad data.**  Where the
+within-family spread of advantages is below the noise floor there is nothing to prefer, and
+labelling those chunks negative would actively teach the model that competent walking is
+bad.  ``null`` is also what the ~30% conditioning dropout writes during training, so
+classifier-free guidance over the label is available at inference.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+
+#: The three label values, in the order the embedding rows are indexed.
+LABEL_NEGATIVE = 0
+LABEL_POSITIVE = 1
+LABEL_NULL = 2
+
+#: Human-readable names, index-aligned with the constants above.
+LABEL_NAMES = ("negative", "positive", "null")
+
+
+def label_from_name(name: str) -> int:
+    """Map ``"negative" / "positive" / "null"`` to its integer label.
+
+    Args:
+        name: One of :data:`LABEL_NAMES`.
+
+    Returns:
+        The integer label.
+
+    Raises:
+        ValueError: On an unrecognised name.  Deliberately not a silent default: the label
+            is the whole experiment, and an export that quietly picked ``null`` would look
+            exactly like one that picked ``positive``.
+    """
+    if name not in LABEL_NAMES:
+        raise ValueError(f"advantage label must be one of {LABEL_NAMES}, got {name!r}")
+    return LABEL_NAMES.index(name)
+
+
+def n_step_advantage(
+    p_fail: np.ndarray,
+    episode_uid: np.ndarray,
+    replan_index: np.ndarray,
+    failed: np.ndarray,
+    n: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute ``A(s_t, a_t) = P(fail|s_t) - P(fail|s_{t+n})`` over a window table.
+
+    Rows are grouped by ``episode_uid`` and ordered by ``replan_index``.  A row whose
+    ``t + n`` lands past the episode's last recorded re-plan is closed with the realized
+    terminal value (``1.0`` if the episode failed, ``0.0`` if it reached the goal) rather
+    than dropped -- those are the rows nearest the outcome and so the most informative.
+
+    Args:
+        p_fail: ``[W]`` critic output ``P(fail | s_t)`` in ``[0, 1]``.
+        episode_uid: ``[W]`` episode id per window.
+        replan_index: ``[W]`` position within the episode, 0-based.
+        failed: ``[W]`` bool, the episode's realized outcome (constant within an episode).
+        n: Look-ahead in re-plans.
+
+    Returns:
+        ``(advantage, bootstrapped)`` -- ``[W]`` float64 and ``[W]`` bool, the latter True
+        where the terminal value was used instead of a critic reading.
+
+    Raises:
+        ValueError: If ``n < 1`` or the arrays disagree in length.
+    """
+    if int(n) < 1:
+        raise ValueError(f"n must be at least one re-plan, got {n}")
+    lengths = {a.shape[0] for a in (p_fail, episode_uid, replan_index, failed)}
+    if len(lengths) != 1:
+        raise ValueError(f"arrays disagree in length: {sorted(lengths)}")
+
+    w = p_fail.shape[0]
+    adv = np.zeros(w, dtype=np.float64)
+    boot = np.zeros(w, dtype=bool)
+    # One pass per episode. `order` sorts by (uid, replan_index) so a group is contiguous
+    # and internally ordered without a per-episode sort.
+    order = np.lexsort((replan_index, episode_uid))
+    uid_s = episode_uid[order]
+    starts = np.flatnonzero(np.r_[True, uid_s[1:] != uid_s[:-1]])
+    ends = np.r_[starts[1:], w] if starts.size else np.array([], dtype=int)
+    for s, e in zip(starts, ends):
+        rows = order[s:e]
+        p = p_fail[rows]
+        m = rows.size
+        # The future reading, index-shifted; the tail bootstraps on the outcome.
+        future = np.empty(m, dtype=np.float64)
+        head = max(m - n, 0)
+        future[:head] = p[n:]
+        future[head:] = 1.0 if bool(failed[rows[0]]) else 0.0
+        adv[rows] = p.astype(np.float64) - future
+        boot[rows[head:]] = True
+    return adv, boot
+
+
+def binarize(
+    advantage: np.ndarray,
+    family_code: np.ndarray,
+    *,
+    percentile: float = 35.0,
+    null_spread: float = 0.02,
+    absolute_floor: float | None = None,
+) -> tuple[np.ndarray, dict[int, dict[str, float]]]:
+    """Turn per-window advantages into ``{negative, positive, null}`` labels, per family.
+
+    A family whose advantage spread is below ``null_spread`` is labelled ``null``
+    WHOLESALE.  That is the case the plan singles out: ``flat`` succeeds ~99% of the time,
+    so its advantages are a cluster of near-zeros carrying no preference, and cutting them
+    at a percentile would manufacture a distinction the data does not contain.
+
+    Args:
+        advantage: ``[W]`` advantages.
+        family_code: ``[W]`` family code per window.
+        percentile: Within-family percentile below which a chunk is negative.  Chunks at or
+            above it are positive.
+        null_spread: If a family's interquartile range of advantages is below this, the whole
+            family is ``null``.
+        absolute_floor: When set, the positive threshold becomes
+            ``max(family_percentile, absolute_floor)`` -- so a family that is uniformly bad
+            cannot label its least-bad third positive.  **Off by default, and a floor of 0.0
+            is stronger than it looks**: over a SUCCESSFUL episode the advantages telescope
+            to a small total spread over ~25 chunks, so an individual chunk's sign is mostly
+            noise and a zero floor labels roughly half of a clean run negative.  The
+            within-family percentile is the calibrated statement; this is an opt-in veto for
+            a family believed hopeless.
+
+    Returns:
+        ``(labels, per_family)`` -- ``[W]`` int64 in ``{0, 1, 2}``, and a per-family record
+        of the threshold used, the IQR and the resulting positive fraction (for the manifest,
+        so a run states what it labelled rather than leaving it to be re-derived).
+    """
+    labels = np.full(advantage.shape[0], LABEL_NULL, dtype=np.int64)
+    report: dict[int, dict[str, float]] = {}
+    for fam in np.unique(family_code):
+        sel = family_code == fam
+        a = advantage[sel]
+        if a.size == 0:
+            continue
+        iqr = float(np.percentile(a, 75) - np.percentile(a, 25))
+        if iqr < float(null_spread):
+            report[int(fam)] = {"n": int(a.size), "iqr": iqr, "threshold": float("nan"),
+                                "positive_frac": 0.0, "null": True}
+            continue
+        thr = float(np.percentile(a, percentile))
+        if absolute_floor is not None:
+            thr = max(thr, float(absolute_floor))
+        lab = np.where(a >= thr, LABEL_POSITIVE, LABEL_NEGATIVE)
+        labels[sel] = lab
+        report[int(fam)] = {"n": int(a.size), "iqr": iqr, "threshold": thr,
+                            "positive_frac": float((lab == LABEL_POSITIVE).mean()),
+                            "null": False}
+    return labels, report

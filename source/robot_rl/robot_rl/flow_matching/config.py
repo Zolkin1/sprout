@@ -713,6 +713,17 @@ class FlowMatchingConfig:
     # differed; here it cannot. ``from_dict``'s default below is the only guard.
     attention_mode: str = "prefix"
 
+    # -- advantage conditioning (the fine-tune arm) --
+    # When True the model carries an extra `nn.Embedding(3, d_model)` added to the flow-time
+    # embedding, taking a label in {negative, positive, null} (see `flow_matching.advantage`).
+    # The embedding is ZERO-INITIALISED, so converting a pretrained generator is bit-identical
+    # under every label -- the conversion is verifiable rather than merely plausible.
+    #
+    # Defaults False, and `from_dict` below does NOT let an absent key pick up a later
+    # default: a pre-flag checkpoint has no embedding in its state dict, so `strict=True`
+    # would refuse it, and that refusal is the correct behaviour rather than a nuisance.
+    advantage_cond: bool = False
+
     # -- observation noise (train-time augmentation on the clean history tokens) --
     # Mirrors the RL teacher/tracker obs corruption (Unoise per term): the inputs the
     # generator conditions on at deployment come from noisy sensors, so the first

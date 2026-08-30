@@ -225,6 +225,7 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
     y = torch.as_tensor(lab["failed"].astype(np.float32), device=device)
     tr = np.flatnonzero(train)
     rng = np.random.default_rng(0)
+    best_state, best_auc, best_epoch, last_auc = None, -1.0, 0, float("nan")
     for ep in range(epochs):
         model.train()
         rng.shuffle(tr)
@@ -255,8 +256,22 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                                 y_np[j])
             log[f"{label}/{scope}/auc_epoch"] = a
             print(f"      {scope} AUC {a:.3f}")
+            if scope == "val_seen_tiles" and np.isfinite(a):
+                last_auc = a
+                if a > best_auc:
+                    best_auc, best_epoch = a, ep + 1
+                    best_state = {k: v.detach().clone()
+                                  for k, v in model.state_dict().items()}
         if wb is not None:
             wb.log(log)
+    if best_state is not None:
+        # Select on the fold's OWN validation episodes -- seen tiles, unseen episodes. The
+        # unseen-TILE score is the generalisation measure and must not also be the selection
+        # criterion, or it stops being a holdout. With folds every window gets scored by a
+        # model that did not train on it, so this split costs nothing.
+        print(f"  [{label}] restoring epoch {best_epoch} (val AUC {best_auc:.3f} against "
+              f"{last_auc:.3f} at the end)")
+        model.load_state_dict(best_state)
     model.eval()
     out = np.zeros(W["episode_uid"].size, dtype=np.float64)
     with torch.no_grad():
@@ -277,7 +292,17 @@ def main() -> int:
     p.add_argument("--epochs", type=int, default=8)
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
-    p.add_argument("--val_frac", type=float, default=0.25)
+    p.add_argument("--val_frac", type=float, default=0.25,
+                   help="Fraction of TILES held out entirely, and (at --folds 1) of episodes.")
+    p.add_argument("--folds", type=int, default=1,
+                   help="K-fold cross-fit over EPISODES, for labelling. At K>1 every window "
+                        "on a training tile gets an OUT-OF-FOLD prediction from a model that "
+                        "never saw its episode -- which is what stops the advantage from "
+                        "being a lookup of the realized outcome. Costs the same wall-clock "
+                        "as K=1 (each fold trains on 1/K less data), at the price of each "
+                        "fold model seeing less.")
+    p.add_argument("--variants", type=str, default="V_priv,V_onboard",
+                   help="Which critics to fit, comma-separated.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_windows", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -322,6 +347,25 @@ def main() -> int:
           f"{int(np.unique(uids[val_ep]).size)} val (seen tiles) / "
           f"{int(np.unique(uids[val_tile]).size)} val (unseen tiles)")
 
+    if args.folds < 1:
+        raise SystemExit(f"--folds must be at least 1, got {args.folds}")
+    if args.folds == 1:
+        folds = [(train, val_ep)]
+    else:
+        # Partition the TRAINING-tile episodes into K folds. The tile holdout is excluded
+        # from every fold's training set, so it stays a clean generalisation measure.
+        pool = np.unique(uids[~val_tile])
+        rng_f = np.random.default_rng(args.seed + 1)
+        assign = {int(u): int(i % args.folds)
+                  for i, u in enumerate(rng_f.permutation(pool))}
+        fold_of = np.array([assign.get(int(u), -1) for u in uids])
+        folds = []
+        for k in range(args.folds):
+            va_k = (fold_of == k)
+            folds.append(((~val_tile) & ~va_k, va_k))
+        sizes = [int(np.unique(uids[v]).size) for _, v in folds]
+        print(f"[fit] {args.folds}-fold cross-fit over episodes: fold sizes {sizes}")
+
     scan_hw = E["attrs"].get("height_scan_hw")
     if not scan_hw:
         raise SystemExit(
@@ -344,15 +388,17 @@ def main() -> int:
                                     "n_episodes": n_ep, "n_windows": int(uids.size),
                                     "n_failed_episodes": n_fail_ep,
                                     "n_tiles": int(np.unique(tiles).size)})
-            # Declare epoch as the x-axis, per variant. Without this every series is plotted
-            # against wandb's auto-incrementing `_step`, and because the two variants train
-            # SEQUENTIALLY into one run they land on disjoint parts of that axis -- V_priv on
-            # steps 0..N-1 and V_onboard on N..2N-1. Each curve then looks like a stub and
-            # overlaying them looks offset, which is a plotting artefact rather than anything
-            # about the models.
+            # Declare epoch as the x-axis, one per (variant, fold). Without this every
+            # series is plotted against wandb's auto-incrementing `_step`, and because the
+            # variants and folds train SEQUENTIALLY into one run they land on disjoint parts
+            # of that axis -- V_priv on steps 0..N-1 and V_onboard on N..2N-1. Each curve
+            # then looks like a stub and overlaying them looks offset, which is a plotting
+            # artefact rather than anything about the models.
             for label in ("V_priv", "V_onboard"):
-                wandb.define_metric(f"{label}/epoch")
-                wandb.define_metric(f"{label}/*", step_metric=f"{label}/epoch")
+                for k in range(max(int(args.folds), 1)):
+                    tag = label if args.folds == 1 else f"{label}/f{k}"
+                    wandb.define_metric(f"{tag}/epoch")
+                    wandb.define_metric(f"{tag}/*", step_metric=f"{tag}/epoch")
         except Exception as exc:                                          # noqa: BLE001
             print(f"[WARN] wandb logging is OFF: {type(exc).__name__}: {exc}\n"
                   f"       The fit continues; gates.json and predictions.npz still land in "
@@ -362,23 +408,48 @@ def main() -> int:
     ctx = online.load_fm_context(args.fm_checkpoint, device=args.device)
     results = {}
     preds = {}
+    wanted = [v.strip() for v in args.variants.split(",") if v.strip()]
+    unknown = [v for v in wanted if v not in ("V_priv", "V_onboard")]
+    if unknown:
+        raise SystemExit(f"--variants: unknown {unknown}; choose from V_priv, V_onboard")
+    os.makedirs(args.out, exist_ok=True)
     for label, priv in (("V_priv", True), ("V_onboard", False)):
+        if label not in wanted:
+            continue
         print(f"[fit] {label}")
-        model, p_all = _fit(ctx, W, lab, train, val_ep, priv=priv, epochs=args.epochs,
-                        batch=args.batch, lr=args.lr, device=args.device, label=label,
-                        scan_hw=scan_hw, wb=wb, val_tile=val_tile)
+        p_all = np.zeros(uids.size, dtype=np.float64)
+        for k, (tr_k, va_k) in enumerate(folds):
+            if len(folds) > 1:
+                print(f"  [{label}] fold {k + 1}/{len(folds)}  "
+                      f"{int(np.unique(uids[tr_k]).size)} train episodes")
+            model, p_k = _fit(ctx, W, lab, tr_k, va_k, priv=priv, epochs=args.epochs,
+                              batch=args.batch, lr=args.lr, device=args.device,
+                              label=(label if len(folds) == 1 else f"{label}/f{k}"),
+                              scan_hw=scan_hw, wb=wb, val_tile=val_tile)
+            # OUT OF FOLD: each window takes the prediction of the model that did not train
+            # on its episode. The held-out TILES are out-of-sample for every fold, so they
+            # take the mean -- averaging there is a free variance reduction, and doing it on
+            # a training fold would silently reintroduce the in-sample reading.
+            p_all[va_k] = p_k[va_k]
+            p_all[val_tile] += p_k[val_tile] / len(folds)
+            # Checkpoint it. Without this the fit is write-only: the gates land on disk but
+            # the thing that produced them does not, so labelling a rollout or scoring
+            # candidate chunks would mean re-fitting from scratch.
+            name = f"{label}.pt" if len(folds) == 1 else f"{label}.fold{k}.pt"
+            torch.save({"model": model.state_dict(), "variant": label,
+                        "fm_checkpoint": os.path.abspath(args.fm_checkpoint),
+                        "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
+                        "context_dim": int(3 + (6 if priv else 3)), "privileged": bool(priv),
+                        "epochs": int(args.epochs), "stem": stem,
+                        "fold": int(k), "num_folds": int(len(folds))},
+                       os.path.join(args.out, name))
+            del model
         preds[label] = p_all
-        # Checkpoint it. Without this the fit is write-only: the gates land on disk but the
-        # thing that produced them does not, so labelling a rollout or scoring candidate
-        # chunks would mean re-fitting from scratch.
-        torch.save({"model": model.state_dict(), "variant": label,
-                    "fm_checkpoint": os.path.abspath(args.fm_checkpoint),
-                    "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
-                    "context_dim": int(3 + (6 if priv else 3)), "privileged": bool(priv),
-                    "epochs": int(args.epochs), "stem": stem},
-                   os.path.join(args.out, f"{label}.pt"))
         results[label] = {}
-        for scope, mask in (("val_seen_tiles", val_ep), ("val_UNSEEN_tiles", val_tile)):
+        # With folds the seen-tile scope is EVERY training-tile window, each scored out of
+        # fold -- a far larger sample than the single held-out episode split it replaces.
+        seen_scope = (~val_tile) if len(folds) > 1 else val_ep
+        for scope, mask in (("val_seen_tiles", seen_scope), ("val_UNSEEN_tiles", val_tile)):
             print(f"  -- {scope} --")
             results[label][scope] = _gates(p_all, lab, W, mask)
         if wb is not None:
@@ -404,10 +475,11 @@ def main() -> int:
               + ("   <-- large: the critic is reading the TILE, not the state"
                  if a_seen - a_new > 0.10 else ""))
 
-    gap = float(np.mean(np.abs(preds["V_priv"] - preds["V_onboard"])))
-    print(f"\n[fit] V_priv / V_onboard mean |dP| = {gap:.4f}  "
-          "(how much outcome-relevant information the generator cannot see)")
-    os.makedirs(args.out, exist_ok=True)
+    gap = float("nan")
+    if "V_priv" in preds and "V_onboard" in preds:
+        gap = float(np.mean(np.abs(preds["V_priv"] - preds["V_onboard"])))
+        print(f"\n[fit] V_priv / V_onboard mean |dP| = {gap:.4f}  "
+              "(how much outcome-relevant information the generator cannot see)")
     with open(os.path.join(args.out, "gates.json"), "w") as f:
         json.dump({"gap_mean_abs": gap, "n_episodes": n_ep, "n_windows": int(uids.size),
                    "results": results}, f, indent=2, default=_jsonable)
@@ -415,10 +487,12 @@ def main() -> int:
              replan_index=W["replan_index"], val=val_ep, val_tile=val_tile, tile=tiles,
              failed=lab["failed"],
              first_fall_step=lab["first_fall_step"], family_code=lab["family_code"],
+             num_folds=int(args.folds),
              **{f"p_{k}": v for k, v in preds.items()})
     if wb is not None:
-        wb.log({"gap_mean_abs": gap})
-        wb.summary["gap_mean_abs"] = gap
+        if np.isfinite(gap):
+            wb.log({"gap_mean_abs": gap})
+            wb.summary["gap_mean_abs"] = gap
         wb.finish()
     print(f"[fit] wrote {args.out}/gates.json and predictions.npz")
     return 0
