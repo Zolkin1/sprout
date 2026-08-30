@@ -724,6 +724,24 @@ class FlowMatchingConfig:
     # would refuse it, and that refusal is the correct behaviour rather than a nuisance.
     advantage_cond: bool = False
 
+    # HOW the label reaches the network, and the two are not interchangeable artifacts.
+    #   `time_embed`   -- added to the flow-time embedding. Zero-init makes the conversion
+    #                     exactly inert and `prefix_len` does not move, so the ONNX shapes and
+    #                     the prefix cache are untouched. MEASURED INADEQUATE on this data:
+    #                     across three configurations (1x and 50x embedding lr, and a 10x
+    #                     whole-model lr that demonstrably moved the model by half a sampling
+    #                     noise draw) the label changed the served window by only 0.3-0.7% of
+    #                     ordinary flow-noise variation. The bottleneck is not magnitude.
+    #   `prefix_token` -- its own token in the conditioning prefix, with its own type
+    #                     embedding and its own attention weights at every layer, so it can
+    #                     modulate WHICH conditioning the future tokens attend to rather than
+    #                     applying one shared additive shift. This is the form the pi/RECAP
+    #                     line of work uses. It costs what the additive form was chosen to
+    #                     avoid: `prefix_len` grows by one, so the exported graph's shapes
+    #                     differ and a checkpoint of one kind cannot be served by the other's
+    #                     graph -- which is why this rides in the artifact and is checked.
+    advantage_inject: str = "time_embed"
+
     # WHICH label a conditioned checkpoint is SERVED with in simulation. `advantage_cond`
     # says the model can take a label; this says which one to ask for, and it travels in the
     # artifact for the same reason `attention_mode` and `extero_clip` do -- a label is not

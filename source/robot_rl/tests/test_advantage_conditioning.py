@@ -179,3 +179,127 @@ def test_the_conversion_adds_exactly_one_state_dict_key():
     missing, unexpected = cond.load_state_dict(plain.state_dict(), strict=False)
     assert set(missing) == {"advantage_emb.weight"}
     assert not unexpected
+
+
+# --------------------------------------------------------------------------------------
+# prefix_token injection. The additive variant was MEASURED INADEQUATE on real data (the
+# label moved the served window by 0.3-0.7% of ordinary sampling noise across three
+# configurations, including one whose whole model demonstrably moved), so the label gets its
+# own TOKEN -- with its own attention weights at every layer -- as the structural alternative.
+# --------------------------------------------------------------------------------------
+
+def _tok_model(seed=0):
+    """A prefix_token-injection model."""
+    torch.manual_seed(seed)
+    return FlowMatchingTransformer(
+        state_dim=D, future_len=F, num_history_states=N, extero_sensor_dim=K,
+        extero_sensor_count=T, cmd_dim=CMD, cmd_stride=4, d_model=32, nhead=4,
+        num_layers=2, dim_feedforward=64, attention_mode="prefix",
+        advantage_cond=True, advantage_inject="prefix_token").eval()
+
+
+def test_the_token_variant_GROWS_prefix_len_by_exactly_one():
+    """It is one extra conditioning token -- and that is the cost the additive form avoided.
+
+    `prefix_len` feeds the exported graph's shapes, so this is why a time_embed checkpoint and
+    a prefix_token one are not interchangeable artifacts and the mode has to ride in the file.
+    """
+    assert _tok_model().prefix_len == _model(True).prefix_len + 1
+    assert _tok_model().sequence_len == _model(True).sequence_len + 1
+
+
+def test_the_token_CHANGES_the_output_between_labels():
+    """The whole point: a differently-valued token must produce a different prediction."""
+    m = _tok_model()
+    x = _inputs()
+    with torch.no_grad():
+        pos = m(**x, advantage=torch.full((4,), POS, dtype=torch.long))
+        neg = m(**x, advantage=torch.full((4,), NEG, dtype=torch.long))
+    assert not torch.allclose(pos, neg)
+
+
+def test_the_token_reaches_the_PREFIX_CACHE_unlike_the_additive_form():
+    """This is the structural difference, stated as a test.
+
+    Under `time_embed` the label rides the flow-time embedding, so `encode_prefix` is
+    label-INDEPENDENT and one cache serves every label. Under `prefix_token` the label IS a
+    conditioning token, so the cache itself differs -- which is exactly what lets it modulate
+    how the future tokens attend to the rest of the conditioning, and also why CFG over the
+    label costs a second encode here.
+    """
+    x = _inputs()
+    add = _model(True)
+    with torch.no_grad():
+        torch.nn.init.normal_(add.advantage_emb.weight, std=0.5)
+        c_pos = add.encode_prefix(x["history"], x["extero"], x["cmd_tokens"],
+                                  advantage=torch.full((4,), POS, dtype=torch.long))
+        c_neg = add.encode_prefix(x["history"], x["extero"], x["cmd_tokens"],
+                                  advantage=torch.full((4,), NEG, dtype=torch.long))
+    for a, b in zip(c_pos, c_neg):
+        assert torch.equal(a, b), "time_embed: the prefix must NOT depend on the label"
+
+    tok = _tok_model()
+    with torch.no_grad():
+        t_pos = tok.encode_prefix(x["history"], x["extero"], x["cmd_tokens"],
+                                  advantage=torch.full((4,), POS, dtype=torch.long))
+        t_neg = tok.encode_prefix(x["history"], x["extero"], x["cmd_tokens"],
+                                  advantage=torch.full((4,), NEG, dtype=torch.long))
+    assert not torch.allclose(t_pos[0], t_neg[0]), \
+        "prefix_token: the prefix MUST depend on the label"
+
+
+def test_omitting_the_label_still_means_null_under_the_token():
+    """Same convention as the additive path: `None` is the null ROW, not a missing token.
+
+    Otherwise the unconditioned call would produce a DIFFERENT SEQUENCE LENGTH from a
+    conditioned one, which would be a far worse failure than a wrong value.
+    """
+    m = _tok_model()
+    x = _inputs()
+    with torch.no_grad():
+        omitted = m(**x)
+        explicit = m(**x, advantage=torch.full((4,), NULL, dtype=torch.long))
+    assert torch.equal(omitted, explicit)
+
+
+def test_the_token_rows_do_NOT_start_at_zero():
+    """A zero token still changes the attention softmax while carrying no signal to separate
+    the rows -- the worst of both worlds, so the token variant starts at a real scale."""
+    m = _tok_model()
+    assert m.advantage_emb.weight.norm() > 0.1
+
+
+def test_an_unrecognised_injection_mode_is_refused():
+    """A silent fallback would train one architecture while the config claimed another."""
+    with pytest.raises(ValueError, match="advantage_inject"):
+        FlowMatchingTransformer(
+            state_dim=D, future_len=F, num_history_states=N, extero_sensor_dim=K,
+            extero_sensor_count=T, cmd_dim=CMD, cmd_stride=4, d_model=32, nhead=4,
+            num_layers=2, dim_feedforward=64, advantage_cond=True,
+            advantage_inject="both")
+
+
+def test_sample_trajectory_ROUTES_the_label_into_the_cached_prefix():
+    """The hoisted `encode_prefix` must receive the label, or the token path serves `null`.
+
+    REGRESSION. `sample_trajectory` encodes the conditioning ONCE outside the Euler loop
+    (that is the whole point of `prefix` attention). The first version of the token variant
+    did not pass `advantage` to that call, so under `prefix_token` both arms encoded a `null`
+    prefix and a positive-conditioned sample came out BIT-IDENTICAL to a negative-conditioned
+    one -- served windows differing by exactly 0.0000, which reads as "the model ignored the
+    label" rather than as a plumbing bug. The unit tests above did not catch it because they
+    call `model(...)` directly; only the sampler hoists.
+    """
+    from robot_rl.flow_matching.flow import sample_trajectory
+
+    m = _tok_model()
+    x = _inputs()
+    noise = torch.randn(4, F, D, generator=torch.Generator().manual_seed(0))
+    kw = dict(future_len=F, state_dim=D, num_steps=3, noise=noise)
+    with torch.no_grad():
+        pos = sample_trajectory(m, x["history"], x["extero"], x["cmd_tokens"],
+                                advantage=torch.full((4,), POS, dtype=torch.long), **kw)
+        neg = sample_trajectory(m, x["history"], x["extero"], x["cmd_tokens"],
+                                advantage=torch.full((4,), NEG, dtype=torch.long), **kw)
+    assert not torch.allclose(pos, neg), \
+        "the label did not reach the cached prefix: both arms sampled identically"

@@ -64,9 +64,14 @@ from robot_rl.flow_matching.rollout_dataset import (  # noqa: E402
     RolloutWindowDataset, join_labels,
 )
 
-#: The one state-dict key the conversion adds.  Anything else missing means the pretrained
-#: checkpoint is not the architecture this script thinks it is.
-_NEW_KEYS = {"advantage_emb.weight"}
+#: The state-dict keys the conversion adds, per injection mode.  Anything else missing means
+#: the pretrained checkpoint is not the architecture this script thinks it is.
+_NEW_KEYS = {
+    "time_embed": {"advantage_emb.weight"},
+    # The token variant also carries its own type embedding, exactly as every other stream in
+    # the prefix does.
+    "prefix_token": {"advantage_emb.weight", "advantage_type"},
+}
 
 
 def resolved_config(path: str) -> FlowMatchingConfig:
@@ -88,13 +93,14 @@ def resolved_config(path: str) -> FlowMatchingConfig:
     return cfg
 
 
-def convert(ctx, cfg, device) -> FlowMatchingTransformer:
+def convert(ctx, cfg, device, inject: str | None = None) -> FlowMatchingTransformer:
     """Build the advantage-conditioned twin of a loaded checkpoint's model.
 
     Args:
         ctx: A loaded :class:`~robot_rl.flow_matching.online.FmOnlineContext`.
         cfg: That checkpoint's resolved config.
         device: Where to put it.
+        inject: Override the injection mode ('time_embed' / 'prefix_token').
 
     Returns:
         A trainable :class:`FlowMatchingTransformer` with ``advantage_cond=True``, carrying
@@ -106,13 +112,16 @@ def convert(ctx, cfg, device) -> FlowMatchingTransformer:
     """
     cfg = copy.deepcopy(cfg)
     cfg.advantage_cond = True
+    if inject is not None:
+        cfg.advantage_inject = inject
     model = FlowMatchingTransformer.from_config(cfg).to(device)
     missing, unexpected = model.load_state_dict(ctx.model.state_dict(), strict=False)
-    if set(missing) != _NEW_KEYS or unexpected:
+    want = _NEW_KEYS[cfg.advantage_inject]
+    if set(missing) != want or unexpected:
         raise RuntimeError(
-            f"converting to advantage_cond should add exactly {sorted(_NEW_KEYS)}; got "
-            f"missing={sorted(missing)} unexpected={sorted(unexpected)}. The pretrained "
-            "checkpoint is not the architecture this config describes.")
+            f"converting to advantage_cond ({cfg.advantage_inject}) should add exactly "
+            f"{sorted(want)}; got missing={sorted(missing)} unexpected={sorted(unexpected)}. "
+            "The pretrained checkpoint is not the architecture this config describes.")
     return model
 
 
@@ -211,6 +220,17 @@ def main() -> int:
                         "from a shipped model, and the failure mode is losing motion quality "
                         "that no success rate will show. Applies to every parameter EXCEPT "
                         "advantage_emb when --emb_lr_multiplier != 1.")
+    p.add_argument("--advantage_inject", default="time_embed",
+                   choices=("time_embed", "prefix_token"),
+                   help="HOW the label reaches the network. `time_embed` adds it to the "
+                        "flow-time embedding (zero-init, conversion exactly inert, ONNX "
+                        "shapes unchanged) and is MEASURED INADEQUATE here -- across 1x/50x "
+                        "embedding lr and a 10x whole-model lr it moved the served window by "
+                        "0.3-0.7% of ordinary sampling noise. `prefix_token` gives the label "
+                        "its own token in the conditioning prefix, with its own attention "
+                        "weights per layer, so it can modulate WHICH conditioning is attended "
+                        "to; it grows prefix_len by 1, so its exported graph is not "
+                        "interchangeable with a time_embed one.")
     p.add_argument("--emb_lr_multiplier", type=float, default=1.0,
                    help="advantage_emb.weight gets lr * this, every other parameter gets "
                         "lr unchanged -- a separate AdamW param group, not a global scale. "
@@ -259,7 +279,7 @@ def main() -> int:
             f"{args.pretrained} is ALREADY advantage-conditioned. Every iteration fine-tunes "
             "from the pretrained checkpoint, never from the previous one -- chaining makes "
             "iteration k an unrepeatable path rather than one defined step.")
-    model = convert(ctx, cfg, device)
+    model = convert(ctx, cfg, device, args.advantage_inject)
 
     import h5py
     with h5py.File(args.rollout, "r") as f:
@@ -300,10 +320,33 @@ def main() -> int:
     if labels is not None:
         print(f"[ft] train label counts (before null dropout): {train_ds.label_counts()}")
 
-    if args.verify_identity:
+    if args.verify_identity and args.advantage_inject == "time_embed":
         worst = verify_identity(ctx, model, train_ds, device)
         print(f"[ft] conversion is identical to the parent under all {len(LABEL_NAMES)} "
               f"labels (max |delta| {worst:.2e})")
+    elif args.verify_identity:
+        # A TOKEN is a key in the attention softmax, so its presence changes every other
+        # token's output at ANY initialisation -- there is no inert conversion to assert, and
+        # claiming one would be false. What replaces it is measuring how far the untrained
+        # conversion already sits from its parent, so a later change is read against that
+        # baseline rather than against an assumed zero.
+        with torch.no_grad():
+            items = [train_ds[i] for i in range(min(4, len(train_ds)))]
+            hist = torch.stack([it["history"] for it in items]).to(device)
+            ext = torch.stack([it["extero"] for it in items]).to(device)
+            cmd = (torch.stack([it["cmd_tokens"] for it in items]).to(device)
+                   if "cmd_tokens" in items[0] else None)
+            nullm = torch.stack([it["history_null"] for it in items]).to(device)
+            noise = torch.randn(len(items), ctx.F, ctx.D,
+                                generator=torch.Generator().manual_seed(0)).to(device)
+            base = sample_trajectory(ctx.model, hist, ext, cmd, ctx.F, ctx.D, ctx.num_steps,
+                                     history_null_mask=nullm, noise=noise)
+            adv = torch.full((len(items),), 1, dtype=torch.long, device=device)
+            got = sample_trajectory(model, hist, ext, cmd, ctx.F, ctx.D, ctx.num_steps,
+                                    history_null_mask=nullm, noise=noise, advantage=adv)
+            d = float((got - base).abs().mean())
+        print(f"[ft] prefix_token: conversion is NOT inert by construction (a token changes "
+              f"the attention softmax at any init). Untrained |delta| from parent: {d:.4f}")
 
     loader = torch.utils.data.DataLoader(
         train_ds, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers,
@@ -455,6 +498,7 @@ def _save(args, cfg, model, opt, ema, epoch: int, history: list, path: str) -> N
     parent = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     cfg = copy.deepcopy(cfg)
     cfg.advantage_cond = True
+    cfg.advantage_inject = args.advantage_inject
     ckpt = dict(parent)
     ckpt["model"] = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     ckpt["config"] = cfg.to_dict()

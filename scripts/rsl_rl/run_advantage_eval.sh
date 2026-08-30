@@ -79,7 +79,15 @@ if [ ! -f "${OUT}/plan.json" ]; then
 fi
 
 # --------------------------------------------------------------------------------- grid
-python scripts/rsl_rl/eval/evaluate.py --stage grid --out "$OUT" 2>&1 | tee "${OUT}/grid.log"
+# `--stage grid` is a SEPARATE argparse invocation from `--stage plan` -- it does not re-read
+# flags off plan.json, only off its own command line. Anything set at plan time that stage_grid
+# also reads (see its own forwarding list) has to be restated here or it silently reverts to
+# argparse's default in every cell subprocess. Bit once already in this exact run: an eval with
+# no --goal_regions here ran with reached_goal permanently 0 for its whole duration, and
+# report.py refused the table only at the very end.
+python scripts/rsl_rl/eval/evaluate.py --stage grid --out "$OUT" \
+    --num_envs 200 --goal_regions "logs/rollouts/${TAG}/goal_regions.json" \
+    2>&1 | tee "${OUT}/grid.log"
 date
 
 # ------------------------------------------------------------------------------- report

@@ -768,10 +768,21 @@ def sample_trajectory(
     #
     # In the guided branch the prefix is built once at 2B (the conditional half plus the
     # null-history half), so CFG pays for one doubled prefix pass rather than eight.
+    #
+    # The ADVANTAGE label must reach this call under `prefix_token` injection, where the label
+    # IS a conditioning token and so is part of what gets encoded. Omitting it silently
+    # defaulted the prefix to `null` for every arm, making a positive-conditioned sample
+    # bit-identical to a negative-conditioned one -- the served windows differed by exactly
+    # 0.0000, which is how it was caught. Under `time_embed` the label rides the flow-time
+    # embedding instead and the prefix is label-independent, so passing it here is a harmless
+    # no-op on that path.
     cache = None
     if getattr(model, "attention_mode", "full") == "prefix":
-        cache = (model.encode_prefix(hist2, extero2, cmd2, mask2) if guided
-                 else model.encode_prefix(history, extero, cmd_tokens, history_null_mask))
+        adv_pre = (None if advantage is None
+                   else (torch.cat([advantage, advantage], 0) if guided else advantage))
+        cache = (model.encode_prefix(hist2, extero2, cmd2, mask2, adv_pre) if guided
+                 else model.encode_prefix(history, extero, cmd_tokens, history_null_mask,
+                                          adv_pre))
 
     for i in range(num_steps):
         tau = torch.full((b,), i * dt, device=device, dtype=history.dtype)
