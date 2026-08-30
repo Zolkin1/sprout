@@ -120,9 +120,9 @@ ROLLOUT_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     # property of where the episode opened, and a fit that ignores it is training a critic on
     # a large population of states labelled "success" that required nothing.
     #
-    # Measured on a 298-episode rollout with the clip's own random start phase (start_step
-    # median 107, max 883): 81 of 197 arrivals -- 41% -- were this. `--start_step 0` is now
-    # the default for exactly that reason.
+    # A large fraction of arrivals were this whenever the clip's own random start phase was
+    # left on, because that phase opens episodes at or past the clip's own endpoint.
+    # `--start_step 0` is the default for exactly that reason.
     ("spawned_in_goal", _U8),
     # How far the CLIP itself travels from where this episode opened to the goal. Negative
     # means the goal is BEHIND the spawn, which a forward half-plane cannot express -- see
@@ -134,6 +134,34 @@ ROLLOUT_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
 ROLLOUT_COLUMN_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_EPISODE_COLUMNS)
 
 
+# TODO(jump-off-front): this family fails far more than any other and it is not understood.
+#
+# Established, from the per-window goal offsets (clean data, independent of the contaminated
+# tilt column -- see TODO(terminal-tilt)):
+#   * almost all of its failures bind on DOWNRANGE at their closest approach, not on lateral;
+#   * lateral offsets at closest approach sit comfortably INSIDE the fitted half-width, so a
+#     yaw/width hypothesis is not supported;
+#   * so the robot is not getting there, rather than getting there and being missed.
+#
+# NOT established: whether those failures are falls or stalls. That split reads
+# `first_fall_step`, which TODO(terminal-tilt) shows can be set spuriously.
+#
+# Hypotheses worth separating:
+#   (a) real dismount failures -- the generator genuinely cannot do the forward drop;
+#   (b) the 70 deg TILT limb sitting inside the family's own envelope. This is the same shape
+#       of defect the HEIGHT limb already had here: `base_fallen`'s old 0.50 m sat inside
+#       jump_off_front's own reference envelope, which is why it was lowered. A forward
+#       dismount pitches hard, so the tilt limb deserves the identical check -- and it cannot
+#       be run until the tilt column is trustworthy;
+#   (c) the goal, anchored at the clip's terminal position, sitting past a drop the robot
+#       cannot reach -- an unreachable region rather than an unachievable motion.
+#
+# Cheapest next step: draw a dozen of them in Isaac with the goal region visible
+# (`--viz kit`, `env.commands.traj_ref.debug_vis_goal_regions=...`) and watch where they
+# stop. That is how the goal-region defects were found, and it costs minutes.
+#
+# Numbers deliberately not inlined: they are a property of one pair on one library and would
+# go stale faster than this comment. Re-derive from a rollout's own `episodes.h5`.
 def terminal_reward(cols: dict[str, np.ndarray]) -> np.ndarray:
     """The sparse terminal reward, stated once so every consumer reads the same rule.
 
@@ -315,6 +343,26 @@ ROLLOUT_WINDOW_COLUMNS: tuple[tuple[str, str], ...] = (
     ("goal_downrange_m", "f4"),   # + = past the goal anchor, in the TERRAIN frame
     ("goal_lateral_m", "f4"),
     ("goal_height_err_m", "f4"),
+    # --- proprioception, as per-timestep tokens for the critic ---------------------------
+    #
+    # `(H, PROPRIO_DIM)`, NEWEST LAST. Its own ring rather than the observation manager's
+    # history-stacked terms: those flatten to `(N, history*dim)`, and whether that is (T, D)
+    # or (D, T) is an IsaacLab internal. Getting it backwards is shape-silent and would hand
+    # the critic a transposed history it could still partly fit.
+    ("proprio", "f4"),
+    # The measured base TWIST -- linear(3) + angular(3) -- in the ROBOT'S YAW FRAME,
+    # `yaw_quat(root_quat_w)`. Six wide and in that frame on purpose: that is exactly the
+    # layout and the frame of the plan's own `base_vel` block, so "what the base is doing"
+    # and "what the plan asked for" are comparable without a transform. The body frame would
+    # tilt with the torso and swing the forward component on every pitch; world would defeat
+    # heading invariance.
+    #
+    # Only the LINEAR half is privileged -- it needs odometry. The angular half is
+    # measurable: an IMU gives body-frame rates and the yaw frame is reachable from those
+    # plus the IMU's own roll and pitch, the same argument that keeps the generator's depth
+    # unprojection odometry-free. Carried together so the twist stays one object;
+    # `V_onboard` takes the angular half and drops the linear one.
+    ("base_twist_yaw", "f4"),
 )
 
 ROLLOUT_WINDOW_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_WINDOW_COLUMNS)
@@ -327,6 +375,15 @@ ROLLOUT_WINDOW_INDEX: tuple[str, ...] = (
     "depth_lag_used", "clip_step",
     "goal_downrange_m", "goal_lateral_m", "goal_height_err_m",
 )
+
+#: Width of one proprioception row: joint_pos(29) + joint_vel(29) + base_ang_vel(3) +
+#: projected_gravity(3). All measurable on the robot; none of it visible to the generator,
+#: which conditions on its own plan, the camera row and the command.
+PROPRIO_DIM: int = 64
+#: Control steps of proprioception kept per window. 10 = 0.2 s, at the CONTROL rate rather
+#: than the re-plan rate: a fall develops over tens of milliseconds, and sampling it every
+#: 0.24 s would miss the onset -- which is the moment the lead-time gate is entirely about.
+PROPRIO_HISTORY: int = 10
 
 
 class RolloutWindowWriter:
@@ -346,7 +403,7 @@ class RolloutWindowWriter:
 
     def __init__(self, path: str, *, num_windows: int, num_history: int, state_dim: int,
                  future_len: int, cmd_dim: int, extero_shape: tuple[int, int],
-                 scan_dim: int = 0, attrs: dict | None = None,
+                 proprio_hw: tuple[int, int], scan_dim: int = 0, attrs: dict | None = None,
                  compression: str | None = "lzf") -> None:
         """Create the file and pre-size every dataset.
 
@@ -358,6 +415,7 @@ class RolloutWindowWriter:
             future_len: ``F``, nodes the generator predicts.
             cmd_dim: Command width.
             extero_shape: ``(T, K)`` per reading, from the generator's own contract.
+            proprio_hw: ``(H, PROPRIO_DIM)`` proprioception ring, newest last.
             scan_dim: Privileged height-scan width, or 0 for none.
             attrs: Provenance, JSON-encoded onto the root.
             compression: h5py compression for every dataset.
@@ -378,6 +436,8 @@ class RolloutWindowWriter:
             "anchor_pos": (num_windows, 3), "anchor_quat": (num_windows, 4),
             "goal_downrange_m": (num_windows,), "goal_lateral_m": (num_windows,),
             "goal_height_err_m": (num_windows,),
+            "proprio": (num_windows, int(proprio_hw[0]), int(proprio_hw[1])),
+            "base_twist_yaw": (num_windows, 6),
         }
         if int(scan_dim) > 0:
             shapes["height_scan"] = (num_windows, int(scan_dim))

@@ -67,7 +67,7 @@ def test_arriving_upright_is_the_only_zero_reward():
 def test_a_free_success_is_flagged_rather_than_hidden():
     """An episode already inside the goal on its first step had no task to do.
 
-    Measured with the clip's random start phase on, 41% of arrivals were this -- episodes
+    With the clip's random start phase on, a large fraction of arrivals are this -- episodes
     opening at or past the clip's own endpoint. They are still scored a success (the rule is
     the rule) but the flag is what lets a fit drop them, and what makes the contamination
     visible instead of silent.
@@ -105,11 +105,11 @@ def test_falling_BEFORE_arriving_is_a_failure():
 def test_arriving_BEFORE_falling_is_a_SUCCESS():
     """Reached the goal at step 90, fell in the run-out at 140. The task was done.
 
-    Worth 17 points on real data: of 298 finished episodes in one rollout, 51 arrived and
-    then fell. Scoring those as failures -- which `arrived AND not terminated` does -- moved
-    the measured success rate 48.0% -> 65.1%, which is far larger than any policy difference
-    this is meant to resolve. `mjeval` has always used the first-event rule (it tests
-    `robot.failed()` before the target each step and breaks on either).
+    Not a corner case: a substantial share of episodes arrive and then fall, so scoring those
+    as failures -- which `arrived AND not terminated` does -- shifts the measured success rate
+    by more than the policy differences this is meant to resolve. `mjeval` has always used the
+    first-event rule (it tests `robot.failed()` before the target each step and breaks on
+    either).
     """
     t = ro.RolloutOutcomeTable()
     t.append_batch(_row(reached_goal=1, terminated=1, first_goal_step=90, first_fall_step=140))
@@ -307,10 +307,11 @@ def test_goal_travel_is_recorded_so_a_backwards_family_cannot_hide():
     """A negative travel means the goal sits BEHIND where the episode opened.
 
     A forward half-plane cannot express that, so the robot is inside it on step 1 and stays
-    there. Measured on the shipped library: `jump_off` travels -0.41 m and 80% of its
-    episodes scored a free success, while `jump_on` travels +2.68 m and none did. Recording
-    the travel is what makes that visible on a library nobody has measured yet -- it was
-    found the first time by drawing six episodes and looking.
+    there. On the shipped library `jump_off` travels NEGATIVE -- it is the jump-off-a-box
+    BACKWARDS family -- and most of its episodes scored a free success, while the forward
+    families travel positive and none did. Recording the travel is what makes that visible on
+    a library nobody has measured yet; it was found the first time by drawing six episodes
+    and looking.
     """
     t = ro.RolloutOutcomeTable()
     t.append_batch(_row(goal_travel_m=-0.41, spawned_in_goal=1, first_goal_step=1))

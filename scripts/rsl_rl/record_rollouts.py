@@ -43,6 +43,7 @@ import argparse
 import importlib.metadata as metadata
 import os
 import sys
+import time
 
 import gymnasium as gym
 import numpy as np
@@ -78,8 +79,14 @@ parser.add_argument("--fm_checkpoint", type=str, default=None,
 parser.add_argument("--clip", type=str, default=None, help="Clip library .h5 to run on.")
 parser.add_argument("--clip_device", type=str, default=None,
                     help="'cpu' keeps a large library off the GPU.")
+parser.add_argument("--num_episodes", type=int, default=0,
+                    help="Stop once this many episodes have FINISHED. The natural unit: with "
+                         "a terminal-only reward every window of an episode carries the same "
+                         "label, so the effective sample size is the episode count and a "
+                         "window quota is only a proxy for it. 0 = no episode limit.")
 parser.add_argument("--num_windows", type=int, default=100000,
-                    help="Stop after this many re-plan windows.")
+                    help="Hard cap on re-plan windows; also sizes the pre-allocated file, so "
+                         "set it above what --num_episodes will produce.")
 parser.add_argument("--max_steps", type=int, default=0,
                     help="Also stop after this many control steps (0 = no ceiling).")
 parser.add_argument("--goal_regions", default="",
@@ -94,24 +101,33 @@ parser.add_argument("--min_height", type=float, default=0.40,
                          "critic fitted to those episodes learns the threshold, not the fall.")
 parser.add_argument("--output_dir", type=str, default=None,
                     help="Where the two .h5 files go; defaults beside the checkpoint.")
-parser.add_argument("--skip_families", default="jump_off,distractor",
+parser.add_argument("--skip_families", default="jump_off,distractor,stairs_dn_pure,stairs_up_pure",
                     help="Families this rollout REFUSES to run on. The library is checked at "
                          "load and the run aborts if any are present, naming the command to "
                          "build a filtered subset -- filtering at the reset instead leaves "
-                         "envs parked on tiles with no clips. Defaults to the two the rest "
-                         "of the pipeline already drops: `jump_off` jumps BACKWARDS, so its "
-                         "goal sits behind the spawn and 80%% of its episodes score a free "
-                         "success; `distractor` travels 0.40 m in total, less than the "
-                         "approach margin, so the margin swallows the whole task. Empty = "
-                         "run everything, and read `goal_travel_m` before believing it.")
+                         "envs parked on tiles with no clips. Four, for three reasons:\n"
+                         "  jump_off      -- jumps BACKWARDS, so a forward half-plane puts "
+                         "its goal behind the spawn and most of its episodes score free.\n"
+                         "  distractor    -- travels less, in total, than the approach "
+                         "margin, so the margin swallows the whole task.\n"
+                         "  stairs_*_pure -- these clips OPEN ON THE STAIRS, so the "
+                         "generator's first re-plan after every reset runs on the learned "
+                         "NULL-history embedding while standing on a riser. That embedding "
+                         "was fitted overwhelmingly on flat ground, so those first samples "
+                         "are bad for a reason that belongs to the reset rather than to the "
+                         "generator, and a critic fitted on them learns the artefact. They "
+                         "are also the only stairs tiles with NO width variation (uniform "
+                         "5.2 m against 0.81-4.14 m on the transition families), so dropping "
+                         "them costs no geometric coverage.\n"
+                         "Empty = run everything, and read `goal_travel_m` first.")
 parser.add_argument("--start_step", type=int, default=0,
                     help="Pin every episode to open at this clip step. 0 (the default) makes "
                          "every episode run the whole clip, so every one has the full task to "
                          "do. -1 restores the clip's own random start phase, which gives more "
                          "varied initial states BUT opens many episodes at or past the clip's "
-                         "own endpoint: measured with it on, 41%% of arrivals were already "
-                         "inside the goal region on their first step and scored a free "
-                         "success. Those are flagged `spawned_in_goal` either way, so a fit "
+                         "own endpoint, so a large fraction of arrivals are already inside "
+                         "the goal region on their first step and score a free success. "
+                         "Those are flagged `spawned_in_goal` either way, so a fit "
                          "can drop them -- but do not leave the phase on and forget to.")
 parser.add_argument("--seed", type=int, default=None)
 cli_args.add_rsl_rl_args(parser)
@@ -272,7 +288,71 @@ def _assert_sampler_is_stochastic(cmd) -> None:
           f"max {delta:.4g} (ctx.zero_noise={ctx.zero_noise})")
 
 
-def _emit(cmd, tracker, family_codes, scan_sensor, env) -> dict | None:
+class ProprioRing:
+    """The last ``H`` control steps of proprioception, newest last.
+
+    Kept at the CONTROL rate and not at the re-plan rate. A fall develops over tens of
+    milliseconds; sampled every 0.24 s the onset is simply not in the data, and the onset is
+    what the lead-time gate is about.
+
+    Maintained here rather than read out of the observation manager's history-stacked terms,
+    whose flattening to ``(N, history*dim)`` may be (T, D) or (D, T) -- an IsaacLab internal.
+    A transposed history is shape-silent and partly fittable, which is the worst combination.
+    """
+
+    def __init__(self, n_envs: int, device, history: int, dim: int) -> None:
+        """Allocate the ring.
+
+        Args:
+            n_envs: Environment count.
+            device: Torch device.
+            history: Rows kept per env.
+            dim: Row width; must equal :data:`rollout_outcomes.PROPRIO_DIM`.
+        """
+        self.buf = torch.zeros(n_envs, history, dim, device=device)
+        self.history = int(history)
+
+    def push(self, rd) -> None:
+        """Roll in this step's row for every env.
+
+        Args:
+            rd: The accumulator's converting view of ``ArticulationData`` (several of those
+                buffers are warp arrays, which do not accept a torch-style index).
+        """
+        row = torch.cat([rd.joint_pos, rd.joint_vel, rd.root_ang_vel_b,
+                         rd.projected_gravity_b], dim=-1)
+        self.buf = torch.roll(self.buf, shifts=-1, dims=1)
+        self.buf[:, -1] = row
+
+    def invalidate(self, dones) -> None:
+        """Zero the ring for envs that just reset, so no window spans two episodes."""
+        m = dones.to(torch.bool)
+        if bool(m.any()):
+            self.buf[m] = 0.0
+
+
+def _twist_yaw(rd):
+    """The measured base twist in the robot's YAW frame, ``(N, 6)``.
+
+    ``yaw_quat(root_quat_w)`` is the level frame the generator predicts its window in -- z is
+    gravity, roll and pitch are zero -- so this is directly comparable with the plan's own
+    `base_vel` block without a transform. The body frame would tilt with the torso and swing
+    the forward component on every pitch; world would defeat heading invariance.
+
+    Args:
+        rd: The converting view of ``ArticulationData``.
+
+    Returns:
+        ``(N, 6)``: linear(3) then angular(3).
+    """
+    from isaaclab.utils.math import quat_apply_inverse, yaw_quat  # noqa: PLC0415
+
+    q = yaw_quat(rd.root_quat_w)
+    return torch.cat([quat_apply_inverse(q, rd.root_lin_vel_w),
+                      quat_apply_inverse(q, rd.root_ang_vel_w)], dim=-1)
+
+
+def _emit(cmd, tracker, family_codes, scan_sensor, env, ring) -> dict | None:
     """Assemble one batch of windows for the envs that re-planned this step.
 
     Everything here is read at ONE instant -- after ``env.step`` has run
@@ -285,6 +365,7 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env) -> dict | None:
         family_codes: ``[num_clips]`` family codes, or ``None``.
         scan_sensor: Privileged scan sensor name, or ``None``.
         env: The unwrapped env.
+        ring: The :class:`ProprioRing`.
 
     Returns:
         The batch, or ``None`` when no env re-planned.
@@ -328,6 +409,8 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env) -> dict | None:
     batch["goal_downrange_m"] = cpu(down[idx]).astype(np.float32)
     batch["goal_lateral_m"] = cpu(lat[idx]).astype(np.float32)
     batch["goal_height_err_m"] = cpu(hz[idx]).astype(np.float32)
+    batch["proprio"] = cpu(ring.buf[idx]).astype(np.float32)
+    batch["base_twist_yaw"] = cpu(_twist_yaw(tracker.accum.rd)[idx]).astype(np.float32)
     if scan_sensor is not None:
         from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: PLC0415
         scan = mdp.scan_obs_stack(env, scan_sensor)[:, 0]
@@ -412,7 +495,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         scan_sensor = mdp.fm_scan_sensor(u)
         scan_dim = (int(mdp.scan_obs_stack(u, scan_sensor).shape[-1])
                     if scan_sensor is not None else 0)
+        # The scan's (height, width), read from its own contract rather than factorised out
+        # of the ray count. 176 is 11x16 and also 16x11, and under a convolution a transposed
+        # grid is scrambled input rather than a reordered vector -- the exact hazard
+        # `test_height_scan_grid.py` exists for.
+        scan_hw = None
+        if scan_sensor is not None:
+            scan_spec = mdp.height_scan_specs(u, scan_sensor)[0]
+            scan_hw = [int(scan_spec["height"]), int(scan_spec["width"])]
         extero = cmd._lagged_extero()
+        ring = ProprioRing(int(u.num_envs), u.device, ro.PROPRIO_HISTORY, ro.PROPRIO_DIM)
         os.makedirs(out_dir, exist_ok=True)
         stem = os.path.join(out_dir, f"rollout_{os.path.basename(log_dir)}")
         win_path, ep_path = stem + ".h5", stem + ".episodes.h5"
@@ -428,6 +520,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
             "fm_zero_noise": bool(cmd.ctx.zero_noise),
             "fm_update_every": int(cmd.cfg.fm_update_every),
             "num_envs": int(u.num_envs),
+            "proprio_history": int(ro.PROPRIO_HISTORY),
+            "proprio_layout": ["joint_pos(29)", "joint_vel(29)", "base_ang_vel_b(3)",
+                               "projected_gravity_b(3)"],
+            "base_twist_yaw_layout": ["lin(3)", "ang(3)", "frame=yaw_quat(root_quat_w)"],
+            "height_scan_hw": scan_hw,
         }
         print(f"[rollout] goal region {args_cli.goal_regions} (default margin "
               f"{spec.default.approach_margin_m} m, half-width {spec.default.half_width_m} m, "
@@ -438,27 +535,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
 
         obs = env.get_observations()
         steps = 0
+        t0 = time.time()
         ceiling = int(args_cli.max_steps) or None
         with ro.RolloutWindowWriter(
             win_path, num_windows=int(args_cli.num_windows), num_history=int(cmd.ctx.N),
             state_dim=int(cmd.ctx.D), future_len=int(cmd.ctx.F), cmd_dim=int(cmd.ctx.cmd_dim),
-            extero_shape=(int(extero.shape[1]), int(extero.shape[2])), scan_dim=scan_dim,
+            extero_shape=(int(extero.shape[1]), int(extero.shape[2])),
+            proprio_hw=(ro.PROPRIO_HISTORY, ro.PROPRIO_DIM), scan_dim=scan_dim,
             attrs=prov,
         ) as writer:
             with torch.inference_mode():
+                want_ep = int(args_cli.num_episodes) or None
                 while writer.written < int(args_cli.num_windows):
                     if ceiling is not None and steps >= ceiling:
                         print(f"[rollout] step ceiling {ceiling} reached")
                         break
+                    if want_ep is not None and tracker.harvested >= want_ep:
+                        print(f"[rollout] {tracker.harvested} episodes reached")
+                        break
                     obs, _, dones, _ = env.step(policy(obs))
                     steps += 1
                     tracker.fold(dones)
-                    batch = _emit(cmd, tracker, family_codes, scan_sensor, u)
+                    # Zero the ring for envs that just reset BEFORE pushing this step, or a
+                    # window emitted in the first H steps of a new episode carries rows from
+                    # the previous one -- which for a fall is precisely the signature the
+                    # critic is being asked to learn.
+                    ring.invalidate(dones)
+                    ring.push(tracker.accum.rd)
+                    batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring)
                     if batch is not None:
                         writer.write_batch(batch)
                     if steps % 500 == 0:
+                        el = time.time() - t0
                         print(f"[rollout] step {steps}: {writer.written} windows, "
-                              f"{tracker.harvested} episodes")
+                              f"{tracker.harvested} episodes, {el / 60:.1f} min "
+                              f"({steps / max(el, 1e-9):.1f} steps/s, "
+                              f"{tracker.harvested / max(el / 3600, 1e-9):.0f} ep/h)")
                 # Inside inference_mode: the accumulators were last written here, which makes
                 # them inference tensors, and those cannot be updated in place outside it.
                 tracker.flush(u, torch.arange(int(u.num_envs), device=u.device))

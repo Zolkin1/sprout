@@ -196,12 +196,14 @@ def main() -> int:
     p.add_argument("--write_bootstrap", default="",
                    help="emit an UNCALIBRATED spec here and exit; run the clip arm against "
                         "it to produce the table this script then fits")
-    p.add_argument("--skip_families", default="jump_off,distractor",
+    p.add_argument("--skip_families", default="jump_off,distractor,stairs_dn_pure,stairs_up_pure",
                    help="Families excluded from the FIT. The same two the rest of the "
                         "pipeline drops: `jump_off` travels backwards so its goal sits "
-                        "behind the spawn, and `distractor` travels 0.40 m in total. Fitting "
-                        "tolerances from either would size the region to a task that is not "
-                        "one.")
+                        "behind the spawn, `distractor` travels less in total than a typical "
+                        "approach margin, and the "
+                        "`*_pure` families open ON the stairs so their first re-plan runs on "
+                        "a null-history embedding fitted on flat. Fitting tolerances from any "
+                        "of them would size the region to a task that is not one.")
     p.add_argument("--quantile", type=float, default=DEFAULT_QUANTILE)
     p.add_argument("--pad_m", type=float, default=DEFAULT_PAD_M)
     args = p.parse_args()

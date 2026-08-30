@@ -495,6 +495,35 @@ class EpisodeAccumulator:
         cos = (1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])).clamp(-1.0, 1.0)
         return torch.acos(cos)
 
+    # TODO(terminal-tilt): `max_tilt_rad` is CONTAMINATED and `first_fall_step` may be too.
+    #
+    # A non-trivial fraction of SUCCESSFUL episodes record `max_tilt_rad` ABOVE the 70 deg
+    # termination limit, some of them far above it. That is impossible if the column measured
+    # what it claims -- `base_fallen` would have ended those episodes -- so a transient is
+    # being folded in. First seen on a closed-loop rollout; re-derive the rate from any
+    # `episodes.h5` by taking `max_tilt_rad` over the episodes the reward scores a success.
+    #
+    # The suspect is the `max()` below. It is deliberate and well argued for ordering
+    # robustness, but max(a, b) where one input is a mid-teleport pose is that pose. If
+    # `root_quat_w` is momentarily garbage inside the reset hook rather than merely fresh,
+    # this picks it up and nothing downstream can tell.
+    #
+    # WHAT IS AFFECTED, and what is not:
+    #   * `max_tilt_rad` -- unusable as reported.
+    #   * `first_fall_step` -- `fold_terminal` sets it when EITHER limb crosses, so a
+    #     spurious tilt marks an episode as having fallen when it did not. That makes the
+    #     fall-vs-stall SPLIT unreliable.
+    #   * the success verdict is SAFE: it comes from `reached_goal` and the first-event
+    #     ordering, and an episode that reached the goal before the terminal frame keeps its
+    #     success regardless. That is why this hid.
+    #   * the eval harness shares this accumulator, so its `max_tilt_rad` and derived `fell`
+    #     column may carry the same defect. CLAUDE.md records a PREVIOUS bug in this exact
+    #     place (the derived fall flag inheriting the previous episode's orientation), so
+    #     check whether this is a recurrence rather than a new fault.
+    #
+    # To diagnose: log both limbs separately at the terminal fold for a few hundred episodes
+    # and compare against the per-step maximum, which is computed from a buffer that is not
+    # mid-reset. Blocks TODO(jump-off-front).
     def _tilt_terminal(self, d) -> torch.Tensor:
         """Tilt for the TERMINAL fold, where the two buffers disagree on purpose.
 
