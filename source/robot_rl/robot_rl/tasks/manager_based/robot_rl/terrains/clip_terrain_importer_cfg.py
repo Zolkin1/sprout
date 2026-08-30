@@ -34,6 +34,27 @@ class ClipTerrainImporterCfg(TerrainImporterCfg):
     num_rows: int = 1
     """Replicas of the tile set (each a strip in y) -> more distinct env spawns."""
 
+    render_decor: bool = True
+    """Whether to build the library's visual-only decoration (walls, rooms, clutter) at all.
+
+    ``False`` gives the terrain geometry alone, which is exactly the state an UNDECORATED
+    library already produces -- ``create_decor_prim`` writes its unhittable placeholder, so
+    ``/World/decor`` still exists and the depth cameras still have the target prim they are
+    configured against. Nothing special-cases the off path.
+
+    **This changes what the DEPTH CAMERAS see**, and therefore what the generator is
+    conditioned on: the walls are the one channel that alters the image without altering what
+    the robot stands on. So it is a VIEWING knob. Turning it off to look at geometry is fine;
+    a measured run with it off is a different experiment from one with it on, and the two
+    success rates are not comparable.
+
+    The concrete reason it exists: walls ring each tile's own rendered FLOOR EDGE
+    (``motion_gen.terrain.decorate.add_walls``) and are baked into the manifest, so where
+    they sit is a property of the tile, not of how many tiles were loaded. In a small subset
+    that puts a flat tile's room wall right where its NEIGHBOUR's terrain starts -- visually
+    confusing without being wrong, and worth switching off while inspecting.
+    """
+
     decor_overlay_path: str = ""
     """Optional clutter sidecar (``scripts/rsl_rl/author_clutter.py``) merged into the
     manifest at load.

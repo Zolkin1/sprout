@@ -188,8 +188,129 @@ class EpisodeAccumulator:
         self.slip = z()
         self.contact_steps = z()
         self._prev_action = torch.zeros(self.n, self.robot.num_joints, device=self.device)
+        # -- the SPATIAL goal ------------------------------------------------------------
+        # Every other outcome above is a clip-CURSOR condition and cannot tell a robot that
+        # climbed the staircase from one that stood still while the cursor ran out. These
+        # are the buffers that can.
+        #
+        # The ANCHOR is episode-constant by construction (the globally placed clip's own
+        # terminal base pose), so it is resolved once per reset in `refresh_goal_anchor`
+        # rather than gathered every step -- cheaper, and it makes the constancy explicit
+        # instead of incidental.
+        # `goal_region` sits behind the `mdp` package __init__, which imports
+        # `isaaclab.envs.mdp`; `runner.py` imports THIS module before AppLauncher runs, so a
+        # module-level import here would bind pip's usd-core ahead of Kit's and segfault.
+        # See `test_no_pre_app_pxr_import.py`. Attached instead, after the env exists.
+        self._gr = None
+        self.goal_spec = None
+        self._goal_pos_w = torch.zeros(self.n, 3, device=self.device)
+        self._goal_yaw = torch.zeros(self.n, device=self.device)
+        self._goal_valid = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        self._goal_tol = torch.zeros(self.n, 3, device=self.device)
+        self.goal_reached = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        self.first_goal = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
+        self.min_goal_dist = torch.full((self.n,), float("inf"), device=self.device)
+        self.max_goal_down = torch.full((self.n,), -float("inf"), device=self.device)
+        self.end_goal = torch.full((self.n, 3), float("nan"), device=self.device)
         self._prev_xy = self.rd.root_pos_w[:, :2].clone()
         self._have_prev = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+
+    # ------------------------------------------------------------------
+    # The SPATIAL goal.  See mdp/goal_region.py for why it has to exist.
+    # ------------------------------------------------------------------
+    def attach_goal_region(self, spec, family_of_env=None) -> None:
+        """Turn on the goal columns, with ``spec``'s tolerances.
+
+        Off until called: with no spec the goal columns come out "never reached" / NaN and
+        ``report.py`` REFUSES to derive spatial success from them.  That is deliberate --
+        a spatial success rule silently falling back to a temporal one would be the exact
+        defect this whole module exists to remove, and "absent" has to be distinguishable
+        from "never arrived".
+
+        Args:
+            spec: A :class:`mdp.goal_region.GoalRegionSpec`.
+            family_of_env: Optional ``[n]`` sequence of normalised family names, so each env
+                gets its own family's calibrated tolerances.  ``None`` gives every env the
+                spec's default.
+        """
+        from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+        self._gr = goal_region
+        self.goal_spec = spec
+        self.set_goal_families(family_of_env)
+
+    def set_goal_families(self, family_of_env=None, env_ids: torch.Tensor | None = None) -> None:
+        """Write per-env tolerances from each env's family.
+
+        Called again whenever an env is re-pinned to a clip of a different family -- the
+        tolerances are per family, and a batch of 1024 envs spans several.
+
+        Args:
+            family_of_env: Sequence of normalised family names, one per entry of ``env_ids``
+                (or per env when ``env_ids`` is None).  ``None`` uses the spec default.
+            env_ids: Optional subset to write.
+        """
+        if self.goal_spec is None:
+            return
+        ids = (torch.arange(self.n, device=self.device) if env_ids is None
+               else env_ids.to(self.device))
+        if family_of_env is None:
+            t = self.goal_spec.default
+            row = torch.tensor([t.approach_margin_m, t.half_width_m, t.height_tol_m],
+                               device=self.device, dtype=self._goal_tol.dtype)
+            self._goal_tol[ids] = row
+            return
+        rows = [self.goal_spec.for_family(f) for f in family_of_env]
+        self._goal_tol[ids] = torch.tensor(
+            [[r.approach_margin_m, r.half_width_m, r.height_tol_m] for r in rows],
+            device=self.device, dtype=self._goal_tol.dtype)
+
+    def refresh_goal_anchor(self, env_ids: torch.Tensor | None = None) -> None:
+        """Resolve where the clip itself finishes, for ``env_ids``, once per episode.
+
+        The anchor is episode-CONSTANT -- it is the globally placed clip's own base pose at
+        ``last_usable_step``, and neither the placement nor that step moves once the episode
+        has started.  Resolving it per reset rather than per step is therefore not just
+        cheaper (it is a library gather over every env), it states that constancy instead of
+        leaving it incidental.
+
+        Must be called AFTER the reset has committed the new clip and its placement, or the
+        anchor describes the previous episode's clip -- the same shape of carry-over bug that
+        made ``projected_gravity_b`` inflate the derived fall flag.
+
+        Args:
+            env_ids: Envs to refresh, or ``None`` for all.
+        """
+        if self._gr is None:
+            return
+        pos, yaw = self._gr.goal_anchor_world(self.cmd)
+        ids = (torch.arange(self.n, device=self.device) if env_ids is None
+               else env_ids.to(self.device))
+        self._goal_pos_w[ids] = pos[ids].to(self._goal_pos_w.dtype)
+        self._goal_yaw[ids] = yaw[ids].to(self._goal_yaw.dtype)
+        self._goal_valid[ids] = True
+
+    def _fold_goal(self, m: torch.Tensor) -> None:
+        """Fold this step's goal geometry for the envs in ``m``."""
+        if self._gr is None:
+            return
+        down, lat, hz = self._gr.goal_frame_offsets(
+            self.rd.root_pos_w, self._goal_pos_w, self._goal_yaw)
+        live = m & self._goal_valid
+        inside = self._gr.in_goal(down, lat, hz, self._goal_tol) & live
+        dist = self._gr.goal_distance_m(down, lat, hz, self._goal_tol)
+
+        newly = inside & ~self.goal_reached
+        self.first_goal = torch.where(newly, self.steps, self.first_goal)
+        self.goal_reached = self.goal_reached | inside
+        self.min_goal_dist = torch.where(live, torch.minimum(self.min_goal_dist, dist),
+                                         self.min_goal_dist)
+        self.max_goal_down = torch.where(live, torch.maximum(self.max_goal_down, down),
+                                         self.max_goal_down)
+        # The terminal offsets are simply the LAST folded ones, so no separate terminal hook
+        # is needed: `fold_terminal` folds the ending frame through this same path.
+        self.end_goal = torch.where(live.unsqueeze(-1),
+                                    torch.stack([down, lat, hz], dim=-1), self.end_goal)
 
     def _resolve_feet(self, u) -> torch.Tensor:
         """Body indices of the two ankle-roll links, for the foot-slip term."""
@@ -332,6 +453,8 @@ class EpisodeAccumulator:
         self._prev_xy = xy.clone()
         self._have_prev = self._have_prev | m
 
+        self._fold_goal(m)
+
         # -- foot slip --------------------------------------------------------------------
         if self._foot_ids.numel() and self._contact_sensors:
             contact = self._foot_contact()
@@ -453,6 +576,20 @@ class EpisodeAccumulator:
             (height < self.fall_min_height) | (tilt > self.fall_tilt_rad))
         self.first_fall[ids] = torch.where(crossed, self.steps[ids], self.first_fall[ids])
 
+        # The goal too, and for the same reason: under `clip_end` truncation the LAST step is
+        # exactly when a robot is most likely to be standing in the goal, so omitting the
+        # terminal frame would systematically under-count arrivals.
+        #
+        # This inherits the same assumption the height limb above already makes -- that
+        # `root_pos_w` still holds the terminal pose here -- which `_check_terminal_state`
+        # verifies empirically once per run. If that ever breaks, the failure is benign in
+        # the one direction that matters: a post-reset read is the clip's SPAWN, which is
+        # maximally far from the goal, so it can corrupt `min_dist_to_goal_m` but can never
+        # falsely mark an episode as having arrived.
+        m = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        m[ids] = True
+        self._fold_goal(m)
+
     def snapshot(self, env_ids: torch.Tensor) -> dict[str, np.ndarray]:
         """Reduce the running sums for ``env_ids`` into per-episode values.
 
@@ -464,7 +601,20 @@ class EpisodeAccumulator:
         cpu = lambda t: t.detach().to("cpu").numpy()  # noqa: E731
 
         pc = cpu(self.plan_counts[ids]).astype(np.int64)
+        # NaN/inf out of the goal buffers means "never folded with a valid anchor", which is
+        # what an un-attached goal region looks like; `report.py` refuses to derive spatial
+        # success from that rather than reading it as "never arrived".
+        end_goal = cpu(self.end_goal[ids]).astype(np.float32)
+        min_gd = cpu(self.min_goal_dist[ids]).astype(np.float32)
+        max_gdown = cpu(self.max_goal_down[ids]).astype(np.float32)
         out: dict[str, np.ndarray] = {
+            "reached_goal": cpu(self.goal_reached[ids]).astype(np.uint8),
+            "first_goal_step": cpu(self.first_goal[ids]).astype(np.int64),
+            "min_dist_to_goal_m": np.where(np.isfinite(min_gd), min_gd, np.nan),
+            "goal_downrange_m": end_goal[:, 0],
+            "goal_lateral_m": end_goal[:, 1],
+            "goal_height_err_m": end_goal[:, 2],
+            "max_goal_downrange_m": np.where(np.isfinite(max_gdown), max_gdown, np.nan),
             "steps_survived": cpu(self.steps[ids]).astype(np.int64),
             "n_steps_scored": cpu(self.steps[ids]).astype(np.int64),
             "n_plans": pc.sum(1),
@@ -536,3 +686,11 @@ class EpisodeAccumulator:
         self.slip[ids] = 0.0
         self.contact_steps[ids] = 0.0
         self._have_prev[ids] = False
+        self.goal_reached[ids] = False
+        self.first_goal[ids] = -1
+        self.min_goal_dist[ids] = float("inf")
+        self.max_goal_down[ids] = -float("inf")
+        self.end_goal[ids] = float("nan")
+        # NOT `_goal_valid`: the anchor is refreshed by `refresh_goal_anchor` AFTER the clip
+        # reset commits the new clip, and clearing it here would only widen the window in
+        # which a stale anchor could be folded.

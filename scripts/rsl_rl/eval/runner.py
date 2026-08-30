@@ -230,10 +230,40 @@ class EvalResetHook:
                     assign_env_tiles(self.importer, self.levels, self.queue.env_column)
                     self.retargets += 1
         self.armed = True
-        return self.base_func(env, env_ids, command_name=command_name,
-                              base_frame_name=base_frame_name, asset_cfg=asset_cfg,
-                              pin_clip_ids=pin_clip_ids, pin_start_step=pin_start_step,
-                              spawn_z_offset=spawn_z_offset, clip_draw=clip_draw)
+        out = self.base_func(env, env_ids, command_name=command_name,
+                             base_frame_name=base_frame_name, asset_cfg=asset_cfg,
+                             pin_clip_ids=pin_clip_ids, pin_start_step=pin_start_step,
+                             spawn_z_offset=spawn_z_offset, clip_draw=clip_draw)
+        # AFTER the real reset, never before: the goal anchor is the newly committed clip's
+        # own terminal pose, and its tolerances are that clip's family's. Refreshing ahead of
+        # `base_func` would anchor every episode on its PREDECESSOR's clip -- a plausible
+        # region on the wrong tile, which no shape check could see.
+        self._refresh_goal(env, env_ids)
+        return out
+
+    def _refresh_goal(self, env, env_ids) -> None:
+        """Re-resolve the goal anchor and per-family tolerances for the envs that just reset.
+
+        A no-op unless a goal region was attached, so a run without one behaves exactly as
+        before rather than half-populating the goal columns.
+
+        Args:
+            env: The unwrapped env.
+            env_ids: The envs whose clip was just committed, or ``None`` for all.
+        """
+        if getattr(self.accum, "_gr", None) is None:
+            return
+        cmd = env.command_manager.get_term("traj_ref")
+        if env_ids is None:
+            ids = None
+            fams = [self.plan["clips"][int(c)]["family"] for c in cmd.clip_id.tolist()]
+        else:
+            ids = env_ids
+            picks = cmd.clip_id.detach().to("cpu").numpy()
+            fams = [self.plan["clips"][int(picks[int(e)])]["family"]
+                    for e in (env_ids.tolist() if hasattr(env_ids, "tolist") else env_ids)]
+        self.accum.set_goal_families(fams, env_ids=ids)
+        self.accum.refresh_goal_anchor(ids)
 
     def _harvest(self, env, env_ids, *, count_completion: bool = True) -> None:
         """Emit one row per ended episode and zero those accumulators.
@@ -494,6 +524,36 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
     else:
         notes["terminations_added"] = []
 
+    # --- the fall plane -------------------------------------------------------------------
+    # 0.50 m, the historical value, sits INSIDE jump_off_front's own reference envelope: the
+    # deepest clip's pelvis reaches 0.525 m and a well-tracking robot legitimately undershoots
+    # by up to 60 mm, so a correctly tracking robot is terminated there and anything fitted to
+    # those episodes learns the threshold rather than the fall. Recorded in the notes because
+    # a success rate is not comparable across two values of it.
+    fall_h = float(args.fall_min_height)
+    fallen = getattr(env_cfg.terminations, "base_fallen", None)
+    if fallen is None:
+        raise RuntimeError(
+            "the task has no `base_fallen` termination, so --fall_min_height has nothing to "
+            "set and the only failure term is missing. Check the task name.")
+    fallen.params["min_height"] = fall_h
+    notes["fall_min_height"] = fall_h
+
+    # The goal region travels with the table by PATH AND CONTENT HASH. The path alone rots
+    # (the same filename can hold different tolerances a week later) and the hash alone is
+    # unreadable, so both -- the same reason every artifact in this repo is fingerprinted.
+    notes["goal_regions"] = str(getattr(args, "goal_regions", "") or "")
+    if notes["goal_regions"]:
+        import hashlib  # noqa: PLC0415
+        with open(notes["goal_regions"], "rb") as f:
+            notes["goal_regions_sha256"] = hashlib.sha256(f.read()).hexdigest()[:12]
+        # An UNCALIBRATED spec must be visible in the table, not just in the file it came
+        # from: its reached_goal is 1 everywhere by construction, so a reader who reduced it
+        # would get 100% success from a tool working exactly as designed.
+        from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
+        _spec = goal_region.GoalRegionSpec.load(notes["goal_regions"])
+        notes["goal_regions_bootstrap"] = bool(_spec.provenance.get("bootstrap", False))
+
     # --- the clip reset's own knobs -------------------------------------------------------
     reset = env_cfg.events.reset_on_clip
     # -1 = do not pin; the command's own random_start_phase draws (and its min_start_step
@@ -605,7 +665,11 @@ def stage_cell(args) -> int:
         policy = runner.get_inference_policy(device=u.device)
 
         dt = float(u.step_dt)
-        accum = accumulate.EpisodeAccumulator(env, dt=dt)
+        # Same threshold the termination got, or the DERIVED fall flag and the term
+        # disagree about what a fall is -- which is what `_check_terminal_state`
+        # exists to detect and would then fire on every run.
+        accum = accumulate.EpisodeAccumulator(
+            env, dt=dt, fall_min_height=float(args.fall_min_height))
         capacity = int(cell["robots_per_clip"]) * len(clips) + int(args.num_envs)
         table = out_cell / "episodes.h5.inprogress"
         writer = schema.EpisodeTableWriter(str(table), capacity=capacity, meta={
@@ -620,6 +684,26 @@ def stage_cell(args) -> int:
                              queue=queue, accum=accum, writer=writer, plan=plan,
                              cell=cell, env_ref=u, importer=u.scene.terrain, levels=levels)
         u.event_manager.get_term_cfg("reset_on_clip").func = hook
+
+        # The SPATIAL success columns. Off unless a calibrated region was given: with none,
+        # every outcome in this table is a clip-cursor condition and `report.py` refuses to
+        # derive spatial success rather than falling back to the temporal rule.
+        if getattr(args, "goal_regions", ""):
+            from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
+            spec = goal_region.GoalRegionSpec.load(args.goal_regions)
+            accum.attach_goal_region(spec)
+            # The FIRST episode never passes through the reset hook -- the queue assigned its
+            # clip in its constructor and the pin list carried it into the config -- so its
+            # anchor has to be primed here or the whole first batch folds against a zero goal.
+            hook._refresh_goal(u, None)
+            print(f"[cell] goal region: {args.goal_regions} "
+                  f"(default margin {spec.default.approach_margin_m} m, "
+                  f"half-width {spec.default.half_width_m} m, "
+                  f"height {spec.default.height_tol_m} m; "
+                  f"{len(spec.by_family)} family override(s))")
+        else:
+            print("[cell] NO goal region: reached_goal will be 0 and the goal offsets NaN. "
+                  "report.py will refuse to derive spatial success from this table.")
 
         # Attach the plan classifier, when one was given and a generator is loaded. Never on
         # the clip arm: there is no plan to classify, and a zero count there is the honest
@@ -776,6 +860,9 @@ def stage_grid(args) -> int:
         # its argparse default in the subprocess. Measured, twice: --num_envs ran a grid at 256
         # while the manifest recorded 1024, and --terrain_ref produced 3950 episodes with
         # n_plans == 0 and no error anywhere.
+        if getattr(args, "goal_regions", ""):
+            cmd += ["--goal_regions", args.goal_regions]
+        cmd += ["--fall_min_height", str(args.fall_min_height)]
         if getattr(args, "terrain_ref", ""):
             cmd += ["--terrain_ref", args.terrain_ref]
         if getattr(args, "dump_flagged", 0):

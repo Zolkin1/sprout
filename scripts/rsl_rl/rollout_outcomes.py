@@ -1,0 +1,722 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""A closed-loop rollout's two tables: per-re-plan WINDOWS and per-episode OUTCOMES.
+
+``record_rollouts.py`` streams one window per generator re-plan.  Fitting a value function on
+those windows needs the thing a window cannot carry: **how the episode it belongs to ended**,
+which is not known until it does.  So a rollout writes two files, and this module owns both.
+
+**Windows are stored in the GENERATOR's own space, not the clip recorder's.**  That is the
+one structural decision here and it was reached by trying the other way first.
+``record_data.py`` writes 22 WORLD-frame state terms per node -- root pose, twist, joints, and
+four end-effector frames -- because a clip carries all of them and the dataset rebuilds a
+training window from them.  A generator predicts three BLOCKS
+(``base_pose, base_vel, joint_pos``) and no end effectors at all, so on an FM-driven rollout
+that format cannot be filled: ``get_future_world_frames`` refuses outright, and every array
+that survives is a lossy re-encoding of something the command already holds exactly.
+
+What it holds, at the instant of a re-plan, needing no reconstruction:
+
+===============================  ================================  ====================
+quantity                         source                            shape
+===============================  ================================  ====================
+history tokens                   ``_history.stack_padded("node")``  ``(N, 4, D)``
+exteroception actually served     ``_lagged_extero()``               ``(N, T, K)``
+command over the horizon          ``get_command_velocity_horizon``   ``(N, F, 3)``
+the emitted chunk                 ``_pred_window``                   ``(N, F, D)``
+the plan anchor                   ``_anchor_pos`` / ``_anchor_quat``  ``(N, 3)`` / ``(N, 4)``
+===============================  ================================  ====================
+
+Those five ARE the model's input and output.  Storing them is a record of what happened;
+storing the clip format would be a record of what a clip would have looked like.
+
+**The join key is ``episode_uid``, assigned at RESET**, and that is the whole reason this
+module exists rather than a few lines in the recorder:
+
+* ``collect_windows`` already keeps an ``episode_id``, but it is a per-ENV counter that starts
+  at the env index and steps by ``num_envs``; it says which episode of that env this was.
+* the eval accumulator's ``episode_id`` is assigned at HARVEST, from a global counter, in
+  whatever order envs happen to finish.
+
+Neither is the other, and joining a window table on one against an outcome table on the other
+lines up different episodes -- silently, and only for envs that have reset a different number
+of times, which is every env after the first few hundred steps.  One counter, written into
+both files, removes the class of bug rather than documenting it.
+
+**Outcomes are folded by** :class:`eval.accumulate.EpisodeAccumulator`, unchanged.  That is
+deliberate reuse and not convenience: it is where ``fell`` and the four goal columns are
+DEFINED, and a second implementation of "did this episode arrive" would be free to disagree
+with the one the eval harness reports.  What this module adds is the identity columns the eval
+gets from its plan (which a rollout has no equivalent of) and a writer sized to what a critic
+reads, rather than the eval's full 68-column contract.
+
+**The harvest has to happen inside the reset event.**  By the time ``env.step`` returns, the
+terminal state is gone -- the buffers already describe the next episode's spawn.  So this
+wraps ``reset_on_clip`` the way ``eval.runner.EvalResetHook`` does, for the same reason.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+import numpy as np
+import torch
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+for _d in (os.path.join(_HERE, "eval"), _HERE):
+    if _d not in sys.path:
+        sys.path.insert(0, _d)
+
+#: Bump on any column removal, rename or change of meaning.
+SCHEMA_VERSION: int = 1
+
+_F = "f4"
+_I = "i4"
+_L = "i8"
+_U8 = "u1"
+
+#: ``(name, dtype)`` per episode, in write order.
+#:
+#: A SUBSET of the eval's 68, chosen for what fitting a critic and computing a terminal reward
+#: actually read.  The eval's tracking and effort metrics are dropped: they describe how well
+#: a reference was followed, which is not what this table is for, and every one of them would
+#: have to be filled or explained.
+ROLLOUT_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
+    # --- identity / join ---------------------------------------------------------------
+    ("episode_uid", _L),          # THE join key; matches the window table's column
+    ("env_id", _I),
+    ("clip_id", _I),              # index into the library the rollout ran
+    ("terrain_id", _I),           # manifest tile id; -1 for flat
+    ("family_code", _U8),         # indexes the file's own `family_names` attr
+    ("start_step", _I),           # episodes may open mid-clip
+    ("last_usable_step", _I),     # what clip_end truncates at, lookahead reserve included
+    ("n_replans", _I),            # windows this episode contributed; the n-step join's bound
+    # --- outcome -----------------------------------------------------------------------
+    ("steps_survived", _I),
+    ("terminated", _U8),          # a FAILURE term fired (not a truncation)
+    ("truncated", _U8),           # clip_end / time_out
+    ("censored", _U8),            # still running when the rollout hit its ceiling
+    ("first_fall_step", _I),      # -1 = never crossed the fall predicate
+    ("min_base_height_w", _F),
+    ("max_tilt_rad", _F),
+    # --- the SPATIAL goal (mdp.goal_region) --------------------------------------------
+    ("reached_goal", _U8),
+    ("first_goal_step", _I),
+    ("min_dist_to_goal_m", _F),
+    ("goal_downrange_m", _F),
+    ("goal_lateral_m", _F),
+    ("goal_height_err_m", _F),
+    ("max_goal_downrange_m", _F),
+    # The region's own placement, so a viewer or a plot can DRAW it without re-running the
+    # sim. The anchor is the globally-placed clip's terminal base pose and the yaw is the
+    # terrain's authored heading; both are episode constants, and neither is recoverable
+    # from the offsets alone.
+    ("goal_pos_w_x", _F), ("goal_pos_w_y", _F), ("goal_pos_w_z", _F),
+    ("goal_frame_yaw", _F),
+    # The base was ALREADY inside the region on the episode's first folded step, so there was
+    # no task to do and the success is free. Recorded rather than silently dropped: it is a
+    # property of where the episode opened, and a fit that ignores it is training a critic on
+    # a large population of states labelled "success" that required nothing.
+    #
+    # Measured on a 298-episode rollout with the clip's own random start phase (start_step
+    # median 107, max 883): 81 of 197 arrivals -- 41% -- were this. `--start_step 0` is now
+    # the default for exactly that reason.
+    ("spawned_in_goal", _U8),
+    # How far the CLIP itself travels from where this episode opened to the goal. Negative
+    # means the goal is BEHIND the spawn, which a forward half-plane cannot express -- see
+    # `mdp.goal_region.goal_travel_m`. Recorded per episode so a library nobody has measured
+    # cannot hide the same defect the shipped one did.
+    ("goal_travel_m", _F),
+)
+
+ROLLOUT_COLUMN_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_EPISODE_COLUMNS)
+
+
+def terminal_reward(cols: dict[str, np.ndarray]) -> np.ndarray:
+    """The sparse terminal reward, stated once so every consumer reads the same rule.
+
+    Under the MDP this rollout serves: gamma = 1, reward zero everywhere but the terminal
+    step, and ``V(s) = -P(fail | s)``.  So::
+
+        r_T =  0   the base entered the goal region before it ever crossed the fall
+                   predicate
+        r_T = -1   otherwise -- fell first, or survived without arriving
+
+    The second clause is the load-bearing one.  If merely staying upright scored 0, standing
+    still would score identically to climbing the staircase with none of the risk, and an
+    operator that reshapes a generator toward high-scoring outcomes finds that immediately.
+    Arrival is what makes the reward un-gameable by waiting.
+
+    **Censored episodes are excluded by the caller, not scored here.**  An episode cut when
+    the rollout hit its step ceiling has no outcome -- it neither fell nor failed to arrive --
+    and scoring it -1 would teach the critic that whatever was happening at the ceiling
+    predicts failure, which is a property of the harness.
+
+    Args:
+        cols: Columns from :func:`read_rollout_episodes`.
+
+    Returns:
+        Float array in ``{-1.0, 0.0}``, one per episode.
+    """
+    arrived = np.asarray(cols["reached_goal"]).astype(bool)
+    fg = np.asarray(cols["first_goal_step"])
+    ff = np.asarray(cols["first_fall_step"])
+    # WHICHEVER CAME FIRST. An episode that reaches the goal and then falls in the run-out
+    # did the task; one that falls and is later dragged across the line by a reset did not.
+    # This is `mjeval`'s convention -- it tests `robot.failed()` before the target every step
+    # and breaks on either -- and it is worth 17 points here: measured on a 298-episode
+    # rollout, 51 episodes arrived and then fell, which a plain `arrived AND not terminated`
+    # scored as failures. That is larger than any policy difference this is meant to resolve.
+    fell_first = (ff >= 0) & ((fg < 0) | (ff < fg))
+    return np.where(arrived & ~fell_first, 0.0, -1.0).astype(np.float32)
+
+
+class RolloutOutcomeTable:
+    """Append-only per-episode accumulator, written once at the end.
+
+    Held in memory: a long rollout is tens of thousands of episodes of 22 small columns, a
+    few megabytes, so incremental appends would buy nothing and cost a torn file on an
+    interrupt.
+    """
+
+    def __init__(self, family_names: list[str] | None = None) -> None:
+        """Start an empty table.
+
+        Args:
+            family_names: ``family_names[code]`` for the ``family_code`` column, stored on
+                the file so a reader never has to guess what a code meant.
+        """
+        self._rows: list[dict] = []
+        self.family_names = list(family_names or ["unknown"])
+
+    def append_batch(self, batch: dict[str, np.ndarray]) -> int:
+        """Add one episode per element of ``batch``'s arrays.
+
+        Args:
+            batch: A dict whose keys are exactly :data:`ROLLOUT_COLUMN_NAMES`, each an array
+                of the same length.
+
+        Returns:
+            How many episodes were added.
+
+        Raises:
+            ValueError: On a missing or unexpected key, naming both sets, or on ragged
+                lengths.  Validated here rather than at write time so the failure points at
+                the batch that produced it rather than at the end of a multi-hour rollout.
+        """
+        want, got = set(ROLLOUT_COLUMN_NAMES), set(batch)
+        if want != got:
+            raise ValueError(
+                f"rollout episode batch does not match the schema: missing "
+                f"{sorted(want - got)}, unexpected {sorted(got - want)}")
+        lengths = {len(np.atleast_1d(v)) for v in batch.values()}
+        if len(lengths) != 1:
+            raise ValueError(f"ragged rollout episode batch: column lengths {lengths}")
+        n = lengths.pop()
+        for i in range(n):
+            self._rows.append({k: np.atleast_1d(batch[k])[i] for k in ROLLOUT_COLUMN_NAMES})
+        return n
+
+    def __len__(self) -> int:
+        """Episodes appended so far."""
+        return len(self._rows)
+
+    def write(self, path: str, attrs: dict | None = None) -> None:
+        """Write the table plus its provenance.
+
+        Args:
+            path: Destination ``.h5``.  Parent directories are created.
+            attrs: Run provenance; every value is JSON-encoded so nested dicts survive.
+        """
+        import h5py
+
+        os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+        with h5py.File(path, "w") as f:
+            for name, dtype in ROLLOUT_EPISODE_COLUMNS:
+                f.create_dataset(name, data=np.asarray([r[name] for r in self._rows],
+                                                       dtype=dtype))
+            f.attrs["schema_version"] = SCHEMA_VERSION
+            f.attrs["columns"] = json.dumps(list(ROLLOUT_COLUMN_NAMES))
+            f.attrs["family_names"] = json.dumps(self.family_names)
+            for key, value in (attrs or {}).items():
+                f.attrs[key] = json.dumps(value, default=str)
+
+
+def read_rollout_episodes(path: str) -> tuple[dict[str, np.ndarray], dict]:
+    """Read a table written by :meth:`RolloutOutcomeTable.write`.
+
+    Args:
+        path: The ``.h5``.
+
+    Returns:
+        ``(columns, attrs)``, attrs JSON-decoded.
+
+    Raises:
+        ValueError: On an unknown ``schema_version``.  Reading a renamed column as its old
+            self is worse than refusing.
+    """
+    import h5py
+
+    cols: dict[str, np.ndarray] = {}
+    attrs: dict = {}
+    with h5py.File(str(path), "r") as f:
+        version = int(f.attrs.get("schema_version", -1))
+        if version != SCHEMA_VERSION:
+            raise ValueError(
+                f"{path} is schema_version {version}; this reader knows {SCHEMA_VERSION}. "
+                "Re-record rather than reading it through the wrong contract.")
+        for key in f.keys():
+            cols[key] = f[key][...]
+        for key, raw in f.attrs.items():
+            if key == "schema_version":
+                attrs[key] = int(raw)
+                continue
+            try:
+                attrs[key] = json.loads(raw)
+            except (TypeError, ValueError):
+                attrs[key] = raw
+    return cols, attrs
+
+
+#: ``(name, dtype)`` per WINDOW, in write order.  Every one is the model's own input or
+#: output at a re-plan; nothing here is reconstructed.
+ROLLOUT_WINDOW_COLUMNS: tuple[tuple[str, str], ...] = (
+    # --- join keys ---------------------------------------------------------------------
+    ("episode_uid", _L),          # matches the outcome table's column
+    ("replan_index", _I),         # from 0, within the episode
+    ("env_id", _I),
+    ("clip_id", _I),
+    ("family_code", _U8),
+    # --- the conditioning: state s_t ----------------------------------------------------
+    ("history", "f4"),            # (N, num_history, D) -- the nodes it emitted before this
+    ("history_null", _U8),        # 1 while the ring is still filling; the learned null branch
+    ("extero", "f2"),             # (T, K) -- the reading ACTUALLY served, lag included
+    ("cmd_future", "f4"),         # (F, cmd_dim) -- the command over the horizon
+    ("depth_lag_used", _U8),      # lag served, in control steps
+    # --- the action a_t -----------------------------------------------------------------
+    ("fm_plan", "f4"),            # (F, D) -- the emitted chunk, in window space
+    # --- where it happened, for privileged critic features and diagnostics --------------
+    ("anchor_pos", "f4"),         # (3,) plan anchor, world
+    ("anchor_quat", "f4"),        # (4,) xyzw
+    ("clip_step", _I),
+    ("height_scan", "f2"),        # (K_scan,) privileged; empty when the task has no scanner
+    # --- where the goal is, from HERE. Privileged, and load-bearing for the critic --------
+    #
+    # A value function fitted with a sparse terminal goal reward cannot estimate P(fail)
+    # without knowing how far the goal is: two states that look identical to the generator
+    # are worth different amounts depending on whether the terrain is one metre ahead or
+    # eight. Omitting this makes V unpredictable BY CONSTRUCTION, and the resulting poor fit
+    # looks like the method failing rather than like a missing input.
+    #
+    # Recorded per window rather than derived later because deriving it needs the clip's
+    # world placement, which only exists inside the running sim.
+    ("goal_downrange_m", "f4"),   # + = past the goal anchor, in the TERRAIN frame
+    ("goal_lateral_m", "f4"),
+    ("goal_height_err_m", "f4"),
+)
+
+ROLLOUT_WINDOW_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_WINDOW_COLUMNS)
+
+#: Per-window columns small enough to load in full just to DECIDE what else to load.  Fitting
+#: a value function walks the join keys and the outcome; it touches an extero row only for
+#: the windows it actually trains on.
+ROLLOUT_WINDOW_INDEX: tuple[str, ...] = (
+    "episode_uid", "replan_index", "env_id", "clip_id", "family_code", "history_null",
+    "depth_lag_used", "clip_step",
+    "goal_downrange_m", "goal_lateral_m", "goal_height_err_m",
+)
+
+
+class RolloutWindowWriter:
+    """Streams per-re-plan windows to a chunked ``.h5``.
+
+    Pre-sized and written in place, like ``recorded_data_io.RecordedWindowWriter``: a rollout
+    is hours long and the extero rows alone are tens of gigabytes, so nothing is buffered
+    beyond one flush batch.
+
+    ``extero`` and ``height_scan`` are **float16**.  Both are sensor readings whose useful
+    precision is far coarser than f32 -- the depth row arrives already normalised and clipped
+    to a band of +-5.575, so f16's ~3 decimal digits resolve it to well under a millimetre at
+    the near plane -- and they are the whole file's size. Measured elsewhere in this repo:
+    lzf holds ~39x on f16 sensor data where it collapses to ~1.7x on f32 with mantissa
+    jitter.
+    """
+
+    def __init__(self, path: str, *, num_windows: int, num_history: int, state_dim: int,
+                 future_len: int, cmd_dim: int, extero_shape: tuple[int, int],
+                 scan_dim: int = 0, attrs: dict | None = None,
+                 compression: str | None = "lzf") -> None:
+        """Create the file and pre-size every dataset.
+
+        Args:
+            path: Destination ``.h5``.
+            num_windows: Upper bound on windows; the file records how many were written.
+            num_history: ``N``, history tokens per window.
+            state_dim: ``D``, the window node width.
+            future_len: ``F``, nodes the generator predicts.
+            cmd_dim: Command width.
+            extero_shape: ``(T, K)`` per reading, from the generator's own contract.
+            scan_dim: Privileged height-scan width, or 0 for none.
+            attrs: Provenance, JSON-encoded onto the root.
+            compression: h5py compression for every dataset.
+        """
+        import h5py
+
+        self.path = str(path)
+        self.num_windows = int(num_windows)
+        shapes = {
+            "episode_uid": (num_windows,), "replan_index": (num_windows,),
+            "env_id": (num_windows,), "clip_id": (num_windows,),
+            "family_code": (num_windows,), "history_null": (num_windows,),
+            "depth_lag_used": (num_windows,), "clip_step": (num_windows,),
+            "history": (num_windows, int(num_history), int(state_dim)),
+            "extero": (num_windows, int(extero_shape[0]), int(extero_shape[1])),
+            "cmd_future": (num_windows, int(future_len), int(cmd_dim)),
+            "fm_plan": (num_windows, int(future_len), int(state_dim)),
+            "anchor_pos": (num_windows, 3), "anchor_quat": (num_windows, 4),
+            "goal_downrange_m": (num_windows,), "goal_lateral_m": (num_windows,),
+            "goal_height_err_m": (num_windows,),
+        }
+        if int(scan_dim) > 0:
+            shapes["height_scan"] = (num_windows, int(scan_dim))
+        dtypes = dict(ROLLOUT_WINDOW_COLUMNS)
+        self._keys = list(shapes)
+        self._f = h5py.File(self.path, "w")
+        for key, shape in shapes.items():
+            self._f.create_dataset(key, shape=shape, dtype=dtypes[key],
+                                   chunks=_chunk(shape, dtypes[key]),
+                                   compression=compression)
+        self._f.attrs["schema_version"] = SCHEMA_VERSION
+        self._f.attrs["columns"] = json.dumps(self._keys)
+        for k, v in (attrs or {}).items():
+            self._f.attrs[k] = json.dumps(v, default=str)
+        self._f.attrs["num_windows"] = int(num_windows)
+        self._written = 0
+
+    @property
+    def written(self) -> int:
+        """Windows written so far."""
+        return self._written
+
+    def write_batch(self, batch: dict[str, np.ndarray]) -> int:
+        """Append a batch, truncating at ``num_windows``.
+
+        Args:
+            batch: One array per declared key, all the same leading length.
+
+        Returns:
+            How many rows were actually written (0 once the file is full).
+
+        Raises:
+            KeyError: On a missing declared key -- a silently absent column would read back
+                as zeros, which for ``fm_plan`` is a valid-looking window.
+        """
+        missing = [k for k in self._keys if k not in batch]
+        if missing:
+            raise KeyError(f"rollout window batch is missing {missing}")
+        n = len(np.atleast_1d(batch[self._keys[0]]))
+        take = min(n, self.num_windows - self._written)
+        if take <= 0:
+            return 0
+        lo, hi = self._written, self._written + take
+        for key in self._keys:
+            self._f[key][lo:hi] = np.asarray(batch[key])[:take]
+        self._written = hi
+        return take
+
+    def close(self) -> None:
+        """Record how many windows were written and close."""
+        if self._f is not None:
+            self._f.attrs["num_windows_written"] = int(self._written)
+            self._f.close()
+            self._f = None
+
+    def __enter__(self):
+        """Context manager entry."""
+        return self
+
+    def __exit__(self, *exc):
+        """Close on the way out, including on an exception."""
+        self.close()
+        return False
+
+
+def _chunk(shape: tuple[int, ...], dtype: str, target_bytes: int = 4 << 20) -> tuple[int, ...]:
+    """A chunk covering whole rows, ~``target_bytes`` at a time.
+
+    Args:
+        shape: The dataset shape.
+        dtype: Its dtype string.
+        target_bytes: Chunk size to aim for.
+
+    Returns:
+        The chunk shape.
+    """
+    row = int(np.prod(shape[1:])) * int(np.dtype(dtype).itemsize) if len(shape) > 1 else \
+        int(np.dtype(dtype).itemsize)
+    rows = max(1, min(int(shape[0]), max(1, target_bytes // max(row, 1)), 8192))
+    return (rows,) + tuple(int(s) for s in shape[1:])
+
+
+def read_rollout_windows(path: str, columns: list[str] | None = None
+                         ) -> tuple[dict[str, np.ndarray], dict]:
+    """Read a window table, optionally only some columns.
+
+    Args:
+        path: The ``.h5``.
+        columns: Columns to load; ``None`` loads all. Pass
+            :data:`ROLLOUT_WINDOW_INDEX` to walk the join keys without touching an image.
+
+    Returns:
+        ``(data, attrs)``, sliced to the number of windows actually written.
+
+    Raises:
+        ValueError: On an unknown ``schema_version``, or a requested column that is absent.
+    """
+    import h5py
+
+    data: dict[str, np.ndarray] = {}
+    attrs: dict = {}
+    with h5py.File(str(path), "r") as f:
+        version = int(f.attrs.get("schema_version", -1))
+        if version != SCHEMA_VERSION:
+            raise ValueError(
+                f"{path} is schema_version {version}; this reader knows {SCHEMA_VERSION}.")
+        n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+        want = list(columns) if columns is not None else [k for k in f.keys()]
+        absent = [c for c in want if c not in f]
+        if absent:
+            raise ValueError(f"{path} has no column(s) {absent}")
+        for key in want:
+            data[key] = f[key][:n]
+        for key, raw in f.attrs.items():
+            if key in ("schema_version", "num_windows", "num_windows_written"):
+                attrs[key] = int(raw)
+                continue
+            try:
+                attrs[key] = json.loads(raw)
+            except (TypeError, ValueError):
+                attrs[key] = raw
+    return data, attrs
+
+
+class RolloutEpisodeTracker:
+    """Owns the episode identity, folds outcomes, and harvests inside the clip reset.
+
+    Wraps ``events.reset_on_clip``'s function, exactly as ``eval.runner.EvalResetHook`` does
+    and for the same reason: the state of the episode that just ended is readable there and
+    nowhere else.  By the time ``env.step`` returns, the buffers describe the next spawn.
+
+    It also owns the two counters the window table joins on -- ``episode_uid`` (per episode,
+    global) and ``replan_index`` (per re-plan, within an episode).  Both live here rather than
+    in the recorder because they must be reset together and at the same instant: an episode
+    id bumped without its index, or the reverse, produces a table that joins to the wrong
+    rows for exactly one episode per env and reads correctly everywhere else.
+    """
+
+    def __init__(self, base_func, *, env, accum, table, family_codes=None,
+                 goal_spec=None) -> None:
+        """Install over a reset function.
+
+        Args:
+            base_func: The original ``reset_on_clip`` function.
+            env: The unwrapped env.
+            accum: An ``eval.accumulate.EpisodeAccumulator``.
+            table: A :class:`RolloutOutcomeTable`.
+            family_codes: Optional ``[num_clips]`` long tensor of family codes.
+            goal_spec: Optional ``mdp.goal_region.GoalRegionSpec``, already attached to
+                ``accum``; used here only to re-resolve per-family tolerances on reset.
+        """
+        self.base_func = base_func
+        self.env = env
+        self.accum = accum
+        self.table = table
+        self.family_codes = family_codes
+        self.goal_spec = goal_spec
+        n = int(env.num_envs)
+        dev = env.device
+        self.episode_uid = torch.arange(n, dtype=torch.long, device=dev)
+        self.replan_index = torch.zeros(n, dtype=torch.long, device=dev)
+        self._next_uid = int(n)
+        self.armed = False
+        self.harvested = 0
+        self._term_names: list[str] = []
+
+    # ------------------------------------------------------------------
+    def on_replan(self, idx: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+        """Claim ``(episode_uid, replan_index)`` for the envs emitting a window now.
+
+        Args:
+            idx: ``[k]`` env indices whose re-plan produced a window this step.
+
+        Returns:
+            ``(uid[k], replan_index[k])`` as numpy, BEFORE the index is bumped -- so the
+            first window of an episode is index 0.
+        """
+        uid = self.episode_uid[idx].detach().to("cpu").numpy().astype(np.int64)
+        ridx = self.replan_index[idx].detach().to("cpu").numpy().astype(np.int32)
+        self.replan_index[idx] += 1
+        return uid, ridx
+
+    def fold(self, dones) -> None:
+        """Fold one step, excluding envs that just reset.
+
+        Args:
+            dones: The step's done flags.
+        """
+        self.accum.fold(~dones.to(torch.bool))
+
+    # ------------------------------------------------------------------
+    def __call__(self, env, env_ids, **kwargs):
+        """Harvest the ending episodes, then delegate to the real clip reset."""
+        if self.armed and env_ids is not None and len(env_ids) > 0:
+            self._harvest(env, env_ids)
+        self.armed = True
+        out = self.base_func(env, env_ids, **kwargs)
+        # AFTER the reset commits the new clip: the goal anchor is that clip's own terminal
+        # pose and its tolerances are that clip's family's, so resolving either beforehand
+        # describes the PREVIOUS episode -- a plausible region on the wrong tile.
+        self._refresh_goal(env, env_ids)
+        return out
+
+    def _refresh_goal(self, env, env_ids) -> None:
+        """Re-resolve the goal anchor and per-family tolerances for the envs that reset."""
+        if getattr(self.accum, "_gr", None) is None:
+            return
+        if self.goal_spec is not None and self.family_codes is not None:
+            cmd = env.command_manager.get_term("traj_ref")
+            ids = (torch.arange(int(env.num_envs), device=cmd.clip_id.device)
+                   if env_ids is None else env_ids)
+            codes = self.family_codes[cmd.clip_id.to(self.family_codes.device)]
+            names = [self.table.family_names[int(c)]
+                     for c in codes[ids.to(codes.device)].tolist()]
+            self.accum.set_goal_families(_normalized(names), env_ids=ids)
+        self.accum.refresh_goal_anchor(env_ids)
+
+    def flush(self, env, env_ids) -> None:
+        """Harvest the episodes still in flight, marked censored.
+
+        Called once at the end of a rollout.  Those episodes did not finish, so their
+        outcome is not "failed to arrive" -- they have none, and
+        :func:`terminal_reward`'s caller drops them.
+
+        Args:
+            env: The unwrapped env.
+            env_ids: The envs still running.
+        """
+        if env_ids is not None and len(env_ids) > 0:
+            self._harvest(env, env_ids, censored=True)
+
+    # ------------------------------------------------------------------
+    def _harvest(self, env, env_ids, censored: bool = False) -> None:
+        """Emit one row per ended episode, zero those accumulators, and issue new uids."""
+        ids = env_ids if torch.is_tensor(env_ids) else torch.as_tensor(env_ids)
+        ids = ids.to(self.accum.device).long()
+        ids_np = ids.detach().to("cpu").numpy().astype(np.int64)
+        cmd = env.command_manager.get_term("traj_ref")
+        tm = env.termination_manager
+        if not self._term_names:
+            self._term_names = list(tm.active_terms)
+
+        # The terminal frame, before `snapshot` reduces. Without it the one frame that ENDED
+        # the episode -- for a fall, the frame that crossed the threshold -- is the one frame
+        # missing from every extreme.
+        from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
+
+        self.accum.fold_terminal(ids)
+        red = self.accum.snapshot(ids)
+        gp = self.accum._goal_pos_w[ids].detach().to("cpu").numpy()
+        travel = goal_region.goal_travel_m(cmd).detach().to("cpu").numpy()[ids_np]
+
+        truncated = tm.time_outs.detach().to("cpu").numpy().astype(bool)[ids_np]
+        terminated = tm.terminated.detach().to("cpu").numpy().astype(bool)[ids_np]
+
+        lu = goal_region.last_usable_step(cmd).detach().to("cpu").numpy()[ids_np]
+        clip_ids = cmd.clip_id.detach().to("cpu").numpy().astype(np.int64)[ids_np]
+        lib = cmd.manager.lib
+        tid = getattr(lib, "terrain_id", None)
+        terrain = (tid.detach().to("cpu").numpy()[clip_ids].astype(np.int64)
+                   if tid is not None and tid.numel() else np.full(ids_np.size, -1))
+        fam = (self.family_codes.detach().to("cpu").numpy()[clip_ids]
+               if self.family_codes is not None else np.zeros(ids_np.size))
+
+        self.table.append_batch({
+            "episode_uid": self.episode_uid[ids].detach().to("cpu").numpy(),
+            "env_id": ids_np,
+            "clip_id": clip_ids,
+            "terrain_id": terrain,
+            "family_code": fam,
+            "start_step": cmd.start_step.detach().to("cpu").numpy()[ids_np],
+            "last_usable_step": lu,
+            "n_replans": self.replan_index[ids].detach().to("cpu").numpy(),
+            "steps_survived": red["steps_survived"],
+            "terminated": terminated.astype(np.uint8),
+            "truncated": truncated.astype(np.uint8),
+            "censored": np.full(ids_np.size, int(bool(censored)), dtype=np.uint8),
+            "first_fall_step": red["first_fall_step"],
+            "min_base_height_w": red["min_base_height_w"],
+            "max_tilt_rad": red["max_tilt_rad"],
+            "reached_goal": red["reached_goal"],
+            "first_goal_step": red["first_goal_step"],
+            "min_dist_to_goal_m": red["min_dist_to_goal_m"],
+            "goal_downrange_m": red["goal_downrange_m"],
+            "goal_lateral_m": red["goal_lateral_m"],
+            "goal_height_err_m": red["goal_height_err_m"],
+            "max_goal_downrange_m": red["max_goal_downrange_m"],
+            "goal_pos_w_x": gp[:, 0], "goal_pos_w_y": gp[:, 1], "goal_pos_w_z": gp[:, 2],
+            "goal_frame_yaw": self.accum._goal_yaw[ids].detach().to("cpu").numpy(),
+            # `first_goal_step == 1` is the first FOLDED step: `EpisodeAccumulator.fold`
+            # increments its counter before the goal fold runs, so arrival is 1-based and 0
+            # means "never".
+            "spawned_in_goal": (red["first_goal_step"] == 1).astype(np.uint8),
+            "goal_travel_m": travel,
+        })
+        self.harvested += ids_np.size
+        self.accum.reset_envs(ids)
+        self.reissue(ids)
+
+    def reissue(self, ids: torch.Tensor) -> None:
+        """Give ``ids`` fresh identities: a new uid each, and a re-plan index back at 0.
+
+        Split out of :meth:`_harvest` so the invariant is testable without a simulator.
+        BOTH counters, in one call, always: a uid bumped without its index makes the first
+        windows of the new episode claim indices continuing the previous one, and an index
+        reset without a uid makes two episodes share a key. Either way the tables still join
+        -- to the wrong rows, for exactly the envs that reset, which is the subset most
+        likely to be interesting.
+
+        Args:
+            ids: ``[k]`` env indices that just ended an episode.
+        """
+        k = int(ids.numel())
+        if k == 0:
+            return
+        self.episode_uid[ids] = torch.arange(self._next_uid, self._next_uid + k,
+                                             dtype=torch.long, device=self.episode_uid.device)
+        self._next_uid += k
+        self.replan_index[ids] = 0
+
+
+def _normalized(names: list[str]) -> list[str]:
+    """Strip the ``family_`` prefix and any ``.h5`` suffix, as the eval's sampler does.
+
+    The clip library spells a family ``family_stairs_up`` (and, for a composed library,
+    ``family_stairs_up.h5``); ``goal_regions.json`` is keyed the way
+    ``eval.sampler.normalize_family`` returns it.  Deliberately re-implemented in one line
+    rather than importing the eval's sampler, which would pull its whole clip-index module in
+    for a string strip.
+
+    Args:
+        names: Raw family names.
+
+    Returns:
+        Normalised names.
+    """
+    out = []
+    for n in names:
+        n = str(n)
+        n = n[:-3] if n.endswith(".h5") else n
+        out.append(n[len("family_"):] if n.startswith("family_") else n)
+    return out

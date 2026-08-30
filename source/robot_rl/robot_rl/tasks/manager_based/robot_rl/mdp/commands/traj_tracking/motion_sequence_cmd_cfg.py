@@ -174,6 +174,33 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     """Radius (m) of the tracked-body spheres."""
 
     debug_vis_obs_window: bool = True
+
+    #: Path to a ``goal_regions.json`` (see ``scripts/rsl_rl/build_goal_regions.py``). When
+    #: set, the debug visualiser draws each env's GOAL REGION as a translucent gate: a slab
+    #: at the region's near face, spanning its lateral band and its height band, square to
+    #: the terrain frame.
+    #:
+    #: This exists to be LOOKED AT before anything is measured. The region is the only
+    #: spatial success test in the tracker task -- every other outcome signal compares step
+    #: indices -- and the ways it can be subtly wrong all produce a perfectly plausible
+    #: number: the wrong yaw frame shows only on tiles whose heading is not world-x, an
+    #: anchor taken at the clip's padded tail rather than at ``last_usable_step`` sits a
+    #: whole observation window too far downrange, and a band whose height is off puts the
+    #: gate under the terrain. None of those is visible in a table.
+    #:
+    #: **The DEFAULT tolerances are drawn, not any per-family override.** The thing worth
+    #: eyeballing is the anchor and the frame, which are family-independent; read the JSON
+    #: for a family's own numbers.
+    #:
+    #: **``play.py`` needs ``--viz kit``.** This IsaacLab defaults to headless ("No
+    #: visualizer was selected, so running in headless mode"), and headless never fires
+    #: ``_debug_vis_callback`` at all -- so the gate silently does not draw, along with every
+    #: other debug marker. That reads exactly like a region placed somewhere off screen,
+    #: which is the one conclusion this visualiser must not allow. ``--video`` does not
+    #: substitute: it renders offscreen without firing the callback either.
+    #:
+    #: Empty = off, which is every existing task.
+    debug_vis_goal_regions: str = ""
     """Draw a ribbon along the base of the reference window the POLICY observes.
 
     Distinct from the clip ribbon, which is drawn at the clip's GLOBAL placement: this one

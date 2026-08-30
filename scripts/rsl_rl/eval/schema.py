@@ -39,7 +39,7 @@ import numpy as np
 #: cell written under a different major, and the reducer refuses a file it does not know.
 SCHEMA_VERSION: int = 2
 #: Bump on a purely additive column.  A reader may ignore columns it does not know.
-SCHEMA_MINOR: int = 0
+SCHEMA_MINOR: int = 1
 
 _F = "f4"
 _I = "i4"
@@ -82,6 +82,28 @@ EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("terrain_end_reached", _U8),
     ("terrain_completed", _U8),
     ("terrain_progress", _F),    # NaN without a pinned span
+    # --- the SPATIAL goal (mdp.goal_region) --------------------------------------------
+    #
+    # Every column ABOVE this block is a clip-CURSOR condition: `steps_survived` against a
+    # step index. None of them can tell a robot that climbed the staircase from one that
+    # stood still while the cursor ran out, so none of them can carry a success rule for a
+    # method that reshapes the generator toward "outcomes that score well" -- standing still
+    # would be a trivially reachable optimum. These are the columns that answer "did it
+    # physically get there".
+    #
+    # `reached_goal` is evaluated per STEP against the run's own `goal_regions.json` (an
+    # episode that arrives and then wanders back out still arrived). The three raw terminal
+    # offsets are stored BESIDE it so a recalibration of the tolerances can be checked, and
+    # so `build_goal_regions.py` has something to fit -- that is the whole reason the
+    # tolerances are an artifact and not constants.
+    ("reached_goal", _U8),
+    ("first_goal_step", _I),      # -1 = never entered
+    ("min_dist_to_goal_m", _F),   # 0 inside; separates a near-miss timeout from a stall
+    ("goal_downrange_m", _F),     # terminal, terrain frame; + = past the clip's own endpoint
+    ("goal_lateral_m", _F),       # terminal, terrain frame
+    ("goal_height_err_m", _F),    # terminal; + = above. The limb that catches a robot that
+                                  # walked off an elevated tile onto the floor downrange of it
+    ("max_goal_downrange_m", _F), # furthest downrange reached, the progress analogue
     # --- commanded-velocity tracking ---------------------------------------------------
     ("vel_mse_vx", _F), ("vel_mse_vy", _F), ("vel_mse_wz", _F),
     ("vel_maxabs_vx", _F), ("vel_maxabs_vy", _F), ("vel_maxabs_wz", _F),
@@ -140,6 +162,8 @@ COLUMN_UNITS: dict[str, str] = {
     "max_tilt_rad": "rad", "end_tilt_rad": "rad",
     "torque_rms": "N*m", "mech_work_j": "J", "distance_m": "m",
     "foot_slip_dist_m": "m",
+    "min_dist_to_goal_m": "m", "goal_downrange_m": "m", "goal_lateral_m": "m",
+    "goal_height_err_m": "m", "max_goal_downrange_m": "m",
 }
 
 #: The fall predicate applied to the recorded extremes.

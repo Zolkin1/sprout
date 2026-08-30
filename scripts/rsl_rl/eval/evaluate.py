@@ -30,6 +30,7 @@ import argparse
 import datetime
 import glob
 import json
+import os
 import pathlib
 import re
 import sys
@@ -180,6 +181,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "given fall back to the built-in defaults")
 
     g = p.add_argument_group("env")
+    g.add_argument("--goal_regions", default="",
+                   help="goal_regions.json from build_goal_regions.py. Turns on the SPATIAL "
+                        "success columns (reached_goal / min_dist_to_goal_m / the three "
+                        "terminal offsets). WITHOUT it every outcome signal in the table is a "
+                        "clip-CURSOR condition -- `clip_end` and every terrain_* column "
+                        "compare step indices -- and none of them can tell a robot that "
+                        "climbed the staircase from one that stood still while the cursor ran "
+                        "out. Empty = off, and report.py then refuses to derive spatial "
+                        "success rather than silently falling back to the temporal rule.")
+    g.add_argument("--fall_min_height", type=float, default=0.40,
+                   help="base_fallen's world-z threshold, m. 0.40 rather than the historical "
+                        "0.50: the deepest jump_off_front clip's own pelvis reaches 0.525 m "
+                        "and a well-tracking robot legitimately undershoots its reference by "
+                        "up to 60 mm, so at 0.50 a CORRECTLY tracking robot is terminated and "
+                        "any critic fitted to those episodes learns the threshold rather than "
+                        "the fall. Numbers at 0.40 are not comparable with the published "
+                        "0.50 ones; re-run both arms.")
     g.add_argument("--terrain_ref", default="",
                    help="terrain_class.py reference .npz; classifies every FM re-plan as "
                         "flat/jump/stairs and counts them per episode. Ignored on the clip "
@@ -237,11 +255,24 @@ def resolve_checkpoint(args) -> str:
     if not args.load_run:
         raise SystemExit("plan needs --checkpoint or --load_run")
     root = pathlib.Path("logs") / "rsl_rl" / args.experiment_name / args.load_run
-    models = sorted(glob.glob(str(root / "model_*.pt")),
-                    key=lambda s: int(re.search(r"model_(\d+)\.pt$", s).group(1)))
-    if not models:
-        raise SystemExit(f"no model_*.pt under {root}")
-    return str(pathlib.Path(models[-1]).resolve())
+    # The glob is wider than the key can parse: a run directory legitimately holds
+    # `model_19999_padded.pt` (pad_critic_for_finetune.py writes one), and keying on
+    # `model_(\d+)\.pt$` returned None for it and died with a bare AttributeError pointing
+    # at a lambda. FILTER on the same pattern the key reads, so an unparsable name is simply
+    # not a candidate -- picking the highest iteration is the whole job, and a name that does
+    # not state an iteration cannot be the highest one.
+    numbered = []
+    for path in glob.glob(str(root / "model_*.pt")):
+        m = re.search(r"model_(\d+)\.pt$", path)
+        if m is not None:
+            numbered.append((int(m.group(1)), path))
+    if not numbered:
+        extras = sorted(os.path.basename(p) for p in glob.glob(str(root / "model_*.pt")))
+        raise SystemExit(
+            f"no model_<iteration>.pt under {root}"
+            + (f" (found {extras}, none of which states an iteration; pass --checkpoint)"
+               if extras else ""))
+    return str(pathlib.Path(max(numbered)[1]).resolve())
 
 
 def fm_contract(path: str) -> dict:

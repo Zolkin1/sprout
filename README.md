@@ -370,6 +370,93 @@ python scripts/rsl_rl/eval/report.py logs/terrain_eval/<name>
 python scripts/rsl_rl/eval/report.py logs/terrain_eval/{a,b}   # comparison
 ```
 
+#### Success is SPATIAL, and the goal region is a measured artifact
+
+`clip_end` and every `terrain_*` column compare STEP INDICES, so a success rule built on them
+means "stayed upright for N steps", not "got anywhere" -- a robot that stalls in place, lags
+several metres behind, or drifts laterally off the flight scores one. `--goal_regions` adds the
+test that cannot be passed by waiting: a **downrange half-plane** at the clip's own endpoint,
+intersected with a **lateral band** and a **height band**, all in the terrain's own frame. The
+height band is not optional -- a robot that walks off the side of an elevated tile lands ~0.79 m
+up, which does not trip a 0.40 m absolute fall test, and would otherwise score as having climbed
+the staircase it fell off.
+
+The tolerances are FITTED from where surviving clip-arm episodes actually end, so the region can
+never be tighter than the tracker's own demonstrated ability and a miss is the generator's:
+
+```bash
+# 0a. an UNCALIBRATED spec, so the geometry gets recorded and the gate can be SEEN
+python scripts/rsl_rl/build_goal_regions.py --write_bootstrap logs/terrain_eval/<name>/goal_regions.bootstrap.json
+
+# 0b. LOOK AT IT. `--viz kit` is required: this IsaacLab defaults to headless, which never
+#     fires the debug-vis callback, so the gate silently does not draw.
+python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play --viz kit \
+    --load_run <teacher run> --fm_checkpoint <fm.pt> --clip <lib> --clip_device cpu \
+    env.commands.traj_ref.debug_vis_goal_regions=logs/terrain_eval/<name>/goal_regions.bootstrap.json
+
+# 0c. run the CLIP arm against it, then fit the real spec from where it finished
+python scripts/rsl_rl/eval/evaluate.py --stage grid --out logs/terrain_eval/<name> \
+    --goal_regions logs/terrain_eval/<name>/goal_regions.bootstrap.json --cells clip/train
+python scripts/rsl_rl/build_goal_regions.py logs/terrain_eval/<name> \
+    --out logs/terrain_eval/<name>/goal_regions.json
+```
+
+Then pass `--goal_regions .../goal_regions.json` to every cell. Three refusals guard the path,
+each because the alternative is a confident wrong number:
+
+* a table with no `reached_goal` column is **refused** under the spatial rule rather than
+  reduced under the temporal one (`--success_rule legacy_temporal` reads it explicitly);
+* a table whose column is zero everywhere -- what a cell run without `--goal_regions` looks
+  like -- is refused rather than reported as 0.000 success;
+* a table run under the **bootstrap** spec is refused, because its tolerances are placeholders.
+
+#### Recording closed-loop rollouts (`record_rollouts.py`)
+
+For fitting a value function on the generator's own behaviour, `scripts/rsl_rl/record_rollouts.py`
+rolls the frozen pair out and writes **two** tables:
+
+```bash
+PYTHONPATH=source/robot_rl:source/motion_gen python scripts/rsl_rl/record_rollouts.py \
+    --task=G1-tracker-clf-fm-terrain-depth-play \
+    --load_run <teacher run> --fm_checkpoint <fm.pt> \
+    --clip clips/<lib>.h5 --clip_device cpu \
+    --goal_regions logs/terrain_eval/<name>/goal_regions.json \
+    --num_envs 256 --num_windows 200000 --output_dir logs/rollouts/<name>
+```
+
+* `<stem>.h5` — one row per generator **re-plan**: the history tokens, the exteroception row
+  actually served (lag included), the command over the horizon, and the emitted chunk. All in
+  the generator's own window space, so nothing is reconstructed.
+* `<stem>.episodes.h5` — one row per **episode**: how it ended, including the spatial goal
+  columns. `rollout_outcomes.terminal_reward` states the reward rule in one place.
+
+The two join on **`episode_uid`**, assigned at reset and written into both. That column exists
+because the repo already had two episode counters and they are not each other — `collect_windows`
+keeps a per-ENV one, the eval accumulator assigns its own at harvest — so joining on either
+lines up different episodes, silently, for every env that has reset a different number of times.
+
+This is deliberately **not** `record_data.py`. That script records the TEACHER tracking clips
+and its node is 22 world-frame terms including four end-effector frames; a generator predicts
+three blocks and no end effectors, so on an FM-driven rollout that format cannot be filled
+(`get_future_world_frames` refuses outright).
+
+Two settings are asserted rather than defaulted, because each is silent when wrong:
+
+* **Gaussian flow noise.** At `x0 = 0` — the default in every deploy runtime and in MuJoCo —
+  the flow is deterministic, so every chunk drawn at a given state is identical and `A(s, a)`
+  collapses to `A(s)`: the label would say how hard the STATE was and nothing about which
+  ACTION was better. Isaac already defaults to Gaussian; the recorder makes it a property of
+  the recording.
+* **A calibrated (non-bootstrap) goal region**, for the reason in the previous section.
+
+Measured on the shipped pair: **24.3 kB per window** (f16 exteroception and height scan, f32
+plan), so ~6 GB per 250k windows.
+
+`--fall_min_height` defaults to **0.40 m**, not the historical 0.50. The deepest
+`jump_off_front` clip's own pelvis reaches 0.525 m and a well-tracking robot undershoots its
+reference by up to 60 mm, so at 0.50 a correctly tracking robot is terminated. **Numbers at the
+two thresholds are not comparable**; re-run both arms.
+
 `--quick` (3 tiles/family, 1 clip/tile) smoke-tests the whole pipeline in a couple of minutes.
 
 **A cell is `(reference_mode, dr_preset, fm_label)`.** `--fm_checkpoint` is repeatable, and the

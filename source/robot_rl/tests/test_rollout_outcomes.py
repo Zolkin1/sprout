@@ -1,0 +1,323 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""Pin the rollout outcome table, and above all the JOIN KEY.
+
+A closed-loop rollout writes two files: one row per generator re-plan, and one row per
+episode. An advantage label is a function of both, so the key that joins them is the single
+thing most able to produce a table that is well formed, reduces without error, and describes
+something that never happened.
+
+There were already two episode counters in the repo and they are not each other:
+
+* ``collect_windows``' ``episode_id`` is per ENV -- it starts at the env index and steps by
+  ``num_envs``, so it says which episode of that env this was;
+* ``eval.accumulate``'s is assigned at HARVEST from a global counter, in whatever order envs
+  happen to finish.
+
+Joining a window table on one against an outcome table on the other lines up different
+episodes, for every env that has reset a different number of times -- which after a few
+hundred steps is all of them. ``episode_uid`` exists so there is one counter, and these tests
+are what stop it drifting back into two.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import sys
+
+import numpy as np
+import pytest
+
+_HERE = pathlib.Path(__file__).resolve()
+_SCRIPTS = _HERE.parents[3] / "scripts" / "rsl_rl"
+if str(_SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS))
+
+import rollout_outcomes as ro  # noqa: E402
+
+
+def _row(**over):
+    """One episode row with every column present, overridable."""
+    base = {
+        "episode_uid": 0, "env_id": 0, "clip_id": 0, "terrain_id": -1, "family_code": 0,
+        "start_step": 0, "last_usable_step": 300, "n_replans": 25,
+        "steps_survived": 299, "terminated": 0, "truncated": 1, "censored": 0,
+        "first_fall_step": -1, "min_base_height_w": 0.75, "max_tilt_rad": 0.1,
+        "reached_goal": 1, "first_goal_step": 200, "min_dist_to_goal_m": 0.0,
+        "goal_downrange_m": 0.0, "goal_lateral_m": 0.0, "goal_height_err_m": 0.0,
+        "max_goal_downrange_m": 0.0,
+        "goal_pos_w_x": 0.0, "goal_pos_w_y": 0.0, "goal_pos_w_z": 0.0,
+        "goal_frame_yaw": 0.0, "spawned_in_goal": 0, "goal_travel_m": 5.0,
+    }
+    base.update(over)
+    return {k: np.asarray([v]) for k, v in base.items()}
+
+
+# ----------------------------------------------------------------------------------------
+# The reward. Every clause here is a way the method fails if it is wrong.
+# ----------------------------------------------------------------------------------------
+
+def test_arriving_upright_is_the_only_zero_reward():
+    t = ro.RolloutOutcomeTable()
+    t.append_batch(_row(reached_goal=1, terminated=0))
+    cols = {k: np.asarray([r[k] for r in t._rows]) for k in ro.ROLLOUT_COLUMN_NAMES}
+    assert ro.terminal_reward(cols).tolist() == [0.0]
+
+
+def test_a_free_success_is_flagged_rather_than_hidden():
+    """An episode already inside the goal on its first step had no task to do.
+
+    Measured with the clip's random start phase on, 41% of arrivals were this -- episodes
+    opening at or past the clip's own endpoint. They are still scored a success (the rule is
+    the rule) but the flag is what lets a fit drop them, and what makes the contamination
+    visible instead of silent.
+    """
+    t = ro.RolloutOutcomeTable()
+    t.append_batch(_row(reached_goal=1, first_goal_step=1, spawned_in_goal=1))
+    cols = {k: np.asarray([r[k] for r in t._rows]) for k in ro.ROLLOUT_COLUMN_NAMES}
+    assert ro.terminal_reward(cols).tolist() == [0.0]
+    assert cols["spawned_in_goal"].tolist() == [1]
+
+
+def test_surviving_without_arriving_is_a_FAILURE():
+    """The stall clause, and the single most important line in the reward.
+
+    If merely staying upright scored 0, standing still would score identically to climbing
+    the staircase with none of the risk -- and an operator that reshapes a generator toward
+    high-scoring outcomes finds that immediately. The generator is conditioned on a velocity
+    command but nothing forces it to obey one.
+    """
+    t = ro.RolloutOutcomeTable()
+    t.append_batch(_row(reached_goal=0, first_goal_step=-1, terminated=0, truncated=1,
+                        steps_survived=299))
+    cols = {k: np.asarray([r[k] for r in t._rows]) for k in ro.ROLLOUT_COLUMN_NAMES}
+    assert ro.terminal_reward(cols).tolist() == [-1.0]
+
+
+def test_falling_BEFORE_arriving_is_a_failure():
+    """Fell at step 40, dragged over the line later -- that is not doing the task."""
+    t = ro.RolloutOutcomeTable()
+    t.append_batch(_row(reached_goal=1, terminated=1, first_fall_step=40, first_goal_step=90))
+    cols = {k: np.asarray([r[k] for r in t._rows]) for k in ro.ROLLOUT_COLUMN_NAMES}
+    assert ro.terminal_reward(cols).tolist() == [-1.0]
+
+
+def test_arriving_BEFORE_falling_is_a_SUCCESS():
+    """Reached the goal at step 90, fell in the run-out at 140. The task was done.
+
+    Worth 17 points on real data: of 298 finished episodes in one rollout, 51 arrived and
+    then fell. Scoring those as failures -- which `arrived AND not terminated` does -- moved
+    the measured success rate 48.0% -> 65.1%, which is far larger than any policy difference
+    this is meant to resolve. `mjeval` has always used the first-event rule (it tests
+    `robot.failed()` before the target each step and breaks on either).
+    """
+    t = ro.RolloutOutcomeTable()
+    t.append_batch(_row(reached_goal=1, terminated=1, first_goal_step=90, first_fall_step=140))
+    cols = {k: np.asarray([r[k] for r in t._rows]) for k in ro.ROLLOUT_COLUMN_NAMES}
+    assert ro.terminal_reward(cols).tolist() == [0.0]
+
+
+def test_never_arriving_is_a_failure_however_it_ended():
+    t = ro.RolloutOutcomeTable()
+    for kw in ({"terminated": 1, "first_fall_step": 40}, {"terminated": 0, "truncated": 1}):
+        t.append_batch(_row(reached_goal=0, first_goal_step=-1, **kw))
+    cols = {k: np.asarray([r[k] for r in t._rows]) for k in ro.ROLLOUT_COLUMN_NAMES}
+    assert ro.terminal_reward(cols).tolist() == [-1.0, -1.0]
+
+
+def test_reward_does_not_read_steps_survived():
+    """Duration is not evidence of anything here; if this fails a temporal term crept in."""
+    t = ro.RolloutOutcomeTable()
+    t.append_batch(_row(reached_goal=1, terminated=0, steps_survived=5))
+    t.append_batch(_row(reached_goal=1, terminated=0, steps_survived=999))
+    cols = {k: np.asarray([r[k] for r in t._rows]) for k in ro.ROLLOUT_COLUMN_NAMES}
+    assert ro.terminal_reward(cols).tolist() == [0.0, 0.0]
+
+
+# ----------------------------------------------------------------------------------------
+# The table contract.
+# ----------------------------------------------------------------------------------------
+
+def test_a_missing_column_is_refused_naming_both_sets():
+    t = ro.RolloutOutcomeTable()
+    bad = _row()
+    del bad["reached_goal"]
+    with pytest.raises(ValueError, match="missing.*reached_goal"):
+        t.append_batch(bad)
+
+
+def test_an_unexpected_column_is_refused():
+    t = ro.RolloutOutcomeTable()
+    bad = _row()
+    bad["something_new"] = np.asarray([1])
+    with pytest.raises(ValueError, match="unexpected.*something_new"):
+        t.append_batch(bad)
+
+
+def test_a_ragged_batch_is_refused():
+    t = ro.RolloutOutcomeTable()
+    bad = _row()
+    bad["env_id"] = np.asarray([0, 1])
+    with pytest.raises(ValueError, match="ragged"):
+        t.append_batch(bad)
+
+
+def test_round_trip_through_h5(tmp_path):
+    t = ro.RolloutOutcomeTable(family_names=["unknown", "family_stairs_up"])
+    t.append_batch(_row(episode_uid=7, family_code=1, reached_goal=0))
+    t.append_batch(_row(episode_uid=8, family_code=1, reached_goal=1))
+    path = str(tmp_path / "episodes.h5")
+    t.write(path, attrs={"goal_regions": "/tmp/x.json"})
+    cols, attrs = ro.read_rollout_episodes(path)
+    assert cols["episode_uid"].tolist() == [7, 8]
+    assert cols["reached_goal"].tolist() == [0, 1]
+    assert attrs["family_names"] == ["unknown", "family_stairs_up"]
+    assert attrs["goal_regions"] == "/tmp/x.json"
+    assert ro.terminal_reward(cols).tolist() == [-1.0, 0.0]
+
+
+def test_a_foreign_schema_version_is_refused(tmp_path):
+    import h5py
+    path = str(tmp_path / "old.h5")
+    with h5py.File(path, "w") as f:
+        f.attrs["schema_version"] = 99
+    with pytest.raises(ValueError, match="schema_version 99"):
+        ro.read_rollout_episodes(path)
+
+
+# ----------------------------------------------------------------------------------------
+# Family normalisation: goal_regions.json is keyed the way the eval's sampler spells it.
+# ----------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raw,want", [
+    ("family_stairs_up", "stairs_up"),
+    ("family_stairs_up.h5", "stairs_up"),
+    ("stairs_up", "stairs_up"),
+    ("unknown", "unknown"),
+])
+def test_family_names_normalise_the_way_the_eval_spells_them(raw, want):
+    assert ro._normalized([raw]) == [want]
+
+
+def test_normalisation_matches_the_evals_own_sampler():
+    """One spelling, checked against the definition rather than restated.
+
+    `goal_regions.json` is written keyed by `eval.sampler.normalize_family`'s output, so a
+    second normaliser that disagrees would silently hand every family the DEFAULT tolerances
+    -- which is a plausible region, on every tile, and invisible in the table.
+    """
+    sampler = pytest.importorskip("sampler")
+    raws = ["family_stairs_up", "family_stairs_up.h5", "family_jump_off_front", "unknown"]
+    assert ro._normalized(raws) == [sampler.normalize_family(r) for r in raws]
+
+
+# ----------------------------------------------------------------------------------------
+# The join invariant. This is the failure that produces a table which reduces without error
+# and describes episodes that never happened.
+# ----------------------------------------------------------------------------------------
+
+class _FakeEnv:
+    """The two attributes the tracker reads at construction."""
+
+    def __init__(self, n):
+        self.num_envs = n
+        self.device = "cpu"
+
+
+class _FakeAccum:
+    device = "cpu"
+
+
+def _tracker(n=4):
+    return ro.RolloutEpisodeTracker(
+        base_func=lambda *a, **k: None, env=_FakeEnv(n), accum=_FakeAccum(),
+        table=ro.RolloutOutcomeTable())
+
+
+def test_replan_index_starts_at_zero_and_counts_up():
+    import torch
+    t = _tracker(4)
+    ids = torch.tensor([0, 1])
+    for expect in (0, 1, 2):
+        _, ridx = t.on_replan(ids)
+        assert ridx.tolist() == [expect, expect]
+
+
+def test_on_replan_returns_the_index_BEFORE_bumping():
+    """The first window of an episode must be index 0, not 1.
+
+    An off-by-one here shifts every n-step advantage by one re-plan, which is a quarter of a
+    second of look-ahead silently attributed to the wrong chunk.
+    """
+    import torch
+    t = _tracker(2)
+    _, first = t.on_replan(torch.tensor([0]))
+    assert first.tolist() == [0]
+
+
+def test_reissue_moves_BOTH_counters():
+    import torch
+    t = _tracker(4)
+    ids = torch.tensor([1, 2])
+    t.on_replan(ids)
+    t.on_replan(ids)
+    assert t.replan_index[ids].tolist() == [2, 2]
+    before = t.episode_uid[ids].tolist()
+    t.reissue(ids)
+    assert t.replan_index[ids].tolist() == [0, 0], "index not reset -> keys continue the old episode"
+    assert t.episode_uid[ids].tolist() != before, "uid not bumped -> two episodes share a key"
+
+
+def test_uids_are_never_reused():
+    """Every episode across the whole rollout needs its own key, not just every env."""
+    import torch
+    t = _tracker(4)
+    seen = set(t.episode_uid.tolist())
+    for _ in range(50):
+        ids = torch.tensor([0, 3])
+        t.reissue(ids)
+        new = t.episode_uid[ids].tolist()
+        assert not (seen & set(new)), f"uid reused: {sorted(seen & set(new))}"
+        seen |= set(new)
+    assert len(seen) == 4 + 100
+
+
+def test_untouched_envs_keep_their_identity_across_a_partial_reset():
+    """Resets are per-env. Reissuing the whole batch would orphan every running episode."""
+    import torch
+    t = _tracker(4)
+    t.on_replan(torch.tensor([0, 1, 2, 3]))
+    before_uid = t.episode_uid.tolist()
+    before_idx = t.replan_index.tolist()
+    t.reissue(torch.tensor([2]))
+    assert t.episode_uid[[0, 1, 3]].tolist() == [before_uid[i] for i in (0, 1, 3)]
+    assert t.replan_index[[0, 1, 3]].tolist() == [before_idx[i] for i in (0, 1, 3)]
+    assert t.replan_index[2].item() == 0
+
+
+def test_reissue_of_nothing_is_a_no_op():
+    import torch
+    t = _tracker(4)
+    before = (t.episode_uid.tolist(), t._next_uid)
+    t.reissue(torch.tensor([], dtype=torch.long))
+    assert (t.episode_uid.tolist(), t._next_uid) == before
+
+
+def test_goal_travel_is_recorded_so_a_backwards_family_cannot_hide():
+    """A negative travel means the goal sits BEHIND where the episode opened.
+
+    A forward half-plane cannot express that, so the robot is inside it on step 1 and stays
+    there. Measured on the shipped library: `jump_off` travels -0.41 m and 80% of its
+    episodes scored a free success, while `jump_on` travels +2.68 m and none did. Recording
+    the travel is what makes that visible on a library nobody has measured yet -- it was
+    found the first time by drawing six episodes and looking.
+    """
+    t = ro.RolloutOutcomeTable()
+    t.append_batch(_row(goal_travel_m=-0.41, spawned_in_goal=1, first_goal_step=1))
+    t.append_batch(_row(goal_travel_m=2.68, spawned_in_goal=0, first_goal_step=180))
+    cols = {k: np.asarray([r[k] for r in t._rows]) for k in ro.ROLLOUT_COLUMN_NAMES}
+    assert cols["goal_travel_m"].tolist() == pytest.approx([-0.41, 2.68])
+    # Both still score successes -- the rule is the rule. The flag and the travel are what
+    # say the first one meant nothing.
+    assert ro.terminal_reward(cols).tolist() == [0.0, 0.0]
+    assert cols["spawned_in_goal"].tolist() == [1, 0]

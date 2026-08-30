@@ -1337,3 +1337,129 @@ def test_stage_grid_forwards_every_flag_the_cell_stage_reads():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ==========================================================================================
+# The SPATIAL success rule.
+#
+# Everything the table stores about an outcome, apart from the goal columns, is a clip-CURSOR
+# condition: `clip_end_reached` fires on a step index and every `terrain_*` column compares
+# `steps_survived` against one.  So a success rule built on them means "stayed upright for N
+# steps", not "got anywhere" -- and a robot that stalls in place scores one.  These tests pin
+# that the rule does not quietly go back to that.
+# ==========================================================================================
+
+import report  # noqa: E402
+
+
+def _fake_cell(n=4, *, reached=None, fell_bits=None, with_goal=True, steps=None):
+    """A minimal cell dict shaped like `load_cell`'s output.
+
+    Only the columns `derived_columns` reads are present; anything it starts reading that is
+    absent here fails loudly, which is the intent.
+    """
+    z = lambda: np.zeros(n)  # noqa: E731
+    d = {
+        "termination_bits": (np.zeros(n, dtype=np.uint16) if fell_bits is None
+                             else np.asarray(fell_bits, dtype=np.uint16)),
+        "admin_censored": np.zeros(n, dtype=np.uint8),
+        "min_base_height_w": np.full(n, 0.75),
+        "max_tilt_rad": z(),
+        "terrain_end_reached": np.ones(n, dtype=np.uint8),
+        "terrain_completed": np.ones(n, dtype=np.uint8),
+        "terrain_progress": np.ones(n),
+        "vel_mse_vx": z(), "vel_mse_vy": z(), "vel_mse_wz": z(),
+        "ref_joint_pos_mse": z(), "ref_base_ori_mse_rad": z(),
+        "cost_of_transport": z(), "torque_util_max": z(), "action_rate_mean": z(),
+        "steps_survived": (np.full(n, 300) if steps is None else np.asarray(steps)),
+        "last_usable_step": np.full(n, 300),
+        "event_observed": np.zeros(n, dtype=np.uint8),
+        "terrain_end_step": np.full(n, 200),
+    }
+    if with_goal:
+        d["reached_goal"] = (np.ones(n, dtype=np.uint8) if reached is None
+                             else np.asarray(reached, dtype=np.uint8))
+        d["min_dist_to_goal_m"] = z()
+    meta = {"cell": "fm__train__x", "termination_terms": ["time_out", "clip_end", "base_fallen"]}
+    return {"data": d, "meta": meta}
+
+
+def test_a_robot_that_survived_but_never_arrived_is_NOT_a_success():
+    """The stall case. Every temporal column here says the episode went perfectly."""
+    cell = _fake_cell(n=4, reached=[1, 1, 0, 0])
+    out = report.derived_columns(cell, {}, "spatial")
+    assert out["success"].tolist() == [1.0, 1.0, 0.0, 0.0]
+    # ...and the temporal rule calls all four a success, which is the defect.
+    assert report.derived_columns(cell, {}, "legacy_temporal")["success"].tolist() == [1.0] * 4
+
+
+def test_arriving_does_not_rescue_an_episode_that_fell():
+    """Success is `arrived AND not failed`, not `arrived`."""
+    bits = np.zeros(3, dtype=np.uint16)
+    bits[1] = 1 << 2                       # base_fallen, index 2 in termination_terms
+    out = report.derived_columns(_fake_cell(3, reached=[1, 1, 1], fell_bits=bits), {}, "spatial")
+    assert out["success"].tolist() == [1.0, 0.0, 1.0]
+
+
+def test_success_does_not_depend_on_steps_survived():
+    """The property the whole module exists for, stated directly.
+
+    Two episodes identical except in how long they lasted must score the same, because
+    duration is not evidence of arrival.  If this fails, a temporal term has crept back in.
+    """
+    long_ep = report.derived_columns(_fake_cell(2, reached=[1, 0], steps=[300, 300]), {},
+                                     "spatial")["success"]
+    short_ep = report.derived_columns(_fake_cell(2, reached=[1, 0], steps=[7, 7]), {},
+                                      "spatial")["success"]
+    assert long_ep.tolist() == short_ep.tolist() == [1.0, 0.0]
+
+
+def test_a_table_without_the_goal_columns_is_REFUSED_not_reduced():
+    """Not a fallback. A spatial claim resting on a temporal measurement is the defect."""
+    with pytest.raises(ValueError, match="no `reached_goal` column"):
+        report.derived_columns(_fake_cell(with_goal=False), {}, "spatial")
+    # ...and is readable under the explicit legacy rule, which is what it is for.
+    assert report.derived_columns(_fake_cell(with_goal=False), {},
+                                  "legacy_temporal")["success"].tolist() == [1.0] * 4
+
+
+def test_an_all_zero_goal_column_is_refused_rather_than_reported_as_zero_success():
+    """A cell run without --goal_regions has the column and never populates it.
+
+    That is indistinguishable here from a policy that never arrived, so reporting 0.000
+    success would be a confident wrong number -- the exact failure mode a missing artifact
+    should never be able to produce.
+    """
+    with pytest.raises(ValueError, match="zero on every one of its"):
+        report.derived_columns(_fake_cell(4, reached=[0, 0, 0, 0]), {}, "spatial")
+
+
+def test_reached_goal_is_reported_beside_success_only_under_the_spatial_rule():
+    spatial = report.derived_columns(_fake_cell(2, reached=[1, 0]), {}, "spatial")
+    assert spatial["reached_goal"].tolist() == [1.0, 0.0]
+    legacy = report.derived_columns(_fake_cell(2, reached=[1, 0]), {}, "legacy_temporal")
+    assert "reached_goal" not in legacy, (
+        "an all-ones reached_goal under the legacy rule would state that every episode "
+        "arrived, when nothing measured whether any of them did")
+
+
+def test_an_unknown_success_rule_is_refused():
+    with pytest.raises(ValueError, match="unknown success_rule"):
+        report.derived_columns(_fake_cell(), {}, "whatever_looks_best")
+
+
+def test_a_bootstrap_table_is_refused_rather_than_reported():
+    """Placeholder tolerances must not be able to produce a success rate.
+
+    A bootstrap run's `reached_goal` is measured against tolerances that were guessed, so its
+    success column is a number produced by a tool working exactly as designed and meaning
+    nothing. It is the one case where the columns are all present and the answer is still not
+    usable, which is why the refusal keys on provenance rather than on the data.
+    """
+    cell = _fake_cell(4, reached=[1, 1, 0, 1])
+    cell["meta"]["overrides"] = {"goal_regions_bootstrap": True}
+    with pytest.raises(ValueError, match="BOOTSTRAP goal region"):
+        report.derived_columns(cell, {}, "spatial")
+    # A fitted spec on the same data reduces fine.
+    cell["meta"]["overrides"] = {"goal_regions_bootstrap": False}
+    assert report.derived_columns(cell, {}, "spatial")["success"].tolist() == [1.0, 1.0, 0.0, 1.0]

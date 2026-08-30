@@ -183,7 +183,11 @@ class ClipTerrainImporter(TerrainImporter):
             flat_buffer=cfg.flat_buffer, transition_back_buffer=cfg.transition_back_buffer,
         )
         self.import_mesh("terrain", mesh)
-        self._import_decor(layout.decor_mesh)
+        # `render_decor=False` takes the same path an undecorated library takes, rather
+        # than a second one: `create_decor_prim(None, ...)` writes the placeholder, so
+        # /World/decor exists either way and the depth cameras keep their target prim.
+        self._import_decor(layout.decor_mesh if getattr(cfg, "render_decor", True)
+                           else None)
         # Base curriculum origin distribution: terrain_levels (rows) + terrain_types
         # (columns == tiles); env_origins = origins[level, type] = tile center.
         self.configure_env_origins(origins)

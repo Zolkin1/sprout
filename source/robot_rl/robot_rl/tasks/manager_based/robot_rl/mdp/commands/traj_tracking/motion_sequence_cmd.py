@@ -75,6 +75,15 @@ _DEBUG_OBS_WINDOW_COLOR: tuple[float, float, float] = (1.00, 0.95, 0.20)  # yell
 # debug ribbon unless cfg.debug_vis_show_hands is True).
 _DEBUG_HAND_FRAME_KEYS: tuple[str, ...] = ("wrist", "hand")
 _DEBUG_VIZ_PRIM_PATH: str = "/Visuals/motion_seq_ref"
+#: Own prim path for the goal gate, so toggling it cannot disturb the reference ribbon's
+#: prototype list -- the ribbon indexes prototypes POSITIONALLY, and appending one there
+#: would silently recolour every frame.
+_DEBUG_GOAL_PRIM_PATH: str = "/Visuals/motion_seq_goal"
+#: Cyan; nothing else in the scene uses it.
+_DEBUG_GOAL_COLOR: tuple[float, float, float] = (0.15, 0.85, 0.95)
+#: Thickness of the drawn gate along downrange, metres. It is a HALF-PLANE, not a slab -- the
+#: robot may be anywhere past it -- so this is a legible face, not the region's extent.
+_DEBUG_GOAL_FACE_M: float = 0.08
 _DEBUG_BODY_VIZ_PRIM_PATH: str = "/Visuals/motion_seq_bodies"
 _DEBUG_VIZ_EPS: float = 1e-6  # guard against zero-length segments / degenerate axes
 
@@ -89,6 +98,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
     _debug_markers: object | None = None
     _debug_body_markers: object | None = None
     _debug_vis_pending: bool = False
+    _goal_markers = None
+    _goal_spec = "unset"
 
     # ------------------------------------------------------------------
     # Construction
@@ -1253,7 +1264,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
                 self._debug_body_markers.set_visibility(True)
         else:
             self._debug_vis_pending = False
-            for m in (self._debug_markers, self._debug_body_markers):
+            for m in (self._debug_markers, self._debug_body_markers, self._goal_markers):
                 if m is not None:
                     m.set_visibility(False)
 
@@ -1293,6 +1304,86 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         except Exception as exc:
             print(f"[WARN MotionSequenceCommand] could not create VisualizationMarkers: {exc}")
             return None
+
+    def _create_goal_markers(self):
+        """Build the goal-gate marker set: one translucent cuboid prototype."""
+        try:
+            import isaaclab.sim as sim_utils
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+        except Exception as exc:  # sim not up yet
+            print(f"[WARN MotionSequenceCommand] no VisualizationMarkers for the goal: {exc}")
+            return None
+        cfg = VisualizationMarkersCfg(
+            prim_path=_DEBUG_GOAL_PRIM_PATH,
+            markers={"goal_gate": sim_utils.CuboidCfg(
+                size=(1.0, 1.0, 1.0),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=_DEBUG_GOAL_COLOR, opacity=0.25),
+            )},
+        )
+        try:
+            return VisualizationMarkers(cfg)
+        except Exception as exc:
+            print(f"[WARN MotionSequenceCommand] could not create the goal markers: {exc}")
+            return None
+
+    def _load_goal_spec(self):
+        """Load (once) the goal spec named by ``cfg.debug_vis_goal_regions``.
+
+        Returns:
+            The spec, or ``None`` when the cfg names no file.  A named file that cannot be
+            read RAISES rather than silently drawing nothing: a gate that quietly fails to
+            appear reads exactly like a region correctly placed off-screen, which is the one
+            reading this visualiser must never allow.
+        """
+        if self._goal_spec != "unset":
+            return self._goal_spec
+        path = str(getattr(self.cfg, "debug_vis_goal_regions", "") or "")
+        if not path:
+            self._goal_spec = None
+            return None
+        from ...goal_region import GoalRegionSpec  # noqa: PLC0415
+
+        self._goal_spec = GoalRegionSpec.load(path)
+        t = self._goal_spec.default
+        print(f"[MotionSequenceCommand] goal gate from {path}: margin "
+              f"{t.approach_margin_m:.2f} m, half-width {t.half_width_m:.2f} m, height "
+              f"{t.height_tol_m:.2f} m (the DEFAULT tolerances; per-family overrides are "
+              f"not drawn)")
+        return self._goal_spec
+
+    def _draw_goal_gate(self) -> None:
+        """Draw one gate per env at its goal region's near face.
+
+        The region is a downrange half-plane intersected with a lateral band and a height
+        band, so what is drawn is the FACE the robot has to cross: a thin slab spanning both
+        bands, centred on the boundary, square to the terrain frame.  Everything past it is
+        inside.
+        """
+        spec = self._load_goal_spec()
+        if spec is None:
+            return
+        if self._goal_markers is None:
+            self._goal_markers = self._create_goal_markers()
+            if self._goal_markers is None:
+                return
+        from ...goal_region import goal_anchor_world  # noqa: PLC0415
+
+        pos, yaw = goal_anchor_world(self)
+        t = spec.default
+        # The boundary sits `approach_margin_m` SHORT of the clip's own endpoint, along the
+        # terrain frame's downrange axis -- not along world x, which is the same thing only
+        # on tiles that happen to face that way.
+        back = float(t.approach_margin_m)
+        centre = pos.clone()
+        centre[:, 0] -= back * torch.cos(yaw)
+        centre[:, 1] -= back * torch.sin(yaw)
+        quat = quat_from_angle_axis(yaw, self._world_z.expand(yaw.shape[0], 3))
+        scales = torch.tensor(
+            [_DEBUG_GOAL_FACE_M, 2.0 * float(t.half_width_m), 2.0 * float(t.height_tol_m)],
+            device=pos.device).expand(pos.shape[0], 3)
+        self._goal_markers.set_visibility(True)
+        self._goal_markers.visualize(translations=centre, orientations=quat, scales=scales)
 
     def _create_debug_body_markers(self):
         """Build the tracked-body sphere markers: prototype 0 = measured, 1 = reference."""
@@ -1461,6 +1552,12 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """
         if not self._scene_alive():
             return
+        # BEFORE the ribbon, and on its own markers: the goal region has nothing to do with
+        # the reference frames, and everything below here returns early in two cases (no
+        # ribbon markers yet, and a command with no debug frames at all). Drawn from inside
+        # that flow, an absent gate would be indistinguishable from a correctly-placed one
+        # off screen -- which is the single reading this visualiser exists to prevent.
+        self._draw_goal_gate()
         if self._debug_markers is None:
             if not self._debug_vis_pending:
                 return

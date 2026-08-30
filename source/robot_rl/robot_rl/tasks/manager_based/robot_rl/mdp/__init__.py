@@ -45,6 +45,20 @@ from .observations.height_scan import (  # noqa: F401
     scan_obs_stack,
 )
 from .terminations.terminations import *  # noqa: F401, F403
+# The SPATIAL success test. Deliberately its own module and not part of `terminations`:
+# it is recorded as columns and reduced offline, never wired as a DoneTerm, because the
+# tolerances are a measured artifact that will want recalibrating and baking them into a
+# termination would force a full re-collection every time they moved.
+from .goal_region import (  # noqa: F401
+    KNOWN_FAMILIES,
+    GoalRegionSpec,
+    GoalTolerances,
+    goal_anchor_world,
+    goal_distance_m,
+    goal_frame_offsets,
+    in_goal,
+    last_usable_step,
+)
 from .commands import *  # noqa: F401, F403
 from .events.physical_randomization import *  # noqa: F401, F403
 from .events.resets import *  # noqa: F401, F403
