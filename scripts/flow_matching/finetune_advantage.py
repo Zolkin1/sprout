@@ -53,7 +53,9 @@ for _p in (os.path.join(_ROOT, "source", "robot_rl"), os.path.join(_ROOT, "sourc
         sys.path.insert(0, _p)
 
 from robot_rl.flow_matching import online  # noqa: E402
-from robot_rl.flow_matching.advantage import LABEL_NAMES, LABEL_NULL  # noqa: E402
+from robot_rl.flow_matching.advantage import (  # noqa: E402
+    LABEL_NAMES, LABEL_NULL, label_from_name,
+)
 from robot_rl.flow_matching.config import FlowMatchingConfig  # noqa: E402
 from robot_rl.flow_matching.ema import WeightEMA  # noqa: E402
 from robot_rl.flow_matching.flow import flow_matching_loss, sample_trajectory  # noqa: E402
@@ -368,19 +370,52 @@ def main() -> int:
                   os.path.join(args.out, "best.pt"))
             if val is not None:
                 rec["is_best"] = True
+    # SERVABLE copies, one per arm. `best.pt` names no arm, deliberately -- a conditioned
+    # checkpoint that does not state one is refused at load, so nothing (an Isaac eval, a
+    # probe, a play run) can serve an arm by accident. These two say which they are, in the
+    # artifact, exactly as `fm_meta.advantage_label` does on the ONNX side.
+    for name in ("positive", "negative"):
+        stamp_serve_label(os.path.join(args.out, "best.pt"),
+                          os.path.join(args.out, f"best_{name}.pt"), name)
+        print(f"[ft] wrote {args.out}/best_{name}.pt")
     with open(os.path.join(args.out, "finetune.json"), "w") as f:
         json.dump({"args": vars(args), "history": history,
                    "label_counts": train_ds.label_counts()}, f, indent=2)
     if wb is not None:
         wb.finish()
     print(f"[ft] wrote {args.out}/best.pt")
-    print("[ft] NEXT, before any sweep: export BOTH labels and compare them.\n"
-          f"     python scripts/flow_matching/export_fm_onnx.py {args.out}/best.pt "
-          "--advantage_label positive ...\n"
-          f"     python scripts/flow_matching/export_fm_onnx.py {args.out}/best.pt "
-          "--advantage_label negative ...\n"
-          "     If the two perform the same, the model ignored the label.")
+    print("[ft] NEXT, before any sweep: run BOTH arms and compare them.\n"
+          f"     Isaac:  --fm_checkpoint pos={args.out}/best_positive.pt "
+          f"neg={args.out}/best_negative.pt\n"
+          f"     ONNX :  export_fm_onnx.py --checkpoint {args.out}/best.pt "
+          "--advantage_label positive|negative\n"
+          "     If the two perform the same, the model ignored the label and every other "
+          "number here is noise.")
     return 0
+
+
+def stamp_serve_label(src: str, dst: str, label: str) -> None:
+    """Copy a conditioned checkpoint, naming the arm it serves.
+
+    The label is not recoverable from the weights -- one parameter set answers to all three --
+    so it has to travel in the artifact, the same way ``attention_mode`` and ``extero_clip``
+    already do and for the same reason. A consumer then reads which arm it holds instead of
+    being told at the call site, where it could be told wrongly.
+
+    Args:
+        src: The unlabelled checkpoint.
+        dst: Where to write the labelled copy.
+        label: One of :data:`~robot_rl.flow_matching.advantage.LABEL_NAMES`.
+
+    Raises:
+        ValueError: On an unrecognised label, or a checkpoint with no label embedding.
+    """
+    label_from_name(label)
+    ck = torch.load(src, map_location="cpu", weights_only=False)
+    if not ck["config"].get("advantage_cond"):
+        raise ValueError(f"{src} is not advantage-conditioned; there is no arm to name.")
+    ck["config"]["advantage_serve_label"] = label
+    torch.save(ck, dst)
 
 
 def _save(args, cfg, model, opt, ema, epoch: int, history: list, path: str) -> None:

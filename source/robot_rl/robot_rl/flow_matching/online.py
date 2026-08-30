@@ -26,6 +26,7 @@ import torch
 
 from .config import FlowMatchingConfig
 from .flow import sample_trajectory
+from .advantage import label_from_name
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import sanitize_extero
@@ -299,6 +300,15 @@ class FmOnlineContext:
     latency the generator expects instead of feeding it a fresh frame it never saw in
     training. Hardware must ignore it -- the lag there is physical and already in the frames.
     """
+    advantage_label: int | None = None
+    """Which advantage label this context SERVES, as an index into ``advantage.LABEL_NAMES``.
+
+    ``None`` for an unconditioned generator.  For a conditioned one it is never ``None``:
+    :func:`load_fm_context` refuses a checkpoint that does not state an arm, because ``null``
+    and ``positive`` are both valid and a default would make the deliverable and its own
+    control indistinguishable at the call site.  :func:`sample_window` is the single place it
+    is applied, so simulation cannot serve a different arm from the one the artifact names.
+    """
     extero_image_hw: list[tuple[int, int]] | None = None
     """Per-sensor ``(height, width)`` the exteroception row folds into, or ``None``.
 
@@ -529,6 +539,7 @@ def load_fm_context(
     zero_noise: bool = False,
     guidance_scale: float = 1.0,
     use_ema: bool = True,
+    advantage_label: str | None = None,
 ) -> FmOnlineContext:
     """Load a flow-matching checkpoint into an inference-ready context.
 
@@ -543,6 +554,11 @@ def load_fm_context(
         map_location: ``torch.load`` map location when ``checkpoint`` is a path.
         zero_noise: Sample deterministically from ``x0 = 0`` (see :class:`FmOnlineContext`).
         guidance_scale: Classifier-free guidance weight over the history (1.0 = off).
+        advantage_label: Override which arm of an advantage-conditioned checkpoint to serve
+            (``"positive"`` / ``"negative"`` / ``"null"``).  Normally left ``None`` so the
+            ARTIFACT decides, via its own ``advantage_serve_label``; the override exists for
+            the exporter and for a diagnostic that sweeps arms from one file.  Supplying it
+            for an unconditioned checkpoint is refused, since it would be silently dropped.
         use_ema: Load the averaged ``model_ema`` weights when the checkpoint has them
             (the default, since they are what training selected ``best.pt`` on and what
             would be deployed). Set False to inspect the raw weights instead. Checkpoints
@@ -647,6 +663,30 @@ def load_fm_context(
             "  Under extero_norm_mode='contract' the run's own extero_xyz_envelope decides it: "
             "5.0 comes only from 5.575, 3.5 only from 2.0."
         )
+    # WHICH ARM this context serves. A conditioned checkpoint must SAY: `null` and `positive`
+    # are both valid labels, so a default would quietly turn the deliverable into a control
+    # (or the reverse) with nothing in the run to show it. Same rule the ONNX exporter applies,
+    # and the same reason -- the two graphs are otherwise identical on disk.
+    serve_label = None
+    if getattr(cfg, "advantage_cond", False):
+        name = advantage_label or getattr(cfg, "advantage_serve_label", None)
+        if name is None:
+            raise ValueError(
+                "this checkpoint is advantage-conditioned but does not say WHICH arm to "
+                "serve, and there is no safe default -- `null` and `positive` are both real "
+                "labels, so guessing would silently swap the deliverable for a control.\n"
+                "  Stamp it into the artifact (what the fine-tune writes as "
+                "best_<label>.pt):\n"
+                "    ck = torch.load(<ckpt>, map_location='cpu', weights_only=False)\n"
+                "    ck['config']['advantage_serve_label'] = 'positive'\n"
+                "    torch.save(ck, <ckpt-positive>)\n"
+                "  or pass advantage_label= explicitly, which is what export_fm_onnx does.")
+        serve_label = label_from_name(name)
+    elif advantage_label is not None:
+        raise ValueError(
+            f"advantage_label={advantage_label!r} was given but this checkpoint has no label "
+            "embedding (advantage_cond=False), so it would be silently dropped.")
+
     cmd_steps = list(range(0, cfg.future_len, cfg.cmd_stride))
     return FmOnlineContext(
         model=model, state_norm=state_norm, cmd_norm=cmd_norm,
@@ -677,6 +717,7 @@ def load_fm_context(
         extero_clip=cfg.extero_clip,
         depth_latency_probs=(tuple(float(p) for p in cfg.depth_latency_probs)
                              if cfg.depth_latency_probs else None),
+        advantage_label=serve_label,
     )
 
 
@@ -787,10 +828,17 @@ def sample_window(
     """
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
+    # The label the ARTIFACT names, applied here and nowhere else, so simulation cannot serve
+    # a different arm from the one the checkpoint states. `None` on a conditioned model would
+    # resolve to `null` inside the model, which is a third arm rather than "unconditioned" --
+    # load_fm_context refuses to let that happen by accident.
+    adv = (None if ctx.advantage_label is None
+           else torch.tensor([ctx.advantage_label], dtype=torch.long, device=history.device))
     pred_std = sample_trajectory(ctx.model, history, extero, cmd_tokens, ctx.F, ctx.D,
                                  ctx.num_steps, history_null_mask=history_null_mask,
                                  zero_noise=ctx.zero_noise,
-                                 guidance_scale=ctx.guidance_scale, noise=noise)
+                                 guidance_scale=ctx.guidance_scale, noise=noise,
+                                 advantage=adv)
     # Project the rotation block back onto SO(3): the model emits 6 free numbers, and the
     # served window is both a reference pose and the next step's history token. The exported
     # ONNX module does the same, so sim and deploy agree.

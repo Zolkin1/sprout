@@ -724,6 +724,18 @@ class FlowMatchingConfig:
     # would refuse it, and that refusal is the correct behaviour rather than a nuisance.
     advantage_cond: bool = False
 
+    # WHICH label a conditioned checkpoint is SERVED with in simulation. `advantage_cond`
+    # says the model can take a label; this says which one to ask for, and it travels in the
+    # artifact for the same reason `attention_mode` and `extero_clip` do -- a label is not
+    # recoverable from the weights, and serving the wrong one produces a perfectly plausible
+    # generator that is simply not the arm you meant to measure.
+    #
+    # It is the `.pt` twin of `fm_meta.advantage_label`, which the ONNX export bakes into the
+    # graph. `load_fm_context` REFUSES a conditioned checkpoint that does not state one
+    # rather than defaulting: `null` and `positive` are both valid arms, so a default would
+    # make the deliverable and a control indistinguishable at the call site.
+    advantage_serve_label: str | None = None
+
     # -- observation noise (train-time augmentation on the clean history tokens) --
     # Mirrors the RL teacher/tracker obs corruption (Unoise per term): the inputs the
     # generator conditions on at deployment come from noisy sensors, so the first

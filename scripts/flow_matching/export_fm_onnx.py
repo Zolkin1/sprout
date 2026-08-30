@@ -41,7 +41,7 @@ import onnx
 import torch
 import torch.nn as nn
 
-from robot_rl.flow_matching.advantage import label_from_name
+from robot_rl.flow_matching.advantage import LABEL_NAMES, label_from_name
 from robot_rl.flow_matching.window import project_window_rotations, window_blocks
 from robot_rl.flow_matching.online import load_fm_context, FmOnlineContext
 
@@ -384,21 +384,27 @@ def export_fm_onnx(
         ValueError: On a non-command-conditioned checkpoint, or on a privileged-exteroception
             checkpoint without the override.
     """
-    ctx = load_fm_context(checkpoint, device="cpu")
+    # The label goes to the LOADER too, not just the wrapper: a conditioned checkpoint with
+    # no `advantage_serve_label` is refused at load, and the exporter is exactly the caller
+    # that legitimately states the arm on the command line instead of reading it off the file.
+    ctx = load_fm_context(checkpoint, device="cpu", advantage_label=advantage_label)
     if ctx.cmd_dim <= 0:
         raise ValueError("export_fm_onnx expects a command-conditioned checkpoint (cmd_dim>0).")
     _refuse_privileged_extero(ctx, checkpoint, allow_privileged_extero)
     conditioned = ctx.model.advantage_emb is not None
-    if conditioned and advantage_label is None:
+    if conditioned and advantage_label is None and ctx.advantage_label is None:
         raise ValueError(
             "this checkpoint is advantage-conditioned, so the graph must state WHICH arm it "
             "is: pass --advantage_label {positive,negative,null}. Defaulting would make the "
             "deliverable and its own control indistinguishable on disk.")
-    if advantage_label is not None and not conditioned:
-        raise ValueError(
-            f"--advantage_label {advantage_label!r} was given but this checkpoint has no "
-            "label embedding (advantage_cond=False), so the label would be silently dropped.")
-    label_id = None if advantage_label is None else label_from_name(advantage_label)
+    # An unconditioned checkpoint given a label already failed at load, above.
+    # Falling back to the artifact's own arm keeps `export_fm_onnx <best_positive.pt>` working
+    # without restating what the file already says.
+    label_id = ctx.advantage_label
+    if advantage_label is not None:
+        label_id = label_from_name(advantage_label)
+    if label_id is not None:
+        advantage_label = LABEL_NAMES[label_id]
     wrapper = _FmSamplerOnnx(ctx, label_id).eval()
 
     v, n, f, d, n_cmd, cmd = 1, ctx.N, ctx.F, ctx.D, ctx.num_cmd_tokens, ctx.cmd_dim
