@@ -187,9 +187,30 @@ def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
                              scan=scan, proprio=proprio, context=ctx)
 
 
+def _predict(model, ctx, W, idx, priv, device, scan_hw, batch):
+    """``P(fail)`` over ``idx``, in eval mode and without gradients."""
+    was = model.training
+    model.eval()
+    out = np.zeros(idx.size, dtype=np.float64)
+    with torch.no_grad():
+        for i in range(0, idx.size, batch):
+            j = idx[i:i + batch]
+            out[i:i + j.size] = model.p_fail(
+                _batch(ctx, W, j, priv, device, scan_hw)).cpu().numpy()
+    model.train(was)
+    return out
+
+
 def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: float,
-         device, label: str, scan_hw, wb=None) -> tuple[value.FlowValueModel, np.ndarray]:
-    """Train one variant and return it plus held-out ``P(fail)``."""
+         device, label: str, scan_hw, wb=None, val_tile=None
+         ) -> tuple[value.FlowValueModel, np.ndarray]:
+    """Train one variant and return it plus held-out ``P(fail)``.
+
+    Validation runs EVERY epoch, on both scopes. Without it the only visible signal is the
+    training loss, which falls whether the model is learning the task or the tiles -- so
+    there is no way to see overfitting happen, and no basis for choosing the epoch count
+    other than guessing. The per-epoch unseen-tile AUC is the curve that shows it.
+    """
     import copy  # noqa: PLC0415
 
     model = value.FlowValueModel(
@@ -221,11 +242,21 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                     "input: the height scan carries -inf for missed rays.")
             loss.backward()
             opt.step()
-            tot += float(loss) * j.size
+            tot += float(loss.detach()) * j.size
         bce = tot / max(tr.size, 1)
         print(f"  [{label}] epoch {ep + 1}/{epochs}  train BCE {bce:.4f}")
+        log = {f"{label}/train_bce": bce, f"{label}/epoch": ep + 1}
+        y_np = lab["failed"]
+        for scope, m in (("val_seen_tiles", val), ("val_UNSEEN_tiles", val_tile)):
+            if m is None or not m.any():
+                continue
+            j = np.flatnonzero(m)
+            a = value_gates.auc(_predict(model, ctx, W, j, priv, device, scan_hw, batch),
+                                y_np[j])
+            log[f"{label}/{scope}/auc_epoch"] = a
+            print(f"      {scope} AUC {a:.3f}")
         if wb is not None:
-            wb.log({f"{label}/train_bce": bce, f"{label}/epoch": ep + 1})
+            wb.log(log)
     model.eval()
     out = np.zeros(W["episode_uid"].size, dtype=np.float64)
     with torch.no_grad():
@@ -313,6 +344,15 @@ def main() -> int:
                                     "n_episodes": n_ep, "n_windows": int(uids.size),
                                     "n_failed_episodes": n_fail_ep,
                                     "n_tiles": int(np.unique(tiles).size)})
+            # Declare epoch as the x-axis, per variant. Without this every series is plotted
+            # against wandb's auto-incrementing `_step`, and because the two variants train
+            # SEQUENTIALLY into one run they land on disjoint parts of that axis -- V_priv on
+            # steps 0..N-1 and V_onboard on N..2N-1. Each curve then looks like a stub and
+            # overlaying them looks offset, which is a plotting artefact rather than anything
+            # about the models.
+            for label in ("V_priv", "V_onboard"):
+                wandb.define_metric(f"{label}/epoch")
+                wandb.define_metric(f"{label}/*", step_metric=f"{label}/epoch")
         except Exception as exc:                                          # noqa: BLE001
             print(f"[WARN] wandb logging is OFF: {type(exc).__name__}: {exc}\n"
                   f"       The fit continues; gates.json and predictions.npz still land in "
@@ -324,10 +364,19 @@ def main() -> int:
     preds = {}
     for label, priv in (("V_priv", True), ("V_onboard", False)):
         print(f"[fit] {label}")
-        _, p_all = _fit(ctx, W, lab, train, val_ep, priv=priv, epochs=args.epochs,
+        model, p_all = _fit(ctx, W, lab, train, val_ep, priv=priv, epochs=args.epochs,
                         batch=args.batch, lr=args.lr, device=args.device, label=label,
-                        scan_hw=scan_hw, wb=wb)
+                        scan_hw=scan_hw, wb=wb, val_tile=val_tile)
         preds[label] = p_all
+        # Checkpoint it. Without this the fit is write-only: the gates land on disk but the
+        # thing that produced them does not, so labelling a rollout or scoring candidate
+        # chunks would mean re-fitting from scratch.
+        torch.save({"model": model.state_dict(), "variant": label,
+                    "fm_checkpoint": os.path.abspath(args.fm_checkpoint),
+                    "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
+                    "context_dim": int(3 + (6 if priv else 3)), "privileged": bool(priv),
+                    "epochs": int(args.epochs), "stem": stem},
+                   os.path.join(args.out, f"{label}.pt"))
         results[label] = {}
         for scope, mask in (("val_seen_tiles", val_ep), ("val_UNSEEN_tiles", val_tile)):
             print(f"  -- {scope} --")
@@ -363,7 +412,8 @@ def main() -> int:
         json.dump({"gap_mean_abs": gap, "n_episodes": n_ep, "n_windows": int(uids.size),
                    "results": results}, f, indent=2, default=_jsonable)
     np.savez(os.path.join(args.out, "predictions.npz"), episode_uid=uids,
-             replan_index=W["replan_index"], val=val, failed=lab["failed"],
+             replan_index=W["replan_index"], val=val_ep, val_tile=val_tile, tile=tiles,
+             failed=lab["failed"],
              first_fall_step=lab["first_fall_step"], family_code=lab["family_code"],
              **{f"p_{k}": v for k, v in preds.items()})
     if wb is not None:

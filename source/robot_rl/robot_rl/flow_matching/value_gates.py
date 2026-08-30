@@ -82,6 +82,23 @@ def auc(scores: np.ndarray, positive: np.ndarray) -> float:
     return float((ranks[y].sum() - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg))
 
 
+# TODO(critic-calibration): the critic's PROBABILITIES are not usable as-is on new terrain,
+# only its ranking. Measured on held-out tiles, the reliability curve is flatter than the
+# diagonal at both ends -- it predicts more extreme values than the outcomes justify, which is
+# ordinary over-confidence -- and the ECE moved noticeably between two fits of the SAME
+# configuration differing only in seed, so it is not yet a stable property of the model.
+#
+# This matters more than a ranking metric suggests, and the reason is specific to what the
+# critic is FOR. The advantage is a DIFFERENCE of two predictions,
+# `P(fail|s_t) - P(fail|s_{t+n})`, so a distortion that varies with the predicted level does
+# not cancel: two chunks that move P(fail) by the same true amount get different labels
+# depending on whereabouts in an episode they sit. A constant offset would cancel; an
+# S-shaped one does not.
+#
+# The cheap fix is temperature scaling -- one scalar fitted on a held-out split, applied to
+# the logits -- which preserves the ranking exactly and so cannot cost anything the AUC
+# measures. Fit it on the held-out TILES rather than the held-out episodes, since it is the
+# transfer case that is miscalibrated. Do this before any label is trusted.
 def calibration(p_fail: np.ndarray, failed: np.ndarray, *, n_bins: int = 10
                 ) -> dict[str, np.ndarray | float]:
     """Predicted failure probability against the observed frequency, by bin.
@@ -147,6 +164,26 @@ def auc_by_phase(p_fail: np.ndarray, failed: np.ndarray, phase: np.ndarray, *,
     return {"bin_lo": edges[:-1], "bin_hi": edges[1:], "n": cnt, "auc": out}
 
 
+# TODO(advantage-n): the two instruments for choosing `n` DISAGREE, and the gap is large.
+#
+# `lead_time` below reports a few chunks of warning per failure, measured as a sustained
+# crossing of `tau`. But plotting P(fail) per episode against time-to-terminal
+# (`plot_value_traces.py`) shows the success and failure FAMILIES already well separated
+# several seconds -- tens of chunks -- before the end. Both are correct and they answer
+# different questions:
+#
+#   * lead_time asks when an INDIVIDUAL episode's prediction crosses an absolute level, which
+#     is sensitive to `tau` and to how confident the critic happens to be;
+#   * the traces show when the two POPULATIONS separate, which is what "the outcome became
+#     predictable" actually means.
+#
+# `n` should span the interval over which a chunk's consequence becomes visible to the critic,
+# so the population answer is closer to the right one and the current `tau = 0.5` is probably
+# conservative. Two ways to settle it without guessing: sweep `tau` and see how much the lead
+# moves (a threshold-sensitive number is the wrong statistic), and sweep `n` directly, picking
+# the value that maximises the correlation between the resulting advantage and the realised
+# outcome on held-out data. The second is the definition that matters and it needs no new
+# instrument.
 def lead_time(p_fail: np.ndarray, episode: np.ndarray, index: np.ndarray,
               failed: np.ndarray, *, tau: float = 0.5,
               reference: np.ndarray | None = None) -> dict[str, np.ndarray]:
