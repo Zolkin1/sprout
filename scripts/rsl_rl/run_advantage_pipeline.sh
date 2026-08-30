@@ -43,7 +43,7 @@ FLAT_CLIPS=175
 NUM_ENVS=128
 FIT_EPOCHS=20
 FIT_FOLDS=2
-ADV_N=8
+ADV_N=12
 FT_EPOCHS=6
 
 export PYTHONPATH="source/robot_rl:source/motion_gen"

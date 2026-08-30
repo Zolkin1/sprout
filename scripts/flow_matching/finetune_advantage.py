@@ -209,7 +209,22 @@ def main() -> int:
     p.add_argument("--lr", type=float, default=3e-5,
                    help="Deliberately well below the pretraining 3e-4: this is a fine-tune "
                         "from a shipped model, and the failure mode is losing motion quality "
-                        "that no success rate will show.")
+                        "that no success rate will show. Applies to every parameter EXCEPT "
+                        "advantage_emb when --emb_lr_multiplier != 1.")
+    p.add_argument("--emb_lr_multiplier", type=float, default=1.0,
+                   help="advantage_emb.weight gets lr * this, every other parameter gets "
+                        "lr unchanged -- a separate AdamW param group, not a global scale. "
+                        "MOTIVATION, measured on the v2/n=12 run: the embedding is the only "
+                        "parameter starting at exact zero (everything else is pretrained and "
+                        "converged), and at multiplier=1 it moved to a row norm of ~0.03-0.04 "
+                        "against the ~17-34 scale of the time_mlp output it is summed with -- "
+                        "three orders of magnitude too small to matter, while flow_mse barely "
+                        "moved. Raising the WHOLE model's lr to compensate would move the "
+                        "converged 26.8M-param bulk just as fast, which is the motion-quality "
+                        "risk --lr is conservative to avoid. A multiplier here targets only "
+                        "the parameter that actually needs a bigger step. Try ~100-300x as a "
+                        "starting point (an extrapolation, not a derivation) and re-check the "
+                        "embedding norm against the target scale before trusting a full run.")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--null_prob", type=float, default=0.3,
@@ -297,7 +312,18 @@ def main() -> int:
         val_ds, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers,
         collate_fn=_collate) if val_ds is not None else None)
 
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.emb_lr_multiplier != 1.0:
+        emb_params = list(model.advantage_emb.parameters())
+        emb_ids = {id(p) for p in emb_params}
+        rest = [p for p in model.parameters() if id(p) not in emb_ids]
+        opt = torch.optim.AdamW(
+            [{"params": rest, "lr": args.lr},
+             {"params": emb_params, "lr": args.lr * args.emb_lr_multiplier}],
+            weight_decay=args.weight_decay)
+        print(f"[ft] advantage_emb gets its own param group: lr={args.lr * args.emb_lr_multiplier:.2e} "
+              f"({args.emb_lr_multiplier}x the base {args.lr:.2e}); everything else at {args.lr:.2e}")
+    else:
+        opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     ema = WeightEMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
 
     wb = None

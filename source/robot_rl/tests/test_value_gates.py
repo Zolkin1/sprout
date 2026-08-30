@@ -206,3 +206,48 @@ def test_value_traces_sort_by_index_and_carry_the_outcome():
     assert tr[7]["index"].tolist() == [0, 1, 2]
     assert tr[7]["p_fail"].tolist() == pytest.approx([0.1, 0.2, 0.3])
     assert tr[7]["failed"] is True
+
+
+def test_auc_within_stratum_isolates_DIFFICULTY_from_discrimination():
+    """A critic that reads tile difficulty alone must collapse toward 0.5 within a tile.
+
+    Two tiles, one easy (mostly successes) and one hard (mostly failures). A score that is
+    CONSTANT per tile (pure difficulty, zero within-tile signal) separates the pooled sample
+    almost perfectly -- easy-tile scores are all low, hard-tile scores all high -- but must
+    read as chance once every comparison is confined to one tile.
+    """
+    import numpy as np
+    from robot_rl.flow_matching.value_gates import auc, auc_within_stratum
+
+    rng = np.random.default_rng(0)
+    tile = np.r_[np.zeros(200, int), np.ones(200, int)]
+    failed = np.r_[rng.random(200) < 0.1, rng.random(200) < 0.9]      # easy vs hard
+    score = np.where(tile == 0, 0.1, 0.9) + rng.normal(0, 1e-6, 400)  # pure difficulty
+
+    assert auc(score, failed) > 0.85                      # confounded: looks highly predictive
+    assert abs(auc_within_stratum(score, failed, tile) - 0.5) < 0.05   # correctly collapses
+
+
+def test_auc_within_stratum_matches_plain_auc_on_ONE_stratum():
+    """With a single group the pooled statistic must reduce to ordinary AUC."""
+    import numpy as np
+    from robot_rl.flow_matching.value_gates import auc, auc_within_stratum
+
+    rng = np.random.default_rng(1)
+    score = rng.normal(size=300)
+    failed = rng.random(300) < 0.3
+    tile = np.zeros(300, dtype=int)
+    assert auc_within_stratum(score, failed, tile) == auc(score, failed)
+
+
+def test_auc_within_stratum_finds_REAL_signal_when_present():
+    """The opposite failure mode: a genuinely predictive score must NOT be washed out just
+    because it is computed within strata."""
+    import numpy as np
+    from robot_rl.flow_matching.value_gates import auc_within_stratum
+
+    rng = np.random.default_rng(2)
+    tile = rng.integers(0, 5, 400)
+    failed = rng.random(400) < 0.3
+    score = np.where(failed, rng.normal(0.8, 0.1, 400), rng.normal(0.2, 0.1, 400))
+    assert auc_within_stratum(score, failed, tile) > 0.85

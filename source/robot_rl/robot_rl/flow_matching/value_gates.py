@@ -137,6 +137,45 @@ def calibration(p_fail: np.ndarray, failed: np.ndarray, *, n_bins: int = 10
     }
 
 
+def auc_within_stratum(scores: np.ndarray, positive: np.ndarray, stratum: np.ndarray) -> float:
+    """AUC computed by comparing episodes ONLY against others in the same stratum, then pooled.
+
+    Plain AUC ranks every positive against every negative in the whole sample, so on a mix of
+    easy and hard TILES it rewards a critic for knowing *which tile this is* every bit as much
+    as for reading how one rollout is going -- an early-episode critic that has learned
+    difficulty from the privileged scan can score well here without separating a single good
+    attempt from a bad one on the SAME piece of terrain. Restricting every comparison to a
+    common stratum removes exactly that: if the pooled statistic collapses toward 0.5 while
+    the unstratified AUC stays high, the unstratified number was difficulty discrimination,
+    not the per-rollout signal advantage conditioning needs.
+
+    Pooled rather than averaged per stratum: concordant/discordant PAIR counts are summed
+    across strata before dividing, which is what lets a handful of large tiles carry a small
+    tile's noisy few-episode AUC rather than have it count equally in a mean of AUCs.
+
+    Args:
+        scores: ``[n]`` predictions; higher should mean more likely positive.
+        positive: ``[n]`` boolean labels.
+        stratum: ``[n]`` group id (e.g. terrain tile) a comparison may not cross.
+
+    Returns:
+        The pooled within-stratum AUC, or NaN if no stratum contains both classes.
+    """
+    s = np.asarray(scores, dtype=np.float64)
+    y = np.asarray(positive).astype(bool)
+    g = np.asarray(stratum)
+    concordant, pairs = 0.0, 0.0
+    for tile in np.unique(g):
+        m = g == tile
+        n_pos, n_neg = int(y[m].sum()), int((~y[m]).sum())
+        if n_pos == 0 or n_neg == 0:
+            continue
+        a = auc(s[m], y[m])
+        concordant += a * n_pos * n_neg
+        pairs += n_pos * n_neg
+    return float(concordant / pairs) if pairs > 0 else float("nan")
+
+
 def auc_by_phase(p_fail: np.ndarray, failed: np.ndarray, phase: np.ndarray, *,
                  n_bins: int = 10) -> dict[str, np.ndarray]:
     """Discrimination as a function of where in the episode the state sits.
