@@ -251,6 +251,14 @@ def main() -> int:
     p.add_argument("--max_windows", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--ablate_action", action="store_true",
+                   help="Zero the action tokens, making this a V(s) control. The ONLY "
+                        "difference from the Q arm -- same split, same data, same trunk, same "
+                        "schedule, same seed -- so the ranking gap between the two arms is "
+                        "attributable to the action and nothing else. Comparing against an "
+                        "independently-trained V (fit_value) instead would confound it: that "
+                        "model used its own tile holdout, so windows held out here may sit in "
+                        "ITS training set, flattering it by an unknown amount.")
     p.add_argument("--no_wandb", action="store_true")
     p.add_argument("--wandb_project", default="robot_rl_qvalue")
     p.add_argument("--run_name", default="")
@@ -260,6 +268,13 @@ def main() -> int:
     rng = np.random.default_rng(args.seed)
     os.makedirs(args.out, exist_ok=True)
     W, meta, lab = _load(args.rollout, args.max_windows)
+    if args.ablate_action:
+        # Zeroed, not removed: the model keeps its action tokens, their type embedding and
+        # their positions, so the two arms have identical parameter counts and identical
+        # optimisation. Removing the stream would change the architecture and the gap would
+        # then mix "the action helps" with "a smaller model".
+        W["fm_plan"] = np.zeros_like(W["fm_plan"])
+        print("[fit_q] ABLATION: action tokens zeroed -- this arm is a V(s) control")
     scan_hw = tuple(meta["attrs"]["height_scan_hw"])
     uids = W["episode_uid"]
     tiles = np.array([meta["ep_terrain"][int(u)] for u in uids])
@@ -347,6 +362,7 @@ def main() -> int:
             torch.save({"model": model.state_dict(), "fm_checkpoint": args.fm_checkpoint,
                         "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
                         "context_dim": 9, "action_steps": n_a,
+                        "ablate_action": bool(args.ablate_action),
                         "action_dim": int(W["fm_plan"].shape[-1]), "epoch": ep},
                        os.path.join(args.out, "Q.pt"))
         with open(os.path.join(args.out, "history.json"), "a") as fh:
