@@ -165,7 +165,16 @@ def run(args) -> int:
     crit = C.FailureCritic(args.critic_ckpt, device=args.device)
     tiles = [int(t) for t in args.tiles.split(",")]
     clips = select_clips(args.clip_lib, tiles, int(args.clips_per_tile))
-    print(f"[collect] {len(clips)} clips over {len(tiles)} tiles", flush=True)
+    # SHUFFLED, deterministically. `select_clips` returns them sorted, so a run that stops on
+    # its time budget before exhausting the list covers only the low tile ids -- and the
+    # families differ enough in clip length (stairs ~6.3 s, jump_on ~10.5 s) that the slow
+    # worker reaches barely a quarter of its clips in the same wall time. Shuffling makes an
+    # early stop an unbiased SUBSAMPLE of the tiles rather than a prefix of them, which is the
+    # same coverage bias that spoiled the first attempt, arriving by a different route.
+    np.random.default_rng(int(args.shuffle_seed)).shuffle(clips)
+    print(f"[collect] {len(clips)} clips over {len(tiles)} tiles, shuffled "
+          f"(seed {args.shuffle_seed}) so an early stop is a subsample, not a prefix",
+          flush=True)
 
     w = Writer(os.path.join(args.out, f"q_data_{args.shard}.h5"), args.flush_every)
     counts = {"onpolicy": 0, "branch": 0, "episodes": 0, "clips_failed": 0}
@@ -351,6 +360,9 @@ def main() -> int:
                         "split between 'many states, one action' and 'one state, many "
                         "actions', and only the second contains the comparison a selector "
                         "has to make.")
+    p.add_argument("--shuffle_seed", type=int, default=0,
+                   help="orders the clip list. Deterministic, so a resumed or re-run shard "
+                        "covers the same clips in the same order.")
     p.add_argument("--max_offset", type=int, default=50)
     p.add_argument("--device", default="cuda")
     p.add_argument("--providers", default="auto")
