@@ -297,8 +297,18 @@ def run(args) -> int:
     from fm_noise_attribution import build_arm  # noqa: PLC0415
 
     ks = [int(x) for x in args.k.split(",")]
-    crit = (None if ks == [1] else
-            C.FailureCritic(args.critic_ckpt, device=args.device))
+    use_q = bool(args.q_ckpt)
+    scorer = None
+    if args.state_critic_ckpt and ks != [1]:
+        scorer = StateCritic(args.state_critic_ckpt, device=args.device,
+                             fm_override=args.fm_pt)
+    elif use_q and ks != [1]:
+        scorer = QScorer(args.q_ckpt, device=args.device, fm_override=args.fm_pt)
+    elif ks != [1]:
+        if not args.critic_ckpt:
+            raise SystemExit("need --critic_ckpt (V selector) or --q_ckpt (Q selector)")
+        scorer = C.FailureCritic(args.critic_ckpt, device=args.device)
+    crit = scorer
     os.makedirs(args.out, exist_ok=True)
     rows, t0 = [], time.time()
 
@@ -322,12 +332,14 @@ def run(args) -> int:
         for k in ks:
             wins = 0
             for ep in range(args.seed_offset, args.seed_offset + args.episodes):
-                v, f, nr, sc = run_episode_selected(
+                fn = run_episode_q_selected if use_q else run_episode_selected
+                v, f, nr, sc = fn(
                     rig, policy, fm_lag, spawn, cmd, cfg, crit, course.goal_anchor_xyz,
                     k=k, seed=ep, mjrunner=mjrunner)
                 wins += int(v == "success")
                 rows.append({"tile": tile, "k": k, "episode": ep, "verdict": v,
-                             "failure": f, "n_replans": nr})
+                             "failure": f, "n_replans": nr, "spread": float(sc),
+                             "selector": "Q" if use_q else "V"})
                 done = ep - args.seed_offset + 1
                 if done % max(1, args.episodes // 10) == 0:
                     print(f"  tile {tile} K={k}: {done}/{args.episodes} "
@@ -359,7 +371,20 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", required=True)
-    p.add_argument("--critic_ckpt", required=True)
+    p.add_argument("--critic_ckpt", default="", help="V(s) critic, for the rollout selector.")
+    p.add_argument("--q_ckpt", default="",
+                   help="A fit_q checkpoint. Selects with Q(s, a), which scores each candidate "
+                        "chunk WITHOUT executing it -- K generator calls and no physics, "
+                        "against the V selector needing K rollouts of 0.24 s. This is also the "
+                        "only one of the two a robot could run: it cannot execute eight "
+                        "futures and undo seven.")
+    p.add_argument("--fm_pt", default="", help="Local generator .pt, when the Q checkpoint "
+                                               "names a path from another machine.")
+    p.add_argument("--state_critic_ckpt", default="",
+                   help="An ABLATED fit_q checkpoint, driven as V(s) by the ROLLOUT selector "
+                        "(candidates are executed 0.24 s and the resulting state is scored). "
+                        "Use this to run the same selector that worked with V_priv, but with "
+                        "a V trained on the fit_q split.")
     p.add_argument("--tracker_onnx", required=True)
     p.add_argument("--fm_onnx", required=True)
     p.add_argument("--clip_lib", required=True)
@@ -381,6 +406,313 @@ def main() -> int:
     p.add_argument("--fall_tilt_deg", type=float, default=70.0)
     p.add_argument("--scene_tag", default="_ls")
     return run(p.parse_args())
+
+
+
+
+class QScorer:
+    """Scores a candidate CHUNK from the current state, without executing it.
+
+    This is the difference between a ``Q`` selector and the ``V`` one above, and it is not a
+    detail.  ``V(s')`` needs a state to score, so every candidate must first be ROLLED 0.24 s
+    -- 95.6 ms each, measured.  ``Q(s, a)`` scores the chunk directly, so the candidates cost
+    one generator call apiece and no physics at all.  That makes the Q selector roughly an
+    order of magnitude cheaper AND deployable: a robot cannot execute eight futures and undo
+    seven of them, but it can sample eight plans and pick one.
+
+    Args:
+        ckpt: A ``fit_q`` checkpoint.
+        device: Torch device.
+        fm_override: Path to the generator ``.pt`` the checkpoint borrows, when the recorded
+            one does not resolve here -- a checkpoint trained on another machine names ITS
+            path. Overriding is safe only because the trunk is frozen and both sides must be
+            the same file; the loader below refuses a DIFFERENT generator by content hash
+            rather than trusting the caller.
+    """
+
+    def __init__(self, ckpt: str, device: str = "cuda", fm_override: str = "") -> None:
+        import copy as _copy  # noqa: PLC0415
+
+        import torch  # noqa: PLC0415
+        from robot_rl.flow_matching import online, qvalue  # noqa: PLC0415
+
+        self._torch = torch
+        self._qv = qvalue
+        self.device = device
+        k = torch.load(ckpt, map_location="cpu", weights_only=False)
+        if bool(k.get("ablate_action", False)):
+            raise ValueError(
+                f"{ckpt} is the ACTION-ABLATED control arm -- its action tokens were zeroed "
+                "during training, so it is a V(s) in a Q's clothing and would rank every "
+                "candidate at a state identically. Selecting on it is a no-op that looks "
+                "like a working selector.")
+        fm = str(k["fm_checkpoint"])
+        if fm_override:
+            import hashlib as _h  # noqa: PLC0415
+
+            def _sha(q):
+                h = _h.sha256()
+                with open(q, "rb") as fh:
+                    for c in iter(lambda: fh.read(1 << 20), b""):
+                        h.update(c)
+                return h.hexdigest()
+            if os.path.exists(fm) and _sha(fm) != _sha(fm_override):
+                raise ValueError(
+                    f"fm_override {fm_override!r} is a DIFFERENT generator from the one this Q "
+                    f"was fitted over ({fm!r}). The trunk is frozen, so a different one loads "
+                    "with the right shapes and three wrong normalizers -- silently.")
+            fm = fm_override
+        elif not os.path.exists(fm):
+            raise FileNotFoundError(
+                f"the Q checkpoint names {fm!r}, which does not exist here. It was probably "
+                "trained on another machine; pass fm_override with the local copy.")
+        self.ctx = online.load_fm_context(fm, device=device)
+        self.model = qvalue.FlowQModel(
+            _copy.deepcopy(self.ctx.model), action_dim=int(k["action_dim"]),
+            action_steps=int(k["action_steps"]), scan_hw=tuple(k["scan_hw"]),
+            proprio_dim=int(k["proprio_hw"][-1]), proprio_steps=int(k["proprio_hw"][0]),
+            context_dim=int(k["context_dim"])).to(device)
+        self.model.load_state_dict(k["model"])
+        self.model.eval()
+        self.scan_hw = tuple(k["scan_hw"])
+        self.steps = torch.as_tensor(self.ctx.cmd_steps, dtype=torch.long, device=device)
+
+    def score(self, inp, window) -> float:
+        """``P(fail | s, a)`` for one candidate; lower is better.
+
+        Normalizer order mirrors ``fit_q._batch`` exactly, including the action being
+        normalized with ``state_norm`` -- the emitted plan nodes live in the same space as the
+        history nodes, which is what that normalizer was fitted on.
+
+        Args:
+            inp: A :class:`critic.CriticInputs` for the current state.
+            window: ``(F, D)`` the candidate chunk.
+
+        Returns:
+            The score.
+        """
+        import numpy as _np  # noqa: PLC0415
+        import torch  # noqa: PLC0415
+        from robot_rl.flow_matching import transforms, value  # noqa: PLC0415
+
+        from goal_anchor import GOAL_SCALE_M  # noqa: PLC0415
+
+        t = lambda a, d=torch.float32: torch.as_tensor(  # noqa: E731
+            _np.asarray(a), dtype=d, device=self.device).unsqueeze(0)
+        c = self.ctx
+        cmd = (c.cmd_norm.normalize(t(inp.cmd_future)[:, self.steps, :])
+               if c.cmd_dim > 0 else None)
+        goal = _np.nan_to_num(_np.asarray(inp.goal, dtype=_np.float64) / GOAL_SCALE_M,
+                              nan=0.0, posinf=0.0, neginf=0.0)
+        st = value.ValueInputs(
+            history=c.state_norm.normalize(t(inp.history)),
+            extero=c.extero_norm.normalize(t(inp.extero).reshape(1, -1)),
+            cmd_tokens=cmd,
+            history_null=t(_np.array([inp.history_null]), torch.bool).reshape(1),
+            scan=transforms.sanitize_extero(t(inp.scan), "height_scan").reshape(1, *self.scan_hw),
+            proprio=t(inp.proprio),
+            context=t(_np.concatenate([goal, _np.asarray(inp.twist, dtype=_np.float32)])))
+        a = c.state_norm.normalize(t(window)[:, self.steps, :])
+        with torch.no_grad():
+            return float(self.model.p_fail(self._qv.QInputs(state=st, action=a)).item())
+
+
+class StateCritic:
+    """A ``fit_q`` ABLATED checkpoint used as ``V(s)``, for the rollout selector.
+
+    The ablated arm was trained with its action tokens zeroed, so it is a state critic that
+    happens to be a :class:`FlowQModel`.  This exposes it behind the same two members the
+    rollout selector reads from ``critic.FailureCritic`` -- ``privileged`` and ``p_fail`` --
+    so the same loop can be driven by either.
+
+    **The action is passed as ZEROS, matching training.**  Feeding it a real chunk would put
+    the model off the distribution it was fitted on: it never saw a non-zero action, so
+    whatever it does with one is unconstrained rather than merely unhelpful.
+
+    Args:
+        ckpt: An ablated ``fit_q`` checkpoint.
+        device: Torch device.
+        fm_override: Local generator ``.pt``, when the checkpoint names another machine's path.
+
+    Raises:
+        ValueError: If the checkpoint is NOT ablated.  A live-action Q used here would be
+            scored with a zero action at every candidate, making it a state critic by
+            accident and silently discarding the thing it was trained for.
+    """
+
+    def __init__(self, ckpt: str, device: str = "cuda", fm_override: str = "") -> None:
+        import torch  # noqa: PLC0415
+
+        k = torch.load(ckpt, map_location="cpu", weights_only=False)
+        if not bool(k.get("ablate_action", False)):
+            raise ValueError(
+                f"{ckpt} is a LIVE-action Q, not the ablated control. Driving the rollout "
+                "selector with it would pass a zero action at every candidate -- turning it "
+                "into a state critic by accident and throwing away exactly what it was "
+                "trained to add. Use QScorer for a live Q.")
+        # Built through a loader that skips QScorer's ablation guard: that guard protects the
+        # Q selector, where an ablated model would rank every candidate the same. Here the
+        # ablation is the POINT.
+        self._q = _load_q_unchecked(ckpt, device, fm_override)
+        self.privileged = True
+        self._torch = torch
+
+    def p_fail(self, inp) -> float:
+        """``P(fail | s)`` with the action held at zero.
+
+        Args:
+            inp: A :class:`critic.CriticInputs`.
+
+        Returns:
+            The score.
+        """
+        import numpy as _np  # noqa: PLC0415
+
+        zero = _np.zeros((64, self._q.model.action_in[0].in_features), dtype=_np.float32)
+        return self._q.score(inp, zero)
+
+
+def _load_q_unchecked(ckpt: str, device: str, fm_override: str):
+    """A :class:`QScorer` built without the ablation guard.
+
+    Args:
+        ckpt: The checkpoint.
+        device: Torch device.
+        fm_override: Local generator path.
+
+    Returns:
+        The scorer.
+    """
+    import copy as _copy  # noqa: PLC0415
+
+    import torch  # noqa: PLC0415
+    from robot_rl.flow_matching import online, qvalue  # noqa: PLC0415
+
+    o = QScorer.__new__(QScorer)
+    k = torch.load(ckpt, map_location="cpu", weights_only=False)
+    fm = fm_override or str(k["fm_checkpoint"])
+    o._torch, o._qv, o.device = torch, qvalue, device
+    o.ctx = online.load_fm_context(fm, device=device)
+    o.model = qvalue.FlowQModel(
+        _copy.deepcopy(o.ctx.model), action_dim=int(k["action_dim"]),
+        action_steps=int(k["action_steps"]), scan_hw=tuple(k["scan_hw"]),
+        proprio_dim=int(k["proprio_hw"][-1]), proprio_steps=int(k["proprio_hw"][0]),
+        context_dim=int(k["context_dim"])).to(device)
+    o.model.load_state_dict(k["model"])
+    o.model.eval()
+    o.scan_hw = tuple(k["scan_hw"])
+    o.steps = torch.as_tensor(o.ctx.cmd_steps, dtype=torch.long, device=device)
+    return o
+
+
+def run_episode_q_selected(rig, policy, fm_lag, spawn, cmd, cfg, scorer, anchor, *,
+                           k: int, seed: int, mjrunner):
+    """One episode where each re-plan picks the best of ``k`` chunks by ``Q(s, a)``.
+
+    Unlike :func:`run_episode_selected`, **no candidate is executed to be scored**.  At a
+    re-plan the generator is sampled ``k`` times against the SAME conditioning, each sample is
+    scored where it stands, and only the winner is committed.  Cost is ``k`` generator calls,
+    not ``k`` chunk rollouts.
+
+    The state half of ``Q``'s input is built ONCE and reused across candidates: it is the
+    conditioning at this re-plan, which every candidate shares by construction.  Rebuilding it
+    per candidate would additionally re-cast depth, which mutates the lag ring -- the bug that
+    made the V selector look worse than no selection at all.
+
+    Args:
+        rig: The course rig.
+        policy: The loaded pair.
+        fm_lag: The camera-lag ring.
+        spawn: Initial condition.
+        cmd: ``(3,)`` commanded twist.
+        cfg: The ``ArmRun``.
+        scorer: A :class:`QScorer`, or ``None`` for ``k == 1``.
+        anchor: Goal anchor for the goal features.
+        k: Candidates per re-plan.
+        seed: Episode seed.
+        mjrunner: The ``runner`` module.
+
+    Returns:
+        ``(verdict, failure, n_replans, mean_spread)`` where ``mean_spread`` is the mean
+        max-minus-min of ``Q`` across candidates -- if that is ~0 the model is not
+        discriminating and any success change is not selection.
+    """
+    import critic as C  # noqa: PLC0415
+    import mujoco  # noqa: PLC0415
+
+    from gen_tracker_runner import build_state  # noqa: PLC0415
+
+    robot, course = rig.robot, rig.course
+    mujoco.mj_resetData(robot.mj_model, robot.mj_data)
+    robot.set_base_and_joints(spawn.base_pos, spawn.base_quat_wxyz, rig.hold_target,
+                              base_lin_vel_w=spawn.base_lin_vel_w,
+                              base_ang_vel_w=spawn.base_ang_vel_w,
+                              joint_vel_mujoco=rig.hold_joint_vel)
+    policy._rng = np.random.default_rng(seed)
+    mjrunner._reset_episode_state(policy, fm_lag)
+    ring = C.ProprioRing()
+    z0 = float(robot.mj_data.qpos[2])
+    zex = [z0, z0]
+    n_replans, spreads = 0, []
+    last_plan_id = -1
+
+    while robot.mj_data.time <= course.budget_s:
+        state = build_state(robot, policy, cmd, rig.depth_cams, want_depth_hits=False,
+                            fm_depth_cams=rig.fm_depth_cams, fm_lag=fm_lag)
+        ring.push(state["joint_pos"], state["joint_vel"], state["base_ang_vel"],
+                  C.projected_gravity_b(state["root_quat"]))
+        # Snapshot BEFORE create_obs. `_ctrl_step` is the re-plan cadence counter, so a
+        # snapshot taken AFTER it has already advanced restores to MID-CHUNK -- and a
+        # create_obs there does not re-plan, it consumes the plan already made. The
+        # "candidates" are then different offsets into ONE plan rather than different plans:
+        # their windows genuinely differ, so nothing looks wrong, but plan_id never
+        # increments and the selector is choosing among readings of the same decision.
+        pre = Snapshot(robot, policy, fm_lag)
+        obs = policy.create_obs(state)
+        plan = policy.last_plan()
+        is_replan = plan is not None and int(plan["plan_id"]) != last_plan_id
+
+        if is_replan and k > 1 and scorer is not None:
+            last_plan_id = int(plan["plan_id"])
+            snap = pre
+            # Built once: this is the conditioning at THIS re-plan, shared by every candidate.
+            inp = C.CriticInputs.from_runtime(policy, robot, state, anchor=anchor, ring=ring,
+                                              want_scan=True)
+            w0 = policy.predicted_window()
+            cands = [(scorer.score(inp, w0), 0)] if w0 is not None else []
+            for c in range(1, k):
+                snap.restore(robot, policy, fm_lag)
+                policy._rng = np.random.default_rng([seed, n_replans, c])
+                policy.create_obs(state)
+                w = policy.predicted_window()
+                if w is not None:
+                    cands.append((scorer.score(inp, w), c))
+            if cands:
+                sc = [s for s, _ in cands]
+                spreads.append(max(sc) - min(sc))
+                best_c = min(cands)[1]
+                snap.restore(robot, policy, fm_lag)
+                # Candidate 0 used whatever rng the episode had reached; reproduce that by
+                # restoring rather than re-seeding, so the committed plan is the one scored.
+                if best_c:
+                    policy._rng = np.random.default_rng([seed, n_replans, best_c])
+                obs = policy.create_obs(state)
+            n_replans += 1
+        elif is_replan:
+            last_plan_id = int(plan["plan_id"])
+            n_replans += 1
+
+        robot.apply_action(policy.get_action(obs, robot.joint_names))
+        if robot.failed():
+            return "fall", robot.failure_reason(), n_replans, float(np.mean(spreads or [0.0]))
+        for _ in range(rig.decim):
+            robot.step()
+        z = float(robot.mj_data.qpos[2])
+        zex[0], zex[1] = max(zex[0], z), min(zex[1], z)
+        if (course.in_goal(float(robot.mj_data.qpos[0]), float(robot.mj_data.qpos[1]))
+                and course.traversed(zex[0], zex[1])):
+            return "success", "", n_replans, float(np.mean(spreads or [0.0]))
+    return "timeout", "", n_replans, float(np.mean(spreads or [0.0]))
 
 
 if __name__ == "__main__":
