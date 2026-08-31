@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 import time
@@ -245,6 +246,19 @@ def main() -> int:
                         "the parameter that actually needs a bigger step. Try ~100-300x as a "
                         "starting point (an extrapolation, not a derivation) and re-check the "
                         "embedding norm against the target scale before trusting a full run.")
+    p.add_argument("--cosine", action="store_true",
+                   help="Anneal the LR from --lr to 0 over the run, cosine-shaped and applied "
+                        "per EPOCH. Lets a run start at a peak that would be destructive to "
+                        "hold: the model moves early and settles late, instead of taking "
+                        "same-size steps on an already-converged checkpoint all the way "
+                        "through. Reproduces CosineAnnealingLR(T_max=epochs, eta_min=0) at "
+                        "epoch granularity, the same closed form scripts/flow_matching/"
+                        "train.py uses.")
+    p.add_argument("--lr_warmup_steps", type=int, default=0,
+                   help="Linearly ramp to --lr over this many optimizer steps. Worth having "
+                        "with a high peak: the first batch against a converged checkpoint is "
+                        "the one most able to wreck it, and Adam's second-moment estimate is "
+                        "still cold there.")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--null_prob", type=float, default=0.3,
@@ -257,6 +271,16 @@ def main() -> int:
     p.add_argument("--ema_decay", type=float, default=0.999)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--filter_label", default="", choices=("", "positive", "negative", "null"),
+                   help="FILTERED BC: keep only windows carrying this label and train "
+                        "UNCONDITIONED on them -- no label embedding, no token, no serve arm. "
+                        "The simplest possible version of the idea: if the good chunks are "
+                        "distinguishable at all, cloning only those should move the policy on "
+                        "its OWN training distribution. It is the control that separates 'the "
+                        "label never reaches the model' (which conditioning arms cannot rule "
+                        "out) from 'this fine-tuning setup moves nothing', because here there "
+                        "is no label pathway left to blame. Requires --labels for the sidecar; "
+                        "the model architecture is left exactly as the pretrained one.")
     p.add_argument("--drop_tile_holdout", action="store_true",
                    help="Train on training tiles only, keeping the held-out tiles clean for "
                         "evaluation. Requires --labels (the sidecar carries the split).")
@@ -279,7 +303,6 @@ def main() -> int:
             f"{args.pretrained} is ALREADY advantage-conditioned. Every iteration fine-tunes "
             "from the pretrained checkpoint, never from the previous one -- chaining makes "
             "iteration k an unrepeatable path rather than one defined step.")
-    model = convert(ctx, cfg, device, args.advantage_inject)
 
     import h5py
     with h5py.File(args.rollout, "r") as f:
@@ -305,6 +328,26 @@ def main() -> int:
     elif args.drop_tile_holdout:
         raise SystemExit("--drop_tile_holdout needs --labels: the tile split lives in the "
                          "sidecar, and guessing it would silently train on the holdout.")
+    if args.filter_label:
+        if labels is None:
+            raise SystemExit("--filter_label needs --labels: there is nothing to filter on.")
+        want = label_from_name(args.filter_label)
+        keep &= (labels == want)
+        print(f"[ft] FILTERED BC: keeping only '{args.filter_label}' windows -> "
+              f"{int(keep.sum())} of {n_win}")
+        # The label has done its whole job by selecting rows. Handing it to the dataset as
+        # well would make this an advantage-CONDITIONED run on a filtered subset, which is a
+        # different experiment and not the one this flag is for.
+        labels = None
+
+    # UNCONDITIONED for filtered BC: the architecture stays exactly the pretrained one, so
+    # there is no embedding, no token, no `prefix_len` change and no serve arm -- the output
+    # is a plain generator that every existing consumer loads without knowing this ran.
+    model = (convert(ctx, cfg, device, args.advantage_inject) if not args.filter_label
+             else copy.deepcopy(ctx.model).to(device))
+    if args.filter_label:
+        for prm in model.parameters():
+            prm.requires_grad_(True)
 
     rows = np.flatnonzero(keep)
     if args.max_windows and rows.size > args.max_windows:
@@ -320,7 +363,9 @@ def main() -> int:
     if labels is not None:
         print(f"[ft] train label counts (before null dropout): {train_ds.label_counts()}")
 
-    if args.verify_identity and args.advantage_inject == "time_embed":
+    if args.filter_label:
+        print("[ft] filtered BC: no conversion to verify -- the model IS the pretrained one.")
+    elif args.verify_identity and args.advantage_inject == "time_embed":
         worst = verify_identity(ctx, model, train_ds, device)
         print(f"[ft] conversion is identical to the parent under all {len(LABEL_NAMES)} "
               f"labels (max |delta| {worst:.2e})")
@@ -379,6 +424,22 @@ def main() -> int:
         except Exception as exc:                                          # noqa: BLE001
             print(f"[WARN] wandb logging is OFF: {type(exc).__name__}: {exc}")
 
+    def _lr_at(epoch: int, step: int) -> float:
+        """Peak LR shaped by the cosine (per epoch) and the warmup (per step).
+
+        Closed form in ``(epoch, step)`` rather than a stateful scheduler, because the two
+        act at different granularities and ``CosineAnnealingLR.get_lr`` is recursive in
+        ``param_group["lr"]`` -- mutating the group mid-epoch for the warmup would corrupt
+        the cosine's own state rather than scale it. Same reasoning, and same arithmetic, as
+        ``train.scheduled_lr``.
+        """
+        lr = args.lr
+        if args.cosine and args.epochs > 1:
+            lr *= 0.5 * (1.0 + math.cos(math.pi * epoch / args.epochs))
+        if args.lr_warmup_steps > 0 and step < args.lr_warmup_steps:
+            lr *= (step + 1) / args.lr_warmup_steps
+        return lr
+
     def _run(batch, train: bool) -> dict:
         """One forward (and optionally backward) pass over a collated batch."""
         x1 = batch["state"].to(device)
@@ -401,17 +462,25 @@ def main() -> int:
                 ema.update(model)
         return {k: float(v.detach()) for k, v in out.items()}
 
-    history, best_val = [], float("inf")
+    history, best_val, gstep = [], float("inf"), 0
     for epoch in range(args.epochs):
         model.train()
         t0, tot, seen = time.time(), 0.0, 0
         for batch in loader:
+            if args.cosine or args.lr_warmup_steps > 0:
+                lr_now = _lr_at(epoch, gstep)
+                # The embedding's group keeps its multiplier, so a schedule scales BOTH
+                # groups rather than silently collapsing them onto one rate.
+                for gi, g in enumerate(opt.param_groups):
+                    mult = args.emb_lr_multiplier if (gi == 1 and len(opt.param_groups) > 1) else 1.0
+                    g["lr"] = lr_now * mult
+            gstep += 1
             m = _run(batch, True)
             tot += m["flow_mse"] * batch["state"].shape[0]
             seen += batch["state"].shape[0]
         train_mse = tot / max(seen, 1)
         rec = {"epoch": epoch + 1, "train_flow_mse": train_mse,
-               "secs": round(time.time() - t0, 1)}
+               "lr": _lr_at(epoch, gstep), "secs": round(time.time() - t0, 1)}
         if val_loader is not None:
             model.eval()
             with torch.no_grad():
@@ -443,16 +512,25 @@ def main() -> int:
     # checkpoint that does not state one is refused at load, so nothing (an Isaac eval, a
     # probe, a play run) can serve an arm by accident. These two say which they are, in the
     # artifact, exactly as `fm_meta.advantage_label` does on the ONNX side.
-    for name in ("positive", "negative"):
-        stamp_serve_label(os.path.join(args.out, "best.pt"),
-                          os.path.join(args.out, f"best_{name}.pt"), name)
-        print(f"[ft] wrote {args.out}/best_{name}.pt")
+    if not args.filter_label:
+        for name in ("positive", "negative"):
+            stamp_serve_label(os.path.join(args.out, "best.pt"),
+                              os.path.join(args.out, f"best_{name}.pt"), name)
+            print(f"[ft] wrote {args.out}/best_{name}.pt")
     with open(os.path.join(args.out, "finetune.json"), "w") as f:
         json.dump({"args": vars(args), "history": history,
                    "label_counts": train_ds.label_counts()}, f, indent=2)
     if wb is not None:
         wb.finish()
     print(f"[ft] wrote {args.out}/best.pt")
+    if args.filter_label:
+        print(f"[ft] NEXT: this is a PLAIN generator ({args.filter_label}-filtered BC), so it "
+              "evaluates as ONE cell against the pretrained base -- there is no arm to\n"
+              "     control against, and therefore no internal check that the training did "
+              "anything. The eval against `base` IS the check.")
+        if wb is not None:
+            wb.finish()
+        return 0
     print("[ft] NEXT, before any sweep: run BOTH arms and compare them.\n"
           f"     Isaac:  --fm_checkpoint pos={args.out}/best_positive.pt "
           f"neg={args.out}/best_negative.pt\n"
@@ -497,8 +575,11 @@ def _save(args, cfg, model, opt, ema, epoch: int, history: list, path: str) -> N
     """
     parent = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     cfg = copy.deepcopy(cfg)
-    cfg.advantage_cond = True
-    cfg.advantage_inject = args.advantage_inject
+    # Filtered BC produces a PLAIN generator: claiming advantage_cond would make
+    # `load_fm_context` demand a serve arm the weights cannot honour.
+    cfg.advantage_cond = not args.filter_label
+    if not args.filter_label:
+        cfg.advantage_inject = args.advantage_inject
     ckpt = dict(parent)
     ckpt["model"] = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     ckpt["config"] = cfg.to_dict()
