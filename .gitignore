@@ -178,5 +178,12 @@ transfer/sim/robots/g1/*_mjeval_*.xml
 # each worker its own scene TAG so concurrent workers cannot tear one file -- so a run leaves
 # one XML per shard. Regenerated deterministically from the clip library's terrain_manifest,
 # so they are build output rather than assets, exactly like the mjeval courses above.
-transfer/sim/robots/g1/*_tile*_attr*.xml
-transfer/sim/robots/g1/*_tile*_smoke.xml
+# ONE rule rather than a line per tool. This was four per-tool patterns (_attr*, _smoke,
+# _expl*, and _gate would have been a fifth), which is a shape that rots: every new probe
+# needs a new line, and forgetting one commits build output. The tracked tile scenes ALL end
+# in `_scene.xml` -- g1_perceptive_tile0_scene.xml and its five siblings -- so the negation
+# keeps exactly the assets and drops exactly the generated ones. Verified with
+# `git check-ignore -v` on both sets; the negation works because only FILES are excluded here
+# (a re-include cannot rescue a file under an excluded directory).
+transfer/sim/robots/g1/*_tile*.xml
+!transfer/sim/robots/g1/*_scene.xml

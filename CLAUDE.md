@@ -640,10 +640,12 @@ before the first riser on the flight's centreline:
   load. The generated scenes are derived and deliberately NOT committed.
 
 **The Isaac per-state best-of-K harness was ABANDONED, and why matters.** It branched K
-generator samples from one state by copying an env's state onto K others. The copy is exact in
-every buffer the controller reads (verified: root pose/vel and joint pos/vel all 0.000e+00
-immediately after) but cannot restore PhysX's contact manifolds, friction anchors or solver
-warm start. A same-noise control -- every candidate handed ONE draw, so zero signal by
+generator samples from one state by copying an env's state onto K others. The copy matches on
+the four PHYSICS buffers -- root pose/vel and joint pos/vel, all 0.000e+00 immediately after --
+but NOT on what the controller actually READS: `obs_policy` differed by 2.375 in that same
+instant, and one step later joint positions had diverged 0.2195 rad
+(`logs/headroom/v1/headroom/restore_probe.json`). PhysX's contact manifolds, friction anchors
+and solver warm start are not restorable either. A same-noise control -- every candidate handed ONE draw, so zero signal by
 construction -- produced a best-of-K rise of +0.005 to +0.031 per family, matching or exceeding
 the real arm's at every horizon from 0.24 s to 1.20 s (ratio 0.80-0.93). Independent
 per-candidate noise MANUFACTURES a best-of-K rise of about its own flip probability, and two
@@ -652,6 +654,77 @@ control's rise 0.0151. So the instrument had no resolving power and its "the gap
 bias-limited" reading was not supported. A second defect compounded it: the first action after
 a restore was computed from the PRE-restore observation. The MuJoCo probe has no restore at
 all, which is why it replaced it.
+
+## The failure critic READS IN MUJOCO (2026-08-30), and the goal anchor is what unblocked it
+
+`fit_value.py` trains a `P(fail)` head over the generator's frozen encoder. It could only be
+read in Isaac, because three of its context features are goal-region quantities needing a live
+`MotionSequenceCommand` -- which is why `fm_sample_explorer.py` records outcomes rather than
+critic readings and why `TODO(attribution-critic-trace)` existed. `transfer/sim/mjeval/`
+`goal_anchor.py` + `critic.py` close it. This matters because best-of-K needs to branch K
+candidates from one state, and MuJoCo needs no state restore at all (a fixed noise tape replayed
+from spawn is exactly deterministic), where the Isaac attempt at the same thing was abandoned.
+
+**The anchor is EXACT and free, and it is NOT `Course.target_xy`.** Measured over 14703
+episodes / 2289 clips / 75 real tiles:
+
+    goal_pos_w - y_des[clip, clip_len - 51, 0:3]   is CONSTANT within a tile
+        max within-tile spread   x 7.6e-06   y 1.5e-05   z 0.0   m
+
+so the anchor in tile-local coords IS the clip's own terminal pelvis position, straight from
+the clip library -- no layout rebuild, no torch, no IsaacLab. `goal_frame_yaw == 0.0` on every
+episode, so the terrain rotation is the identity and `frame_offsets` is plain subtraction
+(`assert_yaw_free` refuses a library that ever authors turned tiles).
+- **`target_xy` is the far platform's CENTRE** and those platforms are 7.5-10.1 m deep while
+  the clip steps only 0.8-2.1 m onto them. Bias: stairs_up **-3.06 m**, stairs_down **-3.17**,
+  jump_on **-0.44**, jump_off_front **+4.92** (sign flips). That is 0.61-0.63 of a normalized
+  context unit of pure offset on a feature the critic reads directly. It keeps owning
+  `in_goal` / success and is untouched, so every mjeval number already measured stays
+  comparable; the two goals answer different questions and are deliberately not unified.
+- A per-tile MEDIAN costs `|x - median|` of 0.000 (jump_on) / 0.083 (stairs_down) / 0.176
+  (stairs_up) m at the median, 4.3-6.5x better than `target_xy` at p90 -- and the residual is
+  real clip-to-clip variation that the critic, whose Isaac anchor is per CLIP, was fitted
+  across. `target_xy`'s error is a systematic offset, which it was not.
+- **Tile -1 is REFUSED, not approximated**: the flat sentinel has no tile frame at all
+  (spread 129 m), so the identity is undefined rather than noisy.
+
+**Transfer measured against MuJoCo's OWN outcomes** (`critic_gate.py`, 48 episodes / 11 falls,
+tiles 6 + 20): AUC(`p_fail_mean`) **0.946** with a label-shuffle control at **0.517 +/- 0.097**,
+AUC(`p_fail_max`) 0.846, failures 0.772 vs successes 0.368. Isaac's held-out-tile reference is
+0.906. The shuffle landing at 0.50 is what makes the rest mean anything -- it is the check the
+abandoned Isaac harness failed. Read with care: 2 tiles, and the 2.52 s median lead time counts
+only the 8 of 11 falls that ever crossed 0.5, so it says "when it fires it fires early", NOT
+"it catches falls 2.5 s out".
+
+**Two arms of the sabotage suite are BLIND, and they are findings about the CRITIC**: a
+transposed scan fold moves `p_fail` 0.0049 against 0.0704 for zeroing the scan, and a
+history rolled one row 0.0024 against 0.0577 for zeroing it. So it reads the scan's CONTENT
+but barely its spatial LAYOUT, and the history's content but barely its temporal ORDER.
+Neither is catchable by a delta test; `SCAN_HW` is `(11, 16)` and deliberately not square so
+the wrong fold raises on shape instead.
+- `ProprioRing` must stay an exact mirror of `record_rollouts.ProprioRing` -- control rate not
+  re-plan rate, ABSOLUTE joint_pos, zeroed on reset. **Do not substitute
+  `policy._obs_history`** despite its `history_length=10`: it stores
+  `joint_pos - default_joint_angles`, post-clip, and its first push FILLS all ten slots
+  instead of zero-padding. Three silent mismatches at once.
+- The runtime is XYZW everywhere (`build_state` stores `wxyz_to_xyzw(qpos[3:7])`), so the
+  frame helpers delegate to `deploy.quat_math_np` rather than restating the algebra. Hand-
+  rolling it was wrong once, and the error was finite and plausible.
+- **`isaaclab` is not IsaacSim.** `robot_rl.flow_matching.online` imports in 1.1 s pulling 152
+  `isaaclab.*` modules and **zero** `isaacsim`/`omni`/`pxr`/`carb`, and coexists with mujoco
+  and onnxruntime. The critic arm needs `env_isaaclab` only because `env_transfer` carries no
+  torch, deliberately; without `--critic_ckpt` mjeval stays torch-free.
+
+**Two live bugs this surfaced, both fixed here:**
+- **35 tiles could not be built as courses at all.** `isaac_tile_course`'s `klass` inference
+  substring-scanned for `"box"`/`"stairs_down"` against manifest families like
+  `family_jump_on.h5` (20 tiles) and `family_stairs_dn_pure.h5` (15) -- while
+  `family_stairs_up_pure.h5` DID resolve, purely because `"stairs_up"` is a substring of it.
+  A scan that silently succeeds on one `_pure` family and refuses its mirror is matching
+  spelling, not meaning; it is an explicit `FAMILY_KLASS` table now.
+- **The re-plan edge only advanced when a classifier was attached** -- `last_plan_id` lived
+  inside that branch -- so any second consumer of the edge would have seen EVERY step as a
+  re-plan, silently, the flag being plausible either way.
 
 ## What the harness has established about the depth generator (2026-08-24)
 

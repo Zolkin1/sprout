@@ -238,6 +238,17 @@ class Course:
             metric into approach and on-course halves.
         speeds: The ten commanded forward speeds for this course.
         note: One line for the manifest, saying what this course varies.
+        goal_anchor_xyz: Where the failure critic measures its three goal features FROM, in
+            this course's world frame, or ``None`` when no anchor is available.  This is NOT
+            ``target_xy``: that is the far platform's CENTRE and owns ``in_goal`` / success,
+            whereas the critic's anchor is where the reference CLIP finishes, and the two
+            differ by a family-systematic 0.44-3.17 m (see :mod:`goal_anchor`).  Keeping them
+            separate is what lets the critic be scored here without moving any success number
+            already measured.
+        goal_anchor_source: ``"clip"`` when recovered from the library's own terminal pose,
+            ``"none"`` when absent.  A course with no anchor cannot be critic-scored, and
+            saying so beats defaulting to ``target_xy``, which would read as an anchor while
+            being off by most of a normalized unit.
     """
 
     name: str
@@ -253,6 +264,8 @@ class Course:
     note: str
     goal_half_width_m: float = GOAL_HALF_WIDTH_FLOOR
     params: dict = field(default_factory=dict)
+    goal_anchor_xyz: tuple[float, float, float] | None = None
+    goal_anchor_source: str = "none"
 
     @property
     def class_code(self) -> int:
@@ -865,9 +878,60 @@ def manifest_rows() -> list[dict]:
     return rows
 
 
+#: Manifest family -> course class.  An explicit table rather than a substring scan, which is
+#: what this used to be and which was wrong three ways at once: ``family_jump_on.h5`` contains
+#: no "box" so all 20 of those tiles raised, ``family_stairs_dn_pure.h5`` contains no
+#: "stairs_down" so all 15 of those raised -- while ``family_stairs_up_pure.h5`` DID resolve,
+#: purely because "stairs_up" happens to be a substring of it.  That asymmetry is the tell: a
+#: scan that silently succeeds on one "_pure" family and refuses its mirror is matching
+#: spelling, not meaning.
+#:
+#: The excluded families are absent on purpose rather than mapped to something plausible:
+#: ``jump_off`` / ``jump_off_front`` jump BACKWARDS or dismount, which no forward-facing camera
+#: sees and which :mod:`goal_anchor` refuses anyway, and ``distractor`` is skipped from FM
+#: training by default.  A tile from one of those names itself in the error.
+FAMILY_KLASS = {
+    "stairs_up": "stairs_up",
+    "stairs_up_pure": "stairs_up",
+    "stairs_down": "stairs_down",
+    "stairs_dn_pure": "stairs_down",
+    "jump_on": "box",
+}
+
+
+def klass_for_family(family: str, terrain_id: int | None = None) -> str:
+    """Resolve a manifest family string to a :data:`CLASS_CODES` key.
+
+    Args:
+        family: The manifest's own ``family`` entry, e.g. ``"family_jump_on.h5"``.
+        terrain_id: Tile id, for the error message only.
+
+    Returns:
+        The course class.
+
+    Raises:
+        ValueError: If the family maps to no class.  Excluded families are named as excluded
+            rather than reported as unknown, since those two need different responses.
+    """
+    stem = family.removeprefix("family_").removesuffix(".h5")
+    if stem in FAMILY_KLASS:
+        return FAMILY_KLASS[stem]
+    where = "" if terrain_id is None else f"tile {terrain_id} "
+    if stem in ("jump_off", "jump_off_front", "distractor"):
+        raise ValueError(
+            f"{where}is family {stem!r}, which is deliberately EXCLUDED from course building: "
+            "jump_off/jump_off_front move backwards or dismount (unobservable to a "
+            "forward-facing camera, and refused by mjeval.goal_anchor), and distractor is "
+            "skipped from FM training by default. Pass klass= explicitly to override.")
+    raise ValueError(
+        f"{where}family {family!r} maps to no CLASS_CODES key. Known families: "
+        f"{sorted(FAMILY_KLASS)}. Add it to FAMILY_KLASS or pass klass= explicitly.")
+
+
 def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, ...],
                       approach: float = 2.5, name: str | None = None,
-                      klass: str | None = None) -> Course:
+                      klass: str | None = None,
+                      goal_anchor_max_offset: int | None = None) -> Course:
     """A :class:`Course` that IS one tile of a clip library, geometry for geometry.
 
     Every other course in this module is deliberately NOT a trained tile -- authored to vary
@@ -889,6 +953,13 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
             driving ``+x`` walks the feature.
         name: Scene name; defaults to ``tile<id>``.
         klass: One of :data:`CLASS_CODES`; inferred from the manifest family when omitted.
+        goal_anchor_max_offset: The tracker's furthest reference-window offset (50 for every
+            current tracker).  When given, the failure critic's goal anchor is recovered from
+            this library and attached; when ``None`` it is not, and the course cannot be
+            critic-scored.  Opt-in because recovering it reads one row per clip on the tile,
+            which every non-critic caller would pay for nothing.  It is stated rather than
+            defaulted because it sets ``last_usable_step`` and a wrong value yields a
+            plausible anchor about a metre off.
 
     Returns:
         The course, with an infinite floor plane so ``floor_z`` means what it means for every
@@ -912,11 +983,7 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
     obstacle_x = float(step["pos_xy"][0]) - float(step["size_xyz"][0]) / 2.0 - sx
 
     if klass is None:
-        fam = str(entry.get("family", ""))
-        klass = next((k for k in ("stairs_up", "stairs_down", "box") if k in fam), None)
-        if klass is None:
-            raise ValueError(f"tile {terrain_id} family {fam!r} maps to no CLASS_CODES key; "
-                             "pass klass= explicitly")
+        klass = klass_for_family(str(entry.get("family", "")), terrain_id)
 
     # The far platform: walk the walkable tops downrange of the flight and take the farthest
     # one's centre as the goal, so "traversed" means "got off the feature and onto the far
@@ -933,6 +1000,18 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
     # The floor plane's z, read back out of the emitted geom rather than recomputed, so this
     # cannot disagree with the scene it describes.
     floor_z = float(floor.split('pos="0 0 ')[1].split('"')[0])
+
+    # The critic's goal anchor, if asked for. Tile-local -> this course's world frame is the
+    # same subtraction `tile_geoms` applied to the geometry, so the anchor lands in the frame
+    # the robot actually walks in.
+    anchor_xyz, anchor_src = None, "none"
+    if goal_anchor_max_offset is not None:
+        import goal_anchor as _ga  # noqa: PLC0415
+
+        ta = _ga.tile_anchors(clip_path, max_offset=int(goal_anchor_max_offset),
+                              terrain_ids=[int(terrain_id)])[int(terrain_id)]
+        anchor_xyz = (ta.anchor[0] - sx, ta.anchor[1] - sy, ta.anchor[2] - sz)
+        anchor_src = "clip"
     return Course(
         name=name or f"tile{terrain_id}",
         klass=klass,
@@ -949,6 +1028,8 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
               f"x={obstacle_x:+.2f} m, net {target_z - sz:+.3f} m over the feature; "
               "in-distribution terrain, so a variance measured here is not confounded with "
               "perceptive distribution shift"),
+        goal_anchor_xyz=anchor_xyz,
+        goal_anchor_source=anchor_src,
         params={"clip_path": clip_path, "terrain_id": int(terrain_id),
                 "approach": float(approach), "spawn_tile_xy": [sx, sy], "spawn_tile_z": sz},
     )

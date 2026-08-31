@@ -462,7 +462,8 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 cmd: np.ndarray, classifier: PlanClassifier | None,
                 recorder=None, steer_kp: float = 0.0,
                 steer_wz_max: float = STEER_WZ_MAX,
-                cfg_hold: float = terrains.CMD_HOLD_S) -> tuple[str, str, Any]:
+                cfg_hold: float = terrains.CMD_HOLD_S,
+                probe=None) -> tuple[str, str, Any]:
     """One deterministic trial: spawn, drive at ``cmd``, and stop on a fall, the target or time.
 
     **Three orderings inside the loop are load-bearing.**  The fall test runs BEFORE the target
@@ -488,6 +489,14 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             ``view_cell.py`` passes one to capture a replayable trajectory; because the episode
             is deterministic, the captured re-run reproduces its table row exactly, which is
             what makes the replay THE episode rather than a similar one.
+        probe: Optional ``(robot, policy, state, is_replan) -> None``, called once per control
+            step at the same point as ``recorder`` but ALSO handed the state dict the policy
+            was just given, and told whether this step carried a re-plan.  That is what the
+            failure critic needs and ``recorder`` cannot supply: its inputs are the
+            generator's conditioning, which lives in ``state``, and its proprioception ring
+            runs at the CONTROL rate while it is only read at a re-plan.  Additive rather than
+            a widened ``recorder`` so ``view_cell.py`` and ``fm_sample_explorer.py`` are
+            untouched.  ``None`` by default and therefore free.
 
     Returns:
         ``(verdict, failure_code, accumulator)``, the first two being
@@ -535,18 +544,25 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 break
             plan_class = None
             plan = policy.last_plan()
-            if classifier is not None and plan is not None \
-                    and int(plan["plan_id"]) != last_plan_id:
+            # The edge is detected unconditionally now. It used to be computed INSIDE the
+            # `classifier is not None` branch, so `last_plan_id` never advanced without a
+            # classifier and any second consumer of the edge would have seen every step as a
+            # re-plan -- silently, since the flag is plausible either way.
+            is_replan = plan is not None and int(plan["plan_id"]) != last_plan_id
+            if is_replan:
                 last_plan_id = int(plan["plan_id"])
-                window = policy.predicted_window()
-                if window is not None:
-                    plan_class = classifier.label(window)
+                if classifier is not None:
+                    window = policy.predicted_window()
+                    if window is not None:
+                        plan_class = classifier.label(window)
             acc.fold(robot, policy, plan_class, cmd=live_cmd, scored=not holding)
             # Fired at the same point as the fold, so a captured frame is one the policy
             # actually acted on rather than the state after an advance it never saw.  `None`
             # by default and therefore free: the sweep pays nothing for the viewer's hook.
             if recorder is not None:
                 recorder(robot, policy)
+            if probe is not None:
+                probe(robot, policy, state, is_replan)
             for _ in range(rig.decim):
                 robot.step()
             # The traversal gate is the second half of "got through": these lanes are finite in
