@@ -316,8 +316,6 @@ def main() -> int:
             opt.step()
             run += float(loss.item())
             nb += 1
-            if wb is not None and nb % 200 == 0:
-                wb.log({"train/loss": run / nb, "epoch": ep})
 
         row = {"epoch": ep + 1, "train_loss": run / max(nb, 1)}
         for scope, m in (("val_ep", val_ep), ("val_tile", val_tile)):
@@ -338,7 +336,12 @@ def main() -> int:
               f"val_tile AUC {row.get('val_tile/auc', float('nan')):.3f} "
               f"rank {row.get('val_tile/rank_acc', float('nan')):.3f}", flush=True)
         if wb is not None:
-            wb.log({k: v for k, v in row.items() if not isinstance(v, dict)})
+            # step=epoch on EVERY call, matching train.py:1156. Without it wandb advances its
+            # own counter once per log() CALL, so an intra-epoch loss log and an end-of-epoch
+            # metrics log land at different x positions and the axis stops being the epoch.
+            # This used to log every 200 batches as well, which put ~14 points per epoch on
+            # the same axis as the epoch metrics.
+            wb.log({k: v for k, v in row.items() if not isinstance(v, dict)}, step=ep)
         if row["train_loss"] < best[0]:
             best = (row["train_loss"], ep)
             torch.save({"model": model.state_dict(), "fm_checkpoint": args.fm_checkpoint,
