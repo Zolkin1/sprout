@@ -246,7 +246,15 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                 snap.restore(robot, policy, fm_lag)
             # The ONLY difference between candidates. One flow sample is drawn per re-plan,
             # so re-seeding here varies the chunk and nothing else.
-            policy._rng = np.random.default_rng(600000 + 7919 * n_replans + cand)
+            #
+            # THE EPISODE SEED IS PART OF IT. Without it every K>1 episode draws the identical
+            # candidate sequence, so all N episodes of an arm are ONE episode repeated -- the
+            # measured "success rate" is then 0.000 or 1.000 and nothing else, which reads as
+            # a catastrophically bad selector. K=1 is unaffected (it advances policy._rng from
+            # the episode seed naturally), which is exactly what made the two arms look so far
+            # apart. Seeded as a SEQUENCE rather than an arithmetic combination so no
+            # (seed, replan, cand) triple can alias another.
+            policy._rng = np.random.default_rng([seed, n_replans, cand])
             # Each candidate gets its OWN copy of the episode's z extremes: a branch that
             # climbs must not hand its traversal credit to a sibling that did not.
             cz = list(zex)
@@ -313,16 +321,17 @@ def run(args) -> int:
 
         for k in ks:
             wins = 0
-            for ep in range(args.episodes):
+            for ep in range(args.seed_offset, args.seed_offset + args.episodes):
                 v, f, nr, sc = run_episode_selected(
                     rig, policy, fm_lag, spawn, cmd, cfg, crit, course.goal_anchor_xyz,
                     k=k, seed=ep, mjrunner=mjrunner)
                 wins += int(v == "success")
                 rows.append({"tile": tile, "k": k, "episode": ep, "verdict": v,
                              "failure": f, "n_replans": nr})
-                if (ep + 1) % max(1, args.episodes // 10) == 0:
-                    print(f"  tile {tile} K={k}: {ep + 1}/{args.episodes} "
-                          f"success {wins / (ep + 1):.3f}  ({(time.time() - t0) / 60:.1f} min)",
+                done = ep - args.seed_offset + 1
+                if done % max(1, args.episodes // 10) == 0:
+                    print(f"  tile {tile} K={k}: {done}/{args.episodes} "
+                          f"success {wins / done:.3f}  ({(time.time() - t0) / 60:.1f} min)",
                           flush=True)
             print(f"  tile {tile} K={k}: SUCCESS {wins / args.episodes:.3f} "
                   f"({wins}/{args.episodes})", flush=True)
@@ -358,6 +367,11 @@ def main() -> int:
     p.add_argument("--k", default="1,4,8", help="comma list of candidate counts.")
     p.add_argument("--episodes", type=int, default=200,
                    help="per arm per tile, seed-matched across arms (seed = episode index).")
+    p.add_argument("--seed_offset", type=int, default=0,
+                   help="first episode seed. Shards an arm across processes WITHOUT breaking "
+                        "the seed matching, since the seed is the episode index and not a "
+                        "position in a per-process sequence: shard [0,100) and [100,200) of "
+                        "K=8 cover exactly the seeds K=1 ran, so the arms still pair.")
     p.add_argument("--speed", type=float, default=0.8)
     p.add_argument("--approach", type=float, default=2.5)
     p.add_argument("--max_offset", type=int, default=50)
