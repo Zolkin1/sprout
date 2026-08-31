@@ -43,6 +43,7 @@ import dataclasses
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 import traceback
@@ -162,6 +163,18 @@ def run(args) -> int:
 
     t0 = time.time()
     os.makedirs(args.out, exist_ok=True)
+    # A kill already leaves a READABLE file -- verified on a live mid-write copy and on a
+    # crashed shard -- but `meta` is stamped only by `Writer.close()`, so a killed run loses
+    # its own record of how it was built. Catching the signal turns "recoverable" into
+    # "clean": the loop finishes its current episode, the last partial batch is flushed, and
+    # `stopped_on` says a signal did it. Re-raising is deliberately NOT done; a second signal
+    # still kills outright, so a wedged run can always be forced.
+    signalled: list = []
+    for _sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(_sig, lambda sg, _f: (signalled.append(sg),
+                                            print(f"\n[collect] signal {sg}: finishing the "
+                                                  "current episode, then closing cleanly",
+                                                  flush=True)))
     crit = C.FailureCritic(args.critic_ckpt, device=args.device)
     tiles = [int(t) for t in args.tiles.split(",")]
     clips = select_clips(args.clip_lib, tiles, int(args.clips_per_tile))
@@ -184,6 +197,8 @@ def run(args) -> int:
 
     def _budget() -> str | None:
         """Which stop condition binds, or None."""
+        if signalled:
+            return f"signal {signalled[0]}"
         if (time.time() - t0) / 3600.0 >= args.max_hours:
             return f"max_hours ({args.max_hours})"
         if w.n >= args.max_samples:
