@@ -167,6 +167,178 @@ def tile_anchors(clip_h5: str, *, max_offset: int,
     return out
 
 
+def tile_episode_seconds(clip_h5: str, *, max_offset: int, terrain_ids, dt: float = 0.02,
+                         reduce: str = "max") -> dict[int, float]:
+    """How long an ISAAC episode on each tile is allowed to run, in seconds.
+
+    The eval harness adds a ``clip_end`` termination at
+    ``clip_len - 1 - max_offset`` (see ``mdp.clip_end_reached`` and
+    :func:`last_usable_step`), so that -- not a wall clock -- is the window every Isaac episode
+    lived inside, and therefore the only window the failure critic was ever fitted on.
+
+    mjeval has no clip and bounds episodes by ``course_length_m / BUDGET_SPEED`` instead, which
+    is derived from DISTANCE and is measurably the wrong variable: tile 40 (a box jump-on) has
+    the longest clips of the three shipped feature tiles (10.4 s median) and the SHORTEST
+    budget (15.1 s), because it is the shortest course.  Worse for this purpose, a successful
+    tile-6 run takes ~10.8 s against a 6.3 s median clip, so its last ~4.5 s sit outside the
+    regime any training episode reached.
+
+    Args:
+        clip_h5: The clip library.
+        max_offset: The tracker's furthest reference-window offset.
+        terrain_ids: Which tiles to report.
+        dt: Control period, seconds.
+        reduce: ``"max"`` (default) or ``"median"`` over the tile's clips.  MuJoCo needs ONE
+            number per tile where Isaac has one per episode, and ``max`` is the choice that
+            cannot cut a run shorter than the longest Isaac episode on that tile -- so it
+            bounds without introducing a new way to fail.
+
+    Returns:
+        ``{terrain_id: seconds}``.
+    """
+    import h5py  # noqa: PLC0415
+
+    fn = {"max": np.max, "median": np.median}[reduce]
+    with h5py.File(clip_h5, "r") as f:
+        clip_len = f["clip_len"][:]
+        tid = f["terrain_id"][:]
+        step = last_usable_step(clip_len, max_offset)
+        out = {}
+        for t in terrain_ids:
+            rows = np.flatnonzero(tid == int(t))
+            if rows.size == 0:
+                raise ValueError(f"clip library {clip_h5} has no clips on terrain_id {t}")
+            out[int(t)] = float(fn(step[rows]) * dt)
+    return out
+
+
+@dataclass(frozen=True)
+class ClipEpisode:
+    """Everything ONE Isaac episode is defined by, read straight from its clip.
+
+    The point of this object is that nothing in it is aggregated.  A tile carries ~50 clips
+    with different lengths, endpoints and commands, and mjeval used to build one course per
+    TILE -- which forced a reduction of 50 numbers to 1, and any two fields reduced differently
+    (a ``max`` duration beside a ``median`` endpoint) imply a pace neither clip ever ran at.
+    Isaac has no such problem because it runs one clip per episode.  So does this.
+
+    Attributes:
+        clip_id: Index into the library.
+        terrain_id: Its tile.
+        command: ``(T, 3)`` the commanded ``(vx, vy, wz)`` per control step -- the SAME signal
+            Isaac's teacher was driven by, read from ``target_vel`` rather than inferred.  A
+            pace derived as distance/duration is not this and is badly wrong: on tile 6 the
+            derived figure is 0.86 m/s against a real command of 1.60, because the clip climbs
+            and turns and its mean ground speed is far below what it was told to do.
+        constant_command: True when ``command`` never changes over the clip (188 of 200
+            sampled clips).  A constant can be handed to ``run_episode`` as-is; a varying one
+            needs the per-step path.
+        duration_s: ``(clip_len - 1 - max_offset) * dt`` -- the ``clip_end`` window the episode
+            lives inside, and therefore the only window the failure critic was fitted on.
+        goal_xyz: The clip's terminal pelvis position, tile-local.  This is the goal LINE, not
+            the line minus a margin: mjeval's ``in_goal`` already awards success within
+            ``GOAL_DEPTH / 2`` = 1.0 m, which is exactly Isaac's ``approach_margin_m``.
+        start_pos / start_quat_wxyz / start_joint_pos: The reference pose at step 0, tile-local.
+            Isaac starts the robot ON the clip; mjeval used to spawn it standing at a nominal
+            pose, which on stairs is the difference between arriving in phase with the treads
+            and arriving from a standstill.
+        start_lin_vel / start_ang_vel / start_joint_vel: The reference VELOCITIES at step 0,
+            from ``dy_des``.  Isaac writes all four -- root pose, root velocity, joint position
+            and joint velocity (``resets._commit_clip_reset``) -- so dropping the velocity half
+            would start the robot at the right pose and dead still, which is a different
+            initial condition that looks correct in a viewer.
+        joint_names: The clip's own joint ORDER, carried so a consumer can convert rather than
+            assume.  It is the ROBOT's per-limb order and **differs from the policy's
+            interleaved order in 27 of 29 positions** -- writing one where the other is
+            expected produces a plausible, entirely wrong pose.
+    """
+
+    clip_id: int
+    terrain_id: int
+    command: np.ndarray
+    constant_command: bool
+    duration_s: float
+    goal_xyz: tuple[float, float, float]
+    start_pos: tuple[float, float, float]
+    start_quat_wxyz: tuple[float, float, float, float]
+    start_joint_pos: tuple[float, ...]
+    start_lin_vel: tuple[float, float, float]
+    start_ang_vel: tuple[float, float, float]
+    start_joint_vel: tuple[float, ...]
+    joint_names: tuple[str, ...]
+
+
+#: Column layout of ``y_des``, from the library's own ``pos_output_names``.  Read rather than
+#: assumed -- but pinned here so a library that reorders them fails loudly instead of writing
+#: a plausible pose. ``ori_*`` is w-FIRST, which is already MuJoCo's ``qpos[3:7]`` convention.
+Y_DES_POS = slice(0, 3)
+Y_DES_QUAT_WXYZ = slice(3, 7)
+Y_DES_JOINTS = slice(35, 64)
+
+
+def clip_episode(clip_h5: str, clip_id: int, *, max_offset: int,
+                 dt: float = 0.02) -> ClipEpisode:
+    """Read one clip's full episode definition.
+
+    Args:
+        clip_h5: The clip library.
+        clip_id: Which clip.
+        max_offset: The tracker's furthest reference-window offset.
+        dt: Control period, seconds.
+
+    Returns:
+        The :class:`ClipEpisode`.
+
+    Raises:
+        ValueError: If the library's channel layout is not the one :data:`Y_DES_JOINTS` and
+            friends describe -- the slices are constants, so a reordered library would
+            otherwise yield a well-shaped, entirely wrong pose.
+    """
+    import h5py  # noqa: PLC0415
+
+    with h5py.File(clip_h5, "r") as f:
+        names = json.loads(f.attrs["pos_output_names"])
+        if names[0] != "pelvis_link:pos_x" or names[3] != "pelvis_link:ori_w":
+            raise ValueError(
+                f"{clip_h5} does not open with the pelvis pose in the expected order "
+                f"(got {names[:4]}). Y_DES_POS / Y_DES_QUAT_WXYZ are constants and would "
+                "silently read the wrong columns.")
+        joints = [n for n in names if n.startswith("joint:")]
+        if len(joints) != 29 or names[Y_DES_JOINTS][0] != joints[0]:
+            raise ValueError(
+                f"{clip_h5} has {len(joints)} joint columns and they do not start at "
+                f"{Y_DES_JOINTS.start}; the layout this module pins has moved.")
+        vnames = json.loads(f.attrs["vel_output_names"])
+        vj = [i for i, n in enumerate(vnames) if n.startswith("joint:")]
+        if vnames[:6] != ["pelvis_link:pos_x", "pelvis_link:pos_y", "pelvis_link:pos_z",
+                          "pelvis_link:ori_x", "pelvis_link:ori_y", "pelvis_link:ori_z"]:
+            raise ValueError(f"{clip_h5}'s dy_des does not open with the pelvis twist "
+                             f"(got {vnames[:6]}); the velocity slices below would be wrong.")
+        if [vnames[i].split(":")[1] for i in vj] != [n.split(":")[1] for n in names
+                                                     if n.startswith("joint:")]:
+            raise ValueError(f"{clip_h5}'s dy_des joint order differs from y_des's; this "
+                             "module assumes one joint order for the clip and would pair "
+                             "each joint's position with another joint's velocity.")
+        c = int(clip_id)
+        n = int(f["clip_len"][c])
+        end = int(last_usable_step(np.array([n]), max_offset)[0])
+        cmd = np.asarray(f["target_vel"][c, :end + 1], dtype=np.float64)
+        row0 = np.asarray(f["y_des"][c, 0], dtype=np.float64)
+        rowE = np.asarray(f["y_des"][c, end], dtype=np.float64)
+        d0 = np.asarray(f["dy_des"][c, 0], dtype=np.float64)
+        return ClipEpisode(
+            clip_id=c, terrain_id=int(f["terrain_id"][c]),
+            command=cmd, constant_command=bool(np.allclose(cmd, cmd[0], atol=1e-6)),
+            duration_s=float(end * dt),
+            goal_xyz=tuple(rowE[Y_DES_POS]),
+            start_pos=tuple(row0[Y_DES_POS]),
+            start_quat_wxyz=tuple(row0[Y_DES_QUAT_WXYZ]),
+            start_joint_pos=tuple(row0[Y_DES_JOINTS]),
+            start_lin_vel=tuple(d0[0:3]), start_ang_vel=tuple(d0[3:6]),
+            start_joint_vel=tuple(d0[vj]),
+            joint_names=tuple(n.split(":")[1] for n in names if n.startswith("joint:")))
+
+
 def frame_offsets(root_pos: np.ndarray, anchor: np.ndarray) -> np.ndarray:
     """``(downrange, lateral, height_err)`` -- the numpy twin of ``goal_frame_offsets``.
 

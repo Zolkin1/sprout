@@ -266,6 +266,7 @@ class Course:
     params: dict = field(default_factory=dict)
     goal_anchor_xyz: tuple[float, float, float] | None = None
     goal_anchor_source: str = "none"
+    budget_s_override: float | None = None
 
     @property
     def class_code(self) -> int:
@@ -282,7 +283,21 @@ class Course:
         Derived from :data:`BUDGET_SPEED` so it is generous for the slowest trial and
         therefore not the binding constraint at any speed -- which is what makes a timeout at
         2.6 m/s a finding about the policy rather than about the clock.
+
+        **``budget_s_override`` replaces this with the ISAAC episode length**, and that is the
+        right thing whenever something fitted on Isaac rollouts is being read here -- the
+        failure critic above all.  Isaac's eval adds a ``clip_end`` termination at
+        ``clip_len - 1 - max_offset``, so that is the only window the critic ever saw; a
+        MuJoCo run that keeps going past it reads the critic in a regime no training episode
+        reached.  Measured on the shipped tiles, this default runs 1.4-3.6x longer than the
+        clip, so the gap is not marginal.  See ``goal_anchor.tile_episode_seconds``.
+
+        The distance-derived default is also anti-correlated with difficulty on a box tile:
+        tile 40's clips are the LONGEST of the three feature tiles (10.4 s) while its course
+        is the shortest, so it gets the tightest budget of the three.
         """
+        if self.budget_s_override is not None:
+            return float(self.budget_s_override)
         return self.course_length_m / BUDGET_SPEED + BUDGET_SETTLE + CMD_HOLD_S
 
     @property
@@ -928,10 +943,125 @@ def klass_for_family(family: str, terrain_id: int | None = None) -> str:
         f"{sorted(FAMILY_KLASS)}. Add it to FAMILY_KLASS or pass klass= explicitly.")
 
 
+def isaac_clip_course(clip_path: str, clip_id: int, *, max_offset: int = 50,
+                      name: str | None = None, klass: str | None = None) -> Course:
+    """A :class:`Course` that IS one CLIP -- its terrain, start, goal, duration and command.
+
+    :func:`isaac_tile_course` builds one course per TILE, which forces a reduction of the
+    tile's ~50 clips to a single number per field.  Any two fields reduced differently imply a
+    trajectory no clip ever ran: a ``max`` duration beside a ``median`` endpoint understates
+    the pace, and the resulting configuration measured 0 successes in 6 reference episodes on
+    tile 6 -- an infeasible course rather than a policy result.  Isaac has no such problem
+    because it runs one clip per episode.  Neither does this.
+
+    Every number here comes from the SAME clip:
+
+    * **terrain** -- the clip's tile, rebuilt from the manifest exactly as before;
+    * **origin** -- the clip's own start ``(x, y)`` and the walkable surface under it, so the
+      robot begins where the reference begins rather than a fixed ``approach`` distance out;
+    * **goal** -- the clip's terminal pelvis position.  NOT minus an approach margin:
+      ``in_goal`` already awards success within ``GOAL_DEPTH / 2`` = 1.0 m, which is exactly
+      Isaac's ``approach_margin_m``, and subtracting it here too would put the line a full
+      metre nearer than Isaac's while still reporting as matched;
+    * **budget** -- ``(clip_len - 1 - max_offset) * dt``, the ``clip_end`` window;
+    * **command** -- ``target_vel``, the signal Isaac's teacher was actually driven by.  A pace
+      inferred as distance/duration is NOT this and is badly wrong (0.86 m/s inferred against
+      a 1.60 m/s real command on tile 6), because the clip climbs and turns and its mean ground
+      speed is far below what it was told to do.
+
+    The caller still owes the SPAWN, because building it needs the policy's joint order and
+    this module has no policy.  ``params["clip_start_*"]`` carries everything for it, and
+    ``params["clip_joint_names"]`` carries the order those angles are in -- which is the
+    ROBOT's per-limb order and differs from the policy's interleaved order in 27 of 29
+    positions, so a consumer must convert by NAME rather than assume.
+
+    Args:
+        clip_path: Clip library ``.h5``.
+        clip_id: Which clip.
+        max_offset: The tracker's furthest reference-window offset.
+        name: Scene name; defaults to ``clip<id>``.
+        klass: One of :data:`CLASS_CODES`; inferred from the tile's family when omitted.
+
+    Returns:
+        The course.
+
+    Raises:
+        ValueError: If the clip's tile has no walkable surface under the clip's start, which
+            would put the robot in the air or inside geometry.
+    """
+    import generate_clip_tile_scene as gcts  # noqa: PLC0415
+
+    import goal_anchor as _ga  # noqa: PLC0415
+
+    ep = _ga.clip_episode(clip_path, clip_id, max_offset=max_offset)
+    entry, _info = gcts.load_tile(clip_path, ep.terrain_id)
+    overlays = gcts.emittable_overlays(entry)
+
+    # The scene origin is the CLIP's start, not a derived approach point.
+    sx, sy = float(ep.start_pos[0]), float(ep.start_pos[1])
+    sz = gcts.terrain_top_at(gcts.walkable(overlays), sx, sy)
+    if sz is None:
+        raise ValueError(
+            f"clip {clip_id} starts at ({sx:.2f}, {sy:.2f}) on tile {ep.terrain_id}, where "
+            "the tile has no walkable surface -- the robot would spawn in the air or inside "
+            "geometry. This clip cannot be run as a course.")
+    lines, floor = gcts.tile_geoms(entry, overlays, (sx, sy, sz), infinite_floor=True)
+    floor_z = float(floor.split('pos="0 0 ')[1].split('"')[0])
+
+    goal = (float(ep.goal_xyz[0]) - sx, float(ep.goal_xyz[1]) - sy,
+            float(ep.goal_xyz[2]) - sz)
+    if klass is None:
+        klass = klass_for_family(str(entry.get("family", "")), ep.terrain_id)
+
+    step = gcts.first_step(overlays)
+    obstacle_x = (float(step["pos_xy"][0]) - float(step["size_xyz"][0]) / 2.0 - sx
+                  if step is not None else 0.0)
+
+    return Course(
+        name=name or f"clip{int(clip_id)}",
+        klass=klass,
+        variant=int(ep.terrain_id),
+        geoms=tuple(lines),
+        floor_z=floor_z,
+        target_xy=(goal[0], goal[1]),
+        course_length_m=float(math.hypot(goal[0], goal[1])),
+        # The pelvis CLIMB, not the goal's height above the spawn ground. `traversed` tests
+        # `max_base_z >= SPAWN_BASE_Z + TRAVERSAL_FRAC * flight_height_m`, i.e. it measures a
+        # RISE from the spawn pelvis -- so passing the goal's absolute height here inflates the
+        # gate by one pelvis height (1.612 against the true 0.826 on clip 300) and no episode
+        # can ever be marked traversed. That fails as a TIMEOUT after the robot has already
+        # walked through the goal band, which reads as a locomotion result.
+        flight_height_m=float(goal[2] - (float(ep.start_pos[2]) - sz)),
+        obstacle_x_m=float(obstacle_x),
+        speeds=(float(ep.command[0][0]),),
+        note=(f"CLIP {clip_id} of tile {ep.terrain_id} ({entry.get('family', '?')}): "
+              f"{ep.duration_s:.2f} s at cmd {[round(float(v), 2) for v in ep.command[0]]}, "
+              f"{math.hypot(goal[0], goal[1]):.2f} m to the clip's own endpoint. Start, goal, "
+              "duration and command all come from THIS clip -- no aggregation over the tile."),
+        goal_anchor_xyz=goal,
+        goal_anchor_source="clip",
+        budget_s_override=float(ep.duration_s) + CMD_HOLD_S,
+        params={"clip_path": clip_path, "terrain_id": int(ep.terrain_id),
+                "clip_id": int(clip_id), "spawn_tile_xy": [sx, sy], "spawn_tile_z": sz,
+                "clip_duration_s": float(ep.duration_s),
+                "clip_command": ep.command.tolist(),
+                "clip_constant_command": bool(ep.constant_command),
+                "clip_start_pos": [ep.start_pos[0] - sx, ep.start_pos[1] - sy,
+                                   ep.start_pos[2] - sz],
+                "clip_start_quat_wxyz": list(ep.start_quat_wxyz),
+                "clip_start_joint_pos": list(ep.start_joint_pos),
+                "clip_start_lin_vel": list(ep.start_lin_vel),
+                "clip_start_ang_vel": list(ep.start_ang_vel),
+                "clip_start_joint_vel": list(ep.start_joint_vel),
+                "clip_joint_names": list(ep.joint_names)},
+    )
+
+
 def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, ...],
                       approach: float = 2.5, name: str | None = None,
                       klass: str | None = None,
-                      goal_anchor_max_offset: int | None = None) -> Course:
+                      goal_anchor_max_offset: int | None = None,
+                      isaac_matched: bool = False) -> Course:
     """A :class:`Course` that IS one tile of a clip library, geometry for geometry.
 
     Every other course in this module is deliberately NOT a trained tile -- authored to vary
@@ -960,6 +1090,23 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
             which every non-critic caller would pay for nothing.  It is stated rather than
             defaulted because it sets ``last_usable_step`` and a wrong value yields a
             plausible anchor about a metre off.
+        isaac_matched: Run this course the way the ISAAC eval runs its episodes -- which
+            means moving the time budget AND the goal line together, because moving either
+            alone is incoherent:
+
+            * budget becomes ``max(clip_len - 1 - max_offset) * dt + CMD_HOLD_S``, the
+              ``clip_end`` window every Isaac episode lived inside and therefore the only
+              window the failure critic was fitted on (the default runs 1.4-3.6x longer);
+            * the goal moves from ``target_xy`` (the far platform's CENTRE) to the clip's own
+              endpoint, which is what Isaac's goal region is centred on.
+
+            **Moving only the budget makes success unreachable.** At 0.8 m/s, tile 6's
+            ``target_x`` is 11.3 s away against a 7.5 s Isaac budget, and tile 20's is 9.5 s
+            against 8.1 s -- so every episode on both would time out by construction while
+            looking like a policy result. Needs ``goal_anchor_max_offset``.
+
+            Off by default: it changes what "success" MEANS on a course, so every mjeval
+            number measured before it stays comparable only as long as it stays opt-in.
 
     Returns:
         The course, with an infinite floor plane so ``floor_z`` means what it means for every
@@ -1012,6 +1159,42 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
                               terrain_ids=[int(terrain_id)])[int(terrain_id)]
         anchor_xyz = (ta.anchor[0] - sx, ta.anchor[1] - sy, ta.anchor[2] - sz)
         anchor_src = "clip"
+
+    budget_override = None
+    if isaac_matched:
+        if goal_anchor_max_offset is None:
+            raise ValueError("isaac_matched needs goal_anchor_max_offset: the Isaac episode "
+                             "length IS clip_len - 1 - max_offset and the goal IS the clip's "
+                             "endpoint at that step, so the offset is the quantity being "
+                             "matched and guessing it defeats the point.")
+        import goal_anchor as _ga2  # noqa: PLC0415
+        budget_override = _ga2.tile_episode_seconds(
+            clip_path, max_offset=int(goal_anchor_max_offset),
+            terrain_ids=[int(terrain_id)])[int(terrain_id)] + CMD_HOLD_S
+        # The goal moves WITH the budget. See the arg docstring: separately they are
+        # incoherent, and the incoherence presents as a policy result rather than an error.
+        # The goal line IS the anchor, and the approach margin is already there: Isaac awards
+        # success on a half-plane at `anchor_x - approach_margin_m` (1.0 m for every family in
+        # the fitted goal_regions.json), and `in_goal` awards it at `|x - target_x| <=
+        # GOAL_DEPTH / 2`, which is also 1.0 m. Subtracting the margin HERE as well would
+        # double-count it and put the success line a full metre nearer than Isaac's -- a
+        # silently easier course that still reports as matched.
+        #
+        # The two shapes differ (Isaac a half-plane, mjeval a band), but `run_episode` breaks
+        # on the first `in_goal`, so a robot can never leave the band by overshooting it.
+        target_x = float(anchor_xyz[0])
+        target_z = float(anchor_xyz[2]) + sz
+        # The PACE has to move too, and for the same reason the goal did. In Isaac the clip
+        # drives the robot, so it covers its own distance in its own time by construction. In
+        # MuJoCo a constant command sets the pace, and the shipped 0.8 m/s is SLOWER than the
+        # clip on tile 6 (0.86 m/s) -- so timing that command against the clip's budget leaves
+        # -0.0 s of slack and manufactures timeouts that read as policy failures. Exposed
+        # rather than forced: `speeds` is the caller's, and a speed SWEEP against a fixed
+        # budget is still a legitimate experiment, just not an Isaac-matched one.
+        # From the ANCHOR, not the margin-adjusted goal: this is what pace the CLIP
+        # actually moved at, and dividing the shortened distance by the full duration
+        # would under-report it by the margin (0.86 -> 0.72 m/s on tile 6).
+        clip_pace = float(anchor_xyz[0]) / max(budget_override - CMD_HOLD_S, 1e-6)
     return Course(
         name=name or f"tile{terrain_id}",
         klass=klass,
@@ -1030,6 +1213,8 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
               "perceptive distribution shift"),
         goal_anchor_xyz=anchor_xyz,
         goal_anchor_source=anchor_src,
+        budget_s_override=budget_override,
         params={"clip_path": clip_path, "terrain_id": int(terrain_id),
-                "approach": float(approach), "spawn_tile_xy": [sx, sy], "spawn_tile_z": sz},
+                "approach": float(approach), "spawn_tile_xy": [sx, sy], "spawn_tile_z": sz,
+                **({"clip_pace_mps": float(clip_pace)} if isaac_matched else {})},
     )

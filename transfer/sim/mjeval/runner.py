@@ -196,11 +196,85 @@ class Spawn:
             is not.
         base_pos: Pelvis world position, already lifted by ``spawn_z_offset``.
         base_quat_wxyz: Pelvis orientation in MuJoCo's ``(w, x, y, z)`` order.
+        base_lin_vel_w / base_ang_vel_w / joint_vel_isaac: The velocity half, or ``None`` for
+            the standing spawn, which is at rest.  A CLIP spawn is not: clip 300 starts at
+            0.298 m/s with joint rates to 1.09 rad/s, i.e. mid-gait.  Isaac writes all four
+            buffers at reset (``resets._commit_clip_reset``), so dropping these would place
+            the robot at the right pose and dead still -- a different initial condition that
+            looks perfectly correct in a viewer.
     """
 
     joint_pos_isaac: np.ndarray
     base_pos: np.ndarray
     base_quat_wxyz: np.ndarray
+    base_lin_vel_w: np.ndarray | None = None
+    base_ang_vel_w: np.ndarray | None = None
+    joint_vel_isaac: np.ndarray | None = None
+
+
+def clip_spawn(course, policy_joint_names, *, spawn_z_offset: float = 0.005) -> Spawn:
+    """The initial condition of an ``isaac_clip_course``: the clip's own reference at step 0.
+
+    Isaac starts a tracker episode ON the clip -- ``resets._commit_clip_reset`` writes root
+    pose, root velocity, joint position and joint velocity from
+    ``reference_world_state_at(clip_id, start_step, ...)``.  mjeval's default spawn is a
+    STANDING pose at rest, which on stairs is the difference between arriving in phase with
+    the treads and arriving from a standstill, and is the leading suspect for why an
+    Isaac-matched budget looked infeasible.
+
+    **The joint order is converted by NAME, and that is not optional.**  The clip's ``y_des``
+    columns are in the ROBOT's per-limb order (``left_hip_pitch, left_hip_roll, left_hip_yaw,
+    ...``) while ``Spawn.joint_pos_isaac`` is in the POLICY's interleaved order
+    (``left_hip_pitch, right_hip_pitch, waist_yaw, ...``).  They agree in 2 of 29 positions.
+    A positional copy is finite, plausible, and puts every joint at another joint's angle.
+
+    **No yaw rotation is applied**, and that is a measured fact rather than an omission:
+    Isaac's ``lift_base_world_state`` composes ``quat_apply(anchor_inv_yaw(world_quat), ...)``
+    onto the clip's tile-local pose, but ``goal_frame_yaw`` is exactly 0.0 on all 15129
+    episodes of the v2 rollout, so that rotation is the identity and tile-local differs from
+    world by a pure translation -- which ``isaac_clip_course`` has already applied.  A library
+    that ever authors turned tiles breaks this; ``goal_anchor.assert_yaw_free`` is the guard.
+
+    Args:
+        course: A course from ``terrains.isaac_clip_course``.
+        policy_joint_names: ``policy.get_joint_names()`` -- the order ``Spawn`` is read in.
+        spawn_z_offset: Lift applied to the pelvis, matching Isaac's own reset (0.005 m).
+            Isaac added it because every episode otherwise opened 1 cm underground and took a
+            PhysX ejection kick; it is carried here so the two start from the same height.
+
+    Returns:
+        The spawn, velocities included.
+
+    Raises:
+        ValueError: If the course was not built by ``isaac_clip_course`` (no clip params), or
+            if the clip and policy joint NAME SETS differ, which would make the conversion
+            silently drop or invent a joint.
+    """
+    p = course.params
+    if "clip_start_joint_pos" not in p:
+        raise ValueError(
+            f"course {course.name!r} carries no clip start state; clip_spawn needs a course "
+            "built by terrains.isaac_clip_course, not isaac_tile_course.")
+    clip_names = list(p["clip_joint_names"])
+    if set(clip_names) != set(policy_joint_names):
+        missing = sorted(set(policy_joint_names) - set(clip_names))
+        extra = sorted(set(clip_names) - set(policy_joint_names))
+        raise ValueError(
+            f"clip and policy joint NAME SETS differ - missing from clip: {missing}; "
+            f"not in policy: {extra}. The by-name conversion would drop or invent a joint.")
+    pos = np.asarray(p["clip_start_pos"], dtype=np.float64).copy()
+    pos[2] += float(spawn_z_offset)
+    return Spawn(
+        joint_pos_isaac=convert_joint_order(
+            np.asarray(p["clip_start_joint_pos"], dtype=np.float64),
+            clip_names, list(policy_joint_names)),
+        base_pos=pos,
+        base_quat_wxyz=np.asarray(p["clip_start_quat_wxyz"], dtype=np.float64),
+        base_lin_vel_w=np.asarray(p["clip_start_lin_vel"], dtype=np.float64),
+        base_ang_vel_w=np.asarray(p["clip_start_ang_vel"], dtype=np.float64),
+        joint_vel_isaac=convert_joint_order(
+            np.asarray(p["clip_start_joint_vel"], dtype=np.float64),
+            clip_names, list(policy_joint_names)))
 
 
 class CourseRig:
@@ -244,6 +318,12 @@ class CourseRig:
         isaac = policy.get_joint_names()
         self.hold_target = convert_joint_order(spawn.joint_pos_isaac, isaac,
                                                self.robot.joint_names)
+        # Same conversion, same reason: the two orders differ in 27 of 29 positions, so a
+        # positionally-copied velocity vector is finite, plausible and pairs each joint's
+        # rate with a different joint.
+        self.hold_joint_vel = (None if spawn.joint_vel_isaac is None else
+                               convert_joint_order(spawn.joint_vel_isaac, isaac,
+                                                   self.robot.joint_names))
         self.act_ids = np.array(
             [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_ACTUATOR, f"{n}_pos") for n in isaac],
             dtype=np.int64)
@@ -506,7 +586,10 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
     # Zeroes qpos, qvel, contacts, ctrl AND mj_data.time, leaving mj_model -- and therefore the
     # cameras, the actuator ids and the applied PD gains -- untouched.
     mujoco.mj_resetData(robot.mj_model, robot.mj_data)
-    robot.set_base_and_joints(spawn.base_pos, spawn.base_quat_wxyz, rig.hold_target)
+    robot.set_base_and_joints(spawn.base_pos, spawn.base_quat_wxyz, rig.hold_target,
+                              base_lin_vel_w=spawn.base_lin_vel_w,
+                              base_ang_vel_w=spawn.base_ang_vel_w,
+                              joint_vel_mujoco=rig.hold_joint_vel)
     _reset_episode_state(policy, fm_lag)
 
     acc = accumulate.EpisodeAccumulator(course, cmd, policy.get_dt(), rig.act_ids,

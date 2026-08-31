@@ -186,4 +186,5 @@ transfer/sim/robots/g1/*_mjeval_*.xml
 # `git check-ignore -v` on both sets; the negation works because only FILES are excluded here
 # (a re-include cannot rescue a file under an excluded directory).
 transfer/sim/robots/g1/*_tile*.xml
+transfer/sim/robots/g1/*_clip*.xml
 !transfer/sim/robots/g1/*_scene.xml

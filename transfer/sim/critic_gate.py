@@ -87,9 +87,22 @@ def run(args) -> int:
                            device=args.device)
     rows: list[dict] = []
     for tile in [int(t) for t in args.tiles.split(",")]:
-        course = terrains.isaac_tile_course(args.clip_lib, tile, speeds=(args.speed,),
-                                            goal_anchor_max_offset=args.max_offset)
+        course = terrains.isaac_tile_course(args.clip_lib, tile, speeds=(float(args.speed),),
+                                            goal_anchor_max_offset=args.max_offset,
+                                            isaac_matched=args.isaac_matched)
         course = dataclasses.replace(course, name=f"tile{tile}{args.scene_tag}")
+        # The BUDGET and the VELOCITY are one choice, not two. Isaac's episode window is the
+        # clip's own duration, and in Isaac the clip DRIVES the robot -- so the distance and
+        # the time are the same fact and they imply a speed. Taking the clip's time while
+        # commanding an unrelated 0.8 m/s times the robot against a reference it was never
+        # asked to keep up with, which shows up as a timeout and reads as a policy failure.
+        # So under --isaac_matched the command comes from the course, not the CLI.
+        speed = float(args.speed)
+        if args.isaac_matched:
+            speed = float(course.params["clip_pace_mps"])
+            print(f"[isaac_matched] tile {tile}: budget {course.budget_s:.1f} s, goal "
+                  f"{course.target_xy[0]:.2f} m, commanded pace {speed:.2f} m/s "
+                  f"(--speed {args.speed} ignored: it is not free once the budget is fixed)")
         cfg, policy, fm_lag, spawn, rig = build_arm(
             types.SimpleNamespace(tracker_onnx=args.tracker_onnx, fm_onnx=args.fm_onnx,
                                   out=args.out, providers=args.providers,
@@ -97,7 +110,7 @@ def run(args) -> int:
                                   fall_tilt_deg=args.fall_tilt_deg, cmd_hold_s=0.0), course)
         print(f"[gate] {course.name} klass={course.klass} "
               f"anchor={np.round(course.goal_anchor_xyz, 3)}", flush=True)
-        cmd = np.array([args.speed, 0.0, 0.0])
+        cmd = np.array([speed, 0.0, 0.0])
         for seed in range(args.seeds):
             scorer = C.CriticScorer(crit, course.goal_anchor_xyz, rig.robot)
             policy._rng = np.random.default_rng(seed)
@@ -162,6 +175,13 @@ def main() -> int:
     p.add_argument("--speed", type=float, default=0.8)
     p.add_argument("--seeds", type=int, default=24)
     p.add_argument("--max_offset", type=int, default=50)
+    p.add_argument("--isaac_matched", action="store_true",
+                   help="run each course under the ISAAC episode window -- clip_end budget, "
+                        "the clip's own endpoint as the goal, and its approach margin. Use it "
+                        "whenever the critic's reading has to be in-distribution: the default "
+                        "mjeval budget runs 1.4-3.6x longer than any training episode. Moves "
+                        "budget AND goal together; either alone is incoherent (a matched "
+                        "budget with the default goal times out every tile-6 run).")
     p.add_argument("--device", default="cuda")
     p.add_argument("--providers", default="auto")
     p.add_argument("--fall_height", type=float, default=0.2)
