@@ -1,13 +1,20 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Advantage-conditioned fine-tune of a trained flow-matching generator.
+"""Fine-tune a trained flow-matching generator on its own rollouts.
 
-Takes a pretrained generator, a rollout of that generator driving the tracker, and a label
-saying for each emitted chunk whether it bought anything (``label_advantage.py``).  Trains
-the model to reproduce its own chunks with the label as conditioning, using the SAME
-supervised flow-matching objective it was pretrained with.  At inference the label is pinned
-``positive``, which is the whole intervention: nothing about the loss, the sampler or the
-deploy path changes.
+Three modes, differing only in WHERE the "which chunks are good" judgement enters.  All three
+train the model to reproduce chunks it emitted itself, using the SAME supervised
+flow-matching objective it was pretrained with, and none touches the loss or the sampler:
+
+* **advantage-conditioned** (``--labels``) -- every chunk is kept and its label
+  (``label_advantage.py``) is fed to the model as conditioning.  At inference the label is
+  pinned ``positive``, which is the whole intervention.  This is the only mode that changes
+  the ARCHITECTURE: it adds a label embedding and produces per-arm serve checkpoints.
+* **label-filtered BC** (``--labels --filter_label positive``) -- the label SELECTS rows and
+  is then discarded, so the model stays exactly as pretrained.
+* **filtered BC on a pre-filtered rollout** (``--unconditioned``) -- the selection already
+  happened upstream (e.g. ``merge_selected.py``: the critic chose the chunk AND its episode
+  succeeded), so there is no sidecar to point at and nothing to condition on.
 
 Three properties make this safe to run against a shipped checkpoint:
 
@@ -20,18 +27,36 @@ Three properties make this safe to run against a shipped checkpoint:
   iteration -- so iteration k is one well-defined step from a known model rather than the
   end of an unrepeatable chain.
 
-The number that decides whether any of this worked is the NEGATIVE-conditioning control:
-sample the same checkpoint with the label pinned negative.  If it performs the same as
-positive, the model is ignoring the label and every other number in the experiment is noise.
-Run it before any sweep.
+**What decides whether it worked differs by mode, and only one of them has an internal
+control.**  Advantage-conditioned runs have the NEGATIVE-conditioning control: sample the
+same checkpoint with the label pinned negative, and if it performs the same as positive the
+model is ignoring the label and every other number is noise.  Run it before any sweep.  The
+two filtered-BC modes have no arm to control against -- the model IS the pretrained
+architecture -- so the closed-loop eval against the base generator is the only check, which
+is why ``--canary_cache`` exists: four cheap scalars per epoch to say WHERE to spend it.
+
+**None of the training losses selects the checkpoint you want.**  Train loss falls
+monotonically, and ``--val_frac``'s held-out split is drawn from the same narrow slice as
+train, so it mostly detects memorisation.  The closed-loop number peaks and decays where no
+loss here says it does -- hence ``--ckpt_every``, without which the interior epochs are gone
+and recovering one means retraining the arm.
 
 Usage::
 
-    python scripts/flow_matching/finetune_advantage.py \\
+    # advantage-conditioned
+    python scripts/flow_matching/finetune_generator.py \\
         --pretrained logs/flow_matching/<run>/best.pt \\
         --rollout logs/rollouts/v2/rollout_<...>.h5 \\
         --labels logs/value/v2/advantage.npz \\
         --epochs 6 --out logs/flow_matching/<run>_ac_v1
+
+    # filtered BC on an already-filtered rollout (merge_selected.py --successful_only)
+    python scripts/flow_matching/finetune_generator.py \\
+        --pretrained logs/flow_matching/<run>/best.pt \\
+        --rollout logs/value/bc_data_v1/train_success.h5 --unconditioned \\
+        --epochs 20 --lr 3e-5 --lr_warmup_steps 100 --weight_decay 0 \\
+        --ckpt_every 2 --canary_cache logs/value/canary_v1.pt \\
+        --out logs/flow_matching/<run>_bc_v1
 """
 
 from __future__ import annotations
@@ -264,7 +289,32 @@ def main() -> int:
     p.add_argument("--null_prob", type=float, default=0.3,
                    help="Per-access probability of overriding the label with null, so "
                         "classifier-free guidance over the label is available at inference.")
-    p.add_argument("--val_frac", type=float, default=0.05)
+    p.add_argument("--val_frac", type=float, default=0.05,
+                   help="Fraction of ROLLOUT episodes held out. Detects memorisation of the "
+                        "training episodes and nothing more: train and val here are both the "
+                        "same narrow slice (one generator's selected chunks, a few tiles, a "
+                        "few speeds), so a model forgetting everything outside it still "
+                        "shows this loss falling. --canary_cache is the metric that sees "
+                        "that.")
+    p.add_argument("--pair_cache", default="",
+                   help="A pair cache from ft_canary.py --build --pairs. Logs the paired "
+                        "SELECTED-vs-REJECTED flow-loss gap per epoch, over three groups "
+                        "(train / heldout / failed-episode). DIAGNOSTIC ONLY -- it never "
+                        "selects a checkpoint. It separates 'the model learned the selector's "
+                        "ranking' from 'self-distillation improved every sample together', "
+                        "which no loss on the selected chunks alone can distinguish. Read the "
+                        "ABSOLUTE levels beside the gap: a gap that opens because rej_loss "
+                        "ROSE is collapse onto the selected slice, not learning.")
+    p.add_argument("--canary_cache", default="",
+                   help="A cache from ft_canary.py --build. Adds two drift metrics per "
+                        "epoch, each against a FROZEN batch so an LR sweep's arms are "
+                        "comparable: pretrain_val_flow_mse (the pretraining objective on the "
+                        "PRETRAINING recordings' own val split -- rising means the model is "
+                        "leaving the distribution it was fitted on) and drift_l2 (distance "
+                        "from the pretrained model's sampled plan on fixed conditioning, in "
+                        "the space the tracker consumes). Both are also logged on the EMA "
+                        "weights. Epoch 0 records the pretrained baseline, so later epochs "
+                        "read as a move rather than a bare value.")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--max_windows", type=int, default=0,
                    help="Cap the number of windows used, for a smoke test.")
@@ -281,6 +331,25 @@ def main() -> int:
                         "out) from 'this fine-tuning setup moves nothing', because here there "
                         "is no label pathway left to blame. Requires --labels for the sidecar; "
                         "the model architecture is left exactly as the pretrained one.")
+    p.add_argument("--ckpt_every", type=int, default=0,
+                   help="Also write ckpt_<epoch>.pt every N epochs. 0 (default) keeps only "
+                        "last.pt and best.pt, which between them preserve about one point on "
+                        "the curve: last.pt is overwritten every epoch and best.pt tracks "
+                        "val_flow_mse, which on an already-filtered set declines about "
+                        "monotonically. Set it whenever the checkpoint that matters will be "
+                        "chosen by something OTHER than the training losses -- a closed-loop "
+                        "eval peaks and decays where no loss here says it does, and "
+                        "recovering an interior epoch afterwards means retraining the arm.")
+    p.add_argument("--unconditioned", action="store_true",
+                   help="FILTERED BC on a rollout that was ALREADY filtered on disk (e.g. "
+                        "merge_selected.py's selected + successful chunks). Same plain "
+                        "architecture as --filter_label -- no embedding, no token, no serve "
+                        "arm, a drop-in generator every consumer loads unchanged -- but it "
+                        "needs no label sidecar, because the selection happened upstream and "
+                        "left none. WITHOUT this flag a label-free run takes the CONDITIONED "
+                        "path instead: every window gets LABEL_NULL, the positive/negative "
+                        "embeddings never see a gradient, and best_positive.pt is written "
+                        "anyway -- a file naming an arm that was never trained.")
     p.add_argument("--drop_tile_holdout", action="store_true",
                    help="Train on training tiles only, keeping the held-out tiles clean for "
                         "evaluation. Requires --labels (the sidecar carries the split).")
@@ -328,6 +397,25 @@ def main() -> int:
     elif args.drop_tile_holdout:
         raise SystemExit("--drop_tile_holdout needs --labels: the tile split lives in the "
                          "sidecar, and guessing it would silently train on the holdout.")
+    # PLAIN = leave the architecture exactly as the pretrained one. Two ways to ask for it,
+    # because the filtering can happen in either of two places and only one of them leaves a
+    # label sidecar behind:
+    #   --filter_label  the rows are selected HERE, from a label file;
+    #   --unconditioned the rows were already selected UPSTREAM (merge_selected.py's
+    #                   selection + episode outcome), so no sidecar exists to point at.
+    # Without this second door a label-free filtered-BC run silently took the CONDITIONED
+    # path: every window got LABEL_NULL, the positive/negative embeddings received no
+    # gradient at all, and `best_positive.pt` was still written -- a file naming a serve arm
+    # that was never trained.
+    plain = bool(args.filter_label) or args.unconditioned
+    if args.unconditioned and args.filter_label:
+        raise SystemExit("--unconditioned and --filter_label both ask for the plain "
+                         "architecture; --filter_label already implies it. Pass one.")
+    if args.unconditioned and args.labels:
+        raise SystemExit(
+            "--unconditioned with --labels would load a label sidecar and then ignore it. If "
+            "the labels should SELECT rows, that is --filter_label; if they should CONDITION "
+            "the model, drop --unconditioned.")
     if args.filter_label:
         if labels is None:
             raise SystemExit("--filter_label needs --labels: there is nothing to filter on.")
@@ -343,9 +431,9 @@ def main() -> int:
     # UNCONDITIONED for filtered BC: the architecture stays exactly the pretrained one, so
     # there is no embedding, no token, no `prefix_len` change and no serve arm -- the output
     # is a plain generator that every existing consumer loads without knowing this ran.
-    model = (convert(ctx, cfg, device, args.advantage_inject) if not args.filter_label
+    model = (convert(ctx, cfg, device, args.advantage_inject) if not plain
              else copy.deepcopy(ctx.model).to(device))
-    if args.filter_label:
+    if plain:
         for prm in model.parameters():
             prm.requires_grad_(True)
 
@@ -363,7 +451,7 @@ def main() -> int:
     if labels is not None:
         print(f"[ft] train label counts (before null dropout): {train_ds.label_counts()}")
 
-    if args.filter_label:
+    if plain:
         print("[ft] filtered BC: no conversion to verify -- the model IS the pretrained one.")
     elif args.verify_identity and args.advantage_inject == "time_embed":
         worst = verify_identity(ctx, model, train_ds, device)
@@ -414,6 +502,45 @@ def main() -> int:
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     ema = WeightEMA(model, decay=args.ema_decay) if args.ema_decay > 0 else None
 
+    # Epoch 0 = the untouched model, recorded whenever ANY frozen-batch metric is attached.
+    # Every one of them is read as a MOVE from this row -- the pair gap most of all, whose
+    # whole claim is that it starts at ~0 because the candidates are exchangeable draws from
+    # one conditional. Built here rather than inside a single cache's branch, which is what
+    # left a pair-only run with no baseline at all.
+    history_base: dict = {"epoch": 0}
+    pairs = None
+    if args.pair_cache:
+        from ft_canary import PairGapCanary  # noqa: PLC0415
+
+        pairs = PairGapCanary(args.pair_cache, device=args.device)
+        pbase = pairs.score(model)
+        history_base.update(pbase)
+        print("[ft] pair-gap baseline (pretrained weights) -- expect gap ~0 and win_rate "
+              "~0.50; the candidates are exchangeable draws from ONE conditional:")
+        for kk in sorted(pbase):
+            print(f"       {kk} = {pbase[kk]:+.5f}")
+    canary = None
+    if args.canary_cache:
+        from ft_canary import Canary  # noqa: PLC0415
+
+        canary = Canary(args.canary_cache, device=args.device)
+        # Epoch 0 is the BASELINE and is not optional: `pretrain_val_flow_mse` here is the
+        # pretrained model's own number, so every later epoch is read as a move from it
+        # rather than as a bare value, and `drift_l2` must be ~0 (same weights, same cached
+        # sampling noise) -- if it is not, the reference is not a fixed point and the whole
+        # metric is measuring something else.
+        base = canary.score(model)
+        history_base.update(base)
+        print(f"[ft] canary baseline (pretrained weights): "
+              f"pretrain_val_flow_mse={base['pretrain_val_flow_mse']:.6f}  "
+              f"drift_l2={base['drift_l2']:.3e}")
+        if base["drift_l2"] > 1e-4:
+            raise SystemExit(
+                f"the canary's drift reference is not a fixed point: the UNMODIFIED model "
+                f"differs from its own cached plans by {base['drift_l2']:.3e}. Every later "
+                "drift_l2 would be that noise plus the real signal, indistinguishably. "
+                "Rebuild the cache against THIS checkpoint (ft_canary.py --build).")
+
     wb = None
     if args.wandb:
         try:
@@ -463,6 +590,9 @@ def main() -> int:
         return {k: float(v.detach()) for k, v in out.items()}
 
     history, best_val, gstep = [], float("inf"), 0
+    if len(history_base) > 1:
+        history.append(history_base)
+
     for epoch in range(args.epochs):
         model.train()
         t0, tot, seen = time.time(), 0.0, 0
@@ -489,14 +619,39 @@ def main() -> int:
                     vt += _run(batch, False)["flow_mse"] * batch["state"].shape[0]
                     vn += batch["state"].shape[0]
             rec["val_flow_mse"] = vt / max(vn, 1)
+        if pairs is not None:
+            rec.update(pairs.score(model))
+        if canary is not None:
+            # Raw AND EMA. At ~120 steps/epoch an EMA decay of 0.999 has a ~1000-step
+            # horizon, comparable to the whole run, so the EMA curve lags the raw one and
+            # reading only the EMA can hide a real early peak. Logging both makes that lag
+            # visible instead of something to be inferred.
+            rec.update(canary.score(model))
+            if ema is not None:
+                with ema.swapped_in(model):
+                    rec.update({f"ema_{k}": v for k, v in canary.score(model).items()})
         history.append(rec)
         print(f"[ft] epoch {epoch + 1}/{args.epochs}  train {train_mse:.5f}"
               + (f"  val {rec['val_flow_mse']:.5f}" if "val_flow_mse" in rec else "")
+              + (f"  pretrain_val {rec['pretrain_val_flow_mse']:.5f}"
+                 f"  drift {rec['drift_l2']:.4f}" if "drift_l2" in rec else "")
+              + (f"  gap[tr] {rec['pair/train/gap']:+.4f}"
+                 f"  win {rec['pair/train/win_rate']:.2f}"
+                 if "pair/train/gap" in rec else "")
               + f"  ({rec['secs']}s)")
         if wb is not None:
             wb.log(rec)
         _save(args, cfg, model, opt, ema, epoch + 1, history,
               os.path.join(args.out, "last.pt"))
+        # KEEP THE INTERIOR EPOCHS. `last.pt` is overwritten every epoch and `best.pt` tracks
+        # `val_flow_mse`, which on this narrow set declines about monotonically -- so between
+        # them they preserve roughly one point on the curve, the end. The quantity that
+        # actually decides this fine-tune is a MuJoCo eval, and it peaks and decays where no
+        # training loss says it does; without these files, acting on that reading means
+        # retraining the arm to recover a checkpoint that already existed.
+        if args.ckpt_every > 0 and (epoch + 1) % args.ckpt_every == 0:
+            _save(args, cfg, model, opt, ema, epoch + 1, history,
+                  os.path.join(args.out, f"ckpt_{epoch + 1}.pt"))
         # `best.pt` is what every downstream consumer reaches for by convention, so it has to
         # BE the best rather than the last -- a file named for a selection nothing performed
         # is the kind of quiet claim this stack has been bitten by. With no val split there
@@ -512,7 +667,7 @@ def main() -> int:
     # checkpoint that does not state one is refused at load, so nothing (an Isaac eval, a
     # probe, a play run) can serve an arm by accident. These two say which they are, in the
     # artifact, exactly as `fm_meta.advantage_label` does on the ONNX side.
-    if not args.filter_label:
+    if not plain:
         for name in ("positive", "negative"):
             stamp_serve_label(os.path.join(args.out, "best.pt"),
                               os.path.join(args.out, f"best_{name}.pt"), name)
@@ -523,8 +678,9 @@ def main() -> int:
     if wb is not None:
         wb.finish()
     print(f"[ft] wrote {args.out}/best.pt")
-    if args.filter_label:
-        print(f"[ft] NEXT: this is a PLAIN generator ({args.filter_label}-filtered BC), so it "
+    if plain:
+        why = f"{args.filter_label}-filtered BC" if args.filter_label else "filtered BC"
+        print(f"[ft] NEXT: this is a PLAIN generator ({why}), so it "
               "evaluates as ONE cell against the pretrained base -- there is no arm to\n"
               "     control against, and therefore no internal check that the training did "
               "anything. The eval against `base` IS the check.")
@@ -576,9 +732,12 @@ def _save(args, cfg, model, opt, ema, epoch: int, history: list, path: str) -> N
     parent = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     cfg = copy.deepcopy(cfg)
     # Filtered BC produces a PLAIN generator: claiming advantage_cond would make
-    # `load_fm_context` demand a serve arm the weights cannot honour.
-    cfg.advantage_cond = not args.filter_label
-    if not args.filter_label:
+    # `load_fm_context` demand a serve arm the weights cannot honour. Recomputed here rather
+    # than passed in, so this stamp can never disagree with the architecture `main` built --
+    # the one place where a mismatch is unrecoverable, since it travels in the artifact.
+    plain = bool(args.filter_label) or args.unconditioned
+    cfg.advantage_cond = not plain
+    if not plain:
         cfg.advantage_inject = args.advantage_inject
     ckpt = dict(parent)
     ckpt["model"] = {k: v.detach().cpu() for k, v in model.state_dict().items()}

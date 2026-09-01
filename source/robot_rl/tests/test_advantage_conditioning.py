@@ -171,7 +171,7 @@ def test_a_shape_1_index_broadcasts_over_the_batch():
 def test_the_conversion_adds_exactly_one_state_dict_key():
     """Anything else missing would mean weights silently failed to transfer.
 
-    The fine-tune asserts this at load time (``finetune_advantage.convert``); pinning it here
+    The fine-tune asserts this at load time (``finetune_generator.convert``); pinning it here
     means a future architecture change that quietly renames a parameter fails in a unit test
     rather than in an overnight run.
     """

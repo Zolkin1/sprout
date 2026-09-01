@@ -131,7 +131,7 @@ date
 
 # --------------------------------------------------------------------------- 5. the fine-tune
 echo "[chain] 5/6 fine-tune ($FT_EPOCHS epochs)"
-python scripts/flow_matching/finetune_advantage.py \
+python scripts/flow_matching/finetune_generator.py \
     --pretrained "$FM_CKPT" --rollout "${STEM}.h5" --labels "${VAL}/advantage.npz" \
     --out "$FT" --epochs "$FT_EPOCHS" --drop_tile_holdout \
     2>&1 | tee "${FT}/finetune.log"
@@ -159,7 +159,7 @@ python scripts/flow_matching/compare_advantage_labels.py \
 date
 
 echo "[chain] 8/8 fine-tune on the in-sample label"
-python scripts/flow_matching/finetune_advantage.py \
+python scripts/flow_matching/finetune_generator.py \
     --pretrained "$FM_CKPT" --rollout "${STEM}.h5" --labels "${VAL_F1}/advantage.npz" \
     --out "$FT_F1" --epochs "$FT_EPOCHS" --drop_tile_holdout \
     2>&1 | tee "${FT_F1}/finetune.log"
