@@ -53,6 +53,7 @@ import argparse
 import copy
 import dataclasses
 import json
+import math
 import os
 import sys
 import time
@@ -129,7 +130,38 @@ class Snapshot:
             fm_lag._buf = copy.deepcopy(self.lag)
 
 
-def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None):
+def arrived(course, robot, zex) -> bool:
+    """Did the robot arrive, under whichever rule this course carries?
+
+    ISAAC's rule when ``course.isaac_tol`` is set -- a downrange half-plane plus lateral and
+    height bands, no traversal gate.  mjeval's own otherwise -- a rectangle around
+    ``target_xy`` plus the traversal gate.
+
+    They are not interchangeable and disagree three ways: Isaac counts OVERSHOOT (a
+    half-plane, where mjeval's band can be walked out of), Isaac has a HEIGHT band that mjeval
+    lacks, and mjeval has a traversal gate that Isaac does not need -- its height band already
+    refuses a robot that never went up.
+
+    Args:
+        course: The course.
+        robot: The MuJoCo robot.
+        zex: ``[max_base_z, min_base_z]`` so far, for the mjeval gate.
+
+    Returns:
+        Whether the episode should end as a success.
+    """
+    q = robot.mj_data.qpos
+    if course.isaac_tol is not None:
+        from goal_anchor import in_isaac_goal  # noqa: PLC0415
+
+        return in_isaac_goal((float(q[0]), float(q[1]), float(q[2])),
+                             course.goal_anchor_xyz, course.isaac_tol)
+    return bool(course.in_goal(float(q[0]), float(q[1]))
+                and course.traversed(zex[0], zex[1]))
+
+
+def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None,
+          steer_kp: float = 0.0, steer_wz_max: float = 0.68):
     """Advance ``n_steps`` control steps, returning early on a terminal condition.
 
     Mirrors ``runner.run_episode``'s inner loop and its ORDERING, which is load-bearing there
@@ -149,6 +181,10 @@ def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None):
             decide success -- which awards it to a robot that walked BESIDE the course on the
             infinite floor, exactly what the gate exists to refuse.
         scorer: Optional per-step callback ``(robot, policy, state)``.
+        steer_kp: P gain (1/s) on heading error toward the course's goal; ``0`` (default)
+            holds ``cmd`` flat, matching ``runner.run_episode``'s own ``steer_kp`` semantics
+            exactly (same function, ``runner.steer_yaw_rate``, called fresh every step).
+        steer_wz_max: Symmetric clip on the steering yaw rate, rad/s.
 
     Returns:
         ``(verdict, failure, last_state)`` -- ``verdict`` is ``""`` if nothing terminal
@@ -161,13 +197,21 @@ def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None):
         critic and is not.
     """
     from gen_tracker_runner import build_state  # noqa: PLC0415
+    from runner import steer_yaw_rate  # noqa: PLC0415
 
     robot, course = rig.robot, rig.course
     last = None
     for _ in range(int(n_steps)):
         if robot.mj_data.time > course.budget_s:
             return "timeout", "", last
-        state = build_state(robot, policy, cmd, rig.depth_cams, want_depth_hits=False,
+        step_cmd = cmd
+        if steer_kp > 0.0:
+            qw, qx, qy, qz = (float(v) for v in robot.mj_data.qpos[3:7])   # MuJoCo wxyz
+            yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+            wz = steer_yaw_rate(course, float(robot.mj_data.qpos[0]), float(robot.mj_data.qpos[1]),
+                                yaw, steer_kp, steer_wz_max)
+            step_cmd = np.array([cmd[0], cmd[1], wz])
+        state = build_state(robot, policy, step_cmd, rig.depth_cams, want_depth_hits=False,
                             fm_depth_cams=rig.fm_depth_cams, fm_lag=fm_lag)
         last = state
         obs = policy.create_obs(state)
@@ -180,14 +224,14 @@ def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None):
             robot.step()
         z = float(robot.mj_data.qpos[2])
         zex[0], zex[1] = max(zex[0], z), min(zex[1], z)
-        if (course.in_goal(float(robot.mj_data.qpos[0]), float(robot.mj_data.qpos[1]))
-                and course.traversed(zex[0], zex[1])):
+        if arrived(course, robot, zex):
             return "success", "", last
     return "", "", last
 
 
 def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
-                         k: int, seed: int, mjrunner):
+                         k: int, seed: int, mjrunner, steer_kp: float = 0.0,
+                         steer_wz_max: float = 0.68):
     """One episode driven by a live 1-step-lookahead selector over ``k`` candidate chunks.
 
     Args:
@@ -204,6 +248,10 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             not a separate code path.
         seed: Episode seed.
         mjrunner: The ``runner`` module.
+        steer_kp: P gain (1/s) on heading error toward the goal; ``0`` (default) disables
+            steering. Forwarded to every :func:`_chunk` call, so it applies identically to
+            the ``k == 1`` path and every ``k > 1`` candidate.
+        steer_wz_max: Symmetric clip on the steering yaw rate, rad/s.
 
     Returns:
         ``(verdict, failure, n_replans, mean_candidates_scored)``.
@@ -233,7 +281,8 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
     n_replans, scored = 0, []
     while robot.mj_data.time <= course.budget_s:
         if k <= 1:
-            v, f, _st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, zex, scorer=_ring)
+            v, f, _st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, zex, scorer=_ring,
+                              steer_kp=steer_kp, steer_wz_max=steer_wz_max)
             if v:
                 return v, f, n_replans, 0.0
             n_replans += 1
@@ -258,7 +307,8 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             # Each candidate gets its OWN copy of the episode's z extremes: a branch that
             # climbs must not hand its traversal credit to a sibling that did not.
             cz = list(zex)
-            v, f, st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, cz, scorer=_ring)
+            v, f, st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, cz, scorer=_ring,
+                             steer_kp=steer_kp, steer_wz_max=steer_wz_max)
             if v == "fall":
                 # A candidate that already fell is worse than any survivor. Scored 1.0 rather
                 # than skipped, so a re-plan where EVERY candidate falls still has an argmin
@@ -296,8 +346,25 @@ def run(args) -> int:
     import runner as mjrunner  # noqa: PLC0415
     from fm_noise_attribution import build_arm  # noqa: PLC0415
 
+    if args.catalogue:
+        # Matches evaluate.py's own wiring exactly: STAIR_WALLS is a module global read at
+        # course-build time, not a per-course field, so every hand-authored stairs course in
+        # one run shares this setting.
+        terrains.STAIR_WALLS = bool(args.stair_walls)
+        print(f"[live] stair walls: {'ON (touching the treads)' if args.stair_walls else 'OFF'}")
+
     ks = [int(x) for x in args.k.split(",")]
     use_q = bool(args.q_ckpt)
+    if args.steer_kp > 0.0:
+        if use_q:
+            raise SystemExit(
+                "--steer_kp is only wired into run_episode_selected (the V selector, "
+                "--critic_ckpt/--state_critic_ckpt); run_episode_q_selected (--q_ckpt) does "
+                "not read it yet. Refusing rather than silently running unsteered.")
+        print(f"[live] steering ON: P={args.steer_kp:.3f}, wz clipped to "
+              f"+-{args.steer_wz_max:.3f} rad/s (runner.steer_yaw_rate). OFF-DISTRIBUTION ON "
+              "STAIRS -- the training library commands zero turn rate on every stair clip; "
+              "this measures a DIFFERENT thing, not a cleaner one.")
     scorer = None
     if args.state_critic_ckpt and ks != [1]:
         scorer = StateCritic(args.state_critic_ckpt, device=args.device,
@@ -312,32 +379,79 @@ def run(args) -> int:
     os.makedirs(args.out, exist_ok=True)
     rows, t0 = [], time.time()
 
-    for tile in [int(t) for t in args.tiles.split(",")]:
-        # The fm_variance_probe configuration, exactly: tile course, 2.5 m standing approach,
-        # constant 0.8 m/s. That harness measured 0.798 (tile 6) / 0.816 (tile 20) and is the
-        # reference this benchmark is defined against.
-        course = terrains.isaac_tile_course(args.clip_lib, tile, speeds=(args.speed,),
-                                            approach=args.approach,
-                                            goal_anchor_max_offset=args.max_offset)
-        course = dataclasses.replace(course, name=f"tile{tile}{args.scene_tag}")
+    if args.catalogue:
+        units = [("course", int(c)) for c in args.catalogue.split(",") if c.strip()]
+    elif args.clips:
+        units = [("clip", int(c)) for c in args.clips.split(",") if c.strip()]
+    else:
+        units = [("tile", int(t)) for t in args.tiles.split(",")]
+    for kind, uid in units:
+        if kind == "clip":
+            # ISAAC-MATCHED: the clip's own terrain, start (pose AND velocity), goal, duration
+            # and command. No standing approach, and therefore no cmd_hold_s -- the robot
+            # begins already moving at the clip's velocity, so there is no standing-start
+            # transient to settle. That knob is worth +-0.26 on these courses and this is how
+            # it is removed rather than tuned.
+            course = terrains.isaac_clip_course(args.clip_lib, uid,
+                                                max_offset=args.max_offset,
+                                                goal_regions=args.goal_regions)
+            course = dataclasses.replace(course, name=f"clip{uid}{args.scene_tag}")
+        elif kind == "course":
+            # HAND-AUTHORED: terrains.catalogue(), the general mjeval cell/grid harness's own
+            # terrain -- no clip ever walked it, so there is no true terminal pose to anchor
+            # the critic on (see the module's Course.goal_anchor_xyz docstring). target_xy is
+            # what IS available -- the far platform's centre, already used for this course's
+            # own mjeval success rule -- and using it for the critic too is a KNOWN, measured
+            # approximation (0.44-3.17 m off a real clip anchor by family, see
+            # mjeval.goal_anchor), not a substitute for one. isaac_tol stays unset, so the
+            # SUCCESS rule (unlike the critic's goal features) is untouched by this.
+            course = terrains.catalogue()[uid]
+            anchor_z = course.floor_z + max(course.flight_height_m, 0.0) + terrains.SPAWN_BASE_Z
+            course = dataclasses.replace(
+                course, name=f"cat{uid}{args.scene_tag}",
+                goal_anchor_xyz=(course.target_xy[0], course.target_xy[1], anchor_z),
+                goal_anchor_source="target_xy_approx")
+            print(f"[live] course {uid} ({course.klass}): critic anchor APPROXIMATED from "
+                  "target_xy -- expect a 0.44-3.17 m bias against a real clip anchor.",
+                  flush=True)
+        else:
+            # The fm_variance_probe configuration: tile course, 2.5 m standing approach,
+            # constant --speed.
+            course = terrains.isaac_tile_course(args.clip_lib, uid, speeds=(args.speed,),
+                                                approach=args.approach,
+                                                goal_anchor_max_offset=args.max_offset)
+            course = dataclasses.replace(course, name=f"tile{uid}{args.scene_tag}")
         cfg, policy, fm_lag, spawn, rig = build_arm(
             type("A", (), dict(tracker_onnx=args.tracker_onnx, fm_onnx=args.fm_onnx,
                                out=args.out, providers=args.providers,
                                fall_height=args.fall_height,
-                               fall_tilt_deg=args.fall_tilt_deg, cmd_hold_s=0.0))(), course)
-        cmd = np.array([args.speed, 0.0, 0.0])
-        print(f"\n[live] tile {tile} {course.klass} anchor "
-              f"{np.round(course.goal_anchor_xyz, 3)}", flush=True)
+                               fall_tilt_deg=args.fall_tilt_deg,
+                               cmd_hold_s=(0.0 if kind == "clip" else args.cmd_hold_s)))(),
+            course)
+        if kind == "clip":
+            spawn = mjrunner.clip_spawn(course, policy.get_joint_names())
+            rig = mjrunner.CourseRig(course, policy, cfg, spawn)
+            cmd = np.array(course.params["clip_command"][0], dtype=np.float64)
+        else:
+            cmd = np.array([args.speed, 0.0, 0.0])
+        tile = int(course.params.get("terrain_id", uid))
+        rule = "ISAAC (half-plane + lateral + height)" if course.isaac_tol else "mjeval (band + gate)"
+        print(f"\n[live] {kind} {uid} tile {tile} {course.klass} cmd {cmd[0]:.2f} m/s "
+              f"budget {course.budget_s:.2f}s anchor {np.round(course.goal_anchor_xyz, 3)}"
+              f"\n       arrival rule: {rule}", flush=True)
 
         for k in ks:
             wins = 0
             for ep in range(args.seed_offset, args.seed_offset + args.episodes):
                 fn = run_episode_q_selected if use_q else run_episode_selected
+                extra = ({} if use_q else
+                        {"steer_kp": args.steer_kp, "steer_wz_max": args.steer_wz_max})
                 v, f, nr, sc = fn(
                     rig, policy, fm_lag, spawn, cmd, cfg, crit, course.goal_anchor_xyz,
-                    k=k, seed=ep, mjrunner=mjrunner)
+                    k=k, seed=ep, mjrunner=mjrunner, **extra)
                 wins += int(v == "success")
-                rows.append({"tile": tile, "k": k, "episode": ep, "verdict": v,
+                rows.append({"tile": tile, "unit": f"{kind}{uid}", "k": k,
+                         "episode": ep, "verdict": v,
                              "failure": f, "n_replans": nr, "spread": float(sc),
                              "selector": "Q" if use_q else "V"})
                 done = ep - args.seed_offset + 1
@@ -389,6 +503,44 @@ def main() -> int:
     p.add_argument("--fm_onnx", required=True)
     p.add_argument("--clip_lib", required=True)
     p.add_argument("--tiles", default="6,20")
+    p.add_argument("--clips", default="",
+                   help="comma list of CLIP ids. Builds Isaac-matched per-clip courses -- the "
+                        "clip's own terrain, start pose AND velocity, goal, duration and "
+                        "command -- instead of tile courses with a standing approach. "
+                        "Overrides --tiles, --speed and --cmd_hold_s.")
+    p.add_argument("--catalogue", default="",
+                   help="comma list of indices into terrains.catalogue() (0-19), the "
+                        "hand-authored courses used by the general mjeval cell/grid harness -- "
+                        "separate from --tiles/--clips, which read a real clip-library tile. "
+                        "Overrides --tiles and --clips. These courses carry NO goal_anchor_xyz "
+                        "(no clip ever walked them to record one), so the critic's goal "
+                        "features are built from target_xy instead -- a KNOWN, measured "
+                        "approximation, biased 0.44-3.17 m depending on family versus the real "
+                        "clip-anchor a tile course would give (see mjeval.goal_anchor). Every "
+                        "row from this arm is tagged goal_anchor_source=target_xy_approx.")
+    p.add_argument("--goal_regions", default="",
+                   help="a fitted goal_regions.json; makes arrival ISAAC's rule (downrange "
+                        "half-plane + lateral + height bands, no traversal gate) rather than "
+                        "mjeval's rectangle plus gate. Clip courses only.")
+    p.add_argument("--no_stair_walls", dest="stair_walls", action="store_false", default=True,
+                   help="--catalogue only, matches evaluate.py's own flag: build hand-authored "
+                        "stairs courses without the visual stairwell walls.")
+    p.add_argument("--steer_kp", type=float, default=0.0,
+                   help="P gain (1/s) on heading error toward the goal, recomputed every "
+                        "control step via runner.steer_yaw_rate; 0 (default) holds the flat "
+                        "commanded twist. V selector only (--critic_ckpt/--state_critic_ckpt) "
+                        "-- refused with --q_ckpt, which does not read it. "
+                        "OFF-DISTRIBUTION ON STAIRS: the training library commands zero turn "
+                        "rate on every stair clip (3500 of them), so a stairs run with this "
+                        "on is a DIFFERENT measurement, not a cleaner one.")
+    p.add_argument("--steer_wz_max", type=float, default=0.68,
+                   help="Symmetric clip on the steering yaw rate, rad/s. Matches "
+                        "runner.STEER_WZ_MAX. Only used with --steer_kp.")
+    p.add_argument("--cmd_hold_s", type=float, default=0.0,
+                   help="seconds of zero command before stepping to --speed, on TILE courses. "
+                        "Measured worth -0.26 on stairs_up and +0.10 on stairs_down, so it is "
+                        "a real experimental variable and neither value is neutral. Clip "
+                        "courses force 0: they start already moving.")
     p.add_argument("--k", default="1,4,8", help="comma list of candidate counts.")
     p.add_argument("--episodes", type=int, default=200,
                    help="per arm per tile, seed-matched across arms (seed = episode index).")
@@ -709,8 +861,7 @@ def run_episode_q_selected(rig, policy, fm_lag, spawn, cmd, cfg, scorer, anchor,
             robot.step()
         z = float(robot.mj_data.qpos[2])
         zex[0], zex[1] = max(zex[0], z), min(zex[1], z)
-        if (course.in_goal(float(robot.mj_data.qpos[0]), float(robot.mj_data.qpos[1]))
-                and course.traversed(zex[0], zex[1])):
+        if arrived(course, robot, zex):
             return "success", "", n_replans, float(np.mean(spreads or [0.0]))
     return "timeout", "", n_replans, float(np.mean(spreads or [0.0]))
 

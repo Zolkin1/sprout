@@ -339,6 +339,49 @@ def clip_episode(clip_h5: str, clip_id: int, *, max_offset: int,
             joint_names=tuple(n.split(":")[1] for n in names if n.startswith("joint:")))
 
 
+def load_tolerances(path: str, family: str) -> tuple[float, float, float]:
+    """Isaac's goal tolerances for a family, from a fitted ``goal_regions.json``.
+
+    Args:
+        path: The spec written by ``build_goal_regions.py``.
+        family: Bare family name, e.g. ``stairs_up``.
+
+    Returns:
+        ``(approach_margin_m, half_width_m, height_tol_m)``.
+    """
+    with open(path) as f:
+        doc = json.load(f)
+    t = doc.get("by_family", {}).get(family) or doc["default"]
+    return (float(t["approach_margin_m"]), float(t["half_width_m"]), float(t["height_tol_m"]))
+
+
+def in_isaac_goal(root_pos, goal_xyz, tol) -> bool:
+    """Isaac's arrival test, ported exactly.
+
+    A HALF-PLANE downrange plus two bands -- ``(downrange >= -margin) &
+    (|lateral| <= width) & (|height_err| <= height)`` (``mdp.goal_region.in_goal``).  Three
+    differences from mjeval's own rule matter:
+
+    * downrange is a half-plane, so OVERSHOOT still counts.  mjeval's ``in_goal`` is a BAND
+      (``|x - target| <= GOAL_DEPTH/2``), which a robot can leave by walking past it.
+    * there is a HEIGHT band.  mjeval has none, so a robot that fell off an elevated tile and
+      walked to the goal line on the floor below scores differently in the two.
+    * there is no traversal gate.  Isaac does not need one: the height band already refuses a
+      robot that never went up.
+
+    Args:
+        root_pos: ``(3,)`` robot base position, course frame.
+        goal_xyz: ``(3,)`` the anchor, same frame.
+        tol: ``(margin, half_width, height_tol)``.
+
+    Returns:
+        Whether the robot is inside the region.
+    """
+    d = np.asarray(root_pos, dtype=np.float64) - np.asarray(goal_xyz, dtype=np.float64)
+    margin, width, height = tol
+    return bool(d[0] >= -margin and abs(d[1]) <= width and abs(d[2]) <= height)
+
+
 def frame_offsets(root_pos: np.ndarray, anchor: np.ndarray) -> np.ndarray:
     """``(downrange, lateral, height_err)`` -- the numpy twin of ``goal_frame_offsets``.
 

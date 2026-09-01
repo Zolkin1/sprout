@@ -726,6 +726,58 @@ the wrong fold raises on shape instead.
   inside that branch -- so any second consumer of the edge would have seen EVERY step as a
   re-plan, silently, the flag being plausible either way.
 
+
+## The best-of-K selector harness (`scripts/rsl_rl/eval/headroom*.py`)
+
+`headroom.py --stage select` runs a V(s) best-of-K selector to the END of each episode: at
+every re-plan it copies one state into `K` envs, draws a different chunk in each, rolls one
+chunk, scores the resulting states with a `fit_value.py` critic and carries the winner
+forward. `--stage restore_probe` is the state-copy gate; `headroom_select_report.py` pairs
+arms on clip id, per family.
+
+**The state copy is bit-identical, and getting there needed four fixes.** IsaacLab's
+`write_*_to_sim` invalidates seven `ArticulationData` caches by hand and
+`_projected_gravity_b` is NOT among them, so a restored env served its own orientation from a
+current-timestamped cache -- the same buffer, and the same shape of bug, as the eval
+harness's fall flag. `joint_acc` is finite-differenced, so `_previous_joint_vel` has to travel
+too. `RayCasterCameraData.output` is a DICT, so a walk that only accepted bare tensors copied
+each camera's pose and intrinsics while leaving the IMAGE behind. And the roll loop reused the
+pre-restore observation for the first action of every window. `restore_probe` now checks every
+buffer AND every observation term for EXACT equality and exits non-zero otherwise.
+`_body_com_acc_w` / `_body_incoming_joint_wrench_b` are excluded by name: they rebind `.data`
+on every read from PhysX solver output, so a copy cannot stick, and nothing in `robot_rl`
+reads either.
+
+**Isaac reproduces exactly across envs given identical state; the odd one out is an env that
+was never written to.** Two branches restored from one state are bit-identical to each other
+(median 0.000e+00, most pairs exactly equal), while a branch is never bit-identical to its
+un-restored parent -- and self-restoring the parent does not close it. So a control that
+compares RESTORED against UNRESTORED is asking a different question, which is why the selector
+carries the group's state in the winning env rather than in a parent. `enable_enhanced_
+determinism` and higher solver iteration counts were both measured and neither fixes the
+residual; the amplification is the robot, not the solver.
+
+**The arms only mean something against the SAME-NOISE control.** `--same_noise` serves every
+candidate one draw, so every candidate is the same plan and any best-of-K rise is manufactured
+by the simulator. `--no_selection` builds and restores all K envs but always follows candidate
+0, so it must reproduce the `k=0` baseline; a gap there belongs to the K-env structure rather
+than to selection. Both are cheap and both have caught a defect that produced clean, plausible,
+entirely wrong numbers.
+
+**Success is `rollout_outcomes.terminal_reward`, and it is NOT `report.py`'s rule.** The two
+disagree on episodes that arrive and then fall (success here, failure there) and on ones that
+fall and are later dragged over the line (the reverse). To compare this harness against the
+episode harness, score the EVAL's own table under `terminal_reward` rather than assuming the
+two agree -- done that way, the do-nothing control (`--no_restore --no_force_replan`) and the
+episode harness agree to within one standard error on the same clips and generator.
+`--goal_regions` is REQUIRED for the same reason `record_rollouts.py` requires it.
+
+**Two ordering traps, both of which read as a model result.** The goal anchor must be resolved
+INSIDE the reset, after the clip commits -- resolved when the allocator hands out the next
+clip, every episode is scored against its predecessor's goal. And it must be seeded for every
+group's FIRST episode, which no advance ever covers; without that those episodes are scored
+against a goal at the world origin with zero tolerance and can never succeed.
+
 ## What the harness has established about the depth generator (2026-08-24)
 
 Tracker `2026-08-20_09-04-12_mode11_decor_v1`, generator

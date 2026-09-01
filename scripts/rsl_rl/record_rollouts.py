@@ -288,47 +288,8 @@ def _assert_sampler_is_stochastic(cmd) -> None:
           f"max {delta:.4g} (ctx.zero_noise={ctx.zero_noise})")
 
 
-class ProprioRing:
-    """The last ``H`` control steps of proprioception, newest last.
-
-    Kept at the CONTROL rate and not at the re-plan rate. A fall develops over tens of
-    milliseconds; sampled every 0.24 s the onset is simply not in the data, and the onset is
-    what the lead-time gate is about.
-
-    Maintained here rather than read out of the observation manager's history-stacked terms,
-    whose flattening to ``(N, history*dim)`` may be (T, D) or (D, T) -- an IsaacLab internal.
-    A transposed history is shape-silent and partly fittable, which is the worst combination.
-    """
-
-    def __init__(self, n_envs: int, device, history: int, dim: int) -> None:
-        """Allocate the ring.
-
-        Args:
-            n_envs: Environment count.
-            device: Torch device.
-            history: Rows kept per env.
-            dim: Row width; must equal :data:`rollout_outcomes.PROPRIO_DIM`.
-        """
-        self.buf = torch.zeros(n_envs, history, dim, device=device)
-        self.history = int(history)
-
-    def push(self, rd) -> None:
-        """Roll in this step's row for every env.
-
-        Args:
-            rd: The accumulator's converting view of ``ArticulationData`` (several of those
-                buffers are warp arrays, which do not accept a torch-style index).
-        """
-        row = torch.cat([rd.joint_pos, rd.joint_vel, rd.root_ang_vel_b,
-                         rd.projected_gravity_b], dim=-1)
-        self.buf = torch.roll(self.buf, shifts=-1, dims=1)
-        self.buf[:, -1] = row
-
-    def invalidate(self, dones) -> None:
-        """Zero the ring for envs that just reset, so no window spans two episodes."""
-        m = dones.to(torch.bool)
-        if bool(m.any()):
-            self.buf[m] = 0.0
+ProprioRing = ro.ProprioRing
+"""Re-exported: the class moved to rollout_outcomes so both consumers share one definition."""
 
 
 def _twist_yaw(rd):

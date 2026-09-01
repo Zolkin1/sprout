@@ -245,6 +245,12 @@ class Course:
             differ by a family-systematic 0.44-3.17 m (see :mod:`goal_anchor`).  Keeping them
             separate is what lets the critic be scored here without moving any success number
             already measured.
+        isaac_tol: ``(approach_margin_m, half_width_m, height_tol_m)`` when this course is to
+            be scored by ISAAC's arrival rule -- a downrange half-plane plus lateral and
+            HEIGHT bands, and no traversal gate -- rather than mjeval's own rectangle-plus-
+            gate.  ``None`` keeps the mjeval rule.  The two disagree in three ways at once
+            (overshoot, a height band, the gate), so which one is in force has to travel with
+            the course rather than be chosen at the call site.
         goal_anchor_source: ``"clip"`` when recovered from the library's own terminal pose,
             ``"none"`` when absent.  A course with no anchor cannot be critic-scored, and
             saying so beats defaulting to ``target_xy``, which would read as an anchor while
@@ -267,6 +273,7 @@ class Course:
     goal_anchor_xyz: tuple[float, float, float] | None = None
     goal_anchor_source: str = "none"
     budget_s_override: float | None = None
+    isaac_tol: tuple[float, float, float] | None = None
 
     @property
     def class_code(self) -> int:
@@ -944,7 +951,8 @@ def klass_for_family(family: str, terrain_id: int | None = None) -> str:
 
 
 def isaac_clip_course(clip_path: str, clip_id: int, *, max_offset: int = 50,
-                      name: str | None = None, klass: str | None = None) -> Course:
+                      name: str | None = None, klass: str | None = None,
+                      goal_regions: str = "") -> Course:
     """A :class:`Course` that IS one CLIP -- its terrain, start, goal, duration and command.
 
     :func:`isaac_tile_course` builds one course per TILE, which forces a reduction of the
@@ -981,6 +989,11 @@ def isaac_clip_course(clip_path: str, clip_id: int, *, max_offset: int = 50,
         max_offset: The tracker's furthest reference-window offset.
         name: Scene name; defaults to ``clip<id>``.
         klass: One of :data:`CLASS_CODES`; inferred from the tile's family when omitted.
+        goal_regions: A fitted ``goal_regions.json``.  When given, the course is scored by
+            ISAAC's arrival rule with this family's tolerances -- a downrange half-plane plus
+            lateral and height bands, no traversal gate -- instead of mjeval's rectangle plus
+            gate.  Without it the mjeval rule stands and the two harnesses disagree about what
+            arriving means.
 
     Returns:
         The course.
@@ -1017,6 +1030,11 @@ def isaac_clip_course(clip_path: str, clip_id: int, *, max_offset: int = 50,
     obstacle_x = (float(step["pos_xy"][0]) - float(step["size_xyz"][0]) / 2.0 - sx
                   if step is not None else 0.0)
 
+    tol = None
+    if goal_regions:
+        fam = str(entry.get("family", "")).removeprefix("family_").removesuffix(".h5")
+        tol = _ga.load_tolerances(goal_regions, fam)
+
     return Course(
         name=name or f"clip{int(clip_id)}",
         klass=klass,
@@ -1040,6 +1058,7 @@ def isaac_clip_course(clip_path: str, clip_id: int, *, max_offset: int = 50,
               "duration and command all come from THIS clip -- no aggregation over the tile."),
         goal_anchor_xyz=goal,
         goal_anchor_source="clip",
+        isaac_tol=tol,
         budget_s_override=float(ep.duration_s) + CMD_HOLD_S,
         params={"clip_path": clip_path, "terrain_id": int(ep.terrain_id),
                 "clip_id": int(clip_id), "spawn_tile_xy": [sx, sy], "spawn_tile_z": sz,

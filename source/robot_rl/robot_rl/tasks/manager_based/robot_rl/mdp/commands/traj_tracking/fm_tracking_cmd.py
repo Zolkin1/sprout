@@ -95,6 +95,8 @@ class FmTrackingCommand(MotionSequenceCommand):
     #: appended to after __init__ rebinds it per instance, and a shared mutable default would
     #: leak frames between environments.
     _extero_buf: tuple = ()
+    #: Optional per-env flow-matching noise provider; see :meth:`set_noise_source`.
+    _noise_source = None
 
     cfg: FmTrackingCommandCfg
 
@@ -1125,6 +1127,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._pred_window[ids] = sample_window(
             self.ctx, history, height, cmd_tokens,
             history_null_mask=(None if null_hist is None else null_hist[ids]),
+            noise=(None if self._noise_source is None else self._noise_source(ids)),
         )
         # Node 0 = "now", and the frame it is expressed in is the robot AT THIS INSTANT.
         # Both are needed to serve the window later: the cursor to index it, the anchor to
@@ -1133,6 +1136,31 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._anchor_pos[ids] = wp.to_torch(self.robot.data.root_pos_w)[ids].clone()
         self._anchor_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids].clone()
         self._pred_valid[ids] = True
+
+    def set_noise_source(self, source) -> None:
+        """Take the flow's initial noise from ``source`` instead of the global RNG.
+
+        Off by default, and there is no config field for it: training and every normal
+        rollout want an independent draw per re-plan, which is what ``sample_trajectory``
+        does when handed no ``noise``.
+
+        What this exists for is a controlled COMPARISON of two samples at one state. The
+        flow's only stochasticity is ``x0``, so fixing it per env makes the whole plan a
+        deterministic function of the conditioning -- which is what lets the best-of-K
+        headroom harness (``scripts/rsl_rl/eval/headroom*``) hand K envs K different chunks
+        at an identical state, and then hand all of them the SAME draw on every subsequent
+        re-plan so the ranking cannot be dominated by which branch got lucky afterwards.
+
+        This is NOT ``fm_zero_noise``, which replaces the draw with zeros and is off the
+        training distribution. Every draw served here is meant to be an ordinary Gaussian
+        sample; only WHICH one is under external control.
+
+        Args:
+            source: Callable taking the ``[V]`` long tensor of env ids about to be sampled
+                and returning either ``None`` (fall back to the global RNG for this call) or
+                a ``[V, F, D]`` tensor in the same env order.  ``None`` uninstalls.
+        """
+        self._noise_source = source
 
     def enable_extero_stash(self) -> None:
         """Start keeping the exteroception row each plan was drawn from.
