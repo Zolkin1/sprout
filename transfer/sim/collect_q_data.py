@@ -232,7 +232,8 @@ def run(args) -> int:
                     type("A", (), dict(tracker_onnx=args.tracker_onnx, fm_onnx=args.fm_onnx,
                                        out=args.out, providers=args.providers,
                                        fall_height=args.fall_height,
-                                       fall_tilt_deg=args.fall_tilt_deg, cmd_hold_s=0.0))(),
+                                       fall_tilt_deg=args.fall_tilt_deg,
+                                       cmd_hold_s=terrains.CMD_HOLD_S))(),
                     course)[:3]
             cfg, policy, fm_lag = arm[0]
             spawn = mjrunner.clip_spawn(course, policy.get_joint_names())

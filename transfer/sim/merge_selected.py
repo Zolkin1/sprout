@@ -5,7 +5,7 @@
 Each cell of the collection run wrote ``selected.h5`` (the chunk the critic committed at every
 re-plan, with its conditioning) beside ``live_select.json`` (one row per episode, carrying the
 verdict).  This joins them on ``episode_uid`` and writes a single file for
-``finetune_advantage.py``.
+``finetune_generator.py``.
 
 **Two filters, and they answer different questions.**  The recording is already filtered by
 SELECTION -- rejected candidates were never written -- so a merge with ``--all`` trains on
@@ -38,9 +38,23 @@ import os
 
 import numpy as np
 
-#: Columns the recorder writes, and the only ones ``rollout_dataset`` reads.
+#: Columns every recording carries; the only ones ``rollout_dataset`` reads.
 COLUMNS = ("episode_uid", "replan_index", "family_code", "history", "history_null",
            "extero", "cmd_future", "fm_plan")
+
+#: Present only with ``live_select.py --record_candidates``.  DIAGNOSTIC columns -- the
+#: trainer never reads them; ``ft_canary.PairGapCanary`` does.  All-or-nothing across cells:
+#: a merge that quietly kept the intersection would produce a file whose candidate coverage
+#: depends on which cells happened to finish, and the paired statistic would then be computed
+#: over a silently different subset than the training data.
+CANDIDATE_COLUMNS = ("cand_plans", "cand_scores", "cand_verdict", "sel_index")
+
+#: Derived here rather than left to the consumer.  ``--successful_only`` already resolves every
+#: row's episode outcome to decide what to keep; writing it down costs one byte a row and means
+#: a downstream metric can stratify by it WITHOUT re-reading 63 ``live_select.json`` files and
+#: re-deriving the uid encoding -- a second implementation of a join is a second thing to get
+#: wrong.  On a ``--successful_only`` file it is constant 1, which is correct and harmless.
+OUTCOME_COLUMN = "episode_success"
 
 
 def episode_verdicts(cell: str) -> dict[int, str]:
@@ -87,7 +101,26 @@ def main() -> int:
     if not cells:
         raise SystemExit(f"no cells with selected.h5 under {args.root}")
 
-    parts: dict[str, list] = {c: [] for c in COLUMNS}
+    # All-or-nothing, decided BEFORE any data is read, so a partial collection fails here
+    # rather than producing a file that looks complete.
+    have = []
+    for d in cells:
+        with h5py.File(os.path.join(args.root, d, "selected.h5"), "r") as f:
+            have.append(bool(f.attrs.get("has_candidates", 0)))
+    if any(have) and not all(have):
+        missing = [d for d, h in zip(cells, have) if not h]
+        raise SystemExit(
+            f"{sum(have)}/{len(cells)} cells carry candidate columns; these do not: "
+            f"{', '.join(missing[:6])}{' ...' if len(missing) > 6 else ''}\n"
+            "Merging anyway would drop them everywhere (making the pair metric impossible) or "
+            "keep an intersection whose coverage depends on which cells finished. Re-run the "
+            "missing cells with --record_candidates, or delete them.")
+    cand = all(have) and bool(have)
+    columns = tuple(COLUMNS) + (CANDIDATE_COLUMNS if cand else ())
+    print(f"[merge] candidate columns: {'PRESENT' if cand else 'absent'}")
+
+    columns = columns + (OUTCOME_COLUMN,)
+    parts: dict[str, list] = {c: [] for c in columns}
     n_seen = n_kept = 0
     by_speed: dict[float, list[int]] = {}
 
@@ -108,21 +141,24 @@ def main() -> int:
             by_speed[speed][1] += int(keep.sum())
             if not keep.any():
                 continue
-            for c in COLUMNS:
-                parts[c].append(f[c][:n][keep])
+            ok = np.array([verdicts.get(int(u)) == "success" for u in uid], dtype=np.uint8)
+            for c in columns:
+                col = ok if c == OUTCOME_COLUMN else f[c][:n]
+                parts[c].append(col[keep])
 
-    merged = {c: np.concatenate(parts[c]) for c in COLUMNS}
+    merged = {c: np.concatenate(parts[c]) for c in columns}
     total = merged["episode_uid"].shape[0]
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     with h5py.File(args.out, "w") as f:
-        for c in COLUMNS:
+        for c in columns:
             f.create_dataset(c, data=merged[c])
         f.attrs["num_windows_written"] = total
         f.attrs["is_selected_chunk_recording"] = 1
+        f.attrs["has_candidates"] = int(cand)
         f.attrs["filter"] = "selected+successful" if args.successful_only else "selected"
         f.attrs["n_recorded"] = n_seen
         f.attrs["n_cells"] = len(cells)
-        f.attrs["columns_written"] = json.dumps(list(COLUMNS))
+        f.attrs["columns_written"] = json.dumps(list(columns))
 
     print(f"[merge] {len(cells)} cells | recorded {n_seen:,} -> kept {total:,} "
           f"({total / max(n_seen, 1):.1%})"

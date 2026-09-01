@@ -153,7 +153,8 @@ def run(args) -> int:
             types.SimpleNamespace(tracker_onnx=args.tracker_onnx, fm_onnx=args.fm_onnx,
                                   out=args.out, providers=args.providers,
                                   fall_height=args.fall_height,
-                                  fall_tilt_deg=args.fall_tilt_deg, cmd_hold_s=0.0), course)
+                                  fall_tilt_deg=args.fall_tilt_deg,
+                                  cmd_hold_s=terrains.CMD_HOLD_S), course)
         # Isaac starts the robot ON the clip -- pose AND velocity. mjeval's default standing
         # spawn is a different initial condition, and on stairs it is the difference between
         # arriving in phase with the treads and arriving from a standstill.

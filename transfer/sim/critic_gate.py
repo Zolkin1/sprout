@@ -107,7 +107,8 @@ def run(args) -> int:
             types.SimpleNamespace(tracker_onnx=args.tracker_onnx, fm_onnx=args.fm_onnx,
                                   out=args.out, providers=args.providers,
                                   fall_height=args.fall_height,
-                                  fall_tilt_deg=args.fall_tilt_deg, cmd_hold_s=0.0), course)
+                                  fall_tilt_deg=args.fall_tilt_deg,
+                                  cmd_hold_s=terrains.CMD_HOLD_S), course)
         print(f"[gate] {course.name} klass={course.klass} "
               f"anchor={np.round(course.goal_anchor_xyz, 3)}", flush=True)
         cmd = np.array([speed, 0.0, 0.0])

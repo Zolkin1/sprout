@@ -496,6 +496,7 @@ def stage_merge(args) -> int:
 
 def main() -> int:
     """Entry point."""
+    import terrains  # noqa: PLC0415  the shared CMD_HOLD_S default
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--stage", required=True,
@@ -523,7 +524,7 @@ def main() -> int:
                    help="REQUIRED to differ between concurrent runs on one tile: CourseRig "
                         "rewrites robots/g1/<robot>_<course>.xml before loading it, so two "
                         "processes sharing a name tear the file silently.")
-    p.add_argument("--cmd_hold_s", type=float, default=0.0)
+    p.add_argument("--cmd_hold_s", type=float, default=terrains.CMD_HOLD_S)
     p.add_argument("--fall_height", type=float, default=0.2)
     p.add_argument("--fall_tilt_deg", type=float, default=70.0)
     p.add_argument("--providers", default="auto")

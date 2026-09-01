@@ -57,6 +57,10 @@ import terrains  # noqa: E402
 #: the plan ribbon its "baseline" violet, so the viewer and the write-up agree on what is what.
 TARGET_RGBA = (0.06, 0.48, 0.38, 0.55)
 PLAN_RGBA = (0.54, 0.49, 0.66, 0.85)
+
+#: The GHOST arm's plan ribbon. Deliberately a different hue from PLAN_RGBA:
+#: two ribbons in one colour read as one plan with a kink in it.
+GHOST_PLAN_RGBA = (1.0, 0.55, 0.10, 0.85)
 ROOT_RGBA = (0.72, 0.52, 0.17, 0.9)
 
 #: Ghost colours per arm, matching the written report's palette so the two agree on which arm
@@ -452,8 +456,11 @@ def replay(summary: dict, frames: list, plans: list, rt: float, loop: bool,
     target_z = course.floor_z if course.flight_height_m < 0 else course.flight_height_m
 
     gdata = ghost_opt = ghost_scn = None
+    ghost_plan_at: dict[int, np.ndarray] = {}
     n_steps = len(frames)
     if ghost is not None:
+        # Optional, so `view_cell`'s own caller -- which passes no plans -- is unchanged.
+        ghost_plan_at = {step: path for step, path in ghost.get("plans", ())}
         gdata = mujoco.MjData(model)
         ghost_opt = mujoco.MjvOption()
         ghost_opt.geomgroup[:] = 0
@@ -473,6 +480,7 @@ def replay(summary: dict, frames: list, plans: list, rt: float, loop: bool,
         viewer.cam.elevation = -18.0
         viewer.cam.azimuth = 130.0
         current_plan = None
+        current_ghost_plan = None
         while viewer.is_running():
             wall0 = time.time()
             for i in range(n_steps):
@@ -486,6 +494,8 @@ def replay(summary: dict, frames: list, plans: list, rt: float, loop: bool,
                 mujoco.mj_forward(model, data)
                 if i in plan_at:
                     current_plan = plan_at[i]
+                if i in ghost_plan_at:
+                    current_ghost_plan = ghost_plan_at[i]
 
                 viewer.user_scn.ngeom = 0
                 if ghost is not None:
@@ -498,6 +508,12 @@ def replay(summary: dict, frames: list, plans: list, rt: float, loop: bool,
                 _goal_rect(viewer.user_scn, course, target_z)
                 if current_plan is not None:
                     _dots(viewer.user_scn, current_plan, PLAN_RGBA, 0.022, stride=2)
+                if current_ghost_plan is not None:
+                    # Shifted with the ghost body, so the ribbon stays attached to the robot
+                    # it belongs to when --offset_y separates the two arms.
+                    gp = current_ghost_plan.copy()
+                    gp[:, 1] += ghost["offset_y"]
+                    _dots(viewer.user_scn, gp, GHOST_PLAN_RGBA, 0.022, stride=2)
                 _dots(viewer.user_scn, qpos[:3].reshape(1, 3), ROOT_RGBA, 0.05)
                 # Track the robot rather than leaving it to walk out of frame; the operator can
                 # still orbit, because only the lookat point is written.

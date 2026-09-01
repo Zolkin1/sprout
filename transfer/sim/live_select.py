@@ -11,6 +11,11 @@ the calibration work turns out.
 At each re-plan: snapshot, execute 0.24 s of each of K candidate chunks, evaluate ``V_priv``
 on the resulting state, pick the argmin, and continue from THAT branch's state.
 
+``--lookahead n`` deepens the evaluation without changing the decision: each candidate is
+carried a further ``n - 1`` chunks with NO branching before ``V`` is read, and only the FIRST
+chunk is committed.  Breadth and depth then cost the same thing per decision, which is what
+makes ``--k 4 --lookahead 2`` and ``--k 8 --lookahead 1`` a controlled comparison.
+
 **The winner is not re-executed.**  The branch length equals the re-plan cadence, so the
 winner's post-branch state IS the state the episode continues from -- restoring and replaying
 it would cost a (K+1)th chunk and, worse, is the kind of duplicated execution that silently
@@ -135,7 +140,7 @@ class SelectedChunkWriter:
 
     This is the filtered-BC dataset: one row per re-plan, holding the conditioning the
     generator saw and, as ``fm_plan``, the candidate the selector committed -- so training on
-    it is "reproduce the chunk that was picked".  ``finetune_advantage.py`` with no
+    it is "reproduce the chunk that was picked".  ``finetune_generator.py`` with no
     ``--labels`` consumes exactly this and calls it unconditioned self-distillation.
 
     **Only the five columns the trainer reads are written** (``fm_plan``, ``history``,
@@ -144,21 +149,59 @@ class SelectedChunkWriter:
     like a rollout recording and silently answers wrong for proprio, the scan and the goal
     offsets; ``is_selected_chunk_recording`` marks it so nothing mistakes it for one.
 
+    **``record_candidates`` adds the REJECTED chunks, and costs almost nothing extra**,
+    because every candidate at one re-plan branches from the same snapshot and re-plans at the
+    same state -- they differ only in the flow noise draw.  So the conditioning is shared and
+    already stored once, and a row grows by ``K`` plans plus ``K`` scores rather than by ``K``
+    copies of a 7800-wide exteroception row.  These columns are a DIAGNOSTIC, never training
+    data: ``ft_canary.PairGapCanary`` reads them to ask whether the model is pulling away from
+    the chunks the critic rejected or improving on all of them together.
+
+    ``cand_plans`` is fp32 where ``extero`` is fp16 on purpose.  ``extero`` is model INPUT,
+    where fp16 is well inside the sensor's own noise; these are flow-loss TARGETS, and the
+    paired gaps being measured can be ~1e-3, which is fp16's resolution there.
+
     Args:
         path: Output ``.h5``.
         meta: Provenance stamped into the file's attrs.
+        record_candidates: Also store every candidate's plan, score and chunk verdict.
     """
 
-    def __init__(self, path: str, meta: dict) -> None:
+    #: ``cand_verdict`` codes.  CHUNK-level -- what happened during that candidate's own
+    #: 0.24 s branch, which for a REJECTED candidate is the only outcome that exists, since the
+    #: episode never followed it.  Episode-level outcome is still available to a consumer:
+    #: both members of a pair share ``episode_uid``, so `live_select.json`'s verdict conditions
+    #: the pair (which is how ``merge_selected.py --successful_only`` already works).
+    VERDICT_CODES = {"": 0, "fall": 1, "success": 2, "timeout": 3}
+
+    def __init__(self, path: str, meta: dict, record_candidates: bool = False) -> None:
         self.path = str(path)
         self.meta = dict(meta)
+        self.record_candidates = bool(record_candidates)
         self.rows: list[dict] = []
 
     def add(self, *, episode_uid: int, replan_index: int, family_code: int,
             history: np.ndarray, history_null: bool, extero: np.ndarray,
-            cmd_future: np.ndarray, fm_plan: np.ndarray) -> None:
-        """Append one selected chunk with the conditioning it was drawn from."""
-        self.rows.append({
+            cmd_future: np.ndarray, fm_plan: np.ndarray,
+            cand_plans: np.ndarray | None = None, cand_scores: np.ndarray | None = None,
+            cand_verdict: np.ndarray | None = None, sel_index: int = 0) -> None:
+        """Append one selected chunk with the conditioning it was drawn from.
+
+        Args:
+            episode_uid: Join key to ``live_select.json``'s per-episode verdict.
+            replan_index: Re-plan ordinal within the episode.
+            family_code: Terrain family.
+            history: ``(N, D)`` history conditioning.
+            history_null: Whether the learned null history stood in.
+            extero: RAW fused exteroception row (the dataset normalizes it).
+            cmd_future: ``(T, 3)`` future command tokens.
+            fm_plan: The COMMITTED chunk.
+            cand_plans: ``(K, F, D)`` every candidate's chunk, in candidate order.
+            cand_scores: ``(K,)`` the value each was ranked on.
+            cand_verdict: ``(K,)`` per-candidate CHUNK verdict codes.
+            sel_index: Which candidate was committed.
+        """
+        row = {
             "episode_uid": np.int64(episode_uid), "replan_index": np.int32(replan_index),
             "family_code": np.uint8(family_code),
             "history": np.asarray(history, dtype=np.float32),
@@ -166,7 +209,21 @@ class SelectedChunkWriter:
             "extero": np.asarray(extero, dtype=np.float16),
             "cmd_future": np.asarray(cmd_future, dtype=np.float32),
             "fm_plan": np.asarray(fm_plan, dtype=np.float32),
-        })
+        }
+        if self.record_candidates:
+            row["cand_plans"] = np.asarray(cand_plans, dtype=np.float32)
+            row["cand_scores"] = np.asarray(cand_scores, dtype=np.float32)
+            row["cand_verdict"] = np.asarray(cand_verdict, dtype=np.uint8)
+            row["sel_index"] = np.uint8(sel_index)
+        self.rows.append(row)
+
+    def columns(self) -> list[str]:
+        """The datasets this writer emits, training columns first."""
+        cols = ["episode_uid", "replan_index", "family_code", "history", "history_null",
+                "extero", "cmd_future", "fm_plan"]
+        if self.record_candidates:
+            cols += ["cand_plans", "cand_scores", "cand_verdict", "sel_index"]
+        return cols
 
     def close(self) -> int:
         """Write the file. Returns the row count."""
@@ -176,15 +233,15 @@ class SelectedChunkWriter:
         if not n:
             return 0
         os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
+        cols = self.columns()
         with h5py.File(self.path, "w") as f:
-            for key in ("episode_uid", "replan_index", "family_code", "history",
-                        "history_null", "extero", "cmd_future", "fm_plan"):
+            for key in cols:
                 f.create_dataset(key, data=np.stack([r[key] for r in self.rows]))
             f.attrs["num_windows_written"] = n
             f.attrs["is_selected_chunk_recording"] = 1
-            f.attrs["columns_written"] = json.dumps(
-                ["episode_uid", "replan_index", "family_code", "history", "history_null",
-                 "extero", "cmd_future", "fm_plan"])
+            f.attrs["has_candidates"] = int(self.record_candidates)
+            f.attrs["verdict_codes"] = json.dumps(self.VERDICT_CODES)
+            f.attrs["columns_written"] = json.dumps(cols)
             for k, v in self.meta.items():
                 f.attrs[k] = v
         return n
@@ -224,6 +281,38 @@ def capture_conditioning(policy, state) -> dict | None:
     }
 
 
+#: Keys the random-selection control's own RNG, kept clear of the candidate and depth ranges
+#: for the same reason _LOOKAHEAD_TAG is.
+_SELECT_TAG = 5501
+
+#: Appended to every lookahead-continuation draw's seed sequence, so a continuation key can
+#: never alias a first-chunk key however K and the depth grow.  An arbitrary literal outside
+#: both the candidate and the depth range -- the sequences already differ in LENGTH today, and
+#: this keeps that from being the only thing separating them.
+_LOOKAHEAD_TAG = 7717
+
+
+def _sha256(path: str | None) -> str:
+    """Hash a file, or return ``""`` when there is none.
+
+    Args:
+        path: File to hash, or a falsy value.
+
+    Returns:
+        Hex digest, or ``""``. Empty and absent are deliberately the same here -- the caller
+        stores it beside the path, which already says whether one was given.
+    """
+    import hashlib  # noqa: PLC0415
+
+    if not path or not os.path.isfile(path):
+        return ""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blk in iter(lambda: f.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
+
 def arrived(course, robot, zex) -> bool:
     """Did the robot arrive, under whichever rule this course carries?
 
@@ -255,7 +344,8 @@ def arrived(course, robot, zex) -> bool:
 
 
 def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None,
-          steer_kp: float = 0.0, steer_wz_max: float = 0.68, capture: dict | None = None):
+          steer_kp: float = 0.0, steer_wz_max: float = 0.68, capture: dict | None = None,
+          hold_until: float = 0.0):
     """Advance ``n_steps`` control steps, returning early on a terminal condition.
 
     Mirrors ``runner.run_episode``'s inner loop and its ORDERING, which is load-bearing there
@@ -298,8 +388,21 @@ def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None,
     for _ in range(int(n_steps)):
         if robot.mj_data.time > course.budget_s:
             return "timeout", "", last
+        # THE OPENING HOLD, per control step and by absolute sim time -- the same test
+        # `runner.run_episode` makes (`time < hold_until` -> zero, then a hard STEP to the
+        # command, no ramp). It lives here rather than in the caller because a 0.5 s hold is
+        # 25 control steps and the chunk length is 12: it does not divide into chunks, so a
+        # per-chunk decision could not express it.
+        #
+        # This was a NO-OP for the flag's whole life: `--cmd_hold_s` reached `cfg.cmd_hold_s`
+        # and the recorded provenance, but only `run_episode` reads that field and this
+        # harness never calls it. Two arms run at 0.5 came back BIT-IDENTICAL to the same
+        # arms at 0.0, which is what exposed it -- a plausible-looking null result that was
+        # really the flag doing nothing.
         step_cmd = cmd
-        if steer_kp > 0.0:
+        if hold_until > 0.0 and robot.mj_data.time < hold_until:
+            step_cmd = np.zeros(3, dtype=np.float64)
+        elif steer_kp > 0.0:
             qw, qx, qy, qz = (float(v) for v in robot.mj_data.qpos[3:7])   # MuJoCo wxyz
             yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
             wz = steer_yaw_rate(course, float(robot.mj_data.qpos[0]), float(robot.mj_data.qpos[1]),
@@ -333,8 +436,10 @@ def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None,
 def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                          k: int, seed: int, mjrunner, steer_kp: float = 0.0,
                          steer_wz_max: float = 0.68, same_noise: bool = False,
-                         recorder=None, episode_uid: int = -1, family_code: int = 0):
-    """One episode driven by a live 1-step-lookahead selector over ``k`` candidate chunks.
+                         recorder=None, episode_uid: int = -1, family_code: int = 0,
+                         lookahead: int = 1, random_select: bool = False,
+                         cmd_hold_s: float = 0.0):
+    """One episode driven by a live lookahead selector over ``k`` candidate chunks.
 
     Args:
         rig: The course rig.
@@ -354,6 +459,23 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             steering. Forwarded to every :func:`_chunk` call, so it applies identically to
             the ``k == 1`` path and every ``k > 1`` candidate.
         steer_wz_max: Symmetric clip on the steering yaw rate, rad/s.
+        lookahead: Chunks rolled per candidate before ``V`` is read.  ``1`` (default) is the
+            myopic selector: score the state one chunk out.  ``n > 1`` continues each
+            candidate for ``n - 1`` further chunks with NO branching -- one fresh draw each,
+            the generator's own policy -- and bootstraps ``V`` from the end of that, so the
+            score is an ``(n-1)``-step return under the unmodified generator plus a terminal
+            value rather than a value read one chunk out.
+
+            **Only the FIRST chunk is committed.**  The continuation exists to score that
+            chunk and is then discarded, so the decision frequency is identical to
+            ``lookahead=1`` and depth is the only thing that changes.  That is what makes
+            ``k=4, lookahead=2`` and ``k=8, lookahead=1`` an equal-compute breadth-vs-depth
+            pair: both roll 8 chunks per decision.
+
+            **A terminal event in the continuation does NOT end the episode**, since the
+            episode never went there -- it scores the branch (fall 1.0, arrival -1.0) and
+            the committed verdict stays the first chunk's.  Ignored on the ``k == 1`` path,
+            which makes no choice and so has nothing to look ahead for.
 
     Returns:
         ``(verdict, failure, n_replans, mean_candidates_scored)``.
@@ -384,14 +506,28 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
     while robot.mj_data.time <= course.budget_s:
         if k <= 1:
             v, f, _st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, zex, scorer=_ring,
-                              steer_kp=steer_kp, steer_wz_max=steer_wz_max)
+                              steer_kp=steer_kp, steer_wz_max=steer_wz_max,
+                              hold_until=cmd_hold_s)
             if v:
                 return v, f, n_replans, 0.0
             n_replans += 1
             continue
 
         snap = Snapshot(robot, policy, fm_lag)
-        best = None
+        best, sel_index = None, 0
+        # RANDOM-SELECTION CONTROL: every candidate is rolled and scored exactly as usual, and
+        # then the winner is drawn UNIFORMLY instead of by argmin. It differs from the real arm
+        # in one thing only -- the choice rule -- so it isolates the critic's RANKING, where
+        # --same_noise confounds that with the per-re-plan RNG keying (measured worth +0.056
+        # on 9 cells, a third of the apparent best-of-K gain, and unexplained).
+        #
+        # Its own stream, never `policy._rng`: drawing the choice from the policy's generator
+        # would consume from the same sequence that produces the flow noise, so the control
+        # would silently alter the candidates it is supposed to be choosing among.
+        pick_rng = np.random.default_rng([seed, n_replans, _SELECT_TAG])
+        all_cands = []
+        want_cands = recorder is not None and recorder.record_candidates
+        cand_plans, cand_scores, cand_verdict = [], [], []
         for cand in range(k):
             if cand:
                 snap.restore(robot, policy, fm_lag)
@@ -407,7 +543,18 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             # (seed, replan, cand) triple can alias another.
             # SAME-NOISE CONTROL: drop `cand` from the key so every candidate is handed ONE
             # draw. The selector then chooses among K IDENTICAL chunks, so it has zero signal
-            # by construction and this arm must reproduce K=1 EXACTLY -- not approximately.
+            # by construction and any rise it shows over the REAL K arm at the same K is
+            # manufactured by the harness.
+            #
+            # ITS COMPARATOR IS REAL K, NOT K=1. The two K>1 paths re-seed per re-plan
+            # (`[seed, n_replans, ...]`) while K=1 lets `policy._rng` advance naturally from
+            # `default_rng(seed)`, so same-noise K=4 and K=1 run DIFFERENT noise tapes and
+            # differ for that reason alone -- a deviation there is the seeding scheme, not the
+            # snapshot machinery, and reading it as a restore bug would be a false alarm.
+            # What same-noise K=4 does reproduce is a zero-signal draw from the same
+            # distribution as K=1, so it is a valid control on the SELECTOR and not a
+            # bit-exactness test. The bit-exactness test is the K=1 arm itself, which must
+            # match the plain runner.
             #
             # In Isaac this same control is what retired the per-state best-of-K harness: with
             # an imperfect state restore and a non-reproducible sim it still showed a
@@ -423,25 +570,70 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             cz = list(zex)
             cap: dict = {} if recorder is not None else None
             v, f, st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, cz, scorer=_ring,
-                             steer_kp=steer_kp, steer_wz_max=steer_wz_max, capture=cap)
-            if v == "fall":
+                             steer_kp=steer_kp, steer_wz_max=steer_wz_max,
+                             hold_until=cmd_hold_s, capture=cap)
+            # THE COMMIT POINT IS THE END OF THE FIRST CHUNK. With a lookahead the
+            # continuation moves the sim past the state the episode actually resumes from, so
+            # the snapshot has to be taken here, between the chunk being committed and the
+            # rollout that merely scores it. At lookahead=1 it is taken below instead, after
+            # the critic read, exactly where it always was -- so that path stays bit-identical
+            # to every number already measured with it.
+            post = Snapshot(robot, policy, fm_lag) if lookahead > 1 else None
+            v_score, st_score = v, st
+            if lookahead > 1 and not v and st is not None:
+                # The branch's OWN z extremes travel into the continuation (the traversal gate
+                # is an episode-level quantity), but on a COPY: what the continuation climbs
+                # must not be credited to the chunk being committed.
+                cz_look = list(cz)
+                for depth in range(1, lookahead):
+                    # No branching here -- one draw, the generator's unmodified policy. The
+                    # key is longer than any first-chunk key and carries _LOOKAHEAD_TAG, so a
+                    # continuation can never be handed a first chunk's stream.
+                    policy._rng = np.random.default_rng(
+                        [seed, n_replans, depth, _LOOKAHEAD_TAG] if same_noise
+                        else [seed, n_replans, cand, depth, _LOOKAHEAD_TAG])
+                    v_score, _fl, st_look = _chunk(
+                        rig, policy, fm_lag, cmd, cadence, cfg, cz_look, scorer=_ring,
+                        steer_kp=steer_kp, steer_wz_max=steer_wz_max, hold_until=cmd_hold_s)
+                    if st_look is not None:
+                        st_score = st_look
+                    if v_score:
+                        break
+            if v_score == "fall":
                 # A candidate that already fell is worse than any survivor. Scored 1.0 rather
                 # than skipped, so a re-plan where EVERY candidate falls still has an argmin
                 # and the episode ends the way it would have anyway.
                 score = 1.0
-            elif v == "success":
+            elif v_score == "success":
                 score = -1.0
-            elif st is None:
+            elif st_score is None:
                 score = 1.0
             else:
                 # The chunk's own last state, NOT a rebuilt one. See _chunk's docstring: a
                 # rebuild advances the depth-lag ring and corrupts the committed state.
-                x = C.CriticInputs.from_runtime(policy, robot, st, anchor=anchor, ring=ring,
-                                                want_scan=crit.privileged)
+                x = C.CriticInputs.from_runtime(policy, robot, st_score, anchor=anchor,
+                                                ring=ring, want_scan=crit.privileged)
                 score = crit.p_fail(x)
-            post = Snapshot(robot, policy, fm_lag)
+            if post is None:
+                post = Snapshot(robot, policy, fm_lag)
+            # `v`/`f`/`cz` are the FIRST chunk's -- the continuation's verdict scores the
+            # branch but is never the episode's, because the episode never ran it.
+            if random_select:
+                all_cands.append((score, post, v, f, cz, cap))
             if best is None or score < best[0]:
                 best = (score, post, v, f, cz, cap)
+                sel_index = cand
+            if want_cands:
+                # The conditioning is NOT stored per candidate: every candidate restored the
+                # same snapshot (sim, policy ring AND depth-lag ring) and re-planned at the
+                # same state, so history/extero/cmd are identical across them by construction
+                # and are already written once from the winner's capture.
+                cand_plans.append(cap["fm_plan"])
+                cand_scores.append(score)
+                cand_verdict.append(SelectedChunkWriter.VERDICT_CODES.get(v, 0))
+        if random_select:
+            sel_index = int(pick_rng.integers(len(all_cands)))
+            best = all_cands[sel_index]
         scored.append(k)
         # Commit the winner by RESTORING ITS POST-CHUNK STATE -- the branch length is the
         # cadence, so that state is exactly where the episode continues from. Re-executing the
@@ -451,10 +643,15 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
         # The CHOSEN chunk, with the conditioning every candidate shared. Written on commit
         # rather than per candidate: the rejected ones are exactly what filtering removes.
         if recorder is not None and best[5]:
+            extra_c = ({"cand_plans": np.stack(cand_plans),
+                        "cand_scores": np.asarray(cand_scores, dtype=np.float32),
+                        "cand_verdict": np.asarray(cand_verdict, dtype=np.uint8),
+                        "sel_index": sel_index} if want_cands else {})
             recorder.add(episode_uid=episode_uid, replan_index=n_replans,
                          family_code=family_code, history=best[5]["history"],
                          history_null=best[5]["history_null"], extero=best[5]["extero"],
-                         cmd_future=best[5]["cmd_future"], fm_plan=best[5]["fm_plan"])
+                         cmd_future=best[5]["cmd_future"], fm_plan=best[5]["fm_plan"],
+                         **extra_c)
         zex = list(best[4])
         n_replans += 1
         if best[2]:
@@ -477,6 +674,19 @@ def run(args) -> int:
 
     ks = [int(x) for x in args.k.split(",")]
     use_q = bool(args.q_ckpt)
+    if args.lookahead < 1:
+        raise SystemExit("--lookahead must be >= 1")
+    if args.lookahead > 1:
+        if use_q:
+            raise SystemExit(
+                "--lookahead is only wired into run_episode_selected (the V selector). The Q "
+                "selector scores (s, a) at the re-plan itself, so a rolled-out continuation "
+                "is not the same object -- refusing rather than silently running myopic.")
+        print(f"[live] lookahead {args.lookahead}: each candidate rolls {args.lookahead} "
+              f"chunks ({args.lookahead - 1} unbranched continuation) before V is read; only "
+              "the FIRST is committed. Cost is lookahead x the K=... arm, so "
+              f"k=N,lookahead={args.lookahead} matches k={args.lookahead}N,lookahead=1 on "
+              "chunks per decision.")
     if args.steer_kp > 0.0:
         if use_q:
             raise SystemExit(
@@ -504,21 +714,46 @@ def run(args) -> int:
     crit = scorer
     os.makedirs(args.out, exist_ok=True)
     recorder = None
+    if args.random_select and args.same_noise:
+        raise SystemExit(
+            "--random_select and --same_noise are two DIFFERENT controls and composing them "
+            "gives a third thing that answers neither question: with one shared draw every "
+            "candidate is identical, so choosing among them at random is not a control on the "
+            "ranking, it is just the same-noise arm. Run them separately.")
+    if args.random_select and ks == [1]:
+        raise SystemExit("--random_select needs a K>1 arm; at K=1 there is nothing to choose.")
+    if args.record_candidates and not args.record_selected:
+        raise SystemExit("--record_candidates writes into --record_selected's file; pass one.")
     if args.record_selected:
         if ks == [1]:
             raise SystemExit(
                 "--record_selected needs a K>1 arm: at K=1 the selector makes no choice, so "
                 "the 'selected' chunk is just the generator's own sample and fine-tuning on "
                 "it would be a no-op self-distillation.")
+        critic_path = args.critic_ckpt or args.state_critic_ckpt or args.q_ckpt
+        # A PATH IS NOT A FINGERPRINT. This repo has been bitten three times by a default path
+        # that still resolved while naming the wrong artifact (`_DEFAULT_RUN_DIR`,
+        # `G1_DEPLOY_POLICY_DIR`, the hand-kept `g1_29j.urdf`), each time silently. A recording
+        # that is going to be trained on has to be able to PROVE which critic ranked it, so the
+        # hash travels beside the name -- and so does the critic KIND, since V, Q and the state
+        # critic rank on different quantities and their checkpoints are not distinguishable by
+        # filename.
         recorder = SelectedChunkWriter(args.record_selected, {
             "tracker_onnx": os.path.abspath(args.tracker_onnx),
+            "tracker_sha256": _sha256(args.tracker_onnx),
             "fm_onnx": os.path.abspath(args.fm_onnx),
-            "critic": os.path.abspath(args.critic_ckpt or args.state_critic_ckpt),
+            "fm_sha256": _sha256(args.fm_onnx),
+            "critic": os.path.abspath(critic_path) if critic_path else "",
+            "critic_sha256": _sha256(critic_path),
+            "critic_kind": ("Q" if args.q_ckpt else
+                            "state" if args.state_critic_ckpt else "V"),
             "clip_lib": os.path.abspath(args.clip_lib),
+            "clip_lib_sha256": "",   # multi-GB; the path + manifest identify it
             "k": args.k, "episodes": int(args.episodes), "speed": float(args.speed),
             "approach": float(args.approach), "steer_kp": float(args.steer_kp),
+            "lookahead": int(args.lookahead),
             "tiles": args.tiles, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        })
+        }, record_candidates=bool(args.record_candidates))
     rows, t0 = [], time.time()
 
     if args.catalogue:
@@ -590,11 +825,14 @@ def run(args) -> int:
                 extra = ({} if use_q else
                         {"steer_kp": args.steer_kp, "steer_wz_max": args.steer_wz_max,
                          "same_noise": args.same_noise,
+                         "random_select": args.random_select,
                          # Only K>1 selects; a K=1 arm in the same invocation must not write.
                          "recorder": (recorder if k > 1 else None),
                          "episode_uid": (int(tile) * 1000000 + int(k) * 100000
                                          + int(round(args.speed * 10)) * 1000 + int(ep)),
-                         "family_code": int(uid) // 20})
+                         "family_code": int(uid) // 20,
+                         "lookahead": args.lookahead,
+                         "cmd_hold_s": args.cmd_hold_s})
                 v, f, nr, sc = fn(
                     rig, policy, fm_lag, spawn, cmd, cfg, crit, course.goal_anchor_xyz,
                     k=k, seed=ep, mjrunner=mjrunner, **extra)
@@ -688,18 +926,50 @@ def main() -> int:
     p.add_argument("--steer_wz_max", type=float, default=0.68,
                    help="Symmetric clip on the steering yaw rate, rad/s. Matches "
                         "runner.STEER_WZ_MAX. Only used with --steer_kp.")
+    p.add_argument("--lookahead", type=int, default=1,
+                   help="Chunks rolled per candidate before V is read. 1 (default) is the "
+                        "myopic selector. n>1 continues each candidate for n-1 further "
+                        "chunks with NO branching -- one fresh draw each, the generator's own "
+                        "policy -- and bootstraps V from the end, so the score is an "
+                        "(n-1)-step return plus a terminal value. ONLY THE FIRST CHUNK IS "
+                        "COMMITTED, so the decision frequency is unchanged and depth is the "
+                        "only variable; a terminal event in the continuation scores the "
+                        "branch but never ends the episode. Costs lookahead x the arm, which "
+                        "makes --k 4 --lookahead 2 and --k 8 --lookahead 1 an equal-compute "
+                        "breadth-vs-depth pair (8 chunks per decision each). V selector only; "
+                        "ignored on the K=1 path, which makes no choice.")
     p.add_argument("--record_selected", default="",
                    help="Write the CHOSEN chunk at every re-plan to this .h5, with the "
                         "conditioning it was drawn from -- the filtered-BC dataset, consumed "
-                        "by finetune_advantage.py with no --labels. K>1 arms only: at K=1 "
+                        "by finetune_generator.py with no --labels. K>1 arms only: at K=1 "
                         "there is no selection, so a recording would just be the generator's "
                         "own output and training on it is a no-op.")
+    p.add_argument("--record_candidates", action="store_true",
+                   help="With --record_selected, also store every REJECTED candidate's chunk, "
+                        "its critic score and its per-chunk verdict. Diagnostic only, never "
+                        "training data: ft_canary.PairGapCanary reads them to separate 'the "
+                        "model is learning the selector's ranking' from 'self-distillation "
+                        "improved everything together', which no loss on the selected chunks "
+                        "alone can tell apart. Nearly free -- candidates share one "
+                        "conditioning, so a row grows by K plans, not K exteroception rows.")
+    p.add_argument("--random_select", action="store_true",
+                   help="CONTROL: roll and score all K candidates exactly as usual, then "
+                        "commit a UNIFORMLY RANDOM one instead of the argmin. Differs from the "
+                        "real arm in the choice rule ALONE, so the gap between them is the "
+                        "critic's ranking and nothing else. Preferred over --same_noise for "
+                        "that question: same-noise also changes the RNG keying relative to "
+                        "K=1, which is worth a measured +0.056 on its own and confounds the "
+                        "two effects.")
     p.add_argument("--same_noise", action="store_true",
                    help="CONTROL: hand every candidate the SAME draw, so the selector has "
-                        "zero signal by construction. In this deterministic sim it must "
-                        "reproduce K=1 EXACTLY; a deviation is a bug in the snapshot/restore, "
-                        "not a bias to subtract. This is the check the Isaac per-state "
-                        "best-of-K harness failed (its control matched the real arm).")
+                        "zero signal by construction and any rise over the REAL arm AT THE "
+                        "SAME K is manufactured by the harness. This is the check the Isaac "
+                        "per-state best-of-K harness failed (its control matched the real "
+                        "arm). Compare it against real K, NOT against K=1: both K>1 paths "
+                        "re-seed per re-plan while K=1 advances its rng naturally from the "
+                        "episode seed, so same-noise K=4 and K=1 run different noise tapes "
+                        "and differ for that reason alone. Bit-exactness of the "
+                        "snapshot/restore is what the K=1 arm tests, not this.")
     p.add_argument("--klass", default="",
                    help="Force the course class (a terrains.CLASS_CODES key) instead of "
                         "inferring it from the tile's manifest family. TILE courses only. "
@@ -710,11 +980,19 @@ def main() -> int:
                         "footprint. Note the traversal gate and fall datum then read under "
                         "box semantics, which is what makes this explicit rather than "
                         "inferred.")
-    p.add_argument("--cmd_hold_s", type=float, default=0.0,
-                   help="seconds of zero command before stepping to --speed, on TILE courses. "
-                        "Measured worth -0.26 on stairs_up and +0.10 on stairs_down, so it is "
-                        "a real experimental variable and neither value is neutral. Clip "
-                        "courses force 0: they start already moving.")
+    import terrains as _terrains  # noqa: PLC0415  the shared CMD_HOLD_S constant
+
+    p.add_argument("--cmd_hold_s", type=float, default=_terrains.CMD_HOLD_S,
+                   help="Seconds of zero command before stepping to --speed, on TILE courses. "
+                        "Defaults to terrains.CMD_HOLD_S (the one constant every mjeval driver "
+                        "reads) rather than a local literal. Clip courses force 0: they start "
+                        "already moving.\n"
+                        "NOT COSMETIC. Commanding full speed on the first control tick puts the "
+                        "robot through a spawn transient that is itself a failure mode: on tile "
+                        "20 at 2.4 m/s the base generator scores 0.275 at hold 0 and 0.675 at "
+                        "hold 0.5 -- the hold is worth more than the entire fine-tune effect "
+                        "measured there. Anything recorded before this became the default was "
+                        "run at 0 and is NOT comparable.")
     p.add_argument("--k", default="1,4,8", help="comma list of candidate counts.")
     p.add_argument("--episodes", type=int, default=200,
                    help="per arm per tile, seed-matched across arms (seed = episode index).")
