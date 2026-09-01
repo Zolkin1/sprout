@@ -228,6 +228,74 @@ def slot0_verdict(outcome: WindowOutcome, group: int, group_size: int) -> str | 
     return "fell" if bool(outcome.fell[e]) else None
 
 
+class BranchOnce:
+    """One branch point per episode, every candidate rolled to TERMINATION.
+
+    This is the HEADROOM measurement, and it is a different question from the selector's.
+    The selector asks whether a critic can rank the generator's samples; this asks whether
+    the samples are worth ranking -- whether the distribution at a state the policy actually
+    visits contains a chunk that leads to success. An oracle answers the second and bounds
+    the first: no critic can beat picking the candidate that actually worked.
+
+    **Three things make it an honest oracle rather than a leak.**
+
+    * The candidates differ in ONE draw. Before the branch every env in the group is served
+      candidate 0's noise, so they are the same rollout; at the branch they are served K
+      distinct draws; after it they share ONE continuation draw per group
+      (``CrnNoise.arm_continuation``). Without that last part a candidate could win on a lucky
+      continuation and the number would be about downstream noise, not about the chunk.
+    * Nothing is restored after the branch. Each candidate runs its own episode to its own
+      termination, so its outcome IS what that chunk led to rather than an estimate of it.
+    * The K=1 reference is candidate 0 OF THE SAME BRANCH, not a separate run, so best-of-K
+      and its baseline are paired on the state as well as on the clip.
+
+    Slot 0 duplicates candidate 0 by construction (``CrnNoise.candidate`` maps slots 0 and 1
+    to the same index), which is kept rather than removed: two envs handed one draw from one
+    state are a free per-episode reading of the restore floor.
+    """
+
+    def __init__(self, num_groups: int, group_size: int, rng) -> None:
+        """Start every group pre-branch.
+
+        Args:
+            num_groups: Concurrent groups.
+            group_size: ``1 + K``.
+            rng: ``numpy`` generator, for the per-episode branch cycle.
+        """
+        self.num_groups = int(num_groups)
+        self.group_size = int(group_size)
+        self.rng = rng
+        self.branched = np.zeros(num_groups, dtype=bool)
+        #: Cycle index at which each group branches. Sampled per episode so the measurement
+        #: spans the episode rather than reporting the headroom at one privileged phase.
+        self.branch_at = np.zeros(num_groups, dtype=np.int64)
+        self.post = np.zeros(num_groups, dtype=np.int64)
+        self.done = np.zeros((num_groups, group_size), dtype=bool)
+        self.ok = np.zeros((num_groups, group_size), dtype=bool)
+
+    def arm_episode(self, group: int, lo: int = 1, hi: int = 8) -> None:
+        """Choose where this group's episode will branch, and clear its outcome slate."""
+        self.branched[group] = False
+        self.branch_at[group] = int(self.rng.integers(lo, hi + 1))
+        self.post[group] = 0
+        self.done[group] = False
+        self.ok[group] = False
+
+    def result(self, group: int) -> dict:
+        """Best-of-K against candidate 0, for one finished group episode.
+
+        ``k1`` is SLOT 1, not slot 0: slots 0 and 1 share candidate 0's draw, and using the
+        duplicate as the baseline would make the pair differ by simulator noise alone.
+        """
+        row = self.ok[group]
+        cands = row[1:]
+        return {"k1": bool(row[1]) if row.size > 1 else bool(row[0]),
+                "best_of_k": bool(cands.any()) if cands.size else bool(row[0]),
+                "n_success": int(cands.sum()), "n_cand": int(cands.size),
+                "twin_agrees": bool(row[0] == row[1]) if row.size > 1 else True,
+                "branch_at": int(self.branch_at[group])}
+
+
 class GoalRefreshHook:
     """Re-resolve the goal anchor AFTER the clip reset has committed, not before.
 
@@ -521,6 +589,24 @@ def stage_select(args) -> int:
             print(f"[select] critic {ck.get('variant','?')} priv={priv} "
                   f"fitted over {os.path.basename(os.path.dirname(named))}")
 
+        if args.steer_kp != 0.0:
+            # Installed on the COMMAND, so the generator's conditioning, the reward and the
+            # command_window observation all see the same turn. See set_yaw_rate_source.
+            def _steer_source():
+                """Yaw rate toward each env's goal, zero once inside the region."""
+                down, lat, hz = goal_region.goal_frame_offsets(
+                    accum.rd.root_pos_w, accum._goal_pos_w, accum._goal_yaw)
+                return goal_region.steer_yaw_rate(
+                    accum.rd.root_pos_w, accum.rd.root_quat_w, accum._goal_pos_w,
+                    goal_region.in_goal(down, lat, hz, accum._goal_tol),
+                    kp=float(args.steer_kp), wz_max=float(args.steer_wz_max))
+
+            cmd.set_yaw_rate_source(_steer_source)
+            print(f"[select] STEERING ON: kp={args.steer_kp} wz_max={args.steer_wz_max}. "
+                  "This is OFF-DISTRIBUTION on the stair families, which the training "
+                  "library never commands a turn on -- a steered stair number is a "
+                  "different measurement, not a cleaner one.")
+
         crn = headroom_noise.CrnNoise(
             num_envs=num_envs, group_size=group_size, future_len=int(cmd.ctx.F),
             state_dim=int(cmd.ctx.D), device=device, run_seed=int(args.seed))
@@ -546,6 +632,18 @@ def stage_select(args) -> int:
         #: winner, because the chain's state is the winner's -- an arrival by a candidate
         #: that was then discarded is not something the robot did.
         chain_arrived = np.zeros(num_groups, dtype=bool)
+        bo = None
+        if args.branch_once:
+            bo = BranchOnce(num_groups, group_size, np.random.default_rng(int(args.seed)))
+            for g in range(num_groups):
+                bo.arm_episode(g)
+            # Per-ENV latches: after the branch each candidate runs its OWN episode to its own
+            # termination, so arrival is no longer a property of a chain.
+            arrived_env = np.zeros(num_envs, dtype=bool)
+            done_env = np.zeros(num_envs, dtype=bool)
+            print(f"[select] BRANCH-ONCE oracle: one branch point per episode, all "
+                  f"{group_size - 1} candidates rolled to termination under a SHARED "
+                  "continuation draw.")
         next_episode_id = int(num_groups)
         t0 = time.time()
         cycles = 0
@@ -589,6 +687,22 @@ def stage_select(args) -> int:
                 # shapes to show for it.
                 crn.set_round(None, round_index)
                 crn.arm_branch(0)
+                if bo is not None:
+                    pre = ~bo.branched
+                    # BEFORE the branch every candidate is the same rollout, so they are all
+                    # served candidate 0's draw; AT the branch they are served their own.
+                    # --same_noise pins force_candidate to 0 throughout, which is the control:
+                    # the candidates are then identical at the branch too, so any best-of-K
+                    # rise is the simulator and not the generator.
+                    if not args.same_noise:
+                        crn.force_candidate = 0 if pre.all() else None
+                    if not pre.all():
+                        # AFTER the branch, one shared draw per group per re-plan. Without it
+                        # a candidate can win on a lucky continuation and the number stops
+                        # being about the chunk.
+                        post_any = int(bo.post.max())
+                        if post_any > 0:
+                            crn.arm_continuation(post_any)
 
                 # Every env in the group is written from the group's carrier, INCLUDING the
                 # carrier itself. The restore probe showed an env that is never written is a
@@ -609,6 +723,14 @@ def stage_select(args) -> int:
 
                 carrier = torch.as_tensor(ge.carrier, device=device)
                 snap = mirror.capture(carrier)
+                if bo is not None and bo.branched.any():
+                    # A branched group is NOT resynchronised: each candidate must carry its
+                    # own consequences to termination, which is the whole measurement.
+                    keep = torch.as_tensor(np.repeat(~bo.branched, group_size),
+                                           device=device)
+                    restore_ids = all_envs[keep]
+                else:
+                    restore_ids = all_envs
                 if args.no_restore:
                     # Nothing is written to the simulator at all. At k=0 there is nothing to
                     # branch, so this is a pure no-op that must not change the outcome --
@@ -624,10 +746,10 @@ def stage_select(args) -> int:
                     mirror.restore(carrier, snap,
                                    src_index=torch.arange(num_groups, device=device))
                     hr._force_replan(cmd, carrier)
-                else:
-                    mirror.restore(all_envs, snap, src_index=group_of_env)
+                elif restore_ids.numel():
+                    mirror.restore(restore_ids, snap, src_index=group_of_env[restore_ids])
                     if not args.no_force_replan:
-                        hr._force_replan(cmd, all_envs)
+                        hr._force_replan(cmd, restore_ids)
                 # After the restore AND the forced re-plan, the previous step's observation
                 # describes neither the robot nor the plan any more.
                 obs = env.get_observations()
@@ -643,6 +765,30 @@ def stage_select(args) -> int:
                 cycles += 1
                 ge.cycles += 1
                 round_index += 1
+
+                if bo is not None:
+                    ok_now = outcome.arrived_before_falling().detach().to("cpu").numpy()
+                    ended = ((outcome.fell | outcome.finished)
+                             .detach().to("cpu").numpy())
+                    # Latch only while an env is still LIVE. Isaac auto-resets a terminated
+                    # env, so a dead candidate goes on to run a junk episode -- and can
+                    # "arrive" in it. Latching that would score a chunk by what the harness
+                    # did after it failed.
+                    live = ~done_env
+                    arrived_env |= ok_now & live
+                    done_env |= ended & live
+                    for g in range(num_groups):
+                        lo, hi = g * group_size, (g + 1) * group_size
+                        if not bo.branched[g]:
+                            if int(ge.cycles[g]) >= int(bo.branch_at[g]):
+                                bo.branched[g] = True
+                            continue
+                        bo.post[g] += 1
+                        bo.done[g] = done_env[lo:hi]
+                        bo.ok[g] = arrived_env[lo:hi]
+                    # A branched group's episode is over only when EVERY candidate has
+                    # terminated; the slowest one sets the pace.
+                    ge.carrier = np.array([g * group_size for g in range(num_groups)])
 
                 if scorer is not None:
                     # score() returns P(fail): LOWER is better, so the sign flips before an
@@ -667,8 +813,13 @@ def stage_select(args) -> int:
                 chain_arrived |= ok[ge.carrier]
 
                 for g in range(num_groups):
-                    verdict = (slot0_verdict(outcome, g, group_size) if args.no_selection
-                               else group_verdict(outcome, g, group_size))
+                    if bo is not None:
+                        if not (bo.branched[g] and bo.done[g].all()):
+                            continue
+                        verdict = "success" if bo.result(g)["best_of_k"] else "fail"
+                    else:
+                        verdict = (slot0_verdict(outcome, g, group_size) if args.no_selection
+                                   else group_verdict(outcome, g, group_size))
                     if verdict is None or retired[g]:
                         continue
                     clip = int(alloc.group_clip[g])
@@ -682,6 +833,12 @@ def stage_select(args) -> int:
                     chain_arrived[g] = False
                     ge.finish(g, verdict=verdict, clip_id=clip, family=fam,
                               next_episode_id=next_episode_id)
+                    if bo is not None:
+                        ge.rows[-1].update(bo.result(g))
+                        lo, hi = g * group_size, (g + 1) * group_size
+                        arrived_env[lo:hi] = False
+                        done_env[lo:hi] = False
+                        bo.arm_episode(g)
                     next_episode_id += 1
                     if alloc.drained:
                         # `_take` WRAPS to the last job rather than stopping, so a group
@@ -717,6 +874,8 @@ def stage_select(args) -> int:
             arm = "samenoise"
         if args.isolate:
             arm += "_isolate"
+        if args.steer_kp != 0.0:
+            arm += f"_steer{args.steer_kp:g}"
         for flag, tag in ((args.no_restore, "norestore"),
                           (args.no_force_replan, "noforce"),
                           (args.align_cadence, "aligned")):
@@ -727,6 +886,8 @@ def stage_select(args) -> int:
         out.write_text(json.dumps({"summary": summary, "rows": ge.rows,
                                    "k": int(args.k), "same_noise": bool(args.same_noise),
                                    "scorer": args.scorer, "num_groups": num_groups,
+                                   "steer_kp": float(args.steer_kp),
+                                   "steer_wz_max": float(args.steer_wz_max),
                                    "replan_k": replan_k}, indent=2))
         print(f"[select] {arm} k={args.k}: SUCCESS {summary['survived']:.3f} "
               f"over {summary['n']} episodes -> {out}")

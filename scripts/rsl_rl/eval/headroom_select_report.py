@@ -16,44 +16,53 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
+import numpy as np
 import pathlib
 
 
-def load(path: pathlib.Path) -> dict[int, dict]:
-    """Rows of one arm, keyed by clip id.
+def load(path: pathlib.Path) -> dict[int, float]:
+    """Per-CLIP success fraction for one arm.
 
-    Raises:
-        SystemExit: If a clip appears twice.  That is the job-list wrap
-            (``GroupAllocator._take`` re-issues the last job once drained), and silently
-            keeping one of the two would pair the arms on a clip they ran different numbers
-            of times.
+    Clip-averaged, not episode-pooled, which is the convention the eval harness uses and for
+    the same reason: episodes of one clip share a tile and a terrain and are not independent
+    draws, so pooling them overstates the sample. A clip that ran three episodes contributes
+    one number here, its own success fraction.
     """
     rows = json.loads(path.read_text())["rows"]
-    out: dict[int, dict] = {}
+    by: dict[int, list[float]] = {}
     for r in rows:
-        cid = int(r["clip_id"])
-        if cid in out:
-            raise SystemExit(
-                f"{path.name}: clip {cid} appears more than once. The arm re-ran a clip, so "
-                "it cannot be paired -- re-run with the retire-on-drained fix.")
-        out[cid] = r
-    return out
+        by.setdefault(int(r["clip_id"]), []).append(
+            1.0 if r["verdict"] == "success" else 0.0)
+    return {c: sum(v) / len(v) for c, v in by.items()}
 
 
-def mcnemar(base: dict[int, dict], arm: dict[int, dict], clips) -> dict:
-    """Paired survival difference over ``clips``, with the discordant-pair z."""
-    b = [base[c]["verdict"] == "success" for c in clips]
-    a = [arm[c]["verdict"] == "success" for c in clips]
-    win = sum(1 for x, y in zip(b, a) if not x and y)
-    lose = sum(1 for x, y in zip(b, a) if x and not y)
-    disc = win + lose
+def load_family(path: pathlib.Path) -> dict[int, int]:
+    """Family code per clip id."""
+    return {int(r["clip_id"]): int(r["family_code"])
+            for r in json.loads(path.read_text())["rows"]}
+
+
+def paired(base: dict[int, float], arm: dict[int, float], clips, n_boot: int = 4000,
+           seed: int = 0) -> dict:
+    """Clip-averaged paired difference, with a bootstrap CI over CLIPS.
+
+    Bootstrapping the clips rather than the episodes is what makes the interval honest here:
+    the two arms ran the same clips, so the pairing removes the (large) between-clip variance
+    that would otherwise swamp the effect.
+    """
+    b = np.array([base[c] for c in clips])
+    a = np.array([arm[c] for c in clips])
+    d = a - b
     n = len(clips)
-    return {"n": n, "base": sum(b) / n if n else float("nan"),
-            "arm": sum(a) / n if n else float("nan"),
-            "delta": (sum(a) - sum(b)) / n if n else float("nan"),
-            "win": win, "lose": lose,
-            "z": (win - lose) / math.sqrt(disc) if disc else 0.0}
+    if n == 0:
+        return {"n": 0, "base": float("nan"), "arm": float("nan"), "delta": float("nan"),
+                "lo": float("nan"), "hi": float("nan"), "moved": 0}
+    rng = np.random.default_rng(seed)
+    boot = d[rng.integers(0, n, size=(n_boot, n))].mean(axis=1)
+    return {"n": n, "base": float(b.mean()), "arm": float(a.mean()),
+            "delta": float(d.mean()),
+            "lo": float(np.percentile(boot, 2.5)), "hi": float(np.percentile(boot, 97.5)),
+            "moved": int((d != 0).sum())}
 
 
 def main() -> int:
@@ -74,6 +83,7 @@ def main() -> int:
     if not base_path.exists():
         raise SystemExit(f"no baseline at {base_path}")
     base = load(base_path)
+    fam_of = load_family(base_path)
     others = sorted(x for x in d.glob("select__*.json") if x.name != args.baseline)
     print(f"baseline: {args.baseline}  ({len(base)} clips)\n")
 
@@ -82,21 +92,21 @@ def main() -> int:
         shared = sorted(set(base) & set(arm))
         print(f"=== {path.name}  ({len(arm)} clips, {len(shared)} paired) ===")
         print(f"    {'family':<16} {'n':>4} {'base':>7} {'arm':>7} {'delta':>8} "
-              f"{'+/-':>9} {'z':>6}")
+              f"{'95% CI':>18} {'moved':>6}")
         by: dict[int, list[int]] = {}
         for c in shared:
-            by.setdefault(int(base[c]["family_code"]), []).append(c)
+            by.setdefault(fam_of[c], []).append(c)
         def _row(label: str, clips) -> None:
             """One line of the table."""
-            m = mcnemar(base, arm, clips)
-            disc = f"+{m['win']}/-{m['lose']}"
+            m = paired(base, arm, clips)
+            ci = f"[{m['lo']:+.3f}, {m['hi']:+.3f}]"
             print(f"    {label:<16} {m['n']:>4} {m['base']:>7.3f} {m['arm']:>7.3f} "
-                  f"{m['delta']:>+8.3f} {disc:>9} {m['z']:>+6.2f}")
+                  f"{m['delta']:>+8.3f} {ci:>18} {m['moved']:>6}")
 
         for code, clips in sorted(by.items()):
             _row(str(name_of.get(code, code)), clips)
         _row("ALL", shared)
-        noflat = [c for c in shared if name_of.get(int(base[c]["family_code"])) != "flat"]
+        noflat = [c for c in shared if name_of.get(fam_of[c]) != "flat"]
         if len(noflat) != len(shared):
             # Reported separately because you flagged the flat rollouts as mislabelled; the
             # metric here is termination-based rather than goal-based, so flat is less

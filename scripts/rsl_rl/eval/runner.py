@@ -42,6 +42,7 @@ import numpy as np
 
 import accumulate
 import dr_presets
+import fm_seed_noise
 import sampler
 import schema
 
@@ -692,6 +693,36 @@ def stage_cell(args) -> int:
             from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
             spec = goal_region.GoalRegionSpec.load(args.goal_regions)
             accum.attach_goal_region(spec)
+            if int(args.fm_seed) != fm_seed_noise.OFF:
+                _c = u.command_manager.get_term("traj_ref")
+                _c.set_noise_source(fm_seed_noise.FmSeedNoise(
+                    fm_seed=int(args.fm_seed), future_len=int(_c.ctx.F),
+                    state_dim=int(_c.ctx.D), device=u.device,
+                    replan_every=int(getattr(_c, "fm_update_every", 12)),
+                    episode_len_buf=lambda: u.episode_length_buf))
+                notes["fm_seed"] = int(args.fm_seed)
+                print(f"[cell] FM SEED {args.fm_seed}: the generator's noise is named and "
+                      "reproducible; DR, spawn and observation noise are unchanged.")
+            if float(args.steer_kp) != 0.0:
+                # On the COMMAND, so the generator's conditioning, the reward and the
+                # command_window observation move together; see set_yaw_rate_source.
+                _cmd = u.command_manager.get_term("traj_ref")
+
+                def _steer_source():
+                    """Yaw rate toward each env's goal, zero once inside the region."""
+                    down, lat, hz = goal_region.goal_frame_offsets(
+                        accum.rd.root_pos_w, accum._goal_pos_w, accum._goal_yaw)
+                    return goal_region.steer_yaw_rate(
+                        accum.rd.root_pos_w, accum.rd.root_quat_w, accum._goal_pos_w,
+                        goal_region.in_goal(down, lat, hz, accum._goal_tol),
+                        kp=float(args.steer_kp), wz_max=float(args.steer_wz_max))
+
+                _cmd.set_yaw_rate_source(_steer_source)
+                notes["steer_kp"] = float(args.steer_kp)
+                notes["steer_wz_max"] = float(args.steer_wz_max)
+                print(f"[cell] STEERING ON: kp={args.steer_kp} wz_max={args.steer_wz_max} -- "
+                      "OFF-DISTRIBUTION on the stair families. Recorded in the cell meta so a "
+                      "steered cell cannot be read as an unsteered one.")
             # The FIRST episode never passes through the reset hook -- the queue assigned its
             # clip in its constructor and the pin list carried it into the config -- so its
             # anchor has to be primed here or the whole first batch folds against a zero goal.
@@ -863,6 +894,11 @@ def stage_grid(args) -> int:
         if getattr(args, "goal_regions", ""):
             cmd += ["--goal_regions", args.goal_regions]
         cmd += ["--fall_min_height", str(args.fall_min_height)]
+        if int(args.fm_seed) != -1:
+            cmd += ["--fm_seed", str(args.fm_seed)]
+        if args.steer_kp:
+            cmd += ["--steer_kp", str(args.steer_kp),
+                    "--steer_wz_max", str(args.steer_wz_max)]
         if getattr(args, "terrain_ref", ""):
             cmd += ["--terrain_ref", args.terrain_ref]
         if getattr(args, "dump_flagged", 0):

@@ -370,6 +370,56 @@ def in_goal(
     return (downrange >= -margin) & (lateral.abs() <= width) & (height_err.abs() <= height)
 
 
+#: Default clip on the steering controller's yaw rate (rad/s).  0.68 is the largest ``|wz|``
+#: the training library ever commands -- on the box family; the two stair families are
+#: commanded exactly 0.0 over 3500 clips, so any non-zero rate there is extrapolation whatever
+#: the clip.  Matches ``transfer/sim/mjeval/runner.STEER_WZ_MAX`` so the two simulators steer
+#: identically.
+STEER_WZ_MAX: float = 0.68
+
+
+def steer_yaw_rate(root_pos_w, root_quat_w, goal_pos_w, in_goal_mask, kp: float,
+                   wz_max: float = STEER_WZ_MAX):
+    """Proportional yaw rate that points each robot at its goal.
+
+    Nothing in this stack steers: the command is a body-frame velocity and the generator plans
+    from depth, so a few degrees of accumulated heading error over several metres becomes a
+    lateral miss -- and on a thin flight of stairs a lateral miss is a fall.  This closes that
+    one loop so a course is scored on whether the robot could traverse it rather than on
+    whether it happened to hold the centreline.
+
+    **It is OFF-DISTRIBUTION on stairs, and that is not a detail.**  Measured over the training
+    library the two stair families carry ``|wz| max = 0.0000``; ``flat`` and ``box`` do turn.
+    A stair number measured with this on is a different measurement, not a cleaner one, which
+    is why every caller must opt in and say so.
+
+    The heading error is taken as the goal's BEARING IN THE BODY FRAME rather than by
+    extracting a world yaw and subtracting: ``atan2`` of a body-frame offset is already wrapped
+    to ``(-pi, pi]``, and it cannot be got wrong by a quaternion convention.
+
+    Args:
+        root_pos_w: ``[N, 3]`` base position, world.
+        root_quat_w: ``[N, 4]`` base orientation, world, as ``robot.data.root_quat_w``.
+        goal_pos_w: ``[N, 3]`` goal position, world.
+        in_goal_mask: ``[N]`` bool; the rate is 0 wherever it is set, so the controller stops
+            fighting for the centreline once the course is already cleared.
+        kp: Proportional gain (1/s).  ``0`` disables and returns zeros.
+        wz_max: Symmetric clip on the output (rad/s).
+
+    Returns:
+        ``[N]`` commanded yaw rate (rad/s).
+    """
+    import torch
+    from isaaclab.utils.math import subtract_frame_transforms
+
+    if kp == 0.0:
+        return torch.zeros(root_pos_w.shape[0], device=root_pos_w.device)
+    goal_b, _ = subtract_frame_transforms(root_pos_w, root_quat_w, goal_pos_w)
+    err = torch.atan2(goal_b[:, 1], goal_b[:, 0])
+    wz = torch.clamp(kp * err, -float(wz_max), float(wz_max))
+    return torch.where(in_goal_mask.reshape(-1), torch.zeros_like(wz), wz)
+
+
 def goal_distance_m(
     downrange: torch.Tensor, lateral: torch.Tensor, height_err: torch.Tensor, tol,
 ) -> torch.Tensor:

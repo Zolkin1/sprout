@@ -222,3 +222,67 @@ def test_goal_accounting_is_optional():
     out.note(_FakeEnv({"base_fallen": torch.tensor([True]),
                        "clip_end": torch.tensor([False])}))
     assert bool(out.fell[0]) and int(out.first_goal[0]) == -1
+
+
+# ------------------------------------------------------------------ the oracle's bookkeeping
+def test_k1_reference_is_slot_1_not_the_duplicate_slot_0():
+    """Slots 0 and 1 share candidate 0's draw, so slot 0 is a TWIN, not a candidate.
+
+    Using slot 0 as the K=1 baseline would make the headline pair differ by simulator noise
+    rather than by the chunk, which is the one thing this measurement must not do.
+    """
+    b = hs.BranchOnce(1, 4, __import__("numpy").random.default_rng(0))
+    b.ok[0] = [True, False, False, False]   # the twin succeeded, candidate 0 did not
+    r = b.result(0)
+    assert r["k1"] is False, "the baseline is slot 1"
+    assert r["twin_agrees"] is False, "and the disagreement is reported, not hidden"
+
+
+def test_best_of_k_excludes_the_twin():
+    """Counting the twin would make best-of-K a best-of-(K+1) over one repeated draw."""
+    b = hs.BranchOnce(1, 4, __import__("numpy").random.default_rng(0))
+    b.ok[0] = [True, False, False, False]
+    r = b.result(0)
+    assert r["best_of_k"] is False and r["n_cand"] == 3
+
+
+def test_best_of_k_is_any_candidate_succeeding():
+    b = hs.BranchOnce(1, 4, __import__("numpy").random.default_rng(0))
+    b.ok[0] = [False, False, True, False]
+    r = b.result(0)
+    assert r["best_of_k"] is True and r["k1"] is False and r["n_success"] == 1
+
+
+def test_best_of_k_can_never_be_worse_than_k1():
+    """An oracle is monotone in K by construction; if this can fail, the oracle is wrong."""
+    import itertools
+
+    import numpy as _np
+    for bits in itertools.product([False, True], repeat=4):
+        b = hs.BranchOnce(1, 4, _np.random.default_rng(0))
+        b.ok[0] = list(bits)
+        r = b.result(0)
+        assert r["best_of_k"] or not r["k1"], f"best_of_k < k1 for {bits}"
+
+
+def test_arming_an_episode_clears_the_previous_slate():
+    """A stale outcome row would carry one episode's success into the next."""
+    import numpy as _np
+    b = hs.BranchOnce(2, 3, _np.random.default_rng(0))
+    b.ok[1] = True
+    b.done[1] = True
+    b.branched[1] = True
+    b.arm_episode(1)
+    assert not b.ok[1].any() and not b.done[1].any() and not b.branched[1]
+    assert 1 <= b.branch_at[1] <= 8
+
+
+def test_branch_cycle_varies_across_episodes():
+    """A fixed branch point would measure headroom at one privileged phase of the episode."""
+    import numpy as _np
+    b = hs.BranchOnce(1, 3, _np.random.default_rng(0))
+    seen = set()
+    for _ in range(40):
+        b.arm_episode(0)
+        seen.add(int(b.branch_at[0]))
+    assert len(seen) > 1

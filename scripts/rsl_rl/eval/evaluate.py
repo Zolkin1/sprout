@@ -181,6 +181,22 @@ def build_parser() -> argparse.ArgumentParser:
                         "given fall back to the built-in defaults")
 
     g = p.add_argument_group("env")
+    g.add_argument("--fm_seed", type=int, default=-1,
+                   help="Name the generator's initial-noise draw, so it can be varied while "
+                        "EVERYTHING else is held fixed. -1 = off (global RNG). --seed also "
+                        "moves DR, spawn and observation noise, so it cannot isolate the "
+                        "generator; this can. Keyed by (fm_seed, within-episode re-plan "
+                        "index) and NOT by env, so several robots on one clip share a noise "
+                        "sequence and their spread is the simulator floor.")
+    g.add_argument("--steer_kp", type=float, default=0.0,
+                   help="P gain (1/s) on heading error toward the goal, overriding the clip's "
+                        "commanded wz. 0 = off (the deployed behaviour). NON-ZERO IS "
+                        "OFF-DISTRIBUTION ON STAIRS -- the training library commands |wz| = "
+                        "0.0 on both stair families -- so a steered stair number is a "
+                        "different measurement, not a cleaner one. Same law and default clip "
+                        "as mjeval.runner.steer_yaw_rate and headroom.py --steer_kp.")
+    g.add_argument("--steer_wz_max", type=float, default=0.68,
+                   help="Clip on the steering yaw rate (rad/s).")
     g.add_argument("--goal_regions", default="",
                    help="goal_regions.json from build_goal_regions.py. Turns on the SPATIAL "
                         "success columns (reached_goal / min_dist_to_goal_m / the three "

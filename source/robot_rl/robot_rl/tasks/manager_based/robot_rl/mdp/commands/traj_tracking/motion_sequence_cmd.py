@@ -812,6 +812,54 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         """True if the clip library carries a per-step commanded velocity (``target_vel``)."""
         return self.manager.has_target_vel()
 
+    #: Optional per-env commanded-yaw-rate override; see :meth:`set_yaw_rate_source`.
+    _yaw_rate_source = None
+
+    def set_yaw_rate_source(self, source) -> None:
+        """Take the commanded ``wz`` from ``source`` instead of the clip library.
+
+        Off by default and with no config field, for the same reason
+        :meth:`~.fm_tracking_cmd.FmTrackingCommand.set_noise_source` has none: training and
+        every ordinary rollout want the command the clip was generated with. This exists so an
+        EVAL can close a steering loop the deployed stack does not have -- see
+        ``mdp.goal_region.steer_yaw_rate`` for the law and for why it is off-distribution on
+        stairs.
+
+        **It is installed here, on the base command, so that every consumer moves together.**
+        Three accessors read the command -- the reward's, the generator's conditioning horizon
+        and the ``command_window`` observation -- and overriding a subset would condition the
+        generator on a turn while the observation still said straight. That disagreement is
+        invisible in every shape.
+
+        Args:
+            source: Callable of no arguments returning an ``[N]`` yaw rate on the command's
+                device, or ``None`` to fall through to the library for this call. ``None``
+                uninstalls.
+        """
+        self._yaw_rate_source = source
+
+    def _steer(self, vel: torch.Tensor) -> torch.Tensor:
+        """Replace the ``wz`` channel of a command tensor, when an override is installed.
+
+        Accepts ``[N, 3]`` and ``[N, K, 3]``: the rate is held CONSTANT across a look-ahead
+        horizon, which is what a joystick held at one deflection would produce and the only
+        honest choice given the future poses are unknown.
+
+        Args:
+            vel: ``[..., 3]`` commanded ``(vx, vy, wz)``.
+
+        Returns:
+            ``vel`` unchanged when no source is installed, else a copy with ``wz`` replaced.
+        """
+        if self._yaw_rate_source is None:
+            return vel
+        wz = self._yaw_rate_source()
+        if wz is None:
+            return vel
+        out = vel.clone()
+        out[..., 2] = wz.reshape(-1, *([1] * (vel.dim() - 2)))
+        return out
+
     def get_command_velocity(self) -> torch.Tensor:
         """Per-env commanded base velocity ``[N, 3]`` = (vx, vy, wz) at the current step.
 
@@ -824,7 +872,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             raise RuntimeError(
                 "Clip library has no target_vel; regenerate clips with a generator that writes it."
             )
-        return self.manager.gather_target_vel(self.clip_id, self._step)
+        return self._steer(self.manager.gather_target_vel(self.clip_id, self._step))
 
     def get_command_velocity_horizon(self, num_future: int) -> torch.Tensor:
         """Commanded velocity over the next ``num_future`` steps, ``[N, num_future, 3]``.
@@ -841,7 +889,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         offs = torch.arange(num_future, device=self.device)
         steps = (self._step[:, None] + 1 + offs[None, :]).clamp(max=T - 1)  # [N, num_future]
         cid = self.clip_id[:, None].expand_as(steps)
-        return self.manager.gather(self.manager.lib.target_vel, cid, steps)
+        return self._steer(self.manager.gather(self.manager.lib.target_vel, cid, steps))
 
     # ------------------------------------------------------------------
     # Future window (look-ahead into the clip for the teacher policy)
@@ -881,7 +929,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
                 "Clip library has no target_vel; regenerate clips with a generator that writes it."
             )
         cid, steps = self._future_step_indices(offsets)
-        return self.manager.gather(self.manager.lib.target_vel, cid, steps)
+        return self._steer(self.manager.gather(self.manager.lib.target_vel, cid, steps))
 
     def get_future_world_base(
         self, offsets: torch.Tensor

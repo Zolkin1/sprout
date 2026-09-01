@@ -77,6 +77,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "the restore cost cancels.")
     g.add_argument("--window_chunks", type=int, default=headroom_runner.DEFAULT_WINDOW_CHUNKS,
                    help="Scoring window in re-plan chunks (5 x 12 steps x 0.02 s = 1.20 s).")
+    g.add_argument("--steer_kp", type=float, default=0.0,
+                   help="P gain (1/s) on the heading error toward the goal, overriding the "
+                        "clip's commanded wz. 0 = off, which is the deployed behaviour. "
+                        "NON-ZERO IS OFF-DISTRIBUTION ON STAIRS: the two stair families are "
+                        "commanded |wz| = 0.0 across the whole training library, so a steered "
+                        "stair number is a different measurement, not a cleaner one.")
+    g.add_argument("--steer_wz_max", type=float, default=0.68,
+                   help="Clip on the steering yaw rate (rad/s); 0.68 is the largest the "
+                        "training library commands anywhere.")
     g.add_argument("--goal_regions", default="",
                    help="goal_regions.json from build_goal_regions.py. REQUIRED for "
                         "--stage select: without it the only outcome available is a clip "
@@ -87,6 +96,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="A fit_value.py V_*.pt. Required for --scorer v.")
     g.add_argument("--scan_sensor", default="height_scanner",
                    help="Privileged scan sensor, for a priv critic.")
+    g.add_argument("--branch_once", action="store_true",
+                   help="ORACLE/HEADROOM mode: branch ONCE per episode and roll every "
+                        "candidate to termination under a shared continuation draw, so each "
+                        "candidate's outcome is what its chunk led to rather than an "
+                        "estimate. Bounds any critic: no ranking can beat picking the "
+                        "candidate that actually worked.")
     g.add_argument("--no_restore", action="store_true",
                    help="Write nothing to the simulator. At k=0 this is a pure no-op, so any "
                         "change it makes is the restore's own cost.")

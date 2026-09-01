@@ -813,6 +813,37 @@ Tracker `2026-08-20_09-04-12_mode11_decor_v1`, generator
   placement), and displaced poses were achieved to 0.35 mm / 0.24 deg median. The alarming
   `frac_gt_1mm = 0.515` is the depth DR being re-drawn.
 
+
+## Measuring what SAMPLING is worth: the estimator traps (`eval/seed_headroom.py`)
+
+`evaluate.py --fm_seed K` names the generator's initial-noise draw so it can be varied with
+everything else pinned -- `--seed` cannot, because it also moves the DR draws, the spawn jitter
+and the observation noise. The draw is keyed `(fm_seed, within-episode re-plan index)` and
+**deliberately not by env**: several robots on one clip under one seed must be served the
+IDENTICAL noise, because their spread is the simulator floor, and keying by env puts the effect
+being measured inside its own control. `docs/seed_headroom_report.md` is the write-up.
+
+**`max over seeds` is biased upward, and the obvious fix is biased DOWNWARD -- by more.** A
+maximum over K noisy per-seed rates finds a high one whether or not the seed matters, so the raw
+gain overstates. The natural correction is a permutation control (repartition a clip's episodes
+into pseudo-seeds), and it is a valid TEST -- it returns zero on a synthetic null. It is not a
+valid ESTIMATOR: it measures the inflation under the null of NO effect, and where an effect is
+real the max is partly driven by genuinely better seeds and is less noise-inflated than the null
+predicts, so subtracting the full null bias over-corrects. Measured against synthetic ground
+truth it recovered 31%. What works is HELD-OUT selection -- pick the best seed on some robots,
+score it on the rest -- plus a sweep of the selection sample: still climbing means the ceiling is
+above the estimate. **Validate any estimator here against synthetic data with a known answer
+before quoting it**; all three were, and two of the three failed.
+
+Also measured while building it, and each cost a run:
+- **Isaac is NOT reproducible run-to-run here.** The same `fm_seed` in two processes reproduced
+  per-clip rates exactly in 58% of clips. The docs' determinism claim covers re-running a
+  simulation; it did not hold. So a same-seed repeat is a REQUIRED arm, not a nicety.
+- **Do not use `p(1-p)/R` as the within-clip floor.** Robots sharing a draw are strongly
+  correlated -- measured same-seed variance ~8x smaller than independence predicts.
+- `--num_envs` above what a plan can populate is refused with `pinned to clip -1`, not run;
+  1000 envs OOMs a 12 GB card where 750 does not.
+
 ## Terrain misidentification: real, and CLOSED-LOOP ONLY (`terrain_class.py`)
 
 Field observation: the robot sometimes reads a staircase as a box and plans to jump onto it.
