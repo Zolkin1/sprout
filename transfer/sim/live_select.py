@@ -130,6 +130,100 @@ class Snapshot:
             fm_lag._buf = copy.deepcopy(self.lag)
 
 
+class SelectedChunkWriter:
+    """Record the chunk the critic CHOSE at each re-plan, in the fine-tune's own input format.
+
+    This is the filtered-BC dataset: one row per re-plan, holding the conditioning the
+    generator saw and, as ``fm_plan``, the candidate the selector committed -- so training on
+    it is "reproduce the chunk that was picked".  ``finetune_advantage.py`` with no
+    ``--labels`` consumes exactly this and calls it unconditioned self-distillation.
+
+    **Only the five columns the trainer reads are written** (``fm_plan``, ``history``,
+    ``extero``, ``cmd_future``, ``history_null``) plus the join keys, rather than the full
+    ``rollout_outcomes`` schema.  Writing the rest as zeros would produce a file that looks
+    like a rollout recording and silently answers wrong for proprio, the scan and the goal
+    offsets; ``is_selected_chunk_recording`` marks it so nothing mistakes it for one.
+
+    Args:
+        path: Output ``.h5``.
+        meta: Provenance stamped into the file's attrs.
+    """
+
+    def __init__(self, path: str, meta: dict) -> None:
+        self.path = str(path)
+        self.meta = dict(meta)
+        self.rows: list[dict] = []
+
+    def add(self, *, episode_uid: int, replan_index: int, family_code: int,
+            history: np.ndarray, history_null: bool, extero: np.ndarray,
+            cmd_future: np.ndarray, fm_plan: np.ndarray) -> None:
+        """Append one selected chunk with the conditioning it was drawn from."""
+        self.rows.append({
+            "episode_uid": np.int64(episode_uid), "replan_index": np.int32(replan_index),
+            "family_code": np.uint8(family_code),
+            "history": np.asarray(history, dtype=np.float32),
+            "history_null": np.uint8(bool(history_null)),
+            "extero": np.asarray(extero, dtype=np.float16),
+            "cmd_future": np.asarray(cmd_future, dtype=np.float32),
+            "fm_plan": np.asarray(fm_plan, dtype=np.float32),
+        })
+
+    def close(self) -> int:
+        """Write the file. Returns the row count."""
+        import h5py  # noqa: PLC0415
+
+        n = len(self.rows)
+        if not n:
+            return 0
+        os.makedirs(os.path.dirname(os.path.abspath(self.path)) or ".", exist_ok=True)
+        with h5py.File(self.path, "w") as f:
+            for key in ("episode_uid", "replan_index", "family_code", "history",
+                        "history_null", "extero", "cmd_future", "fm_plan"):
+                f.create_dataset(key, data=np.stack([r[key] for r in self.rows]))
+            f.attrs["num_windows_written"] = n
+            f.attrs["is_selected_chunk_recording"] = 1
+            f.attrs["columns_written"] = json.dumps(
+                ["episode_uid", "replan_index", "family_code", "history", "history_null",
+                 "extero", "cmd_future", "fm_plan"])
+            for k, v in self.meta.items():
+                f.attrs[k] = v
+        return n
+
+
+def capture_conditioning(policy, state) -> dict | None:
+    """The generator's conditioning and its emitted chunk, at the instant of a re-plan.
+
+    Every accessor here is the one ``mjeval.critic.CriticInputs.from_runtime`` uses, for the
+    reason its docstring gives: each of these has a shape-identical wrong source sitting
+    beside it.  In particular ``policy._fm_extero_row(state)`` is the RAW fused row, while
+    ``last_plan()["extero_tokens"]`` is the same shape already through the normalizer -- and
+    the fine-tune dataset normalizes what it reads, so recording the latter would normalize
+    twice with nothing downstream able to detect it.
+
+    Args:
+        policy: The ``GenTrackerPolicy``.
+        state: The dict ``build_state`` produced for this control step.
+
+    Returns:
+        ``{history, history_null, extero, cmd_future, fm_plan, plan_id}``, or ``None`` when no
+        plan is live yet.
+    """
+    plan = policy.last_plan()
+    pred = policy.predicted_window()
+    if plan is None or pred is None:
+        return None
+    hist = np.asarray(plan["history_nodes"], dtype=np.float32)
+    cmd = np.asarray(plan["future_cmd"], dtype=np.float32)
+    return {
+        "history": hist.reshape(-1, hist.shape[-1]),
+        "history_null": bool(plan["history_null"]),
+        "extero": np.asarray(policy._fm_extero_row(state), dtype=np.float32),
+        "cmd_future": cmd.reshape(-1, cmd.shape[-1]),
+        "fm_plan": np.asarray(pred, dtype=np.float32),
+        "plan_id": int(plan["plan_id"]),
+    }
+
+
 def arrived(course, robot, zex) -> bool:
     """Did the robot arrive, under whichever rule this course carries?
 
@@ -161,7 +255,7 @@ def arrived(course, robot, zex) -> bool:
 
 
 def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None,
-          steer_kp: float = 0.0, steer_wz_max: float = 0.68):
+          steer_kp: float = 0.0, steer_wz_max: float = 0.68, capture: dict | None = None):
     """Advance ``n_steps`` control steps, returning early on a terminal condition.
 
     Mirrors ``runner.run_episode``'s inner loop and its ORDERING, which is load-bearing there
@@ -215,6 +309,13 @@ def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None,
                             fm_depth_cams=rig.fm_depth_cams, fm_lag=fm_lag)
         last = state
         obs = policy.create_obs(state)
+        # Step 0 of a chunk IS the re-plan (the caller runs exactly `fm_update_every` steps
+        # from a boundary), so this is the one instant the conditioning and the fresh chunk
+        # are both live -- the same edge `record_rollouts._emit` reads.
+        if capture is not None and not capture:
+            got = capture_conditioning(policy, state)
+            if got is not None:
+                capture.update(got)
         robot.apply_action(policy.get_action(obs, robot.joint_names))
         if robot.failed():
             return "fall", robot.failure_reason(), last
@@ -231,7 +332,8 @@ def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None,
 
 def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                          k: int, seed: int, mjrunner, steer_kp: float = 0.0,
-                         steer_wz_max: float = 0.68):
+                         steer_wz_max: float = 0.68, same_noise: bool = False,
+                         recorder=None, episode_uid: int = -1, family_code: int = 0):
     """One episode driven by a live 1-step-lookahead selector over ``k`` candidate chunks.
 
     Args:
@@ -303,12 +405,25 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             # the episode seed naturally), which is exactly what made the two arms look so far
             # apart. Seeded as a SEQUENCE rather than an arithmetic combination so no
             # (seed, replan, cand) triple can alias another.
-            policy._rng = np.random.default_rng([seed, n_replans, cand])
+            # SAME-NOISE CONTROL: drop `cand` from the key so every candidate is handed ONE
+            # draw. The selector then chooses among K IDENTICAL chunks, so it has zero signal
+            # by construction and this arm must reproduce K=1 EXACTLY -- not approximately.
+            #
+            # In Isaac this same control is what retired the per-state best-of-K harness: with
+            # an imperfect state restore and a non-reproducible sim it still showed a
+            # best-of-K rise (+0.005..+0.031, matching the real arm), because independent
+            # per-candidate noise manufactures a rise of about its own flip probability. Here
+            # the sim is deterministic and the snapshot restores qpos/qvel at 0.000e+00, so
+            # any deviation from K=1 is a BUG in the branch machinery rather than a bias to
+            # subtract -- which is what makes it a blocking check instead of a correction.
+            policy._rng = np.random.default_rng([seed, n_replans] if same_noise
+                                                else [seed, n_replans, cand])
             # Each candidate gets its OWN copy of the episode's z extremes: a branch that
             # climbs must not hand its traversal credit to a sibling that did not.
             cz = list(zex)
+            cap: dict = {} if recorder is not None else None
             v, f, st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, cz, scorer=_ring,
-                             steer_kp=steer_kp, steer_wz_max=steer_wz_max)
+                             steer_kp=steer_kp, steer_wz_max=steer_wz_max, capture=cap)
             if v == "fall":
                 # A candidate that already fell is worse than any survivor. Scored 1.0 rather
                 # than skipped, so a re-plan where EVERY candidate falls still has an argmin
@@ -326,13 +441,20 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                 score = crit.p_fail(x)
             post = Snapshot(robot, policy, fm_lag)
             if best is None or score < best[0]:
-                best = (score, post, v, f, cz)
+                best = (score, post, v, f, cz, cap)
         scored.append(k)
         # Commit the winner by RESTORING ITS POST-CHUNK STATE -- the branch length is the
         # cadence, so that state is exactly where the episode continues from. Re-executing the
         # winning draw instead would cost a (K+1)th chunk and would diverge silently if the
         # restore were imperfect.
         best[1].restore(robot, policy, fm_lag)
+        # The CHOSEN chunk, with the conditioning every candidate shared. Written on commit
+        # rather than per candidate: the rejected ones are exactly what filtering removes.
+        if recorder is not None and best[5]:
+            recorder.add(episode_uid=episode_uid, replan_index=n_replans,
+                         family_code=family_code, history=best[5]["history"],
+                         history_null=best[5]["history_null"], extero=best[5]["extero"],
+                         cmd_future=best[5]["cmd_future"], fm_plan=best[5]["fm_plan"])
         zex = list(best[4])
         n_replans += 1
         if best[2]:
@@ -374,9 +496,29 @@ def run(args) -> int:
     elif ks != [1]:
         if not args.critic_ckpt:
             raise SystemExit("need --critic_ckpt (V selector) or --q_ckpt (Q selector)")
-        scorer = C.FailureCritic(args.critic_ckpt, device=args.device)
+        # `--fm_pt` applies here too, not just to the Q arms: a V_priv checkpoint names the
+        # generator it was fitted against by ABSOLUTE path, so a critic trained on one machine
+        # cannot be read on another without it.
+        scorer = C.FailureCritic(args.critic_ckpt, fm_pt=(args.fm_pt or None),
+                                 device=args.device)
     crit = scorer
     os.makedirs(args.out, exist_ok=True)
+    recorder = None
+    if args.record_selected:
+        if ks == [1]:
+            raise SystemExit(
+                "--record_selected needs a K>1 arm: at K=1 the selector makes no choice, so "
+                "the 'selected' chunk is just the generator's own sample and fine-tuning on "
+                "it would be a no-op self-distillation.")
+        recorder = SelectedChunkWriter(args.record_selected, {
+            "tracker_onnx": os.path.abspath(args.tracker_onnx),
+            "fm_onnx": os.path.abspath(args.fm_onnx),
+            "critic": os.path.abspath(args.critic_ckpt or args.state_critic_ckpt),
+            "clip_lib": os.path.abspath(args.clip_lib),
+            "k": args.k, "episodes": int(args.episodes), "speed": float(args.speed),
+            "approach": float(args.approach), "steer_kp": float(args.steer_kp),
+            "tiles": args.tiles, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        })
     rows, t0 = [], time.time()
 
     if args.catalogue:
@@ -419,7 +561,8 @@ def run(args) -> int:
             # constant --speed.
             course = terrains.isaac_tile_course(args.clip_lib, uid, speeds=(args.speed,),
                                                 approach=args.approach,
-                                                goal_anchor_max_offset=args.max_offset)
+                                                goal_anchor_max_offset=args.max_offset,
+                                                klass=(args.klass or None))
             course = dataclasses.replace(course, name=f"tile{uid}{args.scene_tag}")
         cfg, policy, fm_lag, spawn, rig = build_arm(
             type("A", (), dict(tracker_onnx=args.tracker_onnx, fm_onnx=args.fm_onnx,
@@ -445,7 +588,13 @@ def run(args) -> int:
             for ep in range(args.seed_offset, args.seed_offset + args.episodes):
                 fn = run_episode_q_selected if use_q else run_episode_selected
                 extra = ({} if use_q else
-                        {"steer_kp": args.steer_kp, "steer_wz_max": args.steer_wz_max})
+                        {"steer_kp": args.steer_kp, "steer_wz_max": args.steer_wz_max,
+                         "same_noise": args.same_noise,
+                         # Only K>1 selects; a K=1 arm in the same invocation must not write.
+                         "recorder": (recorder if k > 1 else None),
+                         "episode_uid": (int(tile) * 1000000 + int(k) * 100000
+                                         + int(round(args.speed * 10)) * 1000 + int(ep)),
+                         "family_code": int(uid) // 20})
                 v, f, nr, sc = fn(
                     rig, policy, fm_lag, spawn, cmd, cfg, crit, course.goal_anchor_xyz,
                     k=k, seed=ep, mjrunner=mjrunner, **extra)
@@ -476,6 +625,9 @@ def run(args) -> int:
           "benchmark's\nbaseline -- NOT fm_variance_probe's 0.798/0.816, which were measured "
           "with a different\ngenerator (lag48_aug, not the nojumpoff one the critic was "
           "fitted over).")
+    if recorder is not None:
+        n = recorder.close()
+        print(f"[live] recorded {n:,} SELECTED chunks -> {args.record_selected}")
     print(f"\n[live] {len(rows)} episodes -> {args.out}/live_select.json")
     return 0
 
@@ -536,6 +688,28 @@ def main() -> int:
     p.add_argument("--steer_wz_max", type=float, default=0.68,
                    help="Symmetric clip on the steering yaw rate, rad/s. Matches "
                         "runner.STEER_WZ_MAX. Only used with --steer_kp.")
+    p.add_argument("--record_selected", default="",
+                   help="Write the CHOSEN chunk at every re-plan to this .h5, with the "
+                        "conditioning it was drawn from -- the filtered-BC dataset, consumed "
+                        "by finetune_advantage.py with no --labels. K>1 arms only: at K=1 "
+                        "there is no selection, so a recording would just be the generator's "
+                        "own output and training on it is a no-op.")
+    p.add_argument("--same_noise", action="store_true",
+                   help="CONTROL: hand every candidate the SAME draw, so the selector has "
+                        "zero signal by construction. In this deterministic sim it must "
+                        "reproduce K=1 EXACTLY; a deviation is a bug in the snapshot/restore, "
+                        "not a bias to subtract. This is the check the Isaac per-state "
+                        "best-of-K harness failed (its control matched the real arm).")
+    p.add_argument("--klass", default="",
+                   help="Force the course class (a terrains.CLASS_CODES key) instead of "
+                        "inferring it from the tile's manifest family. TILE courses only. "
+                        "Needed for families absent from terrains.FAMILY_KLASS -- notably "
+                        "jump_off_front, which builds fine with klass=box and recovers a real "
+                        "clip anchor on 8 of its 15 tiles (75,76,77,81,82,83,86,87); the "
+                        "other 7 fail earlier, on a spawn that lands outside the tile "
+                        "footprint. Note the traversal gate and fall datum then read under "
+                        "box semantics, which is what makes this explicit rather than "
+                        "inferred.")
     p.add_argument("--cmd_hold_s", type=float, default=0.0,
                    help="seconds of zero command before stepping to --speed, on TILE courses. "
                         "Measured worth -0.26 on stairs_up and +0.10 on stairs_down, so it is "

@@ -569,6 +569,40 @@ def _add_arrow(scn, base: np.ndarray, vec: np.ndarray, rgba: tuple, width: float
     scn.ngeom += 1
 
 
+#: mjeval's own goal-marker colour (``view_cell.TARGET_RGBA``), matched here so a course
+#: watched through this runner and through the standard eval viewer read as the same thing.
+GOAL_RGBA = (0.06, 0.48, 0.38, 0.55)
+
+
+def _add_goal_rect(scn, xy: tuple[float, float], half_width: float, depth: float, z: float,
+                   rgba: tuple = GOAL_RGBA) -> None:
+    """Outline a goal rectangle on the ground as a ring of small spheres.
+
+    Dotted rather than a filled slab for the same reason ``mjeval.view_cell``'s does it this
+    way: a filled slab z-fights with the platform it sits on, and the band's EDGE is what a
+    run is judged against.
+
+    Args:
+        scn: The viewer's ``user_scn``.
+        xy: Rectangle centre, world ``(x, y)``.
+        half_width: Half the lateral extent, m.
+        depth: Extent along travel, m.
+        z: World height to draw at, m.
+        rgba: Marker colour.
+    """
+    gx, gy = xy
+    hw, hd = float(half_width), float(depth) / 2.0
+    corners = [(gx - hd, gy - hw), (gx + hd, gy - hw), (gx + hd, gy + hw), (gx - hd, gy + hw)]
+    for i in range(4):
+        x0, y0 = corners[i]
+        x1, y1 = corners[(i + 1) % 4]
+        n = max(2, int(math.hypot(x1 - x0, y1 - y0) / 0.12))
+        for k in range(n):
+            f = k / n
+            pos = np.array([x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, z])
+            _add_sphere(scn, pos, rgba, 0.028)
+
+
 class InterruptFlag:
     """Make Ctrl-C end the run at the next control step instead of unwinding through it.
 
@@ -652,7 +686,9 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
         viz_geomgroup: list[int] | None = None, viz_contacts: bool = False,
         fm_depth_cams: MujocoDepthCameras | None = None,
-        replay=None, fm_lag: FmDepthLag | None = None) -> bool | None:
+        replay=None, fm_lag: FmDepthLag | None = None,
+        goal_xy: tuple[float, float] | None = None, goal_half_width: float = 2.5,
+        goal_depth: float = 2.0, goal_z: float = 0.0) -> bool | None:
     """Run the control loop; return True if the robot did not fall.
 
     Returns ``None`` when the user interrupts with Ctrl-C, which is neither survival nor a
@@ -710,6 +746,12 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         depth_viz_stride: Draw every Nth depth pixel's hit point in the viewer. The two
             cameras produce 1560 hits per step, well past ``user_scn.maxgeom``, so the
             cloud is subsampled.
+        goal_xy: Centre of a goal-rectangle marker to draw (viewer mode only), or ``None``
+            for no marker. This function has no course/terrain knowledge -- the caller
+            supplies the raw numbers.
+        goal_half_width: Half the goal band's lateral extent, m. Only used with ``goal_xy``.
+        goal_depth: Goal band depth along travel, m. Only used with ``goal_xy``.
+        goal_z: Height to draw the goal marker at, m. Only used with ``goal_xy``.
     """
     dt = policy.get_dt()
     # Checked at every control-step boundary by all three loops (see InterruptFlag).
@@ -1076,6 +1118,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         act_w = np.asarray(state["root_lin_vel_w"], dtype=np.float64) * np.array([1.0, 1.0, 0.0])
         _add_arrow(scn, head, cmd_w * vel_arrow_scale, (0.0, 1.0, 0.0, 1.0))   # desired
         _add_arrow(scn, head, act_w * vel_arrow_scale, (0.0, 0.0, 1.0, 1.0))   # actual
+        if goal_xy is not None:
+            _add_goal_rect(scn, goal_xy, goal_half_width, goal_depth, goal_z)
 
     def advance_physics(state: dict, viewer, ref: dict | None = None) -> None:
         """Step ``decim`` physics sub-steps (logging + viewer sync), then pace to real time."""
@@ -1475,6 +1519,30 @@ def main() -> None:
                              "fail a robot that merely turned around. This is what catches a "
                              "collapse on an UPPER terrain level, which stays far above the "
                              "scene-minimum height bound.")
+    parser.add_argument("--goal_xy", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                        help="Draw a dotted goal-rectangle outline (mjeval's own marker style) "
+                             "centred here. No course/terrain knowledge here -- the caller "
+                             "(e.g. a course-aware script) supplies the raw numbers; omit for "
+                             "no marker, which is the default everywhere this flag is not set.")
+    parser.add_argument("--goal_half_width", type=float, default=2.5,
+                        help="Half the goal band's lateral extent, m. Only used with --goal_xy.")
+    parser.add_argument("--goal_depth", type=float, default=2.0,
+                        help="Goal band depth along travel, m. Only used with --goal_xy.")
+    parser.add_argument("--goal_z", type=float, default=0.0,
+                        help="Height to draw the goal marker at, m. Only used with --goal_xy.")
+    parser.add_argument("--steer_kp", type=float, default=0.0,
+                        help="P gain (1/s) on heading error toward --goal_xy, added to the "
+                             "wz channel of --const_cmd; 0 (default) disables it and holds "
+                             "the flat constant command. Needs --goal_xy. Ported from "
+                             "mjeval.runner.steer_yaw_rate -- same law, same default clip. "
+                             "OFF-DISTRIBUTION ON STAIRS: the two stair families carry "
+                             "|wz| max = 0.0000 over the whole training library (3500 "
+                             "clips) -- the generator has never once been commanded a turn "
+                             "on a staircase. A stairs run with this on is a DIFFERENT "
+                             "measurement, not a cleaner one.")
+    parser.add_argument("--steer_wz_max", type=float, default=0.68,
+                        help="Symmetric clip on the steering yaw rate, rad/s. Matches "
+                             "mjeval.runner.STEER_WZ_MAX. Only used with --steer_kp.")
     parser.add_argument("--dump_replay", type=str, default=None, metavar="DIR",
                         help="Record every tick's INPUTS and this runtime's answers to DIR, as "
                              "the manifest+blob fixture format the C++ side already reads "
@@ -1638,8 +1706,37 @@ def main() -> None:
         # never inherits the "[WARN] no joystick -> [0.5, 0, 0]" fallback, which is a silent
         # way to run a sweep at a speed nobody chose.
         const = np.asarray(args.const_cmd, dtype=np.float64)
-        print(f"[INFO] constant command ({const[0]:+.3f}, {const[1]:+.3f}, {const[2]:+.3f})")
-        command_fn = lambda _t, _c=const: _c
+        if args.steer_kp > 0.0:
+            if args.goal_xy is None:
+                sys.exit("[ERROR] --steer_kp needs --goal_xy to steer toward.")
+            gx, gy = args.goal_xy
+            hw, hd = args.goal_half_width, args.goal_depth / 2.0
+            vxy = const[:2].copy()
+            print(f"[INFO] steering ON: P={args.steer_kp:.3f} toward ({gx:.3f}, {gy:.3f}), "
+                  f"wz clipped to +-{args.steer_wz_max:.3f} rad/s. OFF-DISTRIBUTION ON "
+                  "STAIRS -- the training library commands zero turn rate on every stair "
+                  "clip (see --steer_kp's help); this measures a DIFFERENT thing, not a "
+                  "cleaner one.")
+
+            def command_fn(_t, _vxy=vxy, _gx=gx, _gy=gy, _hw=hw, _hd=hd,       # noqa: E731
+                           _kp=args.steer_kp, _wz_max=args.steer_wz_max):
+                # Reads robot state directly rather than through the command_fn(t) interface,
+                # which is a pure function of time everywhere else -- steering is the one
+                # command source that has to be closed-loop on where the robot actually is.
+                qpos = robot.mj_data.qpos
+                x, y = float(qpos[0]), float(qpos[1])
+                if abs(x - _gx) <= _hd and abs(y - _gy) <= _hw:
+                    wz = 0.0        # inside the goal band: stop fighting for the centreline
+                else:
+                    qw, qx, qy, qz = (float(v) for v in qpos[3:7])   # MuJoCo's own wxyz
+                    yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+                    bearing = math.atan2(_gy - y, _gx - x)
+                    err = math.atan2(math.sin(bearing - yaw), math.cos(bearing - yaw))
+                    wz = float(np.clip(_kp * err, -_wz_max, _wz_max))
+                return np.array([_vxy[0], _vxy[1], wz])
+        else:
+            print(f"[INFO] constant command ({const[0]:+.3f}, {const[1]:+.3f}, {const[2]:+.3f})")
+            command_fn = lambda _t, _c=const: _c
     elif args.mode == "joystick":
         command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz)
     else:
@@ -1799,7 +1896,10 @@ def main() -> None:
                   spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride,
-                  fm_depth_cams=fm_depth_cams, replay=replay, fm_lag=fm_lag)
+                  fm_depth_cams=fm_depth_cams, replay=replay, fm_lag=fm_lag,
+                  goal_xy=(tuple(args.goal_xy) if args.goal_xy is not None else None),
+                  goal_half_width=args.goal_half_width, goal_depth=args.goal_depth,
+                  goal_z=args.goal_z)
     # None = interrupted, which is neither survival nor a fall; saying "Survived: None"
     # would put a non-result into the same line every sweep greps for.
     if success is None:
