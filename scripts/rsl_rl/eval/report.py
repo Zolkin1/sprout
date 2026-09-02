@@ -285,12 +285,21 @@ def derived_columns(cell: dict, plan: dict,
         has_strict = False
 
     out = {
-        # Reported side by side, never folded together: `success` is the headline and the
-        # strict/loose pair is what says how much of it the tracking checks cost. When the
-        # cell carries no tracking columns the two are identical BY CONSTRUCTION, which is
-        # why `strict_checks_active` travels with them.
-        "success": (loose_ok & ~censored).astype(float),
+        # THE HEADLINE IS STRICT WHENEVER THE STRICT DATA EXISTS. It used to be `loose_ok`
+        # unconditionally, so a run that collected the tracking checks reported the fall-only
+        # rate under the name "success" and buried the strict one in the reduced table -- the
+        # tables carried the answer and the printed report did not. Measured on `strict_v1`:
+        # the loose headline read clip 0.9188 / fm 0.6406 while the strict rule those cells
+        # actually ran under is clip 0.9089 / fm 0.6061, and the arms are NOT equally
+        # affected (the checks cost the generator 3.5x what they cost the clip), so the
+        # substitution changes a contrast and not just a level.
+        #
+        # `success_loose` is kept beside it, never folded in: the pair is what says how much
+        # the checks cost. With no tracking columns the two are identical BY CONSTRUCTION,
+        # which is why `strict_checks_active` travels with them.
+        "success": ((strict_ok if has_strict else loose_ok) & ~censored).astype(float),
         "success_strict": (strict_ok & ~censored).astype(float),
+        "success_loose": (loose_ok & ~censored).astype(float),
         "track_reward_mean": (d["track_reward_mean"].astype(float)
                               if "track_reward_mean" in d
                               else np.full(bits.shape, np.nan)),
@@ -333,6 +342,12 @@ def derived_columns(cell: dict, plan: dict,
 #: Metrics reported per cell and per family: ``(column, binary?, label)``.
 REPORTED = (
     ("success", True, "success rate"),
+    # The pair BESIDE the headline, because what the tracking checks cost is a result in its
+    # own right and it is not the same on every arm: measured on `strict_v1` the checks cost
+    # the clip arm 0.010 and the generator 0.035, so reading only one of these changes a
+    # contrast. Identical to `success` when no checks ran.
+    ("success_loose", True, "success rate (fall-only)"),
+    ("track_reward_mean", False, "tracking reward"),
     ("fell", True, "fall rate (derived)"),
     # Reported BESIDE success rather than folded silently into it: success is
     # `arrived & ~fell & ~censored`, so seeing the two limbs apart is what says whether a
@@ -375,6 +390,12 @@ def reduce_cell(cell: dict, plan: dict, args) -> dict:
         "n_censored": int(d["admin_censored"].sum()),
         "termination_terms": cell["meta"].get("termination_terms"),
         "failure_terms": term_partition(cell["meta"])[1],
+        # CELL METADATA, not a metric, which is why it is here rather than in REPORTED: the
+        # reduce step aggregates only REPORTED columns, so a per-episode flag put there would
+        # print as a spurious "rate" row while still being what the definitions block needs.
+        # Distinguishes "the checks ran and nothing fired" from "there were no checks" --
+        # `success` and `success_loose` are identical in both cases.
+        "strict_checks_active": bool(float(np.mean(der["strict_checks_active"])) > 0.5),
         "throughput": cell["info"].get("throughput"),
         "dr": {k: cell["info"]["dr"].get(k)
                for k in ("preset", "ood_scale", "dr_resample", "reset_safe_terms",
@@ -540,6 +561,19 @@ def format_report(reduced: dict) -> str:
           "that stayed")
         a("                   upright without going anywhere counts as a success. ***")
     a(f"                   truncations (not failures): {list(TRUNCATION_TERMS)}")
+    # WHICH RULE THE HEADLINE IS, stated rather than inferable. The column is named `success`
+    # either way, so without this line a strict table and a loose one print identically --
+    # and they differ by 1.0 point on the clip arm and 3.5 on the generator.
+    _strict_on = [c["key"] for c in reduced["cells"] if c.get("strict_checks_active")]
+    if _strict_on:
+        a("                   *** STRICT: a tracking VIOLATION (lateral / height / tilt vs the")
+        a("                   served reference) counts as a failure, and the first event wins.")
+        a(f"                   Cells with the checks active: {_strict_on}")
+        a("                   `success_loose` in the reduced table is the fall-only rate; the")
+        a("                   pair is what says what the checks cost.")
+    else:
+        a("                   LOOSE: no tracking checks in this run -- `success` is fall-only,")
+        a("                   and `success_strict` equals it by construction.")
     for c in reduced["cells"]:
         a(f"                   {c['key']}: failure terms {c['failure_terms']}")
         if rule == "spatial":

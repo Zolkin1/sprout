@@ -1471,25 +1471,36 @@ def test_success_is_decided_by_FIRST_EVENT_ordering_not_by_the_termination_bit()
 
 
 def test_the_strict_checks_only_ever_REMOVE_successes_and_are_flagged_when_absent():
-    """`success_strict` is `success` minus the episodes that violated before arriving.
+    """The HEADLINE `success` follows the strict rule wherever the strict data exists.
 
-    Reported side by side rather than folded together, because the pair is the whole point:
-    the difference between them is what the tracking checks cost, and a cell written before
-    they existed must be distinguishable from one where nothing ever fired.
+    It used to be the loose rule unconditionally, with `success_strict` computed and left in
+    the reduced table -- so a run that collected the tracking checks printed the FALL-ONLY
+    rate under the name "success". Measured on `strict_v1`: loose read clip 0.9188 /
+    fm 0.6406 while the strict rule those cells actually ran under is clip 0.9089 /
+    fm 0.6061, and the checks cost the generator 3.5x what they cost the clip -- so reading
+    the wrong one changes a CONTRAST, not merely a level.
+
+    `success_loose` is kept beside it. The pair is what says what the checks cost, and a cell
+    written before they existed must stay distinguishable from one where nothing ever fired.
     """
     cell = _fake_cell(3, reached=[1, 1, 1], goal_step=[10, 10, 10],
                       viol_step=[-1, 5, 40])
     out = report.derived_columns(cell, {}, "spatial")
-    #                      no violation | violated BEFORE arriving | violated AFTER arriving
-    assert out["success"].tolist() == [1.0, 1.0, 1.0]
+    #                     no violation | violated BEFORE arriving | violated AFTER arriving
+    assert out["success"].tolist() == [1.0, 0.0, 1.0], "the headline is not the strict rule"
     assert out["success_strict"].tolist() == [1.0, 0.0, 1.0]
+    assert out["success_loose"].tolist() == [1.0, 1.0, 1.0]
     assert out["strict_checks_active"].tolist() == [1.0] * 3
+    # Strict only ever REMOVES: it can never turn a loose failure into a success.
+    assert all(a <= b for a, b in zip(out["success_strict"], out["success_loose"]))
 
-    # A table with no tracking columns at all: the two rules coincide by construction, and
-    # the flag says so rather than letting a reader mistake it for "nothing ever fired".
+    # A table with no tracking columns at all: all three coincide BY CONSTRUCTION, so the
+    # headline falls back to loose rather than to an all-zero strict column -- and the flag
+    # says which, rather than letting a reader mistake it for "nothing ever fired".
     old = report.derived_columns(_fake_cell(3, reached=[1, 1, 1], viol_step=False), {},
                                  "spatial")
-    assert old["success"].tolist() == old["success_strict"].tolist() == [1.0] * 3
+    assert (old["success"].tolist() == old["success_strict"].tolist()
+            == old["success_loose"].tolist() == [1.0] * 3)
     assert old["strict_checks_active"].tolist() == [0.0] * 3
 
 
