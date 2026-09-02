@@ -327,14 +327,25 @@ def spearman(a: np.ndarray, b: np.ndarray) -> float:
         return float("nan")
 
     def _rank(x):
-        """Average ranks, so ties do not order by array position."""
+        """Average ranks, so ties do not order by array position.
+
+        Ties are averaged over RUNS OF THE SORTED ARRAY rather than by scanning the whole
+        array once per distinct value. The scanning form is ``O(u * n)`` in the number of
+        distinct values, which on a continuous score is ``O(n^2)``: at the 294k rows of a
+        full rollout table that is ~9e10 element comparisons and the call never returns,
+        while at the few thousand rows every existing caller passes it is merely slow. Same
+        result, and the tests pin the tie behaviour.
+        """
         order = np.argsort(x, kind="mergesort")
+        s = x[order]
         r = np.empty(x.size, dtype=np.float64)
-        r[order] = np.arange(1, x.size + 1, dtype=np.float64)
-        for v in np.unique(x):
-            m = x == v
-            if m.sum() > 1:
-                r[m] = r[m].mean()
+        ranks = np.arange(1, x.size + 1, dtype=np.float64)
+        # Boundaries of equal-value runs in the sorted array; each run takes its mean rank,
+        # which for a contiguous block is the midpoint of its first and last rank.
+        starts = np.flatnonzero(np.r_[True, s[1:] != s[:-1]])
+        ends = np.r_[starts[1:], s.size]
+        means = 0.5 * (ranks[starts] + ranks[ends - 1])
+        r[order] = np.repeat(means, ends - starts)
         return r
 
     ra, rb = _rank(a), _rank(b)
