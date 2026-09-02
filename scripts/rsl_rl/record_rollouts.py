@@ -587,10 +587,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                         writer.write_batch(batch)
                     if steps % 500 == 0:
                         el = time.time() - t0
+                        # flush=True: this is the ONLY progress signal a multi-hour run
+                        # emits, and with stdout redirected to a file Python buffers it ~8 KB
+                        # -- so a healthy run looks stalled for tens of minutes while the
+                        # startup lines (which do flush) sit there alone.
                         print(f"[rollout] step {steps}: {writer.written} windows, "
                               f"{tracker.harvested} episodes, {el / 60:.1f} min "
                               f"({steps / max(el, 1e-9):.1f} steps/s, "
-                              f"{tracker.harvested / max(el / 3600, 1e-9):.0f} ep/h)")
+                              f"{tracker.harvested / max(el / 3600, 1e-9):.0f} ep/h)",
+                              flush=True)
                 # Inside inference_mode: the accumulators were last written here, which makes
                 # them inference tensors, and those cannot be updated in place outside it.
                 tracker.flush(u, torch.arange(int(u.num_envs), device=u.device))
