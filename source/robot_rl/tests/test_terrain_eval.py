@@ -1335,6 +1335,41 @@ def test_stage_grid_forwards_every_flag_the_cell_stage_reads():
         "silently take their argparse defaults in the subprocess")
 
 
+def test_stage_grid_forwards_the_PLANS_value_not_its_own_default():
+    """Forwarding the flag is not enough; it has to forward the right VALUE.
+
+    The test above cannot catch this, and that is the point: the flag IS restated, so the
+    pattern match passes while the value is wrong. It happened a third time -- a strict run
+    passed ``--tracking_spec`` and ``--goal_regions`` to ``--stage plan`` only, and the cell
+    announced "NO goal region: report.py will refuse to derive spatial success", having
+    silently taken ``""``. ``--num_envs`` reverted 2048 -> 256 in the same invocation.
+
+    So every forwarded value now resolves through ``val()``: the CLI when the caller TYPED it,
+    otherwise whatever ``--stage plan`` recorded in the manifest. Both halves matter -- always
+    preferring the plan would make the grid's own flags inert, and always preferring the CLI is
+    the bug.
+    """
+    src = pathlib.Path(_EVAL / "runner.py").read_text()
+    grid = src.split("def stage_grid")[1]
+    # Nothing in the forwarded argv may read `args.<x>` directly any more.
+    body = grid.split("proc = subprocess.run")[0]
+    direct = sorted(set(re.findall(r"args\.([a-z_]+)", body))
+                    - {"out", "cell", "cells", "force", "dry_run", "_explicit"})
+    assert not direct, (
+        f"stage_grid still reads args.{direct} directly when building the cell command; "
+        "those bypass the plan fallback and revert to argparse defaults for any flag the "
+        "caller passed only to --stage plan")
+    assert 'recorded = (manifest.get("cli") or {}).get("resolved") or {}' in grid, (
+        "stage_grid no longer reads the manifest's recorded plan-time values")
+
+    # And the CLI-vs-plan distinction it depends on must still be computed.
+    ev = pathlib.Path(_EVAL / "evaluate.py").read_text()
+    assert "def _explicit_dests(" in ev
+    assert "args._explicit = _explicit_dests(" in ev, (
+        "main() no longer records which flags the caller typed, so `val()` cannot tell a "
+        "deliberate CLI override from an argparse default and the plan would always win")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
 

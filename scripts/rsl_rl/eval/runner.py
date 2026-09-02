@@ -874,7 +874,34 @@ def stage_grid(args) -> int:
     One process per cell so an Isaac crash cannot poison the next cell and the GPU is fully
     released in between -- and so a multi-hour grid can be resumed.
     """
-    plan, _ = load_run(args.out)
+    plan, manifest = load_run(args.out)
+    # EVERY forwarded flag falls back to what --stage plan RECORDED, so a flag given only to
+    # the plan reaches the cell instead of reverting to its argparse default in the child.
+    # That silent revert has now bitten three times: `--num_envs` ran a grid at 256 while the
+    # manifest said 1024, `--terrain_ref` produced 3950 episodes with `n_plans == 0`, and
+    # `--tracking_spec`/`--goal_regions` were dropped from a strict run whose whole purpose
+    # was the strict criterion. A test cannot catch it -- the flag IS restated here, it is the
+    # VALUE that is wrong -- so the fix is to make the wrong value unreachable.
+    #
+    # `args._explicit` is the set of dests the caller actually TYPED (see
+    # `evaluate._explicit_dests`); argparse cannot tell `--num_envs 256` from the 256 default,
+    # and that distinction is exactly what lets the plan's value win WITHOUT overriding a
+    # deliberate CLI override.
+    recorded = (manifest.get("cli") or {}).get("resolved") or {}
+    explicit = set(getattr(args, "_explicit", ()) or ())
+
+    def val(dest: str):
+        """CLI if the caller typed it, else the plan's recorded value, else the default."""
+        if dest in explicit or dest not in recorded:
+            return getattr(args, dest)
+        return recorded[dest]
+
+    from_plan = sorted(d for d in recorded
+                       if d not in explicit and hasattr(args, d)
+                       and recorded[d] != getattr(args, d))
+    if from_plan:
+        print("[grid] taking from plan.json rather than this invocation's defaults: "
+              + ", ".join(f"{d}={recorded[d]!r}" for d in from_plan))
     wanted = [c.strip() for c in args.cells.split(",") if c.strip()]
     cells = [c for c in plan["cells"] if not wanted or c["key"] in wanted]
     print(f"[grid] {len(cells)} cell(s) in {args.out}")
@@ -891,41 +918,41 @@ def stage_grid(args) -> int:
     for c in todo:
         cmd = [sys.executable, "-u", str(pathlib.Path(__file__).with_name("evaluate.py")),
                "--stage", "cell", "--out", str(args.out), "--cell", c["key"],
-               "--num_envs", str(args.num_envs), "--num_rows", str(args.num_rows),
-               "--seed", str(args.seed), "--ood_scale", str(args.ood_scale),
-               "--dr_resample", args.dr_resample,
-               "--spawn_z_offset", str(args.spawn_z_offset),
-               "--start_step", str(args.start_step)]
-        if args.clip_device:
-            cmd += ["--clip_device", args.clip_device]
+               "--num_envs", str(val("num_envs")), "--num_rows", str(val("num_rows")),
+               "--seed", str(val("seed")), "--ood_scale", str(val("ood_scale")),
+               "--dr_resample", val("dr_resample"),
+               "--spawn_z_offset", str(val("spawn_z_offset")),
+               "--start_step", str(val("start_step"))]
+        if val("clip_device"):
+            cmd += ["--clip_device", val("clip_device")]
         # Forward EVERY flag the cell stage reads. This list is the whole reason `fm_tf` is a
         # reference MODE and not a flag: anything added here and forgotten reverts silently to
         # its argparse default in the subprocess. Measured, twice: --num_envs ran a grid at 256
         # while the manifest recorded 1024, and --terrain_ref produced 3950 episodes with
         # n_plans == 0 and no error anywhere.
-        if getattr(args, "goal_regions", ""):
-            cmd += ["--goal_regions", args.goal_regions]
+        if val("goal_regions"):
+            cmd += ["--goal_regions", val("goal_regions")]
         # RESTATED HERE ON PURPOSE. A flag added to the parser is NOT forwarded across the
         # grid -> cell subprocess boundary unless this function repeats it; it reverts to its
         # argparse default in the child, silently. Measured twice already: `--num_envs` ran a
         # grid at 256 while the manifest recorded 1024, and `--terrain_ref` produced 3950
         # episodes with `n_plans == 0` and no error.
-        if getattr(args, "tracking_spec", ""):
-            cmd += ["--tracking_spec", args.tracking_spec]
-        cmd += ["--fall_min_height", str(args.fall_min_height)]
-        if int(args.fm_seed) != -1:
-            cmd += ["--fm_seed", str(args.fm_seed)]
-        if args.steer_kp:
-            cmd += ["--steer_kp", str(args.steer_kp),
-                    "--steer_wz_max", str(args.steer_wz_max)]
-        if getattr(args, "terrain_ref", ""):
-            cmd += ["--terrain_ref", args.terrain_ref]
-        if getattr(args, "dump_flagged", 0):
-            cmd += ["--dump_flagged", str(args.dump_flagged)]
-        if not args.ood_depth_noise:
+        if val("tracking_spec"):
+            cmd += ["--tracking_spec", val("tracking_spec")]
+        cmd += ["--fall_min_height", str(val("fall_min_height"))]
+        if int(val("fm_seed")) != -1:
+            cmd += ["--fm_seed", str(val("fm_seed"))]
+        if val("steer_kp"):
+            cmd += ["--steer_kp", str(val("steer_kp")),
+                    "--steer_wz_max", str(val("steer_wz_max"))]
+        if val("terrain_ref"):
+            cmd += ["--terrain_ref", val("terrain_ref")]
+        if val("dump_flagged"):
+            cmd += ["--dump_flagged", str(val("dump_flagged"))]
+        if not val("ood_depth_noise"):
             cmd += ["--no-ood_depth_noise"]
-        if args.max_steps:
-            cmd += ["--max_steps", str(args.max_steps)]
+        if val("max_steps"):
+            cmd += ["--max_steps", str(val("max_steps"))]
         print(f"\n[grid] === {c['key']} ===\n[grid] {' '.join(cmd)}")
         proc = subprocess.run(cmd, cwd=os.getcwd(), check=False)
         if proc.returncode != 0:

@@ -759,9 +759,48 @@ def _report_plan(plan: dict) -> None:
     print(f"[plan] {total:,} episodes across the grid")
 
 
+def _explicit_dests(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    """Which option ``dest``s the caller actually TYPED, as opposed to argparse defaults.
+
+    ``argparse`` cannot tell ``--num_envs 256`` from the 256 default, and that distinction is
+    what lets ``stage_grid`` fall back to the value ``--stage plan`` recorded WITHOUT
+    overriding a deliberate override on the grid invocation. Without it the fallback would
+    have to choose globally between "the plan always wins" (which makes the grid's own flags
+    inert) and "the CLI always wins" (which is the bug).
+
+    Reads the raw ``argv`` against the parser's own option table rather than re-parsing with
+    ``SUPPRESS`` defaults, because the latter means maintaining every default twice.
+
+    Args:
+        parser: The parser whose option strings to recognise.
+        argv: Arguments as typed, without the program name.
+
+    Returns:
+        The ``dest`` names present in ``argv``.
+    """
+    by_opt: dict[str, str] = {}
+    for action in parser._actions:                      # noqa: SLF001 - the option table
+        for opt in action.option_strings:
+            by_opt[opt] = action.dest
+    seen: set[str] = set()
+    for tok in argv:
+        if tok in by_opt:
+            seen.add(by_opt[tok])
+        elif tok.startswith("--") and "=" in tok:
+            head = tok.split("=", 1)[0]
+            if head in by_opt:
+                seen.add(by_opt[head])
+    return seen
+
+
 def main() -> int:
     """Dispatch to the requested stage."""
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    # Carried so `stage_grid` can prefer the plan's recorded value for anything the caller did
+    # not type. See `_explicit_dests`, and `runner.stage_grid`'s note on the three times a
+    # silently-defaulted flag has invalidated a grid.
+    args._explicit = _explicit_dests(parser, sys.argv[1:])   # noqa: SLF001
     if args.out is None:
         stamp = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d_%H-%M-%S")
         args.out = str(pathlib.Path("logs") / "terrain_eval" / stamp)
