@@ -891,48 +891,63 @@ def run(args) -> int:
     # the two. If they disagree it is summing two different quantities, and both are plausible
     # floats -- so the checkpoint's own stamp wins, `--tracking_spec` is only a fallback for a
     # pre-stamp checkpoint, and a disagreement between the two is refused rather than resolved.
-    track_spec, track_gamma = None, 0.95
-    if ks == [1]:
-        # A K=1-only run makes no choice, so there is nothing to score, no critic is loaded
-        # and there is no spec to resolve. Gated explicitly because `--w_fail` now DEFAULTS
-        # below 1.0: without this, the do-nothing control arm -- which passes no
-        # `--critic_ckpt` at all -- would hard-fail on a missing quality head it never wanted.
-        pass
-    elif args.w_fail < 1.0:
-        from deploy.tracking_error import TrackingErrorSpec  # noqa: PLC0415
-        stamped = getattr(crit, "tracking_spec", None)
-        cli_spec = None
-        if args.tracking_spec:
-            with open(args.tracking_spec) as fh:
-                cli_spec = TrackingErrorSpec.from_dict(json.load(fh))
-        if stamped is not None and cli_spec is not None and stamped != cli_spec:
-            raise SystemExit(
-                f"--tracking_spec {args.tracking_spec!r} disagrees with the spec stamped in "
-                f"{os.path.basename(args.critic_ckpt)}. The stamped one is what the quality "
-                "head was FITTED under; passing a different one silently changes what the "
-                "measured reward means. Drop the flag, or refit.")
-        track_spec = stamped if stamped is not None else cli_spec
-        if track_spec is None:
-            raise SystemExit(
-                "--w_fail < 1 needs the tracking spec the quality head was fitted under, and "
-                f"{os.path.basename(args.critic_ckpt or '?')} carries no `tracking_spec` "
-                "stamp (it predates the stamping fix). Pass --tracking_spec <spec.json> -- "
-                "the same file the recording was made with -- or refit to get it stamped.")
-        if getattr(crit, "has_quality", False) is False:
-            raise SystemExit(
-                f"--w_fail {args.w_fail} asks for the quality term but "
-                f"{os.path.basename(args.critic_ckpt or '?')} has no quality head. Refit with "
-                "--quality_bins > 0, or run the control arm at --w_fail 1.")
-        track_gamma = float(track_spec.gamma)
-        print(f"[live] selection score: J = {1.0 - args.w_fail:.3f}*G_hat - "
-              f"{args.w_fail:.3f}*P_fail  (failure weighted "
-              f"{args.w_fail / max(1e-9, 1.0 - args.w_fail):.2f}x quality), gamma "
-              f"{track_gamma:.3f}, spec "
-              f"{'FITTED' if not track_spec.is_bootstrap else 'BOOTSTRAP'}", flush=True)
+    # THE TRACKING SPEC IS THE FAILURE RULE, so it is resolved for EVERY arm including a
+    # K=1-only run. Gating it on `ks != [1]` -- which this did -- leaves a K=1 baseline on the
+    # fall-only rule while every K>1 candidate is on the strict one, and the paired delta then
+    # measures the rule instead of the selection. That is the same defect as the missing
+    # `probe=` in `run_episode_selected`, one level up, and it would have silently invalidated
+    # the corrected baseline re-run that fix exists to enable.
+    #
+    # A K=1 run loads no critic, so its spec can only come from `--tracking_spec`. Absent
+    # everywhere, BOTH arms fall back to fall-only, which is at least symmetric -- but it is
+    # announced loudly, because a run with no strict number looks identical to one with.
+    from deploy.tracking_error import TrackingErrorSpec  # noqa: PLC0415
+
+    track_gamma = 0.95
+    stamped = getattr(crit, "tracking_spec", None)
+    cli_spec = None
+    if args.tracking_spec:
+        with open(args.tracking_spec) as fh:
+            cli_spec = TrackingErrorSpec.from_dict(json.load(fh))
+    if stamped is not None and cli_spec is not None and stamped != cli_spec:
+        raise SystemExit(
+            f"--tracking_spec {args.tracking_spec!r} disagrees with the spec stamped in "
+            f"{os.path.basename(args.critic_ckpt)}. The stamped one is what the quality head "
+            "was FITTED under; passing a different one silently changes what the measured "
+            "reward means. Drop the flag, or refit.")
+    track_spec = stamped if stamped is not None else cli_spec
+    if track_spec is None:
+        print("[live] WARNING: no tracking spec (none stamped in the critic, none passed). "
+              "BOTH arms fall back to the fall-only rule -- no strict number is produced, and "
+              "nothing here is comparable to a run that had one.", flush=True)
     else:
-        print("[live] selection score: P_fail only (--w_fail 1.0) -- the CONTROL arm, "
-              "bit-identical to every number measured before the quality head existed.",
-              flush=True)
+        track_gamma = float(track_spec.gamma)
+        print(f"[live] failure rule: STRICT -- lateral {track_spec.max_lateral_m:.2f} m / "
+              f"height {track_spec.max_height_m:.2f} m / tilt "
+              f"{math.degrees(track_spec.max_tilt_rad):.0f} deg vs the served reference, "
+              f"TERMINATING, on every arm including K=1. spec "
+              f"{'FITTED' if not track_spec.is_bootstrap else 'BOOTSTRAP'}", flush=True)
+    if ks != [1]:
+        if args.w_fail < 1.0:
+            if track_spec is None:
+                raise SystemExit(
+                    "--w_fail < 1 needs the tracking spec the quality head was fitted under. "
+                    f"{os.path.basename(args.critic_ckpt or '?')} carries no `tracking_spec` "
+                    "stamp (it predates the stamping fix). Pass --tracking_spec <spec.json> "
+                    "-- the same file the recording was made with -- or refit.")
+            if getattr(crit, "has_quality", False) is False:
+                raise SystemExit(
+                    f"--w_fail {args.w_fail} asks for the quality term but "
+                    f"{os.path.basename(args.critic_ckpt or '?')} has no quality head. Refit "
+                    "with --quality_bins > 0, or run the control arm at --w_fail 1.")
+            print(f"[live] selection score: J = {1.0 - args.w_fail:.3f}*G_hat - "
+                  f"{args.w_fail:.3f}*P_fail  (failure weighted "
+                  f"{args.w_fail / max(1e-9, 1.0 - args.w_fail):.2f}x quality), gamma "
+                  f"{track_gamma:.3f}", flush=True)
+        else:
+            print("[live] selection score: P_fail only (--w_fail 1.0) -- the CONTROL arm, "
+                  "bit-identical to every number measured before the quality head existed.",
+                  flush=True)
     os.makedirs(args.out, exist_ok=True)
     recorder = None
     if args.random_select and args.same_noise:
