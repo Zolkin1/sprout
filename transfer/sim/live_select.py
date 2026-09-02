@@ -371,6 +371,26 @@ def arrived(course, robot, zex) -> bool:
                 and course.traversed(zex[0], zex[1]))
 
 
+def _ep_quality(probe) -> float:
+    """Mean measured per-chunk tracking reward over an episode, or NaN without a probe.
+
+    The per-CHUNK mean rather than the per-step one, so it is the same quantity the quality
+    head predicts a discounted sum of and the same one ``selection_score`` measures -- an
+    episode's quality and a candidate's are then directly comparable numbers.
+
+    Args:
+        probe: An episode-level ``TrackingProbe``, or ``None``.
+
+    Returns:
+        The mean, or NaN when nothing was scored (no probe, or an episode that ended entirely
+        inside the opening command hold).
+    """
+    if probe is None:
+        return float("nan")
+    probe.finish()
+    return float(np.mean(probe.chunk_rewards)) if probe.chunk_rewards else float("nan")
+
+
 def selection_score(p_fail: float, g_hat: float | None, chunk_rewards, *,
                     w_fail: float, gamma: float) -> float:
     """BADNESS of one candidate: lower is better, so the caller's ``argmin`` is unchanged.
@@ -638,6 +658,10 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
     # survive into its sibling.
     ep_probe = (tracking.TrackingProbe(spec, hold_until_s=cmd_hold_s)
                 if spec is not None else None)
+    #: Measured per-chunk tracking reward of the COMMITTED chunks, for the K>1 arm. Success is
+    #: no longer the only objective -- the whole point of the dense reward is cleanliness -- so
+    #: every arm reports its realized quality beside its verdict.
+    ep_rewards: list[float] = []
     while robot.mj_data.time <= course.budget_s:
         if k <= 1:
             v, f, _st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, zex, scorer=_ring,
@@ -645,7 +669,7 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                               hold_until=cmd_hold_s, probe=ep_probe,
                               step0=n_replans * cadence)
             if v:
-                return v, f, n_replans, 0.0
+                return v, f, n_replans, 0.0, _ep_quality(ep_probe)
             n_replans += 1
             continue
 
@@ -781,10 +805,11 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                 post = Snapshot(robot, policy, fm_lag)
             # `v`/`f`/`cz` are the FIRST chunk's -- the continuation's verdict scores the
             # branch but is never the episode's, because the episode never ran it.
+            cand_r = list(cprobe.chunk_rewards) if cprobe is not None else []
             if random_select:
-                all_cands.append((score, post, v, f, cz, cap))
+                all_cands.append((score, post, v, f, cz, cap, cand_r))
             if best is None or score < best[0]:
-                best = (score, post, v, f, cz, cap)
+                best = (score, post, v, f, cz, cap, cand_r)
                 sel_index = cand
             if want_cands:
                 # The conditioning is NOT stored per candidate: every candidate restored the
@@ -827,10 +852,16 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                          cmd_future=best[5]["cmd_future"], fm_plan=best[5]["fm_plan"],
                          **extra_c)
         zex = list(best[4])
+        # The COMMITTED chunk's measured tracking reward. Only the winner's, because only the
+        # winner was executed -- a rejected candidate's reward describes a trajectory the
+        # episode never took.
+        ep_rewards.extend(best[6])
         n_replans += 1
         if best[2]:
-            return best[2], best[3], n_replans, float(np.mean(scored))
-    return "timeout", "", n_replans, (float(np.mean(scored)) if scored else 0.0)
+            return (best[2], best[3], n_replans, float(np.mean(scored)),
+                    float(np.mean(ep_rewards)) if ep_rewards else float("nan"))
+    return ("timeout", "", n_replans, (float(np.mean(scored)) if scored else 0.0),
+            float(np.mean(ep_rewards)) if ep_rewards else float("nan"))
 def run(args) -> int:
     """Run the K arms, seed-matched, and report the episode success rate of each."""
     import terrains  # noqa: PLC0415
@@ -1071,13 +1102,19 @@ def run(args) -> int:
                          "cmd_hold_s": args.cmd_hold_s,
                          "w_fail": args.w_fail,
                          "spec": track_spec, "gamma": track_gamma})
-                v, f, nr, sc = fn(
+                v, f, nr, sc, q = fn(
                     rig, policy, fm_lag, spawn, cmd, cfg, crit, course.goal_anchor_xyz,
                     k=k, seed=ep, mjrunner=mjrunner, **extra)
                 wins += int(v == "success")
+                # `track_reward` is reported for EVERY arm, K=1 included. Success stops being
+                # the only objective the moment a dense tracking reward exists: a selector
+                # that buys survival by tracking worse is invisible in a success rate, and
+                # that trade is exactly what the quality head was added to expose. NaN means
+                # no probe (no tracking spec) or an episode that never left the opening hold.
                 rows.append({"tile": tile, "unit": f"{kind}{uid}", "k": k,
                          "episode": ep, "verdict": v,
                              "failure": f, "n_replans": nr, "spread": float(sc),
+                             "track_reward": float(q),
                              "selector": "Q" if use_q else "V"})
                 done = ep - args.seed_offset + 1
                 if done % max(1, args.episodes // 10) == 0:
@@ -1563,14 +1600,14 @@ def run_episode_q_selected(rig, policy, fm_lag, spawn, cmd, cfg, scorer, anchor,
 
         robot.apply_action(policy.get_action(obs, robot.joint_names))
         if robot.failed():
-            return "fall", robot.failure_reason(), n_replans, float(np.mean(spreads or [0.0]))
+            return "fall", robot.failure_reason(), n_replans, float(np.mean(spreads or [0.0])), float("nan")
         for _ in range(rig.decim):
             robot.step()
         z = float(robot.mj_data.qpos[2])
         zex[0], zex[1] = max(zex[0], z), min(zex[1], z)
         if arrived(course, robot, zex):
-            return "success", "", n_replans, float(np.mean(spreads or [0.0]))
-    return "timeout", "", n_replans, float(np.mean(spreads or [0.0]))
+            return "success", "", n_replans, float(np.mean(spreads or [0.0])), float("nan")
+    return "timeout", "", n_replans, float(np.mean(spreads or [0.0])), float("nan")
 
 
 if __name__ == "__main__":

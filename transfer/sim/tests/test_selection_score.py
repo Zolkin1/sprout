@@ -161,6 +161,31 @@ def test_the_k1_arm_is_scored_by_the_same_rule_as_the_candidates():
         "measures the failure RULE, not the selection")
 
 
+def test_both_episode_drivers_return_the_same_arity():
+    """Every return of both drivers hands back 5 elements, and the caller unpacks 5.
+
+    There is ONE call site and it dispatches to either driver, so a return that drops an
+    element ``ValueError``s at run time -- after the scene is built and the policy loaded,
+    minutes into a cell. No unit test can see it, because none of them call ``run()``; this
+    reads the AST instead. It caught a real miss: adding the quality element to both drivers
+    left the caller unpacking four, so every cell would have died on its first episode.
+    """
+    import ast
+    import pathlib
+
+    tree = ast.parse(pathlib.Path(os.path.join(_SIM, "live_select.py")).read_text())
+    drivers = [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)
+               and n.name in ("run_episode_selected", "run_episode_q_selected")]
+    assert len(drivers) == 2, "an episode driver was renamed; this pin needs updating"
+    for fn in drivers:
+        for r in [n for n in ast.walk(fn) if isinstance(n, ast.Return)]:
+            width = len(r.value.elts) if isinstance(r.value, ast.Tuple) else 1
+            assert width == 5, f"{fn.name} line {r.lineno} returns {width}, not 5"
+    # ...and the single call site unpacks exactly that many.
+    src = pathlib.Path(os.path.join(_SIM, "live_select.py")).read_text()
+    assert "v, f, nr, sc, q = fn(" in src, "the dispatch no longer unpacks 5 elements"
+
+
 def test_a_missing_quality_head_raises_rather_than_scoring_zero():
     """A zero ``G_hat`` is the WORST return, so a silent one is not a safe fallback."""
     with pytest.raises(ValueError, match="no quality head"):
