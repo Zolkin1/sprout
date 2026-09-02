@@ -130,6 +130,134 @@ def n_step_advantage(
     return adv, boot
 
 
+def chunk_rewards_from_track_err(
+    track_err_prev: np.ndarray,
+    episode_uid: np.ndarray,
+    replan_index: np.ndarray,
+    spec,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-window chunk reward, UNDOING the recording's one-row storage shift.
+
+    ``track_err_prev`` row ``i`` holds the error of the chunk row ``i-1`` emitted -- a window
+    is written at the re-plan that PRODUCES its ``fm_plan``, whose consequences have not
+    happened yet.  So the reward for row ``i``'s action is row ``i+1``'s block, and undoing
+    that shift is this function's entire job.  Getting it wrong is an off-by-one-CHUNK that
+    fits, trains, and yields a plausible weak critic rather than an error.
+
+    **The last window of every episode has no reward**, because the chunk it emitted drove
+    steps that no later row recorded.  Those rows come back ``valid=False`` rather than
+    zero-filled: a zero reward is the worst possible value, so filling it would teach the
+    critic that the last decision of every episode -- including every successful one -- was
+    maximally bad.
+
+    Row 0's own block is all-zero (no previous chunk) and is never read as a reward, which is
+    the arrangement working rather than a coincidence.
+
+    Args:
+        track_err_prev: ``[W, K, n]`` from the rollout window table.
+        episode_uid: ``[W]``.
+        replan_index: ``[W]``.
+        spec: A ``TrackingErrorSpec`` supplying the kernel widths and weights.
+
+    Returns:
+        ``(reward, valid)`` -- ``[W]`` float64 and ``[W]`` bool.
+    """
+    # The TORCH twin, not `transfer.deploy.tracking_error`: `robot_rl` must not import
+    # `transfer` (the deploy runtime ships without IsaacLab and the dependency runs the other
+    # way). Imported lazily so this module stays importable without IsaacLab unless the
+    # function is actually called -- `label_advantage.py` and the tests both rely on that.
+    import torch  # noqa: PLC0415
+    from robot_rl.tasks.manager_based.robot_rl.mdp.tracking_error import (  # noqa: PLC0415
+        chunk_reward,
+    )
+
+    w = track_err_prev.shape[0]
+    reward = np.zeros(w, dtype=np.float64)
+    valid = np.zeros(w, dtype=bool)
+    per_row = chunk_reward(
+        torch.as_tensor(np.asarray(track_err_prev), dtype=torch.float64), spec).numpy()
+
+    order = np.lexsort((replan_index, episode_uid))
+    uid_s = episode_uid[order]
+    starts = np.flatnonzero(np.r_[True, uid_s[1:] != uid_s[:-1]])
+    ends = np.r_[starts[1:], w] if starts.size else np.array([], dtype=int)
+    for s, e in zip(starts, ends):
+        rows = order[s:e]
+        if rows.size < 2:
+            continue                      # a one-window episode has no next block to read
+        reward[rows[:-1]] = per_row[rows[1:]]
+        valid[rows[:-1]] = True
+    return reward, valid
+
+
+def normalized_returns(
+    reward: np.ndarray,
+    valid: np.ndarray,
+    episode_uid: np.ndarray,
+    replan_index: np.ndarray,
+    failed: np.ndarray,
+    *,
+    gamma: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``G_t`` per window: the QUALITY head's regression target, in ``[0, 1]``.
+
+    ``G_t = (1 - gamma) * sum_j gamma^j R_{t+j} + tail``, over the rewards that remain in the
+    episode.  The ``(1 - gamma)`` factor is what makes the support ``[0, 1]`` DECLARABLE
+    rather than fitted, given a step reward bounded in ``(0, 1]``.
+
+    The tail follows
+    :func:`transfer.deploy.tracking_error.normalized_return`: ``0`` on a failure, which is
+    absorbing, and the LAST observed reward otherwise -- the episode ended by arriving or by
+    the budget, so the motion is assumed to continue at the quality it ended on.  Absorbing on
+    a non-failure would punish arriving QUICKLY, making a short flawless run score far below a
+    long one for reasons that are entirely about episode length.
+
+    Args:
+        reward: ``[W]`` per-window chunk reward from
+            :func:`chunk_rewards_from_track_err`.
+        valid: ``[W]`` which rewards exist.
+        episode_uid: ``[W]``.
+        replan_index: ``[W]``.
+        failed: ``[W]`` bool, the episode's realized outcome.
+        gamma: Per-chunk discount.
+
+    Returns:
+        ``(g, valid_g)`` -- ``[W]`` float64 and ``[W]`` bool. A row is invalid where its
+        episode has no valid reward at all, which is where the target would be a guess.
+
+    Raises:
+        ValueError: On a ``gamma`` outside ``(0, 1)``.
+    """
+    if not 0.0 < float(gamma) < 1.0:
+        raise ValueError(f"gamma must be in (0, 1), got {gamma!r}")
+    g = float(gamma)
+    w = reward.shape[0]
+    out = np.zeros(w, dtype=np.float64)
+    ok = np.zeros(w, dtype=bool)
+
+    order = np.lexsort((replan_index, episode_uid))
+    uid_s = episode_uid[order]
+    starts = np.flatnonzero(np.r_[True, uid_s[1:] != uid_s[:-1]])
+    ends = np.r_[starts[1:], w] if starts.size else np.array([], dtype=int)
+    for s, e in zip(starts, ends):
+        rows = order[s:e]
+        keep = rows[valid[rows]]
+        if keep.size == 0:
+            continue                       # nothing to build a return from; left invalid
+        r = reward[keep]
+        tail = 0.0 if bool(failed[keep[0]]) else float(r[-1])
+        # Backward recursion, so this is O(m) rather than O(m^2):
+        #   G_t = (1-g) R_t + g G_{t+1},   G_after_end = tail
+        acc = tail
+        vals = np.empty(r.size, dtype=np.float64)
+        for i in range(r.size - 1, -1, -1):
+            acc = (1.0 - g) * r[i] + g * acc
+            vals[i] = acc
+        out[keep] = vals
+        ok[keep] = True
+    return out, ok
+
+
 def combined_n_step_advantage(
     p_fail: np.ndarray,
     g_hat: np.ndarray,

@@ -150,3 +150,95 @@ def test_label_names_round_trip_and_an_unknown_one_raises():
     assert label_from_name("null") == LABEL_NULL
     with pytest.raises(ValueError):
         label_from_name("good")
+
+
+# ----------------------------------------------------------------------------------------
+# The QUALITY target: undoing the recording's one-row shift, and the return it feeds.
+# ----------------------------------------------------------------------------------------
+def _spec():
+    """The shared tracking contract, via the torch twin robot_rl is allowed to import."""
+    from robot_rl.tasks.manager_based.robot_rl.mdp.tracking_error import TrackingErrorSpec
+
+    return TrackingErrorSpec()
+
+
+def _blocks(uid, ridx, lateral):
+    """Per-window track_err_prev blocks with a chosen lateral error per row."""
+    from robot_rl.tasks.manager_based.robot_rl.mdp.tracking_error import NUM_FIXED_CHANNELS
+
+    nj, k = 29, 12
+    b = np.zeros((len(uid), k, NUM_FIXED_CHANNELS + nj))
+    b[:, :, 1] = np.asarray(lateral)[:, None]
+    return b
+
+
+def test_the_reward_shift_reads_the_NEXT_rows_block():
+    """Row i's action is scored by row i+1's block, and the last row has no reward.
+
+    A window is written at the re-plan that PRODUCES its fm_plan, whose consequences have not
+    happened yet. Getting this shift wrong is an off-by-one-CHUNK: it fits, it trains, and it
+    yields a plausible weak critic rather than an error.
+    """
+    from robot_rl.flow_matching import advantage as adv
+    from robot_rl.tasks.manager_based.robot_rl.mdp.tracking_error import chunk_reward
+    import torch
+
+    uid = np.array([0, 0, 0, 1, 1])
+    ridx = np.array([0, 1, 2, 0, 1])
+    lateral = np.array([0.0, 0.01, 0.02, 0.0, 0.05])   # row 0 of each episode is all-zero
+    blocks = _blocks(uid, ridx, lateral)
+    r, ok = adv.chunk_rewards_from_track_err(blocks, uid, ridx, _spec())
+
+    per_row = chunk_reward(torch.as_tensor(blocks, dtype=torch.float64), _spec()).numpy()
+    # episode 0: rows 0,1 get rows 1,2's blocks; row 2 has none.
+    assert ok.tolist() == [True, True, False, True, False]
+    assert r[0] == pytest.approx(per_row[1])
+    assert r[1] == pytest.approx(per_row[2])
+    # A larger error must score LOWER, or the shift is inverted.
+    assert r[0] > r[1]
+    # ...and the all-zero row-0 block is never used as a reward.
+    assert not np.isclose(r[0], per_row[0])
+
+
+def test_the_return_is_length_independent_on_arrival_and_decays_on_failure():
+    """G = 1.0 for flawless tracking however long it took; a failure discounts toward 0.
+
+    Absorbing on a NON-failure would punish arriving quickly, making a short flawless run
+    score far below a long one for reasons entirely about episode length.
+    """
+    from robot_rl.flow_matching import advantage as adv
+
+    for m in (2, 5, 40):
+        uid = np.zeros(m, dtype=np.int64)
+        ridx = np.arange(m)
+        r, ok = np.ones(m), np.ones(m, dtype=bool)
+        g_ok, _ = adv.normalized_returns(r, ok, uid, ridx, np.zeros(m, bool), gamma=0.95)
+        assert np.allclose(g_ok, 1.0), f"arrival at m={m} did not score 1.0: {g_ok}"
+        g_bad, _ = adv.normalized_returns(r, ok, uid, ridx, np.ones(m, bool), gamma=0.95)
+        assert (g_bad < 1.0).all()
+        # Nearer the failure is worth less.
+        assert g_bad[-1] < g_bad[0]
+
+
+def test_the_return_stays_in_the_declared_support_and_flags_unusable_episodes():
+    """G in [0, 1] -- what lets the quality head DECLARE its support instead of fitting it."""
+    from robot_rl.flow_matching import advantage as adv
+
+    rng = np.random.default_rng(0)
+    m = 30
+    uid = np.zeros(m, dtype=np.int64)
+    ridx = np.arange(m)
+    r = rng.random(m)
+    ok = np.ones(m, dtype=bool)
+    for failed in (True, False):
+        g, gok = adv.normalized_returns(r, ok, uid, ridx, np.full(m, failed), gamma=0.9)
+        assert bool(((g[gok] >= 0.0) & (g[gok] <= 1.0)).all())
+
+    # A one-window episode has no next block, so no reward and therefore no target -- flagged
+    # rather than zero-filled, since 0 is the worst possible return.
+    g, gok = adv.normalized_returns(np.zeros(1), np.zeros(1, bool), np.zeros(1, dtype=np.int64),
+                                    np.zeros(1, dtype=np.int64), np.zeros(1, bool), gamma=0.95)
+    assert not gok.any()
+
+    with pytest.raises(ValueError, match="gamma"):
+        adv.normalized_returns(r, ok, uid, ridx, np.zeros(m, bool), gamma=1.0)

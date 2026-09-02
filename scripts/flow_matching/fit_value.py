@@ -103,7 +103,53 @@ def _load(stem: str, max_windows: int) -> tuple[dict, dict, dict]:
         "first_fall_step": np.array([outcome[int(u)][2] for u in W["episode_uid"]]),
         "family_code": np.array([outcome[int(u)][3] for u in W["episode_uid"]]),
     }
+    # The QUALITY head's target, when the rollout is schema v2. A v1 table has no
+    # `track_err_prev`, so `g` is absent and the fit trains the survival head alone rather
+    # than inventing a return -- "absent" and "zero" are different things, and a zero return
+    # is the worst possible value.
+    if "track_err_prev" in W:
+        from robot_rl.flow_matching import advantage as adv_mod  # noqa: PLC0415
+        spec = _tracking_spec_from(ea)
+        r, r_ok = adv_mod.chunk_rewards_from_track_err(
+            W["track_err_prev"], W["episode_uid"], W["replan_index"], spec)
+        g, g_ok = adv_mod.normalized_returns(
+            r, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
+            gamma=float(spec.gamma))
+        lab["chunk_reward"], lab["g"], lab["g_valid"] = r, g, g_ok
+        print(f"[fit] quality target from track_err_prev: {int(g_ok.sum())}/{g_ok.size} "
+              f"windows, median G {np.median(g[g_ok]):.4f}, "
+              f"spec {'FITTED' if not spec.is_bootstrap else 'BOOTSTRAP'}")
     return W, {"cols": E, "attrs": ea, "ep_terrain": ep_terrain}, lab
+
+
+def _tracking_spec_from(episode_attrs: dict):
+    """The spec the recording's strict columns were written under.
+
+    Read from the FILE, never re-defaulted: the recorder stamps it precisely so the columns
+    are interpretable without knowing which code ran, and silently substituting today's
+    default would relabel someone else's artifact.
+
+    Args:
+        episode_attrs: Attrs from the episodes table.
+
+    Returns:
+        A ``TrackingErrorSpec``.
+
+    Raises:
+        SystemExit: If the recording carries no spec. That is a pre-stamp file, and guessing
+            one would make its `first_violation_step` mean something it never meant.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.tracking_error import (  # noqa: PLC0415
+        TrackingErrorSpec,
+    )
+
+    raw = episode_attrs.get("tracking_spec")
+    if raw is None:
+        raise SystemExit(
+            "this rollout has a track_err_prev block but no `tracking_spec` attr, so the "
+            "thresholds and kernel widths its columns were written under are unknown. "
+            "Re-record, or fit with --quality_bins 0 to train the survival head alone.")
+    return TrackingErrorSpec.from_dict(raw)
 
 
 def _splits(uids: np.ndarray, tiles: np.ndarray, val_frac: float, seed: int
@@ -202,7 +248,8 @@ def _predict(model, ctx, W, idx, priv, device, scan_hw, batch):
 
 
 def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: float,
-         device, label: str, scan_hw, wb=None, val_tile=None
+         device, label: str, scan_hw, wb=None, val_tile=None,
+         quality_bins: int = 0, quality_weight: float = 1.0
          ) -> tuple[value.FlowValueModel, np.ndarray]:
     """Train one variant and return it plus held-out ``P(fail)``.
 
@@ -219,10 +266,22 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         proprio_dim=(int(W["proprio"].shape[-1]) if priv else 0),
         proprio_steps=(int(W["proprio"].shape[1]) if priv else 0),
         context_dim=(3 + (6 if priv else 3)),
+        quality_bins=int(quality_bins),
     ).to(device)
     opt = torch.optim.AdamW(model.trainable_parameters(), lr=lr, weight_decay=1e-4)
     lossf = torch.nn.BCEWithLogitsLoss()
     y = torch.as_tensor(lab["failed"].astype(np.float32), device=device)
+    # The QUALITY target. `g_valid` excludes the last window of every episode (its chunk's
+    # consequences were never recorded) and any episode with no usable reward at all; those
+    # rows train the survival head only, rather than being handed a zero -- which is the worst
+    # possible return and would teach the critic that every episode's last decision was bad.
+    use_q = int(quality_bins) > 0 and lab.get("g") is not None
+    g_t = (torch.as_tensor(lab["g"].astype(np.float32), device=device) if use_q else None)
+    g_ok = (torch.as_tensor(lab["g_valid"].astype(bool), device=device) if use_q else None)
+    if use_q:
+        print(f"  [{label}] quality head on: {int(lab['g_valid'].sum())}/{lab['g_valid'].size} "
+              f"windows carry a return target "
+              f"(median G {np.median(lab['g'][lab['g_valid']]):.3f})")
     tr = np.flatnonzero(train)
     rng = np.random.default_rng(0)
     best_state, best_auc, best_epoch, last_auc = None, -1.0, 0, float("nan")
@@ -233,7 +292,15 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         for i in range(0, tr.size, batch):
             j = tr[i:i + batch]
             opt.zero_grad(set_to_none=True)
-            loss = lossf(model(_batch(ctx, W, j, priv, device, scan_hw)), y[j])
+            xb = _batch(ctx, W, j, priv, device, scan_hw)
+            fail_logit, q_logits = model.heads(xb)     # ONE encoder pass for both heads
+            loss = lossf(fail_logit, y[j])
+            if use_q and q_logits is not None:
+                jt = torch.as_tensor(j, device=device)
+                m = g_ok[jt]
+                if bool(m.any()):
+                    loss = loss + float(quality_weight) * value.quality_loss(
+                        q_logits[m], g_t[jt][m], model.quality_support)
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     f"[{label}] the loss went non-finite on epoch {ep + 1}. Before this "
@@ -294,6 +361,17 @@ def main() -> int:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--val_frac", type=float, default=0.25,
                    help="Fraction of TILES held out entirely, and (at --folds 1) of episodes.")
+    p.add_argument("--quality_bins", type=int, default=51,
+                   help="Bins for the QUALITY head's distribution over the normalized "
+                        "tracking return. 0 trains the survival head ALONE, which is "
+                        "bit-for-bit the model that shipped and is therefore the control arm. "
+                        "Ignored on a rollout with no track_err_prev block.")
+    p.add_argument("--quality_weight", type=float, default=1.0,
+                   help="Weight on the quality cross-entropy against the survival BCE. Both "
+                        "are per-sample means over comparable ranges, so 1.0 is a real "
+                        "starting point rather than a placeholder -- but the two heads share "
+                        "a frozen trunk and only their own readouts, so they cannot fight for "
+                        "capacity the way two heads on one token would.")
     p.add_argument("--folds", type=int, default=1,
                    help="K-fold cross-fit over EPISODES, for labelling. At K>1 every window "
                         "on a training tile gets an OUT-OF-FOLD prediction from a model that "
@@ -422,7 +500,10 @@ def main() -> int:
             if len(folds) > 1:
                 print(f"  [{label}] fold {k + 1}/{len(folds)}  "
                       f"{int(np.unique(uids[tr_k]).size)} train episodes")
-            model, p_k = _fit(ctx, W, lab, tr_k, va_k, priv=priv, epochs=args.epochs,
+            model, p_k = _fit(ctx, W, lab, tr_k, va_k,
+                              quality_bins=int(args.quality_bins),
+                              quality_weight=float(args.quality_weight),
+                              priv=priv, epochs=args.epochs,
                               batch=args.batch, lr=args.lr, device=args.device,
                               label=(label if len(folds) == 1 else f"{label}/f{k}"),
                               scan_hw=scan_hw, wb=wb, val_tile=val_tile)
