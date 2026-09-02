@@ -191,11 +191,24 @@ def test_the_continuation_tags_cannot_collide_with_a_branch_key():
     a large tag in a later position. Pinned because a collision would silently turn the
     variance-reduction control into a duplicated treatment.
     """
-    assert _bp._CONT_TAG != _bp._CONT_TAG_B
-    assert _bp._CONT_TAG > 1000 and _bp._CONT_TAG_B > 1000, "tags must not alias a cand index"
+    tags = {"cont": _bp._CONT_TAG, "cont_b": _bp._CONT_TAG_B, "commit": _bp._COMMIT_TAG}
+    assert len(set(tags.values())) == 3, f"two tags alias: {tags}"
+    assert all(v > 1000 for v in tags.values()), "a tag must not alias a `cand` index"
+    # ...and no tag may be derived by ARITHMETIC from another. `_CONT_TAG + 1` was the commit
+    # key and IS `_CONT_TAG_B`; it was safe only because the two keys differ in LENGTH, which
+    # is one edit away from aliasing the second-seed tape onto the commit draw.
+    vals = sorted(tags.values())
+    assert all(b - a > 1 for a, b in zip(vals, vals[1:])), (
+        f"tags are adjacent integers, so one is plausibly arithmetic on another: {tags}")
+
     src = open(os.path.join(_SIM, "branch_probe.py")).read()
-    # the shared stream must NOT be keyed by `cand`
+    # the shared continuation stream must NOT be keyed by `cand`
     assert "np.random.default_rng([seed, start_replan, r, tag_seed])" in src, (
         "the continuation key changed; it must carry no `cand`, or siblings stop being paired")
-    assert "np.random.default_rng([seed, n_replans, cand])" in src, (
-        "the branch key must carry `cand` -- that difference IS the treatment")
+    # the branch key MUST carry `cand` -- except under the same-noise control, where handing
+    # every sibling one key is the whole point.
+    assert "[seed, n_replans] if same_noise else [seed, n_replans, cand]" in src, (
+        "the branch key must carry `cand` (the treatment) and must drop it under "
+        "--same_noise (the blocking control)")
+    assert "[seed, n_replans, _COMMIT_TAG]" in src, (
+        "the commit draw must use its own tag, not arithmetic on a continuation tag")
