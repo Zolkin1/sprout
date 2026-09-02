@@ -79,7 +79,18 @@ def _load(stem: str, max_windows: int) -> tuple[dict, dict, dict]:
     W, wa = ro.read_rollout_windows(stem + ".h5", columns=[
         "episode_uid", "replan_index", "family_code", "history", "history_null", "extero",
         "cmd_future", "goal_downrange_m", "goal_lateral_m", "goal_height_err_m",
-        "proprio", "base_twist_yaw", "height_scan"])
+        "proprio", "base_twist_yaw", "height_scan",
+        # The quality head's target. Requested BY NAME like everything else: this loader
+        # takes an explicit column list (it never reads `fm_plan`, 11.3 kB/window), so a
+        # column that is not named is simply absent and the head silently trains on nothing.
+        # That is exactly what happened -- the target code was right and the fit reported no
+        # quality metrics at all, twice, because nobody asked for the column.
+        #
+        # No `try` around it: `read_rollout_windows` RAISES on an absent column, and it
+        # already refuses any file whose schema_version is not 2 -- and `track_err_prev` is
+        # part of what schema 2 MEANS. So a v2 file without it is malformed, and failing
+        # loudly is right.
+        "track_err_prev"])
     E, ea = ro.read_rollout_episodes(stem + ".episodes.h5")
     if max_windows and W["episode_uid"].size > max_windows:
         keep = np.arange(max_windows)
@@ -103,22 +114,20 @@ def _load(stem: str, max_windows: int) -> tuple[dict, dict, dict]:
         "first_fall_step": np.array([outcome[int(u)][2] for u in W["episode_uid"]]),
         "family_code": np.array([outcome[int(u)][3] for u in W["episode_uid"]]),
     }
-    # The QUALITY head's target, when the rollout is schema v2. A v1 table has no
-    # `track_err_prev`, so `g` is absent and the fit trains the survival head alone rather
-    # than inventing a return -- "absent" and "zero" are different things, and a zero return
-    # is the worst possible value.
-    if "track_err_prev" in W:
-        from robot_rl.flow_matching import advantage as adv_mod  # noqa: PLC0415
-        spec = _tracking_spec_from(ea)
-        r, r_ok = adv_mod.chunk_rewards_from_track_err(
-            W["track_err_prev"], W["episode_uid"], W["replan_index"], spec)
-        g, g_ok = adv_mod.normalized_returns(
-            r, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
-            gamma=float(spec.gamma))
-        lab["chunk_reward"], lab["g"], lab["g_valid"] = r, g, g_ok
-        print(f"[fit] quality target from track_err_prev: {int(g_ok.sum())}/{g_ok.size} "
-              f"windows, median G {np.median(g[g_ok]):.4f}, "
-              f"spec {'FITTED' if not spec.is_bootstrap else 'BOOTSTRAP'}")
+    # The QUALITY head's target. Unconditional: the column is part of schema 2 and the
+    # reader refuses anything else, so a guard here would be dead code pretending to be a
+    # fallback. `--quality_bins 0` is how the survival-only control arm is selected.
+    from robot_rl.flow_matching import advantage as adv_mod  # noqa: PLC0415
+    spec = _tracking_spec_from(ea)
+    r, r_ok = adv_mod.chunk_rewards_from_track_err(
+        W["track_err_prev"], W["episode_uid"], W["replan_index"], spec)
+    g, g_ok = adv_mod.normalized_returns(
+        r, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
+        gamma=float(spec.gamma))
+    lab["chunk_reward"], lab["g"], lab["g_valid"] = r, g, g_ok
+    print(f"[fit] quality target from track_err_prev: {int(g_ok.sum())}/{g_ok.size} "
+          f"windows, median G {np.median(g[g_ok]):.4f}, "
+          f"spec {'FITTED' if not spec.is_bootstrap else 'BOOTSTRAP'}")
     return W, {"cols": E, "attrs": ea, "ep_terrain": ep_terrain}, lab
 
 
