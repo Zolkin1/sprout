@@ -256,11 +256,24 @@ def derived_columns(cols: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray],
     """
     v = terrains.VERDICT_CODES
     verdict = cols["verdict"].astype(int)
-    success = np.asarray(schema.derive_success(cols)).astype(float)
+    # LOOSE is the headline, so every number published before the strict checks existed stays
+    # comparable; STRICT sits beside it and the difference between them is what the checks
+    # cost. Never folded together.
+    success = np.asarray(schema.derive_success(cols, strict=False)).astype(float)
+    strict = np.asarray(schema.derive_success(cols, strict=True)).astype(float)
+    has_strict = bool("first_violation_step" in cols
+                      and (np.asarray(cols["first_violation_step"]) >= 0).any())
     der = {"success": success,
+           "success_strict": strict,
+           # A table without the checks reports the two as equal BY CONSTRUCTION. The flag is
+           # what stops a reader mistaking that for "measured and nothing ever fired".
+           "strict_checks_active": np.full(success.shape, float(has_strict)),
            "fall": (verdict == v["fall"]).astype(float),
            "timeout": (verdict == v["timeout"]).astype(float),
+           "violation": (verdict == v["violation"]).astype(float),
            "interrupted": (verdict == v["interrupted"]).astype(float)}
+    if "track_reward_mean" in cols:
+        der["track_reward_mean"] = cols["track_reward_mean"].astype(float)
     warnings: list[str] = []
     disagree = int((success.astype(bool) != (verdict == v["success"])).sum())
     if disagree:

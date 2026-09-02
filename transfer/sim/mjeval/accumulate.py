@@ -37,6 +37,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
 import terrains  # noqa: E402
+import tracking  # noqa: E402
 
 #: Standard gravity used for the cost of transport, matching the Isaac harness's constant so
 #: the two numbers are comparable without a unit conversion.
@@ -117,7 +118,7 @@ class EpisodeAccumulator:
 
     def __init__(self, course: terrains.Course, cmd: np.ndarray, dt: float,
                  act_ids: Sequence[int] | np.ndarray, effort_limits: np.ndarray,
-                 total_mass: float) -> None:
+                 total_mass: float, tracking_spec=None, hold_until_s: float = 0.0) -> None:
         """Allocate this episode's running sums.
 
         Args:
@@ -132,6 +133,12 @@ class EpisodeAccumulator:
                 tracker's own metadata.  Non-positive entries would make the utilisation
                 infinite, so they are replaced by 1.0 and the channel reads as raw torque.
             total_mass: Robot mass (kg), the cost of transport's denominator.
+            tracking_spec: A ``deploy.tracking_error.TrackingErrorSpec`` to turn on the STRICT
+                tracking checks, or ``None`` to leave them off.  Off means the columns come
+                back -1 / NaN, which a reader must be able to tell from "measured and never
+                fired" -- the same rule the Isaac accumulator's `attach_tracking` follows.
+            hold_until_s: End of the opening command hold; its steps are LATCHED but not
+                SCORED (see ``mjeval.tracking.TrackingProbe``).
         """
         self.course = course
         self.cmd = np.asarray(cmd, dtype=np.float64).reshape(3)
@@ -164,6 +171,11 @@ class EpisodeAccumulator:
         self._min_target_dist = float("inf")
         self._first_fall_step = -1
         self._target_step = -1
+        # The STRICT tracking checks, against the SERVED reference node. `robot.failed()`
+        # above is reference-FREE and says nothing about a robot that stumbles down a flight
+        # and barely catches itself.
+        self.track = (tracking.TrackingProbe(tracking_spec, hold_until_s=float(hold_until_s))
+                      if tracking_spec is not None else None)
         # Effort, smoothness, travel.
         self._torque_util_max = 0.0
         self._torque_sq = 0.0
@@ -236,7 +248,7 @@ class EpisodeAccumulator:
 
     # ------------------------------------------------------------------
     def fold(self, robot: Any, policy: Any, plan_class: str | None = None,
-             cmd: Any = None, scored: bool = True) -> None:
+             cmd: Any = None, scored: bool = True, is_replan: bool = False) -> None:
         """Fold one control step into the running sums.
 
         Called once per control step BEFORE the physics advance, so every folded frame is a
@@ -262,10 +274,18 @@ class EpisodeAccumulator:
                 re-plan that a classifier labelled, else ``None``.  ``None`` means no
                 classification THIS step -- most steps are not re-plans -- and is not a
                 fourth class.
+            is_replan: Whether a fresh plan appeared this step.  Passed separately from
+                ``plan_class``, which is ``None`` on every step when no classifier is
+                attached -- deriving the edge from it would put the whole episode in one
+                chunk on the clip arm and on every un-classified run.
         """
         data = robot.mj_data
         qpos = data.qpos
         self._fold_extremes(robot, self._steps)
+        # Before the `scored` early-out: a violation while settling is still a violation, and
+        # the probe makes the latched/scored split itself from the sim clock.
+        if self.track is not None:
+            self.track.fold(robot, policy, self._steps, is_replan=bool(is_replan))
         if not scored:
             # The hold still costs a step of the clock and of the episode's length, so the
             # counter advances; only the statistics above sit it out.
@@ -339,7 +359,7 @@ class EpisodeAccumulator:
 
         self._steps += 1
 
-    def fold_terminal(self, robot: Any) -> None:
+    def fold_terminal(self, robot: Any, policy: Any = None) -> None:
         """Fold the frame the episode ENDED on into the extremes, and stamp the end state.
 
         The loop folds before each physics advance and stops after one, so without this the
@@ -350,8 +370,18 @@ class EpisodeAccumulator:
 
         Args:
             robot: The MuJoCo ``Robot``, in its final state.
+            policy: The loaded policy, for the strict checks' served reference. ``None`` skips
+                them on this frame -- the running latch is unaffected, so an existing caller
+                that does not pass it loses only the terminal frame's crossing rather than the
+                whole column.
         """
         self._fold_extremes(robot, self._steps)
+        # And the strict checks, for the same reason the fall crossing is folded here: on a
+        # fall the loop breaks BEFORE `fold`, so the crossing frame is only ever seen here.
+        if self.track is not None and policy is not None:
+            self.track.fold(robot, policy, self._steps)
+        if self.track is not None:
+            self.track.finish()
         self._end_base_z = float(robot.mj_data.qpos[2])
         self._end_tilt = float(max(robot.tilt_from_upright()))
 
@@ -417,6 +447,18 @@ class EpisodeAccumulator:
             "failure_code": int(terrains.FAILURE_CODES[failure_code]
                                 if isinstance(failure_code, str) else failure_code),
             "first_fall_step": int(self._first_fall_step),
+            # The STRICT tracking checks. -1 / NaN when they were not turned on at all, which
+            # `schema.derive_success` distinguishes from "measured and never fired".
+            "first_violation_step": int(self.track.first_violation_step
+                                        if self.track is not None else -1),
+            "first_lateral_step": int(self.track.first_check_step["lateral"]
+                                      if self.track is not None else -1),
+            "first_height_step": int(self.track.first_check_step["height"]
+                                     if self.track is not None else -1),
+            "first_tilt_step": int(self.track.first_check_step["tilt"]
+                                   if self.track is not None else -1),
+            "track_reward_mean": (float(self.track.mean_step_reward)
+                                  if self.track is not None else float("nan")),
             "reached_target": int(self._target_step >= 0),
             "time_to_target_s": (float(self._target_step * self.dt)
                                  if self._target_step >= 0 else float("nan")),

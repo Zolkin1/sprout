@@ -70,7 +70,8 @@ for _d in (os.path.join(_HERE, "eval"), _HERE):
         sys.path.insert(0, _d)
 
 #: Bump on any column removal, rename or change of meaning.
-SCHEMA_VERSION: int = 1
+# 2: the per-chunk tracking-error block (`track_err`) and the strict violation columns.
+SCHEMA_VERSION: int = 2
 
 _F = "f4"
 _I = "i4"
@@ -99,6 +100,14 @@ ROLLOUT_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("truncated", _U8),           # clip_end / time_out
     ("censored", _U8),            # still running when the rollout hit its ceiling
     ("first_fall_step", _I),      # -1 = never crossed the fall predicate
+    # The STRICT, reference-relative checks. `first_fall_step` above is reference-FREE and
+    # says nothing about a robot that stumbles down a flight and barely catches itself;
+    # `terminal_reward(strict=True)` reads these.
+    ("first_violation_step", _I), # -1 = never; the union of the three below
+    ("first_lateral_step", _I),
+    ("first_height_step", _I),
+    ("first_tilt_step", _I),
+    ("track_reward_mean", _F),    # NaN when the checks were not turned on
     ("min_base_height_w", _F),
     ("max_tilt_rad", _F),
     # --- the SPATIAL goal (mdp.goal_region) --------------------------------------------
@@ -208,15 +217,23 @@ class ProprioRing:
             self.buf[m] = 0.0
 
 
-def terminal_reward(cols: dict[str, np.ndarray]) -> np.ndarray:
+def terminal_reward(cols: dict[str, np.ndarray], *, strict: bool = True) -> np.ndarray:
     """The sparse terminal reward, stated once so every consumer reads the same rule.
 
     Under the MDP this rollout serves: gamma = 1, reward zero everywhere but the terminal
     step, and ``V(s) = -P(fail | s)``.  So::
 
-        r_T =  0   the base entered the goal region before it ever crossed the fall
-                   predicate
-        r_T = -1   otherwise -- fell first, or survived without arriving
+        r_T =  0   the base entered the goal region before it ever FAILED
+        r_T = -1   otherwise -- failed first, or survived without arriving
+
+    **"Failed" is the fall crossing OR the strict tracking violation, whichever came first**
+    (``first_violation_step``; see ``transfer/deploy/tracking_error.py``).  The fall predicate
+    alone is reference-free -- pelvis low, or far from world upright -- and says nothing about
+    a robot that stumbles down a flight and barely catches itself, which is exactly the
+    behaviour a critic fitted on this reward must not be taught to like.  ``strict=False``
+    reproduces the fall-only rule, and a table written before the tracking columns existed
+    takes that path automatically, so every number published under the old rule stays
+    reproducible from the same data.
 
     The second clause is the load-bearing one.  If merely staying upright scored 0, standing
     still would score identically to climbing the staircase with none of the risk, and an
@@ -230,6 +247,8 @@ def terminal_reward(cols: dict[str, np.ndarray]) -> np.ndarray:
 
     Args:
         cols: Columns from :func:`read_rollout_episodes`.
+        strict: Count a tracking violation as a failure. Ignored when the table carries no
+            ``first_violation_step``.
 
     Returns:
         Float array in ``{-1.0, 0.0}``, one per episode.
@@ -237,14 +256,22 @@ def terminal_reward(cols: dict[str, np.ndarray]) -> np.ndarray:
     arrived = np.asarray(cols["reached_goal"]).astype(bool)
     fg = np.asarray(cols["first_goal_step"])
     ff = np.asarray(cols["first_fall_step"])
-    # WHICHEVER CAME FIRST. An episode that reaches the goal and then falls in the run-out
-    # did the task; one that falls and is later dragged across the line by a reset did not.
-    # This is `mjeval`'s convention -- it tests `robot.failed()` before the target every step
-    # and breaks on either -- and it is worth 17 points here: measured on a 298-episode
+    # WHICHEVER CAME FIRST. An episode that reaches the goal and then fails in the run-out
+    # did the task; one that fails and is later dragged across the line by a reset did not.
+    # This is `mjeval`'s convention -- it tests the failure predicate before the target every
+    # step and breaks on either -- and it is worth 17 points here: measured on a 298-episode
     # rollout, 51 episodes arrived and then fell, which a plain `arrived AND not terminated`
     # scored as failures. That is larger than any policy difference this is meant to resolve.
-    fell_first = (ff >= 0) & ((fg < 0) | (ff < fg))
-    return np.where(arrived & ~fell_first, 0.0, -1.0).astype(np.float32)
+    #
+    # `-1` means "never" on BOTH limbs, so the two are combined by a min over the non-negative
+    # entries; a plain `np.minimum` would return -1 the moment either limb never fired.
+    if strict and "first_violation_step" in cols:
+        fv = np.asarray(cols["first_violation_step"])
+        big = np.iinfo(np.int64).max
+        ff = np.minimum(np.where(ff < 0, big, ff), np.where(fv < 0, big, fv))
+        ff = np.where(ff == big, -1, ff)
+    failed_first = (ff >= 0) & ((fg < 0) | (ff < fg))
+    return np.where(arrived & ~failed_first, 0.0, -1.0).astype(np.float32)
 
 
 class RolloutOutcomeTable:
@@ -409,6 +436,36 @@ ROLLOUT_WINDOW_COLUMNS: tuple[tuple[str, str], ...] = (
     # unprojection odometry-free. Carried together so the twist stays one object;
     # `V_onboard` takes the angular half and drops the linear one.
     ("base_twist_yaw", "f4"),
+    # --- the per-step tracking ERROR of the PREVIOUS chunk -------------------------------
+    #
+    # `(K, NUM_FIXED_CHANNELS + nj)`, oldest first, as `transfer/deploy/tracking_error.py`
+    # lays it out. What the critic's QUALITY head regresses a return over, and what the
+    # strict failure checks are thresholded from.
+    #
+    # **`_prev` IS THE POINT, AND THE JOIN IS OFF BY ONE ROW.** A window is emitted at the
+    # re-plan that PRODUCES its `fm_plan`, and that chunk's consequences have not happened
+    # yet -- it goes on to drive the next K control steps. So the error carried here is the
+    # one the PREVIOUS chunk produced, and the reward for row `i`'s action is row `i+1`'s
+    # `track_err_prev`, joined within an episode on `replan_index`. That is the ordinary
+    # `(s_t, a_t, r_t)` storage shift, and the column is NAMED for it because storing it
+    # unnamed would be an off-by-one-chunk that fits, trains, and produces a plausible weak
+    # critic rather than an error.
+    #
+    # The re-plan is applied inside `_update_command`, i.e. inside `env.step`, so by the time
+    # the recorder folds this step the cursor is already on the NEW plan's node 0. The ring is
+    # therefore K+1 deep and the newest row -- the one belonging to the new chunk -- is
+    # dropped here, leaving exactly the K steps the previous chunk served.
+    #
+    # The ERROR VECTOR is stored, never a reward and never a boolean. Both bake a choice into
+    # the file: the kernel widths and weights would fix the reward, the bounds would fix the
+    # verdict. Storing rows keeps all of them an OFFLINE knob, so a threshold or a weight
+    # chosen after this recording is a relabel rather than a re-record -- which is the whole
+    # reason the checks are latched rather than terminating. It also makes the episode
+    # table's `first_violation_step` recomputable under any spec: re-plans tile the episode,
+    # so concatenating these blocks in `replan_index` order reconstructs the per-step error.
+    #
+    # Cost: ~2 kB/window at K=12, nj=29 against `extero`'s 15.6 kB, so about +13% on the file.
+    ("track_err_prev", "f4"),
 )
 
 ROLLOUT_WINDOW_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_WINDOW_COLUMNS)
@@ -432,6 +489,55 @@ PROPRIO_DIM: int = 64
 PROPRIO_HISTORY: int = 10
 
 
+class TrackErrRing:
+    """The tracking-error rows since the last re-plan, newest last.
+
+    Sibling of :class:`ProprioRing` and deliberately the same shape of object, because it has
+    the same three properties and each was got wrong somewhere before: kept at the CONTROL
+    rate rather than the re-plan rate, zeroed on reset so no window spans two episodes, and
+    read at the re-plan instant rather than reconstructed afterwards.
+
+    Depth is ``fm_update_every + 1``, and the extra row is the whole reason this is not a
+    plain ``ProprioRing``.  The re-plan is applied inside ``_update_command`` -- inside
+    ``env.step`` -- so by the time the recorder folds the step at which a window is emitted,
+    the cursor is already on the NEW plan's node 0 and that step's error belongs to the new
+    chunk.  A ring of depth ``K`` would therefore hand out ``K-1`` steps of the previous chunk
+    plus one of the new one: a mix belonging to neither action.  With ``K+1``, dropping the
+    newest row leaves exactly the ``K`` steps the previous chunk served.
+
+    See ``track_err_prev`` in :data:`ROLLOUT_WINDOW_COLUMNS` for the resulting one-row join
+    shift, which is deliberate and is named for.
+
+    Args:
+        n_envs: Environment count.
+        device: Where the buffer lives.
+        history: Rows kept; pass ``fm_update_every + 1``.
+        dim: Row width, ``NUM_FIXED_CHANNELS + num_joints``.
+    """
+
+    def __init__(self, n_envs: int, device, history: int, dim: int) -> None:
+        self.buf = torch.zeros(n_envs, int(history), int(dim), device=device)
+        self.history = int(history)
+
+    def push(self, row: torch.Tensor | None) -> None:
+        """Roll in this step's error row for every env.
+
+        Args:
+            row: ``[N, dim]``, or ``None`` before the generator's first plan -- in which case
+                nothing is rolled, so the ring holds zeros rather than a stale row repeated.
+        """
+        if row is None:
+            return
+        self.buf = torch.roll(self.buf, shifts=-1, dims=1)
+        self.buf[:, -1] = row
+
+    def invalidate(self, dones: torch.Tensor) -> None:
+        """Zero the ring for envs that just reset."""
+        ids = torch.nonzero(dones.reshape(-1)).flatten()
+        if ids.numel():
+            self.buf[ids] = 0.0
+
+
 class RolloutWindowWriter:
     """Streams per-re-plan windows to a chunked ``.h5``.
 
@@ -449,7 +555,8 @@ class RolloutWindowWriter:
 
     def __init__(self, path: str, *, num_windows: int, num_history: int, state_dim: int,
                  future_len: int, cmd_dim: int, extero_shape: tuple[int, int],
-                 proprio_hw: tuple[int, int], scan_dim: int = 0, attrs: dict | None = None,
+                 proprio_hw: tuple[int, int], scan_dim: int = 0,
+                 track_hw: tuple[int, int] | None = None, attrs: dict | None = None,
                  compression: str | None = "lzf") -> None:
         """Create the file and pre-size every dataset.
 
@@ -463,6 +570,9 @@ class RolloutWindowWriter:
             extero_shape: ``(T, K)`` per reading, from the generator's own contract.
             proprio_hw: ``(H, PROPRIO_DIM)`` proprioception ring, newest last.
             scan_dim: Privileged height-scan width, or 0 for none.
+            track_hw: ``(fm_update_every, NUM_FIXED_CHANNELS + nj)`` -- the WRITTEN block's
+                shape, one row per step of the previous chunk. ``None`` omits the column
+                rather than zero-filling it, because zeros read as "tracked perfectly".
             attrs: Provenance, JSON-encoded onto the root.
             compression: h5py compression for every dataset.
         """
@@ -487,6 +597,8 @@ class RolloutWindowWriter:
         }
         if int(scan_dim) > 0:
             shapes["height_scan"] = (num_windows, int(scan_dim))
+        if track_hw is not None:
+            shapes["track_err_prev"] = (num_windows, int(track_hw[0]), int(track_hw[1]))
         dtypes = dict(ROLLOUT_WINDOW_COLUMNS)
         self._keys = list(shapes)
         self._f = h5py.File(self.path, "w")
@@ -762,6 +874,11 @@ class RolloutEpisodeTracker:
             "truncated": truncated.astype(np.uint8),
             "censored": np.full(ids_np.size, int(bool(censored)), dtype=np.uint8),
             "first_fall_step": red["first_fall_step"],
+            "first_violation_step": red["first_violation_step"],
+            "first_lateral_step": red["first_lateral_step"],
+            "first_height_step": red["first_height_step"],
+            "first_tilt_step": red["first_tilt_step"],
+            "track_reward_mean": red["track_reward_mean"],
             "min_base_height_w": red["min_base_height_w"],
             "max_tilt_rad": red["max_tilt_rad"],
             "reached_goal": red["reached_goal"],

@@ -39,7 +39,7 @@ from .depth_obs import (
 from .scan_obs import assert_scan_specs_agree, describe as describe_scan_spec, is_privileged
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
 from .history import BatchedHistory
-from .quat_math_np import quat_apply, quat_inv
+from .quat_math_np import quat_apply, quat_inv, yaw_quat
 from .tracker_session import TrackerSession
 from .window_np import (
     base_pose_block_to_world,
@@ -327,6 +327,10 @@ class GenTrackerPolicy:
         self._lead_buf: deque = deque(maxlen=self.fm_lead_ticks + 1)
         #: The window the last create_obs served; see last_served_window.
         self._last_served_window: np.ndarray | None = None
+        #: The pose THAT window's base blocks are measured from, stashed with it because the
+        #: two are only meaningful together and the anchor a caller could reconstruct later
+        #: is a different one. See served_reference_w.
+        self._last_served_anchor: tuple[np.ndarray, np.ndarray] | None = None
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
         # Set here rather than in _reset_timing, which drains the WINDOW: these are the last
@@ -1468,6 +1472,82 @@ class GenTrackerPolicy:
         lifted = self.predicted_base_pose_w()
         return None if lifted is None else lifted[0]
 
+    def predicted_base_vel_w(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """The predicted window's reference base twist, lifted to the world frame.
+
+        FOR DIAGNOSTICS ONLY, like :meth:`predicted_base_pose_w`, and lifted the same way: the
+        ``base_vel`` block is ``quat_apply_inverse(q_yaw, v_world)`` for both halves, so the
+        return leg is a single ``quat_apply`` through the anchor's YAW. No translation term --
+        a velocity is a free vector, so only the rotation applies.
+
+        Returns:
+            ``([F, 3] linear, [F, 3] angular)`` in world, or ``None`` when there is no live
+            prediction or the window carries no ``base_vel`` block.
+        """
+        if not self._pred_valid:
+            return None
+        sl = window_block_slices(
+            len(self._fm_to_isaac), self.ctx.target_num_extra_frames, self.reference_blocks
+        ).get("base_vel")
+        if sl is None:
+            return None
+        block = np.asarray(self._pred[0, :, sl], dtype=np.float64)            # [F,6]
+        q = yaw_quat(np.asarray(self._anchor_quat, dtype=np.float64))
+        q = np.broadcast_to(q, block.shape[:-1] + (4,))
+        return quat_apply(q, block[..., 0:3]), quat_apply(q, block[..., 3:6])
+
+    def served_reference_w(self) -> dict[str, np.ndarray] | None:
+        """The reference the tracker was told to be at THIS step, in world coordinates.
+
+        This is the quantity a tracking error is measured against, and it is deliberately the
+        one accessor rather than three:
+
+        * it reads the **served** window (:meth:`last_served_window`), so it is what the policy
+          was actually handed -- not the raw plan, which under ``robot_now`` differs by a
+          re-anchoring, and not node 0, which under ``fm_update_every > 1`` is up to ``K-1``
+          steps stale and puts a sawtooth into every channel (see
+          :attr:`served_node_index`);
+        * it lifts through the anchor **stashed with that window**, so the clip arm and the
+          generator arm, and both ``window_anchor`` conventions, are one call site. A caller
+          reaching for ``_anchor_pos`` directly would be right on exactly one of the four
+          combinations.
+
+        Offset 0 of the served window is "now" by construction, whatever the re-plan period.
+
+        Returns:
+            ``{"base_pos_w", "base_quat_w" (xyzw), "base_lin_vel_w", "base_ang_vel_w",
+            "joint_pos"}`` for whichever blocks the window carries -- a dropped block is
+            ABSENT, never zero-filled, because a zero would be drawn and differenced as a
+            reference standing still at the origin. ``None`` before the first observation.
+
+        Raises:
+            ValueError: If the window carries no ``base_pose`` block. Every consumer of this
+                needs a pose, and there is no useful reduced answer.
+        """
+        if getattr(self, "_last_served_window", None) is None:
+            return None
+        nj, n_extra = len(self._fm_to_isaac), self.ctx.target_num_extra_frames
+        slices = window_block_slices(nj, n_extra, self.reference_blocks)
+        if "base_pose" not in slices:
+            raise ValueError(
+                "the served window carries no base_pose block, so there is no reference pose "
+                f"to measure against (blocks={list(self.reference_blocks)})")
+        node = np.asarray(self._last_served_window, dtype=np.float64)[
+            :window_dim(nj, n_extra, self.reference_blocks)]                  # offset 0 = now
+        anchor_pos, anchor_quat = self._last_served_anchor
+
+        pos, quat = base_pose_block_to_world(node[slices["base_pose"]], anchor_pos, anchor_quat)
+        out = {"base_pos_w": pos, "base_quat_w": quat}
+        if "base_vel" in slices:
+            twist = node[slices["base_vel"]]
+            q = yaw_quat(np.asarray(anchor_quat, dtype=np.float64))
+            out["base_lin_vel_w"] = quat_apply(q, twist[0:3])
+            out["base_ang_vel_w"] = quat_apply(q, twist[3:6])
+        if "joint_pos" in slices:
+            # Frame-invariant, so served verbatim -- and already in ISAAC joint order.
+            out["joint_pos"] = node[slices["joint_pos"]]
+        return out
+
     @property
     def served_node_index(self) -> int:
         """Absolute index of the window node being served this step (the cursor).
@@ -1590,7 +1670,8 @@ class GenTrackerPolicy:
         return self._build_obs(state, reference=reference,
                                window_anchor=self._clip_window_anchor(state, clip_tick))
 
-    def _stash_window(self, served: np.ndarray) -> np.ndarray:
+    def _stash_window(self, served: np.ndarray,
+                      anchor: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
         """Remember the window that went into THIS observation, and pass it through.
 
         The served window is the most diagnostic quantity in the loop and it was previously
@@ -1599,13 +1680,23 @@ class GenTrackerPolicy:
         moved on. A recorder that did that would be comparing its own arithmetic, not the
         runtime's.
 
+        The ANCHOR is stashed with it for the same reason and is not optional. A window's base
+        blocks are relative to a pose, that pose differs by arm and by convention (the
+        generator's re-plan latch, the clip's own latch, or the measured root under
+        ``robot_now``), and a caller that picked the wrong one would lift the window to a
+        plausible world pose displaced by the egomotion since the re-plan -- which is exactly
+        the class of bug ``data_logger`` had.
+
         Args:
             served: The window vector about to be assembled into the observation.
+            anchor: ``(pos, quat_xyzw)`` that window's base blocks are measured from.
 
         Returns:
             ``served``, unchanged.
         """
         self._last_served_window = served
+        self._last_served_anchor = (np.asarray(anchor[0], dtype=np.float64).copy(),
+                                    np.asarray(anchor[1], dtype=np.float64).copy())
         return served
 
     def last_served_window(self) -> np.ndarray:
@@ -1720,16 +1811,27 @@ class GenTrackerPolicy:
         default = self._trk.default_joint_angles
         inv_root = quat_inv(root_quat)
 
+        # The pose the served window's base blocks are ACTUALLY measured from, per arm and per
+        # convention. On the generator path under `plan` that is the re-plan latch; otherwise
+        # it is the measured root, because `_serve_nodes` has already re-anchored the plan onto
+        # it. The clip path's is resolved by `_clip_window_anchor` and arrives as
+        # `window_anchor`. Resolved here, beside the window it belongs to, so the two cannot be
+        # paired up wrongly by a caller later.
+        if window is None:
+            served = self._fm_reference_window(state)
+            served_anchor = ((self._anchor_pos, self._anchor_quat)
+                             if self._window_anchor == "plan" else (root_pos, root_quat))
+        else:
+            served_anchor = window_anchor or (root_pos, root_quat)
+            served = self._reference_window(window, *served_anchor)
+
         values = {
             "base_ang_vel": f64(state["base_ang_vel"]),
             "projected_gravity": quat_apply(inv_root, np.array([0.0, 0.0, -1.0])),
             "joint_pos": f64(state["joint_pos"]) - default,
             "joint_vel": f64(state["joint_vel"]),
             "actions": np.asarray(self._trk.action_isaac, dtype=np.float64),
-            "reference_window": self._stash_window(
-                self._fm_reference_window(state) if window is None
-                else self._reference_window(window, *(window_anchor
-                                                      or (root_pos, root_quat)))),
+            "reference_window": self._stash_window(served, served_anchor),
             # The joystick-level command over the same offsets. Deliberately separate from
             # the reference window so it stays clean: at deploy it comes from the joystick
             # or a scripted profile, not the generator. A clip reference supplies each
@@ -1914,6 +2016,11 @@ class GenTrackerPolicy:
             # plans from different episodes share an id in one recording.
             self._last_plan = None
             self._last_reference_window = None
+            # The served window and the anchor it is paired with describe the previous
+            # episode's last step; served_reference_w must say "nothing yet", not lift a stale
+            # node against a stale anchor into a perfectly plausible world pose.
+            self._last_served_window = None
+            self._last_served_anchor = None
             self._reset_timing()
 
     def get_dt(self) -> float:

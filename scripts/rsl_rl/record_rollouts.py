@@ -41,6 +41,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata as metadata
+import json
+import math
 import os
 import sys
 import time
@@ -64,6 +66,7 @@ if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 import cli_args  # noqa: E402
 import rollout_outcomes as ro  # noqa: E402
+from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error  # noqa: E402
 from provenance import git_snapshot  # noqa: E402
 
 parser = argparse.ArgumentParser(description=__doc__,
@@ -93,6 +96,12 @@ parser.add_argument("--goal_regions", default="",
                     help="goal_regions.json from build_goal_regions.py. REQUIRED -- see the "
                          "module docstring for why a rollout without one cannot carry a "
                          "reward that is not maximised by standing still.")
+parser.add_argument("--tracking_spec", default="",
+                    help="tracking_spec.json from measure_tracking_error.py --stage report. "
+                         "Supplies the strict lateral/height/tilt bounds and the reward kernel "
+                         "widths. Without one the BOOTSTRAP placeholders are used and the run "
+                         "says so -- the recorded error rows make the thresholds an OFFLINE "
+                         "knob, so a spec chosen later is a relabel rather than a re-record.")
 parser.add_argument("--min_height", type=float, default=0.40,
                     help="base_fallen's world-z threshold, m. 0.40 rather than the "
                          "historical 0.50: the deepest jump_off_front clip's own pelvis "
@@ -313,7 +322,7 @@ def _twist_yaw(rd):
                       quat_apply_inverse(q, rd.root_ang_vel_w)], dim=-1)
 
 
-def _emit(cmd, tracker, family_codes, scan_sensor, env, ring) -> dict | None:
+def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None) -> dict | None:
     """Assemble one batch of windows for the envs that re-planned this step.
 
     Everything here is read at ONE instant -- after ``env.step`` has run
@@ -327,6 +336,7 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env, ring) -> dict | None:
         scan_sensor: Privileged scan sensor name, or ``None``.
         env: The unwrapped env.
         ring: The :class:`ProprioRing`.
+        track_ring: The :class:`TrackErrRing`, or ``None`` when the strict checks are off.
 
     Returns:
         The batch, or ``None`` when no env re-planned.
@@ -371,6 +381,11 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env, ring) -> dict | None:
     batch["goal_lateral_m"] = cpu(lat[idx]).astype(np.float32)
     batch["goal_height_err_m"] = cpu(hz[idx]).astype(np.float32)
     batch["proprio"] = cpu(ring.buf[idx]).astype(np.float32)
+    if track_ring is not None:
+        # Drop the NEWEST row: the re-plan is applied inside `env.step`, so the step just
+        # folded is already served by the new chunk. What is left is exactly the K steps the
+        # PREVIOUS chunk drove -- hence the column's name and its one-row join shift.
+        batch["track_err_prev"] = cpu(track_ring.buf[idx, :-1]).astype(np.float32)
     batch["base_twist_yaw"] = cpu(_twist_yaw(tracker.accum.rd)[idx]).astype(np.float32)
     if scan_sensor is not None:
         from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: PLC0415
@@ -443,6 +458,20 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         accum = accumulate.EpisodeAccumulator(env, dt=float(u.step_dt),
                                               fall_min_height=float(args_cli.min_height))
         accum.attach_goal_region(spec)
+        # The STRICT tracking checks. Latched, never terminating: the episode runs on, so one
+        # rollout yields both the strict and the loose verdict and a threshold change
+        # afterwards is an offline relabel rather than a re-collection. `--tracking_spec`
+        # supplies fitted bounds; without one the BOOTSTRAP placeholders are used and said so,
+        # on the same terms as a bootstrap goal region.
+        _spec = tracking_error.BOOTSTRAP_SPEC
+        if getattr(args_cli, "tracking_spec", ""):
+            with open(args_cli.tracking_spec) as _f:
+                _spec = tracking_error.TrackingErrorSpec.from_dict(json.load(_f))
+        print(f"[tracking] lateral {_spec.max_lateral_m:.3f} m, height {_spec.max_height_m:.3f} m, "
+              f"tilt {math.degrees(_spec.max_tilt_rad):.1f} deg"
+              + ("  (BOOTSTRAP placeholders -- fit them before publishing a strict number)"
+                 if _spec.is_bootstrap else f"  (from {args_cli.tracking_spec})"))
+        accum.attach_tracking(_spec)
         table = ro.RolloutOutcomeTable(family_names=family_names)
         term_cfg = u.event_manager.get_term_cfg("reset_on_clip")
         tracker = ro.RolloutEpisodeTracker(term_cfg.func, env=u, accum=accum, table=table,
@@ -466,6 +495,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
             scan_hw = [int(scan_spec["height"]), int(scan_spec["width"])]
         extero = cmd._lagged_extero()
         ring = ProprioRing(int(u.num_envs), u.device, ro.PROPRIO_HISTORY, ro.PROPRIO_DIM)
+        # The per-chunk tracking-error block. Depth is `fm_update_every` exactly -- the steps
+        # one emitted chunk drove -- so a window's `track_err` is the error the chunk in the
+        # SAME row produced, not the previous one's.
+        track_dim = tracking_error.NUM_FIXED_CHANNELS + int(u.scene.articulations["robot"].num_joints)
+        track_hw = (int(cmd.cfg.fm_update_every), track_dim)
+        # K+1 deep, one row deeper than what is WRITTEN: the newest row belongs to the chunk
+        # just emitted, whose consequences have not happened yet. See `track_err_prev`.
+        track_ring = ro.TrackErrRing(int(u.num_envs), u.device, track_hw[0] + 1, track_hw[1])
         os.makedirs(out_dir, exist_ok=True)
         stem = os.path.join(out_dir, f"rollout_{os.path.basename(log_dir)}")
         win_path, ep_path = stem + ".h5", stem + ".episodes.h5"
@@ -486,13 +523,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                                "projected_gravity_b(3)"],
             "base_twist_yaw_layout": ["lin(3)", "ang(3)", "frame=yaw_quat(root_quat_w)"],
             "height_scan_hw": scan_hw,
+            # WHAT THE STRICT COLUMNS MEAN. Without this the file's `first_violation_step`
+            # and `track_reward_mean` are only interpretable by knowing which code ran, which
+            # is the thing every other contract in this tree refuses. The error ROWS are
+            # spec-independent, so a later spec is a relabel -- but the columns written HERE
+            # were written under THIS one and have to say so.
+            "tracking_spec": _spec.to_dict(),
+            "tracking_spec_path": (os.path.abspath(args_cli.tracking_spec)
+                                   if args_cli.tracking_spec else ""),
+            # Channel names of one `track_err_prev` row, for the same reason `proprio_layout`
+            # is stamped: the block is (K, NUM_FIXED + nj) and a reader that guessed the order
+            # would get a plausible number from the wrong channel.
+            "track_err_layout": list(
+                tracking_error.error_channel_names(
+                    int(u.scene.articulations["robot"].num_joints))),
+            "track_err_is_previous_chunk": True,
         }
         print(f"[rollout] goal region {args_cli.goal_regions} (default margin "
               f"{spec.default.approach_margin_m} m, half-width {spec.default.half_width_m} m, "
               f"height {spec.default.height_tol_m} m)")
         _assert_sampler_is_stochastic(cmd)
         print(f"[rollout] F={cmd.ctx.F} D={cmd.ctx.D} N={cmd.ctx.N} K={cmd.cfg.fm_update_every} "
-              f"extero={tuple(extero.shape[1:])} scan={scan_dim}")
+              f"extero={tuple(extero.shape[1:])} scan={scan_dim} track_err={track_hw}")
 
         obs = env.get_observations()
         steps = 0
@@ -503,7 +555,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
             state_dim=int(cmd.ctx.D), future_len=int(cmd.ctx.F), cmd_dim=int(cmd.ctx.cmd_dim),
             extero_shape=(int(extero.shape[1]), int(extero.shape[2])),
             proprio_hw=(ro.PROPRIO_HISTORY, ro.PROPRIO_DIM), scan_dim=scan_dim,
-            attrs=prov,
+            track_hw=track_hw, attrs=prov,
         ) as writer:
             with torch.inference_mode():
                 want_ep = int(args_cli.num_episodes) or None
@@ -523,7 +575,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     # critic is being asked to learn.
                     ring.invalidate(dones)
                     ring.push(tracker.accum.rd)
-                    batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring)
+                    if track_ring is not None:
+                        # Same order and the same reason as the proprio ring: zero the envs
+                        # that reset BEFORE pushing, or the first windows of a new episode
+                        # carry the previous one's error rows -- which for a fall is exactly
+                        # the signature the critic is being asked to learn.
+                        track_ring.invalidate(dones)
+                        track_ring.push(tracker.accum.last_track_err)
+                    batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring, track_ring)
                     if batch is not None:
                         writer.write_batch(batch)
                     if steps % 500 == 0:

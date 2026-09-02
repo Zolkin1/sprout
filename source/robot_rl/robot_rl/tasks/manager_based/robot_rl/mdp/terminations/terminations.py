@@ -291,6 +291,16 @@ def base_fallen(
     Returns:
         Boolean ``[num_envs]`` -- True for envs that should terminate.
     """
+    # ``TODO(align-tilt-convention)``: the orientation half is PER-AXIS, while the eval
+    # harness's derived ``fell`` column uses the TOTAL angle from upright -- so this
+    # termination and the column meant to mirror it disagree, measured at 0.045 against 0.054
+    # on one rollout. Over 2e6 uniform orientations the per-axis test is a strict SUBSET of
+    # the total-angle one (zero counter-examples), they differ on 1.54% of the sphere, and the
+    # worst pose this admits is 75.6 deg total. Aligning is monotone -- it can only fire
+    # earlier -- but it changes WHEN episodes end and therefore every recording and every
+    # published rate, so it is a deliberate open item rather than a silent edit. The strict
+    # reference-relative checks (``mdp.tracking_error``) are the primary criterion now; this
+    # is the backstop for a reference that is broken or absent.
     asset: Articulation = env.scene[asset_cfg.name]
     too_low = wp.to_torch(asset.data.root_pos_w)[:, 2] < min_height
     tilted = base_orientation_from_upright(env, roll_limit_deg, pitch_limit_deg, asset_cfg)

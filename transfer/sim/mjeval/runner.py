@@ -177,6 +177,13 @@ class ArmRun:
     steer_kp: float = 0.0
     steer_wz_max: float = STEER_WZ_MAX
     cmd_hold_s: float = terrains.CMD_HOLD_S
+    #: tracking_spec.json for the STRICT checks; "" leaves them off entirely.
+    tracking_spec: str = ""
+    #: End an episode at the first strict violation. A BUDGET decision, not a semantic one --
+    #: the verdict is `schema.derive_success` either way, and `success_strict` is identical
+    #: with and without it. On for a collection run, where only pre-latch states are used and
+    #: a K=4 selector spends ~4 x 95 ms per chunk carrying an already-lost episode.
+    stop_on_violation: bool = False
     zero_noise: bool = True
     fm_seed: int = 0
     shards: int = 1
@@ -543,7 +550,8 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 recorder=None, steer_kp: float = 0.0,
                 steer_wz_max: float = STEER_WZ_MAX,
                 cfg_hold: float = terrains.CMD_HOLD_S,
-                probe=None) -> tuple[str, str, Any]:
+                probe=None, tracking_spec=None,
+                stop_on_violation: bool = False) -> tuple[str, str, Any]:
     """One deterministic trial: spawn, drive at ``cmd``, and stop on a fall, the target or time.
 
     **Three orderings inside the loop are load-bearing.**  The fall test runs BEFORE the target
@@ -569,6 +577,13 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             ``view_cell.py`` passes one to capture a replayable trajectory; because the episode
             is deterministic, the captured re-run reproduces its table row exactly, which is
             what makes the replay THE episode rather than a similar one.
+        tracking_spec: A ``deploy.tracking_error.TrackingErrorSpec`` turning on the STRICT
+            checks, or ``None`` to leave them off. LATCHED, not terminating (unless
+            ``stop_on_violation``), so one run yields the strict and the loose verdict both.
+        stop_on_violation: End the episode at the first strict violation. A BUDGET flag, not a
+            semantic one: the verdict comes from ``schema.derive_success`` either way and
+            ``success_strict`` is identical with and without it, so the only difference is that
+            the loose columns stop being available for that episode.
         probe: Optional ``(robot, policy, state, is_replan) -> None``, called once per control
             step at the same point as ``recorder`` but ALSO handed the state dict the policy
             was just given, and told whether this step carried a re-plan.  That is what the
@@ -593,7 +608,9 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
     _reset_episode_state(policy, fm_lag)
 
     acc = accumulate.EpisodeAccumulator(course, cmd, policy.get_dt(), rig.act_ids,
-                                        rig.effort_limits, rig.total_mass)
+                                        rig.effort_limits, rig.total_mass,
+                                        tracking_spec=tracking_spec,
+                                        hold_until_s=float(cfg_hold))
     # The command is rebuilt per step only when steering; otherwise it is the constant the
     # training clips hold, and `live_cmd is cmd` keeps that path allocation-free.
     live_cmd = cmd
@@ -638,7 +655,8 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                     window = policy.predicted_window()
                     if window is not None:
                         plan_class = classifier.label(window)
-            acc.fold(robot, policy, plan_class, cmd=live_cmd, scored=not holding)
+            acc.fold(robot, policy, plan_class, cmd=live_cmd, scored=not holding,
+                     is_replan=is_replan)
             # Fired at the same point as the fold, so a captured frame is one the policy
             # actually acted on rather than the state after an advance it never saw.  `None`
             # by default and therefore free: the sweep pays nothing for the viewer's hook.
@@ -646,6 +664,12 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 recorder(robot, policy)
             if probe is not None:
                 probe(robot, policy, state, is_replan)
+            # BUDGET-ONLY early exit. Placed after the fold, so this step is latched and
+            # scored exactly as it would be without the flag -- the verdict is unchanged and
+            # only the steps that would have followed are skipped.
+            if stop_on_violation and acc.track is not None and acc.track.violated:
+                verdict, failure = "violation", ""
+                break
             for _ in range(rig.decim):
                 robot.step()
             # The traversal gate is the second half of "got through": these lanes are finite in
@@ -657,7 +681,7 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 break
     except KeyboardInterrupt:
         verdict, failure = "interrupted", ""
-    acc.fold_terminal(robot)
+    acc.fold_terminal(robot, policy)
     return verdict, failure, acc
 
 

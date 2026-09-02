@@ -68,7 +68,8 @@ import terrains  # noqa: E402
 #: does not know rather than reading a renamed column as its old self.
 SCHEMA_VERSION: int = 1
 #: Bump on a purely additive column.  A reader may ignore columns it does not know.
-SCHEMA_MINOR: int = 0
+#: 1: the strict tracking checks (first_violation_step and friends).
+SCHEMA_MINOR: int = 1
 
 _F = "f4"
 _I = "i4"
@@ -94,6 +95,21 @@ MJ_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("verdict", _U8),             # terrains.VERDICT_CODES
     ("failure_code", _U8),        # terrains.FAILURE_CODES -- which predicate fired
     ("first_fall_step", _I),      # -1 = never crossed the fall predicate
+    # --- the STRICT tracking checks (transfer/deploy/tracking_error.py) -----------------
+    #
+    # `robot.failed()` is reference-FREE -- pelvis below the scene minimum, or 70 deg from
+    # world upright -- so it says nothing about a robot that stumbles down a flight and
+    # barely catches itself. These carry the reference-relative checks against the SERVED
+    # node: lateral, height and tilt. All -1 when the run did not turn them on, which
+    # `derive_success` distinguishes from "measured and never fired".
+    #
+    # LATCHED, NEVER TERMINATING, so one run yields both the strict and the loose verdict and
+    # a threshold change afterwards is an offline relabel.
+    ("first_violation_step", _I),
+    ("first_lateral_step", _I),
+    ("first_height_step", _I),
+    ("first_tilt_step", _I),
+    ("track_reward_mean", _F),    # NaN when the checks were off
     # --- target ------------------------------------------------------------------------
     ("reached_target", _U8),
     ("time_to_target_s", _F),     # NaN if never
@@ -113,6 +129,17 @@ MJ_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     # --- robot state -------------------------------------------------------------------
     ("min_base_height_w", _F),
     ("max_base_height_w", _F),    # what the traversal gate is read against
+    # ``TODO(align-tilt-convention)``: this is ``max(|roll|, |pitch|)``, a PER-AXIS maximum,
+    # while the Isaac table's identically named column is the TOTAL angle from upright
+    # (``eval/accumulate._tilt``). So the two harnesses' ``max_tilt_rad`` are not the same
+    # quantity, which quietly undercuts this module's "diffable rather than merely similar"
+    # claim. Measured over 2e6 uniform orientations: the per-axis 70 deg test is a strict
+    # SUBSET of the total-angle one (zero counter-examples), they disagree on 1.54% of the
+    # sphere, and the worst pose per-axis admits is 75.6 deg total. Aligning them is therefore
+    # MONOTONE -- it can only ever call a fall earlier -- but it changes a published column's
+    # MEANING and so needs a SCHEMA_VERSION bump, which invalidates every table already on
+    # disk. Deferred deliberately, not overlooked; the strict tracking checks above are now
+    # the primary criterion and this is the backstop.
     ("max_tilt_rad", _F),
     ("end_base_height_w", _F),
     ("end_tilt_rad", _F),
@@ -262,18 +289,30 @@ def read_table(path: str) -> tuple[dict[str, np.ndarray], dict]:
     return cols, attrs
 
 
-def derive_success(cols: dict[str, np.ndarray]) -> np.ndarray:
+def derive_success(cols: dict[str, np.ndarray], *, strict: bool = True) -> np.ndarray:
     """The success rule, stated once so the report can print it verbatim.
 
     **An episode succeeds when its root entered the goal rectangle AND the traversal gate
-    passed.**  Both halves are needed: the courses are finite in lateral extent while the floor
-    is not, so a robot that drifts wide reaches the target without ever touching the terrain,
-    and the gate -- 80% of the flight height, in the course's own direction -- is what excludes
-    it.  The runner tests ``robot.failed()`` before the target every step, so an episode that
-    face-plants across the line is a fall and is already excluded by ``verdict``.
+    passed AND it had not already FAILED.**  Each clause is load-bearing: the courses are
+    finite in lateral extent while the floor is not, so a robot that drifts wide reaches the
+    target without ever touching the terrain, and the gate -- 80% of the flight height, in the
+    course's own direction -- is what excludes it.
+
+    ``verdict`` already carries the fall half, because the runner tests ``robot.failed()``
+    before the target every step and breaks on either: an episode that face-plants across the
+    line is a ``fall``.  That is FIRST-EVENT ordering, and it is the same rule
+    ``scripts/rsl_rl/eval/schema.arrived_before_failing`` applies on the Isaac side -- the two
+    harnesses now agree by construction rather than by coincidence.
+
+    ``strict`` adds the tracking violation to what counts as failing.  It is applied HERE
+    rather than in the runner because the checks are LATCHED and not terminating: the episode
+    ran on, so one table yields both verdicts and moving a threshold is an offline relabel.
 
     Args:
         cols: Columns from :func:`read_table`.
+        strict: Count a strict tracking violation before arrival as a failure.  Ignored on a
+            table that carries no ``first_violation_step`` -- an old file then reads under the
+            loose rule, which is what it was measured under.
 
     Returns:
         Float array, 1.0 where the episode succeeded and 0.0 elsewhere.  Float rather than
@@ -283,4 +322,11 @@ def derive_success(cols: dict[str, np.ndarray]) -> np.ndarray:
     ok = (verdict == terrains.VERDICT_CODES["success"])
     ok &= np.asarray(cols["reached_target"]).astype(bool)
     ok &= np.asarray(cols["traversed"]).astype(bool)
+    if strict and "first_violation_step" in cols:
+        # A violation ANY TIME before the episode ended: `verdict == success` already means
+        # the robot arrived and did not fall first, so the only thing left to exclude is a
+        # latch that fired on the way there. There is no arrival step in this table to compare
+        # against -- `time_to_target_s` is the arrival and the runner breaks on it, so every
+        # latched step necessarily precedes it.
+        ok &= ~(np.asarray(cols["first_violation_step"]) >= 0)
     return ok.astype(float)

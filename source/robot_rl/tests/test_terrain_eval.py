@@ -1352,11 +1352,23 @@ if __name__ == "__main__":
 import report  # noqa: E402
 
 
-def _fake_cell(n=4, *, reached=None, fell_bits=None, with_goal=True, steps=None):
+def _fake_cell(n=4, *, reached=None, fell_bits=None, with_goal=True, steps=None,
+               goal_step=None, fall_step=None, viol_step=None):
     """A minimal cell dict shaped like `load_cell`'s output.
 
     Only the columns `derived_columns` reads are present; anything it starts reading that is
     absent here fails loudly, which is the intent.
+
+    Args:
+        goal_step: ``first_goal_step`` per episode. Defaults to 100 where ``reached`` and -1
+            elsewhere -- an arrival with no step index is not a state a real table can be in.
+        fall_step: ``first_fall_step``; -1 (never) by default. This is the DERIVED fall
+            crossing and is independent of ``fell_bits``, which is the termination bit -- the
+            success rule reads the former, because only it carries an ORDERING against the
+            goal.
+        viol_step: ``first_violation_step``; -1 by default. Omit the column entirely by
+            passing ``False``, which is what a table written before the strict checks looks
+            like.
     """
     z = lambda: np.zeros(n)  # noqa: E731
     d = {
@@ -1376,10 +1388,19 @@ def _fake_cell(n=4, *, reached=None, fell_bits=None, with_goal=True, steps=None)
         "event_observed": np.zeros(n, dtype=np.uint8),
         "terrain_end_step": np.full(n, 200),
     }
+    d["first_fall_step"] = (np.full(n, -1, dtype=np.int64) if fall_step is None
+                            else np.asarray(fall_step, dtype=np.int64))
+    if viol_step is not False:
+        d["first_violation_step"] = (np.full(n, -1, dtype=np.int64) if viol_step is None
+                                     else np.asarray(viol_step, dtype=np.int64))
     if with_goal:
         d["reached_goal"] = (np.ones(n, dtype=np.uint8) if reached is None
                              else np.asarray(reached, dtype=np.uint8))
         d["min_dist_to_goal_m"] = z()
+        if goal_step is None:
+            d["first_goal_step"] = np.where(d["reached_goal"].astype(bool), 100, -1).astype(np.int64)
+        else:
+            d["first_goal_step"] = np.asarray(goal_step, dtype=np.int64)
     meta = {"cell": "fm__train__x", "termination_terms": ["time_out", "clip_end", "base_fallen"]}
     return {"data": d, "meta": meta}
 
@@ -1393,12 +1414,48 @@ def test_a_robot_that_survived_but_never_arrived_is_NOT_a_success():
     assert report.derived_columns(cell, {}, "legacy_temporal")["success"].tolist() == [1.0] * 4
 
 
-def test_arriving_does_not_rescue_an_episode_that_fell():
-    """Success is `arrived AND not failed`, not `arrived`."""
-    bits = np.zeros(3, dtype=np.uint16)
-    bits[1] = 1 << 2                       # base_fallen, index 2 in termination_terms
-    out = report.derived_columns(_fake_cell(3, reached=[1, 1, 1], fell_bits=bits), {}, "spatial")
-    assert out["success"].tolist() == [1.0, 0.0, 1.0]
+def test_success_is_decided_by_FIRST_EVENT_ordering_not_by_the_termination_bit():
+    """Arriving before falling is a success; falling before arriving is not.
+
+    **This replaces `arrived AND not failed`, which was wrong in one direction.** That rule
+    failed any episode whose fall termination bit was set regardless of WHEN it fired, so an
+    episode that reached the goal and then fell in the run-out scored a failure here while
+    `rollout_outcomes.terminal_reward` scored it a success -- on 51 of 298 episodes of one
+    measured rollout, and `d36e59c1` measured the same first-event change moving mjeval's
+    success 48.0% -> 65.1%. Two arms cannot be compared under two success rules.
+
+    The termination bit is set identically in both episodes below; only the ORDER differs.
+    """
+    bits = np.full(2, 1 << 2, dtype=np.uint16)     # base_fallen, index 2, on BOTH
+    cell = _fake_cell(2, reached=[1, 1], fell_bits=bits,
+                      goal_step=[10, 40], fall_step=[40, 10])
+    out = report.derived_columns(cell, {}, "spatial")
+    assert out["success"].tolist() == [1.0, 0.0], "first-event ordering was not applied"
+    # `failed` still reports the termination bit, unfolded, so the two are separable.
+    assert out["failed"].tolist() == [1.0, 1.0]
+
+
+def test_the_strict_checks_only_ever_REMOVE_successes_and_are_flagged_when_absent():
+    """`success_strict` is `success` minus the episodes that violated before arriving.
+
+    Reported side by side rather than folded together, because the pair is the whole point:
+    the difference between them is what the tracking checks cost, and a cell written before
+    they existed must be distinguishable from one where nothing ever fired.
+    """
+    cell = _fake_cell(3, reached=[1, 1, 1], goal_step=[10, 10, 10],
+                      viol_step=[-1, 5, 40])
+    out = report.derived_columns(cell, {}, "spatial")
+    #                      no violation | violated BEFORE arriving | violated AFTER arriving
+    assert out["success"].tolist() == [1.0, 1.0, 1.0]
+    assert out["success_strict"].tolist() == [1.0, 0.0, 1.0]
+    assert out["strict_checks_active"].tolist() == [1.0] * 3
+
+    # A table with no tracking columns at all: the two rules coincide by construction, and
+    # the flag says so rather than letting a reader mistake it for "nothing ever fired".
+    old = report.derived_columns(_fake_cell(3, reached=[1, 1, 1], viol_step=False), {},
+                                 "spatial")
+    assert old["success"].tolist() == old["success_strict"].tolist() == [1.0] * 3
+    assert old["strict_checks_active"].tolist() == [0.0] * 3
 
 
 def test_success_does_not_depend_on_steps_survived():

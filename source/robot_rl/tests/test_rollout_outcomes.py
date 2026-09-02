@@ -22,6 +22,7 @@ are what stop it drifting back into two.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -42,7 +43,12 @@ def _row(**over):
         "episode_uid": 0, "env_id": 0, "clip_id": 0, "terrain_id": -1, "family_code": 0,
         "start_step": 0, "last_usable_step": 300, "n_replans": 25,
         "steps_survived": 299, "terminated": 0, "truncated": 1, "censored": 0,
-        "first_fall_step": -1, "min_base_height_w": 0.75, "max_tilt_rad": 0.1,
+        "first_fall_step": -1,
+        # Schema v2's strict checks. Default "never fired", so every existing test keeps
+        # measuring the loose rule it was written for.
+        "first_violation_step": -1, "first_lateral_step": -1, "first_height_step": -1,
+        "first_tilt_step": -1, "track_reward_mean": float("nan"),
+        "min_base_height_w": 0.75, "max_tilt_rad": 0.1,
         "reached_goal": 1, "first_goal_step": 200, "min_dist_to_goal_m": 0.0,
         "goal_downrange_m": 0.0, "goal_lateral_m": 0.0, "goal_height_err_m": 0.0,
         "max_goal_downrange_m": 0.0,
@@ -322,3 +328,106 @@ def test_goal_travel_is_recorded_so_a_backwards_family_cannot_hide():
     # say the first one meant nothing.
     assert ro.terminal_reward(cols).tolist() == [0.0, 0.0]
     assert cols["spawned_in_goal"].tolist() == [1, 0]
+
+
+# ----------------------------------------------------------------------------------------
+# Schema v2: the per-chunk tracking-error block and the strict failure limb.
+# ----------------------------------------------------------------------------------------
+def test_the_track_err_ring_drops_the_new_chunks_first_row():
+    """K+1 deep, newest last, and the WRITTEN block is `buf[:, :-1]`.
+
+    The re-plan is applied inside ``env.step``, so the step folded at the emit instant is
+    already served by the NEW chunk. A ring of depth K would hand out K-1 steps of the
+    previous chunk plus one of the new one -- a mix belonging to neither action, and one that
+    would fit, train, and produce a plausible weak critic rather than an error.
+    """
+    import torch
+
+    nj, k, n = 29, 12, 4
+    dim = _TRACK_DIM(nj)
+    ring = ro.TrackErrRing(n, "cpu", k + 1, dim)
+    for step in range(3 * k):
+        ring.push(torch.full((n, dim), float(step)))
+    last = 3 * k - 1
+    assert float(ring.buf[0, -1, 0]) == last, "newest row is not last"
+    written = ring.buf[:, :-1]
+    assert written.shape[1] == k, "the written block is not one chunk wide"
+    assert [float(v) for v in written[0, :, 0]] == [float(last - k + i) for i in range(k)], (
+        "the written block is not exactly the K steps before the emit instant")
+
+    ring.invalidate(torch.tensor([1, 0, 0, 0]))
+    assert float(ring.buf[0].abs().max()) == 0.0, "a reset env kept its rows"
+    assert float(ring.buf[1].abs().max()) > 0.0, "invalidate zeroed an env that did not reset"
+
+    # Before the generator's first plan there is no row; pushing None must be a NO-OP rather
+    # than repeating the last row, which would look like a robot holding a constant error.
+    ring.push(None)
+    assert float(ring.buf[0].abs().max()) == 0.0
+
+
+def _TRACK_DIM(num_joints: int) -> int:
+    """Width of one error row, from the shared contract."""
+    from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
+
+    return tracking_error.NUM_FIXED_CHANNELS + int(num_joints)
+
+
+def test_terminal_reward_strict_adds_the_violation_and_old_tables_fall_back():
+    """The strict limb only ever REMOVES successes, and a v1 table reads under the loose rule.
+
+    The fall-only rule stays reachable so every number published before the tracking checks
+    existed is still reproducible from the same data -- which is the whole reason the checks
+    are latched rather than terminating.
+    """
+    cols = {
+        "reached_goal": np.array([1, 1, 1, 0]),
+        "first_goal_step": np.array([10, 40, 10, -1]),
+        "first_fall_step": np.array([-1, 10, -1, -1]),
+        #             clean | fell first | violated BEFORE arriving | never arrived
+        "first_violation_step": np.array([-1, -1, 5, -1]),
+    }
+    assert ro.terminal_reward(cols, strict=False).tolist() == [0.0, -1.0, 0.0, -1.0]
+    assert ro.terminal_reward(cols, strict=True).tolist() == [0.0, -1.0, -1.0, -1.0]
+
+    old = {k: v for k, v in cols.items() if k != "first_violation_step"}
+    assert ro.terminal_reward(old, strict=True).tolist() == [0.0, -1.0, 0.0, -1.0]
+
+
+def test_a_violation_AFTER_arriving_is_still_a_success():
+    """First-event ordering applies to the strict limb exactly as it does to the fall."""
+    cols = {
+        "reached_goal": np.array([1]),
+        "first_goal_step": np.array([10]),
+        "first_fall_step": np.array([-1]),
+        "first_violation_step": np.array([40]),
+    }
+    assert ro.terminal_reward(cols, strict=True).tolist() == [0.0]
+
+
+def test_the_window_writer_sizes_the_track_err_block():
+    """`track_hw` is optional, and omitting it leaves the column out rather than zero-filling.
+
+    A zero-filled block would be read by the critic as "tracked perfectly for the whole
+    chunk", which is the most flattering possible wrong answer.
+    """
+    import tempfile
+
+    import h5py
+
+    dim = _TRACK_DIM(29)
+    with tempfile.TemporaryDirectory() as d:
+        on = os.path.join(d, "on.h5")
+        with ro.RolloutWindowWriter(on, num_windows=2, num_history=4, state_dim=44,
+                                    future_len=64, cmd_dim=3, extero_shape=(2, 16),
+                                    proprio_hw=(10, 64), track_hw=(12, dim), attrs={}):
+            pass
+        with h5py.File(on, "r") as f:
+            assert f["track_err_prev"].shape == (2, 12, dim)
+
+        off = os.path.join(d, "off.h5")
+        with ro.RolloutWindowWriter(off, num_windows=2, num_history=4, state_dim=44,
+                                    future_len=64, cmd_dim=3, extero_shape=(2, 16),
+                                    proprio_hw=(10, 64), attrs={}):
+            pass
+        with h5py.File(off, "r") as f:
+            assert "track_err_prev" not in f

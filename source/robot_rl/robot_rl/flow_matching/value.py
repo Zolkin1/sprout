@@ -97,6 +97,54 @@ class ValueInputs:
     context: torch.Tensor | None = None
 
 
+def two_hot(target: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
+    """Distribute each scalar target across the two support bins that bracket it.
+
+    The standard two-hot encoding for a distributional value head: a cross-entropy against
+    this has the same MEAN as the scalar target while training far more stably than an MSE on
+    returns, whose gradient scales with the error and whose target moves as the critic does.
+
+    Exact in the mean by construction, which is the property the head's ``quality`` mean
+    accessor relies on -- and it is asserted in the tests rather than argued here.
+
+    Args:
+        target: ``(B,)`` values; clamped into the support's range rather than dropped, since a
+            value outside it means the reward's own bound was wrong and silently discarding
+            those rows would hide it.
+        support: ``(bins,)`` ascending bin centres.
+
+    Returns:
+        ``(B, bins)`` non-negative, summing to 1 along the last axis.
+    """
+    bins = support.numel()
+    if bins < 2:
+        raise ValueError(f"a two-hot target needs at least 2 bins, got {bins}")
+    lo, hi = float(support[0]), float(support[-1])
+    width = (hi - lo) / (bins - 1)
+    pos = ((target.clamp(lo, hi) - lo) / width)
+    low = pos.floor().clamp(0, bins - 2).long()
+    frac = (pos - low.to(pos.dtype)).clamp(0.0, 1.0)
+    out = torch.zeros(target.shape[0], bins, device=target.device, dtype=pos.dtype)
+    out.scatter_(1, low.unsqueeze(1), (1.0 - frac).unsqueeze(1))
+    out.scatter_add_(1, (low + 1).unsqueeze(1), frac.unsqueeze(1))
+    return out
+
+
+def quality_loss(logits: torch.Tensor, target: torch.Tensor,
+                 support: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy of ``logits`` against the two-hot encoding of ``target``.
+
+    Args:
+        logits: ``(B, bins)`` from :meth:`FlowValueModel.quality_logits`.
+        target: ``(B,)`` normalized returns in the support's range.
+        support: ``(bins,)`` bin centres.
+
+    Returns:
+        Scalar mean loss.
+    """
+    return -(two_hot(target, support) * torch.log_softmax(logits, dim=-1)).sum(-1).mean()
+
+
 class FlowValueModel(nn.Module):
     """A failure-probability head reading one readout token over the generator's encoder.
 
@@ -120,12 +168,16 @@ class FlowValueModel(nn.Module):
         freeze_trunk: Keep the generator's weights fixed. The default, and not merely the
             cheap option: it asks the sharper question first -- is the generator's own
             representation predictive of failure -- and answers it in minutes.
+        quality_bins: Bins for the QUALITY head's distribution over the normalized tracking
+            return, or 0 to omit it. 0 reproduces the survival-only model exactly, so an
+            existing checkpoint loads and scores unchanged.
     """
 
     def __init__(self, fm, *, scan_hw: tuple[int, int] | None = None,
                  proprio_dim: int = 0, proprio_steps: int = 0, context_dim: int = 0,
                  scan_channels: Sequence[int] = (16, 32), scan_grid: tuple[int, int] = (2, 3),
-                 hidden: int = 128, freeze_trunk: bool = True) -> None:
+                 hidden: int = 128, freeze_trunk: bool = True,
+                 quality_bins: int = 0) -> None:
         super().__init__()
         if getattr(fm, "attention_mode", "full") != "prefix":
             raise ValueError(
@@ -170,6 +222,29 @@ class FlowValueModel(nn.Module):
 
         self.head = nn.Sequential(nn.Linear(d, hidden), nn.SiLU(), nn.Linear(hidden, 1))
 
+        # ---- the QUALITY head, optional and additive ----------------------------------
+        #
+        # A SECOND readout rather than a second head on the shared one. The readout's whole
+        # argument (above) is that attention lets it learn WHAT TO LOOK AT from its own query
+        # -- and "will this fall" and "how cleanly is it tracking" are not the same question,
+        # so sharing one query would force one compromise representation for both. One extra
+        # token against a 129-token sequence.
+        self.quality_bins = int(quality_bins)
+        self.quality_readout = None
+        self.quality_head = None
+        if self.quality_bins > 0:
+            self.quality_readout = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+            self.quality_type = nn.Parameter(torch.zeros(1, 1, d))
+            self.quality_head = nn.Sequential(nn.Linear(d, hidden), nn.SiLU(),
+                                              nn.Linear(hidden, self.quality_bins))
+            # The support is DECLARED, not fitted, and that is a property of the reward rather
+            # than a convenience: a step reward is bounded in (0, 1] because the DeepMimic
+            # weights sum to 1, and the normalized return carries the (1 - gamma) factor, so
+            # G lands in [0, 1] by construction. Nothing here has to track a running scale,
+            # and two checkpoints fitted on different data are directly comparable.
+            self.register_buffer("quality_support",
+                                 torch.linspace(0.0, 1.0, self.quality_bins))
+
     def value_tokens(self, x: ValueInputs) -> torch.Tensor:
         """Assemble the query stream, readout FIRST.
 
@@ -186,6 +261,10 @@ class FlowValueModel(nn.Module):
             """
         b = x.history.shape[0]
         parts = [self.readout.expand(b, 1, self.d_model) + self.readout_type]
+        # Index 1 when present. The survival readout stays at 0 so a survival-only
+        # checkpoint's head keeps reading the same token.
+        if self.quality_readout is not None:
+            parts.append(self.quality_readout.expand(b, 1, self.d_model) + self.quality_type)
         if self.scan_enc is not None:
             if x.scan is None:
                 raise ValueError("this model has scan tokens but the batch carries no scan; "
@@ -215,15 +294,118 @@ class FlowValueModel(nn.Module):
         """
         # Exactly what the generator computes for its own conditioning -- `prefix` attention
         # means the tokens added below cannot perturb it.
+        return self.head(self._encode(x)[:, 0]).squeeze(-1)   # the survival readout, only
+
+    def _encode(self, x: ValueInputs) -> torch.Tensor:
+        """Run the token stream through the borrowed layers once.
+
+        Factored out so the two heads share ONE forward pass. Reading them from separate
+        calls would double the cost of every selector score for no gain, since the readouts
+        differ only in which token the head takes.
+
+        Args:
+            x: The batch.
+
+        Returns:
+            ``(B, n_tokens, d_model)``.
+        """
         cache = self.fm.encode_prefix(x.history, x.extero, x.cmd_tokens, x.history_null)
         h = self.value_tokens(x)
         for layer, prefix in zip(self.fm.encoder.layers, cache):
             h = self.fm._run_layer(layer, h, torch.cat([prefix, h], dim=1))
-        return self.head(h[:, 0]).squeeze(-1)      # the readout token, and nothing else
+        return h
+
+    def quality_logits(self, x: ValueInputs) -> torch.Tensor:
+        """Logits over the normalized-return bins, from the QUALITY readout.
+
+        Args:
+            x: The batch.
+
+        Returns:
+            ``(B, quality_bins)``.
+
+        Raises:
+            ValueError: If this model has no quality head. Not a zero fallback: a zero return
+                is the worst possible value, so a silent one would rank every candidate as
+                maximally bad and read as the selector being broken rather than absent.
+        """
+        if self.quality_head is None:
+            raise ValueError(
+                "this critic has no quality head (quality_bins=0), so there is no tracking "
+                "return to read. Fit one with --quality_bins, or score on survival alone.")
+        return self.quality_head(self._encode(x)[:, 1])
+
+    def quality(self, x: ValueInputs) -> torch.Tensor:
+        """``G_hat(s)`` in ``[0, 1]`` -- the expected normalized tracking return.
+
+        The distribution's MEAN over the declared support, not its argmax: the head is
+        distributional for training stability, but the selector needs a scalar to order
+        candidates by and the mean is the one that matches the regression target.
+
+        Args:
+            x: The batch.
+
+        Returns:
+            ``(B,)``.
+        """
+        probs = torch.softmax(self.quality_logits(x), dim=-1)
+        return (probs * self.quality_support).sum(dim=-1)
 
     def p_fail(self, x: ValueInputs) -> torch.Tensor:
         """``P(fail | s)`` in ``[0, 1]``."""
         return torch.sigmoid(self.forward(x))
+
+    def heads(self, x: ValueInputs) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Both heads from ONE encoder pass: ``(fail_logit, quality_logits or None)``.
+
+        What training and the selector should call. Two separate calls would run the borrowed
+        layer stack twice for the same tokens.
+
+        Args:
+            x: The batch.
+
+        Returns:
+            ``((B,) survival logit, (B, bins) quality logits or None)``.
+        """
+        h = self._encode(x)
+        fail = self.head(h[:, 0]).squeeze(-1)
+        qual = None if self.quality_head is None else self.quality_head(h[:, 1])
+        return fail, qual
+
+    def combined_value(self, x: ValueInputs, *, w_fail: float = 1.0) -> torch.Tensor:
+        """``V(s) = w_track * G_hat(s) - w_fail * P(fail | s)``, larger is better.
+
+        ONE definition, used by the advantage label and by the selector, so the thing being
+        maximised at run time is the thing the fine-tune's label is computed from -- by
+        construction rather than by two matching implementations.
+
+        ``w_track = 1 - w_fail``, so ``w_fail = 1`` is exactly the survival-only
+        ``V = -P(fail)`` this class shipped with and is therefore the control arm rather than
+        a new configuration.
+
+        Args:
+            x: The batch.
+            w_fail: Weight on the survival term, in ``[0, 1]``.
+
+        Returns:
+            ``(B,)``.
+
+        Raises:
+            ValueError: If ``w_fail < 1`` on a model with no quality head -- asking for a
+                tracking term that does not exist.
+        """
+        if not 0.0 <= float(w_fail) <= 1.0:
+            raise ValueError(f"w_fail must be in [0, 1], got {w_fail!r}")
+        fail_logit, qual_logits = self.heads(x)
+        v = -float(w_fail) * torch.sigmoid(fail_logit)
+        if float(w_fail) >= 1.0:
+            return v
+        if qual_logits is None:
+            raise ValueError(
+                f"w_fail={w_fail} asks for the tracking term, but this critic has no quality "
+                "head. Fit one, or score at w_fail=1.")
+        probs = torch.softmax(qual_logits, dim=-1)
+        return v + (1.0 - float(w_fail)) * (probs * self.quality_support).sum(dim=-1)
 
     def value(self, x: ValueInputs) -> torch.Tensor:
         """``V(s) = -P(fail | s)``, in ``(-1, 0)``."""

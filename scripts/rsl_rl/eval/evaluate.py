@@ -206,6 +206,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "climbed the staircase from one that stood still while the cursor ran "
                         "out. Empty = off, and report.py then refuses to derive spatial "
                         "success rather than silently falling back to the temporal rule.")
+    g.add_argument("--tracking_spec", default="",
+                   help="tracking_spec.json from measure_tracking_error.py --stage report. "
+                        "Turns on the STRICT tracking checks -- lateral / height / tilt "
+                        "against the SERVED reference node -- which are LATCHED, never "
+                        "terminating, so `report.py` derives success_strict and the loose "
+                        "success from the same run. Empty = the BOOTSTRAP placeholders, "
+                        "which are fine for looking and not for publishing.")
     g.add_argument("--fall_min_height", type=float, default=0.40,
                    help="base_fallen's world-z threshold, m. 0.40 rather than the historical "
                         "0.50: the deepest jump_off_front clip's own pelvis reaches 0.525 m "

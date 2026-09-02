@@ -85,16 +85,35 @@ Mean 22.9 re-plans per episode. Falls are 70% tilt, 30% height.
 
 | family | 0.8 K=1 / K=4 | 1.6 K=1 / K=4 | 2.4 K=1 / K=4 |
 |---|---|---|---|
-| jump_off_front | 0.980 / 0.965 | 0.853 / 0.973 | 0.895 / 0.993 |
+| ~~jump_off_front~~ | ~~0.980 / 0.965~~ | ~~0.853 / 0.973~~ | ~~0.895 / 0.993~~ |
 | jump_on | 0.965 / 1.000 | 0.527 / 0.782 | 0.268 / 0.537 |
 | stairs_down | 0.868 / 0.925 | 0.735 / 0.845 | 0.468 / 0.627 |
 | stairs_up | 0.917 / 0.973 | 0.850 / 0.912 | 0.619 / 0.692 |
 
 Speed is by far the largest effect: success 0.949 → 0.813 → 0.638 across 0.8 / 1.6 / 2.4.
 
+> **RETRACTED 2026-09-02 — the `jump_off_front` row measured no dismount.** `isaac_tile_course`
+> found its far surface among the walkable OVERLAYS only, and a dismount lands on the infinite
+> FLOOR, which is not one — so the search returned the block the robot was already standing on.
+> On tile 75 that put `target_x` at 2.74 m with `flight_height_m = 0.000`, which switches
+> `Course.traversed` off entirely, and `in_goal`'s ±1.0 m band then awarded success at **1.74 m
+> — still on the approach platform, before the drop existed.** That is why this family scored
+> highest of the four and why its K=1 rate *rose* with speed (0.980 → 0.853 → 0.895): the
+> episodes were distance-limited, not difficulty-limited.
+>
+> Fixed by giving a dismount the rule every other descending course already uses — the goal
+> `TARGET_LEAD + DESCENT_RUNOUT` past the far edge of the last block, on the floor. Re-measured
+> on tile 75 at 1.6 m/s: episodes go 154–172 → 305–512 steps and 1 of 8 now falls, against 8 of
+> 8 succeeding before. **The other three families are unaffected** — each has a real far-platform
+> overlay, verified: stairs_up +0.260/+0.850/+1.020, stairs_down −0.777/−0.652, jump_on
+> +0.400/+0.750/+0.700 — so every pooled contrast in this report that excludes `jump_off_front`
+> still stands, and the pooled ones include 5 void tiles of 21.
+
 `jump_off_front` needed `--klass box` to build at all (absent from `FAMILY_KLASS`); 8 of its 15
 tiles build, the rest fail with a spawn outside the tile footprint. Its goal anchors were
-recovered from the clip library, not approximated.
+recovered from the clip library, not approximated. **That `--klass` override is what walked past
+`klass_for_family`'s deliberate refusal of this family, and the refusal was load-bearing** — see
+the retraction above.
 
 ## 5. Determinism, measured in both directions
 
@@ -238,7 +257,8 @@ single-decision one.
 - **One generator, one tracker, one critic.** Nothing separates properties of this checkpoint
   pair from properties of the method.
 - `jump_off_front` cells score under `box` traversal-gate semantics — an explicit override, not
-  a validated mapping.
+  a validated mapping. **This limitation turned out to be fatal rather than merely noted: those
+  cells measured 1.74 m of platform walking and no dismount at all. See the retraction in §4.**
 - **The Isaac headroom statistic cannot be computed on this data**, structurally: it needs
   R > 1 robots per `(clip, seed)` so `s_k` is a rate. Here R = 1 by design, so `s_k ∈ {0,1}`,
   `max_k s_k = 1` whenever any seed succeeds, and the within-clip reshuffle preserves the

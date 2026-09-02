@@ -41,6 +41,8 @@ import time
 import numpy as np
 
 import accumulate
+# Same module `accumulate` folds with; imported here only to build the spec.
+from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
 import dr_presets
 import fm_seed_noise
 import sampler
@@ -693,6 +695,16 @@ def stage_cell(args) -> int:
             from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
             spec = goal_region.GoalRegionSpec.load(args.goal_regions)
             accum.attach_goal_region(spec)
+            # The STRICT tracking checks ride with the goal region: both are what make a
+            # verdict spatial and reference-relative rather than a clip-cursor condition, and
+            # neither is meaningful without the other (the strict rule is "arrived BEFORE
+            # failing"). Latched, never terminating, so `report.py` derives the strict and the
+            # loose success from one run.
+            _tspec = tracking_error.BOOTSTRAP_SPEC
+            if getattr(args, "tracking_spec", ""):
+                with open(args.tracking_spec) as _f:
+                    _tspec = tracking_error.TrackingErrorSpec.from_dict(json.load(_f))
+            accum.attach_tracking(_tspec)
             if int(args.fm_seed) != fm_seed_noise.OFF:
                 _c = u.command_manager.get_term("traj_ref")
                 _c.set_noise_source(fm_seed_noise.FmSeedNoise(
@@ -893,6 +905,13 @@ def stage_grid(args) -> int:
         # n_plans == 0 and no error anywhere.
         if getattr(args, "goal_regions", ""):
             cmd += ["--goal_regions", args.goal_regions]
+        # RESTATED HERE ON PURPOSE. A flag added to the parser is NOT forwarded across the
+        # grid -> cell subprocess boundary unless this function repeats it; it reverts to its
+        # argparse default in the child, silently. Measured twice already: `--num_envs` ran a
+        # grid at 256 while the manifest recorded 1024, and `--terrain_ref` produced 3950
+        # episodes with `n_plans == 0` and no error.
+        if getattr(args, "tracking_spec", ""):
+            cmd += ["--tracking_spec", args.tracking_spec]
         cmd += ["--fall_min_height", str(args.fall_min_height)]
         if int(args.fm_seed) != -1:
             cmd += ["--fm_seed", str(args.fm_seed)]

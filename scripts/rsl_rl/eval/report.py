@@ -267,8 +267,34 @@ def derived_columns(cell: dict, plan: dict,
                 "it is not distinguishable here from a policy that never arrived -- so it is "
                 "refused rather than reported as 0.000 success. Check "
                 "`overrides.goal_regions` in the cell meta.")
+    # THE SUCCESS RULE, and it is now `schema.arrived_before_failing` rather than a second
+    # opinion stated here. The old rule was `~failed & ~censored & arrived`, which fails any
+    # episode whose fall TERMINATION bit is set regardless of WHEN it fired -- so an episode
+    # that reached the goal and then fell in the run-out scored a failure here and a success
+    # under `rollout_outcomes.terminal_reward`, on 51 of 298 episodes of one measured rollout.
+    # Two arms cannot be compared under two success rules.
+    #
+    # `legacy_temporal` keeps its own shape: it drops the arrival requirement entirely, so
+    # there is no first-event ordering to apply and "upright without going anywhere" counts.
+    if success_rule == "spatial":
+        strict_ok = schema.arrived_before_failing(d, strict=True)
+        loose_ok = schema.arrived_before_failing(d, strict=False)
+        has_strict = "first_violation_step" in d and bool((d["first_violation_step"] >= 0).any())
+    else:
+        strict_ok = loose_ok = ~failed
+        has_strict = False
+
     out = {
-        "success": (~failed & ~censored & arrived).astype(float),
+        # Reported side by side, never folded together: `success` is the headline and the
+        # strict/loose pair is what says how much of it the tracking checks cost. When the
+        # cell carries no tracking columns the two are identical BY CONSTRUCTION, which is
+        # why `strict_checks_active` travels with them.
+        "success": (loose_ok & ~censored).astype(float),
+        "success_strict": (strict_ok & ~censored).astype(float),
+        "track_reward_mean": (d["track_reward_mean"].astype(float)
+                              if "track_reward_mean" in d
+                              else np.full(bits.shape, np.nan)),
+        "strict_checks_active": np.full(bits.shape, float(has_strict)),
         "failed": failed.astype(float),
         # At the threshold THIS CELL RAN, not the module default. The two came apart when
         # --fall_min_height was added: the termination fired at 0.40 while the derived flag

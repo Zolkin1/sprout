@@ -219,6 +219,30 @@ def first_step(overlays: list[dict]) -> dict | None:
     flight's first riser sends :func:`spawn_point` to that post's centreline -- measured at
     2.05 m outside the tile, over the void, on a probe tile.
 
+    ``TODO(first-step-vs-first-obstacle)``: **this is the first TREAD, which is not always the
+    first OBSTACLE**, and :func:`spawn_point` measures its approach from here -- so where a
+    DEEP platform sits between the spawn and the first tread, the run-up is whatever is left of
+    it rather than the ``approach`` that was asked for.
+
+    Measured on clip library ``g1_mb_v5_body_mode11_decor.h5``: **tile 86 is the only affected
+    tile of the ~75 across stairs_up / stairs_down / jump_on / jump_off_front.**  It has a
+    2.14 m platform (too deep to be a tread, so skipped here) whose near edge is 0.36 m from
+    the spawn, and a 0.48 m block behind it at 2.50 m -- so the robot is placed 2.5 m before
+    the block and 0.36 m before a 0.75 m wall.  Three consequences, all on that tile: no
+    planning distance for the far camera (``X_START``'s whole purpose is that the obstacle is
+    visible for several re-plans before arrival), a hop-up off the spawn instead of an
+    approached climb, and ``Course.obstacle_x_m`` mislabelling the approach/on-course split
+    that ``mjeval.accumulate`` uses, since the robot is already up on the platform from
+    x ~ 0.36.
+
+    NOT fixed, deliberately: one tile in a library, against a filter whose looseness is the
+    railing-post failure above.  A fix would take the nearest walkable edge ABOVE the spawn
+    surface as the approach datum while keeping this function for the flight's first riser --
+    two questions that this one function currently answers with one number.  **Tile 86 is
+    excluded from the watch/eval tile sets until then**; see the dismount branch in
+    ``mjeval.terrains.isaac_tile_course``, which is where the same tile's goal also lands
+    wrong (on the box, before its dismount).
+
     Args:
         overlays: Overlays this emitter can represent.
 

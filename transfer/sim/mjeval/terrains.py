@@ -208,7 +208,15 @@ CLASS_CODES: dict[str, int] = {
 }
 
 #: Verdicts, as stored in the ``verdict`` column.
-VERDICT_CODES: dict[str, int] = {"success": 0, "fall": 1, "timeout": 2, "interrupted": 3}
+#:
+#: ``violation`` appears ONLY under ``run_episode(stop_on_violation=True)``, a budget flag for
+#: collection runs: the episode was cut at the first strict tracking violation because
+#: everything after it is off the pre-latch distribution the critic is fitted on. It is NOT a
+#: fourth outcome of the task -- ``derive_success`` scores it a failure under the strict rule
+#: exactly as the un-cut episode would have been, and under the LOOSE rule the episode simply
+#: has no answer, which is the documented cost of the flag.
+VERDICT_CODES: dict[str, int] = {"success": 0, "fall": 1, "timeout": 2, "interrupted": 3,
+                                 "violation": 4}
 
 #: ``Robot.failure_reason()`` strings, as stored in the ``failure_code`` column.
 FAILURE_CODES: dict[str, int] = {"": 0, "height": 1, "tilt": 2}
@@ -1214,6 +1222,61 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
         # actually moved at, and dividing the shortened distance by the full duration
         # would under-report it by the margin (0.86 -> 0.72 m/s on tile 6).
         clip_pace = float(anchor_xyz[0]) / max(budget_override - CMD_HOLD_S, 1e-6)
+
+    # ---- the DISMOUNT case -------------------------------------------------------------
+    # The search above considers walkable OVERLAYS only, and a dismount lands on the infinite
+    # FLOOR, which is not one -- so on a jump_off_front tile it returns the block the robot is
+    # ALREADY STANDING ON and the course silently always succeeds:
+    #
+    #   * `flight_height_m == 0` makes `traversed` return True unconditionally, switching off
+    #     the half of `derive_success` that checks the robot did the feature at all;
+    #   * `target_x` is the far edge of that block, and `in_goal` is a +/- GOAL_DEPTH/2 band
+    #     around it, so success lands GOAL_DEPTH/2 metres before even that.
+    #
+    # Measured on tile 75: two overlays, both topping out at 0.550 m, the robot spawning on
+    # them, floor at -0.550 -- goal band x in [1.74, 3.74] against a final block at 2.74, so an
+    # episode scored SUCCESS after 1.74 m of walking along the approach platform, before the
+    # drop existed. Every jump_off_front number measured before this fix is that, not a
+    # dismount (see docs/seed_variance_mujoco_report.md, whose jump_off_front column is void).
+    #
+    # The fix is the rule every other DESCENDING course already uses, not a new one: the goal
+    # goes `TARGET_LEAD + DESCENT_RUNOUT` past the far edge of the last thing to stand on, on
+    # the FLOOR. Deliberately NOT the clip's endpoint -- `goal_anchor_xyz` is exact, but
+    # `goal_anchor` states that `target_xy` owns `in_goal`/success on every other course, and
+    # this harness commands a constant velocity rather than the clip's own timing, so matching
+    # the clip's distance would buy nothing and make one family's goal answer to a different
+    # producer than the rest.
+    if float(target_z - sz) == 0.0:
+        floor_top_tile = sz + floor_z
+        if floor_top_tile >= sz:
+            raise ValueError(
+                f"tile {terrain_id} ({entry.get('family', '?')}): the farthest walkable overlay "
+                f"downrange sits at the SPAWN's own height ({sz:+.3f} m) and there is no drop "
+                f"below it either (floor at {floor_top_tile:+.3f} m), so this course has "
+                "nothing to traverse to and `flight_height_m` would be 0.000 -- which switches "
+                "the traversal gate off and puts the goal on the surface the robot starts on.")
+        # Past the far EDGE of the last block, not its centre: the centre is where the robot
+        # still has ground under it.
+        drop_edge_x = float(far["pos_xy"][0]) + float(far["size_xyz"][0]) / 2.0 - sx
+        target_x = drop_edge_x + TARGET_LEAD + DESCENT_RUNOUT
+        target_z = floor_top_tile
+
+    # ``TODO(first-step-vs-first-obstacle)``: the SIGN-FLIPPED version of the bug above is not
+    # caught here and is not fixed. Where the robot spawns BELOW the platform, the farthest
+    # walkable overlay is above it, `flight_height_m` reads as a climb, and the goal lands on
+    # top of the platform -- so the course scores the MOUNT and the tile's dismount happens
+    # after the goal. Measured on tile 86 (the only such tile of ~75 scanned): goal at
+    # rel_x 2.74 on a platform spanning 0.36..2.98, band opening at 1.74 m, while the clip's own
+    # motion crosses the box, drops off the front and ends on the FLOOR at x = 8.67.
+    #
+    # The check that catches BOTH orientations, validated but not wired in: when
+    # `goal_anchor_max_offset` is given, the clip's terminal SURFACE is
+    # `anchor_xyz[2] - SPAWN_BASE_Z`, and it should agree with `flight_height_m`. Measured
+    # disagreement -- stairs_up t6 0.04, stairs_down t20 0.02, jump_on t40 0.005,
+    # jump_off_front t75 0.03 (after the fix above), against tile 86's 0.79 m. It belongs with
+    # the success-rule unification rather than as a fourth special case here.
+    # Until then tile 86 is excluded from the watch/eval tile sets.
+
     return Course(
         name=name or f"tile{terrain_id}",
         klass=klass,

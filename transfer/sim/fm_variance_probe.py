@@ -154,10 +154,19 @@ def run_tile(args, terrain_id: int, course, table, meta: dict) -> dict:
 
 def summarise(course, rows: list[dict], meta: dict) -> dict:
     """Reduce one tile's trials to the numbers the question turns on."""
+    import schema as mjschema  # noqa: PLC0415  -- the ONE success rule
+
     v = np.array([int(r["verdict"]) for r in rows])
     codes = terrains.VERDICT_CODES
     fell = v == codes["fall"]
-    success = v == codes["success"]
+    # Through `derive_success` rather than `verdict == success`, so this probe cannot drift
+    # from the harness it is read beside. The two agree today -- `run_episode` only sets
+    # `success` when `reached_target` and `traversed` both held -- and `mjeval/report.py`
+    # carries a counter for the day they do not. Restating the rule here is how that day
+    # arrives unnoticed.
+    cols = {k: np.array([r[k] for r in rows]) for k in rows[0]}
+    success = mjschema.derive_success(cols, strict=False).astype(bool)
+    strict = mjschema.derive_success(cols, strict=True).astype(bool)
     x = np.array([float(r["progress_x_m"]) for r in rows])
     d = np.array([float(r["distance_m"]) for r in rows])
     xf = x[fell]
@@ -165,6 +174,9 @@ def summarise(course, rows: list[dict], meta: dict) -> dict:
         "course": course.name, "terrain_id": course.variant, "klass": course.klass,
         "n": int(v.size),
         "success_rate": float(success.mean()),
+        # Beside it, never folded in: the difference is what the strict tracking checks cost.
+        # Equal to `success_rate` by construction on a run that did not turn them on.
+        "success_rate_strict": float(strict.mean()),
         "fall_rate": float(fell.mean()),
         "timeout_rate": float((v == codes["timeout"]).mean()),
         "obstacle_x_m": float(course.obstacle_x_m),

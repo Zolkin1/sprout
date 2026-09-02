@@ -130,6 +130,113 @@ def n_step_advantage(
     return adv, boot
 
 
+def combined_n_step_advantage(
+    p_fail: np.ndarray,
+    g_hat: np.ndarray,
+    chunk_reward: np.ndarray,
+    episode_uid: np.ndarray,
+    replan_index: np.ndarray,
+    failed: np.ndarray,
+    n: int,
+    *,
+    gamma: float,
+    w_fail: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The n-step advantage of the COMBINED value, survival plus tracking quality.
+
+    ``V(s) = w_track * G_hat(s) - w_fail * P(fail | s)`` with ``w_track = 1 - w_fail``, the
+    same definition :meth:`FlowValueModel.combined_value` computes at run time -- so the
+    fine-tune's label and the selector's objective are one quantity by construction rather
+    than two implementations that happen to agree::
+
+        A = w_track * [ (1-g) * sum_{i<n} g^i R_{t+i}  +  g^n * G_hat(s_{t+n}) - G_hat(s_t) ]
+          + w_fail  * [ P(fail|s_t) - P(fail|s_{t+n}) ]
+
+    Two things about the shape of this are easy to get wrong:
+
+    * **The second bracket is the SURVIVAL advantage exactly as it already was**, sign and
+      all -- it is already the TD form of a terminal-only reward at ``gamma = 1``. So
+      ``w_fail = 1`` reproduces :func:`n_step_advantage` bit for bit and is the control arm,
+      not a new configuration.
+    * **The ``(1 - gamma)`` factor on the measured rewards is not cosmetic.** ``G_hat`` is a
+      NORMALIZED return, carrying that factor by construction, so without it the measured and
+      bootstrapped halves are in different units and the sum is dominated by whichever
+      happens to be larger.
+
+    The tail bootstraps the same way the survival half does -- on the realized outcome, which
+    for the tracking term is ``0.0`` (a failure is absorbing; nothing good follows) or the
+    last observed ``G_hat`` (the episode ended by arriving or by the budget, so the motion is
+    assumed to continue at the quality it ended on).  Absorbing on a NON-failure would punish
+    arriving quickly, which is the confound
+    :func:`transfer.deploy.tracking_error.normalized_return` documents.
+
+    Args:
+        p_fail: ``[W]`` ``P(fail | s_t)``.
+        g_hat: ``[W]`` predicted normalized tracking return at ``s_t``, in ``[0, 1]``.
+        chunk_reward: ``[W]`` MEASURED per-chunk tracking reward for the chunk emitted at
+            ``t`` -- i.e. already shifted out of ``track_err_prev``, whose row ``i`` holds the
+            chunk of row ``i-1``.
+        episode_uid: ``[W]`` episode id.
+        replan_index: ``[W]`` position within the episode, 0-based.
+        failed: ``[W]`` bool, the episode's realized outcome.
+        n: Look-ahead in re-plans.
+        gamma: Per-CHUNK discount.
+        w_fail: Weight on the survival term, in ``[0, 1]``.
+
+    Returns:
+        ``(advantage, bootstrapped)`` -- ``[W]`` float64 and ``[W]`` bool.
+
+    Raises:
+        ValueError: On a bad ``n``, ``gamma``, ``w_fail``, or ragged inputs.
+    """
+    if not 0.0 <= float(w_fail) <= 1.0:
+        raise ValueError(f"w_fail must be in [0, 1], got {w_fail!r}")
+    if not 0.0 < float(gamma) < 1.0:
+        raise ValueError(f"gamma must be in (0, 1), got {gamma!r}")
+
+    surv, boot = n_step_advantage(p_fail, episode_uid, replan_index, failed, n)
+    w_track = 1.0 - float(w_fail)
+    if w_track == 0.0:
+        # Bit-for-bit the survival advantage. Returned before touching the tracking arrays so
+        # this path cannot be perturbed by a NaN in a column it does not read.
+        return float(w_fail) * surv, boot
+
+    lengths = {a.shape[0] for a in (p_fail, g_hat, chunk_reward, episode_uid, replan_index,
+                                    failed)}
+    if len(lengths) != 1:
+        raise ValueError(f"arrays disagree in length: {sorted(lengths)}")
+
+    g = float(gamma)
+    w = p_fail.shape[0]
+    track = np.zeros(w, dtype=np.float64)
+    order = np.lexsort((replan_index, episode_uid))
+    uid_s = episode_uid[order]
+    starts = np.flatnonzero(np.r_[True, uid_s[1:] != uid_s[:-1]])
+    ends = np.r_[starts[1:], w] if starts.size else np.array([], dtype=int)
+    disc = g ** np.arange(int(n), dtype=np.float64)
+    for s, e in zip(starts, ends):
+        rows = order[s:e]
+        m = rows.size
+        r = chunk_reward[rows].astype(np.float64)
+        gh = g_hat[rows].astype(np.float64)
+        # The tail value: 0 on a failure (absorbing -- nothing good follows) and the last
+        # observed G_hat otherwise (the episode ended by arriving or by the budget, so the
+        # motion is assumed to continue at the quality it ended on). Absorbing on a
+        # NON-failure would punish arriving quickly.
+        tail = 0.0 if bool(failed[rows[0]]) else float(gh[-1])
+        for i in range(m):
+            # TRUNCATED n-step: a row whose window overruns the episode gets the k chunks
+            # that exist and bootstraps at g^k, NOT at g^n. Discounting the tail by the full
+            # g^n while padding the missing rewards with zero is inconsistent -- it charges a
+            # row for chunks that never happened -- and it is worst on the LAST rows, which
+            # are the ones nearest the outcome and so the most informative.
+            k = min(int(n), m - i)
+            measured = float((r[i:i + k] * disc[:k]).sum())
+            future = gh[i + k] if i + k < m else tail
+            track[rows[i]] = (1.0 - g) * measured + (g ** k) * future - gh[i]
+    return float(w_fail) * surv + w_track * track, boot
+
+
 def binarize(
     advantage: np.ndarray,
     family_code: np.ndarray,

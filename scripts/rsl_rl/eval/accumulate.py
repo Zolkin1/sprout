@@ -29,6 +29,13 @@ import torch
 
 import schema
 
+# Torch twin of ``transfer.deploy.tracking_error``, held to it by
+# ``transfer/deploy/tests/test_tracking_error_parity.py``. Safe at module scope: it imports
+# only torch and ``isaaclab.utils.math``, and pulls no ``isaacsim``/``omni``/``pxr``/``carb``
+# -- unlike ``mdp.goal_region``, which is attached after AppLauncher for exactly that reason
+# (see ``test_no_pre_app_pxr_import.py``).
+from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
+
 #: Name patterns that split the clip's output channels into comparable groups.  Same
 #: patterns ``play_plots._print_group_summaries`` uses, so the eval's reference errors group
 #: exactly like the existing stats do.
@@ -214,6 +221,129 @@ class EpisodeAccumulator:
         self.end_goal = torch.full((self.n, 3), float("nan"), device=self.device)
         self._prev_xy = self.rd.root_pos_w[:, :2].clone()
         self._have_prev = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        # -- the STRICT tracking checks --------------------------------------------------
+        # Off until `attach_tracking`, on the same terms as the goal region: with no spec the
+        # columns come out "never violated" / NaN and a reader must be able to tell that from
+        # "measured and never fired".
+        self._track_spec = None
+        self._track_offsets = torch.zeros(1, dtype=torch.long, device=self.device)
+        self.first_violation = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
+        self.first_check = {}
+        self.track_reward_sum = torch.zeros(self.n, device=self.device)
+        self.track_reward_n = torch.zeros(self.n, device=self.device)
+        #: The error row this step, ``[N, n]``, or None before the first served reference.
+        #: Stashed rather than recomputed by the recorder: it is built here from the served
+        #: window at the fold instant, and rebuilding it a step later would measure a
+        #: different pairing.
+        self.last_track_err: torch.Tensor | None = None
+
+    # ------------------------------------------------------------------
+    # The STRICT tracking checks.  See transfer/deploy/tracking_error.py for the contract.
+    # ------------------------------------------------------------------
+    def attach_tracking(self, spec) -> None:
+        """Turn on the strict tracking columns, with ``spec``'s bounds and kernel widths.
+
+        Off until called, like :meth:`attach_goal_region` and for the same reason: a run
+        without it reports ``first_violation_step == -1`` everywhere, and a reader has to be
+        able to tell that from "measured, never fired".  ``report.py`` refuses to derive
+        strict success from a table whose column is absent rather than reading it as "nothing
+        ever went wrong".
+
+        The reference is the SERVED one -- ``get_future_world_base`` / ``get_future_joint_state``
+        at offset 0 answer for whichever arm is applied, so the clip arm and the generator arm
+        go through one call site and cannot drift apart.
+
+        Args:
+            spec: A :class:`~robot_rl...mdp.tracking_error.TrackingErrorSpec`.
+
+        Raises:
+            ValueError: If the served generator predicts no ``base_vel`` or no ``joint_pos``.
+                Checked HERE rather than per step: the accessors raise on that checkpoint, and
+                a run that dies mid-episode after twenty minutes of rollout costs more than
+                one that refuses at setup.
+        """
+        blocks = getattr(self.cmd, "_fm_blocks", None)
+        if blocks is not None:
+            missing = {"base_vel", "joint_pos"} - set(blocks)
+            if missing:
+                raise ValueError(
+                    f"the strict tracking checks need {sorted(missing)} from the served "
+                    f"reference, and this generator's window packs {list(blocks)}. There is "
+                    "no useful reduced form: without base_vel the twist term is undefined, "
+                    "and without joint_pos the reward is a base-only number wearing the name "
+                    "of a whole-body one.")
+        self._track_spec = spec
+        self.first_check = {
+            name: torch.full((self.n,), -1, device=self.device, dtype=torch.long)
+            for name in tracking_error.VIOLATION_CHECK_NAMES}
+
+    def _fold_tracking(self, m: torch.Tensor) -> None:
+        """Latch the strict checks and accumulate the tracking reward, for the envs in ``m``.
+
+        Called from :meth:`fold` and from :meth:`fold_terminal`, on the same terms as the fall
+        crossing: the frame that ended the episode is exactly the one most likely to have
+        crossed, so omitting it would leave a violated episode reading clean.
+
+        Args:
+            m: Boolean ``[N]`` mask of envs to fold.
+        """
+        # NO WARM-UP EXCLUSION HERE, and the asymmetry with MuJoCo is deliberate.
+        # `mjeval.tracking.TrackingProbe` skips the opening command hold, which is a MuJoCo-only
+        # artifact: its courses spawn a standing robot 2.5 m out and then command full speed,
+        # and nothing on this side has a `cmd_hold_s` at all.
+        #
+        # Isaac DOES have the analogous mechanism -- the generator's history ring is empty at
+        # reset, so its first plans are poor. Measured on a 74-episode rollout, mean chunk
+        # reward by re-plan index: 0.40 (1), 0.48 (2), 0.50 (3), 0.52 (4-5), 0.55 (6-10),
+        # 0.64 (21-40). It is KEPT ON PURPOSE, and "the ring is empty" is the reason to keep
+        # it rather than a reason to filter it: the generator has a LEARNED null-history
+        # embedding trained for exactly those steps, so they are a regime the model was fitted
+        # for and not a degenerate warm-up. The return from an early state genuinely includes
+        # those chunks, the critic conditions on the state (history_null included), and the
+        # steps at the start of an episode are real data about real behaviour.
+        #
+        # What it does mean is that `track_reward_mean` is NOT symmetric between the two
+        # harnesses -- this one carries the ramp, mjeval's does not -- so the two columns are
+        # not directly comparable, and this one carries the same short-episode bias mjeval's
+        # hold exclusion exists to remove. Compare within a harness, never across.
+        if self._track_spec is None:
+            return
+        # No served reference yet -- before the generator's first plan there is nothing to
+        # measure, which is a real state rather than an error. `_pred_valid` is absent on the
+        # clip command, where a reference always exists.
+        valid = getattr(self.cmd, "_pred_valid", None)
+        if valid is not None:
+            m = m & valid.to(self.device).reshape(self.n)
+        if not bool(m.any()):
+            self.last_track_err = None
+            return
+
+        pos_w, quat_w, lin_w, ang_w = self.cmd.get_future_world_base(self._track_offsets)
+        jp, _ = self.cmd.get_future_joint_state(self._track_offsets)
+        d = self.rd
+        # `root_link_*`, NOT `root_lin_vel_w`: the latter is the CoM twist, and the MuJoCo
+        # half measures the frame-ORIGIN twist via `mj_jacBody` (`Robot.get_base_world_velocity`
+        # documents the distinction and warns against `mj_objectVelocity`). Mixing the two
+        # would put a systematic offset on the velocity term in one simulator only.
+        err = tracking_error.tracking_error(
+            pos_w[:, 0], quat_w[:, 0], lin_w[:, 0], ang_w[:, 0], jp[:, 0],
+            d.root_pos_w, d.root_quat_w, d.root_link_lin_vel_w, d.root_link_ang_vel_w,
+            d.joint_pos)
+
+        self.last_track_err = err
+        mf = m.to(torch.float32)
+        self.track_reward_sum += tracking_error.step_reward(err, self._track_spec) * mf
+        self.track_reward_n += mf
+
+        checks = tracking_error.violation_checks(err, self._track_spec)
+        for name, hit in checks.items():
+            crossed = m & (self.first_check[name] < 0) & hit
+            self.first_check[name] = torch.where(crossed, self.steps, self.first_check[name])
+        any_hit = torch.zeros_like(m)
+        for hit in checks.values():
+            any_hit = any_hit | hit
+        crossed = m & (self.first_violation < 0) & any_hit
+        self.first_violation = torch.where(crossed, self.steps, self.first_violation)
 
     # ------------------------------------------------------------------
     # The SPATIAL goal.  See mdp/goal_region.py for why it has to exist.
@@ -384,6 +514,9 @@ class EpisodeAccumulator:
         crossed = m & (self.first_fall < 0) & (
             (height < self.fall_min_height) | (tilt > self.fall_tilt_rad))
         self.first_fall = torch.where(crossed, self.steps, self.first_fall)
+
+        # -- the strict tracking checks, on the same mask and the same clock --------------
+        self._fold_tracking(m)
 
         # -- what kind of motion did the generator just plan? -----------------------------
         # Gated on a FRESH plan (`_pred_idx == 0`, set on re-plan and advanced one node per
@@ -618,6 +751,10 @@ class EpisodeAccumulator:
         m = torch.zeros(self.n, dtype=torch.bool, device=self.device)
         m[ids] = True
         self._fold_goal(m)
+        # And the strict checks, for the reason the fall crossing is folded here: the frame
+        # that ended the episode is the one most likely to have crossed, so omitting it would
+        # leave a violated episode reading clean.
+        self._fold_tracking(m)
 
     def snapshot(self, env_ids: torch.Tensor) -> dict[str, np.ndarray]:
         """Reduce the running sums for ``env_ids`` into per-episode values.
@@ -658,6 +795,11 @@ class EpisodeAccumulator:
             "min_base_height_w": cpu(self.min_h[ids]),
             "max_tilt_rad": cpu(self.max_tilt[ids]),
             "first_fall_step": cpu(self.first_fall[ids]).astype(np.int64),
+            "first_violation_step": cpu(self.first_violation[ids]).astype(np.int64),
+            "track_reward_mean": cpu(torch.where(
+                self.track_reward_n[ids] > 0,
+                self.track_reward_sum[ids] / self.track_reward_n[ids],
+                torch.full_like(self.track_reward_n[ids], float("nan")))),
             "action_rate_mean": cpu(self.act_rate[ids] / steps),
             "action_rate_max": cpu(self.act_rate_max[ids]),
             "torque_util_max": cpu(self.torque_util[ids]),
@@ -668,6 +810,14 @@ class EpisodeAccumulator:
             "foot_contact_frac": cpu(self.contact_steps[ids]
                                      / (steps * max(1, int(self._foot_ids.numel())))),
         }
+        # Per-CHECK first-crossing steps. Named individually rather than pooled into the
+        # one `first_violation_step`: lateral and height are chunk-local while tilt is
+        # measured against gravity, so a pooled rate hides which bound is doing the work.
+        for _name in tracking_error.VIOLATION_CHECK_NAMES:
+            _buf = self.first_check.get(_name)
+            out[f"first_{_name}_step"] = (
+                cpu(_buf[ids]).astype(np.int64) if _buf is not None
+                else np.full(int(ids.numel()), -1, dtype=np.int64))
         vel = cpu(self.vel_sq[ids] / steps.unsqueeze(-1))
         vmax = cpu(self.vel_absmax[ids])
         for k, axis in enumerate(("vx", "vy", "wz")):
@@ -705,6 +855,11 @@ class EpisodeAccumulator:
         self.min_h[ids] = float("inf")
         self.max_tilt[ids] = 0.0
         self.first_fall[ids] = -1
+        self.first_violation[ids] = -1
+        for _buf in self.first_check.values():
+            _buf[ids] = -1
+        self.track_reward_sum[ids] = 0.0
+        self.track_reward_n[ids] = 0.0
         self.plan_counts[ids] = 0
         self.act_rate[ids] = 0.0
         self.act_rate_max[ids] = 0.0

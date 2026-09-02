@@ -74,6 +74,22 @@ EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     ("event_observed", _U8),     # 1 = a failure was observed, 0 = censored (survived/cut)
     ("admin_censored", _U8),     # still running when the rollout hit its step ceiling
     ("first_fall_step", _I),     # -1 = never crossed the fall predicate
+    # --- the STRICT tracking checks (transfer/deploy/tracking_error.py) -----------------
+    #
+    # The fall predicate above is reference-FREE: pelvis low, or far from world upright. It
+    # says nothing about a robot that stumbles down a flight and barely catches itself, which
+    # is exactly the behaviour a selector must not be taught to like. These columns carry the
+    # reference-relative checks -- lateral, height and tilt against the SERVED node -- and are
+    # all -1 when `attach_tracking` was never called, which `report.py` distinguishes from
+    # "measured and never fired" rather than reading as a clean run.
+    #
+    # LATCHED, NEVER TERMINATING: the episode runs on, so one rollout yields both the strict
+    # and the loose verdict and a threshold change afterwards is an offline relabel.
+    ("first_violation_step", _I),  # -1 = never; the union of the three below
+    ("first_lateral_step", _I),
+    ("first_height_step", _I),
+    ("first_tilt_step", _I),
+    ("track_reward_mean", _F),     # NaN without attach_tracking
     # --- terrain -----------------------------------------------------------------------
     ("has_terrain_span", _U8),
     ("terrain_start_step", _I),  # -1 when there is no pinned span at all
@@ -330,6 +346,61 @@ def fell(min_base_height_w: np.ndarray, max_tilt_rad: np.ndarray,
     """
     return ((np.asarray(min_base_height_w) < min_height)
             | (np.asarray(max_tilt_rad) > tilt_rad))
+
+
+def first_bad_step(cols: dict, *, strict: bool = True) -> np.ndarray:
+    """Step of the first FAILURE event, or -1 -- the one input the success rule needs.
+
+    Whichever of the fall crossing and the strict tracking violation happened first.  ``-1``
+    on either limb means "never", so this is a min over the non-negative entries and not a
+    plain ``np.minimum``, which would return -1 the moment either limb never fired.
+
+    Args:
+        cols: Columns from a table read.
+        strict: Include the tracking violation.  ``False`` reproduces the LOOSE rule -- the
+            fall crossing alone -- so both verdicts come off one rollout and every number
+            published before the strict checks existed stays reproducible from the same data.
+
+    Returns:
+        ``[N]`` int64.
+    """
+    fall = np.asarray(cols["first_fall_step"], dtype=np.int64)
+    if not strict or "first_violation_step" not in cols:
+        return fall
+    viol = np.asarray(cols["first_violation_step"], dtype=np.int64)
+    big = np.iinfo(np.int64).max
+    out = np.minimum(np.where(fall < 0, big, fall), np.where(viol < 0, big, viol))
+    return np.where(out == big, -1, out).astype(np.int64)
+
+
+def arrived_before_failing(cols: dict, *, strict: bool = True) -> np.ndarray:
+    """**The success rule, stated once for the whole tree.**
+
+    An episode succeeds when its base entered the goal region BEFORE it first failed.  Falling,
+    violating the tracking checks, and timing out are all failures; arriving and then falling in
+    the run-out is a success, because the task was done.
+
+    This is ``rollout_outcomes.terminal_reward``'s rule, and it is now also ``report.py``'s.
+    The two used to disagree -- ``report.py`` failed any episode whose fall TERMINATION bit was
+    set regardless of ordering, which scored arrive-then-fall as a failure on 51 of 298 episodes
+    of one measured rollout, while ``terminal_reward`` scored it a success. A harness cannot
+    compare two arms under two success rules, and this stack had thirty.
+
+    Censoring is NOT handled here: an admin-censored episode has no outcome at all, and callers
+    drop it rather than scoring it either way.
+
+    Args:
+        cols: Columns from a table read; needs ``reached_goal``, ``first_goal_step`` and
+            ``first_fall_step`` (plus ``first_violation_step`` when ``strict``).
+        strict: Count a tracking violation as a failure.  ``False`` is the loose rule.
+
+    Returns:
+        ``[N]`` bool.
+    """
+    arrived = np.asarray(cols["reached_goal"]).astype(bool)
+    goal = np.asarray(cols["first_goal_step"], dtype=np.int64)
+    bad = first_bad_step(cols, strict=strict)
+    return arrived & ((bad < 0) | (goal >= 0) & (goal < bad))
 
 
 #: HDF5's own chunk cache defaults to 1 MiB, so a chunk far above that is read straight
