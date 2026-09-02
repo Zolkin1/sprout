@@ -626,11 +626,24 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
     z0 = float(robot.mj_data.qpos[2])
     zex = [z0, z0]
     n_replans, scored = 0, []
+    # THE K=1 ARM NEEDS THE SAME PROBE AS EVERY CANDIDATE, or the two arms are scored under
+    # DIFFERENT FAILURE RULES and the paired delta measures the rule rather than the
+    # selection. It did exactly that once: K=1 came back `fall 0.211, violation 0.000` while
+    # K=4 came back `violation 0.255, fall 0.000` -- structurally impossible under a shared
+    # criterion, and it read as best-of-K COSTING 0.042 with an interval excluding zero.
+    #
+    # Episode-level rather than fresh per chunk, unlike a candidate's: this is one continuous
+    # trajectory, so the latch has to carry across re-plans and the per-chunk rewards
+    # accumulate. A candidate gets a fresh probe because a REJECTED branch's latch must not
+    # survive into its sibling.
+    ep_probe = (tracking.TrackingProbe(spec, hold_until_s=cmd_hold_s)
+                if spec is not None else None)
     while robot.mj_data.time <= course.budget_s:
         if k <= 1:
             v, f, _st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, zex, scorer=_ring,
                               steer_kp=steer_kp, steer_wz_max=steer_wz_max,
-                              hold_until=cmd_hold_s)
+                              hold_until=cmd_hold_s, probe=ep_probe,
+                              step0=n_replans * cadence)
             if v:
                 return v, f, n_replans, 0.0
             n_replans += 1

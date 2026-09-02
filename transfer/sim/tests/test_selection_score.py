@@ -135,6 +135,32 @@ def test_a_violation_is_not_a_term_in_the_score():
         "caller scores it with the fall sentinel")
 
 
+def test_the_k1_arm_is_scored_by_the_same_rule_as_the_candidates():
+    """The K=1 baseline must fold a tracking probe, or the paired delta measures the RULE.
+
+    A SOURCE check, because the behaviour needs a MuJoCo rig and this defect needs catching
+    without one. It is the same heuristic-pin idiom as
+    ``test_stage_grid_forwards_every_flag_the_cell_stage_reads``.
+
+    This fired for real. The ``k <= 1`` fast path called ``_chunk`` without ``probe=``, so the
+    baseline was scored on falls alone while every ``k > 1`` candidate was scored on the strict
+    criterion. Measured over 63 cells x 40 episodes: K=1 came back ``fall 0.211,
+    violation 0.000`` and K=4 ``violation 0.255, fall 0.000`` -- zero of each in the other arm,
+    which is impossible under one rule -- and it published best-of-K as COSTING 0.042 with a
+    tile-clustered interval that excluded zero. A plausible, significant, entirely wrong number.
+    """
+    import inspect
+    import re
+
+    src = inspect.getsource(_ls.run_episode_selected)
+    m = re.search(r"if k <= 1:(.*?)\n        snap = ", src, re.S)
+    assert m, "the k <= 1 fast path moved; this pin needs updating"
+    assert "probe=" in m.group(1), (
+        "the K=1 arm calls _chunk without a probe, so it is scored on falls alone while every "
+        "k > 1 candidate is scored on the strict criterion -- the paired K=1-vs-K=4 delta then "
+        "measures the failure RULE, not the selection")
+
+
 def test_a_missing_quality_head_raises_rather_than_scoring_zero():
     """A zero ``G_hat`` is the WORST return, so a silent one is not a safe fallback."""
     with pytest.raises(ValueError, match="no quality head"):
