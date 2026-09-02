@@ -297,13 +297,32 @@ class FailureCritic:
             raise FileNotFoundError(
                 f"generator checkpoint {use!r} not found (named by {os.path.basename(ckpt)})")
         if fm_pt is not None and os.path.abspath(fm_pt) != os.path.abspath(named):
-            if not os.path.exists(named):
+            # THE CHECKPOINT'S OWN HASH FIRST, when it has one. `fm_checkpoint` is an absolute
+            # PATH, so a critic fitted on one machine and read on another names a location
+            # that does not exist -- and a path is not what identifies a generator anyway.
+            # With the hash stamped, a relocated-but-identical artifact verifies; without it,
+            # the pair genuinely cannot be checked and the load still refuses.
+            want = str(ck.get("fm_checkpoint_sha256", "") or "")
+            if want:
+                got = _sha256(fm_pt)
+                if got != want:
+                    raise ValueError(
+                        f"critic {os.path.basename(ckpt)} was fitted over a generator with "
+                        f"sha256 {want[:16]}..., but {fm_pt!r} hashes {got[:16]}.... The "
+                        "encoder, state_norm, extero_norm and cmd_norm all come from it; a "
+                        "mismatch is silent.")
+            elif not os.path.exists(named):
                 raise ValueError(
                     f"--critic_fm_pt {fm_pt!r} differs from the one the critic names "
-                    f"({named!r}) and that one is missing, so the pair cannot be verified. A "
+                    f"({named!r}), that one is missing, and this checkpoint carries no "
+                    "`fm_checkpoint_sha256` -- so the pair cannot be verified by content. A "
                     "different generator loads with the right shapes and three WRONG "
-                    "normalizers, which nothing downstream can detect.")
-            if _sha256(fm_pt) != _sha256(named):
+                    "normalizers, which nothing downstream can detect. Re-fit to get the hash "
+                    "stamped, or run where the named path resolves.")
+            # ELIF, not a second check: once the stamped hash has verified, the named path is
+            # irrelevant and hashing it would fail on exactly the cross-machine case the hash
+            # exists to support. These two routes are alternatives, never both.
+            elif _sha256(fm_pt) != _sha256(named):
                 raise ValueError(
                     f"critic {os.path.basename(ckpt)} was fitted over {named!r}, but "
                     f"{fm_pt!r} has different content. The encoder, state_norm, extero_norm "

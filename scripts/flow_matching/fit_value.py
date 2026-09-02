@@ -85,6 +85,17 @@ for _d in (str(_HERE.parent / "rsl_rl"),):
 
 import rollout_outcomes as ro  # noqa: E402
 
+
+def _sha256_file(path: str) -> str:
+    """SHA-256 of a file, streamed. Stamped beside the generator's path in every checkpoint."""
+    import hashlib  # noqa: PLC0415
+
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for blk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(blk)
+    return h.hexdigest()
+
 from robot_rl.flow_matching import online, transforms, value, value_gates  # noqa: E402
 
 #: Metres per unit on the goal-offset features. DECLARED, not fitted: a critic's notion of
@@ -682,6 +693,11 @@ def main() -> int:
             # it was trained against"; see CLAUDE.md on `extero_clip` for the first.
             torch.save({"model": model.state_dict(), "variant": label,
                         "fm_checkpoint": os.path.abspath(args.fm_checkpoint),
+                        # The PATH identifies where it was; the HASH identifies WHAT it was.
+                        # Only the second survives being read on another machine, and the
+                        # generator is what supplies the frozen encoder and all three
+                        # normalizers -- a wrong one loads with correct shapes and is silent.
+                        "fm_checkpoint_sha256": _sha256_file(args.fm_checkpoint),
                         "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
                         "context_dim": int(3 + (6 if priv else 3)), "privileged": bool(priv),
                         "epochs": int(args.epochs), "stem": stem,
