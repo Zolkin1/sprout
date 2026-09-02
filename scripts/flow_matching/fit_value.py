@@ -25,6 +25,42 @@ Gates, in the order they should be read (``robot_rl.flow_matching.value_gates``)
    rises once the base is past recovery, the advantage arrives after the chunk that caused the
    failure and nothing is attributable. It also sets ``n`` empirically.
 
+**THE LABEL IS HORIZON-DEPENDENT, and that is the critic's least portable property.**
+``failed`` means "this EPISODE failed", and an episode ends where its harness says it does --
+in Isaac at ``clip_end`` (``clip_len - 1 - max_offset``), in mjeval at a distance-derived
+budget that runs 1.4-3.6x longer. The same state therefore has a genuinely higher P(fail) in
+mjeval, so a perfectly transferred critic reads as over-optimistic there with no calibration
+error at all. Two consequences worth keeping straight:
+
+* the critic's DISCRIMINATION (AUC) is horizon-robust -- inflating everyone's risk barely
+  reorders anything -- so ranking-only selection (``w_fail = 1``) is unaffected;
+* its CALIBRATION is not, so any cross-harness ECE comparison is confounded, and so is any
+  score that MIXES ``p_fail`` with ``G_hat`` and needs their levels commensurable.
+
+``critic_gate.py --isaac_matched`` was an attempt to match the window and it does not work:
+matching the budget without the initial condition and the velocity profile produced 84.7%
+timeouts (757/893) against 0.3% for the default budget, because the clip's duration implies
+its pace only if you also start at the clip's velocity. The gate now refuses to publish
+calibration numbers from a timeout-dominated run.
+
+``TODO(critic-horizon-feature)``: give the critic the REMAINING TIME as a context feature and
+fix one horizon everywhere -- e.g. let Isaac episodes run the full 20 s rather than stopping at
+``clip_end``, and read the critic at 20 s in every harness. That makes the prediction
+conditional on the horizon instead of implicitly tied to whichever harness produced the label,
+and it retires ``--isaac_matched`` entirely. **The known cost, which is not small:** the
+padded tail is not neutral. The eval harness added ``clip_end`` precisely because without it
+"a 300-frame clip becomes 6 s of motion plus 14 s of a frozen pose, and in the FM arm 14 s of
+being commanded the last frame's velocity off a finite tile" -- so training the critic to 20 s
+would fit most of its label mass on a regime that does not exist at deploy. Worth doing only
+with the tail either terminated on its own condition or excluded from the loss.
+
+``TODO(critic-standing-starts)``: collect Isaac rollouts that begin STANDING AT REST, which is
+how every mjeval and deploy episode begins and how no training episode does -- the tracker task
+spawns on a clip, mid-motion, at the clip's velocity. The ``flat`` family already contains
+standing-to-walk transitions (commands starting at 0.0), so the shape exists in the library; it
+is the terrain families that never see a standing approach. This is the initial-condition half
+of the same mismatch the horizon TODO covers.
+
 Usage::
 
     python scripts/flow_matching/fit_value.py <rollout stem> \\
