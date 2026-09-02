@@ -301,3 +301,109 @@ def value_traces(p_fail: np.ndarray, episode: np.ndarray, index: np.ndarray,
         out[int(e)] = {"index": ix[m][order], "p_fail": p[m][order],
                        "failed": bool(bad[m][0])}
     return out
+
+
+# ----------------------------------------------------------------------------------------
+# The QUALITY head.  A regression head needs different questions from a classifier, and the
+# first one is whether it did anything at all.
+# ----------------------------------------------------------------------------------------
+def spearman(a: np.ndarray, b: np.ndarray) -> float:
+    """Rank correlation, ties averaged.
+
+    Reported instead of (or beside) R^2 because it is the quantity the SELECTOR actually
+    needs: best-of-K takes an argmax, so what matters is whether the head ORDERS candidates
+    correctly, not whether its scale is right.
+
+    Args:
+        a: ``[n]``.
+        b: ``[n]``.
+
+    Returns:
+        Spearman's rho, or NaN when either side is constant (an undefined correlation, which
+        must not be reported as 0.0 -- that would read as "measured, no relationship").
+    """
+    a, b = np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64)
+    if a.size < 2 or np.ptp(a) == 0.0 or np.ptp(b) == 0.0:
+        return float("nan")
+
+    def _rank(x):
+        """Average ranks, so ties do not order by array position."""
+        order = np.argsort(x, kind="mergesort")
+        r = np.empty(x.size, dtype=np.float64)
+        r[order] = np.arange(1, x.size + 1, dtype=np.float64)
+        for v in np.unique(x):
+            m = x == v
+            if m.sum() > 1:
+                r[m] = r[m].mean()
+        return r
+
+    ra, rb = _rank(a), _rank(b)
+    ra -= ra.mean()
+    rb -= rb.mean()
+    denom = float(np.sqrt((ra * ra).sum() * (rb * rb).sum()))
+    return float((ra * rb).sum() / denom) if denom > 0 else float("nan")
+
+
+def return_gates(pred: np.ndarray, target: np.ndarray, *, n_bins: int = 10,
+                 seed: int = 0) -> dict[str, object]:
+    """What to ask of the quality head, with the collapse check FIRST.
+
+    **A regression head's characteristic failure is predicting the mean**, and it is a real
+    stationary point in this repo rather than a hypothetical: an FM arm once sat at a val loss
+    of exactly predict-the-mean for hundreds of steps while its training loss fell.  A head
+    that has collapsed there still produces finite, plausible, well-calibrated-looking numbers
+    -- its calibration curve is a single point on the diagonal -- and it ranks every candidate
+    identically, which presents as "best-of-K does nothing" rather than as a broken critic.
+
+    So ``r2`` is the headline: it is the fraction of variance explained AGAINST THE CONSTANT
+    PREDICTOR, so ``<= 0`` means the head has learned nothing a scalar could not do.  ``rho``
+    is what the selector needs (it takes an argmax, so ordering is the whole job), and
+    ``rho_shuffled`` is its null -- the same statistic on a permuted target, which must land
+    at ~0 for the rest to mean anything.
+
+    Args:
+        pred: ``[n]`` predicted normalized returns.
+        target: ``[n]`` realized normalized returns.
+        n_bins: Equal-width calibration bins over ``[0, 1]``.
+        seed: For the shuffle control.
+
+    Returns:
+        ``r2``, ``rho``, ``rho_shuffled``, ``rmse``, ``pred_std``, ``target_std``,
+        ``bin_lo`` / ``bin_hi`` / ``n`` / ``predicted`` / ``observed`` for the calibration
+        curve, and ``ece`` (count-weighted mean ``|predicted - observed|``).
+    """
+    p = np.asarray(pred, dtype=np.float64)
+    t = np.asarray(target, dtype=np.float64)
+    if p.size != t.size:
+        raise ValueError(f"pred and target disagree in length: {p.size} vs {t.size}")
+    if p.size == 0:
+        raise ValueError("no rows to gate: an empty quality set is a setup error, not a score")
+
+    ss_res = float(((t - p) ** 2).sum())
+    ss_tot = float(((t - t.mean()) ** 2).sum())
+    r2 = float("nan") if ss_tot == 0.0 else 1.0 - ss_res / ss_tot
+
+    rng = np.random.default_rng(seed)
+    edges = np.linspace(0.0, 1.0, int(n_bins) + 1)
+    idx = np.clip(np.digitize(p, edges[1:-1], right=False), 0, n_bins - 1)
+    pred_b = np.full(n_bins, np.nan)
+    obs_b = np.full(n_bins, np.nan)
+    cnt = np.zeros(n_bins, dtype=np.int64)
+    for bi in range(n_bins):
+        m = idx == bi
+        cnt[bi] = int(m.sum())
+        if cnt[bi]:
+            pred_b[bi], obs_b[bi] = float(p[m].mean()), float(t[m].mean())
+    ok = cnt > 0
+    w = cnt[ok] / max(int(cnt.sum()), 1)
+    return {
+        "r2": r2,
+        "rho": spearman(p, t),
+        "rho_shuffled": spearman(p, rng.permutation(t)),
+        "rmse": float(np.sqrt(((t - p) ** 2).mean())),
+        "pred_std": float(p.std()),
+        "target_std": float(t.std()),
+        "bin_lo": edges[:-1], "bin_hi": edges[1:], "n": cnt,
+        "predicted": pred_b, "observed": obs_b,
+        "ece": float((w * np.abs(pred_b[ok] - obs_b[ok])).sum()) if ok.any() else float("nan"),
+    }

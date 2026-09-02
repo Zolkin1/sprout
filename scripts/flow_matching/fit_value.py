@@ -247,6 +247,34 @@ def _predict(model, ctx, W, idx, priv, device, scan_hw, batch):
     return out
 
 
+@torch.no_grad()
+def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int) -> np.ndarray:
+    """``G_hat`` over ``idx``, batched, in eval mode.
+
+    Args:
+        model: The critic.
+        ctx: The FM context.
+        W: The window table.
+        idx: Row indices.
+        priv: Privileged variant.
+        device: Torch device.
+        scan_hw: Height-scan grid.
+        batch: Rows per forward pass.
+
+    Returns:
+        ``[len(idx)]`` predicted normalized returns.
+    """
+    was = model.training
+    model.eval()
+    out = np.empty(idx.size, dtype=np.float64)
+    for i in range(0, idx.size, batch):
+        j = idx[i:i + batch]
+        out[i:i + j.size] = model.quality(
+            _batch(ctx, W, j, priv, device, scan_hw)).cpu().numpy()
+    model.train(was)
+    return out
+
+
 def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: float,
          device, label: str, scan_hw, wb=None, val_tile=None,
          quality_bins: int = 0, quality_weight: float = 1.0
@@ -323,6 +351,25 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                                 y_np[j])
             log[f"{label}/{scope}/auc_epoch"] = a
             print(f"      {scope} AUC {a:.3f}")
+            if use_q:
+                # The quality head needs DIFFERENT questions from the classifier, and the
+                # first is whether it did anything: r2 is measured against the CONSTANT
+                # predictor, so <= 0 means it collapsed to the mean -- a real stationary
+                # point here, and one whose calibration curve is a single point on the
+                # diagonal (measured ECE 0.00000), so calibration alone would pass it. rho is
+                # what the selector needs, since best-of-K takes an argmax and only ordering
+                # matters.
+                jq = j[lab["g_valid"][j]]
+                if jq.size:
+                    qg = value_gates.return_gates(
+                        _predict_quality(model, ctx, W, jq, priv, device, scan_hw, batch),
+                        lab["g"][jq])
+                    log.update({f"{label}/{scope}/q_r2": qg["r2"],
+                                f"{label}/{scope}/q_rho": qg["rho"],
+                                f"{label}/{scope}/q_rmse": qg["rmse"]})
+                    print(f"      {scope} quality r2 {qg['r2']:+.3f}  rho {qg['rho']:.3f} "
+                          f"(shuffled {qg['rho_shuffled']:+.3f})  rmse {qg['rmse']:.4f}  "
+                          f"pred_sd {qg['pred_std']:.3f} vs target_sd {qg['target_std']:.3f}")
             if scope == "val_seen_tiles" and np.isfinite(a):
                 last_auc = a
                 if a > best_auc:
