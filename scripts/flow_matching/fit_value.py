@@ -349,8 +349,13 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
             opt.step()
             tot += float(loss.detach()) * j.size
         bce = tot / max(tr.size, 1)
-        print(f"  [{label}] epoch {ep + 1}/{epochs}  train BCE {bce:.4f}")
-        log = {f"{label}/train_bce": bce, f"{label}/epoch": ep + 1}
+        # Named for what it IS. With the quality head on this is BCE + w * cross-entropy over
+        # 51 bins, and the second term's floor is the target's own entropy rather than zero --
+        # so it reads ~3.4 where the survival-only loss reads ~0.31, and calling it "BCE"
+        # invites reading a working two-head fit as a broken one.
+        name = "loss (BCE + quality CE)" if use_q else "BCE"
+        print(f"  [{label}] epoch {ep + 1}/{epochs}  train {name} {bce:.4f}")
+        log = {f"{label}/train_{'loss' if use_q else 'bce'}": bce, f"{label}/epoch": ep + 1}
         y_np = lab["failed"]
         for scope, m in (("val_seen_tiles", val), ("val_UNSEEN_tiles", val_tile)):
             if m is None or not m.any():
@@ -542,6 +547,7 @@ def main() -> int:
     ctx = online.load_fm_context(args.fm_checkpoint, device=args.device)
     results = {}
     preds = {}
+    qpreds = {}
     wanted = [v.strip() for v in args.variants.split(",") if v.strip()]
     unknown = [v for v in wanted if v not in ("V_priv", "V_onboard")]
     if unknown:
@@ -552,6 +558,9 @@ def main() -> int:
             continue
         print(f"[fit] {label}")
         p_all = np.zeros(uids.size, dtype=np.float64)
+        # The QUALITY head's out-of-fold prediction, assembled exactly like p_fail so the two
+        # are on the same footing when `label_advantage` combines them into one V.
+        q_all = (np.zeros(uids.size, dtype=np.float64) if int(args.quality_bins) > 0 else None)
         for k, (tr_k, va_k) in enumerate(folds):
             if len(folds) > 1:
                 print(f"  [{label}] fold {k + 1}/{len(folds)}  "
@@ -569,6 +578,11 @@ def main() -> int:
             # a training fold would silently reintroduce the in-sample reading.
             p_all[va_k] = p_k[va_k]
             p_all[val_tile] += p_k[val_tile] / len(folds)
+            if q_all is not None:
+                q_k = _predict_quality(model, ctx, W, np.arange(uids.size), priv,
+                                       args.device, scan_hw, args.batch)
+                q_all[va_k] = q_k[va_k]
+                q_all[val_tile] += q_k[val_tile] / len(folds)
             # Checkpoint it. Without this the fit is write-only: the gates land on disk but
             # the thing that produced them does not, so labelling a rollout or scoring
             # candidate chunks would mean re-fitting from scratch.
@@ -582,6 +596,8 @@ def main() -> int:
                        os.path.join(args.out, name))
             del model
         preds[label] = p_all
+        if q_all is not None:
+            qpreds[label] = q_all
         results[label] = {}
         # With folds the seen-tile scope is EVERY training-tile window, each scored out of
         # fold -- a far larger sample than the single held-out episode split it replaces.
@@ -625,7 +641,14 @@ def main() -> int:
              failed=lab["failed"],
              first_fall_step=lab["first_fall_step"], family_code=lab["family_code"],
              num_folds=int(args.folds),
-             **{f"p_{k}": v for k, v in preds.items()})
+             # The quality half of the sidecar: the head's out-of-fold G_hat, the MEASURED
+             # per-chunk reward, and the realized return with its validity mask. Saved so
+             # `label_advantage` can form the combined V without re-reading a 12 GB rollout
+             # -- and so the shift out of `track_err_prev` is undone exactly once, here.
+             chunk_reward=lab["chunk_reward"], g=lab["g"], g_valid=lab["g_valid"],
+             gamma=float(_tracking_spec_from(meta["attrs"]).gamma),
+             **{f"p_{k}": v for k, v in preds.items()},
+             **{f"q_{k}": v for k, v in qpreds.items()})
     if wb is not None:
         if np.isfinite(gap):
             wb.log({"gap_mean_abs": gap})

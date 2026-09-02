@@ -88,6 +88,13 @@ def main() -> int:
     p.add_argument("--out", required=True, help="Output .npz sidecar.")
     p.add_argument("--variant", default="V_priv", choices=("V_priv", "V_onboard"),
                    help="Which critic to label with.")
+    p.add_argument("--w_fail", type=float, default=1.0,
+                   help="Weight on the SURVIVAL term of V = w_track*G_hat - w_fail*P(fail), "
+                        "with w_track = 1 - w_fail. 1.0 (the default) is the survival-only "
+                        "label this script has always produced and is the CONTROL ARM -- it "
+                        "takes a separate code path rather than routing through the combined "
+                        "function, so it cannot be perturbed by a change to it. Below 1 needs "
+                        "a predictions.npz from a fit with a quality head.")
     p.add_argument("--n", type=int, default=8,
                    help="Advantage look-ahead in re-plans (8 = 1.92 s at K=12, 50 Hz).")
     p.add_argument("--percentile", type=float, default=35.0,
@@ -118,7 +125,31 @@ def main() -> int:
     uid, ridx, fam = d["episode_uid"], d["replan_index"], d["family_code"]
     failed, val_tile = d["failed"].astype(bool), d["val_tile"].astype(bool)
 
-    a, boot = adv_mod.n_step_advantage(p_fail, uid, ridx, failed, args.n)
+    # The COMBINED advantage when a quality head is present and asked for.
+    # `w_fail = 1` takes the survival-only path explicitly rather than passing w_fail=1.0
+    # through the combined function: the two are equal by construction and tested to be, but
+    # routing the control arm through the code it is controlling for is how a control stops
+    # controlling for anything.
+    qkey = f"q_{args.variant}"
+    if float(args.w_fail) >= 1.0:
+        a, boot = adv_mod.n_step_advantage(p_fail, uid, ridx, failed, args.n)
+    elif qkey not in d.files:
+        raise SystemExit(
+            f"--w_fail {args.w_fail} asks for the tracking term, but {args.predictions} has "
+            f"no {qkey}. It was written by a fit with --quality_bins 0, or before the quality "
+            "head existed. Refit with a quality head, or label at --w_fail 1.")
+    else:
+        g_hat, g_valid = d[qkey], d["g_valid"].astype(bool)
+        reward = d["chunk_reward"]
+        gamma = float(d["gamma"]) if "gamma" in d.files else 0.95
+        # Rows with no measured reward (the last window of every episode) contribute a zero
+        # to the n-step sum, which is what the truncation already assumes past the end.
+        a, boot = adv_mod.combined_n_step_advantage(
+            p_fail, g_hat, np.where(g_valid, reward, 0.0), uid, ridx, failed, args.n,
+            gamma=gamma, w_fail=float(args.w_fail))
+        print(f"[label] combined V: w_fail {args.w_fail:.2f} / w_track "
+              f"{1 - float(args.w_fail):.2f}, gamma {gamma}, "
+              f"{int(g_valid.sum())}/{g_valid.size} windows carry a measured reward")
     labels, per_family = adv_mod.binarize(
         a, fam, percentile=args.percentile, null_spread=args.null_spread)
     if args.exclude_tile_holdout:
