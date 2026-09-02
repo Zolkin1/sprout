@@ -200,6 +200,27 @@ def run(args) -> int:
           f"{np.array([r['p_fail_max'] for r in ok if not r['failed']]).mean():.3f}")
     print(f"\n[gate] {len(ok)} episodes, {int(y.sum())} falls, {pr.size} re-plans "
           f"-> {args.out}/critic_gate.json")
+    # A TIMEOUT-DOMINATED RUN CANNOT SUPPORT A CALIBRATION CLAIM, and `--isaac_matched`
+    # produces one. MEASURED: on tiles 6-8/20-22/40-42 it returned 757 timeouts of 893
+    # episodes (84.7%) against 0.3% for the default budget. The clip's duration implies its
+    # pace only if you also start at the clip's VELOCITY and CONFIGURATION -- and this harness
+    # spawns standing at rest behind a 0.5 s command hold, then commands the clip's AVERAGE
+    # pace, which a robot accelerating from rest never sustains. Adding CMD_HOLD_S to the
+    # budget covers the hold and not the ramp.
+    #
+    # So the flag matches the episode WINDOW to Isaac while leaving the initial condition and
+    # the command profile un-matched, and those three are one choice. Left reachable because
+    # the budget half is still the right thing IF the spawn is ever matched too; refusing to
+    # publish a number off it is what stops it being read as a critic result. A 90% failure
+    # rate would have made the critic look catastrophically over-optimistic.
+    n_to = sum(1 for r in ok if r["verdict"] == "timeout")
+    if ok and n_to / len(ok) > 0.25:
+        print(f"[gate] REFUSING the calibration numbers above: {n_to}/{len(ok)} episodes "
+              f"({100 * n_to / len(ok):.1f}%) TIMED OUT. The failure label is then mostly a "
+              "statement about the time budget, not about the robot, and the ECE measures the "
+              "budget. With --isaac_matched this is expected and the run is not usable for "
+              "calibration: match the spawn state and the velocity profile too, or drop the "
+              "matched budget.")
     if int(y.sum()) < 100:
         print(f"[gate] WARNING: {int(y.sum())} failed episodes. An ECE and an AUC on that few "
               "positives carry a standard error around +/-0.08-0.10 and cannot support a claim "
@@ -230,7 +251,12 @@ def main() -> int:
     p.add_argument("--seeds", type=int, default=24)
     p.add_argument("--max_offset", type=int, default=50)
     p.add_argument("--isaac_matched", action="store_true",
-                   help="run each course under the ISAAC episode window -- clip_end budget, "
+                   help="NOT USABLE FOR CALIBRATION AS IT STANDS: measured 84.7% timeouts "
+                        "(757/893) against 0.3% for the default budget, because it matches "
+                        "the episode WINDOW while the spawn stays standing-at-rest behind a "
+                        "0.5 s hold and the command is the clip's AVERAGE pace. Budget, "
+                        "initial condition and velocity profile are one choice. "
+                        "run each course under the ISAAC episode window -- clip_end budget, "
                         "the clip's own endpoint as the goal, and its approach margin. Use it "
                         "whenever the critic's reading has to be in-distribution: the default "
                         "mjeval budget runs 1.4-3.6x longer than any training episode. Moves "
