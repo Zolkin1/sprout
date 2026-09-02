@@ -86,8 +86,15 @@ def run(args) -> int:
     crit = C.FailureCritic(args.critic_ckpt, fm_pt=(args.critic_fm_pt or None),
                            device=args.device)
     rows: list[dict] = []
-    for tile in [int(t) for t in args.tiles.split(",")]:
-        course = terrains.isaac_tile_course(args.clip_lib, tile, speeds=(float(args.speed),),
+    # Under --isaac_matched the pace is fixed BY the budget, so a speed grid is not a free
+    # choice there and --speeds is ignored (with a line saying so, rather than silently).
+    grid = [float(x) for x in args.speeds.split(",") if x.strip()] or [float(args.speed)]
+    if args.isaac_matched and len(grid) > 1:
+        print(f"[gate] --speeds {args.speeds} IGNORED under --isaac_matched: the commanded "
+              "pace comes from the clip once the budget is matched.")
+        grid = [float(args.speed)]
+    for tile, sp in [(t, s_) for t in [int(x) for x in args.tiles.split(",")] for s_ in grid]:
+        course = terrains.isaac_tile_course(args.clip_lib, tile, speeds=(sp,),
                                             goal_anchor_max_offset=args.max_offset,
                                             isaac_matched=args.isaac_matched)
         course = dataclasses.replace(course, name=f"tile{tile}{args.scene_tag}")
@@ -97,7 +104,7 @@ def run(args) -> int:
         # commanding an unrelated 0.8 m/s times the robot against a reference it was never
         # asked to keep up with, which shows up as a timeout and reads as a policy failure.
         # So under --isaac_matched the command comes from the course, not the CLI.
-        speed = float(args.speed)
+        speed = sp
         if args.isaac_matched:
             speed = float(course.params["clip_pace_mps"])
             print(f"[isaac_matched] tile {tile}: budget {course.budget_s:.1f} s, goal "
@@ -127,7 +134,8 @@ def run(args) -> int:
             lead = float("nan")
             if failed and p.size and (p >= 0.5).any():
                 lead = float(p.size - int(np.argmax(p >= 0.5)))
-            rows.append({"tile": tile, "seed": seed, "verdict": verdict, "failure": failure,
+            rows.append({"tile": tile, "speed": speed,
+                         "seed": seed, "verdict": verdict, "failure": failure,
                          "failed": bool(failed), "n": int(p.size), "lead_replans": lead,
                          **scorer.summary(), "trace": [round(float(x), 4) for x in p]})
             print(f"  seed {seed:>2}: {verdict:8s} n={p.size:>3} "
@@ -155,9 +163,47 @@ def run(args) -> int:
               f"(Isaac held-out tiles: 4.75 chunks)")
     else:
         print("[gate 2] no failed episode crossed 0.5 -- nothing to select on")
-    print(f"[gate 3] failures  max p_fail: {np.array([r['p_fail_max'] for r in ok if r['failed']]).mean():.3f}"
-          f"   successes: {np.array([r['p_fail_max'] for r in ok if not r['failed']]).mean():.3f}")
-    print(f"\n[gate] {len(ok)} episodes, {int(y.sum())} falls -> {args.out}/critic_gate.json")
+    # ---- gate 3: CALIBRATION, per re-plan ------------------------------------------------
+    #
+    # This used to print only the mean `p_fail_max` on failures versus successes, which is a
+    # separation statistic and not a reliability measure -- the docstring claimed calibration
+    # and the code did not deliver it, so there has never been a MuJoCo ECE.
+    #
+    # The unit is the RE-PLAN, not the episode, because that is the unit the critic was fitted
+    # on: `fit_value` labels every WINDOW of an episode with that episode's outcome. Pairing
+    # each trace entry with its episode's verdict reproduces that pairing exactly, so this ECE
+    # is directly comparable to the fit's own (v2, held-out tiles: 0.039).
+    #
+    # `value_gates.calibration` is imported rather than reimplemented, for the same reason:
+    # equal-width bins and the same ECE/MCE definition, so the two numbers mean one thing.
+    # It needs torch on the path only transitively; the import is local so a torch-free
+    # mjeval run that never asks for a critic is unaffected.
+    from robot_rl.flow_matching import value_gates  # noqa: PLC0415
+
+    pr = np.concatenate([np.asarray(r["trace"], dtype=np.float64) for r in ok]) if ok else \
+        np.zeros(0)
+    yr = np.concatenate([np.full(len(r["trace"]), bool(r["failed"])) for r in ok]) if ok else \
+        np.zeros(0, dtype=bool)
+    cal = value_gates.calibration(pr, yr)
+    print(f"\n[gate 3] CALIBRATION over {pr.size} re-plans "
+          f"({int(yr.sum())} in failed episodes, base rate {yr.mean():.4f})")
+    print(f"         ECE {float(cal['ece']):.4f}   MCE {float(cal['mce']):.4f}"
+          f"   (Isaac held-out tiles, same definition: 0.039)")
+    print(f"         {'bin':>12s} {'n':>7s} {'predicted':>10s} {'observed':>9s}")
+    for lo, hi, n, pd_, ob in zip(np.linspace(0, 1, 11)[:-1], np.linspace(0, 1, 11)[1:],
+                                  cal["count"], cal["predicted"], cal["observed"]):
+        if int(n) > 0:
+            print(f"         [{lo:.1f},{hi:.1f})  {int(n):7d} {pd_:10.4f} {ob:9.4f}")
+    # Kept as a separate line, correctly labelled: it is a separation statistic.
+    print(f"[gate 3b] separation -- mean max p_fail, failures "
+          f"{np.array([r['p_fail_max'] for r in ok if r['failed']]).mean():.3f} vs successes "
+          f"{np.array([r['p_fail_max'] for r in ok if not r['failed']]).mean():.3f}")
+    print(f"\n[gate] {len(ok)} episodes, {int(y.sum())} falls, {pr.size} re-plans "
+          f"-> {args.out}/critic_gate.json")
+    if int(y.sum()) < 100:
+        print(f"[gate] WARNING: {int(y.sum())} failed episodes. An ECE and an AUC on that few "
+              "positives carry a standard error around +/-0.08-0.10 and cannot support a claim "
+              "about calibration. Raise --seeds / --speeds.")
     return 0
 
 
@@ -174,6 +220,13 @@ def main() -> int:
     p.add_argument("--clip_lib", required=True)
     p.add_argument("--tiles", default="6,20")
     p.add_argument("--speed", type=float, default=0.8)
+    p.add_argument("--speeds", default="",
+                   help="comma list of commanded speeds, run as a GRID against --tiles. This "
+                        "is how the gate reaches enough failed episodes to say anything: at "
+                        "the default 2 tiles x 24 seeds it collected 48 episodes and 11 "
+                        "falls, on which an AUC carries about +/-0.09 and an ECE means "
+                        "nothing. Ignored under --isaac_matched, where the pace is fixed by "
+                        "the budget and is not free.")
     p.add_argument("--seeds", type=int, default=24)
     p.add_argument("--max_offset", type=int, default=50)
     p.add_argument("--isaac_matched", action="store_true",
