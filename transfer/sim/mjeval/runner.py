@@ -179,11 +179,20 @@ class ArmRun:
     cmd_hold_s: float = terrains.CMD_HOLD_S
     #: tracking_spec.json for the STRICT checks; "" leaves them off entirely.
     tracking_spec: str = ""
-    #: End an episode at the first strict violation. A BUDGET decision, not a semantic one --
-    #: the verdict is `schema.derive_success` either way, and `success_strict` is identical
-    #: with and without it. On for a collection run, where only pre-latch states are used and
-    #: a K=4 selector spends ~4 x 95 ms per chunk carrying an already-lost episode.
-    stop_on_violation: bool = False
+    #: End an episode at the first strict violation.  **ON by default: everything downstream
+    #: of a RECORDING treats a violation as a hard termination**, because under the strict rule
+    #: it IS a failure and grading it instead would leave the score and
+    #: `schema.derive_success` each holding half of what "failed" means.  Latching without
+    #: terminating is right only for the recording itself, where it keeps the threshold an
+    #: offline knob.
+    #:
+    #: Flipping this default changes NO strict number -- the verdict is
+    #: `schema.derive_success` either way and `success_strict` is identical with and without
+    #: it, which is asserted.  What it costs is the LOOSE columns for a violating episode,
+    #: since the steps after the latch never happen; the loose answer stays recoverable from
+    #: the recording, which latched.  What it buys is not spending ~4 x 95 ms per chunk of a
+    #: K=4 selector carrying an already-lost episode.
+    stop_on_violation: bool = True
     zero_noise: bool = True
     fm_seed: int = 0
     shards: int = 1
@@ -551,7 +560,7 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 steer_wz_max: float = STEER_WZ_MAX,
                 cfg_hold: float = terrains.CMD_HOLD_S,
                 probe=None, tracking_spec=None,
-                stop_on_violation: bool = False) -> tuple[str, str, Any]:
+                stop_on_violation: bool = True) -> tuple[str, str, Any]:
     """One deterministic trial: spawn, drive at ``cmd``, and stop on a fall, the target or time.
 
     **Three orderings inside the loop are load-bearing.**  The fall test runs BEFORE the target
@@ -578,12 +587,15 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             is deterministic, the captured re-run reproduces its table row exactly, which is
             what makes the replay THE episode rather than a similar one.
         tracking_spec: A ``deploy.tracking_error.TrackingErrorSpec`` turning on the STRICT
-            checks, or ``None`` to leave them off. LATCHED, not terminating (unless
-            ``stop_on_violation``), so one run yields the strict and the loose verdict both.
-        stop_on_violation: End the episode at the first strict violation. A BUDGET flag, not a
-            semantic one: the verdict comes from ``schema.derive_success`` either way and
-            ``success_strict`` is identical with and without it, so the only difference is that
-            the loose columns stop being available for that episode.
+            checks, or ``None`` to leave them off.
+        stop_on_violation: End the episode at the first strict violation. **Defaults True**:
+            a violation is a failure under the strict rule, so everything downstream of a
+            recording terminates on it. The verdict comes from ``schema.derive_success``
+            either way and ``success_strict`` is identical with and without it, so this
+            changes no strict number -- it costs the LOOSE columns for a violating episode
+            (still recoverable from the recording, which latches) and saves the compute of
+            carrying an already-lost episode. Pass ``False`` to latch instead, which is what
+            a run wanting both verdicts side by side needs.
         probe: Optional ``(robot, policy, state, is_replan) -> None``, called once per control
             step at the same point as ``recorder`` but ALSO handed the state dict the policy
             was just given, and told whether this step carried a re-plan.  That is what the

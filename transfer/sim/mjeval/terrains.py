@@ -209,12 +209,15 @@ CLASS_CODES: dict[str, int] = {
 
 #: Verdicts, as stored in the ``verdict`` column.
 #:
-#: ``violation`` appears ONLY under ``run_episode(stop_on_violation=True)``, a budget flag for
-#: collection runs: the episode was cut at the first strict tracking violation because
-#: everything after it is off the pre-latch distribution the critic is fitted on. It is NOT a
-#: fourth outcome of the task -- ``derive_success`` scores it a failure under the strict rule
-#: exactly as the un-cut episode would have been, and under the LOOSE rule the episode simply
-#: has no answer, which is the documented cost of the flag.
+#: ``violation`` is the NORMAL outcome of a strict tracking failure: the episode was ended at
+#: the first crossing of the lateral / height / tilt bounds against the served reference.
+#: ``run_episode(stop_on_violation=...)`` defaults True, so everything downstream of a
+#: RECORDING terminates on it -- a violation is a failure under the strict rule, and grading it
+#: instead would leave the selector's score and ``derive_success`` each holding half of what
+#: "failed" means. Only the recording latches, which is what keeps the threshold an offline
+#: knob. ``derive_success`` scores it a failure exactly as the un-cut episode would have been,
+#: so no strict number depends on which mode ran; under the LOOSE rule a terminated episode
+#: simply has no answer, which is the cost.
 VERDICT_CODES: dict[str, int] = {"success": 0, "fall": 1, "timeout": 2, "interrupted": 3,
                                  "violation": 4}
 

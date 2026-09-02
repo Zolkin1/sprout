@@ -449,6 +449,30 @@ Two settings are asserted rather than defaulted, because each is silent when wro
   the recording.
 * **A calibrated (non-bootstrap) goal region**, for the reason in the previous section.
 
+**One gap to close on the next collection**, shared by every recording so far (v2 at 128 envs
+and v4 at 8192 were both taken on `-depth-play`):
+
+* `TODO(record-camera-dr)` — **the camera and the reference window see no DR.** The `-play`
+  task nulls all six depth-camera events (extrinsics, intrinsics, noise/dropout — per camera,
+  via `apply_depth_play_trims`, which nulls every event whose func lives in `mdp.events.depth`)
+  plus `randomize_ground_contact_friction`, and sets `enable_corruption = False` on both actor
+  obs groups. Only the seven `startup`-mode physical terms survive, and being `startup` they are
+  fixed for the run — so each env is a different robot but its draw is confounded with whichever
+  clips it got. Depth is the generator's only exteroception, so the critic has only ever scored a
+  perfect camera. **Do not fix this by switching to the train task**: it has no `clip_end`
+  termination (the play trims install it), so every episode would run the padded 20 s. The fix is
+  a recorder flag that undoes the DR half of the trims and nothing else.
+**One action draw per state is not on that list, deliberately.** No two rows share a state
+(spawn jitter, startup DR and flow noise all differ), and that is the ordinary situation in RL —
+`V` is fitted by regression *across* states, so its value at `s` comes from the neighbourhood
+rather than from repeats at `s`, and every standard actor-critic advantage estimator uses exactly
+one action sample per visited state. The lever is **coverage**, which is what 8192 envs bought and
+what the DR above is asking for. Repeats buy an empirical baseline in place of a learned one (the
+GRPO/RLOO idiom), which pays when the critic is the weak part and when a reset is free — neither
+holds here. The one place a paired sample really is needed is *measurement* of how much of an
+outcome is the noise draw, and `transfer/sim/fm_variance_probe.py` already answers that with no
+state restore at all: a fixed noise tape replayed from spawn in MuJoCo is exactly deterministic.
+
 Measured on the shipped pair: **24.3 kB per window** (f16 exteroception and height scan, f32
 plan), so ~6 GB per 250k windows.
 

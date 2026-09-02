@@ -217,6 +217,36 @@ class ProprioRing:
             self.buf[m] = 0.0
 
 
+def first_bad_step(cols: dict[str, np.ndarray], *, strict: bool = True) -> np.ndarray:
+    """The step an episode FAILED on: the fall crossing or the strict violation, first wins.
+
+    One implementation, because two consumers need it for different purposes and they must not
+    be able to disagree about when an episode ended: :func:`terminal_reward` scores the outcome
+    from it, and ``fit_value``'s drop-after-latch cuts the training set on it.  A window kept
+    past the step its own label was decided by is a state that termination never produces.
+
+    ``-1`` means "never" on BOTH limbs, so they are combined by a min over the non-negative
+    entries.  A plain ``np.minimum`` returns -1 the moment either limb never fired, which reads
+    as "failed at step -1" and is the whole reason this is a named function.
+
+    Args:
+        cols: Episode columns, needing ``first_fall_step`` and -- for the strict rule --
+            ``first_violation_step``.
+        strict: Include the tracking violation.  ``False`` gives the LOOSE rule, so a number
+            published before the strict checks existed stays reproducible from the same table.
+
+    Returns:
+        ``(n_episodes,)`` int64 step indices, ``-1`` where the episode never failed.
+    """
+    ff = np.asarray(cols["first_fall_step"], dtype=np.int64)
+    if not strict or "first_violation_step" not in cols:
+        return ff
+    fv = np.asarray(cols["first_violation_step"], dtype=np.int64)
+    big = np.iinfo(np.int64).max
+    out = np.minimum(np.where(ff < 0, big, ff), np.where(fv < 0, big, fv))
+    return np.where(out == big, -1, out)
+
+
 def terminal_reward(cols: dict[str, np.ndarray], *, strict: bool = True) -> np.ndarray:
     """The sparse terminal reward, stated once so every consumer reads the same rule.
 
@@ -255,21 +285,13 @@ def terminal_reward(cols: dict[str, np.ndarray], *, strict: bool = True) -> np.n
     """
     arrived = np.asarray(cols["reached_goal"]).astype(bool)
     fg = np.asarray(cols["first_goal_step"])
-    ff = np.asarray(cols["first_fall_step"])
     # WHICHEVER CAME FIRST. An episode that reaches the goal and then fails in the run-out
     # did the task; one that fails and is later dragged across the line by a reset did not.
     # This is `mjeval`'s convention -- it tests the failure predicate before the target every
     # step and breaks on either -- and it is worth 17 points here: measured on a 298-episode
     # rollout, 51 episodes arrived and then fell, which a plain `arrived AND not terminated`
     # scored as failures. That is larger than any policy difference this is meant to resolve.
-    #
-    # `-1` means "never" on BOTH limbs, so the two are combined by a min over the non-negative
-    # entries; a plain `np.minimum` would return -1 the moment either limb never fired.
-    if strict and "first_violation_step" in cols:
-        fv = np.asarray(cols["first_violation_step"])
-        big = np.iinfo(np.int64).max
-        ff = np.minimum(np.where(ff < 0, big, ff), np.where(fv < 0, big, fv))
-        ff = np.where(ff == big, -1, ff)
+    ff = first_bad_step(cols, strict=strict)
     failed_first = (ff >= 0) & ((fg < 0) | (ff < fg))
     return np.where(arrived & ~failed_first, 0.0, -1.0).astype(np.float32)
 

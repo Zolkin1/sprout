@@ -27,6 +27,44 @@ Two settings are asserted rather than left to the caller, because each is silent
   "success" would mean "stayed upright for N steps" and a reward built on it is maximised by
   standing still.
 
+One known gap in the recorded DISTRIBUTION, shared by every recording to date (v2 at 128 envs
+and v4 at 8192 were both taken on ``-depth-play``):
+
+* ``TODO(record-camera-dr)`` -- **the camera sees no domain randomisation, and neither does
+  the reference window.**  This recorder is run on the ``-play`` task, and
+  ``g1_depth_env_cfg.apply_depth_play_trims`` nulls every event whose func lives in
+  ``mdp.events.depth`` -- all six of them: extrinsics, intrinsics and the noise/dropout
+  resample, per camera.  ``_apply_tracker_play_trims`` additionally nulls
+  ``randomize_ground_contact_friction`` and sets ``enable_corruption = False`` on BOTH actor
+  obs groups.  What survives is the seven ``startup``-mode physical terms (joint defaults,
+  gains, joint friction, torso mass, torso/backpack CoM, armature), so each env is a
+  different robot -- but fixed for the whole run, so a draw is confounded with whichever
+  clips that env happened to get.  Depth is the generator's ONLY exteroception, so a critic
+  fitted here has only ever scored a perfect camera.  This is the same trap
+  ``scripts/flow_matching/README.md`` already warns about for ``record_data.py``.
+  **The fix is NOT "record on the train task".**  The train task has no ``clip_end``
+  termination (the play trims install it), so every episode would run the padded 20 s -- a
+  300-frame clip becomes 6 s of motion and then 14 s of a saturated command off a finite
+  tile, which is exactly what the eval harness adds ``clip_end`` to avoid.  What is wanted is
+  a recorder flag that undoes the DR half of the play trims and leaves the episode-boundary
+  and scene half alone.
+**One action draw per state is not a gap, and is deliberately NOT a todo.**  A clip repeats
+across envs (2289 clips over 8192 envs) but no two rows share a STATE -- spawn jitter, the
+env's startup DR draw and the flow noise all differ at once.  That is the ordinary situation
+in RL: ``V-hat`` is fitted by regression ACROSS states, so its value at ``s`` comes from the
+neighbourhood rather than from repeats at ``s``, and every standard actor-critic advantage
+estimator is built on exactly one action sample per visited state.  What the fit needs is
+COVERAGE, which is what moving to 8192 envs bought and what ``TODO(record-camera-dr)`` above
+is asking for -- DR widens the conditioning distribution the critic must generalise over.
+
+Repeats at a state buy an empirical baseline in place of a learned one (the GRPO/RLOO idiom),
+which pays when the critic is the unreliable part and when a state can be reset to for free.
+Here neither holds: there is a critic, and in Isaac a reset costs a full state copy.  Where a
+paired sample IS load-bearing is MEASUREMENT -- how much of an outcome is the noise draw --
+and that is already answered without any restore by ``transfer/sim/fm_variance_probe.py``,
+which replays a fixed noise tape from spawn in MuJoCo and is exactly deterministic.  The
+label's own acceptance test is the G2 band gate in ``label_advantage.py``.
+
 Example::
 
     python scripts/rsl_rl/record_rollouts.py \\

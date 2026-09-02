@@ -98,9 +98,14 @@ def _load(stem: str, max_windows: int) -> tuple[dict, dict, dict]:
 
     live = ~E["censored"].astype(bool)
     reward = ro.terminal_reward(E)
-    outcome = {int(u): (float(r), bool(l), int(ff), int(fam))
-               for u, r, l, ff, fam in zip(E["episode_uid"], reward, live,
-                                           E["first_fall_step"], E["family_code"])}
+    # `first_bad` is what drop-after-latch below cuts on: the fall crossing or the strict
+    # violation, whichever came FIRST. Taken from the same table `terminal_reward` scored, so
+    # the label and the cut cannot disagree about when the episode ended.
+    first_bad = ro.first_bad_step(E)
+    outcome = {int(u): (float(r), bool(l), int(ff), int(fam), int(fb))
+               for u, r, l, ff, fam, fb in zip(E["episode_uid"], reward, live,
+                                               E["first_fall_step"], E["family_code"],
+                                               first_bad)}
     missing = sorted({int(u) for u in W["episode_uid"]} - set(outcome))
     if missing:
         raise SystemExit(
@@ -114,6 +119,39 @@ def _load(stem: str, max_windows: int) -> tuple[dict, dict, dict]:
         "first_fall_step": np.array([outcome[int(u)][2] for u in W["episode_uid"]]),
         "family_code": np.array([outcome[int(u)][3] for u in W["episode_uid"]]),
     }
+    # DROP EVERY WINDOW AT OR AFTER THE FIRST BAD STEP -- the fall crossing or the strict
+    # tracking violation, whichever came first.
+    #
+    # The recording LATCHES rather than terminating, which is what keeps the threshold an
+    # offline knob: lowering a bound just moves the latch earlier and drops more rows, a
+    # relabel instead of a re-collection. But every consumer downstream of the recording
+    # treats a violation as a TERMINATION, so the training set has to be the one termination
+    # would have produced -- windows `0 .. t-1`, labelled by the strict outcome. That is
+    # bit-for-bit the same dataset, because under termination the later states never exist.
+    #
+    # Without this the fit is asked to do two impossible things at once. The post-latch
+    # windows LOOK healthy -- the robot recovered, which is why the episode kept going -- yet
+    # carry the failure label, so the survival head is fitted on states termination would
+    # never have shown it. And the quality target for a PRE-latch window sums chunk rewards
+    # from chunks that termination prevents, so `G` is contaminated by post-failure behaviour
+    # rather than being absorbing at the failure. Measured on `v4_big`: 33,428 of 446,131
+    # windows (7.49%), 20,580 of them after a violation.
+    #
+    # Placed BEFORE the return computation on purpose: `normalized_returns` recurses backwards
+    # over each episode's remaining chunks, so dropping first is what makes the tail absorbing
+    # instead of merely zeroed at the end.
+    K = int(ea.get("fm_update_every", 12))
+    first_bad = np.array([outcome[int(u)][4] for u in W["episode_uid"]])
+    step_of = W["replan_index"].astype(np.int64) * K
+    alive = ~((first_bad >= 0) & (step_of >= first_bad))
+    if not alive.all():
+        n_ep_touched = int(np.unique(W["episode_uid"][~alive]).size)
+        print(f"[fit] drop-after-latch: {int((~alive).sum())}/{alive.size} windows "
+              f"({100 * (~alive).mean():.2f}%) at or after the first bad step, over "
+              f"{n_ep_touched} episode(s). These do not exist under termination.")
+        W = {k: v[alive] for k, v in W.items()}
+        lab = {k: v[alive] for k, v in lab.items()}
+
     # The QUALITY head's target. Unconditional: the column is part of schema 2 and the
     # reader refuses anything else, so a guard here would be dead code pretending to be a
     # fallback. `--quality_bins 0` is how the survival-only control arm is selected.
@@ -412,6 +450,12 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
 
 def main() -> int:
     """Entry point."""
+    # Line-buffer stdout. A fit is a ~1 h job that is normally redirected to a file, where
+    # python block-buffers stdout -- so every `[fit]` line sits in a 8 kB buffer while wandb's
+    # own output (stderr, unbuffered) lands immediately. The log then shows the wandb banner
+    # and nothing else, which reads as "still loading" when the job is several epochs in.
+    # That misread has now cost twice, here and in `record_rollouts.py`'s progress print.
+    sys.stdout.reconfigure(line_buffering=True)
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("stem", help="rollout stem: <stem>.h5 and <stem>.episodes.h5")
@@ -468,6 +512,10 @@ def main() -> int:
         W = {k: v[keep] for k, v in W.items()}
         lab = {k: v[keep] for k, v in lab.items()}
 
+    # Resolved ONCE and carried, because three places need it -- the checkpoint stamp, the
+    # sidecar's gamma, and the printed provenance -- and re-deriving it per fold would let
+    # them disagree if the derivation ever grew a default.
+    track_spec = _tracking_spec_from(E["attrs"])
     uids = W["episode_uid"]
     n_ep = int(np.unique(uids).size)
     n_fail_ep = int(np.unique(uids[lab["failed"]]).size)
@@ -587,12 +635,25 @@ def main() -> int:
             # the thing that produced them does not, so labelling a rollout or scoring
             # candidate chunks would mean re-fitting from scratch.
             name = f"{label}.pt" if len(folds) == 1 else f"{label}.fold{k}.pt"
+            # The QUALITY head's shape and the reward it was fitted against travel WITH the
+            # checkpoint. `quality_bins` because a consumer has to build the head before it
+            # can load into it, and a strict `load_state_dict` on a mis-sized head fails with
+            # a shape error rather than a diagnosis. `tracking_spec` because the head predicts
+            # a return under one set of sigmas, bounds and gamma: a selector that measures the
+            # reward under a DIFFERENT spec and adds it to this head's prediction is summing
+            # two different quantities, and both are plausible floats. This is the fourth
+            # instance in this repo of "a checkpoint's saved config is the only record of what
+            # it was trained against"; see CLAUDE.md on `extero_clip` for the first.
             torch.save({"model": model.state_dict(), "variant": label,
                         "fm_checkpoint": os.path.abspath(args.fm_checkpoint),
                         "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
                         "context_dim": int(3 + (6 if priv else 3)), "privileged": bool(priv),
                         "epochs": int(args.epochs), "stem": stem,
-                        "fold": int(k), "num_folds": int(len(folds))},
+                        "fold": int(k), "num_folds": int(len(folds)),
+                        "quality_bins": int(args.quality_bins),
+                        "quality_weight": float(args.quality_weight),
+                        "tracking_spec": track_spec.to_dict(),
+                        "gamma": float(track_spec.gamma)},
                        os.path.join(args.out, name))
             del model
         preds[label] = p_all
@@ -646,7 +707,7 @@ def main() -> int:
              # `label_advantage` can form the combined V without re-reading a 12 GB rollout
              # -- and so the shift out of `track_err_prev` is undone exactly once, here.
              chunk_reward=lab["chunk_reward"], g=lab["g"], g_valid=lab["g_valid"],
-             gamma=float(_tracking_spec_from(meta["attrs"]).gamma),
+             gamma=float(track_spec.gamma),
              **{f"p_{k}": v for k, v in preds.items()},
              **{f"q_{k}": v for k, v in qpreds.items()})
     if wb is not None:

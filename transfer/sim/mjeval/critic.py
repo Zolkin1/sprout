@@ -312,20 +312,83 @@ class FailureCritic:
         self.privileged = bool(ck["privileged"])
         self.variant = str(ck.get("variant", "?"))
         self.ctx = online.load_fm_context(use, device=device)
+        # The QUALITY head's width has to be known BEFORE the load, because the head is built
+        # by the ctor and `load_state_dict` is strict. Preference order, and the fallback is
+        # not a guess: `quality_support` is a persistent buffer of exactly `quality_bins` bin
+        # centres, so an unstamped checkpoint still STATES its own width -- it just states it
+        # in the tensor rather than in a scalar. Stamped is better only because it also
+        # carries the spec, which no shape can recover.
+        self.quality_bins = int(ck.get("quality_bins", 0)) or int(
+            ck["model"]["quality_support"].numel() if "quality_support" in ck["model"] else 0)
         self.model = value.FlowValueModel(
             copy.deepcopy(self.ctx.model),
             scan_hw=(tuple(ck["scan_hw"]) if self.privileged else None),
             proprio_dim=(int(ck["proprio_hw"][-1]) if self.privileged else 0),
             proprio_steps=(int(ck["proprio_hw"][0]) if self.privileged else 0),
-            context_dim=int(ck["context_dim"])).to(device)
+            context_dim=int(ck["context_dim"]),
+            quality_bins=self.quality_bins).to(device)
         self.model.load_state_dict(ck["model"])
         self.model.eval()
+        # The reward the quality head predicts a RETURN of. `None` on a pre-stamp checkpoint,
+        # which is why `live_select` requires one from somewhere and refuses to invent it: the
+        # head's G_hat is a return under one set of sigmas, bounds and gamma, and adding a
+        # reward measured under a different spec to it sums two different quantities. Both are
+        # plausible floats and nothing downstream can tell them apart.
+        self.tracking_spec = None
+        if ck.get("tracking_spec"):
+            from deploy.tracking_error import TrackingErrorSpec  # noqa: PLC0415
+            self.tracking_spec = TrackingErrorSpec.from_dict(dict(ck["tracking_spec"]))
+        self.gamma = float(ck.get("gamma", 0.0)) or (
+            float(self.tracking_spec.gamma) if self.tracking_spec is not None else 0.0)
         self.scan_hw = tuple(ck["scan_hw"]) if self.privileged else None
         if self.privileged and self.scan_hw != SCAN_HW:
             raise ValueError(f"critic expects scan {self.scan_hw}, this port casts {SCAN_HW}")
 
+    @property
+    def has_quality(self) -> bool:
+        """Whether this checkpoint carries a quality head at all."""
+        return self.quality_bins > 0
+
     def p_fail(self, x: CriticInputs) -> float:
         """Failure probability for one state.
+
+        Args:
+            x: The raw inputs.
+
+        Returns:
+            ``P(fail)`` in [0, 1].
+        """
+        import torch  # noqa: PLC0415
+
+        with torch.no_grad():
+            return float(self.model.p_fail(self._inputs(x)).item())
+
+    def read(self, x: CriticInputs) -> tuple[float, float | None]:
+        """Both heads for one state, from ONE encoder pass.
+
+        What the selector calls. Two separate calls would run the borrowed layer stack twice
+        over identical tokens, and the stack is ~97% of the parameters and essentially all of
+        the cost -- so reading the second head is free and reading it separately is not.
+
+        Args:
+            x: The raw inputs.
+
+        Returns:
+            ``(P(fail), G_hat)``, the second ``None`` if this checkpoint has no quality head.
+        """
+        import torch  # noqa: PLC0415
+
+        with torch.no_grad():
+            v = self._inputs(x)
+            fail_logit, q_logits = self.model.heads(v)
+            p = float(torch.sigmoid(fail_logit).item())
+            if q_logits is None:
+                return p, None
+            probs = torch.softmax(q_logits, dim=-1)
+            return p, float((probs * self.model.quality_support).sum(dim=-1).item())
+
+    def _inputs(self, x: CriticInputs):
+        """Normalize and assemble one state into a ``value.ValueInputs``.
 
         Normalizer order mirrors ``fit_value._batch`` exactly: ``state_norm`` on the history,
         ``extero_norm`` on the flattened row (NO sanitize -- the recording's column is not
@@ -336,7 +399,7 @@ class FailureCritic:
             x: The raw inputs.
 
         Returns:
-            ``P(fail)`` in [0, 1].
+            The assembled batch of one.
         """
         import torch  # noqa: PLC0415
         from goal_anchor import GOAL_SCALE_M  # noqa: PLC0415
@@ -367,12 +430,10 @@ class FailureCritic:
         # robot measures the linear half without odometry. Slicing it away is what makes the
         # two variants' gap a statement about information rather than about architecture.
         context = t(np.concatenate([goal, tw if self.privileged else tw[3:]]))
-        with torch.no_grad():
-            v = value.ValueInputs(
-                history=hist, extero=ext, cmd_tokens=cmd,
-                history_null=t(np.array([x.history_null]), torch.bool).reshape(1),
-                scan=scan, proprio=proprio, context=context)
-            return float(self.model.p_fail(v).item())
+        return value.ValueInputs(
+            history=hist, extero=ext, cmd_tokens=cmd,
+            history_null=t(np.array([x.history_null]), torch.bool).reshape(1),
+            scan=scan, proprio=proprio, context=context)
 
 
 class CriticScorer:
