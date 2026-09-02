@@ -89,6 +89,12 @@ _POLICY_FIELDS = (
     "_pred", "_pred_valid", "_pred_idx", "_anchor_pos", "_anchor_quat", "_plan_id",
     "_last_plan", "_last_reference_window", "_last_served_window", "_lead_buf",
     "_future_cmd_override", "_clip_step",
+    # Read by `served_reference_w()`, which the tracking probe calls every step, and cleared
+    # by `reset()` -- so it is live policy state. Its partner `_last_served_window` was here
+    # and it was not; the omission was invisible only because `create_obs` always precedes
+    # the read within a step. Any caller reading the served reference straight after a
+    # restore would have lifted the winner's window through candidate K-1's anchor.
+    "_last_served_anchor",
 )
 
 
@@ -636,12 +642,24 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
     mjrunner._reset_episode_state(policy, fm_lag)
 
     cadence = int(getattr(policy, "fm_update_every", 12))
-    ring = C.ProprioRing() if (crit is not None and crit.privileged) else None
+    # THE PROPRIO RING IS PER CANDIDATE, and the episode's is the WINNER's.
+    #
+    # It used to be one object shared by every candidate and absent from `Snapshot`, so a
+    # candidate began with its predecessor's rows and the episode carried candidate K-1's
+    # away. That was harmless by arithmetic coincidence ALONE -- the ring is 10 rows and the
+    # chunk 12, so each candidate fully overwrote it before the critic read -- and moving the
+    # critic read to the re-plan (below) destroys that coincidence. The two are one fix.
+    ep_ring = C.ProprioRing() if (crit is not None and crit.privileged) else None
 
-    def _ring(robot_, policy_, state):
-        if ring is not None:
-            ring.push(state["joint_pos"], state["joint_vel"], state["base_ang_vel"],
-                      C.projected_gravity_b(state["root_quat"]))
+    def _push_ring(target):
+        """A per-step scorer callback that fills ``target``, or a no-op for ``None``."""
+        def _cb(robot_, policy_, state):
+            if target is not None:
+                target.push(state["joint_pos"], state["joint_vel"], state["base_ang_vel"],
+                            C.projected_gravity_b(state["root_quat"]))
+        return _cb
+
+    _ring = _push_ring(ep_ring)
 
     z0 = float(robot.mj_data.qpos[2])
     zex = [z0, z0]
@@ -689,6 +707,10 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
         want_cands = recorder is not None and recorder.record_candidates
         cand_plans, cand_scores, cand_verdict = [], [], []
         cand_pfail, cand_ghat, cand_reward = [], [], []
+        #: EVERY candidate's score, collected unconditionally -- `cand_scores` above is only
+        #: filled under --record_candidates, and the `spread` diagnostic must not depend on a
+        #: recording flag being set.
+        cand_scores_all: list[float] = []
         for cand in range(k):
             if cand:
                 snap.restore(robot, policy, fm_lag)
@@ -735,17 +757,18 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             # makes that unconditional rather than dependent on a reset call being reached.
             cprobe = (tracking.TrackingProbe(spec, hold_until_s=cmd_hold_s)
                       if spec is not None else None)
-            v, f, st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, cz, scorer=_ring,
+            # ...and its OWN ring, branched from the episode's. See `_push_ring`.
+            cand_ring = copy.deepcopy(ep_ring) if ep_ring is not None else None
+            v, f, st = _chunk(rig, policy, fm_lag, cmd, cadence, cfg, cz,
+                             scorer=_push_ring(cand_ring),
                              steer_kp=steer_kp, steer_wz_max=steer_wz_max,
                              hold_until=cmd_hold_s, capture=cap, probe=cprobe,
                              step0=n_replans * cadence)
-            # THE COMMIT POINT IS THE END OF THE FIRST CHUNK. With a lookahead the
-            # continuation moves the sim past the state the episode actually resumes from, so
-            # the snapshot has to be taken here, between the chunk being committed and the
-            # rollout that merely scores it. At lookahead=1 it is taken below instead, after
-            # the critic read, exactly where it always was -- so that path stays bit-identical
-            # to every number already measured with it.
-            post = Snapshot(robot, policy, fm_lag) if lookahead > 1 else None
+            # THE COMMIT POINT IS THE END OF THE FIRST CHUNK, unconditionally now. With a
+            # lookahead the continuation moves the sim past where the episode resumes; since
+            # the scoring step below does the same at lookahead=1, the snapshot is taken here
+            # on every path rather than after the critic read.
+            post = Snapshot(robot, policy, fm_lag)
             v_score, st_score = v, st
             if lookahead > 1 and not v and st is not None:
                 # The branch's OWN z extremes travel into the continuation (the traversal gate
@@ -760,13 +783,49 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                         [seed, n_replans, depth, _LOOKAHEAD_TAG] if same_noise
                         else [seed, n_replans, cand, depth, _LOOKAHEAD_TAG])
                     v_score, _fl, st_look = _chunk(
-                        rig, policy, fm_lag, cmd, cadence, cfg, cz_look, scorer=_ring,
+                        rig, policy, fm_lag, cmd, cadence, cfg, cz_look,
+                        scorer=_push_ring(cand_ring),
                         steer_kp=steer_kp, steer_wz_max=steer_wz_max, hold_until=cmd_hold_s,
                         probe=cprobe, step0=(n_replans + depth) * cadence)
                     if st_look is not None:
                         st_score = st_look
                     if v_score:
                         break
+            # SCORE AT THE RE-PLAN, NOT AT THE CHUNK'S LAST STEP.
+            #
+            # `CriticInputs.from_runtime` takes `history`, `cmd_future` and `history_null`
+            # from `policy.last_plan()`, which `_run_fm` refreshes only on the cadence
+            # (`_ctrl_step % K == 0`), while `policy._history` appends every control step. So
+            # reading the critic at the chunk's LAST step paired a history stashed at the
+            # chunk's FIRST step with a pose, depth row, scan and goal twelve steps later --
+            # and, fatally, left that history BIT-IDENTICAL across all K candidates, because
+            # they all restored the same snapshot. The critic is a head over the FROZEN FM
+            # encoder and history+cmd are two of its three token groups, so two thirds of the
+            # trunk's input carried no information about which candidate had run.
+            #
+            # Measured symptom before the fix: the four candidates' `p_fail` differed by less
+            # than 0.001 on 29.3% of re-plans and by less than 0.01 on 52.1%, median spread
+            # 0.0087 against an across-state sd of 0.1998 -- and best-of-K bought nothing on
+            # success over 63 cells. Every OTHER consumer of this critic gates on `is_replan`
+            # (`CriticScorer.__call__`, `collect_q_data`, the Q selector in this file); this
+            # was the only call site that did not, and `CriticScorer`'s own docstring names
+            # the cadence mistake as "the single mistake that would make V_priv quietly
+            # worse".
+            #
+            # ONE extra control step reaches step 0 of the NEXT chunk, which IS the re-plan:
+            # `create_obs` there refreshes `last_plan()` with a history whose newest rows are
+            # this candidate's own executed tail. That step's physics is discarded -- `post`
+            # above is the commit point -- so the episode resumes exactly where it did before.
+            # Its verdict is discarded too: the committed verdict stays the first chunk's.
+            if not v_score and st_score is not None:
+                _sv, _sf, st_replan = _chunk(
+                    rig, policy, fm_lag, cmd, 1, cfg, list(cz),
+                    scorer=_push_ring(cand_ring), steer_kp=steer_kp,
+                    steer_wz_max=steer_wz_max, hold_until=cmd_hold_s,
+                    step0=(n_replans + max(lookahead, 1)) * cadence)
+                if st_replan is not None:
+                    st_score = st_replan
+
             # The sentinels have to BOUND whatever the survivor branch can return, and that
             # range widens once the quality term is on. At w_fail = 1 they stay at the
             # historical +/-1.0 so the control arm reproduces every recorded score exactly.
@@ -792,8 +851,11 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             else:
                 # The chunk's own last state, NOT a rebuilt one. See _chunk's docstring: a
                 # rebuild advances the depth-lag ring and corrupts the committed state.
+                # THE CANDIDATE'S OWN ring, not a shared one: its rows must be the steps this
+                # candidate actually ran, for the same reason its snapshot and its chunk
+                # reward are its own.
                 x = C.CriticInputs.from_runtime(policy, robot, st_score, anchor=anchor,
-                                                ring=ring, want_scan=crit.privileged)
+                                                ring=cand_ring, want_scan=crit.privileged)
                 p_f, g_read = crit.read(x)
                 if cprobe is not None and cprobe.chunk_rewards:
                     r_meas = float(np.mean(cprobe.chunk_rewards))
@@ -801,15 +863,14 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                     p_f, g_read, (cprobe.chunk_rewards if cprobe is not None else ()),
                     w_fail=w_fail, gamma=gamma)
                 g_hat = float("nan") if g_read is None else float(g_read)
-            if post is None:
-                post = Snapshot(robot, policy, fm_lag)
             # `v`/`f`/`cz` are the FIRST chunk's -- the continuation's verdict scores the
             # branch but is never the episode's, because the episode never ran it.
+            cand_scores_all.append(float(score))
             cand_r = list(cprobe.chunk_rewards) if cprobe is not None else []
             if random_select:
-                all_cands.append((score, post, v, f, cz, cap, cand_r))
+                all_cands.append((score, post, v, f, cz, cap, cand_r, cand_ring))
             if best is None or score < best[0]:
-                best = (score, post, v, f, cz, cap, cand_r)
+                best = (score, post, v, f, cz, cap, cand_r, cand_ring)
                 sel_index = cand
             if want_cands:
                 # The conditioning is NOT stored per candidate: every candidate restored the
@@ -830,7 +891,15 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
         if random_select:
             sel_index = int(pick_rng.integers(len(all_cands)))
             best = all_cands[sel_index]
-        scored.append(k)
+        # THE REAL SCORE SPREAD, not `k`. This column existed to answer "did the critic
+        # separate the candidates at all", and on the V arm it reported `k` -- a constant --
+        # so 63 cells x 40 episodes were run with no measurement of whether there was any
+        # selection signal. The Q arm writes a genuine max-minus-min under this same key, and
+        # its docstring states the thing that was missing: "if that is ~0 the model is not
+        # discriminating and any success change is not selection." A near-zero spread here is
+        # now visible in `live_select.json` without needing --record_candidates.
+        finite = [x for x in cand_scores_all if np.isfinite(x)]
+        scored.append(max(finite) - min(finite) if len(finite) > 1 else 0.0)
         # Commit the winner by RESTORING ITS POST-CHUNK STATE -- the branch length is the
         # cadence, so that state is exactly where the episode continues from. Re-executing the
         # winning draw instead would cost a (K+1)th chunk and would diverge silently if the
@@ -852,6 +921,11 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                          cmd_future=best[5]["cmd_future"], fm_plan=best[5]["fm_plan"],
                          **extra_c)
         zex = list(best[4])
+        # The winner's ring becomes the episode's, for the same reason its snapshot does: the
+        # rows it holds are the only ones the episode actually lived through.
+        if ep_ring is not None and best[7] is not None:
+            ep_ring = best[7]
+            _ring = _push_ring(ep_ring)
         # The COMMITTED chunk's measured tracking reward. Only the winner's, because only the
         # winner was executed -- a rejected candidate's reward describes a trajectory the
         # episode never took.

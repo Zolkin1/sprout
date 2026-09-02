@@ -178,12 +178,66 @@ def test_both_episode_drivers_return_the_same_arity():
                and n.name in ("run_episode_selected", "run_episode_q_selected")]
     assert len(drivers) == 2, "an episode driver was renamed; this pin needs updating"
     for fn in drivers:
-        for r in [n for n in ast.walk(fn) if isinstance(n, ast.Return)]:
+        # Only the driver's OWN returns. `ast.walk` descends into nested helpers, and both
+        # drivers define per-step callbacks that legitimately `return` something of their own
+        # -- counting those made this pin fail on a helper rather than on the contract.
+        nested = {id(n) for d in ast.walk(fn)
+                  if isinstance(d, (ast.FunctionDef, ast.AsyncFunctionDef)) and d is not fn
+                  for n in ast.walk(d)}
+        for r in [n for n in ast.walk(fn)
+                  if isinstance(n, ast.Return) and id(n) not in nested]:
             width = len(r.value.elts) if isinstance(r.value, ast.Tuple) else 1
             assert width == 5, f"{fn.name} line {r.lineno} returns {width}, not 5"
     # ...and the single call site unpacks exactly that many.
     src = pathlib.Path(os.path.join(_SIM, "live_select.py")).read_text()
     assert "v, f, nr, sc, q = fn(" in src, "the dispatch no longer unpacks 5 elements"
+
+
+def test_the_critic_is_read_at_a_replan_and_the_ring_is_per_candidate():
+    """The two coupled defects that made best-of-K measure nothing, pinned together.
+
+    `CriticInputs.from_runtime` documents its own precondition -- it must be called where
+    `policy.last_plan()` describes the re-plan just made, because it takes `history`,
+    `cmd_future` and `history_null` from that stashed plan while everything else comes from
+    the live state. `_run_fm` refreshes the plan only on the cadence, so reading the critic at
+    the chunk's LAST step left the history stashed at the chunk's FIRST step -- BIT-IDENTICAL
+    across all K candidates, since they all restore the same snapshot. The critic is a head
+    over the frozen FM encoder and history+cmd are two of its three token groups.
+
+    Measured before the fix, over 80250 re-plans: the candidates' `p_fail` differed by under
+    0.001 on 29.3% of them and under 0.01 on 52.1%, and best-of-K bought nothing on success
+    across 63 cells.
+
+    The proprio ring is in the same test because the two must be fixed TOGETHER: one shared
+    ring was safe only by arithmetic coincidence (10 rows, 12-step chunk, read after all 12
+    pushes), and moving the read earlier destroys that coincidence.
+
+    A source check, because the behaviour needs a MuJoCo rig, a loaded ONNX pair and a GPU.
+    """
+    import pathlib as _pl
+    import re as _re
+
+    src = _pl.Path(os.path.join(_SIM, "live_select.py")).read_text()
+    body = src.split("def run_episode_selected")[1].split("\ndef ")[0]
+
+    # 1. An extra single step reaches the re-plan before the critic is read.
+    assert _re.search(r"_chunk\(\s*rig, policy, fm_lag, cmd, 1, cfg", body), (
+        "the scoring step is gone: the critic is being read at the chunk's last step again, "
+        "where `last_plan()` is one full chunk stale and identical across candidates")
+    # ...and it happens BEFORE the critic read, not after. Anchored on the CALL form, since
+    # the bare name also appears in the comment explaining why the step exists -- matching
+    # that made this assertion fail against correct code.
+    assert body.index("st_score = st_replan") < body.index("C.CriticInputs.from_runtime("), (
+        "the scoring step runs after the critic read, so it cannot refresh last_plan()")
+    # 2. The commit snapshot is taken unconditionally at the cadence, not after scoring.
+    assert "post = Snapshot(robot, policy, fm_lag) if lookahead > 1 else None" not in body, (
+        "the commit snapshot is conditional again; at lookahead=1 it would be taken after "
+        "the scoring step and the episode would resume one step late")
+    # 3. Each candidate gets its OWN ring, and the winner's becomes the episode's.
+    assert "cand_ring = copy.deepcopy(ep_ring)" in body
+    assert "ep_ring = best[7]" in body, "the winner's proprio ring is not carried forward"
+    assert _re.search(r"\bring\.push\(", body) is None, (
+        "a direct push into a shared ring survives; every candidate must fill its own")
 
 
 def test_a_missing_quality_head_raises_rather_than_scoring_zero():
