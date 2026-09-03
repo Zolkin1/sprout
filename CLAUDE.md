@@ -643,6 +643,52 @@ defaulting them (it would otherwise have replayed a `baseline_meas` cell as the 
 arm, silently) and lists the arms and cells a run actually covered rather than every one the
 `ARMS` table declares.
 
+## AND THE ANSWER, ON REAL TILES: the history source is worth nothing; HEADING is worth 0.27
+
+**mjeval's courses are the wrong instrument for this**, and its own docstring says why:
+they are AUTHORED to vary one geometric parameter and are deliberately not trained tiles,
+so a measured-history result there is confounded with perceptive distribution shift
+(`isaac_tile_course`). The tell was in the numbers -- the K=1 baseline pools **0.306** on
+three authored `stairs_up` courses against **0.875-1.000** on real library tiles at the same
+speed. Everything above this line is therefore about a floor effect as much as about the arm.
+
+Re-measured through `live_select.py` on tiles **6 / 20 / 40** of
+`g1_mb_v5_body_mode11_decor.h5` (the `ksweep_meas` configuration: 3 speeds x 40 episodes,
+K=1, seed-paired per episode because `live_select` keys each draw on
+`[episode_seed, replan_index]`), 360 paired episodes:
+
+| | served history | measured history | delta |
+|---|---|---|---|
+| pooled (360 ep) | 0.797 | 0.822 | **+0.025**, 42/75 discordant, p=0.36 |
+
+**Indistinguishable from zero.** A tile-6-helps / tile-20-hurts split at 1.6 m/s (+0.225,
+p=0.012 and -0.200, p=0.008) did NOT replicate at 2.4 -- both signs reversed -- and those
+were 2 of 7 tests on one dataset. Read them as what multiple comparisons look like, not as a
+family interaction. `report_measured_pairs.py` is the reducer (`live_select` has none of its
+own); it prints exact McNemar on the DISCORDANT pairs, because a percentile bootstrap over
+three tiles floors out.
+
+**The real lever on tile 6 is HEADING, not history.** With `--steer_kp 1.5` holding the
+flight centreline, the served arm goes **0.658 -> 0.925** and the measured arm **0.750 ->
+0.892** -- and the measured arm's apparent advantage vanishes (-0.033, 8/20 discordant,
+p=0.50). At 0.8 m/s it is 40/40 with zero failures against 20 successes and 17 tilt falls +
+3 `fall/height` unsteered. So tile 6's unsteered failures were mostly the robot drifting in
+heading and meeting the risers off-centre; the measured-history A/B there was measuring drift
+recovery, not riser handling.
+
+That is a coherent mechanism -- measured history tells the generator where the robot ACTUALLY
+is, which only matters once it has drifted -- and it is the first account in this
+investigation that survived its own controls. Two limits: `live_select` records no heading
+error, so "the advantage scales with accumulated yaw error" is the untested prediction rather
+than a measurement; and steering is OFF-DISTRIBUTION on stairs (|wz| = 0.0000 on every stair
+clip across all 3500), so those rates are not comparable to the unsteered baselines and
+`ksweep_meas` is `only_nosteer`. Tile 40 (box) DOES turn in training and is where steering
+is in-distribution.
+
+**Practical reading: on tile 6, heading control is worth ~+0.27 of success and the history
+source is worth nothing.** That points at the operator/planner level, which per this file's
+own framing is a thing this stack deliberately does not have.
+
 # Two families are excluded from FM training BY DEFAULT
 
 Both because the generator cannot be asked to predict what it cannot see, and both are
