@@ -694,7 +694,8 @@ def sample_trajectory(
     guidance_scale: float = 1.0,
     noise: torch.Tensor | None = None,
     advantage: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_aux: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Generate the F-step future window by Euler-integrating the learned flow.
 
     The conditioning (history / extero / command) is fed as separate tokens, held fixed
@@ -734,8 +735,22 @@ def sample_trajectory(
             reference the robot has to physically track is a sharper risk than it is for
             images. Sweep it against TRACKING, not just flow MSE.
 
+        return_aux: Also return the FINAL Euler step's velocity field -- the model's own
+            output at the last integration step, which is what the RL adjuster reads beside
+            the window it corrects. Free: it is the ``v`` the loop already computed, so
+            nothing extra is run and the returned window is bit-identical either way.
+
+            Coherent under guidance as well, because under CFG ``v`` IS the combined field
+            that was integrated (``v_null + w (v_cond - v_null)``) rather than one branch of
+            it -- so no arm is refused here.
+
     Returns:
-        Generated future window (standardized), shape ``(B, F, D)`` -- all F are novel.
+        Generated future window (standardized), shape ``(B, F, D)`` -- all F are novel. With
+        ``return_aux``, ``(window, v_last)`` where ``v_last`` is ``(B, F, D)`` in the SAME
+        standardized space as the window before the caller denormalizes it. It is a rate in
+        standardized units per unit flow time, so the state normalizer's affine does not apply
+        to it -- there is no offset to add, and pairing it with a DENORMALIZED window would put
+        the two on different scales for no gain.
     """
     b = history.shape[0]
     device = history.device
@@ -803,7 +818,7 @@ def sample_trajectory(
             v = model(x, tau, history, extero, cmd_tokens,
                       history_null_mask=history_null_mask, advantage=advantage)
         x = x + dt * v
-    return x
+    return (x, v) if return_aux else x
 
 
 def sample_trajectory_grad(

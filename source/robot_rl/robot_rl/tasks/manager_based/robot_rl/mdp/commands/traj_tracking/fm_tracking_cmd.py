@@ -83,9 +83,12 @@ from robot_rl.flow_matching.window import (
     DEFAULT_WINDOW_ANCHOR,
     MEASURED_HISTORY_FALLBACK,
     assert_history_source_matches,
+    clamp_window_rotation_residual,
     measured_history_fallback_spans,
+    project_window_rotations,
     reanchor_window,
     resolve_reference_blocks,
+    window_block_slices,
     window_to_world,
     world_to_window,
 )
@@ -404,6 +407,14 @@ class FmTrackingCommand(MotionSequenceCommand):
         #: Allocated only by :meth:`enable_extero_stash`, because it is one depth row per
         #: env and nothing in training would ever read it.
         self._extero_stash: torch.Tensor | None = None
+        #: The residual last applied to ``_pred_window`` by :meth:`apply_plan_residual`, in
+        #: RAW units. Allocated on first use, because only the adjuster task applies one and
+        #: it is a whole window per env.
+        self._plan_residual: torch.Tensor | None = None
+        #: Final Euler-step velocity field of each live plan, STANDARDIZED, or ``None``.
+        #: Allocated only by :meth:`enable_flow_stash`, for the same reason the exteroception
+        #: stash is: it is a whole window per env and only the adjuster reads it.
+        self._pred_flow: torch.Tensor | None = None
         self._fm_reinfer_mask = torch.zeros(n, dtype=torch.bool, device=dev)
         self._last_step_seen = -1
         self._arange_n = torch.arange(n, device=dev)
@@ -1185,7 +1196,16 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._seed_clip_history(torch.nonzero(just_reset, as_tuple=False).squeeze(-1))
 
         # Re-plan on cadence, or wherever there is no live prediction to walk (post-reset).
-        reinfer = (self.env.episode_length_buf % max(int(self.cfg.fm_update_every), 1)) == 0
+        #
+        # The cadence counter is the env's when it offers one. ``episode_length_buf`` counts
+        # env steps, which IS the control step on every task here -- except an env whose step
+        # spans a whole re-plan interval (``AdjusterEnv``, where the RL agent acts once per
+        # ``fm_update_every`` control steps). There ``episode_length_buf`` counts the agent's
+        # steps, so ``% fm_update_every`` would fire on every control step of every twelfth
+        # interval instead of on the first of each. Such an env owns a control-step counter and
+        # zeroes it on reset; the fallback keeps every current task bit-identical.
+        cadence_buf = getattr(self.env, "fm_cadence_buf", self.env.episode_length_buf)
+        reinfer = (cadence_buf % max(int(self.cfg.fm_update_every), 1)) == 0
         infer_mask = reinfer | ~self._pred_valid
         # Advance the cursor only where we are NOT re-planning. _check_horizon guarantees F
         # covers (K-1) + max_offset, so this can never run off the end; assert rather than
@@ -1196,7 +1216,8 @@ class FmTrackingCommand(MotionSequenceCommand):
             raise RuntimeError(
                 f"FM prediction cursor ran past the horizon (F={self.ctx.F}) at "
                 f"fm_update_every={self.cfg.fm_update_every}: the re-plan cadence is not "
-                "firing. Check episode_length_buf and the reset latch."
+                "firing. Check the cadence counter (env.fm_cadence_buf if the env has one, "
+                "else episode_length_buf) and the reset latch."
             )
 
         # Envs whose window has not filled yet (post-reset, or the first steps of a run) are
@@ -1257,11 +1278,16 @@ class FmTrackingCommand(MotionSequenceCommand):
         height = build_extero_tokens(self.ctx, extero_row)
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
-        self._pred_window[ids] = sample_window(
+        sampled = sample_window(
             self.ctx, history, height, cmd_tokens,
             history_null_mask=(None if null_hist is None else null_hist[ids]),
             noise=(None if self._noise_source is None else self._noise_source(ids)),
+            return_flow=self._pred_flow is not None,
         )
+        if self._pred_flow is not None:
+            self._pred_window[ids], self._pred_flow[ids] = sampled
+        else:
+            self._pred_window[ids] = sampled
         # Node 0 = "now", and the frame it is expressed in is the robot AT THIS INSTANT.
         # Both are needed to serve the window later: the cursor to index it, the anchor to
         # undo the staleness once the robot has moved on.
@@ -1269,6 +1295,137 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._anchor_pos[ids] = wp.to_torch(self.robot.data.root_pos_w)[ids].clone()
         self._anchor_quat[ids] = wp.to_torch(self.robot.data.root_quat_w)[ids].clone()
         self._pred_valid[ids] = True
+
+    @property
+    def fm_reinfer_mask(self) -> torch.Tensor:
+        """``[N]`` bool: which envs re-planned on the most recent control step.
+
+        Read-only, and the phase check an env whose step spans a whole re-plan interval wants
+        at its boundary: under a locked cadence it is all-True there, so asserting it turns a
+        cadence drift into a failure on step one instead of a slowly-wrong run whose only
+        symptom is two re-plans inside one agent step.
+        """
+        return self._fm_reinfer_mask
+
+    def plan_window(self, node_indices: torch.Tensor | None = None) -> torch.Tensor:
+        """The live predicted window at ABSOLUTE node indices, ``[N, len(idx), D]``.
+
+        Distinct from :meth:`reference_window_obs`, which indexes RELATIVE to the served
+        cursor and refuses an offset past ``F - 1 - (K - 1)`` because the policy's look-ahead
+        has to stay valid for the whole interval. This is the adjuster's own view: it observes
+        and corrects the plan as a plan, in the frame it was drawn in, so every node from 0 to
+        ``F - 1`` is fair game and there is no horizon to check.
+
+        Args:
+            node_indices: ``[M]`` long absolute node indices; ``None`` means all ``F``.
+
+        Returns:
+            ``[N, M, D]`` (or ``[N, F, D]``), in the plan's own frame -- NOT re-anchored onto
+            the robot, and NOT normalized.
+        """
+        if node_indices is None:
+            return self._pred_window
+        return self._pred_window[:, node_indices.to(self._pred_window.device), :]
+
+    def _ori_channel_span(self) -> slice | None:
+        """Column span of ``base_pose``'s 6D rotation half in one node, or ``None``.
+
+        ``None`` when the selection packs no ``base_pose`` -- then there is no rotation to
+        project or bound and the residual is a plain addition.
+        """
+        slices = window_block_slices(
+            self.ctx.nj, self.ctx.target_num_extra_frames, self._fm_blocks
+        )
+        if "base_pose" not in slices:
+            return None
+        start = slices["base_pose"].start + 3
+        return slice(start, start + 6)
+
+    def plan_residual(self) -> torch.Tensor:
+        """The residual most recently applied to the live plan, ``[N, F, D]``, in RAW units.
+
+        Zeros where no residual has been applied (before the first one, and for any env whose
+        plan was not valid when it arrived). The reward terms read THIS rather than the action
+        buffer, so what is penalised is what was actually served: the action goes through a
+        squash, a per-channel scale and an angle clamp on the way in, and only the far end of
+        that chain is the physical quantity the L2 term is meant to price.
+        """
+        if self._plan_residual is None:
+            return torch.zeros_like(self._pred_window)
+        return self._plan_residual
+
+    def apply_plan_residual(self, residual: torch.Tensor) -> None:
+        """Add a residual to the live plan, in the plan's own frame.
+
+        Called ONCE per re-plan interval, before any physics of that interval, by an env whose
+        agent acts at the plan's cadence. Deliberately not folded into :meth:`_run_fm`: that
+        runs at the TAIL of a step, inside ``command_manager.compute``, so a residual applied
+        there would be a function of the state before the plan was drawn -- a state-conditioned
+        bias rather than a correction to a plan the agent has seen.
+
+        Writes into ``_pred_window`` because that is the only write every consumer sees: the
+        tracker's ``reference`` observation, ``y_des``/``dy_des`` and hence the CLF,
+        :func:`~robot_rl.tasks.manager_based.robot_rl.mdp.tracking_error.served_tracking_error`
+        and hence the dense reward and the failure termination, the generator's own history
+        row, and the debug ribbon. Applying it inside :meth:`reference_window_obs` instead
+        would reach the observation alone, leaving every graded quantity describing a plan
+        nobody followed.
+
+        Args:
+            residual: ``[N, F, D]`` in RAW units, already scaled and squashed by the caller.
+                Envs with no live plan are skipped rather than silently corrected.
+
+        Raises:
+            ValueError: If the shape does not match the live plan.
+        """
+        if residual.shape != self._pred_window.shape:
+            raise ValueError(
+                f"plan residual has shape {tuple(residual.shape)} but the live plan is "
+                f"{tuple(self._pred_window.shape)} (N, F, D)."
+            )
+        residual = torch.where(
+            self._pred_valid.view(-1, 1, 1), residual.to(self._pred_window.dtype),
+            torch.zeros_like(self._pred_window),
+        )
+        nj, nee = self.ctx.nj, self.ctx.target_num_extra_frames
+        original = self._pred_window.clone()
+        summed = original + residual
+        adjusted = project_window_rotations(summed, nj, nee, self._fm_blocks)
+        # The projection is not the bound. Adding six free numbers to an orthonormal pair
+        # leaves SO(3), and Gram-Schmidt puts it back -- but says nothing about HOW FAR it
+        # rotated, and the failure termination's tilt check is measured against this very
+        # reference. So the angle is bounded explicitly, after the projection because
+        # ``so3_log`` needs a real rotation.
+        limited = clamp_window_rotation_residual(adjusted, original, nj, nee, self._fm_blocks)
+        # Take the projected+bounded rotation ONLY on nodes whose rotation actually moved.
+        #
+        # ``project_window_rotations`` is a Gram-Schmidt round trip, and in float32 that is not
+        # the identity on input already orthonormal -- measured 2.4e-7 on 6.7% of channels. So
+        # projecting unconditionally means a ZERO residual still perturbs the plan, which
+        # quietly destroys the property the whole verification chain rests on: that the
+        # adjuster at zero action reproduces the bare generator. On a robot that is a chaotic
+        # divergence from a 1e-7 seed, not a rounding difference.
+        ori = self._ori_channel_span()
+        if ori is not None:
+            moved = (residual[..., ori] != 0).any(dim=-1, keepdim=True)   # [N, F, 1]
+            limited = torch.where(moved, limited, summed)
+        # In place, not a rebind: ``_pred_window`` is allocated once in ``_post_init`` and the
+        # diagnostics hold views of it.
+        self._pred_window.copy_(limited)
+        # What was actually applied, after the squash, the scale, the projection AND the angle
+        # clamp -- so the L2 reward prices the served correction rather than the request.
+        if self._plan_residual is None:
+            self._plan_residual = torch.zeros_like(self._pred_window)
+        self._plan_residual.copy_(self._pred_window - original)
+
+        # Re-take the served-node stash. ``_snapshot_and_infer`` latched it at the tail of the
+        # previous step, from the RAW plan, so without this the history row for node 0 is the
+        # unadjusted node while rows 1..K-1 are adjusted -- an inconsistency in the
+        # generator's own conditioning that no shape or width check can see. It matters most
+        # under ``history_from="generator"``; under ``"measured"`` it reaches only the two
+        # MEASURED_HISTORY_FALLBACK channels, which is still the difference between the
+        # fallback describing the served plan and describing a plan that was discarded.
+        self._prev_served_node = self._pred_window[self._arange_n, self._pred_idx].clone()
 
     def set_noise_source(self, source) -> None:
         """Take the flow's initial noise from ``source`` instead of the global RNG.
@@ -1310,6 +1467,43 @@ class FmTrackingCommand(MotionSequenceCommand):
         if self._extero_stash is None:
             row = self._lagged_extero()
             self._extero_stash = torch.zeros_like(row)
+
+    def enable_flow_stash(self) -> None:
+        """Start keeping each plan's final Euler-step velocity field.
+
+        Off by default and allocated here, for the same reason the exteroception stash is: it
+        is a whole ``[N, F, D]`` window per env and only the RL adjuster reads it. Calling it
+        twice is harmless. Must be called BEFORE the first re-plan -- ``_run_fm`` asks the
+        sampler for the field only when the buffer exists, so enabling it mid-episode leaves
+        the current plan's field zero until the next re-plan.
+
+        What it buys the adjuster is a second view of the same node: the window says where the
+        generator ended up, the field says which way the flow was still moving there, which
+        near ``tau = 1`` is the model's own statement about how far the sample sits from its
+        conditional mode.
+        """
+        if self._pred_flow is None:
+            self._pred_flow = torch.zeros_like(self._pred_window)
+
+    def plan_flow(self) -> torch.Tensor:
+        """Each live plan's final-step velocity field, ``[N, F, D]``, STANDARDIZED.
+
+        Zeros unless :meth:`enable_flow_stash` was called before the first re-plan.
+        Standardized, not physical: it is a rate in normalizer units per unit flow time, so
+        the state normalizer's affine does not apply to it.
+
+        Raises:
+            RuntimeError: If the stash was never enabled -- reading zeros would look like a
+                generator whose flow had converged everywhere, which is a plausible number
+                and a wrong one.
+        """
+        if self._pred_flow is None:
+            raise RuntimeError(
+                "plan_flow() needs enable_flow_stash() before the first re-plan; without it "
+                "the field is never captured and this would return zeros, which reads as a "
+                "converged flow rather than as a missing one."
+            )
+        return self._pred_flow
 
     def window_anchor(self) -> tuple[torch.Tensor, torch.Tensor]:
         """The FM command's plan anchor is the pose latched when the plan was drawn.

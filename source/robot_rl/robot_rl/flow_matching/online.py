@@ -816,7 +816,8 @@ def sample_window(
     cmd_tokens: torch.Tensor | None,
     history_null_mask: torch.Tensor | None = None,
     noise: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_flow: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sample the ``F``-node future window, denormalized.
 
     The return value IS the reference window: node 0 is the current step and every node is
@@ -836,9 +837,17 @@ def sample_window(
             :meth:`BatchedHistory.null_mask` to sample before the window has filled --
             which is also the first ``N`` steps after a reset, when the generator has
             emitted nothing to condition on yet.
+        return_flow: Also return the final Euler step's velocity field. The RL adjuster reads
+            it beside the window it corrects, so each of its query tokens carries both what
+            the generator predicted and which way the flow was still moving there. Free -- the
+            loop already computed it -- and the window is bit-identical either way.
 
     Returns:
-        Raw (denormalized) window nodes ``(V, F, D)``.
+        Raw (denormalized) window nodes ``(V, F, D)``. With ``return_flow``,
+        ``(window, v_last)`` where ``v_last`` stays in the STANDARDIZED space: it is a rate in
+        standardized units per unit flow time, so the normalizer's affine does not apply (there
+        is no offset to add), and it is not Gram-Schmidted either -- it is a velocity in the
+        ambient 9-vector space, not a rotation.
     """
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
@@ -848,15 +857,17 @@ def sample_window(
     # load_fm_context refuses to let that happen by accident.
     adv = (None if ctx.advantage_label is None
            else torch.tensor([ctx.advantage_label], dtype=torch.long, device=history.device))
-    pred_std = sample_trajectory(ctx.model, history, extero, cmd_tokens, ctx.F, ctx.D,
-                                 ctx.num_steps, history_null_mask=history_null_mask,
-                                 zero_noise=ctx.zero_noise,
-                                 guidance_scale=ctx.guidance_scale, noise=noise,
-                                 advantage=adv)
+    sampled = sample_trajectory(ctx.model, history, extero, cmd_tokens, ctx.F, ctx.D,
+                                ctx.num_steps, history_null_mask=history_null_mask,
+                                zero_noise=ctx.zero_noise,
+                                guidance_scale=ctx.guidance_scale, noise=noise,
+                                advantage=adv, return_aux=return_flow)
+    pred_std, v_last = sampled if return_flow else (sampled, None)
     # Project the rotation block back onto SO(3): the model emits 6 free numbers, and the
     # served window is both a reference pose and the next step's history token. The exported
     # ONNX module does the same, so sim and deploy agree.
-    return project_window_rotations(
+    window = project_window_rotations(
         ctx.state_norm.denormalize(pred_std),
         ctx.nj, ctx.target_num_extra_frames, ctx.reference_blocks,
     )
+    return (window, v_last) if return_flow else window
