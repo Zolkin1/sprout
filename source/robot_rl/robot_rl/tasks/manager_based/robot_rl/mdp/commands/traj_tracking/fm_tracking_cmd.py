@@ -420,6 +420,9 @@ class FmTrackingCommand(MotionSequenceCommand):
         #: price a change without holding episode state of its own. Zeroed on reset alongside
         #: ``_plan_residual``.
         self._prev_plan_residual: torch.Tensor | None = None
+        #: The three conditioning streams as BUILT for the live plan, flattened, or ``None``.
+        #: Allocated only by :meth:`enable_cond_stash`.
+        self._cond_stash: torch.Tensor | None = None
         #: Final Euler-step velocity field of each live plan, STANDARDIZED, or ``None``.
         #: Allocated only by :meth:`enable_flow_stash`, for the same reason the exteroception
         #: stash is: it is a whole window per env and only the adjuster reads it.
@@ -1298,6 +1301,16 @@ class FmTrackingCommand(MotionSequenceCommand):
         height = build_extero_tokens(self.ctx, extero_row)
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
+        if self._cond_stash is not None:
+            # The three conditioning streams AS BUILT, flattened into one row. The RL adjuster
+            # re-encodes them to borrow this generator's prefix, and it has to be handed the
+            # exact tensors that produced the plan: rebuilding them from the live state at
+            # observation time would read a DIFFERENT instant (after the interval's physics),
+            # and the extero half would be a different lag of a different frame.
+            parts = [history.flatten(1), height.flatten(1)]
+            if cmd_tokens is not None:
+                parts.append(cmd_tokens.flatten(1))
+            self._cond_stash[ids] = torch.cat(parts, dim=-1).detach()
         sampled = sample_window(
             self.ctx, history, height, cmd_tokens,
             history_null_mask=(None if null_hist is None else null_hist[ids]),
@@ -1500,6 +1513,51 @@ class FmTrackingCommand(MotionSequenceCommand):
         if self._extero_stash is None:
             row = self._lagged_extero()
             self._extero_stash = torch.zeros_like(row)
+
+    @property
+    def cond_width(self) -> int:
+        """Width of one flattened conditioning row: history + exteroception + command."""
+        return (self.ctx.N * self.ctx.D
+                + self.ctx.extero_sensor_count * self.ctx.extero_sensor_dim
+                + self.ctx.num_cmd_tokens * self.ctx.cmd_dim)
+
+    def enable_cond_stash(self) -> None:
+        """Start keeping the conditioning each plan was drawn from, as BUILT.
+
+        Off by default and opt-in for the same reason the exteroception stash is -- it is
+        dominated by a depth row per env. Must be called BEFORE the first re-plan, or the
+        current plan's conditioning is never captured and the row reads as zeros.
+
+        What it exists for: the RL adjuster re-encodes this conditioning to borrow the
+        generator's frozen prefix, and the borrow is only exact if it is handed the tensors
+        that actually produced the plan. Rebuilding them at observation time would read a
+        different instant, and the exteroception half would be a different lag of a different
+        frame -- so the prefix would not be the one the plan came from, silently.
+        """
+        if self._cond_stash is None:
+            self._cond_stash = torch.zeros(
+                self.num_envs, self.cond_width, device=self._pred_window.device
+            )
+
+    def plan_conditioning(self) -> torch.Tensor:
+        """The conditioning of each live plan, ``[N, cond_width]``, as the generator got it.
+
+        Returns:
+            History tokens, exteroception tokens and command tokens, in that order, flattened
+            and concatenated -- all already normalized, because that is the form
+            ``encode_prefix`` takes.
+
+        Raises:
+            RuntimeError: If :meth:`enable_cond_stash` was never called. Zeros would encode as
+                a perfectly ordinary conditioning rather than a missing one.
+        """
+        if self._cond_stash is None:
+            raise RuntimeError(
+                "plan_conditioning() needs enable_cond_stash() before the first re-plan; "
+                "without it the row is never captured and this would return zeros, which "
+                "encode as a real conditioning rather than as an absent one."
+            )
+        return self._cond_stash
 
     def enable_flow_stash(self) -> None:
         """Start keeping each plan's final Euler-step velocity field.

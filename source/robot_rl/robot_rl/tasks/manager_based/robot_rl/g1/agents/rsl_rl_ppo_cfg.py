@@ -219,3 +219,113 @@ class SymmetricEpisodicPPORunnerCfg(PPORunnerCfg):
             data_augmentation_func=symmetric_data_augmentation_episodic,
         ),
     )
+
+
+#: Action width the adjuster's PPO constants below were scaled for: F * D on the shipped
+#: measured-history generator (62 nodes x 44 channels). The deployed nojumpoff one is F=64, so
+#: the true width can be 2816 -- a 3% shift, immaterial next to the 94x rescale itself, which
+#: is why these are constants rather than something resolved from a checkpoint the cfg cannot
+#: see. ``test_adjuster_ppo_cfg`` pins the RATIOS rather than the numbers.
+_ADJUSTER_ACTION_DIM = 62 * 44
+#: The teacher's, for the ratios below.
+_TEACHER_ACTION_DIM = 29
+
+
+@configclass
+class AdjusterModelCfg(RslRlMLPModelCfg):
+    """The residual actor over the generator's frozen encoder.
+
+    See :class:`robot_rl.rl.adjuster_model.WindowAdjusterModel`. ``hidden_dims`` sizes a trunk
+    the model REPLACES with its shared per-token head, so it is deliberately minimal --
+    ``rsl_rl.modules.MLP`` rejects an empty list, and raising it only allocates a larger module
+    to throw away.
+    """
+
+    class_name: str = "robot_rl.rl.adjuster_model:WindowAdjusterModel"
+    plan_obs_group: str = "fm_plan"
+    cond_obs_group: str = "fm_cond"
+    #: Borrowed layers kept frozen; the rest become trainable copies warm-started from the
+    #: generator. 6 of 8 leaves ~6.4M trainable against a 26.8M borrowed trunk.
+    num_frozen_layers: int = 6
+
+
+@configclass
+class AdjusterPPORunnerCfg(PPORunnerCfg):
+    """PPO for the residual adjuster, with three constants rescaled by the action dimension.
+
+    **The three rescales are mandatory, and none of them is guarded anywhere in rsl-rl.**
+    ``GaussianDistribution``'s ``entropy``, ``log_prob`` and ``kl_divergence`` all sum over the
+    action dimension, and the adaptive-LR controller compares ``torch.mean(kl)`` directly
+    against ``desired_kl``. Going 29 -> 2728 dims multiplies both statistics by ~94x:
+
+    * ``entropy_coef`` 0.008 -> 8.5e-5. Left alone the entropy term is ~31 against a surrogate
+      of O(0.01-0.1) and the action std runs away -- this repo's documented "entropy goes up
+      during fine-tuning" failure, 94x more likely.
+    * ``desired_kl`` 0.01 -> 0.9. Left alone the per-dimension trust region is 94x tighter, the
+      controller divides the learning rate down to its HARDCODED ``max(1e-5, ...)`` floor, and
+      the policy never moves -- with no symptom but a small LR.
+``num_steps_per_env`` 24 -> 8 because a step is 0.24 s: 8 agent steps is 1.92 s of
+    experience, four times the teacher's 0.48 s, where 24 would be nearly 6 s per iteration.
+
+    ``critic_warmup_iterations`` 30 -> 100: the critic starts from scratch here (the teacher's
+    weights are for a different observation), and the actor's zero-initialised head means
+    warm-up data comes from the UNMODIFIED generator -- exactly the baseline the value function
+    should be anchored on.
+
+    ``num_mini_batches`` and ``gamma`` are deliberately left at the teacher's values.
+
+    ``TODO(adjuster-gamma)``: 0.99 is inherited, not chosen, and it does NOT mean here what it
+    means for the teacher -- gamma is a per-STEP discount and a step is 12 control steps long,
+    so 0.99 per 0.24 s is a far weaker discount per unit time than 0.99 per 0.02 s
+    (equivalently 0.99958 per control step). Over a <=100-decision episode the return is close
+    to undiscounted: a reward ten decisions out weighs 0.90 and one a hundred out still 0.37.
+    Time-matching the teacher would be ``0.99 ** 12 = 0.886``. Worth a sweep once the run
+    trains at all, anchored on something measured -- the failure critic's median lead time on a
+    fall is 2.52 s, about ten decisions, so credit needs to reach at least that far.
+
+    ``TODO(adjuster-minibatches)``: kept at 4, which is a memory bet rather than a compute one
+    (``num_learning_epochs x batch_size`` is invariant, so the total work does not change).
+    ESTIMATED, not measured: at 1024 envs x 8 steps the batch is 8192 samples, so a 4-way split
+    is 2048 per minibatch, and the backward over 8 transformer layers of 62 tokens at
+    ``d_model`` 512 / ``dim_feedforward`` 2048 retains roughly ``(512 + 2048 + 512)`` floats per
+    sample-token per layer -- about 1.6 GB per layer, ~12 GB over the stack. Fine on talos
+    (96 GB); raise it toward 16 if this is ever run on a 12 GB card, where it would present as
+    an OOM inside ``update()`` AFTER a rollout that already succeeded. Note all EIGHT layers
+    count, not just the two trainable ones: gradients flow through the frozen layers to reach
+    the input embedding, so their activations are retained too.
+
+    """
+
+    num_steps_per_env = 8
+    max_iterations = 2000
+    # ~35-42 s/iteration at 1024 envs, so this is ~30-45 min of crash exposure -- the same
+    # trade PPORunnerCfg.save_interval documents, at a much longer iteration.
+    save_interval = 50
+    experiment_name = "g1_adjuster"
+    actor = AdjusterModelCfg(
+        hidden_dims=[1],
+        activation="elu",
+        # init_std is NOT made small: the physical smallness lives in the residual's per-channel
+        # scale table, and KL ~ A * delta^2 / (2 sigma^2), so a tiny sigma strangles the
+        # adaptive controller into an LR collapse instead of limiting the residual.
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.5, std_type="log"),
+        obs_normalization=False,
+    )
+    critic = RslRlMLPModelCfg(
+        hidden_dims=[1024, 512, 256, 128],
+        activation="elu",
+        obs_normalization=False,
+    )
+    algorithm = AuxPpoAlgorithmCfg(**{
+        **_PPO_KWARGS,
+        "entropy_coef": _PPO_KWARGS["entropy_coef"] * _TEACHER_ACTION_DIM / _ADJUSTER_ACTION_DIM,
+        "desired_kl": _PPO_KWARGS["desired_kl"] * _ADJUSTER_ACTION_DIM / _TEACHER_ACTION_DIM,
+        # num_mini_batches and gamma stay at the teacher's values -- see the TODOs above.
+        "critic_warmup_iterations": 100,
+    })
+    obs_groups = {
+        # The actor sees the generator's conditioning and the generator's plan -- and nothing
+        # privileged, so the same network could run on a robot.
+        "actor": ["fm_cond", "fm_plan"],
+        "critic": ["critic"],
+    }

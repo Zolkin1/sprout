@@ -17,6 +17,10 @@ because a stale one silently trains on the wrong terrain.
 import gymnasium as gym
 
 from . import agents
+# For the adjuster task's entry point. Importing the PACKAGE is safe pre-AppLauncher: its
+# ``__init__`` re-exports only the cfg, never the env class, which is the whole reason that
+# split exists (see ``envs/__init__.py``).
+from .. import envs
 
 # Guard to prevent multiple registrations
 _registered = False
@@ -246,6 +250,36 @@ if not _registered:
                 f"{__name__}.g1_tracker_env_cfg:G1FmTrackerTerrainDepthPlayEnvCfg"
             ),
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:FmTrackerPlayRunnerCfg",
+        },
+    )
+
+    ## =========================================
+    ## The ADJUSTER
+    ## =========================================
+    # Trains a residual on the generator's predicted window while BOTH the generator and the
+    # tracker stay frozen. The RL agent acts once per re-plan (0.24 s), so the entry point is
+    # not the stock env: `AdjusterEnv.step` runs a whole interval with the tracker inside it.
+    #
+    # Requires four artifacts and refuses to guess any of them:
+    #   --clip                (library + terrain; use --clip_device cpu)
+    #   --fm_checkpoint       (a PREFIX-attention, measured-history generator)
+    #   --tracker_run         (the frozen tracker's run dir)
+    #   --tracking_spec / --goal_regions   (the two FITTED specs)
+    #
+    # Run it with scripts/rsl_rl/train_adjuster.py, not train.py: the rsl-rl wrapper has to
+    # override `num_actions` (the action manager holds the TRACKER's joints) and
+    # `max_episode_length` (which rsl-rl reads in env steps).
+    gym.register(
+        id="G1-adjuster-fm-terrain-depth",
+        # The first non-`ManagerBasedRLEnv` entry point in this repo. Resolved by gym when the
+        # env is MADE, i.e. after AppLauncher -- which is what lets the concrete env class
+        # import `ManagerBasedRLEnv` (and therefore reach pxr) without breaking the
+        # pre-AppLauncher cfg compose. See envs/__init__.py.
+        entry_point=f"{envs.__name__}.adjuster_env:AdjusterEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_adjuster_env_cfg:G1AdjusterEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:AdjusterPPORunnerCfg",
         },
     )
     _registered = True

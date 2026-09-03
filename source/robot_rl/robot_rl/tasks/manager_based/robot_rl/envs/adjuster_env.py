@@ -111,6 +111,17 @@ class AdjusterEnv(ManagerBasedRLEnv):
             )
         self.fm_cadence_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.track_mean = torch.zeros(self.num_envs, device=self.device)
+        # Per-TERM first-crossing latches, so a sparse reward can name its cause. The
+        # aggregates (`terminated` / `time_outs`) cannot: reaching the goal and running out of
+        # time are both truncations here, and they must be priced differently -- arriving
+        # collects the value bootstrap and nothing else, running out collects a penalty.
+        # `mdp.is_terminated_term` is NOT usable for this: it reads the manager's per-term
+        # state, which is recomputed every control step, so a term that fired early in the
+        # interval and stopped holding would read as never having fired.
+        self.term_latch: dict[str, torch.Tensor] = {
+            name: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            for name in self.termination_manager.active_terms
+        }
         self._track_offsets = torch.zeros(1, dtype=torch.long, device=self.device)
         with open(cfg.tracking_spec_path) as f:
             self._track_spec = tracking_error.TrackingErrorSpec.from_dict(json.load(f))
@@ -121,6 +132,10 @@ class AdjusterEnv(ManagerBasedRLEnv):
             device=self.device,
         )
 
+        # The adjuster's observation is the generator's own conditioning, kept as BUILT so the
+        # actor re-encodes exactly the tensors that produced the plan. Enabled here, before
+        # the first re-plan, because the stash only captures from the next one onward.
+        cmd.enable_cond_stash()
         # The adjuster reads each plan's final-step flow field, so the command term has to
         # capture it -- and it only captures when asked, BEFORE the first re-plan.
         cmd.enable_flow_stash()
@@ -211,6 +226,8 @@ class AdjusterEnv(ManagerBasedRLEnv):
         latched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         term_latch = torch.zeros_like(latched)
         trunc_latch = torch.zeros_like(latched)
+        for buf in self.term_latch.values():
+            buf.zero_()
 
         for inner in range(self.replan_period):
             # `FrozenTracker.__call__` is already `@torch.no_grad`. Deliberately NOT
@@ -250,6 +267,8 @@ class AdjusterEnv(ManagerBasedRLEnv):
             fresh = dones & ~latched
             term_latch |= fresh & self.termination_manager.terminated
             trunc_latch |= fresh & self.termination_manager.time_outs
+            for name in self.term_latch:
+                self.term_latch[name] |= fresh & self.termination_manager.get_term(name)
             latched |= dones
 
             if inner < self.replan_period - 1:

@@ -938,3 +938,112 @@ def ee_ref_relative_to_base(
     return torch.cat(out, dim=-1)
 
 
+
+
+##
+# The adjuster: what it corrects, what it was conditioned on, and where the goal is
+##
+def fm_plan_conditioning(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """The generator's conditioning for the live plan, ``[N, cond_width]``.
+
+    History tokens, exteroception tokens and command tokens, flattened and concatenated in
+    that order, already normalized -- the form ``encode_prefix`` takes.
+
+    Carried as an OBSERVATION rather than recomputed by the policy because PPO's rollout runs
+    under ``inference_mode``: nothing computed there can enter an autograd graph later, so the
+    update re-runs the actor from stored observations. This is what it re-runs it from.
+
+    Read from the command's stash, not rebuilt here. Rebuilding would sample a different
+    instant -- observations are computed after the interval's physics -- and the exteroception
+    half would be a different lag of a different frame, so the borrowed prefix would not be the
+    one the plan came from.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        ``[num_envs, cond_width]``.
+    """
+    return env.command_manager.get_term(command_name).plan_conditioning()
+
+
+def fm_plan_window(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """The live plan and its final-step flow field, ``[N, 2 * F * D]``, STANDARDIZED.
+
+    The two halves are the adjuster's per-node input: what the generator predicted at that
+    node, and which way the flow was still moving there at the last Euler step -- near
+    ``tau = 1`` a statement about how far the drawn sample sits from its conditional mode.
+
+    Standardized, so the two halves are commensurate and both O(1): the window is normalized
+    by the generator's own state normalizer (which is DECLARED, not fitted, so the number means
+    the same thing in every run) and the flow field already lives in that space.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        ``[num_envs, 2 * F * D]`` -- the window first, then the field.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    window = cmd.ctx.state_norm.normalize(cmd.plan_window())
+    flow = cmd.plan_flow()
+    return torch.cat([window.flatten(1), flow.flatten(1)], dim=-1)
+
+
+def window_residual(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """The residual applied to the live plan, ``[N, F * D]``, in normalizer SIGMAS.
+
+    A CRITIC input, and not an optional one. Its group already carries the reference, which
+    says how wrong the served plan is; this says how much of that the adjuster caused. Without
+    the second the critic cannot separate "the generator was wrong" from "the adjuster made it
+    worse" and eats the difference as variance -- which is measured to turn advantages into
+    noise, inflate entropy and stall a run for a thousand iterations.
+
+    Sigmas rather than raw units for the same reason the residual reward uses them: one node
+    mixes metres, dimensionless rot6d components and radians.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        ``[num_envs, F * D]``.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    sigma = cmd.ctx.state_norm.std.to(cmd.plan_residual().device)
+    return (cmd.plan_residual() / sigma).flatten(1)
+
+
+def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Where the goal is and how long is left, ``[N, 4]``: downrange, lateral, height, steps.
+
+    A CRITIC input, and what makes a bootstrapped truncation well posed. On this task reaching
+    the goal is a truncation (so its value IS bootstrapped) while running out of time is a
+    termination (so it is not) -- and that asymmetry is the whole mechanism for rewarding
+    arrival. A critic that cannot see how much time is left is being asked to predict a cut it
+    has no evidence for, which is the classic time-limit bootstrapping error. The fourth
+    channel is precisely that evidence.
+
+    The first three are the robot's displacement from the goal resolved in the TERRAIN's frame
+    -- the same quantities :func:`mdp.in_goal` thresholds, so the critic sees the geometry the
+    termination decides on rather than a proxy for it.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`MotionSequenceCommand` term name.
+
+    Returns:
+        ``[num_envs, 4]``. Control steps remaining is clamped at 0 and is in units of control
+        steps, not seconds, so it does not silently change meaning with ``step_dt``.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+    cmd = env.command_manager.get_term(command_name)
+    root_pos_w = wp.to_torch(env.scene["robot"].data.root_pos_w)
+    goal_pos_w, frame_yaw = goal_region.goal_anchor_world(cmd)
+    down, lat, hz = goal_region.goal_frame_offsets(root_pos_w, goal_pos_w, frame_yaw)
+    remaining = (goal_region.last_usable_step(cmd).to(root_pos_w.device)
+                 - (cmd.start_step + env.episode_length_buf).to(root_pos_w.device))
+    return torch.stack([down, lat, hz, remaining.clamp_min(0).to(down.dtype)], dim=-1)

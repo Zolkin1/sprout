@@ -382,7 +382,12 @@ class TrackingViolation(ManagerTermBase):
         super().__init__(cfg, env)
         from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
 
-        path = str(cfg.params.get("spec_path", "") or "")
+        # The param wins; the env cfg is the fallback, and it is what makes this ONE statement.
+        # Fanning the path out from the env cfg in `__post_init__` instead had an ordering
+        # hazard: hydra applies CLI overrides to the ALREADY-COMPOSED cfg, so a
+        # `--tracking_spec` flag would land after the fan-out and never reach the term.
+        path = str(cfg.params.get("spec_path", "")
+                   or getattr(getattr(env, "cfg", None), "tracking_spec_path", "") or "")
         if not path:
             raise ValueError(
                 "TrackingViolation needs spec_path: the failure bounds and the dense reward's "
@@ -473,7 +478,10 @@ class GoalReached(ManagerTermBase):
         super().__init__(cfg, env)
         from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
 
-        path = str(cfg.params.get("spec_path", "") or "")
+        # As in TrackingViolation: the param wins, the env cfg is the fallback, so the path is
+        # stated once and a CLI override reaches the term whenever it is applied.
+        path = str(cfg.params.get("spec_path", "")
+                   or getattr(getattr(env, "cfg", None), "goal_regions_path", "") or "")
         if not path:
             raise ValueError(
                 "GoalReached needs spec_path (logs/rollouts/v2/goal_regions.json is the fitted "
