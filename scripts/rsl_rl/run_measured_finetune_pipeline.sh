@@ -41,7 +41,23 @@ RUN="$W/logs/rollouts/v5_meas"
 CRITIC="$W/logs/value/critic_meas_v1"
 FT="$W/logs/flow_matching/ft_meas_v1"
 SPEC="$RUN/tracking_spec_v1.json"
-STEM="$RUN/rollout_measured"
+
+# The rollout stem is DERIVED, never assumed. ``record_rollouts`` names its output after the
+# TRACKER RUN (`rollout_<run>.h5`), not after anything this script passes -- `--output_dir`
+# only chooses the directory. Hard-coding a stem here cost a stage: `du` printed an empty
+# size, the script carried on, and `fit_value` died on a missing file 41 minutes later with
+# the recording sitting on disk under its real name.
+resolve_stem () {
+  local hits=()
+  shopt -s nullglob
+  for f in "$RUN"/rollout_*.h5; do
+    case "$f" in *.episodes.h5) ;; *) hits+=("$f");; esac
+  done
+  shopt -u nullglob
+  [ ${#hits[@]} -eq 1 ] || return 1
+  STEM="${hits[0]%.h5}"
+}
+STEM=""
 
 # Local card is 12 GB; the reference rollout used 8192 envs on a 95 GB H100.
 NUM_ENVS=${NUM_ENVS:-512}
@@ -79,7 +95,7 @@ EOF
 fi
 
 # ---- 1. record rollouts under the MEASURED arm ------------------------------------------
-if run_from record && [ ! -f "$STEM.h5" ]; then
+if run_from record && ! resolve_stem; then
   say "stage 1/5 record: $NUM_WINDOWS windows, $NUM_ENVS envs, history_from=measured"
   "$PY" scripts/rsl_rl/record_rollouts.py \
       --task "$TASK" --headless \
@@ -92,10 +108,11 @@ if run_from record && [ ! -f "$STEM.h5" ]; then
       --allow_history_source_mismatch \
       --num_envs "$NUM_ENVS" --num_windows "$NUM_WINDOWS" \
       --output_dir "$RUN" >>"$LOG" 2>&1 || die record $?
-  say "stage 1 done: $(du -h "$STEM.h5" | cut -f1)"
-else
-  say "stage 1 skipped ($STEM.h5 exists or stage>record)"
 fi
+# Resolved (or re-resolved) unconditionally, and a hard failure: every later stage reads it,
+# and the whole point of the block above is that this name is not ours to predict.
+resolve_stem || { say "expected exactly one rollout_*.h5 in $RUN; found $(ls "$RUN"/rollout_*.h5 2>/dev/null | grep -vc episodes) -- cannot continue"; exit 4; }
+say "rollout stem: $STEM ($(du -h "$STEM.h5" | cut -f1))"
 
 # ---- 2. the critic: failure head + quality head ------------------------------------------
 if run_from critic && [ ! -f "$CRITIC/predictions.npz" ]; then
