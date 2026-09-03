@@ -220,3 +220,35 @@ def test_the_task_is_registered_with_its_own_env_class() -> None:
     spec = gym.registry["G1-adjuster-fm-terrain-depth"]
     assert spec.entry_point.endswith("adjuster_env:AdjusterEnv")
     assert spec.kwargs["rsl_rl_cfg_entry_point"].endswith("AdjusterPPORunnerCfg")
+
+
+def test_every_adjuster_flag_train_py_sets_exists_on_the_cfg() -> None:
+    """A flag that sets a field nobody has is a flag that silently does nothing.
+
+    This repo has been bitten twice by exactly that shape -- ``--num_envs`` running a grid at
+    256 while the manifest recorded 1024, and ``--terrain_ref`` producing 3950 episodes with
+    ``n_plans == 0`` and no error. Here the failure would be quieter still: the four artifact
+    fields have no defaults and the env REFUSES an empty one, so a mis-typed field name would
+    present as "tracker_run_dir is unset" while the flag sat right there on the command line.
+
+    A heuristic, like ``test_stage_grid_forwards_every_flag_the_cell_stage_reads``: it reads
+    the mapping out of ``train.py``'s source, so a mapping built some other way is invisible to
+    it.
+    """
+    import re
+
+    from motion_gen.features import _REPO_ROOT
+
+    src = (_REPO_ROOT / "scripts" / "rsl_rl" / "train.py").read_text()
+    block = re.search(r"for flag, field in \((.*?)\n\s*\):", src, re.S)
+    assert block, "the adjuster flag->field mapping is no longer a literal tuple in train.py"
+    pairs = re.findall(r'\("([a-z_]+)",\s*"([a-z_]+)"\)', block.group(1))
+    assert len(pairs) == 4, f"expected four flag->field pairs, parsed {pairs}"
+
+    cfg = G1AdjusterEnvCfg()
+    for flag, field in pairs:
+        assert hasattr(cfg, field), (
+            f"train.py's --{flag} sets env_cfg.{field}, which G1AdjusterEnvCfg does not have. "
+            "The flag would be applied by `hasattr` and silently do nothing, and the env would "
+            "then refuse the unset field as though the flag had never been passed."
+        )

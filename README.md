@@ -579,6 +579,74 @@ breakdown.
 rewrites `robots/g1/<robot>_<course>.xml` before loading it, and a speed sweep shares geometry,
 so the race tears the file silently. The generated scenes are derived and not committed.
 
+### 4d. Train an ADJUSTER on the generator's plan: `G1-adjuster-fm-terrain-depth`
+
+The generator, not the tracker, is the limit on terrain (clip 0.930-0.941 against fm
+0.618-0.672). Everything tried so far improved the reference *within the generator's own
+conditional* and hit a measured ceiling there -- best-of-K, filtered BC and AWR were stopped
+because the chunk choice is only 1.6% of the tracking reward's variance. A learned RESIDUAL is
+the first method not bounded by that: it can move the plan outside the sampling support.
+
+The adjuster is a PPO policy that emits a per-node correction to the generator's 62x44
+reference window, once per re-plan (0.24 s). **Both the generator and the tracker stay frozen**
+-- from the adjuster's point of view the tracker is part of the robot's dynamics. Its network
+borrows the generator's own frozen conditioning encoder (exact, because `prefix` attention
+means the conditioning attends only to itself) with the last two layers as trainable copies:
+~6.4M trainable against a 26.8M borrowed trunk.
+
+**Build the four-family library first.** The initial set is the two stair transitions and the
+two box transitions -- the four the eval identified as mattering on hardware. Filter by cutting
+the library, never at the reset (`sample_terrain_clips` raises on a tile with no clips):
+
+```bash
+python scripts/rsl_rl/make_family_clip_lib.py \
+    --src clips/g1_mb_v5_body_mode11_decor.h5 \
+    --out clips/g1_mb_v5_adjuster4.h5
+# -> 3750 clips over 75 tiles (from 10000 over 200)
+```
+
+Then train. Four artifacts, and every one of them is REFUSED rather than defaulted, because a
+default path to an artifact is a thing this repo has watched rot silently:
+
+```bash
+python scripts/rsl_rl/train.py --task=G1-adjuster-fm-terrain-depth \
+    --clip clips/g1_mb_v5_adjuster4.h5 --clip_device cpu \
+    --fm_checkpoint logs/flow_matching/<measured-history run>/best.pt \
+    --tracker_run logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1 \
+    --tracker_checkpoint model_19999.pt \
+    --tracking_spec logs/tracking/tracking_spec_v1.json \
+    --goal_regions logs/rollouts/v2/goal_regions.json \
+    --num_envs 1024 --headless
+```
+
+`train.py` picks the interval-stepping rsl-rl wrapper off the ENV (`replan_period`), not off a
+flag, so there is no separate script to remember and no way to run it with the wrong one.
+
+Things worth knowing before reading a run:
+
+- **The generator must be a `prefix`-attention, MEASURED-history checkpoint.** The prefix IS
+  the adjuster's state encoder, so under `history_from="generator"` the history rows are the
+  model's own past output -- a plan, not a robot -- and a policy asked to correct for where the
+  robot actually is would have no channel carrying it. The task pins `measured` and
+  `assert_history_source_matches` refuses a checkpoint that disagrees.
+- **The two specs are FITTED files, and a `bootstrap` one is refused.** `tracking_spec_v1.json`
+  is the ADOPTED tracking spec; note a SUPERSEDED one sits at `logs/tracking/v1/` with p99.9
+  bounds ~3x tighter that would terminate on the stumbles the design delegates to the dense
+  reward. Name the file; do not glob.
+- **Only the goal truncates.** Reaching it is `time_out=True` so its value bootstraps; the
+  deadline, the timeout and the tracking violation all terminate. That asymmetry IS the reward
+  for arriving -- there is no terminal bonus anywhere.
+- **`base_fallen` is not used.** The reference-relative `tracking_error.violates` replaces it,
+  and the swap is measured: 13 of 13 falls also violated, 0 of 37 loose successes were demoted,
+  and the violation leads the fall by a median 0.20 s.
+- **`gamma` and `num_mini_batches` are inherited placeholders** carrying `TODO(adjuster-gamma)`
+  and `TODO(adjuster-minibatches)`. `gamma` in particular does not mean here what it means for
+  the teacher: it is a per-STEP discount and a step is twelve control steps long.
+- **`entropy_coef` and `desired_kl` ARE rescaled**, by the 94x action-dimension ratio, and must
+  be -- rsl-rl sums entropy and KL over the action dimension and guards neither, so the
+  teacher's values give either a runaway action std or a learning rate pinned at the hardcoded
+  1e-5 floor, with no symptom but a bad run.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.

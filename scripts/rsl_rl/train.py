@@ -112,6 +112,31 @@ parser.add_argument(
          "command term exposing an fm_checkpoint field (the FmTrackingCommand), "
          "overriding the cfg default.",
 )
+# -- the ADJUSTER task's artifacts. Applied by `hasattr`, exactly as --clip and
+# --fm_checkpoint are, so they are no-ops on every other task.
+parser.add_argument(
+    "--tracker_run", type=str, default=None,
+    help="Adjuster only: logs/rsl_rl/<experiment>/<run> of the FROZEN tracker that drives the "
+         "robot from inside the env. Its params/agent.yaml supplies the architecture, so this "
+         "must be a completed training run and not a bare checkpoint.",
+)
+parser.add_argument(
+    "--tracker_checkpoint", type=str, default=None,
+    help="Adjuster only: checkpoint file name inside --tracker_run.",
+)
+parser.add_argument(
+    "--tracking_spec", type=str, default=None,
+    help="Adjuster only: the FITTED TrackingErrorSpec (.json) supplying both the dense "
+         "reward's kernel widths and the failure termination's bounds. One flag because they "
+         "must agree. A spec whose provenance says 'bootstrap' is refused -- its numbers are "
+         "declared placeholders, ~2x blunter than the fitted ones.",
+)
+parser.add_argument(
+    "--goal_regions", type=str, default=None,
+    help="Adjuster only: the FITTED goal_regions.json. Required rather than defaulted: the "
+         "tolerances are a measurement of where surviving clip-arm episodes end, and guessing "
+         "them decides which episodes count as arrivals.",
+)
 cli_args.add_rsl_rl_args(parser)
 add_launcher_args(parser)
 args_cli, hydra_args = parser.parse_known_args()
@@ -181,6 +206,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if hasattr(term, "fm_checkpoint"):
                     term.fm_checkpoint = args_cli.fm_checkpoint
                     print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
+
+        # The adjuster task's four artifacts, set on the ENV cfg (not on a command term) and
+        # applied by hasattr so every other task ignores them. Set here rather than fanned out
+        # to the termination terms: hydra applies overrides to the already-composed cfg, so a
+        # fan-out inside __post_init__ would copy the default and these flags would go nowhere.
+        # The terms read these fields at construction, which is after this.
+        for flag, field in (
+            ("tracker_run", "tracker_run_dir"),
+            ("tracker_checkpoint", "tracker_checkpoint"),
+            ("tracking_spec", "tracking_spec_path"),
+            ("goal_regions", "goal_regions_path"),
+        ):
+            value = getattr(args_cli, flag, None)
+            if value is not None and hasattr(env_cfg, field):
+                setattr(env_cfg, field, value)
+                print(f"[INFO] {field}='{value}' (--{flag}).")
+
         agent_cfg.max_iterations = (
             args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
         )
@@ -282,7 +324,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
 
         # wrap around environment for rsl-rl
-        env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        #
+        # Chosen from the ENV, not from a flag, and deliberately so: on an interval-stepping
+        # env (the adjuster) the base wrapper reads `num_actions` off the action manager, which
+        # holds the FROZEN TRACKER's joints -- so it would size the agent's head to 29 and the
+        # env would reject the residual later, for a reason that reads as a config error. A
+        # flag could be forgotten; `replan_period` cannot be.
+        if hasattr(env.unwrapped, "replan_period"):
+            from robot_rl.rl.adjuster_wrapper import RslRlAdjusterVecEnvWrapper
+
+            env = RslRlAdjusterVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+        else:
+            env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
         # create runner from rsl-rl
         if agent_cfg.class_name == "OnPolicyRunner":
