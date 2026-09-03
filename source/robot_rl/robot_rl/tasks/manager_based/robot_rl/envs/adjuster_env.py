@@ -59,6 +59,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 from robot_rl.flow_matching.window import residual_scale_vector
 from robot_rl.rl.frozen_tracker import FrozenTracker
 from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
+from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import TrackingViolation
 
 from .adjuster_env_cfg import AdjusterEnvCfg
 
@@ -111,20 +112,60 @@ class AdjusterEnv(ManagerBasedRLEnv):
             )
         self.fm_cadence_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.track_mean = torch.zeros(self.num_envs, device=self.device)
-        # Per-TERM first-crossing latches, so a sparse reward can name its cause. The
+        # WHICH TERM ended each episode, recorded per term so a sparse reward can name its
+        # cause. These are real terminations -- the episode ends and the env resets. This
+        # exists only because the reset is deferred to the interval boundary: an env can
+        # fail at control step 3 of 12, and resetting there would split one agent step
+        # across two episodes (the residual belongs to the old one, the remaining control
+        # steps would run under its plan, and one reward would cover both). The
         # aggregates (`terminated` / `time_outs`) cannot: reaching the goal and running out of
         # time are both truncations here, and they must be priced differently -- arriving
         # collects the value bootstrap and nothing else, running out collects a penalty.
         # `mdp.is_terminated_term` is NOT usable for this: it reads the manager's per-term
         # state, which is recomputed every control step, so a term that fired early in the
         # interval and stopped holding would read as never having fired.
-        self.term_latch: dict[str, torch.Tensor] = {
+        self._warned_no_attribution = False
+        # Per-check violation rates, folded over control steps and reported once per agent
+        # step. See the fold in `step` for why they are never pooled into one number.
+        self._violation_counts = {
+            name: torch.zeros((), device=self.device)
+            for name in tracking_error.VIOLATION_CHECK_NAMES
+        }
+        self._violation_steps = torch.zeros((), device=self.device)
+        self.ended_by: dict[str, torch.Tensor] = {
             name: torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
             for name in self.termination_manager.active_terms
         }
         self._track_offsets = torch.zeros(1, dtype=torch.long, device=self.device)
-        with open(cfg.tracking_spec_path) as f:
+        # ONE spec, and this ENFORCES it rather than assuming it. The dense reward's kernel
+        # widths and the failure termination's bounds have to come from the same file, or the
+        # reward grades against one calibration while the episode ends on another -- silently,
+        # since both are valid specs. `TrackingViolation` prefers its own `spec_path` param
+        # (hydra-overridable) and only falls back to the env cfg, so the two CAN diverge.
+        # Take the term's resolved answer where there is one; that way the override still
+        # works and both halves move together.
+        spec_path = str(cfg.tracking_spec_path)
+        violation = None
+        for name in self.termination_manager.active_terms:
+            term = self.termination_manager.get_term_cfg(name).func
+            if isinstance(term, TrackingViolation):
+                violation = term
+                override = str(term.cfg.params.get("spec_path") or "")
+                if override and override != spec_path:
+                    print(f"[INFO] AdjusterEnv: tracking spec taken from the "
+                          f"'{name}' term ({override}), overriding the env cfg's "
+                          f"{spec_path} -- the reward and the termination stay on one file.")
+                    spec_path = override
+                break
+        with open(spec_path) as f:
             self._track_spec = tracking_error.TrackingErrorSpec.from_dict(json.load(f))
+        if violation is not None and violation.spec != self._track_spec:
+            raise ValueError(
+                "AdjusterEnv: the dense reward and the tracking_violation termination "
+                f"resolved DIFFERENT tracking specs ({spec_path} vs the term's). They grade "
+                "the same quantity, so a split calibration means the reward's kernel widths "
+                "and the failure bounds disagree with no symptom."
+            )
         # Per-channel residual authority, resolved once from the generator's own layout.
         self._residual_scale = torch.tensor(
             residual_scale_vector(cmd.ctx.nj, cmd.ctx.target_num_extra_frames,
@@ -229,16 +270,20 @@ class AdjusterEnv(ManagerBasedRLEnv):
         is_rendering = self.sim.is_rendering
         track_sum = torch.zeros(self.num_envs, device=self.device)
         live = torch.zeros(self.num_envs, device=self.device)
-        latched = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        term_latch = torch.zeros_like(latched)
-        trunc_latch = torch.zeros_like(latched)
-        for buf in self.term_latch.values():
+        done_any = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        ended_terminated = torch.zeros_like(done_any)
+        ended_truncated = torch.zeros_like(done_any)
+        for buf in self.ended_by.values():
             buf.zero_()
+        for buf in self._violation_counts.values():
+            buf.zero_()
+        self._violation_steps.zero_()
 
         for inner in range(self.replan_period):
             # `FrozenTracker.__call__` is already `@torch.no_grad`. Deliberately NOT
             # `inference_mode` on top: that would mark the output an inference tensor, which
             # cannot later enter an autograd graph, and buys nothing a frozen model needs.
+            self.recorder_manager.record_pre_step()
             joint_action = self._frozen_tracker(self.obs_buf)
             self.action_manager.process_action(joint_action.to(self.device))
 
@@ -250,6 +295,7 @@ class AdjusterEnv(ManagerBasedRLEnv):
                 if self._sim_step_counter % self.cfg.sim.render_interval == 0 and is_rendering:
                     self.sim.render()
                 self.scene.update(dt=self.physics_dt)
+            self.recorder_manager.record_post_physics_decimation_step()
 
             self.episode_length_buf += 1
             self.common_step_counter += 1
@@ -260,22 +306,31 @@ class AdjusterEnv(ManagerBasedRLEnv):
             # reward diluted by two thirds zeros, or the return would encode WHEN in the
             # interval it failed rather than that it did.
             err, valid = tracking_error.served_tracking_error(cmd, rd, self._track_offsets)
-            alive = (~latched) & valid
+            alive = (~done_any) & valid
             track_sum += tracking_error.step_reward(err, self._track_spec) * alive
+            # WHICH bound is doing the work, never pooled. Lateral and height are chunk-local
+            # and re-zeroed at every re-plan; tilt is measured against gravity and is not. A
+            # single violation rate cannot tell a spawn transient (tilt, in the opening control
+            # steps) from a bad plan (lateral/height, accumulating over the interval), and
+            # those call for opposite responses. Folded off the SAME `err` the reward uses, so
+            # the diagnostic and the reward cannot disagree about what happened.
+            for name, hit in tracking_error.violation_checks(err, self._track_spec).items():
+                self._violation_counts[name] += (hit & alive).sum()
+            self._violation_steps += alive.sum()
             live += alive
 
-            # -- terminations, latched on the FIRST crossing -------------------------------
+            # -- terminations, recorded at the FIRST crossing -------------------------------
             # First, so an env that reaches the goal at inner 3 and then falls at inner 7 is
             # reported as arriving. `terminated` is absorbing under GAE while `time_outs` gets
             # the value bootstrap, so mislabelling arrival as failure would teach the policy
             # not to arrive.
             dones = self.termination_manager.compute()
-            fresh = dones & ~latched
-            term_latch |= fresh & self.termination_manager.terminated
-            trunc_latch |= fresh & self.termination_manager.time_outs
-            for name in self.term_latch:
-                self.term_latch[name] |= fresh & self.termination_manager.get_term(name)
-            latched |= dones
+            fresh = dones & ~done_any
+            ended_terminated |= fresh & self.termination_manager.terminated
+            ended_truncated |= fresh & self.termination_manager.time_outs
+            for name in self.ended_by:
+                self.ended_by[name] |= fresh & self.termination_manager.get_term(name)
+            done_any |= dones
 
             if inner < self.replan_period - 1:
                 # Advances the plan cursor by one node. The re-plan does NOT fire here: the
@@ -287,9 +342,9 @@ class AdjusterEnv(ManagerBasedRLEnv):
 
         # -- the interval's outcome ---------------------------------------------------------
         self.track_mean = track_sum / live.clamp_min(1.0)
-        self.reset_terminated = term_latch
-        self.reset_time_outs = trunc_latch
-        self.reset_buf = term_latch | trunc_latch
+        self.reset_terminated = ended_terminated
+        self.reset_time_outs = ended_truncated
+        self.reset_buf = ended_terminated | ended_truncated
         # dt=1.0: every term here is per-DECISION (the tracking mean, the residual penalties,
         # the sparse outcomes), not a rate, so the configured weights are the reward
         # magnitudes. Multiplying by a step time would make them a function of the cadence.
@@ -298,6 +353,8 @@ class AdjusterEnv(ManagerBasedRLEnv):
         if len(self.recorder_manager.active_terms) > 0:
             self.obs_buf = self.observation_manager.compute()
             self.recorder_manager.record_post_step()
+
+        self._restore_termination_attribution(ended_terminated | ended_truncated)
 
         # Rewards BEFORE the reset, as the base class does -- and here it is load-bearing
         # rather than incidental: `FmTrackingCommand.reset` zeroes the applied residual, so
@@ -319,7 +376,55 @@ class AdjusterEnv(ManagerBasedRLEnv):
             self.event_manager.apply(mode="interval", dt=self.step_dt)
         self.obs_buf = self.observation_manager.compute(update_history=True)
 
+        # AFTER the reset: `_reset_idx` rebuilds `extras["log"]`, so writing these earlier
+        # would silently drop them on any step where something terminated -- which is most.
+        log = self.extras.setdefault("log", {})
+        denom = self._violation_steps.clamp_min(1.0)
+        for name, count in self._violation_counts.items():
+            log[f"Diagnostics/violation_{name}"] = (count / denom).item()
+
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+
+    # ------------------------------------------------------------------
+    def _restore_termination_attribution(self, ended: torch.Tensor) -> None:
+        """Write the FIRST-crossing terms back over the manager's per-episode attribution.
+
+        ``TerminationManager.compute`` rewrites ``_last_episode_dones`` on every call where
+        any term fires, and this env calls it K times per agent step. Left alone, the row
+        logged at reset is the LAST control step's terms rather than the recorded first
+        crossing -- so an env that reaches the goal at inner 3 and then trips
+        ``tracking_violation`` at inner 7 is logged as a violation.
+
+        The RL signal never had this problem (``reset_terminated`` / ``reset_time_outs`` /
+        ``episode_ended_by`` all read the record), so this is purely about what is REPORTED --
+        which happens to be ``Episode_Termination/goal_reached``, the arrival rate this whole
+        reward design is built to move, and the go/no-go signature for the run. Under-reported
+        by exactly the fraction of arrivals followed by any other termination inside the
+        remaining K-1 control steps.
+
+        Guarded on the private names because they are private: a rename should cost a loud
+        message and correct training, not silent mis-attribution.
+
+        Args:
+            ended: ``[N]`` bool, the envs whose episode ended this interval.
+        """
+        tm = self.termination_manager
+        if not (hasattr(tm, "_term_dones") and hasattr(tm, "_last_episode_dones")):
+            if not self._warned_no_attribution:
+                print("[WARN] AdjusterEnv: TerminationManager has no _term_dones / "
+                      "_last_episode_dones, so Episode_Termination/* reports the LAST "
+                      "control step of each interval rather than the recorded first "
+                      "crossing. Arrival rates will be under-reported.")
+                self._warned_no_attribution = True
+            return
+        if not bool(ended.any()):
+            return
+        rows = ended.nonzero(as_tuple=False).squeeze(-1)
+        for i, name in enumerate(tm.active_terms):
+            buf = self.ended_by.get(name)
+            if buf is not None:
+                tm._term_dones[rows, i] = buf[rows]
+        tm._last_episode_dones[rows] = tm._term_dones[rows]
 
     # ------------------------------------------------------------------
     def _residual_from_action(self, action: torch.Tensor) -> torch.Tensor:

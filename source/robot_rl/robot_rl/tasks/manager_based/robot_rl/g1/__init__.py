@@ -266,9 +266,9 @@ if not _registered:
     #   --tracker_run         (the frozen tracker's run dir)
     #   --tracking_spec / --goal_regions   (the two FITTED specs)
     #
-    # Run it with scripts/rsl_rl/train_adjuster.py, not train.py: the rsl-rl wrapper has to
-    # override `num_actions` (the action manager holds the TRACKER's joints) and
-    # `max_episode_length` (which rsl-rl reads in env steps).
+    # Run it with scripts/rsl_rl/train.py, which wires the four adjuster flags and swaps
+    # in RslRlAdjusterVecEnvWrapper on `hasattr(env, 'replan_period')`. The wrapper has to
+    # override `num_actions`, because the action manager holds the TRACKER's joints.
     gym.register(
         id="G1-adjuster-fm-terrain-depth",
         # The first non-`ManagerBasedRLEnv` entry point in this repo. Resolved by gym when the

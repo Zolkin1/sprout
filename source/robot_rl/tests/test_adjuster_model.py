@@ -50,7 +50,9 @@ CMD_DIM, CMD_STRIDE = 3, 4
 D_MODEL, LAYERS = 32, 2
 N_ENVS = 5
 
-COND_DIM = N * D + SENSORS * SENSOR_DIM + len(range(0, F, CMD_STRIDE)) * CMD_DIM
+# +1: the trailing null-history flag, which is part of the conditioning -- where it is
+# set `encode_prefix` swaps the whole history for a learned embedding.
+COND_DIM = N * D + SENSORS * SENSOR_DIM + len(range(0, F, CMD_STRIDE)) * CMD_DIM + 1
 PLAN_DIM = 2 * F * D
 ACTION_DIM = F * D
 
@@ -224,7 +226,10 @@ def test_training_the_adjuster_does_not_change_the_generator(published) -> None:
     n_ext = SENSORS * SENSOR_DIM
     history = cond["fm_cond"][:, :n_hist].reshape(N_ENVS, N, D)
     extero = cond["fm_cond"][:, n_hist:n_hist + n_ext]
-    cmd = cond["fm_cond"][:, n_hist + n_ext:].reshape(N_ENVS, published.num_cmd_tokens, CMD_DIM)
+    # NOT to the end: the last channel is the null-history flag, not a command token.
+    n_cmd = published.num_cmd_tokens * CMD_DIM
+    cmd = cond["fm_cond"][:, n_hist + n_ext:n_hist + n_ext + n_cmd].reshape(
+        N_ENVS, published.num_cmd_tokens, CMD_DIM)
     noise = torch.randn(N_ENVS, F, D, generator=torch.Generator().manual_seed(7))
 
     def plan() -> torch.Tensor:

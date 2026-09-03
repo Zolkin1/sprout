@@ -1543,9 +1543,19 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         cached = getattr(self, "_obs_win_offsets", "unset")
         if cached != "unset":
             return cached
+        # NOT YET BUILT is not the same as NOT PRESENT, and caching the first for the second
+        # is a silent, whole-run error. `ObservationManager._prepare_terms` calls every term
+        # once to discover its shape, and it does that BEFORE `env.observation_manager` is
+        # assigned -- so a term that reaches this method during the probe (the adjuster's
+        # `goal_geometry` does) used to memoise `None` forever. `last_usable_step` would then
+        # fall back to `clip_len - 1`, which is precisely the mis-anchoring its own docstring
+        # says would put the goal a full observation window past where any episode can reach.
+        # So: resolve every call until it resolves, and only ever CACHE a resolved answer.
+        om = getattr(self.env, "observation_manager", None)
+        if om is None:
+            return None
         self._obs_win_offsets = None
         try:
-            om = self.env.observation_manager
             for group, terms in om.active_terms.items():
                 if "reference_window" in terms:
                     p = om._group_obs_term_cfgs[group][list(terms).index("reference_window")].params

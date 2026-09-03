@@ -217,9 +217,15 @@ class FlowValueModel(nn.Module):
                 "added here would silently change what the generator's own prefix means.")
         self.fm = fm
         self.freeze_trunk = bool(freeze_trunk)
-        if self.freeze_trunk:
-            for p in self.fm.parameters():
-                p.requires_grad_(False)
+        # BOTH directions, explicitly. `load_fm_context` now freezes the generator's
+        # parameters at load (it has to: `requires_grad` on any argument gates
+        # `nn.MultiheadAttention`'s fused fast path, so every inference consumer must agree
+        # on it). That made this an asymmetric switch: `freeze_trunk=False` would arrive with
+        # the trunk already frozen, `trainable_parameters()` filters on `requires_grad`, and
+        # the optimizer would silently get the heads alone -- a fine-tune that runs, whose
+        # loss falls, and that trains nothing it was asked to.
+        for p in self.fm.parameters():
+            p.requires_grad_(not self.freeze_trunk)
         d = int(fm.d_model)
         self.d_model = d
 

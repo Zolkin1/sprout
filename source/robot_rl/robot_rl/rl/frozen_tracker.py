@@ -188,9 +188,23 @@ class FrozenTracker:
         names = list((fm_meta or {}).get("obs_term_names") or [])
         widths = list((fm_meta or {}).get("obs_term_dims") or [])
         if names and widths and len(names) == len(widths):
-            live = dict(zip(env.observation_manager.active_terms["policy"],
+            live_names = list(env.observation_manager.active_terms["policy"])
+            live = dict(zip(live_names,
                             [int(td[0]) for td in
                              env.observation_manager.group_obs_term_dim["policy"]]))
+            # ORDER, not just membership. The group's vector is the concatenation in
+            # `active_terms` order, so the same terms at the same widths in a DIFFERENT order
+            # is a permuted observation -- which loads clean, runs, and merely steers wrong.
+            # That is the exact failure class this whole check exists for, and comparing
+            # dictionaries would let it through.
+            if list(names) == live_names[:len(names)] or set(names) == set(live_names):
+                if list(names) != live_names:
+                    problems.append(
+                        f"group 'policy' holds the right terms in the WRONG ORDER: recorded "
+                        f"{list(names)}, live {live_names}. The vector is a concatenation in "
+                        "this order, so the tracker would read the right widths of the wrong "
+                        "channels."
+                    )
             for name, width in zip(names, widths):
                 if name not in live:
                     problems.append(
@@ -209,8 +223,17 @@ class FrozenTracker:
                         "was not in the recording; the tracker has never seen it"
                     )
 
+        if not (names and widths):
+            print("[WARN] FrozenTracker: the generator's meta carries no per-term observation "
+                  "table, so ORACLE 2 (which names a term rather than a tensor) did not run. "
+                  "A width that happens to match will pass unchecked.")
+
         # -- oracle 3: identity, not width ------------------------------------------------
         recorded = str((fm_meta or {}).get("checkpoint_sha256") or "")
+        if not recorded:
+            print("[WARN] FrozenTracker: the generator's meta carries no checkpoint hash, so "
+                  "ORACLE 3 did not run. A DIFFERENT tracker of the same width would load "
+                  "clean.")
         if recorded:
             actual = _sha256(self.checkpoint_path)
             if actual != recorded:

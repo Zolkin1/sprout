@@ -75,6 +75,9 @@ from .g1_tracker_env_cfg import G1FmTrackerCommandsCfg
 #: against a measured clip-arm 0.99-quantile downrange shortfall of 0.115-0.235 m. So the
 #: slack is 15-30x the demonstrated lag: tracking well is comfortably the way to arrive, and
 #: sprinting buys nothing.
+CONTROL_DT: float = 0.02
+"""The tracker's control period. Only used to express a step count as a fraction."""
+
 GOAL_SLACK_S: float = 3.0
 
 #: Episode budget in seconds. The longest clip's last usable step is 948 control steps; plus
@@ -159,8 +162,15 @@ class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
 
         window_residual: ObsTerm = ObsTerm(func=mdp.window_residual,
                                            params={"command_name": "traj_ref"})
-        goal_geometry: ObsTerm = ObsTerm(func=mdp.goal_geometry,
-                                         params={"command_name": "traj_ref"})
+        # `slack_s` MUST equal the clip_end term's, or the channel counts down to a deadline
+        # that is not the one the episode is cut on and reads 0 for the last 150 control
+        # steps. `step_scale` keeps a ~950-step count from dominating an un-normalized
+        # critic whose every other channel is O(1).
+        goal_geometry: ObsTerm = ObsTerm(
+            func=mdp.goal_geometry,
+            params={"command_name": "traj_ref", "slack_s": GOAL_SLACK_S,
+                    "step_scale": 1.0 / (EPISODE_LENGTH_S / CONTROL_DT)},
+        )
 
         def __post_init__(self) -> None:
             """Drop the two CLF/clip-derived terms, which cannot mean anything here.
@@ -331,6 +341,32 @@ class G1AdjusterEnvCfg(G1TeacherTerrainDepthEnvCfg, AdjusterEnvCfg):
         # error here rather than a silent arm swap. Override on the CLI for that control arm:
         # `env.commands.traj_ref.history_from=generator`.
         self.commands.traj_ref.history_from = "measured"
+
+        # EVERY episode opens at the clip's own initial condition. Two reasons, and the
+        # first is about the generator rather than about the task:
+        #
+        # 1. The FM's first inference of an episode runs under the learned NULL-HISTORY
+        #    embedding -- there is no history yet -- and that embedding is a far better
+        #    prior on FLAT ground than on terrain. A random start phase drops the robot
+        #    mid-motion, so its opening plan is regularly a null-history inference of a
+        #    stair or a box, which is the generator's weakest configuration. Clip step 0 is
+        #    flat by construction.
+        # 2. It removes the spawn-inside-goal artifact outright. The goal anchor sits at
+        #    `clip_len - 51` while `sample_start_step` only guaranteed `clip_len - start >=
+        #    100` control steps, so the latest legal start left ~1.0 s of clip travel to
+        #    reach it against a 1.0 m `approach_margin_m`. MEASURED over 493 episodes:
+        #    31.3% of goal-reached episodes ended within ONE agent step -- a third of the
+        #    positive signal collected for spawning, and since arrival is the BOOTSTRAPPED
+        #    truncation it taught the critic that spawn-like states carry a terminal value.
+        #    Raising `random_start_min_remaining_s` to 4.0 took that to 4.6%; starting at 0
+        #    takes it to none, and costs no clip coverage (every clip is >= 201 steps).
+        #
+        # The cost is start-state diversity, which the reference-window noise and the FM's
+        # own sampling noise already supply in the dimension that matters here.
+        # TODO(adjuster-start-phase): revisit once the residual trains -- a curriculum that
+        # re-introduces mid-clip starts would broaden the state distribution, and by then
+        # the null-history-on-terrain weakness may be one the adjuster can correct FOR.
+        self.commands.traj_ref.random_start_phase = False
 
         # Capture the generator's conditioning and its final-step flow field: the adjuster's
         # two actor observation groups ARE those. Set on the command cfg rather than called on

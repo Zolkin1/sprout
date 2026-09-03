@@ -327,7 +327,7 @@ def episode_ended_by(env: ManagerBasedRLEnv, term_keys: Sequence[str]) -> torch.
     """1.0 where the interval ended because one of ``term_keys`` fired, else 0.0.
 
     The sparse half of the adjuster's reward, and it reads the env's per-term FIRST-CROSSING
-    latches rather than the termination manager's live state.
+    per-term record rather than the termination manager's live state.
 
     That distinction is the whole reason this exists instead of ``mdp.is_terminated_term``:
     terminations are evaluated at the control rate inside the interval while the reward is
@@ -341,30 +341,32 @@ def episode_ended_by(env: ManagerBasedRLEnv, term_keys: Sequence[str]) -> torch.
     be priced separately, and ``time_outs`` cannot tell them apart.
 
     Args:
-        env: An :class:`AdjusterEnv` (anything exposing ``term_latch``).
+        env: An :class:`AdjusterEnv` (anything exposing ``ended_by``).
         term_keys: Termination term names to count.
 
     Returns:
         ``[num_envs]`` float.
 
     Raises:
-        RuntimeError: If the env keeps no latches -- on a per-control-step env there is no
-            interval to latch over, and ``mdp.is_terminated_term`` is correct there.
+        RuntimeError: If the env records no per-term ending -- on a per-control-step env
+            there is no interval to record over, and ``mdp.is_terminated_term`` is correct
+            there.
         KeyError: On an unknown term name, naming the ones that exist. A silent miss would
             price a termination at zero and read as a policy that never fails.
     """
-    latch = getattr(env, "term_latch", None)
-    if latch is None:
+    ended = getattr(env, "ended_by", None)
+    if ended is None:
         raise RuntimeError(
-            "episode_ended_by needs an env that latches per-term dones over an interval (see "
-            "AdjusterEnv). On a per-control-step env use mdp.is_terminated_term instead."
+            "episode_ended_by needs an env that records which term ended each episode over a "
+            "multi-control-step interval (see AdjusterEnv.ended_by). On a per-control-step "
+            "env use mdp.is_terminated_term instead."
         )
     out = torch.zeros(env.num_envs, device=env.device)
     for key in term_keys:
-        if key not in latch:
+        if key not in ended:
             raise KeyError(
                 f"termination term {key!r} is not active; this env has "
-                f"{sorted(latch)}. A miss here would price that ending at zero."
+                f"{sorted(ended)}. A miss here would price that ending at zero."
             )
-        out = torch.maximum(out, latch[key].to(out.dtype))
+        out = torch.maximum(out, ended[key].to(out.dtype))
     return out

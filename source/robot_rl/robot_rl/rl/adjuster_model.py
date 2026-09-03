@@ -289,17 +289,22 @@ class WindowAdjusterModel(MLPModel):
                 f"{want_plan}."
             )
 
+        # ... + 1 for the trailing null-history flag. Kept in step with
+        # `FmTrackingCommand.cond_width`, which is what actually produces this row.
         want_cond = (fm_ctx.N * fm_ctx.D
                      + fm_ctx.extero_sensor_count * fm_ctx.extero_sensor_dim
-                     + fm_ctx.num_cmd_tokens * fm_ctx.cmd_dim)
+                     + fm_ctx.num_cmd_tokens * fm_ctx.cmd_dim
+                     + 1)
         have_cond = int(obs[self._cond_group].shape[-1])
         if have_cond != want_cond:
             raise ValueError(
                 f"group {self._cond_group!r} is {have_cond} wide but this generator's "
                 f"conditioning is history {fm_ctx.N}x{fm_ctx.D} + extero "
                 f"{fm_ctx.extero_sensor_count}x{fm_ctx.extero_sensor_dim} + cmd "
-                f"{fm_ctx.num_cmd_tokens}x{fm_ctx.cmd_dim} = {want_cond}."
+                f"{fm_ctx.num_cmd_tokens}x{fm_ctx.cmd_dim} + 1 null-history flag "
+                f"= {want_cond}."
             )
+        # ... and a trailing scalar, the null-history flag. See `FmTrackingCommand.cond_width`.
         self._cond_split = (
             fm_ctx.N * fm_ctx.D,
             fm_ctx.extero_sensor_count * fm_ctx.extero_sensor_dim,
@@ -320,9 +325,52 @@ class WindowAdjusterModel(MLPModel):
         """
         return self._d_model
 
+    def train(self, mode: bool = True):
+        """Switch modes, but keep the tuned copies matched to the BORROWED layers.
+
+        The six borrowed layers live on the generator, which is hidden from ``nn.Module``
+        registration on purpose, so ``actor.train()`` reaches only ``tuned_layers`` -- leaving
+        layers 1-6 in ``eval`` and 7-8 in ``train``. At the shipped ``dropout=0.0`` that is
+        invisible, which is exactly why it is worth pinning: a generator trained with dropout
+        would apply it in the last two layers only, and would do so inside ``PPO.update``'s
+        recomputation, making the recomputed mean stochastic and feeding noise straight into
+        the importance ratio.
+
+        Args:
+            mode: Ignored for the tuned layers, which follow the frozen trunk.
+
+        Returns:
+            ``self``.
+        """
+        super().train(mode)
+        self.tuned_layers.eval()
+        return self
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+    def as_jit(self, *args, **kwargs):
+        """Refuse, naming the reason. See :meth:`as_onnx`."""
+        raise NotImplementedError(self._EXPORT_MSG)
+
+    def as_onnx(self, *args, **kwargs):
+        """Refuse, naming the reason.
+
+        ``MLPModel``'s exporters deep-copy ``self.mlp`` alone and feed it a flat
+        ``obs_dim``-wide vector. Here ``self.mlp`` is the per-token head, which reshapes to
+        ``(B, F, d_model)`` and needs ``F * d_model``; and the real work is in the borrowed
+        transformer, which the copy does not include. Inherited, the call dies on a shape
+        mismatch far from the cause.
+        """
+        raise NotImplementedError(self._EXPORT_MSG)
+
+    _EXPORT_MSG = (
+        "WindowAdjusterModel cannot use MLPModel's exporters: they copy `self.mlp` alone, "
+        "which here is a per-token head over a borrowed transformer, not the whole policy. "
+        "Exporting an adjuster means exporting the generator's prefix with it -- see "
+        "scripts/flow_matching/export_fm_onnx.py for the shape that takes."
+    )
+
     def get_latent(self, obs, masks=None, hidden_state=None) -> torch.Tensor:
         """Run the query stream over the generator's frozen conditioning prefix.
 
@@ -341,9 +389,15 @@ class WindowAdjusterModel(MLPModel):
         cond = obs[self._cond_group]
         history = cond[:, :n_hist].reshape(-1, ctx.N, ctx.D)
         extero = cond[:, n_hist:n_hist + n_extero]
-        cmd = cond[:, n_hist + n_extero:]
+        _, _, n_cmd = self._cond_split
+        cmd = cond[:, n_hist + n_extero:n_hist + n_extero + n_cmd]
         cmd_tokens = (cmd.reshape(-1, ctx.num_cmd_tokens, ctx.cmd_dim)
                       if ctx.cmd_dim > 0 else None)
+        # The trailing scalar is the null-history flag the plan was drawn under. Dropping it
+        # was a real bug: `encode_prefix` swaps the whole history for a learned embedding
+        # where it is set, and the rows are deliberately left stale there, so re-encoding
+        # without it fed the previous episode's rows -- on every episode's first decision.
+        null_hist = cond[:, -1] > 0.5
 
         plan = obs[self._plan_group]
         half = self.num_nodes * self.node_dim
@@ -355,7 +409,13 @@ class WindowAdjusterModel(MLPModel):
         # rollout runs under `inference_mode`: a tensor made there cannot enter an autograd
         # graph later, which is why stock PPO re-runs the actor from stored observations too.
         with torch.no_grad():
-            prefix = fm.encode_prefix(history, extero, cmd_tokens, None)
+            # Both trailing arguments matter and both were previously defaulted. `advantage`
+            # is currently None on this path (`load_fm_context` refuses a conditioned
+            # checkpoint without a serve label), but passing the context's own value means an
+            # advantage-conditioned generator cannot silently be re-encoded under the `null`
+            # label while its plan was drawn under another.
+            prefix = fm.encode_prefix(history, extero, cmd_tokens, null_hist,
+                                      getattr(ctx, "advantage_label", None))
 
         x = self.token_in(torch.cat([flow, window], dim=-1)) + self.node_pos + self.query_type
         # The BORROWED layers run WITH grad even though their parameters are frozen, and that

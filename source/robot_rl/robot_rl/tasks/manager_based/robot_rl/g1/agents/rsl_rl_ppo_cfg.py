@@ -345,6 +345,23 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
         **_PPO_KWARGS,
         "entropy_coef": _PPO_KWARGS["entropy_coef"] * _TEACHER_ACTION_DIM / _ADJUSTER_ACTION_DIM,
         "desired_kl": _PPO_KWARGS["desired_kl"] * _ADJUSTER_ACTION_DIM / _TEACHER_ACTION_DIM,
+        # THE THIRD action-dim-summed quantity, and the one that is easy to miss because it is
+        # not summed by name. `log_prob` is summed over the action dimension, so PPO's ratio is
+        # `exp` of a 2728-term sum and its spread grows as sqrt(94) ~ 9.7x -- while a clip band
+        # of 0.2 did not move. Measured at the rescaled KL target: only ~10% of samples fall
+        # inside the band and ~45% land on a boundary contributing NO gradient, so the clip,
+        # not the KL, silently became the binding trust region. Scaling the band by the same
+        # sqrt(94) restores the teacher's regime: log(1 + 0.2) * sqrt(94) ~ 1.77, i.e. ~4.8.
+        #
+        # This makes the adaptive KL controller the trust region, which is what the two
+        # rescales above already intended. It is a real change in algorithm character --
+        # clipping is effectively off -- and it is deliberate rather than incidental.
+        # TODO(adjuster-ppo-trust-region): all three of these (entropy_coef, desired_kl,
+        # clip_param) are rescales of teacher values, not measured ones. Once a run trains,
+        # come back and try putting them back toward the normal values -- the 94x argument is
+        # about how rsl-rl REDUCES these statistics, not evidence that the policy needs a
+        # 94x-wider trust region to learn.
+        "clip_param": 4.8,
         # num_mini_batches and gamma stay at the teacher's values -- see the TODOs above.
         "critic_warmup_iterations": 100,
     })

@@ -1318,6 +1318,18 @@ class FmTrackingCommand(MotionSequenceCommand):
             parts = [history.flatten(1), height.flatten(1)]
             if cmd_tokens is not None:
                 parts.append(cmd_tokens.flatten(1))
+            # The null-history FLAG is a fourth input to the prefix, and it is the one that
+            # cannot be recovered from the rows. Where it is set, `encode_prefix` REPLACES
+            # every history token with the learned `null_history` embedding -- and the rows
+            # themselves are deliberately left stale for exactly those envs (see
+            # `BatchedHistory.stack_padded`, which declines to repair them BECAUSE the mask
+            # covers them). So a consumer that re-encodes without it feeds the previous
+            # episode's rows, from a different tile, as though they were real history. That
+            # is every episode's FIRST plan, since the mask is set for the first N control
+            # steps after a reset and the opening re-plan lands inside them.
+            null_col = (torch.zeros_like(ids, dtype=torch.float32) if null_hist is None
+                        else null_hist[ids].to(torch.float32))
+            parts.append(null_col.unsqueeze(-1))
             self._cond_stash[ids] = torch.cat(parts, dim=-1).detach()
         sampled = sample_window(
             self.ctx, history, height, cmd_tokens,
@@ -1524,10 +1536,17 @@ class FmTrackingCommand(MotionSequenceCommand):
 
     @property
     def cond_width(self) -> int:
-        """Width of one flattened conditioning row: history + exteroception + command."""
+        """Width of one row: history + exteroception + command + the null-history flag.
+
+        The trailing scalar is the flag `encode_prefix` takes as ``history_null_mask``. It is
+        part of the CONDITIONING, not metadata: where it is set the history tokens are
+        replaced wholesale by a learned embedding, so a row without it does not describe the
+        prefix the plan was drawn from.
+        """
         return (self.ctx.N * self.ctx.D
                 + self.ctx.extero_sensor_count * self.ctx.extero_sensor_dim
-                + self.ctx.num_cmd_tokens * self.ctx.cmd_dim)
+                + self.ctx.num_cmd_tokens * self.ctx.cmd_dim
+                + 1)
 
     def enable_cond_stash(self) -> None:
         """Start keeping the conditioning each plan was drawn from, as BUILT.

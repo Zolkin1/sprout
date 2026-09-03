@@ -1016,7 +1016,8 @@ def window_residual(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> t
     return (cmd.plan_residual() / sigma).flatten(1)
 
 
-def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref",
+                  slack_s: float = 0.0, step_scale: float = 1.0) -> torch.Tensor:
     """Where the goal is and how long is left, ``[N, 4]``: downrange, lateral, height, steps.
 
     A CRITIC input, and what makes a bootstrapped truncation well posed. On this task reaching
@@ -1030,13 +1031,29 @@ def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> tor
     -- the same quantities :func:`mdp.in_goal` thresholds, so the critic sees the geometry the
     termination decides on rather than a proxy for it.
 
+    ``slack_s`` MUST match the ``clip_end_reached`` term's, because that is the deadline this
+    channel exists to expose. With the default 0.0 against a task running 3.0 s of slack, the
+    count reaches zero 150 control steps -- 12 agent decisions -- before the episode is
+    actually cut, so the last third of a short episode carries no time evidence at all and the
+    cut is exactly as unpredictable as having no channel.
+
+    ``step_scale`` exists because the critic group is un-normalized by design (every other
+    term in it is O(1) by construction: velocities scaled, actions and scan clipped). A raw
+    control-step count reaches ~950 and would dominate the first layer's pre-activations by
+    two to three orders of magnitude. Scaling by ``1 / max_episode_length`` keeps the unit
+    honest -- it is still a step count, just expressed as a fraction of the longest episode.
+
     Args:
         env: IsaacLab environment.
         command_name: The :class:`MotionSequenceCommand` term name.
+        slack_s: Grace period past the clip's last usable step, in seconds. Must equal the
+            ``clip_end_reached`` term's ``slack_s``.
+        step_scale: Multiplier on the remaining-steps channel.
 
     Returns:
-        ``[num_envs, 4]``. Control steps remaining is clamped at 0 and is in units of control
-        steps, not seconds, so it does not silently change meaning with ``step_dt``.
+        ``[num_envs, 4]``. Steps remaining is clamped at 0, is in units of control steps
+        (times ``step_scale``) rather than seconds so it does not silently change meaning with
+        ``step_dt``, and counts to the SAME deadline ``clip_end_reached`` fires on.
     """
     from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
 
@@ -1044,6 +1061,12 @@ def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> tor
     root_pos_w = wp.to_torch(env.scene["robot"].data.root_pos_w)
     goal_pos_w, frame_yaw = goal_region.goal_anchor_world(cmd)
     down, lat, hz = goal_region.goal_frame_offsets(root_pos_w, goal_pos_w, frame_yaw)
-    remaining = (goal_region.last_usable_step(cmd).to(root_pos_w.device)
-                 - (cmd.start_step + env.episode_length_buf).to(root_pos_w.device))
-    return torch.stack([down, lat, hz, remaining.clamp_min(0).to(down.dtype)], dim=-1)
+    cursor = (cmd.start_step + env.episode_length_buf).to(root_pos_w.device)
+    deadline = goal_region.last_usable_step(cmd).to(root_pos_w.device)
+    if slack_s:
+        deadline = deadline + int(round(float(slack_s) / env.step_dt))
+    # The episode also ends at `time_out`, and whichever deadline is nearer is the one the
+    # critic has to predict.
+    time_out_left = int(env.max_episode_length) - env.episode_length_buf.to(root_pos_w.device)
+    remaining = torch.minimum(deadline - cursor, time_out_left).clamp_min(0)
+    return torch.stack([down, lat, hz, remaining.to(down.dtype) * float(step_scale)], dim=-1)
