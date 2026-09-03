@@ -568,7 +568,7 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                          recorder=None, episode_uid: int = -1, family_code: int = 0,
                          lookahead: int = 1, random_select: bool = False,
                          cmd_hold_s: float = 0.0, w_fail: float = 0.75,
-                         spec=None, gamma: float = 0.95):
+                         spec=None, gamma: float = 0.95, select_on: str = "critic"):
     """One episode driven by a live lookahead selector over ``k`` candidate chunks.
 
     Args:
@@ -578,7 +578,29 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
         spawn: The initial condition.
         cmd: ``(3,)`` commanded twist.
         cfg: The ``ArmRun``.
-        crit: A ``critic.FailureCritic``, or ``None`` at ``k == 1``.
+        crit: A ``critic.FailureCritic``, or ``None`` at ``k == 1`` or under
+            ``select_on="measured"``, which reads no model at all.
+        select_on: What orders the candidates.
+
+            * ``"critic"`` -- the learned score, ``selection_score``'s
+              ``w_track * G_hat_n - w_fail * P_fail``.
+            * ``"measured"`` -- the candidate's OWN MEASURED tracking reward over the chunk it
+              just executed, and nothing else.  No critic is loaded, no state is scored, and
+              the ranking is a realized quantity rather than a prediction.
+
+            The distinction is not a weighting of the same thing.  Under ``critic`` the
+            measured reward already enters, through ``G_hat_n``'s identity
+            ``G_t = (1 - gamma) * R_t + gamma * G_{t+1}`` -- but at ``gamma = 0.95`` and
+            ``w_track = 0.25`` the one measured chunk carries ``0.25 * 0.05 = 1.25%`` of the
+            score, so the ordering is the critic's almost entirely.  ``measured`` gives that
+            term the whole weight.
+
+            **It is a myopic selector and deliberately so.**  0.24 s of tracking is not the
+            episode outcome, and a chunk that tracks beautifully into a bad state will win.
+            What it answers is whether the SIGNAL a selector needs is present in a quantity
+            that requires no learned model -- which the critic's own inability to rank
+            siblings (within-state spread 4x below its two folds' disagreement) makes worth
+            asking separately.
         anchor: Goal anchor for the critic's goal features.
         k: Candidates per re-plan.  ``k == 1`` takes the selector's own path with no choice to
             make, so it must reproduce the plain runner exactly -- that is the harness check,
@@ -649,7 +671,10 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
     # away. That was harmless by arithmetic coincidence ALONE -- the ring is 10 rows and the
     # chunk 12, so each candidate fully overwrote it before the critic read -- and moving the
     # critic read to the re-plan (below) destroys that coincidence. The two are one fix.
-    ep_ring = C.ProprioRing() if (crit is not None and crit.privileged) else None
+    # The proprio ring exists ONLY to build privileged critic inputs, so `measured` needs
+    # none -- and asking a None critic for `.privileged` would raise.
+    ep_ring = (C.ProprioRing()
+               if (select_on == "critic" and crit is not None and crit.privileged) else None)
 
     def _push_ring(target):
         """A per-step scorer callback that fills ``target``, or a no-op for ``None``."""
@@ -817,7 +842,10 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             # this candidate's own executed tail. That step's physics is discarded -- `post`
             # above is the commit point -- so the episode resumes exactly where it did before.
             # Its verdict is discarded too: the committed verdict stays the first chunk's.
-            if not v_score and st_score is not None:
+            # `measured` reads no state, so the extra step has nothing to refresh. Skipping
+            # it leaves the episode identical -- its physics is discarded either way, `post`
+            # being the commit point -- and saves one control step per candidate per re-plan.
+            if select_on == "critic" and not v_score and st_score is not None:
                 _sv, _sf, st_replan = _chunk(
                     rig, policy, fm_lag, cmd, 1, cfg, list(cz),
                     scorer=_push_ring(cand_ring), steer_kp=steer_kp,
@@ -846,6 +874,23 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                 score = 1.0
             elif v_score == "success":
                 score = -1.0
+            elif select_on == "measured":
+                # THE CANDIDATE'S OWN REALIZED TRACKING QUALITY, and nothing else. Negated,
+                # because the caller minimises. The reward is in [0, 1], so a survivor scores
+                # in [-1, 0] and the +/-1.0 terminal sentinels still bound it -- a chunk that
+                # tracked a perfect 1.0 would TIE the success sentinel, which cannot happen on
+                # a real reward and would resolve to the earlier candidate if it did.
+                #
+                # An empty `chunk_rewards` means every step of the chunk fell inside the
+                # opening hold, where there is no reference to track. Scored as the middle of
+                # the range rather than as the best or the worst: 0.0 would make an
+                # unmeasurable candidate beat every measured one, and 1.0 would make it lose
+                # to all of them, and neither is a statement the data supports.
+                if cprobe is not None and cprobe.chunk_rewards:
+                    r_meas = float(np.mean(cprobe.chunk_rewards))
+                    score = -r_meas
+                else:
+                    score = -0.5
             elif st_score is None:
                 score = 1.0
             else:
@@ -982,6 +1027,24 @@ def run(args) -> int:
                              fm_override=args.fm_pt)
     elif use_q and ks != [1]:
         scorer = QScorer(args.q_ckpt, device=args.device, fm_override=args.fm_pt)
+    elif ks != [1] and args.select_on == "measured":
+        # NO MODEL AT ALL. The ranking is the candidate's own measured tracking reward, so a
+        # critic would be loaded and never read -- and loading one anyway would put its
+        # absolute path into the provenance of a run that does not depend on it.
+        if args.critic_ckpt or args.q_ckpt or args.state_critic_ckpt:
+            raise SystemExit(
+                "--select_on measured reads no model, so passing a critic is a contradiction: "
+                "the run would record a dependency it does not have. Drop the checkpoint and "
+                "pass --tracking_spec, which is what DEFINES the reward being ranked.")
+        if not args.tracking_spec:
+            raise SystemExit(
+                "--select_on measured needs --tracking_spec: the thing it ranks IS the reward "
+                "that spec defines (its sigmas, bounds and gamma), and it is also the failure "
+                "rule. Without it the selector would rank a bootstrap reward while the "
+                "comparison arm ranks a fitted one. Dump the spec the critic arm used with "
+                "`python -c \"import json,torch; "
+                "print(json.dumps(torch.load(CKPT, map_location=\'cpu\', "
+                "weights_only=False)[\'tracking_spec\']))\"`.")
     elif ks != [1]:
         if not args.critic_ckpt:
             raise SystemExit("need --critic_ckpt (V selector) or --q_ckpt (Q selector)")
@@ -1032,7 +1095,12 @@ def run(args) -> int:
               f"{math.degrees(track_spec.max_tilt_rad):.0f} deg vs the served reference, "
               f"TERMINATING, on every arm including K=1. spec "
               f"{'FITTED' if not track_spec.is_bootstrap else 'BOOTSTRAP'}", flush=True)
-    if ks != [1]:
+    if ks != [1] and args.select_on == "measured":
+        print("[live] selection score: the candidate's OWN MEASURED tracking reward over the "
+              "chunk it just executed -- NO model is read. A realized quantity, not a "
+              "prediction, and MYOPIC: 0.24 s of tracking, not the episode outcome. --w_fail "
+              f"({args.w_fail}) and the critic weights do not apply.", flush=True)
+    elif ks != [1]:
         if args.w_fail < 1.0:
             if track_spec is None:
                 raise SystemExit(
@@ -1055,6 +1123,11 @@ def run(args) -> int:
                   flush=True)
     os.makedirs(args.out, exist_ok=True)
     recorder = None
+    if args.select_on == "measured" and args.random_select:
+        raise SystemExit(
+            "--select_on measured and --random_select are two different rules for the same "
+            "choice; --random_select already IS the control for any rule, so pass it with the "
+            "default --select_on critic and compare deltas.")
     if args.random_select and args.same_noise:
         raise SystemExit(
             "--random_select and --same_noise are two DIFFERENT controls and composing them "
@@ -1167,6 +1240,7 @@ def run(args) -> int:
                         {"steer_kp": args.steer_kp, "steer_wz_max": args.steer_wz_max,
                          "same_noise": args.same_noise,
                          "random_select": args.random_select,
+                         "select_on": args.select_on,
                          # Only K>1 selects; a K=1 arm in the same invocation must not write.
                          "recorder": (recorder if k > 1 else None),
                          "episode_uid": (int(tile) * 1000000 + int(k) * 100000
@@ -1175,7 +1249,8 @@ def run(args) -> int:
                          "lookahead": args.lookahead,
                          "cmd_hold_s": args.cmd_hold_s,
                          "w_fail": args.w_fail,
-                         "spec": track_spec, "gamma": track_gamma})
+                         "spec": track_spec, "gamma": track_gamma,
+                         "select_on": args.select_on})
                 v, f, nr, sc, q = fn(
                     rig, policy, fm_lag, spawn, cmd, cfg, crit, course.goal_anchor_xyz,
                     k=k, seed=ep, mjrunner=mjrunner, **extra)
@@ -1318,6 +1393,15 @@ def main() -> int:
                         "improved everything together', which no loss on the selected chunks "
                         "alone can tell apart. Nearly free -- candidates share one "
                         "conditioning, so a row grows by K plans, not K exteroception rows.")
+    p.add_argument("--select_on", default="critic", choices=("critic", "measured"),
+                   help="what ORDERS the K candidates. 'critic' is the learned score. "
+                        "'measured' is the candidate's own realized tracking reward over the "
+                        "chunk it just executed and nothing else -- no model is read, so it "
+                        "asks whether the signal a selector needs exists in a quantity that "
+                        "needs no critic. Note the measured reward already enters the critic "
+                        "score through G_hat_n, but at gamma 0.95 and w_track 0.25 it carries "
+                        "1.25% of it, so this is a different ordering rather than a reweighted "
+                        "one. MYOPIC by construction: 0.24 s of tracking is not the outcome.")
     p.add_argument("--random_select", action="store_true",
                    help="CONTROL: roll and score all K candidates exactly as usual, then "
                         "commit a UNIFORMLY RANDOM one instead of the argmin. Differs from the "

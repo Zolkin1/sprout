@@ -579,6 +579,76 @@ breakdown.
 rewrites `robots/g1/<robot>_<course>.xml` before loading it, and a speed sweep shares geometry,
 so the race tears the file silently. The generated scenes are derived and not committed.
 
+### 4d. Can a selector rank the generator's own samples? `transfer/sim/branch_probe.py`
+
+4c says the flow draw decides ~1 in 5 outcomes, so there IS mass to select. This asks the next
+question: at one re-plan, does the CHOICE of chunk carry a signal a selector could act on, and
+how much is it worth at best?
+
+`branch_probe.py --stage run` branches K sibling chunks from one probed state, rolls each to
+completion under common random numbers, and reads every critic on hand at the re-plan -- so a
+critic's within-state ranking can be scored against a realized outcome instead of inferred from
+a state-averaged AUC. `--second_seed_every` rolls a SECOND, independently-keyed continuation for
+every sibling, which is what makes the outcome a selector in its own right.
+
+```bash
+cd transfer/sim
+python branch_probe.py --stage run --out ../../logs/value/oracle_gain_data/t6s16 \
+    --tracker_onnx <run>/exported/tracker.onnx --fm_onnx <run>/exported/<fm>.onnx \
+    --fm_pt <fm run>/best.pt --clip_lib ../../clips/g1_mb_v5_body_mode11_decor.h5 \
+    --critic f0=<...>/V_priv.fold0.pt --critic f1=<...>/V_priv.fold1.pt \
+    --tile 6 --speed 1.6 --k 4 --episodes 45 --probe_every 4 --second_seed_every 1 \
+    --scene_tag _og6a
+python branch_probe.py --stage report --out ../../logs/value/oracle_gain_data/t6s16
+
+# THE BLOCKING CONTROL: one draw for every sibling, so they come out bit-identical and the
+# report's informative-group count must be EXACTLY 0. Run it before quoting anything.
+python branch_probe.py --stage run ... --same_noise --out .../ctrl
+```
+
+`--scene_tag` is mandatory when cells share a tile, for the reason 4c gives.
+
+**`oracle_gain.py` is the ceiling that report has to be read against.** It selects the best
+sibling on one continuation column and pays it out on the OTHER, which is the only way to ask
+what choosing is worth without scoring a pick on the draw that made it look good. No critic is
+read; the answer bounds best-of-K, filtered BC and advantage conditioning at ONE decision.
+
+```bash
+python oracle_gain.py --stage selfcheck            # closed-form; run this first
+python oracle_gain.py --stage analyze --out ../../logs/value/oracle_gain_v1 \
+    --run ../../logs/value/oracle_gain_data/t6s16 --run .../t20s16 --run .../t40s16 \
+    --control ../../logs/value/oracle_gain_data/ctrl --include_terminal_binary
+```
+
+Writes `oracle_gain.json`, `oracle_gain_by_stratum.md` (family, tile x speed, realized-spread
+bin, position in episode) and `oracle_gain.png`. Both stages are IsaacLab-free; `--stage
+analyze` needs only numpy/h5py/matplotlib, so it runs in `env_transfer`.
+
+Three arms to read together, and the middle one is the trap: **honest** (select on A, score on
+B), **hindsight** (score the draw it selected with) and **any-of-K** -- the last two are the
+same quantity, and both report the maximum of K noisy numbers as if it were an improvement.
+Measured on the deployed pair over 1952 probe states: one oracle decision is worth **+0.010**
+of episode success, and **85%** of the naive number is luck.
+
+**`ksweep_report.py` is the other half: what a LIVE selector actually collects.** It reduces a
+directory of `live_select.py` runs to cell-paired contrasts with cell-clustered intervals, and
+its decomposition is what separates a selector's ranking from the harness:
+
+```bash
+python ksweep_report.py --sweep ../../logs/value/sweep_v1 --sweep ../../logs/value/randsel_v1 \
+    --clip_lib ../../clips/g1_mb_v5_body_mode11_decor.h5 \
+    --out ../../logs/value/ksweep_v1 --only_nosteer
+```
+
+`--random_select` is the control that makes any K arm interpretable -- it rolls and scores all
+K candidates as usual and commits a UNIFORMLY RANDOM one, so `critic-pick − random-pick` is the
+ranking and nothing else. Do NOT use `--same_noise` for that question: it re-keys the RNG as
+well as removing the signal, worth a measured +0.047 on its own. `--select_on measured` is the
+model-free arm, ordering candidates by the tracking reward each one actually achieved.
+
+See `docs/oracle_gain_report.md` for all of it, including why the +0.167 the v2 critic scored
+was measured with an opening simulator transient that has since been fixed.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.

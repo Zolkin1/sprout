@@ -25,9 +25,12 @@ measured.  This measures it.
   paired and the flow draw stops being a nuisance variable.  The key deliberately carries
   ``_CONT_TAG`` and NOT ``cand``: a key that collided with a branch key would hand a sibling
   its own branch draw as its continuation.
-* **A SECOND continuation seed on a subset**, because CRN pairs the siblings without removing
-  label noise.  Without it, "the critic cannot rank them" and "the labels are noisy" are the
-  same observation.
+* **A SECOND continuation seed on a subset of episodes, for EVERY sibling of those groups**,
+  because CRN pairs the siblings without removing label noise.  Without it, "the critic cannot
+  rank them" and "the labels are noisy" are the same observation.  Two labels per sibling also
+  make the group's own outcomes a SELECTOR that can be scored honestly -- select on one column,
+  score on the other -- which is what `oracle_gain.py` reads and what bounds any per-state
+  sharpening method at one decision.
 * **EVERY critic on hand scores the SAME branches.**  The dataset is critic-agnostic -- states,
   chunks, outcomes -- so extra models cost one forward pass each.  The two cross-fit folds
   disagreeing with each other is the NOISE FLOOR: a within-state spread of 0.009 means nothing
@@ -129,7 +132,8 @@ def _probe_episode(rig, policy, fm_lag, spawn, cmd, cfg, crits, spec, anchor, *,
         mjrunner: ``mjeval.runner``.
         cadence: Control steps per chunk.
         probe_every: Probe one re-plan in this many.
-        second_seed: Also roll a second continuation for the FIRST sibling of each group.
+        second_seed: Also roll a SECOND, independently-keyed continuation for EVERY sibling
+            of this group, so the group carries two independent realized outcomes per branch.
         same_noise: BLOCKING CONTROL -- hand every sibling one draw, so they must be
             identical and no group can be informative.
         rows: Output list, appended in place.
@@ -267,8 +271,25 @@ def _probe_episode(rig, policy, fm_lag, spawn, cmd, cfg, crits, spec, anchor, *,
             for nm, (p, g) in preds.items():
                 row["p_" + nm] = float(p)
                 row["g_" + nm] = float("nan") if g is None else float(g)
-            # A SECOND continuation for sibling 0, to size the label noise CRN leaves.
-            if second_seed and cand == 0 and not v:
+            # A SECOND continuation for EVERY sibling, to size the label noise CRN leaves
+            # AND to give any ranking statistic a measurable ceiling.
+            #
+            # It used to run on sibling 0 alone, which gives a per-branch noise MAGNITUDE but
+            # no ceiling and no counterfactual: the quantity a selection claim has to be read
+            # against is how well a group's realized outcomes rank the SAME group under an
+            # INDEPENDENT continuation draw, and that needs a second label on every sibling,
+            # not on one. Without it "the critic ranks siblings at tau = 0.1" and "no ranking
+            # of these siblings is stable at all" are the same observation, and
+            # `oracle_gain.py` -- which selects on one column and scores on the other -- has
+            # no second column to score in.
+            #
+            # It costs a second-seed group K continuations instead of 1;
+            # `--second_seed_every` is what keeps that affordable. A group gets the full set
+            # or none of it, never a partial one that would silently be a different
+            # estimator -- except for a sibling that terminated INSIDE its own chunk, which
+            # has no continuation to roll at all and makes its whole group partial. Those are
+            # dropped downstream and counted, not patched.
+            if second_seed and not v:
                 post.restore(robot, policy, fm_lag)
                 p2 = tracking.TrackingProbe(spec, hold_until_s=hold)
                 v2, r2 = roll_out(_CONT_TAG_B, n_replans + 1, list(cz),
@@ -375,21 +396,31 @@ def stage_run(args) -> int:
         print(f"  seed {ep:>3}: {v:8s} replans={nr:>3} groups={ng:>3} "
               f"rows={len(rows):>5}  ({(time.time() - t0) / 60:.1f} min)", flush=True)
         if (ep - args.seed_offset + 1) % max(int(args.flush_every), 1) == 0:
-            _write(args, rows, spec, crits)
+            _write(args, rows, spec, crits, course)
 
-    _write(args, rows, spec, crits)
+    _write(args, rows, spec, crits, course)
     print(f"[probe] {len(rows)} branch rows -> {os.path.join(args.out, 'branches.h5')}",
           flush=True)
     return 0
 
 
-def _write(args, rows, spec, crits) -> None:
+def _write(args, rows, spec, crits, course=None) -> None:
     """Write the dataset. Called PERIODICALLY, not only at the end.
 
     A probe episode costs ~2 min and a run is tens of them, all held in memory until the last
     one -- so a crash at episode 39 of 40 used to lose the whole run, and ``--stage report``
     could not be pointed at a run in flight. Rewriting the file whole each time is fine at
     this scale (a few thousand small rows) and keeps the reader trivially correct.
+
+    Args:
+        args: The parsed CLI.
+        rows: Branch rows collected so far.
+        spec: The ``TrackingErrorSpec`` in force.
+        crits: ``{name: FailureCritic}``.
+        course: The ``Course``, so the file states its own family and class rather than
+            leaving a consumer to re-derive them from the tile id and the clip library.
+            ``oracle_gain.py`` stratifies by family and would otherwise have to reopen a 6 GB
+            library to learn what tile 6 is.
     """
     import h5py  # noqa: PLC0415
 
@@ -430,6 +461,17 @@ def _write(args, rows, spec, crits) -> None:
                          ("fall_tilt_deg", float(args.fall_tilt_deg))):
             f.attrs[key] = val
         f.attrs["tracking_spec"] = json.dumps(spec.to_dict())
+        # THE DESIGN, not just the parameters. `second_seed_every` says how OFTEN a second
+        # continuation was rolled; `second_seed_scope` says WHOSE, and the two files differ by
+        # exactly that: a pre-change run second-seeded sibling 0 alone, so its B column cannot
+        # support a selection at all. A consumer that read `second_seed_every` and assumed the
+        # scope would silently analyse one sibling of every group as if it were K.
+        f.attrs["second_seed_scope"] = "all_siblings"
+        f.attrs["cont_tag"] = int(_CONT_TAG)
+        f.attrs["cont_tag_b"] = int(_CONT_TAG_B)
+        if course is not None:
+            f.attrs["klass"] = str(course.klass)
+            f.attrs["course_name"] = str(course.name)
     # Atomic replace, so a reader pointed at a run in flight never sees a half-written file.
     os.replace(tmp, path)
 
@@ -496,9 +538,27 @@ def stage_report(args) -> int:
     """Read the dataset and print the statistics, spread first."""
     import h5py  # noqa: PLC0415
 
-    with h5py.File(os.path.join(args.out, "branches.h5"), "r") as f:
-        d = {k: f[k][:] for k in f}
-        attrs = dict(f.attrs)
+    # SEVERAL directories, because `_write` rewrites the file from the running process's own
+    # rows -- so a resumed run must write to a NEW --out or it would clobber the episodes the
+    # first one collected. Merging happens here instead, where it is safe.
+    dirs = [args.out] + list(args.also)
+    parts, attrs = [], {}
+    for dd in dirs:
+        fp = os.path.join(dd, "branches.h5")
+        if not os.path.exists(fp):
+            print(f"[report] no branches.h5 in {dd}, skipping")
+            continue
+        with h5py.File(fp, "r") as f:
+            parts.append({k: f[k][:] for k in f})
+            attrs = dict(f.attrs) if not attrs else attrs
+    if not parts:
+        raise SystemExit("no branches.h5 found in any of " + ", ".join(dirs))
+    keys = set(parts[0])
+    for q in parts[1:]:
+        keys &= set(q)
+    d = {k: np.concatenate([q[k] for q in parts]) for k in sorted(keys)}
+    if len(parts) > 1:
+        print(f"[report] merged {len(parts)} run directories")
     names = json.loads(attrs["critics"])
     k = int(attrs["k"])
     gid = d["seed"].astype(np.int64) * 100000 + d["replan"].astype(np.int64)
@@ -622,6 +682,11 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--stage", default="run", choices=("run", "report"))
     p.add_argument("--out", required=True)
+    p.add_argument("--also", action="append", default=[],
+                   help="report over ADDITIONAL run dirs as well. A resumed run must use a "
+                        "fresh --out (the writer rewrites the file from its own rows and "
+                        "would clobber the earlier episodes), so merging happens at report "
+                        "time. Seeds must not overlap -- they are the group key.")
     p.add_argument("--critic", action="append", default=[],
                    help="NAME=path, repeatable. Pass BOTH cross-fit folds: their "
                         "disagreement is the noise floor the within-state spread is read "
@@ -643,8 +708,11 @@ def main() -> int:
                    help="branch at one re-plan in this many. Rolling every branch of every "
                         "re-plan to completion costs ~70x a plain episode.")
     p.add_argument("--second_seed_every", type=int, default=4,
-                   help="on one episode in this many, roll sibling 0 on a SECOND continuation "
-                        "seed, to size the label noise CRN leaves behind.")
+                   help="on one episode in this many, roll EVERY sibling on a SECOND "
+                        "continuation seed, to size the label noise CRN leaves behind and to "
+                        "give `oracle_gain.py` a held-out column to score a selection on. "
+                        "Those episodes cost K continuations per group instead of 1, which is "
+                        "what this rations; pass 1 to second-seed every episode.")
     p.add_argument("--same_noise", action="store_true",
                    help="BLOCKING CONTROL: hand every sibling ONE branch draw. They must then "
                         "be bit-identical, so the report's informative-group count must be "
