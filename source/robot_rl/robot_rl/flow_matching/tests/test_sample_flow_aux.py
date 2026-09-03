@@ -110,6 +110,45 @@ def test_the_field_is_the_LAST_step_not_the_first() -> None:
     )
 
 
+def test_freezing_the_weights_changes_the_sample_which_is_why_the_loader_does_it() -> None:
+    """``requires_grad`` on the WEIGHTS decides whether attention takes its fused fast path.
+
+    Measured, and it is the reason ``online.load_fm_context`` freezes what it loads rather
+    than leaving that to each consumer: a loaded-but-unfrozen generator silently takes the
+    unfused path, and the two differ by float32 rounding (~5e-07 here). The RL adjuster
+    borrows this encoder and MUST freeze it -- 27M parameters would otherwise collect
+    gradients for nothing -- so without a freeze at load its plans would sit ~5e-07 from the
+    play task's, which on a robot is a chaotic divergence and makes a zero-residual identity
+    check impossible.
+
+    The tolerance below is a floor, not a target: the point is that the two paths are NOT
+    bit-identical, so a consumer cannot mix them.
+    """
+    model = _model()
+    cond = _conditioning()
+    noise = torch.randn(3, F, D, generator=torch.Generator().manual_seed(2))
+    # Non-contiguous, as the live conditioning is: it is sliced out of one flat observation
+    # group. Contiguity ALSO gates the fast path, so a contiguous fixture would hide this.
+    view = torch.cat([cond["history"], cond["history"]], dim=1)[:, :N]
+
+    def sample() -> torch.Tensor:
+        return sample_trajectory(model, view, cond["extero"], cond["cmd_tokens"], F, D,
+                                 NUM_STEPS, noise=noise)
+
+    assert all(p.requires_grad for p in model.parameters())
+    unfrozen = sample()
+    for p in model.parameters():
+        p.requires_grad_(False)
+    frozen = sample()
+
+    assert torch.equal(frozen, sample()), "frozen sampling must at least be repeatable"
+    assert not torch.equal(unfrozen, frozen), (
+        "freezing left the sample bit-identical here, so this test no longer demonstrates "
+        "why the loader freezes -- check whether the fast-path gating changed in torch"
+    )
+    torch.testing.assert_close(unfrozen, frozen, atol=1e-4, rtol=1e-4)
+
+
 def test_the_field_is_coherent_under_guidance() -> None:
     """Under CFG the field is the COMBINED one that was integrated, so no arm is refused.
 

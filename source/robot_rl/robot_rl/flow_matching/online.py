@@ -541,6 +541,57 @@ def _check_extero_image_hw(cfg: FlowMatchingConfig, meta: dict, encoder: str) ->
         )
 
 
+#: The generator this process is running, published for consumers that cannot be handed it.
+#:
+#: A deliberate module-level registry, and the alternatives are worse. The RL adjuster's
+#: network borrows the generator's frozen encoder, so it needs the same 27M-parameter model
+#: the command term is already running -- but an rsl-rl model is constructed from
+#: ``agent_cfg.to_dict()``, which can carry strings and numbers and not an object. The two
+#: ways to close that are:
+#:
+#: * load a SECOND copy from a path in the cfg -- 27M duplicated parameters on the GPU, and a
+#:   second construction site, which is the exact failure ``FlowMatchingTransformer.from_config``
+#:   exists to prevent (two sites drifted once and the printed architecture was wrong for a
+#:   whole run);
+#: * publish the one that exists. There is one generator per process by construction -- the
+#:   command term loads it in ``_post_init`` -- so a registry states that rather than working
+#:   around it.
+#:
+#: Set by :class:`FmTrackingCommand`; read through :func:`active_fm_context`, which raises
+#: rather than returning ``None`` so a consumer cannot silently proceed without a generator.
+_ACTIVE_FM_CONTEXT: "FmOnlineContext | None" = None
+
+
+def set_active_fm_context(ctx: "FmOnlineContext | None") -> None:
+    """Publish (or clear) the generator this process is running.
+
+    Args:
+        ctx: The loaded context, or ``None`` to clear it.
+    """
+    global _ACTIVE_FM_CONTEXT
+    _ACTIVE_FM_CONTEXT = ctx
+
+
+def active_fm_context() -> "FmOnlineContext":
+    """The generator this process is running.
+
+    Returns:
+        The published :class:`FmOnlineContext`.
+
+    Raises:
+        RuntimeError: If none has been published -- which means the env's command term has no
+            generator loaded, so a consumer borrowing its encoder has nothing to borrow.
+    """
+    if _ACTIVE_FM_CONTEXT is None:
+        raise RuntimeError(
+            "no active flow-matching context: nothing has called set_active_fm_context. The "
+            "command term publishes it when it loads a checkpoint, so this usually means "
+            "fm_checkpoint is empty -- pass --fm_checkpoint, or check that the env was built "
+            "before the model."
+        )
+    return _ACTIVE_FM_CONTEXT
+
+
 def load_fm_context(
     checkpoint: str | dict,
     device: torch.device | str,
@@ -633,6 +684,21 @@ def load_fm_context(
     _check_encoder_matches_weights(weights, encoder)
     model.load_state_dict(weights)
     model.eval()
+    # Frozen, not just in eval mode, and this is a NUMERICS decision rather than a tidiness
+    # one. ``nn.MultiheadAttention``'s fused fast path is used only when none of its tensor
+    # arguments require grad -- the WEIGHTS included -- so a loaded-but-unfrozen model silently
+    # takes the unfused path, and the two differ by float32 rounding: measured 4.77e-07 on one
+    # sampled window. Every consumer of this loader runs inference (it prefers the EMA weights
+    # and calls ``eval``), so freezing here makes them all agree AND all take the faster
+    # kernel. Without it, a consumer that happens to freeze -- the RL adjuster borrows this
+    # encoder and must, or 27M parameters collect gradients for nothing -- would produce plans
+    # ~5e-07 from the play task's, which on a robot is a chaotic divergence rather than a
+    # rounding difference and would make a zero-residual identity check impossible.
+    #
+    # ``scripts/flow_matching/finetune_generator.py`` is the one caller that TRAINS a model
+    # from here, and it re-enables grad explicitly on the model it builds.
+    for _p in model.parameters():
+        _p.requires_grad_(False)
     if which == "EMA":
         st = ckpt.get("ema_state") or {}
         print(f"[INFO load_fm_context] using EMA weights (decay {st.get('decay', '?')}, "

@@ -393,6 +393,22 @@ def export_fm_onnx(
     # no `advantage_serve_label` is refused at load, and the exporter is exactly the caller
     # that legitimately states the arm on the command line instead of reading it off the file.
     ctx = load_fm_context(checkpoint, device="cpu", advantage_label=advantage_label)
+    # UN-freeze for the trace, and this is a hard requirement rather than hygiene.
+    # `load_fm_context` freezes what it loads so every inference consumer takes
+    # `nn.MultiheadAttention`'s fused kernel (see the note there) -- but that kernel is
+    # `aten::_native_multi_head_attention`, which has NO ONNX lowering at opset 18, so tracing
+    # a frozen model fails with UnsupportedOperatorError. Same shape of trap as `torch.isclose`
+    # in `extero_encoder`: a model that trains and runs but cannot be exported.
+    #
+    # The cost is that the traced graph comes from the UNFUSED path while simulation runs the
+    # fused one, a float32 difference measured at ~5e-07 -- three orders below the ~2.6e-3
+    # CPU-vs-CUDA fp32 spread this graph already carries. Note what does and does not bound
+    # it: `test_fm_onnx_matches_torch` compares the graph against THIS model, which is
+    # unfrozen by the line above, so both sides are unfused and it says nothing about the
+    # fused gap. That gap is measured by
+    # `flow_matching/tests/test_sample_flow_aux.py::test_freezing_the_weights_changes_the_sample...`.
+    for _p in ctx.model.parameters():
+        _p.requires_grad_(True)
     if ctx.cmd_dim <= 0:
         raise ValueError("export_fm_onnx expects a command-conditioned checkpoint (cmd_dim>0).")
     _refuse_privileged_extero(ctx, checkpoint, allow_privileged_extero)

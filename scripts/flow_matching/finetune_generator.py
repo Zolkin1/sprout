@@ -463,9 +463,13 @@ def main() -> int:
     # is a plain generator that every existing consumer loads without knowing this ran.
     model = (convert(ctx, cfg, device, args.advantage_inject) if not plain
              else copy.deepcopy(ctx.model).to(device))
-    if plain:
-        for prm in model.parameters():
-            prm.requires_grad_(True)
+    # UNCONDITIONALLY, on both arms: `online.load_fm_context` freezes what it loads, because
+    # it is an inference loader and leaving the weights grad-enabled silently disables
+    # `nn.MultiheadAttention`'s fused fast path (see the note there). This is the one caller
+    # that trains such a model, so it is the one that has to say so -- and it says it for the
+    # converted arm too, whose weights may be deep-copied from the frozen source.
+    for prm in model.parameters():
+        prm.requires_grad_(True)
 
     rows = np.flatnonzero(keep)
     if args.max_windows and rows.size > args.max_windows:

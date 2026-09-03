@@ -9,6 +9,7 @@ gitignored and one ``uv sync`` away from being erased.
 """
 
 from .aux_ppo import AuxPPO
+from .frozen_tracker import FrozenTracker
 from .ref_encoder_model import RefEncoderMLPModel
 
-__all__ = ["AuxPPO", "RefEncoderMLPModel"]
+__all__ = ["AuxPPO", "FrozenTracker", "RefEncoderMLPModel"]

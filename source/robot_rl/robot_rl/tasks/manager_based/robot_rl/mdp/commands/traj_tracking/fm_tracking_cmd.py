@@ -76,6 +76,7 @@ from robot_rl.flow_matching.online import (
     build_history_tokens,
     load_fm_context,
     sample_window,
+    set_active_fm_context,
 )
 from isaaclab.utils.math import quat_apply
 
@@ -179,6 +180,10 @@ class FmTrackingCommand(MotionSequenceCommand):
             zero_noise=self.cfg.fm_zero_noise,
             guidance_scale=self.cfg.fm_guidance_scale,
         )
+        # Publish it: the RL adjuster's network borrows this exact frozen encoder, and an
+        # rsl-rl model is built from a dict of primitives so it cannot be handed an object.
+        # See `online._ACTIVE_FM_CONTEXT` for why a registry beats loading a second copy.
+        set_active_fm_context(self.ctx)
 
         # K must be 1 or >= N: the history is the previous plan's TAIL (cursor K-N .. K-1), so
         # all N rows come from one plan only at K >= N. Between 2 and N-1 the ring straddles
