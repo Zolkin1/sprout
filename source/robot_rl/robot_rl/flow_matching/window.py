@@ -96,7 +96,14 @@ from isaaclab.utils.math import (
     yaw_quat,
 )
 
-from .transforms import matrix_to_rot6d, quat_to_rot6d, rot6d_to_matrix, rot6d_to_quat
+from .transforms import (
+    matrix_to_rot6d,
+    quat_to_rot6d,
+    rot6d_to_matrix,
+    rot6d_to_quat,
+    so3_exp,
+    so3_log,
+)
 
 #: Content and frame of the ``base_pose`` block, carried into the exported tracker
 #: parameters and checked at deploy load.
@@ -218,6 +225,72 @@ REFERENCE_WINDOW_NOISE: dict[str, float | list[float]] = {
     "joint_vel": 0.5,                 # rad/s
     "ee_pos": [0.05, 0.05, 0.01],     # ee position rel. reference base, metres
 }
+
+
+#: Per-block RAW-unit magnitude of the adjuster's residual at a unit action.
+#:
+#: The RL adjuster emits a dimensionless action, squashed to ``[-1, 1]``, and this table is
+#: what turns one node of it into physical units:
+#: ``delta_raw[c] = tanh(a[c]) * RESIDUAL_SCALE[c]``. It sits beside
+#: :data:`REFERENCE_WINDOW_NOISE` on purpose -- both tables say "how wrong is the generator's
+#: prediction, per block", so they answer to one measurement and cannot drift apart the way
+#: the observation and history noise tables did.
+#:
+#: **Two of these entries are safety bounds and the rest are only authority scales.** The
+#: failure termination (``mdp.tracking_error.violates``) is measured against the reference the
+#: adjuster controls, so the residual's reach on ``base_pose`` is what decides whether the
+#: policy can move its own grader. ``base_pos`` and the rotation half are therefore bounded;
+#: the velocity and joint channels are limited by the residual L2 reward instead, because
+#: neither can defeat a check (a velocity residual cannot flatten a walking speed profile
+#: within the reward's 0.5 m/s kernel, and no check reads joint angles at all).
+#:
+#: The numbers, and where each comes from:
+#:
+#: * ``base_pos`` -- ``0.20`` m, chosen to EQUAL ``TrackingErrorSpec.max_lateral_m`` and
+#:   ``max_height_m``. Deliberately loose to start: the point of v1 is to measure how much
+#:   authority the adjuster actually uses before tightening. The consequence is real and is
+#:   why the diagnostics in ``g1_adjuster_env_cfg`` are not optional -- at this cap the
+#:   residual can move the graded node by the entire violation threshold.
+#: * ``base_ori`` -- a PARAMETERISATION, not the bound. The real limit is
+#:   :data:`RESIDUAL_MAX_TILT_RAD`, enforced geometrically by
+#:   :func:`clamp_window_rotation_residual`, because at 15 deg the small-angle
+#:   component-to-radian equivalence this table's ``base_ori`` note relies on has broken
+#:   down (measured: a 0.020 component displacement tilts the frame ~1.6 deg, so the
+#:   relationship is only locally linear). ``0.20`` makes the bound reachable at a unit
+#:   action without overshooting it far enough to make the clamp the whole mechanism.
+#: * ``base_lin_vel`` -- ``0.50`` m/s, ~2.2x the generator's measured far-node error
+#:   (0.122 mean over the observed offsets, ~1.85x that at node 61).
+#: * ``base_ang_vel`` -- ``0.50`` rad/s, only ~1.1x its far-node error, and deliberately the
+#:   least generous entry relative to the error it corrects. The measured fraction of
+#:   window-error energy in ``{const, const+ramp}`` is 0.04/0.11 for ``ang_vel`` against an
+#:   i.i.d. baseline of 0.077/0.154 -- i.e. SUB-white. There is no structured error there for
+#:   a residual to remove, and authority it cannot use is authority it can only misuse.
+#: * ``joint_pos`` -- ``0.30`` rad, ~2.1x its far-node error (0.076 mean).
+#: * ``joint_vel`` / ``ee_pos`` -- ``0.0``. Neither is predicted by any shipped generator
+#:   (they are absent from ``reference_blocks``), so they never reach the layout. Zero rather
+#:   than a guess means that if a future selection does include them the residual is INERT
+#:   until someone calibrates it, instead of silently free on an unmeasured channel.
+REFERENCE_WINDOW_RESIDUAL_SCALE: dict[str, float | list[float]] = {
+    "base_pos": [0.20, 0.20, 0.20],   # metres -- a BOUND; see above
+    "base_ori": 0.20,                 # rot6d components; the bound is RESIDUAL_MAX_TILT_RAD
+    "base_lin_vel": 0.50,             # m/s
+    "base_ang_vel": 0.50,             # rad/s
+    "joint_pos": 0.30,                # rad
+    "joint_vel": 0.0,                 # unpredicted -- inert until calibrated
+    "ee_pos": 0.0,                    # unpredicted -- inert until calibrated
+}
+
+#: Hard cap on the ANGLE the residual may rotate one reference node by, in radians.
+#:
+#: Half of ``TrackingErrorSpec.max_tilt_rad`` (30 deg), so the tilt violation keeps 2x of
+#: margin against the residual where ``base_pos`` currently keeps 1x.
+#:
+#: Enforced as an angle rather than as a box on the six rot6d components because the two are
+#: not the same thing at this magnitude, and the difference is unbounded in the wrong
+#: direction: the components are two unit columns, so a per-component box constrains the
+#: frame's tilt only to first order. :func:`clamp_window_rotation_residual` measures the
+#: realised rotation and shrinks it, which is exact at any angle.
+RESIDUAL_MAX_TILT_RAD: float = math.radians(15.0)
 
 
 #: Blocks a window node packs, in order, when none are selected explicitly.
@@ -542,6 +615,99 @@ def project_window_rotations(
     start = slices["base_pose"].start + 3
     projected = matrix_to_rot6d(rot6d_to_matrix(window[..., start:start + 6]))
     return torch.cat([window[..., :start], projected, window[..., start + 6:]], dim=-1)
+
+
+def residual_scale_vector(
+    num_joints: int,
+    num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
+    scales: dict[str, float | list[float]] | None = None,
+) -> list[float]:
+    """Per-channel RAW-unit scale of the adjuster's residual over ONE window node.
+
+    Expanded through :func:`expand_window_blocks`, the same helper the observation's noise and
+    scale vectors go through, so the residual's authority cannot come to disagree with the
+    layout or with a block SELECTION.
+
+    Args:
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: The selection the window is packed with; defaults to all of them.
+        scales: Per-block magnitudes; defaults to
+            :data:`REFERENCE_WINDOW_RESIDUAL_SCALE`.
+
+    Returns:
+        ``window_dim(nj, K, blocks)`` values, in packing order.
+    """
+    table = REFERENCE_WINDOW_RESIDUAL_SCALE if scales is None else scales
+    return expand_window_blocks(num_joints, num_ee_frames, table, blocks)
+
+
+def clamp_window_rotation_residual(
+    adjusted: torch.Tensor,
+    original: torch.Tensor,
+    num_joints: int,
+    num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
+    max_tilt_rad: float = RESIDUAL_MAX_TILT_RAD,
+) -> torch.Tensor:
+    """Limit how far a residual rotated each node's ``base_pose``, as an ANGLE.
+
+    Bounding the six rot6d components individually does NOT bound the frame's tilt: the block
+    is two unit columns, so a per-component box controls the realised rotation only to first
+    order, and the residual's whole reason for existing is to be large enough to matter.  So
+    this measures the rotation the residual actually produced -- ``Log(R_new R_old^T)`` -- and
+    where its magnitude exceeds ``max_tilt_rad``, shrinks the rotation vector to land exactly
+    on the bound.  Scaling in the Lie algebra keeps the axis and moves only the angle, which
+    is the geodesic interpolation toward the original.
+
+    Only ever SHRINKS: a node already inside the bound is returned bit-identical, so this is
+    safe to apply unconditionally and is idempotent.
+
+    Expects both arguments already on SO(3) -- call :func:`project_window_rotations` on the
+    adjusted window first, since adding six free numbers to an orthonormal pair leaves the
+    manifold and ``so3_log`` needs a real rotation.
+
+    A no-op when ``base_pose`` is not in the selection.
+
+    Args:
+        adjusted: ``[..., D]`` window nodes AFTER the residual was added and projected.
+        original: ``[..., D]`` the same nodes before it was added.
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: The selection both windows are packed with; defaults to all of them.
+        max_tilt_rad: The bound; defaults to :data:`RESIDUAL_MAX_TILT_RAD`.
+
+    Returns:
+        ``[..., D]``, same layout, with every node's rotation within ``max_tilt_rad`` of its
+        original.
+    """
+    slices = window_block_slices(num_joints, num_ee_frames, blocks)
+    if "base_pose" not in slices:
+        return adjusted
+    start = slices["base_pose"].start + 3
+    r_new = rot6d_to_matrix(adjusted[..., start:start + 6])
+    r_old = rot6d_to_matrix(original[..., start:start + 6])
+
+    delta = so3_log(r_new @ r_old.transpose(-1, -2))               # (..., 3), angle in [0, pi]
+    angle = torch.linalg.norm(delta, dim=-1, keepdim=True)
+    # clamp_min on the divisor keeps the identity rotation (angle exactly 0) from producing a
+    # nan factor; clamp_max(1.0) means an inside node's rotation vector is reproduced exactly.
+    factor = (float(max_tilt_rad) / angle.clamp_min(1e-12)).clamp_max(1.0)
+    shrunk = matrix_to_rot6d(so3_exp(delta * factor) @ r_old)
+    # Select rather than rely on ``factor == 1``: the log/exp round trip is exact in exact
+    # arithmetic but costs ~1e-7 in float32, and this function is applied every re-plan to a
+    # window where almost every node is already inside the bound. ``where`` makes "unchanged
+    # inside the bound" literally true, which is what lets the caller apply it blindly.
+    #
+    # The tolerance is what makes it IDEMPOTENT rather than merely convergent. A node the
+    # clamp bound sits at exactly ``max_tilt_rad``, and re-measuring that rotation in float32
+    # can read a few ulps ABOVE it -- so a bare ``<=`` would shrink it again by ~1e-7 on every
+    # re-application. 1e-6 relative widens the effective bound by 15 nano-degrees, which is
+    # immaterial next to the 15 deg it is bounding.
+    inside = angle <= float(max_tilt_rad) * (1.0 + 1e-6)           # (..., 1), broadcasts over 6
+    limited = torch.where(inside, adjusted[..., start:start + 6], shrunk)
+    return torch.cat([adjusted[..., :start], limited, adjusted[..., start + 6:]], dim=-1)
 
 
 def _broadcast_anchor(anchor: torch.Tensor, node_shape: torch.Size) -> torch.Tensor:

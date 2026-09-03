@@ -309,26 +309,19 @@ class EpisodeAccumulator:
         if self._track_spec is None:
             return
         # No served reference yet -- before the generator's first plan there is nothing to
-        # measure, which is a real state rather than an error. `_pred_valid` is absent on the
-        # clip command, where a reference always exists.
-        valid = getattr(self.cmd, "_pred_valid", None)
-        if valid is not None:
-            m = m & valid.to(self.device).reshape(self.n)
+        # measure, which is a real state rather than an error. `served_tracking_error` reports
+        # that as its validity mask; it is all-True on the clip command, where a reference
+        # always exists.
+        #
+        # The ten-argument assembly (offset 0 at the cursor, `root_link_*` rather than the CoM
+        # twist, the reference read through the command's accessors rather than out of `y_des`)
+        # lives in `mdp.tracking_error` so this accumulator, the adjuster's dense reward and its
+        # failure termination cannot come to disagree about what instant they grade.
+        err, valid = tracking_error.served_tracking_error(self.cmd, self.rd, self._track_offsets)
+        m = m & valid.to(self.device).reshape(self.n)
         if not bool(m.any()):
             self.last_track_err = None
             return
-
-        pos_w, quat_w, lin_w, ang_w = self.cmd.get_future_world_base(self._track_offsets)
-        jp, _ = self.cmd.get_future_joint_state(self._track_offsets)
-        d = self.rd
-        # `root_link_*`, NOT `root_lin_vel_w`: the latter is the CoM twist, and the MuJoCo
-        # half measures the frame-ORIGIN twist via `mj_jacBody` (`Robot.get_base_world_velocity`
-        # documents the distinction and warns against `mj_objectVelocity`). Mixing the two
-        # would put a systematic offset on the velocity term in one simulator only.
-        err = tracking_error.tracking_error(
-            pos_w[:, 0], quat_w[:, 0], lin_w[:, 0], ang_w[:, 0], jp[:, 0],
-            d.root_pos_w, d.root_quat_w, d.root_link_lin_vel_w, d.root_link_ang_vel_w,
-            d.joint_pos)
 
         self.last_track_err = err
         mf = m.to(torch.float32)

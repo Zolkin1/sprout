@@ -287,6 +287,63 @@ def violates(err: torch.Tensor, spec: TrackingErrorSpec = BOOTSTRAP_SPEC) -> tor
     return out
 
 
+def served_tracking_error(
+    cmd, robot_data, offsets: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The error row against the node the runtime is serving RIGHT NOW, and its validity.
+
+    The one adapter from a live command term to :func:`tracking_error`, so the dense reward,
+    the failure termination and the eval's accumulator all grade the same instant against the
+    same reference.  They used to share only the raw function, with each caller assembling the
+    ten arguments itself; that is a lot of surface for two callers to come to disagree on which
+    twist convention or which look-ahead offset they meant.
+
+    Three things it gets right that are easy to get wrong:
+
+    * **Offset 0 at the current cursor.**  The graded node is the one being served this control
+      step, not the head of the plan -- ``get_future_world_base`` resolves the offset against
+      ``_pred_idx``, so a zero offset means "now".
+    * **``root_link_*``, not ``root_*``.**  The latter is the CoM twist; the MuJoCo half measures
+      the frame-ORIGIN twist, so mixing them puts a systematic offset on the velocity channels
+      in one simulator only.
+    * **The reference must go through the command's accessors**, never a slice of ``y_des``.
+      Under ``strict_fm_only`` every channel the generator does not write is NaN-filled on
+      purpose, and the ``@root`` blocks are among them.
+
+    Args:
+        cmd: A ``MotionSequenceCommand`` or ``FmTrackingCommand``.
+        robot_data: The articulation's data view (``env.scene["robot"].data``).
+        offsets: A cached ``[1]`` long tensor of zeros.  Built on demand when omitted; pass one
+            from a caller that folds every control step.
+
+    Returns:
+        ``(err, valid)`` -- ``[N, NUM_FIXED_CHANNELS + nj]`` error rows, and a ``[N]`` bool that
+        is False for envs with no served reference yet.  Invalid rows are ZEROED rather than
+        left as they came: before the generator's first plan the window is zeros, whose rotation
+        block is not a rotation, so the row would carry NaN and poison any later reduction that
+        multiplies by a mask instead of selecting with one.
+    """
+    if offsets is None:
+        offsets = torch.zeros(1, dtype=torch.long, device=robot_data.root_pos_w.device)
+
+    pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(offsets)
+    joint_pos, _ = cmd.get_future_joint_state(offsets)
+    err = tracking_error(
+        pos_w[:, 0], quat_w[:, 0], lin_w[:, 0], ang_w[:, 0], joint_pos[:, 0],
+        robot_data.root_pos_w, robot_data.root_quat_w,
+        robot_data.root_link_lin_vel_w, robot_data.root_link_ang_vel_w,
+        robot_data.joint_pos,
+    )
+
+    # ``_pred_valid`` is absent on the clip command, where a reference always exists.
+    valid = getattr(cmd, "_pred_valid", None)
+    if valid is None:
+        valid = torch.ones(err.shape[0], dtype=torch.bool, device=err.device)
+    else:
+        valid = valid.to(err.device).reshape(err.shape[0])
+    return torch.where(valid.unsqueeze(-1), err, torch.zeros_like(err)), valid
+
+
 def step_reward(err: torch.Tensor, spec: TrackingErrorSpec = BOOTSTRAP_SPEC) -> torch.Tensor:
     """DeepMimic-style tracking reward for one control step, in ``(0, 1]``.
 
