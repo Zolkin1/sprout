@@ -208,3 +208,116 @@ def torque_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntit
 ##
 # Individual tracking rewards
 ##
+
+
+##
+# The adjuster: one reward per re-plan interval
+##
+def served_track_reward(env: ManagerBasedRLEnv) -> torch.Tensor:
+    """The interval's MEAN tracking reward, as one number per adjuster decision.
+
+    Read off the env rather than computed here, and that is the whole point. The adjuster
+    acts once per re-plan interval, so the reward it can learn from is one scalar per
+    decision -- but tracking quality is a per-CONTROL-STEP quantity, and a reward term cannot
+    be evaluated at a rate different from its manager's. So the env's inner loop folds
+    ``tracking_error.step_reward`` every control step and this term collects the finished
+    mean.
+
+    **A mean, not a sum.** ``step_reward`` is bounded in ``(0, 1]`` by construction --
+    ``TrackingErrorSpec.__post_init__`` enforces that its four weights sum to 1 precisely so
+    it is -- and a mean preserves that bound while a sum scales with the cadence, putting the
+    value target's range at the mercy of ``fm_update_every``. It is the same argument
+    ``tracking_error.chunk_reward``'s docstring makes for itself.
+
+    The mean is over the control steps an env was still ALIVE for, not over all K, so an env
+    that fails a third of the way in is not diluted by two thirds zeros -- otherwise the
+    return would encode WHEN in the interval the failure happened rather than that it did.
+
+    Args:
+        env: The environment, which must expose ``track_mean``.
+
+    Returns:
+        ``[num_envs]`` in ``(0, 1]``, zero for an interval with no served reference.
+
+    Raises:
+        RuntimeError: If the env does not fold the accumulator. Returning zeros instead would
+            read as a robot that tracked nothing, which is a plausible number and would make
+            the whole dense signal silently absent.
+    """
+    value = getattr(env, "track_mean", None)
+    if value is None:
+        raise RuntimeError(
+            "served_track_reward needs an env that folds `track_mean` over the interval's "
+            "control steps (see AdjusterEnv.step). On a per-control-step env there is no "
+            "interval to average, so use tracking_error.step_reward directly instead."
+        )
+    return value
+
+
+def _to_sigma(cmd, raw: torch.Tensor) -> torch.Tensor:
+    """Convert a residual-shaped ``[N, F, D]`` tensor from RAW units to normalizer sigmas.
+
+    Sigma units because one window node mixes metres, dimensionless rot6d components and
+    radians, and a squared mean over raw channels would be dominated by whichever block
+    happens to have the largest units. The FM's normalizer is DECLARED rather than fitted
+    (position 0.40 m, rot6d 1.0, velocities 0.5 / 0.4, joints 0.067-0.532 rad), so a sigma
+    means the same thing in every run rather than being a property of whichever recording the
+    normalizer was fitted on.
+
+    Scale only, no mean subtraction: these are DIFFERENCES, so there is no offset to remove.
+    """
+    return raw / cmd.ctx.state_norm.std.to(raw.device)
+
+
+def plan_residual_l2(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Mean squared plan residual over nodes and channels, in normalizer sigmas.
+
+    Wire with a NEGATIVE weight. This is what keeps the corrected plan inside the
+    distribution the frozen tracker was trained on, and it is the only limit on the channels
+    that carry no hard cap (velocities and joint angles) -- so its weight is not decoration.
+
+    Reads what was APPLIED, not the action: the request passes through a squash, a per-channel
+    scale, a rotation projection and an angle clamp, and pricing the request would under-price
+    a correction the clamp cut down and over-price one it did not.
+
+    **A MEAN over ``F * D``, never a sum.** A sum silently re-weights itself whenever the node
+    count, the block selection or the channel widths move -- so the same configured weight
+    would mean something different after a layout change, which is exactly the class of drift
+    the window's one-producer tables exist to prevent.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        ``[num_envs]``, non-negative, 0 before the first residual is applied.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    return _to_sigma(cmd, cmd.plan_residual()).pow(2).mean(dim=(1, 2))
+
+
+def plan_residual_rate_l2(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
+    """Mean squared CHANGE of the plan residual between re-plans, in normalizer sigmas.
+
+    Wire with a NEGATIVE weight. Not decoration either: the measured conclusion about
+    perturbing this tracker's reference is that a perturbation "should ramp with look-ahead
+    and be drawn per re-plan, not per step" (``window.REFERENCE_WINDOW_NOISE``), and this term
+    is how the second half of that becomes an incentive rather than a hope. A residual that
+    reverses sign every interval is a reference that jitters, which the tracker reads as noise
+    it cannot follow.
+
+    The difference is kept by the COMMAND TERM, not stashed here: the term is what applies
+    the residual, and it is what has a reset hook -- so an env's first interval after a reset
+    is compared against an unadjusted plan rather than against the previous episode's
+    residual, which would charge the policy once per episode for a change it did not make.
+    A reward term holding its own episode state would have no way to know a reset happened.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        ``[num_envs]``, non-negative.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    return _to_sigma(cmd, cmd.plan_residual_delta()).pow(2).mean(dim=(1, 2))

@@ -441,6 +441,10 @@ def _clip_family_codes(ref_cmd) -> tuple["torch.Tensor | None", list[str]]:
     Clips on a tile with no manifest entry (and every clip of a flat-only library) get code
     0 = ``"unknown"``, which no filter matches.
 
+    The mapping itself lives in :func:`mdp.goal_region.clip_family_codes`, because the goal
+    termination resolves its per-family tolerances from the same manifest and a family read
+    two ways is a family that can be read two ways WRONG. This wrapper adds the reporting.
+
     Args:
         ref_cmd: The resolved trajectory command term (``None`` -> no clips).
 
@@ -448,34 +452,13 @@ def _clip_family_codes(ref_cmd) -> tuple["torch.Tensor | None", list[str]]:
         ``([num_clips] long tensor of family codes, [family names])``. ``(None, [])`` when
         the library carries no manifest or no terrain ids.
     """
-    mgr = getattr(ref_cmd, "manager", None)
-    lib = getattr(mgr, "lib", None)
-    if lib is None or getattr(lib, "terrain_id", None) is None or lib.terrain_id.numel() == 0:
-        return None, []
-    manifest = lib.attrs.get("terrain_manifest") if hasattr(lib, "attrs") else None
-    if not manifest:
-        return None, []
-    if isinstance(manifest, str):
-        manifest = json.loads(manifest)
+    # Imported here, not at module scope: `mdp` pulls in `isaaclab.envs.mdp`, and this module
+    # is imported before AppLauncher runs -- see `test_no_pre_app_pxr_import.py`.
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
 
-    # Family name -> code, with 0 reserved for "no manifest entry".
-    names = ["unknown"]
-    tid_to_code: dict[int, int] = {}
-    for entry in manifest:
-        if "terrain_id" not in entry:
-            continue
-        fam = str(entry.get("family") or "unknown")
-        # Strip the .h5 the composer stamps, so a filter reads family_jump_off not
-        # family_jump_off.h5 -- the extension is an artefact of how the family was stored.
-        fam = fam[:-3] if fam.endswith(".h5") else fam
-        if fam not in names:
-            names.append(fam)
-        tid_to_code[int(entry["terrain_id"])] = names.index(fam)
-
-    tid = lib.terrain_id.to(torch.long)
-    codes = torch.zeros(tid.shape[0], dtype=torch.long, device=tid.device)
-    for t, code in tid_to_code.items():
-        codes[tid == t] = code
+    codes, names = goal_region.clip_family_codes(ref_cmd)
+    if codes is None:
+        return None, []
     counts = {names[c]: int((codes == c).sum()) for c in sorted(set(codes.tolist()))}
     print(f"[INFO] clip families -> per-window 'clip_family' so train.py --skip_families can "
           f"drop any of them later: {counts}")

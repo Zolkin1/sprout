@@ -199,6 +199,56 @@ class GoalRegionSpec:
             return cls.from_dict(json.load(f))
 
 
+def clip_family_codes(cmd) -> tuple[torch.Tensor | None, list[str]]:
+    """Per-CLIP family index plus the family names, from the library's ``terrain_manifest``.
+
+    One producer, because two consumers now need it for different reasons and a family read
+    two ways is a family that can be read two ways WRONG: ``record_data`` stamps the code into
+    every recorded window so ``train.py --skip_families`` can drop a family later, and the
+    goal termination looks the tolerances up per family. Both want the same mapping and the
+    same ``.h5``-stripped spelling.
+
+    Clips on a tile with no manifest entry -- and every clip of a flat-only library, which
+    carries no manifest at all -- get code 0 = ``"unknown"``, which no filter matches.
+
+    Args:
+        cmd: The resolved trajectory command term, or anything exposing ``manager.lib``.
+            ``None`` (no clips) returns the empty answer rather than raising.
+
+    Returns:
+        ``([num_clips] long codes, [family names])``, with ``names[0] == "unknown"``.
+        ``(None, [])`` when the library carries no manifest or no terrain ids.
+    """
+    lib = getattr(getattr(cmd, "manager", None), "lib", None)
+    if lib is None or getattr(lib, "terrain_id", None) is None or lib.terrain_id.numel() == 0:
+        return None, []
+    manifest = lib.attrs.get("terrain_manifest") if hasattr(lib, "attrs") else None
+    if not manifest:
+        return None, []
+    if isinstance(manifest, str):
+        manifest = json.loads(manifest)
+
+    # Family name -> code, with 0 reserved for "no manifest entry".
+    names = ["unknown"]
+    tid_to_code: dict[int, int] = {}
+    for entry in manifest:
+        if "terrain_id" not in entry:
+            continue
+        fam = str(entry.get("family") or "unknown")
+        # Strip the .h5 the composer stamps, so a filter reads family_jump_off not
+        # family_jump_off.h5 -- the extension is an artefact of how the family was stored.
+        fam = fam[:-3] if fam.endswith(".h5") else fam
+        if fam not in names:
+            names.append(fam)
+        tid_to_code[int(entry["terrain_id"])] = names.index(fam)
+
+    tid = lib.terrain_id.to(torch.long)
+    codes = torch.zeros(tid.shape[0], dtype=torch.long, device=tid.device)
+    for t, code in tid_to_code.items():
+        codes[tid == t] = code
+    return codes, names
+
+
 def last_usable_step(cmd) -> torch.Tensor:
     """The step a SURVIVING episode ends on, per env, lookahead reserve included.
 

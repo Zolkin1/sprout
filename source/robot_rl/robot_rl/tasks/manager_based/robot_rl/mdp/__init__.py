@@ -45,14 +45,22 @@ from .observations.height_scan import (  # noqa: F401
     scan_obs_stack,
 )
 from .terminations.terminations import *  # noqa: F401, F403
-# The SPATIAL success test. Deliberately its own module and not part of `terminations`:
-# it is recorded as columns and reduced offline, never wired as a DoneTerm, because the
-# tolerances are a measured artifact that will want recalibrating and baking them into a
-# termination would force a full re-collection every time they moved.
+# The SPATIAL success test. Its own module rather than part of `terminations` because most
+# consumers record it as columns and reduce it offline.
+#
+# It used to say "never wired as a DoneTerm", on the grounds that the tolerances are a
+# measured artifact that will want recalibrating and baking them in would force a
+# re-collection every time they moved. `mdp.GoalReached` wires it now, and it keeps that
+# reasoning rather than overriding it: the spec is a PATH the term loads, not a constant, so
+# recalibration is a config change; a spec whose provenance says `bootstrap` is REFUSED, so a
+# placeholder cannot decide which episodes counted as arrivals; and nothing about the offline
+# columns changes. Reaching for it as a termination is right only where arriving IS the
+# objective -- which is the adjuster task, and is not the eval.
 from .goal_region import (  # noqa: F401
     KNOWN_FAMILIES,
     GoalRegionSpec,
     GoalTolerances,
+    clip_family_codes,
     goal_anchor_world,
     goal_distance_m,
     goal_frame_offsets,

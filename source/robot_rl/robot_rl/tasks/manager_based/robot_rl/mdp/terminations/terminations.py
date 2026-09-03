@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
+
 import torch
 import warp as wp
 from typing import TYPE_CHECKING, Sequence
 
-from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ManagerTermBase, SceneEntityCfg
 from isaaclab.utils.math import (
     euler_xyz_from_quat,
     quat_apply,
@@ -183,7 +185,12 @@ def tracked_frame_error_termination(
     return ((pos_err > max_pos_dist) | (ori_err > ori_lim)).any(dim=-1)
 
 
-def clip_end_reached(env, command_name: str = "traj_ref", reserve_lookahead: bool = True) -> torch.Tensor:
+def clip_end_reached(
+    env,
+    command_name: str = "traj_ref",
+    reserve_lookahead: bool = True,
+    slack_s: float = 0.0,
+) -> torch.Tensor:
     """Truncate (good termination) when the clip's last USABLE step is reached.
 
     Wire this as ``DoneTerm(..., time_out=True)`` so RSL-RL bootstraps the
@@ -200,11 +207,29 @@ def clip_end_reached(env, command_name: str = "traj_ref", reserve_lookahead: boo
     means no observed sample is ever a clamp artefact. The margin is read off the live
     ``reference_window`` term, so it cannot drift from the observation.
 
+    ``slack_s`` extends the deadline PAST that step, and exists because without it the budget
+    is identically the clip's own remaining duration -- the cursor is
+    ``start_step + episode_length_buf``, so a robot has exactly the clip's time and not one
+    step more. On a task where arriving somewhere is the objective that makes hurrying the
+    reliable strategy, and commanded speed is an established degradation vector on stairs.
+    The only slack otherwise is ``GoalTolerances.approach_margin_m`` (1.0 m, so 0.6-1.25 s),
+    6-15% of a 6-11 s episode.
+
+    Running past the clip's end is legitimate **only on a generator-served arm**, and the
+    caller owes that: under ``reference_source="fm"`` the applied ``y_des`` is the generator's
+    and the clip half is NaN-filled by ``strict_fm_only``, while past ``last_usable_step`` the
+    clip's ``target_vel`` gather CLAMPS -- so the command holds the last commanded velocity,
+    which is what a joystick does and what both deploy runtimes do. The clip cursor clamps at
+    ``T - 1``, touching only a passive cache. On a CLIP-graded task the same slack would be
+    grading a frozen reference, so it defaults to 0.0 and every existing caller is unchanged.
+
     Args:
         env: IsaacLab environment.
         command_name: The :class:`MotionSequenceCommand` term name.
         reserve_lookahead: End the episode a full observation window early (default). Set
             False to run to the clip's true last frame and accept the saturated tail.
+        slack_s: Extra seconds allowed past the last usable step, converted with
+            ``env.step_dt``. ``0.0`` (default) is the historical behaviour.
 
     Returns:
         Boolean ``[num_envs]`` -- True for envs at/after the clip's last usable step.
@@ -222,6 +247,8 @@ def clip_end_reached(env, command_name: str = "traj_ref", reserve_lookahead: boo
             # clamp_min(0): a clip shorter than the window has no unsaturated step at all,
             # so it ends immediately rather than silently serving a frozen reference.
             last_step = (last_step - int(offsets.max().item())).clamp_min(0)
+    if slack_s:
+        last_step = last_step + int(round(float(slack_s) / float(env.step_dt)))
     return (cmd.start_step + env.episode_length_buf) >= last_step
 
 def base_orientation_from_upright(
@@ -307,3 +334,244 @@ def base_fallen(
     return too_low | tilted
 
 
+
+class TrackingViolation(ManagerTermBase):
+    """Fail the episode when the robot leaves the served reference's failure bounds.
+
+    The REFERENCE-RELATIVE failure criterion, and the primary one on a generator-served arm.
+    ``mdp.tracking_error.violates`` is the union of three checks measured against the node
+    actually being served, in that node's own yaw frame: lateral, height and tilt. Downrange
+    and yaw are deliberately non-fatal -- a terrain-matched re-plan moves the reference along
+    the direction of travel on purpose, so the tracker cannot be anything but behind it, and
+    the anchor divides heading out in full.
+
+    **This replaces ``base_fallen``, and the swap is measured rather than argued.** The
+    adopted spec's provenance records that at these bounds the checks "rarely bind beyond the
+    fall test": 13 of 13 falls also violated, 0 of 37 loose successes were demoted, and the
+    violation LEADS the fall by a median 0.20 s. So it detects every fall the absolute test
+    did, earlier, and it is correct on multi-level terrain where an absolute height datum is
+    not.
+
+    **Wire as ``DoneTerm(..., time_out=False)``.** It is a failure, so the value must not be
+    bootstrapped -- flagged as a truncation instead, rsl-rl would add ``gamma * V(s)`` to it
+    and the return would stop distinguishing falling from arriving.
+
+    The spec is a PATH, not a default. ``BOOTSTRAP_SPEC``'s kernel widths are placeholders
+    flagged ``provenance={"bootstrap": True}``, and the fitted ones are materially tighter
+    (``sigma_pos_m`` 0.0518 against 0.10), so silently falling back would grade with a blunter
+    reward than the run intended. A bootstrap spec is therefore refused unless asked for.
+
+    Note the interaction with a residual policy: this criterion is measured against a
+    reference the adjuster CONTROLS, so its authority over ``base_pose`` has to stay inside
+    these bounds or it can cancel its own termination. That invariant lives with the residual
+    scale table (``flow_matching.window.REFERENCE_WINDOW_RESIDUAL_SCALE``), not here.
+    """
+
+    def __init__(self, cfg, env) -> None:
+        """Load the tracking spec once.
+
+        Args:
+            cfg: The term cfg. ``params`` takes ``command_name``, ``spec_path`` and
+                ``allow_bootstrap_spec``.
+            env: The environment.
+
+        Raises:
+            ValueError: If ``spec_path`` is empty, or names a bootstrap spec without
+                ``allow_bootstrap_spec``.
+        """
+        super().__init__(cfg, env)
+        from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
+
+        path = str(cfg.params.get("spec_path", "") or "")
+        if not path:
+            raise ValueError(
+                "TrackingViolation needs spec_path: the failure bounds and the dense reward's "
+                "kernel widths come from one fitted file (logs/tracking/tracking_spec_v1.json "
+                "is the adopted one). Defaulting would grade with BOOTSTRAP_SPEC's "
+                "placeholders, which are ~2x blunter."
+            )
+        with open(path) as f:
+            self._spec = tracking_error.TrackingErrorSpec.from_dict(json.load(f))
+        if self._spec.is_bootstrap and not bool(cfg.params.get("allow_bootstrap_spec", False)):
+            raise ValueError(
+                f"{path} is a BOOTSTRAP spec (provenance.bootstrap = true); its kernel widths "
+                "are placeholders. Fit one, or pass allow_bootstrap_spec=True to say out loud "
+                "that this run is graded by placeholders."
+            )
+        self._offsets = torch.zeros(1, dtype=torch.long, device=env.device)
+
+    @property
+    def spec(self):
+        """The loaded :class:`TrackingErrorSpec` -- read by the dense reward too."""
+        return self._spec
+
+    def __call__(
+        self,
+        env,
+        command_name: str = "traj_ref",
+        spec_path: str = "",
+        allow_bootstrap_spec: bool = False,
+    ) -> torch.Tensor:
+        """Whether each env is outside the failure bounds this step.
+
+        Args:
+            env: IsaacLab environment.
+            command_name: The trajectory command term name.
+            spec_path: Consumed in ``__init__``; present so the manager can pass it through.
+            allow_bootstrap_spec: Likewise.
+
+        Returns:
+            Boolean ``[num_envs]``. False wherever no reference has been served yet -- that is
+            a real state rather than a failure, and grading it would fail every env on the
+            first step of every episode.
+        """
+        from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
+
+        cmd = env.command_manager.get_term(command_name)
+        err, valid = tracking_error.served_tracking_error(
+            cmd, env.scene["robot"].data, self._offsets
+        )
+        return tracking_error.violates(err, self._spec) & valid
+
+
+class GoalReached(ManagerTermBase):
+    """Truncate when the base enters the clip's own goal region.
+
+    **Wire as ``DoneTerm(..., time_out=True)``**, and on a task whose other endings are
+    failures that asymmetry is the whole mechanism for rewarding arrival: rsl-rl bootstraps
+    ``gamma * V(s)`` onto a truncation and nothing onto a termination, so only arriving
+    collects the future value. With a positive dense reward that is worth far more than
+    running the clock out, and it costs no terminal bonus and so introduces no dependence on
+    how long a section happens to be.
+
+    The anchor is the globally placed clip's own base pose at ``last_usable_step`` -- NOT the
+    per-step re-anchored placement, which slides onto the robot every step and would follow a
+    stalled robot around, and not ``clip_len - 1``, which is up to a full observation window
+    past where any episode can reach. Resolved once per reset, because it is
+    episode-constant; see :func:`mdp.goal_region.goal_anchor_world`.
+
+    Tolerances come from a fitted ``goal_regions.json``, PER FAMILY. For the four transition
+    families the margin and half-width are identical (1.0 m / 1.5 m) and only the height
+    tolerance varies (0.528-0.629 m), so the per-family lookup is nearly inert on that set --
+    but ``flat``'s half-width is 3.33 m, 2.2x the rest, so the day a flat clip enters the
+    library a default-only lookup would silently score it against a band a third of the right
+    width. Hence per family from the start.
+    """
+
+    def __init__(self, cfg, env) -> None:
+        """Load the goal spec and allocate the per-env anchor and tolerance buffers.
+
+        Args:
+            cfg: The term cfg. ``params`` takes ``command_name``, ``spec_path`` and
+                ``allow_bootstrap_spec``.
+            env: The environment.
+
+        Raises:
+            ValueError: If ``spec_path`` is empty, or names a bootstrap spec without
+                ``allow_bootstrap_spec``.
+        """
+        super().__init__(cfg, env)
+        from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+        path = str(cfg.params.get("spec_path", "") or "")
+        if not path:
+            raise ValueError(
+                "GoalReached needs spec_path (logs/rollouts/v2/goal_regions.json is the fitted "
+                "one). There is no safe default: the tolerances are a MEASUREMENT of where "
+                "surviving clip-arm episodes end, and guessing them decides which episodes "
+                "count as arrivals."
+            )
+        self._spec = goal_region.GoalRegionSpec.load(path)
+        if (self._spec.provenance.get("bootstrap", False)
+                and not bool(cfg.params.get("allow_bootstrap_spec", False))):
+            raise ValueError(
+                f"{path} is a BOOTSTRAP goal spec; its tolerances are placeholders that exist "
+                "only so build_goal_regions.py can record the raw offsets it fits from. Fit "
+                "one, or pass allow_bootstrap_spec=True."
+            )
+
+        n, dev = env.num_envs, env.device
+        self._goal_pos_w = torch.zeros(n, 3, device=dev)
+        self._goal_yaw = torch.zeros(n, device=dev)
+        self._goal_tol = torch.zeros(n, 3, device=dev)
+        self._valid = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Per-CLIP family codes, resolved once from the library's manifest. `None` on a
+        # library with no manifest, where every env falls back to the default tolerances.
+        cmd = env.command_manager.get_term(str(cfg.params.get("command_name", "traj_ref")))
+        self._family_codes, self._family_names = goal_region.clip_family_codes(cmd)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> dict:
+        """Resolve the goal anchor and per-family tolerances for the envs that just reset.
+
+        Called by the termination manager from inside ``_reset_idx``, AFTER the command term
+        has committed the new clip and its placement -- which is the ordering this needs and
+        gets for free: resolved any earlier, the anchor would describe the previous episode's
+        clip, the same shape of carry-over that made ``projected_gravity_b`` inflate the
+        derived fall flag.
+
+        Args:
+            env_ids: Envs to refresh, or ``None`` for all.
+
+        Returns:
+            An empty dict -- nothing here belongs in the episode log.
+        """
+        from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+        env = self._env
+        cmd = env.command_manager.get_term(str(self.cfg.params.get("command_name", "traj_ref")))
+        ids = (torch.arange(env.num_envs, device=env.device) if env_ids is None
+               else torch.as_tensor(env_ids, device=env.device).reshape(-1))
+        if ids.numel() == 0:
+            return {}
+
+        pos, yaw = goal_region.goal_anchor_world(cmd)
+        self._goal_pos_w[ids] = pos[ids].to(self._goal_pos_w.dtype)
+        self._goal_yaw[ids] = yaw[ids].to(self._goal_yaw.dtype)
+        self._goal_tol[ids] = self._tolerances_for(cmd, ids)
+        self._valid[ids] = True
+        return {}
+
+    def _tolerances_for(self, cmd, ids: torch.Tensor) -> torch.Tensor:
+        """``[len(ids), 3]`` of ``(margin, half_width, height_tol)`` for those envs' clips."""
+        if self._family_codes is None:
+            t = self._spec.default
+            row = torch.tensor([t.approach_margin_m, t.half_width_m, t.height_tol_m],
+                               device=self._goal_tol.device, dtype=self._goal_tol.dtype)
+            return row.expand(ids.numel(), 3)
+        codes = self._family_codes.to(cmd.clip_id.device)[cmd.clip_id][ids.to(cmd.clip_id.device)]
+        rows = []
+        for code in codes.tolist():
+            raw = self._family_names[int(code)]
+            # The spec keys on the NORMALISED name ("stairs_up"); the manifest spells it
+            # "family_stairs_up". `for_family` falls back to the default on a miss, so getting
+            # this wrong would be silent -- every family would quietly read the default.
+            name = raw[len("family_"):] if raw.startswith("family_") else raw
+            t = self._spec.for_family(name)
+            rows.append([t.approach_margin_m, t.half_width_m, t.height_tol_m])
+        return torch.tensor(rows, device=self._goal_tol.device, dtype=self._goal_tol.dtype)
+
+    def __call__(
+        self,
+        env,
+        command_name: str = "traj_ref",
+        spec_path: str = "",
+        allow_bootstrap_spec: bool = False,
+    ) -> torch.Tensor:
+        """Whether each env's base is inside its goal region this step.
+
+        Args:
+            env: IsaacLab environment.
+            command_name: The trajectory command term name.
+            spec_path: Consumed in ``__init__``.
+            allow_bootstrap_spec: Likewise.
+
+        Returns:
+            Boolean ``[num_envs]``, False wherever the anchor has not been resolved yet.
+        """
+        from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+        root_pos_w = wp.to_torch(env.scene["robot"].data.root_pos_w)
+        down, lat, hz = goal_region.goal_frame_offsets(
+            root_pos_w, self._goal_pos_w, self._goal_yaw
+        )
+        return goal_region.in_goal(down, lat, hz, self._goal_tol) & self._valid

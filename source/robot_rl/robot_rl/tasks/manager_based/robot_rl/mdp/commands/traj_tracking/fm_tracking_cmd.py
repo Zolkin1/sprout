@@ -411,6 +411,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         #: RAW units. Allocated on first use, because only the adjuster task applies one and
         #: it is a whole window per env.
         self._plan_residual: torch.Tensor | None = None
+        #: The residual applied at the PREVIOUS interval, so the residual-rate reward can
+        #: price a change without holding episode state of its own. Zeroed on reset alongside
+        #: ``_plan_residual``.
+        self._prev_plan_residual: torch.Tensor | None = None
         #: Final Euler-step velocity field of each live plan, STANDARDIZED, or ``None``.
         #: Allocated only by :meth:`enable_flow_stash`, for the same reason the exteroception
         #: stash is: it is a whole window per env and only the adjuster reads it.
@@ -520,6 +524,17 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._pending_reset[:] = True
         else:
             self._pending_reset[env_ids] = True
+        # Forget the previous interval's residual for these envs, so the residual-RATE reward
+        # measures a change within one episode rather than across a boundary. A new episode's
+        # plan starts unadjusted, so zero is the honest baseline; carrying the last episode's
+        # residual over would charge the policy once per episode for a change it did not make.
+        if self._plan_residual is not None:
+            if env_ids is None:
+                self._plan_residual.zero_()
+                self._prev_plan_residual.zero_()
+            else:
+                self._plan_residual[env_ids] = 0.0
+                self._prev_plan_residual[env_ids] = 0.0
         return super().reset(env_ids)
 
     # ------------------------------------------------------------------
@@ -1354,6 +1369,17 @@ class FmTrackingCommand(MotionSequenceCommand):
             return torch.zeros_like(self._pred_window)
         return self._plan_residual
 
+    def plan_residual_delta(self) -> torch.Tensor:
+        """This interval's residual minus the previous interval's, ``[N, F, D]``, RAW units.
+
+        Zeroed for an env on reset, so a new episode's first interval is compared against an
+        unadjusted plan rather than against the last episode's residual -- which would charge
+        the policy once per episode for a change it did not make.
+        """
+        if self._plan_residual is None:
+            return torch.zeros_like(self._pred_window)
+        return self._plan_residual - self._prev_plan_residual
+
     def apply_plan_residual(self, residual: torch.Tensor) -> None:
         """Add a residual to the live plan, in the plan's own frame.
 
@@ -1416,6 +1442,8 @@ class FmTrackingCommand(MotionSequenceCommand):
         # clamp -- so the L2 reward prices the served correction rather than the request.
         if self._plan_residual is None:
             self._plan_residual = torch.zeros_like(self._pred_window)
+            self._prev_plan_residual = torch.zeros_like(self._pred_window)
+        self._prev_plan_residual.copy_(self._plan_residual)
         self._plan_residual.copy_(self._pred_window - original)
 
         # Re-take the served-node stash. ``_snapshot_and_infer`` latched it at the tail of the
