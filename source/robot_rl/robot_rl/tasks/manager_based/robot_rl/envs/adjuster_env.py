@@ -132,13 +132,19 @@ class AdjusterEnv(ManagerBasedRLEnv):
             device=self.device,
         )
 
-        # The adjuster's observation is the generator's own conditioning, kept as BUILT so the
-        # actor re-encodes exactly the tensors that produced the plan. Enabled here, before
-        # the first re-plan, because the stash only captures from the next one onward.
-        cmd.enable_cond_stash()
-        # The adjuster reads each plan's final-step flow field, so the command term has to
-        # capture it -- and it only captures when asked, BEFORE the first re-plan.
-        cmd.enable_flow_stash()
+        # The two stashes are enabled by the COMMAND CFG, not from here, and this asserts it
+        # rather than doing it: `ObservationManager._prepare_terms` calls every term once at
+        # construction to discover its shape, and that happened inside `super().__init__()`
+        # above -- so enabling them here would already be too late and the obs term would have
+        # raised. Found by the first smoke run, with the stash guard naming the cause.
+        missing = [name for name, flag in (("stash_conditioning", cmd.cfg.stash_conditioning),
+                                           ("stash_flow", cmd.cfg.stash_flow)) if not flag]
+        if missing:
+            raise ValueError(
+                f"AdjusterEnv needs {missing} set on the command cfg: its observation groups "
+                "read the generator's conditioning and flow field, which are only captured "
+                "when the command term is told to at construction."
+            )
 
         self._frozen_tracker = FrozenTracker(
             self, cfg.tracker_run_dir, cfg.tracker_checkpoint,

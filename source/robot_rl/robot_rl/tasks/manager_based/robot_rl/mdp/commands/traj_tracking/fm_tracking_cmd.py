@@ -434,6 +434,14 @@ class FmTrackingCommand(MotionSequenceCommand):
         # :meth:`_check_horizon`); -1 = nothing checked yet.
         self._checked_max_offset = -1
 
+        # The adjuster's two stashes, allocated HERE because the observation manager probes
+        # every term's shape at construction and is built after this -- see
+        # FmTrackingCommandCfg.stash_conditioning for why a cfg flag and not a later call.
+        if getattr(self.cfg, "stash_conditioning", False):
+            self.enable_cond_stash()
+        if getattr(self.cfg, "stash_flow", False):
+            self.enable_flow_stash()
+
         # The FM predicts NO orientation or twist for its extra frames (position only), so
         # those output channels are never written. Constant zeros keep the scatter in
         # ``_write_world_des`` uniform; ``strict_fm_only`` then NaNs them like any other
@@ -1553,9 +1561,11 @@ class FmTrackingCommand(MotionSequenceCommand):
         """
         if self._cond_stash is None:
             raise RuntimeError(
-                "plan_conditioning() needs enable_cond_stash() before the first re-plan; "
-                "without it the row is never captured and this would return zeros, which "
-                "encode as a real conditioning rather than as an absent one."
+                "plan_conditioning() needs the conditioning stash, which is off by default. Set "
+                "`stash_conditioning=True` on the command cfg -- NOT enable_cond_stash() "
+                "from the env, which runs after the observation manager has already "
+                "probed every term's shape. Returning zeros instead would encode as a "
+                "real conditioning rather than as an absent one."
             )
         return self._cond_stash
 
@@ -1590,9 +1600,11 @@ class FmTrackingCommand(MotionSequenceCommand):
         """
         if self._pred_flow is None:
             raise RuntimeError(
-                "plan_flow() needs enable_flow_stash() before the first re-plan; without it "
-                "the field is never captured and this would return zeros, which reads as a "
-                "converged flow rather than as a missing one."
+                "plan_flow() needs the flow stash, which is off by default. Set "
+                "`stash_flow=True` on the command cfg -- NOT enable_flow_stash() from the "
+                "env, which runs after the observation manager has already probed every "
+                "term's shape. Returning zeros instead would read as a converged flow "
+                "rather than as a missing one."
             )
         return self._pred_flow
 

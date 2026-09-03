@@ -55,8 +55,10 @@ from isaaclab.utils import configclass
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.envs import AdjusterEnvCfg
 
-from .g1_depth_env_cfg import G1TeacherTerrainDepthEnvCfg
-from .g1_teacher_env_cfg import G1TeacherObservationsCfg
+from .g1_depth_env_cfg import (
+    G1TeacherTerrainDepthEnvCfg,
+    G1TeacherTerrainDepthObservationsCfg,
+)
 # The closed-loop FM command, imported rather than inherited. It is the one genuinely shared
 # piece: ~40 lines of reasoned config (the "plan" anchor, the CLF weights, no default clip or
 # checkpoint, the CPU clip device) that must not be restated and drift.
@@ -82,11 +84,20 @@ EPISODE_LENGTH_S: float = 24.0
 
 
 @configclass
-class G1AdjusterObservationsCfg:
+class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
     """Five groups: two the frozen tracker reads, two the adjuster reads, one the critic reads.
 
-    The first two are the TRACKER's, unchanged from the teacher -- it is a frozen policy and
-    its observation contract is fixed by its checkpoint, which ``FrozenTracker`` asserts.
+    **Extends the DEPTH observations rather than re-declaring the groups**, and that is not
+    cosmetic: the depth variant's ``PolicyCfg`` is what nulls the height scan and adds the two
+    cameras. An earlier version built ``policy`` from the plain teacher's group and the frozen
+    tracker refused to load against it -- 1106 wide against the 2490 its trunk expects, with
+    ``depth_near`` and ``depth_far`` missing and a ``height_scan`` the tracker had never seen.
+    That is precisely the failure ``FrozenTracker``'s per-term oracle exists to name, and it
+    named it; without that check it would have surfaced as a ``load_state_dict`` shape error
+    about ``mlp.0.weight``.
+
+    So ``policy`` and ``reference`` are inherited untouched -- the tracker is frozen and its
+    observation contract is fixed by its checkpoint.
 
     ``fm_cond`` and ``fm_plan`` are the adjuster's, and they are observations rather than
     something the policy recomputes because PPO's rollout runs under ``inference_mode``:
@@ -95,9 +106,6 @@ class G1AdjusterObservationsCfg:
     generator's own state, not a sensor, and the plan arrives in a DECLARED normalized space
     that an empirical normalizer would demote to a dataset statistic.
     """
-
-    policy: G1TeacherObservationsCfg.PolicyCfg = G1TeacherObservationsCfg.PolicyCfg()
-    reference: G1TeacherObservationsCfg.ReferenceCfg = G1TeacherObservationsCfg.ReferenceCfg()
 
     @configclass
     class FmCondCfg(ObsGroup):
@@ -133,7 +141,7 @@ class G1AdjusterObservationsCfg:
             self.concatenate_terms = True
 
     @configclass
-    class CriticCfg(G1TeacherObservationsCfg.CriticCfg):
+    class CriticCfg(G1TeacherTerrainDepthObservationsCfg.CriticCfg):
         """The teacher's privileged group, plus what a residual policy's critic needs.
 
         Both additions are appended LAST so a resumed critic can be zero-padded rather than
@@ -153,6 +161,30 @@ class G1AdjusterObservationsCfg:
                                            params={"command_name": "traj_ref"})
         goal_geometry: ObsTerm = ObsTerm(func=mdp.goal_geometry,
                                          params={"command_name": "traj_ref"})
+
+        def __post_init__(self) -> None:
+            """Drop the two CLF/clip-derived terms, which cannot mean anything here.
+
+            ``tracking_error_local`` reads the CLF's output vector, and under
+            ``strict_fm_only`` every channel the generator does not write is NaN-FILLED on
+            purpose -- that barrier exists so an accidental read of clip-derived data fails
+            loudly rather than quietly. It duly did: the first smoke run reached
+            ``runner.learn`` and stopped on 77 NaN channels per env in this group.
+
+            ``tracking_error_global`` measures drift against the GLOBALLY-PLACED CLIP, which
+            on this task is not the reference anything grades -- the adjuster corrects the
+            generator's plan and is scored against what was served. It is clip data on the
+            critic's path, which is the dependency the FM tracker task deleted its whole
+            critic group to avoid.
+
+            What remains is a strong privileged group with no clip dependence: the clean
+            proprioception history, ``reference_window`` (which under ``reference_source="fm"``
+            IS the served plan), ``command_window``, the privileged ``height_scan``, and the
+            two terms appended above.
+            """
+            super().__post_init__()
+            self.tracking_error_local = None
+            self.tracking_error_global = None
 
     fm_cond: FmCondCfg = FmCondCfg()
     fm_plan: FmPlanCfg = FmPlanCfg()
@@ -299,6 +331,13 @@ class G1AdjusterEnvCfg(G1TeacherTerrainDepthEnvCfg, AdjusterEnvCfg):
         # error here rather than a silent arm swap. Override on the CLI for that control arm:
         # `env.commands.traj_ref.history_from=generator`.
         self.commands.traj_ref.history_from = "measured"
+
+        # Capture the generator's conditioning and its final-step flow field: the adjuster's
+        # two actor observation groups ARE those. Set on the command cfg rather than called on
+        # the env, because the observation manager probes every term's shape while the managers
+        # are still being built -- see FmTrackingCommandCfg.stash_conditioning.
+        self.commands.traj_ref.stash_conditioning = True
+        self.commands.traj_ref.stash_flow = True
 
         # The spec paths are NOT fanned out to the termination terms here, deliberately. Each
         # term falls back to the env cfg's field when its own `spec_path` param is empty, so

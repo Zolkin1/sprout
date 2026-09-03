@@ -21,6 +21,32 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     itself, not even during warmup. See :attr:`strict_fm_only`.
     """
 
+    stash_conditioning: bool = False
+    """Keep each plan's CONDITIONING, as built, for an observation term to read.
+
+    Off by default because it is dominated by a depth row per env and only the RL adjuster
+    reads it -- its network re-encodes this conditioning to borrow the generator's frozen
+    prefix, and the borrow is only exact if it gets the tensors that actually produced the
+    plan (rebuilding them at observation time would read a different instant and a different
+    camera lag).
+
+    **A cfg flag rather than a method call on the env, and the ordering is why.**
+    ``ObservationManager._prepare_terms`` invokes every term ONCE at construction to discover
+    its shape, and the observation manager is built inside ``load_managers`` -- so an env that
+    enabled this after ``super().__init__()`` would have the term raise during that probe.
+    The command manager is constructed FIRST (``ManagerBasedRLEnv.load_managers`` builds it
+    before delegating to the base), so a flag read in ``_post_init`` is early enough and a
+    method call from the env is not.
+    """
+
+    stash_flow: bool = False
+    """Keep each plan's final Euler-step velocity field, for an observation term to read.
+
+    Same trade and the same ordering reason as :attr:`stash_conditioning`. The adjuster reads
+    it beside the window it corrects, so each of its query tokens carries both what the
+    generator predicted at that node and which way the flow was still moving there.
+    """
+
     fm_depth_lag_steps: int | None = None
     """Synthetic camera lag for the GENERATOR, in control steps of 20 ms.
 

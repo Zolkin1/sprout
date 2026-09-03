@@ -305,10 +305,35 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
     actor = AdjusterModelCfg(
         hidden_dims=[1],
         activation="elu",
-        # init_std is NOT made small: the physical smallness lives in the residual's per-channel
-        # scale table, and KL ~ A * delta^2 / (2 sigma^2), so a tiny sigma strangles the
-        # adaptive controller into an LR collapse instead of limiting the residual.
-        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.5, std_type="log"),
+        # MEASURED, not chosen. 0.5 was shipped first on the reasoning that the physical
+        # smallness belongs in the residual's cap table rather than in sigma -- but the caps
+        # are deliberately LOOSE (base position is capped at the full 0.2 m violation
+        # threshold), so sigma 0.5 in capped units is ~0.1 m RMS of re-drawn reference noise
+        # per node, well above the 0.06 m half-width `REFERENCE_WINDOW_NOISE` says the tracker
+        # was hardened to. A 16-env smoke triple, all with the actor frozen by critic warm-up
+        # so each measures only its initialisation:
+        #
+        #   init_std   residual_l2   trackability   goal_reached   tracking_violation
+        #   1e-4              -0.000          0.178          0.320                0.555
+        #   0.15              -0.077          0.135          0.219                0.688
+        #   0.5               -0.330          0.034          0.172                0.812
+        #
+        # Monotone in all four columns, and `residual_l2` is a clean low-noise dose, so the
+        # dose-RESPONSE is solid even though the absolute rates are not: ~50-100 completed
+        # episodes per arm puts a standard error of roughly 0.05-0.07 on `goal_reached`.
+        #
+        # 0.15 puts the initial residual at ~0.03 m RMS on base position -- the noise the
+        # tracker already tolerates -- and it still costs ~24% of trackability against the bare
+        # generator. That is the price of having any exploration at all, and it is a genuine
+        # trade rather than a solved value: too little and PPO has no gradient signal, too much
+        # and the value function is anchored on a distribution far worse than the baseline the
+        # policy has to beat. TODO(adjuster-init-std): revisit once a real run trains, against
+        # whether the early dip recovers.
+        #
+        # Do NOT push it much lower: KL ~ A * delta^2 / (2 sigma^2), so a tiny sigma shrinks
+        # the permitted mean step and strangles the adaptive LR controller instead of limiting
+        # the residual -- which is what the cap table is for.
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.15, std_type="log"),
         obs_normalization=False,
     )
     critic = RslRlMLPModelCfg(

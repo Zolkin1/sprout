@@ -30,6 +30,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any, Sequence
 
 import torch
+import warp as wp
 
 from isaaclab.utils.math import euler_xyz_from_quat, quat_apply, quat_apply_inverse, wrap_to_pi, yaw_quat
 
@@ -287,6 +288,16 @@ def violates(err: torch.Tensor, spec: TrackingErrorSpec = BOOTSTRAP_SPEC) -> tor
     return out
 
 
+def _as_torch(buf) -> torch.Tensor:
+    """A robot-data buffer as a torch tensor, converting a warp array if that is what it is.
+
+    ``ArticulationData`` hands several buffers back as warp arrays, and arithmetic between one
+    and a torch tensor raises inside warp rather than converting. Mirrors
+    ``scripts/rsl_rl/eval/accumulate._to_torch`` and ``data_logger._to_torch``.
+    """
+    return buf if isinstance(buf, torch.Tensor) else wp.to_torch(buf)
+
+
 def served_tracking_error(
     cmd, robot_data, offsets: torch.Tensor | None = None
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -323,16 +334,21 @@ def served_tracking_error(
         block is not a rotation, so the row would carry NaN and poison any later reduction that
         multiplies by a mask instead of selecting with one.
     """
+    # Convert here, so this works on a raw ``ArticulationData`` as well as on a caller's
+    # already-converted view. Several of its buffers are warp arrays, and the failure is not
+    # subtle -- ``vec3f - torch.Tensor`` raises inside warp -- but it IS caller-dependent, and
+    # a shared producer that only works for the caller it was extracted from is not shared.
+    root_pos_w = _as_torch(robot_data.root_pos_w)
     if offsets is None:
-        offsets = torch.zeros(1, dtype=torch.long, device=robot_data.root_pos_w.device)
+        offsets = torch.zeros(1, dtype=torch.long, device=root_pos_w.device)
 
     pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(offsets)
     joint_pos, _ = cmd.get_future_joint_state(offsets)
     err = tracking_error(
         pos_w[:, 0], quat_w[:, 0], lin_w[:, 0], ang_w[:, 0], joint_pos[:, 0],
-        robot_data.root_pos_w, robot_data.root_quat_w,
-        robot_data.root_link_lin_vel_w, robot_data.root_link_ang_vel_w,
-        robot_data.joint_pos,
+        root_pos_w, _as_torch(robot_data.root_quat_w),
+        _as_torch(robot_data.root_link_lin_vel_w), _as_torch(robot_data.root_link_ang_vel_w),
+        _as_torch(robot_data.joint_pos),
     )
 
     # ``_pred_valid`` is absent on the clip command, where a reference always exists.
