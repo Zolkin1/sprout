@@ -2,11 +2,18 @@
 
 """Run one ARM of the MuJoCo terrain eval: every authored course x every commanded speed.
 
-An arm is one tracker.  The generator is held fixed across arms (``evaluate.py`` states which),
-so a paired difference between two ``episodes.h5`` files is a statement about the tracker and
-nothing else.  Closed loop throughout -- the generator conditions on its own served history and
-on depth cast from wherever the robot actually went.  There is no clip, no teacher forcing and
+An arm is one tracker, and one choice of what fills the generator's history.  The generator
+itself is held fixed across arms (``evaluate.py`` states which), so a paired difference between
+two ``episodes.h5`` files is a statement about whichever of those two the arms differ in.
+Depth is cast from wherever the robot actually went.  There is no clip, no teacher forcing and
 no domain randomisation anywhere in this file.
+
+Closed loop by default: the generator conditions on its own served history.  An arm may set
+``history_from="measured"`` instead, feeding it the robot's own achieved state -- still no
+clip, and still nothing the robot could not supply, but off-distribution against a model
+fitted on reference rows.  The two produce history rows of identical width, so the arm's
+``manifest.json`` and the table's own ``history_from`` attribute are the only record of which
+ran.
 
 **Three nested scopes, and that nesting is the point of the module.**  The costs are measured,
 and they are three orders of magnitude apart, so what belongs where is not a matter of taste:
@@ -194,6 +201,26 @@ class ArmRun:
     #: K=4 selector carrying an already-lost episode.
     stop_on_violation: bool = True
     zero_noise: bool = True
+
+    @property
+    def recorded_seed(self) -> int:
+        """What the table's ``seed`` column should hold for this run.
+
+        :data:`ZERO_NOISE_SEED` under ``zero_noise``, where the flow integrates from
+        ``x0 = 0`` and there is no draw to seed, and the real ``fm_seed`` otherwise. It used
+        to be the sentinel unconditionally, which is fine while every run is deterministic
+        and silently wrong the moment one is not: a seeded sweep would write ``-1`` into
+        every row and the table could not say which draw produced which outcome -- the one
+        thing a seed sweep exists to record.
+        """
+        return ZERO_NOISE_SEED if self.zero_noise else int(self.fm_seed)
+    #: What fills the generator's ``N`` history rows: ``"generator"`` (its own served nodes,
+    #: the deployed loop) or ``"measured"`` (the robot's achieved state, bar the base
+    #: position and linear velocity, which no robot can measure).  An ARM dimension rather
+    #: than a run-level flag, so two history sources can be swept against one tracker and
+    #: pair on ``(course, speed)`` -- and so the manifest records which one ran, which no
+    #: width check could tell you: the two rows are the same shape.
+    history_from: str = "generator"
     fm_seed: int = 0
     shards: int = 1
     shard: int = 0
@@ -405,6 +432,7 @@ def load_arm(cfg: ArmRun) -> tuple[GenTrackerPolicy, FmDepthLag, Spawn]:
         # policy's -- the same measured argument `stair_probe._MJCF_ONLY` makes.  This is SIM
         # ONLY; nothing on the robot path sets it.
         allow_robot_asset_mismatch=True,
+        history_from=str(cfg.history_from),
     )
     policy.load()
     print(f"[INFO] onnxruntime providers: {policy.active_providers()}")
@@ -489,11 +517,12 @@ def load_classifier(path: str) -> PlanClassifier | None:
     return clf
 
 
-def _reset_episode_state(policy: GenTrackerPolicy, fm_lag: FmDepthLag) -> None:
+def _reset_episode_state(policy: GenTrackerPolicy, fm_lag: FmDepthLag,
+                         episode_seed=None) -> None:
     """Clear every buffer that would otherwise carry the previous episode into this one.
 
-    Two leaks, both silent, both the same shape -- a ring buffer that ``policy.reset()`` does
-    not own:
+    Three leaks, all silent, and the first two are the same shape -- a ring buffer that
+    ``policy.reset()`` does not own:
 
     * ``policy._trk.action_isaac`` is the tracker's last raw output, and ``reset()`` clears the
       observation history but NOT this.  The next ``_push_history`` fills the WHOLE ``actions``
@@ -506,14 +535,28 @@ def _reset_episode_state(policy: GenTrackerPolicy, fm_lag: FmDepthLag) -> None:
     * ``FmDepthLag``'s ring holds the last ``steps + 1`` depth frames with their poses.  Left
       alone, the first frames the generator sees on a new course are the last frames of the
       previous one -- a different piece of terrain, at full confidence.
+    * the generator's NOISE STREAM, which is not a buffer at all and is why it needs saying.
+      ``GenTrackerPolicy`` builds one RNG at construction and consumes a draw per re-plan, so
+      an episode's noise depends on how many re-plans every episode before it made -- and an
+      arm that falls early makes fewer. Under ``zero_noise`` nothing draws and it cannot
+      matter; under a Gaussian draw two arms would be scored on different noise from the
+      first differing episode onward, drifting further apart the longer the sweep ran, and
+      the tables would look entirely clean. Keying the stream on the CELL removes it: the
+      same ``(course, speed)`` gets the same tape in both arms whatever happened before it,
+      which is what makes the paired delta a statement about the arms.
 
     Args:
         policy: The loaded pair.
         fm_lag: The generator's camera-lag ring.
+        episode_seed: Seed (or seed sequence) to restart the generator's noise stream from.
+            ``None`` resumes it, which is right for a single-cell caller and wrong for a
+            sweep -- see above.
     """
     policy.reset()
     policy._trk.action_isaac = np.zeros_like(policy._trk.action_isaac)
     fm_lag._buf.clear()
+    if episode_seed is not None:
+        policy.reseed(episode_seed)
 
 
 def steer_yaw_rate(course: terrains.Course, x: float, y: float, yaw: float,
@@ -560,7 +603,7 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 steer_wz_max: float = STEER_WZ_MAX,
                 cfg_hold: float = terrains.CMD_HOLD_S,
                 probe=None, tracking_spec=None,
-                stop_on_violation: bool = True) -> tuple[str, str, Any]:
+                stop_on_violation: bool = True, episode_seed=None) -> tuple[str, str, Any]:
     """One deterministic trial: spawn, drive at ``cmd``, and stop on a fall, the target or time.
 
     **Three orderings inside the loop are load-bearing.**  The fall test runs BEFORE the target
@@ -604,6 +647,10 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             runs at the CONTROL rate while it is only read at a re-plan.  Additive rather than
             a widened ``recorder`` so ``view_cell.py`` and ``fm_sample_explorer.py`` are
             untouched.  ``None`` by default and therefore free.
+        episode_seed: Restart the generator's noise stream from this seed instead of resuming
+            it -- see :func:`_reset_episode_state`, which explains why a SWEEP must pass it
+            and a single-cell caller need not.  ``None`` resumes, which is the old behaviour
+            and is invisible under ``zero_noise`` because nothing draws.
 
     Returns:
         ``(verdict, failure_code, accumulator)``, the first two being
@@ -617,7 +664,7 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                               base_lin_vel_w=spawn.base_lin_vel_w,
                               base_ang_vel_w=spawn.base_ang_vel_w,
                               joint_vel_mujoco=rig.hold_joint_vel)
-    _reset_episode_state(policy, fm_lag)
+    _reset_episode_state(policy, fm_lag, episode_seed)
 
     acc = accumulate.EpisodeAccumulator(course, cmd, policy.get_dt(), rig.act_ids,
                                         rig.effort_limits, rig.total_mass,
@@ -731,15 +778,20 @@ def run_arm(cfg: ArmRun) -> str:
         for speed_idx, speed in enumerate(speeds):
             cmd = np.array([float(speed), 0.0, 0.0])
             t0 = time.time()
+            # Keyed on the CELL, not on arrival order: the same (course, speed) then draws
+            # the same noise in every arm and at every shard boundary, whatever happened
+            # before it. A no-op under zero_noise, where nothing draws at all.
             verdict, failure, acc = run_episode(rig, policy, fm_lag, spawn, cmd,
                                                 classifier, steer_kp=cfg.steer_kp,
                                                 steer_wz_max=cfg.steer_wz_max,
-                                                cfg_hold=cfg.cmd_hold_s)
+                                                cfg_hold=cfg.cmd_hold_s,
+                                                episode_seed=(int(cfg.fm_seed), terrain_idx,
+                                                              speed_idx))
             # Derived rather than counted, so an episode's id is the same number whichever
             # shard ran it and a merged table has no duplicates to renumber.
             row = acc.row(episode_id=terrain_idx * EPISODE_ID_STRIDE + speed_idx,
                           terrain_idx=terrain_idx, speed_idx=speed_idx,
-                          arm=cfg.arm, seed=ZERO_NOISE_SEED, verdict=verdict,
+                          arm=cfg.arm, seed=cfg.recorded_seed, verdict=verdict,
                           failure_code=failure)
             table.append(row)
             tag = f"{cfg.label}" if cfg.shards == 1 else f"{cfg.label} s{cfg.shard}"
@@ -760,7 +812,16 @@ def run_arm(cfg: ArmRun) -> str:
         "tracker_onnx": cfg.tracker_onnx, "fm_onnx": cfg.fm_onnx,
         "dt": policy.get_dt(), "fm_update_every": policy.fm_update_every,
         "fm_depth_lag_steps": fm_lag.steps,
-        "zero_noise": True, "domain_randomization": "none",
+        # The RESOLVED value off the loaded policy, not `cfg.history_from`: the point of
+        # stamping it is to record what ran, and two arms sharing a tracker and a generator
+        # are otherwise indistinguishable in this file.
+        "history_from": policy.history_from,
+        # Read off the loaded POLICY, not written as a literal: `True` here was correct only
+        # while the harness had no other mode, and a seeded run would have recorded itself as
+        # deterministic. `fm_seed` rides along so a table states its draw even where the
+        # per-episode column holds the sentinel.
+        "zero_noise": bool(policy.zero_noise), "fm_seed": int(cfg.fm_seed),
+        "domain_randomization": "none",
         "steer_kp": cfg.steer_kp, "steer_wz_max": cfg.steer_wz_max,
         "cmd_hold_s": cfg.cmd_hold_s,
         "goal_half_width_m": [c.goal_half_width_m for c in terrains.catalogue()],

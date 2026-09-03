@@ -69,6 +69,8 @@ ROOT_RGBA = (0.72, 0.52, 0.17, 0.9)
 GHOST_RGBA: dict[str, tuple] = {
     "baseline": (0.54, 0.49, 0.66, 0.42),
     "finetune": (0.06, 0.48, 0.38, 0.42),
+    "ft_v3": (0.80, 0.42, 0.12, 0.42),
+    "baseline_meas": (0.72, 0.20, 0.30, 0.42),
 }
 
 
@@ -179,6 +181,12 @@ def print_grid(run_dir: str, labels: list[str], disagree_only: bool) -> None:
         disagree_only: Print only cells whose arms reached different verdicts -- which is where
             a spot check has the most to learn, since the geometry and the command were
             identical and only the tracker differed.
+
+    Cells the run did not cover are SKIPPED rather than fatal: a smoke run truncates the
+    catalogue (``--max_courses`` / ``--max_speeds``) and a sharded one holds a residue class,
+    so demanding the full 20x10 grid meant the browser could not open the table it was
+    pointed at. A cell present for some arms and missing for others is still an error -- that
+    is a torn run, not a truncated one.
     """
     tables = {lab: load_rows(run_dir, lab) for lab in labels}
     courses = terrains.catalogue()
@@ -192,6 +200,16 @@ def print_grid(run_dir: str, labels: list[str], disagree_only: bool) -> None:
     shown = 0
     for terrain_idx, course in enumerate(courses):
         for speed_idx, speed in enumerate(course.speeds):
+            present = [lab for lab in labels
+                       if np.any((tables[lab]["terrain_idx"] == terrain_idx)
+                                 & (tables[lab]["speed_idx"] == speed_idx))]
+            if not present:
+                continue                      # a cell this run did not cover
+            if len(present) != len(labels):
+                raise SystemExit(
+                    f"cell (terrain {terrain_idx}, speed {speed_idx}) is in {present} but "
+                    f"not in {[la for la in labels if la not in present]}. The arms cover "
+                    "different cells, so no paired comparison over this run is valid.")
             verdicts = []
             for lab in labels:
                 r = find_row(tables[lab], terrain_idx, speed_idx)
@@ -236,9 +254,17 @@ def capture(run_dir: str, label: str, terrain_idx: int, speed_idx: int, args
     steer_kp = float(attrs.get("steer_kp", 0.0))
     steer_wz_max = float(attrs.get("steer_wz_max", runner.STEER_WZ_MAX))
     cmd_hold_s = float(attrs.get("cmd_hold_s", terrains.CMD_HOLD_S))
+    # Read from the TABLE, like the three above, and for a sharper reason: the history source
+    # and the noise draw change the trajectory completely while changing no shape, so a
+    # replay that defaulted them would re-run a different experiment and blame the mismatch
+    # on the checker. An older table names neither, and the defaults are what it ran.
+    history_from = str(attrs.get("history_from", "generator"))
+    zero_noise = bool(attrs.get("zero_noise", True))
+    fm_seed = int(attrs.get("fm_seed", 0))
     print(f"  config from the run: steer_kp {steer_kp:g}"
           + (f" (wz clip {steer_wz_max:g} rad/s)" if steer_kp > 0 else " -- steering off")
-          + f", cmd_hold {cmd_hold_s:g} s", flush=True)
+          + f", cmd_hold {cmd_hold_s:g} s, history_from {history_from}"
+          + (", x0=0" if zero_noise else f", GAUSSIAN x0 seed {fm_seed}"), flush=True)
 
     cfg = runner.ArmRun(
         arm=arm.code, label=arm.label,
@@ -248,6 +274,7 @@ def capture(run_dir: str, label: str, terrain_idx: int, speed_idx: int, args
         fall_height=args.fall_height, fall_tilt_deg=args.fall_tilt_deg,
         spawn_z_offset=args.spawn_z_offset,
         steer_kp=steer_kp, steer_wz_max=steer_wz_max, cmd_hold_s=cmd_hold_s,
+        history_from=history_from, zero_noise=zero_noise, fm_seed=fm_seed,
     )
     policy, fm_lag, spawn = runner.load_arm(cfg)
     rig = runner.CourseRig(course, policy, cfg, spawn)
@@ -270,10 +297,13 @@ def capture(run_dir: str, label: str, terrain_idx: int, speed_idx: int, args
     verdict, failure, acc = runner.run_episode(rig, policy, fm_lag, spawn, cmd, None,
                                                recorder=record, steer_kp=steer_kp,
                                                steer_wz_max=steer_wz_max,
-                                               cfg_hold=cmd_hold_s)
+                                               cfg_hold=cmd_hold_s,
+                                               # The same cell key run_arm used, or the
+                                               # replay draws different noise than the row.
+                                               episode_seed=(fm_seed, terrain_idx, speed_idx))
     row = acc.row(episode_id=terrain_idx * runner.EPISODE_ID_STRIDE + speed_idx,
                   terrain_idx=terrain_idx, speed_idx=speed_idx, arm=arm.code,
-                  seed=runner.ZERO_NOISE_SEED, verdict=verdict, failure_code=failure)
+                  seed=cfg.recorded_seed, verdict=verdict, failure_code=failure)
     summary = {"course": course, "speed": speed, "verdict": verdict, "failure": failure,
                "row": row, "model": rig.robot.mj_model}
     return summary, frames, plans
@@ -631,9 +661,21 @@ def main() -> int:
     """
     args = build_parser().parse_args()
     run_dir = os.path.abspath(args.run)
-    labels = [a.label for a in evaluate.ARMS]
+    # The arms that actually RAN here, not every arm the table declares. A run is free to
+    # cover a subset (`evaluate.py --arm baseline,baseline_meas` does), and listing a
+    # declared-but-absent one used to abort the whole browse on its missing episodes.h5 --
+    # so the tool could not show you the grid of the run you had.
+    labels = [a.label for a in evaluate.ARMS
+              if os.path.isfile(os.path.join(run_dir, a.label, "episodes.h5"))]
+    if not labels:
+        raise SystemExit(
+            f"no arm under {run_dir} has an episodes.h5. Declared arms: "
+            f"{[a.label for a in evaluate.ARMS]}")
+    absent = [a.label for a in evaluate.ARMS if a.label not in labels]
 
     if args.list:
+        if absent:
+            print(f"[INFO] arms present: {labels}; not run here: {absent}")
         print_grid(run_dir, labels, args.disagree)
         return 0
 

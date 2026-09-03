@@ -81,12 +81,18 @@ class Arm:
         label: Short name; also the output subdirectory, which ``report.py`` reads as a run.
         tracker_run: Run directory name under :data:`LOG_ROOT`.
         note: One line for the manifest saying what this arm is.
+        history_from: What fills the generator's history rows -- ``"generator"`` (its own
+            served nodes, the deployed loop) or ``"measured"`` (the robot's achieved state).
+            An arm dimension, so the same tracker can appear twice differing only in this;
+            the two produce rows of IDENTICAL width, so nothing but the manifest can say
+            which ran.
     """
 
     code: int
     label: str
     tracker_run: str
     note: str
+    history_from: str = "generator"
 
     @property
     def tracker_onnx(self) -> str:
@@ -111,6 +117,16 @@ ARMS: tuple[Arm, ...] = (
         "unchanged at 3101) and trains on the narrower nojo_nodist clip library. Exported "
         "with tracking_mode='body', which shapes the CLF reward and not the observation, so "
         "the FM path serves it exactly as it serves the other two"),
+    Arm(3, "baseline_meas", "2026-08-20_16-36-10_mode11_decor_plan_v1",
+        "the DEPLOYED tracker again, with the generator conditioned on the robot's own "
+        "achieved state instead of its own served nodes (base position and linear velocity "
+        "excepted -- no robot can measure those, so they still come from the plan). Pairs "
+        "with 'baseline' on (course, speed): same tracker, same generator, same courses, "
+        "and the history source is the only difference. Read it against "
+        "scripts/flow_matching/measured_history_gap.py, which measures the input as 0.54 "
+        "sigma off-distribution on the joints and 0.69 on angular velocity -- this arm is "
+        "not a clean grounding experiment until a generator is TRAINED on measured rows",
+        history_from="measured"),
 )
 
 
@@ -245,6 +261,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "are legitimately zero")
     p.add_argument("--max_courses", type=int, default=0, help="smoke run: first N courses")
     p.add_argument("--max_speeds", type=int, default=0, help="smoke run: first N speeds")
+    p.add_argument("--gaussian_noise", dest="zero_noise", action="store_false", default=True,
+                   help="Draw the flow's x0 from a Gaussian instead of integrating from 0. "
+                        "OFF by default: x0=0 is what the hardware controller runs and it "
+                        "makes a repeat at fixed (course, speed) bit-identical, which is why "
+                        "the sweep has one trial per cell. But that draw is NOT a neutral "
+                        "sample -- it sits near the conditional's mode and succeeds where a "
+                        "third of Gaussian draws fail (fm_variance_probe) -- so a result that "
+                        "has to hold for the model rather than for one draw needs this, plus "
+                        "several --fm_seed values in separate --out directories.")
+    p.add_argument("--fm_seed", type=int, default=0,
+                   help="Seed for the generator's noise draws. Only meaningful with "
+                        "--gaussian_noise; recorded either way.")
     # OPT-IN, and off by default, because it changes what is being measured rather than how
     # cleanly. See runner.steer_yaw_rate: the stair families were commanded |wz| = 0.0000 over
     # all 3500 clips, so any non-zero yaw there is extrapolation. flat and box do turn.
@@ -344,28 +372,40 @@ def write_manifest(out_dir: str, arms: list[Arm], args: argparse.Namespace) -> d
         rt = resolved_runtime(arm)
         rows.append({"arm": arm.code, "label": arm.label, "tracker_run": arm.tracker_run,
                      "note": arm.note, "artifacts": art, "runtime": rt,
+                     "history_from": arm.history_from,
                      "out_dir": os.path.join(out_dir, arm.label)})
         arm_dir = os.path.join(out_dir, arm.label)
         os.makedirs(arm_dir, exist_ok=True)
         with open(os.path.join(arm_dir, "manifest.json"), "w") as f:
             json.dump({"arm": arm.code, "label": arm.label, "artifacts": art, "runtime": rt,
-                       "note": arm.note, "zero_noise": True, "domain_randomization": "none"},
+                       "note": arm.note, "zero_noise": bool(args.zero_noise),
+                       "fm_seed": int(args.fm_seed), "domain_randomization": "none",
+                       # Two arms can share every artifact hash above and still be different
+                       # experiments; this is the only field that says so.
+                       "history_from": arm.history_from},
                       f, indent=2, default=str)
 
     manifest = {
         "created": datetime.datetime.now().isoformat(timespec="seconds"),
         "git": git_state(),
         "robot_name": args.robot_name,
-        "zero_noise": True,
+        "zero_noise": bool(args.zero_noise),
+        "fm_seed": int(args.fm_seed),
         # Stated rather than implied: every physical DR term, the observation corruption and
         # the depth sensor model are OFF, so a number here is what the pair does on a nominal
         # robot with clean cameras and nothing else.
         "domain_randomization": "none -- no physical DR, no observation noise, no depth noise",
         "reference_mode": "fm closed loop (autoregressive); no clip, no teacher forcing",
         "trials_per_cell": 1,
-        "determinism": ("zero_noise integrates the flow from x0 = 0 and MuJoCo is "
-                        "deterministic, so a repeat at fixed (course, speed) is bit-identical "
-                        "and the arms pair exactly"),
+        "determinism": (
+            "zero_noise integrates the flow from x0 = 0 and MuJoCo is deterministic, so a "
+            "repeat at fixed (course, speed) is bit-identical and the arms pair exactly"
+            if args.zero_noise else
+            f"GAUSSIAN x0 at fm_seed={args.fm_seed}: MuJoCo is still deterministic and the "
+            "arms still pair exactly at fixed (course, speed), because the seed is shared -- "
+            "but a repeat at another seed is a DIFFERENT draw, so one seed is one sample of "
+            "the sampler and several --out directories are needed to say anything about the "
+            "model rather than about the draw"),
         "fall_height_m": args.fall_height, "fall_tilt_deg": args.fall_tilt_deg,
         "spawn_z_offset_m": args.spawn_z_offset,
         "providers": args.providers,
@@ -421,10 +461,13 @@ def stage_run(out_dir: str, arms: list[Arm], args: argparse.Namespace,
             shards=args.shards, shard=args.shard,
             steer_kp=args.steer_kp, steer_wz_max=args.steer_wz_max,
             cmd_hold_s=args.cmd_hold_s,
+            history_from=arm.history_from,
+            zero_noise=args.zero_noise, fm_seed=args.fm_seed,
             attrs={"git": manifest["git"], "arm_note": arm.note,
                    "declared_runtime": by_label[arm.label]["runtime"],
                    "artifacts": by_label[arm.label]["artifacts"],
-                   "reference_mode": manifest["reference_mode"]},
+                   "reference_mode": manifest["reference_mode"],
+                   "history_from": arm.history_from},
         )
         out_paths.append(runner.run_arm(cfg))
     return out_paths

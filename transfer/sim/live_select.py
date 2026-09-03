@@ -1146,7 +1146,7 @@ def run(args) -> int:
                                fall_height=args.fall_height,
                                fall_tilt_deg=args.fall_tilt_deg,
                                cmd_hold_s=(0.0 if kind == "clip" else args.cmd_hold_s)))(),
-            course)
+            course, history_from=args.history_from)
         if kind == "clip":
             spawn = mjrunner.clip_spawn(course, policy.get_joint_names())
             rig = mjrunner.CourseRig(course, policy, cfg, spawn)
@@ -1259,6 +1259,17 @@ def main() -> int:
     p.add_argument("--fm_onnx", required=True)
     p.add_argument("--clip_lib", required=True)
     p.add_argument("--tiles", default="6,20")
+    p.add_argument("--history_from", default="generator",
+                   choices=["generator", "measured"],
+                   help="What fills the generator's N history rows: its own served nodes "
+                        "('generator', the deployed closed loop) or the ROBOT'S OWN achieved "
+                        "state ('measured'), bar the base position and linear velocity, "
+                        "which no robot can measure and which still come from the served "
+                        "node. Run it against a 'generator' arm at the SAME --seed_offset "
+                        "and tiles: the arms are then seed-matched per episode and the "
+                        "difference is the conditioning. Off-distribution by 0.54-0.69 "
+                        "sigma (scripts/flow_matching/measured_history_gap.py), so read a "
+                        "result against that rather than as a clean grounding experiment.")
     p.add_argument("--clips", default="",
                    help="comma list of CLIP ids. Builds Isaac-matched per-clip courses -- the "
                         "clip's own terrain, start pose AND velocity, goal, duration and "

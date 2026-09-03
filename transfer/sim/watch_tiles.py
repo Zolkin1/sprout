@@ -97,6 +97,12 @@ def main() -> int:
     p.add_argument("--load_run", required=True, help="tracker run dir name")
     p.add_argument("--fm_onnx", required=True)
     p.add_argument("--tiles", default="6,20", help="comma list of tile ids to offer")
+    p.add_argument("--history_from", default="generator",
+                   choices=["generator", "measured"],
+                   help="What fills the generator's N history rows: its own served nodes "
+                        "('generator', the deployed closed loop) or the ROBOT'S OWN achieved "
+                        "state ('measured'), bar the base position and linear velocity, "
+                        "which no robot can measure. Forwarded to gen_tracker_runner.py.")
     p.add_argument("--speed", type=float, default=0.8)
     p.add_argument("--approach", type=float, default=2.5)
     p.add_argument("--max_offset", type=int, default=50)
@@ -174,6 +180,10 @@ def main() -> int:
                 "--goal_xy", f"{course.target_xy[0]}", f"{course.target_xy[1]}",
                 "--goal_half_width", f"{course.goal_half_width_m}",
                 "--goal_z", f"{goal_z}",
+                # RESTATED here because this is a subprocess boundary, which is where flags
+                # go missing: unforwarded it would revert to the child's argparse default
+                # and every episode would silently be the closed-loop arm.
+                "--history_from", args.history_from,
                 "--allow_robot_asset_mismatch"]
         if steer:
             argv += ["--steer_kp", f"{args.steer_kp}", "--steer_wz_max", f"{args.steer_wz_max}"]

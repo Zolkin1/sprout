@@ -165,11 +165,26 @@ def _course(terrains, clip_lib: str, tile: int, speed: float, scene_tag: str):
                                       name=f"tile{tile}{scene_tag}")
 
 
-def build_arm(args, course):
-    """Load the pair once and rig the course; returns everything ``roll`` needs."""
+def build_arm(args, course, history_from: str = "generator"):
+    """Load the pair once and rig the course; returns everything ``roll`` needs.
+
+    Args:
+        args: Parsed CLI, for the artifact paths and the physical thresholds.
+        course: The course to rig.
+        history_from: What fills the generator's ``N`` history rows -- ``"generator"`` (its
+            own served nodes, the deployed loop) or ``"measured"`` (the robot's achieved
+            state). An explicit keyword with the deployed default rather than something read
+            off ``args``, because nine callers share this function and only the ones running
+            that A/B declare the flag; a ``getattr`` fallback here would silently absorb a
+            rename of it.
+
+    Returns:
+        ``(cfg, policy, fm_lag, spawn, rig)``.
+    """
     import runner as mjrunner
 
     cfg = mjrunner.ArmRun(
+        history_from=history_from,
         arm=0, label=f"attr_{course.name}", tracker_onnx=args.tracker_onnx,
         fm_onnx=args.fm_onnx, out_dir=args.out,
         providers=tuple(x.strip() for x in args.providers.split(",") if x.strip()),

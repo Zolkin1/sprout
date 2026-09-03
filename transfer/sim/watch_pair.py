@@ -394,6 +394,14 @@ def main() -> int:
     p.add_argument("--fm_onnx_b", required=True, help="arm B -- drawn translucent.")
     p.add_argument("--label_a", default="base")
     p.add_argument("--label_b", default="fine-tuned")
+    p.add_argument("--history_from", default="generator",
+                   choices=["generator", "measured"],
+                   help="arm A's history source: the nodes it served ('generator') or the "
+                        "robot's own achieved state ('measured').")
+    p.add_argument("--history_from_b", default="generator",
+                   choices=["generator", "measured"],
+                   help="arm B's history source. Pass the SAME --fm_onnx twice and differ "
+                        "only here to see the measured-history A/B side by side.")
     p.add_argument("--clip_lib", default="clips/g1_mb_v5_body_mode11_decor.h5")
     p.add_argument("--offset_y", type=float, default=0.0,
                    help="shift arm B sideways (m). 0 overlays them at true position, which is "
@@ -438,18 +446,23 @@ def main() -> int:
                                         approach=args.approach, klass=(args.klass or None))
     course = dataclasses.replace(course, name=f"tile{args.tile}{args.scene_tag}")
 
-    def arm(fm_onnx, label):
+    def arm(fm_onnx, label, history_from):
         cfg = mjrunner.ArmRun(
             arm=0, label=label, tracker_onnx=args.tracker_onnx, fm_onnx=fm_onnx,
             out_dir="/tmp",
             providers=tuple(x.strip() for x in args.providers.split(",") if x.strip()),
             fall_height=args.fall_height, fall_tilt_deg=args.fall_tilt_deg,
-            cmd_hold_s=0.0, steer_kp=0.0, zero_noise=False, fm_seed=0)
+            cmd_hold_s=0.0, steer_kp=0.0, zero_noise=False, fm_seed=0,
+            history_from=history_from)
         return cfg, *mjrunner.load_arm(cfg)
 
-    cfg_a, pol_a, lag_a, spawn = arm(args.fm_onnx, args.label_a)
+    # The two arms may differ in the GENERATOR, in the HISTORY SOURCE, or in both. Passing
+    # the same fm.onnx twice with different --history_from is the measured-history A/B, and
+    # it is the case where a side-by-side earns the most: the success rates are close enough
+    # that a number cannot say what changed, while the plans are visibly different.
+    cfg_a, pol_a, lag_a, spawn = arm(args.fm_onnx, args.label_a, args.history_from)
     rig = mjrunner.CourseRig(course, pol_a, cfg_a, spawn)
-    cfg_b, pol_b, lag_b, _sp = arm(args.fm_onnx_b, args.label_b)
+    cfg_b, pol_b, lag_b, _sp = arm(args.fm_onnx_b, args.label_b, args.history_from_b)
 
     # ONE spec for BOTH arms, always. The reward here is a comparison, and two arms folded
     # under different thresholds would differ by the thresholds rather than by the policy.
