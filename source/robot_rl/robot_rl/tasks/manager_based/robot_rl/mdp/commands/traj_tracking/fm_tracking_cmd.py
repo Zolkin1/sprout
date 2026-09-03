@@ -334,9 +334,19 @@ class FmTrackingCommand(MotionSequenceCommand):
             )
         # The arm has to be one the CHECKPOINT was fitted for. Identical row widths either
         # way, so a mismatch is a silently wrong conditioning rather than a load error.
-        assert_history_source_matches(
-            self.cfg.history_from, getattr(self.ctx, "history_source", None),
-            where=str(self.cfg.fm_checkpoint or "the FM checkpoint"))
+        _ckpt_src = str(getattr(self.ctx, "history_source", None) or "reference")
+        if self.cfg.allow_history_source_mismatch:
+            # Loud even when it agrees: the flag being ON is the thing worth knowing, since
+            # it disables the only check that can see a wrong-kind history.
+            print("[WARN FmTrackingCommand] allow_history_source_mismatch=True: serving "
+                  f"history_from={self.cfg.history_from!r} against a checkpoint fitted on "
+                  f"history_source={_ckpt_src!r}. Legitimate only when these rollouts are "
+                  "the training set that moves it onto this arm; anything measured under "
+                  "the mismatch describes a model fed the wrong kind of history.")
+        else:
+            assert_history_source_matches(
+                self.cfg.history_from, _ckpt_src,
+                where=str(self.cfg.fm_checkpoint or "the FM checkpoint"))
         # Printed UNCONDITIONALLY. Which history the generator is eating changes the
         # result more than anything else on this command, and a message that appears only
         # in the non-default case makes "no message" ambiguous with "I did not look".

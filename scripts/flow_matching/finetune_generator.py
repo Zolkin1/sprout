@@ -100,6 +100,36 @@ _NEW_KEYS = {
 }
 
 
+def _rollout_history_from(path: str) -> str:
+    """The history arm a rollout recording was made under, or ``""`` if it does not say.
+
+    ``record_rollouts`` stamps ``history_from`` into the window table's attributes. A file
+    written before that stamp existed is definitionally the ``generator`` arm -- the measured
+    one did not exist -- and maps to the ``reference`` history source; ``""`` is returned for
+    it instead so the caller leaves the parent's value alone rather than asserting one.
+
+    Args:
+        path: The rollout window ``.h5``.
+
+    Returns:
+        ``"measured"``, ``"reference"``, or ``""`` when unstamped or unreadable.
+    """
+    import h5py  # noqa: PLC0415 -- only needed here, and the module is heavy
+
+    try:
+        with h5py.File(path, "r") as f:
+            arm = f.attrs.get("history_from")
+    except OSError:
+        return ""
+    if arm is None:
+        return ""
+    arm = arm.decode() if isinstance(arm, bytes) else str(arm)
+    arm = arm.strip().strip('"')
+    # The window ARM maps onto the checkpoint's own SOURCE contract: a served node and a
+    # clip node are both applied references, so only "measured" is its own thing.
+    return "measured" if arm == "measured" else "reference"
+
+
 def resolved_config(path: str) -> FlowMatchingConfig:
     """The checkpoint's config, with ``extero_encoder`` resolved the way the loader does.
 
@@ -739,6 +769,19 @@ def _save(args, cfg, model, opt, ema, epoch: int, history: list, path: str) -> N
     cfg.advantage_cond = not plain
     if not plain:
         cfg.advantage_inject = args.advantage_inject
+    # THE HISTORY ARM THE ROLLOUTS RAN, not the one the parent was fitted on. A fine-tune
+    # onto a new arm is exactly the case where those differ: the rollouts were recorded
+    # under `measured` from a `reference` parent, and after training on them the model's own
+    # contract is `measured`. Inheriting the parent's value would leave a measured-tuned
+    # checkpoint claiming `reference`, which both runtimes would then happily serve the
+    # WRONG arm -- identical row widths, no error, just wrong. Read from the recording so
+    # the artifact cannot disagree with its own training set.
+    _arm = _rollout_history_from(args.rollout)
+    if _arm and _arm != cfg.history_source:
+        print(f"[ft] history_source: parent {cfg.history_source!r} -> {_arm!r}, the arm "
+              f"{os.path.basename(args.rollout)} was recorded under. The fine-tuned "
+              "checkpoint's contract is the arm it was TRAINED on.")
+        cfg.history_source = _arm
     ckpt = dict(parent)
     ckpt["model"] = {k: v.detach().cpu() for k, v in model.state_dict().items()}
     ckpt["config"] = cfg.to_dict()

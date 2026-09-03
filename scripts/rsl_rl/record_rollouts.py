@@ -117,6 +117,19 @@ parser.add_argument("--fm_checkpoint", type=str, default=None,
                     help="The generator that drives the tracker. REQUIRED: without one the "
                          "command falls back to the clip and the recording is a clip arm "
                          "under a rollout's name -- same shapes, different experiment.")
+parser.add_argument("--history_from", type=str, default="generator",
+                    choices=["generator", "clip", "measured"],
+                    help="What fills the generator's N history rows during the rollout. "
+                         "'generator' (default) is the deployed closed loop and is what "
+                         "every rollout before this flag recorded. 'measured' is the "
+                         "robot's own achieved state, bar the base position and linear "
+                         "velocity. The recording carries whatever ran, so a critic and a "
+                         "fine-tune built from it inherit this arm -- which is the point "
+                         "when the fine-tune is meant to MOVE the generator onto it.")
+parser.add_argument("--allow_history_source_mismatch", action="store_true",
+                    help="Record under an arm the generator was not fitted for. Needed to "
+                         "bootstrap a fine-tune onto a new arm (the rollouts ARE the "
+                         "training set), and wrong for anything being measured as-is.")
 parser.add_argument("--clip", type=str, default=None, help="Clip library .h5 to run on.")
 parser.add_argument("--clip_device", type=str, default=None,
                     help="'cpu' keeps a large library off the GPU.")
@@ -198,7 +211,11 @@ def _apply_overrides(env_cfg) -> None:
             "this task's commands.traj_ref is not an FmTrackingCommand; a rollout needs one "
             "(G1-tracker-clf-fm-terrain-depth-play and friends).")
     cmd.reference_source = "fm"
-    cmd.history_from = "generator"
+    cmd.history_from = args_cli.history_from
+    # Recording under an arm the checkpoint was not fitted for is the POINT when these
+    # rollouts are the fine-tune's training set, so the refusal is lifted here and only
+    # here -- and only when the arm actually differs, so a matched run keeps the guard.
+    cmd.allow_history_source_mismatch = bool(args_cli.allow_history_source_mismatch)
     cmd.fm_zero_noise = False
     if args_cli.fm_checkpoint is not None:
         cmd.fm_checkpoint = args_cli.fm_checkpoint
@@ -225,7 +242,9 @@ def _apply_overrides(env_cfg) -> None:
         raise ValueError("this task has no `reset_on_clip` event to pin the start step on.")
     reset.params["pin_start_step"] = (None if int(args_cli.start_step) < 0
                                       else int(args_cli.start_step))
-    print(f"[rollout] cfg: reference_source=fm history_from=generator fm_zero_noise=False "
+    print(f"[rollout] cfg: reference_source=fm history_from={args_cli.history_from} "
+          f"allow_history_source_mismatch={bool(args_cli.allow_history_source_mismatch)} "
+          f"fm_zero_noise=False "
           f"base_fallen.min_height={args_cli.min_height} "
           f"pin_start_step={reset.params['pin_start_step']}")
 
@@ -554,6 +573,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
             # The RESOLVED value the sampler reads, not the flag that was set. A literal
             # here would let the provenance claim Gaussian noise on a run that had none.
             "fm_zero_noise": bool(cmd.ctx.zero_noise),
+            # What filled the generator's history rows, and what the checkpoint driving them
+            # was FITTED on. Both, because a fine-tune bootstrapping onto a new arm runs with
+            # them deliberately different, and everything built from this file -- the critic,
+            # the advantages, the filtered BC -- inherits the arm without being able to see
+            # it otherwise: the rows are the same width either way.
+            "history_from": str(cmd.cfg.history_from),
+            "fm_history_source": str(getattr(cmd.ctx, "history_source", "reference")),
             "fm_update_every": int(cmd.cfg.fm_update_every),
             "num_envs": int(u.num_envs),
             "proprio_history": int(ro.PROPRIO_HISTORY),

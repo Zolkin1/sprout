@@ -186,6 +186,24 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     ``"clip"`` is not available at deploy -- there is no clip on the robot.
     ``"generator"`` and ``"measured"`` both are, and ``transfer/deploy`` implements both."""
 
+    allow_history_source_mismatch: bool = False
+    """Serve an arm the loaded checkpoint was NOT fitted for.
+
+    Normally refused: the two history kinds produce rows of identical width, so a mismatch
+    loads clean and merely feeds the model a quantity it has never seen
+    (:func:`~robot_rl.flow_matching.window.assert_history_source_matches`).
+
+    The one legitimate use is FINE-TUNING onto the other arm -- recording rollouts under
+    ``history_from="measured"`` from a ``history_source="reference"`` generator is
+    deliberately off-distribution, because those rollouts are the training set that moves it
+    onto the new conditioning. Anything MEASURED under a mismatch is a statement about a
+    model being fed the wrong kind of history, which is occasionally the question and never
+    the default.
+
+    SIM ONLY by construction: nothing on the deploy path sets it, and the numpy runtime has
+    no equivalent -- ``GenTrackerPolicy`` refuses unconditionally, so a mismatched pair
+    cannot reach a robot."""
+
     fm_guidance_scale: float = 1.0
     """Classifier-free guidance weight ``w`` over the FM's HISTORY conditioning.
 
