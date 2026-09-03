@@ -727,7 +727,42 @@ added casually.
 
 What this does NOT answer is a generator TRAINED on measured rows from scratch rather than
 adapted to them -- see `history_source` above; that pair (N=3 measured vs N=3 reference, same
-data, same seed) is the matched experiment.
+data, same seed) is the matched experiment. It was run, and it is below.
+
+## THE MATCHED TEST: training on measured rows is worth +0.003 (2026-09-03)
+
+Two generators, `history_source=measured` and `history_source=reference`, same 361k-window
+dataset, same seed, same `num_history_states=3`, same epoch, each served the arm it was
+TRAINED for -- so no guard override anywhere, unlike every measured-arm eval before it.
+`scripts/rsl_rl/eval_n3_pair.sh`. MuJoCo tiles 6/20/40 x 3 speeds x 40 seed-paired episodes:
+
+| | ref_n3 | meas_n3 | delta |
+|---|---|---|---|
+| pooled, 360 episodes | 0.744 | 0.747 | **+0.003**, 38/75 discordant, p=1.000 |
+
+**38 of 75 discordant pairs is a coin flip.** Two cells look interesting -- tile 20 @2.4
+(+0.250, p=0.041) and tile 6 @1.6 (-0.150, p=0.070) -- and they point in OPPOSITE directions,
+2 of 9 tests on one dataset. That is the third time this exact shape has appeared in this
+investigation and the third time it has not survived; do not quote either.
+
+**Four independent measurements now agree that the history source does not matter:**
+
+| experiment | episodes | delta |
+|---|---|---|
+| measured arm fed to a reference generator, MuJoCo tiles | 360 | +0.025, p=0.36 |
+| filtered BC onto the measured arm | 360 | +0.019, p=0.48 |
+| measured arm fed to a reference generator, Isaac grid | 19,800 | +0.021, CIs overlap |
+| **TRAINED on measured, matched control** | 360 | **+0.003, p=1.00** |
+
+The matched one is both the most informative and the smallest. Fed, fine-tuned onto, or
+trained on from scratch, conditioning the generator on the robot's own state does not move
+outcomes -- against a clip ceiling of 0.907 and `fm` at 0.533, the generator is still the
+limit and this is not the lever. Compare the ~+0.27 that heading control buys on tile 6.
+
+Read at the scale it was measured: these are mid-training snapshots (~epoch 46 of 100, both
+losses still falling and within 0.0001 of each other), 3 tiles = 3 clusters, and `best.pt`
+is EMA weights selected on `val_ema/flow_mse`. The Isaac grid at 264 clips is the
+better-powered version of the same contrast.
 
 # Two families are excluded from FM training BY DEFAULT
 
