@@ -647,6 +647,20 @@ Things worth knowing before reading a run:
   teacher's values give either a runaway action std or a learning rate pinned at the hardcoded
   1e-5 floor, with no symptom but a bad run.
 
+Before a long run, `scripts/rsl_rl/verify_adjuster_cadence.py` takes the same artifact flags
+and asserts the two properties no unit test can reach -- that one agent step contains exactly
+one re-plan per env, and that `track_mean` is the mean over the control steps the env was
+ALIVE for. It also checks in place that a zero residual leaves the served plan BIT-identical
+(`project_window_rotations` is a Gram-Schmidt round trip, so that is a real risk, not a
+formality). Measured over 200 agent steps at 16 envs, with 273 resets across 147 distinct
+steps: cursor swept 0..11, plan change 0.000e+00, reward reconstruction 0.000e+00.
+
+One thing it established rather than assumed: at a step where anything resets, the working
+`_update_command` comes from `_reset_idx` -> `command_manager.reset` -> `_resample_command`,
+and the post-loop `command_manager.compute` early-returns on `_last_step_seen`. That is true
+of every task here -- the guard is what makes the second call idempotent -- so "one re-plan
+per env per agent step" holds while WHICH call performs it varies with whether anything reset.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.
