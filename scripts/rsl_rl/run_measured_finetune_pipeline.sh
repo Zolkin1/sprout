@@ -169,8 +169,16 @@ fi
 # that matters is fine-tune-vs-parent, both measured, not either against the generator arm.
 if run_from eval; then
   say "stage 5/5 eval: export, then tiles 6/20/40 x 3 speeds, BOTH arms"
-  "$PY" scripts/flow_matching/export_fm_onnx.py \
-      --checkpoint "$FT/best.pt" --out "$FT/exported" >>"$LOG" 2>&1 || die export $?
+  # --out is an output .onnx PATH, not a directory: passing a directory writes a 130 MB
+  # extensionless file called `exported` and still exits 0, which is how this cost a stage.
+  # Named to the deploy convention (`<run>_fm.onnx`) so resolve_fm_onnx would accept it.
+  mkdir -p "$FT/exported"
+  FT_TARGET="$FT/exported/$(basename "$FT")_fm.onnx"
+  if [ ! -f "$FT_TARGET" ]; then
+    "$PY" scripts/flow_matching/export_fm_onnx.py \
+        --checkpoint "$FT/best.pt" --out "$FT_TARGET" >>"$LOG" 2>&1 || die export $?
+    [ -f "$FT_TARGET" ] || { say "export exited 0 but wrote no $FT_TARGET"; exit 5; }
+  fi
 
   # Resolved by GLOB, not by name: export_fm_onnx names the file after the run it came from
   # (fm_artifact_name), so a hard-coded name rots the moment the directory is renamed. More

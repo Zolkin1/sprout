@@ -689,6 +689,46 @@ is in-distribution.
 source is worth nothing.** That points at the operator/planner level, which per this file's
 own framing is a thing this stack deliberately does not have.
 
+## Filtered BC on measured history buys +0.019, i.e. the ceiling (2026-09-03)
+
+The whole pipeline, on the measured arm: record 300k windows under
+`history_from=measured` -> two-head critic -> advantages from the QUALITY head alone
+(`--w_fail 0`) -> filtered BC on the top 30% (`--percentile 70`), stratified per-family x 3
+speed bins x 5 progress bins. `scripts/rsl_rl/run_measured_finetune_pipeline.sh`, resumable
+per stage.
+
+| | parent | fine-tune | delta |
+|---|---|---|---|
+| pooled, 360 seed-paired episodes | 0.800 | 0.819 | **+0.019**, 40/73 discordant, p=0.48 |
+
+**That is the ceiling, not an escape from it**: a perfect best-of-4 is worth +0.0207 and the
+earlier generator-arm fine-tunes already took +0.011-0.014. Measured conditioning did not
+change the causal structure, which is consistent with the conditioning alone being worth
++0.025 (p=0.36) untuned. One cell reaches p=0.039 (tile 6 @ 1.6) and is the 8th test in a
+9-cell table whose neighbour at 2.4 goes the other way -- the same non-replicating shape as
+the two retracted results above.
+
+**It is a real null, not a broken run**, and each precondition was checked because any of
+them could have failed silently:
+- critic **AUC 0.904 on UNSEEN tiles** (the split is `val_UNSEEN_tiles`; 0.928 seen), against
+  the 0.906 Isaac reference -- so the critic transfers to measured-history data;
+- quality head **rho 0.752 against a label-shuffle control of 0.003**, `pred_sd 0.190` vs
+  `target_sd 0.253` (under-confident, not collapsed to the mean);
+- labels **78,413 positive / 182,899 negative / 0 null**, exactly 30.0% per stratum with a
+  per-stratum threshold (+0.21 to +0.29), so `null_spread` nulled nothing wholesale;
+- the fine-tune's `history_source` re-stamped `reference -> measured` from the recording.
+
+**The parent ran its `generator` arm and the fine-tune its `measured` arm** -- each on the arm
+it was TRAINED for, because `GenTrackerPolicy` refuses a mismatched pair unconditionally and
+has no sim override by design. So conditioning and fine-tuning are confounded here; with the
+conditioning alone at +0.025 there is no room in +0.019 for the confound to be hiding a real
+fine-tune effect. A 2x2 would need that override, which does not exist and should not be
+added casually.
+
+What this does NOT answer is a generator TRAINED on measured rows from scratch rather than
+adapted to them -- see `history_source` above; that pair (N=3 measured vs N=3 reference, same
+data, same seed) is the matched experiment.
+
 # Two families are excluded from FM training BY DEFAULT
 
 Both because the generator cannot be asked to predict what it cannot see, and both are
