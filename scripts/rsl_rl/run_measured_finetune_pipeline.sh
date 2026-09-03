@@ -151,25 +151,49 @@ fi
 # parent under that arm is the same comparison already measured at +0.025 -- so the number
 # that matters is fine-tune-vs-parent, both measured, not either against the generator arm.
 if run_from eval; then
-  say "stage 5/5 eval: exporting the fine-tune and running tiles 6/20/40"
+  say "stage 5/5 eval: export, then tiles 6/20/40 x 3 speeds, BOTH arms"
   "$PY" scripts/flow_matching/export_fm_onnx.py \
-      --checkpoint "$FT/best.pt" --out "$FT/exported" >>"$LOG" 2>&1 \
-      || say "export failed -- run it by hand; the checkpoint is fine"
-  say "pipeline complete. Eval commands are in $RUN/NEXT_STEPS.txt"
-  cat > "$RUN/NEXT_STEPS.txt" <<EOF
-The fine-tuned generator is $FT/best.pt (exported under $FT/exported).
+      --checkpoint "$FT/best.pt" --out "$FT/exported" >>"$LOG" 2>&1 || die export $?
 
-MuJoCo A/B, both arms on the MEASURED history (which is what it was tuned for):
+  # Resolved by GLOB, not by name: export_fm_onnx names the file after the run it came from
+  # (fm_artifact_name), so a hard-coded name rots the moment the directory is renamed. More
+  # than one match is REFUSED for the same reason resolve_fm_onnx refuses it -- defaulting to
+  # the newest would reinstate as a silent default the ambiguity the naming removed.
+  shopt -s nullglob
+  FT_ONNX=("$FT/exported"/*_fm.onnx)
+  shopt -u nullglob
+  [ ${#FT_ONNX[@]} -eq 1 ] || { say "want exactly one *_fm.onnx in $FT/exported, got ${#FT_ONNX[@]}"; exit 3; }
+  EXPORTED="$W/logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1/exported"
+  PARENT_ONNX="$EXPORTED/2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx"
 
-cd transfer/sim
-for ARM in parent finetune; do
-  FM=\$([ \$ARM = parent ] && echo "$W/logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1/exported/2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx" || echo "$FT/exported/"*_fm.onnx)
-  \$PY live_select.py --out $W/logs/value/ft_meas_\$ARM \\
-    --tracker_onnx $W/logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1/exported/tracker.onnx \\
-    --fm_onnx "\$FM" --clip_lib $W/clips/g1_mb_v5_body_mode11_decor.h5 \\
-    --tiles 6,20,40 --k 1 --episodes 40 --speed 0.8 \\
-    --history_from measured --scene_tag _ftm\$ARM
-done
-EOF
+  # BOTH arms run here rather than reusing tonight's measured-arm sweep, which looks like a
+  # free baseline and is not: that sweep drove the 2026-08-25 nojumpoff generator, while
+  # this fine-tune's parent is the deployed 2026-08-22 one. Pairing across two different
+  # parents would charge their difference to the fine-tune.
+  #
+  # Sequential, and one --scene_tag per arm: CourseRig writes robots/g1/<robot>_<course>.xml
+  # from the course before loading it, so two concurrent runs on one tile tear that file
+  # silently rather than failing to load.
+  for SPEED in 0.8 1.6 2.4; do
+    for ARM in parent finetune; do
+      OUT="$W/logs/value/ftmeas_s${SPEED}_$ARM"
+      if [ -f "$OUT/live_select.json" ]; then say "  eval $ARM @$SPEED skipped"; continue; fi
+      FM=$([ "$ARM" = parent ] && echo "$PARENT_ONNX" || echo "${FT_ONNX[0]}")
+      say "  eval $ARM @$SPEED"
+      ( cd "$W/transfer/sim" && "$PY" live_select.py \
+          --out "$OUT" \
+          --tracker_onnx "$EXPORTED/tracker.onnx" --fm_onnx "$FM" \
+          --clip_lib "$W/clips/g1_mb_v5_body_mode11_decor.h5" \
+          --tiles 6,20,40 --k 1 --episodes 40 --speed "$SPEED" \
+          --history_from measured --scene_tag "_ftm$ARM" ) >>"$LOG" 2>&1 \
+        || say "  eval $ARM @$SPEED FAILED (continuing: the remaining cells still run)"
+    done
+  done
+
+  say "stage 5 done -- paired table:"
+  "$PY" scripts/rsl_rl/report_measured_pairs.py \
+      --a "$W/logs/value/ftmeas_s*_parent" \
+      --b "$W/logs/value/ftmeas_s*_finetune" \
+      --label_a parent --label_b finetune 2>&1 | tee -a "$LOG"
 fi
 say "DONE (from stage $STAGE)"
