@@ -165,7 +165,8 @@ def _course(terrains, clip_lib: str, tile: int, speed: float, scene_tag: str):
                                       name=f"tile{tile}{scene_tag}")
 
 
-def build_arm(args, course, history_from: str = "generator"):
+def build_arm(args, course, history_from: str = "generator",
+              allow_privileged_extero: bool = False):
     """Load the pair once and rig the course; returns everything ``roll`` needs.
 
     Args:
@@ -177,6 +178,9 @@ def build_arm(args, course, history_from: str = "generator"):
             off ``args``, because nine callers share this function and only the ones running
             that A/B declare the flag; a ``getattr`` fallback here would silently absorb a
             rename of it.
+        allow_privileged_extero: Accept a generator conditioned on the PRIVILEGED dense
+            height scan. Same explicit-keyword reasoning, and the same default-off contract
+            that keeps a pair no robot can feed off the robot path.
 
     Returns:
         ``(cfg, policy, fm_lag, spawn, rig)``.
@@ -185,6 +189,7 @@ def build_arm(args, course, history_from: str = "generator"):
 
     cfg = mjrunner.ArmRun(
         history_from=history_from,
+        allow_privileged_extero=allow_privileged_extero,
         arm=0, label=f"attr_{course.name}", tracker_onnx=args.tracker_onnx,
         fm_onnx=args.fm_onnx, out_dir=args.out,
         providers=tuple(x.strip() for x in args.providers.split(",") if x.strip()),

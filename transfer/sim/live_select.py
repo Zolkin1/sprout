@@ -1146,7 +1146,8 @@ def run(args) -> int:
                                fall_height=args.fall_height,
                                fall_tilt_deg=args.fall_tilt_deg,
                                cmd_hold_s=(0.0 if kind == "clip" else args.cmd_hold_s)))(),
-            course, history_from=args.history_from)
+            course, history_from=args.history_from,
+            allow_privileged_extero=args.allow_privileged_extero)
         if kind == "clip":
             spawn = mjrunner.clip_spawn(course, policy.get_joint_names())
             rig = mjrunner.CourseRig(course, policy, cfg, spawn)
@@ -1259,6 +1260,14 @@ def main() -> int:
     p.add_argument("--fm_onnx", required=True)
     p.add_argument("--clip_lib", required=True)
     p.add_argument("--tiles", default="6,20")
+    p.add_argument("--allow_privileged_extero", action="store_true",
+                   help="Run a generator conditioned on the PRIVILEGED dense height scan "
+                        "(121x121 = 14641 rays, exact and noise-free). MuJoCo can honour "
+                        "that contract -- it casts the same grid against the same terrain, "
+                        "~20 ms/step -- and HARDWARE cannot, which is why the flag is off by "
+                        "default and nothing on the robot path passes it. Anything measured "
+                        "under it is a statement about the model GIVEN PERFECT TERRAIN, and "
+                        "never about a deployment.")
     p.add_argument("--history_from", default="generator",
                    choices=["generator", "measured"],
                    help="What fills the generator's N history rows: its own served nodes "

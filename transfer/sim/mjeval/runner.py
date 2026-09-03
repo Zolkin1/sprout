@@ -200,6 +200,12 @@ class ArmRun:
     #: the recording, which latched.  What it buys is not spending ~4 x 95 ms per chunk of a
     #: K=4 selector carrying an already-lost episode.
     stop_on_violation: bool = True
+    #: Accept a generator conditioned on the PRIVILEGED dense height scan. Off by default,
+    #: which is what makes hardware refuse a pair no robot can feed -- only a simulator can
+    #: honour that contract, and MuJoCo does, casting the same 121x121 grid against the same
+    #: terrain (~20 ms/step for 14641 rays). Anything measured under it is a statement about
+    #: the model given perfect terrain, never about a deployment.
+    allow_privileged_extero: bool = False
     zero_noise: bool = True
 
     @property
@@ -433,6 +439,7 @@ def load_arm(cfg: ArmRun) -> tuple[GenTrackerPolicy, FmDepthLag, Spawn]:
         # ONLY; nothing on the robot path sets it.
         allow_robot_asset_mismatch=True,
         history_from=str(cfg.history_from),
+        allow_privileged_extero=bool(cfg.allow_privileged_extero),
     )
     policy.load()
     print(f"[INFO] onnxruntime providers: {policy.active_providers()}")
