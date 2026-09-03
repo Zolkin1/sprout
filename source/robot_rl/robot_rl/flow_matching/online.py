@@ -303,6 +303,20 @@ class FmOnlineContext:
     scan's 1.0 m default is too tight for a large grid, and a live reading clipped harder than
     the training data is silently a different sensor.
     """
+    recording_meta: dict | None = None
+    """The RECORDING's meta, verbatim, as the checkpoint carried it.
+
+    Already the source of :attr:`extero_spec`, :attr:`robot_asset` and
+    :attr:`fm_snap_every`; kept whole because it is also the only record of the OBSERVATION
+    contract the generator was recorded through -- ``obs_term_names`` / ``obs_term_dims`` and
+    the tracker's ``checkpoint_sha256``.
+
+    That matters where a tracker and a generator have to run together: the widths alone cannot
+    tell two trackers of one architecture apart, and a width mismatch reports a tensor rather
+    than the observation term someone has to fix. ``rl.frozen_tracker.FrozenTracker`` reads it
+    for exactly those two checks, and without it here they would be unreachable in production
+    -- checks that only ever fire in their own tests.
+    """
     depth_latency_probs: tuple[float, ...] | None = None
     """Camera-latency distribution this checkpoint TRAINED under, or ``None`` for none.
 
@@ -790,6 +804,9 @@ def load_fm_context(
         # and train.py's asdict() puts it in the checkpoint, so nothing new has to be plumbed
         # through training -- only READ, here, and written into fm_meta at export.
         robot_asset=(meta.get("robot_asset") or None),
+        # The whole meta as well, for the observation contract a tracker+generator pair has to
+        # agree on; see the field's docstring.
+        recording_meta=(dict(meta) if meta else None),
         extero_image_hw=([(int(h), int(w)) for h, w in cfg.extero_image_hw]
                          if cfg.extero_image_hw else None),
         # The band this checkpoint was TRAINED under, so the live token builder clamps the way

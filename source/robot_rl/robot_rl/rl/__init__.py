@@ -8,8 +8,9 @@ without patching the installed wheel -- which matters because ``env_isaaclab/`` 
 gitignored and one ``uv sync`` away from being erased.
 """
 
+from .adjuster_model import WindowAdjusterModel
 from .aux_ppo import AuxPPO
 from .frozen_tracker import FrozenTracker
 from .ref_encoder_model import RefEncoderMLPModel
 
-__all__ = ["AuxPPO", "FrozenTracker", "RefEncoderMLPModel"]
+__all__ = ["AuxPPO", "FrozenTracker", "RefEncoderMLPModel", "WindowAdjusterModel"]

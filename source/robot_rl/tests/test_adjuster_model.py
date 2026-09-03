@@ -290,3 +290,20 @@ def test_a_missing_context_says_what_to_pass() -> None:
     online.set_active_fm_context(None)
     with pytest.raises(RuntimeError, match=r"fm_checkpoint"):
         _model(_obs())
+
+
+def test_the_rsl_rl_wrapper_refuses_a_per_control_step_env() -> None:
+    """Wrapping a plain env by mistake must fail, not train a 29-dimensional "residual".
+
+    The base wrapper reads ``num_actions`` off the action manager, which on this task holds
+    the frozen TRACKER's joints -- so the mistake is silent in the worst way: the adjuster's
+    head would be sized to 29 and the env would reject the action later, for a reason that
+    reads as a config error rather than as a wrapper assumption.
+    """
+    from types import SimpleNamespace
+
+    from robot_rl.rl.adjuster_wrapper import RslRlAdjusterVecEnvWrapper
+
+    plain = SimpleNamespace(unwrapped=SimpleNamespace())      # no `replan_period`
+    with pytest.raises(ValueError, match=r"expects an AdjusterEnv"):
+        RslRlAdjusterVecEnvWrapper(plain)
