@@ -1157,7 +1157,12 @@ class FutureStateDataset(Dataset):
             p_anchor[:, None, :], q_anchor[:, None, :], self.target_frame_names, self.blocks,
         ).contiguous()                                        # (Nw, F, D)
 
-        self._check_window_invariants(target, history, snap_ref, tw[:, 0], s_slc, f)
+        # Under ``measured`` the newest history row is adjacent to the MEASURED snap, not to
+        # the reference target -- see guard 4. Frame-invariant block, so the raw joints are
+        # the window's joints with no transform.
+        _adj = (snap_meas[:, s_slc["joint_pos"][0]:s_slc["joint_pos"][1]]
+                if cfg.history_source == "measured" else None)
+        self._check_window_invariants(target, history, snap_ref, tw[:, 0], s_slc, f, _adj)
 
         # Exteroception readings at the snap row. The recording carries either
         # ``height_scan`` (P|W, K) -- one sensor -- or ``depth`` (P|W, T, K) with one row
@@ -1581,6 +1586,7 @@ class FutureStateDataset(Dataset):
         future_node0: torch.Tensor,
         s_slc: dict[str, tuple[int, int]],
         f: int,
+        adjacent_joints: torch.Tensor | None = None,
     ) -> None:
         """Fail on the recording defects that would otherwise train a plausible wrong model.
 
@@ -1672,15 +1678,31 @@ class FutureStateDataset(Dataset):
         #    18 rad/s joint covers 0.36 rad in a step all by itself), so any fixed tolerance
         #    is either loose on slow clips or wrong on fast ones. An off-by-k history shows
         #    up as a gap ~k times the one-step gap, which this catches at any joint speed.
+        #
+        #    WHAT IT IS COMPARED AGAINST depends on the history source, and the choice is
+        #    the difference between a real check and a guaranteed failure. The gap only
+        #    means "one step" when both sides come from the SAME trajectory:
+        #
+        #    * ``reference`` -- both are the applied reference, so ``target[0]`` is the
+        #      adjacent step and this is a straight comparison.
+        #    * ``measured`` -- the history row is the ROBOT'S joints and ``target[0]`` is
+        #      the REFERENCE's, so their gap is the TRACKING ERROR, not a step of motion.
+        #      Measured on the shipped recording that is 0.070 rad against 0.016 rad per
+        #      step, i.e. it reads as 4.4 steps of misalignment and fails every window.
+        #      The adjacent quantity is instead the MEASURED state at the snap, which the
+        #      caller passes in -- same trajectory, one step apart, so the off-by-k
+        #      sensitivity is exactly as strong as for the reference arm.
         if "joint_pos" not in self.block_slices:
             return
         jp = self.block_slices["joint_pos"]
         one_step = (target[:, 1, jp] - target[:, 0, jp]).abs().mean().item()
-        hist_gap = (history[:, -1, jp] - target[:, 0, jp]).abs().mean().item()
+        against = target[:, 0, jp] if adjacent_joints is None else adjacent_joints
+        hist_gap = (history[:, -1, jp] - against).abs().mean().item()
         if hist_gap > 3.0 * one_step + 1e-4:
+            what = "target[0]" if adjacent_joints is None else "the measured snap row"
             raise ValueError(
                 f"history[-1] is {hist_gap / max(one_step, 1e-9):.1f} control steps away from "
-                f"target[0] in joint_pos (gap {hist_gap:.4f} rad vs {one_step:.4f} rad per "
+                f"{what} in joint_pos (gap {hist_gap:.4f} rad vs {one_step:.4f} rad per "
                 "step): the autoregressive history rows are misaligned against the future "
                 "window. The history block is the N rows BEFORE node 0."
             )
