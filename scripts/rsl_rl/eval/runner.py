@@ -464,7 +464,19 @@ def reference_overrides(mode: str) -> dict:
         # Same generator, same reference source, same clip placement as ``fm`` -- the ONLY
         # difference is where the history rows come from, which is what makes the paired
         # delta against ``fm`` a statement about the context and nothing else.
+        #
+        # ``allow_history_source_mismatch`` because this cell EXISTS to measure the
+        # off-distribution arm. A generator trained on reference rows will refuse to be
+        # served measured ones (``assert_history_source_matches``), and rightly so on a
+        # deploy path -- but refusing here would mean the harness could never measure the
+        # arm at all against today's checkpoints, which is the only thing there is to
+        # measure until a measured-trained generator exists. Same standing as ``fm_tf``: a
+        # deliberately non-deployable diagnostic whose nature is recorded in the cell
+        # manifest (``notes["history_from"]``) rather than inferred. Against a
+        # measured-TRAINED generator the flag is inert -- the arms agree and the guard
+        # passes on its own.
         return {"reference_source": "fm", "history_from": "measured",
+                "allow_history_source_mismatch": True,
                 "ego_anchor_fraction": None}
     raise ValueError(f"unknown reference mode {mode!r}")
 
@@ -521,6 +533,11 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
     # Recorded because ``reference_source`` alone cannot distinguish fm from fm_tf: both run
     # the generator, and the whole point of the pair is the difference between them.
     notes["history_from"] = getattr(traj, "history_from", None)
+    # Recorded beside it because the two together are what make the cell interpretable: the
+    # arm alone does not say whether the generator was FITTED on it, and a cell run under a
+    # mismatch is measuring a model fed the wrong kind of history.
+    notes["allow_history_source_mismatch"] = bool(
+        getattr(traj, "allow_history_source_mismatch", False))
     notes["ego_anchor_fraction"] = getattr(traj, "ego_anchor_fraction", None)
     notes["ego_anchor_every"] = getattr(traj, "ego_anchor_every", None)
     notes["tracking_mode"] = getattr(traj, "tracking_mode", None)
