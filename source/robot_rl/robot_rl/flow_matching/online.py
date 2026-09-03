@@ -233,6 +233,16 @@ class FmOnlineContext:
     checkpoint rather than on whatever the task config happens to say.  Defaults to the
     height scan, which is also what a checkpoint predating the selector resolves to.
     """
+    history_source: str = "reference"
+    """What the ``N`` history rows this model was FITTED on contained.
+
+    ``"reference"`` (the applied reference, and every checkpoint before the flag) or
+    ``"measured"`` (the robot's own achieved state, bar the two blocks no robot can supply).
+    The row width is identical either way, so a consumer feeding the wrong kind is
+    off-distribution with nothing to reveal it -- hence carried on the context, printed at
+    load, and checked against the serving arm by ``FmTrackingCommand`` and
+    ``GenTrackerPolicy`` alike.
+    """
     fm_snap_every: int | None = None
     """Control steps between snap (re-plan) events in the recording this model trained on.
 
@@ -600,12 +610,15 @@ def load_fm_context(
     encoder = cfg.resolve_extero_encoder()
     cfg.check_extero_encoder()
     cfg.check_attention_mode()
+    cfg.check_history_source()
     _check_extero_image_hw(cfg, meta, encoder)
     # Said out loud because nothing else can reveal it: the two attention modes share one
     # parameter set, so a checkpoint carries no structural evidence of which it was trained
     # under. If this line disagrees with what you expect, the config is what to look at.
+    # ``history_source`` is on this line for the identical reason -- same row width under
+    # either value, so the config is the only witness.
     print(f"[INFO load_fm_context] attention_mode={cfg.attention_mode} "
-          f"(extero_encoder={encoder})")
+          f"history_source={cfg.history_source} (extero_encoder={encoder})")
     # ONE construction site, shared with the trainer. ``encoder`` is the resolved name and is
     # already written back onto cfg by the dataset; assert rather than pass it separately, so
     # there is no second path by which the two could describe different models. This is also
@@ -700,6 +713,7 @@ def load_fm_context(
         reference_blocks=blocks,
         zero_noise=bool(zero_noise),
         guidance_scale=float(guidance_scale),
+        history_source=str(cfg.history_source),
         fm_snap_every=(int(meta["fm_snap_every"]) or None) if meta.get("fm_snap_every") else None,
         extero_source=str(cfg.extero_source),
         extero_sensor_count=int(cfg.extero_sensor_count),

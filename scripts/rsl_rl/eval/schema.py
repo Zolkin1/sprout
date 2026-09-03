@@ -208,9 +208,9 @@ def cell_key(reference_mode: str, dr_preset: str, fm_label: str = "-") -> str:
     """Filesystem-safe key for one grid cell.
 
     Args:
-        reference_mode: ``clip``, ``fm``, or ``fm_tf`` (the generator teacher-forced --
-            same generator as ``fm``, history from the clip). See
-            ``evaluate.REFERENCE_MODES``.
+        reference_mode: ``clip``, ``fm``, ``fm_tf`` (the generator teacher-forced -- same
+            generator as ``fm``, history from the clip) or ``fm_meas`` (same generator,
+            history from the robot's own achieved state). See ``evaluate.REFERENCE_MODES``.
         dr_preset: ``none``, ``train``, ``ood``, ...
         fm_label: The generator's label; ``-`` for the clip arm.
 

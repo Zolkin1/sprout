@@ -1,15 +1,21 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Closed-loop, robot-state-conditioned flow-matching tracking command (world-frame CLF).
+"""Closed-loop flow-matching tracking command (world-frame CLF).
 
 Extends :class:`MotionSequenceCommand`: every env tracks the **flow-matching generator**,
-which conditions on the **live robot state** history (the N most-recent measured steps, in
-the FM's xyz+yaw ground frame), an exteroception token, and the future velocity command,
-and predicts the F-step ego-anchored clip future. Because the FM is anchored on the robot's
-own xyz+yaw pose each re-plan and predicts node 0 = "now" (offset ≈ 0), no re-centering
-hack is needed -- the prediction is already in the robot's frame. This is the deploy
-counterpart of the recorded ``ego_anchored_clip_future`` training data (each re-inference
-== a snap).
+which conditions on an ``N``-row history of reference-window nodes, an exteroception token,
+and the future velocity command, and predicts the F-step ego-anchored clip future. Because
+the FM is anchored on the robot's own xyz+yaw pose each re-plan and predicts node 0 = "now"
+(offset ≈ 0), no re-centering hack is needed -- the prediction is already in the robot's
+frame. This is the deploy counterpart of the recorded ``ego_anchored_clip_future`` training
+data (each re-inference == a snap).
+
+**The history rows are NOT the measured robot state**, whatever an older version of this
+docstring said. By default they are the nodes this command SERVED at the previous ``N``
+steps -- the model's own output, which is what makes the loop autoregressive and what keeps
+odometry off the generator's critical path. ``cfg.history_from`` selects the producer:
+``"generator"`` (that default), ``"clip"`` (teacher forcing) or ``"measured"`` (the robot's
+achieved state, which really is measured, and is off-distribution because of it).
 
 **The reference is the FM and only the FM, from control step 0.** There is no clip warmup
 fallback: before the N-step history window fills, the generator is sampled with the learned
@@ -75,9 +81,13 @@ from isaaclab.utils.math import quat_apply
 
 from robot_rl.flow_matching.window import (
     DEFAULT_WINDOW_ANCHOR,
+    MEASURED_HISTORY_FALLBACK,
+    assert_history_source_matches,
+    measured_history_fallback_spans,
     reanchor_window,
     resolve_reference_blocks,
     window_to_world,
+    world_to_window,
 )
 
 from .motion_sequence_cmd import MotionSequenceCommand
@@ -299,13 +309,34 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "generator on a window that includes it."
             )
 
+        # For history_from="measured": the robot bodies whose MEASURED positions fill the
+        # ee_pos block, in the same order ``reference_window_obs`` gathers the reference's,
+        # and the node columns a robot cannot measure. Both resolved once, and only where
+        # the checkpoint's layout actually carries them -- a node without ``ee_pos`` needs
+        # no body lookup and one without ``base_vel`` has no linear half to fall back on.
+        self._measured_ee_idx: torch.Tensor | None = None
+        if "ee_pos" in self._fm_blocks:
+            body_names = list(self.robot.data.body_names)
+            self._measured_ee_idx = torch.tensor(
+                [body_names.index(nm) for nm in self.resolve_ee_frames(None)],
+                dtype=torch.long, device=dev,
+            )
+        self._measured_fallback_spans = measured_history_fallback_spans(
+            self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks)
+
         # ONE prediction buffer: the F reference-window nodes, in exactly the layout the
         # policy observes. No world-frame mirror -- ``window_to_world`` derives that on
         # demand for the diagnostic CLF and the debug ribbon, sim-side only.
-        if self.cfg.history_from not in ("generator", "clip"):
+        if self.cfg.history_from not in ("generator", "clip", "measured"):
             raise ValueError(
-                f"history_from={self.cfg.history_from!r} must be 'generator' or 'clip'."
+                f"history_from={self.cfg.history_from!r} must be 'generator', 'clip' or "
+                "'measured'."
             )
+        # The arm has to be one the CHECKPOINT was fitted for. Identical row widths either
+        # way, so a mismatch is a silently wrong conditioning rather than a load error.
+        assert_history_source_matches(
+            self.cfg.history_from, getattr(self.ctx, "history_source", None),
+            where=str(self.cfg.fm_checkpoint or "the FM checkpoint"))
         # Printed UNCONDITIONALLY. Which history the generator is eating changes the
         # result more than anything else on this command, and a message that appears only
         # in the non-default case makes "no message" ambiguous with "I did not look".
@@ -314,6 +345,19 @@ class FmTrackingCommand(MotionSequenceCommand):
                   "generator conditions on the clip's nodes, not its own -- a diagnostic "
                   "for separating a weak model from a diverging closed loop. This is NOT "
                   "deployable; there is no clip on the robot.")
+        elif self.cfg.history_from == "measured":
+            print("[INFO FmTrackingCommand] history_from='measured': the generator "
+                  f"conditions on the ROBOT'S OWN state over the last {self.ctx.N} steps, "
+                  f"except {list(MEASURED_HISTORY_FALLBACK)} which no robot can measure and "
+                  "which come from the served node. This is real but OFF-DISTRIBUTION -- "
+                  "the model was fitted on reference rows, not achieved ones.")
+            if self._seeding_enabled:
+                print("[WARN FmTrackingCommand] seed_history_from_clip="
+                      f"{self.cfg.seed_history_from_clip!r} with history_from='measured': "
+                      "each episode OPENS on clip rows and then switches to achieved ones, "
+                      "so the ring mixes two kinds of quantity for its first "
+                      f"{self.ctx.N} steps. Deliberate for opening a '*_pure' clip in phase; "
+                      "set 'never' for an arm that is measured throughout.")
         else:
             print(f"[INFO FmTrackingCommand] history_from='generator': CLOSED LOOP -- the "
                   f"generator conditions on its own last {self.ctx.N} served nodes. "
@@ -325,6 +369,11 @@ class FmTrackingCommand(MotionSequenceCommand):
         # clip on by the time the push happens -- so it is stashed a step ahead.
         self._prev_clip_node: torch.Tensor | None = None
         self._clip_node_valid = torch.zeros(n, dtype=torch.bool, device=dev)
+        # Last step's MEASURED node, for history_from="measured". Stashed a step ahead for
+        # the same reason the clip node is: the row pushed at step t must describe step t-1,
+        # and ``robot.data`` at push time already holds the state after step t's physics.
+        self._prev_measured_node: torch.Tensor | None = None
+        self._measured_node_valid = torch.zeros(n, dtype=torch.bool, device=dev)
 
         f, d, k = self.ctx.F, self.ctx.D, self.ctx.num_extra_frames
         self._pred_window = torch.zeros(n, f, d, device=dev)
@@ -740,7 +789,11 @@ class FmTrackingCommand(MotionSequenceCommand):
         repeated across its rows.
 
         Closed-loop runs never reach this: on a robot there is no clip to read, so that arm
-        keeps the null embedding and the two are deliberately allowed to differ here.
+        keeps the null embedding and the two are deliberately allowed to differ here. Nor
+        does ``history_from="measured"`` under the ``"auto"`` default -- and an explicit
+        ``"always"`` / ``"on_terrain_start"`` there mixes CLIP rows into a ring that
+        otherwise holds achieved ones, which ``_post_init`` warns about rather than refusing
+        (it is the one way to open a ``*_pure`` stair clip in phase under that arm).
 
         Args:
             env_ids: Long indices of the envs that just reset.
@@ -836,6 +889,45 @@ class FmTrackingCommand(MotionSequenceCommand):
             self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks,
         )[:, 0]
 
+    def _measured_history_node(self) -> torch.Tensor:
+        """The ROBOT'S OWN state as a window node, in the plan's frame.
+
+        The third history producer, beside the served node and the clip node, and built the
+        same way all three are: :func:`world_to_window` with the plan anchor. What differs is
+        only what is handed in as the "reference" -- here the robot's measured base pose,
+        base velocity, joints and end-effector positions.
+
+        The anchor is ``_anchor_pos`` / ``_anchor_quat``, the pose at the last re-plan, NOT
+        the robot now. That is the frame every history row lives in (the recorder substitutes
+        it into rows ``0..H-2``), and it is what the two other producers use. Under it the
+        ``base_pose`` position half is the robot's displacement SINCE the re-plan -- at most
+        ``fm_update_every`` steps of travel -- which is why this arm needs only short-horizon
+        relative odometry on a robot rather than a global base position. Note that half is
+        overwritten by the caller anyway, since this robot cannot supply it at all; it is
+        computed here so the node is complete and the substitution is one explicit step.
+
+        Joint order needs no permutation: the window's joint block is defined in the robot's
+        order and ``_post_init`` refuses a checkpoint whose order differs.
+
+        Returns:
+            ``[N, D]`` window nodes in the checkpoint's own block layout.
+        """
+        d = self.robot.data
+        root_pos = wp.to_torch(d.root_pos_w)[:, None, :]                 # [N, 1, 3]
+        root_quat = wp.to_torch(d.root_quat_w)[:, None, :]               # [N, 1, 4]
+        if self._measured_ee_idx is not None:
+            ee_w = wp.to_torch(d.body_pos_w)[:, self._measured_ee_idx, :][:, None, :, :]
+        else:
+            ee_w = root_pos.new_zeros(root_pos.shape[0], 1, 0, 3)
+        return world_to_window(
+            self._anchor_pos[:, None, :], self._anchor_quat[:, None, :],
+            root_pos, root_quat,
+            wp.to_torch(d.root_link_lin_vel_w)[:, None, :],
+            wp.to_torch(d.root_link_ang_vel_w)[:, None, :],
+            wp.to_torch(d.joint_pos)[:, None, :], wp.to_torch(d.joint_vel)[:, None, :],
+            ee_w, blocks=self._fm_blocks,
+        )[:, 0]
+
     def _push_served_node(self) -> None:
         """Push one row into the autoregressive history (see ``cfg.history_from``).
 
@@ -848,10 +940,15 @@ class FmTrackingCommand(MotionSequenceCommand):
         Under ``history_from="clip"`` it is instead the CLIP's node for the previous step:
         teacher forcing, to tell a weak model apart from a diverging loop.
 
-        Either way the row is from the PREVIOUS step, which is the convention the dataset
-        uses (the history block is the N rows BEFORE node 0). For the clip that means
-        pushing the value stashed last step, not the one available now -- ``_advance_step``
-        has already moved the clip on to the current step by the time this runs.
+        Under ``history_from="measured"`` it is the ROBOT'S OWN state at the previous step
+        (:meth:`_measured_history_node`), with the columns no robot can measure
+        (:data:`MEASURED_HISTORY_FALLBACK`) taken from the node served at that same step.
+
+        Whichever it is, the row is from the PREVIOUS step, which is the convention the
+        dataset uses (the history block is the N rows BEFORE node 0). For the clip and the
+        measured arms that means pushing the value stashed last step, not the one available
+        now -- ``_advance_step`` has already moved the clip on to the current step by the
+        time this runs, and ``robot.data`` already holds the state after this step's physics.
 
         Before the first inference (and for the first ``N`` steps after a reset) there is
         nothing real to push; zeros go in and :meth:`BatchedHistory.null_mask` tells the model
@@ -864,6 +961,28 @@ class FmTrackingCommand(MotionSequenceCommand):
                                      torch.zeros_like(stash)))
             self._prev_clip_node = self._clip_history_node()
             self._clip_node_valid = torch.ones_like(self._pred_valid)
+        elif self.cfg.history_from == "measured":
+            stash = self._prev_measured_node
+            served = self._prev_served_node
+            # Both stashes describe step t-1 at this instant -- the measured one was taken
+            # at the end of that step and ``_prev_served_node`` is set at the end of
+            # ``_snapshot_and_infer``, so the substitution below pairs the SAME step. Doing
+            # it at stash time instead would pair a measured row for step t with a served
+            # node for step t-1, off by one control step of travel.
+            valid = self._measured_node_valid & self._pred_valid
+            if stash is None or served is None:
+                # Nothing real to push: either the robot has no previous step or the
+                # generator has served nothing, and 3 of the row's columns can only come
+                # from the latter. A row that is part measurement and part zero is not a
+                # row the model has ever seen, so the whole thing goes in as zeros and the
+                # null-history embedding covers it -- exactly as the other two arms do.
+                node = torch.zeros_like(self._pred_window[:, 0])
+            else:
+                node = torch.where(valid[:, None], stash, torch.zeros_like(stash))
+                for a, b in self._measured_fallback_spans:
+                    node[:, a:b] = torch.where(valid[:, None], served[:, a:b], node[:, a:b])
+            self._prev_measured_node = self._measured_history_node()
+            self._measured_node_valid = torch.ones_like(self._pred_valid)
         else:
             stash = self._prev_served_node
             node = (torch.zeros_like(self._pred_window[:, 0]) if stash is None
@@ -1042,6 +1161,10 @@ class FmTrackingCommand(MotionSequenceCommand):
             # anyway, but leaving stale data in the ring to be masked is the kind of thing
             # that stops being masked the moment someone changes the warmup.
             self._clip_node_valid = self._clip_node_valid & ~just_reset
+            # Same for the measured stash, and for a sharper reason: it is the robot's pose
+            # on the PREVIOUS tile, so pushing it would hand the generator a metres-wide
+            # step in base_pose that reads as a fall rather than as a reset.
+            self._measured_node_valid = self._measured_node_valid & ~just_reset
 
         self._history.invalidate(just_reset)
         self._push_served_node()

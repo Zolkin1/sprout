@@ -482,6 +482,167 @@ classification failure, and `scripts/rsl_rl/eval/terrain_class.py` is the instru
 Keep the two apart: obstacle avoidance is an operator-level or planner-level concern that
 this stack does not have and should not grow by accident.
 
+# The generator's history has THREE producers, and only two say the same kind of thing
+
+`history_from` decides what fills the FM's `N` context rows. They are reference-window
+nodes, identical in width whatever fills them, so a mislabelled run is invisible to every
+shape check -- which is why the arm is printed unconditionally by both runtimes and stamped
+into every manifest.
+
+| arm | a row is | available on a robot |
+|---|---|---|
+| `generator` (default) | the node this runtime SERVED that step -- its own output | yes, and it is what deploys |
+| `clip` | the CLIP's node for that step (teacher forcing) | no -- there is no clip |
+| `measured` | the ROBOT'S OWN achieved state that step | yes, in principle (see below) |
+
+**The first two both mean "the reference applied at that step"; only `measured` is a
+different kind of quantity**, and that is the point of it. The model is FITTED on reference
+rows (`dataset` builds history from `history_ref`, using `history_state` only for the
+per-row anchor), so the closed loop is distribution-consistent in kind and merely drifting,
+while `measured` is real and off-distribution.
+
+**Two of the five node blocks fall back to the prediction, because no robot can measure
+them** (`window.MEASURED_HISTORY_FALLBACK`, mirrored in `window_np`): `base_pose`'s POSITION
+half (no odometry) and `base_vel`'s LINEAR half (no base velocity estimate). Named at
+HALF-block granularity because that is where the answer changes -- falling back over the
+whole parent blocks would replace the robot's own orientation and angular velocity too,
+leaving an arm barely measured at all, at exactly the same width. The rest is measured:
+orientation from the IMU plus the heading change since the plan anchor, angular velocity
+from the gyro, joints from the encoders. **38 of the deployed layout's 44 dims.**
+
+**Under `window_anchor="plan"` this arm is not hardware-impossible.** History rows share the
+PREVIOUS plan's anchor, so the position half is the robot's displacement over at most
+`fm_update_every` control steps (0.24 s at K=12) -- short-horizon relative odometry, which
+leg odometry can supply, not the global base position the `plan` convention exists to avoid.
+`TODO(measured-history-odometry)` sits on the fallback list; the gap numbers below say the
+expected gain from closing it is small.
+
+**Both stashes must describe the SAME step.** The row pushed at step `t` describes `t-1`, so
+the substitution pairs `_prev_measured_node` with `_prev_served_node` at PUSH time, where
+both hold `t-1`. Doing it at stash time instead pairs a measured row for `t` with a served
+node for `t-1` -- off by one step of travel, in the three columns that carry where the robot
+is. A row is also **all-or-nothing**: before the first plan, three columns can come from
+nowhere, and part-measurement-part-zero is a row training never presented, so the whole row
+goes in as zeros under the null-history embedding.
+
+## How far off-distribution it is, measured (2026-09-02)
+
+`scripts/flow_matching/measured_history_gap.py`, one script over two sources, reporting the
+gap in the units the model sees (the state normalizer's per-dimension sigmas, so 1.0 = a
+full sigma of that block's training spread). Against the deployed pair:
+
+| block | role | sigma p50 | physical p50 |
+|---|---|---|---|
+| `base_pos` | fallback | 0.019 | 1.3 cm |
+| `base_rot6d` | **measured** | **0.029** | 3.9 deg |
+| `base_lin_vel` | fallback | 0.150 | 0.13 m/s |
+| `base_ang_vel` | **measured** | **0.694** | 0.48 rad/s |
+| `joint_pos` | **measured** | **0.540** | 0.079 rad |
+
+- **The two blocks a robot CANNOT measure are the two that move LEAST** (0.019 / 0.150). So
+  the hardware constraint costs almost nothing -- the hybrid captures essentially all the
+  available grounding -- and odometry would buy little. That is a result, not an assumption.
+- **The arm IS substantially off-distribution**: 0.54 and 0.69 sigma on two measured blocks
+  is a different input distribution, not a perturbation. Read any `fm_meas` result against
+  this table, not as a clean grounding experiment. A matched retrain (recorder change ->
+  re-record -> `history_source` in the dataset) is what would fix it, and is NOT done.
+- Two sources agree, which is the cross-check: `--rollout` (served-vs-measured, closed loop,
+  `logs/rollouts/v4_big`, joint_pos only) gives 0.518 against `--recording`'s 0.540
+  (applied-reference-vs-measured, the FM's own 200k-window training set on talos).
+- `stairs_dn_pure` is the outlier again -- 0.866 joint_pos, 0.084 rot6d, ~3x the others.
+- **Only the per-block NORM is anchor-free**, and that is what makes the snap-row measurement
+  valid at all: the anchor position cancels out of a DIFFERENCE and its yaw is a rotation,
+  which preserves norms (every block's normalizer entries are equal within the block, so
+  normalizing does not break it). The per-COMPONENT split of the base blocks is NOT anchor-
+  free, so it is not reported. `--self_check` asserts both halves -- norms invariant under a
+  deliberately wrong anchor, base components moved by it -- and the two tolerances are 100x
+  apart on purpose: the recorded rows are float32, so an invariant moves ~1e-7, while a
+  random yaw moves a component by O(0.1).
+- The offset sweep in `--rollout` mode is a real check, not a convenience: `history[3]`
+  pairs with `proprio[8]`, and the sweep MEASURES that (interior minimum at offset 5)
+  rather than trusting a reading of the push order. The test is that the minimum is
+  INTERIOR, not that it is deep -- one control step barely moves a joint next to the
+  tracking error, so the curve is legitimately shallow.
+
+## Where the arm is wired
+
+- Isaac: `history_from="measured"` on the command; eval cell `fm_meas` joins `clip`/`fm`/
+  `fm_tf` (`reference_overrides` gives it `ego_anchor_fraction=None` like `fm`, NOT `1.0`
+  like `fm_tf` -- no clip row reaches the generator, and pinning it would make the arm differ
+  from `fm` in two ways at once and destroy the pairing).
+- MuJoCo/deploy: `gen_tracker_runner.py --history_from measured`, and an mjeval ARM
+  dimension (`baseline_meas`) so one tracker can appear twice differing only in this.
+  **There is no `clip` arm on the deploy side** and the ctor refuses one by name.
+- **`--history_from measured` is a hard exit with `--fm_lead_ticks` / `--dump_replay`**: both
+  exist to line this runner up against the C++ runtime, which has no measured arm at all, so
+  `compare_replay.py` would report a divergence that is the harness's fault.
+- Verified running in MuJoCo sim2sim on flat at 0.8 m/s: both arms survive 8 s, and 130 of
+  135 logged columns differ (the 5 that do not are `time`, the three command channels and
+  `fell`) -- so the arm is live rather than a silent no-op, and the generator's own plan
+  moves by up to 0.37 m.
+
+## The measured arm looks CATASTROPHIC on x0=0 and roughly NEUTRAL on real draws (2026-09-03)
+
+3 stairs_up courses x 3 speeds = 9 cells per arm, paired exactly on (course, speed) -- same
+tracker, same generator (`2026-08-25_09-03-39_plan_v1_h64_27M_nojumpoff`), only the history
+source differs. Run once on the deterministic draw and then on four Gaussian seeds:
+
+| run | `baseline` (served) | `baseline_meas` | paired delta |
+|---|---|---|---|
+| `x0 = 0` (`measured_history_9cell`) | **0.889** | **0.000** | **-0.889** |
+| seed 0 (`measured_history_seed0`) | 0.556 | 0.222 | -0.333 |
+| seed 1 | 0.333 | 0.111 | -0.222 |
+| seed 2 | 0.222 | 0.222 | 0.000 |
+| seed 3 | 0.111 | 0.222 | **+0.111** |
+| **4 seeds pooled (36 cells)** | **0.306** | **0.194** | **-0.111** |
+
+**The deterministic draw overstates the gap by ~8x, and the single-run conclusion drawn
+from it was wrong.** Almost all of the -0.889 is the BASELINE being flattered: it goes
+0.889 -> 0.306 the moment the noise is the noise the model was trained under. The measured
+arm moves far less (0.000 -> 0.194). Over the four seeds the delta ranges -0.333 to +0.111
+and the SIGN FLIPS -- seed 3 has the measured arm ahead, seed 2 ties -- so at 36 cells this
+is "not resolvable", not "catastrophic".
+
+That is `fm_variance_probe`'s finding again, harder: `zero_noise` is not a neutral sample,
+it sits near the conditional's mode, and **any single-draw A/B on this stack is measuring
+the draw as much as the arms.** Both mjeval and the seed sweep default to `x0 = 0` because
+that is what the hardware controller runs, so the trap is on by default -- pass
+`--gaussian_noise --fm_seed N` across several `--out` directories for anything that has to
+hold for the model.
+
+**What survives:** the measured arm is not better, and there is no evidence it helps. What
+does NOT survive is "it breaks the generator". The eval-only question is still answered
+"not worth shipping", but the honest reason is "no measurable gain", not "collapse".
+
+**The seed sweep needed three fixes before it could mean anything**, all of the same shape:
+- `runner.py` wrote `ZERO_NOISE_SEED` into every row's `seed` column unconditionally, so a
+  seeded run recorded `-1` -- the one thing a seed sweep exists to record. Now
+  `ArmRun.recorded_seed`.
+- the table's and manifest's `zero_noise` were the literal `True`, so a Gaussian run
+  recorded itself as deterministic. Now read off the loaded policy.
+- **the noise stream was never re-keyed per episode.** `GenTrackerPolicy` builds one RNG at
+  construction and draws once per re-plan, so an episode's noise depended on how many
+  re-plans every episode before it made -- and an arm that falls early makes fewer. The two
+  arms would have been scored on different draws from the first differing cell onward,
+  drifting further apart the longer the sweep ran, with clean-looking tables throughout.
+  `GenTrackerPolicy.reseed` plus a per-cell key `(fm_seed, terrain_idx, speed_idx)` fixes
+  it; `reseed` is deliberately NOT part of `reset()`, since whether an episode resumes or
+  restarts a stream is the harness's experiment design.
+
+Read with the limits: **3 courses, all `stairs_up`** (`--max_courses 3` takes the
+catalogue's first three, and the six ascending flights come first), so it is not a
+cross-family read; and the pooled baseline of 0.306 says this cell set is hard for both
+arms. The sign-flip p on any single run is **0.2499 against a floor of 0.2500** -- fully
+SATURATED at three courses, so quote effects, never the p. The gap table was measured on the
+deployed `2026-08-22` generator and on this `2026-08-25` one (0.540 vs 0.518 on `joint_pos`),
+so the reading does not hinge on which of the two ran.
+
+`view_cell.py` replays any of these cells and asserts the replay reproduced the recorded
+row; it now reads `history_from` / `zero_noise` / `fm_seed` off the table rather than
+defaulting them (it would otherwise have replayed a `baseline_meas` cell as the generator
+arm, silently) and lists the arms and cells a run actually covered rather than every one the
+`ARMS` table declares.
+
 # Two families are excluded from FM training BY DEFAULT
 
 Both because the generator cannot be asked to predict what it cannot see, and both are

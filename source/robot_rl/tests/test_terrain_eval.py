@@ -1239,9 +1239,20 @@ def test_teacher_forcing_ego_anchors_the_clip_it_reads_history_from():
 
 
 def test_every_mode_states_history_from_rather_than_inheriting_it():
-    """A task default must not be able to turn an `fm` cell into a teacher-forced one."""
+    """A task default must not be able to turn an `fm` cell into a teacher-forced one.
+
+    The accepted set is read off the COMMAND's own validation rather than restated here: a
+    new arm added there and forgotten in a mode mapping is the failure worth catching, and a
+    literal list in this test would instead fail on the arm's arrival and be widened.
+    """
+    src = (REPO / "source" / "robot_rl" / "robot_rl" / "tasks" / "manager_based"
+           / "robot_rl" / "mdp" / "commands" / "traj_tracking"
+           / "fm_tracking_cmd.py").read_text()
+    accepted = set(re.findall(r'history_from not in \(([^)]*)\)', src)[0]
+                   .replace('"', "").split(", "))
+    assert accepted, "could not read the accepted history_from arms off the command"
     for mode in ev.REFERENCE_MODES:
-        assert rn.reference_overrides(mode)["history_from"] in ("generator", "clip")
+        assert rn.reference_overrides(mode)["history_from"] in accepted
 
 
 def test_reference_overrides_refuses_an_unknown_mode():

@@ -16,6 +16,7 @@ from .config import (
     EXTERO_ENCODERS,
     EXTERO_NORM_MODES,
     EXTERO_SOURCES,
+    HISTORY_SOURCES,
     FlowMatchingConfig,
 )
 from .ema import WeightEMA
@@ -67,6 +68,10 @@ from .transforms import (
 )
 from .window import (
     BASE_POSE_CONVENTION,
+    HISTORY_ARM_SOURCE,
+    MEASURED_HISTORY_FALLBACK,
+    assert_history_source_matches,
+    measured_history_fallback_spans,
     REFERENCE_BLOCK_KEYS,
     REFERENCE_WINDOW_BLOCK_NAMES,
     REFERENCE_WINDOW_NOISE,
@@ -92,6 +97,11 @@ __all__ = [
     "EXTERO_NORM_MODES",
     "EXTERO_CLIP",
     "ATTENTION_MODES",
+    "HISTORY_SOURCES",
+    "HISTORY_ARM_SOURCE",
+    "MEASURED_HISTORY_FALLBACK",
+    "assert_history_source_matches",
+    "measured_history_fallback_spans",
     "FlowMatchingTransformer",
     "ExteroImageEncoder",
     "ExteroImageEncoderSet",

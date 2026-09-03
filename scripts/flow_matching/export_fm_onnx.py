@@ -214,6 +214,11 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # the graph is opaque and folds the whole sampler in -- but a loaded artifact should
         # be able to say which architecture it is, because nothing in the weights can.
         "attention_mode": str(ctx.model.attention_mode),
+        # What the N history rows CONTAIN -- the applied reference, or the robot's own
+        # achieved state. Same row WIDTH either way, so this is the only thing that can say
+        # which, and the runtimes refuse a pair whose serving arm disagrees with it. Absent
+        # in graphs exported before the flag, which are definitionally "reference".
+        "history_source": str(getattr(ctx, "history_source", "reference")),
         # What the history tokens must be built from, and the re-plan period the targets
         # were cut at. Both are contracts the runtime has to honour, not descriptions: a
         # deployment feeding a measured history to a partially autoregressive model, or

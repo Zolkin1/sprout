@@ -75,6 +75,9 @@ DEFAULT_ROBOTS = {
     "fm_tf/none": 25,
     "fm_tf/train": 25,
     "fm_tf/ood": 25,
+    "fm_meas/none": 25,
+    "fm_meas/train": 25,
+    "fm_meas/ood": 25,
 }
 
 #: Tasks the harness defaults to.  The tracker task is used for BOTH arms so that "success"
@@ -102,10 +105,20 @@ DEFAULT_MAX_OFFSET = 50
 #:                 with ``fm`` on clip id, and the DIFFERENCE between them is the exposure
 #:                 bias -- the measurement that says whether to attack the loop or the model.
 #:                 Not deployable: there is no clip on the robot.
-REFERENCE_MODES = ("clip", "fm", "fm_tf")
+#: * ``fm_meas`` -- the generator drives it, but its history is the ROBOT'S OWN achieved
+#:                 state (``history_from='measured'``), except the base position and linear
+#:                 velocity, which no robot can measure and which come from the served node.
+#:                 Between the other two in how grounded the context is: real rather than
+#:                 self-generated, but off-distribution, because the model was fitted on
+#:                 reference rows and an achieved row is a different kind of quantity.
+#:                 ``scripts/flow_matching/measured_history_gap.py`` measures by how much
+#:                 (0.03 sigma on base orientation, 0.54 on joints, 0.69 on angular
+#:                 velocity), so read this arm against that rather than as a clean
+#:                 grounding experiment. Deployable in principle, unlike ``fm_tf``.
+REFERENCE_MODES = ("clip", "fm", "fm_tf", "fm_meas")
 
 #: Modes that need a generator loaded.
-FM_MODES = ("fm", "fm_tf")
+FM_MODES = ("fm", "fm_tf", "fm_meas")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -430,6 +430,11 @@ def reference_overrides(mode: str) -> dict:
       cost of getting this wrong: 18/24 instead of 22/24.
     * ``fm`` -- ``None``.  The generator's plan is the reference; the clip placement does not
       feed it, so the task's deploy default (0.0) is what should run.
+    * ``fm_meas`` -- ``None``, for the SAME reason as ``fm`` and pointedly not ``fm_tf``'s.
+      The history is the robot's own achieved state, so no clip row reaches the generator
+      and re-anchoring the clip would change only where the robot is asked to go, not what
+      it conditions on.  Pinning it to 1.0 here would make ``fm_meas`` differ from ``fm`` in
+      two ways at once and destroy the pairing that is the whole point of the arm.
 
     The CADENCE (``ego_anchor_every``) is never pinned here -- pinning it to 1 is what made
     base-position error identically zero in earlier sweeps.
@@ -455,6 +460,12 @@ def reference_overrides(mode: str) -> dict:
         # Same generator, same reference SOURCE -- only the autoregressive context differs.
         return {"reference_source": "fm", "history_from": "clip",
                 "ego_anchor_fraction": 1.0}
+    if mode == "fm_meas":
+        # Same generator, same reference source, same clip placement as ``fm`` -- the ONLY
+        # difference is where the history rows come from, which is what makes the paired
+        # delta against ``fm`` a statement about the context and nothing else.
+        return {"reference_source": "fm", "history_from": "measured",
+                "ego_anchor_fraction": None}
     raise ValueError(f"unknown reference mode {mode!r}")
 
 

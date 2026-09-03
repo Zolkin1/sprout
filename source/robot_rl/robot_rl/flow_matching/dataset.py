@@ -725,6 +725,70 @@ def _stack_frame_positions(split_fn, frame_names: list[str]) -> torch.Tensor:
     return torch.stack([split_fn(f"{f}:pos_w") for f in frame_names], dim=-2)
 
 
+#: Raw ``state_term_names`` a MEASURED history row takes from the APPLIED REFERENCE instead
+#: of from the robot, because no robot can measure them.
+#:
+#: The window-level names are ``window.MEASURED_HISTORY_FALLBACK`` -- ``base_pos`` and
+#: ``base_lin_vel``. These are the raw terms ``world_to_window`` reads each of them out of,
+#: so splicing here is equivalent to splicing the built window's spans and costs one pass
+#: instead of two. Kept as a separate tuple rather than derived, because the mapping from a
+#: window half to a state term is not something either module can compute: it is the
+#: definition of the block.
+MEASURED_HISTORY_FALLBACK_TERMS: tuple[str, ...] = ("root_pos_w", "root_link_lin_vel_w")
+
+
+def _check_measured_lag_alignment(dls: torch.Tensor, hs_sel: torch.Tensor, H: int,
+                                  s_slc: dict[str, tuple[int, int]]) -> None:
+    """Assert ``depth_lag_state`` lag ``k`` really is ``history_state`` row ``H-1-k``.
+
+    The measured history build rests entirely on that identity, and it is an identity
+    between two arrays the recorder fills in different places -- so it is checked on the
+    data rather than trusted from the code. Two halves, and BOTH are needed:
+
+    * lag 0 must equal row ``H-1`` in FULL. That row is the snap, which the recorder leaves
+      measured, so this pins the lag indexing with no substitution in the way.
+    * for lag ``k >= 1``, the PRESERVED columns (everything past ``root_quat_w``) must match
+      row ``H-1-k`` exactly, while the pose columns must DIFFER -- the latter being the plan
+      anchor the recorder substituted. Without the "must differ" half the check would pass
+      on a recording that never substituted anything, where these rows would not be plan-
+      anchored and the whole history frame would be wrong.
+
+    Args:
+        dls: ``(Nw, L, node)`` ``depth_lag_state`` for the selected windows.
+        hs_sel: ``(Nw, H, node)`` ``history_state`` for the same windows.
+        H: History-ring length.
+        s_slc: Term-name -> ``(start, stop)`` for one state row.
+
+    Raises:
+        ValueError: If either half fails.
+    """
+    pose_end = s_slc["root_quat_w"][1]
+    if not torch.equal(dls[:, 0, :], hs_sel[:, H - 1, :]):
+        d = float((dls[:, 0, :] - hs_sel[:, H - 1, :]).abs().max())
+        raise ValueError(
+            f"depth_lag_state lag 0 != history_state row {H - 1} (max |diff| {d:.3e}). Those "
+            "are both the measured state at the snap, so the lag index is not a history-row "
+            "index in this recording and the measured history would be built from the wrong "
+            "steps.")
+    for k in range(1, int(dls.shape[1])):
+        row = H - 1 - k
+        if row < 0:
+            break
+        keep = (dls[:, k, pose_end:] - hs_sel[:, row, pose_end:]).abs().max()
+        if float(keep) != 0.0:
+            raise ValueError(
+                f"depth_lag_state lag {k} and history_state row {row} disagree on the "
+                f"PRESERVED columns (max |diff| {float(keep):.3e}); they should be the same "
+                "measured row. The lag/row alignment does not hold in this recording.")
+        pose = (dls[:, k, :pose_end] - hs_sel[:, row, :pose_end]).abs().max()
+        if float(pose) == 0.0:
+            raise ValueError(
+                f"depth_lag_state lag {k} and history_state row {row} AGREE on the root "
+                "pose, but the recorder is supposed to have substituted the plan anchor "
+                "there. This recording's history rows are therefore not plan-anchored, so "
+                "the frame the measured rows would be observed in is not the trained one.")
+
+
 def _rows_to_window(
     split_fn,
     anchor_pos: torch.Tensor,
@@ -1015,6 +1079,40 @@ class FutureStateDataset(Dataset):
             snap_meas = hs_state[sel][:, H - 1, :]           # (Nw, node) robot at the snap
             snap_ref = hr[sel][:, H - 1, :]                  # (Nw, node) reference at the snap
             tw = rf_t[sel]                                   # (Nw, F, node)
+            # -- history_source="measured": the ROBOT'S OWN rows ------------------------
+            # ``history_state`` cannot supply them: the recorder substitutes the plan anchor
+            # into rows 0..H-2, cols 0:7, so the measured root POSE of every non-snap row is
+            # gone from there. ``depth_lag_state`` is the same ``_assemble_state`` cloned
+            # BEFORE that substitution, at lags 0..depth_lag_steps, and lag k is row H-1-k --
+            # verified bit-exact on the shipped recordings (lag 0 vs row H-1 is 0.000e+00,
+            # and lags 1..3 match rows 6/5/4 on every preserved column while differing on
+            # 0:7, which is the substitution).
+            hw_src = hw_ref
+            if cfg.history_source == "measured":
+                if data.get("depth_lag_state") is None:
+                    raise ValueError(
+                        "history_source='measured' needs the un-overwritten measured state, "
+                        "which lives in 'depth_lag_state'; this recording has none (it was "
+                        "written without depth). Re-record, or train with "
+                        "history_source='reference'.")
+                dls = torch.from_numpy(
+                    np.ascontiguousarray(data["depth_lag_state"])).float()[sel]
+                cfg.check_history_source(available_lags=int(dls.shape[1]) - 1)
+                # Lags n..1, oldest first, matching the history block's row order.
+                hw_src = dls[:, torch.arange(n, 0, -1), :].clone()
+                _check_measured_lag_alignment(dls, hs_state[sel], H, s_slc)
+                # THE FALLBACK, spliced in the RAW row rather than in the built window.
+                # ``world_to_window`` reads the base position out of ``root_pos_w`` and the
+                # linear velocity out of ``root_link_lin_vel_w``, so substituting those two
+                # terms from the reference row yields exactly the node the deploy runtime
+                # serves: there the same two blocks come from the SERVED node, whose
+                # base_pose[0:3] is R_planyawT (p_ref - p_plan) -- the identical quantity,
+                # since a served node IS the applied reference. Splicing here also keeps one
+                # ``_rows_to_window`` call instead of building the window twice and
+                # overwriting half of it.
+                for term in MEASURED_HISTORY_FALLBACK_TERMS:
+                    a, b = s_slc[term]
+                    hw_src[..., a:b] = hw_ref[..., a:b]
         else:
             idx_all = np.stack(windows).astype(np.int64)     # (Nw, N+1); last = snap
             idx_hist, snap_rows = idx_all[:, :-1], idx_all[:, -1]
@@ -1027,18 +1125,29 @@ class FutureStateDataset(Dataset):
                     "current record_data.py."
                 )
             ref_t = torch.from_numpy(np.ascontiguousarray(data["ref_state"])).float()
+            if cfg.history_source == "measured":
+                raise ValueError(
+                    "history_source='measured' is not implemented for the legacy per-step "
+                    "(.npz) format. It would be easy and pointless: that path anchors every "
+                    "row on its OWN step rather than on the plan, so a measured row's base "
+                    "block would be ~zero by construction and carry nothing. Use a windowed "
+                    "recording.")
             hw_meas = state_t[idx_hist]                      # (Nw, N, node)
             hw_ref = ref_t[idx_hist]                         # (Nw, N, node)
+            hw_src = hw_ref
             snap_meas = state_t[snap_rows]                   # (Nw, node)
             snap_ref = ref_t[snap_rows]
             tw = rf_t[snap_rows]                             # (Nw, F, node)
 
         p_anchor, q_anchor = _p(snap_meas), _q(snap_meas)    # (Nw, 3) / (Nw, 4)
 
-        # -- history: the emitted reference at lags n..1, all in the PLAN's frame (windowed;
-        # the legacy per-step path still anchors each row on its own step) --
+        # -- history: lags n..1, all in the PLAN's frame (windowed; the legacy per-step path
+        # still anchors each row on its own step). ``hw_src`` is the applied reference under
+        # ``history_source="reference"`` and the robot's own state (bar the two unmeasurable
+        # blocks) under ``"measured"``; the ANCHOR is the plan pose either way, which is what
+        # every history row is observed in.
         history = _rows_to_window(
-            lambda name: hw_ref[..., s_slc[name][0]:s_slc[name][1]],
+            lambda name: hw_src[..., s_slc[name][0]:s_slc[name][1]],
             _p(hw_meas), _q(hw_meas), self.target_frame_names, self.blocks,
         ).contiguous()                                        # (Nw, n, D)
 

@@ -317,6 +317,108 @@ def window_block_slices(
     return out
 
 
+#: Node content a MEASURED history row cannot fill on a ROBOT, and therefore takes from the
+#: node the runtime last SERVED instead.
+#:
+#: The G1 has no odometry and no base linear-velocity estimate, so a history row built from
+#: the robot's own state can supply its orientation (IMU roll/pitch, plus the heading change
+#: since the plan anchor, which is at most ``fm_update_every`` steps of gyro), its angular
+#: velocity and its joints -- but not where the base IS or how fast it is travelling. Those
+#: two come from the prediction, which is what the closed loop would have used anyway.
+#:
+#: Named at HALF-BLOCK granularity because that is where the answer changes: ``base_pose``
+#: is one block in the layout but its position half is unmeasurable while its rotation half
+#: is not, and reporting or serving them together would hide that.
+#:
+#: TODO(measured-history-odometry): leg odometry gives the base displacement over the few
+#: steps since the plan anchor, which is all the ``plan`` convention needs, and a base
+#: velocity estimate would close the other one. Revisit both entries then -- and note the
+#: gap probe measures these two as the SMALLEST of the five, so the expected gain is small.
+MEASURED_HISTORY_FALLBACK: tuple[str, ...] = ("base_pos", "base_lin_vel")
+
+#: Where each :data:`MEASURED_HISTORY_FALLBACK` name sits inside its parent block.
+_FALLBACK_HALVES: dict[str, tuple[str, int, int]] = {
+    "base_pos": ("base_pose", 0, 3),        # the position half of base_pose
+    "base_lin_vel": ("base_vel", 0, 3),     # the linear half of base_vel
+}
+
+
+#: ``history_from`` serving arm -> the ``history_source`` a checkpoint must declare for it.
+#: ``"clip"`` maps to ``"reference"``: teacher forcing feeds the clip's node, which IS an
+#: applied reference, so it is the same KIND of row the reference-trained model expects.
+HISTORY_ARM_SOURCE: dict[str, str] = {
+    "generator": "reference",
+    "clip": "reference",
+    "measured": "measured",
+}
+
+
+def assert_history_source_matches(history_from: str, checkpoint_source: str | None,
+                                  where: str = "") -> None:
+    """Refuse a serving arm the checkpoint was not fitted for.
+
+    The two history kinds produce rows of IDENTICAL width, so a mismatch loads clean, runs,
+    and is merely wrong -- the same failure shape as ``window_anchor`` and
+    ``attention_mode``. Nothing downstream can catch it, which is why this is a hard refusal
+    at load rather than a warning.
+
+    A ``None`` checkpoint source means the artifact predates the flag, which is
+    definitionally ``"reference"`` -- resolved by the caller's config loader, not silently
+    permitted here.
+
+    Args:
+        history_from: The runtime's serving arm.
+        checkpoint_source: What the checkpoint says it trained on.
+        where: Optional context for the message (an artifact path).
+
+    Raises:
+        ValueError: On an unknown arm, or an arm the checkpoint does not match.
+    """
+    want = HISTORY_ARM_SOURCE.get(history_from)
+    if want is None:
+        raise ValueError(
+            f"history_from={history_from!r} is not one of {sorted(HISTORY_ARM_SOURCE)}.")
+    got = str(checkpoint_source or "reference")
+    if got != want:
+        raise ValueError(
+            f"history_from={history_from!r} needs a generator trained with "
+            f"history_source={want!r}, but {where or 'this checkpoint'} declares "
+            f"history_source={got!r}.\n"
+            "The two produce history rows of the SAME WIDTH, so this would load and run and "
+            "simply feed the model a kind of history it was never fitted on. Either serve "
+            f"the arm it was trained for, or point at a {want!r}-trained generator.")
+
+
+def measured_history_fallback_spans(
+    num_joints: int, num_ee_frames: int, blocks: Sequence[str] | None = None
+) -> tuple[tuple[int, int], ...]:
+    """Column spans of :data:`MEASURED_HISTORY_FALLBACK` within one window node.
+
+    Returned as spans rather than as a mask so the torch and numpy runtimes can each build
+    their own without this module having to know which array library is asking -- the same
+    reason :func:`window_block_slices` returns slices rather than indices.
+
+    A fallback whose parent block is not in the selection contributes nothing: a checkpoint
+    that does not carry ``base_vel`` has no linear-velocity half to fall back on.
+
+    Args:
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: Subset to include; defaults to all of them.
+
+    Returns:
+        ``((start, stop), ...)`` in packing order.
+    """
+    slices = window_block_slices(num_joints, num_ee_frames, blocks)
+    out = []
+    for name in MEASURED_HISTORY_FALLBACK:
+        parent, lo, hi = _FALLBACK_HALVES[name]
+        if parent in slices:
+            base = slices[parent].start
+            out.append((base + lo, base + hi))
+    return tuple(out)
+
+
 def expand_window_blocks(
     num_joints: int,
     num_ee_frames: int,

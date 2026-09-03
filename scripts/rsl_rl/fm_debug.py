@@ -981,12 +981,13 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Run without a viewport (default). --no_headless opens the Isaac "
                           "GUI with the reference ribbons drawn.")
     run.add_argument("--no_headless", dest="headless", action="store_false")
-    run.add_argument("--history_from", default="generator", choices=["generator", "clip"],
+    run.add_argument("--history_from", default="generator",
+                     choices=["generator", "clip", "measured"],
                      help="What the generator's autoregressive history holds: its own last "
-                          "served nodes ('generator', the closed loop) or the clip's nodes "
-                          "('clip', teacher forcing). Running both at identical robot "
-                          "states is what separates the model's per-plan error from its "
-                          "own history drift.")
+                          "served nodes ('generator', the closed loop), the clip's nodes "
+                          "('clip', teacher forcing) or the robot's own achieved state "
+                          "('measured'). Running these at identical robot states is what "
+                          "separates the model's per-plan error from its own history drift.")
     run.add_argument("--ego_anchor_every", type=int, default=12,
                      help="Clip-mode re-anchor cadence, in control steps. Default 12 = the "
                           "trained value (params/conventions.yaml) and the generator's K, so "

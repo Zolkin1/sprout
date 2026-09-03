@@ -158,6 +158,18 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     * ``"clip"`` -- the nodes the CLIP reference would have produced at those same steps,
       anchored the same way. Teacher forcing: the generator still predicts the future and
       the tracker still follows it, but the context it conditions on is always correct.
+    * ``"measured"`` -- the ROBOT'S OWN state at those steps, as a window node in the same
+      frame. Where the other two arms both say "the reference applied at that step", this
+      one says "where the robot actually got to", which is a different kind of quantity and
+      not one the model was fitted on -- see :data:`MEASURED_HISTORY_FALLBACK` for the two
+      blocks a robot cannot supply, and ``scripts/flow_matching/measured_history_gap.py``
+      for how far off-distribution the rest of the row lands.
+
+    ``"measured"`` sits between the other two in how grounded the context is: teacher
+    forcing is correct-by-construction and unavailable on a robot, the closed loop is the
+    model's own drifting output, and this is real but off-distribution. Unlike ``"clip"`` it
+    IS deployable in principle -- under ``window_anchor="plan"`` it needs the base
+    displacement over at most ``fm_update_every`` control steps, not global odometry.
 
     This is the experiment that separates the two failure modes that look identical from
     the outside. The model is trained on clip history and deployed on its own, so if the
@@ -171,8 +183,8 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     * ``"clip"`` also bad in a way ``val_flow_mse`` did not predict -> the offline metric
       is not measuring what the tracker needs.
 
-    Not available at deploy: there is no clip on the robot. ``transfer/deploy`` implements
-    the generator path only."""
+    ``"clip"`` is not available at deploy -- there is no clip on the robot.
+    ``"generator"`` and ``"measured"`` both are, and ``transfer/deploy`` implements both."""
 
     fm_guidance_scale: float = 1.0
     """Classifier-free guidance weight ``w`` over the FM's HISTORY conditioning.

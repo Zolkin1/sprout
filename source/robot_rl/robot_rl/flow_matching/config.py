@@ -109,6 +109,10 @@ DEFAULT_SKIP_FAMILIES: tuple[str, ...] = ("family_jump_off",)
 #: Recognised :attr:`FlowMatchingConfig.attention_mode` values.
 ATTENTION_MODES: tuple[str, ...] = ("full", "prefix")
 
+#: What the ``N`` history rows contain; see :attr:`FlowMatchingConfig.history_source`. Same
+#: row WIDTH under either value, which is why the choice has to travel in the artifact.
+HISTORY_SOURCES: tuple[str, ...] = ("reference", "measured")
+
 #: Config keys renamed when the exteroception contract stopped being height-scan-shaped:
 #: old name -> new name. Applied by :meth:`FlowMatchingConfig.from_dict`, so a checkpoint
 #: trained before the rename still loads and can still serve as an A/B control.
@@ -217,6 +221,29 @@ class FlowMatchingConfig:
     # continued rather than a state being read -- more of the recent trajectory to
     # extrapolate from, and 0.08 s of it instead of 0.04 s.
     num_history_states: int = 4
+
+    #: What the ``N`` history rows CONTAIN. The width is identical either way, so a
+    #: mislabelled checkpoint runs silently under the wrong conditioning -- the same class of
+    #: failure as ``window_anchor`` and ``attention_mode``, and the reason it is stamped into
+    #: ``fm_meta``, printed at load, and refused by both runtimes against their own
+    #: ``history_from``.
+    #:
+    #: * ``"reference"`` (default, and what every checkpoint before this flag trained on) --
+    #:   the APPLIED REFERENCE at each of those steps, from the recording's ``history_ref``.
+    #:   At deploy the matching arm is ``history_from="generator"``: the node the runtime
+    #:   served is the reference it applied, so the two are the same kind of quantity.
+    #: * ``"measured"`` -- the ROBOT'S OWN achieved state, from ``depth_lag_state``, except
+    #:   the blocks no robot can supply (``window.MEASURED_HISTORY_FALLBACK``: the base
+    #:   position and linear velocity), which come from ``history_ref`` here and from the
+    #:   served node at deploy -- again the same kind of quantity on both sides. Pairs with
+    #:   ``history_from="measured"``.
+    #:
+    #: ``"measured"`` needs ``depth_lag_state``, which covers lags ``0..depth_lag_steps``,
+    #: and the history rows are lags ``num_history_states..1`` -- so it constrains
+    #: ``num_history_states <= depth_lag_steps``. On the shipped recordings that is 3, and
+    #: :meth:`resolve_history_source` refuses rather than truncating.
+    history_source: str = "reference"
+
     stride: int = 1
     val_fraction: float = 0.1
     precompute: bool = True
@@ -1075,6 +1102,42 @@ class FlowMatchingConfig:
             raise ValueError(f"extero_clip must be positive, got {band}.")
         return band
 
+    def check_history_source(self, available_lags: int | None = None) -> None:
+        """Validate :attr:`history_source` and, for ``"measured"``, that the lags exist.
+
+        The history rows are lags ``num_history_states .. 1``, and ``depth_lag_state``
+        carries lags ``0 .. depth_lag_steps``. So a measured build needs
+        ``num_history_states <= depth_lag_steps``.
+
+        REFUSES rather than truncating ``N``, which is the tempting repair: silently
+        training a 3-row model when 4 were asked for would produce a checkpoint whose
+        ``num_history_states`` disagrees with its own weights, and every runtime reads that
+        field to size the ring.
+
+        Args:
+            available_lags: ``depth_lag_steps`` of the recording being built from -- i.e. the
+                largest lag present, so ``depth_lag_state.shape[1] - 1``. ``None`` skips the
+                coverage half (nothing to check it against yet).
+
+        Raises:
+            ValueError: On an unknown source, or a measured build the recording cannot fill.
+        """
+        if self.history_source not in HISTORY_SOURCES:
+            raise ValueError(
+                f"history_source={self.history_source!r} is not one of "
+                f"{sorted(HISTORY_SOURCES)}.")
+        if self.history_source != "measured" or available_lags is None:
+            return
+        n = int(self.num_history_states)
+        if n > int(available_lags):
+            raise ValueError(
+                f"history_source='measured' needs the measured state at lags {n}..1, but "
+                f"this recording's depth_lag_state only covers lags 0..{available_lags}. "
+                f"Either train with num_history_states <= {available_lags}, or re-record "
+                "with a larger DEPTH_LAG_STEPS. Refusing rather than shortening N, which "
+                "would leave the checkpoint's own num_history_states disagreeing with its "
+                "weights.")
+
     def check_extero_norm_mode(self) -> None:
         """Raise if :attr:`extero_norm_mode` is not one of the three supported modes."""
         if self.extero_norm_mode not in EXTERO_NORM_MODES:
@@ -1237,4 +1300,11 @@ class FlowMatchingConfig:
         # but it is the sole provenance of a training set, so it must not drift.
         if kwargs.get("skip_families") is None:
             kwargs["skip_families"] = [] if "skip_families" in renamed else list(DEFAULT_SKIP_FAMILIES)
+        # A FIFTH instance, and this one CAN corrupt inference. A checkpoint written before
+        # ``history_source`` existed was trained on the applied reference, definitionally --
+        # the measured path did not exist. So an absent key resolves to "reference" and never
+        # to whatever the default becomes later. The rows are the same width under either
+        # value, so a wrong reading here is a generator fed the wrong kind of history with
+        # nothing anywhere to notice.
+        kwargs.setdefault("history_source", "reference")
         return cls(**kwargs)

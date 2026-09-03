@@ -50,6 +50,8 @@ from robot_rl.flow_matching import (  # noqa: E402
     EXTERO_ENCODERS,
     EXTERO_NORM_MODES,
     EXTERO_SOURCES,
+    HISTORY_SOURCES,
+    MEASURED_HISTORY_FALLBACK,
     FlowMatchingTransformer,
     FutureStateDataset,
     build_train_val,
@@ -156,6 +158,20 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "camera. Empty keeps the trunk's native grid. This is the knob that separates "
              "'a CNN beats an MLP' from '16 tokens beat 1': '1,1' gives the legacy token "
              "count through a conv trunk.")
+    parser.add_argument(
+        "--history_source", type=str, default=FlowMatchingConfig().history_source,
+        choices=list(HISTORY_SOURCES),
+        help="What the N history rows CONTAIN. 'reference' (default, and every checkpoint "
+             "before this flag) is the APPLIED REFERENCE at those steps, which pairs with "
+             "the deploy arm history_from='generator' -- a served node IS an applied "
+             "reference. 'measured' is the robot's OWN achieved state, bar the base position "
+             "and linear velocity, which no robot can measure and which come from the "
+             "reference on both sides. 'measured' reads the un-overwritten state out of "
+             "depth_lag_state, which covers lags 0..depth_lag_steps, so it requires "
+             "num_history_states <= depth_lag_steps (3 on the shipped recordings) and "
+             "REFUSES rather than shortening N. The two produce rows of identical width, so "
+             "the choice is stamped into fm_meta and both runtimes refuse a serving arm that "
+             "disagrees with it.")
     parser.add_argument(
         "--attention_mode", type=str, default=FlowMatchingConfig().attention_mode,
         choices=list(ATTENTION_MODES),
@@ -514,6 +530,7 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
         cmd_scale=([float(v) for v in args.cmd_scale.split(",") if v.strip()]
                    if args.cmd_scale and args.cmd_scale.lower() != "none" else None),
         attention_mode=args.attention_mode,
+        history_source=args.history_source,
     )
     # Noise amplitudes and the clip band keep their per-source defaults unless named, so an
     # unspecified flag reproduces the previous behaviour exactly rather than overwriting it
@@ -902,6 +919,16 @@ def main() -> None:
                    else "every token attends to every other (the pre-flag architecture)")
     print(f"[INFO] attention_mode={cfg.attention_mode}: {prefix_note}; "
           f"prefix {cfg.sequence_len - cfg.future_len} + future {cfg.future_len} tokens.")
+    # Same reason as the line above: identical row widths under either value, so this log
+    # line and the checkpoint's config are the only record of what the model was fitted on.
+    cfg.check_history_source()
+    src_note = ("the ROBOT'S OWN achieved state (bar "
+                f"{list(MEASURED_HISTORY_FALLBACK)}, which come from the reference); pairs "
+                "with the deploy arm history_from='measured'"
+                if cfg.history_source == "measured" else
+                "the APPLIED REFERENCE at each step; pairs with history_from='generator'")
+    print(f"[INFO] history_source={cfg.history_source}: the {cfg.num_history_states} history "
+          f"rows are {src_note}.")
     if cfg.obs_noise:
         # Only the keys feeding a SELECTED block -- the others are not in the window and
         # so are not applied, and printing them would suggest otherwise.

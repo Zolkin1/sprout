@@ -8,10 +8,14 @@ the flow-matching generator (``fm.onnx``) online and feeds its world-frame predi
 into the RL tracker (``tracker.onnx``), reproducing the ``FmTrackingCommand`` coupling.
 No torch / isaaclab / robot_rl imports.
 
-The generator is **robot-state-conditioned**, exactly like the in-loop
-``FmTrackingCommand``: the ``N`` history tokens are the LIVE MEASURED robot state
-(phase), NOT the FM's own past output -- this fixes the autoregressive z-drift /
-exposure bias. Each freshly sampled trajectory is anchored on the robot's current
+The generator is **autoregressive**, exactly like the in-loop ``FmTrackingCommand``: the
+``N`` history tokens are the reference-window nodes this runtime SERVED over the previous
+``N`` steps -- its own past output, already expressed in the frame of the plan each came
+from, which is what keeps odometry off the generator's critical path. (An older version of
+this paragraph claimed the opposite -- "the LIVE MEASURED robot state, NOT the FM's own past
+output" -- which was true of a much earlier design and has been wrong since. ``history_from``
+now offers a real measured arm, so the distinction matters: see
+:meth:`GenTrackerPolicy._measured_history_node`.) Each freshly sampled trajectory is anchored on the robot's current
 base pose (xyz+yaw ground frame; node 0 = "now"), with exteroception token(s) -- the
 height scan or the depth cameras, per the checkpoint -- describing the terrain. Depth
 cameras additionally carry their geometry in the ONNX metadata, checked for agreement
@@ -42,7 +46,9 @@ from .history import BatchedHistory
 from .quat_math_np import quat_apply, quat_inv, yaw_quat
 from .tracker_session import TrackerSession
 from .window_np import (
+    assert_history_source_matches,
     base_pose_block_to_world,
+    measured_history_fallback_spans,
     reanchor_window,
     window_block_slices,
     window_dim,
@@ -230,6 +236,13 @@ class GenTrackerPolicy:
     #: reordering cannot leave it briefly unset while ``_serve_nodes`` is reachable.
     _window_anchor: str = "robot_now"
 
+    #: Which history producer fills the ``N`` context rows, for the same reason and with the
+    #: same caveat as the two above: an instance that skips construction gets the DEPLOYED
+    #: arm rather than an AttributeError. A test double meaning to exercise the measured arm
+    #: must therefore say so -- silence here means the closed loop, which is the safer way
+    #: round, since that is what the artifact on a robot runs.
+    history_from: str = "generator"
+
     def __init__(
         self,
         tracker_onnx: str,
@@ -245,6 +258,7 @@ class GenTrackerPolicy:
         allow_privileged_extero: bool = False,
         allow_robot_asset_mismatch: bool = False,
         fm_lead_ticks: int = 0,
+        history_from: str = "generator",
     ):
         """Configure the generator + tracker pair from the ONNX artifacts.
 
@@ -298,7 +312,22 @@ class GenTrackerPolicy:
         was 0.05 (3 ticks, 60 ms, ~4.5 cm), which on a stair edge is a different problem
         rather than a rounding difference, and is why the default moved. Default 0
         (unchanged behaviour); set it to compare the two stacks on equal terms.
+
+        ``history_from`` chooses what fills the ``N`` history rows, mirroring
+        ``FmTrackingCommandCfg.history_from``. ``"generator"`` (the default and the
+        deployment behaviour) is the nodes this runtime served. ``"measured"`` is the
+        robot's own achieved state, except :data:`window_np.MEASURED_HISTORY_FALLBACK`,
+        which no robot can measure and which still comes from the served node -- a
+        DIAGNOSTIC arm, off-distribution against a model fitted on reference rows, and
+        implemented here because MuJoCo can feed it honestly. There is no ``"clip"`` arm on
+        this side: teacher forcing needs a clip and the robot has none.
         """
+        if history_from not in ("generator", "measured"):
+            raise ValueError(
+                f"history_from={history_from!r} must be 'generator' or 'measured'. "
+                "('clip' is an Isaac-only arm -- there is no clip on this path.)"
+            )
+        self.history_from = history_from
         self.tracker_onnx = tracker_onnx
         self.fm_onnx = fm_onnx
         self.fm_update_every = max(int(fm_update_every), 1)
@@ -363,6 +392,17 @@ class GenTrackerPolicy:
             _assert_robot_assets_agree(self._trk.get_robot_asset(), self.ctx.robot_asset,
                                        self.tracker_onnx, self.fm_onnx,
                                        allow_mismatch=self.allow_robot_asset_mismatch)
+            # The serving arm must be the one this graph was FITTED for. Not gated behind
+            # allow_robot_asset_mismatch: that flag says "these two artifacts describe the
+            # same robot closely enough", which is a different claim from "this generator
+            # eats the history I am about to hand it".
+            # ``getattr`` with None, not a "reference" literal: None is the DEFINED reading
+            # for a graph older than the flag (the measured path did not exist, so it was
+            # fitted on the reference), and the guard resolves it. A real ``FmContext``
+            # always carries the field -- this only covers a context built without one.
+            assert_history_source_matches(
+                self.history_from, getattr(self.ctx, "history_source", None),
+                where=str(self.fm_onnx))
         # Re-plan cadence: the tracker metadata (the value the tracker task trained with),
         # else the constructor/CLI default. The old middle tier -- falling back to the FM's
         # fm_snap_every -- existed only to satisfy the agreement rule that has since been
@@ -444,6 +484,13 @@ class GenTrackerPolicy:
         # Node served on the PREVIOUS step, already re-anchored onto the robot as it was
         # then -- the frame the dataset's history rows use. None until the first serve.
         self._prev_served_node: np.ndarray | None = None
+        # The MEASURED node for the previous step, for history_from="measured". Stashed a
+        # step ahead of its push for the same reason the Isaac side does it: the row pushed
+        # at step t has to describe step t-1.
+        self._prev_measured_node: np.ndarray | None = None
+        # Node columns a measured row cannot fill on a robot; see window_np.
+        self._measured_fallback_spans = measured_history_fallback_spans(
+            len(self._fm_to_isaac), self.ctx.target_num_extra_frames, self.reference_blocks)
         self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
         # Last generator sample's inputs + identity, for logging (see _run_fm / last_plan).
         self._plan_id = 0
@@ -1122,21 +1169,84 @@ class GenTrackerPolicy:
     # ------------------------------------------------------------------
     # Snapshot + generator inference
     # ------------------------------------------------------------------
+    def _measured_history_node(self, state: dict) -> np.ndarray:
+        """The ROBOT'S OWN state as a history row ``(1, D)``, in the plan's frame.
+
+        The numpy twin of ``FmTrackingCommand._measured_history_node``: one
+        :func:`window_np.world_to_window` call whose "reference" arguments are the measured
+        base pose, base velocity, joints and end-effector positions, anchored on
+        ``_anchor_pos`` / ``_anchor_quat`` -- the pose at the last re-plan, which is the
+        frame every history row lives in.
+
+        Joints are permuted isaac -> FM (``_isaac_to_fm``); the state dict arrives in the
+        robot's order and the node's joint block is the checkpoint's.
+
+        Unlike the served row this one is built from the state at THIS step, and the caller
+        stashes it for the next step's push -- ``_update_generator`` pushes a row describing
+        the previous step.
+
+        Args:
+            state: This tick's state dict (``root_pos``, ``root_quat``, ``root_lin_vel_w``,
+                ``root_ang_vel_w``, ``joint_pos``, ``joint_vel``, and ``frame_pos`` when
+                the layout carries an ``ee_pos`` block).
+
+        Returns:
+            ``(1, D)`` window node.
+
+        Raises:
+            KeyError: If an ``ee_pos`` layout is not given ``frame_pos``. Refused rather
+                than zero-filled: a zeroed posture block is a plausible number for a robot
+                folded in half.
+        """
+        f64 = lambda k: np.asarray(state[k], dtype=np.float64)      # noqa: E731
+        n_ee = self.ctx.target_num_extra_frames
+        if "ee_pos" in self.reference_blocks and n_ee > 0:
+            ee = f64("frame_pos")[:n_ee].reshape(1, 1, n_ee, 3)
+        else:
+            ee = np.zeros((1, 1, 0, 3))
+        jp = f64("joint_pos")[self._isaac_to_fm].reshape(1, 1, -1)
+        jv = f64("joint_vel")[self._isaac_to_fm].reshape(1, 1, -1)
+        return world_to_window(
+            self._anchor_pos.reshape(1, 1, 3), self._anchor_quat.reshape(1, 1, 4),
+            f64("root_pos").reshape(1, 1, 3), f64("root_quat").reshape(1, 1, 4),
+            f64("root_lin_vel_w").reshape(1, 1, 3), f64("root_ang_vel_w").reshape(1, 1, 3),
+            jp, jv, ee, blocks=self.reference_blocks,
+        ).reshape(1, self.ctx.D)
+
     def _make_snapshot(self, state: dict) -> dict[str, np.ndarray]:
         """Pack one autoregressive history row (1 env).
 
-        The row is the reference-window node this runtime SERVED last step -- the
-        generator's own output -- not a measured state. It is already expressed relative to
-        the robot as it was at that step, which is how the dataset builds the history, so
-        there is nothing to transform and no base pose to estimate. Before the first sample
-        (and for the first ``N`` steps after a reset) there is nothing real to push; zeros
-        go in and the learned ``null_history`` embedding covers them.
+        Under ``history_from="generator"`` the row is the reference-window node this runtime
+        SERVED last step -- the generator's own output -- not a measured state. It is already
+        expressed relative to the robot as it was at that step, which is how the dataset
+        builds the history, so there is nothing to transform and no base pose to estimate.
+
+        Under ``history_from="measured"`` it is the robot's own state at the previous step
+        (stashed by :meth:`_update_generator`), with the columns no robot can measure taken
+        from the node served at that SAME step. Both stashes describe the previous step at
+        this instant, which is what makes the substitution line up; pairing a measured row
+        for this step with a served node for the last would be off by one step of travel.
+
+        Either way, before the first sample (and for the first ``N`` steps after a reset)
+        there is nothing real to push; zeros go in and the learned ``null_history``
+        embedding covers them. The measured arm is gated on the SERVED node too, not only
+        on its own stash: 3 of the row's columns can come from nowhere else, and a row that
+        is part measurement and part zero is not one the model has ever seen.
 
         ``command`` rides along for the held-command fallback in :meth:`_run_fm`.
         """
+        cmd = np.array(state["command"], dtype=np.float64, copy=True)[None]
+        if self.history_from == "measured":
+            meas, served = self._prev_measured_node, self._prev_served_node
+            if meas is None or served is None:
+                return {"node": np.zeros((1, self.ctx.D)), "cmd": cmd}
+            node = meas.reshape(1, self.ctx.D).copy()
+            for a, b in self._measured_fallback_spans:
+                node[:, a:b] = served.reshape(1, self.ctx.D)[:, a:b]
+            return {"node": node, "cmd": cmd}
         node = (np.zeros((1, self.ctx.D)) if self._prev_served_node is None
                 else self._prev_served_node.reshape(1, self.ctx.D).copy())
-        return {"node": node, "cmd": np.array(state["command"], dtype=np.float64, copy=True)[None]}
+        return {"node": node, "cmd": cmd}
 
     def advance_dormant_step(self) -> None:
         """Advance the control-step counter while the generator is dormant.
@@ -1165,7 +1275,8 @@ class GenTrackerPolicy:
         The step order IS the algorithm, and it mirrors
         ``FmTrackingCommand._snapshot_and_infer`` exactly:
 
-        1. push the node served LAST step into the history (already in that step's frame);
+        1. push the node served LAST step into the history (already in that step's frame),
+           or under ``history_from="measured"`` the row describing that step;
         2. decide whether to re-plan -- on cadence, or whenever there is no live plan;
         3. otherwise advance the cursor one node into the existing plan;
         4. re-plan where asked, which resets the cursor and re-captures the anchor;
@@ -1181,6 +1292,12 @@ class GenTrackerPolicy:
         if self.fm_lead_ticks:
             self._lead_buf.append(self._lead_sample(state))
         self._history.append(self._make_snapshot(state))
+        if self.history_from == "measured":
+            # Stashed AFTER the push, so the row that just went in describes the previous
+            # step and this one describes the current step -- and stashed with the anchor
+            # in force now, before this step's possible re-plan moves it, so the row carries
+            # the frame of the step it describes.
+            self._prev_measured_node = self._measured_history_node(state)
         if self._prev_served_node is None:
             # Nothing has been served yet, so that row is the zero placeholder, not a node
             # this runtime produced. Keep the window INVALID so the learned null-history
@@ -2012,6 +2129,13 @@ class GenTrackerPolicy:
             self._clip_anchor_pos = None
             self._clip_anchor_quat = None
             self._prev_served_node = None
+            # And the measured stash, for the SAME reason spelled out above: it is a world
+            # pose from the previous episode, on another course. The ordering happens to
+            # overwrite it before the first read (`_prev_served_node is None` zeroes the row
+            # at step 0, and the stash is refreshed on that same step), so leaving it would
+            # be safe today and by accident -- which is what this whole method exists not to
+            # rely on.
+            self._prev_measured_node = None
             # NOT _plan_id: it identifies a sample, and restarting it at 0 would make two
             # plans from different episodes share an id in one recording.
             self._last_plan = None
@@ -2022,6 +2146,29 @@ class GenTrackerPolicy:
             self._last_served_window = None
             self._last_served_anchor = None
             self._reset_timing()
+
+    def reseed(self, seed) -> None:
+        """Restart the generator's noise stream from ``seed``.
+
+        Deliberately NOT part of :meth:`reset`, which clears per-episode STATE: the RNG is a
+        stream, and whether an episode should resume it or restart it is the caller's
+        experiment design, not this class's business.
+
+        A harness comparing two arms episode-by-episode has to call this per episode, keyed
+        on the CELL rather than on arrival order. Left alone the stream is consumed one draw
+        per re-plan, so an episode's noise depends on how many re-plans every episode before
+        it made -- and an arm that falls early makes fewer. Two arms would then be scored on
+        different draws from the same cell onward, drifting further apart the longer the
+        sweep ran, with nothing in the tables to show it. That is the same defect as keying
+        the Isaac seed sweep by env: it puts the effect being measured inside its own control.
+
+        Args:
+            seed: Anything ``numpy.random.default_rng`` accepts -- an int, or a SEQUENCE of
+                them, which is the useful form here: a caller keying on a cell can pass
+                ``(fm_seed, terrain_idx, speed_idx)`` and get a well-mixed independent
+                stream per cell without inventing its own hash.
+        """
+        self._rng = np.random.default_rng(seed)
 
     def get_dt(self) -> float:
         return self._trk.get_dt()

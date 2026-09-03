@@ -822,6 +822,18 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         robot.set_pd_gains_from_policy(policy)
         print("[INFO] Spawning straight into FM+tracker control on the RL gains (no standing "
               "hold: the generator runs from step 0 on its learned null-history embedding).")
+    # Printed UNCONDITIONALLY, matching FmTrackingCommand: which history the generator is
+    # eating changes the result more than anything else here, and the two arms produce rows
+    # of identical width, so a message that appeared only in the non-default case would make
+    # "no message" ambiguous with "I did not look".
+    if policy.fm_enabled and policy.history_from == "measured":
+        print("[INFO] history_from='measured': the generator conditions on the ROBOT'S OWN "
+              "achieved state, except the base position and linear velocity (no robot can "
+              "measure those; they come from the served node). DIAGNOSTIC -- the model was "
+              "fitted on reference rows, so this input is off-distribution.")
+    elif policy.fm_enabled:
+        print(f"[INFO] history_from='generator': CLOSED LOOP -- the generator conditions on "
+              f"its own last {policy.ctx.N} served nodes.")
 
     # Predicted extra-frame indices that are feet (for the FM viz spheres).
     foot_idx = [i for i, n in enumerate(policy.ctx.target_frame_names)
@@ -1561,6 +1573,16 @@ def main() -> None:
                              "behaviour. The C++ default fm_lead_sec=0.02 at dt=0.02 is 1 "
                              "tick, so --fm_lead_ticks 1 is the matched comparison; 3 "
                              "reproduces the old 60 ms default.")
+    parser.add_argument("--history_from", default="generator",
+                        choices=["generator", "measured"],
+                        help="What fills the generator's N history rows: its own served "
+                             "nodes ('generator', the deployed closed loop) or the ROBOT'S "
+                             "OWN achieved state ('measured'), except the base position and "
+                             "linear velocity, which no robot can measure and which still "
+                             "come from the served node. 'measured' is a DIAGNOSTIC: it is "
+                             "real but off-distribution, since the model was fitted on "
+                             "reference rows -- see "
+                             "scripts/flow_matching/measured_history_gap.py for how far.")
     parser.add_argument("--log", action="store_true", default=False)
     parser.add_argument("--no_metrics", dest="metrics", action="store_false", default=True,
                         help="With --log, still write sim_log.csv and stamp the verdict into "
@@ -1663,6 +1685,7 @@ def main() -> None:
         allow_privileged_extero=args.allow_privileged_extero,
         allow_robot_asset_mismatch=args.allow_robot_asset_mismatch,
         fm_lead_ticks=args.fm_lead_ticks,
+        history_from=args.history_from,
     )
     policy.load()
     replay = None
@@ -1869,6 +1892,18 @@ def main() -> None:
     # `fm_extero` divergence that is the harness's fault, which is the one thing that harness
     # promises to rule out.
     _cpp_parity = bool(args.fm_lead_ticks) or bool(args.dump_replay)
+    # --history_from measured does not compose with either, for a sharper reason than the
+    # lag does: the C++ runtime has no measured arm at all. Its history is always the rows it
+    # served, so there is nothing on that side to line up against, and compare_replay.py
+    # would report an `fm_history` divergence that is the harness's fault -- the same failure
+    # the block above exists to prevent, one input over. Refused rather than warned: a lead
+    # comparison against a runtime that cannot run this arm is not a comparison.
+    if args.history_from != "generator" and _cpp_parity:
+        sys.exit(
+            f"[FATAL] --history_from {args.history_from} cannot be combined with "
+            "--fm_lead_ticks / --dump_replay. Both exist to line this runner up against the "
+            "C++ runtime, which fills the generator's history from the nodes it SERVED and "
+            "has no measured arm to compare against. Drop one.")
     if args.fm_depth_lag_steps is not None:
         if _cpp_parity and args.fm_depth_lag_steps > 0:
             sys.exit(
