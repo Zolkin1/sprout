@@ -457,7 +457,7 @@ def chunk_reward(err: np.ndarray,
 
 def normalized_return(chunk_rewards: Sequence[float] | np.ndarray,
                       spec: TrackingErrorSpec = BOOTSTRAP_SPEC,
-                      *, failed: bool) -> float:
+                      *, failed: bool, tail_chunks: int = 1) -> float:
     """``G = (1 - gamma) * sum gamma^i R_i  +  tail``, in ``[0, 1]``.
 
     The ``(1 - gamma)`` factor is not cosmetic.  It is what puts a return on the same scale as
@@ -481,6 +481,13 @@ def normalized_return(chunk_rewards: Sequence[float] | np.ndarray,
         chunk_rewards: ``[T]`` per-chunk rewards, earliest first, already truncated at the
             terminal event (for a latched episode, at the latch).
         spec: Supplies ``gamma``.
+        tail_chunks: How many trailing chunk rewards the non-failure tail averages. ``1``
+            (the default) is what every existing artifact was built under; the tail is
+            stamped nowhere, so changing the DEFAULT would silently re-price every critic
+            already fitted. Larger values trade a little bias for variance -- the tail
+            carries a median 52% of ``G`` on a survived episode, so resting it on one
+            measurement is what makes it worth averaging. MUST match whatever built the
+            quality head's target.
         failed: Whether the truncation point is a FAILURE.  Keyword-only and with no default:
             the two answers differ by more than a factor of two on a short episode, and a
             silent default would pick one of them for every caller that forgot.
@@ -493,5 +500,8 @@ def normalized_return(chunk_rewards: Sequence[float] | np.ndarray,
         return 0.0
     g = float(spec.gamma)
     head = (1.0 - g) * float(np.sum(r * g ** np.arange(r.size, dtype=np.float64)))
-    tail = 0.0 if failed else float(g ** r.size * r[-1])
+    # The tail averages the last `tail_chunks` rewards, clamped to the episode's own
+    # length so a short one averages what it has rather than reaching past its start.
+    k = max(1, min(int(tail_chunks), r.size))
+    tail = 0.0 if failed else float(g ** r.size * float(np.mean(r[-k:])))
     return head + tail

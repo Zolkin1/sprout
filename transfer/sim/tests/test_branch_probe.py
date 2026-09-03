@@ -197,5 +197,10 @@ def test_the_continuation_tags_cannot_collide_with_a_branch_key():
     # the shared stream must NOT be keyed by `cand`
     assert "np.random.default_rng([seed, start_replan, r, tag_seed])" in src, (
         "the continuation key changed; it must carry no `cand`, or siblings stop being paired")
-    assert "np.random.default_rng([seed, n_replans, cand])" in src, (
-        "the branch key must carry `cand` -- that difference IS the treatment")
+    # The branch key must carry `cand` -- that difference IS the treatment -- and under
+    # --same_noise it must NOT, since the control's whole content is that every sibling was
+    # handed one draw. Both halves are asserted, because the control silently keeping `cand`
+    # would make it a second treatment arm reported as a control.
+    assert "[seed, n_replans] if same_noise else [seed, n_replans, cand]" in src, (
+        "the branch key changed; it must carry `cand` normally and drop it under "
+        "--same_noise, or the control stops controlling for anything")

@@ -131,6 +131,64 @@ def test_reproduces_the_fit(fitted):
     assert d.max() < 1e-4, f"port disagrees with fit_value: max |dp| = {d.max():.3e}"
 
 
+def test_the_no_goal_arm_drops_the_SAME_columns_on_both_sides(fitted):
+    """The port and the fit must remove the goal identically, columns included.
+
+    Only the assembled context is compared, not a ``p_fail``: this checkpoint's ``context_in``
+    is 9 wide, so there is no forward pass to make. That is the point -- the hazard is not a
+    shape error, it is one side dropping the goal from the FRONT and the other from the back,
+    which leaves both widths at 6 and slides the twist into the goal's columns. Every number
+    stays finite and plausible, and only a column-wise comparison can see it.
+    """
+    import importlib.util
+
+    import torch
+
+    import critic as C
+
+    fc, W, _ = fitted
+    spec = importlib.util.spec_from_file_location(
+        "fv", os.path.join(_ROOT, "scripts/flow_matching/fit_value.py"))
+    fv = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fv)
+    was = fc.goal_context
+    try:
+        fc.goal_context = False
+        mine = torch.cat([fc._inputs(_inputs(C, W, i)).context
+                          for i in range(N_WINDOWS)], dim=0)
+    finally:
+        fc.goal_context = was
+    theirs = fv._batch(fc.ctx, W, np.arange(N_WINDOWS), True, "cpu",
+                       tuple(fc.scan_hw), goal_context=False).context
+    assert mine.shape == theirs.shape == (N_WINDOWS, 6), tuple(mine.shape)
+    # And the surviving columns are the full twist, unmoved from where the with-goal arm
+    # puts it: the goal is PREPENDED, so it owns 0:3 and nothing else shifts.
+    with_goal = fv._batch(fc.ctx, W, np.arange(N_WINDOWS), True, "cpu",
+                          tuple(fc.scan_hw), goal_context=True).context
+    assert torch.allclose(mine, theirs, atol=0, rtol=0)
+    assert torch.allclose(theirs, with_goal[:, 3:], atol=0, rtol=0)
+
+
+def test_a_goal_context_stamp_that_contradicts_context_dim_is_REFUSED(tmp_path):
+    """``goal_context: False`` on a 9-wide checkpoint must not load.
+
+    ``load_state_dict`` cannot catch this: the checkpoint and the model are both built from
+    ``context_dim``, so they agree with each other and disagree only with the stamp -- and the
+    stamp is what decides which columns the batch carries.
+    """
+    import torch
+
+    import critic as C
+
+    ck = torch.load(CKPT, map_location="cpu", weights_only=False)
+    assert int(ck["context_dim"]) == 9 and bool(ck["privileged"])
+    ck["goal_context"] = False
+    bad = tmp_path / "V_priv_bad_stamp.pt"
+    torch.save(ck, bad)
+    with pytest.raises(ValueError, match="context_dim"):
+        C.FailureCritic(str(bad), device="cpu")
+
+
 #: ``(sabotage, measured mean |dp|, margin)`` over this module's own 64-window sample.
 #:
 #: **Margins are half the measured value, and that is the whole rule.**  Two blind arms

@@ -198,6 +198,7 @@ def normalized_returns(
     failed: np.ndarray,
     *,
     gamma: float,
+    tail_chunks: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """``G_t`` per window: the QUALITY head's regression target, in ``[0, 1]``.
 
@@ -220,6 +221,15 @@ def normalized_returns(
         replan_index: ``[W]``.
         failed: ``[W]`` bool, the episode's realized outcome.
         gamma: Per-chunk discount.
+        tail_chunks: How many trailing chunk rewards the NON-FAILURE tail averages.  ``1``
+            (the default) is what every existing artifact was built under, and changing the
+            DEFAULT rather than the argument would silently re-price every critic already
+            fitted -- the tail is stamped nowhere, so an old checkpoint read by new code
+            would be scored against a target it never saw.  Larger values trade a little bias
+            for variance: the tail carries a median 52% of ``G`` on a survived episode, and
+            resting all of that on one measurement is why it is worth averaging.  Measured on
+            ``v4_big``, 1 -> 3 drops the tail's own spread 12.1% (sd 0.243 -> 0.213) and moves
+            ``G`` by 0.22 of an advantage sd -- a real change, not a rounding.
 
     Returns:
         ``(g, valid_g)`` -- ``[W]`` float64 and ``[W]`` bool. A row is invalid where its
@@ -245,7 +255,12 @@ def normalized_returns(
         if keep.size == 0:
             continue                       # nothing to build a return from; left invalid
         r = reward[keep]
-        tail = 0.0 if bool(failed[keep[0]]) else float(r[-1])
+        # The non-failure tail: the motion is assumed to continue at the quality it ended
+        # on, and `tail_chunks` decides over how many trailing chunks that "quality" is read.
+        # Clamped to the episode's own length, so a 2-chunk episode averages what it has
+        # rather than reaching past its own start.
+        k = max(1, min(int(tail_chunks), r.size))
+        tail = 0.0 if bool(failed[keep[0]]) else float(r[-k:].mean())
         # Backward recursion, so this is O(m) rather than O(m^2):
         #   G_t = (1-g) R_t + g G_{t+1},   G_after_end = tail
         acc = tail
@@ -269,6 +284,8 @@ def combined_n_step_advantage(
     *,
     gamma: float,
     w_fail: float = 1.0,
+    valid: np.ndarray | None = None,
+    tail_chunks: int = 1,
 ) -> tuple[np.ndarray, np.ndarray]:
     """The n-step advantage of the COMBINED value, survival plus tracking quality.
 
@@ -310,6 +327,10 @@ def combined_n_step_advantage(
         n: Look-ahead in re-plans.
         gamma: Per-CHUNK discount.
         w_fail: Weight on the survival term, in ``[0, 1]``.
+        tail_chunks: Trailing chunks the non-failure tail averages. MUST match what
+            :func:`normalized_returns` built the quality head's target with, or this
+            advantage's ``G`` is again a different quantity from the one its own baseline
+            was trained to predict.
 
     Returns:
         ``(advantage, bootstrapped)`` -- ``[W]`` float64 and ``[W]`` bool.
@@ -344,14 +365,29 @@ def combined_n_step_advantage(
     disc = g ** np.arange(int(n), dtype=np.float64)
     for s, e in zip(starts, ends):
         rows = order[s:e]
+        if valid is not None:
+            # ROWS WITH NO MEASURED REWARD ARE DROPPED, not zero-filled. Every episode's LAST
+            # row is one: `chunk_rewards_from_track_err` stores each chunk's reward on the row
+            # BEFORE it, so the final row carries a placeholder 0. Summing that placeholder
+            # charges the episode for a chunk that was never measured, and it is the same
+            # defect -- in the same direction -- as closing a TD chain on it.
+            rows = rows[valid[rows]]
+            if rows.size == 0:
+                continue
         m = rows.size
         r = chunk_reward[rows].astype(np.float64)
         gh = g_hat[rows].astype(np.float64)
         # The tail value: 0 on a failure (absorbing -- nothing good follows) and the last
-        # observed G_hat otherwise (the episode ended by arriving or by the budget, so the
-        # motion is assumed to continue at the quality it ended on). Absorbing on a
-        # NON-failure would punish arriving quickly.
-        tail = 0.0 if bool(failed[rows[0]]) else float(gh[-1])
+        # MEASURED REWARD otherwise. Not `gh[-1]`: `normalized_returns` -- the recursion the
+        # quality head was FITTED to -- closes on `r[-1]`, and under the (1-gamma)
+        # normalization that is exactly the return of continuing forever at the quality the
+        # episode ended on. Closing here on a prediction instead makes this advantage's G a
+        # different quantity from the one its own baseline was trained to predict, so `A =
+        # G - G_hat` stops being an advantage. Measured on v4_big, the two agree exactly on
+        # failed episodes (tail 0 either way) and differ on survived ones by enough to move a
+        # quarter of a top-50% filter.
+        k_tail = max(1, min(int(tail_chunks), r.size))
+        tail = 0.0 if bool(failed[rows[0]]) else float(r[-k_tail:].mean())
         for i in range(m):
             # TRUNCATED n-step: a row whose window overruns the episode gets the k chunks
             # that exist and bootstraps at g^k, NOT at g^n. Discounting the tail by the full
@@ -369,10 +405,11 @@ def binarize(
     advantage: np.ndarray,
     family_code: np.ndarray,
     *,
+    strata: np.ndarray | None = None,
     percentile: float = 35.0,
     null_spread: float = 0.02,
     absolute_floor: float | None = None,
-) -> tuple[np.ndarray, dict[int, dict[str, float]]]:
+) -> tuple[np.ndarray, dict]:
     """Turn per-window advantages into ``{negative, positive, null}`` labels, per family.
 
     A family whose advantage spread is below ``null_spread`` is labelled ``null``
@@ -380,10 +417,24 @@ def binarize(
     so its advantages are a cluster of near-zeros carrying no preference, and cutting them
     at a percentile would manufacture a distinction the data does not contain.
 
+    **``strata`` exists because a per-family cut still selects on WHERE IN THE EPISODE a
+    chunk sits.**  A Monte-Carlo advantage is systematically positive early in a surviving
+    episode: the critic hedges toward the mean when the outcome is still uncertain, and
+    conditional on the episode having survived, those early states beat the hedge.  Measured
+    on ``v4_big``, mean ``A_MC`` runs ~0 at the end of a survived episode and +0.071 twenty
+    chunks out, about half a standard deviation -- so a family-only cut keeps 56% of opening
+    chunks against 41% of closing ones, and the closing ones are where the stairs and jumps
+    are.  Crossing the family with a progress bin removes that, and the two keep-sets differ
+    on ~8% of rows.  It is a selection effect, not a property of the chunks, which is why it
+    is corrected by stratifying rather than by trusting the score.
+
     Args:
         advantage: ``[W]`` advantages.
         family_code: ``[W]`` family code per window.
-        percentile: Within-family percentile below which a chunk is negative.  Chunks at or
+        strata: ``[W]`` optional second grouping crossed with the family -- a normalized
+            progress bin in the intended use.  ``None`` groups by family alone, which is the
+            historical behaviour and what every pre-existing sidecar was labelled under.
+        percentile: Within-stratum percentile below which a chunk is negative.  Chunks at or
             above it are positive.
         null_spread: If a family's interquartile range of advantages is below this, the whole
             family is ``null``.
@@ -397,28 +448,42 @@ def binarize(
             a family believed hopeless.
 
     Returns:
-        ``(labels, per_family)`` -- ``[W]`` int64 in ``{0, 1, 2}``, and a per-family record
-        of the threshold used, the IQR and the resulting positive fraction (for the manifest,
-        so a run states what it labelled rather than leaving it to be re-derived).
+        ``(labels, per_group)`` -- ``[W]`` int64 in ``{0, 1, 2}``, and a per-group record of
+        the threshold used, the IQR and the resulting positive fraction (for the manifest, so
+        a run states what it labelled rather than leaving it to be re-derived).  Keyed by the
+        integer family when ``strata`` is ``None``, and by ``"fam=<f>|stratum=<s>"`` when it
+        is -- the key states the grouping, so a sidecar cannot be read as family-only when it
+        was not.
+
+    Raises:
+        ValueError: If ``strata`` disagrees with ``advantage`` in length.
     """
+    if strata is not None and strata.shape[0] != advantage.shape[0]:
+        raise ValueError(f"strata has length {strata.shape[0]}, expected "
+                         f"{advantage.shape[0]}")
     labels = np.full(advantage.shape[0], LABEL_NULL, dtype=np.int64)
-    report: dict[int, dict[str, float]] = {}
-    for fam in np.unique(family_code):
-        sel = family_code == fam
-        a = advantage[sel]
-        if a.size == 0:
-            continue
-        iqr = float(np.percentile(a, 75) - np.percentile(a, 25))
-        if iqr < float(null_spread):
-            report[int(fam)] = {"n": int(a.size), "iqr": iqr, "threshold": float("nan"),
-                                "positive_frac": 0.0, "null": True}
-            continue
-        thr = float(np.percentile(a, percentile))
-        if absolute_floor is not None:
-            thr = max(thr, float(absolute_floor))
-        lab = np.where(a >= thr, LABEL_POSITIVE, LABEL_NEGATIVE)
-        labels[sel] = lab
-        report[int(fam)] = {"n": int(a.size), "iqr": iqr, "threshold": thr,
-                            "positive_frac": float((lab == LABEL_POSITIVE).mean()),
-                            "null": False}
+    report: dict = {}
+    fams = np.unique(family_code)
+    strata_vals = [None] if strata is None else list(np.unique(strata))
+    for fam in fams:
+        in_fam = family_code == fam
+        for st in strata_vals:
+            sel = in_fam if st is None else (in_fam & (strata == st))
+            key = int(fam) if st is None else f"fam={int(fam)}|stratum={int(st)}"
+            a = advantage[sel]
+            if a.size == 0:
+                continue
+            iqr = float(np.percentile(a, 75) - np.percentile(a, 25))
+            if iqr < float(null_spread):
+                report[key] = {"n": int(a.size), "iqr": iqr, "threshold": float("nan"),
+                               "positive_frac": 0.0, "null": True}
+                continue
+            thr = float(np.percentile(a, percentile))
+            if absolute_floor is not None:
+                thr = max(thr, float(absolute_floor))
+            lab = np.where(a >= thr, LABEL_POSITIVE, LABEL_NEGATIVE)
+            labels[sel] = lab
+            report[key] = {"n": int(a.size), "iqr": iqr, "threshold": thr,
+                           "positive_frac": float((lab == LABEL_POSITIVE).mean()),
+                           "null": False}
     return labels, report

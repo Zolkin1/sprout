@@ -24,7 +24,12 @@ Generated tables and figures: `logs/value/critic_eval_v4/tables.md`.
 | what does the critic contribute to it? | **61% of the return's variance**, as a baseline | §6 |
 | does the offline arm agree? | **yes, independently** — `A_MC`'s within-episode signal is 1.9× `A_TD`'s | §7 |
 | would a filtered-BC set differ from the outcome-only one? | **yes**, 26% of chunks change class | §7 |
-| **recommendation** | **GO, on `A_MC` / high-λ GAE over the QUALITY head** | §8 |
+| **recommendation (as written 2026-09-02, before the fine-tune)** | **GO, on `A_MC` / high-λ GAE over the QUALITY head** | §8 |
+| **outcome (same day, after running it)** | **STOP — the prize is 1.6% of the reward's variance, and half of it was already taken** | §10 |
+
+> **Read §10 before acting on §8.** The GO above was right about the critic and wrong about
+> how much room there was to win. The fine-tune was run, and the ceiling was then measured
+> directly rather than assumed.
 
 ## 1. Two uses of one critic, and why the second does not follow from the first
 
@@ -310,6 +315,109 @@ contained change and is what §7's β grid assumes.
   dropped, leaving 15,037. `spawned_in_goal` (12 live episodes) and `goal_travel_m <= 0`
   (2 live) are *not* dropped and are free successes — too few to matter here, but they are
   labelled successes that required nothing.
+
+## 10. Outcome: the fine-tune was run, and the effort is STOPPED
+
+§8 recommended a filtered-BC attempt on `A_MC`. It was run the same day. **The critic was not
+the limiting factor — the generator's own conditional was**, and this section exists because
+nothing above measured that.
+
+### What the fine-tunes did
+
+Two arms, both at LR 3e-5 and 1e-4, evaluated in MuJoCo (27 cells / 1080 episodes) and Isaac:
+
+| | tracking reward | success |
+|---|---|---|
+| `amc` (filtered on `A_MC`, top 30% per family × progress × speed) | **+0.011 to +0.014**, CIs exclude zero | no change |
+| `survived` (all chunks of surviving episodes, NO critic) | matched or beat `amc` everywhere | no change |
+
+**The success null is informative, not underpowered**: the same cells and the same episodes
+detect the reward effect, and bound success at ±0.036.
+
+### The ceiling, measured causally
+
+`transfer/sim/branch_probe.py` draws K=4 sibling chunks from one **exactly restored** MuJoCo
+state — only the flow-noise draw differs — and rolls each to completion. 340 groups, tile 6 @
+0.8 m/s. The blocking control passes exactly: under `--same_noise` the within-group spread is
+`0.000e+00`, so the restore is bit-exact and the treatment arm measures the action rather than
+the simulator. (This is the check the abandoned Isaac best-of-K harness failed.)
+
+    Var(R | same state) / Var(R) = 0.016
+
+    perfect best-of-4 gain     tracking reward  +0.0207 on a base of 0.7373   (+2.8%)
+                               realized G       +0.0411                        (+7.1%)
+                               survival         +0.0763                       (+12.2%)
+
+**The tracking-reward figure is exact, the other two are luck-inflated.** `r_exec` is measured
+over the branch chunk *before* any continuation seed is drawn, so it carries no label noise —
+verified directly, its within-group spread under `--same_noise` is `0.000e+00`. `G` and survival
+depend on the continuation, so their oracle selects partly on luck; the honest version (select
+on seed A, score on seed B) was **not** computed. The old probe data cannot give it — its second
+seed ran on sibling 0 only (`{0: 37, 1: 0, 2: 0, 3: 0}`) — and the re-run with the current code
+(`--second_seed_every 1`, ~17 s/group) was stopped at 14 groups.
+
+So: the fine-tunes captured **more than half of all the room that exists** in chunk choice on
+the metric they moved, and the remaining lever is about +0.008.
+
+### An independent method agrees
+
+`scripts/flow_matching/advantage_aliasing_probe.py`, 60k Isaac windows, kNN in the generator's
+own conditioning space (local Var of the score among neighbours, against its global Var):
+
+| score | variance explained by (state, action) | contributed by the ACTION |
+|---|---|---|
+| `A_MC` | 0.09 | **0.0%** |
+| tracking reward, demeaned by family × progress × speed | 0.56 | **1.1%** |
+
+1.1% observational against 1.6% causal, from unrelated instruments.
+
+### Three traps in that probe, each of which produced a plausible wrong reading
+
+1. **`history` is PAST ACTIONS.** `record_rollouts.py:401` stores the generator's own
+   previously-served nodes, and they linearly predict **45%** of the next chunk (held out *by
+   episode* — adjacent windows share three of four history nodes, so a row split leaks). Drop
+   history and the action's apparent share jumps 1.1% → 10.4%. That is the action standing in
+   for removed state, not a discovery. Quote the with-history number.
+2. **The t-SNE's structure is terrain**, not advantage: family kNN lift 2.63×, advantage sign
+   1.00×, held-out-tile control 1.00×.
+3. **Raw tracking reward is 16.4% between-stratum**, so colour by it demeaned or you re-find
+   terrain and call it signal.
+
+### Two embedding bugs found while doing this, both silent
+
+- `_block_embed` re-standardized every retained PCA component to unit variance. `cmd_future` is
+  192 dims of a command that barely moves within a re-plan window and has effective rank 10, so
+  components 10–15 (down to `3.07e-08` of the block against a leading `3.35e-01`) were float32
+  round-off divided by its own size — one window landed at 236σ. That both hijacked the global
+  PCA (its first component became "the direction isolating that row") and gave six of 64
+  dimensions to noise, which blurs neighbourhoods and biases the statistic *toward* the
+  no-separation answer. A variance floor was the first fix and was **not** sufficient: the block
+  is near-degenerate in a graded way, and on the reward row-set a component survived a 1e-4
+  floor and still reached 110σ. The fix is a **single scalar per block** — no threshold, so a
+  direction carrying no variance contributes no distance on any data.
+- `_zscore` pooled its mean over non-finite values. The height scan carries `-inf` for a missed
+  ray by construction, which makes a column's mean `-inf`, every centred value NaN, and the
+  finite-guard then zeroes the **whole column** — so the `proprio,scan,goal,twist_linear` arm
+  had been silently returning numbers identical to proprio-only.
+
+Both are pinned by `source/robot_rl/tests/test_aliasing_probe_embedding.py`, including a test
+asserting the unfixed path is visibly wrong so the fix cannot be silently reverted.
+
+### What would reopen this
+
+Not a better critic. **The ceiling is a property of the generator's conditional, not of the
+scorer** — it is how much two chunks drawn at one state can differ in consequence. It reopens if
+that spread grows (a wider sampling temperature, a less peaked conditional), or if the target
+changes to one with more room: survival's ceiling is 4× the reward's, and its held-out value was
+never measured. See the sampling-variance result — 20% of draws fall at 0.8 m/s — for why the
+*survival* headroom is real even though the reward headroom is not.
+
+### Caveats on the ceiling
+
+- **One cell.** Tile 6 (stairs-up) at 0.8 m/s, chosen because K=1 success sits near 0.5 there,
+  which maximises the survival arm's power. It is not a claim about the whole distribution.
+- **K=4.** A larger K raises the oracle gain; the *variance* decomposition (1.6%) does not
+  depend on K, and it is the more portable number.
 
 ## Appendix A: how to reproduce
 

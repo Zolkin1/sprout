@@ -80,6 +80,38 @@ def _bandwise_gate(p_state: np.ndarray, labels: np.ndarray, failed: np.ndarray,
     return out
 
 
+def _commanded_speed(stem: str, uid: np.ndarray, ridx: np.ndarray) -> np.ndarray:
+    """``|v_xy|`` commanded at each labelled window, joined from the recording BY KEY.
+
+    Args:
+        stem: Rollout stem (without ``.h5``).
+        uid: ``[W]`` episode ids of the rows being labelled.
+        ridx: ``[W]`` re-plan indices of those rows.
+
+    Returns:
+        ``[W]`` commanded planar speed in m/s.
+
+    Raises:
+        SystemExit: If any labelled row has no matching window. The fit drops censored and
+            post-latch rows, so the tables differ in LENGTH -- a positional join would line
+            up silently and mis-assign every speed.
+    """
+    import h5py  # noqa: PLC0415
+
+    with h5py.File(stem + ".h5", "r") as f:
+        n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+        cmd0 = f["cmd_future"][:n, 0, :2]      # the command in force at the window
+        w_uid, w_ri = f["episode_uid"][:n], f["replan_index"][:n]
+    key_w = w_uid.astype(np.int64) * 100000 + w_ri.astype(np.int64)
+    key_l = uid.astype(np.int64) * 100000 + ridx.astype(np.int64)
+    order = np.argsort(key_w)
+    pos = order[np.searchsorted(key_w, key_l, sorter=order)]
+    if not (key_w[pos] == key_l).all():
+        raise SystemExit(f"{stem}.h5 has no window for some labelled rows; the recording and "
+                         "the predictions do not describe the same run.")
+    return np.linalg.norm(cmd0[pos], axis=1)
+
+
 def main() -> int:
     """Entry point."""
     p = argparse.ArgumentParser(description=__doc__,
@@ -97,6 +129,33 @@ def main() -> int:
                         "a predictions.npz from a fit with a quality head.")
     p.add_argument("--n", type=int, default=8,
                    help="Advantage look-ahead in re-plans (8 = 1.92 s at K=12, 50 Hz).")
+    p.add_argument("--rollout", default="",
+                   help="Rollout stem, needed only for --speed_bins: the commanded velocity "
+                        "lives in the recording's `cmd_future`, not in predictions.npz. "
+                        "Joined BY KEY on (episode_uid, replan_index), since the fit dropped "
+                        "censored and post-latch rows and the two tables differ in length.")
+    p.add_argument("--speed_bins", type=int, default=1,
+                   help="Cross the cut with this many EQUAL-COUNT commanded-speed bins. 1 "
+                        "(the default) does not stratify on speed. Without it a Monte-Carlo "
+                        "advantage selects faster commands -- measured 0.33 keep rate above "
+                        "1.3 m/s against 0.23 below 0.9 -- so the fine-tune would see a "
+                        "different speed distribution from the recording, and a control arm "
+                        "filtered by a different rule skews the other way, which confounds "
+                        "the comparison with the thing being compared. Quantile edges, not "
+                        "fixed ones: a fixed grid puts a handful of rows in the extreme bins "
+                        "and a percentile over a handful of rows is noise.")
+    p.add_argument("--progress_bins", type=int, default=1,
+                   help="Cross the per-family percentile with this many NORMALIZED PROGRESS "
+                        "bins. 1 (the default) is the historical family-only cut, which "
+                        "over-selects the openings of surviving episodes because a "
+                        "Monte-Carlo advantage is biased positive there -- the critic hedges "
+                        "while the outcome is uncertain and the survivors beat the hedge. 5 "
+                        "flattens the keep rate across the episode.")
+    p.add_argument("--tail_chunks", type=int, default=1,
+                   help="Trailing chunks the non-failure tail averages. MUST match the value "
+                        "the critic's own fit used (fit_value.py stamps it as `tail_chunks`); "
+                        "a mismatch makes this advantage's G a different quantity from the "
+                        "one its baseline was trained to predict.")
     p.add_argument("--percentile", type=float, default=35.0,
                    help="Within-family percentile below which a chunk is negative.")
     p.add_argument("--null_spread", type=float, default=0.02,
@@ -142,16 +201,45 @@ def main() -> int:
         g_hat, g_valid = d[qkey], d["g_valid"].astype(bool)
         reward = d["chunk_reward"]
         gamma = float(d["gamma"]) if "gamma" in d.files else 0.95
-        # Rows with no measured reward (the last window of every episode) contribute a zero
-        # to the n-step sum, which is what the truncation already assumes past the end.
+        # The validity mask is PASSED, not pre-zeroed. Zero-filling the last window of each
+        # episode charges it for a chunk that was never measured; dropping it is what
+        # `normalized_returns` -- the recursion the quality head was fitted to -- does, and it
+        # is what makes this advantage's G the same quantity its own baseline predicts.
         a, boot = adv_mod.combined_n_step_advantage(
-            p_fail, g_hat, np.where(g_valid, reward, 0.0), uid, ridx, failed, args.n,
-            gamma=gamma, w_fail=float(args.w_fail))
+            p_fail, g_hat, reward, uid, ridx, failed, args.n,
+            gamma=gamma, w_fail=float(args.w_fail), valid=g_valid,
+            tail_chunks=int(args.tail_chunks))
         print(f"[label] combined V: w_fail {args.w_fail:.2f} / w_track "
               f"{1 - float(args.w_fail):.2f}, gamma {gamma}, "
               f"{int(g_valid.sum())}/{g_valid.size} windows carry a measured reward")
+    # PROGRESS STRATA, crossed with the family. A Monte-Carlo advantage is systematically
+    # positive early in a surviving episode (the critic hedges when the outcome is still
+    # uncertain, and the survivors beat the hedge), so a family-only cut over-selects episode
+    # OPENINGS and under-selects their ends -- which is where the terrain is. Computed from
+    # the table's own last index per episode, not from any recorded length, because the fit
+    # drops censored episodes and every window at or after the first bad step.
+    strata = None
+    n_prog, n_speed = int(args.progress_bins), int(args.speed_bins)
+    if n_speed > 1 and not args.rollout:
+        raise SystemExit("--speed_bins needs --rollout: the commanded velocity is in the "
+                         "recording's `cmd_future`, not in predictions.npz.")
+    if n_prog > 1:
+        _, inv = np.unique(uid, return_inverse=True)
+        last = np.zeros(uid.size, dtype=np.int64)
+        np.maximum.at(last, inv, ridx)
+        denom = np.maximum(last[inv], 1)
+        prog = np.where(last[inv] > 0, ridx / denom, 0.0)
+        strata = np.clip((prog * n_prog).astype(np.int64), 0, n_prog - 1)
+        print(f"[label] stratifying the cut by family x {n_prog} progress bins")
+    if n_speed > 1:
+        speed = _commanded_speed(args.rollout, uid, ridx)
+        edges = np.quantile(speed, np.linspace(0.0, 1.0, n_speed + 1))[1:-1]
+        sb = np.searchsorted(edges, speed).astype(np.int64)
+        strata = sb if strata is None else (strata * n_speed + sb)
+        qs = ", ".join(f"{e:.2f}" for e in edges)
+        print(f"[label] ... x {n_speed} equal-count speed bins (edges {qs} m/s)")
     labels, per_family = adv_mod.binarize(
-        a, fam, percentile=args.percentile, null_spread=args.null_spread)
+        a, fam, strata=strata, percentile=args.percentile, null_spread=args.null_spread)
     if args.exclude_tile_holdout:
         labels = np.where(val_tile, adv_mod.LABEL_NULL, labels)
 
@@ -187,6 +275,9 @@ def main() -> int:
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
     meta = {"n": int(args.n), "variant": args.variant, "percentile": float(args.percentile),
             "null_spread": float(args.null_spread), "num_folds": folds,
+            "w_fail": float(args.w_fail), "progress_bins": int(args.progress_bins),
+            "speed_bins": int(args.speed_bins), "rollout": args.rollout,
+            "tail_chunks": int(args.tail_chunks),
             "predictions": os.path.abspath(args.predictions),
             "counts": counts, "per_family": {str(k): v for k, v in per_family.items()},
             "g2_bands": gate}

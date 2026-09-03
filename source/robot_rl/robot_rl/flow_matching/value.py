@@ -97,6 +97,35 @@ class ValueInputs:
     context: torch.Tensor | None = None
 
 
+#: Width of the goal block in the scalar-context token: ``goal_downrange_m``,
+#: ``goal_lateral_m``, ``goal_height_err_m``, each on the declared metre scale.
+GOAL_BLOCK_WIDTH: int = 3
+
+
+def context_width(*, privileged: bool, goal_context: bool = True) -> int:
+    """Width of the scalar-context token, the ONE place that arithmetic is done.
+
+    Four sites build this vector -- the fit, the mjeval reader, the Isaac online scorer and
+    the out-of-fold predictor -- and every one of them used to restate ``3 + (6 if priv else
+    3)``. With ``goal_context`` now a per-checkpoint property that is four chances for the
+    stamp and the built width to disagree, and a disagreement is a linear layer fed the wrong
+    columns rather than a shape error: drop the goal from the batch but not from the model and
+    the twist slides into the goal's slots, which is finite and plausible.
+
+    Args:
+        privileged: The ``V_priv`` variant, which gets the FULL base twist. ``V_onboard`` gets
+            the angular half alone, since nothing on the robot measures the linear half
+            without odometry.
+        goal_context: Whether the goal offsets are in the token at all. ``False`` is the
+            ablation arm: it asks whether the critic can predict failure with no idea how far
+            the goal is, which the module docstring above predicts it cannot.
+
+    Returns:
+        The width, in scalars.
+    """
+    return (GOAL_BLOCK_WIDTH if goal_context else 0) + (6 if privileged else 3)
+
+
 def two_hot(target: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
     """Distribute each scalar target across the two support bins that bracket it.
 

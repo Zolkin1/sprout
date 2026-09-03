@@ -337,7 +337,7 @@ def chunk_reward(err: torch.Tensor, spec: TrackingErrorSpec = BOOTSTRAP_SPEC) ->
 
 def normalized_return(chunk_rewards: Sequence[float] | torch.Tensor,
                       spec: TrackingErrorSpec = BOOTSTRAP_SPEC,
-                      *, failed: bool) -> float:
+                      *, failed: bool, tail_chunks: int = 1) -> float:
     """``G = (1 - gamma) * sum gamma^i R_i + tail``, in ``[0, 1]``.
 
     **How the episode ENDED decides the tail.**  ``failed=True`` gives a zero tail -- nothing
@@ -351,6 +351,13 @@ def normalized_return(chunk_rewards: Sequence[float] | torch.Tensor,
         chunk_rewards: ``[T]`` per-chunk rewards, earliest first, truncated at the terminal
             event (for a latched episode, at the latch).
         spec: Supplies ``gamma``.
+        tail_chunks: How many trailing chunk rewards the non-failure tail averages. ``1``
+            (the default) is what every existing artifact was built under; the tail is
+            stamped nowhere, so changing the DEFAULT would silently re-price every critic
+            already fitted. Larger values trade a little bias for variance -- the tail
+            carries a median 52% of ``G`` on a survived episode, so resting it on one
+            measurement is what makes it worth averaging. MUST match whatever built the
+            quality head's target.
         failed: Whether the truncation point is a FAILURE.  Keyword-only with no default: the
             two answers differ by more than 2x on a short episode.
 
@@ -363,5 +370,8 @@ def normalized_return(chunk_rewards: Sequence[float] | torch.Tensor,
     g = float(spec.gamma)
     disc = g ** torch.arange(r.numel(), dtype=torch.float64)
     head = (1.0 - g) * float((r * disc).sum())
-    tail = 0.0 if failed else float(g ** r.numel() * r[-1])
+    # The tail averages the last `tail_chunks` rewards, clamped to the episode's own
+    # length so a short one averages what it has rather than reaching past its start.
+    k = max(1, min(int(tail_chunks), r.numel()))
+    tail = 0.0 if failed else float(g ** r.numel() * float(r[-k:].mean()))
     return head + tail

@@ -14,7 +14,8 @@ import numpy as np
 import pytest
 
 from robot_rl.flow_matching.advantage import (
-    LABEL_NEGATIVE, LABEL_NULL, LABEL_POSITIVE, binarize, label_from_name, n_step_advantage,
+    LABEL_NEGATIVE, LABEL_NULL, LABEL_POSITIVE, binarize, combined_n_step_advantage,
+    label_from_name, n_step_advantage, normalized_returns,
 )
 from robot_rl.flow_matching.rollout_dataset import join_labels
 
@@ -242,3 +243,142 @@ def test_the_return_stays_in_the_declared_support_and_flags_unusable_episodes():
 
     with pytest.raises(ValueError, match="gamma"):
         adv.normalized_returns(r, ok, uid, ridx, np.zeros(m, bool), gamma=1.0)
+
+
+def test_the_combined_advantage_at_a_long_horizon_IS_the_monte_carlo_one():
+    """``w_fail = 0`` with ``n`` past the longest episode must equal ``G - G_hat`` exactly.
+
+    That is the identity the filtered-BC label rests on: ``A_MC = G_t - V(s_t)`` is only an
+    advantage if its ``G`` is the quantity the baseline was fitted to predict, which is
+    :func:`normalized_returns`'. Two things used to break it, and both are invisible in the
+    output -- the reward sum included each episode's placeholder final row, and the
+    non-failure tail closed on ``G_hat[-1]`` (a prediction) where ``normalized_returns``
+    closes on ``r[-1]`` (the last measurement). They agreed on FAILED episodes, where the
+    tail is 0 either way, so half the data looked correct.
+    """
+    rng = np.random.default_rng(5)
+    uid, ri, rew, fail, ok = [], [], [], [], []
+    for e in range(9):
+        m = int(rng.integers(3, 12))
+        f = bool(e % 3 == 0)
+        uid += [e] * m
+        ri += list(range(m))
+        rew += list(rng.uniform(0.1, 1.0, size=m - 1)) + [0.0]   # the placeholder last row
+        fail += [f] * m
+        ok += [True] * (m - 1) + [False]
+    order = rng.permutation(len(uid))                            # rows need not arrive sorted
+    uid = np.asarray(uid)[order]
+    ri = np.asarray(ri)[order]
+    rew = np.asarray(rew)[order]
+    fail = np.asarray(fail)[order]
+    ok = np.asarray(ok)[order]
+    gam = 0.95
+
+    g, g_ok = normalized_returns(rew, ok, uid, ri, fail, gamma=gam)
+    q = g + rng.normal(0.0, 0.05, size=g.size)                   # a plausible baseline
+    a, _ = combined_n_step_advantage(np.zeros(g.size), q, rew, uid, ri, fail, 500,
+                                     gamma=gam, w_fail=0.0, valid=ok)
+    assert np.abs(a[g_ok] - (g - q)[g_ok]).max() < 1e-12
+
+    # And the survival control arm is untouched by any of it.
+    p = rng.uniform(0.0, 1.0, size=g.size)
+    s1, _ = combined_n_step_advantage(p, q, rew, uid, ri, fail, 4, gamma=gam,
+                                      w_fail=1.0, valid=ok)
+    s2, _ = n_step_advantage(p, uid, ri, fail, 4)
+    assert np.abs(s1 - s2).max() == 0.0
+
+
+def test_the_cut_can_be_stratified_beyond_the_family():
+    """``strata`` must make the positive rate flat in the stratum, not just in the family.
+
+    A Monte-Carlo advantage drifts with position in the episode, so a family-only percentile
+    keeps disproportionately many chunks from wherever the drift is high. The synthetic case
+    here is that drift and nothing else: one family, an advantage that rises with the bin.
+    """
+    rng = np.random.default_rng(6)
+    n_per = 4000
+    bins = np.repeat(np.arange(5), n_per)
+    adv = rng.normal(size=bins.size) * 0.1 + bins * 0.5      # a strong positional trend
+    fam = np.zeros(bins.size, dtype=np.int64)
+
+    flat, _ = binarize(adv, fam, percentile=50.0, null_spread=0.0)
+    strat, rep = binarize(adv, fam, strata=bins, percentile=50.0, null_spread=0.0)
+
+    rate_flat = [float((flat[bins == b] == LABEL_POSITIVE).mean()) for b in range(5)]
+    rate_str = [float((strat[bins == b] == LABEL_POSITIVE).mean()) for b in range(5)]
+    # Family-only: the trend decides everything -- the low bins are all negative.
+    assert rate_flat[0] < 0.02 and rate_flat[-1] > 0.98
+    # Stratified: every bin keeps its own half.
+    assert all(abs(r - 0.5) < 0.02 for r in rate_str), rate_str
+    # And the report says which grouping produced it, rather than looking family-keyed.
+    assert all(isinstance(k, str) and "stratum=" in k for k in rep)
+
+
+def test_the_success_tail_can_average_several_chunks_and_defaults_to_one():
+    """``tail_chunks`` must average the last k rewards on a success, and change nothing else.
+
+    Three properties, because each can break independently:
+
+    * the DEFAULT is 1, reproducing every artifact built before the argument existed -- the
+      tail is stamped in no old checkpoint, so a changed default would score a fitted critic
+      against a target it never saw;
+    * a FAILED episode is untouched at any k (its tail is absorbing at 0);
+    * the tail really is the mean of the last k, which is checkable in closed form: the last
+      surviving chunk's ``G`` is ``(1-g) R_last + g * mean(last k)``.
+    """
+    uid = np.zeros(6, dtype=np.int64)
+    ri = np.arange(6)
+    rew = np.array([0.2, 0.4, 0.6, 0.8, 0.9, 0.0])   # last row is the placeholder
+    ok = np.array([True] * 5 + [False])
+    g = 0.9
+
+    base, _ = normalized_returns(rew, ok, uid, ri, np.zeros(6, bool), gamma=g)
+    k1, _ = normalized_returns(rew, ok, uid, ri, np.zeros(6, bool), gamma=g, tail_chunks=1)
+    assert np.array_equal(base, k1), "the default must be tail_chunks=1"
+
+    k3, ok3 = normalized_returns(rew, ok, uid, ri, np.zeros(6, bool), gamma=g, tail_chunks=3)
+    want_tail = float(np.mean([0.6, 0.8, 0.9]))
+    assert k3[4] == pytest.approx((1 - g) * 0.9 + g * want_tail)
+    # Direction, stated so it cannot be misread: on a RISING reward trace the average pulls
+    # the tail DOWN toward the earlier, worse chunks (0.767 against the final 0.9); on a
+    # falling one it lifts it. The purpose is variance, not a directional correction.
+    assert k3[4] < k1[4]
+    assert k1[4] == pytest.approx(0.9), "at k=1 the last chunk's G IS its own reward"
+
+    # A failure is absorbing at 0 regardless of k.
+    f1, _ = normalized_returns(rew, ok, uid, ri, np.ones(6, bool), gamma=g, tail_chunks=1)
+    f3, _ = normalized_returns(rew, ok, uid, ri, np.ones(6, bool), gamma=g, tail_chunks=3)
+    assert np.array_equal(f1, f3)
+
+    # An episode shorter than k averages what it has rather than reaching past its start.
+    su, sr, so = np.zeros(3, np.int64), np.array([0.4, 0.8, 0.0]), np.array([True, True, False])
+    short, _ = normalized_returns(sr, so, su, np.arange(3), np.zeros(3, bool),
+                                  gamma=g, tail_chunks=9)
+    assert short[1] == pytest.approx((1 - g) * 0.8 + g * float(np.mean([0.4, 0.8])))
+
+
+def test_the_combined_advantage_tracks_the_same_tail():
+    """``combined_n_step_advantage`` must use the SAME tail, or ``A_MC`` stops being one.
+
+    Its baseline is a head fitted to ``normalized_returns``' target, so the two tails have to
+    agree for ``G - G_hat`` to be a difference of like quantities. At a long horizon the
+    identity is exact, which is what this checks -- at ``tail_chunks=3`` on both sides.
+    """
+    rng = np.random.default_rng(11)
+    uid, ri, rew, fail, ok = [], [], [], [], []
+    for e in range(7):
+        m = int(rng.integers(4, 11))
+        f = bool(e % 2)
+        uid += [e] * m
+        ri += list(range(m))
+        rew += list(rng.uniform(0.1, 1.0, size=m - 1)) + [0.0]
+        fail += [f] * m
+        ok += [True] * (m - 1) + [False]
+    uid, ri = np.asarray(uid), np.asarray(ri)
+    rew, fail, ok = np.asarray(rew), np.asarray(fail), np.asarray(ok)
+
+    g, g_ok = normalized_returns(rew, ok, uid, ri, fail, gamma=0.95, tail_chunks=3)
+    q = g + rng.normal(0.0, 0.05, size=g.size)
+    a, _ = combined_n_step_advantage(np.zeros(g.size), q, rew, uid, ri, fail, 500,
+                                     gamma=0.95, w_fail=0.0, valid=ok, tail_chunks=3)
+    assert np.abs(a[g_ok] - (g - q)[g_ok]).max() < 1e-12

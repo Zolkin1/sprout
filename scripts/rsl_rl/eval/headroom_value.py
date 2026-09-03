@@ -106,6 +106,9 @@ class OnlineValueScorer:
             anything else reintroduces the copy this module exists to avoid.
         scan_sensor: Name of the privileged scanner, passed to ``mdp.scan_obs_stack``.
             Required when ``priv``, refused otherwise.
+        goal_context: Whether the three goal offsets go into the context token.  Comes from
+            the checkpoint's own ``goal_context`` stamp; it cannot be inferred from the width,
+            since 6 is both ``V_onboard`` with the goal and ``V_priv`` without it.
 
     Raises:
         ValueError: When ``priv`` disagrees with the model's own tokens, when the declared
@@ -115,10 +118,11 @@ class OnlineValueScorer:
     """
 
     def __init__(self, model, ctx, *, priv: bool, scan_hw, device,
-                 scan_sensor: str | None) -> None:
+                 scan_sensor: str | None, goal_context: bool = True) -> None:
         self.model = model
         self.ctx = ctx
         self.priv = bool(priv)
+        self.goal_context = bool(goal_context)
         self.device = torch.device(device)
         self.scan_sensor = scan_sensor
         self.scan_hw = None if scan_hw is None else (int(scan_hw[0]), int(scan_hw[1]))
@@ -155,14 +159,20 @@ class OnlineValueScorer:
                     f"({self.scan_sensor}) is read. Passing one is a statement that the scan "
                     "reaches the critic, and it does not -- refused rather than ignored.")
 
-        want_ctx = 3 + (6 if self.priv else 3)
+        from robot_rl.flow_matching import value as _fmvalue  # noqa: PLC0415
+
+        want_ctx = _fmvalue.context_width(privileged=self.priv,
+                                          goal_context=self.goal_context)
         ctx_in = getattr(model, "context_in", None)
         if ctx_in is not None and int(ctx_in[0].in_features) != want_ctx:
             raise ValueError(
                 f"the checkpoint's context token is {int(ctx_in[0].in_features)} wide but "
-                f"priv={self.priv} builds {want_ctx} (3 goal offsets + "
-                f"{'6' if self.priv else '3'} twist). The two variants differ ONLY here and "
-                "in the tokens, so this is where a mislabelled checkpoint shows up.")
+                f"priv={self.priv} / goal_context={self.goal_context} builds {want_ctx} "
+                f"({'3 goal offsets + ' if self.goal_context else 'NO goal + '}"
+                f"{'6' if self.priv else '3'} twist). The arms differ ONLY here and in the "
+                "tokens, so this is where a mislabelled checkpoint shows up -- and note a "
+                "width of 6 is reachable two ways, which is why `goal_context` travels as a "
+                "stamp rather than being read off this number.")
 
         # Precomputed once: `_batch` builds this tensor per call, and the strided indexing is
         # the step most easily done in the wrong order (index the batch, then the steps).
@@ -315,13 +325,18 @@ class OnlineValueScorer:
 
         # Goal offsets on a DECLARED metre scale rather than a fitted statistic, so a critic's
         # notion of "far" is a property of the robot and not of whichever rollout was on disk.
-        goal = self._goal_offsets(tracker, ids).to(torch.float32) / self._goal_scale_m
-        goal = torch.nan_to_num(goal, nan=0.0, posinf=0.0, neginf=0.0)
+        goal = None
+        if self.goal_context:
+            goal = self._goal_offsets(tracker, ids).to(torch.float32) / self._goal_scale_m
+            goal = torch.nan_to_num(goal, nan=0.0, posinf=0.0, neginf=0.0)
         twist = self._f32(self._twist_yaw(tracker.accum.rd, ids))
         # ONBOARD keeps only the ANGULAR half: an IMU measures body rates and the yaw frame is
         # reachable from those plus its own roll/pitch, but nothing on the robot measures the
         # linear half without odometry.
-        context = torch.cat([goal, twist if self.priv else twist[:, 3:]], dim=-1)
+        # The goal is PREPENDED when present, matching `fit_value._batch`: it owns columns
+        # 0:3 and the twist follows, so a with-goal checkpoint's columns never move.
+        half = twist if self.priv else twist[:, 3:]
+        context = half if goal is None else torch.cat([goal, half], dim=-1)
 
         return value.ValueInputs(
             history=hist, extero=ext, cmd_tokens=cmd_tokens,

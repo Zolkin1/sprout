@@ -576,6 +576,9 @@ def stage_select(args) -> int:
                     "shapes and three wrong normalizers and nothing downstream can detect "
                     "it. Re-plan against the critic's generator, or refit the critic.")
             priv = bool(ck["privileged"])
+            # See `fit_value`'s stamp: absent means "fitted before the flag existed", and
+            # every such checkpoint carried the goal.
+            goal_ctx = bool(ck.get("goal_context", True))
             model = fmvalue.FlowValueModel(
                 copy.deepcopy(cmd.ctx.model),
                 scan_hw=(tuple(ck["scan_hw"]) if priv else None),
@@ -585,8 +588,10 @@ def stage_select(args) -> int:
             model.load_state_dict(ck["model"])
             scorer = headroom_value.OnlineValueScorer(
                 model, cmd.ctx, priv=priv, scan_hw=(tuple(ck["scan_hw"]) if priv else None),
-                device=device, scan_sensor=(args.scan_sensor if priv else None))
+                device=device, scan_sensor=(args.scan_sensor if priv else None),
+                goal_context=goal_ctx)
             print(f"[select] critic {ck.get('variant','?')} priv={priv} "
+                  f"goal_context={goal_ctx} "
                   f"fitted over {os.path.basename(os.path.dirname(named))}")
 
         if args.steer_kp != 0.0:

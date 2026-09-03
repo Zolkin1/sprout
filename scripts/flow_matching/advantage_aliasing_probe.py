@@ -105,6 +105,12 @@ def _hidden_block_raw(name: str, W: dict[str, np.ndarray]) -> np.ndarray:
 
 #: Raw columns the generator's own conditioning reads -- ``encode_prefix``'s three arguments,
 #: literally.  Nothing else is part of ``s_partial`` no matter what the critic also sees.
+#: The generator's conditioning, and the DEFAULT definition of "state" here -- exactly the
+#: three arguments of ``FlowMatchingTransformer.encode_prefix``.
+#:
+#: ``history`` is the generator's own previously-served nodes, so it is PAST ACTIONS. It is
+#: state in the sense that the model reads it, and not state in the sense that the policy
+#: chose it -- which is why ``--state_blocks`` exists rather than this being a constant.
 PARTIAL_COLUMNS: tuple[str, ...] = ("history", "extero", "cmd_future")
 
 
@@ -216,37 +222,85 @@ def _zscore(x: np.ndarray) -> np.ndarray:
     against a unit-ish command) dominates every distance and the neighbourhood is effectively
     conditioned on that block alone -- the exact failure mode the method note warns about.
 
+    **Statistics are pooled over FINITE values only, and that is load-bearing.** The height
+    scan carries ``-inf`` for a missed ray by construction. Taking the mean over it makes the
+    column mean ``-inf``, every centred value in that column NaN, and the finite-guard below
+    then maps the WHOLE COLUMN to zero -- so a block silently disappears while the run still
+    prints its dimension count. Measured: the ``proprio,scan,goal,twist_linear`` arm raised
+    this and returned numbers indistinguishable from the proprio-only arm.
+
     Args:
         x: ``[N, D]`` raw features.
 
     Returns:
-        ``[N, D]``, zero mean and unit variance per column; constant columns are left at zero
-        rather than divided by zero.
+        ``[N, D]``, zero mean and unit variance per column over the finite entries; non-finite
+        entries are imputed to the column mean (0.0 after centring) and constant columns are
+        left at zero rather than divided by zero.
     """
-    mu = x.mean(axis=0, keepdims=True)
-    sd = x.std(axis=0, keepdims=True)
-    sd = np.where(sd < 1e-8, 1.0, sd)
-    z = (x - mu) / sd
+    finite = np.isfinite(x)
+    if not finite.all():
+        # Reported rather than merely handled: a column that is mostly imputed is not
+        # evidence about the signal it names, and the caller has to be able to see that.
+        frac = 1.0 - float(finite.mean())
+        worst = float((~finite).mean(axis=0).max())
+        print(f"[alias] _zscore: {100 * frac:.3f}% of values non-finite (worst column "
+              f"{100 * worst:.1f}%); pooling over finite entries and imputing to the mean")
+    xf = np.where(finite, x, np.nan)
+    with np.errstate(invalid="ignore"):
+        mu = np.nanmean(xf, axis=0, keepdims=True)
+        sd = np.nanstd(xf, axis=0, keepdims=True)
+    mu = np.where(np.isfinite(mu), mu, 0.0)
+    sd = np.where(np.isfinite(sd) & (sd >= 1e-8), sd, 1.0)
+    z = (np.where(finite, x, mu) - mu) / sd
     return np.where(np.isfinite(z), z, 0.0).astype(np.float32)
 
 
-def _block_embed(raw: np.ndarray, n_components: int, seed: int) -> np.ndarray:
-    """One SOURCE's raw features -> a fixed-rank, re-standardized embedding.
+#: Components below this fraction of a block's variance are dropped outright. It is a cheap
+#: guard against an EXACTLY degenerate direction (a constant column, a duplicated sensor), not
+#: the mechanism that keeps near-degenerate ones in their place -- that is the single-scalar
+#: normalization in :func:`_block_embed`, which needs no threshold. A floor was tried as the
+#: primary fix and was abandoned: `cmd_future` is near-degenerate in a graded way, so on one
+#: row-set it left a component just above 1e-4 that still reached 110 sigma when whitened.
+MIN_COMPONENT_EVR: float = 1e-8
+
+
+def _block_embed(raw: np.ndarray, n_components: int, seed: int,
+                 name: str = "") -> np.ndarray:
+    """One SOURCE's raw features -> a rank-limited, re-standardized embedding.
 
     This is what makes concatenating sources across very different native widths fair: after
     z-scoring, a block's total variance mass equals its raw dimension count, so a naive
     concatenation gives ``extero`` (~7800 dims) roughly 20x the say of ``action`` (352 dims)
-    regardless of which one actually predicts the advantage. Reducing every source to the SAME
-    ``n_components`` and re-standardizing the result gives each one an equal, fixed variance
-    budget before it ever reaches the shared kNN space.
+    regardless of which one actually predicts the advantage. Reducing every source to a
+    bounded rank and re-standardizing the result gives each one a comparable variance budget
+    before it ever reaches the shared kNN space.
+
+    **The block is scaled by ONE scalar, never whitened per component, and that distinction
+    was a bug.** Re-standardizing each retained component to unit variance declares every
+    direction equally important, which inverts the block's own spectrum: a near-degenerate
+    direction gets the same say in every distance as the leading one, and its content is
+    float round-off. Measured on v4_big, ``cmd_future`` is 192 dims of a command that barely
+    moves within a re-plan window; its 16th component held 3.07e-08 of the block against a
+    leading 3.35e-01, and whitening put one window 236 sigma out. That both wrecked the global
+    PCA -- its first component became "the direction isolating that one row" -- and blurred
+    every neighbourhood through six noise dimensions, which biases the local-variance
+    statistic TOWARD the no-separation answer the probe exists to test.
+
+    A variance FLOOR was the first fix and is not sufficient: the same block is near-degenerate
+    in a graded way, so on the reward row-set a component survived a 1e-4 floor and still
+    reached 110 sigma. Raising the floor only moves the failure to the next dataset. Scaling
+    the whole block by ``sqrt(k / total_variance)`` instead needs no threshold: a direction
+    carrying no variance contributes no distance, automatically and on any data.
 
     Args:
         raw: ``[N, D]`` one source's raw (not yet standardized) features.
-        n_components: Target rank; clipped to ``min(N, D)``.
+        n_components: Rank CEILING; clipped to ``min(N - 1, D)`` and then trimmed to the
+            components carrying at least :data:`MIN_COMPONENT_EVR` of the block.
         seed: RNG seed for the randomized PCA solver.
+        name: Block name, for the retained-rank line. Purely diagnostic.
 
     Returns:
-        ``[N, k]``, ``k = min(n_components, N-1, D)``, zero mean and unit variance per column.
+        ``[N, k]`` with ``k <= n_components``, zero mean and unit variance per column.
     """
     from sklearn.decomposition import PCA  # noqa: PLC0415
 
@@ -254,8 +308,24 @@ def _block_embed(raw: np.ndarray, n_components: int, seed: int) -> np.ndarray:
     k = int(min(n_components, z.shape[0] - 1, z.shape[1]))
     if k <= 0:
         return np.zeros((z.shape[0], 0), dtype=np.float32)
-    emb = PCA(n_components=k, svd_solver="randomized", random_state=seed).fit_transform(z)
-    return _zscore(emb)
+    pca = PCA(n_components=k, svd_solver="randomized", random_state=seed)
+    emb = pca.fit_transform(z)
+    keep = pca.explained_variance_ratio_ >= MIN_COMPONENT_EVR
+    if not keep.any():
+        return np.zeros((z.shape[0], 0), dtype=np.float32)
+    emb = emb[:, keep]
+    # ONE scalar, so the block's TOTAL variance is its retained rank -- every block gets the
+    # same budget (the point of this function) while keeping its own spectrum, so a direction
+    # that carries almost nothing goes on carrying almost nothing.
+    total = float(emb.var(axis=0).sum())
+    emb = emb * np.sqrt(emb.shape[1] / total) if total > 0 else emb
+    var = emb.var(axis=0)
+    # The PARTICIPATION RATIO is the honest width of this block: 16 whitened columns always
+    # "look" 16-dimensional, whereas this says how many directions actually carry the block.
+    pr = float(var.sum() ** 2 / np.square(var).sum()) if total > 0 else 0.0
+    print(f"[alias] {name or 'block'}: {emb.shape[1]} components, effective width "
+          f"{pr:.1f} (participation ratio), max |z| {float(np.abs(emb).max()):.1f}")
+    return emb.astype(np.float32)
 
 
 def _action_features(fm_plan: np.ndarray, n_nodes: int) -> np.ndarray:
@@ -318,6 +388,12 @@ def main() -> int:
     p.add_argument("--rollout", required=True, help="Rollout stem, without .h5")
     p.add_argument("--advantage", required=True, help="advantage.npz from label_advantage.py")
     p.add_argument("--out", required=True)
+    p.add_argument("--state_blocks", default=",".join(PARTIAL_COLUMNS),
+                   help="Comma-separated generator-conditioning blocks forming z_partial, "
+                        f"from {list(PARTIAL_COLUMNS)}. Drop 'history' to ask whether the "
+                        "action looks redundant only because the generator's OWN PAST "
+                        "OUTPUT is already in the tuple -- history is the previously-served "
+                        "nodes, not a measurement of the robot.")
     p.add_argument("--hidden", default="proprio",
                    help="Comma-separated hidden-state blocks added to build z_full, from "
                         f"{sorted(HIDDEN_COLUMNS)}. Default is the specific worry: does the "
@@ -373,14 +449,26 @@ def main() -> int:
     print(f"[alias] advantage: mean {advantage.mean():+.4f}  sd {advantage.std():.4f}")
 
     hidden_cols = sorted({c for h in hidden_names for c in HIDDEN_COLUMNS[h]})
-    W = _fetch_rows(args.rollout, uid, ridx, list(PARTIAL_COLUMNS) + hidden_cols + ["fm_plan"])
+    state_cols = [c.strip() for c in args.state_blocks.split(",") if c.strip()]
+    unknown = [c for c in state_cols if c not in PARTIAL_COLUMNS]
+    if unknown:
+        raise SystemExit(f"--state_blocks has unknown block(s) {unknown}; "
+                         f"choose from {list(PARTIAL_COLUMNS)}")
+    if not state_cols and args.no_action:
+        raise SystemExit("--state_blocks is empty and --no_action is set, so z_partial would "
+                         "have no columns at all.")
+    if set(state_cols) != set(PARTIAL_COLUMNS):
+        print(f"[alias] z_partial state blocks: {state_cols} "
+              f"(dropped {sorted(set(PARTIAL_COLUMNS) - set(state_cols))})")
+    W = _fetch_rows(args.rollout, uid, ridx, state_cols + hidden_cols + ["fm_plan"])
 
-    raw_dims = {c: int(np.prod(W[c].shape[1:])) for c in PARTIAL_COLUMNS}
+    raw_dims = {c: int(np.prod(W[c].shape[1:])) for c in state_cols}
     print(f"[alias] raw dims per source: {raw_dims}  -- each embedded to rank "
           f"{args.block_components} separately before concatenation, so none of them buys "
           "extra say in the shared space by sheer sensor width")
-    partial_blocks = [_block_embed(_flatten(W[c]), args.block_components, args.seed)
-                      for c in PARTIAL_COLUMNS]
+    partial_blocks = [_block_embed(_flatten(W[c]), args.block_components, args.seed,
+                                   name=c)
+                      for c in state_cols]
 
     action_raw_dim = 0
     if args.no_action:
@@ -388,13 +476,15 @@ def main() -> int:
     else:
         action_raw = _action_features(W["fm_plan"], args.action_nodes)
         action_raw_dim = int(action_raw.shape[1])
-        action_emb = _block_embed(action_raw, args.block_components, args.seed)
+        action_emb = _block_embed(action_raw, args.block_components, args.seed,
+                                  name="action")
 
     hidden_raw_dim = 0
     if hidden_names:
         hidden_raw = np.concatenate([_hidden_block_raw(h, W) for h in hidden_names], axis=1)
         hidden_raw_dim = int(hidden_raw.shape[1])
-        hidden_emb = _block_embed(hidden_raw, args.block_components, args.seed)
+        hidden_emb = _block_embed(hidden_raw, args.block_components, args.seed,
+                                  name="+".join(hidden_names))
     else:
         hidden_emb = np.zeros((idx.size, 0), dtype=np.float32)
     # Shuffling the EMBEDDED rows is equivalent to shuffling the raw ones and re-fitting PCA --
@@ -403,7 +493,7 @@ def main() -> int:
     hidden_emb_shuf = hidden_emb[rng.permutation(hidden_emb.shape[0])]
 
     print(f"[alias] embedded dims: partial={sum(b.shape[1] for b in partial_blocks)} "
-          f"(3 x {args.block_components})  action={action_emb.shape[1]}"
+          f"({len(state_cols)} x {args.block_components})  action={action_emb.shape[1]}"
           f"{' (excluded, raw was ' + str(action_raw_dim) + ')' if args.no_action else ''}  "
           f"hidden({'+'.join(hidden_names) or 'none'})={hidden_emb.shape[1]} "
           f"(raw {hidden_raw_dim})")
@@ -521,7 +611,7 @@ def _plot_ratio_curves(rows: list[dict], hidden_names: list[str], out: str,
 
 def _plot_tsne(p_partial: np.ndarray, advantage: np.ndarray, p_full: np.ndarray,
               args: argparse.Namespace, ks: list[int]) -> None:
-    """t-SNE the partial-space embedding once, colour it two ways.
+    """Embed BOTH spaces, and colour them so the privileged blocks' effect is readable.
 
     One embedding does double duty: coloured by advantage, it shows where the outcome is good
     or bad; coloured by the FULL-space sign-disagreement rate at a representative ``k``, it
@@ -557,32 +647,88 @@ def _plot_tsne(p_partial: np.ndarray, advantage: np.ndarray, p_full: np.ndarray,
     print(f"[alias] t-SNE over {take:,} points (mean k={k_rep} full-space disagreement "
           f"{disagree['sign_disagree']:.3f})")
 
-    emb = TSNE(n_components=2, init="pca", random_state=args.seed,
-              perplexity=min(30, max(5, take // 100))).fit_transform(p_partial[sel])
+    # BOTH spaces are embedded, because the question is comparative: adding the critic's
+    # privileged blocks either pulls the colours apart or it does not, and only the two
+    # pictures side by side answer that.
+    #
+    # PCA is the primary projection. Deterministic, and it reports the variance it explains --
+    # so a 2-D picture that represents almost none of the data says so out loud instead of
+    # looking like a map, which t-SNE never does.
+    from sklearn.decomposition import PCA  # noqa: PLC0415
+    perp = min(30, max(5, take // 100))
+    spaces = {"z_partial": p_partial, "z_full": p_full}
+    pemb, emb, evr = {}, {}, {}
+    for zname, z in spaces.items():
+        # FIT on the central bulk, PROJECT everything. A single window can carry a whole
+        # feature direction on its own -- `cmd_future` has one that is ~0 on every other row
+        # -- and PCA maximizes variance, so an unrobust fit points its first component at
+        # that window and the remaining 7,999 collapse to a line. Outliers are still drawn,
+        # at the edge, where they belong; they just no longer choose the axes.
+        zz = z[sel]
+        r = np.linalg.norm(zz - np.median(zz, axis=0), axis=1)
+        bulk = r <= np.percentile(r, 99.5)
+        pca = PCA(n_components=2, random_state=args.seed).fit(zz[bulk])
+        pemb[zname] = pca.transform(zz)
+        evr[zname] = pca.explained_variance_ratio_
+        if not bulk.all():
+            print(f"[alias] {zname}: PCA fitted on the central {100 * bulk.mean():.1f}% "
+                  f"({int((~bulk).sum())} points excluded from the FIT, all still plotted)")
+        print(f"[alias] PCA(2) over {zname} ({z.shape[1]}d) explains "
+              f"{100 * evr[zname].sum():.1f}% of its variance "
+              f"({100 * evr[zname][0]:.1f} + {100 * evr[zname][1]:.1f})")
+        emb[zname] = TSNE(n_components=2, init="pca", random_state=args.seed,
+                          perplexity=perp).fit_transform(z[sel])
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
 
     tag = " (state only, no action)" if args.no_action else ""
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.6))
+    hid = "+".join(args.hidden.split(",")) if args.hidden else "none"
+    # ONE colour scale across every panel. Per-panel autoscaling would make the two spaces
+    # look different when only their spreads differ, which is the exact confusion this figure
+    # exists to resolve.
     vmax = float(np.percentile(np.abs(advantage[sel]), 95)) or 1.0
-    sc0 = axes[0].scatter(emb[:, 0], emb[:, 1], c=advantage[sel], cmap="coolwarm",
-                          vmin=-vmax, vmax=vmax, s=4, linewidths=0)
-    axes[0].set_title(f"t-SNE(z_partial), coloured by advantage{tag}")
-    fig.colorbar(sc0, ax=axes[0], shrink=0.85)
+    fig, axes = plt.subplots(2, 3, figsize=(16.0, 9.4))
 
-    sc1 = axes[1].scatter(emb[:, 0], emb[:, 1], c=per_point_disagree, cmap="viridis",
-                          vmin=0, vmax=1, s=4, linewidths=0)
-    axes[1].set_title(f"same embedding, coloured by full-space k={k_rep} sign disagreement{tag}")
-    fig.colorbar(sc1, ax=axes[1], shrink=0.85)
-
-    for ax in axes:
+    for row, (xy, proj) in enumerate(((pemb, "PCA"), (emb, "t-SNE"))):
+        for col, zname in enumerate(("z_partial", "z_full")):
+            frac = f" [{100 * evr[zname].sum():.1f}% var]" if proj == "PCA" else ""
+            sc = axes[row][col].scatter(xy[zname][:, 0], xy[zname][:, 1], c=advantage[sel],
+                                        cmap="coolwarm", vmin=-vmax, vmax=vmax, s=4,
+                                        linewidths=0)
+            what = "generator's own view" if zname == "z_partial" else f"+ privileged {hid}"
+            axes[row][col].set_title(f"{proj}({zname}){frac}\n{what}, coloured by ADVANTAGE"
+                                     f"{tag}", fontsize=10)
+            fig.colorbar(sc, ax=axes[row][col], shrink=0.85)
+        sc1 = axes[row][2].scatter(xy["z_full"][:, 0], xy["z_full"][:, 1],
+                                   c=per_point_disagree, cmap="viridis", vmin=0, vmax=1, s=4,
+                                   linewidths=0)
+        axes[row][2].set_title(f"{proj}(z_full), coloured by\nk={k_rep} sign DISAGREEMENT",
+                               fontsize=10)
+        fig.colorbar(sc1, ax=axes[row][2], shrink=0.85)
+    for ax in axes.ravel():
         ax.set_xticks([])
         ax.set_yticks([])
     fig.tight_layout()
     fig.savefig(os.path.join(args.out, "tsne_partial_space.png"), dpi=150)
     plt.close(fig)
+
+    # The embeddings are saved so a DIFFERENT colouring -- family, tile, speed, episode
+    # outcome -- costs a scatter call rather than another PCA and t-SNE over 60k windows.
+    # Which matters here: the first thing to ask of a cluster is whether it is terrain rather
+    # than advantage.
+    np.savez_compressed(
+        os.path.join(args.out, "embedding.npz"),
+        pca_partial=pemb["z_partial"].astype(np.float32),
+        pca_full=pemb["z_full"].astype(np.float32),
+        tsne_partial=emb["z_partial"].astype(np.float32),
+        tsne_full=emb["z_full"].astype(np.float32),
+        advantage=advantage[sel].astype(np.float32),
+        disagree=per_point_disagree.astype(np.float32),
+        rows=sel.astype(np.int64),
+        evr_partial=evr["z_partial"].astype(np.float64),
+        evr_full=evr["z_full"].astype(np.float64))
     print(f"[alias] wrote {args.out}/tsne_partial_space.png")
 
 

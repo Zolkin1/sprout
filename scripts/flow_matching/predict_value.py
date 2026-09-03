@@ -102,7 +102,8 @@ def main() -> int:
               f"({int(va_k.sum())} own fold + {int(val_tile.sum())} held-out tiles)")
         pk = np.zeros(uids.size, dtype=np.float64)
         pk[idx] = fit_value._predict(model, ctx, W, idx, priv, args.device, scan_hw,
-                                     args.batch)
+                                     args.batch,
+                                     goal_context=bool(ck.get("goal_context", True)))
         p_all[va_k] = pk[va_k]
         p_all[val_tile] += pk[val_tile] / n_folds
         del model

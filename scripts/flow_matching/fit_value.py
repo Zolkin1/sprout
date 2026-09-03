@@ -104,12 +104,13 @@ from robot_rl.flow_matching import online, transforms, value, value_gates  # noq
 GOAL_SCALE_M: float = 5.0
 
 
-def _load(stem: str, max_windows: int) -> tuple[dict, dict, dict]:
+def _load(stem: str, max_windows: int, tail_chunks: int = 1) -> tuple[dict, dict, dict]:
     """Read both tables and join them on ``episode_uid``.
 
     Args:
         stem: The rollout stem.
         max_windows: Cap, so a multi-gigabyte recording can be smoke-tested.
+        tail_chunks: Trailing chunks the quality target's non-failure tail averages.
 
     Returns:
         ``(windows, episodes, per_window_labels)``.
@@ -208,7 +209,7 @@ def _load(stem: str, max_windows: int) -> tuple[dict, dict, dict]:
         W["track_err_prev"], W["episode_uid"], W["replan_index"], spec)
     g, g_ok = adv_mod.normalized_returns(
         r, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
-        gamma=float(spec.gamma))
+        gamma=float(spec.gamma), tail_chunks=tail_chunks)
     lab["chunk_reward"], lab["g"], lab["g_valid"] = r, g, g_ok
     print(f"[fit] quality target from track_err_prev: {int(g_ok.sum())}/{g_ok.size} "
           f"windows, median G {np.median(g[g_ok]):.4f}, "
@@ -288,12 +289,27 @@ def _splits(uids: np.ndarray, tiles: np.ndarray, val_frac: float, seed: int
 
 
 def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
-           scan_hw) -> value.ValueInputs:
+           scan_hw, *, goal_context: bool = True) -> value.ValueInputs:
     """Build one normalized batch from raw recorded rows.
 
     Normalized with the GENERATOR's own normalizers, so the critic sees exactly what the
     generator saw. Re-fitting them here would put the two models in different input spaces
     while every shape still agreed.
+
+    Args:
+        ctx: The loaded FM context, which supplies the encoder and all three normalizers.
+        W: The window table.
+        idx: Row indices.
+        priv: The ``V_priv`` variant -- adds the scan and proprio tokens and the LINEAR half
+            of the base twist.
+        device: Torch device.
+        scan_hw: ``(H, W)`` fold of the privileged height scan.
+        goal_context: Whether the three goal offsets go into the context token. ``False`` is
+            the ablation arm; the width must come from :func:`value.context_width` with the
+            same flag or the twist lands in the goal's columns silently.
+
+    Returns:
+        The assembled batch.
     """
     to = lambda a, d=torch.float32: torch.as_tensor(np.asarray(a), dtype=d, device=device)  # noqa: E731
     hist = ctx.state_norm.normalize(to(W["history"][idx]))
@@ -310,24 +326,31 @@ def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
         scan = transforms.sanitize_extero(
             to(W["height_scan"][idx]), "height_scan").reshape(len(idx), *scan_hw)
         proprio = to(W["proprio"][idx])
-    # Goal offsets on a DECLARED metre scale rather than a fitted statistic, so a critic's
-    # notion of "far" is a property of the robot and not of whichever rollout was on disk --
-    # the same idiom as the generator's `contract` normalization.
-    goal = to(np.stack([W["goal_downrange_m"][idx], W["goal_lateral_m"][idx],
-                        W["goal_height_err_m"][idx]], axis=-1)) / GOAL_SCALE_M
-    goal = torch.nan_to_num(goal, nan=0.0, posinf=0.0, neginf=0.0)
     twist = to(W["base_twist_yaw"][idx])
     # ONBOARD keeps only the ANGULAR half: an IMU measures body rates and the yaw frame is
     # reachable from those plus its own roll/pitch, but nothing on the robot measures the
     # linear half without odometry. Slicing it away here is what makes the two variants'
     # gap a statement about information rather than about architecture.
-    ctx = torch.cat([goal, twist if priv else twist[:, 3:]], dim=-1)
+    blocks = [twist if priv else twist[:, 3:]]
+    if goal_context:
+        # Goal offsets on a DECLARED metre scale rather than a fitted statistic, so a
+        # critic's notion of "far" is a property of the robot and not of whichever rollout
+        # was on disk -- the same idiom as the generator's `contract` normalization.
+        #
+        # PREPENDED, so the goal keeps columns 0:3 exactly as every existing checkpoint has
+        # them. Appending instead would leave the width right and shift the twist, which is
+        # the one way to make a pre-flag checkpoint load and read the wrong columns.
+        goal = to(np.stack([W["goal_downrange_m"][idx], W["goal_lateral_m"][idx],
+                            W["goal_height_err_m"][idx]], axis=-1)) / GOAL_SCALE_M
+        blocks.insert(0, torch.nan_to_num(goal, nan=0.0, posinf=0.0, neginf=0.0))
+    ctx = torch.cat(blocks, dim=-1)
     return value.ValueInputs(history=hist, extero=ext, cmd_tokens=cmd,
                              history_null=to(W["history_null"][idx], torch.bool),
                              scan=scan, proprio=proprio, context=ctx)
 
 
-def _predict(model, ctx, W, idx, priv, device, scan_hw, batch):
+def _predict(model, ctx, W, idx, priv, device, scan_hw, batch, *,
+             goal_context: bool = True):
     """``P(fail)`` over ``idx``, in eval mode and without gradients."""
     was = model.training
     model.eval()
@@ -336,13 +359,15 @@ def _predict(model, ctx, W, idx, priv, device, scan_hw, batch):
         for i in range(0, idx.size, batch):
             j = idx[i:i + batch]
             out[i:i + j.size] = model.p_fail(
-                _batch(ctx, W, j, priv, device, scan_hw)).cpu().numpy()
+                _batch(ctx, W, j, priv, device, scan_hw,
+                       goal_context=goal_context)).cpu().numpy()
     model.train(was)
     return out
 
 
 @torch.no_grad()
-def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int) -> np.ndarray:
+def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
+                     goal_context: bool = True) -> np.ndarray:
     """``G_hat`` over ``idx``, batched, in eval mode.
 
     Args:
@@ -354,6 +379,7 @@ def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int) -> n
         device: Torch device.
         scan_hw: Height-scan grid.
         batch: Rows per forward pass.
+        goal_context: Whether the goal offsets are in the context token.
 
     Returns:
         ``[len(idx)]`` predicted normalized returns.
@@ -364,15 +390,16 @@ def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int) -> n
     for i in range(0, idx.size, batch):
         j = idx[i:i + batch]
         out[i:i + j.size] = model.quality(
-            _batch(ctx, W, j, priv, device, scan_hw)).cpu().numpy()
+            _batch(ctx, W, j, priv, device, scan_hw,
+                   goal_context=goal_context)).cpu().numpy()
     model.train(was)
     return out
 
 
 def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: float,
          device, label: str, scan_hw, wb=None, val_tile=None,
-         quality_bins: int = 0, quality_weight: float = 1.0
-         ) -> tuple[value.FlowValueModel, np.ndarray]:
+         quality_bins: int = 0, quality_weight: float = 1.0,
+         goal_context: bool = True) -> tuple[value.FlowValueModel, np.ndarray]:
     """Train one variant and return it plus held-out ``P(fail)``.
 
     Validation runs EVERY epoch, on both scopes. Without it the only visible signal is the
@@ -387,7 +414,7 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         scan_hw=(tuple(scan_hw) if priv else None),
         proprio_dim=(int(W["proprio"].shape[-1]) if priv else 0),
         proprio_steps=(int(W["proprio"].shape[1]) if priv else 0),
-        context_dim=(3 + (6 if priv else 3)),
+        context_dim=value.context_width(privileged=priv, goal_context=goal_context),
         quality_bins=int(quality_bins),
     ).to(device)
     opt = torch.optim.AdamW(model.trainable_parameters(), lr=lr, weight_decay=1e-4)
@@ -414,7 +441,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         for i in range(0, tr.size, batch):
             j = tr[i:i + batch]
             opt.zero_grad(set_to_none=True)
-            xb = _batch(ctx, W, j, priv, device, scan_hw)
+            xb = _batch(ctx, W, j, priv, device, scan_hw,
+                        goal_context=goal_context)
             fail_logit, q_logits = model.heads(xb)     # ONE encoder pass for both heads
             loss = lossf(fail_logit, y[j])
             if use_q and q_logits is not None:
@@ -446,7 +474,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
             if m is None or not m.any():
                 continue
             j = np.flatnonzero(m)
-            a = value_gates.auc(_predict(model, ctx, W, j, priv, device, scan_hw, batch),
+            a = value_gates.auc(_predict(model, ctx, W, j, priv, device, scan_hw, batch,
+                                         goal_context=goal_context),
                                 y_np[j])
             log[f"{label}/{scope}/auc_epoch"] = a
             print(f"      {scope} AUC {a:.3f}")
@@ -461,7 +490,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                 jq = j[lab["g_valid"][j]]
                 if jq.size:
                     qg = value_gates.return_gates(
-                        _predict_quality(model, ctx, W, jq, priv, device, scan_hw, batch),
+                        _predict_quality(model, ctx, W, jq, priv, device, scan_hw,
+                                         batch, goal_context=goal_context),
                         lab["g"][jq])
                     log.update({f"{label}/{scope}/q_r2": qg["r2"],
                                 f"{label}/{scope}/q_rho": qg["rho"],
@@ -491,7 +521,9 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         allidx = np.arange(out.size)
         for i in range(0, out.size, batch):
             j = allidx[i:i + batch]
-            out[j] = model.p_fail(_batch(ctx, W, j, priv, device, scan_hw)).cpu().numpy()
+            out[j] = model.p_fail(
+                _batch(ctx, W, j, priv, device, scan_hw,
+                       goal_context=goal_context)).cpu().numpy()
     return model, out
 
 
@@ -533,6 +565,26 @@ def main() -> int:
                         "fold model seeing less.")
     p.add_argument("--variants", type=str, default="V_priv,V_onboard",
                    help="Which critics to fit, comma-separated.")
+    # Opt-OUT, so the default arm stays the one every existing checkpoint was fitted under.
+    p.add_argument("--goal_context", action="store_true", default=True,
+                   help="Put the three goal offsets in the context token (default).")
+    p.add_argument("--no_goal_context", dest="goal_context", action="store_false",
+                   help="ABLATION: fit with NO goal offsets, so the critic is told nothing "
+                        "about how far the goal is. `value.py` predicts this fails -- with a "
+                        "sparse terminal goal reward, two states identical to the generator "
+                        "are worth different amounts depending on whether the terrain is one "
+                        "metre ahead or eight -- so a degraded AUC here is the hypothesis "
+                        "being confirmed, not the fit going wrong. The context token keeps "
+                        "the base twist, so it does not disappear: V_priv goes 9 -> 6 wide "
+                        "and V_onboard 6 -> 3.")
+    p.add_argument("--tail_chunks", type=int, default=1,
+                   help="Trailing chunks the QUALITY target's non-failure tail averages. The "
+                        "tail carries a median 52%% of G on a survived episode, so resting it "
+                        "on one measurement is high variance; 3 drops its spread ~12%%. It is "
+                        "an ARGUMENT and not a new default because the tail is stamped in no "
+                        "existing artifact -- a changed default would silently score every "
+                        "critic already fitted against a target it never saw. Stamped into "
+                        "the checkpoint, so a refit states what it used.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_windows", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -548,7 +600,7 @@ def main() -> int:
 
     stem = args.stem[:-3] if args.stem.endswith(".h5") else args.stem
     stem = stem[:-9] if stem.endswith(".episodes") else stem
-    W, E, lab = _load(stem, args.max_windows)
+    W, E, lab = _load(stem, args.max_windows, int(args.tail_chunks))
     keep = lab["live"]
     if not keep.all():
         # Censored episodes have NO outcome: they neither fell nor failed to arrive, they were
@@ -566,6 +618,16 @@ def main() -> int:
     uids = W["episode_uid"]
     n_ep = int(np.unique(uids).size)
     n_fail_ep = int(np.unique(uids[lab["failed"]]).size)
+    # PRINTED, and the same idiom as train.py printing the resolved `extero_clip`: the arm
+    # is invisible in the output otherwise, and a log that does not say which one ran is a log
+    # whose AUC cannot be attributed.
+    print(f"[fit] context token: {'goal(3) + ' if args.goal_context else 'NO GOAL, '}"
+          f"twist -> {value.context_width(privileged=True, goal_context=args.goal_context)} "
+          f"wide (V_priv) / "
+          f"{value.context_width(privileged=False, goal_context=args.goal_context)} "
+          f"(V_onboard)"
+          + ("" if args.goal_context else
+             "   <-- ABLATION: goal_downrange_m / goal_lateral_m / goal_height_err_m are OUT"))
     print(f"[fit] {uids.size} windows over {n_ep} episodes "
           f"({n_fail_ep} failed, {100 * n_fail_ep / max(n_ep, 1):.1f}%)")
     print(f"[fit] EFFECTIVE sample size is the EPISODE count ({n_ep}), not the window count: "
@@ -663,6 +725,7 @@ def main() -> int:
             model, p_k = _fit(ctx, W, lab, tr_k, va_k,
                               quality_bins=int(args.quality_bins),
                               quality_weight=float(args.quality_weight),
+                              goal_context=bool(args.goal_context),
                               priv=priv, epochs=args.epochs,
                               batch=args.batch, lr=args.lr, device=args.device,
                               label=(label if len(folds) == 1 else f"{label}/f{k}"),
@@ -675,7 +738,8 @@ def main() -> int:
             p_all[val_tile] += p_k[val_tile] / len(folds)
             if q_all is not None:
                 q_k = _predict_quality(model, ctx, W, np.arange(uids.size), priv,
-                                       args.device, scan_hw, args.batch)
+                                       args.device, scan_hw, args.batch,
+                                       goal_context=bool(args.goal_context))
                 q_all[va_k] = q_k[va_k]
                 q_all[val_tile] += q_k[val_tile] / len(folds)
             # Checkpoint it. Without this the fit is write-only: the gates land on disk but
@@ -699,13 +763,28 @@ def main() -> int:
                         # normalizers -- a wrong one loads with correct shapes and is silent.
                         "fm_checkpoint_sha256": _sha256_file(args.fm_checkpoint),
                         "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
-                        "context_dim": int(3 + (6 if priv else 3)), "privileged": bool(priv),
+                        "context_dim": value.context_width(
+                            privileged=priv, goal_context=bool(args.goal_context)),
+                        "privileged": bool(priv),
+                        # WHETHER THE GOAL WAS IN THE CONTEXT TOKEN. Stamped because the two
+                        # arms differ only in this token's width, and four readers build that
+                        # token: without the stamp a no-goal checkpoint would be handed a
+                        # 9-wide vector against a 6-wide layer, and if the widths ever did
+                        # line up the twist would silently occupy the goal's columns. Readers
+                        # default an ABSENT stamp to True -- every checkpoint predating this
+                        # flag did carry the goal, so that is a fact about them rather than
+                        # today's default re-resolved onto someone else's artifact.
+                        "goal_context": bool(args.goal_context),
                         "epochs": int(args.epochs), "stem": stem,
                         "fold": int(k), "num_folds": int(len(folds)),
                         "quality_bins": int(args.quality_bins),
                         "quality_weight": float(args.quality_weight),
                         "tracking_spec": track_spec.to_dict(),
-                        "gamma": float(track_spec.gamma)},
+                        "gamma": float(track_spec.gamma),
+                        # STAMPED, because the tail is otherwise unrecoverable from
+                        # the checkpoint and an advantage built with a different one
+                        # prices its baseline against a target this never saw.
+                        "tail_chunks": int(args.tail_chunks)},
                        os.path.join(args.out, name))
             del model
         preds[label] = p_all

@@ -330,6 +330,13 @@ class FailureCritic:
 
         self.privileged = bool(ck["privileged"])
         self.variant = str(ck.get("variant", "?"))
+        # WHETHER THE GOAL OFFSETS ARE IN THE CONTEXT TOKEN. Read from the stamp, never
+        # inferred from the width: 9 is V_priv-with-goal and 6 is BOTH V_onboard-with-goal
+        # and V_priv-without, so the width alone cannot tell the arms apart. `True` for an
+        # absent stamp is a fact about pre-flag checkpoints -- all of them carried the goal --
+        # rather than today's default re-resolved onto an older artifact, which is the trap
+        # CLAUDE.md records for `extero_clip`, `attention_mode` and `skip_families`.
+        self.goal_context = bool(ck.get("goal_context", True))
         self.ctx = online.load_fm_context(use, device=device)
         # The QUALITY head's width has to be known BEFORE the load, because the head is built
         # by the ctor and `load_state_dict` is strict. Preference order, and the fallback is
@@ -346,6 +353,19 @@ class FailureCritic:
             proprio_steps=(int(ck["proprio_hw"][0]) if self.privileged else 0),
             context_dim=int(ck["context_dim"]),
             quality_bins=self.quality_bins).to(device)
+        # The stamp against the width the two flags imply. `load_state_dict` checks the
+        # checkpoint against the MODEL and both come from `context_dim`, so it cannot see a
+        # stamp that disagrees with them -- and the failure mode is not a shape error but a
+        # linear layer reading the twist out of the goal's columns.
+        want = value.context_width(privileged=self.privileged,
+                                   goal_context=self.goal_context)
+        if int(ck["context_dim"]) != want:
+            raise ValueError(
+                f"{os.path.basename(ckpt)} stamps context_dim={int(ck['context_dim'])} but "
+                f"privileged={self.privileged} + goal_context={self.goal_context} build "
+                f"{want}. One of the three is wrong, and every combination of the other two "
+                "produces a context vector that is finite, plausible and reading the wrong "
+                "columns.")
         self.model.load_state_dict(ck["model"])
         self.model.eval()
         # The reward the quality head predicts a RETURN of. `None` on a pre-stamp checkpoint,
@@ -442,13 +462,17 @@ class FailureCritic:
                                  f"proprio={x.proprio is None and 'None' or 'ok'}")
             scan = transforms.sanitize_extero(t(x.scan), "height_scan").reshape(1, *SCAN_HW)
             proprio = t(x.proprio)
-        goal = np.nan_to_num(np.asarray(x.goal, dtype=np.float64) / GOAL_SCALE_M,
-                             nan=0.0, posinf=0.0, neginf=0.0)
         tw = np.asarray(x.twist, dtype=np.float32)
         # ONBOARD keeps only the ANGULAR half: an IMU measures body rates, but nothing on the
         # robot measures the linear half without odometry. Slicing it away is what makes the
         # two variants' gap a statement about information rather than about architecture.
-        context = t(np.concatenate([goal, tw if self.privileged else tw[3:]]))
+        blocks = [tw if self.privileged else tw[3:]]
+        if self.goal_context:
+            # PREPENDED, matching `fit_value._batch`: the goal owns columns 0:3.
+            blocks.insert(0, np.nan_to_num(
+                np.asarray(x.goal, dtype=np.float64) / GOAL_SCALE_M,
+                nan=0.0, posinf=0.0, neginf=0.0))
+        context = t(np.concatenate(blocks))
         return value.ValueInputs(
             history=hist, extero=ext, cmd_tokens=cmd,
             history_null=t(np.array([x.history_null]), torch.bool).reshape(1),

@@ -313,7 +313,7 @@ def _world(seed: int = 0):
     return ctx, cmd, tracker, ring, cols, scan
 
 
-def _scorer(ctx, scan: torch.Tensor, *, priv: bool, model=None):
+def _scorer(ctx, scan: torch.Tensor, *, priv: bool, model=None, goal_context: bool = True):
     """An ``OnlineValueScorer`` whose scan read is stubbed.
 
     ``_read_scan`` is the module's only dependency on a built scene; overriding it is what
@@ -324,29 +324,32 @@ def _scorer(ctx, scan: torch.Tensor, *, priv: bool, model=None):
         scan: ``(num_envs, num_rays)`` the stubbed sensor read.
         priv: Which variant to build.
         model: A model to score with; a stub with the right token attributes by default.
+        goal_context: Whether the goal offsets are in the context token.
 
     Returns:
         The scorer.
     """
-    m = model if model is not None else _stub_model(priv)
+    m = model if model is not None else _stub_model(priv, goal_context=goal_context)
     s = headroom_value.OnlineValueScorer(
         m, ctx, priv=priv, scan_hw=(SCAN_HW if priv else None), device=DEVICE,
-        scan_sensor=("height_scanner" if priv else None))
+        scan_sensor=("height_scanner" if priv else None), goal_context=goal_context)
     s._read_scan = types.MethodType(lambda self, env: scan, s)
     return s
 
 
-def _stub_model(priv: bool):
+def _stub_model(priv: bool, *, goal_context: bool = True):
     """A stand-in carrying only the attributes the scorer's constructor validates.
 
     Args:
         priv: Which variant it claims to be.
+        goal_context: Whether its context token includes the goal offsets.
 
     Returns:
         An object with ``scan_enc`` / ``proprio_in`` / ``context_in`` shaped like the real
         model's, and a ``training`` flag so ``score``'s eval-mode round trip is exercisable.
     """
-    ctx_in = torch.nn.Sequential(torch.nn.Linear(3 + (6 if priv else 3), 8))
+    ctx_in = torch.nn.Sequential(torch.nn.Linear(
+        value.context_width(privileged=priv, goal_context=goal_context), 8))
     return types.SimpleNamespace(
         scan_enc=(types.SimpleNamespace(image_hw=SCAN_HW) if priv else None),
         proprio_in=(object() if priv else None),
@@ -377,17 +380,59 @@ def _assert_same(online, offline) -> None:
 # The measurement.
 # ----------------------------------------------------------------------
 @pytest.mark.parametrize("priv", [True, False])
-def test_online_inputs_are_bit_identical_to_fit_value_batch(priv):
+@pytest.mark.parametrize("goal_context", [True, False])
+def test_online_inputs_are_bit_identical_to_fit_value_batch(priv, goal_context):
     """The whole point: same state, same normalizers, same numbers.
 
     A divergence here means the critic scores in a different input space from the one it was
     fitted in, with every shape still agreeing -- which nothing downstream can see.
+
+    Parametrised over ``goal_context`` because the no-goal arm is the one place the two
+    assemblies could diverge WITHOUT a shape error: both drop three numbers, and if one
+    dropped them from the front while the other dropped them from the back the twist would
+    be read out of the goal's columns and every value would still be finite.
     """
     ctx, cmd, tracker, ring, cols, scan = _world()
-    online = _scorer(ctx, scan, priv=priv).inputs(
+    online = _scorer(ctx, scan, priv=priv, goal_context=goal_context).inputs(
         cmd, tracker, ring, object(), torch.as_tensor(IDX))
-    offline = fit_value._batch(ctx, cols, IDX, priv, DEVICE, SCAN_HW)
+    offline = fit_value._batch(ctx, cols, IDX, priv, DEVICE, SCAN_HW,
+                               goal_context=goal_context)
     _assert_same(online, offline)
+
+
+@pytest.mark.parametrize("priv", [True, False])
+def test_dropping_the_goal_removes_the_GOAL_columns_and_moves_no_others(priv):
+    """The ablation takes columns 0:3 away and leaves the twist exactly where it was.
+
+    The goal is PREPENDED in both assemblies precisely so this holds: a with-goal checkpoint's
+    twist lives at 3: and a no-goal one's at 0:, and the shared tail is bit-identical. Had
+    either side appended instead, the widths would still be 9 and 6 and every column would be
+    off by three -- a shift no shape check can see and no value can look wrong.
+    """
+    ctx, cmd, tracker, ring, _, scan = _world()
+    args = (cmd, tracker, ring, object(), torch.as_tensor(IDX))
+    with_goal = _scorer(ctx, scan, priv=priv, goal_context=True).inputs(*args).context
+    without = _scorer(ctx, scan, priv=priv, goal_context=False).inputs(*args).context
+    n_tw = 6 if priv else 3
+    assert with_goal.shape == (IDX.size, 3 + n_tw)
+    assert without.shape == (IDX.size, n_tw)
+    assert torch.equal(without, with_goal[:, 3:])
+
+
+@pytest.mark.parametrize("priv", [True, False])
+def test_a_goal_context_mismatch_between_scorer_and_checkpoint_is_refused(priv):
+    """A no-goal model handed a with-goal scorer, and the reverse.
+
+    Both directions are a width disagreement the ctor can see; neither is left to a shape
+    error at forward, because for ``priv`` the wrong pairing is 9-against-6 and for the
+    onboard variant it is 6-against-3 -- and a 6-wide context is reachable BOTH ways, which
+    is why the flag travels as a stamp rather than being read off the width.
+    """
+    ctx, _, _, _, _, scan = _world()
+    for model_goal, scorer_goal in ((False, True), (True, False)):
+        with pytest.raises(ValueError, match="context token"):
+            _scorer(ctx, scan, priv=priv, goal_context=scorer_goal,
+                    model=_stub_model(priv, goal_context=model_goal))
 
 
 def test_the_privileged_variant_is_the_only_one_carrying_the_linear_twist():
