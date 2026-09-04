@@ -51,7 +51,7 @@ from .tokenizer import TrajectoryTokenizer
 
 def _run_layer(
     layer: nn.Module, x: torch.Tensor, kv: torch.Tensor,
-    attn_mask: torch.Tensor | None = None,
+    attn_mask: torch.Tensor | None = None, kv_normed: bool = False,
 ) -> torch.Tensor:
     """One PRE-norm ``nn.TransformerEncoderLayer``, with keys/values given separately.
 
@@ -68,13 +68,17 @@ def _run_layer(
         x: Query rows and residual stream, ``(B, Lq, d_model)``.
         kv: Key/value rows, ``(B, Lkv, d_model)``, un-normed.
         attn_mask: Optional ``(Lq, Lkv)`` bool mask; ``True`` means *not allowed to attend*.
+        kv_normed: ``kv`` has already had ``norm1`` applied. Exact, not an approximation:
+            ``LayerNorm`` is per token, so norming a concatenation and concatenating normed
+            halves give the same tensor. Incremental decoding uses it to avoid re-norming
+            every key at every step, which would be quadratic in the token count.
 
     Returns:
         ``(B, Lq, d_model)``.
     """
     xn = layer.norm1(x)
-    a = layer.self_attn(xn, layer.norm1(kv), layer.norm1(kv),
-                        attn_mask=attn_mask, need_weights=False)[0]
+    kvn = kv if kv_normed else layer.norm1(kv)
+    a = layer.self_attn(xn, kvn, kvn, attn_mask=attn_mask, need_weights=False)[0]
     x = x + layer.dropout1(a)
     ff = layer.linear2(layer.dropout(layer.activation(layer.linear1(layer.norm2(x)))))
     return x + layer.dropout2(ff)
@@ -338,16 +342,33 @@ class TokenPlanner(nn.Module):
             raise ValueError(f"temperature must be positive, got {temperature}.")
         b = history.shape[0]
         cache = self.encode_prefix(history, extero, cmd_tokens, history_null_mask)
-        # Per layer, the INPUTS of the output slots emitted so far -- the same quantity the
-        # prefix cache holds, so the two concatenate directly.
-        past: list[list[torch.Tensor]] = [[] for _ in self.encoder.layers]
+        layers = list(self.encoder.layers)
+        pl, n, d = self.prefix_len, self.num_tokens, self.cfg.d_model
+
+        # A PREALLOCATED per-layer key/value buffer, holding [prefix | slots emitted so far],
+        # pre-normed. Both properties are worth their memory:
+        #
+        # * preallocated -- the obvious `torch.cat([prefix, *past], 1)` rebuilds a growing
+        #   tensor once per layer per step, so a 16-token plan through 8 layers is 128
+        #   allocate-and-copy pairs of up to (B, 145, 512). Writing into a slice and reading a
+        #   VIEW of it is zero copies.
+        # * pre-normed -- `_run_layer` would otherwise apply `norm1` to every key again at
+        #   every step, which is quadratic in the token count for a result that cannot change.
+        #
+        # At batch 1 this is 2.4 MB and the model is dispatch-bound, which is exactly where
+        # removing 128 allocations per plan is worth more than removing FLOPs.
+        kv = [torch.empty(b, pl + n, d, device=history.device, dtype=cache[0].dtype)
+              for _ in layers]
+        for i, layer in enumerate(layers):
+            kv[i][:, :pl] = layer.norm1(cache[i])
+
         tokens, logps, ents = [], [], []
         x = self._embed_outputs(None, b)                       # (B, 1, d): the BOS slot
         for step in range(self.num_tokens):
             h = x
-            for i, layer in enumerate(self.encoder.layers):
-                past[i].append(h)
-                h = _run_layer(layer, h, torch.cat([cache[i], *past[i]], dim=1))
+            for i, layer in enumerate(layers):
+                kv[i][:, pl + step:pl + step + 1] = layer.norm1(h)
+                h = _run_layer(layer, h, kv[i][:, :pl + step + 1], kv_normed=True)
             logits = self.head(self.head_norm(h))[:, -1, :]     # (B, V)
             logp_all = F.log_softmax(logits / temperature, dim=-1)
             if greedy:
