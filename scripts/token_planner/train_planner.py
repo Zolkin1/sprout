@@ -703,9 +703,12 @@ def main() -> None:
             # after the whole build and tokenize pass.
             line += (f"  {tag} ce {scal['ce']:.4f}  top1 {100 * scal['top1']:.1f}%  "
                      f"H {scal['entropy_nats']:.2f}")
-            for key, unit in (("base_pos", "m"), ("joint_pos", "rad")):
+            # The group's own name, not a prefix of it: `base_pos` and `base_ori` both
+            # start with "base", so truncating makes the two indistinguishable in the one
+            # line anyone reads per epoch.
+            for key, label, unit in (("base_pos", "pos", "m"), ("joint_pos", "jnt", "rad")):
                 if f"rmse/{key}" in scal:
-                    line += f"  {key.split('_')[0]} {scal[f'rmse/{key}']:.4f} {unit}"
+                    line += f"  {label} {scal[f'rmse/{key}']:.4f} {unit}"
             if sel < best:
                 best = sel
                 save_checkpoint(os.path.join(out_dir, "planner.pt"), model, opt, cfg,
