@@ -138,7 +138,7 @@ def sample_diversity(
         cmd_tokens: ``(B, num_cmd_tokens, cmd_dim)`` or ``None``.
         num_samples: Draws per context.
         temperature: Sampling temperature.
-        generator: Explicit RNG.
+        generator: Explicit RNG, on the same device as the conditioning.
         std: ``(node_dim,)`` normalizer std, to report the trajectory distance in physical
             units. ``None`` reports it in normalized units.
 

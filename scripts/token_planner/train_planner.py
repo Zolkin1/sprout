@@ -110,6 +110,12 @@ def parse_args() -> tuple[PlannerConfig, argparse.Namespace]:
                    help="Validation contexts to measure sample diversity over.")
     p.add_argument("--diversity_samples", type=int, default=16,
                    help="Draws per context for the diversity metric.")
+    p.add_argument("--load_rows", type=int, default=0,
+                   help="SMOKE TEST ONLY: load only the first N windows of each recording. "
+                        "This CHANGES THE SPLIT, so nothing measured is comparable -- but it "
+                        "is the only way to exercise this whole path against a tokenizer "
+                        "trained the same way, which is what verifies the state-normalizer "
+                        "agreement rather than assuming it.")
     p.add_argument("--wandb", action="store_true", default=True,
                    help="Log to Weights & Biases (default; use --no_wandb to disable).")
     p.add_argument("--no_wandb", dest="wandb", action="store_false")
@@ -207,12 +213,52 @@ def load_fm_config(path: str) -> FlowMatchingConfig:
     with open(path) as fh:
         raw = yaml.safe_load(fh)
     cfg = FlowMatchingConfig.from_dict(raw)
+    cfg.fk_model_path = _relocate_fk_model(cfg.fk_model_path)
     for field_name, (value, why) in _OVERRIDES.items():
         have = getattr(cfg, field_name, None)
         if have != value:
             print(f"[ar] override {field_name}: {have!r} -> {value!r} ({why})")
             setattr(cfg, field_name, value)
     return cfg
+
+
+def _relocate_fk_model(path: str) -> str:
+    """Re-resolve a saved ``fk_model_path`` against THIS checkout.
+
+    A generator's config records the absolute path its training box used, and that box is
+    usually not this one -- the shipped run's is under ``/mnt/zolkin_new/...``. The file it
+    names is the robot, so the fix is to find the same file here rather than to fail.
+
+    **The BASENAME must match.** Silently substituting a different robot model is precisely
+    the failure CLAUDE.md's ``g1_29j.urdf`` story records: nothing errored, every joint name
+    resolved, and both depth cameras landed 10 mm out on every unprojected channel. So a
+    relocation that would change which file is FK'd is refused instead.
+
+    Args:
+        path: The saved path.
+
+    Returns:
+        A path that exists, or ``path`` unchanged when it already does.
+
+    Raises:
+        SystemExit: If the local candidate is a different file by name, or none exists.
+    """
+    if not path or os.path.exists(path):
+        return path
+    from motion_gen.features import DEFAULT_MJCF
+
+    local = str(DEFAULT_MJCF if os.path.isabs(str(DEFAULT_MJCF))
+                else _REPO_ROOT / str(DEFAULT_MJCF))
+    if os.path.basename(local) != os.path.basename(path):
+        raise SystemExit(
+            f"[ar] the config's fk_model_path is {path}, which does not exist here, and this "
+            f"checkout's default robot is {local} -- a DIFFERENT file. Refusing to "
+            "substitute it: FK'ing the wrong robot resolves every joint name and puts the "
+            "cameras a centimetre out, which no shape check can see.")
+    if not os.path.exists(local):
+        raise SystemExit(f"[ar] neither {path} nor {local} exists; no robot model to FK.")
+    print(f"[ar] fk_model_path relocated to this checkout: {path} -> {local}")
+    return local
 
 
 def scheduled_lr(cfg: PlannerConfig, epoch: int, step: int) -> float:
@@ -427,6 +473,11 @@ def main() -> None:
 
     keys = [k for k in _recorded_data_io().WINDOW_ARRAY_KEYS
             if k not in set(_EXTERO_BY_COST) - {fm.extero_source}]
+    if args.load_rows > 0:
+        print(f"[ar] *** --load_rows {args.load_rows}: SMOKE TEST. The episode split is "
+              "computed over a truncated recording, so nothing measured here is comparable "
+              "with a full run. ***")
+        _patch_row_limit(args.load_rows)
     data, meta = load_recordings(paths, keys=keys)
     train_ds, val_ds = build_train_val(data, meta, fm)
     assert_normalizers_agree(train_ds.state_normalizer, tok_ckpt["state_normalizer"])
@@ -647,7 +698,7 @@ def main() -> None:
         with (ema.swapped_in(model) if ema is not None else _null_ctx()):
             div = sample_diversity(
                 model, hist, extero, cmd, num_samples=int(args.diversity_samples),
-                generator=torch.Generator(device="cpu").manual_seed(cfg.seed),
+                generator=torch.Generator(device=device.type).manual_seed(cfg.seed),
                 std=std.to(device))
         for key, v in div.items():
             writer.add_scalar(f"val_ema/diversity_{key}", v, cfg.num_epochs - 1)
@@ -667,6 +718,24 @@ def main() -> None:
             fh.write(text + "\n")
         print("\n" + text)
     print(f"[ar] done. best val ce {best:.6f} -> {out_dir}/planner.pt")
+
+
+def _patch_row_limit(n: int) -> None:
+    """Restrict every recording read to its first ``n`` windows (smoke tests only).
+
+    Args:
+        n: Row cap.
+    """
+    from robot_rl.token_planner import data as tpd
+
+    rdio = tpd._recorded_data_io()
+    original = rdio.load_recorded_windows
+
+    def limited(path, keys=None, rows=None):
+        """Read only the first ``n`` rows, whatever was asked for."""
+        return original(path, keys=keys, rows=np.arange(n))
+
+    rdio.load_recorded_windows = limited
 
 
 class _null_ctx:

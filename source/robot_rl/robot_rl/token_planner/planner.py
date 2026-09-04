@@ -340,6 +340,17 @@ class TokenPlanner(nn.Module):
         """
         if temperature <= 0.0:
             raise ValueError(f"temperature must be positive, got {temperature}.")
+        if (generator is not None and not greedy
+                and generator.device.type != history.device.type):
+            # torch.multinomial requires the two to agree, and the error it raises names
+            # neither the argument nor the fix. Caught here because a rollout's whole point
+            # is the explicit generator, so silently ignoring it is not an option either.
+            raise ValueError(
+                f"the sampling generator is on '{generator.device.type}' but the "
+                f"conditioning is on '{history.device.type}'. Build it as "
+                f"torch.Generator(device='{history.device.type}') -- a generator is not "
+                "portable across devices, so this cannot be papered over without changing "
+                "which numbers a seed produces.")
         b = history.shape[0]
         cache = self.encode_prefix(history, extero, cmd_tokens, history_null_mask)
         layers = list(self.encoder.layers)

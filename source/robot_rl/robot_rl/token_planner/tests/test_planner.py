@@ -305,3 +305,15 @@ def test_the_null_history_path_changes_the_prediction():
         a = m(tokens, hist, extero, cmd, None)
         b = m(tokens, hist, extero, cmd, torch.ones(hist.shape[0], dtype=torch.bool))
     assert not torch.allclose(a, b)
+
+
+def test_a_generator_on_the_wrong_device_is_refused_by_name():
+    """``torch.multinomial``'s own error names neither the argument nor the fix, and it only
+    fires on GPU -- so a rollout script that works on a laptop dies on the training box."""
+    m = small_planner()
+    hist, extero, cmd = conditioning(m)
+    if not torch.cuda.is_available():
+        pytest.skip("needs a second device to have a wrong one")
+    g = torch.Generator(device="cuda").manual_seed(0)
+    with pytest.raises(ValueError, match="generator is on"):
+        m.sample(hist, extero, cmd, generator=g)
