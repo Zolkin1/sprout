@@ -149,6 +149,34 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     ``window_anchor`` in their saved config, so they resolve to the default, and their
     recorded convention string has to keep matching."""
 
+    stand_start: bool = False
+    """Spawn STANDING -- default joint pose, zero velocity, yaw-only orientation.
+
+    Off by default so every existing task is bit-identical. The clip's first frame is a
+    snapshot of a motion already in progress: measured on the 4-family library, about half of
+    every family's clips open with |v| > 0.3 m/s and some at 2.27 m/s, so the default reset
+    drops the robot mid-stride at speed. That is a state no deployment ever starts from -- a
+    real robot stands up and then walks -- and the generator's first inference has to be made
+    from it, under the null-history embedding, which is its weakest configuration.
+
+    The clip's PLACEMENT (xy and heading) is kept, because it is what puts the robot on the
+    right tile facing the traversal; only the pose and motion are replaced.
+
+    Pairs with :attr:`cmd_hold_s`: standing still while being commanded 1.5 m/s is its own
+    off-distribution state, so the settle window is what makes this coherent.
+    """
+
+    cmd_hold_s: float = 0.0
+    """Hold the commanded velocity at ZERO for this long at the start of an episode.
+
+    Applies to the horizon as well as the current step, so the generator conditions on a
+    command that is zero now and resumes later -- which is what will actually happen -- rather
+    than on a constant command it is not being asked to follow yet.
+
+    0.0 (the default) reproduces every existing task exactly. ~0.3 s covers the first re-plan
+    interval at ``fm_update_every=12``.
+    """
+
     # --- Debug visualization (set ``debug_vis = True`` to enable) ---
     debug_vis_horizon_s: float = 3.0
     """Forward window (seconds) of the reference trajectory drawn as markers."""

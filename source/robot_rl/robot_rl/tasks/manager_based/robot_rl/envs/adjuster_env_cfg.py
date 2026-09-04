@@ -34,8 +34,21 @@ class AdjusterEnvCfg(ManagerBasedRLEnvCfg):
         allow_tracker_mismatch: Downgrade the tracker's observation-contract failures to
             warnings. For a deliberate cross-pair experiment only.
         command_name: The :class:`FmTrackingCommand` term name.
+        zero_residual: Force the applied residual to EXACTLY zero, whatever the policy emits
+            -- the bare-generator control. The served plan is then bit-identical to the
+            generator's own (that identity is exact by construction; see
+            ``apply_plan_residual``'s per-node ``moved`` mask, which exists so the
+            Gram-Schmidt round trip cannot perturb a zero residual), so a run with it on and
+            a run with it off differ in exactly one thing.
+
+            Mainly for LOOKING: the debug ribbon draws ``_pred_window``, which
+            ``apply_plan_residual`` has already modified in place, so without this the plan
+            on screen is the generator's PLUS whatever the policy currently does -- early in
+            training, noise with a 0.2 m position bound. Loading ``model_0.pt`` achieves the
+            same thing, but only by accident of the head being zero-initialised.
     """
 
+    zero_residual: bool = False
     tracker_run_dir: str = ""
     tracker_checkpoint: str = "model_19999.pt"
     tracking_spec_path: str = ""

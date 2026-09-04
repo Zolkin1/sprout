@@ -228,6 +228,31 @@ class ChunkPPO(AuxPPO):
             self.chunk_diagnostics["log_ratio_std_joint"] = log_ratio.sum(dim=-1).std().item()
         return loss
 
+    def _value_loss(self, batch, values: torch.Tensor) -> torch.Tensor:
+        """The stock value loss, plus EXPLAINED VARIANCE as a diagnostic.
+
+        ``1 - Var(returns - V) / Var(returns)``: 1.0 is a perfect fit, 0.0 is no better than
+        predicting the mean return, and NEGATIVE is worse than that. It is the number that
+        says whether the value function is doing anything, and here it is the one to watch --
+        the whole reward design rests on bootstrapping V at an arriving state, which is only
+        meaningful if V is fit at all. The value LOSS alone cannot say this: it falls as the
+        return distribution narrows, whether or not the critic explains any of it.
+
+        Args:
+            batch: The minibatch.
+            values: Fresh critic predictions.
+
+        Returns:
+            Scalar value loss, unchanged from the parent.
+        """
+        with torch.no_grad():
+            ret = batch.returns.flatten()
+            var = ret.var()
+            ev = (1.0 - (ret - values.detach().flatten()).var() / var) if var > 0 else \
+                torch.zeros((), device=ret.device)
+            self.chunk_diagnostics["explained_variance"] = float(ev)
+        return super()._value_loss(batch, values)
+
     def update(self) -> dict[str, float]:
         """Run the parent update and merge in the chunk-ratio diagnostics.
 

@@ -404,6 +404,33 @@ class EvalResetHook:
         return {k: rows[k] for k in schema.EPISODE_COLUMN_NAMES}
 
 
+#: The realistic opening, applied to the GENERATOR arms only.
+#:
+#: A clip's first frame is a motion already running -- about half of the 4-family library's
+#: clips open above 0.3 m/s, some at 2.27 m/s -- and the generator's very first inference is
+#: made from it under the null-history embedding, its weakest configuration. No robot starts
+#: that way. So the generator arms spawn standing and hold the command at zero long enough to
+#: cover the first re-plan.
+#:
+#: **The clip arm is deliberately excluded**, and that is a real asymmetry rather than an
+#: oversight: `cmd_hold_s` zeroes only the generator's conditioning, not the clip, so a
+#: standing spawn on the clip arm is a pure handicap (see the `clip` branch below).
+#:
+#: **`fm_tf` is excluded too**, and for the same reason as `clip`: teacher forcing feeds the
+#: CLIP's nodes as history, so a standing robot would be conditioned on a history describing
+#: a moving one.
+#:
+#: `fm_meas` DOES get it -- its history is the robot's own achieved state, so "standing" is
+#: what the rows say and what is true.
+#:
+#: The COST, stated because these are the prices of the choice: the headline `fm` vs `clip`
+#: delta now contains a second difference besides the reference source, and so does the
+#: `fm_tf` vs `fm` exposure-bias delta. The `fm_meas` vs `fm` pairing is the one that stays
+#: fully controlled. Read the first two as arm comparisons, not as clean single-variable
+#: contrasts.
+_STAND_START = {"stand_start": True, "cmd_hold_s": 0.3}
+
+
 def reference_overrides(mode: str) -> dict:
     """The command-term fields that DEFINE a reference mode.
 
@@ -452,14 +479,27 @@ def reference_overrides(mode: str) -> dict:
         # The generator is not loaded at all, so history_from is inert -- stated anyway so
         # the recorded cell manifest says what ran.
         return {"reference_source": "clip", "history_from": "generator",
-                "ego_anchor_fraction": 1.0}
+                "ego_anchor_fraction": 1.0,
+                # NOT the standing start. `cmd_hold_s` zeroes only what the GENERATOR is
+                # conditioned on -- it does not stop the clip, whose reference keeps
+                # advancing from step 0. Spawning standing here would hand the tracker a
+                # reference already walking away from a stationary robot, an artificial
+                # opening error on the arm that is the CEILING every other arm is measured
+                # against. So the clip arm keeps the clip's own first frame.
+                "stand_start": False, "cmd_hold_s": 0.0}
     if mode == "fm":
         return {"reference_source": "fm", "history_from": "generator",
-                "ego_anchor_fraction": None}
+                "ego_anchor_fraction": None,
+                **_STAND_START}
     if mode == "fm_tf":
         # Same generator, same reference SOURCE -- only the autoregressive context differs.
+        # NO standing start, for the same reason as the clip arm: this arm's history rows
+        # ARE the clip's nodes. Hold the command and the robot stands while the clip walks
+        # on, so the generator would be fed a history describing a moving robot that is in
+        # fact stationary -- incoherent in a way the default start is not.
         return {"reference_source": "fm", "history_from": "clip",
-                "ego_anchor_fraction": 1.0}
+                "ego_anchor_fraction": 1.0,
+                "stand_start": False, "cmd_hold_s": 0.0}
     if mode == "fm_meas":
         # Same generator, same reference source, same clip placement as ``fm`` -- the ONLY
         # difference is where the history rows come from, which is what makes the paired
@@ -477,7 +517,8 @@ def reference_overrides(mode: str) -> dict:
         # passes on its own.
         return {"reference_source": "fm", "history_from": "measured",
                 "allow_history_source_mismatch": True,
-                "ego_anchor_fraction": None}
+                "ego_anchor_fraction": None,
+                **_STAND_START}
     raise ValueError(f"unknown reference mode {mode!r}")
 
 

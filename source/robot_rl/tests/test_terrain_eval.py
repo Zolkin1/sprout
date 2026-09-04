@@ -1212,16 +1212,32 @@ def test_an_unknown_reference_mode_is_refused_not_ignored():
         ev._cell_list(_Args("clip,fm_teacher"), _contracts("g"), {})
 
 
-def test_teacher_forcing_differs_from_the_closed_loop_in_exactly_one_field():
-    """Same generator, same reference source -- only the history moves.
+def test_teacher_forcing_differs_from_the_closed_loop_in_history_and_in_the_start():
+    """Same generator, same reference source -- but NO LONGER a single-variable contrast.
 
-    If ``reference_source`` also differed, ``fm_tf`` would not be measuring the same
-    generator and the difference would not be the exposure bias.
+    ``fm`` spawns standing with an opening command hold, because its history is its own
+    output and a realistic start is what a deployment gives it. ``fm_tf`` does NOT, because
+    its history rows are the CLIP's: hold the command and the robot stands while the clip
+    walks on, feeding the generator a history describing a moving robot that is stationary.
+
+    So the ``fm_tf`` vs ``fm`` delta now carries the start condition as well as the history
+    source. That is a deliberate trade -- the alternative is an incoherent arm -- and it is
+    asserted here so the confound is recorded rather than rediscovered from a surprising
+    number. ``fm_meas`` vs ``fm`` remains the fully controlled pairing.
     """
     fm, tf = rn.reference_overrides("fm"), rn.reference_overrides("fm_tf")
     assert fm["reference_source"] == tf["reference_source"] == "fm"
     assert fm["history_from"] == "generator"
     assert tf["history_from"] == "clip"
+    assert fm["stand_start"] is True and tf["stand_start"] is False
+    assert fm["cmd_hold_s"] > 0.0 and tf["cmd_hold_s"] == 0.0
+
+    meas = rn.reference_overrides("fm_meas")
+    assert meas["stand_start"] == fm["stand_start"], (
+        "fm_meas must match fm on the start condition; it is the one arm whose delta against "
+        "fm is meant to isolate the history source alone"
+    )
+    assert meas["cmd_hold_s"] == fm["cmd_hold_s"]
 
 
 def test_teacher_forcing_ego_anchors_the_clip_it_reads_history_from():

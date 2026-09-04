@@ -258,6 +258,12 @@ class AdjusterEnv(ManagerBasedRLEnv):
             )
 
         residual = self._residual_from_action(action)
+        if getattr(self.cfg, "zero_residual", False):
+            # The bare-generator control. Zeroed HERE rather than by not calling
+            # `apply_plan_residual` at all, so the plan still goes through the identical
+            # code path -- the projection, the rotation clamp, the `_prev_served_node`
+            # re-take -- and the only difference from a live run is the number itself.
+            residual = torch.zeros_like(residual)
         cmd.apply_plan_residual(residual)
         # The tracker must see the CORRECTED plan on the interval's very first control step.
         # Only the reference group is rebuilt: the policy group's depth is unchanged by a

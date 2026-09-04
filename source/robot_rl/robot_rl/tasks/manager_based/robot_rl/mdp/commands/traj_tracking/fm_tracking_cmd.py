@@ -896,6 +896,42 @@ class FmTrackingCommand(MotionSequenceCommand):
         )[:, 0].reshape(rows.shape)
         self._history.seed(env_ids, {"node": seeded})
 
+    def _seed_stand_history(self, env_ids: torch.Tensor) -> None:
+        """Fill a just-reset env's history with N copies of its own spawn state.
+
+        See :attr:`FmTrackingCommandCfg.seed_history_from_stand` for why. In short: the first
+        inference of an episode otherwise runs on the phase-agnostic ``null_history``
+        embedding, which cannot say "standing, both feet down", so the opening plan comes out
+        mid-gait -- feet in the air -- and drifts.
+
+        The node is built by the SAME producer the live measured arm uses
+        (:meth:`_measured_history_node`), so a seeded row and a pushed row are the same kind
+        of object in the same frame. Nothing is invented: the robot really is at this pose.
+
+        Args:
+            env_ids: Long indices of the envs that just reset.
+        """
+        if env_ids.numel() == 0:
+            return
+        # LATCH THE ANCHOR FIRST. `_measured_history_node` expresses the row against
+        # `_anchor_pos`/`_anchor_quat`, and at a reset those still hold the PREVIOUS
+        # episode's plan anchor -- on a different tile, metres away. Seeding through the
+        # stale anchor writes rows saying "the robot is far from the plan origin", and the
+        # generator plans to come back: measured -0.517 m of opening travel against +0.004 m
+        # for the null embedding it was meant to improve on, with a worst case of -1.77 m.
+        #
+        # The spawn pose IS what the next re-plan will latch (`_run_fm` sets exactly this,
+        # from the same buffers, a moment later and before the robot has moved), so writing
+        # it here is not an assumption -- it is the same value, early. Idempotent.
+        pos = wp.to_torch(self.robot.data.root_pos_w)[env_ids]
+        quat = wp.to_torch(self.robot.data.root_quat_w)[env_ids]
+        self._anchor_pos[env_ids] = pos.clone()
+        self._anchor_quat[env_ids] = quat.clone()
+
+        node = self._measured_history_node()[env_ids]                    # [K, D]
+        rows = node[:, None, :].expand(-1, self.ctx.N, -1).contiguous()  # [K, N, D]
+        self._history.seed(env_ids, {"node": rows})
+
     def _clip_history_node(self) -> torch.Tensor:
         """The CLIP's window node for the current step, anchored on the robot now.
 
@@ -1224,7 +1260,13 @@ class FmTrackingCommand(MotionSequenceCommand):
         # cleared), so seeding first would have that row shift the oldest seeded one out.
         # Seeding last overwrites the whole ring for those envs and clears their mask.
         if bool(just_reset.any()):
-            self._seed_clip_history(torch.nonzero(just_reset, as_tuple=False).squeeze(-1))
+            ids = torch.nonzero(just_reset, as_tuple=False).squeeze(-1)
+            # Standing seed FIRST, then the clip seed, so an explicitly-configured clip seed
+            # still wins where both are on -- the two are alternatives, not a stack, and the
+            # clip one is the older, more specific request.
+            if getattr(self.cfg, "seed_history_from_stand", False):
+                self._seed_stand_history(ids)
+            self._seed_clip_history(ids)
 
         # Re-plan on cadence, or wherever there is no live prediction to walk (post-reset).
         #

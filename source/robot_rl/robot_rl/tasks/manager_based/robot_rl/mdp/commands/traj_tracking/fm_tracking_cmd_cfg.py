@@ -152,6 +152,31 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     Turn it off only to debug what a clip-sourced channel *would* have contained."""
 
+    seed_history_from_stand: bool = False
+    """Seed a resetting env's generator history with the ROBOT'S OWN spawn state, repeated.
+
+    The fix for the first inference of an episode, and it exists because the alternatives do
+    not cover a standing spawn:
+
+    * the ``null_history`` embedding is phase-AGNOSTIC, fitted on 20% of windows nulled at
+      random from a corpus that is overwhelmingly walking -- so it has no way to express
+      "both feet are planted and the robot is still", and the opening plan comes out
+      mid-gait, feet off the ground, drifting in whichever direction the prior leans;
+    * :attr:`seed_history_from_clip` reads the clip's PRECEDING steps, of which there are
+      none at ``start_step = 0``, and which would describe a mid-stride robot anyway when
+      :attr:`stand_start` has just placed a standing one.
+
+    What this writes is true rather than fabricated: the robot IS standing at that pose, and
+    under ``history_from="measured"`` the ring holds achieved states, so N copies of the spawn
+    state say exactly "it has been standing here". That is the distinction from the warm-up
+    paths this repo deleted, which filled the ring with ZEROS -- a state no episode ever
+    started from.
+
+    Pairs with :attr:`stand_start` and :attr:`cmd_hold_s`: standing pose, standing history,
+    zero command. All three agree, and the generator is asked for the one thing it can then
+    unambiguously produce.
+    """
+
     seed_history_from_clip: str = "auto"
     """When to fill a resetting env's generator history from the CLIP's preceding steps.
 

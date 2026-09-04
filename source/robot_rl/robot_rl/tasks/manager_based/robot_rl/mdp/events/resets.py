@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 import torch
+import warp as wp
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
@@ -126,6 +127,51 @@ def reset_on_motion_sequence(
                        spawn_z_offset=spawn_z_offset)
 
 
+#: Pelvis height (m) of the STANDING pose above the foot-link origin it stands on.
+#:
+#: The standing pose itself is the robot's own ``init_state`` -- hip_pitch -0.25, knee 0.46,
+#: ankle_pitch -0.25, shoulders 0.31/+-0.24, elbow 0.8 -- which is byte-identical to the
+#: MJCF's ``standing`` keyframe, so Isaac and MuJoCo spawn the same robot.
+#:
+#: 0.755 = the cfg's ``init_state.pos.z`` of 0.785 (pelvis above FLAT GROUND) less the 0.030 m
+#: the ankle-roll link's origin sits above the sole. Expressed against the foot LINK rather
+#: than the ground because that is what a clip frame gives us directly, which removes the sole
+#: thickness from the arithmetic instead of making it another constant to keep right.
+#:
+#: Cross-checks: MuJoCo pins the same pose's pelvis at 0.79 with a 0.005 spawn offset (0.785),
+#: and the mode of frame-0 pelvis-above-foot across the clip library is 0.755 -- i.e. the
+#: clips that already start standing agree with this number.
+STANDING_PELVIS_ABOVE_FOOT_M: float = 0.755
+
+
+def _as_torch(buf) -> torch.Tensor:
+    """A buffer as a torch tensor, converting a warp array if that is what it is."""
+    return buf if isinstance(buf, torch.Tensor) else wp.to_torch(buf)
+
+
+def _yaw_only_quat_xyzw(quat: torch.Tensor) -> torch.Tensor:
+    """Strip roll and pitch from an ``[N, 4]`` XYZW quaternion, keeping the heading.
+
+    A standing spawn must be upright: the clip's first frame may carry a lean, and writing it
+    with a standing joint pose would put the robot down already tilted -- a state the tilt
+    termination grades and the settle window cannot recover from.
+
+    Args:
+        quat: ``[N, 4]`` in XYZW order, which is what ``write_root_pose_to_sim_index`` takes.
+
+    Returns:
+        ``[N, 4]`` XYZW, same heading, zero roll and pitch.
+    """
+    # yaw = atan2(2(wz + xy), 1 - 2(y^2 + z^2)) with (x, y, z, w) ordering.
+    x, y, z, w = quat[:, 0], quat[:, 1], quat[:, 2], quat[:, 3]
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    half = 0.5 * yaw
+    out = torch.zeros_like(quat)
+    out[:, 2] = torch.sin(half)
+    out[:, 3] = torch.cos(half)
+    return out
+
+
 def _commit_clip_reset(
     cmd,
     asset: "Articulation",
@@ -208,6 +254,41 @@ def _commit_clip_reset(
         #   the removal condition on ``reset_on_clip`` in g1_teacher_env_cfg.py.
         base_pose = base_pose.clone()
         base_pose[:, 2] += spawn_z_offset
+    if getattr(cmd.cfg, "stand_start", False):
+        # STAND, do not drop in mid-stride. The clip's first frame is a snapshot of a motion
+        # already running -- measured on the 4-family library, ~half of every family's clips
+        # open above 0.3 m/s and some at 2.27 m/s -- and the generator's very first inference
+        # has to be made from it, under the null-history embedding, which is its weakest
+        # configuration. No deployment starts that way: a robot stands, then walks.
+        #
+        # The clip's PLACEMENT survives (xy, and heading via the yaw), because that is what
+        # puts the robot on the right tile facing the traversal. Only the pose and the motion
+        # are replaced. Height is left as the clip's: at step 0 the robot is on flat ground at
+        # a natural standing height, and any few-centimetre mismatch against the default joint
+        # pose is exactly what `cmd_hold_s` gives it time to settle out of.
+        base_pose = base_pose.clone()
+        base_pose[:, 3:7] = _yaw_only_quat_xyzw(base_pose[:, 3:7])
+        base_vel = torch.zeros_like(base_vel)
+        joint_pos = _as_torch(asset.data.default_joint_pos)[env_ids].clone()
+        joint_vel = torch.zeros_like(joint_vel)
+        # HEIGHT FROM THE TERRAIN, not from the clip.
+        #
+        # The clip's pelvis z belongs to the clip's OWN leg configuration, and we have just
+        # replaced the legs with the standing pose. Inheriting it puts a standing robot at a
+        # walking robot's hip height: measured over 400 clips, frame-0 pelvis-above-foot
+        # ranges 0.668 to 0.756 m, so the tail spawns ~87 mm low and the feet start inside
+        # the tread. That is the intermittent "sometimes buried, sometimes fine".
+        #
+        # The clip's own lowest foot IS the terrain height under the spawn -- the clip is a
+        # physically valid motion, so its lower foot is in contact -- and it needs no
+        # raycast, no scene query, and works on a multi-level tile where a box top and the
+        # floor differ by a metre. Same convention MuJoCo uses (`mjeval.terrains`:
+        # "descending courses are dug DOWN, not spawned UP", pelvis pinned at 0.79 = this
+        # 0.785 plus the same 0.005 spawn offset).
+        foot_z = cmd.clip_frame_foot_z(clip_id, start_step, world_pos, world_quat)
+        if foot_z is not None:
+            base_pose[:, 2] = foot_z + STANDING_PELVIS_ABOVE_FOOT_M
+
     asset.write_root_pose_to_sim_index(root_pose=base_pose, env_ids=env_ids)
     asset.write_root_link_velocity_to_sim_index(root_velocity=base_vel, env_ids=env_ids)
     asset.write_joint_position_to_sim_index(position=joint_pos, env_ids=env_ids)

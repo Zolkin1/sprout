@@ -8,15 +8,16 @@
 rsl-rl's :class:`~rsl_rl.algorithms.PPO` assembles its total loss inline in
 :meth:`~rsl_rl.algorithms.PPO.update` and offers no hook for extra terms, so
 :meth:`AuxPPO.update` below is a **verbatim copy of rsl-rl 5.0.1's**
-``rsl_rl/algorithms/ppo.py`` lines 211-416 with exactly four changes, all marked
+``rsl_rl/algorithms/ppo.py`` lines 211-416 with exactly five changes, all marked
 ``# [robot_rl]``:
 
 1. the reconstruction term added into ``loss`` right after the PPO loss is assembled;
 2. its running mean, reported as ``loss_dict["reference_recon"]``;
 3. the KL the learning-rate controller reads goes through :meth:`_kl_for_lr_control`;
-4. the surrogate goes through :meth:`_surrogate_loss`.
+4. the surrogate goes through :meth:`_surrogate_loss`;
+5. the value loss goes through :meth:`_value_loss`.
 
-The last two are EXTRACTIONS, not edits: each default body is the upstream expression
+The last three are EXTRACTIONS, not edits: each default body is the upstream expression
 verbatim, so stock behaviour is unchanged and a subclass can re-factorize the PPO ratio
 without a second copy of this method existing. See :class:`~robot_rl.rl.chunk_ppo.ChunkPPO`.
 
@@ -152,6 +153,28 @@ class AuxPPO(PPO):
         )
         return torch.max(surrogate, surrogate_clipped).mean()
 
+    def _value_loss(self, batch, values: torch.Tensor) -> torch.Tensor:
+        """The value-function loss. This default is exactly rsl-rl 5.0.1's expression.
+
+        A hook so a subclass can report fit quality (explained variance) from the one place
+        that has both the predictions and the returns, without a second copy of this method.
+
+        Args:
+            batch: The minibatch, carrying ``values`` and ``returns``.
+            values: Fresh critic predictions for this minibatch.
+
+        Returns:
+            Scalar value loss.
+        """
+        if self.use_clipped_value_loss:
+            value_clipped = batch.values + (values - batch.values).clamp(
+                -self.clip_param, self.clip_param
+            )
+            value_losses = (values - batch.returns).pow(2)
+            value_losses_clipped = (value_clipped - batch.returns).pow(2)
+            return torch.max(value_losses, value_losses_clipped).mean()
+        return (batch.returns - values).pow(2).mean()
+
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
         mean_value_loss = 0
@@ -248,13 +271,8 @@ class AuxPPO(PPO):
             surrogate_loss = self._surrogate_loss(batch, actions_log_prob)
 
             # Value function loss
-            if self.use_clipped_value_loss:
-                value_clipped = batch.values + (values - batch.values).clamp(-self.clip_param, self.clip_param)
-                value_losses = (values - batch.returns).pow(2)
-                value_losses_clipped = (value_clipped - batch.returns).pow(2)
-                value_loss = torch.max(value_losses, value_losses_clipped).mean()
-            else:
-                value_loss = (batch.returns - values).pow(2).mean()
+            # [robot_rl] via a hook. The default IS the upstream six lines.
+            value_loss = self._value_loss(batch, values)
 
             if self._in_critic_warmup:
                 # Value term ALONE. Nothing here touches the actor, so its grads stay

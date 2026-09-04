@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import MISSING
 from typing import TYPE_CHECKING
 
+from isaaclab.managers import SceneEntityCfg
 from isaaclab.utils import configclass
 from isaaclab.utils.math import (
     quat_apply,
@@ -1014,6 +1015,155 @@ def window_residual(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> t
     cmd = env.command_manager.get_term(command_name)
     sigma = cmd.ctx.state_norm.std.to(cmd.plan_residual().device)
     return (cmd.plan_residual() / sigma).flatten(1)
+
+
+def _to_torch(buf) -> torch.Tensor:
+    """A sensor/articulation buffer as a torch tensor, converting a warp array if needed.
+
+    Mirrors ``mdp.tracking_error._as_torch``. Kept local rather than imported so this module
+    does not depend on the tracking-error one for a two-line utility.
+    """
+    return buf if isinstance(buf, torch.Tensor) else wp.to_torch(buf)
+
+
+TERRAIN_HEIGHT_CLIP: float = 3.0
+"""Metres, symmetric, for every terrain-height observation here.
+
+NOT the stock height-scan's 1.0 m. These rays reach 3.5 m, and a staircase over that span
+rises or drops about 2 m -- so a 1 m band would saturate exactly the far samples the far
+reach was added to provide, and the channel would read "as high as it gets" for every
+staircase alike.
+"""
+
+_REF_RADIUS_M: float = 0.15
+"""Radius around the base whose terrain samples define "the ground under the robot"."""
+
+
+def _reference_height(env: ManagerBasedRLEnv, ref_sensor_name: str) -> torch.Tensor:
+    """Terrain height under the base, ``[N]``, GUARANTEED FINITE.
+
+    Finite by construction is the whole point. A missed ray reports a non-finite hit, and if
+    one reaches a consumer that only ``clamp``s -- which does not remove NaN -- it becomes a
+    NaN observation, a NaN value loss, and then a NaN gradient on EVERY parameter, because
+    the total loss is one sum. That is how a terrain-sensor detail silently kills the actor's
+    log_std. Measured: it did.
+
+    Args:
+        env: IsaacLab environment.
+        ref_sensor_name: Sensor whose near-base rays define the ground under the robot.
+
+    Returns:
+        ``[num_envs]`` world-frame height.
+
+    Raises:
+        RuntimeError: If NO env has a ray near the base -- a misconfigured offset, which
+            would otherwise reference terrain a metre away.
+    """
+    ref = env.scene.sensors[ref_sensor_name]
+    hits = _to_torch(ref.data.ray_hits_w)                 # [N, R, 3]
+    pos = _to_torch(ref.data.pos_w)                       # [N, 3]
+    finite = torch.isfinite(hits).all(dim=-1)
+    near = (hits[..., :2] - pos[:, None, :2]).norm(dim=-1) < _REF_RADIUS_M
+    # NO RUNTIME GUARD HERE, deliberately, and the reason is worth stating because two earlier
+    # versions of this function had one and both were wrong.
+    #
+    # What a guard would want to catch is a misconfigured OFFSET -- a patch shifted so far
+    # forward that nothing samples the ground under the robot. But that is a property of the
+    # PATTERN, which is static, while everything available here is dynamic hit data, and the
+    # dynamic signals are ambiguous:
+    #
+    #   * "no ray is near" also happens at construction, before any ray has been cast --
+    #     `ObservationManager._prepare_terms` calls every term once to discover its shape.
+    #   * "finite hits exist but none near" also happens whenever the robot stands over a
+    #     VOID or a tile edge, which is routine on these tiles and is exactly the case the
+    #     fallback below exists for.
+    #
+    # So the geometry check lives in the config tests instead, where it is unambiguous, and
+    # this function is total: every input produces a finite height.
+    usable = near & finite
+    z = torch.where(usable, hits[..., 2], torch.nan)
+    ref_z = torch.nanmedian(z, dim=-1).values
+    # An env with no usable near ray (standing over a void) still needs a number. The sensor's
+    # own height is the neutral choice: it makes every relative height read as the raw offset
+    # from the sensor, which the caller's clip then bounds.
+    return torch.where(torch.isfinite(ref_z), ref_z, pos[:, 2])
+
+
+def _relative_terrain_heights(env: ManagerBasedRLEnv, sensor_name: str,
+                              ref_sensor_name: str) -> torch.Tensor:
+    """Ray hit heights minus the terrain height under the base, clipped and finite.
+
+    Measured against the ground under the ROBOT rather than in world z, so flat ground reads
+    0 whatever the stance height and whatever level of a multi-storey tile the robot is on --
+    the same reason the stock height-scan subtracts the base.
+
+    Both terms take their reference from the SAME sensor, so a step edge between them cannot
+    offset one against the other. That would be a slowly-wrong input rather than a broken one.
+
+    Args:
+        env: IsaacLab environment.
+        sensor_name: Scene sensor whose hits are returned.
+        ref_sensor_name: Scene sensor supplying the under-base reference height.
+
+    Returns:
+        ``[num_envs, num_rays]``, clipped to +/- :data:`TERRAIN_HEIGHT_CLIP`.
+
+    Raises:
+        RuntimeError: If the reference sensor has no ray near the base, which would silently
+            substitute a distant sample for "the ground under the robot".
+    """
+    sensor = env.scene.sensors[sensor_name]
+    ref_z = _reference_height(env, ref_sensor_name).unsqueeze(-1)
+
+    heights = _to_torch(sensor.data.ray_hits_w)[..., 2] - ref_z
+    # A MISS MEANS A VOID, AND ITS SIGN IS NEGATIVE.
+    #
+    # These rays cast DOWNWARD from well above the robot, so a ray that hits nothing found no
+    # ground -- the tile ended, or it is over a drop. `ray_hits_w` reports +inf there, and
+    # mapping that straight through gives +CLIP, i.e. "terrain 3 m ABOVE you" for a hole in
+    # the floor. The far rays leave the tile routinely, so this is not a corner case: it was
+    # measured as the entire top of the range, `terrain_rays` maxing at exactly +3.000.
+    #
+    # A void is maximally LOW, so both infinities map to -CLIP. nan_to_num runs AFTER the
+    # subtraction so an infinite reference cannot silently zero a whole row instead.
+    heights = torch.nan_to_num(heights, nan=-TERRAIN_HEIGHT_CLIP,
+                               posinf=-TERRAIN_HEIGHT_CLIP, neginf=-TERRAIN_HEIGHT_CLIP)
+    return heights.clamp(-TERRAIN_HEIGHT_CLIP, TERRAIN_HEIGHT_CLIP)
+
+
+def terrain_rays(env: ManagerBasedRLEnv, sensor_name: str = "terrain_rays",
+                 ref_sensor_name: str = "terrain_base_patch") -> torch.Tensor:
+    """The forward ray fan's terrain heights, ``[N, 200]`` in ``(ray, distance)`` order.
+
+    Reaches ~3.5 m where the stock grid reaches ~1 m, which is roughly the far camera's
+    ground footprint and roughly what a 1.24 s plan actually crosses.
+
+    Args:
+        env: IsaacLab environment.
+        sensor_name: The fan sensor.
+        ref_sensor_name: Sensor supplying the under-base reference height.
+
+    Returns:
+        ``[num_envs, num_rays]``.
+    """
+    return _relative_terrain_heights(env, sensor_name, ref_sensor_name)
+
+
+def terrain_base_patch(env: ManagerBasedRLEnv, sensor_name: str = "terrain_base_patch",
+                       ref_sensor_name: str = "terrain_base_patch") -> torch.Tensor:
+    """The dense patch under and just ahead of the base, ``[N, 117]``.
+
+    The fan is sparse laterally, so this covers what the feet are about to land on.
+
+    Args:
+        env: IsaacLab environment.
+        sensor_name: The patch sensor.
+        ref_sensor_name: Sensor supplying the under-base reference height (itself by default).
+
+    Returns:
+        ``[num_envs, num_rays]``.
+    """
+    return _relative_terrain_heights(env, sensor_name, ref_sensor_name)
 
 
 def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref",

@@ -52,9 +52,17 @@ from isaaclab.managers import RewardTermCfg as RewTerm
 from isaaclab.managers import TerminationTermCfg as DoneTerm
 from isaaclab.utils import configclass
 
+from isaaclab.sensors import RayCasterCfg, patterns
 from robot_rl.tasks.manager_based.robot_rl import mdp
+from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.ray_fan import RayFanPatternCfg
 from robot_rl.tasks.manager_based.robot_rl.envs import AdjusterEnvCfg
 
+from .g1_teacher_env_cfg import (
+    PROPRIO_HISTORY_LENGTH,
+    _REF_PARAMS,
+    _REF_SCALE,
+    _REF_WINDOW_PARAMS,
+)
 from .g1_depth_env_cfg import (
     G1TeacherTerrainDepthEnvCfg,
     G1TeacherTerrainDepthObservationsCfg,
@@ -88,6 +96,14 @@ are the tile's downrange extent, the fitted goal HALF-WIDTH and its height TOLER
 reads as "about one goal-region away" -- the scale `mdp.in_goal` thresholds on. Declared
 rather than fitted, like the extero contract normalization, so it means the same thing in
 every run.
+"""
+
+STAND_SETTLE_S: float = 0.3
+"""Seconds of zero command at the start of an episode, to stand and settle.
+
+0.3 s is 15 control steps, so it spans the first re-plan interval (12 steps at
+``fm_update_every=12``) with margin: the opening plan AND the one after it are drawn while
+the command is still zero, so the robot is standing before it is asked to move.
 """
 
 GOAL_SLACK_S: float = 3.0
@@ -156,28 +172,59 @@ class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
             self.concatenate_terms = True
 
     @configclass
-    class CriticCfg(G1TeacherTerrainDepthObservationsCfg.CriticCfg):
-        """The teacher's privileged group, plus what a residual policy's critic needs.
+    class CriticCfg(ObsGroup):
+        """DECLARED, not inherited-and-nulled, because almost every term changed.
 
-        Both additions are appended LAST so a resumed critic can be zero-padded rather than
-        permuted -- the mechanism ``scripts/rsl_rl/pad_critic_for_finetune.py`` exists for.
+        Four principles, each of which removed channels rather than added them:
 
-        ``window_residual`` is not optional. The group already carries the reference, which
-        says how wrong the served plan is; the residual says how much of that the ADJUSTER
-        caused. Without the second, the critic cannot separate "the generator was wrong" from
-        "the adjuster made it worse" and eats the difference as variance -- measured to turn
-        advantages into noise, inflate entropy and stall a run past a thousand iterations.
+        1. **It is V(s), not Q(s, a).** ``window_residual`` -- 2728 channels, 60% of the old
+           group -- WAS the action. A critic that sees the sampled residual is fitting an
+           action-value while PPO's advantage arithmetic assumes a state-value, so the
+           baseline absorbs variance it should be exposing.
+        2. **Sample count is small.** One transition per re-plan, not per control step, so
+           this group trains on ~1/12 the data a per-step critic would. 4519 channels against
+           that is a width the data cannot support; this is ~1635.
+        3. **The terrain representation should reach as far as the PLAN does.** The 176-cell
+           uniform grid sees ~1 m while the chunk covers 1.24 s of travel. Replaced by a
+           forward ray fan to 3.5 m plus a dense patch under the feet -- 317 channels for
+           3.5x the reach.
+        4. **Absolute yaw is noise.** ``root_quat`` is dropped; ``projected_gravity`` already
+           carries roll and pitch, and nothing here should depend on which way the tile faces.
 
-        ``goal_geometry`` is what makes the bootstrapped goal truncation well posed; see the
-        module docstring.
+        The proprioception keeps its DENSE 10-step history: the critic wants the current state
+        and how it got there. The decimated layout in this stack is the FUTURE window
+        (``REFERENCE_OFFSETS``), which ``reference_window`` keeps unchanged.
         """
 
-        window_residual: ObsTerm = ObsTerm(func=mdp.window_residual,
-                                           params={"command_name": "traj_ref"})
-        # `slack_s` MUST equal the clip_end term's, or the channel counts down to a deadline
-        # that is not the one the episode is cut on and reads 0 for the last 150 control
-        # steps. `step_scale` keeps a ~950-step count from dominating an un-normalized
-        # critic whose every other channel is O(1).
+        # -- current state + history, dense, exactly the actor's frames ------------------
+        base_lin_vel: ObsTerm = ObsTerm(func=mdp.base_lin_vel, scale=1.0,
+                               history_length=PROPRIO_HISTORY_LENGTH)
+        base_ang_vel: ObsTerm = ObsTerm(func=mdp.base_ang_vel, scale=1.0,
+                               history_length=PROPRIO_HISTORY_LENGTH)
+        projected_gravity: ObsTerm = ObsTerm(func=mdp.projected_gravity,
+                                    history_length=PROPRIO_HISTORY_LENGTH)
+        joint_pos: ObsTerm = ObsTerm(func=mdp.joint_pos_rel,
+                            history_length=PROPRIO_HISTORY_LENGTH)
+        joint_vel: ObsTerm = ObsTerm(func=mdp.joint_vel_rel, scale=0.05,
+                            history_length=PROPRIO_HISTORY_LENGTH)
+        # LAST FRAME ONLY. These are the frozen tracker's joint targets, not the adjuster's
+        # action, so they are state -- but ten frames of them is 290 channels restating what
+        # joint_pos already carries.
+        actions: ObsTerm = ObsTerm(func=mdp.last_action, clip=(-20.0, 20.0))
+
+        # -- the plan being corrected, and the command ----------------------------------
+        reference_window: ObsTerm = ObsTerm(func=mdp.reference_window, params=_REF_WINDOW_PARAMS,
+                                   clip=(-20.0, 20.0), scale=_REF_SCALE)
+        command_window: ObsTerm = ObsTerm(func=mdp.command_window, params=_REF_PARAMS)
+
+        # -- terrain, privileged, in the base YAW frame ---------------------------------
+        terrain_rays: ObsTerm = ObsTerm(func=mdp.terrain_rays)
+        terrain_base_patch: ObsTerm = ObsTerm(func=mdp.terrain_base_patch)
+
+        # -- the goal ---------------------------------------------------------------------
+        # KEPT, and it is not optional: arrival is a bootstrapped truncation here, so a critic
+        # that cannot see the goal or the deadline is asked to predict a cut it has no
+        # evidence for. Four channels.
         goal_geometry: ObsTerm = ObsTerm(
             func=mdp.goal_geometry,
             params={"command_name": "traj_ref", "slack_s": GOAL_SLACK_S,
@@ -186,28 +233,9 @@ class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
         )
 
         def __post_init__(self) -> None:
-            """Drop the two CLF/clip-derived terms, which cannot mean anything here.
-
-            ``tracking_error_local`` reads the CLF's output vector, and under
-            ``strict_fm_only`` every channel the generator does not write is NaN-FILLED on
-            purpose -- that barrier exists so an accidental read of clip-derived data fails
-            loudly rather than quietly. It duly did: the first smoke run reached
-            ``runner.learn`` and stopped on 77 NaN channels per env in this group.
-
-            ``tracking_error_global`` measures drift against the GLOBALLY-PLACED CLIP, which
-            on this task is not the reference anything grades -- the adjuster corrects the
-            generator's plan and is scored against what was served. It is clip data on the
-            critic's path, which is the dependency the FM tracker task deleted its whole
-            critic group to avoid.
-
-            What remains is a strong privileged group with no clip dependence: the clean
-            proprioception history, ``reference_window`` (which under ``reference_source="fm"``
-            IS the served plan), ``command_window``, the privileged ``height_scan``, and the
-            two terms appended above.
-            """
-            super().__post_init__()
-            self.tracking_error_local = None
-            self.tracking_error_global = None
+            """Clean inputs: this group is privileged and never deployed."""
+            self.enable_corruption = False
+            self.concatenate_terms = True
 
     fm_cond: FmCondCfg = FmCondCfg()
     fm_plan: FmPlanCfg = FmPlanCfg()
@@ -381,6 +409,73 @@ class G1AdjusterEnvCfg(G1TeacherTerrainDepthEnvCfg, AdjusterEnvCfg):
         # the null-history-on-terrain weakness may be one the adjuster can correct FOR.
         self.commands.traj_ref.random_start_phase = False
 
+        # STAND, SETTLE, THEN GO. The clip's first frame is a running motion, and the
+        # generator's first inference -- made under the null-history embedding, its weakest
+        # configuration -- would be made from it. No robot ever starts that way. So spawn
+        # standing and hold the command at zero long enough to cover the first re-plan, which
+        # lets the tracker settle before the first plan it must follow means anything.
+        #
+        # TODO(adjuster-clip-free-start): once these two are on, the ONLY thing the clip still
+        # supplies at reset is the velocity command and a place to stand. That is an argument
+        # for driving this task from a free-form command instead of a clip library -- see the
+        # clip-free terrain work on worktree-fm-reward-finetune. Not done here: the spawn pose
+        # still has to come from somewhere, and the clip is what knows where a tile's
+        # traversal begins.
+        self.commands.traj_ref.stand_start = True
+        self.commands.traj_ref.cmd_hold_s = STAND_SETTLE_S
+        # ...and tell the generator the robot has been standing, rather than leaving it the
+        # phase-agnostic null embedding, which cannot express "both feet planted" and
+        # produces a mid-gait opening plan with the feet off the ground. Chosen by eye on the
+        # play viz -- the opening plan looks right with it on.
+        #
+        # TODO(adjuster-zero-command-drift): the seed fixes the POSE at the opening but
+        # exposes a second, separate defect it cannot fix. MEASURED on the bare generator,
+        # predicted forward travel over a 62-node chunk under a zero command:
+        #
+        #     null history (no seed)      +0.004 m      <- looks fine, but only because the
+        #     standing seed              -0.100 m          null embedding is phase-agnostic
+        #     full history, mid-episode  -0.094 m      <- the SAME bias, all episode long
+        #     normal command             +0.909 m      <- never backwards, 0 of 1152
+        #
+        # So the generator drifts ~9 cm per chunk BACKWARDS under a zero command whenever it
+        # has real history, at any point in the episode; the seed simply makes the opening
+        # consistent with the rest instead of masking it. Likely cause, from a second
+        # direction: stand commands are 16.4% of the FLAT clips and 0.00% of every terrain
+        # family, so "hold still with stairs in view" is a combination the checkpoint was
+        # never trained on -- which is why the same thing works cleanly in MuJoCo, where the
+        # stand happens on a purpose-built flat lane with no terrain in the cameras.
+        #
+        # Not fixable from this side: it is the frozen generator's behaviour. The routes are
+        # (a) let the adjuster correct it -- systematic and identifiable, the best case for a
+        # residual, though 0.2 m of authority against it; or (b) put stands-on-terrain into
+        # the training distribution, which the clip-free redesign would make natural.
+        self.commands.traj_ref.seed_history_from_stand = True
+
+        # The two privileged terrain sensors, added to the inherited scene. Both are
+        # `ray_alignment="yaw"`, which is what puts them in the base's YAW frame: under the
+        # full orientation the whole pattern would pitch with the torso and a lean would read
+        # as terrain moving. Both cast against the importer's mesh at /World/ground.
+        self.scene.terrain_base_patch = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/Geometry/pelvis_link",
+            # 0.2 m AHEAD, and high enough that a ray starting inside a riser still casts.
+            offset=RayCasterCfg.OffsetCfg(pos=(0.2, 0.0, 20.0)),
+            ray_alignment="yaw",
+            # 1.2 x 0.8 m at 0.1 m. IsaacLab's grid is endpoint-INCLUSIVE, so this is 13 x 9
+            # = 117 rays, not 12 x 8 = 96 -- the same convention that makes the stock
+            # [1.5, 1.0] scan 176 rather than 150.
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.2, 0.8]),
+            mesh_prim_paths=["/World/ground"],
+            debug_vis=False,
+        )
+        self.scene.terrain_rays = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/Geometry/pelvis_link",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            ray_alignment="yaw",
+            pattern_cfg=RayFanPatternCfg(),
+            mesh_prim_paths=["/World/ground"],
+            debug_vis=False,
+        )
+
         # Capture the generator's conditioning and its final-step flow field: the adjuster's
         # two actor observation groups ARE those. Set on the command cfg rather than called on
         # the env, because the observation manager probes every term's shape while the managers
@@ -394,3 +489,56 @@ class G1AdjusterEnvCfg(G1TeacherTerrainDepthEnvCfg, AdjusterEnvCfg):
         # applies CLI overrides to the already-composed cfg, so a fan-out in this method would
         # copy the DEFAULT and a `--tracking_spec` flag would never reach the term. Found by
         # `test_each_spec_path_is_stated_once_and_fanned_out`.
+
+
+@configclass
+class G1AdjusterEnvCfgPlay(G1AdjusterEnvCfg):
+    """Watch the adjuster: few envs, both terrain sensors DRAWN, no randomisation.
+
+    Exists to make the ray casts visible. ``debug_vis`` on a ``RayCaster`` renders one marker
+    per hit, so at training env counts it is 300k markers and unusable; here it is a handful.
+
+    Observation corruption is off so what is drawn is what the policy is fed, and the episode
+    still starts at the clip's initial condition, so a staircase is approached the way
+    training approaches it.
+    """
+
+    def __post_init__(self) -> None:
+        """Shrink the scene and turn the terrain sensors' markers on."""
+        super().__post_init__()
+        # ONE replica row, so the library's tiles appear ONCE each. `num_rows` is an env-
+        # CAPACITY knob -- rows are pure replicas of the whole tile set -- so the training
+        # value of 10 turns an 8-tile library into 80 tiles stretching off into the distance.
+        # Every other play cfg here does the same (see G1TeacherTerrainEnvCfgPlay).
+        self.scene.terrain.num_rows = 1
+        # One env per tile, so each terrain is shown exactly once and nothing is hidden
+        # behind a robot standing on top of it.
+        self.scene.num_envs = 8
+        # NO DECORATION. Walls ring the RENDERED FLOOR rather than the manifest tile, and at
+        # a small tile count the floors are close enough together that one tile's walls stand
+        # on its neighbour -- which is confusing to look at and hides the ray casts this cfg
+        # exists to show. All-or-nothing is the only granularity available: the wall knobs
+        # (`wall_frac`, `wall_clearance_m`, ...) live in `DecorateConfig`, which ran OFFLINE
+        # when the library was decorated, so they are baked into the .h5.
+        #
+        # WHAT THIS CHANGES, and it is not nothing: decoration is invisible to physics and to
+        # the terrain sensors here (both cast against /World/ground alone), but the DEPTH
+        # CAMERAS do see it, and they feed the generator. So the plans drawn in this view are
+        # from a slightly different conditioning than training's. Fine for inspecting sensor
+        # geometry; not a configuration to draw behavioural conclusions from. Turn it back on
+        # with `env.scene.terrain.render_decor=True`.
+        self.scene.terrain.render_decor = False
+        self.observations.policy.enable_corruption = False
+        # The command term's own ribbons: the FM's predicted world trajectory (which is what
+        # the adjuster is correcting) and the goal region it is aiming at. `debug_vis` is the
+        # master switch; the two sub-flags below select what it draws.
+        self.commands.traj_ref.debug_vis = True
+        self.commands.traj_ref.debug_vis_show_fm_prediction = True
+        # A PATH, not a bool: the regions are fitted per family and live in the same JSON the
+        # GoalReached termination reads, so the drawing and the termination cannot disagree
+        # about where the goal is.
+        self.commands.traj_ref.debug_vis_goal_regions = self.goal_regions_path
+        # THE POINT of this cfg. Both are False in training: markers are per-hit, so 317 of
+        # them per env would be 300k+ at 1024 envs.
+        self.scene.terrain_rays.debug_vis = True
+        self.scene.terrain_base_patch.debug_vis = True

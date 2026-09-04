@@ -282,4 +282,20 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:AdjusterPPORunnerCfg",
         },
     )
+    # Watch an adjuster checkpoint on a small tile set, with the terrain ray casts DRAWN.
+    # `load_critic = False` on its runner cfg is what lets a checkpoint from before a
+    # critic-group change still load: play never evaluates the value function, and this
+    # task's critic width has moved while its actor has not.
+    gym.register(
+        id="G1-adjuster-fm-terrain-depth-play",
+        entry_point=f"{envs.__name__}.adjuster_env:AdjusterEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_adjuster_env_cfg:G1AdjusterEnvCfgPlay",
+            "rsl_rl_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_ppo_cfg:AdjusterPlayPPORunnerCfg"
+            ),
+        },
+    )
+
     _registered = True

@@ -364,7 +364,13 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
     critic = RslRlMLPModelCfg(
         hidden_dims=[1024, 512, 256, 128],
         activation="elu",
-        obs_normalization=False,
+        # ON, unlike the actor's. This group is un-normalized nowhere else in the repo
+        # only because the teacher's happened to be O(1) by construction; here it mixes
+        # metres, radians, normalized window units and binary contacts, and the critic
+        # trains on ~1/12 the samples a per-control-step one would. Running per-channel
+        # mean/std costs one buffer and removes a whole class of conditioning defect --
+        # the goal_geometry scaling above was one instance found by hand.
+        obs_normalization=True,
     )
     algorithm = ChunkPpoAlgorithmCfg(**{
         **_PPO_KWARGS,
@@ -406,3 +412,22 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
         "actor": ["fm_cond", "fm_plan"],
         "critic": ["critic"],
     }
+
+
+@configclass
+class AdjusterPlayPPORunnerCfg(AdjusterPPORunnerCfg):
+    """Watch an adjuster checkpoint. Same actor, no critic restored.
+
+    ``play.py`` never evaluates the value function, so skipping the critic load is what lets
+    a checkpoint from BEFORE a critic-group change still drive the robot -- and this task's
+    critic group has moved (4519 -> 1631 channels) while its actor has not. Without this the
+    load fails on the critic's width alone and says nothing about the policy.
+
+    The actor is still loaded STRICTLY, so a genuine policy mismatch fails loudly.
+    """
+
+    load_critic = False
+    """Skip restoring ``critic_state_dict`` (``play.py`` honours this).
+
+    A plain attribute rather than a field of the rsl-rl base cfg, which has no such knob.
+    """

@@ -160,15 +160,54 @@ def test_the_actor_sees_only_deployable_groups() -> None:
     assert "critic" not in actor
 
 
-def test_the_critic_terms_are_appended_last() -> None:
-    """So a resumed critic is zero-padded rather than permuted."""
-    teacher = _terms(G1TeacherObservationsCfg.CriticCfg())
-    adjuster = _terms(G1AdjusterEnvCfg().observations.critic)
-    assert adjuster[: len(teacher)] == teacher, (
-        "the teacher's critic terms must keep their positions; pad_critic_for_finetune.py "
-        "zero-pads a widened first layer and cannot repair a permutation"
+def test_the_critic_cannot_see_the_action() -> None:
+    """It is V(s), not Q(s, a) -- and the residual WAS 60% of the old group.
+
+    PPO's advantage arithmetic assumes a state-value baseline. A critic conditioned on the
+    sampled residual fits an action-value instead, so the baseline absorbs exactly the
+    variance the advantage is supposed to expose, and the policy gradient shrinks toward
+    noise. Nothing about the resulting numbers looks wrong.
+    """
+    terms = _terms(G1AdjusterEnvCfg().observations.critic)
+    assert "window_residual" not in terms, (
+        "window_residual is the ACTION; a critic that sees it is a Q function"
     )
-    assert adjuster[len(teacher):] == ["window_residual", "goal_geometry"]
+    # Absolute yaw is not state the value function should depend on; projected_gravity
+    # already carries roll and pitch.
+    assert "root_quat" not in terms
+
+
+def test_the_critic_reaches_further_than_the_plan_it_grades() -> None:
+    """The terrain representation replaced a ~1 m uniform grid with a 3.5 m fan."""
+    terms = _terms(G1AdjusterEnvCfg().observations.critic)
+    assert "height_scan" not in terms
+    assert {"terrain_rays", "terrain_base_patch"} <= set(terms)
+
+    from robot_rl.tasks.manager_based.robot_rl.mdp.sensors.ray_fan import (
+        RayFanPatternCfg,
+        ray_fan_pattern,
+    )
+
+    starts, dirs = ray_fan_pattern(RayFanPatternCfg(), "cpu")
+    assert starts.shape == (200, 3) and bool((dirs[:, 2] == -1.0).all())
+    reach = starts[:, :2].norm(dim=-1)
+    assert float(reach.max()) == pytest.approx(3.5, rel=1e-3), (
+        "the fan no longer reaches 3.5 m; a 1.24 s plan crosses terrain the critic would "
+        "then be unable to see"
+    )
+    # Ray-major layout is a contract: the observation is a flat vector, so a reordering
+    # permutes the critic's input while every width still matches.
+    per_ray = reach[:40]
+    assert int(per_ray.unique().numel()) == 40, "1.0 m is sampled twice, wasting a channel"
+
+
+def test_the_critic_group_is_normalized() -> None:
+    """It mixes metres, radians, window sigmas and binary flags on ~1/12 the sample count."""
+    from robot_rl.tasks.manager_based.robot_rl.g1.agents.rsl_rl_ppo_cfg import (
+        AdjusterPPORunnerCfg,
+    )
+
+    assert AdjusterPPORunnerCfg().critic.obs_normalization is True
 
 
 def test_the_plan_groups_are_noise_free() -> None:

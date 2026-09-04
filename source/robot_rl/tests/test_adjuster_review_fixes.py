@@ -178,3 +178,57 @@ def test_the_wrapper_leaves_max_episode_length_in_control_steps() -> None:
         "max_episode_length is overridden again; rsl-rl seeds episode_length_buf from it and "
         "that buffer counts control steps on this env"
     )
+
+
+def test_the_reference_patch_actually_samples_under_the_robot() -> None:
+    """A STATIC check, where it is unambiguous -- not a runtime one on hit data.
+
+    `_reference_height` measures "the ground under the robot" from the rays of the base patch
+    that land near the sensor's own origin. If the patch's offset ever moves it entirely off
+    the robot, every terrain height would silently be measured against ground a metre away.
+    That is a property of the PATTERN, so it is checkable here; at runtime the same symptom is
+    produced by a robot standing over a void, which is routine and must NOT raise.
+    """
+    from isaaclab.sensors.ray_caster.patterns import patterns, patterns_cfg
+
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_adjuster_env_cfg as cfg
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.observations import (
+        _REF_RADIUS_M,
+    )
+
+    env = cfg.G1AdjusterEnvCfg()
+    patch = env.scene.terrain_base_patch
+    starts, _ = patterns.grid_pattern(patch.pattern_cfg, "cpu")
+    assert isinstance(patch.pattern_cfg, patterns_cfg.GridPatternCfg)
+    # Distance from the SENSOR origin, which is where `_reference_height` measures from.
+    assert float(starts[:, :2].norm(dim=-1).min()) < _REF_RADIUS_M, (
+        "the base patch has no ray within the reference radius of its own origin, so "
+        "'terrain height under the robot' would be measured somewhere else entirely"
+    )
+
+
+def test_the_play_cfg_shows_each_tile_once_and_training_still_replicates() -> None:
+    """``num_rows`` is an env-CAPACITY knob, and the two tasks need opposite values.
+
+    Rows are pure REPLICAS of the whole tile set, so a play cfg that inherits the training
+    value renders the library ten times over -- an 8-tile set becomes 80 tiles marching off
+    into the distance, which is what it did before this was pinned.
+
+    Training must keep the replicas: measured at 256 envs on the 75-tile 4-family library,
+    all 75 distinct terrains are covered with 3-4 envs each. One row there would put ~13 envs
+    on identical geometry.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_adjuster_env_cfg import (
+        G1AdjusterEnvCfg,
+        G1AdjusterEnvCfgPlay,
+    )
+
+    play = G1AdjusterEnvCfgPlay()
+    assert play.scene.terrain.num_rows == 1, (
+        "the play cfg replicates the tile set; every terrain should appear exactly once"
+    )
+    train = G1AdjusterEnvCfg()
+    assert train.scene.terrain.num_rows > 1, (
+        "training lost its replica rows, which are what give env capacity and spatial "
+        "separation across a small library"
+    )

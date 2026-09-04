@@ -860,6 +860,49 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         out[..., 2] = wz.reshape(-1, *([1] * (vel.dim() - 2)))
         return out
 
+    def _hold(self, vel: torch.Tensor) -> torch.Tensor:
+        """Zero the command during the opening settle window (:attr:`cfg.cmd_hold_s`).
+
+        Accepts ``[N, 3]`` (the current step) and ``[N, K, 3]`` (a look-ahead horizon). While
+        the hold is active the WHOLE horizon is zeroed, not just the entries that fall inside
+        it -- so the generator is told the command is zero, full stop, and plans a stand.
+
+        **This is a deliberate choice against the more literal alternative.** Masking per
+        future step is the honest description of what will happen (entry ``k`` describes step
+        ``s + 1 + k``, and some of those are past the hold), but it does not do what the
+        window is for: the plan spans ``future_len`` nodes -- 1.24 s at F=62 -- so a hold
+        several times shorter than that barely moves the plan. MEASURED on the shipped 0.3 s
+        hold, opening-plan travel over the 62 nodes was 0.361 m under per-step masking against
+        0.071 m when the whole horizon was zero, and 0.925 m under a normal command. Per-step
+        masking produced "stand for a moment, then accelerate", which is not a settle.
+
+        The cost, stated because it is real: the command STEPS from zero to its full value
+        when the hold ends, and the generator sees that as a discontinuity rather than as
+        something it was given notice of. Keep the hold at least one re-plan interval long so
+        the transition lands on a re-plan boundary rather than mid-chunk.
+
+        Args:
+            vel: ``[N, 3]`` or ``[N, K, 3]`` commanded velocity.
+
+        Returns:
+            The same shape, zeroed while the hold is active.
+        """
+        hold_s = float(getattr(self.cfg, "cmd_hold_s", 0.0))
+        if hold_s <= 0.0:
+            return vel
+        steps = int(round(hold_s / float(self.env.step_dt)))
+        if steps <= 0:
+            return vel
+        # `episode_length_buf` is correct here, and that is MEASURED rather than assumed: the
+        # generator's opening inference sits out the reset-time resample (`_resampling`, see
+        # `_resample_command`) and runs in the `compute()` that follows, by which point the
+        # buffer is zeroed. Probed over 14 fresh episodes: `elb=0`, `_step=0`, and the
+        # opening command horizon zero on all of them.
+        elapsed = self.env.episode_length_buf.to(vel.device)
+        active = elapsed < steps
+        mask = active.view(-1, *([1] * (vel.dim() - 1)))
+        return torch.where(mask, torch.zeros_like(vel), vel)
+
     def get_command_velocity(self) -> torch.Tensor:
         """Per-env commanded base velocity ``[N, 3]`` = (vx, vy, wz) at the current step.
 
@@ -872,7 +915,7 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
             raise RuntimeError(
                 "Clip library has no target_vel; regenerate clips with a generator that writes it."
             )
-        return self._steer(self.manager.gather_target_vel(self.clip_id, self._step))
+        return self._hold(self._steer(self.manager.gather_target_vel(self.clip_id, self._step)))
 
     def get_command_velocity_horizon(self, num_future: int) -> torch.Tensor:
         """Commanded velocity over the next ``num_future`` steps, ``[N, num_future, 3]``.
@@ -889,7 +932,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         offs = torch.arange(num_future, device=self.device)
         steps = (self._step[:, None] + 1 + offs[None, :]).clamp(max=T - 1)  # [N, num_future]
         cid = self.clip_id[:, None].expand_as(steps)
-        return self._steer(self.manager.gather(self.manager.lib.target_vel, cid, steps))
+        return self._hold(
+            self._steer(self.manager.gather(self.manager.lib.target_vel, cid, steps)))
 
     # ------------------------------------------------------------------
     # Future window (look-ahead into the clip for the teacher policy)
@@ -929,7 +973,8 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
                 "Clip library has no target_vel; regenerate clips with a generator that writes it."
             )
         cid, steps = self._future_step_indices(offsets)
-        return self._steer(self.manager.gather(self.manager.lib.target_vel, cid, steps))
+        return self._hold(
+            self._steer(self.manager.gather(self.manager.lib.target_vel, cid, steps)))
 
     def get_future_world_base(
         self, offsets: torch.Tensor
@@ -1189,6 +1234,59 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
                 f"'{self.cfg.base_frame_name}'; got '{base_frame_name}'."
             )
         return self.reference_world_state()
+
+    def clip_frame_foot_z(self, clip_id: torch.Tensor, step: torch.Tensor,
+                          world_pos: torch.Tensor, world_quat: torch.Tensor
+                          ) -> torch.Tensor | None:
+        """World z of the LOWEST foot link at a clip frame, ``[K]`` -- the ground under it.
+
+        A clip is a physically valid motion, so at any frame its lower foot is in contact.
+        That makes this the terrain height under the spawn, available without a raycast or a
+        scene query and correct on a multi-level tile where the box top and the floor differ
+        by a metre.
+
+        Args:
+            clip_id: ``[K]`` clip indices.
+            step: ``[K]`` step indices.
+            world_pos: ``[K, 3]`` clip-placement world positions.
+            world_quat: ``[K, 4]`` clip-placement world quaternions (xyzw).
+
+        Returns:
+            ``[K]`` world z, or ``None`` if the library names no foot channels -- in which
+            case the caller must fall back rather than invent a height.
+        """
+        cols = self._foot_z_columns()
+        if cols is None:
+            return None
+        # Through the same placement transform the base pose uses, so the two cannot
+        # disagree about where the clip was put.
+        rows = self.manager.gather(self.manager.lib.y_des, clip_id, step)   # [K, P]
+        local_z = rows[:, cols]                                            # [K, F]
+        # The placement is a planar translation plus a yaw, so z is a pure offset.
+        return local_z.min(dim=-1).values.to(world_pos.device) + world_pos[:, 2]
+
+    def _foot_z_columns(self) -> list[int] | None:
+        """Column indices of the foot links' ``pos_z`` channels, resolved once.
+
+        Returns:
+            The indices, or ``None`` when the library names no such channel.
+        """
+        cached = getattr(self, "_foot_z_cols", "unset")
+        if cached != "unset":
+            return cached
+        names = getattr(self.manager, "pos_output_names", None)
+        if callable(names):
+            names = names()
+        names = list(names or [])
+        cols = [i for i, n in enumerate(names)
+                if "ankle_roll" in n and n.endswith(":pos_z") and "@" not in n]
+        if not cols:
+            print("[WARN MotionSequenceCommand] the clip library names no ankle_roll pos_z "
+                  "channel, so a standing spawn cannot read the terrain height under it and "
+                  "will fall back to the clip's own pelvis height.")
+            cols = None
+        self._foot_z_cols = cols
+        return cols
 
     def reference_world_state_at(
         self, clip_id: torch.Tensor, step: torch.Tensor, world_pos: torch.Tensor, world_quat: torch.Tensor,

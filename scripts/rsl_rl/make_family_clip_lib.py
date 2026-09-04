@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--families", nargs="+", default=list(DEFAULT_FAMILIES),
                    help="Families to keep, NORMALISED (no 'family_' prefix, no '.h5'). "
                         f"Default: {' '.join(DEFAULT_FAMILIES)}")
+    p.add_argument("--max-tiles-per-family", type=int, default=None,
+                   help="Keep at most this many TILES of each family, evenly spaced across "
+                        "that family's tiles. Tiles are the unit of terrain -- a library "
+                        "capped by clips can still span every tile -- so this is the knob "
+                        "for a small library you want to LOOK at rather than train on.")
     p.add_argument("--max-clips", type=int, default=None,
                    help="Keep at most this many clips, evenly spaced across the selection so "
                         "the sample spans every kept family rather than taking a correlated "
@@ -131,6 +136,17 @@ def main() -> None:
         total = int(f.attrs["num_clips"])
 
     keep_tiles = {t for t, fam in by_tile.items() if fam in wanted}
+    if args.max_tiles_per_family is not None:
+        # Evenly spaced within each family, not a prefix: tile ids are grouped, so the first
+        # N of a family would be adjacent tiles and therefore near-identical geometry.
+        trimmed: set[int] = set()
+        for fam in wanted:
+            fam_tiles = sorted(t for t in keep_tiles if by_tile[t] == fam)
+            if len(fam_tiles) > args.max_tiles_per_family:
+                pick = np.linspace(0, len(fam_tiles) - 1, args.max_tiles_per_family)
+                fam_tiles = [fam_tiles[i] for i in np.unique(pick.round().astype(int))]
+            trimmed.update(fam_tiles)
+        keep_tiles = trimmed
     keep = np.flatnonzero(np.isin(terrain_id, sorted(keep_tiles)))
     if keep.size == 0:
         raise SystemExit(
