@@ -232,6 +232,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         # the command branches on the kind; `self._sample_window` carries the choice from
         # here to the one call site.
         kind = _generator_kind_of(self.cfg.fm_checkpoint, str(self.cfg.generator_kind))
+        # Bound before the branch: the startup banner below is written for the flow arm and
+        # reads this, and a name defined on only one arm of a two-arm load is an
+        # UnboundLocalError that no test without a live simulator can reach.
+        steps = None
         if kind == "token_planner":
             from robot_rl.token_planner import online as _tp_online  # noqa: PLC0415
             from robot_rl.token_planner.online import load_planner_context  # noqa: PLC0415
@@ -288,16 +292,31 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "this checkpoint). The generator's history is a slice of ONE plan's tail, so K "
                 f"must be either 1 or >= N. Use 1, or {self.ctx.N} or more."
             )
-        if steps is not None:
-            print(f"[INFO FmTrackingCommand] fm_num_sampling_steps={steps} overrides the "
-                  f"checkpoint's; the flow is integrated in {steps} Euler steps.")
-        if float(self.cfg.fm_guidance_scale) != 1.0:
-            print(f"[INFO FmTrackingCommand] fm_guidance_scale={self.cfg.fm_guidance_scale}: "
-                  "classifier-free guidance on the history branch (2x-batch forward per step).")
-        if self.cfg.fm_zero_noise:
-            print("[INFO FmTrackingCommand] fm_zero_noise=True: the flow integrates from x0=0, "
-                  "so predictions are deterministic given the conditioning (diagnostic mode, "
-                  "off the training distribution).")
+        if kind == "token_planner":
+            # The planner's own banner. Every flow line below describes a mechanism it does
+            # not have, and all three of those settings are refused on this arm anyway.
+            how = ("greedy" if self.ctx.greedy
+                   else f"sampled at T={self.ctx.temperature}"
+                        + ("" if self.cfg.planner_seed is None
+                           else f", seed={self.cfg.planner_seed}"))
+            print(f"[INFO FmTrackingCommand] token planner: {self.ctx.num_steps} "
+                  f"autoregressive decode steps per plan over a {self.ctx.model.vocab_size}"
+                  f"-token vocabulary, {how}.")
+            if not self.ctx.greedy and self.cfg.planner_seed is None:
+                print("[WARN FmTrackingCommand] planner_greedy=False with no planner_seed: "
+                      "the draw comes off the global RNG, so this run cannot be replayed.")
+        else:
+            if steps is not None:
+                print(f"[INFO FmTrackingCommand] fm_num_sampling_steps={steps} overrides the "
+                      f"checkpoint's; the flow is integrated in {steps} Euler steps.")
+            if float(self.cfg.fm_guidance_scale) != 1.0:
+                print(f"[INFO FmTrackingCommand] fm_guidance_scale="
+                      f"{self.cfg.fm_guidance_scale}: classifier-free guidance on the history "
+                      "branch (2x-batch forward per step).")
+            if self.cfg.fm_zero_noise:
+                print("[INFO FmTrackingCommand] fm_zero_noise=True: the flow integrates from "
+                      "x0=0, so predictions are deterministic given the conditioning "
+                      "(diagnostic mode, off the training distribution).")
         if self.ctx.cmd_dim <= 0:
             raise ValueError("FmTrackingCommand expects a command-conditioned FM checkpoint (cmd_dim>0).")
         if self.cfg.tracking_mode == "body" and self.cfg.reference_source == "fm":

@@ -117,6 +117,13 @@ class FmContext:
     ``GenTrackerPolicy`` must use the same ``fm_update_every``: the horizon ``F`` is sized
     from this period. ``None`` for a graph exported before the field existed."""
     history_source: str = "reference"
+    """What the ``N`` history rows this graph was FITTED on contained.
+
+    ``"reference"`` (the applied reference -- what the runtime's ``generator`` arm serves,
+    since a served node IS an applied reference) or ``"measured"`` (the robot's own achieved
+    state). The rows are the same WIDTH either way, so this is the only thing that can say
+    which, and ``GenTrackerPolicy.load`` refuses a serving arm that disagrees with it. A
+    graph exported before the flag is definitionally ``"reference"``."""
     generator_kind: str = "flow_matching"
     """WHICH KIND of generator this graph is -- ``"flow_matching"`` or ``"token_planner"``.
 
@@ -139,14 +146,6 @@ class FmContext:
     """How to draw :attr:`noise`: ``"gaussian"`` for a flow ``x0``, ``"gumbel"`` for the
     planner's ``argmax(logits/T + g)`` sampling. Under both, ZEROS give the deterministic
     arm -- the flow integrates from its source mode, the planner takes the argmax."""
-    """What the ``N`` history rows this graph was FITTED on contained.
-
-    ``"reference"`` (the applied reference -- what the runtime's ``generator`` arm serves,
-    since a served node IS an applied reference) or ``"measured"`` (the robot's own achieved
-    state). The rows are the same WIDTH either way, so this is the only thing that can say
-    which, and ``GenTrackerPolicy.load`` refuses a serving arm that disagrees with it. A
-    graph exported before the flag is definitionally ``"reference"``."""
-
     binding: object | None = None
     """IoBinding holding the captured graph's fixed device buffers, or None when capture is off.
 

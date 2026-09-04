@@ -26,7 +26,7 @@ from robot_rl.flow_matching.online import (  # noqa: E402
     build_history_tokens,
 )
 from robot_rl.token_planner.online import load_planner_context, sample_window  # noqa: E402
-from robot_rl.token_planner.tests.test_online import NODE_DIM, make_checkpoint  # noqa: E402
+from robot_rl.token_planner.tests.test_online import NJ, NODE_DIM, make_checkpoint  # noqa: E402
 
 
 def export_pair(tmp_path, temperature: float = 1.0):
@@ -203,5 +203,7 @@ def test_the_metadata_states_what_a_runtime_cannot_assume(tmp_path):
                 "nj", "cmd_dim", "cmd_steps", "num_cmd_tokens", "joint_names",
                 "target_frame_names", "has_history_null", "history_source"):
         assert key in meta, f"fm_meta is missing the load-bearing key {key!r}"
-    assert meta["window_blocks"] == ["base_pose", "base_vel", "joint_pos"]
+    # ``[[name, width], ...]``. Pinning bare names is what let the export ship a layout the
+    # deploy loader unpacks a STRING from; the widths are the half that makes it a layout.
+    assert meta["window_blocks"] == [["base_pose", 9], ["base_vel", 6], ["joint_pos", NJ]]
     assert meta["D"] == NODE_DIM

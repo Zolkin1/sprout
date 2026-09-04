@@ -57,8 +57,12 @@ sys.path.insert(0, str(_REPO_ROOT / "transfer"))
 
 from deploy.artifacts import fm_artifact_name  # noqa: E402
 
-from robot_rl.flow_matching.window import project_window_rotations  # noqa: E402
+from robot_rl.flow_matching.window import (  # noqa: E402
+    project_window_rotations,
+    window_blocks,
+)
 from robot_rl.token_planner.online import TokenPlannerContext, load_planner_context  # noqa: E402
+from robot_rl.token_planner.planner import _run_layer  # noqa: E402
 
 #: Graph input/output names, in ``_PlannerSamplerOnnx.forward`` argument order. IDENTICAL to
 #: ``export_fm_onnx._IO_NAMES`` so no runtime has to learn a second set.
@@ -144,12 +148,14 @@ class _PlannerSamplerOnnx(nn.Module):
         for step in range(self.num_tokens):
             h = x
             for i, layer in enumerate(layers):
+                # THE layer function, not a second copy of the pre-norm body. Its own
+                # docstring flags that there are three dropout modules on the way through and
+                # a wrong one is invisible at eval-time dropout -- and a copy here would sit
+                # outside `test_run_layer_matches_a_masked_full_pass`, which is the only
+                # thing that pins the op order. Measured drop-in: bit-identical output and
+                # the same node count.
                 kv[i] = torch.cat([kv[i], layer.norm1(h)], dim=1)
-                a = layer.self_attn(layer.norm1(h), kv[i], kv[i], need_weights=False)[0]
-                h = h + layer.dropout1(a)
-                ff = layer.linear2(layer.dropout(
-                    layer.activation(layer.linear1(layer.norm2(h)))))
-                h = h + layer.dropout2(ff)
+                h = _run_layer(layer, h, kv[i], kv_normed=True)
             logits = m.head(m.head_norm(h))[:, -1, :] / self.temperature
             # Gumbel-max: exact sampling at `temperature`, and exactly greedy at noise=0.
             nxt = torch.argmax(logits + noise[:, step, :], dim=-1)
@@ -163,6 +169,46 @@ class _PlannerSamplerOnnx(nn.Module):
             nodes * self.s_std + self.s_mean,
             self.nj, self.num_extra_frames, self.reference_blocks,
         )
+
+
+def _refuse_incomplete(ctx: TokenPlannerContext) -> None:
+    """Refuse to export a graph whose contract is empty, at EXPORT rather than at deploy.
+
+    The flow exporter refuses the same things (a depth graph with no stated band, a
+    privileged exteroception), and for the same reason: a deployment can only discover them
+    later, and the message it gives then names the wrong tool.
+
+    An EMPTY list is refused, not tolerated. "Absent" is a migration allowance; an empty
+    ``joint_names`` is a positive claim about a zero-joint robot, and it silently switches
+    off both the robot-fingerprint guard and the tracker/generator camera agreement (which
+    then compares the tracker with itself).
+
+    Args:
+        ctx: The loaded context.
+
+    Raises:
+        ValueError: On any of them, naming the fix.
+    """
+    if not ctx.joint_names:
+        raise ValueError(
+            "this checkpoint states no joint names, so the exported graph could not map the "
+            "generator's joint order onto a robot's. Re-train with a current "
+            "`train_planner.py`, or run `scripts/token_planner/stamp_planner_meta.py` "
+            "against the recording it trained on.")
+    if len(ctx.target_frame_names) != ctx.target_num_extra_frames:
+        raise ValueError(
+            f"{len(ctx.target_frame_names)} frame name(s) against K="
+            f"{ctx.target_num_extra_frames}; the two are one fact.")
+    if ctx.extero_source == "depth" and ctx.extero_clip is None:
+        raise ValueError(
+            "a depth generator must STATE its extero_clip band; this one says None, which "
+            "resolves to 5.575 in training and 2.0 on the deploy side. Train with "
+            "--fm_config so the band is inherited.")
+    if ctx.extero_source == "height_scan":
+        raise ValueError(
+            "this generator conditions on a height scan, which no deployment can produce. "
+            "The flow exporter refuses the same by default; there is no --allow_privileged "
+            "path here because nothing has needed one yet.")
 
 
 def _tp_meta(ctx: TokenPlannerContext, temperature: float) -> dict:
@@ -183,6 +229,7 @@ def _tp_meta(ctx: TokenPlannerContext, temperature: float) -> dict:
     Returns:
         The metadata dict.
     """
+    planner_cfg = dict(ctx.planner_config)
     return {
         "generator_kind": "token_planner",
         "joint_names": list(ctx.joint_names),
@@ -198,10 +245,23 @@ def _tp_meta(ctx: TokenPlannerContext, temperature: float) -> dict:
         "extero_spec": ctx.extero_spec,
         "robot_asset": ctx.robot_asset,
         "extero_channels": int(ctx.extero_channels),
-        "extero_image_hw": ctx.extero_image_hw,
+        # The ENCODER, or the deploy banner reports a convolutional model as folding each
+        # camera to one token through an MLP -- and `extero_image_hw` is meaningless for the
+        # permutation-invariant flat path, so it is stamped only where it constrains
+        # anything, exactly as `export_fm_onnx` stamps it.
+        "extero_encoder": str(planner_cfg.get("extero_encoder", "cnn")),
+        "extero_image_hw": (ctx.extero_image_hw
+                            if planner_cfg.get("extero_encoder") == "cnn" else None),
+        "extero_tokens_per_sensor": int(ctx.model.prefix.tokens_per_sensor),
         "history_source": str(ctx.history_source),
         "fm_snap_every": ctx.fm_snap_every,
-        "window_blocks": list(ctx.reference_blocks),
+        # ``[[name, width], ...]``, NOT bare names: `fm_session._check_state_layout` does
+        # `for n, _ in declared`, so a list of strings unpacks each STRING and every planner
+        # artifact failed to load with "too many values to unpack". The widths are what make
+        # it a layout rather than a list of labels.
+        "window_blocks": [[n, int(w)] for n, w in
+                          window_blocks(ctx.nj, len(ctx.target_frame_names),
+                                        ctx.reference_blocks)],
         "has_history_null": True,
         "extero_clip": ctx.extero_clip,
         "depth_latency_probs": (list(ctx.depth_latency_probs)
@@ -237,6 +297,7 @@ def export(checkpoint: str, out_path: str | None = None, opset: int = 18,
     ctx = load_planner_context(checkpoint, device="cpu", greedy=True, use_ema=use_ema)
     if ctx.cmd_dim <= 0:
         raise ValueError("export expects a command-conditioned checkpoint (cmd_dim > 0).")
+    _refuse_incomplete(ctx)
     # Match the flow exporter: tracing a frozen model hits UnsupportedOperatorError on the
     # fused attention path, so the parameters are un-frozen for the trace only.
     for p in ctx.model.parameters():
