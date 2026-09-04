@@ -237,6 +237,47 @@ Two things to size the recording against, both measured on `g1_mb_v5_body`:
 The composer can only spread what the recording took, so phase uniformity comes from
 `--start_step 0` — composing an old random-start recording still yields the ramp.
 
+### 3c. Train the trajectory tokenizer (tokenized AR planner, stage A)
+
+An alternative to the flow-matching generator: a discrete-token autoregressive planner. The
+motivation is what it makes possible AFTER supervised training -- a categorical policy has an
+exact per-token log-probability and an exact entropy, so a PPO fine-tune needs neither a
+reparameterisation trick nor a surrogate for the sampling density, which is what makes the
+continuous generator awkward to fine-tune with RL.
+
+Stage A is the tokenizer: a chunk-local autoencoder with an FSQ bottleneck mapping one plan
+(`H` reference-window nodes) to `N = H / D` tokens and back. It trains on the generator's own
+targets, through `flow_matching.dataset.build_train_val`, so the episode split and the state
+normalizer cannot drift from the FM's.
+
+```bash
+# where the recordings are (the build reads tens of GB):
+python scripts/token_planner/train_tokenizer.py --data <recorded>.h5,<augmented>.h5 \
+    --cache chunks.pt --build_cache_only \
+    --match_val_episodes logs/flow_matching/<fm run>/params/data.yaml
+# where you iterate (the cache is the portable artifact, ~5x smaller than the recordings):
+python scripts/token_planner/train_tokenizer.py --cache chunks.pt --run_name d4_v1
+```
+
+`--data` is optional once the cache exists -- it carries its own record of what it was built
+from, and the key refuses a cache built from other recordings, another split seed, another
+horizon or another family exclusion rather than rebuilding silently.
+
+**`D` must divide `H`, and the mismatch is an error rather than a pad.** The shipped
+generator is `future_len = 64`, so `D = 4` gives 16 tokens of 80 ms each; the older 62-node
+horizon is `2 x 31` and admits only `D` in {1, 2, 31, 62}. Padding would make the tokens at
+the chunk seam mean something different from the tokens inside it.
+
+**The encoder emits raw pre-activations; `FSQ` owns the `tanh`.** Squashing in both places
+composes to `tanh(tanh(z))`, whose range is `(-0.762, 0.762)` -- two of the eight codes on
+each axis become unreachable and the 12800-word vocabulary silently collapses to 1944. Every
+tensor stays the right shape, so the only symptom is a codebook-utilisation number that reads
+as a training problem.
+
+`--match_val_episodes` asserts the held-out episode set is identical to a named FM run's,
+which is what "the same split as the generator" has to mean for the eventual AR-vs-FM
+comparison to be paired.
+
 ### 4. Deploy the tracker, in Isaac and in MuJoCo
 
 The tracker is the *same* teacher policy, tracking the FM instead of the clip:

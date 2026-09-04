@@ -76,6 +76,12 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
                         "Use the SAME set the generator was trained on. Optional when "
                         "--cache names an existing cache, which carries its own record of "
                         "what it was built from; given anyway, the two must agree.")
+    p.add_argument("--build_cache_only", action="store_true",
+                   help="Build --cache and exit without training. The point of the split is "
+                        "that the build belongs where the recordings are and the training "
+                        "belongs where you iterate; running an epoch just to get the cache "
+                        "would leave a tokenizer.pt and a gating report that mean nothing "
+                        "and could later be mistaken for a result.")
     p.add_argument("--verify_data_sha256", action="store_true",
                    help="Re-hash the --data files and require them to match what the cache "
                         "was built from. Off by default because it is a full read of tens of "
@@ -556,6 +562,14 @@ def main() -> None:
 
     chunks = resolve_chunks(cfg, args)
     cfg.validate()
+
+    if args.build_cache_only:
+        if not args.cache:
+            raise SystemExit("--build_cache_only needs --cache to say where to write it.")
+        print(f"[tok] --build_cache_only: {chunks.train_nodes.shape[0]} train / "
+              f"{chunks.val_nodes.shape[0]} val chunks of "
+              f"({cfg.chunk_len}, {cfg.node_dim}) -> {args.cache}")
+        return
 
     run = (f"{time.strftime('%Y-%m-%d_%H-%M-%S')}_{args.run_name}"
            if args.run_name else time.strftime("%Y-%m-%d_%H-%M-%S"))
