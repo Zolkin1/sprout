@@ -70,24 +70,7 @@ GROUP_UNITS: dict[str, str] = {
 }
 
 
-def _geodesic_rad(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """Angle between two 6-D rotation representations, in radians.
-
-    Args:
-        a: ``(..., 6)`` rot6d.
-        b: ``(..., 6)`` rot6d.
-
-    Returns:
-        ``(...)`` angles.
-    """
-    from robot_rl.flow_matching.transforms import rot6d_to_matrix  # noqa: PLC0415
-
-    rel = rot6d_to_matrix(a).transpose(-1, -2) @ rot6d_to_matrix(b)
-    cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
-    return torch.arccos(cos)
-
-
-@dataclass
+@dataclass(kw_only=True)
 class ReconAccumulator:
     """Streaming reconstruction + codebook statistics over a whole split.
 
@@ -98,7 +81,10 @@ class ReconAccumulator:
     trajectory fine and falls on the one node that jumped.
 
     Args:
-        group_names: Group names, from :func:`channel_group_labels`.
+    Keyword-only on purpose: ``std`` and ``mean`` are both ``(D,)`` float tensors, so
+    swapping them positionally is shape-silent and was measured to inflate ``base_pos`` RMSE
+    25x while every number still looked like a number.
+
         labels: ``(D,)`` group label per channel.
         mean: ``(D,)`` normalizer mean. Only the geodesic needs it (an error cancels the
             mean, a rotation matrix does not).
@@ -126,7 +112,6 @@ class ReconAccumulator:
     _n_by_family: torch.Tensor = field(init=False)          # (F, G)
     _token_counts: torch.Tensor = field(init=False)         # (V,)
     _node_err: list[torch.Tensor] = field(init=False)       # per-batch (B*H, G) node RMS
-    _node_family: list[torch.Tensor] = field(init=False)    # per-batch (B*H,) family code
     _geo_sum: float = field(init=False, default=0.0)         # sum of geodesic angles (rad)
     _geo_n: int = field(init=False, default=0)
     _chunks: int = field(init=False, default=0)
@@ -141,7 +126,6 @@ class ReconAccumulator:
         self._n_by_family = torch.zeros(self.num_families, g, dtype=torch.float64)
         self._token_counts = torch.zeros(self.vocab_size, dtype=torch.int64)
         self._node_err = []
-        self._node_family = []
         self._geo_sum = 0.0
         self._geo_n = 0
         self._chunks = 0
@@ -177,7 +161,14 @@ class ReconAccumulator:
         self._n_by_pos += (cnt_g.unsqueeze(0) * target.shape[0]).expand(
             self.chunk_len, g).cpu()
 
-        fam = family.to(dev).long().clamp_(0, self.num_families - 1)
+        # NOT in place, and NOT clamped: `clamp_` on an int64 tensor already on `dev` is a
+        # no-op-then-mutate chain that rewrites the CALLER's array, and folding an
+        # out-of-range code into the last family would silently mislabel it.
+        fam = family.to(device=dev, dtype=torch.long)
+        if fam.numel() and (int(fam.min()) < 0 or int(fam.max()) >= self.num_families):
+            raise ValueError(
+                f"family code out of range [0, {self.num_families}): "
+                f"min={int(fam.min())} max={int(fam.max())}.")
         per_chunk = sq_g.sum(dim=1)                                 # (B, G)
         self._sq_by_family.index_add_(0, fam.cpu(), per_chunk.cpu())
         self._n_by_family.index_add_(
@@ -188,8 +179,6 @@ class ReconAccumulator:
         # Per-node group RMS, kept for the exact tail.
         node_rms = (sq_g / cnt_g.clamp(min=1.0)).sqrt()             # (B, H, G)
         self._node_err.append(node_rms.reshape(-1, g).float().cpu())
-        self._node_family.append(
-            fam.cpu().unsqueeze(1).expand(-1, target.shape[1]).reshape(-1))
 
         self._token_counts += torch.bincount(
             ids.reshape(-1).cpu(), minlength=self.vocab_size)
@@ -204,7 +193,11 @@ class ReconAccumulator:
         if "base_ori" in self.group_names:
             col = self.labels.to(dev) == self.group_names.index("base_ori")
             m, sd = self.mean.to(dev), std
-            self._geo_sum += float(_geodesic_rad(
+            from robot_rl.flow_matching.transforms import (  # noqa: PLC0415
+                geodesic_angle_rot6d,
+            )
+
+            self._geo_sum += float(geodesic_angle_rot6d(
                 (recon * sd + m)[..., col], (target * sd + m)[..., col]).sum())
             self._geo_n += int(target.shape[0] * target.shape[1])
 
@@ -214,8 +207,10 @@ class ReconAccumulator:
     def ori_geodesic_rad(self) -> float:
         """Mean angle between the reconstructed and true base orientations, in radians.
 
-        The same definition ``scripts/flow_matching/train.py``'s ``channel_metrics`` reports
-        as ``ori_geodesic_rad``, so the two are directly comparable.
+        Literally the same function ``scripts/flow_matching/train.py``'s
+        ``channel_metrics`` calls for ``ori_geodesic_rad`` -- they share
+        ``flow_matching.transforms.geodesic_angle_rot6d`` -- so the two numbers are
+        comparable by construction rather than by a comment saying so.
         """
         return self._geo_sum / max(self._geo_n, 1)
 
@@ -274,9 +269,15 @@ class ReconAccumulator:
         """
         curve = self.rmse_by_position()
         out: dict[str, dict[str, float]] = {}
+        # A chunk too short to HAVE an interior would otherwise compare each end against a
+        # "middle" that contains it, which reads as exactly 1.0 -- the value the docstring
+        # defines as healthy. Report nothing rather than something reassuring and wrong.
+        if self.chunk_len <= 2 * int(edge) + 1:
+            return {n: {"lo": math.nan, "hi": math.nan, "interior_slope": math.nan}
+                    for n in curve}
         for name, vals in curve.items():
             v = torch.tensor(vals, dtype=torch.float64)
-            inner = v[edge:-edge] if v.numel() > 2 * edge else v
+            inner = v[edge:-edge]
             mid = float(inner.mean())
             q = max(inner.numel() // 4, 1)
             lo_q, hi_q = float(inner[:q].mean()), float(inner[-q:].mean())
@@ -299,6 +300,14 @@ class ReconAccumulator:
         if not self._node_err:
             return {n: 0.0 for n in self.group_names}
         allv = torch.cat(self._node_err, dim=0)
+        # torch.quantile refuses an input past 2**24 elements. Subsample rather than fail:
+        # a uniform sample of 16M nodes puts the 99th percentile well inside its own
+        # rounding, and the alternative is a crash after the first validation epoch of a
+        # large split.
+        cap = 1 << 24
+        if allv.shape[0] > cap:
+            idx = torch.randperm(allv.shape[0], generator=torch.Generator().manual_seed(0))
+            allv = allv[idx[:cap]]
         return {
             n: float(torch.quantile(allv[:, i].double(), q))
             for i, n in enumerate(self.group_names)

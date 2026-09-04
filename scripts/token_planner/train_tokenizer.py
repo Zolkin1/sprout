@@ -47,6 +47,7 @@ from robot_rl.flow_matching.ema import WeightEMA  # noqa: E402
 from robot_rl.flow_matching.normalizer import Normalizer  # noqa: E402
 from robot_rl.token_planner.config import TokenizerConfig  # noqa: E402
 from robot_rl.token_planner.data import (  # noqa: E402
+    STATE_SCALE_NAMES,
     ChunkDataset,
     build_chunk_data,
     cache_key,
@@ -107,6 +108,14 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
     p.add_argument("--wandb_project", type=str, default="robot_rl_token_planner")
     p.add_argument("--val_every", type=int, default=1)
     p.add_argument("--ckpt_every", type=int, default=10)
+    p.add_argument("--fm_config", default="",
+                   help="A flow-matching run's params/fm_config.yaml. Supplies the DECLARED "
+                        "STATE SCALES, the only config values that reach the state "
+                        "normalizer -- and the normalizer is what makes a reconstruction "
+                        "error mean the same thing in both stages. Without it the scales are "
+                        "whatever FlowMatchingConfig currently defaults to, which is the trap "
+                        "CLAUDE.md records four times over for other fields. The resolved "
+                        "values are recorded and keyed either way.")
     p.add_argument("--match_val_episodes", default="",
                    help="Path to a flow-matching run's params/data.yaml. Asserts this "
                         "build's held-out episode ids are IDENTICAL to that run's, which is "
@@ -159,13 +168,17 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
     p.add_argument("--grad_clip", type=float, default=d.grad_clip)
     p.add_argument("--ema_decay", type=float, default=d.ema_decay)
     p.add_argument("--seed", type=int, default=d.seed)
-    p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True,
-                   help="bf16 autocast. On by default, unlike the FM trainer, which is fp32 "
-                        "throughout -- this is a fresh model with no checkpoint to stay "
-                        "numerically comparable with.")
+    p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=d.bf16,
+                   help="bf16 autocast. OFF by default, and that is a correctness choice: "
+                        "under autocast the encoder emits bf16 pre-activations, and rounding "
+                        "those to the FSQ lattice moves 5.9%% of the emitted TOKENS against "
+                        "the fp32 answer -- which are exactly stage B's targets, produced "
+                        "outside autocast. The model is 5.5M parameters, so the speed is not "
+                        "worth it, and the FM trainer is fp32 throughout as well.")
 
     args = p.parse_args()
     cfg = TokenizerConfig(
+        bf16=args.bf16,
         chunk_len=args.chunk_len,
         fsq_levels=[int(v) for v in args.fsq_levels.split(",") if v.strip()],
         downsample=args.downsample,
@@ -187,6 +200,11 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
         ema_decay=args.ema_decay,
         seed=args.seed,
     )
+    # BEFORE anything reads a recording: a bad (H, D) pair, or an empty level table, would
+    # otherwise cost the whole build -- minutes, tens of GB, or a multi-gigabyte cache load
+    # -- before raising. TrajectoryTokenizer validates at construction for the same reason,
+    # and building first defeats it.
+    cfg.validate()
     return cfg, args
 
 
@@ -322,6 +340,7 @@ def resolve_chunks(cfg: TokenizerConfig, args: argparse.Namespace):
 
     families = (list(DEFAULT_SKIP_FAMILIES) if args.skip_families is None
                 else [f for f in args.skip_families.split(",") if f.strip()])
+    scales = _state_scales_from(args.fm_config)
 
     def _build():
         if args.load_rows > 0:
@@ -333,7 +352,7 @@ def resolve_chunks(cfg: TokenizerConfig, args: argparse.Namespace):
             paths, chunk_len=cfg.chunk_len, seed=args.split_seed,
             val_fraction=args.val_fraction, stride=args.stride,
             skip_distractors=args.skip_distractors, skip_families=families,
-            reference_blocks=blocks,
+            reference_blocks=blocks, state_scales=scales,
         )
         chunks.provenance["load_rows"] = int(args.load_rows)
         return chunks
@@ -405,7 +424,11 @@ def _load_cache(path: str, cfg: TokenizerConfig, args: argparse.Namespace,
     """
     from robot_rl.token_planner.data import CACHE_VERSION
 
-    cached_key = torch.load(path, map_location="cpu", weights_only=False).get("key", {})
+    # ONE read. This file is the built chunks -- 4.16 GB on the shipped recordings -- so
+    # loading it to inspect the key and then loading it again to use it is a second full
+    # read and a second full peak allocation on every run start.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    cached_key = dict(payload.get("key", {}))
     want = {
         "version": CACHE_VERSION,
         "chunk_len": int(cfg.chunk_len),
@@ -416,9 +439,14 @@ def _load_cache(path: str, cfg: TokenizerConfig, args: argparse.Namespace,
         "skip_families": list(families),
         "reference_blocks": (blocks if blocks is not None
                              else cached_key.get("reference_blocks")),
+        # A full run must not accept a cache built from a TRUNCATED recording -- that is a
+        # different episode split, so nothing measured against it is comparable.
+        "load_rows": int(args.load_rows),
         "data_sha256": cached_key.get("data_sha256"),
+        # The declared per-block scales ARE the normalizer on the blocks they cover.
+        "state_scales": cached_key.get("state_scales", {}),
     }
-    chunks = load_chunk_cache(path, want)
+    chunks = load_chunk_cache(path, want, payload=payload)
 
     cached_paths = [p for p in str(chunks.provenance.get("data", "")).split(",") if p]
     cached_shas = [h for h in str(chunks.provenance.get("data_sha256", "")).split(",") if h]
@@ -463,6 +491,31 @@ def _load_cache(path: str, cfg: TokenizerConfig, args: argparse.Namespace,
                 )
         print(f"[tok] --verify_data_sha256: {len(cached_paths)} file(s) match.")
     return chunks
+
+
+def _state_scales_from(fm_config_path: str) -> dict[str, float | None] | None:
+    """The declared per-block state scales a generator trained under.
+
+    Args:
+        fm_config_path: A run's ``params/fm_config.yaml``, or ``""``.
+
+    Returns:
+        ``{block: scale}`` for every entry present, or ``None`` when no path is given (which
+        takes ``FlowMatchingConfig``'s current defaults -- see ``build_chunk_data``).
+    """
+    if not fm_config_path:
+        print("[tok] no --fm_config: the declared state scales are FlowMatchingConfig's "
+              "current defaults. They define the normalizer, so pass the generator's own "
+              "config if this tokenizer is meant to pair with it.")
+        return None
+    import yaml
+
+    with open(fm_config_path) as fh:
+        raw = yaml.safe_load(fh) or {}
+    out = {n: raw[f"state_scale_{n}"] for n in STATE_SCALE_NAMES
+           if f"state_scale_{n}" in raw}
+    print(f"[tok] state scales from {fm_config_path}: {out}")
+    return out
 
 
 def _assert_split_matches(chunks, params_data_yaml: str) -> None:
@@ -524,7 +577,7 @@ def _patch_row_limit(n: int) -> None:
 
 def save_checkpoint(path: str, model: TrajectoryTokenizer, opt, cfg: TokenizerConfig,
                     chunks, epoch: int, scalars: dict[str, float],
-                    report: dict[str, Any], ema: WeightEMA | None) -> None:
+                    report: dict[str, Any], ema: WeightEMA | None, step: int = 0) -> None:
     """Write a self-describing tokenizer checkpoint.
 
     Self-describing is the requirement, not a nicety: the AR planner's targets are token ids,
@@ -542,6 +595,12 @@ def save_checkpoint(path: str, model: TrajectoryTokenizer, opt, cfg: TokenizerCo
         scalars: Flat validation scalars.
         report: The full validation report.
         ema: The weight EMA, or ``None``.
+        step: The global optimizer step. ``scheduled_lr`` is a pure function of
+            ``(epoch, step)``, so without it even a hand-written resume would restart
+            the warmup. There is no resume path yet; this is what one would need.
+        step: The global optimizer step. ``scheduled_lr`` is a pure function of
+            ``(epoch, step)``, so without it even a hand-written resume would restart the
+            warmup. There is no resume path yet; this is what one would need.
     """
     payload: dict[str, Any] = {
         "model": model.state_dict(),
@@ -555,6 +614,7 @@ def save_checkpoint(path: str, model: TrajectoryTokenizer, opt, cfg: TokenizerCo
         "val_episode_ids": list(chunks.val_episode_ids),
         "provenance": dict(chunks.provenance),
         "epoch": int(epoch),
+        "step": int(step),
         "metrics": dict(scalars),
         "report": report,
     }
@@ -572,7 +632,6 @@ def main() -> None:
     device = torch.device(args.device)
 
     chunks = resolve_chunks(cfg, args)
-    cfg.validate()
 
     if args.build_cache_only:
         if not args.cache:
@@ -752,7 +811,7 @@ def main() -> None:
             if sel < best:
                 best = sel
                 save_checkpoint(os.path.join(out_dir, "tokenizer.pt"), model, opt, cfg,
-                                chunks, epoch, scal, sel_rep, ema)
+                                chunks, epoch, scal, sel_rep, ema, step)
                 with open(os.path.join(out_dir, "gating_report.json"), "w") as fh:
                     json.dump({"epoch": epoch, "scalars": scal, "report": sel_rep}, fh,
                               indent=2)
@@ -768,8 +827,15 @@ def main() -> None:
 
         if epoch % max(args.ckpt_every, 1) == 0 or epoch == cfg.num_epochs - 1:
             save_checkpoint(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg,
-                            chunks, epoch, {}, {}, ema)
+                            chunks, epoch, {}, {}, ema, step)
 
+    if val_loader is None:
+        # Without a validation split nothing above ever fired, so the run would finish
+        # having printed the path of a file it never wrote.
+        save_checkpoint(os.path.join(out_dir, "tokenizer.pt"), model, opt, cfg, chunks,
+                        cfg.num_epochs - 1, {}, {}, ema, step)
+        print("[tok] no validation split: wrote tokenizer.pt from the final weights, with "
+              "no metrics and no model selection.")
     writer.close()
     if wandb_run is not None:
         wandb_run.finish()

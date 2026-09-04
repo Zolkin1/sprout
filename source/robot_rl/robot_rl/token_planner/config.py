@@ -124,6 +124,18 @@ class TokenizerConfig:
     #: raw ones. The FM trainer's EMA is what the shipped generator was selected on, so the
     #: same instrument is used here.
     ema_decay: float = 0.999
+    #: bf16 autocast. **OFF by default, and that is a correctness choice, not a taste one.**
+    #: Under autocast the encoder emits bf16 pre-activations, and rounding those to the FSQ
+    #: lattice moves 5.9% of the emitted TOKENS against the fp32 answer. Stage B's targets
+    #: are exactly those tokens and are produced outside autocast, so a bf16-trained
+    #: tokenizer would hand the planner a 6%-different sequence from the one its own decoder
+    #: was trained to invert -- with no shape anywhere to notice. The model is 5.5M
+    #: parameters at ~37 s/epoch, so the speed bf16 buys is not worth that; the flow-matching
+    #: trainer is fp32 throughout for its own reasons and this now matches it.
+    #:
+    #: RECORDED rather than left on the command line, because it is the one runtime flag that
+    #: changes what the artifact MEANS.
+    bf16: bool = False
 
     @property
     def latent_dim(self) -> int:

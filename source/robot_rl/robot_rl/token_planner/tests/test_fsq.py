@@ -110,3 +110,43 @@ def test_the_ablation_level_table_works_too():
     assert q.vocab_size == 4375
     ids = torch.arange(q.vocab_size)
     assert torch.equal(codes_to_id(id_to_codes(ids, q.levels), q.levels), ids)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float64])
+def test_the_lattice_does_not_depend_on_the_input_dtype(dtype):
+    """The dequantized latent is a CONSTANT of the level table, not of the caller's dtype.
+
+    It was not: :meth:`FSQ.quantize` computed the lattice in ``z``'s dtype while
+    ``id_to_latent`` used fp32, so under bf16 autocast the decoder was trained against one
+    lattice and served another -- measured at 3.3e-3 in latent units and 1.0 mm / 20.2 mm p99
+    of base position on a live checkpoint, with the reported metrics (computed outside
+    autocast) moving 0.04%. Nothing had the wrong shape, so no number in a run could show it.
+    """
+    q = FSQ(LEVELS)
+    z = torch.randn(4096, len(LEVELS)) * 2.0
+    latent_ref, ids_ref = q(z)
+    latent, ids = q(z.to(dtype))
+    assert latent.dtype == torch.float32, "the lattice must come back in fp32"
+    # The IDS may differ, because casting z is a real change to the encoder's output; what
+    # may not differ is the latent a given id maps to.
+    assert torch.equal(q.id_to_latent(ids), latent)
+    assert torch.equal(q.id_to_latent(ids_ref), latent_ref)
+
+
+def test_a_double_tanh_would_lose_the_end_codes_of_the_eight_level_axes():
+    """The failure the module docstring is about, measured rather than asserted.
+
+    Kept as a test because the number in that docstring was wrong once: the 5-level axes
+    SURVIVE a double tanh (``half * (1 - tanh 1) = 0.477`` still rounds to 0), so the
+    collapse is 12800 -> 5400 and not the 1944 a first estimate claimed.
+    """
+    q = FSQ(LEVELS)
+    z = torch.linspace(-60.0, 60.0, 20001).unsqueeze(-1).repeat(1, len(LEVELS))
+    reachable_ok = [int(torch.unique(id_to_codes(q(z)[1], q.levels)[:, i]).numel())
+                    for i in range(len(LEVELS))]
+    assert reachable_ok == list(LEVELS)
+    # The bug: a squash applied before FSQ's own.
+    reachable_bad = [int(torch.unique(id_to_codes(q(torch.tanh(z))[1], q.levels)[:, i]).numel())
+                     for i in range(len(LEVELS))]
+    assert reachable_bad == [6, 6, 6, 5, 5]
+    assert math.prod(reachable_bad) == 5400

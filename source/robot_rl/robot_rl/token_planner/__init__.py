@@ -17,9 +17,13 @@ categorical policy has an exact per-token log-probability and an exact entropy, 
 fine-tuning needs no reparameterisation trick and no surrogate for the sampling density --
 the two things that make the flow-matching generator awkward to fine-tune with RL.
 
-**Nothing here imports IsaacLab.** The models are torch-only so their tests run in
-``env_transfer``; the code that builds a dataset out of a recording lives in the training
-scripts, which do import the RL side.
+**The model modules import no IsaacLab AT MODULE SCOPE** -- ``fsq``, ``tokenizer``,
+``prefix`` (whose one import is the flow-matching extero encoder, itself Isaac-free) and the
+metrics take their layout lazily, inside the one function that needs it. That is a
+maintenance property, not a deployability one: importing this PACKAGE still goes through
+``robot_rl/__init__.py``, which registers every gym env and pulls in ~60 isaaclab modules, so
+nothing here runs in ``env_transfer`` (which ships no torch at all). The code that builds a
+dataset out of a recording lives in the training scripts, which import the RL side outright.
 """
 
 from .config import DOWNSAMPLE_D, FSQ_LEVELS, PlannerConfig, TokenizerConfig

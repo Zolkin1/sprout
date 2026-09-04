@@ -177,3 +177,33 @@ def test_the_shipped_size_is_in_the_target_band():
     the planner."""
     n = sum(p.numel() for p in TrajectoryTokenizer(TokenizerConfig()).parameters())
     assert 2e6 <= n <= 6e6, f"{n / 1e6:.2f}M parameters"
+
+
+def test_the_reconstruction_metrics_cannot_be_built_positionally():
+    """``std`` and ``mean`` are both ``(D,)`` float tensors, so swapping them is shape-silent.
+
+    Measured, before the accumulator was made keyword-only: passing them the other way round
+    reported a ``base_pos`` RMSE of 1.0 where the truth was 0.04 -- a 25x error that still
+    looks like a number, in the one place the gating decision is read from.
+    """
+    from robot_rl.token_planner.metrics import ReconAccumulator, channel_group_labels
+
+    names, labels = channel_group_labels(29, 0, ["base_pose", "base_vel", "joint_pos"])
+    with pytest.raises(TypeError):
+        ReconAccumulator(names, labels, torch.ones(44), torch.zeros(44), 64, 12800, 1, ["a"])
+
+
+def test_the_accumulator_refuses_an_out_of_range_family_and_leaves_its_input_alone():
+    """It used to `clamp_` in place: an illegal code was folded into the last family, and the
+    caller's own array was rewritten under it."""
+    from robot_rl.token_planner.metrics import ReconAccumulator, channel_group_labels
+
+    names, labels = channel_group_labels(4, 0, ["base_pose"])
+    acc = ReconAccumulator(group_names=names, labels=labels, std=torch.ones(9),
+                           mean=torch.zeros(9), chunk_len=4, vocab_size=16,
+                           num_families=3, family_names=["a", "b", "c"])
+    t = torch.randn(4, 4, 9)
+    fam = torch.tensor([0, 1, 99, 2])
+    with pytest.raises(ValueError, match="family code out of range"):
+        acc.update(t, t, torch.zeros(4, 1, dtype=torch.long), fam)
+    assert fam.tolist() == [0, 1, 99, 2], "the caller's tensor must not be mutated"

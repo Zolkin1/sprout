@@ -62,6 +62,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     REFERENCE_WINDOW_BLOCK_NAMES,
     REFERENCE_WINDOW_NOISE,
     REFERENCE_BLOCK_KEYS,
+    geodesic_angle_rot6d,
     rot6d_to_matrix,
     window_block_slices,
     sample_trajectory,
@@ -572,13 +573,11 @@ def channel_metrics(
     def _geodesic(slc: slice) -> float:
         """Angle between the predicted and target base orientations, in radians.
 
-        Through the rotation group rather than differencing the raw channels, so the metric
-        is a real angle -- and so the prediction's Gram-Schmidt residual is projected out
-        rather than counted as orientation error.
+        The maths lives in ``flow_matching.transforms.geodesic_angle_rot6d`` because the
+        token planner reports the same quantity, and the two are only comparable if they are
+        the same function.
         """
-        rel = rot6d_to_matrix(pred[..., slc]).transpose(-1, -2) @ rot6d_to_matrix(tgt[..., slc])
-        cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
-        return torch.arccos(cos).mean().item()
+        return geodesic_angle_rot6d(pred[..., slc], tgt[..., slc]).mean().item()
 
     b = window_block_slices(num_joints, num_extra_frames, blocks)
     out: dict[str, float] = {}

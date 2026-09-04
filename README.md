@@ -269,10 +269,10 @@ horizon is `2 x 31` and admits only `D` in {1, 2, 31, 62}. Padding would make th
 the chunk seam mean something different from the tokens inside it.
 
 **The encoder emits raw pre-activations; `FSQ` owns the `tanh`.** Squashing in both places
-composes to `tanh(tanh(z))`, whose range is `(-0.762, 0.762)` -- two of the eight codes on
-each axis become unreachable and the 12800-word vocabulary silently collapses to 1944. Every
-tensor stays the right shape, so the only symptom is a codebook-utilisation number that reads
-as a training problem.
+composes to `tanh(tanh(z))`, whose range is `(-0.762, 0.762)` -- the three 8-level axes lose
+both end codes and the 12800-word vocabulary silently collapses to 5400 (measured; the
+5-level axes happen to survive). Every tensor stays the right shape, so the only symptom is a
+codebook-utilisation number that reads as a training problem.
 
 `--match_val_episodes` asserts the held-out episode set is identical to a named FM run's,
 which is what "the same split as the generator" has to mean for the eventual AR-vs-FM

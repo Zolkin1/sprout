@@ -87,6 +87,13 @@ CACHE_VERSION: int = 1
 #: Exteroception arrays in increasing cost per window, for the "cheapest present" choice.
 _EXTERO_BY_COST: tuple[str, ...] = ("height_scan", "depth")
 
+#: The per-block declared scales, by the suffix of their ``FlowMatchingConfig`` field. These
+#: are the ONLY config values that reach the state normalizer, which is why they are pinned,
+#: recorded and keyed rather than defaulted.
+STATE_SCALE_NAMES: tuple[str, ...] = (
+    "base_pos", "base_lin_vel", "base_ang_vel", "joint_pos", "joint_vel", "ee_pos",
+)
+
 
 @dataclass
 class ChunkData:
@@ -125,11 +132,27 @@ class ChunkData:
     provenance: dict[str, Any] = field(default_factory=dict)
 
 
-def cheapest_extero_source(data: dict[str, np.ndarray]) -> str:
+def present_arrays(path: str) -> dict[str, object]:
+    """Which arrays a recording holds, WITHOUT reading any of them.
+
+    Args:
+        path: A windowed ``.h5``.
+
+    Returns:
+        A dict whose keys are the datasets present; the values are placeholders.
+    """
+    import h5py  # noqa: PLC0415
+
+    with h5py.File(path, "r") as fh:
+        return {k: True for k in fh.keys()}
+
+
+def cheapest_extero_source(data: dict[str, object]) -> str:
     """Pick the narrowest exteroception array the recording carries.
 
     Args:
-        data: Recorded arrays.
+        data: Recorded arrays, or anything key-compatible with them (see
+            :func:`present_arrays`).
 
     Returns:
         An entry of :data:`_EXTERO_BY_COST`.
@@ -239,6 +262,7 @@ def build_chunk_data(
     skip_distractors: bool = True,
     skip_families: Sequence[str] | None = None,
     reference_blocks: Sequence[str] | None = None,
+    state_scales: dict[str, float | None] | None = None,
 ) -> ChunkData:
     """Build train/val chunks by running the flow-matching dataset and keeping ``state``.
 
@@ -253,6 +277,16 @@ def build_chunk_data(
         skip_families: Families to drop; ``None`` takes the FM's own default (which is
             ``family_jump_off``, unobservable to a forward-facing camera).
         reference_blocks: Node block selection, or ``None`` to take the recording's.
+        state_scales: The generator's ``state_scale_*`` fields, e.g.
+            ``{"base_pos": 0.4, "joint_pos": None}``. ``None`` takes
+            :class:`~robot_rl.flow_matching.config.FlowMatchingConfig`'s current defaults --
+            which is a trap worth naming, since these are the ONLY config values that reach
+            the state normalizer, and the normalizer is what makes a reconstruction error in
+            normalized units mean the same thing in both stages. A generator trained with an
+            override, or a later change to a default, would silently give the tokenizer a
+            different affine while every shape and every episode id still matched. Pass the
+            generator's own values (``train_tokenizer.py --fm_config`` does) and they are
+            recorded in the provenance and in the cache key.
 
     Returns:
         The built :class:`ChunkData`.
@@ -278,14 +312,17 @@ def build_chunk_data(
         "is_distractor", "clip_family", "clip_id", "clip_step", "env_id", "cmd_future",
     }
     # Which exteroception array to satisfy the FM dataset with -- ONE statement of the
-    # rule, so a recording carrying neither hits its own error here rather than resolving
-    # to "depth" and failing later with an unrelated message.
-    head, _ = load_recordings(paths[:1], keys=list(_EXTERO_BY_COST))
-    extero = cheapest_extero_source(head)
-    del head
+    # rule, so a recording carrying neither hits its own error here rather than resolving to
+    # "depth" and failing later with an unrelated message.
+    #
+    # Answered from the FILE'S KEYS, not by loading. Reading both arrays to find out which
+    # exist decompresses ~6.2 GB of depth and throws it away, immediately under a docstring
+    # justifying this whole design as a 6.2 GB -> 141 MB saving.
+    extero = cheapest_extero_source(present_arrays(paths[0]))
     keys = sorted((want | {extero}) & set(rdio.WINDOW_ARRAY_KEYS))
     data, meta = load_recordings(paths, keys=keys)
 
+    scales = dict(state_scales or {})
     cfg = FlowMatchingConfig(
         future_len=int(chunk_len),
         num_history_states=1,          # the smallest legal value; the history is not used
@@ -306,7 +343,14 @@ def build_chunk_data(
         pinned_axis_metrics=False,
         cmd_array=None,
         obs_noise=False,
+        **{f"state_scale_{k}": v for k, v in scales.items()},
     )
+    # Read BACK, so the provenance and the cache key record what was resolved rather than
+    # what was requested -- an unspecified scale is a real value, just a defaulted one.
+    resolved_scales = {
+        name: getattr(cfg, f"state_scale_{name}")
+        for name in STATE_SCALE_NAMES
+    }
     train_ds, val_ds = build_train_val(data, meta, cfg)
     if len(train_ds) == 0:
         raise ValueError("the build produced no training chunks.")
@@ -401,6 +445,7 @@ def build_chunk_data(
             "stride": int(stride),
             "skip_distractors": bool(skip_distractors),
             "skip_families": list(cfg.skip_families),
+            "state_scales": resolved_scales,
             "recording_dt": float(getattr(meta, "dt", 0.02)),
             "recording_replan_period": int(getattr(meta, "fm_snap_every", 0) or 0),
             "recording_ref_future_len": int(getattr(meta, "ref_future_len", 0) or 0),
@@ -434,6 +479,13 @@ def cache_key(provenance: dict[str, Any], chunk_len: int,
         "stride": int(provenance.get("stride", 1)),
         "skip_distractors": bool(provenance.get("skip_distractors", True)),
         "skip_families": list(provenance.get("skip_families", [])),
+        # The declared per-block scales ARE the normalizer on the blocks they cover, so a
+        # cache built under different ones holds chunks in a different space.
+        "state_scales": dict(provenance.get("state_scales", {})),
+        # A truncated recording is a different episode split, so a cache built with
+        # --load_rows must not satisfy a full run. The flag's help said this was true before
+        # it was.
+        "load_rows": int(provenance.get("load_rows", 0) or 0),
     }
 
 
@@ -452,12 +504,32 @@ def save_chunk_cache(path: str, chunks: ChunkData) -> None:
     torch.save(payload, path)
 
 
-def load_chunk_cache(path: str, key: dict[str, Any]) -> ChunkData:
+def read_cache_key(path: str) -> dict[str, Any]:
+    """The key of a cache, without materializing its tensors.
+
+    ``torch.load`` reads the whole file, so asking for the key and then loading is two full
+    reads of a multi-gigabyte artifact. :func:`load_chunk_cache` therefore takes an
+    already-loaded payload, and this exists for the one caller that genuinely only wants the
+    key.
+
+    Args:
+        path: A file written by :func:`save_chunk_cache`.
+
+    Returns:
+        The stored key dict.
+    """
+    return dict(torch.load(path, map_location="meta", weights_only=False).get("key", {}))
+
+
+def load_chunk_cache(path: str, key: dict[str, Any],
+                     payload: dict[str, Any] | None = None) -> ChunkData:
     """Read a cached build, refusing one that does not match ``key``.
 
     Args:
         path: A file written by :func:`save_chunk_cache`.
         key: The key the caller requires, from :func:`cache_key`.
+        payload: An already-loaded ``torch.load`` of ``path``, to avoid a second full read
+            of a multi-gigabyte file.
 
     Returns:
         The cached :class:`ChunkData`.
@@ -467,7 +539,8 @@ def load_chunk_cache(path: str, key: dict[str, Any]) -> ChunkData:
             would be worse: the whole point of the cache is that a run's numbers are about
             the data the run says they are about.
     """
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if payload is None:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
     have = dict(payload.get("key", {}))
     diff = {k: (have.get(k), v) for k, v in key.items() if have.get(k) != v}
     if diff:

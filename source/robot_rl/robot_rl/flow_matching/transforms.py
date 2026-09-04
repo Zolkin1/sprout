@@ -585,3 +585,27 @@ def sanitize_extero(
     """
     band = EXTERO_CLIP[source] if clip is None else float(clip)
     return sanitize_height_scan(values, clip=band)
+
+
+def geodesic_angle_rot6d(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Angle between two 6-D rotation representations, in radians.
+
+    Through the rotation GROUP rather than by differencing the raw channels, so the result is
+    a real angle and a prediction's Gram-Schmidt residual is projected out instead of being
+    counted as orientation error.
+
+    Lives here rather than in either caller because it has two: the flow-matching trainer's
+    ``channel_metrics`` reports it as ``ori_geodesic_rad`` and the token planner's
+    reconstruction metrics report the same quantity, and the two are only comparable if they
+    are the same function. They were the same function written twice.
+
+    Args:
+        a: ``(..., 6)`` rot6d.
+        b: ``(..., 6)`` rot6d.
+
+    Returns:
+        ``(...)`` angles in ``[0, pi]``.
+    """
+    rel = rot6d_to_matrix(a).transpose(-1, -2) @ rot6d_to_matrix(b)
+    cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
+    return torch.arccos(cos)

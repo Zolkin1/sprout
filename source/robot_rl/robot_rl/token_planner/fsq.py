@@ -18,9 +18,11 @@ becomes a property of the ENCODER's output distribution rather than of the optim
     range is ``(-0.7616, 0.7616)`` rather than ``(-1, 1)``. That is not a mild rescaling: on
     an 8-level axis the reachable integers become ``1..6``, so **two of the eight codes are
     unreachable by construction** and the ``[8, 8, 8, 5, 5]`` vocabulary silently collapses
-    from 12800 to 1944. Nothing about the shapes changes, so the only symptom would be a
-    utilisation number that looks like a training problem. :func:`quantize` therefore owns
-    the bound and :class:`FSQ` exposes no option to move it.
+    from 12800 to 5400 (measured; the 5-level axes happen to survive, since
+    ``2 * (1 - tanh 1) < 1``, so it is the three 8-level axes that lose their ends). Nothing
+    about the shapes changes, so the only symptom would be a utilisation number that looks
+    like a training problem. :func:`quantize` therefore owns the bound and :class:`FSQ`
+    exposes no option to move it.
 
 Grid convention, stated once because three helpers have to agree on it:
 
@@ -128,9 +130,20 @@ class FSQ(nn.Module):
             raise ValueError(
                 f"FSQ expected a trailing dim of {self.latent_dim}, got {z.shape[-1]}."
             )
+        # FLOAT32, whatever `z` arrives as. The lattice is a fixed set of constants, and a
+        # constant that changes with the caller's autocast dtype is not a constant: under
+        # bf16 autocast the training path's latent differed from `id_to_latent`'s by 3.3e-3
+        # and 5.2% of the emitted TOKENS differed from the fp32 answer -- so the decoder was
+        # trained against one lattice and served another, and the planner's targets depended
+        # on whether autocast happened to be on. Nothing had the wrong shape and the reported
+        # metrics (computed outside autocast) moved by 0.04%, so no number in a run could
+        # have shown it.
+        #
+        # Returning fp32 costs nothing: under autocast the next matmul re-casts anyway.
+        z32 = z.float()
         lv = self.levels.to(z.device)
-        bounded = torch.tanh(z)                                  # (-1, 1)
-        half = (lv.to(z.dtype) - 1.0) * 0.5
+        bounded = torch.tanh(z32)                                 # (-1, 1)
+        half = (lv.float() - 1.0) * 0.5
         codes_f = _round_ste(half * (bounded + 1.0))              # [0, l-1], STE
         codes_f = torch.clamp(codes_f, torch.zeros_like(half), 2.0 * half)
         latent = codes_f / half - 1.0                             # back to [-1, 1]
@@ -166,6 +179,9 @@ class FSQ(nn.Module):
                 f"token id out of range [0, {self.vocab_size}): "
                 f"min={int(ids.min())} max={int(ids.max())}."
             )
+        # fp32, matching :meth:`quantize` exactly -- see the dtype note there. These two are
+        # the same lattice written twice and must agree bit for bit, which is what
+        # ``test_the_lattice_does_not_depend_on_the_input_dtype`` requires.
         codes = id_to_codes(ids, self.levels)
         half = (self.levels.to(torch.float32) - 1.0) * 0.5
         return codes.to(torch.float32) / half - 1.0
