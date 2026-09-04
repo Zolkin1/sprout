@@ -198,3 +198,134 @@ class TokenizerConfig:
         """
         names = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in d.items() if k in names})
+
+
+@dataclass
+class PlannerConfig:
+    """Hyperparameters for the autoregressive token planner (stage B).
+
+    The conditioning half is the flow-matching generator's, field for field, because the
+    whole point of the comparison is that the two models see the same thing -- see
+    :class:`~robot_rl.token_planner.prefix.ConditioningPrefix`. Only the output side differs:
+    a learned token embedding, a causal mask over the output block, and a categorical head.
+
+    The tokenizer's config is EMBEDDED (:attr:`tokenizer`) rather than referenced. A token id
+    is meaningless without the FSQ table, ``D``, ``H`` and the normalizer that says what the
+    decoded numbers are, so a planner checkpoint that only named a tokenizer file would stop
+    being self-describing the moment that file moved.
+    """
+
+    # -- the frozen tokenizer this planner emits tokens for --
+    #: The tokenizer's own config, as a dict (``TokenizerConfig.to_dict()``).
+    tokenizer: dict[str, Any] = field(default_factory=dict)
+    #: Path the tokenizer checkpoint was loaded from, for provenance only. The weights and
+    #: the config travel inside the planner checkpoint; this is where they CAME from.
+    tokenizer_path: str = ""
+
+    # -- conditioning (resolved from the recording, exactly as the generator resolves it) --
+    history_dim: int = 44
+    num_history_states: int = 4
+    future_len: int = 64
+    extero_source: str = "depth"
+    extero_encoder: str = "cnn"
+    extero_sensor_count: int = 2
+    extero_sensor_dim: int = 3900
+    extero_channels: int | None = None
+    extero_image_hw: list[list[int]] | None = None
+    extero_cnn_channels: list[int] = field(default_factory=lambda: [16, 32, 64])
+    extero_cnn_grid: list[int] | None = None
+    extero_cnn_strides: list[int] | None = field(default_factory=lambda: [1, 2, 2])
+    extero_coord_extent_m: list[float] | None = None
+    extero_grid_ordering: str = "xy"
+    extero_fourier_bands: int = 4
+    extero_miss_sentinel: float | None = None
+    extero_camera_intrinsics: list[list[float]] | None = None
+    cmd_dim: int = 3
+    cmd_stride: int = 5
+
+    # -- trunk --
+    d_model: int = 512
+    nhead: int = 8
+    num_layers: int = 8
+    dim_feedforward: int = 2048
+    #: Dropout on attention and the MLP. NON-ZERO, unlike the generator's 0.0: this is a
+    #: categorical model trained with cross-entropy on a 12800-way target, which overfits in a
+    #: way a regression to a continuous vector does not.
+    dropout: float = 0.1
+    #: Probability that a sample's history rows are replaced by the learned null embedding.
+    #: The generator's defence, kept for the same reason: it covers the first ``N`` control
+    #: steps after a reset, when no history exists yet.
+    null_cond_prob: float = 0.2
+
+    # -- loss --
+    #: Cross-entropy label smoothing. DELIBERATE and load-bearing: it keeps entropy in the
+    #: token distribution, and that distribution is the exploration distribution for the RL
+    #: stage. A planner annealed to a near-deterministic argmax has nothing for PPO to
+    #: explore with. Do not set it to 0 without a reason.
+    label_smoothing: float = 0.1
+
+    # -- training --
+    lr: float = 3e-4
+    lr_min: float = 3e-5
+    weight_decay: float = 0.05
+    betas: list[float] = field(default_factory=lambda: [0.9, 0.95])
+    warmup_steps: int = 2000
+    batch_size: int = 512
+    num_epochs: int = 100
+    grad_clip: float = 1.0
+    seed: int = 0
+    ema_decay: float = 0.999
+
+    @property
+    def tokenizer_cfg(self) -> TokenizerConfig:
+        """The embedded tokenizer config, as an object."""
+        return TokenizerConfig.from_dict(self.tokenizer)
+
+    @property
+    def num_tokens(self) -> int:
+        """Tokens per plan ``N`` -- the number of autoregressive steps."""
+        return self.tokenizer_cfg.num_tokens
+
+    @property
+    def vocab_size(self) -> int:
+        """Token vocabulary ``V`` -- the width of the categorical head."""
+        return self.tokenizer_cfg.vocab_size
+
+    def validate(self) -> None:
+        """Check the cross-stage agreements that would otherwise fail silently.
+
+        Raises:
+            ValueError: If no tokenizer is embedded, or if the planner's horizon disagrees
+                with the tokenizer's chunk. The second one is the dangerous case: the planner
+                would emit a valid token sequence that decodes to a plan of the wrong length,
+                and the shape error would surface far away, in the tracker.
+        """
+        if not self.tokenizer:
+            raise ValueError(
+                "PlannerConfig.tokenizer is empty; a planner's targets are token ids and "
+                "nothing can interpret them without the tokenizer that produced them."
+            )
+        tok = self.tokenizer_cfg
+        if int(tok.chunk_len) != int(self.future_len):
+            raise ValueError(
+                f"the tokenizer's chunk is {tok.chunk_len} nodes but the planner's horizon "
+                f"is {self.future_len}. The chunk IS one plan; a mismatch means the planner "
+                "conditions on one timeline and decodes onto another."
+            )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Plain-dict copy, for checkpointing."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PlannerConfig":
+        """Build a config from a dict, ignoring unknown keys.
+
+        Args:
+            d: A saved :meth:`to_dict`.
+
+        Returns:
+            The config.
+        """
+        names = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in names})
