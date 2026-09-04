@@ -60,27 +60,46 @@ def parse_args() -> argparse.Namespace:
                    help="Autocast the decode. Off by default: the deploy path is fp32.")
     p.add_argument("--greedy", action=argparse.BooleanOptionalAction, default=True,
                    help="Greedy decoding, as a deployment would use.")
+    p.add_argument("--downsample", default="",
+                   help="Comma-separated tokenizer downsample factors D to sweep, e.g. "
+                        "'2,4,8,16'. Only meaningful without --planner (it changes the "
+                        "architecture). D sets the token count N = H / D, which is the "
+                        "number of DECODE STEPS -- the quantity per-plan latency is "
+                        "expected to scale with at batch 1, where the model is launch-bound "
+                        "rather than FLOP-bound. This is the knob that decides whether the "
+                        "architecture can hold a control period at all.")
     p.add_argument("--out", default="", help="Write the numbers to this JSON path.")
     return p.parse_args()
 
 
-def build_model(path: str, device: torch.device) -> TokenPlanner:
+def build_model(path: str, device: torch.device,
+                downsample: int | None = None) -> TokenPlanner:
     """Load a planner, or build the shipped architecture untrained.
 
     Args:
         path: A ``planner.pt``, or ``""``.
         device: Target device.
+        downsample: Override the tokenizer's ``D`` (hence the token count). Only valid
+            without ``path`` -- changing it under a trained planner would build a model its
+            weights do not fit.
 
     Returns:
         The planner in eval mode.
+
+    Raises:
+        ValueError: If ``downsample`` is given alongside a checkpoint.
     """
+    if path and downsample is not None:
+        raise ValueError(
+            "--downsample changes the architecture, so it cannot be combined with "
+            "--planner; drop --planner to sweep it on the shipped defaults.")
     if path:
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
         cfg = PlannerConfig.from_dict(ckpt["config"])
         model = TokenPlanner(cfg, TrajectoryTokenizer(cfg.tokenizer_cfg))
         model.load_state_dict(ckpt.get("model_ema") or ckpt["model"])
         return model.to(device).eval()
-    tok = TokenizerConfig()
+    tok = TokenizerConfig() if downsample is None else TokenizerConfig(downsample=int(downsample))
     cfg = PlannerConfig(
         tokenizer=tok.to_dict(), extero_channels=5, extero_image_hw=[[26, 30], [26, 30]],
         extero_camera_intrinsics=[[12.586494467659199, 18.56592408764749, 15.0, 13.0],
@@ -129,12 +148,35 @@ def main() -> None:
     """Measure and print the per-plan latency."""
     args = parse_args()
     device = torch.device(args.device)
-    model = build_model(args.planner, device)
-    cfg = model.cfg
     print(f"[bench] {args.planner or 'untrained defaults'} on {device} "
           f"({torch.cuda.get_device_name(0) if device.type == 'cuda' else 'cpu'})")
-    print(f"[bench] prefix {model.prefix_len} + {model.num_tokens} output slots, "
-          f"d={cfg.d_model} x{cfg.num_layers}, V={model.vocab_size}, "
+    sweep = [int(v) for v in args.downsample.split(",") if v.strip()] or [None]
+    all_results: dict[str, dict] = {}
+    for d_factor in sweep:
+        model = build_model(args.planner, device, d_factor)
+        all_results[str(d_factor or "default")] = _measure(model, args, device)
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump(all_results, fh, indent=2)
+        print(f"[bench] wrote {args.out}")
+
+
+def _measure(model: TokenPlanner, args: argparse.Namespace,
+             device: torch.device) -> dict[str, dict]:
+    """Time one architecture at every requested batch size.
+
+    Args:
+        model: The planner.
+        args: Runtime args.
+        device: Where to run.
+
+    Returns:
+        Batch size (as a string) -> timings.
+    """
+    cfg = model.cfg
+    print(f"[bench] prefix {model.prefix_len} + {model.num_tokens} output slots "
+          f"(D={cfg.tokenizer_cfg.downsample}), d={cfg.d_model} x{cfg.num_layers}, "
+          f"V={model.vocab_size}, "
           f"{sum(p.numel() for p in model.parameters()) / 1e6:.1f}M params")
 
     results: dict[str, dict] = {}
@@ -170,16 +212,13 @@ def main() -> None:
     one = results.get("1")
     if one:
         m = one["plan"]["median_ms"]
-        print(f"\n[bench] deployment (batch 1): {m:.2f} ms/plan against a 20 ms control "
+        print(f"[bench] deployment (batch 1): {m:.2f} ms/plan against a 20 ms control "
               f"period -- {'INSIDE' if m < 20.0 else 'OVER'} budget "
               f"({100 * m / 20.0:.0f}% of it). The FM it replaces measures 8.3 ms on an "
               "RTX 4070 and 14-15 ms on the Jetson Thor, both as an exported CUDA-graph "
               "ONNX; this is unexported torch, so it is an architecture bound rather than a "
-              "deployment one.")
-    if args.out:
-        with open(args.out, "w") as fh:
-            json.dump({"results": results, "config": cfg.to_dict()}, fh, indent=2)
-        print(f"[bench] wrote {args.out}")
+              "deployment one.\n")
+    return results
 
 
 if __name__ == "__main__":
