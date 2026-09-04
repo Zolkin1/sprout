@@ -70,6 +70,23 @@ GROUP_UNITS: dict[str, str] = {
 }
 
 
+def _geodesic_rad(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Angle between two 6-D rotation representations, in radians.
+
+    Args:
+        a: ``(..., 6)`` rot6d.
+        b: ``(..., 6)`` rot6d.
+
+    Returns:
+        ``(...)`` angles.
+    """
+    from robot_rl.flow_matching.transforms import rot6d_to_matrix  # noqa: PLC0415
+
+    rel = rot6d_to_matrix(a).transpose(-1, -2) @ rot6d_to_matrix(b)
+    cos = ((rel.diagonal(dim1=-2, dim2=-1).sum(-1) - 1.0) / 2.0).clamp(-1.0, 1.0)
+    return torch.arccos(cos)
+
+
 @dataclass
 class ReconAccumulator:
     """Streaming reconstruction + codebook statistics over a whole split.
@@ -83,6 +100,8 @@ class ReconAccumulator:
     Args:
         group_names: Group names, from :func:`channel_group_labels`.
         labels: ``(D,)`` group label per channel.
+        mean: ``(D,)`` normalizer mean. Only the geodesic needs it (an error cancels the
+            mean, a rotation matrix does not).
         std: ``(D,)`` normalizer std, for the conversion to physical units.
         chunk_len: Nodes per chunk ``H``, for the per-position curve.
         vocab_size: Token vocabulary ``V``, for the utilisation histogram.
@@ -93,6 +112,7 @@ class ReconAccumulator:
     group_names: list[str]
     labels: torch.Tensor
     std: torch.Tensor
+    mean: torch.Tensor
     chunk_len: int
     vocab_size: int
     num_families: int
@@ -107,6 +127,8 @@ class ReconAccumulator:
     _token_counts: torch.Tensor = field(init=False)         # (V,)
     _node_err: list[torch.Tensor] = field(init=False)       # per-batch (B*H, G) node RMS
     _node_family: list[torch.Tensor] = field(init=False)    # per-batch (B*H,) family code
+    _geo_sum: float = field(init=False, default=0.0)         # sum of geodesic angles (rad)
+    _geo_n: int = field(init=False, default=0)
     _chunks: int = field(init=False, default=0)
 
     def __post_init__(self):
@@ -120,6 +142,8 @@ class ReconAccumulator:
         self._token_counts = torch.zeros(self.vocab_size, dtype=torch.int64)
         self._node_err = []
         self._node_family = []
+        self._geo_sum = 0.0
+        self._geo_n = 0
         self._chunks = 0
 
     @torch.no_grad()
@@ -171,9 +195,30 @@ class ReconAccumulator:
             ids.reshape(-1).cpu(), minlength=self.vocab_size)
         self._chunks += int(target.shape[0])
 
+        # Orientation, as an ANGLE. A Frobenius RMSE on the rot6d channels is a fine loss but
+        # is not a quantity anyone can compare against anything -- the generator reports
+        # ``ori_geodesic_rad``, and matching that definition is the only way the tokenizer's
+        # information loss can be read against the generator's own prediction error. Going
+        # through the rotation group also projects out the Gram-Schmidt residual rather than
+        # counting it as orientation error.
+        if "base_ori" in self.group_names:
+            col = self.labels.to(dev) == self.group_names.index("base_ori")
+            m, sd = self.mean.to(dev), std
+            self._geo_sum += float(_geodesic_rad(
+                (recon * sd + m)[..., col], (target * sd + m)[..., col]).sum())
+            self._geo_n += int(target.shape[0] * target.shape[1])
+
     # ------------------------------------------------------------------
     # Reductions
     # ------------------------------------------------------------------
+    def ori_geodesic_rad(self) -> float:
+        """Mean angle between the reconstructed and true base orientations, in radians.
+
+        The same definition ``scripts/flow_matching/train.py``'s ``channel_metrics`` reports
+        as ``ori_geodesic_rad``, so the two are directly comparable.
+        """
+        return self._geo_sum / max(self._geo_n, 1)
+
     def group_rmse(self) -> dict[str, float]:
         """Physical RMSE per channel group, over the whole split."""
         rmse = (self._sq_by_group / self._n_by_group.clamp(min=1.0)).sqrt()
@@ -305,6 +350,7 @@ class ReconAccumulator:
             "node_rmse_p99": self.node_error_quantile(0.99),
             "node_rmse_max": self.node_error_max(),
             "codebook": self.codebook(),
+            "ori_geodesic_rad": self.ori_geodesic_rad(),
         }
 
 
@@ -345,6 +391,8 @@ def format_report(rep: dict[str, Any], max_families: int = 12) -> str:
         row("interior slope", {g: bp[g]["interior_slope"] for g in groups if g in bp}),
         "",
     ]
+    lines.append(f"base orientation geodesic: {rep.get('ori_geodesic_rad', 0.0):.5f} rad "
+                 f"({math.degrees(rep.get('ori_geodesic_rad', 0.0)):.2f} deg)")
     cb = rep["codebook"]
     lines.append(
         f"codebook: {int(cb['distinct'])}/{int(cb['vocab_size'])} ids used "

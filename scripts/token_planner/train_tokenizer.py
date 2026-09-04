@@ -95,6 +95,16 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
     p.add_argument("--cache", default="",
                    help="Path to a chunk cache (.pt). Written if absent, reused if present "
                         "and matching. Skips minutes of h5 decompression per ablation run.")
+    # Opt-OUT, matching scripts/flow_matching/train.py (and the RL side, whose agent cfgs
+    # ship `logger: wandb`). A quantization run's decisive numbers are the codebook
+    # utilisation and the per-group physical RMSEs, and comparing those ACROSS the D / C /
+    # level-table ablations is the whole point of stage A -- which is precisely what a
+    # per-run TensorBoard directory is bad at.
+    p.add_argument("--wandb", action="store_true", default=True,
+                   help="Log to Weights & Biases (default; use --no_wandb to disable).")
+    p.add_argument("--no_wandb", dest="wandb", action="store_false",
+                   help="Disable Weights & Biases logging.")
+    p.add_argument("--wandb_project", type=str, default="robot_rl_token_planner")
     p.add_argument("--val_every", type=int, default=1)
     p.add_argument("--ckpt_every", type=int, default=10)
     p.add_argument("--match_val_episodes", default="",
@@ -282,6 +292,7 @@ def evaluate(
             scalars[f"edge/{g}/{end}"] = v
     for k, v in rep["codebook"].items():
         scalars[f"codebook/{k}"] = v
+    scalars["ori_geodesic_rad"] = rep["ori_geodesic_rad"]
     # ONE selection scalar, so "best" is not a judgement call made differently each run.
     # Mean of the group RMSEs in their own units: the groups are already O(1)-comparable
     # (metres, rad, rad/s all land in the same decade on this data) and weighting them would
@@ -625,12 +636,14 @@ def main() -> None:
 
     group_names, labels = channel_group_labels(
         cfg.num_joints, cfg.num_ee_frames, cfg.reference_blocks)
-    std = Normalizer.from_state_dict(chunks.state_normalizer_state).std.clone()
+    _norm = Normalizer.from_state_dict(chunks.state_normalizer_state)
+    std, mean = _norm.std.clone(), _norm.mean.clone()
 
     def acc_factory() -> ReconAccumulator:
         """A fresh accumulator wired to this run's layout."""
         return ReconAccumulator(
-            group_names=group_names, labels=labels, std=std, chunk_len=cfg.chunk_len,
+            group_names=group_names, labels=labels, std=std, mean=mean,
+            chunk_len=cfg.chunk_len,
             vocab_size=cfg.vocab_size, num_families=len(chunks.family_names),
             family_names=list(chunks.family_names),
         )
@@ -641,6 +654,26 @@ def main() -> None:
     )
     ema = WeightEMA(model, decay=cfg.ema_decay) if cfg.ema_decay > 0.0 else None
     writer = SummaryWriter(log_dir=out_dir)
+    wandb_run = None
+    if args.wandb:
+        # Never let telemetry take down a training run: an uninstalled wandb, a missing
+        # login or a network blip would otherwise kill the job before its first epoch.
+        # Degrade to TensorBoard (always written) and say so loudly enough to notice.
+        try:
+            import wandb  # noqa: PLC0415
+
+            wandb_run = wandb.init(
+                project=args.wandb_project, name=run,
+                config={**cfg.to_dict(), **chunks.provenance,
+                        "train_chunks": int(chunks.train_nodes.shape[0]),
+                        "val_chunks": int(chunks.val_nodes.shape[0]),
+                        "num_tokens": cfg.num_tokens, "vocab_size": cfg.vocab_size,
+                        "token_seconds": cfg.token_seconds, "params": n_par},
+            )
+        except Exception as exc:                                          # noqa: BLE001
+            print(f"[WARN] wandb logging is OFF: {type(exc).__name__}: {exc}\n"
+                  f"       Training continues; scalars still go to TensorBoard in {out_dir}.\n"
+                  "       Pass --no_wandb to silence this, or fix the login (wandb login).")
     use_bf16 = bool(args.bf16 and device.type == "cuda")
 
     best = math.inf
@@ -678,10 +711,18 @@ def main() -> None:
         line = (f"[tok] epoch {epoch:>4d}  train {run_loss / max(run_n, 1):.6f}  "
                 f"{time.time() - t0:.1f}s")
 
+        epoch_scalars = {
+            "train/loss_epoch": run_loss / max(run_n, 1),
+            "train/grad_clipped_frac": clipped / max(len(train_loader), 1),
+            "train/epoch_time_s": time.time() - t0,
+            "train/lr": scheduled_lr(cfg, epoch, step),
+        }
+
         do_val = val_loader is not None and (
             epoch % max(args.val_every, 1) == 0 or epoch == cfg.num_epochs - 1)
         if do_val:
             rep, scal = evaluate(model, val_loader, device, acc_factory, cfg)
+            _val_raw = dict(scal)
             for k, v in scal.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
             sel, sel_rep, tag = scal["rmse_mean"], rep, "val"
@@ -691,7 +732,18 @@ def main() -> None:
                 for k, v in scal_e.items():
                     writer.add_scalar(f"val_ema/{k}", v, epoch)
                 sel, sel_rep, tag = scal_e["rmse_mean"], rep_e, "val_ema"
+                epoch_scalars.update({f"val_ema/{k}": v for k, v in scal_e.items()})
                 scal = scal_e
+            # The RAW-weight numbers, always -- ``scal`` has been rebound to the EMA's by
+            # the branch above, and logging those under both names would make the two series
+            # identical and hide whatever the EMA is actually buying.
+            epoch_scalars.update({f"val/{k}": v for k, v in _val_raw.items()})
+            # The per-terrain-family split is where a quantization failure shows up first --
+            # the *_pure families compress far better than the transition ones -- so it goes
+            # to wandb as its own series rather than only into the report file.
+            for fam, vals in sel_rep["rmse_by_family"].items():
+                for g, v in vals.items():
+                    epoch_scalars[f"family/{fam}/{g}"] = v
             line += (f"  {tag} rmse_mean {sel:.5f}  "
                      f"pos {scal['rmse/base_pos']:.4f} m  "
                      f"jnt {scal['rmse/joint_pos']:.4f} rad  "
@@ -708,12 +760,19 @@ def main() -> None:
                     fh.write(format_report(sel_rep) + "\n")
                 line += "  *"
         print(line, flush=True)
+        if wandb_run is not None:
+            # step=epoch on EVERY call. Without it wandb increments its own counter once per
+            # log() CALL, so a run with several logs per epoch ends up with an x-axis that is
+            # not the epoch -- the same trap scripts/flow_matching/train.py records.
+            wandb_run.log({**epoch_scalars, "epoch": epoch}, step=epoch)
 
         if epoch % max(args.ckpt_every, 1) == 0 or epoch == cfg.num_epochs - 1:
             save_checkpoint(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg,
                             chunks, epoch, {}, {}, ema)
 
     writer.close()
+    if wandb_run is not None:
+        wandb_run.finish()
     if os.path.exists(os.path.join(out_dir, "gating_report.txt")):
         print("\n" + pathlib.Path(out_dir, "gating_report.txt").read_text())
     print(f"[tok] done. best val rmse_mean {best:.6f} -> {out_dir}/tokenizer.pt")
