@@ -232,3 +232,47 @@ def test_the_play_cfg_shows_each_tile_once_and_training_still_replicates() -> No
         "training lost its replica rows, which are what give env capacity and spatial "
         "separation across a small library"
     )
+
+
+def test_play_matches_training_on_every_behavioural_knob() -> None:
+    """What is WATCHED must be what is TRAINED, or the viz is answering another question.
+
+    The play cfg exists to make the task visible -- fewer envs, one replica row, decoration
+    off, sensors drawn. Those are presentation. Anything that changes what the robot is asked
+    to do, or what the generator is conditioned on, must be identical, and it is easy for it
+    not to be: the play cfg inherits, so a knob set on the PLAY side only, or a training knob
+    added after the play cfg was written, both drift silently.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_adjuster_env_cfg import (
+        G1AdjusterEnvCfg,
+        G1AdjusterEnvCfgPlay,
+    )
+
+    train, play = G1AdjusterEnvCfg(), G1AdjusterEnvCfgPlay()
+    for field in ("steer_kp", "steer_wz_max", "zero_residual", "tracking_spec_path",
+                  "goal_regions_path", "episode_length_s"):
+        assert getattr(play, field) == getattr(train, field), (
+            f"play and training disagree on {field!r}: "
+            f"{getattr(play, field)!r} vs {getattr(train, field)!r}"
+        )
+    for field in ("stand_start", "cmd_hold_s", "seed_history_from_stand",
+                  "random_start_phase", "history_from", "reference_source",
+                  "fm_update_every", "stash_conditioning", "stash_flow"):
+        assert getattr(play.commands.traj_ref, field) == getattr(train.commands.traj_ref, field), (
+            f"play and training disagree on commands.traj_ref.{field!r}"
+        )
+
+
+def test_steering_aims_at_the_goal_the_episode_actually_ends_on() -> None:
+    """One goal, not two. The controller reads the GoalReached term's own cached anchor.
+
+    Resolving the goal a second time for the steering would let the robot be steered toward
+    one point while the episode ends at another -- and both would look right in isolation.
+    """
+    import inspect
+
+    from robot_rl.tasks.manager_based.robot_rl.envs import adjuster_env
+
+    src = inspect.getsource(adjuster_env.AdjusterEnv._install_steering)
+    assert "GoalReached" in src and "_goal_pos_w" in src
+    assert "in_goal" in src, "the controller must stop steering once inside the region"

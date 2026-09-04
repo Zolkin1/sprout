@@ -404,7 +404,14 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
         # a few hundred iterations -- come back and tune against it.
         "entropy_coef": 1.6e-4,
         # num_mini_batches and gamma stay at the teacher's values -- see the TODOs above.
-        "critic_warmup_iterations": 100,
+        # 30, not the 100 this started at. The critic is a third of its old width, with
+        # `window_residual` (the majority of it) gone and input normalization on, so it has
+        # far less to fit and better-conditioned inputs to fit it from. What warm-up buys is
+        # unchanged and still wanted -- a garbage critic turns advantages into noise and the
+        # entropy term, which has no such problem, wins -- so this is shortened rather than
+        # dropped. `explained_variance` (logged every iteration) is the number that says
+        # whether 30 was enough: if it is still climbing when the actor is released, raise it.
+        "critic_warmup_iterations": 30,
     })
     obs_groups = {
         # The actor sees the generator's conditioning and the generator's plan -- and nothing

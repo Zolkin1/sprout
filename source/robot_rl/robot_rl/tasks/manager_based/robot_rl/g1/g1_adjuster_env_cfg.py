@@ -98,6 +98,20 @@ rather than fitted, like the extero contract normalization, so it means the same
 every run.
 """
 
+STEER_KP: float = 1.5
+"""Gain of the yaw controller that holds the robot on the goal bearing.
+
+Nothing else in this stack steers -- the command is a body-frame velocity and the generator
+plans from depth -- so accumulated heading error over several metres becomes a lateral miss,
+and on a thin flight of stairs a lateral miss is a fall. Closing this one loop is the largest
+single effect measured on this pair, larger than any conditioning change tried.
+
+OFF-DISTRIBUTION on the stair families by construction: their clips carry |wz| = 0 across the
+whole library, so the generator has never been asked to turn there. That is the point -- the
+adjuster is being trained on a command distribution the generator cannot already serve -- but
+it also means results here are not comparable to unsteered ones.
+"""
+
 STAND_SETTLE_S: float = 0.3
 """Seconds of zero command at the start of an episode, to stand and settle.
 
@@ -450,6 +464,10 @@ class G1AdjusterEnvCfg(G1TeacherTerrainDepthEnvCfg, AdjusterEnvCfg):
         # residual, though 0.2 m of authority against it; or (b) put stands-on-terrain into
         # the training distribution, which the clip-free redesign would make natural.
         self.commands.traj_ref.seed_history_from_stand = True
+
+        # Steering, on the ENV cfg so the play variant inherits it: the two must agree, or
+        # what is watched is not what is trained.
+        self.steer_kp = STEER_KP
 
         # The two privileged terrain sensors, added to the inherited scene. Both are
         # `ray_alignment="yaw"`, which is what puts them in the base's YAW frame: under the

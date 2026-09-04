@@ -34,6 +34,8 @@ class AdjusterEnvCfg(ManagerBasedRLEnvCfg):
         allow_tracker_mismatch: Downgrade the tracker's observation-contract failures to
             warnings. For a deliberate cross-pair experiment only.
         command_name: The :class:`FmTrackingCommand` term name.
+        steer_kp: Gain of a yaw controller pointing the robot at its goal; 0 disables.
+        steer_wz_max: Clip on that controller's output (rad/s).
         zero_residual: Force the applied residual to EXACTLY zero, whatever the policy emits
             -- the bare-generator control. The served plan is then bit-identical to the
             generator's own (that identity is exact by construction; see
@@ -47,6 +49,28 @@ class AdjusterEnvCfg(ManagerBasedRLEnvCfg):
             training, noise with a 0.2 m position bound. Loading ``model_0.pt`` achieves the
             same thing, but only by accident of the head being zero-initialised.
     """
+
+    steer_kp: float = 0.0
+    """Proportional gain (1/s) of a yaw controller that points the robot at its goal.
+
+    ``0.0`` (the default) leaves the command's ``wz`` channel exactly as the clip states it,
+    which is what every task here has always done.
+
+    Nothing else in this stack steers: the command is a body-frame velocity and the generator
+    plans from depth, so a few degrees of accumulated heading error over several metres
+    becomes a lateral miss -- and on a thin flight of stairs a lateral miss is a fall. Closing
+    that one loop is the largest single effect measured on this pair to date, worth far more
+    than any conditioning change tried.
+
+    **It is OFF-DISTRIBUTION on the stair families**, whose clips carry ``|wz| max = 0.0000``
+    across the whole library, so a steered stair result is a different measurement rather than
+    a cleaner one. Applied to the COMMAND, so the generator's conditioning, the reward and the
+    ``command_window`` observation all move together -- see
+    :meth:`MotionSequenceCommand.set_yaw_rate_source`.
+    """
+
+    steer_wz_max: float = 0.68
+    """Symmetric clip on the steering yaw rate (rad/s). Matches the eval's default."""
 
     zero_residual: bool = False
     tracker_run_dir: str = ""

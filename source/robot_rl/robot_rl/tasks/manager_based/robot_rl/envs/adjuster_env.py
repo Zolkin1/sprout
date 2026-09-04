@@ -58,8 +58,11 @@ from isaaclab.envs import ManagerBasedRLEnv
 
 from robot_rl.flow_matching.window import residual_scale_vector
 from robot_rl.rl.frozen_tracker import FrozenTracker
-from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
-from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import TrackingViolation
+from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region, tracking_error
+from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import (
+    GoalReached,
+    TrackingViolation,
+)
 
 from .adjuster_env_cfg import AdjusterEnvCfg
 
@@ -186,6 +189,8 @@ class AdjusterEnv(ManagerBasedRLEnv):
                 "read the generator's conditioning and flow field, which are only captured "
                 "when the command term is told to at construction."
             )
+
+        self._install_steering(cmd)
 
         self._frozen_tracker = FrozenTracker(
             self, cfg.tracker_run_dir, cfg.tracker_checkpoint,
@@ -390,6 +395,59 @@ class AdjusterEnv(ManagerBasedRLEnv):
             log[f"Diagnostics/violation_{name}"] = (count / denom).item()
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
+
+    # ------------------------------------------------------------------
+    def _install_steering(self, cmd) -> None:
+        """Close a yaw loop onto the command, if ``cfg.steer_kp`` asks for one.
+
+        Aimed at the SAME goal the ``goal_reached`` termination uses -- its own cached anchor
+        and tolerances -- rather than a second resolution of the goal, so the controller
+        cannot steer at one point while the episode ends at another. It also stops steering
+        the moment the robot is inside the region, which is what that mask is for.
+
+        Installed on the COMMAND rather than on the action, so the generator's conditioning,
+        the reward and the ``command_window`` observation all see the same turn. On the
+        stair families this is off-distribution by construction (their clips never turn);
+        that is a property of the experiment, and the gain is recorded in the run's cfg.
+
+        Args:
+            cmd: The :class:`FmTrackingCommand` term.
+        """
+        kp = float(getattr(self.cfg, "steer_kp", 0.0))
+        if kp == 0.0:
+            return
+        goal_term = None
+        for name in self.termination_manager.active_terms:
+            term = self.termination_manager.get_term_cfg(name).func
+            if isinstance(term, GoalReached):
+                goal_term = term
+                break
+        if goal_term is None:
+            raise ValueError(
+                "steer_kp is set but no GoalReached termination is active, so there is no "
+                "goal to steer at. Steering at a separately-resolved goal would let the "
+                "controller aim somewhere the episode does not end."
+            )
+
+        wz_max = float(getattr(self.cfg, "steer_wz_max", 0.68))
+        robot_data = self.scene["robot"].data
+
+        def _source():
+            """Yaw rate toward the goal, zero once inside the region."""
+            root_pos_w = tracking_error._as_torch(robot_data.root_pos_w)
+            root_quat_w = tracking_error._as_torch(robot_data.root_quat_w)
+            down, lat, hz = goal_region.goal_frame_offsets(
+                root_pos_w, goal_term._goal_pos_w, goal_term._goal_yaw)
+            return goal_region.steer_yaw_rate(
+                root_pos_w, root_quat_w, goal_term._goal_pos_w,
+                goal_region.in_goal(down, lat, hz, goal_term._goal_tol),
+                kp=kp, wz_max=wz_max,
+            )
+
+        cmd.set_yaw_rate_source(_source)
+        print(f"[INFO] AdjusterEnv: STEERING ON, kp={kp} wz_max={wz_max} -- the command's wz "
+              "is a closed loop on the goal bearing. OFF-DISTRIBUTION on the stair families, "
+              "whose clips never turn.")
 
     # ------------------------------------------------------------------
     def _restore_termination_attribution(self, ended: torch.Tensor) -> None:
