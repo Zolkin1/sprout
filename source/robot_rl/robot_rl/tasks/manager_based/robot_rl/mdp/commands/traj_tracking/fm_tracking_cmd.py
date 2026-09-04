@@ -112,6 +112,14 @@ class FmTrackingCommand(MotionSequenceCommand):
     #: Optional per-env flow-matching noise provider; see :meth:`set_noise_source`.
     _noise_source = None
 
+    #: The plan-residual buffers, declared at CLASS level because ``_post_init`` returns
+    #: early when no generator is loaded (``fm_enabled`` False -- the eval's clip arm), while
+    #: ``reset`` touches them on every path. Assigning them only after that early return left
+    #: them missing on exactly the arm that skips it, and the clip cells died on an
+    #: AttributeError in ``reset`` while every generator cell ran clean.
+    _plan_residual = None
+    _prev_plan_residual = None
+
     cfg: FmTrackingCommandCfg
 
     # Debug-viz marker handles (lazily built once the sim is up).
