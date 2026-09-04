@@ -239,22 +239,23 @@ class FmTrackingCommand(MotionSequenceCommand):
             unusable = [n for n, v in (("fm_num_sampling_steps",
                                         int(self.cfg.fm_num_sampling_steps)),
                                        ("fm_guidance_scale",
-                                        self.cfg.fm_guidance_scale != 1.0))
+                                        self.cfg.fm_guidance_scale != 1.0),
+                                       ("fm_zero_noise", bool(self.cfg.fm_zero_noise)))
                         if v]
             if unusable:
                 raise ValueError(
                     f"{unusable} are flow-matching settings and have no meaning for a token "
-                    "planner: it integrates nothing and there is no classifier-free "
-                    "guidance. Its analogous knob is greedy-vs-temperature sampling, which "
-                    "`fm_zero_noise` selects (True = greedy).")
+                    "planner: it integrates nothing, so there is no x0 to start at the "
+                    "origin and no classifier-free guidance. Use `planner_greedy` / "
+                    "`planner_temperature` / `planner_seed`, which name what they actually "
+                    "do -- reusing a flow flag would make it mean two different things "
+                    "depending on which artifact was loaded.")
             self._sample_module = _tp_online
             self.ctx = load_planner_context(
                 self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
-                # The flow model's `zero_noise` and the planner's `greedy` are the same
-                # request -- make the plan a deterministic function of the conditioning --
-                # so one flag drives both and a task config does not have to know which
-                # generator it has.
-                greedy=bool(self.cfg.fm_zero_noise),
+                greedy=bool(self.cfg.planner_greedy),
+                temperature=float(self.cfg.planner_temperature),
+                seed=self.cfg.planner_seed,
             )
         else:
             # 0 means "keep the checkpoint's own step count" -- the cfg cannot default to

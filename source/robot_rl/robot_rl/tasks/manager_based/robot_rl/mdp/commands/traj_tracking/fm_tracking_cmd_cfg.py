@@ -90,6 +90,36 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     do not apply to it and it says so.
     """
 
+    planner_greedy: bool = True
+    """Take the argmax at each decode step instead of sampling. ``generator_kind="token_planner"`` only.
+
+    **Its own field, rather than a re-use of :attr:`fm_zero_noise`.** Both do mean "make the
+    plan a deterministic function of the conditioning", and an earlier version mapped one onto
+    the other -- but ``fm_zero_noise`` is named for a mechanism a token planner does not have
+    (there is no ``x0`` to integrate from; ``sample_window`` REFUSES a noise tensor), so the
+    flag would have meant something different depending on which artifact was loaded, with
+    nothing on screen to say which. That is the failure this file already records for
+    ``window_anchor``, ``attention_mode`` and ``history_source``.
+
+    It defaults TRUE where ``fm_zero_noise`` defaults False, and deliberately: the deployed
+    controller runs the deterministic arm, and the difference here is not small. Measured on
+    the epoch-20 checkpoint, sampling changes **98% of the 16 tokens** against greedy and
+    moves base position by 0.169 m sd over 20 draws -- so a default of "sample" would have
+    made every first look at a planner a look at one arbitrary draw.
+    """
+
+    planner_temperature: float = 1.0
+    """Softmax temperature for the categorical draw. Ignored when :attr:`planner_greedy`."""
+
+    planner_seed: int | None = None
+    """Seed for the sampling RNG, or ``None`` to draw off the global one.
+
+    Set it for anything whose result has to be replayable. The flow generator's equivalent
+    handle is ``evaluate.py --fm_seed``, which reaches the model as an injected ``noise``
+    tensor -- a path a planner refuses by design, so without this field a stochastic planner
+    run would have had no reproducibility handle at all.
+    """
+
     fm_checkpoint: str = ""
     """Path to the trained robot-state-conditioned flow-matching ``.pt`` checkpoint
     (``target_source=ego_anchored_clip_future``). Required, except with
