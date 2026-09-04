@@ -69,6 +69,7 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
     fm_depth_groups,
 )
 
+from robot_rl.flow_matching import online as _fm_online
 from robot_rl.flow_matching.online import (
     BatchedHistory,
     build_cmd_tokens,
@@ -98,6 +99,48 @@ from .motion_sequence_cmd import MotionSequenceCommand
 from .fm_tracking_cmd_cfg import FmTrackingCommandCfg
 
 
+def _generator_kind_of(checkpoint: str, declared: str) -> str:
+    """WHICH generator a checkpoint is, read from the artifact rather than from a config.
+
+    ``generator_kind`` is a config field, and a config field is exactly the thing this
+    repo's eval harness records getting DROPPED: every programmatic caller
+    (``eval/runner.py``, ``headroom_runner.py``, ``fm_debug.py``, ``play.py``) sets
+    ``fm_checkpoint`` and nothing else, so a planner routed through any of them would reach
+    the flow loader and die on a missing key. The file itself cannot be dropped, so the file
+    decides and the config is a cross-check.
+
+    A planner checkpoint is identified by carrying a non-empty ``config.tokenizer``: a token
+    id means nothing without one, so every planner has it and no flow checkpoint does.
+
+    Args:
+        checkpoint: Path to the generator checkpoint.
+        declared: The config's ``generator_kind``.
+
+    Returns:
+        ``"flow_matching"`` or ``"token_planner"``.
+
+    Raises:
+        ValueError: On an unknown declared value, or when the declaration contradicts the
+            file -- which means one of the two is about a different artifact.
+    """
+    import torch as _torch  # noqa: PLC0415
+
+    if declared not in ("flow_matching", "token_planner"):
+        raise ValueError(
+            f"generator_kind must be 'flow_matching' or 'token_planner', got {declared!r}.")
+    blob = _torch.load(checkpoint, map_location="meta", weights_only=False)
+    actual = ("token_planner" if (blob.get("config") or {}).get("tokenizer")
+              else "flow_matching")
+    if declared != actual:
+        # Not silently preferred either way: a disagreement means the config and the path
+        # were last edited about different runs, and guessing which is stale is how the
+        # wrong artifact gets served.
+        raise ValueError(
+            f"generator_kind says {declared!r} but {checkpoint} is a {actual!r} checkpoint. "
+            "Fix whichever is stale rather than letting one win.")
+    return actual
+
+
 class FmTrackingCommand(MotionSequenceCommand):
     """Track a robot-state-conditioned flow-matching generator in the world frame."""
 
@@ -111,6 +154,11 @@ class FmTrackingCommand(MotionSequenceCommand):
     _extero_buf: tuple = ()
     #: Optional per-env flow-matching noise provider; see :meth:`set_noise_source`.
     _noise_source = None
+    #: Which module's ``sample_window`` serves this command, set in ``_post_init`` for a
+    #: generator arm. Defaulted at CLASS level for the same reason the fields around it are:
+    #: the clip-only path returns before that branch, and this class's docstring already
+    #: records the clip cells dying on an AttributeError in ``reset`` once.
+    _sample_module = None
 
     #: The plan-residual buffers, declared at CLASS level because ``_post_init`` returns
     #: early when no generator is loaded (``fm_enabled`` False -- the eval's clip arm), while
@@ -183,15 +231,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         # fields and a `sample_window` with the same signature -- so this is the only place
         # the command branches on the kind; `self._sample_window` carries the choice from
         # here to the one call site.
-        kind = str(self.cfg.generator_kind)
-        if kind not in ("flow_matching", "token_planner"):
-            raise ValueError(
-                f"generator_kind must be 'flow_matching' or 'token_planner', got {kind!r}.")
+        kind = _generator_kind_of(self.cfg.fm_checkpoint, str(self.cfg.generator_kind))
         if kind == "token_planner":
-            from robot_rl.token_planner.online import (  # noqa: PLC0415
-                load_planner_context,
-                sample_window as _tp_sample_window,
-            )
+            from robot_rl.token_planner import online as _tp_online  # noqa: PLC0415
+            from robot_rl.token_planner.online import load_planner_context  # noqa: PLC0415
 
             unusable = [n for n, v in (("fm_num_sampling_steps",
                                         int(self.cfg.fm_num_sampling_steps)),
@@ -204,6 +247,7 @@ class FmTrackingCommand(MotionSequenceCommand):
                     "planner: it integrates nothing and there is no classifier-free "
                     "guidance. Its analogous knob is greedy-vs-temperature sampling, which "
                     "`fm_zero_noise` selects (True = greedy).")
+            self._sample_module = _tp_online
             self.ctx = load_planner_context(
                 self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
                 # The flow model's `zero_noise` and the planner's `greedy` are the same
@@ -212,7 +256,6 @@ class FmTrackingCommand(MotionSequenceCommand):
                 # generator it has.
                 greedy=bool(self.cfg.fm_zero_noise),
             )
-            self._sample_window = _tp_sample_window
         else:
             # 0 means "keep the checkpoint's own step count" -- the cfg cannot default to
             # None without making the field un-overridable from hydra (see the cfg's
@@ -224,7 +267,7 @@ class FmTrackingCommand(MotionSequenceCommand):
                 zero_noise=self.cfg.fm_zero_noise,
                 guidance_scale=self.cfg.fm_guidance_scale,
             )
-            self._sample_window = sample_window
+            self._sample_module = _fm_online
         # Publish it: the RL adjuster's network borrows this exact frozen encoder, and an
         # rsl-rl model is built from a dict of primitives so it cannot be handed an object.
         # See `online._ACTIVE_FM_CONTEXT` for why a registry beats loading a second copy.
@@ -1418,7 +1461,13 @@ class FmTrackingCommand(MotionSequenceCommand):
                         else null_hist[ids].to(torch.float32))
             parts.append(null_col.unsqueeze(-1))
             self._cond_stash[ids] = torch.cat(parts, dim=-1).detach()
-        sampled = self._sample_window(
+        # Resolved through the MODULE at call time, never captured at load. Capturing the
+        # function object shadows a monkeypatch: `scripts/rsl_rl/fm_terrain_probe.py` sets
+        # `online.sample_window = _paired_sample_window` AFTER gym.make to give every
+        # condition one shared noise draw, and a bound reference would have served unpaired
+        # noise while the probe printed that it was paired -- turning the within-subjects
+        # comparison it exists to make back into a between-subjects one, silently.
+        sampled = self._sample_module.sample_window(
             self.ctx, history, height, cmd_tokens,
             history_null_mask=(None if null_hist is None else null_hist[ids]),
             noise=(None if self._noise_source is None else self._noise_source(ids)),

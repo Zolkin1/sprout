@@ -612,7 +612,22 @@ def main() -> None:
             print(f"[WARN] wandb logging is OFF: {type(exc).__name__}: {exc}\n"
                   f"       Training continues; scalars still go to TensorBoard in {out_dir}.")
     use_bf16 = bool(args.bf16 and device.type == "cuda")
+    # THE RECORDING'S META. Everything the serving context gets from the recording rather
+    # than from a config lives here -- joint order, the predicted frame names, the camera
+    # contract, the robot fingerprint, the snap cadence. Omitting it made
+    # `load_planner_context` return `joint_names=[]`, and the Isaac command dies on
+    # `joint_names.index(...)`; nothing before a live simulator could see it, because the
+    # test double supplied the dict the trainer did not.
+    #
+    # `extero_spec` is stored under THAT name, not `depth_camera_spec`: the flow checkpoint
+    # uses `extero_spec` and every consumer reads that key. The dataset resolved it, so it is
+    # taken from there rather than from the raw recording attrs.
+    meta_out = {k: v for k, v in vars(meta).items()} if hasattr(meta, "__dict__") else {}
+    meta_out["extero_spec"] = getattr(train_ds, "extero_spec", None)
+    meta_out["target_frame_names"] = list(train_ds.target_frame_names)
     extras = {
+        "meta": meta_out,
+        "target_frame_names": list(train_ds.target_frame_names),
         "state_normalizer": norm.state_dict(),
         "extero_normalizer": train_ds.extero_normalizer.state_dict(),
         "cmd_normalizer": (train_ds.cmd_normalizer.state_dict()
