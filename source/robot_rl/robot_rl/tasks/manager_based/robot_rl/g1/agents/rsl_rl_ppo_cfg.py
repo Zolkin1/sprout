@@ -382,27 +382,30 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
         # neither a wider clip band nor a smaller desired_kl fixes the joint ratio.
         "clip_param": 0.2,
         "desired_kl": 0.01,
-        # MEASURED against the tracker's balance, not reverted and not zeroed.
+        # ZERO. Measured on the first steered run, and the number that settles it is the
+        # LOSS ratio rather than the gradient one I originally reasoned from:
         #
-        # The entropy term's gradient on ANY SINGLE log_std is exactly `entropy_coef`,
-        # independent of the action's dimension count -- summing entropy over dimensions does
-        # not change one dimension's own gradient. That is why the original 94x rescale was
-        # the wrong correction. What DID change is the surrogate: the per-step mean divides
-        # its gradient on log_std by exactly T, measured 1.46e-02 (teacher, joint) against
-        # 2.86e-04 (adjuster, per-step) = 62.0x = T.
+        #     Mean surrogate loss   -0.0345
+        #     Mean entropy loss     -1059      (= 2728 dims x (log sigma + 1.419))
+        #     entropy contribution  -coef * entropy = -1.6e-4 * -1059 = +0.169
         #
-        # So matching the teacher's ratio of entropy pressure to surrogate pressure (0.55)
-        # gives 0.008 * 2.86e-04 / 1.46e-02 = 1.6e-4. The two endpoints are both wrong in a
-        # known way: 0.008 is 62x too strong here (this repo's documented "entropy goes up
-        # during fine-tuning" failure), and 0.0 removes the only force opposing std COLLAPSE
-        # -- with a state-independent log-std and nothing pushing back, PPO shrinks it
-        # whenever lower-variance actions score better, and nothing arrests that.
+        # The entropy term entered the loss about 5x larger than the objective PPO is meant
+        # to maximise, so the optimiser spent the run inflating sigma: 0.150 -> 0.164 over
+        # 110 iterations, with the residual penalty growing alongside it and the mean return
+        # falling monotonically from +0.70 to -1.52 from the moment the actor was released.
+        # Success never moved off the bare generator's rate.
         #
-        # TODO(adjuster-entropy-coef): this reproduces the balance of a configuration known to
-        # have trained (the tracker), which is a defensible prior and not a measurement of
-        # what THIS policy needs. `Policy/mean_noise_std` shows a collapse or a runaway within
-        # a few hundred iterations -- come back and tune against it.
-        "entropy_coef": 1.6e-4,
+        # I set 1.6e-4 by matching the teacher's ratio of entropy to surrogate GRADIENT on
+        # log_std and never compared the two as they enter the loss; the 5:1 would have been
+        # visible immediately. Zero is what the original design called for.
+        #
+        # Exploration does not come from this term -- sigma is a learned parameter, and the
+        # surrogate adapts it in BOTH directions (up when high-advantage actions landed far
+        # from the mean, down when they landed near it). What the bonus buys is insurance
+        # against premature COLLAPSE, which is a different failure, slower, and visible in
+        # `Policy/mean_noise_std`. TODO(adjuster-entropy-coef): if sigma collapses, ~2e-5
+        # puts entropy at roughly 5-10% of the surrogate's gradient instead of 56%.
+        "entropy_coef": 0.0,
         # num_mini_batches and gamma stay at the teacher's values -- see the TODOs above.
         # 30, not the 100 this started at. The critic is a third of its old width, with
         # `window_residual` (the majority of it) gone and input normalization on, so it has

@@ -313,11 +313,24 @@ class G1AdjusterRewardCfg:
     """
 
     trackability: RewTerm = RewTerm(func=mdp.served_track_reward, weight=1.0)
+    # -0.5 and -0.25, down 4x from -2.0/-1.0. MEASURED on the first steered run: the two
+    # penalties together came to -0.305 against a trackability signal of +0.306 -- they
+    # cancelled the ENTIRE dense reward, leaving only the sparse failure term, so the
+    # optimum of the reward as written was "emit no residual at all". That was true at the
+    # initial sigma too (~83%), so it is a mis-scaling and not just the sigma inflation.
+    #
+    # The residual is already bounded HARD -- 0.2 m on position, 15 deg on orientation, in
+    # `apply_plan_residual` -- so this L2 was only ever meant as a soft anchor on top of a
+    # real cap. At a quarter weight it is ~21% of the trackability signal: still a pull
+    # toward small corrections, no longer the dominant term.
+    #
+    # These scale as sigma^2, so they are coupled to `init_std`: raising it 0.15 -> 0.30
+    # multiplies them by ~3.3 and would re-create the cancellation. Move the two together.
     residual_l2: RewTerm = RewTerm(
-        func=mdp.plan_residual_l2, weight=-2.0, params={"command_name": "traj_ref"}
+        func=mdp.plan_residual_l2, weight=-0.5, params={"command_name": "traj_ref"}
     )
     residual_rate_l2: RewTerm = RewTerm(
-        func=mdp.plan_residual_rate_l2, weight=-1.0, params={"command_name": "traj_ref"}
+        func=mdp.plan_residual_rate_l2, weight=-0.25, params={"command_name": "traj_ref"}
     )
     failed: RewTerm = RewTerm(
         func=mdp.episode_ended_by, weight=-10.0,

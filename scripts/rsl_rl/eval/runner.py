@@ -423,12 +423,19 @@ class EvalResetHook:
 #: `fm_meas` DOES get it -- its history is the robot's own achieved state, so "standing" is
 #: what the rows say and what is true.
 #:
+#: The history SEED rides along for the same reason it does in training: without it the first
+#: inference of an episode runs on the phase-agnostic `null_history` embedding, which cannot
+#: express "both feet planted" and yields a mid-gait opening plan. The three settings are one
+#: decision -- standing pose, standing history, zero command -- and splitting them would
+#: measure a configuration nothing is trained under.
+#:
 #: The COST, stated because these are the prices of the choice: the headline `fm` vs `clip`
 #: delta now contains a second difference besides the reference source, and so does the
 #: `fm_tf` vs `fm` exposure-bias delta. The `fm_meas` vs `fm` pairing is the one that stays
 #: fully controlled. Read the first two as arm comparisons, not as clean single-variable
 #: contrasts.
-_STAND_START = {"stand_start": True, "cmd_hold_s": 0.3}
+_STAND_START = {"stand_start": True, "cmd_hold_s": 0.3,
+                "seed_history_from_stand": True}
 
 
 def reference_overrides(mode: str) -> dict:
@@ -486,7 +493,8 @@ def reference_overrides(mode: str) -> dict:
                 # reference already walking away from a stationary robot, an artificial
                 # opening error on the arm that is the CEILING every other arm is measured
                 # against. So the clip arm keeps the clip's own first frame.
-                "stand_start": False, "cmd_hold_s": 0.0}
+                "stand_start": False, "cmd_hold_s": 0.0,
+                "seed_history_from_stand": False}
     if mode == "fm":
         return {"reference_source": "fm", "history_from": "generator",
                 "ego_anchor_fraction": None,
@@ -499,7 +507,8 @@ def reference_overrides(mode: str) -> dict:
         # fact stationary -- incoherent in a way the default start is not.
         return {"reference_source": "fm", "history_from": "clip",
                 "ego_anchor_fraction": 1.0,
-                "stand_start": False, "cmd_hold_s": 0.0}
+                "stand_start": False, "cmd_hold_s": 0.0,
+                "seed_history_from_stand": False}
     if mode == "fm_meas":
         # Same generator, same reference source, same clip placement as ``fm`` -- the ONLY
         # difference is where the history rows come from, which is what makes the paired

@@ -70,14 +70,19 @@ def test_the_ppo_constants_are_stock_because_the_ratio_is_per_step() -> None:
     teacher = PPORunnerCfg().algorithm
     assert alg.desired_kl == teacher.desired_kl
     assert alg.clip_param == teacher.clip_param
-    # NOT the teacher's literal value, and not zero. The entropy gradient per log_std is
-    # `entropy_coef` regardless of dimension count, while the per-step mean divides the
-    # surrogate's by T -- so the teacher's 0.008 would be 62x too strong, and 0.0 leaves
-    # nothing opposing a std collapse. 1.6e-4 reproduces the teacher's measured balance.
-    assert 0.0 < alg.entropy_coef < teacher.entropy_coef
-    assert alg.entropy_coef * 62 == pytest.approx(teacher.entropy_coef, rel=0.3), (
-        f"entropy_coef {alg.entropy_coef:.2e} no longer matches the tracker's balance under "
-        "the per-step ratio (expected ~teacher/T)"
+    # ZERO, and that is a measured retreat from a value I set by the wrong comparison.
+    # 1.6e-4 matched the teacher's entropy-to-surrogate GRADIENT ratio on log_std; what
+    # decides the optimiser's behaviour is how the two enter the LOSS, and there the entropy
+    # term ran about 5x the surrogate (-1.6e-4 * -1059 = +0.169 against -0.0345). The run
+    # inflated sigma 0.150 -> 0.164 and drove the mean return from +0.70 to -1.52 while
+    # success never left the bare generator's rate.
+    #
+    # Exploration does not depend on this term: sigma is a learned parameter and the
+    # surrogate moves it in both directions. The bonus only insures against premature
+    # COLLAPSE, which is observable in `Policy/mean_noise_std` if it happens.
+    assert alg.entropy_coef == 0.0, (
+        "a non-zero entropy_coef here must be justified against the LOSS ratio, not the "
+        "gradient ratio -- see the run that inflated sigma at 1.6e-4"
     )
 
     cfg = G1AdjusterEnvCfg()
