@@ -71,6 +71,25 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
         ".fm_tracking_cmd:FmTrackingCommand"
     )
 
+    generator_kind: str = "flow_matching"
+    """WHICH KIND of generator :attr:`fm_checkpoint` is -- ``"flow_matching"`` or
+    ``"token_planner"``.
+
+    Deliberately NOT a third value of :attr:`reference_source`. That field answers "is the
+    applied reference the clip or a generated one?", which is a different question from "which
+    generator produced it"; folding them together would make every consumer that tests
+    ``reference_source == "fm"`` -- the eval runner, ``fm_debug.py``, the sweeps, the data
+    logger -- silently stop recognising a generated arm.
+
+    The two kinds are served through the same interface: a context carrying the same fields
+    and a ``sample_window`` with the same signature, returning ``(V, F, D)`` raw window nodes.
+    Everything in this command downstream of the load is written against that interface and
+    does not branch on the kind. What DOES differ is refused rather than faked -- a token
+    planner has no ``x0`` noise and no flow field, so :attr:`fm_zero_noise`,
+    :attr:`fm_guidance_scale`, :attr:`fm_num_sampling_steps` and the adjuster's ``plan_flow``
+    do not apply to it and it says so.
+    """
+
     fm_checkpoint: str = ""
     """Path to the trained robot-state-conditioned flow-matching ``.pt`` checkpoint
     (``target_source=ego_anchored_clip_future``). Required, except with

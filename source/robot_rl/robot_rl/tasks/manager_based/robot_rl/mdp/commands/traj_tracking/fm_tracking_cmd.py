@@ -179,15 +179,52 @@ class FmTrackingCommand(MotionSequenceCommand):
         if k < 1:
             raise ValueError(f"fm_update_every must be >= 1, got {k}.")
 
-        # 0 means "keep the checkpoint's own step count" -- the cfg cannot default to None
-        # without making the field un-overridable from hydra (see the cfg's docstring).
-        steps = int(self.cfg.fm_num_sampling_steps) or None
-        self.ctx = load_fm_context(
-            self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
-            num_sampling_steps=steps,
-            zero_noise=self.cfg.fm_zero_noise,
-            guidance_scale=self.cfg.fm_guidance_scale,
-        )
+        # WHICH generator. The two kinds share one interface -- a context with the same
+        # fields and a `sample_window` with the same signature -- so this is the only place
+        # the command branches on the kind; `self._sample_window` carries the choice from
+        # here to the one call site.
+        kind = str(self.cfg.generator_kind)
+        if kind not in ("flow_matching", "token_planner"):
+            raise ValueError(
+                f"generator_kind must be 'flow_matching' or 'token_planner', got {kind!r}.")
+        if kind == "token_planner":
+            from robot_rl.token_planner.online import (  # noqa: PLC0415
+                load_planner_context,
+                sample_window as _tp_sample_window,
+            )
+
+            unusable = [n for n, v in (("fm_num_sampling_steps",
+                                        int(self.cfg.fm_num_sampling_steps)),
+                                       ("fm_guidance_scale",
+                                        self.cfg.fm_guidance_scale != 1.0))
+                        if v]
+            if unusable:
+                raise ValueError(
+                    f"{unusable} are flow-matching settings and have no meaning for a token "
+                    "planner: it integrates nothing and there is no classifier-free "
+                    "guidance. Its analogous knob is greedy-vs-temperature sampling, which "
+                    "`fm_zero_noise` selects (True = greedy).")
+            self.ctx = load_planner_context(
+                self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
+                # The flow model's `zero_noise` and the planner's `greedy` are the same
+                # request -- make the plan a deterministic function of the conditioning --
+                # so one flag drives both and a task config does not have to know which
+                # generator it has.
+                greedy=bool(self.cfg.fm_zero_noise),
+            )
+            self._sample_window = _tp_sample_window
+        else:
+            # 0 means "keep the checkpoint's own step count" -- the cfg cannot default to
+            # None without making the field un-overridable from hydra (see the cfg's
+            # docstring).
+            steps = int(self.cfg.fm_num_sampling_steps) or None
+            self.ctx = load_fm_context(
+                self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
+                num_sampling_steps=steps,
+                zero_noise=self.cfg.fm_zero_noise,
+                guidance_scale=self.cfg.fm_guidance_scale,
+            )
+            self._sample_window = sample_window
         # Publish it: the RL adjuster's network borrows this exact frozen encoder, and an
         # rsl-rl model is built from a dict of primitives so it cannot be handed an object.
         # See `online._ACTIVE_FM_CONTEXT` for why a registry beats loading a second copy.
@@ -1381,7 +1418,7 @@ class FmTrackingCommand(MotionSequenceCommand):
                         else null_hist[ids].to(torch.float32))
             parts.append(null_col.unsqueeze(-1))
             self._cond_stash[ids] = torch.cat(parts, dim=-1).detach()
-        sampled = sample_window(
+        sampled = self._sample_window(
             self.ctx, history, height, cmd_tokens,
             history_null_mask=(None if null_hist is None else null_hist[ids]),
             noise=(None if self._noise_source is None else self._noise_source(ids)),
