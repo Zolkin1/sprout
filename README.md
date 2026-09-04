@@ -278,6 +278,35 @@ codebook-utilisation number that reads as a training problem.
 which is what "the same split as the generator" has to mean for the eventual AR-vs-FM
 comparison to be paired.
 
+Stage B is the planner itself -- a prefix-LM whose conditioning is the generator's, reused
+rather than reinvented:
+
+```bash
+python scripts/token_planner/train_planner.py \
+    --data <recorded>.h5,<augmented>.h5 \
+    --tokenizer logs/token_planner/<tok run>/tokenizer.pt \
+    --fm_config logs/flow_matching/<fm run>/params/fm_config.yaml --run_name ar_v1
+```
+
+`--fm_config` supplies the WHOLE conditioning contract -- the exteroception spec, the camera
+intrinsics, the normalization mode, the camera-latency distribution, the history noise -- so
+an AR-vs-FM difference is attributable to the output representation and not to a
+differently-wired depth encoder. Restating twenty fields on a command line is how they drift.
+
+**The state normalizer must be the tokenizer's, and it is asserted at startup.** The
+planner's targets are token ids, and the tokenizer decodes into the space *its* normalizer
+defined -- so a normalizer that differs here means every id denotes a different trajectory,
+with no shape anywhere to notice.
+
+`benchmark_planner.py` measures one plan. The result that matters for deployment: latency is
+**linear in the token count at a constant ~1.3 ms per decode step**, and an H100 measures
+*slower* than an RTX 4070 -- both signatures of a launch-bound model rather than a
+FLOP-bound one. So `D` is a latency knob as well as a fidelity one. On an idle RTX 4070, in
+unexported eager torch: `D=2` 43.5 ms, `D=4` 22.8 ms, `D=8` 12.6 ms, `D=16` 7.5 ms per plan,
+against a 20 ms control period. For scale, the flow-matching generator it replaces is 11.6 ms
+in torch and 8.3 ms as an exported CUDA-graph ONNX on the same card, so the same export path
+is the obvious lever before `D` is.
+
 ### 4. Deploy the tracker, in Isaac and in MuJoCo
 
 The tracker is the *same* teacher policy, tracking the FM instead of the clip:
