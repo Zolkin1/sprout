@@ -53,6 +53,9 @@ def small_planner(**kw) -> TokenPlanner:
     return TokenPlanner(cfg, TrajectoryTokenizer(tok_cfg)).eval()
 
 
+
+
+
 def conditioning(model: TokenPlanner, batch: int = 3, seed: int = 0):
     """Random conditioning of the shapes the planner expects.
 
@@ -317,3 +320,65 @@ def test_a_generator_on_the_wrong_device_is_refused_by_name():
     g = torch.Generator(device="cuda").manual_seed(0)
     with pytest.raises(ValueError, match="generator is on"):
         m.sample(hist, extero, cmd, generator=g)
+
+
+def test_sampling_in_train_mode_is_refused():
+    """The per-token log-probability is only exact against ``logprobs`` in eval mode.
+
+    The shipped dropout is 0.1, so two independent draws over the same tokens disagree by up
+    to 0.087 nats -- a ~9% error in a PPO importance ratio, in the direction of noise. A
+    rollout collected from a model left in train mode is the easy way to cause that, and it
+    would look like a noisy advantage rather than a bug.
+    """
+    m = small_planner(dropout=0.1).train()
+    hist, extero, cmd = conditioning(m)
+    with pytest.raises(RuntimeError, match="requires eval mode"):
+        m.sample(hist, extero, cmd, greedy=True)
+    m.eval()
+    m.sample(hist, extero, cmd, greedy=True)      # no raise
+
+
+def test_a_supplied_prefix_cache_gives_the_same_plan_as_re_encoding():
+    """The prefix is a function of the conditioning alone, so handing back the cache
+    ``forward`` just built must change nothing -- it is 18% of a validation batch."""
+    m = small_planner()
+    hist, extero, cmd = conditioning(m)
+    tokens = torch.randint(0, m.vocab_size, (hist.shape[0], m.num_tokens))
+    with torch.no_grad():
+        m(tokens, hist, extero, cmd)              # populates _last_prefix_cache
+        a, la, _ = m.sample(hist, extero, cmd, greedy=True)
+        b, lb, _ = m.sample(hist, extero, cmd, greedy=True,
+                            prefix_cache=m._last_prefix_cache)
+    assert torch.equal(a, b)
+    assert torch.allclose(la, lb, atol=1e-6)
+    with pytest.raises(ValueError, match="one per layer"):
+        m.sample(hist, extero, cmd, greedy=True, prefix_cache=m._last_prefix_cache[:-1])
+
+
+def test_the_ema_does_not_average_the_frozen_tokenizer():
+    """Every loader prefers ``model_ema``, so an averaged tokenizer is the one that SHIPS.
+
+    Harmless for decoding, and not harmless for anything that re-ENCODES, because FSQ rounds
+    to a lattice and a drifted encoder crosses cell boundaries.
+    """
+    from robot_rl.flow_matching.ema import WeightEMA
+
+    m = small_planner().train()
+    ema = WeightEMA(m, decay=0.9, freeze=("tokenizer.",))
+    opt = torch.optim.SGD([p for p in m.parameters() if p.requires_grad], lr=0.5)
+    hist, extero, cmd = conditioning(m)
+    tokens = torch.randint(0, m.vocab_size, (hist.shape[0], m.num_tokens))
+    for _ in range(20):
+        opt.zero_grad()
+        m(tokens, hist, extero, cmd).square().mean().backward()
+        opt.step()
+        ema.update(m)
+    live = m.state_dict()
+    tok_keys = [k for k in ema.shadow if k.startswith("tokenizer.")]
+    assert tok_keys, "the tokenizer must be in the state dict at all"
+    for k in tok_keys:
+        assert torch.equal(ema.shadow[k], live[k]), f"{k} drifted from the frozen weights"
+    # And the trunk IS averaged, or the freeze would be doing nothing useful.
+    moved = [k for k in ema.shadow
+             if k.startswith("encoder.") and not torch.equal(ema.shadow[k], live[k])]
+    assert moved, "the trunk should have been averaged away from the live weights"

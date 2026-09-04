@@ -287,6 +287,16 @@ class PlannerConfig:
     grad_clip: float = 1.0
     seed: int = 0
     ema_decay: float = 0.999
+    #: bf16 autocast. RECORDED rather than left on the command line, for the same reason
+    #: :attr:`TokenizerConfig.bf16` is: it is a runtime flag that changes what the artifact
+    #: means. Unlike the tokenizer's it defaults ON -- this model's output is logits, not a
+    #: quantization lattice, so there is no dtype-dependent rounding to protect.
+    bf16: bool = True
+    #: Windows loaded per recording, or ``0`` for all of them. Non-zero means a SMOKE TEST on
+    #: a truncated recording, hence a different episode split -- so it travels in the config
+    #: and the checkpoint. Its own help text promises this; without it a smoke-test
+    #: checkpoint is indistinguishable from a real one on disk.
+    load_rows: int = 0
 
     @property
     def tokenizer_cfg(self) -> TokenizerConfig:
@@ -318,11 +328,20 @@ class PlannerConfig:
                 "nothing can interpret them without the tokenizer that produced them."
             )
         tok = self.tokenizer_cfg
+        if int(self.d_model) % int(self.nhead):
+            raise ValueError(
+                f"d_model={self.d_model} is not divisible by nhead={self.nhead}.")
         if int(tok.chunk_len) != int(self.future_len):
             raise ValueError(
                 f"the tokenizer's chunk is {tok.chunk_len} nodes but the planner's horizon "
                 f"is {self.future_len}. The chunk IS one plan; a mismatch means the planner "
                 "conditions on one timeline and decodes onto another."
+            )
+        node_dim = int(tok.node_dim)
+        if node_dim and int(self.history_dim) != node_dim:
+            raise ValueError(
+                f"history rows are {self.history_dim} wide but the tokenizer's nodes are "
+                f"{node_dim}. History rows ARE window nodes, so the two cannot differ."
             )
 
     def to_dict(self) -> dict[str, Any]:

@@ -153,7 +153,7 @@ def main() -> None:
     sweep = [int(v) for v in args.downsample.split(",") if v.strip()] or [None]
     all_results: dict[str, dict] = {}
     for d_factor in sweep:
-        model = build_model(args.planner, device, d_factor)
+        model = build_model(args.planner, device, d_factor).eval()
         all_results[str(d_factor or "default")] = _measure(model, args, device)
     if args.out:
         with open(args.out, "w") as fh:
@@ -192,6 +192,11 @@ def _measure(model: TokenPlanner, args: argparse.Namespace,
                                 enabled=args.bf16 and device.type == "cuda"):
                 model.encode_prefix(hist, extero, cmd)
 
+        toks = torch.zeros(b, model.num_tokens, dtype=torch.long, device=device)
+
+        def _decode():
+            model.decode(toks)
+
         def _plan():
             with torch.autocast("cuda", dtype=torch.bfloat16,
                                 enabled=args.bf16 and device.type == "cuda"):
@@ -201,13 +206,21 @@ def _measure(model: TokenPlanner, args: argparse.Namespace,
 
         with torch.no_grad():
             pre = timed(_prefix, args.iters, args.warmup, device)
+            dec = timed(_decode, args.iters, args.warmup, device)
             whole = timed(_plan, args.iters, args.warmup, device)
-        per_token = (whole["median_ms"] - pre["median_ms"]) / max(model.num_tokens, 1)
-        results[str(b)] = {"prefix": pre, "plan": whole, "per_token_ms": per_token,
+        # BOTH constants are subtracted before dividing. The prefix encode and the tokenizer
+        # DECODE are each once per plan, so folding either into a per-token figure charges a
+        # constant to N -- which manufactures exactly the falling curve a `--downsample`
+        # sweep exists to look for. Only `sample`'s N decode steps are per-token.
+        per_token = ((whole["median_ms"] - pre["median_ms"] - dec["median_ms"])
+                     / max(model.num_tokens, 1))
+        results[str(b)] = {"prefix": pre, "decode": dec, "plan": whole,
+                           "per_token_ms": per_token,
                            "tokens_per_plan": model.num_tokens}
         print(f"[bench] batch {b:>5d}: plan {whole['median_ms']:7.2f} ms "
               f"(p90 {whole['p90_ms']:7.2f})  = prefix {pre['median_ms']:6.2f} "
-              f"+ {model.num_tokens} x {per_token:5.2f} ms/token")
+              f"+ decode {dec['median_ms']:5.2f} + {model.num_tokens} x "
+              f"{per_token:5.2f} ms/token")
 
     one = results.get("1")
     if one:

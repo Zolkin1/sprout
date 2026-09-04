@@ -32,6 +32,7 @@ future is tokenized.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -145,7 +146,7 @@ def parse_args() -> tuple[PlannerConfig, argparse.Namespace]:
     p.add_argument("--grad_clip", type=float, default=d.grad_clip)
     p.add_argument("--ema_decay", type=float, default=d.ema_decay)
     p.add_argument("--seed", type=int, default=d.seed)
-    p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--bf16", action=argparse.BooleanOptionalAction, default=d.bf16)
 
     args = p.parse_args()
     cfg = PlannerConfig(
@@ -155,7 +156,7 @@ def parse_args() -> tuple[PlannerConfig, argparse.Namespace]:
         lr=args.lr, lr_min=args.lr_min, weight_decay=args.weight_decay,
         warmup_steps=args.warmup_steps, batch_size=args.batch_size,
         num_epochs=args.num_epochs, grad_clip=args.grad_clip, ema_decay=args.ema_decay,
-        seed=args.seed,
+        seed=args.seed, bf16=args.bf16, load_rows=args.load_rows,
     )
     return cfg, args
 
@@ -382,8 +383,10 @@ def evaluate(model: TokenPlanner, loader: DataLoader, device: torch.device,
         hist, extero, cmd, _ = _cond(batch, device)
         tokens = batch["tokens"].to(device, non_blocking=True)
         tok_acc.update(model(tokens, hist, extero, cmd), tokens)
-        # Greedy decode -> the trajectory the tracker would actually be handed.
-        greedy, _, _ = model.sample(hist, extero, cmd, greedy=True)
+        # Reuse the prefix `forward` just built: it is a function of the conditioning alone,
+        # so re-encoding it here was 18% of this loop's cost for an identical answer.
+        greedy, _, _ = model.sample(hist, extero, cmd, greedy=True,
+                                    prefix_cache=model._last_prefix_cache)
         recon.update(batch["state"].to(device, non_blocking=True),
                      model.decode(greedy), greedy, batch["family"])
     trep, rrep = tok_acc.report(), recon.report()
@@ -404,7 +407,7 @@ def evaluate(model: TokenPlanner, loader: DataLoader, device: torch.device,
 
 def save_checkpoint(path: str, model: TokenPlanner, opt, cfg: PlannerConfig,
                     extras: dict[str, Any], epoch: int, scalars: dict[str, float],
-                    report: dict[str, Any], ema: WeightEMA | None) -> None:
+                    report: dict[str, Any], ema: WeightEMA | None, step: int = 0) -> None:
     """Write a self-describing planner checkpoint.
 
     Everything needed to interpret a token id travels here: the tokenizer's config AND its
@@ -422,12 +425,15 @@ def save_checkpoint(path: str, model: TokenPlanner, opt, cfg: PlannerConfig,
         scalars: Flat validation scalars.
         report: The full validation report.
         ema: The weight EMA, or ``None``.
+        step: The global optimizer step; ``scheduled_lr`` is a pure function of
+            ``(epoch, step)``, so a resume needs it.
     """
     payload: dict[str, Any] = {
         "model": model.state_dict(),
         "optimizer": opt.state_dict(),
         "config": cfg.to_dict(),
         "epoch": int(epoch),
+        "step": int(step),
         "metrics": dict(scalars),
         "report": report,
         **extras,
@@ -517,6 +523,11 @@ def main() -> None:
                  "extero_camera_intrinsics", "cmd_dim", "cmd_stride"):
         setattr(cfg, name, getattr(fm, name))
     cfg.extero_channels = fm.resolve_extero_channels()
+    # RESOLVED, not copied. It works today only because `build_train_val` mutates
+    # `cfg.extero_encoder` in place before the copy above; reorder those two statements, or
+    # build a planner without going through the dataset, and `ConditioningPrefix` raises
+    # "unknown extero_encoder 'auto'".
+    cfg.extero_encoder = fm.resolve_extero_encoder()
     model = TokenPlanner(cfg, tokenizer).to(device)
     n_par = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_pre = sum(p.numel() for p in model.prefix.parameters())
@@ -577,7 +588,13 @@ def main() -> None:
         [p for p in model.parameters() if p.requires_grad], lr=cfg.lr,
         weight_decay=cfg.weight_decay,
         betas=(float(cfg.betas[0]), float(cfg.betas[1])))
-    ema = WeightEMA(model, decay=cfg.ema_decay) if cfg.ema_decay > 0.0 else None
+    # `freeze=("tokenizer.",)`: the tokenizer is a submodule and therefore 5.55M of the
+    # model's 38M state-dict entries. Averaging it would drift the shadow away from the
+    # weights it was frozen at, and every loader prefers `model_ema` -- so the tokenizer that
+    # SHIPS would not be the frozen one. Harmless for decoding; not harmless for re-encoding,
+    # since FSQ rounds to a lattice.
+    ema = (WeightEMA(model, decay=cfg.ema_decay, freeze=("tokenizer.",))
+           if cfg.ema_decay > 0.0 else None)
     writer = SummaryWriter(log_dir=out_dir)
     wandb_run = None
     if args.wandb:
@@ -615,7 +632,7 @@ def main() -> None:
     for epoch in range(cfg.num_epochs):
         model.train()
         t0 = time.time()
-        run_loss, run_n, clipped = 0.0, 0, 0
+        run_loss, run_raw, run_n, clipped = 0.0, 0.0, 0, 0
         for batch in train_loader:
             hist, extero, cmd, null = _cond(batch, device, cfg.null_cond_prob)
             tokens = batch["tokens"].to(device, non_blocking=True)
@@ -624,9 +641,18 @@ def main() -> None:
                 g["lr"] = lr
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 logits = model(tokens, hist, extero, cmd, null)
+            flat, flat_t = logits.float().reshape(-1, model.vocab_size), tokens.reshape(-1)
             loss = torch.nn.functional.cross_entropy(
-                logits.float().reshape(-1, model.vocab_size), tokens.reshape(-1),
-                label_smoothing=cfg.label_smoothing)
+                flat, flat_t, label_smoothing=cfg.label_smoothing)
+            # The UNSMOOTHED value too, because the smoothed one is not comparable with the
+            # validation CE -- `TokenAccumulator` is deliberately unsmoothed (a smoothed CE
+            # depends on V, and the FSQ level table is an ablation axis). Smoothing adds a
+            # floor that GROWS as the model sharpens: +0.20 nats for a weak model, +3.13 for
+            # a sharp one at V=12800. Logging only the smoothed number makes validation
+            # appear to beat training by a widening margin, all run long, on the one figure
+            # anyone reads per epoch.
+            with torch.no_grad():
+                raw_ce = float(torch.nn.functional.cross_entropy(flat, flat_t))
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = float(torch.nn.utils.clip_grad_norm_(
@@ -636,6 +662,7 @@ def main() -> None:
             if ema is not None:
                 ema.update(model)
             run_loss += float(loss.detach()) * tokens.shape[0]
+            run_raw += raw_ce * tokens.shape[0]
             run_n += int(tokens.shape[0])
             if step % 50 == 0:
                 writer.add_scalar("train/loss_step", float(loss.detach()), step)
@@ -645,14 +672,16 @@ def main() -> None:
 
         scal_epoch = {
             "train/loss_epoch": run_loss / max(run_n, 1),
+            "train/ce_unsmoothed": run_raw / max(run_n, 1),
             "train/grad_clipped_frac": clipped / max(len(train_loader), 1),
             "train/epoch_time_s": time.time() - t0,
             "train/lr": scheduled_lr(cfg, epoch, step),
         }
         for k, v in scal_epoch.items():
             writer.add_scalar(k, v, epoch)
-        line = (f"[ar] epoch {epoch:>4d}  train_ce {run_loss / max(run_n, 1):.4f}  "
-                f"{time.time() - t0:.1f}s")
+        # Both, and labelled: `smoothed` is the objective, `ce` is what compares with val.
+        line = (f"[ar] epoch {epoch:>4d}  train ce {run_raw / max(run_n, 1):.4f} "
+                f"(smoothed {run_loss / max(run_n, 1):.4f})  {time.time() - t0:.1f}s")
 
         do_val = val_loader is not None and (
             epoch % max(args.val_every, 1) == 0 or epoch == cfg.num_epochs - 1)
@@ -669,13 +698,18 @@ def main() -> None:
                     writer.add_scalar(f"val_ema/{k}", v, epoch)
                 scal_epoch.update({f"val_ema/{k}": v for k, v in scal_e.items()})
                 sel, sel_rep, tag, scal = scal_e["ce"], rep_e, "val_ema", scal_e
+            # Indexed with `.get`: a `reference_blocks` selection without one of these
+            # groups would otherwise KeyError at the end of the first validation epoch,
+            # after the whole build and tokenize pass.
             line += (f"  {tag} ce {scal['ce']:.4f}  top1 {100 * scal['top1']:.1f}%  "
-                     f"H {scal['entropy_nats']:.2f}  pos {scal['rmse/base_pos']:.4f} m  "
-                     f"jnt {scal['rmse/joint_pos']:.4f} rad")
+                     f"H {scal['entropy_nats']:.2f}")
+            for key, unit in (("base_pos", "m"), ("joint_pos", "rad")):
+                if f"rmse/{key}" in scal:
+                    line += f"  {key.split('_')[0]} {scal[f'rmse/{key}']:.4f} {unit}"
             if sel < best:
                 best = sel
                 save_checkpoint(os.path.join(out_dir, "planner.pt"), model, opt, cfg,
-                                extras, epoch, scal, sel_rep, ema)
+                                extras, epoch, scal, sel_rep, ema, step)
                 with open(os.path.join(out_dir, "offline_report.json"), "w") as fh:
                     json.dump({"epoch": epoch, "scalars": scal, "report": sel_rep}, fh,
                               indent=2)
@@ -685,7 +719,7 @@ def main() -> None:
             wandb_run.log({**scal_epoch, "epoch": epoch}, step=epoch)
         if epoch % max(args.ckpt_every, 1) == 0 or epoch == cfg.num_epochs - 1:
             save_checkpoint(os.path.join(out_dir, f"ckpt_{epoch}.pt"), model, opt, cfg,
-                            extras, epoch, {}, {}, ema)
+                            extras, epoch, {}, {}, ema, step)
 
     # -- diversity, once, at the end: it costs `diversity_samples` full decodes per context --
     div = None
@@ -695,7 +729,7 @@ def main() -> None:
         hist, extero, cmd, _ = _cond(
             {key: v[:k] for key, v in batch.items()}, device)
         # Measured on the EMA weights when there are any, matching what `best` selected on.
-        with (ema.swapped_in(model) if ema is not None else _null_ctx()):
+        with (ema.swapped_in(model) if ema is not None else contextlib.nullcontext()):
             div = sample_diversity(
                 model, hist, extero, cmd, num_samples=int(args.diversity_samples),
                 generator=torch.Generator(device=device.type).manual_seed(cfg.seed),
@@ -736,16 +770,6 @@ def _patch_row_limit(n: int) -> None:
         return original(path, keys=keys, rows=np.arange(n))
 
     rdio.load_recorded_windows = limited
-
-
-class _null_ctx:
-    """A do-nothing context manager, so the diversity block has one code path."""
-
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *exc):
-        return False
 
 
 if __name__ == "__main__":

@@ -86,12 +86,32 @@ def test_the_prefix_matches_the_flow_matching_models_embedding(encoder, sensors)
     fm = FlowMatchingTransformer.from_config(cfg).eval()
     prefix = prefix_from(cfg).eval()
 
+    # RANDOMISE THE ZERO-INITIALISED TAGS FIRST. `hist_type`, `extero_type`, `cmd_type`,
+    # `extero_id` and `null_history` are all zeros in a fresh model, so copying them across
+    # and comparing outputs compares zero against zero -- and the test passes just as
+    # happily with those terms deleted outright or with `extero_id` broadcast down the wrong
+    # axis, which is measured: all four arms below passed with two of them removed. Since
+    # this test is the ENTIRE safety net for restating the assembly, it has to be able to
+    # see the drifts its own docstring names.
+    torch.manual_seed(11)
+    with torch.no_grad():
+        for name in ("hist_type", "extero_type", "cmd_type", "null_history", "extero_id"):
+            tag = getattr(fm, name, None)
+            if tag is not None:
+                tag.normal_(0.0, 0.5)
+
     shared = {k: v for k, v in fm.state_dict().items() if k in dict(prefix.state_dict())}
     missing, unexpected = prefix.load_state_dict(shared, strict=False)
     # Nothing may be left at its own initialisation: an un-copied parameter would make the
     # comparison below a comparison of two random modules that happen to agree on shape.
     assert not [m for m in missing if m not in ("pos", "cmd_steps")], missing
-    assert not unexpected, unexpected
+    # `unexpected` cannot fire (``shared`` is filtered to the prefix's own keys), so the
+    # real check is that every tag the FM has was actually transferred.
+    have = dict(prefix.state_dict())
+    for name in ("hist_type", "extero_type", "cmd_type", "null_history", "extero_id"):
+        if getattr(fm, name, None) is not None:
+            assert name in have, f"the prefix has no {name}; the streams are untagged"
+            assert torch.equal(have[name], getattr(fm, name)), f"{name} did not transfer"
 
     torch.manual_seed(0)
     b = 3

@@ -38,8 +38,6 @@ dropout modules and a wrong one is invisible at ``dropout=0``.
 
 from __future__ import annotations
 
-from typing import Sequence
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -103,6 +101,25 @@ def causal_output_mask(
         [torch.zeros(num_tokens, prefix_len, dtype=torch.bool, device=device), out], dim=1)
 
 
+def _resolve_extero_channels(cfg: PlannerConfig) -> int:
+    """Planes per exteroception pixel, resolved the way the rest of the repo resolves it.
+
+    ``None`` means "resolve from the source" -- 5 for depth, 1 for a height scan, whose rays
+    already are ground points. That idiom is
+    :meth:`~robot_rl.flow_matching.config.FlowMatchingConfig.resolve_extero_channels`'s, and
+    hard-coding a 1 here would be a fifth place the rule is written down.
+
+    Args:
+        cfg: The planner config.
+
+    Returns:
+        The channel count.
+    """
+    if cfg.extero_channels is not None:
+        return int(cfg.extero_channels)
+    return 5 if str(cfg.extero_source) == "depth" else 1
+
+
 class TokenPlanner(nn.Module):
     """Prefix-LM over trajectory tokens, with a frozen tokenizer for decoding.
 
@@ -138,7 +155,7 @@ class TokenPlanner(nn.Module):
             extero_grid_ordering=cfg.extero_grid_ordering,
             extero_fourier_bands=cfg.extero_fourier_bands,
             extero_miss_sentinel=cfg.extero_miss_sentinel,
-            extero_channels=(1 if cfg.extero_channels is None else int(cfg.extero_channels)),
+            extero_channels=_resolve_extero_channels(cfg),
             extero_camera_intrinsics=cfg.extero_camera_intrinsics,
             cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
         )
@@ -174,6 +191,11 @@ class TokenPlanner(nn.Module):
         self.head_norm = nn.LayerNorm(d)
         self.head = nn.Linear(d, self.vocab_size, bias=False)
         self.head.weight = self.token_emb.weight        # tied
+        # The prefix `forward` last built, so a caller that teacher-forces and then samples
+        # the same batch can hand it back to `sample(prefix_cache=...)`. Deliberately NOT
+        # consulted automatically: it belongs to whatever conditioning ran last, and using
+        # it implicitly would silently sample against a different batch's prefix.
+        self._last_prefix_cache: tuple[torch.Tensor, ...] | None = None
 
     @property
     def prefix_len(self) -> int:
@@ -257,6 +279,7 @@ class TokenPlanner(nn.Module):
             raise ValueError(
                 f"expected {self.num_tokens} token(s) per plan, got {tokens.shape[-1]}.")
         cache = self.encode_prefix(history, extero, cmd_tokens, history_null_mask)
+        self._last_prefix_cache = cache
         x = self._embed_outputs(tokens[:, :-1], tokens.shape[0])
         mask = causal_output_mask(self.num_tokens, self.prefix_len, tokens.device)
         for layer, prefix in zip(self.encoder.layers, cache):
@@ -282,8 +305,11 @@ class TokenPlanner(nn.Module):
             tokens: ``(B, N)`` ids to score.
             history / extero / cmd_tokens / history_null_mask: The conditioning.
             temperature: Softmax temperature; must match what :meth:`sample` drew at.
-            return_logits: Also return the raw ``(B, N, V)`` logits, so an exact KL to a
-                reference policy can be computed without a second pass.
+            return_logits: Also return the ``(B, N, V)`` logits **already divided by
+                ``temperature``**, so an exact KL to a reference policy is a log-softmax away
+                and needs no second pass. Returning the raw logits beside tempered
+                log-probabilities would make the two describe different distributions, and
+                the caller would have to know to divide.
 
         Returns:
             ``(logprobs, entropy)`` each ``(B, N)``, or ``(logprobs, entropy, logits)``.
@@ -293,8 +319,8 @@ class TokenPlanner(nn.Module):
         """
         if temperature <= 0.0:
             raise ValueError(f"temperature must be positive, got {temperature}.")
-        logits = self(tokens, history, extero, cmd_tokens, history_null_mask)
-        logp_all = F.log_softmax(logits / temperature, dim=-1)
+        logits = self(tokens, history, extero, cmd_tokens, history_null_mask) / temperature
+        logp_all = F.log_softmax(logits, dim=-1)
         logp = logp_all.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
         ent = -(logp_all.exp() * logp_all).sum(-1)
         return (logp, ent, logits) if return_logits else (logp, ent)
@@ -312,13 +338,16 @@ class TokenPlanner(nn.Module):
         temperature: float = 1.0,
         greedy: bool = False,
         generator: torch.Generator | None = None,
+        prefix_cache: tuple[torch.Tensor, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode a plan autoregressively, with a per-layer KV cache.
 
         No attention mask: at step ``i`` the query is the single new slot and the keys are the
         prefix plus the slots already emitted, so causality holds by construction. That is
-        also what makes this agree with :meth:`forward` exactly rather than approximately --
-        pinned by ``test_sample_and_logprobs_agree``.
+        what makes this agree with :meth:`forward` to float round-off (~1e-6, measured) rather
+        than merely approximately -- the two sum the same numbers in a different order, one
+        over a growing key set and one over the whole block. Pinned by
+        ``test_sample_and_logprobs_agree_on_the_same_tokens``.
 
         No top-k and no nucleus truncation, deliberately: both put zero probability on tokens
         the model gave mass to, which makes the sampled log-probability disagree with the
@@ -331,6 +360,11 @@ class TokenPlanner(nn.Module):
                 under the tempered distribution, so they remain the density of what was
                 emitted.
             generator: Explicit RNG, so a rollout is reproducible.
+            prefix_cache: A cache from :meth:`encode_prefix` for this same conditioning, to
+                skip re-encoding it. The whole point of the decomposition is that the prefix
+                is a function of the conditioning alone, so a caller that has just run
+                :meth:`forward` on the same batch already has it -- and re-encoding was
+                measured at 18% of a validation batch's cost, doubled by the EMA arm.
 
         Returns:
             ``(tokens, logprobs, entropy)`` of shapes ``(B, N)``, ``(B, N)``, ``(B, N)``.
@@ -340,6 +374,20 @@ class TokenPlanner(nn.Module):
         """
         if temperature <= 0.0:
             raise ValueError(f"temperature must be positive, got {temperature}.")
+        if self.training:
+            # The per-token log-probability this returns is only EXACT against
+            # :meth:`logprobs` in eval mode: the shipped dropout is 0.1 (the generator's is
+            # 0.0), and two independent dropout draws over the same tokens disagree by up to
+            # 0.087 nats -- a ~9% error in a PPO importance ratio, in the direction of noise
+            # rather than signal. A rollout collected from a model left in train mode is the
+            # easy way to make that happen, so it is refused rather than warned about.
+            raise RuntimeError(
+                "TokenPlanner.sample() requires eval mode: this model ships dropout="
+                f"{self.cfg.dropout}, so sampling under train mode returns log-probabilities "
+                "drawn through a different network than logprobs() would score them with. "
+                "Call model.eval() first (and model.train() again afterwards to resume "
+                "training)."
+            )
         if (generator is not None and not greedy
                 and generator.device.type != history.device.type):
             # torch.multinomial requires the two to agree, and the error it raises names
@@ -352,7 +400,12 @@ class TokenPlanner(nn.Module):
                 "portable across devices, so this cannot be papered over without changing "
                 "which numbers a seed produces.")
         b = history.shape[0]
-        cache = self.encode_prefix(history, extero, cmd_tokens, history_null_mask)
+        cache = (self.encode_prefix(history, extero, cmd_tokens, history_null_mask)
+                 if prefix_cache is None else tuple(prefix_cache))
+        if len(cache) != len(self.encoder.layers):
+            raise ValueError(
+                f"prefix_cache has {len(cache)} entries but the trunk has "
+                f"{len(self.encoder.layers)} layers; it must carry one per layer.")
         layers = list(self.encoder.layers)
         pl, n, d = self.prefix_len, self.num_tokens, self.cfg.d_model
 
@@ -366,8 +419,11 @@ class TokenPlanner(nn.Module):
         # * pre-normed -- `_run_layer` would otherwise apply `norm1` to every key again at
         #   every step, which is quadratic in the token count for a result that cannot change.
         #
-        # At batch 1 this is 2.4 MB and the model is dispatch-bound, which is exactly where
-        # removing 128 allocations per plan is worth more than removing FLOPs.
+        # It costs `L * B * (P + N) * d * 4` bytes: 2.4 MB at batch 1, where the model is
+        # dispatch-bound and removing 128 allocations per plan is worth far more than the
+        # memory -- but 608 MB at batch 256 and 2.4 GB at batch 1024, which is the regime an
+        # RL rollout and `benchmark_planner.py --batches 1024` both run in. Quoting only the
+        # batch-1 figure would make that look free.
         kv = [torch.empty(b, pl + n, d, device=history.device, dtype=cache[0].dtype)
               for _ in layers]
         for i, layer in enumerate(layers):

@@ -23,6 +23,7 @@ question "did EMA help this run?" is answerable from the run itself rather than 
 from __future__ import annotations
 
 from contextlib import contextmanager
+from typing import Sequence
 
 import torch
 
@@ -36,19 +37,31 @@ class WeightEMA:
         warmup: Ramp the decay in over the first steps (see :meth:`update`). Leave on --
             without it the average is dominated by the random initialisation for the first
             ``1 / (1 - decay)`` steps, which on a short run is most of the run.
+        freeze: State-dict key PREFIXES to copy verbatim instead of averaging. For a frozen
+            submodule -- a model that owns a pretrained tokenizer, say -- averaging is not
+            merely pointless but wrong: the shadow drifts away from the weights the submodule
+            was frozen at, and since every loader prefers ``model_ema``, the artifact that
+            ships is then not the frozen module. Measured at 3.0e-7 after 300 steps, which is
+            harmless for a decoder and is not harmless for anything that RE-ENCODES, because
+            the FSQ lattice rounds. ``None`` averages everything, which is the flow-matching
+            generator's behaviour and is unchanged by this argument existing.
     """
 
-    def __init__(self, model: torch.nn.Module, decay: float = 0.999, warmup: bool = True):
+    def __init__(self, model: torch.nn.Module, decay: float = 0.999, warmup: bool = True,
+                 freeze: Sequence[str] | None = None):
         if not 0.0 < decay < 1.0:
             raise ValueError(f"decay must be in (0, 1), got {decay}.")
         self.decay = float(decay)
         self.warmup = bool(warmup)
+        self.freeze = tuple(freeze or ())
         self.step = 0
         # Shadow EVERY state_dict entry so the EMA is a drop-in replacement. Only floating
         # point tensors are averaged; integer buffers (counters, index tables) are copied,
-        # because an average of indices is meaningless.
+        # because an average of indices is meaningless -- and so are the frozen prefixes,
+        # for which a copy keeps the shadow bit-identical to the module.
         self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        self._avg = {k for k, v in self.shadow.items() if v.is_floating_point()}
+        self._avg = {k for k, v in self.shadow.items()
+                     if v.is_floating_point() and not k.startswith(self.freeze)}
 
     def effective_decay(self) -> float:
         """Decay for the current step, ramped in when ``warmup``.
@@ -89,7 +102,7 @@ class WeightEMA:
     def state_dict(self) -> dict:
         """Serialisable state: the shadow weights plus the step count and settings."""
         return {"shadow": self.shadow, "step": self.step,
-                "decay": self.decay, "warmup": self.warmup}
+                "decay": self.decay, "warmup": self.warmup, "freeze": list(self.freeze)}
 
     def load_state_dict(self, state: dict) -> None:
         """Restore from :meth:`state_dict` (for resuming a run)."""
@@ -97,7 +110,9 @@ class WeightEMA:
         self.step = int(state.get("step", 0))
         self.decay = float(state.get("decay", self.decay))
         self.warmup = bool(state.get("warmup", self.warmup))
-        self._avg = {k for k, v in self.shadow.items() if v.is_floating_point()}
+        self.freeze = tuple(state.get("freeze", self.freeze))
+        self._avg = {k for k, v in self.shadow.items()
+                     if v.is_floating_point() and not k.startswith(self.freeze)}
 
     def to(self, device) -> "WeightEMA":
         """Move the shadow weights to ``device`` (in place); returns self."""

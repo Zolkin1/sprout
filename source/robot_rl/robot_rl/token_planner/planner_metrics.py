@@ -148,6 +148,11 @@ def sample_diversity(
         fraction of differing tokens; ``distinct_plans`` the mean number of distinct token
         sequences among the draws.
     """
+    if planner.training:
+        raise RuntimeError(
+            "sample_diversity() needs the planner in eval mode -- dropout would make each "
+            "draw come from a different network, so the spread measured would be the "
+            "dropout's rather than the policy's.")
     b = history.shape[0]
     plans, toks = [], []
     for _ in range(int(num_samples)):
