@@ -1486,9 +1486,25 @@ class GenTrackerPolicy:
         sampler and is *not* the mean of the conditional distribution (the flow ODE is
         nonlinear, so the image of the source mode is not the target mean). The library
         default stays Gaussian for hardware and the torch/numpy parity tests.
+
+        The SHAPE and the DISTRIBUTION are read off the graph, not computed. A
+        flow-matching graph takes an ``x0`` of ``(F, D)`` drawn from ``N(0, I)``; a token
+        planner takes Gumbel noise of ``(num_plan_tokens, vocab)``, because its sampling loop
+        is made traceable by the Gumbel-max identity -- ``argmax(logits/T + g)`` with
+        ``g ~ Gumbel(0, 1)`` is an exact draw from ``softmax(logits/T)``. Both keep the same
+        input name and the same meaning ("the randomness for this plan, supplied by the
+        caller so a probe can hold it fixed across arms"), so nothing else here branches; and
+        under both, ZEROS give the deterministic arm. Computing the shape instead of reading
+        it would feed one generator the other's tensor and fail at the session boundary --
+        loudly, but for a reason that reads as a corrupt artifact.
         """
-        shape = (1, self.ctx.F, self.ctx.D)
-        return np.zeros(shape) if self.zero_noise else self._rng.standard_normal(shape)
+        shape = (1, *self.ctx.noise_shape)
+        if self.zero_noise:
+            return np.zeros(shape)
+        if self.ctx.noise_distribution == "gumbel":
+            u = self._rng.uniform(np.finfo(np.float64).tiny, 1.0, size=shape)
+            return -np.log(-np.log(u))
+        return self._rng.standard_normal(shape)
 
     def _serve_nodes(self, state: dict, offsets) -> np.ndarray:
         """Served nodes at ``offsets``, re-expressed relative to the robot RIGHT NOW.

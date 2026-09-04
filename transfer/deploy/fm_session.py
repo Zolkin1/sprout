@@ -117,6 +117,28 @@ class FmContext:
     ``GenTrackerPolicy`` must use the same ``fm_update_every``: the horizon ``F`` is sized
     from this period. ``None`` for a graph exported before the field existed."""
     history_source: str = "reference"
+    generator_kind: str = "flow_matching"
+    """WHICH KIND of generator this graph is -- ``"flow_matching"`` or ``"token_planner"``.
+
+    The two share this entire contract: the same five inputs, the same output, the same
+    metadata key, and every load-time check here (node layout, sensor geometry, robot
+    identity, re-plan cadence) applies to both unchanged. What differs is confined to
+    :attr:`noise_shape` and :attr:`noise_distribution`. A graph that does not say is a
+    flow-matching one, which is what every graph exported before this field existed is.
+    """
+    noise_shape: tuple[int, ...] = ()
+    """Shape of the ``noise`` input, WITHOUT the batch axis.
+
+    Read rather than computed. A flow graph wants ``(F, D)`` -- the ``x0`` it integrates from
+    -- and a token planner wants ``(num_plan_tokens, vocab)``, the per-class Gumbel noise
+    that makes its sampling loop traceable. Both keep the input NAME, so a runtime that
+    reads this needs no other change; one that computes ``(F, D)`` feeds the other generator
+    the wrong tensor.
+    """
+    noise_distribution: str = "gaussian"
+    """How to draw :attr:`noise`: ``"gaussian"`` for a flow ``x0``, ``"gumbel"`` for the
+    planner's ``argmax(logits/T + g)`` sampling. Under both, ZEROS give the deterministic
+    arm -- the flow integrates from its source mode, the planner takes the argmax."""
     """What the ``N`` history rows this graph was FITTED on contained.
 
     ``"reference"`` (the applied reference -- what the runtime's ``generator`` arm serves,
@@ -349,6 +371,12 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None,
         extero_image_hw=[(int(h), int(w)) for h, w in (m.get("extero_image_hw") or [])],
         extero_tokens_per_sensor=int(m.get("extero_tokens_per_sensor", 1)),
         extero_clip=(None if m.get("extero_clip") is None else float(m["extero_clip"])),
+        generator_kind=str(m.get("generator_kind", "flow_matching")),
+        # Absent means a flow graph, whose noise is its x0 and therefore the window's shape.
+        # Stated rather than defaulted for a planner, whose noise is neither.
+        noise_shape=tuple(int(v) for v in
+                          (m.get("noise_shape") or (int(m["F"]), int(m["D"])))),
+        noise_distribution=str(m.get("noise_distribution", "gaussian")),
         depth_latency_probs=(tuple(float(p) for p in m["depth_latency_probs"])
                              if m.get("depth_latency_probs") else None),
         # ``.get``: absent in every graph exported before the fingerprint existed, and an
