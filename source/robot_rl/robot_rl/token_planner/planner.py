@@ -454,17 +454,42 @@ class TokenPlanner(nn.Module):
     # Decoding to a trajectory
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def decode(self, tokens: torch.Tensor, normalizer=None) -> torch.Tensor:
-        """Frozen tokenizer decoder, then denormalization into the planner frame.
+    def decode(self, tokens: torch.Tensor, normalizer=None,
+               project_rotations: bool = True) -> torch.Tensor:
+        """Frozen tokenizer decoder, denormalization, and the rotation projection.
+
+        The projection is not cosmetic. ``base_pose``'s rotation half is six free numbers,
+        and a decoder emitting them produces something only APPROXIMATELY a rotation -- so a
+        served reference would not be a real pose, and the autoregressive history would drift
+        off the manifold it was trained on. The flow-matching generator projects at exactly
+        the same point (``online.sample_window``), which is what lets everything downstream,
+        including the torch-free deploy port, assume the window is valid.
 
         Args:
             tokens: ``(B, N)`` ids.
             normalizer: The state :class:`~robot_rl.flow_matching.normalizer.Normalizer`. When
                 ``None`` the nodes are returned in NORMALIZED space -- useful in a test, wrong
                 for anything that hands them to a tracker.
+            project_rotations: Re-orthonormalize the rot6d block. Only turn this off to
+                MEASURE how far off the manifold the raw decode is; serving an unprojected
+                window is never correct. Requires ``normalizer``, since the projection is
+                defined in physical space.
 
         Returns:
             ``(B, H, node_dim)`` nodes.
         """
         nodes = self.tokenizer.decode_ids(tokens)
-        return nodes if normalizer is None else normalizer.denormalize(nodes)
+        if normalizer is None:
+            return nodes
+        nodes = normalizer.denormalize(nodes)
+        if project_rotations:
+            from robot_rl.flow_matching.window import (  # noqa: PLC0415
+                project_window_rotations,
+            )
+
+            nodes = project_window_rotations(
+                nodes, int(self.cfg.num_joints_for_layout),
+                int(self.cfg.num_ee_frames_for_layout),
+                list(self.cfg.tokenizer_cfg.reference_blocks),
+            )
+        return nodes

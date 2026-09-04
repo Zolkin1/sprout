@@ -382,3 +382,37 @@ def test_the_ema_does_not_average_the_frozen_tokenizer():
     moved = [k for k in ema.shadow
              if k.startswith("encoder.") and not torch.equal(ema.shadow[k], live[k])]
     assert moved, "the trunk should have been averaged away from the live weights"
+
+
+def test_decode_returns_a_real_rotation():
+    """A decoder emitting six free numbers produces something only APPROXIMATELY a rotation.
+
+    The flow-matching generator projects at exactly this point
+    (``online.sample_window``), which is what lets the tracker, the world lift and the
+    torch-free deploy port all assume the served window is a valid pose. Without it the
+    autoregressive history also drifts off the manifold it was trained on -- and nothing
+    downstream checks, because the block is the right WIDTH either way.
+    """
+    from robot_rl.flow_matching.normalizer import Normalizer
+
+    m = small_planner()
+    d = m.cfg.tokenizer_cfg.node_dim
+    norm = Normalizer(torch.zeros(d), torch.ones(d), torch.ones(d, dtype=torch.bool))
+    tokens = torch.randint(0, m.vocab_size, (4, m.num_tokens))
+    raw = m.decode(tokens, norm, project_rotations=False)
+    fixed = m.decode(tokens, norm)
+    assert fixed.shape == raw.shape
+
+    # base_pose is first in the packing, so its rotation half is columns 3:9.
+    def gram_error(w):
+        """Departure from orthonormality of the two rot6d columns."""
+        a, b = w[..., 3:6], w[..., 6:9]
+        return max(float((a.norm(dim=-1) - 1).abs().max()),
+                   float((b.norm(dim=-1) - 1).abs().max()),
+                   float((a * b).sum(-1).abs().max()))
+
+    assert gram_error(raw) > 1e-3, "untrained decode should be off the manifold to begin with"
+    assert gram_error(fixed) < 1e-5, "the projection must put it back on"
+    # Everything OUTSIDE the rotation block is untouched -- the projection is not a filter.
+    assert torch.equal(raw[..., :3], fixed[..., :3])
+    assert torch.equal(raw[..., 9:], fixed[..., 9:])

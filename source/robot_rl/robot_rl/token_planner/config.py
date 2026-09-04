@@ -304,6 +304,22 @@ class PlannerConfig:
         return TokenizerConfig.from_dict(self.tokenizer)
 
     @property
+    def num_joints_for_layout(self) -> int:
+        """Robot joint count, from the tokenizer's recorded layout.
+
+        The node packing is ``base_pose(9) | base_vel(6) | joint_pos(nj) | ...``, so slicing
+        the rotation block out of a decoded window needs ``nj`` and the end-effector frame
+        count. Both are properties of the DATA, and the tokenizer's config is where they were
+        resolved and written down -- taking them from anywhere else would be a second answer.
+        """
+        return int(self.tokenizer_cfg.num_joints)
+
+    @property
+    def num_ee_frames_for_layout(self) -> int:
+        """End-effector frame count, from the tokenizer's recorded layout."""
+        return int(self.tokenizer_cfg.num_ee_frames)
+
+    @property
     def num_tokens(self) -> int:
         """Tokens per plan ``N`` -- the number of autoregressive steps."""
         return self.tokenizer_cfg.num_tokens
