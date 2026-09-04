@@ -129,6 +129,26 @@ class TokenPlannerContext:
         return int(self.target_num_extra_frames)
 
 
+def generator_kind_of(checkpoint: str) -> str:
+    """WHICH KIND of generator a checkpoint file is, read from the artifact itself.
+
+    A planner checkpoint is identified by carrying a non-empty ``config.tokenizer``: a token
+    id is meaningless without the tokenizer that produced it, so every planner has one and no
+    flow checkpoint does. Reading the FILE rather than trusting a config field is what keeps
+    the two apart everywhere a caller passes only a path -- which is every programmatic
+    caller in the repo.
+
+    Args:
+        checkpoint: Path to a generator checkpoint.
+
+    Returns:
+        ``"token_planner"`` or ``"flow_matching"``.
+    """
+    blob = torch.load(checkpoint, map_location="meta", weights_only=False)
+    return ("token_planner" if (blob.get("config") or {}).get("tokenizer")
+            else "flow_matching")
+
+
 def _meta_from_recording(path: str) -> dict:
     """The recording contract, read from an ``.h5``'s ATTRS -- no array data.
 

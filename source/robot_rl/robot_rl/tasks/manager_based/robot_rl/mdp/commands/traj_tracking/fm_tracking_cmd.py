@@ -123,14 +123,12 @@ def _generator_kind_of(checkpoint: str, declared: str) -> str:
         ValueError: On an unknown declared value, or when the declaration contradicts the
             file -- which means one of the two is about a different artifact.
     """
-    import torch as _torch  # noqa: PLC0415
+    from robot_rl.token_planner.online import generator_kind_of  # noqa: PLC0415
 
     if declared not in ("flow_matching", "token_planner"):
         raise ValueError(
             f"generator_kind must be 'flow_matching' or 'token_planner', got {declared!r}.")
-    blob = _torch.load(checkpoint, map_location="meta", weights_only=False)
-    actual = ("token_planner" if (blob.get("config") or {}).get("tokenizer")
-              else "flow_matching")
+    actual = generator_kind_of(checkpoint)
     if declared != actual:
         # Not silently preferred either way: a disagreement means the config and the path
         # were last edited about different runs, and guessing which is stale is how the

@@ -50,6 +50,13 @@ if _FM_SCRIPT_DIR not in sys.path:
     sys.path.insert(0, _FM_SCRIPT_DIR)
 from export_tracker_onnx import export_tracker_onnx  # isort: skip
 from export_fm_onnx import export_fm_onnx  # isort: skip
+# The token planner's exporter, alongside the FM's, so play.py can write either generator's
+# deploy artifact. Same derivation as _FM_SCRIPT_DIR immediately above.
+_TP_SCRIPT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                              os.pardir, "token_planner"))
+if _TP_SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _TP_SCRIPT_DIR)
+from export_planner_onnx import export as export_planner_onnx  # isort: skip
 # export_fm_onnx already puts transfer/ on the path (it shares the artifact NAMING rule with
 # the off-sim consumers that resolve these files); import from there rather than restate it.
 from deploy.artifacts import fm_artifact_name  # isort: skip
@@ -735,8 +742,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # deploy.artifacts.resolve_fm_onnx is how the runners find them again.
                 fm_out = os.path.join(export_model_dir,
                                       fm_artifact_name(args_cli.fm_checkpoint))
-                export_fm_onnx(args_cli.fm_checkpoint, fm_out,
-                               allow_privileged_extero=args_cli.allow_privileged_extero)
+                # WHICH exporter, read off the artifact. The two write the same graph
+                # signature and the same metadata key, so everything downstream is identical
+                # -- but a planner checkpoint through the flow loader dies on a config field
+                # it does not have, naming something unrelated.
+                from robot_rl.token_planner.online import (  # noqa: PLC0415
+                    generator_kind_of,
+                )
+
+                if generator_kind_of(args_cli.fm_checkpoint) == "token_planner":
+                    export_planner_onnx(args_cli.fm_checkpoint, fm_out)
+                else:
+                    export_fm_onnx(args_cli.fm_checkpoint, fm_out,
+                                   allow_privileged_extero=args_cli.allow_privileged_extero)
                 print(f"[INFO] wrote {fm_out}")
             else:
                 print("[INFO] no --fm_checkpoint, so no generator exported (tracker only).")
