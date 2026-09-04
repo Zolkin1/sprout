@@ -143,6 +143,25 @@ def test_goal_geometry_counts_to_the_deadline_the_episode_is_actually_cut_on() -
     assert params["step_scale"] * horizon == pytest.approx(1.0)
 
 
+def test_every_critic_channel_is_scaled_to_order_one() -> None:
+    """The critic group is un-normalized, so a raw metre channel is a conditioning defect.
+
+    MEASURED over 60 agent steps at 32 envs: with the offsets raw, `goal_geometry` reached
+    -14.1 m and had a std of 2.105, against <= 0.93 for every other term in the group. It was
+    the only outlier -- `window_residual`, which is 60% of the group, sits at std 0.277.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_adjuster_env_cfg as cfg
+
+    params = cfg.G1AdjusterObservationsCfg.CriticCfg().goal_geometry.params
+    scale = params["offset_scale"]
+    assert len(scale) == 3 and all(s > 0 for s in scale)
+    # 14 m downrange, and the goal's own fitted half-width / height tolerance, must all land
+    # near 1 rather than near 10.
+    assert 14.0 * scale[0] < 2.0, "downrange still reaches an order of magnitude above its peers"
+    assert 1.5 * scale[1] == pytest.approx(1.0), "lateral should read 1.0 at the goal half-width"
+    assert 0.6 * scale[2] == pytest.approx(1.0), "height should read 1.0 at the tolerance"
+
+
 def test_the_wrapper_leaves_max_episode_length_in_control_steps() -> None:
     """Its one rsl-rl reader seeds a buffer this env keeps in CONTROL steps.
 

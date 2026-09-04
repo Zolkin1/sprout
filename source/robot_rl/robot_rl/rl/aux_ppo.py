@@ -8,11 +8,17 @@
 rsl-rl's :class:`~rsl_rl.algorithms.PPO` assembles its total loss inline in
 :meth:`~rsl_rl.algorithms.PPO.update` and offers no hook for extra terms, so
 :meth:`AuxPPO.update` below is a **verbatim copy of rsl-rl 5.0.1's**
-``rsl_rl/algorithms/ppo.py`` lines 211-416 with exactly two additions, both marked
+``rsl_rl/algorithms/ppo.py`` lines 211-416 with exactly four changes, all marked
 ``# [robot_rl]``:
 
 1. the reconstruction term added into ``loss`` right after the PPO loss is assembled;
-2. its running mean, reported as ``loss_dict["reference_recon"]``.
+2. its running mean, reported as ``loss_dict["reference_recon"]``;
+3. the KL the learning-rate controller reads goes through :meth:`_kl_for_lr_control`;
+4. the surrogate goes through :meth:`_surrogate_loss`.
+
+The last two are EXTRACTIONS, not edits: each default body is the upstream expression
+verbatim, so stock behaviour is unchanged and a subclass can re-factorize the PPO ratio
+without a second copy of this method existing. See :class:`~robot_rl.rl.chunk_ppo.ChunkPPO`.
 
 Copying rather than restructuring is deliberate: with
 ``reference_reconstruction_coeff = 0`` (the default) the arithmetic is identical to stock
@@ -108,6 +114,44 @@ class AuxPPO(PPO):
         """Whether the auxiliary reconstruction term is active this run."""
         return self.reference_reconstruction_coeff > 0.0
 
+    def _kl_for_lr_control(self, batch, distribution_params) -> torch.Tensor:
+        """Mean KL(old || new) that the adaptive learning-rate controller reads.
+
+        Extracted as a hook rather than left inline so a policy whose action is a CHUNK can
+        report a PER-STEP KL instead of one summed over every dimension of the chunk. This
+        default is exactly rsl-rl 5.0.1's expression.
+
+        Args:
+            batch: The minibatch, carrying ``old_distribution_params``.
+            distribution_params: The current distribution's parameters.
+
+        Returns:
+            Scalar mean KL.
+        """
+        kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)
+        return torch.mean(kl)
+
+    def _surrogate_loss(self, batch, actions_log_prob: torch.Tensor) -> torch.Tensor:
+        """The clipped PPO surrogate. This default is exactly rsl-rl 5.0.1's expression.
+
+        A hook because the ratio's FACTORIZATION is a policy-structure choice: for a chunked
+        action the joint ratio is an exponential of a sum over thousands of dimensions, whose
+        spread grows with that count while ``clip_param`` does not.
+
+        Args:
+            batch: The minibatch.
+            actions_log_prob: Log-probability of the stored actions under the current policy.
+
+        Returns:
+            Scalar surrogate loss.
+        """
+        ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))
+        surrogate = -torch.squeeze(batch.advantages) * ratio
+        surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(
+            ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
+        )
+        return torch.max(surrogate, surrogate_clipped).mean()
+
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
         mean_value_loss = 0
@@ -174,8 +218,8 @@ class AuxPPO(PPO):
             if (self.desired_kl is not None and self.schedule == "adaptive"
                     and not self._in_critic_warmup):
                 with torch.inference_mode():
-                    kl = self.actor.get_kl_divergence(batch.old_distribution_params, distribution_params)  # type: ignore
-                    kl_mean = torch.mean(kl)
+                    # [robot_rl] via a hook. The default IS the upstream expression.
+                    kl_mean = self._kl_for_lr_control(batch, distribution_params)
 
                     # Reduce the KL divergence across all GPUs
                     if self.is_multi_gpu:
@@ -200,12 +244,8 @@ class AuxPPO(PPO):
                         param_group["lr"] = self.learning_rate
 
             # Surrogate loss
-            ratio = torch.exp(actions_log_prob - torch.squeeze(batch.old_actions_log_prob))  # type: ignore
-            surrogate = -torch.squeeze(batch.advantages) * ratio  # type: ignore
-            surrogate_clipped = -torch.squeeze(batch.advantages) * torch.clamp(  # type: ignore
-                ratio, 1.0 - self.clip_param, 1.0 + self.clip_param
-            )
-            surrogate_loss = torch.max(surrogate, surrogate_clipped).mean()
+            # [robot_rl] via a hook. The default IS the upstream four lines.
+            surrogate_loss = self._surrogate_loss(batch, actions_log_prob)
 
             # Value function loss
             if self.use_clipped_value_loss:

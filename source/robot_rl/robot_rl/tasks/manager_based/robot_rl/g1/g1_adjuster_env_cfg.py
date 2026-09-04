@@ -78,6 +78,18 @@ from .g1_tracker_env_cfg import G1FmTrackerCommandsCfg
 CONTROL_DT: float = 0.02
 """The tracker's control period. Only used to express a step count as a fraction."""
 
+GOAL_OFFSET_SCALE: tuple[float, float, float] = (1.0 / 10.0, 1.0 / 1.5, 1.0 / 0.6)
+"""Reciprocals of a characteristic (downrange, lateral, height) size, in metres.
+
+The critic group is deliberately un-normalized, and every term in it is O(1) by construction
+-- except this one was not. Measured over 60 agent steps at 32 envs: downrange reached 14.1 m,
+giving `goal_geometry` a std of 2.105 against <= 0.93 for every other term. The three numbers
+are the tile's downrange extent, the fitted goal HALF-WIDTH and its height TOLERANCE, so 1.0
+reads as "about one goal-region away" -- the scale `mdp.in_goal` thresholds on. Declared
+rather than fitted, like the extero contract normalization, so it means the same thing in
+every run.
+"""
+
 GOAL_SLACK_S: float = 3.0
 
 #: Episode budget in seconds. The longest clip's last usable step is 948 control steps; plus
@@ -169,7 +181,8 @@ class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
         goal_geometry: ObsTerm = ObsTerm(
             func=mdp.goal_geometry,
             params={"command_name": "traj_ref", "slack_s": GOAL_SLACK_S,
-                    "step_scale": 1.0 / (EPISODE_LENGTH_S / CONTROL_DT)},
+                    "step_scale": 1.0 / (EPISODE_LENGTH_S / CONTROL_DT),
+                    "offset_scale": GOAL_OFFSET_SCALE},
         )
 
         def __post_init__(self) -> None:

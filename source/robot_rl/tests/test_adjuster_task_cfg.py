@@ -51,34 +51,44 @@ def _terms(group) -> list[str]:
 # ----------------------------------------------------------------------------------
 # The two invisible run-killers
 # ----------------------------------------------------------------------------------
-def test_entropy_coef_is_rescaled_per_action_dimension() -> None:
-    """Left at the teacher's value the entropy bonus swamps the surrogate and sigma diverges."""
-    teacher = PPORunnerCfg().algorithm.entropy_coef
-    adjuster = AdjusterPPORunnerCfg().algorithm.entropy_coef
+def test_the_ppo_constants_are_stock_because_the_ratio_is_per_step() -> None:
+    """The 94x rescales are REVERTED, and that is only legal alongside a per-step ratio.
+
+    These two constants bound statistics that rsl-rl reduces over the action dimension. With
+    the JOINT ratio -- ``exp`` of a sum over all 2728 dims -- they had to be rescaled by the
+    dimension ratio, and even then the clip band did not follow and became the real trust
+    region. ``ChunkPPO`` instead factors the ratio along the chunk's time axis into 62
+    ratios of 44 dims each, so the statistics are per-STEP and the stock values are correct
+    again. If the algorithm ever reverts to the joint ratio, these must be rescaled or the
+    run dies silently -- an inflated action std, or a learning rate pinned to its 1e-5 floor.
+    """
+    alg = AdjusterPPORunnerCfg().algorithm
+    assert alg.class_name.endswith("ChunkPPO"), (
+        "the stock constants below are only valid under the per-step ratio; this cfg no "
+        "longer selects ChunkPPO"
+    )
+    teacher = PPORunnerCfg().algorithm
+    assert alg.desired_kl == teacher.desired_kl
+    assert alg.clip_param == teacher.clip_param
+    # NOT the teacher's literal value, and not zero. The entropy gradient per log_std is
+    # `entropy_coef` regardless of dimension count, while the per-step mean divides the
+    # surrogate's by T -- so the teacher's 0.008 would be 62x too strong, and 0.0 leaves
+    # nothing opposing a std collapse. 1.6e-4 reproduces the teacher's measured balance.
+    assert 0.0 < alg.entropy_coef < teacher.entropy_coef
+    assert alg.entropy_coef * 62 == pytest.approx(teacher.entropy_coef, rel=0.3), (
+        f"entropy_coef {alg.entropy_coef:.2e} no longer matches the tracker's balance under "
+        "the per-step ratio (expected ~teacher/T)"
+    )
+
     cfg = G1AdjusterEnvCfg()
     del cfg  # constructed only to prove the module imports cleanly beside the agent cfg
 
-    # Per-dimension, the two should be within a small factor of each other. 4x of slack, so a
-    # deliberate retune stays legal and a forgotten rescale (94x) does not.
-    ratio = (adjuster * 2728) / (teacher * TEACHER_ACTION_DIM)
-    assert 0.25 <= ratio <= 4.0, (
-        f"entropy_coef is {adjuster:.3e}; per action dimension that is {ratio:.1f}x the "
-        f"teacher's {teacher}. rsl-rl SUMS entropy over the action dimension, so at ~94x the "
-        "teacher's width the bonus dwarfs the surrogate loss and the action std runs away."
-    )
 
-
-def test_desired_kl_is_rescaled_per_action_dimension() -> None:
-    """Left at the teacher's value the LR collapses to rsl-rl's hardcoded floor, silently."""
-    teacher = PPORunnerCfg().algorithm.desired_kl
-    adjuster = AdjusterPPORunnerCfg().algorithm.desired_kl
-    ratio = (adjuster / 2728) / (teacher / TEACHER_ACTION_DIM)
-    assert 0.25 <= ratio <= 4.0, (
-        f"desired_kl is {adjuster}; per action dimension that is {ratio:.2f}x the teacher's "
-        f"{teacher}. rsl-rl compares mean(kl) -- summed over dimensions -- against this, so "
-        "an unscaled value divides the learning rate down to its 1e-5 floor and the policy "
-        "never moves."
-    )
+def test_the_chunk_layout_matches_the_action_width() -> None:
+    """A wrong (T, D) split mixes channels across nodes while every shape still checks out."""
+    alg = AdjusterPPORunnerCfg().algorithm
+    # Left as None on purpose: read off the actor, so the two cannot drift apart.
+    assert alg.chunk_steps is None and alg.chunk_dim is None
 
 
 def test_gamma_and_the_minibatch_count_are_inherited_on_purpose() -> None:

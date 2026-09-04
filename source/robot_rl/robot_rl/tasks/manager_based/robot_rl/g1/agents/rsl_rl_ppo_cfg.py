@@ -232,6 +232,31 @@ _TEACHER_ACTION_DIM = 29
 
 
 @configclass
+class ChunkPpoAlgorithmCfg(AuxPpoAlgorithmCfg):
+    """:class:`AuxPpoAlgorithmCfg` with the importance ratio factored along the chunk.
+
+    See :class:`robot_rl.rl.chunk_ppo.ChunkPPO`. ``chunk_steps`` / ``chunk_dim`` default to
+    the actor's own ``(num_nodes, node_dim)``, and a mismatch against the policy's output
+    width is refused rather than reshaped.
+    """
+
+    class_name: str = "robot_rl.rl.chunk_ppo:ChunkPPO"
+
+    chunk_steps: int | None = None
+    """``T``, look-ahead nodes per chunk. ``None`` reads it off the actor."""
+
+    chunk_dim: int | None = None
+    """``D``, channels per node. ``None`` reads it off the actor."""
+
+    ratio_mode: str = "per_step"
+    """``"per_step"`` (T ratios of D dims) or ``"gspo"`` (one geometric-mean ratio).
+
+    ``gspo`` needs a much SMALLER ``clip_param``, not a larger one -- its ``1/N``
+    normalization divides the log-ratio spread by ``N`` rather than by ``sqrt(N)``.
+    """
+
+
+@configclass
 class AdjusterModelCfg(RslRlMLPModelCfg):
     """The residual actor over the generator's frozen encoder.
 
@@ -341,27 +366,37 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
         activation="elu",
         obs_normalization=False,
     )
-    algorithm = AuxPpoAlgorithmCfg(**{
+    algorithm = ChunkPpoAlgorithmCfg(**{
         **_PPO_KWARGS,
-        "entropy_coef": _PPO_KWARGS["entropy_coef"] * _TEACHER_ACTION_DIM / _ADJUSTER_ACTION_DIM,
-        "desired_kl": _PPO_KWARGS["desired_kl"] * _ADJUSTER_ACTION_DIM / _TEACHER_ACTION_DIM,
-        # THE THIRD action-dim-summed quantity, and the one that is easy to miss because it is
-        # not summed by name. `log_prob` is summed over the action dimension, so PPO's ratio is
-        # `exp` of a 2728-term sum and its spread grows as sqrt(94) ~ 9.7x -- while a clip band
-        # of 0.2 did not move. Measured at the rescaled KL target: only ~10% of samples fall
-        # inside the band and ~45% land on a boundary contributing NO gradient, so the clip,
-        # not the KL, silently became the binding trust region. Scaling the band by the same
-        # sqrt(94) restores the teacher's regime: log(1 + 0.2) * sqrt(94) ~ 1.77, i.e. ~4.8.
+        # ALL THREE 94x rescales are reverted, because the statistics they bound are now
+        # per-STEP rather than per-chunk. `ChunkPPO` factors the importance ratio along the
+        # chunk's time axis -- one 44-dim Gaussian ratio per look-ahead node, each clipped
+        # separately under one shared chunk advantage -- which is the regime these defaults
+        # were tuned for. See robot_rl/rl/chunk_ppo.py for the derivation and for why
+        # neither a wider clip band nor a smaller desired_kl fixes the joint ratio.
+        "clip_param": 0.2,
+        "desired_kl": 0.01,
+        # MEASURED against the tracker's balance, not reverted and not zeroed.
         #
-        # This makes the adaptive KL controller the trust region, which is what the two
-        # rescales above already intended. It is a real change in algorithm character --
-        # clipping is effectively off -- and it is deliberate rather than incidental.
-        # TODO(adjuster-ppo-trust-region): all three of these (entropy_coef, desired_kl,
-        # clip_param) are rescales of teacher values, not measured ones. Once a run trains,
-        # come back and try putting them back toward the normal values -- the 94x argument is
-        # about how rsl-rl REDUCES these statistics, not evidence that the policy needs a
-        # 94x-wider trust region to learn.
-        "clip_param": 4.8,
+        # The entropy term's gradient on ANY SINGLE log_std is exactly `entropy_coef`,
+        # independent of the action's dimension count -- summing entropy over dimensions does
+        # not change one dimension's own gradient. That is why the original 94x rescale was
+        # the wrong correction. What DID change is the surrogate: the per-step mean divides
+        # its gradient on log_std by exactly T, measured 1.46e-02 (teacher, joint) against
+        # 2.86e-04 (adjuster, per-step) = 62.0x = T.
+        #
+        # So matching the teacher's ratio of entropy pressure to surrogate pressure (0.55)
+        # gives 0.008 * 2.86e-04 / 1.46e-02 = 1.6e-4. The two endpoints are both wrong in a
+        # known way: 0.008 is 62x too strong here (this repo's documented "entropy goes up
+        # during fine-tuning" failure), and 0.0 removes the only force opposing std COLLAPSE
+        # -- with a state-independent log-std and nothing pushing back, PPO shrinks it
+        # whenever lower-variance actions score better, and nothing arrests that.
+        #
+        # TODO(adjuster-entropy-coef): this reproduces the balance of a configuration known to
+        # have trained (the tracker), which is a defensible prior and not a measurement of
+        # what THIS policy needs. `Policy/mean_noise_std` shows a collapse or a runaway within
+        # a few hundred iterations -- come back and tune against it.
+        "entropy_coef": 1.6e-4,
         # num_mini_batches and gamma stay at the teacher's values -- see the TODOs above.
         "critic_warmup_iterations": 100,
     })

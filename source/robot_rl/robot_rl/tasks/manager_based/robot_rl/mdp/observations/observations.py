@@ -1017,7 +1017,8 @@ def window_residual(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> t
 
 
 def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref",
-                  slack_s: float = 0.0, step_scale: float = 1.0) -> torch.Tensor:
+                  slack_s: float = 0.0, step_scale: float = 1.0,
+                  offset_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)) -> torch.Tensor:
     """Where the goal is and how long is left, ``[N, 4]``: downrange, lateral, height, steps.
 
     A CRITIC input, and what makes a bootstrapped truncation well posed. On this task reaching
@@ -1049,6 +1050,12 @@ def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref",
         slack_s: Grace period past the clip's last usable step, in seconds. Must equal the
             ``clip_end_reached`` term's ``slack_s``.
         step_scale: Multiplier on the remaining-steps channel.
+        offset_scale: Per-channel multiplier on (downrange, lateral, height). MEASURED as
+            necessary: raw, downrange reaches ~14 m and gives this term a std of 2.1 where
+            every other term in the un-normalized critic group sits at <= 0.93. Expressed as
+            reciprocals of a characteristic size -- the tile's downrange extent, the goal
+            half-width, the height tolerance -- 1.0 then reads as "about one goal-region
+            away", which is the scale `in_goal` actually thresholds on.
 
     Returns:
         ``[num_envs, 4]``. Steps remaining is clamped at 0, is in units of control steps
@@ -1069,4 +1076,6 @@ def goal_geometry(env: ManagerBasedRLEnv, command_name: str = "traj_ref",
     # critic has to predict.
     time_out_left = int(env.max_episode_length) - env.episode_length_buf.to(root_pos_w.device)
     remaining = torch.minimum(deadline - cursor, time_out_left).clamp_min(0)
-    return torch.stack([down, lat, hz, remaining.to(down.dtype) * float(step_scale)], dim=-1)
+    sc = torch.as_tensor(offset_scale, device=down.device, dtype=down.dtype)
+    return torch.stack([down * sc[0], lat * sc[1], hz * sc[2],
+                        remaining.to(down.dtype) * float(step_scale)], dim=-1)
