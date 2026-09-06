@@ -214,6 +214,17 @@ def last_usable_step(cmd) -> torch.Tensor:
     Returns:
         ``[N]`` long, on ``cmd.clip_id``'s device, never below 0.
     """
+    if not cmd.has_clips:
+        # No clip, so no clip length. The quantity this stands for is "the last step of this
+        # episode that could still serve a full look-ahead window", and on a clip-free task the
+        # episode is bounded by the time-out horizon rather than by a motion -- so that is what
+        # it resolves to. Constant across envs, which is correct: every section shares it.
+        horizon = int(getattr(cmd._env, "max_episode_length", 0))
+        step = torch.full_like(cmd.clip_id, max(horizon - 1, 0))
+        offsets = cmd.obs_window_offsets()
+        if offsets is not None and offsets.numel() > 0:
+            step = step - int(offsets.max().item())
+        return step.clamp_min(0).long()
     clip_len = cmd.manager.clip_len
     step = clip_len[cmd.clip_id.to(clip_len.device)].to(cmd.clip_id.device) - 1
     offsets = cmd.obs_window_offsets()
@@ -222,8 +233,73 @@ def last_usable_step(cmd) -> torch.Tensor:
     return step.clamp_min(0).long()
 
 
+def freeform_goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
+    """The goal anchor for a CLIP-FREE section, read off the manifest's route block.
+
+    :func:`goal_anchor_world` recovers the anchor from the placed clip's own terminal pose, and
+    on a manifest-only library there is no clip to ask -- every gather refuses by name
+    (``MotionClipManager._require_clips``).  A free-form section declares its goal instead, in
+    tile-local coordinates, and this is the inverse of the lift
+    ``mdp.terminations.freeform_goal_reached`` applies to the robot: local ``(goal_x, goal_y,
+    goal_z)`` rotated by the tile's ``frame_yaw`` and translated to its corner.
+
+    **The two must agree, and they do by construction**: both read the SAME route row through
+    :func:`~.events.resets.freeform_route`, so the anchor the outcome is folded against and
+    the line the episode terminates on cannot drift apart.  The termination tests a half-plane
+    plus a lateral band while the fold measures a signed displacement from this point; that is
+    the same geometry read two ways, not two goals.
+
+    Args:
+        cmd: A :class:`MotionSequenceCommand` (or subclass) whose env carries a route-bearing
+            terrain.
+
+    Returns:
+        ``(goal_pos_w [N, 3], frame_yaw [N])`` on the env device.
+
+    Raises:
+        TypeError: If the terrain carries no ``terrain_route`` -- a clip library, or a
+            free-form library built before the route block existed.
+    """
+    from .events.resets import freeform_route  # noqa: PLC0415
+
+    dev = cmd._mask_frame_yaw.device
+    n = cmd._mask_frame_yaw.shape[0]
+    route = freeform_route(cmd._env.scene.terrain, torch.arange(n, device=dev))
+    yaw = route["frame_yaw"]
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+    gx, gy = route["goal_x"], route["goal_y"]
+    # `goal_z` rides beyond FREEFORM_ROUTE_FIELDS, so read it defensively: a library written
+    # before it existed still has a usable x/y goal, and the height term is the one the
+    # termination does not test either.
+    gz = route.get("goal_z")
+    corner = route["corner"]
+    # **The anchor is a PELVIS height, not a ground height**, because that is what the clip
+    # anchor is -- `goal_anchor_world` returns the clip's terminal BASE pose -- and
+    # `height_tol_m` is applied to `|root_z - goal_z|`. A route's `goal_z` is the walkable
+    # SURFACE there, so using it raw would put a standing robot ~0.79 m outside a 0.5 m
+    # tolerance at every goal: `in_goal` could never fire while `freeform_goal_reached` still
+    # terminated, and the recorder would label every arrival a failure.
+    # The standing height is read off the asset's own `default_root_pose`, which is the same
+    # quantity `reset_on_freeform_section` adds to `start_z` when it places the spawn -- so
+    # the two ends of the episode are measured against one number rather than two.
+    import warp as wp  # noqa: PLC0415
+
+    asset = cmd._env.scene["robot"]
+    nominal_z = wp.to_torch(asset.data.default_root_pose)[:, 2].to(dev)
+    pos = torch.stack((corner[:, 0] + cos_y * gx - sin_y * gy,
+                       corner[:, 1] + sin_y * gx + cos_y * gy,
+                       corner[:, 2] + (gz if gz is not None else torch.zeros_like(gx))
+                       + nominal_z), dim=-1)
+    return pos, yaw.to(pos.device)
+
+
 def goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
     """Where the clip itself finishes, in the world, and the terrain heading to measure in.
+
+    **Dispatches on whether there is a clip at all.**  A manifest-only library refuses every
+    gather, so a clip-free run reads its declared route goal instead
+    (:func:`freeform_goal_anchor_world`).  Branching here rather than at each of the four call
+    sites keeps "where is the goal" one question with one answer.
 
     Uses the GLOBAL placement -- ``_reset_world_pos`` / ``_reset_world_yaw``, the reset-time
     terrain-cell anchor -- exactly as :func:`base_pose_error_termination` does, and for the
@@ -239,6 +315,8 @@ def goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
     """
     from isaaclab.utils.math import quat_from_angle_axis
 
+    if not cmd.has_clips:
+        return freeform_goal_anchor_world(cmd)
     yaw = cmd._reset_world_yaw
     world_quat = quat_from_angle_axis(yaw, cmd._world_z.expand(yaw.shape[0], 3))
     state = cmd.reference_world_state_at(
@@ -282,6 +360,17 @@ def goal_travel_m(cmd) -> torch.Tensor:
     """
     from isaaclab.utils.math import quat_from_angle_axis
 
+    if not cmd.has_clips:
+        # The clip-free answer is the SECTION's own downrange run: spawn to goal line, both
+        # declared in the route block. There is no motion to ask how far it travels, and the
+        # quantity this feeds -- the degenerate-goal / `spawned_in_goal` check -- is asking
+        # whether the goal sits ahead of the spawn at all, which the route answers directly.
+        from .events.resets import freeform_route  # noqa: PLC0415
+
+        dev = cmd._mask_frame_yaw.device
+        route = freeform_route(cmd._env.scene.terrain,
+                               torch.arange(cmd._mask_frame_yaw.shape[0], device=dev))
+        return route["goal_x"] - route["start_x"]
     goal, yaw = goal_anchor_world(cmd)
     world_quat = quat_from_angle_axis(cmd._reset_world_yaw,
                                       cmd._world_z.expand(cmd._reset_world_yaw.shape[0], 3))

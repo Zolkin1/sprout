@@ -221,11 +221,20 @@ def _apply_overrides(env_cfg) -> None:
         cmd.fm_checkpoint = args_cli.fm_checkpoint
     if not getattr(cmd, "fm_checkpoint", ""):
         raise ValueError("a rollout needs --fm_checkpoint; see the flag's help.")
-    fallen = getattr(getattr(env_cfg, "terminations", None), "base_fallen", None)
+    # The height-fall term is spelled differently on the two task families and is the SAME
+    # test either way -- `mdp.base_height_below_termination` on absolute world z, taking
+    # `min_height`. The tracker calls it `base_fallen`; the fine-tune tasks call it
+    # `base_height` (`G1FinetuneTerminationCfg`, whose other failure term is a
+    # reference-relative tilt). Accepting both by NAME rather than renaming either: the names
+    # are load-bearing in their own configs and downstream tables.
+    terms = getattr(env_cfg, "terminations", None)
+    fallen = next((t for t in (getattr(terms, "base_fallen", None),
+                               getattr(terms, "base_height", None)) if t is not None), None)
     if fallen is None:
         raise ValueError(
-            "this task has no `base_fallen` termination, which on the tracker is the only "
-            "FAILURE term and therefore the only thing a reward can read as a fall.")
+            "this task has no `base_fallen` (tracker) or `base_height` (fine-tune) "
+            "termination, which is the only world-z FAILURE term and therefore the only "
+            "thing a reward can read as a fall.")
     fallen.params["min_height"] = float(args_cli.min_height)
     if args_cli.clip is not None:
         cmd.path = args_cli.clip
@@ -237,16 +246,31 @@ def _apply_overrides(env_cfg) -> None:
     # "cfg:" on purpose. This runs before the generator's context is built, so it can only
     # echo what was just assigned -- which is not the value the sampler ends up reading.
     # `_assert_sampler_is_stochastic` prints the resolved truth, and measures it.
-    reset = getattr(getattr(env_cfg, "events", None), "reset_on_clip", None)
+    # A clip-free task spawns from the manifest's route block (`reset_on_section`) and has no
+    # clip PHASE at all, so there is no start step to pin -- and pinning one would be a
+    # parameter the term does not take. Refuse a non-default `--start_step` there rather than
+    # dropping it silently: it would read as having been applied.
+    events = getattr(env_cfg, "events", None)
+    reset = getattr(events, "reset_on_clip", None)
     if reset is None:
-        raise ValueError("this task has no `reset_on_clip` event to pin the start step on.")
-    reset.params["pin_start_step"] = (None if int(args_cli.start_step) < 0
-                                      else int(args_cli.start_step))
+        section = getattr(events, "reset_on_section", None)
+        if section is None:
+            raise ValueError(
+                "this task has neither a `reset_on_clip` event to pin the start step on nor "
+                "a `reset_on_section` one to spawn from a manifest route.")
+        if int(args_cli.start_step) > 0:
+            raise ValueError(
+                f"--start_step {args_cli.start_step} was given, but this task spawns from a "
+                "free-form section's route block and has no clip phase to pin. Drop the flag.")
+    else:
+        reset.params["pin_start_step"] = (None if int(args_cli.start_step) < 0
+                                          else int(args_cli.start_step))
     print(f"[rollout] cfg: reference_source=fm history_from={args_cli.history_from} "
           f"allow_history_source_mismatch={bool(args_cli.allow_history_source_mismatch)} "
           f"fm_zero_noise=False "
-          f"base_fallen.min_height={args_cli.min_height} "
-          f"pin_start_step={reset.params['pin_start_step']}")
+          f"fall_min_height={args_cli.min_height} "
+          + (f"pin_start_step={reset.params['pin_start_step']}" if reset is not None
+             else "spawn=free-form route (no clip phase to pin)"))
 
 
 def _assert_families_are_filtered(codes, names) -> None:
@@ -530,7 +554,18 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                  if _spec.is_bootstrap else f"  (from {args_cli.tracking_spec})"))
         accum.attach_tracking(_spec)
         table = ro.RolloutOutcomeTable(family_names=family_names)
-        term_cfg = u.event_manager.get_term_cfg("reset_on_clip")
+        # The reset term the episode tracker wraps, so it can refresh the goal anchor INSIDE
+        # the reset -- after the new episode has committed. A clip-free task spawns from the
+        # manifest's route block instead, and the term is named for what it does.
+        _reset_name = next(
+            (n for n in ("reset_on_clip", "reset_on_section")
+             if n in u.event_manager.active_terms.get("reset", [])), None)
+        if _reset_name is None:
+            raise ValueError(
+                "no reset term to hang the episode tracker on: expected `reset_on_clip` "
+                "(clip tasks) or `reset_on_section` (free-form). Without it the goal anchor "
+                "is never refreshed and every episode folds against its predecessor's goal.")
+        term_cfg = u.event_manager.get_term_cfg(_reset_name)
         tracker = ro.RolloutEpisodeTracker(term_cfg.func, env=u, accum=accum, table=table,
                                            family_codes=family_codes, goal_spec=spec)
         term_cfg.func = tracker

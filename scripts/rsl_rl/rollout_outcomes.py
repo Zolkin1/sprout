@@ -877,8 +877,16 @@ class RolloutEpisodeTracker:
         clip_ids = cmd.clip_id.detach().to("cpu").numpy().astype(np.int64)[ids_np]
         lib = cmd.manager.lib
         tid = getattr(lib, "terrain_id", None)
-        terrain = (tid.detach().to("cpu").numpy()[clip_ids].astype(np.int64)
-                   if tid is not None and tid.numel() else np.full(ids_np.size, -1))
+        if tid is not None and tid.numel():
+            terrain = tid.detach().to("cpu").numpy()[clip_ids].astype(np.int64)
+        else:
+            # A CLIP-FREE library has no per-clip tile table, but the env is still standing on
+            # a tile and the importer knows which. Without this the column is -1 on every row
+            # and the tile an episode ran on -- which on the free-form terrain IS its initial
+            # condition -- is unrecoverable from the table.
+            env_tid = getattr(getattr(env.scene, "terrain", None), "env_terrain_id", None)
+            terrain = (env_tid.detach().to("cpu").numpy()[ids_np].astype(np.int64)
+                       if env_tid is not None else np.full(ids_np.size, -1))
         fam = (self.family_codes.detach().to("cpu").numpy()[clip_ids]
                if self.family_codes is not None else np.zeros(ids_np.size))
 

@@ -445,6 +445,26 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
             clip=(-2.0, 2.0),
         )
 
+        #: The far camera's slot in the POLICY vector, declared and left OFF.
+        #:
+        #: Declared rather than deleted because a term's position in this class IS its position
+        #: in the observation vector, and every tracker checkpoint that exists was trained with
+        #: the far camera HERE -- between ``depth_near`` and ``reference_window`` (read off
+        #: ``2026-08-20_16-36-10_mode11_decor_plan_v1``'s exported ``observation_terms``).
+        #: Re-adding it in a ``__post_init__`` would APPEND it, past ``command_window``, and the
+        #: vector would be the right WIDTH with two blocks transposed -- a checkpoint that loads
+        #: clean and reads scrambled input, which is the failure mode this repo keeps paying for.
+        #:
+        #: ``None`` is the default because near-only is the decision for the next teacher
+        #: retrain; :func:`enable_policy_far_camera` turns it back on for running an EXISTING
+        #: two-camera checkpoint, which is every one on disk today.
+        #: NOTE the missing type annotation, and it is load-bearing: ``depth_near`` above is an
+        #: un-annotated class attribute, and ``configclass`` orders ANNOTATED fields ahead of
+        #: un-annotated ones. Written as ``depth_far: ObsTerm | None = None`` this slot lands
+        #: BEFORE ``depth_near`` -- measured, and the tracker then reads the far camera as the
+        #: near one: right width, transposed blocks, robot on the floor in a second.
+        depth_far = None
+
         def __post_init__(self):
             super().__post_init__()
             self.height_scan = None
@@ -641,6 +661,41 @@ _FM_PREFIX = "fm_"
 _POLICY_CAMERAS: tuple[tuple[str, _CameraSpec], ...] = (
     ("depth_camera_near", _NEAR),
 )
+
+def enable_policy_far_camera(cfg) -> None:
+    """Put the FAR camera back into the POLICY observation, in its historical slot.
+
+    The policy reads the near camera alone by decision (see :data:`_POLICY_CAMERAS`), taken
+    ahead of a teacher retrain that has not happened.  So every tracker checkpoint on disk was
+    trained on BOTH -- 3002 inputs against the 2222 a near-only task builds -- and cannot run
+    on a near-only task at all.  This restores the term for those runs.
+
+    **It fills the declared slot rather than adding one**, so the far block lands between
+    ``depth_near`` and ``reference_window`` exactly as the trained vector has it.
+
+    Call it BEFORE ``install_fm_depth_group``: the generator's group is built from the scene's
+    cameras and is unaffected either way, but the ordering of the two calls is what a reader
+    checks, so keep it the same everywhere.
+
+    Args:
+        cfg: A composed env cfg whose ``observations.policy`` carries the declared slot.
+
+    Raises:
+        AttributeError: If the policy group has no ``depth_far`` slot -- which would mean the
+            declaration was deleted and the ordering guarantee with it.
+    """
+    policy = cfg.observations.policy
+    if not hasattr(policy, "depth_far"):
+        raise AttributeError(
+            "observations.policy has no `depth_far` slot to fill. It is declared (as None) so "
+            "that enabling it preserves the trained term ORDER; adding it here instead would "
+            "append it past command_window and silently transpose the vector.")
+    policy.depth_far = ObsTerm(
+        func=mdp.depth_image,
+        params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), **_depth_obs_params(_FAR)},
+        clip=(-2.0, 2.0),
+    )
+
 
 #: Every depth camera the SCENE carries, in observation order -- the set the GENERATOR
 #: conditions on. What :func:`install_fm_depth_group` observes, mirrors and extends the DR

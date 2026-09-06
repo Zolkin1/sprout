@@ -60,6 +60,7 @@ from .clf_weights import WALKING_Q_weights, WALKING_R_weights
 from .g1_depth_env_cfg import (
     G1TeacherTerrainDepthEnvCfg,
     G1TeacherTerrainDepthEventsCfg,
+    enable_policy_far_camera,
     install_fm_depth_group,
 )
 from .g1_teacher_env_cfg import REPLAN_PERIOD_K
@@ -417,3 +418,31 @@ class G1FinetuneFreeformEnvCfg(G1FinetuneTerrainDepthEnvCfg):
         self.observations.critic.tracking_error_global.params = {
             "command_name": "traj_ref", "datum": "plan_anchor",
         }
+
+
+@configclass
+class G1Box2FinetuneEnvCfg(G1FinetuneFreeformEnvCfg):
+    """The free-form fine-tune, on the fixed TWO-BOX course, for an EXISTING tracker.
+
+    Everything comes from :class:`G1FinetuneFreeformEnvCfg` -- the manifest spawn, the steered
+    command with its standing hold, the section goal band, and the reward set (the CLF tracking
+    terms, the absolute-z fall and the tilt bound).  Pass ``--clip clips/box2_train.h5``; the
+    two-box tiles are ordinary free-form sections and every term reads them unchanged.
+
+    **What this adds is the FAR camera, back in the policy observation.**  The policy reads the
+    near camera alone by decision, taken ahead of a teacher retrain that has not happened -- so
+    every tracker checkpoint on disk expects 3002 inputs where a near-only task builds 2222,
+    and none of them can run the free-form task at all.  Recording the two-box set needs one of
+    those checkpoints (it is the pair the MuJoCo box2 sweep measured, which is what makes the
+    Isaac and MuJoCo numbers comparable), so the term goes back into its trained slot.
+
+    Retire this task, not the flag, once a near-only teacher exists: at that point the plain
+    free-form task takes the two-box library directly and this subclass is the stale thing.
+    """
+
+    def __post_init__(self):
+        """Compose the free-form fine-tune, then restore the policy's far camera."""
+        super().__post_init__()
+        # AFTER super(): the ancestors build the observation groups, and this fills a slot
+        # they declared. Before it, there is nothing to fill.
+        enable_policy_far_camera(self)

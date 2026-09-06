@@ -188,6 +188,25 @@ if not _registered:
         },
     )
 
+    # The same fine-tune pinned to the FIXED two-box course, and with the far camera back in
+    # the POLICY observation so an existing (two-camera) tracker checkpoint can run it. Takes
+    # `--clip clips/box2_train.h5` or `clips/box2_holdout.h5` from
+    # `scripts/rsl_rl/make_box2_terrain.py`. See `motion_gen.terrain.box2` for why this course.
+    ## =========================================
+    gym.register(
+        id="G1-box2-finetune",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": (
+                f"{__name__}.g1_finetune_env_cfg:G1Box2FinetuneEnvCfg"
+            ),
+            "rsl_rl_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_ppo_cfg:FinetunePPORunnerCfg"
+            ),
+        },
+    )
+
     gym.register(
         id="G1-teacher-clf-terrain-depth-play",
         entry_point="isaaclab.envs:ManagerBasedRLEnv",
