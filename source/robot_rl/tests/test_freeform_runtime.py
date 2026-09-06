@@ -435,3 +435,105 @@ def test_every_freeform_switch_is_off_by_default(monkeypatch):
     assert set(inspect.signature(term.clip_end_reached).parameters) == {
         "env", "command_name", "reserve_lookahead",
     }
+
+
+# ==============================================================================================
+# The clip-free GOAL ANCHOR.
+#
+# `goal_region.goal_anchor_world` recovers the anchor from the placed clip's terminal BASE pose.
+# A manifest-only library has no clip, so it dispatches to `freeform_goal_anchor_world`, which
+# reads the section's declared goal instead. The height half of that is a trap worth pinning:
+# `height_tol_m` is applied to |root_z - goal_z|, and a route's `goal_z` is the WALKABLE SURFACE
+# -- so an anchor placed there sits ~0.79 m under a standing robot, `in_goal` can never fire
+# while `freeform_goal_reached` still terminates, and every arrival records as a failure.
+# ==============================================================================================
+
+
+class _StubGoalCmd:
+    """``MotionSequenceCommand`` stand-in: no clips, one env handle, one yaw buffer."""
+
+    def __init__(self, env: _StubEnv, has_clips: bool = False, offsets=None) -> None:
+        """Hold what the two clip-free goal helpers actually read."""
+        n = env.num_envs
+        self._env = env
+        self.has_clips = has_clips
+        self._mask_frame_yaw = torch.zeros(n)
+        self.clip_id = torch.zeros(n, dtype=torch.long)
+        self._offsets = offsets
+
+    def obs_window_offsets(self):
+        """The tracker's reference-window offsets, or ``None``."""
+        return self._offsets
+
+
+def test_the_clip_free_goal_anchor_is_the_declared_goal_lifted_to_world(monkeypatch):
+    """corner + Rz(frame_yaw) @ (goal_x, goal_y, goal_z) + the nominal standing height."""
+    _plain_warp(monkeypatch)
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+    env, _asset = _env(n=3, corner=(10.0, -5.0, 0.0))
+    pos, yaw = goal_region.freeform_goal_anchor_world(_StubGoalCmd(env))
+    assert torch.allclose(yaw, torch.zeros(3))
+    # goal (7.0, 2.0) tile-local, corner (10, -5, 0), frame_yaw 0.
+    assert torch.allclose(pos[:, 0], torch.full((3,), 17.0))
+    assert torch.allclose(pos[:, 1], torch.full((3,), -3.0))
+    assert torch.allclose(pos[:, 2], torch.full((3,), _NOMINAL_BASE_Z))
+
+
+def test_the_goal_anchor_is_a_PELVIS_height_not_the_walkable_surface(monkeypatch):
+    """The regression that would make every arrival read as a failure.
+
+    A robot standing at the goal has its base a nominal standing height above the surface. If
+    the anchor were the surface, |root_z - goal_z| would be that whole height -- outside any
+    sane ``height_tol_m`` -- so ``in_goal`` would be unreachable while the termination fired.
+    """
+    _plain_warp(monkeypatch)
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+    env, _asset = _env(n=2)
+    pos, _ = goal_region.freeform_goal_anchor_world(_StubGoalCmd(env))
+    surface_z = _ROUTE["start_z"]                      # this section is flat: goal_z == 0.0
+    assert pos[0, 2] > surface_z + 0.5, (
+        "the anchor sits at the walkable surface; a standing robot is then ~0.79 m from it and "
+        "outside the 0.5 m height tolerance, so in_goal can never fire.")
+    standing_root_z = surface_z + _NOMINAL_BASE_Z
+    assert abs(standing_root_z - pos[0, 2].item()) < 0.5, (
+        "a robot standing at the goal must be INSIDE the default 0.5 m height tolerance.")
+
+
+def test_the_anchor_follows_a_rotated_tile_frame(monkeypatch):
+    """``frame_yaw`` rotates the declared goal, matching the lift the termination inverts."""
+    _plain_warp(monkeypatch)
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+    env, _asset = _env(n=1, frame_yaw=torch.pi / 2, corner=(0.0, 0.0, 0.0))
+    pos, yaw = goal_region.freeform_goal_anchor_world(_StubGoalCmd(env))
+    # (7, 2) rotated +90 deg about z -> (-2, 7).
+    assert torch.allclose(pos[0, :2], torch.tensor([-2.0, 7.0]), atol=1e-5)
+    assert torch.allclose(yaw, torch.full((1,), torch.pi / 2))
+
+
+def test_clip_free_goal_travel_is_the_sections_own_run(monkeypatch):
+    """``goal_travel_m`` answers from the route, not from a motion that does not exist."""
+    _plain_warp(monkeypatch)
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+    env, _asset = _env(n=3)
+    travel = goal_region.goal_travel_m(_StubGoalCmd(env))
+    assert torch.allclose(travel, torch.full((3,), _ROUTE["goal_x"] - _ROUTE["start_x"]))
+    assert (travel > 0).all(), "a positive travel is what keeps `spawned_in_goal` False"
+
+
+def test_clip_free_last_usable_step_is_the_horizon_less_the_lookahead(monkeypatch):
+    """No clip length to read, so the episode bound is the time-out horizon."""
+    _plain_warp(monkeypatch)
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+    env, _asset = _env(n=2)
+    env.max_episode_length = 1000
+    plain = goal_region.last_usable_step(_StubGoalCmd(env))
+    assert torch.equal(plain, torch.full((2,), 999, dtype=torch.long))
+    # With look-ahead offsets the last servable step moves back by the furthest one.
+    reserved = goal_region.last_usable_step(
+        _StubGoalCmd(env, offsets=torch.tensor([0, 12, 50])))
+    assert torch.equal(reserved, torch.full((2,), 949, dtype=torch.long))
