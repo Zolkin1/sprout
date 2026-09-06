@@ -94,6 +94,19 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--val_every", type=int, default=5, help="Validate every N epochs.")
     parser.add_argument("--ckpt_every", type=int, default=20, help="Checkpoint every N epochs.")
     parser.add_argument("--cosine", action="store_true", help="Use cosine LR annealing.")
+    parser.add_argument(
+        "--resume", type=str, default="",
+        help="CONTINUE a finished run from one of its ckpt_<N>.pt files (the LAST one, not "
+             "best.pt -- best is a snapshot from whichever epoch scored well and its "
+             "optimizer state belongs to that epoch). Restores weights, the Adam moments and "
+             "the EMA shadow, starts at the checkpoint's epoch + 1 and runs to "
+             "--num_epochs. Every config field that changes the model or the data is "
+             "compared, and so is the held-out split.")
+    parser.add_argument(
+        "--allow_unverified_resume", action="store_true",
+        help="Resume even when the source run's held-out split cannot be recovered. Only "
+             "correct when the data, seed, val_fraction and val_split_by all match, which is "
+             "what makes the split reproduce.")
     # Opt-OUT, matching the RL side (its agent cfgs ship `logger: wandb`). Every FM run is
     # worth comparing against the others, and a run you have to remember to instrument is
     # a run whose curve you do not have when you want it. TensorBoard is written either way.
@@ -794,6 +807,115 @@ def evaluate(model, loader, cfg, state_normalizer, num_joints, device, num_extra
     return out
 
 
+def resume_from(path: str, model, opt, ema, train_ds, cfg, data_sha256: str,
+                allow_unverified: bool) -> int:
+    """Restore a finished run's weights, optimizer and EMA, and return the next epoch.
+
+    Continuing a run is not the same as starting one from its weights, and the difference is
+    the optimizer: Adam's second moment takes hundreds of steps to rebuild, so a "resume"
+    that drops it spends the first stretch at an effectively different learning rate. The EMA
+    shadow matters for the same reason in reverse -- ``best.pt`` is selected on
+    ``val_ema/flow_mse``, so a restarted EMA makes the first epochs' selection metric a
+    average over a handful of steps rather than over the run.
+
+    .. admonition:: The SPLIT is verified, not assumed
+
+        A resume that silently trains on a different held-out set would put previously-val
+        clips into training and keep reporting a val number, and nothing about the shapes,
+        the counts or the loss curve would say so. The split here is a pure function of the
+        data, ``seed``, ``val_fraction`` and ``val_split_by`` -- so it reproduces, and this
+        checks that it did rather than trusting that it must have. Older checkpoints predate
+        ``val_split_ids``, so the source run's ``params/data.yaml`` is consulted as well.
+
+    Args:
+        path: A ``ckpt_<N>.pt`` from the run being continued. Use the LAST one, not
+            ``best.pt``: best is a snapshot from whichever epoch scored well, and its
+            optimizer state belongs to that epoch rather than to the end of the run.
+        model / opt / ema: The freshly-built objects to restore into.
+        train_ds: The rebuilt training split, for the verification.
+        cfg: This run's config, checked field-by-field against the checkpoint's.
+        data_sha256: The recordings' hashes as loaded, compared to the source run's.
+        allow_unverified: Proceed when the source run's split cannot be recovered.
+
+    Returns:
+        The epoch to start at (the checkpoint's + 1).
+
+    Raises:
+        SystemExit: On a config field that changes the data or the model, on a split
+            mismatch, or when the checkpoint is already past ``--num_epochs``.
+    """
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    old = ck["config"]
+    # Everything that changes what the model IS or what it sees. `num_epochs` is excluded on
+    # purpose -- extending it is the whole point -- and so are the logging knobs.
+    for field in ("future_len", "num_history_states", "history_source", "state_dim",
+                  "history_dim", "extero_source", "extero_channels", "extero_sensor_dim",
+                  "extero_sensor_count", "extero_encoder", "extero_clip", "reference_blocks",
+                  "d_model", "nhead", "num_layers", "dim_feedforward", "attention_mode",
+                  "cmd_dim", "cmd_stride", "seed", "val_fraction", "val_split_by",
+                  "skip_distractors", "skip_families", "depth_latency_probs"):
+        a, b = old.get(field), getattr(cfg, field, None)
+        if isinstance(a, (list, tuple)) or isinstance(b, (list, tuple)):
+            a, b = list(a or []), list(b or [])
+        if a != b:
+            raise SystemExit(
+                f"--resume {path}: '{field}' was {a!r} and is now {b!r}. Continuing a run "
+                "means continuing the same run; a field that changes the model or the data "
+                "makes this a different experiment wearing the previous one's weights.")
+    if ck.get("data_sha256") and data_sha256 and ck["data_sha256"] != data_sha256:
+        raise SystemExit(
+            f"--resume {path}: the recordings have changed.\n  then: {ck['data_sha256']}\n"
+            f"  now : {data_sha256}\nThe split is drawn over the data, so a different file "
+            "is a different split whatever the seed says.")
+
+    # --- the split ------------------------------------------------------------------------
+    mine = [int(i) for i in (getattr(train_ds, "val_split_ids", None) or [])]
+    theirs = [int(i) for i in (ck.get("val_split_ids") or [])]
+    if not theirs:
+        side = os.path.join(os.path.dirname(os.path.abspath(path)), "params", "data.yaml")
+        if os.path.exists(side):
+            import yaml  # noqa: PLC0415
+
+            with open(side) as fh:
+                theirs = [int(i) for i in (yaml.safe_load(fh).get("val_split_ids") or [])]
+    if theirs:
+        if mine != theirs:
+            raise SystemExit(
+                f"--resume {path}: the held-out split has moved -- {len(theirs)} "
+                f"{ck.get('val_split_key', old.get('val_split_by', '?'))}(s) then, "
+                f"{len(mine)} now, {len(set(mine) ^ set(theirs))} differing. Training on it "
+                "would fold previously-held-out data into training while still reporting a "
+                "val number, and nothing downstream would say so.")
+        print(f"[INFO] resume: split verified identical -- {len(mine)} held-out "
+              f"{cfg.val_split_by}(s)")
+    elif not allow_unverified:
+        raise SystemExit(
+            f"--resume {path}: neither the checkpoint nor {os.path.dirname(path)}/params/"
+            "data.yaml records the held-out split, so it cannot be verified. Pass "
+            "--allow_unverified_resume to proceed on the argument that the split is a pure "
+            "function of (data, seed, val_fraction, val_split_by) and those all match.")
+    else:
+        print("[WARN] resume: the source split could not be recovered and was NOT verified.")
+
+    model.load_state_dict(ck["model"])
+    opt.load_state_dict(ck["optimizer"])
+    if ema is not None and ck.get("model_ema") is not None:
+        ema.shadow = {k: v.to(next(model.parameters()).device) for k, v in ck["model_ema"].items()}
+        for k, v in (ck.get("ema_state") or {}).items():
+            setattr(ema, k, v)
+    elif ema is not None:
+        print("[WARN] resume: the checkpoint carries no EMA shadow; it restarts from the "
+              "restored weights, so val_ema is a short average for the first epochs.")
+    start = int(ck["epoch"]) + 1
+    if start >= cfg.num_epochs:
+        raise SystemExit(
+            f"--resume {path} is at epoch {ck['epoch']} and --num_epochs is "
+            f"{cfg.num_epochs}; there is nothing to run. Raise --num_epochs.")
+    print(f"[INFO] RESUMED from {path} at epoch {ck['epoch']} -> running {start}.."
+          f"{cfg.num_epochs - 1} ({cfg.num_epochs - start} more). Optimizer and EMA restored.")
+    return start
+
+
 def main() -> None:
     """Entry point: load data, build datasets, train, validate, checkpoint."""
     cfg, args = parse_args()
@@ -1086,8 +1208,15 @@ def main() -> None:
                   "       Pass --no_wandb to silence this, or fix the login (wandb login).")
 
     best_val = math.inf
-    global_step = 0
-    for epoch in range(cfg.num_epochs):
+    start_epoch = 0
+    if args.resume:
+        start_epoch = resume_from(args.resume, model, opt, ema, train_ds, cfg,
+                                  data_sha256, args.allow_unverified_resume)
+    # Counted from where the run actually starts, so an extension does not re-enter the LR
+    # warmup. `scheduled_lr` reads it, and a restarted counter would drop the first
+    # `lr_warmup_steps` optimizer steps back down a ramp the run left behind 100 epochs ago.
+    global_step = start_epoch * max(len(train_loader), 1)
+    for epoch in range(start_epoch, cfg.num_epochs):
         model.train()
         epoch_start = time.perf_counter()
         epoch_loss, n = 0.0, 0
@@ -1406,6 +1535,10 @@ def _save_ckpt(path, model, opt, cfg, train_ds, meta, epoch, data_path="", data_
         "data_path": data_path,
         "data_sha256": data_sha256,
         "epoch": epoch,
+        # The held-out split, so --resume can VERIFY it rather than trusting that a pure
+        # function of (data, seed, val_fraction, val_split_by) must have reproduced.
+        "val_split_key": getattr(train_ds, "val_split_key", "episode"),
+        "val_split_ids": getattr(train_ds, "val_split_ids", []),
     }
     if train_ds.cmd_normalizer is not None:
         ckpt["cmd_normalizer"] = train_ds.cmd_normalizer.state_dict()
