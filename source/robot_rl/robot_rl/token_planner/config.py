@@ -301,6 +301,20 @@ class PlannerConfig:
     #: stage. A planner annealed to a near-deterministic argmax has nothing for PPO to
     #: explore with. Do not set it to 0 without a reason.
     label_smoothing: float = 0.1
+    #: Condition on the flow-matching generator's OWN prediction, and emit RESIDUAL tokens
+    #: that correct it. Off = the absolute planner, which replaces the generator; on = the
+    #: ADJUSTER, which rides on top of it and is the arm PPO is meant to fine-tune.
+    #:
+    #: Adds one prefix token per output slot, folding the same ``downsample`` plan nodes the
+    #: tokenizer folds, so a plan token and the residual token correcting it cover the same
+    #: span and sit at the same point on the timeline. The tokenizer this pairs with must be
+    #: a RESIDUAL one -- its codes decode to a correction, not to a trajectory -- and the two
+    #: are refused in both directions at load.
+    plan_conditioning: bool = False
+    #: Scalar gain on the decoded residual before it is composed onto the plan. ``0.0`` makes
+    #: the adjuster exactly the identity, which is how RL initialises it as a no-op when the
+    #: supervised arm has not earned the right to steer yet.
+    residual_alpha: float = 1.0
 
     # -- training --
     lr: float = 3e-4

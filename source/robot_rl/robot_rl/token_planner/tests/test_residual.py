@@ -207,11 +207,16 @@ def test_an_absolute_cache_is_refused_by_the_residual_loader(tmp_path):
     """The mirror direction, so neither arm can be reached by accident."""
     from robot_rl.token_planner.data import save_chunk_cache
 
-    chunks = _residual_chunks()
-    plain = {k: v for k, v in vars(chunks).items()
-             if k not in ("train_plan", "val_plan", "absolute_normalizer_state",
-                          "fm_provenance")}
+    import dataclasses
+
     from robot_rl.token_planner.data import ChunkData
+
+    chunks = _residual_chunks()
+    # DERIVED from ChunkData's own fields, not a hand-kept exclusion list: every field added
+    # to ResidualChunkData would otherwise have to be remembered here, and forgetting one
+    # fails this test for a reason that has nothing to do with what it is checking.
+    keep = {f.name for f in dataclasses.fields(ChunkData)}
+    plain = {k: v for k, v in vars(chunks).items() if k in keep}
 
     path = str(tmp_path / "abs.pt")
     save_chunk_cache(path, ChunkData(**plain))
@@ -294,3 +299,113 @@ def test_a_suppressed_geodesic_prints_as_absent_not_as_zero():
     assert "n/a (residual arm" in out
     assert "0.00000 rad" not in out
     assert "0.05000 rad" in format_report({**rep, "ori_geodesic_rad": 0.05})
+
+
+# ----------------------------------------------------------------------------------------
+# The ADJUSTER arm: plan conditioning and residual decoding.
+# ----------------------------------------------------------------------------------------
+
+def _adjuster(plan_conditioning: bool):
+    """A tiny planner pair, with the plan stream on or off."""
+    from robot_rl.token_planner.config import PlannerConfig, TokenizerConfig
+    from robot_rl.token_planner.planner import TokenPlanner
+    from robot_rl.token_planner.tokenizer import TrajectoryTokenizer
+
+    tok_cfg = TokenizerConfig(chunk_len=16, downsample=2, node_dim=D, channels=32,
+                              num_blocks_high=1, num_blocks_low=1, num_joints=NJ,
+                              num_ee_frames=NEE, reference_blocks=list(BLOCKS))
+    cfg = PlannerConfig(tokenizer=tok_cfg.to_dict(), future_len=16, num_history_states=3,
+                        history_dim=D, extero_sensor_dim=12, extero_sensor_count=1,
+                        extero_encoder="mlp", cmd_dim=3, cmd_stride=5, d_model=32, nhead=2,
+                        num_layers=2, dim_feedforward=64,
+                        plan_conditioning=plan_conditioning)
+    return TokenPlanner(cfg, TrajectoryTokenizer(tok_cfg)).eval()
+
+
+def _cond(m, b: int = 2):
+    """Conditioning tensors for ``m``, plus a plan window."""
+    return (torch.randn(b, 3, D), torch.randn(b, 1, 12),
+            torch.randn(b, len(range(0, 16, 5)), 3), torch.randn(b, 16, D))
+
+
+def test_the_plan_stream_adds_exactly_one_prefix_token_per_output_slot():
+    """One token per slot is what lets a plan token and the residual token correcting it sit
+    at the same point on the timeline; any other count breaks that correspondence silently."""
+    off, on = _adjuster(False), _adjuster(True)
+    assert on.prefix_len == off.prefix_len + on.num_tokens
+
+
+def test_the_plan_stream_is_off_by_default():
+    """Because the FM-parity test in test_prefix.py depends on it: the generator has no plan
+    stream, so a prefix that grew one unconditionally could never be bit-identical to its
+    embedding."""
+    from robot_rl.token_planner.config import PlannerConfig
+
+    assert PlannerConfig().plan_conditioning is False
+    assert _adjuster(False).prefix.plan_in is None
+
+
+@pytest.mark.parametrize("conditioned", [False, True])
+def test_every_entry_point_carries_the_plan(conditioned):
+    """``forward`` / ``logprobs`` / ``sample`` must all reach the same prefix. A path that
+    dropped the plan would still return correctly-shaped tokens, and the only symptom would
+    be that the adjuster's corrections were worse."""
+    m = _adjuster(conditioned)
+    hist, ext, cmd, plan_w = _cond(m)
+    plan = m.plan_tokens_from_window(plan_w) if conditioned else None
+    ids = torch.randint(0, m.vocab_size, (2, m.num_tokens))
+    assert m(ids, hist, ext, cmd, plan=plan).shape == (2, m.num_tokens, m.vocab_size)
+    lp, ent = m.logprobs(ids, hist, ext, cmd, plan=plan)
+    assert lp.shape == ent.shape == (2, m.num_tokens)
+    tok, _, _ = m.sample(hist, ext, cmd, greedy=True, plan=plan)
+    assert tok.shape == (2, m.num_tokens)
+
+
+def test_the_plan_argument_and_the_plan_stream_must_agree_in_both_directions():
+    """An adjuster run without its plan, or an absolute planner handed one, are both silent
+    failures at the level of shapes."""
+    on, off = _adjuster(True), _adjuster(False)
+    ids = torch.randint(0, on.vocab_size, (2, on.num_tokens))
+    hist, ext, cmd, plan_w = _cond(on)
+    with pytest.raises(ValueError, match="must agree"):
+        on(ids, hist, ext, cmd)                                    # conditioned, no plan
+    with pytest.raises(ValueError, match="must agree"):
+        off(ids, hist, ext, cmd, plan=off.plan_tokens_from_window(plan_w))
+
+
+def test_the_plan_fold_is_time_major_and_refuses_the_wrong_horizon():
+    """A token must hold `downsample` consecutive NODES, not a channel-interleaving of them:
+    both are the same width, and only one is a short trajectory."""
+    m = _adjuster(True)
+    w = torch.arange(2 * 16 * D, dtype=torch.float32).reshape(2, 16, D)
+    folded = m.plan_tokens_from_window(w)
+    assert folded.shape == (2, m.num_tokens, 2 * D)
+    torch.testing.assert_close(folded[0, 0], w[0, :2].reshape(-1))
+    torch.testing.assert_close(folded[0, 3], w[0, 6:8].reshape(-1))
+    with pytest.raises(ValueError, match="horizon"):
+        m.plan_tokens_from_window(torch.randn(2, 15, D))
+
+
+def test_decode_residual_composes_and_is_the_identity_at_alpha_zero():
+    """``alpha = 0`` is the RL identity initialisation, and it has to be EXACT -- an adjuster
+    that perturbs the plan at zero action is a chaotic divergence on a robot."""
+    from robot_rl.flow_matching.normalizer import Normalizer
+
+    m = _adjuster(True)
+    norm = fit_residual_normalizer(torch.randn(64, 16, D))
+    plan = _plan(2, seed=7)[:, :16]
+    ids = torch.randint(0, m.vocab_size, (2, m.num_tokens))
+    assert torch.equal(m.decode_residual(plan, ids, norm, alpha=0.0), plan)
+    moved = m.decode_residual(plan, ids, norm, alpha=1.0)
+    assert not torch.equal(moved, plan)
+    assert moved.shape == plan.shape
+    assert isinstance(norm, Normalizer)
+
+
+def test_an_absolute_planner_refuses_to_decode_a_residual():
+    """Its codes are a trajectory; composing them onto a plan would add two trajectories."""
+    m = _adjuster(False)
+    norm = fit_residual_normalizer(torch.randn(64, 16, D))
+    with pytest.raises(ValueError, match="WITHOUT plan_conditioning"):
+        m.decode_residual(_plan(2, seed=8)[:, :16],
+                          torch.randint(0, m.vocab_size, (2, m.num_tokens)), norm)

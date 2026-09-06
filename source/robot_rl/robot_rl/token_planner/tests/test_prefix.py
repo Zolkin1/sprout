@@ -104,7 +104,16 @@ def test_the_prefix_matches_the_flow_matching_models_embedding(encoder, sensors)
     missing, unexpected = prefix.load_state_dict(shared, strict=False)
     # Nothing may be left at its own initialisation: an un-copied parameter would make the
     # comparison below a comparison of two random modules that happen to agree on shape.
-    assert not [m for m in missing if m not in ("pos", "cmd_steps")], missing
+    #
+    # The three exemptions are INDEX/POSITION buffers, not learned content: `pos` is a fixed
+    # sinusoidal table, and `cmd_steps` / `plan_steps` are the timeline indices their streams
+    # sit on. `plan_steps` is additionally EMPTY here -- the plan stream is an adjuster-only
+    # option and the generator has no counterpart to copy from, which is exactly why it
+    # defaults off. Anything with a weight in it must still transfer.
+    assert not [m for m in missing if m not in ("pos", "cmd_steps", "plan_steps")], missing
+    assert prefix.plan_in is None, (
+        "the parity check must run with the plan stream OFF -- the generator has no plan "
+        "stream, so a prefix carrying one cannot be bit-identical to its embedding.")
     # `unexpected` cannot fire (``shared`` is filtered to the prefix's own keys), so the
     # real check is that every tag the FM has was actually transferred.
     have = dict(prefix.state_dict())

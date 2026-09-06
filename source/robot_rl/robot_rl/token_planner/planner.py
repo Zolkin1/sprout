@@ -158,6 +158,14 @@ class TokenPlanner(nn.Module):
             extero_channels=_resolve_extero_channels(cfg),
             extero_camera_intrinsics=cfg.extero_camera_intrinsics,
             cmd_dim=cfg.cmd_dim, cmd_stride=cfg.cmd_stride,
+            # The ADJUSTER arm. Off unless the config says otherwise, so an absolute planner
+            # is byte-identical to what it was. One token per output slot, each folding the
+            # same `downsample` plan nodes the tokenizer folds -- so plan token i and the
+            # residual token that corrects it describe the same span.
+            plan_dim=(int(cfg.tokenizer_cfg.downsample) * int(cfg.tokenizer_cfg.node_dim)
+                      if cfg.plan_conditioning else 0),
+            plan_tokens=int(cfg.num_tokens) if cfg.plan_conditioning else 0,
+            plan_stride=int(cfg.tokenizer_cfg.downsample),
         )
 
         # Output side. `token_emb` is tied to the head, so the vocabulary is embedded and
@@ -211,6 +219,7 @@ class TokenPlanner(nn.Module):
         extero: torch.Tensor,
         cmd_tokens: torch.Tensor | None = None,
         history_null_mask: torch.Tensor | None = None,
+        plan: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, ...]:
         """Run the conditioning through the trunk on its own; return its per-layer INPUTS.
 
@@ -222,11 +231,13 @@ class TokenPlanner(nn.Module):
             extero: ``(B, T, extero_sensor_dim)`` or anything reshaping to it.
             cmd_tokens: ``(B, num_cmd_tokens, cmd_dim)`` or ``None``.
             history_null_mask: ``(B,)`` bool null-history selector.
+            plan: ``(B, N, downsample * node_dim)`` the generator's own prediction, for an
+                ADJUSTER. Required exactly when the config asked for plan conditioning.
 
         Returns:
             One ``(B, P, d_model)`` tensor per layer, in layer order.
         """
-        x = self.prefix(history, extero, cmd_tokens, history_null_mask)
+        x = self.prefix(history, extero, cmd_tokens, history_null_mask, plan)
         cache: list[torch.Tensor] = []
         for layer in self.encoder.layers:
             cache.append(x)
@@ -258,6 +269,7 @@ class TokenPlanner(nn.Module):
         extero: torch.Tensor,
         cmd_tokens: torch.Tensor | None = None,
         history_null_mask: torch.Tensor | None = None,
+        plan: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Teacher-forced logits for every output position, in ONE pass.
 
@@ -278,7 +290,7 @@ class TokenPlanner(nn.Module):
         if tokens.shape[-1] != self.num_tokens:
             raise ValueError(
                 f"expected {self.num_tokens} token(s) per plan, got {tokens.shape[-1]}.")
-        cache = self.encode_prefix(history, extero, cmd_tokens, history_null_mask)
+        cache = self.encode_prefix(history, extero, cmd_tokens, history_null_mask, plan)
         self._last_prefix_cache = cache
         x = self._embed_outputs(tokens[:, :-1], tokens.shape[0])
         mask = causal_output_mask(self.num_tokens, self.prefix_len, tokens.device)
@@ -295,6 +307,7 @@ class TokenPlanner(nn.Module):
         history_null_mask: torch.Tensor | None = None,
         temperature: float = 1.0,
         return_logits: bool = False,
+        plan: torch.Tensor | None = None,
     ):
         """Per-token log-probabilities and entropies for GIVEN tokens, in one pass.
 
@@ -319,7 +332,8 @@ class TokenPlanner(nn.Module):
         """
         if temperature <= 0.0:
             raise ValueError(f"temperature must be positive, got {temperature}.")
-        logits = self(tokens, history, extero, cmd_tokens, history_null_mask) / temperature
+        logits = self(tokens, history, extero, cmd_tokens, history_null_mask,
+                      plan) / temperature
         logp_all = F.log_softmax(logits, dim=-1)
         logp = logp_all.gather(-1, tokens.unsqueeze(-1)).squeeze(-1)
         ent = -(logp_all.exp() * logp_all).sum(-1)
@@ -340,6 +354,7 @@ class TokenPlanner(nn.Module):
         generator: torch.Generator | None = None,
         prefix_cache: tuple[torch.Tensor, ...] | None = None,
         force_tokens: torch.Tensor | None = None,
+        plan: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode a plan autoregressively, with a per-layer KV cache.
 
@@ -408,7 +423,7 @@ class TokenPlanner(nn.Module):
                 "portable across devices, so this cannot be papered over without changing "
                 "which numbers a seed produces.")
         b = history.shape[0]
-        cache = (self.encode_prefix(history, extero, cmd_tokens, history_null_mask)
+        cache = (self.encode_prefix(history, extero, cmd_tokens, history_null_mask, plan)
                  if prefix_cache is None else tuple(prefix_cache))
         if len(cache) != len(self.encoder.layers):
             raise ValueError(
@@ -506,3 +521,75 @@ class TokenPlanner(nn.Module):
                 list(self.cfg.tokenizer_cfg.reference_blocks),
             )
         return nodes
+
+    @torch.no_grad()
+    def decode_residual(self, plan: torch.Tensor, tokens: torch.Tensor, normalizer,
+                        alpha: float | None = None) -> torch.Tensor:
+        """Decode residual tokens and COMPOSE them onto the plan they correct.
+
+        The adjuster's counterpart to :meth:`decode`. The difference is not cosmetic: this
+        model's codes decode to a CORRECTION, so returning them as a window -- which
+        :meth:`decode` would happily do, at the right shape -- would hand a tracker the error
+        instead of the trajectory.
+
+        Composition goes through ``window.compose_window_residual``, the same rule
+        ``FmTrackingCommand.apply_plan_residual`` serves online, so what is fitted here and
+        what reaches the robot cannot come apart. At ``alpha = 0`` it returns the plan
+        BIT-IDENTICALLY, which is what makes an identity initialisation exact rather than
+        approximate.
+
+        Args:
+            plan: ``(B, H, node_dim)`` the generator's window, RAW units, already projected.
+            tokens: ``(B, N)`` residual ids.
+            normalizer: The RESIDUAL normalizer -- the one the residual tokenizer was fitted
+                with, not the generator's state normalizer. Required: a residual in
+                normalized units is not a correction in metres, and the two differ by a
+                per-channel factor that nothing downstream would notice.
+            alpha: Gain, defaulting to :attr:`PlannerConfig.residual_alpha`.
+
+        Returns:
+            ``(B, H, node_dim)`` the corrected window, RAW units.
+
+        Raises:
+            ValueError: If this planner was not built for plan conditioning -- an absolute
+                planner's codes are a trajectory, and composing one onto a plan would add two
+                trajectories together.
+        """
+        from robot_rl.flow_matching.window import compose_window_residual  # noqa: PLC0415
+
+        if not self.cfg.plan_conditioning:
+            raise ValueError(
+                "decode_residual on a planner built WITHOUT plan_conditioning: its codes "
+                "decode to a trajectory, not to a correction, so composing them onto a plan "
+                "would add two trajectories. Use decode().")
+        residual = normalizer.denormalize(self.tokenizer.decode_ids(tokens))
+        return compose_window_residual(
+            plan, residual, int(self.cfg.num_joints_for_layout),
+            int(self.cfg.num_ee_frames_for_layout),
+            list(self.cfg.tokenizer_cfg.reference_blocks),
+            alpha=float(self.cfg.residual_alpha if alpha is None else alpha),
+        )
+
+    def plan_tokens_from_window(self, plan: torch.Tensor) -> torch.Tensor:
+        """Fold a plan window into the per-slot conditioning tokens the prefix expects.
+
+        One token per output slot, each holding the ``downsample`` consecutive nodes that
+        slot's residual token covers. The fold is TIME-MAJOR within a token (node 0's whole
+        channel vector, then node 1's), because that is what makes the token a short
+        trajectory rather than an interleaving of channels across time.
+
+        Args:
+            plan: ``(B, H, node_dim)`` the generator's window, in the space the model reads.
+
+        Returns:
+            ``(B, N, downsample * node_dim)``.
+
+        Raises:
+            ValueError: On a plan whose length is not this planner's horizon.
+        """
+        h = int(self.cfg.future_len)
+        if plan.shape[-2] != h:
+            raise ValueError(
+                f"plan has {plan.shape[-2]} node(s) but this planner's horizon is {h}.")
+        b = plan.shape[0]
+        return plan.reshape(b, self.num_tokens, -1)

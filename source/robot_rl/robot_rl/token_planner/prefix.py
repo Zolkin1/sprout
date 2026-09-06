@@ -91,6 +91,9 @@ class ConditioningPrefix(nn.Module):
         extero_camera_intrinsics: Sequence[Sequence[float]] | None = None,
         cmd_dim: int = 0,
         cmd_stride: int = 5,
+        plan_dim: int = 0,
+        plan_tokens: int = 0,
+        plan_stride: int = 1,
     ):
         super().__init__()
         self.d_model = int(d_model)
@@ -157,6 +160,39 @@ class ConditioningPrefix(nn.Module):
             self.cmd_type = None
             self.register_buffer("cmd_steps", torch.zeros(0, dtype=torch.long))
 
+        # The PLAN stream: the generator's own prediction, as one token per output slot.
+        #
+        # Off by default (``plan_tokens=0``), and that default is load-bearing: with it the
+        # module is byte-identical to what it was, so
+        # ``test_the_prefix_matches_the_flow_matching_models_embedding`` -- which copies a
+        # FlowMatchingTransformer's weights across by NAME and requires bit-identical output
+        # -- keeps holding. An adjuster is the only thing that turns it on, and the generator
+        # has no counterpart for it to disagree with.
+        self.plan_dim = int(plan_dim)
+        self.plan_tokens = int(plan_tokens)
+        self.plan_stride = int(plan_stride)
+        if self.plan_tokens > 0:
+            if self.plan_dim <= 0:
+                raise ValueError(
+                    f"plan_tokens={self.plan_tokens} needs a positive plan_dim; got "
+                    f"{self.plan_dim}.")
+            self.plan_in = _token_mlp(self.plan_dim, d_model)
+            self.plan_type = nn.Parameter(torch.zeros(1, 1, d_model))
+            # Plan token i covers plan nodes [i*stride, (i+1)*stride), so it sits on the
+            # TIMELINE at that node -- the same convention the command tokens use, and the
+            # reason it is the right one: a plan token and the output slot that corrects it
+            # describe the same instant, and the trunk can only exploit that if their
+            # positions say so.
+            self.register_buffer(
+                "plan_steps",
+                torch.tensor([i * self.plan_stride for i in range(self.plan_tokens)],
+                             dtype=torch.long),
+            )
+        else:
+            self.plan_in = None
+            self.plan_type = None
+            self.register_buffer("plan_steps", torch.zeros(0, dtype=torch.long))
+
         # The generator's timeline: history at 0..N-1, the plan at N..N+H-1, each command
         # token at N + (its future step). The exteroception carries no timeline position --
         # the reading is "now" -- only a type, a per-sensor id and (CNN) a spatial slot.
@@ -172,9 +208,9 @@ class ConditioningPrefix(nn.Module):
 
     @property
     def prefix_len(self) -> int:
-        """Conditioning tokens ``P``: history + exteroception + command."""
+        """Conditioning tokens ``P``: history + exteroception + command + plan."""
         return (int(self.num_history_states) + self.extero_seq_tokens
-                + int(self.cmd_steps.numel()))
+                + int(self.cmd_steps.numel()) + int(self.plan_steps.numel()))
 
     def forward(
         self,
@@ -182,6 +218,7 @@ class ConditioningPrefix(nn.Module):
         extero: torch.Tensor,
         cmd_tokens: torch.Tensor | None = None,
         history_null_mask: torch.Tensor | None = None,
+        plan: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Assemble the conditioning tokens.
 
@@ -194,11 +231,18 @@ class ConditioningPrefix(nn.Module):
                 it covers the same real situation -- the first ``N`` control steps after a
                 reset, when no history exists yet.
 
+            plan: ``(B, plan_tokens, plan_dim)`` the generator's own prediction, folded
+                ``plan_stride`` nodes to a token. Required exactly when the module was built
+                with a plan stream, and refused when it was not -- an adjuster that silently
+                ran without the plan it is supposed to be correcting would still produce
+                tokens, and the only symptom would be that its corrections were worse.
+
         Returns:
             ``(B, prefix_len, d_model)``.
 
         Raises:
-            ValueError: If command conditioning was built but no tokens were given.
+            ValueError: If command conditioning was built but no tokens were given, or if
+                the plan stream and the ``plan`` argument disagree about existing.
         """
         b = history.shape[0]
         n = self.num_history_states
@@ -219,7 +263,20 @@ class ConditioningPrefix(nn.Module):
         # Camera-major, slot-minor -- the order the ids and slots were added in.
         ht = et.reshape(b, self.extero_seq_tokens, self.d_model)
 
+        if (self.plan_in is None) != (plan is None):
+            raise ValueError(
+                "the plan stream and the `plan` argument must agree: this prefix was built "
+                f"{'WITH' if self.plan_in is not None else 'WITHOUT'} one and `plan` was "
+                f"{'given' if plan is not None else 'not given'}.")
+
         parts = [h, ht]
+        if self.plan_in is not None:
+            if plan.shape[1:] != (int(self.plan_steps.numel()), self.plan_dim):
+                raise ValueError(
+                    f"plan must be (B, {int(self.plan_steps.numel())}, {self.plan_dim}), got "
+                    f"{tuple(plan.shape)}.")
+            parts.append(self.plan_in(plan)
+                         + self.pos[:, n + self.plan_steps, :] + self.plan_type)
         if self.cmd_in is not None:
             if cmd_tokens is None:
                 raise ValueError("prefix built with cmd_dim > 0 requires cmd_tokens.")

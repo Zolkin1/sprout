@@ -369,12 +369,19 @@ def sample_residuals(paths: list[str], rows: np.ndarray, counts: list[int], run_
     loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False)
     dev = torch.device(device)
     plans, targets, masks, yaws = [], [], [], []
+    hist_c, ext_c, cmd_c = [], [], []
     with torch.no_grad():
         for batch in loader:
             cmd = batch["cmd_tokens"].to(dev) if "cmd_tokens" in batch else None
             p = sample_window(ctx, batch["history"].to(dev), batch["extero"].to(dev), cmd)
             plans.append(p.float().cpu())
             targets.append(ctx.state_norm.denormalize(batch["state"].to(dev)).float().cpu())
+            # Kept from the SAME batch that produced the plan, so the adjuster cannot end up
+            # conditioned on a different window's depth than the plan it corrects.
+            hist_c.append(batch["history"].float())
+            ext_c.append(batch["extero"].float())
+            if cmd is not None:
+                cmd_c.append(batch["cmd_tokens"].float())
             # The dataset renames this on the way out (``mask_frame_yaw_rel`` there,
             # ``mask_frame_yaw`` on a ChunkData); carrying both halves or neither is enforced
             # by ChunkDataset, so they travel together here too.
@@ -389,6 +396,9 @@ def sample_residuals(paths: list[str], rows: np.ndarray, counts: list[int], run_
         "residual": decompose_window_residual(plan, target),
         "anchor_mask": torch.cat(masks) if masks else None,
         "mask_frame_yaw": torch.cat(yaws) if yaws else None,
+        "history": torch.cat(hist_c),
+        "extero": torch.cat(ext_c),
+        "cmd": torch.cat(cmd_c) if cmd_c else None,
         "cfg": cfg,
         "ctx": ctx,
         "dataset": ds,
@@ -540,6 +550,28 @@ def audit_delta(args: argparse.Namespace, report: dict[str, Any], paths: list[st
             "--honesty clean."))
 
 
+def _pad(x, keep, zero_n: int):
+    """Select the train rows and repeat the first ``zero_n`` to match the injected chunks.
+
+    The all-zero residual chunks appended to the train side need a conditioning row each, or
+    every per-window array stops agreeing on length. WHICH row is arbitrary -- the target for
+    those chunks is "no correction" regardless of what the generator saw -- so the first few
+    are reused rather than fabricating conditioning that never occurred.
+
+    Args:
+        x: ``(Nw, ...)`` a per-window array.
+        keep: ``(Nw,)`` bool train mask.
+        zero_n: Injected chunk count.
+
+    Returns:
+        ``(keep.sum() + zero_n, ...)``.
+    """
+    import torch  # noqa: PLC0415
+
+    sel = x[keep]
+    return sel if zero_n == 0 else torch.cat([sel, sel[:zero_n]])
+
+
 def build(args: argparse.Namespace) -> str:
     """Run the generator over the honest rows and write the residual cache.
 
@@ -635,6 +667,10 @@ def build(args: argparse.Namespace) -> str:
         "history_source": cfg.history_source,
         "honesty": args.honesty,
         "checkpoint": args.checkpoint,
+        # The generator's full config, so the adjuster can RESOLVE its conditioning geometry
+        # from the build rather than defaulting it. Several of those fields (the extero image
+        # shapes, the cnn strides, the command stride) are width-silent when wrong.
+        "fm_config": cfg.to_dict(),
     }
     prov = {
         "data": paths,
@@ -667,6 +703,12 @@ def build(args: argparse.Namespace) -> str:
         train_mask_frame_yaw=train_yaw,
         val_mask_frame_yaw=None if ayaw is None else ayaw[in_val],
         train_plan=train_plan, val_plan=plan[in_val],
+        train_history=_pad(got["history"], ~in_val, zero_n),
+        val_history=got["history"][in_val],
+        train_extero=_pad(got["extero"], ~in_val, zero_n),
+        val_extero=got["extero"][in_val],
+        train_cmd=None if got["cmd"] is None else _pad(got["cmd"], ~in_val, zero_n),
+        val_cmd=None if got["cmd"] is None else got["cmd"][in_val],
         absolute_normalizer_state=got["ctx"].state_norm.state_dict(),
         fm_provenance=fm_prov,
     )

@@ -81,6 +81,21 @@ class ResidualChunkData(ChunkData):
 
     train_plan: torch.Tensor | None = None
     val_plan: torch.Tensor | None = None
+    #: The generator's CONDITIONING for each window -- normalized history rows, the
+    #: normalized exteroception row, and the strided command tokens -- stored so the adjuster
+    #: stage is a function of this file alone.
+    #:
+    #: It could be re-derived from the recording, and deliberately is not: the adjuster has to
+    #: see the same conditioning the generator saw for the plan it is correcting, and a
+    #: re-derivation joins two independently-built window sets by INDEX. That join is right
+    #: until a filter, a lag draw or a row order changes, at which point it silently pairs a
+    #: plan with someone else's depth -- which looks exactly like a model that will not learn.
+    train_history: torch.Tensor | None = None
+    val_history: torch.Tensor | None = None
+    train_extero: torch.Tensor | None = None
+    val_extero: torch.Tensor | None = None
+    train_cmd: torch.Tensor | None = None
+    val_cmd: torch.Tensor | None = None
     absolute_normalizer_state: dict[str, torch.Tensor] = field(default_factory=dict)
     fm_provenance: dict[str, Any] = field(default_factory=dict)
 
