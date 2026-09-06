@@ -498,7 +498,13 @@ def test_camera_spec_is_empty_without_depth_terms():
     # it had not cleared. So the term list is asserted before it is cleared: the policy
     # group holds the near camera alone.
     depth_terms = [n for n in vars(observations.policy) if n.startswith("depth_")]
-    assert depth_terms == ["depth_near"], depth_terms
+    # BOTH slots are declared: `depth_far` exists as None so that
+    # `enable_policy_far_camera` can fill it without changing the term ORDER (configclass
+    # resolves order from the declarations, and appending it later would transpose the two
+    # cameras in the policy vector). Declared-and-None contributes no contract, which is
+    # what the assertion below then shows.
+    assert depth_terms == ["depth_near", "depth_far"], depth_terms
+    assert observations.policy.depth_far is None, "the far slot must default OFF"
     observations.policy.depth_near = None
     assert depth_camera_specs_from_cfg(observations=observations) == []
 

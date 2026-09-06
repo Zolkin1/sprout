@@ -92,7 +92,19 @@ def test_the_task_is_registered_against_the_freeform_cfg_and_the_finetune_runner
     assert kwargs["rsl_rl_cfg_entry_point"].endswith(":FinetunePPORunnerCfg")
 
 
-def test_exactly_one_registered_task_manufactures_its_own_command():
+#: Every task allowed to manufacture its own velocity command, and each is a FREE-FORM task
+#: whose library carries no clip to take one from. Named rather than counted: the guard is
+#: "no CLIP task turned this on", and a bare count would pass the day someone adds a
+#: free-form task and silently flips a clip task at the same time.
+_FREEFORM_COMMAND_TASKS: tuple[str, ...] = (
+    "G1-teacher-clf-terrain-depth-finetune-freeform",
+    # The same fine-tune pinned to the fixed two-box course, with the policy's far camera
+    # restored so an existing two-camera tracker can run it.
+    "G1-box2-finetune",
+)
+
+
+def test_only_the_freeform_tasks_manufacture_their_own_command():
     """Enumerated over the REGISTRY, so a task added later cannot slip past this.
 
     The free-form command replaces every command-velocity accessor. On a clip task that would
@@ -109,7 +121,7 @@ def test_exactly_one_registered_task_manufactures_its_own_command():
         traj_ref = getattr(cls().commands, "traj_ref", None)
         if getattr(traj_ref, "freeform_command", False):
             turned_on.append(task_id)
-    assert turned_on == [TASK_ID]
+    assert sorted(turned_on) == sorted(_FREEFORM_COMMAND_TASKS)
 
 
 # ----------------------------------------------------------------------
