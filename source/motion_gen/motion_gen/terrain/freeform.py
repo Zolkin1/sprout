@@ -1174,7 +1174,8 @@ def generate_freeform_manifest(cfg: FreeformConfig) -> list[dict]:
 #: ``tests/test_freeform_terrain.py`` against the real frozenset.
 OVERLAY_KINDS: frozenset[str] = frozenset(("box", "obstacle", "overhead"))
 
-def validate_manifest(manifest: list[dict]) -> None:
+def validate_manifest(manifest: list[dict],
+                      families: Sequence[str] = FAMILIES) -> None:
     """Refuse a manifest the RL loader or a simulator would misread.
 
     Everything checked here is something that fails SILENTLY or far from its cause downstream:
@@ -1185,6 +1186,11 @@ def validate_manifest(manifest: list[dict]) -> None:
 
     Args:
         manifest: The tile list.
+        families: The family names this manifest is allowed to carry.  Defaults to the three
+            randomised free-form families; a FIXED course authored elsewhere (see
+            :mod:`motion_gen.terrain.box2`) passes its own, because every other check here --
+            ids, footprints, overlay yaw, the ground rule -- applies to it unchanged and
+            forking the validator to gain one string would leave the real checks in two places.
 
     Raises:
         ValueError: Naming the tile and the field on the first violation.
@@ -1197,8 +1203,8 @@ def validate_manifest(manifest: list[dict]) -> None:
         tid = int(m["terrain_id"])
         if m["type"] != "terrain":
             raise ValueError(f"tile {tid}: type {m['type']!r}; every free-form tile is 'terrain'.")
-        if m.get("family") not in FAMILIES:
-            raise ValueError(f"tile {tid}: family {m.get('family')!r} not in {FAMILIES}.")
+        if m.get("family") not in families:
+            raise ValueError(f"tile {tid}: family {m.get('family')!r} not in {tuple(families)}.")
         if m.get("has_floor", True):
             raise ValueError(f"tile {tid}: has_floor must be False -- the section authors its "
                              "own ground overlay, so a loader floor would double it.")
