@@ -114,26 +114,64 @@ def assert_contracts_agree(attrs: list[dict], stems: list[str]) -> None:
                 "'different' are both reasons not to merge; re-record the odd one out.")
 
 
-def merge(stems: list[str], out_stem: str) -> None:
+def subsample_episodes(W: dict, E: dict, keep: int, rng: np.random.Generator) -> None:
+    """Cut a stem down to ``keep`` episodes, IN PLACE, keeping each one whole.
+
+    **Sampled by EPISODE, never by window.** ``fit_value`` splits by episode because every
+    window of an episode carries the same terminal label, so dropping windows from the middle
+    of an episode would thin the label without removing it -- the effective sample size is the
+    episode count either way, and a partial episode just costs coverage of its own trajectory.
+
+    Args:
+        W: The stem's window columns, mutated.
+        E: The stem's episode columns, mutated.
+        keep: Episodes to retain; a value at or above the stem's count is a no-op.
+        rng: Draw source, so a subsampled merge is reproducible.
+    """
+    uids = E["episode_uid"]
+    if keep >= uids.size:
+        return
+    chosen = np.sort(rng.choice(uids, size=keep, replace=False))
+    emask = np.isin(uids, chosen)
+    wmask = np.isin(W["episode_uid"], chosen)
+    for d, m in ((E, emask), (W, wmask)):
+        for k in list(d):
+            d[k] = d[k][m]
+
+
+def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
+          seed: int = 0) -> None:
     """Concatenate the window and episode tables of every stem into ``out_stem``.
 
     Args:
         stems: Input rollout stems (without ``.h5``).
         out_stem: Output stem; ``<out_stem>.h5`` and ``<out_stem>.episodes.h5`` are written.
+        max_episodes_per_stem: Keep at most this many episodes from each stem; 0 keeps all.
+            The exteroception column dominates the size (a 5-channel two-camera row is ~15.6
+            kB), so a six-run grid is ~28 GB and the concatenation peaks at roughly twice
+            that -- subsampling is what keeps the merge inside memory. Balanced BY STEM
+            rather than over the pool, so one cell cannot dominate the critic's training set.
+        seed: Draw seed for the subsample.
 
     Raises:
         SystemExit: On a contract mismatch, or if a window's episode has no outcome row.
     """
     win, wattrs, eps, eattrs = [], [], [], []
-    for s in stems:
+    for i, s in enumerate(stems):
         for suffix in (".h5", ".episodes.h5"):
             if not os.path.isfile(s + suffix):
                 raise SystemExit(f"{s + suffix} not found -- is {s!r} a rollout stem?")
         W, wa = ro.read_rollout_windows(s + ".h5")
         E, ea = ro.read_rollout_episodes(s + ".episodes.h5")
+        n_all = len(E["episode_uid"])
+        if max_episodes_per_stem:
+            subsample_episodes(W, E, int(max_episodes_per_stem),
+                               np.random.default_rng([seed, i]))
         win.append(W); wattrs.append(wa); eps.append(E); eattrs.append(ea)
+        note = ("" if len(E["episode_uid"]) == n_all
+                else f"  (subsampled from {n_all})")
         print(f"[merge] {s}: {len(E['episode_uid'])} episodes, "
-              f"{len(W['episode_uid'])} windows")
+              f"{len(W['episode_uid'])} windows{note}")
     assert_contracts_agree(wattrs, stems)
 
     # Renumber per file, past the running max. See the module docstring for why a collision
@@ -197,8 +235,13 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("stems", nargs="+", help="rollout stems (without .h5)")
     p.add_argument("--out", required=True, help="output stem")
+    p.add_argument("--max_episodes_per_stem", type=int, default=0,
+                   help="keep at most this many episodes from EACH stem (0 = all). The "
+                        "exteroception column is ~15.6 kB a window, so a six-run grid is "
+                        "~28 GB and the concatenation peaks at about twice that.")
+    p.add_argument("--seed", type=int, default=0, help="subsample draw seed")
     a = p.parse_args()
-    merge(list(a.stems), a.out)
+    merge(list(a.stems), a.out, a.max_episodes_per_stem, a.seed)
     return 0
 
 

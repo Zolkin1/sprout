@@ -159,3 +159,53 @@ def test_a_missing_stem_names_itself(tmp_path):
     merge = _load_merger()
     with pytest.raises(SystemExit, match="not found"):
         merge.merge([str(tmp_path / "nope")], str(tmp_path / "merged"))
+
+
+def test_subsampling_keeps_whole_episodes_and_balances_by_stem(tmp_path):
+    """``--max_episodes_per_stem`` cuts episodes, never the middle of one.
+
+    Sampled by episode because every window of an episode carries the same terminal label:
+    dropping windows from inside one thins the label without removing it, and the effective
+    sample size is the episode count either way.
+    """
+    merge = _load_merger()
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    _write_stem(a, n_eps=10, per_ep=4)
+    _write_stem(b, n_eps=6, per_ep=4)
+    out = str(tmp_path / "merged")
+    merge.merge([a, b], out, max_episodes_per_stem=3, seed=0)
+
+    E, _ = ro.read_rollout_episodes(out + ".episodes.h5")
+    W, _ = ro.read_rollout_windows(out + ".h5")
+    assert len(E["episode_uid"]) == 6, "3 from each stem, balanced BY STEM"
+    assert len(np.unique(E["episode_uid"])) == 6
+    # Every surviving episode keeps ALL of its windows.
+    counts = {int(u): int((W["episode_uid"] == u).sum()) for u in E["episode_uid"]}
+    assert set(counts.values()) == {4}, counts
+    assert len(W["episode_uid"]) == 6 * 4
+
+
+def test_subsampling_above_the_stems_size_is_a_no_op(tmp_path):
+    """Asking for more episodes than a stem holds keeps it whole rather than erroring."""
+    merge = _load_merger()
+    a = str(tmp_path / "a")
+    _write_stem(a, n_eps=3, per_ep=2)
+    out = str(tmp_path / "merged")
+    merge.merge([a], out, max_episodes_per_stem=99)
+    E, _ = ro.read_rollout_episodes(out + ".episodes.h5")
+    assert len(E["episode_uid"]) == 3
+
+
+def test_the_subsample_is_reproducible(tmp_path):
+    """Same seed, same episodes -- so a merged training set can be rebuilt exactly."""
+    merge = _load_merger()
+    a = str(tmp_path / "a")
+    _write_stem(a, n_eps=20, per_ep=2)
+    got = []
+    for i, seed in enumerate((7, 7, 8)):
+        out = str(tmp_path / f"m{i}")
+        merge.merge([a], out, max_episodes_per_stem=5, seed=seed)
+        E, _ = ro.read_rollout_episodes(out + ".episodes.h5")
+        got.append(E["episode_uid"].tolist())
+    assert got[0] == got[1], "same seed must give the same draw"
+    assert got[0] != got[2], "a different seed must give a different draw"
