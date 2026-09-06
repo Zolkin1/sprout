@@ -16,6 +16,8 @@ from isaaclab.utils.math import (
 
 from motion_gen.world_lift import anchor_mask_from_free
 
+from ..events.resets import freeform_route, tile_local_xy
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
 
@@ -224,6 +226,72 @@ def clip_end_reached(env, command_name: str = "traj_ref", reserve_lookahead: boo
             last_step = (last_step - int(offsets.max().item())).clamp_min(0)
     return (cmd.start_step + env.episode_length_buf) >= last_step
 
+def base_height_below_termination(
+    env, min_height: float = 0.3, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base world height drops below ``min_height``: the fall detector.
+
+    The height half of :func:`base_fallen` with the attitude half left out, because a
+    generator-driven run grades attitude against the REFERENCE instead
+    (:func:`fm_base_tilt_error_termination`) and the two would otherwise double-count.
+
+    **Absolute, deliberately, and it is the reference-relative version that fails here.**
+    Height error against the served reference looks like the consistent choice, but under
+    ``ego_anchor_fraction=1.0`` the reference is re-datumed onto the robot at every re-plan,
+    so that error collapses toward zero every ``fm_update_every`` steps -- a slow sink walks
+    straight through it. World z has no such hole.
+
+    The cost is that this assumes the terrain never goes below world zero: if it did, a
+    healthy robot descending far enough would trip it. That holds for the shipped libraries
+    (every tile builds upward from the ground plane) and is why the bound can sit as low as
+    0.3 m -- deep under any standing pose, so it fires on a collapse rather than on a stoop.
+
+    Args:
+        env: IsaacLab environment.
+        min_height: Base world height below which the episode ends (m).
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    robot = env.scene[asset_cfg.name]
+    return wp.to_torch(robot.data.root_pos_w)[:, 2] < min_height
+
+
+def fm_base_tilt_error_termination(
+    env, command_name: str = "traj_ref", max_tilt_rad: float = 1.047,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base tilts too far from the REFERENCE's attitude (yaw ignored).
+
+    :func:`base_orientation_from_upright` measures against world upright, which is the wrong
+    datum once the reference itself leans -- climbing and jumping both pitch the base on
+    purpose, so a fixed cone around vertical either fires on healthy motion or has to be
+    slackened until it catches nothing.  This measures the angle between the robot's own up
+    axis and the REFERENCE's, so the allowance travels with the motion.
+
+    Yaw drops out by construction: comparing up axes says nothing about heading, which is the
+    same reason :func:`base_orientation_from_upright` ignores it.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The tracking command term.
+        max_tilt_rad: Maximum angle between the two up axes (rad); 1.047 = 60 deg.
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    robot = env.scene[asset_cfg.name]
+    up = torch.zeros(env.num_envs, 3, device=env.device)
+    up[:, 2] = 1.0
+    ref_up = quat_apply(cmd.reference_world_state()[:, 3:7], up)
+    act_up = quat_apply(wp.to_torch(robot.data.root_quat_w), up)
+    cos = (ref_up * act_up).sum(-1).clamp(-1.0, 1.0)
+    return torch.arccos(cos) > max_tilt_rad
+
+
 def base_orientation_from_upright(
     env,
     roll_limit_deg: float = 70.0,
@@ -307,3 +375,56 @@ def base_fallen(
     return too_low | tilted
 
 
+
+def freeform_goal_reached(
+    env,
+    min_half_width: float = 2.5,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Truncate (good termination) when the robot has walked its free-form section.
+
+    The clip-free replacement for :func:`clip_end_reached`, which bounds an episode by the
+    length of a motion that no longer exists. Wire it as ``DoneTerm(..., time_out=True)``:
+    walking the section IS the task, so its end is a truncation and RSL-RL bootstraps the
+    value from the final state rather than scoring it as a failure. Keep the task's plain
+    ``time_out`` alongside -- this fires only on success.
+
+    **A wide BAND across the section, not a disc**, and that is the lesson mjeval paid for:
+    a 0.5 m circle on the centreline scored most of its timeouts as "did not get through"
+    when the robot had cleared the terrain cleanly and passed BESIDE the disc, because a few
+    degrees of accumulated heading error over six metres is more than half a metre of lateral
+    miss (``mjeval.terrains.GOAL_HALF_WIDTH_FLOOR``). Measuring the absence of a heading
+    controller is not what this is for. So: any lateral position within the band, and any
+    downrange position at or past the goal line.
+
+    **Downrange it is a HALF-PLANE, where mjeval uses a 2 m-deep band.** mjeval polls
+    ``in_goal`` as a verdict on a trial that keeps running, so it needs a far edge; here the
+    first step past the line ENDS the episode, so a far edge could only add a way to step over
+    the goal and miss it.
+
+    **There is no HEIGHT test, and that leaves a bounded hole.** The generator's containment
+    check does not filter walkable ground by height, so where ``min_half_width`` clamps a
+    narrow flight's band wider than the flight, the band overhangs onto the tile floor below --
+    measured at at most 0.1395 m per side on 5.9% of tiles, stairs only
+    (``motion_gen.terrain.freeform.GOAL_HALF_WIDTH_FLOOR_M`` carries the sweep). Inside that
+    overhang a robot on the floor, up to 4 m under the goal and having never climbed, scores
+    the same successful truncation as one on the runout. Closing it means carrying ``goal_z``
+    into ``FREEFORM_ROUTE_FIELDS`` and picking a tolerance; until then this is the bound.
+
+    Args:
+        env: IsaacLab environment (``env.scene.terrain`` must carry ``terrain_route``).
+        min_half_width: Floor on the band's half-extent (m), applied over each section's own
+            declared ``goal_half_width``. mjeval's floor, for its reason: the widest feature in
+            that catalogue is 3.96 m across, and 2.5 m clears everything with margin.
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs at or past their section's goal line.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    root_pos_w = wp.to_torch(asset.data.root_pos_w)
+    route = freeform_route(env.scene.terrain,
+                           torch.arange(env.num_envs, device=root_pos_w.device))
+    local = tile_local_xy(route["corner"], route["frame_yaw"], root_pos_w)
+    half_w = torch.clamp(route["goal_half_width"], min=float(min_half_width))
+    return (local[:, 0] >= route["goal_x"]) & ((local[:, 1] - route["goal_y"]).abs() <= half_w)

@@ -389,3 +389,68 @@ def test_want_raw_refuses_to_lie_when_a_noiser_is_attached(flat_scene):
     assert noisy.noiser is not None
     with pytest.raises(ValueError, match="raw"):
         noisy.compute(data, want_raw=True)
+
+
+##
+# 4. Sharing the mount draw across two casters whose camera SETS differ
+#
+# The policy is conditioned on the near camera alone while the generator reads both, so a
+# second caster is a SUPERSET of the first. Mirroring by list position would hand the
+# tracker's only mount to whichever camera happens to be first, silently.
+##
+
+def _mounts(cams: MujocoDepthCameras) -> dict:
+    """Every camera's sampled mount, keyed by physical camera."""
+    return {c.key: (c.offset_pos.copy(), c.offset_rot.copy()) for c in cams.cameras}
+
+
+def test_mirror_shares_the_mount_of_a_camera_both_casters_have(flat_scene):
+    """The near camera is one lens, so both casters must place it identically."""
+    model, _ = flat_scene
+    trk = MujocoDepthCameras(model, _spec()[:1])                  # near only
+    gen = MujocoDepthCameras(model, _spec())                      # near + far
+    trk.jitter_extrinsics(np.random.default_rng(0))
+    gen.jitter_extrinsics(np.random.default_rng(1))
+    before = _mounts(gen)
+    gen.mirror_extrinsics_from(trk)
+    after = _mounts(gen)
+    assert np.allclose(after["depth_camera_near"][0], _mounts(trk)["depth_camera_near"][0])
+    assert np.allclose(after["depth_camera_near"][1], _mounts(trk)["depth_camera_near"][1])
+    # The far camera has no tracker draw to adopt and keeps its own -- it is not left on the
+    # nominal mount, which would make it the one lens in the rig with no calibration error.
+    assert np.allclose(after["depth_camera_far"][0], before["depth_camera_far"][0])
+    assert not np.allclose(after["depth_camera_far"][0],
+                           gen.cameras[1].nominal_offset_pos)
+
+
+def test_mirror_matches_by_name_and_not_by_position(flat_scene):
+    """A FAR-only tracker must move the generator's FAR camera, not its first one."""
+    model, _ = flat_scene
+    trk = MujocoDepthCameras(model, _spec()[1:])                  # far only
+    gen = MujocoDepthCameras(model, _spec())                      # near + far
+    trk.jitter_extrinsics(np.random.default_rng(0))
+    before = _mounts(gen)
+    gen.mirror_extrinsics_from(trk)
+    after = _mounts(gen)
+    assert np.allclose(after["depth_camera_far"][0], _mounts(trk)["depth_camera_far"][0])
+    assert np.allclose(after["depth_camera_near"][0], before["depth_camera_near"][0]), (
+        "the tracker's only camera is the FAR one; a positional mirror would have written "
+        "its mount onto the generator's NEAR camera")
+
+
+def test_mirror_refuses_two_casters_with_no_camera_in_common(flat_scene):
+    """Disjoint sets are not two samplings of one rig, whatever their lengths."""
+    model, _ = flat_scene
+    other = MujocoDepthCameras(model, [{**_spec()[0], "sensor": "depth_camera_side"}])
+    gen = MujocoDepthCameras(model, _spec())
+    with pytest.raises(ValueError, match="not two samplings of one camera rig"):
+        gen.mirror_extrinsics_from(other)
+
+
+def test_mirror_still_refuses_a_matched_pair_on_different_nominal_mounts(flat_scene):
+    """Same name, different nominal mount: not one physical camera, so no shared draw."""
+    model, _ = flat_scene
+    moved = MujocoDepthCameras(model, [{**_spec()[0], "offset_pos": [0.2, 0.0, 0.1]}])
+    gen = MujocoDepthCameras(model, _spec())
+    with pytest.raises(ValueError, match="do not share a nominal mount"):
+        gen.mirror_extrinsics_from(moved)

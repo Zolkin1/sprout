@@ -178,9 +178,10 @@ class FmDepthLag:
         """
         if not self.steps:
             return state
-        # `fm_depth` when the generator samples its own grid, else a COPY of the tracker's --
-        # `_fm_depth_reading` treats `fm_depth` as authoritative whenever it is present, so
-        # this reaches the generator without touching what the tracker observes.
+        # `fm_depth` when the generator samples its own grid, else a COPY of the union cast --
+        # `_fm_depth_reading` treats `fm_depth` as authoritative whenever it is present and
+        # selects the generator's own rows out of it, so this reaches the generator without
+        # touching what the tracker observes.
         img = state.get("fm_depth")
         if img is None:
             img = state.get("depth")
@@ -215,13 +216,15 @@ def build_state(
         robot: The MuJoCo robot wrapper.
         policy: The loaded generator + tracker policy (for joint order + ctx).
         command: Velocity command ``(vx, vy, wz)``.
-        depth_cams: The TRACKER's depth cameras to cast, or ``None`` when the policy has
-            none.
+        depth_cams: The cameras to cast -- the UNION of the tracker's and the generator's
+            (``policy.get_depth_camera_spec()``), since the policy reads the near camera
+            alone and the generator both. ``None`` when neither artifact has cameras.
         want_depth_hits: Also collect the depth rays' world hit points (viewer only).
         want_raw_depth: Also collect pre-normalisation depth in metres (replay dump only).
         fm_depth_cams: The GENERATOR's cameras, when it samples the same lenses on its own
-            grid. ``None`` when the two samplings match, in which case the generator reads
-            ``state["depth"]`` like it always did.
+            GRID. ``None`` when the two samplings match, in which case the generator selects
+            its own rows out of ``state["depth"]``. A differing camera SET needs none of
+            this -- one cast of the union serves both.
 
     Returns:
         State dict (numpy, FM/isaac joint order, world frame, xyzw quats).
@@ -334,13 +337,15 @@ def build_state(
             poses.append((p_rel, matrix_from_quat(q_rel)))
         state["fm_camera_pose"] = poses
 
-    # Depth cameras: cast the policy's own pinhole grids against the terrain AND the
-    # robot's visual meshes, normalised exactly as the observation term does. One cast
-    # feeds BOTH consumers -- the tracker's depth obs terms (keyed by term name) and the
-    # FM's exteroception tokens (stacked, matching mdp.depth_obs_stack) -- because there
-    # is one physical camera pair -- the policy keys the rows by obs term itself, from the
-    # contract it loaded. Both cameras run at the control rate, so a single cast per step
-    # is exact: no staleness to model.
+    # Depth cameras: cast the pinhole grids against the terrain AND the robot's visual
+    # meshes, normalised exactly as the observation term does. ONE cast of the UNION feeds
+    # both consumers -- the tracker's depth obs terms (keyed by term name) and the FM's
+    # exteroception tokens (stacked, matching mdp.depth_obs_stack) -- and each SELECTS its
+    # own cameras out of it by name, because the policy reads the near camera alone while
+    # the generator reads both. Casting the two sets separately would give the shared camera
+    # two independent per-frame noise draws, where IsaacLab feeds one sensor's pixels to
+    # both obs groups. Every camera runs at the control rate, so a single cast per step is
+    # exact: no staleness to model.
     if depth_cams is not None:
         # `depth_raw` is METRES along the optical axis, recorded only for --dump_replay: the
         # C++ runtime is fed raw and normalises internally, and the normalisation clips and
@@ -738,11 +743,12 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         clip_handoff_time: In clip mode, sim time (s) at which to hand the reference off
             from the clip to the FM generator (the FM history is kept warm during the
             clip phase). ``< 0`` never hands off (clip-only playback).
-        depth_cams: The TRACKER's depth cameras to cast each control step, or ``None`` when
-            the loaded policy has none. Feeds the tracker's depth obs terms, and the FM's
-            exteroception tokens too when both sample the same grid.
-        fm_depth_cams: The GENERATOR's cameras, cast separately when it samples the same
-            lenses on its own grid (``policy.depth_sampling_is_split()``).
+        depth_cams: The UNION of both artifacts' depth cameras, cast each control step, or
+            ``None`` when the loaded policy has none. Feeds the tracker's depth obs terms and
+            the FM's exteroception tokens, each selecting its own rows by name.
+        fm_depth_cams: The GENERATOR's cameras, cast separately only when it samples the
+            same lenses on its own GRID (``policy.depth_sampling_is_split()``); a differing
+            camera set does not need this.
         depth_viz_stride: Draw every Nth depth pixel's hit point in the viewer. The two
             cameras produce 1560 hits per step, well past ``user_scn.maxgeom``, so the
             cloud is subsampled.
@@ -1842,7 +1848,9 @@ def main() -> None:
 
     # Depth cameras, if the loaded artifacts use them. The contract comes from the ONNX
     # metadata (checked for tracker/generator agreement inside policy.load()), so the
-    # cameras cast here are exactly the ones the networks were trained on.
+    # cameras cast here are exactly the ones the networks were trained on. It is the UNION
+    # of the two artifacts' cameras: the policy is conditioned on the near camera alone and
+    # the generator on both, and each selects its own rows out of this one reading by name.
     depth_cams = None
     depth_spec = policy.get_depth_camera_spec()
     if depth_spec:
@@ -1854,10 +1862,12 @@ def main() -> None:
             print("[INFO] Depth sensor noise ON (plane bias, per-pixel noise, blur, dropout) "
                   "plus mount jitter -- the training distribution, not the play config.")
 
-    # A SECOND caster when the generator samples those same lenses on its own grid. Two
-    # instances rather than one: MujocoDepthCameras returns its cameras as ONE array, which
-    # cannot hold two widths -- and that refusal is still correct, since each artifact's own
-    # cameras do share a resolution.
+    # A SECOND caster ONLY when the generator samples those same lenses on its own GRID.
+    # Two instances rather than one: MujocoDepthCameras returns its cameras as ONE array,
+    # which cannot hold two widths -- and that refusal is still correct, since each
+    # artifact's own cameras do share a resolution. A differing camera SET is NOT this case:
+    # the union above already carries it, and a second cast there would hand the shared
+    # camera two independent per-frame noise draws.
     fm_depth_cams = None
     if policy.depth_sampling_is_split():
         fm_spec = policy.get_fm_depth_camera_spec()
@@ -1867,9 +1877,13 @@ def main() -> None:
               f"(tracker: {depth_spec[0]['width']}x{depth_spec[0]['height']}); casting both.")
         if args.depth_noise:
             fm_depth_cams.enable_noise(np.random.default_rng(args.depth_noise_seed))
-            # The mount jitter is SHARED: one physical camera cannot be in two places, and
-            # the two casters are two samplings of it. (The per-frame noise draws stay
-            # independent -- they cannot be shared across differing pixel counts.)
+            # Draw first, then mirror: the mount jitter is SHARED for a camera BOTH casters
+            # have (one physical camera cannot be in two places), while a camera only the
+            # generator reads has no tracker draw to adopt and keeps this one. Mirroring
+            # alone would leave such a camera on its nominal mount, i.e. the one lens in the
+            # rig with no calibration error. Its own stream, so an unmatched camera's mount
+            # error is not a copy of the tracker's first camera's.
+            fm_depth_cams.jitter_extrinsics(np.random.default_rng(args.depth_noise_seed + 1))
             fm_depth_cams.mirror_extrinsics_from(depth_cams)
 
     # From the CLI when given, else from the graph's own trained distribution. Derived

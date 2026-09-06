@@ -66,6 +66,22 @@ class G1TeacherTerrainSceneCfg(G1TeacherSceneCfg):
         # terrains.clip_terrain_loader.default_num_flat_tiles.)
         # Replica rows for env capacity (rows are pure replicas of the tile set).
         num_rows=10,
+        # NO visual-only decoration while TRAINING. Nothing in this stack avoids obstacles
+        # (no obstacle reward, observation or termination), so walls, rooms and clutter teach
+        # the tracker nothing -- it follows a reference -- while costing render time and depth
+        # pixels on every one of ~12k iterations. The walkable ground is untouched: physical
+        # variation (flight and landing widths, the box support variants) is a manifest rewrite
+        # of the ground, NOT decoration, and stays.
+        #
+        # This is the wrong default for anything with the GENERATOR in the loop or being
+        # RECORDED -- that is where a vertical surface in camera range is the point -- so the
+        # play cfg below turns it back on, and the FM tracker / fine-tune cfgs (which subclass
+        # this scene through the non-play chain) must do the same.
+        #
+        # It is invisible in every artifact: terrain_fingerprint hashes the manifest, so a
+        # decor-off run and a decor-on one export byte-identical metadata. The importer prints
+        # which one it built; see ClipTerrainImporterCfg.render_decor.
+        render_decor=False,
         # No difficulty ordering -> use ALL replica rows (not just [0, max_init]).
         max_init_terrain_level=None,
         collision_group=-1,
@@ -121,6 +137,14 @@ class G1TeacherTerrainEnvCfgPlay(G1TeacherTerrainEnvCfg):
         super().__post_init__()
         # One replica row + one env per tile -> every terrain is shown exactly once.
         self.scene.terrain.num_rows = 1
+        # Decoration BACK ON. The -play tasks are what record_data.py records from (they strip
+        # the depth DR, so a play recording captures clean depth at the nominal pose), and the
+        # FM's whole difficulty with vertical surfaces is that it has barely seen any -- so the
+        # recorder must render them even though the teacher training above does not. It is also
+        # the visual check of the terrain, where the walls are the thing being looked at.
+        # For a play look at exactly what training saw, override
+        # env.scene.terrain.render_decor=False on the CLI.
+        self.scene.terrain.render_decor = True
         self.scene.num_envs = 24
         # Local play is usually on a small GPU; a large terrain clip library would OOM
         # if loaded onto the GPU, so keep the clip library on CPU (device-safe gather).

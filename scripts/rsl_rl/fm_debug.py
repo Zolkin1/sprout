@@ -478,19 +478,30 @@ def contract_report(env, cmd, args, manifest: dict) -> str:
                 sys.path.insert(0, transfer)
             from deploy.depth_obs import assert_depth_specs_agree, parse_depth_spec
             from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (
+                FM_DEPTH_OBS_GROUP,
                 depth_camera_specs,
                 fm_depth_groups,
             )
 
-            # The generator's own cameras when it samples its own grid, else the
-            # policy's -- the same scoping FmTrackingCommand._read_extero uses, so
-            # this compares the contract the FM is actually being fed.
-            live = depth_camera_specs(u, fm_depth_groups(u) or ["policy"])
+            # The GENERATOR's cameras -- the same scoping FmTrackingCommand._read_extero
+            # uses, so this compares the contract the FM is actually being fed. There is no
+            # "or the policy group" fallback: the policy reads the near camera alone, so
+            # that fallback would compare a one-camera env contract against a two-camera
+            # checkpoint and report a mismatch whose real cause is the missing group.
+            groups = fm_depth_groups(u)
+            if groups is None:
+                raise ValueError(
+                    f"this task observes depth but has no active '{FM_DEPTH_OBS_GROUP}' "
+                    "observation group, so the generator is being fed the POLICY's cameras "
+                    "-- the near one alone. play.py installs the group from the FM "
+                    "checkpoint; the FM tracker task installs it in __post_init__."
+                )
+            live = depth_camera_specs(u, groups)
             fm_spec = parse_depth_spec(cmd.ctx.extero_spec, "fm checkpoint")
             # STRICT here, unlike the deploy: these cameras were BUILT from this checkpoint
-            # (play.py reads its resolution and calls add_fm_depth_pair), so they should match
-            # exactly. A difference means the pair was built wrong, which is worth surfacing
-            # rather than tolerating.
+            # (play.py reads its resolution and calls install_fm_depth_group), so they should
+            # match exactly. A difference means the pair was built wrong, which is worth
+            # surfacing rather than tolerating.
             assert_depth_specs_agree(live, fm_spec, "env", "fm checkpoint",
                                      require_same_resolution=True)
             _add("depth camera contract", [
@@ -567,10 +578,17 @@ def _apply_env_overrides(env_cfg, args, manifest: dict) -> None:
               f"obs_corruption={spec.get('obs_corruption')}")
 
     if args.corrupt_obs:
-        for group in ("policy", "reference"):
+        # The SAME group list the DR presets drive, so --corrupt_obs is the exact inverse of
+        # --dr_preset none. It includes the generator's own depth group: that group is
+        # corrupted by default (a generator conditions on a real noisy camera at deploy), and
+        # a list stopping at 'policy' would leave --dr_preset none --corrupt_obs serving the
+        # generator clean depth while claiming training's noise.
+        from eval.dr_presets import CORRUPTED_OBS_GROUPS
+        for group in CORRUPTED_OBS_GROUPS:
             if hasattr(env_cfg.observations, group):
                 getattr(env_cfg.observations, group).enable_corruption = True
-        print("[run_one] observation corruption ON (noise + clipping, as in training)")
+        print("[run_one] observation corruption ON (noise + clipping, as in training) for "
+              f"{[g for g in CORRUPTED_OBS_GROUPS if hasattr(env_cfg.observations, g)]}")
 
     # One episode covers the whole rollout: a mid-run time_out would reset every env onto a
     # fresh (identical) clip and stitch two attempts into one trace.

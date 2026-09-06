@@ -215,17 +215,35 @@ It is the single producer for all consumers, so nothing off-sim restates a camer
   `extero_sensor_dim` — sensor-neutral names; the old `extero_tokens`/`height_dim` are shimmed
   on `.pt` load but a stale `fm.onnx` is refused and must be re-exported), plumbed env cfg ->
   `RecordingMeta.depth_camera_spec` -> FM dataset -> checkpoint -> export;
-- `GenTrackerPolicy.load()` requires the two to AGREE (`transfer/deploy/depth_obs.py`) — there is one
-  physical camera pair, so a tracker and generator running together cannot describe different ones.
+- `GenTrackerPolicy.load()` requires the two to AGREE on every camera they SHARE
+  (`transfer/deploy/depth_obs.py`) — there is one physical camera pair, so a tracker and
+  generator running together cannot describe the same lens differently.
 
-**The generator may SAMPLE that pair on its own grid** (so its vision input can change without
-retraining the teacher). `add_fm_depth_pair(env_cfg, W, H)` in `g1_depth_env_cfg.py` adds a second
-pair built from the SAME `_CameraSpec` — same mount, apertures, range and normalization, only the
-ray grid differs — in its own `fm_depth` obs group, and EXTENDS the three DR events to
-`sensor_cfgs` lists so one draw moves both samplings (extrinsics copy directly; intrinsics
-transfer as a ratio, which is why `operation="scale"` is now required for a list). It is a no-op
-when the resolutions match, and `mdp.fm_depth_groups(env)` then returns `None` = "all groups" =
-the old behaviour, which is what keeps every scoped call site free.
+**The POLICY reads the NEAR camera alone; the GENERATOR reads both.** The tracker follows an
+already-placed reference, so terrain ahead is the generator's problem, not its. That makes the
+tracker's camera set a strict, name-matched SUBSET of the generator's, and it is the shipped
+configuration — so the two contracts have DIFFERENT LENGTHS and `assert_depth_specs_agree`
+matches by NAME (`camera_key`, which strips the `fm_` sampling prefix) rather than by list
+index. Pairing by index would compare the policy's near camera against the generator's far one
+and report two genuinely different cameras as a contract violation. The other direction stays an
+error: a camera the tracker reads and the generator does not is one the pair cannot supply.
+
+**The generator's group is INSTALLED, never inferred.** `install_fm_depth_group(cfg, W=None,
+H=None)` in `g1_depth_env_cfg.py` (it replaced `add_fm_depth_pair`) puts every scene camera in
+its own `fm_depth` obs group. At the policy's own 30x26 the group's terms point at the EXISTING
+sensors — no duplicate ray cast — and at any other grid it builds `fm_`-prefixed duplicates from
+the SAME `_CameraSpec` (same mount, apertures, range and normalization; only the ray grid
+differs) and EXTENDS the three DR events to `sensor_cfgs` lists so one draw moves both samplings
+(extrinsics copy directly; intrinsics transfer as a ratio, which is why `operation="scale"` is
+now required for a list). `mdp.fm_depth_groups(env)` returns that group and
+`mdp.rl_depth_groups(env)` everything else.
+- **A missing group is a FAULT, not an opt-out.** Without it `fm_depth_groups` falls back to
+  `None` = "all groups", which on this task is the policy's NEAR camera alone: the recorder
+  would stamp a one-camera `depth_camera_spec`, the FM would train on it, `export_fm_onnx` would
+  emit a matching graph and the deploy agreement check would PASS — every artifact
+  self-consistent about a half-blind generator. `assert_fm_depth_group_covers_every_camera` is
+  the guard; every task and script that runs or records the generator installs the group
+  unconditionally.
 - Who states the resolution: `record_data.py --fm_depth_resolution WxH` DECLARES it (no artifact
   exists yet); `play.py` and `augment_registration.py` DERIVE it (from the checkpoint via
   `online.read_fm_extero_meta`, and from the recording's own `depth_camera_spec`).
@@ -432,6 +450,25 @@ rewritten offline while the motion stays exactly as recorded, which is what the 
 - The **decoration channel is VISUAL ONLY** and lives on its own prim (`decor.DECOR_PRIM_PATH`
   = `/World/decor`), which the depth cameras cast against and physics ignores. It is the one
   thing that changes what the robot SEES without changing what it stands on.
+- **The RL TEACHER renders none of it** (`ClipTerrainImporterCfg.render_decor`, default `True`,
+  set `False` on `G1TeacherTerrainSceneCfg`). Nothing in this stack avoids obstacles, so walls
+  and rooms teach the tracker nothing while costing render time and depth pixels over ~12k
+  iterations. It is a RENDER-time drop, not a second library: one `.h5` serves both roles, so
+  no clip fingerprint or sha256 moves. Everything with the GENERATOR in the loop or being
+  RECORDED turns it back on -- the `-play` cfgs, the FM tracker, the fine-tune task,
+  `record_data.py`, `augment_registration.py` -- because a vertical surface it has never seen
+  is what the generator misreads as a box.
+- **What is decoration and what is not.** Flight and landing WIDTHS and the box SUPPORT
+  variants (`solid` / `floating` / `floating_center_leg` / `floating_corner_legs`) are manifest
+  rewrites of the WALKABLE ground and are unaffected by the flag. Only `decor=True` overlays,
+  the `flat_tile_decor` rooms and a schema-1 clutter sidecar are dropped; a schema-2 ground
+  variant is not decoration and passes through (asking for clutter with `render_decor=False`
+  is refused rather than silently rendering nothing).
+- **`render_decor` is invisible in every artifact.** `terrain_fingerprint` hashes the MANIFEST,
+  so a decor-on and a decor-off run export byte-identical metadata, `tracker.onnx` included.
+  The only record is the run's `params/env.yaml` and the importer's startup print, which is why
+  it prints. Folding it into the fingerprint would make a decoration-only difference read as a
+  GROUND difference to every check that compares it.
 - Walls ring the RENDERED FLOOR rather than the manifest tile, up to four per tile, and the flat
   tiles get rooms. `test_wall_footprint.py` and `test_decor_prim_is_mandatory.py` pin both.
 - `decor.py` imports NOTHING on purpose. The depth camera cfgs need the prim path at module

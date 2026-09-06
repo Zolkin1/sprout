@@ -19,6 +19,10 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     The clip library supplies **only** the reset spawn pose (and the terrain meshed from
     it) and the ``target_vel`` command -- there is no clip fallback for the reference
     itself, not even during warmup. See :attr:`strict_fm_only`.
+
+    On the free-form terrain sections it supplies neither: :attr:`freeform_command` generates
+    the velocity command instead, and the reset spawns off the manifest, so that library needs
+    no clips at all.
     """
 
     fm_depth_lag_steps: int | None = None
@@ -244,6 +248,105 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     counterpart (``GenTrackerPolicy(zero_noise=...)``, exposed as ``--zero_noise`` /
     ``--gaussian_noise``) defaults it ON, so a default Isaac run and a default MuJoCo run are
     NOT comparing like with like. ``x0 = 0`` is off the training distribution."""
+
+    # --- Free-form velocity command (the terrain sections of the FM fine-tune) ---
+    #
+    # Every field below is inert while ``freeform_command`` is False, which is the default, so
+    # the five clip tasks keep the library's ``target_vel`` untouched.
+
+    freeform_command: bool = False
+    """Generate the velocity command HERE instead of reading the clip's ``target_vel``.
+
+    The clip-driven tasks take the command from the library because the clip WAS generated
+    from it -- reference and command are one artefact. The free-form terrain sections have no
+    clips: the reference is whatever the generator predicts from depth, so a command has to be
+    manufactured, and it is manufactured the way the deployed joystick supplies one -- a
+    forward speed plus a yaw rate that keeps the robot pointed down the section.
+
+    Turning this on replaces all four command-velocity accessors
+    (:meth:`~.fm_tracking_cmd.FmTrackingCommand.get_command_velocity` and the three
+    look-ahead forms), which is every path the command reaches: the FM's own conditioning
+    tokens, the policy's ``command_window`` observation, the recorder's ``target_vel`` column
+    and the eval accumulator's tracking target. It also makes the command self-sufficient of a
+    library ``target_vel`` -- ``command_velocity_available`` reports True regardless -- which
+    is what lets a manifest-only terrain ``.h5`` be passed as ``--clip``.
+
+    **The command is HELD across every offset**, where the clip path serves a per-offset
+    future. See :attr:`freeform_speed_min` for why that is a train/deploy mismatch being
+    removed rather than a simplification.
+    """
+
+    freeform_speed_min: float = 0.6
+    """Low end of the per-episode forward-speed draw (m/s), inclusive.
+
+    One constant per EPISODE, drawn uniformly in ``[min, max]`` at reset and held for the
+    whole rollout -- which is how every terrain clip in the training library was generated
+    (one commanded velocity per clip, no ramp, from frame 0). ``vy`` is always exactly 0.0:
+    the hardware controller ships ``v_y_scale: 0.0`` and the library measures
+    ``|vy| max = 0.0000`` across all 3500 stair clips, so a lateral channel would train
+    something the deployed pair cannot ask for.
+
+    The default band is the trained stair grid's endpoints (``transfer/sim/mjeval/terrains``
+    ``STAIR_SPEEDS``: a uniform 0.600 .. 2.600 over 3500 clips). Restated rather than imported
+    because ``robot_rl`` must not import the MuJoCo half.
+
+    **The whole (vx, 0, wz) triple is broadcast across every window offset and across the
+    generator's F-step horizon.** The clip path instead serves ``target_vel`` sampled at each
+    offset, which is a future no deployed runtime has: both ``transfer/deploy/gen_tracker.py``
+    and the C++ runtime hold ONE command across the offsets and over F ("the future command is
+    not knowable; hold the one from request time"). So holding it here removes a train/deploy
+    mismatch for free -- but it does change what the tracker's reference-group encoder sees,
+    because ``command_window`` goes from 13 distinct rows to 13 copies of one.
+    """
+
+    freeform_speed_max: float = 2.6
+    """High end of the per-episode forward-speed draw (m/s), inclusive.
+
+    See :attr:`freeform_speed_min`. Must be ``>=`` it; equal pins every episode to one speed.
+    """
+
+    freeform_cmd_hold_s: float = 0.5
+    """Seconds of ZERO command at the start of every episode, before the step to the draw.
+
+    The robot spawns from a standing pose at rest and would otherwise be told the full speed
+    on the very first control step. A HOLD then a STEP, not a ramp: a ramp is its own
+    off-distribution shape, while standing-to-walk transitions at a command that starts at 0.0
+    are something the flat family actually contains. The number is
+    ``transfer/sim/mjeval/terrains.CMD_HOLD_S``, where it was measured: on the first
+    400-episode MuJoCo grid 59% of the baseline's falls (94 of 159) never reached the terrain
+    at all, and in the fast half of the ladder the median fall was 0.40 m from spawn.
+
+    Rounded to whole control steps against ``env.step_dt``; ``0`` restores the instant-full-
+    speed opening.
+    """
+
+    freeform_steer_kp: float = 1.0
+    """Proportional gain (1/s) from heading error to commanded yaw rate.
+
+    ``0`` disables steering and leaves ``wz = 0`` -- the constant ``(vx, 0, 0)`` the training
+    clips carry -- while everything else about the free-form command stays on. See
+    :func:`~.fm_tracking_cmd.freeform_yaw_rate` for the law, the cross-track gain it implies
+    with :attr:`freeform_lookahead_m`, and the distribution change it is.
+    """
+
+    freeform_lookahead_m: float = 5.0
+    """Distance along the section centreline to the point the robot is aimed at (m).
+
+    Must be ``> 0``. A pure P on BEARING has effective cross-track gain ``kp / L``, so this
+    and :attr:`freeform_steer_kp` are not independent: at the default pair that is 0.2 1/s,
+    and 5 m of look-ahead across a 1.219 m flight is a weak restoring gain. ``L`` is therefore
+    the first thing to tune if lateral drift persists -- shortening it stiffens the loop
+    without touching ``kp``.
+    """
+
+    freeform_wz_max: float = 0.68
+    """Symmetric clip on the steering yaw rate (rad/s).
+
+    0.68 is the largest ``|wz|`` the training library ever commands, on the box family
+    (``transfer/sim/mjeval/runner.STEER_WZ_MAX``, restated because ``robot_rl`` cannot import
+    the MuJoCo half). It is a bound on how far outside the commanded distribution the
+    generator is pushed, not a physical limit.
+    """
 
     # --- Debug visualization ---
     debug_vis_show_fm_prediction: bool = True

@@ -10,7 +10,9 @@ the consumer side, shared by the MuJoCo sim2sim caster
 
 * :func:`parse_depth_spec` validates an embedded contract;
 * :func:`assert_depth_specs_agree` refuses a tracker/generator pair that disagrees
-  about the one physical camera pair they both read;
+  about the physical cameras they SHARE -- the tracker's set may be a strict SUBSET of the
+  generator's, which is the shipped configuration (the policy reads the near camera, the
+  generator both), so cameras are matched by NAME and never by list index;
 * :func:`normalize_depth_np` reproduces ``mdp.observations.depth.normalize_depth``
   exactly, which is what turns metres of range into the numbers the networks saw --
   with :func:`denormalize_depth_np` and :func:`invalid_depth_value` for the diagnostics
@@ -57,10 +59,17 @@ _NAMING_FIELDS: frozenset[str] = frozenset({"obs_term", "update_period"})
 #: height may differ, so must they. ``sensor`` is here rather than in
 #: :data:`_NAMING_FIELDS` on purpose: the generator's cameras carry distinct scene names, so
 #: it cannot be compared when the samplings are split, but a re-tightened check should still
-#: catch a swapped or renamed camera.
+#: catch a swapped or renamed camera. It is not the identity check either way -- that is
+#: :func:`camera_key`, which strips exactly the one prefix those distinct names add.
 _SAMPLING_FIELDS: frozenset[str] = frozenset(
     {"sensor", "width", "height", "fx", "fy", "cx", "cy"}
 )
+
+#: The prefix ``install_fm_depth_group`` gives the GENERATOR's own sampling of a lens
+#: (``fm_depth_camera_near`` beside the policy's ``depth_camera_near``). A camera's IDENTITY
+#: is the physical lens, not the scene prim, so this is stripped before two contracts are
+#: matched -- otherwise one lens sampled twice would read as two different cameras.
+_FM_SAMPLING_PREFIX: str = "fm_"
 
 #: Whether a tracker and a generator must SAMPLE the depth cameras identically.
 #:
@@ -256,47 +265,123 @@ def camera_half_angles_rad(cam: dict) -> tuple[float, float, float, float]:
     )
 
 
+def camera_key(cam: dict) -> str:
+    """The PHYSICAL camera a contract entry describes, as a name two artifacts can match on.
+
+    Pairing by list INDEX is what this replaces, and it stopped being safe the moment the
+    two artifacts could list different cameras: the policy reads the near camera alone while
+    the generator reads both, so index ``i`` no longer names one lens and pairing by it would
+    compare the policy's near camera against the generator's far one.
+
+    ``sensor`` is the scene name and is the identity; ``obs_term`` is the fallback for a
+    contract that carries no sensor name. The ``fm_`` prefix is stripped because
+    ``install_fm_depth_group`` names the generator's own sampling of a lens
+    ``fm_depth_camera_near`` -- a second grid on the SAME mount, not a second camera.
+
+    Args:
+        cam: One camera contract entry.
+
+    Returns:
+        The camera's identity.
+
+    Raises:
+        ValueError: If the entry carries neither ``sensor`` nor ``obs_term``, in which case
+            nothing can say which lens it is.
+    """
+    name = cam.get("sensor") or cam.get("obs_term")
+    if not name:
+        raise ValueError(
+            "a depth-camera contract entry carries neither 'sensor' nor 'obs_term', so there "
+            "is no name to match it to the other artifact's cameras by."
+        )
+    name = str(name)
+    return name[len(_FM_SAMPLING_PREFIX):] if name.startswith(_FM_SAMPLING_PREFIX) else name
+
+
+def index_cameras_by_key(spec: list[dict], source: str = "spec") -> dict[str, dict]:
+    """One contract as ``{camera identity: entry}``, in contract order.
+
+    Args:
+        spec: A parsed contract.
+        source: Label for the error message.
+
+    Returns:
+        The entries keyed by :func:`camera_key`.
+
+    Raises:
+        ValueError: If two entries resolve to the same physical camera -- which would make
+            every by-name match ambiguous and silently drop one of them.
+    """
+    out: dict[str, dict] = {}
+    for cam in spec:
+        key = camera_key(cam)
+        if key in out:
+            raise ValueError(
+                f"{source} lists two cameras that both resolve to '{key}'; a contract names "
+                "each physical camera once, and a by-name match cannot choose between them."
+            )
+        out[key] = cam
+    return out
+
+
 def assert_depth_specs_agree(
     a: list[dict], b: list[dict], name_a: str = "tracker", name_b: str = "generator",
     require_same_resolution: bool | None = None,
 ) -> None:
-    """Raise unless two artifacts describe the same physical depth cameras.
+    """Raise unless ``a``'s depth cameras are ``b``'s, or a strict SUBSET of them.
 
     A deployment has ONE camera pair, so a tracker and a generator running together must
     have trained on the same mount, optics, range and normalisation.  Mismatched geometry
     is otherwise silent: both networks accept the wrong image and simply behave worse.
 
-    The generator may SAMPLE that pair on its own grid (so its vision input can change
-    without retraining the policy), which is what ``require_same_resolution=False`` allows.
-    Relaxing it is not merely "drop width and height": that would also permit a different
-    LENS, since ``fx/fy/cx/cy`` are free to move once the resolution is. So the sampling
-    fields are exchanged for a positive check on the resolution-invariant cone
+    **``a`` may read FEWER cameras than ``b``, and that is the shipped configuration.**  The
+    policy is conditioned on the NEAR camera alone -- it tracks a reference and does not need
+    to read terrain ahead -- while the generator reads both.  So the two contracts have
+    different lengths, index ``i`` no longer names one lens, and cameras are matched by NAME
+    (:func:`camera_key`) instead.  Pairing by index here would compare the policy's near
+    camera against the generator's far one and report the mount, cone and range of two
+    genuinely different cameras as a contract violation.
+
+    The other direction stays an error: a camera ``a`` reads and ``b`` does not is one the
+    pair cannot supply, and it is reported in those words.
+
+    The generator may also SAMPLE those lenses on its own grid (so its vision input can
+    change without retraining the policy), which is what ``require_same_resolution=False``
+    allows.  Relaxing it is not merely "drop width and height": that would also permit a
+    different LENS, since ``fx/fy/cx/cy`` are free to move once the resolution is. So the
+    sampling fields are exchanged for a positive check on the resolution-invariant cone
     (:func:`camera_half_angles_rad`) -- the constraint is weakened, not removed.
 
     Args:
-        a: Parsed contract from the first artifact.
-        b: Parsed contract from the second artifact.
+        a: Parsed contract from the first artifact (the SUBSET side -- the tracker).
+        b: Parsed contract from the second artifact (the superset -- the generator).
         name_a: Label for the first artifact, used in the error.
         name_b: Label for the second artifact, used in the error.
         require_same_resolution: Whether the two must sample identically. ``None`` takes
             :data:`REQUIRE_SAME_DEPTH_RESOLUTION`, the deployment-wide default.
 
     Raises:
-        ValueError: On a differing camera count, any differing physical field, or (when
-            resolutions may differ) a differing cone -- listing every disagreement rather
-            than only the first.
+        ValueError: On a camera ``a`` has and ``b`` lacks, a duplicated camera identity, any
+            differing physical field, or (when resolutions may differ) a differing cone --
+            listing every disagreement rather than only the first.
     """
     strict = REQUIRE_SAME_DEPTH_RESOLUTION if require_same_resolution is None \
         else bool(require_same_resolution)
-    if len(a) != len(b):
+    index_a = index_cameras_by_key(a, name_a)
+    index_b = index_cameras_by_key(b, name_b)
+    absent = [key for key in index_a if key not in index_b]
+    if absent:
         raise ValueError(
-            f"{name_a} has {len(a)} depth camera(s) but {name_b} has {len(b)}; they "
-            "cannot be reading the same physical pair."
+            f"{name_a} reads depth camera(s) {absent} that {name_b} does not have "
+            f"({name_a}: {list(index_a)}; {name_b}: {list(index_b)}). {name_a}'s cameras "
+            f"must be a SUBSET of {name_b}'s: the generator may read cameras the policy does "
+            "not, never the other way round -- nothing in the pair can state a contract for "
+            "a camera only one artifact knows about."
         )
     ignored = _NAMING_FIELDS if strict else (_NAMING_FIELDS | _SAMPLING_FIELDS)
     diffs: list[str] = []
-    for i, (cam_a, cam_b) in enumerate(zip(a, b)):
-        label = cam_a.get("sensor") or cam_a.get("obs_term") or f"camera {i}"
+    for label, cam_a in index_a.items():
+        cam_b = index_b[label]
         for field in sorted((set(cam_a) | set(cam_b)) - ignored):
             va, vb = cam_a.get(field), cam_b.get(field)
             if _values_differ(va, vb):

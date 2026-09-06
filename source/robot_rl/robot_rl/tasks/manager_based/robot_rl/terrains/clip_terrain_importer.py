@@ -93,6 +93,34 @@ def create_decor_prim(decor_mesh, prim_path: str) -> int:
     return 0 if empty else len(faces)
 
 
+def assert_sidecar_is_rendered(doc: dict, render_decor: bool, path: str) -> None:
+    """Refuse a clutter sidecar that ``render_decor=False`` would then throw away.
+
+    Schema 1 contributes NOTHING but ``decor`` boxes, so merging one into a run that does not
+    render decoration produces a world byte-identical to the same run with no sidecar at all --
+    while the merge still prints "+N visual-only boxes". Asking for clutter and then not
+    rendering it is a contradiction the caller has to see, not a no-op to absorb.
+
+    Schema 2 (``ground_variants``) is deliberately NOT covered: it edits the walkable ground,
+    which this flag does not touch, so the combination is meaningful.
+
+    Args:
+        doc: The parsed sidecar.
+        render_decor: The importer cfg's flag.
+        path: The sidecar path, for the message.
+
+    Raises:
+        ValueError: On a schema-1 sidecar with ``render_decor=False``.
+    """
+    if render_decor or int(doc.get("schema", 1)) != 1:
+        return
+    raise ValueError(
+        f"decor_overlay_path={path!r} is a clutter sidecar (schema 1), which adds ONLY "
+        "visual-only boxes, but render_decor=False drops every one of them -- this run would "
+        "be identical to one with no sidecar. Drop the sidecar, or set render_decor=True."
+    )
+
+
 class ClipTerrainImporter(TerrainImporter):
     """Custom-mesh importer for clip-library terrains with per-env terrain id."""
 
@@ -135,6 +163,7 @@ class ClipTerrainImporter(TerrainImporter):
                 "command's commands.traj_ref.path to the same file."
             )
         lib = load_clip_library(cfg.clip_library_path, device="cpu")
+        render_decor = bool(getattr(cfg, "render_decor", True))
         self._clutter: dict | None = None
         if getattr(cfg, "decor_overlay_path", ""):
             # Merged before the mesh is assembled, so the clutter goes through exactly the
@@ -145,6 +174,7 @@ class ClipTerrainImporter(TerrainImporter):
             from motion_gen.terrain.clutter import merge_flat_decor, merge_into_manifest
             with open(cfg.decor_overlay_path) as _fh:
                 self._clutter = _json.load(_fh)
+            assert_sidecar_is_rendered(self._clutter, render_decor, cfg.decor_overlay_path)
             _man = lib.attrs.get("terrain_manifest")
             _man = _json.loads(_man) if isinstance(_man, str) else list(_man or [])
             # Two sidecar kinds arrive on this one path. Schema 1 is the clutter pass and
@@ -181,13 +211,15 @@ class ClipTerrainImporter(TerrainImporter):
             lib, num_rows=cfg.num_rows, num_flat_tiles=cfg.num_flat_tiles,
             col_gap=cfg.col_gap, row_gap=cfg.row_gap, size_margin=cfg.size_margin,
             flat_buffer=cfg.flat_buffer, transition_back_buffer=cfg.transition_back_buffer,
+            render_decor=render_decor,
         )
         self.import_mesh("terrain", mesh)
-        # `render_decor=False` takes the same path an undecorated library takes, rather
-        # than a second one: `create_decor_prim(None, ...)` writes the placeholder, so
-        # /World/decor exists either way and the depth cameras keep their target prim.
-        self._import_decor(layout.decor_mesh if getattr(cfg, "render_decor", True)
-                           else None)
+        # The suppression itself happens UPSTREAM, in the layout assembly above
+        # (`render_decor=render_decor`), so `decor_mesh` is already empty here and the flag
+        # only tells `_import_decor` which of the two empty cases to print. Suppressing at
+        # this call site instead -- the older form -- left the decoration assembled and threw
+        # it away, which also skipped `assert_sidecar_is_rendered`.
+        self._import_decor(layout.decor_mesh, render_decor)
         # Base curriculum origin distribution: terrain_levels (rows) + terrain_types
         # (columns == tiles); env_origins = origins[level, type] = tile center.
         self.configure_env_origins(origins)
@@ -209,6 +241,12 @@ class ClipTerrainImporter(TerrainImporter):
         self.clip_size_y = layout.clip_size_y
         self.terrain_type_code = layout.terrain_type_code
         self.terrain_frame_yaw = layout.terrain_frame_yaw
+        # Per-terrain-id free-form section route; an EMPTY dict on every clip library. The
+        # clip-free runtime (``mdp.events.resets.freeform_route``) both reads it and reads its
+        # ABSENCE as "this is not a free-form terrain", so it is exposed unconditionally
+        # rather than only when non-empty -- an attribute that appears on some libraries and
+        # not others would make the check a getattr default instead of a value.
+        self.terrain_route = layout.terrain_route
         # Per-tile terrain-frame heading, tabled for the per-env gather below. The tile's mesh is
         # emitted axis-aligned and translated onto its corner, so a terrain's world frame yaw IS its
         # authored tile-local frame yaw.
@@ -230,16 +268,28 @@ class ClipTerrainImporter(TerrainImporter):
     #: explicitly (``g1_depth_env_cfg``).
     DECOR_PRIM_PATH = _DECOR_PRIM_PATH
 
-    def _import_decor(self, decor_mesh) -> None:
-        """Import the decoration mesh as a visual-only prim.
+    def _import_decor(self, decor_mesh, render_decor: bool = True) -> None:
+        """Import the decoration mesh as a visual-only prim, and SAY which case this is.
+
+        A decor-off run is invisible in every artifact -- ``terrain_fingerprint`` hashes the
+        manifest, not this flag -- so the log is the only record that the cameras saw bare
+        tiles. That is why the suppressed case gets its own line rather than sharing the
+        "no decoration in this library" one: those are different worlds from the same file.
 
         Args:
-            decor_mesh: The assembled decoration, or ``None`` for an undecorated library.
+            decor_mesh: The assembled decoration, or ``None`` for none at all.
+            render_decor: The cfg flag, so the print can distinguish "suppressed" from
+                "the library has none".
         """
         n = create_decor_prim(decor_mesh, self.DECOR_PRIM_PATH)
         if n:
             print(f"[ClipTerrainImporter] decoration: {n} faces at {self.DECOR_PRIM_PATH} "
                   "(visual only -- no collider, not in the height scan)")
+        elif not render_decor:
+            print("[ClipTerrainImporter] render_decor=False: visual-only decoration SUPPRESSED "
+                  "(tile walls, flat-tile rooms, clutter); the walkable ground is unchanged. "
+                  f"{self.DECOR_PRIM_PATH} carries the unhittable placeholder. NOT in "
+                  "terrain_fingerprint -- this line and params/env.yaml are the only record.")
         else:
             print(f"[ClipTerrainImporter] no decoration in this library; "
                   f"{self.DECOR_PRIM_PATH} carries the unhittable placeholder")
