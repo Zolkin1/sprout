@@ -92,3 +92,11 @@ def test_alpha_defaults_to_one_but_zero_is_expressible(cfg) -> None:
     cfg2 = G1TokenAdjusterEnvCfg()
     cfg2.residual_alpha = 0.0
     assert cfg2.residual_alpha == 0.0
+
+
+def test_the_generator_is_sampled_the_way_the_adjuster_was_fitted(cfg) -> None:
+    """The residual dataset was built at x0 = 0 and the deployed controller runs x0 = 0, so
+    RL must correct the same deterministic plans. A stochastic generator here would train the
+    policy against a plan distribution neither end of the pipeline ever sees, and a plan is a
+    plan -- nothing about the shapes would say so."""
+    assert cfg.commands.traj_ref.fm_zero_noise is True

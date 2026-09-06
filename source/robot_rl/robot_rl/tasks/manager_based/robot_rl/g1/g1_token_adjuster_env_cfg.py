@@ -116,3 +116,10 @@ class G1TokenAdjusterEnvCfg(G1AdjusterEnvCfg, TokenAdjusterEnvCfg):
         # the CFG, not via `enable_cond_stash()`, which runs after the observation manager
         # has probed shapes.
         self.commands.traj_ref.stash_conditioning = True
+        # x0 = 0, matching BOTH ends of this arm. The residual dataset was built by sampling
+        # the generator at zero noise, so the plans the adjuster was fitted to correct are
+        # the deterministic ones; and the deployed C++ controller runs zero-noise too. Left
+        # stochastic, RL would train the policy to correct plans drawn from a distribution
+        # neither its initialisation nor its deployment ever sees -- at exactly the same
+        # shape, since a plan is a plan.
+        self.commands.traj_ref.fm_zero_noise = True

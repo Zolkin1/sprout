@@ -1420,7 +1420,22 @@ class FmTrackingCommand(MotionSequenceCommand):
         never depends on measured state.
         """
         step = int(getattr(self.env, "common_step_counter", self._last_step_seen + 1))
-        if step == self._last_step_seen:
+        # A DUPLICATE STEP MUST STILL PROCESS A PENDING RESET.
+        #
+        # The de-duplication exists so a step that computes the command twice pushes one
+        # history row, and it used to return unconditionally. But `env.reset()` calls
+        # `command_manager.compute` at whatever counter the preceding `step()` already used,
+        # so a reset arriving there was swallowed whole: the robot was teleported onto a new
+        # clip and a new tile while the generator kept the previous episode's history ring
+        # and its stale plan. Measured on the adjuster's RL loop -- 2% of envs failing within
+        # 0.24 s on the first iteration, 30-44% on every one after, with the action provably
+        # inert. Nothing raised; the plans were merely wrong.
+        #
+        # So a duplicate step still runs the reset bookkeeping (invalidate, seed, re-plan)
+        # and skips only `_push_served_node`, which is the one part that must happen once per
+        # control step rather than once per call.
+        duplicate = step == self._last_step_seen
+        if duplicate and not bool(self._pending_reset.any()):
             return
         self._last_step_seen = step
 
@@ -1441,7 +1456,8 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._measured_node_valid = self._measured_node_valid & ~just_reset
 
         self._history.invalidate(just_reset)
-        self._push_served_node()
+        if not duplicate:
+            self._push_served_node()
         # AFTER the push: it appends a row (zeros for a reset env, whose stash was just
         # cleared), so seeding first would have that row shift the oldest seeded one out.
         # Seeding last overwrites the whole ring for those envs and clears their mask.
