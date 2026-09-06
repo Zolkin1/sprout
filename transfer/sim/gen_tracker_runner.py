@@ -1288,6 +1288,12 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 viewer.cam.trackbodyid = mujoco.mj_name2id(robot.mj_model, mujoco.mjtObj.mjOBJ_BODY, "torso_link")
                 viewer.cam.type = mujoco.mjtCamera.mjCAMERA_TRACKING
                 _apply_viz_options(viewer, robot.mj_model, viz_geomgroup, viz_contacts)
+                if getattr(policy, "plan_hook", None) is not None:
+                    # The chooser draws candidates and syncs the viewer ITSELF, because it
+                    # blocks on input from inside the observation build -- the runner's own
+                    # draw/sync at the end of the step would not run until after the answer.
+                    policy.plan_hook.viewer = viewer
+                    policy.plan_hook.add_sphere = _add_sphere
                 success = loop_fn(viewer)
 
     if log_file:
@@ -1481,6 +1487,19 @@ def main() -> None:
                              "straight through (chosen empirically -- it looks better in MuJoCo). "
                              "Pass 2.0 to match the clip library's training ramp rate. Overridden "
                              "by tracker metadata 'max_acc' when that key is present.")
+    parser.add_argument("--interactive_plans", type=int, default=0, metavar="K",
+                        help="Interactive plan explorer: at every re-plan, draw the top K "
+                             "candidate plans from --planner_pt and pick one by keypress. "
+                             "Implies a paused, single-robot session; needs the viewer.")
+    parser.add_argument("--planner_pt", default=None,
+                        help="Token planner .pt for --interactive_plans. The TORCH model, "
+                             "since only it reports per-token log-probabilities.")
+    parser.add_argument("--plan_pool", type=int, default=32,
+                        help="Candidates sampled per re-plan before ranking/de-duplication.")
+    parser.add_argument("--plan_temperature", type=float, default=1.0)
+    parser.add_argument("--plan_seed", type=int, default=0)
+    parser.add_argument("--plan_auto", type=int, default=None,
+                        help="Skip the prompt and always take this candidate index.")
     parser.add_argument("--fm_traj_points", type=int, default=0,
                         help="Number of spheres drawn along the FM predicted root/feet trajectory; "
                              "<=0 draws every predicted node (dense ribbon, like IsaacLab).")
@@ -1688,6 +1707,22 @@ def main() -> None:
         history_from=args.history_from,
     )
     policy.load()
+    if args.interactive_plans > 0:
+        if not args.planner_pt:
+            parser.error("--interactive_plans needs --planner_pt (the token planner .pt)")
+        if args.headless and args.plan_auto is None:
+            parser.error("--interactive_plans needs the viewer to show candidates and a "
+                         "terminal to answer on; drop --headless, or pass --plan_auto N to "
+                         "run it scripted (always take candidate N), which is headless-safe "
+                         "and is how it is smoke-tested.")
+        from plan_chooser import PlanChooser  # noqa: PLC0415
+        policy.plan_hook = PlanChooser(
+            args.planner_pt, device=("cuda" if not args.tracker_on_cpu else "cpu"),
+            num_candidates=args.interactive_plans, num_samples=args.plan_pool,
+            temperature=args.plan_temperature, seed=args.plan_seed, auto=args.plan_auto)
+        print(f"[INFO] interactive plan explorer: {args.interactive_plans} candidates from a "
+              f"pool of {args.plan_pool}, temperature {args.plan_temperature}. The sim pauses "
+              "at every re-plan.")
     replay = None
     if args.dump_replay:
         from deploy.replay_stream import ReplayWriter

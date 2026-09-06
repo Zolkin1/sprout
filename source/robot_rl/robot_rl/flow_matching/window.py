@@ -709,6 +709,132 @@ def clamp_window_rotation_residual(
     limited = torch.where(inside, adjusted[..., start:start + 6], shrunk)
     return torch.cat([adjusted[..., :start], limited, adjusted[..., start + 6:]], dim=-1)
 
+def window_rotation_span(
+    num_joints: int,
+    num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
+) -> slice | None:
+    """Column span of ``base_pose``'s 6D rotation half within ONE node, or ``None``.
+
+    ``None`` when the selection packs no ``base_pose`` -- then there is no rotation to project
+    or bound and a residual is a plain addition.
+
+    Args:
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: The selection the window is packed with; defaults to all of them.
+
+    Returns:
+        A 6-wide :class:`slice`, or ``None``.
+    """
+    slices = window_block_slices(num_joints, num_ee_frames, blocks)
+    if "base_pose" not in slices:
+        return None
+    start = slices["base_pose"].start + 3
+    return slice(start, start + 6)
+
+
+def compose_window_residual(
+    plan: torch.Tensor,
+    residual: torch.Tensor,
+    num_joints: int,
+    num_ee_frames: int,
+    blocks: Sequence[str] | None = None,
+    alpha: float = 1.0,
+    max_tilt_rad: float = RESIDUAL_MAX_TILT_RAD,
+) -> torch.Tensor:
+    """Add a residual to a window and return a window that is still a valid reference.
+
+    THE composition rule -- the one an RL adjuster applies to the live plan
+    (``FmTrackingCommand.apply_plan_residual``), and the one an offline residual dataset must
+    invert to define its own target. Those two must agree exactly, or a residual fitted
+    offline means something different from the residual served online, so they share this
+    function rather than each stating the arithmetic.
+
+    Three steps, in this order and for these reasons:
+
+    1. **Add**, elementwise, in raw units. ``base_pose``'s rotation half is six free numbers
+       here, so the sum leaves SO(3).
+    2. **Project** it back (:func:`project_window_rotations`), because the served window is
+       both a reference pose and the next step's history token.
+    3. **Bound the ANGLE** (:func:`clamp_window_rotation_residual`), because the projection
+       says nothing about how far the frame rotated and the failure termination's tilt check
+       is measured against this very reference. After the projection, since ``so3_log`` needs
+       a real rotation.
+
+    .. admonition:: A zero residual returns the plan bit-identically, and that is load-bearing
+
+        Gram-Schmidt is not the identity on already-orthonormal input in float32 -- measured
+        2.4e-7 on 6.7% of channels. Projecting unconditionally would mean the adjuster at zero
+        action does NOT reproduce the bare generator, and on a robot a 1e-7 seed is a chaotic
+        divergence rather than a rounding difference. So the projected-and-bounded rotation is
+        taken only on nodes whose rotation channels actually moved.
+
+    Args:
+        plan: ``[..., F, D]`` the window being corrected, in raw units.
+        residual: ``[..., F, D]`` the correction, in raw units, same shape as ``plan``.
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: The selection both are packed with; defaults to all of them.
+        alpha: Scalar gain on the residual, applied before anything else. ``0.0`` makes this
+            the identity on ``plan``, which is how an adjuster is initialised as a no-op.
+        max_tilt_rad: The per-node rotation bound; defaults to :data:`RESIDUAL_MAX_TILT_RAD`.
+
+    Returns:
+        ``[..., F, D]`` the corrected window, in raw units.
+
+    Raises:
+        ValueError: If ``residual`` does not match ``plan``'s shape. Broadcasting here would
+            silently apply one node's correction to every node.
+    """
+    if residual.shape != plan.shape:
+        raise ValueError(
+            f"residual has shape {tuple(residual.shape)} but the plan is "
+            f"{tuple(plan.shape)}; they must match exactly."
+        )
+    scaled = residual if alpha == 1.0 else residual * float(alpha)
+    summed = plan + scaled
+    adjusted = project_window_rotations(summed, num_joints, num_ee_frames, blocks)
+    limited = clamp_window_rotation_residual(
+        adjusted, plan, num_joints, num_ee_frames, blocks, max_tilt_rad=max_tilt_rad
+    )
+    ori = window_rotation_span(num_joints, num_ee_frames, blocks)
+    if ori is not None:
+        moved = (scaled[..., ori] != 0).any(dim=-1, keepdim=True)
+        limited = torch.where(moved, limited, summed)
+    return limited
+
+
+def decompose_window_residual(plan: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """The residual carrying ``plan`` toward ``target``: a plain elementwise difference.
+
+    The left inverse of :func:`compose_window_residual` up to that function's rotation
+    projection and angle bound -- exactly inverse on every linear channel, and inverse on the
+    rotation half whenever the implied rotation is inside ``max_tilt_rad`` and both windows
+    are already on SO(3).
+
+    Elementwise on the rotation half rather than through the group: the composition ADDS six
+    numbers and re-projects, so the quantity that has to be predicted is the one that gets
+    added. A geodesic residual is the right target for a composition that MULTIPLIES, and
+    pairing one with the other is a mismatch no shape check can see.
+
+    Args:
+        plan: ``[..., F, D]`` the window being corrected, in raw units.
+        target: ``[..., F, D]`` the window it should have been, in raw units.
+
+    Returns:
+        ``[..., F, D]`` the residual, in raw units.
+
+    Raises:
+        ValueError: If the two shapes disagree.
+    """
+    if target.shape != plan.shape:
+        raise ValueError(
+            f"target has shape {tuple(target.shape)} but the plan is {tuple(plan.shape)}; "
+            "they must match exactly."
+        )
+    return target - plan
+
 
 def _broadcast_anchor(anchor: torch.Tensor, node_shape: torch.Size) -> torch.Tensor:
     """Expand an anchor to one entry per node and flatten to ``(-1, width)``.

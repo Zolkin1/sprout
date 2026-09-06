@@ -1148,6 +1148,15 @@ def run(args) -> int:
                                cmd_hold_s=(0.0 if kind == "clip" else args.cmd_hold_s)))(),
             course, history_from=args.history_from,
             allow_privileged_extero=args.allow_privileged_extero)
+        if args.planner_pt:
+            # Attached AFTER build_arm, which hardcodes zero_noise=False for the branching
+            # selector's benefit. Irrelevant here: the hook replaces the draw outright, so
+            # the graph's own noise input is never consulted and both arms are decided
+            # entirely by --plan_mode.
+            from plan_chooser import PlanChooser  # noqa: PLC0415
+            policy.plan_hook = PlanChooser(
+                args.planner_pt, device=args.device, num_samples=args.plan_n,
+                seed=args.seed_offset, mode=args.plan_mode)
         if kind == "clip":
             spawn = mjrunner.clip_spawn(course, policy.get_joint_names())
             rig = mjrunner.CourseRig(course, policy, cfg, spawn)
@@ -1256,6 +1265,19 @@ def main() -> int:
                         "(candidates are executed 0.24 s and the resulting state is scored). "
                         "Use this to run the same selector that worked with V_priv, but with "
                         "a V trained on the fit_q split.")
+    p.add_argument("--planner_pt", default="",
+                   help="Token planner .pt. Attaches a plan hook that REPLACES the "
+                        "generator's own draw, so --plan_mode decides how each plan is "
+                        "picked. The exported .onnx is still required (--fm_onnx) for the "
+                        "conditioning contract and normalizers.")
+    p.add_argument("--plan_mode", choices=("greedy", "best_of"), default="greedy",
+                   help="greedy: per-token argmax, what deployment serves. best_of: draw "
+                        "--plan_n samples and serve the highest JOINT log-probability. "
+                        "Neither rolls a candidate out or uses a critic -- the only judge is "
+                        "the generator's own density, so a gap between them is the DECODE "
+                        "RULE and nothing else. Requires --planner_pt.")
+    p.add_argument("--plan_n", type=int, default=16,
+                   help="Samples per re-plan for --plan_mode best_of.")
     p.add_argument("--tracker_onnx", required=True)
     p.add_argument("--fm_onnx", required=True)
     p.add_argument("--clip_lib", required=True)

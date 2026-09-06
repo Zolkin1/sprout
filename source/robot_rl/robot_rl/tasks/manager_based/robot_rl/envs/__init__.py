@@ -23,5 +23,6 @@ hydra does need it at compose time, and it costs nothing -- ``ManagerBasedRLEnvC
 """
 
 from .adjuster_env_cfg import AdjusterEnvCfg
+from .token_planner_env_cfg import TokenPlannerEnvCfg
 
-__all__ = ["AdjusterEnvCfg"]
+__all__ = ["AdjusterEnvCfg", "TokenPlannerEnvCfg"]

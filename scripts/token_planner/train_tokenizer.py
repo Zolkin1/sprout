@@ -24,6 +24,7 @@ trainer runs.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -108,6 +109,14 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
     p.add_argument("--wandb_project", type=str, default="robot_rl_token_planner")
     p.add_argument("--val_every", type=int, default=1)
     p.add_argument("--ckpt_every", type=int, default=10)
+    p.add_argument("--residual", action="store_true",
+                   help="Train on FM RESIDUALS rather than on the clip's own future: the "
+                        "chunks are `clip - generator_plan` and the normalizer is the "
+                        "residual's. --cache must name a build from "
+                        "scripts/token_planner/build_residual_cache.py, and the two arms are "
+                        "refused in BOTH directions -- their tensors have identical shape and "
+                        "completely different meaning, so a mix-up would train to completion "
+                        "and report plausible numbers about the wrong quantity.")
     p.add_argument("--fm_config", default="",
                    help="A flow-matching run's params/fm_config.yaml. Supplies the DECLARED "
                         "STATE SCALES, the only config values that reach the state "
@@ -131,6 +140,11 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
                         "printed as a warning for exactly that reason.")
 
     # -- data / layout --
+    p.add_argument("--with_anchor_mask", action="store_true",
+                   help="Join the per-node anchor mask and the window-to-terrain frame angle "
+                        "back from the clip library at BUILD time, so --pinned_axis_weight "
+                        "has something to weight. Costs one library open and its sha256 "
+                        "check, and makes a cache that older runs can still read.")
     p.add_argument("--chunk_len", type=int, default=d.chunk_len,
                    help="Nodes per chunk H; must equal the generator's future_len.")
     p.add_argument("--val_fraction", type=float, default=0.1,
@@ -159,6 +173,18 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
     # -- loss / training --
     p.add_argument("--lambda_vel", type=float, default=d.lambda_vel)
     p.add_argument("--lambda_acc", type=float, default=d.lambda_acc)
+    p.add_argument("--pinned_axis_weight", type=float, default=d.pinned_axis_weight,
+                   help="Reconstruction weight on the terrain-PINNED root DOFs -- the "
+                        "generator's pinned_axis_loss_weight, ported. Height on flat, "
+                        "downrange + height + yaw on stairs and boxes. Needs a chunk build "
+                        "carrying the anchor mask (--with_anchor_mask); a cache without one "
+                        "is refused rather than silently unweighted. Renormalized to mean 1 "
+                        "together with --base_pose_weight.")
+    p.add_argument("--base_pose_weight", type=float, default=d.base_pose_weight,
+                   help="Reconstruction weight on the base_pose block (position + 6-D "
+                        "orientation, 9 channels); every other channel stays 1. The vector "
+                        "is renormalized to mean 1, so this is a pure ratio and does not "
+                        "also move the effective learning rate.")
     p.add_argument("--lr", type=float, default=d.lr)
     p.add_argument("--lr_min", type=float, default=d.lr_min)
     p.add_argument("--weight_decay", type=float, default=d.weight_decay)
@@ -190,6 +216,8 @@ def parse_args() -> tuple[TokenizerConfig, argparse.Namespace]:
         upsample_mode=args.upsample_mode,
         lambda_vel=args.lambda_vel,
         lambda_acc=args.lambda_acc,
+        base_pose_weight=args.base_pose_weight,
+        pinned_axis_weight=args.pinned_axis_weight,
         lr=args.lr,
         lr_min=args.lr_min,
         weight_decay=args.weight_decay,
@@ -230,8 +258,172 @@ def scheduled_lr(cfg: TokenizerConfig, epoch: int, step: int) -> float:
     return lr
 
 
+def pinned_axis_terms(
+    err: torch.Tensor,
+    sq: torch.Tensor,
+    w: torch.Tensor,
+    anchor_mask: torch.Tensor,
+    mask_frame_yaw: torch.Tensor | None,
+    weight: float,
+    state_std: torch.Tensor | None,
+    cfg: TokenizerConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The terrain-pinned root-DOF weighting, as ``(extra_total, extra_w_sum)``.
+
+    A port of :func:`robot_rl.flow_matching.flow.pinned_axis_flow_loss` onto the tokenizer's
+    reconstruction error. It is the same quantity computed on the same chunk layout, so the
+    generator's reasoning carries over verbatim and is not restated here beyond what a reader
+    needs; three things stop it being a channel mask:
+
+    * **The pinned planar axis is not a channel.** ``downrange`` is named in the TERRAIN's
+      frame while the chunk's x/y are the snap robot's yaw frame, so the weight is a
+      quadratic form ``I + (w-1) u u^T``.
+    * **x and y are standardized differently** (0.442 vs 0.102 on the shipped teacher, 4.3x),
+      so the error is projected in METRES and divided by the std ALONG that direction.
+      Projecting the already-normalized error onto the normalized image of the metric axis
+      would leak most of a downrange weight onto lateral error.
+    * **Yaw is not a channel** -- the orientation block is a 6-D rotation, so it is weighted
+      only when roll, pitch AND yaw are all pinned. Flat frees yaw and gets no orientation
+      weight.
+
+    The height and orientation parts ARE axis-aligned, so they are folded into ``w`` in
+    place. The planar part is a rank-1 bump on the 2x2 xy block and contributes a SCALAR per
+    node, returned separately rather than broadcast across every channel.
+
+    Args:
+        err: ``(B, H, D)`` reconstruction error in NORMALIZED units.
+        sq: ``err ** 2``, precomputed.
+        w: ``(B, H, D)`` weight tensor, MUTATED in place for the axis-aligned parts.
+        anchor_mask: ``(B, H)`` int64 anchor bitmasks; bit CLEAR = that DOF is pinned.
+        mask_frame_yaw: ``(B,)`` angle from the chunk's frame to the terrain's, or ``None``
+            to treat them as aligned.
+        weight: Multiplier on pinned DOFs.
+        state_std: ``(D,)`` per-channel std, for the anisotropy correction. ``None`` falls
+            back to isotropic.
+        cfg: The config, for the block layout.
+
+    Returns:
+        ``(extra_total, extra_w_sum)`` -- the planar term's contribution to the weighted sum
+        of squares and to the trace the mean divides by. Both are zero when nothing is
+        planar-pinned.
+    """
+    from robot_rl.flow_matching.flow import _ANCHOR_BIT  # noqa: PLC0415
+    from robot_rl.flow_matching.window import window_block_slices  # noqa: PLC0415
+
+    slices = window_block_slices(int(cfg.num_joints), int(cfg.num_ee_frames),
+                                 list(cfg.reference_blocks))
+    zero = torch.zeros((), dtype=err.dtype, device=err.device)
+    if "base_pose" not in slices:
+        return zero, zero
+    base = slices["base_pose"].start
+    extra = float(weight) - 1.0
+
+    def is_pinned(name: str) -> torch.Tensor:
+        """``(B, H)`` float: 1 where that DOF is FIXED (bit CLEAR = pinned)."""
+        return ((anchor_mask >> _ANCHOR_BIT[name]) & 1 == 0).to(err.dtype)
+
+    w[..., base + 2] = w[..., base + 2] * (1.0 + extra * is_pinned("height"))
+    rot_pinned = is_pinned("roll") * is_pinned("pitch") * is_pinned("yaw")
+    w[..., base + 3:base + 9] = w[..., base + 3:base + 9] * (
+        1.0 + extra * rot_pinned).unsqueeze(-1)
+
+    p_dr, p_lat = is_pinned("downrange"), is_pinned("lateral")
+    if float((p_dr + p_lat).sum()) == 0.0:
+        return zero, zero
+    std = torch.ones(2, dtype=err.dtype, device=err.device)
+    if state_std is not None:
+        std = state_std[base:base + 2].to(err.dtype).to(err.device)
+    ang = (torch.zeros_like(p_dr) if mask_frame_yaw is None
+           else mask_frame_yaw.to(err.dtype).to(err.device).unsqueeze(-1).expand_as(p_dr))
+    e_m = err[..., base:base + 2] * std                       # (B, H, 2) metres
+    total, w_sum = zero, zero
+    for pinned, (ux, uy) in ((p_dr, (torch.cos(ang), torch.sin(ang))),
+                             (p_lat, (-torch.sin(ang), torch.cos(ang)))):
+        if float(pinned.sum()) == 0.0:
+            continue
+        along = e_m[..., 0] * ux + e_m[..., 1] * uy           # (B, H) metres along the axis
+        std_u = ((std[0] * ux) ** 2 + (std[1] * uy) ** 2).sqrt().clamp_min(1e-12)
+        total = total + (extra * pinned * (along / std_u) ** 2).sum()
+        # A rank-1 bump of (weight - 1) adds exactly that to the 2x2 block's trace, and the
+        # trace is what the mean must divide by.
+        w_sum = w_sum + extra * pinned.sum()
+    return total, w_sum
+
+
+#: ``(node_dim,)`` loss weights per config+device, so the vector is built once rather than
+#: per batch. Keyed on everything that changes it.
+_CHANNEL_WEIGHT_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def channel_weights(cfg: TokenizerConfig, device: torch.device) -> torch.Tensor | None:
+    """Per-channel reconstruction weights, or ``None`` when every channel is weighted 1.
+
+    ``base_pose_weight`` upweights the base position and the 6-D orientation TOGETHER -- one
+    block, because they are one pose and the tracker reads them as one. The vector is
+    normalized to mean 1 (see :attr:`TokenizerConfig.base_pose_weight` for why), so the plain
+    unweighted path and a weighted one put the same total scale into the gradient.
+
+    Args:
+        cfg: The config; the weight, the block selection and the joint/frame counts.
+        device: Where the loss is computed.
+
+    Returns:
+        ``(node_dim,)`` weights, or ``None`` at weight 1 -- which keeps the untouched
+        ``F.mse_loss`` path rather than multiplying by a vector of ones.
+
+    Raises:
+        ValueError: If the resolved block widths do not sum to ``node_dim``, which would
+            silently weight the wrong channels.
+    """
+    w = float(cfg.base_pose_weight)
+    if w == 1.0:
+        return None
+    key = (w, int(cfg.node_dim), int(cfg.num_joints), int(cfg.num_ee_frames),
+           tuple(cfg.reference_blocks), str(device))
+    hit = _CHANNEL_WEIGHT_CACHE.get(key)
+    if hit is not None:
+        return hit
+    from robot_rl.flow_matching.window import window_blocks  # noqa: PLC0415
+
+    blocks = window_blocks(int(cfg.num_joints), int(cfg.num_ee_frames),
+                           list(cfg.reference_blocks))
+    total = sum(width for _, width in blocks)
+    if total != int(cfg.node_dim):
+        raise ValueError(
+            f"the reference blocks {cfg.reference_blocks} are {total} channels wide but "
+            f"node_dim is {cfg.node_dim}; the weights would land on the wrong channels."
+        )
+    vec = torch.ones(int(cfg.node_dim), device=device)
+    i = 0
+    for name, width in blocks:
+        if name == "base_pose":
+            vec[i:i + width] = w
+        i += width
+    vec = vec / vec.mean()
+    _CHANNEL_WEIGHT_CACHE[key] = vec
+    return vec
+
+
+def _mse(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor | None) -> torch.Tensor:
+    """Mean squared error over all axes, optionally weighted along the CHANNEL axis.
+
+    Args:
+        a: Prediction, ``(B, T, node_dim)``.
+        b: Target, same shape.
+        w: ``(node_dim,)`` weights, or ``None`` for the plain mean.
+
+    Returns:
+        The scalar loss.
+    """
+    if w is None:
+        return torch.nn.functional.mse_loss(a, b)
+    return (((a - b) ** 2) * w).mean()
+
+
 def reconstruction_loss(
-    recon: torch.Tensor, target: torch.Tensor, cfg: TokenizerConfig
+    recon: torch.Tensor, target: torch.Tensor, cfg: TokenizerConfig,
+    batch: dict[str, torch.Tensor] | None = None,
+    state_std: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Normalized-space reconstruction loss, plus its terms for logging.
 
@@ -250,21 +442,49 @@ def reconstruction_loss(
     Args:
         recon: ``(B, H, D)`` reconstruction.
         target: ``(B, H, D)`` ground truth.
-        cfg: The config, for the two lambdas.
+        cfg: The config, for the two lambdas and the two weights.
+        batch: The loader's item, for ``anchor_mask`` / ``mask_frame_yaw``. Only read when
+            ``pinned_axis_weight != 1``.
+        state_std: ``(D,)`` per-channel std, for the pinned planar term's anisotropy
+            correction.
 
     Returns:
         ``(loss, terms)``.
+
+    Raises:
+        ValueError: If ``pinned_axis_weight != 1`` but the batch carries no anchor mask --
+            the run would otherwise train unweighted under a name that says otherwise.
     """
-    rec = torch.nn.functional.mse_loss(recon, target)
+    w = channel_weights(cfg, recon.device)
+    if float(cfg.pinned_axis_weight) != 1.0:
+        if batch is None or "anchor_mask" not in batch:
+            raise ValueError(
+                "pinned_axis_weight != 1 needs the per-node anchor mask, which this chunk "
+                "build does not carry. Rebuild the cache with --with_anchor_mask."
+            )
+        err = recon - target
+        sq = err ** 2
+        wt = (torch.ones_like(sq) if w is None
+              else w.to(sq.dtype).expand_as(sq).clone())
+        pin_total, pin_wsum = pinned_axis_terms(
+            err, sq, wt, batch["anchor_mask"].to(recon.device),
+            batch.get("mask_frame_yaw"), float(cfg.pinned_axis_weight), state_std, cfg)
+        # ONE renormalization over the COMBINED weights, so base_pose_weight and
+        # pinned_axis_weight compose without either one moving the loss scale.
+        rec = ((wt * sq).sum() + pin_total) / (wt.sum() + pin_wsum).clamp_min(1e-12)
+        loss = rec
+        terms = {"rec": float(rec.detach()), "total": float(rec.detach())}
+        return loss, terms
+    rec = _mse(recon, target, w)
     loss = rec
     terms = {"rec": float(rec.detach())}
     if cfg.lambda_vel > 0.0:
-        v = torch.nn.functional.mse_loss(recon.diff(dim=1), target.diff(dim=1))
+        v = _mse(recon.diff(dim=1), target.diff(dim=1), w)
         loss = loss + cfg.lambda_vel * v
         terms["vel"] = float(v.detach())
     if cfg.lambda_acc > 0.0:
-        a = torch.nn.functional.mse_loss(
-            recon.diff(dim=1).diff(dim=1), target.diff(dim=1).diff(dim=1))
+        a = _mse(
+            recon.diff(dim=1).diff(dim=1), target.diff(dim=1).diff(dim=1), w)
         loss = loss + cfg.lambda_acc * a
         terms["acc"] = float(a.detach())
     terms["total"] = float(loss.detach())
@@ -274,7 +494,8 @@ def reconstruction_loss(
 @torch.no_grad()
 def evaluate(
     model: TrajectoryTokenizer, loader: DataLoader, device: torch.device,
-    acc_factory, cfg: TokenizerConfig,
+    acc_factory, cfg: TokenizerConfig, state_std: torch.Tensor | None = None,
+    residual: bool = False,
 ) -> tuple[dict[str, Any], dict[str, float]]:
     """Run a full pass and return ``(report, scalars)``.
 
@@ -284,6 +505,13 @@ def evaluate(
         device: Where to run.
         acc_factory: Zero-argument factory for a fresh :class:`ReconAccumulator`.
         cfg: The config, for the loss terms.
+        state_std: ``(D,)`` per-channel std, for the pinned planar term.
+        residual: The chunks are FM residuals, so ``ori_geodesic_rad`` is dropped -- the
+            angle between two DIFFERENCES of rotation frames is not a rotation angle, and
+            reporting one would put a plausible number on a meaningless quantity. The
+            orientation error that does mean something is measured in PLAN space, after the
+            residual is composed back onto the plan; see
+            :func:`~robot_rl.token_planner.residual.plan_space_report`.
 
     Returns:
         ``(report, scalars)`` -- the full nested report, and the flat scalars for
@@ -295,7 +523,7 @@ def evaluate(
     for batch in loader:
         nodes = batch["nodes"].to(device, non_blocking=True)
         recon, ids = model(nodes)
-        loss, _ = reconstruction_loss(recon.float(), nodes, cfg)
+        loss, _ = reconstruction_loss(recon.float(), nodes, cfg, batch, state_std)
         loss_sum += float(loss) * nodes.shape[0]
         n += int(nodes.shape[0])
         acc.update(nodes, recon.float(), ids, batch["family"])
@@ -310,7 +538,10 @@ def evaluate(
             scalars[f"edge/{g}/{end}"] = v
     for k, v in rep["codebook"].items():
         scalars[f"codebook/{k}"] = v
-    scalars["ori_geodesic_rad"] = rep["ori_geodesic_rad"]
+    if residual:
+        rep.pop("ori_geodesic_rad", None)
+    else:
+        scalars["ori_geodesic_rad"] = rep["ori_geodesic_rad"]
     # ONE selection scalar, so "best" is not a judgement call made differently each run.
     # Mean of the group RMSEs in their own units: the groups are already O(1)-comparable
     # (metres, rad, rad/s all land in the same decade on this data) and weighting them would
@@ -340,6 +571,8 @@ def resolve_chunks(cfg: TokenizerConfig, args: argparse.Namespace):
 
     families = (list(DEFAULT_SKIP_FAMILIES) if args.skip_families is None
                 else [f for f in args.skip_families.split(",") if f.strip()])
+    if args.residual:
+        return _resolve_residual_chunks(cfg, args, blocks)
     scales = _state_scales_from(args.fm_config)
 
     def _build():
@@ -353,6 +586,7 @@ def resolve_chunks(cfg: TokenizerConfig, args: argparse.Namespace):
             val_fraction=args.val_fraction, stride=args.stride,
             skip_distractors=args.skip_distractors, skip_families=families,
             reference_blocks=blocks, state_scales=scales,
+            with_anchor_mask=bool(args.with_anchor_mask),
         )
         chunks.provenance["load_rows"] = int(args.load_rows)
         return chunks
@@ -384,6 +618,120 @@ def resolve_chunks(cfg: TokenizerConfig, args: argparse.Namespace):
     cfg.replan_period = int(chunks.provenance.get("recording_replan_period", 0)) or \
         cfg.replan_period
     return chunks
+
+
+def _resolve_residual_chunks(cfg: TokenizerConfig, args: argparse.Namespace,
+                             blocks: list[str] | None):
+    """Load a residual build and write its layout back onto ``cfg``.
+
+    There is no build path here on purpose. Forming a residual needs the GENERATOR -- its
+    weights, its normalizers and its own held-out split -- which is a different set of inputs
+    from anything this trainer takes, so it lives in
+    ``scripts/token_planner/build_residual_cache.py`` and its output is the only way in.
+
+    What this checks, and why each one:
+
+    * the payload's ARM, so an absolute cache cannot be trained as a residual one. Both hold
+      ``(Nw, H, D)`` float tensors; only their meaning differs.
+    * ``--fm_config``, which is REFUSED. Its declared state scales are the absolute
+      normalizer, and in this arm the cache's own residual normalizer is the only one that
+      may reach the model -- silently applying the wrong affine would rescale every channel
+      and every reported metre.
+    * the layout the tokenizer will build against, so a 62-node cache cannot feed a 64-node
+      config.
+
+    Args:
+        cfg: The config, written through with the cache's layout.
+        args: Runtime args.
+        blocks: An explicit ``--reference_blocks``, or ``None`` to take the cache's.
+
+    Returns:
+        The :class:`~robot_rl.token_planner.residual.ResidualChunkData`.
+
+    Raises:
+        SystemExit: If ``--cache`` is missing or absent, or ``--fm_config`` was given.
+    """
+    from robot_rl.token_planner.residual import RESIDUAL_CACHE_VERSION, load_residual_cache
+
+    if not args.cache or not os.path.exists(args.cache):
+        raise SystemExit(
+            "--residual needs --cache to name an existing residual build. Make one with "
+            "scripts/token_planner/build_residual_cache.py --stage build; it is not built "
+            "here because forming a residual needs the generator, not just a recording.")
+    if args.fm_config:
+        raise SystemExit(
+            "--residual and --fm_config are mutually exclusive. --fm_config supplies the "
+            "declared state scales, which are the ABSOLUTE normalizer; a residual build "
+            "carries its own, fitted on the residual with the mean pinned to zero. Applying "
+            "the absolute one here would rescale every channel and every reported metre "
+            "while every shape stayed right.")
+    payload = torch.load(args.cache, map_location="cpu", weights_only=False)
+    # Only what the TRAINER can independently assert. The generator fields in the full key
+    # exist so a rebuild can detect its own staleness; this side has no way to know them and
+    # would only be restating whatever the file said.
+    want = {
+        "residual_version": RESIDUAL_CACHE_VERSION,
+        "chunk_len": int(cfg.chunk_len),
+        "reference_blocks": (blocks if blocks is not None
+                             else dict(payload.get("key", {})).get("reference_blocks")),
+    }
+    chunks = load_residual_cache(args.cache, want, payload=payload)
+
+    fm = chunks.fm_provenance
+    print(f"[tok] RESIDUAL arm: chunks are (clip - plan) from {fm.get('fm_run')}")
+    print(f"[tok]   checkpoint {fm.get('checkpoint')} epoch {fm.get('fm_epoch')} "
+          f"sha {str(fm.get('fm_sha256'))[:16]}")
+    print(f"[tok]   draw={fm.get('draw')}  history_source={fm.get('history_source')}  "
+          f"honesty={fm.get('honesty')}")
+    print(f"[tok]   {tuple(chunks.train_nodes.shape)} train / "
+          f"{tuple(chunks.val_nodes.shape)} val"
+          + (f", {chunks.provenance.get('zero_chunks_injected', 0)} of the train chunks are "
+             "injected all-zero residuals"
+             if chunks.provenance.get("zero_chunks_injected") else ""))
+    _print_residual_band(chunks)
+
+    cfg.node_dim = chunks.node_dim
+    cfg.reference_blocks = list(chunks.reference_blocks)
+    cfg.num_joints = chunks.num_joints
+    cfg.num_ee_frames = chunks.num_ee_frames
+    cfg.dt = chunks.dt
+    return chunks
+
+
+def _print_residual_band(chunks) -> None:
+    """Print the fitted residual scale beside the adjuster's DECLARED authority.
+
+    The ratio is the number worth seeing: it says how much of the correction the RL adjuster
+    is allowed to make the generator's typical error actually occupies. It also makes the
+    fitted mean visible -- which is NOT subtracted (the origin has to keep meaning "the
+    generator was right") but IS the generator's systematic bias, and a large one is a finding
+    rather than a nuisance.
+
+    Args:
+        chunks: The loaded residual build.
+    """
+    from robot_rl.flow_matching.normalizer import Normalizer
+    from robot_rl.token_planner.metrics import channel_group_labels
+    from robot_rl.token_planner.residual import declared_residual_normalizer
+
+    norm = Normalizer.from_state_dict(chunks.state_normalizer_state)
+    names, labels = channel_group_labels(chunks.num_joints, chunks.num_ee_frames,
+                                         chunks.reference_blocks)
+    try:
+        declared = declared_residual_normalizer(chunks.num_joints, chunks.num_ee_frames,
+                                                chunks.reference_blocks).std
+    except ValueError:
+        declared = None
+    mean = torch.tensor(chunks.provenance.get("residual_fitted_mean", [0.0] * norm.std.numel()))
+    print("[tok]   residual scale (fitted std | declared adjuster band | fitted mean, "
+          "per group):")
+    for g, name in enumerate(names):
+        sel = labels == g
+        fit = float(norm.std[sel].mean())
+        dec = float(declared[sel].mean()) if declared is not None else float("nan")
+        bias = float(mean[sel].abs().max()) if mean.numel() == norm.std.numel() else float("nan")
+        print(f"[tok]     {name:<14} {fit:8.4f} | {dec:8.4f} ({fit / dec:5.2f}x) | "
+              f"max|bias| {bias:.4f}")
 
 
 def _load_cache(path: str, cfg: TokenizerConfig, args: argparse.Namespace,
@@ -575,6 +923,91 @@ def _patch_row_limit(n: int) -> None:
     rdio.load_recorded_windows = limited
 
 
+@torch.no_grad()
+def residual_gate(model: TrajectoryTokenizer, chunks, cfg: TokenizerConfig,
+                  device: torch.device, batch_size: int = 256) -> dict[str, Any]:
+    """The two things a residual tokenizer is gated on, measured on the selected weights.
+
+    **ZERO_CODE.** An adjuster has to be able to say "the generator was right here", and under
+    a shared codebook that means one id whose constant chunk decodes to ~nothing. FSQ is
+    parameter-free and its lattice has no exact centre on an even-levelled axis, so the id is
+    FOUND after training rather than reserved -- and if the build injected no all-zero chunks
+    there simply will not be a good one, which is what the recorded norm is for.
+
+    **The plan-space gate.** Reconstruction error on the residual would answer the wrong
+    question. What matters is whether ``P (+) delta_hat`` is closer to the clip than ``P``
+    alone, composed through the SAME rule the robot serves -- Gram-Schmidt and the 15 deg tilt
+    bound included. On the linear channels the two are identical, since
+    ``(P + d_hat) - gt == d_hat - d``; on the rotation half they are not, and that is exactly
+    where a correction can be clamped away.
+
+    Args:
+        model: The tokenizer in the weights being selected (swap the EMA in first).
+        chunks: The residual build; its ``val_plan`` is what makes this measurable.
+        cfg: The config, for the layout.
+        device: Where to run.
+        batch_size: Chunks per decode.
+
+    Returns:
+        ``{"zero_code", "zero_code_decode", "zero_code_rms", "plan_space", "zero_code_frac"}``.
+    """
+    from robot_rl.flow_matching.normalizer import Normalizer
+    from robot_rl.token_planner.metrics import channel_group_labels
+    from robot_rl.token_planner.residual import find_zero_code, plan_space_report
+
+    # Two copies rather than one moved back and forth: ``Normalizer.to`` mutates in place, so
+    # a single instance shuttled between devices would silently leave the caller's on whichever
+    # side it was last used.
+    norm = Normalizer.from_state_dict(chunks.state_normalizer_state).to(device)
+    norm_cpu = Normalizer.from_state_dict(chunks.state_normalizer_state)
+    names, labels = channel_group_labels(cfg.num_joints, cfg.num_ee_frames,
+                                         cfg.reference_blocks)
+    zero_id, per_group, rms = find_zero_code(model, norm, labels, names)
+
+    recon, ids = [], []
+    for i in range(0, int(chunks.val_nodes.shape[0]), batch_size):
+        nodes = chunks.val_nodes[i:i + batch_size].to(device)
+        out, tok = model(nodes)
+        recon.append(norm.denormalize(out.float()).cpu())
+        ids.append(tok.cpu())
+    delta_hat = torch.cat(recon)
+    tok_ids = torch.cat(ids)
+
+    plan = chunks.val_plan
+    # ``target = plan + delta`` reconstructs the clip exactly, because the residual was formed
+    # as a plain elementwise difference. Re-deriving it here rather than storing it keeps the
+    # cache smaller and makes the identity explicit.
+    target = plan + norm_cpu.denormalize(chunks.val_nodes)
+    rep = plan_space_report(plan, target, delta_hat, cfg.num_joints, cfg.num_ee_frames,
+                            cfg.reference_blocks, chunks.val_family, chunks.family_names,
+                            model.vocab_size)
+    frac = float((tok_ids == zero_id).float().mean())
+    out = {
+        "zero_code": int(zero_id),
+        "zero_code_decode": per_group,
+        "zero_code_rms": rms,
+        "zero_code_frac": frac,
+        "plan_space": rep,
+    }
+    print(f"[tok] ZERO_CODE {zero_id}: decode rms {rms:.5f}, per group "
+          + "  ".join(f"{g} {v:.5f}" for g, v in per_group.items()))
+    print(f"[tok]   {100 * frac:.1f}% of held-out tokens ARE that id"
+          + ("  <-- over ~60% means the residuals are too small to be worth tokenizing"
+             if frac > 0.6 else ""))
+    print("[tok] PLAN SPACE (metres/rad, vs the clip): "
+          "arm            " + "  ".join(f"{g:>12}" for g in rep["plan"]["rmse"]))
+    for arm in ("plan", "plan_plus_residual"):
+        print(f"[tok]   {arm:<22}" + "  ".join(f"{v:12.4f}"
+                                               for v in rep[arm]["rmse"].values()))
+    better = {g: rep["plan_plus_residual"]["rmse"][g] < rep["plan"]["rmse"][g]
+              for g in rep["plan"]["rmse"]}
+    print("[tok]   the correction HELPS on: "
+          + ", ".join(g for g, ok in better.items() if ok)
+          + (" | HURTS on: " + ", ".join(g for g, ok in better.items() if not ok)
+             if not all(better.values()) else ""))
+    return out
+
+
 def save_checkpoint(path: str, model: TrajectoryTokenizer, opt, cfg: TokenizerConfig,
                     chunks, epoch: int, scalars: dict[str, float],
                     report: dict[str, Any], ema: WeightEMA | None, step: int = 0) -> None:
@@ -664,7 +1097,8 @@ def main() -> None:
         f"k={cfg.kernel_size} pad={cfg.pad_mode} up={cfg.upsample_mode} "
         f"-> {n_par / 1e6:.2f}M params\n"
         f"[tok] loss: rec + {cfg.lambda_vel} * vel + {cfg.lambda_acc} * acc "
-        f"(normalized space)\n"
+        f"(normalized space); base_pose weight {cfg.base_pose_weight}, "
+        f"pinned_axis weight {cfg.pinned_axis_weight} (mean-1 normalized)\n"
         f"[tok] data: {chunks.train_nodes.shape[0]} train / {chunks.val_nodes.shape[0]} val "
         f"chunks over {len(chunks.val_episode_ids)} held-out episodes\n"
         f"[tok] out: {out_dir}"
@@ -682,12 +1116,14 @@ def main() -> None:
     })
 
     train_loader = DataLoader(
-        ChunkDataset(chunks.train_nodes, chunks.train_family),
+        ChunkDataset(chunks.train_nodes, chunks.train_family,
+                     chunks.train_anchor_mask, chunks.train_mask_frame_yaw),
         batch_size=cfg.batch_size, shuffle=True, drop_last=True,
         num_workers=args.num_workers, pin_memory=(device.type == "cuda"),
     )
     val_loader = (
-        DataLoader(ChunkDataset(chunks.val_nodes, chunks.val_family),
+        DataLoader(ChunkDataset(chunks.val_nodes, chunks.val_family,
+                                chunks.val_anchor_mask, chunks.val_mask_frame_yaw),
                    batch_size=cfg.batch_size, shuffle=False,
                    num_workers=args.num_workers, pin_memory=(device.type == "cuda"))
         if chunks.val_nodes.shape[0] else None
@@ -697,6 +1133,17 @@ def main() -> None:
         cfg.num_joints, cfg.num_ee_frames, cfg.reference_blocks)
     _norm = Normalizer.from_state_dict(chunks.state_normalizer_state)
     std, mean = _norm.std.clone(), _norm.mean.clone()
+    # The pinned planar term projects in METRES and divides by the std along the pinned
+    # direction, so it needs the same normalizer the chunks were built under -- not a fresh
+    # one, and not the accumulator's copy by coincidence.
+    state_std = std.to(device)
+    if float(cfg.pinned_axis_weight) != 1.0 and chunks.train_anchor_mask is None:
+        raise SystemExit(
+            f"[tok] --pinned_axis_weight {cfg.pinned_axis_weight:g} needs the per-node anchor "
+            "mask, and this chunk build carries none.\n"
+            "      Rebuild with --with_anchor_mask (and a --cache path of its own, so the "
+            "maskless cache other runs use is left alone)."
+        )
 
     def acc_factory() -> ReconAccumulator:
         """A fresh accumulator wired to this run's layout."""
@@ -748,7 +1195,8 @@ def main() -> None:
                 g["lr"] = lr
             with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
                 recon, _ = model(nodes)
-            loss, terms = reconstruction_loss(recon.float(), nodes, cfg)
+            loss, terms = reconstruction_loss(recon.float(), nodes, cfg, batch,
+                                               state_std)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             gn = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip))
@@ -780,14 +1228,16 @@ def main() -> None:
         do_val = val_loader is not None and (
             epoch % max(args.val_every, 1) == 0 or epoch == cfg.num_epochs - 1)
         if do_val:
-            rep, scal = evaluate(model, val_loader, device, acc_factory, cfg)
+            rep, scal = evaluate(model, val_loader, device, acc_factory, cfg, state_std,
+                                 residual=args.residual)
             _val_raw = dict(scal)
             for k, v in scal.items():
                 writer.add_scalar(f"val/{k}", v, epoch)
             sel, sel_rep, tag = scal["rmse_mean"], rep, "val"
             if ema is not None:
                 with ema.swapped_in(model):
-                    rep_e, scal_e = evaluate(model, val_loader, device, acc_factory, cfg)
+                    rep_e, scal_e = evaluate(model, val_loader, device, acc_factory,
+                                             cfg, state_std, residual=args.residual)
                 for k, v in scal_e.items():
                     writer.add_scalar(f"val_ema/{k}", v, epoch)
                 sel, sel_rep, tag = scal_e["rmse_mean"], rep_e, "val_ema"
@@ -810,6 +1260,19 @@ def main() -> None:
                      f"ppl {scal['codebook/perplexity']:.0f}")
             if sel < best:
                 best = sel
+                if args.residual:
+                    # Under the SELECTED weights: `sel` came from the EMA arm when there is
+                    # one, and gating the raw weights instead would report a checkpoint
+                    # nobody serves.
+                    ctx = ema.swapped_in(model) if ema is not None else contextlib.nullcontext()
+                    with ctx:
+                        sel_rep["residual_gate"] = residual_gate(model, chunks, cfg, device)
+                    gate = sel_rep["residual_gate"]
+                    scal["zero_code_rms"] = gate["zero_code_rms"]
+                    scal["zero_code_frac"] = gate["zero_code_frac"]
+                    for arm in ("plan", "plan_plus_residual"):
+                        for g, v in gate["plan_space"][arm]["rmse"].items():
+                            scal[f"{arm}/{g}"] = v
                 save_checkpoint(os.path.join(out_dir, "tokenizer.pt"), model, opt, cfg,
                                 chunks, epoch, scal, sel_rep, ema, step)
                 with open(os.path.join(out_dir, "gating_report.json"), "w") as fh:

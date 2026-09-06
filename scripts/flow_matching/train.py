@@ -330,6 +330,15 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--val_fraction", type=float, default=0.1)
     parser.add_argument(
+        "--val_split_by", type=str, default=FlowMatchingConfig().val_split_by,
+        choices=("episode", "clip"),
+        help="What the held-out split is keyed on. 'episode' is the historical default and "
+             "LEAKS whenever one clip is played by more than one episode or a recording is "
+             "trained on beside an augmented re-render of itself -- measured at 86.5%% of "
+             "held-out clips on the shipped measured_n3 pair, deflating the generator's "
+             "residual there to 0.41-0.78x its value on genuinely unseen clips. 'clip' keys "
+             "on the library id every copy of a motion shares and closes it.")
+    parser.add_argument(
         "--target_source", type=str, default="auto",
         choices=["auto", "ego_anchored_clip_future"],
         help="Future target. 'ego_anchored_clip_future': the clip ego-anchored onto the robot at "
@@ -482,7 +491,8 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
             if args.reference_blocks else None
         ),
         null_cond_prob=args.null_cond_prob, stride=args.stride,
-        val_fraction=args.val_fraction, target_source=args.target_source,
+        val_fraction=args.val_fraction, val_split_by=args.val_split_by,
+        target_source=args.target_source,
         recovery_mode=args.recovery_mode,
         cmd_array=args.cmd_array, cmd_stride=args.cmd_stride,
         d_model=args.d_model, nhead=args.nhead, num_layers=args.num_layers,
@@ -966,6 +976,10 @@ def main() -> None:
         # Held-out val episode ids (by episode_id) so the test bench can label the
         # forecast_step --forecast-split eval set deterministically.
         "val_episode_ids": getattr(train_ds, "val_episode_ids", []),
+        # Under a clip split the episode ids above are a CONSEQUENCE of the draw; these two
+        # are the draw itself, and are what a later honesty audit has to read.
+        "val_split_key": getattr(train_ds, "val_split_key", "episode"),
+        "val_split_ids": getattr(train_ds, "val_split_ids", []),
     })
     print(f"[INFO] Provenance -> {out_dir}/params/{{fm_config,data}}.yaml + git/  (data sha {data_sha256[:12]})")
 

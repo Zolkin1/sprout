@@ -462,6 +462,12 @@ class GenTrackerPolicy:
         self._lead_buf = deque(maxlen=self.fm_lead_ticks + 1)
         # ONE buffer: the F predicted reference-window nodes, which ARE the observation.
         self._pred = np.zeros((1, self.ctx.F, self.ctx.D))
+        #: Optional ``(policy, state, history, extero, cmd_tokens, history_null) -> (1,F,D)``.
+        #: ``state`` is passed because the plan anchor is latched from it AFTER this call, so
+        #: a hook that wants this plan's frame must read the root pose from here, not from
+        #: ``_anchor_pos`` (which still holds the PREVIOUS plan's).
+        #: When set it REPLACES the generator; see `_run_fm`. Production leaves it None.
+        self.plan_hook = None
         self._pred_valid = False
         self._ctrl_step = -1
         # -- receding-horizon serving state (mirrors FmTrackingCommand) --
@@ -1426,8 +1432,18 @@ class GenTrackerPolicy:
         noise = self._sample_noise()
 
         t0 = time.perf_counter()
-        self._pred = sample_window(ctx, history, extero, cmd_tokens, noise,
-                                   history_null=np.array([bool(history_null)]))
+        if self.plan_hook is not None:
+            # An external chooser REPLACES the generator for this step. It is handed the
+            # conditioning exactly as built above -- the same arrays `sample_window` would
+            # get -- so anything it produces is answering the question the runtime actually
+            # asked, rather than a re-derived approximation of it. `None` on every production
+            # path; set only by interactive/diagnostic tools (transfer/sim/plan_chooser.py).
+            self._pred = np.asarray(
+                self.plan_hook(self, state, history, extero, cmd_tokens, bool(history_null)),
+                dtype=np.float64).reshape(1, ctx.F, ctx.D)
+        else:
+            self._pred = sample_window(ctx, history, extero, cmd_tokens, noise,
+                                       history_null=np.array([bool(history_null)]))
         infer_s = time.perf_counter() - t0
         self._fm_infer_s += infer_s
         self._last_fm_infer_ms = 1e3 * infer_s

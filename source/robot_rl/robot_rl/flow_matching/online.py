@@ -900,6 +900,7 @@ def sample_window(
     history_null_mask: torch.Tensor | None = None,
     noise: torch.Tensor | None = None,
     return_flow: bool = False,
+    force_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Sample the ``F``-node future window, denormalized.
 
@@ -934,6 +935,18 @@ def sample_window(
     """
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
+    if force_tokens is not None:
+        # Refused by NAME rather than ignored, the mirror of the token planner refusing
+        # `noise`: this generator has no tokens to force. Its output is one continuous window
+        # integrated in a single pass, so there is no per-chunk decision to pin and no
+        # intermediate the caller could substitute. Silently dropping the argument would let
+        # a teacher-forcing sweep report the FM arm as "forced" while it ran wide open, which
+        # is exactly the shape of confound `--history_from` already documents.
+        raise ValueError(
+            "the flow-matching generator takes no `force_tokens`: it emits a continuous "
+            "window in one pass and has no token sequence to teacher-force. Its "
+            "coarser equivalent is `history_from='clip'`, which forces the CONDITIONING; "
+            "token-level forcing exists only on generator_kind='token_planner'.")
     # The label the ARTIFACT names, applied here and nowhere else, so simulation cannot serve
     # a different arm from the one the checkpoint states. `None` on a conditioned model would
     # resolve to `null` inside the model, which is a third arm rather than "unconditioned" --

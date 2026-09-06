@@ -282,6 +282,21 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:AdjusterPPORunnerCfg",
         },
     )
+    # The tokenized planner under PPO: the agent's action is a whole plan's token ids, and
+    # the frozen tracker executes it inside the env step. Same entry-point split as the
+    # adjuster -- concrete env class resolved by gym AFTER AppLauncher, cfg module composable
+    # before it (see envs/__init__.py).
+    gym.register(
+        id="G1-token-planner-rl",
+        entry_point=f"{envs.__name__}.token_planner_env:TokenPlannerEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": (
+                f"{__name__}.g1_token_planner_env_cfg:G1TokenPlannerEnvCfg"
+            ),
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:AdjusterPPORunnerCfg",
+        },
+    )
     # Watch an adjuster checkpoint on a small tile set, with the terrain ray casts DRAWN.
     # `load_critic = False` on its runner cfg is what lets a checkpoint from before a
     # critic-group change still load: play never evaluates the value function, and this

@@ -339,6 +339,7 @@ class TokenPlanner(nn.Module):
         greedy: bool = False,
         generator: torch.Generator | None = None,
         prefix_cache: tuple[torch.Tensor, ...] | None = None,
+        force_tokens: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Decode a plan autoregressively, with a per-layer KV cache.
 
@@ -360,6 +361,13 @@ class TokenPlanner(nn.Module):
                 under the tempered distribution, so they remain the density of what was
                 emitted.
             generator: Explicit RNG, so a rollout is reproducible.
+            force_tokens: ``(B, N)`` int64, or ``None``. Where an entry is ``>= 0`` that
+                token REPLACES the one this step would have drawn, and decoding continues
+                conditioned on the replacement -- teacher forcing at chosen positions. A
+                negative entry (use ``-1``) leaves the position free. The reported
+                log-probability is that of the token actually emitted, so a forced position
+                reports the model's own density on the forced id, which is what a
+                teacher-forcing diagnostic needs.
             prefix_cache: A cache from :meth:`encode_prefix` for this same conditioning, to
                 skip re-encoding it. The whole point of the decomposition is that the prefix
                 is a function of the conditioning alone, so a caller that has just run
@@ -442,6 +450,11 @@ class TokenPlanner(nn.Module):
                 nxt = logp_all.argmax(dim=-1)
             else:
                 nxt = torch.multinomial(logp_all.exp(), 1, generator=generator).squeeze(-1)
+            if force_tokens is not None:
+                # Substitute AFTER the draw, so `logps` below reports the model's density on
+                # whatever is actually emitted and the next step conditions on it.
+                forced = force_tokens[:, step]
+                nxt = torch.where(forced >= 0, forced, nxt)
             tokens.append(nxt)
             logps.append(logp_all.gather(-1, nxt.unsqueeze(-1)).squeeze(-1))
             ents.append(-(logp_all.exp() * logp_all).sum(-1))

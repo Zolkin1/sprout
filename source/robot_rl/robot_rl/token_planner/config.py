@@ -109,6 +109,32 @@ class TokenizerConfig:
     lambda_vel: float = 0.0
     #: Weight on the second-difference (acceleration) reconstruction term. ``0`` = off.
     lambda_acc: float = 0.0
+    #: Reconstruction weight on the ``base_pose`` block -- base POSITION and the 6-D
+    #: ORIENTATION together, the 9 channels the tracker's reference window reads first and
+    #: the group the planner's gating number is quoted on. Every other channel keeps 1.
+    #:
+    #: The weight vector is normalized to MEAN 1 before use, so this changes only the RATIO
+    #: between the groups. At weight 5 on 9 of 44 channels a raw vector would have mean
+    #: 1.82, which is also a 1.82x change in the gradient scale and therefore in the
+    #: effective learning rate -- two effects in one flag, inseparable afterwards.
+    base_pose_weight: float = 1.0
+    #: Reconstruction weight on the terrain-PINNED root DOFs, ported from the generator's
+    #: ``pinned_axis_loss_weight`` (20.0 there). A pinned DOF is one the reference keeps from
+    #: the terrain rather than re-anchoring onto the robot -- height on flat ground,
+    #: downrange + height + yaw on stairs and boxes -- and they are exactly the axes a
+    #: predicted stair segment slides along when it fails.
+    #:
+    #: NOT a channel mask, for the three reasons the generator's own docstring gives: the
+    #: pinned planar axis is named in the TERRAIN's frame while the chunk's x/y are the snap
+    #: robot's, so it is a quadratic form ``I + (w-1) u u^T``; x and y are standardized ~4.3x
+    #: differently, so the metric direction appears at ``S^-1 u``; and yaw is not a channel,
+    #: so the orientation block is weighted only when roll, pitch AND yaw are all pinned.
+    #:
+    #: Needs a chunk build carrying the anchor mask (``build_chunk_data(with_anchor_mask=
+    #: True)``); a cache without one is refused rather than silently unweighted. Composes
+    #: multiplicatively with :attr:`base_pose_weight`, and the product is renormalized to
+    #: mean 1 once, so neither moves the effective learning rate.
+    pinned_axis_weight: float = 1.0
 
     # -- training --
     lr: float = 3e-4

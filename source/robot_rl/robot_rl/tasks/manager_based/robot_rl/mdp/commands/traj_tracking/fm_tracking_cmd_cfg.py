@@ -108,6 +108,26 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     made every first look at a planner a look at one arbitrary draw.
     """
 
+    planner_force_tokens: int = 0
+    """Teacher-force this many LEADING decode tokens from the clip. ``token_planner`` only.
+
+    ``0`` is off. ``n > 0`` encodes the clip's own future window through the frozen
+    tokenizer at each re-plan and pins the first ``n`` of the plan's ``N`` tokens to the
+    result, letting the model decode the rest conditioned on them; ``-1`` means all of them.
+
+    **This is a strictly finer instrument than ``history_from="clip"``, and they compose.**
+    The history arm forces the CONDITIONING and leaves the plan free, which is the only
+    teacher forcing a flow generator can express (``sample_window`` there refuses this
+    argument by name). Here the plan itself can be pinned chunk by chunk, so the two ends of
+    the loop separate: with the history forced and ``n = 0`` a bad plan is the model's own;
+    sweeping ``n`` from ``0`` to ``N`` walks from the model's plan to the clip's and says how
+    much of the error each token carries.
+
+    ``-1`` is the useful control at both ends: it should reproduce the TOKENIZER's
+    reconstruction of the clip and nothing better, so a run that still fails there is failing
+    for a reason no amount of planner training can fix.
+    """
+
     planner_temperature: float = 1.0
     """Softmax temperature for the categorical draw. Ignored when :attr:`planner_greedy`."""
 

@@ -130,6 +130,17 @@ class ChunkData:
     dt: float
     val_episode_ids: list[int]
     provenance: dict[str, Any] = field(default_factory=dict)
+    #: ``(Nw, H)`` int64 anchor bitmask per node: which root DOFs that node's reference is
+    #: REGISTERED TO THE TERRAIN rather than re-anchored onto the robot. Bit SET = FREE, so a
+    #: PINNED DOF is a clear bit. ``None`` unless the build asked for it -- it costs a join
+    #: back to the clip library, which the chunks themselves do not need.
+    train_anchor_mask: torch.Tensor | None = None
+    val_anchor_mask: torch.Tensor | None = None
+    #: ``(Nw,)`` angle from this window's own yaw frame to the TERRAIN's, in radians. The
+    #: mask names ``downrange``/``lateral`` in the terrain frame while the chunk's x/y are the
+    #: snap robot's, so a loss that weights a planar axis needs this to rotate into.
+    train_mask_frame_yaw: torch.Tensor | None = None
+    val_mask_frame_yaw: torch.Tensor | None = None
 
 
 def present_arrays(path: str) -> dict[str, object]:
@@ -234,22 +245,54 @@ class ChunkDataset(Dataset):
     Args:
         nodes: ``(Nw, H, D)`` normalized chunks.
         family: ``(Nw,)`` int64 family codes.
+        anchor_mask: ``(Nw, H)`` per-node anchor bitmasks, or ``None``.
+        mask_frame_yaw: ``(Nw,)`` window-to-terrain frame angles, or ``None``.
+
+    Raises:
+        ValueError: If any per-window array disagrees with ``nodes`` on the window count, or
+            if exactly one of the two mask arrays is given -- the planar half of the pinned
+            weighting is meaningless without the angle, and would silently be computed as if
+            the frames were aligned.
     """
 
-    def __init__(self, nodes: torch.Tensor, family: torch.Tensor):
+    def __init__(self, nodes: torch.Tensor, family: torch.Tensor,
+                 anchor_mask: torch.Tensor | None = None,
+                 mask_frame_yaw: torch.Tensor | None = None):
         if nodes.shape[0] != family.shape[0]:
             raise ValueError(
                 f"{nodes.shape[0]} chunk(s) but {family.shape[0]} family code(s)."
             )
+        if (anchor_mask is None) != (mask_frame_yaw is None):
+            raise ValueError(
+                "anchor_mask and mask_frame_yaw must be given together: the mask names its "
+                "planar axes in the TERRAIN's frame and the angle is what rotates them into "
+                "the chunk's, so a mask without an angle silently assumes they are aligned."
+            )
+        for name, arr in (("anchor_mask", anchor_mask), ("mask_frame_yaw", mask_frame_yaw)):
+            if arr is not None and arr.shape[0] != nodes.shape[0]:
+                raise ValueError(
+                    f"{nodes.shape[0]} chunk(s) but {arr.shape[0]} {name} entr(y/ies)."
+                )
+        if anchor_mask is not None and anchor_mask.shape[1] != nodes.shape[1]:
+            raise ValueError(
+                f"anchor_mask is {anchor_mask.shape[1]} node(s) wide but the chunk is "
+                f"{nodes.shape[1]}."
+            )
         self.nodes = nodes
         self.family = family
+        self.anchor_mask = anchor_mask
+        self.mask_frame_yaw = mask_frame_yaw
 
     def __len__(self) -> int:
         return int(self.nodes.shape[0])
 
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
-        """Return ``{"nodes": (H, D), "family": ()}``."""
-        return {"nodes": self.nodes[i], "family": self.family[i]}
+        """Return ``{"nodes": (H, D), "family": ()}``, plus the masks when the build has them."""
+        item = {"nodes": self.nodes[i], "family": self.family[i]}
+        if self.anchor_mask is not None:
+            item["anchor_mask"] = self.anchor_mask[i]
+            item["mask_frame_yaw"] = self.mask_frame_yaw[i]
+        return item
 
 
 def build_chunk_data(
@@ -263,6 +306,7 @@ def build_chunk_data(
     skip_families: Sequence[str] | None = None,
     reference_blocks: Sequence[str] | None = None,
     state_scales: dict[str, float | None] | None = None,
+    with_anchor_mask: bool = False,
 ) -> ChunkData:
     """Build train/val chunks by running the flow-matching dataset and keeping ``state``.
 
@@ -277,6 +321,9 @@ def build_chunk_data(
         skip_families: Families to drop; ``None`` takes the FM's own default (which is
             ``family_jump_off``, unobservable to a forward-facing camera).
         reference_blocks: Node block selection, or ``None`` to take the recording's.
+        with_anchor_mask: Also join the per-node anchor mask and the window-to-terrain frame
+            angle back from the clip library, for a loss that weights the terrain-pinned root
+            DOFs. Costs one library open plus its sha256 check, so it is off unless asked for.
         state_scales: The generator's ``state_scale_*`` fields, e.g.
             ``{"base_pos": 0.4, "joint_pos": None}``. ``None`` takes
             :class:`~robot_rl.flow_matching.config.FlowMatchingConfig`'s current defaults --
@@ -339,8 +386,13 @@ def build_chunk_data(
         # quantities that only a conditioning model reads.
         extero_norm_mode="metric",
         depth_latency_probs=None,
-        pinned_axis_loss_weight=1.0,
-        pinned_axis_metrics=False,
+        # `pinned_axis_metrics` is what makes the dataset do the library join; the WEIGHT
+        # is the tokenizer's own and is applied in its loss, not here. Set to 20.0 rather
+        # than 1.0 only because the dataset treats a weighted build's join failure as fatal
+        # and a metrics-only one as a warning -- and a tokenizer that silently lost its mask
+        # would train unweighted under a run name that says otherwise.
+        pinned_axis_loss_weight=(20.0 if with_anchor_mask else 1.0),
+        pinned_axis_metrics=bool(with_anchor_mask),
         cmd_array=None,
         obs_noise=False,
         **{f"state_scale_{k}": v for k, v in scales.items()},
@@ -354,6 +406,12 @@ def build_chunk_data(
     train_ds, val_ds = build_train_val(data, meta, cfg)
     if len(train_ds) == 0:
         raise ValueError("the build produced no training chunks.")
+    if with_anchor_mask and getattr(train_ds, "anchor_mask", None) is None:
+        raise ValueError(
+            "with_anchor_mask was asked for but the dataset produced none. It needs a "
+            "WINDOWED recording carrying 'clip_id'/'clip_step' and the clip library those "
+            "index into (the recording names it in 'clip_library_path')."
+        )
 
     fam_names = [str(s) for s in (getattr(meta, "family_names", None) or ["unknown"])]
     # ``window_sel`` indexes the FILTERED window array, not the recording. The dataset builds
@@ -449,7 +507,14 @@ def build_chunk_data(
             "recording_dt": float(getattr(meta, "dt", 0.02)),
             "recording_replan_period": int(getattr(meta, "fm_snap_every", 0) or 0),
             "recording_ref_future_len": int(getattr(meta, "ref_future_len", 0) or 0),
+            "with_anchor_mask": bool(with_anchor_mask),
         },
+        train_anchor_mask=getattr(train_ds, "anchor_mask", None),
+        val_anchor_mask=(getattr(val_ds, "anchor_mask", None) if val_ds is not None
+                         else None),
+        train_mask_frame_yaw=getattr(train_ds, "mask_frame_yaw_rel", None),
+        val_mask_frame_yaw=(getattr(val_ds, "mask_frame_yaw_rel", None) if val_ds is not None
+                            else None),
     )
 
 
@@ -541,6 +606,19 @@ def load_chunk_cache(path: str, key: dict[str, Any],
     """
     if payload is None:
         payload = torch.load(path, map_location="cpu", weights_only=False)
+    # An untagged payload predates the residual arm and IS an absolute build -- the one case
+    # where a missing value has a single correct reading, because no residual cache was ever
+    # written without the tag. The two hold tensors of identical shape in different spaces, so
+    # without this check a residual cache would fail later on an unexpected dataclass field
+    # and point at the wrong thing.
+    arm = str(payload.get("arm", "absolute"))
+    if arm != "absolute":
+        raise ValueError(
+            f"{path} is a {arm!r} chunk cache, but an ABSOLUTE build was asked for. Its "
+            "chunks are the generator's ERROR against the clip, not the clip's own future; "
+            "training on them would run to completion and report plausible numbers about the "
+            "wrong quantity. Pass --residual, or point --cache at an absolute build."
+        )
     have = dict(payload.get("key", {}))
     diff = {k: (have.get(k), v) for k, v in key.items() if have.get(k) != v}
     if diff:

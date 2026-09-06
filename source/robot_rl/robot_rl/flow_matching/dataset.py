@@ -2017,6 +2017,12 @@ def build_train_val(
             "Check ego_anchor_every > num_history_states and the recording length."
         )
 
+    if str(cfg.val_split_by) != "episode":
+        raise ValueError(
+            f"val_split_by={cfg.val_split_by!r} is only implemented for the windowed .h5 "
+            "path; this is the legacy per-step format. Drawing an episode split here instead "
+            "would report a clip-disjoint split that was never drawn."
+        )
     ep_of_window = np.array([data["episode_id"][w[-1]] for w in windows])  # episode of the snap
     unique_eps = np.unique(ep_of_window)
     rng = np.random.default_rng(cfg.seed)
@@ -2039,6 +2045,66 @@ def build_train_val(
             extero_normalizer=train_ds.extero_normalizer,
         )
     return train_ds, val_ds
+
+
+#: How the held-out split is drawn. See :func:`draw_val_split`.
+VAL_SPLIT_KEYS: tuple[str, ...] = ("episode", "clip")
+
+
+def draw_val_split(
+    data: dict[str, np.ndarray], cfg: FlowMatchingConfig, num_windows: int
+) -> tuple[np.ndarray, str, np.ndarray]:
+    """Draw the held-out window mask, keyed on episodes or on CLIPS.
+
+    ``"episode"`` is the historical behaviour and it has a measured hole. ``episode_id`` is
+    numbered PER RECORDING and ``train.py`` offsets each subsequent file past the running
+    maximum, so when a run trains on a recording plus an augmented re-render of it, an
+    episode and its own twin carry different ids and land on opposite sides of the draw. Worse,
+    a clip played by more than one episode leaks the same way inside a single file.
+
+    Measured on the shipped ``measured_n3`` pair: **740 of its 855 held-out clips (86.5%) also
+    appear in a training window**, and the leak is not cosmetic -- the generator's residual on
+    those rows is 0.41-0.78x its residual on genuinely unseen clips, group by group, and 18x
+    smaller at the median on ``joint_pos``. Its reported ``valema_rmse_base_pos`` of 0.0348
+    sits between the leaked rows' 0.0264 and the clean rows' 0.0441, exactly where a mixture
+    should: the published held-out error is optimistic.
+
+    ``"clip"`` closes it. ``clip_id`` indexes the clip LIBRARY, so it is the same integer for
+    an episode, for every other episode that played the same motion, and for every re-render
+    of either -- which makes it the only key under which "the generator has not seen this
+    motion" is answerable at all.
+
+    Args:
+        data: The recording arrays, already filtered.
+        cfg: The run config; ``val_split_by``, ``val_fraction`` and ``seed`` are read.
+        num_windows: ``W``, the filtered window count.
+
+    Returns:
+        ``(in_val, key_name, held_out_ids)`` -- a ``(W,)`` bool mask, the key that was used,
+        and the sorted ids held out under it.
+
+    Raises:
+        ValueError: If ``val_split_by`` is not one of :data:`VAL_SPLIT_KEYS`, or if it asks
+            for ``"clip"`` on a recording carrying no ``clip_id``. Falling back to episodes
+            there would silently restore the leak this option exists to remove.
+    """
+    key = str(cfg.val_split_by)
+    if key not in VAL_SPLIT_KEYS:
+        raise ValueError(f"val_split_by={key!r} is not one of {list(VAL_SPLIT_KEYS)}.")
+    column = "episode_id" if key == "episode" else "clip_id"
+    if column not in data:
+        raise ValueError(
+            f"val_split_by={key!r} needs a per-window '{column}' array and this recording has "
+            "none. Splitting on the other key instead would silently reinstate the leak this "
+            "option exists to remove."
+        )
+    ids = np.asarray(data[column]).reshape(-1)[:num_windows]
+    unique = np.unique(ids)
+    rng = np.random.default_rng(cfg.seed)
+    n_val = int(round(cfg.val_fraction * len(unique)))
+    held = rng.choice(unique, size=n_val, replace=False) if n_val > 0 else unique[:0]
+    in_val = np.isin(ids, held) if n_val > 0 else np.zeros(num_windows, dtype=bool)
+    return in_val, key, np.sort(held)
 
 
 def _distractor_keep_mask(
@@ -2487,21 +2553,26 @@ def _build_train_val_windowed(
         data = {**data, **{k: v[keep] for k, v in data.items()
                            if isinstance(v, np.ndarray) and v.shape[:1] == (W,)}}
         W = int(ep.shape[0])
-    unique_eps = np.unique(ep)
-    rng = np.random.default_rng(cfg.seed)
-    n_val = int(round(cfg.val_fraction * len(unique_eps)))
-    val_eps = set(rng.choice(unique_eps, size=n_val, replace=False).tolist()) if n_val > 0 else set()
-
+    in_val, split_key, held_ids = draw_val_split(data, cfg, W)
     all_idx = np.arange(W, dtype=np.int64)
-    in_val = np.isin(ep, list(val_eps)) if val_eps else np.zeros(W, dtype=bool)
     stride = max(int(cfg.stride), 1)
     train_idx = all_idx[~in_val][::stride]
     val_idx = all_idx[in_val][::stride]
+    # The EPISODES that ended up held out are recorded whichever key drew the split, because
+    # every downstream consumer reads `val_episode_ids` -- but under a clip split they are a
+    # CONSEQUENCE of the draw, not the draw itself, which is what `val_split_key` says.
+    val_eps = np.unique(ep[in_val]) if in_val.any() else ep[:0]
     print(f"[fm-data] {W} snap windows ({train_idx.size} train / {val_idx.size} val) "
-          f"over {len(unique_eps)} episodes [windowed .h5].")
+          f"over {np.unique(ep).size} episodes, split by {split_key.upper()} "
+          f"({held_ids.size} held out) [windowed .h5].")
+    if split_key == "clip":
+        print("[fm-data] the held-out set is clip-disjoint from training: no episode, repeat "
+              "play or augmented re-render of a val clip reaches the train split.")
 
     train_ds = FutureStateDataset(data, meta, cfg, train_idx, add_noise=True)
     train_ds.val_episode_ids = sorted(int(e) for e in val_eps)  # for the bench's eval split
+    train_ds.val_split_key = split_key
+    train_ds.val_split_ids = [int(i) for i in held_ids]
     # Sampler weights for cfg.transition_fraction, on the TRAIN split only -- val must keep
     # the natural distribution or its metrics stop being comparable across runs.
     train_ds.sampler_weights = transition_sampler_weights(data, meta, cfg, W, train_idx)

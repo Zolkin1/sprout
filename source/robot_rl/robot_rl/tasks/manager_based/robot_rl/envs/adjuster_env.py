@@ -81,6 +81,12 @@ class AdjusterEnv(ManagerBasedRLEnv):
 
     cfg: AdjusterEnvCfg
 
+    #: Command-cfg stashes this env's observation groups require. A CLASS attribute so a
+    #: subclass can narrow it: :class:`~.token_planner_env.TokenPlannerEnv` has no flow field
+    #: to stash (its generator emits a categorical, not a velocity), and asserting a stash it
+    #: cannot fill would make the env unconstructible for a reason that is not a defect.
+    REQUIRED_STASHES: tuple[str, ...] = ("stash_conditioning", "stash_flow")
+
     def __init__(self, cfg: AdjusterEnvCfg, **kwargs) -> None:
         """Build the env, then load the frozen tracker against it.
 
@@ -181,8 +187,7 @@ class AdjusterEnv(ManagerBasedRLEnv):
         # construction to discover its shape, and that happened inside `super().__init__()`
         # above -- so enabling them here would already be too late and the obs term would have
         # raised. Found by the first smoke run, with the stash guard naming the cause.
-        missing = [name for name, flag in (("stash_conditioning", cmd.cfg.stash_conditioning),
-                                           ("stash_flow", cmd.cfg.stash_flow)) if not flag]
+        missing = [n for n in self.REQUIRED_STASHES if not getattr(cmd.cfg, n)]
         if missing:
             raise ValueError(
                 f"AdjusterEnv needs {missing} set on the command cfg: its observation groups "
@@ -269,7 +274,7 @@ class AdjusterEnv(ManagerBasedRLEnv):
             # code path -- the projection, the rotation clamp, the `_prev_served_node`
             # re-take -- and the only difference from a live run is the number itself.
             residual = torch.zeros_like(residual)
-        cmd.apply_plan_residual(residual)
+        self._apply_plan(cmd, residual)
         # The tracker must see the CORRECTED plan on the interval's very first control step.
         # Only the reference group is rebuilt: the policy group's depth is unchanged by a
         # residual and re-drawing it would only resample its observation noise.
@@ -491,6 +496,21 @@ class AdjusterEnv(ManagerBasedRLEnv):
         tm._last_episode_dones[rows] = tm._term_dones[rows]
 
     # ------------------------------------------------------------------
+    def _apply_plan(self, cmd, residual: torch.Tensor) -> None:
+        """Write this interval's plan through the command term.
+
+        A seam, not indirection: :class:`~.token_planner_env.TokenPlannerEnv` overrides it to
+        REPLACE the plan outright (its agent emits the plan) where this class corrects one.
+        Everything around it -- the phase assertion, the reference-group rebuild, the interval
+        loop, the termination attribution, the rewards-before-reset ordering -- is identical
+        for both and is why the override lives here rather than in a second ``step``.
+
+        Args:
+            cmd: The ``FmTrackingCommand``.
+            residual: ``[N, F, D]`` from :meth:`_residual_from_action`.
+        """
+        cmd.apply_plan_residual(residual)
+
     def _residual_from_action(self, action: torch.Tensor) -> torch.Tensor:
         """Turn the agent's dimensionless action into a RAW-unit ``[N, F, D]`` residual.
 

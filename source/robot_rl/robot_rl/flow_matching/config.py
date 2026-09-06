@@ -246,6 +246,17 @@ class FlowMatchingConfig:
 
     stride: int = 1
     val_fraction: float = 0.1
+    #: What the held-out split is keyed on: ``"episode"`` (historical) or ``"clip"``.
+    #:
+    #: ``"episode"`` has a measured hole. ``episode_id`` is numbered per RECORDING and
+    #: ``train.py`` offsets each subsequent file past the running maximum, so an episode and
+    #: its own augmented re-render carry different ids and land on opposite sides of the draw
+    #: -- and a clip played by two episodes leaks the same way inside one file. On the shipped
+    #: ``measured_n3`` pair that put **740 of 855 held-out clips (86.5%) into training**, and
+    #: the generator's residual on those rows is 0.41-0.78x its residual on genuinely unseen
+    #: clips. ``"clip"`` keys on the clip LIBRARY id, which every copy of a motion shares, and
+    #: closes it. See :func:`~robot_rl.flow_matching.dataset.draw_val_split`.
+    val_split_by: str = "episode"
     precompute: bool = True
 
     # Future-target source. "ego_anchored_clip_future": predict the motion clip

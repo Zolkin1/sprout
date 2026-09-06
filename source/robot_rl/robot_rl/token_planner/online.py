@@ -384,6 +384,7 @@ def sample_window(
     history_null_mask: torch.Tensor | None = None,
     noise: torch.Tensor | None = None,
     return_flow: bool = False,
+    force_tokens: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample the ``F``-node future window, denormalized -- the flow sampler's twin.
 
@@ -402,6 +403,12 @@ def sample_window(
         history_null_mask: ``(V,)`` bool; where True the history is replaced by the learned
             null embedding -- the first ``N`` steps after a reset, when nothing has been
             emitted to condition on.
+        force_tokens: ``(V, N)`` int64 or ``None``. Entries ``>= 0`` REPLACE the token that
+            decode step would have drawn, and decoding continues conditioned on the
+            replacement -- token-level teacher forcing. ``-1`` leaves a position free. The
+            flow sampler has no equivalent and refuses this argument, which is the point:
+            teacher forcing a token planner is a strictly finer instrument than swapping its
+            history, because it can pin the PLAN itself one chunk at a time.
         noise: Must be ``None``. Present only so this is signature-compatible with the flow
             sampler; see below.
         return_flow: Must be ``False``. Likewise.
@@ -433,5 +440,6 @@ def sample_window(
     tokens, _, _ = ctx.model.sample(
         history, extero, cmd_tokens, history_null_mask,
         temperature=ctx.temperature, greedy=ctx.greedy, generator=ctx.generator,
+        force_tokens=force_tokens,
     )
     return ctx.model.decode(tokens, ctx.state_norm)

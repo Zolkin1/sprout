@@ -400,8 +400,15 @@ def format_report(rep: dict[str, Any], max_families: int = 12) -> str:
         row("interior slope", {g: bp[g]["interior_slope"] for g in groups if g in bp}),
         "",
     ]
-    lines.append(f"base orientation geodesic: {rep.get('ori_geodesic_rad', 0.0):.5f} rad "
-                 f"({math.degrees(rep.get('ori_geodesic_rad', 0.0)):.2f} deg)")
+    # ABSENT, not zero. The residual arm drops this key on purpose -- the angle between two
+    # DIFFERENCES of rotation frames is not a rotation angle -- and a defaulted 0.0 would
+    # print as a perfect score for a quantity that was never measured.
+    if "ori_geodesic_rad" in rep:
+        lines.append(f"base orientation geodesic: {rep['ori_geodesic_rad']:.5f} rad "
+                     f"({math.degrees(rep['ori_geodesic_rad']):.2f} deg)")
+    else:
+        lines.append("base orientation geodesic: n/a (residual arm -- measured in PLAN space, "
+                     "see residual_gate)")
     cb = rep["codebook"]
     lines.append(
         f"codebook: {int(cb['distinct'])}/{int(cb['vocab_size'])} ids used "

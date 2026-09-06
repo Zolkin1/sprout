@@ -85,12 +85,12 @@ from robot_rl.flow_matching.window import (
     DEFAULT_WINDOW_ANCHOR,
     MEASURED_HISTORY_FALLBACK,
     assert_history_source_matches,
-    clamp_window_rotation_residual,
+    compose_window_residual,
     measured_history_fallback_spans,
-    project_window_rotations,
     reanchor_window,
     resolve_reference_blocks,
     window_block_slices,
+    window_rotation_span,
     window_to_world,
     world_to_window,
 )
@@ -196,6 +196,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         # Offset of the node being served within the live plan: 0 on a re-plan, +1 per step
         # kept as a tensor so the look-ahead helpers take one code path.
         self._zero_offset = torch.zeros(1, dtype=torch.long, device=dev)
+        #: ``[F]`` every offset of one plan, for building the clip's whole future
+        #: window in one call (`planner_force_tokens`). Allocated once: this runs on
+        #: the re-plan path, which is already the command term's hot phase.
+        self._plan_offsets = None
 
         if not self.command_velocity_available:
             raise RuntimeError(
@@ -253,6 +257,13 @@ class FmTrackingCommand(MotionSequenceCommand):
                     "do -- reusing a flow flag would make it mean two different things "
                     "depending on which artifact was loaded.")
             self._sample_module = _tp_online
+            n_force = int(self.cfg.planner_force_tokens)
+            if n_force != 0 and self.cfg.reference_source != "fm":
+                raise ValueError(
+                    f"planner_force_tokens={n_force} but reference_source="
+                    f"{self.cfg.reference_source!r}: the forced plan would be built and then "
+                    "not served, so the run would look like teacher forcing and measure the "
+                    "clip arm. Set reference_source='fm'.")
             self.ctx = load_planner_context(
                 self.cfg.fm_checkpoint, device=self.cfg.fm_device or dev,
                 greedy=bool(self.cfg.planner_greedy),
@@ -270,6 +281,11 @@ class FmTrackingCommand(MotionSequenceCommand):
                 zero_noise=self.cfg.fm_zero_noise,
                 guidance_scale=self.cfg.fm_guidance_scale,
             )
+            if int(self.cfg.planner_force_tokens) != 0:
+                raise ValueError(
+                    "planner_force_tokens is a token-planner setting and has no meaning for "
+                    "the flow generator: it emits one continuous window and has no token "
+                    "sequence to pin. Its coarser equivalent is history_from='clip'.")
             self._sample_module = _fm_online
         # Publish it: the RL adjuster's network borrows this exact frozen encoder, and an
         # rsl-rl model is built from a dict of primitives so it cannot be handed an object.
@@ -464,6 +480,17 @@ class FmTrackingCommand(MotionSequenceCommand):
         # Printed UNCONDITIONALLY. Which history the generator is eating changes the
         # result more than anything else on this command, and a message that appears only
         # in the non-default case makes "no message" ambiguous with "I did not look".
+        if int(getattr(self.cfg, "planner_force_tokens", 0)) != 0:
+            n_force = int(self.cfg.planner_force_tokens)
+            n_tok = getattr(self.ctx, "num_tokens", None) or getattr(
+                getattr(self.ctx, "model", None), "num_tokens", "?")
+            shown = n_tok if (n_force < 0 or (n_tok != "?" and n_force >= n_tok)) else n_force
+            print(f"[INFO FmTrackingCommand] planner_force_tokens={n_force}: TOKEN-LEVEL "
+                  f"TEACHER FORCING -- the first {shown} of {n_tok} decode tokens come from "
+                  "the CLIP's own future window, encoded by this checkpoint's frozen "
+                  "tokenizer. With all of them forced the served plan is the TOKENIZER's "
+                  "reconstruction of the clip, which is the floor this generator can reach, "
+                  "not the clip itself.")
         if self.cfg.history_from == "clip":
             print("[INFO FmTrackingCommand] history_from='clip': TEACHER FORCING. The "
                   "generator conditions on the clip's nodes, not its own -- a diagnostic "
@@ -1083,6 +1110,59 @@ class FmTrackingCommand(MotionSequenceCommand):
             self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks,
         )[:, 0]
 
+    def _clip_force_tokens(self, ids: torch.Tensor) -> torch.Tensor | None:
+        """Token ids from the CLIP's own future window, for teacher-forcing the decode.
+
+        The token-level counterpart of ``history_from="clip"``. That arm forces the
+        CONDITIONING and leaves the plan free; this one pins the PLAN, one chunk at a time,
+        so a sweep over ``cfg.planner_force_tokens`` walks from the model's own plan to the
+        clip's and says how much of the tracking error each token carries.
+
+        The window is encoded by the SAME frozen tokenizer the planner embeds, so the ids are
+        in the vocabulary the model was fitted on -- and forcing all ``N`` of them reproduces
+        the tokenizer's reconstruction of the clip, never anything better. That is the useful
+        floor: a run that still fails with every token forced is failing for a reason no
+        amount of planner training can fix.
+
+        Args:
+            ids: ``[V]`` env indices being re-planned this step.
+
+        Returns:
+            ``[V, N]`` int64 with ``-1`` at free positions, or ``None`` when forcing is off.
+        """
+        n = int(self.cfg.planner_force_tokens)
+        if n == 0:
+            return None
+        if self._plan_offsets is None:
+            self._plan_offsets = torch.arange(
+                self.ctx.F, dtype=torch.long, device=self.device)
+        prev = self._serve_override
+        self._serve_override = "clip"
+        try:
+            anchor_pos, anchor_quat = self.window_anchor()
+            win = super().reference_window_obs(self._plan_offsets, self._fm_blocks)
+        finally:
+            self._serve_override = prev
+        # Re-expressed onto the anchor THIS plan is about to be latched against -- the robot
+        # as it is now, which `_run_fm` writes into `_anchor_pos` a few lines below. The
+        # source frame is read back from `window_anchor()` rather than assumed to be
+        # robot-now (`_clip_history_node` hardcodes that assumption), because which frame the
+        # inherited accessor answers in depends on `cfg.window_anchor` and on whether a
+        # generator is loaded -- and a window forced in the wrong frame is a plausible plan
+        # with a translation baked in, which no shape check would catch.
+        win = reanchor_window(
+            win, anchor_pos[:, None, :], anchor_quat[:, None, :],
+            wp.to_torch(self.robot.data.root_pos_w)[:, None, :],
+            wp.to_torch(self.robot.data.root_quat_w)[:, None, :],
+            self.ctx.nj, self.ctx.num_extra_frames, self._fm_blocks,
+        )[ids]
+        tok = self.ctx.model.tokenizer.encode_to_ids(self.ctx.state_norm.normalize(win))
+        if n < 0 or n >= tok.shape[1]:
+            return tok
+        forced = torch.full_like(tok, -1)
+        forced[:, :n] = tok[:, :n]
+        return forced
+
     def _measured_history_node(self) -> torch.Tensor:
         """The ROBOT'S OWN state as a window node, in the plan's frame.
 
@@ -1490,6 +1570,7 @@ class FmTrackingCommand(MotionSequenceCommand):
             history_null_mask=(None if null_hist is None else null_hist[ids]),
             noise=(None if self._noise_source is None else self._noise_source(ids)),
             return_flow=self._pred_flow is not None,
+            force_tokens=self._clip_force_tokens(ids),
         )
         if self._pred_flow is not None:
             self._pred_window[ids], self._pred_flow[ids] = sampled
@@ -1540,13 +1621,9 @@ class FmTrackingCommand(MotionSequenceCommand):
         ``None`` when the selection packs no ``base_pose`` -- then there is no rotation to
         project or bound and the residual is a plain addition.
         """
-        slices = window_block_slices(
+        return window_rotation_span(
             self.ctx.nj, self.ctx.target_num_extra_frames, self._fm_blocks
         )
-        if "base_pose" not in slices:
-            return None
-        start = slices["base_pose"].start + 3
-        return slice(start, start + 6)
 
     def plan_residual(self) -> torch.Tensor:
         """The residual most recently applied to the live plan, ``[N, F, D]``, in RAW units.
@@ -1605,28 +1682,14 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._pred_valid.view(-1, 1, 1), residual.to(self._pred_window.dtype),
             torch.zeros_like(self._pred_window),
         )
-        nj, nee = self.ctx.nj, self.ctx.target_num_extra_frames
         original = self._pred_window.clone()
-        summed = original + residual
-        adjusted = project_window_rotations(summed, nj, nee, self._fm_blocks)
-        # The projection is not the bound. Adding six free numbers to an orthonormal pair
-        # leaves SO(3), and Gram-Schmidt puts it back -- but says nothing about HOW FAR it
-        # rotated, and the failure termination's tilt check is measured against this very
-        # reference. So the angle is bounded explicitly, after the projection because
-        # ``so3_log`` needs a real rotation.
-        limited = clamp_window_rotation_residual(adjusted, original, nj, nee, self._fm_blocks)
-        # Take the projected+bounded rotation ONLY on nodes whose rotation actually moved.
-        #
-        # ``project_window_rotations`` is a Gram-Schmidt round trip, and in float32 that is not
-        # the identity on input already orthonormal -- measured 2.4e-7 on 6.7% of channels. So
-        # projecting unconditionally means a ZERO residual still perturbs the plan, which
-        # quietly destroys the property the whole verification chain rests on: that the
-        # adjuster at zero action reproduces the bare generator. On a robot that is a chaotic
-        # divergence from a 1e-7 seed, not a rounding difference.
-        ori = self._ori_channel_span()
-        if ori is not None:
-            moved = (residual[..., ori] != 0).any(dim=-1, keepdim=True)   # [N, F, 1]
-            limited = torch.where(moved, limited, summed)
+        # add -> Gram-Schmidt -> geodesic tilt bound -> take the projection only where the
+        # rotation moved, so a zero residual reproduces the bare generator BIT-IDENTICALLY.
+        # Shared with the offline residual dataset, which has to INVERT exactly this rule:
+        # a residual fitted against a different composition means something else when served.
+        limited = compose_window_residual(
+            original, residual, self.ctx.nj, self.ctx.target_num_extra_frames, self._fm_blocks
+        )
         # In place, not a rebind: ``_pred_window`` is allocated once in ``_post_init`` and the
         # diagnostics hold views of it.
         self._pred_window.copy_(limited)
@@ -1645,6 +1708,49 @@ class FmTrackingCommand(MotionSequenceCommand):
         # under ``history_from="generator"``; under ``"measured"`` it reaches only the two
         # MEASURED_HISTORY_FALLBACK channels, which is still the difference between the
         # fallback describing the served plan and describing a plan that was discarded.
+        self._prev_served_node = self._pred_window[self._arange_n, self._pred_idx].clone()
+
+    def apply_plan_window(self, window: torch.Tensor) -> None:
+        """REPLACE the live plan outright, in the plan's own frame.
+
+        The absolute sibling of :meth:`apply_plan_residual`, for an agent whose action IS the
+        plan rather than a correction to one -- the tokenized planner under RL, where the
+        policy emits ``N`` tokens and the decoded window is what the tracker must follow.
+
+        Everything :meth:`apply_plan_residual`'s docstring says about WHERE to write applies
+        unchanged, and is the reason this exists at all: ``_pred_window`` is the only write
+        every consumer sees -- the tracker's ``reference`` observation, ``y_des``/``dy_des``
+        and hence the CLF, ``served_tracking_error`` and hence the dense reward and the
+        failure termination, the generator's own history row, and the debug ribbon.
+
+        No projection and no rotation clamp here, unlike the residual path. ``decode`` has
+        already Gram-Schmidted the rotation block, so the window arrives on SO(3); and there
+        is no "how far did it rotate" to bound, because this is not a perturbation of a plan
+        the generator drew -- it IS the plan, and the reference it would be measured against
+        does not exist.
+
+        Args:
+            window: ``[N, F, D]`` raw (denormalized) nodes. Envs with no live plan keep
+                whatever they had rather than being silently given one.
+
+        Raises:
+            ValueError: If the shape does not match the live plan.
+        """
+        if window.shape != self._pred_window.shape:
+            raise ValueError(
+                f"plan window {tuple(window.shape)} != live plan "
+                f"{tuple(self._pred_window.shape)}. The agent's decoded plan has to be the "
+                "window this command serves, node for node and channel for channel.")
+        keep = self._pred_valid.view(-1, 1, 1)
+        # In place, not a rebind: `_pred_window` is allocated once in `_post_init` and the
+        # diagnostics hold views of it.
+        self._pred_window.copy_(
+            torch.where(keep, window.to(self._pred_window.dtype), self._pred_window))
+        # Re-take the served-node stash, for the same reason the residual path does:
+        # `_snapshot_and_infer` latched it at the tail of the previous step from the plan the
+        # GENERATOR drew, so without this the history row for node 0 describes a plan that
+        # was discarded while rows 1..K-1 describe the served one -- an inconsistency in the
+        # planner's own conditioning that no shape or width check can see.
         self._prev_served_node = self._pred_window[self._arange_n, self._pred_idx].clone()
 
     def set_noise_source(self, source) -> None:
