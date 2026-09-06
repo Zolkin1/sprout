@@ -617,7 +617,13 @@ def _log(it, roll, adv, degenerate, stats, env, writer, wandb_run, secs) -> None
           f"deg {100 * sc['train/degenerate_frac']:.0f}%  "
           f"ent {sc['train/entropy']:.2f}  zero {sc['train/zero_nll']:.2f}  "
           f"clip {100 * sc['train/clipped_frac']:.0f}%  "
-          f"goal {rates.get('goal_rate', 0.0):.3f}  fall {rates.get('fall_rate', 0.0):.3f}  "
+          # INDEXED, not .get()-with-a-default. `EndingCounts.rates()` names these
+          # `success`/`fell`, and an earlier version of this line asked for `goal_rate` /
+          # `fall_rate` -- keys that do not exist -- so it printed 0.000 for both while 459
+          # of 600 episodes were ending per iteration. A missing headline key must raise.
+          f"succ {rates['success']:.3f}  fell {rates['fell']:.3f}  "
+          f"to {rates['timeout']:.3f}  n {counts.episodes}  "
+          f"fin {100 * sc['train/finished_frac']:.0f}%  "
           f"({secs:.0f}s)", flush=True)
 
 
