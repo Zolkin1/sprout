@@ -32,7 +32,9 @@ def _env(cmd_dim: int = CMD_DIM):
     ctx = types.SimpleNamespace(
         N=N, D=D, extero_sensor_count=SENSORS, extero_sensor_dim=SENSOR_DIM,
         num_cmd_tokens=CMD_TOK, cmd_dim=cmd_dim)
-    return types.SimpleNamespace(planner_ctx=ctx)
+    # `generator_ctx` is the one accessor the split reads; supplying it directly is
+    # what keeps this test simulator-free.
+    return types.SimpleNamespace(generator_ctx=ctx, planner_ctx=ctx)
 
 
 def _pack(hist, extero, cmd, null):

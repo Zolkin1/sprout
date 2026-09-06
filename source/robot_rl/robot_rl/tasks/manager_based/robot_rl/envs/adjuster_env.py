@@ -496,6 +496,56 @@ class AdjusterEnv(ManagerBasedRLEnv):
         tm._last_episode_dones[rows] = tm._term_dones[rows]
 
     # ------------------------------------------------------------------
+    @property
+    def generator_ctx(self):
+        """The loaded generator's context: widths, normalizers, and the model itself.
+
+        One accessor rather than each caller reaching through the command term, so a stub in
+        a test can stand in for it and the packing inverse below stays testable without a
+        simulator.
+
+        Returns:
+            The context the command term loaded (an ``FmOnlineContext`` or a
+            ``TokenPlannerContext``, depending on ``generator_kind``).
+        """
+        return self.command_manager.get_term(self.cfg.command_name).ctx
+
+    def split_conditioning(self, cond: torch.Tensor):
+        """Split the flat conditioning row back into the generator's four inputs.
+
+        Lives here rather than on either subclass because BOTH need it and the packing it
+        inverts is the command term's, not theirs: ``_run_fm`` flattens history, extero and
+        command into one row and appends the null-history flag, and this is the only thing
+        that reads it back. Two copies of that inverse would be two chances to disagree with
+        one packer, and the failure -- a policy conditioned on scrambled inputs -- has no
+        shape that would show it.
+
+        Args:
+            cond: ``[B, cond_dim]`` as :meth:`planner_conditioning` returns it.
+
+        Returns:
+            ``(history, extero, cmd_tokens, history_null_mask)``.
+
+        Raises:
+            ValueError: If the width disagrees with the checkpoint's contract. Slicing a
+                mismatched row would succeed and misalign every field after the first.
+        """
+        ctx = self.generator_ctx
+        b = cond.shape[0]
+        nh = ctx.N * ctx.D
+        ne = ctx.extero_sensor_count * ctx.extero_sensor_dim
+        nc = ctx.num_cmd_tokens * ctx.cmd_dim if ctx.cmd_dim > 0 else 0
+        if cond.shape[1] != nh + ne + nc + 1:
+            raise ValueError(
+                f"conditioning width {cond.shape[1]} != {nh}+{ne}+{nc}+1 expected from the "
+                "checkpoint's contract. The stash layout and this split have come apart.")
+        hist = cond[:, :nh].view(b, ctx.N, ctx.D)
+        extero = cond[:, nh:nh + ne]
+        cmd = (cond[:, nh + ne:nh + ne + nc].view(b, ctx.num_cmd_tokens, ctx.cmd_dim)
+               if nc else None)
+        null = cond[:, -1] > 0.5
+        return hist, extero, cmd, null
+
     def _apply_plan(self, cmd, residual: torch.Tensor) -> None:
         """Write this interval's plan through the command term.
 

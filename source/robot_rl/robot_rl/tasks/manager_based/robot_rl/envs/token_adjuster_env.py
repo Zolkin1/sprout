@@ -158,6 +158,32 @@ class TokenAdjusterEnv(AdjusterEnv):
         """
         return self._cmd.plan_window()
 
+    @property
+    def residual_normalizer(self):
+        """The residual space the ACTION's ids name.
+
+        Public because the trainer must compare it against the one its policy checkpoint
+        carries: both decode the same ids, and disagreeing on the space they name would make
+        the correction the policy scores a different one from the correction served, with
+        every shape still right.
+
+        Returns:
+            The :class:`~robot_rl.flow_matching.normalizer.Normalizer`.
+        """
+        return self._res_norm
+
+    @property
+    def plan_normalizer(self):
+        """The GENERATOR's state normalizer -- the space :meth:`plan_window` is raw in.
+
+        A policy conditions on the plan in this space, not in the residual's. They are
+        different affines over the same 44 channels, so using the wrong one is silent.
+
+        Returns:
+            The :class:`~robot_rl.flow_matching.normalizer.Normalizer`.
+        """
+        return self._cmd.ctx.state_norm
+
     # ------------------------------------------------------------------
     def step(self, action: torch.Tensor):
         """Compose one decoded correction onto the plan, then run the whole interval.
