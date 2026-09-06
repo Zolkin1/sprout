@@ -167,14 +167,24 @@ def merge(stems: list[str], out_stem: str) -> None:
                    if k not in ("depth_camera_spec", "height_scan_spec")}}
         for s, W, E, ea in zip(stems, win, eps, eattrs)]}
 
-    for path, cols, base in ((out_stem + ".h5", out_w, wattrs[0]),
-                             (out_stem + ".episodes.h5", out_e, eattrs[0])):
+    n_win = len(out_w["episode_uid"])
+    for path, cols, base, is_windows in (
+            (out_stem + ".h5", out_w, wattrs[0], True),
+            (out_stem + ".episodes.h5", out_e, eattrs[0], False)):
         with h5py.File(path, "w") as f:
             for k, v in cols.items():
                 f.create_dataset(k, data=v, compression="lzf" if v.nbytes > (1 << 20) else None)
             for k, v in base.items():
                 f.attrs[k] = v if isinstance(v, (str, bytes)) else json.dumps(
                     v.tolist() if isinstance(v, np.ndarray) else v, default=str)
+            # **The window COUNT is the merged one, not the first file's.**
+            # `read_rollout_windows` slices `[:num_windows_written]`, so inheriting the
+            # source's value silently truncates the merged table to the first file's length:
+            # the file holds every row, every reader sees a sixth of them, and a critic
+            # trained on it reports nothing wrong. Caught by test_merge_rollouts.
+            if is_windows:
+                for key in ("num_windows", "num_windows_written"):
+                    f.attrs[key] = n_win
             f.attrs["merge_provenance"] = json.dumps(prov, default=str)
         print(f"[merge] wrote {path}: {len(next(iter(cols.values())))} rows")
     print(f"[merge] {n_eps} episodes, {len(out_w['episode_uid'])} windows, "
