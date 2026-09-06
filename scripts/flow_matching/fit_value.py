@@ -104,13 +104,21 @@ from robot_rl.flow_matching import online, transforms, value, value_gates  # noq
 GOAL_SCALE_M: float = 5.0
 
 
-def _load(stem: str, max_windows: int, tail_chunks: int = 1) -> tuple[dict, dict, dict]:
+def _load(stem: str, max_windows: int, tail_chunks: int = 1,
+          strict_failure: bool = True) -> tuple[dict, dict, dict]:
     """Read both tables and join them on ``episode_uid``.
 
     Args:
         stem: The rollout stem.
         max_windows: Cap, so a multi-gigabyte recording can be smoke-tested.
         tail_chunks: Trailing chunks the quality target's non-failure tail averages.
+        strict_failure: Count the STRICT tracking violation as a failure alongside the fall
+            crossing.  ``False`` is the LOOSE rule -- the fall alone -- which is what MuJoCo
+            scores (``mjeval`` tests ``robot.failed()``: height and tilt, no tracking check).
+            It matters enormously on an out-of-distribution course under placeholder
+            tolerances: on the box2 grid the strict rule labels 8967 of 9000 episodes failed
+            while the loose one labels 8272, because 695 episodes REACHED THE GOAL and tripped
+            the 0.2 m / 30 deg bootstrap tolerances on the way -- 33 positives against 728.
 
     Returns:
         ``(windows, episodes, per_window_labels)``.
@@ -145,11 +153,11 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1) -> tuple[dict, dict
         W = {k: v[keep] for k, v in W.items()}
 
     live = ~E["censored"].astype(bool)
-    reward = ro.terminal_reward(E)
+    reward = ro.terminal_reward(E, strict=strict_failure)
     # `first_bad` is what drop-after-latch below cuts on: the fall crossing or the strict
     # violation, whichever came FIRST. Taken from the same table `terminal_reward` scored, so
     # the label and the cut cannot disagree about when the episode ended.
-    first_bad = ro.first_bad_step(E)
+    first_bad = ro.first_bad_step(E, strict=strict_failure)
     outcome = {int(u): (float(r), bool(l), int(ff), int(fam), int(fb))
                for u, r, l, ff, fam, fb in zip(E["episode_uid"], reward, live,
                                                E["first_fall_step"], E["family_code"],
@@ -585,6 +593,13 @@ def main() -> int:
                         "existing artifact -- a changed default would silently score every "
                         "critic already fitted against a target it never saw. Stamped into "
                         "the checkpoint, so a refit states what it used.")
+    p.add_argument("--failure_rule", choices=("strict", "loose"), default="strict",
+                   help="What counts as a failure. 'strict' is the fall crossing OR the "
+                        "strict tracking violation; 'loose' is the fall alone, which is what "
+                        "MuJoCo scores. Under PLACEHOLDER tracking tolerances the strict rule "
+                        "can label almost everything failed -- on the box2 grid it left 33 "
+                        "non-failures against the loose rule's 728 -- so check the positive "
+                        "count that this prints before trusting an AUC.")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--max_windows", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -600,7 +615,13 @@ def main() -> int:
 
     stem = args.stem[:-3] if args.stem.endswith(".h5") else args.stem
     stem = stem[:-9] if stem.endswith(".episodes") else stem
-    W, E, lab = _load(stem, args.max_windows, int(args.tail_chunks))
+    strict_failure = args.failure_rule == "strict"
+    W, E, lab = _load(stem, args.max_windows, int(args.tail_chunks), strict_failure)
+    print(f"[fit] failure rule: {args.failure_rule} "
+          + ("(fall crossing OR strict tracking violation)" if strict_failure
+             else "(the FALL ALONE -- MuJoCo's rule; the tracking violation is ignored)")
+          + ". The QUALITY target is unaffected by this and still answers to the tracking "
+            "spec.")
     keep = lab["live"]
     if not keep.all():
         # Censored episodes have NO outcome: they neither fell nor failed to arrive, they were
@@ -756,6 +777,13 @@ def main() -> int:
             # instance in this repo of "a checkpoint's saved config is the only record of what
             # it was trained against"; see CLAUDE.md on `extero_clip` for the first.
             torch.save({"model": model.state_dict(), "variant": label,
+                        # WHICH FAILURE RULE trained this head. The strict and loose rules
+                        # differ by a factor of 22 in positive count on the box2 grid, and
+                        # nothing about the weights says which one produced them -- so a
+                        # consumer scoring under the other rule would compare two different
+                        # quantities, both plausible. Fifth instance of "a checkpoint's saved
+                        # config is the only record of what it was trained against".
+                        "failure_rule": args.failure_rule,
                         "fm_checkpoint": os.path.abspath(args.fm_checkpoint),
                         # The PATH identifies where it was; the HASH identifies WHAT it was.
                         # Only the second survives being read on another machine, and the

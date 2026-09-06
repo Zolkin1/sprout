@@ -148,7 +148,14 @@ def main() -> int:
     priv = bool(ck.get("privileged", True))
     print(f"[score] {os.path.basename(a.checkpoint)}: variant {ck.get('variant','?')}, "
           f"privileged={priv}, goal_context={ck.get('goal_context', True)}")
-    W, E, lab_all = fv._load(a.stem, a.max_windows)
+    # Scored under the rule the critic was FITTED under, read off its stamp. Scoring a
+    # loose-rule head against strict labels (or the reverse) compares two different
+    # quantities and both are plausible numbers; an unstamped checkpoint predates the flag,
+    # when strict was the only behaviour.
+    rule = str(ck.get("failure_rule", "strict"))
+    print(f"[score] failure rule from the checkpoint: {rule}"
+          + ("" if "failure_rule" in ck else "  (unstamped -- predates the flag, so strict)"))
+    W, E, lab_all = fv._load(a.stem, a.max_windows, strict_failure=(rule == "strict"))
     ctx = load_fm_context(fm_ckpt, device=a.device)
     model = rebuild(ck, ctx, a.device)
 
