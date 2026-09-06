@@ -61,12 +61,27 @@ def test_the_history_arm_matches_the_residual_dataset(cfg) -> None:
     assert cfg.commands.traj_ref.history_from == "measured"
 
 
-def test_the_residual_terms_are_present_and_unpriced(cfg) -> None:
-    """Present, so the correction's magnitude is measured; zero, so it is not priced."""
+def test_the_residual_terms_are_measured_but_not_priced(cfg) -> None:
+    """Present AND NON-ZERO, so the term actually runs.
+
+    The earlier version of this test asserted ``weight == 0.0`` and called it "measured but
+    not priced" -- enshrining the defect it was meant to guard. ``RewardManager.compute``
+    SKIPS a zero-weight term entirely, so the one quantity saying how hard the agent is
+    pushing would read 0.0 forever while ``reset`` kept emitting an all-zero
+    ``Episode_Reward`` for it. Indistinguishable from the "does nothing" failure this stage
+    exists to escape.
+    """
     for name in ("residual_l2", "residual_rate_l2"):
         term = getattr(cfg.rewards, name, None)
         assert term is not None, f"{name} is the only place |residual| is computed"
-        assert term.weight == 0.0, f"{name} must not price the correction; the KL does"
+        assert term.weight != 0.0, (
+            f"{name} at weight 0 is never CALLED by RewardManager.compute, so the "
+            "diagnostic it exists for is a structural zero")
+        # ...and small enough not to price anything: the dense reward is order 1 and a fall
+        # is -10, so a diagnostic weight must sit far below both.
+        assert abs(term.weight) < 1e-6, (
+            f"{name} at {term.weight} is pricing the correction, not measuring it; the "
+            "magnitude bound is the zero-code anchor in the loss")
 
 
 def test_falling_costs_the_same_however_it_is_detected(cfg) -> None:

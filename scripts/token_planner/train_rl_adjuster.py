@@ -249,6 +249,28 @@ def main() -> None:
                 f"the adjuster's residual normalizer and the env's disagree on '{field}'. "
                 "Both decode the same ids; disagreeing on the space they name makes the "
                 "correction the policy scores a different one from the correction served.")
+    # ...and the normalizer alone CANNOT catch the drift that matters. It is copied verbatim
+    # out of the residual cache into every tokenizer trained on that cache, so two tokenizers
+    # with completely different codebooks compare equal on it -- the check above passes by
+    # construction for exactly the case its own message describes. What decides what an id
+    # MEANS is the decoder's weights, so those are what is hashed. Measured: the same ids
+    # under two same-cache codebooks decode 3.24 apart in normalized units.
+    def _codebook_sha(tok) -> str:
+        h = hashlib.sha256()
+        for k, v in sorted(tok.state_dict().items()):
+            h.update(k.encode())
+            h.update(v.detach().cpu().contiguous().numpy().tobytes())
+        return h.hexdigest()[:16]
+
+    mine, theirs = _codebook_sha(policy.tokenizer), _codebook_sha(env._tokenizer)
+    if mine != theirs:
+        raise SystemExit(
+            f"the adjuster's codebook ({mine}) is not the env's ({theirs}). The policy emits "
+            "ids under one decoder and the env serves them under another, so every "
+            "correction is a different trajectory from the one scored -- and the normalizers "
+            "agree, because they come from the shared cache rather than from the codebook. "
+            "Pass --residual_tokenizer the checkpoint the adjuster was fitted against.")
+    print(f"[rladj] codebook {mine} agrees between the policy and the env")
 
     names, labels = channel_group_labels(
         int(policy.cfg.num_joints_for_layout), int(policy.cfg.num_ee_frames_for_layout),
@@ -456,8 +478,14 @@ def main() -> None:
                     stats["gn"].append(gn)
             if not warm and abs(_fmean(stats["approx_kl"][-4:])) > args.target_kl:
                 stop = True
-        _report(it, warm, R, D, advn, ret, COf, Rf, critic, counts, stats, env,
-                writer, wandb_run, out_dir, policy, opt, parent, zero_code, time.time() - t0)
+        stop_reason = _report(it, warm, R, D, advn, ret, COf, Rf, critic, counts, stats,
+                              env, writer, wandb_run, out_dir, policy, opt, parent,
+                              zero_code, time.time() - t0)
+        if stop_reason:
+            break
+    writer.close()
+    if wandb_run is not None:
+        wandb_run.finish()
     env.close()
 
 
@@ -474,7 +502,7 @@ def _fmean(v) -> float:
 
 
 def _report(it, warm, R, D, advn, ret, COf, Rf, critic, counts, stats, env,
-            writer, wandb_run, out_dir, policy, opt, parent, zero_code, secs) -> None:
+            writer, wandb_run, out_dir, policy, opt, parent, zero_code, secs) -> str:
     """Log one iteration, check the divergence gates, and checkpoint.
 
     The gates are the sibling trainer's, and each caught a run that otherwise looked healthy:
@@ -508,7 +536,7 @@ def _report(it, warm, R, D, advn, ret, COf, Rf, critic, counts, stats, env,
         "train/approx_kl": _fmean(stats["approx_kl"]),
         "train/grad_norm": _fmean(stats["gn"]),
         "train/explained_variance": float(ev),
-        "train/done_rate": float(D.mean()),
+        "train/truncated_rate": float(D.mean()),   # D holds TRUNCATIONS (arrival)
         "train/warmup": float(warm),
         "train/adv_abs": float(advn.abs().mean()),
         "train/iter_s": secs,
@@ -543,15 +571,19 @@ def _report(it, warm, R, D, advn, ret, COf, Rf, critic, counts, stats, env,
     elif not warm and it >= args.warmup_iters + 5 and ev < 0.0:
         stop_reason = f"critic explained variance {ev:.3f} < 0 after warm-up"
     if it % args.ckpt_every == 0 or stop_reason or it == args.iters - 1:
-        _save(os.path.join(out_dir, f"rl_{it}.pt"), policy, opt, parent, it, zero_code)
+        _save(os.path.join(out_dir, f"rl_{it}.pt"), policy, critic, opt, parent, it,
+              zero_code, float(env.residual_alpha))
     if stop_reason:
         print(f"[rladj] STOP: {stop_reason}", flush=True)
         with open(os.path.join(out_dir, "stop.json"), "w") as fh:
             json.dump({"iter": it, "reason": stop_reason, "scalars": sc}, fh, indent=2)
-        raise SystemExit(1)
+    # RETURNED, not raised. A SystemExit from inside a helper skips the caller's env.close()
+    # and simulation_app.close(), which leaves a Kit process holding the GPU on every gate
+    # trip -- the gates being the paths most likely to fire unattended.
+    return stop_reason
 
 
-def _save(path, policy, opt, parent, it, zero_code) -> None:
+def _save(path, policy, critic, opt, parent, it, zero_code, alpha) -> None:
     """Write an RL checkpoint that ``load_planner_context`` can actually load.
 
     The graft list includes ``data``, which the sibling trainer's saver omitted -- without it
@@ -567,8 +599,14 @@ def _save(path, policy, opt, parent, it, zero_code) -> None:
         zero_code: The magnitude anchor's id, recorded so a later run cannot re-derive a
             different one against the same codebook.
     """
-    ck = {"model": policy.state_dict(), "optimizer": opt.state_dict(),
-          "config": policy.cfg.to_dict(), "epoch": it, "zero_code": int(zero_code),
+    cfg = policy.cfg.to_dict()
+    # The LIVE gain, not stage C's. The trainer ramps `env.residual_alpha` per iteration and
+    # `decode_residual` defaults its alpha to this field, so leaving the stale value here
+    # makes any offline re-score of this checkpoint use a gain the run never served.
+    cfg["residual_alpha"] = float(alpha)
+    ck = {"model": policy.state_dict(), "critic": critic.state_dict(),
+          "optimizer": opt.state_dict(),
+          "config": cfg, "epoch": it, "zero_code": int(zero_code),
           "rl": {k: v for k, v in vars(args).items() if not k.startswith("_")},
           "adjuster_sha": hashlib.sha256(
               open(args.adjuster, "rb").read(1 << 20)).hexdigest()[:16]}

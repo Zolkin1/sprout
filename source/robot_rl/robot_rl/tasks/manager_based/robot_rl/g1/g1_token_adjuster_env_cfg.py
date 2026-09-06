@@ -20,6 +20,14 @@ from robot_rl.tasks.manager_based.robot_rl.envs import TokenAdjusterEnvCfg
 from .g1_adjuster_env_cfg import G1AdjusterEnvCfg
 
 
+#: Weight that keeps the residual-magnitude terms COMPUTED without pricing them.
+#:
+#: Not 0: ``RewardManager.compute`` skips zero-weight terms, so the diagnostic would be a
+#: structural 0.0. At 1e-8 against a dense reward of order 1 and a -10 fall, the contribution
+#: is 9 orders below the smallest thing that matters, while the term still runs and logs.
+RESIDUAL_DIAGNOSTIC_WEIGHT: float = -1e-8
+
+
 @configclass
 class G1TokenAdjusterRewardCfg:
     """The adjuster's reward set, with the residual penalties kept but ZEROED.
@@ -48,20 +56,29 @@ class G1TokenAdjusterRewardCfg:
         without caring how peaked the rest of the distribution is) or these terms, which price
         the decoded correction directly.
 
-    Zero by default because the loss-side anchor is the default; non-zero turns them into the
-    bound. Either way they must stay PRESENT, because they are the only place the served
-    correction's size is computed and the reward manager logs them at any weight. On the
-    continuous adjuster these same terms at ``-2.0 / -1.0`` were measured cancelling the
-    entire dense reward, which is exactly what a logged term catches and an absent one does
-    not.
+    .. admonition:: The weight is -1e-8, not 0, and that is not a rounding choice
+
+        IsaacLab's ``RewardManager.compute`` SKIPS a zero-weight term entirely -- it never
+        calls the function -- while ``reset`` still emits ``Episode_Reward/residual_l2`` from
+        an all-zero accumulator. So a weight of exactly 0 does not mean "measured but not
+        priced"; it means the one quantity saying how hard the agent is pushing reads 0.0
+        forever, which is indistinguishable from the "does nothing" failure this whole stage
+        exists to escape. :data:`RESIDUAL_DIAGNOSTIC_WEIGHT` is small enough to be inert
+        against a dense reward of order 1 and a fall at -10, and non-zero so the term runs.
+
+    Set it to a real magnitude to make these the bound instead of the loss-side anchor. On
+    the continuous adjuster the same terms at ``-2.0 / -1.0`` were measured cancelling the
+    entire dense reward, which is what a logged term catches and an absent one does not.
     """
 
     trackability: RewTerm = RewTerm(func=mdp.served_track_reward, weight=1.0)
     residual_l2: RewTerm = RewTerm(
-        func=mdp.plan_residual_l2, weight=0.0, params={"command_name": "traj_ref"}
+        func=mdp.plan_residual_l2, weight=RESIDUAL_DIAGNOSTIC_WEIGHT,
+        params={"command_name": "traj_ref"},
     )
     residual_rate_l2: RewTerm = RewTerm(
-        func=mdp.plan_residual_rate_l2, weight=0.0, params={"command_name": "traj_ref"}
+        func=mdp.plan_residual_rate_l2, weight=RESIDUAL_DIAGNOSTIC_WEIGHT,
+        params={"command_name": "traj_ref"},
     )
     failed: RewTerm = RewTerm(
         func=mdp.episode_ended_by, weight=-10.0,
