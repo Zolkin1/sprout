@@ -1249,6 +1249,107 @@ back bit-identical, and two different clutter variants give bit-identical height
   `val_fraction ** (k-1)` -- at seven files and a 5% split, 2e-8. Not only a reported number:
   `best.pt` is selected on the val metric.
 
+# The TWO-BOX overfit set: one OOD obstacle, an IC grid, and a critic (2026-09-06)
+
+`worktree-box2-finetune` = `worktree-measured-history` (the filtered-BC/AWR tip) + a merge of
+`worktree-fm-reward-finetune` (the clip-free free-form terrain). **NOT** off
+`worktree-fm-adjuster`, which is that same tip plus 15 adjuster commits none of this needs.
+`worktree-bestofk` is deliberately UNMERGED -- 8 conflict hunks in `branch_probe.py`, which
+nothing here reads -- so its `oracle_gain.py` and its branch-probe defect fixes are still out.
+
+**The obstacle is `mjeval_box2_h040`, cloned into Isaac** (`motion_gen/terrain/box2.py`,
+`scripts/rsl_rl/make_box2_terrain.py`): two 0.40 m boxes 1.20 m deep, 3 m apart. Chosen because
+it is the worst course in the mjeval catalogue and the only one that fails at EVERY speed --
+0.060 unsteered / 0.145 steered over 20 flow-noise seeds x 10 speeds, and 0/10 at every speed on
+the deterministic `x0 = 0` draw -- while the SINGLE 0.40 m box scores 0.70. The second box is
+what breaks it, so it is a MODE choice rather than a capability limit, and the generator visibly
+proposes different modes there (`view_cell.py --plans`). Overfitting to it is the point.
+
+- **Geometry is MIRRORED, not imported**: `source/motion_gen` stays free of `transfer` as it
+  stays free of IsaacLab, and `transfer/sim/tests/test_box2_matches_mjeval.py` imports both and
+  requires them to agree -- comparing distances FROM THE SPAWN, since mjeval puts its origin at
+  the spawn and a free-form tile is corner-anchored.
+- **The goal is mjeval's, MAPPED**: mjeval scores arrival inside a 2.0 m-deep rectangle,
+  `freeform_goal_reached` tests a downrange LINE plus a lateral band, so the line sits at the
+  rectangle's NEAR EDGE and the two agree on the boundary that decides the outcome.
+- **The IC grid is a grid over TILES**: one tile per approach distance {1.5, 2.0, 2.5, 3.0, 4.0}
+  m, identical boxes on every one, because the reset already reads the spawn off the route
+  block. The speed axis is a COMMAND, pinned per recording run by
+  `freeform_speed_min == freeform_speed_max`. Held out: **(2.25 m, 1.00 m/s)**, off the training
+  grid on both axes and INTERIOR to it, in its own `box2_holdout.h5` -- a separate file rather
+  than a "do not sample" flag, because a runtime filter is the shape of leak the FM's episode
+  split already paid for.
+
+## The far camera had to go back, and the restore was silently wrong first
+
+Since `efe93b4e` the POLICY reads the near camera alone -- taken ahead of a teacher retrain that
+**has not happened**. So every tracker checkpoint on disk expects 3002 inputs where a near-only
+task builds 2222, and **none of them can run the free-form task at all**.
+`enable_policy_far_camera` + the `G1-box2-finetune` task put the term back.
+
+**It must go back in its TRAINED SLOT, and the obvious spelling puts it in the wrong one.**
+Written as an annotated field (`depth_far: ObsTerm | None = None`) it lands BEFORE `depth_near`,
+because `configclass` orders ANNOTATED fields ahead of un-annotated ones and `depth_near` carries
+no annotation. The vector is then the right WIDTH with two 780-wide blocks transposed:
+`load_state_dict` passes and the tracker reads the far camera as the near one. Measured over 64
+episodes:
+
+| order | reached_goal | steps_survived (med) | track_reward |
+|---|---|---|---|
+| transposed | 0.000 | 143 | 0.57 |
+| correct | **0.188** | **517** | **0.69** |
+
+Nothing in the first row reads as a config bug; it reads as a policy that cannot do the task.
+`test_box2_task_obs_order.py` pins it against the deployed artifact's OWN `observation_terms`
+block, plus a mechanism check on the declared field order that still runs where `logs/` is absent.
+Note `reference_window` / `command_window` appear in that block but are NOT cfg observation
+terms -- they are `RefEncoderMLPModel` inputs, which is why the MLP takes 2490 raw + 512 encoded
+= 3002 rather than the block's full 3101.
+
+## Five clip-shaped assumptions the recorder had, and the pelvis-height trap
+
+A manifest-only library refuses every gather by name, so each of these failed loudly -- but the
+FIX for one of them is where the silent hazard was:
+
+- `goal_region.goal_anchor_world` recovered the anchor from the placed clip's terminal pose; it
+  now dispatches to `freeform_goal_anchor_world`, the exact inverse of the lift
+  `freeform_goal_reached` applies to the robot. Both read the SAME route row.
+- **The anchor is a PELVIS height, not the walkable surface.** `height_tol_m` is applied to
+  `|root_z - goal_z|` and the clip anchor is a BASE pose, so a surface-height goal puts a
+  standing robot ~0.79 m outside a 0.5 m tolerance: `in_goal` could never fire while the
+  termination still did, and every arrival would have recorded as a failure. The standing height
+  is read off the asset's own `default_root_pose` -- the same quantity the spawn adds to
+  `start_z`, so the two ends of an episode are measured against one number.
+- `goal_travel_m` and `last_usable_step` likewise gathered the clip (the section's own
+  start-to-goal run, and the time-out horizon).
+- `record_rollouts` required terms named `base_fallen` / `reset_on_clip`; the fine-tune tasks
+  spell the same things `base_height` / `reset_on_section`.
+- `rollout_outcomes` derived `terrain_id` from a per-CLIP table, so it was **-1 on every row** --
+  and on this terrain the tile IS the initial condition, so the IC an episode ran at was
+  unrecoverable from the table. It falls back to the importer's `env_terrain_id`.
+
+`merge_rollouts.py` joins the per-speed stems for `fit_value`, renumbering `episode_uid` past
+the running max: the uid is assigned per RUN from 0, and `fit_value` splits BY EPISODE precisely
+so near-duplicate windows cannot straddle the split -- a collision merges two unrelated episodes
+into one group and deals their windows to both sides.
+
+## What the first run measured, and why it is 12x below MuJoCo
+
+5001 episodes at 0.50 m/s, ~800-1200 per tile: **pooled reached_goal 0.059**, against mjeval's
+0.15 unsteered / 0.75 steered on the same course and the same pair. The gap is REAL and is
+DOMAIN RANDOMISATION, verified on the composed cfg rather than assumed: all six depth DR terms
+live (extrinsics, intrinsics, noise resample, per camera), seven physical DR terms live, and
+`enable_corruption=True` on the policy obs. mjeval has none of it.
+
+**That is the desirable direction**, and it closes `record_rollouts`' own
+`TODO(record-camera-dr)`: every previous recording ran on a `-play` task, where
+`apply_depth_play_trims` nulls all six camera events, so "a critic fitted here has only ever
+scored a perfect camera". This is the first recording where it has not.
+
+Not a scoring artifact, checked: of 616 truncations, 293 are genuine arrivals (terminal
+downrange 0.009 m, height error -0.12 m, both well inside tolerance) and 323 are plain
+time-outs. 88% of episodes terminate on a fall.
+
 # obelisk (ROS2 deploy) — the default run pipeline
 
 Three commands, in this order, every time:
