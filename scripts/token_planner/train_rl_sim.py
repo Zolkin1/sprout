@@ -111,49 +111,10 @@ import robot_rl.tasks  # noqa: F401,E402  (registers the tasks)
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 from robot_rl.token_planner.config import PlannerConfig, TokenizerConfig  # noqa: E402
 from robot_rl.token_planner.planner import TokenPlanner  # noqa: E402
+from robot_rl.token_planner.rl_critic import Critic  # noqa: E402
 from robot_rl.token_planner.rl_gae import compute_gae  # noqa: E402
 from robot_rl.token_planner.rl_outcomes import EndingCounts  # noqa: E402
 from robot_rl.token_planner.tokenizer import TrajectoryTokenizer  # noqa: E402
-
-
-class Critic(nn.Module):
-    """A plain MLP state-value head with running input and return normalization.
-
-    Deliberately NOT the planner's trunk: the spec asks for a separate network, and sharing
-    would couple the value loss's gradients into the very encoder whose drift the KL term is
-    trying to bound.
-
-    Args:
-        obs_dim: Width of the critic observation.
-        hidden: Hidden widths.
-    """
-
-    def __init__(self, obs_dim: int, hidden: tuple[int, ...] = (512, 256, 128)) -> None:
-        super().__init__()
-        layers, d = [], obs_dim
-        for h in hidden:
-            layers += [nn.Linear(d, h), nn.ELU()]
-            d = h
-        layers += [nn.Linear(d, 1)]
-        self.net = nn.Sequential(*layers)
-        self.register_buffer("_mu", torch.zeros(obs_dim))
-        self.register_buffer("_var", torch.ones(obs_dim))
-        self.register_buffer("_n", torch.tensor(1e-4))
-
-    def update_norm(self, x: torch.Tensor) -> None:
-        """Welford update of the input normalizer over a rollout batch."""
-        b = x.shape[0]
-        mu, var = x.mean(0), x.var(0, unbiased=False)
-        d = mu - self._mu
-        tot = self._n + b
-        self._mu += d * b / tot
-        self._var.copy_((self._var * self._n + var * b + d.pow(2) * self._n * b / tot) / tot)
-        self._n.copy_(tot)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Value estimate ``[B]`` for a normalized observation."""
-        z = (x - self._mu) / (self._var.sqrt() + 1e-6)
-        return self.net(z.clamp(-10.0, 10.0)).squeeze(-1)
 
 
 def load_planner(path: str, device) -> TokenPlanner:

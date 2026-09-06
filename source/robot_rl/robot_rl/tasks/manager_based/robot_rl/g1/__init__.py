@@ -286,6 +286,19 @@ if not _registered:
     # the frozen tracker executes it inside the env step. Same entry-point split as the
     # adjuster -- concrete env class resolved by gym AFTER AppLauncher, cfg module composable
     # before it (see envs/__init__.py).
+    # The generator PLANS and a discrete policy CORRECTS it -- the cross of the two envs
+    # above. Same entry-point split for the same reason.
+    gym.register(
+        id="G1-token-adjuster-rl",
+        entry_point=f"{envs.__name__}.token_adjuster_env:TokenAdjusterEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": (
+                f"{__name__}.g1_token_adjuster_env_cfg:G1TokenAdjusterEnvCfg"
+            ),
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:AdjusterPPORunnerCfg",
+        },
+    )
     gym.register(
         id="G1-token-planner-rl",
         entry_point=f"{envs.__name__}.token_planner_env:TokenPlannerEnv",
