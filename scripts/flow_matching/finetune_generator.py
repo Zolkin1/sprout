@@ -36,9 +36,10 @@ per-sample weight; the objective is unchanged) -- none touches the sampler:
   one holding a genuinely high-advantage row, and the advantage signal is normalized away
   ACROSS batches while surviving only within them.  Its sharp limit is therefore
   BEST-OF-BATCH, not filtered BC, and the realized effective sample size floors at about
-  ``n / (batch / 2)``.  Measured at n = 20k / B = 128, the reported ESS falls 346 -> 17 -> 5
-  over beta 0.25 / 0.10 / 0.05 while the realized one holds at 580 / 327 / 312 -- so below
-  beta ~0.1 the printed number keeps collapsing and the update stops changing.
+  ``n / (batch / 2)``.  Measured at n = 20k / B = 128 (the old default), the reported ESS falls
+  346 -> 17 -> 5 over beta 0.25 / 0.10 / 0.05 while the realized one holds at 580 / 327 / 312
+  -- so below beta ~0.1 the printed number keeps collapsing and the update stops changing.
+  At the current B = 256 that floor is twice as high again.
 
   The default changed from ``batch`` on 2026-09-07.  Every AWR run before that date is a
   ``batch`` run; the arm is recorded in the checkpoint's own ``awr`` block, so which one a
@@ -334,7 +335,14 @@ def main() -> int:
                         "label helped' from 'more training on rollout data helped'.")
     p.add_argument("--out", required=True, help="Output run directory.")
     p.add_argument("--epochs", type=int, default=6)
-    p.add_argument("--batch_size", type=int, default=128)
+    p.add_argument("--batch_size", type=int, default=256,
+                   help="Rows per optimizer step. There is no gradient accumulation -- one "
+                        "mini-batch IS one step -- so this is the whole averaging window. "
+                        "Raised 128 -> 256 alongside the `global` normalization default: "
+                        "under `global` a step's magnitude varies with the advantage mass "
+                        "that batch happened to draw, and a wider batch is what pays for "
+                        "that variance. Under `batch` it also raises the realized ESS floor "
+                        "(~n/(batch/2)), which is the opposite of what a sharp beta wants.")
     p.add_argument("--lr", type=float, default=3e-5,
                    help="Deliberately well below the pretraining 3e-4: this is a fine-tune "
                         "from a shipped model, and the failure mode is losing motion quality "
