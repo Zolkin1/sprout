@@ -24,15 +24,25 @@ per-sample weight; the objective is unchanged) -- none touches the sampler:
   labelled row.  The reported **ESS** is what says where on that line a given run actually
   sat, and it is not inferable from ``beta`` alone.
 
-  **The SHARP end depends on ``--awr_normalize``, and the default does not reach filtered
-  BC.**  Under ``batch`` (the standard AWR estimator) the loss is self-normalized inside
-  each batch, so every batch contributes a full-size step no matter how small its weights
-  are: the realized effective sample size floors at about ``n / (batch / 2)`` and
-  ``beta -> 0`` converges to BEST-OF-BATCH.  Measured at n = 20k / B = 128, the reported ESS
-  falls 346 -> 17 -> 5 over beta 0.25 / 0.10 / 0.05 while the realized one holds at
-  580 / 327 / 312 -- so below beta ~0.1 the printed number keeps collapsing and the update
-  stops changing.  ``--awr_normalize global`` is the arm whose sharp limit really is
+  **``--awr_normalize global`` is the DEFAULT, and it is the classic AWR estimator.**  The
+  weights are scaled once to global mean 1 and the loss takes a plain ``mean(w * mse_i)``, so
+  a batch of low-advantage rows genuinely contributes a smaller step and the sharp limit IS
   filtered BC at a shrinking percentile.
+
+  ``batch`` is the self-normalized alternative -- ``sum(w * mse_i) / sum(w)``, dividing by the
+  BATCH'S OWN weight sum -- and it is kept as the lower-variance arm.  Know what it costs
+  before choosing it: rescaling per batch means every batch contributes a full-size step
+  however small its weights are, so a batch of mediocre rows lands the same total gradient as
+  one holding a genuinely high-advantage row, and the advantage signal is normalized away
+  ACROSS batches while surviving only within them.  Its sharp limit is therefore
+  BEST-OF-BATCH, not filtered BC, and the realized effective sample size floors at about
+  ``n / (batch / 2)``.  Measured at n = 20k / B = 128, the reported ESS falls 346 -> 17 -> 5
+  over beta 0.25 / 0.10 / 0.05 while the realized one holds at 580 / 327 / 312 -- so below
+  beta ~0.1 the printed number keeps collapsing and the update stops changing.
+
+  The default changed from ``batch`` on 2026-09-07.  Every AWR run before that date is a
+  ``batch`` run; the arm is recorded in the checkpoint's own ``awr`` block, so which one a
+  result came from is recoverable rather than inferred from its date.
 
   **The advantage is centered within the cell the label was cut in** (``--awr_center
   stratum``, the default).  ``binarize`` takes its percentile INSIDE ``family x progress x
@@ -439,15 +449,16 @@ def main() -> int:
                         "clip. Without it one row can own an update at a sharp beta. Read it "
                         "beside the reported ESS: the clip is what stops the collapse, and "
                         "how much mass it removes is itself a statement about the tail.")
-    p.add_argument("--awr_normalize", default="batch", choices=("batch", "global"),
+    p.add_argument("--awr_normalize", default="global", choices=("global", "batch"),
                    help="How the weights are normalized, which decides what the SHARP limit "
-                        "of AWR is. `batch` (default, the standard estimator) self-normalizes "
-                        "per batch, so beta -> 0 converges to best-of-BATCH and the realized "
-                        "ESS floors at ~n/(batch/2) however small beta goes. `global` scales "
-                        "the weights to global mean 1 and takes a plain mean, so a low-weight "
-                        "batch really does contribute less and the sharp limit IS filtered BC. "
-                        "Use `global` to bracket filtered BC; `batch` has lower gradient "
-                        "variance.")
+                        "of AWR is. `global` (DEFAULT, classic AWR) scales the weights to "
+                        "global mean 1 and takes a plain mean, so a low-advantage batch "
+                        "genuinely contributes less and the sharp limit IS filtered BC. "
+                        "`batch` self-normalizes per batch, which rescales every batch to a "
+                        "full-size step -- a batch of mediocre rows then lands the same total "
+                        "gradient as one holding a high-advantage row, beta -> 0 converges to "
+                        "best-of-BATCH, and the ESS floors at ~n/(batch/2). `batch` has lower "
+                        "gradient variance and is the reason it is kept.")
     p.add_argument("--awr_balance", default="cell", choices=("cell", "none"),
                    help="Rescale each label CELL's total weight to its share of the rows. "
                         "`cell` (default) is what makes AWR's composition match filtered "

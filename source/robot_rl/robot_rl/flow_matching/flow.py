@@ -595,23 +595,30 @@ def flow_matching_loss(
         report_consistency: Compute ``vel_consistency`` as a METRIC even when its
             weight is 0. For validation; the training step should leave it off.
         sample_weight: ``(B,)`` non-negative per-sample loss weight (advantage-weighted
-            regression), or ``None`` for a uniform one.  **Self-normalized within the
-            batch** -- ``sum(w * mse_i) / sum(w)`` -- so the gradient's SCALE does not move
-            with the weights and a learning rate inherited from the pretrained run keeps its
-            meaning.  The alternative, dividing by a global mean weight, is unbiased but lets
-            a batch that happens to draw low-weight rows shrink its own step; the
-            self-normalized form is the standard AWR estimator and is what is used here.
-            Mutually exclusive with the pinned-axis path, which does its own reduction.
-        weight_reduction: How the weights are normalized, and it decides what the sharp
-            limit of AWR IS.  ``"batch"`` (the default, and the standard AWR estimator)
-            self-normalizes inside each batch, so a batch always contributes a full-size
-            step and ``beta -> 0`` converges to BEST-OF-BATCH, not to filtered BC -- the
-            realized effective sample size floors at roughly ``n / (batch / 2)`` however
-            small beta goes.  ``"global"`` expects weights pre-scaled to global mean 1 and
-            takes a plain mean, so a batch of low-weight rows genuinely contributes less and
-            the sharp limit IS filtered BC at a shrinking percentile.  Use ``"global"`` when
-            the point is to bracket filtered BC; ``"batch"`` has the lower gradient
-            variance.
+            regression), or ``None`` for a uniform one.  How it is reduced is
+            ``weight_reduction``'s job, and the two options are genuinely different
+            estimators rather than a scaling convention -- see below.  Mutually exclusive
+            with the pinned-axis path, which does its own reduction.
+        weight_reduction: How the weights are reduced, and it decides what the sharp limit
+            of AWR IS.
+
+            ``"global"`` expects weights pre-scaled to global mean 1 and takes a plain
+            ``mean(w * mse_i)``.  This is the unbiased weighted-risk estimator -- classic AWR
+            -- so a batch of low-advantage rows genuinely contributes a smaller step and the
+            sharp limit IS filtered BC at a shrinking percentile.
+
+            ``"batch"`` self-normalizes inside each batch, ``sum(w * mse_i) / sum(w)``,
+            dividing by the BATCH'S OWN weight sum.  That rescales every batch to a full-size
+            step however small its weights are: a batch of mediocre rows lands the same total
+            gradient as one holding a genuinely high-advantage row, so the advantage signal
+            survives WITHIN a batch and is normalized away ACROSS batches.  Its sharp limit is
+            best-of-batch, and the realized effective sample size floors at roughly
+            ``n / (batch / 2)`` however small beta goes.  It is kept because it has the lower
+            gradient variance, which is a real cost of ``"global"``.
+
+            ``finetune_generator.py`` defaults to ``"global"``; this function's own default
+            stays ``"batch"`` so that a direct caller passing only ``sample_weight`` is not
+            silently switched to an estimator that assumes a pre-scaling it never applied.
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
