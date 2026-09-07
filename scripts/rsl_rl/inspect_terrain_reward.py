@@ -161,6 +161,7 @@ def _grade_rows(
     thresh: float,
     dilate: int,
     max_gap: int = CONTACT_MAX_GAP_NODES,
+    device: str = "cpu",
     chunk: int | None = None,
     keep_nodes: bool = False,
 ) -> dict[str, np.ndarray]:
@@ -175,6 +176,7 @@ def _grade_rows(
         spec: The reward constants.
         thresh: Contact speed threshold (m/s).
         dilate: Contact dilation radius (nodes).
+        device: Where the FK and the SDF run.
         chunk: Rows per read; ``None`` derives it from :data:`SDF_TARGET_CELLS`.
         keep_nodes: Also return the per-node arrays (large; for the viewer / report).
 
@@ -210,9 +212,10 @@ def _grade_rows(
     with h5py.File(rollout, "r") as f:
         for lo in range(0, len(rows), chunk):
             idx = rows[lo : lo + chunk]
-            plan = torch.as_tensor(f["fm_plan"][idx], dtype=torch.float64)
-            a_pos = torch.as_tensor(f["anchor_pos"][idx], dtype=torch.float64)
-            a_quat = torch.as_tensor(f["anchor_quat"][idx], dtype=torch.float64)
+            plan = torch.as_tensor(f["fm_plan"][idx], dtype=torch.float64, device=device)
+            a_pos = torch.as_tensor(f["anchor_pos"][idx], dtype=torch.float64, device=device)
+            a_quat = torch.as_tensor(f["anchor_quat"][idx], dtype=torch.float64,
+                                     device=device)
             uid = f["episode_uid"][idx]
             rep = f["replan_index"][idx]
 
@@ -227,13 +230,13 @@ def _grade_rows(
             pts = plan_collider_points(base_pos, base_rot, q, model)
             contact = plan_contact(pts, model, dt=CONTROL_DT, thresh=thresh, dilate=dilate,
                                    max_gap=max_gap)
-            terrain = trio.terrain_for_rows(table, tid, corner)
+            terrain = trio.terrain_for_rows(table, tid, corner, device=device)
             out = terrain_consistency(pts, contact, terrain, model, spec,
                                       chunk_nodes=max(1, 8_000_000 //
                                                       max(len(idx) * model.num_points, 1)))
 
             for k in scalars:
-                acc[k].append(out[k].numpy())
+                acc[k].append(out[k].cpu().numpy())
             acc["episode_uid"].append(uid)
             acc["replan_index"].append(rep)
             acc["terrain_id"].append(tid)
@@ -244,28 +247,30 @@ def _grade_rows(
             # yaw-only, so the anchor's tilt is dropped by construction -- this is the
             # measurement that says so rather than the assumption.
             g = quat_apply(a_quat[:, [3, 0, 1, 2]],
-                           torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64).expand(
-                               len(idx), 3))
+                           torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64,
+                                        device=device).expand(len(idx), 3))
             acc["anchor_pitch_rad"].append(
-                torch.arccos(g[:, 2].clamp(-1.0, 1.0)).numpy())
+                torch.arccos(g[:, 2].clamp(-1.0, 1.0)).cpu().numpy())
             # Placement residual at node 0: lowest sole corner vs the terrain under it.
             sole = pts[:, 0][:, model.sole_index.reshape(-1)]                  # (N, 8, 3)
             low = sole[..., 2].argmin(dim=1)
-            p_low = sole[torch.arange(len(idx)), low]
+            p_low = sole[torch.arange(len(idx), device=device), low]
             top = terrain.top_z_at(p_low[:, None, :2])[:, 0]
-            acc["node0_sole_z"].append(p_low[:, 2].numpy())
-            acc["node0_top_z"].append(top.numpy())
+            acc["node0_sole_z"].append(p_low[:, 2].cpu().numpy())
+            acc["node0_top_z"].append(top.cpu().numpy())
             if keep_nodes:
                 acc["node_contact_penalty"].append(
-                    out["node_contact_penalty"].numpy().astype(np.float32))
+                    out["node_contact_penalty"].cpu().numpy().astype(np.float32))
                 acc["node_penetration_m"].append(
-                    out["node_penetration_m"].numpy().astype(np.float32))
+                    out["node_penetration_m"].cpu().numpy().astype(np.float32))
                 acc["node_foot_abs"].append(
-                    out["node_foot_abs"].numpy().astype(np.float16))
-                acc["node_sd_min"].append(out["node_sd_min"].numpy().astype(np.float16))
+                    out["node_foot_abs"].cpu().numpy().astype(np.float16))
+                acc["node_sd_min"].append(
+                    out["node_sd_min"].cpu().numpy().astype(np.float16))
                 acc["node_foot_clearance"].append(
-                    out["node_foot_clearance"].numpy().astype(np.float16))
-                acc["foot_speed"].append(contact["foot_speed"].numpy().astype(np.float16))
+                    out["node_foot_clearance"].cpu().numpy().astype(np.float16))
+                acc["foot_speed"].append(
+                    contact["foot_speed"].cpu().numpy().astype(np.float16))
 
     return {k: np.concatenate(v, axis=0) for k, v in acc.items() if v}
 
@@ -278,11 +283,12 @@ def stage_frame(args, state: dict) -> None:
     clip = clip if os.path.isabs(clip) else str(MGF._REPO_ROOT / clip)
     table = trio.load_tile_table(clip)
     print(f"\n=== stage frame: {os.path.basename(args.rollout)} ===")
-    model, _names = _plan_model(rollout, args.isaac_joint_names, args.spacing)
+    model, _names = _plan_model(rollout, args.isaac_joint_names, args.spacing, args.device)
 
     rows = _window_rows(rollout, args.frame_windows, args.seed)
     got = _grade_rows(rollout, episodes, table, model, rows,
-                      TerrainConsistencySpec(), CONTACT_SPEED_DEFAULT, 0, args.max_gap)
+                      TerrainConsistencySpec(), CONTACT_SPEED_DEFAULT, 0, args.max_gap,
+                      args.device)
     res = trio.placement_residual(got["node0_sole_z"], got["node0_top_z"])
     inside = float(np.mean(np.isfinite(got["node0_top_z"])))
 
@@ -312,8 +318,8 @@ def stage_frame(args, state: dict) -> None:
 CONTACT_SPEED_DEFAULT: float = CONTACT_SPEED_THRESH
 
 
-def _plan_model(rollout: str, override: str,
-                spacing: float | None = None) -> tuple[PlanColliderModel, list[str]]:
+def _plan_model(rollout: str, override: str, spacing: float | None = None,
+                device: str = "cpu") -> tuple[PlanColliderModel, list[str]]:
     """The collider model built in the joint order the RECORDED PLAN is actually in.
 
     Separated out and printed because getting it wrong is silent: the clip order and the
@@ -326,6 +332,9 @@ def _plan_model(rollout: str, override: str,
         rollout: The rollout ``.h5``.
         override: ``--isaac_joint_names``, passed through.
         spacing: Collider surface-sample spacing (m), or ``None`` for extreme points.
+        device: Where the FK and the SDF run.  The whole grading pass is dense elementwise
+            torch, so a GPU is worth an order of magnitude here -- at 1.18M windows the CPU
+            path is hours.
 
     Returns:
         ``(model, joint_names)``.
@@ -340,7 +349,7 @@ def _plan_model(rollout: str, override: str,
           f"(differs from the clip order on "
           f"{sum(a != b for a, b in zip(names, G1_JOINT_NAMES))} of {len(names)} positions)")
     model = PlanColliderModel(MGF.DEFAULT_MJCF, list(names), dtype=torch.float64,
-                              spacing=spacing)
+                              spacing=spacing).to(device)
     print(f"  colliders         {model.num_points} points over {len(model.body_order)} "
           f"bodies, {model.total_area_m2:.4f} m^2 sampled "
           f"({'surface samples, r=0' if spacing else 'extreme points, r>0'}), "
@@ -545,9 +554,9 @@ def stage_grade(args, state: dict) -> None:
     rows = _window_rows(rollout, args.grade_windows, args.seed)
     print(f"\n=== stage grade: {len(rows)} windows, thresh={args.thresh} "
           f"dilate={args.dilate} ===")
-    model, _names = _plan_model(rollout, args.isaac_joint_names, args.spacing)
+    model, _names = _plan_model(rollout, args.isaac_joint_names, args.spacing, args.device)
     got = _grade_rows(rollout, episodes, table, model, rows, spec, args.thresh, args.dilate,
-                      args.max_gap, keep_nodes=True)
+                      args.max_gap, args.device, keep_nodes=True)
 
     np.savez_compressed(os.path.join(args.out, "graded.npz"),
                         **{k: v for k, v in got.items()})
@@ -589,14 +598,14 @@ def stage_grade(args, state: dict) -> None:
     sweep_rows = rows[: min(len(rows), args.sweep_windows)]
     for r in DILATE_SWEEP:
         s = _grade_rows(rollout, episodes, table, model, sweep_rows, spec, args.thresh, r,
-                        args.max_gap)
+                        args.max_gap, args.device)
         report["sweeps"][f"dilate_{r}"] = {
             "penetration_sum_m": _summary(s["penetration_sum_m"]),
             "exempt_fraction": _summary(s["exempt_fraction"]),
             "max_penetration_m": _summary(s["max_penetration_m"])}
     for th in (0.03, 0.05, 0.08, 0.10, 0.20):
         s = _grade_rows(rollout, episodes, table, model, sweep_rows, spec, th, args.dilate,
-                        args.max_gap)
+                        args.max_gap, args.device)
         report["sweeps"][f"thresh_{th}"] = {
             "contact_penalty": _summary(s["contact_penalty"]),
             "contact_coverage": _summary(s["contact_coverage"]),
@@ -667,9 +676,9 @@ def stage_reward(args, state: dict) -> None:
 
     rows = _window_rows(rollout, args.reward_windows, args.seed)
     print(f"\n=== stage reward: {len(rows)} windows ===")
-    model, names = _plan_model(rollout, args.isaac_joint_names, args.spacing)
+    model, names = _plan_model(rollout, args.isaac_joint_names, args.spacing, args.device)
     got = _grade_rows(rollout, episodes, table, model, rows, spec, args.thresh, args.dilate,
-                      args.max_gap)
+                      args.max_gap, args.device)
 
     penalty = got["contact_penalty"] * spec.contact_weight \
         + got["penetration_sum_m"] * spec.penetration_weight
@@ -801,6 +810,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--isaac_joint_names", default="",
                    help="policy_parameters.yaml (or a run dir) stating joint_names_isaac; "
                         "default: derived from the rollout's own checkpoint_path")
+    p.add_argument("--device", default="cpu",
+                   help="where the FK and the SDF run. The grading pass is dense elementwise "
+                        "torch, so 'cuda' is worth an order of magnitude at scale.")
     p.add_argument("--seed", type=int, default=0)
     return p
 
