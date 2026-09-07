@@ -307,3 +307,201 @@ def test_clustered_bootstrap_accepts_row_indices_as_values():
                                            n_boot=200, seed=0)
     assert lo <= pt <= hi
     assert pt > 0.1, "the informative score must beat the uninformative one"
+
+
+# --- stratified AWR ------------------------------------------------------------------
+# The weighted arm's job is to select over the SAME population filtered BC does. Filtered
+# BC gets that from `binarize`'s per-cell percentile; AWR has to get it from centering, and
+# these pin that the centering actually removes what it claims to.
+
+
+def test_centering_removes_a_between_stratum_offset():
+    """Two equal cells differing only by an OFFSET must end up sharing the weight equally.
+
+    This is the whole reason `stratified_awr_weights` exists rather than a bare
+    `awr_weights`: the offset is a property of the cell, so letting it drive the weight
+    upweights an easy speed bin wholesale instead of the good chunks inside each bin.
+    """
+    rng = np.random.default_rng(0)
+    a = np.r_[rng.normal(0.0, 1.0, 4000), rng.normal(3.0, 1.0, 4000)]
+    s = np.r_[np.zeros(4000, np.int64), np.ones(4000, np.int64)]
+    hi = ce.stratified_awr_weights(a, beta=1.0, strata=s, balance=False)
+    share = hi[s == 1].sum() / hi.sum()
+    assert 0.45 < share < 0.55, f"centered share {share}"
+    # And the control: without strata the offset dominates, which is the defect.
+    flat = ce.stratified_awr_weights(a, beta=1.0, strata=None, balance=False)
+    assert flat[s == 1].sum() / flat.sum() > 0.75
+
+
+def test_the_scale_stays_pooled_so_a_flat_cell_keeps_flat_weights():
+    """Per-cell SIGMA would amplify a no-signal cell up to a real one's spread."""
+    rng = np.random.default_rng(1)
+    a = np.r_[rng.normal(0.0, 1.0, 4000), rng.normal(0.0, 0.01, 4000)]
+    s = np.r_[np.zeros(4000, np.int64), np.ones(4000, np.int64)]
+    w = ce.stratified_awr_weights(a, beta=1.0, strata=s, balance=False)
+    wide, narrow = w[s == 0], w[s == 1]
+    assert narrow.std() < 0.1 * wide.std(), (
+        "the low-spread cell's weights are as spread as the informative cell's, so the "
+        "scale was fitted per cell rather than pooled")
+
+
+def test_the_fit_mask_is_what_the_statistics_come_from():
+    """Rows outside `fit` are weighted but must not move the centering or the scale."""
+    rng = np.random.default_rng(2)
+    a = rng.normal(0.0, 1.0, 2000)
+    fit = np.zeros(2000, bool)
+    fit[:1000] = True
+    base = ce.stratified_awr_weights(a, beta=1.0, fit=fit)
+    # Corrupt only the non-fit half; the fit statistics, and so every weight's exponent
+    # relative to the others in the fit half, must be unchanged.
+    b = a.copy()
+    b[1000:] += 50.0
+    got = ce.stratified_awr_weights(b, beta=1.0, fit=fit, w_max=None)
+    ref = ce.stratified_awr_weights(a, beta=1.0, fit=fit, w_max=None)
+    r_got = got[:1000] / got[:1000].sum()
+    r_ref = ref[:1000] / ref[:1000].sum()
+    assert np.allclose(r_got, r_ref), "the non-fit rows moved the fitted statistics"
+    assert base.shape == (2000,)
+    # AND with the clip ON, which is the path that used to leak: the clip LEVEL is
+    # `w_max * mean(w)`, so taking that mean over val rows too makes every training weight a
+    # function of the split. Checking only the `w_max=None` calls above passes on the leak.
+    cg = ce.stratified_awr_weights(b, beta=0.5, fit=fit, w_max=20.0)
+    cr = ce.stratified_awr_weights(a, beta=0.5, fit=fit, w_max=20.0)
+    assert np.allclose(cg[:1000] / cg[:1000].sum(), cr[:1000] / cr[:1000].sum()), (
+        "the clip level was estimated over rows outside `fit`")
+
+
+def test_a_stratum_with_no_fit_row_falls_back_to_the_global_mean():
+    """Centering it on 0 would leave it carrying the raw offset every other cell lost."""
+    a = np.r_[np.full(100, 5.0), np.full(10, 5.0)]
+    s = np.r_[np.zeros(100, np.int64), np.ones(10, np.int64)]
+    fit = np.r_[np.ones(100, bool), np.zeros(10, bool)]
+    w = ce.stratified_awr_weights(a, beta=1.0, strata=s, fit=fit, w_max=None,
+                                  balance=False)
+    # Both cells sit at the same value, so after centering every weight is equal. A zero
+    # fallback would leave cell 1's exponent 5/sigma above cell 0's.
+    assert np.allclose(w, w[0]), w[:3]
+
+
+def test_the_hot_limit_is_unweighted_bc_over_every_labelled_row():
+    """beta -> inf must reproduce plain BC, which is what makes a beta sweep a bracket."""
+    rng = np.random.default_rng(3)
+    a = rng.normal(0.0, 1.0, 500)
+    s = rng.integers(0, 5, 500)
+    w = ce.stratified_awr_weights(a, beta=1e6, strata=s, balance=False)
+    assert np.allclose(w, w[0], rtol=1e-3), "the hot limit is not uniform"
+    assert ce.effective_sample_size(w) / w.size > 0.999
+
+
+def test_a_sharper_beta_never_raises_the_effective_sample_size():
+    """ESS is the number the run reports to say where on the filtered<->BC line it sat."""
+    rng = np.random.default_rng(4)
+    a = rng.normal(0.0, 1.0, 4000)
+    s = rng.integers(0, 4, 4000)
+    ess = [ce.effective_sample_size(
+        ce.stratified_awr_weights(a, beta=b, strata=s, balance=False))
+           for b in (0.1, 0.3, 1.0, 3.0)]
+    assert ess == sorted(ess), f"ESS must be monotone in beta, got {ess}"
+
+
+def test_a_fit_mask_selecting_nothing_is_refused():
+    """Silently falling back to all rows would make beta a function of the val split."""
+    with pytest.raises(ValueError, match="nothing to estimate"):
+        ce.stratified_awr_weights(np.arange(10.0), beta=1.0, fit=np.zeros(10, bool))
+
+
+def test_the_clip_actually_bounds_a_row_at_its_stated_multiple():
+    """Clipping lowers the mean the level is stated against, so it needs a FIXED POINT.
+
+    Applied once against the pre-clip mean the property fails exactly where the clip
+    matters: measured post-clip max/mean was 20.0 at beta 1.0 but 103 at 0.25 and 1061 at
+    0.1, while the run reported a clip of 20.
+    """
+    rng = np.random.default_rng(5)
+    a = rng.normal(0.0, 0.06, 20000)
+    s = rng.integers(0, 9, 20000)
+    for beta in (1.0, 0.5, 0.25, 0.1, 0.05):
+        w = ce.stratified_awr_weights(a, beta=beta, strata=s, w_max=20.0, balance=False)
+        assert w.max() / w.mean() <= 20.0 + 1e-6, (beta, w.max() / w.mean())
+
+
+def test_the_uncentered_control_runs_at_the_SAME_temperature():
+    """`--awr_center none` must differ in the centering ALONE, not also in the scale.
+
+    Scaling by the total sd when uncentered and the within-cell sd when centered makes the
+    control run cooler by the between-cell variance -- 1.37x at a 0.5 fraction -- so the A/B
+    confounds what it is testing. With no between-cell variance the two must coincide.
+    """
+    rng = np.random.default_rng(6)
+    a = rng.normal(0.0, 1.0, 4000)
+    s = rng.integers(0, 4, 4000)
+    a = a - np.array([a[s == k].mean() for k in range(4)])[s]   # zero between-cell variance
+    on = ce.stratified_awr_weights(a, beta=0.5, strata=s, center=True, w_max=None,
+                                   balance=False)
+    off = ce.stratified_awr_weights(a, beta=0.5, strata=s, center=False, w_max=None,
+                                    balance=False)
+    assert np.allclose(on / on.sum(), off / off.sum(), atol=1e-9)
+
+
+def test_the_uncentered_control_still_differs_when_there_IS_an_offset():
+    """...and the flag is not a no-op: with an offset the two arms must diverge."""
+    a = np.r_[np.full(500, -1.0), np.full(500, 1.0)] + np.linspace(0, 0.1, 1000)
+    s = np.r_[np.zeros(500, np.int64), np.ones(500, np.int64)]
+    on = ce.stratified_awr_weights(a, beta=0.5, strata=s, center=True, w_max=None,
+                                   balance=False)
+    off = ce.stratified_awr_weights(a, beta=0.5, strata=s, center=False, w_max=None,
+                                    balance=False)
+    assert not np.allclose(on / on.sum(), off / off.sum(), atol=1e-6)
+
+
+def test_balancing_makes_each_cell_carry_its_share_of_the_rows():
+    """This is the property filtered BC has by construction and centering does not.
+
+    ``binarize`` keeps a fixed fraction of EVERY cell, so its keep-set composition equals
+    the data's exactly. Centering only removes a cell's MEAN; the pooled scale leaves a
+    wider-spread cell capturing more weight through its upper tail. Measured on the box2 v2
+    labels the max deviation from the row share was 0.29 points for filtered BC, 2.54 for
+    centered AWR and ~0 with balancing on.
+    """
+    rng = np.random.default_rng(11)
+    # Deliberately unequal cell SPREADS, which is what breaks the centered arm.
+    a = np.concatenate([rng.normal(0.0, sd, n) for sd, n in
+                        ((0.05, 3000), (0.30, 3000), (0.12, 2000))])
+    s = np.concatenate([np.full(3000, 0), np.full(3000, 1), np.full(2000, 2)])
+    row = np.array([(s == c).sum() / s.size for c in (0, 1, 2)])
+    for bal, tol in ((False, None), (True, 1e-9)):
+        w = ce.stratified_awr_weights(a, beta=0.5, strata=s, balance=bal)
+        share = np.array([w[s == c].sum() / w.sum() for c in (0, 1, 2)])
+        dev = np.abs(share - row).max()
+        if bal:
+            assert dev < tol, f"balanced share still off the row share by {dev}"
+        else:
+            assert dev > 0.01, ("the unbalanced arm matched the row share, so this fixture "
+                                "does not exercise what balancing fixes")
+
+
+def test_balancing_subsumes_centering():
+    """With the cell totals pinned, a per-cell mean shift cannot change any weight.
+
+    It is a per-cell CONSTANT factor on ``exp()``, and the per-cell rescale divides it out.
+    So ``--awr_center`` is a no-op under ``--awr_balance cell`` -- worth pinning, because two
+    flags that look like independent controls and are not is how a run comes to report a
+    correction it did not apply.
+    """
+    a = np.r_[np.linspace(-1, 1, 400) - 1.0, np.linspace(-1, 1, 400) + 1.0]
+    s = np.r_[np.zeros(400, np.int64), np.ones(400, np.int64)]
+    on = ce.stratified_awr_weights(a, beta=0.5, strata=s, center=True, w_max=None)
+    off = ce.stratified_awr_weights(a, beta=0.5, strata=s, center=False, w_max=None)
+    assert np.allclose(on / on.sum(), off / off.sum(), atol=1e-12)
+
+
+def test_balancing_preserves_the_ranking_inside_a_cell():
+    """Only each cell's TOTAL moves; AWR's whole content is the within-cell ordering."""
+    rng = np.random.default_rng(12)
+    a = rng.normal(size=900)
+    s = rng.integers(0, 3, 900)
+    w0 = ce.stratified_awr_weights(a, beta=0.5, strata=s, balance=False)
+    w1 = ce.stratified_awr_weights(a, beta=0.5, strata=s, balance=True)
+    for c in (0, 1, 2):
+        m = s == c
+        assert (np.argsort(w0[m]) == np.argsort(w1[m])).all()

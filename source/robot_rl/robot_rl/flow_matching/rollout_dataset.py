@@ -85,6 +85,10 @@ class RolloutWindowDataset(Dataset):
             ``None`` for an unconditioned fine-tune.
         null_prob: Probability of overriding the label with ``null`` per access, so
             classifier-free guidance over the label is available at inference.
+        weight: ``[W]`` non-negative per-FILE-row loss weight (AWR), or ``None`` for a
+            uniform one.  Carried alongside ``label`` rather than instead of it because the
+            two are independent choices: a weighted run uses the plain architecture, so it
+            passes ``weight`` and NO ``label``.
         seed: RNG seed for the null dropout.
 
     Raises:
@@ -93,7 +97,8 @@ class RolloutWindowDataset(Dataset):
     """
 
     def __init__(self, path: str, rows: np.ndarray, ctx, label: np.ndarray | None = None,
-                 null_prob: float = 0.3, seed: int = 0):
+                 null_prob: float = 0.3, seed: int = 0,
+                 weight: np.ndarray | None = None):
         import h5py
 
         self.path = str(path)
@@ -132,6 +137,23 @@ class RolloutWindowDataset(Dataset):
                 f"the label sidecar has {self.label.shape[0]} entries against {n} windows. "
                 "It must be one per FILE row -- joined on (episode_uid, replan_index) by "
                 "the caller, not sliced to a split.")
+        # float64, NOT float32. The weights come out of an `exp` shifted so the max is 1.0,
+        # so at a sharp beta most of them are tiny -- and in float32 they round to EXACTLY
+        # zero (10.1% of rows at beta 0.05, 96.9% at 0.02), which silently drops those rows
+        # and makes ~1.7% of batches all-zero, i.e. a no-op step. Nothing downstream can see
+        # it: `flow_mse` is unweighted, and the reported ESS is computed in float64 upstream.
+        self.weight = None if weight is None else np.asarray(weight, dtype=np.float64)
+        if self.weight is not None:
+            if self.weight.shape[0] != n:
+                raise ValueError(
+                    f"the weight array has {self.weight.shape[0]} entries against {n} "
+                    "windows. Like the label it must be one per FILE row.")
+            bad = ~np.isfinite(self.weight[self.rows]) | (self.weight[self.rows] < 0)
+            if bad.any():
+                raise ValueError(
+                    f"{int(bad.sum())} of this split's weights are negative or non-finite. "
+                    "A NaN would poison the whole batch mean and a negative weight would "
+                    "train the model AWAY from a chunk, which is not what AWR does.")
 
     def __len__(self) -> int:
         """Number of windows in this split."""
@@ -184,6 +206,8 @@ class RolloutWindowDataset(Dataset):
             if self.null_prob > 0.0 and self._rng.random() < self.null_prob:
                 lab = LABEL_NULL
             item["advantage"] = torch.tensor(lab, dtype=torch.long)
+        if self.weight is not None:
+            item["weight"] = torch.tensor(float(self.weight[r]), dtype=torch.float64)
         return item
 
     def label_counts(self) -> dict[str, int]:
@@ -216,6 +240,32 @@ def join_labels(sidecar: dict[str, np.ndarray], episode_uid: np.ndarray,
         ValueError: If the sidecar's own key pair has duplicates -- then the join is not a
             function and whichever row won would be arbitrary.
     """
+    order, pos, hit = _join_positions(sidecar, episode_uid, replan_index)
+    out = np.full(episode_uid.shape[0], LABEL_NULL, dtype=np.int64)
+    out[hit] = sidecar["label"].astype(np.int64)[order][pos[hit]]
+    return out
+
+
+def _join_positions(sidecar: dict[str, np.ndarray], episode_uid: np.ndarray,
+                    replan_index: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Resolve ``(uid, replan)`` from a sidecar onto a window file's rows.
+
+    Split out so the label join and the VALUE join cannot drift apart: they must agree row
+    for row, and two copies of a searchsorted are two chances to key them differently.
+
+    Args:
+        sidecar: Must carry ``episode_uid`` and ``replan_index``.
+        episode_uid: ``[W]`` the window file's own episode ids.
+        replan_index: ``[W]`` the window file's own re-plan indices.
+
+    Returns:
+        ``(order, pos, hit)`` -- the sidecar's sort permutation, the position each file row
+        resolves to within it, and which rows actually matched.
+
+    Raises:
+        ValueError: If the sidecar's own key pair has duplicates -- then the join is not a
+            function and whichever row won would be arbitrary.
+    """
     key_side = (sidecar["episode_uid"].astype(np.int64) << np.int64(20)) \
         + sidecar["replan_index"].astype(np.int64)
     if np.unique(key_side).size != key_side.size:
@@ -224,8 +274,41 @@ def join_labels(sidecar: dict[str, np.ndarray], episode_uid: np.ndarray,
         + replan_index.astype(np.int64)
     order = np.argsort(key_side)
     pos = np.searchsorted(key_side[order], key_file)
-    pos = np.clip(pos, 0, key_side.size - 1)
-    hit = key_side[order][pos] == key_file
-    out = np.full(key_file.size, LABEL_NULL, dtype=np.int64)
-    out[hit] = sidecar["label"].astype(np.int64)[order][pos[hit]]
-    return out
+    pos = np.clip(pos, 0, max(key_side.size - 1, 0))
+    hit = key_side[order][pos] == key_file if key_side.size else np.zeros_like(key_file, bool)
+    return order, pos, hit
+
+
+def join_values(sidecar: dict[str, np.ndarray], key: str, episode_uid: np.ndarray,
+                replan_index: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Expand a FLOAT sidecar column onto every row of the window file, on ``(uid, replan)``.
+
+    The float twin of :func:`join_labels`, and it returns the hit mask rather than a filler.
+    A label has ``null`` to mean "no entry"; a float has no such value, and ``0.0`` is a
+    perfectly ordinary advantage -- so a miss filled with zero would read as a chunk the
+    critic scored exactly neutral, which under AWR is a weight of ``exp(0) = 1``, i.e. an
+    unlabelled row silently carrying average influence over the update.  Misses come back
+    ``NaN`` AND flagged, so neither a downstream mean nor a downstream weight can absorb one
+    quietly.
+
+    Args:
+        sidecar: Must carry ``key``, ``episode_uid`` and ``replan_index``.
+        key: The column to join, e.g. ``"advantage"``.
+        episode_uid: ``[W]`` the window file's own episode ids.
+        replan_index: ``[W]`` the window file's own re-plan indices.
+
+    Returns:
+        ``(values, hit)`` -- ``[W]`` float64 with ``NaN`` where the sidecar has no row, and
+        ``[W]`` bool marking the rows it did have.
+
+    Raises:
+        KeyError: If ``key`` is not in the sidecar.
+        ValueError: If the sidecar's key pair has duplicates.
+    """
+    if key not in sidecar:
+        raise KeyError(f"the sidecar carries no {key!r} column; it has "
+                       f"{sorted(sidecar)}")
+    order, pos, hit = _join_positions(sidecar, episode_uid, replan_index)
+    out = np.full(episode_uid.shape[0], np.nan, dtype=np.float64)
+    out[hit] = np.asarray(sidecar[key], dtype=np.float64)[order][pos[hit]]
+    return out, hit

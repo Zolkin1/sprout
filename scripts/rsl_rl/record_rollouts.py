@@ -78,6 +78,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.metadata as metadata
 import json
 import math
@@ -141,6 +142,18 @@ parser.add_argument("--num_episodes", type=int, default=0,
 parser.add_argument("--num_windows", type=int, default=100000,
                     help="Hard cap on re-plan windows; also sizes the pre-allocated file, so "
                          "set it above what --num_episodes will produce.")
+parser.add_argument("--no_windows", action="store_true",
+                    help="Record OUTCOMES ONLY -- write the episode table and no window "
+                         "table at all. An EVAL needs success, the failure mode and "
+                         "`track_reward_mean`, all of which live in the episode table; the "
+                         "window table is the entire cost of a recording (~7.7 GB and most "
+                         "of the per-step CPU per 5000 episodes, since `_emit` assembles the "
+                         "depth rows, the proprio ring and the scan for every re-plan). It "
+                         "also frees the run from `--num_windows`, which is a HARD CAP on the "
+                         "loop rather than only a file size, so an eval sized for episodes "
+                         "could otherwise stop early. REQUIRES --num_episodes or "
+                         "--max_steps, since the window quota is what would otherwise "
+                         "terminate the loop.")
 parser.add_argument("--max_steps", type=int, default=0,
                     help="Also stop after this many control steps (0 = no ceiling).")
 parser.add_argument("--goal_regions", default="",
@@ -649,16 +662,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         steps = 0
         t0 = time.time()
         ceiling = int(args_cli.max_steps) or None
-        with ro.RolloutWindowWriter(
+        no_win = bool(args_cli.no_windows)
+        if no_win and not (int(args_cli.num_episodes) or ceiling):
+            raise SystemExit(
+                "--no_windows needs --num_episodes (or --max_steps): the window quota is "
+                "what bounds the loop otherwise, so without one of these the recording "
+                "would never stop.")
+        writer_cm = (contextlib.nullcontext(_NullWindowWriter()) if no_win
+                     else ro.RolloutWindowWriter(
             win_path, num_windows=int(args_cli.num_windows), num_history=int(cmd.ctx.N),
             state_dim=int(cmd.ctx.D), future_len=int(cmd.ctx.F), cmd_dim=int(cmd.ctx.cmd_dim),
             extero_shape=(int(extero.shape[1]), int(extero.shape[2])),
             proprio_hw=(ro.PROPRIO_HISTORY, ro.PROPRIO_DIM), scan_dim=scan_dim,
-            track_hw=track_hw, attrs=prov,
-        ) as writer:
+            track_hw=track_hw, attrs=prov))
+        with writer_cm as writer:
             with torch.inference_mode():
                 want_ep = int(args_cli.num_episodes) or None
-                while writer.written < int(args_cli.num_windows):
+                while no_win or writer.written < int(args_cli.num_windows):
                     if ceiling is not None and steps >= ceiling:
                         print(f"[rollout] step ceiling {ceiling} reached")
                         break
@@ -681,9 +701,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                         # the signature the critic is being asked to learn.
                         track_ring.invalidate(dones)
                         track_ring.push(tracker.accum.last_track_err)
-                    batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring, track_ring)
-                    if batch is not None:
-                        writer.write_batch(batch)
+                    # Skipped entirely under --no_windows: `_emit` is where the depth
+                    # rows, the proprio ring and the scan are assembled per re-plan, so it is
+                    # most of the per-step cost and none of it reaches the episode table.
+                    if not no_win:
+                        batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring,
+                                      track_ring)
+                        if batch is not None:
+                            writer.write_batch(batch)
                     if steps % 500 == 0:
                         el = time.time() - t0
                         # flush=True: this is the ONLY progress signal a multi-hour run
@@ -701,9 +726,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         _report_goal_sanity(table)
         table.write(ep_path, attrs=prov)
         git_snapshot(stem + ".provenance")
-        print(f"[rollout] {writer.written} windows -> {win_path}")
+        if no_win:
+            print("[rollout] --no_windows: no window table written (outcomes only)")
+        else:
+            print(f"[rollout] {writer.written} windows -> {win_path}")
         print(f"[rollout] {len(table)} episodes -> {ep_path}")
         env.close()
+
+
+class _NullWindowWriter:
+    """A window writer that writes nothing, for ``--no_windows``.
+
+    A stand-in rather than a branch at every call site: the loop's progress print and its
+    closing report both read ``written``, and threading ``None`` through them would put an
+    ``if`` on three lines that have nothing to do with the choice.  ``write_batch`` is never
+    reached under the flag (``_emit`` is skipped) and is a no-op rather than an error so that
+    the object cannot half-work if that ever changes.
+    """
+
+    written: int = 0
+
+    def write_batch(self, batch) -> None:
+        """Discard a batch of windows."""
+        return None
 
 
 def _report_goal_sanity(table) -> None:

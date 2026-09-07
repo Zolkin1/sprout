@@ -19,7 +19,13 @@ from .base import (
 )
 from .composite import CompositeSubTerrainCfg, composite_terrain
 from .flat import FlatBlock, FlatBlockCfg
-from .overlay import OVERLAY_KINDS, OverlayOutput, OverlayVolumeCfg, build_overlay
+from .overlay import (
+    OVERLAY_KINDS,
+    OverlayOutput,
+    OverlayVolumeCfg,
+    build_overlay,
+    overlay_sub_boxes,
+)
 from .randomized_composite import (
     BlockChoice,
     RandomizedCompositeSubTerrainCfg,
@@ -45,6 +51,7 @@ __all__ = [
     "TerrainBlockCfg",
     "build_overlay",
     "OVERLAY_KINDS",
+    "overlay_sub_boxes",
     "composite_terrain",
     "randomized_composite_terrain",
     "validate_skill_probs",

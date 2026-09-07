@@ -208,8 +208,8 @@ def main() -> int:
         pr = np.load(a.predictions)
         v = join_on_window({"episode_uid": pr["episode_uid"],
                             "replan_index": pr["replan_index"],
-                            "advantage": pr["p_fail_V_priv"] if "p_fail_V_priv" in pr.files
-                            else pr["p_fail"]}, uid, ridx)
+                            # fit_value writes the failure head as `p_<variant>`.
+                            "advantage": pr["p_V_priv"]}, uid, ridx)
         # Stratify the same way the label did: progress within the episode, so a pair is not
         # an episode opening against an episode end.
         _, inv = np.unique(uid, return_inverse=True)

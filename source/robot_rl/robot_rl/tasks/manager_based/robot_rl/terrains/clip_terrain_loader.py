@@ -31,6 +31,7 @@ import json
 import math
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 import trimesh
 
@@ -44,6 +45,7 @@ from .blocks import (
     build_overlay,
 )
 from motion_gen.terrain.decorate import DEFAULT_FLAT_BUFFER
+from motion_gen.terrain.overlay_boxes import GROUND_SLAB_THICKNESS_M, overlay_sub_boxes
 
 from .blocks.base import TerrainBlockCfg
 from .blocks.composite import composite_terrain
@@ -94,6 +96,18 @@ class ClipTerrainLayout:
     # emitted by ``composite_terrain``'s ``meta_data["overlays"]``.  The box world
     # (x, y) for a tile is ``tile_corner[:2] + overlay["pos_xy"]`` (Phase-3 reset).
     terrain_overlays: dict[int, list[dict]] = field(default_factory=dict)
+    # terrain id -> ``(B, 6)`` array of ``(cx, cy, cz, sx, sy, sz)`` COLLIDER boxes in the
+    # tile's local-corner frame: every non-decor overlay expanded through
+    # ``overlay_sub_boxes`` (so a floating tread contributes its slab, not the gap beneath it)
+    # plus a ground slab where the tile has one.  This is what the terrain-consistency reward
+    # evaluates its signed distance against, and it is built HERE rather than from
+    # ``terrain_overlays`` because that metadata drops ``variant``.
+    #
+    # A tile is ABSENT when its geometry is not a box union -- the legacy ``bands`` stair and
+    # slope schemas, whose surfaces are recomputed by their block builders.  Absent rather
+    # than a bare ground slab, because a flat floor under a staircase is exactly the
+    # flat-``ground_z`` mistake that made the FM's terrain-penetration loss inert.
+    terrain_collider_boxes: dict[int, np.ndarray] = field(default_factory=dict)
     # The VISUAL-ONLY decoration, assembled and centred exactly like the ground mesh but kept
     # out of it. ``None`` for an undecorated library, and for ``render_decor=False``. Carried
     # on the layout rather than added to ``assemble_clip_terrain``'s return tuple so every
@@ -440,6 +454,43 @@ def _tile_mesh(
     return trimesh.util.concatenate(meshes), meta.get("overlays", []), decor_mesh
 
 
+def _tile_collider_boxes(
+    footprint: tuple[float, float],
+    blocks: list[TerrainBlockCfg],
+    overlays: list[OverlayVolumeCfg],
+) -> np.ndarray | None:
+    """One tile's COLLIDER boxes in tile-local coordinates, or ``None`` if it is not boxes.
+
+    Built from the block/overlay CFGS rather than from ``composite_terrain``'s overlay
+    metadata, because that metadata carries no ``variant`` -- so a ``floating`` tread would
+    come back as a solid pillar and the reward would charge a robot for passing under it.
+
+    Args:
+        footprint: The tile's ``(size_x, size_y)`` (m).
+        blocks: The tile's ground blocks. Only an all-flat set can be expressed as a box; a
+            legacy stair or slope block cannot.
+        overlays: The tile's overlay volumes, decor included (it is filtered here).
+
+    Returns:
+        ``(B, 6)`` float64 centres + FULL extents, or ``None`` when the tile's ground is not
+        a flat slab.
+    """
+    if blocks and not all(isinstance(b, FlatBlockCfg) for b in blocks):
+        return None
+    boxes: list[tuple[float, ...]] = []
+    for ov in overlays:
+        if getattr(ov, "decor", False):
+            continue
+        boxes.extend(overlay_sub_boxes(
+            str(ov.variant), tuple(ov.size_xyz), tuple(ov.pos_xy), float(ov.base_z),
+            float(ov.slab_thickness), tuple(ov.leg_size), float(ov.leg_inset)))
+    if blocks:
+        sx, sy = float(footprint[0]), float(footprint[1])
+        t = GROUND_SLAB_THICKNESS_M
+        boxes.append((sx / 2.0, sy / 2.0, -t / 2.0, sx, sy, t))
+    return np.asarray(boxes, dtype=np.float64) if boxes else None
+
+
 def default_num_flat_tiles(lib) -> int:
     """Number of flat tiles to build when the caller doesn't specify one.
 
@@ -609,6 +660,15 @@ def assemble_clip_terrain(
                       _flat_decor_overlays(lib, flat_fp, _i_flat)))
     clip_size_y[_FLAT_TERRAIN_ID], type_code[_FLAT_TERRAIN_ID] = flat_fp[1], 0
 
+    # Per-tile collider boxes for the terrain-consistency reward. One pass over the specs so
+    # every tile class is covered by the same rule and none can be forgotten as a class is
+    # added.
+    terrain_collider_boxes: dict[int, np.ndarray] = {}
+    for _tid, _tc, _fp, _blocks, _cxoff, _ovs in specs:
+        got = _tile_collider_boxes(_fp, _blocks, _ovs)
+        if got is not None:
+            terrain_collider_boxes[int(_tid)] = got
+
     # Terrain frame per terrain id (see ClipTerrainLayout.terrain_frame_yaw): AUTHORED in the
     # manifest, defaulting to the tile's own +x so every manifest predating the field keeps the
     # world-axis masking it was generated under.  Flat ground has no traversal axis -> 0.
@@ -700,6 +760,7 @@ def assemble_clip_terrain(
         terrain_frame_yaw=terrain_frame_yaw,
         terrain_route=terrain_route,
         terrain_overlays=terrain_overlays,
+        terrain_collider_boxes=terrain_collider_boxes,
         decor_mesh=decor_mesh,
     )
     return mesh, origins, layout

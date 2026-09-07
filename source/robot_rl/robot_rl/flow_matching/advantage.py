@@ -190,6 +190,119 @@ def chunk_rewards_from_track_err(
     return reward, valid
 
 
+def clipped_window_return(
+    penalty: np.ndarray,
+    valid: np.ndarray,
+    episode_uid: np.ndarray,
+    replan_index: np.ndarray,
+    failed: np.ndarray,
+    *,
+    clip_c: float,
+    window: int,
+    gamma: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Truncated-window return of a CLIPPED penalty, normalized into ``[-1, 0]``.
+
+    The whole reward and value specification is three numbers -- one clip constant, one window
+    length, one discount::
+
+        r_t = -min(p_t, c)                              live chunk, so r in [-c, 0]
+        r_t = -c                                        every chunk after TERMINATION
+        G_t = sum_{i<N} gamma^i r_{t+i}                 fixed window, no bootstrap
+        G_t / (c * sum_{i<N} gamma^i)                   so the MSE target is in [-1, 0]
+
+    **The clip constant does three jobs at once**, which is why there is only one of them:
+
+    * it is the TERMINATION PENALTY -- dying at chunk 2 pays ``-c`` for each remaining chunk
+      of the window, so an earlier death costs strictly more, in proportion to how early. No
+      separate terminal bonus to size.
+    * it is the SURVIVAL REWARD -- adding a constant per surviving chunk and padding the dead
+      ones with ``-c`` are the same thing up to an offset, so there is no bonus to pick.
+    * it is OUTLIER CONTROL for the regression. Measured on this reward, the penalty's max is
+      47.5 against a p95 of 1.72: unclipped, a handful of through-the-wall plans would
+      dominate an MSE. Clipped, a catastrophic plan and a dead robot look the same -- which is
+      the intent, not a loss of information.
+
+    Set ``clip_c`` around the p95-p99 of the penalty distribution (about 2 to 3 on the
+    measured numbers) so a bad-but-survivable chunk and a chunk of death are comparable
+    without termination swamping everything else in the advantage.
+
+    **A window that runs past a NON-failure episode end makes the row invalid**, rather than
+    being padded. Padding with ``-c`` would price arriving at the goal as if it were dying,
+    and padding with ``0`` or with the last reward would invent an outcome; the spec's ``-c``
+    fill is for chunks after TERMINATION, and a goal-reached or budget-exhausted episode has
+    not terminated in that sense. At a short window this costs the last ``N-1`` rows of each
+    surviving episode -- a few percent -- which is cheaper than a guess.
+
+    Args:
+        penalty: ``[W]`` per-chunk penalty ``p_t >= 0`` (the terrain total, unclipped).
+        valid: ``[W]`` which penalties exist.
+        episode_uid: ``[W]``.
+        replan_index: ``[W]`` position within the episode, 0-based.
+        failed: ``[W]`` bool, the episode's realized outcome (constant within an episode).
+        clip_c: The clip constant ``c > 0``, in penalty units.
+        window: Chunks in the window ``N >= 1``.
+        gamma: Per-chunk discount in ``(0, 1]``.
+
+    Returns:
+        ``(g, valid_g)`` -- ``[W]`` float64 in ``[-1, 0]`` and ``[W]`` bool.
+
+    Raises:
+        ValueError: If the arrays disagree in length, or any of the three constants is out of
+            range.
+    """
+    arrays = (penalty, valid, episode_uid, replan_index, failed)
+    if len({a.shape[0] for a in arrays}) != 1:
+        raise ValueError("clipped_window_return inputs must agree in length; got "
+                         f"{[int(a.shape[0]) for a in arrays]}")
+    if not clip_c > 0.0:
+        raise ValueError(f"clip_c must be positive; got {clip_c}")
+    if int(window) < 1:
+        raise ValueError(f"window must be >= 1; got {window}")
+    if not 0.0 < gamma <= 1.0:
+        raise ValueError(f"gamma must be in (0, 1]; got {gamma}")
+
+    n = int(window)
+    c = float(clip_c)
+    disc = np.power(float(gamma), np.arange(n, dtype=np.float64))
+    scale = c * disc.sum()                       # the window's max magnitude
+
+    g = np.zeros(penalty.shape[0], dtype=np.float64)
+    ok = np.zeros(penalty.shape[0], dtype=bool)
+    order = np.lexsort((replan_index, episode_uid))
+    bounds = np.flatnonzero(np.diff(episode_uid[order], prepend=-1, append=-1) != 0)
+
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        idx = order[lo:hi]
+        ridx = replan_index[idx].astype(np.int64)
+        # Dense over the episode's own re-plan indices, so a gap in the table (the fit drops
+        # post-latch windows) is a MISSING chunk rather than a shifted one.
+        span = int(ridx.max()) + 1
+        r = np.full(span, np.nan, dtype=np.float64)
+        present = valid[idx].astype(bool)
+        r[ridx[present]] = -np.minimum(penalty[idx][present].astype(np.float64), c)
+        ep_failed = bool(failed[idx][0])
+
+        for k, row in enumerate(idx):
+            t = int(ridx[k])
+            if not present[k]:
+                continue
+            acc, good = 0.0, True
+            for i in range(n):
+                j = t + i
+                if j < span and np.isfinite(r[j]):
+                    acc += disc[i] * r[j]
+                elif ep_failed:
+                    acc += disc[i] * (-c)        # after termination
+                else:
+                    good = False                 # ran past a non-failure end
+                    break
+            if good:
+                g[row] = acc / scale
+                ok[row] = True
+    return g, ok
+
+
 def normalized_returns(
     reward: np.ndarray,
     valid: np.ndarray,
@@ -271,6 +384,77 @@ def normalized_returns(
         out[keep] = vals
         ok[keep] = True
     return out, ok
+
+
+def mc_advantage(
+    g: np.ndarray,
+    g_hat: np.ndarray,
+    p_fail: np.ndarray,
+    failed: np.ndarray,
+    *,
+    w_fail: float = 1.0,
+    valid: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The MONTE-CARLO advantage: realized outcome minus the critic's own baseline.
+
+    ``A = w_track * [ G_t - G_hat(s_t) ] + w_fail * [ P(fail|s_t) - 1{failed} ]``
+    with ``w_track = 1 - w_fail``, matching :func:`combined_n_step_advantage`'s decomposition
+    of ``V(s) = w_track * G_hat(s) - w_fail * P(fail|s)`` so the two estimators label the same
+    quantity and differ only in how the target is formed.
+
+    **No bootstrapping anywhere.**  Both halves difference against something MEASURED --
+    ``G_t``, the realized normalized return from :func:`normalized_returns`, and the episode's
+    own terminal outcome -- where :func:`combined_n_step_advantage` differences against the
+    critic's predictions at ``t + n``.  That removes the bootstrap bias entirely and pays for
+    it in variance: an MC advantage carries the whole remaining episode's noise, while the
+    n-step form has ``gamma^n`` of it.  There is no ``n``, so nothing has to be tuned.
+
+    Both signs are "higher is better for this chunk": the quality half is positive when the
+    episode did better than the critic expected, and the survival half is positive when the
+    critic expected failure and the episode survived.
+
+    **The baseline MUST be out of fold.**  ``G_hat(s_t)`` and ``P(fail|s_t)`` are what the
+    critic was fitted to predict, so an in-sample reading has partly memorised ``G_t`` and the
+    realized outcome, and the advantage collapses toward zero -- degrading the label to noise
+    rather than making it wrong, which is the harder failure to notice. ``fit_value.py``'s
+    ``predictions.npz`` holds out-of-fold predictions when it was run with ``--folds >= 2``,
+    and ``label_advantage.py`` warns when it was not.
+
+    Args:
+        g: ``[W]`` realized normalized return per window, from :func:`normalized_returns`.
+        g_hat: ``[W]`` the quality head's out-of-fold prediction of ``g``.
+        p_fail: ``[W]`` the failure head's out-of-fold ``P(fail | s_t)``.
+        failed: ``[W]`` bool, the episode's realized outcome (constant within an episode).
+        w_fail: Weight on the survival half; ``1.0`` is survival only, ``0.0`` quality only.
+        valid: ``[W]`` bool, which rows carry a usable ``g``; ``None`` means all of them.
+            Rows where it is False come back zero and flagged invalid rather than being
+            charged for a return that was never measured.
+
+    Returns:
+        ``(advantage, valid)`` -- ``[W]`` float64 and ``[W]`` bool.
+
+    Raises:
+        ValueError: If the arrays disagree in length or ``w_fail`` is outside ``[0, 1]``.
+    """
+    arrays = (g, g_hat, p_fail, failed)
+    if len({a.shape[0] for a in arrays}) != 1:
+        raise ValueError(
+            "mc_advantage inputs must agree in length; got "
+            f"{[int(a.shape[0]) for a in arrays]}")
+    if not 0.0 <= float(w_fail) <= 1.0:
+        raise ValueError(f"w_fail must be in [0, 1]; got {w_fail}")
+
+    ok = np.ones(g.shape[0], dtype=bool) if valid is None else np.asarray(valid, dtype=bool)
+    w_track = 1.0 - float(w_fail)
+    quality = np.where(ok, np.asarray(g, dtype=np.float64)
+                       - np.asarray(g_hat, dtype=np.float64), 0.0)
+    survival = (np.asarray(p_fail, dtype=np.float64)
+                - np.asarray(failed, dtype=bool).astype(np.float64))
+    adv = w_track * quality + float(w_fail) * survival
+    # A row with no measured return has no quality half. It still has a survival half, so it
+    # stays valid at w_fail > 0 and is dropped only when the quality term is all there is.
+    keep = ok | (float(w_fail) > 0.0)
+    return np.where(keep, adv, 0.0), keep
 
 
 def combined_n_step_advantage(
@@ -399,6 +583,40 @@ def combined_n_step_advantage(
             future = gh[i + k] if i + k < m else tail
             track[rows[i]] = (1.0 - g) * measured + (g ** k) * future - gh[i]
     return float(w_fail) * surv + w_track * track, boot
+
+
+def group_ids(family_code: np.ndarray, strata: np.ndarray | None = None) -> np.ndarray:
+    """Dense integer id for each ``(family, stratum)`` group :func:`binarize` cuts within.
+
+    ``binarize`` loops over ``family x strata`` and takes a percentile INSIDE each cell, so
+    the cell -- not the family -- is the unit its threshold is calibrated on.  Anything that
+    wants to reproduce that grouping later (AWR standardizing the advantage, a report
+    breaking a result down by cell) has to agree with it exactly, and re-deriving the
+    crossing at each call site is how two of them come to disagree.  So it is computed once,
+    here, and the sidecar carries the result.
+
+    Args:
+        family_code: ``[W]`` family code per window.
+        strata: ``[W]`` optional second grouping crossed with the family, or ``None`` for
+            family alone -- the same argument :func:`binarize` takes, and it must be the same
+            array, or the ids describe a different partition from the one the labels used.
+
+    Returns:
+        ``[W]`` int64 in ``[0, n_groups)``, dense and stable under the input's own ordering.
+
+    Raises:
+        ValueError: If ``strata`` disagrees with ``family_code`` in length.
+    """
+    fam = np.asarray(family_code, dtype=np.int64)
+    if strata is None:
+        return np.unique(fam, return_inverse=True)[1].astype(np.int64)
+    st = np.asarray(strata, dtype=np.int64)
+    if st.shape[0] != fam.shape[0]:
+        raise ValueError(f"strata has length {st.shape[0]}, expected {fam.shape[0]}")
+    # Pair -> dense id via the unique rows, rather than `fam * k + st`: the latter needs a
+    # bound on `st` and silently collides if one is wrong.
+    pair = np.stack((fam, st), axis=1)
+    return np.unique(pair, axis=0, return_inverse=True)[1].astype(np.int64)
 
 
 def binarize(

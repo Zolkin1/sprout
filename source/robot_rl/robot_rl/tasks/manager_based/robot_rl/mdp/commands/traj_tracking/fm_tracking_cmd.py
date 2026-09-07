@@ -98,7 +98,17 @@ from robot_rl.flow_matching.online import (
     load_fm_context,
     sample_window,
 )
-from isaaclab.utils.math import quat_apply, quat_from_matrix
+from isaaclab.utils.math import matrix_from_quat, quat_apply, quat_from_matrix
+
+from motion_gen.plan_geometry import FOOT_BODIES
+
+#: Colour of the ribbon marker for a plan node the plan's own kinematics call a STANCE.
+#:
+#: Deliberately not one of ``_DEBUG_FRAME_COLOR_MAP``'s per-frame colours: the point is to
+#: read contact against the frame colour, so it has to be distinguishable from every one of
+#: them. Drawn at 1.35x the swing radius as well, because a colour alone is hard to pick out
+#: in a dense ribbon.
+DEBUG_CONTACT_COLOR: tuple[float, float, float] = (0.15, 0.85, 0.35)
 
 from robot_rl.flow_matching.window import (
     DEFAULT_WINDOW_ANCHOR,
@@ -577,6 +587,19 @@ class FmTrackingCommand(MotionSequenceCommand):
                 self._fm_pred_specs.append((name, color, "base", -1))
             elif name in self.ctx.frame_names and draw_ee:
                 self._fm_pred_specs.append((name, color, "frame", self.ctx.frame_names.index(name)))
+        # A SECOND prototype per foot frame, in the contact colour, so a node the plan's own
+        # kinematics call a stance is drawn differently from a swing node. The ribbon then
+        # shows the flag the terrain-consistency reward gates on, and the two cannot drift:
+        # both read `plan_foot_contact`, which is the single producer.
+        self._fm_contact_specs: list[tuple[str, tuple[float, float, float], str, int]] = []
+        self._fm_contact_proto: dict[int, int] = {}
+        for i, (name, _c, kind, k) in enumerate(self._fm_pred_specs):
+            if kind == "frame" and name in FOOT_BODIES:
+                self._fm_contact_proto[i] = len(self._fm_pred_specs) + len(
+                    self._fm_contact_specs)
+                self._fm_contact_specs.append(
+                    (f"{name}_contact", DEBUG_CONTACT_COLOR, kind, k))
+        self._plan_collider_model = None
         # The ribbon draws EVERY predicted node (dense), independent of the clip
         # ribbon's debug_vis_stride subsampling. It indexes _pred_window directly
         # rather than through the cursor, so it needs no offset table.
@@ -2388,15 +2411,101 @@ class FmTrackingCommand(MotionSequenceCommand):
         if "ee_pos_w" not in world:
             world["ee_pos_w"] = self._fk_ee_positions(world)
         translations, marker_indices = [], []
-        for proto_idx, (_name, _color, kind, k) in enumerate(self._fm_pred_specs):
+        contact = self.plan_foot_contact()
+        for proto_idx, (name, _color, kind, k) in enumerate(self._fm_pred_specs):
             pts = (world["base_pos_w"] if kind == "base"
                    else world["ee_pos_w"][:, :, k]).reshape(-1, 3)
             translations.append(pts)
-            marker_indices.append(torch.full((pts.shape[0],), proto_idx, dtype=torch.long, device=self.device))
+            idx = torch.full((pts.shape[0],), proto_idx, dtype=torch.long, device=self.device)
+            alt = self._fm_contact_proto.get(proto_idx)
+            if alt is not None and contact is not None:
+                # `contact["contact"]` is [N, F, 2] in FOOT_BODIES order, and the ribbon's
+                # points are node-major within each env, matching the reshape above.
+                j = FOOT_BODIES.index(name)
+                idx = torch.where(contact["contact"][:, :, j].reshape(-1),
+                                  torch.full_like(idx, alt), idx)
+            marker_indices.append(idx)
         self._fm_markers.set_visibility(True)
         self._fm_markers.visualize(
             translations=torch.cat(translations, dim=0), marker_indices=torch.cat(marker_indices, dim=0),
         )
+
+    def plan_collider_model(self):
+        """The feet-only collider model the plan's contact flags are derived from.
+
+        Built lazily and cached: parsing the MJCF and resolving the FK chain is the whole
+        setup cost, and this is read once per debug draw (and, once the terrain-consistency
+        reward is wired, once per re-plan).
+
+        FEET ONLY, and surface-sampled. The contact flag reads the sole, so nothing else is
+        needed here -- and keeping it to the feet is what makes the flag cheap enough to
+        compute for a debug ribbon at full env count.
+
+        Returns:
+            A :class:`~motion_gen.plan_geometry.PlanColliderModel`, or ``None`` when the
+            window predicts no joints (there is then no posture to run FK on).
+        """
+        if self._plan_collider_model is not None:
+            return self._plan_collider_model
+        if "joint_pos" not in self._fm_blocks:
+            return None
+        try:
+            from motion_gen.features import DEFAULT_MJCF                    # noqa: PLC0415
+            from motion_gen.plan_geometry import PlanColliderModel          # noqa: PLC0415
+            self._plan_collider_model = PlanColliderModel(
+                DEFAULT_MJCF, list(self.ctx.joint_names), body_names=list(FOOT_BODIES),
+                base_link=self.cfg.base_frame_name, dtype=torch.float32,
+            ).to(self.device)
+        except Exception as exc:
+            print(f"[WARN FmTrackingCommand] could not build the plan collider model "
+                  f"({exc}); the ribbon will not mark contacts.")
+            return None
+        return self._plan_collider_model
+
+    def plan_foot_contact(self):
+        """Contact flags for the CURRENT plan, from sole-corner speed alone.
+
+        The single producer shared by the debug ribbon and the terrain-consistency reward, so
+        the flag drawn is the flag graded. See
+        :func:`~motion_gen.plan_geometry.plan_contact` for why the criterion is velocity and
+        not proximity: gating a terrain reward on nearness to the terrain would be a
+        tautology.
+
+        Returns:
+            The :func:`~motion_gen.plan_geometry.plan_contact` mapping over ``[N, F, 2]``, or
+            ``None`` when no collider model could be built.
+        """
+        model = self.plan_collider_model()
+        if model is None:
+            return None
+        from motion_gen.plan_geometry import (                              # noqa: PLC0415
+            plan_collider_points, plan_contact)
+        base_pos, rot, joint_pos = self.plan_world_pose()
+        pts = plan_collider_points(base_pos, rot, joint_pos, model)
+        # The plan's nodes are contiguous CONTROL steps, so the node spacing IS the env's
+        # control period -- read off the env rather than restated, since a decimation change
+        # would otherwise leave a stale dt scaling every speed the contact test thresholds.
+        return plan_contact(pts, model, dt=float(self._env.step_dt))
+
+    def plan_world_pose(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The current plan lifted into the world: base position, base rotation, joints.
+
+        One producer for the lift, shared by the contact flags and by the terrain-consistency
+        rewards, so the two can never place the same plan differently. The anchor frame is
+        YAW-ONLY -- ``window_to_world`` drops the anchor's roll and pitch and keeps the
+        reference's -- and restating that at a call site is precisely the frame detail that
+        goes wrong silently.
+
+        Returns:
+            ``(base_pos_w (N, F, 3), base_rot_w (N, F, 3, 3), joint_pos (N, F, nj))``. The
+            rotation as a MATRIX because that is what the collider FK consumes.
+        """
+        world = window_to_world(self._pred_window, self._anchor_pos[:, None, :],
+                                self._anchor_quat[:, None, :], self.ctx.nj,
+                                self.ctx.num_extra_frames, self._fm_blocks)
+        n, f = world["base_pos_w"].shape[:2]
+        rot = matrix_from_quat(world["base_quat_w"].reshape(n * f, 4)).reshape(n, f, 3, 3)
+        return world["base_pos_w"], rot, world["joint_pos"]
 
     def _create_fm_markers(self):
         """Build a sphere-per-frame marker set for the FM-prediction ribbon."""
@@ -2409,9 +2518,10 @@ class FmTrackingCommand(MotionSequenceCommand):
         radius = float(self.cfg.debug_vis_fm_marker_radius)
         prototypes = {
             f"fm_{name}": sim_utils.SphereCfg(
-                radius=radius, visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(color)),
+                radius=radius * (1.35 if name.endswith("_contact") else 1.0),
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(color)),
             )
-            for name, color, _kind, _k in self._fm_pred_specs
+            for name, color, _kind, _k in self._fm_pred_specs + self._fm_contact_specs
         }
         cfg = VisualizationMarkersCfg(prim_path="/Visuals/fm_pred", markers=prototypes)
         try:

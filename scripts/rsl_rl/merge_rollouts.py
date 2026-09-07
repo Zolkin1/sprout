@@ -143,90 +143,130 @@ def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
           seed: int = 0) -> None:
     """Concatenate the window and episode tables of every stem into ``out_stem``.
 
+    **Streamed, one stem at a time**, which is what makes the full grid mergeable at all.
+    Holding every input plus the output in RAM peaked at 21.8 GB over 9000 episodes -- about
+    73 GB extrapolated to 30k, against 75 GB available -- while the FIT itself needs only 8.1
+    GB at 9000 (``_load`` reads just the columns the critic uses and skips ``fm_plan``, 11.3
+    kB/window on its own). So the memory ceiling was the merge, not the training, and capping
+    the dataset to fit it was throwing away 70% of the episodes for no reason. Appending into
+    resizable datasets caps the peak at the largest single stem.
+
     Args:
         stems: Input rollout stems (without ``.h5``).
         out_stem: Output stem; ``<out_stem>.h5`` and ``<out_stem>.episodes.h5`` are written.
         max_episodes_per_stem: Keep at most this many episodes from each stem; 0 keeps all.
-            The exteroception column dominates the size (a 5-channel two-camera row is ~15.6
-            kB), so a six-run grid is ~28 GB and the concatenation peaks at roughly twice
-            that -- subsampling is what keeps the merge inside memory. Balanced BY STEM
-            rather than over the pool, so one cell cannot dominate the critic's training set.
+            Balanced BY STEM rather than over the pool, so one cell cannot dominate. Rarely
+            needed now that the merge streams -- it is for deliberately thinning a set, not
+            for fitting one into memory.
         seed: Draw seed for the subsample.
 
     Raises:
-        SystemExit: On a contract mismatch, or if a window's episode has no outcome row.
+        SystemExit: On a contract mismatch, a uid collision, or a window whose episode has no
+            outcome row.
     """
-    win, wattrs, eps, eattrs = [], [], [], []
-    for i, s in enumerate(stems):
+    for s in stems:
         for suffix in (".h5", ".episodes.h5"):
             if not os.path.isfile(s + suffix):
                 raise SystemExit(f"{s + suffix} not found -- is {s!r} a rollout stem?")
-        W, wa = ro.read_rollout_windows(s + ".h5")
-        E, ea = ro.read_rollout_episodes(s + ".episodes.h5")
-        n_all = len(E["episode_uid"])
-        if max_episodes_per_stem:
-            subsample_episodes(W, E, int(max_episodes_per_stem),
-                               np.random.default_rng([seed, i]))
-        win.append(W); wattrs.append(wa); eps.append(E); eattrs.append(ea)
-        note = ("" if len(E["episode_uid"]) == n_all
-                else f"  (subsampled from {n_all})")
-        print(f"[merge] {s}: {len(E['episode_uid'])} episodes, "
-              f"{len(W['episode_uid'])} windows{note}")
-    assert_contracts_agree(wattrs, stems)
-
-    # Renumber per file, past the running max. See the module docstring for why a collision
-    # here is not cosmetic.
-    offset = 0
-    for W, E in zip(win, eps):
-        n = int(max(E["episode_uid"].max(initial=-1), W["episode_uid"].max(initial=-1))) + 1
-        E["episode_uid"] = E["episode_uid"] + offset
-        W["episode_uid"] = W["episode_uid"] + offset
-        offset += n
-
-    out_w = {k: np.concatenate([W[k] for W in win], axis=0) for k in win[0]}
-    out_e = {k: np.concatenate([E[k] for E in eps], axis=0) for k in eps[0]}
-    n_eps = len(out_e["episode_uid"])
-    if len(np.unique(out_e["episode_uid"])) != n_eps:
-        raise SystemExit("episode_uid is not unique after renumbering -- the offset is wrong; "
-                         "refusing rather than writing a table fit_value would mis-split.")
-    orphans = np.setdiff1d(np.unique(out_w["episode_uid"]), out_e["episode_uid"])
-    if orphans.size:
-        raise SystemExit(f"{orphans.size} window episode_uid(s) have no outcome row "
-                         f"(e.g. {orphans[:5].tolist()}); the join would drop them silently.")
-
     os.makedirs(os.path.dirname(os.path.abspath(out_stem)) or ".", exist_ok=True)
-    prov = {"merged_sources": [
-        {"stem": s,
-         "n_episodes": int(len(E["episode_uid"])),
-         "n_windows": int(len(W["episode_uid"])),
-         # Everything a reader needs to tell the cells apart after the join.
-         "attrs": {k: (v.tolist() if isinstance(v, np.ndarray) else v)
-                   for k, v in ea.items()
-                   if k not in ("depth_camera_spec", "height_scan_spec")}}
-        for s, W, E, ea in zip(stems, win, eps, eattrs)]}
 
-    n_win = len(out_w["episode_uid"])
-    for path, cols, base, is_windows in (
-            (out_stem + ".h5", out_w, wattrs[0], True),
-            (out_stem + ".episodes.h5", out_e, eattrs[0], False)):
-        with h5py.File(path, "w") as f:
-            for k, v in cols.items():
-                f.create_dataset(k, data=v, compression="lzf" if v.nbytes > (1 << 20) else None)
+    wattrs: list[dict] = []
+    eattrs: list[dict] = []
+    prov: list[dict] = []
+    offset, n_win_total, n_eps_total = 0, 0, 0
+    seen_uids: set[int] = set()
+    wpath, epath = out_stem + ".h5", out_stem + ".episodes.h5"
+
+    with h5py.File(wpath, "w") as fw, h5py.File(epath, "w") as fe:
+        for i, stem in enumerate(stems):
+            W, wa = ro.read_rollout_windows(stem + ".h5")
+            E, ea = ro.read_rollout_episodes(stem + ".episodes.h5")
+            n_all = len(E["episode_uid"])
+            if max_episodes_per_stem:
+                subsample_episodes(W, E, int(max_episodes_per_stem),
+                                   np.random.default_rng([seed, i]))
+            wattrs.append(wa)
+            eattrs.append(ea)
+            # Checked as each stem arrives, so a mismatch is caught before anything is
+            # written rather than after the whole set has been read.
+            assert_contracts_agree(wattrs, stems[:i + 1])
+
+            # An orphan can only exist WITHIN a stem: offsetting shifts both tables equally.
+            orphans = np.setdiff1d(np.unique(W["episode_uid"]), E["episode_uid"])
+            if orphans.size:
+                raise SystemExit(
+                    f"{stem}: {orphans.size} window episode_uid(s) have no outcome row "
+                    f"(e.g. {orphans[:5].tolist()}); the join would drop them silently.")
+
+            n = int(max(E["episode_uid"].max(initial=-1),
+                        W["episode_uid"].max(initial=-1))) + 1
+            E["episode_uid"] = E["episode_uid"] + offset
+            W["episode_uid"] = W["episode_uid"] + offset
+            offset += n
+            clash = seen_uids & set(E["episode_uid"].tolist())
+            if clash:
+                raise SystemExit(
+                    f"{stem}: uid(s) {sorted(clash)[:5]} already used. The offset is wrong, "
+                    "and fit_value would deal one episode's windows to both sides of its "
+                    "by-episode split. Refusing.")
+            seen_uids |= set(E["episode_uid"].tolist())
+
+            for f, cols in ((fw, W), (fe, E)):
+                for k, v in cols.items():
+                    if k not in f:
+                        # CHUNK WHOLE ROWS. `chunks=True` lets h5py pick, and its heuristic
+                        # balances the axes rather than knowing that a row is the unit every
+                        # reader asks for -- on a (326270, 64, 44) window table it chose
+                        # (10196, 2, 3), so ONE row's `fm_plan` spans ceil(64/2)*ceil(44/3) =
+                        # 480 chunks. Measured across the four window datasets that is
+                        # 172 MB decompressed to serve a 27 KB window, against 16.8 MB from
+                        # the recorder's own `_chunk` -- and at 86k windows an epoch of the
+                        # fine-tune's random-order reads became 14.9 TB of lzf, which is a
+                        # 50-minute epoch on data the FM trains through in a fraction of that.
+                        # `_chunk` is the recorder's rule and is reused rather than restated.
+                        f.create_dataset(
+                            k, data=v, maxshape=(None,) + v.shape[1:],
+                            chunks=ro._chunk((1 << 24,) + v.shape[1:], v.dtype.str),
+                            compression="lzf" if v.nbytes > (1 << 20) else None)
+                    else:
+                        d = f[k]
+                        d.resize(d.shape[0] + v.shape[0], axis=0)
+                        d[-v.shape[0]:] = v
+            n_win_total += len(W["episode_uid"])
+            n_eps_total += len(E["episode_uid"])
+            note = "" if len(E["episode_uid"]) == n_all else f"  (subsampled from {n_all})"
+            print(f"[merge] {stem}: {len(E['episode_uid'])} episodes, "
+                  f"{len(W['episode_uid'])} windows{note}", flush=True)
+            prov.append({"stem": stem, "n_episodes": int(len(E["episode_uid"])),
+                         "n_windows": int(len(W["episode_uid"])),
+                         "attrs": {k: (v.tolist() if isinstance(v, np.ndarray) else v)
+                                   for k, v in ea.items()
+                                   if k not in ("depth_camera_spec", "height_scan_spec")}})
+            del W, E                                    # release before the next stem
+
+        # BOTH files keep their source attrs. The episode table's are not decoration:
+        # `fit_value._tracking_spec_from` reads the strict spec off them, and `family_names`
+        # is what makes the family_code column legible. Dropping them left the merged set
+        # without a tracking spec -- which the hand-built test fixtures could not see,
+        # because they only carry schema_version.
+        for f, base, is_windows in ((fw, wattrs[0], True), (fe, eattrs[0], False)):
             for k, v in base.items():
                 f.attrs[k] = v if isinstance(v, (str, bytes)) else json.dumps(
                     v.tolist() if isinstance(v, np.ndarray) else v, default=str)
             # **The window COUNT is the merged one, not the first file's.**
             # `read_rollout_windows` slices `[:num_windows_written]`, so inheriting the
             # source's value silently truncates the merged table to the first file's length:
-            # the file holds every row, every reader sees a sixth of them, and a critic
+            # the file holds every row, every reader sees a fraction of them, and a critic
             # trained on it reports nothing wrong. Caught by test_merge_rollouts.
             if is_windows:
                 for key in ("num_windows", "num_windows_written"):
-                    f.attrs[key] = n_win
-            f.attrs["merge_provenance"] = json.dumps(prov, default=str)
-        print(f"[merge] wrote {path}: {len(next(iter(cols.values())))} rows")
-    print(f"[merge] {n_eps} episodes, {len(out_w['episode_uid'])} windows, "
-          f"uids 0..{int(out_e['episode_uid'].max())}")
+                    f.attrs[key] = n_win_total
+            f.attrs["merge_provenance"] = json.dumps({"merged_sources": prov}, default=str)
+        fe.attrs["schema_version"] = ro.SCHEMA_VERSION
+
+    print(f"[merge] wrote {wpath}: {n_win_total} rows")
+    print(f"[merge] wrote {epath}: {n_eps_total} rows")
+    print(f"[merge] {n_eps_total} episodes, {n_win_total} windows, uids 0..{offset - 1}")
 
 
 def main() -> int:

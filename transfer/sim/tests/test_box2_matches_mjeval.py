@@ -135,3 +135,59 @@ def test_the_ic_grid_holds_its_holdout_out():
     assert min(box2.TRAIN_SPAWN_DISTANCES_M) < box2.HOLDOUT_SPAWN_DISTANCE_M
     assert box2.HOLDOUT_SPAWN_DISTANCE_M < max(box2.TRAIN_SPAWN_DISTANCES_M)
     assert min(box2.TRAIN_SPEEDS_MPS) < box2.HOLDOUT_SPEED_MPS < max(box2.TRAIN_SPEEDS_MPS)
+
+
+# --- the v2 variant ------------------------------------------------------------------
+# v2 exists to lengthen the RUN-OUT, not to change the obstacle. These pin both halves of
+# that claim, and pin that v1 is untouched -- the fingerprint hashes the whole tile dict, so
+# a field added for v2's sake moved v1's hash once already (aa50da093337 -> 826a2af3918a) on
+# geometry that had not changed at all.
+
+
+def test_v2_moves_only_the_goal_and_grows_the_tile_to_match():
+    """Boxes, spawn and lateral extent identical; goal and tile length both +3 m."""
+    for dist in box2.TRAIN_SPAWN_DISTANCES_M:
+        v1 = box2.make_box2_tile(0, dist)
+        v2 = box2.make_box2_tile(0, dist, target_lead_m=box2.TARGET_LEAD_V2_M,
+                                 family=box2.BOX2_V2_FAMILY)
+        assert v1["box2"]["box_faces_x"] == v2["box2"]["box_faces_x"], dist
+        assert v1["route"]["start_x"] == v2["route"]["start_x"], dist
+        assert v1["size_y"] == v2["size_y"], dist
+        assert v2["route"]["goal_x"] - v1["route"]["goal_x"] == pytest.approx(
+            box2.GOAL_SHIFT_V2_M), dist
+        assert v2["size_x"] - v1["size_x"] == pytest.approx(box2.GOAL_SHIFT_V2_M), dist
+
+
+def test_v2_carries_its_own_family_so_nothing_pools_the_two():
+    """A longer run-out is strictly more chances to fall, so the rates are incomparable.
+
+    `binarize` thresholds per family and every report groups by it, so a shared family would
+    silently average a v1 and a v2 recording into one number.
+    """
+    v1 = box2.make_box2_tile(0, 3.0)
+    v2 = box2.make_box2_tile(0, 3.0, target_lead_m=box2.TARGET_LEAD_V2_M,
+                             family=box2.BOX2_V2_FAMILY)
+    assert v1["family"] == box2.BOX2_FAMILY
+    assert v2["family"] == box2.BOX2_V2_FAMILY
+    assert v1["family"] != v2["family"]
+
+
+def test_only_v1_claims_to_be_the_mjeval_course():
+    """v2 is deliberately NOT that course; a recording must not read as an mjeval clone."""
+    assert box2.make_box2_tile(0, 3.0)["box2"]["mjeval_course"] == "mjeval_box2_h040"
+    v2 = box2.make_box2_tile(0, 3.0, target_lead_m=box2.TARGET_LEAD_V2_M,
+                             family=box2.BOX2_V2_FAMILY)
+    assert v2["box2"]["mjeval_course"] == ""
+
+
+def test_the_default_tile_records_no_target_lead_field():
+    """Adding it unconditionally moved v1's terrain fingerprint on unchanged geometry.
+
+    `fingerprint_terrain_manifest` hashes the tile dict, so an extra key is a hash change --
+    which would strand every v1 rollout already recorded, none of which a freshly built v1
+    library could then reproduce. The default needs no field to say it is the default.
+    """
+    assert "target_lead_m" not in box2.make_box2_tile(0, 3.0)["box2"]
+    v2 = box2.make_box2_tile(0, 3.0, target_lead_m=box2.TARGET_LEAD_V2_M,
+                             family=box2.BOX2_V2_FAMILY)
+    assert v2["box2"]["target_lead_m"] == pytest.approx(box2.TARGET_LEAD_V2_M)

@@ -209,3 +209,59 @@ def test_the_subsample_is_reproducible(tmp_path):
         got.append(E["episode_uid"].tolist())
     assert got[0] == got[1], "same seed must give the same draw"
     assert got[0] != got[2], "a different seed must give a different draw"
+
+
+def test_both_files_keep_their_source_attributes(tmp_path):
+    """The EPISODE table's attrs travel too, not just the window table's.
+
+    `fit_value._tracking_spec_from` reads the strict spec off the episode attrs and
+    `family_names` is what makes `family_code` legible, so dropping them leaves a merged set
+    that trains under placeholder tolerances without saying so. The first streaming rewrite
+    did exactly that, and these fixtures could not see it until they carried an attr.
+    """
+    import json as _json
+
+    merge = _load_merger()
+    a = str(tmp_path / "a")
+    _write_stem(a, n_eps=2, per_ep=2)
+    with h5py.File(a + ".episodes.h5", "a") as f:
+        f.attrs["family_names"] = _json.dumps(["box2"])
+        f.attrs["tracking_spec"] = _json.dumps({"max_lateral_m": 0.4})
+    out = str(tmp_path / "merged")
+    merge.merge([a], out)
+    _, ea = ro.read_rollout_episodes(out + ".episodes.h5")
+    assert ea.get("family_names") == ["box2"], ea
+    assert ea.get("tracking_spec", {}).get("max_lateral_m") == 0.4, ea
+    _, wa = ro.read_rollout_windows(out + ".h5")
+    assert wa.get("extero_shape") == [2, 3900], wa
+
+
+def test_the_merge_chunks_whole_rows(tmp_path):
+    """Chunks must cover the full trailing dims, because a ROW is what every reader asks for.
+
+    ``chunks=True`` lets h5py choose, and its heuristic balances the axes without knowing the
+    access pattern. On the real (326270, 64, 44) window table it picked ``(10196, 2, 3)``, so
+    reading ONE row's ``fm_plan`` spanned ``ceil(64/2) * ceil(44/3) = 480`` chunks. Across the
+    four window datasets that is **172 MB decompressed to serve a 27 KB window** against 16.8
+    from the recorder's own ``_chunk`` -- measured at 10.9 random windows/s rising to 73.0
+    after a repack, i.e. a 50-minute fine-tune epoch on 86k windows that the FM trains
+    through in a fraction of the time on 14x more data.
+
+    Nothing about it is visible in the data: the file is correct, complete and readable, and
+    only its speed says anything is wrong.
+    """
+    merge = _load_merger()
+    a = str(tmp_path / "a")
+    _write_stem(a, n_eps=4, per_ep=3)
+    # A wide multi-dimensional column, which is where the auto-chunker goes wrong.
+    with h5py.File(a + ".h5", "a") as f:
+        n = f["episode_uid"].shape[0]
+        f.create_dataset("fm_plan", data=np.zeros((n, 64, 44), dtype=np.float32))
+    out = str(tmp_path / "merged")
+    merge.merge([a], out)
+    with h5py.File(out + ".h5", "r") as f:
+        d = f["fm_plan"]
+        assert d.chunks is not None
+        assert d.chunks[1:] == d.shape[1:], (
+            f"chunks {d.chunks} do not cover a whole row of shape {d.shape[1:]}; one row "
+            "read would touch several chunks and decompress far more than it returns")

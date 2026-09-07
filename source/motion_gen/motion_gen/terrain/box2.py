@@ -49,6 +49,10 @@ from motion_gen.terrain.freeform import (
 #: eval's family tables key off exactly this string.
 BOX2_FAMILY: str = "box2"
 
+#: Family for the v2 (goal moved out) variant.  DISTINCT on purpose -- see
+#: :data:`GOAL_SHIFT_V2_M` for why the two must never pool.
+BOX2_V2_FAMILY: str = "box2_v2"
+
 # --------------------------------------------------------------------------------------------
 # mjeval's geometry.  Mirrored from ``transfer/sim/mjeval/terrains.py`` and
 # ``transfer/sim/generate_stairs_scene.py``; pinned by test_box2_matches_mjeval.py.
@@ -75,6 +79,23 @@ TARGET_LEAD_M: float = 1.50
 
 #: Depth of mjeval's goal RECTANGLE along travel (m), ``GOAL_DEPTH``.
 GOAL_DEPTH_M: float = 2.00
+
+#: How much further out the **v2** variant puts the goal (m).
+#:
+#: The BOXES DO NOT MOVE.  v2 is the same obstacle with a longer run-out: the robot has to
+#: stay up for an extra 3 m after clearing box 2 before the line counts.  The tile grows to
+#: match, because ``size_x`` is derived from ``goal_x``.
+#:
+#: **v1 and v2 success rates are NOT comparable**, which is the whole reason the variant has
+#: its own family (:data:`BOX2_V2_FAMILY`) and its own library files rather than a flag: a
+#: longer run-out is strictly more chances to fall, so a v2 number is lower than a v1 number
+#: on the same policy for a reason that has nothing to do with the policy.  Anything that
+#: groups by family therefore keeps them apart by default -- ``box2_ic_report``,
+#: ``binarize``'s per-cell threshold, every report that breaks a result down by family.
+GOAL_SHIFT_V2_M: float = 3.00
+
+#: v2's lead: the v1 lead plus :data:`GOAL_SHIFT_V2_M`.
+TARGET_LEAD_V2_M: float = TARGET_LEAD_M + GOAL_SHIFT_V2_M
 
 #: Half-extent of mjeval's goal band (m).  ``_with_goal_width`` resolves this course to
 #: ``max(GOAL_HALF_WIDTH_FLOOR=2.5, BOX_WIDTH_M / 2 + GOAL_WIDTH_MARGIN=1.0)`` = 2.5.
@@ -120,7 +141,9 @@ def box_faces(spawn_distance_m: float) -> tuple[tuple[float, float], ...]:
     return ((a0, a1), (b0, b0 + BOX_DEPTH_M))
 
 
-def make_box2_tile(terrain_id: int, spawn_distance_m: float) -> dict:
+def make_box2_tile(terrain_id: int, spawn_distance_m: float, *,
+                   target_lead_m: float = TARGET_LEAD_M,
+                   family: str = BOX2_FAMILY) -> dict:
     """One two-box section, spawning ``spawn_distance_m`` before the first box.
 
     **The goal is mjeval's, mapped rather than re-invented.**  mjeval scores arrival inside a
@@ -135,6 +158,12 @@ def make_box2_tile(terrain_id: int, spawn_distance_m: float) -> dict:
     Args:
         terrain_id: The tile id.
         spawn_distance_m: Pelvis-to-first-face distance at spawn (m).
+        target_lead_m: How far past box 2's far face the goal RECTANGLE's centre sits (m).
+            Defaults to mjeval's :data:`TARGET_LEAD_M`; :data:`TARGET_LEAD_V2_M` is the v2
+            variant.  Only the goal and the tile length move -- the boxes are placed from
+            ``spawn_distance_m`` alone and are identical across variants.
+        family: The manifest family, which is what keeps v1 and v2 from pooling in any
+            report or per-family threshold.  Pass :data:`BOX2_V2_FAMILY` with the v2 lead.
 
     Returns:
         The manifest entry, carrying its ``route`` block and a ``box2`` record of the geometry.
@@ -153,7 +182,9 @@ def make_box2_tile(terrain_id: int, spawn_distance_m: float) -> dict:
     off_y = SECTION_MARGIN_M + half_y
     size_y = 2.0 * half_y + 2.0 * SECTION_MARGIN_M
 
-    goal_x = b1 + TARGET_LEAD_M - GOAL_DEPTH_M / 2.0
+    # `size_x` follows `goal_x`, so a longer lead grows the tile with no other change --
+    # which is what makes v2 a parameter rather than a second geometry.
+    goal_x = b1 + float(target_lead_m) - GOAL_DEPTH_M / 2.0
     size_x = goal_x + GOAL_INSET_M + SECTION_MARGIN_M
 
     overlays = [_ground_overlay(size_x, size_y)]
@@ -163,24 +194,39 @@ def make_box2_tile(terrain_id: int, spawn_distance_m: float) -> dict:
 
     route = _route((off_x, off_y), 0.0, 0.0, (goal_x, off_y),
                    _fit_goal_half_width(GOAL_HALF_WIDTH_M, overlays, (goal_x, off_y)), 0.0)
-    tile = _base_tile(terrain_id, BOX2_FAMILY, size_x, size_y, overlays, route)
+    tile = _base_tile(terrain_id, str(family), size_x, size_y, overlays, route)
     tile["box2"] = {
         "spawn_distance_m": float(spawn_distance_m),
         "height_m": BOX_HEIGHT_M, "depth_m": BOX_DEPTH_M, "width_m": BOX_WIDTH_M,
         "gap_m": BOX_GAP_M,
         "box_faces_x": [[a0, a1], [b0, b1]],
-        "goal_rect_centre_x": b1 + TARGET_LEAD_M,
+        "goal_rect_centre_x": b1 + float(target_lead_m),
         "goal_depth_m": GOAL_DEPTH_M,
-        "mjeval_course": "mjeval_box2_h040",
+        # Only the DEFAULT lead is mjeval's course; v2 deliberately is not, and saying so in
+        # the tile stops a v2 recording being read as an mjeval clone.
+        "mjeval_course": ("mjeval_box2_h040"
+                          if abs(float(target_lead_m) - TARGET_LEAD_M) < 1e-9 else ""),
     }
+    # `target_lead_m` is recorded ONLY when it is not the default, and that asymmetry is
+    # deliberate. `fingerprint_terrain_manifest` hashes the whole tile dict, so adding a key
+    # unconditionally moved v1's fingerprint from aa50da093337 to 826a2af3918a on geometry
+    # that had not changed by a millimetre -- which would leave every already-recorded v1
+    # rollout carrying a fingerprint no freshly-built v1 library can reproduce. A variant
+    # that IS the default needs no field to say so; one that is not, does.
+    if abs(float(target_lead_m) - TARGET_LEAD_M) >= 1e-9:
+        tile["box2"]["target_lead_m"] = float(target_lead_m)
     return tile
 
 
-def generate_box2_manifest(spawn_distances_m: tuple[float, ...]) -> list[dict]:
+def generate_box2_manifest(spawn_distances_m: tuple[float, ...], *,
+                           target_lead_m: float = TARGET_LEAD_M,
+                           family: str = BOX2_FAMILY) -> list[dict]:
     """One tile per approach distance, in the order given.
 
     Args:
         spawn_distances_m: Pelvis-to-first-face distances (m).
+        target_lead_m: See :func:`make_box2_tile`.
+        family: See :func:`make_box2_tile`.
 
     Returns:
         The manifest tile list, ``terrain_id`` running 0..n-1 in the order given -- so the
@@ -196,4 +242,5 @@ def generate_box2_manifest(spawn_distances_m: tuple[float, ...]) -> list[dict]:
     if bad:
         raise ValueError(f"spawn distances must be positive, got {bad}. The distance is measured "
                          "from the pelvis to the first box FACE, so 0 spawns inside the box.")
-    return [make_box2_tile(i, d) for i, d in enumerate(spawn_distances_m)]
+    return [make_box2_tile(i, d, target_lead_m=target_lead_m, family=family)
+            for i, d in enumerate(spawn_distances_m)]

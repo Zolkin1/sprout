@@ -208,3 +208,135 @@ def torque_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntit
 ##
 # Individual tracking rewards
 ##
+
+
+##
+# Terrain consistency: does the PLAN's own geometry agree with the ground?
+##
+
+#: Plan nodes per SDF pass inside the reward.
+#:
+#: The SDF's working set is ``envs * nodes * points * boxes``; at 512 envs, 64 nodes, 1462
+#: surface points and a handful of boxes that is over a gigabyte as one tensor, so it is
+#: chunked. 8 nodes keeps the peak in the low hundreds of MB for 8 extra kernel launches.
+_TERRAIN_CHUNK_NODES: int = 8
+
+
+def _terrain_consistency(env: ManagerBasedRLEnv, command_name: str) -> dict[str, torch.Tensor]:
+    """Grade the live plan against the env's terrain, once per step, cached.
+
+    Three reward terms read this and the manager calls each separately, so without a cache the
+    whole SDF pass (a few thousand collider points x the plan's nodes) would run three times
+    per step for the same answer. Keyed on the env's step counter, so a stale result cannot
+    outlive the plan it describes.
+
+    Everything numeric is delegated and nothing here restates a threshold or a geometry: the
+    contact flags come from the COMMAND's ``plan_foot_contact`` (the same producer the debug
+    ribbon colours, so the flag graded is the flag drawn), the world lift from its
+    ``plan_world_pose``, the boxes from the terrain importer, and the terms from
+    :mod:`motion_gen.terrain_consistency`.
+
+    Args:
+        env: The environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        The :func:`~motion_gen.terrain_consistency.terrain_consistency` mapping.
+
+    Raises:
+        RuntimeError: If the command cannot produce contact flags (a window that predicts no
+            joints), or the terrain has no box decomposition. Both are refusals rather than
+            zeros: a zero here reads as a geometrically perfect plan.
+    """
+    from motion_gen.plan_geometry import plan_collider_points          # noqa: PLC0415
+    from motion_gen.terrain_consistency import terrain_consistency     # noqa: PLC0415
+
+    cached = getattr(env, "_terrain_consistency_cache", None)
+    step = int(env.common_step_counter)
+    if cached is not None and cached[0] == step:
+        return cached[1]
+
+    cmd = env.command_manager.get_term(command_name)
+    contact = cmd.plan_foot_contact()
+    if contact is None:
+        raise RuntimeError(
+            f"command {command_name!r} cannot produce plan contact flags, so the "
+            "terrain-consistency rewards have nothing to gate on -- this window predicts no "
+            "joint positions. Returning zeros would read as a perfect plan."
+        )
+    model = cmd.plan_collider_model()
+    base_pos, base_rot, joint_pos = cmd.plan_world_pose()
+    points = plan_collider_points(base_pos, base_rot, joint_pos, model)
+    out = terrain_consistency(points, contact, env.scene.terrain.terrain_collider_boxes(),
+                              model, chunk_nodes=_TERRAIN_CHUNK_NODES)
+    env._terrain_consistency_cache = (step, out)
+    return out
+
+
+def plan_terrain_contact(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
+                         ) -> torch.Tensor:
+    """PARC's terrain CONTACT loss over the plan, widened by a deadband. **Wire NEGATIVE.**
+
+    ``mean_t sum_b c_b * max(0, min_p |sd(p)| - deadband)`` over the plan's nodes, where ``b``
+    runs over the feet, ``c_b`` is the plan's own kinematic contact flag, and ``p`` runs over
+    that foot's sole points (PARC Eq 8; see
+    :func:`~motion_gen.terrain_consistency.terrain_consistency` for the two deviations -- the
+    deadband, and reading the sole rather than the whole body).
+
+    This is the term that grades MODE selection. A plan whose own kinematics say a foot is
+    planted, 15 cm above the tread it is meant to be standing on, has read the terrain wrong
+    -- and it has done so BEFORE the robot falls, which is what makes it actionable in a way
+    an outcome is not.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        ``[num_envs]``, non-negative, 0 when every marked stance sits within the deadband of
+        the terrain.
+    """
+    return _terrain_consistency(env, command_name)["contact_penalty"]
+
+
+def plan_terrain_penetration(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
+                             ) -> torch.Tensor:
+    """PARC's terrain PENETRATION loss over the plan. **Wire NEGATIVE.**
+
+    ``mean_t sum_i max(0, -sd(p_i) - tol)`` over the plan's nodes and every collider point the
+    contact buffer does not exempt (PARC Eq 7).
+
+    **The magnitude is tied to the collider sampling density**, because a sum over points is.
+    ``motion_gen.plan_geometry.DEFAULT_COLLIDER_SPACING`` is therefore part of this term's
+    definition: changing it rescales the reward, so a tuned weight does not survive such a
+    change. ``penetration_volume_m3`` is the area-weighted, density-invariant twin if a
+    comparison across spacings is ever needed.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        ``[num_envs]``, non-negative, 0 for a plan that stays out of the terrain.
+    """
+    return _terrain_consistency(env, command_name)["penetration_sum_m"]
+
+
+def plan_support_fraction(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
+                          ) -> torch.Tensor:
+    """Fraction of plan nodes with at least one foot in contact. **Log only (weight 0).**
+
+    The guard against the contact term being satisfied vacuously: both PARC terms are gated by
+    ``c_b``, so a plan that never marks a stance is charged nothing by either and a policy
+    could in principle learn to keep its feet moving. This puts that in the training log
+    instead of leaving it as a slow, invisible drift.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        ``[num_envs]`` in ``[0, 1]``.
+    """
+    return _terrain_consistency(env, command_name)["support_fraction"]
+

@@ -30,6 +30,7 @@ import isaaclab.sim as sim_utils
 from isaaclab.terrains.terrain_importer import TerrainImporter
 
 from motion_gen.clips.clip_fingerprint import fingerprint_terrain_manifest
+from motion_gen.terrain.box_sdf import BoxUnionTerrain, pad_box_sets
 from motion_gen.clips.clip_io import load_clip_library
 from .clip_terrain_loader import assemble_clip_terrain
 from .decor import DECOR_PRIM_PATH as _DECOR_PRIM_PATH
@@ -255,6 +256,21 @@ class ClipTerrainImporter(TerrainImporter):
              for row in layout.tile_terrain_id.tolist()],
             dtype=torch.float32, device=self.device,
         )
+        # Per-TILE collider boxes for the terrain-consistency reward, padded into one tensor.
+        # Kept per tile rather than per env: the tile set is small (tens) while the env count
+        # is hundreds, so the per-env view is a gather refreshed with the other env arrays.
+        self._collider_ids: list[int] = sorted(layout.terrain_collider_boxes)
+        self._collider_row_of = {int(t): i for i, t in enumerate(self._collider_ids)}
+        if self._collider_ids:
+            self._collider_boxes, self._collider_mask = pad_box_sets(
+                [layout.terrain_collider_boxes[t] for t in self._collider_ids],
+                device=self.device)
+        else:
+            self._collider_boxes = self._collider_mask = None
+        self._missing_collider_tiles = sorted(
+            {int(t) for row in layout.tile_terrain_id.tolist() for t in row}
+            - set(int(t) for t in self._collider_ids))
+
         self._refresh_env_arrays()
 
         self.set_debug_vis(cfg.debug_vis)
@@ -304,6 +320,14 @@ class ClipTerrainImporter(TerrainImporter):
         """Per-env terrain id + tile corner/center from the env->tile mapping."""
         lv, ty = self.terrain_levels, self.terrain_types
         self.env_terrain_id = self._tile_terrain_id[lv, ty]
+        if getattr(self, "_collider_ids", None):
+            # +1 on the index so the flat tile's own id of -1 lands in slot 0 rather than
+            # wrapping to the end of the table.
+            lut = torch.full((int(self._tile_terrain_id.max()) + 2,), 0,
+                             dtype=torch.long, device=self.device)
+            for tid, row in self._collider_row_of.items():
+                lut[tid + 1] = row
+            self._env_collider_row = lut[self.env_terrain_id.long() + 1]
         self.env_cell_corner = self._tile_corner[lv, ty]
         self.env_clip_x_offset = self._tile_clip_x_offset[lv, ty]
         self.env_terrain_yaw = self._tile_frame_yaw[lv, ty]
@@ -312,3 +336,36 @@ class ClipTerrainImporter(TerrainImporter):
         center[:, 0] += fp[:, 0] / 2.0
         center[:, 1] += fp[:, 1] / 2.0
         self.env_cell_center = center
+
+    def terrain_collider_boxes(self, env_ids: torch.Tensor | None = None):
+        """The env's terrain as a WORLD-frame box union, for a geometric reward.
+
+        The tile table is stored tile-local and translated onto each env's own corner here, so
+        the boxes come back in the same frame a predicted plan is lifted into.
+
+        Args:
+            env_ids: Envs to return, or ``None`` for all of them.
+
+        Returns:
+            A :class:`~motion_gen.terrain.box_sdf.BoxUnionTerrain` of batch size
+            ``len(env_ids)``.
+
+        Raises:
+            RuntimeError: If any tile in play has no box decomposition -- the legacy ``bands``
+                stair and slope schemas. Refused rather than substituting a bare ground slab,
+                which would be a flat floor under a staircase and would make a penetration
+                term quietly meaningless. That is the defect that retired the FM's own terrain
+                loss (commit 27723572), and it is worth refusing loudly a second time.
+        """
+        if self._collider_boxes is None or self._missing_collider_tiles:
+            raise RuntimeError(
+                "this library's terrain has no box decomposition"
+                + (f" for terrain ids {self._missing_collider_tiles}"
+                   if self._missing_collider_tiles else "")
+                + ". The terrain-consistency reward needs one; regenerate the library with a "
+                "current generator, which emits the overlay schema."
+            )
+        rows = self._env_collider_row if env_ids is None else self._env_collider_row[env_ids]
+        corner = self.env_cell_corner if env_ids is None else self.env_cell_corner[env_ids]
+        tiles = BoxUnionTerrain(self._collider_boxes, self._collider_mask)
+        return tiles.index(rows).translated(corner.to(self._collider_boxes.dtype))

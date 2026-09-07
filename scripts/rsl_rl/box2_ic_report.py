@@ -70,7 +70,7 @@ def run_speed(name: str) -> float | None:
     return float(m.group("speed")) if m else None
 
 
-def load_cells(root: str) -> list[dict]:
+def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[dict]:
     """One record per ``(run, tile)`` cell under ``root``.
 
     Args:
@@ -90,7 +90,8 @@ def load_cells(root: str) -> list[dict]:
             continue
         name = os.path.basename(run_dir)
         holdout = name.startswith("holdout")
-        dists = ((HOLDOUT_SPAWN_DISTANCE_M,) if holdout else TRAIN_SPAWN_DISTANCES_M)
+        dists = ((HOLDOUT_SPAWN_DISTANCE_M,) if holdout
+                 else (tuple(distances) if distances else TRAIN_SPAWN_DISTANCES_M))
         with h5py.File(tables[0], "r") as h:
             keep = ~h["censored"][:].astype(bool)
             tid = h["terrain_id"][:][keep]
@@ -103,6 +104,12 @@ def load_cells(root: str) -> list[dict]:
             # categories summing to ~0.32 and the rest unaccounted for.
             failed = h["terminated"][:][keep].astype(bool)
             steps = h["steps_survived"][:][keep]
+            # Tracking quality, reported beside success because the two can move in
+            # opposite directions: a fine-tune that tracks its own chunks more closely has
+            # not necessarily arrived more often, and on this obstacle the interesting
+            # failure is a MODE choice that a tracking mean cannot see.
+            track = (h["track_reward_mean"][:][keep] if "track_reward_mean" in h
+                     else np.full(int(keep.sum()), np.nan))
         for t in sorted(np.unique(tid)):
             if t < 0:
                 continue
@@ -116,6 +123,7 @@ def load_cells(root: str) -> list[dict]:
                 "timeout": float((trunc[m] & ~ok[m]).mean()),
                 "failed": float(failed[m].mean()),
                 "steps_median": float(np.median(steps[m])),
+                "track_reward_mean": float(np.nanmean(track[m])),
             })
     if not cells:
         raise SystemExit(f"no *.episodes.h5 under {root!r}. An empty report is "
@@ -157,6 +165,10 @@ def format_report(cells: list[dict]) -> str:
     n_tr = sum(c["n"] for c in train)
     pooled = sum(c["reached_goal"] * c["n"] for c in train) / n_tr if n_tr else float("nan")
     L.append(f"\n  pooled over {n_tr} training episodes: {pooled:.4f}")
+    tr = [c for c in train if np.isfinite(c.get("track_reward_mean", float("nan")))]
+    if tr:
+        tq = sum(c["track_reward_mean"] * c["n"] for c in tr) / sum(c["n"] for c in tr)
+        L.append(f"  pooled track_reward_mean: {tq:.4f}")
 
     if hold:
         n_h = sum(c["n"] for c in hold)
@@ -167,7 +179,7 @@ def format_report(cells: list[dict]) -> str:
 
     L += ["", "-- per cell " + "-" * 65,
           f"  {'run':<16}{'tile':>5}{'dist':>7}{'n':>7}{'reached':>9}{'failed':>8}"
-          f"{'timeout':>9}{'sum':>7}{'steps':>8}"]
+          f"{'timeout':>9}{'sum':>7}{'steps':>8}{'track':>8}"]
     for c in cells:
         flag = "  <- TIMEOUT-LIMITED" if c["timeout"] > TIMEOUT_WARN else ""
         # reached + failed + timeout must account for the episode; printed so a category
@@ -175,7 +187,8 @@ def format_report(cells: list[dict]) -> str:
         total = c["reached_goal"] + c["failed"] + c["timeout"]
         L.append(f"  {c['run']:<16}{c['tile']:>5}{c['distance_m'] or 0:>7.2f}{c['n']:>7}"
                  f"{c['reached_goal']:>9.3f}{c['failed']:>8.3f}{c['timeout']:>9.3f}"
-                 f"{total:>7.3f}{c['steps_median']:>8.0f}{flag}")
+                 f"{total:>7.3f}{c['steps_median']:>8.0f}"
+                 f"{c.get('track_reward_mean', float('nan')):>8.3f}{flag}")
     hot = [c for c in cells if c["timeout"] > TIMEOUT_WARN]
     if hot:
         L.append(f"\n  !! {len(hot)} cell(s) time out above {TIMEOUT_WARN:.0%}: their rates are "
@@ -194,8 +207,16 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("root", help="directory holding the per-run rollout subdirectories")
     p.add_argument("--json", default="", help="also write the cells here")
+    p.add_argument("--distances", type=float, nargs="+", default=None,
+                   help="The approach distance of each TILE INDEX, when the run used a "
+                        "library other than the full training one. `terrain_id` is a tile "
+                        "index, not a distance, so a 2-tile `box2_quick` run has 3.00 m at "
+                        "tile 1 while the full grid has it at tile 3 -- reduced against the "
+                        "default tuple that cell would be silently relabelled 2.00 m and "
+                        "then paired against the wrong control. Pass the library's own "
+                        "distances, in tile order.")
     a = p.parse_args()
-    cells = load_cells(a.root)
+    cells = load_cells(a.root, tuple(a.distances) if a.distances else None)
     print(format_report(cells))
     if a.json:
         os.makedirs(os.path.dirname(os.path.abspath(a.json)) or ".", exist_ok=True)

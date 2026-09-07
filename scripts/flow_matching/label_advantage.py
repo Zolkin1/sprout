@@ -45,6 +45,78 @@ for _p in (os.path.join(_ROOT, "source", "robot_rl"), os.path.join(_ROOT, "sourc
 from robot_rl.flow_matching import advantage as adv_mod  # noqa: E402
 
 
+
+def check_reward_consistency(fitted_on: str, w_fail: float, estimator: str,
+                             terrain_only: bool, fitted_hash: str = "?",
+                             quality_range: tuple[float, float] = (0.0, 1.0),
+                             quality_kind: str = "two_hot",
+                             quality_only: bool = False) -> None:
+    """Refuse an advantage that would silently mix two different rewards.
+
+    "Terrain rewards only" is three conditions, and **any one of them missing gives a
+    plausible, wrong label rather than an error**:
+
+    1. the SURVIVAL half must be off (``w_fail == 0``), or the advantage is part realized
+       fall outcome;
+    2. the estimator must be ``mc``, or the quality half bootstraps on the critic's own
+       prediction at ``t + n`` and stops being a difference against measured terrain reward;
+    3. the critic's quality head must have been FITTED on the terrain reward, or the advantage
+       is ``G_terrain - G_hat_tracking`` -- right shape, right units, no meaning.
+
+    (3) is the dangerous one: nothing about it shows up in the numbers, which is why it is
+    stamped into ``predictions.npz`` by ``fit_value.py`` and checked here rather than trusted.
+
+    Args:
+        fitted_on: The ``reward_source`` the critic was fitted on.
+        w_fail: Weight on the survival half.
+        estimator: ``"n_step"`` or ``"mc"``.
+        terrain_only: Whether the caller asked for the terrain signal alone.
+        fitted_hash: The sidecar hash stamped at fit time, for the log line.
+        quality_range: The support the critic's quality head was fitted over. Reported,
+            because ``[0, 1]`` and ``[-1, 0]`` are both plausible-looking and an advantage
+            formed across them is silently wrong.
+        quality_kind: ``"two_hot"`` or ``"mse"``, for the log line.
+        quality_only: Whether the critic was fitted with the survival head's loss DROPPED. If
+            it was, ``p_fail`` was never trained -- it still produces numbers, and they look
+            exactly like predictions -- so any ``w_fail > 0`` is refused outright rather than
+            warned about. That is not a configuration, it is reading an untrained head.
+
+    Raises:
+        SystemExit: If ``terrain_only`` is asked for and any of the three does not hold.
+    """
+    if quality_only and w_fail > 0.0:
+        raise SystemExit(
+            f"--w_fail {w_fail} reads P(fail|s), but this critic was fitted with "
+            "--quality_only: the survival head's loss was dropped, so that head is UNTRAINED "
+            "and its output is noise shaped like a probability. Label at --w_fail 0, or refit "
+            "without --quality_only.")
+    if terrain_only:
+        if fitted_on != "terrain":
+            raise SystemExit(
+                f"--terrain_only, but this critic was fitted on {fitted_on!r}. Its quality "
+                "head predicts a different reward from the one the advantage would measure, "
+                "so the difference would be meaningless while looking entirely normal. "
+                "Refit with: fit_value.py --reward_npz <terrain sidecar>.")
+        if w_fail != 0.0:
+            raise SystemExit(
+                f"--terrain_only needs --w_fail 0 so the survival half is excluded; got "
+                f"{w_fail}. At w_fail > 0 the advantage mixes the realized fall outcome into "
+                "what is supposed to be a terrain-only signal.")
+        if estimator != "mc":
+            raise SystemExit(
+                "--terrain_only needs --estimator mc: the n_step quality half bootstraps on "
+                "the critic's prediction at t+n, so it is not a difference against measured "
+                "terrain reward.")
+        print(f"[label] TERRAIN ONLY: quality half alone, MC target, critic fitted on "
+              f"{fitted_on!r} (hash {fitted_hash}), {quality_kind} head over "
+              f"[{quality_range[0]:g}, {quality_range[1]:g}]"
+              + (", survival head UNTRAINED (quality_only fit)" if quality_only else ""))
+    elif fitted_on == "terrain" and w_fail > 0.0:
+        print(f"[label] WARNING: this critic was fitted on the TERRAIN reward but --w_fail "
+              f"{w_fail} mixes in the realized fall outcome. Pass --terrain_only if you meant "
+              "the terrain signal alone.")
+
+
 def _bandwise_gate(p_state: np.ndarray, labels: np.ndarray, failed: np.ndarray,
                    n_bands: int = 5) -> list[dict]:
     """G2: compare positive- and negative-labelled chunks WITHIN narrow ``V(s_t)`` bands.
@@ -127,6 +199,17 @@ def main() -> int:
                         "takes a separate code path rather than routing through the combined "
                         "function, so it cannot be perturbed by a change to it. Below 1 needs "
                         "a predictions.npz from a fit with a quality head.")
+    p.add_argument("--terrain_only", action="store_true",
+                   help="the advantage is the TERRAIN reward and nothing else. Requires "
+                        "--w_fail 0, --estimator mc, and a critic fitted on a terrain reward "
+                        "sidecar; each is CHECKED, because any one missing gives a plausible "
+                        "wrong label rather than an error.")
+    p.add_argument("--estimator", default="n_step", choices=("n_step", "mc"),
+                   help="how the advantage target is formed. 'n_step' bootstraps on the "
+                        "critic's own predictions at t+n; 'mc' differences against the "
+                        "REALIZED return and outcome -- no bootstrap bias, more variance, and "
+                        "no n to tune. Default stays n_step so existing artifacts are "
+                        "reproduced unchanged.")
     p.add_argument("--n", type=int, default=8,
                    help="Advantage look-ahead in re-plans (8 = 1.92 s at K=12, 50 Hz).")
     p.add_argument("--rollout", default="",
@@ -189,8 +272,42 @@ def main() -> int:
     # through the combined function: the two are equal by construction and tested to be, but
     # routing the control arm through the code it is controlling for is how a control stops
     # controlling for anything.
+    fitted_on = str(d["reward_source"]) if "reward_source" in d.files else "track_err"
+    fitted_hash = str(d["reward_hash"]) if "reward_hash" in d.files else "?"
+    q_range = (tuple(d["quality_range"].tolist()) if "quality_range" in d.files
+               else (0.0, 1.0))
+    quality_only = bool(d["quality_only"]) if "quality_only" in d.files else False
+    check_reward_consistency(fitted_on, float(args.w_fail), args.estimator,
+                             bool(args.terrain_only), fitted_hash, q_range,
+                             str(d["quality_kind"]) if "quality_kind" in d.files
+                             else "two_hot",
+                             quality_only)
+
     qkey = f"q_{args.variant}"
-    if float(args.w_fail) >= 1.0:
+    if args.estimator == "mc":
+        # MONTE CARLO: both halves difference against something measured, so there is no
+        # bootstrap and no `n`. The quality half needs the return and its baseline; the
+        # survival half needs only the realized outcome, so w_fail=1 works with no quality
+        # head at all.
+        if float(args.w_fail) >= 1.0:
+            g_hat = np.zeros_like(p_fail)
+            g = np.zeros_like(p_fail)
+            g_valid = np.zeros(p_fail.shape[0], dtype=bool)
+        elif qkey not in d.files or "g" not in d.files:
+            raise SystemExit(
+                f"--estimator mc at --w_fail {args.w_fail} needs the quality head and the "
+                f"realized return, but {args.predictions} has no {qkey}/g. Refit with a "
+                "quality head, or label at --w_fail 1.")
+        else:
+            g_hat, g = d[qkey], d["g"]
+            g_valid = d["g_valid"].astype(bool)
+        a, boot = adv_mod.mc_advantage(g, g_hat, p_fail, failed,
+                                       w_fail=float(args.w_fail), valid=g_valid)
+        boot = np.zeros_like(boot)          # nothing is bootstrapped by construction
+        print(f"[label] MC advantage: w_fail {args.w_fail:.2f} / w_track "
+              f"{1 - float(args.w_fail):.2f}, "
+              f"{int(g_valid.sum())}/{g_valid.size} windows carry a measured return")
+    elif float(args.w_fail) >= 1.0:
         a, boot = adv_mod.n_step_advantage(p_fail, uid, ridx, failed, args.n)
     elif qkey not in d.files:
         raise SystemExit(
@@ -254,37 +371,57 @@ def main() -> int:
             f"thr {r['threshold']:+.4f}  positive {r['positive_frac']:.1%}"
         print(f"    family {f}: n={r['n']:7d}  IQR {r['iqr']:.4f}  {tag}")
 
-    gate = _bandwise_gate(p_fail, labels, failed)
-    print("[label] G2 -- realized failure rate by label, WITHIN P(fail|s_t) bands:")
-    print("        (the unbanded comparison is true by construction; only this one is a test)")
-    for r in gate:
-        if r["delta"] is None:
-            print(f"    [{r['p_lo']:.3f}, {r['p_hi']:.3f})  n_pos {r['n_pos']:6d} "
-                  f"n_neg {r['n_neg']:6d}   -- too few to report")
-        else:
-            print(f"    [{r['p_lo']:.3f}, {r['p_hi']:.3f})  n_pos {r['n_pos']:6d} "
-                  f"n_neg {r['n_neg']:6d}   fail pos {r['fail_pos']:.3f} / "
-                  f"neg {r['fail_neg']:.3f}   delta {r['delta']:+.3f}")
-    good = [r["delta"] for r in gate if r["delta"] is not None]
-    if good:
-        print(f"[label] G2 median band delta {float(np.median(good)):+.3f} "
-              f"({sum(x > 0 for x in good)}/{len(good)} bands positive). A delta at or below "
-              "zero means the label is reproducing state difficulty and conditioning on it "
-              "cannot work.")
+    # The G2 gate BANDS BY P(fail|s_t), so it needs a trained survival head. Under a
+    # quality_only fit that head is untrained: every band collapses onto ~0.5, every delta is
+    # 0.000, and the gate then prints "the label is reproducing state difficulty" -- a
+    # conclusion about the LABEL drawn from a head that was never fitted. Skipped and said so,
+    # on the same principle this file's sibling states outright: a number produced by a broken
+    # head is worse than no number.
+    if quality_only:
+        gate = []
+        print("[label] G2 gate SKIPPED: it bands by P(fail|s_t) and this critic was fitted "
+              "with --quality_only, so that head is untrained. There is no survival "
+              "stratification to condition on, and any delta it reported would be an "
+              "artefact of an unfitted sigmoid sitting at 0.5.")
+    else:
+        gate = _bandwise_gate(p_fail, labels, failed)
+        print("[label] G2 -- realized failure rate by label, WITHIN P(fail|s_t) bands:")
+        print("        (the unbanded comparison is true by construction; only this one is a test)")
+        for r in gate:
+            if r["delta"] is None:
+                print(f"    [{r['p_lo']:.3f}, {r['p_hi']:.3f})  n_pos {r['n_pos']:6d} "
+                      f"n_neg {r['n_neg']:6d}   -- too few to report")
+            else:
+                print(f"    [{r['p_lo']:.3f}, {r['p_hi']:.3f})  n_pos {r['n_pos']:6d} "
+                      f"n_neg {r['n_neg']:6d}   fail pos {r['fail_pos']:.3f} / "
+                      f"neg {r['fail_neg']:.3f}   delta {r['delta']:+.3f}")
+        good = [r["delta"] for r in gate if r["delta"] is not None]
+        if good:
+            print(f"[label] G2 median band delta {float(np.median(good)):+.3f} "
+                  f"({sum(x > 0 for x in good)}/{len(good)} bands positive). A delta at or below "
+                  "zero means the label is reproducing state difficulty and conditioning on it "
+                  "cannot work.")
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-    meta = {"n": int(args.n), "variant": args.variant, "percentile": float(args.percentile),
-            "null_spread": float(args.null_spread), "num_folds": folds,
-            "w_fail": float(args.w_fail), "progress_bins": int(args.progress_bins),
-            "speed_bins": int(args.speed_bins), "rollout": args.rollout,
-            "tail_chunks": int(args.tail_chunks),
-            "predictions": os.path.abspath(args.predictions),
-            "counts": counts, "per_family": {str(k): v for k, v in per_family.items()},
-            "g2_bands": gate}
-    np.savez(args.out, label=labels.astype(np.int8), advantage=a.astype(np.float32),
-             bootstrapped=boot, episode_uid=uid, replan_index=ridx, family_code=fam,
-             val_tile=val_tile, meta=json.dumps(meta))
-    print(f"[label] wrote {args.out}")
+        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+        meta = {"n": int(args.n), "variant": args.variant, "percentile": float(args.percentile),
+                "null_spread": float(args.null_spread), "num_folds": folds,
+                "w_fail": float(args.w_fail), "progress_bins": int(args.progress_bins),
+                "speed_bins": int(args.speed_bins), "rollout": args.rollout,
+                "tail_chunks": int(args.tail_chunks),
+                "predictions": os.path.abspath(args.predictions),
+                "counts": counts, "per_family": {str(k): v for k, v in per_family.items()},
+                "g2_bands": gate,
+                "g2_skipped": ("quality_only" if quality_only else "")}
+        # `stratum` is the CELL binarize cut within, not a convenience: a consumer that
+        # re-derives the family x progress x speed crossing from `family_code` alone gets a
+        # different partition, and AWR standardizing over the wrong one puts back exactly the
+        # speed skew the stratified threshold removed (0.33 keep rate above 1.3 m/s against 0.23
+        # below 0.9). Saved so it is read rather than rebuilt.
+        np.savez(args.out, label=labels.astype(np.int8), advantage=a.astype(np.float32),
+                 bootstrapped=boot, episode_uid=uid, replan_index=ridx, family_code=fam,
+                 stratum=adv_mod.group_ids(fam, strata), val_tile=val_tile,
+                 meta=json.dumps(meta))
+        print(f"[label] wrote {args.out}")
     return 0
 
 

@@ -105,13 +105,22 @@ GOAL_SCALE_M: float = 5.0
 
 
 def _load(stem: str, max_windows: int, tail_chunks: int = 1,
-          strict_failure: bool = True) -> tuple[dict, dict, dict]:
+          strict_failure: bool = True, reward_npz: str = "", clip_c: float = 0.0,
+          window: int = 3) -> tuple[dict, dict, dict]:
     """Read both tables and join them on ``episode_uid``.
 
     Args:
         stem: The rollout stem.
         max_windows: Cap, so a multi-gigabyte recording can be smoke-tested.
         tail_chunks: Trailing chunks the quality target's non-failure tail averages.
+        reward_npz: A per-window reward sidecar to fit the quality head on INSTEAD of the
+            tracking error -- see :func:`_reward_sidecar`. Empty means the tracking reward,
+            which is what every existing artifact was fitted on.
+        clip_c: Non-zero switches the target to
+            :func:`~robot_rl.flow_matching.advantage.clipped_window_return` over the
+            sidecar's RAW penalty, in ``[-1, 0]``.  Zero keeps the ``(1 - gamma)``-normalized
+            return in ``[0, 1]``.
+        window: Chunks in the clipped window.
         strict_failure: Count the STRICT tracking violation as a failure alongside the fall
             crossing.  ``False`` is the LOOSE rule -- the fall alone -- which is what MuJoCo
             scores (``mjeval`` tests ``robot.failed()``: height and tilt, no tracking check).
@@ -213,16 +222,104 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1,
     # fallback. `--quality_bins 0` is how the survival-only control arm is selected.
     from robot_rl.flow_matching import advantage as adv_mod  # noqa: PLC0415
     spec = _tracking_spec_from(ea)
-    r, r_ok = adv_mod.chunk_rewards_from_track_err(
-        W["track_err_prev"], W["episode_uid"], W["replan_index"], spec)
-    g, g_ok = adv_mod.normalized_returns(
-        r, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
-        gamma=float(spec.gamma), tail_chunks=tail_chunks)
+    # NOT in `lab`: that dict is row-indexed twice below (the alive filter here and the
+    # censored filter in main), so anything in it that is not a per-window array raises on
+    # the first boolean index -- or worse, gets silently sliced.
+    meta_out: dict = {}
+    if reward_npz:
+        r, r_ok, rmeta = _reward_sidecar(reward_npz, W["episode_uid"], W["replan_index"],
+                                         column=("penalty" if clip_c > 0.0 else "reward"))
+        meta_out["reward_source"] = str(rmeta.get("reward_source", "unknown"))
+        meta_out["reward_hash"] = str(rmeta.get("reward_hash", ""))
+        source_note = f"{meta_out['reward_source']} sidecar"
+    else:
+        r, r_ok = adv_mod.chunk_rewards_from_track_err(
+            W["track_err_prev"], W["episode_uid"], W["replan_index"], spec)
+        meta_out["reward_source"], meta_out["reward_hash"] = "track_err", ""
+        source_note = "track_err_prev"
+    if clip_c > 0.0:
+        if not reward_npz:
+            raise SystemExit(
+                "--clip_c needs --reward_npz: the clipped window return is computed from the "
+                "sidecar's RAW penalty, which is not in the recording.")
+        g, g_ok = adv_mod.clipped_window_return(
+            r, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
+            clip_c=float(clip_c), window=int(window), gamma=float(spec.gamma))
+        meta_out["quality_range"] = (-1.0, 0.0)
+        print(f"[fit] quality target: CLIPPED WINDOW RETURN from {source_note}, "
+              f"c={clip_c:g} N={window} gamma={spec.gamma:g} -> "
+              f"{int(g_ok.sum())}/{g_ok.size} windows in [-1, 0], median G "
+              f"{np.median(g[g_ok]):.4f}, "
+              f"{100 * float((g[g_ok] <= -0.999).mean()):.1f}% saturated at -1")
+    else:
+        g, g_ok = adv_mod.normalized_returns(
+            r, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
+            gamma=float(spec.gamma), tail_chunks=tail_chunks)
+        meta_out["quality_range"] = (0.0, 1.0)
+        print(f"[fit] quality target from {source_note}: {int(g_ok.sum())}/{g_ok.size} "
+              f"windows, median G {np.median(g[g_ok]):.4f}, "
+              f"spec {'FITTED' if not spec.is_bootstrap else 'BOOTSTRAP'}")
     lab["chunk_reward"], lab["g"], lab["g_valid"] = r, g, g_ok
-    print(f"[fit] quality target from track_err_prev: {int(g_ok.sum())}/{g_ok.size} "
-          f"windows, median G {np.median(g[g_ok]):.4f}, "
-          f"spec {'FITTED' if not spec.is_bootstrap else 'BOOTSTRAP'}")
-    return W, {"cols": E, "attrs": ea, "ep_terrain": ep_terrain}, lab
+    # `lab` is row-indexed by the caller; anything in it must be a per-window array of the
+    # same length, or the index raises (a string) or silently truncates (a short array).
+    n_rows = W["episode_uid"].shape[0]
+    bad = {k: type(v).__name__ for k, v in lab.items()
+           if not isinstance(v, np.ndarray) or v.shape[0] != n_rows}
+    if bad:
+        raise SystemExit(
+            f"[fit] `lab` must hold only per-window arrays of length {n_rows}; got {bad}. "
+            "Metadata belongs in the returned meta dict -- `lab` is boolean-indexed twice "
+            "downstream, so a scalar there raises and a short array truncates silently.")
+    return W, {"cols": E, "attrs": ea, "ep_terrain": ep_terrain, **meta_out}, lab
+
+
+def _reward_sidecar(path: str, episode_uid: np.ndarray, replan_index: np.ndarray,
+                    column: str = "reward") -> tuple[np.ndarray, np.ndarray, dict]:
+    """Per-window reward read from a sidecar and joined on ``(episode_uid, replan_index)``.
+
+    **Joined by KEY, never by position.** The sidecar is written from a random subset of the
+    rollout's rows and this table has already had its post-latch windows dropped, so the two
+    orders have no reason to agree -- and a positional join would silently pair each window
+    with some other window's reward, producing a critic fitted on a shuffled target that
+    trains without complaint.
+
+    Args:
+        path: The ``.npz`` written by ``inspect_terrain_reward.py --stage reward``.
+        episode_uid: ``[W]`` this table's episode ids.
+        replan_index: ``[W]`` this table's re-plan indices.
+        column: Which sidecar column to read -- ``"reward"`` for the bounded ``exp(-p/tau)``
+            map, or ``"penalty"`` for the RAW penalty the clipped window return needs.
+
+    Returns:
+        ``(reward, valid, meta)`` -- ``[W]`` float64, ``[W]`` bool for the rows the sidecar
+        covers, and the sidecar's stamped metadata plus its ``reward_hash``.
+
+    Raises:
+        SystemExit: If the sidecar covers none of these windows, which means it was written
+            for a different rollout.
+    """
+    d = np.load(path, allow_pickle=False)
+    meta = json.loads(str(d["meta_json"]))
+    meta["reward_hash"] = str(d["reward_hash"])
+    key = (d["episode_uid"].astype(np.int64) << np.int64(20)) + d["replan_index"].astype(
+        np.int64)
+    want = (episode_uid.astype(np.int64) << np.int64(20)) + replan_index.astype(np.int64)
+    order = np.argsort(key)
+    pos = np.searchsorted(key[order], want)
+    pos_clipped = np.clip(pos, 0, key.size - 1)
+    hit = key[order][pos_clipped] == want
+    reward = np.zeros(want.size, dtype=np.float64)
+    reward[hit] = d[column].astype(np.float64)[order][pos_clipped[hit]]
+    if not hit.any():
+        raise SystemExit(
+            f"{path} covers none of this rollout's windows -- it was written for "
+            f"{meta.get('rollout')!r}. A critic fitted on an empty join would train on "
+            "nothing but zeros.")
+    print(f"[fit] reward sidecar {os.path.basename(path)}: source "
+          f"{meta.get('reward_source')!r}, hash {meta['reward_hash']}, column {column!r}, "
+          f"covers {int(hit.sum())}/{hit.size} windows ({100 * hit.mean():.1f}%), median "
+          f"{np.median(reward[hit]):.4f}")
+    return reward, hit, meta
 
 
 def _tracking_spec_from(episode_attrs: dict):
@@ -407,6 +504,8 @@ def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
 def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: float,
          device, label: str, scan_hw, wb=None, val_tile=None,
          quality_bins: int = 0, quality_weight: float = 1.0,
+         quality_kind: str = "two_hot", quality_range: tuple[float, float] = (0.0, 1.0),
+         quality_only: bool = False,
          goal_context: bool = True) -> tuple[value.FlowValueModel, np.ndarray]:
     """Train one variant and return it plus held-out ``P(fail)``.
 
@@ -424,6 +523,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         proprio_steps=(int(W["proprio"].shape[1]) if priv else 0),
         context_dim=value.context_width(privileged=priv, goal_context=goal_context),
         quality_bins=int(quality_bins),
+        quality_kind=str(quality_kind),
+        quality_range=tuple(quality_range),
     ).to(device)
     opt = torch.optim.AdamW(model.trainable_parameters(), lr=lr, weight_decay=1e-4)
     lossf = torch.nn.BCEWithLogitsLoss()
@@ -441,7 +542,11 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
               f"(median G {np.median(lab['g'][lab['g_valid']]):.3f})")
     tr = np.flatnonzero(train)
     rng = np.random.default_rng(0)
+    # Under quality_only the survival head is never trained, so its AUC is a coin flip and
+    # cannot select a model. Select on the fold's own validation quality error instead --
+    # lower is better, hence the sign flip so one comparison serves both modes.
     best_state, best_auc, best_epoch, last_auc = None, -1.0, 0, float("nan")
+    select_name = "val quality MSE" if quality_only else "val AUC"
     for ep in range(epochs):
         model.train()
         rng.shuffle(tr)
@@ -452,13 +557,22 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
             xb = _batch(ctx, W, j, priv, device, scan_hw,
                         goal_context=goal_context)
             fail_logit, q_logits = model.heads(xb)     # ONE encoder pass for both heads
-            loss = lossf(fail_logit, y[j])
+            # QUALITY ONLY drops the survival term outright rather than down-weighting it.
+            # A tiny weight would still shape the shared encoder while producing a p_fail
+            # nobody should read; zero makes the head's uselessness total and checkable.
+            loss = (torch.zeros((), device=device) if quality_only
+                    else lossf(fail_logit, y[j]))
             if use_q and q_logits is not None:
                 jt = torch.as_tensor(j, device=device)
                 m = g_ok[jt]
                 if bool(m.any()):
-                    loss = loss + float(quality_weight) * value.quality_loss(
-                        q_logits[m], g_t[jt][m], model.quality_support)
+                    # MSE regresses the scalar head straight onto the return; the two-hot
+                    # path is unchanged and is the A/B control.
+                    q_term = (value.quality_mse_loss(q_logits[m], g_t[jt][m])
+                              if model.quality_kind == "mse"
+                              else value.quality_loss(q_logits[m], g_t[jt][m],
+                                                      model.quality_support))
+                    loss = loss + float(quality_weight) * q_term
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     f"[{label}] the loss went non-finite on epoch {ep + 1}. Before this "
@@ -474,7 +588,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         # 51 bins, and the second term's floor is the target's own entropy rather than zero --
         # so it reads ~3.4 where the survival-only loss reads ~0.31, and calling it "BCE"
         # invites reading a working two-head fit as a broken one.
-        name = "loss (BCE + quality CE)" if use_q else "BCE"
+        name = ("quality MSE only" if quality_only
+                else ("loss (BCE + quality CE)" if use_q else "BCE"))
         print(f"  [{label}] epoch {ep + 1}/{epochs}  train {name} {bce:.4f}")
         log = {f"{label}/train_{'loss' if use_q else 'bce'}": bce, f"{label}/epoch": ep + 1}
         y_np = lab["failed"]
@@ -497,16 +612,43 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                 # matters.
                 jq = j[lab["g_valid"][j]]
                 if jq.size:
-                    qg = value_gates.return_gates(
-                        _predict_quality(model, ctx, W, jq, priv, device, scan_hw,
-                                         batch, goal_context=goal_context),
-                        lab["g"][jq])
+                    q_hat = _predict_quality(model, ctx, W, jq, priv, device, scan_hw,
+                                             batch, goal_context=goal_context)
+                    qg = value_gates.return_gates(q_hat, lab["g"][jq])
                     log.update({f"{label}/{scope}/q_r2": qg["r2"],
                                 f"{label}/{scope}/q_rho": qg["rho"],
                                 f"{label}/{scope}/q_rmse": qg["rmse"]})
                     print(f"      {scope} quality r2 {qg['r2']:+.3f}  rho {qg['rho']:.3f} "
                           f"(shuffled {qg['rho_shuffled']:+.3f})  rmse {qg['rmse']:.4f}  "
                           f"pred_sd {qg['pred_std']:.3f} vs target_sd {qg['target_std']:.3f}")
+                    # And the DIFFERENCE gates, which are what an advantage actually uses.
+                    # `return_gates` above scores the LEVEL, and the two are different
+                    # questions: measured on the v2 critic, pointwise rho 0.809 against
+                    # 0.590 for the 8-step difference, with the predicted change 1.9x larger
+                    # than the real one. Printed here because it was only ever found by hand,
+                    # and `--n` on label_advantage is the knob it argues about.
+                    dg = value_gates.difference_gates(
+                        q_hat, lab["g"][jq], W["episode_uid"][jq], W["replan_index"][jq])
+                    if dg:
+                        cells = "  ".join(
+                            f"n{n}: rho {r['rho']:+.3f} ratio {r['ratio']:.2f}"
+                            for n, r in sorted(dg.items()))
+                        print(f"      {scope} quality DIFFERENCES  {cells}"
+                              "     (ratio = sd(predicted change) / sd(real change);"
+                              " >1 inflates every advantage)")
+                        log.update({f"{label}/{scope}/dq_rho_n{n}": r["rho"]
+                                    for n, r in dg.items()})
+                        log.update({f"{label}/{scope}/dq_ratio_n{n}": r["ratio"]
+                                    for n, r in dg.items()})
+            if quality_only and scope == "val_seen_tiles":
+                # -MSE, so "higher is better" holds for both selection criteria.
+                jq = j[g_ok.cpu().numpy()[j]] if use_q else j
+                a = (-float(np.mean((_predict_quality(
+                    model, ctx, W, jq, priv, device, scan_hw, batch,
+                    goal_context=goal_context) - lab["g"][jq]) ** 2))
+                     if jq.size else float("nan"))
+                log[f"{label}/{scope}/quality_mse"] = -a
+                print(f"      {scope} quality MSE {-a:.5f}")
             if scope == "val_seen_tiles" and np.isfinite(a):
                 last_auc = a
                 if a > best_auc:
@@ -520,8 +662,9 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         # unseen-TILE score is the generalisation measure and must not also be the selection
         # criterion, or it stops being a holdout. With folds every window gets scored by a
         # model that did not train on it, so this split costs nothing.
-        print(f"  [{label}] restoring epoch {best_epoch} (val AUC {best_auc:.3f} against "
-              f"{last_auc:.3f} at the end)")
+        shown = (abs(best_auc), abs(last_auc)) if quality_only else (best_auc, last_auc)
+        print(f"  [{label}] restoring epoch {best_epoch} ({select_name} {shown[0]:.5f} "
+              f"against {shown[1]:.5f} at the end)")
         model.load_state_dict(best_state)
     model.eval()
     out = np.zeros(W["episode_uid"].size, dtype=np.float64)
@@ -585,6 +728,34 @@ def main() -> int:
                         "being confirmed, not the fit going wrong. The context token keeps "
                         "the base twist, so it does not disappear: V_priv goes 9 -> 6 wide "
                         "and V_onboard 6 -> 3.")
+    p.add_argument("--quality_only", action="store_true",
+                   help="train ONLY the quality (terrain reward) head -- the survival BCE is "
+                        "dropped from the loss entirely. The p_fail head is then UNTRAINED, "
+                        "so its predictions and every survival gate are meaningless; they "
+                        "are skipped and the fact is stamped into predictions.npz, and "
+                        "label_advantage refuses to use them.")
+    p.add_argument("--quality_kind", default="two_hot", choices=("two_hot", "mse"),
+                   help="how the quality head is fitted. 'two_hot' is the distributional "
+                        "head every existing checkpoint uses; 'mse' regresses a SCALAR head "
+                        "onto the return. The two share no parameters, so a checkpoint "
+                        "fitted under one cannot load as the other.")
+    p.add_argument("--clip_c", type=float, default=0.0,
+                   help="clip constant c for the reward spec r = -min(p, c). Non-zero "
+                        "switches the quality target to the CLIPPED WINDOW RETURN over "
+                        "--window chunks, normalized into [-1, 0], with post-termination "
+                        "chunks filled with -c. Needs --reward_npz (it reads the raw "
+                        "penalty). 2 to 3 is the measured range and the choice inside it is "
+                        "INSENSITIVE: the terrain penalty is bimodal (p95 1.72, p97 18.2, "
+                        "p99 39.0), so almost nothing lands between them and c=2 vs c=3 "
+                        "moves the saturating fraction only 4.67% -> 4.13%.")
+    p.add_argument("--window", type=int, default=3,
+                   help="chunks in the clipped-window return. Start short (2-4) and lengthen "
+                        "only if per-mode advantage separation improves.")
+    p.add_argument("--reward_npz", default="",
+                   help="per-window reward sidecar to fit the QUALITY head on instead of the "
+                        "tracking error (from inspect_terrain_reward.py --stage reward). The "
+                        "source name and its hash are stamped into predictions.npz so "
+                        "label_advantage can refuse to mix two rewards.")
     p.add_argument("--tail_chunks", type=int, default=1,
                    help="Trailing chunks the QUALITY target's non-failure tail averages. The "
                         "tail carries a median 52%% of G on a survived episode, so resting it "
@@ -616,7 +787,15 @@ def main() -> int:
     stem = args.stem[:-3] if args.stem.endswith(".h5") else args.stem
     stem = stem[:-9] if stem.endswith(".episodes") else stem
     strict_failure = args.failure_rule == "strict"
-    W, E, lab = _load(stem, args.max_windows, int(args.tail_chunks), strict_failure)
+    if args.quality_kind == "mse" and int(args.quality_bins) == 0:
+        # `quality_bins` is what creates the head at all, so leaving it 0 under --quality_kind
+        # mse would fit the survival head alone and report nothing about it.
+        print("[fit] --quality_kind mse implies a quality head; setting --quality_bins 1 "
+              "(the MSE head has ONE output regardless of the bin count).")
+        args.quality_bins = 1
+    W, E, lab = _load(stem, args.max_windows, int(args.tail_chunks), strict_failure,
+                      reward_npz=args.reward_npz, clip_c=float(args.clip_c),
+                      window=int(args.window))
     print(f"[fit] failure rule: {args.failure_rule} "
           + ("(fall crossing OR strict tracking violation)" if strict_failure
              else "(the FALL ALONE -- MuJoCo's rule; the tracking violation is ignored)")
@@ -746,6 +925,9 @@ def main() -> int:
             model, p_k = _fit(ctx, W, lab, tr_k, va_k,
                               quality_bins=int(args.quality_bins),
                               quality_weight=float(args.quality_weight),
+                              quality_kind=str(args.quality_kind),
+                              quality_range=tuple(E.get("quality_range", (0.0, 1.0))),
+                              quality_only=bool(args.quality_only),
                               goal_context=bool(args.goal_context),
                               priv=priv, epochs=args.epochs,
                               batch=args.batch, lr=args.lr, device=args.device,
@@ -824,10 +1006,13 @@ def main() -> int:
         seen_scope = (~val_tile) if len(folds) > 1 else val_ep
         for scope, mask in (("val_seen_tiles", seen_scope), ("val_UNSEEN_tiles", val_tile)):
             print(f"  -- {scope} --")
-            results[label][scope] = _gates(p_all, lab, W, mask)
+            results[label][scope] = _gates(p_all, lab, W, mask,
+                                           quality_only=bool(args.quality_only))
         if wb is not None:
             for scope in ("val_seen_tiles", "val_UNSEEN_tiles"):
                 r = results[label][scope]
+                if r.get("quality_only"):
+                    continue           # nothing here describes a fitted head
                 lead = r["lead_to_fall"]["lead"]
                 good = np.isfinite(lead)
                 wb.log({
@@ -844,6 +1029,9 @@ def main() -> int:
                 })
         a_seen = results[label]["val_seen_tiles"]["auc"]
         a_new = results[label]["val_UNSEEN_tiles"]["auc"]
+        if a_seen is None or a_new is None:
+            print("  generalisation gap: n/a (survival gates skipped under --quality_only)")
+            continue
         print(f"  generalisation gap (seen - unseen tiles): {a_seen - a_new:+.3f}"
               + ("   <-- large: the critic is reading the TILE, not the state"
                  if a_seen - a_new > 0.10 else ""))
@@ -867,6 +1055,20 @@ def main() -> int:
              # -- and so the shift out of `track_err_prev` is undone exactly once, here.
              chunk_reward=lab["chunk_reward"], g=lab["g"], g_valid=lab["g_valid"],
              gamma=float(track_spec.gamma),
+             # WHICH reward this critic's quality head was fitted on. Stamped so an advantage
+             # can never difference a G built from one reward against a baseline fitted on
+             # another -- that mismatch is dimensionally plausible and numerically nonsense.
+             reward_source=str(E.get("reward_source", "track_err")),
+             reward_hash=str(E.get("reward_hash", "")),
+             # The target SPEC and whether the SURVIVAL head was trained at all. Both are
+             # stamped because an advantage must not be formed against a baseline fitted on a
+             # differently-shaped return, and because an UNTRAINED p_fail still produces
+             # numbers that look exactly like predictions. Range matters as much as source:
+             # [0, 1] and [-1, 0] are both plausible-looking.
+             quality_only=bool(args.quality_only),
+             quality_kind=str(args.quality_kind),
+             quality_range=np.asarray(E.get("quality_range", (0.0, 1.0)), np.float64),
+             clip_c=float(args.clip_c), window=int(args.window),
              **{f"p_{k}": v for k, v in preds.items()},
              **{f"q_{k}": v for k, v in qpreds.items()})
     if wb is not None:
@@ -891,7 +1093,7 @@ def _jsonable(o):
     raise TypeError(f"not JSON-serialisable: {type(o)}")
 
 
-def _gates(p_all, lab, W, val) -> dict:
+def _gates(p_all, lab, W, val, quality_only: bool = False) -> dict:
     """Run the three gates on the held-out split and print them."""
     uids, ix = W["episode_uid"], W["replan_index"]
     y = lab["failed"]
@@ -908,6 +1110,21 @@ def _gates(p_all, lab, W, val) -> dict:
     lead_end = value_gates.lead_time(p_all[m], uids[m], ix[m], y[m])
     lead_fall = value_gates.lead_time(p_all[m], uids[m], ix[m], y[m], reference=ref[m])
 
+    if quality_only:
+        # Every number below reads the SURVIVAL head, which a quality_only fit never trained.
+        # An unfitted sigmoid still produces an AUC (nan or ~0.5), an ECE (~0.49) and a lead
+        # time, and they are indistinguishable in print from a badly-calibrated real critic.
+        # This file already carries the lesson: "a number produced by a broken fit is worse
+        # than no number."
+        print("    survival gates SKIPPED (--quality_only: the p_fail head was never "
+              "trained, so its AUC / ECE / lead time describe an unfitted sigmoid). The "
+              "quality head's own diagnostics are the per-epoch dq_rho / dq_ratio above.")
+        # Same KEYS as the real return, so every consumer's lookup still resolves; the
+        # values are None so nothing can mistake them for measurements.
+        return {"quality_only": True, "auc": None, "calibration": None,
+                "auc_by_phase": None,
+                "lead_to_end": {"lead": np.full(1, np.nan)},
+                "lead_to_fall": {"lead": np.full(1, np.nan)}}
     print(f"    aggregate AUC {value_gates.auc(p_all[m], y[m]):.3f}   "
           f"ECE {cal['ece']:.3f}  MCE {cal['mce']:.3f}")
     print("    AUC by phase: " + "  ".join(

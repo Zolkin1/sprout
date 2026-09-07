@@ -1,0 +1,66 @@
+#!/bin/bash
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# box2_quick -- the ~30 minute two-box comparator.
+#
+# 2 approach distances x 3 speeds instead of the full 5 x 6, with every episode concentrated
+# on the two tiles rather than spread over five, so a short run still reaches n ~ 700 per
+# cell. The tile GEOMETRY is identical to the full grid's, so a box2_quick cell and a
+# full-grid cell at the same (distance, speed) are the same course and are directly
+# comparable -- which is what lets a quick run be scored against the full-grid parent
+# baseline instead of needing its own control.
+#
+#   distances  1.50 m, 3.00 m   -- the two where the first fine-tune moved most
+#   speeds     0.83, 1.17, 1.50 -- around the parent's peak, i.e. the highest base rates,
+#                                  which is where a fixed episode budget has the most power
+#
+# WHAT IT CAN AND CANNOT RESOLVE. At ~700 episodes/cell the per-cell 95% interval is about
+# +-0.027 and the pooled one about +-0.015. So this is a TRIAGE instrument: it separates
+# "clearly better/worse" from "no big effect". It cannot resolve the ~+0.008 that the full
+# grid measured for filtered BC, and a null here is not evidence of no effect -- run the full
+# grid for that.
+#
+# Usage:
+#   scripts/rsl_rl/run_box2_quick_eval.sh <fm_checkpoint> <out_tag> [episodes_per_speed]
+#
+# Example:
+#   scripts/rsl_rl/run_box2_quick_eval.sh logs/box2/awr_b1.0_w0/best.pt awr_b1.0
+set -u
+FM=${1:?usage: run_box2_quick_eval.sh <fm_checkpoint> <out_tag> [episodes_per_speed]}
+TAG=${2:?usage: run_box2_quick_eval.sh <fm_checkpoint> <out_tag> [episodes_per_speed]}
+NEPS=${3:-1400}
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$ROOT"
+export PYTHONPATH=source/robot_rl:source/motion_gen
+TRK=2026-08-20_16-36-10_mode11_decor_plan_v1
+CLIP=clips/box2_quick_train.h5
+GR=logs/box2/goal_regions.json
+OUT=logs/box2/quick/$TAG
+NENV=384
+#: The distances box2_quick's tiles were built at, in TILE ORDER. The report needs them
+#: because `terrain_id` is a tile index: 3.00 m is tile 1 here and tile 3 in the full grid.
+DISTS="1.5 3.0"
+
+[ -f "$FM" ] || { echo "no such checkpoint: $FM" >&2; exit 2; }
+[ -f "$CLIP" ] || { echo "missing $CLIP -- build it with: python scripts/rsl_rl/make_box2_terrain.py \
+--out_dir clips --prefix box2_quick --train_distances $DISTS --like clips/g1_mb_v5_body_mode11_decor.h5" >&2; exit 2; }
+
+mkdir -p "$OUT"
+echo "[quick] $TAG  fm=$FM  $NEPS episodes/speed  -> $OUT"
+for spd in 0.83 1.17 1.50; do
+  d="$OUT/train_v${spd}"
+  if [ -f "$d/rollout_${TRK}.episodes.h5" ]; then echo "[quick] SKIP $spd (exists)"; continue; fi
+  echo "[quick] speed $spd  $(date +%H:%M)"
+  ./env_isaaclab/bin/python scripts/rsl_rl/record_rollouts.py \
+    --task=G1-box2-finetune --load_run "$TRK" --fm_checkpoint "$FM" \
+    --clip "$CLIP" --clip_device cpu --goal_regions "$GR" \
+    --num_envs $NENV --num_episodes "$NEPS" --no_windows \
+    --output_dir "$d" \
+    env.commands.traj_ref.freeform_speed_min=$spd \
+    env.commands.traj_ref.freeform_speed_max=$spd \
+    env.episode_length_s=40.0 \
+    > "$d.log" 2>&1 || { echo "[quick] speed $spd FAILED, see $d.log" >&2; exit 1; }
+done
+echo "[quick] done $(date +%H:%M)"
+./env_isaaclab/bin/python scripts/rsl_rl/box2_ic_report.py "$OUT" --distances $DISTS

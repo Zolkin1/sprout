@@ -163,6 +163,25 @@ class FinetunePPORunnerCfg(PPORunnerCfg):
     grid to exactly that (see the eval README on ``stage_grid`` forwarding).
     """
 
+    load_critic = False
+    """Skip restoring ``critic_state_dict``; ``play.py`` honours this.
+
+    The free-form tasks build a DIFFERENT critic group from any teacher the actor came from
+    -- a clip-free library has no clip terms to observe, so the critic is 1961 wide here
+    against 2533 in the `model_*_padded.pt` checkpoints -- while the ACTOR's groups are
+    identical. Loading the critic therefore couples `play.py` to a width that has nothing to
+    do with what it is about to run, and it failed outright: `size mismatch for mlp.0.weight
+    ... [1024, 2533] vs [1024, 1961]`, before a single frame was drawn.
+
+    `record_rollouts.py` already passes `load_cfg={"critic": False}` unconditionally and
+    documents the same numbers, so this makes the viewer agree with the recorder rather than
+    be the one entry point that cannot open these tasks. Actor weights are still loaded
+    STRICTLY, so a genuine policy mismatch fails as loudly as before.
+
+    A plain attribute rather than a field of the rsl-rl base cfg, which has no such knob --
+    so it cannot be set from the hydra CLI and has to live here.
+    """
+
     algorithm = AuxPpoAlgorithmCfg(**{
         **_PPO_KWARGS,
         # Critic-only iterations before the actor is released. Long enough for the value loss

@@ -2,9 +2,10 @@
 
 """Fine-tune a trained flow-matching generator on its own rollouts.
 
-Three modes, differing only in WHERE the "which chunks are good" judgement enters.  All three
+Four modes, differing only in WHERE the "which chunks are good" judgement enters.  All four
 train the model to reproduce chunks it emitted itself, using the SAME supervised
-flow-matching objective it was pretrained with, and none touches the loss or the sampler:
+flow-matching objective it was pretrained with, and only AWR touches the loss (as a
+per-sample weight; the objective is unchanged) -- none touches the sampler:
 
 * **advantage-conditioned** (``--labels``) -- every chunk is kept and its label
   (``label_advantage.py``) is fed to the model as conditioning.  At inference the label is
@@ -15,6 +16,30 @@ flow-matching objective it was pretrained with, and none touches the loss or the
 * **filtered BC on a pre-filtered rollout** (``--unconditioned``) -- the selection already
   happened upstream (e.g. ``merge_selected.py``: the critic chose the chunk AND its episode
   succeeded), so there is no sidecar to point at and nothing to condition on.
+* **AWR** (``--labels --awr_beta B``) -- every LABELLED chunk is kept and its loss scaled by
+  ``exp(A / beta)``, so the judgement is a continuous weight instead of a hard keep/drop.
+  Plain architecture, like the filtered arms.  It is a strict generalisation of both
+  neighbours rather than a fourth unrelated idea, which is what makes a ``beta`` sweep worth
+  running: as ``beta -> inf`` the weights go uniform and AWR IS unweighted BC over every
+  labelled row.  The reported **ESS** is what says where on that line a given run actually
+  sat, and it is not inferable from ``beta`` alone.
+
+  **The SHARP end depends on ``--awr_normalize``, and the default does not reach filtered
+  BC.**  Under ``batch`` (the standard AWR estimator) the loss is self-normalized inside
+  each batch, so every batch contributes a full-size step no matter how small its weights
+  are: the realized effective sample size floors at about ``n / (batch / 2)`` and
+  ``beta -> 0`` converges to BEST-OF-BATCH.  Measured at n = 20k / B = 128, the reported ESS
+  falls 346 -> 17 -> 5 over beta 0.25 / 0.10 / 0.05 while the realized one holds at
+  580 / 327 / 312 -- so below beta ~0.1 the printed number keeps collapsing and the update
+  stops changing.  ``--awr_normalize global`` is the arm whose sharp limit really is
+  filtered BC at a shrinking percentile.
+
+  **The advantage is centered within the cell the label was cut in** (``--awr_center
+  stratum``, the default).  ``binarize`` takes its percentile INSIDE ``family x progress x
+  speed`` precisely so the keep-set is free of the between-cell offset; a weight built on
+  the raw advantage puts that offset straight back, upweighting whole speed bins instead of
+  chunks within them.  Measured on a synthetic two-cell case with a 3-sigma offset and equal
+  spreads, the high cell takes 84.1% of all weight uncentered against 49.9% centered.
 
 Three properties make this safe to run against a shipped checkpoint:
 
@@ -86,8 +111,11 @@ from robot_rl.flow_matching.config import FlowMatchingConfig  # noqa: E402
 from robot_rl.flow_matching.ema import WeightEMA  # noqa: E402
 from robot_rl.flow_matching.flow import flow_matching_loss, sample_trajectory  # noqa: E402
 from robot_rl.flow_matching.model import FlowMatchingTransformer  # noqa: E402
+from robot_rl.flow_matching.critic_eval import (  # noqa: E402
+    effective_sample_size, stratified_awr_weights,
+)
 from robot_rl.flow_matching.rollout_dataset import (  # noqa: E402
-    RolloutWindowDataset, join_labels,
+    RolloutWindowDataset, join_labels, join_values,
 )
 
 #: The state-dict keys the conversion adds, per injection mode.  Anything else missing means
@@ -98,6 +126,32 @@ _NEW_KEYS = {
     # the prefix does.
     "prefix_token": {"advantage_emb.weight", "advantage_type"},
 }
+
+
+def is_plain_arm(args) -> bool:
+    """Whether this run trains the PLAIN architecture -- no advantage embedding.
+
+    **One definition, called twice.**  ``main`` uses it to decide what to BUILD and ``_save``
+    to decide what to STAMP, and those two must agree or the artifact describes an
+    architecture its own weights do not have: ``load_fm_context`` then builds the conditioned
+    model and ``load_state_dict`` fails on a missing ``advantage_emb.weight``, at load time,
+    in whatever consumer picks the checkpoint up.
+
+    That is not hypothetical -- ``_save`` used to RESTATE the rule "so this stamp can never
+    disagree with the architecture main built", which made it a second copy that then went
+    out of date the moment AWR was added as a third plain arm.  Every AWR checkpoint written
+    before this was stamped ``advantage_cond=True`` over plain weights and could not be
+    loaded at all.
+
+    Args:
+        args: The parsed command line.
+
+    Returns:
+        True for the label-filtered, unconditioned and AWR arms; False for the
+        advantage-conditioned one, which is the only arm that grows an embedding.
+    """
+    return (bool(args.filter_label) or bool(args.unconditioned)
+            or float(args.awr_beta) > 0.0)
 
 
 def _rollout_history_from(path: str) -> str:
@@ -282,7 +336,7 @@ def main() -> int:
                         "flow-time embedding (zero-init, conversion exactly inert, ONNX "
                         "shapes unchanged) and is MEASURED INADEQUATE here -- across 1x/50x "
                         "embedding lr and a 10x whole-model lr it moved the served window by "
-                        "0.3-0.7% of ordinary sampling noise. `prefix_token` gives the label "
+                        "0.3-0.7%% of ordinary sampling noise. `prefix_token` gives the label "
                         "its own token in the conditioning prefix, with its own attention "
                         "weights per layer, so it can modulate WHICH conditioning is attended "
                         "to; it grows prefix_len by 1, so its exported graph is not "
@@ -361,15 +415,58 @@ def main() -> int:
                         "out) from 'this fine-tuning setup moves nothing', because here there "
                         "is no label pathway left to blame. Requires --labels for the sidecar; "
                         "the model architecture is left exactly as the pretrained one.")
-    p.add_argument("--ckpt_every", type=int, default=0,
-                   help="Also write ckpt_<epoch>.pt every N epochs. 0 (default) keeps only "
-                        "last.pt and best.pt, which between them preserve about one point on "
-                        "the curve: last.pt is overwritten every epoch and best.pt tracks "
-                        "val_flow_mse, which on an already-filtered set declines about "
-                        "monotonically. Set it whenever the checkpoint that matters will be "
-                        "chosen by something OTHER than the training losses -- a closed-loop "
-                        "eval peaks and decays where no loss here says it does, and "
-                        "recovering an interior epoch afterwards means retraining the arm.")
+    p.add_argument("--ckpt_every", type=int, default=2,
+                   help="Also write ckpt_<epoch>.pt every N epochs. DEFAULT 2, because the "
+                        "checkpoint that matters here is chosen by something OTHER than the "
+                        "training losses: a closed-loop eval peaks and decays where no loss "
+                        "in this script says it does, and last.pt (overwritten every epoch) "
+                        "plus best.pt (val_flow_mse, which on an already-filtered set "
+                        "declines about monotonically) preserve about ONE point on the "
+                        "curve between them. Recovering an interior epoch afterwards means "
+                        "retraining the arm, so the default keeps them rather than making "
+                        "that the thing you had to remember. 0 turns it off.")
+    p.add_argument("--awr_beta", type=float, default=0.0,
+                   help="ADVANTAGE-WEIGHTED REGRESSION. Every labelled chunk is kept and its "
+                        "loss is scaled by exp(A/beta), instead of the top-percentile subset "
+                        "being kept at weight 1 and the rest dropped (--filter_label). "
+                        "Smaller beta is sharper; in the hot limit AWR IS unweighted BC on "
+                        "every labelled row, so a beta sweep brackets both baselines. Needs "
+                        "--labels for the sidecar's continuous `advantage` column, and uses "
+                        "the PLAIN architecture like --filter_label -- the advantage steers "
+                        "the update, it is not fed to the model. 0 (default) is off.")
+    p.add_argument("--awr_clip", type=float, default=20.0,
+                   help="Clip each weight at this multiple of the MEAN weight, or 0 for no "
+                        "clip. Without it one row can own an update at a sharp beta. Read it "
+                        "beside the reported ESS: the clip is what stops the collapse, and "
+                        "how much mass it removes is itself a statement about the tail.")
+    p.add_argument("--awr_normalize", default="batch", choices=("batch", "global"),
+                   help="How the weights are normalized, which decides what the SHARP limit "
+                        "of AWR is. `batch` (default, the standard estimator) self-normalizes "
+                        "per batch, so beta -> 0 converges to best-of-BATCH and the realized "
+                        "ESS floors at ~n/(batch/2) however small beta goes. `global` scales "
+                        "the weights to global mean 1 and takes a plain mean, so a low-weight "
+                        "batch really does contribute less and the sharp limit IS filtered BC. "
+                        "Use `global` to bracket filtered BC; `batch` has lower gradient "
+                        "variance.")
+    p.add_argument("--awr_balance", default="cell", choices=("cell", "none"),
+                   help="Rescale each label CELL's total weight to its share of the rows. "
+                        "`cell` (default) is what makes AWR's composition match filtered "
+                        "BC's, which is the arm it is compared against: binarize keeps 30%% "
+                        "of EVERY cell so its composition equals the data's exactly, while "
+                        "centering alone leaves a wider-spread cell capturing more weight "
+                        "through its upper tail -- measured max deviation from the row "
+                        "share 0.29 points for filtered BC, 2.54 for centered AWR, ~0 with "
+                        "this on. `none` reproduces the un-balanced arm. Within-cell "
+                        "ranking is untouched either way; the trade is that `w_max` becomes "
+                        "a per-cell bound rather than a global one (~6%% overshoot).")
+    p.add_argument("--awr_center", default="stratum", choices=("stratum", "none"),
+                   help="Center the advantage within the CELL label_advantage cut in "
+                        "(family x progress x speed) before exponentiating. `stratum` (the "
+                        "default) is what keeps AWR's selection comparable to filtered BC's: "
+                        "the per-cell percentile threshold makes the label free of the "
+                        "between-cell offset, and a weight built on the RAW advantage puts "
+                        "that offset straight back -- upweighting whole speed bins rather "
+                        "than chunks within them. `none` is the unstratified control.")
     p.add_argument("--unconditioned", action="store_true",
                    help="FILTERED BC on a rollout that was ALREADY filtered on disk (e.g. "
                         "merge_selected.py's selected + successful chunks). Same plain "
@@ -437,10 +534,24 @@ def main() -> int:
     # path: every window got LABEL_NULL, the positive/negative embeddings received no
     # gradient at all, and `best_positive.pt` was still written -- a file naming a serve arm
     # that was never trained.
-    plain = bool(args.filter_label) or args.unconditioned
+    awr = float(args.awr_beta) > 0.0
+    plain = is_plain_arm(args)
     if args.unconditioned and args.filter_label:
         raise SystemExit("--unconditioned and --filter_label both ask for the plain "
                          "architecture; --filter_label already implies it. Pass one.")
+    if awr and args.filter_label:
+        raise SystemExit(
+            "--awr_beta and --filter_label are two different answers to the same question. "
+            "Filtering keeps the top percentile at weight 1 and drops the rest; AWR keeps "
+            "every labelled row at exp(A/beta). Running both would filter first and then "
+            "weight the survivors, which is neither baseline and is not what either number "
+            "would be compared against. Pass one.")
+    if awr and args.unconditioned:
+        raise SystemExit("--awr_beta needs --labels for the advantage column, and "
+                         "--unconditioned refuses --labels. Pass --awr_beta with --labels.")
+    if awr and not args.labels:
+        raise SystemExit("--awr_beta needs --labels: the weight is exp(A/beta) and the "
+                         "continuous advantage lives in the sidecar.")
     if args.unconditioned and args.labels:
         raise SystemExit(
             "--unconditioned with --labels would load a label sidecar and then ignore it. If "
@@ -458,6 +569,57 @@ def main() -> int:
         # different experiment and not the one this flag is for.
         labels = None
 
+    adv_all = strat_all = awr_stats = None
+    if awr:
+        # AWR keeps every row the sidecar could LABEL and reweights it. `LABEL_NULL` is not
+        # "advantage zero" -- it is a held-out tile (`--exclude_tile_holdout`) or a cell
+        # whose spread was below `null_spread`, i.e. rows whose advantage is either
+        # forbidden or noise. Dropping them is the same decision `--filter_label` makes by
+        # keeping only positives, so the two arms see the same universe of rows.
+        adv_all, hit = join_values(side, "advantage", uid, ridx)
+        # Counted BEFORE narrowing `keep`, but over the rows `keep` already admits -- so the
+        # filtered-BC comparison is against what that arm would keep from the SAME pool.
+        # Taken over all `n_win` rows it silently included held-out-tile positives that
+        # `--drop_tile_holdout` had already removed from this run.
+        would_filter = int((keep & (labels == label_from_name("positive"))).sum())
+        keep &= (labels != LABEL_NULL) & hit
+        print(f"[ft] AWR: keeping every LABELLED window -> {int(keep.sum())} of {n_win} "
+              f"(against {would_filter} the top-percentile filter would keep from the same "
+              f"pool)")
+        if args.awr_center == "stratum":
+            if "stratum" not in side:
+                raise SystemExit(
+                    "--awr_center stratum needs a `stratum` column and this sidecar has "
+                    f"none (it has {sorted(k for k in side)}). It was written before "
+                    "label_advantage saved the cell it cut in, and `family_code` is NOT a "
+                    "substitute -- the cut was family x progress x speed, so centering on "
+                    "the family alone leaves the between-cell offset the threshold removed. "
+                    "Re-run label_advantage.py with the same flags to regenerate it, or "
+                    "pass --awr_center none for the unstratified control.")
+            # PRESENCE IS NOT ENOUGH. `label_advantage` defaults to --progress_bins 1
+            # --speed_bins 1, and with no crossing `group_ids(fam, None)` writes a densified
+            # FAMILY CODE into `stratum` -- a perfectly valid column that centers on exactly
+            # what the message above says is not a substitute. So the sidecar's own record of
+            # what it crossed is what decides, and a family-only one is refused by name
+            # rather than accepted as "stratified".
+            n_prog = int(meta.get("progress_bins", 1) or 1)
+            n_speed = int(meta.get("speed_bins", 1) or 1)
+            if n_prog <= 1 and n_speed <= 1:
+                raise SystemExit(
+                    f"this sidecar's `stratum` is the FAMILY alone: it was written with "
+                    f"progress_bins={n_prog} and speed_bins={n_speed}, so there is no "
+                    "crossing to centre within and --awr_center stratum would report a "
+                    "stratified run that removed no between-cell offset at all. Re-run "
+                    "label_advantage.py with --progress_bins/--speed_bins (the filtered-BC "
+                    "arm you are comparing against was cut that way), or pass "
+                    "--awr_center none and read it as the unstratified arm.")
+            print(f"[ft] AWR centering within the sidecar's own cells: "
+                  f"family x {n_prog} progress x {n_speed} speed")
+            strat_all, _ = join_values(side, "stratum", uid, ridx)
+        # The label itself is NOT passed on: AWR steers the update through the weight, and
+        # also conditioning on it would be a different experiment.
+        labels = None
+
     # UNCONDITIONED for filtered BC: the architecture stays exactly the pretrained one, so
     # there is no embedding, no token, no `prefix_len` change and no serve arm -- the output
     # is a plain generator that every existing consumer loads without knowing this ran.
@@ -472,9 +634,99 @@ def main() -> int:
         print(f"[ft] --max_windows: using {args.max_windows} of {rows.size} windows")
         rows = rows[:args.max_windows]
     tr_rows, va_rows = _split_rows(uid, rows, args.val_frac, args.seed)
+
+    weight = None
+    if awr:
+        # Estimated on the TRAIN rows and applied to all of them, so `beta` is not a
+        # function of the validation split. Scattered back into a full-length, per-FILE-row
+        # array because that is what the dataset indexes with; rows outside `rows` are never
+        # read (the datasets only ever index `tr_rows` / `va_rows`) and hold 0.0 rather than
+        # NaN so the dataset's own finiteness check stays a real check.
+        if float(args.awr_clip) < 0:
+            raise SystemExit(f"--awr_clip {args.awr_clip} is negative; 0 means 'no clip' and "
+                             "a negative value would silently mean the same thing.")
+        fit_mask = np.isin(rows, tr_rows)
+        # `strata` is passed in BOTH arms: it sets the pooled within-cell sigma, so the
+        # control differs from the treatment in the centering alone rather than also in the
+        # temperature.
+        strat_sel = strat_all[rows] if strat_all is not None else None
+        if args.awr_balance == "cell" and args.awr_center == "stratum":
+            # Not a warning about a mistake -- a statement that one of these two flags is
+            # doing nothing. A per-cell mean shift is a per-cell CONSTANT factor on exp(),
+            # and rescaling each cell's total divides that factor out: measured identical to
+            # 4e-18. Left reachable so `--awr_center none --awr_balance none` is still the
+            # raw arm, but a run should not report two controls when it applied one.
+            print("[ft] note: --awr_balance cell makes --awr_center a no-op (a per-cell "
+                  "mean shift is exactly cancelled by the per-cell rescale). The balance "
+                  "is the binding control here.")
+        w_max = float(args.awr_clip) if float(args.awr_clip) > 0 else None
+        kw = dict(beta=float(args.awr_beta), strata=strat_sel, fit=fit_mask,
+                  center=(args.awr_center == "stratum"),
+                  balance=(args.awr_balance == "cell"))
+        w_sel = stratified_awr_weights(adv_all[rows], w_max=w_max, **kw)
+        # Counted against the level the clip actually settled at, over the UNCLIPPED weights.
+        # Comparing against the post-clip mean over-reported by 1.3x-4.0x as beta sharpened,
+        # because clipping lowers the very mean the threshold is stated against.
+        if w_max is not None:
+            w_raw = stratified_awr_weights(adv_all[rows], w_max=None, **kw)
+            n_clip = int((w_raw > w_sel.max() * (1 + 1e-9)).sum())
+        else:
+            n_clip = 0
+        if args.awr_normalize == "global":
+            # `flow_matching_loss` takes a plain mean in this arm, so the weights must carry
+            # a global mean of 1 or the loss scale -- and with it the effective lr -- moves
+            # with beta. Scaled on the TRAIN rows, which are the ones it averages over.
+            mu = float(w_sel[fit_mask].mean())
+            w_sel = w_sel / mu if mu > 0 else w_sel
+        weight = np.zeros(n_win, dtype=np.float64)
+        weight[rows] = w_sel
+        ess = effective_sample_size(w_sel)
+        ess_frac = ess / max(w_sel.size, 1)
+        print(f"[ft] AWR beta {args.awr_beta} (center={args.awr_center}, "
+              f"balance={args.awr_balance}, "
+              f"clip={args.awr_clip or 'none'}, normalize={args.awr_normalize}): "
+              f"ESS {ess:,.0f} of {w_sel.size:,} rows ({ess_frac:.1%})")
+        print(f"[ft]     weights: min {w_sel.min():.4g}  median {np.median(w_sel):.4g}  "
+              f"max {w_sel.max():.4g}  ({n_clip} clipped)")
+        awr_stats = {
+            "beta": float(args.awr_beta), "clip": float(args.awr_clip),
+            "center": args.awr_center, "normalize": args.awr_normalize,
+            "balance": args.awr_balance, "realised_max_over_mean":
+                float(w_sel.max() / w_sel.mean()),
+            "n_rows": int(w_sel.size), "n_clipped": n_clip,
+            "would_filter_keep": int(would_filter),
+            "ess": float(ess), "ess_frac": float(ess_frac),
+            "w_min": float(w_sel.min()), "w_median": float(np.median(w_sel)),
+            "w_max": float(w_sel.max()),
+            "progress_bins": int(meta.get("progress_bins", 1) or 1),
+            "speed_bins": int(meta.get("speed_bins", 1) or 1),
+        }
+        if args.awr_normalize == "batch":
+            # The printed ESS is a GLOBAL statistic, but the loss self-normalizes per batch,
+            # so the update's realized ESS floors at roughly n/(batch/2) however small beta
+            # goes -- measured 17 reported against 327 realized at beta 0.1, n=20k, B=128.
+            floor = w_sel.size / max(args.batch_size / 2.0, 1.0)
+            awr_stats["realized_ess_floor"] = float(floor)
+            if ess < floor:
+                print(f"[ft]     NOTE: under batch normalization the realized ESS cannot "
+                      f"fall below ~{floor:,.0f} ({floor / w_sel.size:.1%}), so the "
+                      f"{ess:,.0f} above UNDERSTATES this run. Sharpening beta further "
+                      f"moves the printed number and not the update; --awr_normalize global "
+                      f"is the arm that actually reaches filtered BC.")
+        # The number that says whether this is still AWR. As ESS falls the update is carried
+        # by fewer and fewer rows, and in the limit AWR IS filtered BC with a softer edge and
+        # a smaller sample -- the comparison the beta sweep exists to make, so it is reported
+        # rather than guarded.
+        if ess / max(w_sel.size, 1) < 0.05:
+            print("[ft]     !! under 5% ESS -- at this beta the update is carried by a tiny "
+                  "fraction of rows, which is filtered BC with extra variance rather than a "
+                  "distinct arm. Raise --awr_beta or read the result against that.")
+
     common = dict(ctx=ctx, label=labels, seed=args.seed)
-    train_ds = RolloutWindowDataset(args.rollout, tr_rows, null_prob=args.null_prob, **common)
-    val_ds = (RolloutWindowDataset(args.rollout, va_rows, null_prob=0.0, **common)
+    train_ds = RolloutWindowDataset(args.rollout, tr_rows, null_prob=args.null_prob,
+                                    weight=weight, **common)
+    val_ds = (RolloutWindowDataset(args.rollout, va_rows, null_prob=0.0,
+                                   weight=weight, **common)
               if va_rows.size else None)
     print(f"[ft] {len(train_ds)} train / {0 if val_ds is None else len(val_ds)} val windows "
           f"over {int(np.unique(uid[rows]).size)} episodes")
@@ -482,7 +734,8 @@ def main() -> int:
         print(f"[ft] train label counts (before null dropout): {train_ds.label_counts()}")
 
     if plain:
-        print("[ft] filtered BC: no conversion to verify -- the model IS the pretrained one.")
+        arm = "AWR" if awr else "filtered BC"
+        print(f"[ft] {arm}: no conversion to verify -- the model IS the pretrained one.")
     elif args.verify_identity and args.advantage_inject == "time_embed":
         worst = verify_identity(ctx, model, train_ds, device)
         print(f"[ft] conversion is identical to the parent under all {len(LABEL_NAMES)} "
@@ -605,6 +858,12 @@ def main() -> int:
             cmd_tokens=(batch["cmd_tokens"].to(device) if "cmd_tokens" in batch else None),
             history_null_mask=batch["history_null"].to(device),
             advantage=(batch["advantage"].to(device) if "advantage" in batch else None),
+            # TRAIN ONLY. `flow_mse` is unweighted either way, but weighting the val pass
+            # would make `loss` there a weighted quantity while the number actually used for
+            # checkpoint selection is not -- two different things under one name.
+            sample_weight=((batch["weight"].to(device)
+                            if "weight" in batch else None) if train else None),
+            weight_reduction=args.awr_normalize,
             # No anchor mask and no auxiliary terms: the target is the model's OWN chunk, so
             # there is no clip to be off-axis from and the consistency terms would be
             # regressing the model onto its own already-consistent output.
@@ -703,8 +962,13 @@ def main() -> int:
                               os.path.join(args.out, f"best_{name}.pt"), name)
             print(f"[ft] wrote {args.out}/best_{name}.pt")
     with open(os.path.join(args.out, "finetune.json"), "w") as f:
+        # `awr` is recorded because the module docstring's own claim is that ESS "is not
+        # inferable from beta alone" -- and `label_counts()` is empty under AWR, since the
+        # label selects nothing there. Without this the artifact states the temperature and
+        # nothing about what it did.
         json.dump({"args": vars(args), "history": history,
-                   "label_counts": train_ds.label_counts()}, f, indent=2)
+                   "label_counts": train_ds.label_counts(),
+                   "awr": awr_stats}, f, indent=2)
     if wb is not None:
         wb.finish()
     print(f"[ft] wrote {args.out}/best.pt")
@@ -761,11 +1025,11 @@ def _save(args, cfg, model, opt, ema, epoch: int, history: list, path: str) -> N
     """
     parent = torch.load(args.pretrained, map_location="cpu", weights_only=False)
     cfg = copy.deepcopy(cfg)
-    # Filtered BC produces a PLAIN generator: claiming advantage_cond would make
-    # `load_fm_context` demand a serve arm the weights cannot honour. Recomputed here rather
-    # than passed in, so this stamp can never disagree with the architecture `main` built --
-    # the one place where a mismatch is unrecoverable, since it travels in the artifact.
-    plain = bool(args.filter_label) or args.unconditioned
+    # The plain arms produce a PLAIN generator: claiming advantage_cond would make
+    # `load_fm_context` demand a serve arm the weights cannot honour. `is_plain_arm` is the
+    # SINGLE definition of that rule, shared with `main` -- restating it here is what let an
+    # AWR checkpoint be stamped as conditioned over plain weights.
+    plain = is_plain_arm(args)
     cfg.advantage_cond = not plain
     if not plain:
         cfg.advantage_inject = args.advantage_inject

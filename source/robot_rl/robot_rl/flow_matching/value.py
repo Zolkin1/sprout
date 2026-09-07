@@ -159,6 +159,24 @@ def two_hot(target: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def quality_mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Plain MSE of a SCALAR quality head against its return target.
+
+    The alternative to :func:`quality_loss`'s two-hot cross-entropy, and the two are kept side
+    by side so the choice can be A/B'd rather than argued: the distributional head trains more
+    stably in general, but it needs a declared support, and an MSE needs only that the target
+    be bounded -- which the clipped window return guarantees by construction (``[-1, 0]``).
+
+    Args:
+        pred: ``(B,)`` scalar prediction.
+        target: ``(B,)`` return target.
+
+    Returns:
+        Scalar mean squared error.
+    """
+    return torch.nn.functional.mse_loss(pred.reshape(-1), target.reshape(-1))
+
+
 def quality_loss(logits: torch.Tensor, target: torch.Tensor,
                  support: torch.Tensor) -> torch.Tensor:
     """Cross-entropy of ``logits`` against the two-hot encoding of ``target``.
@@ -197,6 +215,15 @@ class FlowValueModel(nn.Module):
         freeze_trunk: Keep the generator's weights fixed. The default, and not merely the
             cheap option: it asks the sharper question first -- is the generator's own
             representation predictive of failure -- and answers it in minutes.
+        quality_kind: ``"two_hot"`` for the distributional head (the default, and what every
+            existing checkpoint was fitted as) or ``"mse"`` for a SCALAR head regressed with
+            :func:`quality_mse_loss`.  **The two share no parameters**: ``mse`` gives the head
+            one output unit instead of ``quality_bins``, so a checkpoint fitted under one kind
+            cannot be loaded as the other -- ``load_state_dict`` catches it on the shape.
+        quality_range: ``(lo, hi)`` support for the two-hot head.  Declared, not fitted, and
+            it is a property of the REWARD: the tracking return lands in ``[0, 1]`` while the
+            clipped window return lands in ``[-1, 0]``, so the range travels with the target.
+            Ignored by ``mse``, which needs no support.
         quality_bins: Bins for the QUALITY head's distribution over the normalized tracking
             return, or 0 to omit it. 0 reproduces the survival-only model exactly, so an
             existing checkpoint loads and scores unchanged.
@@ -206,7 +233,8 @@ class FlowValueModel(nn.Module):
                  proprio_dim: int = 0, proprio_steps: int = 0, context_dim: int = 0,
                  scan_channels: Sequence[int] = (16, 32), scan_grid: tuple[int, int] = (2, 3),
                  hidden: int = 128, freeze_trunk: bool = True,
-                 quality_bins: int = 0) -> None:
+                 quality_bins: int = 0, quality_kind: str = "two_hot",
+                 quality_range: tuple[float, float] = (0.0, 1.0)) -> None:
         super().__init__()
         if getattr(fm, "attention_mode", "full") != "prefix":
             raise ValueError(
@@ -259,20 +287,31 @@ class FlowValueModel(nn.Module):
         # so sharing one query would force one compromise representation for both. One extra
         # token against a 129-token sequence.
         self.quality_bins = int(quality_bins)
+        self.quality_kind = str(quality_kind)
+        if self.quality_kind not in ("two_hot", "mse"):
+            raise ValueError(
+                f"quality_kind must be 'two_hot' or 'mse'; got {quality_kind!r}")
+        self.quality_range = (float(quality_range[0]), float(quality_range[1]))
+        if self.quality_range[0] >= self.quality_range[1]:
+            raise ValueError(f"quality_range must be (lo, hi) with lo < hi; got "
+                             f"{self.quality_range}")
         self.quality_readout = None
         self.quality_head = None
         if self.quality_bins > 0:
             self.quality_readout = nn.Parameter(torch.randn(1, 1, d) * 0.02)
             self.quality_type = nn.Parameter(torch.zeros(1, 1, d))
+            n_out = 1 if self.quality_kind == "mse" else self.quality_bins
             self.quality_head = nn.Sequential(nn.Linear(d, hidden), nn.SiLU(),
-                                              nn.Linear(hidden, self.quality_bins))
+                                              nn.Linear(hidden, n_out))
             # The support is DECLARED, not fitted, and that is a property of the reward rather
             # than a convenience: a step reward is bounded in (0, 1] because the DeepMimic
             # weights sum to 1, and the normalized return carries the (1 - gamma) factor, so
             # G lands in [0, 1] by construction. Nothing here has to track a running scale,
             # and two checkpoints fitted on different data are directly comparable.
-            self.register_buffer("quality_support",
-                                 torch.linspace(0.0, 1.0, self.quality_bins))
+            self.register_buffer(
+                "quality_support",
+                torch.linspace(self.quality_range[0], self.quality_range[1],
+                               self.quality_bins))
 
     def value_tokens(self, x: ValueInputs) -> torch.Tensor:
         """Assemble the query stream, readout FIRST.
@@ -351,7 +390,7 @@ class FlowValueModel(nn.Module):
             x: The batch.
 
         Returns:
-            ``(B, quality_bins)``.
+            ``(B, quality_bins)`` under ``two_hot``, ``(B, 1)`` under ``mse``.
 
         Raises:
             ValueError: If this model has no quality head. Not a zero fallback: a zero return
@@ -365,11 +404,16 @@ class FlowValueModel(nn.Module):
         return self.quality_head(self._encode(x)[:, 1])
 
     def quality(self, x: ValueInputs) -> torch.Tensor:
-        """``G_hat(s)`` in ``[0, 1]`` -- the expected normalized tracking return.
+        """``G_hat(s)`` -- the expected normalized return, in :attr:`quality_range`.
 
-        The distribution's MEAN over the declared support, not its argmax: the head is
-        distributional for training stability, but the selector needs a scalar to order
-        candidates by and the mean is the one that matches the regression target.
+        Under ``two_hot`` this is the distribution's MEAN over the declared support, not its
+        argmax: the head is distributional for training stability, but a selector needs a
+        scalar to order candidates by and the mean is what matches the regression target.
+
+        Under ``mse`` the head's single output IS the prediction and is returned RAW --
+        deliberately not clamped into the range. An advantage is ``G - G_hat``, so clamping
+        would bias it wherever the critic is miscalibrated, and an out-of-range prediction is
+        information about the fit rather than something to hide.
 
         Args:
             x: The batch.
@@ -377,7 +421,10 @@ class FlowValueModel(nn.Module):
         Returns:
             ``(B,)``.
         """
-        probs = torch.softmax(self.quality_logits(x), dim=-1)
+        out = self.quality_logits(x)
+        if self.quality_kind == "mse":
+            return out.reshape(out.shape[0])
+        probs = torch.softmax(out, dim=-1)
         return (probs * self.quality_support).sum(dim=-1)
 
     def p_fail(self, x: ValueInputs) -> torch.Tensor:

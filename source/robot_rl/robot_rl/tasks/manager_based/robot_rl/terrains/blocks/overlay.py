@@ -26,6 +26,8 @@ import trimesh
 
 from isaaclab.utils import configclass
 
+from motion_gen.terrain.overlay_boxes import overlay_sub_boxes
+
 
 #: The values :attr:`OverlayVolumeCfg.kind` accepts, as data rather than only as a type
 #: annotation.  ``@configclass`` does not validate a ``Literal`` at runtime, so
@@ -126,74 +128,15 @@ class OverlayOutput:
     """z of the volume's top face (``base_z + sz``); a box's walkable height."""
 
 
-# Legs poke this far up into the top slab so the concatenated mesh has no hairline
-# gap at the slab/leg seam (which would create a degenerate collider manifold).
-_LEG_SLAB_OVERLAP = 0.005
-
-
-def overlay_sub_boxes(
-    variant: str,
-    size_xyz: tuple[float, float, float],
-    pos_xy: tuple[float, float],
-    base_z: float,
-    slab_thickness: float,
-    leg_size: tuple[float, float],
-    leg_inset: float,
-) -> list[tuple[float, float, float, float, float, float]]:
-    """Decompose an overlay volume into its axis-aligned sub-boxes.
-
-    Returns a list of ``(cx, cy, cz, sx, sy, sz)`` (center + full extents), the same
-    numbers every renderer needs.  This is the **single source of truth** for the
-    box-variant geometry -- :func:`build_overlay` (IsaacLab collider / grey viser
-    mesh) and the hand-rolled ``view_clip_viser`` mesh both call it, so they cannot
-    drift apart.
-
-    The walkable top face is at ``base_z + size_xyz[2]`` for every variant; only the
-    support *below* the top changes.
-
-    Args:
-        variant: One of ``"solid"``, ``"floating"``, ``"floating_center_leg"``,
-            ``"floating_corner_legs"``.
-        size_xyz: Full box extents ``(sx, sy, sz)`` (m).
-        pos_xy: Box footprint center ``(px, py)`` (m).
-        base_z: z of the box's bottom face (m).
-        slab_thickness: Top-slab thickness for the ``floating*`` variants (m).
-        leg_size: Support-leg cross-section ``(lx, ly)`` (m).
-        leg_inset: Corner-leg inset from the footprint edge (m).
-
-    Returns:
-        List of sub-box ``(cx, cy, cz, sx, sy, sz)`` tuples.
-    """
-    sx, sy, sz = (float(v) for v in size_xyz)
-    px, py = float(pos_xy[0]), float(pos_xy[1])
-    base_z = float(base_z)
-    top_z = base_z + sz
-
-    if variant == "solid":
-        return [(px, py, base_z + sz / 2.0, sx, sy, sz)]
-
-    # Floating variants: a thin top slab (+ optional support legs beneath it).
-    slab_t = min(float(slab_thickness), sz)
-    boxes = [(px, py, top_z - slab_t / 2.0, sx, sy, slab_t)]
-    if variant == "floating":
-        return boxes
-
-    lx, ly = float(leg_size[0]), float(leg_size[1])
-    leg_h = sz - slab_t + _LEG_SLAB_OVERLAP
-    if leg_h <= 1e-6:  # slab fills the whole height; no room for legs
-        return boxes
-    leg_cz = base_z + leg_h / 2.0
-    if variant == "floating_center_leg":
-        boxes.append((px, py, leg_cz, lx, ly, leg_h))
-    elif variant == "floating_corner_legs":
-        ox = max(0.0, sx / 2.0 - float(leg_inset) - lx / 2.0)
-        oy = max(0.0, sy / 2.0 - float(leg_inset) - ly / 2.0)
-        for sxn in (-1.0, 1.0):
-            for syn in (-1.0, 1.0):
-                boxes.append((px + sxn * ox, py + syn * oy, leg_cz, lx, ly, leg_h))
-    else:
-        raise ValueError(f"unknown overlay variant {variant!r}")
-    return boxes
+#: :func:`overlay_sub_boxes` lives in ``motion_gen.terrain.overlay_boxes`` and is re-exported
+#: here so every call site that imports it from this module is unchanged.
+#:
+#: It MOVED because the decomposition of an overlay dict into solid boxes belongs to the
+#: package that WRITES the manifest, not to the one that reads it -- and because the
+#: terrain-consistency reward needs it in processes that have no IsaacLab (an offline
+#: inspector, a unit test), which importing this module cannot give them.  The vendored
+#: MuJoCo twin in ``transfer/sim/overlay_geom.py`` is unaffected and still pinned against
+#: this by ``test_clip_tile_scene.py``.
 
 
 def build_overlay(cfg: OverlayVolumeCfg) -> OverlayOutput:

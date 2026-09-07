@@ -43,6 +43,8 @@ separate.  :func:`value_traces` returns exactly that.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import numpy as np
 
 
@@ -307,6 +309,70 @@ def value_traces(p_fail: np.ndarray, episode: np.ndarray, index: np.ndarray,
 # The QUALITY head.  A regression head needs different questions from a classifier, and the
 # first one is whether it did anything at all.
 # ----------------------------------------------------------------------------------------
+def difference_gates(pred: np.ndarray, target: np.ndarray, episode: np.ndarray,
+                     index: np.ndarray, *, horizons: Sequence[int] = (1, 4, 8, 20),
+                     ) -> dict[int, dict[str, float]]:
+    """How well the value predicts its own n-step CHANGE -- not its level.
+
+    Every other gate here scores a level: ``auc`` on ``P(fail | s)``, ``return_gates`` on
+    ``Ghat`` against ``G``.  An advantage uses neither.  It uses
+    ``gamma^n * Ghat(s_{t+n}) - Ghat(s_t)``, and a critic can predict levels well while its
+    DIFFERENCES over a few steps are mostly its own noise -- the two are different questions
+    and a good answer to the first implies nothing about the second.
+
+    Measured on the box2 v2 critic, held-out rows: pointwise ``rho = 0.809`` while the 8-step
+    difference manages ``0.590``, and the predicted change is **1.9x larger than the real
+    one** (5.4x at ``n = 1``).  So the term carrying 119% of the advantage's variance is
+    roughly 62% noise, and nothing the fit printed could show it.
+
+    ``ratio`` is the diagnostic to read first.  Above 1 the value is wandering more than the
+    return does, which inflates every advantage built from it; it should fall toward 1 as
+    ``n`` grows, because a longer horizon puts more of the advantage on measured reward
+    (weight ``1 - gamma^n``) and less on this difference.
+
+    Args:
+        pred: ``[W]`` predicted value (the quality head's ``Ghat``).
+        target: ``[W]`` its realized target (``G``).
+        episode: ``[W]`` episode id -- differences are taken WITHIN an episode, since a pair
+            straddling a boundary compares two unrelated trajectories.
+        index: ``[W]`` position within the episode.
+        horizons: The ``n`` values to report.
+
+    Returns:
+        ``n -> {"n_pairs", "rho", "r", "sd_pred", "sd_target", "ratio"}``.  A horizon with
+        fewer than 2 usable pairs is omitted rather than reported as ``nan``.
+    """
+    order = np.lexsort((index, episode))
+    ep_s = episode[order]
+    starts = np.flatnonzero(np.r_[True, ep_s[1:] != ep_s[:-1]])
+    ends = np.r_[starts[1:], episode.shape[0]]
+    out: dict[int, dict[str, float]] = {}
+    for n in horizons:
+        dp, dt = [], []
+        for s, e in zip(starts, ends):
+            rows = order[s:e]
+            if rows.size <= n:
+                continue
+            dp.append(pred[rows[n:]] - pred[rows[:-n]])
+            dt.append(target[rows[n:]] - target[rows[:-n]])
+        if not dp:
+            continue
+        a, b = np.concatenate(dp), np.concatenate(dt)
+        ok = np.isfinite(a) & np.isfinite(b)
+        if int(ok.sum()) < 2:
+            continue
+        a, b = a[ok], b[ok]
+        sp, st = float(a.std()), float(b.std())
+        out[int(n)] = {
+            "n_pairs": int(a.size),
+            "rho": spearman(a, b),
+            "r": (float(np.corrcoef(a, b)[0, 1]) if sp > 0 and st > 0 else float("nan")),
+            "sd_pred": sp, "sd_target": st,
+            "ratio": (sp / st if st > 0 else float("inf")),
+        }
+    return out
+
+
 def spearman(a: np.ndarray, b: np.ndarray) -> float:
     """Rank correlation, ties averaged.
 
