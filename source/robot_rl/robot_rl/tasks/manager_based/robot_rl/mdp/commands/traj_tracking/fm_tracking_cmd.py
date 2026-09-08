@@ -600,6 +600,7 @@ class FmTrackingCommand(MotionSequenceCommand):
                 self._fm_contact_specs.append(
                     (f"{name}_contact", DEBUG_CONTACT_COLOR, kind, k))
         self._plan_collider_model = None
+        self._plan_reward_collider_model = None
         # The ribbon draws EVERY predicted node (dense), independent of the clip
         # ribbon's debug_vis_stride subsampling. It indexes _pred_window directly
         # rather than through the cursor, so it needs no offset table.
@@ -2461,6 +2462,51 @@ class FmTrackingCommand(MotionSequenceCommand):
                   f"({exc}); the ribbon will not mark contacts.")
             return None
         return self._plan_collider_model
+
+    def plan_reward_collider_model(self):
+        """The WHOLE-BODY collider model the terrain-consistency REWARD is graded on.
+
+        Not :meth:`plan_collider_model`, and the difference is not an optimisation.  That one
+        is feet-only because the contact flag reads the sole and a debug ribbon has to be cheap
+        at full env count.  The PENETRATION term sums over every collider point with a per-body
+        weight -- feet 1.0, everything else 10.0 -- so grading it on a feet-only model silently
+        charges nothing for a knee, a torso or a hand inside the terrain.
+
+        That was measured, not reasoned: against the offline grader over 3933 real re-plans the
+        feet-only reward agreed on `contact_penalty` to 1e-6 (it reads soles either way) and
+        under-read `penetration_sum_m` by 13-17x on exactly the windows where the robot had
+        fallen -- the windows a terrain reward exists to charge.  The offline grader builds the
+        full model, and the critic was fitted on ITS numbers, so this is the model that makes
+        the live reward the same quantity.
+
+        Built lazily and cached separately, so a run that only draws the ribbon never pays for
+        it.
+
+        Returns:
+            A :class:`~motion_gen.plan_geometry.PlanColliderModel` over every body carrying
+            collision geometry, or ``None`` when the window predicts no joints.
+        """
+        if self._plan_reward_collider_model is not None:
+            return self._plan_reward_collider_model
+        if "joint_pos" not in self._fm_blocks:
+            return None
+        try:
+            from motion_gen.features import DEFAULT_MJCF                    # noqa: PLC0415
+            from motion_gen.plan_geometry import PlanColliderModel          # noqa: PLC0415
+            # `body_names=None` = every body with collision geometry, matching
+            # `inspect_terrain_reward._plan_model`. Refused rather than defaulted if it
+            # fails: a feet-only fallback here is precisely the bug this method exists for.
+            self._plan_reward_collider_model = PlanColliderModel(
+                DEFAULT_MJCF, list(self.ctx.joint_names), body_names=None,
+                base_link=self.cfg.base_frame_name, dtype=torch.float32,
+            ).to(self.device)
+        except Exception as exc:
+            raise RuntimeError(
+                f"could not build the whole-body collider model for the terrain reward "
+                f"({exc}). Falling back to the feet-only model would under-read the "
+                "penetration term by 13-17x on fallen plans while reporting the same "
+                "column name.") from exc
+        return self._plan_reward_collider_model
 
     def plan_foot_contact(self):
         """Contact flags for the CURRENT plan, from sole-corner speed alone.

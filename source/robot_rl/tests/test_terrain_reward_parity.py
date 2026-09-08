@@ -139,6 +139,7 @@ def _fake_cmd(model, plan):
 
     ns = types.SimpleNamespace(
         plan_collider_model=lambda: model,
+        plan_reward_collider_model=lambda: model,
         plan_world_pose=lambda: plan,
         _env=types.SimpleNamespace(step_dt=STEP_DT),
     )
@@ -150,6 +151,7 @@ def _fake_env(cmd, terrain):
     """A stand-in exposing exactly what `_terrain_consistency` reads off the env."""
     return types.SimpleNamespace(
         common_step_counter=0,
+        step_dt=STEP_DT,
         command_manager=types.SimpleNamespace(get_term=lambda _name: cmd),
         scene=types.SimpleNamespace(
             terrain=types.SimpleNamespace(terrain_collider_boxes=lambda: terrain)),
@@ -409,3 +411,69 @@ def test_the_verifier_joins_by_key_and_not_by_position():
     for lr, sr in zip(lrows, srows, strict=True):
         assert live["episode_uid"][lr] == side["episode_uid"][sr]
         assert live["replan_index"][lr] == side["replan_index"][sr]
+
+
+def test_the_reward_grades_the_whole_body_and_the_ribbon_only_the_feet():
+    """Two collider models, deliberately, and the reward must take the WHOLE-BODY one.
+
+    ``plan_collider_model`` is feet-only so a debug ribbon stays cheap at full env count.
+    The penetration term sums over every collider point with a per-body weight -- feet 1.0,
+    everything else 10.0 -- so grading it on the feet-only model charges NOTHING for a knee or
+    a torso inside the terrain.  Measured against the offline grader over 3933 real re-plans:
+    ``contact_penalty`` agreed to 1e-6 (it reads soles either way) while
+    ``penetration_sum_m`` was under-read 13-17x on exactly the fallen windows the reward
+    exists to charge.
+
+    This is asserted on the SOURCE because building the real models needs a live command term,
+    and the unit test that was supposed to catch this originally could not: it handed a
+    whole-body model to a fake command, bypassing the feet-only builder entirely.
+    """
+    import inspect
+    import pathlib as _pl
+
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking import (
+        fm_tracking_cmd)
+    from robot_rl.tasks.manager_based.robot_rl.mdp.rewards import rewards
+
+    cmd_src = _pl.Path(inspect.getsourcefile(fm_tracking_cmd)).read_text()
+    ribbon = cmd_src[cmd_src.index("def plan_collider_model"):]
+    ribbon = ribbon[:ribbon.index("\n    def ")]
+    assert "body_names=list(FOOT_BODIES)" in ribbon, "the ribbon model is no longer feet-only"
+
+    reward_model = cmd_src[cmd_src.index("def plan_reward_collider_model"):]
+    reward_model = reward_model[:reward_model.index("\n    def ")]
+    assert "body_names=None" in reward_model, (
+        "the reward's collider model is no longer whole-body; penetration would charge only "
+        "the feet")
+
+    rw_src = _pl.Path(inspect.getsourcefile(rewards)).read_text()
+    fn = rw_src[rw_src.index("def _terrain_consistency"):]
+    fn = fn[:fn.index("\ndef ")]
+    assert "plan_reward_collider_model()" in fn, (
+        "the reward reads the feet-only model; that under-reads penetration 13-17x on fallen "
+        "plans while reporting the same column name")
+    assert "cmd.plan_collider_model()" not in fn
+
+
+def test_the_two_models_agree_on_the_contact_FLAGS(terrain):
+    """Using the whole-body model for the reward must not move the contact flags.
+
+    The reward derives contact from its own (whole-body) points so the flags and the graded
+    geometry come from one model.  That is only safe if it produces the SAME flags the
+    feet-only producer does -- both threshold the same sole points at the same spec -- which is
+    what keeps "the flag drawn is the flag graded" true across two models.
+    """
+    from motion_gen.plan_geometry import FOOT_BODIES
+
+    whole = PlanColliderModel(F.DEFAULT_MJCF, list(G1_JOINT_NAMES), dtype=torch.float64)
+    feet = PlanColliderModel(F.DEFAULT_MJCF, list(G1_JOINT_NAMES),
+                             body_names=list(FOOT_BODIES), dtype=torch.float64)
+    assert whole.num_points > feet.num_points, "the two models are the same; the split is gone"
+    for dz, x0 in PLAN_CASES:
+        plan = _make_plan(dz, x0)
+        cw = plan_contact(plan_collider_points(*plan, whole), whole, dt=STEP_DT)
+        cf = plan_contact(plan_collider_points(*plan, feet), feet, dt=STEP_DT)
+        for key in ("contact", "contact_filled", "contact_buffered", "support"):
+            assert torch.equal(cw[key], cf[key]), (
+                f"{key} differs between the whole-body and feet-only models at "
+                f"dz={dz} x0={x0}; the reward and the ribbon would disagree")

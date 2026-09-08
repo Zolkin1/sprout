@@ -255,17 +255,30 @@ def _terrain_consistency(env: ManagerBasedRLEnv, command_name: str) -> dict[str,
     if cached is not None and cached[0] == step:
         return cached[1]
 
+    from motion_gen.plan_geometry import plan_contact                   # noqa: PLC0415
+
     cmd = env.command_manager.get_term(command_name)
-    contact = cmd.plan_foot_contact()
-    if contact is None:
+    # WHOLE-BODY, not the feet-only model the ribbon uses. The penetration term sums over
+    # every collider point with a per-body weight (feet 1.0, everything else 10.0), so a
+    # feet-only model charges nothing for a knee or a torso inside the terrain -- measured at
+    # 13-17x under-read against the offline grader on exactly the fallen windows the reward
+    # exists to charge. The critic was fitted on the offline numbers, so this is the model
+    # that makes the live reward the same quantity.
+    model = cmd.plan_reward_collider_model()
+    if model is None:
         raise RuntimeError(
-            f"command {command_name!r} cannot produce plan contact flags, so the "
-            "terrain-consistency rewards have nothing to gate on -- this window predicts no "
+            f"command {command_name!r} cannot build a collider model, so the "
+            "terrain-consistency rewards have nothing to grade -- this window predicts no "
             "joint positions. Returning zeros would read as a perfect plan."
         )
-    model = cmd.plan_collider_model()
     base_pos, base_rot, joint_pos = cmd.plan_world_pose()
     points = plan_collider_points(base_pos, base_rot, joint_pos, model)
+    # Contact from the SAME points the reward grades, so the flags and the geometry cannot
+    # come from two different models. Numerically identical to `cmd.plan_foot_contact()` --
+    # both threshold the same sole points at the same spec -- and pinned as such by
+    # test_terrain_reward_parity, which is what keeps "the flag drawn is the flag graded"
+    # true across the two models.
+    contact = plan_contact(points, model, dt=float(env.step_dt))
     terrain = env.scene.terrain.terrain_collider_boxes()
     out = terrain_consistency(
         points, contact, terrain, model,
