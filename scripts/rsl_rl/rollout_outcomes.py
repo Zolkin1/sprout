@@ -590,6 +590,15 @@ def read_rollout_episodes(path: str) -> tuple[dict[str, np.ndarray], dict]:
                 f"{sorted(READABLE_SCHEMAS)}. "
                 "Re-record rather than reading it through the wrong contract.")
         for key in f.keys():
+            # DATASETS ONLY. `--terrain_reward` puts the per-chunk grade in a `chunks` GROUP
+            # inside this same file (`ChunkRewardTable.write_into`), and `f[key][...]` on a
+            # group raises `TypeError: Accessing a group is done with bytes or str, not
+            # <class 'ellipsis'>` -- so every recording graded live was unreadable through
+            # this reader, and unmergeable, while `box2_ic_report` worked because it uses
+            # h5py directly. The chunk table has its own reader (`read_rollout_chunks`);
+            # this one returns the episode COLUMNS and must skip anything that is not one.
+            if not isinstance(f[key], h5py.Dataset):
+                continue
             cols[key] = f[key][...]
         for key, raw in f.attrs.items():
             if key == "schema_version":

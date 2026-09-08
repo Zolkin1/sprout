@@ -265,3 +265,127 @@ def test_the_merge_chunks_whole_rows(tmp_path):
         assert d.chunks[1:] == d.shape[1:], (
             f"chunks {d.chunks} do not cover a whole row of shape {d.shape[1:]}; one row "
             "read would touch several chunks and decompress far more than it returns")
+
+
+# --------------------------------------------------------------------------------------
+# `--keep_manifest`: naming exactly which episodes survive, with renumbering OFF.
+# --------------------------------------------------------------------------------------
+
+
+def _manifest(path, rows) -> str:
+    """Write a minimal ``uid_space == "global"`` buffer manifest.
+
+    Args:
+        path: Destination ``.json``.
+        rows: ``(stem, uids)`` pairs.
+
+    Returns:
+        The path written, as a string.
+    """
+    import json
+    json_path = str(path)
+    with open(json_path, "w") as f:
+        json.dump({"schema": 1, "uid_space": "global",
+                   "stems": [{"stem": s, "uids": list(u)} for s, u in rows]}, f)
+    return json_path
+
+
+def test_keep_manifest_selects_exactly_the_named_episodes_without_renumbering(tmp_path):
+    """The uids on disk are the uids in the output -- that is what makes a manifest durable."""
+    mr = _load_merger()
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    _write_stem(a, n_eps=4, per_ep=2, first_uid=1000)
+    _write_stem(b, n_eps=4, per_ep=2, first_uid=2000)
+    man = _manifest(tmp_path / "buf.json", [(a, [1000, 1002]), (b, [2001, 2003])])
+    out = str(tmp_path / "out")
+    mr.merge([a, b], out, keep_manifest=man)
+
+    with h5py.File(out + ".episodes.h5", "r") as f:
+        assert sorted(f["episode_uid"][...].tolist()) == [1000, 1002, 2001, 2003]
+    with h5py.File(out + ".h5", "r") as f:
+        assert sorted(set(f["episode_uid"][...].tolist())) == [1000, 1002, 2001, 2003]
+        assert int(f.attrs["num_windows_written"]) == 8
+
+
+def test_keep_manifest_refuses_a_stem_it_does_not_name(tmp_path):
+    """An unnamed stem is currently merged WHOLE -- silently an oversized buffer."""
+    mr = _load_merger()
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    _write_stem(a, n_eps=2, per_ep=2, first_uid=10)
+    _write_stem(b, n_eps=2, per_ep=2, first_uid=20)
+    man = _manifest(tmp_path / "buf.json", [(a, [10, 11])])
+    with pytest.raises(SystemExit, match="not in"):
+        mr.merge([a, b], str(tmp_path / "out"), keep_manifest=man)
+
+
+def test_keep_manifest_refuses_a_named_stem_that_was_not_given(tmp_path):
+    """The mirror case: the buffer would be missing episodes the manifest claims it holds."""
+    mr = _load_merger()
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    _write_stem(a, n_eps=2, per_ep=2, first_uid=10)
+    _write_stem(b, n_eps=2, per_ep=2, first_uid=20)
+    man = _manifest(tmp_path / "buf.json", [(a, [10, 11]), (b, [20, 21])])
+    with pytest.raises(SystemExit, match="were not given on the command line"):
+        mr.merge([a], str(tmp_path / "out"), keep_manifest=man)
+
+
+def test_keep_manifest_refuses_a_uid_the_stem_does_not_have(tmp_path):
+    """A re-recorded increment would otherwise shrink the buffer with nothing raising."""
+    mr = _load_merger()
+    a = str(tmp_path / "a")
+    _write_stem(a, n_eps=2, per_ep=2, first_uid=10)
+    man = _manifest(tmp_path / "buf.json", [(a, [10, 99])])
+    with pytest.raises(SystemExit, match="does not have"):
+        mr.merge([a], str(tmp_path / "out"), keep_manifest=man)
+
+
+def test_keep_manifest_and_max_episodes_per_stem_are_mutually_exclusive(tmp_path):
+    """A random cut on top of a named set makes the manifest a lie."""
+    mr = _load_merger()
+    a = str(tmp_path / "a")
+    _write_stem(a, n_eps=4, per_ep=2, first_uid=10)
+    man = _manifest(tmp_path / "buf.json", [(a, [10, 11])])
+    with pytest.raises(SystemExit, match="mutually exclusive"):
+        mr.merge([a], str(tmp_path / "out"), max_episodes_per_stem=2, keep_manifest=man)
+
+
+def test_a_per_stem_uid_space_is_refused(tmp_path):
+    """Names are meaningless against uids that are only locally unique."""
+    import json
+    mr = _load_merger()
+    a = str(tmp_path / "a")
+    _write_stem(a, n_eps=2, per_ep=2, first_uid=0)
+    p = str(tmp_path / "buf.json")
+    with open(p, "w") as f:
+        json.dump({"schema": 1, "uid_space": "per_stem",
+                   "stems": [{"stem": a, "uids": [0, 1]}]}, f)
+    with pytest.raises(SystemExit, match="uid_space"):
+        mr.merge([a], str(tmp_path / "out"), keep_manifest=p)
+
+
+def test_keep_manifest_records_itself_in_the_provenance(tmp_path):
+    """Which manifest produced a buffer has to be recoverable from the buffer."""
+    import json
+    mr = _load_merger()
+    a = str(tmp_path / "a")
+    _write_stem(a, n_eps=4, per_ep=2, first_uid=10)
+    man = _manifest(tmp_path / "buf.json", [(a, [10, 12])])
+    out = str(tmp_path / "out")
+    mr.merge([a], out, keep_manifest=man)
+    with h5py.File(out + ".h5", "r") as f:
+        rec = json.loads(f.attrs["merge_provenance"])
+    assert rec["keep_manifest"]["path"] == os.path.abspath(man)
+    assert len(rec["keep_manifest"]["sha256"]) == 64
+    assert rec["merged_sources"][0]["uid_min"] == 10
+    assert rec["merged_sources"][0]["uid_max"] == 12
+
+
+def test_a_colliding_uid_across_stems_is_still_refused_under_a_manifest(tmp_path):
+    """With renumbering off, the existing collision check IS the uniqueness assertion."""
+    mr = _load_merger()
+    a, b = str(tmp_path / "a"), str(tmp_path / "b")
+    _write_stem(a, n_eps=2, per_ep=2, first_uid=0)
+    _write_stem(b, n_eps=2, per_ep=2, first_uid=0)
+    man = _manifest(tmp_path / "buf.json", [(a, [0, 1]), (b, [0, 1])])
+    with pytest.raises(SystemExit, match="already used"):
+        mr.merge([a, b], str(tmp_path / "out"), keep_manifest=man)

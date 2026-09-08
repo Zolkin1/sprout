@@ -571,3 +571,30 @@ def test_the_episode_reader_loads_a_pre_perturbation_recording(tmp_path):
     got, attrs = ro.read_rollout_episodes(str(p))
     assert attrs["schema_version"] == 2
     assert got["episode_uid"].shape == (n,)
+
+
+def test_read_rollout_episodes_skips_the_terrain_reward_chunks_group(tmp_path):
+    """A live-graded recording must be READABLE, not a TypeError from deep inside the reader.
+
+    ``--terrain_reward`` writes the per-chunk grade into a ``chunks`` GROUP inside the same
+    episodes file.  The reader used to do ``f[key][...]`` over every key, which on a group
+    raises ``TypeError: Accessing a group is done with bytes or str, not <class 'ellipsis'>``
+    -- so every recording graded live was unreadable here and unmergeable, while
+    ``box2_ic_report`` worked because it reaches for h5py directly.
+    """
+    import h5py
+    import numpy as np
+
+    path = str(tmp_path / "r.episodes.h5")
+    with h5py.File(path, "w") as f:
+        f.attrs["schema_version"] = ro.SCHEMA_VERSION
+        f.create_dataset("episode_uid", data=np.arange(3, dtype=np.int64))
+        f.create_dataset("reached_goal", data=np.ones(3, dtype=np.int64))
+        grp = f.create_group("chunks")
+        grp.create_dataset("episode_uid", data=np.arange(9, dtype=np.int64))
+        grp.create_dataset("contact_penalty", data=np.zeros(9, dtype=np.float64))
+
+    cols, attrs = ro.read_rollout_episodes(path)
+    assert sorted(cols) == ["episode_uid", "reached_goal"]
+    assert "chunks" not in cols
+    assert attrs["schema_version"] == ro.SCHEMA_VERSION

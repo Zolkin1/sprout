@@ -38,6 +38,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -139,8 +140,74 @@ def subsample_episodes(W: dict, E: dict, keep: int, rng: np.random.Generator) ->
             d[k] = d[k][m]
 
 
+def load_keep_manifest(path: str) -> tuple[dict[str, np.ndarray], str]:
+    """Read an ``awr_buffer`` manifest into a ``{absolute stem: uids}`` map.
+
+    Only two fields are read -- ``uid_space`` and ``stems[*].{stem, uids}``.  The manifest is
+    ONE file owned by ``awr_buffer.py``; this reader deliberately ignores everything else in
+    it so that the buffer's bookkeeping can grow without touching the merge.
+
+    Args:
+        path: Path to ``buffer.json``.
+
+    Returns:
+        ``(map, sha256)`` -- the per-stem uid arrays keyed by absolute stem path, and the
+        manifest's own hash for the provenance record.
+
+    Raises:
+        SystemExit: If the manifest is not a ``uid_space == "global"`` manifest, or names a
+            stem twice.
+    """
+    raw = pathlib.Path(path).read_bytes()
+    man = json.loads(raw)
+    space = man.get("uid_space")
+    if space != "global":
+        raise SystemExit(
+            f"{path}: uid_space is {space!r}, expected 'global'. --keep_manifest names uids "
+            "in a GLOBAL space and switches renumbering off; against a per-stem uid space "
+            "the names would be ambiguous. Run `awr_buffer adopt` to rebase the increments.")
+    out: dict[str, np.ndarray] = {}
+    for row in man.get("stems", []):
+        key = os.path.abspath(row["stem"])
+        if key in out:
+            raise SystemExit(f"{path}: stem {key!r} appears twice; the union would be a guess.")
+        out[key] = np.asarray(row["uids"], dtype=np.int64)
+    return out, hashlib.sha256(raw).hexdigest()
+
+
+def select_uids(W: dict, E: dict, keep: np.ndarray, stem: str) -> None:
+    """Cut a stem down to exactly the NAMED episodes, IN PLACE -- the manifest twin of
+    :func:`subsample_episodes`.
+
+    Whole episodes, like the random selector, and for the same reason: every window of an
+    episode carries the same terminal label, so a partial episode thins the trajectory without
+    thinning the label.
+
+    Args:
+        W: The stem's window columns, mutated.
+        E: The stem's episode columns, mutated.
+        keep: The episode uids to retain.
+        stem: The stem, for the message.
+
+    Raises:
+        SystemExit: If the stem does not contain every named uid -- a re-recorded or
+            short-collected increment would otherwise shrink the buffer silently.
+    """
+    missing = np.setdiff1d(keep, E["episode_uid"])
+    if missing.size:
+        raise SystemExit(
+            f"{stem}: the manifest names {missing.size} uid(s) this stem does not have "
+            f"(e.g. {missing[:5].tolist()}). The buffer would come out SMALLER than the "
+            "manifest claims, and every size check downstream reads the manifest. Refusing.")
+    emask = np.isin(E["episode_uid"], keep)
+    wmask = np.isin(W["episode_uid"], keep)
+    for d, m in ((E, emask), (W, wmask)):
+        for k in list(d):
+            d[k] = d[k][m]
+
+
 def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
-          seed: int = 0) -> None:
+          seed: int = 0, keep_manifest: str = "") -> None:
     """Concatenate the window and episode tables of every stem into ``out_stem``.
 
     **Streamed, one stem at a time**, which is what makes the full grid mergeable at all.
@@ -159,11 +226,40 @@ def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
             needed now that the merge streams -- it is for deliberately thinning a set, not
             for fitting one into memory.
         seed: Draw seed for the subsample.
+        keep_manifest: Path to an ``awr_buffer`` ``buffer.json``.  When given, each stem is cut
+            to exactly the uids that manifest names for it, and **renumbering is switched
+            off** -- the uids are already global (``awr_buffer adopt`` rebased them once, at
+            adoption) and the manifest names them, so shifting them here would invalidate
+            every name in it. The existing collision check then becomes the assertion that the
+            global space really is collision-free. Mutually exclusive with
+            ``max_episodes_per_stem``.
 
     Raises:
-        SystemExit: On a contract mismatch, a uid collision, or a window whose episode has no
-            outcome row.
+        SystemExit: On a contract mismatch, a uid collision, a window whose episode has no
+            outcome row, or any manifest/stem-set disagreement.
     """
+    if keep_manifest and max_episodes_per_stem:
+        raise SystemExit(
+            "--keep_manifest and --max_episodes_per_stem are mutually exclusive: a random cut "
+            "on top of a named set would make the manifest a lie about what the buffer holds.")
+    keep_map: dict[str, np.ndarray] = {}
+    man_sha = ""
+    if keep_manifest:
+        keep_map, man_sha = load_keep_manifest(keep_manifest)
+        named = set(keep_map)
+        given = {os.path.abspath(s_) for s_ in stems}
+        # BOTH directions. A stem given but unnamed would currently be merged WHOLE -- a
+        # silently oversized buffer; a stem named but not given would silently be missing.
+        if given - named:
+            raise SystemExit(
+                f"{sorted(given - named)} were given on the command line but are not in "
+                f"{keep_manifest}. An unnamed stem would be merged WHOLE, so the buffer would "
+                "be larger than the manifest claims. Refusing.")
+        if named - given:
+            raise SystemExit(
+                f"{keep_manifest} names {sorted(named - given)}, which were not given on the "
+                "command line. The buffer would be missing them while the manifest says it "
+                "holds them. Refusing.")
     for s in stems:
         for suffix in (".h5", ".episodes.h5"):
             if not os.path.isfile(s + suffix):
@@ -181,8 +277,20 @@ def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
         for i, stem in enumerate(stems):
             W, wa = ro.read_rollout_windows(stem + ".h5")
             E, ea = ro.read_rollout_episodes(stem + ".episodes.h5")
+            # A live-graded recording (`--terrain_reward`) carries its per-chunk grade in a
+            # `chunks` GROUP that `read_rollout_episodes` skips and this merge cannot
+            # concatenate. Warn rather than refuse: the window table is still complete, and
+            # the grade is reproducible offline (`inspect_terrain_reward.py --stage reward`),
+            # which is how the AWR loop gets it. Silent loss is the only unacceptable option.
+            with h5py.File(stem + ".episodes.h5", "r") as _fe:
+                if isinstance(_fe.get("chunks"), h5py.Group):
+                    print(f"[merge] WARNING {stem}: its `chunks` terrain-reward group is NOT "
+                          "carried into the merge. Re-grade the merged stem offline if you "
+                          "need it.", flush=True)
             n_all = len(E["episode_uid"])
-            if max_episodes_per_stem:
+            if keep_manifest:
+                select_uids(W, E, keep_map[os.path.abspath(stem)], stem)
+            elif max_episodes_per_stem:
                 subsample_episodes(W, E, int(max_episodes_per_stem),
                                    np.random.default_rng([seed, i]))
             wattrs.append(wa)
@@ -198,11 +306,19 @@ def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
                     f"{stem}: {orphans.size} window episode_uid(s) have no outcome row "
                     f"(e.g. {orphans[:5].tolist()}); the join would drop them silently.")
 
-            n = int(max(E["episode_uid"].max(initial=-1),
-                        W["episode_uid"].max(initial=-1))) + 1
-            E["episode_uid"] = E["episode_uid"] + offset
-            W["episode_uid"] = W["episode_uid"] + offset
-            offset += n
+            # **Renumbering is SKIPPED under a manifest, and that is the point.** The
+            # offset here is derived from `max(uid)+1` computed AFTER the cut, so it depends
+            # on WHICH episodes the drop removed: an episode's uid would change every
+            # iteration and a dropped uid would be REUSED by a fresh episode. Every join
+            # downstream is `(episode_uid, replan_index)` and `fit_value._reward_sidecar`
+            # refuses only at ZERO coverage -- so a 60%-wrong join prints a coverage
+            # percentage and trains. The uids arrive already global instead.
+            if not keep_manifest:
+                n = int(max(E["episode_uid"].max(initial=-1),
+                            W["episode_uid"].max(initial=-1))) + 1
+                E["episode_uid"] = E["episode_uid"] + offset
+                W["episode_uid"] = W["episode_uid"] + offset
+                offset += n
             clash = seen_uids & set(E["episode_uid"].tolist())
             if clash:
                 raise SystemExit(
@@ -230,6 +346,12 @@ def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
                             compression="lzf" if v.nbytes > (1 << 20) else None)
                     else:
                         d = f[k]
+                        if v.shape[0] == 0:
+                            # `d[-0:]` is the WHOLE dataset, not an empty slice, so an
+                            # empty stem would overwrite everything appended so far with a
+                            # broadcast error -- which is how a diagnosable uid mismatch
+                            # surfaces as `Can't broadcast (0,) -> (9,)` from inside h5py.
+                            continue
                         d.resize(d.shape[0] + v.shape[0], axis=0)
                         d[-v.shape[0]:] = v
             n_win_total += len(W["episode_uid"])
@@ -239,6 +361,11 @@ def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
                   f"{len(W['episode_uid'])} windows{note}", flush=True)
             prov.append({"stem": stem, "n_episodes": int(len(E["episode_uid"])),
                          "n_windows": int(len(W["episode_uid"])),
+                         # `initial=` is a STARTING BOUND, not an empty-case default, so
+                         # `min(initial=-1)` would clamp every result to -1. It is only
+                         # correct for the `max` above.
+                         "uid_min": int(E["episode_uid"].min()) if len(E["episode_uid"]) else -1,
+                         "uid_max": int(E["episode_uid"].max()) if len(E["episode_uid"]) else -1,
                          "attrs": {k: (v.tolist() if isinstance(v, np.ndarray) else v)
                                    for k, v in ea.items()
                                    if k not in ("depth_camera_spec", "height_scan_spec")}})
@@ -261,12 +388,18 @@ def merge(stems: list[str], out_stem: str, max_episodes_per_stem: int = 0,
             if is_windows:
                 for key in ("num_windows", "num_windows_written"):
                     f.attrs[key] = n_win_total
-            f.attrs["merge_provenance"] = json.dumps({"merged_sources": prov}, default=str)
+            record = {"merged_sources": prov}
+            if keep_manifest:
+                record["keep_manifest"] = {"path": os.path.abspath(keep_manifest),
+                                           "sha256": man_sha}
+            f.attrs["merge_provenance"] = json.dumps(record, default=str)
         fe.attrs["schema_version"] = ro.SCHEMA_VERSION
 
     print(f"[merge] wrote {wpath}: {n_win_total} rows")
     print(f"[merge] wrote {epath}: {n_eps_total} rows")
-    print(f"[merge] {n_eps_total} episodes, {n_win_total} windows, uids 0..{offset - 1}")
+    span = (f"uids 0..{offset - 1}" if not keep_manifest
+            else f"uids named by {os.path.basename(keep_manifest)}")
+    print(f"[merge] {n_eps_total} episodes, {n_win_total} windows, {span}")
 
 
 def main() -> int:
@@ -280,8 +413,12 @@ def main() -> int:
                         "exteroception column is ~15.6 kB a window, so a six-run grid is "
                         "~28 GB and the concatenation peaks at about twice that.")
     p.add_argument("--seed", type=int, default=0, help="subsample draw seed")
+    p.add_argument("--keep_manifest", type=str, default="",
+                   help="an awr_buffer buffer.json naming exactly which episode uids to keep "
+                        "from each stem. Switches uid renumbering OFF (the uids are already "
+                        "global). Mutually exclusive with --max_episodes_per_stem.")
     a = p.parse_args()
-    merge(list(a.stems), a.out, a.max_episodes_per_stem, a.seed)
+    merge(list(a.stems), a.out, a.max_episodes_per_stem, a.seed, a.keep_manifest)
     return 0
 
 

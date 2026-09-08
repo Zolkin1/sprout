@@ -707,7 +707,16 @@ def main() -> int:
     p.add_argument("stem", help="rollout stem: <stem>.h5 and <stem>.episodes.h5")
     p.add_argument("--fm_checkpoint", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--epochs", type=int, default=8)
+    p.add_argument("--epochs", type=int, default=5,
+                   help="Passes over the training folds. 5 because the critic on this task is "
+                        "DATA-limited, not optimisation-limited, and that is measured: on a "
+                        "2000-episode subset, 20 epochs restored epoch 13/14 by validation "
+                        "and reached r2 +0.791 against 4 epochs' +0.786 -- 0.6% relative for "
+                        "3.8x the wall time (27.8 min against 7.2). The effect only gets "
+                        "weaker with more data, since 4 epochs over 16k episodes is already "
+                        "8x the gradient steps of 4 over 2k. Raise it when the data grows, "
+                        "not when the fit looks unfinished; the best-by-val restore means a "
+                        "larger number costs time rather than accuracy.")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--val_frac", type=float, default=0.25,

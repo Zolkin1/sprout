@@ -547,9 +547,16 @@ def main() -> int:
     cfg = resolved_config(args.pretrained)
     if cfg.advantage_cond:
         raise SystemExit(
-            f"{args.pretrained} is ALREADY advantage-conditioned. Every iteration fine-tunes "
-            "from the pretrained checkpoint, never from the previous one -- chaining makes "
-            "iteration k an unrepeatable path rather than one defined step.")
+            f"{args.pretrained} is ALREADY advantage-conditioned. An advantage-CONDITIONED "
+            "arm fine-tunes from the pretrained checkpoint, never from the previous one: "
+            "chaining would confound the conditioning mechanism under test with an "
+            "unrepeatable optimisation path.\n"
+            "This does NOT apply to a plain AWR arm, which is chained ON PURPOSE by "
+            "`run_awr_loop.sh` -- there the path IS the algorithm (AWR's convergence argument "
+            "is about iterating, and re-fitting from the parent every time is what makes a "
+            "single step advantage-weighted BC instead). Reproducibility there comes from the "
+            "buffer manifest recording each iteration's parent checkpoint, not from refusing "
+            "to chain.")
 
     import h5py
     with h5py.File(args.rollout, "r") as f:
