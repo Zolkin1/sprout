@@ -104,7 +104,8 @@ from robot_rl.flow_matching import online, transforms, value, value_gates  # noq
 GOAL_SCALE_M: float = 5.0
 
 
-def _load(stem: str, max_windows: int, tail_chunks: int = 1,
+def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
+          max_episodes: int = 0, seed: int = 0,
           strict_failure: bool = True, reward_npz: str = "", clip_c: float = 0.0,
           window: int = 3) -> tuple[dict, dict, dict]:
     """Read both tables and join them on ``episode_uid``.
@@ -112,6 +113,8 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1,
     Args:
         stem: The rollout stem.
         max_windows: Cap, so a multi-gigabyte recording can be smoke-tested.
+        max_episodes: Keep a random subset of this many episodes (0 = all).
+        seed: RNG seed for that subset, so a sizing sweep is reproducible.
         tail_chunks: Trailing chunks the quality target's non-failure tail averages.
         reward_npz: A per-window reward sidecar to fit the quality head on INSTEAD of the
             tracking error -- see :func:`_reward_sidecar`. Empty means the tracking reward,
@@ -160,6 +163,19 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1,
     if max_windows and W["episode_uid"].size > max_windows:
         keep = np.arange(max_windows)
         W = {k: v[keep] for k, v in W.items()}
+    if max_episodes:
+        # RANDOM over episodes, keeping every window of the chosen ones: the label lives on
+        # the episode, so a window-level draw would shrink the gradient count without
+        # shrinking the information and would answer a different question.
+        uids = np.unique(W["episode_uid"])
+        if uids.size > max_episodes:
+            rng = np.random.default_rng(int(seed))
+            chosen = rng.choice(uids, size=int(max_episodes), replace=False)
+            keep = np.isin(W["episode_uid"], chosen)
+            W = {k: v[keep] for k, v in W.items()}
+            print(f"[fit] --max_episodes {max_episodes}: kept "
+                  f"{int(keep.sum()):,} of {keep.size:,} windows over "
+                  f"{int(np.unique(W['episode_uid']).size):,} episodes")
 
     live = ~E["censored"].astype(bool)
     reward = ro.terminal_reward(E, strict=strict_failure)
@@ -772,7 +788,21 @@ def main() -> int:
                         "non-failures against the loose rule's 728 -- so check the positive "
                         "count that this prints before trusting an AUC.")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--max_windows", type=int, default=0)
+    p.add_argument("--max_windows", type=int, default=0,
+                   help="Cap on WINDOWS, taken as the first N rows -- a smoke-test knob, not "
+                        "a sampling one. On a merged multi-speed recording the first N rows "
+                        "all come from the first cell, so the cap silently yields a "
+                        "single-speed subset whose opening rows are the stand-and-settle "
+                        "hold. Use --max_episodes to size a fit.")
+    p.add_argument("--max_episodes", type=int, default=0,
+                   help="Keep a RANDOM subset of this many episodes (seeded by --seed), with "
+                        "all of their windows. This is the knob for asking how much data a "
+                        "critic needs: the fit's own effective sample size is the EPISODE "
+                        "count, not the window count, because every window of an episode "
+                        "carries the same label -- so halving windows within episodes "
+                        "changes almost nothing while halving episodes halves the "
+                        "information. Drawn over episodes rather than per cell so the speed "
+                        "mix is preserved in expectation.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     # Opt-OUT, matching `scripts/flow_matching/train.py` and the RL agent cfgs.
     p.add_argument("--wandb", action="store_true", default=True,
@@ -793,7 +823,9 @@ def main() -> int:
         print("[fit] --quality_kind mse implies a quality head; setting --quality_bins 1 "
               "(the MSE head has ONE output regardless of the bin count).")
         args.quality_bins = 1
-    W, E, lab = _load(stem, args.max_windows, int(args.tail_chunks), strict_failure,
+    W, E, lab = _load(stem, args.max_windows, int(args.tail_chunks),
+                      strict_failure=strict_failure,
+                      max_episodes=int(args.max_episodes), seed=int(args.seed),
                       reward_npz=args.reward_npz, clip_c=float(args.clip_c),
                       window=int(args.window))
     print(f"[fit] failure rule: {args.failure_rule} "
