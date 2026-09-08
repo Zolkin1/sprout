@@ -57,7 +57,7 @@ def _load(name: str):
 def _write_increment(root: str, iteration: int, n_eps: int, per_ep: int = 3,
                      first_uid: int = 0, contract: dict | None = None,
                      reward_meta: dict | None = None, allocated: int | None = None,
-                     n_censored: int = 2) -> str:
+                     n_censored: int = 2, n_envs: int = 1) -> str:
     """Write a readable rollout pair plus its terrain-reward sidecar into ``inc_<NNN>/``.
 
     Args:
@@ -65,6 +65,7 @@ def _write_increment(root: str, iteration: int, n_eps: int, per_ep: int = 3,
         iteration: 1-based iteration whose increment this is.
         n_eps: USABLE (uncensored) episodes to write.
         per_ep: Re-plan windows per episode.
+        n_envs: Envs to spread the episodes over, for the per-env round selection.
         n_censored: Extra rows marked ``censored``, on top of ``n_eps``. Defaults to 2 rather
             than 0 because every real recording has exactly ``num_envs`` of them --
             ``record_rollouts`` ends by flushing whatever is still in flight -- and a fixture
@@ -100,6 +101,8 @@ def _write_increment(root: str, iteration: int, n_eps: int, per_ep: int = 3,
     with h5py.File(stem + ".episodes.h5", "w") as f:
         f.create_dataset("episode_uid", data=uids)
         f.create_dataset("censored", data=censored)
+        # Envs cycle, so uid order interleaves them exactly as a real rollout does.
+        f.create_dataset("env_id", data=(np.arange(n_all) % max(1, n_envs)).astype(np.int64))
         f.create_dataset("n_replans", data=np.full(n_all, per_ep, dtype=np.int64))
         f.attrs["schema_version"] = ro.SCHEMA_VERSION
         f.attrs["tracking_spec"] = json.dumps({"mode": "body"})
@@ -140,7 +143,7 @@ def _run(root: str, iteration: int, capacity: int, refresh: int, n_new: int,
     _write_increment(root, iteration, n_new, **inc_kw)
     ns = __import__("argparse").Namespace
     ab.cmd_adopt(ns(root=root, iteration=iteration, expect_episodes=n_new, policy="ckpt.pt",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
     ab.cmd_plan(ns(root=root, iteration=iteration, capacity=capacity, refresh=refresh,
                    seed=seed))
     ab.cmd_materialise(ns(root=root, iteration=iteration))
@@ -190,7 +193,7 @@ def test_an_over_collection_is_trimmed_without_favouring_short_episodes(tmp_path
     ab = _load("awr_buffer")
     _write_increment(root, 1, 40, n_censored=3)
     ns = __import__("argparse").Namespace
-    ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=10, policy="", trim_seed=0))
+    ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=10, policy="", rounds=0, trim_seed=0))
     rec = json.loads((tmp_path / "inc_001" / "adopt.json").read_text())
     assert rec["n_episodes"] == 10
     local = [u - rec["uid_base"] for u in rec["uids"]]
@@ -245,11 +248,11 @@ def test_adopt_is_idempotent_because_rebasing_twice_would_move_the_band(tmp_path
     stem = _write_increment(root, 1, 4)
     ns = __import__("argparse").Namespace
     ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=4, policy="",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
     with h5py.File(stem + ".episodes.h5", "r") as f:
         first = f["episode_uid"][...].copy()
     ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=4, policy="",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
     with h5py.File(stem + ".episodes.h5", "r") as f:
         assert np.array_equal(f["episode_uid"][...], first)
 
@@ -262,7 +265,7 @@ def test_plan_never_redraws_the_drop(tmp_path):
     _write_increment(root, 2, 3)
     ns = __import__("argparse").Namespace
     ab.cmd_adopt(ns(root=root, iteration=2, expect_episodes=3, policy="",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
     ab.cmd_plan(ns(root=root, iteration=2, capacity=6, refresh=3, seed=0))
     first = (tmp_path / "iter_002" / "buffer.json").read_text()
     ab.cmd_plan(ns(root=root, iteration=2, capacity=6, refresh=3, seed=1))
@@ -277,7 +280,7 @@ def test_a_truncated_collection_is_refused_rather_than_shrinking_the_buffer(tmp_
     ns = __import__("argparse").Namespace
     with pytest.raises(SystemExit, match="HARD CAP"):
         ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=4, policy="",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
 
 
 def test_a_short_collection_is_refused(tmp_path):
@@ -288,7 +291,7 @@ def test_a_short_collection_is_refused(tmp_path):
     ns = __import__("argparse").Namespace
     with pytest.raises(SystemExit, match="3 USABLE episodes"):
         ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=6, policy="",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
 
 
 def test_a_moved_tracking_spec_is_refused_even_though_the_merge_allows_it(tmp_path):
@@ -303,7 +306,7 @@ def test_a_moved_tracking_spec_is_refused_even_though_the_merge_allows_it(tmp_pa
     ns = __import__("argparse").Namespace
     with pytest.raises(SystemExit, match="moved since iteration 1"):
         ab.cmd_adopt(ns(root=root, iteration=2, expect_episodes=3, policy="",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
 
 
 def test_two_graders_are_refused_rather_than_becoming_one_quantity(tmp_path):
@@ -314,7 +317,7 @@ def test_two_graders_are_refused_rather_than_becoming_one_quantity(tmp_path):
     _write_increment(root, 2, 3, reward_meta={"tau": 0.25})
     ns = __import__("argparse").Namespace
     ab.cmd_adopt(ns(root=root, iteration=2, expect_episodes=3, policy="",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
     ab.cmd_plan(ns(root=root, iteration=2, capacity=6, refresh=3, seed=0))
     with pytest.raises(SystemExit, match="reward field 'tau'"):
         ab.cmd_materialise(ns(root=root, iteration=2))
@@ -328,7 +331,7 @@ def test_a_manifest_whose_size_claim_is_wrong_is_not_committed(tmp_path):
     _write_increment(root, 2, 3)
     ns = __import__("argparse").Namespace
     ab.cmd_adopt(ns(root=root, iteration=2, expect_episodes=3, policy="",
-                    trim_seed=0))
+                    rounds=0, trim_seed=0))
     with pytest.raises(SystemExit, match="not the stated capacity"):
         ab.cmd_plan(ns(root=root, iteration=2, capacity=6, refresh=1, seed=0))
 
@@ -369,7 +372,7 @@ def test_a_rebase_killed_between_the_two_tables_is_completed_not_repeated(tmp_pa
         f["episode_uid"][...] = f["episode_uid"][...].astype(np.int64) + ab.UID_STRIDE
         f.attrs["awr_uid_base"] = ab.UID_STRIDE
     ns = __import__("argparse").Namespace
-    ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=6, policy="", trim_seed=0))
+    ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=6, policy="", rounds=0, trim_seed=0))
     with h5py.File(stem + ".h5", "r") as f:
         win = np.unique(f["episode_uid"][...])
     with h5py.File(stem + ".episodes.h5", "r") as f:
@@ -386,7 +389,7 @@ def test_a_local_uid_at_the_stride_is_refused_because_the_bands_would_overlap(tm
     _write_increment(root, 1, 3, first_uid=ab.UID_STRIDE - 1)
     ns = __import__("argparse").Namespace
     with pytest.raises(SystemExit, match="UID_STRIDE"):
-        ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=3, policy="", trim_seed=0))
+        ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=3, policy="", rounds=0, trim_seed=0))
 
 
 def test_verify_catches_an_episode_set_that_drifts_from_the_manifest(tmp_path):
@@ -412,3 +415,45 @@ def test_the_drop_is_reproducible_from_the_seed(tmp_path):
     b = run(str(tmp_path / "b"))
     assert a["drop"]["uids"] == b["drop"]["uids"]
     assert a["drop"]["seed"] == [7, 2]
+
+
+def test_only_the_first_round_per_env_is_kept(tmp_path):
+    """The surplus a round-based stop leaves behind is the SHORT tail, so it is discarded.
+
+    A rollout stops when the slowest env finishes its k-th episode, by which time the fast
+    envs have finished more -- and an env finishes more precisely when its episodes were
+    short. Keeping the surplus would tilt the sample back toward the short episodes the
+    round-based stop exists to stop selecting.
+    """
+    root = str(tmp_path)
+    ab = _load("awr_buffer")
+    # 4 envs, 12 completed episodes: env 0 finished 3, the others 3 each by construction,
+    # so asking for 1 round must keep exactly 4 -- one per env.
+    _write_increment(root, 1, 12, n_censored=4, n_envs=4)
+    ns = __import__("argparse").Namespace
+    ab.cmd_adopt(ns(root=root, iteration=1, expect_episodes=0, policy="", rounds=1,
+                    trim_seed=0))
+    rec = json.loads((tmp_path / "inc_001" / "adopt.json").read_text())
+    assert rec["n_episodes"] == 4, rec["n_episodes"]
+    local = sorted(u - rec["uid_base"] for u in rec["uids"])
+    assert local == [0, 1, 2, 3], local           # the FIRST episode of each env
+
+
+def test_first_per_env_is_a_complete_design(tmp_path):
+    """Two rounds over three envs keeps exactly six, two from each."""
+    ab = _load("awr_buffer")
+    uids = np.arange(12, dtype=np.int64)
+    env = np.arange(12, dtype=np.int64) % 3
+    keep = ab.first_per_env(uids, env, rounds=2)
+    assert len(keep) == 6
+    per = {}
+    for u in keep:
+        per[int(env[u])] = per.get(int(env[u]), 0) + 1
+    assert per == {0: 2, 1: 2, 2: 2}
+
+
+def test_rounds_zero_keeps_everything(tmp_path):
+    """A recording made before rounds existed must still adopt whole."""
+    ab = _load("awr_buffer")
+    uids = np.arange(5, dtype=np.int64)
+    assert ab.first_per_env(uids, np.zeros(5, dtype=np.int64), rounds=0) == [0, 1, 2, 3, 4]

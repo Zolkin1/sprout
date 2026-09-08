@@ -139,6 +139,17 @@ parser.add_argument("--num_episodes", type=int, default=0,
                          "a terminal-only reward every window of an episode carries the same "
                          "label, so the effective sample size is the episode count and a "
                          "window quota is only a proxy for it. 0 = no episode limit.")
+parser.add_argument("--episodes_per_env", type=int, default=0,
+                    help="Stop once EVERY env has completed this many episodes, rather than "
+                         "once a TOTAL count has finished. Use this whenever episode length "
+                         "varies with the commanded speed: a total-count stop fires as soon "
+                         "as the fastest episodes finish, so it keeps the short ones and "
+                         "discards every slow episode still in flight -- on the box2 band "
+                         "that made the kept episodes last 177 steps against a population "
+                         "median of 392. Rounds keep the collected set a complete design "
+                         "over (env, round), whose membership cannot depend on duration. "
+                         "The cost is waiting for the slowest env, bounded by "
+                         "episode_length_s. 0 = use --num_episodes instead.")
 parser.add_argument("--num_windows", type=int, default=100000,
                     help="Hard cap on re-plan windows; also sizes the pre-allocated file, so "
                          "set it above what --num_episodes will produce.")
@@ -773,7 +784,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         t0 = time.time()
         ceiling = int(args_cli.max_steps) or None
         no_win = bool(args_cli.no_windows)
-        if no_win and not (int(args_cli.num_episodes) or ceiling):
+        if no_win and not (int(args_cli.num_episodes) or int(args_cli.episodes_per_env)
+                           or ceiling):
             raise SystemExit(
                 "--no_windows needs --num_episodes (or --max_steps): the window quota is "
                 "what bounds the loop otherwise, so without one of these the recording "
@@ -788,9 +800,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         with writer_cm as writer:
             with torch.inference_mode():
                 want_ep = int(args_cli.num_episodes) or None
+                want_rounds = int(args_cli.episodes_per_env) or None
                 while no_win or writer.written < int(args_cli.num_windows):
                     if ceiling is not None and steps >= ceiling:
                         print(f"[rollout] step ceiling {ceiling} reached")
+                        break
+                    if want_rounds is not None and tracker.rounds_complete() >= want_rounds:
+                        print(f"[rollout] every env completed {want_rounds} episode(s); "
+                              f"{tracker.harvested} harvested")
                         break
                     if want_ep is not None and tracker.harvested >= want_ep:
                         print(f"[rollout] {tracker.harvested} episodes reached")

@@ -1021,6 +1021,13 @@ class RolloutEpisodeTracker:
         self._next_uid = int(n)
         self.armed = False
         self.harvested = 0
+        #: Episodes each env has completed NATURALLY (the end-of-run flush does not count).
+        #: A rollout that stops on a total episode count stops as soon as the fastest
+        #: episodes have finished, which under a per-episode speed draw selects the shortest
+        #: ones and discards every slow episode still in flight. Stopping instead once EVERY
+        #: env has completed the same number makes the collected set a complete design over
+        #: (env, round) whose membership does not depend on how long an episode took.
+        self.completed_per_env = np.zeros(n, dtype=np.int64)
         self._term_names: list[str] = []
 
     # ------------------------------------------------------------------
@@ -1166,8 +1173,18 @@ class RolloutEpisodeTracker:
             "goal_travel_m": travel,
         })
         self.harvested += ids_np.size
+        if not censored:
+            np.add.at(self.completed_per_env, ids_np, 1)
         self.accum.reset_envs(ids)
         self.reissue(ids)
+
+    def rounds_complete(self) -> int:
+        """How many episodes EVERY env has finished -- the number of complete rounds.
+
+        Returns:
+            ``min`` over envs of the naturally-completed episode count.
+        """
+        return int(self.completed_per_env.min()) if self.completed_per_env.size else 0
 
     def reissue(self, ids: torch.Tensor) -> None:
         """Give ``ids`` fresh identities: a new uid each, and a re-plan index back at 0.

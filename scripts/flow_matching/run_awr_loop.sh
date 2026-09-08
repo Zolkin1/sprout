@@ -115,11 +115,24 @@ for (( it=1; it<=ITERS; it++ )); do
   # Iteration 1 fills the buffer; every later one collects a single refresh.
   if [ "$it" -eq 1 ]; then NEPS="$BUFFER"; POLICY="$PARENT";
   else NEPS="$REFRESH"; POLICY="$ROOT/$(printf 'iter_%03d' $((it-1)))/ft/last.pt"; fi
-  # Ask for 5% MORE than the buffer needs. `--num_episodes` stops on naturally-finished
-  # episodes and `adopt` keeps only those (the end-of-run flush marks `num_envs` more as
-  # censored, and `fit_value` drops them), then trims to exactly NEPS. Without slack a
-  # collection that lands one episode short of the target fails `adopt` after ~30 minutes.
-  COLLECT=$(( NEPS + NEPS / 20 + 1 ))
+  # **COLLECT IN WHOLE ROUNDS, NOT TO A TOTAL COUNT.** A total-count stop fires as soon as
+  # the fastest episodes have finished -- and under a per-episode speed draw the fast ones
+  # end in ~150 steps while a slow one runs 600+, so it keeps the short episodes and
+  # discards every slow one still in flight. Measured on the box2 band: the kept episodes
+  # had a median of 177 steps against a population median of 392, and their terrain-penalty
+  # tail was HALF as wide -- the tail being the signal AWR feeds on. Running until every env
+  # has finished ROUNDS episodes makes membership independent of duration, and it scales the
+  # right way: more envs collect more per round rather than a worse sample.
+  # Never run MORE envs than episodes wanted. A round is all-or-nothing, so 500 episodes on
+  # 2048 envs would collect 2048 and discard 1548 -- paying for four times the sim and four
+  # times the grade to keep a quarter of it. Capping at the request makes the small refresh
+  # collections exact (500 on 500 envs, nothing discarded) while a large one still uses the
+  # whole card: 8000 wanted keeps all 2048 envs and runs 4 rounds. This is NOT the earlier
+  # "use fewer robots" idea -- the bias is already gone, killed by the round-based stop; this
+  # only stops over-collecting.
+  ENVS=$(( NENV < NEPS ? NENV : NEPS ))
+  ROUNDS=$(( (NEPS + ENVS - 1) / ENVS ))
+  COLLECT=$(( ROUNDS * ENVS ))
   # `--num_windows` is a HARD CAP *and* the file pre-allocation, so it is set far above what
   # the episode budget will produce: as the policy improves episodes survive longer and make
   # MORE re-plans each, so a cap sized for iteration 1 would silently truncate iteration 5
@@ -135,15 +148,15 @@ for (( it=1; it<=ITERS; it++ )); do
   if [ -f "$INC/rollout_${TRK}.episodes.h5" ]; then
     echo "[awr] 1/8 collect     SKIP (exists)"
   else
-    echo "[awr] 1/8 collect     $COLLECT episodes (for $NEPS usable), $NENV envs, "\
-         "speed $SPEED_MIN-$SPEED_MAX"
+    echo "[awr] 1/8 collect     $ROUNDS round(s) x $ENVS envs = $COLLECT episodes"\
+         " (sampling $NEPS), speed $SPEED_MIN-$SPEED_MAX"
     # ONE launch over the whole speed band: the commanded speed is drawn per EPISODE, so
     # pinning it (as the v2 collection did) would mean six Isaac starts for no extra
     # coverage. The band matches the range those six pinned runs covered.
     "$PY" -u scripts/rsl_rl/record_rollouts.py \
       --task="$TASK" --load_run "$TRK" --fm_checkpoint "$POLICY" \
       --clip "$CLIP" --clip_device cpu --goal_regions "$GOALS" \
-      --num_envs "$NENV" --num_episodes "$COLLECT" --num_windows "$NWIN" \
+      --num_envs "$ENVS" --episodes_per_env "$ROUNDS" --num_windows "$NWIN" \
       --output_dir "$INC" \
       env.commands.traj_ref.fm_perturb_fraction=0.5 \
       env.commands.traj_ref.fm_upper_camera_noise_fraction=0.5 \
@@ -175,7 +188,7 @@ for (( it=1; it<=ITERS; it++ )); do
   echo "[awr] 3/8 adopt"
   "$PY" -u scripts/flow_matching/awr_buffer.py --root "$ROOT" adopt \
     --iteration "$it" --expect_episodes "$NEPS" --policy "$POLICY" \
-    --trim_seed "$SEED" || fail adopt "$it"
+    --rounds "$ROUNDS" --trim_seed "$SEED" || fail adopt "$it"
   echo "[awr] 4/8 plan        (drop $([ "$it" -eq 1 ] && echo 0 || echo "$REFRESH"))"
   "$PY" -u scripts/flow_matching/awr_buffer.py --root "$ROOT" plan \
     --iteration "$it" --capacity "$BUFFER" \

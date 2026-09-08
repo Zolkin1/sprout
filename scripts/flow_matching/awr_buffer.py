@@ -178,7 +178,7 @@ def sidecar_path(stem: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(stem)), SIDECAR_NAME)
 
 
-def rebase_uids(stem: str, uid_base: int) -> tuple[int, list[int]]:
+def rebase_uids(stem: str, uid_base: int, rounds: int = 0) -> tuple[int, list[int]]:
     """Shift a frozen increment's episode uids into the global space, IN PLACE.
 
     Rewrites ``episode_uid`` in BOTH tables and in the reward sidecar, so every
@@ -191,6 +191,7 @@ def rebase_uids(stem: str, uid_base: int) -> tuple[int, list[int]]:
     Args:
         stem: The rollout stem, already graded.
         uid_base: Value added to every uid.
+        rounds: Episodes to keep per env; see :func:`first_per_env`.
 
     Returns:
         ``(n_rows, usable_uids)`` -- every episode row in the table, and the shifted uids of
@@ -255,11 +256,49 @@ def rebase_uids(stem: str, uid_base: int) -> tuple[int, list[int]]:
         uids = f["episode_uid"][...].astype(np.int64)
         censored = (f["censored"][...].astype(bool) if "censored" in f
                     else np.zeros(uids.size, dtype=bool))
+        env_id = (f["env_id"][...].astype(np.int64) if "env_id" in f
+                  else np.zeros(uids.size, dtype=np.int64))
     if uids.size and int(uids.max()) - uid_base >= UID_STRIDE:
         raise SystemExit(
             f"{stem}: uids span {int(uids.min())}..{int(uids.max())}, wider than one "
             f"UID_STRIDE from base {uid_base}. The bands overlap. Refusing.")
-    return int(uids.size), sorted(int(u) for u in uids[~censored])
+    return int(uids.size), first_per_env(uids[~censored], env_id[~censored], rounds)
+
+
+def first_per_env(uids: np.ndarray, env_id: np.ndarray, rounds: int) -> list[int]:
+    """Keep the first ``rounds`` completed episodes of each env, discarding later ones.
+
+    **The extras are not free data -- keeping them would reintroduce the bias the round-based
+    stop removes.** A rollout stops when the SLOWEST env finishes its k-th episode, by which
+    time the fast envs have finished more; and an env finishes more episodes precisely when
+    its episodes were short. So the surplus is drawn from the short tail, and keeping it
+    would tilt the sample back the way it came, just less far. Taking exactly the first
+    ``rounds`` per env leaves a complete design over ``(env, round)``, whose membership
+    cannot depend on how long any episode took.
+
+    A uid is issued when an episode ENDS, so ascending uid within an env is completion order.
+
+    Args:
+        uids: ``[n]`` episode uids of the naturally-completed episodes.
+        env_id: ``[n]`` the env each one ran in.
+        rounds: Episodes to keep per env; ``0`` keeps everything (the total-count stop's
+            behaviour, retained for a recording made without rounds).
+
+    Returns:
+        The retained uids, sorted.
+    """
+    if rounds <= 0 or uids.size == 0:
+        return sorted(int(u) for u in uids)
+    order = np.argsort(uids, kind="stable")
+    keep: list[int] = []
+    seen: dict[int, int] = {}
+    for i in order:
+        e = int(env_id[i])
+        n = seen.get(e, 0)
+        if n < rounds:
+            keep.append(int(uids[i]))
+            seen[e] = n + 1
+    return sorted(keep)
 
 
 def cmd_adopt(args: argparse.Namespace) -> int:
@@ -342,7 +381,7 @@ def cmd_adopt(args: argparse.Namespace) -> int:
                     "silently. Refusing.")
 
     uid_base = int(args.iteration) * UID_STRIDE
-    n_eps, uids = rebase_uids(stem, uid_base)
+    n_eps, uids = rebase_uids(stem, uid_base, int(args.rounds))
     # Trim to EXACTLY the target, at random rather than by uid order: a uid is assigned when
     # an episode ENDS, so the lowest ones are the shortest episodes, which on this course are
     # disproportionately the failures. Taking a prefix would quietly bias every buffer toward
@@ -366,8 +405,9 @@ def cmd_adopt(args: argparse.Namespace) -> int:
         "reward_source": side_meta.get("reward_source", ""),
     }
     pathlib.Path(marker).write_text(json.dumps(rec, indent=1, sort_keys=True, default=str))
-    print(f"[adopt] iter {args.iteration}: {len(uids)} usable episodes "
-          f"({n_eps} rows less {n_censored} censored), {written} windows, "
+    print(f"[adopt] iter {args.iteration}: {len(uids)} kept of {n_usable} completed "
+          f"({n_eps} rows less {n_censored} censored"
+          f"{f', first {args.rounds}/env' if args.rounds else ''}), {written} windows, "
           f"uids {min(uids)}..{max(uids)} (base {uid_base}), reward hash {reward_hash}")
     return 0
 
@@ -712,6 +752,9 @@ def main() -> int:
     a.add_argument("--iteration", type=int, required=True)
     a.add_argument("--expect_episodes", type=int, default=0)
     a.add_argument("--policy", type=str, default="", help="checkpoint that collected it")
+    a.add_argument("--rounds", type=int, default=0,
+                   help="episodes each env was asked to complete; only the first this many "
+                        "per env are kept (0 = keep every completed episode)")
     a.add_argument("--trim_seed", type=int, default=0,
                    help="seed for trimming an over-collection down to --expect_episodes")
     a.set_defaults(fn=cmd_adopt)
