@@ -73,6 +73,26 @@ for _d in (os.path.join(_HERE, "eval"), _HERE):
 # 2: the per-chunk tracking-error block (`track_err`) and the strict violation columns.
 SCHEMA_VERSION: int = 3
 
+#: Window schema versions this reader accepts, newest first.
+#:
+#: Bumping :data:`SCHEMA_VERSION` alone makes every recording already on disk unreadable, which
+#: is what happened when the perturbation columns landed: the 32k-episode v1 set the critic was
+#: fitted on stopped loading.  So the reader states which versions it can read, and what it
+#: substitutes for each one's missing columns.
+READABLE_WINDOW_SCHEMAS: frozenset[int] = frozenset((2, 3))
+
+#: Columns added after schema 2, with the value to fill for an older file.
+#:
+#: **This is not the "absent is not zero" rule being broken -- it is the case that rule exists
+#: to distinguish.** `penetration_volume_m3` is absent when the collider model carries no
+#: areas, where a zero would assert a geometrically perfect plan; here the perturbation arms
+#: did not EXIST when a schema-2 file was written, so "this row was not perturbed" is the
+#: accurate statement about it rather than a guess standing in for one.
+WINDOW_SCHEMA_BACKFILL: dict[str, tuple[int, str]] = {
+    "perturb_null_history": (0, "u1"),
+    "perturb_noisy_upper_cam": (0, "u1"),
+}
+
 _F = "f4"
 _I = "i4"
 _L = "i8"
@@ -894,15 +914,24 @@ def read_rollout_windows(path: str, columns: list[str] | None = None
     attrs: dict = {}
     with h5py.File(str(path), "r") as f:
         version = int(f.attrs.get("schema_version", -1))
-        if version != SCHEMA_VERSION:
+        if version not in READABLE_WINDOW_SCHEMAS:
             raise ValueError(
-                f"{path} is schema_version {version}; this reader knows {SCHEMA_VERSION}.")
+                f"{path} is schema_version {version}; this reader knows "
+                f"{sorted(READABLE_WINDOW_SCHEMAS)}.")
         n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
         want = list(columns) if columns is not None else [k for k in f.keys()]
-        absent = [c for c in want if c not in f]
+        # A column added after this file's schema is BACKFILLED with the value that is true of
+        # a file written before the feature existed; anything else absent is still a refusal.
+        fill = {c: WINDOW_SCHEMA_BACKFILL[c] for c in want
+                if c not in f and c in WINDOW_SCHEMA_BACKFILL}
+        absent = [c for c in want if c not in f and c not in fill]
         if absent:
             raise ValueError(f"{path} has no column(s) {absent}")
         for key in want:
+            if key in fill:
+                value, dtype = fill[key]
+                data[key] = np.full(n, value, dtype=dtype)
+                continue
             data[key] = f[key][:n]
         for key, raw in f.attrs.items():
             if key in ("schema_version", "num_windows", "num_windows_written"):

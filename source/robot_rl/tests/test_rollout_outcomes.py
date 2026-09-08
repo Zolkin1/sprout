@@ -473,3 +473,58 @@ def test_the_perturbation_arms_are_recorded_per_window():
     assert "history_null" in ro.ROLLOUT_WINDOW_NAMES, (
         "history_null is a different signal and must not have been replaced")
     assert ro.SCHEMA_VERSION >= 3, "adding columns must bump the schema version"
+
+
+def test_the_reader_still_loads_a_pre_perturbation_recording(tmp_path):
+    """Bumping the schema must not orphan the data already on disk.
+
+    The perturbation columns took SCHEMA_VERSION 2 -> 3 and instantly made every existing
+    recording unreadable -- including the 32k-episode set the critic was fitted on.  A
+    schema-2 file has to keep loading, with the arms filled as "not perturbed", which is what
+    is TRUE of a file written before the arms existed rather than a zero standing in for an
+    unknown.
+    """
+    import h5py
+    import numpy as np
+
+    import rollout_outcomes as ro
+
+    p = tmp_path / "old.h5"
+    n = 3
+    with h5py.File(p, "w") as f:
+        f.attrs["schema_version"] = 2
+        f.attrs["num_windows"] = n
+        f.attrs["num_windows_written"] = n
+        f.create_dataset("episode_uid", data=np.arange(n, dtype=np.int64))
+        f.create_dataset("replan_index", data=np.zeros(n, np.int32))
+
+    got, attrs = ro.read_rollout_windows(
+        str(p), columns=["episode_uid", "replan_index",
+                         "perturb_null_history", "perturb_noisy_upper_cam"])
+    assert attrs["schema_version"] == 2
+    assert got["episode_uid"].tolist() == [0, 1, 2]
+    for col in ("perturb_null_history", "perturb_noisy_upper_cam"):
+        assert got[col].shape == (n,)
+        assert not got[col].any(), f"{col} must backfill as NOT perturbed"
+
+    # A column that is genuinely missing -- not merely newer than the file -- still refuses.
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="no column"):
+        ro.read_rollout_windows(str(p), columns=["episode_uid", "not_a_real_column"])
+
+
+def test_only_the_post_schema2_columns_are_backfillable():
+    """The backfill table must not grow into a general "absent means zero" policy.
+
+    That rule exists to be broken here and nowhere else: the perturbation arms did not exist
+    when a schema-2 file was written, so "not perturbed" is accurate.  `penetration_volume_m3`
+    is the counter-case -- absent when the collider model has no areas, where a zero would
+    assert a geometrically perfect plan.
+    """
+    import rollout_outcomes as ro
+
+    assert set(ro.WINDOW_SCHEMA_BACKFILL) == {
+        "perturb_null_history", "perturb_noisy_upper_cam"}
+    assert ro.READABLE_WINDOW_SCHEMAS == frozenset((2, 3))
+    for col in ro.WINDOW_SCHEMA_BACKFILL:
+        assert col in ro.ROLLOUT_WINDOW_NAMES
