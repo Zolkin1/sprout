@@ -22,6 +22,8 @@ are what stop it drifting back into two.
 
 from __future__ import annotations
 
+import json
+
 import os
 import pathlib
 import sys
@@ -525,6 +527,47 @@ def test_only_the_post_schema2_columns_are_backfillable():
 
     assert set(ro.WINDOW_SCHEMA_BACKFILL) == {
         "perturb_null_history", "perturb_noisy_upper_cam"}
-    assert ro.READABLE_WINDOW_SCHEMAS == frozenset((2, 3))
+    assert ro.READABLE_SCHEMAS == frozenset((2, 3))
     for col in ro.WINDOW_SCHEMA_BACKFILL:
         assert col in ro.ROLLOUT_WINDOW_NAMES
+
+
+def test_every_reader_admits_every_readable_schema():
+    """No reader may keep a strict `!= SCHEMA_VERSION` check.
+
+    `schema_version` is ONE number stamped on both tables, so a reader that accepts only the
+    newest orphans an older recording -- and there are two readers.  Fixing one and shipping
+    was exactly the failure: the window reader was loosened, the EPISODE reader was not, and
+    the sizing sweep failed a second time on the same class of error one call site along.
+    """
+    import inspect
+    import pathlib
+
+    import rollout_outcomes as ro
+
+    src = pathlib.Path(inspect.getsourcefile(ro)).read_text()
+    assert "!= SCHEMA_VERSION" not in src, (
+        "a reader still pins one exact schema; use READABLE_SCHEMAS")
+    # Both readers must consult the shared set.
+    assert src.count("if version not in READABLE_SCHEMAS:") == 2, (
+        "expected exactly two version gates (episodes and windows)")
+
+
+def test_the_episode_reader_loads_a_pre_perturbation_recording(tmp_path):
+    """The episode table is unchanged across schemas 2 and 3, so it needs only admitting."""
+    import h5py
+    import numpy as np
+
+    import rollout_outcomes as ro
+
+    p = tmp_path / "old.episodes.h5"
+    n = 2
+    with h5py.File(p, "w") as f:
+        f.attrs["schema_version"] = 2
+        f.attrs["family_names"] = json.dumps(["a"])
+        f.attrs["columns"] = json.dumps(list(ro.ROLLOUT_COLUMN_NAMES))
+        for name, dtype in ro.ROLLOUT_EPISODE_COLUMNS:
+            f.create_dataset(name, data=np.zeros(n, dtype=dtype))
+    got, attrs = ro.read_rollout_episodes(str(p))
+    assert attrs["schema_version"] == 2
+    assert got["episode_uid"].shape == (n,)

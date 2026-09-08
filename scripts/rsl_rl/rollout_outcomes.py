@@ -73,13 +73,15 @@ for _d in (os.path.join(_HERE, "eval"), _HERE):
 # 2: the per-chunk tracking-error block (`track_err`) and the strict violation columns.
 SCHEMA_VERSION: int = 3
 
-#: Window schema versions this reader accepts, newest first.
+#: Schema versions the readers accept.  ONE set, because ``schema_version`` is a single
+#: number stamped on both tables -- so a reader that accepts only the newest orphans the
+#: episode table of an older recording as surely as the window table.
 #:
 #: Bumping :data:`SCHEMA_VERSION` alone makes every recording already on disk unreadable, which
 #: is what happened when the perturbation columns landed: the 32k-episode v1 set the critic was
 #: fitted on stopped loading.  So the reader states which versions it can read, and what it
 #: substitutes for each one's missing columns.
-READABLE_WINDOW_SCHEMAS: frozenset[int] = frozenset((2, 3))
+READABLE_SCHEMAS: frozenset[int] = frozenset((2, 3))
 
 #: Columns added after schema 2, with the value to fill for an older file.
 #:
@@ -557,9 +559,13 @@ def read_rollout_episodes(path: str) -> tuple[dict[str, np.ndarray], dict]:
     attrs: dict = {}
     with h5py.File(str(path), "r") as f:
         version = int(f.attrs.get("schema_version", -1))
-        if version != SCHEMA_VERSION:
+        # The episode table's COLUMNS are unchanged across schemas 2 and 3 -- the
+        # perturbation arms went into the window table and the terrain grade into its own
+        # `chunks` group -- so an older file needs no backfill here, only admitting.
+        if version not in READABLE_SCHEMAS:
             raise ValueError(
-                f"{path} is schema_version {version}; this reader knows {SCHEMA_VERSION}. "
+                f"{path} is schema_version {version}; this reader knows "
+                f"{sorted(READABLE_SCHEMAS)}. "
                 "Re-record rather than reading it through the wrong contract.")
         for key in f.keys():
             cols[key] = f[key][...]
@@ -914,10 +920,10 @@ def read_rollout_windows(path: str, columns: list[str] | None = None
     attrs: dict = {}
     with h5py.File(str(path), "r") as f:
         version = int(f.attrs.get("schema_version", -1))
-        if version not in READABLE_WINDOW_SCHEMAS:
+        if version not in READABLE_SCHEMAS:
             raise ValueError(
                 f"{path} is schema_version {version}; this reader knows "
-                f"{sorted(READABLE_WINDOW_SCHEMAS)}.")
+                f"{sorted(READABLE_SCHEMAS)}.")
         n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
         want = list(columns) if columns is not None else [k for k in f.keys()]
         # A column added after this file's schema is BACKFILLED with the value that is true of
