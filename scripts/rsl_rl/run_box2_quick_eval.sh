@@ -47,7 +47,12 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
 export PYTHONPATH=source/robot_rl:source/motion_gen
 TRK=2026-08-20_16-36-10_mode11_decor_plan_v1
-CLIP=clips/box2_quick_train.h5
+#: The comparator library. Overridable because v1 and v2 are NOT comparable courses -- v2
+#: puts the goal 3 m further out with the boxes unmoved, so a v2 rate is lower than a v1 rate
+#: on the same policy for a reason that is not the policy (see make_box2_terrain --variant).
+#: An arm trained on v2 data therefore needs a v2 BASELINE, which means both arms of a
+#: comparison must name the same library here.
+CLIP=${CLIP:-clips/box2_quick_train.h5}
 GR=logs/box2/goal_regions.json
 OUT=logs/box2/quick/$TAG
 #: The distances box2_quick's tiles were built at, in TILE ORDER. The report needs them
@@ -56,7 +61,8 @@ DISTS="1.5 3.0"
 
 [ -f "$FM" ] || { echo "no such checkpoint: $FM" >&2; exit 2; }
 [ -f "$CLIP" ] || { echo "missing $CLIP -- build it with: python scripts/rsl_rl/make_box2_terrain.py \
---out_dir clips --prefix box2_quick --train_distances $DISTS --like clips/g1_mb_v5_body_mode11_decor.h5" >&2; exit 2; }
+--out_dir clips --prefix $(basename "$CLIP" _train.h5) --train_distances $DISTS \
+--variant <v1|v2> --like clips/g1_mb_v5_body_mode11_decor.h5" >&2; exit 2; }
 
 mkdir -p "$OUT"
 echo "[quick] $TAG  fm=$FM  $NEPS episodes/speed  $NENV envs  -> $OUT"
