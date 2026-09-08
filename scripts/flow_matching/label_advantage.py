@@ -402,26 +402,32 @@ def main() -> int:
                   "zero means the label is reproducing state difficulty and conditioning on it "
                   "cannot work.")
 
-        os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-        meta = {"n": int(args.n), "variant": args.variant, "percentile": float(args.percentile),
-                "null_spread": float(args.null_spread), "num_folds": folds,
-                "w_fail": float(args.w_fail), "progress_bins": int(args.progress_bins),
-                "speed_bins": int(args.speed_bins), "rollout": args.rollout,
-                "tail_chunks": int(args.tail_chunks),
-                "predictions": os.path.abspath(args.predictions),
-                "counts": counts, "per_family": {str(k): v for k, v in per_family.items()},
-                "g2_bands": gate,
-                "g2_skipped": ("quality_only" if quality_only else "")}
-        # `stratum` is the CELL binarize cut within, not a convenience: a consumer that
-        # re-derives the family x progress x speed crossing from `family_code` alone gets a
-        # different partition, and AWR standardizing over the wrong one puts back exactly the
-        # speed skew the stratified threshold removed (0.33 keep rate above 1.3 m/s against 0.23
-        # below 0.9). Saved so it is read rather than rebuilt.
-        np.savez(args.out, label=labels.astype(np.int8), advantage=a.astype(np.float32),
-                 bootstrapped=boot, episode_uid=uid, replan_index=ridx, family_code=fam,
-                 stratum=adv_mod.group_ids(fam, strata), val_tile=val_tile,
-                 meta=json.dumps(meta))
-        print(f"[label] wrote {args.out}")
+    # WRITTEN IN BOTH BRANCHES, and at THIS indentation deliberately. This block used to sit
+    # inside the `else` above, so a `--quality_only` fit skipped the G2 gate and silently
+    # skipped the WRITE with it: the run printed every statistic, returned 0, and left no
+    # advantage.npz -- which a downstream fine-tune then either refused or, worse, satisfied
+    # from a stale file. `meta`'s own `g2_skipped` field is the evidence it was always meant to
+    # run without the gate. Pinned by test_label_advantage_writes_under_quality_only.
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+    meta = {"n": int(args.n), "variant": args.variant, "percentile": float(args.percentile),
+            "null_spread": float(args.null_spread), "num_folds": folds,
+            "w_fail": float(args.w_fail), "progress_bins": int(args.progress_bins),
+            "speed_bins": int(args.speed_bins), "rollout": args.rollout,
+            "tail_chunks": int(args.tail_chunks),
+            "predictions": os.path.abspath(args.predictions),
+            "counts": counts, "per_family": {str(k): v for k, v in per_family.items()},
+            "g2_bands": gate,
+            "g2_skipped": ("quality_only" if quality_only else "")}
+    # `stratum` is the CELL binarize cut within, not a convenience: a consumer that
+    # re-derives the family x progress x speed crossing from `family_code` alone gets a
+    # different partition, and AWR standardizing over the wrong one puts back exactly the
+    # speed skew the stratified threshold removed (0.33 keep rate above 1.3 m/s against 0.23
+    # below 0.9). Saved so it is read rather than rebuilt.
+    np.savez(args.out, label=labels.astype(np.int8), advantage=a.astype(np.float32),
+             bootstrapped=boot, episode_uid=uid, replan_index=ridx, family_code=fam,
+             stratum=adv_mod.group_ids(fam, strata), val_tile=val_tile,
+             meta=json.dumps(meta))
+    print(f"[label] wrote {args.out}")
     return 0
 
 

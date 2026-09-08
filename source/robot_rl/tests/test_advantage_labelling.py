@@ -382,3 +382,44 @@ def test_the_combined_advantage_tracks_the_same_tail():
     a, _ = combined_n_step_advantage(np.zeros(g.size), q, rew, uid, ri, fail, 500,
                                      gamma=0.95, w_fail=0.0, valid=ok, tail_chunks=3)
     assert np.abs(a[g_ok] - (g - q)[g_ok]).max() < 1e-12
+
+
+def test_label_advantage_writes_under_quality_only():
+    """The sidecar write must not be nested inside the G2 gate's `else`.
+
+    It was, and the failure was silent in the worst way: a ``--quality_only`` fit skips the G2
+    gate (that gate bands by ``P(fail|s_t)`` and the survival head is untrained), and the write
+    went with it -- so the run printed every statistic, returned 0, and produced no
+    ``advantage.npz``.  A pipeline reading it then either refused or, if a previous run had left
+    one, trained on a STALE label with nothing anywhere saying so.
+
+    Checked structurally rather than by running the script, which needs a fitted
+    ``predictions.npz``: the ``np.savez`` must not be a descendant of the ``if quality_only``
+    statement in either direction.
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[3] / "scripts/flow_matching/label_advantage.py"
+    tree = ast.parse(src.read_text())
+
+    def is_quality_only_test(node: ast.If) -> bool:
+        return isinstance(node.test, ast.Name) and node.test.id == "quality_only"
+
+    gates = [n for n in ast.walk(tree) if isinstance(n, ast.If) and is_quality_only_test(n)]
+    assert gates, "the `if quality_only:` gate is gone; re-check where the write sits"
+
+    def saves(node) -> bool:
+        return any(isinstance(c, ast.Attribute) and c.attr == "savez"
+                   for c in ast.walk(node))
+
+    for gate in gates:
+        for branch, name in ((gate.body, "body"), (gate.orelse, "orelse")):
+            for stmt in branch:
+                assert not saves(stmt), (
+                    f"np.savez is inside the `if quality_only` {name}; a quality_only fit "
+                    "would write no advantage.npz while still returning 0")
+
+    # And it must actually still be there at all.
+    assert any(isinstance(n, ast.Attribute) and n.attr == "savez" for n in ast.walk(tree)), \
+        "label_advantage no longer writes a sidecar"
