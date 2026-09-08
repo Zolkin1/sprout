@@ -142,6 +142,16 @@ parser.add_argument("--num_episodes", type=int, default=0,
 parser.add_argument("--num_windows", type=int, default=100000,
                     help="Hard cap on re-plan windows; also sizes the pre-allocated file, so "
                          "set it above what --num_episodes will produce.")
+parser.add_argument("--terrain_reward", action="store_true",
+                    help="Grade the plan's terrain consistency ONCE PER RE-PLAN and write it "
+                         "as a `chunks` group of the episode file: one row per re-plan, keyed "
+                         "(episode_uid, replan_index), holding the SAME raw terms "
+                         "`inspect_terrain_reward.py --stage reward` writes per window. About "
+                         "60 bytes a row against ~30 kB for the window it is graded from, so "
+                         "it composes with --no_windows to give a terrain-reward eval that "
+                         "records nothing else. The spec it graded under is stamped on the "
+                         "group, and the offline re-grade reads that rather than its own "
+                         "defaults -- see tests/test_terrain_reward_parity.py.")
 parser.add_argument("--no_windows", action="store_true",
                     help="Record OUTCOMES ONLY -- write the episode table and no window "
                          "table at all. An EVAL needs success, the failure mode and "
@@ -416,7 +426,69 @@ def _twist_yaw(rd):
                       quat_apply_inverse(q, rd.root_ang_vel_w)], dim=-1)
 
 
-def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None) -> dict | None:
+def _replanned(cmd, tracker):
+    """Claim ``(episode_uid, replan_index)`` for the envs that re-planned this step.
+
+    **Hoisted out of :func:`_emit` because the claim must happen in BOTH modes.**  ``_emit``
+    is skipped entirely under ``--no_windows`` -- it is most of the per-step cost and none of
+    it reaches the episode table -- so while the claim lived inside it, a windowless run left
+    ``replan_index`` at zero and wrote ``n_replans = 0`` on every episode.  The terrain chunk
+    table is keyed on exactly that index and is most useful in precisely that mode, so the
+    counter now advances whether or not a window is written, and both consumers are handed
+    the same claim rather than each taking their own.
+
+    Args:
+        cmd: The ``FmTrackingCommand``.
+        tracker: The :class:`rollout_outcomes.RolloutEpisodeTracker`.
+
+    Returns:
+        ``(idx, uid, ridx)`` for the re-planning envs, or ``None`` when none did.
+    """
+    mask = cmd._fm_reinfer_mask
+    if not bool(mask.any()):
+        return None
+    idx = mask.nonzero(as_tuple=False).flatten()
+    uid, ridx = tracker.on_replan(idx)
+    return idx, uid, ridx
+
+
+def _terrain_chunk_batch(env, command_name: str, claim) -> dict:
+    """Grade the live plan for the re-planning envs, as one chunk-table batch.
+
+    Reads :func:`mdp.plan_terrain_terms`, which is the cached producer the three terrain
+    reward terms read, so the row recorded here is the number those terms would report.
+
+    **Graded over the WHOLE plan, which is what the critic was fitted on.**  The sidecar's
+    penalty is built from the unsuffixed ``contact_penalty`` / ``penetration_sum_m``, i.e. all
+    62 nodes; the ``_served`` twins are recorded beside them but are not that number.  A
+    served-only grade would score the 12 nodes that get executed and miss the tail, which is
+    where a plan that has read a staircase as a box commits to the jump.
+
+    Args:
+        env: The unwrapped env.
+        command_name: The :class:`FmTrackingCommand` term name.
+        claim: The ``(idx, uid, ridx)`` from :func:`_replanned`.
+
+    Returns:
+        A batch keyed by :data:`rollout_outcomes.ROLLOUT_CHUNK_NAMES`.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp import plan_terrain_terms  # noqa: PLC0415
+
+    idx, uid, ridx = claim
+    terms = plan_terrain_terms(env, command_name)
+    out = {"episode_uid": uid, "replan_index": ridx,
+           "env_id": idx.detach().to("cpu").numpy().astype(np.int32)}
+    for name in ro.TERRAIN_CHUNK_TERMS:
+        if name not in terms:
+            raise KeyError(
+                f"terrain_consistency returned no {name!r}; the chunk table's schema and the "
+                f"grader have diverged. Present: {sorted(k for k in terms)}")
+        out[name] = terms[name][idx].detach().to("cpu").numpy().astype(np.float32)
+    return out
+
+
+def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None,
+          claim=None) -> dict | None:
     """Assemble one batch of windows for the envs that re-planned this step.
 
     Everything here is read at ONE instant -- after ``env.step`` has run
@@ -431,15 +503,16 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None) -
         env: The unwrapped env.
         ring: The :class:`ProprioRing`.
         track_ring: The :class:`TrackErrRing`, or ``None`` when the strict checks are off.
+        claim: The ``(idx, uid, ridx)`` from :func:`_replanned`.  Required -- passing it is
+            what keeps the window and chunk tables on ONE claim, since ``on_replan`` bumps
+            the index and calling it twice per step would number them apart.
 
     Returns:
         The batch, or ``None`` when no env re-planned.
     """
-    mask = cmd._fm_reinfer_mask
-    if not bool(mask.any()):
+    if claim is None:
         return None
-    idx = mask.nonzero(as_tuple=False).flatten()
-    uid, ridx = tracker.on_replan(idx)
+    idx, uid, ridx = claim
     cpu = lambda t: t.detach().to("cpu").numpy()  # noqa: E731
 
     nominal = int(getattr(cmd, "_depth_lag_steps", 0) or 0)
@@ -567,6 +640,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                  if _spec.is_bootstrap else f"  (from {args_cli.tracking_spec})"))
         accum.attach_tracking(_spec)
         table = ro.RolloutOutcomeTable(family_names=family_names)
+        # The terrain grade is a property of the PLAN and the ground, so it needs no rollout
+        # state beyond the command term -- but the spec it ran under does have to travel, or
+        # an offline re-grade silently applies its own defaults to rows graded under others.
+        chunks = None
+        if bool(args_cli.terrain_reward):
+            from motion_gen import plan_geometry as _pg  # noqa: PLC0415
+            from motion_gen.terrain_consistency import TerrainConsistencySpec  # noqa: PLC0415
+            _tc = TerrainConsistencySpec()
+            chunks = ro.ChunkRewardTable(spec_meta={
+                "contact_speed_thresh": float(_tc.contact_speed_thresh),
+                "contact_dilate_nodes": int(_tc.contact_dilate_nodes),
+                "contact_max_gap_nodes": int(_pg.CONTACT_MAX_GAP_NODES),
+                "collider_spacing": float(_pg.DEFAULT_COLLIDER_SPACING),
+                "penetration_tol_m": float(_tc.penetration_tol_m),
+                "contact_deadband_m": float(_tc.contact_deadband_m),
+                "contact_weight": float(_tc.contact_weight),
+                "penetration_weight": float(_tc.penetration_weight),
+                "penetration_default_weight": float(_tc.penetration_default_weight),
+                "body_penetration_weights": dict(_tc.body_penetration_weights),
+                "served_nodes": int(_tc.served_nodes),
+                "graded": "whole_plan",
+            })
+            print(f"[terrain] grading every re-plan over the WHOLE plan "
+                  f"(spacing {_pg.DEFAULT_COLLIDER_SPACING:.3f} m, "
+                  f"thresh {_tc.contact_speed_thresh:.3f} m/s)")
         # The reset term the episode tracker wraps, so it can refresh the goal anchor INSIDE
         # the reset -- after the new episode has committed. A clip-free task spawns from the
         # manifest's route block instead, and the term is named for what it does.
@@ -704,9 +802,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     # Skipped entirely under --no_windows: `_emit` is where the depth
                     # rows, the proprio ring and the scan are assembled per re-plan, so it is
                     # most of the per-step cost and none of it reaches the episode table.
+                    # ONE claim per re-plan, shared: `on_replan` bumps `replan_index`, so
+                    # letting the window and chunk paths each claim would number them apart
+                    # and break the join they exist to support.
+                    claim = _replanned(cmd, tracker)
+                    if claim is not None and chunks is not None:
+                        chunks.append_batch(
+                            _terrain_chunk_batch(u, "traj_ref", claim))
                     if not no_win:
                         batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring,
-                                      track_ring)
+                                      track_ring, claim=claim)
                         if batch is not None:
                             writer.write_batch(batch)
                     if steps % 500 == 0:
@@ -724,13 +829,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                 # them inference tensors, and those cannot be updated in place outside it.
                 tracker.flush(u, torch.arange(int(u.num_envs), device=u.device))
         _report_goal_sanity(table)
-        table.write(ep_path, attrs=prov)
+        table.write(ep_path, attrs=prov, chunks=chunks)
         git_snapshot(stem + ".provenance")
         if no_win:
             print("[rollout] --no_windows: no window table written (outcomes only)")
         else:
             print(f"[rollout] {writer.written} windows -> {win_path}")
         print(f"[rollout] {len(table)} episodes -> {ep_path}")
+        if chunks is not None:
+            print(f"[rollout] {len(chunks)} terrain chunks -> {ep_path}:/chunks")
         env.close()
 
 

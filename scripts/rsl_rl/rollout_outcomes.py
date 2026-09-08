@@ -143,6 +143,53 @@ ROLLOUT_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
 ROLLOUT_COLUMN_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_EPISODE_COLUMNS)
 
 
+#: One row per RE-PLAN of the terrain-consistency grade, written when
+#: ``record_rollouts.py --terrain_reward`` is on.
+#:
+#: **The columns are the offline sidecar's, deliberately.**  ``inspect_terrain_reward.py
+#: --stage reward`` writes ``contact_penalty`` / ``penetration_sum_m`` per window under the
+#: same ``(episode_uid, replan_index)`` key, and the critic regresses on
+#: ``contact_penalty * contact_weight + penetration_sum_m * penetration_weight`` built from
+#: exactly those two.  Recording the same names under the same key is what makes the live and
+#: offline numbers joinable and diffable rather than merely similar -- which is the whole
+#: point of :mod:`test_terrain_reward_parity`.
+#:
+#: **The RAW terms are stored, never the penalty and never a reward**, matching this module's
+#: existing rule for the tracking error.  ``tau``, the per-body penetration weights and the
+#: contact/penetration mix all stay offline knobs, so a re-weighting costs an array op
+#: instead of a re-capture.
+ROLLOUT_CHUNK_COLUMNS: tuple[tuple[str, str], ...] = (
+    # --- identity / join; the SAME key the window table and the sidecar use ---------------
+    ("episode_uid", _L),
+    ("replan_index", _I),
+    ("env_id", _I),
+    # --- THE two terms the critic is fitted on -------------------------------------------
+    ("contact_penalty", _F),
+    ("penetration_sum_m", _F),
+    # --- the served-window twins (first `served_nodes` nodes) ----------------------------
+    # Recorded but NOT what the critic uses: the mode error lives in the tail of the plan,
+    # not in the 12 nodes that get executed.  Here so that choice stays measurable.
+    ("contact_penalty_served", _F),
+    ("penetration_sum_m_served", _F),
+    # --- alternative reductions and the vacuity guards ------------------------------------
+    ("penetration_volume_m3", _F),   # area-weighted, density-invariant
+    ("penetration_mean", _F),
+    ("max_penetration_m", _F),
+    ("contact_reward", _F),
+    ("clearance", _F),
+    ("support_fraction", _F),        # a plan that never plants a foot is charged nothing
+    ("contact_coverage", _F),
+    ("exempt_fraction", _F),
+)
+
+ROLLOUT_CHUNK_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_CHUNK_COLUMNS)
+
+#: The :func:`~motion_gen.terrain_consistency.terrain_consistency` keys the chunk table reads.
+#: Everything except the three join keys, which the recorder supplies.
+TERRAIN_CHUNK_TERMS: tuple[str, ...] = tuple(
+    n for n in ROLLOUT_CHUNK_NAMES if n not in ("episode_uid", "replan_index", "env_id"))
+
+
 # TODO(jump-off-front): this family fails far more than any other and it is not understood.
 #
 # Established, from the per-window goal offsets (clean data, independent of the contaminated
@@ -346,12 +393,16 @@ class RolloutOutcomeTable:
         """Episodes appended so far."""
         return len(self._rows)
 
-    def write(self, path: str, attrs: dict | None = None) -> None:
+    def write(self, path: str, attrs: dict | None = None,
+              chunks: "ChunkRewardTable | None" = None) -> None:
         """Write the table plus its provenance.
 
         Args:
             path: Destination ``.h5``.  Parent directories are created.
             attrs: Run provenance; every value is JSON-encoded so nested dicts survive.
+            chunks: An optional per-re-plan terrain-reward table, written into a ``chunks``
+                GROUP of the same file.  One artifact rather than two, because the chunk rows
+                join to these episodes and a pair of files can be separated.
         """
         import h5py
 
@@ -365,6 +416,106 @@ class RolloutOutcomeTable:
             f.attrs["family_names"] = json.dumps(self.family_names)
             for key, value in (attrs or {}).items():
                 f.attrs[key] = json.dumps(value, default=str)
+            if chunks is not None:
+                chunks.write_into(f)
+
+
+class ChunkRewardTable:
+    """Append-only per-RE-PLAN terrain-consistency table, written beside the episodes.
+
+    One row per re-plan, keyed ``(episode_uid, replan_index)`` -- the same key the window
+    table stamps and the same key ``inspect_terrain_reward.py --stage reward`` writes its
+    sidecar under.  That is what lets the live and offline grades be joined and differenced
+    rather than merely compared in aggregate.
+
+    Held in memory like :class:`RolloutOutcomeTable`: a 4000-episode arm is ~150k rows of 15
+    small columns, under 10 MB.
+    """
+
+    def __init__(self, spec_meta: dict | None = None) -> None:
+        """Start an empty table.
+
+        Args:
+            spec_meta: The :class:`~motion_gen.terrain_consistency.TerrainConsistencySpec`
+                and contact settings the rows were graded under, stamped onto the group.  The
+                offline re-grade READS this rather than restating its own defaults, so the
+                two sides cannot drift into grading different things while reporting the same
+                column names.
+        """
+        self._cols: dict[str, list[np.ndarray]] = {n: [] for n in ROLLOUT_CHUNK_NAMES}
+        self._n = 0
+        self.spec_meta = dict(spec_meta or {})
+
+    def append_batch(self, batch: dict[str, np.ndarray]) -> int:
+        """Add one row per element of ``batch``'s arrays.
+
+        Args:
+            batch: A dict whose keys are exactly :data:`ROLLOUT_CHUNK_NAMES`.
+
+        Returns:
+            How many rows were added.
+
+        Raises:
+            ValueError: On a missing or unexpected key, or on ragged lengths.  A missing
+                ``penetration_volume_m3`` is the expected way to get here: it is ABSENT (not
+                zero) when the collider model carries no areas, i.e. when the model was built
+                in extreme-point mode instead of by surface sampling.
+        """
+        want, got = set(ROLLOUT_CHUNK_NAMES), set(batch)
+        if want != got:
+            raise ValueError(
+                f"terrain chunk batch does not match the schema: missing {sorted(want - got)}"
+                f", unexpected {sorted(got - want)}. A missing `penetration_volume_m3` means "
+                "the collider model has no areas -- build it with a surface `spacing` rather "
+                "than in extreme-point mode.")
+        lengths = {len(np.atleast_1d(v)) for v in batch.values()}
+        if len(lengths) != 1:
+            raise ValueError(f"ragged terrain chunk batch: column lengths {lengths}")
+        n = lengths.pop()
+        for name, dtype in ROLLOUT_CHUNK_COLUMNS:
+            self._cols[name].append(np.asarray(batch[name], dtype=dtype).reshape(-1))
+        self._n += n
+        return n
+
+    def __len__(self) -> int:
+        """Rows appended so far."""
+        return self._n
+
+    def write_into(self, f) -> None:
+        """Write the rows as a ``chunks`` group of an open episodes file.
+
+        Args:
+            f: An open, writable :class:`h5py.File`.
+        """
+        g = f.create_group("chunks")
+        for name, dtype in ROLLOUT_CHUNK_COLUMNS:
+            parts = self._cols[name]
+            data = (np.concatenate(parts) if parts else np.zeros(0, dtype=dtype))
+            g.create_dataset(name, data=data.astype(dtype))
+        g.attrs["columns"] = json.dumps(list(ROLLOUT_CHUNK_NAMES))
+        g.attrs["n_rows"] = int(self._n)
+        g.attrs["spec"] = json.dumps(self.spec_meta, sort_keys=True, default=str)
+
+
+def read_rollout_chunks(path: str) -> tuple[dict[str, np.ndarray], dict]:
+    """Read the ``chunks`` group written by :meth:`ChunkRewardTable.write_into`.
+
+    Args:
+        path: The episodes ``.h5``.
+
+    Returns:
+        ``(columns, spec)``; ``({}, {})`` when the file carries no chunk group (which is what
+        a run without ``--terrain_reward`` produces).
+    """
+    import h5py
+
+    with h5py.File(path, "r") as f:
+        if "chunks" not in f:
+            return {}, {}
+        g = f["chunks"]
+        cols = {name: g[name][:] for name in ROLLOUT_CHUNK_NAMES if name in g}
+        spec = json.loads(g.attrs.get("spec", "{}"))
+    return cols, spec
 
 
 def read_rollout_episodes(path: str) -> tuple[dict[str, np.ndarray], dict]:

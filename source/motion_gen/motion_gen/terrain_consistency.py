@@ -283,6 +283,47 @@ def _pen_reductions(
     }
 
 
+#: Elements of the ``(N, P, B)`` working tensor the SDF pass may materialise at once.
+#:
+#: :func:`~motion_gen.terrain.box_sdf.box_union_sdf` keeps about five such tensors live at
+#: peak -- ``sq_outside``, ``max_q``, the in-loop ``q`` and ``pos``, and ``sd`` -- so the peak
+#: is roughly ``5 * budget * 4`` bytes at fp32, i.e. **~8 GB** at this value.  Sized for the
+#: H100s the evals run on, where that is under a tenth of the card; turn it down for a small
+#: GPU, and note that doing so changes only speed, never the answer beyond float association.
+#:
+#: **The bound is on ``N * P * B``, not on ``N * P``.**  A fixed NODE count scales its working
+#: set with the batch (8 nodes is 0.07 GB at 384 envs and 1.5 GB at 8192) and a budget that
+#: ignores the box count scales with tile complexity (a 12-box staircase tile is 4x a 3-box
+#: two-box tile).  Bounding the product is invariant to both, so one number holds for every
+#: env count and every terrain.
+#:
+#: At 8192 envs, 1886 collider points and the two-box tile's 3 boxes this yields 8 nodes a
+#: pass -- the value that was hardcoded before it was derived.
+SDF_ELEMENT_BUDGET: int = 400_000_000
+
+
+def sdf_chunk_nodes(batch: int, num_points: int, num_boxes: int = 1) -> int:
+    """Plan nodes per SDF pass that keep the working set inside :data:`SDF_ELEMENT_BUDGET`.
+
+    **One tiling rule for the live reward and the offline grader.**  The tiling changes the
+    ORDER the per-point depths are summed in, so two callers using different rules agree only
+    to floating-point association -- about one ULP, harmless but a residual that has to be
+    re-explained every time the two grades are diffed.  Sharing the rule makes them
+    bit-identical whenever the batch, point count and box count all match.
+
+    Args:
+        batch: Windows (or envs) being graded at once.
+        num_points: Collider points per node, i.e. ``model.num_points``.
+        num_boxes: Padded boxes per element, i.e. ``terrain.boxes.shape[1]``.
+
+    Returns:
+        At least 1; a batch large enough to exceed the budget on a single node gets one node a
+        pass, which is as small as the tiling goes.
+    """
+    per_node = max(int(batch) * int(num_points) * max(int(num_boxes), 1), 1)
+    return max(1, SDF_ELEMENT_BUDGET // per_node)
+
+
 def terrain_consistency(
     points: torch.Tensor,
     contact: dict[str, torch.Tensor],

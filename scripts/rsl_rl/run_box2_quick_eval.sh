@@ -14,6 +14,14 @@
 #   speeds     0.83, 1.17, 1.50 -- around the parent's peak, i.e. the highest base rates,
 #                                  which is where a fixed episode budget has the most power
 #
+# WHAT IT MEASURES. Two things, and the SECOND is the primary one:
+#   reached_goal        -- the by-product, and the weaker signal (see the resolution note)
+#   the terrain grade   -- one row per re-plan in the episode file's `chunks` group, holding
+#                          the same raw terms the offline sidecar writes and the critic is
+#                          fitted on. `--terrain_reward` costs ~60 bytes a re-plan against
+#                          ~30 kB for the window it grades, so it composes with --no_windows:
+#                          nothing else is recorded and the run stays this fast.
+#
 # WHAT IT CAN AND CANNOT RESOLVE. At ~700 episodes/cell the per-cell 95% interval is about
 # +-0.027 and the pooled one about +-0.015. So this is a TRIAGE instrument: it separates
 # "clearly better/worse" from "no big effect". It cannot resolve the ~+0.008 that the full
@@ -29,6 +37,11 @@ set -u
 FM=${1:?usage: run_box2_quick_eval.sh <fm_checkpoint> <out_tag> [episodes_per_speed]}
 TAG=${2:?usage: run_box2_quick_eval.sh <fm_checkpoint> <out_tag> [episodes_per_speed]}
 NEPS=${3:-1400}
+#: Envs, overridable because the right number is a property of the BOX not the eval: 384 fits
+#: a 12 GB dev card, 8192 suits an H100's 96 GB and is ~21x the throughput. The terrain grade
+#: tiles its SDF pass to a fixed element budget (`motion_gen.terrain_consistency`), so its
+#: working set is ~7.4 GB at either -- the env itself is what scales.
+NENV=${NENV:-384}
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
@@ -37,7 +50,6 @@ TRK=2026-08-20_16-36-10_mode11_decor_plan_v1
 CLIP=clips/box2_quick_train.h5
 GR=logs/box2/goal_regions.json
 OUT=logs/box2/quick/$TAG
-NENV=384
 #: The distances box2_quick's tiles were built at, in TILE ORDER. The report needs them
 #: because `terrain_id` is a tile index: 3.00 m is tile 1 here and tile 3 in the full grid.
 DISTS="1.5 3.0"
@@ -47,7 +59,7 @@ DISTS="1.5 3.0"
 --out_dir clips --prefix box2_quick --train_distances $DISTS --like clips/g1_mb_v5_body_mode11_decor.h5" >&2; exit 2; }
 
 mkdir -p "$OUT"
-echo "[quick] $TAG  fm=$FM  $NEPS episodes/speed  -> $OUT"
+echo "[quick] $TAG  fm=$FM  $NEPS episodes/speed  $NENV envs  -> $OUT"
 for spd in 0.83 1.17 1.50; do
   d="$OUT/train_v${spd}"
   if [ -f "$d/rollout_${TRK}.episodes.h5" ]; then echo "[quick] SKIP $spd (exists)"; continue; fi
@@ -55,7 +67,7 @@ for spd in 0.83 1.17 1.50; do
   ./env_isaaclab/bin/python scripts/rsl_rl/record_rollouts.py \
     --task=G1-box2-finetune --load_run "$TRK" --fm_checkpoint "$FM" \
     --clip "$CLIP" --clip_device cpu --goal_regions "$GR" \
-    --num_envs $NENV --num_episodes "$NEPS" --no_windows \
+    --num_envs $NENV --num_episodes "$NEPS" --no_windows --terrain_reward \
     --output_dir "$d" \
     env.commands.traj_ref.freeform_speed_min=$spd \
     env.commands.traj_ref.freeform_speed_max=$spd \

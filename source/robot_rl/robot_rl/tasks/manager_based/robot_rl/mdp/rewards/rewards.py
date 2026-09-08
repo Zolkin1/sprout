@@ -214,12 +214,10 @@ def torque_limits(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg = SceneEntit
 # Terrain consistency: does the PLAN's own geometry agree with the ground?
 ##
 
-#: Plan nodes per SDF pass inside the reward.
-#:
-#: The SDF's working set is ``envs * nodes * points * boxes``; at 512 envs, 64 nodes, 1462
-#: surface points and a handful of boxes that is over a gigabyte as one tensor, so it is
-#: chunked. 8 nodes keeps the peak in the low hundreds of MB for 8 extra kernel launches.
-_TERRAIN_CHUNK_NODES: int = 8
+# The SDF tiling is NOT a constant here: it is derived per call from
+# `motion_gen.terrain_consistency.sdf_chunk_nodes`, the same rule the offline grader uses. A
+# fixed node count scales its working set with the env count -- 8 nodes is 0.07 GB at 384 envs
+# and 1.48 GB at 8192 -- so an eval scaled up for speed would run out of memory instead.
 
 
 def _terrain_consistency(env: ManagerBasedRLEnv, command_name: str) -> dict[str, torch.Tensor]:
@@ -249,7 +247,8 @@ def _terrain_consistency(env: ManagerBasedRLEnv, command_name: str) -> dict[str,
             zeros: a zero here reads as a geometrically perfect plan.
     """
     from motion_gen.plan_geometry import plan_collider_points          # noqa: PLC0415
-    from motion_gen.terrain_consistency import terrain_consistency     # noqa: PLC0415
+    from motion_gen.terrain_consistency import (                       # noqa: PLC0415
+        sdf_chunk_nodes, terrain_consistency)
 
     cached = getattr(env, "_terrain_consistency_cache", None)
     step = int(env.common_step_counter)
@@ -267,10 +266,34 @@ def _terrain_consistency(env: ManagerBasedRLEnv, command_name: str) -> dict[str,
     model = cmd.plan_collider_model()
     base_pos, base_rot, joint_pos = cmd.plan_world_pose()
     points = plan_collider_points(base_pos, base_rot, joint_pos, model)
-    out = terrain_consistency(points, contact, env.scene.terrain.terrain_collider_boxes(),
-                              model, chunk_nodes=_TERRAIN_CHUNK_NODES)
+    terrain = env.scene.terrain.terrain_collider_boxes()
+    out = terrain_consistency(
+        points, contact, terrain, model,
+        chunk_nodes=sdf_chunk_nodes(points.shape[0], model.num_points,
+                                    terrain.boxes.shape[1]))
     env._terrain_consistency_cache = (step, out)
     return out
+
+
+def plan_terrain_terms(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
+                       ) -> dict[str, torch.Tensor]:
+    """The full terrain-consistency grade of the live plan, every reduction.
+
+    The public face of the same cached producer the three reward terms read, so a consumer
+    that wants more than one scalar -- the rollout recorder's per-re-plan chunk table -- gets
+    the SAME numbers the rewards would report rather than a second grade of its own.  Calling
+    this and then a reward term in the same step costs one evaluation, not two.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The :class:`FmTrackingCommand` term name.
+
+    Returns:
+        The :func:`~motion_gen.terrain_consistency.terrain_consistency` mapping: the two
+        penalties, their ``_served`` twins, the alternative reductions and the per-node
+        arrays.
+    """
+    return _terrain_consistency(env, command_name)
 
 
 def plan_terrain_contact(env: ManagerBasedRLEnv, command_name: str = "traj_ref"

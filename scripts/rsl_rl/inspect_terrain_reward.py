@@ -68,6 +68,7 @@ from motion_gen.plan_geometry import (                                    # noqa
 )
 from motion_gen.terrain_consistency import (                              # noqa: E402
     TerrainConsistencySpec,
+    sdf_chunk_nodes,
     terrain_consistency,
 )
 import terrain_reward_io as trio                                          # noqa: E402
@@ -232,8 +233,9 @@ def _grade_rows(
                                    max_gap=max_gap)
             terrain = trio.terrain_for_rows(table, tid, corner, device=device)
             out = terrain_consistency(pts, contact, terrain, model, spec,
-                                      chunk_nodes=max(1, 8_000_000 //
-                                                      max(len(idx) * model.num_points, 1)))
+                                      chunk_nodes=sdf_chunk_nodes(
+                                          len(idx), model.num_points,
+                                          terrain.boxes.shape[1]))
 
             for k in scalars:
                 acc[k].append(out[k].cpu().numpy())
