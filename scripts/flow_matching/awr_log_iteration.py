@@ -184,6 +184,41 @@ def ft_curve(ft_dir: str, iteration: int, epochs_per_iter: int) -> list[dict]:
     return rows
 
 
+def start_run(args) -> int:
+    """Create the arm's run and stamp its configuration, before any iteration finishes.
+
+    Silencing the child stages bought one run per arm but cost the live view: the loop's own
+    row is only written when an iteration ENDS, so nothing reached wandb for the first 25-40
+    minutes, and a crash inside iteration 1 left no record at all. This makes the run exist
+    from the first minute, carrying what the loop is configured to do, so its absence means a
+    launch failure rather than patience.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        0 always -- telemetry must never fail a loop.
+    """
+    cfg = {"tag": args.tag, "buffer": args.buffer, "refresh": args.refresh,
+           "iterations": args.iterations, "epochs_per_iter": args.epochs_per_iter,
+           "parent": args.parent, "git_head": args.git_head, "root": args.root,
+           "gpu": args.gpu, "seed": args.seed}
+    print(f"[awr-log] start {args.run_id}: {cfg}")
+    if args.dry_run:
+        return 0
+    try:
+        import wandb  # noqa: PLC0415
+
+        run = wandb.init(project=args.project, id=args.run_id, resume="allow",
+                        name=args.run_name or args.run_id, job_type="loop",
+                        config={k: v for k, v in cfg.items() if v not in ("", None)})
+        run.finish()
+        print(f"[awr-log] created {args.project}/{args.run_id}")
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"[awr-log] WARNING wandb start skipped: {type(exc).__name__}: {exc}")
+    return 0
+
+
 def main() -> int:
     """Parse arguments and append one row to the loop run.
 
@@ -193,9 +228,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--root", required=True)
-    p.add_argument("--iteration", type=int, required=True)
-    p.add_argument("--critic_dir", required=True)
-    p.add_argument("--ft_dir", required=True)
+    p.add_argument("--iteration", type=int, default=0)
+    p.add_argument("--critic_dir", default="")
+    p.add_argument("--ft_dir", default="")
     p.add_argument("--project", default="robot_rl_awr")
     p.add_argument("--run_id", required=True, help="stable id so every iteration appends to "
                                                    "ONE run rather than making a new one")
@@ -205,7 +240,16 @@ def main() -> int:
                    help="fine-tune epochs per iteration, for the global epoch axis; the "
                         "artifact's own value wins when it disagrees")
     p.add_argument("--dry_run", action="store_true", help="print the row, log nothing")
+    p.add_argument("--mode", choices=("start", "iteration"), default="iteration",
+                   help="'start' creates the run and stamps its config before any iteration "
+                        "has finished, so the arm is visible from the first minute")
+    for name in ("tag", "parent", "git_head"):
+        p.add_argument(f"--{name}", type=str, default="")
+    for name in ("buffer", "refresh", "iterations", "gpu", "seed"):
+        p.add_argument(f"--{name}", type=int, default=0)
     a = p.parse_args()
+    if a.mode == "start":
+        return start_run(a)
 
     try:
         row = collect_row(a.root, a.iteration, a.critic_dir, a.ft_dir)

@@ -105,6 +105,16 @@ echo "==================================================================="
 
 fail () { echo "[awr] FAILED at $1 (iteration $2)" >&2; exit 1; }
 
+# Create the run NOW, before any iteration finishes. The loop's own row is written only at
+# the end of an iteration, so without this nothing reaches wandb for the first 25-40 minutes
+# and a crash inside iteration 1 leaves no record at all -- the arm's absence from the
+# sidebar has to mean "launch failed", not "wait longer".
+"$PY" -u scripts/flow_matching/awr_log_iteration.py --mode start \
+  --root "$ROOT" --project "$PROJECT" --run_id "loop_$TAG" --run_name "awr_$TAG" \
+  --tag "$TAG" --buffer "$BUFFER" --refresh "$REFRESH" --iterations "$ITERS" \
+  --epochs_per_iter "$EPOCHS_FT" --parent "$PARENT" --git_head "$HEAD" \
+  --gpu "$GPU" --seed "$SEED" || true
+
 for (( it=1; it<=ITERS; it++ )); do
   INC="$ROOT/$(printf 'inc_%03d' "$it")"
   ITD="$ROOT/$(printf 'iter_%03d' "$it")"
@@ -137,7 +147,15 @@ for (( it=1; it<=ITERS; it++ )); do
   # the episode budget will produce: as the policy improves episodes survive longer and make
   # MORE re-plans each, so a cap sized for iteration 1 would silently truncate iteration 5
   # and quietly shrink the buffer. `awr_buffer adopt` refuses a run where it bound.
-  NWIN=$(( COLLECT * 150 ))
+  # Sized from the EPISODE LENGTH CAP, not a guessed windows-per-episode. At
+  # episode_length_s=40, a 0.02 s control step and K=12 that is 40/0.24 = 167 re-plans for an
+  # episode that runs the full clock, so an env can contribute at most ROUNDS * 167 windows
+  # once the claim is gated by the quota. The old `COLLECT * 150` was calibrated on
+  # total-count collections whose episodes were TRUNCATED at ~30 windows, and it bound at
+  # 300k on the first round-based run. `adopt` refuses a run where the cap bound, so an
+  # under-estimate costs a re-collection rather than a silently short buffer.
+  WIN_PER_EP="${WIN_PER_EP:-170}"
+  NWIN=$(( ENVS * ROUNDS * WIN_PER_EP ))
 
   echo ""
   echo "[awr] ####### iteration $it/$ITERS  ($NEPS episodes)  $(date +%H:%M) #######"

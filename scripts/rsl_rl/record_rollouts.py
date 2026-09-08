@@ -437,7 +437,7 @@ def _twist_yaw(rd):
                       quat_apply_inverse(q, rd.root_ang_vel_w)], dim=-1)
 
 
-def _replanned(cmd, tracker):
+def _replanned(cmd, tracker, quota: int = 0):
     """Claim ``(episode_uid, replan_index)`` for the envs that re-planned this step.
 
     **Hoisted out of :func:`_emit` because the claim must happen in BOTH modes.**  ``_emit``
@@ -451,11 +451,27 @@ def _replanned(cmd, tracker):
     Args:
         cmd: The ``FmTrackingCommand``.
         tracker: The :class:`rollout_outcomes.RolloutEpisodeTracker`.
+        quota: Under ``--episodes_per_env``, stop claiming for an env once it has completed
+            this many episodes.  0 disables the gate.
+
+            **This is what keeps a round-based collection the same SIZE as what it keeps.**
+            A round ends when the slowest env finishes its k-th episode, so a fast env spends
+            most of the run on episodes 2, 3, 4 -- which `awr_buffer.first_per_env` then
+            discards, because keeping them would reintroduce the duration bias rounds exist
+            to remove. Recording them anyway wrote 150 windows per env where 33 were wanted:
+            the window cap bound at 300k, and raising it would have meant ~9 GB increments to
+            grade and store for a quarter of the content. The episode still SIMULATES to its
+            end -- only the window claim is skipped -- so nothing about the run changes except
+            what reaches the table.
 
     Returns:
         ``(idx, uid, ridx)`` for the re-planning envs, or ``None`` when none did.
     """
     mask = cmd._fm_reinfer_mask
+    if quota > 0:
+        done = torch.as_tensor(tracker.completed_per_env >= int(quota),
+                               device=mask.device)
+        mask = mask & ~done
     if not bool(mask.any()):
         return None
     idx = mask.nonzero(as_tuple=False).flatten()
@@ -834,7 +850,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     # ONE claim per re-plan, shared: `on_replan` bumps `replan_index`, so
                     # letting the window and chunk paths each claim would number them apart
                     # and break the join they exist to support.
-                    claim = _replanned(cmd, tracker)
+                    claim = _replanned(cmd, tracker, quota=(want_rounds or 0))
                     if claim is not None and chunks is not None:
                         chunks.append_batch(
                             _terrain_chunk_batch(u, "traj_ref", claim, tracker))
