@@ -1,17 +1,33 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Log one AWR iteration's headline numbers to the loop-level wandb run.
+"""Log an AWR loop into ONE wandb run per arm.
 
-The critic and the fine-tune each open their OWN wandb run, joined into one group by
-``WANDB_RUN_GROUP`` (both scripts pass no ``group=`` to ``init``, so the environment is
-honoured -- no change was needed in either).  Those runs carry per-EPOCH detail.  What they
-cannot carry is the series across iterations, because each one is a different run: so this
-opens a third run, one per loop, keyed on ``iteration``, and appends a row per iteration by
-reading the artifacts the stages already wrote.
+**One run, not one per stage.**  The obvious wiring -- let ``fit_value`` and
+``finetune_generator`` each open their own run and join them with ``WANDB_RUN_GROUP`` -- was
+tried and is wrong to use.  ``finetune_generator`` takes no ``--run_name`` and falls back to
+its output directory's basename, which is ``ft`` for every iteration, so the sidebar fills
+with identically-named runs whose only distinguishing feature is their colour; and the count
+grows as ``2 * iterations * arms``.  Worse, each fine-tune restarts its step axis at 0, so
+the thing one most wants to see -- whether the policy is still improving as the loop turns --
+is split across runs that cannot be overlaid.
+
+So the CHILD stages log nothing (the orchestrator passes ``--no_wandb``), and this script
+carries the whole loop: it resumes one fixed run id per arm and appends, reading the
+artifacts each stage already wrote.  Two step axes, declared so neither disturbs the other:
+
+  * ``ft/global_epoch`` -- ``(iteration - 1) * epochs + epoch``, so the fine-tune's per-epoch
+    train/val curve is CONTINUOUS across iterations and reads as one training run, which is
+    what it is.
+  * ``iteration`` -- the buffer's composition, the critic's out-of-fold quality, and the AWR
+    weight statistics, one point per iteration.
+
+The cost, stated because it is a real loss: the critic's PER-EPOCH curves go to its stdout
+and nowhere machine-readable, so only its end-of-fit out-of-fold metrics reach wandb. That is
+the right granularity for a loop view, but it is not the same as having them.
 
 Nothing here may take down a loop.  Telemetry failure prints a warning and exits 0 -- the
-run's real outputs are the checkpoints and the manifests on disk, and this repo already treats
-wandb that way in ``fit_value`` and ``train``.
+run's real outputs are the checkpoints and the manifests on disk, and this repo already
+treats wandb that way in ``fit_value`` and ``train``.
 """
 
 from __future__ import annotations
@@ -139,6 +155,35 @@ def collect_row(root: str, iteration: int, critic_dir: str, ft_dir: str) -> dict
     return row
 
 
+def ft_curve(ft_dir: str, iteration: int, epochs_per_iter: int) -> list[dict]:
+    """One row per fine-tune EPOCH, on a step axis that continues across iterations.
+
+    Args:
+        ft_dir: The fine-tune's output directory.
+        iteration: 1-based iteration number.
+        epochs_per_iter: Epochs each iteration runs, used to offset the global axis.  Read
+            from the artifact when it disagrees, so a changed ``--epochs`` mid-loop does not
+            silently overlay two iterations on the same steps.
+
+    Returns:
+        Rows ready to log, each carrying ``ft/global_epoch``.
+    """
+    ft = _read(os.path.join(ft_dir, "finetune.json"))
+    hist = ft.get("history") or []
+    if not hist:
+        return []
+    per = int(ft.get("args", {}).get("epochs") or epochs_per_iter or len(hist))
+    base = (int(iteration) - 1) * per
+    rows: list[dict] = []
+    for i, e in enumerate(hist):
+        r = {"ft/global_epoch": base + i + 1, "ft/iteration": int(iteration)}
+        for key, val in e.items():
+            if isinstance(val, (int, float)) and key != "epoch":
+                r[f"ft/{key}"] = val
+        rows.append(r)
+    return rows
+
+
 def main() -> int:
     """Parse arguments and append one row to the loop run.
 
@@ -156,6 +201,9 @@ def main() -> int:
                                                    "ONE run rather than making a new one")
     p.add_argument("--run_name", default="")
     p.add_argument("--group", default="")
+    p.add_argument("--epochs_per_iter", type=int, default=0,
+                   help="fine-tune epochs per iteration, for the global epoch axis; the "
+                        "artifact's own value wins when it disagrees")
     p.add_argument("--dry_run", action="store_true", help="print the row, log nothing")
     a = p.parse_args()
 
@@ -164,29 +212,44 @@ def main() -> int:
     except Exception as exc:                                  # noqa: BLE001
         print(f"[awr-log] WARNING could not gather metrics: {type(exc).__name__}: {exc}")
         return 0
-    print(f"[awr-log] iteration {a.iteration}: {len(row) - 1} metrics")
     for k in sorted(row):
         print(f"    {k} = {row[k]}")
+    curve = ft_curve(a.ft_dir, a.iteration, a.epochs_per_iter)
+    print(f"[awr-log] iteration {a.iteration}: {len(row) - 1} metrics, "
+          f"{len(curve)} fine-tune epoch rows")
     if a.dry_run:
+        for r in curve:
+            print(f"    curve {r}")
         return 0
 
     try:
         import wandb  # noqa: PLC0415
 
+        # ONE run per arm, resumed. `resume="allow"` creates it on the first iteration and
+        # appends on every later one, so the sidebar holds one row per arm however long the
+        # loop runs -- against `2 * iterations * arms` under per-stage runs.
         run = wandb.init(project=a.project, id=a.run_id, resume="allow",
                         name=a.run_name or a.run_id, group=a.group or None,
                         job_type="loop")
-        # Every series is against `iteration`, not wandb's auto-incrementing `_step`: the
-        # rows arrive one per process, so an implicit step would number them by call order
-        # and a resumed loop would restart at 0.
+        # TWO step axes in one run, each declared. Without this every series would be
+        # plotted against wandb's auto-incrementing `_step`, which counts LOG CALLS -- so
+        # the per-iteration metrics and the per-epoch curve would interleave on a shared
+        # axis that means neither, and a resumed loop would restart it at 0.
         wandb.define_metric("iteration")
-        wandb.define_metric("buffer/*", step_metric="iteration")
-        wandb.define_metric("critic/*", step_metric="iteration")
-        wandb.define_metric("awr/*", step_metric="iteration")
-        wandb.define_metric("ft/*", step_metric="iteration")
+        wandb.define_metric("ft/global_epoch")
+        for prefix in ("buffer/*", "critic/*", "awr/*", "ft/final/*", "ft/epochs"):
+            wandb.define_metric(prefix, step_metric="iteration")
+        # Listed explicitly rather than as `ft/*`: the `ft/final/*` and `ft/epochs` series
+        # also start with `ft/`, and wandb's glob resolution between overlapping patterns is
+        # not something to rely on for which axis a series lands on.
+        for prefix in ("ft/train_flow_mse", "ft/val_flow_mse", "ft/lr", "ft/secs",
+                       "ft/is_best", "ft/iteration"):
+            wandb.define_metric(prefix, step_metric="ft/global_epoch")
+        for r in curve:
+            run.log(r)
         run.log(row)
         run.finish()
-        print(f"[awr-log] appended to {a.project}/{a.run_id}")
+        print(f"[awr-log] appended iteration {a.iteration} to {a.project}/{a.run_id}")
     except Exception as exc:                                  # noqa: BLE001
         print(f"[awr-log] WARNING wandb logging skipped: {type(exc).__name__}: {exc}")
     return 0

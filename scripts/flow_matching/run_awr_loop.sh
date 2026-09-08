@@ -78,7 +78,6 @@ done
   echo "  left to keep."; exit 2; }
 [ "$ITERS" -ge 1 ] || { echo "REFUSING: --iterations must be at least 1."; exit 2; }
 ROOT="${ROOT:-/mnt/zolkin_new/sprout/awr_$TAG}"
-GROUP="awr_$TAG"
 # The drop seed is derived from the tag, so the two arms churn differently and a re-run of
 # one arm reproduces its own churn exactly.
 SEED=$(( $(printf '%s' "$TAG" | cksum | cut -d' ' -f1) % 100000 ))
@@ -101,7 +100,7 @@ echo "[awr] tag $TAG  gpu $GPU  worktree $HEAD"
 echo "[awr] buffer $BUFFER episodes, refresh $REFRESH, $ITERS iterations"
 echo "[awr] parent $PARENT"
 echo "[awr] root   $ROOT"
-echo "[awr] wandb  $PROJECT / group $GROUP / seed $SEED"
+echo "[awr] wandb  $PROJECT / ONE run 'loop_$TAG' / seed $SEED"
 echo "==================================================================="
 
 fail () { echo "[awr] FAILED at $1 (iteration $2)" >&2; exit 1; }
@@ -205,14 +204,15 @@ for (( it=1; it<=ITERS; it++ )); do
     echo "[awr] 6/8 critic      SKIP (exists)"
   else
     echo "[awr] 6/8 critic      fresh fit, $EPOCHS_CRITIC epochs, 2 folds"
-    WANDB_RUN_GROUP="$GROUP" WANDB_JOB_TYPE="critic" \
-    "$PY" -u scripts/flow_matching/fit_value.py "$BUF_STEM" \
+    # `--no_wandb`: the CHILD stages log nothing. One run per arm is assembled by
+    # `awr_log_iteration.py` from the artifacts instead -- see its docstring for why
+    # per-stage runs were tried and abandoned (20 runs, three of them all named `ft`, and a
+    # fine-tune curve split across runs that cannot be overlaid).
+    "$PY" -u scripts/flow_matching/fit_value.py "$BUF_STEM" --no_wandb \
       --fm_checkpoint "$PARENT" \
       --reward_npz "$BUF_NPZ" \
       --clip_c 2.5 --window 3 --quality_kind mse --quality_only \
       --folds 2 --epochs "$EPOCHS_CRITIC" --variants V_priv --device cuda \
-      --wandb_project "$PROJECT" \
-      --run_name "$(printf '%s_iter%02d_critic' "$TAG" "$it")" \
       --out "$CRITIC" > "$ITD/critic.log" 2>&1 \
       || fail "critic (see $ITD/critic.log)" "$it"
   fi
@@ -236,23 +236,22 @@ for (( it=1; it<=ITERS; it++ )); do
     echo "[awr] 8/8 finetune    SKIP (exists)"
   else
     echo "[awr] 8/8 finetune    $EPOCHS_FT epochs from $(basename "$(dirname "$POLICY")")"
-    WANDB_RUN_GROUP="$GROUP" WANDB_JOB_TYPE="finetune" \
-    "$PY" -u scripts/flow_matching/finetune_generator.py \
+    "$PY" -u scripts/flow_matching/finetune_generator.py --no_wandb \
       --pretrained "$POLICY" \
       --rollout "${BUF_STEM}.h5" \
       --labels "$CRITIC/advantage.npz" \
       --awr_beta "$BETA" --awr_normalize global --awr_center none --awr_balance none \
       --awr_clip 20.0 --batch_size 256 --num_workers "$WORKERS" \
       --epochs "$EPOCHS_FT" --ckpt_every 1 --device cuda \
-      --wandb_project "$PROJECT" \
       --out "$FT" > "$ITD/ft.log" 2>&1 || fail "finetune (see $ITD/ft.log)" "$it"
   fi
   fi                                       # end of the stages-5-8 block
 
   # ---- iteration-level telemetry, and the previous buffer's disk ---------------------
-  WANDB_RUN_GROUP="$GROUP" "$PY" -u scripts/flow_matching/awr_log_iteration.py \
+  "$PY" -u scripts/flow_matching/awr_log_iteration.py \
     --root "$ROOT" --iteration "$it" --critic_dir "$CRITIC" --ft_dir "$FT" \
-    --project "$PROJECT" --run_id "loop_$TAG" --run_name "awr_$TAG" --group "$GROUP" \
+    --project "$PROJECT" --run_id "loop_$TAG" --run_name "awr_$TAG" \
+    --epochs_per_iter "$EPOCHS_FT" \
     >> "$ITD/critic.log" 2>&1 || true
 
   # Drop iteration k-1's MERGED buffer now that k's has verified. Increments are never
