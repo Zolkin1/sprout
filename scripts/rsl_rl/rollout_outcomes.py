@@ -202,14 +202,36 @@ ROLLOUT_CHUNK_COLUMNS: tuple[tuple[str, str], ...] = (
     ("support_fraction", _F),        # a plan that never plants a foot is charged nothing
     ("contact_coverage", _F),
     ("exempt_fraction", _F),
+    # --- WHERE ON THE COURSE this re-plan happened --------------------------------------
+    #
+    # Signed downrange to the goal anchor in the TERRAIN frame at the instant of the re-plan
+    # -- the same quantity, from the same function, the window table records per window.
+    #
+    # **This is what makes the penalty comparison position-matched rather than
+    # phase-matched.** The penalty is a per-re-plan average, and a better policy survives
+    # longer, so its re-plans come from further down the course where the geometry is harder;
+    # an unmatched average charges it for getting further. Capping on `replan_index` corrects
+    # most of that (pooled +0.39 -> -0.07 on the 30-cell grid) but matches TIME, not
+    # POSITION: a policy that tracks better covers more ground per second, so residual bias
+    # survives in its favour. Binning on this column compares plans made at the same PLACE.
+    ("goal_downrange_m", _F),
 )
 
 ROLLOUT_CHUNK_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_CHUNK_COLUMNS)
 
+#: Columns of :data:`ROLLOUT_CHUNK_COLUMNS` the recorder supplies ITSELF rather than reading
+#: from the grader: the three join keys and the course position.
+CHUNK_NON_TERM_COLUMNS: frozenset[str] = frozenset(
+    ("episode_uid", "replan_index", "env_id", "goal_downrange_m"))
+
 #: The :func:`~motion_gen.terrain_consistency.terrain_consistency` keys the chunk table reads.
-#: Everything except the three join keys, which the recorder supplies.
+#:
+#: Derived by SUBTRACTION, so a new column is excluded by naming it above rather than by
+#: remembering to. Getting this wrong is a KeyError on the first re-plan of a run --
+#: `_terrain_chunk_batch` looks every one of these up in the grader's output -- which is loud,
+#: but only after a simulator launch.
 TERRAIN_CHUNK_TERMS: tuple[str, ...] = tuple(
-    n for n in ROLLOUT_CHUNK_NAMES if n not in ("episode_uid", "replan_index", "env_id"))
+    n for n in ROLLOUT_CHUNK_NAMES if n not in CHUNK_NON_TERM_COLUMNS)
 
 
 # TODO(jump-off-front): this family fails far more than any other and it is not understood.

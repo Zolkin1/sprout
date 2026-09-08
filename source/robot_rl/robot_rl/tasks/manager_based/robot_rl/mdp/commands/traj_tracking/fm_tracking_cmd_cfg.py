@@ -363,6 +363,14 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     ``1.0`` (default) reproduces the ungated behaviour: every env is eligible.
 
+    **MEASURED WORTH IT (2026-09-08).**  The AWR arm trained on data collected with the
+    upper-camera perturbation moved Isaac box2 success ``0.1421 -> 0.2650`` (+0.125, 30 of 30
+    matched cells) against ``+0.050`` for the unperturbed v1 arms, with a correspondingly
+    wider advantage (sd 0.117 vs 0.088) -- the perturbation's job is to widen the state and
+    plan distribution, and it did.  **Confounded**: that run also changed course (v2 adds 3 m
+    of run-out past the second box), so this is not an isolated attribution.  See
+    ``scripts/flow_matching/finetune_generator.py``'s module docstring.
+
     **The perturbations are a BEHAVIOUR POLICY, not a data corruption.** They are applied to
     what the generator is CONDITIONED on, and the recorder stores the true history and the true
     camera regardless -- so the critic and the fine-tune learn from the measurement that

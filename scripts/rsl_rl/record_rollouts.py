@@ -452,7 +452,7 @@ def _replanned(cmd, tracker):
     return idx, uid, ridx
 
 
-def _terrain_chunk_batch(env, command_name: str, claim) -> dict:
+def _terrain_chunk_batch(env, command_name: str, claim, tracker) -> dict:
     """Grade the live plan for the re-planning envs, as one chunk-table batch.
 
     Reads :func:`mdp.plan_terrain_terms`, which is the cached producer the three terrain
@@ -468,6 +468,7 @@ def _terrain_chunk_batch(env, command_name: str, claim) -> dict:
         env: The unwrapped env.
         command_name: The :class:`FmTrackingCommand` term name.
         claim: The ``(idx, uid, ridx)`` from :func:`_replanned`.
+        tracker: The episode tracker, for the goal anchor the downrange is measured from.
 
     Returns:
         A batch keyed by :data:`rollout_outcomes.ROLLOUT_CHUNK_NAMES`.
@@ -476,8 +477,14 @@ def _terrain_chunk_batch(env, command_name: str, claim) -> dict:
 
     idx, uid, ridx = claim
     terms = plan_terrain_terms(env, command_name)
+    # WHERE this re-plan happened, through the same function the window table and the outcome
+    # fold use, so the three cannot disagree about which way a tile faces.
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
+    down, _lat, _hz = goal_region.goal_frame_offsets(
+        tracker.accum.rd.root_pos_w, tracker.accum._goal_pos_w, tracker.accum._goal_yaw)
     out = {"episode_uid": uid, "replan_index": ridx,
-           "env_id": idx.detach().to("cpu").numpy().astype(np.int32)}
+           "env_id": idx.detach().to("cpu").numpy().astype(np.int32),
+           "goal_downrange_m": down[idx].detach().to("cpu").numpy().astype(np.float32)}
     for name in ro.TERRAIN_CHUNK_TERMS:
         if name not in terms:
             raise KeyError(
@@ -813,7 +820,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     claim = _replanned(cmd, tracker)
                     if claim is not None and chunks is not None:
                         chunks.append_batch(
-                            _terrain_chunk_batch(u, "traj_ref", claim))
+                            _terrain_chunk_batch(u, "traj_ref", claim, tracker))
                     if not no_win:
                         batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring,
                                       track_ring, claim=claim)

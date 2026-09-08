@@ -353,11 +353,13 @@ def test_the_chunk_table_round_trips_and_stamps_its_spec(tmp_path):
 
     chunks = ro.ChunkRewardTable(spec_meta={"contact_speed_thresh": 0.05, "graded": "x"})
     n = 5
-    batch = {"episode_uid": np.arange(n, dtype=np.int64),
-             "replan_index": np.arange(n, dtype=np.int32),
-             "env_id": np.full(n, 7, dtype=np.int32)}
-    for name in ro.TERRAIN_CHUNK_TERMS:
-        batch[name] = np.linspace(0.0, 1.0, n)
+    # Built from the SCHEMA, not from a hand-listed subset, so a column added later fails the
+    # writer's own check rather than this fixture.
+    batch = {name: np.linspace(0.0, 1.0, n).astype(dtype)
+             for name, dtype in ro.ROLLOUT_CHUNK_COLUMNS}
+    batch["episode_uid"] = np.arange(n, dtype=np.int64)
+    batch["replan_index"] = np.arange(n, dtype=np.int32)
+    batch["env_id"] = np.full(n, 7, dtype=np.int32)
     assert chunks.append_batch(batch) == n
     assert chunks.append_batch(batch) == n
     table = ro.RolloutOutcomeTable(family_names=["a"])
@@ -507,11 +509,11 @@ def test_the_ic_report_reads_the_chunk_group_and_uses_its_stamped_weights(tmp_pa
     chunks = ro.ChunkRewardTable(spec_meta={"contact_weight": 68.0,
                                             "penetration_weight": 0.107})
     rng = np.random.default_rng(0)
-    batch = {"episode_uid": np.repeat(np.arange(n_ep, dtype=np.int64), per_ep),
-             "replan_index": np.tile(np.arange(per_ep, dtype=np.int32), n_ep),
-             "env_id": np.zeros(n_ch, np.int32)}
-    for name in ro.TERRAIN_CHUNK_TERMS:
-        batch[name] = rng.random(n_ch)
+    batch = {name: rng.random(n_ch).astype(dtype)
+             for name, dtype in ro.ROLLOUT_CHUNK_COLUMNS}
+    batch["episode_uid"] = np.repeat(np.arange(n_ep, dtype=np.int64), per_ep)
+    batch["replan_index"] = np.tile(np.arange(per_ep, dtype=np.int32), n_ep)
+    batch["env_id"] = np.zeros(n_ch, np.int32)
     batch["max_penetration_m"] = np.linspace(0.0, 0.06, n_ch)
     chunks.append_batch(batch)
 

@@ -2,6 +2,38 @@
 
 """Fine-tune a trained flow-matching generator on its own rollouts.
 
+**AWR AGAINST THE TERRAIN-CONSISTENCY REWARD IS THE FIRST ARM HERE THAT PRODUCED A REAL
+IMPROVEMENT** (measured 2026-09-08, Isaac box2, paired on ``(distance, speed)`` with a
+tile-clustered interval).  Earlier attempts targeted the TRACKING reward and were stopped on a
+measured causal ceiling -- the chunk choice is only 1.6% of that reward's variance, and
+filtered BC had already taken half of it.  Changing the TARGET is what changed the outcome:
+
+    v1 course, 30k episodes    success 0.1077 -> 0.1618   +0.054   4/4 cells
+    v1 course, 1.9k episodes   success 0.1077 -> 0.1578   +0.050   6/6 cells
+    v2 course, perturbed data  success 0.1421 -> 0.2650   +0.125  30/30 cells
+
+and the reward it optimised moved with it: at matched exposure the fraction of re-plans
+putting a body 3 cm or more into the terrain fell 0.113 -> 0.076, and the penetration term
+38% (0.808 -> 0.497), improving at every one of the six commanded speeds.
+
+**The largest gain came from the arm trained on PERTURBED data** (`fm_upper_camera_noise_*`
+in the FM command cfg: the generator is conditioned on a dead forward camera for a fraction of
+re-plans while the recorder stores the true measurement, widening the distribution of states
+and plans a run visits).  That arm nearly tripled the gain, and its advantage was
+correspondingly wider (sd 0.117 against 0.088).  **It is not an isolated result**: that run
+also moved to the v2 course, which adds 3 m of run-out past the second box, so the two changes
+are confounded and the perturbation's own contribution is unmeasured.  Separating them needs a
+v2 dataset collected without perturbations.  Treat this as a promising start on the method
+rather than a finished attribution.
+
+Two things that were load-bearing and are easy to get wrong.  The per-re-plan penalty MUST be
+compared at matched exposure -- a better policy survives longer, so its re-plans come from
+deeper, harder course, and the unmatched pooled average reads WORSE while every phase-matched
+window reads better (it inverted the conclusion three times).  And ``best.pt`` is the wrong
+artifact to evaluate: it is selected on UNWEIGHTED ``val_flow_mse``, which AWR moves away from
+by design, so it favours the checkpoint that changed least -- score ``ckpt_*`` by the terrain
+reward instead.
+
 Four modes, differing only in WHERE the "which chunks are good" judgement enters.  All four
 train the model to reproduce chunks it emitted itself, using the SAME supervised
 flow-matching objective it was pretrained with, and only AWR touches the loss (as a
