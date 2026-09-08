@@ -477,3 +477,100 @@ def test_the_two_models_agree_on_the_contact_FLAGS(terrain):
             assert torch.equal(cw[key], cf[key]), (
                 f"{key} differs between the whole-body and feet-only models at "
                 f"dz={dz} x0={x0}; the reward and the ribbon would disagree")
+
+
+def test_the_ic_report_reads_the_chunk_group_and_uses_its_stamped_weights(tmp_path):
+    """The per-cell terrain columns, and the weights they are built with.
+
+    ``box2_compare`` pairs cells on ``(distance, speed)`` because success varies far more
+    across initial conditions than between generators, and the terrain penalty has to travel
+    the same path or the two arms are compared on pooled numbers.  The penalty is rebuilt from
+    the raw terms with the weights the rows were GRADED under -- read from the group's own
+    ``spec`` stamp -- so a report cannot silently apply different ones than the critic.
+    """
+    import pathlib
+    import sys
+
+    import numpy as np
+
+    repo = pathlib.Path(__file__).resolve().parents[3]
+    sys.path.insert(0, str(repo / "scripts/rsl_rl"))
+    import box2_ic_report as icr
+    import rollout_outcomes as ro
+
+    n_ep, per_ep = 4, 10
+    n_ch = n_ep * per_ep
+    ep_dir = tmp_path / "train_v1.17"
+    ep_dir.mkdir()
+    path = ep_dir / "rollout_x.episodes.h5"
+
+    chunks = ro.ChunkRewardTable(spec_meta={"contact_weight": 68.0,
+                                            "penetration_weight": 0.107})
+    rng = np.random.default_rng(0)
+    batch = {"episode_uid": np.repeat(np.arange(n_ep, dtype=np.int64), per_ep),
+             "replan_index": np.tile(np.arange(per_ep, dtype=np.int32), n_ep),
+             "env_id": np.zeros(n_ch, np.int32)}
+    for name in ro.TERRAIN_CHUNK_TERMS:
+        batch[name] = rng.random(n_ch)
+    batch["max_penetration_m"] = np.linspace(0.0, 0.06, n_ch)
+    chunks.append_batch(batch)
+
+    # A COMPLETE episode batch: every schema column, so nothing is left at length 0. Patching
+    # a subset after the fact leaves the rest ragged and `load_cells` indexes one array with
+    # another's mask.
+    table = ro.RolloutOutcomeTable(family_names=["a"])
+    ep = {}
+    for name, dtype in ro.ROLLOUT_EPISODE_COLUMNS:
+        ep[name] = np.zeros(n_ep, dtype=dtype)
+    ep["episode_uid"] = np.arange(n_ep, dtype=np.int64)
+    ep["terrain_id"] = np.zeros(n_ep, np.int32)
+    ep["reached_goal"] = np.ones(n_ep, np.uint8)
+    ep["steps_survived"] = np.full(n_ep, 100, np.int32)
+    table.append_batch(ep)
+    table.write(str(path), attrs={}, chunks=chunks)
+
+    cells = icr.load_cells(str(tmp_path), distances=(1.5,))
+    assert len(cells) == 1, cells
+    c = cells[0]
+    assert c["n_chunks"] == n_ch
+    # The penalty must use the STAMPED weights, not 1.0 each.  Compared at fp32 tolerance
+    # because the chunk table stores f4 on purpose (60 bytes a row against ~30 kB for the
+    # window it grades), so a float64 expectation cannot round-trip exactly.
+    pen = (68.0 * batch["contact_penalty"].astype(np.float32).astype(np.float64)
+           + 0.107 * batch["penetration_sum_m"].astype(np.float32).astype(np.float64))
+    assert c["terrain_penalty_mean"] == pytest.approx(float(pen.mean()), rel=1e-6)
+    assert c["terrain_penalty_median"] == pytest.approx(float(np.median(pen)), rel=1e-6)
+    # `deep` counts re-plans at or past the threshold, not a mean depth.
+    want = float((batch["max_penetration_m"] >= icr.DEEP_PENETRATION_M).mean())
+    assert c["terrain_deep_frac"] == pytest.approx(want)
+
+
+def test_a_run_without_terrain_reward_reports_no_terrain_columns(tmp_path):
+    """No chunk group must mean absent columns, never zeros.
+
+    A zero penalty reads as a geometrically perfect plan, so the report has to omit the
+    columns rather than default them -- which is also what lets one table hold both a
+    --terrain_reward arm and an older one.
+    """
+    import pathlib
+    import sys
+
+    import numpy as np
+
+    repo = pathlib.Path(__file__).resolve().parents[3]
+    sys.path.insert(0, str(repo / "scripts/rsl_rl"))
+    import box2_ic_report as icr
+    import rollout_outcomes as ro
+
+    ep_dir = tmp_path / "train_v1.17"
+    ep_dir.mkdir()
+    table = ro.RolloutOutcomeTable(family_names=["a"])
+    ep = {name: np.zeros(2, dtype=dt) for name, dt in ro.ROLLOUT_EPISODE_COLUMNS}
+    ep["episode_uid"] = np.arange(2, dtype=np.int64)
+    table.append_batch(ep)
+    table.write(str(ep_dir / "rollout_x.episodes.h5"), attrs={})
+
+    cells = icr.load_cells(str(tmp_path), distances=(1.5,))
+    assert len(cells) == 1
+    for key in ("n_chunks", "terrain_penalty_mean", "terrain_deep_frac"):
+        assert key not in cells[0], f"{key} was defaulted rather than omitted"

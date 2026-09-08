@@ -135,6 +135,42 @@ def main() -> int:
           f"delta {pb - pa:+.4f}")
     print(f"  pooled track_reward   {la} {ta:.4f}   {lb} {tb:.4f}   delta {tb - ta:+.4f}"
           f"   ({int((dt > 0).sum())}/{len(keys)} cells up)")
+    # THE PRIMARY METRIC, when both arms recorded it. Success is the by-product here: at an
+    # ~8.5% base rate and two tiles the clustered interval on `reached_goal` is triage-grade,
+    # while the terrain penalty is measured once per RE-PLAN -- tens of thousands of
+    # observations against thousands of episodes -- and is what the critic and the AWR weight
+    # were built from. Reported with the same three views, and LOWER IS BETTER.
+    if all("terrain_penalty_mean" in A[k] and "terrain_penalty_mean" in B[k] for k in keys):
+        print(f"\n  -- terrain penalty (LOWER IS BETTER; the reward AWR optimised) "
+              + "-" * 22)
+        print(f"{'speed':>6}{'dist':>6}{'pen ' + la:>12}{'pen ' + lb:>12}{'delta':>9}"
+              f"{'deep ' + la:>11}{'deep ' + lb:>11}{'delta':>9}")
+        dp = np.array([B[k]["terrain_penalty_mean"] - A[k]["terrain_penalty_mean"]
+                       for k in keys])
+        dd = np.array([B[k]["terrain_deep_frac"] - A[k]["terrain_deep_frac"] for k in keys])
+        for i, k in enumerate(keys):
+            x, y = A[k], B[k]
+            print(f"{k[0]:>6.2f}{k[1]:>6.2f}{x['terrain_penalty_mean']:>12.4f}"
+                  f"{y['terrain_penalty_mean']:>12.4f}{dp[i]:>+9.4f}"
+                  f"{x['terrain_deep_frac']:>11.3f}{y['terrain_deep_frac']:>11.3f}"
+                  f"{dd[i]:>+9.3f}")
+        ca = sum(A[k]["n_chunks"] for k in keys)
+        cb = sum(B[k]["n_chunks"] for k in keys)
+        qa = sum(A[k]["terrain_penalty_mean"] * A[k]["n_chunks"] for k in keys) / ca
+        qb = sum(B[k]["terrain_penalty_mean"] * B[k]["n_chunks"] for k in keys) / cb
+        fa = sum(A[k]["terrain_deep_frac"] * A[k]["n_chunks"] for k in keys) / ca
+        fb = sum(B[k]["terrain_deep_frac"] * B[k]["n_chunks"] for k in keys) / cb
+        p_pos, p_nnz, p_sign = sign_test(-dp)   # negated: a DROP in penalty is the win
+        plo, phi = clustered_ci(dp, tiles)
+        print(f"\n  pooled penalty        {la} {qa:.4f} ({ca:,} re-plans)   "
+              f"{lb} {qb:.4f} ({cb:,})   delta {qb - qa:+.4f}")
+        print(f"  pooled deep fraction  {la} {fa:.3f}   {lb} {fb:.3f}   "
+              f"delta {fb - fa:+.3f}")
+        print(f"  sign test over cells  {p_pos}/{p_nnz} cells IMPROVED (penalty down), "
+              f"p = {p_sign:.4f}")
+        print(f"  tile-clustered 95%    [{plo:+.4f}, {phi:+.4f}] on the penalty delta"
+              f"   -- believe this one")
+
     print(f"\n  mean per-cell delta   {d.mean():+.4f}   median {np.median(d):+.4f}")
     print(f"  sign test over cells  {pos}/{nnz} positive, p = {psign:.4f}")
     print(f"  naive binomial 95%    [{pb - pa - 1.96 * se:+.4f}, {pb - pa + 1.96 * se:+.4f}]"

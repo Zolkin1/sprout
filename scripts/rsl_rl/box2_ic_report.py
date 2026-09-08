@@ -70,6 +70,73 @@ def run_speed(name: str) -> float | None:
     return float(m.group("speed")) if m else None
 
 
+#: Depth at which a re-plan counts as putting a body INSIDE the terrain (m).
+#:
+#: 3 cm is the threshold the offline grade reported against: 25.1% of parent-generator plans
+#: put a foot or knee at least this deep.  Recorded as a FRACTION of re-plans rather than a
+#: mean depth because the penalty is a tail phenomenon -- its median is ~0 and its p95 is two
+#: orders above -- so a mean over re-plans hides exactly the windows that matter.
+DEEP_PENETRATION_M: float = 0.03
+
+
+def _terrain_cells(h, keep: "np.ndarray", tid: "np.ndarray", uid_kept: "np.ndarray"
+                   ) -> dict[int, dict[str, float]]:
+    """Per-tile terrain-reward statistics from the file's ``chunks`` group.
+
+    One row per RE-PLAN, keyed ``(episode_uid, replan_index)``, written by
+    ``record_rollouts.py --terrain_reward``.  Attributed to a tile through the episode table,
+    since the tile is a property of the episode.
+
+    **The penalty is rebuilt with the weights the rows were GRADED under**, read from the
+    group's own ``spec`` stamp rather than restated here.  The critic regresses on
+    ``contact_penalty * contact_weight + penetration_sum_m * penetration_weight``, and a
+    report that assumed different weights would compare arms on a quantity neither the reward
+    nor the critic uses.
+
+    Args:
+        h: The open episodes ``h5py.File``.
+        keep: ``[n_episodes]`` bool, the non-censored mask already applied to ``tid``.
+        tid: ``[n_kept]`` terrain id per kept episode.
+        uid_kept: ``[n_kept]`` episode uid per kept episode.
+
+    Returns:
+        ``{tile: {stat: value}}``, empty when the file carries no chunk group (which is what
+        a run without ``--terrain_reward`` produces).
+    """
+    if "chunks" not in h:
+        return {}
+    g = h["chunks"]
+    spec = json.loads(g.attrs.get("spec", "{}"))
+    w_c = float(spec.get("contact_weight", 1.0))
+    w_p = float(spec.get("penetration_weight", 1.0))
+    c_uid = g["episode_uid"][:]
+    pen = (w_c * g["contact_penalty"][:].astype(np.float64)
+           + w_p * g["penetration_sum_m"][:].astype(np.float64))
+    deep = g["max_penetration_m"][:].astype(np.float64) >= DEEP_PENETRATION_M
+
+    # uid -> tile, over the KEPT episodes only, so a censored episode's chunks are dropped the
+    # same way its outcome is. `np.isin` rather than a dict: 150k chunks against 12k episodes.
+    order = np.argsort(uid_kept)
+    su, st = uid_kept[order], tid[order]
+    pos = np.searchsorted(su, c_uid)
+    pos = np.clip(pos, 0, su.size - 1)
+    ok = su[pos] == c_uid
+    ctile = np.where(ok, st[pos], -1)
+
+    out: dict[int, dict[str, float]] = {}
+    for t in np.unique(ctile[ctile >= 0]):
+        m = ctile == t
+        pt = pen[m]
+        out[int(t)] = {
+            "n_chunks": int(m.sum()),
+            "terrain_penalty_median": float(np.median(pt)),
+            "terrain_penalty_mean": float(pt.mean()),
+            "terrain_penalty_p95": float(np.percentile(pt, 95.0)),
+            "terrain_deep_frac": float(deep[m].mean()),
+        }
+    return out
+
+
 def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[dict]:
     """One record per ``(run, tile)`` cell under ``root``.
 
@@ -110,6 +177,7 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[di
             # failure is a MODE choice that a tracking mean cannot see.
             track = (h["track_reward_mean"][:][keep] if "track_reward_mean" in h
                      else np.full(int(keep.sum()), np.nan))
+            terrain = _terrain_cells(h, keep, tid, h["episode_uid"][:][keep])
         for t in sorted(np.unique(tid)):
             if t < 0:
                 continue
@@ -124,6 +192,7 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[di
                 "failed": float(failed[m].mean()),
                 "steps_median": float(np.median(steps[m])),
                 "track_reward_mean": float(np.nanmean(track[m])),
+                **terrain.get(int(t), {}),
             })
     if not cells:
         raise SystemExit(f"no *.episodes.h5 under {root!r}. An empty report is "
@@ -165,6 +234,17 @@ def format_report(cells: list[dict]) -> str:
     n_tr = sum(c["n"] for c in train)
     pooled = sum(c["reached_goal"] * c["n"] for c in train) / n_tr if n_tr else float("nan")
     L.append(f"\n  pooled over {n_tr} training episodes: {pooled:.4f}")
+    te = [c for c in train if "terrain_penalty_median" in c]
+    if te:
+        nch = sum(c["n_chunks"] for c in te)
+        # Chunk-weighted, because a cell's chunk count varies with how long its episodes ran
+        # -- an unweighted mean over cells would let a cell that fell early count as much as
+        # one that walked the course.
+        pm = sum(c["terrain_penalty_mean"] * c["n_chunks"] for c in te) / nch
+        dp = sum(c["terrain_deep_frac"] * c["n_chunks"] for c in te) / nch
+        L.append(f"  pooled terrain penalty (mean over {nch:,} re-plans): {pm:.4f}"
+                 f"   >= {DEEP_PENETRATION_M * 100:.0f} cm deep on {dp:.1%} of them")
+
     tr = [c for c in train if np.isfinite(c.get("track_reward_mean", float("nan")))]
     if tr:
         tq = sum(c["track_reward_mean"] * c["n"] for c in tr) / sum(c["n"] for c in tr)
@@ -177,9 +257,12 @@ def format_report(cells: list[dict]) -> str:
         L.append(f"  HELD OUT ({d} m, {hold[0]['speed']} m/s), {n_h} episodes: {ph:.4f}"
                  "   -- off the training grid on BOTH axes")
 
+    has_terrain = any("terrain_penalty_median" in c for c in cells)
+    t_head = (f"{'chunks':>8}{'pen_med':>9}{'pen_mean':>9}{'pen_p95':>9}{'deep':>7}"
+              if has_terrain else "")
     L += ["", "-- per cell " + "-" * 65,
           f"  {'run':<16}{'tile':>5}{'dist':>7}{'n':>7}{'reached':>9}{'failed':>8}"
-          f"{'timeout':>9}{'sum':>7}{'steps':>8}{'track':>8}"]
+          f"{'timeout':>9}{'sum':>7}{'steps':>8}{'track':>8}{t_head}"]
     for c in cells:
         flag = "  <- TIMEOUT-LIMITED" if c["timeout"] > TIMEOUT_WARN else ""
         # reached + failed + timeout must account for the episode; printed so a category
@@ -188,7 +271,13 @@ def format_report(cells: list[dict]) -> str:
         L.append(f"  {c['run']:<16}{c['tile']:>5}{c['distance_m'] or 0:>7.2f}{c['n']:>7}"
                  f"{c['reached_goal']:>9.3f}{c['failed']:>8.3f}{c['timeout']:>9.3f}"
                  f"{total:>7.3f}{c['steps_median']:>8.0f}"
-                 f"{c.get('track_reward_mean', float('nan')):>8.3f}{flag}")
+                 f"{c.get('track_reward_mean', float('nan')):>8.3f}"
+                 + ((f"{c.get('n_chunks', 0):>8}"
+                     f"{c.get('terrain_penalty_median', float('nan')):>9.4f}"
+                     f"{c.get('terrain_penalty_mean', float('nan')):>9.3f}"
+                     f"{c.get('terrain_penalty_p95', float('nan')):>9.3f}"
+                     f"{c.get('terrain_deep_frac', float('nan')):>7.3f}")
+                    if has_terrain else "") + flag)
     hot = [c for c in cells if c["timeout"] > TIMEOUT_WARN]
     if hot:
         L.append(f"\n  !! {len(hot)} cell(s) time out above {TIMEOUT_WARN:.0%}: their rates are "
