@@ -110,6 +110,26 @@ from motion_gen.plan_geometry import FOOT_BODIES
 #: in a dense ribbon.
 DEBUG_CONTACT_COLOR: tuple[float, float, float] = (0.15, 0.85, 0.35)
 
+#: Root-path colours for the DIAGNOSTIC ARMS, indexed by
+#: ``history_nulled + 2 * upper_camera_noised``.  Index 0 is absent on purpose: an env on no
+#: arm keeps its ordinary frame colour, so a scene with every knob off looks exactly as it
+#: always did.
+#:
+#: Chosen against the frames already on screen -- the root is orange (0.95, 0.55, 0.10), the
+#: ankles blue and red, the wrists cyan (0.20, 0.80, 0.85) and purple (0.80, 0.30, 0.90), and
+#: contact markers green at 1.35x radius.  White and yellow are unused; magenta is close to the
+#: purple wrist, which is a real (if minor) clash kept only because it is the colour already
+#: in use for the history arm.
+DEBUG_ARM_COLORS: dict[int, tuple[str, tuple[float, float, float]]] = {
+    1: ("null_history", (0.95, 0.15, 0.85)),          # magenta
+    2: ("noisy_upper_cam", (1.00, 1.00, 1.00)),       # white
+    3: ("null_history_and_noisy_cam", (1.00, 0.90, 0.10)),   # yellow
+}
+
+#: Kept as its own name because the history arm's colour is referenced by tests and by the
+#: play-script instructions users already have.
+DEBUG_NULL_HISTORY_COLOR: tuple[float, float, float] = DEBUG_ARM_COLORS[1][1]
+
 from robot_rl.flow_matching.window import (
     DEFAULT_WINDOW_ANCHOR,
     MEASURED_HISTORY_FALLBACK,
@@ -599,8 +619,80 @@ class FmTrackingCommand(MotionSequenceCommand):
                     self._fm_contact_specs)
                 self._fm_contact_specs.append(
                     (f"{name}_contact", DEBUG_CONTACT_COLOR, kind, k))
+        # One extra prototype per DIAGNOSTIC ARM, on the base frame only. The root path is
+        # drawn at every node and is the most legible thing to pick out of a crowd of robots,
+        # and confining the recolour to it leaves the feet free to keep showing contact --
+        # which is the signal the arms exist to change.
+        self._fm_arm_specs: list[tuple[str, tuple[float, float, float], str, int]] = []
+        self._fm_arm_protos: torch.Tensor | None = None
+        for i, (name, _c, kind, k) in enumerate(self._fm_pred_specs):
+            if kind != "base":
+                continue
+            # Index 0 = no arm = the ordinary base prototype, so an all-off scene is unchanged.
+            protos = [i]
+            for arm in sorted(DEBUG_ARM_COLORS):
+                suffix, color = DEBUG_ARM_COLORS[arm]
+                protos.append(len(self._fm_pred_specs) + len(self._fm_contact_specs)
+                              + len(self._fm_arm_specs))
+                self._fm_arm_specs.append((f"{name}_{suffix}", color, kind, k))
+            self._fm_arm_protos = torch.tensor(protos, dtype=torch.long,
+                                               device=self.device)
+            break
         self._plan_collider_model = None
         self._plan_reward_collider_model = None
+        # Envs served the learned null-history embedding instead of their own history, to
+        # break an autoregressively COMMITTED mode (see `cfg.fm_history_null_fraction`).
+        # Its own generator, so turning the knob on does not shift every other per-env draw
+        # in the run and make an A/B differ in more than this.
+        self._force_null_hist = torch.zeros(self.num_envs, dtype=torch.bool,
+                                            device=self.device)
+        # Envs whose UPPER (far) depth camera is replaced with garbage. Same per-episode,
+        # per-env, own-generator pattern as the history-null arm above.
+        self._noise_upper_cam = torch.zeros(self.num_envs, dtype=torch.bool,
+                                            device=self.device)
+        # The OUTER gate: envs outside it are pristine whatever the per-arm fractions say, so
+        # a run carries a control population of a stated size on the same terrain.
+        self._perturb_eligible = torch.ones(self.num_envs, dtype=torch.bool,
+                                            device=self.device)
+        self._perturb_gen = torch.Generator(device=self.device)
+        self._perturb_gen.manual_seed(0x9C4A ^ int(self.num_envs))
+        self._upper_cam_gen = torch.Generator(device=self.device)
+        self._upper_cam_gen.manual_seed(0x5E1F ^ int(self.num_envs))
+        self._upper_cam_index = self._resolve_upper_camera()
+        if float(self.cfg.fm_upper_camera_noise_fraction) > 0.0:
+            frac = float(self.cfg.fm_upper_camera_noise_fraction)
+            if not 0.0 <= frac <= 1.0:
+                raise ValueError(
+                    f"fm_upper_camera_noise_fraction must be in [0, 1]; got {frac}")
+            if str(self.cfg.fm_upper_camera_noise_cadence) not in ("episode", "replan"):
+                raise ValueError(
+                    f"fm_upper_camera_noise_cadence must be 'episode' or 'replan'; got "
+                    f"{self.cfg.fm_upper_camera_noise_cadence!r}")
+            if str(self.cfg.fm_upper_camera_noise_mode) not in ("gaussian", "dead"):
+                raise ValueError(
+                    f"fm_upper_camera_noise_mode must be 'gaussian' or 'dead'; got "
+                    f"{self.cfg.fm_upper_camera_noise_mode!r}")
+            if self._upper_cam_index is None:
+                raise ValueError(
+                    "fm_upper_camera_noise_fraction is set but the upper camera could not be "
+                    "identified: this checkpoint's extero_spec carries no mount heights (or "
+                    "it is a height-scan generator, which has no cameras). Refusing rather "
+                    "than corrupting sensor 1 on the assumption that it is the far one.")
+            print(f"[FmTrackingCommand] upper camera (sensor {self._upper_cam_index}) "
+                  f"replaced with {self.cfg.fm_upper_camera_noise_mode!r} on {frac:.0%} of "
+                  f"{self.num_envs} envs, re-drawn per "
+                  f"{self.cfg.fm_upper_camera_noise_cadence}")
+        self._null_hist_gen = torch.Generator(device=self.device)
+        self._null_hist_gen.manual_seed(0x2B1D ^ int(self.num_envs))
+        if float(self.cfg.fm_history_null_fraction) > 0.0:
+            frac = float(self.cfg.fm_history_null_fraction)
+            if not 0.0 <= frac <= 1.0:
+                raise ValueError(
+                    f"fm_history_null_fraction must be in [0, 1]; got {frac}")
+            print(f"[FmTrackingCommand] history-nulling {frac:.0%} of {self.num_envs} envs "
+                  f"per episode: those envs re-decide the plan MODE from exteroception and "
+                  f"the command alone. Expect ~{frac * self.num_envs:.1f} env(s) at a time; "
+                  f"raise --num_envs if that rounds to zero.")
         # The ribbon draws EVERY predicted node (dense), independent of the clip
         # ribbon's debug_vis_stride subsampling. It indexes _pred_window directly
         # rather than through the cursor, so it needs no offset table.
@@ -684,11 +776,166 @@ class FmTrackingCommand(MotionSequenceCommand):
         else:
             self._pending_reset[env_ids] = True
         out = super().reset(env_ids)
+        self._draw_perturb_eligible(env_ids)
+        self._draw_history_null(env_ids)
+        if str(self.cfg.fm_upper_camera_noise_cadence) == "episode":
+            self._draw_upper_cam_noise(env_ids)
         if self.freeform_command:
             ids = (torch.arange(self.num_envs, device=self.device) if env_ids is None
                    else env_ids)
             self._reset_freeform_command(ids)
         return out
+
+    def _draw_perturb_eligible(self, env_ids) -> None:
+        """Re-draw which envs are eligible for any perturbation. Per EPISODE, always.
+
+        Drawn per episode even when an arm re-draws per re-plan: the gate defines the control
+        POPULATION, and a population that changed mid-episode would not be one.
+
+        Args:
+            env_ids: Envs whose eligibility to re-draw, or ``None`` for all of them.
+        """
+        frac = float(self.cfg.fm_perturb_fraction)
+        if frac >= 1.0:
+            return
+        if not 0.0 <= frac <= 1.0:
+            raise ValueError(f"fm_perturb_fraction must be in [0, 1]; got {frac}")
+        ids = (torch.arange(self.num_envs, device=self.device) if env_ids is None
+               else env_ids)
+        if ids.numel() == 0:
+            return
+        draw = torch.rand(ids.numel(), device=self.device, generator=self._perturb_gen)
+        self._perturb_eligible[ids] = draw < frac
+
+    def _resolve_upper_camera(self) -> int | None:
+        """Sensor index of the physically HIGHEST-mounted depth camera, or ``None``.
+
+        Derived from the checkpoint's own ``extero_spec`` mount poses rather than from a
+        hardcoded index or a name match.  The sensor axis is fixed by the obs group's term
+        ORDER, so a reordering there would leave a hardcoded ``1`` corrupting the near camera
+        while the flag still claimed to be testing forward preview -- a wrong answer with no
+        error.  ``None`` when there is nothing to resolve (a height-scan generator, or a spec
+        without mount poses), which the caller turns into a refusal.
+
+        Returns:
+            The index into the extero sensor axis, or ``None``.
+        """
+        spec = getattr(self.ctx, "extero_spec", None)
+        if not spec or len(spec) < 2:
+            return None
+        heights: list[tuple[float, int]] = []
+        for i, cam in enumerate(spec):
+            pos = (cam or {}).get("offset_pos")
+            if pos is None or len(pos) < 3:
+                return None
+            heights.append((float(pos[2]), i))
+        heights.sort()
+        # A tie means the two cameras are at the same height and "upper" is not a thing.
+        if heights[-1][0] <= heights[-2][0]:
+            return None
+        return heights[-1][1]
+
+    def _draw_upper_cam_noise(self, env_ids) -> None:
+        """Re-draw which envs get a corrupted upper camera, for the given envs.
+
+        Args:
+            env_ids: Envs whose assignment to re-draw, or ``None`` for all of them.
+        """
+        frac = float(self.cfg.fm_upper_camera_noise_fraction)
+        if frac <= 0.0:
+            return
+        ids = (torch.arange(self.num_envs, device=self.device) if env_ids is None
+               else env_ids)
+        if ids.numel() == 0:
+            return
+        draw = torch.rand(ids.numel(), device=self.device, generator=self._upper_cam_gen)
+        # Gated: an ineligible env is pristine however the draw lands.
+        self._noise_upper_cam[ids] = (draw < frac) & self._perturb_eligible[ids]
+
+    def upper_camera_noised(self) -> torch.Tensor:
+        """``(num_envs,)`` bool: envs whose upper depth camera is being corrupted."""
+        return self._noise_upper_cam
+
+    def _corrupt_upper_camera(self, extero_row: torch.Tensor,
+                              ids: torch.Tensor) -> torch.Tensor:
+        """Replace the upper camera's rows with garbage, for the flagged envs in ``ids``.
+
+        Applied to the row the FM is about to be conditioned on -- AFTER the lag, so the
+        corruption lands on whichever frame was actually served, and after normalisation, so
+        the scale is the model's own input scale rather than metres.
+
+        Args:
+            extero_row: ``(len(ids), T, K)`` normalised exteroception.
+            ids: The env ids those rows belong to.
+
+        Returns:
+            The row, corrupted in place for the flagged envs.
+        """
+        if self._upper_cam_index is None:
+            return extero_row
+        flag = self._noise_upper_cam[ids]
+        if not bool(flag.any()):
+            return extero_row
+        t = int(self._upper_cam_index)
+        sel = flag.nonzero(as_tuple=False).flatten()
+        k = extero_row.shape[-1]
+        nch = int(getattr(self.ctx, "extero_channels", 1) or 1)
+        mode = str(self.cfg.fm_upper_camera_noise_mode)
+        if mode == "gaussian":
+            # Every channel, validity included: the input then asserts valid readings of
+            # random geometry, which is the point and also why it is off distribution.
+            extero_row[sel, t, :] = torch.randn(
+                (sel.numel(), k), device=extero_row.device, dtype=extero_row.dtype)
+            return extero_row
+        # "dead": the CHANNEL-MAJOR fold is (nch, pixels) -- interleaving would scramble
+        # every kernel -- and `extero_channel_names` fixes the order as d, x, y, z, v.
+        if k % nch != 0:
+            raise ValueError(
+                f"extero row width {k} is not divisible by extero_channels {nch}, so the "
+                "channel-major fold the 'dead' mode needs cannot be taken")
+        view = extero_row[sel, t, :].view(sel.numel(), nch, k // nch)
+        view[:, 0, :] = float(getattr(self.ctx, "extero_clip", 1.0) or 1.0)  # d: no return
+        if nch >= 4:
+            view[:, 1:4, :] = 0.0                                            # xyz: unknown
+        if nch >= 5:
+            view[:, 4, :] = 0.0                                              # v: invalid
+        extero_row[sel, t, :] = view.reshape(sel.numel(), k)
+        return extero_row
+
+    def _draw_history_null(self, env_ids) -> None:
+        """Re-draw which envs are served the null-history embedding, for the given envs.
+
+        Per EPISODE rather than per re-plan: an env keeps its assignment for the whole
+        episode, so the effect is watchable (one robot plans without history from spawn to
+        fall) and a recording can attribute a whole episode to the arm.  A per-re-plan draw
+        would mix both conditionings inside one episode and make neither attributable.
+
+        Args:
+            env_ids: Envs whose assignment to re-draw, or ``None`` for all of them.
+        """
+        frac = float(self.cfg.fm_history_null_fraction)
+        if frac <= 0.0:
+            return
+        ids = (torch.arange(self.num_envs, device=self.device) if env_ids is None
+               else env_ids)
+        if ids.numel() == 0:
+            return
+        draw = torch.rand(ids.numel(), device=self.device, generator=self._null_hist_gen)
+        # Gated: an ineligible env is pristine however the draw lands.
+        self._force_null_hist[ids] = (draw < frac) & self._perturb_eligible[ids]
+
+    def history_nulled(self) -> torch.Tensor:
+        """``(num_envs,)`` bool: envs currently served the null-history embedding by CHOICE.
+
+        Does NOT include the envs whose history is merely unfilled after a reset -- those come
+        from :meth:`BatchedHistory.null_mask` and are a transient, not an arm.  A consumer
+        wanting the mask the model actually saw must OR the two, which is what
+        :meth:`_snapshot_and_infer` does.
+
+        Returns:
+            The per-env flag; all-False unless ``cfg.fm_history_null_fraction > 0``.
+        """
+        return self._force_null_hist
 
     # ------------------------------------------------------------------
     # The free-form velocity command (cfg.freeform_command; off by default)
@@ -1818,8 +2065,20 @@ class FmTrackingCommand(MotionSequenceCommand):
         # sampled with the learned null-history embedding the FM was trained with, so the
         # generator drives from step 0 and no clip fallback is needed.
         null_hist = self._history.null_mask()
+        # The DELIBERATE arm rides on top of the post-reset transient: both reach the model as
+        # one `history_null_mask`, because the model has exactly one null-history embedding
+        # and no way to tell why a row is nulled.
+        if bool(self._force_null_hist.any()):
+            null_hist = (self._force_null_hist if null_hist is None
+                         else (null_hist | self._force_null_hist))
         self._fm_reinfer_mask = infer_mask
         if bool(infer_mask.any()):
+            # Per-REPLAN cadence re-rolls the camera arm for exactly the envs about to sample,
+            # immediately before they do, so the flag that gates the corruption is the flag
+            # the resulting plan was conditioned under -- and the one the ribbon then colours.
+            if str(self.cfg.fm_upper_camera_noise_cadence) == "replan":
+                self._draw_upper_cam_noise(
+                    infer_mask.nonzero(as_tuple=False).flatten())
             self._run_fm(infer_mask, null_hist)
         if not bool(self._pred_valid.all()):
             raise RuntimeError(
@@ -1863,6 +2122,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         # checkpoint was TRAINED on -- the same mdp functions the teacher obs uses, so
         # deployment conditions on exactly the training signal.
         extero_row = self._lagged_extero()[ids]
+        extero_row = self._corrupt_upper_camera(extero_row, ids)
         if self._extero_stash is not None:
             # The row the generator ACTUALLY conditioned on, kept per env for diagnostics.
             # Re-reading the sensor afterwards is not the same thing: this is the LAGGED
@@ -2418,6 +2678,16 @@ class FmTrackingCommand(MotionSequenceCommand):
                    else world["ee_pos_w"][:, :, k]).reshape(-1, 3)
             translations.append(pts)
             idx = torch.full((pts.shape[0],), proto_idx, dtype=torch.long, device=self.device)
+            if kind == "base" and self._fm_arm_protos is not None:
+                # Which diagnostic arm each env is on, as one index: 0 none, 1 history-nulled,
+                # 2 noisy upper camera, 3 both. Points are env-major, node-minor (the
+                # [N, F, 3] reshape above), so a per-env value expands along the node axis.
+                arm = (self._force_null_hist.long()
+                       + 2 * self._noise_upper_cam.long())
+                if bool((arm > 0).any()):
+                    proto = self._fm_arm_protos[arm]                  # (N,)
+                    idx = proto[:, None].expand(
+                        -1, world["base_pos_w"].shape[1]).reshape(-1).clone()
             alt = self._fm_contact_proto.get(proto_idx)
             if alt is not None and contact is not None:
                 # `contact["contact"]` is [N, F, 2] in FOOT_BODIES order, and the ribbon's
@@ -2567,7 +2837,9 @@ class FmTrackingCommand(MotionSequenceCommand):
                 radius=radius * (1.35 if name.endswith("_contact") else 1.0),
                 visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=tuple(color)),
             )
-            for name, color, _kind, _k in self._fm_pred_specs + self._fm_contact_specs
+            for name, color, _kind, _k in (self._fm_pred_specs
+                                            + self._fm_contact_specs
+                                            + self._fm_arm_specs)
         }
         cfg = VisualizationMarkersCfg(prim_path="/Visuals/fm_pred", markers=prototypes)
         try:

@@ -431,3 +431,45 @@ def test_the_window_writer_sizes_the_track_err_block():
             pass
         with h5py.File(off, "r") as f:
             assert "track_err_prev" not in f
+
+
+def test_every_window_column_is_actually_allocated(tmp_path):
+    """A column in the schema tuple but not in the writer's `shapes` is dropped in SILENCE.
+
+    `RolloutWindowWriter` allocates from an explicit `shapes` dict, not from
+    :data:`ROLLOUT_WINDOW_COLUMNS`, so the two can disagree -- and the failure is a column
+    that every reader believes exists, that nothing wrote, and that no error mentions.
+    """
+    import rollout_outcomes as ro
+
+    w = ro.RolloutWindowWriter(
+        str(tmp_path / "w.h5"), num_windows=4, num_history=2, state_dim=3,
+        extero_shape=(2, 5), future_len=6, cmd_dim=3, proprio_hw=(2, 4), scan_dim=7,
+        track_hw=(2, 3), attrs={})
+    try:
+        allocated = set(w._keys)
+    finally:
+        w.close()
+    declared = set(ro.ROLLOUT_WINDOW_NAMES)
+    assert declared - allocated == set(), (
+        f"declared but never allocated: {sorted(declared - allocated)}")
+    assert allocated - declared == set(), (
+        f"allocated but not declared: {sorted(allocated - declared)}")
+
+
+def test_the_perturbation_arms_are_recorded_per_window():
+    """The only on-disk record that a row's ACTION came from perturbed conditioning.
+
+    `history` and `extero` store the TRUE measurement by design, so without these flags the
+    perturbed and pristine populations are indistinguishable and the advantage cannot be split
+    by arm.  Distinct from `history_null`, which is the post-reset transient and is true of the
+    recorded history.
+    """
+    import rollout_outcomes as ro
+
+    for col in ("perturb_null_history", "perturb_noisy_upper_cam"):
+        assert col in ro.ROLLOUT_WINDOW_NAMES, col
+        assert dict(ro.ROLLOUT_WINDOW_COLUMNS)[col] == "u1", f"{col} should be one byte"
+    assert "history_null" in ro.ROLLOUT_WINDOW_NAMES, (
+        "history_null is a different signal and must not have been replaced")
+    assert ro.SCHEMA_VERSION >= 3, "adding columns must bump the schema version"

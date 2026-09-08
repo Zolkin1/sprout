@@ -349,6 +349,107 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     """
 
     # --- Debug visualization ---
+    fm_perturb_fraction: float = 1.0
+    """Fraction of envs ELIGIBLE for the diagnostic perturbations, drawn per episode.
+
+    An outer gate over :attr:`fm_upper_camera_noise_fraction` and
+    :attr:`fm_history_null_fraction`: an env outside it is pristine no matter what those say.
+
+    **Why a gate rather than just halving the two fractions.** Independent draws at 0.5 each
+    leave only ``0.5 * 0.5 = 25%`` of envs untouched, and which envs those are moves with every
+    draw.  A gate guarantees a clean control population of a stated size, in the SAME run and
+    therefore on the same terrain, tiles and command distribution -- which is what lets the
+    recording be split by arm afterwards instead of compared across runs.
+
+    ``1.0`` (default) reproduces the ungated behaviour: every env is eligible.
+
+    **The perturbations are a BEHAVIOUR POLICY, not a data corruption.** They are applied to
+    what the generator is CONDITIONED on, and the recorder stores the true history and the true
+    camera regardless -- so the critic and the fine-tune learn from the measurement that
+    actually occurred, and the perturbation's only job is to widen the distribution of states
+    and plans the run visits.  That split is load-bearing and is pinned by
+    ``test_the_recording_stores_the_TRUE_conditioning``.
+    """
+
+    fm_upper_camera_noise_fraction: float = 0.0
+    """Fraction of envs whose UPPER (far) depth camera is replaced with garbage, re-drawn per
+    episode.
+
+    The upper camera is the one that previews terrain AHEAD -- mounted at z = 0.285 m and
+    pitched 15 deg down, with its boresight meeting the ground 4.25 m out, against the near
+    camera's 0.51 m.  So this is the knob that asks whether a plan's MODE depends on forward
+    terrain preview: if the generator still commits to the same box dismount with the far
+    camera destroyed, the decision is not coming from looking ahead.
+
+    **Which sensor is "upper" is DERIVED from the checkpoint's own ``extero_spec``** (the
+    highest ``offset_pos[2]``), never from a hardcoded index.  The obs group's term order is
+    what fixes the sensor axis today, and a reordering there would silently corrupt the near
+    camera instead while the flag went on claiming otherwise.
+
+    See :attr:`fm_upper_camera_noise_mode` for what "garbage" means -- the choice matters more
+    than the fraction does.
+    """
+
+    fm_upper_camera_noise_mode: str = "gaussian"
+    """How :attr:`fm_upper_camera_noise_fraction` corrupts the camera: ``"gaussian"`` or
+    ``"dead"``.  **These test different things and only one of them is in distribution.**
+
+    ``"dead"`` is what a failed or fully-occluded camera looks like: every pixel at the far end
+    of the depth band, xyz zeroed, and the VALIDITY channel set to 0.  The model was trained
+    with 6.4-8.9% of pixels carrying no reading and has a validity channel for exactly this, so
+    a whole camera reading "no data" is an extrapolation along a direction it understands.
+
+    ``"gaussian"`` replaces every channel -- validity included -- with unit-variance noise.
+    Nothing in training looks like this: the model is handed an input asserting, incoherently,
+    that it has valid readings of random geometry.  It is the harsher test of "can this be
+    ignored", but a behaviour change under it does not distinguish "the plan needed that
+    camera" from "the model was pushed off distribution", so read a result from it narrowly.
+    """
+
+    fm_upper_camera_noise_cadence: str = "episode"
+    """How often :attr:`fm_upper_camera_noise_fraction` is re-drawn: ``"episode"`` or
+    ``"replan"``.  **They ask different questions.**
+
+    ``"episode"`` (default) is a BROKEN camera: drawn once at reset and held, so a robot is
+    either on the arm for a whole traverse or not at all.  That is the right shape for "can
+    this policy work without forward preview" and for domain randomisation, and it is the only
+    cadence under which an episode's outcome is attributable to the arm.
+
+    ``"replan"`` is intermittent DROPOUT: re-drawn for every env that re-plans, so the camera
+    can be fine on approach and dead at the moment the plan commits to a dismount.  That is
+    the sharper probe of whether a particular DECISION uses the preview, and it avoids a
+    confound the per-episode cadence has: training corrupted 20% of windows independently
+    (``null_cond_prob``), never a whole episode, so a failure late in a fully-corrupted episode
+    may be compounding state drift rather than the camera mattering at that moment.
+
+    Under ``"replan"`` the ribbon's root colour changes as the arm does, so each drawn plan is
+    coloured by the conditioning it was actually sampled under.
+    """
+
+    fm_history_null_fraction: float = 0.0
+    """Fraction of envs served the model's learned NULL-HISTORY embedding instead of their
+    own history, re-drawn per episode.
+
+    **What this is for: breaking a committed MODE.** The generator is autoregressive on its
+    own past output, so once it reads a box top as a descending staircase it keeps being
+    conditioned on a plan that says "stairs down" and the reading persists.  History-nulling
+    removes that conditioning, so the mode is re-decided from exteroception and the command
+    alone at every re-plan of an affected env.
+
+    **It is IN DISTRIBUTION, not a hack.** Training nulls the history on ``null_prob`` of its
+    windows (0.3 by default) and the model carries a learned ``null_history`` embedding for
+    exactly that case -- the same embedding that already covers the first steps after a reset,
+    where no history exists yet (see :meth:`BatchedHistory.null_mask`).  What is new here is
+    only WHICH envs get it and for how long.
+
+    **Drawn at random per env, never strided.** Envs map to tiles through a structured grid
+    lookup, so taking every n-th env would risk putting every history-nulled env on the same
+    tile and confounding the comparison with terrain.
+
+    ``0.0`` (default) leaves the serve path exactly as it was: the mask is then whatever
+    ``BatchedHistory.null_mask`` says, i.e. post-reset underfill only.
+    """
+
     debug_vis_show_fm_prediction: bool = True
     """Draw the FM's predicted world-frame trajectory as a ribbon of spheres (one color per
     frame). Overlay it on the yellow observation-window ribbon (``debug_vis_obs_window``) to

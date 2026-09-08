@@ -71,7 +71,7 @@ for _d in (os.path.join(_HERE, "eval"), _HERE):
 
 #: Bump on any column removal, rename or change of meaning.
 # 2: the per-chunk tracking-error block (`track_err`) and the strict violation columns.
-SCHEMA_VERSION: int = 2
+SCHEMA_VERSION: int = 3
 
 _F = "f4"
 _I = "i4"
@@ -569,6 +569,23 @@ ROLLOUT_WINDOW_COLUMNS: tuple[tuple[str, str], ...] = (
     ("extero", "f2"),             # (T, K) -- the reading ACTUALLY served, lag included
     ("cmd_future", "f4"),         # (F, cmd_dim) -- the command over the horizon
     ("depth_lag_used", _U8),      # lag served, in control steps
+    # --- HOW THE GENERATOR WAS PERTURBED WHEN IT PRODUCED THIS CHUNK --------------------
+    #
+    # The two diagnostic arms are a BEHAVIOUR POLICY: the generator is conditioned on a dead
+    # upper camera and/or the learned null-history embedding to widen the distribution of
+    # states and plans a run visits, while `history` and `extero` above store the TRUE
+    # measurement -- so the critic and the fine-tune learn from what actually happened.
+    #
+    # That makes these flags the only record that a row's ACTION came from conditioning other
+    # than the state stored beside it.  Without them the perturbed and pristine populations are
+    # indistinguishable on disk: the advantage could not be split by arm, and a fine-tune could
+    # not weight, drop or balance them.  Two bytes a window against ~30 kB of conditioning.
+    #
+    # `history_null` above is a DIFFERENT thing and both are needed: it is the post-reset
+    # transient, true of the recorded history, whereas this is the deliberate arm applied to
+    # the model while the recorded history stayed complete.
+    ("perturb_null_history", _U8),   # the learned null embedding replaced the real history
+    ("perturb_noisy_upper_cam", _U8),  # the upper (far) camera was replaced with garbage
     # --- the action a_t -----------------------------------------------------------------
     ("fm_plan", "f4"),            # (F, D) -- the emitted chunk, in window space
     # --- where it happened, for privileged critic features and diagnostics --------------
@@ -758,6 +775,11 @@ class RolloutWindowWriter:
             "env_id": (num_windows,), "clip_id": (num_windows,),
             "family_code": (num_windows,), "history_null": (num_windows,),
             "depth_lag_used": (num_windows,), "clip_step": (num_windows,),
+            # The behaviour-policy arms. Declared HERE as well as in
+            # ROLLOUT_WINDOW_COLUMNS because `shapes` is what actually gets allocated -- a
+            # column present only in the tuple is created by nothing and dropped in silence.
+            "perturb_null_history": (num_windows,),
+            "perturb_noisy_upper_cam": (num_windows,),
             "history": (num_windows, int(num_history), int(state_dim)),
             "extero": (num_windows, int(extero_shape[0]), int(extero_shape[1])),
             "cmd_future": (num_windows, int(future_len), int(cmd_dim)),

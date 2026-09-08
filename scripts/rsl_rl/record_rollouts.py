@@ -532,6 +532,11 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None,
         "extero": cpu(cmd._lagged_extero()[idx]).astype(np.float16),
         "cmd_future": cpu(cmd.get_command_velocity_horizon(cmd.ctx.F)[idx]).astype(np.float32),
         "depth_lag_used": np.full(idx.numel(), served, dtype=np.uint8),
+        # The behaviour-policy arms this chunk was generated under. Read from the command
+        # term's own flags at the instant of the re-plan, which is when the corruption was
+        # applied -- `history` and `extero` above are the TRUE measurement either way.
+        "perturb_null_history": cpu(cmd.history_nulled()[idx]).astype(np.uint8),
+        "perturb_noisy_upper_cam": cpu(cmd.upper_camera_noised()[idx]).astype(np.uint8),
         "fm_plan": cpu(cmd._pred_window[idx]).astype(np.float32),
         "anchor_pos": cpu(cmd._anchor_pos[idx]).astype(np.float32),
         "anchor_quat": cpu(cmd._anchor_quat[idx]).astype(np.float32),
