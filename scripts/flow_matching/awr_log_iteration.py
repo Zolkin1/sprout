@@ -37,6 +37,52 @@ def _read(path: str) -> dict:
         return {}
 
 
+def _critic_quality(path: str) -> dict:
+    """Recompute the quality head's out-of-fold metrics from the saved predictions.
+
+    Reported on UNSEEN tiles, which is the only split that ever tracked outcome, and
+    alongside the dispersion ratio ``pred_sd / target_sd`` -- a ratio above 1 inflates every
+    advantage the fine-tune then weights by, so it is the number to watch across iterations.
+
+    Args:
+        path: The critic's ``predictions.npz``.
+
+    Returns:
+        Metrics keyed for wandb, or ``{}`` if the file is absent or carries no quality head.
+    """
+    try:
+        import numpy as np  # noqa: PLC0415
+
+        with np.load(path, allow_pickle=False) as z:
+            if "q_V_priv" not in z.files or "g" not in z.files:
+                return {}
+            pred = z["q_V_priv"].astype(np.float64)
+            targ = z["g"].astype(np.float64)
+            ok = z["g_valid"].astype(bool) if "g_valid" in z.files else np.ones(pred.size, bool)
+            unseen = z["val_tile"].astype(bool) if "val_tile" in z.files else np.zeros(pred.size, bool)
+    except (OSError, ValueError, KeyError):
+        return {}
+
+    out: dict = {}
+    for tag, mask in (("unseen", ok & unseen), ("seen", ok & ~unseen)):
+        if int(mask.sum()) < 8:
+            continue
+        pm, tm = pred[mask], targ[mask]
+        var = float(((tm - tm.mean()) ** 2).mean())
+        out[f"critic/{tag}/r2"] = (1.0 - float(((pm - tm) ** 2).mean()) / var) if var > 0 else 0.0
+        out[f"critic/{tag}/pred_sd"] = float(pm.std())
+        out[f"critic/{tag}/target_sd"] = float(tm.std())
+        if tm.std() > 0:
+            out[f"critic/{tag}/dispersion_ratio"] = float(pm.std() / tm.std())
+        if pm.std() > 0 and tm.std() > 0:
+            # Spearman: rank-correlate without pulling in scipy.
+            rp = np.argsort(np.argsort(pm)).astype(np.float64)
+            rt = np.argsort(np.argsort(tm)).astype(np.float64)
+            out[f"critic/{tag}/rho"] = float(np.corrcoef(rp, rt)[0, 1])
+        out[f"critic/{tag}/n"] = int(mask.sum())
+    return out
+
+
 def collect_row(root: str, iteration: int, critic_dir: str, ft_dir: str) -> dict:
     """Gather one iteration's metrics from the artifacts on disk.
 
@@ -67,16 +113,16 @@ def collect_row(root: str, iteration: int, critic_dir: str, ft_dir: str) -> dict
         if man.get("n_episodes"):
             row["buffer/fresh_fraction"] = fresh / float(man["n_episodes"])
 
+    # **COMPUTED FROM `predictions.npz`, NOT SCRAPED FROM THE LOG.** Under `--quality_only`
+    # the critic's `gates.json` `results` block carries only `quality_only: true` -- the AUC
+    # and calibration entries are null because there is no failure head -- and the numbers
+    # that matter (unseen-tile r2/rho, and the dispersion ratio that says whether the head
+    # inflates advantages) are printed to stdout and nowhere else. The out-of-fold
+    # predictions ARE saved, so recomputing is both possible and steadier than parsing text.
     if gates:
         row["critic/n_episodes"] = gates.get("n_episodes")
         row["critic/n_windows"] = gates.get("n_windows")
-        # `results` is a list of per-(variant, fold) dicts; report the unseen-tile numbers,
-        # which are the only ones that ever tracked outcome.
-        for res in gates.get("results", []) or []:
-            tag = f"{res.get('variant', '?')}_f{res.get('fold', '?')}"
-            for key in ("r2_unseen", "rho_unseen", "pred_sd", "target_sd", "auc_unseen"):
-                if res.get(key) is not None:
-                    row[f"critic/{tag}/{key}"] = res[key]
+    row.update(_critic_quality(os.path.join(critic_dir, "predictions.npz")))
 
     if ft:
         awr = ft.get("awr") or {}
@@ -113,7 +159,11 @@ def main() -> int:
     p.add_argument("--dry_run", action="store_true", help="print the row, log nothing")
     a = p.parse_args()
 
-    row = collect_row(a.root, a.iteration, a.critic_dir, a.ft_dir)
+    try:
+        row = collect_row(a.root, a.iteration, a.critic_dir, a.ft_dir)
+    except Exception as exc:                                  # noqa: BLE001
+        print(f"[awr-log] WARNING could not gather metrics: {type(exc).__name__}: {exc}")
+        return 0
     print(f"[awr-log] iteration {a.iteration}: {len(row) - 1} metrics")
     for k in sorted(row):
         print(f"    {k} = {row[k]}")
