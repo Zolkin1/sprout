@@ -97,14 +97,17 @@ def test_the_history_null_arm_is_drawn_and_ors_into_the_served_mask():
     """
     src = _cmd_source()
 
-    # It rides on the same mask, not a separate model input.
+    # It rides on the same mask, not a separate model input.  Bracketed by the CONSUMER
+    # (`_run_fm`) rather than by `_fm_reinfer_mask`, which used to follow the composition and
+    # now precedes it: the per-re-plan draws have to land before the fold, so the assignment
+    # moved above it (see test_the_replan_history_draw_precedes_the_null_mask_composition).
     infer = src[src.index("null_hist = self._history.null_mask()"):]
-    infer = infer[:infer.index("self._fm_reinfer_mask")]
+    infer = infer[:infer.index("self._run_fm(infer_mask, null_hist)")]
     assert "_force_null_hist" in infer and "|" in infer, (
         "the deliberate arm must OR into `history_null_mask`; a second channel would need a "
         "second embedding the model does not have")
 
-    # Re-drawn per EPISODE, so a whole episode is attributable to one arm.
+    # Drawn at reset, under the per-episode cadence (the default).
     reset = src[src.index("    def reset(self, env_ids=None):"):]
     reset = reset[:reset.index("\n    # ---")]
     assert "_draw_history_null" in reset
@@ -233,6 +236,58 @@ def test_both_diagnostic_arms_are_visually_distinct_and_composable():
     assert tuple(DEBUG_NULL_HISTORY_COLOR) == tuple(DEBUG_ARM_COLORS[1][1])
 
 
+def test_arm_3_is_separated_from_the_ROOT_by_LIGHTNESS_not_by_hue():
+    """Arm 3's colour must contrast with arm 0's root, and hue distance is the wrong test.
+
+    Arm 3 recolours the SAME marker arm 0 draws -- the predicted root path -- just on different
+    envs, so the only confusion that matters is arm 3 against the ordinary root colour.  It was
+    yellow (1.00, 0.90, 0.10) for exactly one reason: no other marker used yellow.  That is an
+    unused-HUE argument, and it does not answer the question.  Measured against the orange root
+    (0.95, 0.55, 0.10), yellow sat 21.6 deg of hue and 1.40:1 of luminance away -- two bright
+    warm colours differing mostly in one channel -- and read as the unperturbed root in the
+    viewport, which is the single mistake the recolour exists to prevent.
+
+    **Do not replace this with an RGB- or hue-distance check.**  Both rank yellow-vs-orange
+    (0.354 RGB, 21.6 deg) as BETTER separated than the magenta-vs-purple-wrist clash the
+    palette already documents as real (0.218 RGB, 17.5 deg), so either metric would have passed
+    the very case that failed.  What actually fixed it is LIGHTNESS: black needs no free hue,
+    which matters because the warm half of this palette is full.
+
+    The 4.0:1 floor is WCAG's large-text threshold, used here only as a defensible reference
+    point -- it fails yellow (1.40) with margin and passes black (13.05) with a lot more.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.fm_tracking_cmd \
+        import DEBUG_ARM_COLORS
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd \
+        import _DEBUG_FRAME_COLOR_MAP
+
+    def luminance(c):
+        """Relative luminance of a linear RGB triple."""
+        return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+    def contrast(a, b):
+        """WCAG-style contrast ratio between two linear RGB triples."""
+        la, lb = luminance(a), luminance(b)
+        return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+    root = _DEBUG_FRAME_COLOR_MAP["pelvis_link"]
+    name, arm3 = DEBUG_ARM_COLORS[3]
+    ratio = contrast(arm3, root)
+    assert ratio >= 4.0, (
+        f"{name} at {arm3} contrasts only {ratio:.2f}:1 with the root path's own "
+        f"{root}. Both arms draw the SAME marker, so this is the pairing that decides "
+        "whether a both-arms env is recognisable. Yellow failed here at 1.40:1.")
+
+    # And it must stay the DARK end specifically: the whole argument is that it does not
+    # compete for a hue, so a mid-tone that happens to clear the ratio would lose it.
+    assert luminance(arm3) < luminance(root), (
+        f"{name} must be DARKER than the root, not brighter: a bright colour has to find an "
+        "unused hue, and this palette has none free in the warm half.")
+    for frame, c in _DEBUG_FRAME_COLOR_MAP.items():
+        assert contrast(arm3, c) >= 4.0, (
+            f"{name} contrasts only {contrast(arm3, c):.2f}:1 with {frame}")
+
+
 def test_the_arm_index_composes_the_two_flags():
     """`history_nulled + 2 * upper_camera_noised`, so all four states are reachable."""
     src = _cmd_source()
@@ -244,36 +299,109 @@ def test_the_arm_index_composes_the_two_flags():
 
 
 def test_the_replan_cadence_draws_immediately_before_sampling():
-    """The flag gating the corruption must be the flag the plan was sampled under.
+    """The flag gating a perturbation must be the flag the plan was sampled under.
 
     Under the per-re-plan cadence the draw has to happen for exactly the re-planning envs and
-    right before `_run_fm`.  Drawing it a step early or for all envs would corrupt a different
+    right before `_run_fm`.  Drawing it a step early or for all envs would perturb a different
     set than the one that then samples, and the ribbon -- which colours by the same flag --
-    would attribute each plan to the wrong condition.
+    would attribute each plan to the wrong condition.  Both arms, since both have the cadence.
     """
     src = _cmd_source()
     infer = src[src.index("self._fm_reinfer_mask = infer_mask"):]
     infer = infer[:infer.index("self._run_fm(infer_mask, null_hist)")]
     assert 'fm_upper_camera_noise_cadence) == "replan"' in infer
+    assert 'fm_history_null_cadence) == "replan"' in infer
     assert "infer_mask.nonzero" in infer, (
         "the draw must take the re-planning env IDS; a bool mask would size the draw wrong")
 
 
+def test_the_replan_history_draw_precedes_the_null_mask_composition():
+    """The per-re-plan HISTORY draw must land BEFORE `null_hist` is built.
+
+    This is the one asymmetry between the two arms, and it is invisible in a flag dump.  The
+    camera arm is read LIVE inside `_run_fm`, so where it is drawn does not matter.  The
+    history arm is not: it is folded into `null_hist` once, and `null_hist` is what `_run_fm`
+    conditions on.  Draw it after that fold and the flag takes effect one re-plan LATE -- so
+    every plan the ribbon coloured for the arm would be one sampled with its history intact,
+    the arm would measure as a no-op, and every flag, colour and recorded column would agree
+    with each other and be wrong.
+
+    Pinned positionally rather than by behaviour because the failure is an ORDERING, and the
+    two orderings produce identical shapes, identical flags and identical marker colours.
+    """
+    src = _cmd_source()
+    fn = src[src.index("    def _snapshot_and_infer"):]
+    fn = fn[:fn.index("\n    def ", 10)]
+    draw = fn.index('fm_history_null_cadence) == "replan"')
+    compose = fn.index("null_hist = self._history.null_mask()")
+    run = fn.index("self._run_fm(infer_mask, null_hist)")
+    assert draw < compose < run, (
+        f"per-re-plan history draw at {draw}, null_hist composed at {compose}, _run_fm at "
+        f"{run}: the draw must come first or the arm is one re-plan late")
+
+
 def test_the_two_cadences_are_mutually_exclusive():
-    """Exactly one of reset / re-plan draws, or the arm is re-rolled twice a step."""
+    """Exactly one of reset / re-plan draws, or an arm is re-rolled twice a step.
+
+    Both arms now carry the knob, so both reset draws are conditional.  An unconditional one
+    would re-roll at reset AND at the first re-plan of the episode -- which is the same step,
+    because a reset clears `_pred_valid` and `infer_mask` includes `~_pred_valid`.
+    """
     src = _cmd_source()
     reset = src[src.index("    def reset(self, env_ids=None):"):]
     reset = reset[:reset.index("return out")]
-    assert 'fm_upper_camera_noise_cadence) == "episode"' in reset, (
-        "reset must draw only under the per-episode cadence")
-    # The history arm is unconditional -- it has no cadence knob yet, and that is deliberate.
-    assert "self._draw_history_null(env_ids)" in reset
+    for arm in ("fm_upper_camera_noise_cadence", "fm_history_null_cadence"):
+        assert f'{arm}) == "episode"' in reset, (
+            f"reset must draw {arm}'s arm only under the per-episode cadence")
+    # The GATE stays unconditional: both arms are gated by it, so drawing an arm against the
+    # previous episode's eligibility would make the control population one episode stale.
+    assert "self._draw_perturb_eligible(env_ids)" in reset
+    assert reset.index("_draw_perturb_eligible") < reset.index("_draw_history_null")
 
 
 def test_an_unknown_cadence_is_refused():
     """A typo must not silently fall through to one of the two behaviours."""
     src = _cmd_source()
-    assert "fm_upper_camera_noise_cadence must be 'episode' or 'replan'" in src
+    for arm in ("fm_upper_camera_noise_cadence", "fm_history_null_cadence"):
+        assert f"{arm} must be 'episode' or 'replan'" in src, arm
+
+
+def test_the_history_cadence_defaults_to_episode():
+    """The new knob must not change what an existing run does.
+
+    ``"episode"`` is what the arm did before the cadence existed, and it is the cadence under
+    which an EPISODE-level result is attributable to the arm -- so every recording already on
+    disk keeps meaning what it said.
+    """
+    import dataclasses
+
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking import (
+        fm_tracking_cmd_cfg)
+
+    fields = {f.name: f for f in dataclasses.fields(fm_tracking_cmd_cfg.FmTrackingCommandCfg)}
+    f = fields["fm_history_null_cadence"]
+    got = (f.default_factory() if f.default is dataclasses.MISSING else f.default)
+    assert got == "episode", got
+    # And it must match the camera's default, or "configure both the same way" is not true.
+    c = fields["fm_upper_camera_noise_cadence"]
+    assert got == (c.default_factory() if c.default is dataclasses.MISSING else c.default)
+
+
+def test_both_startup_prints_report_the_GATED_rate():
+    """The prints must state the effective rate, not the inner fraction.
+
+    `fm_perturb_fraction` gates both arms multiplicatively, so a 0.5 gate with a 0.1 history
+    fraction perturbs 5% of envs while the inner number says 10%.  Reporting the inner number
+    alone made a correctly-working arm read as broken: at 8 envs the message promised ~0.8
+    affected envs where the truth was ~0.4, and the arm was invisible for most of a run.
+    """
+    src = _cmd_source()
+    for anchor in ("upper camera (sensor", "history-nulling"):
+        i = src.index(anchor)
+        block = src[max(0, i - 700):i + 700]
+        assert "fm_perturb_fraction" in block, (
+            f"the {anchor!r} print does not account for the gate")
+        assert "eff" in block
 
 
 def test_the_recording_stores_the_TRUE_conditioning_not_the_perturbed_one():

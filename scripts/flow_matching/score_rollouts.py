@@ -103,8 +103,11 @@ def rebuild(ckpt: dict, ctx, device: str):
     # to the MODEL and both come from `context_dim`, so it cannot see a stamp that disagrees
     # with them -- and the failure is not a shape error but a linear layer reading the twist
     # out of the goal's columns.
-    want = value.context_width(privileged=priv,
-                               goal_context=bool(ckpt.get("goal_context", True)))
+    # `worst_penalty_context` joins `goal_context` here: A checkpoint fitted with `--worst_context` stamps `worst_penalty_context` and is one block WIDER, so a check that omits the flag rejects a perfectly good critic (and, if the widths ever coincided, would accept a wrong one).
+    want = value.context_width(
+        privileged=priv,
+        goal_context=bool(ckpt.get("goal_context", True)),
+        worst_penalty_context=bool(ckpt.get("worst_penalty_context", False)))
     if int(ckpt["context_dim"]) != want:
         raise SystemExit(
             f"context_dim {ckpt['context_dim']} but privileged={priv} / "
@@ -126,6 +129,10 @@ def main() -> int:
                         "checkpoint names")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--max_windows", type=int, default=0)
+    p.add_argument("--reward_npz", default="",
+                   help="The terrain sidecar the critic was fitted against. Required only "
+                        "for a critic stamped `worst_penalty_context`, whose context token "
+                        "carries a block derived from that file's `penalty` column.")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--json", default="", help="also write the gates here")
     a = p.parse_args()
@@ -155,15 +162,25 @@ def main() -> int:
     rule = str(ck.get("failure_rule", "strict"))
     print(f"[score] failure rule from the checkpoint: {rule}"
           + ("" if "failure_rule" in ck else "  (unstamped -- predates the flag, so strict)"))
-    W, E, lab_all = fv._load(a.stem, a.max_windows, strict_failure=(rule == "strict"))
+    # Same reasoning as `predict_value`: a `--worst_context` critic cannot be scored without
+    # the sidecar that block is derived from.
+    wctx = bool(ck.get("worst_penalty_context", False))
+    if wctx and not a.reward_npz:
+        raise SystemExit(
+            "this critic was fitted with --worst_context, so scoring it needs the same "
+            "terrain sidecar to rebuild that context block: pass --reward_npz.")
+    W, E, lab_all = fv._load(a.stem, a.max_windows, strict_failure=(rule == "strict"),
+                             reward_npz=a.reward_npz, worst_context=wctx)
     ctx = load_fm_context(fm_ckpt, device=a.device)
     model = rebuild(ck, ctx, a.device)
 
     idx = np.arange(len(W["episode_uid"]))
-    p_fail = fv._predict(model, ctx, W, idx, priv, a.device, tuple(ck["scan_hw"]), a.batch)
+    p_fail = fv._predict(model, ctx, W, idx, priv, a.device, tuple(ck["scan_hw"]), a.batch,
+                         worst_so_far=lab_all.get("worst_so_far"))
     gates = fv._gates(p_fail, lab_all, W, idx)
     q_pred, q_tgt = fv._predict_quality(model, ctx, W, idx, priv, a.device,
-                                        tuple(ck["scan_hw"]), a.batch)
+                                        tuple(ck["scan_hw"]), a.batch,
+                                        worst_so_far=lab_all.get("worst_so_far"))
 
     n_ep = len(np.unique(W["episode_uid"]))
     n_fail = int(lab_all[idx].sum())

@@ -469,12 +469,18 @@ def test_the_perturbation_arms_are_recorded_per_window():
     """
     import rollout_outcomes as ro
 
-    for col in ("perturb_null_history", "perturb_noisy_upper_cam"):
+    for col in ("perturb_null_history", "perturb_noisy_upper_cam",
+                "perturb_speed_mismatch"):
         assert col in ro.ROLLOUT_WINDOW_NAMES, col
         assert dict(ro.ROLLOUT_WINDOW_COLUMNS)[col] == "u1", f"{col} should be one byte"
+    # The speed arm records its OFFSET as well as its flag, because unlike the other two the
+    # corruption is a MAGNITUDE: the flag alone cannot say what the generator was shown, and
+    # `cmd_future` deliberately keeps the TRUE command.
+    assert "perturb_speed_offset_mps" in ro.ROLLOUT_WINDOW_NAMES
+    assert dict(ro.ROLLOUT_WINDOW_COLUMNS)["perturb_speed_offset_mps"] == "f4"
     assert "history_null" in ro.ROLLOUT_WINDOW_NAMES, (
         "history_null is a different signal and must not have been replaced")
-    assert ro.SCHEMA_VERSION >= 3, "adding columns must bump the schema version"
+    assert ro.SCHEMA_VERSION >= 4, "adding columns must bump the schema version"
 
 
 def test_the_reader_still_loads_a_pre_perturbation_recording(tmp_path):
@@ -515,6 +521,41 @@ def test_the_reader_still_loads_a_pre_perturbation_recording(tmp_path):
         ro.read_rollout_windows(str(p), columns=["episode_uid", "not_a_real_column"])
 
 
+def test_the_reader_still_loads_a_SCHEMA_3_recording(tmp_path):
+    """The bump this change makes, tested in its own right.
+
+    Schema 3 is not a historical curiosity: every AWR buffer and every graded increment on
+    disk right now is schema 3, so the speed arm's columns going in must leave those loading
+    with the arm filled as "not mismatched". The 2 -> 3 bump orphaned the 32k-episode critic
+    set and this is the same mistake one version later.
+    """
+    import h5py
+    import numpy as np
+
+    import rollout_outcomes as ro
+
+    p = tmp_path / "v3.h5"
+    n = 4
+    with h5py.File(p, "w") as f:
+        f.attrs["schema_version"] = 3
+        f.attrs["num_windows"] = n
+        f.attrs["num_windows_written"] = n
+        f.create_dataset("episode_uid", data=np.arange(n, dtype=np.int64))
+        f.create_dataset("replan_index", data=np.zeros(n, np.int32))
+        # A schema-3 file HAS the first two arms and lacks only the speed one.
+        f.create_dataset("perturb_null_history", data=np.ones(n, np.uint8))
+        f.create_dataset("perturb_noisy_upper_cam", data=np.zeros(n, np.uint8))
+
+    got, attrs = ro.read_rollout_windows(
+        str(p), columns=["episode_uid", "perturb_null_history",
+                         "perturb_speed_mismatch", "perturb_speed_offset_mps"])
+    assert attrs["schema_version"] == 3
+    # The columns it HAS come through unchanged -- the backfill must not overwrite real data.
+    assert got["perturb_null_history"].all(), "a present column was backfilled over"
+    assert not got["perturb_speed_mismatch"].any()
+    assert not got["perturb_speed_offset_mps"].any()
+
+
 def test_only_the_post_schema2_columns_are_backfillable():
     """The backfill table must not grow into a general "absent means zero" policy.
 
@@ -526,8 +567,9 @@ def test_only_the_post_schema2_columns_are_backfillable():
     import rollout_outcomes as ro
 
     assert set(ro.WINDOW_SCHEMA_BACKFILL) == {
-        "perturb_null_history", "perturb_noisy_upper_cam"}
-    assert ro.READABLE_SCHEMAS == frozenset((2, 3))
+        "perturb_null_history", "perturb_noisy_upper_cam",
+        "perturb_speed_mismatch", "perturb_speed_offset_mps"}
+    assert ro.READABLE_SCHEMAS == frozenset((2, 3, 4))
     for col in ro.WINDOW_SCHEMA_BACKFILL:
         assert col in ro.ROLLOUT_WINDOW_NAMES
 

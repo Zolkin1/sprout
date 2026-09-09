@@ -464,12 +464,34 @@ def cmd_plan(args: argparse.Namespace) -> int:
         if args.refresh > pool.size:
             raise SystemExit(
                 f"cannot drop {args.refresh} of {pool.size} episodes.")
-        # Uniform over the WHOLE pool, not per stem: that is what "randomly replace" means,
-        # and it gives data an exponential age (a few episodes survive many iterations)
-        # rather than the hard 4-iteration cutoff a per-stem or FIFO retirement would.
+        # **OLDEST ITERATION FIRST**, not uniform over the pool. A uniform draw gives data an
+        # exponential age -- a few episodes survive many iterations, so the buffer always
+        # carries a thin tail collected by policies several generations stale, and how stale
+        # is a matter of luck. Retiring in collection order gives a hard, stated window of
+        # `capacity / refresh` iterations instead, which is the thing the buffer is supposed
+        # to be: a fixed-length view of recent behaviour. Within the partially-drained stem
+        # the draw is still random and seeded, so which of an iteration's episodes survives
+        # longest is not decided by uid order -- a uid is issued when an episode ENDS, so a
+        # prefix there would systematically retire the short ones.
         rng = np.random.default_rng([int(args.seed), int(args.iteration)])
-        dropped = sorted(int(u) for u in rng.choice(pool, size=int(args.refresh),
-                                                    replace=False))
+        need = int(args.refresh)
+        dropped_l: list[int] = []
+        for row in sorted(prev["stems"], key=lambda r: int(r["iteration_collected"])):
+            if need <= 0:
+                break
+            have = np.asarray(row["uids"], dtype=np.int64)
+            if have.size <= need:
+                dropped_l.extend(int(u) for u in have)
+                need -= have.size
+            else:
+                dropped_l.extend(int(u) for u in rng.choice(have, size=need, replace=False))
+                need = 0
+        if need > 0:
+            raise SystemExit(
+                f"cannot drop {args.refresh} episodes: the buffer holds {pool.size} and the "
+                f"per-stem walk came up {need} short, which means a stem's uid list "
+                "disagrees with n_episodes.")
+        dropped = sorted(dropped_l)
         drop_set = set(dropped)
         stems = []
         for row in prev["stems"]:

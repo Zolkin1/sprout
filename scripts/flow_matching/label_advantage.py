@@ -44,6 +44,18 @@ for _p in (os.path.join(_ROOT, "source", "robot_rl"), os.path.join(_ROOT, "sourc
 
 from robot_rl.flow_matching import advantage as adv_mod  # noqa: E402
 
+#: Reward sources that ARE the terrain signal, so `--terrain_only` accepts them. Both are
+#: per-chunk terrain-gated rewards measured by the SAME grader; `terrain_progress` adds a
+#: gated velocity term and a one-off terminal bonus on top of `terrain`'s geometry, which
+#: changes the reward's RANGE (and its reducer) but not what the advantage means. Restated
+#: here rather than imported from `fit_value` because that module launches an argparse and
+#: reads h5; the two are pinned equal by `test_label_advantage.py`.
+TERRAIN_REWARD_SOURCES: tuple[str, ...] = ("terrain", "terrain_progress")
+
+#: The progress reward specifically, whose target is bootstrapped and whose per-chunk range
+#: is not `terrain`'s. Named so the one condition that differs can name it.
+PROGRESS_REWARD_SOURCE: str = "terrain_progress"
+
 
 
 def check_reward_consistency(fitted_on: str, w_fail: float, estimator: str,
@@ -91,9 +103,10 @@ def check_reward_consistency(fitted_on: str, w_fail: float, estimator: str,
             "and its output is noise shaped like a probability. Label at --w_fail 0, or refit "
             "without --quality_only.")
     if terrain_only:
-        if fitted_on != "terrain":
+        if fitted_on not in TERRAIN_REWARD_SOURCES:
             raise SystemExit(
-                f"--terrain_only, but this critic was fitted on {fitted_on!r}. Its quality "
+                f"--terrain_only, but this critic was fitted on {fitted_on!r}, which is not "
+                f"one of {TERRAIN_REWARD_SOURCES}. Its quality "
                 "head predicts a different reward from the one the advantage would measure, "
                 "so the difference would be meaningless while looking entirely normal. "
                 "Refit with: fit_value.py --reward_npz <terrain sidecar>.")
@@ -107,11 +120,24 @@ def check_reward_consistency(fitted_on: str, w_fail: float, estimator: str,
                 "--terrain_only needs --estimator mc: the n_step quality half bootstraps on "
                 "the critic's prediction at t+n, so it is not a difference against measured "
                 "terrain reward.")
+        if fitted_on == PROGRESS_REWARD_SOURCE:
+            # The ADVANTAGE stays MC -- `--estimator mc` above is still required, and G is
+            # still the realized return. What changed is the BASELINE: under fitted value
+            # iteration the critic's quality head was fitted against a bootstrapped target,
+            # so V(s) estimates the discounted return rather than the 3-chunk window sum.
+            # That is the intent (a terminal bonus cannot reach 3 chunks back), but it means
+            # `G - V` differences a full-horizon baseline against a windowed return unless
+            # G is built the same way. Stated rather than refused, because `fit_value` bounds
+            # both by the same `return_max` and the loop builds G with the same reducer.
+            print("[label] NOTE: this critic was fitted on the PROGRESS reward, whose target "
+                  "is the (1-gamma)-weighted return with a terminal bonus. G must be built "
+                  "by the same reducer (bootstrapped_window_return) and bounded by the same "
+                  "return_max, or the advantage differences two scales.")
         print(f"[label] TERRAIN ONLY: quality half alone, MC target, critic fitted on "
               f"{fitted_on!r} (hash {fitted_hash}), {quality_kind} head over "
               f"[{quality_range[0]:g}, {quality_range[1]:g}]"
               + (", survival head UNTRAINED (quality_only fit)" if quality_only else ""))
-    elif fitted_on == "terrain" and w_fail > 0.0:
+    elif fitted_on in TERRAIN_REWARD_SOURCES and w_fail > 0.0:
         print(f"[label] WARNING: this critic was fitted on the TERRAIN reward but --w_fail "
               f"{w_fail} mixes in the realized fall outcome. Pass --terrain_only if you meant "
               "the terrain signal alone.")

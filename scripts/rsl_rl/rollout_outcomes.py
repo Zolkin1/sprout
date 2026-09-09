@@ -71,7 +71,7 @@ for _d in (os.path.join(_HERE, "eval"), _HERE):
 
 #: Bump on any column removal, rename or change of meaning.
 # 2: the per-chunk tracking-error block (`track_err`) and the strict violation columns.
-SCHEMA_VERSION: int = 3
+SCHEMA_VERSION: int = 4
 
 #: Schema versions the readers accept.  ONE set, because ``schema_version`` is a single
 #: number stamped on both tables -- so a reader that accepts only the newest orphans the
@@ -81,9 +81,11 @@ SCHEMA_VERSION: int = 3
 #: is what happened when the perturbation columns landed: the 32k-episode v1 set the critic was
 #: fitted on stopped loading.  So the reader states which versions it can read, and what it
 #: substitutes for each one's missing columns.
-READABLE_SCHEMAS: frozenset[int] = frozenset((2, 3))
+READABLE_SCHEMAS: frozenset[int] = frozenset((2, 3, 4))
 
-#: Columns added after schema 2, with the value to fill for an older file.
+#: Columns added after schema 2, with the value to fill for an older file.  Keyed by column
+#: rather than by version because the reader's job is "substitute for what is missing", and a
+#: schema-2 file is missing everything a schema-3 one is missing plus more.
 #:
 #: **This is not the "absent is not zero" rule being broken -- it is the case that rule exists
 #: to distinguish.** `penetration_volume_m3` is absent when the collider model carries no
@@ -93,6 +95,12 @@ READABLE_SCHEMAS: frozenset[int] = frozenset((2, 3))
 WINDOW_SCHEMA_BACKFILL: dict[str, tuple[int, str]] = {
     "perturb_null_history": (0, "u1"),
     "perturb_noisy_upper_cam": (0, "u1"),
+    # Schema 4: the speed-mismatch arm. The OFFSET backfills to 0.0, which is the accurate
+    # statement about a file written before the arm existed -- and it is an offset rather
+    # than an absolute speed precisely so that 0 means "no mismatch" instead of "commanded
+    # 0 m/s", which is a real and very different thing on this task.
+    "perturb_speed_mismatch": (0, "u1"),
+    "perturb_speed_offset_mps": (0, "f4"),
 }
 
 _F = "f4"
@@ -643,6 +651,11 @@ ROLLOUT_WINDOW_COLUMNS: tuple[tuple[str, str], ...] = (
     # the model while the recorded history stayed complete.
     ("perturb_null_history", _U8),   # the learned null embedding replaced the real history
     ("perturb_noisy_upper_cam", _U8),  # the upper (far) camera was replaced with garbage
+    ("perturb_speed_mismatch", _U8),   # the CONDITIONING command speed was offset
+    # The OFFSET, in m/s, signed. Recorded rather than the absolute conditioning speed
+    # because `cmd_future` already carries the TRUE command, so the pair is complete and a
+    # zero here reads as "no mismatch" rather than as a commanded standstill.
+    ("perturb_speed_offset_mps", _F),
     # --- the action a_t -----------------------------------------------------------------
     ("fm_plan", "f4"),            # (F, D) -- the emitted chunk, in window space
     # --- where it happened, for privileged critic features and diagnostics --------------
@@ -837,6 +850,8 @@ class RolloutWindowWriter:
             # column present only in the tuple is created by nothing and dropped in silence.
             "perturb_null_history": (num_windows,),
             "perturb_noisy_upper_cam": (num_windows,),
+            "perturb_speed_mismatch": (num_windows,),
+            "perturb_speed_offset_mps": (num_windows,),
             "history": (num_windows, int(num_history), int(state_dim)),
             "extero": (num_windows, int(extero_shape[0]), int(extero_shape[1])),
             "cmd_future": (num_windows, int(future_len), int(cmd_dim)),

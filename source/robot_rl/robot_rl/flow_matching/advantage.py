@@ -303,6 +303,215 @@ def clipped_window_return(
     return g, ok
 
 
+def worst_penalty_before(
+    penalty: np.ndarray,
+    valid: np.ndarray,
+    episode_uid: np.ndarray,
+    replan_index: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The largest terrain penalty over the chunks STRICTLY BEFORE each row's own.
+
+    A critic context feature, not a reward.  The progress reward's success term is gated on
+    the episode's WORST chunk, which is a property of the whole episode including its future
+    -- so ``V(s_t)`` has no way to know the bonus has already been forfeited, and the part of
+    the return that depends on it is unpredictable from state.  This supplies the half of that
+    the state legitimately knows: what has already gone wrong.
+
+    **Strictly before, and that is the whole design.**  Including a row's own penalty would
+    put part of ``r_t`` into ``V(s_t)``, and the advantage ``G_t - V(s_t)`` would cancel
+    exactly that much of the signal it exists to carry -- a critic that looks better by every
+    fit metric while the thing it is for gets weaker.  The first chunk of an episode has no
+    history, so it gets 0: nothing has gone wrong yet, which is true.
+
+    Args:
+        penalty: ``[W]`` per-chunk terrain penalty, non-negative, higher is worse.
+        valid: ``[W]`` rows whose penalty is real.
+        episode_uid: ``[W]`` episode id.
+        replan_index: ``[W]`` chunk index within the episode.
+
+    Returns:
+        ``(worst, ok)`` -- ``[W]`` float64 running maximum over earlier chunks, and the rows
+        it is defined for (every valid row; the value is 0 where there is no history).
+    """
+    out = np.zeros(penalty.shape[0], dtype=np.float64)
+    ok = np.zeros(penalty.shape[0], dtype=bool)
+    order = np.lexsort((replan_index, episode_uid))
+    bounds = np.flatnonzero(np.diff(episode_uid[order], prepend=-1, append=-1) != 0)
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        idx = order[lo:hi]
+        present = valid[idx].astype(bool)
+        if not present.any():
+            continue
+        # `idx` is already ascending in replan_index within the episode, so a shifted
+        # cumulative maximum over it IS the exclusive running worst.
+        rows = idx[present]
+        p = penalty[rows].astype(np.float64)
+        run = np.maximum.accumulate(p)
+        out[rows[0]] = 0.0
+        if rows.size > 1:
+            out[rows[1:]] = run[:-1]
+        ok[rows] = True
+    return out, ok
+
+
+def bootstrapped_window_return(
+    reward_ongoing: np.ndarray,
+    reward_terminal: np.ndarray,
+    valid: np.ndarray,
+    episode_uid: np.ndarray,
+    replan_index: np.ndarray,
+    failed: np.ndarray,
+    v: np.ndarray | None = None,
+    window: int = 3,
+    gamma: float = 0.95,
+    return_max: float = 2.5,
+    tail_chunks: int = 3,
+) -> tuple[np.ndarray, np.ndarray]:
+    """``G_t`` for a GOODNESS reward with a ONE-OFF terminal bonus, optionally bootstrapped.
+
+    The third reducer beside :func:`clipped_window_return` (a penalty, fixed window, no
+    bootstrap) and :func:`normalized_returns` (a goodness in ``(0, 1]``, no terminal event).
+    This one exists because the progress reward is a goodness that is not bounded by 1 -- the
+    terminal chunk of a successful episode carries ``2 + C`` -- and because a terminal bonus
+    needs a horizon longer than three chunks to reach the states that earned it.
+
+    **The convention is the (1-gamma)-weighted average**, so ``G`` and ``v`` are the same kind
+    of quantity and the bootstrap is self-consistent::
+
+        v(s_t)  ~  (1 - gamma) * sum_j gamma^j r_(t+j)
+        G_t     =  (1 - gamma) * sum_(i<N) gamma^i r_(t+i)  +  gamma^N * v(s_(t+N))
+
+    For a constant reward ``r`` the first term is ``r * (1 - gamma^N)`` and the second
+    ``gamma^N * r``, so ``G = r = v``.  A convention failing that fixed point would drift on
+    every round of value iteration, in a direction no metric on the fit reports.
+
+    **THE TAIL IS THE PART THAT IS EASY TO GET WRONG, and it is not absorbing.** It follows
+    :func:`normalized_returns`, whose docstring records why: ``0`` on a failure, which really
+    is absorbing, but the LAST OBSERVED ONGOING REWARD otherwise, because the episode ended by
+    arriving or by the budget and the motion is assumed to continue at the quality it ended on.
+    An absorbing non-failure tail punishes arriving QUICKLY -- measured on a 40-chunk episode
+    with a terminal bonus, it made ``G`` *fall* from 0.282 to 0.224 over the last six chunks,
+    so the critic would have learned that approaching the goal is worse than being far from it
+    and the advantage would have been inverted exactly where it matters.
+
+    **The bonus is excluded from the tail.** ``reward_terminal`` is a one-off event, not a
+    continuing quality, so extending it forever would value every post-episode step as though
+    the robot arrived repeatedly.  It enters the sum once, at the chunk it happened on.
+
+    **The bound is the RETURN's, not the per-step reward's, and they differ 5x.** With ongoing
+    rewards bounded by 2 and one terminal ``C``, the weighted average is bounded by
+    ``2 + (1 - gamma) * C`` -- 2.5 at ``C = 10, gamma = 0.95`` -- while the per-step reward
+    reaches 12.  Normalising by 12 leaves a critic regressing a target whose realised range is
+    a tenth of its declared one: it trains cleanly and wastes most of the head's resolution.
+
+    Args:
+        reward_ongoing: ``[W]`` the per-chunk continuing reward (terrain + gated velocity),
+            bounded by 2.
+        reward_terminal: ``[W]`` the one-off bonus, non-zero only on the chunk it was earned.
+        valid: ``[W]`` bool, rows whose reward is real.
+        episode_uid: ``[W]`` episode id.
+        replan_index: ``[W]`` chunk index within the episode.
+        failed: ``[W]`` bool, whether the row's EPISODE failed; read per episode from its
+            first row, as the other reducers do.
+        v: ``[W]`` a FROZEN value estimate per row, on the same weighted-average scale.
+            ``None`` gives the full-episode Monte Carlo return, which is what round 0 of value
+            iteration wants -- bootstrapping off an untrained head fits noise to noise.
+            **Non-finite entries mean "no estimate for this row" and fall back to the tail**,
+            which is how a partially-covered source (an out-of-fold prediction assembled from
+            too few folds) degrades to the Monte Carlo target instead of poisoning it.
+        window: ``N``, chunks of real reward before the bootstrap takes over.
+        gamma: Discount.
+        return_max: The declared bound above; ``G`` is divided by it.
+        tail_chunks: Trailing ongoing rewards the non-failure tail averages.  3 rather than
+            :func:`normalized_returns`' 1, because that function's own docstring measures the
+            tail carrying a median 52% of ``G`` on a survived episode and 1 -> 3 dropping its
+            spread 12.1%; there is no back-compatibility reason to keep 1 here, since no
+            artifact was ever fitted with this reducer.
+
+    Returns:
+        ``(g, ok)`` -- ``[W]`` targets in ``[0, 1]`` and the rows they are defined for.
+    """
+    if not 0.0 < gamma < 1.0:
+        raise ValueError(f"gamma must be in (0, 1); got {gamma}")
+    if return_max <= 0.0:
+        raise ValueError(f"return_max must be positive; got {return_max}")
+    n = max(int(window), 1)
+    k_tail = max(int(tail_chunks), 1)
+
+    g = np.zeros(reward_ongoing.shape[0], dtype=np.float64)
+    ok = np.zeros(reward_ongoing.shape[0], dtype=bool)
+    order = np.lexsort((replan_index, episode_uid))
+    bounds = np.flatnonzero(np.diff(episode_uid[order], prepend=-1, append=-1) != 0)
+
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        idx = order[lo:hi]
+        ridx = replan_index[idx].astype(np.int64)
+        present = valid[idx].astype(bool)
+        if not present.any():
+            continue
+        span = int(ridx.max()) + 1
+        r = np.zeros(span, dtype=np.float64)
+        b = np.zeros(span, dtype=np.float64)
+        have = np.zeros(span, dtype=bool)
+        r[ridx[present]] = reward_ongoing[idx][present].astype(np.float64)
+        b[ridx[present]] = reward_terminal[idx][present].astype(np.float64)
+        have[ridx[present]] = True
+        # `have_v` is SEPARATE from `have`: `have` says the REWARD is present, while a frozen
+        # value can be missing on a row whose reward is fine -- an out-of-fold prediction
+        # covers only the folds' validation episodes, so a 1-fold source leaves most rows
+        # without one. Those arrive as non-finite and must fall back to the tail. Reading
+        # them as 0 would assert "worthless", which is a FAILED state's value; letting the
+        # nan through poisons G for every row whose window reaches it (measured: median G
+        # came back nan from a 40%-covered source).
+        vv = np.zeros(span, dtype=np.float64)
+        have_v = np.zeros(span, dtype=bool)
+        if v is not None:
+            vals = v[idx][present].astype(np.float64)
+            vv[ridx[present]] = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
+            have_v[ridx[present]] = np.isfinite(vals)
+
+        ep_failed = bool(failed[idx][0])
+        seen = np.flatnonzero(have)
+        # The continuing quality the episode ended on, averaged over the last few chunks so
+        # the tail does not rest on one measurement. Zero on a failure, which is absorbing.
+        tail_v = 0.0 if ep_failed else float(r[seen[-k_tail:]].mean())
+
+        for j, row in enumerate(idx):
+            if not present[j]:
+                continue
+            t = int(ridx[j])
+            if v is None:
+                acc, disc = 0.0, 1.0
+                for i in range(t, span):
+                    if have[i]:
+                        acc += disc * (r[i] + b[i])
+                    disc *= gamma
+                # Beyond the episode: the tail continues at `tail_v` forever, whose weighted
+                # contribution is exactly gamma^(span - t) * tail_v.
+                g[row] = ((1.0 - gamma) * acc + (gamma ** (span - t)) * tail_v) / return_max
+            else:
+                # A window running PAST the episode end takes `tail_v` for the chunks it
+                # cannot observe -- exactly as the MC branch does, and for the same reason.
+                # Skipping them while still discounting the bootstrap by the full gamma^n
+                # drops the (gamma - gamma^n) weight those chunks should have carried, which
+                # UNDER-values the last `n - 1` chunks of every episode. Those are the chunks
+                # holding the terminal bonus, so the error lands precisely on the success
+                # signal, and it breaks the `G = v = r` fixed point that keeps value
+                # iteration from drifting (measured: 0.4718 against 0.5200 at r = 1.3).
+                acc = 0.0
+                for i in range(n):
+                    m = t + i
+                    if m < span and have[m]:
+                        acc += (gamma ** i) * (r[m] + b[m])
+                    else:
+                        acc += (gamma ** i) * tail_v
+                boot = (vv[t + n] if (t + n) < span and have[t + n] and have_v[t + n]
+                        else tail_v)
+                g[row] = ((1.0 - gamma) * acc + (gamma ** n) * boot) / return_max
+            ok[row] = True
+    return g, ok
+
+
 def normalized_returns(
     reward: np.ndarray,
     valid: np.ndarray,

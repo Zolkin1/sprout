@@ -337,6 +337,11 @@ class FailureCritic:
         # rather than today's default re-resolved onto an older artifact, which is the trap
         # CLAUDE.md records for `extero_clip`, `attention_mode` and `skip_families`.
         self.goal_context = bool(ck.get("goal_context", True))
+        #: Whether the critic's context token carries the worst-terrain-penalty-so-far block.
+        #: Read from the checkpoint and never assumed: such a fit is one block WIDER, so a
+        #: check omitting the flag rejects a good critic -- and, if the widths ever coincided,
+        #: would accept a wrong one.
+        self.worst_penalty_context = bool(ck.get("worst_penalty_context", False))
         self.ctx = online.load_fm_context(use, device=device)
         # The QUALITY head's width has to be known BEFORE the load, because the head is built
         # by the ctor and `load_state_dict` is strict. Preference order, and the fallback is
@@ -357,12 +362,25 @@ class FailureCritic:
         # checkpoint against the MODEL and both come from `context_dim`, so it cannot see a
         # stamp that disagrees with them -- and the failure mode is not a shape error but a
         # linear layer reading the twist out of the goal's columns.
+        if self.worst_penalty_context:
+            # A critic fitted with `--worst_context` reads the worst terrain penalty seen so
+            # far in the episode, and NOTHING on this path computes a terrain penalty -- there
+            # is no grader in this loop and no running worst to hand it. Refused here, at load,
+            # rather than at the context builder: the builder would report a missing piece,
+            # which reads as a bug in this file instead of as the missing plumbing it is.
+            raise SystemExit(
+                f"{os.path.basename(ckpt)} was fitted with --worst_context, whose context "
+                "block is the worst terrain penalty BEFORE each chunk. This consumer has no "
+                "terrain grader and cannot supply it. Fit the critic without --worst_context "
+                "to score it here, or add a running worst-penalty accumulator to this path.")
         want = value.context_width(privileged=self.privileged,
-                                   goal_context=self.goal_context)
+                                   goal_context=self.goal_context,
+                                   worst_penalty_context=self.worst_penalty_context)
         if int(ck["context_dim"]) != want:
             raise ValueError(
                 f"{os.path.basename(ckpt)} stamps context_dim={int(ck['context_dim'])} but "
-                f"privileged={self.privileged} + goal_context={self.goal_context} build "
+                f"privileged={self.privileged} + goal_context={self.goal_context} + "
+                f"worst_penalty_context={self.worst_penalty_context} build "
                 f"{want}. One of the three is wrong, and every combination of the other two "
                 "produces a context vector that is finite, plausible and reading the wrong "
                 "columns.")
@@ -466,13 +484,16 @@ class FailureCritic:
         # ONBOARD keeps only the ANGULAR half: an IMU measures body rates, but nothing on the
         # robot measures the linear half without odometry. Slicing it away is what makes the
         # two variants' gap a statement about information rather than about architecture.
-        blocks = [tw if self.privileged else tw[3:]]
+        # `value.build_context` owns the order -- the same call the fit makes, so this reader
+        # and the process that trained the checkpoint cannot disagree about which column is
+        # which. Built as tensors rather than numpy for that reason.
+        pieces = {"twist": t(np.asarray(tw, dtype=np.float64))}
         if self.goal_context:
-            # PREPENDED, matching `fit_value._batch`: the goal owns columns 0:3.
-            blocks.insert(0, np.nan_to_num(
+            pieces["goal"] = t(np.nan_to_num(
                 np.asarray(x.goal, dtype=np.float64) / GOAL_SCALE_M,
                 nan=0.0, posinf=0.0, neginf=0.0))
-        context = t(np.concatenate(blocks))
+        context = value.build_context(privileged=self.privileged,
+                                      goal_context=self.goal_context, **pieces)
         return value.ValueInputs(
             history=hist, extero=ext, cmd_tokens=cmd,
             history_null=t(np.array([x.history_null]), torch.bool).reshape(1),

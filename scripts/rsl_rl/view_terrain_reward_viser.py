@@ -583,9 +583,57 @@ def _episode_index(path: str) -> dict:
     return out
 
 
+
+def _dismount_rows(rollout: str, total: int, blocks: tuple[str, ...], nj: int,
+                   min_drop_m: float = 0.25, land_tol_m: float = 0.15) -> np.ndarray:
+    """Rows whose PLAN steps DOWN onto the ground, as a boolean mask.
+
+    Ranking a reward column alone answers the wrong question when the thing being calibrated
+    is a gate on box dismounts: the lowest-penalty windows in any box2 recording are flat
+    standing plans, which are geometrically immaculate and say nothing about whether the gate
+    pays for a good step-off.  So this restricts the ranking to windows that actually descend.
+
+    The test is on the plan's own base height, which is what the terrain penalty is charged
+    against, and it needs no contact flag, family label or config: a window qualifies when the
+    plan's base falls at least ``min_drop_m`` across the window AND ends within ``land_tol_m``
+    of the GROUND STANDING HEIGHT, which is taken as the median final base height over the
+    whole recording.  That median is the right reference because most plans in any box2
+    recording are on the ground -- and using it rather than a declared constant means the
+    filter cannot disagree with the robot's actual stance.  The second condition is what
+    separates a dismount from a descent between two raised surfaces, and from a fall.
+
+    Args:
+        rollout: The rollout ``.h5``.
+        total: Rows written.
+        blocks: The window's block layout.
+        nj: Joint count, for the plan unpack.
+        min_drop_m: Least fall in the plan's base height to count as a step-off.  0.25 against
+            a 0.40 m box, so a plan that only begins the descent still counts -- the window is
+            0.24 s of a longer motion and the reward is charged per window.
+        land_tol_m: How close to the ground stance the plan must END.
+
+    Returns:
+        ``[total]`` bool.
+    """
+    with h5py.File(rollout, "r") as f:
+        plan = torch.as_tensor(f["fm_plan"][:total], dtype=torch.float64)
+        a_pos = torch.as_tensor(f["anchor_pos"][:total], dtype=torch.float64)
+        a_quat = torch.as_tensor(f["anchor_quat"][:total], dtype=torch.float64)
+    base_pos, _rot, _q, _bq = trio.plan_to_world(plan, a_pos, a_quat, nj, 4, blocks)
+    z = base_pos[..., 2].numpy()                      # (rows, nodes), world base height
+    ref = float(np.median(z[:, -1]))
+    drop = z[:, 0] - z[:, -1]
+    mask = (drop >= float(min_drop_m)) & (np.abs(z[:, -1] - ref) <= float(land_tol_m))
+    print(f"--dismount: ground stance taken as {ref:.3f} m (median final base height); "
+          f"{int(mask.sum())} of {total} windows drop >= {min_drop_m:g} m onto it")
+    return mask
+
+
 def _pick_rows(rollout: str, n: int, seed: int, worst: bool, model: PlanColliderModel,
                episode: dict, table: trio.TileTable, blocks: tuple[str, ...],
-               thresh: float, dilate: int, max_gap: int) -> np.ndarray:
+               thresh: float, dilate: int, max_gap: int,
+               sidecar: str = "", column: str = "reward", best: bool = True,
+               episodes: int = 0, restrict: np.ndarray | None = None) -> np.ndarray:
     """Choose which windows are selectable.
 
     Args:
@@ -596,12 +644,106 @@ def _pick_rows(rollout: str, n: int, seed: int, worst: bool, model: PlanCollider
             The interesting plans are rare -- three quarters of them penetrate nothing -- so a
             plain random draw mostly shows plans with nothing wrong.
         model / episode / table / blocks / thresh / dilate: As for the grading path.
+        sidecar: A reward sidecar ``.npz``. When given it overrides ``worst`` and rows are
+            ranked by ``column`` -- the reward a critic was actually fitted on -- rather than
+            by a quantity recomputed here.
+        column: Which sidecar column to rank by; falls back to ``reward``.
+        best: Rank descending (the rows the reward LIKES) rather than ascending.
+        episodes: When > 0, offer every re-plan of this many whole EPISODES, ranked by their
+            best window, instead of a list of individual windows.
+        restrict: Optional ``[total]`` bool restricting which rows may be RANKED (``--dismount``
+            passes the step-off mask).  Under ``episodes`` it selects which episodes are
+            ranked, and every re-plan of a chosen episode is still offered -- the point is to
+            watch the whole run that produced the qualifying window.
 
     Returns:
-        Sorted row indices.
+        Row indices to offer, in slider order.  Ascending for every mode except
+        ``episodes``, which groups by episode and orders each one's re-plans -- see there.
     """
     total = trio.rollout_meta(rollout)["_num_written"]
     rng = np.random.default_rng(seed)
+    if sidecar:
+        # **Rows chosen by the REWARD a critic was actually fitted on**, read straight from
+        # the sidecar rather than recomputed, so what is on screen is what the fit saw. The
+        # point of `--best` is the question `--worst` cannot answer: a reward is only trusted
+        # once the rows it likes look right, and a geometric reward can be high for a plan
+        # that is clean and motionless as easily as for one that is clean and moving.
+        with np.load(sidecar, allow_pickle=False) as z:
+            s_uid = z["episode_uid"].astype(np.int64)
+            s_rep = z["replan_index"].astype(np.int64)
+            s_col = z[column].astype(np.float64) if column in z.files \
+                else z["reward"].astype(np.float64)
+        with h5py.File(rollout, "r") as f:
+            f_uid = f["episode_uid"][:total].astype(np.int64)
+            f_rep = f["replan_index"][:total].astype(np.int64)
+        # Joined on (episode_uid, replan_index) -- the sidecar is a row SUBSET in its own
+        # order, so a positional pairing would show a different window than it scored.
+        f_key = (f_uid << np.int64(20)) + f_rep
+        s_key = (s_uid << np.int64(20)) + s_rep
+        o = np.argsort(s_key)
+        pos = np.clip(np.searchsorted(s_key[o], f_key), 0, s_key.size - 1)
+        hit = s_key[o][pos] == f_key
+        val = np.full(total, np.nan)
+        val[hit] = s_col[o][pos[hit]]
+        # Ranked over the COVERED rows only. Sorting the whole array with a sentinel puts the
+        # sentinel first in one of the two directions -- with -inf, `--lowest` offered rows
+        # the sidecar never scored, which looks exactly like a legitimately bad plan.
+        cov = np.flatnonzero(hit if restrict is None else (hit & restrict))
+        if cov.size == 0 and restrict is not None:
+            raise SystemExit(
+                "no window is both covered by the sidecar and a dismount. Loosen "
+                "--dismount_drop, or this recording has no step-off in it.")
+        ranked = cov[np.argsort(-val[cov] if best else val[cov])]
+        kind = "highest" if best else "lowest"
+        if episodes > 0:
+            # **WHOLE EPISODES, in re-plan order.** A single window is a quarter-second of
+            # plan, so a ranked list of windows shows the best quarter-seconds of many
+            # different episodes and answers nothing about how the robot got there. Episodes
+            # are ranked by their BEST window -- the direct reading of "show me what earned
+            # this" -- and then every one of their re-plans is offered so the run can be
+            # stepped through.
+            keep: list[int] = []
+            picked: list[int] = []
+            for r in ranked:
+                e = int(f_uid[r])
+                if e in picked:
+                    continue
+                picked.append(e)
+                ep = cov[f_uid[cov] == e]
+                keep.extend(ep[np.argsort(f_rep[ep])].tolist())
+                if len(picked) >= episodes:
+                    break
+            # **NOT sorted by row index.** Rows are written env-major per re-plan, so row
+            # order interleaves the chosen episodes and the window slider would jump between
+            # them every step. `keep` is already built episode-by-episode with each one's
+            # re-plans in order, so returning it as-is makes the slider a walk: episode 1
+            # start to finish, then episode 2. Nothing downstream needs ascending rows -- the
+            # viewer reads one window on demand rather than a bulk slice.
+            out = np.array(keep, dtype=np.int64)
+            print(f"--episodes {episodes}: {len(picked)} episode(s) whose best {column!r} is "
+                  f"{val[ranked[0]]:.4f}, {out.size} windows in re-plan order "
+                  f"(uids {picked[:6]}{'...' if len(picked) > 6 else ''})")
+            return out
+        # A column that is mostly zero -- `success` is non-zero only on the terminal chunk of
+        # a successful episode, 16 rows in 4000 -- would otherwise pad the selection with
+        # arbitrary ties, which look like consecutive re-plans of whichever episode sorts
+        # first and read as a deliberate choice.
+        informative = int(np.count_nonzero(val[cov] != val[cov].min())) if cov.size else 0
+        take = min(n, cov.size) if not best else min(n, max(informative, 1))
+        order = ranked[:take]
+        if order.size == 0:
+            # `.max()` on an empty selection raises a bare numpy reduction error, which reads
+            # as a bug in this viewer rather than as "the sidecar does not describe this
+            # rollout" -- the actual cause every time it has happened.
+            raise SystemExit(
+                f"no rows of this rollout are covered by the sidecar's {column!r} column "
+                f"({cov.size} of {total} rows matched). The sidecar and the rollout are "
+                "probably from different runs -- they join on (episode_uid, replan_index), "
+                "which is per-run unless the uids were rebased.")
+        print(f"--{'best' if best else 'lowest'}: {kind} {column!r} in the offered windows "
+              f"{val[order].max():.4f} .. {val[order].min():.4f} "
+              f"({cov.size} of {total} rows in the sidecar, {informative} above its minimum)")
+        return np.sort(order)
     if not worst:
         return np.sort(rng.choice(total, size=min(n, total), replace=False))
 
@@ -647,6 +789,34 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_gap", type=int, default=CONTACT_MAX_GAP_NODES,
                    help="close runs of non-contact this long between two stances; "
                         "0 disables the filter")
+    p.add_argument("--sidecar", default="",
+                   help="A reward sidecar .npz (from inspect_terrain_reward.py --stage "
+                        "reward). Offers the windows the REWARD ranks highest, joined on "
+                        "(episode_uid, replan_index) so what is drawn is what was scored. "
+                        "This is the check --worst cannot make: a geometric reward scores a "
+                        "clean MOTIONLESS plan as highly as a clean moving one, and looking "
+                        "at its favourites is how that gets noticed.")
+    p.add_argument("--episodes", type=int, default=0,
+                   help="With --sidecar, offer every re-plan of this many whole EPISODES "
+                        "(ranked by their best-scoring window) instead of a list of isolated "
+                        "windows. A window is a quarter-second of plan, so the ranked-window "
+                        "view shows the best quarter-seconds of many different episodes and "
+                        "says nothing about how the robot got there. Overrides --rows.")
+    p.add_argument("--reward_column", default="reward",
+                   help="which sidecar column to rank by (reward, reward_terrain, vel_track, "
+                        "gate, success)")
+    p.add_argument("--dismount", action="store_true",
+                   help="Rank ONLY windows whose plan steps down onto the ground. The point "
+                        "is calibrating the success gate's sharpness: the lowest-penalty "
+                        "windows in a box2 recording are flat standing plans, which are "
+                        "geometrically perfect and say nothing about whether the gate pays "
+                        "for a clean step-off. Needs --sidecar.")
+    p.add_argument("--dismount_drop", type=float, default=0.25,
+                   help="Least fall in the plan's base height, in metres, for --dismount to "
+                        "count a window. 0.25 against a 0.40 m box, so a plan that only "
+                        "begins the descent still qualifies.")
+    p.add_argument("--lowest", action="store_true",
+                   help="with --sidecar, offer the LOWEST-scoring windows instead")
     p.add_argument("--worst", action="store_true",
                    help="offer the DEEPEST-penetrating windows instead of random ones")
     p.add_argument("--check", type=int, default=0,
@@ -683,8 +853,16 @@ def main() -> None:
           f"{model.total_area_m2:.4f} m^2, {model.sole_index.shape[1]} sole points per foot")
 
     episode = _episode_index(args.rollout + ".episodes.h5")
+    restrict = None
+    if args.dismount:
+        if not args.sidecar:
+            raise SystemExit("--dismount ranks a reward column, so it needs --sidecar.")
+        restrict = _dismount_rows(rollout, trio.rollout_meta(rollout)["_num_written"],
+                                  blocks, len(names), min_drop_m=args.dismount_drop)
     rows = _pick_rows(rollout, args.rows, args.seed, args.worst, model, episode, table,
-                      blocks, args.thresh, args.dilate, args.max_gap)
+                      blocks, args.thresh, args.dilate, args.max_gap,
+                      sidecar=args.sidecar, column=args.reward_column,
+                      best=not args.lowest, episodes=args.episodes, restrict=restrict)
 
     server = viser.ViserServer(port=args.port)
     urdf_path = args.urdf or str(MGF._REPO_ROOT / "robot_assets" / "g1_perceptive"

@@ -436,7 +436,7 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     fm_history_null_fraction: float = 0.0
     """Fraction of envs served the model's learned NULL-HISTORY embedding instead of their
-    own history, re-drawn per episode.
+    own history, re-drawn on :attr:`fm_history_null_cadence`.
 
     **What this is for: breaking a committed MODE.** The generator is autoregressive on its
     own past output, so once it reads a box top as a descending staircase it keeps being
@@ -456,6 +456,103 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
 
     ``0.0`` (default) leaves the serve path exactly as it was: the mask is then whatever
     ``BatchedHistory.null_mask`` says, i.e. post-reset underfill only.
+    """
+
+    fm_history_null_cadence: str = "episode"
+    """How often :attr:`fm_history_null_fraction` is re-drawn: ``"episode"`` or ``"replan"``.
+    Mirrors :attr:`fm_upper_camera_noise_cadence` field for field, so the two arms can be
+    configured the same way and a run can state one cadence for both.
+
+    ``"episode"`` (default) draws once at reset and holds, so one robot plans without history
+    from spawn to fall.  That is the cadence under which an EPISODE's outcome is attributable
+    to the arm, and it is what a recording split by arm wants.
+
+    ``"replan"`` re-draws for every env about to sample, so the conditioning changes mid
+    episode.  Two reasons to want it, and the first is the stronger:
+
+    * **It is what TRAINING did.** The model nulls history on ``null_prob`` of its WINDOWS
+      (0.3 by default), independently, never for a whole episode -- so per-re-plan is the
+      cadence the learned ``null_history`` embedding was actually fitted under.  Under
+      ``"episode"`` a failure late in a fully-nulled episode may be compounding state drift
+      rather than the missing history mattering at that moment; this removes that confound,
+      exactly as the camera arm's own ``"replan"`` does.
+    * **It is far easier to SEE.** The arm is gated by
+      :attr:`fm_perturb_fraction`, so at a small ``--num_envs`` a per-episode draw leaves
+      most resets with no affected env at all and nothing to look at for a whole episode.
+
+    The cost, and it is real: an episode is then a mixture, so no episode-level outcome can be
+    attributed to the arm.  Use ``"episode"`` for anything being measured and ``"replan"`` for
+    anything being watched or compared per PLAN.
+
+    Under either cadence the ribbon colours each drawn plan by the conditioning it was
+    actually sampled under, because the draw lands before the plan does (see
+    ``_snapshot_and_infer``); under ``"replan"`` an env on the history arm therefore alternates
+    between the two arm colours as the camera arm re-rolls beside it.
+    """
+
+    fm_speed_mismatch_fraction: float = 0.0
+    """Fraction of envs whose CONDITIONING command speed is offset from the one the robot is
+    actually being asked for, re-drawn on :attr:`fm_speed_mismatch_cadence` and held for
+    :attr:`fm_speed_mismatch_replans`.
+
+    **What this is for: the approach speed is a MODE choice, and the generator only ever sees
+    one.** On the free-form path the episode draws a single speed and holds it, so the command
+    channel is constant for the whole run and the generator has never had to plan a box
+    approach at a speed other than the one it is travelling at. That makes the command a
+    near-redundant input, and it is the input a deployed joystick moves most.
+
+    **It is a CONDITIONING corruption, not a new command.** The override reaches
+    ``fut_cmd`` inside :meth:`_run_fm` and nothing else, so the robot is still ASKED for the
+    nominal speed: the tracking rewards, the ``command_window`` observation, the eval's
+    tracking target and the recorded ``cmd_future`` all keep the true value. The right reading
+    is the dead upper camera's, not a curriculum's -- an input the generator must stay robust
+    to, and one the progress reward deliberately scores against the NOMINAL speed so a
+    generator that follows the corrupted number is penalised for it.
+
+    **Drawn at random per env, never strided**, for the same reason as the other two arms:
+    envs map to tiles through a structured grid lookup, so every n-th env risks putting the
+    whole arm on one tile and confounding it with terrain.
+
+    ``0.0`` (default) leaves the conditioning exactly as it was.
+    """
+
+    fm_speed_mismatch_range_mps: float = 0.75
+    """Half-width of the uniform OFFSET applied to the conditioning speed, in m/s.
+
+    An OFFSET rather than an absolute speed, because :meth:`reset` redraws the episode's
+    nominal ``_ff_speed`` AFTER the arm's own draw -- an absolute would be stale by exactly
+    one episode, and stale in a way that still looks like a plausible speed.
+
+    0.75 against the free-form band's own 0.5--2.2 m/s: large enough that the conditioning
+    names a different gait regime than the body is in, small enough that the offset speed is
+    still inside the range the generator was trained on. A corruption that pushed the command
+    outside the training band would test extrapolation instead of robustness.
+    """
+
+    fm_speed_mismatch_replans: tuple[int, int] = (2, 3)
+    """Inclusive range of consecutive re-plans one drawn offset is HELD for.
+
+    A mismatch has to outlast a single plan to matter: the generator re-plans every 0.24 s and
+    a one-window corruption is corrected before the body has moved. Holding it for 2--3
+    re-plans (0.48--0.72 s) covers most of an approach stride while still letting several
+    draws land in one episode.
+
+    The countdown decrements per re-plan and a fresh activation is rolled ONLY where it has
+    reached zero, so an active hold is never re-rolled mid-persistence -- which is what makes
+    the hold length mean what it says.
+    """
+
+    fm_speed_mismatch_cadence: str = "episode"
+    """How often :attr:`fm_speed_mismatch_fraction` is re-drawn: ``"episode"`` or ``"replan"``.
+
+    Mirrors :attr:`fm_history_null_cadence` and :attr:`fm_upper_camera_noise_cadence` field
+    for field, with the same trade-off: ``"episode"`` makes an episode's outcome attributable
+    to the arm and is what a recording being MEASURED wants, while ``"replan"`` re-rolls the
+    activation whenever a hold expires and is easier to WATCH at small env counts.
+
+    Note the hold in :attr:`fm_speed_mismatch_replans` applies under BOTH cadences -- under
+    ``"episode"`` it decides how long each activation within an eligible episode lasts, and
+    under ``"replan"`` it additionally bounds how often the env can re-roll.
     """
 
     debug_vis_show_fm_prediction: bool = True

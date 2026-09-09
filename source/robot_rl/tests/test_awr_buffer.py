@@ -457,3 +457,43 @@ def test_rounds_zero_keeps_everything(tmp_path):
     ab = _load("awr_buffer")
     uids = np.arange(5, dtype=np.int64)
     assert ab.first_per_env(uids, np.zeros(5, dtype=np.int64), rounds=0) == [0, 1, 2, 3, 4]
+
+
+def test_eviction_retires_the_OLDEST_iteration_first(tmp_path):
+    """A hard `capacity / refresh` window, not the exponential age a uniform draw gives.
+
+    Under a uniform draw a few episodes survive many iterations, so the buffer always carries
+    a thin tail collected by policies several generations stale and how stale is luck. Oldest
+    first makes the window a stated property.
+    """
+    root = str(tmp_path)
+    _run(root, 1, capacity=40, refresh=0, n_new=40, n_censored=3)
+    ages = []
+    for it in (2, 3, 4, 5):
+        _run(root, it, capacity=40, refresh=10, n_new=10, n_censored=3)
+        man = json.loads((pathlib.Path(root) / f"iter_{it:03d}" / "buffer.json").read_text())
+        comp = {int(s["iteration_collected"]): len(s["uids"]) for s in man["stems"]}
+        ages.append(comp)
+        assert man["n_episodes"] == 40
+
+    # Iteration 1's 40 episodes are retired 10 at a time and gone after four refreshes; a
+    # uniform draw would have left a random remnant of them alive throughout.
+    assert ages[0] == {1: 30, 2: 10}, ages[0]
+    assert ages[1] == {1: 20, 2: 10, 3: 10}, ages[1]
+    assert ages[2] == {1: 10, 2: 10, 3: 10, 4: 10}, ages[2]
+    assert ages[3] == {2: 10, 3: 10, 4: 10, 5: 10}, ages[3]
+    assert 1 not in ages[3], "the oldest iteration must be fully retired at the window's end"
+
+
+def test_the_partial_drain_of_one_stem_is_random_not_a_uid_prefix(tmp_path):
+    """A uid is issued when an episode ENDS, so a prefix retires the SHORT ones."""
+    root = str(tmp_path)
+    _run(root, 1, capacity=40, refresh=0, n_new=40, n_censored=3)
+    _run(root, 2, capacity=40, refresh=10, n_new=10, n_censored=3)
+    man = json.loads((tmp_path / "iter_002" / "buffer.json").read_text())
+    kept = [s for s in man["stems"] if int(s["iteration_collected"]) == 1][0]
+    base = int(kept["uid_base"])
+    local = sorted(u - base for u in kept["uids"])
+    # 30 of 40 survive; a prefix-retirement would leave exactly 10..39.
+    assert len(local) == 30
+    assert local != list(range(10, 40)), "the partial drain took a uid prefix"

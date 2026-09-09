@@ -106,6 +106,10 @@ class OnlineValueScorer:
             anything else reintroduces the copy this module exists to avoid.
         scan_sensor: Name of the privileged scanner, passed to ``mdp.scan_obs_stack``.
             Required when ``priv``, refused otherwise.
+        worst_penalty_context: Whether the worst-terrain-penalty-so-far block is in the
+            context token.  From the checkpoint's own stamp, for the same reason as
+            ``goal_context``: such a fit is one block WIDER, so a check omitting it rejects a
+            good critic.  This path cannot SERVE one -- see the refusal below.
         goal_context: Whether the three goal offsets go into the context token.  Comes from
             the checkpoint's own ``goal_context`` stamp; it cannot be inferred from the width,
             since 6 is both ``V_onboard`` with the goal and ``V_priv`` without it.
@@ -118,11 +122,13 @@ class OnlineValueScorer:
     """
 
     def __init__(self, model, ctx, *, priv: bool, scan_hw, device,
-                 scan_sensor: str | None, goal_context: bool = True) -> None:
+                 scan_sensor: str | None, goal_context: bool = True,
+                 worst_penalty_context: bool = False) -> None:
         self.model = model
         self.ctx = ctx
         self.priv = bool(priv)
         self.goal_context = bool(goal_context)
+        self.worst_penalty_context = bool(worst_penalty_context)
         self.device = torch.device(device)
         self.scan_sensor = scan_sensor
         self.scan_hw = None if scan_hw is None else (int(scan_hw[0]), int(scan_hw[1]))
@@ -161,13 +167,23 @@ class OnlineValueScorer:
 
         from robot_rl.flow_matching import value as _fmvalue  # noqa: PLC0415
 
+        if self.worst_penalty_context:
+            # Nothing in the best-of-K selector computes a terrain penalty, so there is no
+            # running worst to put in the context token. Refused at load rather than at the
+            # builder, so the message names the missing plumbing.
+            raise SystemExit(
+                "this critic was fitted with --worst_context (its context token carries the "
+                "worst terrain penalty BEFORE each chunk) and the selector has no terrain "
+                "grader to supply it. Fit without --worst_context to use it here.")
         want_ctx = _fmvalue.context_width(privileged=self.priv,
-                                          goal_context=self.goal_context)
+                                          goal_context=self.goal_context,
+                                          worst_penalty_context=self.worst_penalty_context)
         ctx_in = getattr(model, "context_in", None)
         if ctx_in is not None and int(ctx_in[0].in_features) != want_ctx:
             raise ValueError(
                 f"the checkpoint's context token is {int(ctx_in[0].in_features)} wide but "
-                f"priv={self.priv} / goal_context={self.goal_context} builds {want_ctx} "
+                f"priv={self.priv} / goal_context={self.goal_context} / "
+                f"worst_penalty_context={self.worst_penalty_context} builds {want_ctx} "
                 f"({'3 goal offsets + ' if self.goal_context else 'NO goal + '}"
                 f"{'6' if self.priv else '3'} twist). The arms differ ONLY here and in the "
                 "tokens, so this is where a mislabelled checkpoint shows up -- and note a "
@@ -333,10 +349,16 @@ class OnlineValueScorer:
         # ONBOARD keeps only the ANGULAR half: an IMU measures body rates and the yaw frame is
         # reachable from those plus its own roll/pitch, but nothing on the robot measures the
         # linear half without odometry.
-        # The goal is PREPENDED when present, matching `fit_value._batch`: it owns columns
-        # 0:3 and the twist follows, so a with-goal checkpoint's columns never move.
-        half = twist if self.priv else twist[:, 3:]
-        context = half if goal is None else torch.cat([goal, half], dim=-1)
+        # Assembled by `value.build_context`, which owns the order -- the same call the fit,
+        # fit_q and the mjeval reader make, so the layout cannot differ between the process
+        # that trains a critic and the one that reads it.
+        from robot_rl.flow_matching import value as _fmvalue  # noqa: PLC0415
+
+        pieces = {"twist": twist}
+        if goal is not None:
+            pieces["goal"] = goal
+        context = _fmvalue.build_context(privileged=self.priv,
+                                         goal_context=goal is not None, **pieces)
 
         return value.ValueInputs(
             history=hist, extero=ext, cmd_tokens=cmd_tokens,

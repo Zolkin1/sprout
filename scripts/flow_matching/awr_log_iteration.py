@@ -99,6 +99,41 @@ def _critic_quality(path: str) -> dict:
     return out
 
 
+def _buffer_outcomes(man: dict) -> dict:
+    """How many of the buffer's episodes actually reached the goal.
+
+    The buffer's composition metrics say how much data there is and how fresh it is; this says
+    whether any of it contains the behaviour the reward is trying to select for. A buffer whose
+    success count is falling while its size holds is the signature of the loop optimising
+    something other than the goal -- which is exactly what happened over five iterations
+    against the terrain-only reward, and it was only visible by grading the increments by hand
+    afterwards.
+
+    Args:
+        man: The iteration's ``buffer.json``.
+
+    Returns:
+        ``buffer/n_success`` and ``buffer/success_rate``, or ``{}`` if the table is unreadable.
+    """
+    stem = (man.get("buffer") or {}).get("stem")
+    if not stem:
+        return {}
+    try:
+        import h5py  # noqa: PLC0415
+        import numpy as np  # noqa: PLC0415
+
+        with h5py.File(stem + ".episodes.h5", "r", locking=False) as f:
+            if "reached_goal" not in f:
+                return {}
+            rg = f["reached_goal"][...].astype(bool)
+    except (OSError, KeyError, ValueError):
+        return {}
+    out = {"buffer/n_success": int(rg.sum())}
+    if rg.size:
+        out["buffer/success_rate"] = float(rg.mean())
+    return out
+
+
 def collect_row(root: str, iteration: int, critic_dir: str, ft_dir: str) -> dict:
     """Gather one iteration's metrics from the artifacts on disk.
 
@@ -119,6 +154,7 @@ def collect_row(root: str, iteration: int, critic_dir: str, ft_dir: str) -> dict
     if man:
         row["buffer/n_episodes"] = man.get("n_episodes")
         row["buffer/n_windows"] = man.get("n_windows")
+        row.update(_buffer_outcomes(man))
         row["buffer/n_stems"] = len(man.get("stems", []))
         row["buffer/n_dropped"] = man.get("drop", {}).get("n", 0)
         # How mixed the buffer is: episodes from the newest increment over the whole buffer.

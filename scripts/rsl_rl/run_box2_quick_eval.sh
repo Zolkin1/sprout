@@ -22,6 +22,17 @@
 #                          ~30 kB for the window it grades, so it composes with --no_windows:
 #                          nothing else is recorded and the run stays this fast.
 #
+# THE STOP RULE IS ROUND-BASED, AND THIS IS NOT A DETAIL. `--num_episodes` stops when a TOTAL
+# count has finished, which fires as soon as the FASTEST episodes complete and cuts every slow
+# episode still in flight -- so the kept sample is a policy's fast-failing tail, and the bias
+# runs against the SLOWER arm. Measured on exactly this eval: the parent at 1024 envs came out
+# 20% censored with its uncensored episodes reaching the full 1999-step budget, while an AWR
+# arm at 4096 envs came out 74.5% censored with a hard ceiling of 869 steps. Scored that way
+# the arm read 0.0005 against the parent's 0.1960 -- a policy that looks destroyed and is not.
+# `--episodes_per_env` keeps the collected set a complete design over (env, round), whose
+# membership cannot depend on duration. NENV therefore also has to MATCH across arms: it sets
+# how many episodes are in flight at the stop, so it decides the censored fraction.
+#
 # WHAT IT CAN AND CANNOT RESOLVE. At ~700 episodes/cell the per-cell 95% interval is about
 # +-0.027 and the pooled one about +-0.015. So this is a TRIAGE instrument: it separates
 # "clearly better/worse" from "no big effect". It cannot resolve the ~+0.008 that the full
@@ -37,11 +48,16 @@ set -u
 FM=${1:?usage: run_box2_quick_eval.sh <fm_checkpoint> <out_tag> [episodes_per_speed]}
 TAG=${2:?usage: run_box2_quick_eval.sh <fm_checkpoint> <out_tag> [episodes_per_speed]}
 NEPS=${3:-1400}
+
 #: Envs, overridable because the right number is a property of the BOX not the eval: 384 fits
 #: a 12 GB dev card, 8192 suits an H100's 96 GB and is ~21x the throughput. The terrain grade
 #: tiles its SDF pass to a fixed element budget (`motion_gen.terrain_consistency`), so its
 #: working set is ~7.4 GB at either -- the env itself is what scales.
 NENV=${NENV:-384}
+#: Rounds per env, derived so the total is at least NEPS. Ceil, so the run never collects
+#: fewer than asked; the surplus is a COMPLETE round, which is what keeps the design balanced.
+#: At NENV >= NEPS this is 1 round, i.e. one episode per env -- already a complete design.
+ROUNDS=$(( (NEPS + NENV - 1) / NENV ))
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
@@ -65,7 +81,9 @@ DISTS="1.5 3.0"
 --variant <v1|v2> --like clips/g1_mb_v5_body_mode11_decor.h5" >&2; exit 2; }
 
 mkdir -p "$OUT"
-echo "[quick] $TAG  fm=$FM  $NEPS episodes/speed  $NENV envs  -> $OUT"
+echo "[quick] $TAG  fm=$FM  $NENV envs x $ROUNDS rounds = $((NENV * ROUNDS)) episodes/speed"
+echo "[quick]   (round-based stop; an arm compared against this one must match BOTH numbers)"
+echo "[quick]   -> $OUT"
 for spd in 0.83 1.17 1.50; do
   d="$OUT/train_v${spd}"
   if [ -f "$d/rollout_${TRK}.episodes.h5" ]; then echo "[quick] SKIP $spd (exists)"; continue; fi
@@ -73,7 +91,7 @@ for spd in 0.83 1.17 1.50; do
   ./env_isaaclab/bin/python scripts/rsl_rl/record_rollouts.py \
     --task=G1-box2-finetune --load_run "$TRK" --fm_checkpoint "$FM" \
     --clip "$CLIP" --clip_device cpu --goal_regions "$GR" \
-    --num_envs $NENV --num_episodes "$NEPS" --no_windows --terrain_reward \
+    --num_envs $NENV --episodes_per_env "$ROUNDS" --no_windows --terrain_reward \
     --output_dir "$d" \
     env.commands.traj_ref.freeform_speed_min=$spd \
     env.commands.traj_ref.freeform_speed_max=$spd \

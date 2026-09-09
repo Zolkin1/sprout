@@ -56,6 +56,11 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0, help="must match the fit")
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--reward_npz", default="",
+                   help="The terrain sidecar the critic was fitted against. Required only "
+                        "for a critic stamped `worst_penalty_context`, whose context token "
+                        "carries a block derived from that file's `penalty` column and "
+                        "cannot be rebuilt without it.")
     args = p.parse_args()
 
     folds = sorted(f for f in os.listdir(args.fit_dir)
@@ -64,7 +69,20 @@ def main() -> int:
         raise SystemExit(f"{args.fit_dir} holds no {args.variant}.fold*.pt")
     print(f"[pred] {len(folds)} fold checkpoint(s): {folds}")
 
-    W, E, lab = fit_value._load(args.stem, 0)
+    # A `--worst_context` critic needs its context block rebuilt here, which means the
+    # sidecar the penalty came from. Required rather than defaulted off: without it `_load`
+    # produces a 9-wide token for a 10-wide model, which `build_context` refuses -- correctly,
+    # but pointing at this file instead of at the missing flag.
+    _probe = torch.load(os.path.join(args.fit_dir, folds[0]), map_location="cpu",
+                        weights_only=False)
+    wctx = bool(_probe.get("worst_penalty_context", False))
+    del _probe
+    if wctx and not args.reward_npz:
+        raise SystemExit(
+            f"{args.variant} was fitted with --worst_context, so scoring it needs the same "
+            "terrain sidecar to rebuild that block: pass --reward_npz.")
+    W, E, lab = fit_value._load(args.stem, 0, reward_npz=args.reward_npz,
+                                worst_context=wctx)
     keep = lab["live"]
     if not keep.all():
         W = {k: v[keep] for k, v in W.items()}
@@ -103,7 +121,8 @@ def main() -> int:
         pk = np.zeros(uids.size, dtype=np.float64)
         pk[idx] = fit_value._predict(model, ctx, W, idx, priv, args.device, scan_hw,
                                      args.batch,
-                                     goal_context=bool(ck.get("goal_context", True)))
+                                     goal_context=bool(ck.get("goal_context", True)),
+                                     worst_so_far=lab.get("worst_so_far"))
         p_all[va_k] = pk[va_k]
         p_all[val_tile] += pk[val_tile] / n_folds
         del model

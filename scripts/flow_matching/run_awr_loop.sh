@@ -44,7 +44,20 @@ GOALS="${GOALS:-logs/box2/goal_regions.json}"
 TASK="${TASK:-G1-box2-finetune}"
 NENV="${NENV:-2048}"
 EPOCHS_CRITIC="${EPOCHS_CRITIC:-5}"
-EPOCHS_FT="${EPOCHS_FT:-3}"
+EPOCHS_FT="${EPOCHS_FT:-5}"
+#: The PROGRESS reward's constants. Off by default would be the wrong default here -- the
+#: whole point of this arm is that the plain terrain grade is maximised by standing still
+#: (measured: 5 iterations took forward progress 11.50 -> 3.95 m per 1000 steps while
+#: survival ROSE), so the loop grades and fits the progress reward unless told otherwise.
+PROGRESS="${PROGRESS:-1}"
+GATE_S="${GATE_S:-2.0}"                 # velocity gate sharpness
+SUCCESS_GATE_S="${SUCCESS_GATE_S:-3.0}" # success gate sharpness, on the episode's WORST chunk
+VEL_SIGMA="${VEL_SIGMA:-0.5}"
+SUCCESS_C="${SUCCESS_C:-10.0}"
+#: Rounds of FITTED VALUE ITERATION per iteration. Round 0 is the Monte Carlo return; each
+#: later round refits against `r + gamma^N V` with V FROZEN as the previous round's
+#: predictions on disk. 1 = pure MC, i.e. the old behaviour.
+FVI_ROUNDS="${FVI_ROUNDS:-2}"
 BETA="${BETA:-0.5}"
 WORKERS="${WORKERS:-16}"
 PROJECT="${PROJECT:-robot_rl_awr}"
@@ -156,6 +169,12 @@ for (( it=1; it<=ITERS; it++ )); do
   # under-estimate costs a re-collection rather than a silently short buffer.
   WIN_PER_EP="${WIN_PER_EP:-170}"
   NWIN=$(( ENVS * ROUNDS * WIN_PER_EP ))
+  # HALF the perturbation gate after the first iteration. Iteration 1 collects from the parent
+  # and is the one increment that has to carry the widest behaviour spread on its own; from
+  # iteration 2 the buffer already holds several generations, so a narrower gate keeps more of
+  # each increment pristine while the mix stays broad. 0.5 x the 0.5 camera arm is ~25% of
+  # plans perturbed on iteration 1 and ~12.5% thereafter.
+  PERTURB_FRAC=$([ "$it" -eq 1 ] && echo 0.5 || echo 0.25)
 
   echo ""
   echo "[awr] ####### iteration $it/$ITERS  ($NEPS episodes)  $(date +%H:%M) #######"
@@ -176,7 +195,7 @@ for (( it=1; it<=ITERS; it++ )); do
       --clip "$CLIP" --clip_device cpu --goal_regions "$GOALS" \
       --num_envs "$ENVS" --episodes_per_env "$ROUNDS" --num_windows "$NWIN" \
       --output_dir "$INC" \
-      env.commands.traj_ref.fm_perturb_fraction=0.5 \
+      env.commands.traj_ref.fm_perturb_fraction="$PERTURB_FRAC" \
       env.commands.traj_ref.fm_upper_camera_noise_fraction=0.5 \
       env.commands.traj_ref.fm_upper_camera_noise_mode=dead \
       env.commands.traj_ref.fm_upper_camera_noise_cadence=replan \
@@ -193,8 +212,17 @@ for (( it=1; it<=ITERS; it++ )); do
   if [ -f "$INC/terrain_reward_sidecar.npz" ]; then
     echo "[awr] 2/8 grade       SKIP (exists)"
   else
-    echo "[awr] 2/8 grade       terrain reward, every window"
+    if [ "$PROGRESS" = "1" ]; then
+      echo "[awr] 2/8 grade       PROGRESS reward (terrain + gated velocity + terminal success)"
+      PROGRESS_ARGS=(--progress --gate_sharpness "$GATE_S"
+                     --success_gate_sharpness "$SUCCESS_GATE_S"
+                     --vel_sigma "$VEL_SIGMA" --success_const "$SUCCESS_C")
+    else
+      echo "[awr] 2/8 grade       terrain reward, every window"
+      PROGRESS_ARGS=()
+    fi
     "$PY" -u scripts/rsl_rl/inspect_terrain_reward.py --stage reward --reward_windows 0 \
+      "${PROGRESS_ARGS[@]}" \
       --rollout "$INC/rollout_${TRK}" --clip "$CLIP" \
       --isaac_joint_names "logs/rsl_rl/g1/$TRK/exported/policy_parameters.yaml" \
       --device cuda --out "$INC/grade" \
@@ -234,18 +262,64 @@ for (( it=1; it<=ITERS; it++ )); do
   if [ -f "$CRITIC/predictions.npz" ]; then
     echo "[awr] 6/8 critic      SKIP (exists)"
   else
-    echo "[awr] 6/8 critic      fresh fit, $EPOCHS_CRITIC epochs, 2 folds"
     # `--no_wandb`: the CHILD stages log nothing. One run per arm is assembled by
     # `awr_log_iteration.py` from the artifacts instead -- see its docstring for why
     # per-stage runs were tried and abandoned (20 runs, three of them all named `ft`, and a
     # fine-tune curve split across runs that cannot be overlaid).
-    "$PY" -u scripts/flow_matching/fit_value.py "$BUF_STEM" --no_wandb \
-      --fm_checkpoint "$PARENT" \
-      --reward_npz "$BUF_NPZ" \
-      --clip_c 2.5 --window 3 --quality_kind mse --quality_only \
-      --folds 2 --epochs "$EPOCHS_CRITIC" --variants V_priv --device cuda \
-      --out "$CRITIC" > "$ITD/critic.log" 2>&1 \
-      || fail "critic (see $ITD/critic.log)" "$it"
+    #
+    # **`--clip_c` SELECTS THE REDUCER, and 2.5 would silently keep the old reward.** The
+    # clipped-penalty path maps `r = -min(p, c)` into [-1, 0], which is the wrong target for
+    # a goodness in roughly [0, 12] with a one-off terminal bonus. `--clip_c 0` takes the
+    # progress branch (`bootstrapped_window_return`, bounded by 2 + (1-gamma)*C).
+    if [ "$PROGRESS" = "1" ]; then
+      REWARD_ARGS=(--clip_c 0 --worst_context)
+    else
+      REWARD_ARGS=(--clip_c 2.5)
+    fi
+    # FITTED VALUE ITERATION. Round 0 fits the Monte Carlo return; each later round refits
+    # against the previous round's FROZEN predictions. Frozen because it is a file: a target
+    # recomputed from the live model is a moving target, and the failure is a slow divergence
+    # no metric on the fit reports. Only the LAST round's output feeds the label stage, but
+    # every round's gates.json is kept so the effect of bootstrapping is visible.
+    ROUNDS_FVI=1
+    [ "$PROGRESS" = "1" ] && ROUNDS_FVI=$FVI_ROUNDS
+    PREV_PRED=""
+    for (( fr=0; fr<ROUNDS_FVI; fr++ )); do
+      RDIR="$CRITIC"
+      [ "$ROUNDS_FVI" -gt 1 ] && RDIR="$CRITIC/round_$fr"
+      if [ -f "$RDIR/predictions.npz" ]; then
+        echo "[awr] 6/8 critic      round $fr SKIP (exists)"
+        PREV_PRED="$RDIR/predictions.npz"; continue
+      fi
+      BOOT_ARGS=()
+      [ -n "$PREV_PRED" ] && BOOT_ARGS=(--bootstrap_v "$PREV_PRED" --bootstrap_variant V_priv)
+      echo "[awr] 6/8 critic      round $fr/$((ROUNDS_FVI - 1)), $EPOCHS_CRITIC epochs, 2 folds"\
+           "$([ -n "$PREV_PRED" ] && echo "(bootstrapped)" || echo "(Monte Carlo)")"
+      "$PY" -u scripts/flow_matching/fit_value.py "$BUF_STEM" --no_wandb \
+        --fm_checkpoint "$PARENT" \
+        --reward_npz "$BUF_NPZ" \
+        "${REWARD_ARGS[@]}" "${BOOT_ARGS[@]}" \
+        --window 3 --quality_kind mse --quality_only \
+        --folds 2 --epochs "$EPOCHS_CRITIC" --variants V_priv --device cuda \
+        --out "$RDIR" >> "$ITD/critic.log" 2>&1 \
+        || fail "critic round $fr (see $ITD/critic.log)" "$it"
+      PREV_PRED="$RDIR/predictions.npz"
+    done
+    # The label stage reads `$CRITIC/predictions.npz`, so the last round's answer has to be
+    # THERE rather than one directory down. Copied, not moved: the round dir stays a complete
+    # record of the fit that produced it.
+    #
+    # GLOBBED, because the checkpoint's NAME depends on the fold count: `fit_value` writes
+    # `V_priv.pt` at one fold and `V_priv.fold0.pt` / `V_priv.fold1.pt` at two. A literal
+    # `V_priv.pt` therefore always failed here -- and this script is `set -uo pipefail` with
+    # NO `-e`, so it failed silently and left $CRITIC holding predictions and gates but no
+    # weights at all. `|| fail` is what makes that loud.
+    if [ "$ROUNDS_FVI" -gt 1 ]; then
+      RD="$(dirname "$PREV_PRED")"
+      cp "$PREV_PRED" "$CRITIC/predictions.npz" || fail "collecting predictions.npz" "$it"
+      cp "$RD"/V_priv*.pt "$CRITIC/" || fail "collecting the critic weights" "$it"
+      cp "$RD/gates.json" "$CRITIC/gates.json" || fail "collecting gates.json" "$it"
+    fi
   fi
 
   # ---- 7. label ---------------------------------------------------------------------

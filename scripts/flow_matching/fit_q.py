@@ -61,7 +61,10 @@ for _p in (os.path.join(_ROOT, "source", "robot_rl"), os.path.join(_ROOT, "scrip
 import rollout_outcomes as ro  # noqa: E402
 from robot_rl.flow_matching import online, qvalue, transforms, value, value_gates  # noqa: E402
 
-#: Declared metre scale for the goal offsets, mirroring ``fit_value.GOAL_SCALE_M`` so the two
+#: Declared metre scale for the goal offsets.  Still restated rather than imported because
+#: importing ``fit_value`` here would drag its argparse and torch setup into a module that is
+#: also read by tests; the LAYOUT is now shared through ``value.build_context``, which is the
+#: half that could silently mis-column a critic.  Mirrors ``fit_value.GOAL_SCALE_M`` so the two
 #: models read the same numbers.
 GOAL_SCALE_M = 5.0
 
@@ -158,7 +161,9 @@ def _batch(ctx, W, idx, device, scan_hw, action_steps):
         history=hist, extero=ext, cmd_tokens=cmd,
         history_null=to(W["history_null"][idx], torch.bool),
         scan=scan, proprio=to(W["proprio"][idx]),
-        context=torch.cat([goal, to(W["base_twist_yaw"][idx])], dim=-1))
+        # `value.build_context` owns the order; fit_q is always privileged + goal.
+        context=value.build_context(privileged=True, goal_context=True,
+                                    goal=goal, twist=to(W["base_twist_yaw"][idx])))
     a = ctx.state_norm.normalize(to(W["fm_plan"][idx])[:, action_steps, :])
     return qvalue.QInputs(state=st, action=a)
 

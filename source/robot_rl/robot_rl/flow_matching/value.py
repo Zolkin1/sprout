@@ -102,15 +102,32 @@ class ValueInputs:
 GOAL_BLOCK_WIDTH: int = 3
 
 
-def context_width(*, privileged: bool, goal_context: bool = True) -> int:
-    """Width of the scalar-context token, the ONE place that arithmetic is done.
+#: Width of the worst-penalty-so-far block: one scalar.
+#:
+#: Naming: the FLAG is ``worst_penalty_context`` and the PIECE is ``worst_penalty``, mirroring
+#: ``goal_context`` / ``goal``.  They must differ -- :func:`build_context` takes the pieces as
+#: ``**kwargs``, so a flag sharing a piece's name is a syntax error at every call site that
+#: passes both.
+WORST_BLOCK_WIDTH: int = 1
 
-    Four sites build this vector -- the fit, the mjeval reader, the Isaac online scorer and
-    the out-of-fold predictor -- and every one of them used to restate ``3 + (6 if priv else
-    3)``. With ``goal_context`` now a per-checkpoint property that is four chances for the
-    stamp and the built width to disagree, and a disagreement is a linear layer fed the wrong
-    columns rather than a shape error: drop the goal from the batch but not from the model and
-    the twist slides into the goal's slots, which is finite and plausible.
+
+def context_layout(*, privileged: bool, goal_context: bool = True,
+                   worst_penalty_context: bool = False) -> tuple[tuple[str, int], ...]:
+    """The scalar-context token's blocks, in order, as ``(name, width)``.
+
+    **The layout is DATA, and it is the only statement of it.**  Five sites build this vector
+    -- the fit, ``fit_q``, the mjeval reader, the Isaac online scorer and the out-of-fold
+    predictor -- and each used to assemble it by hand, so the ORDER lived five times while the
+    width lived once.  That is the dangerous shape: a disagreement is a linear layer fed the
+    wrong columns rather than a shape error.  Drop the goal from the batch but not from the
+    model and the twist slides into the goal's slots, which is finite and plausible and shows
+    up as a critic that merely predicts a bit worse.
+
+    So both :func:`context_width` and :func:`build_context` read this, and a caller supplies
+    NAMED pieces rather than a concatenation order.  Adding a block is one edit here.
+
+    Order note: ``goal`` is first because every existing checkpoint has it in columns 0:3, and
+    new blocks are APPENDED so those positions never move.
 
     Args:
         privileged: The ``V_priv`` variant, which gets the FULL base twist. ``V_onboard`` gets
@@ -119,11 +136,91 @@ def context_width(*, privileged: bool, goal_context: bool = True) -> int:
         goal_context: Whether the goal offsets are in the token at all. ``False`` is the
             ablation arm: it asks whether the critic can predict failure with no idea how far
             the goal is, which the module docstring above predicts it cannot.
+        worst_penalty_context: Whether the WORST TERRAIN PENALTY SO FAR is in the token.  It is a
+            property of the episode's history, and it is what lets the critic predict a
+            return whose success term is gated on the episode's worst chunk -- without it,
+            ``V(s_t)`` has no way to know that the bonus has already been forfeited.
+            **Strictly the chunks BEFORE t**: including t's own penalty would leak part of
+            ``r_t`` into ``V(s_t)`` and cancel exactly that much of the advantage.
+
+    Returns:
+        The blocks, in concatenation order.
+    """
+    blocks: list[tuple[str, int]] = []
+    if goal_context:
+        blocks.append(("goal", GOAL_BLOCK_WIDTH))
+    blocks.append(("twist", 6 if privileged else 3))
+    if worst_penalty_context:
+        blocks.append(("worst_penalty", WORST_BLOCK_WIDTH))
+    return tuple(blocks)
+
+
+def context_width(*, privileged: bool, goal_context: bool = True,
+                  worst_penalty_context: bool = False) -> int:
+    """Width of the scalar-context token, derived from :func:`context_layout`.
+
+    Args:
+        privileged: See :func:`context_layout`.
+        goal_context: See :func:`context_layout`.
+        worst_penalty_context: See :func:`context_layout`.
 
     Returns:
         The width, in scalars.
     """
-    return (GOAL_BLOCK_WIDTH if goal_context else 0) + (6 if privileged else 3)
+    return sum(w for _, w in context_layout(privileged=privileged,
+                                            goal_context=goal_context,
+                                            worst_penalty_context=worst_penalty_context))
+
+
+def build_context(*, privileged: bool, goal_context: bool = True,
+                  worst_penalty_context: bool = False,
+                  **pieces: torch.Tensor) -> torch.Tensor:
+    """Assemble the scalar-context token from NAMED pieces, in the canonical order.
+
+    The counterpart to :func:`context_layout`: callers pass ``goal=``, ``twist=`` and
+    ``worst_penalty=`` and never choose an order.  Every block the layout asks for must be
+    supplied at the width it asks for, and anything extra is refused -- a silently ignored
+    piece is a caller that thinks it contributed a feature and did not.
+
+    ``twist`` is passed FULL (6 wide) and sliced here for the onboard variant, so the "keep
+    only the angular half" rule lives with the layout rather than at each call site.
+
+    Args:
+        privileged: See :func:`context_layout`.
+        goal_context: See :func:`context_layout`.
+        worst_penalty_context: See :func:`context_layout`.
+        **pieces: ``(B, w)`` tensors by block name.  ``twist`` may be ``(B, 6)`` on either
+            variant.
+
+    Returns:
+        ``(B, context_width(...))``.
+
+    Raises:
+        ValueError: On a missing block, an unexpected one, or a width that does not match.
+    """
+    layout = context_layout(privileged=privileged, goal_context=goal_context,
+                            worst_penalty_context=worst_penalty_context)
+    want = {n for n, _ in layout}
+    extra = sorted(set(pieces) - want)
+    if extra:
+        raise ValueError(
+            f"build_context got {extra}, which this layout does not carry "
+            f"(privileged={privileged}, goal_context={goal_context}, "
+            f"worst_penalty_context={worst_penalty_context}). A piece silently dropped is a "
+            "CALLER that believes it contributed a feature and did not.")
+    out: list[torch.Tensor] = []
+    for name, width in layout:
+        if name not in pieces:
+            raise ValueError(f"build_context needs {name!r} ({width} wide) for this layout.")
+        t = pieces[name]
+        if name == "twist" and t.shape[-1] == 6 and width == 3:
+            t = t[..., 3:]          # the ANGULAR half; see context_layout
+        if t.shape[-1] != width:
+            raise ValueError(
+                f"build_context got {name!r} {tuple(t.shape)} but the layout wants width "
+                f"{width}.")
+        out.append(t)
+    return torch.cat(out, dim=-1)
 
 
 def two_hot(target: torch.Tensor, support: torch.Tensor) -> torch.Tensor:

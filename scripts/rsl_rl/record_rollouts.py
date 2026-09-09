@@ -571,6 +571,12 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None,
         # applied -- `history` and `extero` above are the TRUE measurement either way.
         "perturb_null_history": cpu(cmd.history_nulled()[idx]).astype(np.uint8),
         "perturb_noisy_upper_cam": cpu(cmd.upper_camera_noised()[idx]).astype(np.uint8),
+        # The speed arm's flag AND its offset. A row whose action came from other
+        # conditioning must say so, and the offset is what makes the statement checkable:
+        # `cmd_future` holds the TRUE command, so the two together recover exactly what the
+        # generator was shown without the recording ever storing a corrupted command.
+        "perturb_speed_mismatch": cpu(cmd.speed_mismatched()[idx]).astype(np.uint8),
+        "perturb_speed_offset_mps": cpu(cmd.speed_mismatch_offset()[idx]).astype(np.float32),
         "fm_plan": cpu(cmd._pred_window[idx]).astype(np.float32),
         "anchor_pos": cpu(cmd._anchor_pos[idx]).astype(np.float32),
         "anchor_quat": cpu(cmd._anchor_quat[idx]).astype(np.float32),

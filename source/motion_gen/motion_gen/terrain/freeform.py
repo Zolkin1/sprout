@@ -181,6 +181,16 @@ WALL_T_M: float = 0.15
 #: How far into the section the robot spawns / the goal sits, measured from the geometry's own
 #: start and end (m).
 SPAWN_INSET_M: float = 0.75
+
+#: Half-extents of the ORDINARY single-start spawn jitter, in metres.  Defined here rather
+#: than in the env cfg because two places need the same number and they must not drift: the
+#: reset synthesises a fallback spawn area at these extents for a tile declaring none, and a
+#: tile that DOES declare areas has to author its ground-level one at the same size or its
+#: ground spawns stop being comparable to every run before it.  Measured cost of getting that
+#: wrong: box2's ground third was authored 0.375 x 0.995 against this 0.25 x 0.25, a 4x
+#: lateral spread that let the robot start a metre off the approach centreline -- and because
+#: declared areas REPLACE the jitter, `pos_jitter_m` had silently stopped doing anything there.
+FREEFORM_SPAWN_JITTER_M: tuple[float, float] = (0.25, 0.25)
 GOAL_INSET_M: float = 0.75
 
 #: Slack (m) allowed in every geometric containment check: an overlay against its tile footprint,
@@ -604,8 +614,51 @@ def _fit_goal_half_width(desired: float, overlays: Sequence[dict],
     return min(float(desired), room)
 
 
+#: Keys of one entry in a route's optional ``spawn_areas`` list.  A RECTANGLE the robot may be
+#: placed anywhere inside, in the tile-local frame, plus the walkable surface height under it
+#: and a relative draw weight.
+#:
+#: **Why areas rather than one start pose.** A section with a single start gives the generator
+#: one initial condition per tile, so every episode meets the obstacle from the same place and
+#: the whole set is degenerate in the variable a fine-tune is trying to broaden -- which is why
+#: ``reset_on_freeform_section`` already jitters the single start. Areas generalise that: a
+#: terrain can declare that standing ON an obstacle is a legal start, which is the only way to
+#: collect the second half of a traverse without first succeeding at the first half. Measured
+#: on the two-box course: every one of 352 successful episodes reached the goal by
+#: stairs-down-ing off a box, because a correct two-jump traverse is rare enough that the
+#: behaviour policy never produced one -- and AWR can only reweight what it is shown.
+SPAWN_AREA_FIELDS: tuple[str, ...] = ("x", "y", "z", "half_x", "half_y", "yaw", "weight")
+
+
+def spawn_area(x: float, y: float, z: float, half_x: float, half_y: float,
+               yaw: float = 0.0, weight: float = 1.0) -> dict:
+    """One rectangular spawn area, tile-local.
+
+    Args:
+        x: Rectangle centre, downrange (m).
+        y: Rectangle centre, lateral (m).
+        z: Walkable surface height under the rectangle (m).  For a box top this is the box's
+            height, not 0 -- the reset adds the robot's standing height to it.
+        half_x: Half-extent downrange (m).
+        half_y: Half-extent lateral (m).
+        yaw: Spawn heading relative to the tile frame (rad).
+        weight: Relative draw weight.  Normalised across a tile's areas, so the numbers are
+            ratios and adding an area does not silently re-weight the others' absolute rates.
+
+    Returns:
+        The area dict, carrying :data:`SPAWN_AREA_FIELDS`.
+    """
+    if half_x < 0.0 or half_y < 0.0:
+        raise ValueError(f"spawn area half-extents must be >= 0; got ({half_x}, {half_y})")
+    if weight <= 0.0:
+        raise ValueError(f"spawn area weight must be > 0; got {weight}")
+    return {"x": float(x), "y": float(y), "z": float(z), "half_x": float(half_x),
+            "half_y": float(half_y), "yaw": float(yaw), "weight": float(weight)}
+
+
 def _route(start_xy: tuple[float, float], start_z: float, start_yaw: float,
-           goal_xy: tuple[float, float], goal_half_width: float, goal_z: float) -> dict:
+           goal_xy: tuple[float, float], goal_half_width: float, goal_z: float,
+           spawn_areas: list[dict] | None = None) -> dict:
     """One section's route block, in the tile-local corner frame.
 
     Args:
@@ -615,14 +668,23 @@ def _route(start_xy: tuple[float, float], start_z: float, start_yaw: float,
         goal_xy: Goal band centre (m).
         goal_half_width: Goal band half-extent (m).
         goal_z: Walkable surface at the goal (m).
+        spawn_areas: Optional rectangles the robot may start inside, from :func:`spawn_area`.
+            Omitted or empty means the single ``start_*`` pose, which is what every existing
+            terrain declares and what the reset falls back to -- so this is additive and no
+            library needs regenerating to keep working.
 
     Returns:
-        The route dict, carrying :data:`ROUTE_FIELDS` plus ``goal_z``.
+        The route dict, carrying :data:`ROUTE_FIELDS` plus ``goal_z`` and, when given,
+        ``spawn_areas``.  The consuming table reads only :data:`ROUTE_FIELDS` and ignores
+        extra keys, which is what lets a list ride inside a block of scalars.
     """
-    return {"start_x": float(start_xy[0]), "start_y": float(start_xy[1]),
-            "start_z": float(start_z), "start_yaw": float(start_yaw),
-            "goal_x": float(goal_xy[0]), "goal_y": float(goal_xy[1]),
-            "goal_half_width": float(goal_half_width), "goal_z": float(goal_z)}
+    out = {"start_x": float(start_xy[0]), "start_y": float(start_xy[1]),
+           "start_z": float(start_z), "start_yaw": float(start_yaw),
+           "goal_x": float(goal_xy[0]), "goal_y": float(goal_xy[1]),
+           "goal_half_width": float(goal_half_width), "goal_z": float(goal_z)}
+    if spawn_areas:
+        out["spawn_areas"] = [dict(a) for a in spawn_areas]
+    return out
 
 
 def route_direction(route: dict) -> tuple[float, float]:

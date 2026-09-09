@@ -103,11 +103,29 @@ from robot_rl.flow_matching import online, transforms, value, value_gates  # noq
 #: be on disk when the normalizer ran. 5 m spans the approach on every family measured.
 GOAL_SCALE_M: float = 5.0
 
+#: Reward-source name of the progress reward (terrain + gated velocity + terminal success),
+#: matching ``inspect_terrain_reward.PROGRESS_SOURCE``.  Restated rather than imported: that
+#: script pulls in torch and a simulator-free geometry stack, and this one is imported by
+#: tests.  A mismatch is caught by ``label_advantage.check_reward_consistency``.
+PROGRESS_SOURCE: str = "terrain_progress"
+
+#: Clip for the worst-penalty-so-far context feature, which is then divided by it so the
+#: feature lands in ``[0, 1]``.
+#:
+#: **Clipped, not merely scaled.** The raw terrain penalty is unbounded -- p95 1.72 against a
+#: measured max of 47.5 -- and an unbounded input into a linear layer lets one catastrophic
+#: chunk dominate the whole feature's scale for every other row in the batch.  2.5 is
+#: ``clipped_window_return``'s own ``clip_c``, chosen there at the penalty's p95-p99, so the
+#: two places that bound this quantity bound it the same way.
+WORST_CLIP: float = 2.5
+
 
 def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
           max_episodes: int = 0, seed: int = 0,
           strict_failure: bool = True, reward_npz: str = "", clip_c: float = 0.0,
-          window: int = 3) -> tuple[dict, dict, dict]:
+          window: int = 3, worst_context: bool = False,
+          bootstrap_v: str = "", bootstrap_variant: str = "V_priv",
+          ) -> tuple[dict, dict, dict]:
     """Read both tables and join them on ``episode_uid``.
 
     Args:
@@ -124,6 +142,9 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
             sidecar's RAW penalty, in ``[-1, 0]``.  Zero keeps the ``(1 - gamma)``-normalized
             return in ``[0, 1]``.
         window: Chunks in the clipped window.
+        worst_context: Compute the worst-terrain-penalty-so-far context feature. Off by
+            default because it widens the critic's input, so a checkpoint that has it must
+            say so -- exactly as it must for ``goal_context``.
         strict_failure: Count the STRICT tracking violation as a failure alongside the fall
             crossing.  ``False`` is the LOOSE rule -- the fall alone -- which is what MuJoCo
             scores (``mjeval`` tests ``robot.failed()``: height and tilt, no tracking check).
@@ -267,6 +288,27 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
               f"{int(g_ok.sum())}/{g_ok.size} windows in [-1, 0], median G "
               f"{np.median(g[g_ok]):.4f}, "
               f"{100 * float((g[g_ok] <= -0.999).mean()):.1f}% saturated at -1")
+    elif str(meta_out.get("reward_source", "")) == PROGRESS_SOURCE:
+        # The PROGRESS reward: a goodness with a ONE-OFF terminal bonus, so neither existing
+        # reducer fits it -- `normalized_returns` assumes a per-step reward in (0, 1] and the
+        # terminal chunk carries 2 + C. `bootstrapped_window_return` takes the ongoing and
+        # terminal halves apart and bounds the RETURN at 2 + (1 - gamma) * C.
+        term = _sidecar_column(reward_npz, W["episode_uid"], W["replan_index"], "success")
+        ongoing = r - term
+        r_max = 2.0 + (1.0 - float(spec.gamma)) * float(rmeta.get("success_const", 10.0))
+        v_prev = (_bootstrap_v(bootstrap_v, bootstrap_variant, W["episode_uid"],
+                               W["replan_index"], r_max) if bootstrap_v else None)
+        g, g_ok = adv_mod.bootstrapped_window_return(
+            ongoing, term, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
+            v=v_prev, window=int(window), gamma=float(spec.gamma), return_max=r_max)
+        meta_out["fvi_bootstrap_from"] = str(bootstrap_v)
+        meta_out["quality_range"] = (0.0, 1.0)
+        meta_out["return_max"] = r_max
+        print(f"[fit] quality target: PROGRESS return from {source_note}, "
+              f"N={window} gamma={spec.gamma:g} return_max={r_max:.3f} -> "
+              f"{int(g_ok.sum())}/{g_ok.size} windows, median G {np.median(g[g_ok]):.4f}, "
+              f"terminal bonus on {int((term > 0).sum())} rows, "
+              f"{'BOOTSTRAPPED' if bootstrap_v else 'MONTE CARLO (round 0)'}")
     else:
         g, g_ok = adv_mod.normalized_returns(
             r, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
@@ -275,6 +317,18 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
         print(f"[fit] quality target from {source_note}: {int(g_ok.sum())}/{g_ok.size} "
               f"windows, median G {np.median(g[g_ok]):.4f}, "
               f"spec {'FITTED' if not spec.is_bootstrap else 'BOOTSTRAP'}")
+    # The WORST-SO-FAR context feature. Computed from the sidecar's raw penalty, and only
+    # when asked: it changes the critic's input width, so a checkpoint must record whether it
+    # has it (`worst_penalty_context`) exactly as it records `goal_context`.
+    if worst_context:
+        pen = _sidecar_column(reward_npz, W["episode_uid"], W["replan_index"], "penalty")
+        lab["worst_so_far"], _w_ok = adv_mod.worst_penalty_before(
+            pen, r_ok, W["episode_uid"], W["replan_index"])
+        lab["worst_so_far"] = np.minimum(lab["worst_so_far"], WORST_CLIP) / WORST_CLIP
+        print(f"[fit] context: worst terrain penalty BEFORE each chunk, "
+              f"clipped at {WORST_CLIP:g} "
+              f"-> median {np.median(lab['worst_so_far']):.4f} "
+              f"p95 {np.quantile(lab['worst_so_far'], 0.95):.4f}")
     lab["chunk_reward"], lab["g"], lab["g_valid"] = r, g, g_ok
     # `lab` is row-indexed by the caller; anything in it must be a per-window array of the
     # same length, or the index raises (a string) or silently truncates (a short array).
@@ -287,6 +341,55 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
             "Metadata belongs in the returned meta dict -- `lab` is boolean-indexed twice "
             "downstream, so a scalar there raises and a short array truncates silently.")
     return W, {"cols": E, "attrs": ea, "ep_terrain": ep_terrain, **meta_out}, lab
+
+
+def _sidecar_column(path: str, episode_uid: np.ndarray, replan_index: np.ndarray,
+                    column: str) -> np.ndarray:
+    """One column of a reward sidecar, joined on ``(episode_uid, replan_index)``.
+
+    The thin general form of :func:`_reward_sidecar`, for the extra columns the progress
+    reward writes -- ``success``, ``penalty``, ``vel_track`` -- which are read for the return's
+    terminal half and the worst-so-far feature rather than as the reward itself.
+
+    Joined by KEY for the same reason :func:`_reward_sidecar` is: the sidecar is a row subset
+    in its own order, so a positional pairing would silently attach each window to some other
+    window's value.
+
+    Args:
+        path: The sidecar ``.npz``.
+        episode_uid: ``[W]`` this table's episode ids.
+        replan_index: ``[W]`` this table's re-plan indices.
+        column: The column to read.
+
+    Returns:
+        ``[W]`` float64, zero where the sidecar does not cover the row.
+
+    Raises:
+        SystemExit: If the sidecar has no such column, which means it was written by a
+            grader that did not compute it.
+    """
+    d = np.load(path, allow_pickle=False)
+    if column not in d.files:
+        raise SystemExit(
+            f"{path} has no {column!r} column (it carries {sorted(d.files)}). A progress "
+            "reward needs one written by `inspect_terrain_reward.py --stage reward "
+            "--progress`; a terrain-only sidecar cannot be read as one.")
+    key = (d["episode_uid"].astype(np.int64) << np.int64(20)) + d["replan_index"].astype(
+        np.int64)
+    want = (episode_uid.astype(np.int64) << np.int64(20)) + replan_index.astype(np.int64)
+    out = np.zeros(want.size, dtype=np.float64)
+    if key.size == 0:
+        # `clamp(0, size - 1)` gives -1 on an empty key and then indexes an empty array.
+        # An empty sidecar is a real state (a grade killed before its first flush), and the
+        # message has to say that rather than raise from inside a lookup.
+        raise SystemExit(
+            f"the sidecar holds no rows, so column {column!r} covers nothing. Re-run the "
+            "grade stage.")
+    order = np.argsort(key)
+    pos = np.clip(np.searchsorted(key[order], want), 0, key.size - 1)
+    hit = key[order][pos] == want
+    out[hit] = d[column].astype(np.float64)[order][pos[hit]]
+    return out
 
 
 def _reward_sidecar(path: str, episode_uid: np.ndarray, replan_index: np.ndarray,
@@ -409,8 +512,111 @@ def _splits(uids: np.ndarray, tiles: np.ndarray, val_frac: float, seed: int
     return val_ep, val_tile
 
 
+
+def _bootstrap_v(path: str, variant: str, uid: np.ndarray, rep: np.ndarray,
+                 return_max: float) -> np.ndarray:
+    """Read a PREVIOUS round's value predictions, aligned to this round's window rows.
+
+    Fitted value iteration with a FROZEN target: round 0 fits the Monte Carlo return, and
+    round ``k`` fits ``r + gamma^N V_(k-1)``, where ``V_(k-1)`` is a file on disk rather than
+    the model being trained.  Freezing it per round is what makes each round an ordinary
+    supervised regression -- a target recomputed from the live model as it moves is a moving
+    target, and the failure mode is a slow divergence that no metric on the fit reports.
+
+    **The scale conversion is the part that is silently wrong if skipped.** The quality head
+    predicts ``G``, which is the ``(1-gamma)``-weighted average ALREADY DIVIDED by
+    ``return_max``, while :func:`bootstrapped_window_return` wants ``v`` on the raw weighted
+    scale and divides at the end.  Feeding the head's output back unscaled bootstraps off a
+    value ``return_max`` times too small, which trains cleanly and shrinks every target
+    toward the first ``N`` chunks of real reward.
+
+    **Rows the previous round did not cover are left at the MC tail, not at zero.** A missing
+    prediction is an absent opinion; zero is the value of a failed state, and asserting it
+    would teach the critic that unseen states are fatal.  They come back as ``nan`` and
+    :func:`bootstrapped_window_return` falls back to its own tail on them.
+
+    Args:
+        path: A previous round's ``predictions.npz``.
+        variant: Which critic's out-of-fold predictions to bootstrap off -- the key
+            ``q_<variant>`` in that file.
+        uid: ``[W]`` this round's episode uids.
+        rep: ``[W]`` this round's replan indices.
+        return_max: The declared return bound, to undo the head's normalization.
+
+    Returns:
+        ``[W]`` the frozen value per row on the raw weighted scale, ``nan`` where the
+        previous round has no prediction.
+
+    Raises:
+        SystemExit: If the file carries no predictions for ``variant``, or if it was fitted
+            on a different reward -- either would bootstrap onto a different quantity.
+    """
+    d = np.load(path, allow_pickle=False)
+    key = f"q_{variant}"
+    if key not in d.files:
+        raise SystemExit(
+            f"--bootstrap_v {path} has no `{key}`: it was fitted without a quality head, or "
+            f"without that variant. Available: {sorted(f for f in d.files if f.startswith('q_'))}")
+    prev_max = float(d["return_max"]) if "return_max" in d.files else 0.0
+    if prev_max > 0.0 and abs(prev_max - float(return_max)) > 1e-9:
+        raise SystemExit(
+            f"--bootstrap_v {path} normalised its return by {prev_max:g} but this fit uses "
+            f"{return_max:g}. Undoing the wrong division bootstraps onto a value scaled by "
+            f"{float(return_max) / prev_max:.3f}, which trains cleanly. Both rounds need the "
+            "same reward constants (`success_const`, `gamma`).")
+    prev_src = str(d["reward_source"]) if "reward_source" in d.files else ""
+    if prev_src != PROGRESS_SOURCE:
+        raise SystemExit(
+            f"--bootstrap_v {path} was fitted on reward_source={prev_src!r}, not "
+            f"{PROGRESS_SOURCE!r}. Bootstrapping across rewards differences two different "
+            f"quantities and both are plausible floats.")
+    # **WHICH ROWS ACTUALLY CARRY A PREDICTION, and it is not all of them.** `q_all` is
+    # assembled OUT OF FOLD: each fold writes only its own validation episodes, so a
+    # 2-fold fit covers every row while a 1-FOLD fit leaves every TRAINING row at its
+    # initialised 0.0 -- present in the file, numerically indistinguishable from a confident
+    # "this state is worthless", and 0 is exactly the value of a FAILED state. Bootstrapping
+    # on that would teach the critic that most of its own training set is fatal. Measured on
+    # a 1-fold smoke fit: median v came back 0.0000 against a target median G of 0.0901.
+    #
+    # The file records `num_folds`, and with one fold the covered rows are precisely the two
+    # validation scopes, so they can be recovered rather than guessed.
+    n_folds = int(d["num_folds"]) if "num_folds" in d.files else 0
+    covered = np.ones(d["episode_uid"].size, dtype=bool)
+    if n_folds < 2:
+        val = d["val"].astype(bool) if "val" in d.files else np.zeros_like(covered)
+        vt = d["val_tile"].astype(bool) if "val_tile" in d.files else np.zeros_like(covered)
+        covered = val | vt
+        print(f"[fit] bootstrap: the source was fitted with num_folds={n_folds}, so only its "
+              f"{int(covered.sum())}/{covered.size} VALIDATION rows carry an out-of-fold "
+              f"prediction; the rest are dropped to the MC tail rather than read as 0.")
+    # The same join key `merge_rollouts` and `label_advantage` use. uid is global after
+    # `awr_buffer` rebases, so this is unique across iterations.
+    want = (uid.astype(np.int64) << 20) + rep.astype(np.int64)
+    have = (d["episode_uid"].astype(np.int64) << 20) + d["replan_index"].astype(np.int64)
+    lut = {int(k): i for i, k in enumerate(have) if covered[i]}
+    q = np.asarray(d[key], dtype=np.float64)
+    out = np.full(want.size, np.nan, dtype=np.float64)
+    idx = np.array([lut.get(int(k), -1) for k in want], dtype=np.int64)
+    hit = idx >= 0
+    out[hit] = q[idx[hit]] * float(return_max)
+    if not hit.any():
+        raise SystemExit(
+            f"--bootstrap_v {path} covers NONE of this fit's rows. Round 0 must be fitted on "
+            "the same buffer, with --folds 2 or more so every row gets an out-of-fold "
+            "prediction.")
+    print(f"[fit] bootstrap: V from {os.path.basename(os.path.dirname(path)) or path} "
+          f"[{variant}] covers {int(hit.sum())}/{want.size} rows "
+          f"({100.0 * hit.mean():.1f}%), median v {np.nanmedian(out[hit]):.4f} "
+          f"(raw scale, return_max {return_max:g})")
+    if hit.mean() < 0.5:
+        print(f"[fit] bootstrap: WARNING only {100.0 * hit.mean():.1f}% of rows are "
+              "bootstrapped; the rest keep the Monte Carlo tail, so this round is mostly "
+              "round 0 again. Refit the source with more folds.")
+    return out
+
 def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
-           scan_hw, *, goal_context: bool = True) -> value.ValueInputs:
+           scan_hw, *, goal_context: bool = True,
+           worst_so_far: np.ndarray | None = None) -> value.ValueInputs:
     """Build one normalized batch from raw recorded rows.
 
     Normalized with the GENERATOR's own normalizers, so the critic sees exactly what the
@@ -425,6 +631,10 @@ def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
             of the base twist.
         device: Torch device.
         scan_hw: ``(H, W)`` fold of the privileged height scan.
+        worst_so_far: ``[W]`` the worst terrain penalty over the chunks STRICTLY BEFORE each
+            row's own, or ``None`` to leave the block out.  Strictly before, because including
+            a row's own penalty would leak part of ``r_t`` into ``V(s_t)`` and cancel exactly
+            that much of the advantage the fit exists to produce.
         goal_context: Whether the three goal offsets go into the context token. ``False`` is
             the ablation arm; the width must come from :func:`value.context_width` with the
             same flag or the twist lands in the goal's columns silently.
@@ -452,26 +662,28 @@ def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
     # reachable from those plus its own roll/pitch, but nothing on the robot measures the
     # linear half without odometry. Slicing it away here is what makes the two variants'
     # gap a statement about information rather than about architecture.
-    blocks = [twist if priv else twist[:, 3:]]
+    # NAMED pieces, assembled by `value.build_context`, which owns the order. Five sites used
+    # to concatenate this by hand, so the layout lived five times while its width lived once
+    # -- and a disagreement is a linear layer fed the wrong columns, not a shape error.
+    pieces: dict[str, torch.Tensor] = {"twist": twist}
     if goal_context:
         # Goal offsets on a DECLARED metre scale rather than a fitted statistic, so a
         # critic's notion of "far" is a property of the robot and not of whichever rollout
         # was on disk -- the same idiom as the generator's `contract` normalization.
-        #
-        # PREPENDED, so the goal keeps columns 0:3 exactly as every existing checkpoint has
-        # them. Appending instead would leave the width right and shift the twist, which is
-        # the one way to make a pre-flag checkpoint load and read the wrong columns.
         goal = to(np.stack([W["goal_downrange_m"][idx], W["goal_lateral_m"][idx],
                             W["goal_height_err_m"][idx]], axis=-1)) / GOAL_SCALE_M
-        blocks.insert(0, torch.nan_to_num(goal, nan=0.0, posinf=0.0, neginf=0.0))
-    ctx = torch.cat(blocks, dim=-1)
+        pieces["goal"] = torch.nan_to_num(goal, nan=0.0, posinf=0.0, neginf=0.0)
+    if worst_so_far is not None:
+        pieces["worst_penalty"] = to(worst_so_far[idx])[:, None]
+    ctx = value.build_context(privileged=priv, goal_context=goal_context,
+                              worst_penalty_context=worst_so_far is not None, **pieces)
     return value.ValueInputs(history=hist, extero=ext, cmd_tokens=cmd,
                              history_null=to(W["history_null"][idx], torch.bool),
                              scan=scan, proprio=proprio, context=ctx)
 
 
 def _predict(model, ctx, W, idx, priv, device, scan_hw, batch, *,
-             goal_context: bool = True):
+             goal_context: bool = True, worst_so_far: np.ndarray | None = None):
     """``P(fail)`` over ``idx``, in eval mode and without gradients."""
     was = model.training
     model.eval()
@@ -481,14 +693,16 @@ def _predict(model, ctx, W, idx, priv, device, scan_hw, batch, *,
             j = idx[i:i + batch]
             out[i:i + j.size] = model.p_fail(
                 _batch(ctx, W, j, priv, device, scan_hw,
-                       goal_context=goal_context)).cpu().numpy()
+                       goal_context=goal_context,
+                       worst_so_far=worst_so_far)).cpu().numpy()
     model.train(was)
     return out
 
 
 @torch.no_grad()
 def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
-                     goal_context: bool = True) -> np.ndarray:
+                     goal_context: bool = True,
+                     worst_so_far: np.ndarray | None = None) -> np.ndarray:
     """``G_hat`` over ``idx``, batched, in eval mode.
 
     Args:
@@ -512,7 +726,8 @@ def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
         j = idx[i:i + batch]
         out[i:i + j.size] = model.quality(
             _batch(ctx, W, j, priv, device, scan_hw,
-                   goal_context=goal_context)).cpu().numpy()
+                   goal_context=goal_context,
+                   worst_so_far=worst_so_far)).cpu().numpy()
     model.train(was)
     return out
 
@@ -522,7 +737,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
          quality_bins: int = 0, quality_weight: float = 1.0,
          quality_kind: str = "two_hot", quality_range: tuple[float, float] = (0.0, 1.0),
          quality_only: bool = False,
-         goal_context: bool = True) -> tuple[value.FlowValueModel, np.ndarray]:
+         goal_context: bool = True,
+         worst_so_far: np.ndarray | None = None) -> tuple[value.FlowValueModel, np.ndarray]:
     """Train one variant and return it plus held-out ``P(fail)``.
 
     Validation runs EVERY epoch, on both scopes. Without it the only visible signal is the
@@ -537,7 +753,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         scan_hw=(tuple(scan_hw) if priv else None),
         proprio_dim=(int(W["proprio"].shape[-1]) if priv else 0),
         proprio_steps=(int(W["proprio"].shape[1]) if priv else 0),
-        context_dim=value.context_width(privileged=priv, goal_context=goal_context),
+        context_dim=value.context_width(privileged=priv, goal_context=goal_context,
+                                        worst_penalty_context=(worst_so_far is not None)),
         quality_bins=int(quality_bins),
         quality_kind=str(quality_kind),
         quality_range=tuple(quality_range),
@@ -571,7 +788,7 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
             j = tr[i:i + batch]
             opt.zero_grad(set_to_none=True)
             xb = _batch(ctx, W, j, priv, device, scan_hw,
-                        goal_context=goal_context)
+                        goal_context=goal_context, worst_so_far=worst_so_far)
             fail_logit, q_logits = model.heads(xb)     # ONE encoder pass for both heads
             # QUALITY ONLY drops the survival term outright rather than down-weighting it.
             # A tiny weight would still shape the shared encoder while producing a p_fail
@@ -614,7 +831,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                 continue
             j = np.flatnonzero(m)
             a = value_gates.auc(_predict(model, ctx, W, j, priv, device, scan_hw, batch,
-                                         goal_context=goal_context),
+                                         goal_context=goal_context,
+                                         worst_so_far=worst_so_far),
                                 y_np[j])
             log[f"{label}/{scope}/auc_epoch"] = a
             print(f"      {scope} AUC {a:.3f}")
@@ -629,7 +847,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                 jq = j[lab["g_valid"][j]]
                 if jq.size:
                     q_hat = _predict_quality(model, ctx, W, jq, priv, device, scan_hw,
-                                             batch, goal_context=goal_context)
+                                             batch, goal_context=goal_context,
+                                             worst_so_far=worst_so_far)
                     qg = value_gates.return_gates(q_hat, lab["g"][jq])
                     log.update({f"{label}/{scope}/q_r2": qg["r2"],
                                 f"{label}/{scope}/q_rho": qg["rho"],
@@ -661,7 +880,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                 jq = j[g_ok.cpu().numpy()[j]] if use_q else j
                 a = (-float(np.mean((_predict_quality(
                     model, ctx, W, jq, priv, device, scan_hw, batch,
-                    goal_context=goal_context) - lab["g"][jq]) ** 2))
+                    goal_context=goal_context,
+                    worst_so_far=worst_so_far) - lab["g"][jq]) ** 2))
                      if jq.size else float("nan"))
                 log[f"{label}/{scope}/quality_mse"] = -a
                 print(f"      {scope} quality MSE {-a:.5f}")
@@ -690,7 +910,8 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
             j = allidx[i:i + batch]
             out[j] = model.p_fail(
                 _batch(ctx, W, j, priv, device, scan_hw,
-                       goal_context=goal_context)).cpu().numpy()
+                       goal_context=goal_context,
+                       worst_so_far=worst_so_far)).cpu().numpy()
     return model, out
 
 
@@ -711,7 +932,7 @@ def main() -> int:
                    help="Passes over the training folds. 5 because the critic on this task is "
                         "DATA-limited, not optimisation-limited, and that is measured: on a "
                         "2000-episode subset, 20 epochs restored epoch 13/14 by validation "
-                        "and reached r2 +0.791 against 4 epochs' +0.786 -- 0.6% relative for "
+                        "and reached r2 +0.791 against 4 epochs' +0.786 -- 0.6%% relative for "
                         "3.8x the wall time (27.8 min against 7.2). The effect only gets "
                         "weaker with more data, since 4 epochs over 16k episodes is already "
                         "8x the gradient steps of 4 over 2k. Raise it when the data grows, "
@@ -741,6 +962,38 @@ def main() -> int:
                         "fold model seeing less.")
     p.add_argument("--variants", type=str, default="V_priv,V_onboard",
                    help="Which critics to fit, comma-separated.")
+    # Opt-IN, unlike `--goal_context`: it WIDENS the context token, so every checkpoint
+    # already on disk was fitted without it and must keep loading.
+    p.add_argument("--bootstrap_v", type=str, default="",
+                   help="A PREVIOUS round's predictions.npz. Turns the quality target from "
+                        "the full-episode Monte Carlo return into the N-step bootstrap "
+                        "r + gamma^N V_prev -- one round of fitted value iteration, with the "
+                        "target FROZEN because it is a file rather than the live model. Round "
+                        "0 leaves this empty: bootstrapping off an untrained head fits noise "
+                        "to noise. Progress reward only (--reward_npz whose reward_source is "
+                        "terrain_progress); the file's reward_source must match, since "
+                        "bootstrapping across rewards differences two unrelated quantities. "
+                        "Rows the previous round did not cover fall back to the MC tail.")
+    p.add_argument("--bootstrap_variant", type=str, default="V_priv",
+                   choices=("V_priv", "V_onboard"),
+                   help="Which critic's out-of-fold predictions --bootstrap_v reads. V_priv "
+                        "by default because it is the better estimator (it sees the scan and "
+                        "proprio), and ONE target is built per fit, so both variants are "
+                        "fitted against it. That makes V_onboard's target partly a "
+                        "distillation of the privileged critic -- deliberate, and the reason "
+                        "this is a flag rather than a constant.")
+    p.add_argument("--worst_context", action="store_true",
+                   help="Give the critic the worst terrain penalty seen STRICTLY BEFORE this "
+                        f"chunk, clipped to {WORST_CLIP:g} and scaled to [0, 1]. The return it "
+                        "is asked "
+                        "to predict is a windowed sum over chunks that have already happened, "
+                        "so a critic told nothing about the episode's history so far has to "
+                        "average over how badly it has been going -- and the advantage is the "
+                        "difference between the realised return and that average, so the "
+                        "unexplained history lands in the advantage as noise. Strictly BEFORE "
+                        "is the load-bearing half: including chunk t's own penalty leaks r_t "
+                        "into V(s_t) and cancels exactly that much of A_t. Requires "
+                        "--reward_npz, and the fitted checkpoint stamps the flag.")
     # Opt-OUT, so the default arm stays the one every existing checkpoint was fitted under.
     p.add_argument("--goal_context", action="store_true", default=True,
                    help="Put the three goal offsets in the context token (default).")
@@ -772,7 +1025,7 @@ def main() -> int:
                         "penalty). 2 to 3 is the measured range and the choice inside it is "
                         "INSENSITIVE: the terrain penalty is bimodal (p95 1.72, p97 18.2, "
                         "p99 39.0), so almost nothing lands between them and c=2 vs c=3 "
-                        "moves the saturating fraction only 4.67% -> 4.13%.")
+                        "moves the saturating fraction only 4.67%% -> 4.13%%.")
     p.add_argument("--window", type=int, default=3,
                    help="chunks in the clipped-window return. Start short (2-4) and lengthen "
                         "only if per-mode advantage separation improves.")
@@ -822,6 +1075,27 @@ def main() -> int:
     p.add_argument("--run_name", type=str, default="",
                    help="W&B run name; defaults to the output directory's basename.")
     args = p.parse_args()
+    if args.bootstrap_v and float(args.clip_c) > 0.0:
+        # `--clip_c` SELECTS THE REDUCER, and the clipped-penalty branch never consults `v`,
+        # so this combination would run an ordinary Monte Carlo fit while the operator
+        # believed a round of value iteration had happened -- and print nothing either way.
+        raise SystemExit(
+            f"--bootstrap_v with --clip_c {args.clip_c}: the clipped-penalty reducer takes no "
+            "bootstrap, so the flag would be silently ignored. Pass --clip_c 0 for the "
+            "progress reward's reducer, which is the one value iteration applies to.")
+    if args.bootstrap_v and not args.reward_npz:
+        raise SystemExit(
+            "--bootstrap_v needs --reward_npz: the bootstrap target is only defined for the "
+            "progress reward's ongoing/terminal split, which comes from the sidecar.")
+    if args.bootstrap_v and not os.path.exists(args.bootstrap_v):
+        raise SystemExit(f"--bootstrap_v: no such file {args.bootstrap_v}")
+    if args.worst_context and not args.reward_npz:
+        # NOT a warning. The stamp declares the block from the FLAG while the batch builder
+        # takes it from the DATA, so a flag with no sidecar writes a checkpoint claiming an
+        # input width it was not fitted at -- which loads clean against the wrong layer.
+        raise SystemExit(
+            "--worst_context needs --reward_npz: the worst-penalty-so-far block is derived "
+            "from the sidecar's `penalty` column, and there is nowhere else to get it.")
 
     stem = args.stem[:-3] if args.stem.endswith(".h5") else args.stem
     stem = stem[:-9] if stem.endswith(".episodes") else stem
@@ -836,7 +1110,9 @@ def main() -> int:
                       strict_failure=strict_failure,
                       max_episodes=int(args.max_episodes), seed=int(args.seed),
                       reward_npz=args.reward_npz, clip_c=float(args.clip_c),
-                      window=int(args.window))
+                      window=int(args.window), worst_context=bool(args.worst_context),
+                      bootstrap_v=str(args.bootstrap_v),
+                      bootstrap_variant=str(args.bootstrap_variant))
     print(f"[fit] failure rule: {args.failure_rule} "
           + ("(fall crossing OR strict tracking violation)" if strict_failure
              else "(the FALL ALONE -- MuJoCo's rule; the tracking violation is ignored)")
@@ -862,10 +1138,14 @@ def main() -> int:
     # PRINTED, and the same idiom as train.py printing the resolved `extero_clip`: the arm
     # is invisible in the output otherwise, and a log that does not say which one ran is a log
     # whose AUC cannot be attributed.
+    # The width PRINTED must be the width BUILT, `--worst_context` included: this line is the
+    # only place a reader sees the critic's input width, and one that omitted the new block
+    # said 9 while the model was 10 and the checkpoint stamped 10.
     print(f"[fit] context token: {'goal(3) + ' if args.goal_context else 'NO GOAL, '}"
-          f"twist -> {value.context_width(privileged=True, goal_context=args.goal_context)} "
+          f"twist{' + worst(1)' if args.worst_context else ''}"
+          f" -> {value.context_width(privileged=True, goal_context=args.goal_context, worst_penalty_context=args.worst_context)} "
           f"wide (V_priv) / "
-          f"{value.context_width(privileged=False, goal_context=args.goal_context)} "
+          f"{value.context_width(privileged=False, goal_context=args.goal_context, worst_penalty_context=args.worst_context)} "
           f"(V_onboard)"
           + ("" if args.goal_context else
              "   <-- ABLATION: goal_downrange_m / goal_lateral_m / goal_height_err_m are OUT"))
@@ -970,6 +1250,7 @@ def main() -> int:
                               quality_range=tuple(E.get("quality_range", (0.0, 1.0))),
                               quality_only=bool(args.quality_only),
                               goal_context=bool(args.goal_context),
+                              worst_so_far=lab.get("worst_so_far"),
                               priv=priv, epochs=args.epochs,
                               batch=args.batch, lr=args.lr, device=args.device,
                               label=(label if len(folds) == 1 else f"{label}/f{k}"),
@@ -983,7 +1264,8 @@ def main() -> int:
             if q_all is not None:
                 q_k = _predict_quality(model, ctx, W, np.arange(uids.size), priv,
                                        args.device, scan_hw, args.batch,
-                                       goal_context=bool(args.goal_context))
+                                       goal_context=bool(args.goal_context),
+                                       worst_so_far=lab.get("worst_so_far"))
                 q_all[va_k] = q_k[va_k]
                 q_all[val_tile] += q_k[val_tile] / len(folds)
             # Checkpoint it. Without this the fit is write-only: the gates land on disk but
@@ -1015,8 +1297,14 @@ def main() -> int:
                         "fm_checkpoint_sha256": _sha256_file(args.fm_checkpoint),
                         "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
                         "context_dim": value.context_width(
-                            privileged=priv, goal_context=bool(args.goal_context)),
+                            privileged=priv, goal_context=bool(args.goal_context),
+                            worst_penalty_context=bool(args.worst_context)),
                         "privileged": bool(priv),
+                        #: WHETHER THE WORST-PENALTY-SO-FAR BLOCK IS IN THE CONTEXT TOKEN.
+                        #: Same reasoning as `goal_context` below -- the arms differ only in
+                        #: this token's width, so an undeclared one loads against the wrong
+                        #: layer or, worse, at a width that happens to agree.
+                        "worst_penalty_context": bool(args.worst_context),
                         # WHETHER THE GOAL WAS IN THE CONTEXT TOKEN. Stamped because the two
                         # arms differ only in this token's width, and four readers build that
                         # token: without the stamp a no-goal checkpoint would be handed a
@@ -1096,6 +1384,11 @@ def main() -> int:
              # -- and so the shift out of `track_err_prev` is undone exactly once, here.
              chunk_reward=lab["chunk_reward"], g=lab["g"], g_valid=lab["g_valid"],
              gamma=float(track_spec.gamma),
+             # The declared RETURN bound this fit's `g` was divided by. Stamped because
+             # `_bootstrap_v` has to undo exactly that division, and it otherwise re-derives
+             # the bound from the CURRENT sidecar's `success_const` -- which agrees only
+             # while the two rounds share a sidecar.
+             return_max=float(E.get("return_max", 0.0)),
              # WHICH reward this critic's quality head was fitted on. Stamped so an advantage
              # can never difference a G built from one reward against a baseline fitted on
              # another -- that mismatch is dimensionally plausible and numerically nonsense.

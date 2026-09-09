@@ -36,9 +36,11 @@ from __future__ import annotations
 from motion_gen.terrain.freeform import (
     GOAL_INSET_M,
     SECTION_MARGIN_M,
+    FREEFORM_SPAWN_JITTER_M,
     SPAWN_INSET_M,
     _base_tile,
     _fit_goal_half_width,
+    spawn_area,
     _ground_overlay,
     _overlay,
     _route,
@@ -125,6 +127,26 @@ TRAIN_SPEEDS_MPS: tuple[float, ...] = (0.50, 0.83, 1.17, 1.50, 1.83, 2.17)
 HOLDOUT_SPEED_MPS: float = 1.00
 
 
+#: Keep-out band from a box top's edges when spawning on it (m).  The robot must start with
+#: both soles fully on the surface and room to take a step without walking off the side it did
+#: not intend to leave from, so the usable rectangle is the box inset by this on all four
+#: sides: at :data:`BOX_DEPTH_M` 1.20 x :data:`BOX_WIDTH_M` 2.59 that leaves 0.60 x 1.99 m,
+#: against a stance roughly 0.25 m long and 0.30 m wide.
+BOX_SPAWN_EDGE_BUFFER_M: float = 0.30
+
+#: Relative draw weight of each spawn area: the ground start, box 1's top, box 2's top.  Equal
+#: thirds.
+#:
+#: **Why spawn on the boxes at all.** The course needs two correct jumps and the second is only
+#: reachable by first getting the first right, so a ground-only spawn collects the second
+#: dismount only in the rare episodes that already solved the first. Measured: of 352
+#: successful episodes on this course, EVERY one reached the goal by stairs-down-ing off a box
+#: -- a correct two-jump traverse never appeared in the data at all, so no reweighting could
+#: select for it. Starting on box 2 makes the final dismount its own, frequent, isolated
+#: problem; starting on box 1 does the same for the gap crossing.
+BOX2_SPAWN_WEIGHTS: tuple[float, float, float] = (1.0, 1.0, 1.0)
+
+
 def box_faces(spawn_distance_m: float) -> tuple[tuple[float, float], ...]:
     """The two boxes' near and far faces, tile-local, for a given approach distance.
 
@@ -192,8 +214,36 @@ def make_box2_tile(terrain_id: int, spawn_distance_m: float, *,
         overlays.append(_overlay((x0 + x1) / 2.0, off_y, 0.0,
                                  x1 - x0, BOX_WIDTH_M, BOX_HEIGHT_M))
 
+    # Three spawn areas: the ground start, then each box top. All three are DECLARED rather
+    # than leaving the ground to the reset's synthesised fallback, so the 1/3 : 1/3 : 1/3 split
+    # is a property of the manifest instead of an implicit share -- and every one goes through
+    # one code path.
+    #
+    # **The ground area is authored at exactly the ordinary jitter extents.** Declaring areas
+    # REPLACES `pos_jitter_m` for the tile (`resets._draw_spawn_areas`), so sizing this one to
+    # anything else silently changes the ground spawns and makes them incomparable to every
+    # earlier run. It was 0.375 x 0.995 first -- a 4x lateral spread, the robot starting a
+    # metre off the approach centreline -- which is why the number now comes from one place.
+    buf = float(BOX_SPAWN_EDGE_BUFFER_M)
+    w_ground, w_box1, w_box2 = BOX2_SPAWN_WEIGHTS
+    areas = [
+        spawn_area(off_x, off_y, 0.0,
+                   FREEFORM_SPAWN_JITTER_M[0], FREEFORM_SPAWN_JITTER_M[1],
+                   weight=w_ground),
+    ]
+    for (x0, x1), w in (((a0, a1), w_box1), ((b0, b1), w_box2)):
+        half_x = max((x1 - x0) / 2.0 - buf, 0.0)
+        half_y = max(BOX_WIDTH_M / 2.0 - buf, 0.0)
+        if half_x <= 0.0 or half_y <= 0.0:
+            raise ValueError(
+                f"box [{x0:.2f}, {x1:.2f}] is too small for a {buf:.2f} m spawn edge buffer; "
+                "lower BOX_SPAWN_EDGE_BUFFER_M or widen the box.")
+        areas.append(spawn_area((x0 + x1) / 2.0, off_y, BOX_HEIGHT_M, half_x, half_y,
+                                weight=w))
+
     route = _route((off_x, off_y), 0.0, 0.0, (goal_x, off_y),
-                   _fit_goal_half_width(GOAL_HALF_WIDTH_M, overlays, (goal_x, off_y)), 0.0)
+                   _fit_goal_half_width(GOAL_HALF_WIDTH_M, overlays, (goal_x, off_y)), 0.0,
+                   spawn_areas=areas)
     tile = _base_tile(terrain_id, str(family), size_x, size_y, overlays, route)
     tile["box2"] = {
         "spawn_distance_m": float(spawn_distance_m),

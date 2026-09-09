@@ -117,13 +117,31 @@ DEBUG_CONTACT_COLOR: tuple[float, float, float] = (0.15, 0.85, 0.35)
 #:
 #: Chosen against the frames already on screen -- the root is orange (0.95, 0.55, 0.10), the
 #: ankles blue and red, the wrists cyan (0.20, 0.80, 0.85) and purple (0.80, 0.30, 0.90), and
-#: contact markers green at 1.35x radius.  White and yellow are unused; magenta is close to the
-#: purple wrist, which is a real (if minor) clash kept only because it is the colour already
-#: in use for the history arm.
+#: contact markers green at 1.35x radius.
+#:
+#: **Arm 3 is BLACK, and it used to be yellow.**  Yellow was picked because no other marker
+#: used it -- an UNUSED-hue argument, which is the wrong test.  What matters is separation
+#: from the colour arm 3 will be confused with, and that is arm 0's orange root, since the
+#: two are the same marker drawn on different envs.  Measured, yellow (1.00, 0.90, 0.10)
+#: against that orange: **21.6 deg of hue and a 1.40:1 luminance ratio** -- both bright,
+#: both warm, differing mostly in one channel.  It read as the unperturbed root in the
+#: viewport, which is the one mistake this recolour exists to prevent.  Black is 13.05:1
+#: against the root and at worst 8.05:1 against anything else on screen, because it
+#: separates by LIGHTNESS instead of hunting for a free hue -- so it does not compete with
+#: a palette that is already crowded in the warm half.  A third saturated hue would.
+#:
+#: The cost, stated because it is the one way black is worse: it has no colour of its own to
+#: recognise, so against terrain in deep shadow it reads as a hole rather than a marker.  If
+#: that ever bites, a near-black (0.05, 0.05, 0.05) keeps the contrast argument intact.
+#:
+#: Magenta is close to the purple wrist -- a real (if minor) clash kept only because it is the
+#: colour already in use for the history arm and quoted in instructions users have.  It is
+#: also, and worse, within 0.050 RGB / 3.1 deg of ``_DEBUG_REWARDED_COLOR``, the tracked-body
+#: reference sphere, which is on by default; that one is NOT deliberate, merely unaddressed.
 DEBUG_ARM_COLORS: dict[int, tuple[str, tuple[float, float, float]]] = {
     1: ("null_history", (0.95, 0.15, 0.85)),          # magenta
     2: ("noisy_upper_cam", (1.00, 1.00, 1.00)),       # white
-    3: ("null_history_and_noisy_cam", (1.00, 0.90, 0.10)),   # yellow
+    3: ("null_history_and_noisy_cam", (0.00, 0.00, 0.00)),   # black
 }
 
 #: Kept as its own name because the history arm's colour is referenced by tests and by the
@@ -678,21 +696,48 @@ class FmTrackingCommand(MotionSequenceCommand):
                     "identified: this checkpoint's extero_spec carries no mount heights (or "
                     "it is a height-scan generator, which has no cameras). Refusing rather "
                     "than corrupting sensor 1 on the assumption that it is the far one.")
+            # The EFFECTIVE rate, not the inner fraction: `fm_perturb_fraction` gates this
+            # arm, so a 0.5 gate with a 0.5 fraction perturbs 25% of envs. Printing the
+            # inner number alone made a run look 2x more perturbed than it was, and that is
+            # exactly how a knob gets read as broken when it is only rare.
+            eff = frac * float(self.cfg.fm_perturb_fraction)
             print(f"[FmTrackingCommand] upper camera (sensor {self._upper_cam_index}) "
-                  f"replaced with {self.cfg.fm_upper_camera_noise_mode!r} on {frac:.0%} of "
-                  f"{self.num_envs} envs, re-drawn per "
-                  f"{self.cfg.fm_upper_camera_noise_cadence}")
+                  f"replaced with {self.cfg.fm_upper_camera_noise_mode!r} on {eff:.1%} of "
+                  f"{self.num_envs} envs ({frac:.0%} of the {self.cfg.fm_perturb_fraction:.0%} "
+                  f"eligible), re-drawn per {self.cfg.fm_upper_camera_noise_cadence}. "
+                  f"Expect ~{eff * self.num_envs:.1f} env(s) at a time")
         self._null_hist_gen = torch.Generator(device=self.device)
         self._null_hist_gen.manual_seed(0x2B1D ^ int(self.num_envs))
+        #: The SPEED-MISMATCH arm. An OFFSET, not an absolute: `reset` redraws `_ff_speed`
+        #: after the arm's own draw, so an absolute would be one episode stale -- and stale
+        #: in a way that still reads as a plausible speed.
+        self._speed_mismatch = torch.zeros(self.num_envs, dtype=torch.bool,
+                                           device=self.device)
+        self._speed_mismatch_offset = torch.zeros(self.num_envs, device=self.device)
+        #: Re-plans left in the current hold. Decremented per re-plan; a fresh activation is
+        #: rolled ONLY where this has reached 0, so a hold is never re-rolled part-way.
+        self._speed_mismatch_left = torch.zeros(self.num_envs, dtype=torch.long,
+                                                device=self.device)
+        self._speed_gen = torch.Generator(device=self.device)
+        self._speed_gen.manual_seed(0x7D3B ^ int(self.num_envs))
         if float(self.cfg.fm_history_null_fraction) > 0.0:
             frac = float(self.cfg.fm_history_null_fraction)
             if not 0.0 <= frac <= 1.0:
                 raise ValueError(
                     f"fm_history_null_fraction must be in [0, 1]; got {frac}")
-            print(f"[FmTrackingCommand] history-nulling {frac:.0%} of {self.num_envs} envs "
-                  f"per episode: those envs re-decide the plan MODE from exteroception and "
-                  f"the command alone. Expect ~{frac * self.num_envs:.1f} env(s) at a time; "
-                  f"raise --num_envs if that rounds to zero.")
+            if str(self.cfg.fm_history_null_cadence) not in ("episode", "replan"):
+                raise ValueError(
+                    f"fm_history_null_cadence must be 'episode' or 'replan'; got "
+                    f"{self.cfg.fm_history_null_cadence!r}")
+            # As above: the EFFECTIVE rate. This print already warned about rounding to zero
+            # and still understated the problem by the gate factor.
+            eff = frac * float(self.cfg.fm_perturb_fraction)
+            print(f"[FmTrackingCommand] history-nulling {eff:.1%} of {self.num_envs} envs "
+                  f"({frac:.0%} of the {self.cfg.fm_perturb_fraction:.0%} eligible) per "
+                  f"{self.cfg.fm_history_null_cadence}: those envs re-decide the plan MODE "
+                  f"from exteroception and the command alone. Expect "
+                  f"~{eff * self.num_envs:.1f} env(s) at a time; raise --num_envs if that "
+                  f"rounds to zero.")
         # The ribbon draws EVERY predicted node (dense), independent of the clip
         # ribbon's debug_vis_stride subsampling. It indexes _pred_window directly
         # rather than through the cursor, so it needs no offset table.
@@ -777,9 +822,24 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._pending_reset[env_ids] = True
         out = super().reset(env_ids)
         self._draw_perturb_eligible(env_ids)
-        self._draw_history_null(env_ids)
+        # The gate is drawn FIRST and always, because every arm is gated by it: drawing an
+        # arm against the previous episode's eligibility would make the control population
+        # one episode stale.
+        if str(self.cfg.fm_history_null_cadence) == "episode":
+            self._draw_history_null(env_ids)
         if str(self.cfg.fm_upper_camera_noise_cadence) == "episode":
             self._draw_upper_cam_noise(env_ids)
+        # The SPEED arm is CLEARED at reset rather than drawn: its activation happens on the
+        # re-plan, and a hold carried across an episode boundary would corrupt the opening
+        # plans of an env that may not even be eligible any more. Clearing the countdown is
+        # what lets `_draw_speed_mismatch` re-roll on the episode's first re-plan -- which
+        # fires for every reset env, since a reset clears `_pred_valid`.
+        ids_all = (torch.arange(self.num_envs, device=self.device) if env_ids is None
+                   else env_ids)
+        if float(self.cfg.fm_speed_mismatch_fraction) > 0.0 and ids_all.numel():
+            self._speed_mismatch[ids_all] = False
+            self._speed_mismatch_left[ids_all] = 0
+            self._speed_mismatch_offset[ids_all] = 0.0
         if self.freeform_command:
             ids = (torch.arange(self.num_envs, device=self.device) if env_ids is None
                    else env_ids)
@@ -905,10 +965,16 @@ class FmTrackingCommand(MotionSequenceCommand):
     def _draw_history_null(self, env_ids) -> None:
         """Re-draw which envs are served the null-history embedding, for the given envs.
 
-        Per EPISODE rather than per re-plan: an env keeps its assignment for the whole
-        episode, so the effect is watchable (one robot plans without history from spawn to
-        fall) and a recording can attribute a whole episode to the arm.  A per-re-plan draw
-        would mix both conditionings inside one episode and make neither attributable.
+        **The CALLER decides the cadence**, exactly as for the camera arm: ``reset`` calls
+        this under ``fm_history_null_cadence="episode"`` and ``_snapshot_and_infer`` calls it
+        per re-plan under ``"replan"``.  This used to be per-episode unconditionally, on the
+        argument that an env keeping its assignment for a whole episode is what makes an
+        EPISODE-level outcome attributable to the arm -- which is still true, and is why
+        ``"episode"`` remains the default.  What that argument missed is that per-re-plan is
+        the cadence the model was TRAINED under (``null_prob`` nulls independent WINDOWS, never
+        whole episodes), so it is the less confounded arm for a per-PLAN comparison as well as
+        the far easier one to see at a small env count.  See
+        :attr:`FmTrackingCommandCfg.fm_history_null_cadence`.
 
         Args:
             env_ids: Envs whose assignment to re-draw, or ``None`` for all of them.
@@ -936,6 +1002,97 @@ class FmTrackingCommand(MotionSequenceCommand):
             The per-env flag; all-False unless ``cfg.fm_history_null_fraction > 0``.
         """
         return self._force_null_hist
+
+    def _draw_speed_mismatch(self, env_ids) -> None:
+        """Roll the speed-mismatch arm, honouring any hold still in progress.
+
+        The countdown is decremented FIRST and a fresh activation rolled only where it has
+        reached zero, so an active hold survives a re-plan instead of being re-rolled every
+        time -- which is what makes :attr:`~FmTrackingCommandCfg.fm_speed_mismatch_replans`
+        mean what it says. An expired hold clears the flag whether or not it re-activates,
+        so an env cannot stay corrupted by a draw that missed.
+
+        Args:
+            env_ids: Envs to consider, or ``None`` for all of them.
+        """
+        frac = float(self.cfg.fm_speed_mismatch_fraction)
+        if frac <= 0.0:
+            return
+        ids = (torch.arange(self.num_envs, device=self.device) if env_ids is None
+               else env_ids)
+        if ids.numel() == 0:
+            return
+        self._speed_mismatch_left[ids] = (self._speed_mismatch_left[ids] - 1).clamp_min(0)
+        self._speed_mismatch[ids] &= self._speed_mismatch_left[ids] > 0
+        free = ids[self._speed_mismatch_left[ids] <= 0]
+        if free.numel() == 0:
+            return
+        draw = torch.rand(free.numel(), device=self.device, generator=self._speed_gen)
+        # Gated by the outer eligibility, exactly as the other two arms are: an ineligible
+        # env is pristine however the draw lands.
+        on = (draw < frac) & self._perturb_eligible[free]
+        lo, hi = (int(v) for v in self.cfg.fm_speed_mismatch_replans)
+        hold = torch.randint(lo, hi + 1, (free.numel(),), device=self.device,
+                             generator=self._speed_gen, dtype=torch.long)
+        rng = float(self.cfg.fm_speed_mismatch_range_mps)
+        off = (torch.rand(free.numel(), device=self.device,
+                          generator=self._speed_gen) * 2.0 - 1.0) * rng
+        self._speed_mismatch[free] = on
+        self._speed_mismatch_left[free] = torch.where(on, hold,
+                                                      torch.zeros_like(hold))
+        self._speed_mismatch_offset[free] = torch.where(on, off,
+                                                        torch.zeros_like(off))
+
+    def speed_mismatched(self) -> torch.Tensor:
+        """``(num_envs,)`` bool: envs whose CONDITIONING speed is currently offset.
+
+        Returns:
+            The per-env flag; all-False unless ``cfg.fm_speed_mismatch_fraction > 0``.
+        """
+        return self._speed_mismatch
+
+    def speed_mismatch_offset(self) -> torch.Tensor:
+        """``(num_envs,)`` the current conditioning speed OFFSET in m/s, 0 where inactive.
+
+        Returned as the offset rather than the absolute speed so a recording that backfills
+        it reads ``0.0`` honestly -- an absolute would backfill to a lie.
+
+        Returns:
+            The per-env offset.
+        """
+        return self._speed_mismatch_offset
+
+    def _override_cmd_speed(self, fut_cmd: torch.Tensor,
+                            ids: torch.Tensor) -> torch.Tensor:
+        """Offset the CONDITIONING command speed for the drawn envs.
+
+        **``fut_cmd`` must already be a COPY, and on the live path it is**: the caller builds
+        it with an index-tensor gather (``get_command_velocity_horizon(F)[ids]``), which
+        allocates. That is what keeps this out of ``_ff_cmd`` -- a single buffer feeding the
+        policy's ``command_window`` observation, the tracking rewards, the eval's tracking
+        target and the recorded ``cmd_future``. Overriding inside
+        :meth:`get_command_velocity_horizon` would change what the robot is ASKED to do rather
+        than what the generator is CONDITIONED on, and would break the recorder's guarantee
+        that it stores the true conditioning. Cloned defensively anyway, because a caller that
+        ever passed a view would corrupt the command with no error.
+
+        Args:
+            fut_cmd: ``[V, F, 3]`` the command horizon for ``ids``, in env order.
+            ids: ``[V]`` the envs about to sample.
+
+        Returns:
+            ``[V, F, 3]`` with channel 0 offset where the arm is active.
+        """
+        if float(self.cfg.fm_speed_mismatch_fraction) <= 0.0:
+            return fut_cmd
+        flag = self._speed_mismatch[ids]
+        if not bool(flag.any()):
+            return fut_cmd
+        out = fut_cmd.clone()
+        off = self._speed_mismatch_offset[ids].to(out.dtype)
+        out[..., 0] = out[..., 0] + torch.where(flag, off,
+                                                torch.zeros_like(off))[:, None]
+        return out
 
     # ------------------------------------------------------------------
     # The free-form velocity command (cfg.freeform_command; off by default)
@@ -2061,6 +2218,38 @@ class FmTrackingCommand(MotionSequenceCommand):
                 "firing. Check episode_length_buf and the reset latch."
             )
 
+        self._fm_reinfer_mask = infer_mask
+        if bool(infer_mask.any()):
+            # Per-REPLAN cadence re-rolls an arm for exactly the envs about to sample,
+            # immediately before they do, so the flag that gates the perturbation is the flag
+            # the resulting plan was conditioned under -- and the one the ribbon then colours.
+            #
+            # **Both draws land BEFORE `null_hist` is composed below, and for the HISTORY arm
+            # that ordering is load-bearing rather than tidy.** `null_hist` is the tensor
+            # `_run_fm` conditions on, so a history draw made after it would take effect one
+            # re-plan LATE: every plan the ribbon coloured for the arm would be one that had
+            # been sampled with its history intact, and the arm would look like a no-op while
+            # every flag and colour said otherwise. The CAMERA arm is immune -- `_run_fm`
+            # reads `_noise_upper_cam` live, inside the corruption -- but it is drawn here
+            # too so the two cadences cannot drift apart.
+            #
+            # A reset clears `_pred_valid`, and `infer_mask` is `reinfer | ~_pred_valid`, so
+            # every reset env re-plans on its first step: under `"replan"` the draw fires at
+            # the start of every episode as well, and no env is ever served under the
+            # previous episode's flag.
+            replan_ids = infer_mask.nonzero(as_tuple=False).flatten()
+            if str(self.cfg.fm_upper_camera_noise_cadence) == "replan":
+                self._draw_upper_cam_noise(replan_ids)
+            if str(self.cfg.fm_history_null_cadence) == "replan":
+                self._draw_history_null(replan_ids)
+            # The speed arm is drawn on EVERY re-plan regardless of cadence, because its
+            # countdown lives in the draw: `"episode"` still needs the per-re-plan tick to
+            # expire a hold, and `_draw_speed_mismatch` only re-rolls where the hold has
+            # reached zero. Under `"episode"` an env therefore keeps re-activating within its
+            # eligible episode; under `"replan"` it is the same call, so the two cadences
+            # differ here only in what `reset` does.
+            self._draw_speed_mismatch(replan_ids)
+
         # Envs whose window has not filled yet (post-reset, or the first steps of a run) are
         # sampled with the learned null-history embedding the FM was trained with, so the
         # generator drives from step 0 and no clip fallback is needed.
@@ -2071,14 +2260,7 @@ class FmTrackingCommand(MotionSequenceCommand):
         if bool(self._force_null_hist.any()):
             null_hist = (self._force_null_hist if null_hist is None
                          else (null_hist | self._force_null_hist))
-        self._fm_reinfer_mask = infer_mask
         if bool(infer_mask.any()):
-            # Per-REPLAN cadence re-rolls the camera arm for exactly the envs about to sample,
-            # immediately before they do, so the flag that gates the corruption is the flag
-            # the resulting plan was conditioned under -- and the one the ribbon then colours.
-            if str(self.cfg.fm_upper_camera_noise_cadence) == "replan":
-                self._draw_upper_cam_noise(
-                    infer_mask.nonzero(as_tuple=False).flatten())
             self._run_fm(infer_mask, null_hist)
         if not bool(self._pred_valid.all()):
             raise RuntimeError(
@@ -2131,6 +2313,9 @@ class FmTrackingCommand(MotionSequenceCommand):
             self._extero_stash[ids] = extero_row.detach()
         height = build_extero_tokens(self.ctx, extero_row)
         fut_cmd = self.get_command_velocity_horizon(self.ctx.F)[ids]  # [V,F,3]
+        # CONDITIONING ONLY -- see `_override_cmd_speed` for why this placement is the whole
+        # safety argument. Mirrors `_corrupt_upper_camera` above it.
+        fut_cmd = self._override_cmd_speed(fut_cmd, ids)
         cmd_tokens = build_cmd_tokens(self.ctx, fut_cmd)
         self._pred_window[ids] = sample_window(
             self.ctx, history, height, cmd_tokens,

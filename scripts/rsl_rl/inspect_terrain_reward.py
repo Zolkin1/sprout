@@ -650,6 +650,169 @@ def _print_grade(r: dict) -> None:
 # ---------------------------------------------------------------------------------------
 # stage: reward
 # ---------------------------------------------------------------------------------------
+#: Source name for the reward that adds velocity tracking and success to the terrain grade.
+#: A DIFFERENT name from :data:`REWARD_SOURCE`, so `label_advantage.check_reward_consistency`
+#: refuses to mix the two and a critic records which one it was fitted on.
+PROGRESS_SOURCE: str = "terrain_progress"
+
+#: Re-plans between recorded windows.  The recorder writes one window per re-plan and the
+#: command term re-plans every `fm_update_every` control steps, so consecutive `replan_index`
+#: values are exactly this far apart in time.  Read from the recording rather than assumed.
+DEFAULT_REPLAN_K: int = 12
+
+def per_step_reward_max(success_const: float) -> float:
+    """Largest value the per-step progress reward can take.
+
+    Args:
+        success_const: ``C``, the terminal success bonus.
+
+    Returns:
+        ``1 + 1 + C`` -- terrain and the gated velocity term are each bounded by 1, and the
+        terminal chunk of a successful episode additionally carries ``gate_worst * C``.
+    """
+    return 2.0 + float(success_const)
+
+
+def _progress_terms(rollout: str, rows: np.ndarray, uid: np.ndarray, rep: np.ndarray,
+                    reward_terrain: np.ndarray, reached_goal: np.ndarray,
+                    n_replans: np.ndarray, sharpness: float, success_sharpness: float,
+                    vel_sigma: float, success_const: float,
+                    replan_k: int) -> dict[str, np.ndarray]:
+    """The velocity-tracking and success terms, each gated by terrain consistency.
+
+    **Why this reward exists.** The terrain grade is a per-re-plan geometric penalty with no
+    progress term, so standing still is very nearly its optimum -- and five AWR iterations
+    against it drove forward progress from 11.50 to 3.95 m per 1000 steps (0.20 m/s against a
+    commanded 1.35) while survival rose and falls fell. Both new terms are multiplied by a
+    gate that closes as the plan's terrain interaction worsens, so neither can be earned by
+    charging through the boxes: the reward asks for speed AND cleanliness, not either.
+
+    **The gate.** ``sin((pi/2) * R**s)`` where ``R = exp(-penalty/tau)`` is the terrain grade
+    already computed. That is identically ``cos((pi/2) * (1 - R**s))`` -- the requested form --
+    but written as a sine of ``R`` because ``R`` is the quantity on hand and the identity saves
+    a subtraction. ``s`` multiplies the penalty before gating (``exp(-s*p/tau) == R**s``), so
+    ``s = 2`` gates as though every penalty were twice as large.
+
+    **The velocity is a TRUE 0.24 s average, derived not read.** ``anchor_pos`` is
+    ``root_pos_w`` at the re-plan instant, and re-plans are exactly ``replan_k`` control steps
+    apart, so differencing consecutive anchors within an episode gives the mean velocity over
+    the interval the plan governed. The recorded ``base_twist_yaw`` would be an instantaneous
+    sample, and is a CoM twist where this is the frame-origin velocity the command means.
+
+    **It tracks the NOMINAL command**, ``cmd_future``, which the recorder stores as the true
+    conditioning even when the speed-mismatch arm lied to the generator. That is deliberate:
+    the arm is an input corruption to be rejected, so the robot is asked to achieve the speed
+    it was really given.
+
+    Args:
+        rollout: The rollout ``.h5``.
+        rows: Row indices being graded, ascending.
+        uid: ``[R]`` episode uid per graded row.
+        rep: ``[R]`` replan index per graded row.
+        reward_terrain: ``[R]`` the terrain grade ``exp(-penalty/tau)`` in (0, 1].
+        reached_goal: ``[R]`` the row's episode success flag, 0/1.
+        n_replans: ``[R]`` the row's episode's TRUE re-plan count, from the episodes table's
+            ``n_replans``.  **Not counted from the rows being graded**: ``--reward_windows``
+            takes a random SUBSET, so a bincount over the graded rows gives the sampled count
+            and not the episode's -- measured at 3 against a true ~48, which made the
+            per-chunk success share 16x too large and silently pinned it to its clip. The
+            production path grades every row and would have hidden this.
+        sharpness: ``s`` in the PER-CHUNK gate on the velocity term.
+        success_sharpness: ``s`` in the EPISODE gate on the success term. Separate, and
+            higher, because that gate reads the episode's WORST chunk: a single destructive
+            re-plan should cost the success bonus much of its value, where one mediocre chunk
+            among many should only dim its own velocity credit.
+        vel_sigma: ``exp(-|err| / vel_sigma)``.
+        success_const: ``C``, the success reward before gating.
+        replan_k: Control steps between re-plans.
+
+    Returns:
+        ``gate``, ``vel_track``, ``vel_err_mps``, ``success``, ``valid`` -- all ``[R]``.
+        ``valid`` is False for the last re-plan of each episode, which has no successor to
+        difference against.
+    """
+    with h5py.File(rollout, "r") as f:
+        # The recorder PRE-ALLOCATES, so the datasets are longer than the rows actually
+        # written and the attribute is authoritative where it exists. Falling back to 0 was
+        # wrong in the one case it covered: a file without the attribute then joined against
+        # an EMPTY key array and died with `index -1 is out of bounds` from inside the
+        # successor lookup -- an IndexError several functions away from "this file does not
+        # say how many windows it holds". The dataset length is the right fallback, and zero
+        # rows is refused outright.
+        n = int(f.attrs.get("num_windows_written",
+                            f.attrs.get("num_windows", f["episode_uid"].shape[0])))
+        if n <= 0:
+            raise SystemExit(
+                f"{os.path.basename(rollout)} declares {n} written windows, so there is "
+                "nothing to grade. A recording killed before its first flush looks like "
+                "this.")
+        a_pos_all = f["anchor_pos"][:n].astype(np.float64)
+        a_quat_all = f["anchor_quat"][:n].astype(np.float64)
+        # Only the vx in force at the re-plan: on the free-form path every one of the F rows
+        # of `cmd_future` is the same held (vx, 0, wz), so row 0 is the whole content.
+        cmd_vx_all = f["cmd_future"][:n, 0, 0].astype(np.float64)
+        uid_all = f["episode_uid"][:n].astype(np.int64)
+        rep_all = f["replan_index"][:n].astype(np.int64)
+
+    # The successor of (uid, rep) is (uid, rep + 1). Joined BY KEY, never by row order: rows
+    # are written env-major per re-plan, so a row's successor is thousands of rows away.
+    key_all = (uid_all << np.int64(20)) + rep_all
+    order = np.argsort(key_all, kind="stable")
+    key_sorted = key_all[order]
+    want_next = (uid.astype(np.int64) << np.int64(20)) + rep.astype(np.int64) + 1
+    pos = np.searchsorted(key_sorted, want_next)
+    pos_c = np.clip(pos, 0, key_sorted.size - 1)
+    hit = key_sorted[pos_c] == want_next
+    nxt = order[pos_c]
+
+    dt = float(replan_k) * CONTROL_DT
+    d_pos = a_pos_all[nxt] - a_pos_all[rows]
+    v_w = d_pos / dt
+
+    # Into the yaw frame of the anchor the interval STARTED at, because the command is a
+    # heading-frame joystick quantity. Only the yaw is removed: a full-quaternion rotation
+    # would swing the forward component on every pitch.
+    # XYZW, w LAST -- the layout `rollout_outcomes.py:650` and `plan_to_world` both declare,
+    # and verified against a real recording rather than trusted: over 2000 upright windows the
+    # mean |component| is [0.003, 0.010, 0.050, 0.998], so the near-unit one is index 3. A
+    # wxyz/xyzw mix-up here would rotate every velocity by the robot's own tilt and leave the
+    # magnitudes plausible, which is why it is checked and not assumed.
+    qw, qx, qy, qz = (a_quat_all[rows][:, 3], a_quat_all[rows][:, 0],
+                      a_quat_all[rows][:, 1], a_quat_all[rows][:, 2])
+    yaw = np.arctan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+    c, sn = np.cos(-yaw), np.sin(-yaw)
+    v_fwd = c * v_w[:, 0] - sn * v_w[:, 1]
+
+    err = np.abs(v_fwd - cmd_vx_all[rows])
+    vel = np.exp(-err / float(vel_sigma))
+    gate = np.sin(0.5 * np.pi * np.power(np.clip(reward_terrain, 0.0, 1.0), float(sharpness)))
+
+    # The EPISODE gate is the worst chunk's, so success only pays when the robot was
+    # consistent throughout -- not when it was clean once and destructive elsewhere.
+    _, inv = np.unique(uid, return_inverse=True)
+    worst_by_ep = np.full(int(inv.max()) + 1 if inv.size else 0, np.inf, dtype=np.float64)
+    np.minimum.at(worst_by_ep, inv, reward_terrain)
+    worst_arr = worst_by_ep[inv]
+    gate_worst = np.sin(0.5 * np.pi
+                        * np.power(np.clip(worst_arr, 0.0, 1.0), float(success_sharpness)))
+    # **TERMINAL, on the episode's last re-plan only.** Two earlier shapes were tried and
+    # measured: adding C to every chunk made the target near-binary (unsuccessful rows 0.11,
+    # successful 0.95, with terrain and velocity confined to the bottom sixth of the range),
+    # and distributing C/n diluted it to inertia -- mean 0.019 against terrain's 0.965, i.e.
+    # 2% of the reward, so the thing the reward exists to encode barely appeared in it.
+    #
+    # A terminal bonus keeps it concentrated where it is earned and lets the CRITIC propagate
+    # it backwards, which is what bootstrapping is for. Under a (1-gamma)-weighted return a
+    # single terminal C contributes (1-gamma)*C to G at that chunk -- 0.5 at C=10, against a
+    # typical per-step 1.2 -- so it is a 42% lift at the goal that decays backwards.
+    n_chunks = n_replans.astype(np.float64)
+    is_last = rep.astype(np.float64) >= (n_chunks - 1.0)
+    success = gate_worst * float(success_const) * reached_goal.astype(np.float64) * is_last
+
+    return {"gate": gate, "vel_track": vel, "vel_err_mps": err,
+            "success": success, "n_chunks": n_chunks, "valid": hit}
+
+
 def stage_reward(args, state: dict) -> None:
     """Write the per-window terrain reward as a sidecar the critic can be fitted on.
 
@@ -685,9 +848,54 @@ def stage_reward(args, state: dict) -> None:
     penalty = got["contact_penalty"] * spec.contact_weight \
         + got["penetration_sum_m"] * spec.penetration_weight
     reward = np.exp(-penalty / float(args.tau))
+    reward_terrain = reward.copy()
+
+    prog: dict[str, np.ndarray] = {}
+    if args.progress:
+        replan_k = int(trio.rollout_meta(rollout).get("fm_update_every")
+                       or DEFAULT_REPLAN_K)
+        ep_uid = episodes["episode_uid"]
+        n_rep_by_uid = dict(zip(ep_uid.tolist(), episodes["n_replans"].tolist()))
+        n_replans_row = np.array([n_rep_by_uid[int(u)] for u in got["episode_uid"]],
+                                 dtype=np.float64)
+        prog = _progress_terms(
+            rollout, got["row"], got["episode_uid"], got["replan_index"],
+            reward_terrain, got["reached_goal"], n_replans_row,
+            sharpness=float(args.gate_sharpness),
+            success_sharpness=float(args.success_gate_sharpness),
+            vel_sigma=float(args.vel_sigma),
+            success_const=float(args.success_const), replan_k=replan_k)
+        # **NOT NORMALIZED HERE.** The per-chunk reward is handed over raw -- bounded by
+        # `per_step_reward_max(C)`, since R_terrain <= 1, gate * vel <= 1 and success <= C --
+        # and the RETURN reducer does the division. That split is the whole reason
+        # `bootstrapped_window_return` exists: with a one-off terminal bonus the per-step
+        # bound (2 + C = 12) and the RETURN bound (2 + (1-gamma)*C = 2.5) are different
+        # numbers, so dividing here by either one is wrong downstream. 12 would leave the
+        # critic regressing a target whose realised range is a tenth of its declared one;
+        # 2.5 would let a single chunk exceed the declared support outright.
+        reward = reward_terrain + prog["gate"] * prog["vel_track"] + prog["success"]
+        # The last re-plan of every episode has no successor to difference against, exactly
+        # as `track_err_prev` has no predecessor. Those rows keep the terrain grade alone
+        # rather than a velocity term computed from a fabricated displacement.
+        bad = ~prog["valid"]
+        if bad.any():
+            reward[bad] = reward_terrain[bad] + prog["success"][bad]
+        print(f"  progress terms: s_vel={args.gate_sharpness:g} "
+              f"s_success={args.success_gate_sharpness:g} sigma={args.vel_sigma:g} "
+              f"C={args.success_const:g} "
+              f"per-chunk max {per_step_reward_max(float(args.success_const)):g}")
+        print(f"    vel_err   median {np.median(prog['vel_err_mps'][prog['valid']]):.4f} m/s"
+              f"  p95 {np.quantile(prog['vel_err_mps'][prog['valid']], .95):.4f}")
+        print(f"    vel_track median {np.median(prog['vel_track'][prog['valid']]):.4f}"
+              f"   gate median {np.median(prog['gate']):.4f}")
+        print(f"    success   fires on {float((prog['success'] > 0).mean()):.4f} of rows"
+              f"  mean {float(prog['success'].mean()):.4f}"
+              f"  per-chunk max {float(prog['success'].max()):.4f}")
+        print(f"    chunks/episode median {float(np.median(prog['n_chunks'])):.1f}")
+        print(f"    no-successor rows: {int(bad.sum())} of {bad.size}")
 
     meta = {
-        "reward_source": REWARD_SOURCE,
+        "reward_source": PROGRESS_SOURCE if args.progress else REWARD_SOURCE,
         "tau": float(args.tau),
         "thresh": float(args.thresh), "dilate": int(args.dilate),
         "max_gap": int(args.max_gap), "spacing": args.spacing,
@@ -701,6 +909,18 @@ def stage_reward(args, state: dict) -> None:
         "rollout": os.path.abspath(args.rollout), "clip": clip,
         "n_windows": int(len(rows)), "joint_names": list(names),
     }
+    if args.progress:
+        meta.update({
+            "gate_sharpness": float(args.gate_sharpness),
+            "success_gate_sharpness": float(args.success_gate_sharpness),
+            "vel_sigma_mps": float(args.vel_sigma),
+            "success_const": float(args.success_const),
+            "per_step_reward_max": per_step_reward_max(float(args.success_const)),
+            "success_shape": "terminal",
+            "replan_k": int(trio.rollout_meta(rollout).get("fm_update_every")
+                            or DEFAULT_REPLAN_K),
+        })
+
     payload = {
         "episode_uid": got["episode_uid"].astype(np.int64),
         "replan_index": got["replan_index"].astype(np.int32),
@@ -710,6 +930,17 @@ def stage_reward(args, state: dict) -> None:
         "penetration_sum_m": got["penetration_sum_m"].astype(np.float64),
         "meta_json": json.dumps(meta, sort_keys=True),
     }
+    if args.progress:
+        # The components, so a reward can be taken apart after the fact without re-grading --
+        # which is what makes "did the velocity term or the success term move this" answerable.
+        payload.update({
+            "reward_terrain": reward_terrain.astype(np.float64),
+            "gate": prog["gate"].astype(np.float64),
+            "vel_track": prog["vel_track"].astype(np.float64),
+            "vel_err_mps": prog["vel_err_mps"].astype(np.float64),
+            "success": prog["success"].astype(np.float64),
+            "vel_valid": prog["valid"].astype(np.uint8),
+        })
     digest = hashlib.sha256(
         payload["episode_uid"].tobytes() + payload["replan_index"].tobytes()
         + payload["reward"].tobytes() + payload["meta_json"].encode()).hexdigest()[:16]
@@ -718,7 +949,16 @@ def stage_reward(args, state: dict) -> None:
     path = args.reward_out or os.path.join(args.out, "terrain_reward_sidecar.npz")
     np.savez_compressed(path, **payload)
     q = np.quantile(reward, [0.05, 0.25, 0.5, 0.75, 0.95])
-    print(f"  R = exp(-penalty / {args.tau:g}), support (0, 1]")
+    # The SUPPORT depends on which reward was built: the bare terrain grade is a bounded
+    # goodness in (0, 1], while the progress reward adds a gated velocity term (<= 1) and a
+    # one-off terminal bonus (<= C), so its per-chunk range is (0, 2 + C].
+    if args.progress:
+        print(f"  R = exp(-penalty / {args.tau:g}) gated; per-chunk reward support "
+              f"(0, {2.0 + float(args.success_const):g}] "
+              f"(terrain <= 1, gated velocity <= 1, terminal bonus <= "
+              f"{float(args.success_const):g})")
+    else:
+        print(f"  R = exp(-penalty / {args.tau:g}), support (0, 1]")
     print(f"    penalty  median {np.median(penalty):.5f}  p95 {np.quantile(penalty, .95):.5f}"
           f"  max {penalty.max():.5f}")
     print(f"    reward   p05 {q[0]:.4f}  p25 {q[1]:.4f}  median {q[2]:.4f}  p75 {q[3]:.4f}"
@@ -783,6 +1023,51 @@ def build_parser() -> argparse.ArgumentParser:
     """The CLI."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--progress", action="store_true",
+                   help="Add the VELOCITY-TRACKING and SUCCESS terms, each gated by terrain "
+                        "consistency, and write the sum as the reward. Without this the "
+                        "sidecar is the terrain grade alone -- which five AWR iterations "
+                        "drove to 0.20 m/s against a commanded 1.35, because a per-re-plan "
+                        "geometric penalty is very nearly maximised by standing still.")
+    p.add_argument("--gate_sharpness", type=float, default=2.0,
+                   help="s in the gate sin((pi/2) * R**s). It MULTIPLIES THE PENALTY before "
+                        "gating (exp(-s*p/tau) == R**s), so s=2 gates as though every "
+                        "chunk's terrain penalty were twice as large. Default 2.0: at s=1 a "
+                        "penalty of 0.5 still passes 82%% of its velocity credit, which "
+                        "reintroduces the sloppy-but-fast failure one level up; s=2 halves "
+                        "that to 55%%.")
+    p.add_argument("--success_gate_sharpness", type=float, default=3.0,
+                   help="s in the EPISODE gate sin((pi/2) * min_t(R)**s) on the success term. "
+                        "Separate from --gate_sharpness and higher (3.0 vs 2.0) because this "
+                        "gate reads the episode's WORST chunk: one destructive re-plan should "
+                        "cost the success bonus most of its value, where one mediocre chunk "
+                        "among many should only dim its own velocity credit. At s=4 a worst "
+                        "chunk with penalty 0.5 pays 34%% of C; s=4 would pay 21%%, s=5 13%%.\n"
+                        "3 is CALIBRATED AGAINST REAL DISMOUNTS, not guessed. Over 6140 "
+                        "step-off windows in the parent's own data the terrain penalty runs "
+                        "p05 0.003 / p25 0.151 / median 0.378 / p75 0.713, so s=3 pays a good "
+                        "dismount 1.00-0.84 and a sloppy one 0.18 -- while s=4 costs the "
+                        "MEDIAN dismount a third of its credit for no separation we can point "
+                        "at. Dismounts are much harder than average (median 0.378 against "
+                        "0.030 over all windows), which is why the sharpness has to be read "
+                        "against them and not against the whole distribution: "
+                        "`view_terrain_reward_viser.py --dismount` is that view, and "
+                        "`calibrate_clean_dismount.py` shows an AUTHORED dismount scores "
+                        "~0.000, i.e. gate 1.000 at any s.\n"
+                        "It is still only meaningful with spawn diversity. "
+                        "Measured on the parent's own data, every one of 352 successful "
+                        "episodes had a worst-chunk penalty of at least 0.673 (median 1.844), "
+                        "so at s=5 no success earned more than 5.4%% of C -- the term was "
+                        "dead, and the cleanest successes available were the stairs-down "
+                        "dismounts the gate exists to refuse. Box-top spawns are what make a "
+                        "clean success reachable, and only then does a strict gate select "
+                        "rather than annihilate.")
+    p.add_argument("--vel_sigma", type=float, default=0.5,
+                   help="exp(-|v_err| / sigma) for the velocity term, m/s. 0.5 means "
+                        "tracking within 0.5 m/s scores 0.37 and perfect tracking 1.0.")
+    p.add_argument("--success_const", type=float, default=10.0,
+                   help="C in gate_worst * C * reached_goal. 10 makes reaching the goal worth "
+                        "about ten re-plans of perfect velocity tracking.")
     p.add_argument("--stage", default="all",
                    choices=("frame", "calibrate", "grade", "reward", "report", "all"))
     p.add_argument("--rollout", required=True,
@@ -823,6 +1108,17 @@ def main() -> None:
     """Run the requested stages, sharing one json."""
     args = build_parser().parse_args()
     args.spacing = args.spacing if args.spacing and args.spacing > 0 else None
+    if args.progress and int(args.reward_windows) != 0:
+        # The SUCCESS gate is a `min` over the episode's chunks, and a minimum over a SUBSET
+        # is systematically larger -- so a sampled grade pays more success credit than the
+        # episode earned, always in the flattering direction. This is the same defect this
+        # file already records as measured for the chunk COUNT (3 against a true ~48), and it
+        # is refused rather than corrected because an episode's minimum cannot be honestly
+        # recovered from a sample of it.
+        raise SystemExit(
+            f"--progress needs --reward_windows 0 (every window); got {args.reward_windows}. "
+            "The success term is gated on the episode's WORST chunk, and a minimum over a "
+            "sampled subset is biased high, so a subset grade over-pays success everywhere.")
     if not args.out:
         args.out = os.path.join(os.path.dirname(os.path.abspath(args.rollout)),
                                 "terrain_reward")
