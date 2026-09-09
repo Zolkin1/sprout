@@ -541,7 +541,7 @@ def read_commanded_speed_range(path: str) -> tuple[float, float] | None:
     if raw is None:
         return None
     cfg = json.loads(raw) if isinstance(raw, (str, bytes)) else dict(raw)
-    for block in ("step_course", "box2", "freeform"):
+    for block in ("step_course", "box2", "freeform", "varied_courses"):
         rng = (cfg.get(block) or {}).get("commanded_speed_range_mps")
         if rng is None:
             continue
