@@ -24,7 +24,7 @@ _REPO = pathlib.Path(__file__).resolve().parents[3]
 LOOP = _REPO / "scripts" / "flow_matching" / "run_finetune_loop.sh"
 
 #: The algorithms the loop must offer, and what each one's update stage is allowed to pass.
-ALGOS = ("awr", "fbc", "bc")
+ALGOS = ("awr", "fbc", "bc", "arrived")
 
 
 @pytest.fixture(scope="module")
@@ -59,7 +59,8 @@ def test_the_script_exists_under_its_new_name(text: str) -> None:
 def test_every_algo_is_accepted_and_anything_else_is_refused(text: str) -> None:
     for a in ALGOS:
         assert re.search(rf"\b{a}\b", text), f"{a} is not mentioned"
-    assert "ALGO must be awr, fbc or bc" in text, "an unknown ALGO must be refused, not run"
+    assert "ALGO must be awr, fbc, bc or arrived" in text, (
+        "an unknown ALGO must be refused, not run")
 
 
 def test_plain_bc_passes_no_labels_at_all() -> None:
@@ -97,8 +98,11 @@ def test_the_three_arms_differ_ONLY_in_the_update(text: str) -> None:
     update stage and the two stages `bc` skips because nothing reads them.
     """
     allowed = ("ROUNDS_FVI=0", "7/8 label", "ALGO_ARGS", "algo   ", "ALGO must be",
-               # the label stage's skip, the second of the two stages `bc` drops
-               '[ "$ALGO" = "bc" ]; then')
+               # the label stage's branches, the second of the two stages `bc` drops
+               '[ "$ALGO" = "bc" ]; then', '[ "$ALGO" = "arrived" ]',
+               "case \"$ALGO\" in bc|arrived)",
+               # `$ALGO` inside a SKIP message names which arm it was; that is reporting.
+               "6/8 critic      SKIP")
     for m in re.finditer(r'^.*\$ALGO.*$', text, re.M):
         line = m.group(0)
         if line.strip().startswith("#:") or line.strip().startswith("#"):
@@ -114,7 +118,7 @@ def test_bc_skips_the_critic_and_the_label(text: str) -> None:
     ~28 minutes an iteration, and an arm that computes a value function it does not use
     invites the reader to wonder whether it used it after all.
     """
-    assert 'ALGO" = "bc" ] && ROUNDS_FVI=0' in text
+    assert 'case "$ALGO" in bc|arrived) ROUNDS_FVI=0;; esac' in text
     assert 'ALGO" = "bc" ]; then' in text, "the label stage must skip under bc"
 
 
@@ -134,3 +138,35 @@ def test_the_banner_states_which_algorithm_ran(text: str) -> None:
     """A run's own log is the only durable record of which arm it was."""
     for a in ("AWR", "FILTERED BC", "PLAIN BC"):
         assert a in text, f"the banner never names {a}"
+
+
+def test_the_arrived_arm_skips_the_critic() -> None:
+    """A no-critic baseline that needs a critic is not a no-critic baseline.
+
+    That is the whole content of the arm: it asks whether spending a value function buys
+    anything over "keep the chunks of episodes that did not fail".  On the tracking reward the
+    equivalent comparison found this rule matched or beat the critic one.
+    """
+    t = LOOP.read_text()
+    assert 'case "$ALGO" in bc|arrived) ROUNDS_FVI=0;; esac' in t, (
+        "arrived must skip the critic exactly as bc does")
+
+
+def test_the_arrived_arm_uses_its_own_labeller() -> None:
+    """``label_advantage.py`` reads the critic's predictions, so it cannot serve this arm."""
+    t = LOOP.read_text()
+    assert "label_arrived.py" in t
+    # And it must produce the sidecar the SAME fine-tune stage consumes, so the arms differ in
+    # the selection rule alone.
+    assert re.search(r"fbc\|arrived\) ALGO_ARGS=\(--labels[^)]*--filter_label positive", t)
+
+
+def test_the_failure_rule_is_explicit_and_matches_the_critic_arms() -> None:
+    """strict vs loose moves the positive set from 33 rows to 728 on the box2 grid.
+
+    ``fit_value.py``'s default is strict, so an arm compared against a critic arm has to be
+    strict too or the two select from differently-defined populations.
+    """
+    t = LOOP.read_text()
+    assert re.search(r'^FAILURE_RULE="\$\{FAILURE_RULE:-strict\}"', t, re.M)
+    assert '--failure_rule "$FAILURE_RULE"' in t

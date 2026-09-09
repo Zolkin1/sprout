@@ -88,13 +88,31 @@ PROJECT="${PROJECT:-robot_rl_awr}"
 #:        coincide only in a limit, and the limit is not the algorithm.
 #:   bc   PLAIN BC on ALL the data: no labels, no weighting, no filter. The critic and label
 #:        stages are SKIPPED because nothing reads them, which also makes it the cheapest arm.
+#:   arrived ARRIVED-ONLY: keep every chunk of an episode that reached the goal before it
+#:        failed, decided by the recording alone. The CRITIC IS SKIPPED -- that is the whole
+#:        point, so a critic-free rule can be compared against one that spends a value
+#:        function. On the tracking reward the equivalent comparison found the no-critic
+#:        outcome filter MATCHED OR BEAT the critic one, so it is the arm to beat.
+#:
+#:        ARRIVAL, not survival. `terminal_reward` scores -1 for a robot that stayed upright
+#:        and never got there, deliberately -- "standing still would score identically to
+#:        climbing the staircase with none of the risk". A falls-only rule keeps 96.5% of
+#:        windows (measured), which is barely a filter, lands on top of `bc`, and selects the
+#:        very pathology the progress reward exists to remove. Arrival keeps 56.5%.
 #:
 #: `bc` is the control that matters most: the parent was never trained on this terrain at all,
 #: so any fine-tune on these rollouts is also domain adaptation. Without it, "the advantage
 #: selected good behaviour" cannot be separated from "the model finally saw this terrain".
 ALGO="${ALGO:-awr}"
-case "$ALGO" in awr|fbc|bc) ;; *)
-  echo "REFUSING: ALGO must be awr, fbc or bc; got '$ALGO'."; exit 2;; esac
+case "$ALGO" in awr|fbc|bc|arrived) ;; *)
+  echo "REFUSING: ALGO must be awr, fbc, bc or arrived; got '$ALGO'."; exit 2;; esac
+
+#: What counts as failing BEFORE arrival for the `arrived` arm -- which is what that filter
+#: tests against, so it moves the keep rate a lot: strict keeps 55.8% of episodes on a real
+#: buffer against loose's 67.1%, because 41.7% of them trip a tracking violation somewhere.
+#: Must match the rule the arms it is compared against used; `fit_value.py`'s default is
+#: strict, so this is too.
+FAILURE_RULE="${FAILURE_RULE:-strict}"
 
 #: Percentile BELOW which a chunk is negative, i.e. `fbc` keeps the top `100 - this`%.
 #: Only read by `fbc`; `awr` uses the continuous advantage column and ignores the labels.
@@ -184,6 +202,7 @@ case "$ALGO" in
   awr) echo "[awr] algo   AWR, beta $BETA (sd units), clip 20, global normalize";;
   fbc) echo "[awr] algo   FILTERED BC, top $(awk -v p="$PERCENTILE" 'BEGIN{printf "%g", 100-p}')% by advantage (--filter_label positive)";;
   bc)  echo "[awr] algo   PLAIN BC on ALL data -- no labels, no weights; critic+label SKIPPED";;
+  arrived) echo "[awr] algo   ARRIVED-ONLY filter ($FAILURE_RULE failure rule); critic SKIPPED";;
 esac
 echo "[awr] arms   camera 0.5 (dead, per-replan), history 0.0, speed-mismatch $SPEED_MISMATCH"
 echo "[awr] clip   $CLIP"
@@ -364,9 +383,9 @@ for (( it=1; it<=ITERS; it++ )); do
     # `bc` trains on every row unweighted, so no value function and no label are read. Skipped
     # rather than run-and-ignored: it is ~28 min an iteration, and an arm that quietly computes
     # something it does not use invites the reader to wonder whether it used it after all.
-    [ "$ALGO" = "bc" ] && ROUNDS_FVI=0
+    case "$ALGO" in bc|arrived) ROUNDS_FVI=0;; esac
     PREV_PRED=""
-    [ "$ROUNDS_FVI" -eq 0 ] && echo "[awr] 6/8 critic      SKIP (ALGO=bc reads no value function)"
+    [ "$ROUNDS_FVI" -eq 0 ] && echo "[awr] 6/8 critic      SKIP (ALGO=$ALGO reads no value function)"
     for (( fr=0; fr<ROUNDS_FVI; fr++ )); do
       RDIR="$CRITIC"
       [ "$ROUNDS_FVI" -gt 1 ] && RDIR="$CRITIC/round_$fr"
@@ -408,6 +427,15 @@ for (( it=1; it<=ITERS; it++ )); do
   # ---- 7. label ---------------------------------------------------------------------
   if [ "$ALGO" = "bc" ]; then
     echo "[awr] 7/8 label       SKIP (ALGO=bc trains on every row)"
+  elif [ "$ALGO" = "arrived" ] && [ ! -f "$CRITIC/advantage.npz" ]; then
+    # A different labeller, not a mode of the critic-based one: `label_advantage.py` reads
+    # the critic's predictions, so a critic-free path through it would still need a critic to
+    # have run. It writes the SAME sidecar, so the fine-tune stage is unchanged.
+    echo "[awr] 7/8 label       ARRIVED-ONLY, $FAILURE_RULE failure rule (no critic)"
+    mkdir -p "$CRITIC"
+    "$PY" -u scripts/flow_matching/label_arrived.py "$BUF_STEM" \
+      --failure_rule "$FAILURE_RULE" \
+      --out "$CRITIC/advantage.npz" >> "$ITD/critic.log" 2>&1 || fail "label (arrived)" "$it"
   elif [ -f "$CRITIC/advantage.npz" ]; then
     echo "[awr] 7/8 label       SKIP (exists)"
   else
@@ -438,7 +466,7 @@ for (( it=1; it<=ITERS; it++ )); do
       awr) ALGO_ARGS=(--labels "$CRITIC/advantage.npz"
                       --awr_beta "$BETA" --awr_normalize global --awr_center none
                       --awr_balance none --awr_clip 20.0);;
-      fbc) ALGO_ARGS=(--labels "$CRITIC/advantage.npz" --filter_label positive);;
+      fbc|arrived) ALGO_ARGS=(--labels "$CRITIC/advantage.npz" --filter_label positive);;
       bc)  ALGO_ARGS=();;
     esac
     "$PY" -u scripts/flow_matching/finetune_generator.py --no_wandb \
