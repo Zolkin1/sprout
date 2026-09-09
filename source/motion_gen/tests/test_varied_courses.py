@@ -395,9 +395,9 @@ def test_the_declared_spec_matches_what_the_tiles_were_built_to() -> None:
     spec = goal_region_spec(6, 6)
     assert spec["default"]["half_width_m"] == pytest.approx(GOAL_HALF_WIDTH_M)
     assert spec["default"]["approach_margin_m"] == 0.0
-    # OFF: both families' goals sit at ground level, so there is nothing for it to catch, and a
-    # non-zero tolerance is what let an in-distribution `jump_on` goal score from the floor.
-    assert spec["default"]["height_tol_m"] == 0.0
+    # A REAL band, not 0: see `test_the_goal_spec_never_declares_a_zero_height_tolerance` --
+    # 0 is an exact-equality test in `in_goal`, and it voided a whole arm.
+    assert spec["default"]["height_tol_m"] == pytest.approx(0.5)
     assert spec["provenance"]["declared"] is True
     for t in generate_varied_manifest(6, 6):
         assert t["route"]["goal_half_width"] == pytest.approx(spec["default"]["half_width_m"])
@@ -427,3 +427,33 @@ def test_the_shipped_default_authors_no_rotation_at_all() -> None:
                 for b, ov in zip(t["varied_boxes"]["boxes"], t["overlays"][1:]):
                     assert ov["pos_xy"][1] == pytest.approx(r["start_y"]), (
                         f"tile {t['terrain_id']} box off the centreline")
+
+
+def test_the_goal_spec_never_declares_a_zero_height_tolerance() -> None:
+    """0 is not "off" for `in_goal`, and writing it there voids an entire arm.
+
+    ``height_tol_m`` names two quantities with opposite conventions at zero:
+    ``terminations.freeform_goal_reached`` guards its height clause with ``if height_tol_m >
+    0``, so 0 disables the test, while ``goal_region.in_goal`` applies
+    ``|height_err| <= height_tol_m`` unconditionally -- so 0 is an exact-equality test that
+    floating point never satisfies.
+
+    Written as 0.0 once, it made every arrival on the varied tiles record as a non-arrival:
+    the eval read 0.0000 on both arms over 8400 episodes, and because the progress reward's
+    success term is ``gate * C * reached_goal`` it was identically zero through all five
+    training iterations too.  Nothing failed; the numbers were simply all zero.
+    """
+    tol = goal_region_spec(4, 4)["default"]["height_tol_m"]
+    assert tol > 0.0, "0 is an exact-equality test in `in_goal`, not a disabled one"
+    # Matches every other course's spec, and `GoalTolerances`' own default.
+    assert tol == pytest.approx(0.5)
+
+
+def test_the_goal_spec_tolerances_are_all_usable() -> None:
+    """A zero band on any axis is unsatisfiable, not permissive."""
+    d = goal_region_spec(4, 4)["default"]
+    assert d["half_width_m"] > 0.0
+    assert d["height_tol_m"] > 0.0
+    # The margin is the one that MAY be zero: `in_goal` tests `downrange >= -margin`, so 0
+    # means "at or past the line", which is exactly the intent.
+    assert d["approach_margin_m"] >= 0.0

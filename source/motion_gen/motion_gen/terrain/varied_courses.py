@@ -619,11 +619,24 @@ def goal_region_spec(n_boxes: int, n_updown: int,
         "default": {
             "approach_margin_m": 0.0,
             "half_width_m": float(GOAL_HALF_WIDTH_M),
-            # The height test is OFF. A varied library's goals sit at ground level on both
-            # families -- past the runout, past the last box -- so there is nothing for it to
-            # catch, and a non-zero tolerance here is what made an in-distribution `jump_on`
-            # goal scoreable from the floor.
-            "height_tol_m": 0.0,
+            # **NOT 0, and 0 here is not "off".**  `height_tol_m` names two quantities with
+            # opposite conventions at zero: `terminations.freeform_goal_reached` guards its
+            # height clause with `if height_tol_m > 0`, so 0 disables it, while
+            # `goal_region.in_goal` applies `|height_err| <= height_tol_m` unconditionally --
+            # its docstring says the band "is not optional" -- so 0 is an EXACT-equality test
+            # that floating point never satisfies.
+            #
+            # Written as 0.0 once, and it cost a whole arm: every arrival on the varied tiles
+            # recorded as a non-arrival, so the eval read 0.0000 on both arms over 8400
+            # episodes AND the progress reward's success term (`gate * C * reached_goal`) was
+            # identically zero through all 5 training iterations. The run was not merely
+            # unevaluable, it was mistrained.
+            #
+            # 0.5 m is what every other course's spec declares and is `GoalTolerances`' own
+            # default. It is a real band here rather than a formality: the goals sit at ground
+            # level past the runout, and the datum is the goal's own STANDING height, so a
+            # robot arriving upright reads ~0 and one arriving in a crouch still counts.
+            "height_tol_m": 0.5,
         },
         "by_family": {},
         "provenance": {

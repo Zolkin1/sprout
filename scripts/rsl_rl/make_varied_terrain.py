@@ -120,8 +120,10 @@ def main() -> int:
             json.dump(spec, fh, indent=2)
         # Both roles share it: the band is a scoring TOLERANCE and every tile of every family
         # here is built to it, which is what lets one number serve the whole library.
+        d = spec["default"]
         print(f"[varied] goal regions -> {args.goals}  "
-              f"(half_width {spec['default']['half_width_m']:.2f} m, height test OFF)")
+              f"(half_width {d['half_width_m']:.2f} m, height band "
+              f"{d['height_tol_m']:.2f} m)")
 
     roles = [("train", args.seed)]
     if not args.no_holdout:
