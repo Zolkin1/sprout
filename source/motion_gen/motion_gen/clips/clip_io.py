@@ -505,6 +505,55 @@ def set_flat_tile_count(path: str, tiles: int) -> int:
     return int(tiles)
 
 
+def read_commanded_speed_range(path: str) -> tuple[float, float] | None:
+    """The commanded-speed interval a manifest library declares, or ``None``.
+
+    **The speed is a property of the COURSE, not of the run that records it.** A 6 x 0.15 m
+    staircase and a two-box jump are asked for different bands, and before this the band lived
+    only in whatever env override a launcher happened to pass -- so a library could be recorded
+    at 0.5-2.2 by one script and 0.6-2.6 by another with nothing on disk saying which was
+    intended, and neither being wrong. Stamping it and reading it back makes the course own it.
+
+    Stored in the ``generator_config`` ATTR rather than in the ``terrain_manifest``, and that
+    placement is deliberate: ``fingerprint_terrain_manifest`` hashes the manifest, so a key
+    added there would move the fingerprint of geometry that has not changed by a millimetre and
+    strand every rollout already recorded against it. A commanded speed is not geometry.
+
+    Args:
+        path: A clip library ``.h5``.
+
+    Returns:
+        ``(min, max)`` in m/s, or ``None`` when the library declares none -- which every
+        library written before this did, so a caller must treat absence as "no opinion" and
+        fall back to its own default rather than to a guess.
+
+    Raises:
+        ValueError: If a range is present but not a positive, ordered pair. A silently
+            reversed or zero band would sample a constant speed and look like a policy that
+            refuses to vary.
+    """
+    import json                                                            # noqa: PLC0415
+
+    import h5py                                                           # noqa: PLC0415
+
+    with h5py.File(path, "r") as f:
+        raw = f.attrs.get("generator_config")
+    if raw is None:
+        return None
+    cfg = json.loads(raw) if isinstance(raw, (str, bytes)) else dict(raw)
+    for block in ("step_course", "box2", "freeform"):
+        rng = (cfg.get(block) or {}).get("commanded_speed_range_mps")
+        if rng is None:
+            continue
+        lo, hi = (float(v) for v in rng)
+        if not (0.0 < lo < hi):
+            raise ValueError(
+                f"{path} declares commanded_speed_range_mps {rng}, which is not a positive "
+                "ordered pair; sampling it would give a constant or negative speed.")
+        return lo, hi
+    return None
+
+
 def group_clips_by_terrain(lib: ClipLibraryData) -> dict[int, torch.Tensor]:
     """Group clip indices by their ``terrain_id`` (``-1`` = flat / no terrain).
 

@@ -301,6 +301,19 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
         g, g_ok = adv_mod.bootstrapped_window_return(
             ongoing, term, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
             v=v_prev, window=int(window), gamma=float(spec.gamma), return_max=r_max)
+        # **The MONTE CARLO return, always, beside whatever target this round fitted.**
+        # The critic's TARGET is bootstrapped by design -- a terminal bonus cannot reach the
+        # chunks that chose the mode through a 3-chunk window -- but the ADVANTAGE must stay
+        # `G_real - V`. `label_advantage` differences the `g` column against the head, so
+        # writing only the bootstrapped target there makes the advantage
+        # `(r + gamma^N V_prev) - V`: a TD advantage, which is a legitimate algorithm and is
+        # not the one asked for, and nothing downstream could tell the two apart because both
+        # are the same shape, the same scale and the same plausible magnitude.
+        # Round 0 recomputes an identical array; that costs ~1 s on 200k rows and keeps the
+        # consumer unconditional, which is worth more than the second.
+        lab["g_mc"], lab["g_mc_valid"] = adv_mod.bootstrapped_window_return(
+            ongoing, term, r_ok, W["episode_uid"], W["replan_index"], lab["failed"],
+            v=None, window=int(window), gamma=float(spec.gamma), return_max=r_max)
         meta_out["fvi_bootstrap_from"] = str(bootstrap_v)
         meta_out["quality_range"] = (0.0, 1.0)
         meta_out["return_max"] = r_max
@@ -1383,6 +1396,10 @@ def main() -> int:
              # `label_advantage` can form the combined V without re-reading a 12 GB rollout
              # -- and so the shift out of `track_err_prev` is undone exactly once, here.
              chunk_reward=lab["chunk_reward"], g=lab["g"], g_valid=lab["g_valid"],
+             # The realized MC return, for the ADVANTAGE. Equal to `g` on a Monte Carlo
+             # round and different on a bootstrapped one, which is exactly when it matters.
+             **({} if "g_mc" not in lab else
+                {"g_mc": lab["g_mc"], "g_mc_valid": lab["g_mc_valid"]}),
              gamma=float(track_spec.gamma),
              # The declared RETURN bound this fit's `g` was divided by. Stamped because
              # `_bootstrap_v` has to undo exactly that division, and it otherwise re-derives
@@ -1393,6 +1410,11 @@ def main() -> int:
              # can never difference a G built from one reward against a baseline fitted on
              # another -- that mismatch is dimensionally plausible and numerically nonsense.
              reward_source=str(E.get("reward_source", "track_err")),
+             # WHICH round of value iteration this is, i.e. whether `g` is the realized
+             # return or a bootstrapped target. Stamped so `label_advantage` can REFUSE a
+             # bootstrapped file that carries no `g_mc` instead of quietly differencing the
+             # target against the head and calling it an advantage.
+             fvi_bootstrap_from=str(E.get("fvi_bootstrap_from", "")),
              reward_hash=str(E.get("reward_hash", "")),
              # The target SPEC and whether the SURVIVAL head was trained at all. Both are
              # stamped because an advantage must not be formed against a baseline fitted on a

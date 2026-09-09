@@ -67,8 +67,14 @@ SPEED_MISMATCH="${SPEED_MISMATCH:-0.0}"
 BETA="${BETA:-0.5}"
 WORKERS="${WORKERS:-16}"
 PROJECT="${PROJECT:-robot_rl_awr}"
-SPEED_MIN="${SPEED_MIN:-0.5}"
-SPEED_MAX="${SPEED_MAX:-2.2}"
+#: The commanded-speed band. Defaults come from the CLIP LIBRARY when it declares one
+#: (`clip_io.read_commanded_speed_range`), because the band is a property of the course --
+#: a 6 x 0.15 m staircase and a two-box jump want different ones, and before this the band
+#: lived only in whichever launcher happened to pass an override. An explicit SPEED_MIN /
+#: SPEED_MAX still wins, so a deliberate sweep is unaffected; a library that declares
+#: nothing falls back to these, which is box2's historical band.
+SPEED_MIN="${SPEED_MIN:-}"
+SPEED_MAX="${SPEED_MAX:-}"
 PY="${PY:-$W/env_isaaclab/bin/python}"
 
 while [ $# -gt 0 ]; do
@@ -86,6 +92,30 @@ done
 [ -n "$TAG" ] || { echo "REFUSING: --tag is required; it names the output tree, the wandb"; \
                    echo "  group and the drop seed, so two arms cannot collide."; exit 2; }
 [ -n "$GPU" ] || { echo "REFUSING: --gpu is required."; exit 2; }
+
+#: Resolve the speed band: the library's declaration unless the caller overrode it. Read with
+#: the repo's own reader rather than by poking at h5 attrs here, so the storage location is
+#: stated in exactly one place.
+if [ -z "$SPEED_MIN" ] || [ -z "$SPEED_MAX" ]; then
+  _rng=$("$PY" - "$CLIP" <<'PYEOF' 2>/dev/null
+import sys
+sys.path.insert(0, "source/motion_gen")
+from motion_gen.clips.clip_io import read_commanded_speed_range
+r = read_commanded_speed_range(sys.argv[1])
+print(f"{r[0]} {r[1]}" if r else "")
+PYEOF
+)
+  if [ -n "$_rng" ]; then
+    SPEED_MIN="${SPEED_MIN:-$(printf '%s' "$_rng" | cut -d' ' -f1)}"
+    SPEED_MAX="${SPEED_MAX:-$(printf '%s' "$_rng" | cut -d' ' -f2)}"
+    SPEED_SRC="declared by $(basename "$CLIP")"
+  else
+    SPEED_MIN="${SPEED_MIN:-0.5}"; SPEED_MAX="${SPEED_MAX:-2.2}"
+    SPEED_SRC="loop default ($(basename "$CLIP") declares none)"
+  fi
+else
+  SPEED_SRC="set on the command line"
+fi
 for pair in "buffer:$BUFFER" "refresh:$REFRESH" "iterations:$ITERS"; do
   case "${pair#*:}" in
     ''|*[!0-9]*) echo "REFUSING: --${pair%%:*} must be a positive integer, got '${pair#*:}'."
@@ -124,6 +154,7 @@ echo "[awr] reward $([ "$PROGRESS" = "1" ] && echo "PROGRESS (s_vel=$GATE_S s_su
 echo "[awr] critic $FVI_ROUNDS FVI round(s)$([ "$PROGRESS" = "1" ] && echo ", worst-penalty-so-far context")"
 echo "[awr] arms   camera 0.5 (dead, per-replan), history 0.0, speed-mismatch $SPEED_MISMATCH"
 echo "[awr] clip   $CLIP"
+echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
 echo "==================================================================="
 
 fail () { echo "[awr] FAILED at $1 (iteration $2)" >&2; exit 1; }

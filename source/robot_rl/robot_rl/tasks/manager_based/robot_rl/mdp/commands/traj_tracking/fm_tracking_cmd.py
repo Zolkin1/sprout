@@ -394,6 +394,32 @@ class FmTrackingCommand(MotionSequenceCommand):
             print("[INFO FmTrackingCommand] fm_zero_noise=True: the flow integrates from x0=0, "
                   "so predictions are deterministic given the conditioning (diagnostic mode, "
                   "off the training distribution).")
+        # **A `debug_vis_*` sub-flag with the MASTER `debug_vis` off draws nothing and says
+        # nothing.** `debug_vis` gates `_debug_vis_callback` entirely, and the fine-tune task
+        # ships it False (training should not draw), so asking for the FM ribbon or the goal
+        # gate on that task is a no-op unless it is turned on too. Silence there is
+        # indistinguishable from "the markers are somewhere off screen", which is the one
+        # conclusion these visualisers must not allow -- the same reasoning
+        # `debug_vis_goal_regions` already carries for `--viz kit`, one gate further out.
+        # ENUMERATED off the cfg and compared against the CLASS DEFAULTS, neither of which is
+        # incidental. Enumerated, because a hardcoded list goes stale the first time a sub-flag
+        # is added and the failure it then misses is the silent one. Against the defaults,
+        # because most of these are ON by default (`debug_vis_obs_window`,
+        # `debug_vis_show_fm_prediction`) or are parameters rather than requests (the radii,
+        # the horizon) -- so "non-default" is what isolates "someone asked for this", and
+        # warning on the rest would fire on every training run and be ignored.
+        try:
+            _dflt = type(self.cfg)()
+            _asked = sorted(n for n in vars(self.cfg) if n.startswith("debug_vis_")
+                            and getattr(self.cfg, n) != getattr(_dflt, n, object()))
+        except Exception:                                   # noqa: BLE001
+            _asked = []                                     # a cfg that cannot be re-made
+
+        if _asked and not bool(getattr(self.cfg, "debug_vis", False)):
+            print(f"[WARN FmTrackingCommand] {_asked} asked for, but commands.traj_ref."
+                  f"debug_vis=False gates every marker: NOTHING will be drawn. Add "
+                  f"`env.commands.traj_ref.debug_vis=true` (and run with `--viz kit`; "
+                  f"headless never fires the callback either).")
         if self.ctx.cmd_dim <= 0:
             raise ValueError("FmTrackingCommand expects a command-conditioned FM checkpoint (cmd_dim>0).")
         # NOTE: the re-plan cadence is deliberately NOT checked against the recording's

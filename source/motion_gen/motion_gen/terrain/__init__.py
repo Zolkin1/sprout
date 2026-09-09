@@ -16,4 +16,10 @@ numbers, so nothing is recomputed (or allowed to drift) between generation and t
 * :mod:`freeform` -- sections authored for their own sake, with no clip behind them: the
   FM-driven fine-tune predicts its reference from the cameras, so the ground no longer has to
   be built under a recorded motion.  Each tile carries the ``route`` the RL steering follows.
+* :mod:`box2` / :mod:`step_courses` -- FIXED free-form courses, built on :mod:`freeform`'s
+  helpers.  Where the families above present a DISTRIBUTION, these present one obstacle that
+  can be overfitted to, re-evaluated on and compared against the MuJoCo eval: the two-box
+  course, a single wide step (a curb), and a staircase walked up and back down.  Two of the
+  three mirror an mjeval course and are held to it by a test rather than by an import, since
+  this package stays free of ``transfer`` as it stays free of IsaacLab.
 """

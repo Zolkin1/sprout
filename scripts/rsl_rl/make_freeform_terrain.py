@@ -212,14 +212,42 @@ def verify(path: str, manifest: list[dict]) -> None:
     n_flat = default_num_flat_tiles(lib)
     assert n_flat == 0, f"expected 0 synthesised flat tiles, got {n_flat}"
     mesh, origins, layout = assemble_clip_terrain(lib)
-    # The highest walkable surface the manifest claims, against the mesh's own z extent: the two
-    # must agree, or a slab was authored at a height the loader did not build.
-    claim = max(float(o["base_z"]) + float(o["size_xyz"][2])
-                for m in manifest for o in m["overlays"])
+
+    # The highest surface the manifest claims, against the mesh's own z extent: the two must
+    # agree, or a slab was authored at a height the loader did not build.
+    #
+    # **Split by ``decor``, because the two land in DIFFERENT meshes.** ``assemble_clip_terrain``
+    # returns the ground mesh and puts every ``decor=True`` overlay in ``layout.decor_mesh``, so
+    # pooling them compares a walkable claim against a mesh the walls are not in. The free-form
+    # families never emit decoration -- their stairwell walls are collidable -- so this only
+    # bites a FIXED course that mirrors mjeval's visual-only walls
+    # (``motion_gen.terrain.step_courses``), where it reported the 2.0 m wall top against a
+    # 0.9 m platform. Both halves are checked, so a wall silently landing in the ground mesh
+    # (or vice versa) fails here rather than at the first depth frame.
+    def _top(want_decor: bool) -> float | None:
+        """Highest surface among the manifest's decor / non-decor overlays, or None."""
+        tops = [float(o["base_z"]) + float(o["size_xyz"][2])
+                for m in manifest for o in m["overlays"]
+                if bool(o.get("decor", False)) is want_decor]
+        return max(tops) if tops else None
+
+    claim = _top(False)
     got = float(mesh.bounds[1][2])
-    assert abs(claim - got) < 1e-6, f"mesh top {got} != manifest's highest surface {claim}"
+    assert claim is not None, "every tile is decoration; there is no ground to stand on"
+    assert abs(claim - got) < 1e-6, f"ground mesh top {got} != manifest's highest walkable {claim}"
+    decor_claim = _top(True)
+    decor_mesh = getattr(layout, "decor_mesh", None)
+    assert (decor_claim is None) == (decor_mesh is None), (
+        f"the manifest has {'no ' if decor_claim is None else ''}decoration but the loader "
+        f"built {'none' if decor_mesh is None else 'some'}")
+    if decor_claim is not None:
+        decor_got = float(decor_mesh.bounds[1][2])
+        assert abs(decor_claim - decor_got) < 1e-6, (
+            f"decor mesh top {decor_got} != manifest's highest decoration {decor_claim}")
     print(f"[freeform] mesh OK: {len(mesh.faces)} faces, {layout.num_tiles} tiles, "
-          f"origins {tuple(origins.shape)}, z in [{mesh.bounds[0][2]:.3f}, {got:.3f}]")
+          f"origins {tuple(origins.shape)}, z in [{mesh.bounds[0][2]:.3f}, {got:.3f}]"
+          + ("" if decor_claim is None
+             else f"; decor {len(decor_mesh.faces)} faces to z {decor_claim:.3f}"))
 
 
 def main() -> int:

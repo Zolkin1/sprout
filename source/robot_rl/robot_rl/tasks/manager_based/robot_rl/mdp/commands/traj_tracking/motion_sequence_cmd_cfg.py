@@ -201,11 +201,11 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     #:
     #: Empty = off, which is every existing task.
     debug_vis_goal_regions: str = ""
-    """Draw a ribbon along the base of the reference window the POLICY observes.
+    """Path to a ``goal_regions.json`` whose regions to draw; empty = off.
 
-    Distinct from the clip ribbon, which is drawn at the clip's GLOBAL placement: this one
-    is anchored, so it rides the robot.  The separation between the two ribbons is exactly
-    the accumulated drift -- the thing the reward forgives and the termination fires on."""
-    """Whether to draw the hand/wrist end-effector frames in the debug ribbon.
-    Off by default (pelvis + feet are usually what matters); set True to also
-    visualize the wrist trajectories."""
+    The two docstrings that used to sit here belonged to OTHER fields -- one to
+    :attr:`debug_vis_obs_window` above, and one to a ``debug_vis_ee_frames`` that no longer
+    exists -- so this flag was documented as "draw a ribbon along the base of the reference
+    window", which is not what it does. Nothing read the missing field, so the only cost was
+    the wrong description on the flag a reader reaches for. See the ``#:`` comments above for
+    what this actually draws and why it needs ``--viz kit``."""

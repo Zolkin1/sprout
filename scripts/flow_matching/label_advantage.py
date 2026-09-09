@@ -325,7 +325,27 @@ def main() -> int:
                 f"realized return, but {args.predictions} has no {qkey}/g. Refit with a "
                 "quality head, or label at --w_fail 1.")
         else:
-            g_hat, g = d[qkey], d["g"]
+            # **`g_mc` when the file has it.** Under fitted value iteration `g` is the
+            # target that round FITTED, which past round 0 is `r + gamma^N V_prev` -- so
+            # differencing it against the head gives a TD advantage rather than
+            # `G_real - V`. `g_mc` is the realized Monte Carlo return the same reducer
+            # produced; a file without it either predates the split or was a pure MC fit, in
+            # which case `g` IS the realized return.
+            g_hat = d[qkey]
+            if "g_mc" in d.files:
+                g = d["g_mc"]
+                print("[label] G = the realized MONTE CARLO return (`g_mc`); the critic's own "
+                      "target was bootstrapped, which is the intended split.")
+            else:
+                g = d["g"]
+                _boot = ("fvi_bootstrap_from" in d.files
+                         and str(d["fvi_bootstrap_from"]).strip() not in ("", "None"))
+                if _boot:
+                    raise SystemExit(
+                        f"{args.predictions} was fitted with --bootstrap_v but carries no "
+                        "`g_mc`, so the only return in it is the BOOTSTRAPPED target. "
+                        "Differencing that against the head gives a TD advantage, not "
+                        "G_real - V. Refit with a fit_value that writes `g_mc`.")
             g_valid = d["g_valid"].astype(bool)
         a, boot = adv_mod.mc_advantage(g, g_hat, p_fail, failed,
                                        w_fail=float(args.w_fail), valid=g_valid)
