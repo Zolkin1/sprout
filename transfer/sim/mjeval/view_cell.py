@@ -241,6 +241,7 @@ def capture(run_dir: str, label: str, terrain_idx: int, speed_idx: int, args
     import runner  # noqa: PLC0415 - mujoco + the deploy runtime; --list must not pay for it
 
     arm = {a.label: a for a in evaluate.ARMS}[label]
+    fm_onnx = generator_from_manifest(run_dir, arm.fm_onnx)
     course = terrains.catalogue()[terrain_idx]
     speed = course.speeds[speed_idx]
 
@@ -268,7 +269,7 @@ def capture(run_dir: str, label: str, terrain_idx: int, speed_idx: int, args
 
     cfg = runner.ArmRun(
         arm=arm.code, label=arm.label,
-        tracker_onnx=arm.tracker_onnx, fm_onnx=arm.fm_onnx,
+        tracker_onnx=arm.tracker_onnx, fm_onnx=fm_onnx,
         out_dir=os.path.join(run_dir, arm.label),
         robot_name=args.robot_name, providers=tuple(args.providers.split(",")),
         fall_height=args.fall_height, fall_tilt_deg=args.fall_tilt_deg,
@@ -307,6 +308,45 @@ def capture(run_dir: str, label: str, terrain_idx: int, speed_idx: int, args
     summary = {"course": course, "speed": speed, "verdict": verdict, "failure": failure,
                "row": row, "model": rig.robot.mj_model}
     return summary, frames, plans
+
+
+def generator_from_manifest(run: str, default: str) -> str:
+    """The generator the RUN scored, from its manifest -- not this module's default.
+
+    `evaluate.py --fm_onnx` lets a run name its own generator, and every AWR iteration
+    exports one, so the module constant is no longer "the" generator. Reading it here instead
+    of the manifest replayed a DIFFERENT model than the one scored, which
+    `verify_against_table` then correctly refused -- on 24 columns, with `max_tilt_rad` 1.225
+    against 1.376 and the fall 5 steps later. That refusal is the only reason it was noticed,
+    and it should not have needed to fire.
+
+    Args:
+        run: The run directory.
+        default: What to fall back to when the manifest predates the field.
+
+    Returns:
+        The generator path.
+
+    Raises:
+        SystemExit: If the manifest names a generator that is no longer on disk. A silent
+            fallback to the default would reproduce exactly the bug this function fixes.
+    """
+    import json                                                     # noqa: PLC0415
+
+    mf = os.path.join(run, "manifest.json")
+    if not os.path.exists(mf):
+        return default
+    with open(mf) as f:
+        got = (json.load(f).get("artifacts") or {}).get("generator") or {}
+    name = str(got.get("name") or "")
+    if not name:
+        return default
+    if not os.path.exists(name):
+        raise SystemExit(
+            f"{mf} was scored with generator {name}, which is not on disk now. Replaying "
+            "with anything else would show a rollout that was never scored -- restore that "
+            "file, or re-run the sweep.")
+    return name
 
 
 def verify_against_table(row: dict, cols: dict[str, np.ndarray], idx: int) -> list[str]:
@@ -584,7 +624,7 @@ def live(run_dir: str, label: str, terrain_idx: int, speed_idx: int, args) -> No
             "--const_cmd", f"{speed}", "0", "0",
             "--rt_factor", f"{args.rt}",
             "--load_run", os.path.basename(os.path.dirname(os.path.dirname(arm.tracker_onnx))),
-            "--fm_onnx", arm.fm_onnx,
+            "--fm_onnx", generator_from_manifest(args.run, arm.fm_onnx),
             "--fall_height", f"{args.fall_height}",
             "--fall_tilt_deg", f"{args.fall_tilt_deg}",
             "--allow_robot_asset_mismatch", "--viz"]

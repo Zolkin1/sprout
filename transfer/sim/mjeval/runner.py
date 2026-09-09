@@ -162,6 +162,9 @@ class ArmRun:
         terrain_ref: A ``terrain_class.py`` reference set.  Empty means no plan classification,
             and the four ``n_plans*`` columns are then legitimately zero rather than missing.
         max_courses: Truncate the catalogue, for a smoke run.  ``0`` runs all of it.
+        only_courses: Comma-separated course NAMES to keep.  Independent of
+            ``max_courses``, which can only take a PREFIX of the catalogue and so cannot
+            select one course by name.
         max_speeds: Truncate each course's ladder, for a smoke run.  ``0`` runs all of it.
         attrs: Provenance from the caller, stamped onto ``episodes.h5`` verbatim.  What the
             RUNNER resolved (dt, cadence, the lag it actually applied) is added on top, so the
@@ -231,6 +234,8 @@ class ArmRun:
     shards: int = 1
     shard: int = 0
     max_courses: int = 0
+    #: Comma-separated course NAMES to run, or "" for all of them.
+    only_courses: str = ""
     max_speeds: int = 0
     attrs: dict[str, Any] = field(default_factory=dict)
 
@@ -768,12 +773,30 @@ def run_arm(cfg: ArmRun) -> str:
     if cfg.max_courses:
         courses = courses[:cfg.max_courses]
 
+    # **A NAME filter must SKIP, never slice.** `terrain_idx` is the GLOBAL catalogue index --
+    # `view_cell` and `report` both map it back through `terrains.catalogue()` -- so removing
+    # entries renumbers every course after them. Slicing to select box2 (global index 17)
+    # recorded it as 0, and `--list` then named it `mjeval_up_w122_modal`, which is course 0.
+    # This is the same hazard the shard note below describes, arrived at from the other side;
+    # `max_courses` gets away with slicing only because it keeps a PREFIX, so no surviving
+    # index moves.
+    keep: set[int] | None = None
+    if cfg.only_courses:
+        want = {n.strip() for n in cfg.only_courses.split(",") if n.strip()}
+        missing = want - {c.name for c in courses}
+        if missing:
+            raise ValueError(
+                f"--courses named {sorted(missing)}, which this catalogue does not contain. "
+                f"Available: {sorted(c.name for c in courses)}")
+        keep = {i for i, c in enumerate(courses) if c.name in want}
+
     # The catalogue is enumerated in FULL and the shard skips what is not its own, so
     # `terrain_idx` stays the global catalogue index in every shard.  Slicing the list instead
     # would renumber the courses per shard, and the merged table would then carry several
     # different courses under one `terrain_idx` -- which the report clusters on, so the
     # bootstrap would resample a cluster that does not exist.
-    mine = [i for i in range(len(courses)) if i % cfg.shards == cfg.shard]
+    mine = [i for i in range(len(courses))
+            if i % cfg.shards == cfg.shard and (keep is None or i in keep)]
 
     table = schema.EpisodeTable()
     interrupted = False

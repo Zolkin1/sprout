@@ -61,6 +61,9 @@ ROUNDS=$(( (NEPS + NENV - 1) / NENV ))
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$ROOT"
+#: Pin the card, so two arms can evaluate at once on a multi-GPU box. Unset leaves whatever
+#: the caller's environment says, which is the old behaviour.
+[ -n "${GPU:-}" ] && export CUDA_VISIBLE_DEVICES="$GPU"
 export PYTHONPATH=source/robot_rl:source/motion_gen
 TRK=2026-08-20_16-36-10_mode11_decor_plan_v1
 #: The comparator library. Overridable because v1 and v2 are NOT comparable courses -- v2
@@ -69,11 +72,17 @@ TRK=2026-08-20_16-36-10_mode11_decor_plan_v1
 #: An arm trained on v2 data therefore needs a v2 BASELINE, which means both arms of a
 #: comparison must name the same library here.
 CLIP=${CLIP:-clips/box2_quick_train.h5}
-GR=logs/box2/goal_regions.json
+#: The DECLARED goal spec. Overridable because it is a property of the COURSE, not of this
+#: script: the up-into-down and curb libraries carry their own (`logs/{updown,curb}/`), and
+#: pointing a run at the wrong one silently scores arrival against another course's band.
+GR=${GR:-logs/box2/goal_regions.json}
 OUT=logs/box2/quick/$TAG
 #: The distances box2_quick's tiles were built at, in TILE ORDER. The report needs them
 #: because `terrain_id` is a tile index: 3.00 m is tile 1 here and tile 3 in the full grid.
-DISTS="1.5 3.0"
+#: What this library's tiles vary, in TILE ORDER -- the report needs it because `terrain_id`
+#: is an index into it. box2_quick's two approach distances by default; the up-into-down
+#: library grids five, so a run there MUST pass its own or every tile is mislabelled.
+DISTS=${DISTS:-"1.5 3.0"}
 
 [ -f "$FM" ] || { echo "no such checkpoint: $FM" >&2; exit 2; }
 [ -f "$CLIP" ] || { echo "missing $CLIP -- build it with: python scripts/rsl_rl/make_box2_terrain.py \
@@ -84,7 +93,11 @@ mkdir -p "$OUT"
 echo "[quick] $TAG  fm=$FM  $NENV envs x $ROUNDS rounds = $((NENV * ROUNDS)) episodes/speed"
 echo "[quick]   (round-based stop; an arm compared against this one must match BOTH numbers)"
 echo "[quick]   -> $OUT"
-for spd in 0.83 1.17 1.50; do
+#: The commanded speeds, one recording each, pinned per cell. Inside every course's own band
+#: (box2 0.5-2.2, up-into-down 0.6-2.5) so the same three are comparable across them -- which
+#: is the point of not deriving them from the library here.
+SPEEDS=${SPEEDS:-"0.83 1.17 1.50"}
+for spd in $SPEEDS; do
   d="$OUT/train_v${spd}"
   if [ -f "$d/rollout_${TRK}.episodes.h5" ]; then echo "[quick] SKIP $spd (exists)"; continue; fi
   echo "[quick] speed $spd  $(date +%H:%M)"

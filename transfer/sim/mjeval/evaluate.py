@@ -72,6 +72,10 @@ GENERATOR_ONNX: str = os.path.join(
     "2026-08-25_09-03-39_plan_v1_h64_27M_nojumpoff_fm.onnx")
 
 
+#: Set once from ``--fm_onnx``; empty means use :data:`GENERATOR_ONNX`.
+_GENERATOR_OVERRIDE: str = ""
+
+
 @dataclass(frozen=True)
 class Arm:
     """One tracker to sweep, and the generator it is paired with.
@@ -101,8 +105,14 @@ class Arm:
 
     @property
     def fm_onnx(self) -> str:
-        """Absolute path to the generator, which is shared by every arm."""
-        return GENERATOR_ONNX
+        """Absolute path to the generator, shared by every arm.
+
+        Reads the module-level override rather than the constant directly, so ``--fm_onnx``
+        can name the generator a run actually scored. The arms vary the TRACKER and share one
+        generator, which was a constant because there was one; every AWR iteration now
+        exports its own, and a run has to be able to say which it used.
+        """
+        return _GENERATOR_OVERRIDE or GENERATOR_ONNX
 
 
 #: The two arms.  Same generator, same courses, same commands; the tracker is the variable.
@@ -260,6 +270,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="a terrain_class.py reference .npz; without it the n_plans* columns "
                         "are legitimately zero")
     p.add_argument("--max_courses", type=int, default=0, help="smoke run: first N courses")
+    p.add_argument("--courses", default="",
+                   help="comma-separated course NAMES to run (e.g. mjeval_box2_h040). "
+                        "--max_courses can only take a PREFIX of the catalogue, so it cannot "
+                        "select one course by name.")
+    p.add_argument("--fm_onnx", default="",
+                   help="the GENERATOR to evaluate, overriding the module default. The arms "
+                        "vary the TRACKER and share one generator, which was a constant "
+                        "because there was one; there are now many (every AWR iteration "
+                        "exports its own), and a run must be able to name the one it scored. "
+                        "It is hashed into the manifest either way.")
     p.add_argument("--max_speeds", type=int, default=0, help="smoke run: first N speeds")
     p.add_argument("--gaussian_noise", dest="zero_noise", action="store_false", default=True,
                    help="Draw the flow's x0 from a Gaussian instead of integrating from 0. "
@@ -457,7 +477,8 @@ def stage_run(out_dir: str, arms: list[Arm], args: argparse.Namespace,
             spawn_z_offset=args.spawn_z_offset,
             fm_depth_lag_steps=args.fm_depth_lag_steps,
             terrain_ref=args.terrain_ref,
-            max_courses=args.max_courses, max_speeds=args.max_speeds,
+            max_courses=args.max_courses, only_courses=args.courses,
+            max_speeds=args.max_speeds,
             shards=args.shards, shard=args.shard,
             steer_kp=args.steer_kp, steer_wz_max=args.steer_wz_max,
             cmd_hold_s=args.cmd_hold_s,
@@ -480,6 +501,12 @@ def main() -> int:
         Process exit code.
     """
     args = build_parser().parse_args()
+    if args.fm_onnx:
+        if not os.path.exists(args.fm_onnx):
+            raise SystemExit(f"--fm_onnx: no such file {args.fm_onnx}")
+        global _GENERATOR_OVERRIDE                                  # noqa: PLW0603
+        _GENERATOR_OVERRIDE = os.path.abspath(args.fm_onnx)
+        print(f"[mjeval] generator OVERRIDDEN: {_GENERATOR_OVERRIDE}")
     out_dir = args.out or os.path.join(
         REPO_ROOT, "logs", "mjeval",
         datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S"))
