@@ -432,8 +432,19 @@ rewritten offline while the motion stays exactly as recorded, which is what the 
 - The **decoration channel is VISUAL ONLY** and lives on its own prim (`decor.DECOR_PRIM_PATH`
   = `/World/decor`), which the depth cameras cast against and physics ignores. It is the one
   thing that changes what the robot SEES without changing what it stands on.
-- Walls ring the RENDERED FLOOR rather than the manifest tile, up to four per tile, and the flat
-  tiles get rooms. `test_wall_footprint.py` and `test_decor_prim_is_mandatory.py` pin both.
+- **Walls and flat rooms are OFF for v6b onward.** The pass still exists (walls ring the RENDERED
+  FLOOR rather than the manifest tile, up to four per tile; flat tiles get rooms;
+  `test_wall_footprint.py` and `test_decor_prim_is_mandatory.py` pin both), but the driver passes
+  `--no_walls --flat_room_variants 0`. Nothing in this stack avoids obstacles, so a wall is only
+  ever something to be misread as a box -- which is the live hardware symptom. The floating steps
+  and voids come from the GENERATOR (`stair_float_frac`, `stair_floor_frac`), not from decoration,
+  so they are unaffected.
+- **Stair flights land in a 4-8 ft band** (`min_tread_m` / `max_tread_m`), because that is what
+  real stairwells are. The flight is sized from the TRAVERSAL foot envelope (`anchor_mask_t == 2`),
+  never the whole clip's: measured on v6b those are 1.05 m and 2.53 m median per tile, and the
+  difference is the approach and exit wandering ~1 m BETWEEN clips on the flat PLATFORMS. Sizing a
+  flight from the whole clip is what made the shipped stairs 0.80-5.47 m wide. Platforms still
+  answer to the whole-clip envelope -- they do carry that wander.
 - `decor.py` imports NOTHING on purpose. The depth camera cfgs need the prim path at module
   scope, and importing the importer to read one string drags in `pxr` -- which, because hydra
   composes the env cfg BEFORE `AppLauncher` runs, binds pip's `usd-core` instead of Kit's and

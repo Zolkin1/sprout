@@ -509,3 +509,51 @@ def test_flat_rooms_are_decor_by_default():
                             DecorateConfig(seed=0, wall_frac=1.0, flat_room_frac=1.0,
                                            wall_collidable=True))
     assert all(o["decor"] is False for r in solid for o in r)
+
+
+def test_every_flight_lands_in_the_stair_width_band():
+    """4 ft to 8 ft, whichever arm drew.
+
+    The band is the point of the pass now: the robot is trained on stairwells the width of
+    real ones, and no arm reaches the whole tile any more. Before this, `tread_full_frac`
+    took 30% of `wide_stairs` flights all the way to the tile edge and `narrow_landing`
+    left its treads at the generated ~0.9 m, so the shipped spread was 0.80-5.47 m.
+    """
+    cfg = DecorateConfig(seed=11)
+    widths = []
+    for t in range(60):
+        tile = _tile(terrain_id=t, size_y=6.0)
+        report = decorate_transition_tile(tile, _footprint(t), cfg)
+        widths += report.tread_after
+    assert widths
+    assert min(widths) >= cfg.min_tread_m - 1e-9, f"a flight came out at {min(widths):.3f} m"
+    assert max(widths) <= cfg.max_tread_m + 1e-9, f"a flight came out at {max(widths):.3f} m"
+    # And the band is actually sampled, not collapsed onto one end by the arm weights.
+    assert max(widths) - min(widths) > 0.5 * (cfg.max_tread_m - cfg.min_tread_m)
+
+
+def test_a_flight_is_sized_from_the_TRAVERSAL_feet_not_the_whole_clip():
+    """The whole-clip envelope contains the approach and exit, which are on the PLATFORMS.
+
+    On the real library that is a 2.51 m union against 0.35 m of traversal, because the 50
+    clips sharing a tile are laterally offset from each other by ~1 m while wandering on the
+    flat -- and a staircase has no reason to span that. So a tile whose clips wander widely
+    but whose treads are walked down the middle gets a flight sized by the middle.
+    """
+    wide = TileFootprint(terrain_id=0, n_clips=10, y_min=0.6, y_max=5.4,
+                         x_min=0.0, x_max=20.0, y_min_sized=0.5, y_max_sized=5.5,
+                         tread_y_min_sized=2.7, tread_y_max_sized=3.3)
+    tile = _tile(terrain_id=0, size_y=6.0)
+    report = decorate_transition_tile(tile, wide, DecorateConfig(seed=3))
+    assert max(report.tread_after) <= 2.438 + 1e-9, (
+        "the flight was sized from the whole-clip envelope, which is 5.0 m wide here"
+    )
+    # The whole-clip envelope is still what the PLATFORMS answer to -- they do carry that wander.
+    assert max(report.platform_after) >= 4.9
+
+
+def test_the_traversal_envelope_falls_back_to_the_whole_clip_when_absent():
+    """A library with no anchor mask must not read as a tile needing no surface at all."""
+    fp = _footprint(0, lo=1.2, hi=1.8)
+    assert fp.tread_y_min_sized is None
+    assert fp.tread_envelope() == (1.2, 1.8)

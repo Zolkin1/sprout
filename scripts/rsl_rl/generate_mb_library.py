@@ -377,15 +377,28 @@ def main() -> int:
     #
     # It writes a NEW file rather than editing in place, so the undecorated output stays on disk for
     # comparison; ``--out`` is the name the rest of the pipeline should use.
+    # Resolved for d2, e AND f, because `args.out = decorated` below only carries forward inside
+    # ONE process. Run `--stage e` on its own and the gate would otherwise describe the
+    # UNDECORATED file and fail it for being undecorated -- a default path quietly naming the
+    # wrong artifact, which this repo has now been bitten by four times.
+    stem, ext = os.path.splitext(args.out)
+    decorated = f"{stem}_decor{ext}"
     if stage in ("all", "d2"):
-        stem, ext = os.path.splitext(args.out)
-        decorated = f"{stem}_decor{ext}"
         if os.path.exists(os.path.join(_REPO, decorated)):
             print(f"\n===== [decorate] {decorated} exists, skipping")
         else:
+            # NO WALLS, and no flat rooms. The stack avoids nothing (see CLAUDE.md), so a wall
+            # is only ever something to be misread as a box -- which is the live hardware
+            # symptom. What the decoration is kept for is the width variation below, and the
+            # floating steps and voids, which come from the GENERATOR (`stair_float_frac`,
+            # `stair_floor_frac`) and are unaffected by dropping the wall pass.
             _run("decorate", "decorate_terrain.py",
-                 ["--clip", args.out, "--out", decorated, "--seed", str(cfg.seed)])
+                 ["--clip", args.out, "--out", decorated, "--seed", str(cfg.seed),
+                  "--no_walls", "--flat_room_variants", "0"])
         args.out = decorated          # the gate and the report describe the FINISHED library
+
+    if stage in ("e", "f") and os.path.exists(os.path.join(_REPO, decorated)):
+        args.out = decorated
 
     # --- stage e: the LIBRARY GATE ------------------------------------------------------------------
     # Last, and it fails the build rather than printing. Everything before this is a report a human

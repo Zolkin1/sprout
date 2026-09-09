@@ -106,8 +106,10 @@ def main() -> None:
     p.add_argument("--clip", required=True, help="input clip library .h5")
     p.add_argument("--out", required=True, help="output .h5 (must not exist)")
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--tread_full_frac", type=float, default=0.30,
-                   help="fraction of wide_stairs tiles taken to the full tile width")
+    p.add_argument("--tread_band_m", type=float, nargs=2, default=(1.219, 2.438),
+                   metavar=("MIN", "MAX"),
+                   help="the stair-width band every flight lands in (m); the default is "
+                        "4 ft to 8 ft, which is what real stairwells are")
     p.add_argument("--max_clips_per_tile", type=int, default=12,
                    help="clips sampled per tile for the envelope and the check")
     p.add_argument("--no_box_variants", action="store_true",
@@ -128,7 +130,8 @@ def main() -> None:
     if os.path.exists(args.out) and not args.dry_run:
         raise FileExistsError(f"{args.out} exists; refusing to overwrite.")
 
-    cfg = DecorateConfig(seed=args.seed, tread_full_frac=args.tread_full_frac,
+    cfg = DecorateConfig(seed=args.seed, min_tread_m=float(args.tread_band_m[0]),
+                         max_tread_m=float(args.tread_band_m[1]),
                          wall_collidable=args.collidable_walls)
     prints = {fp.terrain_id: fp for fp in measure(args.clip, args.max_clips_per_tile)}
 
@@ -298,7 +301,7 @@ def main() -> None:
         f.attrs["terrain_decoration"] = json.dumps({
             "source": os.path.basename(args.clip),
             "seed": args.seed,
-            "tread_full_frac": args.tread_full_frac,
+            "tread_band_m": [float(args.tread_band_m[0]), float(args.tread_band_m[1])],
             "arms": {r.terrain_id: r.arm for r in reports.values()},
             "box_variants": box_variants,
             "wall_boxes": n_wall_boxes,
