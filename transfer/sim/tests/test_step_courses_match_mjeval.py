@@ -182,22 +182,39 @@ def test_the_apron_beside_the_flight_is_the_wall_band_and_nothing_more(courses):
             assert outer == pytest.approx(tile["size_y"] / 2.0), depth
 
 
-def test_the_walls_are_visual_only_and_span_mjevals_own_length(courses):
-    """Wall geometry, and the decor flag that makes them non-colliding in Isaac.
+def test_the_walls_span_mjevals_own_length_and_only_a_VISUAL_one_claims_the_clone(courses):
+    """Wall geometry, and the invariant that survived making them solid.
 
-    mjeval's ``lane_wall_geoms`` refuses to emit a solid one, and the reason is not
-    fastidiousness: a collidable wall touching the tread edge is swept by the reference's own
-    arm swing, which blocks a wrist, fires ``ee_pose_error`` and ends the episode for something
-    no policy could fix.  The free-form ``stairs`` family authors COLLIDABLE walls, so getting
-    this wrong here is a one-word edit that changes both the physics and the height scan.
+    mjeval's ``STAIR_WALLS`` calls visual-only "not negotiable", for one specific reason: a
+    solid wall this close to the tread edge is swept by the reference's own arm swing, which
+    blocks a wrist and fires ``ee_pose_error`` -- ending the episode for something no policy
+    could fix.  **That termination does not exist on the fine-tune task** (its enders are the
+    time-out, the absolute height floor, the tilt cone and the goal), so the failure the flag
+    guarded against cannot happen there, and solid walls buy a real signal: they enter the
+    collider SDF, so the terrain reward charges a plan that puts a limb inside one.
+
+    What still has to hold is the CLAIM: solid walls are different physics, so a tile carrying
+    them must not advertise itself as an mjeval clone -- a rate measured against solid walls
+    cannot be read against an mjeval rate. That implication is what this pins, in both
+    directions, rather than the flag's value.
     """
     for depth in courses:
+        for collidable in (False, True):
+            tile = sc.make_updown_tile(0, mj_terrains.X_START, depth,
+                                       wall_collidable=collidable)
+            walls = [o for o in tile["overlays"] if o["kind"] == "obstacle"]
+            assert len(walls) == 2, depth
+            for w in walls:
+                assert w["decor"] is (not collidable), (depth, collidable)
+                assert w["walkable_top"] is False
+            claim = tile["updown"]["mjeval_course"]
+            assert bool(claim) is (not collidable), (
+                f"a tile with collidable={collidable} walls claims mjeval_course={claim!r}; "
+                "solid walls are different physics and must not advertise the clone.")
+        # And the geometry itself is mjeval's under either flag -- only the collider differs.
         tile = sc.make_updown_tile(0, mj_terrains.X_START, depth)
         walls = [o for o in tile["overlays"] if o["kind"] == "obstacle"]
-        assert len(walls) == 2, depth
         for w in walls:
-            assert w["decor"] is True, "a colliding stairwell wall ends episodes unfixably"
-            assert w["walkable_top"] is False
             assert w["size_xyz"][1] == pytest.approx(freeform.WALL_T_M)
             assert w["size_xyz"][2] == pytest.approx(mj_terrains.STAIR_WALL_HEIGHT)
             # mjeval's span: lead before the first riser, `steps * run * 2 + platform` after it.
@@ -271,7 +288,10 @@ def test_the_two_platform_depths_cannot_pool():
         assert fam == f"updown_p{int(round(d * 10)):03d}"
         assert _course(d).name == f"mjeval_{fam.replace('updown', 'updn')}"
         assert sc.make_updown_tile(0, 2.5, d)["family"] == fam
-        assert sc.make_updown_tile(0, 2.5, d)["updown"]["mjeval_course"] == _course(d).name
+        # The clone CLAIM belongs to mjeval's own configuration, which is visual walls --
+        # solid ones are different physics and withhold it (see the wall test).
+        assert sc.make_updown_tile(0, 2.5, d, wall_collidable=False
+                                   )["updown"]["mjeval_course"] == _course(d).name
 
 
 def test_a_lengthened_runout_takes_its_own_family_and_disclaims_mjeval():
@@ -281,11 +301,14 @@ def test_a_lengthened_runout_takes_its_own_family_and_disclaims_mjeval():
     tile dict, so a key added unconditionally moves the fingerprint of geometry that has not
     changed and strands every rollout already recorded against it (box2 paid this once).
     """
-    base = sc.make_updown_tile(0, 2.5, 2.0)
+    # `wall_collidable=False` throughout, so the only thing under test is the RUNOUT: the
+    # wall flag withholds the mjeval claim on its own, and leaving it at the default would
+    # make this test pass for the wrong reason.
+    base = sc.make_updown_tile(0, 2.5, 2.0, wall_collidable=False)
     assert "runout_m" not in base["updown"]
     assert base["updown"]["mjeval_course"] == "mjeval_updn_p020"
 
-    longer = sc.make_updown_tile(0, 2.5, 2.0, runout_m=3.0)
+    longer = sc.make_updown_tile(0, 2.5, 2.0, runout_m=3.0, wall_collidable=False)
     assert longer["updown"]["runout_m"] == pytest.approx(3.0)
     assert longer["updown"]["mjeval_course"] == ""
     assert longer["family"] != base["family"]

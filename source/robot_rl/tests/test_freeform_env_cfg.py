@@ -166,17 +166,23 @@ def test_the_episode_is_bounded_by_the_goal_band_not_by_a_clip_running_out(cfgs)
 
     ``time_out=True`` bootstraps the value from the final state, so walking the section is
     neither punished nor paid and the return does not become a function of section LENGTH
-    (10-38 m across this terrain set). The two FAILURE terms are inherited untouched -- they
-    never referred to a clip.
+    (10-38 m across this terrain set). The THREE failure terms are inherited untouched -- none
+    of them ever referred to a clip.
+
+    `base_upright` is the third: a slack 70 deg world-upright backstop covering the blind spot
+    in the absolute height term, which cannot see a collapse on RAISED ground (the
+    up-into-down platform is 0.90 m up, a box top 0.40). It is pinned here because the
+    termination SET is what decides how an episode can end, and a term silently added or
+    dropped changes every outcome table without changing any number's shape.
     """
     freeform, clip = cfgs
     assert freeform.terminations.clip_end is None
     assert freeform.terminations.goal_reached.time_out is True
     assert _active(freeform.terminations) == [
-        "time_out", "base_height", "base_tilt_error", "goal_reached",
+        "time_out", "base_height", "base_tilt_error", "base_upright", "goal_reached",
     ]
     assert _active(clip.terminations) == [
-        "time_out", "clip_end", "base_height", "base_tilt_error",
+        "time_out", "clip_end", "base_height", "base_tilt_error", "base_upright",
     ]
 
 

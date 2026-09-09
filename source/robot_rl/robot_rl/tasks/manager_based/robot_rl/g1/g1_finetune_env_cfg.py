@@ -116,6 +116,34 @@ class G1FinetuneTerminationCfg:
         params={"command_name": "traj_ref", "max_tilt_rad": 1.047},
     )
 
+    #: A SLACK backstop on world upright, 70 deg per axis, kept BESIDE the reference-relative
+    #: attitude test rather than replacing it.
+    #:
+    #: **What it exists for is a hole in the absolute HEIGHT term.** That term is world z, so
+    #: it only fires when the pelvis drops under 0.3 m -- which a collapse on RAISED ground
+    #: never does. On the up-into-down course the spawn platform is 0.90 m up, so a robot that
+    #: falls over up there sits at ~0.90 m and the height detector cannot see it; the same
+    #: applies to a fall on a 0.40 m box top. Before this, such a fall was caught only by the
+    #: reference-relative cone, which is a comparison against a prediction and therefore goes
+    #: quiet exactly when the generator's plan has also fallen apart.
+    #:
+    #: **The class docstring's objection is to a TIGHT cone, not to this one.** A fixed cone
+    #: around world upright cannot bound healthy terrain motion -- climbing and jumping pitch
+    #: the base deliberately -- so it is either tripped by good behaviour or slackened until it
+    #: catches nothing. 70 deg is the slackened end ON PURPOSE: it is far outside any
+    #: deliberate pitch (a stair climb is ~20-30 deg, a box jump ~40) and inside a face-plant.
+    #: It is a second opinion on a genuine collapse, not an attitude budget.
+    #:
+    #: PER-AXIS roll and pitch, matching `base_fallen`'s convention rather than the cone the
+    #: two `max_tilt_rad` terms use -- so a combined 60/60 (about 76 deg from vertical) passes
+    #: it. That is looser than "70 deg from vertical" and is the documented
+    #: `TODO(align-tilt-convention)`; acceptable because this is a backstop, and a true cone
+    #: would be the stricter of the two.
+    base_upright = DoneTerm(
+        func=mdp.base_orientation_from_upright,
+        params={"roll_limit_deg": 70.0, "pitch_limit_deg": 70.0},
+    )
+
 
 ##
 # Commands

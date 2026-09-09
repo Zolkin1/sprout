@@ -140,3 +140,70 @@ def test_the_task_is_registered():
     spec = gym.spec("G1-teacher-clf-terrain-depth-finetune")
     assert "g1_finetune_env_cfg:G1FinetuneTerrainDepthEnvCfg" in spec.kwargs["env_cfg_entry_point"]
     assert "FinetunePPORunnerCfg" in spec.kwargs["rsl_rl_cfg_entry_point"]
+
+
+def test_a_slack_world_upright_backstop_covers_the_height_terms_blind_spot():
+    """The absolute height term cannot see a fall on RAISED ground, so a backstop is needed.
+
+    `base_height_below_termination` is world z below 0.3 m, which a collapse on the
+    up-into-down course's 0.90 m spawn platform -- or on a 0.40 m box top -- never reaches.
+    Before `base_upright` such a fall was caught only by the reference-relative cone, which is
+    a comparison against a PREDICTION and therefore goes quiet exactly when the generator's
+    plan has also fallen apart.
+
+    It has to be SLACK. The termination cfg's own docstring records why a tight cone around
+    world upright cannot work on terrain -- climbing and jumping pitch the base deliberately --
+    so this pins both directions: nothing fires at a deliberate terrain pitch, and a
+    face-plant does.
+    """
+    import math
+
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_finetune_env_cfg import (
+        G1Box2FinetuneEnvCfg,
+    )
+    from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import (
+        base_orientation_from_upright,
+    )
+
+    cfg = G1Box2FinetuneEnvCfg()
+    term = getattr(cfg.terminations, "base_upright", None)
+    assert term is not None, "the world-upright backstop is gone"
+    assert term.params["roll_limit_deg"] == 70.0
+    assert term.params["pitch_limit_deg"] == 70.0
+    # It must NOT replace either of the other two -- it is a third opinion, not a swap.
+    assert cfg.terminations.base_height is not None
+    assert cfg.terminations.base_tilt_error is not None
+    # And `base_height` specifically must survive under that NAME: `record_rollouts` resolves
+    # the fall term by name (`base_fallen` on the tracker, `base_height` here) and refuses a
+    # task carrying neither.
+    assert cfg.terminations.base_height.params["min_height"] == 0.3
+
+    class _Asset:
+        def __init__(self, quat):
+            self.data = type("D", (), {"root_quat_w": quat})()
+
+    class _Env:
+        def __init__(self, quat):
+            self.scene = {"robot": _Asset(quat)}
+
+    import numpy as np
+    import warp as wp
+
+    def fires(pitch_deg: float) -> bool:
+        """Whether the backstop trips at a pure pitch of `pitch_deg`.
+
+        The quaternion is XYZW, which is what `root_quat_w` carries, and it is handed over as
+        a WARP array because the termination reads it through `wp.to_torch` -- so this
+        exercises the shipped function rather than a re-derivation of its arithmetic.
+        """
+        h = math.radians(pitch_deg) / 2.0
+        q = np.array([[0.0, math.sin(h), 0.0, math.cos(h)]], dtype=np.float32)
+        return bool(base_orientation_from_upright(
+            _Env(wp.array(q, dtype=wp.float32)), 70.0, 70.0)[0])
+
+    # A stair climb is ~20-30 deg and a box jump ~40: healthy terrain motion, must not fire.
+    for healthy in (0.0, 20.0, 30.0, 40.0, 55.0):
+        assert not fires(healthy), f"the backstop fires at a deliberate {healthy} deg pitch"
+    # A face-plant does.
+    for fallen in (75.0, 90.0, 120.0):
+        assert fires(fallen), f"a {fallen} deg pitch is not caught"

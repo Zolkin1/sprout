@@ -89,6 +89,13 @@ def parse_args() -> argparse.Namespace:
                         "adds 3.0, because at 0.0 the goal band starts 0.5 m past the last "
                         "riser and a robot still stumbling off the flight scores the same as "
                         "one that recovered. A non-zero value takes its own family.")
+    p.add_argument("--visual_walls", action="store_true",
+                   help="Author the stairwell walls as DECOR (no collider), which is mjeval's "
+                        "configuration and what makes a tile an mjeval clone. Default is solid: "
+                        "the reason mjeval calls visual-only non-negotiable is `ee_pose_error`, "
+                        "a termination the fine-tune task does not have. Solid walls enter the "
+                        "collider SDF, so the terrain reward charges a plan that puts a limb "
+                        "inside one.")
     p.add_argument("--no_walls", action="store_true",
                    help="updown only: omit the visual-only stairwell walls. They are what "
                         "mjeval has, and a wall is the vertical surface the generator is known "
@@ -174,7 +181,8 @@ def _resolve(args: argparse.Namespace) -> dict:
                   else sc.UPDOWN_TRAIN_APPROACHES_M)
     walls = not args.no_walls
     family = sc.updown_family(depth, args.runout)
-    kw = {"runout_m": args.runout, "walls": walls}
+    kw = {"runout_m": args.runout, "walls": walls,
+          "wall_collidable": not bool(args.visual_walls)}
     return {
         "prefix": args.prefix or family,
         "family": family,
@@ -183,8 +191,12 @@ def _resolve(args: argparse.Namespace) -> dict:
                    "rise_m": sc.UPDOWN_RISE_M, "run_m": sc.UPDOWN_RUN_M,
                    "steps": int(sc.UPDOWN_STEPS), "width_m": sc.UPDOWN_WIDTH_M,
                    "walls": bool(walls),
+                   "wall_collidable": bool(walls and not args.visual_walls),
+                   # Agrees with `make_updown_tile`'s own claim, which needs BOTH the
+                   # default runout and visual walls -- solid walls are different physics.
                    "mjeval_course": (f"mjeval_updn_p{int(round(float(depth) * 10)):03d}"
-                                     if args.runout == sc.UPDOWN_RUNOUT_M else "")},
+                                     if (args.runout == sc.UPDOWN_RUNOUT_M
+                                         and (args.visual_walls or not walls)) else "")},
         # The commanded band is a property of the COURSE and is stamped, so a runner reads
         # it rather than restating it -- see `clip_io.read_commanded_speed_range`. The
         # holdout keeps a single pinned speed: it is a held-out INITIAL CONDITION, and

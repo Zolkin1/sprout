@@ -313,6 +313,27 @@ UPDOWN_WALLS: bool = True
 #: module docstring for why that 0.5 m is a route past the staircase on this course and not on
 #: that one.  The consequence is neat rather than merely acceptable: the apron IS exactly where
 #: the (visual-only) walls stand, so every walkable point outside the flight is under a wall.
+#: Whether the stairwell walls are real COLLISION geometry rather than visual-only decor.
+#:
+#: ``True`` here and ``False`` in mjeval, and the divergence is deliberate rather than an
+#: oversight. mjeval's ``STAIR_WALLS`` note calls visual-only "not negotiable" for one specific
+#: reason: a solid wall this close to the tread edge is swept by the reference's own arm swing,
+#: which blocks a wrist and fires ``ee_pose_error`` -- ending the episode for something no
+#: policy could fix. **That termination does not exist on the fine-tune task**, whose only
+#: enders are the time-out, the absolute height floor, the tilt cone and the goal, so the
+#: failure the flag was protecting against cannot happen here.
+#:
+#: What making them solid buys: they enter the collider SDF, so the terrain-consistency reward
+#: charges a plan that puts a limb inside a wall -- on a 1.96 m corridor that is a real part of
+#: planning a staircase and was previously unpenalised. They also become physical, so the
+#: apron under them stops being a walkable bypass by GEOMETRY as well as by the goal band, and
+#: the privileged height scan sees them.
+#:
+#: **A tile with solid walls is NOT an mjeval clone**, and :func:`make_updown_tile` withholds
+#: the ``mjeval_course`` claim accordingly -- the two are then different physics, so a rate
+#: from one cannot be read against a rate from the other.
+UPDOWN_WALL_COLLIDABLE: bool = True
+
 UPDOWN_APRON_M: float = WALL_T_M
 
 #: Stairwell wall height (m) and how far before the first riser it begins (m).
@@ -427,6 +448,7 @@ def updown_feature_x(approach_m: float, platform_depth_m: float) -> dict[str, fl
 def make_updown_tile(terrain_id: int, approach_m: float, platform_depth_m: float, *,
                      runout_m: float = UPDOWN_RUNOUT_M,
                      walls: bool = UPDOWN_WALLS,
+                     wall_collidable: bool = UPDOWN_WALL_COLLIDABLE,
                      family: str | None = None) -> dict:
     """One up-into-down section: 6 risers up, a platform, 6 risers back down to the floor.
 
@@ -439,7 +461,9 @@ def make_updown_tile(terrain_id: int, approach_m: float, platform_depth_m: float
         approach_m: Flat run-up from the spawn to the first riser (m).
         platform_depth_m: Flat platform between the two flights (m).
         runout_m: Extra flat ground past the bottom riser (m); see :data:`UPDOWN_RUNOUT_M`.
-        walls: Author the visual-only stairwell walls; see :data:`UPDOWN_WALLS`.
+        walls: Author the stairwell walls at all; see :data:`UPDOWN_WALLS`.
+        wall_collidable: Author them as collision geometry rather than decor; see
+            :data:`UPDOWN_WALL_COLLIDABLE`.
         family: The manifest family.  ``None`` derives it with :func:`updown_family`, which is
             what keeps the two platform depths from pooling.
 
@@ -492,7 +516,8 @@ def make_updown_tile(terrain_id: int, approach_m: float, platform_depth_m: float
             overlays.append(_overlay(
                 (wx0 + wx1) / 2.0, cy + sign * (UPDOWN_WIDTH_M / 2.0 + WALL_T_M / 2.0), 0.0,
                 wx1 - wx0, WALL_T_M, UPDOWN_WALL_HEIGHT_M,
-                kind="obstacle", walkable_top=False, decor=True))
+                kind="obstacle", walkable_top=False,
+                decor=not bool(wall_collidable)))
 
     # Half the CORRIDOR, floored at what the RL termination clamps up to -- not mjeval's 2.5 m.
     # See the module docstring for why the two harnesses differ here on purpose.
@@ -536,14 +561,19 @@ def make_updown_tile(terrain_id: int, approach_m: float, platform_depth_m: float
         "platform_x": [f["platform_x0"], f["platform_x1"]],
         "bottom_x": f["bottom_x"],
         "walls": bool(walls),
+        "wall_collidable": bool(walls and wall_collidable),
         "spawn_areas": len(areas),
         "top_spawn_half_xy": [half_x, half_y],
         "goal_rect_centre_x": goal_x + GOAL_DEPTH_M / 2.0,
         "goal_depth_m": GOAL_DEPTH_M,
         # Only the DEFAULT runout is mjeval's course, and only then does the tile claim to be
         # it -- so a lengthened-runout recording cannot be read as an mjeval clone.
+        # Claimed only by a tile that really IS the mjeval course: its runout AND its wall
+        # collidability both have to match, because solid walls are different physics and a
+        # rate measured against them cannot be read as an mjeval rate.
         "mjeval_course": (f"mjeval_updn_p{int(round(float(platform_depth_m) * 10)):03d}"
-                          if abs(float(runout_m) - UPDOWN_RUNOUT_M) < 1e-9 else ""),
+                          if (abs(float(runout_m) - UPDOWN_RUNOUT_M) < 1e-9
+                              and not (walls and wall_collidable)) else ""),
     }
     # Recorded ONLY when it is not the default, and that asymmetry is deliberate:
     # `fingerprint_terrain_manifest` hashes the whole tile dict, so a key added unconditionally
@@ -558,6 +588,7 @@ def make_updown_tile(terrain_id: int, approach_m: float, platform_depth_m: float
 def generate_updown_manifest(approaches_m: tuple[float, ...], platform_depth_m: float, *,
                              runout_m: float = UPDOWN_RUNOUT_M,
                              walls: bool = UPDOWN_WALLS,
+                             wall_collidable: bool = UPDOWN_WALL_COLLIDABLE,
                              family: str | None = None) -> list[dict]:
     """One tile per approach distance at one platform depth, in the order given.
 
@@ -582,5 +613,5 @@ def generate_updown_manifest(approaches_m: tuple[float, ...], platform_depth_m: 
         raise ValueError("no approach distances given; an up-into-down library needs at least "
                          "one tile.")
     return [make_updown_tile(i, a, platform_depth_m, runout_m=runout_m, walls=walls,
-                             family=family)
+                             wall_collidable=wall_collidable, family=family)
             for i, a in enumerate(approaches_m)]
