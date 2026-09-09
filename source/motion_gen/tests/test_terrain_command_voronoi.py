@@ -98,13 +98,13 @@ def test_asking_for_a_cell_of_a_reference_the_geometry_excludes_is_an_error():
 
 # ------------------------------------------------------------------ the sampler that uses the cell
 def test_the_schedule_never_leaves_the_cell_or_the_band():
-    import mb_terrain_clips as mtc
+    from motion_gen import command_schedule as mtc
 
     rng = np.random.default_rng(0)
     for cell, band in (((0.5, float("inf")), (0.2, 2.6)), ((0.0, 0.5), (0.2, 2.6)),
                        ((0.0, float("inf")), (0.2, 3.5))):
         for _ in range(50):
-            sched = mtc._interaction_schedule(rng, cell, band, 0.31, 3, 1.0)
+            sched = mtc.terrain_interaction_schedule(rng, cell, band, 0.31, 3, 1.0)
             assert sched and abs(sum(seg[0] for seg in sched) - 1.0) < 1e-6
             for _f, vx, _vy, _wz in sched:
                 assert cell[0] - 1e-9 <= abs(vx) <= cell[1] + 1e-9
@@ -112,20 +112,20 @@ def test_the_schedule_never_leaves_the_cell_or_the_band():
 
 
 def test_a_family_sign_is_carried_and_an_empty_intersection_falls_back():
-    import mb_terrain_clips as mtc
+    from motion_gen import command_schedule as mtc
 
     rng = np.random.default_rng(0)
-    back = mtc._interaction_schedule(rng, (0.0, float("inf")), (0.2, 1.0), 0.5, 2, -1.0)
+    back = mtc.terrain_interaction_schedule(rng, (0.0, float("inf")), (0.2, 1.0), 0.5, 2, -1.0)
     assert all(seg[1] < 0 for seg in back), back
     # A cell entirely above the band has no legal command; fall back to the reference's own speed.
-    fb = mtc._interaction_schedule(rng, (9.0, 10.0), (0.2, 2.6), 0.44, 3, 1.0)
+    fb = mtc.terrain_interaction_schedule(rng, (9.0, 10.0), (0.2, 2.6), 0.44, 3, 1.0)
     assert len(fb) == 3 and all(seg[1] == pytest.approx(0.44) for seg in fb)
 
 
 def test_one_segment_reproduces_the_old_constant():
-    import mb_terrain_clips as mtc
+    from motion_gen import command_schedule as mtc
 
-    sched = mtc._interaction_schedule(np.random.default_rng(3), (0.0, float("inf")),
+    sched = mtc.terrain_interaction_schedule(np.random.default_rng(3), (0.0, float("inf")),
                                       (0.2, 2.6), 0.31, 1, 1.0)
     assert len(sched) == 1 and sched[0][0] == pytest.approx(1.0)
 
@@ -139,12 +139,12 @@ def test_lateral_and_yaw_are_UNCONSTRAINED_by_the_cell():
     identically zero on every terrain clip, so the generator had never been asked to turn while a
     staircase was under it -- and could not have learned that the answer is to keep climbing.
     """
-    import mb_terrain_clips as mtc
+    from motion_gen import command_schedule as mtc
 
     rng = np.random.default_rng(1)
     seen_vy = seen_wz = False
     for _ in range(200):
-        for _f, _vx, vy, wz in mtc._interaction_schedule(
+        for _f, _vx, vy, wz in mtc.terrain_interaction_schedule(
                 rng, (0.5, float("inf")), (0.2, 2.6), 0.69, 3, 1.0,
                 vy_range=(-0.6, 0.6), wz_range=(-0.8, 0.8)):
             assert abs(vy) <= 0.6 + 1e-9 and abs(wz) <= 0.8 + 1e-9
@@ -157,9 +157,9 @@ def test_lateral_and_yaw_are_UNCONSTRAINED_by_the_cell():
 
 
 def test_the_default_ranges_are_off_so_a_caller_must_opt_in():
-    import mb_terrain_clips as mtc
+    from motion_gen import command_schedule as mtc
 
-    for _f, _vx, vy, wz in mtc._interaction_schedule(
+    for _f, _vx, vy, wz in mtc.terrain_interaction_schedule(
             np.random.default_rng(2), (0.0, float("inf")), (0.2, 2.6), 0.5, 3, 1.0):
         assert vy == 0.0 and wz == 0.0
 
@@ -167,7 +167,7 @@ def test_the_default_ranges_are_off_so_a_caller_must_opt_in():
 def test_the_schedule_lands_ONLY_on_the_replay_span():
     """vy/wz belong where the pose is world-pinned and nowhere else -- off the replay they would
     describe motion the clip does not contain."""
-    import mb_terrain_clips as mtc
+    import mb_terrain_clips as mtc          # the APPLIER stays torch-side; only the sampler moved
 
     track = torch.zeros(100)
     track[:] = 1.5

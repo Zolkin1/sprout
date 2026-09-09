@@ -97,7 +97,7 @@ def test_the_recipe_parser_refuses_a_pre_v6_recipe(tmp_path):
 
 def test_the_recipe_parser_reads_all_three_envelopes():
     ranges = tlc.read_recipe_ranges(str(_REPO / "configs" / "clip_gen" / "g1_mb_v6.yaml"))
-    assert ranges["flat_vx_range"] == (-1.0, 3.6)
+    assert ranges["flat_vx_range"] == (-1.0, 2.5)
     assert ranges["flat_vy_range"] == (-0.6, 0.6)
     assert ranges["flat_wz_range"] == (-0.8, 0.8)
 

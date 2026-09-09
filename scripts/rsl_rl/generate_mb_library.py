@@ -308,6 +308,11 @@ def main() -> int:
                     "--source", args.source, "--terrain-lib", args.library,
                     "--terrain-skills", direction, "--out", pure_h5,
                     "--n-tiles", str(cfg.pure_stair_tiles),
+                    # The SAME command variation the transition traversals get -- a pure tile's
+                    # replay is equally fixed, so the same argument applies.
+                    "--cmd-segments", str(cfg.terrain_cmd_segments),
+                    "--cmd-vy-range", *(str(v) for v in cfg.terrain_cmd_vy_range),
+                    "--cmd-wz-range", *(str(v) for v in cfg.terrain_cmd_wz_range),
                     "--clips-per-tile", str(cpt),
                     "--stair-vel-range", *(str(v) for v in cfg.stair_vel_range),
                     "--pure-seconds", str(cfg.pure_seconds),

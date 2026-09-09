@@ -46,7 +46,8 @@ from motion_gen.ingest.terrain_ingest import ingest_terrain_library
 from motion_gen.joint_names import world_position_channels
 from motion_gen.library_metadata import read_library_metadata
 from motion_gen.terrain.box_clip import build_anchor_mask_t, stair_tile_boxes
-from motion_gen.terrain.terrain_place import place_periodic_on_tile
+from motion_gen import command_schedule as cs
+from motion_gen.terrain.terrain_place import place_periodic_on_tile, speed_cell_from
 from motion_gen.terrain.terrain_sampler import sample_stair_tiles
 from motion_gen.world_lift import _ANCHOR_MASK_BOX
 
@@ -93,7 +94,7 @@ def _achieved_vx(Wp, dt: float) -> float:
     return float((Wp[-1, 0] - Wp[0, 0]) / max((n - 1) * float(dt), 1e-6))
 
 
-def _pure_clip(builder, ts, tile, args, dev, steady_vx: float) -> dict:
+def _pure_clip(builder, ts, tile, args, dev, steady_vx: float, cell: tuple) -> dict:
     """One looped-traversal clip on a fixed pure stair ``tile`` -> record dict.
 
     The tile's geometry is authored from the tile, not the motion, and the datum is the boxes alone,
@@ -135,17 +136,40 @@ def _pure_clip(builder, ts, tile, args, dev, steady_vx: float) -> dict:
                 "overlays": overlays, "frame_yaw": 0.0, "has_floor": bool(tile.has_floor)}
     # ONE constant command, equal to the speed the looped traversal ACTUALLY achieves.
     #
-    # A pure tile is stairs from the first frame to the last, and its motion is a fixed looped
-    # replay -- it cannot track a command at all. So the rule "the motion tracks the command except
-    # where terrain overrides" means the override covers the WHOLE clip here, and a varying command
-    # would be misaligned for 100% of it: the worst case, not a feature. (An earlier version did
-    # exactly that.) Pinning the command to the achieved speed instead makes it aligned by
-    # construction, which is the closest a pure tile can get to the contract.
+    # THE COMMAND VARIES ACROSS THE TRAVERSAL, and this REVERSES an earlier decision here.
     #
-    # ``steady_vx`` -- the speed the tile's reference was SELECTED for -- is only the nearest solved
-    # stride, so it is not what the motion does; measuring the placement is.
+    # What used to be written: "a pure tile is stairs from the first frame to the last, and its
+    # motion is a fixed looped replay -- it cannot track a command at all, so a varying command would
+    # be misaligned for 100% of it: the worst case, not a feature." The command was therefore pinned
+    # to the traversal's own achieved speed.
+    #
+    # That argument was right about the FACT and wrong about the conclusion, and the transition
+    # families are what settled it. Their replays are equally fixed and equally unable to track, and
+    # they now carry several commands each -- because a generator only ever shown a command that
+    # matches its motion cannot learn that a command SELECTS a reference, which is most of what it
+    # has to do on terrain. The misalignment is the training signal, not the defect.
+    #
+    # Leaving pure stairs pinned made it worse than merely inconsistent: 1500 clips, 15% of the
+    # library, were the one place where command and motion always agreed exactly -- and they are all
+    # STAIRS, so the generator's largest single block of staircase experience taught it a rule that
+    # is false on every transition tile and false at deploy. Measured on the v6b build, the pure
+    # families spanned 0.30-0.69 m/s of commanded speed against 0.20-2.60 for the transitions.
+    #
+    # The constraint is the same one the transitions use: every value lies inside the played
+    # reference's Voronoi cell (``terrain_place.terrain_speed_cell``), so the command may disagree
+    # with the motion but never points at a DIFFERENT solved reference.
+    sched = cs.terrain_interaction_schedule(
+        np.random.default_rng([int(args.tile_seed), int(tile.terrain_id), int(round(steady_vx * 1e4))]),
+        cell, tuple(args.stair_vel_range), abs(float(_achieved_vx(Wp, float(args.dt)))),
+        int(args.cmd_segments), 1.0,
+        vy_range=tuple(args.cmd_vy_range), wz_range=tuple(args.cmd_wz_range))
     tvel = torch.zeros(T, 3, dtype=torch.float32, device=dev)
-    tvel[:, 0] = float(_achieved_vx(Wp, float(args.dt)))
+    t0 = 0
+    for k, (frac, vx, vy, wz) in enumerate(sched):
+        t1 = T if k == len(sched) - 1 else min(T, t0 + int(round(float(frac) * T)))
+        if t1 > t0:
+            tvel[t0:t1, 0], tvel[t0:t1, 1], tvel[t0:t1, 2] = float(vx), float(vy), float(wz)
+        t0 = t1
     return {"y": y, "dy": dy, "contact": contact, "anchor_mask_t": amt, "target_vel": tvel,
             "terrain_id": int(tile.terrain_id), "n": T, "manifest": manifest, "name": ts.name,
             "corner": (float(corner[0]), float(corner[1]))}
@@ -208,6 +232,12 @@ def main() -> int:
                    metavar=("MIN", "MAX"),
                    help="Commanded speed band. SAME flag and default as mb_plan_library, so the "
                         "pure and transition stair families share one band by construction.")
+    p.add_argument("--cmd-segments", type=int, default=2,
+                   help="Command segments across a pure traversal. The motion is one fixed replay and this changes none of it -- only target_vel. Pinning the command to the achieved speed (what this used to do) made 15%% of the library the one place command and motion always agreed, and all of it stairs. 1 restores the old behaviour.")
+    p.add_argument("--cmd-vy-range", type=float, nargs=2, default=(-0.6, 0.6), metavar=("MIN","MAX"),
+                   help="Lateral command on a pure traversal. Moves nothing -- the replay is world-pinned -- which is exactly why the generator must see it to learn to ignore it.")
+    p.add_argument("--cmd-wz-range", type=float, nargs=2, default=(-0.8, 0.8), metavar=("MIN","MAX"),
+                   help="Yaw-rate command on a pure traversal; same reasoning as --cmd-vy-range.")
     p.add_argument("--pure-seconds", type=float, default=6.0,
                    help="Tile LENGTH, expressed as seconds at the stride's horizontal speed. Note "
                         "the resulting CLIP runs about 2x longer than this: climbing covers ground "
@@ -289,9 +319,13 @@ def main() -> int:
             # Nearest geometry, then nearest natural speed within it.
             key = min(variants, key=lambda k: (k[0] - tile.step_height) ** 2
                       + (k[1] - tile.step_depth) ** 2)
-            ts = min(variants[key], key=lambda sv: abs(sv[1] - vx))[0]
+            ts, ts_vx = min(variants[key], key=lambda sv: abs(sv[1] - vx))
+            # The speeds that would have selected THIS reference at THIS geometry -- the same
+            # Voronoi rule the transition families use, applied to the candidate list this inline
+            # nearest-geometry pick produced.
+            cell = speed_cell_from([v for _, v in variants[key]], ts_vx)
             try:
-                tile_recs.append(_pure_clip(builder, ts, tile, args, dev, vx))
+                tile_recs.append(_pure_clip(builder, ts, tile, args, dev, vx, cell))
             except Exception as e:                      # noqa: BLE001 -- skip the clip, keep the tile
                 print(f"[pure][WARN] tile {tile.terrain_id} vx={vx:.2f}: skipped ({e})")
         if not tile_recs:

@@ -18,7 +18,10 @@ seed: 0
 clips_per_tile: 4
 stair_tiles: 2                 # TRANSITION stair tiles per direction (up/down)
 pure_stair_tiles: 2
-box_tiles: [2, 1, 1]         # jump_on, jump_off, jump_off_front
+box_tiles: [2, 0, 1]        # jump_on, jump_off, jump_off_front. jump_off is 0 to
+                              # match the full recipe -- a smoke build that exercises a
+                              # family the real one no longer produces is not a smoke test
+                              # of the real build.         # jump_on, jump_off, jump_off_front
 # The 20 tiles the distractor family used to hold went to TERRAIN, because a tile is how the RL and
 # the FM see geometry: each one carries its own corridor width, platform widths, step count,
 # floor-or-void and box height, and the importer round-robins envs over tiles. That is independent of
@@ -34,7 +37,7 @@ flat_tiles: 4
 # ---------------------------------------------------------------- flat family
 flat_loops: true              # exact looped strides + bounded MB transients
 flat_hold_s_range: [1.5, 4.0]  # s of STEADY loop per segment, before rounding to a gait phase
-flat_vx_range:  [-1.0, 3.6]    # THE DRIVER'S ENVELOPE, sampled continuously and uniformly. Not
+flat_vx_range:  [-1.0, 2.5]    # THE DRIVER'S ENVELOPE, sampled continuously and uniformly. Not
 flat_vy_range:  [-0.6, 0.6]    # what the solved library can serve -- the motion is whichever stride
 flat_wz_range:  [-0.8, 0.8]    # is nearest, and the recorded command is the continuous value. A
                                # generator only ever commanded speeds it had motions for cannot learn
@@ -54,14 +57,14 @@ flat_hop_slack: 1.15
 flat_clip_length: 20.0
 
 # ---------------------------------------------------------------- stair families
-stair_vel_range: [0.2, 2.6]
+stair_vel_range: [0.2, 2.5]
 stair_floor_frac: 0.5
 stair_float_frac: 0.3
 stair_float_thick_range: [0.03, 0.06]
 pure_seconds: 6.0
 
 # ---------------------------------------------------------------- box families
-box_vel_range: [0.2, 3.5]
+box_vel_range: [0.2, 2.5]
 box_top_vx_range: [0.2, 1.0]
 box_two_sided_frac: 0.5
 box_nav_width: -1.0

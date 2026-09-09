@@ -230,3 +230,63 @@ def as_json(schedule: Schedule) -> list[list[float]]:
 def from_json(raw) -> Schedule:
     """Inverse of :func:`as_json`."""
     return [(float(d), float(vx), float(vy), float(wz)) for d, vx, vy, wz in raw]
+
+
+def terrain_interaction_schedule(rng, cell: tuple, band: tuple, ref_speed: float, n_seg: int,
+                          sign: float, vy_range=(0.0, 0.0), wz_range=(0.0, 0.0)) -> list:
+    """``[(fraction_of_replay, vx, vy, wz)]`` -- the command while the terrain traversal plays.
+
+    The motion is a single fixed replay and nothing here changes it; this is ``target_vel`` only. What
+    it buys is the one thing a constant command cannot: the generator sees the SAME motion asked for
+    at several commands, which is what teaches it that a command selects a reference rather than
+    describing one.
+
+    **vx is constrained; vy and wz are not, and that asymmetry is the whole design.**
+
+    ``vx`` is drawn from the intersection of the played reference's VORONOI CELL
+    (:func:`terrain_place.terrain_speed_cell`) with the family's own band. Outside the cell the command
+    would point at a DIFFERENT solved motion, which teaches the opposite of the intended lesson; the
+    band keeps a stair clip from being commanded faster than any stair clip is ever generated.
+
+    ``vy`` and ``wz`` are free, because on a traversal they are unconstrained BY CONSTRUCTION: the
+    replay is world-pinned (``anchor_mask == 2``), so a lateral or yaw command cannot move the robot
+    off the tile no matter what it says. Before this they were identically zero on every terrain clip
+    -- ``tvel[:, 1:]`` was never written -- so the generator had never once been asked to turn while a
+    staircase was under it, and could not have learned that the answer is to keep climbing. It has to
+    see them to learn to ignore them.
+
+    The selector compares FORWARD speed only, so vy and wz cannot move which reference is nearest and
+    need no cell. And when a diagonal or turning stair gait is eventually solved, it slots in here
+    without changing this contract: it arrives as another candidate reference, ``terrain_speed_cell``
+    starts splitting on it, and the command that used to be ignorable starts selecting.
+
+    At most ONE of ``vy`` / ``wz`` is non-zero per segment -- the same rule the flat sampler follows,
+    and it matches the solved library exactly (zero of its cells carry both).
+
+    Segment boundaries are drawn uniformly over the replay: the motion is identical throughout, so no
+    frame is a better place for a change than any other, and a fixed fraction would be a landmark.
+    """
+    lo = max(float(cell[0]), float(min(band)))
+    hi = min(float(cell[1]), float(max(band)))
+    n = max(1, int(n_seg))
+    degenerate = not (hi > lo)
+
+    def _lat():
+        """At most one of (vy, wz), drawn from its own range; either may be zero."""
+        pick = rng.integers(0, 3)                     # 0 = straight, 1 = lateral, 2 = yaw
+        if pick == 1 and max(map(abs, vy_range)) > 0:
+            return float(rng.uniform(*vy_range)), 0.0
+        if pick == 2 and max(map(abs, wz_range)) > 0:
+            return 0.0, float(rng.uniform(*wz_range))
+        return 0.0, 0.0
+
+    cuts = sorted(float(x) for x in rng.uniform(0.0, 1.0, size=n - 1)) if n > 1 else []
+    out, prev = [], 0.0
+    for c in list(cuts) + [1.0]:
+        vx = (float(sign) * abs(float(ref_speed)) if degenerate
+              else float(sign) * float(rng.uniform(lo, hi)))
+        vy, wz = _lat()
+        out.append((float(c) - prev, vx, vy, wz))
+        prev = float(c)
+    out = [r for r in out if r[0] > 1e-6]
+    return out or [(1.0, float(sign) * abs(float(ref_speed)), 0.0, 0.0)]

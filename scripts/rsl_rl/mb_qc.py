@@ -324,14 +324,17 @@ def main() -> int:
                         "driver runs this as its last stage, so a bad library fails the build instead "
                         "of being written and looked at later -- which is how a 9.8%% flat root-speed "
                         "blow-up shipped in g1_mb_v8 and was only found by watching a clip.")
-    p.add_argument("--gate-max-root-speed", type=float, default=7.5,
+    p.add_argument("--gate-max-root-speed", type=float, default=5.5,
                    help="No clip may contain a frame faster than this (m/s). DERIVED, not sampled: an "
                         "in-betweening's travel is set by Motion Bricks' pinned target at "
                         "|v1| * DEFAULT_PLANING_HORIZON = |v1| * 1.0 m regardless of the horizon it "
                         "picks, so at the 6-token floor (0.533 s kept) its mean speed is 1.88x its own "
-                        "command -- and at the envelope's top command of 3.6 m/s that is a legitimate "
-                        "6.75 m/s. 7.5 clears it with margin and still sits far below the 19-31 m/s "
-                        "the gate exists to catch.")
+                        "command -- and at the envelope's top command of 2.5 m/s that is a legitimate "
+                        "4.7 m/s. 5.5 clears it with margin and still sits far below the 19-31 m/s the "
+                        "gate exists to catch.\n\n"
+                        "It TRACKS THE ENVELOPE, so it must move when the envelope does: it was 7.5 "
+                        "while the top command was 3.6, and came down with the cap to 2.5. A ceiling "
+                        "left behind at an old envelope stops separating anything.")
     p.add_argument("--gate-allow-undecorated", action="store_true",
                    help="Let the gate pass a library that decorate_terrain.py has never touched. Off "
                         "by default: straight out of generation every wide stair platform is stretched "

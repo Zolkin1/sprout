@@ -54,16 +54,28 @@ def test_the_full_recipe_is_200_tiles_and_10000_clips():
 def test_the_terrain_families_got_the_distractor_tiles():
     """The reallocation, stated as the shares it produces rather than as the deltas.
 
-    Before: 20+20 transition, 15+15 pure, 20/15/15 box, 60 flat, 20 distractor.
+    Two rounds of it. First the distractor family's 20 tiles went to terrain (before: 20+20
+    transition, 15+15 pure, 20/15/15 box, 60 flat, 20 distractor). Then jump_off was cut to ZERO and
+    pure stairs halved, and both refunds went to the four families that matter on hardware.
     """
     c = _cfg("g1_mb_v6.yaml")
-    assert c.stair_tiles == 26, "transition stairs should hold 26 per direction"
-    assert list(c.box_tiles) == [24, 15, 19], "jump_on / jump_off / jump_off_front"
-    assert c.pure_stair_tiles == 15 and c.flat_tiles == 60, "these were deliberately NOT changed"
-    # jump_off is not grown: DEFAULT_SKIP_FAMILIES excludes it from FM training (it drops
-    # BACKWARDS off a box and no forward-facing camera sees it). It is not cut either -- the
-    # teacher trains on it and C++ clip playback keeps the family.
-    assert c.box_tiles[1] == 15
+    assert c.stair_tiles == 33, "transition stairs, per direction"
+    assert list(c.box_tiles) == [32, 0, 26], "jump_on / jump_off / jump_off_front"
+    assert c.pure_stair_tiles == 8, "halved -- a pure tile is one long staircase and carries less "\
+                                    "geometric variety per tile than a transition tile"
+    assert c.flat_tiles == 60, "deliberately unchanged"
+
+
+def test_jump_off_is_cut_to_zero_on_purpose():
+    """It jumps BACKWARDS off a box and the robot has no rear-facing camera.
+
+    So the generator can never see what it is being asked to do there -- which is why it was already
+    in ``DEFAULT_SKIP_FAMILIES`` for FM training. Cutting it to zero stops the TEACHER spending
+    capacity on it too. Pinned as an explicit 0 rather than a missing entry, so it reads as a
+    decision and not as a reallocation accident.
+    """
+    c = _cfg("g1_mb_v6.yaml")
+    assert c.box_tiles[1] == 0
 
 
 def test_the_distractor_family_is_unreachable():
@@ -93,4 +105,6 @@ def test_every_family_gets_at_least_one_tile(recipe):
     the recipe rather than something a reallocation did by accident."""
     c = _cfg(recipe)
     assert c.stair_tiles > 0 and c.pure_stair_tiles > 0 and c.flat_tiles > 0
-    assert all(n > 0 for n in c.box_tiles), c.box_tiles
+    # jump_off (box_tiles[1]) is a DELIBERATE zero -- see test_jump_off_is_cut_to_zero_on_purpose.
+    # Every other box family must still be present.
+    assert c.box_tiles[0] > 0 and c.box_tiles[2] > 0, c.box_tiles

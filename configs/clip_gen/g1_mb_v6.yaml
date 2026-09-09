@@ -19,9 +19,20 @@ seed: 0
 
 # ---------------------------------------------------------------- scale (tiles x clips)
 clips_per_tile: 50
-stair_tiles: 26                 # TRANSITION stair tiles per direction (up/down)
-pure_stair_tiles: 15            # PURE stair tiles per direction (one long staircase, no approach)
-box_tiles: [24, 15, 19]         # jump_on, jump_off, jump_off_front
+stair_tiles: 33                 # TRANSITION stair tiles per direction (up/down)
+pure_stair_tiles: 8             # PURE stair tiles per direction (one long staircase, no approach)
+box_tiles: [32, 0, 26]          # jump_on, jump_off, jump_off_front.
+                                # jump_off is ZERO: it jumps BACKWARDS off a box, and the robot has
+                                # no rear-facing camera, so the generator can never see what it is
+                                # asked to do there. It was already in DEFAULT_SKIP_FAMILIES for FM
+                                # training, so this only stops the teacher spending capacity on it.
+                                #
+                                # Its 15 tiles and 7 per direction from pure stairs (15 -> 8) went to
+                                # the four families that matter on hardware: stair transitions
+                                # 26 -> 33 per direction (+14), jump_on 24 -> 32, jump_off_front
+                                # 19 -> 26. Total stays 200, and a tile is how the RL and the FM see
+                                # geometry -- envs round-robin over tiles, so a family's geometric
+                                # variety IS its tile count.
 # The 20 tiles the distractor family used to hold went to TERRAIN, because a tile is how the RL and
 # the FM see geometry: each one carries its own corridor width, platform widths, step count,
 # floor-or-void and box height, and the importer round-robins envs over tiles. That is independent of
@@ -41,7 +52,7 @@ flat_tiles: 60
 # while keeping the 60/40 walk/run weighting.
 flat_loops: true              # exact looped strides + bounded MB transients
 flat_hold_s_range: [1.5, 4.0]  # s of STEADY loop per segment, before rounding to a gait phase
-flat_vx_range:  [-1.0, 3.6]    # THE DRIVER'S ENVELOPE, sampled continuously and uniformly. Not
+flat_vx_range:  [-1.0, 2.5]    # THE DRIVER'S ENVELOPE, sampled continuously and uniformly. Not
 flat_vy_range:  [-0.6, 0.6]    # what the solved library can serve -- the motion is whichever stride
 flat_wz_range:  [-0.8, 0.8]    # is nearest, and the recorded command is the continuous value. A
                                # generator only ever commanded speeds it had motions for cannot learn
@@ -64,7 +75,7 @@ flat_clip_length: 20.0          # s; every flat clip is this long, all real moti
 # vel_range feeds BOTH stair families: the transition tiles (mb_plan_library, via Motion Bricks) and
 # the pure tiles (mb_pure_stair_clips, matcher-free). One band by construction -- they used to be
 # two hand-matched grids kept equal by eye.
-stair_vel_range: [0.2, 2.6]
+stair_vel_range: [0.2, 2.5]
 stair_floor_frac: 0.5           # fraction of tiles with a flat ground plane under the stairs
 stair_float_frac: 0.3           # fraction with FLOATING treads
 stair_float_thick_range: [0.03, 0.06]
@@ -72,7 +83,7 @@ pure_seconds: 6.0               # pure-tile length in s at the stride's horizont
                                 # the CLIP runs ~2x that (climbing covers ground more slowly)
 
 # ---------------------------------------------------------------- box families
-box_vel_range: [0.2, 3.5]       # GROUND-level run-up / walk-away band
+box_vel_range: [0.2, 2.5]       # GROUND-level run-up / walk-away band
 box_top_vx_range: [0.2, 1.0]    # speed ON the box top
 box_two_sided_frac: 0.5
 box_nav_width: -1.0             # -1 = derive from the tile width
