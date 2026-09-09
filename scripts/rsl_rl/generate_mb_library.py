@@ -134,7 +134,7 @@ def main() -> int:
     p.add_argument("--library", default="trajectories/skills/library_v2")
     p.add_argument("--stride-bank", default=None, help="Stride bank .npz (default <work-dir>/stride_bank.npz).")
     p.add_argument("--families-dir", default=None, help="Where the per-family .h5 go (default <work-dir>/families).")
-    p.add_argument("--stage", default="all", choices=["all", "0", "a", "b", "c", "d", "e"])
+    p.add_argument("--stage", default="all", choices=["all", "0", "a", "b", "c", "d", "e", "f"])
     p.add_argument("--device", default="cpu")
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--config", required=True,
@@ -359,6 +359,15 @@ def main() -> int:
     # that argues about quality gets switched off.
     if stage in ("all", "e"):
         _run("gate", "mb_qc.py", ["--lib", args.out, "--gate"])
+
+    # --- stage f: the REPORT ------------------------------------------------------------------------
+    # After the gate, because a library that fails the gate should not produce a reassuring picture.
+    # "Show me the distributions after a generation" is satisfied by the build rather than by
+    # remembering a tool -- which is the difference between a check that runs and one that exists.
+    if stage in ("all", "f"):
+        _run("report", "clip_library_report.py", [
+            "--lib", args.out, "--recipe", os.path.abspath(args.config),
+            "--out-dir", os.path.join(work, "report"), "--sample-viser", "5"])
 
     print(f"\n===== MB library: {args.out}  (total {time.time() - t0:.0f}s) =====")
     return 0

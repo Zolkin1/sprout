@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 
 import h5py
 import matplotlib as mpl
@@ -35,30 +37,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 # --------------------------------------------------------------------------- plot style
-mpl.rcParams.update({
-    "text.usetex": True, "font.family": "serif", "font.serif": ["Computer Modern Roman"],
-    "text.latex.preamble": r"\usepackage{amsmath} \usepackage{amssymb}",
-})
-try:
-    _f, _a = plt.subplots(); _a.set_title(r"$\alpha$"); _f.canvas.draw(); plt.close(_f)
-except Exception:
-    print("LaTeX unavailable -- falling back to mathtext.")
-    mpl.rcParams["text.usetex"] = False
-    mpl.rcParams["font.family"] = "serif"
-    mpl.rcParams["mathtext.fontset"] = "cm"
-mpl.rcParams.update({
-    "lines.linewidth": 4, "lines.markersize": 10, "lines.markeredgewidth": 2,
-    "axes.linewidth": 1.5, "axes.labelsize": 20, "axes.titlesize": 22,
-    "axes.titlepad": 12, "axes.labelpad": 8,
-    "xtick.labelsize": 16, "ytick.labelsize": 16,
-    "xtick.major.width": 1.5, "ytick.major.width": 1.5,
-    "xtick.major.size": 6, "ytick.major.size": 6,
-    "xtick.direction": "in", "ytick.direction": "in",
-    "legend.fontsize": 15, "legend.framealpha": 0.9, "legend.edgecolor": "0.4",
-    "legend.fancybox": False, "legend.handlelength": 2.0,
-    "figure.dpi": 150, "savefig.dpi": 300, "savefig.bbox": "tight", "savefig.pad_inches": 0.05,
-})
-PALETTE = ["#0077BB", "#EE7733", "#009988", "#CC3311", "#33BBEE", "#EE3377", "#BBBBBB", "#000000"]
+# The SHARED style, applied by the caller -- never at import. This module used to write rcParams at
+# module scope, which is exactly what ``plot_style``'s own docstring says poisons every other plot in
+# the process: importing this file for its ``collect()`` alone silently restyled anything else the
+# process later drew. It also carried a private PALETTE, the only copy in the repo.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from plot_style import COLOR_CYCLE as PALETTE  # noqa: E402
+from plot_style import apply_paper_style, tex_escape  # noqa: E402
 
 CHANNELS: dict[str, int] = {"vx": 0, "vy": 1, "wz": 2}
 # Coarse buckets for the grouped bar chart. Standing is split out rather than folded into
@@ -226,6 +211,7 @@ def plot(d: dict, live: list[int], channel_name: str, out: str) -> None:
 
 def main() -> int:
     """Profile a clip library's commanded speeds per terrain family."""
+    apply_paper_style()
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--clip", required=True, help="Clip library .h5 (no default on purpose).")
