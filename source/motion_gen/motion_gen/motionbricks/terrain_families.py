@@ -45,23 +45,17 @@ freedom to disagree shrinks exactly as the reason for it does.
 So a family still carries no "what does the RL see over the replay" knob: the schedule is authored by
 :mod:`scripts.rsl_rl.mb_terrain_clips`, where the reference -- and therefore the cell -- is chosen.
 
-TODO(lead-in-turning): the LEAD-UP is still forward-only, and should not stay that way -- a diagonal
-or yawing approach to terrain is wanted. ``align_boundary`` makes arrival safe by construction (it
-rotates the whole pre-anchor run onto the entry pose, and arc length >= chord means a curved approach
-covers less downrange x than a straight one, so a platform sized for the straight case contains it).
-The open parts are lateral WIDTH on box top-side segments and keeping the approach zone itself
-straight. See the note in ``mb_plan_library._rl_holds``.
 
 This module is numpy-only (no torch, no Motion Bricks, no IsaacLab imports) so it loads in the Motion
 Bricks conda env as well as in ``env_isaaclab`` -- the terrain plan (:mod:`.terrain_plan`) is built on one
 side and consumed on the other.
 
-TODO(lead-in-turning): the LEAD-UP is still forward-only and should not stay that way -- a diagonal or
-yawing approach to terrain is wanted. ``align_boundary`` makes arrival safe by construction: it
-rotates the whole pre-anchor run onto the entry pose, and arc length >= chord means a curved approach
-covers LESS downrange x than a straight one, so a platform sized for the straight case contains it.
-The open parts are lateral WIDTH on box top-side segments and keeping the approach zone itself
-straight. See the note in ``mb_plan_library._rl_holds``.
+
+
+The LEAD-UP stays forward-only by decision, not omission: diagonal and yawing approaches were scoped
+and dropped (2026-09-09), because the traversal already carries the lateral and yaw commands the
+generator needs to learn to ignore. See the note in ``mb_plan_library._rl_holds`` for why arrival
+geometry was never the obstacle.
 
 """
 
