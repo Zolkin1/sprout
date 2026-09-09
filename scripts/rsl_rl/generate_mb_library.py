@@ -12,11 +12,14 @@ stage script                                env            product
 0     ``export_stride_bank.py``             env_isaaclab   stride bank (skipped if it exists)
 a     ``mb_plan_library.py``                env_isaaclab   sampled tiles + per-clip plans + requests
 b     ``mb_terrain_segments.py --requests``  motionbricks   every unique approach / exit segment
-b     ``mb_encode.py --n-clips``             motionbricks   the flat family's raw motions
+b     ``mb_flat_clips.py --dump-plan``       env_isaaclab   the flat family's plans
+b     ``mb_flat_transients.py``              motionbricks   one segment per flat transient
 c     ``mb_assemble_library.py``             env_isaaclab   per-family TRANSITION + box ``.h5``
 c     ``mb_pure_stair_clips.py``             env_isaaclab   the PURE stair families (no MB needed)
-c     ``generate_mb_clips.py``               env_isaaclab   the flat ``.h5``
+c     ``mb_flat_clips.py --assemble``        env_isaaclab   the flat ``.h5``
 d     ``compose_terrain_library.py``         env_isaaclab   ONE training library
+e     ``mb_qc.py --gate``                    env_isaaclab   PASS/FAIL -- a bad library fails the build
+f     ``clip_library_report.py``             env_isaaclab   the figures + report.json
 ===== ===================================== ============== =========================================
 
 Every stage is skip-if-done, so a killed run resumes where it stopped, and ``--stage`` runs one stage alone
@@ -40,10 +43,18 @@ transition path uses) and folded into stage d automatically. They previously cam
 silently shipped ZERO pure stairs; ``--extra-mix`` is still there for genuinely external families.
 Example::
 
-    python scripts/rsl_rl/generate_mb_library.py \
-        --work-dir mb_raw/lib_v1 --out clips/g1_mb_v1.h5 \
+    python scripts/rsl_rl/generate_mb_library.py --config configs/clip_gen/g1_mb_v6.yaml \
+        --work-dir mb_raw/lib_v6b --out clips/g1_mb_v6b.h5 \
         --source hf/trajectories/retargeted/2026-06-13_15-10-58_merged \
-        --mb-root ../GR00T-WholeBodyControl/motionbricks --quick
+        --library trajectories/skills/library_v2 \
+        --mb-root ../GR00T-WholeBodyControl/motionbricks
+
+``--config`` is REQUIRED (``--quick`` went when the recipes arrived) and so is ``--library``: the
+solved traj-opt library is what every terrain reference is replayed from, and there is deliberately
+no default, because a stale one silently trains on motion nobody solved for this robot.
+
+THE BUILD IS NOT FINISHED WHEN THIS EXITS -- ``decorate_terrain.py`` must run on the output. Stage e
+refuses an undecorated library rather than letting one look finished; see its note.
 """
 
 from __future__ import annotations
@@ -134,7 +145,7 @@ def main() -> int:
     p.add_argument("--library", default="trajectories/skills/library_v2")
     p.add_argument("--stride-bank", default=None, help="Stride bank .npz (default <work-dir>/stride_bank.npz).")
     p.add_argument("--families-dir", default=None, help="Where the per-family .h5 go (default <work-dir>/families).")
-    p.add_argument("--stage", default="all", choices=["all", "0", "a", "b", "c", "d", "e", "f"])
+    p.add_argument("--stage", default="all", choices=["all", "0", "a", "b", "c", "d", "d2", "e", "f"])
     p.add_argument("--device", default="cpu")
     p.add_argument("--workers", type=int, default=0)
     p.add_argument("--config", required=True,
@@ -350,6 +361,26 @@ def main() -> int:
             compose += ["--flat-from", flat_h5, "--flat-tiles", str(cfg.flat_tiles),
                         "--flat-clips", str(n_flat_clips)]
         _run("compose", "compose_terrain_library.py", compose)
+
+    # --- stage d2: DECORATE ---------------------------------------------------------------------
+    # Not optional, and it used to live outside the driver -- which meant a full build could report
+    # success and hand over a library whose stair platforms are every one exactly ``size_y``. That is
+    # correct straight out of generation (both assemblers stretch them, as a safety net against a
+    # drifting segment stepping off a landing) and it is also why a REGENERATED library silently
+    # returns to a uniform world: against a 16x11 scan spanning +-0.5 m an 0.8 m flight straddles
+    # both edges in every frame, so the exteroception sees no width variation at all.
+    #
+    # It writes a NEW file rather than editing in place, so the undecorated output stays on disk for
+    # comparison; ``--out`` is the name the rest of the pipeline should use.
+    if stage in ("all", "d2"):
+        stem, ext = os.path.splitext(args.out)
+        decorated = f"{stem}_decor{ext}"
+        if os.path.exists(os.path.join(_REPO, decorated)):
+            print(f"\n===== [decorate] {decorated} exists, skipping")
+        else:
+            _run("decorate", "decorate_terrain.py",
+                 ["--clip", args.out, "--out", decorated, "--seed", str(cfg.seed)])
+        args.out = decorated          # the gate and the report describe the FINISHED library
 
     # --- stage e: the LIBRARY GATE ------------------------------------------------------------------
     # Last, and it fails the build rather than printing. Everything before this is a report a human

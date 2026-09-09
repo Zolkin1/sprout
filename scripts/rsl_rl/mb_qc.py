@@ -32,6 +32,8 @@ import argparse
 
 import numpy as np
 
+from motion_gen.terrain.decorate import has_width_variation
+
 from motion_gen.clips.clip_io import load_clip_library
 from motion_gen.world_lift import _ANCHOR_MASK_FLAT
 
@@ -327,6 +329,15 @@ def main() -> int:
                         "looped replays peak at 3.82 and the worst sound in-betweening at 4.84, so "
                         "6.0 sits above everything correct with margin; the blow-ups it exists to "
                         "catch ran 19-31.")
+    p.add_argument("--gate-allow-undecorated", action="store_true",
+                   help="Let the gate pass a library that decorate_terrain.py has never touched. Off "
+                        "by default: straight out of generation every wide stair platform is stretched "
+                        "to exactly size_y (a safety net against a drifting segment stepping off a "
+                        "landing), so an undecorated library has NO stair-width variation and no walls "
+                        "at all -- against a 16x11 scan spanning +-0.5 m an 0.8 m flight straddles both "
+                        "edges in every frame. The decoration pass is not in the build driver, so "
+                        "without this check a full build reports success and hands over a uniform "
+                        "world. Pass it only when you are deliberately inspecting the raw output.")
     p.add_argument("--gate-pelvis-band", type=float, nargs=2, default=(0.40, 0.95),
                    metavar=("MIN", "MAX"),
                    help="Pelvis height above the LOWER FOOT (m), not above the world. Absolute height "
@@ -484,6 +495,18 @@ def main() -> int:
         # and a pelvis outside the range a standing robot can occupy -- because a gate that argues
         # about quality gets turned off, and one that catches broken motion does not.
         fails = []
+        # IS THIS LIBRARY DECORATED? Asked structurally rather than by attribute, because
+        # ``has_width_variation`` reads the manifest's actual platform widths and so cannot be
+        # fooled by a flag somebody set by hand.
+        if not args.gate_allow_undecorated:
+            _man = lib.attrs.get("terrain_manifest")
+            _man = json.loads(_man) if isinstance(_man, str) else (_man or [])
+            if _man and not has_width_variation(_man):
+                fails.append(
+                    "the terrain is UNDECORATED -- every stair platform is exactly size_y, so the "
+                    "library has no width variation and no walls. Run decorate_terrain.py on it "
+                    "(then build_clutter_occupancy.py + author_clutter.py), or pass "
+                    "--gate-allow-undecorated to inspect the raw output deliberately.")
         for i in idx:
             n = int(lib.clip_len[i])
             p_xy = np.asarray(lib.y_des[i, :n, 0:2])
