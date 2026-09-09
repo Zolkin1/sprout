@@ -511,3 +511,41 @@ def test_the_approach_angle_actually_reaches_the_controller(freeform_library):
     for i in angled:
         assert float(heading_w[i]) == pytest.approx(
             layout.terrain_route[ids[i]]["start_yaw"], abs=1e-6)
+
+
+def test_the_goal_height_test_is_off_by_default_and_closes_the_ascent_hole():
+    """`freeform_goal_reached`'s height term must be opt-in, and must use the PELVIS datum.
+
+    Off by default because turning it on silently would change the termination of every
+    free-form task including arms already measured, and a success rate that moved for that
+    reason is indistinguishable from one that moved because the policy did.
+
+    Needed at all because the downrange-and-lateral test has no height: on a clip-library
+    `stairs_up` tile there is 0.90 m of open floor either side of a 2.25 m flight and
+    `min_half_width` clamps the band at least that wide, so a robot that never left the floor
+    passes the goal line and scores. The DESCENDING families are immune for a different
+    reason -- goal at floor level, spawn on the platform -- which is why this is a parameter.
+    """
+    import inspect
+
+    from robot_rl.tasks.manager_based.robot_rl.mdp.terminations import terminations as T
+
+    sig = inspect.signature(T.freeform_goal_reached)
+    assert "height_tol_m" in sig.parameters, "the height term is gone"
+    assert sig.parameters["height_tol_m"].default == 0.0, (
+        "the height term must default OFF: enabling it changes every free-form task's "
+        "termination, and every number measured before it")
+
+    src = inspect.getsource(T.freeform_goal_reached)
+    # The datum is the pelvis, not the walkable surface. `goal_z` is a SURFACE height and a
+    # standing root sits ~0.79 m above it, so a raw `root_z` vs `goal_z` comparison puts
+    # every genuine arrival outside a 0.5 m tolerance -- the asymmetry that once made every
+    # box2 arrival record as a failure.
+    assert "default_root_pose" in src, (
+        "the height test must add the asset's nominal root height, or it compares a pelvis "
+        "against a floor")
+    assert 'route["corner"]' in src and "goal_z" in src, (
+        "the goal height must sum the tile corner, the route's goal_z and the standing "
+        "height -- the same three terms freeform_goal_anchor_world uses")
+    # And it must still be an AND with the lateral/downrange test, not a replacement.
+    assert "hit = hit &" in src or "hit &" in src

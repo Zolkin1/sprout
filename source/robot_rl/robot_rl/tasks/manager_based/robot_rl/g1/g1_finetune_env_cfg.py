@@ -287,7 +287,18 @@ class G1FinetuneFreeformTerminationCfg(G1FinetuneTerminationCfg):
 
     goal_reached = DoneTerm(
         func=mdp.freeform_goal_reached,
-        params={"min_half_width": FREEFORM_GOAL_MIN_HALF_WIDTH_M},
+        params={"min_half_width": FREEFORM_GOAL_MIN_HALF_WIDTH_M,
+                # Declared at 0 (the height test OFF) rather than omitted, so it is
+                # OVERRIDABLE: hydra's struct mode refuses a key absent from the dict, and a
+                # param that cannot be set from the CLI also never reaches the run's
+                # params/env.yaml -- the only record of what a run was configured with.
+                #
+                # Turn it on where the goal is ABOVE the spawn. The downrange-and-lateral
+                # test has no height, so on a clip-library `stairs_up` tile -- 0.90 m of open
+                # floor either side of a 2.25 m flight, band clamped at least that wide -- a
+                # robot that never left the floor passes the line and scores. The descending
+                # families need it off: their goal IS at floor level.
+                "height_tol_m": 0.0},
         time_out=True,
     )
 

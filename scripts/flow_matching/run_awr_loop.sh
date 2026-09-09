@@ -73,6 +73,12 @@ PROJECT="${PROJECT:-robot_rl_awr}"
 #: lived only in whichever launcher happened to pass an override. An explicit SPEED_MIN /
 #: SPEED_MAX still wins, so a deliberate sweep is unaffected; a library that declares
 #: nothing falls back to these, which is box2's historical band.
+#: The goal's HEIGHT tolerance (m), 0 = the test off.  It has to be settable from here: on a
+#: course whose goal is ABOVE the spawn the downrange-and-lateral goal test scores a robot
+#: that never climbed, and that inflated `reached_goal` feeds the reward's success term -- so
+#: the fine-tune would be trained on arrivals that did not happen. Needed for the
+#: in-distribution `stairs_up` / `jump_on` tiles; harmless (and off) everywhere else.
+HEIGHT_TOL="${HEIGHT_TOL:-0}"
 SPEED_MIN="${SPEED_MIN:-}"
 SPEED_MAX="${SPEED_MAX:-}"
 PY="${PY:-$W/env_isaaclab/bin/python}"
@@ -155,6 +161,7 @@ echo "[awr] critic $FVI_ROUNDS FVI round(s)$([ "$PROGRESS" = "1" ] && echo ", wo
 echo "[awr] arms   camera 0.5 (dead, per-replan), history 0.0, speed-mismatch $SPEED_MISMATCH"
 echo "[awr] clip   $CLIP"
 echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
+echo "[awr] goal   height tolerance $HEIGHT_TOL m $([ "$HEIGHT_TOL" = "0" ] && echo "(height test OFF -- a goal ABOVE the spawn can be scored from the floor)" || echo "(pelvis must arrive at the goal height)")"
 echo "==================================================================="
 
 fail () { echo "[awr] FAILED at $1 (iteration $2)" >&2; exit 1; }
@@ -246,6 +253,7 @@ for (( it=1; it<=ITERS; it++ )); do
       env.commands.traj_ref.freeform_speed_min="$SPEED_MIN" \
       env.commands.traj_ref.freeform_speed_max="$SPEED_MAX" \
       env.episode_length_s=40.0 \
+      env.terminations.goal_reached.params.height_tol_m="$HEIGHT_TOL" \
       > "$INC/collect.log" 2>&1 || fail "collect (see $INC/collect.log)" "$it"
   fi
 

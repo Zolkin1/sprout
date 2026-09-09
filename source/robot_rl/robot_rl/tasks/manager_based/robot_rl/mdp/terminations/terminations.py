@@ -379,6 +379,7 @@ def base_fallen(
 def freeform_goal_reached(
     env,
     min_half_width: float = 2.5,
+    height_tol_m: float = 0.0,
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
 ) -> torch.Tensor:
     """Truncate (good termination) when the robot has walked its free-form section.
@@ -402,20 +403,40 @@ def freeform_goal_reached(
     first step past the line ENDS the episode, so a far edge could only add a way to step over
     the goal and miss it.
 
-    **There is no HEIGHT test, and that leaves a bounded hole.** The generator's containment
-    check does not filter walkable ground by height, so where ``min_half_width`` clamps a
-    narrow flight's band wider than the flight, the band overhangs onto the tile floor below --
-    measured at at most 0.1395 m per side on 5.9% of tiles, stairs only
-    (``motion_gen.terrain.freeform.GOAL_HALF_WIDTH_FLOOR_M`` carries the sweep). Inside that
-    overhang a robot on the floor, up to 4 m under the goal and having never climbed, scores
-    the same successful truncation as one on the runout. Closing it means carrying ``goal_z``
-    into ``FREEFORM_ROUTE_FIELDS`` and picking a tolerance; until then this is the bound.
+    **The HEIGHT test is OPTIONAL and off by default** (``height_tol_m = 0``), and the reason
+    to turn it on depends entirely on the terrain.
+
+    On an AUTHORED section the hole it closes is small: the band overhangs the tile floor by at
+    most 0.1395 m per side on 5.9% of tiles, stairs only
+    (``motion_gen.terrain.freeform.GOAL_HALF_WIDTH_FLOOR_M`` carries the sweep), and inside
+    that overhang a robot on the floor scores the same truncation as one on the runout.
+
+    On a section whose goal is UP -- a raised landing, a box top -- the hole is not small at
+    all, and it is the whole measurement. A clip-library ``stairs_up`` tile has 0.90 m of open
+    floor either side of a 2.25 m flight, and ``min_half_width`` clamps the band to at least
+    that, so a robot that never left the floor can pass the goal line and score. The two
+    DESCENDING families are immune for a different reason -- their goal is at floor level and
+    their spawn is on the platform, so the height change is unavoidable -- which is why this is
+    a parameter rather than a constant: it is needed exactly where the goal is above the spawn.
+
+    Off by DEFAULT because turning it on silently would change the termination of every
+    free-form task, including arms already measured, and a success rate that moved for that
+    reason is indistinguishable from one that moved because the policy did.
+
+    The datum is the PELVIS, matching :func:`~.goal_region.freeform_goal_anchor_world`: the
+    route's ``goal_z`` is the walkable SURFACE, and a standing robot's root sits a nominal
+    height above it, so comparing raw ``root_z`` against ``goal_z`` would put every genuine
+    arrival ~0.79 m outside a 0.5 m tolerance. That asymmetry already cost this stack a run
+    where every arrival recorded as a failure.
 
     Args:
         env: IsaacLab environment (``env.scene.terrain`` must carry ``terrain_route``).
         min_half_width: Floor on the band's half-extent (m), applied over each section's own
             declared ``goal_half_width``. mjeval's floor, for its reason: the widest feature in
             that catalogue is 3.96 m across, and 2.5 m clears everything with margin.
+        height_tol_m: Also require the PELVIS within this many metres of the goal's own
+            standing height.  ``0`` (default) disables the test entirely and reproduces the
+            downrange-and-lateral behaviour every existing task was measured under.
         asset_cfg: Robot scene entity.
 
     Returns:
@@ -427,4 +448,17 @@ def freeform_goal_reached(
                            torch.arange(env.num_envs, device=root_pos_w.device))
     local = tile_local_xy(route["corner"], route["frame_yaw"], root_pos_w)
     half_w = torch.clamp(route["goal_half_width"], min=float(min_half_width))
-    return (local[:, 0] >= route["goal_x"]) & ((local[:, 1] - route["goal_y"]).abs() <= half_w)
+    hit = ((local[:, 0] >= route["goal_x"])
+           & ((local[:, 1] - route["goal_y"]).abs() <= half_w))
+    if float(height_tol_m) > 0.0:
+        # The goal's own STANDING height: the tile corner, plus the route's walkable `goal_z`,
+        # plus the asset's nominal root height -- the same three terms
+        # `freeform_goal_anchor_world` sums, so the line the episode ends on and the anchor the
+        # outcome is folded against cannot disagree about where "there" is.
+        gz = route.get("goal_z")
+        nominal_z = wp.to_torch(asset.data.default_root_pose)[:, 2].to(root_pos_w.device)
+        goal_h = (route["corner"][:, 2].to(root_pos_w.device) + nominal_z
+                  + (gz.to(root_pos_w.device) if gz is not None
+                     else torch.zeros_like(nominal_z)))
+        hit = hit & ((root_pos_w[:, 2] - goal_h).abs() <= float(height_tol_m))
+    return hit
