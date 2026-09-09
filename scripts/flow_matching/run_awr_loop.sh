@@ -78,7 +78,7 @@ PROJECT="${PROJECT:-robot_rl_awr}"
 #: that never climbed, and that inflated `reached_goal` feeds the reward's success term -- so
 #: the fine-tune would be trained on arrivals that did not happen. Needed for the
 #: in-distribution `stairs_up` / `jump_on` tiles; harmless (and off) everywhere else.
-HEIGHT_TOL="${HEIGHT_TOL:-0}"
+HEIGHT_TOL="${HEIGHT_TOL:-0.0}"
 SPEED_MIN="${SPEED_MIN:-}"
 SPEED_MAX="${SPEED_MAX:-}"
 PY="${PY:-$W/env_isaaclab/bin/python}"
@@ -161,7 +161,7 @@ echo "[awr] critic $FVI_ROUNDS FVI round(s)$([ "$PROGRESS" = "1" ] && echo ", wo
 echo "[awr] arms   camera 0.5 (dead, per-replan), history 0.0, speed-mismatch $SPEED_MISMATCH"
 echo "[awr] clip   $CLIP"
 echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
-echo "[awr] goal   height tolerance $HEIGHT_TOL m $([ "$HEIGHT_TOL" = "0" ] && echo "(height test OFF -- a goal ABOVE the spawn can be scored from the floor)" || echo "(pelvis must arrive at the goal height)")"
+echo "[awr] goal   height tolerance $HEIGHT_TOL m $(awk -v v="$HEIGHT_TOL" 'BEGIN{exit !(v+0==0)}' && echo "(height test OFF -- a goal ABOVE the spawn can be scored from the floor)" || echo "(pelvis must arrive at the goal height)")"
 echo "==================================================================="
 
 fail () { echo "[awr] FAILED at $1 (iteration $2)" >&2; exit 1; }
