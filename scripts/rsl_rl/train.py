@@ -181,6 +181,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 if hasattr(term, "fm_checkpoint"):
                     term.fm_checkpoint = args_cli.fm_checkpoint
                     print(f"[INFO] fm_checkpoint='{args_cli.fm_checkpoint}' for commands.{name}.")
+
+        # The commanded-speed band of a FREE-FORM course, which the course itself declares.
+        #
+        # Under `freeform_command` the runtime draws one speed per episode from
+        # `freeform_speed_min/max`, and the band belongs to the COURSE -- a 6 x 0.15 m
+        # staircase and a two-box jump want different ones. `run_awr_loop.sh` and
+        # `run_box2_quick_eval.sh` both read the library's declaration and pass it; training
+        # did not, so a fine-tune ran at whatever `FmTrackingCommandCfg` happened to default
+        # to (0.6-2.6) while every recording and eval of the same course used the declared
+        # band. Nothing about that disagreement is visible in a run's own logs.
+        #
+        # Absence is "no opinion", never a guess: a library that declares nothing keeps the
+        # cfg default, which is the caller's own number and not a third one invented here.
+        # An explicit `env.commands.traj_ref.freeform_speed_*` on the CLI still wins -- it is
+        # detected in `hydra_args`, because hydra has already applied it to `env_cfg` by the
+        # time this runs and there is no other way to tell it from the default.
+        if args_cli.clip is not None and hasattr(env_cfg, "commands") and env_cfg.commands is not None:
+            from motion_gen.clips.clip_io import read_commanded_speed_range  # noqa: PLC0415
+
+            band = read_commanded_speed_range(args_cli.clip)
+            typed = {key for key in ("freeform_speed_min", "freeform_speed_max")
+                     if any(key in arg for arg in hydra_args)}
+            for name, term in vars(env_cfg.commands).items():
+                if not getattr(term, "freeform_command", False):
+                    continue
+                if band is not None:
+                    for key, value in zip(("freeform_speed_min", "freeform_speed_max"), band):
+                        if key not in typed:
+                            setattr(term, key, float(value))
+                    source = f"declared by {os.path.basename(args_cli.clip)}"
+                    if typed:
+                        source += f", but {sorted(typed)} overridden on the CLI"
+                else:
+                    source = f"cfg default; {os.path.basename(args_cli.clip)} declares none"
+                print(f"[INFO] commanded speed band "
+                      f"{term.freeform_speed_min:.3f}-{term.freeform_speed_max:.3f} m/s "
+                      f"for commands.{name}: {source}.")
         agent_cfg.max_iterations = (
             args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
         )

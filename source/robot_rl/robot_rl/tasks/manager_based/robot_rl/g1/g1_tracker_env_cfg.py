@@ -350,11 +350,16 @@ class G1FmTrackerTerrainDepthEnvCfg(G1TeacherTerrainDepthEnvCfg):
         # one variable it conditions on -- and a vertical surface it has never seen is what
         # it misreads as a box.
         self.scene.terrain.render_decor = True
-        # The depth teacher is a BODY-tracking env, and FmTrackingCommand refuses body mode:
-        # the body CLF grades 13 '@root' links the generator does not predict, so under
-        # strict_fm_only they would all be NaN. Nothing is lost here -- this task's CLF is
-        # diagnostic (no reward reads it) and the actor's groups are mode-independent, so a
-        # body-mode depth teacher still loads and still behaves as trained.
+        # The depth teacher is a BODY-tracking env; this task grades in JOINT mode anyway.
+        #
+        # Not because body mode is unavailable -- FmTrackingCommand supports it, deriving the
+        # 13 '@root' links the generator does not predict by FK from the base and joints it
+        # does (`_write_fm_root_body_frames`, and `_build_strict_masks` registers those slots
+        # so strict_fm_only does not NaN them). That is what the generator-graded fine-tune
+        # runs on. It is pinned here because nothing on THIS task needs it: the CLF is purely
+        # diagnostic (no reward reads it) and the actor's groups are mode-independent, so
+        # joint mode costs nothing and skips the per-step FK. Any teacher checkpoint, body- or
+        # joint-trained, still loads and still behaves as trained.
         #
         # Safe AFTER super(): _apply_tracking_mode is a validation only, and the reference
         # observation is deliberately identical in both modes (see g1_teacher_env_cfg).

@@ -696,8 +696,11 @@ def test_tracker_env_has_no_rewards_and_no_clip_graded_termination(index):
     assert cfg.commands.traj_ref.ego_anchor_fraction == 0.0
     # No default generator: a stale FM loads and predicts and is silently wrong.
     assert cfg.commands.traj_ref.fm_checkpoint == ""
-    # FmTrackingCommand refuses body mode (it predicts no '@root' links), so both variants
-    # must land on joint -- the depth env derives from the BODY teacher, which sets body.
+    # Both variants must land on JOINT even though the depth env derives from the BODY
+    # teacher, which sets body. Not because body mode is unavailable -- FmTrackingCommand
+    # derives the 13 '@root' links by FK from the joints it does predict, which is what the
+    # generator-graded fine-tune runs on -- but because nothing on this task reads the CLF,
+    # so joint mode skips the per-step FK for free.
     assert cfg.commands.traj_ref.tracking_mode == "joint"
 
 

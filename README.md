@@ -579,7 +579,7 @@ breakdown.
 rewrites `robots/g1/<robot>_<course>.xml` before loading it, and a speed sweep shares geometry,
 so the race tears the file silently. The generated scenes are derived and not committed.
 
-### 4c. Fine-tune on FREE-FORM terrain
+### 4d. Fine-tune on FREE-FORM terrain
 
 `G1-teacher-clf-terrain-depth-finetune-freeform` runs the generator-graded fine-tune on
 terrain that **no clip was ever generated for**. Every other library here exists to match one
@@ -656,6 +656,67 @@ first reset and one would never fail at all.
 are checked against the ee frames resolved from the library's OWN channel names, so the
 minimal 7-channel layout admits only a generator with no extra frames. `--like
 clips/g1_mb_v5_body_mode11_decor.h5` gives the shipped 155/137-channel, 29-joint layout.
+
+### 4e. Fine-tune the TRACKER on a fixed course, with the generator frozen
+
+The same generator-graded fine-tune, on the fixed courses the AWR work uses. `G1-box2-finetune`
+is the task for all of them -- box2, curb, up-into-down and the varied set are ordinary
+free-form libraries and every term reads them unchanged, but only this task restores the
+policy's FAR camera, and without it no tracker checkpoint on disk loads at all (they expect
+3002 policy inputs where a near-only task builds 2222).
+
+**This is the mirror image of the AWR generator loop, and the two compose by flag.**
+`run_awr_loop.sh` freezes the TRACKER (`TRK=`) and improves the generator; this freezes the
+GENERATOR (`--fm_checkpoint`) and improves the tracker. Alternating them is manual and
+deliberate -- hand each side the other's newest artifact.
+
+```bash
+# Verify first: the generator is what gets graded, and the body links reach the CLF.
+PYTHONPATH=source/robot_rl:source/motion_gen python -u \
+    scripts/rsl_rl/verify_finetune_grades_fm.py \
+    --clip clips/varied60_train.h5 \
+    --fm_checkpoint logs/flow_matching/<fm run>/best.pt
+
+# Then fine-tune a trained depth teacher against that frozen generator.
+PYTHONPATH=source/robot_rl:source/motion_gen python -u scripts/rsl_rl/train.py \
+    --task=G1-box2-finetune \
+    --clip clips/varied60_train.h5 --clip_device cpu \
+    --fm_checkpoint logs/flow_matching/<fm run>/best.pt \
+    --load_run 2026-08-20_16-36-10_mode11_decor_plan_v1 --checkpoint model_19999.pt --resume \
+    --num_envs 4096 --headless \
+    agent.algorithm.learning_rate=1e-4
+```
+
+**`--checkpoint` is REQUIRED, and leaving it off fails in a way that reads as a broken task.**
+`train.py` loads the critic unconditionally (`FinetunePPORunnerCfg.load_critic = False` is
+honoured by `play.py` and `record_rollouts.py`, not by the train path), and the free-form critic
+is 1961 wide -- while `model_19999_padded.pt`, left over from the deleted clip-graded design
+(`pad_critic_for_finetune.py`, removed at `2dc81f16`), carries a 2533-wide one and **sits inside
+the teacher's own run directory**, where it wins the default checkpoint glob. So
+`--load_run <teacher> --resume` alone picks the padded file and dies with
+`size mismatch for mlp.0.weight ... [1024, 2533] vs [1024, 1961]`, thousands of lines into a
+Kit log. Name the unpadded checkpoint. The teacher must also be **body-mode**:
+`tracking_error_local` is 168 wide in body mode and 118 in joint.
+
+**A failed `train.py` still exits 0.** Kit shuts itself down and replaces the code, so a
+traceback does not propagate -- grep the log for `Traceback`, do not trust `$?`. (The same
+shape is why `verify_finetune_grades_fm.py` closes the app before setting its own exit code.)
+
+**`learning_rate=1e-4` on the first pass is not optional.** The LR is *not* inherited from the
+checkpoint -- it comes from the agent cfg at `1e-3` with an adaptive schedule whose floor is
+hardcoded at `1e-5` in rsl-rl -- and descending to that floor takes ~12 updates, so a converged
+policy runs hot for the first ~12 steps. The action std *is* inherited, and
+`critic_warmup_iterations = 30` runs first (entropy is bit-constant across the warm-up, since
+it depends only on `log_std`, so that is the freeze test).
+
+**Do not read `Episode_Reward/*` or `Train/mean_episode_length` early.** Both count only
+COMPLETED episodes, so before ~iteration 15 they are biased hard toward early failures.
+`Loss/learning_rate` and the KL are trustworthy immediately.
+
+**The course declares its own commanded-speed band** and `train.py` now reads it
+(`clip_io.read_commanded_speed_range`), printing the resolved band and whether it was declared;
+`varied60` and the `updown_*` libraries declare 0.6-2.5 m/s, box2 and curb declare none and keep
+the cfg default. An explicit `env.commands.traj_ref.freeform_speed_min=...` still wins.
 
 ### 5. Hardware
 
