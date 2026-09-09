@@ -118,12 +118,17 @@ def fig_commanded_vx(rep: dict, recipe: dict | None):
     zero = float(np.mean(np.abs(vx) <= 1e-9)) if vx.size else 0.0
     ax.set_xlabel(r"commanded $v_x$ (m/s)")
     ax.set_ylabel("share of moving time")
-    h, _ = np.histogram(moving, bins=edges)
+    # The DRAWN grid is deliberately wider than the envelope, so its edges are visible. The
+    # STATISTICS are over the declared envelope only: bins outside it are empty by design, and
+    # counting them reported 6 empty bins forever regardless of what was built.
+    slo, shi = recipe["flat_vx_range"] if recipe else (float(edges[0]), float(edges[-1]))
+    h, _ = np.histogram(moving, bins=np.arange(float(slo), float(shi) + 1e-9, 0.2))
     sh = h / max(h.sum(), 1)
     nz = sh[sh > 0]
     ratio = sh.max() / nz.min() if nz.size else float("nan")
     cap = (f"Commanded forward speed on the flat family, time-weighted and masked to clip length. "
-           f"Bins are 0.2 m/s. max/min bin share {ratio:.2f} over {int((sh == 0).sum())} empty bins; "
+           f"Bins are 0.2 m/s; the shaded band is the declared envelope and the statistics are "
+           f"over it. max/min bin share {ratio:.2f} over {int((sh == 0).sum())} empty bins; "
            f"a further {zero:.1%} of commanded time is an exact zero (the declared stand and "
            f"sidestep masses) and is excluded here, since it is a point mass rather than part of "
            f"the continuous marginal.")
