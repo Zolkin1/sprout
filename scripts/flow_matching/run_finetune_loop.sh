@@ -28,8 +28,8 @@
 # GPU this loop is using. Run it afterwards against any iteration's `ft/last.pt`.
 #
 # Usage:
-#   bash scripts/flow_matching/run_awr_loop.sh --tag a4k --gpu 1 --buffer 4000 --refresh 1000
-#   bash scripts/flow_matching/run_awr_loop.sh --tag b2k --gpu 2 --buffer 2000 --refresh 500
+#   bash scripts/flow_matching/run_finetune_loop.sh --tag a4k --gpu 1 --buffer 4000 --refresh 1000
+#   bash scripts/flow_matching/run_finetune_loop.sh --tag b2k --gpu 2 --buffer 2000 --refresh 500
 set -uo pipefail
 
 W="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -78,6 +78,28 @@ PROJECT="${PROJECT:-robot_rl_awr}"
 #: that never climbed, and that inflated `reached_goal` feeds the reward's success term -- so
 #: the fine-tune would be trained on arrivals that did not happen. Needed for the
 #: in-distribution `stairs_up` / `jump_on` tiles; harmless (and off) everywhere else.
+#: WHICH fine-tuning algorithm the update stage runs. The collect / grade / buffer stages are
+#: identical across all of them, and so is the iteration count and the policy chaining, so an
+#: arm differs from another in the objective ALONE.
+#:
+#:   awr  weight every labelled chunk by exp(A / (beta * sd A)), clipped. The main arm.
+#:   fbc  FILTERED BC: keep the top `100 - PERCENTILE`% by advantage at weight 1, drop the
+#:        rest. A real hard filter via `--filter_label positive`, NOT a sharp beta -- the two
+#:        coincide only in a limit, and the limit is not the algorithm.
+#:   bc   PLAIN BC on ALL the data: no labels, no weighting, no filter. The critic and label
+#:        stages are SKIPPED because nothing reads them, which also makes it the cheapest arm.
+#:
+#: `bc` is the control that matters most: the parent was never trained on this terrain at all,
+#: so any fine-tune on these rollouts is also domain adaptation. Without it, "the advantage
+#: selected good behaviour" cannot be separated from "the model finally saw this terrain".
+ALGO="${ALGO:-awr}"
+case "$ALGO" in awr|fbc|bc) ;; *)
+  echo "REFUSING: ALGO must be awr, fbc or bc; got '$ALGO'."; exit 2;; esac
+
+#: Percentile BELOW which a chunk is negative, i.e. `fbc` keeps the top `100 - this`%.
+#: Only read by `fbc`; `awr` uses the continuous advantage column and ignores the labels.
+PERCENTILE="${PERCENTILE:-70.0}"
+
 HEIGHT_TOL="${HEIGHT_TOL:-0.0}"
 SPEED_MIN="${SPEED_MIN:-}"
 SPEED_MAX="${SPEED_MAX:-}"
@@ -158,6 +180,11 @@ echo "[awr] root   $ROOT"
 echo "[awr] wandb  $PROJECT / ONE run 'loop_$TAG' / seed $SEED"
 echo "[awr] reward $([ "$PROGRESS" = "1" ] && echo "PROGRESS (s_vel=$GATE_S s_success=$SUCCESS_GATE_S sigma=$VEL_SIGMA C=$SUCCESS_C)" || echo "terrain only")"
 echo "[awr] critic $FVI_ROUNDS FVI round(s)$([ "$PROGRESS" = "1" ] && echo ", worst-penalty-so-far context")"
+case "$ALGO" in
+  awr) echo "[awr] algo   AWR, beta $BETA (sd units), clip 20, global normalize";;
+  fbc) echo "[awr] algo   FILTERED BC, top $(awk -v p="$PERCENTILE" 'BEGIN{printf "%g", 100-p}')% by advantage (--filter_label positive)";;
+  bc)  echo "[awr] algo   PLAIN BC on ALL data -- no labels, no weights; critic+label SKIPPED";;
+esac
 echo "[awr] arms   camera 0.5 (dead, per-replan), history 0.0, speed-mismatch $SPEED_MISMATCH"
 echo "[awr] clip   $CLIP"
 echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
@@ -334,7 +361,12 @@ for (( it=1; it<=ITERS; it++ )); do
     # every round's gates.json is kept so the effect of bootstrapping is visible.
     ROUNDS_FVI=1
     [ "$PROGRESS" = "1" ] && ROUNDS_FVI=$FVI_ROUNDS
+    # `bc` trains on every row unweighted, so no value function and no label are read. Skipped
+    # rather than run-and-ignored: it is ~28 min an iteration, and an arm that quietly computes
+    # something it does not use invites the reader to wonder whether it used it after all.
+    [ "$ALGO" = "bc" ] && ROUNDS_FVI=0
     PREV_PRED=""
+    [ "$ROUNDS_FVI" -eq 0 ] && echo "[awr] 6/8 critic      SKIP (ALGO=bc reads no value function)"
     for (( fr=0; fr<ROUNDS_FVI; fr++ )); do
       RDIR="$CRITIC"
       [ "$ROUNDS_FVI" -gt 1 ] && RDIR="$CRITIC/round_$fr"
@@ -365,7 +397,7 @@ for (( it=1; it<=ITERS; it++ )); do
     # `V_priv.pt` therefore always failed here -- and this script is `set -uo pipefail` with
     # NO `-e`, so it failed silently and left $CRITIC holding predictions and gates but no
     # weights at all. `|| fail` is what makes that loud.
-    if [ "$ROUNDS_FVI" -gt 1 ]; then
+    if [ "$ROUNDS_FVI" -gt 1 ] && [ -n "$PREV_PRED" ]; then
       RD="$(dirname "$PREV_PRED")"
       cp "$PREV_PRED" "$CRITIC/predictions.npz" || fail "collecting predictions.npz" "$it"
       cp "$RD"/V_priv*.pt "$CRITIC/" || fail "collecting the critic weights" "$it"
@@ -374,12 +406,19 @@ for (( it=1; it<=ITERS; it++ )); do
   fi
 
   # ---- 7. label ---------------------------------------------------------------------
-  if [ -f "$CRITIC/advantage.npz" ]; then
+  if [ "$ALGO" = "bc" ]; then
+    echo "[awr] 7/8 label       SKIP (ALGO=bc trains on every row)"
+  elif [ -f "$CRITIC/advantage.npz" ]; then
     echo "[awr] 7/8 label       SKIP (exists)"
   else
-    echo "[awr] 7/8 label       MC advantage, terrain only"
+    # `--percentile` decides the SIGN threshold, which only `fbc` reads: AWR weights the
+    # continuous `advantage` column and never looks at the label. Passed explicitly for both
+    # so the sidecar records the same number the arm was configured with, rather than `fbc`
+    # inheriting the script default of 35 that nothing chose.
+    echo "[awr] 7/8 label       MC advantage, terrain only, percentile $PERCENTILE"
     "$PY" -u scripts/flow_matching/label_advantage.py "$CRITIC/predictions.npz" \
       --terrain_only --w_fail 0 --estimator mc --variant V_priv \
+      --percentile "$PERCENTILE" \
       --out "$CRITIC/advantage.npz" >> "$ITD/critic.log" 2>&1 || fail label "$it"
   fi
 
@@ -392,12 +431,21 @@ for (( it=1; it<=ITERS; it++ )); do
     echo "[awr] 8/8 finetune    SKIP (exists)"
   else
     echo "[awr] 8/8 finetune    $EPOCHS_FT epochs from $(basename "$(dirname "$POLICY")")"
+    # The ONE place the arms differ. `bc` passes no `--labels` at all, which is what makes it
+    # plain BC on every row rather than AWR at a hot beta -- the two agree only in a limit,
+    # and a limit is not the algorithm anyone would say they ran.
+    case "$ALGO" in
+      awr) ALGO_ARGS=(--labels "$CRITIC/advantage.npz"
+                      --awr_beta "$BETA" --awr_normalize global --awr_center none
+                      --awr_balance none --awr_clip 20.0);;
+      fbc) ALGO_ARGS=(--labels "$CRITIC/advantage.npz" --filter_label positive);;
+      bc)  ALGO_ARGS=();;
+    esac
     "$PY" -u scripts/flow_matching/finetune_generator.py --no_wandb \
       --pretrained "$POLICY" \
       --rollout "${BUF_STEM}.h5" \
-      --labels "$CRITIC/advantage.npz" \
-      --awr_beta "$BETA" --awr_normalize global --awr_center none --awr_balance none \
-      --awr_clip 20.0 --batch_size 256 --num_workers "$WORKERS" \
+      "${ALGO_ARGS[@]}" \
+      --batch_size 256 --num_workers "$WORKERS" \
       --epochs "$EPOCHS_FT" --ckpt_every 1 --device cuda \
       --out "$FT" > "$ITD/ft.log" 2>&1 || fail "finetune (see $ITD/ft.log)" "$it"
   fi

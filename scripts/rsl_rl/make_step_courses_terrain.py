@@ -230,7 +230,7 @@ def write_library(path: str, manifest: list[dict], meta: dict, role: str,
         speed_range: The commanded-speed interval this course is to be recorded over (m/s),
             stamped so a runner READS it instead of restating it --
             :func:`motion_gen.clips.clip_io.read_commanded_speed_range` is the reader and
-            ``run_awr_loop.sh`` uses it. ``None`` stamps nothing, which every library written
+            ``run_finetune_loop.sh`` uses it. ``None`` stamps nothing, which every library written
             before this did, and a reader must then fall back to its own default.
         config: The course's own constants, from :func:`_resolve`.
     """

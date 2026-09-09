@@ -552,7 +552,7 @@ def main() -> int:
             "chaining would confound the conditioning mechanism under test with an "
             "unrepeatable optimisation path.\n"
             "This does NOT apply to a plain AWR arm, which is chained ON PURPOSE by "
-            "`run_awr_loop.sh` -- there the path IS the algorithm (AWR's convergence argument "
+            "`run_finetune_loop.sh` -- there the path IS the algorithm (AWR's convergence argument "
             "is about iterating, and re-fitting from the parent every time is what makes a "
             "single step advantage-weighted BC instead). Reproducibility there comes from the "
             "buffer manifest recording each iteration's parent checkpoint, not from refusing "
