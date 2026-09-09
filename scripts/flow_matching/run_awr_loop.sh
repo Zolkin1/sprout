@@ -58,6 +58,12 @@ SUCCESS_C="${SUCCESS_C:-10.0}"
 #: later round refits against `r + gamma^N V` with V FROZEN as the previous round's
 #: predictions on disk. 1 = pure MC, i.e. the old behaviour.
 FVI_ROUNDS="${FVI_ROUNDS:-2}"
+#: The SPEED-MISMATCH arm's fraction, within the eligible population. Off by default: it is a
+#: third change on top of the reward and the spawns, and an arm nobody asked for should not be
+#: in a run's data silently. Set it per run (SPEED_MISMATCH=0.5) once the reward itself has a
+#: baseline. The reward scores velocity against the NOMINAL speed, so this arm is a
+#: corruption to reject rather than a command to follow -- see the cfg field's docstring.
+SPEED_MISMATCH="${SPEED_MISMATCH:-0.0}"
 BETA="${BETA:-0.5}"
 WORKERS="${WORKERS:-16}"
 PROJECT="${PROJECT:-robot_rl_awr}"
@@ -114,6 +120,10 @@ echo "[awr] buffer $BUFFER episodes, refresh $REFRESH, $ITERS iterations"
 echo "[awr] parent $PARENT"
 echo "[awr] root   $ROOT"
 echo "[awr] wandb  $PROJECT / ONE run 'loop_$TAG' / seed $SEED"
+echo "[awr] reward $([ "$PROGRESS" = "1" ] && echo "PROGRESS (s_vel=$GATE_S s_success=$SUCCESS_GATE_S sigma=$VEL_SIGMA C=$SUCCESS_C)" || echo "terrain only")"
+echo "[awr] critic $FVI_ROUNDS FVI round(s)$([ "$PROGRESS" = "1" ] && echo ", worst-penalty-so-far context")"
+echo "[awr] arms   camera 0.5 (dead, per-replan), history 0.0, speed-mismatch $SPEED_MISMATCH"
+echo "[awr] clip   $CLIP"
 echo "==================================================================="
 
 fail () { echo "[awr] FAILED at $1 (iteration $2)" >&2; exit 1; }
@@ -200,6 +210,8 @@ for (( it=1; it<=ITERS; it++ )); do
       env.commands.traj_ref.fm_upper_camera_noise_mode=dead \
       env.commands.traj_ref.fm_upper_camera_noise_cadence=replan \
       env.commands.traj_ref.fm_history_null_fraction=0.0 \
+      env.commands.traj_ref.fm_speed_mismatch_fraction="$SPEED_MISMATCH" \
+      env.commands.traj_ref.fm_speed_mismatch_cadence=replan \
       env.commands.traj_ref.freeform_speed_min="$SPEED_MIN" \
       env.commands.traj_ref.freeform_speed_max="$SPEED_MAX" \
       env.episode_length_s=40.0 \
