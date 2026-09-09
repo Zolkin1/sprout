@@ -686,6 +686,16 @@ unstable (0.010 to 0.116) until the reference reached ~12k windows.
 
 ## Visual clutter: re-render a recording's pixels, don't re-record (2026-08-26)
 
+**OFF BY DEFAULT as of v6c (2026-09-09), by decision.** The basic RL terrain is back to
+generally UNCLUTTERED and undecorated -- no walls, no rooms, no clutter sidecar. Decoration
+survives only for stair-WIDTH variation and the floating steps/voids. Nothing here changes to
+achieve that (`decor_overlay_path` already defaults to `""` and the build driver never invokes
+`build_clutter_occupancy.py` / `author_clutter.py`); it is simply not run. The exposure
+argument below is still believed -- it is deferred to FM training or the FM FINE-TUNE, where
+`augment_registration --visual_only --clutter` re-renders an EXISTING recording and so costs no
+re-record and no teacher retrain. Note this and the no-walls decision point the same way:
+the stack avoids nothing, so a wall in the RL terrain is only ever something to be misread.
+
 The generator had essentially never seen a vertical surface within camera range -- 0.0% of
 flat clips have a wall in reach, terrain tiles' walls sit a median 9.6 m past where the motion
 stops, and `family_distractor` is skipped by default. A wall at 2 m is therefore out of

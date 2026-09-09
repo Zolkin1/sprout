@@ -283,11 +283,21 @@ def draw_all(rep: dict, out_dir: str, recipe: dict | None, which=None) -> list[s
     return made
 
 
-def _summary(rep: dict) -> dict:
-    """The scalars worth diffing between builds, beside the figures."""
+def _summary(rep: dict, recipe: dict | None = None) -> dict:
+    """The scalars worth diffing between builds, beside the figures.
+
+    The vx grid comes from the RECIPE, never a constant. It was hardcoded to the old
+    ``[-1.0, 3.6]`` envelope, so after the band was capped at 2.5 the five bins above the cap
+    were empty BY CONSTRUCTION -- the summary reported `vx_empty_bins 5` on a library that had
+    no hole in it, and would have gone on reporting 5 whatever was built. `fig_commanded_vx`
+    was already reading the recipe; only this was not.
+    """
     vx = _cat(rep["rows"], "cmd_vx", {"flat"})
-    moving = vx[np.abs(vx) > 1e-9]
-    h, _ = np.histogram(moving, bins=np.arange(-1.0, 3.61, 0.2))
+    moving = vx[np.abs(vx) > 1e-9]       # a stand is not a forward speed
+    # Subscript, not .get with a default: a renamed key must fail loudly rather than silently
+    # restore the stale constant, which is the whole defect being fixed here.
+    lo, hi = recipe["flat_vx_range"] if recipe else (-1.0, 3.6)
+    h, _ = np.histogram(moving, bins=np.arange(float(lo), float(hi) + 1e-9, 0.2))
     sh = h / max(h.sum(), 1)
     nz = sh[sh > 0]
     sp = _cat(rep["rows"], "speed")
@@ -295,6 +305,9 @@ def _summary(rep: dict) -> dict:
     vy, wz = np.abs(_cat(rep["rows"], "cmd_vy")), np.abs(_cat(rep["rows"], "cmd_wz"))
     return {
         "n_clips": rep["n_clips"], "families": rep["families"],
+        # Over NON-EMPTY bins, with `vx_empty_bins` beside it -- an empty bin makes the true
+        # ratio infinite, which would say nothing about the bins that do carry mass. The two
+        # must be read together: a healthy ratio with a non-zero empty count is not a pass.
         "vx_bin_max_over_min": float(sh.max() / nz.min()) if nz.size else None,
         "vx_empty_bins": int((sh == 0).sum()),
         "vx_distinct": int(len(np.unique(np.round(vx, 6)))),
@@ -329,7 +342,7 @@ def main() -> int:
         recipe = tlc.read_recipe_ranges(args.recipe)
     made = draw_all(rep, args.out_dir, recipe,
                     which=set(args.only.split(",")) if args.only else None)
-    summ = _summary(rep)
+    summ = _summary(rep, recipe)
     with open(os.path.join(args.out_dir, "report.json"), "w") as f:
         json.dump(summ, f, indent=1)
     print(f"[report] {len(made)} figures -> {args.out_dir}")
