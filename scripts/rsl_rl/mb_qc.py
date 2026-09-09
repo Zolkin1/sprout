@@ -324,11 +324,14 @@ def main() -> int:
                         "driver runs this as its last stage, so a bad library fails the build instead "
                         "of being written and looked at later -- which is how a 9.8%% flat root-speed "
                         "blow-up shipped in g1_mb_v8 and was only found by watching a clip.")
-    p.add_argument("--gate-max-root-speed", type=float, default=6.0,
-                   help="No clip may contain a frame faster than this (m/s). The library's own exact "
-                        "looped replays peak at 3.82 and the worst sound in-betweening at 4.84, so "
-                        "6.0 sits above everything correct with margin; the blow-ups it exists to "
-                        "catch ran 19-31.")
+    p.add_argument("--gate-max-root-speed", type=float, default=7.5,
+                   help="No clip may contain a frame faster than this (m/s). DERIVED, not sampled: an "
+                        "in-betweening's travel is set by Motion Bricks' pinned target at "
+                        "|v1| * DEFAULT_PLANING_HORIZON = |v1| * 1.0 m regardless of the horizon it "
+                        "picks, so at the 6-token floor (0.533 s kept) its mean speed is 1.88x its own "
+                        "command -- and at the envelope's top command of 3.6 m/s that is a legitimate "
+                        "6.75 m/s. 7.5 clears it with margin and still sits far below the 19-31 m/s "
+                        "the gate exists to catch.")
     p.add_argument("--gate-allow-undecorated", action="store_true",
                    help="Let the gate pass a library that decorate_terrain.py has never touched. Off "
                         "by default: straight out of generation every wide stair platform is stretched "
@@ -338,14 +341,16 @@ def main() -> int:
                         "edges in every frame. The decoration pass is not in the build driver, so "
                         "without this check a full build reports success and hands over a uniform "
                         "world. Pass it only when you are deliberately inspecting the raw output.")
-    p.add_argument("--gate-pelvis-band", type=float, nargs=2, default=(0.40, 0.95),
+    p.add_argument("--gate-pelvis-band", type=float, nargs=2, default=(0.30, 0.95),
                    metavar=("MIN", "MAX"),
                    help="Pelvis height above the LOWER FOOT (m), not above the world. Absolute height "
                         "is wrong on terrain -- a pure-stairs clip legitimately reaches 3.10 m as it "
                         "climbs -- while the pelvis-to-foot distance is a property of the ROBOT and "
-                        "needs no terrain knowledge at all. Measured over the whole library it spans "
-                        "0.511-0.757 m (p01 0.614, p99 0.753), so this band clears everything correct "
-                        "and still catches a robot collapsed on the floor or launched into the air.")
+                        "needs no terrain knowledge at all. Over the full 10 000-clip library it "
+                        "spans 0.397-0.76 m (p0.01 0.404, p1 0.494, p50 0.622); the deepest is a "
+                        "smooth 21-frame crouch inside a backward in-betweening, not a collapse. The "
+                        "floor is set to separate CROUCHING from COLLAPSED -- a robot actually on the "
+                        "floor reads 0.1-0.2 -- rather than to hug the observed tail.")
     p.add_argument("--top", type=int, default=10, help="List this many worst clips per ranking key.")
     p.add_argument("--ramp-s", type=float, default=0.4,
                    help="Regime window (s) around a command change; matches mb_env.regime_weight's default.")
@@ -491,7 +496,16 @@ def main() -> int:
         except ValueError:
             raise SystemExit("--gate needs the ankle position channels; this library has none")
         # THE BACKSTOP. Everything above is a report a human reads; this is the number that fails a
-        # build. It deliberately checks only what is unambiguous -- a speed nothing correct reaches,
+        # build.
+        #
+        # BOTH THRESHOLDS ARE DERIVED, AND THE FIRST VERSIONS WERE NOT. They were fitted to a 64-clip
+        # smoke build and then failed the first real 10 000-clip build on three clips -- two at
+        # 6.01 and 6.16 m/s against a 6.0 ceiling, one at 0.397 m against a 0.40 floor. None was a
+        # defect: the fast pair sat inside the pin law's own bound for their commands (3.43 and
+        # 3.52 m/s), and the deep one was a smooth crouch. A smoke build cannot see the tail of a
+        # library 156x its size, so a threshold hugging its observed range is a threshold that will
+        # fail on the first real run for no reason. Derive from the MECHANISM and leave the tail
+        # room. It deliberately checks only what is unambiguous -- a speed nothing correct reaches,
         # and a pelvis outside the range a standing robot can occupy -- because a gate that argues
         # about quality gets turned off, and one that catches broken motion does not.
         fails = []
