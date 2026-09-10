@@ -54,7 +54,7 @@ class _StubImporter:
 
 
 _JITTER = freeform.FREEFORM_SPAWN_JITTER_M
-_TOL = resets.GROUND_SPAWN_TOL_M
+_TOL = resets.SPAWN_Z_TIE_TOL_M
 
 
 @pytest.mark.parametrize("name", sorted(_routes()))
@@ -161,18 +161,46 @@ def test_the_filter_is_part_of_the_tables_cache_key() -> None:
     assert int(again_i[0, 1]) == n_all
 
 
-def test_a_tile_whose_only_declared_starts_are_raised_is_REFUSED() -> None:
-    """Not a silent fall-through to the synthesised start.
+def test_a_DESCENDING_tile_keeps_its_raised_start_rather_than_being_refused() -> None:
+    """A descent has no ground start, and the eval rule must not demand one.
 
-    That would place the robot at ``start_*`` with the jitter extents -- a pose this terrain
-    never claimed was legal, on a course nobody authored. Every shipped family declares a
-    ground area, so this is unreachable today and the test is what keeps it so.
+    This test asserted the OPPOSITE until 2026-09-10: the filter tested ``z <= tol`` against
+    absolute zero, so a tile whose only declared start is raised was refused outright, on the
+    stated grounds that "every shipped family declares a ground area". That was false. The
+    in-distribution routes are built from real clip-library tiles, and two of their four
+    families -- ``stairs_down`` and ``jump_off_front`` -- spawn on the platform because you
+    cannot begin a descent from the floor. The refusal killed all three in-distribution evals
+    at env construction, before a single episode was collected.
+
+    The rule is now the tile's MINIMUM declared ``z``, which expresses what the eval actually
+    wants -- start where the course starts, never part-way along it -- without asserting that
+    every course starts on the floor.
     """
     raised = freeform._route((1.0, 0.0), 0.0, 0.0, (6.0, 0.0), 1.0, 0.0,
                              spawn_areas=[freeform.spawn_area(3.0, 0.0, 0.4, 0.3, 0.3)])
     imp = _StubImporter({0: raised})
-    with pytest.raises(ValueError, match="none at ground level"):
-        resets._freeform_spawn_table(imp, _JITTER, "ground")
+    table, index, lo = resets._freeform_spawn_table(imp, _JITTER, "ground")
+    assert int(index[0, 1]) == 1, "the single declared start must survive the eval filter"
+    assert table[0, 2] == pytest.approx(0.4), (
+        "the platform start must be served AS AUTHORED; falling back to the synthesised "
+        "ground start would place the robot at a pose the terrain never declared legal")
+
+
+def test_ground_only_keeps_the_LOWEST_tier_when_a_tile_has_several() -> None:
+    """The discriminating case: a descending tile with a platform AND a higher landing.
+
+    Minimum-z must keep the platform alone. An absolute-ground test keeps nothing here (the
+    old bug) and a "keep everything" fallback keeps both -- which would score a fraction of
+    the course as a traverse, the very thing the eval rule exists to prevent.
+    """
+    tiered = freeform._route(
+        (1.0, 0.0), 0.0, 0.0, (6.0, 0.0), 1.0, 0.0,
+        spawn_areas=[freeform.spawn_area(3.0, 0.0, 0.40, 0.3, 0.3),
+                     freeform.spawn_area(4.0, 0.0, 0.95, 0.3, 0.3)])
+    imp = _StubImporter({0: tiered})
+    table, index, lo = resets._freeform_spawn_table(imp, _JITTER, "ground")
+    assert int(index[0, 1]) == 1
+    assert table[0, 2] == pytest.approx(0.40)
 
 
 def test_an_unknown_subset_is_refused_rather_than_treated_as_all() -> None:
@@ -192,7 +220,12 @@ def test_every_draw_lands_on_the_ground_under_the_eval_rule() -> None:
     imp = _StubImporter({0: _routes()["box2"]}, n_envs=512)
     env_ids = torch.arange(512, dtype=torch.long)
     drawn = resets._draw_spawn_areas(imp, env_ids, _JITTER, "ground")
-    assert torch.all(drawn[:, 2] <= _TOL), "an eval draw landed on a raised area"
+    # box2's lowest declared area IS the floor, so the bound here is still zero -- the
+    # point of stating it as the minimum is that the assertion keeps holding on a course
+    # whose lowest start is a platform.
+    z_lo = min(float(a["z"]) for a in _routes()["box2"]["spawn_areas"])
+    assert torch.all(drawn[:, 2] <= z_lo + _TOL), "an eval draw landed above the lowest start"
+    assert z_lo == pytest.approx(0.0), "box2 should still start on the floor"
     # The control: with the filter off, the same draw must reach the box tops -- otherwise
     # this test would pass just as well against a broken weighted draw.
     imp2 = _StubImporter({0: _routes()["box2"]}, n_envs=512)

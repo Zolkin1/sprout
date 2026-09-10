@@ -859,11 +859,19 @@ def tile_local_xy(
 #: is IsaacLab-free and cannot be imported here.
 FREEFORM_SPAWN_FIELDS: tuple[str, ...] = ("x", "y", "z", "half_x", "half_y", "yaw", "weight")
 
-#: Surface height (m) at or under which a spawn area counts as GROUND LEVEL.  A tolerance
-#: rather than an equality because the authored value is a float, and every family authors its
-#: ground areas at a literal ``0.0`` while the raised ones sit at a box height or a flight's
-#: top -- the smallest of which is a 0.40 m box top, four orders above this.
-GROUND_SPAWN_TOL_M: float = 1e-6
+#: How close in ``z`` (m) two spawn areas must be to count as the SAME level.  ``ground``
+#: keeps every area within this of the tile's LOWEST declared one, so it is a tie tolerance
+#: rather than a distance from zero -- a float equality on an authored value.
+#:
+#: It used to be a distance from ``z = 0`` ("is this area on the floor"), which is the same
+#: test on every family that starts on the floor and WRONG on the ones that cannot: the
+#: in-distribution routes come from real clip tiles, and the descending families
+#: (``stairs_down``, ``jump_off_front``) spawn on the platform by necessity. There is no
+#: ground start for a descent, so the absolute test left those tiles with no area at all.
+#:
+#: The separation it has to resolve is large in every case: a tile's raised areas sit at a
+#: box height or a flight's top, the smallest being a 0.40 m box top -- five orders above this.
+SPAWN_Z_TIE_TOL_M: float = 1e-6
 
 #: The spawn-area subsets a reset can draw from.
 #:
@@ -904,15 +912,17 @@ def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float],
         importer: The ``ClipTerrainImporter``, carrying ``terrain_route``.
         pos_jitter_m: Half-widths for the synthesised single-start area.
         spawn_from: Which declared areas to keep; one of :data:`SPAWN_FROM`.  ``ground``
-            drops every area above :data:`GROUND_SPAWN_TOL_M`, which is how every eval runs.
+            keeps only the tile's LOWEST declared areas -- those within
+            :data:`SPAWN_Z_TIE_TOL_M` of the minimum ``z`` -- which is how every eval runs.
 
     Returns:
         ``(areas, index, lo)`` -- ``[A, 7]`` float, ``[hi - lo + 1, 2]`` long, and the terrain
         id row 0 of the index stands for.
 
     Raises:
-        ValueError: If a declared area is missing a field, or ``spawn_from`` is unknown, or
-            the filter leaves a tile with no area at all.
+        ValueError: If a declared area is missing a field, or ``spawn_from`` is unknown.
+            The filter itself cannot empty a tile: it keeps the minimum-``z`` areas, and a
+            minimum over a non-empty list is non-empty.
     """
     if spawn_from not in SPAWN_FROM:
         raise ValueError(f"spawn_from must be one of {list(SPAWN_FROM)}; got {spawn_from!r}")
@@ -934,19 +944,20 @@ def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float],
         route = routes[tid]
         areas = route.get("spawn_areas") or []
         if areas and spawn_from == "ground":
-            kept = [a for a in areas if float(a["z"]) <= GROUND_SPAWN_TOL_M]
-            if not kept:
-                # NOT a silent fall-through to the synthesised start. That would place the
-                # robot at `start_*` with the jitter extents, which for a tile whose only
-                # declared starts are raised is a pose the terrain never claimed was legal --
-                # a plausible spawn on a course nobody authored. Every shipped family authors
-                # a ground area, so this is unreachable today and is here to stay that way.
-                raise ValueError(
-                    f"terrain {tid} declares {len(areas)} spawn area(s) and none at ground "
-                    f"level (z <= {GROUND_SPAWN_TOL_M}); spawn_from='ground' would leave it "
-                    "with nowhere to start. Author a ground area at "
-                    "freeform.FREEFORM_SPAWN_JITTER_M extents.")
-            areas = kept
+            # The tile's LOWEST declared areas, not the ones at absolute ground. On every
+            # family that starts on the floor -- box2, up-into-down, varied -- the minimum IS
+            # zero and this is bit-identical to the old absolute test, so no measured number
+            # moves. On a family that cannot start on the floor it is the difference between
+            # working and refusing: the in-distribution routes are real clip tiles, and the
+            # descending ones (`stairs_down`, `jump_off_front`) spawn on the platform because
+            # a descent has no ground start. The absolute test left them with zero areas and
+            # raised, which killed all three in-distribution evals on 2026-09-10.
+            #
+            # One rule either way, and it is the rule the eval actually wants: start where the
+            # course starts, never part-way along it. A minimum over a non-empty list keeps at
+            # least one area, so this cannot fall through to the synthesised start below.
+            z_lo = min(float(a["z"]) for a in areas)
+            areas = [a for a in areas if float(a["z"]) <= z_lo + SPAWN_Z_TIE_TOL_M]
         if not areas:
             areas = [{"x": route["start_x"], "y": route["start_y"], "z": route["start_z"],
                       "half_x": float(pos_jitter_m[0]), "half_y": float(pos_jitter_m[1]),
