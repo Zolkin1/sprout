@@ -1350,6 +1350,200 @@ Not a scoring artifact, checked: of 616 truncations, 293 are genuine arrivals (t
 downrange 0.009 m, height error -0.12 m, both well inside tolerance) and 323 are plain
 time-outs. 88% of episodes terminate on a fall.
 
+# FINE-TUNING THE GENERATOR ON TERRAIN: the loop, and what it has established (2026-09-09)
+
+Take a trained generator and improve it on ONE hard course by re-weighting its own behaviour,
+with no simulator in the training loop: collect rollouts, grade them, fit a value function,
+weight or filter the chunks, update the generator, x5. `scripts/flow_matching/run_finetune_loop.sh`
+runs the whole thing and is resumable per stage; **`scripts/flow_matching/FINETUNE.md` is the
+runbook** and carries the artifact provenance, the library fingerprints and the traps.
+
+This is NOT the teacher PPO fine-tune `README.md` §4c documents. Nothing here calls `train.py`.
+
+**WHAT IT BUYS, on the two-box course, paired at the ENV level** (both arms draw the same reset
+stream, so every env's first episode opens at a bit-identical downrange -- max |diff| 0.00e+00,
+which is why the paired interval is the honest one and the level intervals are conservative):
+
+| arm | paired delta vs parent | McNemar |
+|---|---|---|
+| AWR on the progress reward | +0.3510 [+0.2514, +0.4476] | p=1.8e-226 |
+| **+ the velocity-mismatch knob (0.30)** | **+0.4817 [+0.3905, +0.5831]** | p underflows |
+| filtered BC, top 30% | +0.3531 [+0.2124, +0.5124] | p=9.2e-242 |
+
+**Filtered BC MATCHES AWR here** -- the intervals overlap almost entirely and fBC's is 55%
+wider. On this course the advantage WEIGHTING buys nothing over a top-30% filter, which is the
+ablation's real finding. Up-into-down is +0.2069 and the in-distribution control (routes over
+the original clip tiles) is +0.1046, so the OOD fine-tune did not cost in-distribution skill.
+
+Every number above is regenerable from the repo: `fig_reduce.py` -> `plot_finetune_bars.py` for
+the figure, `paired_delta.py` for the paired test, `variance_audit.py` for what is inside the
+episode count. They route their episode selection through `awr_buffer.first_per_env` and their
+success rule through `rollout_outcomes.terminal_reward`, so the figure, the report and the
+paired test cannot describe one recording differently.
+
+## The four algorithms are ONE selectivity ladder, and only the update differs
+
+`ALGO=awr|fbc|arrived|bc`. Collect, grade and buffer churn never branch on it, so a difference
+between arms is the objective and not the data -- pinned by parsing the script
+(`test_finetune_loop_algos.py`), because that property lives in shell where nothing type-checks
+it.
+
+| `ALGO` | update | critic | selects |
+|---|---|---|---|
+| `awr` | `w = clip(exp(A / (beta * sd A)), 0, 20)` | yes | ~10-15% effective |
+| `fbc` | filtered BC on the top 30% by advantage | yes | 30% |
+| `arrived` | BC on episodes that ARRIVED before failing | **no** | ~8.8% |
+| `bc` | plain BC on every row | **no** | 100% |
+
+**AWR's hot limit is unweighted BC on the labelled rows and its sharp limit under `global`
+normalization IS filtered BC**, so the ladder only means something if each arm is actually its
+own algorithm: `bc` passes no `--labels` at all rather than a large beta, and `fbc`/`arrived`
+filter rather than weight.
+
+**`bc` also needs `--unconditioned`, and that is not obvious.** `is_plain_arm` is true for
+`filter_label`, `unconditioned` or `awr_beta > 0` -- plain BC passes NONE of those, which is
+the whole point of the arm, so without the flag it takes the advantage-CONDITIONED path,
+grows an embedding no label ever reaches, and writes a checkpoint with no serve arm that every
+consumer then refuses. That is not hypothetical: `eval_bc_s3_i1` is three log files and no
+data. BC was the FOURTH plain arm and `is_plain_arm`'s docstring had already recorded the rule
+going stale once, "the moment AWR was added as a third plain arm".
+
+## The progress reward, and why the terrain-only one is maximised by standing still
+
+`R_t = R_terrain + gate * exp(-|v_err| / sigma) + gate_worst * C * reached_goal * is_last`,
+`C = 10`. The terrain-consistency grade alone rewards not touching the terrain, and it showed:
+a terrain-only run drove forward progress 11.50 -> 3.95 m per 1000 steps WHILE survival rose.
+So the velocity term and an ARRIVAL bonus are what make it un-gameable by waiting.
+
+**The success bonus is TERMINAL and gated on the episode's WORST chunk.** Two other shapes were
+measured and rejected: adding `C` to every chunk made the target near-binary (unsuccessful rows
+0.11, successful 0.95, with terrain and velocity squeezed into the bottom sixth of the range),
+and distributing `C/n` diluted it to 2% of the reward. A terminal bonus keeps it where it is
+earned and lets the CRITIC propagate it backwards, which is what bootstrapping is for.
+
+**The gate means arriving destructively pays nothing** -- of 352 successful two-box episodes,
+every one reached the goal by dismounting a box, because a correct two-jump traverse is rare
+enough that the behaviour policy never produced one and AWR can only reweight what it is shown.
+That is also why the course declares box-top SPAWN AREAS.
+
+## Isaac TERMINATES on the strict tracking bounds, and the bound is 0.12 m
+
+`terminations.tracking_violation` (`mdp.fm_tracking_violation_termination`) ends the episode at
+the union of lateral 0.20 / height 0.12 / tilt 30 deg around the SERVED node. It goes through
+`tracking_error.violation_checks` rather than restating the tests, so the termination and every
+offline reader of `first_violation_step` cannot disagree about what a violation is.
+
+**It replaced an offline LATCH, and the latch was quietly destroying the success signal.** The
+recording used to run on past a violation and every consumer cut the episode there afterwards
+-- so a run reached the goal, banked the terminal bonus, and the offline cut then deleted the
+row it was paid on. Measured: the last re-plan survived on **4.7%** of arriving episodes, so of
+728 arrivals ~34 kept their bonus in the return. The critic was fitted on a reward with
+essentially no success term in it, and every log read healthy. Terminating means nothing
+downstream truncates anything, and `reached_goal` and `rollout_outcomes.terminal_reward` become
+the same question.
+
+**0.12 is measured, not fitted.** Watching the course, proper box jump-downs peak at
+0.130-0.182 m against the old 0.20 bound -- nowhere near it -- while stairs-down-off-a-box
+dismounts approach it, so the bound separates a correct dismount from the wrong MODE rather
+than catching a fall. Its cost was measured on the real opening data set BEFORE the change
+(`awr_vm30/inc_001`, 2000 parent episodes, DR on): clean arrivals 21.70% -> 16.85% of all
+episodes, windows surviving 95.7% -> 93.4%. Ground-start clean arrivals collapse 4.18% ->
+0.46%, so at this bound every clean success in an opening set is a box-top dismount -- a
+scarcity that predates the change. The tilt bound never binds before the height one on that
+data. `fit_tracking_thresholds.py` still does not exist, so the spec is still `bootstrap: True`
+and publishing consumers still refuse it.
+
+**The bound's discriminative power is a property of the POLICY, not the terrain**, which is the
+thing to remember before quoting any of it. Peak |height error|, arrived vs fell: the vm30 arm
+separates (0.092 / 0.224 median; at 0.12 it flags 0.219 of box-top arrivals and 0.866 of
+falls) while the PARENT is inverted -- the strict union fires on 0.953 of its arrivals against
+0.807 of its falls. And restricted to ground starts the "cost" on vm30 rises from 0.308 to
+0.586, because pooling box-top dismounts with full traverses compares a single dismount against
+a two-jump course.
+
+**Whether the bound tracks the wrong MODE is UNMEASURED.** It is a hypothesis from watching
+episodes, and there is no automated mode detector: `terrain_class.py` is validated as a
+POPULATION statistic and its own numbers say "this plan is a misread" is not a claim it
+supports. `transfer/sim/mode_probe.py` -- human labels, blind and interleaved, N noise draws on
+one tile -- is the only instrument, and `watch_tracking.py --spec` is how to see what a given
+bound catches (it pauses the replay ON the latch; press a key with the VIEWER focused).
+
+## Success is defined ONCE, and three places have to agree
+
+* the REWARD pays on `reached_goal`, gated by the worst chunk;
+* the CRITIC keeps every window up to the first failure and drops the rest -- a no-op now that
+  the episode ends there;
+* the EVAL reports `terminal_reward >= 0`: arrival BEFORE the first failure, so a fall in the
+  run-out after the goal is a success and a robot dragged over the line after failing is not.
+
+`FAILURE_RULE` decides what "failure" means for the last two and is `strict` -- what Isaac now
+terminates on. **Score a recording made BEFORE the termination with `loose`**, or the strict
+rule is applied to episodes it never ended: it then fires on 99.5% of them and reports 0.0049
+against the fall rule's 0.1051. `rollout_outcomes.assert_tracking_bounds_agree` refuses a
+comparison whose two arms were latched at different bounds, because nothing in the numbers
+shows it -- both arms have the column, both are populated, both are plausible.
+
+## Training draws every spawn area; every EVAL draws the initial GROUND one
+
+Raised areas exist so the second half of a traverse appears in the data at all. Scoring from
+them reports a fraction of the course as a traverse, so `run_quick_eval.sh` passes
+`SPAWN_FROM=ground` on every terrain and prints it. It costs nothing in comparability, checked
+rather than argued: every family authors its ground area at exactly
+`freeform.FREEFORM_SPAWN_JITTER_M`, which is also what the reset synthesises for a tile
+declaring none -- so a ground-only draw is BIT-IDENTICAL to the pre-spawn-areas libraries every
+earlier number was measured on.
+
+## Reduce FIRST-PER-ENV, always
+
+A round-based stop ends when the SLOWEST env finishes its k-th episode, and an env finishes
+more episodes precisely when its episodes were short -- so the surplus is drawn from the
+fast-failing tail and pooling it tilts the sample back the way it came. Measured bias 0.15 on
+one in-distribution tile. Worse is `--num_episodes`, a TOTAL-count stop, which cuts every slow
+episode still in flight: one arm read 0.0005 against a parent's 0.1960 that way, a policy that
+looks destroyed and is not.
+
+## The terrain contract every course satisfies
+
+One `.h5` per course, manifest-only: terrain and zero clips, still passed with `--clip`. All
+nine regenerate with the terrain fingerprint UNCHANGED (`generator_config` sits outside
+`fingerprint_terrain_manifest`, because a commanded speed is not geometry). Each declares
+`commanded_speed_range_mps` under the key `clip_io.read_commanded_speed_range` actually reads
+-- box2 and the curb shipped an `intended_speeds_mps` LADDER for weeks, which nothing reads, so
+the whole declared-band path was a silent no-op and the loop used its own default.
+
+`varied_courses` is the one where a tile is GEOMETRY rather than an initial condition: 30 box +
+30 up-into-down tiles in one library, with the spawn-area chain and a continuous band carrying
+the variation a fixed course puts on separate tiles.
+
+## TRAPS, each of which cost real time
+
+* **`height_tol_m` MEANS OPPOSITE THINGS AT ZERO.** `terminations.freeform_goal_reached`
+  guards with `if height_tol_m > 0.0` (0 = the test is OFF); `goal_region.in_goal` applies
+  `|height_err| <= height_tol_m` unconditionally (0 = EXACT equality, never satisfiable). A
+  spec of 0 scored an arm 0.0000 over 8400 episodes AND zeroed the reward's success term for
+  five whole training iterations. `TODO(height-tol-conventions)`.
+* **IsaacLab type-checks hydra overrides**: `height_tol_m=0` (an int) is refused where `0.0` is
+  accepted, and it fails at hydra composition before the GPU is touched.
+* **`record_rollouts.py` has its own `--history_from`**, applied AFTER hydra composition, so
+  `env.commands.traj_ref.history_from=` is silently discarded. Pass the FLAG.
+* **A comment inside a `\`-continued shell command ENDS the command**, making every argument
+  after it a separate command. `bash -n` accepts it and these scripts have no `set -e`, so the
+  flag simply vanishes and the callee uses its default. `test_shell_continuations.py` scans for
+  it.
+* **`robot.data`'s buffers are WARP arrays in a termination.** `eval.accumulate` reads them
+  through a shim that converts on every access, so copying its accessor NAMES without the shim
+  hands `tracking_error` a `vec3f` and it dies at the first step of collection -- and the
+  suite passed, because nothing executed the function.
+* **`ArmRun` passes `allow_robot_asset_mismatch=True` unconditionally**, so the robot
+  fingerprint guard warns and continues on every mjeval run. Anything measured there is a
+  statement about a pair the fingerprint says is not matched.
+* **mjeval's `in_goal` is a +-`GOAL_DEPTH/2` BAND**; the free-form `goal_reached` is a
+  downrange HALF-PLANE. The band's near edge cuts arriving episodes short, which is what
+  `stop_on_goal=False` exists for when RECORDING rather than scoring.
+* **A declared spawn area REPLACES `pos_jitter_m`** for the whole tile, so an authored ground
+  area sized to anything but `FREEFORM_SPAWN_JITTER_M` silently changes the spawn distribution.
+  box2 paid this once at 4x the intended lateral spread.
+
 # obelisk (ROS2 deploy) — the default run pipeline
 
 Three commands, in this order, every time:

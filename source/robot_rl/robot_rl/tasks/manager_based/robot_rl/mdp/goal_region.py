@@ -77,6 +77,9 @@ class GoalTolerances:
             coordinate.
         height_tol_m: Absolute band on ``|robot_z - goal_z|``.  Catches the robot that
             reached the right (x, y) while standing on the floor beside or below the terrain.
+            **0 turns the test OFF**, the same as in
+            :func:`~mdp.terminations.terminations.freeform_goal_reached` -- see
+            :func:`in_goal` for the arm this cost when the two disagreed.
     """
 
     approach_margin_m: float = 1.0
@@ -445,6 +448,21 @@ def in_goal(
 ) -> torch.Tensor:
     """Whether the base is inside the region.
 
+    **A ``height_tol_m`` of 0 means the height test is OFF, matching
+    :func:`~mdp.terminations.terminations.freeform_goal_reached`.**  It used to mean an EXACT
+    equality here -- ``|height_err| <= 0`` on a continuous quantity, which is never satisfiable
+    -- while the termination guarded with ``if height_tol_m > 0.0`` and treated the same value
+    as "skip this test". One field, two meanings, both reachable from one run: a varied-terrain
+    spec that declared 0 read 0.0000 over 8400 episodes AND zeroed the progress reward's
+    success term for five whole training iterations, and the two tells pointed the wrong way
+    (episodes ended at ~474 steps rather than timing out, so the TERMINATION was firing while
+    `in_goal` could not).
+
+    Zero is now legal and means what it means at the other end. What it does NOT mean is safe:
+    with the test off, a goal ABOVE the spawn can be scored from the floor beside the terrain,
+    which is exactly what the tolerance exists to catch. `terminations.freeform_goal_reached`
+    says the same thing in its own docstring, and the eval's banner prints which it is.
+
     Args:
         downrange: ``[N]`` from :func:`goal_frame_offsets`.
         lateral: ``[N]``.
@@ -456,7 +474,10 @@ def in_goal(
         ``[N]`` bool.
     """
     margin, width, height = _tol_columns(tol, downrange)
-    return (downrange >= -margin) & (lateral.abs() <= width) & (height_err.abs() <= height)
+    # `| (height <= 0)` rather than a python branch: `height` may be a per-env COLUMN, so the
+    # "off" case has to be elementwise too.
+    ok_height = (height_err.abs() <= height) | (height <= 0)
+    return (downrange >= -margin) & (lateral.abs() <= width) & ok_height
 
 
 #: Default clip on the steering controller's yaw rate (rad/s).  0.68 is the largest ``|wz|``
