@@ -216,3 +216,31 @@ def test_the_banner_states_the_failure_rule_for_every_arm() -> None:
     t = LOOP.read_text()
     assert re.search(r'echo "\[awr\] failed \$FAILURE_RULE', t), (
         "the banner never names the failure rule outside the arrived arm's line")
+
+
+def test_the_history_arm_is_passed_as_a_CLI_FLAG_not_a_hydra_override() -> None:
+    """``record_rollouts.py`` has its OWN ``--history_from`` and applies it AFTER composition.
+
+    So ``env.commands.traj_ref.history_from=`` is silently discarded: the run serves the
+    generator arm to whatever checkpoint it was given, and on a measured-trained one
+    ``assert_history_source_matches`` then kills it -- after the simulator has launched, with
+    the refusal naming the checkpoint rather than the override that did not take. That cost a
+    GPU launch on 2026-09-09.
+
+    This is the same shape as the eval harness's own rule that a flag added to a parser is not
+    forwarded unless the caller restates it; here the caller restated it in the WRONG channel.
+    """
+    t = LOOP.read_text()
+    assert '--history_from "$HISTORY_FROM"' in t, (
+        "the loop must pass the arm as a CLI flag; the hydra override is overwritten")
+    # An ARGUMENT line, not the string anywhere: the comment above the flag names the
+    # override precisely to say why it is not used, and must not fail its own test.
+    assert not re.search(r"^\s*env\.commands\.traj_ref\.history_from=", t, re.M), (
+        "the hydra override is back as an argument, and record_rollouts will discard it")
+
+
+def test_the_eval_passes_the_history_arm_the_same_way() -> None:
+    """Both sides must agree, or an arm is evaluated on a history it was not trained for."""
+    ev = (_REPO / "scripts" / "rsl_rl" / "run_quick_eval.sh").read_text()
+    assert '--history_from "$HISTORY_FROM"' in ev
+    assert not re.search(r"^\s*env\.commands\.traj_ref\.history_from=", ev, re.M)

@@ -333,13 +333,18 @@ for (( it=1; it<=ITERS; it++ )); do
       --task="$TASK" --load_run "$TRK" --fm_checkpoint "$POLICY" \
       --clip "$CLIP" --clip_device cpu --goal_regions "$GOALS" \
       --num_envs "$ENVS" --episodes_per_env "$ROUNDS" --num_windows "$NWIN" \
+      # `--history_from`, NOT the hydra override. `record_rollouts.py` has its OWN flag for
+      # this (default "generator") and writes it onto the command AFTER hydra composition, so
+      # `env.commands.traj_ref.history_from=` is silently overwritten -- the run then serves
+      # the generator arm to a measured-trained checkpoint and `assert_history_source_matches`
+      # kills it after the simulator has launched. Cost: one wasted GPU launch.
+      --history_from "$HISTORY_FROM" \
       --output_dir "$INC" \
       env.commands.traj_ref.fm_perturb_fraction="$PERTURB_FRAC" \
       env.commands.traj_ref.fm_upper_camera_noise_fraction=0.5 \
       env.commands.traj_ref.fm_upper_camera_noise_mode=dead \
       env.commands.traj_ref.fm_upper_camera_noise_cadence=replan \
       env.commands.traj_ref.fm_history_null_fraction=0.0 \
-      env.commands.traj_ref.history_from="$HISTORY_FROM" \
       env.commands.traj_ref.fm_speed_mismatch_fraction="$SPEED_MISMATCH" \
       env.commands.traj_ref.fm_speed_mismatch_cadence=replan \
       env.commands.traj_ref.freeform_speed_min="$SPEED_MIN" \

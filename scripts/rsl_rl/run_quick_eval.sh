@@ -190,11 +190,13 @@ for spd in $SPEEDS; do
     --task="$TASK" --load_run "$TRK" --fm_checkpoint "$FM" \
     --clip "$CLIP" --clip_device cpu --goal_regions "$GR" \
     --num_envs $NENV --episodes_per_env "$ROUNDS" --no_windows --terrain_reward \
+    # `--history_from`, NOT a hydra override: record_rollouts has its own flag for this and
+    # applies it after composition, so the override is silently discarded.
+    --history_from "$HISTORY_FROM" \
     --output_dir "$d" \
     env.commands.traj_ref.freeform_speed_min=$spd \
     env.commands.traj_ref.freeform_speed_max=$spd \
     env.events.reset_on_section.params.spawn_from=$SPAWN_FROM \
-    env.commands.traj_ref.history_from=$HISTORY_FROM \
     env.terminations.goal_reached.params.height_tol_m=$HEIGHT_TOL \
     env.episode_length_s=40.0 \
     > "$d.log" 2>&1 || { echo "[eval] speed $spd FAILED, see $d.log" >&2; exit 1; }
