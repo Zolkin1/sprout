@@ -233,7 +233,8 @@ def from_json(raw) -> Schedule:
 
 
 def terrain_interaction_schedule(rng, cell: tuple, band: tuple, ref_speed: float, n_seg: int,
-                          sign: float, vy_range=(0.0, 0.0), wz_range=(0.0, 0.0)) -> list:
+                          sign: float, vy_range=(0.0, 0.0), wz_range=(0.0, 0.0),
+                          p_straight: float = 0.5) -> list:
     """``[(fraction_of_replay, vx, vy, wz)]`` -- the command while the terrain traversal plays.
 
     The motion is a single fixed replay and nothing here changes it; this is ``target_vel`` only. What
@@ -263,6 +264,17 @@ def terrain_interaction_schedule(rng, cell: tuple, band: tuple, ref_speed: float
     At most ONE of ``vy`` / ``wz`` is non-zero per segment -- the same rule the flat sampler follows,
     and it matches the solved library exactly (zero of its cells carry both).
 
+    **``p_straight`` keeps lateral/yaw from becoming a terrain DETECTOR.** Drawing per segment made
+    a traversal straight only ``(1/3)**n_seg`` of the time -- 11% at n_seg=2, so 88.5% of measured
+    traversals carried lateral or yaw while the flat pieces carried none at all. Within a terrain
+    clip that is a PERFECT cue: measured on g1_mb_v6c, 42126 frames of lateral/yaw on traversals
+    against 0 on the flat pieces, so a generator could read "lateral commanded" as "terrain under
+    me" and never be wrong. This draw is per CLIP rather than per segment, because a per-segment
+    coin still puts some lateral on nearly every traversal -- which is the thing being avoided.
+
+    On its own this only makes the cue rarer, not uninformative; the other half of the fix is
+    putting lateral/yaw on the flat pieces too (``mb_plan_library._rl_holds``). Both are needed.
+
     Segment boundaries are drawn uniformly over the replay: the motion is identical throughout, so no
     frame is a better place for a change than any other, and a fixed fraction would be a landmark.
     """
@@ -280,12 +292,13 @@ def terrain_interaction_schedule(rng, cell: tuple, band: tuple, ref_speed: float
             return 0.0, float(rng.uniform(*wz_range))
         return 0.0, 0.0
 
+    straight = float(rng.random()) < float(p_straight)     # per CLIP, not per segment
     cuts = sorted(float(x) for x in rng.uniform(0.0, 1.0, size=n - 1)) if n > 1 else []
     out, prev = [], 0.0
     for c in list(cuts) + [1.0]:
         vx = (float(sign) * abs(float(ref_speed)) if degenerate
               else float(sign) * float(rng.uniform(lo, hi)))
-        vy, wz = _lat()
+        vy, wz = (0.0, 0.0) if straight else _lat()
         out.append((float(c) - prev, vx, vy, wz))
         prev = float(c)
     out = [r for r in out if r[0] > 1e-6]

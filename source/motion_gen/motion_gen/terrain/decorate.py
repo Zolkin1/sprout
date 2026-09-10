@@ -683,12 +683,18 @@ def decorate_transition_tile(tile: dict, footprint: TileFootprint,
     report.tread_before = [float(o["size_xyz"][1]) for o in treads]
     report.platform_before = [float(o["size_xyz"][1]) for o in platforms]
 
-    if arm in ("narrow_landing", "matched"):
-        for overlay in platforms:
-            old_lo, old_hi = span(overlay)
-            # Narrow INTO the existing platform: never grow it, and never past the envelope.
-            _resize_y(overlay, max(old_lo, env_lo), min(old_hi, env_hi),
-                      must_contain=(env_lo, env_hi), widening=False)
+    # ONE CENTRE for the flight and its platforms, and the platforms are never narrower than the
+    # flight. Before this the two were placed against DIFFERENT envelopes -- treads about their own
+    # flight centre, platforms narrowed into the whole-clip envelope -- so they drifted apart:
+    # measured on g1_mb_v6c, a median 0.190 m centre offset (max 0.742) with the platform NARROWER
+    # than the stair on 3 of 66 tiles. A staircase stepping onto a landing that is offset from it,
+    # or narrower than it, is not a thing the robot should be asked to walk.
+    #
+    # The centre is the TRAVERSAL envelope's, because that is where the feet actually cross the
+    # treads. Forcing the platform to share it costs width -- it has to reach twice the larger half
+    # of an asymmetric approach envelope -- and that is the right direction to overpay in: a wider
+    # landing is always safe, a narrower one drops a foot.
+    centre = sum(footprint.tread_envelope()) / 2.0
 
     if treads:
         # EVERY flight lands inside [min_tread_m, max_tread_m] -- the band of real stair widths
@@ -718,12 +724,8 @@ def decorate_transition_tile(tile: dict, footprint: TileFootprint,
         # The band is a target, never a promise to under-run the feet or over-run the tile.
         width = min(max(width, need_hi - need_lo), size_y - 2.0 * cfg.clearance_m)
 
-        # Grow or shrink about the flight's OWN centre -- "grow in place, never re-centre" --
-        # then shift by the least that puts the feet on it and keeps it inside the tile.
-        mid = (min(span(o)[0] for o in treads) + max(span(o)[1] for o in treads)) / 2.0
-        target_lo = mid - width / 2.0
-        # Slide (never resize) until the feet are covered, then until the tile is. Both windows
-        # are wide enough for `width` by the clamp above, so the second cannot undo the first.
+        # Centred on the traversal feet, then slid by the least that keeps it inside the tile.
+        target_lo = centre - width / 2.0
         target_lo = min(max(target_lo, need_hi - width), need_lo)
         target_lo = min(max(target_lo, cfg.clearance_m), size_y - cfg.clearance_m - width)
         target_hi = target_lo + width
@@ -733,6 +735,23 @@ def decorate_transition_tile(tile: dict, footprint: TileFootprint,
             # that it still covers the feet that walked on it.
             _resize_y(overlay, target_lo, target_hi,
                       must_contain=(need_lo, need_hi), widening=False)
+
+    # The platforms, AFTER the flight, so its final span is known and can be a floor. They carry
+    # the approach and exit wander (the whole-clip envelope), the flight does not.
+    if platforms:
+        flight_lo, flight_hi = ((min(span(o)[0] for o in treads), max(span(o)[1] for o in treads))
+                                if treads else (env_lo, env_hi))
+        c = (flight_lo + flight_hi) / 2.0 if treads else centre
+        # Half-width that (a) covers the flight, (b) covers the whole-clip feet about the SAME
+        # centre. Widening the narrow side rather than re-centring is what keeps them aligned.
+        half = max(flight_hi - c, c - flight_lo, env_hi - c, c - env_lo)
+        if arm == "wide_stairs":
+            # This arm leaves the landings alone; it only has to satisfy the two floors.
+            half = max(half, *( [max(span(o)[1] - c, c - span(o)[0]) for o in platforms] or [0.0] ))
+        half = min(half, min(c - cfg.clearance_m, size_y - cfg.clearance_m - c))
+        for overlay in platforms:
+            _resize_y(overlay, c - half, c + half,
+                      must_contain=(max(env_lo, c - half), min(env_hi, c + half)), widening=False)
 
     report.tread_after = [float(o["size_xyz"][1]) for o in treads]
     report.platform_after = [float(o["size_xyz"][1]) for o in platforms]

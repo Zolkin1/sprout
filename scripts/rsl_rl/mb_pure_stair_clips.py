@@ -162,7 +162,8 @@ def _pure_clip(builder, ts, tile, args, dev, steady_vx: float, cell: tuple) -> d
         np.random.default_rng([int(args.tile_seed), int(tile.terrain_id), int(round(steady_vx * 1e4))]),
         cell, tuple(args.stair_vel_range), abs(float(_achieved_vx(Wp, float(args.dt)))),
         int(args.cmd_segments), 1.0,
-        vy_range=tuple(args.cmd_vy_range), wz_range=tuple(args.cmd_wz_range))
+        vy_range=tuple(args.cmd_vy_range), wz_range=tuple(args.cmd_wz_range),
+        p_straight=float(args.cmd_p_straight))
     tvel = torch.zeros(T, 3, dtype=torch.float32, device=dev)
     t0 = 0
     for k, (frac, vx, vy, wz) in enumerate(sched):
@@ -232,6 +233,11 @@ def main() -> int:
                    metavar=("MIN", "MAX"),
                    help="Commanded speed band. SAME flag and default as mb_plan_library, so the "
                         "pure and transition stair families share one band by construction.")
+    p.add_argument("--cmd-p-straight", type=float, default=0.25,
+                   help="Probability a pure traversal is fully STRAIGHT, drawn per clip. Pure stairs "
+                        "are the only place lateral/yaw is commanded on terrain, so if every one of "
+                        "them carried it, 'lateral' would predict 'pure stairs' exactly the way it "
+                        "used to predict 'terrain' -- see terrain_interaction_schedule.")
     p.add_argument("--cmd-segments", type=int, default=2,
                    help="Command segments across a pure traversal. The motion is one fixed replay and this changes none of it -- only target_vel. Pinning the command to the achieved speed (what this used to do) made 15%% of the library the one place command and motion always agreed, and all of it stairs. 1 restores the old behaviour.")
     p.add_argument("--cmd-vy-range", type=float, nargs=2, default=(-0.6, 0.6), metavar=("MIN","MAX"),

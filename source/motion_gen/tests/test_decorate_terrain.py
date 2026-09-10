@@ -557,3 +557,54 @@ def test_the_traversal_envelope_falls_back_to_the_whole_clip_when_absent():
     fp = _footprint(0, lo=1.2, hi=1.8)
     assert fp.tread_y_min_sized is None
     assert fp.tread_envelope() == (1.2, 1.8)
+
+
+def test_the_flight_and_its_platforms_share_a_centre_and_the_platforms_are_never_narrower():
+    """A staircase must not step onto a landing that is offset from it, or narrower than it.
+
+    Before this the two were placed against DIFFERENT envelopes -- treads about their own flight
+    centre against the traversal feet, platforms narrowed into the whole-clip envelope -- so they
+    drifted apart. Measured on g1_mb_v6c: median 0.190 m of centre offset (max 0.742) with the
+    platform narrower than the stair on 3 of 66 tiles.
+    """
+    for seed in range(40):
+        for size_y in (3.0, 4.0, 6.0):
+            tile = _tile(terrain_id=seed, size_y=size_y)
+            roles_before = classify_overlays(tile)
+            decorate_transition_tile(tile, _footprint(seed), DecorateConfig(seed=seed))
+            spans = [span(o) for o in tile["overlays"]]
+            tre = [s for s, r in zip(spans, roles_before) if r == "tread"]
+            plat = [s for s, r in zip(spans, roles_before) if r == "platform"]
+            assert tre and plat
+            tc = [(lo + hi) / 2 for lo, hi in tre]
+            pc = [(lo + hi) / 2 for lo, hi in plat]
+            assert max(tc) - min(tc) < 1e-9, "the treads of one flight must share a centre"
+            assert abs(sum(tc) / len(tc) - sum(pc) / len(pc)) < 1e-6, (
+                f"seed {seed} size_y {size_y}: flight centre {sum(tc)/len(tc):.4f} against "
+                f"platform centre {sum(pc)/len(pc):.4f}"
+            )
+            widest_tread = max(hi - lo for lo, hi in tre)
+            assert min(hi - lo for lo, hi in plat) >= widest_tread - 1e-6, (
+                f"seed {seed} size_y {size_y}: a platform is narrower than the flight it serves"
+            )
+
+
+def test_a_short_flight_is_authorable():
+    """1 and 2 riser transitions -- a curb and a step-up -- are real deployment geometry.
+
+    `n_steps_range` started at 3, so the library had none. The camera argument against them stands
+    (a 0.13 m riser is 1.97 px at any range) and is why they are worth TRAINING on rather than
+    omitting; see approach_zone.py.
+    """
+    import numpy as np
+    from collections import Counter
+    from motion_gen.terrain.terrain_sampler import sample_stair_tiles
+
+    tiles = sample_stair_tiles(
+        np.random.default_rng(0), hd_grid=[(0.13, 0.25), (0.15, 0.25)], n_pure=0, n_transition=200,
+        pure_length=1.0, transition_length=12.0, width_range=(1.0, 1.6), num_steps_range=(1, 7),
+        lead_in_range=(1.5, 4.0), end_platform=1.0, inter_flat_range=(3.0, 5.0),
+        nav_width_range=(1.0, 1.6), flat_width_margin=0.3, single_step_frac=0.0, floor_frac=0.5,
+        decor_params={"float_frac": 0.0, "float_thick_range": (0.0, 0.0)})
+    counts = Counter(s for t in tiles for s in t.stair_steps)
+    assert counts[1] > 0 and counts[2] > 0, f"no short flights authored: {dict(counts)}"

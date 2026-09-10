@@ -310,9 +310,12 @@ def main() -> int:
                     "--n-tiles", str(cfg.pure_stair_tiles),
                     # The SAME command variation the transition traversals get -- a pure tile's
                     # replay is equally fixed, so the same argument applies.
-                    "--cmd-segments", str(cfg.terrain_cmd_segments),
-                    "--cmd-vy-range", *(str(v) for v in cfg.terrain_cmd_vy_range),
-                    "--cmd-wz-range", *(str(v) for v in cfg.terrain_cmd_wz_range),
+                    # The PURE families read their OWN keys: they are the only place lateral/yaw
+                    # is commanded on terrain, and the transition keys are now zero.
+                    "--cmd-segments", str(cfg.pure_cmd_segments),
+                    "--cmd-vy-range", *(str(v) for v in cfg.pure_cmd_vy_range),
+                    "--cmd-wz-range", *(str(v) for v in cfg.pure_cmd_wz_range),
+                    "--cmd-p-straight", str(cfg.pure_cmd_p_straight),
                     "--clips-per-tile", str(cpt),
                     "--stair-vel-range", *(str(v) for v in cfg.stair_vel_range),
                     "--pure-seconds", str(cfg.pure_seconds),

@@ -105,9 +105,21 @@ gen_attempts: 6                 # seeds to try before giving up on one in-betwee
 
 # ---------------------------------------------------------------- RL-visible command
 terrain_cmd_changes_per_side: 2   # command changes during the lead-up / trail-away. 0 = the
-terrain_cmd_segments: 2           # command segments ACROSS the traversal itself. The motion is one
-terrain_cmd_vy_range: [-0.6, 0.6] # lateral / yaw commands ON a traversal. They move NOTHING -- the
-terrain_cmd_wz_range: [-0.8, 0.8] # replay is world-pinned -- and that is exactly why they belong
+terrain_cmd_segments: 1           # command segments ACROSS a TRANSITION traversal. The motion is one
+# TRANSITION traversals are STRAIGHT and single-segment, and pure stairs carry the lateral/yaw
+# instead. Measured on g1_mb_v6c, which had lateral on every traversal and none on any flat piece:
+# P(on terrain | lateral or yaw commanded) = 1.0000 WITHIN a terrain clip (42126 frames on
+# traversals, 0 on flat pieces), so a generator could read "lateral commanded" as "terrain underfoot"
+# and never be wrong. Speed changes were 6.7x more frequent per unit time on terrain than on flat.
+#
+# Putting lateral on the transition clips' own flat pieces was the other candidate and was rejected:
+# it needs the lead-up to route to a terrain entry pose, and on box top-side segments the platform is
+# not widened, so _platform_trim would start cutting clips. A PURE tile is 100% terrain with no
+# approach at all, so it carries the lesson at no geometric risk -- and a transition clip then has no
+# lateral anywhere, which removes the confound from inside it rather than diluting it.
+# Projected: P(terrain | lateral) 0.196 -> 0.071 library-wide, and undefined inside a transition clip.
+terrain_cmd_vy_range: [0.0, 0.0]  # lateral / yaw ON A TRANSITION traversal -- deliberately zero.
+terrain_cmd_wz_range: [0.0, 0.0]  # See above. Pure stairs keep them; that is where the generator
                                   # there: both channels were identically zero on every terrain clip,
                                   # so the generator had never been asked to turn while a staircase
                                   # was under it and could not learn that the answer is to keep
@@ -123,6 +135,21 @@ terrain_cmd_wz_range: [-0.8, 0.8] # replay is world-pinned -- and that is exactl
                                   # pre-step-8 single hold. A CEILING: the travel budget decides how
                                   # many steady stretches actually fit. Each change is one extra MB
                                   # generation per clip, so 2 is ~3x the stage-b cost of 0.
+# ---------------------------------------------------------------- PURE-stair command
+# The ONLY place lateral/yaw is commanded on terrain. A pure tile is one long staircase, 100%
+# terrain (measured: 100.0% of frames carry anchor_mask 2) with no approach or exit, so a command
+# that moves nothing cannot route the robot off an entry pose. This is what teaches the generator
+# that lateral and yaw are to be IGNORED while stairs are underfoot.
+pure_cmd_segments: 2              # segments across a pure traversal -- kept at 2 so the lateral and
+                                  # yaw actually VARY within a clip rather than being one constant.
+pure_cmd_vy_range: [-0.6, 0.6]
+pure_cmd_wz_range: [-0.8, 0.8]
+pure_cmd_p_straight: 0.25         # probability a pure clip's traversal is fully straight, drawn per
+                                  # CLIP. Not 0: if every pure-stair clip carried lateral, "lateral"
+                                  # would predict "pure stairs" the way it used to predict "terrain".
+                                  # Not 0.5 either -- pure stairs are now the only carrier of the
+                                  # lesson, so most of them should carry it.
+
 min_hold_m: 1.5                   # shortest steady stretch (m) a hold may be. Below a gait cycle a
                                   # "hold" is not steady, and loop_frames_for rounds it UP -- which
                                   # overruns the travel budget and pushes terrain past the platform.
@@ -138,7 +165,14 @@ segment_reuse: false            # share a generated MB segment between clips wit
 # The tile POPULATION and the gait phase each clip hands off at. Distribution parameters in the
 # same sense the velocity bands are -- these used to reach a build only through mb_plan_library's
 # argparse defaults, i.e. from a second place, which is the thing this file exists to prevent.
-n_steps_range: [3, 7]            # treads per TRANSITION stair tile
+n_steps_range: [1, 7]            # treads per TRANSITION stair tile. The low end is 1 and 2 on
+                                 # purpose: a curb and a two-riser step-up are real deployment
+                                 # geometry and the library had NONE (it started at 3). The camera
+                                 # argument against them is real and unchanged -- a single 0.13 m
+                                 # riser subtends 1.97 px at any range, so the robot cannot tell a
+                                 # curb from a low box -- but that is an argument for TRAINING on
+                                 # them, since the ambiguity is what it has to survive. See
+                                 # approach_zone.py for the pixel table.
 tile_width_range: [0.8, 1.2]     # corridor width (m) per transition tile
 entry_pick: sample               # which boundary-gate candidate the terrain entry hands off at.
                                  # 'sample' varies the gait phase per clip; a fixed preference

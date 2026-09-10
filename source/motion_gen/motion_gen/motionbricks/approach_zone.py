@@ -74,10 +74,16 @@ And one thing worth writing down, because it bounds what any zone can buy:
 
 * **what distinguishes a staircase from a box is never resolved.** Tread structure subtends ~1.7 px
   per riser at 2 m and less further out, while both features present a well-resolved vertical face.
-  A single 0.13 m riser peaks at 1.97 px at any range -- which is the reason
-  ``mb_plan_library``'s ``single_step_frac`` is 0. That is a statement about the sensor, not about
-  the model, and it is a measured mechanism for the stairs-read-as-box confusion the eval harness
-  put at 0.174 closed-loop against a 0.103 control.
+  A single 0.13 m riser peaks at 1.97 px at any range. That is a statement about the sensor, not
+  about the model, and it is a measured mechanism for the stairs-read-as-box confusion the eval
+  harness put at 0.174 closed-loop against a 0.103 control.
+
+  **This used to be the reason ``single_step_frac`` was 0 and ``n_steps_range`` started at 3, and
+  that conclusion was REVERSED (2026-09-09).** The sensor argument is unchanged and still correct;
+  what changed is what follows from it. A curb and a two-riser step-up are real deployment geometry,
+  and if the robot cannot distinguish one from a low box then it has to survive the ambiguity rather
+  than never meet it -- a library that omits them does not remove the confusion, it removes the
+  training signal for it. ``n_steps_range`` is now ``[1, 7]``.
 
 If it ever wants sizing by measurement instead of assertion, the instrument exists:
 ``make_terrain_probe_clips.py`` + ``fm_terrain_probe.py`` build "one flat clip, N tiles, N sceneries,

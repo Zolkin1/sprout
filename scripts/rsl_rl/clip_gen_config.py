@@ -133,6 +133,14 @@ _SCHEMA: dict[str, tuple] = {
     "gen_attempts": ("int", 1),
     "terrain_cmd_changes_per_side": ("int", 1),
     "terrain_cmd_segments": ("int", 1),
+    # The PURE-stair families get their own three, because they are the only place lateral/yaw on
+    # terrain is kept. A pure tile is 100% terrain with no approach to route, so a lateral command
+    # there cannot walk the robot off an entry pose -- and a transition clip carrying none means the
+    # confound (lateral commanded <=> terrain underfoot) does not exist inside it at all.
+    "pure_cmd_segments": ("int", 1),
+    "pure_cmd_vy_range": ("range", 2),
+    "pure_cmd_wz_range": ("range", 2),
+    "pure_cmd_p_straight": ("float", 1),
     "terrain_cmd_vy_range": ("range", 2),
     "terrain_cmd_wz_range": ("range", 2),
     "min_hold_m": ("float", 2),

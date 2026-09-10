@@ -178,3 +178,65 @@ def test_the_schedule_lands_ONLY_on_the_replay_span():
     assert torch.all(out[:40, 0] == 1.5) and torch.all(out[80:, 0] == 1.5)
     assert out[40, 0] == pytest.approx(0.7) and out[40, 1] == pytest.approx(0.4)
     assert out[60, 0] == pytest.approx(0.9) and out[60, 2] == pytest.approx(-0.6)
+
+
+def test_p_straight_is_drawn_per_clip_not_per_segment():
+    """A per-segment coin still puts lateral on nearly every traversal, which is the whole problem.
+
+    Measured on g1_mb_v6c, where `_lat()` drew per segment at n_seg=2: 88.5% of traversals carried
+    lateral or yaw while the flat pieces carried none, making `P(on terrain | lateral commanded)`
+    exactly 1.0000 inside a terrain clip. The draw has to be per clip so that a whole traversal is
+    either straight or not.
+    """
+    import numpy as np
+    from motion_gen import command_schedule as mtc
+
+    n_straight = 0
+    for seed in range(400):
+        sched = mtc.terrain_interaction_schedule(
+            np.random.default_rng(seed), (0.0, float("inf")), (0.2, 2.5), 0.5, n_seg=4, sign=1.0,
+            vy_range=(-0.6, 0.6), wz_range=(-0.8, 0.8), p_straight=0.5)
+        lat = [(abs(vy) > 1e-9 or abs(wz) > 1e-9) for _f, _vx, vy, wz in sched]
+        # per CLIP: a traversal is either wholly straight, or free to carry lateral in any segment.
+        if not any(lat):
+            n_straight += 1
+    # A per-SEGMENT coin at n_seg=4 would make an all-straight traversal (1/3)**4 = 1.2% likely.
+    assert 0.40 < n_straight / 400 < 0.60, (
+        f"{n_straight}/400 traversals straight; p_straight=0.5 must be a per-clip draw"
+    )
+
+
+def test_p_straight_extremes_are_reachable():
+    """1.0 silences lateral/yaw entirely; 0.0 leaves the per-segment behaviour intact."""
+    import numpy as np
+    from motion_gen import command_schedule as mtc
+
+    for seed in range(50):
+        sched = mtc.terrain_interaction_schedule(
+            np.random.default_rng(seed), (0.0, float("inf")), (0.2, 2.5), 0.5, n_seg=3, sign=1.0,
+            vy_range=(-0.6, 0.6), wz_range=(-0.8, 0.8), p_straight=1.0)
+        assert all(abs(vy) < 1e-9 and abs(wz) < 1e-9 for _f, _vx, vy, wz in sched)
+
+    any_lat = False
+    for seed in range(50):
+        sched = mtc.terrain_interaction_schedule(
+            np.random.default_rng(seed), (0.0, float("inf")), (0.2, 2.5), 0.5, n_seg=3, sign=1.0,
+            vy_range=(-0.6, 0.6), wz_range=(-0.8, 0.8), p_straight=0.0)
+        any_lat |= any(abs(vy) > 1e-9 or abs(wz) > 1e-9 for _f, _vx, vy, wz in sched)
+    assert any_lat, "p_straight=0.0 must leave lateral/yaw reachable"
+
+
+def test_a_zero_range_silences_the_channel():
+    """How the TRANSITION families are made straight: their vy/wz ranges are zero in the recipe.
+
+    No code branch does it -- `_lat()` already refuses a range whose magnitude is zero -- so the
+    transitions and the pure stairs run the same function with different numbers.
+    """
+    import numpy as np
+    from motion_gen import command_schedule as mtc
+
+    for seed in range(80):
+        sched = mtc.terrain_interaction_schedule(
+            np.random.default_rng(seed), (0.0, float("inf")), (0.2, 2.5), 0.5, n_seg=3, sign=1.0,
+            vy_range=(0.0, 0.0), wz_range=(0.0, 0.0), p_straight=0.0)
+        assert all(abs(vy) < 1e-9 and abs(wz) < 1e-9 for _f, _vx, vy, wz in sched)

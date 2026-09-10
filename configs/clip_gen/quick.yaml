@@ -86,9 +86,9 @@ gen_attempts: 6                 # seeds to try before giving up on one in-betwee
 
 # ---------------------------------------------------------------- RL-visible command
 terrain_cmd_changes_per_side: 2   # command changes during the lead-up / trail-away. 0 = the
-terrain_cmd_segments: 2           # command segments ACROSS the traversal itself. The motion is one
-terrain_cmd_vy_range: [-0.6, 0.6] # lateral / yaw commands ON a traversal. They move NOTHING -- the
-terrain_cmd_wz_range: [-0.8, 0.8] # replay is world-pinned -- and that is exactly why they belong
+terrain_cmd_segments: 1           # TRANSITION traversals: single segment and STRAIGHT (see g1_mb_v6.yaml)
+terrain_cmd_vy_range: [0.0, 0.0]  # zero on transitions; pure stairs carry lateral/yaw instead
+terrain_cmd_wz_range: [0.0, 0.0]
                                   # there: both channels were identically zero on every terrain clip,
                                   # so the generator had never been asked to turn while a staircase
                                   # was under it and could not learn that the answer is to keep
@@ -104,6 +104,10 @@ terrain_cmd_wz_range: [-0.8, 0.8] # replay is world-pinned -- and that is exactl
                                   # pre-step-8 single hold. A CEILING: the travel budget decides how
                                   # many steady stretches actually fit. Each change is one extra MB
                                   # generation per clip, so 2 is ~3x the stage-b cost of 0.
+pure_cmd_segments: 2              # pure stairs are the ONLY place lateral/yaw is on terrain
+pure_cmd_vy_range: [-0.6, 0.6]
+pure_cmd_wz_range: [-0.8, 0.8]
+pure_cmd_p_straight: 0.25
 min_hold_m: 1.5                   # shortest steady stretch (m) a hold may be. Below a gait cycle a
                                   # "hold" is not steady, and loop_frames_for rounds it UP -- which
                                   # overruns the travel budget and pushes terrain past the platform.
@@ -116,7 +120,7 @@ segment_reuse: false            # share a generated MB segment between clips wit
 # The tile POPULATION and the gait phase each clip hands off at. Distribution parameters in the
 # same sense the velocity bands are -- these used to reach a build only through mb_plan_library's
 # argparse defaults, i.e. from a second place, which is the thing this file exists to prevent.
-n_steps_range: [3, 7]            # treads per TRANSITION stair tile
+n_steps_range: [1, 7]            # 1 and 2 included; see g1_mb_v6.yaml
 tile_width_range: [0.8, 1.2]     # corridor width (m) per transition tile
 entry_pick: sample               # which boundary-gate candidate the terrain entry hands off at.
                                  # 'sample' varies the gait phase per clip; a fixed preference
