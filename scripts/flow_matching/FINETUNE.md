@@ -16,13 +16,38 @@ This is NOT the teacher PPO fine-tune that `README.md` §4c documents; nothing h
 Both are exported side by side in the same `exported/` directory, which is exactly how they
 get confused -- the mistake reads as a plausible run against a plausible generator.
 
+**Two parents, and only these two, until a new generator is trained** (decided 2026-09-09):
+
+| arm | checkpoint | serve with |
+|---|---|---|
+| **reference history** | `logs/flow_matching/2026-08-25_09-03-39_plan_v1_h64_27M_nojumpoff/best.pt` | `HISTORY_FROM=generator` |
+| **measured history** | `logs/flow_matching/2026-09-03_01-42-04_2026-09-03_measured_n3/best.pt` | `HISTORY_FROM=measured` |
+
 | role | artifact |
 |---|---|
-| **parent generator** | `logs/flow_matching/2026-08-25_09-03-39_plan_v1_h64_27M_nojumpoff/best.pt` |
-| | exported: `2026-08-25_09-03-39_plan_v1_h64_27M_nojumpoff_fm.onnx` |
 | **tracker** | `logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1` (the loop's `TRK` default) |
 | task | `G1-box2-finetune` |
-| *the DEPLOYED generator, for contrast* | `2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx` -- **the pair that drove the robot, and NOT this parent** |
+| *the DEPLOYED generator, for contrast* | `2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx` -- **the pair that drove the robot, and NOT either parent** |
+
+Three things about that pair that are easy to get wrong:
+
+- **`nojumpoff` drops only the BACKWARDS dismount.** `skip_families=['family_jump_off']`;
+  `family_jump_off_front`, the forward dismount, is still in the training set -- which matters
+  because dismounting a box is forward. Both parents carry the same skip list.
+- **There is no runtime arm called "reference".** `HISTORY_ARM_SOURCE` is
+  `{"generator": "reference", "measured": "measured"}`, so a reference-trained checkpoint is
+  served by `history_from="generator"`, its own previous output. The runtimes refuse a
+  mismatched pair: the two kinds of history row are identical in WIDTH, so a mismatch loads
+  clean and merely steers wrong.
+- **They are not architecture-matched.** The reference parent is `N=4` and every measured
+  generator is `N=3`, and they trained on different datasets. So a difference between the two
+  is not attributable to the history kind alone; the one-variable comparison is the
+  `ref_n3` / `meas_n3` pair, which is what the matched test used to measure +0.003.
+
+Two wrong turns, both of which cost time on 2026-09-09: the deployed generator sits in the
+same `exported/` directory and was never a parent; and the three `lag48_aug` runs have
+`skip_families=None`, i.e. they INCLUDE the backwards jump-off, so none of them is "the
+no-jump-off one".
 
 `nojumpoff` names the difference that matters: it was trained with `family_jump_off` excluded
 (the BACKWARDS dismount, which no forward-facing camera can see). Recorded in every arm's own
@@ -94,10 +119,15 @@ reported as plain BC has to actually be plain BC or the ladder has no bottom run
   so a fall in the run-out after the goal is a success and a robot dragged over the line after
   failing is not.
 
-`FAILURE_RULE` decides what "failure" means for the last two, and **it is the fall alone
-(`loose`)**. `strict` adds the bootstrap tracking tolerances, and on this terrain they saturate:
-99.5% of episodes, median step 378 against a median ARRIVAL at step 765. Measured consequences,
-both of which read as policy results --
+`FAILURE_RULE` decides what "failure" means for the last two, and **it is `strict` -- the fall
+OR the tracking bounds -- because Isaac now TERMINATES on those bounds**
+(`terminations.tracking_violation`, height 0.12 m). On a recording made with that termination
+the two rules agree by construction: an episode that leaves the bounds ends there, so it cannot
+arrive afterwards.
+
+**On a recording made BEFORE the termination, score it with `loose`.** There the run continued
+past a violation, and strict then fires on 99.5% of episodes at a median step 378 against a
+median ARRIVAL at 765 -- consequences that read as policy results --
 
 - the `arrived` filter keeps 33 of 8310 episodes (0.40%) instead of 728 (8.8%);
 - the critic's window cut removes the episode's LAST re-plan, the only row the success bonus is
@@ -105,8 +135,8 @@ both of which read as policy results --
   essentially no success term in it.
 
 Of the strict violations on arriving episodes, **88% are the HEIGHT bound firing first**
-(`max_height_m = 0.2` against a `BOX_HEIGHT_M = 0.40` obstacle -- you cannot climb the box
-without transiently violating it); tilt 9.9%, lateral 3.3%. Those bounds are marked
+(`max_height_m = 0.12` since 2026-09-09, chosen from the measured arrived-vs-fell separation
+rather than fitted); tilt 9.9%, lateral 3.3%. Those bounds are marked
 `provenance["bootstrap"]` and were never fitted. `TODO(tracking-height-bound)`.
 
 ## Spawn areas: training draws all of them, every eval draws the ground
@@ -173,9 +203,11 @@ what it is. Not a mismatch.
 
 `--obstacle_from raised` is required on a box course: the default tread filter refuses a 1.20 m
 box by design. Nothing else in `transfer/sim` applies the strict bounds -- `mode_probe.py` and
-`gen_tracker_runner.py` pass no `tracking_spec`, so every clip they produce is fall-only, and in
-Isaac the violation is LATCHED rather than terminated. This script is the only place the strict
-rule is visible.
+`gen_tracker_runner.py` pass no `tracking_spec`, so every clip they produce is fall-only. In
+ISAAC the violation is now a TERMINATION (`terminations.tracking_violation`), so a recording
+made after 2026-09-09 ends at the bound; recordings made before it ran on past one, which is
+why the reducers take `--failure_rule`. In MuJoCo this script is still the only place the
+strict rule is visible.
 
 ## Traps, each already paid for
 

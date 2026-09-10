@@ -116,6 +116,15 @@ ROUNDS=$(( (NEPS + NENV - 1) / NENV ))
 
 #: WHICH SPAWN AREAS. `ground` is the eval rule on every terrain; `all` reproduces the
 #: TRAINING distribution and is not a success rate for the course.
+#: What fills the generator's history rows. MUST match the arm the checkpoint was TRAINED
+#: for -- the fine-tune stamps `history_source` from its recording and the runtimes refuse a
+#: mismatched pair, because the two kinds of history row are identical in WIDTH and a
+#: mismatch merely steers wrong.
+HISTORY_FROM=${HISTORY_FROM:-generator}
+case "$HISTORY_FROM" in generator|measured) ;; *)
+  echo "REFUSING: HISTORY_FROM must be generator or measured; got '$HISTORY_FROM'." >&2
+  exit 2;; esac
+
 SPAWN_FROM=${SPAWN_FROM:-ground}
 case "$SPAWN_FROM" in ground|all) ;; *)
   echo "REFUSING: SPAWN_FROM must be ground or all; got '$SPAWN_FROM'." >&2; exit 2;; esac
@@ -127,6 +136,15 @@ case "$SPAWN_FROM" in ground|all) ;; *)
 #: EXACT-EQUALITY test in `goal_region.in_goal`, so a spec of 0 scored an entire arm at 0.0000
 #: over 8400 episodes while looking like a broken policy.
 HEIGHT_TOL=$(awk -v v="${HEIGHT_TOL:-$DEF_TOL}" 'BEGIN{printf "%.6f", v+0}')
+# awk's `v+0` turns ANYTHING un-numeric into 0 -- and 0 is the value this comment says scored
+# an arm at 0.0000 over 8400 episodes. So the coercion is checked, not trusted: `HEIGHT_TOL=p5`
+# would otherwise silently disable the height test on the one terrain where it decides arrival.
+awk -v v="${HEIGHT_TOL:-$DEF_TOL}" 'BEGIN{exit !(v+0 > 0 && v+0 == v+0)}' 2>/dev/null \
+  && [ "$(awk -v v="$HEIGHT_TOL" 'BEGIN{exit !(v>0)}'; echo $?)" = "0" ] || {
+  echo "REFUSING: HEIGHT_TOL='${HEIGHT_TOL:-$DEF_TOL}' is not a positive number (it coerced" >&2
+  echo "  to $HEIGHT_TOL). 0 does not mean 'off' here -- goal_region.in_goal reads it as an" >&2
+  echo "  EXACT-equality test, which is never satisfiable." >&2
+  exit 2; }
 
 #: The commanded speeds, one recording each, pinned per cell. THE SAME THREE ON EVERY COURSE,
 #: which is what makes a box2 cell and an up-into-down cell the same command -- and they are
@@ -156,6 +174,7 @@ mkdir -p "$OUT"
 echo "[eval] $TAG  terrain=$TERRAIN  fm=$FM"
 echo "[eval]   clip   $CLIP"
 echo "[eval]   goals  $GR  height_tol=$HEIGHT_TOL"
+echo "[eval]   hist   $HISTORY_FROM"
 echo "[eval]   spawn  $SPAWN_FROM  (the eval rule is 'ground' -- the INITIAL area only)"
 echo "[eval]   axis   $AXIS = [$DISTS]"
 echo "[eval]   speeds $SPEEDS m/s"
@@ -175,9 +194,19 @@ for spd in $SPEEDS; do
     env.commands.traj_ref.freeform_speed_min=$spd \
     env.commands.traj_ref.freeform_speed_max=$spd \
     env.events.reset_on_section.params.spawn_from=$SPAWN_FROM \
+    env.commands.traj_ref.history_from=$HISTORY_FROM \
     env.terminations.goal_reached.params.height_tol_m=$HEIGHT_TOL \
     env.episode_length_s=40.0 \
     > "$d.log" 2>&1 || { echo "[eval] speed $spd FAILED, see $d.log" >&2; exit 1; }
 done
 echo "[eval] done $(date +%H:%M)"
-$PY scripts/rsl_rl/box2_ic_report.py "$OUT" --distances $DISTS
+# `--distances` only when the course HAS a scalar axis. `varied` and `indist` have none --
+# their tiles vary wholesale geometry and are 75 real library tiles -- so `terrain_axis.py`
+# returns an empty list by design, and passing the flag with no values made argparse refuse
+# AFTER the entire GPU eval had finished.
+if [ -n "$DISTS" ]; then
+  $PY scripts/rsl_rl/box2_ic_report.py "$OUT" --distances $DISTS
+else
+  echo "[eval] $AXIS: no scalar axis on this course; cells are labelled by tile index"
+  $PY scripts/rsl_rl/box2_ic_report.py "$OUT"
+fi

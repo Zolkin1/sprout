@@ -39,7 +39,12 @@ cd "$W" || exit 1
 TAG=""; GPU=""; BUFFER=4000; REFRESH=1000; ITERS=5; ROOT=""
 PARENT="${PARENT:-/mnt/zolkin_new/sprout/terrain_reward_smoke/fm/best.pt}"
 TRK="${TRK:-2026-08-20_16-36-10_mode11_decor_plan_v1}"
-CLIP="${CLIP:-clips/box2_v2_train.h5}"
+#: The two-box TRAINING library: v2 geometry with the three spawn areas declared. The old
+#: default `box2_v2_train.h5` was retired on 2026-09-09 -- it declares 0 spawn areas, which
+#: today's generator cannot reproduce, and it is in `clips/_retired_2026-09-09/`. The eval
+#: uses `box2_v2spawn_quick_train.h5`, the same course on 2 tiles, and the ground-only spawn
+#: rule makes the two comparable by construction.
+CLIP="${CLIP:-clips/box2_v2spawn_train.h5}"
 GOALS="${GOALS:-logs/box2/goal_regions.json}"
 TASK="${TASK:-G1-box2-finetune}"
 NENV="${NENV:-2048}"
@@ -127,6 +132,25 @@ case "$ALGO" in awr|fbc|bc|arrived) ;; *)
 FAILURE_RULE="${FAILURE_RULE:-strict}"
 case "$FAILURE_RULE" in strict|loose) ;; *)
   echo "REFUSING: FAILURE_RULE must be strict or loose; got '$FAILURE_RULE'."; exit 2;; esac
+
+#: What fills the generator's HISTORY rows during collection.
+#:
+#: `generator` (default) is its own previous output -- the closed loop, and what deploys.
+#: `measured` is the robot's own achieved state, which is a different KIND of quantity: the
+#: model is FITTED on reference rows, so the closed loop is distribution-consistent and merely
+#: drifting where measured is real and off-distribution (0.54 sigma on joint_pos, 0.69 on
+#: base_ang_vel). Four independent measurements put the arm at +0.003 to +0.025, all null --
+#: read a `measured` run against that, not as a clean grounding experiment.
+#:
+#: The fine-tune re-stamps `history_source` from the recording, so the checkpoint records the
+#: arm it was trained for and the runtimes refuse a mismatched pair. The EVAL therefore has to
+#: be told too: pass the same HISTORY_FROM to `run_quick_eval.sh`.
+HISTORY_FROM="${HISTORY_FROM:-generator}"
+case "$HISTORY_FROM" in generator|measured) ;; *)
+  echo "REFUSING: HISTORY_FROM must be generator or measured; got '$HISTORY_FROM'."
+  echo "  'clip' is teacher forcing and is IMPOSSIBLE on these courses: the free-form"
+  echo "  libraries are manifest-only with zero clips, so there is no reference to feed."
+  exit 2;; esac
 
 #: Percentile BELOW which a chunk is negative, i.e. `fbc` keeps the top `100 - this`%.
 #: Only read by `fbc`; `awr` uses the continuous advantage column and ignores the labels.
@@ -224,7 +248,8 @@ esac
 echo "[awr] failed $FAILURE_RULE -- $([ "$FAILURE_RULE" = "strict" ] \
   && echo "fall OR the tracking bounds (Isaac TERMINATES on them: height 0.12 m)" \
   || echo "the FALL alone -- for scoring a recording made before the termination landed")"
-echo "[awr] arms   camera 0.5 (dead, per-replan), history 0.0, speed-mismatch $SPEED_MISMATCH"
+echo "[awr] arms   camera 0.5 (dead, per-replan), history-null 0.0, speed-mismatch $SPEED_MISMATCH"
+echo "[awr] hist   $HISTORY_FROM$([ "$HISTORY_FROM" = "measured" ] && echo " -- OFF-DISTRIBUTION by design; the eval must pass the same" || echo "")"
 echo "[awr] clip   $CLIP"
 echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
 echo "[awr] goal   height tolerance $HEIGHT_TOL m $(awk -v v="$HEIGHT_TOL" 'BEGIN{exit !(v+0==0)}' && echo "(height test OFF -- a goal ABOVE the spawn can be scored from the floor)" || echo "(pelvis must arrive at the goal height)")"
@@ -314,6 +339,7 @@ for (( it=1; it<=ITERS; it++ )); do
       env.commands.traj_ref.fm_upper_camera_noise_mode=dead \
       env.commands.traj_ref.fm_upper_camera_noise_cadence=replan \
       env.commands.traj_ref.fm_history_null_fraction=0.0 \
+      env.commands.traj_ref.history_from="$HISTORY_FROM" \
       env.commands.traj_ref.fm_speed_mismatch_fraction="$SPEED_MISMATCH" \
       env.commands.traj_ref.fm_speed_mismatch_cadence=replan \
       env.commands.traj_ref.freeform_speed_min="$SPEED_MIN" \
