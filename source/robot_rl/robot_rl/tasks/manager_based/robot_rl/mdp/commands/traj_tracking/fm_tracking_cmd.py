@@ -1153,9 +1153,22 @@ class FmTrackingCommand(MotionSequenceCommand):
     #: describing a start that never happens. Verified by walking the constructed cfg, not by
     #: reading the class.
     _CLIP_PHASE_KNOBS: tuple[tuple[str, object, str], ...] = (
-        ("history_from", "generator",
-         "the only other value is 'clip' -- teacher forcing, which feeds the generator the "
-         "CLIP's window as history (_clip_history_node) and is a per-step clip gather"),
+        # ALLOWED: generator and measured. Refused: clip.
+        #
+        # This entry used to demand `generator` alone, with the reason "the only other value
+        # is 'clip'" -- true when there were two arms, and wrong since `measured` was added.
+        # `measured` fills the history from the ROBOT's own achieved state and reads no clip
+        # at all (`window.MEASURED_HISTORY_FALLBACK` names the two half-blocks that fall back
+        # to the prediction because no robot can measure them), so a clip-free library is no
+        # obstacle to it. `clip` IS teacher forcing -- it feeds the generator the CLIP's
+        # window via `_clip_history_node`, a per-step clip gather -- and stays refused.
+        #
+        # The over-broad version made the measured arm impossible on every free-form course,
+        # which is every course this pipeline uses.
+        ("history_from", ("generator", "measured"),
+         "'clip' is teacher forcing, which feeds the generator the CLIP's window as history "
+         "(_clip_history_node) and is a per-step clip gather; 'measured' reads only the "
+         "robot's own state and is allowed"),
         ("seed_history_from_clip", "never",
          "seeding reads the clip's steps BEFORE the episode start; with no clip every episode "
          "opens on the learned null-history embedding, which is the deploy condition anyway"),
@@ -1175,13 +1188,25 @@ class FmTrackingCommand(MotionSequenceCommand):
         Raises:
             ValueError: If any knob in :data:`_CLIP_PHASE_KNOBS` is not at its required value.
         """
+        def _ok(got, want) -> bool:
+            """Whether a knob is at a permitted value.
+
+            ``want`` is either the single required value or a TUPLE of permitted ones -- some
+            knobs are genuinely binary against a clip-free library and one (`history_from`)
+            has three arms of which two need no clip.
+            """
+            return got in want if isinstance(want, tuple) else got == want
+
         wrong = [(name, getattr(self.cfg, name, want), want, why)
                  for name, want, why in self._CLIP_PHASE_KNOBS
-                 if getattr(self.cfg, name, want) != want]
+                 if not _ok(getattr(self.cfg, name, want if not isinstance(want, tuple)
+                                    else want[0]), want)]
         if not wrong:
             return
         lines = "\n".join(
-            f"    commands.traj_ref.{name} = {got!r}  (must be {want!r}: {why})"
+            f"    commands.traj_ref.{name} = {got!r}  (must be "
+            f"{' or '.join(map(repr, want)) if isinstance(want, tuple) else repr(want)}"
+            f": {why})"
             for name, got, want, why in wrong
         )
         raise ValueError(
