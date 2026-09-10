@@ -78,6 +78,13 @@ for _pkg in ("motion_gen", "robot_rl"):
     _p = str(_REPO_ROOT / "source" / _pkg)
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# Its OWN directory, so the sibling `terrain_library` import below resolves however this module
+# was loaded. Running it as a script works without this -- python puts the script's directory on
+# the path itself -- so the gap is invisible from the CLI and appears only when something
+# IMPORTS this module, which `test_freeform_env_cfg` does.
+_HERE = str(pathlib.Path(__file__).resolve().parent)
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
 
 from motion_gen.clips.clip_fingerprint import fingerprint_terrain_manifest  # noqa: E402
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library  # noqa: E402
