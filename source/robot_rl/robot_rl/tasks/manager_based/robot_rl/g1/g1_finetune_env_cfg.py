@@ -145,6 +145,7 @@ class G1FinetuneTerminationCfg:
     )
 
 
+
 ##
 # Commands
 ##
@@ -285,6 +286,44 @@ class G1FinetuneFreeformTerminationCfg(G1FinetuneTerminationCfg):
     which varies 10-38 m across this terrain set.
     """
 
+    #: THE STRICT TRACKING BOUNDS, as a termination rather than an offline latch.
+    #:
+    #: The union of lateral 0.20 m / height 0.12 m / tilt 30 deg around the SERVED node, from
+    #: `tracking_error.BOOTSTRAP_SPEC` -- so this term and every offline reader of
+    #: `first_violation_step` cannot disagree about what a violation is.
+    #:
+    #: **What it buys, and it is not primarily a fall detector.** The height bound separates a
+    #: correct box dismount from a stairs-down-off-a-box one: watching the two-box course,
+    #: proper jump-downs peak at 0.130-0.182 m while the wrong mode approaches the bound. So
+    #: an episode that takes the wrong mode ends there and never banks the progress reward's
+    #: success bonus, which is paid on the last re-plan of an ARRIVING episode.
+    #:
+    #: **It also makes the pipeline coherent.** Previously the recording ran past a violation
+    #: and every consumer cut the episode there offline -- so a run reached the goal, banked
+    #: the bonus, and the offline cut then deleted the row it was paid on, measured at 95.3%
+    #: of arriving episodes. Terminating means no consumer needs to truncate anything and
+    #: `reached_goal` and `rollout_outcomes.terminal_reward` become the same question.
+    #:
+    #: **Cost, measured on the real opening data set before switching it on** (2000 parent
+    #: episodes, DR on, 3 spawn areas): clean arrivals 21.70% -> 16.85% of all episodes;
+    #: windows surviving 95.7% -> 93.4%. Ground-start clean arrivals fall 4.18% -> 0.46%, so
+    #: at this bound every clean success in an opening set is a box-top dismount -- a scarcity
+    #: that predates this and is what box-top spawns exist for.
+    #:
+    #: `base_tilt_error` (60 deg) is now redundant with this term's 30 deg and is kept as a
+    #: backstop: it is a different function on a different reference accessor, and on the
+    #: measured opening set the tilt bound never binds before the height one anyway.
+    #:
+    #: **DECLARED HERE, on the free-form cfg, and deliberately NOT on the clip fine-tune it
+    #: inherits from.** Two reasons, and the second is correctness rather than scope: the bound
+    #: was calibrated against the GENERATOR's served node on these courses, and
+    #: `_pred_valid` -- the gate that stops this firing before the first plan exists -- is
+    #: absent on the clip command, where a reference always exists. On the clip path the gate
+    #: would silently be a no-op and the term live from step 0, on a task nothing here
+    #: measured.
+    tracking_violation = DoneTerm(func=mdp.fm_tracking_violation_termination,
+                                  params={"command_name": "traj_ref"})
+
     goal_reached = DoneTerm(
         func=mdp.freeform_goal_reached,
         params={"min_half_width": FREEFORM_GOAL_MIN_HALF_WIDTH_M,
@@ -337,8 +376,17 @@ class G1FinetuneFreeformEventsCfg(G1TeacherTerrainDepthEventsCfg):
         # inside the start platform, which the 1.219 m platform minimum affords; at the 1.219 m
         # narrowest flight the lateral half-width leaves 0.36 m of apron either side of the
         # robot, so widening it needs the apron widened too.
+        #
+        # ``spawn_from`` is "all" here because this is the TRAINING task: the raised areas
+        # (a box top, the platform between two flights) exist so the second half of a
+        # traverse appears in the data at all, and AWR can only reweight what it is shown.
+        # **Every EVAL overrides it to "ground"**, on every terrain, so a reported rate is
+        # always the complete course --
+        # `env.events.reset_on_section.params.spawn_from=ground`, which
+        # `scripts/rsl_rl/run_quick_eval.sh` passes and records. See
+        # `mdp.events.resets.SPAWN_FROM`.
         params={"spawn_z_offset": 0.005, "pos_jitter_m": (0.25, 0.25),
-                "yaw_jitter_rad": 0.2},
+                "yaw_jitter_rad": 0.2, "spawn_from": "all"},
     )
 
 

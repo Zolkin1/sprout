@@ -292,6 +292,76 @@ def fm_base_tilt_error_termination(
     return torch.arccos(cos) > max_tilt_rad
 
 
+def fm_tracking_violation_termination(
+    env,
+    command_name: str = "traj_ref",
+    spec: "object | None" = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate where the robot leaves the STRICT tracking bounds around the served node.
+
+    The union of the three checks in :func:`mdp.tracking_error.violation_checks` -- lateral,
+    height, tilt -- evaluated against the reference the generator actually served this step.
+    It goes through those functions rather than restating the tests, so this termination and
+    every offline consumer of ``first_violation_step`` cannot disagree about what a violation
+    is; the bounds likewise come from ``BOOTSTRAP_SPEC`` rather than being written here.
+
+    **Why this is a TERMINATION and not just the offline latch it used to be.**  The recording
+    used to run on past a violation and every consumer then cut the episode there offline,
+    which left the two halves incoherent: the run reached the goal and banked the progress
+    reward's success bonus, and the offline cut then deleted the very row that bonus was paid
+    on -- measured at 95.3% of arriving episodes.  Terminating makes the episode END where
+    every consumer already thought it ended, so the bonus is simply never earned by a run that
+    left the bounds, no truncation is needed anywhere, and ``reached_goal`` and
+    ``rollout_outcomes.terminal_reward`` become the same question.
+
+    **It cannot fire before the generator has planned.**  ``_pred_valid`` is False until the
+    first re-plan, and before that there is no served reference to be far from -- a real state
+    rather than an error.  Without this gate every episode would terminate on step 0, which
+    is indistinguishable from a policy that cannot stand up.
+
+    **The height bound is doing the work here, and it is chunk-local.**  Under
+    ``window_anchor="plan"`` the served node is expressed against the robot's own root at the
+    last re-plan, so a height excursion has to accumulate inside one re-plan (0.24 s at
+    K=12).  That is why this does not contradict
+    :func:`base_height_below_termination`'s docstring, which rejects a reference-relative
+    height bound as a FALL detector: a slow sink re-datums away and is invisible here, which
+    is exactly why the absolute-height term stays.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The tracking command term.
+        spec: A ``tracking_error.TrackingErrorSpec``, or ``None`` for ``BOOTSTRAP_SPEC``.
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    from ..tracking_error import BOOTSTRAP_SPEC, tracking_error, violates  # noqa: PLC0415
+
+    cmd = env.command_manager.get_term(command_name)
+    robot = env.scene[asset_cfg.name]
+    sp = BOOTSTRAP_SPEC if spec is None else spec
+    # Offset 0 -- the node being tracked THIS step, which is what the accumulator grades and
+    # what `first_violation_step` is recorded against.
+    zero = torch.zeros(1, dtype=torch.long, device=env.device)
+    pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(zero)
+    jp, _ = cmd.get_future_joint_state(zero)
+    d = robot.data
+    # `root_link_*`, NOT `root_lin_vel_w`: the latter is the CoM twist. The same choice as
+    # `eval.accumulate`, and mixing the two would put a systematic offset on the velocity
+    # term in one place only.
+    err = tracking_error(
+        pos_w[:, 0], quat_w[:, 0], lin_w[:, 0], ang_w[:, 0], jp[:, 0],
+        d.root_pos_w, d.root_quat_w, d.root_link_lin_vel_w, d.root_link_ang_vel_w,
+        d.joint_pos)
+    hit = violates(err, sp)
+    valid = getattr(cmd, "_pred_valid", None)
+    if valid is not None:
+        hit = hit & valid.reshape(-1).to(hit.device)
+    return hit
+
+
 def base_orientation_from_upright(
     env,
     roll_limit_deg: float = 70.0,

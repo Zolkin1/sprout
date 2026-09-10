@@ -31,15 +31,27 @@ reads ``predictions.npz`` -- the critic's output -- so a critic-free path throug
 still need a critic to have run, which defeats the baseline.  Here nothing is fitted: the
 label is a property of the recording.
 
-**The failure rule is IMPORTED, not restated**, and it decides what "before it failed"
-means, so it moves this filter a lot: strict keeps 55.8% of episodes on a real buffer against
-loose's 67.1%, because 41.7% of them trip a tracking violation somewhere.  ``rollout_outcomes.terminal_reward`` is the
-one definition of "this episode failed", and the strict/loose choice moves the answer
-enormously -- on the box2 grid the strict rule labels 8967 of 9000 episodes failed against the
-loose rule's 8272, because 695 episodes REACHED THE GOAL and tripped the bootstrap tolerances
-on the way, so the positive set is 33 rows or 728 depending on the flag.  An arm that
-reimplemented the rule could differ from the arm it is being compared against for a reason
-that has nothing to do with selection.
+**The failure rule is IMPORTED, not restated** -- ``rollout_outcomes.terminal_reward`` is the
+one definition of "this episode failed" -- and the choice between its two rules decides
+whether this arm is a baseline at all.
+
+**Use ``strict``, and since 2026-09-09 that is what Isaac TERMINATES on** -- an episode
+that leaves the tracking bounds ends there, so it cannot arrive and this filter rejects it by
+construction rather than by a threshold applied after the fact.  ``loose`` is for scoring a
+recording made BEFORE the termination landed, where the two differ a great deal.  On the
+in-distribution buffer the two rules are merely different: strict keeps 55.8% of episodes
+against loose's 67.1%, because 41.7% trip a tracking tolerance somewhere.  On the
+out-of-distribution box2 grid the strict rule saturates -- it fires on 99.5% of episodes at a
+median step 378 against a median ARRIVAL at step 765 -- and labels 8967 of 9000 episodes
+failed against the loose rule's 8272, because 695 episodes REACHED THE GOAL and tripped the
+bootstrap tolerances on the way.  **So the positive set is 33 rows or 728 depending on one
+flag**, i.e. 0.40% or 8.8% of the buffer, and at 33 rows "keep the episodes that did not fail"
+is not a selection rule, it is noise.
+
+The same rule reaches ``fit_value.py``, where it cuts every window at or after the first bad
+step: under strict that cut removes the episode's LAST re-plan -- the only row the progress
+reward's success bonus is paid on -- from 95.3% of the arriving episodes.  One rule, chosen
+once, passed to both; ``run_finetune_loop.sh`` does that and prints it.
 """
 
 from __future__ import annotations
@@ -70,11 +82,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--out", required=True, help="Output .npz sidecar.")
     p.add_argument("--failure_rule", default="strict", choices=("strict", "loose"),
                    help="What counts as failing BEFORE arrival, which is what this filter "
-                        "tests against. MUST match the rule the arm being "
-                        "compared against used -- fit_value.py's own default is strict, so "
-                        "that is the default here. Strict counts the tracking violation "
-                        "alongside the fall; loose is the fall alone, which is what MuJoCo "
-                        "scores. On the box2 grid the two differ by 695 episodes of 9000.")
+                        "tests against. loose (the default) is the FALL alone, which is what "
+                        "MuJoCo scores and what the eval reports; strict adds the bootstrap "
+                        "tracking tolerances, which on out-of-distribution terrain fire on "
+                        "99.5%% of episodes and cut the positive set from 728 rows to 33. "
+                        "MUST match the rule the arm being compared against used.")
     p.add_argument("--drop_censored", action="store_true", default=True,
                    help="Drop chunks of episodes cut off by the recording's stop rather than "
                         "by an outcome. A censored episode neither survived nor failed, and "

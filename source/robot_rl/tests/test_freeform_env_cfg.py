@@ -174,13 +174,29 @@ def test_the_episode_is_bounded_by_the_goal_band_not_by_a_clip_running_out(cfgs)
     up-into-down platform is 0.90 m up, a box top 0.40). It is pinned here because the
     termination SET is what decides how an episode can end, and a term silently added or
     dropped changes every outcome table without changing any number's shape.
+
+    `tracking_violation` is the FOURTH failure term, added 2026-09-09: the strict tracking
+    bounds around the served node (lateral 0.20 / height 0.12 / tilt 30 deg). It is the one
+    term here that is not a fall detector -- the height bound separates a correct box dismount
+    from a stairs-down-off-a-box one -- and it exists as a TERMINATION rather than the offline
+    latch it used to be because the latch made the pipeline incoherent: the run reached the
+    goal and banked the progress reward's success bonus, then every consumer cut the episode at
+    the latch and deleted the row that bonus was paid on, on 95.3% of arriving episodes.
+
+    It is deliberately NOT `time_out`: a violation is a failure, and marking it a truncation
+    would make ``rollout_outcomes.terminal_reward`` score it 0 rather than -1.
     """
     freeform, clip = cfgs
     assert freeform.terminations.clip_end is None
     assert freeform.terminations.goal_reached.time_out is True
     assert _active(freeform.terminations) == [
-        "time_out", "base_height", "base_tilt_error", "base_upright", "goal_reached",
+        "time_out", "base_height", "base_tilt_error", "base_upright", "tracking_violation",
+        "goal_reached",
     ]
+    assert freeform.terminations.tracking_violation.time_out is not True
+    # The CLIP fine-tune is untouched: its reference is a placed clip, so a bound built for the
+    # generator's served node has no meaning there and adding it would change a task this
+    # decision was never about.
     assert _active(clip.terminations) == [
         "time_out", "clip_end", "base_height", "base_tilt_error", "base_upright",
     ]

@@ -107,12 +107,26 @@ ALGO="${ALGO:-awr}"
 case "$ALGO" in awr|fbc|bc|arrived) ;; *)
   echo "REFUSING: ALGO must be awr, fbc, bc or arrived; got '$ALGO'."; exit 2;; esac
 
-#: What counts as failing BEFORE arrival for the `arrived` arm -- which is what that filter
-#: tests against, so it moves the keep rate a lot: strict keeps 55.8% of episodes on a real
-#: buffer against loose's 67.1%, because 41.7% of them trip a tracking violation somewhere.
-#: Must match the rule the arms it is compared against used; `fit_value.py`'s default is
-#: strict, so this is too.
+#: What counts as FAILING, for every stage that needs the answer: the `arrived` arm's filter
+#: and the critic's window cut. ONE rule, passed to both, because they are two uses of one
+#: definition and an arm whose filter and whose critic disagreed about when an episode ended
+#: would differ from its control for a reason that is not the algorithm.
+#:
+#: **`strict` -- the fall OR the tracking bounds -- and as of 2026-09-09 Isaac TERMINATES on
+#: the tracking bounds too** (`terminations.tracking_violation`, height 0.12 m). That is what
+#: makes strict the coherent default rather than a truncation: an episode that leaves the
+#: bounds ENDS there, so it cannot reach the goal, cannot bank the success bonus, and no
+#: consumer has to cut anything offline. `reached_goal` and `terminal_reward` then ask the
+#: same question and the critic's window cut is a no-op.
+#:
+#: Measured before switching it on, on the real opening data set (2000 parent episodes, DR on,
+#: 3 spawn areas): clean arrivals 21.70% -> 16.85% of all episodes, windows 95.7% -> 93.4%.
+#: `loose` reproduces the pre-termination behaviour and is what a recording made before this
+#: must be scored under -- under `strict`, on a recording that did NOT terminate, the cut
+#: deleted the success bonus row from 95.3% of arriving episodes.
 FAILURE_RULE="${FAILURE_RULE:-strict}"
+case "$FAILURE_RULE" in strict|loose) ;; *)
+  echo "REFUSING: FAILURE_RULE must be strict or loose; got '$FAILURE_RULE'."; exit 2;; esac
 
 #: Percentile BELOW which a chunk is negative, i.e. `fbc` keeps the top `100 - this`%.
 #: Only read by `fbc`; `awr` uses the continuous advantage column and ignores the labels.
@@ -202,8 +216,14 @@ case "$ALGO" in
   awr) echo "[awr] algo   AWR, beta $BETA (sd units), clip 20, global normalize";;
   fbc) echo "[awr] algo   FILTERED BC, top $(awk -v p="$PERCENTILE" 'BEGIN{printf "%g", 100-p}')% by advantage (--filter_label positive)";;
   bc)  echo "[awr] algo   PLAIN BC on ALL data -- no labels, no weights; critic+label SKIPPED";;
-  arrived) echo "[awr] algo   ARRIVED-ONLY filter ($FAILURE_RULE failure rule); critic SKIPPED";;
+  arrived) echo "[awr] algo   ARRIVED-ONLY filter; critic SKIPPED";;
 esac
+# EVERY arm that reads it, not just `arrived`: the critic's window cut uses the same rule, and
+# under `strict` on this terrain that cut removes the success bonus from 95% of the arriving
+# episodes. A run's own log is the only durable record of which definition it used.
+echo "[awr] failed $FAILURE_RULE -- $([ "$FAILURE_RULE" = "strict" ] \
+  && echo "fall OR the tracking bounds (Isaac TERMINATES on them: height 0.12 m)" \
+  || echo "the FALL alone -- for scoring a recording made before the termination landed")"
 echo "[awr] arms   camera 0.5 (dead, per-replan), history 0.0, speed-mismatch $SPEED_MISMATCH"
 echo "[awr] clip   $CLIP"
 echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
@@ -402,6 +422,7 @@ for (( it=1; it<=ITERS; it++ )); do
         --reward_npz "$BUF_NPZ" \
         "${REWARD_ARGS[@]}" "${BOOT_ARGS[@]}" \
         --window 3 --quality_kind mse --quality_only \
+        --failure_rule "$FAILURE_RULE" \
         --folds 2 --epochs "$EPOCHS_CRITIC" --variants V_priv --device cuda \
         --out "$RDIR" >> "$ITD/critic.log" 2>&1 \
         || fail "critic round $fr (see $ITD/critic.log)" "$it"
@@ -503,4 +524,7 @@ echo "[awr] policies:"
 for (( it=1; it<=ITERS; it++ )); do
   echo "    iter $it -> $ROOT/$(printf 'iter_%03d' "$it")/ft/last.pt"
 done
-echo "[awr] evaluate with: NENV=4096 bash scripts/rsl_rl/run_box2_quick_eval.sh"
+_last="$ROOT/$(printf 'iter_%03d' "$ITERS")/ft/last.pt"
+echo "[awr] evaluate with:"
+echo "    NENV=$NENV TERRAIN=box2 bash scripts/rsl_rl/run_quick_eval.sh $_last $TAG"
+echo "[awr]   NENV must MATCH across the arms of a comparison -- it sets the censored fraction."

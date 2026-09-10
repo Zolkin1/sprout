@@ -161,12 +161,49 @@ def test_the_arrived_arm_uses_its_own_labeller() -> None:
     assert re.search(r"fbc\|arrived\) ALGO_ARGS=\(--labels[^)]*--filter_label positive", t)
 
 
-def test_the_failure_rule_is_explicit_and_matches_the_critic_arms() -> None:
-    """strict vs loose moves the positive set from 33 rows to 728 on the box2 grid.
+def test_the_failure_rule_is_STRICT_because_isaac_now_terminates_on_it() -> None:
+    """strict vs loose moved the positive set from 33 rows to 728 on a pre-termination grid.
 
-    ``fit_value.py``'s default is strict, so an arm compared against a critic arm has to be
-    strict too or the two select from differently-defined populations.
+    That difference was the tell for an incoherence rather than a preference: the recording ran
+    PAST a violation and every consumer then cut the episode there offline, so a run reached
+    the goal, banked the progress reward's success bonus, and the cut deleted the row it was
+    paid on -- 95.3% of arriving episodes. Now ``terminations.tracking_violation`` ends the
+    episode at the bounds, so strict is what the simulator does and the two rules agree by
+    construction. ``loose`` survives for scoring a recording made before that.
     """
     t = LOOP.read_text()
-    assert re.search(r'^FAILURE_RULE="\$\{FAILURE_RULE:-strict\}"', t, re.M)
+    assert re.search(r'^FAILURE_RULE="\$\{FAILURE_RULE:-strict\}"', t, re.M), (
+        "the loop must default to the rule Isaac terminates on")
     assert '--failure_rule "$FAILURE_RULE"' in t
+    assert "REFUSING: FAILURE_RULE must be strict or loose" in t
+
+
+def test_ONE_failure_rule_reaches_both_the_critic_and_the_arrived_filter() -> None:
+    """They are two uses of one definition, and the loop used to pass it to only one.
+
+    ``fit_value.py`` cuts every window at or after the first bad step, and the progress
+    reward pays its success bonus on the episode's LAST re-plan alone -- so under strict that
+    cut removed the bonus from 95.3% of the ARRIVING episodes, and the critic was fitted on a
+    reward with essentially no success term in it while every log read as healthy. The loop
+    never passed the flag to the critic at all, so the two stages silently used different
+    definitions of the same word.
+    """
+    t = LOOP.read_text()
+    passes = re.findall(r'--failure_rule "\$FAILURE_RULE"', t)
+    assert len(passes) >= 2, (
+        f"the failure rule reaches {len(passes)} stage(s); the critic's window cut and the "
+        "arrived filter both need it")
+    # The INVOCATION, not the prose: anchored on the interpreter, since the flag's own
+    # rationale is written out in a comment that mentions the script by name.
+    fit = re.search(r'"\$PY" -u scripts/flow_matching/fit_value\.py(.*?)\n\n', t, re.S)
+    assert fit, "fit_value.py's invocation is not where this test expects it"
+    assert '--failure_rule "$FAILURE_RULE"' in fit.group(1), (
+        "fit_value.py is called without the failure rule, so it falls back to its own "
+        "default -- which is how the critic and the arrived filter came to disagree")
+
+
+def test_the_banner_states_the_failure_rule_for_every_arm() -> None:
+    """A run's log is the only durable record of which definition of "failed" it used."""
+    t = LOOP.read_text()
+    assert re.search(r'echo "\[awr\] failed \$FAILURE_RULE', t), (
+        "the banner never names the failure rule outside the arrived arm's line")

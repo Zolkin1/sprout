@@ -251,6 +251,40 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
         print(f"[fit] drop-after-latch: {int((~alive).sum())}/{alive.size} windows "
               f"({100 * (~alive).mean():.2f}%) at or after the first bad step, over "
               f"{n_ep_touched} episode(s). These do not exist under termination.")
+        # DOES THE CUT REMOVE THE REWARD'S TERMINAL TERM? The progress reward pays its
+        # success bonus on the episode's LAST re-plan only, so a cut that lands before that
+        # row deletes the bonus rather than truncating a tail -- and value iteration then
+        # propagates a reward that has no success in it at all, while every log still reads
+        # as a healthy fit.
+        #
+        # Measured on box2 under `strict`: the tracking tolerances saturate on this
+        # out-of-distribution terrain (99.5% of episodes, median step 378 against a median
+        # ARRIVAL at 765), so the last re-plan survived on 4.7% of arriving episodes against
+        # 100% under `loose`. On the in-distribution buffer the same rule fires on ~42% and
+        # the cut is a real tail, which is why this is a warning keyed on the MEASUREMENT
+        # rather than a refusal to use the strict rule.
+        last_rep = {}
+        for u, rp in zip(W["episode_uid"], W["replan_index"]):
+            last_rep[int(u)] = max(last_rep.get(int(u), -1), int(rp))
+        # `reached_goal`, NOT the strict-scored reward: the question is which episodes carry
+        # a success bonus at all, and under strict the reward calls only 0.4% of them
+        # arrivals -- precisely the ones whose last re-plan trivially survived. Asking the
+        # reward would make the guard inspect the sample that cannot show the defect.
+        arrived_eps = {int(u) for u, rg in zip(E["episode_uid"], E["reached_goal"]) if rg}
+        if arrived_eps:
+            n_ep = {int(u): int(c) for u, c in zip(E["episode_uid"], E["n_replans"])} \
+                if "n_replans" in E else {}
+            if n_ep:
+                kept_last = [last_rep.get(u, -1) >= n_ep.get(u, 0) - 1 for u in arrived_eps]
+                frac = float(np.mean(kept_last)) if kept_last else 1.0
+                if frac < 0.5:
+                    print(f"[fit] !! the cut removes the LAST re-plan of "
+                          f"{100 * (1 - frac):.1f}% of the {len(arrived_eps)} ARRIVING "
+                          "episodes. The progress reward pays its success bonus there and "
+                          "nowhere else, so the critic is about to be fitted on a reward with "
+                          "essentially no success term in it. This is what the strict tracking "
+                          "rule does on out-of-distribution terrain -- pass "
+                          "`--failure_rule loose` unless you mean it.")
         W = {k: v[alive] for k, v in W.items()}
         lab = {k: v[alive] for k, v in lab.items()}
 
