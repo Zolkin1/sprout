@@ -862,7 +862,7 @@ FREEFORM_SPAWN_FIELDS: tuple[str, ...] = ("x", "y", "z", "half_x", "half_y", "ya
 #: Surface height (m) at or under which a spawn area counts as GROUND LEVEL.  A tolerance
 #: rather than an equality because the authored value is a float, and every family authors its
 #: ground areas at a literal ``0.0`` while the raised ones sit at a box height or a flight's
-#: top -- the smallest of which is the curb, two orders above this.
+#: top -- the smallest of which is a 0.40 m box top, four orders above this.
 GROUND_SPAWN_TOL_M: float = 1e-6
 
 #: The spawn-area subsets a reset can draw from.

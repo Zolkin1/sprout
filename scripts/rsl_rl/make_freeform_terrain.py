@@ -82,6 +82,10 @@ for _pkg in ("motion_gen", "robot_rl"):
 from motion_gen.clips.clip_fingerprint import fingerprint_terrain_manifest  # noqa: E402
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library  # noqa: E402
 from motion_gen.clips.clip_manager import MotionClipManager  # noqa: E402
+# The ONE copy. These were duplicated here when they moved out; two byte-identical
+# definitions of `verify` is exactly the drift the move existed to prevent.
+from terrain_library import _MINIMAL_META, library_meta, verify  # noqa: E402,F401
+
 from motion_gen.terrain.freeform import (  # noqa: E402
     COMMANDED_SPEED_RANGE_MPS,
     FAMILIES,
@@ -95,21 +99,7 @@ from motion_gen.terrain.freeform import (  # noqa: E402
 #: reads it without clips to index -- but it has to be a coherent, non-empty layout, because the
 #: loader's metadata keys are not optional and a zero-width name list would make the shapes
 #: degenerate.  ``--like`` copies a real library's layout for a consumer that inspects it.
-_MINIMAL_META: dict = {
-    "dt": 0.02,
-    "num_steps": 1,
-    "clip_length_s": 0.02,
-    "pos_output_names": ["pelvis_link:pos_x", "pelvis_link:pos_y", "pelvis_link:pos_z",
-                         "pelvis_link:ori_w", "pelvis_link:ori_x", "pelvis_link:ori_y",
-                         "pelvis_link:ori_z"],
-    "vel_output_names": ["pelvis_link:pos_x", "pelvis_link:pos_y", "pelvis_link:pos_z",
-                         "pelvis_link:ori_x", "pelvis_link:ori_y", "pelvis_link:ori_z"],
-    "contact_frames": ["left_ankle_roll_link", "right_ankle_roll_link"],
-    "ref_frame": "pelvis_link",
-    "skill_list": ["standing"],
-}
 
-_META_KEYS: tuple[str, ...] = tuple(_MINIMAL_META)
 
 
 def parse_args() -> argparse.Namespace:
@@ -128,24 +118,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-verify", action="store_true",
                    help="Skip the load-back + assemble_clip_terrain round trip.")
     return p.parse_args()
-
-
-def library_meta(like: str | None) -> dict:
-    """The channel-layout metadata to stamp on the terrain-only library.
-
-    Args:
-        like: A source library whose layout to copy, or ``None`` for :data:`_MINIMAL_META`.
-
-    Returns:
-        The metadata dict.
-
-    Raises:
-        KeyError: If ``like`` is missing one of the layout attributes.
-    """
-    if like is None:
-        return dict(_MINIMAL_META)
-    with h5py.File(like, "r") as f:
-        return {k: json.loads(f.attrs[k]) for k in _META_KEYS}
 
 
 def write_terrain_library(path: str, manifest: list[dict], meta: dict, cfg: FreeformConfig) -> None:
@@ -182,91 +154,6 @@ def write_terrain_library(path: str, manifest: list[dict], meta: dict, cfg: Free
                          "commanded_speed_range_mps":
                              [float(v) for v in COMMANDED_SPEED_RANGE_MPS]},
         })
-
-
-def verify(path: str, manifest: list[dict]) -> None:
-    """Load the file back, build a clip manager on it, and build its mesh.
-
-    Three checks, each catching a different way this file can be wrong, and the middle one is
-    the reason the whole free-form task could not be constructed before: a clip-free library
-    must still answer every LAYOUT question :class:`MotionClipManager` asks, because the command
-    term builds one before anything knows whether a clip will ever be read.  Failing here costs
-    a second; failing in Isaac costs a simulator launch.
-
-    ``assemble_clip_terrain`` needs ``isaaclab.utils`` but no simulator.  Where it is missing the
-    first two halves still run and the mesh half is reported as skipped rather than passed.
-
-    Args:
-        path: The written library.
-        manifest: The manifest that was written, to check the mesh against.
-    """
-    lib = load_clip_library(path)
-    assert lib.num_clips == 0, f"expected a clip-free library, got {lib.num_clips} clips"
-    assert not lib.has_clips, "has_clips must be False on a clip-free library"
-    assert lib.attrs["terrain_manifest"], "terrain_manifest did not survive the round trip"
-    # The RANK is the point: ``num_steps`` is read off this axis, and an omitted dataset loads
-    # rank-1 and takes it away.
-    assert lib.y_des.ndim == 3, f"y_des must keep its (N, T, P) rank, got {tuple(lib.y_des.shape)}"
-    print(f"[freeform] load-back OK: {lib.num_clips} clips, "
-          f"{len(lib.attrs['terrain_manifest'])} tiles, "
-          f"y_des {tuple(lib.y_des.shape)}, num_steps {lib.num_steps}")
-
-    manager = MotionClipManager(lib)
-    assert not manager.has_clips
-    assert manager.num_steps == lib.num_steps
-    # Everything the command term reads at construction, driven here so a layout that cannot
-    # answer them is caught by the generator rather than by the env.
-    manager.order_outputs(manager.pos_output_names, manager.vel_output_names)
-    print(f"[freeform] clip manager OK: dt {manager.dt}, T {manager.num_steps}, "
-          f"{manager.num_pos_outputs} pos / {manager.num_vel_outputs} vel outputs, "
-          f"ref_frame {manager.ref_frame}, total_time {float(manager.get_total_time()):.3f} s "
-          f"(every gather refuses; --like copies a real library's channel layout)")
-    try:
-        from robot_rl.tasks.manager_based.robot_rl.terrains.clip_terrain_loader import (
-            assemble_clip_terrain, default_num_flat_tiles,
-        )
-    except ImportError as e:
-        print(f"[freeform] mesh check SKIPPED (no isaaclab: {e})")
-        return
-    n_flat = default_num_flat_tiles(lib)
-    assert n_flat == 0, f"expected 0 synthesised flat tiles, got {n_flat}"
-    mesh, origins, layout = assemble_clip_terrain(lib)
-
-    # The highest surface the manifest claims, against the mesh's own z extent: the two must
-    # agree, or a slab was authored at a height the loader did not build.
-    #
-    # **Split by ``decor``, because the two land in DIFFERENT meshes.** ``assemble_clip_terrain``
-    # returns the ground mesh and puts every ``decor=True`` overlay in ``layout.decor_mesh``, so
-    # pooling them compares a walkable claim against a mesh the walls are not in. The free-form
-    # families never emit decoration -- their stairwell walls are collidable -- so this only
-    # bites a FIXED course that mirrors mjeval's visual-only walls
-    # (``motion_gen.terrain.step_courses``), where it reported the 2.0 m wall top against a
-    # 0.9 m platform. Both halves are checked, so a wall silently landing in the ground mesh
-    # (or vice versa) fails here rather than at the first depth frame.
-    def _top(want_decor: bool) -> float | None:
-        """Highest surface among the manifest's decor / non-decor overlays, or None."""
-        tops = [float(o["base_z"]) + float(o["size_xyz"][2])
-                for m in manifest for o in m["overlays"]
-                if bool(o.get("decor", False)) is want_decor]
-        return max(tops) if tops else None
-
-    claim = _top(False)
-    got = float(mesh.bounds[1][2])
-    assert claim is not None, "every tile is decoration; there is no ground to stand on"
-    assert abs(claim - got) < 1e-6, f"ground mesh top {got} != manifest's highest walkable {claim}"
-    decor_claim = _top(True)
-    decor_mesh = getattr(layout, "decor_mesh", None)
-    assert (decor_claim is None) == (decor_mesh is None), (
-        f"the manifest has {'no ' if decor_claim is None else ''}decoration but the loader "
-        f"built {'none' if decor_mesh is None else 'some'}")
-    if decor_claim is not None:
-        decor_got = float(decor_mesh.bounds[1][2])
-        assert abs(decor_claim - decor_got) < 1e-6, (
-            f"decor mesh top {decor_got} != manifest's highest decoration {decor_claim}")
-    print(f"[freeform] mesh OK: {len(mesh.faces)} faces, {layout.num_tiles} tiles, "
-          f"origins {tuple(origins.shape)}, z in [{mesh.bounds[0][2]:.3f}, {got:.3f}]"
-          + ("" if decor_claim is None
-             else f"; decor {len(decor_mesh.faces)} faces to z {decor_claim:.3f}"))
 
 
 def main() -> int:

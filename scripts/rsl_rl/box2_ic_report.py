@@ -184,8 +184,9 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None, *,
         distances: The approach distance of each tile index, when the run used a library
             other than the full training one.
         metric: Which success rule sets ``success``; one of :data:`METRICS`.
-        strict: Count a tracking violation as a failure as well as a fall.  ``False`` (the
-            default for reporting) is fall-only; see the module docstring for why.  Ignored
+        strict: Count a tracking violation as a failure as well as a fall.  ``True`` is the
+            default, because Isaac now terminates on those bounds; ``False`` is fall-only and
+            is what a recording made before that termination must be scored under.  Ignored
             on a table with no violation column.
         rounds: Episodes to keep per env (first-completed first).  ``0`` pools everything.
 
@@ -233,7 +234,13 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None, *,
             bad_step = ro.first_bad_step(cols, strict=strict)
             bad = bad_step >= 0
             failed = (~ok) & bad
+            # NOT "timed out" -- it is "ended without arriving and without tripping the
+            # failure predicate", which also catches `base_orientation_from_upright` and any
+            # other termination the accumulator's fall/violation columns do not cover. Read
+            # against `truncated` so a cell that is ending some other way is visible instead
+            # of being reported as a budget problem with the advice to raise the budget.
             trunc = (~ok) & ~bad
+            other = trunc & ~cols["truncated"].astype(bool)
             # Where the two rules DISAGREE, so the cost of the choice sits in the table rather
             # than in a changelog: a robot dragged over the line after it had already failed.
             late = reached & ~tr_ok
@@ -262,6 +269,7 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None, *,
                 "arrived_before_failing": float(tr_ok[m].mean()),
                 "late_arrival": float(late[m].mean()),
                 "timeout": float(trunc[m].mean()),
+                "ended_other_way": float(other[m].mean()),
                 # Of the episodes that latched, the share that kept going well past it --
                 # the tell for a recording made before the violation became a termination.
                 "ran_past_latch": float(
@@ -388,6 +396,13 @@ def format_report(cells: list[dict], *, metric: str = "terminal_reward",
                      f"{c.get('terrain_penalty_p95', float('nan')):>9.3f}"
                      f"{c.get('terrain_deep_frac', float('nan')):>7.3f}")
                     if has_terrain else "") + flag)
+    oth = sum(c.get("ended_other_way", 0.0) * c["n"] for c in train) / n_tr if n_tr else 0.0
+    if oth > 0.01:
+        L.append(f"\n  !! {oth:.1%} of episodes ended without arriving, without tripping the "
+                 "failure predicate, and WITHOUT being truncated -- so they are in the "
+                 "`timeout` column while not being timeouts. Some other termination is firing "
+                 "(base_orientation_from_upright is the usual one); raising the budget will "
+                 "not move them.")
     hot = [c for c in cells if c["timeout"] > TIMEOUT_WARN]
     if hot:
         L.append(f"\n  !! {len(hot)} cell(s) time out above {TIMEOUT_WARN:.0%}: their rates are "
@@ -419,11 +434,12 @@ def main() -> int:
                         "is what the labellers select on; `reached_goal` is arrival at any "
                         "point and reproduces every number published before 2026-09-09.")
     p.add_argument("--failure_rule", choices=("strict", "loose"), default="strict",
-                   help="loose (the default) counts only the FALL. strict adds the bootstrap "
-                        "tracking tolerances, which on this terrain fire on 99.5%% of "
-                        "episodes and before arrival on 95%% of successful traverses -- it is "
-                        "what the critic labels select on, and it is not a reportable success "
-                        "rate here. See the module docstring.")
+                   help="strict (the default) is the fall OR the tracking bounds, which is "
+                        "what Isaac now TERMINATES on -- on a recording made with that "
+                        "termination the two rules agree by construction. Use loose to score "
+                        "a recording made BEFORE it, where strict fires on 99.5%% of episodes "
+                        "and reports 0.0049 against the fall rule's 0.1051. See the module "
+                        "docstring.")
     p.add_argument("--rounds", type=int, default=1,
                    help="Episodes to keep per env, first-completed first (default 1). A "
                         "round-based stop leaves the fast envs with extra SHORT episodes, so "

@@ -116,11 +116,23 @@ def report(name: str, cells_a: dict, cells_b: dict, *, n_boot: int = N_BOOT,
     """
     rng = np.random.default_rng(seed)
     cells = sorted(set(cells_a) & set(cells_b))
-    per_cell = []
+    per_cell, empty = [], []
     for c in cells:
         envs = sorted(set(cells_a[c]) & set(cells_b[c]))
+        if not envs:
+            # A cell the two arms share but with NO shared env -- reachable when an env's
+            # first uncensored episode lands on a different tile in the two arms, or is
+            # censored in one only. Kept out of the design rather than contributing a
+            # nan: `np.mean` over it poisons the delta and both interval bounds while
+            # `n_env`, `improved` and `mcnemar_p` all still print plausibly.
+            empty.append(c)
+            continue
         per_cell.append((np.array([cells_a[c][e] for e in envs]),
                          np.array([cells_b[c][e] for e in envs])))
+    if empty:
+        print(f"  !! {len(empty)} of {len(cells)} shared cells have no shared env and are "
+              f"EXCLUDED: {empty[:4]}{' ...' if len(empty) > 4 else ''}")
+    cells = [c for c in cells if c not in set(empty)]
     if not per_cell or not any(a.size for a, _ in per_cell):
         # An empty intersection is the shape of a FAILED eval, not of a null result: the arm
         # whose run directory holds only `.log` files intersects nothing, and dividing by the
@@ -179,7 +191,17 @@ def main() -> int:
     a = p.parse_args()
     kw = dict(metric=a.metric, strict=a.failure_rule == "strict")
     out = {}
+    # THE BOUNDS THE COLUMNS WERE LATCHED AT must match across the arms, or a delta that
+    # reads `first_violation_step` contains the bound change. See
+    # `rollout_outcomes.assert_tracking_bounds_agree` for why nothing in the numbers shows it.
+    def _a_table(tag: str) -> str | None:
+        """Any one episode table from a run, for the spec stamp."""
+        g = sorted(glob.glob(os.path.join(a.root, tag, "train_v*", "*.episodes.h5")))
+        return g[0] if g else None
+
     for nm, pt, ft, tiles in CLUSTERS:
+        _t = {f"{nm}/parent": _a_table(pt), f"{nm}/fine-tuned": _a_table(ft)}
+        ro.assert_tracking_bounds_agree({k: v for k, v in _t.items() if v})
         out[nm] = report(nm, load(a.root, pt, tiles, **kw), load(a.root, ft, tiles, **kw),
                          n_boot=a.n_boot, seed=a.seed)
     out["_meta"] = {"metric": a.metric, "failure_rule": a.failure_rule,

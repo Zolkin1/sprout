@@ -150,6 +150,10 @@ def load(root: str, tag: str, tiles: range | None = None, *,
             cells[(int(t), speed)] = {
                 "goal": ok[m].astype(float), "pen": (con + pnt)[cm], "dr": dr[cm],
                 "con": con[cm], "pnt": pnt[cm], "weights": (w_c, w_p),
+                # The tolerance the depths are already net of, from the SAME stamp the
+                # weights come from -- restating it was the class of thing reading the stamp
+                # was supposed to remove.
+                "penetration_tol_m": float(spec.get("penetration_tol_m", float("nan"))),
                 **{f"deep{int(round(v * 100)):02d}": (mx[cm] >= v).astype(float)
                    for v in DEEP_THRESH_M}}
     if not cells:
@@ -245,6 +249,16 @@ def boot(cells_a: dict, cells_b: dict, *, n_boot: int = N_BOOT, seed: int = 0) -
     out = {"n_cells": n, "n_tiles": len({k[0] for k in keys}),
            "n_episodes_a": int(sum(v.size for v in ga)),
            "n_episodes_b": int(sum(v.size for v in gb))}
+    # WHAT THE PENALTY WAS BUILT UNDER. Without these the json records a number nobody can
+    # re-derive: the two terms' p95s differ by 640x, so the weights decide what "total" means.
+    wts = {cells_a[k]["weights"] for k in keys} | {cells_b[k]["weights"] for k in keys}
+    tols = {cells_a[k]["penetration_tol_m"] for k in keys}
+    if len(wts) != 1:
+        raise SystemExit(
+            f"the cells were graded under different penalty weights {sorted(wts)}; a "
+            "cell-averaged 'total' across them is not one quantity.")
+    out["contact_weight"], out["penetration_weight"] = next(iter(wts))
+    out["penetration_tol_m"] = next(iter(tols)) if len(tols) == 1 else None
     # Point estimates: the cell-averaged rate, matching the bootstrap's own statistic.
     out["succ_a"] = float(np.mean([v.mean() for v in ga]))
     out["succ_b"] = float(np.mean([v.mean() for v in gb]))
@@ -331,7 +345,17 @@ def main() -> int:
     strict = a.failure_rule == "strict"
     kw = dict(metric=a.metric, strict=strict, rounds=a.rounds)
     res: dict = {}
+    # THE BOUNDS THE COLUMNS WERE LATCHED AT must match across the arms, or a delta that
+    # reads `first_violation_step` contains the bound change. See
+    # `rollout_outcomes.assert_tracking_bounds_agree` for why nothing in the numbers shows it.
+    def _a_table(tag: str) -> str | None:
+        """Any one episode table from a run, for the spec stamp."""
+        g = sorted(glob.glob(os.path.join(a.root, tag, "train_v*", "*.episodes.h5")))
+        return g[0] if g else None
+
     for name, (pt, ft, tiles) in arms.items():
+        _t = {f"{name}/parent": _a_table(pt), f"{name}/fine-tuned": _a_table(ft)}
+        ro.assert_tracking_bounds_agree({k: v for k, v in _t.items() if v})
         res[name] = boot(load(a.root, pt, tiles, **kw), load(a.root, ft, tiles, **kw),
                          n_boot=a.n_boot, seed=a.seed)
         r = res[name]
@@ -354,7 +378,7 @@ def main() -> int:
         print(f"  cells up {r['cells_up']}/{r['cells_tested']}, sign p={r['sign_p']:.4g}")
 
     res["_meta"] = {
-        "deep_thresholds_m": list(DEEP_THRESH_M), "penetration_tol_m": 0.005,
+        "deep_thresholds_m": list(DEEP_THRESH_M),
         "n_boot": a.n_boot, "seed": a.seed, "downrange_bin_m": BIN_M,
         "metric": a.metric, "failure_rule": a.failure_rule, "rounds": a.rounds,
         "success": f"{a.metric}, first {a.rounds} episode(s) per env, cell-averaged",

@@ -112,7 +112,7 @@ def _resolve(args: argparse.Namespace) -> dict:
 
     Kept apart from :func:`main` because it is the half that decides what a file MEANS, and it
     refuses a cross-course flag rather than ignoring it -- a `--platform_depth` silently
-    dropped on a curb run would write a file whose name and contents disagreed.
+    dropped would write a file whose name and contents disagreed.
 
     Args:
         args: Parsed arguments.
@@ -178,7 +178,7 @@ def write_library(path: str, manifest: list[dict], meta: dict, role: str,
         manifest: The terrain manifest.
         meta: Channel-layout metadata.
         role: ``"train"`` or ``"holdout"``, recorded in the file.
-        grid_name: What this course's tiles vary (``step_heights_m`` / ``approach_distances_m``).
+        grid_name: What this course's tiles vary (``approach_distances_m``).
         grid: The values those tiles were built at, in TILE ORDER -- so ``terrain_id`` is an
             index into this and the geometry or IC a row was collected at is recoverable.
         speeds: Representative commanded speeds, for the build banner. Provenance only.
@@ -209,7 +209,7 @@ def _describe(tile: dict) -> str:
     """One line naming what a tile's geometry is, for the build log.
 
     Args:
-        tile: A manifest entry from either course.
+        tile: A manifest entry.
 
     Returns:
         The line, without the leading tile id.
@@ -218,11 +218,6 @@ def _describe(tile: dict) -> str:
     common = (f"tile {tile['size_x']:.2f} x {tile['size_y']:.2f} m, "
               f"spawn x={r['start_x']:.2f}, goal x={r['goal_x']:.2f} "
               f"+-{r['goal_half_width']:.2f} m at z={r['goal_z']:.3f}")
-    if "curb" in tile:
-        c = tile["curb"]
-        return (f"step {c['height_m']:.3f} m at x={c['riser_x'][0]:.2f}, top to "
-                f"x={c['riser_x'][1]:.2f} ({c['top_depth_m']:.1f} m deep, full "
-                f"{c['width_m']:.2f} m width); {common}")
     u = tile["updown"]
     return (f"spawn {u['approach_m']:.2f} m out, {u['steps']} x {u['rise_m']:.3f} m up to "
             f"z={u['flight_height_m']:.2f} (x={u['first_riser_x']:.2f}), platform "
@@ -243,8 +238,6 @@ def main() -> int:
     for role, manifest, grid, speeds in spec["roles"]:
         validate_manifest(manifest, families=(spec["family"],))
         path = str(out_dir / f"{spec['prefix']}_{role}.h5")
-        # The HOLDOUT stamps no range: its speed is pinned, so a band there would say the
-        # opposite of what the file is for.
         # THE HOLDOUT STAMPS THE BAND TOO, and it used to stamp nothing. The band describes
         # the COURSE, and the holdout is the same course at one held-out initial condition --
         # so withholding it did not pin the holdout's command, it only made a runner pointed

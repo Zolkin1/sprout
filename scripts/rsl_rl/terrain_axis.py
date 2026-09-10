@@ -47,7 +47,7 @@ from motion_gen.clips.clip_io import read_commanded_speed_range  # noqa: E402
 #: instead of inventing a distance.
 AXES: dict[str, tuple[str, ...]] = {
     "box2": ("spawn_distances_m",),
-    "step_course": ("approach_distances_m", "step_heights_m"),
+    "step_course": ("approach_distances_m",),
 }
 
 

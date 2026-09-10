@@ -356,10 +356,21 @@ def fm_tracking_violation_termination(
         d.root_pos_w, d.root_quat_w, d.root_link_lin_vel_w, d.root_link_ang_vel_w,
         d.joint_pos)
     hit = violates(err, sp)
+    # THE GATE IS REQUIRED, not optional. `_pred_valid` is allocated only when the command has
+    # a generator (`fm_enabled`); on the clip arm `_post_init` returns before that, so a
+    # `getattr(..., None)` fallback would SKIP the gate exactly where there is no served
+    # prediction to be far from -- terminating from step 0 on a task nothing here measured,
+    # which reads as a policy that cannot stand up. Refuse instead: this term belongs to the
+    # generator arm and says so.
     valid = getattr(cmd, "_pred_valid", None)
-    if valid is not None:
-        hit = hit & valid.reshape(-1).to(hit.device)
-    return hit
+    if valid is None:
+        raise ValueError(
+            f"command {command_name!r} has no `_pred_valid`, so it is serving no generator "
+            "prediction (reference_source is not 'fm', or no fm_checkpoint was given). The "
+            "strict tracking bounds are defined against the SERVED node, so there is nothing "
+            "for this termination to measure -- remove `tracking_violation` from the "
+            "terminations for this arm rather than letting it fire from step 0.")
+    return hit & valid.reshape(-1).to(hit.device)
 
 
 def base_orientation_from_upright(

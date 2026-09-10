@@ -316,6 +316,76 @@ class ProprioRing:
             self.buf[m] = 0.0
 
 
+#: The bound fields of a stamped ``tracking_spec`` that decide what the STRICT columns MEAN.
+#: The kernel widths and weights shape a reward, not a latch, so they are not compared.
+TRACKING_BOUND_FIELDS: tuple[str, ...] = ("max_lateral_m", "max_height_m", "max_tilt_rad")
+
+
+def read_tracking_spec(path: str) -> dict | None:
+    """The ``tracking_spec`` an episode table was written under, or ``None``.
+
+    ``record_rollouts`` stamps it for a stated reason -- ``first_violation_step`` and
+    ``track_reward_mean`` are only interpretable against the bounds that produced them -- and
+    for a long time nothing read it back.
+
+    Args:
+        path: An ``*.episodes.h5``.
+
+    Returns:
+        The spec dict, or ``None`` on a table written before it was stamped.
+    """
+    import json                                                            # noqa: PLC0415
+
+    import h5py                                                           # noqa: PLC0415
+
+    with h5py.File(path, "r") as f:
+        raw = f.attrs.get("tracking_spec")
+    if raw is None:
+        return None
+    return json.loads(raw) if isinstance(raw, (str, bytes)) else dict(raw)
+
+
+def assert_tracking_bounds_agree(paths: dict[str, str]) -> dict:
+    """Refuse to compare arms whose STRICT columns were latched at different bounds.
+
+    **This is the guard that was missing when the height bound moved 0.20 -> 0.12.**  Two arms
+    recorded either side of that change carry ``first_violation_step`` latched at different
+    thresholds, so any rule that reads it -- and ``strict`` is the default everywhere -- puts a
+    40% bound tightening into the reported delta and attributes it to the policy.  Nothing in
+    the numbers looks wrong: both arms have the column, both are populated, both are plausible.
+
+    Args:
+        paths: ``{arm label: an *.episodes.h5 from that arm}``.
+
+    Returns:
+        The agreed bounds, or ``{}`` when no arm stamped a spec.
+
+    Raises:
+        SystemExit: If two arms disagree on any of :data:`TRACKING_BOUND_FIELDS`.
+    """
+    seen: dict[tuple, list[str]] = {}
+    for label, p in paths.items():
+        spec = read_tracking_spec(p)
+        if spec is None:
+            continue
+        key = tuple(round(float(spec.get(f, float("nan"))), 9)
+                    for f in TRACKING_BOUND_FIELDS)
+        seen.setdefault(key, []).append(label)
+    if len(seen) <= 1:
+        return ({f: v for f, v in zip(TRACKING_BOUND_FIELDS, next(iter(seen)))}
+                if seen else {})
+    lines = [f"      {dict(zip(TRACKING_BOUND_FIELDS, k))}  <- {', '.join(v)}"
+             for k, v in seen.items()]
+    raise SystemExit(
+        "REFUSING: these arms were recorded under DIFFERENT strict tracking bounds, so their "
+        "`first_violation_step` columns do not mean the same thing:\n"
+        + "\n".join(lines)
+        + "\n  Every success rule except `--metric reached_goal --failure_rule loose` reads "
+          "that column, so a delta across this boundary contains the bound change. Either "
+          "re-record the older arm under the current bounds, or reduce both with "
+          "`--metric reached_goal --failure_rule loose`, which reads only `reached_goal`.")
+
+
 def first_bad_step(cols: dict[str, np.ndarray], *, strict: bool = True) -> np.ndarray:
     """The step an episode FAILED on: the fall crossing or the strict violation, first wins.
 
