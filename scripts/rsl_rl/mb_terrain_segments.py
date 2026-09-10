@@ -120,7 +120,7 @@ def _terminal_loop(plan, side: str):
 
 
 def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: float, alpha_max: float,
-                               token_floor: int = 0,
+                               token_floor: int = 0, token_band=None, free_root: bool = False,
                                floor_s: float, slack: float, seed: int):
     """The approach as a BOUNDED transient: an exact steady stride hands off to a short in-betweening.
 
@@ -196,6 +196,7 @@ def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: f
     # out clean given more.
     n_min = int(min(mb.max_tokens, n_min + max(0, int(token_floor))))
     n_max = int(max(n_min, n_max))
+    n_min, n_max = _apply_band_override(mb, n_min, n_max, token_band)
     allowed = mb_env.allowed_tokens_mask(n_min, mb.min_tokens, mb.max_tokens, n_max=n_max)
     # Pin the terrain boundary as the target POSE.  Every family now tracks the replay's future joints,
     # so the arrival keeps stepping; ``terrain_families.pin_future`` survives as the narrower question of
@@ -227,8 +228,8 @@ def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: f
         mb.reset(seed)
         mb.set_target_pose(pin_win, kind="terrain")
         mb.set_regime(1.0, 0.0)
-        n_new = int(mb.prime(mb_env.walk_control(seed_ctx, v1, mb.lookahead_times, target=_carrot(n),
-                                                 allowed_tokens=allowed)))
+        n_new = int(mb.prime(mb_env.walk_control(seed_ctx, v1, mb.lookahead_times, target=None if free_root else _carrot(n),
+                                                 allowed_tokens=allowed, free_root=free_root)))
         if n_new == n:
             break
         n = n_new
@@ -247,6 +248,10 @@ def _generate_approach_bounded(mb, targeter, plan, *, pin_future: bool, a_max: f
     return qpos, cmd, {"seed_stride": int(s_idx), "seed_phase": int(phase_out),
                        "sched_vx": float(v_app), "entry_vx": float(plan.entry_vx),
                        "n_min": int(n_min), "n_max": int(n_max), "t_min": float(_t_min),
+                       # The CEILING, recorded because the band is meaningless without it:
+                       # n_min == n_max says the model had no choice, but only max_tokens says
+                       # whether that was the ceiling biting or the slack never asking.
+                       "max_tokens": int(mb.max_tokens), "nfpt": int(mb.nfpt),
                        "tokens": int(n) // mb.nfpt, "travel": travel, "bounded": True}
 
 
@@ -260,7 +265,7 @@ def _seed_overlap_idx(frames: np.ndarray, seed_last: np.ndarray, search: int = 8
 
 
 def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float,
-                           token_floor: int = 0, floor_s: float,
+                           token_floor: int = 0, token_band=None, free_root: bool = False, floor_s: float,
                            slack: float, seed: int):
     """The exit as a BOUNDED transient: the replay hands off to a short in-betweening, then an exact loop.
 
@@ -303,11 +308,16 @@ def _generate_exit_bounded(mb, targeter, plan, *, a_max: float, alpha_max: float
                                          floor_s=floor_s, slack=slack)
     n_min = int(min(mb.max_tokens, n_min + max(0, int(token_floor))))
     n_max = int(max(n_min, n_max))
+    n_min, n_max = _apply_band_override(mb, n_min, n_max, token_band)
     allowed = mb_env.allowed_tokens_mask(n_min, mb.min_tokens, mb.max_tokens, n_max=n_max)
     win = plan.exit_seed_window(mb.nfpt, mb.dt)
     win[:, 2] -= float(plan.exit_surf_z)                              # generate on virtual flat ground
     seed_ctx = t.as_tensor(np.asarray(win, np.float32), dtype=t.float32, device=mb.agent._device)[None]
-    n = mb.prime(mb_env.walk_control(seed_ctx, v1, mb.lookahead_times, allowed_tokens=allowed))
+    # The exit never had a fixed CARROT -- it takes walk_control's velocity rollout -- so
+    # `free_root` here means dropping that rollout pin, not a carrot. Same meaning as the
+    # approach (no positional pin at all), different thing being removed.
+    n = mb.prime(mb_env.walk_control(seed_ctx, v1, mb.lookahead_times, allowed_tokens=allowed,
+                                     free_root=free_root))
     frames = np.stack([mb.next_frame() for _ in range(int(n))], 0)
 
     lead = _seed_overlap_idx(frames, np.asarray(win[-1], np.float32)) + 1
@@ -379,6 +389,38 @@ def _emit_interior(mb, targeter, plan, side: str, piece_key: str, out: str, args
     return out
 
 
+def _cli_band(args):
+    """``--token-band LO HI`` as a ``(lo, hi)`` pair, with -1 meaning "leave that end derived"."""
+    b = getattr(args, "token_band", None)
+    if not b:
+        return None
+    lo, hi = int(b[0]), int(b[1])
+    return (None if lo < 0 else lo, None if hi < 0 else hi)
+
+
+def _apply_band_override(mb, n_min: int, n_max: int, band) -> tuple[int, int]:
+    """Apply a caller-supplied token band, clipped to what Motion Bricks can actually emit.
+
+    ``band`` is ``(lo, hi)``; either may be ``None`` to leave that end alone, and ``lo == hi`` forces
+    one horizon exactly. Only ``stitch_lab`` and ``--token-band`` set it -- a library build passes
+    ``None`` and gets the derived band unchanged, so this cannot move a build by accident.
+
+    It exists because the derived band routinely COLLAPSES: `hop_tokens` sizes the transient from the
+    velocity change alone, so a hand-off that barely changes speed gets `n_min == n_max` and Motion
+    Bricks' own horizon head -- which chooses 6..16 tokens -- is masked down to a single option. That
+    is fine when the transient only has to change speed and wrong when it also has to reconcile a
+    gait phase, which needs about half a cycle it cannot ask for.
+    """
+    if not band:
+        return n_min, n_max
+    lo, hi = band
+    if lo is not None:
+        n_min = int(np.clip(int(lo), mb.min_tokens, mb.max_tokens))
+    if hi is not None:
+        n_max = int(np.clip(int(hi), mb.min_tokens, mb.max_tokens))
+    return n_min, int(max(n_min, n_max))
+
+
 def _emit_segment(mb, targeter, plan, family, side: str, pin: str, dist: float, out: str,
                   args, raw_schema, quiet: bool = False, plan_path: str | None = None,
                   start: str = "stand") -> str:
@@ -420,11 +462,11 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, dist: float, 
             qpos, cmd, extra = _generate_approach_bounded(
                 mb, targeter, plan, pin_future=pin_future, a_max=args.a_max,
                 alpha_max=args.alpha_max, floor_s=args.min_transient_s, slack=args.hop_slack,
-                token_floor=attempt, seed=seed)
+                token_floor=attempt, token_band=_cli_band(args), free_root=bool(args.free_root), seed=seed)
         else:
             qpos, cmd, extra = _generate_exit_bounded(
                 mb, targeter, plan, a_max=args.a_max, alpha_max=args.alpha_max,
-                floor_s=args.min_transient_s, slack=args.hop_slack, token_floor=attempt, seed=seed)
+                floor_s=args.min_transient_s, slack=args.hop_slack, token_floor=attempt, token_band=_cli_band(args), free_root=bool(args.free_root), seed=seed)
         pk = peak_root_speed(qpos, mb.fps)
         extra["peak_speed"] = float(pk)
         extra["speed_ceiling"] = float(ceil_)
@@ -689,6 +731,14 @@ def main() -> int:
     p.add_argument("--alpha-max", type=float, default=2.0, help="Max yaw acceleration (rad/s^2).")
     p.add_argument("--min-transient-s", type=float, default=0.35,
                    help="Absolute floor on a bounded transient's kept duration (s).")
+    p.add_argument("--free-root", action="store_true",
+                   help="Drop the positional pin on a terrain boundary transient and let Motion "
+                        "Bricks choose the root motion itself (see mb_env.walk_control free_root). "
+                        "DEBUG: the driver never passes it.")
+    p.add_argument("--token-band", type=int, nargs=2, default=None, metavar=("LO", "HI"),
+                   help="Force the in-betweening's token band, overriding the one hop_tokens derives "
+                        "from the velocity change. LO == HI pins one horizon exactly. -1 on either "
+                        "end leaves that end derived. TERRAIN boundary transients only.")
     p.add_argument("--gen-attempts", type=int, default=3,
                    help="Seeds to try before giving up on one in-betweening. The pose-pinned terrain "
                         "generation occasionally diverges on a particular draw -- neighbours with "

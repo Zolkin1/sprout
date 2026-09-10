@@ -66,6 +66,9 @@ _ARGPARSE_DEFAULT_IS_FINE: dict[str, str] = {
     "--side": "single-clip path",
     "--tag": "single-clip path output naming",
     "--approach-dist": "single-clip override of the plan's own travel budget",
+    "--free-root": "stitch_lab's positional-pin override -- a DEBUG knob. A driver run must keep "
+                   "the carrot; if a free root is ever adopted it arrives as its own recipe key.",
+    "--token-band": "stitch_lab's horizon override -- a DEBUG knob for generating one hand-off at several horizons. A driver run must keep the band hop_tokens derives, so forwarding it from the recipe is exactly what should not happen; if a terrain-specific band is ever adopted it arrives as its own recipe key, not by wiring this one up.",
     "--exit-dist": "single-clip override of the plan's own travel budget",
     "--approach-start": "per-clip in batch mode: the request carries it, drawn from "
                         "steady_approach_frac",

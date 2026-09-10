@@ -308,6 +308,13 @@ _KEPT_S_MAX = (16 * 4 - 2 * 4) / 30.0       # 1.867 s
 # TRAVEL is set by that pin at ``|v1| * H`` metres, not by its duration. Fitted over all 28 terrain
 # exit segments of the quick build, measured/predicted mean speed = 1.033 (range 0.961-1.071) across
 # |v1| 0.20-3.33 m/s and 6-15 tokens, so the law holds across the whole band.
+#: Motion Bricks' own frame geometry, declared here because pass A must predict what pass B will
+#: generate and cannot import the model (it lives in another conda env). ``mb.nfpt`` / ``mb.fps`` at
+#: runtime; a generated segment records both in its provenance, so a drift would be visible rather
+#: than silent.
+MB_FRAMES_PER_TOKEN = 4
+MB_FPS = 30.0
+
 MB_PLANNING_HORIZON_S = 1.0
 
 
@@ -326,7 +333,7 @@ def pin_travel(v1) -> float:
 
 
 def transient_travel_bound(v0, v1, *, a_max: float, floor_s: float, slack: float,
-                           ramp_dv: float = 1.0) -> float:
+                           ramp_dv: float = 1.0, tokens: int | None = None) -> float:
     """Upper bound on the metres one in-betweening between ``v0`` and ``v1`` will cover.
 
     Mirrors what ``mb_transient.generate`` actually does, which is TWO things:
@@ -349,7 +356,21 @@ def transient_travel_bound(v0, v1, *, a_max: float, floor_s: float, slack: float
 
     A BOUND rather than an estimate: over-reserving costs a shorter loop, under-reserving costs the
     loop entirely, and those two failures are not equally bad.
+
+    ``tokens`` short-circuits all of the above with the horizon the generation is FORCED to, which is
+    the only honest bound once the token band is pinned: the duration is then known exactly rather
+    than derived from the velocity change, and a free-root transient covers whatever the model
+    chooses within it. Measured on a 0.80 -> 0.62 m/s hand-off at 10 forced tokens with a free root:
+    the derived bound says 0.379 m and the real segment travelled 0.593 m, so pass A under-reserved
+    by 56% and the terrain would have been pushed past the platform. From the horizon the bound is
+    0.85 m -- over-reserving, which pass C hands to the last flat loop.
     """
+    if tokens:
+        kept_s = max(1e-3, (int(tokens) * MB_FRAMES_PER_TOKEN - 2 * MB_FRAMES_PER_TOKEN) / MB_FPS)
+        import numpy as _np2
+        fastest = max(float(_np2.linalg.norm(_np2.asarray(v0, _np2.float64).reshape(-1)[:2])),
+                      float(_np2.linalg.norm(_np2.asarray(v1, _np2.float64).reshape(-1)[:2])))
+        return float(fastest * kept_s)
     import math as _math
 
     import numpy as _np

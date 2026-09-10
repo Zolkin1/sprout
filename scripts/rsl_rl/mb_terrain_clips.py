@@ -577,8 +577,21 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
         entry_gate = boundary_candidates(_soles(builder, Wp, Wq, Wj, args.dt), contact, levels,
                                          tol=args.contact_tol, swing_clear=swing_clear,
                                          swing_band=swing_band, window=(0, int(ts.n)))
-        k = pick_boundary(entry_gate, prefer=args.entry_pick,
-                          rng=np.random.default_rng([int(getattr(args, "clip_seed", 0)), 0xE471]))
+        # `entry_frame` overrides the gate's own pick. getattr, because mb_plan_library builds its
+        # args as a SimpleNamespace with no such field. A forced frame that the gate REJECTED is
+        # allowed and warned about, not refused -- seeing the seam an unvetted hand-off produces is
+        # the whole point of `stitch_lab.py`.
+        _forced_k = getattr(args, "entry_frame", None)
+        if _forced_k is None:
+            k = pick_boundary(entry_gate, prefer=args.entry_pick,
+                              rng=np.random.default_rng([int(getattr(args, "clip_seed", 0)), 0xE471]))
+        else:
+            k = int(_forced_k)
+            if not 0 <= k < int(ts.n):      # loop_periodic slices rp[k:], with no modulo
+                raise SystemExit(f"entry frame {k} outside the source period [0, {int(ts.n)})")
+            if k not in set(entry_gate.frames.tolist()):
+                print(f"[mb_terrain]   WARNING: forced entry frame {k} is NOT a gate candidate "
+                      f"{entry_gate.frames.tolist()} -- the hand-off pose is unvetted")
         print(f"[mb_terrain]   entry gate: {entry_gate.reason} -> frame {k} (source period {ts.n} frames, "
               f"{'strict' if entry_gate.strict else 'FALLBACK'})")
         if k != 0:
@@ -619,7 +632,17 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
             raise SystemExit(f"{family.skill}: the traversal never lands a foot on the exit surface "
                              f"z={exit_surf:.3f} after the first liftoff (frame {_lift}) -- check "
                              f"--n-steps / the reference geometry")
-        exit_frame = pick_boundary(exit_gate, prefer=args.exit_pick)
+        _forced_e = getattr(args, "exit_frame_override", None)
+        if _forced_e is None:
+            exit_frame = pick_boundary(exit_gate, prefer=args.exit_pick)
+        else:
+            exit_frame = int(_forced_e)
+            if not 0 < exit_frame < int(Wp.shape[0]):   # >0 is >entry_frame; TerrainPlan re-checks
+                raise SystemExit(f"exit frame {exit_frame} outside the PLACED replay "
+                                 f"(0, {int(Wp.shape[0])}) -- note it shrinks as the entry frame grows")
+            if exit_frame not in set(exit_gate.frames.tolist()):
+                print(f"[mb_terrain]   WARNING: forced exit frame {exit_frame} is NOT a gate "
+                      f"candidate {exit_gate.frames.tolist()} -- the hand-off pose is unvetted")
         print(f"[mb_terrain]   exit gate: {exit_gate.reason} -> frame {exit_frame}/{Wp.shape[0] - 1} "
               f"({'strict' if exit_gate.strict else 'FALLBACK'})")
     else:
@@ -680,6 +703,10 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
         "entry_strict": bool(entry_gate.strict) if entry_gate else True,
         "exit_strict": bool(exit_gate.strict) if exit_gate else True,
         "entry_source_frame": int(k),               # which entry candidate the replay was re-anchored from
+        # The SOURCE PERIOD the entry frame indexes. entry_candidates live in this space while
+        # exit_candidates index the PLACED replay, and nothing recorded the former's extent --
+        # so a reader could not tell which frames were even askable for. -1 when aperiodic.
+        "source_period": int(ts.n) if family.periodic else -1,
     })
     plan = TerrainPlan(
         skill=family.skill, dt=float(args.dt), terrain_qpos=qpos,
@@ -1236,8 +1263,19 @@ def main() -> int:
                    help="Steady approach command (m/s); default = the reference speed (walk) or 0 (stand).")
     p.add_argument("--exit-vx", type=float, default=1.0,
                    help="Steady exit walk-away command magnitude (m/s); the family sets the sign.")
-    p.add_argument("--approach-s", type=float, default=2.5, help="MB approach duration (s).")
-    p.add_argument("--exit-s", type=float, default=2.5, help="MB exit duration (s).")
+    # METRES, not seconds. The batch path moved to a distance budget (the tile is sized in metres
+    # and a platform is `max(dists) + PLATFORM_BUFFER_M`, with no speed term), and this CLI kept
+    # `--approach-s` -- so `plan_from_spec` read `args.approach_dist`, which did not exist, and the
+    # single-clip debug path had been dead with an AttributeError. It is the only way to generate
+    # ONE clip, which is exactly what you reach for when a seam looks wrong.
+    p.add_argument("--approach-dist", type=float, default=4.0,
+                   help="Approach travel budget (m), INCLUDING the approach zone.")
+    p.add_argument("--exit-dist", type=float, default=4.0, help="Trail-away travel budget (m).")
+    p.add_argument("--entry-frame", type=int, default=None,
+                   help="Force the entry hand-off to this frame of the SOURCE PERIOD, overriding "
+                        "--entry-pick. A frame the gate rejected is allowed, with a warning.")
+    p.add_argument("--exit-frame-override", type=int, default=None,
+                   help="Force the exit hand-off to this frame of the PLACED replay.")
     p.add_argument("--entry-pick", default="first", choices=["first", "middle", "last"],
                    help="[periodic] which filtered ENTRY candidate to hand-pick.")
     p.add_argument("--exit-pick", default="first", choices=["first", "middle", "last"],

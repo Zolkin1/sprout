@@ -280,7 +280,7 @@ def allowed_tokens_mask(n_min: int, min_tokens: int, max_tokens: int,
 
 def walk_control(ctx: t.Tensor, cmd, lookahead_times, *, start=None, standing: bool | None = None,
                  target: tuple[float, float, float] | None = None,
-                 allowed_tokens: np.ndarray | None = None) -> dict:
+                 allowed_tokens: np.ndarray | None = None, free_root: bool = False) -> dict:
     """Build one exact-velocity control dict for ``generate_new_frames``.
 
     The root is pinned to the exact-velocity rollout of ``cmd`` (``specific_target_positions`` /
@@ -304,6 +304,22 @@ def walk_control(ctx: t.Tensor, cmd, lookahead_times, *, start=None, standing: b
         start: optional ``(x, y, yaw)`` to integrate from instead of the context pose.
         standing: force stand / walk mode; by default a ~zero command stands.
         target: optional fixed world ``(x, y, yaw)`` to pin instead of integrating ``cmd``.
+        free_root: drop the positional pin entirely (``has_specific_target = 0``), leaving Motion
+            Bricks its OWN root prediction from ``movement_direction`` / ``target_vel`` -- which is
+            how the shipped ``interactive_demo_g1`` drives it, since that demo sends a direction and
+            a mode and no ``specific_target_positions`` at all.
+
+            Worth having because for a TERRAIN boundary the positional pin is arguably redundant:
+            ``terrain_splice.align_boundary`` rigidly re-places the finished segment onto the entry
+            pose, so the absolute root the model produced is discarded. What the pin really fixes is
+            the DISPLACEMENT over the transient, and pinning that fights the pose target -- the pose
+            window is the replay's opening frames, which are MOVING, while a fixed carrot is a point
+            the model decelerates into. Measured on one hand-off at 6/10/14 tokens: arrival speed
+            0.56x -> 0.41x -> 0.30x of the replay's entry speed as the horizon grows, i.e. the longer
+            the transient the more the positional pin wins the argument.
+
+            Not free: the displacement becomes the model's choice, bounded only by ``max_tokens``, and
+            pass A reserves platform for the transient from the same bound the generation uses.
     """
     cx, cy, _cz, cyaw = cur_pose(ctx) if start is None else (start[0], start[1], 0.0, start[2])
     cmd = np.asarray(cmd, np.float32)
@@ -328,7 +344,7 @@ def walk_control(ctx: t.Tensor, cmd, lookahead_times, *, start=None, standing: b
         "target_vel": t.tensor([speed], dtype=t.float32),
         "specific_target_positions": t.from_numpy(spec_pos).view([1, -1, 3]),
         "specific_target_headings": t.from_numpy(spec_head).view([1, -1]),
-        "has_specific_target": t.tensor([[1]], dtype=t.int32),
+        "has_specific_target": t.tensor([[0 if free_root else 1]], dtype=t.int32),
         "context_mujoco_qpos": ctx,
     }
 
