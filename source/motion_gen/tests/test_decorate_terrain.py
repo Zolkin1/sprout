@@ -589,12 +589,16 @@ def test_the_flight_and_its_platforms_share_a_centre_and_the_platforms_are_never
             )
 
 
-def test_a_short_flight_is_authorable():
-    """1 and 2 riser transitions -- a curb and a step-up -- are real deployment geometry.
+def test_a_two_riser_flight_is_authorable_and_one_riser_is_not_usable():
+    """2 is the smallest transition the pipeline can express, and the reason is structural.
 
-    `n_steps_range` started at 3, so the library had none. The camera argument against them stands
-    (a 0.13 m riser is 1.97 px at any range) and is why they are worth TRAINING on rather than
-    omitting; see approach_zone.py.
+    `n_steps_range` started at 3, so short step-ups did not exist; it is now [2, 7]. The SAMPLER
+    will happily author a 1-riser tile -- this test pins that it does -- but no clip can be
+    generated on one: the entry gate anchors the stance foot onto tread 1 while `exit_surf` is
+    `upper_z = n_steps * riser`, so at n_steps == 1 entry and exit are the SAME surface and the
+    traversal has zero length. Measured: a [1, 7] build lost 385 clips, every one n_steps=1, while
+    2 and 3 in isolation author 7/7 tiles with 0 skips. A curb needs a step-up-and-settle solve,
+    which the library does not have (smallest jump_on box 0.25 m against a 0.13-0.17 m curb).
     """
     import numpy as np
     from collections import Counter
@@ -607,4 +611,12 @@ def test_a_short_flight_is_authorable():
         nav_width_range=(1.0, 1.6), flat_width_margin=0.3, single_step_frac=0.0, floor_frac=0.5,
         decor_params={"float_frac": 0.0, "float_thick_range": (0.0, 0.0)})
     counts = Counter(s for t in tiles for s in t.stair_steps)
-    assert counts[1] > 0 and counts[2] > 0, f"no short flights authored: {dict(counts)}"
+    assert counts[2] > 0, f"no two-riser flights authored: {dict(counts)}"
+    # The sampler is not the limit -- it authors 1-riser tiles fine. The recipe excludes them.
+    assert counts[1] > 0, "the sampler should still be able to author a 1-riser tile"
+    import yaml, pathlib
+    for name in ("g1_mb_v6.yaml", "quick.yaml"):
+        cfg = pathlib.Path(__file__).resolve().parents[3] / "configs" / "clip_gen" / name
+        if cfg.exists():
+            lo = yaml.safe_load(cfg.read_text())["n_steps_range"][0]
+            assert lo >= 2, f"{name} asks for n_steps={lo}; 1 produces a zero-length traversal"

@@ -587,12 +587,38 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
         entry_frame = 0
         # EXIT: the first clean arrival on the far surface, so the traversal stops as soon as it has landed
         # and never steps onto a phantom tread past the tile.
+        # The window opens at the first LIFTOFF after the entry -- the frame at which a foot planted
+        # at the entry leaves the ground -- so an exit cannot be the entry pose itself.
+        #
+        # This is a NO-OP for every tile the recipe authors, and is kept for the error it produces
+        # rather than the clips it saves: on a multi-tread tile `exit_surf` is the TOP tread, which
+        # no early frame stands on (measured on v6d, exit frames land at 204/314 against a liftoff
+        # around 5-10), and n_steps=1 is excluded by `n_steps_range` [2, 7].
+        #
+        # It does NOT make a one-tread tile work, and the attempt is worth recording. There the
+        # entry anchors the stance foot onto tread 1 while `exit_surf` is `upper_z = 1 * riser` --
+        # the SAME surface -- so an unwindowed gate returned frame 0 and TerrainPlan refused it
+        # ("exit_frame 0 must be after entry_frame 0"), which cost the v6d build 385 clips, every
+        # one n_steps=1. Windowing past the liftoff only moves the failure to "never lands a foot on
+        # the exit surface", because a periodic climbing stride never settles on the tread it just
+        # reached: the next landing is a riser higher, on a tread the tile does not have. No gating
+        # change reaches it. A 1-riser curb needs a step-up-and-settle solve that the library does
+        # not contain -- its smallest jump_on box is 0.25 m against a 0.13-0.17 m curb.
+        _c0 = np.asarray(contact)[:, :2] > 0
+        _planted_at_entry = _c0[0]
+        _lift = 1
+        for _f in range(1, _c0.shape[0]):
+            if (_planted_at_entry & ~_c0[_f]).any():
+                _lift = _f
+                break
         exit_gate = boundary_candidates(_soles(builder, Wp, Wq, Wj, args.dt), contact, [exit_surf],
                                         tol=args.contact_tol, swing_clear=swing_clear,
-                                        swing_band=swing_band)
+                                        swing_band=swing_band,
+                                        window=(_lift, int(Wp.shape[0])))
         if exit_gate.frames.size == 0:
             raise SystemExit(f"{family.skill}: the traversal never lands a foot on the exit surface "
-                             f"z={exit_surf:.3f} -- check --n-steps / the reference geometry")
+                             f"z={exit_surf:.3f} after the first liftoff (frame {_lift}) -- check "
+                             f"--n-steps / the reference geometry")
         exit_frame = pick_boundary(exit_gate, prefer=args.exit_pick)
         print(f"[mb_terrain]   exit gate: {exit_gate.reason} -> frame {exit_frame}/{Wp.shape[0] - 1} "
               f"({'strict' if exit_gate.strict else 'FALLBACK'})")

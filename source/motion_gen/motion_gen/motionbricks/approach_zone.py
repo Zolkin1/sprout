@@ -83,7 +83,14 @@ And one thing worth writing down, because it bounds what any zone can buy:
   what changed is what follows from it. A curb and a two-riser step-up are real deployment geometry,
   and if the robot cannot distinguish one from a low box then it has to survive the ambiguity rather
   than never meet it -- a library that omits them does not remove the confusion, it removes the
-  training signal for it. ``n_steps_range`` is now ``[1, 7]``.
+  training signal for it. ``n_steps_range`` is now ``[2, 7]``.
+
+  **A ONE-riser curb is still absent, and for a different reason than the camera.** It is not
+  authorable from a periodic stair reference at all: the entry gate anchors the stance foot onto
+  tread 1 while ``exit_surf`` is ``upper_z = n_steps * riser``, so at ``n_steps == 1`` the entry and
+  exit are the same surface and the traversal has zero length -- and a climbing stride never settles
+  on the tread it just reached, so no gating change reaches it. It needs a step-up-and-settle solve.
+  The gap is real: the smallest solved ``jump_on`` box is 0.25 m, a curb is 0.13-0.17 m.
 
 If it ever wants sizing by measurement instead of assertion, the instrument exists:
 ``make_terrain_probe_clips.py`` + ``fm_terrain_probe.py`` build "one flat clip, N tiles, N sceneries,
