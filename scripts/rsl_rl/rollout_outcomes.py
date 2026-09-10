@@ -381,9 +381,14 @@ def assert_tracking_bounds_agree(paths: dict[str, str]) -> dict:
         "`first_violation_step` columns do not mean the same thing:\n"
         + "\n".join(lines)
         + "\n  Every success rule except `--metric reached_goal --failure_rule loose` reads "
-          "that column, so a delta across this boundary contains the bound change. Either "
-          "re-record the older arm under the current bounds, or reduce both with "
-          "`--metric reached_goal --failure_rule loose`, which reads only `reached_goal`.")
+          "that column, so a delta across this boundary contains the bound change.\n"
+          "  RE-RECORD the older arm under the current bounds. `--metric reached_goal "
+          "--failure_rule loose` is NOT an escape hatch once the bounds TERMINATE: the "
+          "episode ends at the violation, so the robot is prevented from ever arriving and "
+          "`reached_goal` carries the bound change too -- more severely, not less. Measured "
+          "on one unchanged parent checkpoint over 4200 box2 episodes: reached_goal 0.2440 "
+          "under a LATCHED 0.20 bound against 0.0002 under a TERMINATING 0.12 one. That "
+          "1000x is the termination, not the policy.")
 
 
 def first_bad_step(cols: dict[str, np.ndarray], *, strict: bool = True) -> np.ndarray:
