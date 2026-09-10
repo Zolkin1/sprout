@@ -156,7 +156,9 @@ case "$HISTORY_FROM" in generator|measured) ;; *)
 #: Only read by `fbc`; `awr` uses the continuous advantage column and ignores the labels.
 PERCENTILE="${PERCENTILE:-70.0}"
 
-HEIGHT_TOL="${HEIGHT_TOL:-0.0}"
+#: Goal height band. EMPTY means "derive it from the goal spec", which is the only place
+#: the number is authored -- see the derivation once $GOALS has been validated.
+HEIGHT_TOL="${HEIGHT_TOL:-}"
 SPEED_MIN="${SPEED_MIN:-}"
 SPEED_MAX="${SPEED_MAX:-}"
 PY="${PY:-$W/env_isaaclab/bin/python}"
@@ -226,6 +228,25 @@ fi
 [ -f "$CLIP" ]   || { echo "REFUSING: clip library $CLIP not found."; exit 3; }
 [ -f "$GOALS" ]  || { echo "REFUSING: goal regions $GOALS not found."; exit 3; }
 
+# The height band is DERIVED from the goal spec rather than defaulted here. It used to default
+# to 0.0 -- the height test OFF -- while every spec on disk declares 0.5 and
+# `run_quick_eval.sh` REFUSES a non-positive value. So a loop run that did not set it trained
+# against a laxer goal than the eval scored it with, and nothing said so: `vm30_ref_strict`
+# trained at 0.0 and was evaluated at 0.5, which silently made it incomparable with the other
+# arms of its own ablation ladder (they all took the queue's explicit 0.5).
+#
+# The TERMINATION's own default stays 0.0 on purpose -- it is a library function, and enabling
+# a height test by default would change every free-form task's termination and every number
+# measured before it (`test_freeform_env_cfg`). This is the other half of that: a caller that
+# has a spec in its hand should not be re-deciding the number, it should be reading it.
+if [ -z "$HEIGHT_TOL" ]; then
+  HEIGHT_TOL=$("$PY" -c 'import json,sys; print(float(json.load(open(sys.argv[1]))["default"]["height_tol_m"]))' "$GOALS") \
+    || { echo "REFUSING: could not read default.height_tol_m from $GOALS."; exit 3; }
+  DERIVED_TOL=" (DERIVED from $GOALS)"
+else
+  DERIVED_TOL=" (set explicitly)"
+fi
+
 mkdir -p "$ROOT"
 HEAD="$(git rev-parse --short HEAD)"
 echo "==================================================================="
@@ -252,7 +273,7 @@ echo "[awr] arms   camera 0.5 (dead, per-replan), history-null 0.0, speed-mismat
 echo "[awr] hist   $HISTORY_FROM$([ "$HISTORY_FROM" = "measured" ] && echo " -- OFF-DISTRIBUTION by design; the eval must pass the same" || echo "")"
 echo "[awr] clip   $CLIP"
 echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
-echo "[awr] goal   height tolerance $HEIGHT_TOL m $(awk -v v="$HEIGHT_TOL" 'BEGIN{exit !(v+0==0)}' && echo "(height test OFF -- a goal ABOVE the spawn can be scored from the floor)" || echo "(pelvis must arrive at the goal height)")"
+echo "[awr] goal   height tolerance $HEIGHT_TOL m${DERIVED_TOL} $(awk -v v="$HEIGHT_TOL" 'BEGIN{exit !(v+0==0)}' && echo "(height test OFF -- a goal ABOVE the spawn can be scored from the floor)" || echo "(pelvis must arrive at the goal height)")"
 echo "==================================================================="
 
 fail () { echo "[awr] FAILED at $1 (iteration $2)" >&2; exit 1; }

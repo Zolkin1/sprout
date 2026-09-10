@@ -565,3 +565,37 @@ def test_the_goal_height_test_is_off_by_default_and_closes_the_ascent_hole():
         "height -- the same three terms freeform_goal_anchor_world uses")
     # And it must still be an AND with the lateral/downrange test, not a replacement.
     assert "hit = hit &" in src or "hit &" in src
+
+
+def test_the_finetune_env_turns_the_height_test_ON_by_default() -> None:
+    """The FUNCTION defaults the height test off; the fine-tune ENV must not.
+
+    Two different decisions, and conflating them is what left the check off everywhere.  The
+    library default is off so that enabling a height term cannot silently move every free-form
+    task's termination -- see
+    :func:`test_the_goal_height_term_is_opt_in_and_uses_the_pelvis`.  The fine-tune env is a
+    concrete task whose four courses (box2, up-into-down, varied, in-distribution) all declare
+    0.5 in their own goal specs, so a DIRECT ``train.py`` / ``play.py`` launch should get the
+    check those courses were designed with rather than the library's safe-for-migration default.
+
+    0.5 specifically, because it must not bind on the DESCENDING courses, whose goal sits at
+    floor level and whose height change is unavoidable.  Measured at arrival: box2 tops out at
+    0.203 m of ``|height_err|`` and up-into-down at 0.399, while in-distribution binds at
+    exactly 0.500 -- so one value serves ascending and descending alike.
+
+    What it buys: the downrange-and-lateral test has no height, so on a ``stairs_up`` tile with
+    0.90 m of open floor either side of the flight, a robot that never left the floor passes the
+    goal line and scores a traverse.
+    """
+    import inspect
+
+    from robot_rl.tasks.manager_based.robot_rl.g1 import g1_finetune_env_cfg as C
+
+    src = inspect.getsource(C)
+    assert '"height_tol_m": 0.5' in src, (
+        "the fine-tune env's goal_reached must declare the height band ON at 0.5; 0.0 turns "
+        "the test off and makes the floor-walker a scored traverse")
+    # DECLARED rather than omitted: hydra's struct mode refuses a key that is absent, so
+    # dropping it would make the band unsettable from the CLI and keep it out of the run's own
+    # params/env.yaml -- the only record of what a run was configured with.
+    assert "height_tol_m" in src

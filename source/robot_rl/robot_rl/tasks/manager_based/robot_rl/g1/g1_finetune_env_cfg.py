@@ -327,17 +327,28 @@ class G1FinetuneFreeformTerminationCfg(G1FinetuneTerminationCfg):
     goal_reached = DoneTerm(
         func=mdp.freeform_goal_reached,
         params={"min_half_width": FREEFORM_GOAL_MIN_HALF_WIDTH_M,
-                # Declared at 0 (the height test OFF) rather than omitted, so it is
-                # OVERRIDABLE: hydra's struct mode refuses a key absent from the dict, and a
-                # param that cannot be set from the CLI also never reaches the run's
-                # params/env.yaml -- the only record of what a run was configured with.
+                # Declared EXPLICITLY rather than omitted, so it is overridable: hydra's
+                # struct mode refuses a key absent from the dict, and a param that cannot be
+                # set from the CLI also never reaches the run's params/env.yaml -- the only
+                # record of what a run was configured with. Both callers do override it
+                # (`run_finetune_loop.sh`, `run_quick_eval.sh`), so this value is what a
+                # DIRECT train.py/play.py launch gets.
                 #
-                # Turn it on where the goal is ABOVE the spawn. The downrange-and-lateral
-                # test has no height, so on a clip-library `stairs_up` tile -- 0.90 m of open
-                # floor either side of a 2.25 m flight, band clamped at least that wide -- a
-                # robot that never left the floor passes the line and scores. The descending
-                # families need it off: their goal IS at floor level.
-                "height_tol_m": 0.0},
+                # ON by default, at the value every course's goal spec declares. The
+                # downrange-and-lateral test has no height, so on a clip-library `stairs_up`
+                # tile -- 0.90 m of open floor either side of a 2.25 m flight, band clamped at
+                # least that wide -- a robot that never left the floor passes the goal line and
+                # scores a traverse. Off by default made that the silent case.
+                #
+                # 0.5 rather than something tighter because it must not bind on the DESCENDING
+                # courses, whose goal is at floor level and whose height change is unavoidable.
+                # Measured at arrival: box2 tops out at 0.203 m of |height_err| and
+                # up-into-down at 0.399, while in-distribution binds at exactly 0.500 -- so one
+                # value serves ascending and descending alike. The FUNCTION's own default stays
+                # 0.0 (`terminations.freeform_goal_reached`): it is a library default, and
+                # switching a height test on there would move every free-form task's
+                # termination, including arms already measured.
+                "height_tol_m": 0.5},
         time_out=True,
     )
 
