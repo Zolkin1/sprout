@@ -859,8 +859,32 @@ def tile_local_xy(
 #: is IsaacLab-free and cannot be imported here.
 FREEFORM_SPAWN_FIELDS: tuple[str, ...] = ("x", "y", "z", "half_x", "half_y", "yaw", "weight")
 
+#: Surface height (m) at or under which a spawn area counts as GROUND LEVEL.  A tolerance
+#: rather than an equality because the authored value is a float, and every family authors its
+#: ground areas at a literal ``0.0`` while the raised ones sit at a box height or a flight's
+#: top -- the smallest of which is the curb, two orders above this.
+GROUND_SPAWN_TOL_M: float = 1e-6
 
-def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float]
+#: The spawn-area subsets a reset can draw from.
+#:
+#: **``ground`` is what every EVAL uses, on every terrain, and the asymmetry is the point.**
+#: Training declares raised areas -- a box top, the platform between two flights -- because a
+#: complete traverse is rare enough that the behaviour policy never produced one, and AWR can
+#: only reweight what it is shown.  Scoring from those same areas would report a fraction of
+#: the course as a traverse: a robot that starts on the second box has already been given the
+#: jump the course exists to measure.  So the eval starts where the task starts.
+#:
+#: It costs nothing in comparability, by construction rather than by luck: declared areas
+#: REPLACE ``pos_jitter_m``, so every family authors its ground area at exactly
+#: ``freeform.FREEFORM_SPAWN_JITTER_M`` (there is a constant, and a comment recording the 4x
+#: lateral spread from getting it wrong) -- which is also what the reset synthesises for a
+#: tile declaring no areas at all.  A ground-only draw on a library WITH areas therefore has
+#: the same spawn distribution as the frozen eval grids recorded before areas existed.
+SPAWN_FROM: tuple[str, ...] = ("all", "ground")
+
+
+def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float],
+                          spawn_from: str = "all"
                           ) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Build (once) the terrain-id -> spawn-area lookup.
 
@@ -879,16 +903,25 @@ def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float]
     Args:
         importer: The ``ClipTerrainImporter``, carrying ``terrain_route``.
         pos_jitter_m: Half-widths for the synthesised single-start area.
+        spawn_from: Which declared areas to keep; one of :data:`SPAWN_FROM`.  ``ground``
+            drops every area above :data:`GROUND_SPAWN_TOL_M`, which is how every eval runs.
 
     Returns:
         ``(areas, index, lo)`` -- ``[A, 7]`` float, ``[hi - lo + 1, 2]`` long, and the terrain
         id row 0 of the index stands for.
 
     Raises:
-        ValueError: If a declared area is missing a field.
+        ValueError: If a declared area is missing a field, or ``spawn_from`` is unknown, or
+            the filter leaves a tile with no area at all.
     """
+    if spawn_from not in SPAWN_FROM:
+        raise ValueError(f"spawn_from must be one of {list(SPAWN_FROM)}; got {spawn_from!r}")
+    # THE FILTER IS PART OF THE KEY. The table is built once and cached on the importer, so a
+    # process that switched arms mid-run would otherwise be served the table it built first --
+    # silently, and at exactly the same shape.
+    key = (tuple(float(v) for v in pos_jitter_m), str(spawn_from))
     cached = getattr(importer, "_freeform_spawn_cache", None)
-    if cached is not None and cached[0] == tuple(float(v) for v in pos_jitter_m):
+    if cached is not None and cached[0] == key:
         return cached[1], cached[2], cached[3]
 
     routes = getattr(importer, "terrain_route", None) or {}
@@ -900,6 +933,20 @@ def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float]
     for tid in ids:
         route = routes[tid]
         areas = route.get("spawn_areas") or []
+        if areas and spawn_from == "ground":
+            kept = [a for a in areas if float(a["z"]) <= GROUND_SPAWN_TOL_M]
+            if not kept:
+                # NOT a silent fall-through to the synthesised start. That would place the
+                # robot at `start_*` with the jitter extents, which for a tile whose only
+                # declared starts are raised is a pose the terrain never claimed was legal --
+                # a plausible spawn on a course nobody authored. Every shipped family authors
+                # a ground area, so this is unreachable today and is here to stay that way.
+                raise ValueError(
+                    f"terrain {tid} declares {len(areas)} spawn area(s) and none at ground "
+                    f"level (z <= {GROUND_SPAWN_TOL_M}); spawn_from='ground' would leave it "
+                    "with nowhere to start. Author a ground area at "
+                    "freeform.FREEFORM_SPAWN_JITTER_M extents.")
+            areas = kept
         if not areas:
             areas = [{"x": route["start_x"], "y": route["start_y"], "z": route["start_z"],
                       "half_x": float(pos_jitter_m[0]), "half_y": float(pos_jitter_m[1]),
@@ -914,24 +961,26 @@ def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float]
                     f"declare all of {list(FREEFORM_SPAWN_FIELDS)}.")
             rows.append([float(a[f]) for f in FREEFORM_SPAWN_FIELDS])
     table = torch.tensor(rows, dtype=torch.float32, device=device)
-    importer._freeform_spawn_cache = (tuple(float(v) for v in pos_jitter_m), table, index, lo)
+    importer._freeform_spawn_cache = (key, table, index, lo)
     return table, index, lo
 
 
 def _draw_spawn_areas(importer, env_ids: torch.Tensor,
-                      pos_jitter_m: tuple[float, float]) -> torch.Tensor:
+                      pos_jitter_m: tuple[float, float],
+                      spawn_from: str = "all") -> torch.Tensor:
     """Pick one spawn area per env, weighted, and return its row.
 
     Args:
         importer: The ``ClipTerrainImporter``.
         env_ids: Envs being reset.
         pos_jitter_m: Half-widths for a synthesised single-start area.
+        spawn_from: Which declared areas are eligible; one of :data:`SPAWN_FROM`.
 
     Returns:
         ``[k, 7]`` the drawn areas' :data:`FREEFORM_SPAWN_FIELDS`.
     """
     k = env_ids.shape[0]
-    table, index, lo = _freeform_spawn_table(importer, pos_jitter_m)
+    table, index, lo = _freeform_spawn_table(importer, pos_jitter_m, spawn_from)
     tid = importer.env_terrain_id.reshape(-1)[env_ids].long()
     off = index[tid - lo, 0]
     cnt = index[tid - lo, 1]
@@ -968,6 +1017,7 @@ def reset_on_freeform_section(
     spawn_z_offset: float = 0.005,
     pos_jitter_m: tuple[float, float] = (0.25, 0.25),
     yaw_jitter_rad: float = 0.2,
+    spawn_from: str = "all",
 ) -> None:
     """Spawn the robot standing at its section's start pose -- no clip anywhere in it.
 
@@ -1004,9 +1054,13 @@ def reset_on_freeform_section(
         yaw_jitter_rad: Half-width of the uniform spawn-heading jitter (0.2 rad = 11.5 deg).
             Small on purpose: the section is walked downrange, and a large heading error at
             spawn asks the yaw controller to recover before the robot has taken a step.
+        spawn_from: Which of the tile's declared areas may be drawn -- one of
+            :data:`SPAWN_FROM`.  ``all`` is training; **every eval runs ``ground``**, on every
+            terrain, so a reported rate is always the complete course.  See :data:`SPAWN_FROM`.
 
     Raises:
         TypeError: If the scene terrain is not a route-carrying ``ClipTerrainImporter``.
+        ValueError: If ``spawn_from`` is unknown, or leaves a tile with no eligible area.
     """
     if env_ids.numel() == 0:
         return
@@ -1030,7 +1084,7 @@ def reset_on_freeform_section(
     # half-extents replace it. That is deliberate -- on a box top they are what keeps both
     # soles on the surface -- but it means an authored GROUND area must be sized at
     # `freeform.FREEFORM_SPAWN_JITTER_M` or its spawns stop matching the unauthored path.
-    area = _draw_spawn_areas(importer, env_ids, pos_jitter_m)      # [k, 7]
+    area = _draw_spawn_areas(importer, env_ids, pos_jitter_m, spawn_from)      # [k, 7]
     # Uniform WITHIN the area, in the TILE frame, so "downrange" means the same thing on every
     # tile. The area's own half-extents replace `pos_jitter_m`: for a box top they are what
     # keeps both soles on the surface, and adding the jitter on top would walk the robot off
