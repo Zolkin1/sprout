@@ -3,8 +3,25 @@
 
 """Stage 1' (Motion Bricks env): drive Motion Bricks with OUR optimized strides as the target pose.
 
-Phase-2 FLAT generation. Unlike ``mb_generate.py`` (which lets Motion Bricks free-run its built-in style
-clips), this drives the model from a scripted ``(vx, vy, wz)`` command schedule and, at every replan,
+**BROKEN AND OFF THE PIPELINE (2026-09-09). Kept on purpose -- read this before deleting it.**
+
+It does not run: ``sample_schedule`` below calls ``command_schedule.sample_command_schedule`` with
+``run_vx_range`` / ``back_vx_range`` / ``side_vy`` / ``turn_max`` / ``stand_frac``, and the command
+envelope rewrite replaced all five with one continuous ``(vx_range, vy_range, wz_range)`` plus
+declared masses -- so the first call raises TypeError. ``generate_mb_library`` hard-exits if a
+recipe selects this path.
+
+Why it is kept: it is the MIDDLE ARM of the comparison the paper needs. ``mb_baseline.py`` is
+Motion Bricks ALONE (its own poses, its own root); the live pipeline is our exact looped strides
+spliced with bounded in-betweenings; THIS is Motion Bricks' root with OUR poses and no exact loops.
+That isolates whether the win comes from the optimized poses or from the exact looping -- the
+"why not just pin your poses into Motion Bricks?" question -- and nothing else in the tree can
+answer it. Reviving it is a small fix (the five arguments collapse onto the new signature) plus a
+path from its output into ``mb_baseline``'s scorer.
+
+Phase-2 FLAT generation. Unlike letting Motion Bricks free-run its own built-in style clips (which is
+what ``scripts/interactive_demo_g1.py`` in the MB clone does, and what ``mb_baseline.py`` scores us
+against), this drives the model from a scripted ``(vx, vy, wz)`` command schedule and, at every replan,
 supplies the *target pose* from our velocity-matched optimized steady stride (the stride bank written by
 ``export_stride_bank.py``) instead of Motion Bricks' style-clip holder. Motion Bricks' own spring-model
 root/heading realignment is kept -- so the ROOT trajectory (where the robot goes) is Motion Bricks'

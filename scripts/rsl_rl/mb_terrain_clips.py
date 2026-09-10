@@ -1265,9 +1265,6 @@ def main() -> int:
                         "way, so the reference motion is unchanged -- only the mesh below it. Clamped per "
                         "tread to that tread's height.")
     p.add_argument("--box-height", type=float, default=0.45, help="[box] target box height (m).")
-    p.add_argument("--box-platform-buffer", type=float, default=1.0,
-                   help="[box] extra metres of top platform beyond the elevated segment's nominal travel, "
-                        "so the reference cannot walk off the far edge.")
     p.add_argument("--box-nav-width", type=float, default=0.0,
                    help="[box] y-width (m) to widen the box AND its top platform to (expand-only); "
                         "0 keeps the reference box's own extents.")

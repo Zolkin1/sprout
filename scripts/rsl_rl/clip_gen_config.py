@@ -125,6 +125,7 @@ _SCHEMA: dict[str, tuple] = {
     # used to open from.
     "flat_ramp_dv": ("float", 1),
     "flat_a_max": ("float", 1),
+    "flat_alpha_max": ("float", 1),
     "flat_min_transient_s": ("float", 1),
     "flat_hop_slack": ("float", 1),
     "approach_a_max": ("float", 1),
@@ -136,6 +137,7 @@ _SCHEMA: dict[str, tuple] = {
     # How the terrain BOUNDARY transients are generated. See mb_env.walk_control(free_root) and
     # mb_terrain_segments --token-band; both were debug knobs until the seam work settled them.
     "terrain_transient_tokens": ("int", 1),
+    "terrain_alpha_max": ("float", 1),
     "terrain_free_root": ("bool", 1),
     "terrain_exit_swing_clear": ("float", 1),
     # The PURE-stair families get their own three, because they are the only place lateral/yaw on

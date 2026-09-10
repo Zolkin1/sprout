@@ -48,10 +48,13 @@ flat_mass_sidestep: 0.10       # declared pure-lateral mass at vx = 0. DECLARED,
                                # an emergent 12.8% of flat time: the old sidestep mode set vx = 0 as a
                                # side effect, so nobody had chosen how much mass sat at zero.
 flat_strata_width:  0.2        # variance-reduction bookkeeping ONLY -- it quantizes nothing, since a
-                               # draw is uniform WITHIN its stratum. 23 strata over [-1.0, 3.6].
+                               # draw is uniform WITHIN its stratum. 18 strata over [-1.0, 2.5].
 flat_speed_quota:   stratified # stratified | iid. Same distribution; iid is the honest ablation.
 flat_ramp_dv: 1.4              # max speed change per single in-betweening; bigger is split
 flat_a_max: 1.15               # m/s^2; peak accel measures ~1.75x this
+flat_alpha_max: 1.15           # rad/s^2, the flat transients' YAW bound. Its own key because
+                               # it used to be read off flat_a_max, which is m/s^2 -- so the two
+                               # could not be moved independently. 1.15 is what v6f was built with.
 flat_min_transient_s: 0.35
 flat_hop_slack: 1.15
 flat_clip_length: 20.0
@@ -120,6 +123,12 @@ terrain_free_root: true           # drop the positional pin on both boundary tra
                                   # fixed carrot is a point the model decelerates into). Measured on
                                   # one hand-off: foot drag -159 -> -15 mm and arrival speed 0.56 ->
                                   # 1.44x of the replay's entry speed.
+terrain_alpha_max: 2.0            # yaw-acceleration bound (rad/s^2) for the terrain
+                                  # in-betweenings. ONE value serves the boundary and the
+                                  # interior -- mb_terrain_segments has a single
+                                  # --alpha-max where the linear bound is split into
+                                  # --a-max / --flat-a-max -- so it cannot be tuned per hop
+                                  # without splitting that flag first.
 terrain_transient_tokens: 10      # force the horizon (0 = let hop_tokens derive it). The derived
                                   # band routinely COLLAPSES -- n_min == n_max == 6 on the measured
                                   # hand-off -- so Motion Bricks' own 6..16 token head is masked to a

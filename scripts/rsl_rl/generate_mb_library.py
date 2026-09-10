@@ -17,13 +17,20 @@ b     ``mb_flat_transients.py``              motionbricks   one segment per flat
 c     ``mb_assemble_library.py``             env_isaaclab   per-family TRANSITION + box ``.h5``
 c     ``mb_pure_stair_clips.py``             env_isaaclab   the PURE stair families (no MB needed)
 c     ``mb_flat_clips.py --assemble``        env_isaaclab   the flat ``.h5``
-d     ``compose_terrain_library.py``         env_isaaclab   ONE training library
+d     ``compose_terrain_library.py``         env_isaaclab   ONE training library (``--out``)
+d2    ``decorate_terrain.py``                env_isaaclab   the FINISHED ``<out>_decor.h5``
 e     ``mb_qc.py --gate``                    env_isaaclab   PASS/FAIL -- a bad library fails the build
 f     ``clip_library_report.py``             env_isaaclab   the figures + report.json
 ===== ===================================== ============== =========================================
 
-Every stage is skip-if-done, so a killed run resumes where it stopped, and ``--stage`` runs one stage alone
-(e.g. to run stage b on the machine that has the GPU). Stage b is invoked through ``conda run``; each of its
+A killed run resumes where it stopped and ``--stage`` runs one stage alone (e.g. to run stage b on the
+machine that has the GPU) -- but "skip-if-done" is NOT uniform, and which is which matters. Stages 0, a,
+c and d2 skip on their OUTPUT FILE; stage b skips per SEGMENT inside ``mb_terrain_segments`` (``_is_stale``
+compares the generation knobs, so a knob change regenerates where a plain resume does not); stages d, e
+and f have no guard at all -- d recomposes ``--out`` from the per-family ``.h5`` every run, which is cheap
+and fully derived, and e/f are reports that should always describe the library in hand. What this costs is
+the thing to remember: a stale intermediate is reused silently, so a fresh ``--work-dir`` is the right move
+after a recipe change. Stage b is invoked through ``conda run``; each of its
 two scripts loads the model ONCE and then generates everything it owns, which is the difference between one
 checkpoint load and thousands.
 
@@ -53,8 +60,12 @@ Example::
 solved traj-opt library is what every terrain reference is replayed from, and there is deliberately
 no default, because a stale one silently trains on motion nobody solved for this robot.
 
-THE BUILD IS NOT FINISHED WHEN THIS EXITS -- ``decorate_terrain.py`` must run on the output. Stage e
-refuses an undecorated library rather than letting one look finished; see its note.
+THE FINISHED LIBRARY IS ``<out>_decor.h5``, NOT ``--out``. Stage d2 runs ``decorate_terrain.py``
+on the compose output and writes a new file; ``--out`` names the undecorated intermediate, and
+stages e and f both describe the decorated one. Point training, recording and every viewer at the
+``_decor`` file. Decoration used to be the caller's job and this docstring used to say so, which
+is how an undecorated library -- every stair platform exactly ``size_y``, no width variation at
+all -- could look finished; stage e now refuses one rather than allowing that again.
 """
 
 from __future__ import annotations
@@ -62,6 +73,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import datetime
 import os
 import shutil
 import subprocess
@@ -75,6 +87,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))          # <repo>/scripts/rsl_rl -> <repo>
 
 
+#: Where `_run` appends each stage's resolved argv. Set once the work dir is known; a `None` path
+#: means "not recording", which is what a --stage run before the work dir exists gets.
+_STAGE_LOG: dict = {"path": None}
+
+
 def _run(name: str, script: str, argv: list[str], conda_env: str | None = None) -> None:
     """Run one stage as a subprocess (repo-root cwd, PYTHONPATH set); raise on failure."""
     env = dict(os.environ)
@@ -84,6 +101,17 @@ def _run(name: str, script: str, argv: list[str], conda_env: str | None = None) 
     cmd = (["conda", "run", "--no-capture-output", "-n", conda_env, "python", "-u", path]
            if conda_env else [sys.executable, "-u", path]) + argv
     print(f"\n===== [{name}] {'(' + conda_env + ') ' if conda_env else ''}" + " ".join(argv), flush=True)
+    # Keep the RESOLVED argv, not just print it. `test_recipe_forwards_every_parameter` is a
+    # heuristic -- it checks that a flag STRING appears somewhere in this file, so a flag forwarded
+    # to one stage counts as forwarded to every stage, and it never compares the two values. Three
+    # real gaps hid behind that (--seed and --alpha-max never reached the segments stage at all;
+    # --seam-blend-s reached only one of the two flat calls). A static test cannot close that
+    # cheaply, but a build that RECORDS what each stage actually received makes it answerable after
+    # the fact -- and answerable for the build in hand rather than for the tree in general.
+    if _STAGE_LOG["path"]:
+        with open(_STAGE_LOG["path"], "a") as _f:
+            _f.write(f"[{name}] {'conda:' + conda_env + ' ' if conda_env else ''}{script}\n")
+            _f.write("    " + " ".join(argv) + "\n\n")
     t0 = time.time()
     r = subprocess.run(cmd, cwd=_REPO, env=env)
     dt = time.time() - t0
@@ -142,7 +170,12 @@ def main() -> int:
     p.add_argument("--mb-root", default="../GR00T-WholeBodyControl/motionbricks",
                    help="GR00T motionbricks package root (stage b only).")
     p.add_argument("--conda-env", default="motionbricks", help="Conda env that has Motion Bricks.")
-    p.add_argument("--library", default="trajectories/skills/library_v2")
+    p.add_argument("--library", required=True,
+                   help="Solved traj-opt library every terrain reference is replayed from. "
+                        "REQUIRED and deliberately without a default -- it is stamped into "
+                        "the finished .h5 as provenance, so a forgotten flag records a "
+                        "library the clips may not have come from. The module docstring has "
+                        "claimed this since the recipes arrived; the default contradicted it.")
     p.add_argument("--stride-bank", default=None, help="Stride bank .npz (default <work-dir>/stride_bank.npz).")
     p.add_argument("--families-dir", default=None, help="Where the per-family .h5 go (default <work-dir>/families).")
     p.add_argument("--stage", default="all", choices=["all", "0", "a", "b", "c", "d", "d2", "e", "f"])
@@ -162,6 +195,10 @@ def main() -> int:
     raw_flat = os.path.join(work, "raw_flat")
     flat_h5 = os.path.join(fam_dir, "family_flat.h5")
     os.makedirs(os.path.join(_REPO, work), exist_ok=True)
+    _STAGE_LOG["path"] = os.path.join(_REPO, work, "stage_commands.txt")
+    with open(_STAGE_LOG["path"], "a") as _f:
+        _f.write(f"# {datetime.datetime.now().astimezone().isoformat()}  stage={args.stage}  "
+                 f"recipe={cfg.config_path}\n")
     # Copy the recipe next to the artifacts it produced. A work dir is resumable and long-lived, so
     # "which parameters built this" has to travel with it rather than living only in a shell history.
     shutil.copyfile(cfg.config_path, os.path.join(_REPO, work, "clip_gen_config.yaml"))
@@ -247,6 +284,17 @@ def main() -> int:
             # (interior peak max 10.87 -> 3.88 m/s, one blow-up -> none).
             "--flat-a-max", str(cfg.flat_a_max),
             "--gen-attempts", str(cfg.gen_attempts),
+            # --seed: without it every boundary AND interior in-betweening came from this stage's
+            # own default, so the recipe header's "reproducible from (this file + --source +
+            # --seed)" was false for the one stage that does the generating.
+            "--seed", str(cfg.seed),
+            # --alpha-max is the YAW bound (rad/s^2) and ONE of them serves the boundary and the
+            # interior both (mb_terrain_segments consumes args.alpha_max at all three sites), so it
+            # cannot be split per-hop the way --a-max / --flat-a-max are. It briefly got
+            # cfg.flat_a_max here, which is a LINEAR bound in m/s^2 -- a dimension error that also
+            # dropped the boundary's yaw bound 2.0 -> 1.15 as a side effect. Declared in the recipe
+            # instead, so the value is stated once and is the right quantity.
+            "--alpha-max", str(cfg.terrain_alpha_max),
             "--pin-future", cfg.pin_future]
            + (["--free-root"] if cfg.terrain_free_root else [])
            + (["--token-band", str(cfg.terrain_transient_tokens),
@@ -261,6 +309,11 @@ def main() -> int:
             if not os.path.exists(os.path.join(_REPO, flat_plans)):
                 _run("flat-plan", "mb_flat_clips.py", [
                     "--stride-bank", bank, "--dump-plan", flat_plans,
+                    # Pass A needs the blend window too: it sets the loop-usability floor
+                    # 2*blend_n + 1 (flat_plan.sample_plan). Forwarded only to the --assemble call,
+                    # the plan's loops were sized against the argparse default while the splice used
+                    # the recipe -- they agree today at 0.24 and would diverge the moment it moved.
+                    "--seam-blend-s", str(cfg.flat_seam_blend_s),
                     "--n-clips", str(n_flat_clips), "--clip-length", str(cfg.flat_clip_length),
                     "--hold-s-range", *(str(v) for v in cfg.flat_hold_s_range),
                     # The DRIVER'S ENVELOPE, sampled continuously -- one range per channel, not a set
@@ -276,16 +329,25 @@ def main() -> int:
             _run("flat-transients", "mb_flat_transients.py", [
                 "--mb-root", args.mb_root, "--stride-bank", bank, "--plans", flat_plans,
                 "--out-dir", flat_tr, "--ramp-dv", str(cfg.flat_ramp_dv),
-                "--a-max", str(cfg.flat_a_max), "--alpha-max", str(cfg.flat_a_max),
+                # --a-max is m/s^2 and --alpha-max is rad/s^2. Both used to be fed
+                # cfg.flat_a_max, so a change to the LINEAR bound silently moved the YAW
+                # one -- the same dimension error the terrain arm had. Declared separately
+                # now, at the value every library through v6f was actually built with.
+                "--a-max", str(cfg.flat_a_max), "--alpha-max", str(cfg.flat_alpha_max),
                 "--min-transient-s", str(cfg.flat_min_transient_s),
                 "--hop-slack", str(cfg.flat_hop_slack), "--seed", str(cfg.seed)],
                 conda_env=args.conda_env)
         if not cfg.flat_loops:
-            # The free-running mb_encode path is GONE, not merely off. It generated the flat family
-            # as one long Motion Bricks rollout instead of exact looped strides plus bounded
-            # transients, and its own knobs (flat_seg_dur_range, rl_vels) went with the command
-            # envelope rewrite -- the schema no longer accepts them, so a recipe that asked for this
-            # path would fail on a missing attribute somewhere far from the cause. Say so here.
+            # The mb_encode path is off the pipeline. It generated the flat family as one long
+            # Motion Bricks rollout instead of exact looped strides plus bounded transients, and its
+            # own knobs (flat_seg_dur_range, rl_vels) went with the command envelope rewrite -- the
+            # schema no longer accepts them, so a recipe that asked for this path would fail on a
+            # missing attribute somewhere far from the cause. Say so here.
+            #
+            # NOT "free-running", which this comment used to claim: mb_encode pinned OUR optimized
+            # stride as the target pose and kept only Motion Bricks' root. That makes it the middle
+            # arm of the paper's comparison rather than a superseded duplicate, which is why the
+            # file stays on disk -- see its module docstring.
             raise SystemExit(
                 "flat_loops: false selects the mb_encode rollout path, which no longer exists. The "
                 "flat family is exact looped strides plus bounded in-betweenings; there is no other "

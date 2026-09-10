@@ -13,8 +13,10 @@ kept so the MB clips can be compared against a matcher baseline in an ablation.
 | `beam.py` | approximate beam search |
 | `dp.py` | exact backward dynamic program — the strongest of the three |
 | `locomotion_db.py` | assembles the flat bones + clean-stride + jump-lead-in DB the matchers search |
-| `features.py` | the matching feature space (trajectory + pose features) and its FK |
 | `slope_rotate.py` | rotates flat clips onto a slope — shelved (works only straight up/down-slope; cross-slope and turning clips lean sideways) |
+
+The matching feature space and its FK moved to `motion_gen/features.py` (see "What moved
+out" below); this table listed it here long after it left.
 
 `trajopt_ingest.py` and `mm_clip_generator.py` were removed when the trajectory-manager stack
 was deleted: the former needed the manager's full Bezier evaluation, and the latter was only
@@ -26,8 +28,18 @@ drivers below all seed from the bones cache or the clean stride library.
 Its drivers live in `scripts/rsl_rl/` and each carries a `DEPRECATED:` banner naming the MB
 equivalent:
 
+**The committed bones cache is STALE and every matcher path is blocked on it.**
+`clips/bones_cache_locomotion.h5` (2.7 GB, built 2026-07-08) carries `joint_pos` of width **21**
+against this tree's 29-joint robot, and its `feature_frames` name `left_palm_link` /
+`right_palm_link` -- the Dex3 hands, which the perceptive robot replaced with passive rubber ones.
+So it describes neither the joint set nor the bodies anything here now has. Rebuilding it is one
+`precompute_bones_cache.py` run and NOT a code change; nothing else in the matcher stack is known
+to be stale. Do that first -- an ablation against this cache would be an ablation against a
+different robot.
+
 ```bash
-# once: build the bones feature cache every matcher needs
+# once: build the bones feature cache every matcher needs. REQUIRED before anything below --
+# see the note above; the committed cache is 21-joint and cannot be used with this robot.
 python scripts/rsl_rl/precompute_bones_cache.py --out clips/bones_cache_locomotion.h5
 
 # flat clips (DP), and the box / stair traversal families

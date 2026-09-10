@@ -422,7 +422,9 @@ def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
 
     **The two pins are PER SIDE, because on a box the two sides are different surfaces.** A jump_on
     clip approaches along the ground and walks away on top of the box, and those have separate speed
-    bands (``box_vel_range`` [0.2, 3.5] against ``box_top_vx_range`` [0.2, 0.7]). Pinning both sides
+    bands (``box_vel_range`` against ``box_top_vx_range``; [0.2, 2.5] against [0.2, 1.0] on the
+    shipped recipe -- quoted from ``configs/clip_gen/g1_mb_v6.yaml`` rather than restated here,
+    because the two numbers written into this sentence had already drifted from it once). Pinning both sides
     to one scalar made ``box_top_vx_range`` DEAD on the command path: the box-top draw was computed,
     written into ``plan.exit_vx``, and then silently shadowed by the ground draw, which is the value
     generation actually reads (``mb_terrain_segments._hold_cmd``). Measured over the box families,
@@ -432,6 +434,14 @@ def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
     It is invisible on stairs and always was: there ``a_mag == x_mag == g_mag``, so 32 of 32 stair
     sides already agreed with their declaration to 0.000. Only a family whose two sides sit on
     different surfaces can show it.
+
+    **What ``box_top_vx_range`` governs is the HOLD, not every elevated frame**, and that is worth
+    stating because the obvious measurement disagrees. Measured on the v6 smoke library, commanded
+    ``|vx|`` over ALL post-terrain frames of the box families runs 0.755 .. 2.308 against a declared
+    [0.2, 1.0] -- not a violation, because those frames are the box-top hold FOLLOWED BY ordinary
+    exit flat pieces, and those are sampled from the driver envelope like any other flat piece.
+    Only the hold answers to this band. Anything checking it must slice the hold specifically;
+    taking a max over the elevated stretch measures the exit sampler instead.
 
     The commands are drawn CONTINUOUSLY from the family's band and are not tailored to the strides
     that exist: the motion is whichever stride is nearest (``flat_plan.nearest_stride``), and the

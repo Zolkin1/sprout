@@ -378,7 +378,7 @@ def _emit_interior(mb, targeter, plan, side: str, piece_key: str, out: str, args
         provenance={"backend": "motionbricks", "mode": f"{side}_interior", "skill": plan.skill,
                     "key": piece_key, "stride_out": int(tr.stride_out), "phase_out": int(tr.phase_out),
                     "stride_in": int(tr.stride_in), "phase_in": int(tr.phase_in),
-                    "gen_version": _GEN_VERSION,
+                    "gen_version": _GEN_VERSION, "seed": int(args.seed),
                     "stride_bank": os.path.basename(args.stride_bank),
                     "a_max": float(a_max), "alpha_max": float(args.alpha_max),
                     "min_transient_s": float(args.min_transient_s),
@@ -505,7 +505,7 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, dist: float, 
                     # The full set of knobs that shape this motion -- ``_gen_params`` compares them on
                     # resume so a settings change regenerates instead of silently reusing a stale segment
                     # (they are NOT in the request key, which only describes WHAT to reach, not HOW).
-                    "gen_version": _GEN_VERSION,
+                    "gen_version": _GEN_VERSION, "seed": int(args.seed),
                     "a_max": float(args.a_max),
                     "alpha_max": float(args.alpha_max),
                     "min_transient_s": float(args.min_transient_s), "hop_slack": float(args.hop_slack),
@@ -531,7 +531,10 @@ def _emit_segment(mb, targeter, plan, family, side: str, pin: str, dist: float, 
 
 # Generation knobs that change the MOTION for the same request. The key deliberately does not include
 # them (it says which boundary pose to reach and at what command), so resume compares them explicitly.
-_GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "dist", "pin", "a_max",
+# "seed" is in here because the driver forwards it: without it a seed change silently reused
+# every cached segment, so "reproducible from (recipe + source + seed)" was unenforceable
+# even once the flag arrived. Adding it invalidates existing caches, which is the point.
+_GEN_KNOBS = ("gen_version", "stride_bank", "pin_future", "start", "dist", "pin", "a_max", "seed",
               "alpha_max", "min_transient_s", "hop_slack")
 
 # Bump when the GENERATOR changes what it produces for identical knobs -- a CLI flag is comparable, code
@@ -571,7 +574,8 @@ def _gen_params(args, side: str, pin: str, dist: float, start: str) -> dict:
     would invalidate every segment whenever the work dir moved, while the basename still catches the case
     that matters (a different bank).
     """
-    return {"gen_version": _GEN_VERSION, "stride_bank": os.path.basename(args.stride_bank),
+    return {"gen_version": _GEN_VERSION, "seed": int(args.seed),
+            "stride_bank": os.path.basename(args.stride_bank),
             "a_max": float(args.a_max), "alpha_max": float(args.alpha_max),
             "min_transient_s": float(args.min_transient_s), "hop_slack": float(args.hop_slack),
             "pin_future": args.pin_future, "start": start if side == "approach" else "",
@@ -600,7 +604,7 @@ def _is_stale(path: str, want: dict, raw_schema) -> str | None:
     return None
 
 
-_INTERIOR_KNOBS = ("gen_version", "stride_bank", "a_max", "alpha_max", "min_transient_s",
+_INTERIOR_KNOBS = ("gen_version", "stride_bank", "a_max", "seed", "alpha_max", "min_transient_s",
                    "hop_slack", "ramp_dv")
 
 
@@ -763,7 +767,9 @@ def main() -> int:
     p.add_argument("--tag", default="", help="Suffix for the output filenames (e.g. the pin combination).")
     p.add_argument("--side", default="both", choices=["both", "approach", "exit"],
                    help="Generate only one side (e.g. to re-roll a seam without redoing the other).")
-    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--seed", type=int, default=0,
+                   help="Base seed. 0 to match every other stage; the driver forwards "
+                        "the recipe's value.")
     p.add_argument("--controller", default="random")          # unused; keeps build_demo_args happy
     p.add_argument("--allowed-mode", default=None)
     args = p.parse_args()

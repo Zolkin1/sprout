@@ -110,7 +110,7 @@ def _corners(pos_w: np.ndarray, R_w: np.ndarray) -> np.ndarray:
     return pos_w[None, :] + local @ R_w.T
 
 
-def foot_report(qpos_row: np.ndarray, boxes: list[dict], fk) -> dict:
+def foot_report(qpos_row: np.ndarray, boxes: list[dict], fk: object) -> dict:
     """What the gate does NOT look at, for one MuJoCo-layout ``qpos`` row.
 
     Returns each foot's lowest corner height, its PITCH, and the deepest corner relative to the
@@ -140,7 +140,7 @@ def foot_report(qpos_row: np.ndarray, boxes: list[dict], fk) -> dict:
 # --------------------------------------------------------------------------------- stage: sweep
 
 
-def stage_sweep(args) -> int:
+def stage_sweep(args: argparse.Namespace) -> int:
     """Plan the tile once per source-period frame and record what each hand-off would give."""
     sys.path.insert(0, _HERE)
     import torch
@@ -155,7 +155,7 @@ def stage_sweep(args) -> int:
     mjcf = DEFAULT_MJCF if os.path.isabs(DEFAULT_MJCF) else os.path.join(_REPO, DEFAULT_MJCF)
     chain = FKChain(mjcf, list(G1_JOINT_NAMES), list(ANKLES), base_link="pelvis_link")
 
-    def fk(joints: np.ndarray):
+    def fk(joints: np.ndarray) -> dict:
         """Base-frame ankle ``(pos[K,3], rot[K,3,3])`` for one joint vector."""
         jt = torch.as_tensor(np.asarray(joints, dtype=np.float32)[None, :])
         pos, rot, _, _ = chain.pose_and_jacobian(jt)
@@ -210,7 +210,7 @@ def stage_sweep(args) -> int:
 # --------------------------------------------------------------------------------- generation
 
 
-def generate(out_dir: str, k: int, spec: dict, args, tokens=0,
+def generate(out_dir: str, k: int, spec: dict, args: argparse.Namespace, tokens: int = 0,
              free_root: bool = False, exit_frame: int | None = None) -> str | None:
     """Run THE REAL pipeline for hand-off frame ``k`` -> a one-clip ``.h5``, or None on failure.
 
@@ -269,7 +269,7 @@ def generate(out_dir: str, k: int, spec: dict, args, tokens=0,
 # --------------------------------------------------------------------------------- stage: view
 
 
-def _clip_poses(path: str):
+def _clip_poses(path: str) -> tuple:
     """``(pos[T,3], wxyz[T,4], joints[T,29], overlays, anchor_mask[T])`` from a one-clip ``.h5``.
 
     The clip's own manifest is used, NOT the plan's boxes: the spliced clip is authored in the
@@ -366,7 +366,7 @@ def seam_mechanics(sp: dict, prov: dict, spec: dict, bank_period: int | None) ->
     return "\n\n".join(lines)
 
 
-def stage_view(args) -> int:
+def stage_view(args: argparse.Namespace) -> int:
     """Scrub the hand-off frames, generate the one you pick, and see the CLIP in the same scene."""
     import viser
     from viser.extras import ViserUrdf
@@ -418,7 +418,7 @@ def stage_view(args) -> int:
     except Exception as e:                      # a missing bank costs the half-step line, nothing else
         print(f"[stitch] no stride bank ({e}); the half-step comparison will be omitted")
 
-    def draw_paths(pelvis, ank, sp) -> None:
+    def draw_paths(pelvis: np.ndarray, ank: np.ndarray, sp: np.ndarray) -> None:
         """Pelvis + both ankle tracks, coloured by which piece of the clip made them.
 
         The ankle tracks are the point: a foot doubling back on itself is the transient
@@ -441,12 +441,14 @@ def stage_view(args) -> int:
                     point_size=0.012 if name == "pelvis" else 0.008))
 
     def set_tile(boxes: list[dict]) -> None:
+        """Rebuild the terrain mesh for the current tile geometry."""
         if st["mesh"] is not None:
             st["mesh"].remove()
         st["mesh"] = (server.scene.add_mesh_trimesh(
             "/tile", trimesh.util.concatenate([box_mesh(b) for b in boxes])) if boxes else None)
 
     def draw(t: int) -> None:
+        """Place the robot at frame ``t`` of whatever the Showing dropdown selects."""
         p = st["poses"]
         if p is None:
             return
@@ -457,11 +459,13 @@ def stage_view(args) -> int:
         vurdf.update_cfg(np.asarray(cfg[t])[st["perm"]])
 
     def clip_path(k: int, tokens: int | None = None) -> str:
+        """Path of the generated clip for the hand-off frame now selected."""
         t = int(tok_sl.value) if tokens is None else int(tokens)
         return os.path.join(args.out, f"gen_k{k:03d}" + (f"_t{t:02d}" if t else "")
                             + ("_free" if free_cb.value else ""), "clip.h5")
 
     def show_replay(k: int) -> None:
+        """Switch the viewer to the pinned terrain replay."""
         r = rows.get(int(k))
         if r is None or not r["ok"]:
             info.content = f"### k = {k}\n\n**REFUSED** — {r['why'] if r else 'not swept'}"
@@ -491,6 +495,7 @@ def stage_view(args) -> int:
         draw(0)
 
     def show_clip(k: int) -> None:
+        """Switch the viewer to a generated clip, loading it if present."""
         path = clip_path(k)
         if not os.path.exists(path):
             info.content = f"### k = {k}\n\nNo generated clip yet — press **Generate**."
@@ -518,36 +523,44 @@ def stage_view(args) -> int:
         draw(t_sl.value)
 
     def refresh() -> None:
+        """Re-read the sweep state and rebuild every viser control from it."""
         (show_clip if src.value == "generated clip" else show_replay)(int(k_sl.value))
 
     @k_sl.on_update
-    def _(_e) -> None:
+    def _(_e: object) -> None:
+        """Viser callback: refresh the view when this control changes."""
         refresh()
 
     @src.on_update
-    def _(_e) -> None:
+    def _(_e: object) -> None:
+        """Viser callback: refresh the view when this control changes."""
         refresh()
 
     @t_sl.on_update
-    def _(_e) -> None:
+    def _(_e: object) -> None:
+        """Viser callback: refresh the view when this control changes."""
         draw(int(t_sl.value))
 
     @tok_sl.on_update
-    def _(_e) -> None:
+    def _(_e: object) -> None:
+        """Viser callback: refresh the view when this control changes."""
         if src.value == "generated clip":
             refresh()
 
     @free_cb.on_update
-    def _(_e) -> None:
+    def _(_e: object) -> None:
+        """Viser callback: refresh the view when this control changes."""
         if src.value == "generated clip":
             refresh()
 
     @seam_btn.on_click
-    def _(_e) -> None:
+    def _(_e: object) -> None:
+        """Viser callback: refresh the view when this control changes."""
         t_sl.value = st["seam"]
 
     @gen_btn.on_click
-    def _(_e) -> None:
+    def _(_e: object) -> None:
+        """Viser callback: refresh the view when this control changes."""
         k = int(k_sl.value)
         gen_btn.disabled = True
         gen_out.content = f"generating k = {k} … (pass 1 → Motion Bricks → pass 2, ~30 s)"
@@ -612,7 +625,7 @@ def main() -> int:
     for k, v in {"entry_pick": "first", "exit_pick": "first", "contact_tol": 0.02,
                  "swing_clear": None, "swing_band": None, "terrain_id": 0,
                  "footprint_margin": 1.0, "has_floor": True, "stair_float_thickness": 0.0,
-                 "box_height": 0.45, "box_platform_buffer": 1.0, "box_nav_width": 0.0,
+                 "box_height": 0.45, "box_nav_width": 0.0,
                  "entry_frame": None, "exit_frame_override": None}.items():
         if not hasattr(args, k):
             setattr(args, k, v)
