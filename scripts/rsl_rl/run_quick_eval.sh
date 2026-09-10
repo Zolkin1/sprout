@@ -186,12 +186,12 @@ for spd in $SPEEDS; do
   d="$OUT/train_v${spd}"
   if [ -f "$d/rollout_${TRK}.episodes.h5" ]; then echo "[eval] SKIP $spd (exists)"; continue; fi
   echo "[eval] speed $spd  $(date +%H:%M)"
+  # `--history_from` is a CLI FLAG, not a hydra override: record_rollouts has its own flag
+  # for it and applies it after composition, so an override is silently discarded.
   $PY scripts/rsl_rl/record_rollouts.py \
     --task="$TASK" --load_run "$TRK" --fm_checkpoint "$FM" \
     --clip "$CLIP" --clip_device cpu --goal_regions "$GR" \
     --num_envs $NENV --episodes_per_env "$ROUNDS" --no_windows --terrain_reward \
-    # `--history_from`, NOT a hydra override: record_rollouts has its own flag for this and
-    # applies it after composition, so the override is silently discarded.
     --history_from "$HISTORY_FROM" \
     --output_dir "$d" \
     env.commands.traj_ref.freeform_speed_min=$spd \

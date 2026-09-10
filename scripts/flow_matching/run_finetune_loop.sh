@@ -329,15 +329,15 @@ for (( it=1; it<=ITERS; it++ )); do
     # ONE launch over the whole speed band: the commanded speed is drawn per EPISODE, so
     # pinning it (as the v2 collection did) would mean six Isaac starts for no extra
     # coverage. The band matches the range those six pinned runs covered.
+    # `--history_from` is a CLI FLAG, not a hydra override: `record_rollouts.py` has its own
+    # flag for it (default "generator") and writes it onto the command AFTER hydra
+    # composition, so `env.commands.traj_ref.history_from=` is silently overwritten. The run
+    # then serves the generator arm to a measured-trained checkpoint and
+    # `assert_history_source_matches` kills it after the simulator has launched.
     "$PY" -u scripts/rsl_rl/record_rollouts.py \
       --task="$TASK" --load_run "$TRK" --fm_checkpoint "$POLICY" \
       --clip "$CLIP" --clip_device cpu --goal_regions "$GOALS" \
       --num_envs "$ENVS" --episodes_per_env "$ROUNDS" --num_windows "$NWIN" \
-      # `--history_from`, NOT the hydra override. `record_rollouts.py` has its OWN flag for
-      # this (default "generator") and writes it onto the command AFTER hydra composition, so
-      # `env.commands.traj_ref.history_from=` is silently overwritten -- the run then serves
-      # the generator arm to a measured-trained checkpoint and `assert_history_source_matches`
-      # kills it after the simulator has launched. Cost: one wasted GPU launch.
       --history_from "$HISTORY_FROM" \
       --output_dir "$INC" \
       env.commands.traj_ref.fm_perturb_fraction="$PERTURB_FRAC" \
