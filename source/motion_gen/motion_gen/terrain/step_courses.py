@@ -158,6 +158,19 @@ CURB_HALF_WIDTH_M: float = 2.5
 #: at the same speed are the same command.
 CURB_TRAIN_SPEEDS_MPS: tuple[float, ...] = (0.50, 0.83, 1.17, 1.50, 1.83, 2.17)
 
+#: The band a TRAINING run samples continuously, stamped under the key
+#: :func:`motion_gen.clips.clip_io.read_commanded_speed_range` reads.
+#:
+#: box2's band, for the same reason the ladder above is box2's: a curb cell and a box2 cell at
+#: the same command must be the same command, or the "how low before it stops being a box"
+#: question is confounded with a speed difference.  Restated rather than imported so an edit
+#: there cannot move this library's provenance; ``test_step_courses.py`` pins them equal.
+#:
+#: Before this the curb declared only :data:`CURB_TRAIN_SPEEDS_MPS`, which nothing reads, so
+#: a loop pointed here fell back to its own default -- the same numbers, arrived at by
+#: coincidence rather than by declaration.
+CURB_SPEED_RANGE_MPS: tuple[float, float] = (0.5, 2.2)
+
 #: The held-out commanded speed (m/s), box2's.
 CURB_HOLDOUT_SPEED_MPS: float = 1.00
 

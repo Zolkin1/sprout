@@ -541,7 +541,11 @@ def read_commanded_speed_range(path: str) -> tuple[float, float] | None:
     if raw is None:
         return None
     cfg = json.loads(raw) if isinstance(raw, (str, bytes)) else dict(raw)
-    for block in ("step_course", "box2", "freeform", "varied_courses"):
+    # EVERY generator's block name, and the list is the contract. A block missing from here
+    # makes the whole declared-band path a silent no-op for that course: the library says
+    # 0.6-2.5, the reader returns None, and the caller falls back to a default nobody chose.
+    # `test_speed_band_contract.py` walks the builders and fails on a name that is not here.
+    for block in ("step_course", "box2", "freeform", "varied_courses", "indist_routes"):
         rng = (cfg.get(block) or {}).get("commanded_speed_range_mps")
         if rng is None:
             continue

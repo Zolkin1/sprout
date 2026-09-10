@@ -120,7 +120,24 @@ HOLDOUT_SPAWN_DISTANCE_M: float = 2.25
 #: mjeval's own box ladder where the 20-seed sweep found ANY successes; the last two scored
 #: 0.000 at both steering settings and are included deliberately, as the saturated-failure
 #: anchor a critic needs in order to have a boundary to place.
+#:
+#: **This is a LADDER for an eval, not the training distribution.**  A recording pins one rung
+#: per run so a cell is a (distance, speed) pair; training samples :data:`COMMANDED_SPEED_RANGE_MPS`
+#: continuously per episode, as the up-into-down and varied courses do.
 TRAIN_SPEEDS_MPS: tuple[float, ...] = (0.50, 0.83, 1.17, 1.50, 1.83, 2.17)
+
+#: The band a TRAINING run samples continuously, stamped into ``generator_config`` under the
+#: key ``clip_io.read_commanded_speed_range`` reads.
+#:
+#: **These are exactly the numbers the fine-tune loop already fell back to** when a library
+#: declared nothing (``SPEED_MIN=0.5`` / ``SPEED_MAX=2.2`` in ``run_finetune_loop.sh``), so
+#: declaring them changes no run that has ever been recorded -- it moves the statement from a
+#: default in a shell script into the artifact, which is where every other contract in this
+#: tree lives.  The ladder above spans 0.50-2.17 and sits inside it.
+#:
+#: It does NOT move the terrain fingerprint: ``generator_config`` is deliberately outside
+#: ``fingerprint_terrain_manifest``, because a commanded speed is not geometry.
+COMMANDED_SPEED_RANGE_MPS: tuple[float, float] = (0.5, 2.2)
 
 #: The HELD-OUT commanded speed (m/s).  Between rungs 2 and 3 of the training ladder, where the
 #: MuJoCo sweep puts success in the interesting 0.25-0.75 band rather than at either saturation.

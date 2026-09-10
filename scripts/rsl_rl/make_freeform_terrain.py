@@ -70,6 +70,7 @@ from motion_gen.clips.clip_fingerprint import fingerprint_terrain_manifest  # no
 from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library  # noqa: E402
 from motion_gen.clips.clip_manager import MotionClipManager  # noqa: E402
 from motion_gen.terrain.freeform import (  # noqa: E402
+    COMMANDED_SPEED_RANGE_MPS,
     FAMILIES,
     GENERATOR_TAG,
     FreeformConfig,
@@ -161,7 +162,12 @@ def write_terrain_library(path: str, manifest: list[dict], meta: dict, cfg: Free
             # flat SECTIONS here are manifest tiles like any other, so this is 0 and the
             # free-form counts live under their own key.
             "counts": {"flat": 0},
-            "freeform": {"section_counts": counts},
+            # The band, under the key `clip_io.read_commanded_speed_range` reads. Without it
+            # a loop pointed here falls back to box2's 0.5-2.2, whose floor is below this
+            # command's own 0.6 -- a speed it was never built to be recorded at.
+            "freeform": {"section_counts": counts,
+                         "commanded_speed_range_mps":
+                             [float(v) for v in COMMANDED_SPEED_RANGE_MPS]},
         })
 
 

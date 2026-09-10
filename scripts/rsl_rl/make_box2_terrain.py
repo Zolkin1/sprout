@@ -48,6 +48,7 @@ from motion_gen.clips.clip_io import ClipLibraryWriter  # noqa: E402
 from motion_gen.terrain.box2 import (  # noqa: E402
     BOX2_FAMILY,
     BOX2_V2_FAMILY,
+    COMMANDED_SPEED_RANGE_MPS,
     GOAL_SHIFT_V2_M,
     TARGET_LEAD_M,
     TARGET_LEAD_V2_M,
@@ -125,8 +126,19 @@ def write_box2_library(path: str, manifest: list[dict], meta: dict, role: str,
             "box2": {"role": role, "family": family,
                      "variant": variant, "target_lead_m": float(target_lead_m),
                      "spawn_distances_m": [float(d) for d in distances],
+                     # The eval LADDER, provenance only -- a recording pins one rung per run.
                      "intended_speeds_mps": [float(s) for s in speeds],
-                     "mjeval_course": "mjeval_box2_h040"},
+                     # The band a TRAINING run samples continuously, under the key
+                     # `clip_io.read_commanded_speed_range` actually reads. Before this the
+                     # library declared only `intended_speeds_mps`, which NOTHING reads, so
+                     # the whole declared-band path was a no-op here and the loop fell back
+                     # to its own 0.5-2.2 -- the same numbers, stated in a shell script
+                     # instead of in the artifact.
+                     "commanded_speed_range_mps": [float(v) for v in COMMANDED_SPEED_RANGE_MPS],
+                     # ONLY v1 is the mjeval clone. v2 moves the goal 3 m further out with the
+                     # boxes unmoved, so it is a different course; claiming the clone on both
+                     # let a v2 recording read as reproducing an mjeval number.
+                     **({"mjeval_course": "mjeval_box2_h040"} if variant == "v1" else {})},
         })
 
 

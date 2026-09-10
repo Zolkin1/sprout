@@ -55,6 +55,7 @@ if str(_HERE) not in sys.path:
 
 from motion_gen.clips.clip_fingerprint import fingerprint_terrain_manifest  # noqa: E402
 from motion_gen.clips.clip_io import ClipLibraryWriter  # noqa: E402
+from motion_gen.terrain.box2 import COMMANDED_SPEED_RANGE_MPS  # noqa: E402
 from motion_gen.terrain.freeform import (  # noqa: E402
     FREEFORM_SPAWN_JITTER_M,
     GENERATOR_TAG,
@@ -269,6 +270,12 @@ def main() -> int:
             "indist_routes": {
                 "source": os.path.basename(args.source),
                 "families": sorted(FAMILIES),
+                # The band, under the key `clip_io.read_commanded_speed_range` reads. These
+                # are REAL library tiles, so the band is the one the fine-tune's other courses
+                # use -- the comparison this set exists for is "did the OOD fine-tune cost
+                # anything in distribution", and a different command band would answer a
+                # different question.
+                "commanded_speed_range_mps": [float(v) for v in COMMANDED_SPEED_RANGE_MPS],
                 "goal_above_spawn": {k: v for k, v in FAMILIES.items()},
                 "goal_half_width_m": GOAL_HALF_WIDTH_M,
                 # The route is derived from GEOMETRY, not from clip poses -- recorded so a

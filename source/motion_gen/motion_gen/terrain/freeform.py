@@ -191,6 +191,16 @@ SPAWN_INSET_M: float = 0.75
 #: lateral spread that let the robot start a metre off the approach centreline -- and because
 #: declared areas REPLACE the jitter, `pos_jitter_m` had silently stopped doing anything there.
 FREEFORM_SPAWN_JITTER_M: tuple[float, float] = (0.25, 0.25)
+
+#: The band a free-form training run samples continuously (m/s), stamped into
+#: ``generator_config`` under the key ``clip_io.read_commanded_speed_range`` reads.
+#:
+#: These are the CLIP-FREE COMMAND TERM's own defaults (``FmTrackingCommandCfg``'s
+#: ``freeform_speed_{min,max}``), restated here so the LIBRARY declares its band rather than
+#: inheriting whatever the env cfg happens to say on the day it is recorded -- which is the
+#: whole reason every other course stamps one.  `motion_gen` is IsaacLab-free and cannot
+#: import that cfg to read them; ``test_speed_band_contract.py`` pins the pair equal.
+COMMANDED_SPEED_RANGE_MPS: tuple[float, float] = (0.6, 2.6)
 GOAL_INSET_M: float = 0.75
 
 #: Slack (m) allowed in every geometric containment check: an overlay against its tile footprint,

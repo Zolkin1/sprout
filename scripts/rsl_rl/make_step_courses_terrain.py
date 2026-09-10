@@ -168,7 +168,7 @@ def _resolve(args: argparse.Namespace) -> dict:
                 ("holdout", sc.generate_curb_manifest((sc.CURB_HOLDOUT_HEIGHT_M,)),
                  (sc.CURB_HOLDOUT_HEIGHT_M,), (sc.CURB_HOLDOUT_SPEED_MPS,)),
             ),
-            "speed_range": None,
+            "speed_range": sc.CURB_SPEED_RANGE_MPS,
         "grid_name": "step_heights_m",
         }
 
@@ -198,9 +198,7 @@ def _resolve(args: argparse.Namespace) -> dict:
                                      if (args.runout == sc.UPDOWN_RUNOUT_M
                                          and (args.visual_walls or not walls)) else "")},
         # The commanded band is a property of the COURSE and is stamped, so a runner reads
-        # it rather than restating it -- see `clip_io.read_commanded_speed_range`. The
-        # holdout keeps a single pinned speed: it is a held-out INITIAL CONDITION, and
-        # varying its command too would confound the two axes.
+        # it rather than restating it -- see `clip_io.read_commanded_speed_range`.
         "speed_range": sc.UPDOWN_SPEED_RANGE_MPS,
         "roles": (
             ("train", sc.generate_updown_manifest(approaches, depth, **kw), approaches,
@@ -290,9 +288,15 @@ def main() -> int:
         path = str(out_dir / f"{spec['prefix']}_{role}.h5")
         # The HOLDOUT stamps no range: its speed is pinned, so a band there would say the
         # opposite of what the file is for.
+        # THE HOLDOUT STAMPS THE BAND TOO, and it used to stamp nothing. The band describes
+        # the COURSE, and the holdout is the same course at one held-out initial condition --
+        # so withholding it did not pin the holdout's command, it only made a runner pointed
+        # there fall back to ITS default: 0.5-2.2, whose floor is BELOW this course's own 0.6.
+        # What keeps the holdout's command from varying is that a recording pins it
+        # (`freeform_speed_{min,max}`), which is the recording's business; `intended_speeds_mps`
+        # still records which speed that is.
         write_library(path, manifest, meta, role, spec["grid_name"], grid, speeds,
-                      spec["config"],
-                      speed_range=(spec.get("speed_range") if role == "train" else None))
+                      spec["config"], speed_range=spec.get("speed_range"))
         print(f"\n[step] {role}: {len(manifest)} tile(s) -> {path}")
         print(f"[step]   {spec['grid_name']} {list(grid)}, "
               f"intended speeds {list(speeds)} m/s")
