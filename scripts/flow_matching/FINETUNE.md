@@ -212,6 +212,10 @@ python scripts/flow_matching/export_fm_onnx.py --checkpoint logs/box2/prog_s3_it
 
 The arms worth watching, and where their checkpoints live:
 
+Success rates below are under the PRE-TERMINATION rule (`--metric reached_goal
+--failure_rule loose`), which is what existed when they were collected. See CLAUDE.md for why
+the current default reports something different on the same files.
+
 | arm | box2 success | checkpoint |
 |---|---|---|
 | parent | 0.2440 | `logs/flow_matching/2026-08-25_09-03-39_plan_v1_h64_27M_nojumpoff/best.pt` |

@@ -1370,6 +1370,16 @@ which is why the paired interval is the honest one and the level intervals are c
 | **+ the velocity-mismatch knob (0.30)** | **+0.4817 [+0.3905, +0.5831]** | p underflows |
 | filtered BC, top 30% | +0.3531 [+0.2124, +0.5124] | p=9.2e-242 |
 
+**Every number in this section was measured under the PRE-TERMINATION rule** -- `reached_goal`
+on recordings that ran past a tracking violation -- because that is what existed when they were
+collected. To reproduce them from those recordings you must say so:
+`--metric reached_goal --failure_rule loose`. Under the current default (`strict`) the same
+recordings report 0.0052, because the bound is then applied to episodes it never ended;
+`box2_ic_report` detects that and says which rule to use, and
+`rollout_outcomes.assert_tracking_bounds_agree` refuses a comparison that straddles the change.
+Numbers from runs collected AFTER the termination are not comparable to these on the critic's
+definition of an episode.
+
 **Filtered BC MATCHES AWR here** -- the intervals overlap almost entirely and fBC's is 55%
 wider. On this course the advantage WEIGHTING buys nothing over a top-30% filter, which is the
 ablation's real finding. Up-into-down is +0.2069 and the in-distribution control (routes over
