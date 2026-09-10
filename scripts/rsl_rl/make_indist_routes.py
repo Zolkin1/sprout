@@ -218,6 +218,10 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--source", required=True, help="the ORIGINAL clip library to copy tiles from")
+    p.add_argument("--goals", default="logs/indist/goal_regions.json",
+                   help="Write the DECLARED goal_regions.json here. Emitted from the route's "
+                        "own geometry rather than hand-kept, because logs/ is gitignored and "
+                        "a hand-kept spec does not travel with a git sync. '' skips it.")
     p.add_argument("--out_dir", default="clips")
     p.add_argument("--prefix", default="indist")
     p.add_argument("--like", default=None,
@@ -289,6 +293,37 @@ def main() -> int:
                 "needs_height_tol_for": [k for k, v in FAMILIES.items() if v],
             },
         })
+    if args.goals:
+        # EMITTED, not hand-written: `logs/` is gitignored so a hand-kept spec does not travel
+        # with a git sync, and this file's own provenance already named a script that wrote
+        # no spec.
+        _spec = {
+            "default": {"approach_margin_m": 0.0,
+                        "half_width_m": float(GOAL_HALF_WIDTH_M),
+                        "height_tol_m": 0.5},
+            "by_family": {},
+            "provenance": {
+                "declared": True,
+                "source": (f"scripts/rsl_rl/make_indist_routes.py over "
+                           f"{os.path.basename(args.source)}"),
+                "note": ("DECLARED from the authored route, not fitted: this is a "
+                         "manifest-only library with no clips to fit from. half_width_m "
+                         "matches the route's own goal_half_width so `in_goal` and the "
+                         "termination agree on the band. height_tol_m is 0.5 and MATTERS "
+                         "here -- on the two ascending families the goal sits ABOVE the "
+                         "spawn, so with the test off an arrival could be scored from the "
+                         "floor."),
+                "families": sorted(FAMILIES),
+                "needs_height_tol_for": [k for k, v in FAMILIES.items() if v],
+            },
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.goals)) or ".", exist_ok=True)
+        with open(args.goals, "w", encoding="utf-8") as _fh:
+            json.dump(_spec, _fh, indent=2)
+        print(f"[indist] goal regions -> {args.goals}  "
+              f"(half_width {_spec['default']['half_width_m']:.2f} m, height band "
+              f"{_spec['default']['height_tol_m']:.2f} m)")
+
     fp = fingerprint_terrain_manifest(keep)
     print(f"[indist] wrote {out}: {len(keep)} tiles, fingerprint {fp['short']}")
     print(f"[indist] {'tile':>5} {'src':>4} {'family':>16} {'start(x,y,z)':>22} "

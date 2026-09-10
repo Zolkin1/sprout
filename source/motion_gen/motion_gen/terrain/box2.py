@@ -311,3 +311,53 @@ def generate_box2_manifest(spawn_distances_m: tuple[float, ...], *,
                          "from the pelvis to the first box FACE, so 0 spawns inside the box.")
     return [make_box2_tile(i, d, target_lead_m=target_lead_m, family=family)
             for i, d in enumerate(spawn_distances_m)]
+
+
+def goal_region_spec(variant: str = "v2") -> dict:
+    """The DECLARED ``goal_regions.json`` spec for a two-box library.
+
+    Declared from the authored course rather than fitted from clip-arm episodes: this is a
+    manifest-only library with no clips to fit from, and on an authored course the goal region
+    is a property of the geometry.
+
+    ``half_width_m`` is :data:`GOAL_HALF_WIDTH_M`, i.e. every tile's own
+    ``route.goal_half_width``, so ``goal_region.in_goal`` and the ``freeform_goal_reached``
+    termination agree.  ``approach_margin_m`` is 0 because ``freeform_goal_anchor_world``
+    already puts the anchor at the near edge of mjeval's 2.0 m goal rectangle -- subtracting a
+    margin here as well would double-count it and move the success line a metre nearer than
+    mjeval's.
+
+    ``height_tol_m`` is 0.5 and NOT 0: 0 disables the test in the termination and, until it
+    was reconciled, was an unsatisfiable exact-equality in ``in_goal``.  Writing 0 once cost a
+    whole arm five iterations -- see :func:`~mdp.goal_region.in_goal`.
+
+    Args:
+        variant: ``"v1"`` (mjeval's clone) or ``"v2"`` (the goal 3 m further out).
+
+    Returns:
+        A JSON-serialisable spec.
+
+    Raises:
+        ValueError: On an unknown variant, since the two are different courses.
+    """
+    if variant not in ("v1", "v2"):
+        raise ValueError(f"variant must be 'v1' or 'v2', got {variant!r}")
+    return {
+        "default": {"approach_margin_m": 0.0,
+                    "half_width_m": float(GOAL_HALF_WIDTH_M),
+                    "height_tol_m": 0.5},
+        "by_family": {},
+        "provenance": {
+            "declared": True,
+            "source": f"motion_gen.terrain.box2 ({variant})"
+                      + (" / mjeval mjeval_box2_h040" if variant == "v1" else ""),
+            "note": ("DECLARED from the authored course, not fitted from clip-arm episodes: "
+                     "this is a manifest-only library with no clips to fit from, and on an "
+                     "authored course the goal region is a property of the geometry. "
+                     "approach_margin_m=0 because freeform_goal_anchor_world already puts "
+                     "the anchor at the near edge of mjeval's 2.0 m goal rectangle."),
+            "goal_half_width_m": float(GOAL_HALF_WIDTH_M),
+            "goal_depth_m": float(GOAL_DEPTH_M),
+            "mjeval_course": "mjeval_box2_h040" if variant == "v1" else "",
+        },
+    }

@@ -441,3 +441,39 @@ def generate_updown_manifest(approaches_m: tuple[float, ...], platform_depth_m: 
     return [make_updown_tile(i, a, platform_depth_m, runout_m=runout_m, walls=walls,
                              wall_collidable=wall_collidable, family=family)
             for i, a in enumerate(approaches_m)]
+
+
+def goal_region_spec(approaches_m: tuple[float, ...] | None = None) -> dict:
+    """The DECLARED ``goal_regions.json`` spec for an up-into-down library.
+
+    Same reasoning as :func:`motion_gen.terrain.box2.goal_region_spec` -- declared from the
+    authored geometry, ``approach_margin_m`` 0 because the anchor is already the goal LINE the
+    tile declares, ``height_tol_m`` 0.5 and never 0.
+
+    The half-width is HALF THE CORRIDOR, floored at what the RL termination clamps up to, and
+    it is deliberately not mjeval's 2.5 m: this course's corridor is 1.96 m wide, so a 2.5 m
+    band would reach past the walls and score an arrival beside the flight.
+
+    Args:
+        approaches_m: The training grid, recorded in the provenance; the course's own if
+            omitted.
+
+    Returns:
+        A JSON-serialisable spec.
+    """
+    appr = tuple(approaches_m) if approaches_m is not None else UPDOWN_TRAIN_APPROACHES_M
+    half = max(UPDOWN_WIDTH_M / 2.0, GOAL_HALF_WIDTH_FLOOR_M)
+    return {
+        "default": {"approach_margin_m": 0.0,
+                    "half_width_m": float(half),
+                    "height_tol_m": 0.5},
+        "by_family": {},
+        "provenance": {
+            "declared": True,
+            "source": "motion_gen.terrain.step_courses (up-into-down)",
+            "goal_half_width_m": float(half),
+            "goal_depth_m": float(GOAL_DEPTH_M),
+            "approach_distances_m": [float(a) for a in appr],
+            "holdout_approach_m": float(UPDOWN_HOLDOUT_APPROACH_M),
+        },
+    }

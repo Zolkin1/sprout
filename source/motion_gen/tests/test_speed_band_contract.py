@@ -179,3 +179,58 @@ def test_every_course_restates_the_same_goal_geometry(name: str) -> None:
         "RECTANGLE onto the line-plus-band the RL termination tests, so a course whose lead "
         "or depth differs scores arrival at a different place while reporting the same "
         "column.")
+
+
+# ---------------------------------------------------------------------------------------------
+# The GOAL spec, which is the other half of the contract and used to be hand-kept.
+# ---------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("script", ["make_box2_terrain.py", "make_step_courses_terrain.py",
+                                    "make_varied_terrain.py", "make_indist_routes.py"])
+def test_every_builder_emits_its_goal_spec(script: str) -> None:
+    """A course whose geometry regenerates but whose goal spec does not is half reproducible.
+
+    Four of the five specs were hand-written, and `logs/` is gitignored -- so they do not
+    travel with a git sync. That bit us when talos held a stale ``height_tol_m: 0`` after a
+    pull, which is the value that cost an arm five iterations of mistraining; and
+    `logs/indist/goal_regions.json` named as its source a script that wrote no spec at all.
+    """
+    p = _SCRIPTS / script
+    if not p.is_file():
+        pytest.skip(f"{script} not present")
+    src = p.read_text()
+    assert '"--goals"' in src, f"{script} cannot write a goal spec"
+    assert "goal_regions.json" in src
+
+
+@pytest.mark.parametrize("name,fn,kw", [
+    ("box2", "goal_region_spec", {"variant": "v2"}),
+    ("step_courses", "goal_region_spec", {}),
+])
+def test_the_declared_spec_never_disables_the_height_test(name: str, fn: str, kw: dict) -> None:
+    """``height_tol_m`` must be a real band in every emitted spec.
+
+    0 disables the height test, and on a course whose goal sits ABOVE the spawn that lets an
+    arrival be scored from the floor beside the terrain -- which is the whole thing the
+    tolerance exists to catch.
+    """
+    import importlib
+
+    mod = importlib.import_module(f"motion_gen.terrain.{name}")
+    spec = getattr(mod, fn)(**kw)
+    d = spec["default"]
+    assert d["height_tol_m"] > 0.0, f"{name} declares height_tol_m={d['height_tol_m']}"
+    assert d["half_width_m"] > 0.0
+    assert spec["provenance"]["declared"] is True
+
+
+def test_the_updown_band_does_not_reach_past_its_walls() -> None:
+    """mjeval's 2.5 m band would score an arrival BESIDE a 1.96 m corridor's flight.
+
+    The course's own half-width is half the corridor, floored at what the RL termination
+    clamps up to -- and the free-form stairs family's wider margin is the documented apron
+    trap, where 0.65 m of ground-level apron beside the flight is a clean route AROUND it that
+    scores as a success.
+    """
+    d = step_courses.goal_region_spec()["default"]
+    assert d["half_width_m"] <= step_courses.UPDOWN_WIDTH_M / 2.0 + 1e-9
+    assert d["half_width_m"] < 2.5

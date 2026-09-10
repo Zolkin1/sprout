@@ -30,6 +30,7 @@ writes ``clips/updown_p020_{train,holdout}.h5`` (5 + 1 tiles).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -65,6 +66,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefix", default=None,
                    help="Output stem. Defaults to the course's own family name "
                         "(`updown_p020`, `updown_p020_r030`, ...).")
+    p.add_argument("--goals", default="logs/updown/goal_regions.json",
+                   help="Write the DECLARED goal_regions.json here. Emitted from the course's "
+                        "own geometry rather than hand-kept, because logs/ is gitignored and a "
+                        "hand-kept spec does not travel with a git sync. '' skips it.")
     p.add_argument("--out_dir", default="clips", help="Directory for the two .h5 files.")
     p.add_argument("--like", default=None,
                    help="Copy the channel layout from this library. Motion is never copied.")
@@ -231,6 +236,20 @@ def main() -> int:
     spec = _resolve(args)
     meta = library_meta(args.like)
     out_dir = pathlib.Path(args.out_dir)
+    if args.goals:
+        # EMITTED, not hand-written. `logs/` is gitignored, so a hand-kept spec does not
+        # travel with a git sync -- which bit us when talos held a stale `height_tol_m: 0`
+        # after a pull, the value that cost an arm five iterations. A course whose geometry
+        # regenerates but whose goal spec does not is only half reproducible.
+        _spec = sc.goal_region_spec()
+        os.makedirs(os.path.dirname(os.path.abspath(args.goals)) or ".", exist_ok=True)
+        with open(args.goals, "w", encoding="utf-8") as _fh:
+            json.dump(_spec, _fh, indent=2)
+        _d = _spec["default"]
+        print(f"[step] goal regions -> {args.goals}  "
+              f"(half_width {_d['half_width_m']:.2f} m, height band "
+              f"{_d['height_tol_m']:.2f} m)")
+
     print(f"[step] course {args.course!r}, family {spec['family']!r}"
           + (f"  (== mjeval {spec['config']['mjeval_course']})"
              if spec["config"]["mjeval_course"] else "  (authored here; no mjeval twin)"))

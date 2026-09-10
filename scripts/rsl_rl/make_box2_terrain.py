@@ -28,6 +28,7 @@ generator with no extra frames.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pathlib
 import sys
@@ -57,6 +58,7 @@ from motion_gen.terrain.box2 import (  # noqa: E402
     TRAIN_SPAWN_DISTANCES_M,
     TRAIN_SPEEDS_MPS,
     generate_box2_manifest,
+    goal_region_spec,
 )
 from motion_gen.terrain.freeform import GENERATOR_TAG, validate_manifest  # noqa: E402
 
@@ -69,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     """Command-line arguments."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--goals", default="logs/box2/goal_regions.json",
+                   help="Write the DECLARED goal_regions.json here. Emitted from the course's "
+                        "own geometry rather than hand-kept, because logs/ is gitignored and a "
+                        "hand-kept spec does not travel with a git sync. '' skips it.")
     p.add_argument("--out_dir", default="clips", help="Directory for the two .h5 files.")
     p.add_argument("--variant", default="v1", choices=("v1", "v2"),
                    help="v1 is the mjeval course exactly. v2 moves the GOAL "
@@ -147,6 +153,20 @@ def main() -> int:
     args = parse_args()
     meta = library_meta(args.like)
     out_dir = pathlib.Path(args.out_dir)
+    if args.goals:
+        # EMITTED, not hand-written. `logs/` is gitignored, so a hand-kept spec does not
+        # travel with a git sync -- which bit us when talos held a stale `height_tol_m: 0`
+        # after a pull, the value that cost an arm five iterations. A course whose geometry
+        # regenerates but whose goal spec does not is only half reproducible.
+        _spec = goal_region_spec(args.variant)
+        os.makedirs(os.path.dirname(os.path.abspath(args.goals)) or ".", exist_ok=True)
+        with open(args.goals, "w", encoding="utf-8") as _fh:
+            json.dump(_spec, _fh, indent=2)
+        _d = _spec["default"]
+        print(f"[box2] goal regions -> {args.goals}  "
+              f"(half_width {_d['half_width_m']:.2f} m, height band "
+              f"{_d['height_tol_m']:.2f} m)")
+
     v2 = args.variant == "v2"
     lead = TARGET_LEAD_V2_M if v2 else TARGET_LEAD_M
     family = BOX2_V2_FAMILY if v2 else BOX2_FAMILY
