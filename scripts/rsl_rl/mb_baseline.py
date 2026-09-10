@@ -564,6 +564,43 @@ def bucket_mse(cmd: np.ndarray, achieved: np.ndarray, dt: float, buckets: tuple,
     return out
 
 
+def joint_jerk_rms(joints: np.ndarray, dt: float) -> float:
+    """RMS of ``d3q/dt3`` over the actuated joints (rad/s^3) -- the jitter number.
+
+    Third difference rather than second: an acceleration RMS is dominated by the gait's own
+    intended accelerations (a swing leg really does accelerate), where jerk is dominated by
+    frame-to-frame roughness, which is what "the MM output always felt a bit noisy" describes.
+
+    **Jerk carries ``dt^-3``, so every arm must be measured on ONE grid.** Ours and the
+    motion-matching arm are native 50 Hz; Motion Bricks generates at 30 fps, so its jitter is
+    scored on the SAME 50 Hz resampling the velocity metric already uses. Comparing its native
+    30 Hz number against a 50 Hz one would be a factor of ``(50/30)^3 = 4.6`` of pure convention.
+
+    What that resampling costs is MEASURED per run rather than argued, by the ``resample control``
+    row: our own clips routed 50 -> 30 -> 50 by the same interpolation. Two things about it are
+    worth knowing, because the first is a trap:
+
+    * On a synthetic pure tone the round trip INFLATES jerk 5.7x (301 -> 1728), because linear
+      interpolation leaves a slope discontinuity at every source sample and a third difference is
+      exactly what those excite.
+    * On the REAL clips it does the opposite, and mildly: 1647 -> 1466, about -11%. Real motion
+      already carries high-frequency content at 50 Hz that a 30 Hz round trip removes, and that
+      removal outweighs the interpolation kinks. The synthetic tone had none, so only the kinks
+      showed.
+
+    So the operative bias is the measured one, it is small, and it runs in Motion Bricks' favour
+    (its resampled motion reads ~11% smoother than the same motion would natively). A finding that
+    the MB arm is JERKIER than ours therefore survives it; a finding that it is smoother by less
+    than that margin does not. Read the control row on the run in hand -- it is printed for this
+    reason and it is not a constant.
+    """
+    if joints is None or len(joints) < 4:
+        return float("nan")
+    j = np.asarray(joints, np.float64)
+    d3 = (j[3:] - 3.0 * j[2:-1] + 3.0 * j[1:-2] - j[:-3]) / (dt ** 3)
+    return float(np.sqrt(np.mean(d3 ** 2)))
+
+
 def bootstrap_rmse(per_clip: list, n_boot: int = 2000, seed: int = 0,
                    ci: float = 0.95) -> tuple:
     """Clip-CLUSTERED bootstrap of a pooled RMSE. ``per_clip`` is ``[(sum_sq, n_frames)]``.
@@ -697,18 +734,33 @@ def _run_matches(run_path: str, args: argparse.Namespace) -> bool:
     return ok
 
 
+def select_flat_clips(clip_path: str, n_clips: int, seed: int) -> list[int]:
+    """The flat clip indices a batch run scores, as a sorted list.
+
+    THE one definition, because a second arm has to be generated against the SAME commands to be
+    comparable and would otherwise restate this rule. ``generate_mm_clips.py --command-from``
+    imports it rather than mirroring it -- a selection rule copied into two files is the shape of
+    defect this repo keeps finding (see CLAUDE.md on flag forwarding), and here it would be
+    invisible: both arms would run, both would report, and the table would silently pair clip i of
+    one against a different motion in the other.
+    """
+    import h5py
+    with h5py.File(clip_path, "r") as f:
+        tid = np.asarray(f["terrain_id"])
+    flat = np.flatnonzero(tid < 0)
+    rng = np.random.default_rng(seed)
+    return sorted(int(i) for i in rng.choice(flat, size=min(n_clips, len(flat)), replace=False))
+
+
 def stage_batch(args: argparse.Namespace) -> int:
     """Run both arms over many flat clips and report bucketed RMSE with clip-clustered CIs."""
     import h5py
     import subprocess as sp
 
     with h5py.File(args.clip, "r") as f:
-        tid = np.asarray(f["terrain_id"])
-    flat = np.flatnonzero(tid < 0)
-    rng = np.random.default_rng(args.seed)
-    pick = sorted(int(i) for i in rng.choice(flat, size=min(args.n_clips, len(flat)),
-                                             replace=False))
-    print(f"[mb_base] {len(pick)} flat clips of {len(flat)} available: {pick[:8]}"
+        n_flat = int((np.asarray(f["terrain_id"]) < 0).sum())
+    pick = select_flat_clips(args.clip, args.n_clips, args.seed)
+    print(f"[mb_base] {len(pick)} flat clips of {n_flat} available: {pick[:8]}"
           f"{' ...' if len(pick) > 8 else ''}")
 
     work = os.path.join(args.out_dir, "runs")
@@ -717,7 +769,34 @@ def stage_batch(args: argparse.Namespace) -> int:
     ours_b = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
     base_b = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
     floor_b = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
+    mm_b = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
+    jerk = {"ours": [], "baseline": [], "mm": [], "artifact": [],
+            "ours_seam": [], "ours_interior": [], "seam_frac": []}
     run_paths, failed = [], []
+
+    # The motion-matching arm, if one was built. Its clip j corresponds to OUR pick[j] -- that is
+    # what generate_mm_clips.py --command-from guarantees, by importing select_flat_clips rather
+    # than restating it. Verified below rather than trusted: the recorded indices must match.
+    mm_lib = None
+    if args.mm_arm:
+        with h5py.File(args.mm_arm, "r") as f:
+            src = json.loads(f.attrs["command_source"]) if "command_source" in f.attrs else None
+        if isinstance(src, str):        # double-encoded by an older writer
+            src = json.loads(src)
+        if src is not None and not isinstance(src, dict):
+            raise SystemExit(f"{args.mm_arm}: `command_source` is {type(src).__name__}, not an "
+                             "object -- it was written by an incompatible generator")
+        if src is None:
+            raise SystemExit(f"{args.mm_arm} has no `command_source` attr, so it was NOT generated "
+                             "against these commands -- it is the authored MM family, which draws "
+                             "its own speeds and is not comparable. Rebuild with --command-from.")
+        if list(src.get("clip_indices", [])) != list(pick):
+            raise SystemExit(
+                f"{args.mm_arm} was built against clips {src.get('clip_indices', [])[:6]}... but "
+                f"this run scores {pick[:6]}... -- the arms would be paired on different motions. "
+                f"Rebuild it with --command-n-clips {args.n_clips} --command-seed {args.seed}.")
+        mm_lib = args.mm_arm
+        print(f"[mb_base] MM arm: {mm_lib} ({len(src['clip_indices'])} clips, indices verified)")
 
     for j, ci_ in enumerate(pick):
         prof = os.path.join(work, f"profile_{ci_:05d}.npz")
@@ -745,6 +824,7 @@ def stage_batch(args: argparse.Namespace) -> int:
 
         clip = read_clip(args.clip, ci_)
         from robot_rl.flow_matching.viz.robot import xyzw_to_wxyz
+        from motion_gen.joint_names import G1_JOINT_NAMES
         nm = clip["names"]
         ow = xyzw_to_wxyz(clip["y"][:, [nm.index(f"pelvis_link:ori_{c}") for c in "xyzw"]])
         vo = boxcar(body_velocity(clip["pos"], ow, clip["dt"]), clip["dt"], args.smooth_s)
@@ -752,6 +832,40 @@ def stage_batch(args: argparse.Namespace) -> int:
         vb = boxcar(body_velocity(bp, bw, clip["dt"]), clip["dt"], args.smooth_s)
         mo = bucket_mse(clip["cmd"], vo, clip["dt"], buckets, settle_s=args.settle_s)
         mb_ = bucket_mse(clip["cmd"], vb, clip["dt"], buckets, settle_s=args.settle_s)
+
+        # --- jitter, per arm, each at ITS OWN native rate (see joint_jerk_rms on why) ---
+        jcols = [nm.index(f"joint:{n_}") for n_ in G1_JOINT_NAMES]
+        q_ours = clip["y"][:, jcols]
+        jerk["ours"].append(joint_jerk_rms(q_ours, clip["dt"]))
+        with np.load(runp, allow_pickle=True) as _d:
+            fps_mb = float(_d["fps"])
+        # On the CLIPS' 50 Hz grid, not Motion Bricks' native 30: jerk goes as dt^-3, so mixing
+        # rates in one column would be a 4.6x of pure convention. _resample_run is the same
+        # interpolation the velocity metric uses, so the two metrics see one signal.
+        jerk["baseline"].append(joint_jerk_rms(_bj, clip["dt"]))
+        # The CONTROL for that column: OUR joints routed 50 -> 30 -> 50 the way the MB arm's are,
+        # so the resampling inflation is measured on this run's own motion instead of asserted.
+        t50 = np.arange(len(q_ours)) * clip["dt"]
+        t30 = np.arange(0.0, t50[-1] + 1e-9, 1.0 / fps_mb)
+        q_rt = np.stack([np.interp(t50, t30, np.interp(t30, t50, q_ours[:, k]))
+                         for k in range(q_ours.shape[1])], axis=1)
+        jerk["artifact"].append(joint_jerk_rms(q_rt, clip["dt"]))
+        # WHERE our jerk lives. A clip of ours is exact solved strides spliced to MB transients,
+        # so the splice seams are the candidate -- and they are the one part that is a knob
+        # (seam_blend_s) rather than a property of the approach. stride_idx marks them; the MM
+        # and MB arms have no such structure, so this decomposition is OURS only and explains
+        # our own row rather than ranking anything.
+        with h5py.File(args.clip, "r") as _f:
+            si = np.asarray(_f["stride_idx"][ci_, :clip["n"]]) if "stride_idx" in _f else None
+        if si is not None and len(q_ours) > 3:
+            d3 = (q_ours[3:] - 3.0 * q_ours[2:-1] + 3.0 * q_ours[1:-2] - q_ours[:-3]) / clip["dt"] ** 3
+            near = np.zeros(len(d3), bool)
+            for k in np.flatnonzero(si[1:] != si[:-1]) + 1:
+                near[max(0, k - 5):min(len(near), k + 5)] = True
+            if near.any() and (~near).any():
+                jerk["ours_seam"].append(float(np.sqrt((d3[near] ** 2).mean())))
+                jerk["ours_interior"].append(float(np.sqrt((d3[~near] ** 2).mean())))
+                jerk["seam_frac"].append(float(near.mean()))
         # The FLOOR: score the command against a SMOOTHED COPY OF ITSELF, i.e. what a perfect
         # tracker measures under this exact instrument. The boxcar is centred, so half its window
         # of post-change motion leaks backwards across every command change -- harmless in the
@@ -763,11 +877,28 @@ def stage_batch(args: argparse.Namespace) -> int:
         # both arms, so the paired DELTA is unaffected, which is why the claim rests on the delta.
         mf = bucket_mse(clip["cmd"], boxcar(clip["cmd"][:-1].copy(), clip["dt"], args.smooth_s),
                         clip["dt"], buckets, settle_s=args.settle_s)
+        mm_ = None
+        if mm_lib is not None:
+            mmc = read_clip(mm_lib, j)                    # clip j of the MM lib IS our pick[j]
+            mw = xyzw_to_wxyz(mmc["y"][:, [mmc["names"].index(f"pelvis_link:ori_{c}")
+                                           for c in "xyzw"]])
+            vm = boxcar(body_velocity(mmc["pos"], mw, mmc["dt"]), mmc["dt"], args.smooth_s)
+            # Score against OUR command, not the MM library's copy of it -- they should be equal
+            # and this is where that is checked, on the frames both actually cover.
+            k = min(len(clip["cmd"]), len(mmc["cmd"]))
+            if not np.allclose(clip["cmd"][:k], mmc["cmd"][:k], atol=1e-5):
+                raise SystemExit(f"MM clip {j} carries a different command than our clip {ci_}; "
+                                 "the arms are not on one profile")
+            mm_ = bucket_mse(clip["cmd"], vm, clip["dt"], buckets, settle_s=args.settle_s)
+            jerk["mm"].append(joint_jerk_rms(mmc["y"][:, [mmc["names"].index(f"joint:{n_}")
+                                                          for n_ in G1_JOINT_NAMES]], mmc["dt"]))
         for bi in range(len(buckets)):
             for w in ("all", "settled"):
                 ours_b[(bi, w)].append(mo[bi][w])
                 base_b[(bi, w)].append(mb_[bi][w])
                 floor_b[(bi, w)].append(mf[bi][w])
+                if mm_ is not None:
+                    mm_b[(bi, w)].append(mm_[bi][w])
         print(f"[mb_base] clip {ci_:5d}  ({j + 1}/{len(pick)})", flush=True)
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -778,8 +909,7 @@ def stage_batch(args: argparse.Namespace) -> int:
                                  f"change excluded, i.e. steady-state accuracy alone")):
         lines += ["", f"### {title}",
                   f"{'bucket (cmd vx)':>18} {'n frames':>9} {'clips':>6} {'artifact':>9} "
-                  f"{'OURS rmse [95% CI]':>26} {'MB alone rmse [95% CI]':>26} "
-                  f"{'delta [95% CI]':>24}"]
+                  f"{'arm':>10} {'rmse [95% CI]':>26} {'delta vs OURS [95% CI]':>24}"]
         for bi, (lo, hi) in enumerate(buckets):
             # Score both arms over the SAME clips. The baseline covers only the frames Motion
             # Bricks produced, so a bucket reached late in a clip can be populated for us and
@@ -800,17 +930,86 @@ def stage_batch(args: argparse.Namespace) -> int:
                     if o[1] > 0 and b[1] > 0]
             pf, _l, _h, _nf, _nc = bootstrap_rmse([floor_b[(bi, w)][k] for k in keep],
                                                   args.n_boot, args.boot_seed)
+            row = {"window": w, "bucket": [lo, hi], "n_clips_paired": nco,
+                   "n_frames_ours": nfo, "n_frames_baseline": nfb,
+                   "n_clips_unpaired_dropped": n_drop, "smoothing_artifact_rmse": pf,
+                   "ours": {"rmse": po, "ci": [lo_o, hi_o]},
+                   "baseline": {"rmse": pb, "ci": [lo_b, hi_b]},
+                   "delta_base_minus_ours": {"point": dp, "ci": [dlo, dhi]}}
             lines.append(f"{f'({lo:+.1f}, {hi:+.1f}]':>18} {nfo:9d} {nco:6d} {pf:9.4f} "
-                         f"{f'{po:.4f} [{lo_o:.4f}, {hi_o:.4f}]':>26} "
-                         f"{f'{pb:.4f} [{lo_b:.4f}, {hi_b:.4f}]':>26} "
+                         f"{'OURS':>10} {f'{po:.4f} [{lo_o:.4f}, {hi_o:.4f}]':>26} "
+                         f"{'--':>24}")
+            lines.append(f"{'':>18} {'':>9} {'':>6} {'':>9} "
+                         f"{'MB alone':>10} {f'{pb:.4f} [{lo_b:.4f}, {hi_b:.4f}]':>26} "
                          f"{f'{dp:+.4f} [{dlo:+.4f}, {dhi:+.4f}]':>24}")
-            results.append({"window": w, "bucket": [lo, hi], "n_clips_paired": nco,
-                            "n_frames_ours": nfo, "n_frames_baseline": nfb,
-                            "n_clips_unpaired_dropped": n_drop,
-                            "smoothing_artifact_rmse": pf,
-                            "ours": {"rmse": po, "ci": [lo_o, hi_o]},
-                            "baseline": {"rmse": pb, "ci": [lo_b, hi_b]},
-                            "delta_base_minus_ours": {"point": dp, "ci": [dlo, dhi]}})
+            if mm_b[(bi, w)]:
+                # Paired against OURS over the clips both cover -- the same discipline as above,
+                # and separately from the MB pairing, because the two arms drop different clips.
+                mpairs = [(o, m) for o, m in zip(ours_b[(bi, w)], mm_b[(bi, w)])
+                          if o[1] > 0 and m[1] > 0]
+                pm, lo_m, hi_m, nfm, ncm = bootstrap_rmse([q[1] for q in mpairs],
+                                                          args.n_boot, args.boot_seed)
+                dm, dmlo, dmhi = bootstrap_delta([q[0] for q in mpairs], [q[1] for q in mpairs],
+                                                 args.n_boot, args.boot_seed)
+                lines.append(f"{'':>18} {'':>9} {ncm:6d} {'':>9} "
+                             f"{'MM':>10} {f'{pm:.4f} [{lo_m:.4f}, {hi_m:.4f}]':>26} "
+                             f"{f'{dm:+.4f} [{dmlo:+.4f}, {dmhi:+.4f}]':>24}")
+                row["mm"] = {"rmse": pm, "ci": [lo_m, hi_m], "n_frames": nfm, "n_clips": ncm}
+                row["delta_mm_minus_ours"] = {"point": dm, "ci": [dmlo, dmhi]}
+            results.append(row)
+    # --- jitter, the metric that is supposed to separate us from a matcher ---
+    def _mean_ci(v: list) -> str:
+        a = np.asarray([x for x in v if np.isfinite(x)], np.float64)
+        if not len(a):
+            return "n/a"
+        r = np.random.default_rng(args.boot_seed)
+        bs = a[r.integers(0, len(a), size=(args.n_boot, len(a)))].mean(axis=1)
+        return f"{a.mean():.0f} [{np.percentile(bs, 2.5):.0f}, {np.percentile(bs, 97.5):.0f}]"
+
+    def _paired_ci(a: list, b: list) -> str:
+        """Bootstrap CI on the per-clip mean of ``b - a``. Paired, because the fleet means hide it.
+
+        Necessary and not decoration: on the shipped 30 clips the unpaired means say MB alone is
+        smoother than ours while a single clip (7312) says the reverse, so the sign is
+        clip-dependent and only a paired interval can say whether the fleet difference is real.
+        """
+        pa = np.asarray([[x, y] for x, y in zip(a, b) if np.isfinite(x) and np.isfinite(y)])
+        if not len(pa):
+            return "n/a"
+        d = pa[:, 1] - pa[:, 0]
+        r = np.random.default_rng(args.boot_seed)
+        bs = d[r.integers(0, len(d), size=(args.n_boot, len(d)))].mean(axis=1)
+        return f"{d.mean():+.0f} [{np.percentile(bs, 2.5):+.0f}, {np.percentile(bs, 97.5):+.0f}]"
+
+    lines += ["", "### JITTER -- joint jerk RMS (rad/s^3), mean over clips [95% CI]",
+              f"{'arm':>22} {'rate':>7}   {'jerk RMS [95% CI]':>26}   {'paired vs OURS':>22}",
+              f"{'OURS':>22} {'50 Hz':>7}   {_mean_ci(jerk['ours']):>26}   {'--':>22}"]
+    if jerk["ours_seam"]:
+        sf = 100.0 * float(np.mean(jerk["seam_frac"]))
+        lines += [f"{f'  seam +-5fr ({sf:.0f}%)':>22} {'50 Hz':>7}   {_mean_ci(jerk['ours_seam']):>26}   "
+                  f"{_paired_ci(jerk['ours_interior'], jerk['ours_seam']):>22}",
+                  f"{'  everywhere else':>22} {'50 Hz':>7}   {_mean_ci(jerk['ours_interior']):>26}   "
+                  f"{'(the baseline above)':>22}"]
+    if jerk["mm"]:
+        lines.append(f"{'MM (motion matching)':>22} {'50 Hz':>7}   {_mean_ci(jerk['mm']):>26}   "
+                     f"{_paired_ci(jerk['ours'], jerk['mm']):>22}")
+    lines += [f"{'MB alone':>22} {'30->50':>7}   {_mean_ci(jerk['baseline']):>26}   "
+              f"{_paired_ci(jerk['ours'], jerk['baseline']):>22}",
+              f"{'  resample control':>22} {'30->50':>7}   {_mean_ci(jerk['artifact']):>26}   "
+              f"{_paired_ci(jerk['ours'], jerk['artifact']):>22}",
+              "",
+              "All three arms are scored on the clips' 50 Hz grid; jerk goes as dt^-3, so a native",
+              "30 Hz MB number would differ by 4.6x on convention alone. OURS and MM are native",
+              "there. The control row is OUR OWN clips routed 50 -> 30 -> 50 by the same",
+              "interpolation the MB arm goes through -- read against the OURS row it says what that",
+              "path alone costs, measured on this run rather than assumed. A positive paired",
+              "delta means that arm is JERKIER than ours.",
+              "",
+              "The two indented rows split OUR clips by distance to a stride-index change, i.e. a",
+              "splice seam. They are a decomposition of the OURS row, not another arm -- the other",
+              "arms have no seams to split on. Read them against the resample control: if our",
+              "interior sits within that control of a rival, the fleet-level difference is seams,",
+              "and seams answer to seam_blend_s."]
     table = "\n".join(lines).lstrip("\n")
     print("\n" + table)
     print(f"\ndelta > 0 means MB alone is WORSE. Clip-clustered bootstrap, "
@@ -828,7 +1027,8 @@ def stage_batch(args: argparse.Namespace) -> int:
     with open(os.path.join(args.out_dir, "results.json"), "w") as f:
         json.dump({"buckets": results, "clips": pick, "failed": failed,
                    "smooth_s": args.smooth_s, "root_mode": args.root_mode,
-                   "n_boot": args.n_boot}, f, indent=1)
+                   "n_boot": args.n_boot, "mm_arm": args.mm_arm,
+                   "jerk_rms": {k: [float(x) for x in v] for k, v in jerk.items() if v}}, f, indent=1)
     with open(os.path.join(args.out_dir, "results.txt"), "w") as f:
         f.write(table + "\n\ndelta > 0 means MB alone is WORSE.\n")
     with open(os.path.join(args.out_dir, "PROVENANCE.md"), "w") as f:
@@ -855,6 +1055,10 @@ def main() -> int:
     p.add_argument("--n-clips", type=int, default=30, help="batch: how many flat clips to sample.")
     p.add_argument("--out-dir", default=None, help="batch: results + provenance go here.")
     p.add_argument("--conda-env", default="motionbricks")
+    p.add_argument("--mm-arm", default=None,
+                   help="batch: a THIRD arm -- a clip library from `generate_mm_clips.py "
+                        "--command-from`, i.e. motion matching driven by these same commands. Its "
+                        "recorded clip indices must match this run's selection, which is checked.")
     p.add_argument("--reuse-runs", action="store_true",
                    help="batch: skip the Motion Bricks run for any clip whose run .npz already "
                         "exists in --out-dir/runs. Re-score without regenerating.")

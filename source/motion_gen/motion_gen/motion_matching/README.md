@@ -56,6 +56,41 @@ python scripts/rsl_rl/mm_experiment.py ...
 `trajectory` cost at `cut_penalty=3` is the tuned configuration (velocity cost has a
 foot-slide failure mode).
 
+## The PAPER ablation: motion matching as a third arm
+
+`mb_baseline.py` scores our clips against stock Motion Bricks. Motion matching joins as a third
+arm of the same comparison, and the only thing that makes the three comparable is that all of
+them are driven by **one command profile**, taken from our own flat clips:
+
+```bash
+# 1. the MM arm, on OUR commands (not its own random schedule)
+python scripts/rsl_rl/generate_mm_clips.py \
+    --source hf/trajectories/retargeted/2026-06-13_15-10-58_merged \
+    --bones-cache clips/bones_cache_locomotion_29j.h5 \
+    --out clips/mm_ablation_v1.h5 --device cpu \
+    --command-from clips/g1_mb_v6f_decor.h5 --command-n-clips 30 --command-seed 1234
+
+# 2. score all three
+python scripts/rsl_rl/mb_baseline.py --stage batch \
+    --clip clips/g1_mb_v6f_decor.h5 --n-clips 30 --seed 1234 \
+    --mm-arm clips/mm_ablation_v1.h5 --out-dir <paper_data>/... \
+    --mb-root /abs/path/to/GR00T-WholeBodyControl/motionbricks
+```
+
+**`--command-n-clips` and `--command-seed` MUST equal the scorer's `--n-clips` and `--seed`.**
+The selection is `rng.choice(flat, size=n)`, so a different `n` draws a different SET, not a
+prefix of the same one -- at `n=3` it picks clips 9929/9936/9963 where `n=30` starts at 7312.
+Getting this wrong would pair clip *i* of one arm against a different motion in the other, with
+both arms running and both reporting. It cannot happen silently: the generator records the
+indices it used and `mb_baseline` refuses a mismatch, naming the rebuild command. A library with
+no `command_source` attr is refused outright as the authored MM family, which draws its own
+speeds and is not comparable to anything.
+
+Both arms are scored on velocity tracking (bucketed by commanded vx, clip-clustered bootstrap,
+paired) and on **joint jerk RMS**, the jitter number. Read the jitter table's notes before
+quoting it: ours and MM are native 50 Hz and directly comparable, the Motion Bricks arm is
+resampled from 30 fps and its cost is measured per run by the control row.
+
 ## What moved out
 
 The geometry, ingest and clip-writing modules this package used to hold are **not**

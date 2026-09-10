@@ -26,6 +26,8 @@ Records library_v2's fingerprint as ``source_library_fingerprint``.  NO IsaacLab
 from __future__ import annotations
 
 import argparse
+import json
+import os
 
 import numpy as np
 import torch
@@ -101,19 +103,48 @@ def _cmd_from_schedule(sched):
     return cmd
 
 
+def _cmd_from_profile(tvel: np.ndarray, dt: float):
+    """A ``t -> (vx, vy, wz)`` steering signal replaying a recorded ``target_vel`` track.
+
+    The DP matcher steers from a callable in TIME, not from an array, so an injected profile is
+    served by lookup rather than by resampling -- the profile is already on this ``dt`` (it comes
+    out of a clip library built at the same rate) and interpolating it would round a
+    piecewise-constant command into ramps that the authoring stage never issued.
+    """
+    n = len(tvel)
+
+    def cmd(t: float) -> tuple:
+        k = min(n - 1, max(0, int(round(t / dt))))
+        return (float(tvel[k, 0]), float(tvel[k, 1]), float(tvel[k, 2]))
+    return cmd
+
+
 def _flat_worker(i: int):
     """Worker: generate flat clip ``i`` via one DP solve over the shared matcher (inherited by fork),
     restricted to the flat/clean categories.  Returns a one-element ``[record]`` (the fork-pool contract)."""
     S = _SHARED
     args, matcher, builder, T, dt = S["args"], S["matcher"], S["builder"], S["T"], S["args"].dt
     rng = np.random.default_rng([S["seed"], i])                # per-clip stream -> order-independent
-    sched = _schedule(rng, args)
-    cmd = _cmd_from_schedule(sched)
+    prof = S.get("profiles")
+    if prof is not None:
+        # ABLATION MODE: this clip replays another library's command track verbatim, so the three
+        # arms (ours / Motion Bricks alone / this) are scored on one profile and differ only in
+        # who generated the motion. The random schedule below is what the MM family was authored
+        # with and is NOT comparable to anything -- it draws its own speeds.
+        tvel_np, T = prof[i], int(prof[i].shape[0])
+        cmd = _cmd_from_profile(tvel_np, dt)
+        sched = [{"label": "injected", "vx": float(tvel_np[0, 0]),
+                  "vy": float(tvel_np[0, 1]), "wz": float(tvel_np[0, 2]),
+                  "duration_s": T * dt}]
+    else:
+        sched = _schedule(rng, args)
+        cmd = _cmd_from_schedule(sched)
     Wp, Wq, Wj = matcher.generate(cmd, T, allowed_categories=APPROACH_FILTERS["flat"])
     y, dy, contact = builder.build(Wp, Wq, Wj, dt)
     tvel = torch.tensor([list(cmd(k * dt)) for k in range(T)], dtype=torch.float32)
     return [{"y_des": y.unsqueeze(0).cpu(), "dy_des": dy.unsqueeze(0).cpu(), "contact": contact.unsqueeze(0).cpu(),
-             "target_vel": tvel.unsqueeze(0), "_sched": sched, "_n_cuts": int(getattr(matcher, "n_cuts", 0))}]
+             "target_vel": tvel.unsqueeze(0), "_sched": sched, "_len": int(T),
+             "_n_cuts": int(getattr(matcher, "n_cuts", 0))}]
 
 
 def main() -> int:
@@ -141,6 +172,16 @@ def main() -> int:
     p.add_argument("--cut-penalty", type=float, default=3.0, help="DP additive cost per cut.")
     p.add_argument("--workers", type=int, default=0,
                    help="Parallel clip-solve workers (0 = all cores - 2); DP solves fan across a fork pool.")
+    p.add_argument("--command-from", default=None,
+                   help="ABLATION: take each clip's (vx, vy, wz) command track verbatim from this clip "
+                        "library instead of drawing a random schedule, so this arm can be scored "
+                        "against mb_baseline's other two on IDENTICAL commands. Selects the same flat "
+                        "clips mb_baseline does, via its own select_flat_clips -- imported, not "
+                        "restated. Sets --n-clips and the clip length from what it finds.")
+    p.add_argument("--command-n-clips", type=int, default=30,
+                   help="--command-from: how many flat clips to take (mb_baseline --n-clips).")
+    p.add_argument("--command-seed", type=int, default=1234,
+                   help="--command-from: the selection seed (mb_baseline --seed, NOT its --boot-seed).")
     p.add_argument("--flat-anchor", default="x,y,yaw",
                    help="Comma-separated FREE root DOFs (of x,y,z,roll,pitch,yaw) for the RL anchor mask.")
     args = p.parse_args()
@@ -158,8 +199,26 @@ def main() -> int:
     T = max(1, int(round(args.clip_length / args.dt)))
     N = int(args.n_clips)
 
+    profiles = None
+    if args.command_from:
+        import sys as _sys, h5py
+        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from mb_baseline import select_flat_clips          # ONE definition of the clip selection
+        pick = select_flat_clips(args.command_from, args.command_n_clips, args.command_seed)
+        with h5py.File(args.command_from, "r") as f:
+            dt_src = float(f.attrs.get("dt", args.dt))
+            if abs(dt_src - args.dt) > 1e-9:
+                raise SystemExit(f"--command-from is at dt={dt_src} and this run is at dt={args.dt}; "
+                                 "the command track is served by index, so the two must agree")
+            profiles = [np.asarray(f["target_vel"][i][:int(f["clip_len"][i])], np.float32)
+                        for i in pick]
+        N, T = len(profiles), max(int(p_.shape[0]) for p_ in profiles)
+        print(f"[mm] ABLATION: replaying {N} command tracks from {args.command_from} "
+              f"(clips {pick[:6]}{' ...' if len(pick) > 6 else ''}), T={T}")
+
     # --- fan the independent clip solves across a fork pool (shared read-only matcher via COW) ---
-    _SHARED.update(matcher=matcher, builder=builder, args=args, T=T, seed=args.seed)
+    _SHARED.update(matcher=matcher, builder=builder, args=args, T=T, seed=args.seed,
+                   profiles=profiles)
     n_workers = default_workers(N, args.workers)
     print(f"[mm] generating {N} varied flat clips via DP across {n_workers} worker(s) (T={T}) ...")
     records = unit_pool(_flat_worker, range(N), n_workers)
@@ -175,6 +234,15 @@ def main() -> int:
     writer = ClipLibraryWriter(args.out, N, meta)
     writer.set_attr("source_library_fingerprint", clean_library_fingerprint(args.clean_source, args.clean_hf_repo))
     writer.set_attr("generator", "motion_matching_dp_v1")
+    if args.command_from:
+        # A library built this way is an ABLATION ARM, not the MM family: its commands came from
+        # somewhere else. Recorded so a stray file cannot be mistaken for the authored family --
+        # they are the same format and the same generator string otherwise.
+        # set_attr json-encodes for us; passing json.dumps(...) here would double-encode and the
+        # reader would get a str back where it expects a dict.
+        writer.set_attr("command_source",
+                        {"library": args.command_from, "n_clips": int(args.command_n_clips),
+                         "seed": int(args.command_seed), "clip_indices": pick})
     n_cuts_total = 0
     for i, b in enumerate(records):
         writer.write_batch(i, {
@@ -182,7 +250,7 @@ def main() -> int:
             "terrain_id": torch.tensor([-1], dtype=torch.int32),
             "terrain_type": "flat",
             "anchor_mask": torch.tensor([anchor], dtype=torch.uint8),
-            "clip_len": torch.tensor([T], dtype=torch.int32),
+            "clip_len": torch.tensor([int(b["_len"])], dtype=torch.int32),
         })
         n_cuts_total += b["_n_cuts"]
         print(f"[mm]   clip {i}: "
