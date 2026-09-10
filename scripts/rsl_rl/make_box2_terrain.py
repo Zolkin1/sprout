@@ -62,7 +62,7 @@ from motion_gen.terrain.freeform import GENERATOR_TAG, validate_manifest  # noqa
 
 # The layout helper and the load-back check are generic over what is in the manifest, so they
 # are taken from the free-form writer rather than restated.  Only the CONFIG block below differs.
-from make_freeform_terrain import library_meta, verify  # noqa: E402
+from terrain_library import library_meta, verify  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:

@@ -46,7 +46,7 @@ from motion_gen.terrain.varied_courses import (  # noqa: E402
     goal_region_spec,
 )
 
-from make_freeform_terrain import library_meta, verify  # noqa: E402
+from terrain_library import library_meta, verify  # noqa: E402
 
 #: Seed offset for the holdout library.  Large and fixed, so a holdout can never coincide with
 #: a training seed someone picked by hand.

@@ -1,6 +1,19 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Write a MANIFEST-ONLY clip library: free-form terrain with no clips in it.
+"""DEPRECATED 2026-09-09 -- writes the randomised free-form section library.
+
+**Nothing has ever been fine-tuned on it.**  Every result on this branch came from the FIXED
+courses instead (`make_box2_terrain.py`, `make_step_courses_terrain.py`,
+`make_varied_terrain.py`, `make_indist_routes.py`), because a fixed course can be overfitted
+to, re-evaluated on and compared against MuJoCo, and a distribution cannot.  No library it
+writes exists on disk.
+
+Kept, unused, because the reasoning below is still true about how to author terrain.  The two
+helpers four LIVE builders used to import from here -- `library_meta` and `verify` -- moved to
+`scripts/rsl_rl/terrain_library.py`, so a deprecated script is no longer a load-bearing
+dependency of every course that replaced it.
+
+Write a MANIFEST-ONLY clip library: free-form terrain with no clips in it.
 
 The clip library is the spine -- it carries both the reference motions and the terrain they were
 generated on -- and everything downstream reaches terrain through it: the RL importer, both

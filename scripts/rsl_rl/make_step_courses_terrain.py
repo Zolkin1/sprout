@@ -1,37 +1,30 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Write the CURB and UP-INTO-DOWN fine-tune terrains as manifest-only clip libraries.
+"""Write the up-into-down course as a manifest-only clip library, train and holdout.
 
-Two fixed courses, siblings of ``make_box2_terrain.py`` and built the same way -- see
-:mod:`motion_gen.terrain.step_courses` for what each one probes and why every constant is what
-it is.
+See :mod:`motion_gen.terrain.step_courses` for what the course probes and why every constant
+is what it is.
 
-**Two files per course, and that is the holdout.**  The training grid and the held-out cell go
-into SEPARATE libraries, so a recording run cannot reach the held-out tile by accident: it is
-not in the file it was pointed at.  A single library with a "do not sample this tile" flag
-would put the guarantee in a runtime filter any later caller could drop, which is the shape of
-leak this repo has already paid for once (the FM's episode split, where 86.5% of held-out clips
+**Two files, and that is the holdout.**  The training grid and the held-out cell go into
+SEPARATE libraries, so a recording run cannot reach the held-out tile by accident: it is not
+in the file it was pointed at.  A single library with a "do not sample this tile" flag would
+put the guarantee in a runtime filter any later caller could drop, which is the shape of leak
+this repo has already paid for once (the FM's episode split, where 86.5% of held-out clips
 also appeared in training).
-
-**The two courses grid over different things**, which is a property of the questions and not an
-inconsistency: the curb's tiles are step HEIGHTS (the axis that makes it out of distribution)
-at a pinned approach, while up-into-down's tiles are approach DISTANCES on fixed geometry, as
-box2's are.
-
-Usage::
-
-    python scripts/rsl_rl/make_step_courses_terrain.py --course curb \\
-        --out_dir clips --like clips/g1_mb_v5_body_mode11_decor.h5
-
-    python scripts/rsl_rl/make_step_courses_terrain.py --course updown --platform_depth 2.0 \\
-        --out_dir clips --like clips/g1_mb_v5_body_mode11_decor.h5
-
-writes ``clips/curb_{train,holdout}.h5`` (4 + 1 tiles) and
-``clips/updown_p020_{train,holdout}.h5`` (5 + 1 tiles).
 
 **Pass ``--like``.**  The FM checkpoint's ``frame_names`` are checked against the ee frames
 resolved from the library's OWN channel names, so the minimal 7-channel layout admits only a
 generator with no extra frames.
+
+The CURB course was removed on 2026-09-09 -- nothing was ever fine-tuned on it, and its
+geometry is in the git history at ``0080cebe``.
+
+Usage::
+
+    python scripts/rsl_rl/make_step_courses_terrain.py --course updown --platform_depth 2.0 \\
+        --out_dir clips --like clips/g1_mb_v5_body_mode11_decor.h5
+
+writes ``clips/updown_p020_{train,holdout}.h5`` (5 + 1 tiles).
 """
 
 from __future__ import annotations
@@ -59,21 +52,20 @@ from motion_gen.terrain import step_courses as sc  # noqa: E402
 
 # The layout helper and the load-back check are generic over what is in the manifest, so they
 # come from the free-form writer rather than being restated.  Only the CONFIG block differs.
-from make_freeform_terrain import library_meta, verify  # noqa: E402
+from terrain_library import library_meta, verify  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
     """Command-line arguments."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--course", required=True, choices=("curb", "updown"),
-                   help="curb = one wide step onto a surface that keeps going (authored here, "
-                        "deliberately out of distribution). updown = mjeval's staircase walked "
-                        "up, across a platform and back down.")
-    p.add_argument("--out_dir", default="clips", help="Directory for the two .h5 files.")
+    p.add_argument("--course", default="updown", choices=("updown",),
+                   help="The only course this writes. Kept as a flag rather than dropped so "
+                        "an existing command line keeps working.")
     p.add_argument("--prefix", default=None,
-                   help="Filename stem: <prefix>_{train,holdout}.h5. Defaults to the course's "
-                        "family name (`curb`, `updown_p020`, ...).")
+                   help="Output stem. Defaults to the course's own family name "
+                        "(`updown_p020`, `updown_p020_r030`, ...).")
+    p.add_argument("--out_dir", default="clips", help="Directory for the two .h5 files.")
     p.add_argument("--like", default=None,
                    help="Copy the channel layout from this library. Motion is never copied.")
     p.add_argument("--platform_depth", type=float, default=None,
@@ -102,8 +94,8 @@ def parse_args() -> argparse.Namespace:
                         "to misread as a box -- so dropping them changes what the cameras see "
                         "and a run without them is not comparable to one with them.")
     p.add_argument("--train_heights", type=float, nargs="+", default=None,
-                   help="curb only: override the training step heights (m). Defaults to the "
-                        f"full grid {list(sc.CURB_TRAIN_HEIGHTS_M)}.")
+                   help="REMOVED with the curb course on 2026-09-09; refused if "
+                        "passed, rather than silently ignored.")
     p.add_argument("--train_approaches", type=float, nargs="+", default=None,
                    help="updown only: override the training approach distances (m). Defaults "
                         f"to {list(sc.UPDOWN_TRAIN_APPROACHES_M)}. The point of overriding is a "
@@ -132,45 +124,10 @@ def _resolve(args: argparse.Namespace) -> dict:
     Raises:
         SystemExit: On a flag that does not belong to the chosen course.
     """
-    wrong = []
-    if args.course == "curb":
-        for name in ("platform_depth", "train_approaches"):
-            if getattr(args, name) is not None:
-                wrong.append(f"--{name}")
-        if args.runout != sc.UPDOWN_RUNOUT_M:
-            wrong.append("--runout")
-        if args.no_walls:
-            wrong.append("--no_walls")
-    else:
-        if args.train_heights is not None:
-            wrong.append("--train_heights")
-    if wrong:
-        raise SystemExit(f"REFUSING: {', '.join(wrong)} does not apply to --course "
-                         f"{args.course}; a flag that is silently dropped writes a library "
-                         "whose provenance block does not describe it.")
-
-    if args.course == "curb":
-        heights = (tuple(float(h) for h in args.train_heights) if args.train_heights
-                   else sc.CURB_TRAIN_HEIGHTS_M)
-        family = sc.CURB_FAMILY
-        return {
-            "prefix": args.prefix or family,
-            "family": family,
-            "config": {"course": "curb", "family": family,
-                       "approach_m": sc.APPROACH_M,
-                       "top_depth_m": sc.CURB_TOP_DEPTH_M,
-                       "corridor_width_m": 2.0 * sc.CURB_HALF_WIDTH_M
-                                           + 2.0 * sc.SECTION_MARGIN_M,
-                       "mjeval_course": ""},
-            "roles": (
-                ("train", sc.generate_curb_manifest(heights), heights,
-                 sc.CURB_TRAIN_SPEEDS_MPS),
-                ("holdout", sc.generate_curb_manifest((sc.CURB_HOLDOUT_HEIGHT_M,)),
-                 (sc.CURB_HOLDOUT_HEIGHT_M,), (sc.CURB_HOLDOUT_SPEED_MPS,)),
-            ),
-            "speed_range": sc.CURB_SPEED_RANGE_MPS,
-        "grid_name": "step_heights_m",
-        }
+    if args.train_heights is not None:
+        raise SystemExit("REFUSING: --train_heights belonged to the CURB course, which was "
+                         "removed on 2026-09-09; a flag that is silently dropped writes a "
+                         "library whose provenance block does not describe it.")
 
     depth = args.platform_depth
     if depth is None:

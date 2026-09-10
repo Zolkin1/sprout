@@ -1,6 +1,34 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""Free-form terrain sections for the FM-driven fine-tune -- geometry with no clip behind it.
+"""Free-form terrain: the shared foundation every fixed course is built on, plus three
+DEPRECATED randomised section families.
+
+**Read this first.  The module is two things and only one of them is live.**
+
+LIVE -- and imported by every current course (:mod:`box2`, :mod:`step_courses`,
+:mod:`varied_courses`) and by the RL reset, the goal termination and four builder scripts:
+:func:`spawn_area`, :func:`_route` and :data:`ROUTE_FIELDS` / :data:`SPAWN_AREA_FIELDS`,
+:data:`GENERATOR_TAG`, :data:`FREEFORM_SPAWN_JITTER_M`, :data:`COMMANDED_SPEED_RANGE_MPS`,
+the goal geometry constants, :func:`walkable_ground_span` and :func:`validate_manifest`.
+None of that is deprecated; it is the contract a manifest-only library satisfies.
+
+DEPRECATED 2026-09-09 -- the randomised SECTION families (``flat`` / ``boxes`` / ``stairs``:
+:data:`FAMILIES`, :class:`FreeformConfig`, :func:`make_flat_tile`, :func:`make_boxes_tile`,
+:func:`make_stairs_tile`, :func:`generate_freeform_manifest`) and their builder
+``scripts/rsl_rl/make_freeform_terrain.py``.  **Nothing has ever been fine-tuned on them.**
+Every result on this branch came from the FIXED courses instead, because a fixed course can be
+overfitted to, re-evaluated on and compared against MuJoCo, and a distribution cannot.  They
+are kept, unused, for the reasoning below -- the anchor-free authoring, the angle-by-approach
+rule and the apron trap are all still true statements about how to build terrain -- and
+because :mod:`step_courses` takes its flight shape from the ``stairs`` family.  They declare
+no spawn areas, so they are also the only families the eval's ground-only spawn rule cannot
+be applied to.
+
+Do not add a new course here.  Add it as a fixed course beside :mod:`box2`.
+
+--------------------------------------------------------------------------------------------
+
+Free-form terrain sections for the FM-driven fine-tune -- geometry with no clip behind it.
 
 Every terrain the repo has shipped so far exists to MATCH a pre-made motion clip tile by tile:
 the clip is baked in the tile's corner frame and the ground is authored under the recorded feet.

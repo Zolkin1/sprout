@@ -62,7 +62,7 @@ from motion_gen.terrain.freeform import (  # noqa: E402
     spawn_area,
 )
 
-from make_freeform_terrain import library_meta  # noqa: E402
+from terrain_library import library_meta  # noqa: E402
 
 #: The families in scope, and whether their goal sits ABOVE the spawn -- which decides
 #: whether the run needs `terminations.goal_reached.params.height_tol_m` set.

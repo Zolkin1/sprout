@@ -25,7 +25,7 @@ _REPO = pathlib.Path(__file__).resolve().parents[3]
 EVAL = _REPO / "scripts" / "rsl_rl" / "run_quick_eval.sh"
 
 #: Every terrain the eval must offer.
-TERRAINS = ("box2", "updown", "curb", "varied", "indist")
+TERRAINS = ("box2", "updown", "varied", "indist")
 
 
 @pytest.fixture(scope="module")
@@ -34,6 +34,15 @@ def text() -> str:
     if not EVAL.is_file():
         pytest.skip(f"{EVAL} not present")
     return EVAL.read_text()
+
+
+def test_the_curb_bundle_is_gone() -> None:
+    """The curb course was removed on 2026-09-09; nothing was ever fine-tuned on it.
+
+    A bundle for a course whose geometry no longer exists would fail at the library check
+    rather than at the flag, which reads as a missing file rather than a retired course.
+    """
+    assert "  curb)" not in EVAL.read_text()
 
 
 def test_the_old_box2_only_script_is_gone(text: str) -> None:

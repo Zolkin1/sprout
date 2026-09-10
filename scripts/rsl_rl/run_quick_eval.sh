@@ -76,12 +76,6 @@ case "$TERRAIN" in
     DEF_TOL=0.5
     DEF_ROOT=logs/updown/quick
     DEF_BUILD="python scripts/rsl_rl/make_step_courses_terrain.py --course updown --platform_depth 2.0 --runout 3.0 --out_dir clips --like clips/g1_mb_v5_body_mode11_decor.h5";;
-  curb)
-    DEF_CLIP=clips/curb_train.h5
-    DEF_GR=logs/curb/goal_regions.json
-    DEF_TOL=0.5
-    DEF_ROOT=logs/curb/quick
-    DEF_BUILD="python scripts/rsl_rl/make_step_courses_terrain.py --course curb --out_dir clips --like clips/g1_mb_v5_body_mode11_decor.h5";;
   varied)
     DEF_CLIP=clips/varied60_holdout.h5
     DEF_GR=logs/varied/goal_regions.json
@@ -99,7 +93,7 @@ case "$TERRAIN" in
     DEF_ROOT=logs/indist/quick
     DEF_BUILD="python scripts/rsl_rl/make_indist_routes.py --source clips/g1_mb_v5_body_mode11_decor.h5 --out_dir clips --prefix indist";;
   *)
-    echo "REFUSING: TERRAIN must be box2, updown, curb, varied or indist; got '$TERRAIN'." >&2
+    echo "REFUSING: TERRAIN must be box2, updown, varied or indist; got '$TERRAIN'." >&2
     exit 2;;
 esac
 

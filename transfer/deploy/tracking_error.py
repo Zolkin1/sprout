@@ -113,7 +113,11 @@ class TrackingErrorSpec:
     marks them, and consumers that publish a number refuse a bootstrap spec rather than
     reporting one -- the same rule ``eval/report.py`` already applies to a bootstrap goal
     region, and for the same reason: a threshold nobody measured produces a confident wrong
-    number instead of an error.  ``scripts/rsl_rl/fit_tracking_thresholds.py`` writes a real one.
+    number instead of an error.  **There is no script that writes a real one yet** -- `fit_tracking_thresholds.py`
+    is named in `TODO(fit-tracking-thresholds)` and has never existed. What DOES
+    exist is `transfer/sim/measure_tracking_error.py` (the distributions, in MuJoCo)
+    and `transfer/sim/watch_tracking.py` (what a given excursion LOOKED like), which
+    are the two halves its docstring says to read together before choosing a bound.
 
     **There is deliberately no downrange bound and no yaw bound.**  Not an omission and not a
     value of ``inf`` -- the fields do not exist, so nothing can quietly start reading one.  See

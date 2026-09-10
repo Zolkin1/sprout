@@ -44,7 +44,6 @@ BUILDERS: dict[str, str] = {
 #: by restating a number.
 BANDS: dict[str, tuple[float, float]] = {
     "box2": box2.COMMANDED_SPEED_RANGE_MPS,
-    "curb": step_courses.CURB_SPEED_RANGE_MPS,
     "updown": step_courses.UPDOWN_SPEED_RANGE_MPS,
     "varied": varied_courses.COMMANDED_SPEED_RANGE_MPS,
 }
@@ -92,16 +91,6 @@ def test_the_freeform_band_is_the_command_terms_own_default() -> None:
         f"command term's ({lo.group(1)}, {hi.group(1)})")
 
 
-def test_the_curb_and_box2_share_a_band_so_a_cell_is_the_same_COMMAND() -> None:
-    """The curb asks "how low before it stops being a box", against box2.
-
-    A different command band would confound that with a speed difference. The constants are
-    deliberately restated rather than imported (so an edit to one cannot move the other
-    library's provenance), which is exactly why they need pinning equal.
-    """
-    assert step_courses.CURB_SPEED_RANGE_MPS == box2.COMMANDED_SPEED_RANGE_MPS
-
-
 @pytest.mark.parametrize("script,block", sorted(BUILDERS.items()))
 def test_every_builder_stamps_the_band_key_and_not_only_a_ladder(script: str,
                                                                  block: str) -> None:
@@ -143,8 +132,8 @@ def test_the_updown_HOLDOUT_stamps_the_band_too() -> None:
 
 #: The libraries the fine-tune actually runs on.  Skipped where absent, since `clips/` is not
 #: in the repo -- so this is a local/talos check rather than a CI one.
-_LIBS = ("box2_v2spawn_train.h5", "box2_v2spawn_holdout.h5", "curb_train.h5",
-         "curb_holdout.h5", "updown_p020_r030_train.h5", "updown_p020_r030_holdout.h5",
+_LIBS = ("box2_v2spawn_train.h5", "box2_v2spawn_holdout.h5",
+         "updown_p020_r030_train.h5", "updown_p020_r030_holdout.h5",
          "varied60_train.h5", "varied60_holdout.h5", "indist_train.h5")
 
 
@@ -160,3 +149,33 @@ def test_the_library_on_disk_reads_back_a_band(lib: str) -> None:
         "own fallback. Rebuild it with its builder.")
     lo, hi = rng
     assert 0.0 < lo < hi
+
+
+#: The goal-geometry constants each fixed course RESTATES rather than imports, and the module
+#: each copy lives in.
+GOAL_CONSTANTS: tuple[str, ...] = ("TARGET_LEAD_M", "GOAL_DEPTH_M")
+
+
+@pytest.mark.parametrize("name", GOAL_CONSTANTS)
+def test_every_course_restates_the_same_goal_geometry(name: str) -> None:
+    """Three copies, deliberately -- so they need a test rather than a hoist.
+
+    Restating rather than importing is this package's own convention for a number that is
+    mirrored from mjeval: ``step_courses`` says it explicitly of its speed ladder ("restated
+    rather than imported so that an edit there cannot move this library's terrain
+    fingerprint"), and the same argument holds here -- a course's provenance block should not
+    move because a sibling course was edited.
+
+    The cost of that convention is drift, and it was real: ``box2`` and ``step_courses`` are
+    pinned to their mjeval twins by the parity tests in ``transfer/sim/tests``, but
+    ``varied_courses`` mirrors nothing and its copies were unpinned, so a change to either of
+    the others would have left the varied library authoring a goal at a different lead with
+    nothing to notice. This is the missing third pin.
+    """
+    vals = {m.__name__.rsplit(".", 1)[-1]: getattr(m, name)
+            for m in (box2, step_courses, varied_courses)}
+    assert len(set(vals.values())) == 1, (
+        f"{name} differs across the courses: {vals}. Every one of them maps mjeval's goal "
+        "RECTANGLE onto the line-plus-band the RL termination tests, so a course whose lead "
+        "or depth differs scores arrival at a different place while reporting the same "
+        "column.")

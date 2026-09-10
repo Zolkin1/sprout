@@ -14,10 +14,10 @@ place their origins differently: mjeval's course has the spawn at ``x = 0`` and 
 at ``X_START``, while a free-form tile is corner-anchored and insets its spawn by
 ``SECTION_MARGIN_M + SPAWN_INSET_M``.  Comparing absolute x would only be comparing that inset.
 
-**The CURB has no mjeval twin and is not tested here**; it is authored in ``step_courses`` and
-nothing off-sim has to agree with it.  What this file does check about it is the one thing that
-crosses the boundary: its step heights against the trained box grid, which is the claim that
-makes the course out of distribution at all.
+**The CURB course was removed on 2026-09-09** -- it had no mjeval twin, nothing was ever
+fine-tuned on it, and its geometry is in the git history at ``0080cebe``.  What this file now
+covers is the up-into-down course alone, which does have a twin and therefore does have
+something to agree with.
 
 This test lives under ``transfer/sim`` rather than ``source/motion_gen`` because it is the half
 that may import mjeval; it needs ``source/motion_gen`` on the path, which the repo's pytest
@@ -322,84 +322,13 @@ def test_a_lengthened_runout_takes_its_own_family_and_disclaims_mjeval():
     assert mj_terrains.DESCENT_RUNOUT == pytest.approx(3.0)
 
 
-# --- the curb -------------------------------------------------------------------------
-def test_the_curb_is_out_of_distribution_in_the_way_it_claims_to_be():
-    """The step heights against the trained box grid, and the top against the trained depth.
-
-    These are the claims the whole course rests on, and both live on the ``transfer`` side --
-    ``TRAINED_BOX_DEPTH`` is only in ``generate_stairs_scene`` -- so this is where they can be
-    checked rather than asserted in a docstring.
-    """
-    trained = freeform.TRAINED_BOX_HEIGHTS
-    below = [h for h in sc.CURB_TRAIN_HEIGHTS_M if h < min(trained)]
-    assert len(below) == 3, (
-        f"the point of the height axis is rungs BELOW every trained box ({min(trained)} m); "
-        f"got {below} of {list(sc.CURB_TRAIN_HEIGHTS_M)}")
-    # ...and exactly one rung AT the bottom of the grid, as the anchor.
-    assert max(sc.CURB_TRAIN_HEIGHTS_M) == pytest.approx(min(trained))
-    # 0.15 m is a trained stair RISER, which is what makes the context the variable rather
-    # than the height. If the riser set moves, this course's middle rung should move with it.
-    assert 0.15 in freeform.TRAINED_RISERS
-    assert 0.15 in sc.CURB_TRAIN_HEIGHTS_M
-    # The top is a SURFACE, not a box top: far past the trained box depth, and past box2's
-    # own deliberately-OOD depth too.
-    assert sc.CURB_TOP_DEPTH_M > 5.0 * gss.TRAINED_BOX_DEPTH
-    assert sc.CURB_TOP_DEPTH_M > 3.0 * mj_terrains.EVAL_BOX_DEPTH
-
-
-def test_the_curb_spans_the_corridor_so_it_cannot_be_walked_around():
-    """The step is as wide as the tile; a curb runs across your path.
-
-    box2's boxes deliberately do NOT -- a 2.59 m box in a 6 m corridor leaves 1.7 m of floor
-    either side -- so this is the one lateral difference between the two courses and it is the
-    difference between an obstacle and an object.
-    """
-    for h in sc.CURB_TRAIN_HEIGHTS_M:
-        tile = sc.make_curb_tile(0, h)
-        step = [o for o in tile["overlays"]
-                if o["size_xyz"][2] == pytest.approx(h) and o["base_z"] == pytest.approx(0.0)]
-        assert len(step) == 1, h
-        assert step[0]["size_xyz"][1] == pytest.approx(tile["size_y"]), h
-        assert step[0]["size_xyz"][0] == pytest.approx(sc.CURB_TOP_DEPTH_M), h
-        # The goal sits ON the step, so the robot never comes back down.
-        assert tile["route"]["goal_z"] == pytest.approx(h), h
-        assert tile["route"]["goal_x"] < step[0]["pos_xy"][0] + step[0]["size_xyz"][0] / 2.0
-
-
-def test_the_curb_shares_box2s_lateral_geometry_and_approach():
-    """Same corridor width, same run-up, same goal band -- so box2 is its comparator.
-
-    ``box2`` is imported here only to compare; ``step_courses`` deliberately does not import it,
-    so that an edit to box2's grid cannot move this library's terrain fingerprint.  That makes
-    this the check that the two are still the SAME corridor.
-    """
-    box2 = pytest.importorskip("motion_gen.terrain.box2")
-    assert sc.CURB_HALF_WIDTH_M == pytest.approx(box2.GOAL_HALF_WIDTH_M)
-    assert sc.CURB_TRAIN_SPEEDS_MPS == pytest.approx(box2.TRAIN_SPEEDS_MPS)
-    assert sc.CURB_HOLDOUT_SPEED_MPS == pytest.approx(box2.HOLDOUT_SPEED_MPS)
-    curb = sc.make_curb_tile(0, 0.20)
-    b2 = box2.make_box2_tile(0, sc.APPROACH_M)
-    assert curb["size_y"] == pytest.approx(b2["size_y"])
-    assert curb["route"]["start_x"] == pytest.approx(b2["route"]["start_x"])
-    assert curb["route"]["start_y"] == pytest.approx(b2["route"]["start_y"])
-    assert curb["route"]["goal_half_width"] == pytest.approx(b2["route"]["goal_half_width"])
-    # The first obstacle face is at the same distance out on both courses.
-    assert curb["curb"]["riser_x"][0] == pytest.approx(box2.box_faces(sc.APPROACH_M)[0][0])
-    # And up-into-down starts its staircase at the same place, so all three are comparable
-    # at the shared 2.5 m approach.
-    assert sc.updown_feature_x(sc.APPROACH_M, 2.0)["first_riser"] == pytest.approx(
-        curb["curb"]["riser_x"][0])
-    # The approach GRID is box2's too, restated rather than imported -- equal on purpose.
-    assert sc.UPDOWN_TRAIN_APPROACHES_M == pytest.approx(box2.TRAIN_SPAWN_DISTANCES_M)
-    assert sc.UPDOWN_HOLDOUT_APPROACH_M == pytest.approx(box2.HOLDOUT_SPAWN_DISTANCE_M)
-
-
 # --- the holdouts ---------------------------------------------------------------------
-def test_both_holdouts_are_interior_and_off_grid():
-    """A held-out cell must test interpolation, not extrapolation past the training range."""
-    for grid, held in ((sc.CURB_TRAIN_HEIGHTS_M, sc.CURB_HOLDOUT_HEIGHT_M),
-                       (sc.CURB_TRAIN_SPEEDS_MPS, sc.CURB_HOLDOUT_SPEED_MPS),
-                       (sc.UPDOWN_TRAIN_APPROACHES_M, sc.UPDOWN_HOLDOUT_APPROACH_M)):
+def test_the_holdout_is_interior_and_off_grid():
+    """A held-out cell must test interpolation, not extrapolation past the training range.
+
+    Two of the three pairs this covered were the curb's, removed on 2026-09-09.
+    """
+    for grid, held in ((sc.UPDOWN_TRAIN_APPROACHES_M, sc.UPDOWN_HOLDOUT_APPROACH_M),):
         assert held not in grid, (grid, held)
         assert min(grid) < held < max(grid), (grid, held)
     # The updown SPEED is deliberately NOT held out: its band is continuous, so the holdout

@@ -42,10 +42,15 @@ re-declared without moving the geometry.
 | two-box holdout | `box2_v2spawn_holdout.h5` | 1 | `d0154f365c49` | 0.5-2.2 | 2.25 m |
 | up-into-down | `updown_p020_r030_train.h5` | 5 | `113b552f9e19` | 0.6-2.5 | approach |
 | up-into-down holdout | `updown_p020_r030_holdout.h5` | 1 | `edde0931a5d7` | 0.6-2.5 | 2.25 m |
-| curb | `curb_train.h5` | 4 | `e509cc2b6ac1` | 0.5-2.2 | step height |
 | varied multi-terrain | `varied60_train.h5` | 60 | `1149eae02028` | 0.6-2.5 | none (geometry) |
 | varied holdout | `varied60_holdout.h5` | 60 | `b21be22109d1` | 0.6-2.5 | none (geometry) |
 | in-distribution control | `indist_train.h5` | 75 | `8ffdcba61db7` | 0.5-2.2 | none (real tiles) |
+
+Two things were retired on 2026-09-09 and are in the git history rather than here: the **curb**
+course (a single wide step, no mjeval twin) and the **randomised free-form section families**
+(`flat` / `boxes` / `stairs`). Nothing was ever fine-tuned on either. `motion_gen.terrain.freeform`
+still holds the shared foundation every course above is built on -- spawn areas, the route block,
+the goal geometry -- and only its section FAMILIES are deprecated.
 
 Rebuild any of them from the command `run_quick_eval.sh` prints when the file is missing, and
 `scripts/rsl_rl/terrain_axis.py --clip <lib> --values` reads the axis back off the library so

@@ -38,7 +38,6 @@ def _routes() -> dict[str, dict]:
     return {
         "box2": box2.make_box2_tile(0, 2.5, family=box2.BOX2_V2_FAMILY)["route"],
         "updown": step_courses.make_updown_tile(0, 2.5, 1.5)["route"],
-        "curb": step_courses.make_curb_tile(0, 0.15)["route"],
         "varied_boxes": varied_courses.make_boxes_tile(0, cfg)["route"],
         "varied_updown": varied_courses.make_updown_tile(0, cfg)["route"],
     }
