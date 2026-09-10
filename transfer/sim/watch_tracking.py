@@ -351,21 +351,89 @@ def episode_peaks(probe) -> dict[str, float]:
             "tilt": float(np.degrees(err[:, 3].max()))}
 
 
-def _describe(idx: int, seed: int, verdict: str, failure: str, probe, dt: float) -> str:
-    """One line summarising an episode, for the index and the prompt."""
+#: One column of the episode table: ``(header, width, how to get it from a row dict)``.
+#:
+#: ONE spec drives both the header and the rows, so they cannot drift out of alignment -- the
+#: previous version carried its labels inline (``steps 484 r 0.787``), which is readable
+#: without a header and impossible to put one on.
+#:
+#: **The two failure rules are separate columns, and telling them apart is the point of the
+#: table.**  ``outcome``/``cause`` are the LOOSE rule -- the fall -- which is what mjeval
+#: actually ends an episode on and the only rule any replay in this tree has ever applied.
+#: ``latch@``/``tripped`` are the STRICT rule: computed, never fatal, and exactly what
+#: ``fit_value.py`` would have cut the episode at and what the ``arrived`` filter would have
+#: called a failure.  A row reading ``success`` WITH a latch is not an inconsistency; it is the
+#: case latching exists for, and it is tagged.
+_COLUMNS: tuple[tuple[str, int, str], ...] = (
+    ("#", 4, "idx"),
+    ("seed", 5, "seed"),
+    ("outcome", 8, "verdict"),
+    ("cause", 7, "failure"),
+    ("steps", 6, "steps"),
+    ("rew", 7, "rew"),
+    ("down", 7, "down"),
+    ("lat", 7, "lat"),
+    ("hgt", 7, "hgt"),
+    ("tilt", 7, "tilt"),
+    ("latch@", 8, "latch"),
+    ("tripped", 20, "tripped"),
+)
+
+
+def table_header() -> str:
+    """The two-row header, derived from :data:`_COLUMNS` so it matches the rows exactly.
+
+    Returns:
+        Three lines: the group banner, the column names, and a rule.
+    """
+    names = "".join(f"{h:<{w}}" for h, w, _ in _COLUMNS)
+    # Where the two rule groups sit, so "which of these is the fall and which is the tracking
+    # latch" is answered in the header rather than in a docstring nobody has open.
+    lead = sum(w for _, w, _ in _COLUMNS[:2])
+    loose = sum(w for _, w, _ in _COLUMNS[2:4])
+    mid = sum(w for _, w, _ in _COLUMNS[4:6])
+    peaks = sum(w for _, w, _ in _COLUMNS[6:10])
+    banner = (" " * lead + f"{'|--- FALL rule ---|':<{loose}}" + " " * mid
+              + f"{'|--- peak |err| vs the served node (m / deg) ---|':<{peaks}}"
+              + "|--- STRICT tracking rule (never fatal) ---|")
+    return f"\n  {banner}\n  {names}\n  " + "-" * len(names)
+
+
+def _row(idx: int, seed: int, verdict: str, failure: str, probe, dt: float) -> str:
+    """One aligned row of the episode table.
+
+    Args:
+        idx: Row number, which is what ``<number>`` jumps to at the prompt.
+        seed: The FM noise seed -- the only thing that differs between rows.
+        verdict: The loose (fall-rule) outcome.
+        failure: Which fall datum ended it; blank when it did not fall.
+        probe: The episode's tracking probe.
+        dt: Control period, for turning step indices into seconds.
+
+    Returns:
+        The row, plus a tag when the two rules disagree.
+    """
     latch = probe.first_violation_step
-    latch_s = "none" if latch < 0 else f"{latch * dt:.2f}s"
-    checks = ",".join(k for k, v in probe.first_check_step.items() if v >= 0) or "-"
     pk = episode_peaks(probe)
-    tag = ""
+    vals = {
+        "idx": f"[{idx}]", "seed": str(seed), "verdict": verdict, "failure": failure or "-",
+        "steps": str(probe.n_folded), "rew": f"{probe.mean_step_reward:.3f}",
+        "down": f"{pk['down']:.3f}", "lat": f"{pk['lat']:.3f}", "hgt": f"{pk['hgt']:.3f}",
+        "tilt": f"{pk['tilt']:.1f}d",
+        "latch": "none" if latch < 0 else f"{latch * dt:.2f}s",
+        "tripped": ",".join(k for k, v in probe.first_check_step.items() if v >= 0) or "-",
+    }
+    row = "  " + "".join(f"{vals[key]:<{w}}" for _, w, key in _COLUMNS)
     if latch >= 0 and verdict == "success":
         # The case that motivated latching rather than terminating: it went wrong, recovered,
-        # and arrived. Called out by name so it is not read as an inconsistency.
-        tag = "  <- VIOLATED THEN RECOVERED"
-    return (f"[{idx:>3}] seed {seed:>3} {verdict:<8}{failure:<6}"
-            f"steps {probe.n_folded:>4} r {probe.mean_step_reward:.3f}  "
-            f"peak down {pk['down']:.3f} lat {pk['lat']:.3f} hgt {pk['hgt']:.3f} "
-            f"tilt {pk['tilt']:5.1f}d  latch {latch_s:<7}{checks:<9}{tag}")
+        # and arrived. Named, so it is not read as the table contradicting itself.
+        row += " <- STRICT would have cut it here; the FALL rule let it arrive"
+    return row
+
+
+def _describe(idx: int, seed: int, verdict: str, failure: str, probe, dt: float) -> str:
+    """Backwards-compatible alias for :func:`_row`."""
+    return _row(idx, seed, verdict, failure, probe, dt)
 
 
 def main() -> int:
@@ -393,6 +461,21 @@ def main() -> int:
                         "mjeval.goal_anchor excludes it) -- pass --klass box to watch it "
                         "anyway, and read the traversal semantics as borrowed rather than "
                         "validated for that family.")
+    #: The two knobs `isaac_tile_course` needs for a course whose obstacle is not a TREAD.
+    #: Without them this script could only watch the clip library's own step courses -- and
+    #: the terrain the strict bounds are actually being applied to is the two-box one, whose
+    #: 1.20 m boxes are deeper than the tread filter. Watching the bound on a different
+    #: terrain than the one it is cutting is not the same experiment.
+    p.add_argument("--obstacle_from", default="tread", choices=("tread", "raised", "drop"),
+                   help="Which manifest feature IS the obstacle. 'tread' is a step course; "
+                        "pass 'raised' for a box course (box2's 1.20 m boxes are deeper than "
+                        "the tread filter, so the default REFUSES them by design) and 'drop' "
+                        "for a descent.")
+    p.add_argument("--spawn_from", default="approach",
+                   choices=("approach", "route", "top", "ground"),
+                   help="Where the robot starts. 'route' uses the tile's own authored route "
+                        "start, which is what the Isaac fine-tune spawns from -- so it is the "
+                        "right choice when the question is what a RECORDED episode did.")
     p.add_argument("--max_offset", type=int, default=50)
     p.add_argument("--providers", default="CUDAExecutionProvider,CPUExecutionProvider")
     p.add_argument("--scene_tag", default="_watchtrk",
@@ -406,6 +489,12 @@ def main() -> int:
                         "terrains.CMD_HOLD_S; 0 reproduces anything measured before 58d0951c "
                         "and is a spawn transient, not a policy failure.")
     p.add_argument("--rt", type=float, default=0.5, help="Viewer real-time multiple.")
+    p.add_argument("--no_pause_at_latch", action="store_true",
+                   help="Play straight through. By DEFAULT the replay freezes on the first "
+                        "strict violation and holds until a key is pressed, because the "
+                        "question that brings anyone here -- was this a stumble or an "
+                        "ordinary descent -- is asked about the pose at that instant, and at "
+                        "0.5x real time a threshold crossing is two frames.")
     p.add_argument("--loop", action="store_true", help="Loop the replay instead of holding.")
     p.add_argument("--no_view", action="store_true",
                    help="Never open the viewer. With --plot this is the batch path.")
@@ -440,6 +529,8 @@ def main() -> int:
 
     course = _terrains.isaac_tile_course(args.clip_lib, args.tile, speeds=(args.speed,),
                                          klass=(args.klass or None),
+                                         obstacle_from=args.obstacle_from,
+                                         spawn_from=args.spawn_from,
                                          goal_anchor_max_offset=args.max_offset)
     course = dataclasses.replace(course, name=f"tile{args.tile}{args.scene_tag}")
     cfg, policy, fm_lag, spawn, rig = build_arm(
@@ -455,6 +546,7 @@ def main() -> int:
           f"{len(seeds)} episode(s), cmd_hold {args.cmd_hold_s:g} s", flush=True)
 
     episodes = []
+    print(table_header(), flush=True)
     for seed in seeds:
         frames, plans, verdict, failure, probe = roll_capture(
             rig, policy, fm_lag, spawn, cmd, cfg, seed, mjrunner, spec, args.cmd_hold_s)
@@ -501,6 +593,7 @@ def main() -> int:
             return float("inf") if np.isnan(v) else -v
         keep.sort(key=_key)
         print(f"\n[watch] sorted by {args.sort}, worst first:")
+        print(table_header(), flush=True)
         for pos, i in enumerate(keep):
             e = episodes[i]
             print(f"  {pos:>3}. " + _describe(i, e["seed"], e["verdict"], e["failure"],
@@ -537,7 +630,16 @@ def main() -> int:
         print("\n" + _describe(i, e["seed"], e["verdict"], e["failure"], e["probe"], dt))
         summary = {"course": course, "speed": args.speed, "verdict": e["verdict"],
                    "failure": e["failure"], "row": {}, "model": rig.robot.mj_model}
-        view_cell.replay(summary, e["frames"], e["plans"], args.rt, args.loop)
+        # The LATCH step, so the freeze lands on the crossing itself. `first_violation_step`
+        # is an absolute control-step index -- the same numbering `plot_episode` puts its red
+        # line at -- and `frames` is one entry per control step from 0, so it indexes directly.
+        latch = int(e["probe"].first_violation_step)
+        view_cell.replay(summary, e["frames"], e["plans"], args.rt, args.loop,
+                         pause_at=(None if args.no_pause_at_latch or latch < 0 else latch),
+                         pause_label=(f"STRICT latch: "
+                                      + (",".join(k for k, v in e["probe"].first_check_step.items()
+                                                  if v >= 0) or "?")
+                                      + " (the fall rule did NOT end it here)"))
         # AFTER the replay: the MuJoCo viewer owns the GL context and blocks until closed, so a
         # figure opened first would sit behind it unseen.
         if not args.no_plot:

@@ -615,7 +615,8 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 steer_wz_max: float = STEER_WZ_MAX,
                 cfg_hold: float = terrains.CMD_HOLD_S,
                 probe=None, tracking_spec=None,
-                stop_on_violation: bool = True, episode_seed=None) -> tuple[str, str, Any]:
+                stop_on_violation: bool = True, stop_on_goal: bool = True,
+                episode_seed=None) -> tuple[str, str, Any]:
     """One deterministic trial: spawn, drive at ``cmd``, and stop on a fall, the target or time.
 
     **Three orderings inside the loop are load-bearing.**  The fall test runs BEFORE the target
@@ -643,6 +644,12 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             what makes the replay THE episode rather than a similar one.
         tracking_spec: A ``deploy.tracking_error.TrackingErrorSpec`` turning on the STRICT
             checks, or ``None`` to leave them off.
+        stop_on_goal: Whether ARRIVAL ends the episode.  Default True, which is what
+            scoring wants.  False runs to the fall or the time budget instead, which is
+            what a RECORDING for human inspection wants: ``in_goal`` is a
+            +/- ``GOAL_DEPTH / 2`` BAND, so on the up-into-down course its near edge falls
+            at the descent LIP -- an arriving episode was cut off at the TOP of the
+            descent and the second half of the course never reached the footage.
         stop_on_violation: End the episode at the first strict violation. **Defaults True**:
             a violation is a failure under the strict rule, so everything downstream of a
             recording terminates on it. The verdict comes from ``schema.derive_success``
@@ -746,7 +753,9 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             # The traversal gate is the second half of "got through": these lanes are finite in
             # y on an infinite floor, so the circle alone can be entered by walking beside the
             # course.
-            if (course.in_goal(float(robot.mj_data.qpos[0]), float(robot.mj_data.qpos[1]))
+            if (stop_on_goal
+                    and course.in_goal(float(robot.mj_data.qpos[0]),
+                                       float(robot.mj_data.qpos[1]))
                     and acc.traversed):
                 verdict = "success"
                 break

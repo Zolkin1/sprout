@@ -498,8 +498,85 @@ def _ghost(scn, model, gdata, opt, scratch, rgba: tuple) -> None:
         scn.ngeom += 1
 
 
+#: Seconds a latch pause may hold before giving up and playing on.
+#:
+#: A pause that can only be released one way is a hang whenever that way does not work, and it
+#: did: the keystroke reaches whichever window has focus, so typing into the terminal while the
+#: viewer holds focus releases nothing, and a stdin that is not a terminal cannot be polled at
+#: all.  So the wait has THREE independent exits -- a key, closing the viewer, and this cap --
+#: and it says all three before it starts holding.
+PAUSE_CAP_S: float = 120.0
+
+
+#: GLFW keycode for ``S``, the one key that means "abandon the rest of this episode".
+#: GLFW names letter keys by their UPPER-case ASCII regardless of shift.
+_KEY_S: int = ord("S")
+
+
+def _hold_until_resumed(viewer, cap_s: float, pressed: dict | None = None) -> bool:
+    """Freeze on the current frame until the operator releases it, or the cap expires.
+
+    **The VIEWER's own keyboard is the primary channel**, via ``launch_passive``'s
+    ``key_callback``.  A keystroke goes to whichever window has focus, and the window the
+    operator is looking at is the viewer -- so a hold that could only be released from the
+    terminal was, in practice, released by nothing: typing into the terminal while the viewer
+    held focus did nothing at all, and the console went on inviting a key.  The terminal poll
+    is kept as a second path for anyone driving from there.
+
+    Args:
+        viewer: The running passive viewer; closing its window is one of the exits.
+        cap_s: Seconds to hold at most.  Non-positive holds until a key or the window closes.
+        pressed: The mutable box ``replay``'s ``key_callback`` writes the last GLFW keycode
+            into, or ``None`` when no callback was installed.
+
+    Returns:
+        ``True`` when the operator asked to skip the rest of this episode (``S``).
+    """
+    import keys  # noqa: PLC0415 - a sibling; this module is loaded top-level
+
+    if pressed is not None:
+        pressed["key"] = None          # ignore anything pressed before the hold began
+    t0 = time.time()
+    with keys.cbreak_stdin() as live:
+        if not live:
+            # Say it BEFORE holding. The previous version printed this after the wait loop,
+            # which the same condition made unreachable -- so the one case that needed the
+            # message was the one case that could not print it.
+            print(f"  (no cbreak terminal: a key will need Enter after it. Holding "
+                  f"{cap_s:.0f}s; closing the viewer also moves on.)", flush=True)
+        keys.drain_keys()
+        while viewer.is_running():
+            viewer.sync()
+            # POLLED UNCONDITIONALLY. `poll_key` guards on `isatty` itself, so this is safe
+            # without a terminal -- and gating it on cbreak having SUCCEEDED was the defect:
+            # wherever cbreak silently fails, every keystroke was discarded and the only
+            # advertised way out of the hold did nothing at all. Without cbreak a key needs
+            # Enter after it, which is a degraded escape rather than no escape.
+            if pressed is not None and pressed.get("key") is not None:
+                code = int(pressed["key"])
+                pressed["key"] = None
+                return code == _KEY_S
+            k = keys.poll_key()
+            if k is not None:
+                return k == "s"
+            if cap_s > 0 and (time.time() - t0) > cap_s:
+                print(f"  (held {cap_s:.0f}s with no key -- resuming. If you were typing into "
+                      "the terminal, the viewer window had focus; click the terminal first.)",
+                      flush=True)
+                return False
+            try:
+                time.sleep(0.03)
+            except KeyboardInterrupt:
+                # Ctrl-C releases the pause rather than tearing down the whole walkthrough:
+                # an operator reaching for it wants out of THIS hold, not out of the session.
+                print("  (interrupted -- resuming)", flush=True)
+                return False
+    return False
+
+
 def replay(summary: dict, frames: list, plans: list, rt: float, loop: bool,
-           ghost: dict | None = None) -> None:
+           ghost: dict | None = None, pause_at: int | None = None,
+           pause_label: str = "", pause_cap_s: float = PAUSE_CAP_S) -> None:
     """Play the captured trajectory in the viewer.
 
     Writes ``qpos`` and calls ``mj_forward`` only: no physics is stepped and no policy runs, so
@@ -517,8 +594,20 @@ def replay(summary: dict, frames: list, plans: list, rt: float, loop: bool,
             fall while the other is still climbing -- so the shorter track holds its final pose
             rather than looping or vanishing, and the console says which ended when.  Vanishing
             would read as "it left", which is the opposite of what a fall means.
+        pause_at: Control-step index to FREEZE the replay on, or ``None`` to play straight
+            through.  The frame holds until a key is pressed, so the pose at that instant can
+            be inspected rather than watched go past -- which is the whole question when the
+            step is a threshold crossing and what is being judged is whether the crossing was
+            a stumble or an ordinary descent.  Out-of-range values are ignored rather than
+            clamped: clamping would silently pause on the last frame and read as "it latched
+            at the end".
+        pause_label: What to call the pause in the console line, e.g. ``"strict latch"``.
+        pause_cap_s: Seconds a pause may hold before playing on regardless; see
+            :data:`PAUSE_CAP_S` for why an uncapped hold is a hang.
     """
     import mujoco.viewer  # noqa: PLC0415 - opens a GL context; --list must not
+
+    import keys  # noqa: PLC0415 - a sibling; this module is loaded top-level
 
     course, model = summary["course"], summary["model"]
     data = mujoco.MjData(model)
@@ -542,10 +631,34 @@ def replay(summary: dict, frames: list, plans: list, rt: float, loop: bool,
               + (f", offset y {ghost['offset_y']:+.2f} m" if ghost["offset_y"] else
                  " (overlaid at true position)"), flush=True)
 
+    hold_at = None
+    if pause_at is not None and 0 <= int(pause_at) < len(frames):
+        hold_at = int(pause_at)
     print(f"\n  replaying {len(frames)} steps ({frames[-1][0]:.2f} s) at {rt:g}x real time. "
-          "Close the window to exit.\n", flush=True)
+          "Close the window to exit.", flush=True)
+    if hold_at is not None:
+        print(f"  will PAUSE at step {hold_at} ({frames[hold_at][0]:.2f} s)"
+              f"{' -- ' + pause_label if pause_label else ''}", flush=True)
+        print("  to release it: press any key WITH THE VIEWER WINDOW FOCUSED (or in the "
+              f"terminal), or close the viewer, or wait {pause_cap_s:.0f}s. 'S' skips the "
+              "rest of the episode.", flush=True)
+    elif pause_at is not None:
+        # Said and not done, because "it did not pause" is otherwise indistinguishable from
+        # "it never latched".
+        print(f"  (no pause: step {pause_at} is outside this episode's {len(frames)} frames)",
+              flush=True)
+    print("", flush=True)
+    # The box the viewer's keyboard writes into. A dict rather than a nonlocal so the
+    # callback stays a plain function that can be handed to a C-side event loop.
+    pressed: dict[str, int | None] = {"key": None}
+
+    def _on_key(keycode: int) -> None:
+        """Record the last key pressed IN THE VIEWER WINDOW."""
+        pressed["key"] = int(keycode)
+
     with mujoco.viewer.launch_passive(model, data, show_left_ui=False,
-                                      show_right_ui=False) as viewer:
+                                      show_right_ui=False,
+                                      key_callback=_on_key) as viewer:
         viewer.cam.distance = 6.0
         viewer.cam.elevation = -18.0
         viewer.cam.azimuth = 130.0
@@ -589,6 +702,22 @@ def replay(summary: dict, frames: list, plans: list, rt: float, loop: bool,
                 # still orbit, because only the lookat point is written.
                 viewer.cam.lookat[:] = qpos[:3]
                 viewer.sync()
+
+                if hold_at is not None and i == hold_at:
+                    # Freeze by not advancing: `qpos` is already written and `mj_forward` has
+                    # run, so the pose on screen IS the pose at the crossing. Nothing is
+                    # stepped here either -- holding a replay cannot perturb what it shows.
+                    print(f"  PAUSED at step {i} ({t:.2f} s)"
+                          f"{' -- ' + pause_label if pause_label else ''}", flush=True)
+                    skip_rest = _hold_until_resumed(viewer, pause_cap_s, pressed)
+                    hold_at = None          # pause once, not every lap of --loop
+                    if skip_rest:
+                        break
+                    # The wall clock advanced while we held, so the pacing below would think
+                    # the replay was seconds behind and sprint to catch up. Re-base it to
+                    # where this frame should have been.
+                    wall0 = time.time() - (i * (frames[1][0] - frames[0][0]
+                                                if len(frames) > 1 else 0.02)) / max(rt, 1e-9)
 
                 if rt > 0:
                     ahead = (i * (frames[1][0] - frames[0][0] if len(frames) > 1 else 0.02)) \
