@@ -150,6 +150,32 @@ pure_cmd_p_straight: 0.25         # probability a pure clip's traversal is fully
                                   # Not 0.5 either -- pure stairs are now the only carrier of the
                                   # lesson, so most of them should carry it.
 
+# ---------------------------------------------------------------- terrain BOUNDARY transients
+# How the two in-betweenings that join the flat walk to the replay are generated. Settled by
+# generating one hand-off many ways and looking at it (scripts/rsl_rl/stitch_lab.py).
+terrain_free_root: true           # drop the positional pin on both boundary transients and let
+                                  # Motion Bricks own the root motion. terrain_splice.align_boundary
+                                  # rigidly re-places the segment afterwards, so the absolute root it
+                                  # produced is discarded -- what the pin really fixed was the
+                                  # DISPLACEMENT, and pinning that fought the pose target (the pose
+                                  # window is the replay's opening frames, which are MOVING, while a
+                                  # fixed carrot is a point the model decelerates into). Measured on
+                                  # one hand-off: foot drag -159 -> -15 mm and arrival speed 0.56 ->
+                                  # 1.44x of the replay's entry speed.
+terrain_transient_tokens: 10      # force the horizon (0 = let hop_tokens derive it). The derived
+                                  # band routinely COLLAPSES -- n_min == n_max == 6 on the measured
+                                  # hand-off -- so Motion Bricks' own 6..16 token head is masked to a
+                                  # single option and its prediction is discarded. 10 was chosen by
+                                  # eye. It is tuned to ~0.8 m/s: the exit velocity ratio drifts 0.71
+                                  # to 1.47x across the 0.2-2.5 band, so this wants revisiting when
+                                  # the stair trajectories are re-solved.
+terrain_exit_swing_clear: -0.01   # the EXIT gate's swing-foot lower bound (m), NEGATIVE so a
+                                  # near-level hand-off qualifies. The shared swing_clear (+0.075)
+                                  # forces the exit a third of a stride past the landing; judged by
+                                  # eye the near-level frames were better and the gate's own pick was
+                                  # worst. The velocity ratio ranks them the OTHER way (1.01x vs
+                                  # 0.74x), so this follows the eye over the metric on purpose.
+
 min_hold_m: 1.5                   # shortest steady stretch (m) a hold may be. Below a gait cycle a
                                   # "hold" is not steady, and loop_frames_for rounds it UP -- which
                                   # overruns the travel budget and pushes terrain past the platform.

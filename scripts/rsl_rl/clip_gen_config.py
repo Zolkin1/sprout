@@ -133,6 +133,11 @@ _SCHEMA: dict[str, tuple] = {
     "gen_attempts": ("int", 1),
     "terrain_cmd_changes_per_side": ("int", 1),
     "terrain_cmd_segments": ("int", 1),
+    # How the terrain BOUNDARY transients are generated. See mb_env.walk_control(free_root) and
+    # mb_terrain_segments --token-band; both were debug knobs until the seam work settled them.
+    "terrain_transient_tokens": ("int", 1),
+    "terrain_free_root": ("bool", 1),
+    "terrain_exit_swing_clear": ("float", 1),
     # The PURE-stair families get their own three, because they are the only place lateral/yaw on
     # terrain is kept. A pure tile is 100% terrain with no approach to route, so a lateral command
     # there cannot walk the robot off an entry pose -- and a transition clip carrying none means the

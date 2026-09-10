@@ -343,7 +343,7 @@ _HOLD_CYCLES = 1.5
 
 
 def _hold_minimums(cmds: list, min_hold: float, args, bank,
-                   lead_in_from: float | None = None) -> list:
+                   lead_in_from: float | None = None, boundary_tokens: int = 0) -> list:
     """Per-hold minimum travel: enough for a real steady stretch, plus its incoming transient.
 
     Measured when the lead-up became an alternation: sized any smaller, holds lose their loop and pass
@@ -384,8 +384,20 @@ def _hold_minimums(cmds: list, min_hold: float, args, bank,
     # target: its travel is the pin distance |v1| * 1.0 s, not duration x mean speed. Reserving the
     # duration bound instead under-counted a box-top exit 3x (0.20 m predicted, 0.64 measured) and let
     # pass A plan a hold whose loop then would not fit.
-    out = [_steady(cmds[0]) + (0.0 if lead_in_from is None
-                               else max(_bound(lead_in_from, cmds[0]), fp.pin_travel(cmds[0])))]
+    # ``pin_travel`` is the PIN LAW, and it only describes a transient Motion Bricks is aimed at a
+    # pinned target. With a free root there is no pin, so that floor models nothing; the honest
+    # bound is then the forced horizon, which makes the duration known exactly.
+    if boundary_tokens:
+        _lead = (0.0 if lead_in_from is None
+                 else fp.transient_travel_bound((lead_in_from, 0.0, 0.0), (cmds[0], 0.0, 0.0),
+                                                a_max=float(args.approach_a_max),
+                                                floor_s=float(args.approach_min_transient_s),
+                                                slack=float(args.approach_hop_slack), ramp_dv=ramp,
+                                                tokens=int(boundary_tokens)))
+    else:
+        _lead = (0.0 if lead_in_from is None
+                 else max(_bound(lead_in_from, cmds[0]), fp.pin_travel(cmds[0])))
+    out = [_steady(cmds[0]) + _lead]
     for j in range(1, len(cmds)):
         out.append(_steady(cmds[j]) + _bound(cmds[j - 1], cmds[j]))
     return out
@@ -473,14 +485,16 @@ def _rl_holds(rng, family_kind: str, approach_dist: float, exit_dist: float,
             else:
                 cmds[0] = pin_x
             mins = _hold_minimums(cmds, min_hold, args, bank,
-                                  lead_in_from=(None if is_approach else 0.0))
+                                  lead_in_from=(None if is_approach else 0.0),
+                                  boundary_tokens=int(getattr(args, "terrain_transient_tokens", 0)))
             if sum(mins) <= flat:
                 break
             n -= 1
         else:
             cmds = [pin_a if is_approach else pin_x]
-            mins = [min(_hold_minimums(cmds, min_hold, args, bank,
-                                       lead_in_from=(None if is_approach else 0.0))[0], flat)]
+            mins = [min(_hold_minimums(
+                cmds, min_hold, args, bank, lead_in_from=(None if is_approach else 0.0),
+                boundary_tokens=int(getattr(args, "terrain_transient_tokens", 0)))[0], flat)]
         shares = _split_dist(rng, flat, mins)
         # Give the zone to the hold that touches the terrain.
         if is_approach:
@@ -657,6 +671,13 @@ def main() -> int:
                         "reference the identical entry pose.")
     p.add_argument("--exit-pick", default="first", choices=["first", "middle", "last"])
     p.add_argument("--contact-tol", type=float, default=0.02)
+    p.add_argument("--terrain-transient-tokens", type=int, default=0,
+                   help="Forced horizon (tokens) of the terrain BOUNDARY transients, 0 to derive. "
+                        "Pass A needs it only to reserve the exit's travel: with a forced horizon "
+                        "the duration is known exactly, where the pin-law floor models a pin that "
+                        "a free root does not have.")
+    p.add_argument("--exit-swing-clear", type=float, default=None,
+                   help="Swing-foot lower bound for the EXIT boundary gate only (m).")
     p.add_argument("--swing-clear", type=float, default=None)
     p.add_argument("--swing-band", type=float, default=None)
     p.add_argument("--approach-flat-s-range", type=float, nargs=2, default=(1.5, 4.0),
@@ -857,6 +878,7 @@ def main() -> int:
                     clip_seed=int(np.random.default_rng(
                         [args.seed + 11, _skill_seed(skill), int(tid), ci]).integers(0, 2 ** 31)),
                     contact_tol=args.contact_tol, swing_clear=args.swing_clear,
+                    exit_swing_clear=args.exit_swing_clear,
                     swing_band=args.swing_band, footprint_margin=args.footprint_margin,
                 )
                 rel = os.path.join("plans", f"{skill}_t{tid:04d}_c{ci:03d}.npz")

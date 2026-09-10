@@ -185,6 +185,8 @@ def main() -> int:
             "--stride-bank", bank,
             "--terrain-cmd-changes-per-side", str(cfg.terrain_cmd_changes_per_side),
             "--terrain-cmd-segments", str(cfg.terrain_cmd_segments),
+            "--exit-swing-clear", str(cfg.terrain_exit_swing_clear),
+            "--terrain-transient-tokens", str(cfg.terrain_transient_tokens),
             "--terrain-cmd-vy-range", *(str(v) for v in cfg.terrain_cmd_vy_range),
             "--terrain-cmd-wz-range", *(str(v) for v in cfg.terrain_cmd_wz_range),
             "--min-hold-m", str(cfg.min_hold_m),
@@ -245,7 +247,10 @@ def main() -> int:
             # (interior peak max 10.87 -> 3.88 m/s, one blow-up -> none).
             "--flat-a-max", str(cfg.flat_a_max),
             "--gen-attempts", str(cfg.gen_attempts),
-            "--pin-future", cfg.pin_future],
+            "--pin-future", cfg.pin_future]
+           + (["--free-root"] if cfg.terrain_free_root else [])
+           + (["--token-band", str(cfg.terrain_transient_tokens),
+               str(cfg.terrain_transient_tokens)] if cfg.terrain_transient_tokens else []),
             conda_env=args.conda_env)
         flat_plans = os.path.join(work, "flat_plans.json")
         flat_tr = os.path.join(work, "flat_transients")
