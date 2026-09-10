@@ -73,7 +73,16 @@ def test_plain_bc_passes_no_labels_at_all() -> None:
     secretly AWR with a large number in it.
     """
     args = _algo_args("bc")
-    assert args == [], f"bc must pass nothing, got {args}"
+    assert "--labels" not in args, f"bc must pass no label sidecar, got {args}"
+    assert not any(a.startswith("--awr") for a in args), f"bc must not weight: {args}"
+    assert "--filter_label" not in args, f"bc must not filter: {args}"
+    # It DOES pass `--unconditioned`, and must: `finetune_generator.is_plain_arm` is true for
+    # `filter_label`, `unconditioned` or `awr_beta > 0`, so a run with none of those silently
+    # takes the advantage-CONDITIONED path -- trains an embedding no label ever reaches and
+    # writes a checkpoint with no serve arm, which the eval then refuses outright. That is
+    # what killed `eval_bc_s3_i1` at all three speeds.
+    assert "--unconditioned" in args, (
+        f"bc must take the PLAIN architecture path, got {args}")
 
 
 def test_filtered_bc_filters_rather_than_weighting() -> None:

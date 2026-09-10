@@ -488,7 +488,15 @@ for (( it=1; it<=ITERS; it++ )); do
                       --awr_beta "$BETA" --awr_normalize global --awr_center none
                       --awr_balance none --awr_clip 20.0);;
       fbc|arrived) ALGO_ARGS=(--labels "$CRITIC/advantage.npz" --filter_label positive);;
-      bc)  ALGO_ARGS=();;
+      # `--unconditioned` is the PLAIN-architecture flag, and plain BC needs it even though it
+  # passes no labels. `finetune_generator.is_plain_arm` is true for `filter_label`,
+  # `unconditioned` or `awr_beta > 0` -- so a run with none of those takes the
+  # advantage-CONDITIONED path, trains an embedding no label ever reaches, and writes a
+  # checkpoint with no serve arm to choose. The eval then refuses it:
+  #   "this checkpoint is advantage-conditioned but does not say WHICH arm to serve"
+  # which is what killed `eval_bc_s3_i1` at all three speeds. BC is the FOURTH plain arm and
+  # was the one `is_plain_arm`'s own docstring warned would be missed.
+  bc)  ALGO_ARGS=(--unconditioned);;
     esac
     "$PY" -u scripts/flow_matching/finetune_generator.py --no_wandb \
       --pretrained "$POLICY" \

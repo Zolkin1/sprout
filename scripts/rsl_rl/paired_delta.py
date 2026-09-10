@@ -121,6 +121,15 @@ def report(name: str, cells_a: dict, cells_b: dict, *, n_boot: int = N_BOOT,
         envs = sorted(set(cells_a[c]) & set(cells_b[c]))
         per_cell.append((np.array([cells_a[c][e] for e in envs]),
                          np.array([cells_b[c][e] for e in envs])))
+    if not per_cell or not any(a.size for a, _ in per_cell):
+        # An empty intersection is the shape of a FAILED eval, not of a null result: the arm
+        # whose run directory holds only `.log` files intersects nothing, and dividing by the
+        # cell count then raised ZeroDivisionError several frames from the cause. Measured on
+        # `eval_bc_s3_i1`, whose three speeds all died before writing an episode table.
+        raise SystemExit(
+            f"{name}: the two arms share no (tile, speed) cell with paired envs. Usually one "
+            "arm's eval never produced an episode table -- check its run directory for a "
+            "bare `train_v*.log` with no directory beside it.")
     n_env = sum(a.size for a, _ in per_cell)
     delta = float(np.mean([b.mean() - a.mean() for a, b in per_cell]))
     boots = np.empty(n_boot)
