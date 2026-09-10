@@ -528,6 +528,11 @@ def test_the_ic_report_reads_the_chunk_group_and_uses_its_stamped_weights(tmp_pa
     ep["terrain_id"] = np.zeros(n_ep, np.int32)
     ep["reached_goal"] = np.ones(n_ep, np.uint8)
     ep["steps_survived"] = np.full(n_ep, 100, np.int32)
+    # ONE EPISODE PER ENV, which is what a round-based stop at one round produces -- and it is
+    # load-bearing here: the report reduces first-per-env by default, so four episodes sharing
+    # one env would leave three of them (and 30 of the 40 chunk rows) out of the sample as
+    # surplus. That is the correction working, not a fixture detail.
+    ep["env_id"] = np.arange(n_ep, dtype=np.int32)
     table.append_batch(ep)
     table.write(str(path), attrs={}, chunks=chunks)
 

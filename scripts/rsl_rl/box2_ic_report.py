@@ -7,10 +7,32 @@ designed in: distance is a TILE (``terrain_id`` indexes
 :data:`motion_gen.terrain.box2.TRAIN_SPAWN_DISTANCES_M`) and speed is a per-run command, so a
 cell is recoverable from the episode table plus the run it came from.
 
-**Success here is ``reached_goal``, and it is not the same question as "did it survive".**  An
-episode can end upright, on the far side of nothing, having timed out; and a fall can happen
-after crossing the goal line.  Both are reported, because on this obstacle the interesting
-failure is neither -- it is the robot committing to the wrong MODE at the second box.
+**Success is ARRIVAL BEFORE THE FIRST FAILURE**, i.e. ``rollout_outcomes.terminal_reward >= 0``:
+a fall in the run-out after the goal is a success, and a robot dragged over the line after it
+had already failed is not.  ``--metric reached_goal`` reproduces the old rule, which counts the
+latter, and the two are printed side by side so the difference is visible rather than assumed.
+**"Failure" is the STRICT rule -- the fall OR the tracking bounds -- because since 2026-09-09
+Isaac TERMINATES on those bounds** (``terminations.tracking_violation``, height 0.12 m).  On a
+recording made with that termination the choice is moot: an episode that leaves the bounds ends
+there, so it cannot arrive afterwards and the two rules agree by construction.
+
+**On a recording made BEFORE it, use ``--failure_rule loose``, and the difference is enormous.**
+There the run continued past a violation, and the strict rule then fires on 99.51% of episodes
+at a median step 378 against a median arrival at step 765 -- so it trips before arrival on
+95.3% of completed traverses and reports 0.0049 where the fall rule reports 0.1051.  That
+number is about a tracking bound being applied after the fact to episodes that were never
+ended by it, not about the task.  The header states which rule ran, for exactly this reason.
+
+**The reduction is FIRST-PER-ENV by default.**  A round-based collection stops when the SLOWEST
+env finishes, so the fast envs have finished more -- and an env finishes more episodes precisely
+when its episodes were short.  Pooling every episode therefore tilts the sample toward
+fast-failing envs; measured bias 0.15 on one in-distribution tile.  ``--rounds`` sets how many
+per env to keep and ``--pooled`` turns the correction off, which is what a recording made
+without a round-based stop needs.
+
+On this obstacle the interesting failure is neither a fall nor a timeout -- it is the robot
+committing to the wrong MODE at the second box -- so the three outcome categories are printed
+beside every rate.
 
 **Timeout fraction is a DIAGNOSTIC on the harness, not on the policy.**  The episode budget has
 to be non-binding, or the slow x far cells are scored on the clock: at the 20 s default, tile 4
@@ -22,6 +44,8 @@ Usage::
 
     python scripts/rsl_rl/box2_ic_report.py logs/box2/rollouts
     python scripts/rsl_rl/box2_ic_report.py logs/box2/rollouts --json out.json
+    # the pre-2026-09-09 rule, for comparison against a number published under it:
+    python scripts/rsl_rl/box2_ic_report.py logs/box2/rollouts --metric reached_goal --pooled
 """
 
 from __future__ import annotations
@@ -42,11 +66,24 @@ for _pkg in ("motion_gen", "robot_rl"):
     _p = str(_REPO_ROOT / "source" / _pkg)
     if _p not in sys.path:
         sys.path.insert(0, _p)
+# `first_per_env` lives with the buffer that needed it first; importing it is the point --
+# the eval and the training buffer must agree on which episodes a round-based stop leaves,
+# and two implementations of that would be two definitions of the sample.
+_p = str(_REPO_ROOT / "scripts" / "flow_matching")
+if _p not in sys.path:
+    sys.path.insert(0, _p)
 
+import rollout_outcomes as ro  # noqa: E402
+from awr_buffer import first_per_env  # noqa: E402
 from motion_gen.terrain.box2 import (  # noqa: E402
     HOLDOUT_SPAWN_DISTANCE_M,
     TRAIN_SPAWN_DISTANCES_M,
 )
+
+#: The success rules this reduces under.  ``terminal_reward`` is arrival before the first
+#: failure and is the default everywhere; ``reached_goal`` is arrival at any point, which is
+#: what every number published before 2026-09-09 was scored under.
+METRICS: tuple[str, ...] = ("terminal_reward", "reached_goal")
 
 #: A cell whose episodes time out more often than this is being scored partly on the clock, and
 #: the rate below it is not a statement about the policy.  0.05 is well above the 0.004-0.015
@@ -137,11 +174,20 @@ def _terrain_cells(h, keep: "np.ndarray", tid: "np.ndarray", uid_kept: "np.ndarr
     return out
 
 
-def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[dict]:
+def load_cells(root: str, distances: tuple[float, ...] | None = None, *,
+               metric: str = "terminal_reward", strict: bool = True,
+               rounds: int = 1) -> list[dict]:
     """One record per ``(run, tile)`` cell under ``root``.
 
     Args:
         root: Directory holding one subdirectory per recording run.
+        distances: The approach distance of each tile index, when the run used a library
+            other than the full training one.
+        metric: Which success rule sets ``success``; one of :data:`METRICS`.
+        strict: Count a tracking violation as a failure as well as a fall.  ``False`` (the
+            default for reporting) is fall-only; see the module docstring for why.  Ignored
+            on a table with no violation column.
+        rounds: Episodes to keep per env (first-completed first).  ``0`` pools everything.
 
     Returns:
         Cell dicts, sorted by (holdout last, speed, distance).
@@ -149,7 +195,10 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[di
     Raises:
         SystemExit: If no episode table is found -- an empty report reads exactly like a
             finished sweep with nothing in it.
+        ValueError: If ``metric`` is not one of :data:`METRICS`.
     """
+    if metric not in METRICS:
+        raise ValueError(f"metric must be one of {METRICS}, got {metric!r}")
     cells: list[dict] = []
     for run_dir in sorted(glob.glob(os.path.join(root, "*"))):
         tables = glob.glob(os.path.join(run_dir, "*.episodes.h5"))
@@ -161,23 +210,41 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[di
                  else (tuple(distances) if distances else TRAIN_SPAWN_DISTANCES_M))
         with h5py.File(tables[0], "r") as h:
             keep = ~h["censored"][:].astype(bool)
-            tid = h["terrain_id"][:][keep]
-            ok = h["reached_goal"][:][keep].astype(bool)
-            trunc = h["truncated"][:][keep].astype(bool)
-            # The FAILURE ending is `terminated`, not the accumulator's derived fall flag:
-            # measured over 5000 episodes, `terminated` is 0.869 and every one of those has
-            # the tilt and/or absolute-height term latched (`terminated & neither` = 0.000),
-            # while `first_fall_step >= 0` is a stricter 0.237. Using the latter left the three
-            # categories summing to ~0.32 and the rest unaccounted for.
-            failed = h["terminated"][:][keep].astype(bool)
-            steps = h["steps_survived"][:][keep]
+            uid_all = h["episode_uid"][:].astype(np.int64)
+            if rounds > 0 and "env_id" in h:
+                # First-per-env, computed by the SAME function the training buffer uses. The
+                # tightened mask flows into `_terrain_cells` through `uid_kept`, so a
+                # discarded episode's re-plan rows leave the penalty statistics too -- the
+                # alternative would score success on one sample and the penalty on another.
+                env_all = h["env_id"][:].astype(np.int64)
+                keep &= np.isin(uid_all, np.asarray(
+                    first_per_env(uid_all[keep], env_all[keep], rounds), dtype=np.int64))
+            cols = {k: h[k][:][keep] for k in h if isinstance(h[k], h5py.Dataset)}
+            tid = cols["terrain_id"]
+            reached = cols["reached_goal"].astype(bool)
+            # THE THREE CATEGORIES ARE AN EXACT PARTITION, by construction rather than by
+            # measurement. `terminal_reward` is 0 exactly when the base entered the goal
+            # before it ever failed; of the rest, one either failed (`first_bad_step >= 0`)
+            # or ran out of clock without arriving. The old table used `terminated` for the
+            # middle one, which fires on ARRIVAL too -- so its three columns overlapped and
+            # its printed `sum` never had to add to 1.
+            tr_ok = ro.terminal_reward(cols, strict=strict) >= 0.0
+            ok = reached if metric == "reached_goal" else tr_ok
+            bad_step = ro.first_bad_step(cols, strict=strict)
+            bad = bad_step >= 0
+            failed = (~ok) & bad
+            trunc = (~ok) & ~bad
+            # Where the two rules DISAGREE, so the cost of the choice sits in the table rather
+            # than in a changelog: a robot dragged over the line after it had already failed.
+            late = reached & ~tr_ok
+            steps = cols["steps_survived"]
             # Tracking quality, reported beside success because the two can move in
             # opposite directions: a fine-tune that tracks its own chunks more closely has
             # not necessarily arrived more often, and on this obstacle the interesting
             # failure is a MODE choice that a tracking mean cannot see.
-            track = (h["track_reward_mean"][:][keep] if "track_reward_mean" in h
+            track = (cols["track_reward_mean"] if "track_reward_mean" in cols
                      else np.full(int(keep.sum()), np.nan))
-            terrain = _terrain_cells(h, keep, tid, h["episode_uid"][:][keep])
+            terrain = _terrain_cells(h, keep, tid, cols["episode_uid"])
         for t in sorted(np.unique(tid)):
             if t < 0:
                 continue
@@ -187,8 +254,19 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[di
                 "tile": int(t),
                 "distance_m": dists[int(t)] if int(t) < len(dists) else None,
                 "n": int(m.sum()),
-                "reached_goal": float(ok[m].mean()),
-                "timeout": float((trunc[m] & ~ok[m]).mean()),
+                # `success` is the headline under whichever rule ran; the other two are
+                # always both reported, so a table can be read against a number published
+                # under either without re-reducing it.
+                "success": float(ok[m].mean()),
+                "reached_goal": float(reached[m].mean()),
+                "arrived_before_failing": float(tr_ok[m].mean()),
+                "late_arrival": float(late[m].mean()),
+                "timeout": float(trunc[m].mean()),
+                # Of the episodes that latched, the share that kept going well past it --
+                # the tell for a recording made before the violation became a termination.
+                "ran_past_latch": float(
+                    ((cols["steps_survived"][m] - np.maximum(bad_step[m], 0)) > 5 * 12)[
+                        bad[m]].mean()) if bool(bad[m].any()) else 0.0,
                 "failed": float(failed[m].mean()),
                 "steps_median": float(np.median(steps[m])),
                 "track_reward_mean": float(np.nanmean(track[m])),
@@ -200,11 +278,15 @@ def load_cells(root: str, distances: tuple[float, ...] | None = None) -> list[di
     return sorted(cells, key=lambda c: (c["holdout"], c["speed"] or 0.0, c["distance_m"] or 0.0))
 
 
-def format_report(cells: list[dict]) -> str:
+def format_report(cells: list[dict], *, metric: str = "terminal_reward",
+                  strict: bool = True, rounds: int = 1) -> str:
     """The grid, as a table plus its marginals.
 
     Args:
         cells: :func:`load_cells` output.
+        metric: The rule ``success`` was reduced under, named in the header.
+        strict: Whether a tracking violation counted as a failure.
+        rounds: The per-env episode cap that was applied, ``0`` for pooled.
 
     Returns:
         The report text.
@@ -215,25 +297,52 @@ def format_report(cells: list[dict]) -> str:
     dists = sorted({c["distance_m"] for c in train if c["distance_m"] is not None})
     by = {(c["speed"], c["distance_m"]): c for c in train}
 
-    L = ["=" * 78, "TWO-BOX INITIAL-CONDITION GRID -- reached_goal", "=" * 78, ""]
+    # THE RULE IS PART OF THE NUMBER. Two reductions of one recording differ by more than any
+    # policy effect this is meant to resolve, so the header states both choices rather than
+    # leaving them to be inferred from which flags happened to be passed.
+    rule = ("arrival BEFORE the first failure" if metric == "terminal_reward"
+            else "arrival at any point, even after failing")
+    red = f"first {rounds} episode(s) per env" if rounds > 0 else "POOLED (biased -- see docstring)"
+    L = ["=" * 78, f"TWO-BOX INITIAL-CONDITION GRID -- {metric}", "=" * 78, "",
+         f"  success   = {rule}",
+         f"  failure   = {'the fall OR the tracking bounds (what Isaac now terminates on)' if strict else 'the fall alone'}",
+         f"  reduction = {red}", ""]
     L.append("  approach distance (m) across, commanded speed (m/s) down")
     L.append("  " + " " * 8 + "".join(f"{d:>9.2f}" for d in dists) + f"{'row':>11}")
     for s in speeds:
         row = [by.get((s, d)) for d in dists]
         got = [c for c in row if c]
-        rate = (sum(c["reached_goal"] * c["n"] for c in got) / sum(c["n"] for c in got)
+        rate = (sum(c["success"] * c["n"] for c in got) / sum(c["n"] for c in got)
                 if got else float("nan"))
-        L.append(f"  {s:>6.2f}  " + "".join(f"{c['reached_goal']:>9.3f}" if c else f"{'-':>9}"
+        L.append(f"  {s:>6.2f}  " + "".join(f"{c['success']:>9.3f}" if c else f"{'-':>9}"
                                             for c in row) + f"{rate:>11.3f}")
     col = []
     for d in dists:
         got = [by[(s, d)] for s in speeds if (s, d) in by]
-        col.append(sum(c["reached_goal"] * c["n"] for c in got) / sum(c["n"] for c in got)
+        col.append(sum(c["success"] * c["n"] for c in got) / sum(c["n"] for c in got)
                    if got else float("nan"))
     L.append(f"  {'col':>6}  " + "".join(f"{v:>9.3f}" for v in col))
     n_tr = sum(c["n"] for c in train)
-    pooled = sum(c["reached_goal"] * c["n"] for c in train) / n_tr if n_tr else float("nan")
+    pooled = sum(c["success"] * c["n"] for c in train) / n_tr if n_tr else float("nan")
+    # DID THIS RECORDING TERMINATE ON THE VIOLATION? Under `terminations.tracking_violation`
+    # an episode ends AT the latch, so `steps_survived` sits right on it. A recording made
+    # before that ran on for hundreds of steps -- and scoring THAT under the strict rule
+    # applies a bound after the fact to episodes it never ended, which reported 0.0049 against
+    # the fall rule's 0.1051 on one real grid. Cheap to detect, so it is not left to be
+    # remembered.
+    ran_on = sum(c.get("ran_past_latch", 0.0) * c["n"] for c in train) / n_tr if n_tr else 0.0
+    if strict and ran_on > 0.25:
+        L.append(f"\n  !! {ran_on:.0%} of violating episodes RAN ON past the latch, so this "
+                 "recording predates terminations.tracking_violation. The strict rule is "
+                 "being applied to episodes it never ended -- reduce it with "
+                 "`--failure_rule loose` for a number comparable to anything.")
     L.append(f"\n  pooled over {n_tr} training episodes: {pooled:.4f}")
+    # The OTHER rule, on the same episodes, so the choice of metric is never invisible.
+    other = "reached_goal" if metric == "terminal_reward" else "arrived_before_failing"
+    po = sum(c[other] * c["n"] for c in train) / n_tr if n_tr else float("nan")
+    late = sum(c["late_arrival"] * c["n"] for c in train) / n_tr if n_tr else float("nan")
+    L.append(f"  the same episodes under {other}: {po:.4f}  (delta {po - pooled:+.4f})")
+    L.append(f"  they differ on {late:.2%} of episodes -- arrived only AFTER failing")
     te = [c for c in train if "terrain_penalty_median" in c]
     if te:
         nch = sum(c["n_chunks"] for c in te)
@@ -252,7 +361,7 @@ def format_report(cells: list[dict]) -> str:
 
     if hold:
         n_h = sum(c["n"] for c in hold)
-        ph = sum(c["reached_goal"] * c["n"] for c in hold) / n_h
+        ph = sum(c["success"] * c["n"] for c in hold) / n_h
         d = hold[0]["distance_m"]
         L.append(f"  HELD OUT ({d} m, {hold[0]['speed']} m/s), {n_h} episodes: {ph:.4f}"
                  "   -- off the training grid on BOTH axes")
@@ -265,11 +374,12 @@ def format_report(cells: list[dict]) -> str:
           f"{'timeout':>9}{'sum':>7}{'steps':>8}{'track':>8}{t_head}"]
     for c in cells:
         flag = "  <- TIMEOUT-LIMITED" if c["timeout"] > TIMEOUT_WARN else ""
-        # reached + failed + timeout must account for the episode; printed so a category
-        # that stops adding up is visible in the table rather than inferred from it.
-        total = c["reached_goal"] + c["failed"] + c["timeout"]
+        # success + failed + timeout is an exact partition of the kept episodes, so `sum`
+        # must read 1.000 on every row; it is printed because a partition that stops adding
+        # up is the tell that the metric and the categories came apart.
+        total = c["success"] + c["failed"] + c["timeout"]
         L.append(f"  {c['run']:<16}{c['tile']:>5}{c['distance_m'] or 0:>7.2f}{c['n']:>7}"
-                 f"{c['reached_goal']:>9.3f}{c['failed']:>8.3f}{c['timeout']:>9.3f}"
+                 f"{c['success']:>9.3f}{c['failed']:>8.3f}{c['timeout']:>9.3f}"
                  f"{total:>7.3f}{c['steps_median']:>8.0f}"
                  f"{c.get('track_reward_mean', float('nan')):>8.3f}"
                  + ((f"{c.get('n_chunks', 0):>8}"
@@ -304,9 +414,29 @@ def main() -> int:
                         "default tuple that cell would be silently relabelled 2.00 m and "
                         "then paired against the wrong control. Pass the library's own "
                         "distances, in tile order.")
+    p.add_argument("--metric", choices=METRICS, default="terminal_reward",
+                   help="Success rule. The default is arrival BEFORE the first failure, which "
+                        "is what the labellers select on; `reached_goal` is arrival at any "
+                        "point and reproduces every number published before 2026-09-09.")
+    p.add_argument("--failure_rule", choices=("strict", "loose"), default="strict",
+                   help="loose (the default) counts only the FALL. strict adds the bootstrap "
+                        "tracking tolerances, which on this terrain fire on 99.5%% of "
+                        "episodes and before arrival on 95%% of successful traverses -- it is "
+                        "what the critic labels select on, and it is not a reportable success "
+                        "rate here. See the module docstring.")
+    p.add_argument("--rounds", type=int, default=1,
+                   help="Episodes to keep per env, first-completed first (default 1). A "
+                        "round-based stop leaves the fast envs with extra SHORT episodes, so "
+                        "pooling them tilts the sample toward fast failures.")
+    p.add_argument("--pooled", action="store_true",
+                   help="Keep every uncensored episode (equivalent to --rounds 0). Correct "
+                        "only for a recording made without a round-based stop.")
     a = p.parse_args()
-    cells = load_cells(a.root, tuple(a.distances) if a.distances else None)
-    print(format_report(cells))
+    rounds = 0 if a.pooled else int(a.rounds)
+    strict = a.failure_rule == "strict"
+    cells = load_cells(a.root, tuple(a.distances) if a.distances else None,
+                       metric=a.metric, strict=strict, rounds=rounds)
+    print(format_report(cells, metric=a.metric, strict=strict, rounds=rounds))
     if a.json:
         os.makedirs(os.path.dirname(os.path.abspath(a.json)) or ".", exist_ok=True)
         with open(a.json, "w") as f:
