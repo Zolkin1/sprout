@@ -581,6 +581,13 @@ so the race tears the file silently. The generated scenes are derived and not co
 
 ### 4c. Fine-tune on FREE-FORM terrain
 
+> **Looking for the AWR / filtered-BC generator fine-tune?** That is a different pipeline and
+> it lives in **[`scripts/flow_matching/FINETUNE.md`](scripts/flow_matching/FINETUNE.md)** --
+> `run_finetune_loop.sh`, the four algorithms, the terrain libraries and their fingerprints,
+> the eval entry point, and **which generator every published number was fine-tuned from**.
+> Nothing in this section calls `finetune_generator.py`; what follows is the TEACHER's PPO
+> fine-tune on free-form ground, which is a prerequisite for it rather than the same thing.
+
 `G1-teacher-clf-terrain-depth-finetune-freeform` runs the generator-graded fine-tune on
 terrain that **no clip was ever generated for**. Every other library here exists to match one
 recorded motion per tile; under `reference_source="fm"` the reference is predicted from the
