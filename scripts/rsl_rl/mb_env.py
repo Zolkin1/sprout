@@ -332,7 +332,28 @@ def walk_control(ctx: t.Tensor, cmd, lookahead_times, *, start=None, standing: b
     speed = float(np.hypot(cmd[0], cmd[1]))
     if standing is None:
         standing = speed < 1e-3 and abs(float(cmd[2])) < 1e-3
-    mv = (np.array([cmd[0], cmd[1], 0.0], np.float32) / speed) if speed > _EPS else np.zeros(3, np.float32)
+    # ``movement_direction`` is a WORLD-frame unit vector in Motion Bricks' interface -- the shipped
+    # demo builds it as [cos(abs_heading), sin(abs_heading), 0], where abs_heading already includes
+    # the camera/robot heading -- and the SPRING model consumes it as such
+    # (``full_agent._generate_spring_model_position_and_heading``: it adds
+    # ``translation * movement_direction[[1, 0]]`` straight onto the current root position).
+    #
+    # Every PINNED caller here has been sending the BODY-frame command direction instead, and that
+    # was harmless only because those callers override the spring model entirely via
+    # ``specific_target_positions`` -- there ``movement_direction`` carries the sign and nothing
+    # else. The free-root arm is the first thing to actually drive the spring model, and a
+    # body-frame vector in a world-frame slot sends it somewhere else: measured on a stock-stack
+    # run, a +0.81 m/s FORWARD command produced -0.269 m/s of body-frame vx and +0.565 of vy.
+    #
+    # So rotate for `free_root` only. Rotating unconditionally would change the sign convention the
+    # pinned path relies on, i.e. every terrain clip, to fix a path they do not use.
+    if speed <= _EPS:
+        mv = np.zeros(3, np.float32)
+    elif free_root:
+        ang = float(np.arctan2(float(cmd[1]), float(cmd[0]))) + cyaw
+        mv = np.array([np.cos(ang), np.sin(ang), 0.0], np.float32)
+    else:
+        mv = np.array([cmd[0], cmd[1], 0.0], np.float32) / speed
     face = np.array([np.cos(spec_head[-1]), np.sin(spec_head[-1]), 0.0], np.float32)
     extra = ({} if allowed_tokens is None else
              {"allowed_pred_num_tokens": t.from_numpy(np.asarray(allowed_tokens, np.int64)).view([1, -1])})
@@ -490,12 +511,21 @@ class MBAgent:
     control dict from :func:`walk_control`.
     """
 
-    def __init__(self, args, *, capture_keyframes: bool = False, pose_pin_thresh: float = 0.5):
+    def __init__(self, args, *, capture_keyframes: bool = False, pose_pin_thresh: float = 0.5,
+                 pose_override: bool = True):
         from motionbricks.motion_backbone.demo.utils import navigation_demo
 
         self.demo = navigation_demo(build_demo_args(args))
         self.agent = self.demo.full_agent
-        self.agent._generate_target_joint_transforms = types.MethodType(target_pose_override, self.agent)
+        # ``pose_override=False`` leaves Motion Bricks' OWN target-joint hook in place, i.e. the
+        # agent as shipped. Only the stock-stack baseline (``mb_baseline.py``) wants that: every
+        # generator here drives a pinned target pose, and the override is precisely the thing we
+        # added to make that possible -- so a baseline that kept it would not be a baseline. It
+        # also fails loudly rather than subtly without one: the override reads
+        # ``_active_target_qpos``, which ``set_target_pose`` sets and a stock run never does.
+        if pose_override:
+            self.agent._generate_target_joint_transforms = types.MethodType(
+                target_pose_override, self.agent)
         self.agent._capture_kf = bool(capture_keyframes)
         self.agent._captured_kf = []
         self.agent.BYPASS_SPRING_MODEL = True          # our exact per-frame target position, not the spring

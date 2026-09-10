@@ -34,7 +34,7 @@ Run::
 
     # 2. look, pick, generate
     python scripts/rsl_rl/stitch_lab.py --stage view --out /tmp/stitch \\
-        --stride-bank mb_raw/lib_v6e/stride_bank.npz \\
+        --stride-bank mb_raw/lib_v6f/stride_bank.npz \\
         --mb-root /home/zolkin/AmberLab/Project-Isaac-RL/GR00T-WholeBodyControl/motionbricks
 """
 
@@ -600,7 +600,7 @@ def main() -> int:
     p.add_argument("--approach-dist", type=float, default=4.0)
     p.add_argument("--exit-dist", type=float, default=4.0)
     # generation
-    p.add_argument("--stride-bank", default="mb_raw/lib_v6e/stride_bank.npz")
+    p.add_argument("--stride-bank", default="mb_raw/lib_v6f/stride_bank.npz")
     p.add_argument("--mb-root",
                    default="/home/zolkin/AmberLab/Project-Isaac-RL/GR00T-WholeBodyControl/motionbricks",
                    help="ABSOLUTE: the default is relative in the batch driver and wrong from a worktree.")
