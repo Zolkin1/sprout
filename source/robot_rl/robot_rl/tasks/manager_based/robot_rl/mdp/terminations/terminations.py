@@ -347,14 +347,22 @@ def fm_tracking_violation_termination(
     zero = torch.zeros(1, dtype=torch.long, device=env.device)
     pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(zero)
     jp, _ = cmd.get_future_joint_state(zero)
-    d = robot.data
+    # **`robot.data`'s buffers are WARP arrays here and must be converted.** `eval.accumulate`
+    # reads them through a `_Data` shim that calls `wp.to_torch` on every attribute access, so
+    # copying its accessor NAMES without its shim gets a `vec3f` where a tensor is wanted and
+    # raises inside `tracking_error`'s first subtraction -- at the first step of collection,
+    # after the simulator has launched. Every other termination in this file converts
+    # explicitly (see `base_height_below_termination`), which is the idiom.
+    #
     # `root_link_*`, NOT `root_lin_vel_w`: the latter is the CoM twist. The same choice as
     # `eval.accumulate`, and mixing the two would put a systematic offset on the velocity
     # term in one place only.
     err = tracking_error(
         pos_w[:, 0], quat_w[:, 0], lin_w[:, 0], ang_w[:, 0], jp[:, 0],
-        d.root_pos_w, d.root_quat_w, d.root_link_lin_vel_w, d.root_link_ang_vel_w,
-        d.joint_pos)
+        wp.to_torch(robot.data.root_pos_w), wp.to_torch(robot.data.root_quat_w),
+        wp.to_torch(robot.data.root_link_lin_vel_w),
+        wp.to_torch(robot.data.root_link_ang_vel_w),
+        wp.to_torch(robot.data.joint_pos))
     hit = violates(err, sp)
     # THE GATE IS REQUIRED, not optional. `_pred_valid` is allocated only when the command has
     # a generator (`fm_enabled`); on the clip arm `_post_init` returns before that, so a
