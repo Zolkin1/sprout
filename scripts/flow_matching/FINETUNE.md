@@ -77,9 +77,44 @@ course (a single wide step, no mjeval twin) and the **randomised free-form secti
 still holds the shared foundation every course above is built on -- spawn areas, the route block,
 the goal geometry -- and only its section FAMILIES are deprecated.
 
-Rebuild any of them from the command `run_quick_eval.sh` prints when the file is missing, and
-`scripts/rsl_rl/terrain_axis.py --clip <lib> --values` reads the axis back off the library so
-no reducer is ever handed a hand-typed one.
+### Rebuilding them
+
+Every command below was run on 2026-09-09 and reproduced the fingerprint beside it. `LIKE` is
+the source library whose CHANNEL LAYOUT is copied -- no motion is copied, and the FM
+checkpoint's `frame_names` are checked against the ee frames resolved from the library's own
+channel names, so the minimal layout admits only a generator with no extra frames.
+
+```bash
+LIKE=clips/g1_mb_v5_body_mode11_decor.h5     # 6.7 GB; on talos it is under bestofk_p4/clips
+
+# two-box: the training grid (5 tiles) + holdout, then the 2-tile eval grid
+python scripts/rsl_rl/make_box2_terrain.py --out_dir clips --prefix box2_v2spawn \
+    --variant v2 --like $LIKE                            # d6e71e0d1c77 / d0154f365c49
+python scripts/rsl_rl/make_box2_terrain.py --out_dir clips --prefix box2_v2spawn_quick \
+    --variant v2 --train_distances 1.5 3.0 --like $LIKE   # 735d39f57cac
+
+# up-into-down. --runout 3.0 is NOT the default: it is the variant these results used, and it
+# gets its own family because more ground past the bottom riser is more chances to fall.
+python scripts/rsl_rl/make_step_courses_terrain.py --course updown --platform_depth 2.0 \
+    --runout 3.0 --out_dir clips --like $LIKE             # 113b552f9e19 / edde0931a5d7
+
+# the varied multi-terrain set
+python scripts/rsl_rl/make_varied_terrain.py --out_dir clips --prefix varied60 \
+    --boxes 30 --updown 30 --like $LIKE                   # 1149eae02028 / b21be22109d1
+
+# the in-distribution control: real clip-library tiles, routes authored over them
+python scripts/rsl_rl/make_indist_routes.py --source $LIKE --out_dir clips --prefix indist
+                                                          # 8ffdcba61db7
+```
+
+Each also writes its `goal_regions.json` (`--goals`, defaulting to the path its course already
+uses). That matters because `logs/` is GITIGNORED, so a hand-kept spec does not travel with a
+git sync -- talos once held a stale `height_tol_m: 0` after a pull, which is the value that
+mistrained an arm for five iterations.
+
+`scripts/rsl_rl/terrain_axis.py --clip <lib> --values` reads the per-tile axis back off the
+library, so no reducer is handed a hand-typed one; `varied` and `indist` have no scalar axis
+and it correctly returns nothing.
 
 ## Running it
 
