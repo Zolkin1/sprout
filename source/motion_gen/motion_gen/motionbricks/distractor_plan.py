@@ -53,6 +53,33 @@ def profile_cmd(spec: dict):
     raise ValueError(f"unknown distractor profile kind {kind!r}")
 
 
+def profile_holds(spec: dict) -> list[tuple[float, tuple[float, float, float]]]:
+    """A profile dict -> its STEADY phases ``[(duration_s, (vx, vy, wz))]``.
+
+    This is what the loops-and-in-betweening generator wants, and it is deliberately NOT
+    :func:`profile_segs`.  That function discretizes a stop's deceleration into ``_RAMP_STEPS``
+    piecewise-constant commands, which was right when Motion Bricks generated the whole motion by
+    tracking a command schedule.  Under "every command change is an in-betweening" those six steps
+    would become six chained transients -- four to twelve seconds of pure in-betweening inside a six
+    second clip -- and the family would have no steady motion left at all.
+
+    A stop is ONE change: walk, then stand.  The deceleration between them is exactly the transient
+    Motion Bricks is for.  The six-step ramp survives only as the RL-visible ``target_vel``, via
+    :func:`profile_cmd`, which is unchanged.
+    """
+    kind = str(spec["kind"])
+    secs = float(spec["secs"])
+    vx = float(spec.get("vx", 0.0))
+    if kind == "straight":
+        return [(secs, (vx, 0.0, 0.0))]
+    if kind == "turn":
+        return [(secs, (vx, 0.0, float(spec.get("wz", 0.0))))]
+    if kind == "stop":
+        t_stop, ramp_s = float(spec["t_stop"]), max(1e-6, float(spec["ramp_s"]))
+        return [(max(0.0, t_stop - ramp_s), (vx, 0.0, 0.0)), (max(0.0, secs - t_stop), (0.0, 0.0, 0.0))]
+    raise ValueError(f"unknown distractor profile kind {kind!r}")
+
+
 def profile_segs(spec: dict) -> list[tuple[float, float, float, float]]:
     """A profile dict -> piecewise-constant ``[(duration_s, vx, vy, wz)]`` for the Motion Bricks driver.
 

@@ -873,6 +873,12 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         # Height scan is a 176-vector per step: too wide for the CSV, so it streams to a
         # sibling .npy (<log>.scan.npy) that the sim2sim comparison loads alongside.
         scan_rows: list[np.ndarray] = []
+        # Per-step DEPTH images, the exteroception a depth policy actually consumes. Streamed
+        # to a sibling .npy for the same reason the scan is: far too wide for the CSV. Without
+        # it a sim2sim divergence cannot be attributed -- the depth cameras are the most
+        # likely place for the two simulators to disagree and were the one signal not
+        # recorded anywhere.
+        depth_rows: list[np.ndarray] = []
         # Per-step FM predicted WINDOW (root + extra frames), so a viewer can replay what the
         # generator actually emitted at each step rather than only the one frame that was
         # applied. Padded with NaN before the generator has a valid prediction.
@@ -883,7 +889,14 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                          "ref_pos_x", "ref_pos_y", "ref_pos_z", "act_pos_x", "act_pos_y", "act_pos_z",
                          "ref_roll", "ref_pitch", "ref_yaw", "act_roll", "act_pitch", "act_yaw",
                          "base_z", "fell",
-                         *[f"tau_{n}" for n in isaac], *jp_cols, *ee_cols])
+                         *[f"tau_{n}" for n in isaac],
+                         # The COMMANDED joint target the servo tracks, i.e. the policy's
+                         # action after scaling and the default-pose offset. Logged because
+                         # jpref/jpact only show the reference and the outcome -- neither
+                         # says what the policy actually asked for, which is the first thing
+                         # to look at when a joint does not follow.
+                         *[f"ctrl_{n}" for n in isaac],
+                         *jp_cols, *ee_cols])
         # Sidecar metadata for the metrics module (joint order + effort limits + EE frames).
         log_meta = {"joint_names_isaac": isaac, "effort_limits": effort_limits,
                     "ee_frame_names": ee_names, "dt": policy.get_dt(),
@@ -1046,6 +1059,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         inv_root = quat_inv(rq)
         lin_b = quat_apply(inv_root, np.asarray(state["root_lin_vel_w"], dtype=np.float64))
         torques = [float(robot.mj_data.actuator_force[a]) for a in act_ids]
+        ctrls = [float(robot.mj_data.ctrl[a]) for a in act_ids]
         # Per-joint FM reference vs actual (isaac order).
         jp_vals = [v for i in range(len(isaac)) for v in (ref_jp[i], act_jp[i])]
         # Per-EE FM reference vs actual position, expressed in the current base frame.
@@ -1059,6 +1073,10 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                 ee_vals += [rb[0], rb[1], rb[2], ab[0], ab[1], ab[2]]
         if "height_scan" in state:
             scan_rows.append(np.asarray(state["height_scan"], dtype=np.float32).ravel())
+        if "depth" in state:
+            # (num_cameras, H*W) NORMALISED exactly as the policy sees it, so a diff against
+            # the Isaac side compares the observation rather than raw metres.
+            depth_rows.append(np.asarray(state["depth"], dtype=np.float32))
         f_len, k_fr = int(policy.ctx.F), len(ee_names)
         # Per-step predicted WINDOW sidecars: the same lift + FK draw_viz uses, over EVERY
         # node (the viewer may stride, a replay should not).
@@ -1076,7 +1094,7 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
                          float(ref_rpy[0]), float(ref_rpy[1]), float(ref_rpy[2]),
                          float(act_rpy[0]), float(act_rpy[1]), float(act_rpy[2]),
                          float(root_pos[2]), int(robot.failed()),
-                         *torques, *jp_vals, *ee_vals])
+                         *torques, *ctrls, *jp_vals, *ee_vals])
 
     def draw_viz(viewer, state: dict) -> None:
         """Populate ``user_scn`` with the sensor hits + FM root/feet spheres + velocity arrows."""
@@ -1303,6 +1321,11 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
             scan_path = f"{log_path}.scan.npy"
             np.save(scan_path, np.stack(scan_rows))
             print(f"[INFO] Wrote {len(scan_rows)} height-scan rows to {scan_path}")
+        if depth_rows:
+            depth_path = f"{log_path}.depth.npy"
+            np.save(depth_path, np.stack(depth_rows))
+            print(f"[INFO] Wrote {len(depth_rows)} depth frames "
+                  f"{np.stack(depth_rows).shape} to {depth_path}")
         if pred_rows:
             np.save(f"{log_path}.pred.npy", np.stack(pred_rows))
             np.save(f"{log_path}.predf.npy", np.stack(predf_rows))
@@ -1481,6 +1504,15 @@ def main() -> None:
     parser.add_argument("--spawn_z_offset", type=float, default=0.03,
                         help="Metres to raise the spawn pelvis above the standing-config height "
                              "(optimizer frame sits ~3 cm below the MuJoCo foot-contact height).")
+    parser.add_argument("--cmd_horizon", choices=("hold", "tail"), default="hold",
+                        help="How the live command fills the FM's F-node command horizon. "
+                             "'hold' (default) stamps it on every node -- the whole horizon "
+                             "jumps at once, which is NOT a shape training ever saw. 'tail' "
+                             "injects it at the last node and marches it forward one node per "
+                             "control step, reproducing the interior transition the clip's "
+                             "target_vel produces. Costs ~F steps (~1.2 s) of response lag. "
+                             "Ignored during a clip handoff, which feeds the true future "
+                             "command instead.")
     parser.add_argument("--cmd_max_acc", type=float, default=0.0,
                         help="Velocity-command rate limit (m/s^2, rad/s^2) on the live command. "
                              "DEFAULT 0 = DISABLED: the raw joystick/profile command passes "
@@ -1668,7 +1700,9 @@ def main() -> None:
     # clip reference, so the generator is optional -- this is how a pure clip-tracking
     # teacher (which has no fm.onnx) is played in MuJoCo. Every other mode (joystick/eval,
     # or a clip->FM handoff) needs the generator.
-    clip_only = bool(args.clip) and args.clip_handoff_time is None
+    # A NEGATIVE handoff time also means clip-only: run_clip_loop documents "<0 never hands
+    # off", so requiring an fm.onnx for it demanded a generator that is provably never used.
+    clip_only = bool(args.clip) and (args.clip_handoff_time is None or args.clip_handoff_time < 0)
     if not os.path.exists(tracker_onnx):
         sys.exit(f"[ERROR] Missing {tracker_onnx}. Export with export_tracker_onnx.py first.")
     if clip_only:
@@ -1710,6 +1744,11 @@ def main() -> None:
     # default this line is the only thing standing between "the generator is on the GPU" and
     # a 5x-slower run that never said so.
     print(f"[INFO] onnxruntime providers: {policy.active_providers()}")
+    policy.set_command_horizon_mode(args.cmd_horizon)
+    if args.cmd_horizon != "hold":
+        print(f"[INFO] command horizon = {args.cmd_horizon}: a new command enters at node "
+              f"F-1 and reaches node 0 after {policy.ctx.F} steps "
+              f"({policy.ctx.F * policy.get_dt():.2f} s).")
 
     robot = Robot(robot_name=args.robot_name, scene_name=args.scene,
                   joystick_scaling=np.ones(3), input_function=lambda t: np.zeros(3),

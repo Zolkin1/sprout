@@ -521,6 +521,10 @@ def assemble_clip_terrain(
     num_flat_tiles: int | None = None,
     col_gap: float = 1.0,
     row_gap: float = 2.0,
+    # Keep these in step with ClipTerrainImporterCfg, which is what the live path passes; a
+    # direct caller relying on the signature default should get the same terrain the RL sees.
+    # See that class for why size_margin is 1.0 and why raising it needs the wall-footprint
+    # guard plus a decorate_terrain.py re-run first.  TODO(tile-margin).
     size_margin: float = 1.0,
     flat_buffer: float = DEFAULT_FLAT_BUFFER,
     transition_back_buffer: float = 1.0,

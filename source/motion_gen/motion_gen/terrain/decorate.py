@@ -77,11 +77,10 @@ class DecorateConfig:
         seed: Base seed. The RNG is re-derived per tile from ``seed`` and ``terrain_id`` so a
             tile's result does not depend on how many tiles preceded it.
         arm_weights: Probability of each entry of :data:`ARMS`.
-        tread_full_frac: Fraction of ``wide_stairs`` tiles taken all the way to the tile
-            width rather than to an intermediate one. Without it, uniform sampling almost
-            never produces the full-width case, which is the one that stops the FM
-            overfitting to thin flights.
-        min_tread_m: A widened tread is never asked to be narrower than this.
+        min_tread_m: The narrow end of the stair-width band (m). Every flight is at least
+            this wide.
+        max_tread_m: The wide end of the band (m). A flight is only ever taken past it to
+            keep a foot on the surface, which the traversal envelope never requires.
         clearance_m: Slack left inside the tile edge when a surface is grown to it.
         box_variant_fracs: How the box tiles' overlays are split across
             :data:`BOX_VARIANTS`. Must sum to 1.
@@ -108,8 +107,12 @@ class DecorateConfig:
 
     seed: int = 0
     arm_weights: tuple[float, float, float] = (1 / 3, 1 / 3, 1 / 3)
-    tread_full_frac: float = 0.30
-    min_tread_m: float = 0.80
+    # The band of stair widths to train on: 4 ft to 8 ft, which is what real stairwells are
+    # (the ones measured for this robot are 4, 5 and 7 ft). Every flight lands inside it --
+    # `tread_full_frac`, which used to send 30% of flights all the way to the tile edge, is
+    # gone with the whole-tile arm it served.
+    min_tread_m: float = 1.219   # 4 ft
+    max_tread_m: float = 2.438   # 8 ft
     clearance_m: float = 0.02
     box_variant_fracs: tuple[float, float, float, float] = (0.40, 0.20, 0.20, 0.20)
     box_widen_frac: float = 0.55
@@ -161,23 +164,32 @@ def has_width_variation(manifest: list[dict], kind: str = "transition",
     attribute one, and this is the structural half -- it still works on a manifest that has
     been copied out of its file, and it cannot be fooled by an attribute somebody set by hand.
 
+    The test is ROLE-FREE, and has to be. Roles are classified by width and this pass changes
+    widths, so re-deriving them from a decorated manifest inspects the wrong overlays --
+    exactly what :func:`classify_overlays`' docstring warns about. The earlier version did that
+    and only worked by accident, because widened treads happened to read back as
+    not-quite-full-width platforms; once the treads were capped at the stair-width band, every
+    overlay on a narrowed tile read as a tread and the whole manifest reported no variation.
+
+    What is true regardless of roles: straight out of generation EVERY transition tile carries
+    at least one overlay exactly ``size_y`` wide, because that is what the generators force.
+    A tile with none has been narrowed.
+
     Args:
         manifest: The tile list.
         kind: Tile ``type`` to inspect.
         tol: Two widths within this are the same width (m).
 
     Returns:
-        ``True`` if any platform on any tile of that type is not its tile's full width.
+        ``True`` if any tile of that type has no full-width overlay left.
     """
     for tile in manifest:
         if tile.get("type") != kind:
             continue
         size_y = float(tile["size_y"])
-        for overlay, role in zip(tile["overlays"], classify_overlays(tile)):
-            if role != "platform":
-                continue
-            if abs(float(overlay["size_xyz"][1]) - size_y) > tol:
-                return True
+        widths = [float(o["size_xyz"][1]) for o in tile["overlays"]]
+        if widths and not any(abs(w - size_y) <= tol for w in widths):
+            return True
     return False
 
 
@@ -711,37 +723,75 @@ def decorate_transition_tile(tile: dict, footprint: TileFootprint,
     report.tread_before = [float(o["size_xyz"][1]) for o in treads]
     report.platform_before = [float(o["size_xyz"][1]) for o in platforms]
 
-    if arm in ("narrow_landing", "matched"):
-        for overlay in platforms:
-            old_lo, old_hi = span(overlay)
-            # Narrow INTO the existing platform: never grow it, and never past the envelope.
-            _resize_y(overlay, max(old_lo, env_lo), min(old_hi, env_hi),
-                      must_contain=(env_lo, env_hi), widening=False)
+    # ONE CENTRE for the flight and its platforms, and the platforms are never narrower than the
+    # flight. Before this the two were placed against DIFFERENT envelopes -- treads about their own
+    # flight centre, platforms narrowed into the whole-clip envelope -- so they drifted apart:
+    # measured on g1_mb_v6c, a median 0.190 m centre offset (max 0.742) with the platform NARROWER
+    # than the stair on 3 of 66 tiles. A staircase stepping onto a landing that is offset from it,
+    # or narrower than it, is not a thing the robot should be asked to walk.
+    #
+    # The centre is the TRAVERSAL envelope's, because that is where the feet actually cross the
+    # treads. Forcing the platform to share it costs width -- it has to reach twice the larger half
+    # of an asymmetric approach envelope -- and that is the right direction to overpay in: a wider
+    # landing is always safe, a narrower one drops a foot.
+    centre = sum(footprint.tread_envelope()) / 2.0
 
-    if arm in ("wide_stairs", "matched"):
-        # One target span for every tread on the tile, so a flight stays a flight.
-        union_lo = min(span(o)[0] for o in treads) if treads else env_lo
-        union_hi = max(span(o)[1] for o in treads) if treads else env_hi
-        need_lo, need_hi = min(union_lo, env_lo), max(union_hi, env_hi)
+    if treads:
+        # EVERY flight lands inside [min_tread_m, max_tread_m] -- the band of real stair widths
+        # the robot is to be trained on. The arm chooses WHERE in the band; it no longer chooses
+        # whether the flight is in it at all, and no arm reaches the whole tile any more.
+        #
+        # The floor a flight must carry is its TRAVERSAL envelope, not the whole clip's. Measured
+        # on the v6b build: the feet that are actually on the treads span 0.35 m median / 0.56 m
+        # max per tile, while the whole-clip union over a tile's 50 clips is 2.51 m. The extra is
+        # the approach and exit wandering ~1 m BETWEEN clips on the flat platforms -- which the
+        # platforms carry, and which is why sizing a flight from `env_lo/env_hi` made every
+        # staircase about four times wider than anything ever walked on it.
+        tread_lo, tread_hi = footprint.tread_envelope()
+        need_lo = max(0.0 + cfg.clearance_m, min(tread_lo, env_hi))
+        need_hi = min(size_y - cfg.clearance_m, max(tread_hi, env_lo))
+        if need_hi - need_lo <= 0.0:
+            raise ValueError(
+                f"terrain {tile['terrain_id']}: the traversal foot envelope "
+                f"[{tread_lo:.3f}, {tread_hi:.3f}] does not intersect the tile "
+                f"[0, {size_y:.3f}]."
+            )
+
         if arm == "matched":
-            target_lo, target_hi = need_lo, need_hi
+            width = cfg.min_tread_m          # flight and narrowed landing end up alike
         else:
-            full_lo, full_hi = 0.0 + cfg.clearance_m, size_y - cfg.clearance_m
-            if rng.random() < cfg.tread_full_frac:
-                target_lo, target_hi = full_lo, full_hi
-            else:
-                # Somewhere between "just covers what it must" and the whole tile.
-                t = float(rng.random())
-                target_lo = need_lo + (full_lo - need_lo) * t
-                target_hi = need_hi + (full_hi - need_hi) * t
-            if target_hi - target_lo < cfg.min_tread_m:
-                mid = (target_lo + target_hi) / 2.0
-                target_lo, target_hi = mid - cfg.min_tread_m / 2, mid + cfg.min_tread_m / 2
+            width = float(rng.uniform(cfg.min_tread_m, cfg.max_tread_m))
+        # The band is a target, never a promise to under-run the feet or over-run the tile.
+        width = min(max(width, need_hi - need_lo), size_y - 2.0 * cfg.clearance_m)
+
+        # Centred on the traversal feet, then slid by the least that keeps it inside the tile.
+        target_lo = centre - width / 2.0
+        target_lo = min(max(target_lo, need_hi - width), need_lo)
+        target_lo = min(max(target_lo, cfg.clearance_m), size_y - cfg.clearance_m - width)
+        target_hi = target_lo + width
+
         for overlay in treads:
-            old_lo, old_hi = span(overlay)
-            _resize_y(overlay, min(target_lo, old_lo), max(target_hi, old_hi),
-                      must_contain=(min(need_lo, old_lo), max(need_hi, old_hi)),
-                      widening=True)
+            # widening=False: a flight may now SHRINK, and the check that keeps it honest is
+            # that it still covers the feet that walked on it.
+            _resize_y(overlay, target_lo, target_hi,
+                      must_contain=(need_lo, need_hi), widening=False)
+
+    # The platforms, AFTER the flight, so its final span is known and can be a floor. They carry
+    # the approach and exit wander (the whole-clip envelope), the flight does not.
+    if platforms:
+        flight_lo, flight_hi = ((min(span(o)[0] for o in treads), max(span(o)[1] for o in treads))
+                                if treads else (env_lo, env_hi))
+        c = (flight_lo + flight_hi) / 2.0 if treads else centre
+        # Half-width that (a) covers the flight, (b) covers the whole-clip feet about the SAME
+        # centre. Widening the narrow side rather than re-centring is what keeps them aligned.
+        half = max(flight_hi - c, c - flight_lo, env_hi - c, c - env_lo)
+        if arm == "wide_stairs":
+            # This arm leaves the landings alone; it only has to satisfy the two floors.
+            half = max(half, *( [max(span(o)[1] - c, c - span(o)[0]) for o in platforms] or [0.0] ))
+        half = min(half, min(c - cfg.clearance_m, size_y - cfg.clearance_m - c))
+        for overlay in platforms:
+            _resize_y(overlay, c - half, c + half,
+                      must_contain=(max(env_lo, c - half), min(env_hi, c + half)), widening=False)
 
     report.tread_after = [float(o["size_xyz"][1]) for o in treads]
     report.platform_after = [float(o["size_xyz"][1]) for o in platforms]

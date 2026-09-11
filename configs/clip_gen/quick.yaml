@@ -1,0 +1,228 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# SMOKE recipe for scripts/rsl_rl/generate_mb_library.py: the full chain end to end at ~1 minute,
+# for checking that a generation change actually lands before spending hours on it.
+#
+# Deliberately a complete standalone file rather than a diff against g1_mb_v6.yaml. This used to be
+# a --quick FLAG that mutated a handful of values in code, which silently missed every knob added
+# after it was written -- --pure-stair-tiles among them, so a "quick" run built 15 pure tiles per
+# direction. A recipe that is a tracked file cannot fall out of step with itself that way.
+#
+# ONLY the scale differs from g1_mb_v6.yaml. Every distribution parameter is identical, so what this
+# measures is what the full run will produce.
+
+# ---------------------------------------------------------------- reproducibility
+seed: 0
+
+# ---------------------------------------------------------------- scale (the only difference)
+clips_per_tile: 4
+stair_tiles: 2                 # TRANSITION stair tiles per direction (up/down)
+pure_stair_tiles: 2
+box_tiles: [2, 0, 1]        # jump_on, jump_off, jump_off_front. jump_off is 0 to
+                              # match the full recipe -- a smoke build that exercises a
+                              # family the real one no longer produces is not a smoke test
+                              # of the real build.         # jump_on, jump_off, jump_off_front
+# The 20 tiles the distractor family used to hold went to TERRAIN, because a tile is how the RL and
+# the FM see geometry: each one carries its own corridor width, platform widths, step count,
+# floor-or-void and box height, and the importer round-robins envs over tiles. That is independent of
+# how many solved MOTION cells exist -- 26 stair tiles replaying 8 (riser, tread) cells still present
+# 26 different staircases to the camera. Transition stairs +6 per direction, jump_on +4,
+# jump_off_front +4; flat, pure stairs and jump_off unchanged. Still 200 tiles x 50 clips.
+#
+# jump_off is NOT grown: it is in DEFAULT_SKIP_FAMILIES (it drops BACKWARDS off a box and no
+# forward-facing camera sees it), so the generator never trains on it. It is not cut either -- the
+# teacher does train on it and C++ clip playback keeps the family.
+flat_tiles: 4
+
+# ---------------------------------------------------------------- flat family
+flat_loops: true              # exact looped strides + bounded MB transients
+flat_hold_s_range: [1.5, 4.0]  # s of STEADY loop per segment, before rounding to a gait phase
+flat_vx_range:  [-1.0, 2.5]    # THE DRIVER'S ENVELOPE, sampled continuously and uniformly. Not
+flat_vy_range:  [-0.6, 0.6]    # what the solved library can serve -- the motion is whichever stride
+flat_wz_range:  [-0.8, 0.8]    # is nearest, and the recorded command is the continuous value. A
+                               # generator only ever commanded speeds it had motions for cannot learn
+                               # to SELECT, and driving it then needs exactly those velocities, which
+                               # no real driver produces. At most one of vy / wz is non-zero.
+flat_mass_stand:    0.08       # declared probability of an exact stop
+flat_mass_sidestep: 0.10       # declared pure-lateral mass at vx = 0. DECLARED, because it used to be
+                               # an emergent 12.8% of flat time: the old sidestep mode set vx = 0 as a
+                               # side effect, so nobody had chosen how much mass sat at zero.
+flat_strata_width:  0.2        # variance-reduction bookkeeping ONLY -- it quantizes nothing, since a
+                               # draw is uniform WITHIN its stratum. 18 strata over [-1.0, 2.5].
+flat_speed_quota:   stratified # stratified | iid. Same distribution; iid is the honest ablation.
+flat_ramp_dv: 1.4              # max speed change per single in-betweening; bigger is split
+flat_a_max: 1.15               # m/s^2; peak accel measures ~1.75x this
+flat_alpha_max: 1.15           # rad/s^2, the flat transients' YAW bound. Its own key because
+                               # it used to be read off flat_a_max, which is m/s^2 -- so the two
+                               # could not be moved independently. 1.15 is what v6f was built with.
+flat_min_transient_s: 0.35
+flat_hop_slack: 1.15
+flat_clip_length: 20.0
+
+# ---------------------------------------------------------------- stair families
+stair_vel_range: [0.2, 2.5]
+stair_allow_non_converged: true   # keep in sync with g1_mb_v6.yaml; see it for the reasoning
+stair_floor_frac: 0.5
+stair_float_frac: 0.3
+stair_float_thick_range: [0.03, 0.06]
+pure_seconds: 6.0
+
+# ---------------------------------------------------------------- box families
+box_vel_range: [0.2, 2.5]
+box_top_vx_range: [0.2, 1.0]
+box_two_sided_frac: 0.5
+box_nav_width: -1.0
+backward_vx_max: 1.0
+
+# ---------------------------------------------------------------- shared terrain knobs
+steady_approach_frac: 0.5
+# The approach/exit are always [exact loop][bounded transient]; there is no other
+# path, so there is no bounded_approach switch. The --ramp-s / --pin-cmd / --pin-lead
+# knobs that used to sit here were inert on every driver run and are deleted.
+approach_a_max: 2.0
+approach_min_transient_s: 0.35
+approach_hop_slack: 1.3
+gen_attempts: 6                 # seeds to try before giving up on one in-betweening. The pose-pinned
+                                # terrain generation occasionally diverges on a particular draw --
+                                # neighbours with identical endpoints come out clean -- so a retry is
+                                # the cheap fix. Every approach used to share ONE seed, so a diverged
+                                # request diverged permanently and shipped a 30 m/s segment.
+
+# ---------------------------------------------------------------- RL-visible command
+terrain_cmd_changes_per_side: 2   # command changes during the lead-up / trail-away. 0 = the
+terrain_cmd_segments: 1           # TRANSITION traversals: single segment and STRAIGHT (see g1_mb_v6.yaml)
+terrain_cmd_vy_range: [0.0, 0.0]  # zero on transitions; pure stairs carry lateral/yaw instead
+terrain_cmd_wz_range: [0.0, 0.0]
+                                  # there: both channels were identically zero on every terrain clip,
+                                  # so the generator had never been asked to turn while a staircase
+                                  # was under it and could not learn that the answer is to keep
+                                  # climbing. At most one of the two is non-zero per segment. When a
+                                  # diagonal or turning stair gait is solved it slots in without
+                                  # changing this: it arrives as another candidate reference and the
+                                  # Voronoi cell starts splitting on it.
+                                  # fixed replay and this changes none of it -- only target_vel -- but
+                                  # a generator only ever commanded its reference's own speed cannot
+                                  # learn that a command SELECTS a reference. Every value is drawn
+                                  # inside that reference's Voronoi cell, so the command may disagree
+                                  # with the motion but never points at a different one.
+                                  # pre-step-8 single hold. A CEILING: the travel budget decides how
+                                  # many steady stretches actually fit. Each change is one extra MB
+                                  # generation per clip, so 2 is ~3x the stage-b cost of 0.
+pure_cmd_segments: 2              # pure stairs are the ONLY place lateral/yaw is on terrain
+pure_cmd_vy_range: [-0.6, 0.6]
+pure_cmd_wz_range: [-0.8, 0.8]
+pure_cmd_p_straight: 0.25
+# ---------------------------------------------------------------- terrain BOUNDARY transients
+# How the two in-betweenings that join the flat walk to the replay are generated. Settled by
+# generating one hand-off many ways and looking at it (scripts/rsl_rl/stitch_lab.py).
+terrain_free_root: true           # drop the positional pin on both boundary transients and let
+                                  # Motion Bricks own the root motion. terrain_splice.align_boundary
+                                  # rigidly re-places the segment afterwards, so the absolute root it
+                                  # produced is discarded -- what the pin really fixed was the
+                                  # DISPLACEMENT, and pinning that fought the pose target (the pose
+                                  # window is the replay's opening frames, which are MOVING, while a
+                                  # fixed carrot is a point the model decelerates into). Measured on
+                                  # one hand-off: foot drag -159 -> -15 mm and arrival speed 0.56 ->
+                                  # 1.44x of the replay's entry speed.
+terrain_alpha_max: 2.0            # yaw-acceleration bound (rad/s^2) for the terrain
+                                  # in-betweenings. ONE value serves the boundary and the
+                                  # interior -- mb_terrain_segments has a single
+                                  # --alpha-max where the linear bound is split into
+                                  # --a-max / --flat-a-max -- so it cannot be tuned per hop
+                                  # without splitting that flag first.
+terrain_transient_tokens: 10      # force the horizon (0 = let hop_tokens derive it). The derived
+                                  # band routinely COLLAPSES -- n_min == n_max == 6 on the measured
+                                  # hand-off -- so Motion Bricks' own 6..16 token head is masked to a
+                                  # single option and its prediction is discarded. 10 was chosen by
+                                  # eye. It is tuned to ~0.8 m/s: the exit velocity ratio drifts 0.71
+                                  # to 1.47x across the 0.2-2.5 band, so this wants revisiting when
+                                  # the stair trajectories are re-solved.
+terrain_exit_swing_clear: -0.01   # the EXIT gate's swing-foot lower bound (m), NEGATIVE so a
+                                  # near-level hand-off qualifies. The shared swing_clear (+0.075)
+                                  # forces the exit a third of a stride past the landing; judged by
+                                  # eye the near-level frames were better and the gate's own pick was
+                                  # worst. The velocity ratio ranks them the OTHER way (1.01x vs
+                                  # 0.74x), so this follows the eye over the metric on purpose.
+
+min_hold_m: 1.5                   # shortest steady stretch (m) a hold may be. Below a gait cycle a
+                                  # "hold" is not steady, and loop_frames_for rounds it UP -- which
+                                  # overruns the travel budget and pushes terrain past the platform.
+segment_reuse: false            # share a generated MB segment between clips with identical
+                                # conditioning. OFF: with per-clip schedules two clips are only
+                                # interchangeable if their whole schedules match, and ~1.5x the
+                                # segment cost buys "every clip's motion was generated for it"
+
+# ---------------------------------------------------------------- terrain tile geometry (pass A)
+# The tile POPULATION and the gait phase each clip hands off at. Distribution parameters in the
+# same sense the velocity bands are -- these used to reach a build only through mb_plan_library's
+# argparse defaults, i.e. from a second place, which is the thing this file exists to prevent.
+n_steps_range: [2, 7]            # 2 is the smallest a periodic stair reference can express
+tile_width_range: [0.8, 1.2]     # corridor width (m) per transition tile
+entry_pick: sample               # which boundary-gate candidate the terrain entry hands off at.
+                                 # 'sample' varies the gait phase per clip; a fixed preference
+                                 # gives every clip sharing a reference the identical hand-off pose
+exit_pick: first                 # stop as soon as a foot lands on the far surface -- never onto a
+                                 # phantom tread past the end of the tile
+contact_tol: 0.02                # m; sole-to-surface tolerance for a boundary candidate
+swing_clear: null                # m; null derives it from the riser (min(0.05, 0.5*riser))
+swing_band: null                 # m; null derives it from the riser (max(0.5*riser, clear+0.05))
+footprint_margin: 1.0            # m added on all four sides of a tile's footprint
+
+# ---------------------------------------------------------------- approach/exit travel budget (m)
+# Stated in seconds and converted to a DISTANCE at each clip's own speed, then clamped in metres.
+# A fixed distance makes a slow clip take proportionally longer (6 m at 0.2 m/s is 30 s); a fixed
+# duration is what made the tile geometry speed-dependent -- platforms were duration x the tile's
+# fastest clip, so a 3.5 s budget at 2.6 m/s authored a 10.1 m platform on BOTH ends of every
+# transition tile. The clip keeps a duration; the tile only ever sees metres.
+approach_flat_s_range: [1.5, 4.0]   # s of flat lead-in before the approach zone
+exit_flat_s_range: [1.5, 4.0]       # s of flat trail-away after the terrain
+flat_dist_clamp: [1.0, 6.0]         # m; bounds the converted distance at both ends of the band.
+box_top_dist_clamp: [2.25, 3.5]     # m of walking on a box TOP, clamped separately from the ground.
+                                    # A box top is the solved reference's own footprint, not a lead-in:
+                                    # budgeting it like flat ground authored 3-4 m up there, which at
+                                    # 0.2 m/s is 21 s against a 20 s clip ceiling.
+                                    # The FLOOR is not free: an elevated exit gets no approach zone, so
+                                    # this is the whole surface, and it must clear the exit transient
+                                    # (~0.5 m) plus one gait cycle (~0.7 m) or the clip ends with no
+                                    # steady stretch on the box at all. At 0.75 m three jump_on clips
+                                    # did exactly that.
+                                    # Widened 4.0 -> 6.0 for the command variation: after the 2 m
+                                    # approach zone a 4 m flat lead-in can rarely fund a SECOND
+                                    # steady stretch (one gait cycle plus the in-betweening that
+                                    # reaches it), so only 8 of 32 quick-build plans got a command
+                                    # change. At 6.0 that is 17 of 32. Measured cost: terrain tile
+                                    # size_x p50 7.98 -> 9.07 m (+14%), max 18.13 -> 22.30. Step 6
+                                    # had already taken 30-40% off the fast stair tiles by dropping
+                                    # the speed term, so this spends part of that back deliberately.
+dist_step: 0.25                     # m quantization, so segments can still be shared
+platform_buffer_m: 1.0              # m of walkable surface past the nominal travel, so the
+                                    # reference cannot walk off the far edge
+
+# ---------------------------------------------------------------- the splice (pass C)
+seams: ease                      # 'ease' inertializes the seam residual, 'weld' takes it rigidly,
+                                 # 'auto' follows whatever stage 1 pinned for. A PINNED segment
+                                 # spliced EASED is the measured best of the three
+seam_blend_s: 0.25               # ease window (s) for terrain seams
+weld_search: 12                  # frames searched for the best weld frame
+arrival_search: 60               # trailing approach frames searched for the in-betweened arrival
+
+# ---------------------------------------------------------------- pure stair tiles
+# SEPARATE keys from the transition ones on purpose: the matcher-free path ships DIFFERENT
+# geometry -- width (1.0, 1.6) against (0.8, 1.2), and (4, 10) treads against (3, 7). Sharing one
+# key would have silently changed one of the two populations.
+pure_end_buffer: 3               # treads of run-off kept past the traversal's end
+pure_tile_width_range: [1.0, 1.6]
+pure_n_steps_range: [4, 10]
+pure_footprint_margin: 1.0
+
+# ---------------------------------------------------------------- flat family assembly
+flat_seam_blend_s: 0.24          # ease window (s) at loop<->transient seams. A loop's own period
+                                 # seams need nothing -- the strides close bit-exactly
+flat_anchor: "x,y,yaw"           # which DOFs the flat clips' ego anchor frees
+
+# ---------------------------------------------------------------- segment generation
+pin_future: auto                 # 'auto' follows each family's own pin_future (an ASCENT tracks the
+                                 # replay's future so it arrives moving; a DESCENT holds the entry)
+
+# ---------------------------------------------------------------- composition
+extra_mix: ""

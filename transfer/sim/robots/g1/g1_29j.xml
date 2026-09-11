@@ -19,42 +19,63 @@ Position and velocity actuators added. -->
     <!-- ############## -->
     <!-- Hip Pitch -->
     <default class="hip_pitch_pos">
-       <position kp="40.18" kv="2.56" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
   
 
     <!-- Hip Roll -->
     <default class="hip_roll_pos">
-       <position kp="99.1" kv="6.31" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
  
     <!-- Hip Yaw -->
     <default class="hip_yaw_pos">
-       <position kp="40.18" kv="2.56" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
     <!-- Knee -->
     <default class="knee_pos">
-       <position kp="99.1" kv="6.31" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Ankle Pitch -->
     <default class="ankle_pitch_pos">
-       <position kp="28.5" kv="1.81" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
 
 
     <!-- Ankle Roll -->
     <default class="ankle_roll_pos">
-       <position kp="28.5" kv="1.81" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- ############## -->
     <!--  Waist Gains   -->
     <!-- ############## -->
+    <!--
+      ACTUATOR GAINS ARE DELIBERATELY ZERO.
+
+      The gains that matter are the ones the POLICY trained with; they ride in the ONNX
+      artifact's policy_parameters and gen_tracker_runner applies them at startup
+      (Robot.apply_policy_gains, rewriting gainprm[0] / biasprm[1] / biasprm[2]).
+
+      Hand-written numbers here can only be right by coincidence and wrong by drift: they
+      silently disagreed with training before, and a plausible-looking gain set makes a
+      broken run look merely mediocre. Zero fails LOUDLY instead: a robot whose gains were
+      never applied produces no joint torque and collapses on the first step, which is
+      unmistakable.
+
+      Consequence: the runner's keep_xml_gains flag now means "run with no actuator
+      authority" and is only useful as this negative control. Anything driving this model
+      must set its own gains (gen_tracker_runner and simulation.py both do).
+
+      (No double hyphen anywhere in this comment: illegal in XML, and motion_gen.fk parses
+      this same file with Python's strict xml.etree for the FK chain.)
+    -->
+
     <!-- Waist Yaw -->
     <default class="waist_yaw_pos">
-       <position kp="40.18" kv="2.56" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
 
@@ -63,27 +84,27 @@ Position and velocity actuators added. -->
     <!-- ############## -->
     <!-- Shoulder Pitch -->
     <default class="shoulder_pitch_pos">
-       <position kp="14.25" kv="0.91" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Shoulder Roll -->
     <default class="shoulder_roll_pos">
-       <position kp="14.25" kv="0.91" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Shoulder Yaw -->
     <default class="shoulder_yaw_pos">
-       <position kp="14.25" kv="0.91" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Elbow -->
     <default class="elbow_pos">
-       <position kp="14.25" kv="0.91" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Wrist Roll -->
     <default class="wrist_roll_pos">
-       <position kp="14.25" kv="0.91" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Waist Roll / Pitch (unlocked for the 29-DOF policy). Mirrors waist_yaw's class, which
@@ -92,21 +113,21 @@ Position and velocity actuators added. -->
          (waist_yaw is kp=100 here vs stiffness 40.18 in the asset), so these follow the MJCF's
          own convention, not the asset's. Revisit if sim2sim tracking looks stiff/soft. -->
     <default class="waist_roll_pos">
-       <position kp="40.18" kv="2.56" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <default class="waist_pitch_pos">
-       <position kp="40.18" kv="2.56" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Wrist Pitch -->
     <default class="wrist_pitch_pos">
-       <position kp="14.25" kv="0.91" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Wrist Yaw -->
     <default class="wrist_yaw_pos">
-       <position kp="14.25" kv="0.91" ctrllimited="false"/>
+       <position kp="0" kv="0" ctrllimited="false"/>
     </default>
 
     <!-- Foot Contact Parameters -->
@@ -368,6 +389,7 @@ Position and velocity actuators added. -->
             <geom pos="0.0039635 0 -0.054" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.2 0.2 0.2 1" mesh="logo_link"/>
             <geom pos="0.0039635 0 -0.054" quat="1 0 0 0" type="mesh" rgba="0.2 0.2 0.2 1" mesh="logo_link"/>
             <body name="head_link" pos="0.0039635 0 -0.054">
+              <inertial pos="0 0 0" mass="1e-6" diaginertia="1e-9 1e-9 1e-9"/>  <!-- TODO(asset-mass): matched to the training USD, which has no head body and gives the palms 1e-6 kg. MuJoCo derived 1.803 kg (head) and 0.411 kg (each palm) from these geoms' default density, so the model was 2.62 kg (7.2 percent) heavier than the one the policy trained against. WHICH IS RIGHT FOR HARDWARE IS UNRESOLVED: if the robot really has a head, the USD is missing it and the policy trained light. Settle it against the real robot before deploying, and fix whichever asset is wrong rather than leaving the two disagreeing. -->
               <geom pos="0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.2 0.2 0.2 1" mesh="head_link"/>
               <geom pos="0 0 0" type="mesh" rgba="0.2 0.2 0.2 1" mesh="head_link"/>
             </body>
@@ -439,6 +461,7 @@ Position and velocity actuators added. -->
                           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="left_wrist_yaw_link"/>
                           <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="left_wrist_yaw_link"/>
                           <body name="left_palm_link" pos="0.0415 0.003 0">
+                            <inertial pos="0 0 0" mass="1e-6" diaginertia="1e-9 1e-9 1e-9"/>
                             <geom pos="0 0 0" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="left_hand_palm_link"/>
                             <geom class="nocontact" pos="0 0 0" quat="1 0 0 0" type="mesh" rgba="0.7 0.7 0.7 1" mesh="left_hand_palm_link"/>
                           </body>
@@ -529,6 +552,7 @@ Position and velocity actuators added. -->
                           <geom type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="right_wrist_yaw_link"/>
                           <geom type="mesh" rgba="0.7 0.7 0.7 1" mesh="right_wrist_yaw_link"/>
                           <body name="right_palm_link" pos="0.0415 -0.003 0">
+                            <inertial pos="0 0 0" mass="1e-6" diaginertia="1e-9 1e-9 1e-9"/>
                             <geom pos="0 0 0" quat="1 0 0 0" type="mesh" contype="0" conaffinity="0" group="1" density="0" rgba="0.7 0.7 0.7 1" mesh="right_hand_palm_link"/>
                             <geom class="nocontact" pos="0 0 0" quat="1 0 0 0" type="mesh" rgba="0.7 0.7 0.7 1" mesh="right_hand_palm_link"/>
                           </body>

@@ -29,7 +29,10 @@ def _plan(F: int = 100, entry: int = 10, exit_: int = 80, **kw) -> TerrainPlan:
     args = dict(skill="stairs_up", dt=_DT, terrain_qpos=q, terrain_contact=contact,
                 entry_frame=entry, exit_frame=exit_, approach_surf_z=0.15, exit_surf_z=0.90,
                 approach_vx=0.7, exit_vx=1.0, entry_vx=0.6, exit_speed=0.65,
-                approach_mode="walk", exit_mode="walk", approach_s=2.5, exit_s=2.5,
+                # METRES, not seconds. The plan's budget used to be a duration here and a
+                # duration x speed product in the clip writer, which made "where is the terrain"
+                # a function of how fast this clip happens to walk.
+                approach_mode="walk", exit_mode="walk", approach_dist=3.75, exit_dist=3.75,
                 entry_candidates=np.array([10, 20, 30]), exit_candidates=np.array([80, 90]),
                 meta={"boxes": [{"pos": [1.0, 0.0, 0.1], "size": [0.25, 1.4, 0.2], "yaw": 0.0}],
                       "geom": "stairs"})
@@ -53,7 +56,7 @@ def test_round_trip_through_npz(tmp_path):
     q = load_terrain_plan(path)
     for f in ("skill", "dt", "entry_frame", "exit_frame", "approach_surf_z", "exit_surf_z",
               "approach_vx", "exit_vx", "entry_vx", "exit_speed", "approach_mode", "exit_mode",
-              "approach_s", "exit_s"):
+              "approach_dist", "exit_dist"):
         assert getattr(q, f) == pytest.approx(getattr(p, f)) if isinstance(getattr(p, f), float) \
             else getattr(q, f) == getattr(p, f)
     np.testing.assert_allclose(q.terrain_qpos, p.terrain_qpos)

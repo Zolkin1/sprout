@@ -86,6 +86,14 @@ def recording_to_urdf_perm(recording_joint_names: list[str], urdf: yourdfpy.URDF
         ValueError: If any actuated URDF joint is missing from the recording.
     """
     actuated = list(urdf.actuated_joint_names)
+    # The reverse direction is NOT an error -- a URDF may legitimately pose a subset -- but it is
+    # almost always a mistake, and a silent one: the extra joints simply stay at their default, so a
+    # 29-DOF motion rendered on a 21-DOF URDF looks stiff rather than broken.  Say so.
+    extra = [n for n in recording_joint_names if n not in actuated]
+    if extra:
+        print(f"[urdf] WARNING: {len(extra)} recorded joint(s) are not actuated by this URDF and will "
+              f"be frozen at their default: {', '.join(extra[:8])}"
+              f"{' ...' if len(extra) > 8 else ''}")
     missing = [n for n in actuated if n not in recording_joint_names]
     if missing:
         raise ValueError(

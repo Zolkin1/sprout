@@ -145,16 +145,43 @@ def _plot_reference_tracking_legacy(cols, out_dir, meta) -> dict:
     return summary
 
 
+#: Isaac Lab's ``base_fallen`` thresholds (the tracker task's termination params). Kept here
+#: so a MuJoCo run is scored by the SAME predicate the RL side terminates on.
+FALL_MIN_HEIGHT = 0.5
+FALL_TILT_DEG = 70.0
+
+
 def _plot_survival(cols, out_dir, meta) -> dict:
-    """Base height + fall flag over time; returns survival summary."""
+    """Base height + fall over time; returns survival summary.
+
+    Survival is recomputed from the trajectory, NOT read from the logged ``fell`` column.
+    That column is ``Robot.failed()`` (``qpos[2] < 0.2``) sampled at log time, and it has two
+    problems: the run stops the moment it trips, so the failure usually never reaches the
+    log at all -- measured 1/100 flagged where the runner itself reported 30/100 fallen --
+    and even when it does fire it is height-only at 0.2 m, less than half Isaac Lab's 0.5 m,
+    with no orientation check. A robot face-down at 0.21 m and 96 degrees of pitch scored as
+    SURVIVED. Anything comparing MuJoCo against Isaac Lab on "success" inherits that.
+
+    The rule here is Isaac's: below :data:`FALL_MIN_HEIGHT`, or tilted past
+    :data:`FALL_TILT_DEG` in roll or pitch, at any logged step. Agrees with the runner's own
+    live verdict on 98/100 clips, and unlike it, means the same thing the RL side means.
+    """
     t = cols["time"]
-    # The RUNNER'S verdict wins when it is present. The `fell` column cannot be trusted for
-    # this: it is written before each step's physics and the loop exits on the fall without
-    # writing a further row, so a run that fell logs a column of zeros. Inferring from it
-    # reported survival for runs the loop had already scored as falls.
+    # The RUNNER'S verdict wins when it is present, and the fall is DERIVED from state rather
+    # than read from the `fell` column -- both branches independently fixed the same bug and
+    # each fixed half of it.  `fell` cannot be trusted: it is written before each step's
+    # physics and the loop exits on the fall without writing a further row, so a run that fell
+    # logs a column of zeros, and inferring from it reported survival for runs the loop had
+    # already scored as falls.  Deriving it instead applies ISAAC'S rule (below
+    # FALL_MIN_HEIGHT, or past FALL_TILT_DEG in roll or pitch, at any logged step), which is
+    # what makes the two simulators score a rollout identically.
     survived_meta = meta.get("survived") if isinstance(meta, dict) else None
-    fell = cols["fell"] > 0.5
-    fell_idx = np.argmax(fell) if fell.any() else -1
+    tilt = np.radians(FALL_TILT_DEG)
+    fell = cols["base_z"] < FALL_MIN_HEIGHT
+    for axis in ("act_roll", "act_pitch"):
+        if axis in cols:
+            fell = fell | (np.abs(cols[axis]) > tilt)
+    fell_idx = int(np.argmax(fell)) if fell.any() else -1
     time_to_fall = float(t[fell_idx]) if fell_idx >= 0 else None
     if survived_meta is False and time_to_fall is None:
         time_to_fall = meta.get("time_to_fall_s")
@@ -162,6 +189,8 @@ def _plot_survival(cols, out_dir, meta) -> dict:
             time_to_fall = float(time_to_fall)
     fig, ax = plt.subplots(figsize=(9, 3.5))
     ax.plot(t, cols["base_z"], lw=1.5, label="base height")
+    ax.axhline(FALL_MIN_HEIGHT, color="0.6", ls=":", lw=1.0,
+               label=f"fall height {FALL_MIN_HEIGHT} m")
     if time_to_fall is not None:
         ax.axvline(time_to_fall, color="r", ls="--", label=f"fall @ {time_to_fall:.2f}s")
     _mark_handoff(ax, meta)
@@ -170,17 +199,17 @@ def _plot_survival(cols, out_dir, meta) -> dict:
     fig.tight_layout()
     fig.savefig(os.path.join(out_dir, "survival.png"), dpi=120)
     plt.close(fig)
-    # survived_meta is the loop's own answer and is authoritative when present. Inferring
-    # survival from the `fell` column cannot be right: that flag is written before the loop's
-    # fall check and the loop returns on the next step, so the row where the fall happens is
-    # never written and every fall would read as a survival. The time-derived form is only the
-    # fallback for a run recorded before the verdict was stamped, and `verdict_source` says
-    # which of the two answered. `time_to_fall_s` is back-filled from the runner above for the
-    # same reason -- it is a timestamp, and the column has none on a run that fell.
+    # survived_meta is the loop's own answer and is authoritative when present. The DERIVED
+    # height/tilt rule above is the fallback for a run recorded before the verdict was stamped,
+    # and `verdict_source` says which of the two answered. Note what is deliberately NOT used
+    # here: the logged `fell` column. That flag is written before the loop's fall check and the
+    # loop returns on the next step, so the row where the fall happens is never written and
+    # every fall would read as a survival. `time_to_fall_s` is back-filled from the runner
+    # above for the same reason -- it is a timestamp, and the column has none on a run that fell.
     survived = (time_to_fall is None) if survived_meta is None else bool(survived_meta)
     return {"survived": survived, "time_to_fall_s": time_to_fall,
             "final_time_s": float(t[-1]),
-            "verdict_source": "runner" if survived_meta is not None else "fell_column",
+            "verdict_source": "runner" if survived_meta is not None else "derived",
             "failure_reason": (meta.get("failure_reason", "") if isinstance(meta, dict) else "")}
 
 

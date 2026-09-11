@@ -509,3 +509,114 @@ def test_flat_rooms_are_decor_by_default():
                             DecorateConfig(seed=0, wall_frac=1.0, flat_room_frac=1.0,
                                            wall_collidable=True))
     assert all(o["decor"] is False for r in solid for o in r)
+
+
+def test_every_flight_lands_in_the_stair_width_band():
+    """4 ft to 8 ft, whichever arm drew.
+
+    The band is the point of the pass now: the robot is trained on stairwells the width of
+    real ones, and no arm reaches the whole tile any more. Before this, `tread_full_frac`
+    took 30% of `wide_stairs` flights all the way to the tile edge and `narrow_landing`
+    left its treads at the generated ~0.9 m, so the shipped spread was 0.80-5.47 m.
+    """
+    cfg = DecorateConfig(seed=11)
+    widths = []
+    for t in range(60):
+        tile = _tile(terrain_id=t, size_y=6.0)
+        report = decorate_transition_tile(tile, _footprint(t), cfg)
+        widths += report.tread_after
+    assert widths
+    assert min(widths) >= cfg.min_tread_m - 1e-9, f"a flight came out at {min(widths):.3f} m"
+    assert max(widths) <= cfg.max_tread_m + 1e-9, f"a flight came out at {max(widths):.3f} m"
+    # And the band is actually sampled, not collapsed onto one end by the arm weights.
+    assert max(widths) - min(widths) > 0.5 * (cfg.max_tread_m - cfg.min_tread_m)
+
+
+def test_a_flight_is_sized_from_the_TRAVERSAL_feet_not_the_whole_clip():
+    """The whole-clip envelope contains the approach and exit, which are on the PLATFORMS.
+
+    On the real library that is a 2.51 m union against 0.35 m of traversal, because the 50
+    clips sharing a tile are laterally offset from each other by ~1 m while wandering on the
+    flat -- and a staircase has no reason to span that. So a tile whose clips wander widely
+    but whose treads are walked down the middle gets a flight sized by the middle.
+    """
+    wide = TileFootprint(terrain_id=0, n_clips=10, y_min=0.6, y_max=5.4,
+                         x_min=0.0, x_max=20.0, y_min_sized=0.5, y_max_sized=5.5,
+                         tread_y_min_sized=2.7, tread_y_max_sized=3.3)
+    tile = _tile(terrain_id=0, size_y=6.0)
+    report = decorate_transition_tile(tile, wide, DecorateConfig(seed=3))
+    assert max(report.tread_after) <= 2.438 + 1e-9, (
+        "the flight was sized from the whole-clip envelope, which is 5.0 m wide here"
+    )
+    # The whole-clip envelope is still what the PLATFORMS answer to -- they do carry that wander.
+    assert max(report.platform_after) >= 4.9
+
+
+def test_the_traversal_envelope_falls_back_to_the_whole_clip_when_absent():
+    """A library with no anchor mask must not read as a tile needing no surface at all."""
+    fp = _footprint(0, lo=1.2, hi=1.8)
+    assert fp.tread_y_min_sized is None
+    assert fp.tread_envelope() == (1.2, 1.8)
+
+
+def test_the_flight_and_its_platforms_share_a_centre_and_the_platforms_are_never_narrower():
+    """A staircase must not step onto a landing that is offset from it, or narrower than it.
+
+    Before this the two were placed against DIFFERENT envelopes -- treads about their own flight
+    centre against the traversal feet, platforms narrowed into the whole-clip envelope -- so they
+    drifted apart. Measured on g1_mb_v6c: median 0.190 m of centre offset (max 0.742) with the
+    platform narrower than the stair on 3 of 66 tiles.
+    """
+    for seed in range(40):
+        for size_y in (3.0, 4.0, 6.0):
+            tile = _tile(terrain_id=seed, size_y=size_y)
+            roles_before = classify_overlays(tile)
+            decorate_transition_tile(tile, _footprint(seed), DecorateConfig(seed=seed))
+            spans = [span(o) for o in tile["overlays"]]
+            tre = [s for s, r in zip(spans, roles_before) if r == "tread"]
+            plat = [s for s, r in zip(spans, roles_before) if r == "platform"]
+            assert tre and plat
+            tc = [(lo + hi) / 2 for lo, hi in tre]
+            pc = [(lo + hi) / 2 for lo, hi in plat]
+            assert max(tc) - min(tc) < 1e-9, "the treads of one flight must share a centre"
+            assert abs(sum(tc) / len(tc) - sum(pc) / len(pc)) < 1e-6, (
+                f"seed {seed} size_y {size_y}: flight centre {sum(tc)/len(tc):.4f} against "
+                f"platform centre {sum(pc)/len(pc):.4f}"
+            )
+            widest_tread = max(hi - lo for lo, hi in tre)
+            assert min(hi - lo for lo, hi in plat) >= widest_tread - 1e-6, (
+                f"seed {seed} size_y {size_y}: a platform is narrower than the flight it serves"
+            )
+
+
+def test_a_two_riser_flight_is_authorable_and_one_riser_is_not_usable():
+    """2 is the smallest transition the pipeline can express, and the reason is structural.
+
+    `n_steps_range` started at 3, so short step-ups did not exist; it is now [2, 7]. The SAMPLER
+    will happily author a 1-riser tile -- this test pins that it does -- but no clip can be
+    generated on one: the entry gate anchors the stance foot onto tread 1 while `exit_surf` is
+    `upper_z = n_steps * riser`, so at n_steps == 1 entry and exit are the SAME surface and the
+    traversal has zero length. Measured: a [1, 7] build lost 385 clips, every one n_steps=1, while
+    2 and 3 in isolation author 7/7 tiles with 0 skips. A curb needs a step-up-and-settle solve,
+    which the library does not have (smallest jump_on box 0.25 m against a 0.13-0.17 m curb).
+    """
+    import numpy as np
+    from collections import Counter
+    from motion_gen.terrain.terrain_sampler import sample_stair_tiles
+
+    tiles = sample_stair_tiles(
+        np.random.default_rng(0), hd_grid=[(0.13, 0.25), (0.15, 0.25)], n_pure=0, n_transition=200,
+        pure_length=1.0, transition_length=12.0, width_range=(1.0, 1.6), num_steps_range=(1, 7),
+        lead_in_range=(1.5, 4.0), end_platform=1.0, inter_flat_range=(3.0, 5.0),
+        nav_width_range=(1.0, 1.6), flat_width_margin=0.3, single_step_frac=0.0, floor_frac=0.5,
+        decor_params={"float_frac": 0.0, "float_thick_range": (0.0, 0.0)})
+    counts = Counter(s for t in tiles for s in t.stair_steps)
+    assert counts[2] > 0, f"no two-riser flights authored: {dict(counts)}"
+    # The sampler is not the limit -- it authors 1-riser tiles fine. The recipe excludes them.
+    assert counts[1] > 0, "the sampler should still be able to author a 1-riser tile"
+    import yaml, pathlib
+    for name in ("g1_mb_v6.yaml", "quick.yaml"):
+        cfg = pathlib.Path(__file__).resolve().parents[3] / "configs" / "clip_gen" / name
+        if cfg.exists():
+            lo = yaml.safe_load(cfg.read_text())["n_steps_range"][0]
+            assert lo >= 2, f"{name} asks for n_steps={lo}; 1 produces a zero-length traversal"

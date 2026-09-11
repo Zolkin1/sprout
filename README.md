@@ -107,24 +107,42 @@ python scripts/list_envs.py --keyword G1
 
 ### 1. Generate a clip library
 
-Motion Bricks runs in its own conda env (GPU), so generation is staged: the driver
-shells out and skips stages that are already done.
+**Full runbook: [`docs/generating_clips.md`](docs/generating_clips.md).** Stages, both conda envs,
+the traps, and what to look at afterwards.
+
+Motion Bricks runs in its own conda env on a GPU, so generation is staged; the driver shells out and
+skips stages that are already done.
 
 ```bash
-python scripts/rsl_rl/generate_mb_library.py --out clips/g1_mb_v5.h5 [--stage N] [--quick]
+python scripts/rsl_rl/generate_mb_library.py \
+    --config   configs/clip_gen/g1_mb_v6.yaml \
+    --work-dir mb_raw/lib_v7 \
+    --out      clips/g1_mb_v7.h5 \
+    --source   hf/trajectories/retargeted/2026-06-13_15-10-58_merged \
+    --library  trajectories/skills/library_v2 \
+    --mb-root  /abs/path/to/GR00T-WholeBodyControl/motionbricks
 ```
 
-It orchestrates `export_stride_bank` -> `mb_plan_library` -> `mb_terrain_segments` /
-`mb_encode` (in the `motionbricks` env) -> `mb_assemble_library` / `generate_mb_clips` /
-`mb_distractor_clips` -> `compose_terrain_library`.
+All six flags are REQUIRED -- there are no defaults, because a stale library or source silently
+trains on motion nobody solved for this robot, and `--library` is stamped into the output as
+provenance. `--mb-root` may be relative -- the driver resolves it against the repo and then walks
+up looking for the clone, printing what it found -- but a stage script run BY HAND has no such
+fallback and needs an absolute path.
 
-Then check what came out:
+Stages, in order: `export_stride_bank` -> `mb_plan_library` -> (`mb_terrain_segments`,
+`mb_flat_transients` in the `motionbricks` env) -> (`mb_assemble_library`, `mb_pure_stair_clips`,
+`mb_flat_clips`) -> `compose_terrain_library` -> `decorate_terrain` -> `mb_qc --gate` ->
+`clip_library_report`. The gate and the report run as part of the build; a library that fails the
+gate fails the build.
+
+**The finished library is `clips/g1_mb_v7_decor.h5`, not `--out`.** Decoration writes a new file,
+and it is the one to train, record and view against -- an undecorated library has no stair-width
+variation at all.
 
 ```bash
-python scripts/rsl_rl/mb_qc.py --lib clips/g1_mb_v5.h5        # objective quality report
-python scripts/rsl_rl/inspect_clip.py --mode timeseries --lib clips/g1_mb_v5.h5 --clip 0
-python scripts/rsl_rl/view_clip_viser.py --lib clips/g1_mb_v5.h5    # interactive
-python scripts/rsl_rl/view_terrain_isaac.py --lib clips/g1_mb_v5.h5 # per-family tile split
+python scripts/rsl_rl/view_clip_viser.py    --lib clips/g1_mb_v7_decor.h5 --clip 0
+python scripts/rsl_rl/view_terrain_viser.py --lib clips/g1_mb_v7_decor.h5 --traj 3
+python scripts/rsl_rl/mb_qc.py --lib clips/g1_mb_v7_decor.h5      # the report, without the gate
 ```
 
 ### 2. Train the teacher

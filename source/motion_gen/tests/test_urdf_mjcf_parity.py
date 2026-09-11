@@ -309,3 +309,31 @@ def test_the_mjcf_carries_per_joint_armature(facts):
         assert expected is not None, f"the generator has no armature rule for {name}"
         assert seen[name] is not None, f"{name} fell back to the blanket class armature"
         assert float(seen[name]) == pytest.approx(expected, rel=1e-9), name
+
+
+def test_default_mjcf_names_the_perceptive_robot():
+    """``features.DEFAULT_MJCF`` must point at the PERCEPTIVE model, by basename.
+
+    Every clip generator builds a ``ClipOutputBuilder`` with ``mjcf_path=None``, so this one
+    constant decides which robot every ``<body>@root`` and world end-effector channel in every
+    clip library is forward-kinematicked through. It is a plain module-level string with no
+    consumer that would notice it changing, which is exactly the shape of thing that gets
+    reverted by a merge: the ``fm-reference-window`` branch carried ``g1_29j.xml`` here (the
+    pre-mode_11 robot) while ``main`` had moved to ``g1_perceptive.xml``, and ``features.py``
+    was not in that merge's both-changed set -- so the value was decided silently, by whichever
+    side git happened to prefer.
+
+    Pointed at the old file, FK places ``torso_link`` up to 12 mm and the shoulder chain up to
+    7 mm from where the live robot has them (the legs are byte-identical, which is why nothing
+    obvious breaks), and ``check_depth_xyz_agreement.py`` fails at 10.4 mm against a 5 mm
+    tolerance. Basename rather than the full path, so moving the asset does not fail this.
+    """
+    from motion_gen.features import DEFAULT_MJCF, HAND_FRAMES
+
+    assert os.path.basename(DEFAULT_MJCF) == "g1_perceptive.xml", (
+        f"features.DEFAULT_MJCF is {DEFAULT_MJCF!r}. Every clip library's FK channels come from "
+        "this model; g1_29j.xml is the pre-mode_11 robot and is 12 mm out at the torso."
+    )
+    # The hands moved with the robot: the Dex3-1s became passive rubber hands, so a stale
+    # HAND_FRAMES would resolve to link names the perceptive model does not have.
+    assert HAND_FRAMES == ["left_rubber_hand", "right_rubber_hand"], HAND_FRAMES

@@ -15,6 +15,8 @@ exact treads, anchoring an episodic jump onto the tile box -- must be ONE implem
 * :func:`episodic_box_extents` -- how big that solved box is in the frame the placement will put it in,
   so the tile can be authored before the interaction is placed on it.
 * :func:`select_terrain_reference` -- the two-stage reference pick (nearest geometry, then nearest speed)
+* :func:`terrain_speed_cell` -- the speeds that pick would return the SAME reference for
+* :func:`speed_cell_from` -- the midpoint rule underneath it, shared with the pure-stair path
   both generators use.
 
 All functions are pure torch + math: they take an ingested :class:`~.motion_db.MotionSource` plus the
@@ -209,6 +211,80 @@ def place_episodic_on_tile(ts, tile_box, dev, k: int = 0, align: str = "box"):
                       device=Wp.device, dtype=Wp.dtype)
     Wp = Wp + sh                                            # land the interaction's box on the fixed tile box
     return Wp, Wq, Wj, terr_contact
+
+
+def speed_cell_from(candidate_speeds, chosen: float) -> tuple:
+    """The midpoint interval around ``chosen`` among ``candidate_speeds`` -- the Voronoi rule itself.
+
+    Split out so the two callers cannot drift: :func:`terrain_speed_cell` applies it after the
+    selector's geometry filter, and the PURE stair generator applies it to the candidate list its own
+    inline nearest-geometry pick produces. Both are "which speeds would have chosen this same
+    reference", and there is one answer.
+
+    Speeds are compared unsigned; the outermost cells are open, which is the point.
+    """
+    spd = sorted({round(abs(float(v)), 6) for v in candidate_speeds})
+    mine = round(abs(float(chosen)), 6)
+    if mine not in spd:
+        raise ValueError(f"chosen speed {chosen} is not among the candidates {spd}")
+    j = spd.index(mine)
+    lo = 0.0 if j == 0 else 0.5 * (spd[j - 1] + spd[j])
+    hi = float("inf") if j == len(spd) - 1 else 0.5 * (spd[j] + spd[j + 1])
+    return (float(lo), float(hi))
+
+
+def terrain_speed_cell(sources: list, chosen: int, *, riser: float | None = None,
+                       tread: float | None = None, box_height: float | None = None) -> tuple:
+    """Speeds for which :func:`select_terrain_reference` returns ``chosen`` -- its Voronoi cell.
+
+    A terrain clip's COMMAND is allowed to differ from the motion it plays, and on the traversal it
+    must: the replay is one fixed solved motion, so a clip that only ever commands that motion's own
+    speed teaches a generator nothing about SELECTING. What it may not do is command a speed that
+    points at a DIFFERENT reference -- that would teach the opposite of the intended lesson ("you
+    asked for something nearer the other motion, and we gave you this one").
+
+    So the rule is CONSISTENCY, not agreement, and this is the set it is consistent with. Derived from
+    the selector's own two stages rather than restated: filter to the same nearest-geometry candidates
+    (their speeds are the only ones reachable on this tile's geometry), then take the midpoints to the
+    neighbouring candidate speeds. The outermost cells are open, which is the point -- on a stair tile
+    whose solved speeds are {0.31, 0.69} a clip playing 0.69 may legitimately be commanded 2.6, because
+    2.6 is still nearer 0.69 than 0.31.
+
+    The cell SHRINKS as the solved library gains speeds, which is the right direction: more motions to
+    select among means finer selection, and the freedom to disagree narrows exactly as the reason for
+    it does.
+
+    Args:
+        sources: the same ingested list passed to :func:`select_terrain_reference`.
+        chosen: the index it returned.
+        riser / tread / box_height: the same geometry it was called with.
+
+    Returns:
+        ``(lo, hi)`` in m/s, unsigned. ``lo`` is 0.0 and/or ``hi`` is ``inf`` at the extremes.
+    """
+    if not sources:
+        raise ValueError("no terrain references to select from")
+
+    def _geom_dist(s) -> float:
+        tm = s.terrain_meta.get("terrain", {})
+        d = 0.0
+        if riser is not None:
+            d += abs(float(tm.get("riser", 0.0)) - riser)
+        if tread is not None:
+            d += abs(float(tm.get("tread", 0.0)) - tread)
+        if box_height is not None:
+            d += abs(float(tm.get("box_height", 0.0)) - box_height)
+        return d
+
+    dgeom = [_geom_dist(s) for s in sources]
+    dmin = min(dgeom)
+    cand = [i for i, d in enumerate(dgeom) if abs(d - dmin) < 1e-3]
+    if chosen not in cand:
+        raise ValueError(f"reference {chosen} is not among this geometry's candidates {cand}")
+    spd = [abs(float(sources[i].steady_vel[0])) if sources[i].steady_vel is not None else 0.0
+           for i in cand]
+    mine = abs(float(sources[chosen].steady_vel[0])) if sources[chosen].steady_vel is not None else 0.0
+    return speed_cell_from(spd, mine)
 
 
 def select_terrain_reference(sources: list, *, riser: float | None = None, tread: float | None = None,
