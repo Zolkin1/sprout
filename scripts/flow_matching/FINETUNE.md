@@ -126,7 +126,41 @@ TAG=my_run GPU=0 bash scripts/flow_matching/run_finetune_loop.sh --parent <paren
 NENV=4096 TERRAIN=box2 bash scripts/rsl_rl/run_quick_eval.sh <iter_005/ft/last.pt> my_run
 ```
 
-One iteration is collect -> grade -> critic (FVI) -> label -> update, ~40 min on one GPU.
+One iteration is collect -> grade -> critic (FVI) -> label -> update, ~40 min on one GPU
+with the loop's default buffer; the arms that skip the critic (`bc`, `arrived`) run in about
+half that, and iteration 1 is longer than the rest because it fills the whole buffer rather
+than refreshing part of it.
+
+### Reading the result
+
+`run_quick_eval.sh` reduces its own run at the end, but every number in the paper comes from
+one of three scripts, and none of them is reachable by guessing its interface:
+
+```bash
+# ONE arm. Pass the TAG directory, not a per-speed directory and not a stem: the reducer
+# globs <root>/*/*.episodes.h5, i.e. it looks ONE LEVEL DOWN, so the tag dir reduces every
+# speed together. Pointing it at train_v1.17/ finds nothing and it refuses -- correctly,
+# since an empty report is indistinguishable from a finished sweep.
+python scripts/rsl_rl/box2_ic_report.py logs/box2/quick/my_run
+
+# PAIRED arms -> the figure's numbers, with tile-clustered intervals and a per-cell sign test.
+# --arm takes `label:parent:finetuned`, paths relative to --root. It refuses a bare tag.
+python scripts/rsl_rl/fig_reduce.py --root logs \
+  --arm "two-box:box2/quick/parent_tag:box2/quick/my_run" \
+  --arm "in-distribution:indist/quick/parent_tag:indist/quick/my_run" \
+  --out fig_numbers.json
+
+# the figure itself -- imports no IsaacLab and no torch, so it runs anywhere
+python scripts/rsl_rl/plot_finetune_bars.py fig_numbers.json --out logs/paper/finetune_bars
+```
+
+`paired_delta.py` is the third reducer: the arms are 100% spawn-matched, so its paired
+interval is the correct one and `fig_reduce`'s level intervals are conservative by comparison.
+
+**Both reducers default to `--metric terminal_reward --failure_rule strict` and to
+first-episode-per-env**, which is the definition the loop trains against -- see "Success is
+defined ONCE" below. `--pooled` exists and is biased: a round-based stop gives a fast-failing
+env more episodes than a slow one, measured at 0.15 on one in-distribution tile.
 
 ## The four algorithms are one selectivity ladder
 
