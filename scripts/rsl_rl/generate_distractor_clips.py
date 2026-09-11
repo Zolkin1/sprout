@@ -360,7 +360,8 @@ def main() -> int:
     # Fan the independent tiles across the fork pool (matcher/builder/tiles shared COW via _SHARED); each
     # worker returns one tile's clips with its manifest stashed on the first record.
     _SHARED.update(matcher=matcher, builder=builder, args=args, dev=dev, T=T, tiles=tiles)
-    n_workers = default_workers(len(tiles), args.workers)
+    n_workers = default_workers(len(tiles), args.workers, bytes_per_worker=matcher.solve_bytes(T),
+                                log=lambda m: print(f"[distractor] {m}"))
     print(f"[distractor] {len(tiles)} box tiles x {args.clips_per_tile} clips = "
           f"{len(tiles) * args.clips_per_tile} across {n_workers} worker(s)")
     records = unit_pool(_distractor_tile_worker, range(len(tiles)), n_workers)

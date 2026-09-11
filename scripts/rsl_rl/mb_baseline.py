@@ -769,34 +769,48 @@ def stage_batch(args: argparse.Namespace) -> int:
     ours_b = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
     base_b = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
     floor_b = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
-    mm_b = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
-    jerk = {"ours": [], "baseline": [], "mm": [], "artifact": [],
+    mm_b: dict[str, dict] = {}           # label -> {(bucket, window): [per-clip]}
+    jerk = {"ours": [], "baseline": [], "artifact": [],
             "ours_seam": [], "ours_interior": [], "seam_frac": []}
     run_paths, failed = [], []
 
     # The motion-matching arm, if one was built. Its clip j corresponds to OUR pick[j] -- that is
     # what generate_mm_clips.py --command-from guarantees, by importing select_flat_clips rather
     # than restating it. Verified below rather than trusted: the recorded indices must match.
-    mm_lib = None
-    if args.mm_arm:
-        with h5py.File(args.mm_arm, "r") as f:
+    mm_libs: dict[str, str] = {}
+    for spec in (args.mm_arm or []):
+        label, _, path = spec.rpartition("=")
+        with h5py.File(path, "r") as f:
             src = json.loads(f.attrs["command_source"]) if "command_source" in f.attrs else None
+            matcher_attr = f.attrs.get("matcher")
         if isinstance(src, str):        # double-encoded by an older writer
             src = json.loads(src)
         if src is not None and not isinstance(src, dict):
-            raise SystemExit(f"{args.mm_arm}: `command_source` is {type(src).__name__}, not an "
+            raise SystemExit(f"{path}: `command_source` is {type(src).__name__}, not an "
                              "object -- it was written by an incompatible generator")
         if src is None:
-            raise SystemExit(f"{args.mm_arm} has no `command_source` attr, so it was NOT generated "
+            raise SystemExit(f"{path} has no `command_source` attr, so it was NOT generated "
                              "against these commands -- it is the authored MM family, which draws "
                              "its own speeds and is not comparable. Rebuild with --command-from.")
         if list(src.get("clip_indices", [])) != list(pick):
             raise SystemExit(
-                f"{args.mm_arm} was built against clips {src.get('clip_indices', [])[:6]}... but "
+                f"{path} was built against clips {src.get('clip_indices', [])[:6]}... but "
                 f"this run scores {pick[:6]}... -- the arms would be paired on different motions. "
                 f"Rebuild it with --command-n-clips {args.n_clips} --command-seed {args.seed}.")
-        mm_lib = args.mm_arm
-        print(f"[mb_base] MM arm: {mm_lib} ({len(src['clip_indices'])} clips, indices verified)")
+        # The library names its own search (generate_mm_clips writes it); a LABEL= prefix wins.
+        # Falling back to the file stem would let two arms of the same matcher look distinct.
+        if not label:
+            label = (matcher_attr.decode() if isinstance(matcher_attr, bytes)
+                     else matcher_attr) if matcher_attr is not None \
+                    else os.path.splitext(os.path.basename(path))[0]
+        if label in mm_libs:
+            raise SystemExit(f"two --mm-arm entries both label as {label!r} ({mm_libs[label]} and "
+                             f"{path}); give one an explicit LABEL=PATH so the rows are readable")
+        mm_libs[label] = path
+        mm_b[label] = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
+        jerk[f"mm:{label}"] = []
+        print(f"[mb_base] MM arm {label!r}: {path} ({len(src['clip_indices'])} clips, "
+              "indices verified)")
 
     for j, ci_ in enumerate(pick):
         prof = os.path.join(work, f"profile_{ci_:05d}.npz")
@@ -877,8 +891,8 @@ def stage_batch(args: argparse.Namespace) -> int:
         # both arms, so the paired DELTA is unaffected, which is why the claim rests on the delta.
         mf = bucket_mse(clip["cmd"], boxcar(clip["cmd"][:-1].copy(), clip["dt"], args.smooth_s),
                         clip["dt"], buckets, settle_s=args.settle_s)
-        mm_ = None
-        if mm_lib is not None:
+        mm_by_label = {}
+        for label, mm_lib in mm_libs.items():
             mmc = read_clip(mm_lib, j)                    # clip j of the MM lib IS our pick[j]
             mw = xyzw_to_wxyz(mmc["y"][:, [mmc["names"].index(f"pelvis_link:ori_{c}")
                                            for c in "xyzw"]])
@@ -887,18 +901,20 @@ def stage_batch(args: argparse.Namespace) -> int:
             # and this is where that is checked, on the frames both actually cover.
             k = min(len(clip["cmd"]), len(mmc["cmd"]))
             if not np.allclose(clip["cmd"][:k], mmc["cmd"][:k], atol=1e-5):
-                raise SystemExit(f"MM clip {j} carries a different command than our clip {ci_}; "
-                                 "the arms are not on one profile")
-            mm_ = bucket_mse(clip["cmd"], vm, clip["dt"], buckets, settle_s=args.settle_s)
-            jerk["mm"].append(joint_jerk_rms(mmc["y"][:, [mmc["names"].index(f"joint:{n_}")
-                                                          for n_ in G1_JOINT_NAMES]], mmc["dt"]))
+                raise SystemExit(f"MM arm {label!r} clip {j} carries a different command than our "
+                                 f"clip {ci_}; the arms are not on one profile")
+            mm_by_label[label] = bucket_mse(clip["cmd"], vm, clip["dt"], buckets,
+                                            settle_s=args.settle_s)
+            jerk[f"mm:{label}"].append(
+                joint_jerk_rms(mmc["y"][:, [mmc["names"].index(f"joint:{n_}")
+                                            for n_ in G1_JOINT_NAMES]], mmc["dt"]))
         for bi in range(len(buckets)):
             for w in ("all", "settled"):
                 ours_b[(bi, w)].append(mo[bi][w])
                 base_b[(bi, w)].append(mb_[bi][w])
                 floor_b[(bi, w)].append(mf[bi][w])
-                if mm_ is not None:
-                    mm_b[(bi, w)].append(mm_[bi][w])
+                for label, m_ in mm_by_label.items():
+                    mm_b[label][(bi, w)].append(m_[bi][w])
         print(f"[mb_base] clip {ci_:5d}  ({j + 1}/{len(pick)})", flush=True)
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -942,20 +958,23 @@ def stage_batch(args: argparse.Namespace) -> int:
             lines.append(f"{'':>18} {'':>9} {'':>6} {'':>9} "
                          f"{'MB alone':>10} {f'{pb:.4f} [{lo_b:.4f}, {hi_b:.4f}]':>26} "
                          f"{f'{dp:+.4f} [{dlo:+.4f}, {dhi:+.4f}]':>24}")
-            if mm_b[(bi, w)]:
+            for label in mm_libs:
+                if not mm_b[label][(bi, w)]:
+                    continue
                 # Paired against OURS over the clips both cover -- the same discipline as above,
-                # and separately from the MB pairing, because the two arms drop different clips.
-                mpairs = [(o, m) for o, m in zip(ours_b[(bi, w)], mm_b[(bi, w)])
+                # and separately per arm, because each arm drops different clips.
+                mpairs = [(o, m) for o, m in zip(ours_b[(bi, w)], mm_b[label][(bi, w)])
                           if o[1] > 0 and m[1] > 0]
                 pm, lo_m, hi_m, nfm, ncm = bootstrap_rmse([q[1] for q in mpairs],
                                                           args.n_boot, args.boot_seed)
                 dm, dmlo, dmhi = bootstrap_delta([q[0] for q in mpairs], [q[1] for q in mpairs],
                                                  args.n_boot, args.boot_seed)
                 lines.append(f"{'':>18} {'':>9} {ncm:6d} {'':>9} "
-                             f"{'MM':>10} {f'{pm:.4f} [{lo_m:.4f}, {hi_m:.4f}]':>26} "
+                             f"{f'MM {label}':>10} {f'{pm:.4f} [{lo_m:.4f}, {hi_m:.4f}]':>26} "
                              f"{f'{dm:+.4f} [{dmlo:+.4f}, {dmhi:+.4f}]':>24}")
-                row["mm"] = {"rmse": pm, "ci": [lo_m, hi_m], "n_frames": nfm, "n_clips": ncm}
-                row["delta_mm_minus_ours"] = {"point": dm, "ci": [dmlo, dmhi]}
+                row[f"mm:{label}"] = {"rmse": pm, "ci": [lo_m, hi_m],
+                                      "n_frames": nfm, "n_clips": ncm}
+                row[f"delta_mm:{label}_minus_ours"] = {"point": dm, "ci": [dmlo, dmhi]}
             results.append(row)
     # --- jitter, the metric that is supposed to separate us from a matcher ---
     def _mean_ci(v: list) -> str:
@@ -990,9 +1009,11 @@ def stage_batch(args: argparse.Namespace) -> int:
                   f"{_paired_ci(jerk['ours_interior'], jerk['ours_seam']):>22}",
                   f"{'  everywhere else':>22} {'50 Hz':>7}   {_mean_ci(jerk['ours_interior']):>26}   "
                   f"{'(the baseline above)':>22}"]
-    if jerk["mm"]:
-        lines.append(f"{'MM (motion matching)':>22} {'50 Hz':>7}   {_mean_ci(jerk['mm']):>26}   "
-                     f"{_paired_ci(jerk['ours'], jerk['mm']):>22}")
+    for label in mm_libs:
+        if jerk[f"mm:{label}"]:
+            lines.append(f"{f'MM ({label})':>22} {'50 Hz':>7}   "
+                         f"{_mean_ci(jerk[f'mm:{label}']):>26}   "
+                         f"{_paired_ci(jerk['ours'], jerk[f'mm:{label}']):>22}")
     lines += [f"{'MB alone':>22} {'30->50':>7}   {_mean_ci(jerk['baseline']):>26}   "
               f"{_paired_ci(jerk['ours'], jerk['baseline']):>22}",
               f"{'  resample control':>22} {'30->50':>7}   {_mean_ci(jerk['artifact']):>26}   "
@@ -1027,7 +1048,7 @@ def stage_batch(args: argparse.Namespace) -> int:
     with open(os.path.join(args.out_dir, "results.json"), "w") as f:
         json.dump({"buckets": results, "clips": pick, "failed": failed,
                    "smooth_s": args.smooth_s, "root_mode": args.root_mode,
-                   "n_boot": args.n_boot, "mm_arm": args.mm_arm,
+                   "n_boot": args.n_boot, "mm_arms": mm_libs,
                    "jerk_rms": {k: [float(x) for x in v] for k, v in jerk.items() if v}}, f, indent=1)
     with open(os.path.join(args.out_dir, "results.txt"), "w") as f:
         f.write(table + "\n\ndelta > 0 means MB alone is WORSE.\n")
@@ -1055,10 +1076,13 @@ def main() -> int:
     p.add_argument("--n-clips", type=int, default=30, help="batch: how many flat clips to sample.")
     p.add_argument("--out-dir", default=None, help="batch: results + provenance go here.")
     p.add_argument("--conda-env", default="motionbricks")
-    p.add_argument("--mm-arm", default=None,
-                   help="batch: a THIRD arm -- a clip library from `generate_mm_clips.py "
+    p.add_argument("--mm-arm", action="append", default=None, metavar="[LABEL=]PATH",
+                   help="batch: a FURTHER arm -- a clip library from `generate_mm_clips.py "
                         "--command-from`, i.e. motion matching driven by these same commands. Its "
-                        "recorded clip indices must match this run's selection, which is checked.")
+                        "recorded clip indices must match this run's selection, which is checked. "
+                        "Repeatable, so the greedy and DP matchers can be reported side by side; "
+                        "each arm is labelled by its library's own `matcher` attr unless a "
+                        "LABEL= prefix overrides it.")
     p.add_argument("--reuse-runs", action="store_true",
                    help="batch: skip the Motion Bricks run for any clip whose run .npz already "
                         "exists in --out-dir/runs. Re-score without regenerating.")
