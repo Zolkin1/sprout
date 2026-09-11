@@ -245,6 +245,24 @@ def main() -> int:
         res = json.load(fh)
     meta = res.pop("_meta", {})
     terrains = [k for k in res]
+    # The penalty weights live PER ARM (`fig_reduce` stamps each one from that chunk group's
+    # own `spec`), not in `_meta` -- reading them off `_meta` printed "contact None,
+    # penetration None" into the caption, which would have gone into the paper.
+    #
+    # They must AGREE across arms: the caption states one pair of weights, so two arms reduced
+    # under different ones would be mislabelled rather than merely unlabelled. A `spec` differs
+    # between arms exactly when their recordings were graded under different reward
+    # calibrations, which is a comparison that should not be plotted together at all.
+    _wk = ("contact_weight", "penetration_weight")
+    _seen = {tuple(res[k].get(w) for w in _wk) for k in terrains}
+    if len(_seen) > 1:
+        raise SystemExit(
+            "REFUSING: these arms were graded under DIFFERENT penalty weights, so one caption "
+            "cannot describe them:\n"
+            + "\n".join(f"      {dict(zip(_wk, tuple(res[k].get(w) for w in _wk)))}  <- {k}"
+                         for k in terrains)
+            + "\n  Re-grade the arms against one reward spec before plotting them together.")
+    weights = dict(zip(_wk, next(iter(_seen)))) if _seen else {}
     field, ylabel, _ = PANEL_B[args.panel_b]
 
     plot_style.apply_paper_style()
@@ -317,8 +335,9 @@ def main() -> int:
         "environment's first episode, the design whose membership cannot depend on episode "
         "duration. The penalty is exposure-standardised over downrange position, so a "
         "longer-surviving arm is not charged for reaching deeper course."
-        + (f" Penalty weights: contact {meta.get('contact_weight')}, penetration "
-           f"{meta.get('penetration_weight')}." if meta else ""))
+        + (f" Penalty weights: contact {weights['contact_weight']:g}, penetration "
+           f"{weights['penetration_weight']:g}."
+           if weights.get("contact_weight") is not None else ""))
     paths = plot_style.save_figure(fig, args.out, caption=caption)
     for p in paths:
         print(f"wrote {p}")
