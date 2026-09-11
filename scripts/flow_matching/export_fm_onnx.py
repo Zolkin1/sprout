@@ -41,6 +41,7 @@ import onnx
 import torch
 import torch.nn as nn
 
+from robot_rl.flow_matching.advantage import LABEL_NAMES, label_from_name
 from robot_rl.flow_matching.window import project_window_rotations, window_blocks
 from robot_rl.flow_matching.online import load_fm_context, FmOnlineContext
 
@@ -62,11 +63,34 @@ class _FmSamplerOnnx(nn.Module):
     no inpainting / known mask / re-clamp.
     """
 
-    def __init__(self, ctx: FmOnlineContext):
-        """Capture the model + normalizer statistics as buffers from a loaded context."""
+    def __init__(self, ctx: FmOnlineContext, advantage_label: int | None = None):
+        """Capture the model + normalizer statistics as buffers from a loaded context.
+
+        Args:
+            ctx: The loaded context.
+            advantage_label: For an advantage-conditioned checkpoint, the label to BAKE IN
+                as a constant. It is a constant at inference (the deployment always asks for
+                one arm), so it never becomes a graph INPUT: ``_IO_NAMES``, ``fm_session``
+                on both sides, the C++ ``bound_inputs_`` and the CUDA-graph binding are all
+                untouched, and the negative control is simply a second graph. ``None`` for an
+                unconditioned checkpoint.
+        """
         super().__init__()
         self.model = ctx.model
         self.num_steps = int(ctx.num_steps)
+        self.advantage_label = (None if advantage_label is None else int(advantage_label))
+        if self.advantage_label is not None:
+            # A shape-(1,) CONSTANT, not a batch-derived tensor. `nn.Embedding` returns
+            # (1, d_model), which broadcasts against the (B, d_model) flow-time embedding, so
+            # one constant serves any batch -- and being a constant it folds into an
+            # initializer instead of becoming int64 arithmetic on an input. That matters
+            # beyond tidiness: onnxruntime keeps int64 work on the HOST, and a single host
+            # node makes the whole graph ineligible for CUDA Graph capture (it refuses to
+            # create the session at all), which is where 8.3 of the 14-15 ms Thor budget
+            # comes from.
+            self.register_buffer(
+                "advantage_idx",
+                torch.tensor([self.advantage_label], dtype=torch.long), persistent=False)
         # Plain ints/tuples, so the SO(3) projection below traces as fixed slicing.
         self.nj = int(ctx.nj)
         self.num_extra_frames = int(ctx.target_num_extra_frames)
@@ -128,11 +152,13 @@ class _FmSamplerOnnx(nn.Module):
         # batch and breaks the dynamic-batch contract the five graph inputs share.
         cache = (self.model.encode_prefix(hist_n, height_n, cmd_n, null_m)
                  if self.model.attention_mode == "prefix" else None)
+        adv = None if self.advantage_label is None else self.advantage_idx
         for i in range(self.num_steps):
             # Batch-derived tau (V,) so the graph stays dynamic in the batch axis.
             tau = noise[:, 0, 0] * 0.0 + (i * dt)
-            v = (self.model.decode_future(x, tau, cache) if cache is not None
-                 else self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m))
+            v = (self.model.decode_future(x, tau, cache, adv) if cache is not None
+                 else self.model(x, tau, hist_n, height_n, cmd_n, history_null_mask=null_m,
+                                 advantage=adv))
             x = x + dt * v
         # Project the rotation block back onto SO(3), exactly as
         # ``flow_matching.online.sample_window`` does for simulation -- the model emits 6
@@ -188,6 +214,11 @@ def _fm_meta(ctx: FmOnlineContext) -> dict:
         # the graph is opaque and folds the whole sampler in -- but a loaded artifact should
         # be able to say which architecture it is, because nothing in the weights can.
         "attention_mode": str(ctx.model.attention_mode),
+        # What the N history rows CONTAIN -- the applied reference, or the robot's own
+        # achieved state. Same row WIDTH either way, so this is the only thing that can say
+        # which, and the runtimes refuse a pair whose serving arm disagrees with it. Absent
+        # in graphs exported before the flag, which are definitionally "reference".
+        "history_source": str(getattr(ctx, "history_source", "reference")),
         # What the history tokens must be built from, and the re-plan period the targets
         # were cut at. Both are contracts the runtime has to honour, not descriptions: a
         # deployment feeding a measured history to a partially autoregressive model, or
@@ -332,6 +363,7 @@ def _export_graph(wrapper: nn.Module, dummy: tuple, out_path: str, opset: int,
 def export_fm_onnx(
     checkpoint: str, out_path: str, opset: int = 18, allow_privileged_extero: bool = False,
     dynamic_batch: bool = False,
+    advantage_label: str | None = None,
 ) -> dict:
     """Export ``checkpoint`` to ``out_path`` and embed ``fm_meta``; return the meta.
 
@@ -345,6 +377,10 @@ def export_fm_onnx(
         dynamic_batch: Declare the batch axis symbolic (``"V"``) instead of fixing it at 1.
             Off by default; see :func:`_export_graph` for why a symbolic batch is expensive
             here and why nothing on the deploy path wants one.
+        advantage_label: ``"positive"`` / ``"negative"`` / ``"null"``, BAKED IN as a constant
+            for an advantage-conditioned checkpoint (required for one, refused for any
+            other). It rides ``fm_meta`` so an artifact states which arm it is, since two
+            graphs from one checkpoint are otherwise identical on disk.
 
     Returns:
         The embedded ``fm_meta`` dict.
@@ -353,11 +389,28 @@ def export_fm_onnx(
         ValueError: On a non-command-conditioned checkpoint, or on a privileged-exteroception
             checkpoint without the override.
     """
-    ctx = load_fm_context(checkpoint, device="cpu")
+    # The label goes to the LOADER too, not just the wrapper: a conditioned checkpoint with
+    # no `advantage_serve_label` is refused at load, and the exporter is exactly the caller
+    # that legitimately states the arm on the command line instead of reading it off the file.
+    ctx = load_fm_context(checkpoint, device="cpu", advantage_label=advantage_label)
     if ctx.cmd_dim <= 0:
         raise ValueError("export_fm_onnx expects a command-conditioned checkpoint (cmd_dim>0).")
     _refuse_privileged_extero(ctx, checkpoint, allow_privileged_extero)
-    wrapper = _FmSamplerOnnx(ctx).eval()
+    conditioned = ctx.model.advantage_emb is not None
+    if conditioned and advantage_label is None and ctx.advantage_label is None:
+        raise ValueError(
+            "this checkpoint is advantage-conditioned, so the graph must state WHICH arm it "
+            "is: pass --advantage_label {positive,negative,null}. Defaulting would make the "
+            "deliverable and its own control indistinguishable on disk.")
+    # An unconditioned checkpoint given a label already failed at load, above.
+    # Falling back to the artifact's own arm keeps `export_fm_onnx <best_positive.pt>` working
+    # without restating what the file already says.
+    label_id = ctx.advantage_label
+    if advantage_label is not None:
+        label_id = label_from_name(advantage_label)
+    if label_id is not None:
+        advantage_label = LABEL_NAMES[label_id]
+    wrapper = _FmSamplerOnnx(ctx, label_id).eval()
 
     v, n, f, d, n_cmd, cmd = 1, ctx.N, ctx.F, ctx.D, ctx.num_cmd_tokens, ctx.cmd_dim
     # FLAT exteroception width: one token per sensor (176-ray scan) or one per camera
@@ -372,6 +425,7 @@ def export_fm_onnx(
     _export_graph(wrapper, dummy, out_path, opset, dynamic_batch)
 
     meta = _fm_meta(ctx)
+    meta["advantage_label"] = advantage_label
     model = onnx.load(out_path)
     entry = onnx.StringStringEntryProto(key="fm_meta", value=json.dumps(meta))
     model.metadata_props.append(entry)
@@ -397,14 +451,27 @@ def main() -> None:
              "noise-free dense height scan). Refused by default: no deployment can produce "
              "it, so the graph could only fail later -- and would fail quietly, because the "
              "deploy path substitutes a coarse fallback grid.")
+    p.add_argument(
+        "--advantage_label", default=None, choices=("positive", "negative", "null"),
+        help="Bake this advantage label into the graph as a constant. REQUIRED for an "
+             "advantage-conditioned checkpoint and refused for any other. It is a constant "
+             "at inference, so it never becomes a graph input and the whole deploy-side "
+             "contract is untouched; the negative arm is simply a second export.")
     args = p.parse_args()
     # Named for the checkpoint, so exporting a second generator beside the first does not
-    # overwrite it and the filename says which model it holds (deploy.artifacts).
+    # overwrite it and the filename says which model it holds (deploy.artifacts). The label
+    # joins that name for the same reason: `<run>_fm.onnx` and its negative control come from
+    # ONE checkpoint and differ only in a constant inside the graph.
     out = args.out or os.path.join(os.path.dirname(args.checkpoint),
                                    fm_artifact_name(args.checkpoint))
+    if args.advantage_label and not args.out:
+        stem, ext = os.path.splitext(out)
+        out = f"{stem[:-3]}_{args.advantage_label}_fm{ext}" if stem.endswith("_fm") \
+            else f"{stem}_{args.advantage_label}{ext}"
     export_fm_onnx(args.checkpoint, out, args.opset,
                    allow_privileged_extero=args.allow_privileged_extero,
-                   dynamic_batch=args.dynamic_batch)
+                   dynamic_batch=args.dynamic_batch,
+                   advantage_label=args.advantage_label)
 
 
 if __name__ == "__main__":

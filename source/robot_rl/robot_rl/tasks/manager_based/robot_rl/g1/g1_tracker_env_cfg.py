@@ -69,6 +69,7 @@ from .g1_depth_env_cfg import (
     G1TeacherTerrainDepthEnvCfg,
     G1TeacherTerrainDepthObservationsCfg,
     apply_depth_play_trims,
+    install_fm_depth_group,
 )
 from .g1_teacher_env_cfg import REPLAN_PERIOD_K, G1TeacherObservationsCfg
 from .g1_teacher_terrain_env_cfg import G1TeacherTerrainEnvCfg
@@ -148,6 +149,17 @@ class G1FmTrackerCommandsCfg:
     """Robot-state-conditioned FM tracking command (live robot history, world-frame CLF)."""
 
     traj_ref = FmTrackingCommandCfg(
+        # ODOMETRY-FREE BY DEFAULT. Under "plan" the window's base_pose is measured from
+        # the root at the last re-plan, so the generator's output IS the observation and the
+        # deploy runtime serves it without ever reading the robot's world position. Under
+        # "robot_now" it must convert every control step, which on hardware is real odometry
+        # -- and the C++ runtime refuses that arm by design rather than by omission.
+        #
+        # Set HERE, on the task, not on window.DEFAULT_WINDOW_ANCHOR: runs predating the
+        # field carry no window_anchor in their saved config and resolve to that constant,
+        # so moving it would change what their recorded convention string means and
+        # provenance.check_run_conventions would start refusing them.
+        window_anchor="plan",
         contact_bodies=[".*_ankle_roll_link"],
         # No default library -- ``--clip`` sets this and scene.terrain.clip_library_path
         # together (see g1_teacher_terrain_env_cfg).
@@ -214,6 +226,11 @@ class G1FmTrackerTerrainEnvCfg(G1TeacherTerrainEnvCfg):
         """
         super().__post_init__()
         self.rewards = G1TrackerRewardCfg()
+        # ``scene.terrain.render_decor`` is deliberately left at the teacher's (off) here,
+        # unlike the DEPTH tracker below. Decoration is visual-only and lives on the
+        # collider-less ``/World/decor`` prim, which a height scan -- a ray cast at
+        # ``/World/ground`` alone -- cannot reach. Both this task's policy and its generator
+        # read that scan, so rendering the walls would change nothing either of them sees.
 
 
 def _apply_tracker_play_trims(cfg) -> None:
@@ -236,6 +253,28 @@ def _apply_tracker_play_trims(cfg) -> None:
     cfg.observations.reference.enable_corruption = False
     cfg.events.push_robot = None
     cfg.events.randomize_ground_contact_friction = None
+    # End with the CLIP, not on the 20 s wall. Without this every episode runs the full
+    # padded 20 s: a 285-frame clip is 5.7 s of motion and then 14 s of the robot being
+    # commanded the last frame's velocity (the look-ahead gather clamps, so `target_vel`
+    # saturates) straight off a finite tile. Falls in that tail say nothing about the
+    # policy, and they dominate what a viewer sees.
+    #
+    # This is NOT the clip-grading the task drops on purpose. `clip_end_reached` is wired
+    # `time_out=True` -- a TRUNCATION, so rsl-rl bootstraps the value from the final state
+    # rather than scoring it as a failure -- and it reads only the clip's LENGTH, never its
+    # pose. The terms this task refuses (`base_pose_error`, `ee_pose_error`) are the ones
+    # that measure the robot against a clip the generator is free to depart from.
+    #
+    # Same term and the same parameters the eval harness installs (eval/runner.py), so a
+    # run watched here and a cell measured there share their episode boundaries instead of
+    # agreeing only by whoever retyped them. `reserve_lookahead` ends one reference window
+    # (50 steps) early, since the last window of every clip is a clamp artefact.
+    cfg.terminations.clip_end = DoneTerm(
+        func=mdp.clip_end_reached,
+        params={"command_name": "traj_ref", "reserve_lookahead": True},
+        time_out=True,
+    )
+
     # Draw the FM reference markers + the height-scan ray hits on the treads.
     cfg.commands.traj_ref.debug_vis = True
     cfg.scene.height_scanner.debug_vis = True
@@ -293,6 +332,24 @@ class G1FmTrackerTerrainDepthEnvCfg(G1TeacherTerrainDepthEnvCfg):
         """Run the depth teacher's setup, then re-impose the generator/clip barrier."""
         super().__post_init__()
         self.rewards = G1TrackerRewardCfg()
+        # THE GENERATOR READS BOTH CAMERAS; the inherited policy group reads the near one
+        # alone (g1_depth_env_cfg). This is what puts the far camera back in front of an
+        # observation term -- without it ``mdp.fm_depth_groups`` returns None = "every
+        # group", ``FmTrackingCommand._read_extero`` would hand a two-camera generator ONE
+        # camera, and the resulting shape mismatch is the good case; a one-camera checkpoint
+        # would simply run half blind. At the policy's own resolution the group's terms point
+        # at the EXISTING scene sensors, so nothing is cast twice and the DR is untouched;
+        # ``play.py`` re-installs it at the checkpoint's resolution when the generator
+        # samples its own grid.
+        install_fm_depth_group(self)
+        # DECORATION BACK ON. The teacher's training scene renders none of it (the tile
+        # walls, the flat-tile rooms, a clutter sidecar) because nothing in this stack avoids
+        # obstacles and it only costs depth pixels over a 12k-iteration run. The generator is
+        # the opposite case: it reads terrain from the cameras and was recorded with the
+        # decoration visible, so driving it against a bare world is off-distribution in the
+        # one variable it conditions on -- and a vertical surface it has never seen is what
+        # it misreads as a box.
+        self.scene.terrain.render_decor = True
         # The depth teacher is a BODY-tracking env, and FmTrackingCommand refuses body mode:
         # the body CLF grades 13 '@root' links the generator does not predict, so under
         # strict_fm_only they would all be NaN. Nothing is lost here -- this task's CLF is

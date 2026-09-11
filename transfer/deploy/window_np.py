@@ -165,6 +165,84 @@ def window_block_slices(
     return out
 
 
+#: Port of ``robot_rl.flow_matching.window.MEASURED_HISTORY_FALLBACK`` -- the node content a
+#: MEASURED history row cannot fill on a robot (no odometry, no base linear-velocity
+#: estimate) and takes from the last SERVED node instead.  Kept in step with that module by
+#: ``deploy/tests/test_measured_history_np.py``, which compares the spans both sides produce
+#: over two different block selections.
+MEASURED_HISTORY_FALLBACK: tuple[str, ...] = ("base_pos", "base_lin_vel")
+
+#: Where each :data:`MEASURED_HISTORY_FALLBACK` name sits inside its parent block.
+_FALLBACK_HALVES: dict[str, tuple[str, int, int]] = {
+    "base_pos": ("base_pose", 0, 3),
+    "base_lin_vel": ("base_vel", 0, 3),
+}
+
+
+#: Port of ``robot_rl.flow_matching.window.HISTORY_ARM_SOURCE``. No ``"clip"`` entry is
+#: needed on this side -- the deploy runtime has no teacher-forcing arm.
+HISTORY_ARM_SOURCE: dict[str, str] = {
+    "generator": "reference",
+    "measured": "measured",
+}
+
+
+def assert_history_source_matches(history_from: str, checkpoint_source: str | None,
+                                  where: str = "") -> None:
+    """Refuse a serving arm the generator was not fitted for.
+
+    Port of ``robot_rl.flow_matching.window.assert_history_source_matches``. The two history
+    kinds produce rows of identical width, so a mismatch loads clean and is merely wrong --
+    which is why this refuses at load rather than warning.
+
+    Args:
+        history_from: The runtime's serving arm.
+        checkpoint_source: What the graph's ``fm_meta`` declares. ``None`` means a graph
+            older than the flag, which is definitionally ``"reference"``.
+        where: Optional context for the message (an artifact path).
+
+    Raises:
+        ValueError: On an unknown arm, or an arm the graph does not match.
+    """
+    want = HISTORY_ARM_SOURCE.get(history_from)
+    if want is None:
+        raise ValueError(
+            f"history_from={history_from!r} is not one of {sorted(HISTORY_ARM_SOURCE)}.")
+    got = str(checkpoint_source or "reference")
+    if got != want:
+        raise ValueError(
+            f"history_from={history_from!r} needs a generator trained with "
+            f"history_source={want!r}, but {where or 'this fm.onnx'} declares "
+            f"history_source={got!r}.\n"
+            "The two produce history rows of the SAME WIDTH, so this would load and run and "
+            "simply feed the model a kind of history it was never fitted on. Either serve "
+            f"the arm it was trained for, or point --fm_onnx at a {want!r}-trained graph.")
+
+
+def measured_history_fallback_spans(
+    num_joints: int, num_ee_frames: int, blocks: Sequence[str] | None = None
+) -> tuple[tuple[int, int], ...]:
+    """Column spans of :data:`MEASURED_HISTORY_FALLBACK` within one window node.
+
+    Args:
+        num_joints: Robot joint count ``nj``.
+        num_ee_frames: End-effector frames ``K``.
+        blocks: Subset to include; defaults to all of them.
+
+    Returns:
+        ``((start, stop), ...)`` in packing order -- the same tuple
+        :func:`robot_rl.flow_matching.window.measured_history_fallback_spans` returns.
+    """
+    slices = window_block_slices(num_joints, num_ee_frames, blocks)
+    out = []
+    for name in MEASURED_HISTORY_FALLBACK:
+        parent, lo, hi = _FALLBACK_HALVES[name]
+        if parent in slices:
+            base = slices[parent].start
+            out.append((base + lo, base + hi))
+    return tuple(out)
+
+
 def world_to_window(
     root_pos_w: np.ndarray,
     root_quat_w: np.ndarray,

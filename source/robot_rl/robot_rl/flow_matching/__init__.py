@@ -9,12 +9,14 @@ commanded-velocity profile, generating a future trajectory in the current root f
 """
 
 from .config import (
+    DEFAULT_SKIP_FAMILIES,
     DEPTH_LATENCY_PROBS,
     ATTENTION_MODES,
     EXTERO_CLIP,
     EXTERO_ENCODERS,
     EXTERO_NORM_MODES,
     EXTERO_SOURCES,
+    HISTORY_SOURCES,
     FlowMatchingConfig,
 )
 from .ema import WeightEMA
@@ -27,6 +29,7 @@ from .extero_encoder import (
 from .dataset import (
     FutureStateDataset,
     build_train_val,
+    resolve_skip_families,
     resolve_term_slice,
     snap_windows,
 )
@@ -65,6 +68,10 @@ from .transforms import (
 )
 from .window import (
     BASE_POSE_CONVENTION,
+    HISTORY_ARM_SOURCE,
+    MEASURED_HISTORY_FALLBACK,
+    assert_history_source_matches,
+    measured_history_fallback_spans,
     REFERENCE_BLOCK_KEYS,
     REFERENCE_WINDOW_BLOCK_NAMES,
     REFERENCE_WINDOW_NOISE,
@@ -81,6 +88,7 @@ from .window import (
 )
 
 __all__ = [
+    "DEFAULT_SKIP_FAMILIES",
     "DEPTH_LATENCY_PROBS",
     "FlowMatchingConfig",
     "WeightEMA",
@@ -89,6 +97,11 @@ __all__ = [
     "EXTERO_NORM_MODES",
     "EXTERO_CLIP",
     "ATTENTION_MODES",
+    "HISTORY_SOURCES",
+    "HISTORY_ARM_SOURCE",
+    "MEASURED_HISTORY_FALLBACK",
+    "assert_history_source_matches",
+    "measured_history_fallback_spans",
     "FlowMatchingTransformer",
     "ExteroImageEncoder",
     "ExteroImageEncoderSet",
@@ -98,6 +111,7 @@ __all__ = [
     "snap_windows",
     "Normalizer",
     "build_train_val",
+    "resolve_skip_families",
     "resolve_term_slice",
     "FKChain",
     "flow_matching_loss",

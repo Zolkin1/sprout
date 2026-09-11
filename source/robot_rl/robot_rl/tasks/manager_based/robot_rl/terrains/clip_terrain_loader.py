@@ -31,6 +31,7 @@ import json
 import math
 from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 import trimesh
 
@@ -44,6 +45,7 @@ from .blocks import (
     build_overlay,
 )
 from motion_gen.terrain.decorate import DEFAULT_FLAT_BUFFER
+from motion_gen.terrain.overlay_boxes import GROUND_SLAB_THICKNESS_M, overlay_sub_boxes
 
 from .blocks.base import TerrainBlockCfg
 from .blocks.composite import composite_terrain
@@ -80,13 +82,36 @@ class ClipTerrainLayout:
     # generators author geometry travel-along-tile-+x) and for any manifest predating the field, which
     # reproduces world-axis masking exactly.
     terrain_frame_yaw: dict[int, float] = field(default_factory=dict)
+    # terrain id -> the free-form section's ROUTE block, copied verbatim from the manifest:
+    # spawn pose, goal line and goal band, in the TILE-LOCAL CORNER frame (the frame
+    # ``clip_frame_origin`` places geometry in, so the route and the mesh it describes share
+    # one datum and cannot drift).  EMPTY for every clip library, and that emptiness is what
+    # the clip-free runtime keys on: a free-form library carries a manifest and no clips at
+    # all, so nothing places a reference on a tile and the spawn/goal are AUTHORED with the
+    # terrain instead.  Read by ``mdp.events.resets.freeform_route``; the required field names
+    # are its ``FREEFORM_ROUTE_FIELDS``, which the generator's
+    # ``motion_gen.terrain.freeform.ROUTE_FIELDS`` is pinned equal to by test.
+    terrain_route: dict[int, dict] = field(default_factory=dict)
     # terrain id -> overlay volumes (boxes) in the tile's local-corner frame, as
     # emitted by ``composite_terrain``'s ``meta_data["overlays"]``.  The box world
     # (x, y) for a tile is ``tile_corner[:2] + overlay["pos_xy"]`` (Phase-3 reset).
     terrain_overlays: dict[int, list[dict]] = field(default_factory=dict)
+    # terrain id -> ``(B, 6)`` array of ``(cx, cy, cz, sx, sy, sz)`` COLLIDER boxes in the
+    # tile's local-corner frame: every non-decor overlay expanded through
+    # ``overlay_sub_boxes`` (so a floating tread contributes its slab, not the gap beneath it)
+    # plus a ground slab where the tile has one.  This is what the terrain-consistency reward
+    # evaluates its signed distance against, and it is built HERE rather than from
+    # ``terrain_overlays`` because that metadata drops ``variant``.
+    #
+    # A tile is ABSENT when its geometry is not a box union -- the legacy ``bands`` stair and
+    # slope schemas, whose surfaces are recomputed by their block builders.  Absent rather
+    # than a bare ground slab, because a flat floor under a staircase is exactly the
+    # flat-``ground_z`` mistake that made the FM's terrain-penetration loss inert.
+    terrain_collider_boxes: dict[int, np.ndarray] = field(default_factory=dict)
     # The VISUAL-ONLY decoration, assembled and centred exactly like the ground mesh but kept
-    # out of it. ``None`` for an undecorated library. Carried on the layout rather than added
-    # to ``assemble_clip_terrain``'s return tuple so every existing caller is unaffected.
+    # out of it. ``None`` for an undecorated library, and for ``render_decor=False``. Carried
+    # on the layout rather than added to ``assemble_clip_terrain``'s return tuple so every
+    # existing caller is unaffected.
     decor_mesh: object | None = None
 
 
@@ -221,7 +246,15 @@ def _overlays_from_manifest(entry: dict) -> list[OverlayVolumeCfg]:
                 "build_overlay and every renderer that consumes them."
             )
         kind = str(ov.get("kind", "box"))
-        if kind not in OVERLAY_KINDS:
+        # A cylinder is a DECORATION-ONLY kind. Its whole value is a depth silhouette a box
+        # cannot make -- curved returns instead of flat faces -- and it is only ever visual,
+        # so it never has to be walked on, collided with, or decomposed into the sub-boxes
+        # every walkable variant is built from. Allowing it on the walkable path would mean
+        # a top surface that disagrees with the mesh, which is the substitution the check
+        # below exists to prevent.
+        if kind == "cylinder" and bool(ov.get("decor", False)):
+            pass
+        elif kind not in OVERLAY_KINDS:
             raise ValueError(
                 f"terrain {entry.get('terrain_id')} overlay {i} has kind={kind!r}; expected one "
                 f"of {sorted(OVERLAY_KINDS)}. An unknown kind is silently drawn as a box, which "
@@ -295,6 +328,20 @@ def _flat_decor_overlays(lib, flat_fp: tuple[float, float],
     got the 2.0 while training got the 20.0. Absolute coordinates resolved offline would land
     in the wrong place the moment it moved. This adds the centre back.
 
+    **There is no ``render_decor`` argument, deliberately.** This used to take one and return
+    early on it, which put the ONLY validation of ``flat_tile_decor`` content
+    (:func:`_overlays_from_manifest`, which refuses an unknown ``kind`` and a non-zero ``yaw``)
+    behind the flag: a malformed room was accepted by a decor-off teacher and then raised
+    hours later on the recorder or the eval, which run with decoration on. Manifest-borne
+    decor never had that asymmetry -- it is validated in the specs loop whatever the flag says
+    -- so the rooms are built and validated here unconditionally and :func:`_tile_mesh` drops
+    them, which is the single suppression point it claims to be. It costs a few boxes per flat
+    tile that are then discarded.
+
+    That is also why the flag cannot be applied here: a room overlay with ``decor=False``
+    (``DecorateConfig.wall_collidable``) is WALKABLE, so dropping it under ``render_decor=False``
+    would move the ground mesh -- the one thing the flag must never do.
+
     Args:
         lib: The loaded clip library.
         flat_fp: The flat tile footprint, in metres.
@@ -302,7 +349,7 @@ def _flat_decor_overlays(lib, flat_fp: tuple[float, float],
 
     Returns:
         Overlay configs in the tile's local-corner frame; empty when the library carries no
-        flat decor, which is every library predating it.
+        flat decor (every library predating it).
     """
     raw = lib.attrs.get("flat_tile_decor") if getattr(lib, "attrs", None) else None
     if not raw:
@@ -321,10 +368,36 @@ def _flat_decor_overlays(lib, flat_fp: tuple[float, float],
     return out
 
 
+def _decor_mesh(ov) -> "trimesh.Trimesh":
+    """One decoration overlay as a mesh, cylinders included.
+
+    Everything except a cylinder goes through ``build_overlay`` exactly as the walkable path
+    does, so decoration and terrain cannot drift apart in how a box is meshed.
+
+    Args:
+        ov: The overlay cfg.
+
+    Returns:
+        The mesh, positioned in the tile frame.
+    """
+    if getattr(ov, "kind", "box") != "cylinder":
+        return build_overlay(ov).mesh
+    sx, sy, sz = ov.size_xyz
+    # Radius from the mean of the two footprint extents, so an author who writes a square
+    # footprint gets the obvious cylinder and one who writes a rectangle gets its inscribed
+    # circle rather than a silent stretch (trimesh cylinders are circular, not elliptical).
+    m = trimesh.creation.cylinder(radius=float(min(sx, sy)) / 2.0, height=float(sz),
+                                  sections=16)
+    m.apply_translation((float(ov.pos_xy[0]), float(ov.pos_xy[1]),
+                         float(ov.base_z) + float(sz) / 2.0))
+    return m
+
+
 def _tile_mesh(
     footprint: tuple[float, float],
     blocks: list[TerrainBlockCfg],
     overlays: list[OverlayVolumeCfg] | None = None,
+    render_decor: bool = True,
 ) -> tuple[trimesh.Trimesh, list[dict], trimesh.Trimesh | None]:
     """Concatenated mesh of one tile (composite blocks + overlays) in local coords.
 
@@ -337,17 +410,22 @@ def _tile_mesh(
     ``decor_mesh`` is ``None`` when the tile has no decoration, which is every tile in an
     undecorated library.
 
+    ``render_decor=False`` is the SINGLE suppression point for the decoration channel: the
+    decor overlays are dropped here, after the split and before anything is meshed, so no
+    caller can add a decor source that escapes it. The walkable half of the split is untouched
+    by the flag, which is what makes the ground mesh byte-identical either way.
+
     An empty ``blocks`` builds a NO-GROUND tile: only the overlay volumes are meshed (a
     self-supporting structure such as a floating staircase), with no flat ground plane filling the
     footprint. ``composite_terrain`` requires a base block, so that path is built directly here; the
     per-overlay metadata mirrors ``composite_terrain``'s so downstream consumers are unaffected.
     """
     overlays = list(overlays or [])
-    decor_cfgs = [o for o in overlays if getattr(o, "decor", False)]
+    decor_cfgs = ([o for o in overlays if getattr(o, "decor", False)] if render_decor else [])
     overlays = [o for o in overlays if not getattr(o, "decor", False)]
     decor_mesh = None
     if decor_cfgs:
-        decor_mesh = trimesh.util.concatenate([build_overlay(o).mesh for o in decor_cfgs])
+        decor_mesh = trimesh.util.concatenate([_decor_mesh(o) for o in decor_cfgs])
     if not blocks:
         meshes: list[trimesh.Trimesh] = []
         ov_meta: list[dict] = []
@@ -374,6 +452,43 @@ def _tile_mesh(
     )
     meshes, _origin, meta = composite_terrain(0.0, sub)
     return trimesh.util.concatenate(meshes), meta.get("overlays", []), decor_mesh
+
+
+def _tile_collider_boxes(
+    footprint: tuple[float, float],
+    blocks: list[TerrainBlockCfg],
+    overlays: list[OverlayVolumeCfg],
+) -> np.ndarray | None:
+    """One tile's COLLIDER boxes in tile-local coordinates, or ``None`` if it is not boxes.
+
+    Built from the block/overlay CFGS rather than from ``composite_terrain``'s overlay
+    metadata, because that metadata carries no ``variant`` -- so a ``floating`` tread would
+    come back as a solid pillar and the reward would charge a robot for passing under it.
+
+    Args:
+        footprint: The tile's ``(size_x, size_y)`` (m).
+        blocks: The tile's ground blocks. Only an all-flat set can be expressed as a box; a
+            legacy stair or slope block cannot.
+        overlays: The tile's overlay volumes, decor included (it is filtered here).
+
+    Returns:
+        ``(B, 6)`` float64 centres + FULL extents, or ``None`` when the tile's ground is not
+        a flat slab.
+    """
+    if blocks and not all(isinstance(b, FlatBlockCfg) for b in blocks):
+        return None
+    boxes: list[tuple[float, ...]] = []
+    for ov in overlays:
+        if getattr(ov, "decor", False):
+            continue
+        boxes.extend(overlay_sub_boxes(
+            str(ov.variant), tuple(ov.size_xyz), tuple(ov.pos_xy), float(ov.base_z),
+            float(ov.slab_thickness), tuple(ov.leg_size), float(ov.leg_inset)))
+    if blocks:
+        sx, sy = float(footprint[0]), float(footprint[1])
+        t = GROUND_SLAB_THICKNESS_M
+        boxes.append((sx / 2.0, sy / 2.0, -t / 2.0, sx, sy, t))
+    return np.asarray(boxes, dtype=np.float64) if boxes else None
 
 
 def default_num_flat_tiles(lib) -> int:
@@ -409,6 +524,7 @@ def assemble_clip_terrain(
     size_margin: float = 1.0,
     flat_buffer: float = DEFAULT_FLAT_BUFFER,
     transition_back_buffer: float = 1.0,
+    render_decor: bool = True,
 ) -> tuple[trimesh.Trimesh, torch.Tensor, ClipTerrainLayout]:
     """Build the whole terrain mesh + env origins from a clip library manifest.
 
@@ -436,6 +552,10 @@ def assemble_clip_terrain(
             directly -- drew flat tiles 36 m smaller than the ones training built.
         transition_back_buffer: Flat (m) prepended to each transition tile BEHIND
             the robot's start (the clip is shifted forward by this much).
+        render_decor: Build the VISUAL-ONLY decoration (``decor=True`` overlays -- tile walls,
+            flat-tile rooms, clutter). ``False`` returns ``layout.decor_mesh is None`` and
+            leaves the ground mesh, the tile corners and the origins byte-identical; see
+            :func:`_tile_mesh`, which is where the suppression happens.
 
     Returns:
         ``(mesh, origins[num_rows, num_tiles, 3], layout)`` -- the concatenated
@@ -534,10 +654,20 @@ def assemble_clip_terrain(
         specs.append((tid, 4, box_fp, ground, 0.0, _overlays_from_manifest(m)))
         clip_size_y[tid], type_code[tid] = float(m["size_y"]), 4
     for _i_flat in range(n_flat):
+        # Built (and VALIDATED) whatever ``render_decor`` says; _tile_mesh does the dropping.
         specs.append((_FLAT_TERRAIN_ID, 0, flat_fp,
                       [FlatBlockCfg(size_x=flat_fp[0], skill_probs={_TRIVIAL_SKILL: 1.0})], 0.0,
                       _flat_decor_overlays(lib, flat_fp, _i_flat)))
     clip_size_y[_FLAT_TERRAIN_ID], type_code[_FLAT_TERRAIN_ID] = flat_fp[1], 0
+
+    # Per-tile collider boxes for the terrain-consistency reward. One pass over the specs so
+    # every tile class is covered by the same rule and none can be forgotten as a class is
+    # added.
+    terrain_collider_boxes: dict[int, np.ndarray] = {}
+    for _tid, _tc, _fp, _blocks, _cxoff, _ovs in specs:
+        got = _tile_collider_boxes(_fp, _blocks, _ovs)
+        if got is not None:
+            terrain_collider_boxes[int(_tid)] = got
 
     # Terrain frame per terrain id (see ClipTerrainLayout.terrain_frame_yaw): AUTHORED in the
     # manifest, defaulting to the tile's own +x so every manifest predating the field keeps the
@@ -546,6 +676,13 @@ def assemble_clip_terrain(
         int(m["terrain_id"]): float(m.get("frame_yaw", 0.0)) for m in manifest
     }
     terrain_frame_yaw[_FLAT_TERRAIN_ID] = 0.0
+    # The free-form section routes (see ClipTerrainLayout.terrain_route).  Only tiles that
+    # declare one appear -- a clip library declares none, and the FLAT FILLER tile never does
+    # (it is synthesised here rather than authored, so it has no start pose and no goal).  A
+    # free-form library asks for zero filler tiles, so no env can land on one.
+    terrain_route: dict[int, dict] = {
+        int(m["terrain_id"]): dict(m["route"]) for m in manifest if m.get("route")
+    }
 
     num_tiles = len(specs)
     if num_tiles == 0:
@@ -584,7 +721,7 @@ def assemble_clip_terrain(
         xoff = r * rep_w                                    # replicas side-by-side in x
         for c, (tid, _tc, fp, blocks, cxoff, overlays) in enumerate(specs):
             x, y = xoff + base_xy[c][0], base_xy[c][1]
-            m, ov_meta, dm = _tile_mesh(fp, blocks, overlays)
+            m, ov_meta, dm = _tile_mesh(fp, blocks, overlays, render_decor)
             m.apply_translation((x, y, 0.0))
             meshes.append(m)
             if dm is not None and len(dm.faces):
@@ -621,7 +758,9 @@ def assemble_clip_terrain(
         tile_corner=tile_corner, tile_footprint=tile_fp, tile_clip_x_offset=tile_cxoff,
         clip_size_y=clip_size_y, terrain_type_code=type_code,
         terrain_frame_yaw=terrain_frame_yaw,
+        terrain_route=terrain_route,
         terrain_overlays=terrain_overlays,
+        terrain_collider_boxes=terrain_collider_boxes,
         decor_mesh=decor_mesh,
     )
     return mesh, origins, layout

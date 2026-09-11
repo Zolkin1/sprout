@@ -49,10 +49,17 @@ struct RobotAsset {
 ///   tracker: `tracker.onnx`'s `policy_parameters.robot_asset`.
 ///   fm: `fm.onnx`'s `fm_meta.robot_asset`.
 ///   tracker_name / fm_name: paths, for the message.
+///   allow_mismatch: WARN on stderr and load the pair anyway, instead of throwing. Off by
+///     default and it must stay that way -- a wrong pairing is invisible to every shape check,
+///     and this is what would catch a tracker exported against one robot running a generator
+///     trained on another. Turn it on only for a delta someone has read and understood; the
+///     warning names every differing field precisely so that is possible.
 ///
 /// Throws:
-///   std::runtime_error if both carry a fingerprint and a shared field differs.
+///   std::runtime_error if both carry a fingerprint, a shared field differs, and
+///   `allow_mismatch` is false.
 void AssertRobotAssetsAgree(const RobotAsset& tracker, const RobotAsset& fm,
-                            const std::string& tracker_name, const std::string& fm_name);
+                            const std::string& tracker_name, const std::string& fm_name,
+                            bool allow_mismatch = false);
 
 }  // namespace g1_deploy

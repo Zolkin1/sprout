@@ -13,7 +13,10 @@ kept so the MB clips can be compared against a matcher baseline in an ablation.
 | `beam.py` | approximate beam search |
 | `dp.py` | exact backward dynamic program — the strongest of the three |
 | `locomotion_db.py` | assembles the flat bones + clean-stride + jump-lead-in DB the matchers search |
-| `features.py` | the matching feature space (trajectory + pose features) and its FK |
+
+`features.py` moved UP out of this package (to `motion_gen/features.py`) when the repo was
+slimmed: the matching feature space and its FK are read by live code, so they could not stay
+inside a deprecated one.
 | `slope_rotate.py` | rotates flat clips onto a slope — shelved (works only straight up/down-slope; cross-slope and turning clips lean sideways) |
 
 `trajopt_ingest.py` and `mm_clip_generator.py` were removed when the trajectory-manager stack

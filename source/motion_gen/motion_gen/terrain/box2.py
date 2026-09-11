@@ -1,0 +1,363 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+
+"""The mjeval TWO-BOX course, as a free-form Isaac terrain section.
+
+This is a deliberate departure from :mod:`~motion_gen.terrain.freeform`, whose families are
+RANDOMISED so a fine-tune sees a distribution.  Here the geometry is FIXED and is a clone of one
+specific MuJoCo eval course -- ``mjeval_box2_h040``, two 0.40 m boxes 3 m apart -- because the
+question being asked is not "does the generator handle boxes" but "can it be taught to pick the
+right MODE on THIS obstacle".  Overfitting to it is the point, so the terrain must not vary.
+
+**Why this course.**  Measured over 20 flow-noise seeds x 10 speeds in MuJoCo, the deployed pair
+scores **0.060 unsteered / 0.145 steered** on it -- and 0/10 at every speed on the deterministic
+``x0 = 0`` draw the hardware runs.  It is the worst course in the mjeval catalogue and the only
+one that fails at every speed, while the SINGLE 0.40 m box (identical geometry, one box) scores
+0.70.  So the second box is what breaks it, the failure is a mode choice rather than a capability
+limit, and the generator visibly proposes different modes there (``view_cell.py --plans``).
+
+**The geometry is MIRRORED, not re-derived.**  Every constant below is mjeval's, restated here
+because ``source/motion_gen`` must not import ``transfer`` (it is the offline generation package
+and stays free of the deploy stack, exactly as it stays free of IsaacLab).  The two copies are
+held together by a parity test rather than by an import --
+``transfer/sim/tests/test_box2_matches_mjeval.py`` imports BOTH and requires them to agree, which
+is the same device ``freeform.OVERLAY_KINDS`` uses against the RL loader's own table.  A silent
+divergence here would mean the Isaac fine-tune and the MuJoCo evaluation were run on two
+different obstacles while every artifact said otherwise.
+
+**What varies across tiles is the SPAWN DISTANCE and nothing else.**  One tile per approach
+distance, identical boxes, so an initial-condition grid over distance is a grid over TILES and
+needs no per-episode override: the reset already reads the spawn off the manifest's route block
+(``mdp.reset_on_freeform_section``).  The other IC axis, commanded speed, is a COMMAND and is
+pinned per recording run by ``freeform_speed_min == freeform_speed_max``.
+"""
+
+from __future__ import annotations
+
+from motion_gen.terrain.freeform import (
+    GOAL_INSET_M,
+    SECTION_MARGIN_M,
+    FREEFORM_SPAWN_JITTER_M,
+    SPAWN_INSET_M,
+    _base_tile,
+    _fit_goal_half_width,
+    spawn_area,
+    _ground_overlay,
+    _overlay,
+    _route,
+)
+
+#: Family tag for these tiles.  Distinct from :data:`freeform.FAMILIES` on purpose: a consumer
+#: that splits by family must be able to tell a fixed course from a randomised section, and the
+#: eval's family tables key off exactly this string.
+BOX2_FAMILY: str = "box2"
+
+#: Family for the v2 (goal moved out) variant.  DISTINCT on purpose -- see
+#: :data:`GOAL_SHIFT_V2_M` for why the two must never pool.
+BOX2_V2_FAMILY: str = "box2_v2"
+
+# --------------------------------------------------------------------------------------------
+# mjeval's geometry.  Mirrored from ``transfer/sim/mjeval/terrains.py`` and
+# ``transfer/sim/generate_stairs_scene.py``; pinned by test_box2_matches_mjeval.py.
+# --------------------------------------------------------------------------------------------
+
+#: Box top height (m).  ``EVAL_BOX_HEIGHTS[1]``, and the height the two-box course is built at.
+BOX_HEIGHT_M: float = 0.40
+
+#: Extent along travel (m), ``EVAL_BOX_DEPTH``.  **Deliberately out of distribution**: every
+#: trained box is 0.46-0.48 m deep, under one stride, so a robot never stands on top and the
+#: jump up and the jump down collapse into one ballistic event instead of the two this course
+#: exists to separate.  Carried here so the deviation lives in the manifest, not in a comment.
+BOX_DEPTH_M: float = 1.20
+
+#: Lateral extent (m), ``generate_stairs_scene.TRAINED_BOX_WIDTH`` -- the jump_on median.
+BOX_WIDTH_M: float = 2.59
+
+#: Flat ground between the two boxes (m).  The whole reason this course is hard: it is long
+#: enough to demand a landing, a re-approach and a second commitment.
+BOX_GAP_M: float = 3.00
+
+#: How far past the last box face mjeval puts the goal CENTRE (m), ``TARGET_LEAD``.
+TARGET_LEAD_M: float = 1.50
+
+#: Depth of mjeval's goal RECTANGLE along travel (m), ``GOAL_DEPTH``.
+GOAL_DEPTH_M: float = 2.00
+
+#: How much further out the **v2** variant puts the goal (m).
+#:
+#: The BOXES DO NOT MOVE.  v2 is the same obstacle with a longer run-out: the robot has to
+#: stay up for an extra 3 m after clearing box 2 before the line counts.  The tile grows to
+#: match, because ``size_x`` is derived from ``goal_x``.
+#:
+#: **v1 and v2 success rates are NOT comparable**, which is the whole reason the variant has
+#: its own family (:data:`BOX2_V2_FAMILY`) and its own library files rather than a flag: a
+#: longer run-out is strictly more chances to fall, so a v2 number is lower than a v1 number
+#: on the same policy for a reason that has nothing to do with the policy.  Anything that
+#: groups by family therefore keeps them apart by default -- ``box2_ic_report``,
+#: ``binarize``'s per-cell threshold, every report that breaks a result down by family.
+GOAL_SHIFT_V2_M: float = 3.00
+
+#: v2's lead: the v1 lead plus :data:`GOAL_SHIFT_V2_M`.
+TARGET_LEAD_V2_M: float = TARGET_LEAD_M + GOAL_SHIFT_V2_M
+
+#: Half-extent of mjeval's goal band (m).  ``_with_goal_width`` resolves this course to
+#: ``max(GOAL_HALF_WIDTH_FLOOR=2.5, BOX_WIDTH_M / 2 + GOAL_WIDTH_MARGIN=1.0)`` = 2.5.
+GOAL_HALF_WIDTH_M: float = 2.50
+
+# --------------------------------------------------------------------------------------------
+# The initial-condition grid.
+# --------------------------------------------------------------------------------------------
+
+#: Spawn distances (m) from the pelvis to the FIRST box face, one tile each.  Brackets mjeval's
+#: own 2.5 m approach on both sides.
+TRAIN_SPAWN_DISTANCES_M: tuple[float, ...] = (1.5, 2.0, 2.5, 3.0, 4.0)
+
+#: The HELD-OUT approach distance (m).  Interior to the training range and off its grid, so the
+#: held-out cell tests interpolation over the IC rather than extrapolation past it -- the latter
+#: would confound "the critic did not generalise" with "the state was never seen".
+HOLDOUT_SPAWN_DISTANCE_M: float = 2.25
+
+#: Commanded forward speeds (m/s), one recording run each.  The first four are the rungs of
+#: mjeval's own box ladder where the 20-seed sweep found ANY successes; the last two scored
+#: 0.000 at both steering settings and are included deliberately, as the saturated-failure
+#: anchor a critic needs in order to have a boundary to place.
+#:
+#: **This is a LADDER for an eval, not the training distribution.**  A recording pins one rung
+#: per run so a cell is a (distance, speed) pair; training samples :data:`COMMANDED_SPEED_RANGE_MPS`
+#: continuously per episode, as the up-into-down and varied courses do.
+TRAIN_SPEEDS_MPS: tuple[float, ...] = (0.50, 0.83, 1.17, 1.50, 1.83, 2.17)
+
+#: The band a TRAINING run samples continuously, stamped into ``generator_config`` under the
+#: key ``clip_io.read_commanded_speed_range`` reads.
+#:
+#: **These are exactly the numbers the fine-tune loop already fell back to** when a library
+#: declared nothing (``SPEED_MIN=0.5`` / ``SPEED_MAX=2.2`` in ``run_finetune_loop.sh``), so
+#: declaring them changes no run that has ever been recorded -- it moves the statement from a
+#: default in a shell script into the artifact, which is where every other contract in this
+#: tree lives.  The ladder above spans 0.50-2.17 and sits inside it.
+#:
+#: It does NOT move the terrain fingerprint: ``generator_config`` is deliberately outside
+#: ``fingerprint_terrain_manifest``, because a commanded speed is not geometry.
+COMMANDED_SPEED_RANGE_MPS: tuple[float, float] = (0.5, 2.2)
+
+#: The HELD-OUT commanded speed (m/s).  Between rungs 2 and 3 of the training ladder, where the
+#: MuJoCo sweep puts success in the interesting 0.25-0.75 band rather than at either saturation.
+HOLDOUT_SPEED_MPS: float = 1.00
+
+
+#: Keep-out band from a box top's edges when spawning on it (m).  The robot must start with
+#: both soles fully on the surface and room to take a step without walking off the side it did
+#: not intend to leave from, so the usable rectangle is the box inset by this on all four
+#: sides: at :data:`BOX_DEPTH_M` 1.20 x :data:`BOX_WIDTH_M` 2.59 that leaves 0.60 x 1.99 m,
+#: against a stance roughly 0.25 m long and 0.30 m wide.
+BOX_SPAWN_EDGE_BUFFER_M: float = 0.30
+
+#: Relative draw weight of each spawn area: the ground start, box 1's top, box 2's top.  Equal
+#: thirds.
+#:
+#: **Why spawn on the boxes at all.** The course needs two correct jumps and the second is only
+#: reachable by first getting the first right, so a ground-only spawn collects the second
+#: dismount only in the rare episodes that already solved the first. Measured: of 352
+#: successful episodes on this course, EVERY one reached the goal by stairs-down-ing off a box
+#: -- a correct two-jump traverse never appeared in the data at all, so no reweighting could
+#: select for it. Starting on box 2 makes the final dismount its own, frequent, isolated
+#: problem; starting on box 1 does the same for the gap crossing.
+BOX2_SPAWN_WEIGHTS: tuple[float, float, float] = (1.0, 1.0, 1.0)
+
+
+def box_faces(spawn_distance_m: float) -> tuple[tuple[float, float], ...]:
+    """The two boxes' near and far faces, tile-local, for a given approach distance.
+
+    Args:
+        spawn_distance_m: Pelvis-to-first-face distance at spawn (m).
+
+    Returns:
+        ``((x0, x1), (x0, x1))`` for box 0 and box 1.
+    """
+    off_x = SECTION_MARGIN_M + SPAWN_INSET_M
+    a0 = off_x + float(spawn_distance_m)
+    a1 = a0 + BOX_DEPTH_M
+    b0 = a1 + BOX_GAP_M
+    return ((a0, a1), (b0, b0 + BOX_DEPTH_M))
+
+
+def make_box2_tile(terrain_id: int, spawn_distance_m: float, *,
+                   target_lead_m: float = TARGET_LEAD_M,
+                   family: str = BOX2_FAMILY) -> dict:
+    """One two-box section, spawning ``spawn_distance_m`` before the first box.
+
+    **The goal is mjeval's, mapped rather than re-invented.**  mjeval scores arrival inside a
+    RECTANGLE -- centre ``far + TARGET_LEAD``, depth :data:`GOAL_DEPTH_M`, half-width
+    :data:`GOAL_HALF_WIDTH_M` -- while ``mdp.freeform_goal_reached`` tests a downrange LINE plus
+    a lateral band (``x >= goal_x`` and ``|y - goal_y| <= half_width``).  The line is therefore
+    put at the rectangle's NEAR edge, so the two agree on the boundary that decides the outcome.
+    They differ only on a robot that runs past the rectangle's far edge, which mjeval scores a
+    failure and this scores a success -- and here that case is not reachable, because arrival
+    ends the episode the moment the line is crossed.
+
+    Args:
+        terrain_id: The tile id.
+        spawn_distance_m: Pelvis-to-first-face distance at spawn (m).
+        target_lead_m: How far past box 2's far face the goal RECTANGLE's centre sits (m).
+            Defaults to mjeval's :data:`TARGET_LEAD_M`; :data:`TARGET_LEAD_V2_M` is the v2
+            variant.  Only the goal and the tile length move -- the boxes are placed from
+            ``spawn_distance_m`` alone and are identical across variants.
+        family: The manifest family, which is what keeps v1 and v2 from pooling in any
+            report or per-family threshold.  Pass :data:`BOX2_V2_FAMILY` with the v2 lead.
+
+    Returns:
+        The manifest entry, carrying its ``route`` block and a ``box2`` record of the geometry.
+
+    Raises:
+        ValueError: If the tile's ground cannot hold the goal band (via
+            :func:`~motion_gen.terrain.freeform._fit_goal_half_width`).
+    """
+    (a0, a1), (b0, b1) = box_faces(spawn_distance_m)
+    off_x = SECTION_MARGIN_M + SPAWN_INSET_M
+
+    # The y half-extent is set by the GOAL BAND, not by the boxes: at 2.5 m it is wider than the
+    # 2.59 m box (1.295 m a side), and `_fit_goal_half_width` refuses a band the ground cannot
+    # hold rather than letting the RL side clamp it back out over void.
+    half_y = max(GOAL_HALF_WIDTH_M, BOX_WIDTH_M / 2.0)
+    off_y = SECTION_MARGIN_M + half_y
+    size_y = 2.0 * half_y + 2.0 * SECTION_MARGIN_M
+
+    # `size_x` follows `goal_x`, so a longer lead grows the tile with no other change --
+    # which is what makes v2 a parameter rather than a second geometry.
+    goal_x = b1 + float(target_lead_m) - GOAL_DEPTH_M / 2.0
+    size_x = goal_x + GOAL_INSET_M + SECTION_MARGIN_M
+
+    overlays = [_ground_overlay(size_x, size_y)]
+    for x0, x1 in ((a0, a1), (b0, b1)):
+        overlays.append(_overlay((x0 + x1) / 2.0, off_y, 0.0,
+                                 x1 - x0, BOX_WIDTH_M, BOX_HEIGHT_M))
+
+    # Three spawn areas: the ground start, then each box top. All three are DECLARED rather
+    # than leaving the ground to the reset's synthesised fallback, so the 1/3 : 1/3 : 1/3 split
+    # is a property of the manifest instead of an implicit share -- and every one goes through
+    # one code path.
+    #
+    # **The ground area is authored at exactly the ordinary jitter extents.** Declaring areas
+    # REPLACES `pos_jitter_m` for the tile (`resets._draw_spawn_areas`), so sizing this one to
+    # anything else silently changes the ground spawns and makes them incomparable to every
+    # earlier run. It was 0.375 x 0.995 first -- a 4x lateral spread, the robot starting a
+    # metre off the approach centreline -- which is why the number now comes from one place.
+    buf = float(BOX_SPAWN_EDGE_BUFFER_M)
+    w_ground, w_box1, w_box2 = BOX2_SPAWN_WEIGHTS
+    areas = [
+        spawn_area(off_x, off_y, 0.0,
+                   FREEFORM_SPAWN_JITTER_M[0], FREEFORM_SPAWN_JITTER_M[1],
+                   weight=w_ground),
+    ]
+    for (x0, x1), w in (((a0, a1), w_box1), ((b0, b1), w_box2)):
+        half_x = max((x1 - x0) / 2.0 - buf, 0.0)
+        half_y = max(BOX_WIDTH_M / 2.0 - buf, 0.0)
+        if half_x <= 0.0 or half_y <= 0.0:
+            raise ValueError(
+                f"box [{x0:.2f}, {x1:.2f}] is too small for a {buf:.2f} m spawn edge buffer; "
+                "lower BOX_SPAWN_EDGE_BUFFER_M or widen the box.")
+        areas.append(spawn_area((x0 + x1) / 2.0, off_y, BOX_HEIGHT_M, half_x, half_y,
+                                weight=w))
+
+    route = _route((off_x, off_y), 0.0, 0.0, (goal_x, off_y),
+                   _fit_goal_half_width(GOAL_HALF_WIDTH_M, overlays, (goal_x, off_y)), 0.0,
+                   spawn_areas=areas)
+    tile = _base_tile(terrain_id, str(family), size_x, size_y, overlays, route)
+    tile["box2"] = {
+        "spawn_distance_m": float(spawn_distance_m),
+        "height_m": BOX_HEIGHT_M, "depth_m": BOX_DEPTH_M, "width_m": BOX_WIDTH_M,
+        "gap_m": BOX_GAP_M,
+        "box_faces_x": [[a0, a1], [b0, b1]],
+        "goal_rect_centre_x": b1 + float(target_lead_m),
+        "goal_depth_m": GOAL_DEPTH_M,
+        # Only the DEFAULT lead is mjeval's course; v2 deliberately is not, and saying so in
+        # the tile stops a v2 recording being read as an mjeval clone.
+        "mjeval_course": ("mjeval_box2_h040"
+                          if abs(float(target_lead_m) - TARGET_LEAD_M) < 1e-9 else ""),
+    }
+    # `target_lead_m` is recorded ONLY when it is not the default, and that asymmetry is
+    # deliberate. `fingerprint_terrain_manifest` hashes the whole tile dict, so adding a key
+    # unconditionally moved v1's fingerprint from aa50da093337 to 826a2af3918a on geometry
+    # that had not changed by a millimetre -- which would leave every already-recorded v1
+    # rollout carrying a fingerprint no freshly-built v1 library can reproduce. A variant
+    # that IS the default needs no field to say so; one that is not, does.
+    if abs(float(target_lead_m) - TARGET_LEAD_M) >= 1e-9:
+        tile["box2"]["target_lead_m"] = float(target_lead_m)
+    return tile
+
+
+def generate_box2_manifest(spawn_distances_m: tuple[float, ...], *,
+                           target_lead_m: float = TARGET_LEAD_M,
+                           family: str = BOX2_FAMILY) -> list[dict]:
+    """One tile per approach distance, in the order given.
+
+    Args:
+        spawn_distances_m: Pelvis-to-first-face distances (m).
+        target_lead_m: See :func:`make_box2_tile`.
+        family: See :func:`make_box2_tile`.
+
+    Returns:
+        The manifest tile list, ``terrain_id`` running 0..n-1 in the order given -- so the
+        recording's ``terrain_id`` column IS the index into this tuple, and the IC a row was
+        collected at is recoverable from the table alone.
+
+    Raises:
+        ValueError: On an empty or non-positive distance set.
+    """
+    if not spawn_distances_m:
+        raise ValueError("no spawn distances given; a box2 library needs at least one tile.")
+    bad = [d for d in spawn_distances_m if not d > 0.0]
+    if bad:
+        raise ValueError(f"spawn distances must be positive, got {bad}. The distance is measured "
+                         "from the pelvis to the first box FACE, so 0 spawns inside the box.")
+    return [make_box2_tile(i, d, target_lead_m=target_lead_m, family=family)
+            for i, d in enumerate(spawn_distances_m)]
+
+
+def goal_region_spec(variant: str = "v2") -> dict:
+    """The DECLARED ``goal_regions.json`` spec for a two-box library.
+
+    Declared from the authored course rather than fitted from clip-arm episodes: this is a
+    manifest-only library with no clips to fit from, and on an authored course the goal region
+    is a property of the geometry.
+
+    ``half_width_m`` is :data:`GOAL_HALF_WIDTH_M`, i.e. every tile's own
+    ``route.goal_half_width``, so ``goal_region.in_goal`` and the ``freeform_goal_reached``
+    termination agree.  ``approach_margin_m`` is 0 because ``freeform_goal_anchor_world``
+    already puts the anchor at the near edge of mjeval's 2.0 m goal rectangle -- subtracting a
+    margin here as well would double-count it and move the success line a metre nearer than
+    mjeval's.
+
+    ``height_tol_m`` is 0.5 and NOT 0: 0 disables the test in the termination and, until it
+    was reconciled, was an unsatisfiable exact-equality in ``in_goal``.  Writing 0 once cost a
+    whole arm five iterations -- see :func:`~mdp.goal_region.in_goal`.
+
+    Args:
+        variant: ``"v1"`` (mjeval's clone) or ``"v2"`` (the goal 3 m further out).
+
+    Returns:
+        A JSON-serialisable spec.
+
+    Raises:
+        ValueError: On an unknown variant, since the two are different courses.
+    """
+    if variant not in ("v1", "v2"):
+        raise ValueError(f"variant must be 'v1' or 'v2', got {variant!r}")
+    return {
+        "default": {"approach_margin_m": 0.0,
+                    "half_width_m": float(GOAL_HALF_WIDTH_M),
+                    "height_tol_m": 0.5},
+        "by_family": {},
+        "provenance": {
+            "declared": True,
+            "source": f"motion_gen.terrain.box2 ({variant})"
+                      + (" / mjeval mjeval_box2_h040" if variant == "v1" else ""),
+            "note": ("DECLARED from the authored course, not fitted from clip-arm episodes: "
+                     "this is a manifest-only library with no clips to fit from, and on an "
+                     "authored course the goal region is a property of the geometry. "
+                     "approach_margin_m=0 because freeform_goal_anchor_world already puts "
+                     "the anchor at the near edge of mjeval's 2.0 m goal rectangle."),
+            "goal_half_width_m": float(GOAL_HALF_WIDTH_M),
+            "goal_depth_m": float(GOAL_DEPTH_M),
+            "mjeval_course": "mjeval_box2_h040" if variant == "v1" else "",
+        },
+    }

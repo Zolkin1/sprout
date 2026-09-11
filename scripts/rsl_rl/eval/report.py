@@ -62,6 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--baseline", default="",
                    help="series every contrast is taken against, as '<run label>:<cell key>'; "
                         "default is the first run's clip__train__- cell")
+    p.add_argument("--success_rule", default="spatial",
+                   choices=("spatial", "legacy_temporal"),
+                   help="'spatial' (default) requires the robot to have entered the goal "
+                        "region, so a stalled or lagging robot is not a success. "
+                        "'legacy_temporal' is the pre-goal-region rule -- survived to a step "
+                        "index -- and exists ONLY to read tables written before the goal "
+                        "columns. It is not a fallback: a table without them is refused "
+                        "under 'spatial' rather than silently reduced under a rule that "
+                        "cannot support the claim.")
     p.add_argument("--figures", default="default")
     p.add_argument("--no-svg", action="store_true")
     p.add_argument("--allow-plan-mismatch", action="store_true", dest="allow_plan_mismatch")
@@ -181,13 +190,40 @@ def term_partition(meta: dict) -> tuple[list[str], list[str]]:
     return trunc, fail
 
 
-def derived_columns(cell: dict, plan: dict) -> dict[str, np.ndarray]:
+def derived_columns(cell: dict, plan: dict,
+                    success_rule: str = "spatial") -> dict[str, np.ndarray]:
     """Everything the report needs that the table stores as primitives.
 
     ``success`` is derived rather than stored precisely because it is a contested definition:
     on the tracker task it means "did not fall", on the teacher task "did not fall AND did not
     trip a clip-graded bound".  Deriving it from the recorded bits means the report can say
     which, and a reader can recompute the other.
+
+    **Under ``spatial`` (the default) success additionally requires the robot to have entered
+    the goal region.** Without that clause every outcome signal in the table is a clip-CURSOR
+    condition -- ``clip_end`` fires on a step index and every ``terrain_*`` column compares
+    ``steps_survived`` against one -- so "success" means *stayed upright for N steps*, not
+    *got anywhere*, and a robot that stalls in place, lags several metres behind or drifts
+    laterally off the flight scores one.  That is a trivially reachable optimum with none of
+    the risk of the task, which makes it fatal to anything that reshapes a policy toward
+    outcomes that score well.
+
+    ``legacy_temporal`` reproduces the old rule EXACTLY and exists to read tables written
+    before the goal columns.  It is not a fallback: a table without the columns is refused
+    under ``spatial`` rather than silently reduced under a rule it cannot support, because a
+    spatial claim quietly resting on a temporal measurement is the whole defect.
+
+    Args:
+        cell: The loaded cell (``data`` + ``meta``).
+        plan: The run's plan.
+        success_rule: ``"spatial"`` or ``"legacy_temporal"``.
+
+    Returns:
+        The derived columns.
+
+    Raises:
+        ValueError: Under ``spatial`` when the table has no ``reached_goal`` column, or has
+            one that is entirely un-populated (a cell run without ``--goal_regions``).
     """
     d, meta = cell["data"], cell["meta"]
     terms = list(meta.get("termination_terms") or [])
@@ -197,10 +233,84 @@ def derived_columns(cell: dict, plan: dict) -> dict[str, np.ndarray]:
     for name in fail_terms:
         failed |= ((bits >> terms.index(name)) & 1).astype(bool)
     censored = d["admin_censored"].astype(bool)
+    fall_h = float((meta.get("overrides") or {}).get(
+        "fall_min_height", schema.FALL_MIN_HEIGHT_M))
+
+    if success_rule not in ("spatial", "legacy_temporal"):
+        raise ValueError(f"unknown success_rule {success_rule!r}; expected 'spatial' or "
+                         "'legacy_temporal'.")
+    arrived = np.ones(bits.shape, dtype=bool)
+    if success_rule == "spatial":
+        if "reached_goal" not in d:
+            raise ValueError(
+                f"cell {meta.get('cell', '?')} has no `reached_goal` column, so it was "
+                "written before the spatial goal existed or was run without "
+                "--goal_regions. Its only outcome signals are clip-CURSOR conditions, "
+                "which cannot distinguish climbing the terrain from standing still while "
+                "the cursor ran out. Re-run the cell with --goal_regions, or pass "
+                "--success_rule legacy_temporal to read it under the old rule and know "
+                "that is what you are reading.")
+        if bool((meta.get("overrides") or {}).get("goal_regions_bootstrap", False)):
+            raise ValueError(
+                f"cell {meta.get('cell', '?')} was run under a BOOTSTRAP goal region: its "
+                "tolerances are PLACEHOLDERS, chosen only to be finite enough to draw, so "
+                "its reached_goal -- and therefore its success rate -- is a number produced "
+                "by a tool working exactly as designed and meaning nothing. That run exists "
+                "to put a gate on screen and to feed build_goal_regions.py. Fit the real "
+                "spec from it and re-run the cell against goal_regions.json.")
+        arrived = d["reached_goal"].astype(bool)
+        if not arrived.any():
+            raise ValueError(
+                f"cell {meta.get('cell', '?')} has a `reached_goal` column that is zero on "
+                f"every one of its {arrived.size} episodes. That is what a cell run WITHOUT "
+                "--goal_regions looks like (the column exists and was never populated), and "
+                "it is not distinguishable here from a policy that never arrived -- so it is "
+                "refused rather than reported as 0.000 success. Check "
+                "`overrides.goal_regions` in the cell meta.")
+    # THE SUCCESS RULE, and it is now `schema.arrived_before_failing` rather than a second
+    # opinion stated here. The old rule was `~failed & ~censored & arrived`, which fails any
+    # episode whose fall TERMINATION bit is set regardless of WHEN it fired -- so an episode
+    # that reached the goal and then fell in the run-out scored a failure here and a success
+    # under `rollout_outcomes.terminal_reward`, on 51 of 298 episodes of one measured rollout.
+    # Two arms cannot be compared under two success rules.
+    #
+    # `legacy_temporal` keeps its own shape: it drops the arrival requirement entirely, so
+    # there is no first-event ordering to apply and "upright without going anywhere" counts.
+    if success_rule == "spatial":
+        strict_ok = schema.arrived_before_failing(d, strict=True)
+        loose_ok = schema.arrived_before_failing(d, strict=False)
+        has_strict = "first_violation_step" in d and bool((d["first_violation_step"] >= 0).any())
+    else:
+        strict_ok = loose_ok = ~failed
+        has_strict = False
+
     out = {
-        "success": (~failed & ~censored).astype(float),
+        # THE HEADLINE IS STRICT WHENEVER THE STRICT DATA EXISTS. It used to be `loose_ok`
+        # unconditionally, so a run that collected the tracking checks reported the fall-only
+        # rate under the name "success" and buried the strict one in the reduced table -- the
+        # tables carried the answer and the printed report did not. Measured on `strict_v1`:
+        # the loose headline read clip 0.9188 / fm 0.6406 while the strict rule those cells
+        # actually ran under is clip 0.9089 / fm 0.6061, and the arms are NOT equally
+        # affected (the checks cost the generator 3.5x what they cost the clip), so the
+        # substitution changes a contrast and not just a level.
+        #
+        # `success_loose` is kept beside it, never folded in: the pair is what says how much
+        # the checks cost. With no tracking columns the two are identical BY CONSTRUCTION,
+        # which is why `strict_checks_active` travels with them.
+        "success": ((strict_ok if has_strict else loose_ok) & ~censored).astype(float),
+        "success_strict": (strict_ok & ~censored).astype(float),
+        "success_loose": (loose_ok & ~censored).astype(float),
+        "track_reward_mean": (d["track_reward_mean"].astype(float)
+                              if "track_reward_mean" in d
+                              else np.full(bits.shape, np.nan)),
+        "strict_checks_active": np.full(bits.shape, float(has_strict)),
         "failed": failed.astype(float),
-        "fell": schema.fell(d["min_base_height_w"], d["max_tilt_rad"]).astype(float),
+        # At the threshold THIS CELL RAN, not the module default. The two came apart when
+        # --fall_min_height was added: the termination fired at 0.40 while the derived flag
+        # still read 0.50, so `fell` counted episodes the run had not ended and the printed
+        # definition named a number nothing had used.
+        "fell": schema.fell(d["min_base_height_w"], d["max_tilt_rad"],
+                            min_height=fall_h).astype(float),
         "terrain_end_reached": d["terrain_end_reached"].astype(float),
         "terrain_completed": d["terrain_completed"].astype(float),
         "terrain_progress": d["terrain_progress"].astype(float),
@@ -221,13 +331,29 @@ def derived_columns(cell: dict, plan: dict) -> dict[str, np.ndarray]:
     # Whether the completion metric says anything beyond success, per episode.
     out["completion_informative"] = schema.completion_is_informative(
         d["terrain_end_step"], d["last_usable_step"]).astype(float)
+    # Only under `spatial`. Reporting an all-ones column under `legacy_temporal` would state
+    # that every episode arrived, when in fact nothing measured whether any of them did.
+    if success_rule == "spatial":
+        out["reached_goal"] = arrived.astype(float)
+        out["min_dist_to_goal_m"] = d["min_dist_to_goal_m"].astype(float)
     return out
 
 
 #: Metrics reported per cell and per family: ``(column, binary?, label)``.
 REPORTED = (
     ("success", True, "success rate"),
+    # The pair BESIDE the headline, because what the tracking checks cost is a result in its
+    # own right and it is not the same on every arm: measured on `strict_v1` the checks cost
+    # the clip arm 0.010 and the generator 0.035, so reading only one of these changes a
+    # contrast. Identical to `success` when no checks ran.
+    ("success_loose", True, "success rate (fall-only)"),
+    ("track_reward_mean", False, "tracking reward"),
     ("fell", True, "fall rate (derived)"),
+    # Reported BESIDE success rather than folded silently into it: success is
+    # `arrived & ~fell & ~censored`, so seeing the two limbs apart is what says whether a
+    # policy is falling over or merely not getting there. Absent under legacy_temporal.
+    ("reached_goal", True, "reached goal region"),
+    ("min_dist_to_goal_m", False, "min dist to goal (m)"),
     ("terrain_end_reached", True, "reached terrain end"),
     ("terrain_completed", True, "terrain completed"),
     ("terrain_progress", False, "terrain progress"),
@@ -243,7 +369,7 @@ REPORTED = (
 def reduce_cell(cell: dict, plan: dict, args) -> dict:
     """Every reported number for one cell, overall and per family."""
     d = cell["data"]
-    der = derived_columns(cell, plan)
+    der = derived_columns(cell, plan, getattr(args, "success_rule", "spatial"))
     fam_names = cell["meta"].get("family_codes") or {}
     code_to_fam = {int(v): k for k, v in fam_names.items()}
     fam = np.array([code_to_fam.get(int(c), "?") for c in d["family_code"]])
@@ -264,13 +390,29 @@ def reduce_cell(cell: dict, plan: dict, args) -> dict:
         "n_censored": int(d["admin_censored"].sum()),
         "termination_terms": cell["meta"].get("termination_terms"),
         "failure_terms": term_partition(cell["meta"])[1],
+        # CELL METADATA, not a metric, which is why it is here rather than in REPORTED: the
+        # reduce step aggregates only REPORTED columns, so a per-episode flag put there would
+        # print as a spurious "rate" row while still being what the definitions block needs.
+        # Distinguishes "the checks ran and nothing fired" from "there were no checks" --
+        # `success` and `success_loose` are identical in both cases.
+        "strict_checks_active": bool(float(np.mean(der["strict_checks_active"])) > 0.5),
         "throughput": cell["info"].get("throughput"),
         "dr": {k: cell["info"]["dr"].get(k)
                for k in ("preset", "ood_scale", "dr_resample", "reset_safe_terms",
                          "startup_only_terms", "obs_corruption")},
+        # Surfaced so the report can PRINT the rules it applied rather than the module
+        # defaults. A definitions block that names a threshold nothing used is worse than
+        # none: it reads as provenance.
+        "fall_min_height": (cell["meta"].get("overrides") or {}).get("fall_min_height"),
+        "goal_regions": (cell["meta"].get("overrides") or {}).get("goal_regions"),
         "overall": {}, "by_family": {}, "survival": {}, "terminations": {},
     }
-    for col, binary, _label in REPORTED:
+    # `reached_goal` / `min_dist_to_goal_m` exist only under the spatial rule, so REPORTED is
+    # a superset of what any one reduction produces. Skipping an absent column is right here
+    # and would NOT be right for a missing primitive -- the difference is that these two are
+    # derived, and their absence is already a stated property of the rule in force.
+    reported = [(c, b, lbl) for c, b, lbl in REPORTED if c in der]
+    for col, binary, _label in reported:
         out["overall"][col] = _est(col, binary).as_dict()
 
     # Terrain completion is only reported where it is not identical to success.
@@ -288,7 +430,7 @@ def reduce_cell(cell: dict, plan: dict, args) -> dict:
         if entry["n_tiles"] < args.min_clusters:
             entry["note"] = (f"only {entry['n_tiles']} tile cluster(s); intervals reported "
                              "as NaN rather than as misleadingly narrow ones")
-        for col, binary, _label in REPORTED:
+        for col, binary, _label in reported:
             if col in ("terrain_end_reached", "terrain_completed") and not entry[
                     "completion_informative"]:
                 entry[col] = {"value": None, "note": "degenerate (= success) for this family"}
@@ -328,7 +470,8 @@ def paired_contrasts(runs: list[dict], labels: list[str], baseline: str, args) -
         for key, cell in r["cells"].items():
             d = cell["data"]
             series[f"{lab}:{key}"] = (d["clip_id"], d["scene_tile_id"],
-                                      derived_columns(cell, r["plan"]))
+                                      derived_columns(cell, r["plan"],
+                                                      getattr(args, "success_rule", "spatial")))
     if baseline not in series:
         print(f"[report] baseline series {baseline!r} not found; no paired contrasts. "
               f"Available: {sorted(series)}")
@@ -400,15 +543,53 @@ def format_report(reduced: dict) -> str:
 
     a("")
     a("-- DEFINITIONS IN FORCE " + "-" * 75)
-    a("  success        = no FAILURE termination fired and the episode was not censored.")
+    rule = str(reduced.get("success_rule", "spatial"))
+    if rule == "spatial":
+        a("  success        = the base ENTERED THE GOAL REGION, no FAILURE termination fired, "
+          "and the episode")
+        a("                   was not censored. The goal is a downrange half-plane at the "
+          "clip's own endpoint,")
+        a("                   intersected with a lateral band and a height band, in the "
+          "TERRAIN's frame.")
+        a("                   Arrival is spatial on purpose: `clip_end` and every terrain_* "
+          "column compare")
+        a("                   STEP INDICES, so a rule built on them scores a robot that "
+          "stalled in place.")
+    else:
+        a("  success        = no FAILURE termination fired and the episode was not censored.")
+        a("                   *** LEGACY TEMPORAL RULE: arrival is NOT tested, so a robot "
+          "that stayed")
+        a("                   upright without going anywhere counts as a success. ***")
     a(f"                   truncations (not failures): {list(TRUNCATION_TERMS)}")
+    # WHICH RULE THE HEADLINE IS, stated rather than inferable. The column is named `success`
+    # either way, so without this line a strict table and a loose one print identically --
+    # and they differ by 1.0 point on the clip arm and 3.5 on the generator.
+    _strict_on = [c["key"] for c in reduced["cells"] if c.get("strict_checks_active")]
+    if _strict_on:
+        a("                   *** STRICT: a tracking VIOLATION (lateral / height / tilt vs the")
+        a("                   served reference) counts as a failure, and the first event wins.")
+        a(f"                   Cells with the checks active: {_strict_on}")
+        a("                   `success_loose` in the reduced table is the fall-only rate; the")
+        a("                   pair is what says what the checks cost.")
+    else:
+        a("                   LOOSE: no tracking checks in this run -- `success` is fall-only,")
+        a("                   and `success_strict` equals it by construction.")
     for c in reduced["cells"]:
         a(f"                   {c['key']}: failure terms {c['failure_terms']}")
+        if rule == "spatial":
+            gr = (c.get("goal_regions") or "")
+            a(f"                   {c['key']}: goal region {gr or '(none recorded)'}")
         break
+    falls = sorted({c.get("fall_min_height") for c in reduced["cells"]
+                    if c.get("fall_min_height") is not None})
+    fall_txt = ", ".join(f"{v:g}" for v in falls) or f"{schema.FALL_MIN_HEIGHT_M:g}"
     a("  fall           = derived from the recorded extremes at "
-      f"height < {schema.FALL_MIN_HEIGHT_M} m or tilt > "
+      f"height < {fall_txt} m or tilt > "
       f"{np.rad2deg(schema.FALL_TILT_RAD):.0f} deg; NOT a termination term, so adding it "
       "could not change when episodes ended.")
+    if len(falls) > 1:
+        a("                   *** CELLS RAN AT DIFFERENT FALL HEIGHTS; their success rates "
+          "are not comparable. ***")
     a("  terrain done   = survived to min(terrain_end + 2 s, last usable step).")
     a("  progress       = fraction of the REACHABLE pinned span traversed; denominated by "
       "min(terrain_end, last usable) so a success scores exactly 1.0 on every family.")
@@ -454,12 +635,20 @@ def format_report(reduced: dict) -> str:
     a("-- BY FAMILY " + "-" * 86)
     for c in reduced["cells"]:
         a(f"  [{c['key']}]")
-        a(f"    {'family':<18} {'tiles':>5} {'eps':>6} {'success':>24} "
-          f"{'terrain done':>24} {'progress':>24}")
+        # `reached goal` sits beside `success`, not folded into it. Success is
+        # `arrived AND not fallen`, and the two limbs fail for opposite reasons -- a family
+        # where they diverge is one where the robot stays up and does not get there, which
+        # reads as the same number as falling if only the product is shown.
+        spatial = any("reached_goal" in v for v in c["by_family"].values())
+        head = (f"    {'family':<18} {'tiles':>5} {'eps':>6} {'success':>24} ")
+        head += f"{'reached goal':>24} " if spatial else ""
+        a(head + f"{'terrain done':>24} {'progress':>24}")
         for fam in sorted(c["by_family"]):
             f = c["by_family"][fam]
-            a(f"    {fam:<18} {f['n_tiles']:>5} {f['n_episodes']:>6} "
-              f"{_fmt(f['success']):>24} {_fmt(f.get('terrain_completed')):>24} "
+            row = (f"    {fam:<18} {f['n_tiles']:>5} {f['n_episodes']:>6} "
+                   f"{_fmt(f['success']):>24} ")
+            row += f"{_fmt(f.get('reached_goal')):>24} " if spatial else ""
+            a(row + f"{_fmt(f.get('terrain_completed')):>24} "
               f"{_fmt(f.get('terrain_progress')):>24}")
         degen = [k for k, v in c["by_family"].items() if not v["completion_informative"]]
         if degen:
@@ -553,6 +742,7 @@ def main() -> int:
     out.mkdir(parents=True, exist_ok=True)
 
     reduced: dict = {"labels": labels, "boot": args.boot, "seed": args.seed, "ci": args.ci,
+                     "success_rule": args.success_rule,
                      "warnings": warnings, "runs": [], "cells": []}
     for lab, r in zip(labels, runs):
         reduced["runs"].append({

@@ -30,6 +30,7 @@ import argparse
 import datetime
 import glob
 import json
+import os
 import pathlib
 import re
 import sys
@@ -74,6 +75,9 @@ DEFAULT_ROBOTS = {
     "fm_tf/none": 25,
     "fm_tf/train": 25,
     "fm_tf/ood": 25,
+    "fm_meas/none": 25,
+    "fm_meas/train": 25,
+    "fm_meas/ood": 25,
 }
 
 #: Tasks the harness defaults to.  The tracker task is used for BOTH arms so that "success"
@@ -101,10 +105,20 @@ DEFAULT_MAX_OFFSET = 50
 #:                 with ``fm`` on clip id, and the DIFFERENCE between them is the exposure
 #:                 bias -- the measurement that says whether to attack the loop or the model.
 #:                 Not deployable: there is no clip on the robot.
-REFERENCE_MODES = ("clip", "fm", "fm_tf")
+#: * ``fm_meas`` -- the generator drives it, but its history is the ROBOT'S OWN achieved
+#:                 state (``history_from='measured'``), except the base position and linear
+#:                 velocity, which no robot can measure and which come from the served node.
+#:                 Between the other two in how grounded the context is: real rather than
+#:                 self-generated, but off-distribution, because the model was fitted on
+#:                 reference rows and an achieved row is a different kind of quantity.
+#:                 ``scripts/flow_matching/measured_history_gap.py`` measures by how much
+#:                 (0.03 sigma on base orientation, 0.54 on joints, 0.69 on angular
+#:                 velocity), so read this arm against that rather than as a clean
+#:                 grounding experiment. Deployable in principle, unlike ``fm_tf``.
+REFERENCE_MODES = ("clip", "fm", "fm_tf", "fm_meas")
 
 #: Modes that need a generator loaded.
-FM_MODES = ("fm", "fm_tf")
+FM_MODES = ("fm", "fm_tf", "fm_meas")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,15 +178,73 @@ def build_parser() -> argparse.ArgumentParser:
                         "quoted with (fm/none 0.495 -> fm/train 0.468), so it costs a "
                         "third of the grid to re-confirm that DR is not the limit. Ask "
                         "for it when robustness is the question.")
+    g.add_argument("--start_step", type=int, default=0,
+                   help="clip step every episode starts on. 0 (default) plays each clip from "
+                        "its beginning, which is what makes terrain_start_step / "
+                        "terrain_end_step describe the episode and keeps cells paired at the "
+                        "same difficulty. A POSITIVE value is needed to exercise a generator "
+                        "history seeded from the clip (it needs N preceding steps to exist). "
+                        "-1 draws a random start per episode: that exercises gait-phase "
+                        "diversity, but an episode can then begin PAST terrain_start, which "
+                        "biases 'terrain done' and 'terrain_progress', and the draws differ "
+                        "between cells so arms no longer pair at equal difficulty. Success is "
+                        "termination-derived and stays meaningful either way.")
     g.add_argument("--robots_per_clip", default="",
                    help="comma list of KEY=N, e.g. 'clip/train=50,fm/ood=10'; keys not "
                         "given fall back to the built-in defaults")
 
     g = p.add_argument_group("env")
+    g.add_argument("--fm_seed", type=int, default=-1,
+                   help="Name the generator's initial-noise draw, so it can be varied while "
+                        "EVERYTHING else is held fixed. -1 = off (global RNG). --seed also "
+                        "moves DR, spawn and observation noise, so it cannot isolate the "
+                        "generator; this can. Keyed by (fm_seed, within-episode re-plan "
+                        "index) and NOT by env, so several robots on one clip share a noise "
+                        "sequence and their spread is the simulator floor.")
+    g.add_argument("--steer_kp", type=float, default=0.0,
+                   help="P gain (1/s) on heading error toward the goal, overriding the clip's "
+                        "commanded wz. 0 = off (the deployed behaviour). NON-ZERO IS "
+                        "OFF-DISTRIBUTION ON STAIRS -- the training library commands |wz| = "
+                        "0.0 on both stair families -- so a steered stair number is a "
+                        "different measurement, not a cleaner one. Same law and default clip "
+                        "as mjeval.runner.steer_yaw_rate and headroom.py --steer_kp.")
+    g.add_argument("--steer_wz_max", type=float, default=0.68,
+                   help="Clip on the steering yaw rate (rad/s).")
+    g.add_argument("--goal_regions", default="",
+                   help="goal_regions.json from build_goal_regions.py. Turns on the SPATIAL "
+                        "success columns (reached_goal / min_dist_to_goal_m / the three "
+                        "terminal offsets). WITHOUT it every outcome signal in the table is a "
+                        "clip-CURSOR condition -- `clip_end` and every terrain_* column "
+                        "compare step indices -- and none of them can tell a robot that "
+                        "climbed the staircase from one that stood still while the cursor ran "
+                        "out. Empty = off, and report.py then refuses to derive spatial "
+                        "success rather than silently falling back to the temporal rule.")
+    g.add_argument("--tracking_spec", default="",
+                   help="tracking_spec.json from measure_tracking_error.py --stage report. "
+                        "Turns on the STRICT tracking checks -- lateral / height / tilt "
+                        "against the SERVED reference node -- which are LATCHED, never "
+                        "terminating, so `report.py` derives success_strict and the loose "
+                        "success from the same run. Empty = the BOOTSTRAP placeholders, "
+                        "which are fine for looking and not for publishing.")
+    g.add_argument("--fall_min_height", type=float, default=0.40,
+                   help="base_fallen's world-z threshold, m. 0.40 rather than the historical "
+                        "0.50: the deepest jump_off_front clip's own pelvis reaches 0.525 m "
+                        "and a well-tracking robot legitimately undershoots its reference by "
+                        "up to 60 mm, so at 0.50 a CORRECTLY tracking robot is terminated and "
+                        "any critic fitted to those episodes learns the threshold rather than "
+                        "the fall. Numbers at 0.40 are not comparable with the published "
+                        "0.50 ones; re-run both arms.")
     g.add_argument("--terrain_ref", default="",
                    help="terrain_class.py reference .npz; classifies every FM re-plan as "
                         "flat/jump/stairs and counts them per episode. Ignored on the clip "
                         "arm. Empty = off.")
+    g.add_argument("--dump_flagged", type=int, default=0, metavar="N",
+                   help="Keep N re-plans per (true class, predicted class) bucket, with the "
+                        "depth row each was drawn from, to <out>/<cell>/flagged_plans.npz. "
+                        "Needs --terrain_ref. The bucket key collects a misread and its own "
+                        "control together -- stairs->jump beside stairs->stairs -- because a "
+                        "folder of flagged images alone shows whatever the reader expects. "
+                        "0 = off.")
     g.add_argument("--num_envs", type=int, default=256)
     g.add_argument("--num_rows", type=int, default=1)
     g.add_argument("--seed", type=int, default=42)
@@ -219,11 +291,24 @@ def resolve_checkpoint(args) -> str:
     if not args.load_run:
         raise SystemExit("plan needs --checkpoint or --load_run")
     root = pathlib.Path("logs") / "rsl_rl" / args.experiment_name / args.load_run
-    models = sorted(glob.glob(str(root / "model_*.pt")),
-                    key=lambda s: int(re.search(r"model_(\d+)\.pt$", s).group(1)))
-    if not models:
-        raise SystemExit(f"no model_*.pt under {root}")
-    return str(pathlib.Path(models[-1]).resolve())
+    # The glob is wider than the key can parse: a run directory legitimately holds
+    # `model_19999_padded.pt` (pad_critic_for_finetune.py writes one), and keying on
+    # `model_(\d+)\.pt$` returned None for it and died with a bare AttributeError pointing
+    # at a lambda. FILTER on the same pattern the key reads, so an unparsable name is simply
+    # not a candidate -- picking the highest iteration is the whole job, and a name that does
+    # not state an iteration cannot be the highest one.
+    numbered = []
+    for path in glob.glob(str(root / "model_*.pt")):
+        m = re.search(r"model_(\d+)\.pt$", path)
+        if m is not None:
+            numbered.append((int(m.group(1)), path))
+    if not numbered:
+        extras = sorted(os.path.basename(p) for p in glob.glob(str(root / "model_*.pt")))
+        raise SystemExit(
+            f"no model_<iteration>.pt under {root}"
+            + (f" (found {extras}, none of which states an iteration; pass --checkpoint)"
+               if extras else ""))
+    return str(pathlib.Path(max(numbered)[1]).resolve())
 
 
 def fm_contract(path: str) -> dict:
@@ -687,9 +772,48 @@ def _report_plan(plan: dict) -> None:
     print(f"[plan] {total:,} episodes across the grid")
 
 
+def _explicit_dests(parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    """Which option ``dest``s the caller actually TYPED, as opposed to argparse defaults.
+
+    ``argparse`` cannot tell ``--num_envs 256`` from the 256 default, and that distinction is
+    what lets ``stage_grid`` fall back to the value ``--stage plan`` recorded WITHOUT
+    overriding a deliberate override on the grid invocation. Without it the fallback would
+    have to choose globally between "the plan always wins" (which makes the grid's own flags
+    inert) and "the CLI always wins" (which is the bug).
+
+    Reads the raw ``argv`` against the parser's own option table rather than re-parsing with
+    ``SUPPRESS`` defaults, because the latter means maintaining every default twice.
+
+    Args:
+        parser: The parser whose option strings to recognise.
+        argv: Arguments as typed, without the program name.
+
+    Returns:
+        The ``dest`` names present in ``argv``.
+    """
+    by_opt: dict[str, str] = {}
+    for action in parser._actions:                      # noqa: SLF001 - the option table
+        for opt in action.option_strings:
+            by_opt[opt] = action.dest
+    seen: set[str] = set()
+    for tok in argv:
+        if tok in by_opt:
+            seen.add(by_opt[tok])
+        elif tok.startswith("--") and "=" in tok:
+            head = tok.split("=", 1)[0]
+            if head in by_opt:
+                seen.add(by_opt[head])
+    return seen
+
+
 def main() -> int:
     """Dispatch to the requested stage."""
-    args = build_parser().parse_args()
+    parser = build_parser()
+    args = parser.parse_args()
+    # Carried so `stage_grid` can prefer the plan's recorded value for anything the caller did
+    # not type. See `_explicit_dests`, and `runner.stage_grid`'s note on the three times a
+    # silently-defaulted flag has invalidated a grid.
+    args._explicit = _explicit_dests(parser, sys.argv[1:])   # noqa: SLF001
     if args.out is None:
         stamp = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d_%H-%M-%S")
         args.out = str(pathlib.Path("logs") / "terrain_eval" / stamp)

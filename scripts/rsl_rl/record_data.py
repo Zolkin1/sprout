@@ -46,6 +46,7 @@ from packaging import version
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
 from isaaclab.envs import DirectMARLEnvCfg, DirectRLEnvCfg, ManagerBasedRLEnvCfg
+from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg
 from isaaclab.utils.assets import retrieve_file_path
 
 from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, handle_deprecated_rsl_rl_cfg
@@ -189,7 +190,9 @@ parser.add_argument(
          "Adds a second camera pair on the SAME mounts and lenses, sampled on this grid, and "
          "the recorded 'depth' array plus its camera contract then describe THAT pair -- so a "
          "generator trained on this file conditions on this resolution while the teacher that "
-         "produced the file keeps its own. Empty (default) records the policy's cameras. "
+         "produced the file keeps its own. Empty (default) records the scene's own cameras at "
+         "the resolution they carry; it does NOT mean 'record whatever the policy observes', "
+         "which is the near camera alone. Either way the recording covers BOTH cameras. "
          "Costs rays: the pass is ~W*H/780 times the policy pair's per-step depth cost, and "
          "the 'depth' dataset scales the same way (a 200k-window recording is 1.25 GB at "
          "30x26 and 5 GB at 60x52), so pick this before recording rather than after.",
@@ -501,6 +504,47 @@ def _extero_is_corrupted(env) -> bool:
         if get_depth_noiser(env, sensor_name) is not None:
             return True
     return False
+
+
+def _assert_generator_sees_every_camera(env, env_cfg) -> None:
+    """Refuse to record depth from fewer cameras than the robot carries.
+
+    THE FAILURE IS SILENT AND UNRECOVERABLE DOWNSTREAM. The policy reads the near camera
+    alone, so ``mdp.fm_depth_groups`` returning ``None`` ("every group") now means the
+    recorder captures ONE camera, writes a one-camera ``depth_camera_spec`` beside it,
+    trains a generator on that, exports an ``fm.onnx`` carrying the same one-camera
+    contract, and passes the deploy-time agreement check -- every artifact self-consistent
+    about a half-blind generator, and indistinguishable from a deliberate one-camera
+    design. No shape check anywhere sees a problem.
+
+    Two statements, because they fail differently: the group must be ACTIVE in the built
+    env (a cfg that was never installed, or a group the observation manager dropped), and
+    it must NAME every camera on the scene (a stale group, checked by the producer's own
+    guard so the ``fm_``-prefix rule lives in one place).
+
+    Args:
+        env: The unwrapped environment.
+        env_cfg: The env cfg it was built from.
+
+    Raises:
+        ValueError: If the task reads depth but the generator's group is absent or partial.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+        assert_fm_depth_group_covers_every_camera,
+    )
+    if not mdp.find_depth_obs_terms(env, None):
+        return                              # no depth on this task (the height-scan path)
+    if mdp.fm_depth_groups(env) is None:
+        raise ValueError(
+            f"this task observes depth but has no active '{mdp.FM_DEPTH_OBS_GROUP}' "
+            "observation group, so the recording would be scoped to the POLICY's cameras "
+            f"-- {[n for n, _ in mdp.find_depth_obs_terms(env, None)]}, the near camera "
+            "alone. Install the generator's group before gym.make."
+        )
+    assert_fm_depth_group_covers_every_camera(env_cfg)
+    print(f"[INFO] recording depth from "
+          f"{[n for n, _ in mdp.find_depth_obs_terms(env, mdp.fm_depth_groups(env))]} "
+          f"(obs group '{mdp.FM_DEPTH_OBS_GROUP}') -- every camera the scene carries.")
 
 
 def _build_recording_meta(
@@ -1305,6 +1349,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                       f"{terrain.clip_library_path} -> {args_cli.clip}")
                 terrain.clip_library_path = args_cli.clip
 
+        # DECORATION ON, whichever task this is. The teacher's TRAINING scene now renders
+        # none of it (tile walls, flat-tile rooms, a clutter sidecar) -- nothing in that
+        # stack avoids obstacles and it only costs depth pixels over a 12k-iteration run --
+        # while the -play chain turns it back on. Both are reachable here, and a recording
+        # made on the train task would then fit the generator on a bare world while the
+        # world it is deployed into has walls: exactly the vertical surface it already
+        # misreads as a box. Asserted rather than inherited, because which task the recorder
+        # is pointed at must not decide what the generator sees.
+        terrain_cfg = getattr(getattr(env_cfg, "scene", None), "terrain", None)
+        if terrain_cfg is not None and hasattr(terrain_cfg, "render_decor"):
+            if not terrain_cfg.render_decor:
+                print("[INFO] scene.terrain.render_decor False -> True: a recording is what "
+                      "the generator conditions on, so it renders the visual decoration even "
+                      "when the task it was taken from does not.")
+            terrain_cfg.render_decor = True
+
         # Where inside its clip each episode starts. Training SAMPLES a start (so a policy
         # sees every phase as an entry point); a recording wants uniform COVERAGE of clip
         # phase, and only a start at frame 0 gives it -- a sampled start run to the clip end
@@ -1333,19 +1393,35 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             )
         reset_ev.params["clip_draw"] = args_cli.clip_draw
 
-        # Give the GENERATOR its own camera pair when it should record at a resolution the
-        # policy does not use. DECLARED here rather than derived, unlike play.py: there is no
-        # FM artifact yet -- this run is what produces the data one will be trained on.
-        if args_cli.fm_depth_resolution.strip():
+        # Give the GENERATOR its observation group. UNCONDITIONAL on a depth task, because
+        # the policy now reads the NEAR camera alone: without the group the recorder's
+        # ``fm_depth_groups`` scoping falls back to "every group" = that one camera, and it
+        # would then stamp a one-camera depth_camera_spec into the recording, train a
+        # half-blind generator on it and export a matching fm.onnx. Every artifact would
+        # agree with every other, and nothing downstream could tell it from a deliberate
+        # one-camera design. --fm_depth_resolution only DECLARES a different sampling grid
+        # (declared rather than derived, unlike play.py: there is no FM artifact yet -- this
+        # run is what produces the data one will be trained on); absent, the group is still
+        # installed, over the policy's own cameras and with no second ray cast.
+        if any(isinstance(s, MultiMeshRayCasterCameraCfg)
+               for s in vars(env_cfg.scene).values()):
             from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
-                add_fm_depth_pair,
+                install_fm_depth_group,
             )
-            spec = args_cli.fm_depth_resolution.replace("x", ",").split(",")
-            if len(spec) != 2:
-                raise ValueError(
-                    f"--fm_depth_resolution={args_cli.fm_depth_resolution!r}; expected 'WxH'."
-                )
-            add_fm_depth_pair(env_cfg, int(spec[0]), int(spec[1]))
+            fm_res: tuple[int, int] | tuple[None, None] = (None, None)
+            if args_cli.fm_depth_resolution.strip():
+                spec = args_cli.fm_depth_resolution.replace("x", ",").split(",")
+                if len(spec) != 2:
+                    raise ValueError(
+                        f"--fm_depth_resolution={args_cli.fm_depth_resolution!r}; expected 'WxH'."
+                    )
+                fm_res = (int(spec[0]), int(spec[1]))
+            install_fm_depth_group(env_cfg, *fm_res)
+        elif args_cli.fm_depth_resolution.strip():
+            raise ValueError(
+                f"--fm_depth_resolution={args_cli.fm_depth_resolution!r} but --task "
+                f"{args_cli.task!r} carries no depth cameras to sample."
+            )
 
         # Same story for the generator's own dense height scanner: DECLARED here, and for the
         # same reason -- no FM artifact exists yet to derive it from.
@@ -1371,6 +1447,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode=None)
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
+
+        # BEFORE a single step is recorded: the depth this file will carry must be every
+        # camera the robot has, not whatever the policy happens to observe.
+        _assert_generator_sees_every_camera(env.unwrapped, env_cfg)
 
         print(f"[INFO]: Loading model checkpoint from: {resume_path}")
         if agent_cfg.class_name == "OnPolicyRunner":

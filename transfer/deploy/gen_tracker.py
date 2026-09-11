@@ -8,10 +8,14 @@ the flow-matching generator (``fm.onnx``) online and feeds its world-frame predi
 into the RL tracker (``tracker.onnx``), reproducing the ``FmTrackingCommand`` coupling.
 No torch / isaaclab / robot_rl imports.
 
-The generator is **robot-state-conditioned**, exactly like the in-loop
-``FmTrackingCommand``: the ``N`` history tokens are the LIVE MEASURED robot state
-(phase), NOT the FM's own past output -- this fixes the autoregressive z-drift /
-exposure bias. Each freshly sampled trajectory is anchored on the robot's current
+The generator is **autoregressive**, exactly like the in-loop ``FmTrackingCommand``: the
+``N`` history tokens are the reference-window nodes this runtime SERVED over the previous
+``N`` steps -- its own past output, already expressed in the frame of the plan each came
+from, which is what keeps odometry off the generator's critical path. (An older version of
+this paragraph claimed the opposite -- "the LIVE MEASURED robot state, NOT the FM's own past
+output" -- which was true of a much earlier design and has been wrong since. ``history_from``
+now offers a real measured arm, so the distinction matters: see
+:meth:`GenTrackerPolicy._measured_history_node`.) Each freshly sampled trajectory is anchored on the robot's current
 base pose (xyz+yaw ground frame; node 0 = "now"), with exteroception token(s) -- the
 height scan or the depth cameras, per the checkpoint -- describing the terrain. Depth
 cameras additionally carry their geometry in the ONNX metadata, checked for agreement
@@ -33,16 +37,20 @@ import numpy as np
 
 from .depth_obs import (
     assert_depth_specs_agree,
+    camera_key,
     depth_xyz_rows_np,
+    index_cameras_by_key,
     sanitize_extero_np,
 )
 from .scan_obs import assert_scan_specs_agree, describe as describe_scan_spec, is_privileged
 from .fm_session import build_cmd_tokens, build_extero_tokens, build_history_tokens, load_fm_context, sample_window
 from .history import BatchedHistory
-from .quat_math_np import quat_apply, quat_inv
+from .quat_math_np import quat_apply, quat_inv, yaw_quat
 from .tracker_session import TrackerSession
 from .window_np import (
+    assert_history_source_matches,
     base_pose_block_to_world,
+    measured_history_fallback_spans,
     reanchor_window,
     window_block_slices,
     window_dim,
@@ -142,13 +150,50 @@ class _TrackerOnlyCtx:
         self.extero_tokens_per_sensor = 1
 
 
+def _depth_row_map(cast: list[dict], want: list[dict]) -> list[int] | None:
+    """Which row of the CAST depth reading feeds each of ``want``'s cameras.
+
+    The whole point is that this is resolved BY NAME. The tracker's cameras are a subset of
+    the generator's, so the two lists have different lengths and a positional pairing would
+    hand one consumer the other's camera -- with every array the right shape, which is why
+    such a bug is invisible to any check that is not about values.
+
+    Args:
+        cast: The union contract the runtime actually casts, in row order.
+        want: One consumer's own cameras.
+
+    Returns:
+        One row index per entry of ``want``, or ``None`` when the cast cannot serve this
+        consumer -- a camera it does not carry, or the same lens sampled on a different grid,
+        where the row exists but is the wrong width. ``None`` is the caller's cue that a
+        second reading is owed.
+    """
+    if not want:
+        return []
+    order: dict[str, tuple[int, dict]] = {}
+    for i, cam in enumerate(cast):
+        order.setdefault(camera_key(cam), (i, cam))
+    rows: list[int] = []
+    for cam in want:
+        found = order.get(camera_key(cam))
+        if found is None:
+            return None
+        i, cast_cam = found
+        if (int(cast_cam["width"]), int(cast_cam["height"])) != (int(cam["width"]),
+                                                                 int(cam["height"])):
+            return None
+        rows.append(i)
+    return rows
+
+
 #: Robot-fingerprint fields worth naming individually in a mismatch message.
 _ROBOT_ASSET_FIELDS = ("joint_names", "total_mass_kg", "body_names",
                        "urdf_sha256", "mjcf_sha256", "usd_sha256")
 
 
 def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None,
-                               tracker_name: str, fm_name: str) -> None:
+                               tracker_name: str, fm_name: str,
+                               allow_mismatch: bool = False) -> None:
     """Refuse a tracker/generator pair trained on DIFFERENT robots.
 
     A deploy box has no "current robot" to check an artifact against -- it has whatever
@@ -166,9 +211,20 @@ def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None
         fm_asset: ``fm.onnx``'s ``fm_meta.robot_asset``.
         tracker_name: Path, for the message.
         fm_name: Path, for the message.
+        allow_mismatch: Report the differing fields and continue instead of refusing.
+            SIM ONLY -- ``GenTrackerPolicy`` defaults it off and nothing on the hardware path
+            passes it, exactly as ``allow_privileged_extero`` is scoped. It exists because the
+            fingerprint hashes whole FILES: an edit to a part of the MJCF that neither model
+            reads -- the actuator PD gains are the case that prompted this, since sim2sim
+            overwrites them from the policy anyway -- moves the hash without moving anything
+            either artifact depends on. Whether a given difference is of that kind is a
+            judgement only the operator can make, which is why this is a flag and not a
+            softened rule. A differing ``joint_names``, ``body_names`` or ``total_mass`` is
+            never benign.
 
     Raises:
-        ValueError: If both carry a fingerprint and a shared field differs.
+        ValueError: If both carry a fingerprint and a shared field differs, unless
+            ``allow_mismatch``.
     """
     if not tracker_asset or not fm_asset:
         return
@@ -190,8 +246,15 @@ def _assert_robot_assets_agree(tracker_asset: dict | None, fm_asset: dict | None
             lines.append(f"  joint_names: {len(t)} vs {len(f)}")
         else:
             lines.append(f"  {k}: {str(t)[:16]} vs {str(f)[:16]}")
+    if allow_mismatch:
+        print("[WARN] " + "\n[WARN] ".join(lines))
+        print("[WARN] --allow_robot_asset_mismatch was passed: continuing anyway. Anything "
+              "measured from this run is a statement about a pair the fingerprint says is "
+              "not matched.")
+        return
     lines.append("Re-export both from one run, or point --fm_onnx at the generator trained "
-                 "against this tracker.")
+                 "against this tracker. If the differing field is one neither model reads, "
+                 "the MuJoCo runner takes --allow_robot_asset_mismatch (sim only).")
     raise ValueError("\n".join(lines))
 
 
@@ -211,6 +274,13 @@ class GenTrackerPolicy:
     #: reordering cannot leave it briefly unset while ``_serve_nodes`` is reachable.
     _window_anchor: str = "robot_now"
 
+    #: Which history producer fills the ``N`` context rows, for the same reason and with the
+    #: same caveat as the two above: an instance that skips construction gets the DEPLOYED
+    #: arm rather than an AttributeError. A test double meaning to exercise the measured arm
+    #: must therefore say so -- silence here means the closed loop, which is the safer way
+    #: round, since that is what the artifact on a robot runs.
+    history_from: str = "generator"
+
     def __init__(
         self,
         tracker_onnx: str,
@@ -224,7 +294,9 @@ class GenTrackerPolicy:
         fm_cuda_graph: bool = False,
         tracker_on_cpu: bool = False,
         allow_privileged_extero: bool = False,
+        allow_robot_asset_mismatch: bool = False,
         fm_lead_ticks: int = 0,
+        history_from: str = "generator",
     ):
         """Configure the generator + tracker pair from the ONNX artifacts.
 
@@ -278,7 +350,22 @@ class GenTrackerPolicy:
         was 0.05 (3 ticks, 60 ms, ~4.5 cm), which on a stair edge is a different problem
         rather than a rounding difference, and is why the default moved. Default 0
         (unchanged behaviour); set it to compare the two stacks on equal terms.
+
+        ``history_from`` chooses what fills the ``N`` history rows, mirroring
+        ``FmTrackingCommandCfg.history_from``. ``"generator"`` (the default and the
+        deployment behaviour) is the nodes this runtime served. ``"measured"`` is the
+        robot's own achieved state, except :data:`window_np.MEASURED_HISTORY_FALLBACK`,
+        which no robot can measure and which still comes from the served node -- a
+        DIAGNOSTIC arm, off-distribution against a model fitted on reference rows, and
+        implemented here because MuJoCo can feed it honestly. There is no ``"clip"`` arm on
+        this side: teacher forcing needs a clip and the robot has none.
         """
+        if history_from not in ("generator", "measured"):
+            raise ValueError(
+                f"history_from={history_from!r} must be 'generator' or 'measured'. "
+                "('clip' is an Isaac-only arm -- there is no clip on this path.)"
+            )
+        self.history_from = history_from
         self.tracker_onnx = tracker_onnx
         self.fm_onnx = fm_onnx
         self.fm_update_every = max(int(fm_update_every), 1)
@@ -289,6 +376,8 @@ class GenTrackerPolicy:
         self.fm_cuda_graph = bool(fm_cuda_graph)
         self.tracker_on_cpu = bool(tracker_on_cpu)
         self.allow_privileged_extero = bool(allow_privileged_extero)
+        #: SIM ONLY, like allow_privileged_extero: nothing on the robot path sets it.
+        self.allow_robot_asset_mismatch = bool(allow_robot_asset_mismatch)
         #: Emulate the C++ runtime's generator LEAD: it requests each plan `lead` ticks
         #: before the boundary it is for, and conditions it on the exteroception and the
         #: velocity command as they were AT REQUEST TIME (plan_scheduler.h). Its history is
@@ -305,8 +394,18 @@ class GenTrackerPolicy:
         self._lead_buf: deque = deque(maxlen=self.fm_lead_ticks + 1)
         #: The window the last create_obs served; see last_served_window.
         self._last_served_window: np.ndarray | None = None
+        #: The pose THAT window's base blocks are measured from, stashed with it because the
+        #: two are only meaningful together and the anchor a caller could reconstruct later
+        #: is a different one. See served_reference_w.
+        self._last_served_anchor: tuple[np.ndarray, np.ndarray] | None = None
         self._rng = np.random.default_rng(seed)
         self._depth_spec: list[dict] = []
+        # What the RUNTIME must cast / supply as state["depth"]: the union of the two
+        # artifacts' cameras. Resolved in _resolve_depth_cameras, together with the by-name
+        # row maps each consumer selects its own cameras through.
+        self._depth_cast_spec: list[dict] = []
+        self._trk_depth_rows: list[int] | None = None
+        self._fm_depth_rows: list[int] | None = None
         # Set here rather than in _reset_timing, which drains the WINDOW: these are the last
         # single call's cost and must survive a drain. See last_infer_ms.
         self._last_fm_infer_ms = 0.0
@@ -335,7 +434,19 @@ class GenTrackerPolicy:
             if self.ctx.cmd_dim <= 0:
                 raise ValueError("GenTrackerPolicy expects a command-conditioned fm.onnx.")
             _assert_robot_assets_agree(self._trk.get_robot_asset(), self.ctx.robot_asset,
-                                       self.tracker_onnx, self.fm_onnx)
+                                       self.tracker_onnx, self.fm_onnx,
+                                       allow_mismatch=self.allow_robot_asset_mismatch)
+            # The serving arm must be the one this graph was FITTED for. Not gated behind
+            # allow_robot_asset_mismatch: that flag says "these two artifacts describe the
+            # same robot closely enough", which is a different claim from "this generator
+            # eats the history I am about to hand it".
+            # ``getattr`` with None, not a "reference" literal: None is the DEFINED reading
+            # for a graph older than the flag (the measured path did not exist, so it was
+            # fitted on the reference), and the guard resolves it. A real ``FmContext``
+            # always carries the field -- this only covers a context built without one.
+            assert_history_source_matches(
+                self.history_from, getattr(self.ctx, "history_source", None),
+                where=str(self.fm_onnx))
         # Re-plan cadence: the tracker metadata (the value the tracker task trained with),
         # else the constructor/CLI default. The old middle tier -- falling back to the FM's
         # fm_snap_every -- existed only to satisfy the agreement rule that has since been
@@ -417,6 +528,13 @@ class GenTrackerPolicy:
         # Node served on the PREVIOUS step, already re-anchored onto the robot as it was
         # then -- the frame the dataset's history rows use. None until the first serve.
         self._prev_served_node: np.ndarray | None = None
+        # The MEASURED node for the previous step, for history_from="measured". Stashed a
+        # step ahead of its push for the same reason the Isaac side does it: the row pushed
+        # at step t has to describe step t-1.
+        self._prev_measured_node: np.ndarray | None = None
+        # Node columns a measured row cannot fill on a robot; see window_np.
+        self._measured_fallback_spans = measured_history_fallback_spans(
+            len(self._fm_to_isaac), self.ctx.target_num_extra_frames, self.reference_blocks)
         self._future_cmd_override = None  # set by clip→FM handoff to feed the actual future cmd
         # Last generator sample's inputs + identity, for logging (see _run_fm / last_plan).
         self._plan_id = 0
@@ -460,23 +578,32 @@ class GenTrackerPolicy:
     def _resolve_depth_cameras(self) -> None:
         """Settle the depth-camera contract(s) for the whole deployment.
 
-        There is a single physical camera PAIR, so a depth tracker and a depth generator
-        running together must have trained on the same mount, cone, range and
-        normalisation. They may however SAMPLE it on different grids -- that is what lets
-        the generator's vision input change without retraining the policy -- so two
-        contracts are resolved rather than one:
+        The two artifacts read the same physical cameras but not necessarily the same SET of
+        them: the policy is conditioned on the NEAR camera alone (it tracks a reference and
+        does not need to read terrain ahead) while the generator reads both, so the tracker's
+        cameras are a SUBSET of the generator's. They may additionally sample those lenses on
+        different grids. Three lists therefore come out of this, and confusing them is
+        silent -- every check would pass against the wrong one:
 
-        * ``_depth_spec`` -- the tracker's, keyed by observation term. The tracker wins
-          here because ``_build_obs`` looks its cameras up BY TERM NAME.
-        * ``_fm_depth_spec`` -- the generator's, which is what every
-          ``extero_sensor_dim`` / image-fold check has to be measured against.
+        * ``_depth_spec`` -- the TRACKER's, keyed by observation term. ``_build_obs`` looks
+          its cameras up BY TERM NAME, so the tracker owns this one.
+        * ``_fm_depth_spec`` -- the GENERATOR's, which is what every ``extero_sensor_dim`` /
+          image-fold check has to be measured against.
+        * ``_depth_cast_spec`` -- their UNION, which is what the runtime casts and hands over
+          as ``state["depth"]``. One cast, not two: in Isaac the generator's obs terms read
+          the very same sensors at a matching resolution, so a second cast here would give
+          the shared camera an independent per-frame noise draw the training pair never had.
 
-        When they are the same list (the usual case) nothing downstream renders twice.
+        Each consumer then selects its own rows out of that union BY NAME
+        (``_trk_depth_rows`` / ``_fm_depth_rows``), never by index -- with lists of differing
+        length, index ``i`` no longer names one lens, and an index-pairing bug is shape-clean.
+        A row map is ``None`` when the union cannot serve that consumer (the grids differ),
+        which is exactly when the caller owes a second reading.
 
         Raises:
-            ValueError: If the two artifacts describe different physical cameras, or if a
-                depth-conditioned generator has no contract to check and none to fall back
-                on.
+            ValueError: If the two artifacts describe different physical cameras, if the
+                tracker reads one the generator does not, or if a depth-conditioned generator
+                has no contract to check and none to fall back on.
         """
         tracker_spec = self._trk.get_depth_camera_spec() or []
         # ``extero_spec`` holds the generator's own contract, which is a camera list only
@@ -487,13 +614,39 @@ class GenTrackerPolicy:
         # combination (depth tracker + scan generator) this branch exists to allow.
         fm_spec = list(self.ctx.extero_spec or []) if self.ctx.extero_source == "depth" else []
         if tracker_spec and fm_spec:
-            # The ONE relaxation site. Physical geometry is still required to agree; only
-            # the pixel grid may differ. See depth_obs.REQUIRE_SAME_DEPTH_RESOLUTION for
-            # the TODO to re-tighten this once the two train at one resolution again.
+            # The ONE relaxation site. Physical geometry is still required to agree, per
+            # camera matched BY NAME; what may differ is WHICH cameras (the tracker's are a
+            # subset -- the policy reads the near one, the generator both) and the pixel
+            # grid. See depth_obs.REQUIRE_SAME_DEPTH_RESOLUTION for the TODO to re-tighten
+            # the grid half once the two train at one resolution again.
             assert_depth_specs_agree(tracker_spec, fm_spec, "tracker.onnx", "fm.onnx",
                                      require_same_resolution=None)
         self._depth_spec = tracker_spec or fm_spec
         self._fm_depth_spec = fm_spec or tracker_spec
+        # The union, ORDERED AS THE GENERATOR's, since that is the superset -- then any
+        # tracker-only camera appended (only reachable when the generator reads no depth at
+        # all, e.g. a scan generator, where the union is just the tracker's list). A SHARED
+        # camera contributes the TRACKER's entry, so its obs_term and sensor name stay what
+        # every existing consumer of this list already reads; only the generator-only entries
+        # are the generator's. With one producer walking both obs groups in the same order,
+        # an equal pair therefore comes out byte-identical to what this returned before.
+        #
+        # A SPLIT sampling has no castable union: one array cannot hold two pixel widths, and
+        # a MujocoDepthCameras built over one would refuse it. There the cast stays the
+        # tracker's own cameras and the generator is owed state["fm_depth"], as before.
+        if self.depth_sampling_is_split():
+            self._depth_cast_spec = list(self._depth_spec)
+        else:
+            trk_by_key = index_cameras_by_key(self._depth_spec, "tracker.onnx")
+            self._depth_cast_spec = [trk_by_key.get(camera_key(cam), cam)
+                                     for cam in self._fm_depth_spec]
+            seen = {camera_key(cam) for cam in self._depth_cast_spec}
+            for cam in self._depth_spec:
+                if camera_key(cam) not in seen:
+                    self._depth_cast_spec.append(cam)
+                    seen.add(camera_key(cam))
+        self._trk_depth_rows = _depth_row_map(self._depth_cast_spec, self._depth_spec)
+        self._fm_depth_rows = _depth_row_map(self._depth_cast_spec, self._fm_depth_spec)
 
         if self.ctx.extero_source == "depth":
             if not self._fm_depth_spec:
@@ -586,6 +739,17 @@ class GenTrackerPolicy:
                       f"{c.get('sensor', c['obs_term'])} {c['width']}x{c['height']} "
                       f"on {c['mount_body']}" for c in self._depth_spec
                   ) + ("" if split else fold))
+        if self.depth_camera_sets_differ():
+            # Not an anomaly: the policy tracks a reference and does not need the far camera,
+            # so it is the generator's instrument alone. Printed because a runtime casting
+            # only the tracker's cameras would leave the generator's extra plane at zero --
+            # a plausible image, and nothing downstream can catch it.
+            extra = [camera_key(c) for c in self._fm_depth_spec
+                     if camera_key(c) not in {camera_key(t) for t in self._depth_spec}]
+            print(f"[INFO GenTrackerPolicy] the generator additionally reads {extra}, which "
+                  f"the tracker does not. The runtime casts the UNION "
+                  f"({[camera_key(c) for c in self._depth_cast_spec]}) as state['depth'] and "
+                  "each consumer selects its own rows by name.")
         if split:
             print("[INFO GenTrackerPolicy] the generator SAMPLES those same cameras on its own "
                   "grid: "
@@ -594,20 +758,66 @@ class GenTrackerPolicy:
                   + f".{fold} The runner must cast both and supply state['fm_depth']; the "
                     "physical cameras are identical (checked above), only the grids differ.")
 
+    def _select_depth_rows(self, images, want: list[dict], rows: list[int] | None,
+                           consumer: str, key: str) -> np.ndarray:
+        """Pick one consumer's camera rows out of a supplied depth reading, BY NAME.
+
+        The runtime is fed the UNION of the two artifacts' cameras, because the tracker's set
+        is a subset of the generator's. Handing that array straight to either consumer, or
+        pairing it with a spec positionally, is a bug no shape check can see: a 2-row union
+        against a 1-camera tracker is exactly the same array as a 2-camera tracker's, and the
+        far camera's image would simply be read as the near one's.
+
+        Args:
+            images: The reading the caller supplied, ``(T, H*W)``.
+            want: This consumer's cameras.
+            rows: This consumer's row map into :attr:`_depth_cast_spec`, or ``None`` when the
+                union cannot serve it.
+            consumer: "tracker" / "generator", for the message.
+            key: The state key the reading came from, for the message.
+
+        Returns:
+            ``(len(want), H*W)`` in ``want``'s order.
+
+        Raises:
+            ValueError: If the reading's row count matches neither the union nor this
+                consumer's own camera count -- naming both, since which one the caller meant
+                is precisely what is ambiguous.
+        """
+        arr = np.asarray(images, dtype=np.float64)
+        arr = arr.reshape(1, -1) if arr.ndim == 1 else arr
+        n = arr.shape[0]
+        if rows is not None and n == len(self._depth_cast_spec):
+            return arr[rows]
+        if n == len(want):
+            return arr
+        raise ValueError(
+            f"state['{key}'] holds {n} camera row(s), which is neither the {len(self._depth_cast_spec)} "
+            f"of the cast union {[camera_key(c) for c in self._depth_cast_spec]} nor the "
+            f"{len(want)} the {consumer} reads {[camera_key(c) for c in want]}. Cast the "
+            "union and let each consumer select from it, or supply exactly this consumer's "
+            "cameras in its own contract order."
+        )
+
     def _fm_depth_reading(self, state: dict) -> np.ndarray:
         """The depth reading the GENERATOR conditions on, at its own sampling.
 
-        ``state["depth"]`` is the tracker's, keyed to its observation terms. When the
-        samplings are split the generator needs its own array -- the two have different
-        widths, so there is nothing to reuse and nothing to resize (upsampling would invent
-        detail the grid never had).
+        ``state["depth"]`` carries the UNION of the two artifacts' cameras, so the generator's
+        rows are SELECTED out of it by name -- the tracker reads only the near camera and the
+        generator both, and pairing that array positionally would feed the far camera's image
+        in as the near one's with every shape correct.
+
+        When the samplings are split the generator needs its own array instead: the two have
+        different widths, so there is nothing to reuse and nothing to resize (upsampling
+        would invent detail the grid never had).
 
         ``fm_depth`` is AUTHORITATIVE whenever the runner supplies it, split or not. It used
         to be consulted only on a split, which left a caller no way to feed the generator a
         different reading at a shared resolution -- the case a simulator needs to reproduce
         camera latency, where the generator must see an older frame while the tracker's own
         observation stays live. Nothing on the robot sets it at a shared resolution, so the
-        hardware path is unchanged.
+        hardware path is unchanged. It is selected from too, because the lag buffers whatever
+        ``state["depth"]`` held, which is the union.
 
         Args:
             state: The runtime state dict the runner built this step.
@@ -619,9 +829,11 @@ class GenTrackerPolicy:
             KeyError: If the samplings are split and the runner supplied no ``fm_depth``.
         """
         if "fm_depth" in state:
-            return np.asarray(state["fm_depth"], dtype=np.float64)
+            return self._select_depth_rows(state["fm_depth"], self._fm_depth_spec,
+                                           self._fm_depth_rows, "generator", "fm_depth")
         if not self.depth_sampling_is_split():
-            return np.asarray(state["depth"], dtype=np.float64)
+            return self._select_depth_rows(state["depth"], self._fm_depth_spec,
+                                           self._fm_depth_rows, "generator", "depth")
         raise KeyError(
             "the generator samples the depth cameras at "
             f"{self._fm_depth_spec[0]['width']}x{self._fm_depth_spec[0]['height']} while "
@@ -694,46 +906,97 @@ class GenTrackerPolicy:
         return depth_xyz_rows_np(self._fm_depth_spec, image, poses, channels)
 
     def depth_sampling_is_split(self) -> bool:
-        """Whether the generator samples the cameras on a different grid than the tracker.
+        """Whether the generator samples a SHARED camera on a different pixel grid.
 
-        TODO(one-sampling): remove the split path once the generator and tracker are trained
-        at one resolution. It exists so a generator can be retrained at a different grid
-        WITHOUT retraining the teacher, which is a development convenience rather than a
-        deployment need -- and it is not free: sim2sim casts the scene twice, and every
-        consumer has to decide which reading it wants. The long-term intent is that the two
-        match, at which point this predicate is always False and the second cast, the
-        ``fm_depth`` state key and ``add_fm_depth_pair`` all go.
+        This is the "a second ray cast is owed" question, and nothing else: the caller must
+        build a second caster from :meth:`get_fm_depth_camera_spec` and supply
+        ``state["fm_depth"]``, because two grids cannot live in one array and resizing would
+        either invent detail (up) or throw away exactly the detail the generator was trained
+        on (down).
 
-        The runner reads this to decide whether it needs a SECOND ray caster, and the
-        hardware path reads it to refuse: there is one real camera stream per lens, so a
-        split sampling has no wiring on a robot yet.
+        Cameras the generator reads and the tracker does not are NOT this -- see
+        :meth:`depth_camera_sets_differ`. They need no second cast: the runtime casts the
+        union and each consumer selects its own rows, which is what Isaac does too (at a
+        matching resolution the generator's obs terms read the very same sensors). Casting
+        them separately would give a shared camera two independent per-frame noise draws,
+        which is not the pair the models trained against.
+
+        TODO(one-sampling): this predicate can still become permanently False, once the
+        generator and tracker are trained at one resolution. What is no longer true is the
+        rest of that plan: ``install_fm_depth_group``, the ``fm_depth`` observation group
+        and the ``fm_depth`` state key do NOT go with it. The generator's camera SET now
+        differs from the policy's by design (the policy reads the near camera alone), so
+        the group is permanent, and the state key is what the simulator's camera-latency
+        model writes.
 
         Returns:
-            True when the two resolved contracts differ in resolution.
+            True when a camera both artifacts read is sampled at two resolutions.
         """
         if not self._depth_spec or not self._fm_depth_spec:
             return False
-        return [(int(c["width"]), int(c["height"])) for c in self._depth_spec] != \
-               [(int(c["width"]), int(c["height"])) for c in self._fm_depth_spec]
+        fm_by_key = index_cameras_by_key(self._fm_depth_spec, "fm.onnx")
+        for cam in self._depth_spec:
+            other = fm_by_key.get(camera_key(cam))
+            if other is None:
+                continue        # a tracker-only camera; assert_depth_specs_agree owns that
+            if (int(cam["width"]), int(cam["height"])) != (int(other["width"]),
+                                                           int(other["height"])):
+                return True
+        return False
+
+    def depth_camera_sets_differ(self) -> bool:
+        """Whether the generator reads cameras the tracker does not.
+
+        The shipped configuration: the policy is conditioned on the near camera alone and the
+        generator on both. Unlike a split SAMPLING this costs no second cast -- the runtime
+        casts :meth:`get_depth_camera_spec` (the union) and each consumer selects by name --
+        but a caller that fabricates a depth reading, or slices one, has to know that the
+        tracker's camera count is not the generator's.
+
+        Returns:
+            True when the two camera sets are not the same set.
+        """
+        return ({camera_key(c) for c in self._depth_spec}
+                != {camera_key(c) for c in self._fm_depth_spec})
 
     def get_fm_depth_camera_spec(self) -> list[dict]:
         """The GENERATOR's depth-camera contract.
 
-        The same list as :meth:`get_depth_camera_spec` unless the samplings are split, in
-        which case this is the one whose grid the generator's graph expects.
+        A superset of :meth:`get_tracker_depth_camera_spec`, and the list every
+        ``extero_sensor_dim`` / image-fold / camera-pose count is measured against.
 
         Returns:
             One dict per camera, in the generator's sensor-row order.
         """
         return list(self._fm_depth_spec)
 
-    def get_depth_camera_spec(self) -> list[dict]:
-        """The resolved depth-camera contract (empty when the policy has no cameras).
+    def get_tracker_depth_camera_spec(self) -> list[dict]:
+        """The TRACKER's own depth cameras, keyed by observation term.
 
-        The runner reads this to build its ray caster, so sim and hardware cast exactly
-        the cameras the networks were trained on.
+        A SUBSET of the generator's: the policy reads the near camera and the generator both.
+        This is what ``_build_obs`` fills its depth observation terms from, and it is NOT what
+        a runtime should cast -- see :meth:`get_depth_camera_spec` for that.
+
+        Returns:
+            One dict per camera the tracker observes.
         """
         return list(self._depth_spec)
+
+    def get_depth_camera_spec(self) -> list[dict]:
+        """What the runtime must CAST: the union of both artifacts' cameras.
+
+        The runner builds its ray caster from this and hands the result back as
+        ``state["depth"]``; on hardware it is one frame per entry, in this order. It is the
+        UNION rather than the tracker's own list because the generator reads a camera the
+        policy does not, and a runtime casting only the tracker's would leave that plane at
+        zero -- a plausible image of a wall at the near plane, which nothing downstream can
+        catch. Empty when the policy has no cameras.
+
+        Use :meth:`get_tracker_depth_camera_spec` for what the POLICY observes and
+        :meth:`get_fm_depth_camera_spec` for what the GENERATOR conditions on; both are
+        selected out of this reading by name.
+        """
+        return list(self._depth_cast_spec)
 
     def get_obs_terms(self) -> list[dict]:
         """The tracker's ordered observation terms, from its embedded metadata.
@@ -1095,21 +1358,84 @@ class GenTrackerPolicy:
     # ------------------------------------------------------------------
     # Snapshot + generator inference
     # ------------------------------------------------------------------
+    def _measured_history_node(self, state: dict) -> np.ndarray:
+        """The ROBOT'S OWN state as a history row ``(1, D)``, in the plan's frame.
+
+        The numpy twin of ``FmTrackingCommand._measured_history_node``: one
+        :func:`window_np.world_to_window` call whose "reference" arguments are the measured
+        base pose, base velocity, joints and end-effector positions, anchored on
+        ``_anchor_pos`` / ``_anchor_quat`` -- the pose at the last re-plan, which is the
+        frame every history row lives in.
+
+        Joints are permuted isaac -> FM (``_isaac_to_fm``); the state dict arrives in the
+        robot's order and the node's joint block is the checkpoint's.
+
+        Unlike the served row this one is built from the state at THIS step, and the caller
+        stashes it for the next step's push -- ``_update_generator`` pushes a row describing
+        the previous step.
+
+        Args:
+            state: This tick's state dict (``root_pos``, ``root_quat``, ``root_lin_vel_w``,
+                ``root_ang_vel_w``, ``joint_pos``, ``joint_vel``, and ``frame_pos`` when
+                the layout carries an ``ee_pos`` block).
+
+        Returns:
+            ``(1, D)`` window node.
+
+        Raises:
+            KeyError: If an ``ee_pos`` layout is not given ``frame_pos``. Refused rather
+                than zero-filled: a zeroed posture block is a plausible number for a robot
+                folded in half.
+        """
+        f64 = lambda k: np.asarray(state[k], dtype=np.float64)      # noqa: E731
+        n_ee = self.ctx.target_num_extra_frames
+        if "ee_pos" in self.reference_blocks and n_ee > 0:
+            ee = f64("frame_pos")[:n_ee].reshape(1, 1, n_ee, 3)
+        else:
+            ee = np.zeros((1, 1, 0, 3))
+        jp = f64("joint_pos")[self._isaac_to_fm].reshape(1, 1, -1)
+        jv = f64("joint_vel")[self._isaac_to_fm].reshape(1, 1, -1)
+        return world_to_window(
+            self._anchor_pos.reshape(1, 1, 3), self._anchor_quat.reshape(1, 1, 4),
+            f64("root_pos").reshape(1, 1, 3), f64("root_quat").reshape(1, 1, 4),
+            f64("root_lin_vel_w").reshape(1, 1, 3), f64("root_ang_vel_w").reshape(1, 1, 3),
+            jp, jv, ee, blocks=self.reference_blocks,
+        ).reshape(1, self.ctx.D)
+
     def _make_snapshot(self, state: dict) -> dict[str, np.ndarray]:
         """Pack one autoregressive history row (1 env).
 
-        The row is the reference-window node this runtime SERVED last step -- the
-        generator's own output -- not a measured state. It is already expressed relative to
-        the robot as it was at that step, which is how the dataset builds the history, so
-        there is nothing to transform and no base pose to estimate. Before the first sample
-        (and for the first ``N`` steps after a reset) there is nothing real to push; zeros
-        go in and the learned ``null_history`` embedding covers them.
+        Under ``history_from="generator"`` the row is the reference-window node this runtime
+        SERVED last step -- the generator's own output -- not a measured state. It is already
+        expressed relative to the robot as it was at that step, which is how the dataset
+        builds the history, so there is nothing to transform and no base pose to estimate.
+
+        Under ``history_from="measured"`` it is the robot's own state at the previous step
+        (stashed by :meth:`_update_generator`), with the columns no robot can measure taken
+        from the node served at that SAME step. Both stashes describe the previous step at
+        this instant, which is what makes the substitution line up; pairing a measured row
+        for this step with a served node for the last would be off by one step of travel.
+
+        Either way, before the first sample (and for the first ``N`` steps after a reset)
+        there is nothing real to push; zeros go in and the learned ``null_history``
+        embedding covers them. The measured arm is gated on the SERVED node too, not only
+        on its own stash: 3 of the row's columns can come from nowhere else, and a row that
+        is part measurement and part zero is not one the model has ever seen.
 
         ``command`` rides along for the held-command fallback in :meth:`_run_fm`.
         """
+        cmd = np.array(state["command"], dtype=np.float64, copy=True)[None]
+        if self.history_from == "measured":
+            meas, served = self._prev_measured_node, self._prev_served_node
+            if meas is None or served is None:
+                return {"node": np.zeros((1, self.ctx.D)), "cmd": cmd}
+            node = meas.reshape(1, self.ctx.D).copy()
+            for a, b in self._measured_fallback_spans:
+                node[:, a:b] = served.reshape(1, self.ctx.D)[:, a:b]
+            return {"node": node, "cmd": cmd}
         node = (np.zeros((1, self.ctx.D)) if self._prev_served_node is None
                 else self._prev_served_node.reshape(1, self.ctx.D).copy())
-        return {"node": node, "cmd": np.array(state["command"], dtype=np.float64, copy=True)[None]}
+        return {"node": node, "cmd": cmd}
 
     def advance_dormant_step(self) -> None:
         """Advance the control-step counter while the generator is dormant.
@@ -1138,7 +1464,8 @@ class GenTrackerPolicy:
         The step order IS the algorithm, and it mirrors
         ``FmTrackingCommand._snapshot_and_infer`` exactly:
 
-        1. push the node served LAST step into the history (already in that step's frame);
+        1. push the node served LAST step into the history (already in that step's frame),
+           or under ``history_from="measured"`` the row describing that step;
         2. decide whether to re-plan -- on cadence, or whenever there is no live plan;
         3. otherwise advance the cursor one node into the existing plan;
         4. re-plan where asked, which resets the cursor and re-captures the anchor;
@@ -1154,6 +1481,12 @@ class GenTrackerPolicy:
         if self.fm_lead_ticks:
             self._lead_buf.append(self._lead_sample(state))
         self._history.append(self._make_snapshot(state))
+        if self.history_from == "measured":
+            # Stashed AFTER the push, so the row that just went in describes the previous
+            # step and this one describes the current step -- and stashed with the anchor
+            # in force now, before this step's possible re-plan moves it, so the row carries
+            # the frame of the step it describes.
+            self._prev_measured_node = self._measured_history_node(state)
         if self._prev_served_node is None:
             # Nothing has been served yet, so that row is the zero placeholder, not a node
             # this runtime produced. Keep the window INVALID so the learned null-history
@@ -1445,6 +1778,82 @@ class GenTrackerPolicy:
         lifted = self.predicted_base_pose_w()
         return None if lifted is None else lifted[0]
 
+    def predicted_base_vel_w(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """The predicted window's reference base twist, lifted to the world frame.
+
+        FOR DIAGNOSTICS ONLY, like :meth:`predicted_base_pose_w`, and lifted the same way: the
+        ``base_vel`` block is ``quat_apply_inverse(q_yaw, v_world)`` for both halves, so the
+        return leg is a single ``quat_apply`` through the anchor's YAW. No translation term --
+        a velocity is a free vector, so only the rotation applies.
+
+        Returns:
+            ``([F, 3] linear, [F, 3] angular)`` in world, or ``None`` when there is no live
+            prediction or the window carries no ``base_vel`` block.
+        """
+        if not self._pred_valid:
+            return None
+        sl = window_block_slices(
+            len(self._fm_to_isaac), self.ctx.target_num_extra_frames, self.reference_blocks
+        ).get("base_vel")
+        if sl is None:
+            return None
+        block = np.asarray(self._pred[0, :, sl], dtype=np.float64)            # [F,6]
+        q = yaw_quat(np.asarray(self._anchor_quat, dtype=np.float64))
+        q = np.broadcast_to(q, block.shape[:-1] + (4,))
+        return quat_apply(q, block[..., 0:3]), quat_apply(q, block[..., 3:6])
+
+    def served_reference_w(self) -> dict[str, np.ndarray] | None:
+        """The reference the tracker was told to be at THIS step, in world coordinates.
+
+        This is the quantity a tracking error is measured against, and it is deliberately the
+        one accessor rather than three:
+
+        * it reads the **served** window (:meth:`last_served_window`), so it is what the policy
+          was actually handed -- not the raw plan, which under ``robot_now`` differs by a
+          re-anchoring, and not node 0, which under ``fm_update_every > 1`` is up to ``K-1``
+          steps stale and puts a sawtooth into every channel (see
+          :attr:`served_node_index`);
+        * it lifts through the anchor **stashed with that window**, so the clip arm and the
+          generator arm, and both ``window_anchor`` conventions, are one call site. A caller
+          reaching for ``_anchor_pos`` directly would be right on exactly one of the four
+          combinations.
+
+        Offset 0 of the served window is "now" by construction, whatever the re-plan period.
+
+        Returns:
+            ``{"base_pos_w", "base_quat_w" (xyzw), "base_lin_vel_w", "base_ang_vel_w",
+            "joint_pos"}`` for whichever blocks the window carries -- a dropped block is
+            ABSENT, never zero-filled, because a zero would be drawn and differenced as a
+            reference standing still at the origin. ``None`` before the first observation.
+
+        Raises:
+            ValueError: If the window carries no ``base_pose`` block. Every consumer of this
+                needs a pose, and there is no useful reduced answer.
+        """
+        if getattr(self, "_last_served_window", None) is None:
+            return None
+        nj, n_extra = len(self._fm_to_isaac), self.ctx.target_num_extra_frames
+        slices = window_block_slices(nj, n_extra, self.reference_blocks)
+        if "base_pose" not in slices:
+            raise ValueError(
+                "the served window carries no base_pose block, so there is no reference pose "
+                f"to measure against (blocks={list(self.reference_blocks)})")
+        node = np.asarray(self._last_served_window, dtype=np.float64)[
+            :window_dim(nj, n_extra, self.reference_blocks)]                  # offset 0 = now
+        anchor_pos, anchor_quat = self._last_served_anchor
+
+        pos, quat = base_pose_block_to_world(node[slices["base_pose"]], anchor_pos, anchor_quat)
+        out = {"base_pos_w": pos, "base_quat_w": quat}
+        if "base_vel" in slices:
+            twist = node[slices["base_vel"]]
+            q = yaw_quat(np.asarray(anchor_quat, dtype=np.float64))
+            out["base_lin_vel_w"] = quat_apply(q, twist[0:3])
+            out["base_ang_vel_w"] = quat_apply(q, twist[3:6])
+        if "joint_pos" in slices:
+            # Frame-invariant, so served verbatim -- and already in ISAAC joint order.
+            out["joint_pos"] = node[slices["joint_pos"]]
+        return out
+
     @property
     def served_node_index(self) -> int:
         """Absolute index of the window node being served this step (the cursor).
@@ -1567,7 +1976,8 @@ class GenTrackerPolicy:
         return self._build_obs(state, reference=reference,
                                window_anchor=self._clip_window_anchor(state, clip_tick))
 
-    def _stash_window(self, served: np.ndarray) -> np.ndarray:
+    def _stash_window(self, served: np.ndarray,
+                      anchor: tuple[np.ndarray, np.ndarray]) -> np.ndarray:
         """Remember the window that went into THIS observation, and pass it through.
 
         The served window is the most diagnostic quantity in the loop and it was previously
@@ -1576,13 +1986,23 @@ class GenTrackerPolicy:
         moved on. A recorder that did that would be comparing its own arithmetic, not the
         runtime's.
 
+        The ANCHOR is stashed with it for the same reason and is not optional. A window's base
+        blocks are relative to a pose, that pose differs by arm and by convention (the
+        generator's re-plan latch, the clip's own latch, or the measured root under
+        ``robot_now``), and a caller that picked the wrong one would lift the window to a
+        plausible world pose displaced by the egomotion since the re-plan -- which is exactly
+        the class of bug ``data_logger`` had.
+
         Args:
             served: The window vector about to be assembled into the observation.
+            anchor: ``(pos, quat_xyzw)`` that window's base blocks are measured from.
 
         Returns:
             ``served``, unchanged.
         """
         self._last_served_window = served
+        self._last_served_anchor = (np.asarray(anchor[0], dtype=np.float64).copy(),
+                                    np.asarray(anchor[1], dtype=np.float64).copy())
         return served
 
     def last_served_window(self) -> np.ndarray:
@@ -1697,16 +2117,27 @@ class GenTrackerPolicy:
         default = self._trk.default_joint_angles
         inv_root = quat_inv(root_quat)
 
+        # The pose the served window's base blocks are ACTUALLY measured from, per arm and per
+        # convention. On the generator path under `plan` that is the re-plan latch; otherwise
+        # it is the measured root, because `_serve_nodes` has already re-anchored the plan onto
+        # it. The clip path's is resolved by `_clip_window_anchor` and arrives as
+        # `window_anchor`. Resolved here, beside the window it belongs to, so the two cannot be
+        # paired up wrongly by a caller later.
+        if window is None:
+            served = self._fm_reference_window(state)
+            served_anchor = ((self._anchor_pos, self._anchor_quat)
+                             if self._window_anchor == "plan" else (root_pos, root_quat))
+        else:
+            served_anchor = window_anchor or (root_pos, root_quat)
+            served = self._reference_window(window, *served_anchor)
+
         values = {
             "base_ang_vel": f64(state["base_ang_vel"]),
             "projected_gravity": quat_apply(inv_root, np.array([0.0, 0.0, -1.0])),
             "joint_pos": f64(state["joint_pos"]) - default,
             "joint_vel": f64(state["joint_vel"]),
             "actions": np.asarray(self._trk.action_isaac, dtype=np.float64),
-            "reference_window": self._stash_window(
-                self._fm_reference_window(state) if window is None
-                else self._reference_window(window, *(window_anchor
-                                                      or (root_pos, root_quat)))),
+            "reference_window": self._stash_window(served, served_anchor),
             # The joystick-level command over the same offsets. Deliberately separate from
             # the reference window so it stays clean: at deploy it comes from the joystick
             # or a scripted profile, not the generator. A clip reference supplies each
@@ -1735,11 +2166,18 @@ class GenTrackerPolicy:
         # the per-ray clearance in state["height_scan"]; _assemble applies the exported clip.
         if "height_scan" in state:
             values["height_scan"] = f64(state["height_scan"])
-        # Depth: one normalised row per camera, in contract order. Keyed here by the term
-        # name the export recorded, so their position in the vector stays _assemble's
-        # (metadata-driven) job; _assemble then applies the exported obs clip.
-        for cam, image in zip(self._depth_spec, state.get("depth", ())):
-            values[cam["obs_term"]] = f64(image)
+        # Depth: one normalised row per camera the TRACKER observes, SELECTED out of the
+        # supplied reading by camera name. The reading is the union of both artifacts'
+        # cameras (the generator reads one the policy does not), so zipping it against the
+        # tracker's contract would key the far camera's image under the near camera's obs
+        # term -- with every array the right shape. Keyed by the term name the export
+        # recorded, so their position in the vector stays _assemble's (metadata-driven) job;
+        # _assemble then applies the exported obs clip.
+        if self._depth_spec and state.get("depth") is not None:
+            rows = self._select_depth_rows(state["depth"], self._depth_spec,
+                                           self._trk_depth_rows, "tracker", "depth")
+            for cam, image in zip(self._depth_spec, rows):
+                values[cam["obs_term"]] = f64(image)
         return self._assemble(values)
 
     def _push_history(self, name: str, v: np.ndarray, history_length: int) -> np.ndarray:
@@ -1887,11 +2325,46 @@ class GenTrackerPolicy:
             self._clip_anchor_pos = None
             self._clip_anchor_quat = None
             self._prev_served_node = None
+            # And the measured stash, for the SAME reason spelled out above: it is a world
+            # pose from the previous episode, on another course. The ordering happens to
+            # overwrite it before the first read (`_prev_served_node is None` zeroes the row
+            # at step 0, and the stash is refreshed on that same step), so leaving it would
+            # be safe today and by accident -- which is what this whole method exists not to
+            # rely on.
+            self._prev_measured_node = None
             # NOT _plan_id: it identifies a sample, and restarting it at 0 would make two
             # plans from different episodes share an id in one recording.
             self._last_plan = None
             self._last_reference_window = None
+            # The served window and the anchor it is paired with describe the previous
+            # episode's last step; served_reference_w must say "nothing yet", not lift a stale
+            # node against a stale anchor into a perfectly plausible world pose.
+            self._last_served_window = None
+            self._last_served_anchor = None
             self._reset_timing()
+
+    def reseed(self, seed) -> None:
+        """Restart the generator's noise stream from ``seed``.
+
+        Deliberately NOT part of :meth:`reset`, which clears per-episode STATE: the RNG is a
+        stream, and whether an episode should resume it or restart it is the caller's
+        experiment design, not this class's business.
+
+        A harness comparing two arms episode-by-episode has to call this per episode, keyed
+        on the CELL rather than on arrival order. Left alone the stream is consumed one draw
+        per re-plan, so an episode's noise depends on how many re-plans every episode before
+        it made -- and an arm that falls early makes fewer. Two arms would then be scored on
+        different draws from the same cell onward, drifting further apart the longer the
+        sweep ran, with nothing in the tables to show it. That is the same defect as keying
+        the Isaac seed sweep by env: it puts the effect being measured inside its own control.
+
+        Args:
+            seed: Anything ``numpy.random.default_rng`` accepts -- an int, or a SEQUENCE of
+                them, which is the useful form here: a caller keying on a cell can pass
+                ``(fm_seed, terrain_idx, speed_idx)`` and get a well-mixed independent
+                stream per cell without inventing its own hash.
+        """
+        self._rng = np.random.default_rng(seed)
 
     def get_dt(self) -> float:
         return self._trk.get_dt()

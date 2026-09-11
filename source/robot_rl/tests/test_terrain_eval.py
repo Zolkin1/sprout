@@ -1239,9 +1239,20 @@ def test_teacher_forcing_ego_anchors_the_clip_it_reads_history_from():
 
 
 def test_every_mode_states_history_from_rather_than_inheriting_it():
-    """A task default must not be able to turn an `fm` cell into a teacher-forced one."""
+    """A task default must not be able to turn an `fm` cell into a teacher-forced one.
+
+    The accepted set is read off the COMMAND's own validation rather than restated here: a
+    new arm added there and forgotten in a mode mapping is the failure worth catching, and a
+    literal list in this test would instead fail on the arm's arrival and be widened.
+    """
+    src = (REPO / "source" / "robot_rl" / "robot_rl" / "tasks" / "manager_based"
+           / "robot_rl" / "mdp" / "commands" / "traj_tracking"
+           / "fm_tracking_cmd.py").read_text()
+    accepted = set(re.findall(r'history_from not in \(([^)]*)\)', src)[0]
+                   .replace('"', "").split(", "))
+    assert accepted, "could not read the accepted history_from arms off the command"
     for mode in ev.REFERENCE_MODES:
-        assert rn.reference_overrides(mode)["history_from"] in ("generator", "clip")
+        assert rn.reference_overrides(mode)["history_from"] in accepted
 
 
 def test_reference_overrides_refuses_an_unknown_mode():
@@ -1335,5 +1346,234 @@ def test_stage_grid_forwards_every_flag_the_cell_stage_reads():
         "silently take their argparse defaults in the subprocess")
 
 
+def test_stage_grid_forwards_the_PLANS_value_not_its_own_default():
+    """Forwarding the flag is not enough; it has to forward the right VALUE.
+
+    The test above cannot catch this, and that is the point: the flag IS restated, so the
+    pattern match passes while the value is wrong. It happened a third time -- a strict run
+    passed ``--tracking_spec`` and ``--goal_regions`` to ``--stage plan`` only, and the cell
+    announced "NO goal region: report.py will refuse to derive spatial success", having
+    silently taken ``""``. ``--num_envs`` reverted 2048 -> 256 in the same invocation.
+
+    So every forwarded value now resolves through ``val()``: the CLI when the caller TYPED it,
+    otherwise whatever ``--stage plan`` recorded in the manifest. Both halves matter -- always
+    preferring the plan would make the grid's own flags inert, and always preferring the CLI is
+    the bug.
+    """
+    src = pathlib.Path(_EVAL / "runner.py").read_text()
+    grid = src.split("def stage_grid")[1]
+    # Nothing in the forwarded argv may read `args.<x>` directly any more.
+    body = grid.split("proc = subprocess.run")[0]
+    direct = sorted(set(re.findall(r"args\.([a-z_]+)", body))
+                    - {"out", "cell", "cells", "force", "dry_run", "_explicit"})
+    assert not direct, (
+        f"stage_grid still reads args.{direct} directly when building the cell command; "
+        "those bypass the plan fallback and revert to argparse defaults for any flag the "
+        "caller passed only to --stage plan")
+    assert 'recorded = (manifest.get("cli") or {}).get("resolved") or {}' in grid, (
+        "stage_grid no longer reads the manifest's recorded plan-time values")
+
+    # And the CLI-vs-plan distinction it depends on must still be computed.
+    ev = pathlib.Path(_EVAL / "evaluate.py").read_text()
+    assert "def _explicit_dests(" in ev
+    assert "args._explicit = _explicit_dests(" in ev, (
+        "main() no longer records which flags the caller typed, so `val()` cannot tell a "
+        "deliberate CLI override from an argparse default and the plan would always win")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ==========================================================================================
+# The SPATIAL success rule.
+#
+# Everything the table stores about an outcome, apart from the goal columns, is a clip-CURSOR
+# condition: `clip_end_reached` fires on a step index and every `terrain_*` column compares
+# `steps_survived` against one.  So a success rule built on them means "stayed upright for N
+# steps", not "got anywhere" -- and a robot that stalls in place scores one.  These tests pin
+# that the rule does not quietly go back to that.
+# ==========================================================================================
+
+import report  # noqa: E402
+
+
+def _fake_cell(n=4, *, reached=None, fell_bits=None, with_goal=True, steps=None,
+               goal_step=None, fall_step=None, viol_step=None):
+    """A minimal cell dict shaped like `load_cell`'s output.
+
+    Only the columns `derived_columns` reads are present; anything it starts reading that is
+    absent here fails loudly, which is the intent.
+
+    Args:
+        goal_step: ``first_goal_step`` per episode. Defaults to 100 where ``reached`` and -1
+            elsewhere -- an arrival with no step index is not a state a real table can be in.
+        fall_step: ``first_fall_step``; -1 (never) by default. This is the DERIVED fall
+            crossing and is independent of ``fell_bits``, which is the termination bit -- the
+            success rule reads the former, because only it carries an ORDERING against the
+            goal.
+        viol_step: ``first_violation_step``; -1 by default. Omit the column entirely by
+            passing ``False``, which is what a table written before the strict checks looks
+            like.
+    """
+    z = lambda: np.zeros(n)  # noqa: E731
+    d = {
+        "termination_bits": (np.zeros(n, dtype=np.uint16) if fell_bits is None
+                             else np.asarray(fell_bits, dtype=np.uint16)),
+        "admin_censored": np.zeros(n, dtype=np.uint8),
+        "min_base_height_w": np.full(n, 0.75),
+        "max_tilt_rad": z(),
+        "terrain_end_reached": np.ones(n, dtype=np.uint8),
+        "terrain_completed": np.ones(n, dtype=np.uint8),
+        "terrain_progress": np.ones(n),
+        "vel_mse_vx": z(), "vel_mse_vy": z(), "vel_mse_wz": z(),
+        "ref_joint_pos_mse": z(), "ref_base_ori_mse_rad": z(),
+        "cost_of_transport": z(), "torque_util_max": z(), "action_rate_mean": z(),
+        "steps_survived": (np.full(n, 300) if steps is None else np.asarray(steps)),
+        "last_usable_step": np.full(n, 300),
+        "event_observed": np.zeros(n, dtype=np.uint8),
+        "terrain_end_step": np.full(n, 200),
+    }
+    d["first_fall_step"] = (np.full(n, -1, dtype=np.int64) if fall_step is None
+                            else np.asarray(fall_step, dtype=np.int64))
+    if viol_step is not False:
+        d["first_violation_step"] = (np.full(n, -1, dtype=np.int64) if viol_step is None
+                                     else np.asarray(viol_step, dtype=np.int64))
+    if with_goal:
+        d["reached_goal"] = (np.ones(n, dtype=np.uint8) if reached is None
+                             else np.asarray(reached, dtype=np.uint8))
+        d["min_dist_to_goal_m"] = z()
+        if goal_step is None:
+            d["first_goal_step"] = np.where(d["reached_goal"].astype(bool), 100, -1).astype(np.int64)
+        else:
+            d["first_goal_step"] = np.asarray(goal_step, dtype=np.int64)
+    meta = {"cell": "fm__train__x", "termination_terms": ["time_out", "clip_end", "base_fallen"]}
+    return {"data": d, "meta": meta}
+
+
+def test_a_robot_that_survived_but_never_arrived_is_NOT_a_success():
+    """The stall case. Every temporal column here says the episode went perfectly."""
+    cell = _fake_cell(n=4, reached=[1, 1, 0, 0])
+    out = report.derived_columns(cell, {}, "spatial")
+    assert out["success"].tolist() == [1.0, 1.0, 0.0, 0.0]
+    # ...and the temporal rule calls all four a success, which is the defect.
+    assert report.derived_columns(cell, {}, "legacy_temporal")["success"].tolist() == [1.0] * 4
+
+
+def test_success_is_decided_by_FIRST_EVENT_ordering_not_by_the_termination_bit():
+    """Arriving before falling is a success; falling before arriving is not.
+
+    **This replaces `arrived AND not failed`, which was wrong in one direction.** That rule
+    failed any episode whose fall termination bit was set regardless of WHEN it fired, so an
+    episode that reached the goal and then fell in the run-out scored a failure here while
+    `rollout_outcomes.terminal_reward` scored it a success -- on 51 of 298 episodes of one
+    measured rollout, and `d36e59c1` measured the same first-event change moving mjeval's
+    success 48.0% -> 65.1%. Two arms cannot be compared under two success rules.
+
+    The termination bit is set identically in both episodes below; only the ORDER differs.
+    """
+    bits = np.full(2, 1 << 2, dtype=np.uint16)     # base_fallen, index 2, on BOTH
+    cell = _fake_cell(2, reached=[1, 1], fell_bits=bits,
+                      goal_step=[10, 40], fall_step=[40, 10])
+    out = report.derived_columns(cell, {}, "spatial")
+    assert out["success"].tolist() == [1.0, 0.0], "first-event ordering was not applied"
+    # `failed` still reports the termination bit, unfolded, so the two are separable.
+    assert out["failed"].tolist() == [1.0, 1.0]
+
+
+def test_the_strict_checks_only_ever_REMOVE_successes_and_are_flagged_when_absent():
+    """The HEADLINE `success` follows the strict rule wherever the strict data exists.
+
+    It used to be the loose rule unconditionally, with `success_strict` computed and left in
+    the reduced table -- so a run that collected the tracking checks printed the FALL-ONLY
+    rate under the name "success". Measured on `strict_v1`: loose read clip 0.9188 /
+    fm 0.6406 while the strict rule those cells actually ran under is clip 0.9089 /
+    fm 0.6061, and the checks cost the generator 3.5x what they cost the clip -- so reading
+    the wrong one changes a CONTRAST, not merely a level.
+
+    `success_loose` is kept beside it. The pair is what says what the checks cost, and a cell
+    written before they existed must stay distinguishable from one where nothing ever fired.
+    """
+    cell = _fake_cell(3, reached=[1, 1, 1], goal_step=[10, 10, 10],
+                      viol_step=[-1, 5, 40])
+    out = report.derived_columns(cell, {}, "spatial")
+    #                     no violation | violated BEFORE arriving | violated AFTER arriving
+    assert out["success"].tolist() == [1.0, 0.0, 1.0], "the headline is not the strict rule"
+    assert out["success_strict"].tolist() == [1.0, 0.0, 1.0]
+    assert out["success_loose"].tolist() == [1.0, 1.0, 1.0]
+    assert out["strict_checks_active"].tolist() == [1.0] * 3
+    # Strict only ever REMOVES: it can never turn a loose failure into a success.
+    assert all(a <= b for a, b in zip(out["success_strict"], out["success_loose"]))
+
+    # A table with no tracking columns at all: all three coincide BY CONSTRUCTION, so the
+    # headline falls back to loose rather than to an all-zero strict column -- and the flag
+    # says which, rather than letting a reader mistake it for "nothing ever fired".
+    old = report.derived_columns(_fake_cell(3, reached=[1, 1, 1], viol_step=False), {},
+                                 "spatial")
+    assert (old["success"].tolist() == old["success_strict"].tolist()
+            == old["success_loose"].tolist() == [1.0] * 3)
+    assert old["strict_checks_active"].tolist() == [0.0] * 3
+
+
+def test_success_does_not_depend_on_steps_survived():
+    """The property the whole module exists for, stated directly.
+
+    Two episodes identical except in how long they lasted must score the same, because
+    duration is not evidence of arrival.  If this fails, a temporal term has crept back in.
+    """
+    long_ep = report.derived_columns(_fake_cell(2, reached=[1, 0], steps=[300, 300]), {},
+                                     "spatial")["success"]
+    short_ep = report.derived_columns(_fake_cell(2, reached=[1, 0], steps=[7, 7]), {},
+                                      "spatial")["success"]
+    assert long_ep.tolist() == short_ep.tolist() == [1.0, 0.0]
+
+
+def test_a_table_without_the_goal_columns_is_REFUSED_not_reduced():
+    """Not a fallback. A spatial claim resting on a temporal measurement is the defect."""
+    with pytest.raises(ValueError, match="no `reached_goal` column"):
+        report.derived_columns(_fake_cell(with_goal=False), {}, "spatial")
+    # ...and is readable under the explicit legacy rule, which is what it is for.
+    assert report.derived_columns(_fake_cell(with_goal=False), {},
+                                  "legacy_temporal")["success"].tolist() == [1.0] * 4
+
+
+def test_an_all_zero_goal_column_is_refused_rather_than_reported_as_zero_success():
+    """A cell run without --goal_regions has the column and never populates it.
+
+    That is indistinguishable here from a policy that never arrived, so reporting 0.000
+    success would be a confident wrong number -- the exact failure mode a missing artifact
+    should never be able to produce.
+    """
+    with pytest.raises(ValueError, match="zero on every one of its"):
+        report.derived_columns(_fake_cell(4, reached=[0, 0, 0, 0]), {}, "spatial")
+
+
+def test_reached_goal_is_reported_beside_success_only_under_the_spatial_rule():
+    spatial = report.derived_columns(_fake_cell(2, reached=[1, 0]), {}, "spatial")
+    assert spatial["reached_goal"].tolist() == [1.0, 0.0]
+    legacy = report.derived_columns(_fake_cell(2, reached=[1, 0]), {}, "legacy_temporal")
+    assert "reached_goal" not in legacy, (
+        "an all-ones reached_goal under the legacy rule would state that every episode "
+        "arrived, when nothing measured whether any of them did")
+
+
+def test_an_unknown_success_rule_is_refused():
+    with pytest.raises(ValueError, match="unknown success_rule"):
+        report.derived_columns(_fake_cell(), {}, "whatever_looks_best")
+
+
+def test_a_bootstrap_table_is_refused_rather_than_reported():
+    """Placeholder tolerances must not be able to produce a success rate.
+
+    A bootstrap run's `reached_goal` is measured against tolerances that were guessed, so its
+    success column is a number produced by a tool working exactly as designed and meaning
+    nothing. It is the one case where the columns are all present and the answer is still not
+    usable, which is why the refusal keys on provenance rather than on the data.
+    """
+    cell = _fake_cell(4, reached=[1, 1, 0, 1])
+    cell["meta"]["overrides"] = {"goal_regions_bootstrap": True}
+    with pytest.raises(ValueError, match="BOOTSTRAP goal region"):
+        report.derived_columns(cell, {}, "spatial")
+    # A fitted spec on the same data reduces fine.
+    cell["meta"]["overrides"] = {"goal_regions_bootstrap": False}
+    assert report.derived_columns(cell, {}, "spatial")["success"].tolist() == [1.0, 1.0, 0.0, 1.0]

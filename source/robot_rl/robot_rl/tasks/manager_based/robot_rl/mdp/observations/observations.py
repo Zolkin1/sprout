@@ -61,12 +61,19 @@ def tracking_error_local(env: ManagerBasedRLEnv, command_name: str = "traj_ref")
     return eta
 
 
-def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref") -> torch.Tensor:
-    """Base pose error against the GLOBALLY-placed clip (``[N, 6]``).
+def tracking_error_global(
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", datum: str = "clip",
+) -> torch.Tensor:
+    """Base pose error against a GLOBAL datum (``[N, 6]``).
 
     Position error (3) plus the ``quat_box_minus`` rotation vector (3), both in the world
-    frame, measured against the clip on its reset-time terrain cell -- the same reference
-    the pose-drift termination uses.
+    frame. Which datum is measured against is ``datum``:
+
+    * ``"clip"`` (default, and every clip task) -- the clip on its reset-time terrain cell,
+      the same reference the pose-drift termination uses.
+    * ``"plan_anchor"`` -- the pose the generator's CURRENT prediction was made against
+      (:meth:`FmTrackingCommand.window_anchor` under ``window_anchor="plan"``), for the
+      free-form fine-tune, where there is no clip to measure against at all.
 
     Both halves are ``ref - actual``, matching :func:`base_pose_error` and the
     ``reference_window`` -- see
@@ -78,14 +85,52 @@ def tracking_error_global(env: ManagerBasedRLEnv, command_name: str = "traj_ref"
     This is the drift :func:`tracking_error_local` deliberately cannot see: the reward
     forgives planar drift, but the episode still ends on it, so without this the critic
     would be predicting a termination it has no way to anticipate.
+
+    **On the clip-free task the answer is a substitution, never a zero-fill.** Zero-filling
+    preserves the width -- which is what keeps a resumed teacher loading without checkpoint
+    surgery -- but hands the critic a constant where it was trained on a signal, and the clip
+    branch is worse than useless there: ``termination_reference_world_state`` keeps indexing
+    the clip by ``_step``, so under ``reference_source="fm"`` it marches away from the robot
+    on its own. The plan anchor is the closest true analogue. It is latched onto the root at
+    each re-plan, so what it measures is how far the robot has travelled since the window it
+    is currently tracking was drawn -- which is exactly the quantity the served reference
+    becomes unreachable through, and therefore what the free-form terminations fire on.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The tracking command term.
+        datum: ``"clip"`` or ``"plan_anchor"`` (see above).
+
+    Returns:
+        ``[N, 6]`` -- position error (3) then rotation vector (3), both ``ref - actual``.
+
+    Raises:
+        ValueError: On an unknown ``datum``, or on ``"plan_anchor"`` where the command's
+            anchor IS the measured root -- under ``window_anchor="robot_now"``, or with no
+            generator loaded, the drift is identically zero and the critic would be handed a
+            column of zeros with nothing to say so.
     """
     cmd = env.command_manager.get_term(command_name)
-    state = cmd.termination_reference_world_state()
     root_pos_w = wp.to_torch(cmd.robot.data.root_pos_w)
     root_quat_w = wp.to_torch(cmd.robot.data.root_quat_w)
+    if datum == "clip":
+        state = cmd.termination_reference_world_state()
+        ref_pos, ref_quat = state[:, 0:3], state[:, 3:7]
+    elif datum == "plan_anchor":
+        if (getattr(cmd.cfg, "window_anchor", None) != "plan"
+                or not getattr(cmd, "fm_enabled", False)):
+            raise ValueError(
+                "tracking_error_global(datum='plan_anchor') needs a command whose anchor is "
+                "the PLAN pose -- window_anchor='plan' with a generator loaded. Under "
+                "'robot_now', or with no generator, window_anchor() returns the measured root "
+                "and the drift is identically zero."
+            )
+        ref_pos, ref_quat = cmd.window_anchor()
+    else:
+        raise ValueError(f"datum must be 'clip' or 'plan_anchor'; got {datum!r}.")
     return torch.cat([
-        state[:, 0:3] - root_pos_w,
-        quat_box_minus(state[:, 3:7], root_quat_w),   # reference - actual
+        ref_pos - root_pos_w,
+        quat_box_minus(ref_quat, root_quat_w),   # reference - actual
     ], dim=-1)
 
 
@@ -776,6 +821,55 @@ def reference_window_to_world(
         num_ee_frames,
         blocks,
     )
+
+
+def fm_reference_window(
+    env: ManagerBasedRLEnv, command_name: str = "traj_ref", *,
+    offsets: Sequence[int], blocks: Sequence[str] | None = None,
+) -> torch.Tensor:
+    """:func:`reference_window`, served from the GENERATOR while everything else stays on the clip.
+
+    This is the RL fine-tuning seam.  The teacher trains against the clip -- reward, critic
+    and terminations all grade it -- but at deploy the policy is handed the generator's
+    prediction, and the two differ by more than the synthetic reference noise models.  This
+    term closes that gap from the observation side ALONE: the actor sees what it will see on
+    the robot, and nothing about what it is graded against moves.
+
+    That separation is what makes the fine-tune well-posed, and it is bought by ORDERING
+    rather than by a second copy of the reference.  ``FmTrackingCommand._update_command``
+    builds both references every step, applies the configured one, and computes the CLF
+    (``v`` / ``vdot``) there and then -- storing scalars.  ``clf_reward`` reads those stored
+    scalars, so a swap performed later, at observation time, cannot reach the reward however
+    long it lasts.  :meth:`~.fm_tracking_cmd.FmTrackingCommand.as_fm_reference` restores the
+    configured source on the way out, so the swap does not leak into the next term either.
+
+    Pair it with ``reference_source="clip"`` (so the graded reference IS the clip) and a
+    non-empty ``fm_checkpoint`` (so ``fm_enabled`` is true and the generator runs passively
+    beside it).  ``history_from`` then chooses the arm: ``"clip"`` is teacher forcing, which
+    keeps the prediction phase-locked to the motion the reward grades; ``"generator"`` is the
+    closed loop, where the two can drift apart and the reward stops describing what the
+    policy was shown.
+
+    Deliberately NOT applied to :func:`command_window`: that term is the joystick command,
+    which at deploy comes from the operator rather than the generator, and it is noise-free
+    for the same reason.
+
+    Args:
+        env: The environment.
+        command_name: The tracking command term; must be an ``FmTrackingCommand``.
+        offsets: Look-ahead offsets, as :func:`reference_window` takes them.
+        blocks: Reference blocks, as :func:`reference_window` takes them.
+
+    Returns:
+        ``[N, len(offsets) * D]`` -- the same layout the clip-served term produces, so a
+        checkpoint moves between the two without a shape change.
+
+    Raises:
+        RuntimeError: If the command has no generator loaded (``fm_checkpoint`` empty).
+    """
+    cmd = env.command_manager.get_term(command_name)
+    with cmd.as_fm_reference():
+        return reference_window(env, command_name, offsets=offsets, blocks=blocks)
 
 
 def command_window(

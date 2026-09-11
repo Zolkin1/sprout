@@ -8,7 +8,10 @@ are each unit-tested in isolation; this is the end-to-end check that the assembl
 agrees with the sensor it is imitating, on the same robot in the same pose.
 
 Both sides are put on FLAT ground with identical joint angles and root pose, all depth
-randomisation and noise off, and the two 30x26 images are differenced. Also checked:
+randomisation and noise off, and the two 30x26 images are differenced. BOTH cameras, always:
+the contract comes off the GENERATOR's observation group, which covers every camera the robot
+carries, and not off the policy's, which holds the near one alone (see :func:`_isaac_spec`).
+Also checked:
 
 * **Mount frame** -- the world offset of ``torso_link`` from the pelvis in each simulator.
   The contract's camera offsets are expressed in that body's frame, so a USD/MJCF skew here
@@ -142,16 +145,41 @@ def _as_torch(data):
 
 
 def _isaac_spec() -> list[dict]:
-    """The camera contract for this task, via the production simulator-free entry point.
+    """The camera contract for BOTH cameras, via the production simulator-free entry point.
+
+    Read off the GENERATOR's observation group, not the policy's. The policy group holds the
+    near camera alone (the far one reads terrain ahead, which is the generator's job), so
+    describing it here would silently drop the far camera from this comparison: ``CAMERAS``
+    is a pair, ``zip`` truncates, and an acceptance gate that only ever looked at one lens
+    would still print "ok". The generator's group is the one that covers every camera the
+    robot carries, which is what a sim2sim pixel diff has to cover.
 
     Returns:
         The per-camera contract, ordered near then far.
+
+    Raises:
+        RuntimeError: If the contract does not describe exactly :data:`CAMERAS` -- the
+            scene, the contract and the MuJoCo caster must name one camera set.
     """
+    from types import SimpleNamespace
+
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+        G1FmDepthObservationsCfg,
         depth_camera_specs_from_cfg,
     )
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import FM_DEPTH_OBS_GROUP
 
-    return depth_camera_specs_from_cfg()
+    spec = depth_camera_specs_from_cfg(
+        observations=SimpleNamespace(**{FM_DEPTH_OBS_GROUP: G1FmDepthObservationsCfg()}),
+        group=FM_DEPTH_OBS_GROUP,
+    )
+    named = tuple(str(cam["sensor"]) for cam in spec)
+    if named != CAMERAS:
+        raise RuntimeError(
+            f"the generator's obs group describes {named} but this comparison scene carries "
+            f"{CAMERAS}. One camera set, or the diff is measuring different robots."
+        )
+    return spec
 
 
 def _isaac_depth(scene, spec: list[dict]) -> np.ndarray:
@@ -167,8 +195,11 @@ def _isaac_depth(scene, spec: list[dict]) -> np.ndarray:
         ``(num_cameras, H*W)`` normalised depth.
     """
     rows = []
-    for name, cam in zip(CAMERAS, spec):
-        raw = scene.sensors[name].data.output["distance_to_image_plane"].squeeze(-1)
+    for cam in spec:
+        # Keyed by the contract's own sensor name rather than zipped against CAMERAS: a
+        # contract that ever stops covering both cameras must fail loudly at the lookup,
+        # not quietly produce a shorter comparison.
+        raw = scene.sensors[cam["sensor"]].data.output["distance_to_image_plane"].squeeze(-1)
         norm = normalize_depth(
             raw.double(),
             offset=cam["offset"], scale=cam["scale"],
@@ -499,7 +530,10 @@ def main() -> int:
         print(f"  posture: root {np.round(actual_root[:3], 4)} quat(xyzw) "
               f"{np.round(actual_root[3:7], 4)}; settled {drift * 1000:.2f} mrad from the "
               "written joint angles (both sims placed at the settled pose)")
-        for i, (cam, camera) in enumerate(zip(spec, cams.cameras)):
+        # Positional pairing is safe HERE and only here: cams was built as
+        # MujocoDepthCameras(model, spec), so its camera list IS this spec in this order.
+        # Nothing else in the script pairs two independently-derived camera lists.
+        for i, (cam, camera) in enumerate(zip(spec, cams.cameras, strict=True)):
             to_m = lambda row: denormalize_depth_np(row, cam["offset"], cam["scale"])
             diff = np.abs(to_m(isaac_rows[i]) - to_m(mj_rows[i]))
             hands = _hand_mask(model, cams, i)

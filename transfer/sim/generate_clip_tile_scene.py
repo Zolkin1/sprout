@@ -144,7 +144,11 @@ def emittable_overlays(entry: dict) -> list[dict]:
     out = []
     for i, ov in enumerate(entry.get("overlays", [])):
         kind, variant = str(ov.get("kind", "box")), str(ov.get("variant", "solid"))
-        if kind not in OVERLAY_KINDS:
+        # A cylinder is decoration-only, here for the same reason as on the Isaac side: it
+        # exists for its depth silhouette and never for a surface anything stands on.
+        if kind == "cylinder" and is_decor(ov):
+            pass
+        elif kind not in OVERLAY_KINDS:
             raise ValueError(
                 f"tile {entry.get('terrain_id')} overlay {i} has kind='{kind}'; expected one of "
                 f"{list(OVERLAY_KINDS)}. An unknown kind is most likely a new shape, which this "
@@ -215,6 +219,30 @@ def first_step(overlays: list[dict]) -> dict | None:
     flight's first riser sends :func:`spawn_point` to that post's centreline -- measured at
     2.05 m outside the tile, over the void, on a probe tile.
 
+    ``TODO(first-step-vs-first-obstacle)``: **this is the first TREAD, which is not always the
+    first OBSTACLE**, and :func:`spawn_point` measures its approach from here -- so where a
+    DEEP platform sits between the spawn and the first tread, the run-up is whatever is left of
+    it rather than the ``approach`` that was asked for.
+
+    Measured on clip library ``g1_mb_v5_body_mode11_decor.h5``: **tile 86 is the only affected
+    tile of the ~75 across stairs_up / stairs_down / jump_on / jump_off_front.**  It has a
+    2.14 m platform (too deep to be a tread, so skipped here) whose near edge is 0.36 m from
+    the spawn, and a 0.48 m block behind it at 2.50 m -- so the robot is placed 2.5 m before
+    the block and 0.36 m before a 0.75 m wall.  Three consequences, all on that tile: no
+    planning distance for the far camera (``X_START``'s whole purpose is that the obstacle is
+    visible for several re-plans before arrival), a hop-up off the spawn instead of an
+    approached climb, and ``Course.obstacle_x_m`` mislabelling the approach/on-course split
+    that ``mjeval.accumulate`` uses, since the robot is already up on the platform from
+    x ~ 0.36.
+
+    NOT fixed, deliberately: one tile in a library, against a filter whose looseness is the
+    railing-post failure above.  A fix would take the nearest walkable edge ABOVE the spawn
+    surface as the approach datum while keeping this function for the flight's first riser --
+    two questions that this one function currently answers with one number.  **Tile 86 is
+    excluded from the watch/eval tile sets until then**; see the dismount branch in
+    ``mjeval.terrains.isaac_tile_course``, which is where the same tile's goal also lands
+    wrong (on the box, before its dismount).
+
     Args:
         overlays: Overlays this emitter can represent.
 
@@ -225,6 +253,177 @@ def first_step(overlays: list[dict]) -> dict | None:
     steps = [ov for ov in walkable(overlays) if float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M]
     return min(steps, key=lambda ov: float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0) \
         if steps else None
+
+
+def authors_ground(entry: dict, overlays: list[dict], *, tol_m: float = 0.05) -> bool:
+    """Whether the tile authors its OWN ground slab, making a substitute floor a duplicate.
+
+    The free-form courses emit a full-footprint slab whose TOP is the tile's z=0 -- that slab
+    IS the floor, and it is what Isaac builds.  They also carry ``has_floor=False``, which
+    makes :func:`tile_geoms` emit the infinite plane at z=0 as a substitute; the two are then
+    exactly coplanar and z-fight in every viewer.
+
+    The test is footprint AND height, because either alone is wrong: a clip-library tile's
+    approach platform also spans the whole footprint (7.50 x 3.84 on one) but its top is a
+    riser up at +0.170, so it is a PLATFORM and the tile really does need a floor under it.
+
+    Args:
+        entry: The manifest tile entry.
+        overlays: Its emittable overlays.
+        tol_m: Slack on both the footprint match and the top-at-zero test.
+
+    Returns:
+        Whether some walkable overlay is the tile's own ground.
+    """
+    sx, sy = float(entry.get("size_x", 0.0)), float(entry.get("size_y", 0.0))
+    if sx <= 0.0 or sy <= 0.0:
+        return False
+    for ov in walkable(overlays):
+        top = float(ov["base_z"]) + float(ov["size_xyz"][2])
+        if abs(top) > tol_m:
+            continue
+        if (abs(float(ov["size_xyz"][0]) - sx) <= tol_m
+                and abs(float(ov["size_xyz"][1]) - sy) <= tol_m):
+            return True
+    return False
+
+
+def first_raised(overlays: list[dict], floor_top: float, *, min_rise_m: float = 0.05,
+                 from_x: float = -1e30) -> dict | None:
+    """The lowest-x walkable overlay whose top stands above ``floor_top`` -- the first OBSTACLE.
+
+    :func:`first_step` answers a different question: the flight's first TREAD, filtered to at
+    most :data:`_STEP_MAX_TREAD_M` deep so a railing post cannot be mistaken for a riser.  That
+    filter makes it blind to a deep obstacle -- the two-box course's boxes are 1.20 m along
+    travel, so ``first_step`` returns ``None`` on them and the tile reads as "not a feature
+    course" -- which is the ``TODO(first-step-vs-first-obstacle)`` on that function.  This is
+    the other half it names: the approach DATUM, with no depth filter, keyed on standing above
+    the floor instead.
+
+    Args:
+        overlays: The tile's emittable overlays.
+        floor_top: Surface height at the spawn (m); an overlay must exceed it to count.
+        min_rise_m: How far above ``floor_top`` counts as raised.  The ground overlay itself is
+            walkable and must not be selected.
+        from_x: Ignore overlays whose NEAR face is at or behind this tile-local x -- a feature
+            begins at its near face, so that is what "ahead" means. Filtering on the FAR face
+            instead picks the tile-spanning GROUND overlay, whose far face is ahead of every
+            spawn and whose near face is at x=0, giving a negative approach distance.
+
+    Returns:
+        The overlay dict, or ``None`` when nothing ahead stands above the floor.
+    """
+    best = None
+    for ov in walkable(overlays):
+        top = float(ov["base_z"]) + float(ov["size_xyz"][2])
+        if top <= floor_top + float(min_rise_m):
+            continue
+        near = float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0
+        if near <= float(from_x):
+            continue
+        if best is None or near < best[0]:
+            best = (near, ov)
+    return None if best is None else best[1]
+
+
+def first_drop(overlays: list[dict], floor_top: float, *, min_drop_m: float = 0.05,
+               from_x: float = -1e30) -> dict | None:
+    """The nearest walkable overlay ahead that sits BELOW ``floor_top`` -- the first DESCENT.
+
+    The mirror of :func:`first_raised`, and needed for the same reason from the other side: a
+    robot standing on a top platform has nothing raised ahead of it, so a raised datum finds
+    nothing and the tile reads as having no feature.  What is ahead is a drop, and its near
+    face -- the platform's lip -- is where the descent decision is made.
+
+    Args:
+        overlays: The tile's emittable overlays.
+        floor_top: Surface height at the spawn (m); an overlay must sit below it to count.
+        min_drop_m: How far below ``floor_top`` counts as a drop.
+        from_x: Ignore overlays whose NEAR face is at or behind this tile-local x; see
+            :func:`first_raised`.
+
+    Returns:
+        The overlay dict, or ``None`` when nothing ahead is lower.
+    """
+    best = None
+    for ov in walkable(overlays):
+        top = float(ov["base_z"]) + float(ov["size_xyz"][2])
+        if top >= floor_top - float(min_drop_m):
+            continue
+        near = float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0
+        if near <= float(from_x):
+            continue
+        if best is None or near < best[0]:
+            best = (near, ov)
+    return None if best is None else best[1]
+
+
+def area_spawn(entry: dict, overlays: list[dict], which: str = "top"
+                ) -> tuple[float, float, float, str]:
+    """A spawn taken from one of the tile's DECLARED spawn areas.
+
+    The free-form courses declare several -- the ground start and each raised surface -- and
+    the RL reset draws among them by weight, so half of an up-into-down arm's training
+    episodes begin on the top platform.  Reproducing that start is what makes the descent a
+    first decision rather than something only the surviving minority of ground-start trials
+    ever reaches.
+
+    Args:
+        entry: The tile's manifest entry.
+        overlays: Its emittable overlays.
+        which: ``"top"`` for the highest area, ``"ground"`` for the lowest.
+
+    Returns:
+        ``(x, y, z, why)`` tile-local, ``z`` the walkable surface at that xy.
+
+    Raises:
+        ValueError: If the tile declares no spawn areas, or ``which`` is unknown.
+    """
+    areas = ((entry.get("route") or {}).get("spawn_areas")) or []
+    if not areas:
+        raise ValueError(
+            f"tile {entry.get('terrain_id')} declares no spawn areas; use spawn_from='route'.")
+    if which == "top":
+        a = max(areas, key=lambda r: float(r["z"]))
+    elif which == "ground":
+        a = min(areas, key=lambda r: float(r["z"]))
+    else:
+        raise ValueError(f"which must be 'top' or 'ground', got {which!r}")
+    x, y = float(a["x"]), float(a["y"])
+    # The area's own z is the surface it sits on; re-derive it from the geometry anyway, so a
+    # stale declared z cannot spawn the robot inside a tread or a few cm above one.
+    z = terrain_top_at(walkable(overlays), x, y)
+    return x, y, z, (f"the tile's {which} spawn AREA (tile-local x={x:.3f}, y={y:.3f}, "
+                     f"surface z={z:.3f})")
+
+
+def route_spawn(entry: dict, overlays: list[dict]) -> tuple[float, float, float, str]:
+    """The spawn the tile's own ROUTE declares, standing on the surface there.
+
+    :func:`spawn_point` DERIVES a spawn ``approach`` metres before the first tread, which is
+    right for a clip-library tile that declares no route.  The free-form courses do declare
+    one, and Isaac spawns exactly there -- so taking it makes the two simulators agree by
+    construction rather than approximately.  ``spawn_point``'s no-tread fallback is the tile
+    CENTRE, which on a two-box tile is metres from where an Isaac episode opens.
+
+    Args:
+        entry: The tile's manifest entry.
+        overlays: Its emittable overlays.
+
+    Returns:
+        ``(x, y, z, why)`` tile-local, ``z`` the walkable surface at that xy.
+
+    Raises:
+        ValueError: If the tile declares no route.
+    """
+    route = entry.get("route") or {}
+    if "start_x" not in route or "start_y" not in route:
+        raise ValueError(
+            f"tile {entry.get('terrain_id')} declares no route start; use the derived spawn "
+            "(spawn_from='approach') for a clip-library tile.")
+    x, y = float(route["start_x"]), float(route["start_y"])
+    z = terrain_top_at(walkable(overlays), x, y)
+    return x, y, z, f"the tile's own route spawn (tile-local x={x:.3f}, y={y:.3f})"
 
 
 def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[float, float, str]:
@@ -271,8 +470,9 @@ def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[flo
 
 
 def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, sz: float,
-              yaw: float, material: str = "box_material", decor: bool = False) -> str:
-    """One MuJoCo box geom line.
+              yaw: float, material: str = "box_material", decor: bool = False,
+              kind: str = "box") -> str:
+    """One MuJoCo geom line: a box, or a decoration cylinder.
 
     Args:
         name: Geom name.
@@ -283,6 +483,9 @@ def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, 
         decor: Emit it as VISUAL-ONLY -- group 1 rather than 2, and non-colliding. The depth
             cameras cast groups {1, 2} and the height scan casts {2}, so this is what makes a
             wall visible to the cameras, invisible to the scan, and impossible to walk into.
+        kind: ``"cylinder"`` emits a cylinder; anything else emits a box. Only reachable for
+            decoration -- a walkable cylinder is refused upstream, since nothing decomposes
+            one into the sub-boxes the walkable variants are built from.
 
     Returns:
         The geom line.
@@ -290,13 +493,20 @@ def _box_geom(name: str, cx: float, cy: float, cz: float, sx: float, sy: float, 
     quat = f' quat="{math.cos(yaw / 2.0):.9f} 0 0 {math.sin(yaw / 2.0):.9f}"' if yaw else ""
     group = DECOR_GEOM_GROUP if decor else 2
     flags = f" {DECOR_CONTACT_ATTRS}" if decor else ""
+    if kind == "cylinder":
+        # MuJoCo sizes a cylinder as (radius, half-height), not as three half-extents, and
+        # the radius must match what the Isaac side inscribes or the two simulators disagree
+        # on a surface the cameras can see.
+        return (f'        <geom name="{name}" type="cylinder" material="{material}" '
+                f'group="{group}"{flags} size="{min(sx, sy) / 2.0:.6f} {sz / 2.0:.6f}" '
+                f'pos="{cx:.6f} {cy:.6f} {cz:.6f}"{quat}/>')
     return (f'        <geom name="{name}" type="box" material="{material}" group="{group}"'
             f'{flags} size="{sx / 2.0:.6f} {sy / 2.0:.6f} {sz / 2.0:.6f}" '
             f'pos="{cx:.6f} {cy:.6f} {cz:.6f}"{quat}/>')
 
 
 def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, float],
-               infinite_floor: bool) -> tuple[list[str], str]:
+               infinite_floor: bool, no_floor: bool = False) -> tuple[list[str], str]:
     """Emit the tile's geometry, translated so ``origin`` (tile-local) is the world origin.
 
     A ``solid`` overlay is a full-height pillar from its ``base_z``, which is how the
@@ -311,12 +521,16 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
         overlays: Overlays this emitter can represent (see :func:`emittable_overlays`).
         origin: ``(x, y, z)`` tile-local point to place at the world origin.
         infinite_floor: Emit the checkered infinite plane instead of the tile's own floor.
+        no_floor: On a ``has_floor=False`` tile, emit NO ground at all -- what Isaac
+            actually builds. Refused on a tile that has its own floor, where there is no
+            substitute plane to withhold.
 
     Returns:
-        ``(geom_lines, floor_line)``.
+        ``(geom_lines, floor_line)``; ``floor_line`` is ``""`` under ``no_floor``.
     """
     ox, oy, oz = origin
     lines = []
+    kind_of = [str(o.get("kind", "box")) for o in overlays]
     for i, ov in enumerate(overlays):
         decor = is_decor(ov)
         step = float(ov["size_xyz"][0]) <= _STEP_MAX_TREAD_M
@@ -327,13 +541,17 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
         for j, (cx, cy, cz, bx, by, bz) in enumerate(overlay_sub_boxes_from_manifest(ov)):
             lines.append(_box_geom(
                 base if j == 0 else f"{base}_p{j}",
-                cx - ox, cy - oy, cz - oz, bx, by, bz, yaw, decor=decor,
+                cx - ox, cy - oy, cz - oz, bx, by, bz, yaw, decor=decor, kind=kind_of[i],
             ))
 
     if infinite_floor or not bool(entry.get("has_floor", True)):
         # has_floor=False is an isolated structure (a floating staircase): Isaac gives it NO
-        # ground plane, so a robot that steps off falls to infinity. Keep the plane there so
-        # a run ends on the floor rather than in the void.
+        # ground plane, so a robot that steps off falls to infinity. The plane is kept by
+        # DEFAULT so a run ends on the floor rather than in the void -- but that substitute
+        # is the one thing in this scene Isaac does not have, so --no_floor withholds it and
+        # the tile is then faithful to the training world, edge included.
+        if no_floor:
+            return lines, ""
         return lines, ('        <geom name="floor" size="0 0 0.05" type="plane" '
                        f'material="groundplane" group="2" pos="0 0 {-oz:.6f}"/>')
     size_x, size_y = float(entry["size_x"]), float(entry["size_y"])
@@ -341,6 +559,44 @@ def tile_geoms(entry: dict, overlays: list[dict], origin: tuple[float, float, fl
                       -_FLOOR_THICKNESS_M / 2.0 - oz, size_x, size_y, _FLOOR_THICKNESS_M,
                       0.0, material="groundplane")
     return lines, floor
+
+
+def corner_wall_geoms(distance: float, height: float, length: float,
+                      thickness: float = 0.15, solid: bool = False) -> list[str]:
+    """Two walls meeting at 90 deg, ahead of the spawn point.
+
+    A hand-placed obstacle for driving at in sim2sim. The robot spawns at the world origin
+    facing +x, so the pair sits ``distance`` metres downrange: one leg ACROSS the path and
+    one running back along +y from its end, which is the corner an indoor space actually
+    presents and is harder than a single flat face -- two surfaces at different ranges in
+    one frame.
+
+    **Visual only by default**, matching every other decoration in this stack and matching
+    Isaac: ``/World/decor`` carries no collider, so nothing in training has ever pushed back
+    on the robot, and a solid wall here would test a contact response that does not exist.
+    The robot walks through it and what is being watched is the PLAN. ``solid=True`` makes it
+    collide, which is a different experiment and not the trained one.
+
+    Args:
+        distance: Downrange distance from spawn to the across-path leg (m).
+        height: Wall height (m). Barely observable -- the far camera's frame cuts a nearby
+            wall around waist height -- but it changes what a viewer sees.
+        length: Length of each leg (m).
+        thickness: Wall thickness (m).
+        solid: Emit colliding geometry instead of decoration.
+
+    Returns:
+        MuJoCo geom lines, already in the scene's world frame (spawn = origin).
+    """
+    half = length / 2.0
+    return [
+        # Across the path, centred on the spawn line.
+        _box_geom("play_wall_across", distance, 0.0, height / 2.0,
+                  thickness, length, height, 0.0, decor=not solid),
+        # Down one side, meeting it at a right angle and running back toward the robot.
+        _box_geom("play_wall_side", distance - half, half, height / 2.0,
+                  length, thickness, height, 0.0, decor=not solid),
+    ]
 
 
 def main() -> None:
@@ -367,6 +623,23 @@ def main() -> None:
                         "floor. The tile floor stops at the footprint, as in Isaac, so the "
                         "robot can walk off the edge; this trades that fidelity for runs "
                         "that cannot end that way.")
+    p.add_argument("--no_floor", action="store_true", default=False,
+                   help="On a has_floor=False tile, emit NO ground plane -- exactly what "
+                        "Isaac builds. The substitute plane this script normally adds is the "
+                        "one piece of geometry the training world does not have, so it is "
+                        "also the one that makes a step off the edge survivable here and "
+                        "fatal there. Refused on a tile that has its own floor.")
+    p.add_argument("--wall", nargs="?", type=float, const=3.0, default=None, metavar="DIST",
+                   help="Add two walls meeting at 90 deg, DIST metres ahead of spawn "
+                        "(default 3.0 when the flag is given bare). VISUAL ONLY unless "
+                        "--wall_solid: decoration never collides in Isaac either, so a "
+                        "solid one here would test a contact response the robot was never "
+                        "trained to have. What this is for is watching the PLAN.")
+    p.add_argument("--wall_height", type=float, default=2.0, help="Wall height (m).")
+    p.add_argument("--wall_length", type=float, default=4.0, help="Length of each leg (m).")
+    p.add_argument("--wall_solid", action="store_true",
+                   help="Make the walls collide. A different experiment from the trained "
+                        "one -- see --wall.")
     args = p.parse_args()
 
     entry, info = load_tile(args.clip, args.terrain_id)
@@ -377,7 +650,17 @@ def main() -> None:
     else:
         sx, sy, why = spawn_point(entry, overlays, args.approach)
     sz = terrain_top_at(overlays, sx, sy)
-    geoms, floor = tile_geoms(entry, overlays, (sx, sy, sz), args.infinite_floor)
+    if args.no_floor and bool(entry.get("has_floor", True)):
+        raise SystemExit(
+            f"--no_floor on terrain_id {info['terrain_id']}, which HAS its own floor "
+            "(has_floor=True). There is no substitute plane to withhold: the ground here is "
+            "the tile's own slab and removing it would build a tile Isaac never had. "
+            "--no_floor applies to has_floor=False tiles only.")
+    geoms, floor = tile_geoms(entry, overlays, (sx, sy, sz), args.infinite_floor,
+                              no_floor=args.no_floor)
+    if args.wall is not None:
+        geoms = geoms + corner_wall_geoms(args.wall, args.wall_height, args.wall_length,
+                                          solid=args.wall_solid)
 
     scene = args.scene or f"tile{info['terrain_id']}_scene"
     header = (

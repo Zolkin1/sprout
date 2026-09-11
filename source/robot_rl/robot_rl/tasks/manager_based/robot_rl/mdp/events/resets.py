@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 
 import torch
+import warp as wp
 from typing import TYPE_CHECKING
 
 from isaaclab.managers import SceneEntityCfg
@@ -305,6 +306,28 @@ def sample_start_step(
     if cap_at_terrain_end and getattr(cmd.cfg, "random_start_before_terrain_end", False):
         terrain_end = cmd.manager.gather_terrain_end_step(clip_id).to(device)
         hi = torch.minimum(hi, terrain_end + 1).clamp(min=1)
+    if getattr(cmd.cfg, "random_start_before_terrain_start", False):
+        # Open on flat. terrain_start is -1 on a flat clip (no terrain at all), which must not
+        # cap anything -- hence the where() rather than a plain minimum.
+        t_start = cmd.manager.gather_terrain_start_step(clip_id).to(device)
+        hi = torch.where(t_start >= 0, torch.minimum(hi, t_start), hi)
+    # A command that seeds its generator history from the clip needs that history to exist,
+    # so it reserves the first few steps. The clip-step gather clamps only at the TOP
+    # (`_future_step_indices`), so a start inside the reserve would index backwards and read
+    # the clip's END as history -- silently. The pad is what makes the seed safe.
+    lo = int(getattr(cmd, "min_start_step", 0))
+    if lo:
+        # The reserve is what lets a clip-seeded history exist: the clip-step gather clamps
+        # only at the TOP, so a start inside it would index backwards and read the clip's END
+        # as its history, silently.
+        #
+        # When the caps leave no room above the reserve -- a clip whose terrain starts at step
+        # 0, which is exactly the case seeding exists for -- start AT the reserve rather than
+        # falling back to 0. Those episodes open on terrain by necessity; opening them without
+        # a history as well would combine the two things this is trying to avoid.
+        hi = torch.maximum(hi, torch.full_like(hi, lo + 1))
+        lo_t = torch.full_like(hi, lo)
+        return (lo_t + (torch.rand(k, device=device) * (hi - lo_t).float()).long()).long()
     return (torch.rand(k, device=device) * hi.float()).long()
 
 
@@ -664,3 +687,450 @@ def reset_on_terrain_motion_sequence(
     frame_yaw = importer.env_terrain_yaw[env_ids].to(device)
     _commit_clip_reset(cmd, asset, env_ids, clip_id, start_step, world_pos, world_quat, ego_mask,
                        mask_frame_yaw=frame_yaw, spawn_z_offset=spawn_z_offset)
+
+
+# ----------------------------------------------------------------------
+# The CLIP-FREE runtime: free-form sections.
+#
+# The free-form terrain set ships as a MANIFEST-ONLY library (zero clip datasets), because
+# under the FM fine-tune the reference is GENERATED and nothing places a clip on a tile.
+# Every reset above is keyed on one, and fails loudly rather than quietly on such a library:
+# ``sample_terrain_clips`` raises the moment a tile's terrain id has no clips -- correct for a
+# clip library, fatal for this one. What follows reads the spawn off the manifest instead.
+#
+# ASSUMED MANIFEST INTERFACE (the free-form terrain generator owns the producing half): each
+# section's manifest entry carries a ``route`` block, which the loader copies onto
+# ``ClipTerrainLayout.terrain_route`` and the importer re-exposes as
+# ``ClipTerrainImporter.terrain_route: dict[int, dict[str, float]]``, keyed by ``terrain_id`` --
+# the same per-terrain-id dict idiom as ``terrain_frame_yaw`` / ``terrain_type_code`` /
+# ``clip_size_y``.
+# ----------------------------------------------------------------------
+
+#: The route fields every free-form section's manifest entry must declare, in the TILE-LOCAL
+#: CORNER frame -- the frame :func:`...clip_terrain_loader.clip_frame_origin` places geometry
+#: in, so a route and the mesh it describes share one datum and cannot drift. Lengths in m,
+#: angles in rad, ``x`` downrange and ``y`` lateral within the tile's own ``frame_yaw``.
+#:
+#: * ``start_x`` / ``start_y`` -- where the robot spawns.
+#: * ``start_z`` -- the WALKABLE SURFACE the robot stands on there, not a base height: the
+#:   top of the start platform. 0.0 for flat, and for the stairs family by the geometry rule
+#:   that offsets the whole structure so its LOWEST platform top sits at z = 0 (a descending
+#:   section otherwise goes below the world floor and the absolute-z fall termination fires on
+#:   a perfectly good descent).
+#: * ``start_yaw`` -- spawn heading relative to the tile frame; 0.0 = straight down the section.
+#: * ``goal_x`` -- the downrange goal line: past it, the section has been walked.
+#: * ``goal_y`` / ``goal_half_width`` -- the goal band's lateral centre and half-extent.
+FREEFORM_ROUTE_FIELDS: tuple[str, ...] = (
+    "start_x", "start_y", "start_z", "start_yaw", "goal_x", "goal_y", "goal_half_width",
+)
+
+
+def _freeform_route_table(importer) -> tuple[torch.Tensor, int]:
+    """Build (once) and cache the terrain-id -> route lookup, validating it on the way.
+
+    A row per terrain id in ``[lo, hi]``, so a per-env lookup is one gather rather than a
+    python loop over unique tile ids -- which matters because the GOAL TERMINATION reads this
+    every step for every env, not once per reset.
+
+    Everything that can be checked is checked HERE rather than per step, for the same reason:
+    the table is built once, so a bounds check costs one host sync at startup instead of one
+    every control step.
+
+    Args:
+        importer: The :class:`ClipTerrainImporter` (needs ``terrain_route`` and
+            ``env_terrain_id``).
+
+    Returns:
+        ``(table, lo)`` -- ``[hi - lo + 1, len(FREEFORM_ROUTE_FIELDS)]`` float table on the
+        importer's device, and the terrain id its row 0 stands for.
+
+    Raises:
+        TypeError: If the terrain carries no ``terrain_route`` at all (a clip library, or a
+            free-form library built before the route block existed).
+        ValueError: If a route is missing a field, if a tile in the scene has no route, or if
+            a route's goal is not downrange of its own start.
+    """
+    cached = getattr(importer, "_freeform_route_cache", None)
+    if cached is not None:
+        return cached
+
+    routes = getattr(importer, "terrain_route", None)
+    if not routes:
+        raise TypeError(
+            "the free-form runtime needs ClipTerrainImporter.terrain_route (per-terrain-id "
+            f"route dicts carrying {list(FREEFORM_ROUTE_FIELDS)}), and this terrain has none. "
+            "It is a clip library, or a free-form library whose manifest entries carry no "
+            "'route' block -- regenerate it."
+        )
+    device = importer.env_terrain_id.device
+    ids = sorted(int(t) for t in routes)
+    lo, hi = ids[0], ids[-1]
+    table = torch.full((hi - lo + 1, len(FREEFORM_ROUTE_FIELDS)), float("nan"), device=device)
+    for tid, route in routes.items():
+        missing = [f for f in FREEFORM_ROUTE_FIELDS if f not in route]
+        if missing:
+            raise ValueError(
+                f"terrain {int(tid)}'s route is missing {missing}; every free-form section "
+                f"must declare all of {list(FREEFORM_ROUTE_FIELDS)}."
+            )
+        table[int(tid) - lo] = torch.tensor(
+            [float(route[f]) for f in FREEFORM_ROUTE_FIELDS], device=device
+        )
+
+    # Every tile the scene actually placed must have a route: a tile without one would spawn
+    # the robot at NaN, which PhysX turns into a far-away crash rather than an error here.
+    scene_ids = {int(t) for t in importer.env_terrain_id.unique().tolist()}
+    orphans = sorted(t for t in scene_ids if not (lo <= t <= hi) or t not in routes)
+    if orphans:
+        raise ValueError(
+            f"terrain id(s) {orphans} have an env tile but NO route in the manifest -- envs on "
+            "those tiles have nowhere to spawn and no goal. Regenerate the free-form terrain."
+        )
+    # A goal at or behind the start truncates every episode on its first step, which reads as
+    # a policy that never walks rather than as a broken manifest.
+    start_x = table[:, FREEFORM_ROUTE_FIELDS.index("start_x")]
+    goal_x = table[:, FREEFORM_ROUTE_FIELDS.index("goal_x")]
+    half_w = table[:, FREEFORM_ROUTE_FIELDS.index("goal_half_width")]
+    bad = [int(r) + lo for r in torch.nonzero(goal_x <= start_x).flatten().tolist()]
+    if bad:
+        raise ValueError(
+            f"terrain id(s) {bad} declare a goal_x at or BEHIND their own start_x; the goal "
+            "line is downrange (+x in the tile frame), so every episode there would truncate "
+            "on its first step."
+        )
+    bad_w = [int(r) + lo for r in torch.nonzero(half_w <= 0.0).flatten().tolist()]
+    if bad_w:
+        raise ValueError(f"terrain id(s) {bad_w} declare a non-positive goal_half_width.")
+
+    importer._freeform_route_cache = (table, lo)
+    return table, lo
+
+
+def freeform_route(importer, env_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Each env's section route, plus the tile frame it is expressed in.
+
+    One gather off the cached table (see :func:`_freeform_route_table`), so it is cheap
+    enough for the per-step goal test as well as the reset.
+
+    Args:
+        importer: The :class:`ClipTerrainImporter`.
+        env_ids: Env indices to look up.
+
+    Returns:
+        Every name in :data:`FREEFORM_ROUTE_FIELDS` as a ``[k]`` tensor, plus ``corner``
+        (``[k, 3]`` world position of the tile's local (0, 0, 0)) and ``frame_yaw`` (``[k]``
+        heading of the tile's own frame), all on the importer's device.
+    """
+    table, lo = _freeform_route_table(importer)
+    rows = table[importer.env_terrain_id[env_ids].to(torch.long) - lo]        # [k, F]
+    out = {name: rows[:, i] for i, name in enumerate(FREEFORM_ROUTE_FIELDS)}
+    out["corner"] = importer.env_cell_corner[env_ids]
+    out["frame_yaw"] = importer.env_terrain_yaw[env_ids].to(rows.dtype)
+    return out
+
+
+def tile_local_xy(
+    corner: torch.Tensor, frame_yaw: torch.Tensor, pos_w: torch.Tensor,
+) -> torch.Tensor:
+    """World xy -> the tile's own ``(downrange, lateral)`` coordinates.
+
+    The inverse of the placement in :func:`reset_on_freeform_section`, and the same rotation
+    ``base_pose_error_termination`` applies to split an error into downrange / lateral: the
+    terrain frame is a yaw about world z, so this is a translation to the tile corner and a
+    rotation by ``-frame_yaw``.
+
+    Args:
+        corner: ``[k, 3]`` world position of each tile's local (0, 0, 0).
+        frame_yaw: ``[k]`` heading (rad) of each tile's own frame.
+        pos_w: ``[k, 3]`` world positions (only xy is read).
+
+    Returns:
+        ``[k, 2]`` tile-local ``(x, y)``.
+    """
+    d = pos_w[:, :2] - corner[:, :2]
+    cos_y, sin_y = torch.cos(frame_yaw), torch.sin(frame_yaw)
+    return torch.stack([cos_y * d[:, 0] + sin_y * d[:, 1],
+                        -sin_y * d[:, 0] + cos_y * d[:, 1]], dim=-1)
+
+
+#: Columns of the cached spawn-area table, matching ``motion_gen.terrain.freeform``'s
+#: ``SPAWN_AREA_FIELDS``.  Declared on both sides on purpose, the same way
+#: :data:`FREEFORM_ROUTE_FIELDS` mirrors that module's ``ROUTE_FIELDS``: the authoring package
+#: is IsaacLab-free and cannot be imported here.
+FREEFORM_SPAWN_FIELDS: tuple[str, ...] = ("x", "y", "z", "half_x", "half_y", "yaw", "weight")
+
+#: How close in ``z`` (m) two spawn areas must be to count as the SAME level.  ``ground``
+#: keeps every area within this of the tile's LOWEST declared one, so it is a tie tolerance
+#: rather than a distance from zero -- a float equality on an authored value.
+#:
+#: It used to be a distance from ``z = 0`` ("is this area on the floor"), which is the same
+#: test on every family that starts on the floor and WRONG on the ones that cannot: the
+#: in-distribution routes come from real clip tiles, and the descending families
+#: (``stairs_down``, ``jump_off_front``) spawn on the platform by necessity. There is no
+#: ground start for a descent, so the absolute test left those tiles with no area at all.
+#:
+#: The separation it has to resolve is large in every case: a tile's raised areas sit at a
+#: box height or a flight's top, the smallest being a 0.40 m box top -- five orders above this.
+SPAWN_Z_TIE_TOL_M: float = 1e-6
+
+#: The spawn-area subsets a reset can draw from.
+#:
+#: **``ground`` is what every EVAL uses, on every terrain, and the asymmetry is the point.**
+#: Training declares raised areas -- a box top, the platform between two flights -- because a
+#: complete traverse is rare enough that the behaviour policy never produced one, and AWR can
+#: only reweight what it is shown.  Scoring from those same areas would report a fraction of
+#: the course as a traverse: a robot that starts on the second box has already been given the
+#: jump the course exists to measure.  So the eval starts where the task starts.
+#:
+#: It costs nothing in comparability, by construction rather than by luck: declared areas
+#: REPLACE ``pos_jitter_m``, so every family authors its ground area at exactly
+#: ``freeform.FREEFORM_SPAWN_JITTER_M`` (there is a constant, and a comment recording the 4x
+#: lateral spread from getting it wrong) -- which is also what the reset synthesises for a
+#: tile declaring no areas at all.  A ground-only draw on a library WITH areas therefore has
+#: the same spawn distribution as the frozen eval grids recorded before areas existed.
+SPAWN_FROM: tuple[str, ...] = ("all", "ground")
+
+
+def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float],
+                          spawn_from: str = "all"
+                          ) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Build (once) the terrain-id -> spawn-area lookup.
+
+    Two levels, because areas are per tile and variable in number where the route block is a
+    fixed set of scalars: a flat ``[A, 7]`` table of every area in the scene, plus a
+    ``[n_tiles, 2]`` ``(offset, count)`` index, so a per-env draw is two gathers rather than a
+    python loop over tiles.
+
+    **A tile that declares no areas gets one synthesised from its single start**, with the
+    jitter half-widths as its extents.  That makes the fallback the same code path as a
+    declared area rather than a branch, and it is exactly the old behaviour: uniform in
+    ``+/- pos_jitter_m`` about ``start_x/start_y`` at ``start_z``.  Every library authored
+    before spawn areas existed therefore behaves identically, which is what allows this to
+    land without regenerating any clip.
+
+    Args:
+        importer: The ``ClipTerrainImporter``, carrying ``terrain_route``.
+        pos_jitter_m: Half-widths for the synthesised single-start area.
+        spawn_from: Which declared areas to keep; one of :data:`SPAWN_FROM`.  ``ground``
+            keeps only the tile's LOWEST declared areas -- those within
+            :data:`SPAWN_Z_TIE_TOL_M` of the minimum ``z`` -- which is how every eval runs.
+
+    Returns:
+        ``(areas, index, lo)`` -- ``[A, 7]`` float, ``[hi - lo + 1, 2]`` long, and the terrain
+        id row 0 of the index stands for.
+
+    Raises:
+        ValueError: If a declared area is missing a field, or ``spawn_from`` is unknown.
+            The filter itself cannot empty a tile: it keeps the minimum-``z`` areas, and a
+            minimum over a non-empty list is non-empty.
+    """
+    if spawn_from not in SPAWN_FROM:
+        raise ValueError(f"spawn_from must be one of {list(SPAWN_FROM)}; got {spawn_from!r}")
+    # THE FILTER IS PART OF THE KEY. The table is built once and cached on the importer, so a
+    # process that switched arms mid-run would otherwise be served the table it built first --
+    # silently, and at exactly the same shape.
+    key = (tuple(float(v) for v in pos_jitter_m), str(spawn_from))
+    cached = getattr(importer, "_freeform_spawn_cache", None)
+    if cached is not None and cached[0] == key:
+        return cached[1], cached[2], cached[3]
+
+    routes = getattr(importer, "terrain_route", None) or {}
+    device = importer.env_terrain_id.device
+    ids = sorted(int(t) for t in routes)
+    lo, hi = ids[0], ids[-1]
+    rows: list[list[float]] = []
+    index = torch.zeros((hi - lo + 1, 2), dtype=torch.long, device=device)
+    for tid in ids:
+        route = routes[tid]
+        areas = route.get("spawn_areas") or []
+        if areas and spawn_from == "ground":
+            # The tile's LOWEST declared areas, not the ones at absolute ground. On every
+            # family that starts on the floor -- box2, up-into-down, varied -- the minimum IS
+            # zero and this is bit-identical to the old absolute test, so no measured number
+            # moves. On a family that cannot start on the floor it is the difference between
+            # working and refusing: the in-distribution routes are real clip tiles, and the
+            # descending ones (`stairs_down`, `jump_off_front`) spawn on the platform because
+            # a descent has no ground start. The absolute test left them with zero areas and
+            # raised, which killed all three in-distribution evals on 2026-09-10.
+            #
+            # One rule either way, and it is the rule the eval actually wants: start where the
+            # course starts, never part-way along it. A minimum over a non-empty list keeps at
+            # least one area, so this cannot fall through to the synthesised start below.
+            z_lo = min(float(a["z"]) for a in areas)
+            areas = [a for a in areas if float(a["z"]) <= z_lo + SPAWN_Z_TIE_TOL_M]
+        if not areas:
+            areas = [{"x": route["start_x"], "y": route["start_y"], "z": route["start_z"],
+                      "half_x": float(pos_jitter_m[0]), "half_y": float(pos_jitter_m[1]),
+                      "yaw": route["start_yaw"], "weight": 1.0}]
+        index[tid - lo, 0] = len(rows)
+        index[tid - lo, 1] = len(areas)
+        for a in areas:
+            missing = [f for f in FREEFORM_SPAWN_FIELDS if f not in a]
+            if missing:
+                raise ValueError(
+                    f"terrain {tid}'s spawn area is missing {missing}; every area must "
+                    f"declare all of {list(FREEFORM_SPAWN_FIELDS)}.")
+            rows.append([float(a[f]) for f in FREEFORM_SPAWN_FIELDS])
+    table = torch.tensor(rows, dtype=torch.float32, device=device)
+    importer._freeform_spawn_cache = (key, table, index, lo)
+    return table, index, lo
+
+
+def _draw_spawn_areas(importer, env_ids: torch.Tensor,
+                      pos_jitter_m: tuple[float, float],
+                      spawn_from: str = "all") -> torch.Tensor:
+    """Pick one spawn area per env, weighted, and return its row.
+
+    Args:
+        importer: The ``ClipTerrainImporter``.
+        env_ids: Envs being reset.
+        pos_jitter_m: Half-widths for a synthesised single-start area.
+        spawn_from: Which declared areas are eligible; one of :data:`SPAWN_FROM`.
+
+    Returns:
+        ``[k, 7]`` the drawn areas' :data:`FREEFORM_SPAWN_FIELDS`.
+    """
+    k = env_ids.shape[0]
+    table, index, lo = _freeform_spawn_table(importer, pos_jitter_m, spawn_from)
+    tid = importer.env_terrain_id.reshape(-1)[env_ids].long()
+    off = index[tid - lo, 0]
+    cnt = index[tid - lo, 1]
+    # `index` is DENSE over [lo, hi], so a tile id inside that range carrying no route leaves
+    # `cnt = 0` -- and the draw below would then hand that env row `off + max_n - 1`, i.e.
+    # ANOTHER TILE'S spawn area, silently and plausibly. Today this is unreachable because
+    # `freeform_route` raises on an orphan before this is called, but that is an ordering
+    # dependency between two functions rather than a property of either, and a caller that
+    # reordered them would get wrong spawns with no error.
+    if k_bad := int((cnt <= 0).sum().item()):
+        orphan = sorted({int(t) for t in tid[cnt <= 0].tolist()})
+        raise ValueError(
+            f"{k_bad} env(s) sit on terrain {orphan}, which declares no spawn area and no "
+            "route to synthesise one from. Their draw would silently return a neighbouring "
+            "tile's area.")
+    # A weighted draw without a python loop: build the per-env cumulative weight over its own
+    # slice by masking the flat table. `cnt` is small (3 on the two-box course), so the mask
+    # is cheap and stays on device.
+    max_n = int(cnt.max().item()) if k else 1
+    ar = torch.arange(max_n, device=table.device)[None, :].expand(k, -1)
+    valid = ar < cnt[:, None]
+    idx = (off[:, None] + ar).clamp_(0, max(table.shape[0] - 1, 0))
+    w = table[idx, 6] * valid.to(table.dtype)
+    cdf = w.cumsum(dim=1)
+    u = torch.rand(k, 1, device=table.device) * cdf[:, -1:].clamp_min(1e-12)
+    pick = (cdf < u).sum(dim=1).clamp_(max=max_n - 1)
+    return table[off + pick]
+
+
+def reset_on_freeform_section(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    spawn_z_offset: float = 0.005,
+    pos_jitter_m: tuple[float, float] = (0.25, 0.25),
+    yaw_jitter_rad: float = 0.2,
+    spawn_from: str = "all",
+) -> None:
+    """Spawn the robot standing at its section's start pose -- no clip anywhere in it.
+
+    The clip resets above pose the robot FROM the reference they are about to track. There is
+    no reference here at reset: the generator has not run yet, and the library carries no clip
+    to borrow a pose from. So the robot is placed standing, in the articulation's own default
+    joint configuration and at its default base height, on the walkable surface the manifest
+    declares at the section's start (``start_z``, the top of the start platform).
+
+    **The command is deliberately untouched.** A clip reset also commits the command's per-env
+    clip state so the first ``compute`` reproduces the spawn with zero error; there is no such
+    state to commit without a clip, and the FM's plan anchor is latched by its own re-plan on
+    the first step. Anything the clip-free command needs at reset belongs in that command's
+    ``reset``, not here.
+
+    Args:
+        env: The environment (``env.scene.terrain`` must be a ``ClipTerrainImporter`` carrying
+            ``terrain_route``).
+        env_ids: Env indices to reset.
+        asset_cfg: Robot asset config.
+        spawn_z_offset: Metres to raise the spawn above the declared surface (default 0.005).
+            NOT a diagnostic here, unlike the clip resets' identically-named argument: with the
+            soles exactly on the surface PhysX ejects the robot and every episode opens with a
+            kick. 0.785 (the G1's ``init_state`` base height) + this 0.005 is the 0.79 m
+            ``mjeval.terrains.SPAWN_BASE_Z`` records as the measured spawn height.
+        pos_jitter_m: Half-widths (downrange, lateral) of the uniform spawn-position jitter, in
+            the TILE frame.  **Used only for a tile that declares no ``spawn_areas``**, where
+            it becomes the extents of the single implicit area; a declared area carries its
+            own, because on a box top the extents are what keep the soles on the surface. Without it every episode on a tile starts from one pose, so the
+            generator's first plan is conditioned on one image per tile and the whole set is
+            degenerate in exactly the variable the fine-tune is trying to broaden. The box must
+            fit inside the start platform, which the 1.219 m platform minimum affords at the
+            default.
+        yaw_jitter_rad: Half-width of the uniform spawn-heading jitter (0.2 rad = 11.5 deg).
+            Small on purpose: the section is walked downrange, and a large heading error at
+            spawn asks the yaw controller to recover before the robot has taken a step.
+        spawn_from: Which of the tile's declared areas may be drawn -- one of
+            :data:`SPAWN_FROM`.  ``all`` is training; **every eval runs ``ground``**, on every
+            terrain, so a reported rate is always the complete course.  See :data:`SPAWN_FROM`.
+
+    Raises:
+        TypeError: If the scene terrain is not a route-carrying ``ClipTerrainImporter``.
+        ValueError: If ``spawn_from`` is unknown, or leaves a tile with no eligible area.
+    """
+    if env_ids.numel() == 0:
+        return
+    asset: Articulation = env.scene[asset_cfg.name]
+    importer = env.scene.terrain
+    if not hasattr(importer, "env_terrain_id"):
+        raise TypeError(
+            "reset_on_freeform_section requires the scene terrain to be a ClipTerrainImporter "
+            "(exposing env_terrain_id / env_cell_corner / terrain_route)."
+        )
+    k = env_ids.shape[0]
+    device = env.device
+    route = freeform_route(importer, env_ids)
+
+    # One spawn AREA per env, drawn from what the tile declares -- a rectangle the robot may
+    # start anywhere inside, which on the two-box course includes each box's TOP. A tile that
+    # declares none gets one synthesised from its single start with `pos_jitter_m` as the
+    # extents, so an existing library is unchanged and none needs regenerating.
+    #
+    # **A tile that DOES declare areas ignores `pos_jitter_m` entirely**, since the area's own
+    # half-extents replace it. That is deliberate -- on a box top they are what keeps both
+    # soles on the surface -- but it means an authored GROUND area must be sized at
+    # `freeform.FREEFORM_SPAWN_JITTER_M` or its spawns stop matching the unauthored path.
+    area = _draw_spawn_areas(importer, env_ids, pos_jitter_m, spawn_from)      # [k, 7]
+    # Uniform WITHIN the area, in the TILE frame, so "downrange" means the same thing on every
+    # tile. The area's own half-extents replace `pos_jitter_m`: for a box top they are what
+    # keeps both soles on the surface, and adding the jitter on top would walk the robot off
+    # the edge the buffer exists to hold it back from.
+    jitter = (torch.rand(k, 3, device=device) * 2.0 - 1.0)
+    local_x = area[:, 0] + jitter[:, 0] * area[:, 3]
+    local_y = area[:, 1] + jitter[:, 1] * area[:, 4]
+    yaw_f = route["frame_yaw"].to(device)
+    yaw = yaw_f + area[:, 5] + jitter[:, 2] * float(yaw_jitter_rad)
+
+    # Tile-local -> world: a yaw about z and a translation onto the tile's corner. The corner's
+    # own z is the tile ground, so the surface the robot stands on is corner.z + the AREA's
+    # own z (0 on the ground, the box height on a box top), and the base sits a nominal
+    # standing height above THAT.
+    cos_f, sin_f = torch.cos(yaw_f), torch.sin(yaw_f)
+    nominal = wp.to_torch(asset.data.default_root_pose)[env_ids]           # [k, 7], pos + xyzw
+    pos = route["corner"].to(device).clone()
+    pos[:, 0] += cos_f * local_x - sin_f * local_y
+    pos[:, 1] += sin_f * local_x + cos_f * local_y
+    # The AREA's surface height, not the section start's: a box-top spawn stands 0.40 m up.
+    pos[:, 2] += area[:, 2] + nominal[:, 2] + float(spawn_z_offset)
+
+    zeros = torch.zeros_like(yaw)
+    root_pose = torch.cat([pos, quat_from_euler_xyz(zeros, zeros, yaw)], dim=-1)   # xyzw
+    asset.write_root_pose_to_sim_index(root_pose=root_pose, env_ids=env_ids)
+    asset.write_root_link_velocity_to_sim_index(
+        root_velocity=torch.zeros(k, 6, device=device), env_ids=env_ids,
+    )
+    # The DEFAULT joint state, which is also the PD target's rest point -- so the robot opens
+    # the episode holding the pose it is being asked for, rather than with a step input.
+    # ``add_joint_default_pos`` (a startup DR term) writes that same buffer, so a randomised
+    # default is spawned as well as commanded, which is what makes the two consistent.
+    asset.write_joint_position_to_sim_index(
+        position=wp.to_torch(asset.data.default_joint_pos)[env_ids], env_ids=env_ids,
+    )
+    asset.write_joint_velocity_to_sim_index(
+        velocity=wp.to_torch(asset.data.default_joint_vel)[env_ids], env_ids=env_ids,
+    )

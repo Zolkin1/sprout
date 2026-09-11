@@ -196,6 +196,17 @@ class G1TeacherCommandsCfg:
     """Single open-loop clip-tracking command; no velocity conditioner."""
 
     traj_ref = MotionSequenceCommandCfg(
+        # ODOMETRY-FREE BY DEFAULT. Under "plan" the window's base_pose is measured from
+        # the root at the last re-plan, so the generator's output IS the observation and the
+        # deploy runtime serves it without ever reading the robot's world position. Under
+        # "robot_now" it must convert every control step, which on hardware is real odometry
+        # -- and the C++ runtime refuses that arm by design rather than by omission.
+        #
+        # Set HERE, on the task, not on window.DEFAULT_WINDOW_ANCHOR: runs predating the
+        # field carry no window_anchor in their saved config and resolve to that constant,
+        # so moving it would change what their recorded convention string means and
+        # provenance.check_run_conventions would start refusing them.
+        window_anchor="plan",
         contact_bodies=[".*_ankle_roll_link"],
         # No default library: the terrain mesh AND the tracked clips both come from one
         # ``.h5``, and a stale default silently trains on the wrong terrain. ``--clip``

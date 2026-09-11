@@ -26,6 +26,7 @@ import torch
 
 from .config import FlowMatchingConfig
 from .flow import sample_trajectory
+from .advantage import label_from_name
 from .model import FlowMatchingTransformer
 from .normalizer import Normalizer
 from .transforms import sanitize_extero
@@ -82,6 +83,58 @@ class BatchedHistory:
         for _ in range(self.maxlen):
             self._steps.append({k: v.clone() for k, v in step.items()})
         self._steps_since_reset[:] = self.maxlen
+
+    def seed(self, env_ids: torch.Tensor, rows: dict[str, torch.Tensor]) -> None:
+        """Install a REAL history for ``env_ids`` and mark their windows valid immediately.
+
+        This is not :meth:`fill`.  ``fill`` fabricates a history by repeating one snapshot,
+        which is what the deleted warm-up paths did and why they were deleted: it puts the
+        generator in a state no training sample contains while telling it, via the cleared
+        mask, to believe it.  ``seed`` installs rows that actually happened -- the CLIP's own
+        preceding steps, under ``history_from="clip"`` -- so the mask is cleared over ground
+        truth rather than over an invention.
+
+        The point is the OPENING PLAN.  A null-history first inference is phase-agnostic by
+        construction, and an env that spawns mid-clip has a definite gait phase that the
+        reward follows, so the two disagree for the whole first re-plan period.  Seeding
+        removes that disagreement in the teacher-forced arm; the closed loop keeps the null
+        embedding, because on a robot there is no clip to seed from.
+
+        Args:
+            env_ids: Long indices of the envs to seed.
+            rows: Per tracked key, ``(len(env_ids), maxlen, ·)`` -- OLDEST FIRST, matching
+                the deque order that :meth:`stack` reads.
+
+        Raises:
+            ValueError: If a row block is not ``maxlen`` long, or names a key the deque does
+                not already track (which would make :meth:`stack` ragged).
+        """
+        if env_ids.numel() == 0:
+            return
+        for key, block in rows.items():
+            if block.shape[1] != self.maxlen:
+                raise ValueError(
+                    f"seed({key!r}) got {block.shape[1]} rows, expected maxlen={self.maxlen}."
+                )
+        # The deque underfills only at the very start of a run. Pad it to maxlen with zeros
+        # so the seeded envs have slots to be written into; every other env stays masked by
+        # its own counter, so the zeros they receive here are never read.
+        # (num_envs, ...) per slot -- NOT zeros_like(block[0]), which is (maxlen, ...) and
+        # blows up as an out-of-bounds index the moment an env id exceeds maxlen.
+        num_envs = self._steps_since_reset.shape[0]
+        while len(self._steps) < self.maxlen:
+            self._steps.appendleft(
+                {k: v.new_zeros((num_envs, *v.shape[2:])) for k, v in rows.items()}
+            )
+        for key, block in rows.items():
+            if key not in self._steps[0]:
+                raise ValueError(
+                    f"seed({key!r}) names a key the history does not track "
+                    f"({sorted(self._steps[0])}); stack() would be ragged."
+                )
+            for i in range(self.maxlen):
+                self._steps[i][key][env_ids] = block[:, i]
+        self._steps_since_reset[env_ids] = self.maxlen
 
     def stack(self, key: str) -> torch.Tensor:
         """Stack a tracked quantity over the window into ``(N, maxlen, ·)``."""
@@ -180,6 +233,16 @@ class FmOnlineContext:
     checkpoint rather than on whatever the task config happens to say.  Defaults to the
     height scan, which is also what a checkpoint predating the selector resolves to.
     """
+    history_source: str = "reference"
+    """What the ``N`` history rows this model was FITTED on contained.
+
+    ``"reference"`` (the applied reference, and every checkpoint before the flag) or
+    ``"measured"`` (the robot's own achieved state, bar the two blocks no robot can supply).
+    The row width is identical either way, so a consumer feeding the wrong kind is
+    off-distribution with nothing to reveal it -- hence carried on the context, printed at
+    load, and checked against the serving arm by ``FmTrackingCommand`` and
+    ``GenTrackerPolicy`` alike.
+    """
     fm_snap_every: int | None = None
     """Control steps between snap (re-plan) events in the recording this model trained on.
 
@@ -246,6 +309,15 @@ class FmOnlineContext:
     Index is the lag in control steps (20 ms each). Carried so a SIMULATOR can reproduce the
     latency the generator expects instead of feeding it a fresh frame it never saw in
     training. Hardware must ignore it -- the lag there is physical and already in the frames.
+    """
+    advantage_label: int | None = None
+    """Which advantage label this context SERVES, as an index into ``advantage.LABEL_NAMES``.
+
+    ``None`` for an unconditioned generator.  For a conditioned one it is never ``None``:
+    :func:`load_fm_context` refuses a checkpoint that does not state an arm, because ``null``
+    and ``positive`` are both valid and a default would make the deliverable and its own
+    control indistinguishable at the call site.  :func:`sample_window` is the single place it
+    is applied, so simulation cannot serve a different arm from the one the artifact names.
     """
     extero_image_hw: list[tuple[int, int]] | None = None
     """Per-sensor ``(height, width)`` the exteroception row folds into, or ``None``.
@@ -477,6 +549,7 @@ def load_fm_context(
     zero_noise: bool = False,
     guidance_scale: float = 1.0,
     use_ema: bool = True,
+    advantage_label: str | None = None,
 ) -> FmOnlineContext:
     """Load a flow-matching checkpoint into an inference-ready context.
 
@@ -491,6 +564,11 @@ def load_fm_context(
         map_location: ``torch.load`` map location when ``checkpoint`` is a path.
         zero_noise: Sample deterministically from ``x0 = 0`` (see :class:`FmOnlineContext`).
         guidance_scale: Classifier-free guidance weight over the history (1.0 = off).
+        advantage_label: Override which arm of an advantage-conditioned checkpoint to serve
+            (``"positive"`` / ``"negative"`` / ``"null"``).  Normally left ``None`` so the
+            ARTIFACT decides, via its own ``advantage_serve_label``; the override exists for
+            the exporter and for a diagnostic that sweeps arms from one file.  Supplying it
+            for an unconditioned checkpoint is refused, since it would be silently dropped.
         use_ema: Load the averaged ``model_ema`` weights when the checkpoint has them
             (the default, since they are what training selected ``best.pt`` on and what
             would be deployed). Set False to inspect the raw weights instead. Checkpoints
@@ -532,12 +610,15 @@ def load_fm_context(
     encoder = cfg.resolve_extero_encoder()
     cfg.check_extero_encoder()
     cfg.check_attention_mode()
+    cfg.check_history_source()
     _check_extero_image_hw(cfg, meta, encoder)
     # Said out loud because nothing else can reveal it: the two attention modes share one
     # parameter set, so a checkpoint carries no structural evidence of which it was trained
     # under. If this line disagrees with what you expect, the config is what to look at.
+    # ``history_source`` is on this line for the identical reason -- same row width under
+    # either value, so the config is the only witness.
     print(f"[INFO load_fm_context] attention_mode={cfg.attention_mode} "
-          f"(extero_encoder={encoder})")
+          f"history_source={cfg.history_source} (extero_encoder={encoder})")
     # ONE construction site, shared with the trainer. ``encoder`` is the resolved name and is
     # already written back onto cfg by the dataset; assert rather than pass it separately, so
     # there is no second path by which the two could describe different models. This is also
@@ -595,6 +676,30 @@ def load_fm_context(
             "  Under extero_norm_mode='contract' the run's own extero_xyz_envelope decides it: "
             "5.0 comes only from 5.575, 3.5 only from 2.0."
         )
+    # WHICH ARM this context serves. A conditioned checkpoint must SAY: `null` and `positive`
+    # are both valid labels, so a default would quietly turn the deliverable into a control
+    # (or the reverse) with nothing in the run to show it. Same rule the ONNX exporter applies,
+    # and the same reason -- the two graphs are otherwise identical on disk.
+    serve_label = None
+    if getattr(cfg, "advantage_cond", False):
+        name = advantage_label or getattr(cfg, "advantage_serve_label", None)
+        if name is None:
+            raise ValueError(
+                "this checkpoint is advantage-conditioned but does not say WHICH arm to "
+                "serve, and there is no safe default -- `null` and `positive` are both real "
+                "labels, so guessing would silently swap the deliverable for a control.\n"
+                "  Stamp it into the artifact (what the fine-tune writes as "
+                "best_<label>.pt):\n"
+                "    ck = torch.load(<ckpt>, map_location='cpu', weights_only=False)\n"
+                "    ck['config']['advantage_serve_label'] = 'positive'\n"
+                "    torch.save(ck, <ckpt-positive>)\n"
+                "  or pass advantage_label= explicitly, which is what export_fm_onnx does.")
+        serve_label = label_from_name(name)
+    elif advantage_label is not None:
+        raise ValueError(
+            f"advantage_label={advantage_label!r} was given but this checkpoint has no label "
+            "embedding (advantage_cond=False), so it would be silently dropped.")
+
     cmd_steps = list(range(0, cfg.future_len, cfg.cmd_stride))
     return FmOnlineContext(
         model=model, state_norm=state_norm, cmd_norm=cmd_norm,
@@ -608,6 +713,7 @@ def load_fm_context(
         reference_blocks=blocks,
         zero_noise=bool(zero_noise),
         guidance_scale=float(guidance_scale),
+        history_source=str(cfg.history_source),
         fm_snap_every=(int(meta["fm_snap_every"]) or None) if meta.get("fm_snap_every") else None,
         extero_source=str(cfg.extero_source),
         extero_sensor_count=int(cfg.extero_sensor_count),
@@ -625,6 +731,7 @@ def load_fm_context(
         extero_clip=cfg.extero_clip,
         depth_latency_probs=(tuple(float(p) for p in cfg.depth_latency_probs)
                              if cfg.depth_latency_probs else None),
+        advantage_label=serve_label,
     )
 
 
@@ -708,6 +815,7 @@ def sample_window(
     extero: torch.Tensor,
     cmd_tokens: torch.Tensor | None,
     history_null_mask: torch.Tensor | None = None,
+    noise: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample the ``F``-node future window, denormalized.
 
@@ -734,10 +842,17 @@ def sample_window(
     """
     if ctx.cmd_dim > 0 and cmd_tokens is None:
         raise ValueError("Checkpoint is command-conditioned but cmd_tokens is None.")
+    # The label the ARTIFACT names, applied here and nowhere else, so simulation cannot serve
+    # a different arm from the one the checkpoint states. `None` on a conditioned model would
+    # resolve to `null` inside the model, which is a third arm rather than "unconditioned" --
+    # load_fm_context refuses to let that happen by accident.
+    adv = (None if ctx.advantage_label is None
+           else torch.tensor([ctx.advantage_label], dtype=torch.long, device=history.device))
     pred_std = sample_trajectory(ctx.model, history, extero, cmd_tokens, ctx.F, ctx.D,
                                  ctx.num_steps, history_null_mask=history_null_mask,
                                  zero_noise=ctx.zero_noise,
-                                 guidance_scale=ctx.guidance_scale)
+                                 guidance_scale=ctx.guidance_scale, noise=noise,
+                                 advantage=adv)
     # Project the rotation block back onto SO(3): the model emits 6 free numbers, and the
     # served window is both a reference pose and the next step's history token. The exported
     # ONNX module does the same, so sim and deploy agree.

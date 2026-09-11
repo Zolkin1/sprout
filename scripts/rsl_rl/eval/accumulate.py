@@ -29,6 +29,13 @@ import torch
 
 import schema
 
+# Torch twin of ``transfer.deploy.tracking_error``, held to it by
+# ``transfer/deploy/tests/test_tracking_error_parity.py``. Safe at module scope: it imports
+# only torch and ``isaaclab.utils.math``, and pulls no ``isaacsim``/``omni``/``pxr``/``carb``
+# -- unlike ``mdp.goal_region``, which is attached after AppLauncher for exactly that reason
+# (see ``test_no_pre_app_pxr_import.py``).
+from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
+
 #: Name patterns that split the clip's output channels into comparable groups.  Same
 #: patterns ``play_plots._print_group_summaries`` uses, so the eval's reference errors group
 #: exactly like the existing stats do.
@@ -173,6 +180,12 @@ class EpisodeAccumulator:
         # unless a classifier is attached (the clip arm loads no generator).
         self.plan_counts = torch.zeros(self.n, 3, device=self.device, dtype=torch.long)
         self.plan_clf = None
+        #: Optional :class:`FlaggedPlanDump`. Off unless the harness asks for it.
+        self.plan_dump = None
+        #: Running |served - clip| since each env's last re-plan, for the dump's selection.
+        self._div_sum = torch.zeros(self.n, device=self.device)
+        self._div_n = torch.zeros(self.n, device=self.device, dtype=torch.long)
+        self._arange = torch.arange(self.n, device=self.device)
         self.act_rate = z()
         self.act_rate_max = z()
         self.torque_util = z()
@@ -182,8 +195,252 @@ class EpisodeAccumulator:
         self.slip = z()
         self.contact_steps = z()
         self._prev_action = torch.zeros(self.n, self.robot.num_joints, device=self.device)
+        # -- the SPATIAL goal ------------------------------------------------------------
+        # Every other outcome above is a clip-CURSOR condition and cannot tell a robot that
+        # climbed the staircase from one that stood still while the cursor ran out. These
+        # are the buffers that can.
+        #
+        # The ANCHOR is episode-constant by construction (the globally placed clip's own
+        # terminal base pose), so it is resolved once per reset in `refresh_goal_anchor`
+        # rather than gathered every step -- cheaper, and it makes the constancy explicit
+        # instead of incidental.
+        # `goal_region` sits behind the `mdp` package __init__, which imports
+        # `isaaclab.envs.mdp`; `runner.py` imports THIS module before AppLauncher runs, so a
+        # module-level import here would bind pip's usd-core ahead of Kit's and segfault.
+        # See `test_no_pre_app_pxr_import.py`. Attached instead, after the env exists.
+        self._gr = None
+        self.goal_spec = None
+        self._goal_pos_w = torch.zeros(self.n, 3, device=self.device)
+        self._goal_yaw = torch.zeros(self.n, device=self.device)
+        self._goal_valid = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        self._goal_tol = torch.zeros(self.n, 3, device=self.device)
+        self.goal_reached = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        self.first_goal = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
+        self.min_goal_dist = torch.full((self.n,), float("inf"), device=self.device)
+        self.max_goal_down = torch.full((self.n,), -float("inf"), device=self.device)
+        self.end_goal = torch.full((self.n, 3), float("nan"), device=self.device)
         self._prev_xy = self.rd.root_pos_w[:, :2].clone()
         self._have_prev = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        # -- the STRICT tracking checks --------------------------------------------------
+        # Off until `attach_tracking`, on the same terms as the goal region: with no spec the
+        # columns come out "never violated" / NaN and a reader must be able to tell that from
+        # "measured and never fired".
+        self._track_spec = None
+        self._track_offsets = torch.zeros(1, dtype=torch.long, device=self.device)
+        self.first_violation = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
+        self.first_check = {}
+        self.track_reward_sum = torch.zeros(self.n, device=self.device)
+        self.track_reward_n = torch.zeros(self.n, device=self.device)
+        #: The error row this step, ``[N, n]``, or None before the first served reference.
+        #: Stashed rather than recomputed by the recorder: it is built here from the served
+        #: window at the fold instant, and rebuilding it a step later would measure a
+        #: different pairing.
+        self.last_track_err: torch.Tensor | None = None
+
+    # ------------------------------------------------------------------
+    # The STRICT tracking checks.  See transfer/deploy/tracking_error.py for the contract.
+    # ------------------------------------------------------------------
+    def attach_tracking(self, spec) -> None:
+        """Turn on the strict tracking columns, with ``spec``'s bounds and kernel widths.
+
+        Off until called, like :meth:`attach_goal_region` and for the same reason: a run
+        without it reports ``first_violation_step == -1`` everywhere, and a reader has to be
+        able to tell that from "measured, never fired".  ``report.py`` refuses to derive
+        strict success from a table whose column is absent rather than reading it as "nothing
+        ever went wrong".
+
+        The reference is the SERVED one -- ``get_future_world_base`` / ``get_future_joint_state``
+        at offset 0 answer for whichever arm is applied, so the clip arm and the generator arm
+        go through one call site and cannot drift apart.
+
+        Args:
+            spec: A :class:`~robot_rl...mdp.tracking_error.TrackingErrorSpec`.
+
+        Raises:
+            ValueError: If the served generator predicts no ``base_vel`` or no ``joint_pos``.
+                Checked HERE rather than per step: the accessors raise on that checkpoint, and
+                a run that dies mid-episode after twenty minutes of rollout costs more than
+                one that refuses at setup.
+        """
+        blocks = getattr(self.cmd, "_fm_blocks", None)
+        if blocks is not None:
+            missing = {"base_vel", "joint_pos"} - set(blocks)
+            if missing:
+                raise ValueError(
+                    f"the strict tracking checks need {sorted(missing)} from the served "
+                    f"reference, and this generator's window packs {list(blocks)}. There is "
+                    "no useful reduced form: without base_vel the twist term is undefined, "
+                    "and without joint_pos the reward is a base-only number wearing the name "
+                    "of a whole-body one.")
+        self._track_spec = spec
+        self.first_check = {
+            name: torch.full((self.n,), -1, device=self.device, dtype=torch.long)
+            for name in tracking_error.VIOLATION_CHECK_NAMES}
+
+    def _fold_tracking(self, m: torch.Tensor) -> None:
+        """Latch the strict checks and accumulate the tracking reward, for the envs in ``m``.
+
+        Called from :meth:`fold` and from :meth:`fold_terminal`, on the same terms as the fall
+        crossing: the frame that ended the episode is exactly the one most likely to have
+        crossed, so omitting it would leave a violated episode reading clean.
+
+        Args:
+            m: Boolean ``[N]`` mask of envs to fold.
+        """
+        # NO WARM-UP EXCLUSION HERE, and the asymmetry with MuJoCo is deliberate.
+        # `mjeval.tracking.TrackingProbe` skips the opening command hold, which is a MuJoCo-only
+        # artifact: its courses spawn a standing robot 2.5 m out and then command full speed,
+        # and nothing on this side has a `cmd_hold_s` at all.
+        #
+        # Isaac DOES have the analogous mechanism -- the generator's history ring is empty at
+        # reset, so its first plans are poor. Measured on a 74-episode rollout, mean chunk
+        # reward by re-plan index: 0.40 (1), 0.48 (2), 0.50 (3), 0.52 (4-5), 0.55 (6-10),
+        # 0.64 (21-40). It is KEPT ON PURPOSE, and "the ring is empty" is the reason to keep
+        # it rather than a reason to filter it: the generator has a LEARNED null-history
+        # embedding trained for exactly those steps, so they are a regime the model was fitted
+        # for and not a degenerate warm-up. The return from an early state genuinely includes
+        # those chunks, the critic conditions on the state (history_null included), and the
+        # steps at the start of an episode are real data about real behaviour.
+        #
+        # What it does mean is that `track_reward_mean` is NOT symmetric between the two
+        # harnesses -- this one carries the ramp, mjeval's does not -- so the two columns are
+        # not directly comparable, and this one carries the same short-episode bias mjeval's
+        # hold exclusion exists to remove. Compare within a harness, never across.
+        if self._track_spec is None:
+            return
+        # No served reference yet -- before the generator's first plan there is nothing to
+        # measure, which is a real state rather than an error. `_pred_valid` is absent on the
+        # clip command, where a reference always exists.
+        valid = getattr(self.cmd, "_pred_valid", None)
+        if valid is not None:
+            m = m & valid.to(self.device).reshape(self.n)
+        if not bool(m.any()):
+            self.last_track_err = None
+            return
+
+        pos_w, quat_w, lin_w, ang_w = self.cmd.get_future_world_base(self._track_offsets)
+        jp, _ = self.cmd.get_future_joint_state(self._track_offsets)
+        d = self.rd
+        # `root_link_*`, NOT `root_lin_vel_w`: the latter is the CoM twist, and the MuJoCo
+        # half measures the frame-ORIGIN twist via `mj_jacBody` (`Robot.get_base_world_velocity`
+        # documents the distinction and warns against `mj_objectVelocity`). Mixing the two
+        # would put a systematic offset on the velocity term in one simulator only.
+        err = tracking_error.tracking_error(
+            pos_w[:, 0], quat_w[:, 0], lin_w[:, 0], ang_w[:, 0], jp[:, 0],
+            d.root_pos_w, d.root_quat_w, d.root_link_lin_vel_w, d.root_link_ang_vel_w,
+            d.joint_pos)
+
+        self.last_track_err = err
+        mf = m.to(torch.float32)
+        self.track_reward_sum += tracking_error.step_reward(err, self._track_spec) * mf
+        self.track_reward_n += mf
+
+        checks = tracking_error.violation_checks(err, self._track_spec)
+        for name, hit in checks.items():
+            crossed = m & (self.first_check[name] < 0) & hit
+            self.first_check[name] = torch.where(crossed, self.steps, self.first_check[name])
+        any_hit = torch.zeros_like(m)
+        for hit in checks.values():
+            any_hit = any_hit | hit
+        crossed = m & (self.first_violation < 0) & any_hit
+        self.first_violation = torch.where(crossed, self.steps, self.first_violation)
+
+    # ------------------------------------------------------------------
+    # The SPATIAL goal.  See mdp/goal_region.py for why it has to exist.
+    # ------------------------------------------------------------------
+    def attach_goal_region(self, spec, family_of_env=None) -> None:
+        """Turn on the goal columns, with ``spec``'s tolerances.
+
+        Off until called: with no spec the goal columns come out "never reached" / NaN and
+        ``report.py`` REFUSES to derive spatial success from them.  That is deliberate --
+        a spatial success rule silently falling back to a temporal one would be the exact
+        defect this whole module exists to remove, and "absent" has to be distinguishable
+        from "never arrived".
+
+        Args:
+            spec: A :class:`mdp.goal_region.GoalRegionSpec`.
+            family_of_env: Optional ``[n]`` sequence of normalised family names, so each env
+                gets its own family's calibrated tolerances.  ``None`` gives every env the
+                spec's default.
+        """
+        from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+        self._gr = goal_region
+        self.goal_spec = spec
+        self.set_goal_families(family_of_env)
+
+    def set_goal_families(self, family_of_env=None, env_ids: torch.Tensor | None = None) -> None:
+        """Write per-env tolerances from each env's family.
+
+        Called again whenever an env is re-pinned to a clip of a different family -- the
+        tolerances are per family, and a batch of 1024 envs spans several.
+
+        Args:
+            family_of_env: Sequence of normalised family names, one per entry of ``env_ids``
+                (or per env when ``env_ids`` is None).  ``None`` uses the spec default.
+            env_ids: Optional subset to write.
+        """
+        if self.goal_spec is None:
+            return
+        ids = (torch.arange(self.n, device=self.device) if env_ids is None
+               else env_ids.to(self.device))
+        if family_of_env is None:
+            t = self.goal_spec.default
+            row = torch.tensor([t.approach_margin_m, t.half_width_m, t.height_tol_m],
+                               device=self.device, dtype=self._goal_tol.dtype)
+            self._goal_tol[ids] = row
+            return
+        rows = [self.goal_spec.for_family(f) for f in family_of_env]
+        self._goal_tol[ids] = torch.tensor(
+            [[r.approach_margin_m, r.half_width_m, r.height_tol_m] for r in rows],
+            device=self.device, dtype=self._goal_tol.dtype)
+
+    def refresh_goal_anchor(self, env_ids: torch.Tensor | None = None) -> None:
+        """Resolve where the clip itself finishes, for ``env_ids``, once per episode.
+
+        The anchor is episode-CONSTANT -- it is the globally placed clip's own base pose at
+        ``last_usable_step``, and neither the placement nor that step moves once the episode
+        has started.  Resolving it per reset rather than per step is therefore not just
+        cheaper (it is a library gather over every env), it states that constancy instead of
+        leaving it incidental.
+
+        Must be called AFTER the reset has committed the new clip and its placement, or the
+        anchor describes the previous episode's clip -- the same shape of carry-over bug that
+        made ``projected_gravity_b`` inflate the derived fall flag.
+
+        Args:
+            env_ids: Envs to refresh, or ``None`` for all.
+        """
+        if self._gr is None:
+            return
+        pos, yaw = self._gr.goal_anchor_world(self.cmd)
+        ids = (torch.arange(self.n, device=self.device) if env_ids is None
+               else env_ids.to(self.device))
+        self._goal_pos_w[ids] = pos[ids].to(self._goal_pos_w.dtype)
+        self._goal_yaw[ids] = yaw[ids].to(self._goal_yaw.dtype)
+        self._goal_valid[ids] = True
+
+    def _fold_goal(self, m: torch.Tensor) -> None:
+        """Fold this step's goal geometry for the envs in ``m``."""
+        if self._gr is None:
+            return
+        down, lat, hz = self._gr.goal_frame_offsets(
+            self.rd.root_pos_w, self._goal_pos_w, self._goal_yaw)
+        live = m & self._goal_valid
+        inside = self._gr.in_goal(down, lat, hz, self._goal_tol) & live
+        dist = self._gr.goal_distance_m(down, lat, hz, self._goal_tol)
+
+        newly = inside & ~self.goal_reached
+        self.first_goal = torch.where(newly, self.steps, self.first_goal)
+        self.goal_reached = self.goal_reached | inside
+        self.min_goal_dist = torch.where(live, torch.minimum(self.min_goal_dist, dist),
+                                         self.min_goal_dist)
+        self.max_goal_down = torch.where(live, torch.maximum(self.max_goal_down, down),
+                                         self.max_goal_down)
+        # The terminal offsets are simply the LAST folded ones, so no separate terminal hook
+        # is needed: `fold_terminal` folds the ending frame through this same path.
+        self.end_goal = torch.where(live.unsqueeze(-1),
+                                    torch.stack([down, lat, hz], dim=-1), self.end_goal)
 
     def _resolve_feet(self, u) -> torch.Tensor:
         """Body indices of the two ankle-roll links, for the foot-slip term."""
@@ -258,6 +515,9 @@ class EpisodeAccumulator:
             (height < self.fall_min_height) | (tilt > self.fall_tilt_rad))
         self.first_fall = torch.where(crossed, self.steps, self.first_fall)
 
+        # -- the strict tracking checks, on the same mask and the same clock --------------
+        self._fold_tracking(m)
+
         # -- what kind of motion did the generator just plan? -----------------------------
         # Gated on a FRESH plan (`_pred_idx == 0`, set on re-plan and advanced one node per
         # step), so each plan is counted exactly once per env rather than 12 times.
@@ -274,6 +534,36 @@ class EpisodeAccumulator:
                     codes = self.plan_clf.classify(win[ids])
                     codes = torch.as_tensor(codes, device=self.device, dtype=torch.long)
                     self.plan_counts[ids, codes] += 1
+                    if self.plan_dump is not None:
+                        # Close out the plan that just ENDED (its divergence is complete
+                        # only now) before opening the new one.
+                        self.plan_dump.finalize(ids, self._div_sum, self._div_n)
+                        self.plan_dump.offer(ids, codes, win, self.cmd)
+                        self._div_sum[ids] = 0.0
+                        self._div_n[ids] = 0
+
+        # -- served-vs-clip divergence, the ground-truth half of the plan dump -------------
+        # The classifier says what a plan LOOKS like; this says how far it is from what the
+        # clip actually does, with no learned label in the way. _clip_history_node returns
+        # the clip's node in the PLAN's frame -- the same frame the served node is in -- so
+        # the difference is meaningful without any re-anchoring here.
+        if self.plan_dump is not None:
+            try:
+                served = self.cmd._pred_window[self._arange, self.cmd._pred_idx]
+                clip_node = self.cmd._clip_history_node()
+                # Base POSITION only (window channels 0:3). The node mixes position, rot6d
+                # and 29 joint angles; an unweighted norm over all of them is dominated by
+                # whichever block happens to have the largest units, which is not a claim
+                # about the plan.
+                # NOT `d`: that name is the _Data wrapper further down this method, and
+                # shadowing it makes fold() die on `d.applied_torque` several branches later.
+                div_step = torch.linalg.norm(served[:, :3] - clip_node[:, :3], dim=-1)
+                div_ok = m & self.cmd._pred_valid
+                self._div_sum = self._div_sum + torch.where(
+                    div_ok, div_step, torch.zeros_like(div_step))
+                self._div_n = self._div_n + div_ok.long()
+            except (AttributeError, RuntimeError):
+                pass
 
         # -- effort / smoothness ----------------------------------------------------------
         action = self._processed_action()
@@ -295,6 +585,8 @@ class EpisodeAccumulator:
         self.dist += step_dist * mf
         self._prev_xy = xy.clone()
         self._have_prev = self._have_prev | m
+
+        self._fold_goal(m)
 
         # -- foot slip --------------------------------------------------------------------
         if self._foot_ids.numel() and self._contact_sensors:
@@ -336,6 +628,35 @@ class EpisodeAccumulator:
         cos = (1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])).clamp(-1.0, 1.0)
         return torch.acos(cos)
 
+    # TODO(terminal-tilt): `max_tilt_rad` is CONTAMINATED and `first_fall_step` may be too.
+    #
+    # A non-trivial fraction of SUCCESSFUL episodes record `max_tilt_rad` ABOVE the 70 deg
+    # termination limit, some of them far above it. That is impossible if the column measured
+    # what it claims -- `base_fallen` would have ended those episodes -- so a transient is
+    # being folded in. First seen on a closed-loop rollout; re-derive the rate from any
+    # `episodes.h5` by taking `max_tilt_rad` over the episodes the reward scores a success.
+    #
+    # The suspect is the `max()` below. It is deliberate and well argued for ordering
+    # robustness, but max(a, b) where one input is a mid-teleport pose is that pose. If
+    # `root_quat_w` is momentarily garbage inside the reset hook rather than merely fresh,
+    # this picks it up and nothing downstream can tell.
+    #
+    # WHAT IS AFFECTED, and what is not:
+    #   * `max_tilt_rad` -- unusable as reported.
+    #   * `first_fall_step` -- `fold_terminal` sets it when EITHER limb crosses, so a
+    #     spurious tilt marks an episode as having fallen when it did not. That makes the
+    #     fall-vs-stall SPLIT unreliable.
+    #   * the success verdict is SAFE: it comes from `reached_goal` and the first-event
+    #     ordering, and an episode that reached the goal before the terminal frame keeps its
+    #     success regardless. That is why this hid.
+    #   * the eval harness shares this accumulator, so its `max_tilt_rad` and derived `fell`
+    #     column may carry the same defect. CLAUDE.md records a PREVIOUS bug in this exact
+    #     place (the derived fall flag inheriting the previous episode's orientation), so
+    #     check whether this is a recurrence rather than a new fault.
+    #
+    # To diagnose: log both limbs separately at the terminal fold for a few hundred episodes
+    # and compare against the per-step maximum, which is computed from a buffer that is not
+    # mid-reset. Blocks TODO(jump-off-front).
     def _tilt_terminal(self, d) -> torch.Tensor:
         """Tilt for the TERMINAL fold, where the two buffers disagree on purpose.
 
@@ -417,6 +738,24 @@ class EpisodeAccumulator:
             (height < self.fall_min_height) | (tilt > self.fall_tilt_rad))
         self.first_fall[ids] = torch.where(crossed, self.steps[ids], self.first_fall[ids])
 
+        # The goal too, and for the same reason: under `clip_end` truncation the LAST step is
+        # exactly when a robot is most likely to be standing in the goal, so omitting the
+        # terminal frame would systematically under-count arrivals.
+        #
+        # This inherits the same assumption the height limb above already makes -- that
+        # `root_pos_w` still holds the terminal pose here -- which `_check_terminal_state`
+        # verifies empirically once per run. If that ever breaks, the failure is benign in
+        # the one direction that matters: a post-reset read is the clip's SPAWN, which is
+        # maximally far from the goal, so it can corrupt `min_dist_to_goal_m` but can never
+        # falsely mark an episode as having arrived.
+        m = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        m[ids] = True
+        self._fold_goal(m)
+        # And the strict checks, for the reason the fall crossing is folded here: the frame
+        # that ended the episode is the one most likely to have crossed, so omitting it would
+        # leave a violated episode reading clean.
+        self._fold_tracking(m)
+
     def snapshot(self, env_ids: torch.Tensor) -> dict[str, np.ndarray]:
         """Reduce the running sums for ``env_ids`` into per-episode values.
 
@@ -428,7 +767,20 @@ class EpisodeAccumulator:
         cpu = lambda t: t.detach().to("cpu").numpy()  # noqa: E731
 
         pc = cpu(self.plan_counts[ids]).astype(np.int64)
+        # NaN/inf out of the goal buffers means "never folded with a valid anchor", which is
+        # what an un-attached goal region looks like; `report.py` refuses to derive spatial
+        # success from that rather than reading it as "never arrived".
+        end_goal = cpu(self.end_goal[ids]).astype(np.float32)
+        min_gd = cpu(self.min_goal_dist[ids]).astype(np.float32)
+        max_gdown = cpu(self.max_goal_down[ids]).astype(np.float32)
         out: dict[str, np.ndarray] = {
+            "reached_goal": cpu(self.goal_reached[ids]).astype(np.uint8),
+            "first_goal_step": cpu(self.first_goal[ids]).astype(np.int64),
+            "min_dist_to_goal_m": np.where(np.isfinite(min_gd), min_gd, np.nan),
+            "goal_downrange_m": end_goal[:, 0],
+            "goal_lateral_m": end_goal[:, 1],
+            "goal_height_err_m": end_goal[:, 2],
+            "max_goal_downrange_m": np.where(np.isfinite(max_gdown), max_gdown, np.nan),
             "steps_survived": cpu(self.steps[ids]).astype(np.int64),
             "n_steps_scored": cpu(self.steps[ids]).astype(np.int64),
             "n_plans": pc.sum(1),
@@ -443,6 +795,11 @@ class EpisodeAccumulator:
             "min_base_height_w": cpu(self.min_h[ids]),
             "max_tilt_rad": cpu(self.max_tilt[ids]),
             "first_fall_step": cpu(self.first_fall[ids]).astype(np.int64),
+            "first_violation_step": cpu(self.first_violation[ids]).astype(np.int64),
+            "track_reward_mean": cpu(torch.where(
+                self.track_reward_n[ids] > 0,
+                self.track_reward_sum[ids] / self.track_reward_n[ids],
+                torch.full_like(self.track_reward_n[ids], float("nan")))),
             "action_rate_mean": cpu(self.act_rate[ids] / steps),
             "action_rate_max": cpu(self.act_rate_max[ids]),
             "torque_util_max": cpu(self.torque_util[ids]),
@@ -453,6 +810,14 @@ class EpisodeAccumulator:
             "foot_contact_frac": cpu(self.contact_steps[ids]
                                      / (steps * max(1, int(self._foot_ids.numel())))),
         }
+        # Per-CHECK first-crossing steps. Named individually rather than pooled into the
+        # one `first_violation_step`: lateral and height are chunk-local while tilt is
+        # measured against gravity, so a pooled rate hides which bound is doing the work.
+        for _name in tracking_error.VIOLATION_CHECK_NAMES:
+            _buf = self.first_check.get(_name)
+            out[f"first_{_name}_step"] = (
+                cpu(_buf[ids]).astype(np.int64) if _buf is not None
+                else np.full(int(ids.numel()), -1, dtype=np.int64))
         vel = cpu(self.vel_sq[ids] / steps.unsqueeze(-1))
         vmax = cpu(self.vel_absmax[ids])
         for k, axis in enumerate(("vx", "vy", "wz")):
@@ -490,6 +855,11 @@ class EpisodeAccumulator:
         self.min_h[ids] = float("inf")
         self.max_tilt[ids] = 0.0
         self.first_fall[ids] = -1
+        self.first_violation[ids] = -1
+        for _buf in self.first_check.values():
+            _buf[ids] = -1
+        self.track_reward_sum[ids] = 0.0
+        self.track_reward_n[ids] = 0.0
         self.plan_counts[ids] = 0
         self.act_rate[ids] = 0.0
         self.act_rate_max[ids] = 0.0
@@ -500,3 +870,11 @@ class EpisodeAccumulator:
         self.slip[ids] = 0.0
         self.contact_steps[ids] = 0.0
         self._have_prev[ids] = False
+        self.goal_reached[ids] = False
+        self.first_goal[ids] = -1
+        self.min_goal_dist[ids] = float("inf")
+        self.max_goal_down[ids] = -float("inf")
+        self.end_goal[ids] = float("nan")
+        # NOT `_goal_valid`: the anchor is refreshed by `refresh_goal_anchor` AFTER the clip
+        # reset commits the new clip, and clearing it here would only widen the window in
+        # which a stale anchor could be folded.

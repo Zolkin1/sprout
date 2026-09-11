@@ -9,14 +9,18 @@ command sources:
   gamepad (left stick = vx/vy, right stick x = wz), scaled by ``--max_*``.
 * ``--mode eval``: a scripted velocity profile from ``experiments.velocity_commands``
   (``--command``), logging tracking metrics to CSV.
+* ``--const_cmd VX VY WZ``: hold one velocity command for the whole run, overriding both.
+  Every terrain clip in the training library was generated under exactly that -- a per-clip
+  CONSTANT command -- so it is the in-distribution way to drive at a piece of terrain.
 
 Run from ``transfer/sim/`` (the MuJoCo assets are resolved relative to cwd):
 
     python gen_tracker_runner.py --mode joystick --load_run <tracker_run>
     python gen_tracker_runner.py --mode eval --command smooth_ramp_running --log
 
-The flow-matching checkpoint defaults to the one the tracker was trained against
-(read from the run's ``params/env.yaml``); override with ``--fm_checkpoint``.
+The flow-matching graph defaults to the one exported beside the tracker; override with
+``--fm_onnx`` (required when the run's ``exported/`` holds more than one, which the
+resolver refuses to disambiguate).
 """
 
 from __future__ import annotations
@@ -174,9 +178,10 @@ class FmDepthLag:
         """
         if not self.steps:
             return state
-        # `fm_depth` when the generator samples its own grid, else a COPY of the tracker's --
-        # `_fm_depth_reading` treats `fm_depth` as authoritative whenever it is present, so
-        # this reaches the generator without touching what the tracker observes.
+        # `fm_depth` when the generator samples its own grid, else a COPY of the union cast --
+        # `_fm_depth_reading` treats `fm_depth` as authoritative whenever it is present and
+        # selects the generator's own rows out of it, so this reaches the generator without
+        # touching what the tracker observes.
         img = state.get("fm_depth")
         if img is None:
             img = state.get("depth")
@@ -211,13 +216,15 @@ def build_state(
         robot: The MuJoCo robot wrapper.
         policy: The loaded generator + tracker policy (for joint order + ctx).
         command: Velocity command ``(vx, vy, wz)``.
-        depth_cams: The TRACKER's depth cameras to cast, or ``None`` when the policy has
-            none.
+        depth_cams: The cameras to cast -- the UNION of the tracker's and the generator's
+            (``policy.get_depth_camera_spec()``), since the policy reads the near camera
+            alone and the generator both. ``None`` when neither artifact has cameras.
         want_depth_hits: Also collect the depth rays' world hit points (viewer only).
         want_raw_depth: Also collect pre-normalisation depth in metres (replay dump only).
         fm_depth_cams: The GENERATOR's cameras, when it samples the same lenses on its own
-            grid. ``None`` when the two samplings match, in which case the generator reads
-            ``state["depth"]`` like it always did.
+            GRID. ``None`` when the two samplings match, in which case the generator selects
+            its own rows out of ``state["depth"]``. A differing camera SET needs none of
+            this -- one cast of the union serves both.
 
     Returns:
         State dict (numpy, FM/isaac joint order, world frame, xyzw quats).
@@ -330,13 +337,15 @@ def build_state(
             poses.append((p_rel, matrix_from_quat(q_rel)))
         state["fm_camera_pose"] = poses
 
-    # Depth cameras: cast the policy's own pinhole grids against the terrain AND the
-    # robot's visual meshes, normalised exactly as the observation term does. One cast
-    # feeds BOTH consumers -- the tracker's depth obs terms (keyed by term name) and the
-    # FM's exteroception tokens (stacked, matching mdp.depth_obs_stack) -- because there
-    # is one physical camera pair -- the policy keys the rows by obs term itself, from the
-    # contract it loaded. Both cameras run at the control rate, so a single cast per step
-    # is exact: no staleness to model.
+    # Depth cameras: cast the pinhole grids against the terrain AND the robot's visual
+    # meshes, normalised exactly as the observation term does. ONE cast of the UNION feeds
+    # both consumers -- the tracker's depth obs terms (keyed by term name) and the FM's
+    # exteroception tokens (stacked, matching mdp.depth_obs_stack) -- and each SELECTS its
+    # own cameras out of it by name, because the policy reads the near camera alone while
+    # the generator reads both. Casting the two sets separately would give the shared camera
+    # two independent per-frame noise draws, where IsaacLab feeds one sensor's pixels to
+    # both obs groups. Every camera runs at the control rate, so a single cast per step is
+    # exact: no staleness to model.
     if depth_cams is not None:
         # `depth_raw` is METRES along the optical axis, recorded only for --dump_replay: the
         # C++ runtime is fed raw and normalises internally, and the normalisation clips and
@@ -565,6 +574,40 @@ def _add_arrow(scn, base: np.ndarray, vec: np.ndarray, rgba: tuple, width: float
     scn.ngeom += 1
 
 
+#: mjeval's own goal-marker colour (``view_cell.TARGET_RGBA``), matched here so a course
+#: watched through this runner and through the standard eval viewer read as the same thing.
+GOAL_RGBA = (0.06, 0.48, 0.38, 0.55)
+
+
+def _add_goal_rect(scn, xy: tuple[float, float], half_width: float, depth: float, z: float,
+                   rgba: tuple = GOAL_RGBA) -> None:
+    """Outline a goal rectangle on the ground as a ring of small spheres.
+
+    Dotted rather than a filled slab for the same reason ``mjeval.view_cell``'s does it this
+    way: a filled slab z-fights with the platform it sits on, and the band's EDGE is what a
+    run is judged against.
+
+    Args:
+        scn: The viewer's ``user_scn``.
+        xy: Rectangle centre, world ``(x, y)``.
+        half_width: Half the lateral extent, m.
+        depth: Extent along travel, m.
+        z: World height to draw at, m.
+        rgba: Marker colour.
+    """
+    gx, gy = xy
+    hw, hd = float(half_width), float(depth) / 2.0
+    corners = [(gx - hd, gy - hw), (gx + hd, gy - hw), (gx + hd, gy + hw), (gx - hd, gy + hw)]
+    for i in range(4):
+        x0, y0 = corners[i]
+        x1, y1 = corners[(i + 1) % 4]
+        n = max(2, int(math.hypot(x1 - x0, y1 - y0) / 0.12))
+        for k in range(n):
+            f = k / n
+            pos = np.array([x0 + (x1 - x0) * f, y0 + (y1 - y0) * f, z])
+            _add_sphere(scn, pos, rgba, 0.028)
+
+
 class InterruptFlag:
     """Make Ctrl-C end the run at the next control step instead of unwinding through it.
 
@@ -648,7 +691,9 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         depth_cams: MujocoDepthCameras | None = None, depth_viz_stride: int = 8,
         viz_geomgroup: list[int] | None = None, viz_contacts: bool = False,
         fm_depth_cams: MujocoDepthCameras | None = None,
-        replay=None, fm_lag: FmDepthLag | None = None) -> bool | None:
+        replay=None, fm_lag: FmDepthLag | None = None,
+        goal_xy: tuple[float, float] | None = None, goal_half_width: float = 2.5,
+        goal_depth: float = 2.0, goal_z: float = 0.0) -> bool | None:
     """Run the control loop; return True if the robot did not fall.
 
     Returns ``None`` when the user interrupts with Ctrl-C, which is neither survival nor a
@@ -698,14 +743,21 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         clip_handoff_time: In clip mode, sim time (s) at which to hand the reference off
             from the clip to the FM generator (the FM history is kept warm during the
             clip phase). ``< 0`` never hands off (clip-only playback).
-        depth_cams: The TRACKER's depth cameras to cast each control step, or ``None`` when
-            the loaded policy has none. Feeds the tracker's depth obs terms, and the FM's
-            exteroception tokens too when both sample the same grid.
-        fm_depth_cams: The GENERATOR's cameras, cast separately when it samples the same
-            lenses on its own grid (``policy.depth_sampling_is_split()``).
+        depth_cams: The UNION of both artifacts' depth cameras, cast each control step, or
+            ``None`` when the loaded policy has none. Feeds the tracker's depth obs terms and
+            the FM's exteroception tokens, each selecting its own rows by name.
+        fm_depth_cams: The GENERATOR's cameras, cast separately only when it samples the
+            same lenses on its own GRID (``policy.depth_sampling_is_split()``); a differing
+            camera set does not need this.
         depth_viz_stride: Draw every Nth depth pixel's hit point in the viewer. The two
             cameras produce 1560 hits per step, well past ``user_scn.maxgeom``, so the
             cloud is subsampled.
+        goal_xy: Centre of a goal-rectangle marker to draw (viewer mode only), or ``None``
+            for no marker. This function has no course/terrain knowledge -- the caller
+            supplies the raw numbers.
+        goal_half_width: Half the goal band's lateral extent, m. Only used with ``goal_xy``.
+        goal_depth: Goal band depth along travel, m. Only used with ``goal_xy``.
+        goal_z: Height to draw the goal marker at, m. Only used with ``goal_xy``.
     """
     dt = policy.get_dt()
     # Checked at every control-step boundary by all three loops (see InterruptFlag).
@@ -776,6 +828,18 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         robot.set_pd_gains_from_policy(policy)
         print("[INFO] Spawning straight into FM+tracker control on the RL gains (no standing "
               "hold: the generator runs from step 0 on its learned null-history embedding).")
+    # Printed UNCONDITIONALLY, matching FmTrackingCommand: which history the generator is
+    # eating changes the result more than anything else here, and the two arms produce rows
+    # of identical width, so a message that appeared only in the non-default case would make
+    # "no message" ambiguous with "I did not look".
+    if policy.fm_enabled and policy.history_from == "measured":
+        print("[INFO] history_from='measured': the generator conditions on the ROBOT'S OWN "
+              "achieved state, except the base position and linear velocity (no robot can "
+              "measure those; they come from the served node). DIAGNOSTIC -- the model was "
+              "fitted on reference rows, so this input is off-distribution.")
+    elif policy.fm_enabled:
+        print(f"[INFO] history_from='generator': CLOSED LOOP -- the generator conditions on "
+              f"its own last {policy.ctx.N} served nodes.")
 
     # Predicted extra-frame indices that are feet (for the FM viz spheres).
     foot_idx = [i for i, n in enumerate(policy.ctx.target_frame_names)
@@ -1072,6 +1136,8 @@ def run(policy: GenTrackerPolicy, robot: Robot, command_fn, total_time: float,
         act_w = np.asarray(state["root_lin_vel_w"], dtype=np.float64) * np.array([1.0, 1.0, 0.0])
         _add_arrow(scn, head, cmd_w * vel_arrow_scale, (0.0, 1.0, 0.0, 1.0))   # desired
         _add_arrow(scn, head, act_w * vel_arrow_scale, (0.0, 0.0, 1.0, 1.0))   # actual
+        if goal_xy is not None:
+            _add_goal_rect(scn, goal_xy, goal_half_width, goal_depth, goal_z)
 
     def advance_physics(state: dict, viewer, ref: dict | None = None) -> None:
         """Step ``decim`` physics sub-steps (logging + viewer sync), then pace to real time."""
@@ -1301,6 +1367,15 @@ def main() -> None:
                              "-- defaulting to the newest is the ambiguity the naming exists "
                              "to remove.")
     parser.add_argument("--mode", choices=["joystick", "eval"], default="joystick")
+    parser.add_argument("--const_cmd", type=float, nargs=3, default=None,
+                        metavar=("VX", "VY", "WZ"),
+                        help="Hold a CONSTANT velocity command for the whole run, in m/s and "
+                             "rad/s. Overrides --mode / --command. This is the shape every "
+                             "terrain clip in the library was generated under -- the command "
+                             "is a per-clip constant on all seven terrain families -- so it is "
+                             "what an in-distribution approach looks like, and it is what "
+                             "stair_probe.py drives. Ignored under --clip, whose reference "
+                             "carries its own command.")
     parser.add_argument("--command", type=str, default="smooth_ramp_running",
                         help="Scripted velocity profile in experiments.velocity_commands (eval mode).")
     parser.add_argument("--scene", type=str, default="basic_scene")
@@ -1338,6 +1413,13 @@ def main() -> None:
                              "costs ~20 ms/step of ray casting (measured, 14641 rays), and "
                              "any survival number it produces is a statement about the model "
                              "given perfect terrain -- never about deployment.")
+    parser.add_argument("--allow_robot_asset_mismatch", action="store_true", default=False,
+                        help="run a tracker/generator pair whose robot fingerprints disagree. "
+                             "SIM ONLY. The fingerprint hashes whole files, so an edit to a "
+                             "part of the MJCF neither model reads -- the actuator PD gains, "
+                             "which sim2sim overwrites from the policy anyway -- trips it "
+                             "without any model being stale. Read the reported fields first: "
+                             "joint_names, body_names or total_mass differing is never benign.")
     parser.add_argument("--fm_update_every", type=int, default=1,
                         help="Generator re-inference cadence K (control steps); 1 = every step, "
                              "which is the only cadence that pays the full FM cost every tick. "
@@ -1455,6 +1537,30 @@ def main() -> None:
                              "fail a robot that merely turned around. This is what catches a "
                              "collapse on an UPPER terrain level, which stays far above the "
                              "scene-minimum height bound.")
+    parser.add_argument("--goal_xy", type=float, nargs=2, default=None, metavar=("X", "Y"),
+                        help="Draw a dotted goal-rectangle outline (mjeval's own marker style) "
+                             "centred here. No course/terrain knowledge here -- the caller "
+                             "(e.g. a course-aware script) supplies the raw numbers; omit for "
+                             "no marker, which is the default everywhere this flag is not set.")
+    parser.add_argument("--goal_half_width", type=float, default=2.5,
+                        help="Half the goal band's lateral extent, m. Only used with --goal_xy.")
+    parser.add_argument("--goal_depth", type=float, default=2.0,
+                        help="Goal band depth along travel, m. Only used with --goal_xy.")
+    parser.add_argument("--goal_z", type=float, default=0.0,
+                        help="Height to draw the goal marker at, m. Only used with --goal_xy.")
+    parser.add_argument("--steer_kp", type=float, default=0.0,
+                        help="P gain (1/s) on heading error toward --goal_xy, added to the "
+                             "wz channel of --const_cmd; 0 (default) disables it and holds "
+                             "the flat constant command. Needs --goal_xy. Ported from "
+                             "mjeval.runner.steer_yaw_rate -- same law, same default clip. "
+                             "OFF-DISTRIBUTION ON STAIRS: the two stair families carry "
+                             "|wz| max = 0.0000 over the whole training library (3500 "
+                             "clips) -- the generator has never once been commanded a turn "
+                             "on a staircase. A stairs run with this on is a DIFFERENT "
+                             "measurement, not a cleaner one.")
+    parser.add_argument("--steer_wz_max", type=float, default=0.68,
+                        help="Symmetric clip on the steering yaw rate, rad/s. Matches "
+                             "mjeval.runner.STEER_WZ_MAX. Only used with --steer_kp.")
     parser.add_argument("--dump_replay", type=str, default=None, metavar="DIR",
                         help="Record every tick's INPUTS and this runtime's answers to DIR, as "
                              "the manifest+blob fixture format the C++ side already reads "
@@ -1473,7 +1579,24 @@ def main() -> None:
                              "behaviour. The C++ default fm_lead_sec=0.02 at dt=0.02 is 1 "
                              "tick, so --fm_lead_ticks 1 is the matched comparison; 3 "
                              "reproduces the old 60 ms default.")
+    parser.add_argument("--history_from", default="generator",
+                        choices=["generator", "measured"],
+                        help="What fills the generator's N history rows: its own served "
+                             "nodes ('generator', the deployed closed loop) or the ROBOT'S "
+                             "OWN achieved state ('measured'), except the base position and "
+                             "linear velocity, which no robot can measure and which still "
+                             "come from the served node. 'measured' is a DIAGNOSTIC: it is "
+                             "real but off-distribution, since the model was fitted on "
+                             "reference rows -- see "
+                             "scripts/flow_matching/measured_history_gap.py for how far.")
     parser.add_argument("--log", action="store_true", default=False)
+    parser.add_argument("--no_metrics", dest="metrics", action="store_false", default=True,
+                        help="With --log, still write sim_log.csv and stamp the verdict into "
+                             "sim_meta.yaml, but skip gen_tracker_metrics: six figures and a "
+                             "summary JSON dumped to stdout. The two are otherwise coupled -- "
+                             "the verdict a sweep reads only exists when --log is on -- so a "
+                             "sweep that wants the verdict and not the plots had to take both, "
+                             "at a few seconds and a screenful of JSON per run.")
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Where --log writes sim_log.csv + metrics (default: "
                              "<run_dir>/mujoco_gen_tracker_logs). That default is ONE fixed "
@@ -1566,7 +1689,9 @@ def main() -> None:
         tracker_on_cpu=args.tracker_on_cpu,
         providers=([p.strip() for p in args.providers.split(",") if p.strip()] or None),
         allow_privileged_extero=args.allow_privileged_extero,
+        allow_robot_asset_mismatch=args.allow_robot_asset_mismatch,
         fm_lead_ticks=args.fm_lead_ticks,
+        history_from=args.history_from,
     )
     policy.load()
     replay = None
@@ -1605,6 +1730,42 @@ def main() -> None:
         # conflicts with the MuJoCo viewer's GLFW context at interpreter teardown and
         # produces a benign-but-ugly shutdown segfault.
         command_fn = lambda _t: np.zeros(3)
+    elif args.const_cmd is not None:
+        # Bound before the pygame path, so a constant-command run never opens a joystick and
+        # never inherits the "[WARN] no joystick -> [0.5, 0, 0]" fallback, which is a silent
+        # way to run a sweep at a speed nobody chose.
+        const = np.asarray(args.const_cmd, dtype=np.float64)
+        if args.steer_kp > 0.0:
+            if args.goal_xy is None:
+                sys.exit("[ERROR] --steer_kp needs --goal_xy to steer toward.")
+            gx, gy = args.goal_xy
+            hw, hd = args.goal_half_width, args.goal_depth / 2.0
+            vxy = const[:2].copy()
+            print(f"[INFO] steering ON: P={args.steer_kp:.3f} toward ({gx:.3f}, {gy:.3f}), "
+                  f"wz clipped to +-{args.steer_wz_max:.3f} rad/s. OFF-DISTRIBUTION ON "
+                  "STAIRS -- the training library commands zero turn rate on every stair "
+                  "clip (see --steer_kp's help); this measures a DIFFERENT thing, not a "
+                  "cleaner one.")
+
+            def command_fn(_t, _vxy=vxy, _gx=gx, _gy=gy, _hw=hw, _hd=hd,       # noqa: E731
+                           _kp=args.steer_kp, _wz_max=args.steer_wz_max):
+                # Reads robot state directly rather than through the command_fn(t) interface,
+                # which is a pure function of time everywhere else -- steering is the one
+                # command source that has to be closed-loop on where the robot actually is.
+                qpos = robot.mj_data.qpos
+                x, y = float(qpos[0]), float(qpos[1])
+                if abs(x - _gx) <= _hd and abs(y - _gy) <= _hw:
+                    wz = 0.0        # inside the goal band: stop fighting for the centreline
+                else:
+                    qw, qx, qy, qz = (float(v) for v in qpos[3:7])   # MuJoCo's own wxyz
+                    yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+                    bearing = math.atan2(_gy - y, _gx - x)
+                    err = math.atan2(math.sin(bearing - yaw), math.cos(bearing - yaw))
+                    wz = float(np.clip(_kp * err, -_wz_max, _wz_max))
+                return np.array([_vxy[0], _vxy[1], wz])
+        else:
+            print(f"[INFO] constant command ({const[0]:+.3f}, {const[1]:+.3f}, {const[2]:+.3f})")
+            command_fn = lambda _t, _c=const: _c
     elif args.mode == "joystick":
         command_fn = JoystickCommand(args.max_vx, args.max_vy, args.max_wz)
     else:
@@ -1687,7 +1848,9 @@ def main() -> None:
 
     # Depth cameras, if the loaded artifacts use them. The contract comes from the ONNX
     # metadata (checked for tracker/generator agreement inside policy.load()), so the
-    # cameras cast here are exactly the ones the networks were trained on.
+    # cameras cast here are exactly the ones the networks were trained on. It is the UNION
+    # of the two artifacts' cameras: the policy is conditioned on the near camera alone and
+    # the generator on both, and each selects its own rows out of this one reading by name.
     depth_cams = None
     depth_spec = policy.get_depth_camera_spec()
     if depth_spec:
@@ -1699,10 +1862,12 @@ def main() -> None:
             print("[INFO] Depth sensor noise ON (plane bias, per-pixel noise, blur, dropout) "
                   "plus mount jitter -- the training distribution, not the play config.")
 
-    # A SECOND caster when the generator samples those same lenses on its own grid. Two
-    # instances rather than one: MujocoDepthCameras returns its cameras as ONE array, which
-    # cannot hold two widths -- and that refusal is still correct, since each artifact's own
-    # cameras do share a resolution.
+    # A SECOND caster ONLY when the generator samples those same lenses on its own GRID.
+    # Two instances rather than one: MujocoDepthCameras returns its cameras as ONE array,
+    # which cannot hold two widths -- and that refusal is still correct, since each
+    # artifact's own cameras do share a resolution. A differing camera SET is NOT this case:
+    # the union above already carries it, and a second cast there would hand the shared
+    # camera two independent per-frame noise draws.
     fm_depth_cams = None
     if policy.depth_sampling_is_split():
         fm_spec = policy.get_fm_depth_camera_spec()
@@ -1712,9 +1877,13 @@ def main() -> None:
               f"(tracker: {depth_spec[0]['width']}x{depth_spec[0]['height']}); casting both.")
         if args.depth_noise:
             fm_depth_cams.enable_noise(np.random.default_rng(args.depth_noise_seed))
-            # The mount jitter is SHARED: one physical camera cannot be in two places, and
-            # the two casters are two samplings of it. (The per-frame noise draws stay
-            # independent -- they cannot be shared across differing pixel counts.)
+            # Draw first, then mirror: the mount jitter is SHARED for a camera BOTH casters
+            # have (one physical camera cannot be in two places), while a camera only the
+            # generator reads has no tracker draw to adopt and keeps this one. Mirroring
+            # alone would leave such a camera on its nominal mount, i.e. the one lens in the
+            # rig with no calibration error. Its own stream, so an unmatched camera's mount
+            # error is not a copy of the tracker's first camera's.
+            fm_depth_cams.jitter_extrinsics(np.random.default_rng(args.depth_noise_seed + 1))
             fm_depth_cams.mirror_extrinsics_from(depth_cams)
 
     # From the CLI when given, else from the graph's own trained distribution. Derived
@@ -1737,6 +1906,18 @@ def main() -> None:
     # `fm_extero` divergence that is the harness's fault, which is the one thing that harness
     # promises to rule out.
     _cpp_parity = bool(args.fm_lead_ticks) or bool(args.dump_replay)
+    # --history_from measured does not compose with either, for a sharper reason than the
+    # lag does: the C++ runtime has no measured arm at all. Its history is always the rows it
+    # served, so there is nothing on that side to line up against, and compare_replay.py
+    # would report an `fm_history` divergence that is the harness's fault -- the same failure
+    # the block above exists to prevent, one input over. Refused rather than warned: a lead
+    # comparison against a runtime that cannot run this arm is not a comparison.
+    if args.history_from != "generator" and _cpp_parity:
+        sys.exit(
+            f"[FATAL] --history_from {args.history_from} cannot be combined with "
+            "--fm_lead_ticks / --dump_replay. Both exist to line this runner up against the "
+            "C++ runtime, which fills the generator's history from the nodes it SERVED and "
+            "has no measured arm to compare against. Drop one.")
     if args.fm_depth_lag_steps is not None:
         if _cpp_parity and args.fm_depth_lag_steps > 0:
             sys.exit(
@@ -1764,7 +1945,10 @@ def main() -> None:
                   spawn_on_box=args.spawn_on_box,
                   clip=clip, clip_handoff_time=clip_handoff_time,
                   depth_cams=depth_cams, depth_viz_stride=args.depth_viz_stride,
-                  fm_depth_cams=fm_depth_cams, replay=replay, fm_lag=fm_lag)
+                  fm_depth_cams=fm_depth_cams, replay=replay, fm_lag=fm_lag,
+                  goal_xy=(tuple(args.goal_xy) if args.goal_xy is not None else None),
+                  goal_half_width=args.goal_half_width, goal_depth=args.goal_depth,
+                  goal_z=args.goal_z)
     # None = interrupted, which is neither survival nor a fall; saying "Survived: None"
     # would put a non-result into the same line every sweep greps for.
     if success is None:
@@ -1775,7 +1959,14 @@ def main() -> None:
         # Written after the loop, so a run that fell still yields every tick it managed --
         # those ticks are exactly the interesting ones.
         manifest = replay.write(extra_attrs={
-            "scene": args.scene, "robot": args.robot_name, "command": args.command,
+            # What ACTUALLY drove the stream. `args.command` keeps its argparse default under
+            # --const_cmd (and under --mode joystick), so recording it unconditionally stamped
+            # a replay with the name of a scripted profile that was never evaluated -- and one
+            # that need not even exist, since the hasattr check is on the other branch.
+            "scene": args.scene, "robot": args.robot_name,
+            "command": (f"const:{args.const_cmd[0]},{args.const_cmd[1]},{args.const_cmd[2]}"
+                        if args.const_cmd is not None else
+                        "joystick" if args.mode == "joystick" else args.command),
             "fm_lead_ticks": int(args.fm_lead_ticks), "survived": success,
             "dt": float(policy.get_dt()),
             # The POLICY's joint order. Every consumer that compares joints needs it: the
@@ -1819,8 +2010,9 @@ def main() -> None:
             print(f"[WARN] no sim_meta.yaml at {meta_path}; the metrics will infer survival "
                   "from the `fell` column, which cannot see a fall on the final step.")
 
-        import gen_tracker_metrics
-        gen_tracker_metrics.create_metrics(os.path.dirname(log_path))
+        if args.metrics:
+            import gen_tracker_metrics
+            gen_tracker_metrics.create_metrics(os.path.dirname(log_path))
 
     # Hard-exit to skip the native GL teardown. At interpreter exit the MuJoCo viewer's
     # GLFW context and pygame/SDL (joystick) race destroying their GLX contexts on the X

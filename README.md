@@ -167,6 +167,24 @@ python scripts/flow_matching/train.py --data <windows.h5> --wandb
 for the older buffered per-step `.npz`. `command_distribution_stats.py` reports the
 command-dynamics split of either format.
 
+**Two families are excluded from FM training by default**, both because the generator cannot
+be asked to predict what it cannot see:
+
+* `--skip_distractors` (on) drops the distractor windows;
+* `--skip_families family_jump_off` (on) drops the BACKWARDS jump-off-a-box family. The robot
+  has two forward-facing depth cameras and nothing behind, so the drop it steps off is not
+  observable. `family_jump_off_FRONT` is the forward dismount, is observable, and is kept.
+
+Both are train-time switches — every window carries its family and its distractor tag, so
+A/B-ing either costs no re-record. `--skip_families ""` trains on everything. A family you
+NAME must exist in the recording (a typo would otherwise drop nothing, which reads as
+success); a family carried only by the default is skipped where absent with a printed line,
+because a flat-only library has no terrain manifest and therefore no family table at all.
+
+Note the two flags spell the same family differently and deliberately: `--skip_families`
+wants the recording's own `family_names` entry (`family_jump_off`), while the eval harness's
+`--exclude_families` normalizes (`jump_off`). The raw names are what the recording records.
+
 **What a recording contains is a choice, not an accident.** Three knobs decide it, and the
 defaults are the ones a dataset wants rather than the ones training wants:
 
@@ -247,6 +265,40 @@ python transfer/sim/generate_stairs_scene.py   # symmetric up/platform/down lane
 cd transfer/sim && python gen_tracker_runner.py --load_run <run_dir> ...
 ```
 
+##### Stairs or a jump? `stair_probe.py`
+
+The playground has four lanes and four jump boxes, which is the wrong scene for asking whether
+the generator reads a staircase as a box — a box in frame is the alternative explanation. The
+probe puts ONE staircase in front of the robot, holds a constant velocity command
+(`gen_tracker_runner.py --const_cmd VX VY WZ`, which is the shape every terrain clip in the
+library was generated under), and asks you to label what the pair did:
+
+```bash
+cd transfer/sim && python stair_probe.py --load_run <tracker_run> --fm_onnx <run>_fm.onnx
+#   sweeps 4 flight widths x 6 approach speeds, one viewer trial each, ~15 min
+#   -> logs/stair_probe/<stamp>/{labels.jsonl, summary.json, label_grid.png}
+python stair_probe.py ... --resume        # continue the latest session (a plain rerun does NOT)
+python stair_probe.py --plot_only --out <stamp>       # redraw; --out is relative to logs/stair_probe
+
+python stair_probe.py --joystick --repeats 3 ...      # YOU drive; width is the only sweep
+```
+
+`--joystick` swaps the constant command for your gamepad and turns the approach from a setting
+into a MEASUREMENT: the runner already logs `cmd_vx`/`cmd_vy`/`cmd_wz` every step, so each row
+gets medians and signed extremes of all three over the approach (every step before the first
+riser), and the figure plots every trial in the `(|v_y|, |ω_z|)` plane where the entire training
+library sits at the origin. It refuses to start without a pad — the runner's own fallback is a
+silent constant `[0.5, 0, 0]`, which would label itself as your approach.
+
+```bash
+```
+
+The two swept axes are the ones the library couples: `stairs_up` covers a 50-level command
+grid from **0.600 to 2.600 m/s and stops**, while `jump_on` runs to 3.498 — so above 2.6 m/s
+the only fast-forward-approach motion the generator was ever shown is a jump. Trained flight
+widths run 0.81–4.14 m (transition, after terrain decoration) and 5.00–5.29 m (pure).
+`scripts/rsl_rl/plot_family_command_coverage.py --clip <lib>.h5` draws that coverage.
+
 Deeper Isaac-side debugging (height-scan depth images, reference ribbons):
 
 ```bash
@@ -318,6 +370,117 @@ python scripts/rsl_rl/eval/report.py logs/terrain_eval/<name>
 python scripts/rsl_rl/eval/report.py logs/terrain_eval/{a,b}   # comparison
 ```
 
+#### Success is SPATIAL, and the goal region is a measured artifact
+
+`clip_end` and every `terrain_*` column compare STEP INDICES, so a success rule built on them
+means "stayed upright for N steps", not "got anywhere" -- a robot that stalls in place, lags
+several metres behind, or drifts laterally off the flight scores one. `--goal_regions` adds the
+test that cannot be passed by waiting: a **downrange half-plane** at the clip's own endpoint,
+intersected with a **lateral band** and a **height band**, all in the terrain's own frame. The
+height band is not optional -- a robot that walks off the side of an elevated tile lands ~0.79 m
+up, which does not trip a 0.40 m absolute fall test, and would otherwise score as having climbed
+the staircase it fell off.
+
+The tolerances are FITTED from where surviving clip-arm episodes actually end, so the region can
+never be tighter than the tracker's own demonstrated ability and a miss is the generator's:
+
+```bash
+# 0a. an UNCALIBRATED spec, so the geometry gets recorded and the gate can be SEEN
+python scripts/rsl_rl/build_goal_regions.py --write_bootstrap logs/terrain_eval/<name>/goal_regions.bootstrap.json
+
+# 0b. LOOK AT IT. `--viz kit` is required: this IsaacLab defaults to headless, which never
+#     fires the debug-vis callback, so the gate silently does not draw.
+python scripts/rsl_rl/play.py --task=G1-tracker-clf-fm-terrain-depth-play --viz kit \
+    --load_run <teacher run> --fm_checkpoint <fm.pt> --clip <lib> --clip_device cpu \
+    env.commands.traj_ref.debug_vis_goal_regions=logs/terrain_eval/<name>/goal_regions.bootstrap.json
+
+# 0c. run the CLIP arm against it, then fit the real spec from where it finished
+python scripts/rsl_rl/eval/evaluate.py --stage grid --out logs/terrain_eval/<name> \
+    --goal_regions logs/terrain_eval/<name>/goal_regions.bootstrap.json --cells clip/train
+python scripts/rsl_rl/build_goal_regions.py logs/terrain_eval/<name> \
+    --out logs/terrain_eval/<name>/goal_regions.json
+```
+
+Then pass `--goal_regions .../goal_regions.json` to every cell. Three refusals guard the path,
+each because the alternative is a confident wrong number:
+
+* a table with no `reached_goal` column is **refused** under the spatial rule rather than
+  reduced under the temporal one (`--success_rule legacy_temporal` reads it explicitly);
+* a table whose column is zero everywhere -- what a cell run without `--goal_regions` looks
+  like -- is refused rather than reported as 0.000 success;
+* a table run under the **bootstrap** spec is refused, because its tolerances are placeholders.
+
+#### Recording closed-loop rollouts (`record_rollouts.py`)
+
+For fitting a value function on the generator's own behaviour, `scripts/rsl_rl/record_rollouts.py`
+rolls the frozen pair out and writes **two** tables:
+
+```bash
+PYTHONPATH=source/robot_rl:source/motion_gen python scripts/rsl_rl/record_rollouts.py \
+    --task=G1-tracker-clf-fm-terrain-depth-play \
+    --load_run <teacher run> --fm_checkpoint <fm.pt> \
+    --clip clips/<lib>.h5 --clip_device cpu \
+    --goal_regions logs/terrain_eval/<name>/goal_regions.json \
+    --num_envs 256 --num_windows 200000 --output_dir logs/rollouts/<name>
+```
+
+* `<stem>.h5` — one row per generator **re-plan**: the history tokens, the exteroception row
+  actually served (lag included), the command over the horizon, and the emitted chunk. All in
+  the generator's own window space, so nothing is reconstructed.
+* `<stem>.episodes.h5` — one row per **episode**: how it ended, including the spatial goal
+  columns. `rollout_outcomes.terminal_reward` states the reward rule in one place.
+
+The two join on **`episode_uid`**, assigned at reset and written into both. That column exists
+because the repo already had two episode counters and they are not each other — `collect_windows`
+keeps a per-ENV one, the eval accumulator assigns its own at harvest — so joining on either
+lines up different episodes, silently, for every env that has reset a different number of times.
+
+This is deliberately **not** `record_data.py`. That script records the TEACHER tracking clips
+and its node is 22 world-frame terms including four end-effector frames; a generator predicts
+three blocks and no end effectors, so on an FM-driven rollout that format cannot be filled
+(`get_future_world_frames` refuses outright).
+
+Two settings are asserted rather than defaulted, because each is silent when wrong:
+
+* **Gaussian flow noise.** At `x0 = 0` — the default in every deploy runtime and in MuJoCo —
+  the flow is deterministic, so every chunk drawn at a given state is identical and `A(s, a)`
+  collapses to `A(s)`: the label would say how hard the STATE was and nothing about which
+  ACTION was better. Isaac already defaults to Gaussian; the recorder makes it a property of
+  the recording.
+* **A calibrated (non-bootstrap) goal region**, for the reason in the previous section.
+
+**One gap to close on the next collection**, shared by every recording so far (v2 at 128 envs
+and v4 at 8192 were both taken on `-depth-play`):
+
+* `TODO(record-camera-dr)` — **the camera and the reference window see no DR.** The `-play`
+  task nulls all six depth-camera events (extrinsics, intrinsics, noise/dropout — per camera,
+  via `apply_depth_play_trims`, which nulls every event whose func lives in `mdp.events.depth`)
+  plus `randomize_ground_contact_friction`, and sets `enable_corruption = False` on both actor
+  obs groups. Only the seven `startup`-mode physical terms survive, and being `startup` they are
+  fixed for the run — so each env is a different robot but its draw is confounded with whichever
+  clips it got. Depth is the generator's only exteroception, so the critic has only ever scored a
+  perfect camera. **Do not fix this by switching to the train task**: it has no `clip_end`
+  termination (the play trims install it), so every episode would run the padded 20 s. The fix is
+  a recorder flag that undoes the DR half of the trims and nothing else.
+**One action draw per state is not on that list, deliberately.** No two rows share a state
+(spawn jitter, startup DR and flow noise all differ), and that is the ordinary situation in RL —
+`V` is fitted by regression *across* states, so its value at `s` comes from the neighbourhood
+rather than from repeats at `s`, and every standard actor-critic advantage estimator uses exactly
+one action sample per visited state. The lever is **coverage**, which is what 8192 envs bought and
+what the DR above is asking for. Repeats buy an empirical baseline in place of a learned one (the
+GRPO/RLOO idiom), which pays when the critic is the weak part and when a reset is free — neither
+holds here. The one place a paired sample really is needed is *measurement* of how much of an
+outcome is the noise draw, and `transfer/sim/fm_variance_probe.py` already answers that with no
+state restore at all: a fixed noise tape replayed from spawn in MuJoCo is exactly deterministic.
+
+Measured on the shipped pair: **24.3 kB per window** (f16 exteroception and height scan, f32
+plan), so ~6 GB per 250k windows.
+
+`--fall_min_height` defaults to **0.40 m**, not the historical 0.50. The deepest
+`jump_off_front` clip's own pelvis reaches 0.525 m and a well-tracking robot undershoots its
+reference by up to 60 mm, so at 0.50 a correctly tracking robot is terminated. **Numbers at the
+two thresholds are not comparable**; re-run both arms.
+
 `--quick` (3 tiles/family, 1 clip/tile) smoke-tests the whole pipeline in a couple of minutes.
 
 **A cell is `(reference_mode, dr_preset, fm_label)`.** `--fm_checkpoint` is repeatable, and the
@@ -377,6 +540,129 @@ plus `cell.json` (resolved DR, coverage proof, throughput). `report/` holds `rep
 `report.json` -- the text is rendered FROM the json, so nothing downstream ever parses prose --
 `summary_by_family.csv`, and `figures/` as png + svg + a caption sidecar carrying that figure's
 definitions.
+
+### 4c. What does the generator's own sampling variance do? `transfer/sim/fm_variance_probe.py`
+
+The eval says the generator arm sits well below the clip ceiling. This asks whether the flow's
+OWN draw decides the outcome -- which is what decides whether a method that sharpens the
+output distribution has any mass to select.
+
+One initial condition, one constant command, one REAL clip-library tile, N repeats, and the
+only difference between repeats is the flow-matching noise. No DR, no depth noise, no clip,
+and MuJoCo is deterministic, so a fixed seed reproduces bit-exactly. No GPU and no isaaclab --
+`env_transfer` is enough.
+
+```bash
+cd transfer/sim
+python fm_variance_probe.py \
+    --clip ../../logs/headroom/v1/eval_clips.h5 --terrain_id 6 --terrain_id 20 \
+    --tracker_onnx <run>/exported/tracker.onnx --fm_onnx <run>/exported/<fm>.onnx \
+    --speed 0.8 --trials 500 --out ../../logs/fm_variance/v1
+
+# the blocking control: x0 = 0 every trial, so the spread must be EXACTLY zero
+python fm_variance_probe.py ... --trials 5 --zero_noise_control --out .../ctrl
+```
+
+`terrains.isaac_tile_course` turns one library tile into an mjeval `Course` by reading the
+`terrain_manifest` -- the artifact the clip generators emit and the Isaac importer re-reads --
+so the terrain is IN distribution and the variance measured is not confounded with perceptive
+distribution shift. Every other course in that module is deliberately not a trained tile,
+which is right for a bisect and wrong here.
+
+**Measured on the deployed pair: ~20% of draws fall at 0.8 m/s and ~35% at 1.6 m/s, from a
+state where the rest walk through.** The outcome is bimodal rather than a graded spread, start
+position does not matter, and the deterministic `x0 = 0` draw the hardware runs sits at the
+good end except on stairs-up at 1.6 m/s. See CLAUDE.md for the full table and the fall-location
+breakdown.
+
+**`--scene_tag` is mandatory when running two of these concurrently on one tile**: `CourseRig`
+rewrites `robots/g1/<robot>_<course>.xml` before loading it, and a speed sweep shares geometry,
+so the race tears the file silently. The generated scenes are derived and not committed.
+
+### 4c. Fine-tune on FREE-FORM terrain
+
+> **Looking for the AWR / filtered-BC generator fine-tune?** That is a different pipeline and
+> it lives in **[`scripts/flow_matching/FINETUNE.md`](scripts/flow_matching/FINETUNE.md)** --
+> `run_finetune_loop.sh`, the four algorithms, the terrain libraries and their fingerprints,
+> the eval entry point, and **which generator every published number was fine-tuned from**.
+> Nothing in this section calls `finetune_generator.py`; what follows is the TEACHER's PPO
+> fine-tune on free-form ground, which is a prerequisite for it rather than the same thing.
+
+`G1-teacher-clf-terrain-depth-finetune-freeform` runs the generator-graded fine-tune on
+terrain that **no clip was ever generated for**. Every other library here exists to match one
+recorded motion per tile; under `reference_source="fm"` the reference is predicted from the
+cameras, so that constraint is gone and the ground can be free-form -- larger flat extents,
+boxes met off-square, and straight staircases with 1-15 steps per flight, four flights per
+section, each independently up or down.
+
+The terrain ships as a **manifest-only `.h5`** -- terrain and zero clips -- and is still
+passed with `--clip`, which points the importer and the command at one file as always.
+
+```bash
+# 1. Author the terrain (no simulator, seconds). Half the stair tiles are sampled from the
+#    building-code box (IBC / IRC / OSHA, Blondel-coupled) and half from the grid the shipped
+#    library actually used; the manifest records WHICH per tile, so the two can be reported
+#    apart. --like copies an existing library's channel layout.
+python scripts/rsl_rl/make_freeform_terrain.py \
+    --out clips/freeform_v1.h5 --seed 0 --flat 8 --boxes 16 --stairs 24
+
+# 2. Fine-tune a trained depth teacher on it, against a FROZEN generator.
+python scripts/rsl_rl/train.py --task G1-teacher-clf-terrain-depth-finetune-freeform \
+    --clip clips/freeform_v1.h5 \
+    --load_run <teacher run> --resume \
+    --fm_checkpoint logs/flow_matching/<fm run>/best.pt \
+    --num_envs 1024 --headless
+```
+
+What the clip stops supplying, and what replaces it:
+
+| the clip supplied | the free-form task uses |
+|---|---|
+| the terrain mesh | the same `ClipTerrainImporter`, on the manifest-only library |
+| the spawn pose | `mdp.reset_on_freeform_section` -- each section's `route` block |
+| `target_vel` | `FmTrackingCommandCfg.freeform_command` -- a per-episode speed draw after a 0.5 s standing hold, `vy = 0`, and a yaw-rate P controller aiming down the section |
+| `clip_end` | `mdp.freeform_goal_reached` -- the section's goal band, a truncation |
+| the critic's global drift | `tracking_error_global(datum="plan_anchor")` -- same width, so a teacher checkpoint still resumes with no surgery |
+
+**Three distribution changes ride along. None is free, and each is deliberate:**
+
+* **Steering is off-distribution on a staircase.** The generator was commanded `|wz| max =
+  0.0000` over all 3500 stair clips of the library it was fitted on, and it is frozen here, so
+  on a flight it is extrapolating in yaw rate. It is on anyway because nothing else in the loop
+  steers and these sections are tens of metres long -- without it, accumulated heading error
+  walks the robot off the side of the flight and what gets measured is the drift.
+* **The command is held across the window offsets**, where the clip path served a per-offset
+  future. That direction removes a train/deploy mismatch (both deploy runtimes hold one command
+  over the whole horizon), but the tracker's reference encoder now sees 13 copies of one row.
+* **The stairwell walls collide** -- they join the ground mesh and appear in the height scan,
+  where the decoration the generator was fitted on did neither. Nothing in this stack avoids
+  obstacles, so a scan-conditioned number measured here is not comparable to one measured on a
+  clip library.
+
+**A zero-clip library is a defined thing, in three places.** `FmTrackingCommand` inherits
+`MotionSequenceCommand`, which builds a `MotionClipManager` at construction and used to raise
+on such a library (`clip_len_or_full` -> `num_steps` -> `y_des.shape[1]`, IndexError). What
+makes it work is not a special case in the task cfg:
+
+* the WRITER emits the clip datasets at zero extent but full RANK (`ClipLibraryWriter` at
+  `num_clips=0`; it drops the per-clip chunking, which h5py refuses on a zero-extent axis, and
+  keeps the shapes), so `num_steps` is a real number and the manager constructs;
+* the MANAGER answers every layout question and REFUSES every gather by name
+  (`MotionClipManager._require_clips`), so a clip-consuming term left wired on this task fails
+  saying so rather than indexing an empty table or returning an empty tensor;
+* the COMMAND skips the clip half of the step (`_advance_without_a_clip`), keeping only the
+  plan-anchor latch, so `self._step` never marches and `as_clip_reference()` is refused.
+
+The permission is per configuration (`accepts_clip_free_library`, true only under
+`reference_source="fm"`), and the four clip-phase knobs -- `history_from`,
+`seed_history_from_clip`, `random_start_phase`, `random_start_before_terrain_start` -- are
+refused at construction if left on, because three of them would otherwise fail only at the
+first reset and one would never fail at all.
+
+**Pass `--like <a real clip library>` when generating it.** The FM checkpoint's `frame_names`
+are checked against the ee frames resolved from the library's OWN channel names, so the
+minimal 7-channel layout admits only a generator with no extra frames. `--like
+clips/g1_mb_v5_body_mode11_decor.h5` gives the shipped 155/137-channel, 29-joint layout.
 
 ### 5. Hardware
 

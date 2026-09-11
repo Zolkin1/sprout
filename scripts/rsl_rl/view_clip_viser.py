@@ -36,7 +36,7 @@ from motion_gen.joint_names import is_root_frame
 from motion_gen.clips.clip_io import (
     load_clip_library,
 )
-from robot_rl.flow_matching.viz.robot import load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
+from robot_rl.flow_matching.viz.robot import DEFAULT_URDF, load_urdf, recording_to_urdf_perm, xyzw_to_wxyz
 from robot_rl.tasks.manager_based.robot_rl.terrains.blocks.overlay import overlay_sub_boxes
 
 # Distinct colours (RGB 0-1) cycled across reference frames.
@@ -60,7 +60,7 @@ _KEYFRAME_ALPHA = 0.55
 # what Motion Bricks was asked to reach, while its PLACE is wherever the commanded velocity happened to
 # put it -- not where the terrain is.  Gold ghosts (our steady stride) are pose-only by design.
 _KEYFRAME_TERRAIN_COLOR = (0.90, 0.25, 0.20)
-_DEFAULT_URDF = "robot_assets/g1/g1_21j/g1_21j.urdf"
+_DEFAULT_URDF = DEFAULT_URDF
 
 
 def _load_keyframe_sidecar(path: str, urdf) -> dict[int, dict]:

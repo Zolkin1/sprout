@@ -53,6 +53,21 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     immediately hit ``clip_end_reached``). Ignored when ``random_start_phase``
     is False."""
 
+    random_start_before_terrain_start: bool = False
+    """Draw the random start BEFORE the terrain begins, so every episode opens on flat.
+
+    For a generator-driven run this is about the learned ``null_history`` embedding, which
+    covers the first N steps of every episode and is fitted overwhelmingly on flat ground --
+    which is also how the robot starts on hardware. Opening already on terrain asks it for the
+    one case it never saw.
+
+    A clip with no flat lead-in (``terrain_start_step`` at or near 0, i.e. the ``*_pure``
+    stair families and a few ``jump_off*`` clips) cannot satisfy this; those start as early as
+    the history allows instead, and are the ones
+    :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.seed_history_from_clip` covers.
+
+    Independent of :attr:`random_start_before_terrain_end`, which bounds the other end."""
+
     random_start_before_terrain_end: bool = True
     """Cap the random start at the last frame of the clip's terrain-PINNED run.
 
@@ -159,11 +174,38 @@ class MotionSequenceCommandCfg(BaseTrajectoryCommandCfg):
     """Radius (m) of the tracked-body spheres."""
 
     debug_vis_obs_window: bool = True
-    """Draw a ribbon along the base of the reference window the POLICY observes.
 
-    Distinct from the clip ribbon, which is drawn at the clip's GLOBAL placement: this one
-    is anchored, so it rides the robot.  The separation between the two ribbons is exactly
-    the accumulated drift -- the thing the reward forgives and the termination fires on."""
-    """Whether to draw the hand/wrist end-effector frames in the debug ribbon.
-    Off by default (pelvis + feet are usually what matters); set True to also
-    visualize the wrist trajectories."""
+    #: Path to a ``goal_regions.json`` (see ``scripts/rsl_rl/build_goal_regions.py``). When
+    #: set, the debug visualiser draws each env's GOAL REGION as a translucent gate: a slab
+    #: at the region's near face, spanning its lateral band and its height band, square to
+    #: the terrain frame.
+    #:
+    #: This exists to be LOOKED AT before anything is measured. The region is the only
+    #: spatial success test in the tracker task -- every other outcome signal compares step
+    #: indices -- and the ways it can be subtly wrong all produce a perfectly plausible
+    #: number: the wrong yaw frame shows only on tiles whose heading is not world-x, an
+    #: anchor taken at the clip's padded tail rather than at ``last_usable_step`` sits a
+    #: whole observation window too far downrange, and a band whose height is off puts the
+    #: gate under the terrain. None of those is visible in a table.
+    #:
+    #: **The DEFAULT tolerances are drawn, not any per-family override.** The thing worth
+    #: eyeballing is the anchor and the frame, which are family-independent; read the JSON
+    #: for a family's own numbers.
+    #:
+    #: **``play.py`` needs ``--viz kit``.** This IsaacLab defaults to headless ("No
+    #: visualizer was selected, so running in headless mode"), and headless never fires
+    #: ``_debug_vis_callback`` at all -- so the gate silently does not draw, along with every
+    #: other debug marker. That reads exactly like a region placed somewhere off screen,
+    #: which is the one conclusion this visualiser must not allow. ``--video`` does not
+    #: substitute: it renders offscreen without firing the callback either.
+    #:
+    #: Empty = off, which is every existing task.
+    debug_vis_goal_regions: str = ""
+    """Path to a ``goal_regions.json`` whose regions to draw; empty = off.
+
+    The two docstrings that used to sit here belonged to OTHER fields -- one to
+    :attr:`debug_vis_obs_window` above, and one to a ``debug_vis_ee_frames`` that no longer
+    exists -- so this flag was documented as "draw a ribbon along the base of the reference
+    window", which is not what it does. Nothing read the missing field, so the only cost was
+    the wrong description on the flag a reader reaches for. See the ``#:`` comments above for
+    what this actually draws and why it needs ``--viz kit``."""

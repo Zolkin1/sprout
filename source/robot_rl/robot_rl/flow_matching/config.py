@@ -89,8 +89,29 @@ EXTERO_NORM_MODES: tuple[str, ...] = ("contract", "per_channel", "per_sensor", "
 #: prints the band it resolved.
 EXTERO_CLIP: dict[str, float] = {"height_scan": 1.0, "depth": 5.575}
 
+#: Clip families dropped from FM training unless the caller says otherwise
+#: (:attr:`FlowMatchingConfig.skip_families`).
+#:
+#: ``family_jump_off`` is the BACKWARDS jump-off-a-box family. The robot has two
+#: FORWARD-facing depth cameras and nothing behind, so the drop it is stepping off is not
+#: observable at all -- those windows ask the generator to predict something it cannot see.
+#: The eval harness measured them contaminating the exposure-bias diagnostic as well: teacher
+#: forcing buys +0.078 overall, +0.026 with ``jump_off`` removed and +0.006 with both jump
+#: families removed.
+#:
+#: ``family_jump_off_front`` is the FORWARD dismount and IS observable. Do not add it here.
+#:
+#: A name in this default is a REQUEST -- drop it where it exists, say so where it does not.
+#: A name the caller typed is an ASSERTION and is enforced; see ``train.py``'s
+#: ``_resolve_skip_families``.
+DEFAULT_SKIP_FAMILIES: tuple[str, ...] = ("family_jump_off",)
+
 #: Recognised :attr:`FlowMatchingConfig.attention_mode` values.
 ATTENTION_MODES: tuple[str, ...] = ("full", "prefix")
+
+#: What the ``N`` history rows contain; see :attr:`FlowMatchingConfig.history_source`. Same
+#: row WIDTH under either value, which is why the choice has to travel in the artifact.
+HISTORY_SOURCES: tuple[str, ...] = ("reference", "measured")
 
 #: Config keys renamed when the exteroception contract stopped being height-scan-shaped:
 #: old name -> new name. Applied by :meth:`FlowMatchingConfig.from_dict`, so a checkpoint
@@ -200,6 +221,29 @@ class FlowMatchingConfig:
     # continued rather than a state being read -- more of the recent trajectory to
     # extrapolate from, and 0.08 s of it instead of 0.04 s.
     num_history_states: int = 4
+
+    #: What the ``N`` history rows CONTAIN. The width is identical either way, so a
+    #: mislabelled checkpoint runs silently under the wrong conditioning -- the same class of
+    #: failure as ``window_anchor`` and ``attention_mode``, and the reason it is stamped into
+    #: ``fm_meta``, printed at load, and refused by both runtimes against their own
+    #: ``history_from``.
+    #:
+    #: * ``"reference"`` (default, and what every checkpoint before this flag trained on) --
+    #:   the APPLIED REFERENCE at each of those steps, from the recording's ``history_ref``.
+    #:   At deploy the matching arm is ``history_from="generator"``: the node the runtime
+    #:   served is the reference it applied, so the two are the same kind of quantity.
+    #: * ``"measured"`` -- the ROBOT'S OWN achieved state, from ``depth_lag_state``, except
+    #:   the blocks no robot can supply (``window.MEASURED_HISTORY_FALLBACK``: the base
+    #:   position and linear velocity), which come from ``history_ref`` here and from the
+    #:   served node at deploy -- again the same kind of quantity on both sides. Pairs with
+    #:   ``history_from="measured"``.
+    #:
+    #: ``"measured"`` needs ``depth_lag_state``, which covers lags ``0..depth_lag_steps``,
+    #: and the history rows are lags ``num_history_states..1`` -- so it constrains
+    #: ``num_history_states <= depth_lag_steps``. On the shipped recordings that is 3, and
+    #: :meth:`resolve_history_source` refuses rather than truncating.
+    history_source: str = "reference"
+
     stride: int = 1
     val_fraction: float = 0.1
     precompute: bool = True
@@ -234,12 +278,18 @@ class FlowMatchingConfig:
     # same reason skip_distractors is one: the recording tags every window with its family,
     # so A/B-ing a family costs no re-record.
     #
-    # The case this exists for: "family_jump_off" is the BACKWARDS jump-off-a-box family, and
-    # the depth cameras face forward -- the drop behind the robot is not observable, so those
-    # windows ask the generator to predict something it cannot see. Errors (rather than
-    # silently training on them) if the recording predates the tag, or if a named family is
-    # not in the recording at all -- a typo would otherwise read as "nothing to drop".
-    skip_families: list[str] | None = None
+    # Defaults to DEFAULT_SKIP_FAMILIES -- see there for why jump_off is unobservable. A
+    # CONCRETE list rather than None, so the saved config states exactly what was dropped and
+    # a later change to the default cannot silently re-resolve an old checkpoint (the trap
+    # ``extero_clip=None`` already walked into once).
+    #
+    # Strictness is asymmetric, and train.py's ``_resolve_skip_families`` is where it lives:
+    # a DEFAULTED name that the recording does not carry prints a line and drops nothing (a
+    # flat-only library has no family table at all, and refusing to train on one would be
+    # wrong); a name the caller TYPED must be present, because a typo would otherwise read as
+    # "nothing to drop", i.e. as success. Dropping every window is an error either way.
+    # ``--skip_families ""`` is the off switch.
+    skip_families: list[str] = field(default_factory=lambda: list(DEFAULT_SKIP_FAMILIES))
 
     # Oversample windows that CROSS a terrain transition until they are this fraction of each
     # training epoch (e.g. 0.5). ``None`` = natural distribution, which on the v5 library is
@@ -690,6 +740,47 @@ class FlowMatchingConfig:
     # differed; here it cannot. ``from_dict``'s default below is the only guard.
     attention_mode: str = "prefix"
 
+    # -- advantage conditioning (the fine-tune arm) --
+    # When True the model carries an extra `nn.Embedding(3, d_model)` added to the flow-time
+    # embedding, taking a label in {negative, positive, null} (see `flow_matching.advantage`).
+    # The embedding is ZERO-INITIALISED, so converting a pretrained generator is bit-identical
+    # under every label -- the conversion is verifiable rather than merely plausible.
+    #
+    # Defaults False, and `from_dict` below does NOT let an absent key pick up a later
+    # default: a pre-flag checkpoint has no embedding in its state dict, so `strict=True`
+    # would refuse it, and that refusal is the correct behaviour rather than a nuisance.
+    advantage_cond: bool = False
+
+    # HOW the label reaches the network, and the two are not interchangeable artifacts.
+    #   `time_embed`   -- added to the flow-time embedding. Zero-init makes the conversion
+    #                     exactly inert and `prefix_len` does not move, so the ONNX shapes and
+    #                     the prefix cache are untouched. MEASURED INADEQUATE on this data:
+    #                     across three configurations (1x and 50x embedding lr, and a 10x
+    #                     whole-model lr that demonstrably moved the model by half a sampling
+    #                     noise draw) the label changed the served window by only 0.3-0.7% of
+    #                     ordinary flow-noise variation. The bottleneck is not magnitude.
+    #   `prefix_token` -- its own token in the conditioning prefix, with its own type
+    #                     embedding and its own attention weights at every layer, so it can
+    #                     modulate WHICH conditioning the future tokens attend to rather than
+    #                     applying one shared additive shift. This is the form the pi/RECAP
+    #                     line of work uses. It costs what the additive form was chosen to
+    #                     avoid: `prefix_len` grows by one, so the exported graph's shapes
+    #                     differ and a checkpoint of one kind cannot be served by the other's
+    #                     graph -- which is why this rides in the artifact and is checked.
+    advantage_inject: str = "time_embed"
+
+    # WHICH label a conditioned checkpoint is SERVED with in simulation. `advantage_cond`
+    # says the model can take a label; this says which one to ask for, and it travels in the
+    # artifact for the same reason `attention_mode` and `extero_clip` do -- a label is not
+    # recoverable from the weights, and serving the wrong one produces a perfectly plausible
+    # generator that is simply not the arm you meant to measure.
+    #
+    # It is the `.pt` twin of `fm_meta.advantage_label`, which the ONNX export bakes into the
+    # graph. `load_fm_context` REFUSES a conditioned checkpoint that does not state one
+    # rather than defaulting: `null` and `positive` are both valid arms, so a default would
+    # make the deliverable and a control indistinguishable at the call site.
+    advantage_serve_label: str | None = None
+
     # -- observation noise (train-time augmentation on the clean history tokens) --
     # Mirrors the RL teacher/tracker obs corruption (Unoise per term): the inputs the
     # generator conditions on at deployment come from noisy sensors, so the first
@@ -1011,6 +1102,42 @@ class FlowMatchingConfig:
             raise ValueError(f"extero_clip must be positive, got {band}.")
         return band
 
+    def check_history_source(self, available_lags: int | None = None) -> None:
+        """Validate :attr:`history_source` and, for ``"measured"``, that the lags exist.
+
+        The history rows are lags ``num_history_states .. 1``, and ``depth_lag_state``
+        carries lags ``0 .. depth_lag_steps``. So a measured build needs
+        ``num_history_states <= depth_lag_steps``.
+
+        REFUSES rather than truncating ``N``, which is the tempting repair: silently
+        training a 3-row model when 4 were asked for would produce a checkpoint whose
+        ``num_history_states`` disagrees with its own weights, and every runtime reads that
+        field to size the ring.
+
+        Args:
+            available_lags: ``depth_lag_steps`` of the recording being built from -- i.e. the
+                largest lag present, so ``depth_lag_state.shape[1] - 1``. ``None`` skips the
+                coverage half (nothing to check it against yet).
+
+        Raises:
+            ValueError: On an unknown source, or a measured build the recording cannot fill.
+        """
+        if self.history_source not in HISTORY_SOURCES:
+            raise ValueError(
+                f"history_source={self.history_source!r} is not one of "
+                f"{sorted(HISTORY_SOURCES)}.")
+        if self.history_source != "measured" or available_lags is None:
+            return
+        n = int(self.num_history_states)
+        if n > int(available_lags):
+            raise ValueError(
+                f"history_source='measured' needs the measured state at lags {n}..1, but "
+                f"this recording's depth_lag_state only covers lags 0..{available_lags}. "
+                f"Either train with num_history_states <= {available_lags}, or re-record "
+                "with a larger DEPTH_LAG_STEPS. Refusing rather than shortening N, which "
+                "would leave the checkpoint's own num_history_states disagreeing with its "
+                "weights.")
+
     def check_extero_norm_mode(self) -> None:
         """Raise if :attr:`extero_norm_mode` is not one of the three supported modes."""
         if self.extero_norm_mode not in EXTERO_NORM_MODES:
@@ -1163,4 +1290,21 @@ class FlowMatchingConfig:
         # full-attention, so an absent key must resolve to "full" and never to the current
         # default -- which is exactly the mistake this file has now recorded three times.
         kwargs.setdefault("attention_mode", "full")
+        # A FOURTH instance of the same trap, and the reason it is spelled out again: a
+        # checkpoint written before jump_off became a default exclusion carries
+        # ``skip_families: null``, which MEANT "drop nothing". Letting that resolve to the
+        # current default would restate, as a property of that checkpoint, a decision taken
+        # after it was trained -- and its saved config is the only record of what its data
+        # actually contained. An ABSENT key gets the same reading for the same reason.
+        # Unlike the three above this cannot corrupt inference (nothing off-line reads it),
+        # but it is the sole provenance of a training set, so it must not drift.
+        if kwargs.get("skip_families") is None:
+            kwargs["skip_families"] = [] if "skip_families" in renamed else list(DEFAULT_SKIP_FAMILIES)
+        # A FIFTH instance, and this one CAN corrupt inference. A checkpoint written before
+        # ``history_source`` existed was trained on the applied reference, definitionally --
+        # the measured path did not exist. So an absent key resolves to "reference" and never
+        # to whatever the default becomes later. The rows are the same width under either
+        # value, so a wrong reading here is a generator fed the wrong kind of history with
+        # nothing anywhere to notice.
+        kwargs.setdefault("history_source", "reference")
         return cls(**kwargs)

@@ -34,13 +34,14 @@ from isaaclab.utils import configclass
 from .g1_teacher_env_cfg import G1TeacherObservationsCfg
 from .g1_teacher_terrain_env_cfg import G1TeacherTerrainBodyEnvCfg, G1TeacherTerrainBodyEnvCfgPlay
 
-#: Action-rate penalty for the runs queued 2026-08-21, 10x the ``-0.01`` every teacher
-#: inherited from :class:`~.g1_clf_tracking_base.G1ClfTrackingRewardCfg`.
-#:
-#: Shared with the depth teacher so the two arms stay comparable -- a different smoothness
-#: cost on each would confound the blind-vs-camera comparison this config exists for. Kept as
-#: one named constant rather than two literals for the same reason.
-ACTION_RATE_WEIGHT = -0.1
+#: Action-rate penalty, back to the ``-0.01`` every teacher inherits from
+#: :class:`~.g1_clf_tracking_base.G1ClfTrackingRewardCfg`. It was raised 10x for the runs
+#: queued 2026-08-21 and is returned here, so this constant no longer overrides the base --
+#: it is kept, rather than deleted, because it is what holds the blind and depth arms to the
+#: SAME smoothness cost. A different one on each would confound the blind-vs-camera
+#: comparison these configs exist for, and that is a property worth stating even when the
+#: value happens to match the default.
+ACTION_RATE_WEIGHT = -0.01
 
 
 @configclass

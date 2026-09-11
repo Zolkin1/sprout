@@ -51,6 +51,7 @@ recording's, because env origins enter the tile layout.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -83,7 +84,8 @@ parser.add_argument("--yaw", type=float, default=0.15,
                     help="Symmetric +- bound (rad) on heading. The mask PINS yaw on terrain, "
                          "so a yaw offset is a correction the generator must undo.")
 parser.add_argument("--max_source", type=int, default=0,
-                    help="Cap source windows processed (0 = all). Augmented output is this "
+                    help="Cap source windows processed (0 = all), sampled EVENLY across the "
+                         "recording rather than as a prefix. Augmented output is this "
                          "times --num_augments.")
 parser.add_argument("--batch", type=int, default=0,
                     help="Windows per render pass (0 = use num_envs).")
@@ -103,6 +105,46 @@ parser.add_argument("--quat_wxyz", action="store_true",
                     help="Write the root quaternion permuted to wxyz. A/B for the convention: "
                          "the recording states xyzw, the sim API's expectation is what this "
                          "settles empirically against a DR-free delta-0 check.")
+parser.add_argument("--source_slice", default="", metavar="K/N",
+                    help="Render slice K of N: every Nth source window, starting at K. The "
+                         "N slices PARTITION the recording, so rendering each under a "
+                         "different variant buys N visual conditions for the size of one "
+                         "pass. Strided rather than chunked on purpose -- the recording is "
+                         "written env-batch by env-batch, so a contiguous fifth would hand "
+                         "one variant the openings of episodes and another their ends. "
+                         "Note what this does NOT give: a window appears under ONE variant, "
+                         "so there is no same-window-different-scenery pair. What makes it "
+                         "work is that every TILE still appears under every variant, which "
+                         "is what stops scenery predicting terrain.")
+parser.add_argument("--source_rows", default="", metavar="i,j,k",
+                    help="Render ONLY these source window indices, in this order. For "
+                         "looking at a handful of hand-picked frames: --max_source spreads "
+                         "over the whole recording, so getting a few frames that show a "
+                         "particular thing means rendering thousands that do not. Rows can "
+                         "be chosen offline against the source recording's own depth, with "
+                         "no simulator.")
+parser.add_argument("--render_resolution", default="", metavar="WxH",
+                    help="Re-render the generator's depth at a DIFFERENT resolution from the "
+                         "recording's. This deliberately breaks the reproduce-the-source "
+                         "rule every other mode obeys, so it is opt-in and the output is a "
+                         "new contract rather than a copy: the written "
+                         "depth_camera_spec and depth shape are the ones actually rendered. "
+                         "For choosing a resolution by looking at the images; a generator "
+                         "sampling a different grid from the tracker CANNOT ship (the ZEDs "
+                         "publish one resolution and export_sensor_configs refuses a split).")
+parser.add_argument("--clutter", default=None, metavar="SIDECAR.json",
+                    help="Re-render against a visual-clutter variant "
+                         "(scripts/rsl_rl/author_clutter.py) instead of displacing the robot. "
+                         "Implies --visual_only. The sidecar is merged into the SAME library "
+                         "the recording names, and adds only ``decor`` overlays, so the "
+                         "ground mesh and every tile corner are unchanged and the recorded "
+                         "world poses stay exactly as valid as they were -- which is the "
+                         "whole reason a recording can be re-rendered at all.")
+parser.add_argument("--visual_only", action="store_true",
+                    help="Change ONLY what the cameras see: re-render every window at its own "
+                         "recorded pose, with no displacement and no reference arithmetic. "
+                         "The output differs from the input in depth alone, which is what "
+                         "makes the pair a controlled A/B rather than two different datasets.")
 parser.add_argument("--augment_flat", action="store_true",
                     help="Also augment windows with NO terrain in their horizon. OFF by "
                          "default and it should stay off: a flat segment is anchor-mask 35 "
@@ -119,15 +161,39 @@ AppLauncher.add_app_launcher_args(parser)
 args_cli = parser.parse_args()
 args_cli.enable_cameras = True
 
+if args_cli.clutter and "--num_augments" not in sys.argv:
+    # Clutter alone is the controlled A/B: the pair differs in pixels and nothing else.
+    # Asking for --num_augments explicitly is the opt-in to ALSO displace the robot, which
+    # is a training pass rather than a measurement -- and it brings the penetration filter
+    # with it, since the clutter was vetted against the RECORDED path, not a displaced one.
+    args_cli.visual_only = True
+if args_cli.visual_only:
+    if args_cli.check_only:
+        raise SystemExit("--visual_only and --check_only are the same pass with and without a "
+                         "writer; pick one. --check_only reports the delta and writes "
+                         "nothing, --visual_only writes the re-rendered recording.")
+    # The displacement bounds DEFAULT to non-zero, so the test is whether they were asked
+    # for, not whether they are set. Inheriting a default is not intent; typing the flag is.
+    _asked = [n for n in ("downrange", "lateral", "yaw") if f"--{n}" in sys.argv]
+    if _asked:
+        raise SystemExit(
+            f"--visual_only was given {_asked} explicitly. Displacing the robot AND changing "
+            "the scene is a legitimate pass, but the two together make an augmented pair that "
+            "differs in two variables, so neither can be attributed -- ask for it in a "
+            "separate run rather than by combining flags here.")
+    args_cli.downrange = args_cli.lateral = args_cli.yaw = 0.0
+
 app_launcher = AppLauncher(args_cli)
 simulation_app = app_launcher.app
 
 import gymnasium as gym  # noqa: E402
 import numpy as np  # noqa: E402
+from dataclasses import replace  # noqa: E402
 import torch  # noqa: E402
 from isaaclab_tasks.utils import parse_env_cfg  # noqa: E402
 
 from isaaclab.managers import SceneEntityCfg  # noqa: E402
+from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg  # noqa: E402
 
 # After the SimulationApp, or the per-link contact sensors find no bodies (same as play.py).
 import robot_rl.sensors._recursive_contact_sensor_impl  # noqa: F401,E402
@@ -142,6 +208,7 @@ from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: E402
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 from motion_gen.clips.clip_io import load_clip_library  # noqa: E402
+from motion_gen.terrain.clutter import windows_that_penetrate  # noqa: E402
 from recorded_data_io import (  # noqa: E402
     RecordedWindowWriter,
     load_recorded_windows,
@@ -280,6 +347,12 @@ def main() -> int:
     terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
     if terrain is not None and hasattr(terrain, "clip_library_path"):
         terrain.clip_library_path = lib
+        if args_cli.clutter:
+            # The importer merges the sidecar itself, and verifies it was authored against
+            # this library. Nothing about the ground changes, so the sha check above -- which
+            # exists because the recorded poses are absolute world -- still holds and still
+            # means what it says.
+            terrain.decor_overlay_path = args_cli.clutter
     if args_cli.no_depth_dr:
         # DERIVED from the event functions rather than a name list. An earlier hardcoded guess
         # ("randomize_depth_mount_*") matched nothing, so camera EXTRINSICS/INTRINSICS
@@ -296,20 +369,44 @@ def main() -> int:
             raise SystemExit("--no_depth_dr: this task declares no depth DR events at all; "
                              "either it is not a depth task or the events moved module.")
         print(f"[augment] depth DR OFF: {killed}")
-    # A re-render must reproduce the SOURCE exactly, so the resolution comes from the
-    # recording's own camera contract -- not from a flag, and not from whatever the task
-    # happens to default to. When the recording was made at the generator's own resolution
-    # (record_data.py --fm_depth_resolution), that means building the same second pair here.
+    # A re-render must reproduce the SOURCE exactly, and that includes the visual-only
+    # decoration. The teacher's TRAINING scene renders none of it while the -play chain does,
+    # and record_data.py forces it on for every recording -- so re-rendering on the bare
+    # train task would replace walls with sky in an image the FM was fitted on, at the exact
+    # displaced poses this script exists to measure.
+    _terrain = getattr(getattr(env_cfg, "scene", None), "terrain", None)
+    if _terrain is not None and hasattr(_terrain, "render_decor"):
+        _terrain.render_decor = True
+
+    # The resolution comes from the recording's own camera contract -- not from a flag, and
+    # not from whatever the task happens to default to. When the recording was made at the
+    # generator's own resolution (record_data.py --fm_depth_resolution), that means building
+    # the same second pair here.
     _rec_cams = list(getattr(meta, "depth_camera_spec", None) or [])
-    if _rec_cams:
+    _want_res = None
+    if args_cli.render_resolution:
+        try:
+            _w, _h = (int(v) for v in args_cli.render_resolution.lower().split("x"))
+        except ValueError:
+            raise SystemExit(f"--render_resolution {args_cli.render_resolution!r} must be WxH")
+        _want_res = (_w, _h)
+    # The group goes on UNCONDITIONALLY, resolution or not. A recording is made from the
+    # GENERATOR's cameras and the policy now reads only the near one, so without the group
+    # ``mdp.fm_depth_groups`` below falls back to "every group" and this would re-render one
+    # camera into a two-camera recording. That is caught by the resolution comparison a few
+    # lines down, but only because the LIST lengths differ -- and it is not a difference the
+    # re-render should ever be asked to notice.
+    if any(isinstance(_s, MultiMeshRayCasterCameraCfg) for _s in vars(env_cfg.scene).values()):
         _res = {(int(c["width"]), int(c["height"])) for c in _rec_cams}
-        if len(_res) != 1:
+        if not _want_res and len(_res) > 1:
             raise SystemExit(f"the recording's cameras sample at {sorted(_res)}; one "
                              "recording's cameras share one resolution.")
         from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
-            add_fm_depth_pair,
+            install_fm_depth_group,
         )
-        add_fm_depth_pair(env_cfg, *_res.pop())
+        # No stated resolution (a scan-only recording re-rendered on a depth task) means
+        # the scene's own grid, which is the only thing that could reproduce it.
+        install_fm_depth_group(env_cfg, *(_want_res or (_res.pop() if _res else (None, None))))
 
     # Same for the generator's own dense scanner, and for the same reason: the recording was
     # made on a task PLUS `record_data.py --fm_height_scan`, so the bare task carries only the
@@ -360,7 +457,10 @@ def main() -> int:
         _live = mdp.depth_camera_specs(u, _render_groups)
         _live_res = [(int(c["width"]), int(c["height"])) for c in _live]
         _rec_res = [(int(c["width"]), int(c["height"])) for c in _rec_spec]
-        if _live_res != _rec_res:
+        if _live_res != _rec_res and args_cli.render_resolution:
+            print(f"[augment] rendering at {_live_res}, NOT the recording's {_rec_res}. The "
+                  "output is a new camera contract, not a reproduction of the source.")
+        elif _live_res != _rec_res:
             raise SystemExit(
                 f"this task samples depth at {_live_res} but the recording was made at "
                 f"{_rec_res}. A re-render must reproduce the source EXACTLY -- pass "
@@ -446,6 +546,34 @@ def main() -> int:
     with h5py.File(lib, "r") as _lf:
         clip_tid = _lf["terrain_id"][:]
     env_tyaw = to_torch(terr.env_terrain_yaw).detach().cpu().numpy().reshape(-1)
+    # Tile-local origin per env, for the clutter penetration filter. Tile meshes are emitted
+    # AXIS-ALIGNED and translated onto their corner, so tile-local xy is world xy minus this
+    # -- there is no rotation to undo, and env_terrain_yaw is the anchor mask's frame, not
+    # the mesh's.
+    env_corner = to_torch(terr.env_cell_corner).detach().cpu().numpy().reshape(-1, 3)
+    sizes_by_tid: dict[int, tuple[float, float]] = {}
+    _fpt = to_torch(terr._tile_footprint).detach().cpu().numpy().reshape(-1, 2)
+    _tid_flat = to_torch(terr._tile_terrain_id).detach().cpu().numpy().reshape(-1)
+    for _i, _t in enumerate(_tid_flat):
+        sizes_by_tid.setdefault(int(_t), (float(_fpt[_i, 0]), float(_fpt[_i, 1])))
+    clutter_boxes: dict[int, list] = {}
+    if args_cli.clutter and not args_cli.visual_only:
+        with open(args_cli.clutter) as _cf:
+            _side = json.load(_cf)
+        # Two sidecar schemas reach here and they carry the per-tile payload differently:
+        # schema 1 maps a tile to a LIST of boxes, schema 2 to an edit BLOCK. What this
+        # filter wants either way is the volumes a displaced robot must not be put inside,
+        # which for a ground variant is its added DECORATION -- the walkable edits are
+        # ground, and displacing onto ground is the normal case, not a penetration.
+        if int(_side.get("schema", 1)) == 2:
+            clutter_boxes = {int(k): [o for o in (blk.get("add") or []) if o.get("decor")]
+                             for k, blk in _side["per_terrain_id"].items()}
+            clutter_boxes = {k: v for k, v in clutter_boxes.items() if v}
+        else:
+            clutter_boxes = {int(k): v for k, v in _side["per_terrain_id"].items()}
+        print(f"[augment] displacing INTO clutter: {sum(len(v) for v in clutter_boxes.values())} "
+              f"volumes over {len(clutter_boxes)} tiles; windows whose displaced reference "
+              f"enters one will be dropped.")
     _libm = load_clip_library(lib, device="cpu",
                               keys=["anchor_mask", "anchor_mask_t", "clip_len"])
     amt_np = _libm.anchor_mask_per_step().numpy()          # (num_clips, T) uint8, 255 resolved
@@ -459,8 +587,33 @@ def main() -> int:
     s_pos, s_quat = term_slice(names, dims, "root_pos_w"), term_slice(names, dims, "root_quat_w")
     s_jp = term_slice(names, dims, "joint_pos")
 
-    src = np.arange(W if not args_cli.max_source else min(W, args_cli.max_source))
-    if not args_cli.check_only and not args_cli.augment_flat:
+    # SPREAD, never a prefix. The recording is written env-batch by env-batch, so the first
+    # N windows are the OPENINGS of episodes -- taking a prefix samples one narrow band of
+    # clip_step and silently answers a different question than the one asked (it read the
+    # first 36 steps of a 2-6 s clip here, which made every downrange obstacle look far away).
+    if args_cli.source_slice:
+        try:
+            _k, _n = (int(v) for v in args_cli.source_slice.split("/"))
+        except ValueError:
+            raise SystemExit(f"--source_slice {args_cli.source_slice!r} must be K/N")
+        if not 0 <= _k < _n:
+            raise SystemExit(f"--source_slice {_k}/{_n}: need 0 <= K < N")
+        if args_cli.source_rows:
+            raise SystemExit("--source_slice and --source_rows both select rows; pick one.")
+        src = np.arange(_k, W, _n, dtype=np.int64)
+        print(f"[augment] slice {_k} of {_n}: {len(src)} of {W} source windows "
+              f"(every {_n}th from {_k})")
+    elif args_cli.source_rows:
+        src = np.array([int(v) for v in args_cli.source_rows.split(",") if v.strip()],
+                       dtype=np.int64)
+        if src.min() < 0 or src.max() >= W:
+            raise SystemExit(f"--source_rows out of range for a {W}-window recording: "
+                             f"{src.min()}..{src.max()}")
+        print(f"[augment] rendering {len(src)} hand-picked row(s), not a spread")
+    else:
+        src = (np.arange(W) if not args_cli.max_source or args_cli.max_source >= W
+               else np.linspace(0, W - 1, args_cli.max_source).astype(np.int64))
+    if not args_cli.check_only and not args_cli.visual_only and not args_cli.augment_flat:
         # Keep only windows whose horizon CONTAINS terrain (>=1 anchor-mask-pinned node):
         # terrain-only segments and transitions. Pure-flat windows are ego-anchored and must
         # not be given a world-fixed correction -- see --augment_flat. A transition window
@@ -483,7 +636,7 @@ def main() -> int:
               "are skipped (they are ego-anchored and must move WITH the robot).")
         if len(src) == 0:
             raise SystemExit("no windows contain terrain; nothing to augment.")
-    reps = 1 if args_cli.check_only else int(args_cli.num_augments)
+    reps = 1 if (args_cli.check_only or args_cli.visual_only) else int(args_cli.num_augments)
     hs_all = data["history_state"]
 
     # CAMERA LATENCY. A recording made after 2026-08-21 carries the last few depth frames
@@ -506,6 +659,17 @@ def main() -> int:
         if not args_cli.out:
             raise SystemExit("--out is required unless --check_only.")
         depth_shape = (int(data["depth"].shape[1]), int(data["depth"].shape[2]))
+        if args_cli.render_resolution:
+            # The output must describe ITSELF. Inheriting the source's spec and shape here
+            # would write a file whose depth is one resolution and whose contract claims
+            # another -- and every consumer downstream (the FM dataset, the export, the
+            # deploy agreement) reads the contract, not the array.
+            _live_spec = mdp.depth_camera_specs(u, _render_groups)
+            depth_shape = (len(_live_spec),
+                           int(_live_spec[0]["width"]) * int(_live_spec[0]["height"]))
+            meta = replace(meta, depth_camera_spec=_live_spec)
+            print(f"[augment] output contract: {depth_shape[0]} camera(s) x "
+                  f"{depth_shape[1]} px ({_live_spec[0]['width']}x{_live_spec[0]['height']})")
         writer = RecordedWindowWriter(
             args_cli.out, len(src) * reps, H, int(hs_all.shape[2]),
             int(data["ref_future"].shape[1]),
@@ -531,6 +695,8 @@ def main() -> int:
     allren = []
     allsrc = []
     n_done = 0
+    n_dropped = 0
+    _diag_done = [False]
     # Schedule passes so NO window is dropped. Only one window per env can be placed per
     # render pass (they share the env's robot), and after the terrain filter the surviving
     # windows are NOT evenly spread across envs -- so slicing the list into fixed batches
@@ -555,7 +721,11 @@ def main() -> int:
             quat = snap[:, s_quat].copy()
             jp = snap[:, s_jp].copy()
 
-            if args_cli.check_only:
+            if args_cli.check_only or args_cli.visual_only:
+                # Exactly zero, and never drawn: under --visual_only the whole point is that
+                # the robot is where the recording put it, so the pair differs in depth
+                # alone. Drawing and then adding zero would still run the reference
+                # arithmetic below, which is an f64 round trip that need not be bit-exact.
                 d_dr = d_lat = d_yaw = np.zeros(k)
             else:
                 d_dr = rng.uniform(-args_cli.downrange, args_cli.downrange, k)
@@ -826,7 +996,55 @@ def main() -> int:
                 # history_ref stay put so the offset cannot leak in through them.
                 out["history_state"][:, H - 1, s_pos] = place_pos.astype(np.float32)
                 out["history_state"][:, H - 1, s_quat] = new_quat[keep].astype(np.float32)
-                writer.write_batch(out)
+                # DROP windows whose DISPLACED reference walks into a clutter volume. The
+                # clutter was vetted against the recorded path with a 0.45 m veto, and the
+                # displacement spends up to hypot(downrange, lateral) of that, so the worst
+                # case reaches inside the body radius. Nothing collides -- decor has no
+                # collider -- so the cost is a depth image of the robot inside a box and a
+                # target that walks through it, which is precisely the lesson not to teach.
+                if clutter_boxes:
+                    _tids = env_tid[tgt_env]
+                    _rxy = out["ref_future"][:, :, s_pos][..., :2].astype(np.float64)
+                    _rxy = _rxy - env_corner[tgt_env][:, None, :2]      # -> tile-local
+                    _bad = np.zeros(len(_rxy), dtype=bool)
+                    for _t in np.unique(_tids):
+                        _bx = clutter_boxes.get(int(_t))
+                        if not _bx:
+                            continue
+                        _m = _tids == _t
+                        _bad[_m] = windows_that_penetrate(_rxy[_m], _bx)
+                    if not _diag_done[0]:
+                        # ONE-TIME frame check. A wrong tile transform makes this filter
+                        # silently inert -- _bad comes back all-False and reads as "no
+                        # penetrations" rather than "the filter is not looking anywhere".
+                        # Tile-local coordinates must land inside the tile footprint.
+                        _fp = np.array([sizes_by_tid.get(int(t), (np.nan, np.nan))
+                                        for t in _tids], dtype=float)
+                        _in = ((_rxy[..., 0] >= -1.0) & (_rxy[..., 0] <= _fp[:, None, 0] + 1.0)
+                               & (_rxy[..., 1] >= -1.0) & (_rxy[..., 1] <= _fp[:, None, 1] + 1.0))
+                        _frac = float(np.nanmean(_in))
+                        # REFUSE, do not warn. IsaacSim's exit path discards buffered Python
+                        # stdout, so a printed warning here routinely vanishes from a
+                        # redirected log -- and an inert safety filter that logs nothing is
+                        # indistinguishable from one that found nothing to drop.
+                        if _frac < 0.90:
+                            raise SystemExit(
+                                f"clutter penetration filter is looking in the wrong frame: "
+                                f"only {100.0 * _frac:.1f}% of reference nodes land inside "
+                                f"their own tile footprint. Tile-local xy is world xy minus "
+                                f"env_cell_corner; if the tile layout or that mapping has "
+                                f"changed, the filter silently drops nothing.")
+                        print(f"[augment] clutter-filter frame check: {100.0 * _frac:.1f}% "
+                              "of reference nodes inside their tile footprint")
+                        _diag_done[0] = True
+                    if _bad.any():
+                        # keep is an INDEX array, so filtering it keeps len(keep) equal to
+                        # the number of surviving windows and the counter below stays honest.
+                        out = {kk: vv[~_bad] for kk, vv in out.items()}
+                        keep = keep[~_bad]
+                        n_dropped += int(_bad.sum())
+                if len(keep):
+                    writer.write_batch(out)
             n_done += len(keep)
             if n_done % (batch * 8) < batch:
                 print(f"[augment] {n_done}/{len(src) * reps}")
@@ -881,6 +1099,9 @@ def main() -> int:
         print("  (near-zero => placement, tile alignment and sensor refresh are all correct)")
     else:
         writer.close()
+        if n_dropped:
+            print(f"[augment] dropped {n_dropped} window(s) whose displaced reference entered "
+                  f"a clutter volume ({100.0 * n_dropped / max(n_done + n_dropped, 1):.2f}%).")
         print(f"[augment] wrote {args_cli.out}: {n_done} windows "
               f"({len(src)} source x {reps})")
     env.close()

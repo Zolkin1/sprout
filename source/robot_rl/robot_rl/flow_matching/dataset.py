@@ -725,6 +725,70 @@ def _stack_frame_positions(split_fn, frame_names: list[str]) -> torch.Tensor:
     return torch.stack([split_fn(f"{f}:pos_w") for f in frame_names], dim=-2)
 
 
+#: Raw ``state_term_names`` a MEASURED history row takes from the APPLIED REFERENCE instead
+#: of from the robot, because no robot can measure them.
+#:
+#: The window-level names are ``window.MEASURED_HISTORY_FALLBACK`` -- ``base_pos`` and
+#: ``base_lin_vel``. These are the raw terms ``world_to_window`` reads each of them out of,
+#: so splicing here is equivalent to splicing the built window's spans and costs one pass
+#: instead of two. Kept as a separate tuple rather than derived, because the mapping from a
+#: window half to a state term is not something either module can compute: it is the
+#: definition of the block.
+MEASURED_HISTORY_FALLBACK_TERMS: tuple[str, ...] = ("root_pos_w", "root_link_lin_vel_w")
+
+
+def _check_measured_lag_alignment(dls: torch.Tensor, hs_sel: torch.Tensor, H: int,
+                                  s_slc: dict[str, tuple[int, int]]) -> None:
+    """Assert ``depth_lag_state`` lag ``k`` really is ``history_state`` row ``H-1-k``.
+
+    The measured history build rests entirely on that identity, and it is an identity
+    between two arrays the recorder fills in different places -- so it is checked on the
+    data rather than trusted from the code. Two halves, and BOTH are needed:
+
+    * lag 0 must equal row ``H-1`` in FULL. That row is the snap, which the recorder leaves
+      measured, so this pins the lag indexing with no substitution in the way.
+    * for lag ``k >= 1``, the PRESERVED columns (everything past ``root_quat_w``) must match
+      row ``H-1-k`` exactly, while the pose columns must DIFFER -- the latter being the plan
+      anchor the recorder substituted. Without the "must differ" half the check would pass
+      on a recording that never substituted anything, where these rows would not be plan-
+      anchored and the whole history frame would be wrong.
+
+    Args:
+        dls: ``(Nw, L, node)`` ``depth_lag_state`` for the selected windows.
+        hs_sel: ``(Nw, H, node)`` ``history_state`` for the same windows.
+        H: History-ring length.
+        s_slc: Term-name -> ``(start, stop)`` for one state row.
+
+    Raises:
+        ValueError: If either half fails.
+    """
+    pose_end = s_slc["root_quat_w"][1]
+    if not torch.equal(dls[:, 0, :], hs_sel[:, H - 1, :]):
+        d = float((dls[:, 0, :] - hs_sel[:, H - 1, :]).abs().max())
+        raise ValueError(
+            f"depth_lag_state lag 0 != history_state row {H - 1} (max |diff| {d:.3e}). Those "
+            "are both the measured state at the snap, so the lag index is not a history-row "
+            "index in this recording and the measured history would be built from the wrong "
+            "steps.")
+    for k in range(1, int(dls.shape[1])):
+        row = H - 1 - k
+        if row < 0:
+            break
+        keep = (dls[:, k, pose_end:] - hs_sel[:, row, pose_end:]).abs().max()
+        if float(keep) != 0.0:
+            raise ValueError(
+                f"depth_lag_state lag {k} and history_state row {row} disagree on the "
+                f"PRESERVED columns (max |diff| {float(keep):.3e}); they should be the same "
+                "measured row. The lag/row alignment does not hold in this recording.")
+        pose = (dls[:, k, :pose_end] - hs_sel[:, row, :pose_end]).abs().max()
+        if float(pose) == 0.0:
+            raise ValueError(
+                f"depth_lag_state lag {k} and history_state row {row} AGREE on the root "
+                "pose, but the recorder is supposed to have substituted the plan anchor "
+                "there. This recording's history rows are therefore not plan-anchored, so "
+                "the frame the measured rows would be observed in is not the trained one.")
+
+
 def _rows_to_window(
     split_fn,
     anchor_pos: torch.Tensor,
@@ -1015,6 +1079,40 @@ class FutureStateDataset(Dataset):
             snap_meas = hs_state[sel][:, H - 1, :]           # (Nw, node) robot at the snap
             snap_ref = hr[sel][:, H - 1, :]                  # (Nw, node) reference at the snap
             tw = rf_t[sel]                                   # (Nw, F, node)
+            # -- history_source="measured": the ROBOT'S OWN rows ------------------------
+            # ``history_state`` cannot supply them: the recorder substitutes the plan anchor
+            # into rows 0..H-2, cols 0:7, so the measured root POSE of every non-snap row is
+            # gone from there. ``depth_lag_state`` is the same ``_assemble_state`` cloned
+            # BEFORE that substitution, at lags 0..depth_lag_steps, and lag k is row H-1-k --
+            # verified bit-exact on the shipped recordings (lag 0 vs row H-1 is 0.000e+00,
+            # and lags 1..3 match rows 6/5/4 on every preserved column while differing on
+            # 0:7, which is the substitution).
+            hw_src = hw_ref
+            if cfg.history_source == "measured":
+                if data.get("depth_lag_state") is None:
+                    raise ValueError(
+                        "history_source='measured' needs the un-overwritten measured state, "
+                        "which lives in 'depth_lag_state'; this recording has none (it was "
+                        "written without depth). Re-record, or train with "
+                        "history_source='reference'.")
+                dls = torch.from_numpy(
+                    np.ascontiguousarray(data["depth_lag_state"])).float()[sel]
+                cfg.check_history_source(available_lags=int(dls.shape[1]) - 1)
+                # Lags n..1, oldest first, matching the history block's row order.
+                hw_src = dls[:, torch.arange(n, 0, -1), :].clone()
+                _check_measured_lag_alignment(dls, hs_state[sel], H, s_slc)
+                # THE FALLBACK, spliced in the RAW row rather than in the built window.
+                # ``world_to_window`` reads the base position out of ``root_pos_w`` and the
+                # linear velocity out of ``root_link_lin_vel_w``, so substituting those two
+                # terms from the reference row yields exactly the node the deploy runtime
+                # serves: there the same two blocks come from the SERVED node, whose
+                # base_pose[0:3] is R_planyawT (p_ref - p_plan) -- the identical quantity,
+                # since a served node IS the applied reference. Splicing here also keeps one
+                # ``_rows_to_window`` call instead of building the window twice and
+                # overwriting half of it.
+                for term in MEASURED_HISTORY_FALLBACK_TERMS:
+                    a, b = s_slc[term]
+                    hw_src[..., a:b] = hw_ref[..., a:b]
         else:
             idx_all = np.stack(windows).astype(np.int64)     # (Nw, N+1); last = snap
             idx_hist, snap_rows = idx_all[:, :-1], idx_all[:, -1]
@@ -1027,18 +1125,29 @@ class FutureStateDataset(Dataset):
                     "current record_data.py."
                 )
             ref_t = torch.from_numpy(np.ascontiguousarray(data["ref_state"])).float()
+            if cfg.history_source == "measured":
+                raise ValueError(
+                    "history_source='measured' is not implemented for the legacy per-step "
+                    "(.npz) format. It would be easy and pointless: that path anchors every "
+                    "row on its OWN step rather than on the plan, so a measured row's base "
+                    "block would be ~zero by construction and carry nothing. Use a windowed "
+                    "recording.")
             hw_meas = state_t[idx_hist]                      # (Nw, N, node)
             hw_ref = ref_t[idx_hist]                         # (Nw, N, node)
+            hw_src = hw_ref
             snap_meas = state_t[snap_rows]                   # (Nw, node)
             snap_ref = ref_t[snap_rows]
             tw = rf_t[snap_rows]                             # (Nw, F, node)
 
         p_anchor, q_anchor = _p(snap_meas), _q(snap_meas)    # (Nw, 3) / (Nw, 4)
 
-        # -- history: the emitted reference at lags n..1, all in the PLAN's frame (windowed;
-        # the legacy per-step path still anchors each row on its own step) --
+        # -- history: lags n..1, all in the PLAN's frame (windowed; the legacy per-step path
+        # still anchors each row on its own step). ``hw_src`` is the applied reference under
+        # ``history_source="reference"`` and the robot's own state (bar the two unmeasurable
+        # blocks) under ``"measured"``; the ANCHOR is the plan pose either way, which is what
+        # every history row is observed in.
         history = _rows_to_window(
-            lambda name: hw_ref[..., s_slc[name][0]:s_slc[name][1]],
+            lambda name: hw_src[..., s_slc[name][0]:s_slc[name][1]],
             _p(hw_meas), _q(hw_meas), self.target_frame_names, self.blocks,
         ).contiguous()                                        # (Nw, n, D)
 
@@ -1048,7 +1157,12 @@ class FutureStateDataset(Dataset):
             p_anchor[:, None, :], q_anchor[:, None, :], self.target_frame_names, self.blocks,
         ).contiguous()                                        # (Nw, F, D)
 
-        self._check_window_invariants(target, history, snap_ref, tw[:, 0], s_slc, f)
+        # Under ``measured`` the newest history row is adjacent to the MEASURED snap, not to
+        # the reference target -- see guard 4. Frame-invariant block, so the raw joints are
+        # the window's joints with no transform.
+        _adj = (snap_meas[:, s_slc["joint_pos"][0]:s_slc["joint_pos"][1]]
+                if cfg.history_source == "measured" else None)
+        self._check_window_invariants(target, history, snap_ref, tw[:, 0], s_slc, f, _adj)
 
         # Exteroception readings at the snap row. The recording carries either
         # ``height_scan`` (P|W, K) -- one sensor -- or ``depth`` (P|W, T, K) with one row
@@ -1472,6 +1586,7 @@ class FutureStateDataset(Dataset):
         future_node0: torch.Tensor,
         s_slc: dict[str, tuple[int, int]],
         f: int,
+        adjacent_joints: torch.Tensor | None = None,
     ) -> None:
         """Fail on the recording defects that would otherwise train a plausible wrong model.
 
@@ -1563,15 +1678,31 @@ class FutureStateDataset(Dataset):
         #    18 rad/s joint covers 0.36 rad in a step all by itself), so any fixed tolerance
         #    is either loose on slow clips or wrong on fast ones. An off-by-k history shows
         #    up as a gap ~k times the one-step gap, which this catches at any joint speed.
+        #
+        #    WHAT IT IS COMPARED AGAINST depends on the history source, and the choice is
+        #    the difference between a real check and a guaranteed failure. The gap only
+        #    means "one step" when both sides come from the SAME trajectory:
+        #
+        #    * ``reference`` -- both are the applied reference, so ``target[0]`` is the
+        #      adjacent step and this is a straight comparison.
+        #    * ``measured`` -- the history row is the ROBOT'S joints and ``target[0]`` is
+        #      the REFERENCE's, so their gap is the TRACKING ERROR, not a step of motion.
+        #      Measured on the shipped recording that is 0.070 rad against 0.016 rad per
+        #      step, i.e. it reads as 4.4 steps of misalignment and fails every window.
+        #      The adjacent quantity is instead the MEASURED state at the snap, which the
+        #      caller passes in -- same trajectory, one step apart, so the off-by-k
+        #      sensitivity is exactly as strong as for the reference arm.
         if "joint_pos" not in self.block_slices:
             return
         jp = self.block_slices["joint_pos"]
         one_step = (target[:, 1, jp] - target[:, 0, jp]).abs().mean().item()
-        hist_gap = (history[:, -1, jp] - target[:, 0, jp]).abs().mean().item()
+        against = target[:, 0, jp] if adjacent_joints is None else adjacent_joints
+        hist_gap = (history[:, -1, jp] - against).abs().mean().item()
         if hist_gap > 3.0 * one_step + 1e-4:
+            what = "target[0]" if adjacent_joints is None else "the measured snap row"
             raise ValueError(
                 f"history[-1] is {hist_gap / max(one_step, 1e-9):.1f} control steps away from "
-                f"target[0] in joint_pos (gap {hist_gap:.4f} rad vs {one_step:.4f} rad per "
+                f"{what} in joint_pos (gap {hist_gap:.4f} rad vs {one_step:.4f} rad per "
                 "step): the autoregressive history rows are misaligned against the future "
                 "window. The history block is the N rows BEFORE node 0."
             )
@@ -1862,6 +1993,12 @@ def build_train_val(
     # Pre-formed windowed (.h5) recordings skip the snap_windows pass entirely.
     if "history_state" in data:
         return _build_train_val_windowed(data, meta, cfg)
+    # No window-filter guard is needed on this legacy per-step path, though it looks like it
+    # wants one: both filters live in the WINDOWED branch, so a per-step recording would
+    # silently ignore skip_distractors / skip_families. It cannot get that far --
+    # _build_train_val_windowed refuses any recording whose history_anchor is not "plan", and
+    # a per-step recording has no history_anchor at all, so the format is already rejected
+    # outright and for a stronger reason. A second gate here would only shadow that message.
     reanchor = data.get("reanchor_active")
     if reanchor is None:
         raise ValueError(
@@ -1954,6 +2091,46 @@ def _distractor_keep_mask(
     return ~tag
 
 
+def resolve_skip_families(wanted: list[str], have: list[str]) -> tuple[list[str], list[str]]:
+    """Split a requested family-exclusion list into (present, absent), raising on a typo.
+
+    Strictness is asymmetric BY NAME, which is what lets the rule live here rather than in
+    whichever caller happens to know how the list was spelled. A name in
+    :data:`~robot_rl.flow_matching.config.DEFAULT_SKIP_FAMILIES` is a standing REQUEST --
+    "drop the backwards jump-off windows wherever they exist" -- and a recording that has
+    none of them is not an error. Any OTHER name was typed by a caller who believes it is
+    there, so its absence is a typo, and silently dropping nothing would read as success.
+
+    The absent case is not just stale recordings. A flat-only library has no terrain
+    manifest, so ``record_data._clip_family_codes`` writes no family table at all -- a
+    perfectly current flat recording legitimately carries no families to name.
+
+    Args:
+        wanted: Requested family names.
+        have: The recording's own ``family_names`` (empty when it carries no table).
+
+    Returns:
+        ``(present, absent)``, both in the requested order.
+
+    Raises:
+        ValueError: If a name outside the default set is absent from the recording.
+    """
+    from .config import DEFAULT_SKIP_FAMILIES
+
+    wanted = [f for f in (wanted or []) if f]
+    have = list(have or [])
+    absent = [f for f in wanted if f not in have]
+    typo = [f for f in absent if f not in DEFAULT_SKIP_FAMILIES]
+    if typo:
+        listing = have or "(none -- no family table, which is what a flat-only library gives)"
+        raise ValueError(
+            f"--skip_families named {typo}, which this recording does not contain. Its "
+            f"families are {listing}. A typo here would silently drop nothing, which reads "
+            "as success."
+        )
+    return [f for f in wanted if f in have], absent
+
+
 def _family_keep_mask(
     data: dict[str, np.ndarray], meta: Any, cfg: FlowMatchingConfig, num_windows: int
 ) -> np.ndarray | None:
@@ -1970,31 +2147,31 @@ def _family_keep_mask(
         num_windows: ``W``, for validating the tag's length.
 
     Returns:
-        ``(W,)`` bool array (True = keep), or ``None`` when nothing is requested.
+        ``(W,)`` bool array (True = keep), or ``None`` when nothing is requested and when
+        nothing requested is present (a flat-only recording under the default).
 
     Raises:
-        ValueError: If the recording predates the tag, a named family is absent from it, or
-            the filter would drop every window. Each of those would otherwise look like a
-            successful no-op.
+        ValueError: If a family the caller NAMED is absent (see
+            :func:`resolve_skip_families` for why a defaulted name is not), if the tag's
+            length disagrees with ``num_windows``, or if the filter would drop every window.
+            Each of those would otherwise look like a successful no-op.
     """
-    wanted = [f for f in (cfg.skip_families or []) if f]
-    if not wanted:
+    requested = [f for f in (cfg.skip_families or []) if f]
+    if not requested:
         return None
     codes = data.get("clip_family")
     names = list(getattr(meta, "family_names", []) or [])
-    if codes is None or not names:
-        raise ValueError(
-            f"--skip_families {wanted} needs the per-window 'clip_family' tag and the "
-            "recording's family_names; this recording predates them. Re-record with the "
-            "current record_data.py (it writes both unconditionally), or drop the flag -- "
-            "silently training on those families would misreport what was excluded."
-        )
-    unknown = [f for f in wanted if f not in names]
-    if unknown:
-        raise ValueError(
-            f"--skip_families named {unknown}, which this recording does not contain. Its "
-            f"families are {names}. A typo here would silently drop nothing."
-        )
+    # A name only the DEFAULT asks for is dropped where it exists and reported where it does
+    # not; a name a caller typed must be there. Applied here rather than only in train.py
+    # because build_train_val is a library entry point -- the probes, the composer and the
+    # tests all reach it directly, and a default that hard-failed every table-less recording
+    # would break all of them.
+    wanted, absent = resolve_skip_families(requested, names if codes is not None else [])
+    if absent:
+        print(f"[fm-data] --skip_families {absent}: not in this recording "
+              f"({names or 'no family table'}); nothing to drop for them.")
+    if not wanted:
+        return None
     codes = np.asarray(codes).reshape(-1).astype(np.int64)
     if codes.shape[0] != num_windows:
         raise ValueError(

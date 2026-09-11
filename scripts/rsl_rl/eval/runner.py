@@ -41,7 +41,10 @@ import time
 import numpy as np
 
 import accumulate
+# Same module `accumulate` folds with; imported here only to build the spec.
+from robot_rl.tasks.manager_based.robot_rl.mdp import tracking_error
 import dr_presets
+import fm_seed_noise
 import sampler
 import schema
 
@@ -230,10 +233,40 @@ class EvalResetHook:
                     assign_env_tiles(self.importer, self.levels, self.queue.env_column)
                     self.retargets += 1
         self.armed = True
-        return self.base_func(env, env_ids, command_name=command_name,
-                              base_frame_name=base_frame_name, asset_cfg=asset_cfg,
-                              pin_clip_ids=pin_clip_ids, pin_start_step=pin_start_step,
-                              spawn_z_offset=spawn_z_offset, clip_draw=clip_draw)
+        out = self.base_func(env, env_ids, command_name=command_name,
+                             base_frame_name=base_frame_name, asset_cfg=asset_cfg,
+                             pin_clip_ids=pin_clip_ids, pin_start_step=pin_start_step,
+                             spawn_z_offset=spawn_z_offset, clip_draw=clip_draw)
+        # AFTER the real reset, never before: the goal anchor is the newly committed clip's
+        # own terminal pose, and its tolerances are that clip's family's. Refreshing ahead of
+        # `base_func` would anchor every episode on its PREDECESSOR's clip -- a plausible
+        # region on the wrong tile, which no shape check could see.
+        self._refresh_goal(env, env_ids)
+        return out
+
+    def _refresh_goal(self, env, env_ids) -> None:
+        """Re-resolve the goal anchor and per-family tolerances for the envs that just reset.
+
+        A no-op unless a goal region was attached, so a run without one behaves exactly as
+        before rather than half-populating the goal columns.
+
+        Args:
+            env: The unwrapped env.
+            env_ids: The envs whose clip was just committed, or ``None`` for all.
+        """
+        if getattr(self.accum, "_gr", None) is None:
+            return
+        cmd = env.command_manager.get_term("traj_ref")
+        if env_ids is None:
+            ids = None
+            fams = [self.plan["clips"][int(c)]["family"] for c in cmd.clip_id.tolist()]
+        else:
+            ids = env_ids
+            picks = cmd.clip_id.detach().to("cpu").numpy()
+            fams = [self.plan["clips"][int(picks[int(e)])]["family"]
+                    for e in (env_ids.tolist() if hasattr(env_ids, "tolist") else env_ids)]
+        self.accum.set_goal_families(fams, env_ids=ids)
+        self.accum.refresh_goal_anchor(ids)
 
     def _harvest(self, env, env_ids, *, count_completion: bool = True) -> None:
         """Emit one row per ended episode and zero those accumulators.
@@ -397,6 +430,11 @@ def reference_overrides(mode: str) -> dict:
       cost of getting this wrong: 18/24 instead of 22/24.
     * ``fm`` -- ``None``.  The generator's plan is the reference; the clip placement does not
       feed it, so the task's deploy default (0.0) is what should run.
+    * ``fm_meas`` -- ``None``, for the SAME reason as ``fm`` and pointedly not ``fm_tf``'s.
+      The history is the robot's own achieved state, so no clip row reaches the generator
+      and re-anchoring the clip would change only where the robot is asked to go, not what
+      it conditions on.  Pinning it to 1.0 here would make ``fm_meas`` differ from ``fm`` in
+      two ways at once and destroy the pairing that is the whole point of the arm.
 
     The CADENCE (``ego_anchor_every``) is never pinned here -- pinning it to 1 is what made
     base-position error identically zero in earlier sweeps.
@@ -422,6 +460,24 @@ def reference_overrides(mode: str) -> dict:
         # Same generator, same reference SOURCE -- only the autoregressive context differs.
         return {"reference_source": "fm", "history_from": "clip",
                 "ego_anchor_fraction": 1.0}
+    if mode == "fm_meas":
+        # Same generator, same reference source, same clip placement as ``fm`` -- the ONLY
+        # difference is where the history rows come from, which is what makes the paired
+        # delta against ``fm`` a statement about the context and nothing else.
+        #
+        # ``allow_history_source_mismatch`` because this cell EXISTS to measure the
+        # off-distribution arm. A generator trained on reference rows will refuse to be
+        # served measured ones (``assert_history_source_matches``), and rightly so on a
+        # deploy path -- but refusing here would mean the harness could never measure the
+        # arm at all against today's checkpoints, which is the only thing there is to
+        # measure until a measured-trained generator exists. Same standing as ``fm_tf``: a
+        # deliberately non-deployable diagnostic whose nature is recorded in the cell
+        # manifest (``notes["history_from"]``) rather than inferred. Against a
+        # measured-TRAINED generator the flag is inert -- the arms agree and the guard
+        # passes on its own.
+        return {"reference_source": "fm", "history_from": "measured",
+                "allow_history_source_mismatch": True,
+                "ego_anchor_fraction": None}
     raise ValueError(f"unknown reference mode {mode!r}")
 
 
@@ -477,6 +533,11 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
     # Recorded because ``reference_source`` alone cannot distinguish fm from fm_tf: both run
     # the generator, and the whole point of the pair is the difference between them.
     notes["history_from"] = getattr(traj, "history_from", None)
+    # Recorded beside it because the two together are what make the cell interpretable: the
+    # arm alone does not say whether the generator was FITTED on it, and a cell run under a
+    # mismatch is measuring a model fed the wrong kind of history.
+    notes["allow_history_source_mismatch"] = bool(
+        getattr(traj, "allow_history_source_mismatch", False))
     notes["ego_anchor_fraction"] = getattr(traj, "ego_anchor_fraction", None)
     notes["ego_anchor_every"] = getattr(traj, "ego_anchor_every", None)
     notes["tracking_mode"] = getattr(traj, "tracking_mode", None)
@@ -494,9 +555,42 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
     else:
         notes["terminations_added"] = []
 
+    # --- the fall plane -------------------------------------------------------------------
+    # 0.50 m, the historical value, sits INSIDE jump_off_front's own reference envelope: the
+    # deepest clip's pelvis reaches 0.525 m and a well-tracking robot legitimately undershoots
+    # by up to 60 mm, so a correctly tracking robot is terminated there and anything fitted to
+    # those episodes learns the threshold rather than the fall. Recorded in the notes because
+    # a success rate is not comparable across two values of it.
+    fall_h = float(args.fall_min_height)
+    fallen = getattr(env_cfg.terminations, "base_fallen", None)
+    if fallen is None:
+        raise RuntimeError(
+            "the task has no `base_fallen` termination, so --fall_min_height has nothing to "
+            "set and the only failure term is missing. Check the task name.")
+    fallen.params["min_height"] = fall_h
+    notes["fall_min_height"] = fall_h
+
+    # The goal region travels with the table by PATH AND CONTENT HASH. The path alone rots
+    # (the same filename can hold different tolerances a week later) and the hash alone is
+    # unreadable, so both -- the same reason every artifact in this repo is fingerprinted.
+    notes["goal_regions"] = str(getattr(args, "goal_regions", "") or "")
+    if notes["goal_regions"]:
+        import hashlib  # noqa: PLC0415
+        with open(notes["goal_regions"], "rb") as f:
+            notes["goal_regions_sha256"] = hashlib.sha256(f.read()).hexdigest()[:12]
+        # An UNCALIBRATED spec must be visible in the table, not just in the file it came
+        # from: its reached_goal is 1 everywhere by construction, so a reader who reduced it
+        # would get 100% success from a tool working exactly as designed.
+        from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
+        _spec = goal_region.GoalRegionSpec.load(notes["goal_regions"])
+        notes["goal_regions_bootstrap"] = bool(_spec.provenance.get("bootstrap", False))
+
     # --- the clip reset's own knobs -------------------------------------------------------
     reset = env_cfg.events.reset_on_clip
-    reset.params["pin_start_step"] = 0
+    # -1 = do not pin; the command's own random_start_phase draws (and its min_start_step
+    # reserve applies, so a clip-seeded history still has steps to read).
+    reset.params["pin_start_step"] = None if int(args.start_step) < 0 else int(args.start_step)
+    notes["pin_start_step"] = reset.params["pin_start_step"]
     reset.params["spawn_z_offset"] = float(args.spawn_z_offset)
     notes["spawn_z_offset"] = float(args.spawn_z_offset)
 
@@ -602,7 +696,11 @@ def stage_cell(args) -> int:
         policy = runner.get_inference_policy(device=u.device)
 
         dt = float(u.step_dt)
-        accum = accumulate.EpisodeAccumulator(env, dt=dt)
+        # Same threshold the termination got, or the DERIVED fall flag and the term
+        # disagree about what a fall is -- which is what `_check_terminal_state`
+        # exists to detect and would then fire on every run.
+        accum = accumulate.EpisodeAccumulator(
+            env, dt=dt, fall_min_height=float(args.fall_min_height))
         capacity = int(cell["robots_per_clip"]) * len(clips) + int(args.num_envs)
         table = out_cell / "episodes.h5.inprogress"
         writer = schema.EpisodeTableWriter(str(table), capacity=capacity, meta={
@@ -618,6 +716,66 @@ def stage_cell(args) -> int:
                              cell=cell, env_ref=u, importer=u.scene.terrain, levels=levels)
         u.event_manager.get_term_cfg("reset_on_clip").func = hook
 
+        # The SPATIAL success columns. Off unless a calibrated region was given: with none,
+        # every outcome in this table is a clip-cursor condition and `report.py` refuses to
+        # derive spatial success rather than falling back to the temporal rule.
+        if getattr(args, "goal_regions", ""):
+            from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
+            spec = goal_region.GoalRegionSpec.load(args.goal_regions)
+            accum.attach_goal_region(spec)
+            # The STRICT tracking checks ride with the goal region: both are what make a
+            # verdict spatial and reference-relative rather than a clip-cursor condition, and
+            # neither is meaningful without the other (the strict rule is "arrived BEFORE
+            # failing"). Latched, never terminating, so `report.py` derives the strict and the
+            # loose success from one run.
+            _tspec = tracking_error.BOOTSTRAP_SPEC
+            if getattr(args, "tracking_spec", ""):
+                with open(args.tracking_spec) as _f:
+                    _tspec = tracking_error.TrackingErrorSpec.from_dict(json.load(_f))
+            accum.attach_tracking(_tspec)
+            if int(args.fm_seed) != fm_seed_noise.OFF:
+                _c = u.command_manager.get_term("traj_ref")
+                _c.set_noise_source(fm_seed_noise.FmSeedNoise(
+                    fm_seed=int(args.fm_seed), future_len=int(_c.ctx.F),
+                    state_dim=int(_c.ctx.D), device=u.device,
+                    replan_every=int(getattr(_c, "fm_update_every", 12)),
+                    episode_len_buf=lambda: u.episode_length_buf))
+                notes["fm_seed"] = int(args.fm_seed)
+                print(f"[cell] FM SEED {args.fm_seed}: the generator's noise is named and "
+                      "reproducible; DR, spawn and observation noise are unchanged.")
+            if float(args.steer_kp) != 0.0:
+                # On the COMMAND, so the generator's conditioning, the reward and the
+                # command_window observation move together; see set_yaw_rate_source.
+                _cmd = u.command_manager.get_term("traj_ref")
+
+                def _steer_source():
+                    """Yaw rate toward each env's goal, zero once inside the region."""
+                    down, lat, hz = goal_region.goal_frame_offsets(
+                        accum.rd.root_pos_w, accum._goal_pos_w, accum._goal_yaw)
+                    return goal_region.steer_yaw_rate(
+                        accum.rd.root_pos_w, accum.rd.root_quat_w, accum._goal_pos_w,
+                        goal_region.in_goal(down, lat, hz, accum._goal_tol),
+                        kp=float(args.steer_kp), wz_max=float(args.steer_wz_max))
+
+                _cmd.set_yaw_rate_source(_steer_source)
+                notes["steer_kp"] = float(args.steer_kp)
+                notes["steer_wz_max"] = float(args.steer_wz_max)
+                print(f"[cell] STEERING ON: kp={args.steer_kp} wz_max={args.steer_wz_max} -- "
+                      "OFF-DISTRIBUTION on the stair families. Recorded in the cell meta so a "
+                      "steered cell cannot be read as an unsteered one.")
+            # The FIRST episode never passes through the reset hook -- the queue assigned its
+            # clip in its constructor and the pin list carried it into the config -- so its
+            # anchor has to be primed here or the whole first batch folds against a zero goal.
+            hook._refresh_goal(u, None)
+            print(f"[cell] goal region: {args.goal_regions} "
+                  f"(default margin {spec.default.approach_margin_m} m, "
+                  f"half-width {spec.default.half_width_m} m, "
+                  f"height {spec.default.height_tol_m} m; "
+                  f"{len(spec.by_family)} family override(s))")
+        else:
+            print("[cell] NO goal region: reached_goal will be 0 and the goal offsets NaN. "
+                  "report.py will refuse to derive spatial success from this table.")
+
         # Attach the plan classifier, when one was given and a generator is loaded. Never on
         # the clip arm: there is no plan to classify, and a zero count there is the honest
         # record rather than a missing column.
@@ -627,6 +785,17 @@ def stage_cell(args) -> int:
             print(f"[cell] plan classifier: {accum.plan_clf.feats.shape[0]} reference "
                   f"windows from {args.terrain_ref}. Counts are per RE-PLAN; compare against "
                   "the open-loop control stairs->jump 0.059 [0.047, 0.071].")
+            if int(getattr(args, "dump_flagged", 0)):
+                from plan_dump import FlaggedPlanDump  # noqa: PLC0415
+                # The SUBSET library: cell clip ids index that one, not the source.
+                coarse = terrain_class.clip_coarse_codes(
+                    plan['subset_library']['path'])
+                accum.cmd.enable_extero_stash()
+                accum.plan_dump = FlaggedPlanDump(coarse,
+                                                  per_bucket=int(args.dump_flagged),
+                                                  seed=int(args.seed))
+                print(f"[cell] flagged-plan dump: {args.dump_flagged} per (true, pred) "
+                      "bucket, with the exteroception row each plan was drawn from.")
 
         max_steps = int(args.max_steps) or _derived_max_steps(clips, queue, args.num_envs)
         print(f"[cell {key}] rolling: {len(clips)} clips x R={cell['robots_per_clip']} "
@@ -651,6 +820,13 @@ def stage_cell(args) -> int:
             # them inference tensors, and those cannot be updated in place outside the block.
             censored = _flush_inflight(u, accum, writer, hook, queue)
         writer.close()
+        if accum.plan_dump is not None:
+            path = accum.plan_dump.save(
+                str(out_cell / "flagged_plans.npz"),
+                extra=dict(cell=key, fm_checkpoint=cell["fm_checkpoint"],
+                           terrain_ref=args.terrain_ref))
+            print(accum.plan_dump.summary())
+            print(f"[cell] flagged plans -> {path}")
         table.rename(out_cell / "episodes.h5")
 
         wall = time.time() - t0
@@ -726,7 +902,34 @@ def stage_grid(args) -> int:
     One process per cell so an Isaac crash cannot poison the next cell and the GPU is fully
     released in between -- and so a multi-hour grid can be resumed.
     """
-    plan, _ = load_run(args.out)
+    plan, manifest = load_run(args.out)
+    # EVERY forwarded flag falls back to what --stage plan RECORDED, so a flag given only to
+    # the plan reaches the cell instead of reverting to its argparse default in the child.
+    # That silent revert has now bitten three times: `--num_envs` ran a grid at 256 while the
+    # manifest said 1024, `--terrain_ref` produced 3950 episodes with `n_plans == 0`, and
+    # `--tracking_spec`/`--goal_regions` were dropped from a strict run whose whole purpose
+    # was the strict criterion. A test cannot catch it -- the flag IS restated here, it is the
+    # VALUE that is wrong -- so the fix is to make the wrong value unreachable.
+    #
+    # `args._explicit` is the set of dests the caller actually TYPED (see
+    # `evaluate._explicit_dests`); argparse cannot tell `--num_envs 256` from the 256 default,
+    # and that distinction is exactly what lets the plan's value win WITHOUT overriding a
+    # deliberate CLI override.
+    recorded = (manifest.get("cli") or {}).get("resolved") or {}
+    explicit = set(getattr(args, "_explicit", ()) or ())
+
+    def val(dest: str):
+        """CLI if the caller typed it, else the plan's recorded value, else the default."""
+        if dest in explicit or dest not in recorded:
+            return getattr(args, dest)
+        return recorded[dest]
+
+    from_plan = sorted(d for d in recorded
+                       if d not in explicit and hasattr(args, d)
+                       and recorded[d] != getattr(args, d))
+    if from_plan:
+        print("[grid] taking from plan.json rather than this invocation's defaults: "
+              + ", ".join(f"{d}={recorded[d]!r}" for d in from_plan))
     wanted = [c.strip() for c in args.cells.split(",") if c.strip()]
     cells = [c for c in plan["cells"] if not wanted or c["key"] in wanted]
     print(f"[grid] {len(cells)} cell(s) in {args.out}")
@@ -743,23 +946,41 @@ def stage_grid(args) -> int:
     for c in todo:
         cmd = [sys.executable, "-u", str(pathlib.Path(__file__).with_name("evaluate.py")),
                "--stage", "cell", "--out", str(args.out), "--cell", c["key"],
-               "--num_envs", str(args.num_envs), "--num_rows", str(args.num_rows),
-               "--seed", str(args.seed), "--ood_scale", str(args.ood_scale),
-               "--dr_resample", args.dr_resample,
-               "--spawn_z_offset", str(args.spawn_z_offset)]
-        if args.clip_device:
-            cmd += ["--clip_device", args.clip_device]
+               "--num_envs", str(val("num_envs")), "--num_rows", str(val("num_rows")),
+               "--seed", str(val("seed")), "--ood_scale", str(val("ood_scale")),
+               "--dr_resample", val("dr_resample"),
+               "--spawn_z_offset", str(val("spawn_z_offset")),
+               "--start_step", str(val("start_step"))]
+        if val("clip_device"):
+            cmd += ["--clip_device", val("clip_device")]
         # Forward EVERY flag the cell stage reads. This list is the whole reason `fm_tf` is a
         # reference MODE and not a flag: anything added here and forgotten reverts silently to
         # its argparse default in the subprocess. Measured, twice: --num_envs ran a grid at 256
         # while the manifest recorded 1024, and --terrain_ref produced 3950 episodes with
         # n_plans == 0 and no error anywhere.
-        if getattr(args, "terrain_ref", ""):
-            cmd += ["--terrain_ref", args.terrain_ref]
-        if not args.ood_depth_noise:
+        if val("goal_regions"):
+            cmd += ["--goal_regions", val("goal_regions")]
+        # RESTATED HERE ON PURPOSE. A flag added to the parser is NOT forwarded across the
+        # grid -> cell subprocess boundary unless this function repeats it; it reverts to its
+        # argparse default in the child, silently. Measured twice already: `--num_envs` ran a
+        # grid at 256 while the manifest recorded 1024, and `--terrain_ref` produced 3950
+        # episodes with `n_plans == 0` and no error.
+        if val("tracking_spec"):
+            cmd += ["--tracking_spec", val("tracking_spec")]
+        cmd += ["--fall_min_height", str(val("fall_min_height"))]
+        if int(val("fm_seed")) != -1:
+            cmd += ["--fm_seed", str(val("fm_seed"))]
+        if val("steer_kp"):
+            cmd += ["--steer_kp", str(val("steer_kp")),
+                    "--steer_wz_max", str(val("steer_wz_max"))]
+        if val("terrain_ref"):
+            cmd += ["--terrain_ref", val("terrain_ref")]
+        if val("dump_flagged"):
+            cmd += ["--dump_flagged", str(val("dump_flagged"))]
+        if not val("ood_depth_noise"):
             cmd += ["--no-ood_depth_noise"]
-        if args.max_steps:
-            cmd += ["--max_steps", str(args.max_steps)]
+        if val("max_steps"):
+            cmd += ["--max_steps", str(val("max_steps"))]
         print(f"\n[grid] === {c['key']} ===\n[grid] {' '.join(cmd)}")
         proc = subprocess.run(cmd, cwd=os.getcwd(), check=False)
         if proc.returncode != 0:

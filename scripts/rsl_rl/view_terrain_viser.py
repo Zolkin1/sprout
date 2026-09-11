@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import importlib
 import time
 
@@ -105,6 +106,13 @@ _TRAJ_BODIES: tuple[tuple[str, tuple[int, int, int]], ...] = (
 #: Foot-contact dots, drawn where the ``contact`` flag is set.
 _CONTACT_COLOR = (255, 60, 60)
 
+#: ``terrain_id`` -> family name, filled from the manifest when a library is rendered.
+#:
+#: Module scope because the label is drawn deep in the per-tile loop and the manifest is read
+#: once, at the top. It is a cache, not state: rendering a second library overwrites it, and
+#: nothing renders two.
+_FAMILY: dict[int, str] = {}
+
 
 def _body_cols(pos_names: list[str], body: str) -> list[int] | None:
     """Column indices of ``body``'s world xyz, or ``None`` if the library lacks it."""
@@ -116,13 +124,21 @@ def _body_cols(pos_names: list[str], body: str) -> list[int] | None:
 
 
 def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int,
-                           corner: tuple[float, float], n_traj: int, seed: int) -> int:
+                           corner: tuple[float, float], n_traj: int, seed: int,
+                           center: tuple[float, float] | None = None,
+                           mark_step: int | None = None) -> int:
     """Draw a few of this tile's clips on top of it. Returns how many were drawn.
 
-    The clip is baked in the tile's LOCAL-CORNER frame -- ``view_clip_viser`` overlays it on
-    the mesh with no transform -- so placing it is a pure translation by the tile corner.
-    Getting that wrong is the kind of error this overlay exists to reveal, so it is done in
-    one place and stated here rather than inferred at each call.
+    A TERRAIN clip is baked in the tile's LOCAL-CORNER frame -- ``view_clip_viser`` overlays
+    it on the mesh with no transform -- so placing it is a pure translation by the tile
+    corner. Getting that wrong is the kind of error this overlay exists to reveal, so it is
+    done in one place and stated here rather than inferred at each call.
+
+    A FLAT clip is placed differently and drawing it at the corner would be wrong by tens of
+    metres. Flat clips wander, so the reset centres each one's own base-frame BBOX on the
+    tile (``mdp/events/resets.py``: ``world_pos = cell_center - bbox_center``) rather than
+    anchoring its origin. Pass ``center`` for those and the same rule is applied here, which
+    is the only way the drawn path is where the robot will actually be.
 
     Feet are drawn as separate paths from the pelvis, and the CONTACT samples as dots,
     because the question this answers is "do the feet land on the treads?" -- which a pelvis
@@ -135,7 +151,14 @@ def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int
         tid: The tile's ``terrain_id``.
         corner: The tile's world ``(x, y)`` corner.
         n_traj: How many clips to draw.
-        seed: Chooses WHICH clips, so a re-run shows the same ones.
+        seed: Chooses WHICH clips, so a re-run shows the same ones. Combined with the tile
+            so that two tiles sharing a ``terrain_id`` -- every flat tile does -- do not both
+            draw the same clip.
+        center: The tile's world ``(x, y)`` CENTRE. Required for a flat tile
+            (``tid == -1``); ignored otherwise.
+        mark_step: Draw a marker at this clip step. Used by the terrain probe, where the
+            whole measurement is taken at one instant and "is the wall actually in front of
+            the robot at that instant" is the question the picture has to answer.
 
     Returns:
         Number of trajectories drawn.
@@ -147,18 +170,38 @@ def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int
     members = np.flatnonzero(lib.terrain_id.cpu().numpy() == tid)
     if len(members) == 0:
         return 0
-    take = members[np.linspace(0, len(members) - 1, min(n_traj, len(members))).astype(int)]
+    # Seeded PER TILE, which is what makes flat tiles show different motions. They all share
+    # ``terrain_id = -1``, so ``members`` is the same list of thousands of clips for every one
+    # of them; an unseeded pick returns the same clip on all 60 and the flat half of the world
+    # looks like one trajectory stamped out repeatedly. Also honours what ``seed`` has always
+    # been documented to do -- the previous evenly-spaced pick ignored it entirely.
+    # ``tid`` is -1 on a flat tile and a seed sequence rejects negatives, so it is offset
+    # rather than passed through; the prefix carries the tile's own index, which is what
+    # separates two flat tiles that share the id.
+    pick = np.random.default_rng((int(seed) & 0xFFFF, int(tid) + 2, hash(prefix) & 0xFFFF))
+    take = pick.choice(members, size=min(n_traj, len(members)), replace=False)
 
     pos_names = lib.meta.get("pos_output_names") or json.loads(
         lib.attrs["pos_output_names"])
     cols = {b: _body_cols(pos_names, b) for b, _ in _TRAJ_BODIES}
     lens = lib.clip_len.cpu().numpy() if lib.clip_len.numel() else None
-    ox, oy = float(corner[0]), float(corner[1])
+    is_flat = int(tid) < 0
+    if is_flat and center is None:
+        raise ValueError("a flat tile needs its CENTRE: its clips are bbox-recentred on the "
+                         "tile, not anchored at the corner.")
+    base = cols.get("pelvis_link")
 
     drawn = 0
     for k, ci in enumerate(take):
         n = int(lens[ci]) if lens is not None else lib.num_steps
         row = lib.y_des[int(ci), :n].cpu().numpy()
+        if is_flat:
+            bb = row[:, base][:, :2]
+            bbox_center = 0.5 * (bb.max(axis=0) + bb.min(axis=0))
+            ox = float(center[0]) - float(bbox_center[0])
+            oy = float(center[1]) - float(bbox_center[1])
+        else:
+            ox, oy = float(corner[0]), float(corner[1])
         for body, colour in _TRAJ_BODIES:
             c = cols.get(body)
             if c is None:
@@ -194,12 +237,31 @@ def _add_tile_trajectories(server: viser.ViserServer, prefix: str, lib, tid: int
                     colors=np.full((len(allp), 3), _CONTACT_COLOR, np.uint8),
                     point_size=0.03,
                 )
+        if base is not None:
+            # The START, so the direction of travel is readable. A trajectory drawn as a bare
+            # ribbon is ambiguous end-to-end, and on a flat tile -- where the path wanders
+            # and the terrain gives no cue -- there is nothing else to read it from.
+            st = row[0][base].astype(np.float32).copy()
+            st[0] += ox
+            st[1] += oy
+            server.scene.add_icosphere(
+                f"{prefix}/traj_{k}/start", radius=0.14, color=(60, 220, 90),
+                position=(float(st[0]), float(st[1]), float(st[2])))
+        if mark_step is not None and 0 <= int(mark_step) < n and base is not None:
+            here = row[int(mark_step)][base].astype(np.float32).copy()
+            here[0] += ox
+            here[1] += oy
+            server.scene.add_icosphere(
+                f"{prefix}/traj_{k}/probe_step", radius=0.12, color=(255, 40, 40),
+                position=(float(here[0]), float(here[1]), float(here[2])))
         drawn += 1
     return drawn
 
 
 def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
-                    n_traj: int = 0, traj_seed: int = 0) -> trimesh.Trimesh:
+                    n_traj: int = 0, traj_seed: int = 0,
+                    mark_step: int | None = None,
+                    clutter: str | None = None, labels: bool = True) -> trimesh.Trimesh:
     """Render the terrain a clip library's manifest assembles into.
 
     Args:
@@ -215,6 +277,42 @@ def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
     from motion_gen.clips.clip_io import load_clip_library
 
     lib = load_clip_library(lib_path, "cpu")
+    _raw_man = lib.attrs.get("terrain_manifest")
+    for _m in (json.loads(_raw_man) if isinstance(_raw_man, str) else list(_raw_man or [])):
+        if "terrain_id" in _m:
+            _FAMILY[int(_m["terrain_id"])] = str(_m.get("family", "?")).replace(".h5", "")
+    if clutter:
+        from motion_gen.terrain.clutter import merge_flat_decor, merge_into_manifest
+        from motion_gen.terrain.ground_variants import merge_variants
+
+        with open(clutter) as fh:
+            doc = json.load(fh)
+        raw = lib.attrs.get("terrain_manifest")
+        man = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+        # Two sidecar kinds reach this flag. Schema 1 is the clutter pass, which only ever
+        # ADDS visual-only boxes; schema 2 is the terrain-variant pass, which edits the
+        # ground itself. Dispatching on the document rather than on a second flag keeps the
+        # viewer's job "show me what that file does".
+        if int(doc.get("schema", 1)) == 2:
+            n = merge_variants(man, doc, source=os.path.basename(lib_path))
+            print(f"[view_terrain_viser] TERRAIN VARIANT seed {doc.get('seed')}: "
+                  f"{n} tile(s) edited (floor / width / platform / walls)")
+        else:
+            n = merge_into_manifest(man, doc, source=os.path.basename(lib_path))
+        lib.attrs["terrain_manifest"] = man
+        # Flat tiles have no manifest entry, so their share arrives separately and is
+        # PAIRED onto the library's own room variants rather than replacing them: the
+        # rooms sit outside camera range at the shipped buffer, so they cost nothing to
+        # keep, and the combined list keeps the round-robin's period.
+        _flat = doc.get("flat_variants") or []
+        if _flat:
+            _raw = lib.attrs.get("flat_tile_decor")
+            _cur = (json.loads(_raw) if isinstance(_raw, str) else list(_raw or [])) \
+                if _raw is not None else []
+            lib.attrs["flat_tile_decor"] = merge_flat_decor(_cur, _flat)
+        if int(doc.get("schema", 1)) != 2:
+            print(f"[view_terrain_viser] clutter seed {doc.get('seed')}: "
+                  f"+{n} visual-only boxes")
     mesh, _origins, layout = assemble_clip_terrain(lib, num_rows=num_rows)
     _add_mesh(server, "/terrain", mesh, _GROUND_COLOR)
     # The VISUAL-ONLY decoration lives in its own mesh, out of the ground and out of the
@@ -229,12 +327,33 @@ def _render_library(server: viser.ViserServer, lib_path: str, num_rows: int,
     for ti in range(layout.num_tiles):
         tid = int(layout.tile_terrain_id[0, ti])
         corner = layout.tile_corner[0, ti].numpy()
+        if labels:
+            # The TERRAIN_ID, not the tile index. Everything downstream -- the manifest, the
+            # occupancy, the clutter sidecar, author_clutter --verify -- is keyed by
+            # terrain_id, while the scene node is named by position in the layout. Reading
+            # one for the other is how a question about a tile gets answered about a
+            # different tile. The family comes along because it is what the eye is actually
+            # sorting by.
+            fp_l = layout.tile_footprint[0, ti].numpy()
+            server.scene.add_label(
+                f"/lib_tile_{ti}/label",
+                text=(f"tid {tid} · {_FAMILY.get(tid, 'flat')}" if tid >= 0
+                      else f"flat (tile {ti})"),
+                position=(float(corner[0]) + float(fp_l[0]) / 2.0,
+                          float(corner[1]) + float(fp_l[1]) / 2.0, 3.0))
         overlays = layout.terrain_overlays.get(tid, [])
         _add_overlay_boxes(server, f"/lib_tile_{ti}", overlays, (float(corner[0]), float(corner[1])))
-        if n_traj > 0 and tid >= 0:
+        if n_traj > 0:
+            # Flat tiles were skipped here, which meant the one library kind whose decoration
+            # is authored around the MOTION -- flat rooms, and the terrain probe's sceneries --
+            # could never be checked against it. They need the tile CENTRE, not the corner.
+            fp = layout.tile_footprint[0, ti].numpy()
+            center = (float(corner[0]) + float(fp[0]) / 2.0,
+                      float(corner[1]) + float(fp[1]) / 2.0)
             total_traj += _add_tile_trajectories(
                 server, f"/lib_tile_{ti}", lib, tid,
-                (float(corner[0]), float(corner[1])), n_traj, traj_seed)
+                (float(corner[0]), float(corner[1])), n_traj, traj_seed,
+                center=center, mark_step=mark_step)
     print(f"[view_terrain_viser] library '{lib_path}': {layout.num_tiles} tiles x {num_rows} rows")
     if n_traj > 0:
         print(f"[view_terrain_viser] overlaid {total_traj} trajectories "
@@ -312,14 +431,37 @@ def main() -> None:
                         "the treads after a width edit, which the mesh alone cannot show.")
     p.add_argument("--traj-seed", type=int, default=0,
                    help="Which clips are sampled, so a re-run shows the same ones.")
+    p.add_argument("--no-labels", action="store_true",
+                   help="Hide the per-tile label. Labels carry the TERRAIN_ID, which is what "
+                        "every other tool keys on -- the scene-node names carry the tile's "
+                        "position in the layout instead, and the two are different numbers.")
+    p.add_argument("--clutter", default=None, metavar="SIDECAR.json",
+                   help="Overlay a clutter variant from author_clutter.py. It is drawn "
+                        "through the same decor channel as the library's own decoration, so "
+                        "what appears here is what the cameras get.")
+    p.add_argument("--mark-step", type=int, default=None, metavar="STEP",
+                   help="Red sphere on the pelvis at this clip step. Defaults to the probe "
+                        "step when the library is a terrain-probe one, because there the "
+                        "whole measurement is taken at a single instant and the picture has "
+                        "to show where the robot was standing when it was taken.")
     args = p.parse_args()
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("+z")
 
     if args.lib:
+        # A probe library states its own instant; nobody should have to retype it.
+        mark = args.mark_step
+        if mark is None:
+            import h5py
+            with h5py.File(args.lib, "r") as _f:
+                if "terrain_probe" in _f.attrs:
+                    mark = int(json.loads(_f.attrs["terrain_probe"])["start_step"])
+                    print(f"[view_terrain_viser] terrain-probe library: marking step {mark}")
         mesh = _render_library(server, args.lib, args.num_rows,
-                               n_traj=args.traj, traj_seed=args.traj_seed)
+                               n_traj=args.traj, traj_seed=args.traj_seed,
+                               mark_step=mark, clutter=args.clutter,
+                               labels=not args.no_labels)
     else:
         mesh = _render_subterrains(server, _load_cfg(args.cfg or "demo"))
 

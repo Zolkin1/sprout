@@ -25,8 +25,9 @@ What is drawn:
   camera. This is a REPORT, not an input -- placement does not use it (see
   ``make_perceptive_urdf``'s module docstring for why);
 * **yellow spheres** at each welded payload's centre of mass, labelled with its mass --
-  the compute backpack has no visual mesh yet but is 2.6 kg of the robot, so without this
-  it is invisible in exactly the view meant to sanity-check it;
+  the payload masses are otherwise invisible in exactly the view meant to
+  sanity-check them (the backpack SHELL does now have a mesh, ASSY_backpack.STL, but
+  its mass sits on separate thor/zed links that have none);
 * a **boresight ray** from each camera to where it meets the ground plane, with the range
   printed in the GUI, so "the far camera looks 4.2 m ahead" is checkable rather than
   asserted;
@@ -55,7 +56,9 @@ import yourdfpy
 from viser.extras import ViserUrdf
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
-_DEFAULT_URDF = os.path.join(_REPO, "robot_assets", "g1_perceptive", "g1_perceptive.urdf")
+from robot_rl.flow_matching.viz.robot import DEFAULT_URDF  # noqa: E402
+
+_DEFAULT_URDF = os.path.join(_REPO, DEFAULT_URDF)
 
 #: Trained field of view per camera, AFTER the edge crop (``g1_depth_env_cfg`` fov_h/fov_v
 #: minus twice fov_crop_deg). Quoted here rather than imported because that module pulls in

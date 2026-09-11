@@ -17,11 +17,18 @@ cannot be assumed equal, and a disagreement is a TRAIN/SERVE SKEW: the model wou
 on clouds that are systematically offset from the ones it is later handed. No amount of
 training corrects that, and nothing else in the repo compares the two.
 
-The depth IMAGE is taken from the live path and fed to both, deliberately. ``depth_image``
-applies ``DepthNoiser``, so calling it twice gives two different images and any comparison
-that re-reads it would measure the noise instead of the geometry. The dataset does the same
-thing -- it unprojects the depth row the recording already holds -- so this is also the
-honest analogue of what training does.
+The depth IMAGE is taken from the live path and fed to both, deliberately: the dataset does
+the same thing -- it unprojects the depth row the recording already holds -- so this is the
+honest analogue of what training does, and a comparison that re-read the sensor would risk
+measuring ``DepthNoiser`` instead of the geometry. (``DepthNoiser`` now shares one draw per
+camera per control step, and this script drives ``sim.step`` itself so the step counter never
+advances -- one frame for the whole run. That is what makes the two paths comparable, and it
+is also why no noise STATISTIC may be read off this script.)
+
+The cameras are the GENERATOR's, which is every camera the robot carries. The policy's group
+holds the near one alone, and it is the FAR camera -- the one that reads terrain ahead -- whose
+registration the xyz channels exist to fix, so scoping this to the policy would drop precisely
+the interesting half while ``n_cam`` adapted and the check still printed a pass.
 
 What is compared, per pose:
 
@@ -92,6 +99,9 @@ import robot_rl.tasks  # noqa: F401,E402
 from robot_rl.flow_matching.config import FlowMatchingConfig  # noqa: E402
 from robot_rl.flow_matching.dataset import FutureStateDataset as DS  # noqa: E402
 from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: E402
+from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (  # noqa: E402
+    install_fm_depth_group,
+)
 from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import (  # noqa: E402
     depth_camera_pose_yaw_frame,
 )
@@ -213,6 +223,10 @@ def main() -> int:
             [str(args_cli.clip_id)] * args_cli.num_envs
         )
 
+    # --task defaults to a TEACHER task, which installs no generator group of its own; put it
+    # on, at the scene's own resolution, so the check covers both cameras.
+    install_fm_depth_group(env_cfg)
+
     env = gym.make(args_cli.task, cfg=env_cfg)
     u = env.unwrapped
     robot = u.scene["robot"]
@@ -221,7 +235,7 @@ def main() -> int:
         u.sim.step(render=True)
     u.scene.update(u.physics_dt)
 
-    groups = mdp.rl_depth_groups(u)
+    groups = mdp.fm_depth_groups(u)
     spec = mdp.depth_camera_specs(u, groups)
     n_cam = len(spec)
     n_px = int(spec[0]["width"]) * int(spec[0]["height"])

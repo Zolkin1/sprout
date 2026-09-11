@@ -22,7 +22,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
-from deploy.depth_obs import parse_depth_spec  # noqa: E402
+from deploy.depth_obs import camera_key, parse_depth_spec  # noqa: E402
 from deploy.gen_tracker import GenTrackerPolicy  # noqa: E402
 
 _FOCAL = 2.2
@@ -97,6 +97,13 @@ def test_a_tracker_without_cameras_falls_back_to_the_generators_contract():
 ##
 
 def test_both_contracts_are_resolved_and_the_split_is_reported():
+    """Two grids on one lens: each artifact keeps its OWN contract and the split is reported.
+
+    ``depth_sampling_is_split()`` is what tells the runner it owes a second reading, and the
+    resolved ``get_depth_camera_spec()`` stays the TRACKER's because ``_build_obs`` looks its
+    cameras up by observation term. This is the SAMPLING relaxation, independent of the camera
+    SET one below.
+    """
     p = _policy(_pair(30, 26), _pair(60, 52, prefix="fm_"))
     assert p.depth_sampling_is_split() is True
     assert [(c["width"], c["height"]) for c in p.get_depth_camera_spec()] == [(30, 26)] * 2
@@ -145,10 +152,98 @@ def test_a_different_lens_is_still_refused_across_a_split():
         _policy(_pair(30, 26), fm)
 
 
-def test_a_camera_count_mismatch_is_refused():
+def test_a_tracker_camera_the_generator_lacks_is_refused():
+    """A subset in the WRONG direction: nothing in the pair can supply that camera."""
     fm = _pair(60, 52, prefix="fm_")[:1]
-    with pytest.raises(ValueError, match="cannot be reading the same physical pair"):
+    with pytest.raises(ValueError, match="does not have"):
         _policy(_pair(30, 26), fm)
+
+
+##
+# The tracker's cameras are a SUBSET of the generator's (the shipped configuration)
+#
+# The policy is conditioned on the NEAR camera alone; the generator reads both. So the two
+# contracts have different lengths, the runtime casts their UNION, and each consumer selects
+# its own rows BY NAME. An index pairing here is shape-clean and would simply feed one
+# consumer the other's image, which is why these assert on VALUES.
+##
+
+def _rows(policy, spec, rows, images):
+    """Run the selector for one consumer over a supplied reading."""
+    return policy._select_depth_rows(images, spec, rows, "test", "depth")
+
+
+def test_a_near_only_tracker_casts_the_union_and_needs_no_second_cast():
+    """The shipped pair: the tracker reads the near camera, the generator reads both.
+
+    Differing camera SETS is not a split SAMPLING. Both consumers want the same 30x26 grid,
+    so the runtime casts their UNION once -- the generator's contract, which is the superset
+    -- and each selects its own rows by name. Reporting a split here would make the runner
+    demand a second ``state["fm_depth"]`` cast that nothing produces and nothing needs.
+    """
+    p = _policy(_pair(30, 26)[:1], _pair(30, 26))
+    assert p.depth_camera_sets_differ() is True
+    assert p.depth_sampling_is_split() is False, "same grid: one cast serves both"
+    assert [camera_key(c) for c in p.get_depth_camera_spec()] == \
+        ["depth_camera_near", "depth_camera_far"]
+    assert [camera_key(c) for c in p.get_tracker_depth_camera_spec()] == ["depth_camera_near"]
+    assert [camera_key(c) for c in p.get_fm_depth_camera_spec()] == \
+        ["depth_camera_near", "depth_camera_far"]
+
+
+def test_the_union_feed_routes_the_right_image_to_each_consumer():
+    """VALUES, not shapes: an index pairing gives the tracker the far camera's image."""
+    p = _policy(_pair(30, 26)[:1], _pair(30, 26))
+    union = np.stack([np.full(780, 1.0), np.full(780, 2.0)])     # near = 1, far = 2
+    trk = _rows(p, p.get_tracker_depth_camera_spec(), p._trk_depth_rows, union)
+    assert trk.shape == (1, 780) and np.all(trk[0] == 1.0)
+    fm = p._fm_depth_reading({"depth": union})
+    assert fm.shape == (2, 780) and np.all(fm[0] == 1.0) and np.all(fm[1] == 2.0)
+
+
+def test_the_tracker_selects_by_name_and_not_by_position():
+    """A FAR-only tracker: by index it would read the union's row 0, the near camera."""
+    p = _policy(_pair(30, 26)[1:], _pair(30, 26))
+    union = np.stack([np.full(780, 1.0), np.full(780, 2.0)])
+    trk = _rows(p, p.get_tracker_depth_camera_spec(), p._trk_depth_rows, union)
+    assert np.all(trk[0] == 2.0), "row 1 (far) is this tracker's only camera"
+
+
+def test_a_reading_that_is_neither_the_union_nor_the_consumers_own_is_refused():
+    """Three rows are not two cameras and not one; say what both counts are."""
+    p = _policy(_pair(30, 26)[:1], _pair(30, 26))
+    with pytest.raises(ValueError, match="cast union"):
+        _rows(p, p.get_tracker_depth_camera_spec(), p._trk_depth_rows, np.zeros((3, 780)))
+
+
+def test_a_consumers_own_reading_is_still_accepted_unchanged():
+    """A caller that supplies exactly the tracker's cameras (hardware) is untouched."""
+    p = _policy(_pair(30, 26)[:1], _pair(30, 26))
+    own = np.full((1, 780), 7.0)
+    assert np.all(_rows(p, p.get_tracker_depth_camera_spec(), p._trk_depth_rows, own) == 7.0)
+
+
+def test_a_moved_mount_on_the_shared_camera_is_still_refused_across_a_subset():
+    """The relaxation is about which cameras, never about what they are."""
+    fm = _pair(30, 26)
+    fm[0]["mount_body"] = "pelvis_link"
+    with pytest.raises(ValueError, match="depth_camera_near.mount_body"):
+        _policy(_pair(30, 26)[:1], fm)
+
+
+def test_a_split_sampling_on_top_of_a_subset_still_needs_its_own_reading():
+    """Both relaxations at once: differing grids AND differing camera sets."""
+    p = _policy(_pair(30, 26)[:1], _pair(60, 52, prefix="fm_"))
+    assert p.depth_sampling_is_split() is True and p.depth_camera_sets_differ() is True
+    # No castable union: one array cannot hold 780 and 3120 pixel rows, so the cast is the
+    # tracker's own cameras and the generator's row map is withheld.
+    assert [(c["width"], c["height"]) for c in p.get_depth_camera_spec()] == [(30, 26)]
+    assert p._fm_depth_rows is None
+    with pytest.raises(KeyError, match="state\\['fm_depth'\\]"):
+        p._fm_depth_reading({"depth": np.zeros((1, 780))})
+    got = p._fm_depth_reading({"depth": np.zeros((1, 780)),
+                               "fm_depth": np.zeros((2, 60 * 52))})
+    assert got.shape == (2, 3120)
 
 
 if __name__ == "__main__":

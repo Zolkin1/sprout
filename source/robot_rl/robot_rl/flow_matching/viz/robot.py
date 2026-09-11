@@ -16,6 +16,17 @@ import viser
 import yourdfpy
 from viser.extras import ViserUrdf
 
+#: The robot every stage of the pipeline now uses, and therefore the one every viewer should
+#: draw by default. It is the trained robot: mode_11 motors, the 2.64 kg compute backpack,
+#: passive rubber hands, and the depth mounts on their as-built CAD pose.
+#:
+#: Declared ONCE. Five viewers used to carry their own copy and three of them had drifted --
+#: ``view_clip_viser`` was still defaulting to a 21-DoF model, which cannot even be permuted
+#: onto a 29-DoF recording. A default in five places is a default that rots in four of them.
+#:
+#: Repo-relative; callers resolve it against their own root.
+DEFAULT_URDF: str = "robot_assets/g1_perceptive/g1_perceptive.urdf"
+
 # Per-robot overlay colors (RGB 0-1), cycled by env index. Robot 0 keeps the
 # orange the old in-sim visualization used for the root line.
 _ROBOT_COLORS: tuple[tuple[float, float, float], ...] = (

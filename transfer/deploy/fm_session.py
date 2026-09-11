@@ -116,6 +116,14 @@ class FmContext:
 
     ``GenTrackerPolicy`` must use the same ``fm_update_every``: the horizon ``F`` is sized
     from this period. ``None`` for a graph exported before the field existed."""
+    history_source: str = "reference"
+    """What the ``N`` history rows this graph was FITTED on contained.
+
+    ``"reference"`` (the applied reference -- what the runtime's ``generator`` arm serves,
+    since a served node IS an applied reference) or ``"measured"`` (the robot's own achieved
+    state). The rows are the same WIDTH either way, so this is the only thing that can say
+    which, and ``GenTrackerPolicy.load`` refuses a serving arm that disagrees with it. A
+    graph exported before the flag is definitionally ``"reference"``."""
 
     binding: object | None = None
     """IoBinding holding the captured graph's fixed device buffers, or None when capture is off.
@@ -348,6 +356,10 @@ def load_fm_context(onnx_path: str, num_threads: int = 0, providers=None,
         # where only one side can say which robot it came from.
         robot_asset=m.get("robot_asset"),
         fm_snap_every=(int(m["fm_snap_every"]) if m.get("fm_snap_every") else None),
+        # Absent -> "reference": a graph exported before the flag was fitted on the applied
+        # reference, definitionally, because the measured path did not exist. Never resolved
+        # to whatever the training default becomes later.
+        history_source=str(m.get("history_source") or "reference"),
         # Trust the graph itself over the metadata flag: an input either exists or it does not.
         has_history_null=any(i.name == "history_null" for i in sess.get_inputs()),
     )

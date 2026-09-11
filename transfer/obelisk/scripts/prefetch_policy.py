@@ -17,6 +17,13 @@ policy to the SAME folder -- otherwise the robot keeps running the old one, sile
 
 The fetched pair is loaded before this exits, so a tracker/generator that disagree about
 the depth cameras are caught here rather than on the robot.
+
+That load runs under the CONTROLLER's OWN rules, read from the config fragment every launch
+file includes -- currently just ``allow_robot_asset_mismatch``, which lives there and
+nowhere else. Otherwise this script can be STRICTER than the node it is warming a cache
+for, which it was: the config allowed one known-benign ``mjcf_sha256`` delta (an actuator
+gain line the generator never reads) while this refused it, and a validator refusing what
+the robot will happily arm reads as a broken policy rather than as a two-place switch.
 """
 
 from __future__ import annotations
@@ -24,6 +31,8 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+
+import yaml
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _OBELISK_ROOT = os.path.dirname(_HERE)
@@ -39,6 +48,38 @@ from deploy.hardware import DEFAULT_HF_REPO_ID, fetch_artifacts  # noqa: E402
 #: the obelisk ROS stack, which this script deliberately does not need.
 DEFAULT_CACHE = os.path.join(_OBELISK_ROOT, "g1_control", "resource", "hf_cache")
 
+#: The shared low-level fragment. It is a FRAGMENT and cannot be launched on its own, which is
+#: exactly why it is the right file to read: ``g1.yml``, ``g1_cpp.yml`` and ``g1_debug_clip.yml``
+#: all include it, so one answer here covers every launch path.
+DEFAULT_CONTROLLER_CONFIG = os.path.join(_OBELISK_ROOT, "g1_control", "config", "common",
+                                         "low_level.yml")
+
+
+def controller_params(config_path: str) -> dict:
+    """Read the low-level controller node's ROS params out of its config fragment.
+
+    Parsed as plain YAML rather than through obelisk's loader: this script deliberately
+    imports no rclpy, and nothing here needs the include/keyed-merge semantics -- the params
+    this reads are declared in the fragment itself.
+
+    Args:
+        config_path: Config fragment declaring the ``low_level`` control node.
+
+    Returns:
+        That node's ``params`` mapping, or ``{}`` if the file, the ``control`` list or the
+        entry is absent. An unreadable config therefore falls back to the STRICT defaults,
+        which is the safe direction for a validator to fail in.
+    """
+    try:
+        with open(config_path) as f:
+            cfg = yaml.safe_load(f) or {}
+    except OSError:
+        return {}
+    for entry in cfg.get("control") or []:
+        if isinstance(entry, dict) and entry.get("name") == "low_level":
+            return entry.get("params") or {}
+    return {}
+
 
 def main() -> None:
     """Download and validate the policy pair into the controller's cache."""
@@ -50,6 +91,10 @@ def main() -> None:
                         help="Folder within the repo, as set in the controller config.")
     parser.add_argument("--cache_root", default=DEFAULT_CACHE,
                         help="Cache directory (defaults to the one the controller reads).")
+    parser.add_argument("--controller_config", default=DEFAULT_CONTROLLER_CONFIG,
+                        help="Config fragment to take the controller's own load-time rules "
+                             "from (currently allow_robot_asset_mismatch). Defaults to the "
+                             "fragment every launch file includes.")
     parser.add_argument("--refresh", action="store_true",
                         help="Re-download even on a cache hit (after re-pushing a policy).")
     args = parser.parse_args()
@@ -64,7 +109,14 @@ def main() -> None:
     for path in (tracker, fm):
         print(f"[INFO]   {path} ({os.path.getsize(path) / 1e6:.1f} MB)")
 
-    policy = GenTrackerPolicy(tracker, fm)
+    params = controller_params(args.controller_config)
+    allow_mismatch = bool(params.get("allow_robot_asset_mismatch", False))
+    if allow_mismatch:
+        print(f"[INFO] allow_robot_asset_mismatch: true, from {args.controller_config} -- a "
+              "fingerprint mismatch WARNS below instead of refusing, exactly as it will on the "
+              "robot. Read the fields it names: only an actuator-gain-only mjcf_sha256 delta "
+              "is benign.")
+    policy = GenTrackerPolicy(tracker, fm, allow_robot_asset_mismatch=allow_mismatch)
     policy.load()
     spec = policy.get_depth_camera_spec()
     extero = (", ".join(f"{c.get('sensor') or c['obs_term']} {int(c['width'])}x{int(c['height'])}"

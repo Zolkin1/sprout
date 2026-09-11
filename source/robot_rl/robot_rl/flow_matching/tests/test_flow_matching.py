@@ -21,6 +21,7 @@ import pytest
 import torch
 
 from robot_rl.flow_matching import (
+    DEFAULT_SKIP_FAMILIES,
     FKChain,
     FlowMatchingConfig,
     FlowMatchingTransformer,
@@ -1124,17 +1125,54 @@ def test_skip_families_drops_only_the_named_family():
 
 
 def test_skip_families_is_a_noop_when_nothing_is_requested():
-    """No flag, no copy: the common path must not pay for the filter."""
+    """An EMPTY selection is the off switch, and it must not pay for the filter."""
     keep_mask, data, meta = _windowed_with_families([0, 1], ["unknown", "family_jump_off"])
-    assert keep_mask(data, meta, FlowMatchingConfig(), 2) is None
+    assert keep_mask(data, meta, FlowMatchingConfig(skip_families=[]), 2) is None
 
 
-def test_skip_families_refuses_a_recording_without_the_tag():
-    """Silently training on the family you asked to exclude is the failure to avoid."""
+def test_the_shipped_default_drops_the_backwards_jump_off():
+    """The default is the whole point: two forward cameras cannot see a backwards dismount.
+
+    Pinned as a behaviour rather than as a constant so that changing the default without
+    meaning to shows up here, where the reason is written down.
+    """
+    keep_mask, data, meta = _windowed_with_families(
+        [0, 1, 2], ["unknown", "family_jump_off", "family_jump_off_front"])
+    keep = keep_mask(data, meta, FlowMatchingConfig(), 3)
+    # jump_off_FRONT is observable and must survive; only the backwards family goes.
+    assert keep.tolist() == [True, False, True]
+
+
+def test_a_defaulted_family_the_recording_lacks_is_a_printed_no_op():
+    """A flat-only library has NO family table, and that is not an error.
+
+    ``_clip_family_codes`` returns no names when the library has no terrain manifest, so a
+    perfectly current flat recording carries none. Refusing it would make the default
+    unusable on exactly the recordings that have nothing to drop.
+    """
     from robot_rl.flow_matching.dataset import _family_keep_mask
-    cfg = FlowMatchingConfig(skip_families=["family_jump_off"])
-    with pytest.raises(ValueError, match="predates them"):
+    assert _family_keep_mask({}, SimpleNamespace(family_names=[]), FlowMatchingConfig(), 4) is None
+
+
+def test_a_typed_family_the_recording_lacks_still_raises():
+    """A name the caller typed is an assertion; dropping nothing would read as success."""
+    from robot_rl.flow_matching.dataset import _family_keep_mask
+    cfg = FlowMatchingConfig(skip_families=["family_stairs_up"])
+    with pytest.raises(ValueError, match="does not contain"):
         _family_keep_mask({}, SimpleNamespace(family_names=[]), cfg, 4)
+
+
+def test_a_pre_default_checkpoint_keeps_meaning_what_it_meant():
+    """``skip_families: null`` on disk MEANT 'drop nothing' and must not adopt the new default.
+
+    The saved config is the only record of what a checkpoint's training set contained, so
+    letting an absent/None value resolve to the current default would restate a decision
+    taken after that run as a property of it -- the trap ``extero_clip=None`` already fell
+    into. An entirely ABSENT key reads the same way for the same reason.
+    """
+    assert FlowMatchingConfig.from_dict({"skip_families": None}).skip_families == []
+    # A key that was never written at all is a checkpoint from before the field existed.
+    assert FlowMatchingConfig.from_dict({}).skip_families == list(DEFAULT_SKIP_FAMILIES)
 
 
 def test_skip_families_refuses_a_name_the_recording_does_not_have():

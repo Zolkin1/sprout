@@ -160,3 +160,44 @@ claude_plans/
 # library passed in -- regenerate them, don't track them. (The hand-authored scenes next to
 # them, e.g. g1_29j_terrain_scene.xml, ARE tracked.)
 transfer/sim/robots/g1/*_s2s_*_scene.xml
+
+# Per-trial scenes written by transfer/sim/stair_probe.py. One file per flight geometry,
+# regenerated deterministically from the CLI on every run, so they are build output rather
+# than assets -- unlike the hand-invoked scenes beside them, which ARE tracked.
+transfer/sim/robots/g1/*_stair_probe_*.xml
+
+# Eval courses written by transfer/sim/mjeval/terrains.py. Twenty files, regenerated
+# deterministically from the catalogue on every `evaluate.py --stage scenes`, so they are
+# build output rather than assets. The catalogue IS tracked, and it is the authority: a run's
+# manifest.json records the geometry each course was emitted with, so a result stays readable
+# without the XML.
+transfer/sim/robots/g1/*_mjeval_*.xml
+
+# Per-tile scenes written by transfer/sim/mode_probe.py, one per probed tile (and per
+# --scene_tag when two probes share a tile). Rebuilt deterministically from the clip library's
+# terrain_manifest on every stage, including --stage label, which is the point: the labeller
+# regenerating the same geometry is what keeps the replay in the world the trials ran in.
+transfer/sim/robots/g1/*_modeprobe_*.xml
+
+# Lanes written by transfer/sim/vel_tracking_sweep.py -- one per terrain class (and per
+# --scene_tag when two sweeps run concurrently). Regenerated deterministically from the CLI's
+# approach/runout and geometry on every run, so they are build output rather than assets, and
+# the run's summary.json records the profile each lane was emitted with -- which is also what
+# the figure is drawn from, so a result stays readable without the XML.
+transfer/sim/robots/g1/*_veltrack_*.xml
+
+# Per-tile scenes written by transfer/sim/fm_noise_attribution.py. `CourseRig` rewrites
+# robots/g1/<robot>_<course>.xml from the course before loading it, and the sweep shards give
+# each worker its own scene TAG so concurrent workers cannot tear one file -- so a run leaves
+# one XML per shard. Regenerated deterministically from the clip library's terrain_manifest,
+# so they are build output rather than assets, exactly like the mjeval courses above.
+# ONE rule rather than a line per tool. This was four per-tool patterns (_attr*, _smoke,
+# _expl*, and _gate would have been a fifth), which is a shape that rots: every new probe
+# needs a new line, and forgetting one commits build output. The tracked tile scenes ALL end
+# in `_scene.xml` -- g1_perceptive_tile0_scene.xml and its five siblings -- so the negation
+# keeps exactly the assets and drops exactly the generated ones. Verified with
+# `git check-ignore -v` on both sets; the negation works because only FILES are excluded here
+# (a re-include cannot rescue a file under an excluded directory).
+transfer/sim/robots/g1/*_tile*.xml
+transfer/sim/robots/g1/*_clip*.xml
+!transfer/sim/robots/g1/*_scene.xml

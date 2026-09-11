@@ -16,13 +16,25 @@ the way a real depth camera would see it.  See
 needs its own ray-cast target pointed at an inner visual Xform.
 
 Depth REPLACES the height scan in the policy group: the hardware has cameras, not a
-heightmap, so a policy that leans on the scan is not deployable.  Two flavours differing
-only in the observation SHAPE:
+heightmap, so a policy that leans on the scan is not deployable.
 
-- :class:`G1TeacherTerrainDepthEnvCfg` -- flattened ``depth_near`` / ``depth_far`` terms
-  in the policy group.
-- :class:`G1TeacherTerrainDepthImageEnvCfg` -- each camera as an image-shaped
-  observation in its own group, for CNN backbones.
+**The POLICY reads the NEAR camera only; the GENERATOR reads both.**  The far camera is the
+generator's instrument -- it reads the terrain AHEAD, which is what a reference has to be
+planned onto -- while the tracker follows a reference that has already been placed and gains
+nothing from seeing 12 m out.  Dropping it from the policy group takes roughly half the depth
+cost off a 12k-iteration teacher run (``obs`` is 39% of the env step and ~19 ms of that is the
+two cameras).  Both cameras stay on the SCENE regardless: ``lazy_sensor_update`` (on by
+default) never casts a sensor that no observation term reads, so the far camera costs its
+per-env buffers and no rays, and leaving it there keeps its DR terms, the mount test
+(``tests/test_camera_mount_matches_urdf.py``) and MuJoCo's extrinsics mirroring describing the
+same physical pair the robot carries.  :func:`install_fm_depth_group` is what puts it back in
+front of an observation term, and is called wherever the generator runs or is recorded.
+
+Two flavours differing only in the observation SHAPE:
+
+- :class:`G1TeacherTerrainDepthEnvCfg` -- a flattened ``depth_near`` term in the policy group.
+- :class:`G1TeacherTerrainDepthImageEnvCfg` -- that camera as an image-shaped observation in
+  its own group, for CNN backbones.
 
 The CRITIC keeps its height scan, and the pelvis ``height_scanner`` therefore stays in
 the scene.  The critic is privileged and never deployed, so a complete terrain
@@ -397,8 +409,9 @@ class G1TeacherTerrainDepthSceneCfg(G1TeacherTerrainSceneCfg):
 class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
     """Teacher observations where DEPTH REPLACES the height scan in the policy group.
 
-    The policy sees terrain only through the cameras -- that is the point, since the
-    hardware has cameras and not a heightmap.  The critic keeps its height scan: it is
+    The policy sees terrain only through the NEAR camera -- that is the point, since the
+    hardware has cameras and not a heightmap, and the far one is the generator's (see the
+    module docstring).  The critic keeps its height scan: it is
     privileged, never deployed, so a complete terrain description there is free and gives
     the value function a stable target while the policy works the harder problem.  The
     ``height_scanner`` sensor therefore stays in the scene to feed it.
@@ -420,16 +433,37 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
         # PROPRIO_HISTORY_LENGTH stacking).
         # Noise is applied inside mdp.depth_image (driven by the resample_depth_noise
         # event), NOT via the term's `noise` field -- see mdp/sensors/noise.py.
+        #
+        # NEAR ONLY, and the far camera is absent by decision rather than by omission: it
+        # reads terrain ahead, which is what the GENERATOR needs to place a reference and
+        # what a tracker following an already-placed one does not. The sensor stays on the
+        # scene and is simply never cast (lazy_sensor_update), so this costs nothing but the
+        # rays. install_fm_depth_group re-observes it for the generator.
         depth_near = ObsTerm(
             func=mdp.depth_image,
             params={"sensor_cfg": SceneEntityCfg("depth_camera_near"), **_depth_obs_params(_NEAR)},
             clip=(-2.0, 2.0),
         )
-        depth_far = ObsTerm(
-            func=mdp.depth_image,
-            params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), **_depth_obs_params(_FAR)},
-            clip=(-2.0, 2.0),
-        )
+
+        #: The far camera's slot in the POLICY vector, declared and left OFF.
+        #:
+        #: Declared rather than deleted because a term's position in this class IS its position
+        #: in the observation vector, and every tracker checkpoint that exists was trained with
+        #: the far camera HERE -- between ``depth_near`` and ``reference_window`` (read off
+        #: ``2026-08-20_16-36-10_mode11_decor_plan_v1``'s exported ``observation_terms``).
+        #: Re-adding it in a ``__post_init__`` would APPEND it, past ``command_window``, and the
+        #: vector would be the right WIDTH with two blocks transposed -- a checkpoint that loads
+        #: clean and reads scrambled input, which is the failure mode this repo keeps paying for.
+        #:
+        #: ``None`` is the default because near-only is the decision for the next teacher
+        #: retrain; :func:`enable_policy_far_camera` turns it back on for running an EXISTING
+        #: two-camera checkpoint, which is every one on disk today.
+        #: NOTE the missing type annotation, and it is load-bearing: ``depth_near`` above is an
+        #: un-annotated class attribute, and ``configclass`` orders ANNOTATED fields ahead of
+        #: un-annotated ones. Written as ``depth_far: ObsTerm | None = None`` this slot lands
+        #: BEFORE ``depth_near`` -- measured, and the tracker then reads the far camera as the
+        #: near one: right width, transposed blocks, robot on the floor in a second.
+        depth_far = None
 
         def __post_init__(self):
             super().__post_init__()
@@ -536,14 +570,18 @@ class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainBodyEnvCfg):
 
 @configclass
 class G1TeacherTerrainDepthImageObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
-    """Moves the depth out of the policy group into per-camera image groups."""
+    """Moves the depth out of the policy group into its own image-shaped group.
+
+    Follows the flat variant's camera SET exactly -- the near camera alone -- so the two
+    depth teachers cannot disagree about how many cameras the policy reads. They differ in
+    the observation's SHAPE and in nothing else, which is what makes them an A/B.
+    """
 
     @configclass
     class PolicyCfg(G1TeacherTerrainDepthObservationsCfg.PolicyCfg):
         def __post_init__(self):
             super().__post_init__()
             self.depth_near = None
-            self.depth_far = None
 
     @configclass
     class DepthNearImageCfg(ObsGroup):
@@ -566,26 +604,8 @@ class G1TeacherTerrainDepthImageObservationsCfg(G1TeacherTerrainDepthObservation
             # would hand back a TensorDict, which rsl_rl's NaN check and our
             # train.py debug print do not dispatch on.
 
-    @configclass
-    class DepthFarImageCfg(ObsGroup):
-        depth_far_image = ObsTerm(
-            func=mdp.depth_image_4d,
-            params={
-                "sensor_cfg": SceneEntityCfg("depth_camera_far"),
-                "height": _DEPTH_H,
-                "width": _DEPTH_W,
-                **_depth_obs_params(_FAR),
-            },
-            clip=(-2.0, 2.0),
-        )
-
-        def __post_init__(self):
-            super().__post_init__()
-            self.enable_corruption = True
-
     policy: PolicyCfg = PolicyCfg()
     depth_near_image: DepthNearImageCfg = DepthNearImageCfg()
-    depth_far_image: DepthFarImageCfg = DepthFarImageCfg()
 
 
 @configclass
@@ -630,10 +650,69 @@ def apply_depth_play_trims(cfg) -> None:
 #: policy's everywhere a scene is walked by name.
 _FM_PREFIX = "fm_"
 
-#: The policy's cameras, in observation order, paired with the spec each was built from.
-_RL_CAMERAS: tuple[tuple[str, _CameraSpec], ...] = (
+#: The cameras the POLICY observes, in observation order, with the spec each was built from.
+#:
+#: NEAR ONLY -- the far camera reads terrain ahead, which is the generator's job (module
+#: docstring). Kept apart from :data:`_DEPTH_CAMERAS` rather than folded into it because the
+#: two are no longer the same list, and the invariant that matters is that this one is a
+#: strict SUBSET: there is ONE physical camera pair, and the policy reads part of it.
+#: Anything reasoning about the pair itself wants the full set; only the policy's own
+#: observation vector wants this one.
+_POLICY_CAMERAS: tuple[tuple[str, _CameraSpec], ...] = (
+    ("depth_camera_near", _NEAR),
+)
+
+def enable_policy_far_camera(cfg) -> None:
+    """Put the FAR camera back into the POLICY observation, in its historical slot.
+
+    The policy reads the near camera alone by decision (see :data:`_POLICY_CAMERAS`), taken
+    ahead of a teacher retrain that has not happened.  So every tracker checkpoint on disk was
+    trained on BOTH -- 3002 inputs against the 2222 a near-only task builds -- and cannot run
+    on a near-only task at all.  This restores the term for those runs.
+
+    **It fills the declared slot rather than adding one**, so the far block lands between
+    ``depth_near`` and ``reference_window`` exactly as the trained vector has it.
+
+    Call it BEFORE ``install_fm_depth_group``: the generator's group is built from the scene's
+    cameras and is unaffected either way, but the ordering of the two calls is what a reader
+    checks, so keep it the same everywhere.
+
+    Args:
+        cfg: A composed env cfg whose ``observations.policy`` carries the declared slot.
+
+    Raises:
+        AttributeError: If the policy group has no ``depth_far`` slot -- which would mean the
+            declaration was deleted and the ordering guarantee with it.
+    """
+    policy = cfg.observations.policy
+    if not hasattr(policy, "depth_far"):
+        raise AttributeError(
+            "observations.policy has no `depth_far` slot to fill. It is declared (as None) so "
+            "that enabling it preserves the trained term ORDER; adding it here instead would "
+            "append it past command_window and silently transpose the vector.")
+    policy.depth_far = ObsTerm(
+        func=mdp.depth_image,
+        params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), **_depth_obs_params(_FAR)},
+        clip=(-2.0, 2.0),
+    )
+
+
+#: Every depth camera the SCENE carries, in observation order -- the set the GENERATOR
+#: conditions on. What :func:`install_fm_depth_group` observes, mirrors and extends the DR
+#: over, and what :func:`assert_fm_depth_group_covers_every_camera` checks against.
+_DEPTH_CAMERAS: tuple[tuple[str, _CameraSpec], ...] = (
     ("depth_camera_near", _NEAR),
     ("depth_camera_far", _FAR),
+)
+
+#: The generator group's term names, aligned with :data:`_DEPTH_CAMERAS`.
+_FM_DEPTH_TERMS: tuple[str, ...] = ("fm_depth_near", "fm_depth_far")
+
+#: The per-camera DR terms one draw must cover, as ``format`` templates on the camera suffix.
+_DEPTH_DR_TERMS: tuple[str, ...] = (
+    "randomize_camera_extrinsics_{}",
+    "randomize_camera_intrinsics_{}",
+    "resample_depth_noise_{}",
 )
 
 
@@ -641,24 +720,30 @@ _RL_CAMERAS: tuple[tuple[str, _CameraSpec], ...] = (
 class G1FmDepthObservationsCfg(ObsGroup):
     """The GENERATOR's depth, in its own group so the policy's vector is untouched.
 
+    Covers BOTH cameras, always. The ``sensor_cfg`` entries below name the POLICY's sensors,
+    which is the normal case -- the generator samples the same 30x26 grid and simply reads
+    them. :func:`install_fm_depth_group` rewrites them to the ``fm_``-prefixed duplicates
+    when the generator samples on its own grid.
+
     Flat per camera (``mdp.depth_image``), because ``depth_obs_stack`` -- which is what the
     recorder writes and what ``FmTrackingCommand`` reads -- stacks flat rows; the FM's
     convolutional encoder folds them back using the geometry from its own camera contract.
 
-    The normalization comes from the SAME ``_depth_obs_params`` as the policy's terms, so
-    the two samplings of one lens cannot end up on different affine transforms.
+    The normalization comes from the SAME ``_depth_obs_params`` as the policy's term, so the
+    two readings of one lens cannot end up on different affine transforms. When the group
+    reads the policy's own sensor, one physical camera is read by two observation terms in
+    one step -- ``DepthNoiser`` shares the frame's draw so they see the same image, which is
+    what the hardware does and what ``--dump_replay`` needs.
     """
 
     fm_depth_near = ObsTerm(
         func=mdp.depth_image,
-        params={"sensor_cfg": SceneEntityCfg(f"{_FM_PREFIX}depth_camera_near"),
-                **_depth_obs_params(_NEAR)},
+        params={"sensor_cfg": SceneEntityCfg("depth_camera_near"), **_depth_obs_params(_NEAR)},
         clip=(-2.0, 2.0),
     )
     fm_depth_far = ObsTerm(
         func=mdp.depth_image,
-        params={"sensor_cfg": SceneEntityCfg(f"{_FM_PREFIX}depth_camera_far"),
-                **_depth_obs_params(_FAR)},
+        params={"sensor_cfg": SceneEntityCfg("depth_camera_far"), **_depth_obs_params(_FAR)},
         clip=(-2.0, 2.0),
     )
 
@@ -669,77 +754,166 @@ class G1FmDepthObservationsCfg(ObsGroup):
         self.enable_corruption = True
 
 
-def add_fm_depth_pair(cfg, width: int, height: int) -> str | None:
-    """Give the GENERATOR its own camera pair, sampling the same lenses at ``width x height``.
+def assert_fm_depth_group_covers_every_camera(cfg) -> None:
+    """Refuse a generator group that does not name every depth camera on the scene.
 
-    The point is to let the FM's vision input change without retraining the policy: the
-    policy keeps its own cameras and its own observation vector, and the generator gets a
-    second pair on the SAME mounts, with the same apertures, ranges and normalization --
-    only the ray grid differs. Everything physical is shared by CONSTRUCTION (both pairs are
-    built from the same ``_CameraSpec``) rather than checked afterwards.
-
-    A no-op returning ``None`` when the resolution already matches the policy's, which is
-    what keeps every consumer's scoping free: with no ``fm_depth`` group,
-    ``mdp.fm_depth_groups`` returns ``None``, which means "all groups", which is exactly
-    today's behaviour.
-
-    The DR events are EXTENDED rather than duplicated -- each existing per-camera term
-    swaps ``sensor_cfg`` for a ``sensor_cfgs`` list covering both samplings -- so one draw
-    moves both, and there is no second term whose ordering against the first could matter.
+    THE FAILURE THIS EXISTS FOR IS SILENT, and nothing downstream can catch it. The policy
+    group holds the near camera alone; with no ``fm_depth`` group, ``mdp.fm_depth_groups``
+    returns ``None`` = "every group", so the recorder would capture ONE camera, stamp a
+    one-camera ``depth_camera_spec`` into the recording, train a generator on it, export a
+    matching ``fm.onnx``, and pass the deploy-time agreement check -- every artifact
+    self-consistent about a half-blind generator, and indistinguishable from a deliberate
+    one-camera design.
 
     Args:
-        cfg: A depth env cfg (needs ``scene``, ``observations`` and ``events``), modified
-            in place.
-        width: Rays across for the generator's cameras.
-        height: Rays down.
-
-    Returns:
-        The observation group name that was added, or ``None`` if nothing was needed.
+        cfg: A depth env cfg carrying ``scene`` and ``observations``.
 
     Raises:
-        ValueError: If ``cfg`` carries no policy depth cameras to mirror.
-    
-    TODO(one-sampling): this whole second pair is a DEVELOPMENT feature -- it lets the
-    generator's grid change without retraining the teacher. The long-term intent is that the
-    two match, and then this function, the ``fm_depth`` obs group, MuJoCo's second cast and
-    ``GenTrackerPolicy.depth_sampling_is_split`` all go. Hardware never supported it:
-    ``export_sensor_configs.py`` raises on a split rather than emit configs covering only the
-    tracker, so a split pair cannot reach a robot.
+        ValueError: If the group is absent, or names a different set of physical cameras
+            than the scene carries.
     """
-    missing = [name for name, _ in _RL_CAMERAS if getattr(cfg.scene, name, None) is None]
+    group = getattr(cfg.observations, mdp.FM_DEPTH_OBS_GROUP, None)
+    if group is None:
+        raise ValueError(
+            f"no '{mdp.FM_DEPTH_OBS_GROUP}' observation group; the generator would fall back "
+            "to 'every group', which on this task is the policy's NEAR camera alone. Call "
+            "install_fm_depth_group(env_cfg) before gym.make."
+        )
+    named = {
+        term.params["sensor_cfg"].name
+        for term in vars(group).values()
+        if isinstance(term, ObsTerm) and "sensor_cfg" in (term.params or {})
+    }
+    observed = {name.removeprefix(_FM_PREFIX) for name in named}
+    on_scene = {
+        name for name, sensor in vars(cfg.scene).items()
+        if isinstance(sensor, MultiMeshRayCasterCameraCfg) and not name.startswith(_FM_PREFIX)
+    }
+    if observed != on_scene:
+        raise ValueError(
+            f"the generator's '{mdp.FM_DEPTH_OBS_GROUP}' group observes {sorted(observed)} "
+            f"but the scene carries {sorted(on_scene)}. The generator must see every camera "
+            "the robot has -- a missing one is a half-blind generator whose recording, "
+            "checkpoint and fm.onnx all agree with each other."
+        )
+
+
+def _clear_fm_depth_sampling(cfg) -> None:
+    """Remove any generator-owned camera duplicates, restoring the single-sensor DR terms.
+
+    Makes :func:`install_fm_depth_group` re-entrant, which it has to be: a task installs the
+    group at the policy's resolution in ``__post_init__`` and ``play.py`` then re-installs it
+    at whatever resolution the checkpoint states. Without this a split-then-shared call would
+    leave the first call's ``fm_`` cameras on the scene -- cast every step, read by nothing.
+
+    Args:
+        cfg: A depth env cfg (``scene`` and ``events``), modified in place.
+    """
+    for name, _ in _DEPTH_CAMERAS:
+        fm_name = f"{_FM_PREFIX}{name}"
+        if hasattr(cfg.scene, fm_name):
+            delattr(cfg.scene, fm_name)
+        suffix = name.rsplit("_", 1)[-1]                      # "near" / "far"
+        for template in _DEPTH_DR_TERMS:
+            term = getattr(cfg.events, template.format(suffix), None)
+            if term is None or "sensor_cfgs" not in (term.params or {}):
+                continue
+            term.params.pop("sensor_cfgs")
+            term.params["sensor_cfg"] = SceneEntityCfg(name)
+
+
+def install_fm_depth_group(cfg, width: int | None = None, height: int | None = None) -> str:
+    """Give the GENERATOR its observation group, covering EVERY depth camera on the scene.
+
+    ALWAYS installs the group, and the group always names both cameras. That is the whole
+    point: the policy reads the near camera alone, so "no group" no longer means "the
+    generator and the policy see the same thing" -- it means the generator sees half the
+    robot's cameras, silently (see :func:`assert_fm_depth_group_covers_every_camera`). Call
+    this wherever the generator runs or is recorded: the FM tracker and fine-tune tasks do it
+    in ``__post_init__``, ``record_data.py`` / ``play.py`` / ``augment_registration.py`` do it
+    before ``gym.make``.
+
+    Two arms, and only the SAMPLING differs between them:
+
+    * ``width x height`` equal to the policy's (the normal case, and the default when they
+      are left unset) -- the group's terms point at the EXISTING scene sensors. No second
+      camera, no second ray cast, DR untouched. One physical camera is then read by two
+      observation terms in one step, and ``DepthNoiser`` shares the frame's draw between them
+      so they get the same image rather than two independent dropout patterns.
+    * anything else -- a duplicate ``fm_``-prefixed camera per lens, built from the SAME
+      ``_CameraSpec`` (same mount, apertures, range and normalization; only the ray grid
+      differs), and the three per-camera DR terms EXTENDED to ``sensor_cfgs`` lists so one
+      draw moves both samplings. Everything physical is shared by CONSTRUCTION rather than
+      checked afterwards.
+
+    Re-entrant: calling it again replaces the group and tears down any duplicates the
+    previous call built.
+
+    Args:
+        cfg: A depth env cfg (needs ``scene``, ``observations`` and ``events``), modified in
+            place.
+        width: Rays across for the generator's cameras. ``None`` = the policy's.
+        height: Rays down. ``None`` = the policy's.
+
+    Returns:
+        The observation group name that was installed.
+
+    Raises:
+        ValueError: If ``cfg`` carries no depth cameras to observe.
+
+    TODO(one-sampling): the SPLIT arm is a DEVELOPMENT feature -- it lets the generator's grid
+    change without retraining the teacher. The long-term intent is that the two match, and
+    then the ``fm_`` cameras, MuJoCo's second cast and
+    ``GenTrackerPolicy.depth_sampling_is_split`` all go, leaving this function as the shared
+    arm alone. Hardware never supported the split: ``export_sensor_configs.py`` raises rather
+    than emit configs covering only the tracker.
+    """
+    missing = [name for name, _ in _DEPTH_CAMERAS if getattr(cfg.scene, name, None) is None]
     if missing:
         raise ValueError(
-            f"add_fm_depth_pair needs the policy's depth cameras {missing} on the scene; "
-            "this looks like a task without cameras (the height-scan teacher/tracker)."
+            f"install_fm_depth_group needs the scene's depth cameras {missing}; this looks "
+            "like a task without cameras (the height-scan teacher/tracker)."
         )
-    if (int(width), int(height)) == (_DEPTH_W, _DEPTH_H):
-        print(f"[INFO] fm depth resolution {width}x{height} matches the policy's -- the "
-              "generator reads the policy's cameras and no second pair is built.")
-        return None
+    w = _DEPTH_W if width is None else int(width)
+    h = _DEPTH_H if height is None else int(height)
+    split = (w, h) != (_DEPTH_W, _DEPTH_H)
 
-    for name, spec in _RL_CAMERAS:
-        setattr(cfg.scene, f"{_FM_PREFIX}{name}",
-                _make_depth_camera(spec, width=int(width), height=int(height)))
-    setattr(cfg.observations, mdp.FM_DEPTH_OBS_GROUP, G1FmDepthObservationsCfg())
+    _clear_fm_depth_sampling(cfg)
 
-    # One draw per physical camera, now covering both of its samplings.
-    for name, _ in _RL_CAMERAS:
-        suffix = name.rsplit("_", 1)[-1]                     # "near" / "far"
-        shared = [SceneEntityCfg(name), SceneEntityCfg(f"{_FM_PREFIX}{name}")]
-        for term_name in (f"randomize_camera_extrinsics_{suffix}",
-                          f"randomize_camera_intrinsics_{suffix}",
-                          f"resample_depth_noise_{suffix}"):
-            term = getattr(cfg.events, term_name, None)
-            if term is None:
-                continue                                     # trimmed away (a play cfg)
-            term.params.pop("sensor_cfg", None)
-            term.params["sensor_cfgs"] = shared
+    group = G1FmDepthObservationsCfg()
+    for term_name, (camera, spec) in zip(_FM_DEPTH_TERMS, _DEPTH_CAMERAS, strict=True):
+        if split:
+            setattr(cfg.scene, f"{_FM_PREFIX}{camera}",
+                    _make_depth_camera(spec, width=w, height=h))
+            getattr(group, term_name).params["sensor_cfg"] = SceneEntityCfg(
+                f"{_FM_PREFIX}{camera}"
+            )
+    setattr(cfg.observations, mdp.FM_DEPTH_OBS_GROUP, group)
 
-    rays = int(width) * int(height)
-    print(f"[INFO] fm depth pair added at {width}x{height} ({rays} px/camera, "
-          f"{2 * rays} total) in obs group '{mdp.FM_DEPTH_OBS_GROUP}'; the policy keeps "
-          f"{_DEPTH_W}x{_DEPTH_H}. Ray cost scales with the pixel count, so this pair is "
-          f"{rays / (_DEPTH_W * _DEPTH_H):.2g}x the policy pair's.")
+    if split:
+        # One draw per physical camera, now covering both of its samplings.
+        for camera, _ in _DEPTH_CAMERAS:
+            suffix = camera.rsplit("_", 1)[-1]                # "near" / "far"
+            shared = [SceneEntityCfg(camera), SceneEntityCfg(f"{_FM_PREFIX}{camera}")]
+            for template in _DEPTH_DR_TERMS:
+                term = getattr(cfg.events, template.format(suffix), None)
+                if term is None:
+                    continue                                  # trimmed away (a play cfg)
+                term.params.pop("sensor_cfg", None)
+                term.params["sensor_cfgs"] = shared
+
+    assert_fm_depth_group_covers_every_camera(cfg)
+
+    rays = w * h
+    if split:
+        print(f"[INFO] fm depth pair added at {w}x{h} ({rays} px/camera, {2 * rays} total) "
+              f"in obs group '{mdp.FM_DEPTH_OBS_GROUP}'; the policy keeps "
+              f"{_DEPTH_W}x{_DEPTH_H}. Ray cost scales with the pixel count, so this pair is "
+              f"{rays / (_DEPTH_W * _DEPTH_H):.2g}x the policy pair's.")
+    else:
+        print(f"[INFO] obs group '{mdp.FM_DEPTH_OBS_GROUP}' installed over the scene's own "
+              f"{w}x{h} cameras {[n for n, _ in _DEPTH_CAMERAS]}; no second sampling, no "
+              f"second ray cast. The policy reads {[n for n, _ in _POLICY_CAMERAS]}.")
     return mdp.FM_DEPTH_OBS_GROUP
 
 

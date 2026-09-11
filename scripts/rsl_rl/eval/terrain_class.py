@@ -54,8 +54,16 @@ COARSE_CLASSES: tuple[str, ...] = ("flat", "jump", "stairs")
 
 #: Manifest family -> coarse class.  ``unknown`` is the recorder's label for a window with no
 #: terrain, which is flat by construction.
+#:
+#: ``family_distractor`` is FLAT, and it is the most useful member of that class rather than an
+#: awkward one: the robot walks past a box it never touches, so the motion is ordinary walking
+#: while terrain-shaped geometry sits in frame.  That is exactly the discrimination the
+#: stairs->jump measurement is about, so a reference built without it is missing the negative
+#: examples that matter most.  It was absent here only because the first reference was built
+#: from a recording with ``skip_distractors`` already applied, so those windows never appeared
+#: -- ``dump_reference_windows.py`` deliberately applies no filter and surfaced the gap.
 FAMILY_TO_COARSE: dict[str, str] = {
-    "unknown": "flat", "flat": "flat", "family_flat": "flat",
+    "unknown": "flat", "flat": "flat", "family_flat": "flat", "family_distractor": "flat",
     "family_stairs_up": "stairs", "family_stairs_down": "stairs",
     "family_stairs_up_pure": "stairs", "family_stairs_dn_pure": "stairs",
     "family_jump_on": "jump", "family_jump_off": "jump", "family_jump_off_front": "jump",
@@ -205,6 +213,48 @@ class TerrainClassifier:
         nn = self.labels[np.argpartition(d, self.k, axis=1)[:, :self.k]]
         return np.array([np.bincount(r, minlength=len(COARSE_CLASSES)).argmax()
                          for r in nn], dtype=np.int64)
+
+
+def clip_coarse_codes(lib_path: str) -> np.ndarray:
+    """True coarse class per clip id, for labelling a plan the classifier just read.
+
+    The classifier answers "what does this plan look like"; this answers "what should it
+    have looked like", and the pair is what makes a misread identifiable at all.
+
+    Family is a property of the TILE, not of the clip manager: the library gives each clip a
+    ``terrain_id`` and the terrain manifest names that tile's family. Flat clips carry
+    ``terrain_id = -1`` and have no manifest entry, which is the ``flat`` class rather than a
+    missing one.
+
+    Args:
+        lib_path: The clip library ``.h5`` the run is using.
+
+    Returns:
+        ``(num_clips,)`` int codes into :data:`COARSE_CLASSES`; ``-1`` where the tile's
+        family has no coarse class, rather than guessing one.
+    """
+    import h5py  # noqa: PLC0415
+
+    from sampler import normalize_family  # noqa: PLC0415
+
+    with h5py.File(lib_path, "r") as f:
+        tid = np.asarray(f["terrain_id"][:]).astype(np.int64)
+        raw = f.attrs.get("terrain_manifest")
+    entries = json.loads(raw) if isinstance(raw, str) else list(raw or [])
+    fam_of_tile = {int(m["terrain_id"]): normalize_family(m.get("family", m.get("type", "?")))
+                   for m in entries}
+    # FAMILY_TO_COARSE is keyed with the "family_" prefix the recording uses; the manifest
+    # stores it stripped, so put it back rather than duplicating the table.
+    flat = COARSE_CLASSES.index("flat")
+    out = np.full(tid.shape[0], -1, dtype=np.int64)
+    for i, t in enumerate(tid.tolist()):
+        if t < 0:
+            out[i] = flat
+            continue
+        key = f"family_{fam_of_tile.get(int(t), '?')}"
+        if key in FAMILY_TO_COARSE:
+            out[i] = COARSE_CLASSES.index(FAMILY_TO_COARSE[key])
+    return out
 
 
 def main() -> int:
