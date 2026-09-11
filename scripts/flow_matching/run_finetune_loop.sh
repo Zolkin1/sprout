@@ -63,12 +63,26 @@ SUCCESS_C="${SUCCESS_C:-10.0}"
 #: later round refits against `r + gamma^N V` with V FROZEN as the previous round's
 #: predictions on disk. 1 = pure MC, i.e. the old behaviour.
 FVI_ROUNDS="${FVI_ROUNDS:-2}"
-#: The SPEED-MISMATCH arm's fraction, within the eligible population. Off by default: it is a
-#: third change on top of the reward and the spawns, and an arm nobody asked for should not be
-#: in a run's data silently. Set it per run (SPEED_MISMATCH=0.5) once the reward itself has a
-#: baseline. The reward scores velocity against the NOMINAL speed, so this arm is a
-#: corruption to reject rather than a command to follow -- see the cfg field's docstring.
-SPEED_MISMATCH="${SPEED_MISMATCH:-0.0}"
+#: The SPEED-MISMATCH arm's fraction, within the eligible population (so 0.30 of the perturbed
+#: envs is ~15% of episodes). The reward scores velocity against the NOMINAL speed, so this arm
+#: is an input corruption to REJECT rather than a command to follow -- see the cfg field's
+#: docstring.
+#:
+#: 0.30 because EVERY REPORTED RESULT WAS MEASURED AT 0.30, and the default used to be 0.0.
+#: The whole `vm30_*` ladder ran at it -- awr_h05 0.7838, box2 0.6379, fbc 0.5305, arrived
+#: 0.4719, bc 0.0000, plus the up-into-down and in-distribution arms -- each arm's own loop
+#: banner ("speed-mismatch 0.30") being the evidence. Only the superseded `prog_s3` ran at 0.0.
+#: A re-launch from the old default therefore reproduced none of the numbers we report, and
+#: nothing in the output said so; the arm now travels in the repo instead of in three talos
+#: launchers.
+#:
+#: **This value is NOT justified by a measured gain, and do not quote one.** The nearest
+#: comparison, `prog_s3` at 0.0, scored 0.5333 against vm30_box2's 0.6379 -- but that is
+#: pooled over 7591 episodes versus first-per-env over 4200, i.e. a different reducer AND a
+#: different episode count, and the pooled number is biased low (see `first_per_env`). The
+#: 0.30-vs-0.0 A/B at matched settings has never been run. What justifies 0.30 is
+#: reproducibility of the reported ladder, nothing more.
+SPEED_MISMATCH="${SPEED_MISMATCH:-0.30}"
 BETA="${BETA:-0.5}"
 WORKERS="${WORKERS:-16}"
 PROJECT="${PROJECT:-robot_rl_awr}"
