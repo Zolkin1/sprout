@@ -234,13 +234,43 @@ def from_json(raw) -> Schedule:
 
 def terrain_interaction_schedule(rng, cell: tuple, band: tuple, ref_speed: float, n_seg: int,
                           sign: float, vy_range=(0.0, 0.0), wz_range=(0.0, 0.0),
-                          p_straight: float = 0.5) -> list:
+                          p_straight: float = 0.5, hold_vx: float | None = None,
+                          p_constant: float = 1.0) -> list:
     """``[(fraction_of_replay, vx, vy, wz)]`` -- the command while the terrain traversal plays.
 
-    The motion is a single fixed replay and nothing here changes it; this is ``target_vel`` only. What
-    it buys is the one thing a constant command cannot: the generator sees the SAME motion asked for
-    at several commands, which is what teaches it that a command selects a reference rather than
-    describing one.
+    The motion is a single fixed replay and nothing here changes it; this is ``target_vel`` only.
+
+    **``vx`` DEFAULTS TO THE ADJOINING HOLD'S OWN COMMAND (``hold_vx``), not to a fresh draw**, and
+    that is what keeps the command from dating the terrain. An independent draw here is a different
+    value from the approach's in almost every clip, and the resulting step has both its edges welded
+    to the terrain: the leading one because the entry-transient piece inherits this value, so it
+    lands at the transient's FORCED horizon, and the trailing one because the replay's last frame is
+    where the exit hold takes over. Measured on g1_mb_v6f, that step opened 1.04-1.06 s before the
+    traversal in 99.1% of terrain clips (86.2% at 1.04 s alone -- ``terrain_transient_tokens`` makes
+    ``kept_s = 8*nfpt/fps`` a constant, so the lead does not even vary with speed) and closed on the
+    traversal's last frame in 99.7%, returning to the pre-terrain value 70.3% of the time. A
+    rectangular pulse whose edges ARE the terrain boundaries is a cue the generator can read instead
+    of the depth image, and it is the vx twin of the lateral/yaw detector ``p_straight`` fixes below.
+
+    **Nothing is lost by dropping the draw, because the lesson it existed for is carried ACROSS
+    clips.** The point was that the generator sees the SAME motion asked for at several commands --
+    that a command SELECTS a reference rather than describing one. Measured on v6f, one tile's fixed
+    replay already appears under 50 distinct commands spanning the full 0.20-2.50 m/s band across its
+    50 clips, so the within-clip step adds no command the model does not already see on that exact
+    reference. It only adds the cue.
+
+    ``p_constant`` is the probability of taking ``hold_vx``; below 1.0 the rest fall back to the
+    independent draw, which is the A/B rather than a mode anyone should ship. With ``hold_vx`` absent
+    the old behaviour is unchanged, so a caller that does not know the holds is not silently given a
+    constant.
+
+    **On a BOX one edge is unavoidable and it is deliberately put at the EXIT.** ``hold_vx`` is the
+    APPROACH-side pin, and a box's two sides are different surfaces with different bands
+    (``box_vel_range`` against ``box_top_vx_range``), so the exit hold cannot equal it: the step
+    survives at the traversal's end. That is the right end to keep it. The decision the generator has
+    to make from depth is whether to MOUNT, which happens on the approach; a step that lands once the
+    terrain is already behind the robot cannot forewarn that decision. On stairs ``pin_a == pin_x``,
+    so those clips come out constant end to end with no step at all.
 
     **vx is constrained; vy and wz are not, and that asymmetry is the whole design.**
 
@@ -293,13 +323,31 @@ def terrain_interaction_schedule(rng, cell: tuple, band: tuple, ref_speed: float
         return 0.0, 0.0
 
     straight = float(rng.random()) < float(p_straight)     # per CLIP, not per segment
+
+    # Per CLIP: does the traversal simply KEEP the adjoining hold's command? The coin is only drawn
+    # when it can actually go both ways, so the shipped p_constant = 1.0 spends no rng and a build
+    # with the knob at its default is reproducible against one that has never seen it.
+    if hold_vx is None or float(p_constant) <= 0.0:
+        constant = False
+    elif float(p_constant) >= 1.0:
+        constant = True
+    else:
+        constant = float(rng.random()) < float(p_constant)
+    # Measured on v6f, the planned command already lay inside cell ∩ band in 100% of clips of every
+    # family, so this clamp never bound. It stays because that is a measurement of ONE library, not a
+    # property of the code: a wider band or a narrower cell would make it bind, and a command outside
+    # the cell points at a different reference, which is the one thing this function may not emit.
+    pin = (None if not constant else
+           abs(float(hold_vx)) if degenerate else min(max(abs(float(hold_vx)), lo), hi))
+
     cuts = sorted(float(x) for x in rng.uniform(0.0, 1.0, size=n - 1)) if n > 1 else []
     out, prev = [], 0.0
     for c in list(cuts) + [1.0]:
-        vx = (float(sign) * abs(float(ref_speed)) if degenerate
+        vx = (float(sign) * float(pin) if constant
+              else float(sign) * abs(float(ref_speed)) if degenerate
               else float(sign) * float(rng.uniform(lo, hi)))
         vy, wz = (0.0, 0.0) if straight else _lat()
         out.append((float(c) - prev, vx, vy, wz))
         prev = float(c)
     out = [r for r in out if r[0] > 1e-6]
-    return out or [(1.0, float(sign) * abs(float(ref_speed)), 0.0, 0.0)]
+    return out or [(1.0, float(sign) * (float(pin) if constant else abs(float(ref_speed))), 0.0, 0.0)]

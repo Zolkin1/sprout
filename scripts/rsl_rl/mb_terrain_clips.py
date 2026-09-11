@@ -546,12 +546,22 @@ def plan_from_spec(sources, args, dev, builder) -> TerrainPlan:
         riser=(args.riser if family.geom == "stairs" else None),
         tread=(args.tread if family.geom == "stairs" else None),
         box_height=(args.box_height if family.geom == "box" else None))
+    # The APPROACH-side pin is what the traversal keeps, so no command step lands where the robot
+    # has to decide to mount. ``_rl_holds`` runs the approach outermost-first, so its LAST entry is
+    # the hold adjoining the terrain; falling back to the clip's own steady command covers the
+    # matcher-free callers that plan no holds at all.
+    _holds_in = getattr(args, "rl_holds", None) or {}
+    _approach_in = _holds_in.get("approach") or []
+    _hold_vx = (float(_approach_in[-1][1]) if _approach_in
+                else float(_holds_in.get("interaction", float(getattr(args, "terrain_speed", 0.0)))))
     inter_sched = cs.terrain_interaction_schedule(
         np.random.default_rng([int(getattr(args, "clip_seed", 0)) % (2 ** 31), 991]),
         _cell, tuple(getattr(args, "rl_vel_range", RL_CMD_VEL_RANGE)), abs(ref_speed),
         int(getattr(args, "terrain_cmd_segments", 1)), float(family.exit_sign),
         vy_range=tuple(getattr(args, "terrain_cmd_vy_range", (0.0, 0.0))),
-        wz_range=tuple(getattr(args, "terrain_cmd_wz_range", (0.0, 0.0))))
+        wz_range=tuple(getattr(args, "terrain_cmd_wz_range", (0.0, 0.0))),
+        hold_vx=_hold_vx,
+        p_constant=float(getattr(args, "terrain_cmd_p_constant", 1.0)))
     print(f"[mb_terrain] {family.skill}: {family.blurb}")
     print(f"[mb_terrain]   reference {ri}/{len(sources)} '{ts.name}' "
           + (f"riser={tm.get('riser', 0):.3f} tread={tm.get('tread', 0):.3f} "
@@ -832,15 +842,31 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
     # the usual 3 slots, with the loop folded into "approach" -- everything downstream (anchor mask, sole
     # report, keyframe sidecar) indexes those three and does not care that the first one has two parts.
     loop_piece = None
-    if bool(a_prov.get("bounded")) and getattr(args, "stride_bank", None) and approach is not None:
+    # A DISMOUNT ON A ONE-SIDED TILE HAS NO APPROACH, AND THAT USED TO COST IT THE TRAIL-AWAY TOO.
+    # ``mb_plan_library`` drops the ELEVATED side's segment on a one-sided box tile, because there is
+    # no platform up there to walk along -- right for the side it drops, but this gate read the
+    # approach's absence as "not a bounded clip" and sent the WHOLE clip to the legacy ``splice_terrain``
+    # below, which knows nothing about the exit alternation. The planned walk-away was built, generated,
+    # and then silently discarded: measured on v6f, exactly 13 of jump_off_front's 26 tiles ended 1.06 s
+    # after the drop -- the forced transient horizon and nothing more -- against a planned 4-8 m, and
+    # 13/13 the other way, with no tile in between. It is why jump_off_front is the shortest family.
+    # jump_on never showed it because the side IT drops is the exit, which leaves the approach standing.
+    # So the gate asks per SIDE, and the lead-up below is built only where there is one.
+    _has_lead = approach is not None and bool(a_prov.get("bounded"))
+    _has_tail = exit_seg is not None and bool(e_prov.get("bounded"))
+    _bounded = False                                  # did the piece path actually build a clip?
+    if (_has_lead or _has_tail) and getattr(args, "stride_bank", None):
         bank = load_stride_bank(args.stride_bank)
         _seg_dir = getattr(args, "segment_dir", None) or os.path.dirname(
             os.path.abspath(getattr(args, "approach_raw", "") or "."))
         # The approach as an ALTERNATION where pass A authored one, and as the single loop it has
         # always been otherwise. Both are the same shape to everything downstream -- a list of pieces
         # ending just before the terrain transient -- so the rest of this function does not branch.
-        _a_plan = (plan.meta or {}).get("approach_plan")
-        if _a_plan:
+        _a_plan = (plan.meta or {}).get("approach_plan") if _has_lead else None
+        if not _has_lead:
+            a_pieces, a_cmds, loop_travel, a_interior = [], [], 0.0, 0.0
+            loop_piece = None
+        elif _a_plan:
             a_pieces, a_cmds, loop_travel, a_interior = _side_alternation(
                 bank, fp.plan_from_dict(_a_plan), _seg_dir, dt, dev,
                 boundary_travel=float(a_prov.get("travel", 0.0)), boundary_first=False)
@@ -866,17 +892,21 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
         # A TRANSIENT carries the command it is heading TO -- flat_plan.Transient.cmd_vel's own
         # convention, kept so the two paths read the same way.
         piece_cmds: list[float] = []
-        if loop_piece is not None:
+        if loop_piece is not None or not _has_lead:
             # The approach's own pieces (one loop, or a loop/transient alternation), then the terrain
             # entry transient, then the replay. ``a_cmds`` is empty on the single-hold path, where the
-            # one loop carries the one approach command.
-            _lead_cmds = a_cmds if a_cmds else [_a_cmds[0]]
-            piece_cmds = list(_lead_cmds) + [_inter, _inter]   # ...lead-up, entry transient, replay
-            pieces = list(a_pieces) + [
-                      Piece(seg=approach, kind="transient",
-                            ground_z=(None if a_seam == "weld"
-                                      else (0.0 if a_frame == "tile" else float(plan.approach_surf_z)))),
-                      Piece(seg=terrain, kind="replay", rigid=True, anchored=True)]
+            # one loop carries the one approach command. On a one-sided dismount tile the lead-up is
+            # EMPTY -- the clip opens on the box with the drop already under way -- and the replay is
+            # piece 0, which is why the slots below are indexed off the lead-up's length rather than
+            # off a fixed layout.
+            _lead_pieces = (list(a_pieces) + [
+                Piece(seg=approach, kind="transient",
+                      ground_z=(None if a_seam == "weld"
+                                else (0.0 if a_frame == "tile" else float(plan.approach_surf_z))))]
+                if _has_lead else [])
+            _lead_cmds = ((a_cmds if a_cmds else [_a_cmds[0]]) + [_inter]) if _has_lead else []
+            piece_cmds = list(_lead_cmds) + [_inter]          # ...lead-up, entry transient, replay
+            pieces = _lead_pieces + [Piece(seg=terrain, kind="replay", rigid=True, anchored=True)]
             e_skip = 0
             if exit_seg is not None:
                 if e_seeded:
@@ -927,9 +957,13 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
             # The three reported slots: everything before the replay is "approach", however many
             # pieces that is. It used to be `pb[1][1]` because the lead-up was always exactly two
             # pieces (one loop + the entry transient); with an alternation it is len(a_pieces) + 1.
-            n_lead = (len(a_pieces) if a_pieces else 1)
-            n_a = pb[n_lead][1]                              # lead-up + entry transient together
-            n_t = pb[n_lead + 1][1] - pb[n_lead + 1][0]   # the replay
+            # ``_ri`` is the REPLAY's index, i.e. the number of lead-up pieces: len(a_pieces) + 1 for
+            # the entry transient, or 0 when there is no lead-up at all. Reading the replay's own
+            # bounds rather than the piece before it is what makes the empty case fall out -- the
+            # old `pb[n_lead][1]` had no lead piece to end at.
+            _ri = len(_lead_pieces)
+            n_a = pb[_ri][0]                                 # lead-up + entry transient together
+            n_t = pb[_ri][1] - pb[_ri][0]                    # the replay
             bounds = [(0, n_a), (n_a, n_a + n_t), (n_a + n_t, Wp.shape[0])]
             diag = {"approach_seam": a_seam, "exit_seam": e_seam, "approach_frame": a_frame,
                     "exit_frame": e_frame, "approach_loop_travel": float(loop_travel),
@@ -937,7 +971,8 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                     "approach_interior_travel": float(a_interior),
                     "exit_interior_travel": float(x_interior),
                     "exit_loop_travel": float(x_loop_travel),
-                    "approach_joint_res": float(pdiag["placements"]["before"]["joint_res"]),
+                    "approach_joint_res": float(
+                        (pdiag["placements"].get("before") or {}).get("joint_res", 0.0)),
                     "stride_idx_t": sidx_t,
                     "approach_surface_err": 0.0, "exit_surface_err": 0.0,
                     "approach_arrival_cut": 0, "exit_overlap_skip": int(e_skip),
@@ -952,19 +987,23 @@ def clip_from_plan(plan: TerrainPlan, args, builder, dev) -> dict:
                     # motion below, like any other per-frame channel.
                     "rl_cmd_t": _apply_interaction_schedule(
                         _cmd_track_from_bounds(pb, piece_cmds, int(Wp.shape[0])),
-                        pb[n_lead + 1], (plan.meta or {}).get("interaction_schedule")),
+                        pb[_ri], (plan.meta or {}).get("interaction_schedule")),
                     "approach_seam_speed": float(
                         torch.linalg.norm(Wp[n_a] - Wp[n_a - 1]) / dt) if n_a > 0 else 0.0,
                     "exit_seam_speed": float(
                         torch.linalg.norm(Wp[n_a + n_t] - Wp[n_a + n_t - 1]) / dt)
                     if 0 < n_a + n_t < Wp.shape[0] else 0.0}
             if exit_seg is not None:
-                diag["exit_joint_res"] = float(pdiag["placements"]["after"]["joint_res"])
+                diag["exit_joint_res"] = float(
+                    (pdiag["placements"].get("after") or {}).get("joint_res", 0.0))
+            _bounded = True
             _a_used = float(loop_travel) + float(a_interior) + float(a_prov.get("travel", 0.0))
             print(f"[mb_terrain] {plan.skill}: BOUNDED approach -- loop {loop_travel:.2f} m + interior "
                   f"{a_interior:.2f} m + transient {a_prov.get('travel', 0.0):.2f} m = {_a_used:.2f} m "
                   f"of a {plan.approach_dist:.2f} m budget")
-    if loop_piece is None:
+    # Only the piece path can serve a clip whose lead-up or trail-away is an alternation; the legacy
+    # splice is the fallback for everything it could not build.
+    if not _bounded:
         Wp, Wq, Wj, bounds, diag = splice_terrain(
         terrain, approach, exit_seg,
         approach_surf_z=plan.approach_surf_z, exit_surf_z=plan.exit_surf_z, blend_n=blend_n,

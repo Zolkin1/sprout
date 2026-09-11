@@ -240,3 +240,83 @@ def test_a_zero_range_silences_the_channel():
             np.random.default_rng(seed), (0.0, float("inf")), (0.2, 2.5), 0.5, n_seg=3, sign=1.0,
             vy_range=(0.0, 0.0), wz_range=(0.0, 0.0), p_straight=0.0)
         assert all(abs(vy) < 1e-9 and abs(wz) < 1e-9 for _f, _vx, vy, wz in sched)
+
+
+def test_the_traversal_keeps_the_approach_command_by_default():
+    """``hold_vx`` + the default ``p_constant`` leave NO command step at the terrain boundary.
+
+    The trap this pins is what an independent draw did to the timing rather than to the values:
+    measured on g1_mb_v6f, the step it created opened 1.04-1.06 s before the traversal in 99.1% of
+    terrain clips and closed on the traversal's LAST frame in 99.7%, so the command dated the terrain
+    on its own. Both edges are gone only if EVERY segment takes the hold's value -- one segment that
+    re-draws puts an edge back inside the replay.
+    """
+    import numpy as np
+    from motion_gen import command_schedule as mtc
+
+    for seed in range(80):
+        for n_seg in (1, 2, 3):
+            sched = mtc.terrain_interaction_schedule(
+                np.random.default_rng(seed), (0.0, 0.5003), (0.2, 2.5), 0.31, n_seg=n_seg,
+                sign=1.0, hold_vx=0.2)
+            assert all(abs(vx - 0.2) < 1e-9 for _f, vx, _vy, _wz in sched), sched
+
+
+def test_the_sign_still_comes_from_the_family_not_the_hold():
+    """A backwards family commands backwards even though ``hold_vx`` is passed as a magnitude."""
+    import numpy as np
+    from motion_gen import command_schedule as mtc
+
+    sched = mtc.terrain_interaction_schedule(
+        np.random.default_rng(0), (0.0, 1.5), (0.2, 1.0), 0.5, n_seg=2, sign=-1.0, hold_vx=0.6)
+    assert all(abs(vx + 0.6) < 1e-9 for _f, vx, _vy, _wz in sched), sched
+
+
+def test_a_hold_outside_the_cell_is_clamped_never_emitted():
+    """The cell is the one invariant the constant arm may not break.
+
+    Measured on v6f the planned command lay inside cell ∩ band in 100% of clips of every family, so
+    this clamp never bound -- which is a fact about one library, not about the code. Outside the cell
+    the command points at a DIFFERENT solved reference, which teaches the opposite of the lesson.
+    """
+    import numpy as np
+    from motion_gen import command_schedule as mtc
+
+    cell, band = (0.4, 0.9), (0.2, 2.5)
+    for hold, want in ((3.0, 0.9), (0.05, 0.4)):
+        sched = mtc.terrain_interaction_schedule(
+            np.random.default_rng(1), cell, band, 0.5, n_seg=2, sign=1.0, hold_vx=hold)
+        assert all(abs(vx - want) < 1e-9 for _f, vx, _vy, _wz in sched), (hold, sched)
+
+
+def test_p_constant_zero_restores_the_independent_draw():
+    """The A/B arm still works, and is still confined to the cell."""
+    import numpy as np
+    from motion_gen import command_schedule as mtc
+
+    drawn = set()
+    for seed in range(40):
+        sched = mtc.terrain_interaction_schedule(
+            np.random.default_rng(seed), (0.0, 0.5003), (0.2, 2.5), 0.31, n_seg=1, sign=1.0,
+            hold_vx=0.2, p_constant=0.0)
+        for _f, vx, _vy, _wz in sched:
+            assert 0.2 - 1e-9 <= vx <= 0.5003 + 1e-9
+            drawn.add(round(vx, 6))
+    assert len(drawn) > 30, "p_constant=0.0 must go back to drawing per clip"
+
+
+def test_no_hold_given_is_not_silently_constant():
+    """A caller that plans no holds -- the pure-stair path -- keeps the draw.
+
+    A pure tile is 100% terrain with no approach, so it has no adjoining hold to keep and no
+    boundary for a step to mark. Defaulting it to "constant" would silently narrow its command
+    distribution to one value per clip for no reason.
+    """
+    import numpy as np
+    from motion_gen import command_schedule as mtc
+
+    drawn = {round(vx, 6)
+             for seed in range(40)
+             for _f, vx, _vy, _wz in mtc.terrain_interaction_schedule(
+                 np.random.default_rng(seed), (0.0, 0.5003), (0.2, 2.5), 0.31, n_seg=1, sign=1.0)}
+    assert len(drawn) > 30

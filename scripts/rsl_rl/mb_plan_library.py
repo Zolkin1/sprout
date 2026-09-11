@@ -622,6 +622,15 @@ def main() -> int:
     p.add_argument("--terrain-cmd-segments", type=int, default=2,
                    metavar="N",
                    help="Command segments ACROSS the terrain traversal itself. The motion is one fixed replay and this changes none of it -- only target_vel -- but a generator only ever commanded its reference's own speed cannot learn that a command SELECTS a reference. Every value is drawn inside the played reference's Voronoi cell, so the command may disagree with the motion but never points at a different one. 1 reproduces the old constant.")
+    p.add_argument("--terrain-cmd-p-constant", type=float, default=1.0,
+                   metavar="P",
+                   help="Probability that a traversal KEEPS the approach's command instead of drawing "
+                        "its own in-cell value. At the default 1.0 no command step is welded to the "
+                        "terrain; an independent draw put one 1.04 s before every traversal (99.1% of "
+                        "v6f clips) and another on its last frame (99.7%), which dates the terrain "
+                        "from the command alone. Nothing is lost: one tile's replay already appears "
+                        "under 50 distinct commands across its clips. Below 1.0 restores the pulse for "
+                        "the remainder -- the A/B, not a mode to ship.")
     p.add_argument("--terrain-cmd-vy-range", type=float, nargs=2, default=(-0.6, 0.6),
                    metavar=("MIN", "MAX"),
                    help="Lateral command range ON a terrain traversal. It moves nothing -- the replay is world-pinned -- and that is the point: the generator has to SEE a lateral command while a staircase is under it to learn that the answer is to keep climbing. Zero everywhere before this.")
@@ -733,6 +742,13 @@ def main() -> int:
     p.add_argument("--box-top-dist-clamp", type=float, nargs=2, default=(0.75, 2.0),
                    metavar=("MIN", "MAX"),
                    help="Metres of walking on a box TOP, clamped separately from the ground. A box top is the solved reference's own footprint, not a lead-in: budgeting it like flat ground authored 3-4 m up there, which at the bottom of --box-top-vx-range is 21 s against a 20 s clip ceiling.")
+    p.add_argument("--box-drop-exit-dist-clamp", type=float, nargs=2, default=(2.0, 6.0),
+                   metavar=("MIN", "MAX"),
+                   help="Metres of GROUND trail-away after a forward drop-off, clamped apart from "
+                        "--flat-dist-clamp. A clip that has just landed off a box is accelerating, so "
+                        "it spends the shared budget in about a third of the time a stair clip does -- "
+                        "measured 1.65 s of trail-away against the stair families' 4.60 s, which is "
+                        "most of why jump_off_front is the shortest family at a 6.52 s median.")
     p.add_argument("--dist-step", type=float, default=0.25,
                    help="Quantization (m) of the travel budget, so segments can still be shared.")
     p.add_argument("--platform-buffer-m", type=float, default=1.0,
@@ -826,8 +842,17 @@ def main() -> int:
             # Its own clamp, because the two surfaces have nothing to do with each other.
             lo_t, hi_t = args.box_top_dist_clamp
 
-            def _budget(mag: float, s_range, elevated: bool = False, zone: bool = True) -> float:
-                lo, hi = (lo_t, hi_t) if elevated else (lo_d, hi_d)
+            # The GROUND trail-away of a forward drop-off gets its own clamp. Same seconds-to-metres
+            # conversion as any other side; only the metre bounds differ, because the speed it
+            # converts at is the post-landing one and that is the fastest ground stretch in the
+            # library -- the shared [1.0, 6.0] bought jump_off_front a 1.65 s trail-away where the
+            # stair families get 4.60 s off the identical band.
+            lo_x, hi_x = args.box_drop_exit_dist_clamp
+
+            def _budget(mag: float, s_range, elevated: bool = False, zone: bool = True,
+                        drop_exit: bool = False) -> float:
+                lo, hi = ((lo_t, hi_t) if elevated else
+                          (lo_x, hi_x) if drop_exit else (lo_d, hi_d))
                 flat = min(max(abs(float(mag)) * float(d_rng.uniform(*s_range)), lo), hi)
                 return _quantize(flat + (APPROACH_ZONE_M if zone else 0.0), args.dist_step)
 
@@ -839,9 +864,12 @@ def main() -> int:
             # there is nothing ahead to reach, so the 2 m would be pure extra box-top walking. An
             # elevated APPROACH keeps it -- there the box top IS the run-up to the drop-off. Ground
             # sides keep it on both, unchanged.
+            # ``_elev == "approach"`` IS the drop-off case: the family starts on the box top, so its
+            # exit is the ground stretch after the landing. jump_off_front is the only one the recipe
+            # still builds, but jump_off qualifies by the same geometry and gets it too.
             x_dists = [_budget(m if _elev != "exit" else top_mag,
                                args.exit_flat_s_range, elevated=(_elev == "exit"),
-                               zone=(_elev != "exit"))
+                               zone=(_elev != "exit"), drop_exit=(_elev == "approach"))
                        for m in ground_mags]
             # The tile's walking surfaces are sized for the LONGEST budget on it, and every clip
             # authors the geometry with that same number -- otherwise a short clip authors a short
@@ -911,6 +939,7 @@ def main() -> int:
                     platform_buffer_m=args.platform_buffer_m,
                     approach_dist=a_dist, exit_dist=x_dist,
                     terrain_cmd_segments=args.terrain_cmd_segments,
+                    terrain_cmd_p_constant=args.terrain_cmd_p_constant,
                     terrain_cmd_vy_range=tuple(args.terrain_cmd_vy_range),
                     terrain_cmd_wz_range=tuple(args.terrain_cmd_wz_range),
                     entry_pick=args.entry_pick, exit_pick=args.exit_pick,

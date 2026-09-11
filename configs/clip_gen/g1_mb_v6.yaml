@@ -124,6 +124,21 @@ gen_attempts: 6                 # seeds to try before giving up on one in-betwee
 # ---------------------------------------------------------------- RL-visible command
 terrain_cmd_changes_per_side: 2   # command changes during the lead-up / trail-away. 0 = the
 terrain_cmd_segments: 1           # command segments ACROSS a TRANSITION traversal. The motion is one
+terrain_cmd_p_constant: 1.0        # P(the traversal KEEPS the approach's command) rather than drawing
+                                  # its own value inside the reference's Voronoi cell. At 1.0 NO command
+                                  # step is welded to the terrain. The independent draw put one exactly
+                                  # 1.04-1.06 s before every traversal (99.1% of v6f clips -- the entry
+                                  # transient's horizon is forced, so the lead did not even vary with
+                                  # speed) and closed it on the traversal's LAST frame (99.7%), returning
+                                  # to the pre-terrain value 70.3% of the time. A rectangular pulse whose
+                                  # edges ARE the terrain boundaries dates the terrain from the command
+                                  # alone -- the vx twin of the lateral/yaw detector p_straight fixes.
+                                  # Nothing is lost: the "a command SELECTS a reference" lesson is carried
+                                  # ACROSS clips, and one tile's fixed replay already appears under 50
+                                  # distinct commands spanning 0.20-2.50 m/s. On a BOX one step survives
+                                  # at the EXIT (the two sides are different surfaces with different
+                                  # bands); that is the right end to keep it, since the mount decision is
+                                  # made on the approach. Below 1.0 is the A/B, not a mode to ship.
 # TRANSITION traversals are STRAIGHT and single-segment, and pure stairs carry the lateral/yaw
 # instead. Measured on g1_mb_v6c, which had lateral on every traversal and none on any flat piece:
 # P(on terrain | lateral or yaw commanded) = 1.0000 WITHIN a terrain clip (42126 frames on
@@ -263,6 +278,12 @@ box_top_dist_clamp: [2.25, 3.5]     # m of walking on a box TOP, clamped separat
                                     # size_x p50 7.98 -> 9.07 m (+14%), max 18.13 -> 22.30. Step 6
                                     # had already taken 30-40% off the fast stair tiles by dropping
                                     # the speed term, so this spends part of that back deliberately.
+box_drop_exit_dist_clamp: [2.0, 6.0] # m of GROUND trail-away after a forward drop-off, clamped apart
+                                    # from flat_dist_clamp. A clip that has just landed off a box is
+                                    # accelerating, so it spends the shared [1.0, 6.0] in a third of the
+                                    # time a stair clip does: measured 1.65 s of trail-away against the
+                                    # stair families' 4.60 s, which is most of why jump_off_front is the
+                                    # shortest family (6.52 s median against 11.79).
 dist_step: 0.25                     # m quantization, so segments can still be shared
 platform_buffer_m: 1.0              # m of walkable surface past the nominal travel, so the
                                     # reference cannot walk off the far edge

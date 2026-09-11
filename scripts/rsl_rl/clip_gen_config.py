@@ -76,6 +76,10 @@ _SCHEMA: dict[str, tuple] = {
     "exit_flat_s_range": ("range", 2),
     "flat_dist_clamp": ("range", 2),
     "box_top_dist_clamp": ("range", 2),
+    # The GROUND trail-away of a forward drop-off, clamped apart from flat_dist_clamp. A clip that
+    # lands off a box is accelerating, so it spends the shared budget in about a third of the time a
+    # stair clip does -- measured 1.65 s against 4.60 s.
+    "box_drop_exit_dist_clamp": ("range", 2),
     "dist_step": ("float", 1),
     "platform_buffer_m": ("float", 1),
     # ---- pass C: the splice
@@ -135,6 +139,10 @@ _SCHEMA: dict[str, tuple] = {
     "gen_attempts": ("int", 1),
     "terrain_cmd_changes_per_side": ("int", 1),
     "terrain_cmd_segments": ("int", 1),
+    # Probability that the traversal simply KEEPS the approach's command instead of drawing its own
+    # in-cell value. At 1.0 no command step is welded to the terrain; below it, the rest of the clips
+    # get the pre-2026-09-11 pulse back, which is the A/B and not a mode to ship.
+    "terrain_cmd_p_constant": ("float", 1),
     # How the terrain BOUNDARY transients are generated. See mb_env.walk_control(free_root) and
     # mb_terrain_segments --token-band; both were debug knobs until the seam work settled them.
     "terrain_transient_tokens": ("int", 1),
