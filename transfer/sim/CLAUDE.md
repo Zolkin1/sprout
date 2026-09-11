@@ -121,6 +121,10 @@ Deployed pair, tile 6 = stairs_up 5 risers +0.850 m, tile 20 = stairs_down 7 ste
   jump_off_front +4.92 (the sign flips). It keeps owning `in_goal` / success and is untouched, so
   every mjeval number already measured stays comparable. **Tile -1 is REFUSED, not approximated** --
   the flat sentinel has no tile frame at all (spread 129 m).
+- **SUPERSEDED 2026-09-10:** the numbers in this bullet came from `critic_gate.py`, which is
+  DELETED along with the `P(fail)` head it gated -- its lead-time gate was defined by
+  `p_fail` crossing 0.5, and a scalar return regression has no such threshold. Kept as the
+  record of what was measured.
 - Critic transfer measured against MuJoCo's OWN outcomes (`critic_gate.py`, 48 episodes / 11 falls,
   tiles 6 + 20): AUC(`p_fail_mean`) **0.946** with a label-shuffle control at **0.517 +/- 0.097**,
   AUC(`p_fail_max`) 0.846. The shuffle landing at 0.50 is what makes the rest mean anything. Read

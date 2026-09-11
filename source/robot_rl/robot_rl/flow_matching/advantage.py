@@ -73,61 +73,6 @@ def label_from_name(name: str) -> int:
     return LABEL_NAMES.index(name)
 
 
-def n_step_advantage(
-    p_fail: np.ndarray,
-    episode_uid: np.ndarray,
-    replan_index: np.ndarray,
-    failed: np.ndarray,
-    n: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute ``A(s_t, a_t) = P(fail|s_t) - P(fail|s_{t+n})`` over a window table.
-
-    Rows are grouped by ``episode_uid`` and ordered by ``replan_index``.  A row whose
-    ``t + n`` lands past the episode's last recorded re-plan is closed with the realized
-    terminal value (``1.0`` if the episode failed, ``0.0`` if it reached the goal) rather
-    than dropped -- those are the rows nearest the outcome and so the most informative.
-
-    Args:
-        p_fail: ``[W]`` critic output ``P(fail | s_t)`` in ``[0, 1]``.
-        episode_uid: ``[W]`` episode id per window.
-        replan_index: ``[W]`` position within the episode, 0-based.
-        failed: ``[W]`` bool, the episode's realized outcome (constant within an episode).
-        n: Look-ahead in re-plans.
-
-    Returns:
-        ``(advantage, bootstrapped)`` -- ``[W]`` float64 and ``[W]`` bool, the latter True
-        where the terminal value was used instead of a critic reading.
-
-    Raises:
-        ValueError: If ``n < 1`` or the arrays disagree in length.
-    """
-    if int(n) < 1:
-        raise ValueError(f"n must be at least one re-plan, got {n}")
-    lengths = {a.shape[0] for a in (p_fail, episode_uid, replan_index, failed)}
-    if len(lengths) != 1:
-        raise ValueError(f"arrays disagree in length: {sorted(lengths)}")
-
-    w = p_fail.shape[0]
-    adv = np.zeros(w, dtype=np.float64)
-    boot = np.zeros(w, dtype=bool)
-    # One pass per episode. `order` sorts by (uid, replan_index) so a group is contiguous
-    # and internally ordered without a per-episode sort.
-    order = np.lexsort((replan_index, episode_uid))
-    uid_s = episode_uid[order]
-    starts = np.flatnonzero(np.r_[True, uid_s[1:] != uid_s[:-1]])
-    ends = np.r_[starts[1:], w] if starts.size else np.array([], dtype=int)
-    for s, e in zip(starts, ends):
-        rows = order[s:e]
-        p = p_fail[rows]
-        m = rows.size
-        # The future reading, index-shifted; the tail bootstraps on the outcome.
-        future = np.empty(m, dtype=np.float64)
-        head = max(m - n, 0)
-        future[:head] = p[n:]
-        future[head:] = 1.0 if bool(failed[rows[0]]) else 0.0
-        adv[rows] = p.astype(np.float64) - future
-        boot[rows[head:]] = True
-    return adv, boot
 
 
 def chunk_rewards_from_track_err(
@@ -598,200 +543,62 @@ def normalized_returns(
 def mc_advantage(
     g: np.ndarray,
     g_hat: np.ndarray,
-    p_fail: np.ndarray,
-    failed: np.ndarray,
     *,
-    w_fail: float = 1.0,
     valid: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """The MONTE-CARLO advantage: realized outcome minus the critic's own baseline.
+    """The MONTE-CARLO advantage: the realized return minus the critic's own baseline.
 
-    ``A = w_track * [ G_t - G_hat(s_t) ] + w_fail * [ P(fail|s_t) - 1{failed} ]``
-    with ``w_track = 1 - w_fail``, matching :func:`combined_n_step_advantage`'s decomposition
-    of ``V(s) = w_track * G_hat(s) - w_fail * P(fail|s)`` so the two estimators label the same
-    quantity and differ only in how the target is formed.
+    ``A = G_t - V(s_t)``, and that is the whole estimator.
 
-    **No bootstrapping anywhere.**  Both halves difference against something MEASURED --
-    ``G_t``, the realized normalized return from :func:`normalized_returns`, and the episode's
-    own terminal outcome -- where :func:`combined_n_step_advantage` differences against the
-    critic's predictions at ``t + n``.  That removes the bootstrap bias entirely and pays for
-    it in variance: an MC advantage carries the whole remaining episode's noise, while the
-    n-step form has ``gamma^n`` of it.  There is no ``n``, so nothing has to be tuned.
+    It used to be a blend -- ``A = w_track * (G_t - G_hat) + w_fail * (P(fail|s_t) -
+    1{failed})``, with ``w_track = 1 - w_fail`` -- reading a survival head beside the value
+    head. That head is gone: the fine-tune loop dropped its loss, so no reported result used
+    it. With it went ``w_fail``, ``p_fail``, ``failed``, and the ``n_step`` alternatives that
+    differenced against the critic's own prediction at ``t + n``.
 
-    Both signs are "higher is better for this chunk": the quality half is positive when the
-    episode did better than the critic expected, and the survival half is positive when the
-    critic expected failure and the episode survived.
+    **No bootstrapping.** ``G_t`` is the realized normalized return from
+    :func:`bootstrapped_window_return` (or :func:`normalized_returns`), so the difference is
+    against something MEASURED. That removes bootstrap bias entirely and pays for it in
+    variance: an MC advantage carries the whole remaining episode's noise. There is no ``n``,
+    so nothing has to be tuned.
 
-    **The baseline MUST be out of fold.**  ``G_hat(s_t)`` and ``P(fail|s_t)`` are what the
-    critic was fitted to predict, so an in-sample reading has partly memorised ``G_t`` and the
-    realized outcome, and the advantage collapses toward zero -- degrading the label to noise
-    rather than making it wrong, which is the harder failure to notice. ``fit_value.py``'s
-    ``predictions.npz`` holds out-of-fold predictions when it was run with ``--folds >= 2``,
-    and ``label_advantage.py`` warns when it was not.
+    Sign: positive means this chunk did better than the critic expected.
+
+    **The baseline MUST be out of fold.** ``V(s_t)`` is exactly what the critic was fitted to
+    predict, so an in-sample reading has partly memorised ``G_t`` and the advantage collapses
+    toward zero -- degrading the label to noise rather than making it wrong, which is the
+    harder failure to notice. ``fit_value.py``'s ``predictions.npz`` holds out-of-fold
+    predictions when run with ``--folds >= 2``, and ``label_advantage.py`` warns when it was
+    not.
 
     Args:
-        g: ``[W]`` realized normalized return per window, from :func:`normalized_returns`.
-        g_hat: ``[W]`` the quality head's out-of-fold prediction of ``g``.
-        p_fail: ``[W]`` the failure head's out-of-fold ``P(fail | s_t)``.
-        failed: ``[W]`` bool, the episode's realized outcome (constant within an episode).
-        w_fail: Weight on the survival half; ``1.0`` is survival only, ``0.0`` quality only.
+        g: ``[W]`` realized normalized return per window.
+        g_hat: ``[W]`` the value head's out-of-fold prediction of ``g`` -- i.e. ``V(s_t)``.
         valid: ``[W]`` bool, which rows carry a usable ``g``; ``None`` means all of them.
-            Rows where it is False come back zero and flagged invalid rather than being
-            charged for a return that was never measured.
+            Rows where it is False come back zero AND flagged invalid -- zero is a meaningful
+            advantage, so the mask is what says the row means nothing.
 
     Returns:
         ``(advantage, valid)`` -- ``[W]`` float64 and ``[W]`` bool.
 
     Raises:
-        ValueError: If the arrays disagree in length or ``w_fail`` is outside ``[0, 1]``.
+        ValueError: If the two arrays disagree in length.
     """
-    arrays = (g, g_hat, p_fail, failed)
-    if len({a.shape[0] for a in arrays}) != 1:
+    if g.shape[0] != g_hat.shape[0]:
         raise ValueError(
             "mc_advantage inputs must agree in length; got "
-            f"{[int(a.shape[0]) for a in arrays]}")
-    if not 0.0 <= float(w_fail) <= 1.0:
-        raise ValueError(f"w_fail must be in [0, 1]; got {w_fail}")
+            f"{[int(g.shape[0]), int(g_hat.shape[0])]}")
 
     ok = np.ones(g.shape[0], dtype=bool) if valid is None else np.asarray(valid, dtype=bool)
-    w_track = 1.0 - float(w_fail)
-    quality = np.where(ok, np.asarray(g, dtype=np.float64)
-                       - np.asarray(g_hat, dtype=np.float64), 0.0)
-    survival = (np.asarray(p_fail, dtype=np.float64)
-                - np.asarray(failed, dtype=bool).astype(np.float64))
-    adv = w_track * quality + float(w_fail) * survival
-    # A row with no measured return has no quality half. It still has a survival half, so it
-    # stays valid at w_fail > 0 and is dropped only when the quality term is all there is.
-    keep = ok | (float(w_fail) > 0.0)
-    return np.where(keep, adv, 0.0), keep
+    adv = np.where(ok, np.asarray(g, dtype=np.float64)
+                   - np.asarray(g_hat, dtype=np.float64), 0.0)
+    # A row with no measured return now has no advantage at all. It used to survive on the
+    # strength of its SURVIVAL half -- the estimator was
+    # `A = w_track * (G - G_hat) + w_fail * (P(fail) - 1{failed})` -- but that half went with
+    # the critic's survival head, so a row without a return is simply unlabelled.
+    return adv, ok
 
 
-def combined_n_step_advantage(
-    p_fail: np.ndarray,
-    g_hat: np.ndarray,
-    chunk_reward: np.ndarray,
-    episode_uid: np.ndarray,
-    replan_index: np.ndarray,
-    failed: np.ndarray,
-    n: int,
-    *,
-    gamma: float,
-    w_fail: float = 1.0,
-    valid: np.ndarray | None = None,
-    tail_chunks: int = 1,
-) -> tuple[np.ndarray, np.ndarray]:
-    """The n-step advantage of the COMBINED value, survival plus tracking quality.
-
-    ``V(s) = w_track * G_hat(s) - w_fail * P(fail | s)`` with ``w_track = 1 - w_fail``, the
-    same definition :meth:`FlowValueModel.combined_value` computes at run time -- so the
-    fine-tune's label and the selector's objective are one quantity by construction rather
-    than two implementations that happen to agree::
-
-        A = w_track * [ (1-g) * sum_{i<n} g^i R_{t+i}  +  g^n * G_hat(s_{t+n}) - G_hat(s_t) ]
-          + w_fail  * [ P(fail|s_t) - P(fail|s_{t+n}) ]
-
-    Two things about the shape of this are easy to get wrong:
-
-    * **The second bracket is the SURVIVAL advantage exactly as it already was**, sign and
-      all -- it is already the TD form of a terminal-only reward at ``gamma = 1``. So
-      ``w_fail = 1`` reproduces :func:`n_step_advantage` bit for bit and is the control arm,
-      not a new configuration.
-    * **The ``(1 - gamma)`` factor on the measured rewards is not cosmetic.** ``G_hat`` is a
-      NORMALIZED return, carrying that factor by construction, so without it the measured and
-      bootstrapped halves are in different units and the sum is dominated by whichever
-      happens to be larger.
-
-    The tail bootstraps the same way the survival half does -- on the realized outcome, which
-    for the tracking term is ``0.0`` (a failure is absorbing; nothing good follows) or the
-    last observed ``G_hat`` (the episode ended by arriving or by the budget, so the motion is
-    assumed to continue at the quality it ended on).  Absorbing on a NON-failure would punish
-    arriving quickly, which is the confound
-    :func:`transfer.deploy.tracking_error.normalized_return` documents.
-
-    Args:
-        p_fail: ``[W]`` ``P(fail | s_t)``.
-        g_hat: ``[W]`` predicted normalized tracking return at ``s_t``, in ``[0, 1]``.
-        chunk_reward: ``[W]`` MEASURED per-chunk tracking reward for the chunk emitted at
-            ``t`` -- i.e. already shifted out of ``track_err_prev``, whose row ``i`` holds the
-            chunk of row ``i-1``.
-        episode_uid: ``[W]`` episode id.
-        replan_index: ``[W]`` position within the episode, 0-based.
-        failed: ``[W]`` bool, the episode's realized outcome.
-        n: Look-ahead in re-plans.
-        gamma: Per-CHUNK discount.
-        w_fail: Weight on the survival term, in ``[0, 1]``.
-        tail_chunks: Trailing chunks the non-failure tail averages. MUST match what
-            :func:`normalized_returns` built the quality head's target with, or this
-            advantage's ``G`` is again a different quantity from the one its own baseline
-            was trained to predict.
-
-    Returns:
-        ``(advantage, bootstrapped)`` -- ``[W]`` float64 and ``[W]`` bool.
-
-    Raises:
-        ValueError: On a bad ``n``, ``gamma``, ``w_fail``, or ragged inputs.
-    """
-    if not 0.0 <= float(w_fail) <= 1.0:
-        raise ValueError(f"w_fail must be in [0, 1], got {w_fail!r}")
-    if not 0.0 < float(gamma) < 1.0:
-        raise ValueError(f"gamma must be in (0, 1), got {gamma!r}")
-
-    surv, boot = n_step_advantage(p_fail, episode_uid, replan_index, failed, n)
-    w_track = 1.0 - float(w_fail)
-    if w_track == 0.0:
-        # Bit-for-bit the survival advantage. Returned before touching the tracking arrays so
-        # this path cannot be perturbed by a NaN in a column it does not read.
-        return float(w_fail) * surv, boot
-
-    lengths = {a.shape[0] for a in (p_fail, g_hat, chunk_reward, episode_uid, replan_index,
-                                    failed)}
-    if len(lengths) != 1:
-        raise ValueError(f"arrays disagree in length: {sorted(lengths)}")
-
-    g = float(gamma)
-    w = p_fail.shape[0]
-    track = np.zeros(w, dtype=np.float64)
-    order = np.lexsort((replan_index, episode_uid))
-    uid_s = episode_uid[order]
-    starts = np.flatnonzero(np.r_[True, uid_s[1:] != uid_s[:-1]])
-    ends = np.r_[starts[1:], w] if starts.size else np.array([], dtype=int)
-    disc = g ** np.arange(int(n), dtype=np.float64)
-    for s, e in zip(starts, ends):
-        rows = order[s:e]
-        if valid is not None:
-            # ROWS WITH NO MEASURED REWARD ARE DROPPED, not zero-filled. Every episode's LAST
-            # row is one: `chunk_rewards_from_track_err` stores each chunk's reward on the row
-            # BEFORE it, so the final row carries a placeholder 0. Summing that placeholder
-            # charges the episode for a chunk that was never measured, and it is the same
-            # defect -- in the same direction -- as closing a TD chain on it.
-            rows = rows[valid[rows]]
-            if rows.size == 0:
-                continue
-        m = rows.size
-        r = chunk_reward[rows].astype(np.float64)
-        gh = g_hat[rows].astype(np.float64)
-        # The tail value: 0 on a failure (absorbing -- nothing good follows) and the last
-        # MEASURED REWARD otherwise. Not `gh[-1]`: `normalized_returns` -- the recursion the
-        # quality head was FITTED to -- closes on `r[-1]`, and under the (1-gamma)
-        # normalization that is exactly the return of continuing forever at the quality the
-        # episode ended on. Closing here on a prediction instead makes this advantage's G a
-        # different quantity from the one its own baseline was trained to predict, so `A =
-        # G - G_hat` stops being an advantage. Measured on v4_big, the two agree exactly on
-        # failed episodes (tail 0 either way) and differ on survived ones by enough to move a
-        # quarter of a top-50% filter.
-        k_tail = max(1, min(int(tail_chunks), r.size))
-        tail = 0.0 if bool(failed[rows[0]]) else float(r[-k_tail:].mean())
-        for i in range(m):
-            # TRUNCATED n-step: a row whose window overruns the episode gets the k chunks
-            # that exist and bootstraps at g^k, NOT at g^n. Discounting the tail by the full
-            # g^n while padding the missing rewards with zero is inconsistent -- it charges a
-            # row for chunks that never happened -- and it is worst on the LAST rows, which
-            # are the ones nearest the outcome and so the most informative.
-            k = min(int(n), m - i)
-            measured = float((r[i:i + k] * disc[:k]).sum())
-            future = gh[i + k] if i + k < m else tail
-            track[rows[i]] = (1.0 - g) * measured + (g ** k) * future - gh[i]
-    return float(w_fail) * surv + w_track * track, boot
 
 
 def group_ids(family_code: np.ndarray, strata: np.ndarray | None = None) -> np.ndarray:

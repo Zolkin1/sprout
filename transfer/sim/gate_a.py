@@ -19,7 +19,7 @@ than an estimate.  Then compare:
 **Harvesting is the whole game and it is why the critic had to be ported first.**  Branching
 uniformly wastes most of the budget: on a recorded episode 8 of 10 branch states had zero
 headroom because the failure was already committed, and one had none because it was already
-safe.  So states are harvested by the critic's own ``p_fail`` band -- the region where the
+safe.  So states are harvested by the critic's own ``V(s)`` band -- the region where the
 outcome is genuinely undecided.  ``--bands`` reports the headroom per band, which is also the
 answer to "where should a selector spend its samples".
 
@@ -67,7 +67,7 @@ def _roll(rig, policy, fm_lag, spawn, cmd, cfg, tape, mjrunner, *, inject=None, 
         scorer: A :class:`critic.CriticScorer`, or ``None``.
 
     Returns:
-        ``(verdict, failure, taped draws, p_fail list)``.
+        ``(verdict, failure, taped draws, V(s) list)``.
     """
     policy._rng = np.random.default_rng(seed)
     mjrunner._reset_episode_state(policy, fm_lag)
@@ -78,7 +78,7 @@ def _roll(rig, policy, fm_lag, spawn, cmd, cfg, tape, mjrunner, *, inject=None, 
         rig, policy, fm_lag, spawn, cmd, None, steer_kp=cfg.steer_kp,
         steer_wz_max=cfg.steer_wz_max, cfg_hold=cfg.cmd_hold_s,
         probe=scorer)
-    return verdict, failure, list(tape.recorded), (list(scorer.p_fail) if scorer else [])
+    return verdict, failure, list(tape.recorded), (list(scorer.value) if scorer else [])
 
 
 def select_clips(clip_h5: str, tiles, per_tile: int) -> list[int]:
@@ -125,7 +125,7 @@ def run(args) -> int:
     import runner as mjrunner  # noqa: PLC0415
     from fm_noise_attribution import NoiseTape, build_arm  # noqa: PLC0415
 
-    crit = C.FailureCritic(args.critic_ckpt, device=args.device)
+    crit = C.ValueCritic(args.critic_ckpt, device=args.device)
     lo, hi = args.band
     rows, refs = [], []
     tiles = [int(t) for t in args.tiles.split(",")]
@@ -225,13 +225,13 @@ def run(args) -> int:
                 v_sel = (float(outs[int(np.nanargmin(bo))]) if np.isfinite(bo).any()
                          else float("nan"))
                 rows.append({"tile": tile, "clip_id": clip_id, "seed": seed, "pick": pick,
-                             "p_fail": float(p[pick]), "ref_verdict": v,
+                             "value": float(p[pick]), "ref_verdict": v,
                              "survived": [bool(o) for o in outs],
                              "boot_v": [float(b) for b in boots],
                              "boot_truncated": [bool(t) for t in trunc],
                              "v_selector": v_sel,
                              "random": float(np.mean(outs)), "oracle": float(any(outs))})
-                print(f"      pick {pick:>3} p_fail={p[pick]:.3f}  "
+                print(f"      pick {pick:>3} V={p[pick]:.3f}  "
                       f"{sum(outs)}/{args.k} survive  random={np.mean(outs):.3f} "
                       f"v_sel={v_sel:.3f} oracle={float(any(outs)):.3f}"
                       f"{'  (some branches truncated)' if any(trunc) else ''}", flush=True)
@@ -246,7 +246,7 @@ def run(args) -> int:
 
 
 def _report(rows: list[dict], args) -> None:
-    """Headroom pooled and by ``p_fail`` band."""
+    """Headroom pooled and by ``V(s)`` band."""
     if not rows:
         print("\n[gateA] NO states were harvested. Either the band is wrong for this critic "
               "or these episodes are all decided -- widen --band before concluding anything.")
@@ -267,9 +267,9 @@ def _report(rows: list[dict], args) -> None:
         print(f"  ({n_tr}/{len(rows)} states had at least one branch end before the "
               f"{args.bootstrap_replans}-re-plan horizon; those fall back to the last reading)")
     edges = [0.0, 0.2, 0.4, 0.6, 0.8, 1.01]
-    print(f"\n  {'p_fail band':>14} {'n':>4} {'random':>8} {'V-sel':>8} {'oracle':>8} "
+    print(f"\n  {'V(s) band':>14} {'n':>4} {'random':>8} {'V-sel':>8} {'oracle':>8} "
           f"{'headroom':>9} {'realised':>9}")
-    p = np.array([r["p_fail"] for r in rows])
+    p = np.array([r["value"] for r in rows])
     for a, b in zip(edges[:-1], edges[1:]):
         m = (p >= a) & (p < b)
         if not m.any():
@@ -300,7 +300,7 @@ def main() -> int:
     p.add_argument("--k", type=int, default=8, help="candidates per harvested state.")
     p.add_argument("--band", type=float, nargs=2, default=(0.2, 0.8),
                    metavar=("LO", "HI"),
-                   help="harvest re-plans whose p_fail lies here -- the undecided region.")
+                   help="harvest re-plans whose V(s) lies here -- the undecided region.")
     p.add_argument("--bootstrap_replans", type=int, default=8,
                    help="horizon for the bootstrapped label, in re-plans (8 = 1.92 s at "
                         "K=12). Each branch is ALSO scored by the critic this far past the "

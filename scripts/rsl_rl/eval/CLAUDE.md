@@ -197,6 +197,14 @@ the resulting states with a `fit_value.py` critic and carries the winner forward
 
 # The failure critic (`fit_value.py`)
 
+> **SUPERSEDED 2026-09-10 — the `P(fail)` head this describes is DELETED.** The critic now has
+> ONE head, a scalar regression of the return (`FlowValueModel.quality`); the survival head and
+> its own readout token are gone, because the fine-tune loop dropped its loss and no reported
+> result used it. **Every `p_fail` number below predates that cut and does not describe the
+> current code** -- and neither do the quality-head numbers, because removing the survival
+> readout changed the key/value stream the surviving head attends to, making it a different
+> function rather than the same one minus a head. Kept as the record of what was measured.
+
 Trains a `P(fail)` head over the generator's frozen encoder. Three of its context features are
 goal-region quantities needing a live `MotionSequenceCommand`, which is why it could only be read in
 Isaac until `transfer/sim/mjeval/goal_anchor.py` + `critic.py` closed it.

@@ -106,7 +106,13 @@ def main() -> int:
             j = idx[i:i + args.batch]
             b = fit_q._batch(ctx, W, j, args.device, scan_hw, steps)
             pq[i:i + j.size] = q.p_fail(b).cpu().numpy()
-            pv[i:i + j.size] = v.p_fail(b.state).cpu().numpy()
+            # V's side is its VALUE head, negated. It used to be `v.p_fail`, a survival
+            # probability on the same scale as Q's -- but that head is gone from
+            # FlowValueModel, and this comparison does not need the scales to match: both
+            # sides go through `within_state_ranking`, which reads the ORDER alone. The sign
+            # does matter, and flips: a higher P(fail) predicts failure, while a higher
+            # expected RETURN predicts success.
+            pv[i:i + j.size] = -v.quality(b.state).cpu().numpy()
 
     f = lab["failed"]
     rq = fit_q.within_state_ranking(pq, f, W["clip_id"], W["replan_index"])

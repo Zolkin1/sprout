@@ -5,7 +5,7 @@
 The failure critic is ``V(s)``: it scores a STATE.  Best-of-K needs ``Q(s, a)`` -- it has to
 rank the K chunks the generator drew from one state, which is a question about the ACTION.
 Gate A measured that ranking is worth having (headroom +0.116 pooled, +0.472 in the
-``p_fail`` band where outcomes are genuinely undecided, and a 2 s bootstrapped label already
+``V(s)`` band where outcomes are genuinely undecided, and a 2 s bootstrapped label already
 recovers half of it).  This collects what a Q-head would be fitted on.
 
 **Two streams, because they answer different halves and cost differently.**
@@ -122,14 +122,14 @@ class Writer:
             return 0
 
 
-def _sample(inp, window, cmd, p_fail, meta: dict) -> dict:
+def _sample(inp, window, cmd, value, meta: dict) -> dict:
     """One training row: the conditioning, the chunk, and the labels.
 
     Args:
         inp: The :class:`critic.CriticInputs` the state was scored with.
         window: ``(F, D)`` the chunk the generator emitted -- the ACTION.
         cmd: ``(3,)`` the commanded twist.
-        p_fail: The critic's reading at this state, kept as a baseline and so the cheap
+        value: The critic's V(s) at this state, kept as a baseline and so the cheap
             bootstrapped label can be fitted later without re-collecting.
         meta: Identifiers and the outcome.
 
@@ -147,7 +147,7 @@ def _sample(inp, window, cmd, p_fail, meta: dict) -> dict:
         "twist": np.asarray(inp.twist, np.float32),
         "window": np.asarray(window, np.float32),
         "command": np.asarray(cmd, np.float32),
-        "p_fail": np.float32(p_fail),
+        "value": np.float32(value),
         **{k: np.int64(v) for k, v in meta.items()},
     }
 
@@ -175,7 +175,7 @@ def run(args) -> int:
                                             print(f"\n[collect] signal {sg}: finishing the "
                                                   "current episode, then closing cleanly",
                                                   flush=True)))
-    crit = C.FailureCritic(args.critic_ckpt, device=args.device)
+    crit = C.ValueCritic(args.critic_ckpt, device=args.device)
     tiles = [int(t) for t in args.tiles.split(",")]
     clips = select_clips(args.clip_lib, tiles, int(args.clips_per_tile))
     # SHUFFLED, deterministically. `select_clips` returns them sorted, so a run that stops on
@@ -346,7 +346,9 @@ class _Capture:
             return
         inp = C.CriticInputs.from_runtime(policy, robot, state, anchor=self.anchor,
                                           ring=self.ring, want_scan=True)
-        self.rows.append((inp, np.asarray(win, np.float32), self.crit.p_fail(inp)))
+        # The label is V(s) now, not P(fail|s): higher is better, and any consumer
+        # ordering these rows has to flip its comparison.
+        self.rows.append((inp, np.asarray(win, np.float32), self.crit.value(inp)))
 
 
 def C_ring():

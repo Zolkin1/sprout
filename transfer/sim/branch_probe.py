@@ -118,7 +118,7 @@ def _probe_episode(rig, policy, fm_lag, spawn, cmd, cfg, crits, spec, anchor, *,
         spawn: Initial condition.
         cmd: ``(3,)`` commanded twist.
         cfg: The ``ArmRun``.
-        crits: ``{name: FailureCritic}``, all scoring the same branches.
+        crits: ``{name: ValueCritic}``, all scoring the same branches.
         spec: ``TrackingErrorSpec`` for the probe and the return target.
         anchor: Goal anchor for the critic's goal features.
         k: Siblings per probed state.
@@ -240,8 +240,9 @@ def _probe_episode(rig, policy, fm_lag, spawn, cmd, cfg, crits, spec, anchor, *,
                 for nm, cr in crits.items():
                     x = C.CriticInputs.from_runtime(policy, robot, sc, anchor=anchor,
                                                     ring=cring, want_scan=cr.privileged)
-                    p, g = cr.read(x)
-                    preds[nm] = (p, g)
+                    # V(s) only. This used to read BOTH heads through `cr.read(x)`; the
+                    # survival head is gone, so there is one number and no `p_` column.
+                    preds[nm] = cr.value(x)
             # THE LABEL: roll this sibling to completion, on the SHARED continuation stream.
             post.restore(robot, policy, fm_lag)
             cont_probe = tracking.TrackingProbe(spec, hold_until_s=hold)
@@ -263,8 +264,7 @@ def _probe_episode(rig, policy, fm_lag, spawn, cmd, cfg, crits, spec, anchor, *,
                    "failed": bool(failed), "g_real": float(g_real),
                    "terminal_in_branch": bool(v != ""),
                    "r_exec": float(r_exec), "n_cont_chunks": len(crew)}
-            for nm, (p, g) in preds.items():
-                row["p_" + nm] = float(p)
+            for nm, g in preds.items():
                 row["g_" + nm] = float("nan") if g is None else float(g)
             # A SECOND continuation for EVERY sibling, to size the label noise CRN leaves.
             #
@@ -332,9 +332,9 @@ def stage_run(args) -> int:
                 f"--critic name {name!r} is not allowed: it must be alphanumeric/underscore "
                 "and must not be 'real' or 'real_b', which would collide with the g_real / "
                 "g_real_b LABEL columns and score the label against itself.")
-        crits[name] = C.FailureCritic(path, fm_pt=(args.fm_pt or None), device=args.device)
+        crits[name] = C.ValueCritic(path, fm_pt=(args.fm_pt or None), device=args.device)
         print(f"[probe] critic {name}: {os.path.basename(path)} "
-              f"privileged={crits[name].privileged} quality={crits[name].has_quality}",
+              f"privileged={crits[name].privileged}",
               flush=True)
     if not crits:
         raise SystemExit("--critic is required; pass at least one NAME=path")
@@ -571,7 +571,7 @@ def stage_report(args) -> int:
 
     # ---- 3. the noise floor: two honest estimates of the same quantity ----------------
     print("\n-- 3. critic noise floor (fold disagreement) vs within-state SPREAD --")
-    for stat, lbl in (("p_", "p_fail"), ("g_", "G_hat")):
+    for stat, lbl in (("g_", "V"),):
         cols = [stat + n for n in names if stat + n in d]
         if len(cols) < 2:
             continue
@@ -597,8 +597,7 @@ def stage_report(args) -> int:
     rng = np.random.default_rng(0)
     for nm in names:
         for stat, target, lower, tlabel in (
-                ("p_" + nm, (~fail).astype(float), True, "survived"),
-                ("g_" + nm, greal, False, "realized G")):
+                ("g_" + nm, greal, False, "realized G"),):
             if stat not in d:
                 continue
             pred = d[stat]

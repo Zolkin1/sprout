@@ -13,7 +13,8 @@ the effective sample size is close to the EPISODE count, not the window count: 2
 one episode are one label observed from 25 vantage points, and this script prints both numbers
 so the second is never mistaken for the first.
 
-Two variants are always fitted, and their gap is a measurement -- see
+ONE variant is fitted (V_priv). A non-privileged `V_onboard` arm and the gap
+between them are deleted: the loop never fitted it for a reported result. See
 ``robot_rl.flow_matching.value``.
 
 Gates, in the order they should be read (``robot_rl.flow_matching.value_gates``):
@@ -32,12 +33,14 @@ budget that runs 1.4-3.6x longer. The same state therefore has a genuinely highe
 mjeval, so a perfectly transferred critic reads as over-optimistic there with no calibration
 error at all. Two consequences worth keeping straight:
 
-* the critic's DISCRIMINATION (AUC) is horizon-robust -- inflating everyone's risk barely
+* (historical, the survival head this described is deleted) its DISCRIMINATION (AUC) was
+  horizon-robust -- inflating everyone's risk barely
   reorders anything -- so ranking-only selection (``w_fail = 1``) is unaffected;
 * its CALIBRATION is not, so any cross-harness ECE comparison is confounded, and so is any
   score that MIXES ``p_fail`` with ``G_hat`` and needs their levels commensurable.
 
-``critic_gate.py --isaac_matched`` was an attempt to match the window and it does not work:
+``critic_gate.py --isaac_matched`` (since DELETED with the survival head it gated) was an
+attempt to match the window and it did not work:
 matching the budget without the initial condition and the velocity profile produced 84.7%
 timeouts (757/893) against 0.3% for the default budget, because the clip's duration implies
 its pace only if you also start at the clip's velocity. The gate now refuses to publish
@@ -514,7 +517,7 @@ def _tracking_spec_from(episode_attrs: dict):
         raise SystemExit(
             "this rollout has a track_err_prev block but no `tracking_spec` attr, so the "
             "thresholds and kernel widths its columns were written under are unknown. "
-            "Re-record, or fit with --quality_bins 0 to train the survival head alone.")
+            "Re-record with a reward sidecar.")
     return TrackingErrorSpec.from_dict(raw)
 
 
@@ -729,24 +732,6 @@ def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
                              scan=scan, proprio=proprio, context=ctx)
 
 
-def _predict(model, ctx, W, idx, priv, device, scan_hw, batch, *,
-             goal_context: bool = True, worst_so_far: np.ndarray | None = None):
-    """``P(fail)`` over ``idx``, in eval mode and without gradients."""
-    was = model.training
-    model.eval()
-    out = np.zeros(idx.size, dtype=np.float64)
-    with torch.no_grad():
-        for i in range(0, idx.size, batch):
-            j = idx[i:i + batch]
-            out[i:i + j.size] = model.p_fail(
-                _batch(ctx, W, j, priv, device, scan_hw,
-                       goal_context=goal_context,
-                       worst_so_far=worst_so_far)).cpu().numpy()
-    model.train(was)
-    return out
-
-
-@torch.no_grad()
 def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
                      goal_context: bool = True,
                      worst_so_far: np.ndarray | None = None) -> np.ndarray:
@@ -781,9 +766,7 @@ def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
 
 def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: float,
          device, label: str, scan_hw, wb=None, val_tile=None,
-         quality_bins: int = 0, quality_weight: float = 1.0,
-         quality_kind: str = "two_hot", quality_range: tuple[float, float] = (0.0, 1.0),
-         quality_only: bool = False,
+         quality_weight: float = 1.0,
          goal_context: bool = True,
          worst_so_far: np.ndarray | None = None) -> tuple[value.FlowValueModel, np.ndarray]:
     """Train one variant and return it plus held-out ``P(fail)``.
@@ -802,22 +785,23 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         proprio_steps=(int(W["proprio"].shape[1]) if priv else 0),
         context_dim=value.context_width(privileged=priv, goal_context=goal_context,
                                         worst_penalty_context=(worst_so_far is not None)),
-        quality_bins=int(quality_bins),
-        quality_kind=str(quality_kind),
-        quality_range=tuple(quality_range),
     ).to(device)
     opt = torch.optim.AdamW(model.trainable_parameters(), lr=lr, weight_decay=1e-4)
-    lossf = torch.nn.BCEWithLogitsLoss()
-    y = torch.as_tensor(lab["failed"].astype(np.float32), device=device)
     # The QUALITY target. `g_valid` excludes the last window of every episode (its chunk's
     # consequences were never recorded) and any episode with no usable reward at all; those
     # rows train the survival head only, rather than being handed a zero -- which is the worst
     # possible return and would teach the critic that every episode's last decision was bad.
-    use_q = int(quality_bins) > 0 and lab.get("g") is not None
-    g_t = (torch.as_tensor(lab["g"].astype(np.float32), device=device) if use_q else None)
-    g_ok = (torch.as_tensor(lab["g_valid"].astype(bool), device=device) if use_q else None)
-    if use_q:
-        print(f"  [{label}] quality head on: {int(lab['g_valid'].sum())}/{lab['g_valid'].size} "
+    # The value target is the ONLY target, and `g` is unconditional in schema 2 -- so this is
+    # required rather than optional. It used to be `use_q = lab.get("g") is not None`, with
+    # `None` arms threaded through the epoch loop that could never be taken; one of them would
+    # have surfaced as `TypeError: 'NoneType' is not subscriptable` deep inside training.
+    if lab.get("g") is None:
+        raise SystemExit(
+            "these labels carry no `g` column, so there is no value target to fit. That is a "
+            "caller error rather than a mode: re-grade the rollout with a reward sidecar.")
+    g_t = torch.as_tensor(lab["g"].astype(np.float32), device=device)
+    g_ok = torch.as_tensor(lab["g_valid"].astype(bool), device=device)
+    print(f"  [{label}] value head: {int(lab['g_valid'].sum())}/{lab['g_valid'].size} "
               f"windows carry a return target "
               f"(median G {np.median(lab['g'][lab['g_valid']]):.3f})")
     tr = np.flatnonzero(train)
@@ -826,7 +810,7 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
     # cannot select a model. Select on the fold's own validation quality error instead --
     # lower is better, hence the sign flip so one comparison serves both modes.
     best_state, best_auc, best_epoch, last_auc = None, -1.0, 0, float("nan")
-    select_name = "val quality MSE" if quality_only else "val AUC"
+    select_name = "val quality MSE"
     for ep in range(epochs):
         model.train()
         rng.shuffle(tr)
@@ -836,23 +820,22 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
             opt.zero_grad(set_to_none=True)
             xb = _batch(ctx, W, j, priv, device, scan_hw,
                         goal_context=goal_context, worst_so_far=worst_so_far)
-            fail_logit, q_logits = model.heads(xb)     # ONE encoder pass for both heads
-            # QUALITY ONLY drops the survival term outright rather than down-weighting it.
-            # A tiny weight would still shape the shared encoder while producing a p_fail
-            # nobody should read; zero makes the head's uselessness total and checkable.
-            loss = (torch.zeros((), device=device) if quality_only
-                    else lossf(fail_logit, y[j]))
-            if use_q and q_logits is not None:
-                jt = torch.as_tensor(j, device=device)
-                m = g_ok[jt]
-                if bool(m.any()):
-                    # MSE regresses the scalar head straight onto the return; the two-hot
-                    # path is unchanged and is the A/B control.
-                    q_term = (value.quality_mse_loss(q_logits[m], g_t[jt][m])
-                              if model.quality_kind == "mse"
-                              else value.quality_loss(q_logits[m], g_t[jt][m],
-                                                      model.quality_support))
-                    loss = loss + float(quality_weight) * q_term
+            q_logits = model.quality_logits(xb)
+            # ONE term. There used to be a survival BCE here, dropped outright under
+            # `--quality_only` rather than down-weighted -- a tiny weight would still shape
+            # the shared encoder while producing a p_fail nobody should read. Since every
+            # reported result was fitted that way, the head and its loss are gone and this is
+            # simply the value regression.
+            jt = torch.as_tensor(j, device=device)
+            m = g_ok[jt]
+            if not bool(m.any()):
+                # SKIP, do not backward a constant. `torch.zeros(())` carries no grad, so
+                # `loss.backward()` on it raises "element 0 of tensors does not require grad"
+                # -- which under the old two-term loss could not happen, because the survival
+                # BCE covered every row. Now the value target is the only term and a batch
+                # can legitimately hold no row with a measured return.
+                continue
+            loss = float(quality_weight) * value.quality_mse_loss(q_logits[m], g_t[jt][m])
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     f"[{label}] the loss went non-finite on epoch {ep + 1}. Before this "
@@ -868,63 +851,58 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         # 51 bins, and the second term's floor is the target's own entropy rather than zero --
         # so it reads ~3.4 where the survival-only loss reads ~0.31, and calling it "BCE"
         # invites reading a working two-head fit as a broken one.
-        name = ("quality MSE only" if quality_only
-                else ("loss (BCE + quality CE)" if use_q else "BCE"))
+        name = "quality MSE"
         print(f"  [{label}] epoch {ep + 1}/{epochs}  train {name} {bce:.4f}")
-        log = {f"{label}/train_{'loss' if use_q else 'bce'}": bce, f"{label}/epoch": ep + 1}
+        log = {f"{label}/train_loss": bce, f"{label}/epoch": ep + 1}
         y_np = lab["failed"]
         for scope, m in (("val_seen_tiles", val), ("val_UNSEEN_tiles", val_tile)):
             if m is None or not m.any():
                 continue
             j = np.flatnonzero(m)
-            a = value_gates.auc(_predict(model, ctx, W, j, priv, device, scan_hw, batch,
-                                         goal_context=goal_context,
-                                         worst_so_far=worst_so_far),
-                                y_np[j])
-            log[f"{label}/{scope}/auc_epoch"] = a
-            print(f"      {scope} AUC {a:.3f}")
-            if use_q:
-                # The quality head needs DIFFERENT questions from the classifier, and the
-                # first is whether it did anything: r2 is measured against the CONSTANT
-                # predictor, so <= 0 means it collapsed to the mean -- a real stationary
-                # point here, and one whose calibration curve is a single point on the
-                # diagonal (measured ECE 0.00000), so calibration alone would pass it. rho is
-                # what the selector needs, since best-of-K takes an argmax and only ordering
-                # matters.
-                jq = j[lab["g_valid"][j]]
-                if jq.size:
-                    q_hat = _predict_quality(model, ctx, W, jq, priv, device, scan_hw,
-                                             batch, goal_context=goal_context,
-                                             worst_so_far=worst_so_far)
-                    qg = value_gates.return_gates(q_hat, lab["g"][jq])
-                    log.update({f"{label}/{scope}/q_r2": qg["r2"],
-                                f"{label}/{scope}/q_rho": qg["rho"],
-                                f"{label}/{scope}/q_rmse": qg["rmse"]})
-                    print(f"      {scope} quality r2 {qg['r2']:+.3f}  rho {qg['rho']:.3f} "
-                          f"(shuffled {qg['rho_shuffled']:+.3f})  rmse {qg['rmse']:.4f}  "
-                          f"pred_sd {qg['pred_std']:.3f} vs target_sd {qg['target_std']:.3f}")
-                    # And the DIFFERENCE gates, which are what an advantage actually uses.
-                    # `return_gates` above scores the LEVEL, and the two are different
-                    # questions: measured on the v2 critic, pointwise rho 0.809 against
-                    # 0.590 for the 8-step difference, with the predicted change 1.9x larger
-                    # than the real one. Printed here because it was only ever found by hand,
-                    # and `--n` on label_advantage is the knob it argues about.
-                    dg = value_gates.difference_gates(
-                        q_hat, lab["g"][jq], W["episode_uid"][jq], W["replan_index"][jq])
-                    if dg:
-                        cells = "  ".join(
-                            f"n{n}: rho {r['rho']:+.3f} ratio {r['ratio']:.2f}"
-                            for n, r in sorted(dg.items()))
-                        print(f"      {scope} quality DIFFERENCES  {cells}"
-                              "     (ratio = sd(predicted change) / sd(real change);"
-                              " >1 inflates every advantage)")
-                        log.update({f"{label}/{scope}/dq_rho_n{n}": r["rho"]
-                                    for n, r in dg.items()})
-                        log.update({f"{label}/{scope}/dq_ratio_n{n}": r["ratio"]
-                                    for n, r in dg.items()})
-            if quality_only and scope == "val_seen_tiles":
+            # No survival AUC: the head that produced it is gone, and the fit is selected on
+            # the value regression alone. Set here so the flow below reads the same.
+            a = float("nan")
+            # The quality head needs DIFFERENT questions from the classifier, and the
+            # first is whether it did anything: r2 is measured against the CONSTANT
+            # predictor, so <= 0 means it collapsed to the mean -- a real stationary
+            # point here, and one whose calibration curve is a single point on the
+            # diagonal (measured ECE 0.00000), so calibration alone would pass it. rho is
+            # what the selector needs, since best-of-K takes an argmax and only ordering
+            # matters.
+            jq = j[lab["g_valid"][j]]
+            if jq.size:
+                q_hat = _predict_quality(model, ctx, W, jq, priv, device, scan_hw,
+                                         batch, goal_context=goal_context,
+                                         worst_so_far=worst_so_far)
+                qg = value_gates.return_gates(q_hat, lab["g"][jq])
+                log.update({f"{label}/{scope}/q_r2": qg["r2"],
+                            f"{label}/{scope}/q_rho": qg["rho"],
+                            f"{label}/{scope}/q_rmse": qg["rmse"]})
+                print(f"      {scope} quality r2 {qg['r2']:+.3f}  rho {qg['rho']:.3f} "
+                      f"(shuffled {qg['rho_shuffled']:+.3f})  rmse {qg['rmse']:.4f}  "
+                      f"pred_sd {qg['pred_std']:.3f} vs target_sd {qg['target_std']:.3f}")
+                # And the DIFFERENCE gates, which are what an advantage actually uses.
+                # `return_gates` above scores the LEVEL, and the two are different
+                # questions: measured on the v2 critic, pointwise rho 0.809 against
+                # 0.590 for the 8-step difference, with the predicted change 1.9x larger
+                # than the real one. Printed here because it was only ever found by hand,
+                # and `--n` on label_advantage is the knob it argues about.
+                dg = value_gates.difference_gates(
+                    q_hat, lab["g"][jq], W["episode_uid"][jq], W["replan_index"][jq])
+                if dg:
+                    cells = "  ".join(
+                        f"n{n}: rho {r['rho']:+.3f} ratio {r['ratio']:.2f}"
+                        for n, r in sorted(dg.items()))
+                    print(f"      {scope} quality DIFFERENCES  {cells}"
+                          "     (ratio = sd(predicted change) / sd(real change);"
+                          " >1 inflates every advantage)")
+                    log.update({f"{label}/{scope}/dq_rho_n{n}": r["rho"]
+                                for n, r in dg.items()})
+                    log.update({f"{label}/{scope}/dq_ratio_n{n}": r["ratio"]
+                                for n, r in dg.items()})
+            if scope == "val_seen_tiles":
                 # -MSE, so "higher is better" holds for both selection criteria.
-                jq = j[g_ok.cpu().numpy()[j]] if use_q else j
+                jq = j[g_ok.cpu().numpy()[j]]
                 a = (-float(np.mean((_predict_quality(
                     model, ctx, W, jq, priv, device, scan_hw, batch,
                     goal_context=goal_context,
@@ -945,21 +923,12 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         # unseen-TILE score is the generalisation measure and must not also be the selection
         # criterion, or it stops being a holdout. With folds every window gets scored by a
         # model that did not train on it, so this split costs nothing.
-        shown = (abs(best_auc), abs(last_auc)) if quality_only else (best_auc, last_auc)
+        shown = (abs(best_auc), abs(last_auc))
         print(f"  [{label}] restoring epoch {best_epoch} ({select_name} {shown[0]:.5f} "
               f"against {shown[1]:.5f} at the end)")
         model.load_state_dict(best_state)
     model.eval()
-    out = np.zeros(W["episode_uid"].size, dtype=np.float64)
-    with torch.no_grad():
-        allidx = np.arange(out.size)
-        for i in range(0, out.size, batch):
-            j = allidx[i:i + batch]
-            out[j] = model.p_fail(
-                _batch(ctx, W, j, priv, device, scan_hw,
-                       goal_context=goal_context,
-                       worst_so_far=worst_so_far)).cpu().numpy()
-    return model, out
+    return model
 
 
 def main() -> int:
@@ -989,11 +958,6 @@ def main() -> int:
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--val_frac", type=float, default=0.25,
                    help="Fraction of TILES held out entirely, and (at --folds 1) of episodes.")
-    p.add_argument("--quality_bins", type=int, default=51,
-                   help="Bins for the QUALITY head's distribution over the normalized "
-                        "tracking return. 0 trains the survival head ALONE, which is "
-                        "bit-for-bit the model that shipped and is therefore the control arm. "
-                        "Ignored on a rollout with no track_err_prev block.")
     p.add_argument("--quality_weight", type=float, default=1.0,
                    help="Weight on the quality cross-entropy against the survival BCE. Both "
                         "are per-sample means over comparable ranges, so 1.0 is a real "
@@ -1007,10 +971,6 @@ def main() -> int:
                         "being a lookup of the realized outcome. Costs the same wall-clock "
                         "as K=1 (each fold trains on 1/K less data), at the price of each "
                         "fold model seeing less.")
-    p.add_argument("--variants", type=str, default="V_priv,V_onboard",
-                   help="Which critics to fit, comma-separated.")
-    # Opt-IN, unlike `--goal_context`: it WIDENS the context token, so every checkpoint
-    # already on disk was fitted without it and must keep loading.
     p.add_argument("--bootstrap_v", type=str, default="",
                    help="A PREVIOUS round's predictions.npz. Turns the quality target from "
                         "the full-episode Monte Carlo return into the N-step bootstrap "
@@ -1053,17 +1013,6 @@ def main() -> int:
                         "being confirmed, not the fit going wrong. The context token keeps "
                         "the base twist, so it does not disappear: V_priv goes 9 -> 6 wide "
                         "and V_onboard 6 -> 3.")
-    p.add_argument("--quality_only", action="store_true",
-                   help="train ONLY the quality (terrain reward) head -- the survival BCE is "
-                        "dropped from the loss entirely. The p_fail head is then UNTRAINED, "
-                        "so its predictions and every survival gate are meaningless; they "
-                        "are skipped and the fact is stamped into predictions.npz, and "
-                        "label_advantage refuses to use them.")
-    p.add_argument("--quality_kind", default="two_hot", choices=("two_hot", "mse"),
-                   help="how the quality head is fitted. 'two_hot' is the distributional "
-                        "head every existing checkpoint uses; 'mse' regresses a SCALAR head "
-                        "onto the return. The two share no parameters, so a checkpoint "
-                        "fitted under one cannot load as the other.")
     p.add_argument("--clip_c", type=float, default=0.0,
                    help="clip constant c for the reward spec r = -min(p, c). Non-zero "
                         "switches the quality target to the CLIPPED WINDOW RETURN over "
@@ -1147,12 +1096,6 @@ def main() -> int:
     stem = args.stem[:-3] if args.stem.endswith(".h5") else args.stem
     stem = stem[:-9] if stem.endswith(".episodes") else stem
     strict_failure = args.failure_rule == "strict"
-    if args.quality_kind == "mse" and int(args.quality_bins) == 0:
-        # `quality_bins` is what creates the head at all, so leaving it 0 under --quality_kind
-        # mse would fit the survival head alone and report nothing about it.
-        print("[fit] --quality_kind mse implies a quality head; setting --quality_bins 1 "
-              "(the MSE head has ONE output regardless of the bin count).")
-        args.quality_bins = 1
     W, E, lab = _load(stem, args.max_windows, int(args.tail_chunks),
                       strict_failure=strict_failure,
                       max_episodes=int(args.max_episodes), seed=int(args.seed),
@@ -1271,31 +1214,24 @@ def main() -> int:
 
     ctx = online.load_fm_context(args.fm_checkpoint, device=args.device)
     results = {}
-    preds = {}
     qpreds = {}
-    wanted = [v.strip() for v in args.variants.split(",") if v.strip()]
-    unknown = [v for v in wanted if v not in ("V_priv", "V_onboard")]
-    if unknown:
-        raise SystemExit(f"--variants: unknown {unknown}; choose from V_priv, V_onboard")
     os.makedirs(args.out, exist_ok=True)
-    for label, priv in (("V_priv", True), ("V_onboard", False)):
-        if label not in wanted:
-            continue
+    # ONE variant. There used to be a non-privileged `V_onboard` fitted alongside, and their
+    # gap was reported as "how much outcome-relevant information the generator cannot see" --
+    # but the fine-tune loop passes `--variants V_priv`, so it was never fitted for any
+    # reported result and the gap was never measured on one.
+    for label, priv in (("V_priv", True),):
         print(f"[fit] {label}")
-        p_all = np.zeros(uids.size, dtype=np.float64)
-        # The QUALITY head's out-of-fold prediction, assembled exactly like p_fail so the two
-        # are on the same footing when `label_advantage` combines them into one V.
-        q_all = (np.zeros(uids.size, dtype=np.float64) if int(args.quality_bins) > 0 else None)
+        # The value head's out-of-fold prediction: every window scored by a fold that did not
+        # train on it, which is what `A = G - V` needs to avoid differencing a row against a
+        # baseline fitted on itself.
+        q_all = np.zeros(uids.size, dtype=np.float64)
         for k, (tr_k, va_k) in enumerate(folds):
             if len(folds) > 1:
                 print(f"  [{label}] fold {k + 1}/{len(folds)}  "
                       f"{int(np.unique(uids[tr_k]).size)} train episodes")
-            model, p_k = _fit(ctx, W, lab, tr_k, va_k,
-                              quality_bins=int(args.quality_bins),
+            model = _fit(ctx, W, lab, tr_k, va_k,
                               quality_weight=float(args.quality_weight),
-                              quality_kind=str(args.quality_kind),
-                              quality_range=tuple(E.get("quality_range", (0.0, 1.0))),
-                              quality_only=bool(args.quality_only),
                               goal_context=bool(args.goal_context),
                               worst_so_far=lab.get("worst_so_far"),
                               priv=priv, epochs=args.epochs,
@@ -1306,8 +1242,6 @@ def main() -> int:
             # on its episode. The held-out TILES are out-of-sample for every fold, so they
             # take the mean -- averaging there is a free variance reduction, and doing it on
             # a training fold would silently reintroduce the in-sample reading.
-            p_all[va_k] = p_k[va_k]
-            p_all[val_tile] += p_k[val_tile] / len(folds)
             if q_all is not None:
                 q_k = _predict_quality(model, ctx, W, np.arange(uids.size), priv,
                                        args.device, scan_hw, args.batch,
@@ -1363,7 +1297,6 @@ def main() -> int:
                         "goal_context": bool(args.goal_context),
                         "epochs": int(args.epochs), "stem": stem,
                         "fold": int(k), "num_folds": int(len(folds)),
-                        "quality_bins": int(args.quality_bins),
                         "quality_weight": float(args.quality_weight),
                         "tracking_spec": track_spec.to_dict(),
                         "gamma": float(track_spec.gamma),
@@ -1373,50 +1306,19 @@ def main() -> int:
                         "tail_chunks": int(args.tail_chunks)},
                        os.path.join(args.out, name))
             del model
-        preds[label] = p_all
         if q_all is not None:
             qpreds[label] = q_all
+        # No survival gates. `_gates` scored calibration, AUC, AUC-by-phase and lead-to-fall
+        # -- every one of them a property of the P(fail) head, which is gone. The value head's
+        # own diagnostics (r2, rho, rmse, and the DIFFERENCE gates that say whether adjacent
+        # chunks are ordered correctly) are printed per epoch by `_fit` instead, which is where
+        # they can be read against the fit that produced them.
         results[label] = {}
-        # With folds the seen-tile scope is EVERY training-tile window, each scored out of
-        # fold -- a far larger sample than the single held-out episode split it replaces.
-        seen_scope = (~val_tile) if len(folds) > 1 else val_ep
-        for scope, mask in (("val_seen_tiles", seen_scope), ("val_UNSEEN_tiles", val_tile)):
-            print(f"  -- {scope} --")
-            results[label][scope] = _gates(p_all, lab, W, mask,
-                                           quality_only=bool(args.quality_only))
-        if wb is not None:
-            for scope in ("val_seen_tiles", "val_UNSEEN_tiles"):
-                r = results[label][scope]
-                if r.get("quality_only"):
-                    continue           # nothing here describes a fitted head
-                lead = r["lead_to_fall"]["lead"]
-                good = np.isfinite(lead)
-                wb.log({
-                    f"{label}/{scope}/auc": r["auc"],
-                    f"{label}/{scope}/ece": r["calibration"]["ece"],
-                    f"{label}/{scope}/mce": r["calibration"]["mce"],
-                    # The phase curve as separate scalars: a flat, high one is the shape that
-                    # matters, and it is unreadable folded into a single number.
-                    **{f"{label}/{scope}/auc_phase{i}": (None if np.isnan(a) else float(a))
-                       for i, a in enumerate(r["auc_by_phase"]["auc"])},
-                    f"{label}/{scope}/lead_to_fall_chunks":
-                        (float(np.nanmedian(lead[good])) if good.any() else None),
-                    f"{label}/{scope}/lead_warned_frac": float(good.mean()) if lead.size else None,
-                })
-        a_seen = results[label]["val_seen_tiles"]["auc"]
-        a_new = results[label]["val_UNSEEN_tiles"]["auc"]
-        if a_seen is None or a_new is None:
-            print("  generalisation gap: n/a (survival gates skipped under --quality_only)")
-            continue
-        print(f"  generalisation gap (seen - unseen tiles): {a_seen - a_new:+.3f}"
-              + ("   <-- large: the critic is reading the TILE, not the state"
-                 if a_seen - a_new > 0.10 else ""))
 
+    # The V_priv/V_onboard gap is gone with the second variant: it was reported as "how
+    # much outcome-relevant information the generator cannot see", and was never
+    # measured for a reported result because the loop fits V_priv alone.
     gap = float("nan")
-    if "V_priv" in preds and "V_onboard" in preds:
-        gap = float(np.mean(np.abs(preds["V_priv"] - preds["V_onboard"])))
-        print(f"\n[fit] V_priv / V_onboard mean |dP| = {gap:.4f}  "
-              "(how much outcome-relevant information the generator cannot see)")
     with open(os.path.join(args.out, "gates.json"), "w") as f:
         json.dump({"gap_mean_abs": gap, "n_episodes": n_ep, "n_windows": int(uids.size),
                    "results": results}, f, indent=2, default=_jsonable)
@@ -1455,11 +1357,8 @@ def main() -> int:
              # differently-shaped return, and because an UNTRAINED p_fail still produces
              # numbers that look exactly like predictions. Range matters as much as source:
              # [0, 1] and [-1, 0] are both plausible-looking.
-             quality_only=bool(args.quality_only),
-             quality_kind=str(args.quality_kind),
              quality_range=np.asarray(E.get("quality_range", (0.0, 1.0)), np.float64),
              clip_c=float(args.clip_c), window=int(args.window),
-             **{f"p_{k}": v for k, v in preds.items()},
              **{f"q_{k}": v for k, v in qpreds.items()})
     if wb is not None:
         if np.isfinite(gap):
@@ -1483,55 +1382,6 @@ def _jsonable(o):
     raise TypeError(f"not JSON-serialisable: {type(o)}")
 
 
-def _gates(p_all, lab, W, val, quality_only: bool = False) -> dict:
-    """Run the three gates on the held-out split and print them."""
-    uids, ix = W["episode_uid"], W["replan_index"]
-    y = lab["failed"]
-    m = val
-    # Phase: position within the episode, 0 at the first chunk and 1 at the last.
-    last = {int(u): int(ix[uids == u].max()) for u in np.unique(uids)}
-    phase = np.array([ix[i] / max(last[int(uids[i])], 1) for i in range(uids.size)])
-
-    cal = value_gates.calibration(p_all[m], y[m])
-    byph = value_gates.auc_by_phase(p_all[m], y[m], phase[m], n_bins=5)
-    # Against the FALL, in CHUNKS: first_fall_step is a control step, and a chunk is K of them.
-    k = 12
-    ref = np.where(lab["first_fall_step"] >= 0, lab["first_fall_step"] / k, np.nan)
-    lead_end = value_gates.lead_time(p_all[m], uids[m], ix[m], y[m])
-    lead_fall = value_gates.lead_time(p_all[m], uids[m], ix[m], y[m], reference=ref[m])
-
-    if quality_only:
-        # Every number below reads the SURVIVAL head, which a quality_only fit never trained.
-        # An unfitted sigmoid still produces an AUC (nan or ~0.5), an ECE (~0.49) and a lead
-        # time, and they are indistinguishable in print from a badly-calibrated real critic.
-        # This file already carries the lesson: "a number produced by a broken fit is worse
-        # than no number."
-        print("    survival gates SKIPPED (--quality_only: the p_fail head was never "
-              "trained, so its AUC / ECE / lead time describe an unfitted sigmoid). The "
-              "quality head's own diagnostics are the per-epoch dq_rho / dq_ratio above.")
-        # Same KEYS as the real return, so every consumer's lookup still resolves; the
-        # values are None so nothing can mistake them for measurements.
-        return {"quality_only": True, "auc": None, "calibration": None,
-                "auc_by_phase": None,
-                "lead_to_end": {"lead": np.full(1, np.nan)},
-                "lead_to_fall": {"lead": np.full(1, np.nan)}}
-    print(f"    aggregate AUC {value_gates.auc(p_all[m], y[m]):.3f}   "
-          f"ECE {cal['ece']:.3f}  MCE {cal['mce']:.3f}")
-    print("    AUC by phase: " + "  ".join(
-        f"{lo:.1f}-{hi:.1f}:{'  nan' if np.isnan(a) else f'{a:5.3f}'}"
-        for lo, hi, a in zip(byph["bin_lo"], byph["bin_hi"], byph["auc"])))
-    for nm, L in (("to end", lead_end), ("to FALL", lead_fall)):
-        good = np.isfinite(L["lead"])
-        if good.any():
-            print(f"    lead time {nm}: median {np.nanmedian(L['lead'][good]):.1f} chunks "
-                  f"({np.nanmedian(L['lead'][good]) * 0.24:.2f} s) over "
-                  f"{int(good.sum())}/{L['lead'].size} failures")
-        else:
-            print(f"    lead time {nm}: NEVER rose on any failure")
-    return {"auc": value_gates.auc(p_all[m], y[m]), "calibration": cal,
-            "auc_by_phase": byph,
-            "lead_to_end": {k2: v for k2, v in lead_end.items()},
-            "lead_to_fall": {k2: v for k2, v in lead_fall.items()}}
 
 
 if __name__ == "__main__":

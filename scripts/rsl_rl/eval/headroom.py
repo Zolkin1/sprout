@@ -92,8 +92,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "CURSOR condition, which scores a robot that stood still exactly "
                         "like one that climbed the terrain. Use the SAME file the critic "
                         "was fitted with.")
-    g.add_argument("--v_checkpoint", default="",
-                   help="A fit_value.py V_*.pt. Required for --scorer v.")
     g.add_argument("--scan_sensor", default="height_scanner",
                    help="Privileged scan sensor, for a priv critic.")
     g.add_argument("--branch_once", action="store_true",
@@ -120,10 +118,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="STRUCTURAL CONTROL: build and restore all K envs but always follow "
                         "candidate 0, so no choice is made. Must reproduce the k=0 baseline; "
                         "a gap belongs to the K-env structure rather than to selection.")
-    g.add_argument("--scorer", default="oracle", choices=("oracle", "v"),
+    g.add_argument("--scorer", default="oracle", choices=("oracle",),
                    help="oracle = keep whichever candidate survived, which is the BEST any "
                         "selector could do on simulator noise and therefore an upper bound "
-                        "on what the control can manufacture. v = the trained value model.")
+                        "on what the control can manufacture. The `v` scorer is gone: it read "
+                        "the critic's survival head, which was untrained in every reported "
+                        "result and has been deleted.")
     g.add_argument("--max_cycles", type=int, default=100000,
                    help="Hard stop on re-plan cycles; a truncated table says so loudly.")
     g.add_argument("--episodes_per_clip", type=int, default=2,
@@ -214,8 +214,6 @@ def main() -> int:
                     "out -- and a selector scored on those is maximised by standing still. "
                     "record_rollouts.py refuses for the same reason; use the file the "
                     "critic was fitted with.")
-            if args.scorer == "v" and not args.v_checkpoint:
-                raise SystemExit("--scorer v needs --v_checkpoint")
             import headroom_select  # noqa: PLC0415
 
             return headroom_select.stage_select(args)

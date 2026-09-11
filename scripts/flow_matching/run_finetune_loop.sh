@@ -473,9 +473,9 @@ for (( it=1; it<=ITERS; it++ )); do
         --fm_checkpoint "$PARENT" \
         --reward_npz "$BUF_NPZ" \
         "${REWARD_ARGS[@]}" "${BOOT_ARGS[@]}" \
-        --window 3 --quality_kind mse --quality_only \
+        --window 3 \
         --failure_rule "$FAILURE_RULE" \
-        --folds 2 --epochs "$EPOCHS_CRITIC" --variants V_priv --device cuda \
+        --folds 2 --epochs "$EPOCHS_CRITIC" --device cuda \
         --out "$RDIR" >> "$ITD/critic.log" 2>&1 \
         || fail "critic round $fr (see $ITD/critic.log)" "$it"
       PREV_PRED="$RDIR/predictions.npz"
@@ -518,7 +518,7 @@ for (( it=1; it<=ITERS; it++ )); do
     # inheriting the script default of 35 that nothing chose.
     echo "[awr] 7/8 label       MC advantage, terrain only, percentile $PERCENTILE"
     "$PY" -u scripts/flow_matching/label_advantage.py "$CRITIC/predictions.npz" \
-      --terrain_only --w_fail 0 --estimator mc --variant V_priv \
+      --terrain_only --estimator mc --variant V_priv \
       --percentile "$PERCENTILE" \
       --out "$CRITIC/advantage.npz" >> "$ITD/critic.log" 2>&1 || fail label "$it"
   fi

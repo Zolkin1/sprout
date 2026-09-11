@@ -1,3 +1,8 @@
+> **SUPERSEDED 2026-09-10.** This report describes the PRE-CUT two-head critic
+> (`quality_bins=51`, a `P(fail)` head beside the value head). Both that head and
+> `critic_advantage_eval.py`, the tool that produced this, are deleted. The runbook
+> at the end no longer runs.
+
 # Is the critic good enough for advantage estimation?
 
 An evaluation of the v4 trackability critic as a source of advantages for AWR / filtered-BC

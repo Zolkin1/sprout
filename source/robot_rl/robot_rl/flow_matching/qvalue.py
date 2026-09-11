@@ -110,6 +110,19 @@ class FlowQModel(FlowValueModel):
         # 63 is 1.26 s out, and a permutation-invariant read of it would discard the ordering
         # that makes one chunk a step and another a stumble.
         self.action_pos = nn.Parameter(torch.zeros(1, self.action_steps, self.d_model))
+        # Q's OWN head, no longer inherited. `FlowValueModel` used to carry a survival head
+        # (`self.head`, predicting P(fail | s)) which this class read for P(fail | s, a); that
+        # head is gone from V, because the fine-tune drops its loss and no reported result
+        # used it. The question Q answers is still a failure probability, so the head moves
+        # here rather than disappearing -- V is a value regression, Q is a ranking score, and
+        # they were only ever sharing a module by accident of inheritance.
+        # `hidden` MUST match what the inherited head used, or every fitted Q checkpoint
+        # becomes unloadable for a reason nothing states: at the production d_model of 512 a
+        # `d_model // 2` width is (256, 512) against the real (128, 512). Same default, read
+        # from the same kwarg the parent reads.
+        _hidden = int(kw.get("hidden", 128))
+        self.head = nn.Sequential(nn.Linear(self.d_model, _hidden), nn.SiLU(),
+                                  nn.Linear(_hidden, 1))
 
     def value_tokens(self, x) -> torch.Tensor:  # type: ignore[override]
         """The state stream with the action tokens appended.
