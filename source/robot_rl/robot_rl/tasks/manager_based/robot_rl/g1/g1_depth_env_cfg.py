@@ -458,6 +458,19 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
         #: ``None`` is the default because near-only is the decision for the next teacher
         #: retrain; :func:`enable_policy_far_camera` turns it back on for running an EXISTING
         #: two-camera checkpoint, which is every one on disk today.
+        #:
+        #: **THE ASYMMETRY IS DELIBERATE: the RL policy reads the NEAR camera alone, and the
+        #: FM generator still reads BOTH.** They are different consumers of the same pair --
+        #: the policy has to run on a robot and the generator places a reference from what it
+        #: can see ahead, which is what the far camera is for. So this default is NOT a
+        #: statement that the far camera is unhelpful, and it must not be propagated to the
+        #: generator's own exteroception (``extero_source`` / ``add_fm_depth_pair``, which
+        #: samples the same physical pair on its own grid).
+        #:
+        #: Practical consequence for a retrain: a tracker trained under this default has a
+        #: DIFFERENT policy observation from every checkpoint on disk, so it is not a drop-in
+        #: and its numbers are not comparable to the two-camera ones without re-running the
+        #: eval arms.
         #: NOTE the missing type annotation, and it is load-bearing: ``depth_near`` above is an
         #: un-annotated class attribute, and ``configclass`` orders ANNOTATED fields ahead of
         #: un-annotated ones. Written as ``depth_far: ObsTerm | None = None`` this slot lands
@@ -553,8 +566,12 @@ class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainBodyEnvCfg):
     A/B controlled too.
     """
 
+    # 8192, matching the tracker that every result on disk was measured with
+    # (`2026-08-20_16-36-10_mode11_decor_plan_v1`, which passed `--num_envs 8192`). The repo
+    # said 4096, so the pairing lived only in a shell history. The PLAY cfgs below stay small
+    # on purpose -- nothing wants 8192 robots in a viewer.
     scene: G1TeacherTerrainDepthSceneCfg = G1TeacherTerrainDepthSceneCfg(
-        num_envs=4096, env_spacing=2.5
+        num_envs=8192, env_spacing=2.5
     )
     observations: G1TeacherTerrainDepthObservationsCfg = G1TeacherTerrainDepthObservationsCfg()
     events: G1TeacherTerrainDepthEventsCfg = G1TeacherTerrainDepthEventsCfg()
