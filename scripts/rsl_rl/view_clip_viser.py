@@ -20,6 +20,12 @@ Example::
 
     python scripts/rsl_rl/view_clip_viser.py --lib clips/g1_flat_v1.h5 --clip 0
     # then open the printed http://localhost:8080 URL
+
+For a figure, the robot draws in its own URDF materials by default (light shells, dark
+joints, darker camera mounts and backpack); ``--env-map studio`` adds HDRI lighting on top,
+and ``--robot-color`` takes it back to a flat colour when a silhouette reads better::
+
+    python scripts/rsl_rl/view_clip_viser.py --lib clips/g1_mb_v5.h5 --clip 24 --env-map studio
 """
 
 from __future__ import annotations
@@ -48,7 +54,12 @@ _FRAME_COLORS = [
     (0.20, 0.80, 0.85),  # cyan
     (0.85, 0.80, 0.20),  # yellow
 ]
-_SCRUBBER_COLOR = (1.0, 1.0, 1.0)       # solid white-ish robot
+# The solid robot's colour, when it is overridden at all.  ``--robot-color urdf`` (the
+# DEFAULT) overrides nothing and lets the model's own <material> tags through, which is
+# what a figure wants: the G1 is a light-grey shell with dark joints, and the camera
+# mounts and backpack are their own darker grey.  A flat override paints all of that one
+# colour, which is why every part used to read as the same piece of off-white plastic.
+_SCRUBBER_COLOR = (1.0, 1.0, 1.0)       # solid white-ish robot (--robot-color white)
 _GHOST_COLOR = (0.45, 0.55, 0.70)       # translucent steel-blue ghosts
 _GHOST_ALPHA_NEAR, _GHOST_ALPHA_FAR = 0.7, 0.18
 _KEYFRAME_COLOR = (0.95, 0.80, 0.15)    # gold -- pinned target keyframes (Phase-2 mb_encode overlay)
@@ -64,6 +75,34 @@ _KEYFRAME_TERRAIN_COLOR = (0.90, 0.25, 0.20)
 # posing a 29-joint clip with it silently FROZE those 8 joints at zero: the motion looked subtly wrong
 # (stiff torso) in a way that was easy to blame on the clip rather than the viewer.
 _DEFAULT_URDF = DEFAULT_URDF
+
+
+def _parse_robot_color(spec: str) -> tuple[float, float, float, float] | None:
+    """Turn a ``--robot-color`` string into a ``ViserUrdf`` mesh colour override.
+
+    Args:
+        spec: ``"urdf"`` to keep the model's own materials, ``"white"`` for the flat white
+            the viewer used to force, or ``"r,g,b"`` with each component in ``[0, 1]``.
+
+    Returns:
+        An RGBA tuple to pass as ``mesh_color_override``, or ``None`` for ``"urdf"`` --
+        which is not the same as white: ``None`` makes ViserUrdf take the ``add_mesh_trimesh``
+        path, the only one that carries the URDF's per-link material colours through.
+
+    Raises:
+        ValueError: If ``spec`` is neither keyword nor three floats in ``[0, 1]``.
+    """
+    if spec == "urdf":
+        return None
+    if spec == "white":
+        return (*_SCRUBBER_COLOR, 1.0)
+    try:
+        rgb = tuple(float(x) for x in spec.split(","))
+    except ValueError as exc:
+        raise ValueError(f"--robot-color: expected 'urdf', 'white' or 'r,g,b', got {spec!r}") from exc
+    if len(rgb) != 3 or not all(0.0 <= c <= 1.0 for c in rgb):
+        raise ValueError(f"--robot-color: 'r,g,b' needs three components in [0, 1], got {spec!r}")
+    return (*rgb, 1.0)
 
 
 def _load_keyframe_sidecar(path: str, urdf) -> dict[int, dict]:
@@ -466,7 +505,21 @@ def _tracking_image(base_pos: np.ndarray, base_quat_wxyz: np.ndarray,
 class ClipScene:
     """Builds and updates all viser nodes for one clip at a time."""
 
-    def __init__(self, server: viser.ViserServer, lib, urdf, max_ghosts: int, term_dist: float = 0.25):
+    def __init__(self, server: viser.ViserServer, lib, urdf, max_ghosts: int,
+                 term_dist: float = 0.25,
+                 robot_color: tuple[float, float, float, float] | None = None):
+        """Build every static node for the scene; ``load_clip`` fills in the per-clip ones.
+
+        Args:
+            server: The viser server.
+            lib: The loaded clip library.
+            urdf: Shared loaded URDF (see ``viz.robot.load_urdf``).
+            max_ghosts: Trajectory-ghost pool size.
+            term_dist: Base-pose-error termination distance (m), drawn as a corridor tube.
+            robot_color: RGBA override for the solid robot, or ``None`` to render it with
+                the URDF's own materials (see :func:`_parse_robot_color`). The ghosts are
+                always overridden -- their whole job is to be a flat translucent colour.
+        """
         self.server = server
         self.lib = lib
         self.urdf = urdf
@@ -501,7 +554,7 @@ class ClipScene:
         self._scrub_frame = server.scene.add_frame("/scrubber", show_axes=False)
         self._scrub = ViserUrdf(
             server, urdf, root_node_name="/scrubber",
-            mesh_color_override=(*_SCRUBBER_COLOR, 1.0),
+            mesh_color_override=robot_color,
         )
         self._ghosts: list[tuple[viser.FrameHandle, ViserUrdf]] = []
         for s in range(max_ghosts):
@@ -869,11 +922,22 @@ def main() -> int:
                    help="Base-pose-error termination distance (m); radius of the corridor tube.")
     p.add_argument("--keyframes", default=None,
                    help="Optional mb_encode.py _keyframes.npz sidecar: overlay the pinned target poses (gold).")
+    p.add_argument("--robot-color", default="urdf",
+                   help="Solid robot colour: 'urdf' (default -- the model's own <material> tags, "
+                        "which is what the real robot looks like and what a figure wants), "
+                        "'white' (the flat white this viewer used to force), or 'r,g,b' in 0-1.")
+    p.add_argument("--env-map", default="none",
+                   choices=["none", "apartment", "city", "dawn", "forest", "lobby", "night",
+                            "park", "studio", "sunset", "warehouse"],
+                   help="Light the scene with a preset HDRI instead of viser's default lights. "
+                        "'studio' or 'warehouse' give a figure soft shading and specular "
+                        "highlights; the map itself stays out of the background.")
     p.add_argument("--max-keyframes", type=int, default=12,
                    help="Posed keyframe robots to build (each costs TWO URDFs, gold + red). Built "
                         "lazily on first show; a clip with more keyframes is subsampled evenly, "
                         "while the root markers still show every one.")
     args = p.parse_args()
+    robot_color = _parse_robot_color(args.robot_color)
 
     lib = load_clip_library(args.lib, "cpu")
     urdf = load_urdf(args.urdf)
@@ -881,8 +945,13 @@ def main() -> int:
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("+z")  # grid is (re)created per clip in load_clip, sized to the chunk
+    if args.env_map != "none":
+        # background=False: light the robot with the HDRI, but keep the plain backdrop -- a
+        # photographed warehouse behind a figure is noise, and a white page wants a white page.
+        server.scene.configure_environment_map(args.env_map, background=False)
 
-    scene = ClipScene(server, lib, urdf, max_ghosts=args.max_ghosts, term_dist=args.term_dist)
+    scene = ClipScene(server, lib, urdf, max_ghosts=args.max_ghosts, term_dist=args.term_dist,
+                      robot_color=robot_color)
     scene.num_ghosts = min(args.ghosts, args.max_ghosts)
     keyframes = _load_keyframe_sidecar(args.keyframes, urdf) if args.keyframes else None
     if keyframes is not None:
