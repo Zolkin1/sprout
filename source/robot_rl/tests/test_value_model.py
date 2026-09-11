@@ -34,22 +34,19 @@ def _fm():
         num_layers=2, dim_feedforward=64, attention_mode="prefix").eval()
 
 
-def _inputs(b=4, *, scan=True, proprio=True, ctx=True):
+def _inputs(b=4, *, ctx=True):
     g = torch.Generator().manual_seed(0)
     return ValueInputs(
         history=torch.randn(b, N, D, generator=g),
         extero=torch.randn(b, T * K, generator=g),
         cmd_tokens=torch.randn(b, len(range(0, F, 4)), CMD, generator=g),
         history_null=torch.zeros(b, dtype=torch.bool),
-        scan=torch.randn(b, *SCAN_HW, generator=g) if scan else None,
-        proprio=torch.randn(b, P_STEPS, P_DIM, generator=g) if proprio else None,
         context=torch.randn(b, CTX, generator=g) if ctx else None,
     )
 
 
 def _model(fm, **kw):
-    base = dict(scan_hw=SCAN_HW, proprio_dim=P_DIM, proprio_steps=P_STEPS, context_dim=CTX,
-                scan_grid=(2, 3), scan_channels=(4, 8))
+    base = dict(context_dim=CTX)
     base.update(kw)
     return FlowValueModel(fm, **base).eval()
 
@@ -100,7 +97,9 @@ def test_the_value_comes_from_the_READOUT_token_alone():
     x = _inputs()
     with torch.no_grad():
         toks = m.value_tokens(x)
-    assert toks.shape[1] == 1 + 2 * 3 + P_STEPS + 1     # readout + 2x3 scan + proprio + ctx
+    # Readout + context, and nothing else. It was `1 + 2*3 + P_STEPS + 1` -- a 2x3 pooled
+    # scan patch grid and one token per proprio step -- and both streams are gone.
+    assert toks.shape[1] == 2
     assert torch.allclose(toks[:, 0], (m.readout + m.readout_type).expand_as(toks[:, :1])[:, 0])
 
 
@@ -126,27 +125,22 @@ def test_the_frozen_trunk_gets_no_gradient():
 # The streams. Each absence is silent unless refused.
 # ----------------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("drop,match", [
-    ("scan", "as if the ground were flat"),
-    ("proprio", "proprio tokens"),
-    ("ctx", "goal offsets"),
-])
-def test_a_missing_stream_is_REFUSED_not_zero_filled(drop, match):
-    """Zero-filling would score every state against a flat floor, or a goal at the origin --
-    plausible numbers, right shapes, wrong model."""
+def test_a_MISSING_CONTEXT_is_REFUSED_not_zero_filled():
+    """Zero-filling would score every state against a goal at the origin -- plausible
+    numbers, right shapes, wrong model.
+
+    This was parametrized over three streams (scan / proprio / context). The scan and proprio
+    token streams are gone, so the context token is the only added stream left that can be
+    absent -- and it is the one carrying the goal offsets, so a zero there is the most
+    misleading of the three.
+    """
     fm = _fm()
     m = _model(fm)
-    x = _inputs(**{drop: False})
-    with pytest.raises(ValueError, match=match):
+    x = _inputs(ctx=False)
+    with pytest.raises(ValueError, match="goal offsets"):
         m(x)
 
 
-def test_the_onboard_variant_builds_with_no_privileged_streams():
-    fm = _fm()
-    m = FlowValueModel(fm, scan_hw=None, proprio_dim=0, proprio_steps=0, context_dim=CTX)
-    x = _inputs(scan=False, proprio=False)
-    assert m(x).shape == (4,)
-    assert m.value_tokens(x).shape[1] == 2          # readout + context only
 
 
 
@@ -244,3 +238,39 @@ def test_the_head_reads_the_READOUT_token_and_the_index_is_pinned() -> None:
     assert "[:, 0]" in src, (
         "the head's token index is not 0 in the source; value_tokens puts the readout first, "
         "so any other index reads a scan patch or a proprio token")
+
+
+def test_the_critic_has_NO_scan_and_NO_proprio_tokens() -> None:
+    """The second half of the paper's architecture claim, pinned like the first.
+
+    The critic used to add a CNN trunk over the privileged height scan -- pooled to a 2x3
+    patch grid -- plus one token per proprioception step, each stream with its own learned
+    type embedding and the proprio one with a position. All of it is gone: the critic reads
+    the generator's own conditioning plus a single scalar-context token.
+
+    **Unlike the head cut, this one CHANGED V.** Those were live inputs the value readout
+    attended to, not untrained parameters, so a refit is a different function and not a
+    restriction of the old one. The number to judge a refit on is `critic.log`'s n1
+    DIFFERENCE ratio -- sd(predicted change)/sd(real change) between ADJACENT chunks, which is
+    exactly what AWR exponentiates. It read 1.01 with the scan and 4.55 at round 0; a success
+    rate can stay flat for several iterations while that degrades.
+    """
+    from robot_rl.flow_matching import value as V
+
+    m = _model(_fm())
+    for gone in ("scan_enc", "proprio_in", "scan_type", "proprio_type", "proprio_pos",
+                 "proprio_steps"):
+        assert not hasattr(m, gone), f"{gone} is back on the critic"
+
+    import inspect
+    params = set(inspect.signature(V.FlowValueModel.__init__).parameters)
+    for knob in ("scan_hw", "proprio_dim", "proprio_steps", "scan_channels", "scan_grid"):
+        assert knob not in params, f"{knob} is back in the ctor"
+
+    fields = set(V.ValueInputs.__dataclass_fields__)
+    assert "scan" not in fields and "proprio" not in fields, (
+        f"ValueInputs still carries a removed stream: {sorted(fields)}")
+
+    # The whole query stream, so a stream added later cannot slip in unnoticed.
+    with torch.no_grad():
+        assert m.value_tokens(_inputs()).shape[1] == 2, "readout + context, and nothing else"

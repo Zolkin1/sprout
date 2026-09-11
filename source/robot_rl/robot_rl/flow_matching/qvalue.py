@@ -2,6 +2,25 @@
 
 """``Q(s, a)`` over the generator's own samples: score the CHUNK, not just the state.
 
+**DEPRECATED 2026-09-10, and currently BROKEN. Not a warning about style -- it does not run.**
+
+``Q(s, a)`` borrows its token assembly from :class:`~robot_rl.flow_matching.value.FlowValueModel`
+(``FlowQModel.value_tokens`` calls ``super().value_tokens``), and that critic was cut down to the
+architecture the paper describes: ONE readout token, ONE scalar value head, and no scan or proprio
+token streams. Q therefore lost the exteroception it was fitted with, and ``ValueInputs`` no longer
+accepts ``scan=`` / ``proprio=``.
+
+Left broken deliberately rather than quietly rewired, because reviving it is a RESEARCH decision
+and not a mechanical fix: Q would need its own scan and proprio streams, inserted before its action
+tokens so its own token order is preserved, and every fitted ``Q*.pt`` predates that and would need
+refitting anyway. Doing it silently would re-specify a second experiment as a side effect of a
+documentation goal.
+
+To revive: give ``FlowQModel`` its own scan/proprio encoders and type embeddings (it already owns
+its head, for the same reason), then refit. The best-of-K result this line produced is recorded in
+``oracle-gain-ceiling`` -- one oracle decision was worth +0.0099 of success, which is the number
+that should decide whether reviving it is worth the GPU time.
+
 :class:`~robot_rl.flow_matching.value.FlowValueModel` is ``V(s)`` -- it scores a state.
 Best-of-K needs a ranking over the K chunks drawn from ONE state, which is a question about
 the ACTION, and a state-only critic answers it identically for every candidate.  This adds the

@@ -665,7 +665,7 @@ def _bootstrap_v(path: str, variant: str, uid: np.ndarray, rep: np.ndarray,
     return out
 
 def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
-           scan_hw, *, goal_context: bool = True,
+           *, goal_context: bool = True,
            worst_so_far: np.ndarray | None = None) -> value.ValueInputs:
     """Build one normalized batch from raw recorded rows.
 
@@ -677,10 +677,9 @@ def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
         ctx: The loaded FM context, which supplies the encoder and all three normalizers.
         W: The window table.
         idx: Row indices.
-        priv: The ``V_priv`` variant -- adds the scan and proprio tokens and the LINEAR half
+        priv: The ``V_priv`` variant -- keeps the LINEAR half
             of the base twist.
         device: Torch device.
-        scan_hw: ``(H, W)`` fold of the privileged height scan.
         worst_so_far: ``[W]`` the worst terrain penalty over the chunks STRICTLY BEFORE each
             row's own, or ``None`` to leave the block out.  Strictly before, because including
             a row's own penalty would leak part of ``r_t`` into ``V(s_t)`` and cancel exactly
@@ -699,14 +698,11 @@ def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
     if ctx.cmd_dim > 0:
         steps = torch.as_tensor(ctx.cmd_steps, dtype=torch.long, device=device)
         cmd = ctx.cmd_norm.normalize(to(W["cmd_future"][idx])[:, steps, :])
-    scan = proprio = None
-    if priv:
-        # The height scan records -inf for a MISSED RAY, and one non-finite value makes the
-        # whole batch's loss NaN.
-        # `sanitize_extero` is the generator's own guard for exactly this.
-        scan = transforms.sanitize_extero(
-            to(W["height_scan"][idx]), "height_scan").reshape(len(idx), *scan_hw)
-        proprio = to(W["proprio"][idx])
+    # No scan and no proprio. The critic used to add a CNN trunk over the privileged height
+    # scan plus one token per proprioception step; both token streams are gone, so the
+    # recorded `height_scan` / `proprio` columns are simply not read here. They stay in the
+    # recording: `height_scan` is the generator's own exteroception and is read all over the
+    # repo, so it is not the critic's to retire.
     twist = to(W["base_twist_yaw"][idx])
     # ONBOARD keeps only the ANGULAR half: an IMU measures body rates and the yaw frame is
     # reachable from those plus its own roll/pitch, but nothing on the robot measures the
@@ -729,10 +725,10 @@ def _batch(ctx, W: dict, idx: np.ndarray, priv: bool, device,
                               worst_penalty_context=worst_so_far is not None, **pieces)
     return value.ValueInputs(history=hist, extero=ext, cmd_tokens=cmd,
                              history_null=to(W["history_null"][idx], torch.bool),
-                             scan=scan, proprio=proprio, context=ctx)
+                             context=ctx)
 
 
-def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
+def _predict_quality(model, ctx, W, idx, priv, device, batch: int, *,
                      goal_context: bool = True,
                      worst_so_far: np.ndarray | None = None) -> np.ndarray:
     """``G_hat`` over ``idx``, batched, in eval mode.
@@ -744,7 +740,6 @@ def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
         idx: Row indices.
         priv: Privileged variant.
         device: Torch device.
-        scan_hw: Height-scan grid.
         batch: Rows per forward pass.
         goal_context: Whether the goal offsets are in the context token.
 
@@ -757,7 +752,7 @@ def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
     for i in range(0, idx.size, batch):
         j = idx[i:i + batch]
         out[i:i + j.size] = model.quality(
-            _batch(ctx, W, j, priv, device, scan_hw,
+            _batch(ctx, W, j, priv, device,
                    goal_context=goal_context,
                    worst_so_far=worst_so_far)).cpu().numpy()
     model.train(was)
@@ -765,7 +760,7 @@ def _predict_quality(model, ctx, W, idx, priv, device, scan_hw, batch: int, *,
 
 
 def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: float,
-         device, label: str, scan_hw, wb=None, val_tile=None,
+         device, label: str, wb=None, val_tile=None,
          quality_weight: float = 1.0,
          goal_context: bool = True,
          worst_so_far: np.ndarray | None = None) -> tuple[value.FlowValueModel, np.ndarray]:
@@ -780,7 +775,6 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
 
     model = value.FlowValueModel(
         copy.deepcopy(ctx.model),
-        scan_hw=(tuple(scan_hw) if priv else None),
         proprio_dim=(int(W["proprio"].shape[-1]) if priv else 0),
         proprio_steps=(int(W["proprio"].shape[1]) if priv else 0),
         context_dim=value.context_width(privileged=priv, goal_context=goal_context,
@@ -818,7 +812,7 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
         for i in range(0, tr.size, batch):
             j = tr[i:i + batch]
             opt.zero_grad(set_to_none=True)
-            xb = _batch(ctx, W, j, priv, device, scan_hw,
+            xb = _batch(ctx, W, j, priv, device,
                         goal_context=goal_context, worst_so_far=worst_so_far)
             q_logits = model.quality_logits(xb)
             # ONE term. There used to be a survival BCE here, dropped outright under
@@ -871,7 +865,7 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
             # matters.
             jq = j[lab["g_valid"][j]]
             if jq.size:
-                q_hat = _predict_quality(model, ctx, W, jq, priv, device, scan_hw,
+                q_hat = _predict_quality(model, ctx, W, jq, priv, device,
                                          batch, goal_context=goal_context,
                                          worst_so_far=worst_so_far)
                 qg = value_gates.return_gates(q_hat, lab["g"][jq])
@@ -904,7 +898,7 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
                 # -MSE, so "higher is better" holds for both selection criteria.
                 jq = j[g_ok.cpu().numpy()[j]]
                 a = (-float(np.mean((_predict_quality(
-                    model, ctx, W, jq, priv, device, scan_hw, batch,
+                    model, ctx, W, jq, priv, device, batch,
                     goal_context=goal_context,
                     worst_so_far=worst_so_far) - lab["g"][jq]) ** 2))
                      if jq.size else float("nan"))
@@ -1173,13 +1167,10 @@ def main() -> int:
         sizes = [int(np.unique(uids[v]).size) for _, v in folds]
         print(f"[fit] {args.folds}-fold cross-fit over episodes: fold sizes {sizes}")
 
-    scan_hw = E["attrs"].get("height_scan_hw")
-    if not scan_hw:
-        raise SystemExit(
-            "the recording does not state the height scan's (height, width). 176 rays is "
-            "both 11x16 and 16x11, and under a convolution a transposed grid is scrambled "
-            "input rather than a reordered vector -- so it is refused rather than guessed. "
-            "Re-record; `record_rollouts.py` reads it from the sensor's own contract.")
+    # No height-scan fold. This used to REFUSE a recording that did not state the scan's
+    # (height, width), because 176 rays is both 11x16 and 16x11 and a transposed grid is
+    # scrambled input to a convolution rather than a reordered vector. The critic no longer
+    # has a scan trunk to feed, so the fold -- and that whole failure mode -- is gone.
     # Never let telemetry take down a fit. An uninstalled wandb, a missing login or a
     # network blip would otherwise kill the run before its first epoch; the JSON and the
     # npz are written regardless.
@@ -1237,14 +1228,14 @@ def main() -> int:
                               priv=priv, epochs=args.epochs,
                               batch=args.batch, lr=args.lr, device=args.device,
                               label=(label if len(folds) == 1 else f"{label}/f{k}"),
-                              scan_hw=scan_hw, wb=wb, val_tile=val_tile)
+                              wb=wb, val_tile=val_tile)
             # OUT OF FOLD: each window takes the prediction of the model that did not train
             # on its episode. The held-out TILES are out-of-sample for every fold, so they
             # take the mean -- averaging there is a free variance reduction, and doing it on
             # a training fold would silently reintroduce the in-sample reading.
             if q_all is not None:
                 q_k = _predict_quality(model, ctx, W, np.arange(uids.size), priv,
-                                       args.device, scan_hw, args.batch,
+                                       args.device, args.batch,
                                        goal_context=bool(args.goal_context),
                                        worst_so_far=lab.get("worst_so_far"))
                 q_all[va_k] = q_k[va_k]
@@ -1276,7 +1267,6 @@ def main() -> int:
                         # generator is what supplies the frozen encoder and all three
                         # normalizers -- a wrong one loads with correct shapes and is silent.
                         "fm_checkpoint_sha256": _sha256_file(args.fm_checkpoint),
-                        "scan_hw": list(scan_hw), "proprio_hw": list(W["proprio"].shape[1:]),
                         "context_dim": value.context_width(
                             privileged=priv, goal_context=bool(args.goal_context),
                             worst_penalty_context=bool(args.worst_context)),

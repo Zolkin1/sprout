@@ -92,8 +92,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "CURSOR condition, which scores a robot that stood still exactly "
                         "like one that climbed the terrain. Use the SAME file the critic "
                         "was fitted with.")
-    g.add_argument("--scan_sensor", default="height_scanner",
-                   help="Privileged scan sensor, for a priv critic.")
     g.add_argument("--branch_once", action="store_true",
                    help="ORACLE/HEADROOM mode: branch ONCE per episode and roll every "
                         "candidate to termination under a shared continuation draw, so each "

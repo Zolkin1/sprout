@@ -70,7 +70,6 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
-from .extero_encoder import ExteroImageEncoder
 from .model import _token_mlp
 
 
@@ -83,8 +82,6 @@ class ValueInputs:
         extero: ``(B, T * K)`` the exteroception row it was served.
         cmd_tokens: ``(B, n_cmd, cmd_dim)`` strided command, or ``None``.
         history_null: ``(B,)`` bool; True while the ring had not filled.
-        scan: ``(B, H, W)`` privileged height scan, or ``None``.
-        proprio: ``(B, P, proprio_dim)`` per-timestep proprioception, or ``None``.
         context: ``(B, C)`` scalar context -- goal offsets and the base twist.
     """
 
@@ -92,8 +89,6 @@ class ValueInputs:
     extero: torch.Tensor
     cmd_tokens: torch.Tensor | None
     history_null: torch.Tensor | None
-    scan: torch.Tensor | None = None
-    proprio: torch.Tensor | None = None
     context: torch.Tensor | None = None
 
 
@@ -260,21 +255,14 @@ class FlowValueModel(nn.Module):
     Args:
         fm: A trained :class:`FlowMatchingTransformer`, used as encoder and as the layer stack
             the value tokens run through.
-        scan_hw: ``(H, W)`` height-scan grid, or ``None`` to omit the scan tokens.
-        proprio_dim: Width of one proprioception row; 0 omits those tokens.
-        proprio_steps: How many proprioception rows become tokens.
         context_dim: Width of the scalar-context vector; 0 omits that token.
-        scan_channels: Conv widths for the scan trunk.
-        scan_grid: Pooled token grid for the scan, i.e. how many patch tokens it becomes.
         hidden: Head width.
         freeze_trunk: Keep the generator's weights fixed. The default, and not merely the
             cheap option: it asks the sharper question first -- is the generator's own
             representation predictive of failure -- and answers it in minutes.
     """
 
-    def __init__(self, fm, *, scan_hw: tuple[int, int] | None = None,
-                 proprio_dim: int = 0, proprio_steps: int = 0, context_dim: int = 0,
-                 scan_channels: Sequence[int] = (16, 32), scan_grid: tuple[int, int] = (2, 3),
+    def __init__(self, fm, *, context_dim: int = 0,
                  hidden: int = 128, freeze_trunk: bool = True) -> None:
         super().__init__()
         if getattr(fm, "attention_mode", "full") != "prefix":
@@ -297,26 +285,26 @@ class FlowValueModel(nn.Module):
         # probe rather than a strong opinion about where to look.
         self.readout = nn.Parameter(torch.randn(1, 1, d) * 0.02)
 
-        self.scan_enc = None
-        if scan_hw is not None:
-            self.scan_enc = ExteroImageEncoder(
-                (int(scan_hw[0]), int(scan_hw[1])), d, tuple(scan_channels),
-                grid=(int(scan_grid[0]), int(scan_grid[1])), row_channels=1)
-        self.proprio_steps = int(proprio_steps)
-        self.proprio_in = (_token_mlp(int(proprio_dim), d) if proprio_dim > 0 else None)
+        # NO scan and NO proprio tokens. The critic used to add a CNN trunk over the
+        # privileged height scan (pooled to a 2x3 patch grid) and one token per
+        # proprioception step, each with its own type embedding. Both are gone: the
+        # architecture the paper describes reads the generator's own conditioning plus a
+        # scalar-context token, and nothing else.
+        #
+        # This is the one cut here that CHANGES V rather than removing something untrained --
+        # the scan and proprio tokens were live inputs the value readout attended to. Judge a
+        # refit on `critic.log`'s n1 DIFFERENCE ratio (1.01 with the scan, 4.55 at round 0),
+        # not on the success rate: that ratio is sd(predicted change)/sd(real change) between
+        # ADJACENT chunks, which is exactly what AWR exponentiates, and a success rate can
+        # stay flat for several iterations while it degrades.
         self.context_in = (_token_mlp(int(context_dim), d) if context_dim > 0 else None)
 
-        # One learned type embedding per stream, so the encoder can tell a proprio token from
-        # a scan patch. Without them the streams are distinguishable only by content, and the
-        # borrowed layers were never trained to make that distinction.
+        # One learned type embedding per stream, so the borrowed layers can tell the readout
+        # from the context token by more than content -- they were never trained to make that
+        # distinction. Two streams now; there used to be four, with a POSITION on the proprio
+        # tokens because that stream was a time series. Both single tokens need no position.
         self.readout_type = nn.Parameter(torch.zeros(1, 1, d))
-        self.scan_type = nn.Parameter(torch.zeros(1, 1, d))
-        self.proprio_type = nn.Parameter(torch.zeros(1, 1, d))
         self.context_type = nn.Parameter(torch.zeros(1, 1, d))
-        # Proprioception is a time series, so its tokens get a position; the others do not
-        # (a scan patch's position is the CNN's learned spatial slot, and readout and context
-        # are single tokens).
-        self.proprio_pos = nn.Parameter(torch.zeros(1, max(self.proprio_steps, 1), d))
 
         # ONE readout and ONE head: a scalar regression of the normalized return.
         #
@@ -337,7 +325,7 @@ class FlowValueModel(nn.Module):
             x: The batch.
 
         Returns:
-            ``(B, 1 + n_scan + n_proprio + n_context, d_model)``.
+            ``(B, 1 + n_context, d_model)``.
 
         Raises:
             ValueError: When a stream the model was built with is missing from the batch. A
@@ -346,15 +334,6 @@ class FlowValueModel(nn.Module):
             """
         b = x.history.shape[0]
         parts = [self.readout.expand(b, 1, self.d_model) + self.readout_type]
-        if self.scan_enc is not None:
-            if x.scan is None:
-                raise ValueError("this model has scan tokens but the batch carries no scan; "
-                                 "it would score every state as if the ground were flat.")
-            parts.append(self.scan_enc(x.scan.reshape(b, -1)) + self.scan_type)
-        if self.proprio_in is not None:
-            if x.proprio is None:
-                raise ValueError("this model has proprio tokens but the batch carries none.")
-            parts.append(self.proprio_in(x.proprio) + self.proprio_pos + self.proprio_type)
         if self.context_in is not None:
             if x.context is None:
                 raise ValueError(

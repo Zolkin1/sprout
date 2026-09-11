@@ -275,23 +275,6 @@ def test_the_suite_can_see_this_error(fitted, name, measured, margin):
         "floor is 0.005, so a fall to that level means the critic stopped reading the input.")
 
 
-def test_the_scan_fold_is_not_square_so_a_transpose_cannot_be_silent():
-    """The one structural guard covering an arm the sabotage suite is measurably blind to.
-
-    A transposed scan fold moves ``p_fail`` by 0.0049 -- 14x less than zeroing the scan -- so
-    no delta test can catch it.  What makes it safe is that ``(11, 16)`` is not square, so the
-    wrong fold raises on shape instead.  If the grid ever becomes square this guard is gone
-    and the error becomes genuinely silent, which is what this test is here to announce.
-    """
-    import critic as C
-
-    h, w = C.SCAN_HW
-    assert h != w, (
-        f"SCAN_HW is {C.SCAN_HW}, which is SQUARE. A transposed fold is now shape-silent and "
-        "the sabotage suite is measurably blind to it (0.0049 against a 0.05 margin). Add a "
-        "positive orientation check -- see transfer/sim/tests/test_height_scan_grid.py, which "
-        "pins the dense 121x121 grid against the coarse cast for exactly this reason.")
-    assert h * w == 176, f"the coarse scan is 176 rays, {C.SCAN_HW} is {h * w}"
 
 #: ``(name, root_quat_xyzw, expected gravity_b, expected yaw-frame twist of world [1,0,0])``.
 #:
