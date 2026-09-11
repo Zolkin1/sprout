@@ -6,7 +6,34 @@ the chunks, update the generator, x5. `run_finetune_loop.sh` runs the whole thin
 per stage; **`FINETUNE.md` is the runbook** and carries the artifact provenance, the library
 fingerprints and the traps.
 
-This is NOT the teacher PPO fine-tune `README.md` §4c documents. Nothing here calls `train.py`.
+This is NOT the teacher PPO fine-tune `README.md` §4c documents. Nothing here calls
+`scripts/rsl_rl/train.py`.
+
+# BUILDING a generator from scratch: `run_fm_pipeline.sh`
+
+The other direction, and the one to reach for after a teacher retrain: `run_fm_pipeline.sh
+<tracker_run_name> [<clip_library>]` runs record -> augment -> train in one go. It reproduces how the
+SHIPPED generator (`2026-08-25_09-03-39_plan_v1_h64_27M_nojumpoff`) was actually built, read off its
+own `params/data.yaml` rather than from memory.
+
+- **Training takes BOTH recordings, comma-separated** (`--data <recorded>,<augmented>`), not the
+  augmented one alone. That is the step easiest to get wrong and nothing downstream would say so.
+- **`NUM_ENVS=1024`, and the number is load-bearing.** Windows snap every 12 control steps
+  (`fm_snap_every`), so a full clip yields ~77 and an env only reaches a clip's LATE phase if
+  `num_windows / num_envs` comfortably exceeds that. Measured on the shipped recording: 200k windows
+  at 256 envs is 781/env, ~10 episodes, covering **6065 distinct clips** with `clip_step` spanning
+  12..924. 1024 still gives 195/env and holds coverage; **4096 would give 49/env -- less than ONE
+  episode**, so the run ends mid-first-episode for nearly every env and every window comes from the
+  early phase of its clip. That bias is invisible in the output.
+- **It asserts the recording carries TWO cameras.** The generator reads both; the policy reads the
+  near one alone since `efe93b4e`. `record_data` installs the `fm_depth` group unconditionally on a
+  depth task for exactly this reason, but a one-camera recording would train a half-blind generator
+  that the checkpoint, the `fm.onnx` and every eval then agree about, so the check is worth its line.
+- **The exteroception constants are DERIVED, and nothing should declare them.**
+  `extero_xyz_offset` resolves from the recording's own camera contract; on the as-built cameras it
+  comes out `[[0.51, 0.03, -0.79], [4.25, 0.06, -0.79]]`. Passing the older
+  `[[0.55, 0, -0.79], [1.8, 0, -0.79]]` would be the 35-degree far camera, 2.45 m out -- which is
+  what `_XYZ_OFFSET_DRIFT_WARN_M` shouts about.
 
 **WHAT IT BUYS, on the two-box course, paired at the ENV level** (both arms draw the same reset
 stream, so every env's first episode opens at a bit-identical downrange -- max |diff| 0.00e+00, which

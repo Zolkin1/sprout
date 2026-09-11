@@ -295,9 +295,17 @@ tokens/camera** (sequence 191), `contract` normalization.
   recording. `d` -> identity (it already arrives declared-normalised out of the contract). `xyz` ->
   one declared scale (`extero_xyz_scale`, 3.0 m) shared by both cameras and all three axes, with a
   per-camera geometric OFFSET (the boresight's intersection with the nominal ground plane, rounded
-  to 5 cm, recorded: `[[0.55, 0, -0.79], [1.8, 0, -0.79]]`, ground z = -0.7869). `v` -> identity. It
-  rides the existing `Normalizer`, so the checkpoint, the folded affine and the deploy path are
-  untouched.
+  to a centimetre, ground z = -0.7869). `v` -> identity. It rides the existing `Normalizer`, so the
+  checkpoint, the folded affine and the deploy path are untouched.
+  **The offsets are DERIVED per recording and there is no default to quote**: the config field is
+  `None` until the dataset resolves it from that recording's own camera contract. On the as-built
+  cameras (`d514f0b1`, 2026-08-19) they come out `[[0.51, 0.03, -0.79], [4.25, 0.06, -0.79]]`,
+  which is what `..._h64_27M_nojumpoff` carries. This file used to quote
+  `[[0.55, 0, -0.79], [1.8, 0, -0.79]]` as if it were the shipped value; those are the PRE-CAD
+  35-degree far camera, they predate the mount change by two days, and the only place they appear in
+  code is a CLI-parsing test that passes them in explicitly. The 2.45 m gap between the two is the
+  far camera going 35 -> 15 deg, which is exactly what `_XYZ_OFFSET_DRIFT_WARN_M` exists to shout
+  about -- so a stale declared offset warns rather than silently mis-normalising.
 - **`extero_xyz_envelope` is a safety net, not a band** -- derived from each camera's own cone and
   asserted never to bind. It comes from the clip band divided by the **corner cosine**, NOT from
   `max_dist`: a valid pixel carries a z-DEPTH, which becomes a ray length once divided by that
