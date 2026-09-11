@@ -88,6 +88,12 @@ flat_clip_length: 20.0          # s; every flat clip is this long, all real moti
 # the pure tiles (mb_pure_stair_clips, matcher-free). One band by construction -- they used to be
 # two hand-matched grids kept equal by eye.
 stair_vel_range: [0.2, 2.5]
+# Author tiles around every SOLVED (riser, tread) cell, including ones the optimizer ended on its
+# iteration limit. TRUE because these references were reviewed by eye and judged walkable, and
+# "converged" is the solver's verdict on its own iteration count, not on whether the stride is
+# usable. With it false, library_v2's stairs_down grid was 2 of 8 cells -- every descent tile in
+# that library sat on those two, which is a plausible part of why stairs_down is the weak family.
+stair_allow_non_converged: true
 stair_floor_frac: 0.5           # fraction of tiles with a flat ground plane under the stairs
 stair_float_frac: 0.3           # fraction with FLOATING treads
 stair_float_thick_range: [0.03, 0.06]

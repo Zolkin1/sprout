@@ -45,6 +45,7 @@ _SCHEMA: dict[str, tuple] = {
     "flat_clip_length": ("float", 1),
     # stair families
     "stair_vel_range": ("range", 2),
+    "stair_allow_non_converged": ("bool", 1),
     "stair_floor_frac": ("float", 1),
     "stair_float_frac": ("float", 1),
     "stair_float_thick_range": ("range", 2),

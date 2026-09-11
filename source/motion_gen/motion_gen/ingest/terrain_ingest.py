@@ -208,6 +208,7 @@ def ingest_terrain_library(
             c[1] += 1
         detail = "  ".join(f"{k} {c}/{t}" for k, (c, t) in sorted(per.items()) if c < t)
         print(f"[terrain_ingest] {len(sources) - n_bad}/{len(sources)} references converged "
-              f"({detail}). A non-converged reference is still REPLAYED verbatim; the stair tile "
-              f"author drops them from its (riser, tread) grid.")
+              f"({detail}). A non-converged reference is still REPLAYED verbatim; whether its "
+              f"geometry may be authored INTO a stair tile is the tile author's decision "
+              f"(mb_plan_library, stair_allow_non_converged), and it prints which way it went.")
     return sources

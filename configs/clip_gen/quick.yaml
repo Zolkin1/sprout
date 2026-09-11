@@ -61,6 +61,7 @@ flat_clip_length: 20.0
 
 # ---------------------------------------------------------------- stair families
 stair_vel_range: [0.2, 2.5]
+stair_allow_non_converged: true   # keep in sync with g1_mb_v6.yaml; see it for the reasoning
 stair_floor_frac: 0.5
 stair_float_frac: 0.3
 stair_float_thick_range: [0.03, 0.06]

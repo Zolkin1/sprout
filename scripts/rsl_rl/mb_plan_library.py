@@ -182,13 +182,36 @@ def _stair_tile_specs(rng, skill: str, sources, args) -> list[dict]:
     their non-converged cells deliberately (see ``clean_ingest.solve_converged``). Expect it to
     NARROW the descent population until the solver delivers more cells -- that is the honest state,
     not a regression.
+
+    ``--stair-allow-non-converged`` turns the filter OFF and authors tiles around every solved cell.
+    It is a RECIPE decision rather than a hardcode because "converged" is the optimizer's verdict on
+    its own iteration limit, not a verdict on whether the motion is walkable: a solve that hit
+    ``Maximum number of iterations exceeded`` can still be a perfectly good stride, which is what a
+    visual review of the reference establishes and the status column cannot. Measured on the
+    libraries in hand: ``library_v2`` stairs_down is 2/8 converged, ``library_v3`` 7/10 -- so with
+    the filter on, v2 authored every descent tile around TWO cells. Turning it off is how a
+    reviewed-good cell reaches the grid; the printout below reports either way, so which cells a
+    library leaned on stays visible.
     """
-    ok = [s for s in sources if (s.terrain_meta or {}).get("converged", True)]
+    allow_bad = bool(getattr(args, "stair_allow_non_converged", False))
+    ok = list(sources) if allow_bad else \
+        [s for s in sources if (s.terrain_meta or {}).get("converged", True)]
     if not ok:
         raise SystemExit(
             f"[mb_plan] {skill}: every reference in the library is a non-converged solve, so there "
-            f"is no (riser, tread) cell a tile could honestly be authored around. Re-solve, or pass "
-            f"a library that has converged {skill} entries.")
+            f"is no (riser, tread) cell a tile could honestly be authored around. Re-solve, pass "
+            f"a library that has converged {skill} entries, or set stair_allow_non_converged if "
+            f"these references have been reviewed and judged walkable.")
+    # Report in BOTH directions. With the filter off nothing is dropped, so the branch below cannot
+    # fire -- and a library that leaned on non-converged geometry would look identical in the log to
+    # one that had none, which is the state this printout exists to make visible.
+    n_bad = sum(1 for s in sources if not (s.terrain_meta or {}).get("converged", True))
+    if allow_bad and n_bad:
+        kept = sorted({(round(float(s.terrain_meta["terrain"]["riser"]), 4),
+                        round(float(s.terrain_meta["terrain"]["tread"]), 4))
+                       for s in sources if not (s.terrain_meta or {}).get("converged", True)})
+        print(f"[mb_plan] {skill}: {n_bad}/{len(sources)} references did NOT converge and are being "
+              f"used ANYWAY (stair_allow_non_converged). Cells included: {kept}")
     if len(ok) < len(sources):
         # IDENTITY, not `s not in ok`: MotionSource is a dataclass, so `in` invokes __eq__, which
         # compares its tensor fields elementwise and raises on two clips of different lengths
@@ -659,6 +682,12 @@ def main() -> int:
     p.add_argument("--tile-width-range", type=float, nargs=2, default=(0.8, 1.2), metavar=("MIN", "MAX"))
     p.add_argument("--stair-floor-frac", type=float, default=0.5,
                    help="Fraction of stair tiles keeping a ground plane (rest are bare stairs).")
+    p.add_argument("--stair-allow-non-converged", action="store_true",
+                   help="Author stair tiles around EVERY solved (riser, tread) cell, including solves "
+                        "the optimizer ended on its iteration limit. Off by default (a tile built "
+                        "around a failed solve is a staircase its own reference cannot walk); turn it "
+                        "on when the references have been reviewed and judged walkable, which the "
+                        "status column cannot express. See _stair_tile_specs.")
     p.add_argument("--stair-float-frac", type=float, default=0.0,
                    help="Fraction of stair TILES built with FLOATING (riser-less) treads: each tread is a "
                         "thin slab with an open gap beneath instead of a solid pillar to the floor. The "

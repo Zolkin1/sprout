@@ -242,6 +242,7 @@ def main() -> int:
             "--box-two-sided-frac", str(cfg.box_two_sided_frac),
             "--box-nav-width", str(cfg.box_nav_width),
             "--backward-vx-max", str(cfg.backward_vx_max),
+            *(["--stair-allow-non-converged"] if cfg.stair_allow_non_converged else []),
             "--stair-floor-frac", str(cfg.stair_floor_frac),
             "--stair-float-frac", str(cfg.stair_float_frac),
             "--stair-float-thick-range", *(str(v) for v in cfg.stair_float_thick_range),
