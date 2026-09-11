@@ -281,3 +281,43 @@ def test_the_height_bound_is_the_MEASURED_012_in_both_modules() -> None:
     # Still un-fitted: `fit_tracking_thresholds.py` does not exist, so publishing consumers
     # must keep refusing this spec.
     assert NP_SPEC.is_bootstrap and T_SPEC.is_bootstrap
+
+
+def test_the_spawn_HEIGHT_is_recorded_so_the_eval_rule_is_checkable_from_the_artifact() -> None:
+    """The rule above is enforced in code; this is what lets a RECORDING confirm it.
+
+    Without the column the only evidence that an eval drew from the course's lowest area was
+    this test file plus the absence of a refusal -- and the verification plan asked for it in
+    the artifact, because a setting that changes what a number MEANS has to travel with the
+    number rather than in a launcher's banner.
+
+    Three properties, each of which was a way to get this wrong:
+
+    * the column EXISTS on the episode table, so `spawn_from` is auditable offline;
+    * it is initialised to NaN, not 0.0. A course whose spawn is a platform records a
+      positive height legitimately, so zero cannot double as "nobody recorded this" -- the
+      same "absent is not zero" rule `penetration_volume_m3` is documented under;
+    * it is latched BEFORE the goal-spec early return in ``RolloutEpisodeTracker._refresh_goal``, because the spawn
+      height describes the RUN and not the scoring: a rollout with no goal spec attached must
+      still record where the robot started.
+    """
+    import inspect
+
+    import rollout_outcomes as ro
+    from eval import accumulate as acc
+
+    assert "spawn_base_z_w" in ro.ROLLOUT_COLUMN_NAMES, (
+        "the episode table must carry the spawn height, or the ground-only rule is only ever "
+        "confirmable from a banner")
+
+    src = inspect.getsource(acc.EpisodeAccumulator.__init__)
+    assert 'self.spawn_z = torch.full((self.n,), float("nan")' in src, (
+        "spawn_z must start as NaN: 0.0 is a legitimate recorded value and cannot also mean "
+        "'not recorded'")
+
+    ref = inspect.getsource(ro.RolloutEpisodeTracker._refresh_goal)
+    latch = ref.index("record_spawn_z")
+    early = ref.index('_gr", None) is None')
+    assert latch < early, (
+        "record_spawn_z must be called BEFORE the goal-spec early return, or a rollout "
+        "without a goal spec records no spawn height at all")

@@ -213,6 +213,11 @@ class EpisodeAccumulator:
         self._goal_pos_w = torch.zeros(self.n, 3, device=self.device)
         self._goal_yaw = torch.zeros(self.n, device=self.device)
         self._goal_valid = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        # The base height the episode OPENED at, so the eval's spawn rule is checkable from
+        # the recorded artifact instead of from a launcher banner. NaN until an episode has
+        # been opened, which is the honest value for "nobody recorded this" -- 0.0 would be
+        # indistinguishable from a real ground-level spawn.
+        self.spawn_z = torch.full((self.n,), float("nan"), device=self.device)
         self._goal_tol = torch.zeros(self.n, 3, device=self.device)
         self.goal_reached = torch.zeros(self.n, dtype=torch.bool, device=self.device)
         self.first_goal = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
@@ -419,6 +424,24 @@ class EpisodeAccumulator:
         self._goal_pos_w[ids] = pos[ids].to(self._goal_pos_w.dtype)
         self._goal_yaw[ids] = yaw[ids].to(self._goal_yaw.dtype)
         self._goal_valid[ids] = True
+
+    def record_spawn_z(self, env_ids: torch.Tensor | None = None) -> None:
+        """Latch the base height these envs just spawned at.
+
+        Must be called AFTER the reset has committed the new pose, for the same reason
+        :meth:`refresh_goal_anchor` must -- called before, it records the height the PREVIOUS
+        episode ended at, which on a course whose spawn is a platform is a plausible-looking
+        wrong number rather than an obvious one.
+
+        Unlike the goal anchor this is recorded even with no goal spec attached: it describes
+        where the robot started, which is a property of the run rather than of the scoring.
+
+        Args:
+            env_ids: Envs to latch, or ``None`` for all.
+        """
+        ids = (torch.arange(self.n, device=self.device) if env_ids is None
+               else env_ids.to(self.device))
+        self.spawn_z[ids] = self.rd.root_pos_w[ids, 2].to(self.spawn_z.dtype)
 
     def _fold_goal(self, m: torch.Tensor) -> None:
         """Fold this step's goal geometry for the envs in ``m``."""

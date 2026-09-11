@@ -168,6 +168,14 @@ ROLLOUT_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     # `mdp.goal_region.goal_travel_m`. Recorded per episode so a library nobody has measured
     # cannot hide the same defect the shipped one did.
     ("goal_travel_m", _F),
+    # The base height the episode OPENED at. Recorded so the eval's spawn rule -- training
+    # draws every declared area, every eval draws the course's LOWEST -- is checkable from
+    # the artifact rather than from the launcher's banner. That gap was real: the rule was
+    # asserted from a unit test while the recorded data could not confirm it.
+    #
+    # NaN means no episode was opened for that row, not "ground". A course whose spawn is a
+    # platform records a positive value legitimately, so 0.0 is not a safe sentinel.
+    ("spawn_base_z_w", _F),
 )
 
 ROLLOUT_COLUMN_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_EPISODE_COLUMNS)
@@ -1159,6 +1167,9 @@ class RolloutEpisodeTracker:
 
     def _refresh_goal(self, env, env_ids) -> None:
         """Re-resolve the goal anchor and per-family tolerances for the envs that reset."""
+        # Before the goal-spec early return: the spawn height describes the RUN, not the
+        # scoring, so a rollout with no goal spec attached must still record it.
+        self.accum.record_spawn_z(env_ids)
         if getattr(self.accum, "_gr", None) is None:
             return
         if self.goal_spec is not None and self.family_codes is not None:
@@ -1261,6 +1272,7 @@ class RolloutEpisodeTracker:
             # means "never".
             "spawned_in_goal": (red["first_goal_step"] == 1).astype(np.uint8),
             "goal_travel_m": travel,
+            "spawn_base_z_w": self.accum.spawn_z[ids].detach().to("cpu").numpy(),
         })
         self.harvested += ids_np.size
         if not censored:
