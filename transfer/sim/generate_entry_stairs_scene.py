@@ -64,9 +64,16 @@ HALL_RISE_IN: float = 5.25
 HALL_RUN_IN: float = 13.00
 HALL_WIDTH_IN: float = 100.0
 
-#: Flat ground before the first riser (m).  3.0 so the robot has room to reach commanded
-#: speed and the far camera sees the flight before the feet are on it.
-APPROACH_M: float = 3.0
+#: Flat ground before the first riser (m).  Room to reach commanded speed, and for the far
+#: camera to see the flight before the feet are on it.
+#:
+#: 5.5 rather than the 3.0 it started at, and the number comes from the ISAAC side: the tile
+#: there spawns over a chain covering ``approach_range_m`` (up to 4.0 m back from the first
+#: riser) whose farthest area sits 1.25 m in, so anything under 5.25 m hangs the chain off the
+#: tile.  Held equal here by ``test_entry_stairs_matches_mjeval.py`` -- the two simulators show
+#: the same building standing on the same amount of ground, and a robot driven at this
+#: staircase in MuJoCo gets the run-up its Isaac counterpart was trained with.
+APPROACH_M: float = 5.5
 #: The indoor CLEARING the hallway opens into, at the top level (m).  A lobby: the hallway
 #: constrains the robot laterally and then releases it, which is the opposite transition to
 #: the narrowing and is the one a building actually makes on the way in.
