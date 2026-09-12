@@ -32,12 +32,16 @@ OUT=${3:-$(dirname "$LIB")/$(basename "$LIB" .h5)_goal_regions.json}
 
 # ---------------------------------------------------------------- knobs
 # Sized against the shipped set's own provenance: it fitted from 1931 surviving clip-arm
-# episodes. The fit SKIPS the pure and jump_off families, so what matters is the episode count
-# on the four fitted ones -- 12 tiles x 3 clips x R=8 = 288 each, ~1150 after falls.
+# episodes. The fit SKIPS flat, the pure families and jump_off, so what matters is the episode
+# count on the four fitted ones -- 8 tiles x 4 clips x R=8 = 256 each, ~1000 after falls.
 # Spend budget on TILES over robots: the eval's own measurement is that 2x the robots buys
 # nothing while 2x the tiles at half the robots is free and 21% tighter.
-TILES_PER_FAMILY=${TILES_PER_FAMILY:-12}
-CLIPS_PER_TILE=${CLIPS_PER_TILE:-3}
+# 8, because that is what the SMALLEST family has: v6 authors 8 pure-stair tiles per
+# direction against 33 for the transitions, and select_clips refuses a request it cannot
+# fill rather than quietly returning fewer -- so a number above the smallest family's tile
+# count fails the whole plan, not just that family. Raise it only alongside the recipe.
+TILES_PER_FAMILY=${TILES_PER_FAMILY:-8}
+CLIPS_PER_TILE=${CLIPS_PER_TILE:-4}
 FLAT_TILES=${FLAT_TILES:-6}
 ROBOTS=${ROBOTS:-8}
 NUM_ENVS=${NUM_ENVS:-512}

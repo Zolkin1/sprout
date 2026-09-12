@@ -175,6 +175,9 @@ class EpisodeAccumulator:
         self.clf_v = z()
         self.min_h = torch.full((self.n,), float("inf"), device=self.device)
         self.max_tilt = z()
+        #: Quaternion slot order of `root_quat_w`: True = (w,x,y,z), False =
+        #: (x,y,z,w), None = not yet resolvable. See `_upright_cos`.
+        self._quat_wxyz: bool | None = None
         self.first_fall = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
         # Per-episode tally of what KIND of motion each re-plan produced. Stays all-zero
         # unless a classifier is attached (the clip arm loads no generator).
@@ -647,39 +650,109 @@ class EpisodeAccumulator:
         Returns:
             ``[num_envs]`` tilt angle in radians.
         """
-        q = d.root_quat_w
-        cos = (1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])).clamp(-1.0, 1.0)
-        return torch.acos(cos)
+        return torch.acos(self._upright_cos(d))
 
-    # TODO(terminal-tilt): `max_tilt_rad` is CONTAMINATED and `first_fall_step` may be too.
+    def _upright_cos(self, d) -> torch.Tensor:
+        """``cos(tilt)`` -- the world-z component of the body's up-axis -- CONVENTION-RESOLVED.
+
+        For a unit quaternion the body up-axis's world-z component is ``1 - 2(x^2 + y^2)``, so
+        the answer depends entirely on WHICH TWO SLOTS hold x and y. ``(w, x, y, z)`` puts them
+        at 1 and 2; ``(x, y, z, w)`` puts them at 0 and 1, and reading the wrong pair returns
+        ``1 - 2(y^2 + z^2)``, which for a pure yaw of theta is exactly ``cos(theta)``. That
+        does not look like a bug: it reads as a robot tilting in proportion to how much it
+        turns, which only the families that TURN can show.
+
+        **This was live.** ``robot.data`` hands several buffers back as warp arrays and the
+        shim converts them without reordering, so the slot order here is a property of the
+        buffer and not of this file. Measured on a v6 clip-arm eval: `flat` -- the only family
+        whose robot actually rotates, terrain traversals being world-pinned replays -- reported
+        a 42.7% fall rate against a 1.0% height-based one, with median "tilt" 58.9 deg, p95
+        179.5 deg, and correlation 0.893 between the recorded angle and the clip's own
+        commanded yaw. Terrain families were unaffected, which is why it survived review.
+
+        So the convention is RESOLVED against ``projected_gravity_b``, which is a vector and
+        therefore has no slot ambiguity, and the resolution is asserted rather than assumed.
+        Deferred until a sample can actually tell the two apart. The two readings coincide
+        exactly when ``q[0]^2 == q[2]^2`` -- a ~90 deg PITCH, not an upright robot; an identity
+        quaternion is in fact maximally discriminating (+1 one way, -1 the other). So the
+        undecidable sample is a robot already on its side, which is the one case where guessing
+        would matter most.
+
+        Args:
+            d: The converting view over ``robot.data``.
+
+        Returns:
+            ``[num_envs]`` ``cos(tilt)``, clamped to ``[-1, 1]``.
+        """
+        q = d.root_quat_w
+        cos_wxyz = (1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])).clamp(-1.0, 1.0)
+        if self._quat_wxyz is True:
+            return cos_wxyz
+        cos_xyzw = (1.0 - 2.0 * (q[:, 0] * q[:, 0] + q[:, 1] * q[:, 1])).clamp(-1.0, 1.0)
+        if self._quat_wxyz is False:
+            return cos_xyzw
+        self._resolve_quat_convention(d, cos_wxyz, cos_xyzw)
+        return cos_wxyz if self._quat_wxyz else cos_xyzw
+
+    def _resolve_quat_convention(self, d, cos_wxyz, cos_xyzw) -> None:
+        """Decide the quaternion slot order ONCE, against gravity, or leave it undecided.
+
+        ``projected_gravity_b`` is the world down-vector in the body frame, so its z component
+        is ``-cos(tilt)`` under any quaternion convention -- it cannot be ambiguous, which is
+        what makes it the arbiter. It lags one step after a reset (the defect ``_tilt`` was
+        rewritten to avoid), so this only decides on samples where the two candidates DISAGREE
+        by more than the lag could explain; anything else is left undecided and retried.
+
+        Raises:
+            RuntimeError: If a discriminating sample matches NEITHER reading. That means the
+                buffer is not a unit quaternion in either order, and every tilt number after it
+                would be fiction.
+        """
+        g = getattr(d, "projected_gravity_b", None)
+        if g is None:
+            return
+        cos_g = (-g[:, 2] / torch.linalg.vector_norm(g, dim=-1).clamp_min(1e-9)).clamp(-1.0, 1.0)
+        spread = (cos_wxyz - cos_xyzw).abs().median()
+        if float(spread) < 0.05:     # |q0| == |q2|, a ~90 deg pitch: both readings agree, so
+                                     # this sample cannot name the convention. Retry on the next.
+            return
+        e_w = float((cos_wxyz - cos_g).abs().median())
+        e_x = float((cos_xyzw - cos_g).abs().median())
+        if min(e_w, e_x) > 0.10:
+            raise RuntimeError(
+                f"root_quat_w matches NEITHER quaternion convention against gravity (median "
+                f"|cos err| wxyz={e_w:.3f}, xyzw={e_x:.3f}). Every tilt and every derived fall "
+                "flag downstream would be fiction, so this refuses rather than picking one.")
+        self._quat_wxyz = e_w <= e_x
+        if not self._quat_wxyz:
+            print("[eval] root_quat_w is (x, y, z, w), not (w, x, y, z) -- tilt read from slots "
+                  f"0,1 (median |cos err| vs gravity {e_x:.4f} against {e_w:.4f} the other way). "
+                  "Read the wrong way this returns the YAW angle.")
+
+    # RESOLVED(terminal-tilt), 2026-09-12: it was the QUATERNION SLOT ORDER, not the max().
     #
-    # A non-trivial fraction of SUCCESSFUL episodes record `max_tilt_rad` ABOVE the 70 deg
-    # termination limit, some of them far above it. That is impossible if the column measured
-    # what it claims -- `base_fallen` would have ended those episodes -- so a transient is
-    # being folded in. First seen on a closed-loop rollout; re-derive the rate from any
-    # `episodes.h5` by taking `max_tilt_rad` over the episodes the reward scores a success.
+    # The old note here blamed `fold_terminal`'s max() folding in a mid-teleport pose. That was
+    # wrong, and the evidence against it is specific: on a v6 clip-arm eval the spurious falls
+    # land at a MEDIAN OF 33% THROUGH the episode and ZERO of them are on the last step, which
+    # no terminal-fold mechanism can produce. What it actually was: `root_quat_w` arrives in a
+    # slot order this file did not own, and `1 - 2(q[1]^2 + q[2]^2)` read the wrong pair, which
+    # returns the YAW angle (see `_upright_cos`). Only `flat` could show it -- terrain
+    # traversals are world-pinned replays that never rotate -- and it cost that family 42.7%
+    # against a real 1.0%, with correlation 0.893 between the recorded "tilt" and the clip's
+    # own commanded yaw.
     #
-    # The suspect is the `max()` below. It is deliberate and well argued for ordering
-    # robustness, but max(a, b) where one input is a mid-teleport pose is that pose. If
-    # `root_quat_w` is momentarily garbage inside the reset hook rather than merely fresh,
-    # this picks it up and nothing downstream can tell.
+    # The old note also said "the success verdict is SAFE". That held for terrain (a spurious
+    # tilt lands after arrival, so the first-event ordering absorbs it) and was FALSE for flat,
+    # whose goal is the end of a 20 s clip and therefore has a long pre-arrival window: 36 of
+    # its 72 arrivals were scored as having fallen first. Measured cost of the fix, per family:
+    # flat +0.375 success, every terrain family 0.000, pooled +0.042.
     #
-    # WHAT IS AFFECTED, and what is not:
-    #   * `max_tilt_rad` -- unusable as reported.
-    #   * `first_fall_step` -- `fold_terminal` sets it when EITHER limb crosses, so a
-    #     spurious tilt marks an episode as having fallen when it did not. That makes the
-    #     fall-vs-stall SPLIT unreliable.
-    #   * the success verdict is SAFE: it comes from `reached_goal` and the first-event
-    #     ordering, and an episode that reached the goal before the terminal frame keeps its
-    #     success regardless. That is why this hid.
-    #   * the eval harness shares this accumulator, so its `max_tilt_rad` and derived `fell`
-    #     column may carry the same defect. CLAUDE.md records a PREVIOUS bug in this exact
-    #     place (the derived fall flag inheriting the previous episode's orientation), so
-    #     check whether this is a recurrence rather than a new fault.
-    #
-    # To diagnose: log both limbs separately at the terminal fold for a few hundred episodes
-    # and compare against the per-step maximum, which is computed from a buffer that is not
-    # mid-reset. Blocks TODO(jump-off-front).
+    # STILL OPEN, and unrelated: TODO(align-tilt-convention) on `mdp.base_fallen` -- that
+    # termination tests roll and pitch PER AXIS while this column uses the TOTAL angle from
+    # upright. The per-axis test is a strict subset (zero counter-examples over 2e6 uniform
+    # orientations); they differ on 1.54% of the sphere and the worst pose the termination
+    # admits is 75.6 deg total. Aligning them changes WHEN episodes end and therefore every
+    # published rate, so it stays a deliberate decision rather than a silent edit.
     def _tilt_terminal(self, d) -> torch.Tensor:
         """Tilt for the TERMINAL fold, where the two buffers disagree on purpose.
 
