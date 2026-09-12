@@ -196,14 +196,27 @@ def main() -> int:
     p.add_argument("--write_bootstrap", default="",
                    help="emit an UNCALIBRATED spec here and exit; run the clip arm against "
                         "it to produce the table this script then fits")
-    p.add_argument("--skip_families", default="jump_off,distractor,stairs_dn_pure,stairs_up_pure",
+    p.add_argument("--skip_families",
+                   default=("jump_off,distractor,stairs_dn_pure,stairs_up_pure,"
+                            "pure_stairs_down,pure_stairs_up,flat"),
                    help="Families excluded from the FIT. The same two the rest of the "
                         "pipeline drops: `jump_off` travels backwards so its goal sits "
                         "behind the spawn, `distractor` travels less in total than a typical "
                         "approach margin, and the "
                         "`*_pure` families open ON the stairs so their first re-plan runs on "
                         "a null-history embedding fitted on flat. Fitting tolerances from any "
-                        "of them would size the region to a task that is not one.")
+                        "of them would size the region to a task that is not one. BOTH "
+                        "spellings of the pure families are listed because the name changed "
+                        "with the library: `stairs_up_pure` in the v5-era libraries, "
+                        "`pure_stairs_up` in v6. `normalize_family` only strips the `family_` "
+                        "prefix and the `.h5` suffix, so a stale spelling matches nothing and "
+                        "the family is fitted rather than skipped -- silently, and in the "
+                        "direction that sizes the region to a task that is not one. "
+                        "`flat` is skipped for a different reason and the same effect: it has "
+                        "no terrain feature to reach, so its clip end is an arbitrary point on "
+                        "a plane, and a tolerance fitted there measures the sampler\'s speed "
+                        "draw rather than the policy. It is scored by the FALL rule instead -- "
+                        "see report.FALL_ONLY_FAMILIES.")
     p.add_argument("--quantile", type=float, default=DEFAULT_QUANTILE)
     p.add_argument("--pad_m", type=float, default=DEFAULT_PAD_M)
     args = p.parse_args()
