@@ -1,0 +1,66 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# CONFIG 2: randomised up-into-down stairs. One flight up, a platform, one flight back down.
+#
+# Both flights carry the SAME geometry, because a real staircase has one -- which is also why
+# the cell must be valid in both directions, and why `updown_cells` below is the 9-cell
+# rectangular grid rather than all 10 solved cells per direction. library_v3's two steep cells
+# (stairs_up 0.1312/0.2092, stairs_down 0.1381/0.1899) exist in ONE direction each and cannot
+# build a tile that goes up and back down.
+name: updown
+task: G1-box2-finetune
+clip: clips/ft_updown_train.h5
+goals: logs/ft_updown/goal_regions.json
+
+buffer: 2000
+refresh: 500
+iters: 5
+num_envs: 2048
+
+ballast_chunks: 0
+ballast_flat_frac: 0.0
+
+tiles_boxes: 0
+tiles_updown: 30
+tiles_indist: 0
+tiles_entry_stairs: 0
+
+# THE TRAINED GRID, and it is in whole inches: risers 5.12 / 6.10 / 7.09 in, treads
+# 11.02 / 12.01 / 12.99 in. Read from hf/trajectories/skills/library_v3/manifest.csv rather
+# than restated from memory.
+#
+# Rise and run are ONE draw, never two. Drawing them independently builds rise/run pairs no
+# building has -- a 0.180 m riser on a 0.2092 m tread is a ladder, and nothing downstream
+# would question it because both numbers are individually in range.
+updown_cells: [[0.130, 0.280], [0.130, 0.305], [0.130, 0.330],
+               [0.155, 0.280], [0.155, 0.305], [0.155, 0.330],
+               [0.180, 0.280], [0.180, 0.305], [0.180, 0.330]]
+
+# MEASURED REAL STAIRCASES, from buildings around the lab. Deliberately NOT called "ood":
+# (0.1778, 0.3048) is the trained (7", 12") cell to within 2.2 mm and (0.1270, 0.3302) is
+# (5", 13") to within 3.0 mm, so two of the three are in-distribution and a config named for
+# out-of-distribution testing would misreport what it measured. Only (0.1397, 0.3175) --
+# 5.5 in x 12.5 in -- is new geometry, and it INTERPOLATES inside the grid rather than
+# leaving it.
+#
+# What genuinely leaves the hull, if that is ever wanted: a rise above 0.180 m, or a run
+# below 0.280 m, or the two combined off the diagonal.
+updown_measured_cells: [[0.1397, 0.3175], [0.1778, 0.3048], [0.1270, 0.3302]]
+updown_measured_frac: 0.34
+
+# The low end is BELOW the trained flight length on purpose: a one-riser step up is a curb,
+# which the clip library cannot author at all (the entry gate and the exit surface coincide),
+# so the only way the fine-tune sees one is here.
+updown_steps_range: [1, 10]
+updown_width_range_m: [1.219, 3.048]
+updown_platform_range_m: [1.50, 3.00]
+updown_wall_height_range_m: [1.2, 2.4]
+
+boxes_per_tile_range: [1, 2]
+box_height_range_m: [0.25, 0.75]
+box_depth_range_m: [0.45, 1.40]
+box_width_range_m: [1.20, 4.00]
+box_gap_range_m: [1.50, 4.00]
+
+commanded_speed_range_mps: [0.6, 2.5]
+seed: 0

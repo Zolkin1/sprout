@@ -1,0 +1,49 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# CONFIG 1: randomised boxes. One or two, with drawn height / depth / width / gap.
+#
+# The randomised generator (motion_gen.terrain.varied_courses.make_boxes_tile), NOT the pinned
+# two-box course in terrain/box2.py. The pinned one is an mjeval clone -- fixed geometry, one
+# tile per approach distance -- and every earlier fine-tune number was measured on it, so it
+# stays untouched and comparable. This one varies the geometry instead, and a tile is therefore
+# geometry rather than an initial condition: the approach distribution is a CHAIN of ground
+# spawn areas along each tile's own route.
+name: boxes
+task: G1-box2-finetune
+clip: clips/ft_boxes_train.h5
+goals: logs/ft_boxes/goal_regions.json
+
+# 2000 / 500: a single-terrain course. The multi config runs 4000 / 1000 because it has four
+# tile types to cover and the same churn would refresh a quarter as much of each.
+buffer: 2000
+refresh: 500
+iters: 5
+num_envs: 2048
+
+ballast_chunks: 0
+ballast_flat_frac: 0.0
+
+tiles_boxes: 30
+tiles_updown: 0
+tiles_indist: 0
+tiles_entry_stairs: 0
+
+# No stairs here; the keys stay so the schema is total and a config cannot omit a decision.
+updown_cells: []
+updown_measured_cells: []
+updown_measured_frac: 0.0
+updown_steps_range: [1, 10]
+updown_width_range_m: [1.219, 3.048]
+updown_platform_range_m: [1.50, 3.00]
+updown_wall_height_range_m: [1.2, 2.4]
+
+# Height spans the trained 0.46 m box and goes well past it; depth and width sit inside the
+# trained bands. Gap is ignored at one box.
+boxes_per_tile_range: [1, 2]
+box_height_range_m: [0.25, 0.75]
+box_depth_range_m: [0.45, 1.40]
+box_width_range_m: [1.20, 4.00]
+box_gap_range_m: [1.50, 4.00]
+
+commanded_speed_range_mps: [0.6, 2.5]
+seed: 0

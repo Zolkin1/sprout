@@ -218,7 +218,64 @@ def test_the_updown_draws_stay_in_range(seed: int) -> None:
         assert cfg.updown_width_range_m[0] <= u["width_m"] <= cfg.updown_width_range_m[1]
         assert (cfg.updown_platform_range_m[0] <= u["platform_depth_m"]
                 <= cfg.updown_platform_range_m[1])
-        assert u["flight_height_m"] == pytest.approx(u["steps"] * cfg.updown_rise_m)
+        # The staircase geometry is a DRAWN CELL now, not two fixed scalars, so the height
+        # must agree with whichever cell this tile drew -- and the cell must be one that was
+        # offered. A rise that is merely "in range" would pass while pairing a trained riser
+        # with an untrained tread, which is the failure drawing them independently produces.
+        cell = (u["rise_m"], u["run_m"])
+        offered = {(round(r, 6), round(t, 6))
+                   for r, t in tuple(cfg.updown_cells) + tuple(cfg.updown_measured_cells)}
+        assert (round(cell[0], 6), round(cell[1], 6)) in offered, f"unoffered cell {cell}"
+        assert u["flight_height_m"] == pytest.approx(u["steps"] * cell[0])
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_rise_and_run_are_one_draw_never_two(seed: int) -> None:
+    """The pair must come from the offered list, never from a cross product of its axes.
+
+    Drawn independently, a 0.180 m riser lands on a 0.2092 m tread -- a ladder, and no shape
+    check downstream would question it because each number is individually in range. The
+    trained grid is rectangular so most crosses ARE offered; this catches the measured cells,
+    whose rises and runs appear in no other pair.
+    """
+    cfg = VariedCoursesCfg(seed=seed, updown_measured_frac=0.5)
+    offered = {(round(r, 6), round(t, 6))
+               for r, t in tuple(cfg.updown_cells) + tuple(cfg.updown_measured_cells)}
+    seen = set()
+    for t in (make_updown_tile(i, cfg) for i in range(60)):
+        u = t["varied_updown"]
+        seen.add((round(u["rise_m"], 6), round(u["run_m"], 6)))
+    assert seen <= offered, f"cells drawn that were never offered: {sorted(seen - offered)}"
+    assert len(seen) > 1, "the draw collapsed onto one cell"
+
+
+def test_the_measured_cells_are_where_they_were_measured() -> None:
+    """Pins the conversion, because the numbers are inches in the real world.
+
+    12.5 x 5.5, 12 x 7 and 13 x 5 inches. Two of the three land ON trained cells -- which is
+    why they are called `measured` and not `ood`, and why a report about them cannot claim
+    generalisation.
+    """
+    inch = 0.0254
+    want = {(round(5.5 * inch, 4), round(12.5 * inch, 4)),
+            (round(7.0 * inch, 4), round(12.0 * inch, 4)),
+            (round(5.0 * inch, 4), round(13.0 * inch, 4))}
+    got = {(round(r, 4), round(t, 4)) for r, t in VariedCoursesCfg().updown_measured_cells}
+    assert got == want
+    # Their DISTANCE to the trained grid, pinned rather than counted: this is the whole reason
+    # the set is called `measured` and not `ood`, so the numbers belong in the test.
+    trained = VariedCoursesCfg().updown_cells
+    def gap(cell):
+        return min(max(abs(cell[0] - r), abs(cell[1] - t)) for r, t in trained)
+    inch = 0.0254
+    assert gap((7.0 * inch, 12.0 * inch)) == pytest.approx(0.0022, abs=2e-4), "7x12 is (0.180, 0.305)"
+    assert gap((5.0 * inch, 13.0 * inch)) == pytest.approx(0.0030, abs=2e-4), "5x13 is (0.130, 0.330)"
+    # Only this one is new geometry -- and it INTERPOLATES, sitting inside the grid's hull on
+    # both axes rather than beyond it, so it is not an extrapolation test either.
+    assert gap((5.5 * inch, 12.5 * inch)) == pytest.approx(0.0125, abs=2e-4)
+    lo_r, hi_r = min(r for r, _ in trained), max(r for r, _ in trained)
+    lo_t, hi_t = min(t for _, t in trained), max(t for _, t in trained)
+    assert lo_r <= 5.5 * inch <= hi_r and lo_t <= 12.5 * inch <= hi_t
 
 
 def test_a_flight_is_never_unwalled() -> None:

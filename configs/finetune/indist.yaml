@@ -1,0 +1,46 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# CONFIG 3: IN DISTRIBUTION. The exact tiles the RL teacher trained on and the FM pre-training
+# data was gathered from.
+#
+# The control arm. Every other config asks "does the fine-tune help on terrain it has not seen";
+# this one asks "does it cost anything on terrain it has". A fine-tune that improves an OOD
+# course while regressing here has traded one for the other, and only this config can say so.
+#
+# Its geometry is not drawn at all -- the tiles come from the clip library the teacher used, so
+# every geometry knob below is inert. They stay because the schema is total: a config that
+# omitted them would be one where nobody had decided they were irrelevant.
+name: indist
+task: G1-box2-finetune
+clip: clips/ft_indist_train.h5
+goals: logs/ft_indist/goal_regions.json
+
+buffer: 2000
+refresh: 500
+iters: 5
+num_envs: 2048
+
+ballast_chunks: 0
+ballast_flat_frac: 0.0
+
+tiles_boxes: 0
+tiles_updown: 0
+tiles_indist: 60
+tiles_entry_stairs: 0
+
+updown_cells: []
+updown_measured_cells: []
+updown_measured_frac: 0.0
+updown_steps_range: [1, 10]
+updown_width_range_m: [1.219, 3.048]
+updown_platform_range_m: [1.50, 3.00]
+updown_wall_height_range_m: [1.2, 2.4]
+
+boxes_per_tile_range: [1, 2]
+box_height_range_m: [0.25, 0.75]
+box_depth_range_m: [0.45, 1.40]
+box_width_range_m: [1.20, 4.00]
+box_gap_range_m: [1.50, 4.00]
+
+commanded_speed_range_mps: [0.6, 2.5]
+seed: 0
