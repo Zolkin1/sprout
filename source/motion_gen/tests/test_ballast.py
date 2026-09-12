@@ -39,6 +39,10 @@ def _recording(path: pathlib.Path, families=None, n_per=_PER_FAMILY) -> pathlib.
     families = families or _FAMILIES
     code = np.repeat(np.arange(len(families), dtype=np.int64), n_per)
     with h5py.File(path, "w") as h:
+        # `fm_plan` is what makes this a ROLLOUT file: the window already in model space.
+        # Without it the file holds no windows at all, which is now refused rather than
+        # treated as an empty rollout.
+        h.create_dataset("fm_plan", data=np.zeros((code.size, 4, 3), np.float32))
         h.create_dataset("family_code", data=code)
         h.attrs["num_windows_written"] = code.size
         h.attrs["family_names"] = json.dumps(families)
@@ -90,6 +94,7 @@ def test_a_recording_with_no_family_table_is_refused_when_a_share_is_declared(tm
     """Otherwise the flat share would be unverifiable and silently unmet."""
     p = tmp_path / "nofam.h5"
     with h5py.File(p, "w") as h:
+        h.create_dataset("fm_plan", data=np.zeros((50, 4, 3), np.float32))
         h.attrs["num_windows_written"] = 50
     with pytest.raises(SystemExit, match="no family table"):
         bal.select_ballast_rows(str(p), 10, flat_frac=0.5)
@@ -99,6 +104,7 @@ def test_no_family_table_is_FINE_when_no_share_is_declared(tmp_path) -> None:
     """frac 0 never reads the table, so a family-less recording is still usable."""
     p = tmp_path / "nofam.h5"
     with h5py.File(p, "w") as h:
+        h.create_dataset("fm_plan", data=np.zeros((50, 4, 3), np.float32))
         h.attrs["num_windows_written"] = 50
     assert bal.select_ballast_rows(str(p), 10, flat_frac=0.0).size == 10
 
@@ -341,3 +347,98 @@ def test_the_real_collate_survives_a_mixed_batch_in_either_order() -> None:
     # And the shape of the bug, so the mechanism is pinned rather than only its absence.
     with pytest.raises(KeyError):
         collate([dict(bal, weight=torch.ones(1)), dict(buf)])
+
+
+# ---------------------------------------------------------------------------------------------
+# Reading the PRE-TRAINING recording, which is what "ballast" literally means
+# ---------------------------------------------------------------------------------------------
+def _pretrain_recording(path: pathlib.Path, families=None, n_per=10) -> pathlib.Path:
+    """A recording with the PRE-TRAINING schema: raw ingredients, not model-space windows."""
+    families = families or ["flat", "family_stairs_up.h5"]
+    code = np.repeat(np.arange(len(families), dtype=np.uint8), n_per)
+    with h5py.File(path, "w") as h:
+        # `ref_future` is the discriminator: the raw reference window a pre-training
+        # recording stores, against `fm_plan` which a rollout file stores already assembled.
+        h.create_dataset("ref_future", data=np.zeros((code.size, 4, 3), np.float32))
+        h.create_dataset("clip_family", data=code)
+        h.create_dataset("episode_id", data=np.arange(code.size, dtype=np.int64))
+        h.attrs["num_windows_written"] = code.size
+        h.attrs["family_names"] = json.dumps(families)
+    return path
+
+
+def test_the_two_recording_schemas_are_told_apart_by_their_ARRAYS(tmp_path, rec) -> None:
+    """Not by filename: a pre-training recording and a rollout file are both `*.h5`."""
+    assert bal.is_pretraining_recording(str(_pretrain_recording(tmp_path / "pretrain.h5")))
+    assert not bal.is_pretraining_recording(str(rec))
+
+
+def test_a_file_with_neither_window_array_is_refused(tmp_path) -> None:
+    """It holds no windows at all, so there is nothing to draw ballast from."""
+    p = tmp_path / "empty.h5"
+    with h5py.File(p, "w") as h:
+        h.attrs["num_windows_written"] = 5
+    with pytest.raises(SystemExit, match="neither"):
+        bal.is_pretraining_recording(str(p))
+
+
+def test_the_flat_share_works_on_a_PRE_TRAINING_recording(tmp_path) -> None:
+    """Its family column is `clip_family` and its names are in its OWN metadata, where a
+    rollout file has `family_code` with the names on an `.episodes.h5` sibling."""
+    p = _pretrain_recording(tmp_path / "pretrain.h5", n_per=20)
+    rows = bal.select_ballast_rows(str(p), 20, flat_frac=0.5, seed=0)
+    assert rows.size == 20
+    assert int(bal.flat_mask(str(p))[rows].sum()) == 10
+
+
+def test_a_recording_with_no_window_COUNT_attr_falls_back_to_its_arrays(tmp_path) -> None:
+    """A count of 0 would refuse every draw as 'more than the file holds'."""
+    p = _pretrain_recording(tmp_path / "noattr.h5", n_per=25)
+    with h5py.File(p, "a") as h:
+        del h.attrs["num_windows_written"]
+    assert bal.select_ballast_rows(str(p), 40, flat_frac=0.0).size == 40
+
+
+def test_the_adapter_projects_onto_the_fine_tunes_KEY_SET() -> None:
+    """The pre-training dataset yields p_ref/q_ref/anchor_mask; the fine-tune's loss reads
+    none of them and needs `history_null`, which pre-training does not record at all."""
+    torch = pytest.importorskip("torch")
+    from robot_rl.flow_matching.rollout_dataset import PretrainWindowAdapter
+
+    class _Base:
+        """A stand-in FutureStateDataset item shape."""
+
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, i):
+            return {"state": torch.zeros(2, 3), "history": torch.zeros(2, 3),
+                    "extero": torch.zeros(5), "cmd_tokens": torch.zeros(2, 4),
+                    "p_ref": torch.zeros(3), "q_ref": torch.zeros(4),
+                    "anchor_mask": torch.zeros(2), "mask_frame_yaw_rel": torch.zeros(1)}
+
+    ds = PretrainWindowAdapter(_Base(), path="pre.h5")
+    item = ds[0]
+    assert set(item) == {"state", "history", "extero", "cmd_tokens", "history_null"}
+    assert item["history_null"].item() is False
+    # And the optional keys appear only when asked for, so the mirror works in both arms.
+    w = PretrainWindowAdapter(_Base(), weight=np.ones(3), label=np.zeros(3))
+    assert {"weight", "advantage"} <= set(w[0])
+
+
+def test_the_adapter_concatenates_with_a_rollout_part() -> None:
+    """The whole point: pre-training ballast beside a fine-tune buffer, one training set."""
+    torch = pytest.importorskip("torch")
+    from robot_rl.flow_matching.rollout_dataset import PretrainWindowAdapter
+
+    class _Base:
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, i):
+            return {"state": torch.zeros(2, 3), "history": torch.zeros(2, 3),
+                    "extero": torch.zeros(5), "cmd_tokens": torch.zeros(2, 4)}
+
+    adapter = PretrainWindowAdapter(_Base(), path="pre.h5")
+    ds = _concat([_Part(3, "buf", extero=adapter.extero_shape, cmd=adapter.cmd_dim), adapter])
+    assert len(ds) == 5

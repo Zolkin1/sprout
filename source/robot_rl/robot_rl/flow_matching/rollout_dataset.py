@@ -218,6 +218,78 @@ class RolloutWindowDataset(Dataset):
         return {name: int((lab == i).sum()) for i, name in enumerate(LABEL_NAMES)}
 
 
+class PretrainWindowAdapter(Dataset):
+    """Pre-training windows presented in the fine-tune's item shape.
+
+    The two recordings are the same thing assembled in different places -- ``recorded_*.h5``
+    keeps the raw ingredients and :class:`~robot_rl.flow_matching.dataset.FutureStateDataset`
+    builds the model-space window at load, while a rollout file stores it already built -- and
+    both end as the same four tensors in the same loss. So ballast from the pre-training set
+    needs the pre-training reader and a projection, not a converted file.
+
+    What the projection does:
+
+    * keeps ``state`` / ``history`` / ``extero`` / ``cmd_tokens``, which the two agree on;
+    * adds ``history_null``, which the fine-tune's loss takes per row and pre-training does not
+      record at all -- its own trainer draws a null mask from ``null_cond_prob`` instead. These
+      rows are marked as HAVING history, and the fine-tune's ``--null_prob`` dropout then
+      applies to them exactly as it does to the buffer's;
+    * drops ``p_ref`` / ``q_ref`` / ``anchor_mask`` / ``mask_frame_yaw_rel``, which belong to
+      pre-training's own terrain and mask losses and which the fine-tune never reads. They are
+      dropped rather than passed through because :class:`ConcatWindowDataset` requires the
+      parts to agree on their key set -- the collate reads one key set from the batch's first
+      row.
+
+    Attributes:
+        base: The wrapped pre-training dataset.
+    """
+
+    def __init__(self, base, path: str = "", label: "np.ndarray | None" = None,
+                 weight: "np.ndarray | None" = None) -> None:
+        """Wrap a pre-training dataset.
+
+        Args:
+            base: A :class:`FutureStateDataset` (or anything with its item shape).
+            path: The recording it came from, for error messages.
+            label: ``[len(base)]`` int8 label per row, or ``None``.  Present only to MIRROR
+                the buffer's key set; ballast is ungraded, so this is the null label.
+            weight: ``[len(base)]`` loss weight per row, or ``None``.  1.0 where the buffer
+                carries weights; ``None`` where it does not, since an unweighted mean already
+                treats a row as weight 1.
+        """
+        self.base = base
+        self.path = str(path)
+        self.label = None if label is None else np.asarray(label, dtype=np.int64)
+        self.weight = None if weight is None else np.asarray(weight, dtype=np.float64)
+        probe = base[0] if len(base) else {}
+        self.extero_shape = tuple(probe["extero"].shape) if "extero" in probe else ()
+        self.cmd_dim = int(probe["cmd_tokens"].shape[-1]) if "cmd_tokens" in probe else 0
+        self._has_cmd = "cmd_tokens" in probe
+
+    def __len__(self) -> int:
+        """Windows."""
+        return len(self.base)
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        """One window, projected onto the fine-tune's keys."""
+        src = self.base[i]
+        item = {"state": src["state"], "history": src["history"], "extero": src["extero"],
+                "history_null": torch.tensor(False)}
+        if self._has_cmd:
+            item["cmd_tokens"] = src["cmd_tokens"]
+        if self.label is not None:
+            item["advantage"] = torch.tensor(int(self.label[i]), dtype=torch.long)
+        if self.weight is not None:
+            item["weight"] = torch.tensor(float(self.weight[i]), dtype=torch.float64)
+        return item
+
+    def label_counts(self) -> dict[str, int]:
+        """Labels by name, for the run banner."""
+        if self.label is None:
+            return {}
+        return {name: int((self.label == i).sum()) for i, name in enumerate(LABEL_NAMES)}
+
+
 class ConcatWindowDataset(Dataset):
     """Several :class:`RolloutWindowDataset` read as one, for BALLAST.
 

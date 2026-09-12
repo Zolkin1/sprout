@@ -161,26 +161,9 @@ from robot_rl.flow_matching.rollout_dataset import (  # noqa: E402
     ConcatWindowDataset, RolloutWindowDataset, join_labels, join_values,
 )
 
+from ballast import build_ballast_dataset  # noqa: E402
 from ballast import describe as describe_ballast  # noqa: E402
 from ballast import select_ballast_rows  # noqa: E402
-
-
-def _n_written(path: str) -> int:
-    """Windows written to a recording, for a full-length weight array.
-
-    ``RolloutWindowDataset`` requires ``weight`` to be one entry per FILE row rather than one
-    per selected row, so a ballast slice still needs the file's full length.
-
-    Args:
-        path: The window ``.h5``.
-
-    Returns:
-        The written window count.
-    """
-    import h5py
-
-    with h5py.File(path, "r") as f:
-        return int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
 
 #: The state-dict keys the conversion adds, per injection mode.  Anything else missing means
 #: the pretrained checkpoint is not the architecture this script thinks it is.
@@ -190,6 +173,7 @@ _NEW_KEYS = {
     # the prefix does.
     "prefix_token": {"advantage_emb.weight", "advantage_type"},
 }
+
 
 
 def is_plain_arm(args) -> bool:
@@ -859,11 +843,10 @@ def main() -> int:
         # Passing `weight=None` on a plain arm is not a loss of the "weight 1" property: the
         # loss takes an unweighted mean there, so an unweighted row IS a weight-1 row. The
         # ones-array exists only to keep the key sets equal in the arm that has weights.
-        n_bal = _n_written(args.ballast)
-        ballast_ds = RolloutWindowDataset(
-            args.ballast, ballast_rows, ctx=ctx, seed=args.seed, null_prob=args.null_prob,
-            label=(np.full(n_bal, LABEL_NULL, dtype=np.int64) if labels is not None else None),
-            weight=(np.ones(n_bal, dtype=np.float64) if weight is not None else None))
+        # The BALLAST'S OPTIONAL KEYS MIRROR THE BUFFER'S -- see the comment above.
+        ballast_ds = build_ballast_dataset(
+            args.ballast, ballast_rows, ctx, cfg, null_prob=args.null_prob, seed=args.seed,
+            label=labels is not None, weight=weight is not None)
         print(f"[ft] {describe_ballast(args.ballast, ballast_rows)}")
         n_total = len(train_ds) + len(ballast_ds)
         print(f"[ft]     {len(ballast_ds)} of {n_total} train windows "

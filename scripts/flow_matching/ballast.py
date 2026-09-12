@@ -15,6 +15,20 @@ renumbered into a uid range no iteration can ever reach, because every join down
 ``(episode_uid, replan_index)``; one bad offset there makes a ballast window indistinguishable
 from a graded one, and nothing checks it. Separate files cannot be got wrong that way.
 
+**BALLAST READS THE PRE-TRAINING RECORDING ITSELF, not a re-recording of it.** The two files
+look different and are not: ``recorded_*.h5`` stores the raw ingredients (``ref_future``,
+``history_state``, ``depth``) and ``FutureStateDataset`` assembles them into model space, while
+a fine-tune ``rollout_*.h5`` stores windows already assembled (``fm_plan``, ``history``,
+``extero``). Both end as the same four tensors in the same loss -- ``state``, ``history``,
+``extero``, ``cmd_tokens`` -- so the pre-training loader is simply the right reader for the
+pre-training file, and either kind can serve as ballast. :func:`build_ballast_dataset`
+dispatches on which one it was handed.
+
+**The normalizers are the FINE-TUNE'S, never freshly fitted.** ``FutureStateDataset`` will fit
+its own if none are passed -- which is correct when it IS the training set and silently wrong
+here: the ballast would land in a different space from the buffer and quietly pull the model
+toward a rescaled version of itself, with no error and no shape change to show for it.
+
 **The flat share is declared, because a terrain course contains none.** The fine-tune buffer is
 entirely terrain windows, so drift on FLAT ground is invisible to it -- the buffer has no flat
 rows for the critic to grade or the loss to see. ``ballast_flat_frac`` is the share drawn from
@@ -79,6 +93,81 @@ def _family_names(f: h5py.File, path: str = "") -> list[str]:
     return [str(v) for v in np.asarray(raw).ravel().tolist()]
 
 
+def _n_windows(f: h5py.File) -> int:
+    """How many windows a recording holds, by attr or by array length.
+
+    Both writers stamp ``num_windows_written``; the array fallback covers a file written by
+    something that did not, where a count of 0 would otherwise refuse every draw as "more
+    than the file holds".
+
+    Args:
+        f: The open window file.
+
+    Returns:
+        The window count.
+    """
+    n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+    if n:
+        return n
+    for k in ("ref_future", "fm_plan", "episode_id"):
+        if k in f:
+            return int(f[k].shape[0])
+    return 0
+
+
+def is_pretraining_recording(path: str) -> bool:
+    """Whether ``path`` is a pre-training recording rather than a fine-tune rollout file.
+
+    Discriminated on the ARRAYS rather than the name: a pre-training recording carries
+    ``ref_future`` (the raw reference window, assembled at load) and a rollout file carries
+    ``fm_plan`` (the window already in model space).
+
+    Args:
+        path: The ``.h5``.
+
+    Returns:
+        True for a pre-training recording.
+
+    Raises:
+        SystemExit: If it is neither, which means it is not a window recording at all.
+    """
+    with h5py.File(path, "r") as f:
+        if "ref_future" in f:
+            return True
+        if "fm_plan" in f:
+            return False
+    raise SystemExit(
+        f"{path} carries neither `ref_future` (a pre-training recording) nor `fm_plan` (a "
+        "fine-tune rollout file), so it holds no windows this can draw ballast from.")
+
+
+def _family_columns(path: str) -> tuple[np.ndarray, list[str]]:
+    """``(per-window family code, names[code])`` from either recording schema.
+
+    The two schemas name this differently and keep the names in different places, which is
+    the whole reason a declared flat share needed a dispatch: a rollout file has
+    ``family_code`` with its names on the ``.episodes.h5`` SIBLING, and a pre-training
+    recording has ``clip_family`` with ``family_names`` in its own metadata.
+
+    Args:
+        path: The window ``.h5``.
+
+    Returns:
+        The codes and their names.
+    """
+    # h5py only: SELECTION must not need the recording's full metadata. Both writers store
+    # their meta fields as JSON-encoded attrs, so the names are readable either way and the
+    # only real difference is the column's name -- `clip_family` on a pre-training recording,
+    # `family_code` on a rollout file.
+    col = "clip_family" if is_pretraining_recording(path) else "family_code"
+    with h5py.File(path, "r") as f:
+        n = _n_windows(f)
+        names = _family_names(f, path)
+        if col not in f:
+            return np.zeros(0, dtype=np.int64), names
+        return f[col][:n], names
+
+
 def flat_mask(path: str) -> np.ndarray:
     """``[W]`` bool: which windows of a recording are FLAT-family.
 
@@ -92,17 +181,15 @@ def flat_mask(path: str) -> np.ndarray:
         SystemExit: If the recording carries no family table, so flat cannot be told from
             terrain. A declared flat share would then be unverifiable.
     """
-    with h5py.File(path, "r") as f:
-        n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
-        names = _family_names(f, path)
-        if not names or "family_code" not in f:
-            raise SystemExit(
-                f"{path} carries no family table, so FLAT windows cannot be told from terrain "
-                "ones. The names table is stamped on the `.episodes.h5` SIBLING rather than "
-                "on the window file, so check that it exists beside this one; failing that, "
-                "the recording is flat-only (which legitimately has no families) or predates "
-                "the stamp. Set ballast_flat_frac to 0 to draw without a stratum.")
-        code = f["family_code"][:n]
+    code, names = _family_columns(path)
+    if not names or code.size == 0:
+        raise SystemExit(
+            f"{path} carries no family table, so FLAT windows cannot be told from terrain "
+            "ones. On a fine-tune rollout file the names live on the `.episodes.h5` SIBLING, "
+            "so check it exists beside this one; on a pre-training recording they are in its "
+            "own metadata. Failing either, the recording is flat-only (which legitimately has "
+            "no families) or predates the stamp -- set ballast_flat_frac to 0 to draw without "
+            "a stratum.")
     norm = [v[:-3] if v.endswith(".h5") else v for v in names]
     flat_codes = {i for i, v in enumerate(norm) if v in FLAT_FAMILY_NAMES}
     return np.isin(code, np.array(sorted(flat_codes), dtype=code.dtype))
@@ -132,7 +219,7 @@ def select_ballast_rows(path: str, n_chunks: int, flat_frac: float = 0.0,
         raise SystemExit(f"ballast_flat_frac must be in [0, 1], got {flat_frac}")
     try:
         with h5py.File(path, "r") as f:
-            n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+            n = _n_windows(f)
     except OSError as e:
         raise SystemExit(f"cannot read the ballast recording {path}: {e}") from None
     if n_chunks > n:
@@ -180,3 +267,63 @@ def describe(path: str, rows: np.ndarray) -> str:
     except SystemExit:
         share = ""
     return f"ballast: {rows.size} window(s) from {path}{share}, weight 1, ungraded"
+
+
+def build_ballast_dataset(path: str, rows, ctx, cfg, *, null_prob: float, seed: int,
+                          label: bool, weight: bool):
+    """The ballast slice as a dataset in the fine-tune's item shape.
+
+    Dispatches on which kind of recording it was handed. Either is legitimate: the
+    pre-training set is what "ballast" literally means, and a rollout recording of the parent
+    policy is the same thing collected later.
+
+    **The normalizers come from ``ctx``**, i.e. from the checkpoint being fine-tuned.
+    ``FutureStateDataset`` fits its own when none are passed, which is right when it IS the
+    training set and silently wrong here -- the ballast would sit in a different space from
+    the buffer, pulling the model toward a rescaled version of itself with no error to show.
+
+    Args:
+        path: The ballast recording.
+        rows: Row indices from :func:`select_ballast_rows`.
+        ctx: The loaded generator context, for its normalizers.
+        cfg: The checkpoint's ``FlowMatchingConfig``, for the window layout.
+        null_prob: History-dropout probability, matched to the buffer's.
+        seed: Draw seed.
+        label: Emit an ``advantage`` key (the null label), mirroring the buffer.
+        weight: Emit a ``weight`` key of 1.0, mirroring the buffer.
+
+    Returns:
+        A dataset whose items carry the fine-tune's keys.
+    """
+    import numpy as _np
+    from robot_rl.flow_matching.advantage import LABEL_NULL
+    from robot_rl.flow_matching.rollout_dataset import (
+        PretrainWindowAdapter,
+        RolloutWindowDataset,
+    )
+
+    n = int(_np.asarray(rows).size)
+    lab = _np.full(n, LABEL_NULL, dtype=_np.int64) if label else None
+    wgt = _np.ones(n, dtype=_np.float64) if weight else None
+
+    if not is_pretraining_recording(path):
+        # A rollout file is already in model space; its label/weight arrays are per FILE row.
+        with h5py.File(path, "r") as f:
+            n_file = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
+        return RolloutWindowDataset(
+            path, _np.asarray(rows), ctx=ctx, seed=seed, null_prob=null_prob,
+            label=(_np.full(n_file, LABEL_NULL, dtype=_np.int64) if label else None),
+            weight=(_np.ones(n_file, dtype=_np.float64) if weight else None))
+
+    from recorded_data_io import load_recorded_windows
+    from robot_rl.flow_matching.dataset import FutureStateDataset
+
+    # ROWS AT LOAD, not after: the pre-training recording is the whole training set (200k
+    # windows with depth) and the ballast is a couple of thousand, so loading all of it to
+    # keep 1% would cost gigabytes for nothing.
+    data, meta = load_recorded_windows(path, rows=_np.asarray(rows))
+    base = FutureStateDataset(
+        data, meta, cfg, _np.arange(n),
+        state_normalizer=ctx.state_norm, cmd_normalizer=ctx.cmd_norm,
+        extero_normalizer=ctx.extero_norm, add_noise=False)
+    return PretrainWindowAdapter(base, path=path, label=lab, weight=wgt)
