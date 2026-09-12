@@ -72,8 +72,16 @@ from .varied_courses import (
 #: Inches to metres. The ONE conversion; every dimension below is stated in inches.
 IN: float = 0.0254
 
-#: Family name in the manifest, so the eval's per-tile-type breakdown can name it.
+#: Family names in the manifest, so the eval's per-tile-type breakdown can name them.
+#:
+#: The two DIRECTIONS are separate families, not one. They are different questions -- climbing
+#: a flight you can see and descending one whose treads fall away below the camera's view are
+#: the stack's easiest and hardest stair modes respectively (``STAIRS DOWN BAD`` is the
+#: standing hardware finding) -- so pooling them reports a rate that moves with the up/down
+#: mix rather than with the policy.
 ENTRY_STAIRS_FAMILY: str = "entry_stairs"
+ENTRY_STAIRS_UP_FAMILY: str = "entry_stairs_up"
+ENTRY_STAIRS_DOWN_FAMILY: str = "entry_stairs_down"
 
 #: The WIDE lower flight: five risers at 6.00 in on an 11.00 in tread, 200 in across.
 WIDE_STEPS: int = 5
@@ -378,7 +386,8 @@ def make_entry_stairs_tile(terrain_id: int, cfg, descending: bool = False) -> di
     route = _route((max(start_x, 0.0), cy), spawn_z, 0.0, goal_xy,
                    _fit_goal_half_width(GOAL_HALF_WIDTH_M, overlays, goal_xy),
                    goal_z, spawn_areas=areas)
-    tile = _base_tile(terrain_id, ENTRY_STAIRS_FAMILY, size_x, size_y, overlays, route)
+    family = ENTRY_STAIRS_DOWN_FAMILY if descending else ENTRY_STAIRS_UP_FAMILY
+    tile = _base_tile(terrain_id, family, size_x, size_y, overlays, route)
     tile["entry_stairs"] = {
         **g,
         "descending": bool(descending),

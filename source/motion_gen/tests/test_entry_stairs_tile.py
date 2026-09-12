@@ -30,7 +30,8 @@ from motion_gen.terrain.entry_stairs import (
     APPROACH_M,
     CLEARING_LEN_M,
     CLEARING_WIDTH_M,
-    ENTRY_STAIRS_FAMILY,
+    ENTRY_STAIRS_DOWN_FAMILY,
+    ENTRY_STAIRS_UP_FAMILY,
     WALL_H_M,
     geometry_m,
     make_entry_stairs_tile,
@@ -103,7 +104,12 @@ def _last_riser_x(tile: dict) -> float:
 
 @pytest.mark.parametrize("descending", DIRECTIONS)
 def test_the_manifest_validates(descending: bool) -> None:
-    validate_manifest([_tile(descending)], families=(ENTRY_STAIRS_FAMILY,))
+    validate_manifest([_tile(descending)],
+                      families=(ENTRY_STAIRS_UP_FAMILY, ENTRY_STAIRS_DOWN_FAMILY))
+    want = ENTRY_STAIRS_DOWN_FAMILY if descending else ENTRY_STAIRS_UP_FAMILY
+    assert _tile(descending)["family"] == want, (
+        "the two directions must be separate families, or a per-tile-type breakdown pools "
+        "climbing with descending and reports a rate that moves with the mix")
 
 
 # ---------------------------------------------------------------------------------------------

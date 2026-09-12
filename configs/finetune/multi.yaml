@@ -35,13 +35,26 @@ num_envs: 2048
 ballast_chunks: 2000
 ballast_flat_frac: 0.5
 
-# 4 types. The entry stairs get fewer tiles because it is ONE measured geometry, not a
-# distribution -- more tiles of it would be more episodes on the same staircase, which the
-# spawn chain already provides.
+# 4 types, 70 tiles. The entry stairs split 5 ASCENDING / 5 DESCENDING.
+#
+# Read this count as a SAMPLING WEIGHT, not as variety. The other three types draw fresh
+# geometry per tile, so their counts buy coverage of a distribution. The entry stairs are one
+# measured building and the tile draws nothing, so all 5 tiles of a direction are identical and
+# what the count buys is ENV SHARE -- envs are placed round-robin over tiles, so 10 of 70 tiles
+# is 14% of training time and 14% of the episodes the per-type breakdown gets to reduce over.
+#
+# 5 rather than 3 because 3 tiles is a thin slice to read a per-type success rate off, and this
+# is the type the config exists to test: it is the only tile with two flights of DIFFERENT
+# geometry, and the only one that meets a narrowing corridor before a riser.
+#
+# The two directions are separate families and must stay separate in the breakdown. Climbing a
+# flight you can see and descending one whose treads fall away below the camera are the stack's
+# easiest and hardest stair modes -- STAIRS DOWN BAD is the standing hardware finding -- so a
+# pooled entry-stairs rate would move with the up/down mix rather than with the policy.
 tiles_boxes: 20
 tiles_updown: 20
 tiles_indist: 20
-tiles_entry_stairs: 6
+tiles_entry_stairs: 10
 
 updown_cells: [[0.130, 0.280], [0.130, 0.305], [0.130, 0.330],
                [0.155, 0.280], [0.155, 0.305], [0.155, 0.330],
