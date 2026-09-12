@@ -223,8 +223,13 @@ the two to AGREE on every camera they SHARE (`transfer/deploy/depth_obs.py`).
 - Who states the resolution: `record_data.py --fm_depth_resolution WxH` DECLARES it; `play.py` and
   `augment_registration.py` DERIVE it (from the checkpoint, and from the recording's own spec).
 - MuJoCo casts BOTH grids (`mirror_extrinsics_from` shares the jittered mount). **Hardware is not
-  wired for a split sampling** -- `export_sensor_configs.py` raises rather than emitting configs
-  that cover only the tracker.
+  wired for a SPLIT sampling** -- the same lens on two grids has nowhere to declare the second
+  stream, and `export_sensor_configs.py` still raises on it. A **SUBSET** pair is different and is
+  now WIRED (`e56a62e2`): the rig is the GENERATOR's `extero_spec`, the ROS controller subscribes,
+  FKs and watchdogs every rig camera (`PolicyRuntime::rig_cameras`), and the tracker selects its own
+  by `obs_term`. That is the shipped shape -- the policy reads the near camera, the generator both --
+  and before it was wired the retrain could not be deployed at all. The REVERSE (a camera the
+  tracker reads and the generator does not) stays a refusal: two artifacts describing different rigs.
 - `export_parameters.py` emits each obs term's `clip`, so `_assemble` saturates every term the way
   training did instead of consulting a hardcoded table (kept only as a legacy fallback).
 
