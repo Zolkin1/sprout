@@ -847,14 +847,27 @@ def main() -> int:
     if args.ballast_chunks:
         ballast_rows = select_ballast_rows(args.ballast, int(args.ballast_chunks),
                                            float(args.ballast_flat_frac), seed=args.seed)
+        # THE BALLAST'S OPTIONAL KEYS MUST MIRROR THE BUFFER'S, and this is not cosmetic.
+        # `RolloutWindowDataset.__getitem__` adds `weight` and `advantage` only when it was
+        # given them, and `_collate` takes its key set from `batch[0]` and indexes every other
+        # item with it -- so a batch mixing a buffer row without `weight` and a ballast row
+        # with one either raises KeyError or silently drops the ballast's weight, depending on
+        # which row happened to land first. The buffer only carries weights in the AWR arm and
+        # only carries labels in the conditioned arm, so both are mirrored here rather than
+        # passed unconditionally.
+        #
+        # Passing `weight=None` on a plain arm is not a loss of the "weight 1" property: the
+        # loss takes an unweighted mean there, so an unweighted row IS a weight-1 row. The
+        # ones-array exists only to keep the key sets equal in the arm that has weights.
+        n_bal = _n_written(args.ballast)
         ballast_ds = RolloutWindowDataset(
-            args.ballast, ballast_rows, ctx=ctx, label=None, seed=args.seed,
-            null_prob=args.null_prob,
-            weight=np.ones(_n_written(args.ballast), dtype=np.float64))
+            args.ballast, ballast_rows, ctx=ctx, seed=args.seed, null_prob=args.null_prob,
+            label=(np.full(n_bal, LABEL_NULL, dtype=np.int64) if labels is not None else None),
+            weight=(np.ones(n_bal, dtype=np.float64) if weight is not None else None))
         print(f"[ft] {describe_ballast(args.ballast, ballast_rows)}")
-        print(f"[ft]     {len(ballast_ds)} of {len(train_ds)} train windows "
-              f"({len(ballast_ds) / max(len(train_ds) + len(ballast_ds), 1):.1%} of the "
-              "training set) are ungraded pre-training rows")
+        n_total = len(train_ds) + len(ballast_ds)
+        print(f"[ft]     {len(ballast_ds)} of {n_total} train windows "
+              f"({len(ballast_ds) / max(n_total, 1):.1%}) are ungraded pre-training rows")
         train_ds = ConcatWindowDataset([train_ds, ballast_ds])
     print(f"[ft] {len(train_ds)} train / {0 if val_ds is None else len(val_ds)} val windows "
           f"over {int(np.unique(uid[rows]).size)} episodes")

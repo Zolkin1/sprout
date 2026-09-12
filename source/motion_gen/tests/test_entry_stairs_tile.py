@@ -281,18 +281,67 @@ def test_going_down_authors_one_fewer_tread_per_flight() -> None:
     assert treads(down, g["hall_width_m"]) == g["hall_steps"] - 1
 
 
-def test_the_two_directions_are_the_same_building() -> None:
-    """Same landing, same lobby, same flight widths and the same total height -- only the end
-    you start from changes."""
+def test_the_two_directions_are_the_same_STAIRCASE() -> None:
+    """What must match between the directions, compared on the built SURFACES.
+
+    The earlier version of this test compared only the recorded ``x_landing`` / ``x_lobby``
+    intervals, which exclude the flush top tread -- so it passed while the two tiles' actual
+    walkable plateaus differed, and the docstring claimed they were the same building. What
+    is genuinely shared is the staircase: riser counts, riser heights, tread runs and flight
+    widths. The plateaus are NOT, and the next test pins that difference rather than hiding
+    it.
+    """
     g = geometry_m()
     up, down = _tile(False), _tile(True)
+
+    def levels(t):
+        """Every distinct walkable height in the tile."""
+        return sorted({round(ov["base_z"] + ov["size_xyz"][2], 6) for ov in _surfaces(t)})
+
+    # THE SET OF LEVELS THE ROUTE TRAVERSES, which is the staircase itself: ground, five wide
+    # risers to the landing, three hall risers to the lobby. Compared over the whole tile
+    # rather than per flight WIDTH, because the flush top tread belongs to the flight going up
+    # and to the plateau coming down -- the same asymmetry the next test pins, showing up at
+    # the other end.
+    assert levels(up) == levels(down), (
+        f"the two directions present different heights: {levels(up)} vs {levels(down)}")
+    assert len(levels(up)) == 1 + g["wide_steps"] + g["hall_steps"], (
+        "ground plus one level per riser is the whole staircase")
+    # And both present a wide flight and a narrow one.
     for t in (up, down):
-        x0, x1 = t["entry_stairs"]["x_landing"]
-        assert x1 - x0 == pytest.approx(g["landing_len_m"])
-        lo, hi = t["entry_stairs"]["x_lobby"]
-        assert hi - lo == pytest.approx(CLEARING_LEN_M)
+        widths = {round(ov["size_xyz"][1], 4) for ov in _surfaces(t)}
+        assert round(g["wide_width_m"], 4) in widths and round(g["hall_width_m"], 4) in widths
     assert up["size_y"] == pytest.approx(down["size_y"])
     assert len(_walls(up)) == len(_walls(down))
+    for t in (up, down):
+        lo, hi = t["entry_stairs"]["x_lobby"]
+        assert hi - lo == pytest.approx(CLEARING_LEN_M)
+
+
+def test_the_plateaus_differ_by_exactly_one_TREAD_RUN_and_that_is_the_n_minus_1_rule() -> None:
+    """The known, unavoidable asymmetry -- pinned so it stays known.
+
+    Going up, the flight's top tread sits at the height of the surface it arrives on and
+    simply extends it, so the landing's walkable extent is one tread run longer. Removing the
+    difference means either a zero-height step coming down or a missing riser going up. The
+    ASCENDING layout is what MuJoCo authors, which is what the cross-simulator test compares.
+    """
+    g = geometry_m()
+    up, down = _tile(False), _tile(True)
+
+    def plateau(t, z, width):
+        """Total downrange extent of the walkable surface at height ``z`` and ``width``."""
+        return sum(ov["size_xyz"][0] for ov in _surfaces(t)
+                   if ov["size_xyz"][1] == pytest.approx(width)
+                   and ov["base_z"] + ov["size_xyz"][2] == pytest.approx(z))
+
+    up_landing = plateau(up, g["wide_height_m"], g["wide_width_m"])
+    down_landing = plateau(down, g["wide_height_m"], g["wide_width_m"])
+    assert up_landing - down_landing == pytest.approx(g["wide_run_m"]), (
+        f"landing {up_landing:.4f} up vs {down_landing:.4f} down; the difference should be "
+        f"exactly one wide tread run ({g['wide_run_m']:.4f} m)")
+    assert down_landing == pytest.approx(g["landing_len_m"]), (
+        "coming down, the landing should be exactly the measured landing")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -411,16 +460,47 @@ def test_every_wall_is_collidable_and_stands_on_the_surface_it_belongs_to(
     t = _tile(descending)
     g = geometry_m()
     walls = _walls(t)
-    assert len(walls) == 9, (
-        "expected 2 return faces + 2 hallway walls + 2 lobby sides + 2 mouth segments + 1 far "
-        f"wall, got {len(walls)}")
-    levels = (g["wide_height_m"], g["total_height_m"])
+    assert len(walls) == 11, (
+        "expected 2 return faces + 2 hallway walls + 2 stairwell sides + 2 lobby sides + "
+        f"2 mouth segments + 1 far wall, got {len(walls)}")
+    levels = (0.0, g["wide_height_m"], g["total_height_m"])
     for w in walls:
         assert not w["decor"], "a decor wall has no collider -- the corridor would not constrain"
         assert not w["walkable_top"]
-        assert w["size_xyz"][2] == pytest.approx(WALL_H_M)
         assert any(w["base_z"] == pytest.approx(lv) for lv in levels), (
-            f"a wall stands at z={w['base_z']:.3f}, neither the landing nor the lobby")
+            f"a wall stands at z={w['base_z']:.3f}, none of the floor, landing or lobby")
+        # Every wall must clear the surface it encloses, or it is a step rather than a barrier.
+        assert w["base_z"] + w["size_xyz"][2] >= w["base_z"] + WALL_H_M - TOL
+
+
+def test_the_wide_flight_cannot_be_WALKED_AROUND(descending: bool = False) -> None:
+    """The bypass that made the descending goal reachable without descending anything.
+
+    The lobby makes the tile 9.3 m wide against the flight's 5.08, so without side walls a
+    lane of tile floor runs the whole length of the structure. On the DESCENDING tile the goal
+    sits on the ground past the bottom of the flight, so that lane is a complete bypass: step
+    off the side of the landing, walk downrange on flat ground, enter the goal band having
+    descended nothing -- and `goal_z` is 0 there, so the height band does not catch it either.
+    It scores as a traverse. The ascending tile was protected only by accident, its goal being
+    up inside the walled lobby, which is why the asymmetry was easy to miss.
+    """
+    for desc in DIRECTIONS:
+        t = _tile(desc)
+        g = geometry_m()
+        cy = t["size_y"] / 2.0
+        x0, x1 = t["entry_stairs"]["x_wide_flight"]
+        mid = (x0 + x1) / 2.0
+        side = [w for w in _walls(t)
+                if w["base_z"] == pytest.approx(0.0)
+                and w["pos_xy"][0] - w["size_xyz"][0] / 2 <= mid <= w["pos_xy"][0] + w["size_xyz"][0] / 2]
+        assert len(side) == 2, (
+            f"{'descending' if desc else 'ascending'}: the wide flight has {len(side)} "
+            "floor-based side wall(s); it can be walked around")
+        for w in side:
+            assert abs(w["pos_xy"][1] - cy) > g["wide_width_m"] / 2.0 - TOL, (
+                "a side wall is inside the flight rather than beside it")
+            assert w["base_z"] + w["size_xyz"][2] > g["wide_height_m"], (
+                "the side wall is shorter than the landing it encloses, so it is a step")
 
 
 def test_a_spawn_buffer_that_swallows_the_landing_is_refused() -> None:

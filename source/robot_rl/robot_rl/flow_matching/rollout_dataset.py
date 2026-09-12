@@ -249,7 +249,8 @@ class ConcatWindowDataset(Dataset):
                 the others must match.
 
         Raises:
-            ValueError: If no part is given, or two parts disagree on the window geometry.
+            ValueError: If no part is given, if two parts disagree on the window geometry, or
+                if they emit different ITEM KEYS.
         """
         if not parts:
             raise ValueError("a ConcatWindowDataset needs at least one part.")
@@ -260,6 +261,26 @@ class ConcatWindowDataset(Dataset):
                     f"{p.path} holds extero {p.extero_shape} / cmd {p.cmd_dim} against "
                     f"{first.path}'s {first.extero_shape} / {first.cmd_dim}. These are two "
                     "different recordings and the mismatch would surface inside a worker.")
+            # THE KEY SETS, checked here because the collate cannot check them. `__getitem__`
+            # adds `advantage` and `weight` only when this dataset was GIVEN a label or a
+            # weight, and the trainer's collate takes its key set from the first item of the
+            # batch and indexes every other item with it. Two parts that disagree therefore
+            # fail in one of two ways depending on which row a shuffle happened to put first:
+            # a KeyError, or the extra key SILENTLY DROPPED for the whole batch. Neither names
+            # the cause, and the second changes what the model trains on without any error at
+            # all -- so the disagreement is refused here, at construction, where the fix is
+            # obvious.
+            if (p.label is None) != (first.label is None) or \
+                    (p.weight is None) != (first.weight is None):
+                def _keys(d):
+                    """The optional keys a part will emit."""
+                    return sorted(["advantage"] * (d.label is not None)
+                                  + ["weight"] * (d.weight is not None)) or ["(none)"]
+                raise ValueError(
+                    f"{p.path} emits optional keys {_keys(p)} against {first.path}'s "
+                    f"{_keys(first)}. Every part must be given a label if any is, and a "
+                    "weight if any is -- the collate reads one key set from the batch's "
+                    "first row, so a mismatch either raises or silently drops a key.")
         self.parts = list(parts)
         self._sizes = np.array([len(p) for p in self.parts], dtype=np.int64)
         self._offsets = np.concatenate([[0], np.cumsum(self._sizes)])

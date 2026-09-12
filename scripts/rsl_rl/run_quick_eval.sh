@@ -232,6 +232,7 @@ PYEOF
 )
 if [ "${NFAM:-0}" -gt 1 ]; then
   echo "[eval] $NFAM tile types in $CLIP -- per-type breakdown:"
-  $PY scripts/rsl_rl/tile_type_report.py "$OUT" --lib "$CLIP" \
-      --json "$OUT/by_tile_type.json"
+  # No --lib: the recording's own stamp is the only map that is correct, and passing the
+  # shell's $CLIP would skip the check that the two agree.
+  $PY scripts/rsl_rl/tile_type_report.py "$OUT" --json "$OUT/by_tile_type.json"
 fi

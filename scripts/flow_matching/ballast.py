@@ -29,6 +29,7 @@ point of the number is that it is declared.
 from __future__ import annotations
 
 import json
+import os
 
 import h5py
 import numpy as np
@@ -40,11 +41,18 @@ import numpy as np
 FLAT_FAMILY_NAMES: frozenset[str] = frozenset({"flat", "family_flat", "unknown"})
 
 
-def _family_names(f: h5py.File) -> list[str]:
+def _family_names(f: h5py.File, path: str = "") -> list[str]:
     """The recording's own ``family_names`` table, or an empty list.
+
+    **It is not always on the window file.** ``record_rollouts`` writes ``family_code`` into
+    the WINDOW file but stamps ``family_names`` onto the ``.episodes.h5`` sibling, so a
+    rollout recording carries the codes and its neighbour carries what they mean. Looking only
+    at the window file made every ``ballast_flat_frac > 0`` run refuse with a message blaming
+    the recording's age, which is not the reason.
 
     Args:
         f: The open window file.
+        path: That file's path, so the ``.episodes.h5`` sibling can be found.
 
     Returns:
         ``family_names[code]``.
@@ -55,6 +63,12 @@ def _family_names(f: h5py.File) -> list[str]:
             raw = json.loads(str(f.attrs["meta"])).get("family_names")
         except Exception:
             raw = None
+    if raw is None and path:
+        # The sibling. `prov` is written JSON-encoded, so the value needs decoding either way.
+        sib = path[:-3] + ".episodes.h5" if path.endswith(".h5") else ""
+        if sib and os.path.isfile(sib):
+            with h5py.File(sib, "r") as g:
+                raw = g.attrs.get("family_names")
     if raw is None:
         return []
     if isinstance(raw, (bytes, str)):
@@ -80,13 +94,14 @@ def flat_mask(path: str) -> np.ndarray:
     """
     with h5py.File(path, "r") as f:
         n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
-        names = _family_names(f)
+        names = _family_names(f, path)
         if not names or "family_code" not in f:
             raise SystemExit(
                 f"{path} carries no family table, so FLAT windows cannot be told from terrain "
-                "ones. Either the recording predates the family stamp or it is a flat-only "
-                "library (which legitimately has none). Set ballast_flat_frac to 0 to draw "
-                "the ballast without a stratum, or point at a recording that has families.")
+                "ones. The names table is stamped on the `.episodes.h5` SIBLING rather than "
+                "on the window file, so check that it exists beside this one; failing that, "
+                "the recording is flat-only (which legitimately has no families) or predates "
+                "the stamp. Set ballast_flat_frac to 0 to draw without a stratum.")
         code = f["family_code"][:n]
     norm = [v[:-3] if v.endswith(".h5") else v for v in names]
     flat_codes = {i for i, v in enumerate(norm) if v in FLAT_FAMILY_NAMES}

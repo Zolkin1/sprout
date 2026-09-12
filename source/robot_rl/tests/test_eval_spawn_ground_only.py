@@ -172,11 +172,15 @@ def test_a_DESCENDING_tile_keeps_its_raised_start_rather_than_being_refused() ->
     cannot begin a descent from the floor. The refusal killed all three in-distribution evals
     at env construction, before a single episode was collected.
 
-    The rule is now the tile's MINIMUM declared ``z``, which expresses what the eval actually
-    wants -- start where the course starts, never part-way along it -- without asserting that
-    every course starts on the floor.
+    The rule is now the ROUTE'S OWN ``start_z``, which expresses what the eval actually wants
+    -- start where the course starts, never part-way along it -- without asserting that every
+    course starts on the floor, and without assuming that "where the course starts" is the
+    tile's lowest point. It is not on a course that DESCENDS.
     """
-    raised = freeform._route((1.0, 0.0), 0.0, 0.0, (6.0, 0.0), 1.0, 0.0,
+    # `start_z` matches the declared area, which is what every real library does: measured
+    # over 536 routed tiles on disk, 526 have `min(area z) == route.start_z` and the only
+    # exceptions were the descending entry stairs this rule was fixed for.
+    raised = freeform._route((1.0, 0.0), 0.4, 0.0, (6.0, 0.0), 1.0, 0.0,
                              spawn_areas=[freeform.spawn_area(3.0, 0.0, 0.4, 0.3, 0.3)])
     imp = _StubImporter({0: raised})
     table, index, lo = resets._freeform_spawn_table(imp, _JITTER, "ground")
@@ -186,21 +190,55 @@ def test_a_DESCENDING_tile_keeps_its_raised_start_rather_than_being_refused() ->
         "ground start would place the robot at a pose the terrain never declared legal")
 
 
-def test_ground_only_keeps_the_LOWEST_tier_when_a_tile_has_several() -> None:
-    """The discriminating case: a descending tile with a platform AND a higher landing.
+def test_ground_only_keeps_the_STARTING_tier_when_a_tile_has_several() -> None:
+    """The discriminating case: a tile with a starting platform AND a higher landing.
 
-    Minimum-z must keep the platform alone. An absolute-ground test keeps nothing here (the
-    old bug) and a "keep everything" fallback keeps both -- which would score a fraction of
-    the course as a traverse, the very thing the eval rule exists to prevent.
+    Keeping the start alone is the point. An absolute-ground test keeps nothing here (the
+    2026-09-10 bug) and a "keep everything" fallback keeps both -- which would score a
+    fraction of the course as a traverse, the very thing the eval rule exists to prevent.
     """
     tiered = freeform._route(
-        (1.0, 0.0), 0.0, 0.0, (6.0, 0.0), 1.0, 0.0,
+        (1.0, 0.0), 0.40, 0.0, (6.0, 0.0), 1.0, 0.0,
         spawn_areas=[freeform.spawn_area(3.0, 0.0, 0.40, 0.3, 0.3),
                      freeform.spawn_area(4.0, 0.0, 0.95, 0.3, 0.3)])
     imp = _StubImporter({0: tiered})
     table, index, lo = resets._freeform_spawn_table(imp, _JITTER, "ground")
     assert int(index[0, 1]) == 1
     assert table[0, 2] == pytest.approx(0.40)
+
+
+def test_a_DESCENDING_tile_keeps_its_START_not_the_tiles_lowest_area() -> None:
+    """THE case the minimum-z rule got wrong, and it cost half of every descending eval.
+
+    ``entry_stairs_down`` starts in the lobby at 1.162 m and declares a mid-course area on the
+    landing at 0.762. The minimum picked the LANDING, so every eval spawned PAST the first
+    flight -- 5.89 m of a declared 11.82 m course -- while the cells filled and the rates
+    looked entirely normal. There is no other symptom: a spawn distribution that is wrong in
+    this way produces a complete, plausible table.
+    """
+    descending = freeform._route(
+        (4.0, 0.0), 1.162, 0.0, (15.8, 0.0), 0.75, 0.0,
+        spawn_areas=[freeform.spawn_area(4.0, 0.0, 1.162, 0.25, 0.25),   # the lobby: START
+                     freeform.spawn_area(9.9, 0.0, 0.762, 0.9, 2.2)])    # the landing: mid
+    imp = _StubImporter({0: descending})
+    table, index, lo = resets._freeform_spawn_table(imp, _JITTER, "ground")
+    assert int(index[0, 1]) == 1, "both tiers survived; the eval starts part-way along"
+    assert table[0, 2] == pytest.approx(1.162), (
+        f"the eval spawns at z={float(table[0, 2]):.3f}, the mid-course landing, rather than "
+        "at the lobby the route declares as its start")
+
+
+def test_areas_that_disagree_with_the_routes_own_start_are_refused() -> None:
+    """A route and its areas must agree about where the course begins.
+
+    Silently falling back to the lowest area is exactly what put every descending eval
+    part-way along its course, so the disagreement is refused rather than resolved.
+    """
+    inconsistent = freeform._route(
+        (1.0, 0.0), 0.0, 0.0, (6.0, 0.0), 1.0, 0.0,
+        spawn_areas=[freeform.spawn_area(3.0, 0.0, 0.40, 0.3, 0.3)])
+    with pytest.raises(ValueError, match="start_z"):
+        resets._freeform_spawn_table(_StubImporter({0: inconsistent}), _JITTER, "ground")
 
 
 def test_an_unknown_subset_is_refused_rather_than_treated_as_all() -> None:

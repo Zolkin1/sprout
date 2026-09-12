@@ -80,8 +80,8 @@ IN: float = 0.0254
 #: standing hardware finding) -- so pooling them reports a rate that moves with the up/down
 #: mix rather than with the policy.
 ENTRY_STAIRS_FAMILY: str = "entry_stairs"
-ENTRY_STAIRS_UP_FAMILY: str = "entry_stairs_up"
-ENTRY_STAIRS_DOWN_FAMILY: str = "entry_stairs_down"
+ENTRY_STAIRS_UP_FAMILY: str = f"{ENTRY_STAIRS_FAMILY}_up"
+ENTRY_STAIRS_DOWN_FAMILY: str = f"{ENTRY_STAIRS_FAMILY}_down"
 
 #: The WIDE lower flight: five risers at 6.00 in on an 11.00 in tread, 200 in across.
 WIDE_STEPS: int = 5
@@ -158,7 +158,8 @@ def geometry_m() -> dict:
     }
 
 
-def _wall(cx: float, cy: float, base_z: float, sx: float, sy: float) -> dict:
+def _wall(cx: float, cy: float, base_z: float, sx: float, sy: float,
+          height: float | None = None) -> dict:
     """One collidable wall standing on the surface at ``base_z``.
 
     COLLIDABLE (``decor=False``), so it enters the collider SDF and the terrain-consistency
@@ -172,12 +173,15 @@ def _wall(cx: float, cy: float, base_z: float, sx: float, sy: float) -> dict:
     Args:
         cx / cy: Footprint centre (m).
         base_z: The surface the wall stands on (m).
-        sx / sy: Footprint extents (m); the height is :data:`WALL_H_M`.
+        sx / sy: Footprint extents (m).
+        height: Wall height above ``base_z`` (m); :data:`WALL_H_M` by default. The stairwell's
+            side walls stand on the FLOOR and pass a taller value, because a 1.2 m wall based
+            at 0 would be shorter than the 1.16 m structure it is there to enclose.
 
     Returns:
         The overlay dict.
     """
-    return _overlay(cx, cy, base_z, sx, sy, WALL_H_M,
+    return _overlay(cx, cy, base_z, sx, sy, height if height is not None else WALL_H_M,
                     kind="obstacle", walkable_top=False, decor=False)
 
 
@@ -215,11 +219,20 @@ def make_entry_stairs_tile(terrain_id: int, cfg, descending: bool = False) -> di
     ascending tile instead leaves a tread flush with the landing and quietly makes the landing
     one run deeper. ``make_updown_tile`` takes the same care for the same reason.
 
-    Both end sections are built long enough for EITHER job, so the building is identical in
-    the two directions and in MuJoCo, and only the end you start from changes:
+    Both end sections are built long enough for EITHER job, so which end you start from is
+    the only thing ``descending`` chooses:
 
     * going UP, the flat is the approach and the lobby holds the goal;
     * going DOWN, the lobby is the approach and the flat holds the goal.
+
+    **What is IDENTICAL between the directions is the staircase, not the whole tile.** Riser
+    counts, riser heights, tread runs, flight widths, the landing and the lobby are the same
+    measured building read either way. The PLATEAUS differ by one tread run: the ascending
+    flight's top tread is flush with the surface it arrives on and simply extends it, so the
+    landing reads 2.819 m deep going up against 2.540 m coming down. That follows from the
+    ``n`` / ``n - 1`` rule above and cannot be removed without introducing a zero-height step
+    at one end. The ascending layout is the one MuJoCo authors, so it is the ascending tile
+    that the cross-simulator test is comparing.
 
     Args:
         terrain_id: The tile id.
@@ -331,6 +344,28 @@ def make_entry_stairs_tile(terrain_id: int, cfg, descending: bool = False) -> di
         overlays.append(_wall((hall_lo + hall_hi) / 2.0,
                               cy + sign * (h_wide / 2.0 + WALL_T_M / 2.0), z_landing,
                               hall_hi - hall_lo, WALL_T_M))
+
+    # ---- THE STAIRWELL'S OWN SIDES --------------------------------------------------------
+    # Along the WIDE flight and the landing, which would otherwise be open to the side.
+    #
+    # Without these the tile has a walkable lane of tile floor beside the structure -- the
+    # lobby makes the tile 9.3 m wide against the flight's 5.08 -- and on the DESCENDING tile
+    # that lane is a complete bypass: the goal sits on the ground past the bottom of the
+    # flight, so a robot can step off the side of the landing, walk downrange on flat ground
+    # and enter the goal band having descended nothing. `goal_z` is 0 there, so the height
+    # band does not catch it either. That is the apron trap the stairs family already paid
+    # once, and it scores as a traverse.
+    #
+    # The ascending tile is protected by accident -- its goal is up inside the walled lobby --
+    # which is exactly why the asymmetry was easy to miss, so both directions get them.
+    # `varied_updown` walls its flight end to end for the same reason.
+    wall_x0 = min(x_wide0, x_land0) - WALL_T_M
+    wall_x1 = max(x_wide1, x_land1) + WALL_T_M
+    for sign in (1.0, -1.0):
+        overlays.append(_wall((wall_x0 + wall_x1) / 2.0,
+                              cy + sign * (w_wide / 2.0 + WALL_T_M / 2.0), 0.0,
+                              wall_x1 - wall_x0, WALL_T_M,
+                              height=z_landing + WALL_H_M))
 
     # ---- THE LOBBY'S OWN PERIMETER --------------------------------------------------------
     # So it reads as INDOORS rather than as a plateau: side walls, a far wall at its closed

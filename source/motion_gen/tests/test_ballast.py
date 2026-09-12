@@ -208,12 +208,15 @@ def test_the_loop_receives_the_source_path(tmp_path) -> None:
 class _Part:
     """A stand-in for RolloutWindowDataset with only what the concat wrapper touches."""
 
-    def __init__(self, n: int, tag: str, extero=(2, 3), cmd=4, labels=None) -> None:
+    def __init__(self, n: int, tag: str, extero=(2, 3), cmd=4, labels=None,
+                 label=None, weight=None) -> None:
         """Hold a length and a tag so items are identifiable."""
         self.n, self.tag = n, tag
         self.extero_shape, self.cmd_dim = extero, cmd
         self.path = f"{tag}.h5"
         self._labels = labels or {}
+        # The two fields the key-set check reads; None means the part emits no such key.
+        self.label, self.weight = label, weight
 
     def __len__(self) -> int:
         """Windows."""
@@ -280,3 +283,61 @@ def test_parts_from_different_recordings_are_refused() -> None:
 def test_no_parts_is_refused() -> None:
     with pytest.raises(ValueError, match="at least one part"):
         _concat([])
+
+
+def test_parts_that_would_emit_DIFFERENT_KEYS_are_refused() -> None:
+    """THE bug the stubs above could not see, and the one that actually shipped.
+
+    ``RolloutWindowDataset.__getitem__`` adds ``weight`` and ``advantage`` only when it was
+    given them, and the trainer's collate takes its key set from the batch's FIRST row. The
+    buffer carries weights only in the AWR arm and labels only in the conditioned one, so a
+    ballast part built with an unconditional ones-array disagreed with the buffer on three of
+    the four algorithm arms -- raising KeyError or silently dropping the weight for the whole
+    batch depending on which row a shuffle put first.
+    """
+    with pytest.raises(ValueError, match="optional keys"):
+        _concat([_Part(2, "buf"), _Part(2, "bal", weight=np.ones(2))])
+    with pytest.raises(ValueError, match="optional keys"):
+        _concat([_Part(2, "buf", label=np.zeros(2)), _Part(2, "bal")])
+
+
+def test_matching_key_sets_are_accepted() -> None:
+    """Both arms of the mirror: weights on both parts, or on neither."""
+    assert len(_concat([_Part(2, "buf", weight=np.ones(2)),
+                        _Part(1, "bal", weight=np.ones(1))])) == 3
+    assert len(_concat([_Part(2, "buf"), _Part(1, "bal")])) == 3
+
+
+def test_the_real_collate_survives_a_mixed_batch_in_either_order() -> None:
+    """Reproduces the failure end to end through the ACTUAL collate, not a stub.
+
+    Both orders are checked because the two failure modes are order-dependent: buffer-first
+    silently dropped the ballast's key, ballast-first raised. A test that fixed the order
+    would have passed on one of them.
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_ftgen", _ROOT / "scripts" / "flow_matching" / "finetune_generator.py")
+    # Import the collate WITHOUT executing the module's heavy imports: read it out of the
+    # source instead, since the module pulls in torch + isaaclab config machinery.
+    src = (_ROOT / "scripts" / "flow_matching" / "finetune_generator.py").read_text()
+    start = src.index("def _collate(")
+    end = src.index("\ndef ", start + 1)
+    ns: dict = {"torch": pytest.importorskip("torch")}
+    exec(compile(src[start:end], "collate", "exec"), ns)      # noqa: S102
+    collate = ns["_collate"]
+    assert spec is not None
+
+    torch = ns["torch"]
+    buf = {"state": torch.zeros(2), "history_null": torch.zeros(1)}
+    bal = {"state": torch.ones(2), "history_null": torch.ones(1)}
+    # Matching key sets: both orders must collate to a full batch of 2.
+    for batch in ([buf, bal], [bal, buf]):
+        out = collate([dict(b) for b in batch])
+        assert set(out) == {"state", "history_null"}
+        assert out["state"].shape[0] == 2
+
+    # And the shape of the bug, so the mechanism is pinned rather than only its absence.
+    with pytest.raises(KeyError):
+        collate([dict(bal, weight=torch.ones(1)), dict(buf)])

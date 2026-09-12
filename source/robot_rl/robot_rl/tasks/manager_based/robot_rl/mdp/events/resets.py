@@ -916,17 +916,18 @@ def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float],
         importer: The ``ClipTerrainImporter``, carrying ``terrain_route``.
         pos_jitter_m: Half-widths for the synthesised single-start area.
         spawn_from: Which declared areas to keep; one of :data:`SPAWN_FROM`.  ``ground``
-            keeps only the tile's LOWEST declared areas -- those within
-            :data:`SPAWN_Z_TIE_TOL_M` of the minimum ``z`` -- which is how every eval runs.
+            keeps only the areas at the ROUTE'S OWN START LEVEL -- those within
+            :data:`SPAWN_Z_TIE_TOL_M` of ``route.start_z`` -- which is how every eval runs.
+            On a course that descends, that level is the tile's HIGHEST, not its lowest.
 
     Returns:
         ``(areas, index, lo)`` -- ``[A, 7]`` float, ``[hi - lo + 1, 2]`` long, and the terrain
         id row 0 of the index stands for.
 
     Raises:
-        ValueError: If a declared area is missing a field, or ``spawn_from`` is unknown.
-            The filter itself cannot empty a tile: it keeps the minimum-``z`` areas, and a
-            minimum over a non-empty list is non-empty.
+        ValueError: If a declared area is missing a field, if ``spawn_from`` is unknown, or
+            if a tile declares areas but none at its route's own start level -- which means
+            the route and the areas disagree about where the course begins.
     """
     if spawn_from not in SPAWN_FROM:
         raise ValueError(f"spawn_from must be one of {list(SPAWN_FROM)}; got {spawn_from!r}")
@@ -948,20 +949,36 @@ def _freeform_spawn_table(importer, pos_jitter_m: tuple[float, float],
         route = routes[tid]
         areas = route.get("spawn_areas") or []
         if areas and spawn_from == "ground":
-            # The tile's LOWEST declared areas, not the ones at absolute ground. On every
-            # family that starts on the floor -- box2, up-into-down, varied -- the minimum IS
-            # zero and this is bit-identical to the old absolute test, so no measured number
-            # moves. On a family that cannot start on the floor it is the difference between
-            # working and refusing: the in-distribution routes are real clip tiles, and the
-            # descending ones (`stairs_down`, `jump_off_front`) spawn on the platform because
-            # a descent has no ground start. The absolute test left them with zero areas and
-            # raised, which killed all three in-distribution evals on 2026-09-10.
+            # The areas at the ROUTE'S OWN START LEVEL. This has been narrowed twice, each
+            # time toward the same rule the name has always meant: start where the course
+            # starts, never part-way along it.
             #
-            # One rule either way, and it is the rule the eval actually wants: start where the
-            # course starts, never part-way along it. A minimum over a non-empty list keeps at
-            # least one area, so this cannot fall through to the synthesised start below.
-            z_lo = min(float(a["z"]) for a in areas)
-            areas = [a for a in areas if float(a["z"]) <= z_lo + SPAWN_Z_TIE_TOL_M]
+            #   absolute z = 0  -- right on every family that starts on the floor, and it
+            #     left the descending in-distribution families (`stairs_down`,
+            #     `jump_off_front`, which spawn on a platform because a descent has no ground
+            #     start) with zero areas. It raised, killing all three in-distribution evals
+            #     on 2026-09-10.
+            #   the tile's MINIMUM z -- right whenever the course starts at its lowest point,
+            #     which every course did until a DESCENDING one existed. On `entry_stairs_down`
+            #     the start is the lobby at 1.162 m and the mid-course landing is at 0.762, so
+            #     the minimum picked the LANDING: every eval spawned past the first flight,
+            #     with 5.89 m of the declared 11.82 m course remaining, and nothing said so.
+            #   the route's `start_z` -- what both of those were approximating.
+            #
+            # Measured across every routed tile on disk when this landed: 526 of 536 have
+            # `min(area z) == route.start_z`, so this is bit-identical on all of them and no
+            # measured number moves. The 10 that differ are the descending entry stairs, which
+            # is the case it exists for.
+            z0 = float(route["start_z"])
+            at_start = [a for a in areas if abs(float(a["z"]) - z0) <= SPAWN_Z_TIE_TOL_M]
+            if not at_start:
+                raise ValueError(
+                    f"terrain {tid} declares {len(areas)} spawn area(s) but none within "
+                    f"{SPAWN_Z_TIE_TOL_M} m of its route's own start_z {z0:.3f} "
+                    f"(area z: {sorted({round(float(a['z']), 3) for a in areas})}). Falling "
+                    "back to the tile's lowest area is what put every descending eval "
+                    "part-way along its course, so this refuses instead.")
+            areas = at_start
         if not areas:
             areas = [{"x": route["start_x"], "y": route["start_y"], "z": route["start_z"],
                       "half_x": float(pos_jitter_m[0]), "half_y": float(pos_jitter_m[1]),

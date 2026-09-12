@@ -79,7 +79,11 @@ def _write_rollout(run_dir: pathlib.Path, lib: pathlib.Path, seed: int = 0) -> N
     with h5py.File(run_dir / "rollout_x.episodes.h5", "w") as h:
         for k, v in cols.items():
             h.create_dataset(k, data=v)
-        h.attrs["clip_library_path"] = str(lib)
+        # JSON-ENCODED, exactly as record_rollouts writes its whole provenance block. Writing
+        # it raw is what let the resolver's quote bug live: the attr read back as
+        # '"clips/x.h5"', every path built from it missed, and the default resolution -- the
+        # only thing that checks the map against the recording -- was dead code.
+        h.attrs["clip_library_path"] = json.dumps(str(lib))
 
 
 @pytest.fixture()
@@ -204,3 +208,32 @@ def test_the_pooled_row_moves_with_the_MIX_alone(rollouts) -> None:
     assert abs(even - box_heavy) > 0.1, (
         "the two mixes should give materially different pooled rates from identical "
         "per-family rates")
+
+
+def test_the_stamp_is_JSON_decoded_the_way_the_recorder_wrote_it(rollouts) -> None:
+    """A raw read returns the path with its quotes still on and every lookup misses."""
+    root, lib = rollouts
+    with h5py.File(next((root / "run_a").glob("*.episodes.h5")), "r") as h:
+        raw = h.attrs["clip_library_path"]
+    assert raw.startswith('"'), "the fixture no longer matches how the recorder writes it"
+    assert ttr.library_from_recording(str(root)) == str(lib)
+    assert pathlib.Path(ttr.library_from_recording(str(root))).is_file()
+
+
+def test_a_lib_that_disagrees_with_the_stamp_is_refused(rollouts, tmp_path) -> None:
+    """A SUPERSET library resolves every id and files every rate under the wrong terrain.
+
+    The unknown-id check cannot catch it -- there are no unknown ids -- so the disagreement
+    has to be caught at the source, by comparing against what the recording says it ran on.
+    """
+    root, _lib = rollouts
+    bigger = tmp_path / "superset.h5"
+    _write_library(bigger)      # same ids, different file
+    import subprocess
+
+    r = subprocess.run(
+        [sys.executable, str(_ROOT / "scripts" / "rsl_rl" / "tile_type_report.py"),
+         str(root), "--lib", str(bigger)],
+        capture_output=True, text=True)
+    assert r.returncode != 0 and "was made on" in (r.stdout + r.stderr), (
+        f"a disagreeing --lib was accepted:\n{r.stdout}\n{r.stderr}")

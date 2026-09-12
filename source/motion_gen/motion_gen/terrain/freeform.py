@@ -513,25 +513,12 @@ def _riser_slab(x0: float, x1: float, cy: float, width: float, top_z: float) -> 
     return _overlay((x0 + x1) / 2.0, cy, 0.0, max(x1 - x0, 1e-3), width, top_z)
 
 
-# ---------------------------------------------------------------------------------------------
-# The route: one straight ray per section
-# ---------------------------------------------------------------------------------------------
-#: The fields every section's ``route`` block declares, in the TILE-LOCAL CORNER frame, and the
-#: exact set the RL side reads (``mdp.events.resets.FREEFORM_ROUTE_FIELDS``).  Lengths in metres,
-#: angles in radians; ``x`` is downrange within the tile's own ``frame_yaw`` and ``y`` lateral.
+#: The route fields every free-form tile declares, mirrored by the RL side's
+#: ``mdp.events.resets.FREEFORM_ROUTE_FIELDS`` and pinned equal by a test.
 #:
-#: * ``start_x`` / ``start_y`` -- where the robot spawns.
-#: * ``start_z`` -- the WALKABLE SURFACE there, not a base height: the top of the start platform.
-#:   0.0 on flat and boxes; on stairs it follows from the geometry rule that offsets the whole
-#:   structure so its LOWEST platform top sits at z = 0.
-#: * ``start_yaw`` -- the route's heading relative to the tile frame.  0.0 = straight down the
-#:   section; non-zero is how the boxes family produces an angled approach to an axis-aligned box.
-#: * ``goal_x`` -- the downrange goal line: past it, the section has been walked.
-#: * ``goal_y`` / ``goal_half_width`` -- the goal band's lateral centre and half-extent.
-#:
-#: ``goal_z`` is emitted too, beyond this tuple: the walkable surface at the goal, which is the
-#: last platform's top on a descending or climbing stairs section.  The RL table reads only the
-#: seven, so the extra key costs it nothing.
+#: ``goal_z`` joined them in 2026-09: it was written into every manifest from the start and
+#: read by NOBODY, because ``freeform_route`` returns exactly this tuple -- so both height
+#: consumers fell back to zero and scored every goal at the tile floor.
 ROUTE_FIELDS: tuple[str, ...] = (
     "start_x", "start_y", "start_z", "start_yaw", "goal_x", "goal_y", "goal_half_width",
     # `goal_z` is the walkable surface at the goal, and it is a FIELD rather than an extra

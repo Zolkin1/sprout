@@ -113,8 +113,20 @@ def library_from_recording(root: str) -> str:
     for t in sorted(glob.glob(os.path.join(root, "*", "*.episodes.h5"))):
         with h5py.File(t, "r") as h:
             p = h.attrs.get("clip_library_path")
-            if p:
-                found.add(str(p))
+        if p is None:
+            continue
+        # JSON-DECODED. `record_rollouts` writes its whole provenance block with
+        # `json.dumps`, so the raw attr reads back as '"clips/x.h5"' -- quotes included --
+        # and every path built from it missed. That made this resolver, and with it the
+        # stamp-over-flag guard this module is built around, dead code: the only invocation
+        # that ever worked was the one passing --lib.
+        raw = p if isinstance(p, str) else p.decode()
+        try:
+            raw = json.loads(raw)
+        except (ValueError, TypeError):
+            pass
+        if raw:
+            found.add(str(raw))
     if not found:
         raise SystemExit(
             f"no *.episodes.h5 under {root!r} carries a clip_library_path stamp; pass --lib.")
@@ -204,23 +216,28 @@ def format_report(recs: dict[tuple[str, str], dict], *, metric: str, strict: boo
     for run in sorted({r for r, _ in recs}):
         fams = sorted(f for r, f in recs if r == run)
         L.append(f"  run {run}")
-        L.append(f"    {'family':<26}{'tiles':>6}{'eps':>7}{'success':>10}{'95% CI':>17}"
-                 f"{'reached':>9}{'failed':>8}{'timeout':>9}{'steps':>8}")
+        # `success` is the episode-POOLED rate; `tile` is the unweighted tile mean the
+        # interval is built from. They coincide in a balanced design and diverge under
+        # `--rounds 0` or unequal tile occupancy -- where the pooled value can sit outside its
+        # own interval -- so both are printed rather than leaving that to be discovered.
+        L.append(f"    {'family':<26}{'tiles':>6}{'eps':>7}{'success':>10}{'tile':>8}"
+                 f"{'95% CI':>17}{'reached':>9}{'failed':>8}{'timeout':>9}{'steps':>8}")
         tot_n = 0
         tot_ok = 0.0
         for f in fams:
             r = recs[(run, f)]
             s = r["success"]
+            ci = "[{:.3f}, {:.3f}]".format(s["ci_lo"], s["ci_hi"])
             L.append(
                 f"    {f:<26}{r['n_tiles']:>6}{r['n_episodes']:>7}{s['value']:>10.3f}"
-                f"{f'[{s['ci_lo']:.3f}, {s['ci_hi']:.3f}]':>17}"
+                f"{s['cluster_value']:>8.3f}{ci:>17}"
                 f"{r['reached_goal']['value']:>9.3f}{r['failed']['value']:>8.3f}"
                 f"{r['timeout']['value']:>9.3f}{r['steps_median']:>8.0f}")
             tot_n += r["n_episodes"]
             tot_ok += s["value"] * r["n_episodes"]
         # LAST and LABELLED. It is a property of the library's tile mix as much as of the
         # policy, so it is not the headline and must not be compared across libraries.
-        L.append(f"    {'-' * 92}")
+        L.append(f"    {'-' * 100}")
         L.append(f"    {'pooled over this mix':<26}{'':>6}{tot_n:>7}"
                  f"{tot_ok / max(tot_n, 1):>10.3f}"
                  f"{'(mix-dependent)':>17}")
@@ -242,7 +259,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lib", default=None,
                    help="Clip library for the family map. Defaults to the one the episode "
                         "tables say they were recorded on, which is the only one that is "
-                        "correct -- override only to reduce a copy under a different path.")
+                        "correct. A --lib whose basename differs from the stamp is REFUSED: "
+                        "a library holding a SUPERSET of the recording's tile ids resolves "
+                        "every id and prints a full table with every rate filed under the "
+                        "wrong terrain, which no check downstream can catch.")
+    p.add_argument("--force_lib", action="store_true",
+                   help="Allow a --lib that disagrees with the recording's own stamp. For "
+                        "reducing a recording whose library was renamed or moved, and for "
+                        "nothing else.")
     p.add_argument("--json", default="", help="also write the per-family records here")
     p.add_argument("--metric", choices=METRICS, default="terminal_reward",
                    help="Success rule; matches box2_ic_report's flag of the same name.")
@@ -257,6 +281,18 @@ def main() -> int:
     """Reduce and print."""
     args = parse_args()
     lib = args.lib or library_from_recording(args.root)
+    if args.lib and not args.force_lib:
+        try:
+            stamped = library_from_recording(args.root)
+        except SystemExit:
+            stamped = ""
+        if stamped and os.path.basename(stamped) != os.path.basename(args.lib):
+            raise SystemExit(
+                f"--lib names {os.path.basename(args.lib)} but the recording was made on "
+                f"{os.path.basename(stamped)}. A library with a SUPERSET of these tile ids "
+                "resolves all of them and files every rate under the wrong terrain, with a "
+                "full and plausible table to show for it. Pass --force_lib if the library "
+                "was genuinely just renamed or moved.")
     cells = load_cells(args.root, metric=args.metric,
                        strict=args.failure_rule == "strict", rounds=args.rounds)
     recs = by_family(cells, family_map(lib))

@@ -116,8 +116,17 @@ def tile_key(tile: dict) -> tuple[str, int]:
     Returns:
         ``(family, source id)``.
     """
-    return (str(tile.get("family", "?")),
-            int(tile.get("source_terrain_id", tile.get("terrain_id", -1))))
+    # NO fallback to `terrain_id`. It is renumbered on the way into a multi manifest, so a
+    # fallback would compare a renumbered id against a source id: the holdout's exclusion set
+    # would match nothing, the "already spent" refusal would never fire, and the holdout would
+    # silently overlap training -- the exact failure this key exists to prevent. Absent is an
+    # error, which is the same lesson `goal_z`'s defensive `.get` taught.
+    if "source_terrain_id" not in tile:
+        raise ValueError(
+            f"tile {tile.get('terrain_id')} ({tile.get('family')}) carries no "
+            "source_terrain_id, so it cannot be identified in its source library. "
+            "make_indist_routes.py stamps it; a tile without one did not come from there.")
+    return (str(tile.get("family", "?")), int(tile["source_terrain_id"]))
 
 
 def select_indist_tiles(source: list[dict], n: int, seed: int = 0,
@@ -344,6 +353,10 @@ def multi_goal_region_spec(counts: MultiCounts,
     """
     spec = goal_region_spec(counts.boxes, counts.updown, cfg)
     spec["provenance"]["source"] = "motion_gen.terrain.multi_courses"
+    # `varied_courses.goal_region_spec` fills `families` with ITS two-family block, which
+    # describes a library that does not exist here. Left in place it is a provenance record
+    # of the wrong thing, which is worse than none.
+    spec["provenance"].pop("families", None)
     spec["provenance"]["counts"] = {
         "boxes": counts.boxes, "updown": counts.updown,
         "entry_stairs_up": counts.entry_up, "entry_stairs_down": counts.entry_down,

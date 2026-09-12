@@ -304,3 +304,24 @@ def test_the_command_band_is_where_the_reader_looks() -> None:
     and the curb shipped a ladder under a different key for weeks and nothing read it."""
     cfg = multi_generator_config(MultiCounts(boxes=1))
     assert "commanded_speed_range_mps" in cfg["freeform"]
+
+
+def test_a_tile_without_a_source_id_is_refused_rather_than_keyed_on_its_renumbered_one() -> None:
+    """The fallback that would have made the holdout silently overlap again.
+
+    `terrain_id` is renumbered on the way into a multi manifest, so keying on it compares a
+    renumbered id against a source id: the exclusion set matches nothing, the "already spent"
+    refusal never fires, and the holdout quietly reuses the training tiles -- the exact
+    failure the exclusion exists to prevent. Same lesson as `goal_z`'s defensive `.get`.
+    """
+    src = _indist_source()
+    del src[0]["source_terrain_id"]
+    with pytest.raises(ValueError, match="no source_terrain_id"):
+        tile_key(src[0])
+
+
+def test_the_multi_spec_does_not_inherit_the_varied_librarys_family_block() -> None:
+    """It described a library that does not exist here, which is worse than no record."""
+    spec = multi_goal_region_spec(MultiCounts(boxes=2, entry_stairs=2))
+    assert "families" not in spec["provenance"]
+    assert spec["provenance"]["source"].endswith("multi_courses")

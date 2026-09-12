@@ -153,6 +153,16 @@ def _draw_goal_gates(importer: ClipTerrainImporter, spec_path: str):
         _DEBUG_GOAL_FACE_M,
     )
     from robot_rl.tasks.manager_based.robot_rl.mdp.events.resets import freeform_route
+
+    def _normalise_family(name: str) -> str:
+        """A manifest family name as the goal spec keys it."""
+        try:
+            from eval.sampler import normalize_family  # noqa: PLC0415
+
+            return normalize_family(name)
+        except Exception:
+            n = name[:-3] if name.endswith(".h5") else name
+            return n[len("family_"):] if n.startswith("family_") else n
     from robot_rl.tasks.manager_based.robot_rl.mdp.goal_region import GoalRegionSpec
 
     spec = GoalRegionSpec.load(spec_path)
@@ -189,7 +199,11 @@ def _draw_goal_gates(importer: ClipTerrainImporter, spec_path: str):
 
     # Per-tile tolerances, so a spec with per-family overrides draws each family's own band.
     order = sorted(first_env)
-    tols = [spec.for_family(fam_of.get(t, "")) for t in order]
+    # NORMALISED. `GoalRegionSpec.by_family` is keyed by `sampler.normalize_family`
+    # ("stairs_up"), while a manifest carries the raw source name ("family_stairs_up.h5"), so
+    # an un-normalised lookup misses every override and silently falls back to `default` --
+    # while the banner below still announces that overrides exist.
+    tols = [spec.for_family(_normalise_family(fam_of.get(t, ""))) for t in order]
     margin = torch.tensor([float(t.approach_margin_m) for t in tols], device=dev)
     width = torch.tensor([float(t.half_width_m) for t in tols], device=dev)
     height = torch.tensor([float(t.height_tol_m) for t in tols], device=dev)

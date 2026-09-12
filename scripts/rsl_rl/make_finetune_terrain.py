@@ -5,7 +5,7 @@
     python scripts/rsl_rl/make_finetune_terrain.py --config configs/finetune/multi.yaml
 
 One driver for all four configs, because they differ only in their tile COUNTS: boxes.yaml is
-30/0/0/0, updown.yaml 0/30/0/0, indist.yaml 0/0/0/60 and multi.yaml 20/20/6/20. Writing four
+30/0/0/0, updown.yaml 0/30/0/0, indist.yaml 0/0/0/60 and multi.yaml 20/20/10/20. Writing four
 builders would put the same join logic in four places and let them drift, which is the thing
 the shared ``motion_gen.terrain.multi_courses`` exists to stop.
 
