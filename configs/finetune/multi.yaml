@@ -44,10 +44,14 @@ ballast_flat_frac: 0.5
 # generator was fitted on. `build_ballast_dataset` tells them apart by their arrays and reads
 # each with its own loader -- they end as the same four tensors in the same loss.
 #
-# SET THIS BEFORE RUNNING CONFIG 4. The path below is a placeholder; it must name the
-# recording whose generator `--pretrained` names, or the ballast anchors the fine-tune to a
-# distribution that generator was never fitted on.
-ballast_rollout: "logs/fm_pipeline/recorded_data/recorded_LATEST.h5"
+# The v6g pre-training set: 200k windows, the `recorded_` half of the run_fm_pipeline pass
+# started 2026-09-12 against tracker 2026-09-11_11-45-14_paper_v6g_v1. Its family split is
+# 30.5% unknown (= flat) and the rest real terrain families, which is what makes a declared
+# ballast_flat_frac of 0.5 achievable here.
+#
+# It must stay the recording whose generator `--pretrained` names, or the ballast anchors the
+# fine-tune to a distribution that generator was never fitted on.
+ballast_rollout: "logs/rsl_rl/g1/2026-09-11_11-45-14_paper_v6g_v1/recorded_data/recorded_20260912_090151.h5"
 
 # 4 types, 70 tiles. The entry stairs split 5 ASCENDING / 5 DESCENDING.
 #

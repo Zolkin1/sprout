@@ -52,6 +52,18 @@ import numpy as np
 #: ``record_rollouts`` normalises them, and by exact name rather than substring: a substring
 #: test on "flat" also matches nothing today but would match any future ``flat_*`` family
 #: silently, which is the class of bug ``isaac_tile_course``'s FAMILY_KLASS table exists for.
+#:
+#: **``unknown`` is in the set on purpose, and it is the one that carries the flat windows.**
+#: A flat clip sits on a synthesised patch with no terrain-manifest entry, so it has no family
+#: to record and lands in code 0. Measured on the v6g pre-training recording
+#: (``recorded_20260912_090151.h5``, 200k windows): code 0 is 30.5% of them against the
+#: library's known ~30% flat share, and every other code names a real terrain family.
+#:
+#: That is an inference from a count, not a guarantee -- ``unknown`` means "no family was
+#: recorded", which is flat on every library built this way and would be something else on a
+#: library that failed to stamp its families at all. :func:`describe` prints the realised
+#: flat/terrain split into the run banner for exactly that reason, so a recording where the
+#: assumption does not hold shows up as a share nobody asked for rather than as nothing.
 FLAT_FAMILY_NAMES: frozenset[str] = frozenset({"flat", "family_flat", "unknown"})
 
 
