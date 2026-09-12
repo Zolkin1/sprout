@@ -458,6 +458,18 @@ class FlowMatchingConfig:
     # transposed shape are legal, so this is stated per sensor rather than once.
     # ``None`` for the height scan, which has no image shape in an FM recording.
     extero_image_hw: list[list[int]] | None = None
+
+    #: Camera names to KEEP from a depth recording, or ``None`` for all of them.
+    #:
+    #: The paper's near-only ablation. The recording holds both cameras and a camera is dropped
+    #: at dataset build (:func:`~robot_rl.flow_matching.dataset.apply_camera_subset`), so the
+    #: ablation holds the DATA fixed and varies only what the model is shown -- which is the
+    #: comparison being claimed. Re-recording near-only would vary the rollouts too.
+    #:
+    #: Stored on the checkpoint like every other resolved extero knob, so ``fm_meta``'s
+    #: ``extero_spec`` carries one camera and both simulators cast one grid without being told.
+    #: ``None`` means every camera, which is what every existing checkpoint stores.
+    extero_keep_cameras: list[str] | None = None
     # Output channels per stride-2 k3p1 convolution; ``len`` sets the depth, so it sets how
     # many times the image is halved. Three entries take 26x30 to 4x4; a fourth reaches 2x2
     # natively, which is the CHEAPER way to shrink the sequence (pooling pays for the

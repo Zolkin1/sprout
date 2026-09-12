@@ -54,6 +54,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     MEASURED_HISTORY_FALLBACK,
     FlowMatchingTransformer,
     FutureStateDataset,
+    apply_camera_subset,
     build_train_val,
     resolve_skip_families,
     flow_matching_loss,
@@ -111,6 +112,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                         help="N autoregressive context tokens: the reference-window nodes the "
                              "generator emitted at the N previous control steps. Needs a "
                              "recording with history_len >= N + 1.")
+    parser.add_argument(
+        "--extero_keep_cameras", type=str, default="",
+        help="Comma-separated camera names to KEEP (e.g. 'near'). Empty keeps every camera, "
+             "which is what every run before this did. The recording holds both, so this drops "
+             "one at dataset build: the near-only ABLATION then varies what the model is shown "
+             "and nothing else, where re-recording near-only would vary the rollouts too. "
+             "Fewer cameras means fewer extero tokens and no sensor-type embedding, so the "
+             "resulting checkpoint is deliberately not loadable into a two-camera model.")
     parser.add_argument("--extero_source", type=str, default=FlowMatchingConfig().extero_source,
                         choices=list(EXTERO_SOURCES),
                         help="Which recorded exteroception feeds the conditioning tokens. "
@@ -862,6 +871,13 @@ def main() -> None:
     cfg.dt = float(args.dt) if args.dt is not None else float(meta.dt)
     print(f"[auto] target_source={cfg.target_source}, cmd_array={cfg.cmd_array or 'none'}, "
           f"skip_families={cfg.skip_families or 'none'}")
+    # CAMERA SUBSET, before anything derives a sensor count. Downstream everything reads the
+    # shape of `data` and the contract on `meta`, so slicing both here is the whole change --
+    # tokens, the per-sensor angular position embedding, the xyz unprojection and the exported
+    # extero_spec all follow from it. A no-op (and not even a copy) when nothing is dropped.
+    cfg.extero_keep_cameras = (
+        [c.strip() for c in str(args.extero_keep_cameras).split(",") if c.strip()] or None)
+    data, meta = apply_camera_subset(data, meta, cfg.extero_keep_cameras, cfg.extero_source)
     train_ds, val_ds = build_train_val(data, meta, cfg)
     num_joints = train_ds.num_joints
     print(f"[INFO] window blocks={list(train_ds.blocks)} -> {cfg.state_dim}/node "
