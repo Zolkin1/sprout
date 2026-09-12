@@ -52,6 +52,13 @@ parser.add_argument("--flat_buffer", type=float, default=None,
 parser.add_argument("--textured", action="store_true",
                     help="Use the training marble MDL material (needs nucleus); default = plain gray.")
 parser.add_argument("--max_steps", type=int, default=0, help="If >0, step this many then exit (headless smoke).")
+parser.add_argument("--goals", default=None, metavar="goal_regions.json",
+                    help="Draw each tile's GOAL REGION as a translucent cyan gate -- the near "
+                         "face the robot has to cross, spanning the lateral and height bands "
+                         "the spec declares. The region is a downrange HALF-PLANE, so "
+                         "everything past the gate is inside it. Free-form (manifest) tiles "
+                         "only: a clip library's goal is the clip's own terminal pose and "
+                         "there is no clip here to ask.")
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -108,6 +115,133 @@ def _report_distribution(importer: ClipTerrainImporter, lib_path: str) -> None:
         print(f"    {fam:44s}: {c:4d} tiles")
     print("=" * 74 + "\n")
     sys.stdout.flush()   # Kit closes the process hard on exit; flush or the block-buffered report is lost
+
+
+def _draw_goal_gates(importer: ClipTerrainImporter, spec_path: str):
+    """Draw one goal gate per free-form tile, and return the marker set (or ``None``).
+
+    What is drawn is exactly what ``goal_region.in_goal`` tests, read through the same code
+    the runtime reads it through -- ``freeform_route`` for the route row and the tile frame,
+    ``GoalRegionSpec`` for the tolerances -- so a gate in the wrong place here means the
+    SCORING is in the wrong place, which is the only reason to look at it.
+
+    Three things about the geometry are easy to get wrong and are worth knowing while looking:
+
+    * The region is a downrange **half-plane**, not a box. The gate is the near FACE; every
+      point past it, to the end of the tile, is inside.
+    * The datum is a **PELVIS height**, not the walkable surface. ``route.goal_z`` is the
+      surface, and the anchor adds the robot's standing height -- the same quantity the spawn
+      adds to ``start_z`` -- so the band is centred where a standing robot's base would be.
+      Drawn against the surface it would look half a metre too low and be correct.
+    * Per-family overrides ARE honoured here (``spec.for_family``), unlike the in-env gate in
+      ``MotionSequenceCommand``, which draws the default set only.
+
+    Args:
+        importer: The assembled :class:`ClipTerrainImporter`.
+        spec_path: Path to a ``goal_regions.json``.
+
+    Returns:
+        The :class:`VisualizationMarkers`, kept alive by the caller, or ``None`` if no tile
+        carries a route.
+    """
+    from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+    from isaaclab.utils.math import quat_from_angle_axis
+
+    from robot_rl.assets.robots.g1_21j import G1_CFG
+    from robot_rl.tasks.manager_based.robot_rl.mdp.commands.traj_tracking.motion_sequence_cmd import (
+        _DEBUG_GOAL_COLOR,
+        _DEBUG_GOAL_FACE_M,
+    )
+    from robot_rl.tasks.manager_based.robot_rl.mdp.events.resets import freeform_route
+    from robot_rl.tasks.manager_based.robot_rl.mdp.goal_region import GoalRegionSpec
+
+    spec = GoalRegionSpec.load(spec_path)
+    fam_of = _family_by_terrain_id(args.lib)
+
+    # One representative env per distinct tile: envs are round-robin over tiles, so a per-env
+    # draw would stack dozens of identical gates on each tile.
+    dev = importer.env_terrain_id.device
+    tids = importer.env_terrain_id.cpu().tolist()
+    first_env: dict[int, int] = {}
+    for i, t in enumerate(tids):
+        if t >= 0 and t not in first_env:
+            first_env[int(t)] = i
+    if not first_env:
+        print("[view_terrain_isaac] --goals: no tile carries a route block (a clip library's "
+              "goal is the clip's own terminal pose); nothing drawn.")
+        return None
+
+    env_ids = torch.tensor(sorted(first_env.values()), dtype=torch.long, device=dev)
+    route = freeform_route(importer, env_ids)
+    yaw = route["frame_yaw"]
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+    gx, gy = route["goal_x"], route["goal_y"]
+    gz = route["goal_z"]
+    corner = route["corner"]
+
+    # The standing height, off the asset cfg -- the same number `default_root_pose` carries and
+    # that `reset_on_freeform_section` adds to `start_z`. Read rather than restated: a goal
+    # datum that disagreed with the spawn's by even a few cm would put the whole band off.
+    stand_z = float(G1_CFG.init_state.pos[2])
+    anchor = torch.stack((corner[:, 0] + cos_y * gx - sin_y * gy,
+                          corner[:, 1] + sin_y * gx + cos_y * gy,
+                          corner[:, 2] + gz + stand_z), dim=-1)
+
+    # Per-tile tolerances, so a spec with per-family overrides draws each family's own band.
+    order = sorted(first_env)
+    tols = [spec.for_family(fam_of.get(t, "")) for t in order]
+    margin = torch.tensor([float(t.approach_margin_m) for t in tols], device=dev)
+    width = torch.tensor([float(t.half_width_m) for t in tols], device=dev)
+    height = torch.tensor([float(t.height_tol_m) for t in tols], device=dev)
+
+    # The boundary sits `approach_margin_m` SHORT of the anchor, along the TERRAIN frame's
+    # downrange axis -- not along world x, which is the same thing only on tiles facing that way.
+    centre = anchor.clone()
+    centre[:, 0] -= margin * cos_y
+    centre[:, 1] -= margin * sin_y
+
+    # A height tolerance of 0 means the test is OFF, not "a zero-thickness band" -- so draw a
+    # full-height gate there rather than an invisible one, which would read as a missing gate.
+    face_h = torch.where(height > 0.0, 2.0 * height, torch.full_like(height, 4.0))
+    scales = torch.stack(
+        (torch.full_like(width, _DEBUG_GOAL_FACE_M), 2.0 * width, face_h), dim=-1)
+
+    markers = VisualizationMarkers(VisualizationMarkersCfg(
+        prim_path="/Visuals/terrain_goal_regions",
+        markers={"goal_gate": sim_utils.CuboidCfg(
+            size=(1.0, 1.0, 1.0),
+            visual_material=sim_utils.PreviewSurfaceCfg(
+                diffuse_color=_DEBUG_GOAL_COLOR, opacity=0.25))},
+    ))
+    world_z = torch.tensor([0.0, 0.0, 1.0], device=dev).expand(yaw.shape[0], 3)
+    markers.set_visibility(True)
+    markers.visualize(translations=centre,
+                      orientations=quat_from_angle_axis(yaw, world_z),
+                      scales=scales)
+
+    t0 = tols[0]
+    print(f"  --- goal regions from {spec_path} ---")
+    print(f"    gates drawn        : {len(order)} (one per tile)")
+    print(f"    default tolerances : margin {t0.approach_margin_m:.2f} m, half-width "
+          f"{t0.half_width_m:.2f} m, height {t0.height_tol_m:.2f} m"
+          + ("  [height test OFF]" if t0.height_tol_m <= 0 else ""))
+    if spec.by_family:
+        print(f"    per-family overrides: {', '.join(sorted(spec.by_family))}")
+    print(f"    pelvis datum       : surface + {stand_z:.3f} m standing height")
+    # Per tile while the list is short enough to read: with an ascending and a descending
+    # variant of one course the INTERESTING thing is that their gates sit at different
+    # heights, which a single summary row hides.
+    if len(order) <= 12:
+        for i, tid in enumerate(order):
+            print(f"    tile {tid:<3d} {fam_of.get(tid, '?'):<16s}: gate "
+                  f"{[round(v, 3) for v in centre[i].tolist()]}  "
+                  f"half-width {float(width[i]):.2f}  height +-{float(height[i]):.2f}")
+    else:
+        zs = centre[:, 2]
+        print(f"    gate heights       : {float(zs.min()):.3f} .. {float(zs.max()):.3f} m")
+    print("=" * 74 + "\n")
+    sys.stdout.flush()
+    return markers
 
 
 def main() -> None:
@@ -174,6 +308,14 @@ def main() -> None:
     sim.set_camera_view(eye=(center[0] - 8.0, center[1] - 14.0, 12.0), target=(center[0], center[1], 0.0))
 
     sim.reset()
+
+    # After `sim.reset()`: the marker prims need the stage up, and `visualize` writes through
+    # a point instancer that a reset would otherwise clear.
+    # The reference is HELD, not discarded: dropping it lets the marker object be collected
+    # and the gates disappear from the stage a few frames later, which reads as a goal region
+    # that was never drawn.
+    goal_markers = _draw_goal_gates(importer, args.goals) if args.goals else None  # noqa: F841
+
     print("[view_terrain_isaac] terrain up. Orbit in the GUI; Ctrl-C to quit.", flush=True)
     steps = 0
     while simulation_app.is_running():
