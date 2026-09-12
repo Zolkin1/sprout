@@ -34,6 +34,13 @@ num_envs: 2048
 # because a terrain course contains none and flat is 30% of the pre-training library.
 ballast_chunks: 2000
 ballast_flat_frac: 0.5
+# WHICH recording. The pre-training set the shipped generator was actually fitted on -- the
+# `recorded_*.h5` half of run_fm_pipeline.sh's output, NOT the augmented one: the augmented
+# file is the same rollouts re-rendered with clutter, so drawing ballast from it would carry
+# the augmentation's distribution rather than the pre-training one. Set this to the recording
+# whose generator `pretrained` names, or the ballast anchors to a distribution that generator
+# was never fitted on.
+ballast_rollout: "logs/fm_pipeline/recorded_data/recorded_LATEST.h5"
 
 # 4 types, 70 tiles. The entry stairs split 5 ASCENDING / 5 DESCENDING.
 #

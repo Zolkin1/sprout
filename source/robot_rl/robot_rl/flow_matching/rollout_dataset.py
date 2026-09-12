@@ -218,6 +218,72 @@ class RolloutWindowDataset(Dataset):
         return {name: int((lab == i).sum()) for i, name in enumerate(LABEL_NAMES)}
 
 
+class ConcatWindowDataset(Dataset):
+    """Several :class:`RolloutWindowDataset` read as one, for BALLAST.
+
+    The fine-tune trains on the AWR buffer plus a fixed slice of the ORIGINAL pre-training
+    windows, and those live in a different file. Concatenating the FILES was the obvious
+    alternative and is the worse one: the join key downstream is ``(episode_uid,
+    replan_index)`` and a merge would have to renumber the ballast into a uid range no
+    iteration can ever reach, which is a correctness property nothing checks and one bad
+    offset makes a ballast window indistinguishable from a graded one. Keeping the files
+    apart makes the exclusion STRUCTURAL: ``fit_value`` and ``label_advantage`` are never
+    pointed at the ballast file, so it cannot enter the critic or the advantage however the
+    loop is wired.
+
+    Only what the fine-tune loop actually calls is proxied -- length, indexing and the label
+    banner. It is deliberately not a general concatenation: the parts must agree on the
+    model context, which is checked, because two window files from different checkpoints
+    would differ in window WIDTH and the mismatch would surface as a shape error inside a
+    worker rather than here.
+
+    Attributes:
+        parts: The datasets, in order.
+    """
+
+    def __init__(self, parts: "list[RolloutWindowDataset]") -> None:
+        """Hold the parts and index them end to end.
+
+        Args:
+            parts: One or more datasets. The first is the primary; its context defines what
+                the others must match.
+
+        Raises:
+            ValueError: If no part is given, or two parts disagree on the window geometry.
+        """
+        if not parts:
+            raise ValueError("a ConcatWindowDataset needs at least one part.")
+        first = parts[0]
+        for p in parts[1:]:
+            if (p.extero_shape, p.cmd_dim) != (first.extero_shape, first.cmd_dim):
+                raise ValueError(
+                    f"{p.path} holds extero {p.extero_shape} / cmd {p.cmd_dim} against "
+                    f"{first.path}'s {first.extero_shape} / {first.cmd_dim}. These are two "
+                    "different recordings and the mismatch would surface inside a worker.")
+        self.parts = list(parts)
+        self._sizes = np.array([len(p) for p in self.parts], dtype=np.int64)
+        self._offsets = np.concatenate([[0], np.cumsum(self._sizes)])
+
+    def __len__(self) -> int:
+        """Windows across every part."""
+        return int(self._offsets[-1])
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        """One window, from whichever part holds index ``i``."""
+        if i < 0:
+            i += len(self)
+        k = int(np.searchsorted(self._offsets, i, side="right") - 1)
+        return self.parts[k][int(i - self._offsets[k])]
+
+    def label_counts(self) -> dict[str, int]:
+        """Labels across every part, for the run banner."""
+        out: dict[str, int] = {}
+        for p in self.parts:
+            for k, v in p.label_counts().items():
+                out[k] = out.get(k, 0) + v
+        return out
+
+
 def join_labels(sidecar: dict[str, np.ndarray], episode_uid: np.ndarray,
                 replan_index: np.ndarray) -> np.ndarray:
     """Expand a label sidecar onto every row of the window file, on ``(uid, replan)``.

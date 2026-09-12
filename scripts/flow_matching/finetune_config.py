@@ -57,6 +57,11 @@ _SCHEMA: dict[str, tuple] = {
     # are the ones a terrain course contains none of.
     "ballast_chunks": ("int", 1),
     "ballast_flat_frac": ("float", 1),
+    # WHICH recording the ballast comes from. Empty when ``ballast_chunks`` is 0, and
+    # required otherwise: a count with no source is the shape of half-configured run this
+    # loader exists to refuse, and the loop would either fail deep inside training or -- worse
+    # -- fall back to a default and carry ballast from some other distribution entirely.
+    "ballast_rollout": ("str", 1),
 
     # -- the course mix, for a multi-terrain library ---------------------------------------
     # Tile counts per type. A single-terrain config sets its own type and zeroes the rest,
@@ -214,6 +219,21 @@ def load_finetune_config(path: str) -> SimpleNamespace:
         raise SystemExit(f"fine-tune config {path}: updown_measured_frac must be in [0, 1]")
     if not (0.0 <= out["ballast_flat_frac"] <= 1.0):
         raise SystemExit(f"fine-tune config {path}: ballast_flat_frac must be in [0, 1]")
+    if out["ballast_chunks"] > 0 and not out["ballast_rollout"].strip():
+        raise SystemExit(
+            f"fine-tune config {path}: ballast_chunks is {out['ballast_chunks']} but "
+            "ballast_rollout is empty. The ballast is a slice of a SPECIFIC pre-training "
+            "recording -- which one is part of what the run was, and it is invisible in the "
+            "buffer, the labels and the sidecar.")
+    if out["ballast_chunks"] == 0 and out["ballast_rollout"].strip():
+        raise SystemExit(
+            f"fine-tune config {path}: ballast_rollout names "
+            f"{out['ballast_rollout']!r} but ballast_chunks is 0, so nothing would be drawn "
+            "from it. One of the two was meant to change.")
+    if out["ballast_chunks"] == 0 and out["ballast_flat_frac"] > 0.0:
+        raise SystemExit(
+            f"fine-tune config {path}: ballast_flat_frac is {out['ballast_flat_frac']} with "
+            "ballast_chunks 0, which declares a mixture of nothing.")
     if out["tiles_updown"] > 0 and not out["updown_cells"] and not out["updown_measured_cells"]:
         raise SystemExit(
             f"fine-tune config {path}: tiles_updown is {out['tiles_updown']} but no stair cells "
@@ -250,6 +270,7 @@ def as_env(cfg: SimpleNamespace) -> dict[str, str]:
         "NENV": str(cfg.num_envs),
         "BALLAST_CHUNKS": str(cfg.ballast_chunks),
         "BALLAST_FLAT_FRAC": str(cfg.ballast_flat_frac),
+        "BALLAST_ROLLOUT": cfg.ballast_rollout,
     }
 
 

@@ -19,6 +19,7 @@ num_envs: 2048
 
 ballast_chunks: 0
 ballast_flat_frac: 0.0
+ballast_rollout: ""
 
 tiles_boxes: 0
 tiles_updown: 30

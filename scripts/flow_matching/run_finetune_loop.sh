@@ -564,10 +564,21 @@ for (( it=1; it<=ITERS; it++ )); do
   # was the one `is_plain_arm`'s own docstring warned would be missed.
   bc)  ALGO_ARGS=(--unconditioned);;
     esac
+    # BALLAST rides on every ALGO. It is not an algorithm choice -- the ladder's four arms
+    # differ in how the GRADED rows are weighted, and the ballast rows are ungraded -- so
+    # putting it in ALGO_ARGS would make one arm's data set differ from another's, which is
+    # exactly the property test_finetune_loop_algos.py pins by parsing this file.
+    BALLAST_ARGS=()
+    if [ "${BALLAST_CHUNKS:-0}" -gt 0 ]; then
+      [ -n "${BALLAST_ROLLOUT:-}" ] || fail "BALLAST_CHUNKS is set but BALLAST_ROLLOUT is not" "$it"
+      BALLAST_ARGS=(--ballast "$BALLAST_ROLLOUT" --ballast_chunks "$BALLAST_CHUNKS"
+                    --ballast_flat_frac "${BALLAST_FLAT_FRAC:-0.0}")
+    fi
     "$PY" -u scripts/flow_matching/finetune_generator.py --no_wandb \
       --pretrained "$POLICY" \
       --rollout "${BUF_STEM}.h5" \
       "${ALGO_ARGS[@]}" \
+      "${BALLAST_ARGS[@]}" \
       --batch_size 256 --num_workers "$WORKERS" \
       --epochs "$EPOCHS_FT" --ckpt_every 1 --device cuda \
       --out "$FT" > "$ITD/ft.log" 2>&1 || fail "finetune (see $ITD/ft.log)" "$it"
