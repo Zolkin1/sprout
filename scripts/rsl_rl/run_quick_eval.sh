@@ -212,3 +212,26 @@ else
   echo "[eval] $AXIS: no scalar axis on this course; cells are labelled by tile index"
   $PY scripts/rsl_rl/box2_ic_report.py "$OUT"
 fi
+
+# PER TILE TYPE, on any library holding more than one family. The report above reduces per
+# TILE, which on a multi-terrain library is 70 rows nobody reads, and its marginals pool across
+# families -- a pooled rate over a mix moves when the MIX moves, with no policy change at all.
+# Skipped rather than failed on a single-family library: there the two reports are the same
+# number, so it would be a second copy of the row above.
+NFAM=$($PY - "$CLIP" <<'PYEOF'
+import json, sys
+import h5py
+try:
+    with h5py.File(sys.argv[1], "r") as f:
+        raw = f.attrs.get("terrain_manifest")
+    man = json.loads(raw if isinstance(raw, str) else raw.tobytes().decode()) if raw is not None else []
+    print(len({str(t.get("family") or "?") for t in man}))
+except Exception:
+    print(0)
+PYEOF
+)
+if [ "${NFAM:-0}" -gt 1 ]; then
+  echo "[eval] $NFAM tile types in $CLIP -- per-type breakdown:"
+  $PY scripts/rsl_rl/tile_type_report.py "$OUT" --lib "$CLIP" \
+      --json "$OUT/by_tile_type.json"
+fi
