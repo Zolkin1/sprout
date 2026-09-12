@@ -43,6 +43,8 @@ TASK=${TASK:-G1-teacher-clf-terrain-depth}
 EXTRA_TRAIN=${EXTRA_TRAIN:---wandb}
 
 REC_DIR="$RUN_DIR/recorded_data"
+# Both are REASSIGNED after the record stage, from the name record_data actually wrote. These
+# are only here so the refusals below can name a path before anything exists.
 STAMP=$(date +%Y%m%d_%H%M%S)
 RECORDED="$REC_DIR/recorded_${STAMP}.h5"
 AUGMENTED="$REC_DIR/augmented_${STAMP}.h5"
@@ -82,8 +84,13 @@ $PY scripts/rsl_rl/record_data.py \
     --clip_draw cycle \
     --headless
 
-# record_data timestamps its own output; adopt whatever it just wrote.
+# record_data timestamps its own output with ITS OWN clock, which is minutes later than this
+# script's. So adopt what it actually wrote -- and name the augmentation after THAT, not after
+# our start stamp. Otherwise the pair carries two different timestamps, and the next person
+# matching a recording to its augmentation by name pairs the wrong two files; the FM's own
+# data.yaml records both paths, so the mismatch looks authoritative rather than cosmetic.
 RECORDED=$(ls -t "$REC_DIR"/recorded_*.h5 | head -1)
+AUGMENTED="$REC_DIR/augmented_$(basename "$RECORDED" .h5 | sed 's/^recorded_//').h5"
 say "recorded: $RECORDED"
 
 # THE check worth doing by hand once: two cameras, not one.
