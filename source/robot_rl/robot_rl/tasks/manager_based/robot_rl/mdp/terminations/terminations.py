@@ -544,10 +544,10 @@ def freeform_goal_reached(
         # plus the asset's nominal root height -- the same three terms
         # `freeform_goal_anchor_world` sums, so the line the episode ends on and the anchor the
         # outcome is folded against cannot disagree about where "there" is.
-        gz = route.get("goal_z")
+        # Indexed rather than `.get(..., 0)`: the defensive read meant this datum was the tile
+        # FLOOR on every library, since `goal_z` was not a route field at all.
+        gz = route["goal_z"].to(root_pos_w.device)
         nominal_z = wp.to_torch(asset.data.default_root_pose)[:, 2].to(root_pos_w.device)
-        goal_h = (route["corner"][:, 2].to(root_pos_w.device) + nominal_z
-                  + (gz.to(root_pos_w.device) if gz is not None
-                     else torch.zeros_like(nominal_z)))
+        goal_h = route["corner"][:, 2].to(root_pos_w.device) + nominal_z + gz
         hit = hit & ((root_pos_w[:, 2] - goal_h).abs() <= float(height_tol_m))
     return hit

@@ -271,10 +271,12 @@ def freeform_goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
     yaw = route["frame_yaw"]
     cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
     gx, gy = route["goal_x"], route["goal_y"]
-    # `goal_z` rides beyond FREEFORM_ROUTE_FIELDS, so read it defensively: a library written
-    # before it existed still has a usable x/y goal, and the height term is the one the
-    # termination does not test either.
-    gz = route.get("goal_z")
+    # Indexed, NOT `.get(..., 0)`. It used to ride beyond FREEFORM_ROUTE_FIELDS and be read
+    # defensively -- which meant it was read as absent on EVERY library, so the anchor sat at
+    # the tile floor no matter how high the goal was. `_freeform_route_table` refuses a route
+    # missing any field, so an indexing read turns that into a loud error at load instead of a
+    # height band centred a metre low.
+    gz = route["goal_z"]
     corner = route["corner"]
     # **The anchor is a PELVIS height, not a ground height**, because that is what the clip
     # anchor is -- `goal_anchor_world` returns the clip's terminal BASE pose -- and
@@ -291,8 +293,7 @@ def freeform_goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
     nominal_z = wp.to_torch(asset.data.default_root_pose)[:, 2].to(dev)
     pos = torch.stack((corner[:, 0] + cos_y * gx - sin_y * gy,
                        corner[:, 1] + sin_y * gx + cos_y * gy,
-                       corner[:, 2] + (gz if gz is not None else torch.zeros_like(gx))
-                       + nominal_z), dim=-1)
+                       corner[:, 2] + gz + nominal_z), dim=-1)
     return pos, yaw.to(pos.device)
 
 

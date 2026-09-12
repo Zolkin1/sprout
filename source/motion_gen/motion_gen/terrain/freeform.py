@@ -534,6 +534,13 @@ def _riser_slab(x0: float, x1: float, cy: float, width: float, top_z: float) -> 
 #: seven, so the extra key costs it nothing.
 ROUTE_FIELDS: tuple[str, ...] = (
     "start_x", "start_y", "start_z", "start_yaw", "goal_x", "goal_y", "goal_half_width",
+    # `goal_z` is the walkable surface at the goal, and it is a FIELD rather than an extra
+    # because both consumers need it and neither could get it: `freeform_route` builds its
+    # dict from this tuple alone, so their `route.get("goal_z")` read `None` on every library
+    # ever built and silently fell back to zero -- scoring every goal as though it sat at the
+    # tile's own floor. Invisible wherever a traverse ends on the ground (the box and
+    # up-into-down courses, where zero IS the answer) and fatal the moment one does not.
+    "goal_z",
 )
 
 #: Floor on a goal band's half-width (m).  The band is otherwise half the WALKABLE surface at the
@@ -712,8 +719,8 @@ def _route(start_xy: tuple[float, float], start_z: float, start_yaw: float,
             library needs regenerating to keep working.
 
     Returns:
-        The route dict, carrying :data:`ROUTE_FIELDS` plus ``goal_z`` and, when given,
-        ``spawn_areas``.  The consuming table reads only :data:`ROUTE_FIELDS` and ignores
+        The route dict, carrying :data:`ROUTE_FIELDS` and, when given,
+        ``spawn_areas``.  The consuming table reads :data:`ROUTE_FIELDS` and ignores
         extra keys, which is what lets a list ride inside a block of scalars.
     """
     out = {"start_x": float(start_xy[0]), "start_y": float(start_xy[1]),

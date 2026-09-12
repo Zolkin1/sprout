@@ -722,6 +722,10 @@ def reset_on_terrain_motion_sequence(
 #: * ``goal_y`` / ``goal_half_width`` -- the goal band's lateral centre and half-extent.
 FREEFORM_ROUTE_FIELDS: tuple[str, ...] = (
     "start_x", "start_y", "start_z", "start_yaw", "goal_x", "goal_y", "goal_half_width",
+    # See `motion_gen.terrain.freeform.ROUTE_FIELDS`, which this mirrors: `goal_z` was written
+    # into every manifest and read by nobody, because this tuple is what `freeform_route`
+    # returns. Both height consumers fell back to zero without saying so.
+    "goal_z",
 )
 
 
