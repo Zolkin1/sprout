@@ -95,4 +95,55 @@ TEST(FmMeta, APreRenameGraphIsRefusedJustAsThePythonRefusesIt) {
 }
 
 }  // namespace
+
+// --- THE RIG -----------------------------------------------------------------------------
+//
+// Since `efe93b4e` the POLICY reads the near camera alone while the GENERATOR reads both, so
+// `fm_meta.extero_spec` is the only artifact naming the whole rig and the tracker's
+// `depth_camera_spec` is a SUBSET of it. Sizing the generator's row off the tracker's list
+// left the missing camera's plane at 0.0 with nothing raising -- an absent cloud that looks
+// exactly like a plausible one.
+
+/// One camera's contract block, with the fields the shared parser requires.
+std::string Cam(const std::string& obs_term, int width, int height) {
+  return R"({"obs_term":")" + obs_term + R"(","sensor":"cam_)" + obs_term +
+         R"(","mount_body":"torso_link","width":)" + std::to_string(width) +
+         R"(,"height":)" + std::to_string(height) +
+         R"(,"offset":0.0,"scale":1.0,"min_dist":0.1,"max_dist":10.0,)" +
+         R"("min_clip_val":-1.0,"max_clip_val":1.0,"fx":12.0,"fy":18.0,"cx":15.0,"cy":13.0})";
+}
+
+TEST(FmMeta, TheGeneratorCarriesTheWholeRig) {
+  const FmMeta m = ParseFmMeta(Meta(
+      R"("extero_source":"depth","extero_sensor_count":2,"extero_sensor_dim":3900,)"
+      R"("extero_channels":5,"extero_clip":5.575,"extero_spec":[)" +
+      Cam("depth_near", 30, 26) + "," + Cam("depth_far", 30, 26) + "]"));
+  ASSERT_EQ(m.cameras.size(), 2u);
+  EXPECT_EQ(m.cameras[0].obs_term, "depth_near");
+  EXPECT_EQ(m.cameras[1].obs_term, "depth_far");
+  // Parsed with the SAME parser the tracker's block uses, so the geometry survives too -- a
+  // camera whose intrinsics were dropped here unprojects to the wrong place, silently.
+  EXPECT_DOUBLE_EQ(m.cameras[0].fx, 12.0);
+  EXPECT_EQ(m.cameras[0].width, 30);
+}
+
+TEST(FmMeta, ARigThatDisagreesWithTheDeclaredCountIsRefused) {
+  // The row is SIZED from extero_sensor_count and FILLED from the list. Disagreeing means one
+  // camera's worth of the row is never written and stays zero.
+  EXPECT_THROW(ParseFmMeta(Meta(
+                   R"("extero_source":"depth","extero_sensor_count":2,)"
+                   R"("extero_sensor_dim":3900,"extero_channels":5,"extero_clip":5.575,)"
+                   R"("extero_spec":[)" + Cam("depth_near", 30, 26) + "]")),
+               std::runtime_error);
+}
+
+TEST(FmMeta, AScanGeneratorNamesNoCamerasAndThatIsNotAnError) {
+  // extero_spec holds a camera list for one generator and a ray grid for another. A scan
+  // generator has no cameras and needs none; the depth path refuses an empty rig at the point
+  // of USE, where the reason is specific, rather than here where it would also catch this.
+  const FmMeta m = ParseFmMeta(Meta(
+      R"("extero_source":"height_scan","extero_sensor_count":1,"extero_sensor_dim":176)"));
+  EXPECT_TRUE(m.cameras.empty());
+}
+
 }  // namespace g1_deploy

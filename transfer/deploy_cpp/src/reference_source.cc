@@ -50,11 +50,38 @@ void FmReferenceSource::BuildConditioning(const HardwareReadings& readings) {
           "frame (fm_camera_pos / fm_camera_rot, one per camera in contract order). Build "
           "it from FK to the mount plus the IMU's roll/pitch -- never odometry.");
     }
+    // THE GENERATOR'S OWN CAMERAS, not the tracker's.
+    //
+    // Since `efe93b4e` the policy reads the near camera alone while the generator reads both,
+    // so `params_.depth_cameras` is a SUBSET of the rig. Looping it here sized the row from
+    // the generator's metadata but FILLED it from the tracker's list, so the far camera's
+    // plane stayed 0.0 -- an absent cloud that looks exactly like a plausible one, with
+    // nothing raising. Readings arrive in RIG order (see HardwareReadings::depth_raw), which
+    // is this list, so the index is direct.
+    const std::vector<DepthCameraSpec>& rig = fm_->meta().cameras;
+    // Absent rather than wrong: a contract exported before extero_spec existed parses fine and
+    // is refused HERE, where the reason is specific, rather than at parse time, where it would
+    // also refuse the scan generators and the metadata-only readers that never need a camera.
+    if (rig.empty()) {
+      throw std::runtime_error(
+          "fm.onnx conditions on depth but its fm_meta carries no extero_spec, so nothing here "
+          "knows which cameras the generator reads or where they are mounted. The tracker's own "
+          "list cannot stand in -- the policy reads the near camera alone and this is the whole "
+          "rig. Re-export with scripts/flow_matching/export_fm_onnx.py.");
+    }
+    if (readings.depth_raw.size() != rig.size()) {
+      throw std::runtime_error(
+          "the generator conditions on " + std::to_string(rig.size()) +
+          " camera(s) (fm_meta.extero_spec) but " + std::to_string(readings.depth_raw.size()) +
+          " reading(s) were supplied. Readings are in the GENERATOR's contract order -- the "
+          "whole rig -- and the tracker takes its subset of them by name; supplying only the "
+          "tracker's cameras is what left a camera reading as zeros.");
+    }
     std::vector<CameraGeom> geoms;
     std::vector<std::vector<double>> normalised;
     std::vector<const double*> images, positions, rotations;
     for (size_t c = 0; c < readings.depth_raw.size(); ++c) {
-      const CameraGeom g = GeomFromSpec(params_.depth_cameras[c]);
+      const CameraGeom g = GeomFromSpec(rig[c]);
       geoms.push_back(g);
       normalised.emplace_back(readings.depth_raw[c].size());
       NormalizeDepthImage(readings.depth_raw[c].data(), readings.depth_raw[c].size(), g.norm,
@@ -71,7 +98,9 @@ void FmReferenceSource::BuildConditioning(const HardwareReadings& readings) {
   size_t at = 0;
   for (size_t c = 0; channels == 1 && c < readings.depth_raw.size() && at < cond.extero.size();
        ++c) {
-    const CameraGeom g = GeomFromSpec(params_.depth_cameras[c]);
+    // Same rule on the 1-channel path: the generator's list, never the tracker's subset.
+    const CameraGeom g = GeomFromSpec(fm_->meta().cameras.empty() ? params_.depth_cameras[c]
+                                                                 : fm_->meta().cameras[c]);
     for (double v : readings.depth_raw[c]) {
       if (at >= cond.extero.size()) break;
       cond.extero[at++] = NormalizeDepth(v, g.norm);

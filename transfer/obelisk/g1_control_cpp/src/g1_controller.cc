@@ -415,7 +415,7 @@ void G1Controller::SetupCameraFk() {
                 "the generator reads depth alone (1 channel); no camera FK needed");
     return;
   }
-  const auto& cams = policy_->params().depth_cameras;
+  const auto& cams = policy_->rig_cameras();
   if (cams.empty()) {
     // A scan generator on a camera-less tracker: the xyz channels are the SCAN's, and it
     // carries its own metric coordinates. Nothing to FK.
@@ -443,19 +443,22 @@ void G1Controller::SetupCameraFk() {
 }
 
 void G1Controller::SetupDepth() {
-  const auto& cams = policy_->params().depth_cameras;
+  const auto& cams = policy_->rig_cameras();
   if (cams.empty()) {
     if (!depth_topics_.empty()) {
       RCLCPP_WARN(this->get_logger(),
-                  "depth_topics is set but this policy reads no depth cameras; ignoring");
+                  "depth_topics is set but this deployment publishes no depth cameras; "
+                  "ignoring");
     }
     return;
   }
   if (depth_topics_.size() != cams.size()) {
     throw std::runtime_error(
-        "this policy reads " + std::to_string(cams.size()) + " depth camera(s) but " +
+        "this deployment publishes " + std::to_string(cams.size()) + " depth camera(s) but " +
         std::to_string(depth_topics_.size()) +
-        " topic(s) are configured. The order is the CONTRACT order from the artifact metadata, "
+        " topic(s) are configured. The list is the RIG -- the GENERATOR's cameras when one is "
+        "loaded, which since the near-only policy is MORE than the tracker reads; the tracker "
+        "takes its subset by name. The order is the CONTRACT order from the artifact metadata, "
         "not an arbitrary list: swapping near and far is invisible in every shape.");
   }
   depth_.assign(cams.size(), {});
@@ -475,12 +478,12 @@ void G1Controller::SetupDepth() {
         [this, i](const sensor_msgs::msg::Image::SharedPtr msg) { DepthCallback(msg, i); },
         opts));
     RCLCPP_INFO(this->get_logger(), "depth camera %zu ('%s') <- %s", i,
-                policy_->params().depth_cameras[i].obs_term.c_str(), depth_topics_[i].c_str());
+                policy_->rig_cameras()[i].obs_term.c_str(), depth_topics_[i].c_str());
   }
 }
 
 void G1Controller::DepthCallback(const sensor_msgs::msg::Image::SharedPtr msg, size_t index) {
-  const auto& cam = policy_->params().depth_cameras[index];
+  const auto& cam = policy_->rig_cameras()[index];
   // VALIDATE before casting. The python has a TODO here and gets away with it because
   // np.frombuffer raises; in C++ a reinterpret_cast over a short buffer is an out-of-bounds
   // read. A wrong-sized frame is a different camera, not a resizable image.
@@ -555,8 +558,8 @@ void G1Controller::Arm() {
             "would publish empty commands until it does, and the robot would fall while the "
             "policy was never asked for anything.",
             c, depth_.size(),
-            (policy_ && c < policy_->params().depth_cameras.size()
-                 ? policy_->params().depth_cameras[c].obs_term.c_str()
+            (policy_ && c < policy_->rig_cameras().size()
+                 ? policy_->rig_cameras()[c].obs_term.c_str()
                  : "?"));
         return;
       }
@@ -626,7 +629,7 @@ void G1Controller::Disarm(const std::string& why) {
 void G1Controller::UpdateWatchdogs() {
   const double now = this->now().seconds();
 
-  if (!policy_->params().depth_cameras.empty() && depth_timeout_ > 0.0) {
+  if (!policy_->rig_cameras().empty() && depth_timeout_ > 0.0) {
     bool any_stale = false;
     {
       std::lock_guard<std::mutex> lock(depth_mutex_);

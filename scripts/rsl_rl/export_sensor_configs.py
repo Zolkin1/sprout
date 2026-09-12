@@ -9,18 +9,19 @@ this writes the THIRD consumer's copy -- the Obelisk MuJoCo sim's ray-caster con
 the same source, so training, both sims and the real camera cannot drift apart.  Transcribing
 30x26 and an intrinsic matrix by hand into a YAML is exactly how they drift.
 
-These are generated from the TRACKER's contract, and the tracker's cameras are no longer the
-whole rig: the policy reads the near camera alone while the generator reads both. A pair like
-that is REFUSED here (see :func:`generate`) rather than emitted as a config set covering half
-the deployment -- the ROS/C++ runtime has no subset wiring, so the generator's extra camera
-would read as zeros with nothing raising. A refusal is the deliverable; support is not.
+These describe THE RIG -- every camera the robot must publish -- which since the near-only
+policy is the GENERATOR's list, not the tracker's: the policy reads the near camera alone while
+the generator reads both. That subset pair used to be refused here because the ROS/C++ runtime
+had no wiring for it; it is now wired, so the pair is EMITTED. The controller subscribes, FKs
+and watchdogs every rig camera (``PolicyRuntime::rig_cameras``) and the tracker selects its own
+by ``obs_term``. Emitting only the tracker's cameras would leave one nothing publishes, and the
+controller waits on a camera forever rather than failing.
 
-Two consequences of that, each of which is a way the refusal used to be reachable around:
+Two consequences, each of which is a way a half rig used to get out:
 
 * the generator must be EXPORTED BESIDE the tracker, because it is the only artifact naming
-  the whole rig. With no ``fm.onnx`` there is no second contract to compare against, so the
-  subset check simply did not run and half a rig went out unremarked; an absent generator is
-  now itself the refusal.
+  the whole rig. With no ``fm.onnx`` there is nothing here that knows the rig at all, so the
+  files would describe the tracker's half; an absent generator is itself the refusal.
 * every write PRUNES the generated files an earlier run left in the output directory. The
   controller reads that directory by fixed name, so a stale ``depth_far.yml`` beside a fresh
   ``depth_near.yml`` is a complete-looking set describing two different policies' cameras.
@@ -335,24 +336,35 @@ def generate(exported_dir: str) -> dict[str, str]:
             # report a split that is really a subset.
             trk_by_key = index_cameras_by_key(cams, "tracker.onnx")
             fm_by_key = index_cameras_by_key(fm_cams, "fm.onnx")
-            missing = [k for k in fm_by_key if k not in trk_by_key]
-            if missing:
+            # THE RIG IS THE GENERATOR'S LIST, and these files describe the rig.
+            #
+            # A SUBSET pair -- the generator reading a camera the policy does not -- is the
+            # standard shape since the policy went near-only, and it is now WIRED rather than
+            # refused: the ROS controller subscribes, FKs and watchdogs every rig camera
+            # (`PolicyRuntime::rig_cameras`) and the tracker selects its own by `obs_term`.
+            # So the robot must publish every camera the GENERATOR reads, which is what these
+            # configs have to declare -- emitting only the tracker's would leave a camera
+            # nothing publishes, and the controller waits on it forever.
+            #
+            # The reverse is still a contract violation: a camera the TRACKER reads and the
+            # generator does not is not a subset, it is two artifacts describing different
+            # robots, and no ordering of the rig can serve it.
+            extra = [k for k in trk_by_key if k not in fm_by_key]
+            if extra:
                 raise ValueError(
-                    f"fm.onnx conditions on depth camera(s) {missing} that tracker.onnx does "
-                    f"not read (it reads {sorted(trk_by_key)}). These configs are generated "
-                    "from the TRACKER's contract, so emitting them would give the robot a "
-                    "sensor set covering only part of what the deployed pair needs -- and the "
-                    "obelisk/ZED and C++ runtime have no wiring for a subset pair, so the "
-                    "generator's extra camera would silently read as zeros rather than fail. "
-                    "This is a refusal, not a limitation to work around: wire the subset pair "
-                    "through transfer/obelisk and transfer/deploy_cpp first. MuJoCo sim2sim "
-                    "handles it already and needs none of these files."
+                    f"tracker.onnx reads depth camera(s) {extra} that fm.onnx does not "
+                    f"condition on (it reads {sorted(fm_by_key)}). The generator's list is "
+                    "the rig and the tracker is meant to be a SUBSET of it, so this is not a "
+                    "subset pair -- it is two artifacts describing different rigs. Re-export "
+                    "the pair from one run."
                 )
+            cams = list(fm_cams)
             split = {
                 k: ((int(trk_by_key[k]["width"]), int(trk_by_key[k]["height"])),
                     (int(c["width"]), int(c["height"])))
                 for k, c in fm_by_key.items()
-                if (int(trk_by_key[k]["width"]), int(trk_by_key[k]["height"]))
+                if k in trk_by_key
+                and (int(trk_by_key[k]["width"]), int(trk_by_key[k]["height"]))
                 != (int(c["width"]), int(c["height"]))
             }
             if split:

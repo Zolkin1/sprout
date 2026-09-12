@@ -10,6 +10,8 @@
 // be wrong. It now builds and tests in the math core, alongside the depth math it describes.
 
 #include <string>
+
+#include "g1_deploy/policy_params.h"
 #include <utility>
 #include <vector>
 
@@ -51,6 +53,15 @@ struct FmMeta {
   /// successful parse -- see ParseFmMeta for why a depth graph that omits it is refused
   /// rather than defaulted.
   double extero_clip = 0.0;
+
+  /// THE WHOLE RIG: every camera the GENERATOR conditions on, in its own contract order.
+  ///
+  /// Parsed from `fm_meta.extero_spec`, and this is the only artifact that names the whole rig.
+  /// Since `efe93b4e` the POLICY reads the near camera alone while the generator reads both, so
+  /// `PolicyParams::depth_cameras` is a SUBSET of this and cannot be used to size the
+  /// generator's row -- doing that left the missing camera's plane at 0.0 with nothing raising,
+  /// which is a plausible-looking cloud that is simply absent. Empty for a scan generator.
+  std::vector<DepthCameraSpec> cameras;
 
   int extero_dim() const { return extero_tokens * height_dim; }
   /// Pixels per sensor: the row width with the channels divided out.
