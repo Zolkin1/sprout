@@ -39,6 +39,17 @@ cd "$W" || exit 1
 TAG=""; GPU=""; BUFFER=4000; REFRESH=1000; ITERS=5; ROOT=""
 PARENT="${PARENT:-/mnt/zolkin_new/sprout/terrain_reward_smoke/fm/best.pt}"
 TRK="${TRK:-2026-08-20_16-36-10_mode11_decor_plan_v1}"
+#: PIN the tracker checkpoint, rather than letting `--load_run` take the newest.
+#:
+#: `get_checkpoint_path` resolves a run NAME to its latest file, which is correct for a
+#: finished run and wrong for one still training: the generator was fitted on the rollouts of
+#: ONE tracker checkpoint, and grading it against a later one measures the pair rather than the
+#: generator. On a shared box the tracker is often still going, so "newest" moves between two
+#: jobs of the same campaign and nothing in the output says which was used.
+#:
+#: Empty keeps the old behaviour. The recording stamps `checkpoint_path`, so the value to pin
+#: is recoverable from the FM's own training data.
+CKPT="${CKPT:-}"
 #: The two-box TRAINING library: v2 geometry with the three spawn areas declared. The old
 #: default `box2_v2_train.h5` was retired on 2026-09-09 -- it declares 0 spawn areas, which
 #: today's generator cannot reproduce, and it is in `clips/_retired_2026-09-09/`. The eval
@@ -370,7 +381,7 @@ for (( it=1; it<=ITERS; it++ )); do
     # then serves the generator arm to a measured-trained checkpoint and
     # `assert_history_source_matches` kills it after the simulator has launched.
     "$PY" -u scripts/rsl_rl/record_rollouts.py \
-      --task="$TASK" --load_run "$TRK" --fm_checkpoint "$POLICY" \
+      --task="$TASK" --load_run "$TRK" ${CKPT:+--checkpoint "$CKPT"} --fm_checkpoint "$POLICY" \
       --clip "$CLIP" --clip_device cpu --goal_regions "$GOALS" \
       --num_envs "$ENVS" --episodes_per_env "$ROUNDS" --num_windows "$NWIN" \
       --history_from "$HISTORY_FROM" \

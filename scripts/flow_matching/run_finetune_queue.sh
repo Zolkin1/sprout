@@ -36,8 +36,12 @@ set -uo pipefail
 W="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$W"
 
-PARENT="${1:?usage: run_finetune_queue.sh <parent_fm.pt> <tracker_run_name>}"
-TRK="${2:?usage: run_finetune_queue.sh <parent_fm.pt> <tracker_run_name>}"
+PARENT="${1:?usage: run_finetune_queue.sh <parent_fm.pt> <tracker_run_name> [tracker_ckpt]}"
+TRK="${2:?usage: run_finetune_queue.sh <parent_fm.pt> <tracker_run_name> [tracker_ckpt]}"
+#: The tracker checkpoint the FM was RECORDED from. Pinned rather than resolved, because
+#: `--load_run` takes the newest and the tracker is often still training -- see CKPT in
+#: run_finetune_loop.sh. Read it off the recording's own `checkpoint_path` stamp.
+CKPT="${3:-${CKPT:-}}"
 
 #: GPUs that are ours to use as soon as they are idle.
 OURS="${OURS:-1 2 3}"
@@ -110,7 +114,7 @@ launch() {   # kind config gpu
       # Every knob the run needs comes from the config; only the PARENT, the tracker and the
       # GPU are the queue's to say.
       ( set -a; eval "$(cfg_env "$cfg")"; set +a
-        PARENT="$PARENT" TRK="$TRK" GPU="$gpu" ROOT="$(ft_root "$cfg")" \
+        PARENT="$PARENT" TRK="$TRK" CKPT="$CKPT" GPU="$gpu" ROOT="$(ft_root "$cfg")" \
         bash scripts/flow_matching/run_finetune_loop.sh ) > "$log" 2>&1 &
       ;;
     parent_eval|ft_eval)
@@ -123,7 +127,7 @@ launch() {   # kind config gpu
       # what an in-distribution CONTROL is for anyway.
       local evalclip="${clip/_train.h5/_holdout.h5}"
       [ -f "$evalclip" ] || evalclip="$clip"
-      ( GPU="$gpu" TRK="$TRK" TASK="$task" CLIP="$evalclip" GR="$goals" \
+      ( GPU="$gpu" TRK="$TRK" CKPT="$CKPT" TASK="$task" CLIP="$evalclip" GR="$goals" \
         SPEEDS="$SPEEDS" OUT="$ROOT/eval_$tag" \
         bash scripts/rsl_rl/run_quick_eval.sh "$fm" "$tag" ) > "$log" 2>&1 &
       ;;
@@ -147,7 +151,7 @@ for c in $CONFIGS; do PENDING+=("ft_eval:$c"); done
 
 say "queue starting: ${#PENDING[@]} jobs"
 say "  parent  $PARENT"
-say "  tracker $TRK"
+say "  tracker $TRK${CKPT:+ @ $(basename "$CKPT")}"
 say "  gpus    ours=[$OURS] opportunistic=[$OPPORTUNISTIC]"
 say "  root    $ROOT"
 [ -f "$PARENT" ] || say "  waiting for the parent checkpoint to appear..."

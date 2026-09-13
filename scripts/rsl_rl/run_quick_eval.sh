@@ -101,6 +101,17 @@ CLIP=${CLIP:-$DEF_CLIP}
 GR=${GR:-$DEF_GR}
 OUT=${OUT:-$DEF_ROOT/$TAG}
 TRK=${TRK:-2026-08-20_16-36-10_mode11_decor_plan_v1}
+#: PIN the tracker checkpoint, rather than letting `--load_run` take the newest.
+#:
+#: `get_checkpoint_path` resolves a run NAME to its latest file, which is correct for a
+#: finished run and wrong for one still training: the generator was fitted on the rollouts of
+#: ONE tracker checkpoint, and grading it against a later one measures the pair rather than the
+#: generator. On a shared box the tracker is often still going, so "newest" moves between two
+#: jobs of the same campaign and nothing in the output says which was used.
+#:
+#: Empty keeps the old behaviour. The recording stamps `checkpoint_path`, so the value to pin
+#: is recoverable from the FM's own training data.
+CKPT="${CKPT:-}"
 TASK=${TASK:-G1-box2-finetune}
 
 #: Envs, overridable because the right number is a property of the BOX not the eval: 384 fits
@@ -189,7 +200,7 @@ for spd in $SPEEDS; do
   # `--history_from` is a CLI FLAG, not a hydra override: record_rollouts has its own flag
   # for it and applies it after composition, so an override is silently discarded.
   $PY scripts/rsl_rl/record_rollouts.py \
-    --task="$TASK" --load_run "$TRK" --fm_checkpoint "$FM" \
+    --task="$TASK" --load_run "$TRK" ${CKPT:+--checkpoint "$CKPT"} --fm_checkpoint "$FM" \
     --clip "$CLIP" --clip_device cpu --goal_regions "$GR" \
     --num_envs $NENV --episodes_per_env "$ROUNDS" --no_windows --terrain_reward \
     --history_from "$HISTORY_FROM" \
