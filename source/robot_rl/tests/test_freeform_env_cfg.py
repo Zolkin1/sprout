@@ -323,7 +323,9 @@ def freeform_library(tmp_path_factory):
     manifest = ff.generate_freeform_manifest(cfg)
     ff.validate_manifest(manifest)
     path = str(tmp_path_factory.mktemp("freeform") / "lib.h5")
-    maker.write_terrain_library(path, manifest, maker.library_meta(None), cfg)
+    # The bare SCHEMA -- see test_clip_free_library. Nothing here resolves a joint
+    # output, so the layout `library_meta` refuses is exactly the right one to use.
+    maker.write_terrain_library(path, manifest, maker.schema_only_layout(), cfg)
     return path, manifest
 
 

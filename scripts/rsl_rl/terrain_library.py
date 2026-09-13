@@ -52,6 +52,25 @@ _MINIMAL_META: dict = {
 _META_KEYS: tuple[str, ...] = tuple(_MINIMAL_META)
 
 
+def schema_only_layout() -> dict:
+    """The metadata SCHEMA, with no joint channels -- for tests, never for a course to run on.
+
+    :func:`library_meta` refuses ``None`` because a course built on the bare schema writes
+    clean, loads clean, and then dies inside Isaac on a missing ``joint:`` output. That
+    refusal is right for every builder, and it also broke two test fixtures that legitimately
+    want a clip-free library for something the trajectory command never touches --
+    ``MotionClipManager`` construction, route-field plumbing, the manifest round trip.
+
+    So the schema stays reachable, under a name that cannot be mistaken for the production
+    path and states its own limit. A library written with this CANNOT build an env, by
+    construction: :func:`assert_layout_is_usable` rejects it, which is the point.
+
+    Returns:
+        A copy of the minimal metadata.
+    """
+    return dict(_MINIMAL_META)
+
+
 def library_meta(like: str) -> dict:
     """The channel-layout metadata to stamp on the terrain-only library.
 
