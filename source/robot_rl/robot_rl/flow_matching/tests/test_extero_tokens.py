@@ -78,7 +78,11 @@ def _cfg(**kw) -> FlowMatchingConfig:
     #: source-selection contracts these tests pin are channel-independent. The DEFAULT path is
     #: covered on a real 29-joint recording by ``test_depth_xyz_offline``'s
     #: ``test_the_shipped_default_widens_a_depth_row_to_five_channels``.
-    base = dict(num_history_states=2, future_len=6, cmd_array="target_vel", cmd_stride=4,
+    # depth_latency_probs=None: no `depth_lag` in these synthetic recordings, and this
+    # file is about token layout rather than camera latency. The field defaults to the
+    # shipped tuple now, and the dataset refuses a depth recording lacking the frames.
+    base = dict(depth_latency_probs=None,
+                num_history_states=2, future_len=6, cmd_array="target_vel", cmd_stride=4,
                 target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
                 # Unweighted: the shipped 20.0 needs clip_id + the clip library to resolve
                 # the anchor mask, which a synthetic recording cannot provide.

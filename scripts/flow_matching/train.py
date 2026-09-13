@@ -316,8 +316,11 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "CONTROL STEPS, so '0,0.10,0.40,0.50' is P(0 ms), P(20 ms), P(40 ms), P(60 ms) "
              "-- the camera and control both run at 50 Hz, so a step is exactly 20 ms. "
              "'shipped' uses DEPTH_LATENCY_PROBS (that same tuple, mean 48 ms, matching the "
-             "measured depth-compute-plus-ROS lag). Omit for NO latency: the frame captured "
-             "at the re-plan, which is what every recording before 2026-08-21 supports. "
+             "measured depth-compute-plus-ROS lag) and is now what OMITTING the flag gives "
+             "too -- the config defaults to it, because every generator that has gone near a "
+             "robot carries it. Pass 'none' (or 'off') for the no-latency ablation: the frame "
+             "captured at the re-plan, which is what every recording before 2026-08-21 "
+             "supports. "
              "Needs a recording that carries 'depth_lag'; it raises rather than silently "
              "falling back. Keep lag 0 at zero -- a frame cannot arrive in the step it was "
              "captured in, and it is the easiest case.")
@@ -547,8 +550,13 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     if args.extero_clip is not None:
         cfg.extero_clip = float(args.extero_clip)
     if args.depth_latency_probs is not None:
+        # `none` is the OFF switch, and it has to be a spelled word rather than an omitted
+        # flag: the config now DEFAULTS to DEPTH_LATENCY_PROBS, so omitting this gives lag.
+        # Without an explicit off there is no way to run the no-latency ablation the recorder
+        # keeps every frame for.
         cfg.depth_latency_probs = (
-            DEPTH_LATENCY_PROBS if args.depth_latency_probs == "shipped"
+            None if args.depth_latency_probs.lower() in ("none", "off")
+            else DEPTH_LATENCY_PROBS if args.depth_latency_probs == "shipped"
             else tuple(float(x) for x in args.depth_latency_probs.split(",") if x.strip()))
     return cfg, args
 

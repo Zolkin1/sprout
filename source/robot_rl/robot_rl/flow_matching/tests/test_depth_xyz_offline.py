@@ -100,6 +100,12 @@ def _default_channel_dataset(hw: tuple[int, int] = (6, 5), **cfg_kw):
         history_len=4, depth_camera_spec=camera_spec(n_cam, h, w),
     )
     cfg = FlowMatchingConfig(
+        # This fixture's synthetic recording carries no `depth_lag` array, and this file
+        # is not about camera latency. `depth_latency_probs` now defaults to the shipped
+        # tuple and the dataset REFUSES a depth recording without the lagged frames rather
+        # than silently falling back -- so the opt-out is stated here, keeping that refusal
+        # meaningful where it matters: a real recording that predates the arrays.
+        depth_latency_probs=None,
         num_history_states=2, future_len=6, cmd_array="target_vel", cmd_stride=4,
         target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
         d_model=16, nhead=2, num_layers=1, dim_feedforward=32,

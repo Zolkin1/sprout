@@ -1194,10 +1194,25 @@ class FutureStateDataset(Dataset):
         # windows; what it does not do is show the same window at two different lags.
         pose_meas = snap_meas
         self.depth_latency_probs = None
-        if cfg.depth_latency_probs is not None:
+        # GATED ON THE SOURCE, not just on the field being set. The latency being modelled is
+        # the DEPTH pipeline's -- image compute plus ROS transport -- and a height scan has no
+        # such pipeline: it is privileged, sim-only, and its recordings carry no `depth_lag`
+        # array at all. Before `depth_latency_probs` defaulted on, a scan run reached here with
+        # None and the question never arose; with the default flipped, a scan run would raise
+        # on a missing array for a model that cannot apply to it.
+        #
+        # This does NOT weaken the loud failure where it matters: a DEPTH recording that
+        # predates the lagged arrays still raises, which is the case the refusal exists for.
+        if cfg.depth_latency_probs is not None and cfg.extero_source == "depth":
             self.depth_latency_probs = _select_depth_lag(
                 cfg, data, rows, hs, n_sensors, sensor_dim, snap_meas, self)
             hs, pose_meas = self._lagged_hs, self._lagged_pose
+        elif cfg.depth_latency_probs is not None:
+            # Printed rather than passed over in silence: the checkpoint will record None, and
+            # a reader comparing it against the run's flags deserves to see why.
+            print(f"[fm-data] depth_latency_probs set but extero_source="
+                  f"{cfg.extero_source!r}: camera latency models the depth pipeline, so it "
+                  f"does not apply here and the checkpoint records None.")
         # Sanitize before the normalizer fit so a non-finite entry cannot poison the
         # per-dimension mean and yield a NaN loss (matches the deploy token builder). The band
         # is the config's, so a run can widen it past the per-source default -- a 1 m band
