@@ -176,6 +176,22 @@ class G1Controller : public obelisk::ObeliskController<ControlMsg, EstimatorMsg>
   double vel_cmd_time_ = -1.0;
   std::mutex cmd_mutex_;
 
+  /// The commanded-velocity ENVELOPE, applied to every command this controller accepts.
+  ///
+  /// This is the limit; the joystick node's `v_*_scale` is the STICK MAPPING, and the two are
+  /// deliberately different things. A scale is symmetric by construction (the axis is
+  /// [-1, 1]), so it cannot express "0.8 forward, 0.4 back" at all -- and it only constrains
+  /// the joystick, while `sub_vel_cmd` is equally reachable by the scripted node or any future
+  /// high-level planner. Clamping here covers all of them at one point.
+  ///
+  /// Initialised inline as well as declared as parameters: the subscription is registered in
+  /// the CONSTRUCTOR and `on_configure` reads the parameters later, so a command arriving in
+  /// between would otherwise be clamped by whatever these defaulted to.
+  double vel_cmd_x_min_ = -0.4;
+  double vel_cmd_x_max_ = 0.8;
+  double vel_cmd_y_abs_max_ = 0.0;
+  double vel_cmd_yaw_abs_max_ = 0.6;
+
   std::atomic<bool> armed_{false};
 
   // ---- guards -------------------------------------------------------------------------

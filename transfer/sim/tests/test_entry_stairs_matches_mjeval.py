@@ -58,6 +58,20 @@ _MEASURED = (
 #: simulator, at exactly the moment the generator is looking at it.
 _SHARED_M = ("APPROACH_M", "CLEARING_LEN_M", "CLEARING_WIDTH_M", "WALL_H_M", "WALL_T_M")
 
+#: Dimensions that exist on the MuJoCo side ALONE, by design -- the side box.
+#:
+#: It is a joystick test fixture, not part of the building: one scene that offers the
+#: generator both modes it has to choose between (drive straight = staircase, steer = box).
+#: The Isaac tile deliberately does NOT have it, and that asymmetry has to be enforced rather
+#: than merely allowed, which is what the second test below does.
+#:
+#: **Why it must not be added to the Isaac side.** ``entry_stairs`` tiles are in the ``multi``
+#: fine-tune library, and a tile's geometry is hashed into the terrain fingerprint that a
+#: training run records. Adding a box there changes the fingerprint, so every artifact built
+#: against the old one silently describes different ground.
+_MUJOCO_ONLY = ("SIDE_BOX_H_M", "SIDE_BOX_DEPTH_M", "SIDE_BOX_WIDTH_M",
+                "SIDE_BOX_X_M", "SIDE_BOX_Y_M")
+
 
 @pytest.mark.parametrize("name", _MEASURED)
 def test_the_two_sims_agree_on_every_measured_dimension(name: str) -> None:
@@ -96,8 +110,27 @@ def test_no_dimension_escapes_the_comparison() -> None:
     """
     declared = {n for n in dir(gen)
                 if (n.endswith(("_IN", "_STEPS", "_M"))) and not n.startswith("_")}
-    missing = declared - set(_MEASURED) - set(_SHARED_M)
-    assert not missing, f"dimension(s) not compared: {sorted(missing)}"
+    missing = declared - set(_MEASURED) - set(_SHARED_M) - set(_MUJOCO_ONLY)
+    assert not missing, (
+        f"dimension(s) not compared: {sorted(missing)}. Add them to _MEASURED / _SHARED_M if "
+        "both simulators must agree, or to _MUJOCO_ONLY -- with a reason -- if the Isaac tile "
+        "deliberately does not have them.")
+
+
+def test_the_side_box_is_mujoco_only() -> None:
+    """The asymmetry is ENFORCED, not merely tolerated.
+
+    Without this, someone adding the box to the Isaac tile to "make the two match" would be
+    changing the terrain fingerprint of a library that fine-tune runs were recorded against --
+    and every check in the repo would go on passing, because both sides would agree.
+    """
+    for name in _MUJOCO_ONLY:
+        assert hasattr(gen, name), f"{name} vanished from the MuJoCo side"
+        assert not hasattr(es, name), (
+            f"{name} has appeared on the Isaac side. The side box is a MuJoCo joystick "
+            "fixture: putting it in the tile changes the terrain fingerprint that the multi "
+            "fine-tune library was built with, so artifacts would describe different ground "
+            "while every comparison still passed.")
 
 
 def test_the_derived_heights_follow_from_the_measurements() -> None:

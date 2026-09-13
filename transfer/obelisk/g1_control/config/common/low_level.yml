@@ -100,6 +100,21 @@ control:
       # robot walking at the last commanded speed.
       vel_cmd_timeout: 1.0
 
+      # ---- Commanded-velocity envelope ----
+      # THE LIMIT lives here, in the controller, and the joystick's `v_*_scale` below is the
+      # STICK MAPPING. They are different things and the split is deliberate:
+      #   * a scale is symmetric by construction (the axis is [-1, 1]), so it cannot express
+      #     "0.8 forward, 0.4 back" at all;
+      #   * a scale constrains the JOYSTICK only, while /obelisk/g1/vel_cmd is equally
+      #     reachable by the scripted node and by any future high-level planner.
+      # Backwards is held to half of forwards because the generator has two forward-facing
+      # cameras and nothing behind it: reversing is the one direction where it cannot see the
+      # ground it is about to step onto.
+      vel_cmd_x_min: -0.4
+      vel_cmd_x_max: 0.8
+      vel_cmd_y_abs_max: 0.0
+      vel_cmd_yaw_abs_max: 0.6
+
       # ---- Bring-up ----
       # There is no PD warm-up, and the runtime no longer has a way to add one. On entering
       # low-level control whatever feeds the tracker -- the generator or a debug clip --
@@ -157,9 +172,14 @@ control:
     pkg: obelisk_unitree_cpp
     executable: obelisk_unitree_joystick
     params:
+      # The stick MAPPING, not the limit -- see the envelope in the controller params above,
+      # which is what actually bounds the command. Forward full-stick is 0.8 and yaw
+      # full-stick is 0.6, so those two sticks reach exactly the envelope's edge and no
+      # further; full-stick BACKWARD asks for -0.8 and the envelope clamps it to -0.4, which
+      # is the asymmetry a scale cannot express on its own.
       v_x_scale: 0.8
       v_y_scale: 0.0
-      w_z_scale: 0.7
+      w_z_scale: 0.6
       # Yaw on the RIGHT STICK HORIZONTAL (RX = 3 + AXIS_OFFSET). The upstream default is RY
       # -- right stick VERTICAL -- which reads as "yaw does nothing" to anyone who pushes the
       # stick sideways expecting to turn.

@@ -26,7 +26,21 @@ robot:
         # as-is). Not a copy under g1_model/: a second MJCF is a second set of masses,
         # collision geometry and geom groups to keep in sync, and the whole point of this
         # stack is that the two simulators agree. ROBOT_RL_ROOT is transfer/obelisk.
-        model_xml_path: ${ROBOT_RL_ROOT}/../sim/robots/g1/g1_perceptive_terrain_scene.xml
+        #
+        # THE ENTRY STAIRS: the measured building entrance (a wide 5-riser flight, a landing,
+        # a narrowing to a 100" hallway, a 3-riser upper flight, then a walled clearing) with
+        # a 0.40 m box on the ground beside the approach. One scene, both modes: drive
+        # straight and it is a staircase, steer left and it is a box jump-up.
+        #
+        # Regenerate with `python transfer/sim/generate_entry_stairs_scene.py` -- the scene is
+        # DERIVED and deliberately not committed, so a fresh checkout builds it before the
+        # first run. Swap the line below back to g1_perceptive_terrain_scene.xml for the
+        # general in-distribution playground, or to one of the g1_perceptive_tile*_scene.xml
+        # for a single real library tile.
+        #
+        # Stairs have NEVER been tested on the real robot, up or down (see CLAUDE.md,
+        # "Hardware: what has actually run"), so this scene is exactly the untested half.
+        model_xml_path: ${ROBOT_RL_ROOT}/../sim/robots/g1/g1_perceptive_entry_stairs_scene.xml
         time_step: 0.001
         num_steps_per_viz: 10
         sensor_settings:
