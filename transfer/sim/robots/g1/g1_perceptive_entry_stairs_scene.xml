@@ -25,24 +25,24 @@
     <worldbody>
         <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
         <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" group="2"/>
-        <geom name="wide_step1" type="box" material="box_material" group="2" size="0.1397 2.5400 0.0762" pos="3.1397 0.0000 0.0762"/>
-        <geom name="wide_step2" type="box" material="box_material" group="2" size="0.1397 2.5400 0.1524" pos="3.4191 0.0000 0.1524"/>
-        <geom name="wide_step3" type="box" material="box_material" group="2" size="0.1397 2.5400 0.2286" pos="3.6985 0.0000 0.2286"/>
-        <geom name="wide_step4" type="box" material="box_material" group="2" size="0.1397 2.5400 0.3048" pos="3.9779 0.0000 0.3048"/>
-        <geom name="wide_step5" type="box" material="box_material" group="2" size="0.1397 2.5400 0.3810" pos="4.2573 0.0000 0.3810"/>
-        <geom name="landing" type="box" material="box_material" group="2" size="1.2700 2.5400 0.3810" pos="5.6670 0.0000 0.3810"/>
-        <geom name="hall_step1" type="box" material="box_material" group="2" size="0.1651 1.2700 0.4477" pos="7.1021 0.0000 0.4477"/>
-        <geom name="hall_step2" type="box" material="box_material" group="2" size="0.1651 1.2700 0.5143" pos="7.4323 0.0000 0.5143"/>
-        <geom name="hall_step3" type="box" material="box_material" group="2" size="0.1651 1.2700 0.5810" pos="7.7625 0.0000 0.5810"/>
-        <geom name="clearing" type="box" material="box_material" group="2" size="4.0000 4.0000 0.5810" pos="11.9276 0.0000 0.5810"/>
-        <geom name="narrow_left" type="box" material="box_material" group="2" size="0.0750 0.6350 0.6000" pos="6.8620 1.9050 1.3620"/>
-        <geom name="hall_wall_left" type="box" material="box_material" group="2" size="0.5703 0.0750 0.6000" pos="7.3573 1.3450 1.3620"/>
-        <geom name="narrow_right" type="box" material="box_material" group="2" size="0.0750 0.6350 0.6000" pos="6.8620 -1.9050 1.3620"/>
-        <geom name="hall_wall_right" type="box" material="box_material" group="2" size="0.5703 0.0750 0.6000" pos="7.3573 -1.3450 1.3620"/>
-        <geom name="room_wall_left" type="box" material="box_material" group="2" size="4.0000 0.0750 0.6000" pos="11.9276 4.0750 1.7620"/>
-        <geom name="room_near_left" type="box" material="box_material" group="2" size="0.0750 1.3650 0.6000" pos="8.0026 2.6350 1.7620"/>
-        <geom name="room_wall_right" type="box" material="box_material" group="2" size="4.0000 0.0750 0.6000" pos="11.9276 -4.0750 1.7620"/>
-        <geom name="room_near_right" type="box" material="box_material" group="2" size="0.0750 1.3650 0.6000" pos="8.0026 -2.6350 1.7620"/>
-        <geom name="room_far" type="box" material="box_material" group="2" size="0.0750 4.0000 0.6000" pos="15.8526 0.0000 1.7620"/>
+        <geom name="wide_step1" type="box" material="box_material" group="2" size="0.1397 2.5400 0.0762" pos="5.6397 0.0000 0.0762"/>
+        <geom name="wide_step2" type="box" material="box_material" group="2" size="0.1397 2.5400 0.1524" pos="5.9191 0.0000 0.1524"/>
+        <geom name="wide_step3" type="box" material="box_material" group="2" size="0.1397 2.5400 0.2286" pos="6.1985 0.0000 0.2286"/>
+        <geom name="wide_step4" type="box" material="box_material" group="2" size="0.1397 2.5400 0.3048" pos="6.4779 0.0000 0.3048"/>
+        <geom name="wide_step5" type="box" material="box_material" group="2" size="0.1397 2.5400 0.3810" pos="6.7573 0.0000 0.3810"/>
+        <geom name="landing" type="box" material="box_material" group="2" size="1.2700 2.5400 0.3810" pos="8.1670 0.0000 0.3810"/>
+        <geom name="hall_step1" type="box" material="box_material" group="2" size="0.1651 1.2700 0.4477" pos="9.6021 0.0000 0.4477"/>
+        <geom name="hall_step2" type="box" material="box_material" group="2" size="0.1651 1.2700 0.5143" pos="9.9323 0.0000 0.5143"/>
+        <geom name="hall_step3" type="box" material="box_material" group="2" size="0.1651 1.2700 0.5810" pos="10.2625 0.0000 0.5810"/>
+        <geom name="clearing" type="box" material="box_material" group="2" size="4.0000 4.0000 0.5810" pos="14.4276 0.0000 0.5810"/>
+        <geom name="narrow_left" type="box" material="box_material" group="2" size="0.0750 0.6350 0.6000" pos="9.3620 1.9050 1.3620"/>
+        <geom name="hall_wall_left" type="box" material="box_material" group="2" size="0.5703 0.0750 0.6000" pos="9.8573 1.3450 1.3620"/>
+        <geom name="narrow_right" type="box" material="box_material" group="2" size="0.0750 0.6350 0.6000" pos="9.3620 -1.9050 1.3620"/>
+        <geom name="hall_wall_right" type="box" material="box_material" group="2" size="0.5703 0.0750 0.6000" pos="9.8573 -1.3450 1.3620"/>
+        <geom name="room_wall_left" type="box" material="box_material" group="2" size="4.0000 0.0750 0.6000" pos="14.4276 4.0750 1.7620"/>
+        <geom name="room_near_left" type="box" material="box_material" group="2" size="0.0750 1.3650 0.6000" pos="10.5026 2.6350 1.7620"/>
+        <geom name="room_wall_right" type="box" material="box_material" group="2" size="4.0000 0.0750 0.6000" pos="14.4276 -4.0750 1.7620"/>
+        <geom name="room_near_right" type="box" material="box_material" group="2" size="0.0750 1.3650 0.6000" pos="10.5026 -2.6350 1.7620"/>
+        <geom name="room_far" type="box" material="box_material" group="2" size="0.0750 4.0000 0.6000" pos="18.3526 0.0000 1.7620"/>
     </worldbody>
 </mujoco>
