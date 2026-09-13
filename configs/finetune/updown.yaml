@@ -8,7 +8,12 @@
 # (stairs_up 0.1312/0.2092, stairs_down 0.1381/0.1899) exist in ONE direction each and cannot
 # build a tile that goes up and back down.
 name: updown
-task: G1-box2-finetune
+# The plain FREE-FORM fine-tune, not G1-box2-finetune. That variant exists only to put the FAR
+# camera back into the policy observation, for tracker checkpoints trained before the near-only
+# change that expect 3002 inputs. Its own docstring says to retire it once a near-only teacher
+# exists -- and the v6g tracker IS near-only (its tracker.onnx reads depth_camera_near alone),
+# so the far camera would build an observation it was never trained on.
+task: G1-teacher-clf-terrain-depth-finetune-freeform
 clip: clips/ft_updown_train.h5
 goals: logs/ft_updown/goal_regions.json
 

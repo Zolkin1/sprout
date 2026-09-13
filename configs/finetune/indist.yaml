@@ -11,7 +11,12 @@
 # every geometry knob below is inert. They stay because the schema is total: a config that
 # omitted them would be one where nobody had decided they were irrelevant.
 name: indist
-task: G1-box2-finetune
+# The plain FREE-FORM fine-tune, not G1-box2-finetune. That variant exists only to put the FAR
+# camera back into the policy observation, for tracker checkpoints trained before the near-only
+# change that expect 3002 inputs. Its own docstring says to retire it once a near-only teacher
+# exists -- and the v6g tracker IS near-only (its tracker.onnx reads depth_camera_near alone),
+# so the far camera would build an observation it was never trained on.
+task: G1-teacher-clf-terrain-depth-finetune-freeform
 clip: clips/ft_indist_train.h5
 goals: logs/ft_indist/goal_regions.json
 

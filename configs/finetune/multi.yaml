@@ -14,7 +14,12 @@
 # a 100in landing, then 3 x 5.25in/13.0in in a 100in hallway -- so it is the only one that
 # forces a re-plan into a second, different staircase and a narrowing corridor.
 name: multi
-task: G1-box2-finetune
+# The plain FREE-FORM fine-tune, not G1-box2-finetune. That variant exists only to put the FAR
+# camera back into the policy observation, for tracker checkpoints trained before the near-only
+# change that expect 3002 inputs. Its own docstring says to retire it once a near-only teacher
+# exists -- and the v6g tracker IS near-only (its tracker.onnx reads depth_camera_near alone),
+# so the far camera would build an observation it was never trained on.
+task: G1-teacher-clf-terrain-depth-finetune-freeform
 clip: clips/ft_multi_train.h5
 goals: logs/ft_multi/goal_regions.json
 

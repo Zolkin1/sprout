@@ -488,6 +488,19 @@ class G1FinetuneFreeformEnvCfg(G1FinetuneTerrainDepthEnvCfg):
         # bearing down the section. This is also what makes a clip-free library admissible --
         # ``command_velocity_available`` stops depending on a ``target_vel`` dataset.
         cmd.freeform_command = True
+        # JOINT tracking, for the same reason the clip knobs below go off: there is no clip.
+        # The teacher chain sets ``tracking_mode = "body"``
+        # (:class:`G1TeacherTerrainEnvCfg`), which needs a library carrying root-frame body
+        # channels -- and a manifest-only section library carries no channels at all, so
+        # ``base_trajectory_cmd._resolve_tracked_vel_names`` raises at command-manager init:
+        #
+        #     tracking_mode='body' needs a clip library carrying root-frame body channels
+        #     (@root), but this library has none.
+        #
+        # ``g1_tracker_env_cfg`` pins the same value for the same reason, and the two are the
+        # generator-driven paths. Set AFTER ``super()`` because ``_apply_tracking_mode`` runs
+        # as a validation during it.
+        cmd.tracking_mode = "joint"
         # Every clip-phase knob is now meaningless, and each one would otherwise be a claim
         # about a library that has no clips. Off explicitly rather than left at the teacher's
         # value, so a reader of this cfg is not left inferring which of them still apply.
