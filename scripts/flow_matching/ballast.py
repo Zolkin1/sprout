@@ -362,8 +362,21 @@ def build_ballast_dataset(path: str, rows, ctx, cfg, *, null_prob: float, seed: 
     # windows with depth) and the ballast is a couple of thousand, so loading all of it to
     # keep 1% would cost gigabytes for nothing.
     data, meta = load_recorded_windows(path, rows=_np.asarray(rows))
+    # NORMALIZERS CLONED TO THE CPU, exactly as `rollout_dataset._CtxView` does and for the
+    # same two reasons -- this path had been passing `ctx`'s own straight through.
+    #
+    #   * A dataset builds CPU tensors, so a CUDA normalizer gives
+    #     "Expected all tensors to be on the same device" inside `Normalizer.normalize`.
+    #     It is invisible on a CPU-loaded context, which is how it survived an offline check.
+    #   * `Normalizer.to` moves IN PLACE, so normalizing without the deepcopy would leave the
+    #     loaded generator holding CPU statistics against a CUDA model -- which fails later,
+    #     at the next sample, far from here and looking like a model fault.
+    import copy  # noqa: PLC0415
+    state_norm = copy.deepcopy(ctx.state_norm).to("cpu")
+    extero_norm = copy.deepcopy(ctx.extero_norm).to("cpu")
+    cmd_norm = None if ctx.cmd_norm is None else copy.deepcopy(ctx.cmd_norm).to("cpu")
     base = FutureStateDataset(
         data, meta, cfg, _np.arange(n),
-        state_normalizer=ctx.state_norm, cmd_normalizer=ctx.cmd_norm,
-        extero_normalizer=ctx.extero_norm, add_noise=False)
+        state_normalizer=state_norm, cmd_normalizer=cmd_norm,
+        extero_normalizer=extero_norm, add_noise=False)
     return PretrainWindowAdapter(base, path=path, label=lab, weight=wgt)
