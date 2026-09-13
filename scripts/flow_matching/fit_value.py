@@ -171,7 +171,10 @@ def _load(stem: str, max_windows: int, tail_chunks: int = 1, *,
     W, wa = ro.read_rollout_windows(stem + ".h5", columns=[
         "episode_uid", "replan_index", "family_code", "history", "history_null", "extero",
         "cmd_future", "goal_downrange_m", "goal_lateral_m", "goal_height_err_m",
-        "proprio", "base_twist_yaw", "height_scan",
+        # `proprio` and `height_scan` are NOT here: the critic's scan and proprio token
+        # streams were deleted in dcea58f0, so requesting them would load two arrays nothing
+        # reads -- which is what this column list exists to avoid.
+        "base_twist_yaw",
         # The quality head's target. Requested BY NAME like everything else: this loader
         # takes an explicit column list (it never reads `fm_plan`, 11.3 kB/window), so a
         # column that is not named is simply absent and the head silently trains on nothing.
@@ -749,12 +752,23 @@ def _predict_quality(model, ctx, W, idx, priv, device, batch: int, *,
     was = model.training
     model.eval()
     out = np.empty(idx.size, dtype=np.float64)
-    for i in range(0, idx.size, batch):
-        j = idx[i:i + batch]
-        out[i:i + j.size] = model.quality(
-            _batch(ctx, W, j, priv, device,
-                   goal_context=goal_context,
-                   worst_so_far=worst_so_far)).cpu().numpy()
+    # `model.eval()` is NOT `no_grad`: it switches dropout/batchnorm and nothing else, so the
+    # head's output still carries `requires_grad` and `.numpy()` raises.
+    #
+    # This function USED to carry `@torch.no_grad()`, and `0106d088` deleted it as collateral:
+    # that commit removed the survival head, whose own `_predict` helper held two of the
+    # file's three `no_grad` sites, and the third -- this decorator -- went with them while
+    # the function it guarded stayed. Every AWR run up to `awr_vm30_fbc/iter_005` was fine;
+    # nothing has fitted a critic since. Restored as a `with` block rather than a decorator so
+    # the next deletion pass has to read the body to remove it. The graph is 55k windows wide
+    # here, so it is a memory saving as much as a correctness fix.
+    with torch.no_grad():
+        for i in range(0, idx.size, batch):
+            j = idx[i:i + batch]
+            out[i:i + j.size] = model.quality(
+                _batch(ctx, W, j, priv, device,
+                       goal_context=goal_context,
+                       worst_so_far=worst_so_far)).cpu().numpy()
     model.train(was)
     return out
 
@@ -773,10 +787,14 @@ def _fit(ctx, W, lab, train, val, *, priv: bool, epochs: int, batch: int, lr: fl
     """
     import copy  # noqa: PLC0415
 
+    # NO `proprio_dim` / `proprio_steps`: those token streams were deleted in dcea58f0 and
+    # the model has not taken them since. They survived here as dead keyword arguments, which
+    # is not dead code -- it is a `TypeError` at the first critic fit, and nothing before the
+    # fit touches this line. `test_value_model_call_sites.py` now parses this call against the
+    # model's own signature, because an argument list is exactly the kind of drift no import
+    # and no shape check can see.
     model = value.FlowValueModel(
         copy.deepcopy(ctx.model),
-        proprio_dim=(int(W["proprio"].shape[-1]) if priv else 0),
-        proprio_steps=(int(W["proprio"].shape[1]) if priv else 0),
         context_dim=value.context_width(privileged=priv, goal_context=goal_context,
                                         worst_penalty_context=(worst_so_far is not None)),
     ).to(device)
@@ -978,8 +996,9 @@ def main() -> int:
     p.add_argument("--bootstrap_variant", type=str, default="V_priv",
                    choices=("V_priv", "V_onboard"),
                    help="Which critic's out-of-fold predictions --bootstrap_v reads. V_priv "
-                        "by default because it is the better estimator (it sees the scan and "
-                        "proprio), and ONE target is built per fit, so both variants are "
+                        "by default because it is the better estimator (it sees the LINEAR "
+                        "half of the twist, which nothing on the robot measures without "
+                        "odometry), and ONE target is built per fit, so both variants are "
                         "fitted against it. That makes V_onboard's target partly a "
                         "distillation of the privileged critic -- deliberate, and the reason "
                         "this is a flag rather than a constant.")
