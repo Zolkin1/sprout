@@ -229,7 +229,14 @@ class PretrainWindowAdapter(Dataset):
 
     What the projection does:
 
-    * keeps ``state`` / ``history`` / ``extero`` / ``cmd_tokens``, which the two agree on;
+    * keeps ``state`` / ``history`` / ``cmd_tokens``, which the two agree on;
+    * FOLDS ``extero`` from pre-training's flat ``(n_sensors * sensor_dim,)`` row into the
+      rollout buffer's ``(n_sensors, sensor_dim)``. The two do NOT agree on it -- this line
+      used to claim they did -- and the fold is sensor-major, which is how
+      ``FutureStateDataset`` builds the row (``hs`` is ``[Nw, n_sensors * sensor_dim]`` and
+      every per-sensor pass indexes it that way). ``ConcatWindowDataset`` catches the raw
+      mismatch, but only as a shape: 7800 against (2, 3900) is the same data, so a WRONG fold
+      would pass every shape check and scramble each camera's kernels silently;
     * adds ``history_null``, which the fine-tune's loss takes per row and pre-training does not
       record at all -- its own trainer draws a null mask from ``null_cond_prob`` instead. These
       rows are marked as HAVING history, and the fine-tune's ``--null_prob`` dropout then
@@ -261,8 +268,15 @@ class PretrainWindowAdapter(Dataset):
         self.path = str(path)
         self.label = None if label is None else np.asarray(label, dtype=np.int64)
         self.weight = None if weight is None else np.asarray(weight, dtype=np.float64)
+        # Derived from the base rather than hardcoded, so a one-camera or scan run folds too.
+        self._n_sensors = int(getattr(base, "extero_sensor_count", 1) or 1)
+        self._sensor_dim = int(getattr(base, "extero_sensor_dim", 0) or 0)
         probe = base[0] if len(base) else {}
-        self.extero_shape = tuple(probe["extero"].shape) if "extero" in probe else ()
+        # The FOLDED shape, because that is what `__getitem__` hands out and what
+        # `ConcatWindowDataset` compares -- advertising the base's flat width here would
+        # simply move the mismatch to the first batch.
+        self.extero_shape = (tuple(self._fold(probe["extero"]).shape)
+                             if "extero" in probe else ())
         self.cmd_dim = int(probe["cmd_tokens"].shape[-1]) if "cmd_tokens" in probe else 0
         self._has_cmd = "cmd_tokens" in probe
 
@@ -273,8 +287,8 @@ class PretrainWindowAdapter(Dataset):
     def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
         """One window, projected onto the fine-tune's keys."""
         src = self.base[i]
-        item = {"state": src["state"], "history": src["history"], "extero": src["extero"],
-                "history_null": torch.tensor(False)}
+        item = {"state": src["state"], "history": src["history"],
+                "extero": self._fold(src["extero"]), "history_null": torch.tensor(False)}
         if self._has_cmd:
             item["cmd_tokens"] = src["cmd_tokens"]
         if self.label is not None:
@@ -282,6 +296,29 @@ class PretrainWindowAdapter(Dataset):
         if self.weight is not None:
             item["weight"] = torch.tensor(float(self.weight[i]), dtype=torch.float64)
         return item
+
+    def _fold(self, extero: "torch.Tensor") -> "torch.Tensor":
+        """Pre-training's flat extero row as the rollout buffer's per-sensor matrix.
+
+        Args:
+            extero: ``(n_sensors * sensor_dim,)`` from :class:`FutureStateDataset`.
+
+        Returns:
+            ``(n_sensors, sensor_dim)``, or the input unchanged when the widths do not
+            divide -- a scan run is one sensor and already the right shape.
+
+        Raises:
+            ValueError: If the row is not a whole number of sensor readings.
+        """
+        if extero.ndim != 1 or self._n_sensors <= 1 or self._sensor_dim <= 0:
+            return extero
+        want = self._n_sensors * self._sensor_dim
+        if int(extero.shape[0]) != want:
+            raise ValueError(
+                f"ballast extero row is {int(extero.shape[0])} wide but the dataset declares "
+                f"{self._n_sensors} sensor(s) x {self._sensor_dim} = {want}. Folding on a "
+                "mismatch would silently re-attribute pixels between cameras.")
+        return extero.reshape(self._n_sensors, self._sensor_dim)
 
     def label_counts(self) -> dict[str, int]:
         """Labels by name, for the run banner."""
