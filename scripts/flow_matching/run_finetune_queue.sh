@@ -136,9 +136,46 @@ launch() {   # kind config gpu
   say "  -> $kind:$cfg on GPU $gpu (pid ${BUSY[$gpu]}), log $log"
 }
 
+#: How long the parent must sit UNCHANGED before it counts as finished (seconds).
+SETTLE="${SETTLE:-600}"
+
+parent_ready() {
+  # `[ -f best.pt ]` IS NOT ENOUGH, and this is the trap this function exists for: train.py
+  # rewrites `best.pt` every time the validation metric improves, so it appears minutes into a
+  # ten-hour run. Testing only for its existence would launch all four fine-tunes against a
+  # mid-training checkpoint -- which trains perfectly happily and answers a question nobody
+  # asked, with nothing in the output naming the epoch it forked from.
+  #
+  # Three conditions, because each alone is defeatable:
+  #   1. the file exists;
+  #   2. the process WRITING that directory is gone. Its pid is in the tfevents filename
+  #      (`events.out.tfevents.<t>.<host>.<pid>.0`), which is exact where a `pgrep` for
+  #      train.py is not -- several unrelated trainings run on this box at once;
+  #   3. the file has been unchanged for SETTLE seconds, which covers an abnormal exit that
+  #      left a half-written checkpoint, and the gap between the last write and the process
+  #      actually leaving.
+  [ -f "$PARENT" ] || { WAITING="no $PARENT yet"; return 1; }
+  local dir pid ev age
+  dir="$(dirname "$PARENT")"
+  for ev in "$dir"/events.out.tfevents.*; do
+    [ -e "$ev" ] || continue
+    pid="${ev##*.}"; pid="${ev%.*}"; pid="${pid##*.}"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      WAITING="training pid $pid still writing $(basename "$dir")"
+      return 1
+    fi
+  done
+  age=$(( $(date +%s) - $(stat -c %Y "$PARENT") ))
+  if [ "$age" -lt "$SETTLE" ]; then
+    WAITING="$(basename "$PARENT") changed ${age}s ago (settling, need ${SETTLE}s)"
+    return 1
+  fi
+  return 0
+}
+
 ready() {    # kind config -> is it runnable yet
   case "$1" in
-    ft|parent_eval) [ -f "$PARENT" ] ;;
+    ft|parent_eval) parent_ready ;;
     ft_eval)        [ -f "$(ft_result "$2")" ] ;;
   esac
 }
@@ -154,7 +191,7 @@ say "  parent  $PARENT"
 say "  tracker $TRK${CKPT:+ @ $(basename "$CKPT")}"
 say "  gpus    ours=[$OURS] opportunistic=[$OPPORTUNISTIC]"
 say "  root    $ROOT"
-[ -f "$PARENT" ] || say "  waiting for the parent checkpoint to appear..."
+parent_ready || say "  holding: $WAITING"
 
 while [ ${#PENDING[@]} -gt 0 ]; do
   # Reap finished jobs and free their GPUs.
@@ -177,6 +214,10 @@ while [ ${#PENDING[@]} -gt 0 ]; do
     break
   done
   [ "$progressed" = 1 ] && continue
+  if [ "${WAITING:-}" != "${WAITING_SAID:-}" ]; then
+    say "  waiting: ${WAITING:-a free GPU} (${#PENDING[@]} job(s) pending)"
+    WAITING_SAID="${WAITING:-}"
+  fi
   sleep "$POLL"
 done
 
