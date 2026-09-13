@@ -35,6 +35,13 @@ rows for the critic to grade or the loss to see. ``ballast_flat_frac`` is the sh
 flat windows specifically, and the rest come from the terrain families, so the ballast is a
 stated mixture rather than whatever the pre-training recording happened to be made of.
 
+**Ballast needs the RECORDING'S OWN CLIP LIBRARY on disk, and the buffer path does not.**
+The fine-tune's buffer is rollout windows, already in model space; ballast goes through
+``FutureStateDataset``, which resolves the library the recording names (for the anchor masks
+and the frame metadata). So a checkout that can run a fine-tune today can still fail at the
+ballast step with "clip library '...' (from the recording) does not exist" -- a loud error,
+but a surprising one, because nothing else in the loop wants that file.
+
 **A stratum that cannot fill its share is an ERROR.** Silently returning fewer windows would
 make the declared mixture a fiction while every log line still read normally, and the whole
 point of the number is that it is declared.
