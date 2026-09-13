@@ -57,6 +57,13 @@ from motion_gen.terrain.varied_courses import VariedCoursesCfg  # noqa: E402
 from finetune_config import load_finetune_config  # noqa: E402
 from terrain_library import library_meta  # noqa: E402
 
+#: Library whose channel layout every course written here copies.  The layout is identical
+#: across all 29-joint libraries; this is the one the v6g tracker and generator were trained
+#: on, so the course and the artifacts that run on it name the same channels.  **Not
+#: optional** -- see ``terrain_library.library_meta``: without it the course writes, loads and
+#: verifies clean, then dies inside Isaac on a missing ``joint:`` output.
+DEFAULT_LIKE: str = "clips/g1_mb_v6g_decor.h5"
+
 #: Seed offset for the holdout library. Large and fixed, so a holdout can never coincide with
 #: a training seed someone picked by hand.
 HOLDOUT_SEED_OFFSET: int = 100_000
@@ -81,8 +88,11 @@ def parse_args() -> argparse.Namespace:
                         "control arm is the same question on the same ground.")
     p.add_argument("--no_holdout", action="store_true",
                    help="Write only the training library.")
-    p.add_argument("--like", default=None,
-                   help="Library whose channel-layout metadata to copy.")
+    p.add_argument("--like", default=DEFAULT_LIKE,
+                   help="Library whose channel-layout metadata to copy. A clip-free library "
+                        "still has to name one output per robot joint (the trajectory command "
+                        "resolves them at construction), so this is not optional -- it just "
+                        "has a default.")
     return p.parse_args()
 
 
