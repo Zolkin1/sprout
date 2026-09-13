@@ -1,23 +1,27 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 
-"""The ballast's ``extero`` must reach the model in the rollout buffer's layout.
+"""The ballast and the buffer must hand ``_collate`` the SAME extero shape -- both flat.
 
-Pre-training stores exteroception as one FLAT row per window, ``(n_sensors * sensor_dim,)``;
-the AWR rollout buffer stores it per sensor, ``(n_sensors, sensor_dim)``. They are the same
-numbers in a different shape, and ``PretrainWindowAdapter`` used to pass the flat row straight
-through while its own docstring claimed the two "agree on extero".
+Two different quantities are easy to confuse here, and confusing them costs a fine-tune run:
 
-``ConcatWindowDataset`` caught it -- but only as a shape mismatch, ``(7800,)`` against
-``(2, 3900)``. That is the cheap half. **The expensive half is that a WRONG fold has the right
-shape**: reshaping channel-major instead of sensor-major, or transposing, yields exactly
-``(2, 3900)`` and passes every check in the stack while attributing half of one camera's pixels
-to the other. The FM's per-camera CNN would then train on scrambled input with nothing
-anywhere reporting it -- the same class as the transposed-camera trap that once made a tracker
-read as incapable.
+* a part's ``extero_shape`` is its SOURCE RECORDING's per-window sensor geometry,
+  ``(n_sensors, sensor_dim)``. ``RolloutWindowDataset`` reads it straight off
+  ``f["extero"].shape[1:]``. It exists for one consumer, ``ConcatWindowDataset``, which uses it
+  to refuse parts that describe different rigs.
+* an ITEM's ``extero`` is what ``_collate`` stacks, and it is FLAT on both sides, because both
+  datasets end in ``online.build_extero_tokens`` -- documented as "flattened to ``(V, T*dim)``
+  -- the model reshapes internally".
 
-So this file asserts the CONTENT of the fold, not just its shape: row ``s`` must be the ``s``-th
-contiguous slice of the flat row, which is how ``FutureStateDataset`` builds it (``hs`` is
-``[Nw, n_sensors * sensor_dim]`` and every per-sensor pass indexes it that way).
+**The trap, paid for twice.** The adapter first advertised the base's flat width as
+``extero_shape``, so the guard compared ``(7800,)`` against the buffer's ``(2, 3900)`` and
+refused two datasets that agreed perfectly at the item level. Reshaping the ITEMS to make that
+comparison pass then satisfied the guard and broke the collate for real::
+
+    RuntimeError: stack expects each tensor to be equal size,
+                  but got [7800] at entry 0 and [2, 3900] at entry 22
+
+-- which is the failure the reshape was supposed to prevent, now caused by it. The guard had to
+be told what it was comparing; the items were never wrong.
 """
 
 from __future__ import annotations
@@ -31,13 +35,12 @@ PretrainWindowAdapter = rd.PretrainWindowAdapter
 
 
 class _FakeBase:
-    """A stand-in for :class:`FutureStateDataset` with a known flat extero row."""
+    """A stand-in for :class:`FutureStateDataset`: flat extero, declared sensor geometry."""
 
     def __init__(self, n_sensors: int, sensor_dim: int, n: int = 3) -> None:
         self.extero_sensor_count = n_sensors
         self.extero_sensor_dim = sensor_dim
         self._n = n
-        # Values encode their own position, so a mis-fold is visible rather than plausible.
         self._rows = [torch.arange(n_sensors * sensor_dim, dtype=torch.float32) + 1000 * i
                       for i in range(n)]
 
@@ -49,36 +52,52 @@ class _FakeBase:
                 "extero": self._rows[i], "cmd_tokens": torch.zeros(3, 4)}
 
 
-def test_the_fold_is_sensor_major_and_matches_the_flat_row() -> None:
-    """The property a shape check cannot see."""
-    base = _FakeBase(n_sensors=2, sensor_dim=3900)
-    ad = PretrainWindowAdapter(base, path="<fake>")
-    flat = base[0]["extero"]
-    folded = ad[0]["extero"]
-    assert tuple(folded.shape) == (2, 3900)
-    for s in range(2):
-        assert torch.equal(folded[s], flat[s * 3900:(s + 1) * 3900]), (
-            f"sensor {s} is not the {s}-th contiguous slice: the fold is not sensor-major, "
-            "which silently re-attributes pixels between cameras at the right shape")
-
-
-def test_the_advertised_shape_matches_what_getitem_returns() -> None:
-    """``ConcatWindowDataset`` compares ``extero_shape``; it must describe the real item."""
-    ad = PretrainWindowAdapter(_FakeBase(2, 3900), path="<fake>")
-    assert ad.extero_shape == tuple(ad[0]["extero"].shape)
-    assert ad.extero_shape == (2, 3900)
-
-
-def test_a_single_sensor_run_is_left_alone() -> None:
-    """A scan (or a one-camera ablation) is already the buffer's shape."""
-    ad = PretrainWindowAdapter(_FakeBase(1, 176), path="<fake>")
-    assert ad[0]["extero"].ndim == 1
-    assert ad.extero_shape == (176,)
-
-
-def test_a_row_that_does_not_divide_is_REFUSED() -> None:
-    """Folding on a mismatch would re-attribute pixels; it must raise instead."""
+def test_the_item_stays_flat_so_collate_can_stack_it() -> None:
+    """The property the run actually needs."""
     base = _FakeBase(2, 3900)
-    base.extero_sensor_dim = 3901          # declared width no longer divides the row
-    with pytest.raises(ValueError, match="re-attribute"):
-        PretrainWindowAdapter(base, path="<fake>")
+    ad = PretrainWindowAdapter(base, path="<fake>")
+    got = ad[0]["extero"]
+    assert got.ndim == 1 and got.shape[0] == 2 * 3900, (
+        f"ballast items must stay flat like the buffer's, got {tuple(got.shape)}; reshaping "
+        "them is what produced 'stack expects each tensor to be equal size, but got [7800] "
+        "at entry 0 and [2, 3900] at entry 22'")
+    assert torch.equal(got, base[0]["extero"]), "the row must be passed through untouched"
+
+
+def test_extero_shape_describes_the_recording_not_the_item() -> None:
+    """It is the field ``ConcatWindowDataset`` compares, and the buffer sets it from the FILE."""
+    ad = PretrainWindowAdapter(_FakeBase(2, 3900), path="<fake>")
+    assert ad.extero_shape == (2, 3900), (
+        "extero_shape must be the source recording's (n_sensors, sensor_dim), matching what "
+        "RolloutWindowDataset reads off f['extero'].shape[1:] -- not the flat item width")
+    assert ad.extero_shape != tuple(ad[0]["extero"].shape), (
+        "these two are deliberately different quantities; if they ever coincide this test is "
+        "no longer checking anything")
+
+
+def test_a_ballast_part_joins_a_buffer_part_that_names_the_same_rig() -> None:
+    """End to end through the guard: agreeing parts must be accepted."""
+    ad = PretrainWindowAdapter(_FakeBase(2, 3900), path="<ballast>")
+
+    class _Buf:                      # the shape RolloutWindowDataset advertises
+        path, extero_shape, cmd_dim = "<buffer>", (2, 3900), 4
+        # The guard also refuses parts whose OPTIONAL key sets differ; ballast is ungraded, so
+        # both sides carry neither here.
+        label = weight = None
+        def __len__(self): return 5
+        def __getitem__(self, i):
+            return {"state": torch.zeros(2), "history": torch.zeros(2),
+                    "extero": torch.zeros(2 * 3900), "history_null": torch.tensor(False),
+                    "cmd_tokens": torch.zeros(3, 4)}
+
+    ds = rd.ConcatWindowDataset([_Buf(), ad])
+    shapes = {tuple(ds[i]["extero"].shape) for i in range(len(ds))}
+    assert shapes == {(2 * 3900,)}, (
+        f"every part must yield the same flat extero for _collate to stack; got {shapes}")
+
+
+def test_a_scan_run_is_one_sensor() -> None:
+    """A privileged scan has a single reading; the geometry still describes it."""
+    ad = PretrainWindowAdapter(_FakeBase(1, 176), path="<fake>")
+    assert ad.extero_shape == (1, 176)
+    assert ad[0]["extero"].ndim == 1
