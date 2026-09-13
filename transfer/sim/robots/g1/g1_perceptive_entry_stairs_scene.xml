@@ -25,6 +25,7 @@
     <worldbody>
         <light pos="1 0 3.5" dir="0 0 -1" directional="true"/>
         <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" group="2"/>
+        <geom name="side_box" type="box" material="box_material" group="2" size="0.6000 0.8000 0.2000" pos="3.0000 4.3000 0.2000"/>
         <geom name="wide_step1" type="box" material="box_material" group="2" size="0.1397 2.5400 0.0762" pos="5.6397 0.0000 0.0762"/>
         <geom name="wide_step2" type="box" material="box_material" group="2" size="0.1397 2.5400 0.1524" pos="5.9191 0.0000 0.1524"/>
         <geom name="wide_step3" type="box" material="box_material" group="2" size="0.1397 2.5400 0.2286" pos="6.1985 0.0000 0.2286"/>

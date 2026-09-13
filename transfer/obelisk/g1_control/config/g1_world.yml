@@ -32,9 +32,11 @@ robot:
         # a 0.40 m box on the ground beside the approach. One scene, both modes: drive
         # straight and it is a staircase, steer left and it is a box jump-up.
         #
-        # Regenerate with `python transfer/sim/generate_entry_stairs_scene.py` -- the scene is
-        # DERIVED and deliberately not committed, so a fresh checkout builds it before the
-        # first run. Swap the line below back to g1_perceptive_terrain_scene.xml for the
+        # Regenerate with `python transfer/sim/generate_entry_stairs_scene.py` after changing
+        # any dimension. The scene is DERIVED but IS tracked, so a fresh checkout can launch
+        # without running the generator first -- which also means an edit to the generator and
+        # a stale .xml can disagree, and only the generator is authoritative. Swap the line
+        # below back to g1_perceptive_terrain_scene.xml for the
         # general in-distribution playground, or to one of the g1_perceptive_tile*_scene.xml
         # for a single real library tile.
         #
