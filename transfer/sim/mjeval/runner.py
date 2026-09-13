@@ -128,6 +128,12 @@ class ArmRun:
             as a run, so its ``manifest.json`` belongs here too.
         robot_name: MuJoCo robot prefix; the scenes are emitted as ``<robot>_<course>.xml``.
         providers: onnxruntime execution providers, as ``resolve_providers`` takes them.
+        num_threads: onnxruntime intra-op threads. ``0`` is ORT's own default, which is ONE
+            THREAD PER CORE -- on a 128-core shared box that is a 254-thread process at 6000%
+            CPU for a job whose heavy half is on the GPU, and it collapses its own throughput:
+            measured on talos, episodes went from 40 s to over 4 minutes once the box was
+            oversubscribed, with this process the largest single contributor. A small number
+            is both faster here and a better neighbour.
         fall_height: Metres of pelvis clearance above the scene's LOWEST terrain surface below
             which the episode is a fall.  On a descending course that datum is the bottom of
             the flight, so up top only the tilt cone is guarding -- see
@@ -178,6 +184,8 @@ class ArmRun:
     out_dir: str
     robot_name: str = "g1_perceptive"
     providers: tuple[str, ...] = ("auto",)
+    #: 8 rather than ORT's one-thread-per-core default -- see the attribute docs above.
+    num_threads: int = 8
     fall_height: float = 0.2
     fall_tilt_deg: float = 70.0
     spawn_z_offset: float = 0.03
@@ -436,6 +444,7 @@ def load_arm(cfg: ArmRun) -> tuple[GenTrackerPolicy, FmDepthLag, Spawn]:
         zero_noise=bool(cfg.zero_noise),
         seed=int(cfg.fm_seed),
         providers=list(cfg.providers) or None,
+        num_threads=int(getattr(cfg, "num_threads", 0)),
         # One generator against two trackers exported at different times, which is the A/B's
         # whole premise.  The field that can disagree is `mjcf_sha256`, and it reaches nothing
         # in this loop: the generator never reads the MJCF (its FK loss used it offline, at
