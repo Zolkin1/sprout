@@ -396,16 +396,27 @@ void PolicyRuntime::BuildValues(const HardwareReadings& readings) {
     }
     for (size_t c = 0; c < p.depth_cameras.size(); ++c) {
       const DepthCameraSpec& cam = p.depth_cameras[c];
+      // Matched on CameraKey, not on raw `obs_term`. The two artifacts name the same lens
+      // differently by construction: the tracker's term is `depth_near` while the generator's
+      // is `fm_depth_near`, because `install_fm_depth_group` prefixes its own sampling of a
+      // lens. Comparing the raw terms refuses every correctly exported subset pair -- and
+      // does so only HERE, since the python runtime matches on the key, so a pair validates
+      // at export and then disarms on the controller's first tick.
+      const std::string want = CameraKey(cam);
       size_t at = rig.size();
       for (size_t r = 0; r < rig.size(); ++r) {
-        if (rig[r].obs_term == cam.obs_term) { at = r; break; }
+        if (CameraKey(rig[r]) == want) { at = r; break; }
       }
       if (at == rig.size()) {
+        std::string have;
+        for (size_t r = 0; r < rig.size(); ++r) {
+          have += (r ? ", " : "") + CameraKey(rig[r]);
+        }
         throw std::runtime_error(
-            "this policy reads camera '" + cam.obs_term +
-            "' but the rig does not publish it. The rig is the generator's extero_spec; a "
-            "camera the tracker reads and the generator does not is a genuine contract "
-            "violation, not a subset.");
+            "this policy reads camera '" + want +
+            "' but the rig does not publish it (rig: [" + have +
+            "]). The rig is the generator's extero_spec; a camera the tracker reads and the "
+            "generator does not is a genuine contract violation, not a subset.");
       }
       const std::vector<double>& raw = readings.depth_raw[at];
       if (static_cast<int>(raw.size()) != cam.pixels()) {

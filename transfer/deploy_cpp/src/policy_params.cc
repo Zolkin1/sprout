@@ -202,6 +202,15 @@ PolicyParams ParsePolicyParameters(const std::string& json) {
   return p;
 }
 
+std::string CameraKey(const DepthCameraSpec& cam) {
+  // `sensor` first: it is the scene name, i.e. the lens itself. `obs_term` is only a fallback
+  // for a contract exported without one.
+  std::string name = !cam.sensor.empty() ? cam.sensor : cam.obs_term;
+  static const std::string kFmSamplingPrefix = "fm_";
+  if (name.rfind(kFmSamplingPrefix, 0) == 0) name = name.substr(kFmSamplingPrefix.size());
+  return name;
+}
+
 CameraGeom GeomFromSpec(const DepthCameraSpec& spec) {
   CameraGeom g;
   g.width = spec.width;
