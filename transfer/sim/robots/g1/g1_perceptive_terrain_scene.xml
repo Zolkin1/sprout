@@ -87,6 +87,47 @@
         <geom name="slow_tread_down3" type="box" size="0.1046 0.7600 0.1968" pos="6.2782 8.0000 0.1968" group="2" material="box_material"/>
         <geom name="slow_tread_down4" type="box" size="0.1046 0.7600 0.1312" pos="6.4874 8.0000 0.1312" group="2" material="box_material"/>
         <geom name="slow_tread_down5" type="box" size="0.1046 0.7600 0.0656" pos="6.6966 8.0000 0.0656" group="2" material="box_material"/>
+        <!-- tall staircase: 20 up + 20 down, width 1.52 m -->
+        <geom name="tall_step1" type="box" size="0.1588 0.7600 0.0698" pos="2.6587 12.0000 0.0698" group="2" material="box_material"/>
+        <geom name="tall_step2" type="box" size="0.1588 0.7600 0.1397" pos="2.9762 12.0000 0.1397" group="2" material="box_material"/>
+        <geom name="tall_step3" type="box" size="0.1588 0.7600 0.2095" pos="3.2938 12.0000 0.2095" group="2" material="box_material"/>
+        <geom name="tall_step4" type="box" size="0.1588 0.7600 0.2794" pos="3.6113 12.0000 0.2794" group="2" material="box_material"/>
+        <geom name="tall_step5" type="box" size="0.1588 0.7600 0.3492" pos="3.9287 12.0000 0.3492" group="2" material="box_material"/>
+        <geom name="tall_step6" type="box" size="0.1588 0.7600 0.4191" pos="4.2462 12.0000 0.4191" group="2" material="box_material"/>
+        <geom name="tall_step7" type="box" size="0.1588 0.7600 0.4889" pos="4.5638 12.0000 0.4889" group="2" material="box_material"/>
+        <geom name="tall_step8" type="box" size="0.1588 0.7600 0.5588" pos="4.8812 12.0000 0.5588" group="2" material="box_material"/>
+        <geom name="tall_step9" type="box" size="0.1588 0.7600 0.6286" pos="5.1988 12.0000 0.6286" group="2" material="box_material"/>
+        <geom name="tall_step10" type="box" size="0.1588 0.7600 0.6985" pos="5.5162 12.0000 0.6985" group="2" material="box_material"/>
+        <geom name="tall_step11" type="box" size="0.1588 0.7600 0.7683" pos="5.8338 12.0000 0.7683" group="2" material="box_material"/>
+        <geom name="tall_step12" type="box" size="0.1588 0.7600 0.8382" pos="6.1513 12.0000 0.8382" group="2" material="box_material"/>
+        <geom name="tall_step13" type="box" size="0.1588 0.7600 0.9080" pos="6.4688 12.0000 0.9080" group="2" material="box_material"/>
+        <geom name="tall_step14" type="box" size="0.1588 0.7600 0.9779" pos="6.7862 12.0000 0.9779" group="2" material="box_material"/>
+        <geom name="tall_step15" type="box" size="0.1588 0.7600 1.0477" pos="7.1037 12.0000 1.0477" group="2" material="box_material"/>
+        <geom name="tall_step16" type="box" size="0.1588 0.7600 1.1176" pos="7.4212 12.0000 1.1176" group="2" material="box_material"/>
+        <geom name="tall_step17" type="box" size="0.1588 0.7600 1.1874" pos="7.7388 12.0000 1.1874" group="2" material="box_material"/>
+        <geom name="tall_step18" type="box" size="0.1588 0.7600 1.2573" pos="8.0563 12.0000 1.2573" group="2" material="box_material"/>
+        <geom name="tall_step19" type="box" size="0.1588 0.7600 1.3271" pos="8.3738 12.0000 1.3271" group="2" material="box_material"/>
+        <geom name="tall_step20" type="box" size="0.1588 0.7600 1.3970" pos="8.6913 12.0000 1.3970" group="2" material="box_material"/>
+        <geom name="tall_platform" type="box" size="1.0000 0.7600 1.3970" pos="9.8500 12.0000 1.3970" group="2" material="box_material"/>
+        <geom name="tall_down1" type="box" size="0.1588 0.7600 1.3271" pos="11.0087 12.0000 1.3271" group="2" material="box_material"/>
+        <geom name="tall_down2" type="box" size="0.1588 0.7600 1.2573" pos="11.3262 12.0000 1.2573" group="2" material="box_material"/>
+        <geom name="tall_down3" type="box" size="0.1588 0.7600 1.1874" pos="11.6437 12.0000 1.1874" group="2" material="box_material"/>
+        <geom name="tall_down4" type="box" size="0.1588 0.7600 1.1176" pos="11.9612 12.0000 1.1176" group="2" material="box_material"/>
+        <geom name="tall_down5" type="box" size="0.1588 0.7600 1.0477" pos="12.2787 12.0000 1.0477" group="2" material="box_material"/>
+        <geom name="tall_down6" type="box" size="0.1588 0.7600 0.9779" pos="12.5962 12.0000 0.9779" group="2" material="box_material"/>
+        <geom name="tall_down7" type="box" size="0.1588 0.7600 0.9080" pos="12.9138 12.0000 0.9080" group="2" material="box_material"/>
+        <geom name="tall_down8" type="box" size="0.1588 0.7600 0.8382" pos="13.2312 12.0000 0.8382" group="2" material="box_material"/>
+        <geom name="tall_down9" type="box" size="0.1588 0.7600 0.7683" pos="13.5488 12.0000 0.7683" group="2" material="box_material"/>
+        <geom name="tall_down10" type="box" size="0.1588 0.7600 0.6985" pos="13.8662 12.0000 0.6985" group="2" material="box_material"/>
+        <geom name="tall_down11" type="box" size="0.1588 0.7600 0.6286" pos="14.1837 12.0000 0.6286" group="2" material="box_material"/>
+        <geom name="tall_down12" type="box" size="0.1588 0.7600 0.5588" pos="14.5012 12.0000 0.5588" group="2" material="box_material"/>
+        <geom name="tall_down13" type="box" size="0.1588 0.7600 0.4889" pos="14.8187 12.0000 0.4889" group="2" material="box_material"/>
+        <geom name="tall_down14" type="box" size="0.1588 0.7600 0.4191" pos="15.1363 12.0000 0.4191" group="2" material="box_material"/>
+        <geom name="tall_down15" type="box" size="0.1588 0.7600 0.3492" pos="15.4537 12.0000 0.3492" group="2" material="box_material"/>
+        <geom name="tall_down16" type="box" size="0.1588 0.7600 0.2794" pos="15.7712 12.0000 0.2794" group="2" material="box_material"/>
+        <geom name="tall_down17" type="box" size="0.1588 0.7600 0.2095" pos="16.0888 12.0000 0.2095" group="2" material="box_material"/>
+        <geom name="tall_down18" type="box" size="0.1588 0.7600 0.1397" pos="16.4062 12.0000 0.1397" group="2" material="box_material"/>
+        <geom name="tall_down19" type="box" size="0.1588 0.7600 0.0698" pos="16.7237 12.0000 0.0698" group="2" material="box_material"/>
         <geom name="box0" type="box" material="box_material" group="2" size="0.2300 1.2950 0.1250" pos="3.0000 -6.5000 0.1250"/>
         <geom name="box1" type="box" material="box_material" group="2" size="0.2300 1.2950 0.2000" pos="6.0000 -6.5000 0.2000"/>
         <geom name="box2" type="box" material="box_material" group="2" size="0.2300 1.2950 0.2750" pos="9.0000 -6.5000 0.2750"/>

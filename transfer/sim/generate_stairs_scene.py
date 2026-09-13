@@ -203,6 +203,22 @@ DEFAULT_LANES: tuple[Lane, ...] = (
     # width the tread is the only thing that makes it special, which is the point of it.
     Lane(name="slow_tread", y=8.0, width=REAL_STAIR_WIDTHS["indoor"], steps=6,
          rise=0.1312, run=0.2092),
+    # A TALL real staircase: 20 steps at a tape-measured 5.5 in x 12.5 in (0.1397 / 0.3175 m),
+    # the same cell `configs/finetune/*.yaml` carries in `updown_measured_cells`.
+    #
+    # What is new here is the HEIGHT, not the step. The cell INTERPOLATES inside the trained
+    # grid -- 0.1397 sits between the 0.130 and 0.155 risers, 0.3175 between the 0.305 and
+    # 0.330 treads -- so every individual step is a shape the robot has seen. Measured over
+    # v6g's 82 stair tiles, flights run 1..18 steps (p50 5) and 0.13..2.49 m (p50 0.77); at 20
+    # steps this is 2.794 m, 1.12x the tallest flight in the library and ~4x the median.
+    #
+    # That makes it the one lane where a failure is about SUSTAINING the gait rather than
+    # entering it: the others are all over within a few steps of the first riser, and a
+    # generator that re-plans its way onto a staircase correctly can still drift off one over
+    # twenty. `_warn_off_grid` will flag the cell, correctly -- it is not a library cell, it
+    # is a real building's.
+    Lane(name="tall", y=12.0, width=REAL_STAIR_WIDTHS["indoor"], steps=20,
+         rise=0.1397, run=0.3175),
 )
 
 
@@ -664,9 +680,18 @@ def main() -> None:
         if round(b.height, 3) not in TRAINED_BOX_HEIGHTS:
             print(f"[WARN] box '{b.name}' height {b.height} m is OUTSIDE the trained set "
                   f"{TRAINED_BOX_HEIGHTS} -- deliberate OOD test?")
+    # TOLERANCE, not `round(x, 3) in tuple`. The grid is stated to four decimals because two
+    # of its cells are (0.1312, 0.2092) and (0.1381, 0.1899) -- rounding those to three puts
+    # them 0.2 mm outside their own tuple, so the check fired on the very lanes that sit
+    # exactly ON the grid. A false warning here is worse than none: it is printed beside the
+    # real ones, on a run whose whole purpose is to say which lanes are off-distribution.
+    def _on_grid(v: float, grid: tuple[float, ...], tol: float = 1e-3) -> bool:
+        """Whether ``v`` matches a grid value to within a millimetre."""
+        return any(abs(v - g) <= tol for g in grid)
+
     for ln in lanes:
         r, rn = ln.rise if ln.rise is not None else args.rise, ln.run if ln.run is not None else args.run
-        if round(r, 3) not in TRAINED_RISERS or round(rn, 3) not in TRAINED_TREADS:
+        if not _on_grid(r, TRAINED_RISERS) or not _on_grid(rn, TRAINED_TREADS):
             print(f"[WARN] lane '{ln.name}' rise/run {r}/{rn} is off the trained grid "
                   f"{TRAINED_RISERS}/{TRAINED_TREADS} -- deliberate OOD test?")
         # Width had no check at all, which is how a 2.2 m centre lane -- wider than any
