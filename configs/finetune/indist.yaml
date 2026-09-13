@@ -43,5 +43,15 @@ box_depth_range_m: [0.45, 1.40]
 box_width_range_m: [1.20, 4.00]
 box_gap_range_m: [1.50, 4.00]
 
-commanded_speed_range_mps: [0.6, 2.5]
+# 0.4 m/s at the low end is BELOW the trained distribution and that is deliberate. The
+# library's own stair grid is a uniform 0.600 .. 2.600 over 3500 clips
+# (`fm_tracking_cmd_cfg.freeform_speed_min`), so 0.6 was the slowest command the tracker or
+# the generator ever saw. Extending down to 0.4 probes the slow end the same way 2.5 probes
+# the fast one -- but a failure at 0.4 is a distribution statement first and a capability
+# statement second, so read the per-speed breakdown rather than the pooled rate.
+#
+# Stamped into the library at build and read back by run_finetune_loop.sh via
+# `clip_io.read_commanded_speed_range`, so CHANGING THIS REQUIRES REBUILDING THE LIBRARY --
+# the band travels in the .h5, not in the launcher.
+commanded_speed_range_mps: [0.4, 2.5]
 seed: 0
