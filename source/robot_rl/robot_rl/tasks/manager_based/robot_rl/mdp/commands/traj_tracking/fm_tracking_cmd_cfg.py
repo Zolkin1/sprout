@@ -290,6 +290,14 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     ``STAIR_SPEEDS``: a uniform 0.600 .. 2.600 over 3500 clips). Restated rather than imported
     because ``robot_rl`` must not import the MuJoCo half.
 
+    **That is the DEFAULT's provenance, not a statement about the library in use, and it has
+    already misled once.** ``STAIR_SPEEDS`` describes the 3500-clip library v6g replaced.
+    Measured on ``g1_mb_v6g_decor.h5`` (10000 clips): commanded vx spans -1.000 .. 2.500, the
+    three terrain families floor at 0.200, flat reaches -1.000 because it includes backwards
+    walking, and 55.5% of clips dip below 0.6 somewhere. A band below 0.6 is therefore well
+    inside what the tracker and the generator were trained on -- read ``target_vel`` off the
+    library rather than inferring a floor from this number.
+
     **The whole (vx, 0, wz) triple is broadcast across every window offset and across the
     generator's F-step horizon.** The clip path instead serves ``target_vel`` sampled at each
     offset, which is a future no deployed runtime has: both ``transfer/deploy/gen_tracker.py``
