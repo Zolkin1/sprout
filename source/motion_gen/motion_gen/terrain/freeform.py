@@ -105,16 +105,16 @@ FAMILIES: tuple[str, str, str] = ("flat", "boxes", "stairs")
 # ``tests/test_freeform_terrain.py`` loads the real file and fails if the two ever drift.
 
 #: Riser heights (m) the shipped clip library's stair tiles were generated on.
-TRAINED_RISERS: tuple[float, ...] = (0.13, 0.131, 0.15, 0.17)
+TRAINED_RISERS: tuple[float, ...] = (0.130, 0.1312, 0.1381, 0.155, 0.180)
 #: Every trained tread (m), ascending and descending pooled.
-TRAINED_TREADS: tuple[float, ...] = (0.178, 0.19, 0.209, 0.22, 0.221, 0.25, 0.28)
+TRAINED_TREADS: tuple[float, ...] = (0.1899, 0.2092, 0.280, 0.305, 0.330)
 #: The ASCENDING half.  Up and down flights used different tread sets, so a flight drawing from
 #: the pooled set would put a descending tread under an ascending flight -- a pair no tile has.
-TRAINED_TREADS_UP: tuple[float, ...] = (0.209, 0.22, 0.221, 0.25, 0.28)
+TRAINED_TREADS_UP: tuple[float, ...] = (0.2092, 0.280, 0.305, 0.330)
 #: The DESCENDING half.  Stated in ``generate_stairs_scene``'s ``TRAINED_TREADS`` comment rather
 #: than exported as its own constant; the test pins ``set(UP) | set(DOWN) == set(TRAINED_TREADS)``
 #: so a change to either side of the split cannot land on one file only.
-TRAINED_TREADS_DOWN: tuple[float, ...] = (0.178, 0.19, 0.22, 0.25)
+TRAINED_TREADS_DOWN: tuple[float, ...] = (0.1899, 0.280, 0.305, 0.330)
 #: Jump-on / jump-off box heights (m), a 0.05 grid over the library's measured 0.25-0.75 range.
 TRAINED_BOX_HEIGHTS: tuple[float, ...] = (0.25, 0.30, 0.35, 0.40, 0.45,
                                           0.55, 0.60, 0.65, 0.70, 0.75)

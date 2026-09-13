@@ -413,7 +413,7 @@ def step_note(rise: float, run: float, ascending: bool) -> str:
     """Whether this step geometry is one the library trained, for this direction.
 
     Reported per DIRECTION because the trained tread sets differ between them --
-    ``TRAINED_TREADS_UP`` carries 0.209-0.28 and the descending set 0.178-0.25 -- so one
+    ``TRAINED_TREADS_UP`` carries 0.2092-0.330 and the descending set 0.1899-0.330 -- so one
     authored staircase can be in-distribution walked up and out of it walked down.
 
     Args:
@@ -424,7 +424,10 @@ def step_note(rise: float, run: float, ascending: bool) -> str:
     Returns:
         A one-line verdict naming which of the two parameters is off-grid, if either.
     """
-    treads = gss.TRAINED_TREADS_UP if ascending else (0.178, 0.19, 0.22, 0.25)
+    # The DESCENDING set, which `generate_stairs_scene` states only in a comment. Re-measured
+    # with the rest on v6g: the main grid is shared with the ascending set and only the steep
+    # cell differs (0.1899 down against 0.2092 up).
+    treads = gss.TRAINED_TREADS_UP if ascending else (0.1899, 0.280, 0.305, 0.330)
     near = lambda v, grid: any(abs(v - g) < 1e-3 for g in grid)  # noqa: E731
     bad = []
     if not near(rise, gss.TRAINED_RISERS):
