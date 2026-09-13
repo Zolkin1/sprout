@@ -246,12 +246,23 @@ def config_keys() -> list[str]:
     return sorted(_SCHEMA)
 
 
-def as_env(cfg: SimpleNamespace) -> dict[str, str]:
-    """The subset ``run_finetune_loop.sh`` consumes, as its own environment-variable names.
+#: Flags ``run_finetune_loop.sh`` parses from the COMMAND LINE. It assigns these plainly
+#: (``TAG=""; GPU=""; BUFFER=4000; ...``) before parsing, so an exported environment variable
+#: of the same name is OVERWRITTEN and silently ignored -- unlike the rest, which it reads as
+#: ``${VAR:-default}``. Passing TAG in the environment therefore does not fail loudly at the
+#: point of the mistake; it fails at the loop's own guard, "REFUSING: --tag is required",
+#: after the queue has already claimed a GPU and reported the job as dispatched.
+_LOOP_FLAGS: dict[str, str] = {
+    "name": "--tag", "buffer": "--buffer", "refresh": "--refresh", "iters": "--iterations",
+}
 
-    The loop stays a shell script driven by env vars -- this is the bridge, not a rewrite.
-    Anything the shell does not read (the geometry ranges, which the LIBRARY generator consumes)
-    is deliberately absent rather than exported and ignored.
+
+def as_env(cfg: SimpleNamespace) -> dict[str, str]:
+    """The subset ``run_finetune_loop.sh`` reads from the ENVIRONMENT.
+
+    Deliberately excludes everything in :data:`_LOOP_FLAGS`: those are command-line flags and
+    the loop clobbers any same-named environment variable before parsing. Returning them here
+    is what made a queue look correctly configured and refuse on first contact.
 
     Args:
         cfg: A loaded config.
@@ -260,18 +271,27 @@ def as_env(cfg: SimpleNamespace) -> dict[str, str]:
         ``{VAR: value}`` ready to export.
     """
     return {
-        "TAG": cfg.name,
         "TASK": cfg.task,
         "CLIP": cfg.clip,
         "GOALS": cfg.goals,
-        "BUFFER": str(cfg.buffer),
-        "REFRESH": str(cfg.refresh),
-        "ITERS": str(cfg.iters),
         "NENV": str(cfg.num_envs),
         "BALLAST_CHUNKS": str(cfg.ballast_chunks),
         "BALLAST_FLAT_FRAC": str(cfg.ballast_flat_frac),
         "BALLAST_ROLLOUT": cfg.ballast_rollout,
     }
+
+
+def as_flags(cfg: SimpleNamespace) -> list[str]:
+    """The command-line half of the same bridge, in order.
+
+    Args:
+        cfg: A loaded config.
+
+    Returns:
+        ``["--tag", "<name>", "--buffer", "<n>", ...]``.
+    """
+    return [str(part) for key, flag in _LOOP_FLAGS.items()
+            for part in (flag, getattr(cfg, key))]
 
 
 if __name__ == "__main__":  # pragma: no cover - a convenience for the shell

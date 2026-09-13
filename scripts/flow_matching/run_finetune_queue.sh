@@ -100,8 +100,20 @@ cfg_env() {  # config -> the loop's env vars, straight from the tracked YAML
 
 cfg_get() { cfg_env "$1" | awk -F= -v k="$2" '$1==k{print substr($0, index($0,"=")+1)}'; }
 
+cfg_flags() {  # config -> the loop's COMMAND-LINE half (--tag/--buffer/--refresh/--iterations)
+  "$PY" -c "import sys; sys.path.insert(0, 'scripts/flow_matching');
+from finetune_config import load_finetune_config, as_flags
+print(' '.join(as_flags(load_finetune_config('configs/finetune/$1.yaml'))))"
+}
+
 ft_root()   { echo "$ROOT/ft_$1"; }
-ft_result() { echo "$(ft_root "$1")/$(printf 'iter_%03d' "$(cfg_get "$1" ITERS)")/ft/best.pt"; }
+ft_result() {  # where a finished fine-tune leaves its checkpoint
+  local n
+  n=$("$PY" -c "import sys; sys.path.insert(0, 'scripts/flow_matching');
+from finetune_config import load_finetune_config
+print(load_finetune_config('configs/finetune/$1.yaml').iters)")
+  echo "$(ft_root "$1")/$(printf 'iter_%03d' "$n")/ft/best.pt"
+}
 
 # --------------------------------------------------------------------------------- the jobs
 launch() {   # kind config gpu
@@ -113,9 +125,19 @@ launch() {   # kind config gpu
     ft)
       # Every knob the run needs comes from the config; only the PARENT, the tracker and the
       # GPU are the queue's to say.
+      #
+      # HALF ENVIRONMENT, HALF FLAGS, and the split is not cosmetic. run_finetune_loop.sh
+      # assigns its flag-backed variables plainly (`TAG=""; GPU=""; BUFFER=4000; ...`) BEFORE
+      # parsing, so an exported TAG is overwritten and ignored, while the rest it reads as
+      # `${VAR:-default}` where the environment does win. Passing everything as environment
+      # looked right, claimed a GPU, logged the job as dispatched, and the loop refused a
+      # second later with "REFUSING: --tag is required". `finetune_config.as_env` /
+      # `as_flags` own the split now, and a test parses this script to keep them honest.
       ( set -a; eval "$(cfg_env "$cfg")"; set +a
-        PARENT="$PARENT" TRK="$TRK" CKPT="$CKPT" GPU="$gpu" ROOT="$(ft_root "$cfg")" \
-        bash scripts/flow_matching/run_finetune_loop.sh ) > "$log" 2>&1 &
+        TRK="$TRK" CKPT="$CKPT" \
+        bash scripts/flow_matching/run_finetune_loop.sh \
+          $(cfg_flags "$cfg") --gpu "$gpu" --root "$(ft_root "$cfg")" \
+          --parent "$PARENT" ) > "$log" 2>&1 &
       ;;
     parent_eval|ft_eval)
       local fm tag

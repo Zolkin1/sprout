@@ -146,3 +146,60 @@ def test_no_two_configs_write_the_same_library() -> None:
     paths = [(_cfg(n).clip, _cfg(n).goals) for n in ALL]
     assert len({p[0] for p in paths}) == len(ALL)
     assert len({p[1] for p in paths}) == len(ALL)
+
+
+# ---------------------------------------------------------------------------------------------
+# The bridge to run_finetune_loop.sh, checked against the SCRIPT
+# ---------------------------------------------------------------------------------------------
+def _loop_text() -> str:
+    """The fine-tune loop script's source."""
+    return (_ROOT / "scripts" / "flow_matching" / "run_finetune_loop.sh").read_text()
+
+
+def test_nothing_passed_as_ENV_is_actually_a_COMMAND_LINE_FLAG() -> None:
+    """The bridge's one real failure mode, and it already happened.
+
+    `run_finetune_loop.sh` assigns its flag-backed variables plainly -- `TAG=""; GPU="";
+    BUFFER=4000; ...` -- BEFORE parsing, so an exported environment variable of the same name
+    is overwritten and ignored. The rest it reads as `${VAR:-default}`, where the environment
+    does win. `as_env` returned TAG/BUFFER/REFRESH/ITERS anyway, so a queue that looked
+    correctly configured claimed a GPU, reported the job dispatched, and the loop refused one
+    second later with "REFUSING: --tag is required".
+    """
+    import re
+
+    from finetune_config import as_env, as_flags
+
+    flags = set(re.findall(r'^\s*--([a-z_]+)\)\s*([A-Z_]+)=', _loop_text(), re.M))
+    flag_vars = {var for _flag, var in flags}
+    assert flag_vars, "could not find the loop's flag parser; this test is not checking anything"
+    clash = flag_vars & set(as_env(_cfg("multi")))
+    assert not clash, (
+        f"as_env returns {sorted(clash)}, which the loop takes as a COMMAND-LINE FLAG and "
+        "overwrites before parsing -- so passing them in the environment does nothing")
+
+
+def test_every_flag_the_loop_REQUIRES_is_supplied() -> None:
+    """`--tag` is the one it refuses without; check we emit it rather than assuming."""
+    from finetune_config import as_flags
+
+    emitted = {a for a in as_flags(_cfg("multi")) if a.startswith("--")}
+    assert "--tag" in emitted
+    text = _loop_text()
+    for flag in emitted:
+        assert f"{flag})" in text, f"{flag} is not a flag run_finetune_loop.sh parses"
+
+
+def test_the_env_half_is_what_the_loop_actually_reads() -> None:
+    """Each key must appear in the loop as a `${VAR:-...}` read, or it is doing nothing."""
+    import re
+
+    from finetune_config import as_env
+
+    # ANY `${VAR:-...}` read counts, not just the `VAR="${VAR:-default}"` assignment form:
+    # the ballast block tests `"${BALLAST_CHUNKS:-0}"` inline, which is the same contract.
+    text = _loop_text()
+    env_reads = set(re.findall(r'\$\{([A-Z_]+):-', text))
+    for key in as_env(_cfg("multi")):
+        assert key in env_reads, (
+            f"as_env emits {key}, but run_finetune_loop.sh never reads it as ${{{key}:-...}}")
