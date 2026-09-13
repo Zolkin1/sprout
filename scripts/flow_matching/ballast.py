@@ -51,9 +51,30 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
 import h5py
 import numpy as np
+
+#: ``scripts/rsl_rl`` on the path, because THIS module is the one with the dependency.
+#:
+#: ``build_ballast_dataset`` reads a PRE-TRAINING recording, and the reader for those
+#: (``recorded_data_io``) is a sibling of ``record_data.py`` over in ``scripts/rsl_rl`` --
+#: while this file sits in ``scripts/flow_matching``. Its importer, ``finetune_generator.py``,
+#: puts ``source/robot_rl`` and ``source/motion_gen`` on the path and nothing else, so the
+#: deferred import below resolved only by luck of who had already imported what.
+#:
+#: It went unnoticed because THE BALLAST PATH IS THE ONLY CALLER: of the four fine-tune
+#: configs only ``multi`` sets ``ballast_chunks > 0``, and the import is deferred to the
+#: bottom of ``build_ballast_dataset``. So the other three run clean, and multi got through
+#: collect, grade, the buffer, both critic rounds and the AWR weights -- 67 minutes -- before
+#: dying on a missing module at stage 8 of 8.
+#:
+#: Set here rather than in the caller so any future importer of this module inherits it.
+_RSL_RL = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                       os.pardir, "rsl_rl"))
+if _RSL_RL not in sys.path:
+    sys.path.insert(0, _RSL_RL)
 
 #: Family names that count as FLAT. Matched after stripping a trailing ``.h5``, the way
 #: ``record_rollouts`` normalises them, and by exact name rather than substring: a substring

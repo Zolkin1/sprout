@@ -107,12 +107,32 @@ print(' '.join(as_flags(load_finetune_config('configs/finetune/$1.yaml'))))"
 }
 
 ft_root()   { echo "$ROOT/ft_$1"; }
+#: The fine-tune's result is `last.pt`, and `best.pt` is a TRAP with a direction.
+#:
+#: `finetune_generator.py` says it in its own docstring: "best.pt is the wrong artifact to
+#: evaluate: it is selected on UNWEIGHTED val_flow_mse, which AWR moves away from by design,
+#: so it favours the checkpoint that changed least". The two really are different files (same
+#: size, different md5 on ft_boxes/iter_005), so this is not a distinction without a
+#: difference.
+#:
+#: The bias has a SIGN, which is what makes it worth a comment rather than a one-word change.
+#: "The checkpoint that changed least" is the one nearest the parent -- and the parent is the
+#: control arm every one of these evals is measured against. Scoring best.pt would therefore
+#: shrink every fine-tune's delta toward zero and report a null result that looks like
+#: "fine-tuning this course does nothing", with nothing in the output to say otherwise.
+#:
+#: `last.pt` is also what the LOOP chains from (iteration k+1 trains from iter_k/ft/last.pt)
+#: and what its own closing advice tells you to evaluate, so this makes the evaluated model
+#: the model the loop actually built. It is still only the END of the curve: the loop keeps
+#: `ckpt_*` precisely because the MuJoCo eval peaks and decays where no training loss says it
+#: does. Scoring those by the terrain reward is the better answer and is not what this queue
+#: does.
 ft_result() {  # where a finished fine-tune leaves its checkpoint
   local n
   n=$("$PY" -c "import sys; sys.path.insert(0, 'scripts/flow_matching');
 from finetune_config import load_finetune_config
 print(load_finetune_config('configs/finetune/$1.yaml').iters)")
-  echo "$(ft_root "$1")/$(printf 'iter_%03d' "$n")/ft/best.pt"
+  echo "$(ft_root "$1")/$(printf 'iter_%03d' "$n")/ft/last.pt"
 }
 
 # --------------------------------------------------------------------------------- the jobs
