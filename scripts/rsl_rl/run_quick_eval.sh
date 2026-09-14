@@ -193,10 +193,35 @@ echo "[eval]   $NENV envs x $ROUNDS rounds = $((NENV * ROUNDS)) episodes/speed"
 echo "[eval]   (round-based stop; an arm compared against this one must match BOTH numbers)"
 echo "[eval]   -> $OUT"
 
+#: THE EPISODE BUDGET MUST BE NON-BINDING, and a flat 40 s was not once 0.40 m/s joined
+#: SPEEDS. box2_ic_report's own docstring records the same fault one generation earlier: at a
+#: 20 s budget a cell needed 20.3 s at PERFECT tracking and scored 0.011, against 0.075 once
+#: the budget moved to 40 s. A cell scored on the clock is scored on the harness.
+#:
+#: The budget is now a DISTANCE -- 41.5 m, which is what 40 s bought at 0.83 m/s (the slowest
+#: band that was ever non-binding) plus 25% -- divided by the commanded speed, and floored at
+#: 40 s so it can only ever LENGTHEN a cell. Every number already measured at 0.83 and above
+#: is therefore untouched.
+#:
+#: MEASURED, on the report's own timeout column (first-per-env, which is the only reduction
+#: these rates mean anything under): the run-wide warning went from 17 cells above the 5%
+#: threshold to 6, and eval_parent_on_boxes pooled 0.2650 -> 0.2786. So this is an improvement
+#: and NOT a fix -- six cells still bind, and the slowest tiles want more than 41.5 m. Raise
+#: EPLEN_DIST_M if a run still warns; the warning is the instrument, not this constant.
+#:
+#: Do not quote a 0.40 m/s rate from a run that still warns. The censoring is not symmetric
+#: either: a policy that survives runs into the clock where a weaker one has already fallen,
+#: so the cut falls hardest on the arm that is doing best.
+EPLEN_DIST_M="${EPLEN_DIST_M:-41.5}"
+eplen_for() {   # speed -> episode budget in seconds
+  awk -v v="$1" -v d="$EPLEN_DIST_M" 'BEGIN { e = d / v; printf "%.1f", (e > 40.0 ? e : 40.0) }'
+}
+
 for spd in $SPEEDS; do
   d="$OUT/train_v${spd}"
   if [ -f "$d/rollout_${TRK}.episodes.h5" ]; then echo "[eval] SKIP $spd (exists)"; continue; fi
-  echo "[eval] speed $spd  $(date +%H:%M)"
+  EPLEN="${EPLEN_OVERRIDE:-$(eplen_for "$spd")}"
+  echo "[eval] speed $spd  budget ${EPLEN}s  $(date +%H:%M)"
   # `--history_from` is a CLI FLAG, not a hydra override: record_rollouts has its own flag
   # for it and applies it after composition, so an override is silently discarded.
   $PY scripts/rsl_rl/record_rollouts.py \
@@ -209,7 +234,7 @@ for spd in $SPEEDS; do
     env.commands.traj_ref.freeform_speed_max=$spd \
     env.events.reset_on_section.params.spawn_from=$SPAWN_FROM \
     env.terminations.goal_reached.params.height_tol_m=$HEIGHT_TOL \
-    env.episode_length_s=40.0 \
+    env.episode_length_s=$EPLEN \
     > "$d.log" 2>&1 || { echo "[eval] speed $spd FAILED, see $d.log" >&2; exit 1; }
 done
 echo "[eval] done $(date +%H:%M)"
