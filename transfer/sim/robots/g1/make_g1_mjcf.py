@@ -113,6 +113,19 @@ JOINT_ARMATURE: dict[str, float] = {
 NATURAL_FREQ = 10 * 2.0 * 3.1415926535
 DAMPING_RATIO = 2.0
 
+#: Joints whose kd is AUTHORED rather than derived from the law above, mirroring
+#: ``robot_rl.assets.robots.g1_21j.WAIST_ROLL_DAMPING``.  Read that constant for why.
+#:
+#: This table exists because the generator DERIVES gains instead of importing them -- it must
+#: stay `motion_gen`-free and cannot reach the RL package -- so a per-joint override on the RL
+#: side would otherwise never reach MuJoCo and sim2sim would quietly run a different plant.
+#: That is not hypothetical: `3ddab280` fixed exactly this, two hip pitches left 2.46x too soft
+#: because the MJCF was maintained separately.  `test_actuator_table.py` is what keeps the two
+#: honest, and it compares against the RL side, which is the definition.
+JOINT_DAMPING_OVERRIDE: dict[str, float] = {
+    "waist_roll_joint": 5.0,
+}
+
 #: Bodies whose visual mesh must NOT be ray-cast, and the group to park it in.
 #:
 #: ``transfer/sim/depth_camera.py`` casts geom groups {1 = per-link visual meshes,
@@ -352,7 +365,8 @@ def apply_actuator_gains(root: ET.Element, armature=JOINT_ARMATURE) -> dict[str,
                     f"position actuator for {joint} declares no default class, so there is "
                     "nowhere to write its gains.")
             kp = armature[joint] * NATURAL_FREQ ** 2
-            kv = 2.0 * DAMPING_RATIO * armature[joint] * NATURAL_FREQ
+            kv = JOINT_DAMPING_OVERRIDE.get(
+                joint, 2.0 * DAMPING_RATIO * armature[joint] * NATURAL_FREQ)
             per_class.setdefault(cls, {})[joint] = (kp, kv)
     if missing:
         raise ValueError(

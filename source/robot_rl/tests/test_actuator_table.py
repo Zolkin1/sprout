@@ -54,7 +54,9 @@ ACTUATORS: dict[str, tuple[float, float, float, float, float]] = {
     "right_ankle_roll_joint": (35.0, 30.0, 28.501246, 1.814446, 2.0 * ARMATURE_5020),
     # waist.
     "waist_yaw_joint": (88.0, 32.0, 40.179238, 2.557890, ARMATURE_7520_14),
-    "waist_roll_joint": (35.0, 30.0, 40.179238, 2.557890, ARMATURE_7520_14),
+    # kd AUTHORED at 5.0 (2026-09-13), the one joint off the zeta=2.0 law -- see
+    # g1_21j.WAIST_ROLL_DAMPING. The zeta=2.0 value was 2.557890.
+    "waist_roll_joint": (35.0, 30.0, 40.179238, 5.0, ARMATURE_7520_14),
     "waist_pitch_joint": (35.0, 30.0, 40.179238, 2.557890, ARMATURE_7520_14),
     # arms + wrists: the 5020 class throughout.  Wrist pitch/yaw are the light 5 N*m
     # motors and also turn slower (22 rad/s) than everything else on that class.
@@ -132,13 +134,33 @@ def test_motor_constants_match_the_table(joint, resolved):
         assert got == pytest.approx(want, rel=1e-6), f"{joint}.{name}: {got} != {want}"
 
 
+#: Joints whose damping is AUTHORED, so the ``d = 2 z J w`` half of the law does not apply.
+#: Listed here rather than skipped inside the test so the exception is a value someone has to
+#: edit, not a condition that quietly covers a future joint too. Mirrors
+#: ``g1_21j.WAIST_ROLL_DAMPING`` and ``make_g1_mjcf.JOINT_DAMPING_OVERRIDE``; all three must
+#: agree, which is what `test_the_mjcf_gains_match_the_rl_table` below actually enforces.
+DAMPING_EXCEPTIONS: dict[str, float] = {"waist_roll_joint": 5.0}
+
+
 def test_the_derived_gain_formula_still_holds(resolved):
     """``k = J w^2`` and ``d = 2 z J w`` with w = 2 pi 10 Hz, z = 2 -- the whole gain table
-    is one number per motor class, so an armature edit moves stiffness AND damping."""
+    is one number per motor class, so an armature edit moves stiffness AND damping.
+
+    STIFFNESS is still universal. DAMPING has exactly the exceptions in
+    :data:`DAMPING_EXCEPTIONS`, each pinned to its authored value here, so raising one joint's
+    kd stays a deliberate edit in three files rather than a drift that no test notices.
+    """
     w = 10 * 2.0 * 3.1415926535
     for joint, (_e, _v, k, d, j) in resolved.items():
         assert k == pytest.approx(j * w ** 2, rel=1e-9), joint
-        assert d == pytest.approx(2.0 * 2.0 * j * w, rel=1e-9), joint
+        want = DAMPING_EXCEPTIONS.get(joint, 2.0 * 2.0 * j * w)
+        assert d == pytest.approx(want, rel=1e-9), joint
+
+
+def test_the_damping_exceptions_are_all_real_joints():
+    """A typo in :data:`DAMPING_EXCEPTIONS` would silently exempt nothing and pin nothing."""
+    assert set(DAMPING_EXCEPTIONS) <= set(G1_JOINT_NAMES), (
+        f"unknown joint(s) {sorted(set(DAMPING_EXCEPTIONS) - set(G1_JOINT_NAMES))}")
 
 
 @pytest.mark.parametrize("joint", sorted(ACTUATORS))

@@ -145,7 +145,21 @@ class G1ClfTrackingEventsCfg:
         func=mdp.randomize_joint_parameters_multi_friction,
         mode="startup",
         params={"asset_cfg": SceneEntityCfg("robot", joint_names=[".*"]),
-                "static_friction_distribution_params": (0.3, 1.6),
+                # LOWER BOUND dropped 0.3 -> 0.05 on 2026-09-13.  The band is `add` on a base
+                # of 0 (the USD declares no joint friction), drawn ONCE at startup, so this is
+                # the joint's whole friction for that env's entire run.  Widening downward
+                # rather than lowering the ceiling: the hardware waist roll behaved like a
+                # joint with far less stiction than the old floor, and a policy that has never
+                # seen a nearly-free joint pushes it too hard.  The 1.6 top is kept so sticky
+                # robots stay in distribution.
+                #
+                # NOTE this is every joint (`.*`), not just the waist -- one term, one band.
+                "static_friction_distribution_params": (0.05, 1.6),
+                # BOTH OF THESE ARE INERT AND MUST STAY.  `randomize_joint_parameters_multi_friction`
+                # has the dynamic and viscous blocks commented out (Isaac removed the feature),
+                # so only the static coefficient is written -- but its guard reads
+                # `if static_... and dynamic_... and viscous_... is not None`, so deleting the
+                # unused pair silently switches OFF the friction DR that does work.
                 "dynamic_friction_distribution_params": (0.3, 1.2),
                 "viscous_friction_distribution_params": (0.01, 0.1),
                 "operation": "add"},

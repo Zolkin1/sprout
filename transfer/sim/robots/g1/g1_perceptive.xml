@@ -10,49 +10,49 @@
       <position kp="99.0984" kv="6.3088" ctrllimited="false" />
     </default>
     <default class="hip_roll_pos">
-      <position kp="99.1" kv="6.31" ctrllimited="false" />
+      <position kp="99.0984" kv="6.3088" ctrllimited="false" />
     </default>
     <default class="hip_yaw_pos">
-      <position kp="40.18" kv="2.56" ctrllimited="false" />
+      <position kp="40.1792" kv="2.55789" ctrllimited="false" />
     </default>
     <default class="knee_pos">
-      <position kp="99.1" kv="6.31" ctrllimited="false" />
+      <position kp="99.0984" kv="6.3088" ctrllimited="false" />
     </default>
     <default class="ankle_pitch_pos">
-      <position kp="28.5" kv="1.81" ctrllimited="false" />
+      <position kp="28.5012" kv="1.81445" ctrllimited="false" />
     </default>
     <default class="ankle_roll_pos">
-      <position kp="28.5" kv="1.81" ctrllimited="false" />
+      <position kp="28.5012" kv="1.81445" ctrllimited="false" />
     </default>
     <default class="waist_yaw_pos">
-      <position kp="40.18" kv="2.56" ctrllimited="false" />
+      <position kp="40.1792" kv="2.55789" ctrllimited="false" />
     </default>
     <default class="shoulder_pitch_pos">
-      <position kp="14.25" kv="0.91" ctrllimited="false" />
+      <position kp="14.2506" kv="0.907223" ctrllimited="false" />
     </default>
     <default class="shoulder_roll_pos">
-      <position kp="14.25" kv="0.91" ctrllimited="false" />
+      <position kp="14.2506" kv="0.907223" ctrllimited="false" />
     </default>
     <default class="shoulder_yaw_pos">
-      <position kp="14.25" kv="0.91" ctrllimited="false" />
+      <position kp="14.2506" kv="0.907223" ctrllimited="false" />
     </default>
     <default class="elbow_pos">
-      <position kp="14.25" kv="0.91" ctrllimited="false" />
+      <position kp="14.2506" kv="0.907223" ctrllimited="false" />
     </default>
     <default class="wrist_roll_pos">
-      <position kp="14.25" kv="0.91" ctrllimited="false" />
+      <position kp="14.2506" kv="0.907223" ctrllimited="false" />
     </default>
     <default class="waist_roll_pos">
-      <position kp="40.18" kv="2.56" ctrllimited="false" />
+      <position kp="40.1792" kv="5" ctrllimited="false" />
     </default>
     <default class="waist_pitch_pos">
-      <position kp="40.18" kv="2.56" ctrllimited="false" />
+      <position kp="40.1792" kv="2.55789" ctrllimited="false" />
     </default>
     <default class="wrist_pitch_pos">
-      <position kp="14.25" kv="0.91" ctrllimited="false" />
+      <position kp="14.2506" kv="0.907223" ctrllimited="false" />
     </default>
     <default class="wrist_yaw_pos">
-      <position kp="14.25" kv="0.91" ctrllimited="false" />
+      <position kp="14.2506" kv="0.907223" ctrllimited="false" />
     </default>
     <default class="collision">
       <geom size="0.005" priority="1" condim="6" solref="0.01 1.1" />

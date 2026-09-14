@@ -23,6 +23,26 @@ DAMPING_7520_14 = 2.0 * DAMPING_RATIO * ARMATURE_7520_14 * NATURAL_FREQ
 DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ
 DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ
 
+#: ``waist_roll_joint``'s damping, and the ONE joint on the robot off the uniform
+#: ``zeta = 2.0`` law above.  2026-09-13, authored rather than derived: on hardware this joint
+#: alone went oscillatory under a 2 m/s run command where MuJoCo damped the same second peak,
+#: and it is the most saturation-prone joint on the robot by construction -- ``waist_yaw``'s
+#: 7520_14 gain class (kp 40.18) on the URDF's 35 N.m budget rather than yaw's 88, giving it
+#: the lowest action scale outside the wrists (0.1089).
+#:
+#: 5.0 corresponds to ``zeta = 3.909``.  Deliberately NOT expressed as a per-joint
+#: DAMPING_RATIO: the ratio is a property of the whole gain law here, and giving one joint its
+#: own would read as if the law had changed rather than as if this joint were an exception.
+#:
+#: **``waist_pitch`` is NOT changed**, though it is the same motor class with the same 35 N.m
+#: and the same mismatch.  That is a deliberate scoping choice -- only roll misbehaved -- so if
+#: this helps, pitch is the obvious next thing to try.
+#:
+#: kd does NOT enter ``G1_ACTION_SCALE`` (``0.125 * effort / stiffness``), so unlike a motor
+#: swap this leaves the action range untouched and old checkpoints load with the same meaning
+#: per element.  The PLANT still changed, so their behaviour is not comparable.
+WAIST_ROLL_DAMPING = 5.0
+
 import pathlib
 
 
@@ -211,7 +231,15 @@ G1_CFG = ArticulationCfg(
             effort_limit_sim=35.0,
             velocity_limit_sim=30.0,
             stiffness=STIFFNESS_7520_14,
-            damping=DAMPING_7520_14,
+            # Per-joint, because roll and pitch now differ.  The keys must match
+            # ``joint_names_expr`` EXACTLY -- `format_actuator_table` and
+            # `export_parameters` both look a dict up by the pattern string, not by a regex
+            # match, so a key that is merely equivalent resolves to None and the joint ships
+            # with no damping at all.
+            damping={
+                "waist_roll_joint": WAIST_ROLL_DAMPING,
+                "waist_pitch_joint": DAMPING_7520_14,
+            },
             armature=ARMATURE_7520_14,
         ),
         "wrists": ImplicitActuatorCfg(
