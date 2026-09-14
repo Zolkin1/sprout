@@ -49,14 +49,25 @@ ballast_flat_frac: 0.5
 # generator was fitted on. `build_ballast_dataset` tells them apart by their arrays and reads
 # each with its own loader -- they end as the same four tensors in the same loss.
 #
-# The v6g pre-training set: 200k windows, the `recorded_` half of the run_fm_pipeline pass
-# started 2026-09-12 against tracker 2026-09-11_11-45-14_paper_v6g_v1. Its family split is
-# 30.5% unknown (= flat) and the rest real terrain families, which is what makes a declared
-# ballast_flat_frac of 0.5 achievable here.
-#
 # It must stay the recording whose generator `--pretrained` names, or the ballast anchors the
-# fine-tune to a distribution that generator was never fitted on.
-ballast_rollout: "logs/rsl_rl/g1/2026-09-11_11-45-14_paper_v6g_v1/recorded_data/recorded_20260912_090151.h5"
+# fine-tune to a distribution that generator was never fitted on. **THIS FIELD MOVES WITH THE
+# PARENT.** It is the one line here that is not a property of the COURSE, so a new generator
+# silently keeps the previous one's anchor unless it is changed by hand -- which nothing
+# detects: `build_ballast_dataset` dispatches on the file's schema, both recordings carry the
+# same arrays, and every shape agrees, so the wrong anchor trains happily.
+#
+# 2026-09-13: moved 20260912_090151 -> 20260913_094223 with the parent. The difference is not
+# cosmetic. The 0912 set was collected from tracker model_9200 by a generator trained with NO
+# depth lag; the 0913 set is from the finished model_19999 and its generator is the first
+# trained with the deployed latency distribution. Anchoring the lag-trained fine-tune to
+# fresh-frame windows would pull 1.8% of its rows against the property that makes it
+# deployable.
+#
+# The set: 200k windows, the `recorded_` half of the run_fm_pipeline pass started 2026-09-13,
+# tracker model_19999. Carries `depth_lag` (200000, 4, 2, 780) -- four lag steps, which is
+# what `depth_latency_probs` indexes, so `_select_depth_lag` can draw from it. Family split is
+# the same seven names as the 0912 set, so a declared ballast_flat_frac of 0.5 stays reachable.
+ballast_rollout: "logs/rsl_rl/g1/2026-09-11_11-45-14_paper_v6g_v1/recorded_data/recorded_20260913_094223.h5"
 
 # 4 types, 70 tiles. The entry stairs split 5 ASCENDING / 5 DESCENDING.
 #
