@@ -601,6 +601,31 @@ def joint_jerk_rms(joints: np.ndarray, dt: float) -> float:
     return float(np.sqrt(np.mean(d3 ** 2)))
 
 
+def decimate_to(q: np.ndarray, dt_src: float, fps_dst: float,
+                anti_alias: bool = True) -> np.ndarray:
+    """``q`` taken from ``1/dt_src`` Hz down to ``fps_dst`` Hz, for a BANDWIDTH-matched score.
+
+    Rate conversion, not interpolation at points: ``resample_poly`` low-passes at the destination
+    Nyquist before it samples, so content above ``fps_dst/2`` is REMOVED rather than folded back
+    down.  That distinction is the whole point here -- folding would manufacture exactly the
+    high-frequency energy the jitter metric exists to measure.
+
+    ``anti_alias=False`` selects plain ``np.interp`` at the destination times, which DOES alias.
+    Both are reported, because they bracket the answer rather than agreeing: on the shipped run
+    they put the MB delta either side of zero, and quoting one alone would present a decimation
+    choice as a property of the motion.
+    """
+    from fractions import Fraction
+    q = np.asarray(q, np.float64)
+    if anti_alias:
+        from scipy.signal import resample_poly
+        f = Fraction(float(fps_dst) * float(dt_src)).limit_denominator(1000)
+        return np.asarray(resample_poly(q, up=f.numerator, down=f.denominator, axis=0), np.float64)
+    t_src = np.arange(len(q)) * dt_src
+    t_dst = np.arange(0.0, t_src[-1] + 1e-9, 1.0 / fps_dst)
+    return np.stack([np.interp(t_dst, t_src, q[:, k]) for k in range(q.shape[1])], axis=1)
+
+
 def bootstrap_rmse(per_clip: list, n_boot: int = 2000, seed: int = 0,
                    ci: float = 0.95) -> tuple:
     """Clip-CLUSTERED bootstrap of a pooled RMSE. ``per_clip`` is ``[(sum_sq, n_frames)]``.
@@ -734,6 +759,31 @@ def _run_matches(run_path: str, args: argparse.Namespace) -> bool:
     return ok
 
 
+def _mm_command_mismatch(mm_path: str, clip_path: str,
+                         pick: list[int]) -> tuple[int, int, float] | None:
+    """The first MM clip whose command differs from ours, as ``(j, our_index, max |dv|)``.
+
+    ``None`` when all of ``pick`` agree, which is the entire fairness premise of this comparison:
+    the arms are comparable only because ONE command profile drives every one of them.
+
+    Compared over the frames both sides declare (``clip_len``), so a shorter arm is not failed on
+    padding it never solved.  Exact to 1e-6 rather than approximate -- both sides wrote the same
+    float64 array through ``ClipOutputBuilder``, so a real pairing reads 0.0 and anything else is
+    a different motion, not numerical drift.
+    """
+    import h5py
+    with h5py.File(mm_path, "r") as f:
+        mm_cmd, mm_len = np.asarray(f["target_vel"]), np.asarray(f["clip_len"])
+    with h5py.File(clip_path, "r") as f:                 # pick is sorted -> valid h5py fancy index
+        our_cmd, our_len = np.asarray(f["target_vel"][pick]), np.asarray(f["clip_len"][pick])
+    for j in range(len(pick)):
+        n = int(min(mm_len[j], our_len[j]))
+        dv = float(np.abs(mm_cmd[j, :n] - our_cmd[j, :n]).max()) if n else float("inf")
+        if dv > 1e-6:
+            return j, pick[j], dv
+    return None
+
+
 def select_flat_clips(clip_path: str, n_clips: int, seed: int) -> list[int]:
     """The flat clip indices a batch run scores, as a sorted list.
 
@@ -772,6 +822,9 @@ def stage_batch(args: argparse.Namespace) -> int:
     mm_b: dict[str, dict] = {}           # label -> {(bucket, window): [per-clip]}
     jerk = {"ours": [], "baseline": [], "artifact": [],
             "ours_seam": [], "ours_interior": [], "seam_frac": []}
+    # The same six, scored at Motion Bricks' NATIVE rate instead (see the 30 Hz block below).
+    jerk30 = {"ours": [], "ours_lin": [], "baseline": [],
+              "ours_seam": [], "ours_interior": [], "seam_frac": []}
     run_paths, failed = [], []
 
     # The motion-matching arm, if one was built. Its clip j corresponds to OUR pick[j] -- that is
@@ -797,6 +850,23 @@ def stage_batch(args: argparse.Namespace) -> int:
                 f"{path} was built against clips {src.get('clip_indices', [])[:6]}... but "
                 f"this run scores {pick[:6]}... -- the arms would be paired on different motions. "
                 f"Rebuild it with --command-n-clips {args.n_clips} --command-seed {args.seed}.")
+        # ... and then the COMMANDS, because matching indices are NOT matching motions. Two
+        # libraries with the same flat count draw the same picks -- g1_mb_v6f_decor and
+        # g1_mb_v6g_decor both give [7312, 7352, ...] at n=30 seed=1234 -- while authoring
+        # different velocity profiles at them, so the index check alone passes a stale arm
+        # straight through and every row of the table pairs our clip against a motion solved for
+        # a command it never saw. `command_source` does record its library, but a path string is
+        # the wrong comparison: it moves with a rename and says nothing about content. The
+        # command is the contract between the arms, so compare the command.
+        bad = _mm_command_mismatch(path, args.clip, pick)
+        if bad is not None:
+            j_bad, ci_bad, dv = bad
+            raise SystemExit(
+                f"{path} clip {j_bad} carries a DIFFERENT command than {args.clip} clip "
+                f"{ci_bad} (max |dv| = {dv:.4f} m/s) even though the indices agree -- it was "
+                f"built against {src.get('library', '?')}. Rebuild it with "
+                f"--command-from {args.clip} --command-n-clips {args.n_clips} "
+                f"--command-seed {args.seed}.")
         # The library names its own search (generate_mm_clips writes it); a LABEL= prefix wins.
         # Falling back to the file stem would let two arms of the same matcher look distinct.
         if not label:
@@ -809,6 +879,7 @@ def stage_batch(args: argparse.Namespace) -> int:
         mm_libs[label] = path
         mm_b[label] = {(i, w): [] for i in range(len(buckets)) for w in ("all", "settled")}
         jerk[f"mm:{label}"] = []
+        jerk30[f"mm:{label}"], jerk30[f"mm_lin:{label}"] = [], []
         print(f"[mb_base] MM arm {label!r}: {path} ({len(src['clip_indices'])} clips, "
               "indices verified)")
 
@@ -880,6 +951,34 @@ def stage_batch(args: argparse.Namespace) -> int:
                 jerk["ours_seam"].append(float(np.sqrt((d3[near] ** 2).mean())))
                 jerk["ours_interior"].append(float(np.sqrt((d3[~near] ** 2).mean())))
                 jerk["seam_frac"].append(float(near.mean()))
+
+        # --- and again BANDWIDTH-MATCHED, at Motion Bricks' own 30 Hz ---
+        # Everything above sits on 50 Hz, which fixes the dt^-3 convention but NOT the bandwidth:
+        # a 30 fps signal cannot carry anything above 15 Hz, ours carries to 25, and jerk lives at
+        # the top of the band -- so that column charges us for content the MB arm structurally
+        # cannot have.  Here MB is its OWN untouched samples (`qpos`, never interpolated) and the
+        # other arms come down to meet it, which is the only grid on which no arm is asked for
+        # samples it never produced.
+        with np.load(runp, allow_pickle=True) as _d:
+            q_mb_native = np.asarray(_d["qpos"], np.float64)[:, 7:]
+        jerk30["baseline"].append(joint_jerk_rms(q_mb_native, 1.0 / fps_mb))
+        q_o30 = decimate_to(q_ours, clip["dt"], fps_mb)
+        jerk30["ours"].append(joint_jerk_rms(q_o30, 1.0 / fps_mb))
+        jerk30["ours_lin"].append(
+            joint_jerk_rms(decimate_to(q_ours, clip["dt"], fps_mb, anti_alias=False), 1.0 / fps_mb))
+        if si is not None and len(q_o30) > 3:
+            # The seam marks carried onto the coarser grid by nearest source frame, and the window
+            # scaled with it (+-5 frames at 50 Hz is +-3 at 30) so it spans the same ~0.1 s.
+            s30 = si[np.clip((np.arange(len(q_o30)) / (fps_mb * clip["dt"])).round().astype(int),
+                             0, clip["n"] - 1)]
+            d3 = (q_o30[3:] - 3.0 * q_o30[2:-1] + 3.0 * q_o30[1:-2] - q_o30[:-3]) * fps_mb ** 3
+            near30 = np.zeros(len(d3), bool)
+            for k in np.flatnonzero(s30[1:] != s30[:-1]) + 1:
+                near30[max(0, k - 3):min(len(near30), k + 3)] = True
+            if near30.any() and (~near30).any():
+                jerk30["ours_seam"].append(float(np.sqrt((d3[near30] ** 2).mean())))
+                jerk30["ours_interior"].append(float(np.sqrt((d3[~near30] ** 2).mean())))
+                jerk30["seam_frac"].append(float(near30.mean()))
         # The FLOOR: score the command against a SMOOTHED COPY OF ITSELF, i.e. what a perfect
         # tracker measures under this exact instrument. The boxcar is centred, so half its window
         # of post-change motion leaks backwards across every command change -- harmless in the
@@ -908,6 +1007,11 @@ def stage_batch(args: argparse.Namespace) -> int:
             jerk[f"mm:{label}"].append(
                 joint_jerk_rms(mmc["y"][:, [mmc["names"].index(f"joint:{n_}")
                                             for n_ in G1_JOINT_NAMES]], mmc["dt"]))
+            q_mm = mmc["y"][:, [mmc["names"].index(f"joint:{n_}") for n_ in G1_JOINT_NAMES]]
+            jerk30[f"mm:{label}"].append(
+                joint_jerk_rms(decimate_to(q_mm, mmc["dt"], fps_mb), 1.0 / fps_mb))
+            jerk30[f"mm_lin:{label}"].append(
+                joint_jerk_rms(decimate_to(q_mm, mmc["dt"], fps_mb, anti_alias=False), 1.0 / fps_mb))
         for bi in range(len(buckets)):
             for w in ("all", "settled"):
                 ours_b[(bi, w)].append(mo[bi][w])
@@ -1031,6 +1135,45 @@ def stage_batch(args: argparse.Namespace) -> int:
               "arms have no seams to split on. Read them against the resample control: if our",
               "interior sits within that control of a rival, the fleet-level difference is seams,",
               "and seams answer to seam_blend_s."]
+    if jerk30["ours"]:
+        lines += ["", "### JITTER AT 30 Hz -- bandwidth-matched, and the grid to compare METHODS on",
+                  f"{'arm':>22} {'rate':>7}   {'jerk RMS [95% CI]':>26}   {'paired vs OURS':>22}",
+                  f"{'OURS':>22} {'50->30':>7}   {_mean_ci(jerk30['ours']):>26}   {'--':>22}"]
+        if jerk30["ours_seam"]:
+            sf30 = 100.0 * float(np.mean(jerk30["seam_frac"]))
+            lines += [f"{f'  seam +-3fr ({sf30:.0f}%)':>22} {'50->30':>7}   "
+                      f"{_mean_ci(jerk30['ours_seam']):>26}   "
+                      f"{_paired_ci(jerk30['ours_interior'], jerk30['ours_seam']):>22}",
+                      f"{'  everywhere else':>22} {'50->30':>7}   "
+                      f"{_mean_ci(jerk30['ours_interior']):>26}   {'(the baseline above)':>22}"]
+        for label in mm_libs:
+            if jerk30[f"mm:{label}"]:
+                lines.append(f"{f'MM ({label})':>22} {'50->30':>7}   "
+                             f"{_mean_ci(jerk30[f'mm:{label}']):>26}   "
+                             f"{_paired_ci(jerk30['ours'], jerk30[f'mm:{label}']):>22}")
+        lines.append(f"{'MB alone':>22} {'30 Hz':>7}   {_mean_ci(jerk30['baseline']):>26}   "
+                     f"{_paired_ci(jerk30['ours'], jerk30['baseline']):>22}")
+        naive = [f"MB {_paired_ci(jerk30['ours_lin'], jerk30['baseline'])}"]
+        naive += [f"MM ({l}) {_paired_ci(jerk30['ours_lin'], jerk30[f'mm_lin:{l}'])}"
+                  for l in mm_libs if jerk30[f"mm_lin:{l}"]]
+        lines += ["",
+                  "The 50 Hz table fixes the dt^-3 convention but NOT the BANDWIDTH: 30 fps cannot",
+                  "carry anything above 15 Hz, ours carries to 25, and jerk lives at the top of the",
+                  "band -- so it charges us for content the MB arm structurally cannot have. Here MB",
+                  "is its OWN untouched 30 Hz samples and the others are decimated to meet it: the",
+                  "only grid where no arm is asked for samples it never produced. Decimation is",
+                  "anti-aliased (resample_poly). With plain np.interp, which folds >15 Hz content",
+                  "back down instead of removing it, the same deltas read " + "; ".join(naive) + ".",
+                  "Where the two bracket zero, the honest reading is NO detectable difference --",
+                  "the residual is the decimation choice, not the motion.",
+                  "",
+                  "This is the METHOD comparison, and it is two things it may look like but is not:",
+                  "it is not what our stack would produce if it RAN at 30 Hz (that means solving and",
+                  "splicing at 30 Hz, not filtering the output), and it is not what the tracker",
+                  "consumes -- that is 50 Hz, and it is the table above. A lower-rate method is",
+                  "smoother AS DELIVERED for the same reason it scores well here, which is real and",
+                  "is bought with bandwidth."]
+
     table = "\n".join(lines).lstrip("\n")
     print("\n" + table)
     print(f"\ndelta > 0 means MB alone is WORSE. Clip-clustered bootstrap, "
@@ -1049,7 +1192,9 @@ def stage_batch(args: argparse.Namespace) -> int:
         json.dump({"buckets": results, "clips": pick, "failed": failed,
                    "smooth_s": args.smooth_s, "root_mode": args.root_mode,
                    "n_boot": args.n_boot, "mm_arms": mm_libs,
-                   "jerk_rms": {k: [float(x) for x in v] for k, v in jerk.items() if v}}, f, indent=1)
+                   "jerk_rms": {k: [float(x) for x in v] for k, v in jerk.items() if v},
+                   "jerk_rms_30hz": {k: [float(x) for x in v] for k, v in jerk30.items() if v}},
+                  f, indent=1)
     with open(os.path.join(args.out_dir, "results.txt"), "w") as f:
         f.write(table + "\n\ndelta > 0 means MB alone is WORSE.\n")
     with open(os.path.join(args.out_dir, "PROVENANCE.md"), "w") as f:
