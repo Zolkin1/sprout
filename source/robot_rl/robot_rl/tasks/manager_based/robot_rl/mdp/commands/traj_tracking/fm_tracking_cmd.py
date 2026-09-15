@@ -328,6 +328,11 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._ff_speed = torch.zeros(n, device=dev)
         self._ff_origin_w = torch.zeros(n, 2, device=dev)
         self._ff_heading_w = torch.zeros(n, device=dev)
+        #: World-frame goal point per env, for the optional approach controller. Allocated
+        #: unconditionally like every other `_ff_*` buffer (the accessors must never reach an
+        #: attribute a skipped construction path never wrote) but only WRITTEN, and only READ,
+        #: when `freeform_approach_kp > 0`.
+        self._ff_goal_w = torch.zeros(n, 2, device=dev)
         self._ff_hold_steps = 0
         if self.freeform_command:
             self._init_freeform_command()
@@ -1279,6 +1284,29 @@ class FmTrackingCommand(MotionSequenceCommand):
         if hold_s < 0.0:
             raise ValueError(f"freeform_cmd_hold_s must be >= 0, got {hold_s}.")
         self._ff_hold_steps = int(round(hold_s / float(self.env.step_dt)))
+        # The APPROACH controller changes what `vx` MEANS -- the draw becomes a ceiling rather
+        # than the command -- and nothing downstream records the command law, so a run that had
+        # it on would be indistinguishable from one that did not except by this line. Same
+        # reason `history_from` and `attention_mode` are printed unconditionally.
+        a_kp = float(getattr(self.cfg, "freeform_approach_kp", 0.0) or 0.0)
+        if a_kp > 0.0:
+            if float(getattr(self.cfg, "freeform_stop_radius_m", 0.0) or 0.0) < 0.0:
+                raise ValueError(
+                    "freeform_stop_radius_m must be >= 0, got "
+                    f"{self.cfg.freeform_stop_radius_m}; it is a range.")
+            floor = float(getattr(self.cfg, "freeform_approach_min_speed", 0.0) or 0.0)
+            stop_r = float(getattr(self.cfg, "freeform_stop_radius_m", 0.0) or 0.0)
+            approach = (
+                f" APPROACH CONTROLLER ON: vx = clamp({a_kp} * (along_track_to_go - {stop_r}) "
+                f"- {self.cfg.freeform_approach_kd} * closing_rate, {floor}, the drawn speed) "
+                f"while the goal is AHEAD, and exactly 0 within {stop_r} m of it (where wz is "
+                f"zeroed too). The draw above is therefore a CEILING, not the command. "
+                f"Distance-to-go is SIGNED along the route, so an overshoot does not command "
+                f"the robot further away. Standing still inside the stop radius pays FULL "
+                f"marks on the reward's exp(-|v_err|/sigma) term, which is what makes stopping "
+                f"trainable rather than penalised.")
+        else:
+            approach = ""
         print(
             f"[INFO FmTrackingCommand] free-form velocity command: vx ~ U[{lo:.3f}, {hi:.3f}] "
             f"m/s held for the whole episode, vy = {FREEFORM_VY}, "
@@ -1289,7 +1317,7 @@ class FmTrackingCommand(MotionSequenceCommand):
             f"1/s), after {self._ff_hold_steps} steps ({hold_s} s) of zero command. The "
             "library's target_vel is NOT read. STEERING ON A STAIRCASE IS OFF-DISTRIBUTION: "
             "the generator was commanded |wz| max = 0.0000 over all 3500 stair clips and is "
-            "frozen during this fine-tune."
+            "frozen during this fine-tune." + approach
         )
 
     def _reset_freeform_command(self, env_ids: torch.Tensor) -> None:
@@ -1315,6 +1343,12 @@ class FmTrackingCommand(MotionSequenceCommand):
         origin_w, heading_w = self._default_freeform_section(env_ids)
         self._ff_origin_w[env_ids] = origin_w
         self._ff_heading_w[env_ids] = heading_w
+        # Resolved only for the opt-in approach controller. Guarded rather than written
+        # unconditionally so a config that never asked for it does not pay a route lookup per
+        # reset, and so the no-route fallback above cannot silently install a meaningless goal
+        # on a run that would otherwise never look at one.
+        if float(getattr(self.cfg, "freeform_approach_kp", 0.0) or 0.0) > 0.0:
+            self._ff_goal_w[env_ids] = self._default_freeform_goal(env_ids)
         self._ff_cmd[env_ids] = 0.0
 
     def set_freeform_section(
@@ -1422,6 +1456,55 @@ class FmTrackingCommand(MotionSequenceCommand):
         return (origin_w.to(self._ff_origin_w.dtype),
                 heading_w.to(self._ff_heading_w.dtype))
 
+    @staticmethod
+    def _lift_tile_xy(route: dict, xk: str, yk: str, device) -> torch.Tensor:
+        """Lift a tile-local route point into the world by the tile's corner and frame yaw.
+
+        Extracted so the centreline and the goal cannot drift apart in how they are placed --
+        :meth:`_default_freeform_section`'s docstring records what it cost when a route point
+        was resolved by a second, subtly different rule.
+
+        Args:
+            route: A :func:`~...events.resets.freeform_route` dict.
+            xk: Key of the tile-local x field, e.g. ``"goal_x"``.
+            yk: Key of the tile-local y field.
+            device: Device for the result.
+
+        Returns:
+            ``[k, 2]`` world-frame xy.
+        """
+        frame_yaw = route["frame_yaw"].to(device)
+        lx = route[xk].to(device)
+        ly = route[yk].to(device)
+        cos_y, sin_y = torch.cos(frame_yaw), torch.sin(frame_yaw)
+        corner = route["corner"].to(device)
+        return torch.stack([corner[:, 0] + cos_y * lx - sin_y * ly,
+                            corner[:, 1] + sin_y * lx + cos_y * ly], dim=-1)
+
+    def _default_freeform_goal(self, env_ids: torch.Tensor) -> torch.Tensor:
+        """The world-frame goal point per env, for the approach controller.
+
+        Read only when :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.freeform_approach_kp`
+        is positive, so a config that never opted in resolves no goal and a scene with no route
+        is not an error here -- it falls back to the centreline origin, which makes the range
+        term meaningless but keeps a unit-test double constructible. A course that wants the
+        controller must supply a route, and the free-form terrain always does.
+
+        Args:
+            env_ids: ``[k]`` env indices being reset.
+
+        Returns:
+            ``[k, 2]`` world-frame goal xy.
+        """
+        scene = getattr(self.env, "scene", None)
+        importer = getattr(scene, "terrain", None) if scene is not None else None
+        if not getattr(importer, "terrain_route", None):
+            return self._ff_origin_w[env_ids]
+        from ...events.resets import freeform_route
+        route = freeform_route(importer, env_ids)
+        return self._lift_tile_xy(route, "goal_x", "goal_y",
+                                  self.device).to(self._ff_goal_w.dtype)
+
     def _update_freeform_command(self) -> None:
         """Rebuild ``(vx, 0, wz)`` for every env from its pose and its section centreline.
 
@@ -1443,9 +1526,89 @@ class FmTrackingCommand(MotionSequenceCommand):
             float(self.cfg.freeform_wz_max),
         )
         zero = torch.zeros((), device=self._ff_cmd.device, dtype=self._ff_cmd.dtype)
-        self._ff_cmd[:, 0] = torch.where(held, zero, self._ff_speed)
+        vx = self._ff_speed
+        # The APPROACH controller, off unless a course asks for it. `kp == 0` short-circuits
+        # before any goal state is touched, so a config that never set it takes the identical
+        # path it always did -- see `freeform_approach_kp` for why that guarantee is explicit.
+        # getattr, not attribute access: the free-form tests drive this class with
+        # SimpleNamespace cfg doubles, and a bare read turned eight passing tests into
+        # AttributeError. Any new knob added here must be read the same way.
+        kp = float(getattr(self.cfg, "freeform_approach_kp", 0.0) or 0.0)
+        if kp > 0.0:
+            vx, stopped = self._freeform_approach_speed(root_xy, kp)
+            # Inside the stop radius the yaw channel goes quiet too: the look-ahead bearing is
+            # measuring the last of the approach error over a shrinking baseline, so a robot
+            # holding station would be told to keep turning.
+            wz = torch.where(stopped, zero, wz)
+        self._ff_cmd[:, 0] = torch.where(held, zero, vx)
         self._ff_cmd[:, 1] = FREEFORM_VY
         self._ff_cmd[:, 2] = torch.where(held, zero, wz)
+
+    def _freeform_approach_speed(self, root_xy: torch.Tensor,
+                                 kp: float) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward speed from distance-to-goal, and which envs are inside the stop radius.
+
+        ``vx = clamp(kp * (to_go - stop_radius) - kd * closing, floor, drawn_speed)`` outside
+        the stop radius, and exactly ``0`` inside it.
+
+        **``to_go`` is SIGNED ALONG-TRACK, not Euclidean range, and that is a bug fix rather
+        than a refinement.** With an unsigned range a robot that coasts past the goal reads a
+        GROWING distance and is commanded to accelerate away from it -- and on a near-wall tile
+        the far wall is 0.5-1.5 m past the goal, so the controller would drive it into the one
+        thing the course exists to teach it to stop for. Projected on the route direction, an
+        overshoot goes negative, the P term goes negative, and the clamp holds it at the floor
+        of zero.
+
+        **The FLOOR is why a stop is a stop and not a crawl.** Without it the P law decays
+        continuously, so the command spends the last couple of metres in the 0.05-0.3 m/s band
+        -- which is both where the robot stops walking for reasons no reward can see, and a
+        band the generator has barely trained on (5.8% of its command rows are |vx| < 0.1 and
+        ~7% fall in 0.1-0.3). The robot then settles wherever its own deadband put it, short of
+        the goal, and gets scored as not having arrived. Holding a real speed until the disc
+        and then cutting to zero makes the command a RAMP-THEN-STEP, which is the shape
+        :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.freeform_cmd_hold_s` already argues
+        for at the other end of the episode, and keeps every commanded value either 0 or
+        inside the trained band.
+
+        **Past the goal and outside the disc, the command is zero rather than the floor.** The
+        floor exists to stop the robot dawdling on the APPROACH; applying it to an overshoot
+        would drive it further away, into the wall. A robot that overshoots is therefore left
+        standing and the episode times out -- an honest failure, and a visible one, rather than
+        a crash into the geometry.
+
+        Args:
+            root_xy: ``[N, 2]`` root world position.
+            kp: Proportional gain (1/s); the caller has already checked it is positive.
+
+        Returns:
+            ``(vx, stopped)`` -- ``[N]`` commanded forward speed and a ``[N]`` bool mask of the
+            envs within
+            :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.freeform_stop_radius_m` of their
+            goal, whose yaw channel the caller also zeroes.
+        """
+        stop_r = float(getattr(self.cfg, "freeform_stop_radius_m", 0.0) or 0.0)
+        kd = float(getattr(self.cfg, "freeform_approach_kd", 0.0) or 0.0)
+        floor = float(getattr(self.cfg, "freeform_approach_min_speed", 0.0) or 0.0)
+        to_goal = self._ff_goal_w - root_xy                                     # [N, 2]
+        rng = torch.linalg.norm(to_goal, dim=-1)                                # [N]
+        # Along-track component, measured on the ROUTE direction rather than on the bearing to
+        # the goal, so it stays meaningful once the robot is beside or past the goal.
+        ux = torch.cos(self._ff_heading_w)
+        uy = torch.sin(self._ff_heading_w)
+        to_go = to_goal[:, 0] * ux + to_goal[:, 1] * uy                         # signed
+        vel_xy = wp.to_torch(self.robot.data.root_lin_vel_w)[:, :2]
+        closing = vel_xy[:, 0] * ux + vel_xy[:, 1] * uy      # >0 while running down the route
+        vx = kp * (to_go - stop_r) - kd * closing
+        vx = vx.clamp(min=0.0).minimum(self._ff_speed)
+        if floor > 0.0:
+            # Per env, and capped by that env's OWN draw: an episode that drew 0.6 m/s must not
+            # be sped up to the floor, or the floor would quietly widen the commanded band that
+            # `freeform_speed_min` is supposed to define. Applied only where the goal is still
+            # AHEAD -- see the docstring on overshoot.
+            lift = torch.minimum(torch.full_like(vx, floor), self._ff_speed)
+            vx = torch.where(to_go > stop_r, torch.maximum(vx, lift), vx)
+        stopped = rng <= stop_r
+        return torch.where(stopped, torch.zeros_like(vx), vx), stopped
 
     # --- the four command-velocity accessors, overridden as one set -----------------
     #
@@ -2814,6 +2977,78 @@ class FmTrackingCommand(MotionSequenceCommand):
         super()._debug_vis_callback(event)
         if self.fm_enabled and self.cfg.debug_vis_show_fm_prediction:
             self._draw_fm_prediction_ribbon()
+        if bool(getattr(self.cfg, "debug_vis_goal_disc", False)):
+            self._draw_goal_disc()
+
+    def _dwell_radius(self) -> float | None:
+        """The dwell disc's radius, read off the TERMINATION that enforces it.
+
+        Read back rather than restated on this cfg, so the marker cannot disagree with the
+        rule. A course that asks for the disc without wiring
+        :class:`~...terminations.terminations.freeform_goal_dwell` gets a warning and no
+        marker, never a silent nothing: an absent marker looks exactly like a correctly placed
+        off-screen one, which is the reading ``_load_goal_spec`` also refuses to allow.
+
+        Returns:
+            The radius in metres, or ``None`` when no dwell term is wired.
+        """
+        if getattr(self, "_dwell_r", "unset") != "unset":
+            return self._dwell_r
+        self._dwell_r = None
+        terms = getattr(getattr(self.env, "cfg", None), "terminations", None)
+        for name in (vars(terms) if terms is not None else {}):
+            term = getattr(terms, name, None)
+            func = getattr(term, "func", None)
+            fname = getattr(func, "__name__", type(func).__name__ if func else "")
+            if fname == "freeform_goal_dwell":
+                self._dwell_r = float(getattr(term, "params", {}).get("radius_m", 0.5))
+                break
+        if self._dwell_r is None:
+            print("[WARN FmTrackingCommand] debug_vis_goal_disc is on but no "
+                  "freeform_goal_dwell termination is wired, so there is no dwell radius to "
+                  "draw. Nothing will be drawn -- which is why this says so.")
+        return self._dwell_r
+
+    def _draw_goal_disc(self) -> None:
+        """Draw the dwell region: one flat translucent cylinder per env, on its goal.
+
+        A DISC and not the inherited gate, because the two terms mean different regions: the
+        gate is the face of a downrange half-plane ("did it get through"), this is a bounded
+        area the robot has to still be inside seconds later ("did it stop"). Drawing the gate
+        on a dwell course would show a boundary the episode does not turn on.
+
+        Centred on the same world goal the controller drives to (``_ff_goal_w``), so if the
+        controller is aiming somewhere other than where the termination is watching, the
+        marker sits with the CONTROLLER and the disagreement is visible rather than inferred.
+        """
+        radius = self._dwell_radius()
+        if radius is None:
+            return
+        if getattr(self, "_goal_disc_markers", None) is None:
+            from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+            import isaaclab.sim as sim_utils
+            cfg = VisualizationMarkersCfg(
+                prim_path="/Visuals/Command/goal_dwell_disc",
+                markers={"disc": sim_utils.CylinderCfg(
+                    radius=radius, height=0.02,
+                    visual_material=sim_utils.PreviewSurfaceCfg(
+                        diffuse_color=(0.1, 0.8, 0.3), opacity=0.35),
+                )},
+            )
+            try:
+                self._goal_disc_markers = VisualizationMarkers(cfg)
+            except Exception as exc:
+                print(f"[WARN FmTrackingCommand] could not create the goal disc: {exc}")
+                self._goal_disc_markers = False
+        if self._goal_disc_markers is False:
+            return
+        # Lifted just clear of the floor so it reads as a painted region rather than z-fighting
+        # with the ground mesh. The goal's own walkable height is 0 on every wall-field tile;
+        # taking it off the route would be the general fix if that ever stops being true.
+        pos = torch.zeros(self.num_envs, 3, device=self.device)
+        pos[:, :2] = self._ff_goal_w
+        pos[:, 2] = self.env.scene.env_origins[:, 2] + 0.02
+        self._goal_disc_markers.visualize(translations=pos)
 
     def _clip_ribbon_env_mask(self) -> torch.Tensor | None:
         """Draw the inherited CLIP ribbon only when the clip is what the robot tracks.

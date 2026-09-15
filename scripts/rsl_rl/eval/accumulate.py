@@ -222,6 +222,13 @@ class EpisodeAccumulator:
         # indistinguishable from a real ground-level spawn.
         self.spawn_z = torch.full((self.n,), float("nan"), device=self.device)
         self._goal_tol = torch.zeros(self.n, 3, device=self.device)
+        #: The DWELL rule, resolved from the goal spec in `set_goal_regions`. All zero means
+        #: no dwell and the half-plane latch below is what `reached_goal` records -- which is
+        #: every library predating the wall field.
+        self._dwell_steps = 0
+        self._dwell_radius = 0.0
+        self._dwell_height_tol = 0.0
+        self._steps_in_disc = torch.zeros(self.n, dtype=torch.long, device=self.device)
         self.goal_reached = torch.zeros(self.n, dtype=torch.bool, device=self.device)
         self.first_goal = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
         self.min_goal_dist = torch.full((self.n,), float("inf"), device=self.device)
@@ -376,6 +383,30 @@ class EpisodeAccumulator:
         self._gr = goal_region
         self.goal_spec = spec
         self.set_goal_families(family_of_env)
+        # The DWELL rule is a property of the SPEC, not of a family: a course either scores
+        # arrivals by holding a disc or by crossing a line, and mixing the two inside one
+        # library would make `reached_goal` mean two things in one file. Taken from the
+        # default tolerances for that reason, and PRINTED, because it silently changes what
+        # every downstream consumer of `reached_goal` is measuring.
+        t = spec.default
+        self._dwell_radius = float(getattr(t, "dwell_radius_m", 0.0) or 0.0)
+        self._dwell_height_tol = float(t.height_tol_m)
+        dwell_s = float(getattr(t, "dwell_s", 0.0) or 0.0)
+        self._dwell_steps = (int(round(dwell_s / float(self.dt)))
+                             if dwell_s > 0.0 and self._dwell_radius > 0.0 else 0)
+        if self._dwell_steps > 0:
+            print(f"[eval.accumulate] GOAL RULE = DWELL: reached_goal means the robot held a "
+                  f"{self._dwell_radius:.2f} m disc about the goal for {dwell_s:.1f} s "
+                  f"({self._dwell_steps} steps) consecutively, within "
+                  f"{self._dwell_height_tol:.2f} m of the goal's standing height -- NOT the "
+                  f"usual 'was ever inside the half-plane'. Numbers from this recording are "
+                  f"not comparable with a pass-through course's.")
+        elif self._dwell_radius > 0.0 or dwell_s > 0.0:
+            raise ValueError(
+                f"the goal spec declares a partial dwell rule (dwell_radius_m="
+                f"{self._dwell_radius}, dwell_s={dwell_s}); both must be positive or both "
+                "zero. One alone would silently score the pass-through rule while reading as "
+                "a stopping course.")
 
     def set_goal_families(self, family_of_env=None, env_ids: torch.Tensor | None = None) -> None:
         """Write per-env tolerances from each env's family.
@@ -455,6 +486,24 @@ class EpisodeAccumulator:
         live = m & self._goal_valid
         inside = self._gr.in_goal(down, lat, hz, self._goal_tol) & live
         dist = self._gr.goal_distance_m(down, lat, hz, self._goal_tol)
+
+        # THE DWELL RULE, when the spec declares one. `reached_goal` then means "held the disc
+        # for dwell_s" instead of "was ever inside the region", and that redefinition is the
+        # point: the progress reward, the critic's arrived set and `terminal_reward` all read
+        # this one column, so changing it here is what makes the three agree on a stopping
+        # course. A parallel column would have left the REWARD paying for pass-through
+        # behaviour while the report showed the dwell rate.
+        #
+        # Why the half-plane cannot serve: `in_goal` is satisfied by ANY point downrange of the
+        # boundary inside the lateral band, so a robot that crosses the line and keeps walking
+        # -- into the wall this course is about -- satisfies it forever. A disc can be left,
+        # and leaving it resets the count.
+        if self._dwell_steps > 0:
+            held = self._gr.in_goal_disc(down, lat, hz, self._dwell_radius,
+                                         self._dwell_height_tol) & live
+            self._steps_in_disc = torch.where(held, self._steps_in_disc + 1,
+                                              torch.zeros_like(self._steps_in_disc))
+            inside = self._steps_in_disc >= self._dwell_steps
 
         newly = inside & ~self.goal_reached
         self.first_goal = torch.where(newly, self.steps, self.first_goal)
@@ -967,6 +1016,10 @@ class EpisodeAccumulator:
         self.contact_steps[ids] = 0.0
         self._have_prev[ids] = False
         self.goal_reached[ids] = False
+        # Consecutive, so a new episode starts the count from zero. Without this
+        # an env that ended mid-disc would carry its partial dwell into the next
+        # episode and could be scored as having stopped somewhere it never stood.
+        self._steps_in_disc[ids] = 0
         self.first_goal[ids] = -1
         self.min_goal_dist[ids] = float("inf")
         self.max_goal_down[ids] = -float("inf")

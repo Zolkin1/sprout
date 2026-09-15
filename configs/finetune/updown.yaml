@@ -30,6 +30,10 @@ tiles_boxes: 0
 tiles_updown: 30
 tiles_indist: 0
 tiles_entry_stairs: 0
+# The wall field, which this course does not use. Stated rather than omitted: the
+# loader requires the full key set, so a new tile type is a visible edit to every
+# config rather than a default that silently applies.
+tiles_walls: 0
 
 # THE TRAINED GRID, and it is in whole inches: risers 5.12 / 6.10 / 7.09 in, treads
 # 11.02 / 12.01 / 12.99 in. Read from hf/trajectories/skills/library_v3/manifest.csv rather

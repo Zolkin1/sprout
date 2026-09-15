@@ -71,6 +71,12 @@ _SCHEMA: dict[str, tuple] = {
     "tiles_updown": ("int", 1),
     "tiles_indist": ("int", 1),
     "tiles_entry_stairs": ("int", 1),
+    # The wall field. Its geometry is NOT in this schema: `make_walls_terrain.py` owns the
+    # room, wall and goal draws and stamps them into the library's own `generator_config`, so
+    # restating them here would be a second declaration of the same numbers with nothing
+    # checking the two agree. The COUNT is here because it is the one thing this file's
+    # course-mix block is for.
+    "tiles_walls": ("int", 1),
 
     # -- up-into-down geometry -------------------------------------------------------------
     # Drawn per tile from ``updown_cells``, with ``updown_measured_frac`` of tiles drawn from

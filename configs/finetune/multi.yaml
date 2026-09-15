@@ -89,6 +89,10 @@ tiles_boxes: 20
 tiles_updown: 20
 tiles_indist: 20
 tiles_entry_stairs: 10
+# The wall field, which this course does not use. Stated rather than omitted: the
+# loader requires the full key set, so a new tile type is a visible edit to every
+# config rather than a default that silently applies.
+tiles_walls: 0
 
 updown_cells: [[0.130, 0.280], [0.130, 0.305], [0.130, 0.330],
                [0.155, 0.280], [0.155, 0.305], [0.155, 0.330],

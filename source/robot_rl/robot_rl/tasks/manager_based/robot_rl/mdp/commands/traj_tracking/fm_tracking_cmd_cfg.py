@@ -347,6 +347,78 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     without touching ``kp``.
     """
 
+    freeform_approach_kp: float = 0.0
+    """Proportional gain (1/s) from RANGE-TO-GOAL to commanded forward speed. ``0`` is OFF.
+
+    **Off by default, and off is the exact behaviour every existing config was measured
+    under**: at ``0`` the commanded ``vx`` is the per-episode draw held for the whole episode,
+    unchanged, and none of the goal state below is even read. Only a course that opts in pays
+    for it. ``test_freeform_approach_defaults_off.py`` pins that across every registered task.
+
+    Switched on, the forward channel joins the yaw channel on one controller:
+    ``vx = clamp(kp * (range - stop_radius) - kd * range_rate, 0, drawn_speed)``.
+
+    **The per-episode draw becomes a CEILING rather than the command**, which is what keeps
+    :attr:`freeform_speed_min` / :attr:`freeform_speed_max` meaning what they meant: far from
+    the goal ``kp * range`` saturates the clamp, so the robot cruises at its drawn speed
+    exactly as before, and the gain only bites on the approach. At the default 1.5 m stop
+    radius a gain of 0.6 starts decelerating a 2.5 m/s episode about 5.7 m out.
+
+    The floor at 0 matters: a P controller past its setpoint would command BACKWARDS, and
+    reversing is both off-distribution for the generator and not what "stop" means.
+    """
+
+    freeform_approach_kd: float = 0.0
+    """Damping gain (dimensionless) on the CLOSING RATE, the D half of the approach controller.
+
+    Subtracted from the P term, so it brakes when the robot is closing fast. The rate is the
+    root's planar velocity projected onto the goal direction -- a real derivative off the
+    state, not a finite difference of the range, so it carries no sampling noise and needs no
+    filter. ``0`` leaves a pure P, which is stable here because the tracker is itself a closed
+    loop on the commanded velocity; raise it only if the approach visibly overshoots.
+
+    Ignored entirely when :attr:`freeform_approach_kp` is ``0``.
+    """
+
+    freeform_approach_min_speed: float = 0.0
+    """FLOOR on the commanded forward speed while the goal is still ahead (m/s). ``0`` is off.
+
+    Without it the P law decays continuously and the command spends the last couple of metres
+    in the 0.05-0.3 m/s band -- which is both where the robot stops walking for reasons no
+    reward can see, and a band the generator has barely trained on (5.8% of its command rows
+    are ``|vx| < 0.1``; ~7% fall in 0.1-0.3). The robot then settles wherever its own deadband
+    put it, SHORT of the goal, and is scored as not having arrived: observed directly, robots
+    coming to rest just outside the goal region while otherwise behaving correctly.
+
+    With a floor the command is a RAMP then a STEP -- cruise, decelerate to the floor, hold it
+    to the stop radius, then zero -- so every commanded value is either 0 or inside the trained
+    band, and the robot is still walking when it crosses into the region it has to hold.
+    :attr:`freeform_cmd_hold_s` makes the same ramp-vs-step argument at the other end of the
+    episode.
+
+    Capped per env by that episode's own drawn speed, so a slow draw is never sped up and
+    :attr:`freeform_speed_min` keeps defining the band. Not applied past the goal -- there the
+    floor would drive the robot further away, into whatever is behind it.
+
+    Ignored entirely when :attr:`freeform_approach_kp` is ``0``.
+    """
+
+    freeform_stop_radius_m: float = 0.0
+    """Range within which the WHOLE command triple is zeroed (m). ``0`` disables the stop.
+
+    Inside it the robot is commanded to stand: ``vx = 0`` and ``wz = 0``. Zeroing yaw too is
+    not tidiness -- :func:`~.fm_tracking_cmd.freeform_yaw_rate` aims at a point ``lookahead``
+    metres down the centreline, and once the robot is AT the goal that bearing is measuring
+    the last of the approach error at ever-shorter baseline, so a robot trying to hold station
+    would be commanded to keep turning. It mirrors the opening hold, which zeroes the triple
+    for the same reason: a yaw rate on a standing robot is as much a step input as a speed is.
+
+    Subtracted inside the P term as well, so the commanded speed reaches 0 AT the radius
+    rather than stepping to it -- the two are one continuous law, not a ramp plus a cliff.
+
+    Ignored entirely when :attr:`freeform_approach_kp` is ``0``.
+    """
+
     freeform_wz_max: float = 0.68
     """Symmetric clip on the steering yaw rate (rad/s).
 
@@ -561,6 +633,20 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     Note the hold in :attr:`fm_speed_mismatch_replans` applies under BOTH cadences -- under
     ``"episode"`` it decides how long each activation within an eligible episode lasts, and
     under ``"replan"`` it additionally bounds how often the env can re-roll.
+    """
+
+    debug_vis_goal_disc: bool = False
+    """Draw the DWELL disc the robot has to stop inside, one translucent cylinder per env.
+
+    Off by default, like every other course-specific marker, and it draws nothing unless the
+    task also wires :class:`~...terminations.terminations.freeform_goal_dwell` -- the radius is
+    read back OFF THAT TERM rather than restated here, so the picture cannot disagree with the
+    rule it is a picture of. A cfg that asks for the disc with no dwell term WARNS rather than
+    drawing nothing silently: an absent marker reads exactly like a region correctly placed
+    off-screen, which is the one reading a goal visualiser must never allow --
+    ``MotionSequenceCommand._load_goal_spec`` records the same hazard for the gate.
+
+    Needs the master ``debug_vis`` on and ``--viz kit``, like the rest.
     """
 
     debug_vis_show_fm_prediction: bool = True

@@ -101,6 +101,10 @@ _FREEFORM_COMMAND_TASKS: tuple[str, ...] = (
     # The same fine-tune pinned to the fixed two-box course, with the policy's far camera
     # restored so an existing two-camera tracker can run it.
     "G1-box2-finetune",
+    # The wall field: enclosed rooms, walls to ignore, and a goal the robot must STOP in. It
+    # additionally switches the free-form APPROACH controller on, which no other task does --
+    # `test_freeform_approach_defaults_off.py` is what pins that.
+    "G1-teacher-clf-terrain-depth-finetune-walls",
 )
 
 

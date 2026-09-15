@@ -80,11 +80,31 @@ class GoalTolerances:
             **0 turns the test OFF**, the same as in
             :func:`~mdp.terminations.terminations.freeform_goal_reached` -- see
             :func:`in_goal` for the arm this cost when the two disagreed.
+        dwell_radius_m: Radius of a DISC about the goal that the robot must hold, in metres.
+            ``0`` (default) leaves every course on the half-plane test above and is what every
+            library predating the wall field declares.
+        dwell_s: Seconds the robot must hold that disc, CONSECUTIVELY, before it counts as
+            having arrived. ``0`` disables the dwell.
+
+    **A spec that declares a dwell CHANGES WHAT ``reached_goal`` MEANS**, from "was ever inside
+    the region" to "held the disc for ``dwell_s``", and that is deliberate rather than a second
+    column. `scripts/flow_matching/CLAUDE.md` states the rule this keeps: success is defined
+    ONCE and three places have to agree -- the reward pays on ``reached_goal``, the critic
+    keeps windows up to the first failure, and the eval reports ``terminal_reward >= 0``. A
+    parallel ``dwell_reached`` column would have left the REWARD still paying for the
+    pass-through behaviour while the report showed the dwell rate, which is the worst of both:
+    the arm would train toward one definition and be measured against another.
+
+    The cost is that ``reached_goal`` is not comparable across specs that disagree about this.
+    `accumulate` prints the rule at load and stamps ``goal_rule`` into the episodes file, so a
+    reader can tell which one a recording was scored under rather than having to know.
     """
 
     approach_margin_m: float = 1.0
     half_width_m: float = 2.5
     height_tol_m: float = 0.5
+    dwell_radius_m: float = 0.0
+    dwell_s: float = 0.0
 
 
 @dataclass
@@ -555,3 +575,35 @@ def goal_distance_m(
     wide = (lateral.abs() - width).clamp_min(0.0)
     high = (height_err.abs() - height).clamp_min(0.0)
     return torch.sqrt(short * short + wide * wide + high * high)
+
+
+def in_goal_disc(downrange: torch.Tensor, lateral: torch.Tensor,
+                 height_err: torch.Tensor, radius_m: float,
+                 height_tol_m: float) -> torch.Tensor:
+    """Whether the base is inside a DISC about the goal, for the dwell rule.
+
+    A separate function from :func:`in_goal` rather than a mode on it, because the two answer
+    different questions and only one of them can be "held": ``in_goal`` is a downrange
+    half-plane crossed with a lateral band, which a robot keeps satisfying as it walks away
+    downrange. Nothing can dwell in a half-plane.
+
+    **This must agree with the RUNTIME's dwell test**
+    (:class:`~mdp.terminations.terminations.freeform_goal_dwell`), which measures
+    ``|(x, y) - goal|`` in the tile frame. ``downrange`` and ``lateral`` are the same offset
+    resolved on the goal's own axes, so the Euclidean norm of the pair is that distance -- the
+    two are one quantity in two frames, not two definitions.
+
+    Args:
+        downrange: ``[N]`` from :func:`goal_frame_offsets`.
+        lateral: ``[N]``.
+        height_err: ``[N]``.
+        radius_m: Disc radius (m). Must be positive; the caller gates on the spec.
+        height_tol_m: Band on ``|robot_z - goal_z|``; ``0`` turns the height test off, the
+            same convention as everywhere else here.
+
+    Returns:
+        ``[N]`` bool.
+    """
+    ok_height = (height_err.abs() <= height_tol_m) if height_tol_m > 0.0 \
+        else torch.ones_like(height_err, dtype=torch.bool)
+    return (torch.hypot(downrange, lateral) <= float(radius_m)) & ok_height
