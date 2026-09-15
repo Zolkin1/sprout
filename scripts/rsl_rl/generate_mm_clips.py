@@ -189,6 +189,11 @@ def main() -> int:
                         "against mb_baseline's other two on IDENTICAL commands. Selects the same flat "
                         "clips mb_baseline does, via its own select_flat_clips -- imported, not "
                         "restated. Sets --n-clips and the clip length from what it finds.")
+    p.add_argument("--no-clean-library", dest="include_clean", action="store_false",
+                   help="Drop the clean(library_v2) steady strides from the motion DB, leaving the "
+                        "mocap bones ALONE. Those strides are our own trajectory-optimized "
+                        "solutions, so by default the baseline searches a pool containing our "
+                        "steady-state library; this is the arm that does not.")
     p.add_argument("--matcher", default="dp", choices=["dp", "vanilla"],
                    help="Search over the shared DB: 'dp' (exact backward dynamic program, what the "
                         "live generators use) or 'vanilla' (greedy local-lookahead, the standard "
@@ -208,10 +213,13 @@ def main() -> int:
 
     dev = args.device
     lib_meta = read_library_metadata(args.source)   # robot output-names + skill_list only
-    print(f"[mm] building shared locomotion DB (flat/clean; no lead-ins) ...")
+    print(f"[mm] building shared locomotion DB "
+          f"({'flat/clean' if args.include_clean else 'flat ONLY -- no clean library'}; "
+          f"no lead-ins) ...")
     matcher = build_locomotion_matcher(
         bones_cache=args.bones_cache, clean_source=args.clean_source, clean_hf_repo=args.clean_hf_repo,
-        bones_limit=args.bones_limit, include_leadins=False, dt=args.dt, device=dev,
+        bones_limit=args.bones_limit, include_leadins=False, include_clean=args.include_clean,
+        dt=args.dt, device=dev,
         cut_penalty=args.cut_penalty, w_traj=1.0, w_track=0.0, matcher_kind=args.matcher,
         log=lambda m: print(m.replace("[locomotion_db]", "[mm]")))
     builder = ClipOutputBuilder(lib_meta.pos_output_names, lib_meta.vel_output_names,
@@ -263,7 +271,17 @@ def main() -> int:
         "skill_list": lib_meta.skill_list,
     }
     writer = ClipLibraryWriter(args.out, N, meta)
-    writer.set_attr("source_library_fingerprint", clean_library_fingerprint(args.clean_source, args.clean_hf_repo))
+    # The clean library's fingerprint describes a DB INPUT. With --no-clean-library it is not an
+    # input at all, so recording it would assert provenance the clips do not have; `motion_db`
+    # states the composition either way so the two arms are told apart by content, not by filename.
+    if args.include_clean:
+        writer.set_attr("source_library_fingerprint",
+                        clean_library_fingerprint(args.clean_source, args.clean_hf_repo))
+    writer.set_attr("motion_db", {"include_clean": bool(args.include_clean),
+                                  "clean_source": args.clean_source if args.include_clean else None,
+                                  "bones_cache": args.bones_cache,
+                                  "n_clips": len(matcher.src_names),
+                                  "n_frames": int(matcher.feat_raw.shape[0])})
     writer.set_attr("generator", f"motion_matching_{args.matcher}_v1")
     writer.set_attr("matcher", args.matcher)
     if args.command_from:
