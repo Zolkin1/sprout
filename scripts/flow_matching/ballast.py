@@ -362,6 +362,21 @@ def build_ballast_dataset(path: str, rows, ctx, cfg, *, null_prob: float, seed: 
     # windows with depth) and the ballast is a couple of thousand, so loading all of it to
     # keep 1% would cost gigabytes for nothing.
     data, meta = load_recorded_windows(path, rows=_np.asarray(rows))
+    # THE SAME CAMERA SUBSET THE CHECKPOINT WAS TRAINED UNDER. `train.py` calls this once on
+    # the training set, and its docstring says that is deliberate: every consumer derives the
+    # sensor count from `data`'s SHAPE, so slicing here leaves the rest alone. The ballast path
+    # loads its own recording and so needs its own call -- without it a NEAR-ONLY generator
+    # (extero_sensor_count=1) is handed the recording's TWO-camera rows, because
+    # `PretrainWindowAdapter` takes `extero_shape` from the recording's attributes rather than
+    # from the model. Measured on the v6g pair: the model wants 1x3900 and the recording holds
+    # (N, 2, 780).
+    #
+    # `cfg` is the CHECKPOINT's own config, so this follows the parent automatically: a
+    # two-camera parent has `extero_keep_cameras=None` and the call is a no-op.
+    from robot_rl.flow_matching.dataset import apply_camera_subset  # noqa: PLC0415
+    data, meta = apply_camera_subset(
+        data, meta, getattr(cfg, "extero_keep_cameras", None),
+        getattr(cfg, "extero_source", "depth"))
     # NORMALIZERS CLONED TO THE CPU, exactly as `rollout_dataset._CtxView` does and for the
     # same two reasons -- this path had been passing `ctx`'s own straight through.
     #
