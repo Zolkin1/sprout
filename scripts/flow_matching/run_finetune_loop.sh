@@ -277,6 +277,29 @@ HEAD="$(git rev-parse --short HEAD)"
 echo "==================================================================="
 echo "[awr] tag $TAG  gpu $GPU  worktree $HEAD"
 echo "[awr] buffer $BUFFER episodes, refresh $REFRESH, $ITERS iterations"
+#: The upper-camera dropout arm needs an UPPER CAMERA. A near-only generator has one camera,
+#: and `FmTrackingCommand._post_init` refuses the term outright rather than perturbing nothing:
+#:   "fm_upper_camera_noise_fraction is set but the upper camera could not be identified"
+#: -- which kills the collect before a single episode, and reads as a checkpoint fault.
+#:
+#: So it is DERIVED from the parent's own extero_sensor_count rather than assumed to be 2.
+#: This is a real difference in the collect distribution between a near-only arm and a
+#: two-camera one, and an unavoidable one: you cannot drop a camera the model does not have.
+#: Say so when comparing them.
+UPPER_CAM_NOISE=$("$PY" - "$PARENT" <<'PYEOF'
+import sys, torch
+try:
+    ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+    n = int((ck.get("config") or {}).get("extero_sensor_count", 2) or 2)
+except Exception:
+    n = 2
+print("0.5" if n >= 2 else "0.0")
+PYEOF
+)
+echo "[awr] upper-cam noise $UPPER_CAM_NOISE (parent has $("$PY" -c "
+import sys, torch
+ck = torch.load(sys.argv[1], map_location='cpu', weights_only=False)
+print(int((ck.get('config') or {}).get('extero_sensor_count', 2) or 2))" "$PARENT") camera(s))"
 echo "[awr] parent $PARENT"
 echo "[awr] root   $ROOT"
 echo "[awr] wandb  $PROJECT / ONE run 'loop_$TAG' / seed $SEED"
@@ -387,7 +410,7 @@ for (( it=1; it<=ITERS; it++ )); do
       --history_from "$HISTORY_FROM" \
       --output_dir "$INC" \
       env.commands.traj_ref.fm_perturb_fraction="$PERTURB_FRAC" \
-      env.commands.traj_ref.fm_upper_camera_noise_fraction=0.5 \
+      env.commands.traj_ref.fm_upper_camera_noise_fraction="$UPPER_CAM_NOISE" \
       env.commands.traj_ref.fm_upper_camera_noise_mode=dead \
       env.commands.traj_ref.fm_upper_camera_noise_cadence=replan \
       env.commands.traj_ref.fm_history_null_fraction=0.0 \
