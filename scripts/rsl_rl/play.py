@@ -405,7 +405,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     w, h = fm_extero["width"], fm_extero["height"]
                 if any(isinstance(sensor, MultiMeshRayCasterCameraCfg)
                        for sensor in vars(env_cfg.scene).values()):
-                    install_fm_depth_group(env_cfg, w, h)
+                    # WHICH cameras, from the same artifact as the resolution. A near-only
+                    # generator states one, and an env that installed both would be refused
+                    # by the command term's row-count check.
+                    install_fm_depth_group(env_cfg, w, h, cameras=fm_extero["cameras"])
             elif fm_extero["extero_source"] == "height_scan":
                 geom = fm_scan_geometry(fm_extero["extero_spec"])
                 # ``None`` = a checkpoint that states no scan geometry, i.e. every pre-field
