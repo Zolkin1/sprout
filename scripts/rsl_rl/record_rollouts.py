@@ -885,12 +885,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     obs, _, dones, _ = env.step(policy(obs))
                     steps += 1
                     tracker.fold(dones)
-                    # Latched from the env's own term, BEFORE the auto-reset can move the
-                    # robot: `dones` and the term's output describe the step just taken.
-                    if tracker.accum._goal_term_name is not None:
-                        tracker.accum.note_goal_termination(
-                            env.unwrapped.termination_manager.get_term(
-                                tracker.accum._goal_term_name))
+                    # The goal TERMINATION is latched inside the reset hook
+                    # (`RolloutEpisodeTracker._latch_goal_termination`), not here. It used to
+                    # be here, and it was one episode too late every time: the harvest runs
+                    # inside `env.step`, so by the time this line ran the ending episode had
+                    # already been written and the latch landed on its successor.
                     # Zero the ring for envs that just reset BEFORE pushing this step, or a
                     # window emitted in the first H steps of a new episode carries rows from
                     # the previous one -- which for a fall is precisely the signature the

@@ -1155,6 +1155,7 @@ class RolloutEpisodeTracker:
     # ------------------------------------------------------------------
     def __call__(self, env, env_ids, **kwargs):
         """Harvest the ending episodes, then delegate to the real clip reset."""
+        self._latch_goal_termination(env)
         if self.armed and env_ids is not None and len(env_ids) > 0:
             self._harvest(env, env_ids)
         self.armed = True
@@ -1164,6 +1165,36 @@ class RolloutEpisodeTracker:
         # describes the PREVIOUS episode -- a plausible region on the wrong tile.
         self._refresh_goal(env, env_ids)
         return out
+
+    def _latch_goal_termination(self, env) -> None:
+        """OR this step's goal TERMINATION into the accumulator, before anything harvests.
+
+        HERE, and not after ``env.step`` returns. The harvest runs inside this very reset
+        hook -- ``env.step`` calls it -- so a latch applied after ``env.step`` returns lands
+        on the accumulator of the episode that has just BEGUN. Measured, on the wall course:
+        each env's first episode read ``reached_goal`` 0.0000 and every later one carried its
+        predecessor's outcome, against an identical ``min_dist_to_goal_m``, identical
+        ``steps_survived`` and an identical fall rate. Nothing else in the row moved, which is
+        what made it look like a policy that cannot stop rather than an off-by-one episode.
+
+        The damage is worst in exactly the reduction this repo reports: FIRST-PER-ENV has no
+        predecessor to inherit from, so it reads a flat zero, while the all-episode mean is
+        only diluted by one episode in N and still looks plausible.
+
+        Safe to read after the auto-reset: ``TerminationManager.reset`` clears the class
+        terms' own counters but never ``_term_dones``, which is what ``get_term`` returns and
+        which still describes the step just taken.
+
+        A no-op unless ``attach_goal_termination`` named a term, which only a course with a
+        dwell rule does.
+
+        Args:
+            env: The unwrapped env, for its termination manager.
+        """
+        name = getattr(self.accum, "_goal_term_name", None)
+        if name is None:
+            return
+        self.accum.note_goal_termination(env.termination_manager.get_term(name))
 
     def _refresh_goal(self, env, env_ids) -> None:
         """Re-resolve the goal anchor and per-family tolerances for the envs that reset."""
