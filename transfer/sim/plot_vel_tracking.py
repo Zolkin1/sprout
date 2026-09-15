@@ -43,6 +43,7 @@ import os
 import shlex
 import sys
 import warnings
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -183,9 +184,61 @@ class Column:
         """Of ``idx``, those that traversed."""
         return idx[self.traces["ep_verdict"][idx] == self.success_code]
 
-    def title(self, multi: bool) -> str:
-        """Column heading: the terrain, plus the run when several are drawn."""
+    def traversed(self, speeds: Sequence[float]) -> tuple[int, int]:
+        """How many of this column's DRAWN episodes traversed, pooled over ``speeds``.
+
+        Pooled rather than per speed because the heading names the panel and the panel holds
+        every speed; the per-speed split stays in the caption, which is where a reader who
+        needs it looks.  Counted over the speeds actually drawn, not over the run's own list,
+        so a ``--speed``-filtered figure reports the figure rather than the run behind it.
+
+        Args:
+            speeds: The commanded speeds this figure draws.
+
+        Returns:
+            ``(traversed, total)``.  ``(0, 0)`` when the column draws nothing.
+        """
+        ok = total = 0
+        for speed in speeds:
+            pick = self.pick(speed)
+            if pick.size == 0:
+                continue
+            ok += int(self.survived(pick).size)
+            total += int(pick.size)
+        return ok, total
+
+    def title(self, multi: bool, speeds: Sequence[float] = ()) -> str:
+        """Column heading: the terrain, the run when several are drawn, and what traversed.
+
+        The traversed share is shown as a PERCENTAGE; the raw counts behind it stay in the
+        caption, per speed, which is where the denominator belongs.  One decimal because at
+        the usual 50 trials x 3 speeds one episode is 0.67 %, so the digit is resolution
+        rather than noise -- it is not a claim about precision.
+
+        Args:
+            multi: Whether the figure draws more than one run.
+            speeds: The speeds drawn, which the traversed share pools over.  Empty omits the
+                share entirely, which is what a caller that has not resolved its speeds yet
+                gets rather than a wrong denominator.
+
+        Returns:
+            The heading, one or two lines.
+        """
         base = KIND_LABEL.get(self.kind, self.kind)
+        ok, total = self.traversed(speeds) if speeds else (0, 0)
+        if total:
+            import matplotlib as mpl  # noqa: PLC0415  -- lazy, as plot_run imports pyplot
+            # `%` opens a comment in LaTeX, so under `text.usetex` it must be escaped -- and
+            # under mathtext it must NOT be, or the backslash renders literally.  Read off the
+            # live rcParam rather than off `--no_tex`, because apply_paper_style also falls
+            # back to mathtext on its own when LaTeX is simply not installed.
+            mark = r"\%" if mpl.rcParams["text.usetex"] else "%"
+            # Parenthesised on the TERRAIN line, which costs no extra line in the figure --
+            # vertical space is the scarce thing in a paper.  It goes here rather than on the
+            # run-name line because `base` is a short fixed word from KIND_LABEL, so the
+            # heading's width stays bounded; appending it to `label` instead made a three-run
+            # heading as wide as the caller's `--label` and it collided with its neighbour.
+            base = f"{base} ({100.0 * ok / total:.1f}{mark})"
         return f"{base}\n{self.label}" if (multi and self.label) else base
 
 
@@ -290,6 +343,15 @@ def trial_alpha(n: int) -> float:
     """
     return float(min(0.25, max(0.03, 3.0 / max(1, n))))
 
+
+#: Alpha for the failure-end markers.  A CONSTANT, deliberately: it used to scale as
+#: ``12 / n_failures`` per (column, speed), on the constant-ink reasoning behind
+#: :func:`trial_alpha`, and the side effect was that transparency silently encoded how badly a
+#: speed did -- the cell with the most failures drew the FAINTEST crosses, and two panels of
+#: one figure ended up on different scales.  Density still reads, because the crosses sit at
+#: distinct end positions and pile up darker on their own; it now reads the same way in every
+#: panel of every figure instead of being rescaled per cell.
+FAIL_MARKER_ALPHA: float = 0.75
 
 #: Panel text sizes for a multi-column grid.  The shared paper rcParams are sized for a
 #: single full-width plot (22 pt titles, 20 pt labels); four columns of it at journal width
@@ -553,7 +615,7 @@ def plot_run(runs: list[tuple[str, dict, dict]], *, channels: tuple[str, ...],
             if bad.size:
                 ax_traj.plot(tr["ep_end_x"][bad], tr["ep_end_z"][bad], "x", color=fail_colour,
                              markersize=5, markeredgewidth=1.4, linestyle="none", zorder=5,
-                             alpha=float(min(1.0, max(0.35, 12.0 / bad.size))),
+                             alpha=FAIL_MARKER_ALPHA,
                              label="failed" if (ci == 0 and i_s == 0) else None)
 
             if shared_x:
@@ -617,7 +679,7 @@ def plot_run(runs: list[tuple[str, dict, dict]], *, channels: tuple[str, ...],
             if not lay.wants_ylabel(ci):
                 a.tick_params(labelleft=False)
     for ci, c in enumerate(cols):
-        axes[0][ci].set_title(c.title(multi), fontsize=f["title"])
+        axes[0][ci].set_title(c.title(multi, speeds), fontsize=f["title"])
         if lay.wants_ylabel(ci):
             axes[0][ci].set_ylabel(r"root $z$ [m]", fontsize=f["label"])
             for row, ch in enumerate(channels, start=1):
