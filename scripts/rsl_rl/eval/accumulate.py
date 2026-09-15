@@ -225,6 +225,10 @@ class EpisodeAccumulator:
         #: The DWELL rule, resolved from the goal spec in `set_goal_regions`. All zero means
         #: no dwell and the half-plane latch below is what `reached_goal` records -- which is
         #: every library predating the wall field.
+        #: Name of the ENVIRONMENT's own goal termination, when one is authoritative. Set by
+        #: `attach_goal_termination`; while set, `reached_goal` is latched from that term and
+        #: the offline disc test below is NOT run.
+        self._goal_term_name = None
         self._dwell_steps = 0
         self._dwell_radius = 0.0
         self._dwell_height_tol = 0.0
@@ -434,6 +438,52 @@ class EpisodeAccumulator:
             [[r.approach_margin_m, r.half_width_m, r.height_tol_m] for r in rows],
             device=self.device, dtype=self._goal_tol.dtype)
 
+    def attach_goal_termination(self, name: str) -> None:
+        """Take ``reached_goal`` from the ENVIRONMENT's own goal termination, not from here.
+
+        **One rule, computed once.** A dwell -- "stay inside a disc for N consecutive steps" --
+        cannot be re-derived offline as safely as a latch can, because it is destroyed by a
+        SINGLE bad sample where a latch is not. This module folds the goal twice: once per step
+        and once more on the terminal frame, and the terminal fold's own comment says a
+        post-reset read "can corrupt ``min_dist_to_goal_m`` but can never falsely mark an
+        episode as having arrived". That benignness is a property of ``goal_reached |= inside``.
+        Under a consecutive counter the same stray sample zeroes it -- on precisely the step the
+        dwell completes, since the environment truncates the episode the moment it fires.
+
+        Measured: the env-side term fired 73 times in 1400 steps over 64 envs while this
+        module's re-derivation reported 0 arrivals in 6299 episodes.
+
+        So the environment is the single source, exactly as ``tracking_error.violation_checks``
+        is for the tracking bounds. Callers must then feed :meth:`note_goal_termination` every
+        step, or nothing will ever latch.
+
+        Args:
+            name: The termination term's name, for the error messages and the stamp.
+        """
+        self._goal_term_name = str(name)
+        print(f"[eval.accumulate] GOAL RULE = FROM THE ENVIRONMENT's '{name}' termination. "
+              "reached_goal is latched from the term that ends the episode, not re-derived "
+              "here -- a dwell cannot be reconstructed offline as safely as a latch.")
+
+    def note_goal_termination(self, fired: torch.Tensor) -> None:
+        """Latch ``reached_goal`` from the environment's goal termination for this step.
+
+        Args:
+            fired: ``[n]`` bool, the term's output this step.
+
+        Raises:
+            RuntimeError: If no termination was attached, where the caller has fed a signal
+                this accumulator was never told to prefer.
+        """
+        if self._goal_term_name is None:
+            raise RuntimeError(
+                "note_goal_termination() without attach_goal_termination(); the accumulator "
+                "would be scoring its own re-derivation while being fed the env's.")
+        fired = fired.to(self.goal_reached.device).bool()
+        newly = fired & ~self.goal_reached
+        self.first_goal = torch.where(newly, self.steps, self.first_goal)
+        self.goal_reached = self.goal_reached | fired
+
     def refresh_goal_anchor(self, env_ids: torch.Tensor | None = None) -> None:
         """Resolve where the clip itself finishes, for ``env_ids``, once per episode.
 
@@ -498,7 +548,24 @@ class EpisodeAccumulator:
         # boundary inside the lateral band, so a robot that crosses the line and keeps walking
         # -- into the wall this course is about -- satisfies it forever. A disc can be left,
         # and leaving it resets the count.
-        if self._dwell_steps > 0:
+        if self._goal_term_name is not None:
+            # The environment's term is authoritative; `note_goal_termination` does the
+            # latching. Everything else in this function (distances, the terminal offsets) is
+            # still folded, because those are diagnostics rather than the success rule.
+            inside = torch.zeros_like(inside)
+        elif self._dwell_steps > 0:
+            # REFUSED, not attempted. Re-deriving a dwell here is what reported 0 arrivals in
+            # 6299 episodes while the environment's own term fired normally, and it fails in
+            # the direction that looks like a policy that cannot do the task. A spec that
+            # declares a dwell must be paired with `attach_goal_termination`.
+            raise RuntimeError(
+                "the goal spec declares a dwell rule (dwell_radius_m="
+                f"{self._dwell_radius}, {self._dwell_steps} steps) but no environment goal "
+                "termination was attached. A dwell cannot be re-derived here: this module "
+                "folds the goal again on the terminal frame, and a post-reset read -- benign "
+                "for a latch, which cannot be un-set -- zeroes a consecutive counter on "
+                "exactly the step the dwell completes. Call attach_goal_termination() and "
+                "feed note_goal_termination() each step.")
             held = self._gr.in_goal_disc(down, lat, hz, self._dwell_radius,
                                          self._dwell_height_tol) & live
             self._steps_in_disc = torch.where(held, self._steps_in_disc + 1,

@@ -638,11 +638,15 @@ class freeform_goal_dwell(ManagerTermBase):
         """
         if env_ids is None:
             self._steps_inside[:] = 0
+            if hasattr(self, "_peak"):
+                self._peak[:] = 0
         else:
             self._steps_inside[env_ids] = 0
+            if hasattr(self, "_peak"):
+                self._peak[env_ids] = 0
 
     def __call__(self, env, radius_m: float = 0.5, dwell_s: float = 5.0,
-                 height_tol_m: float = 0.5,
+                 height_tol_m: float = 0.5, debug_every: int = 0,
                  asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
         """Advance the dwell counter and report which envs have completed it.
 
@@ -656,6 +660,15 @@ class freeform_goal_dwell(ManagerTermBase):
                 disables the height clause. It is NOT decoration here: without it a robot that
                 has fallen inside the disc keeps accruing dwell and is scored as having
                 stopped, which is the opposite of what the term is for.
+            debug_every: Print an aggregate trace every this many steps; ``0`` (default) is
+                silent and is what every real run uses. The quantities that decide this term
+                are computed here and NOWHERE ELSE, so a diagnostic that rebuilt them outside
+                would be answering about its own reimplementation -- which is how the first
+                attempt at measuring this course reported a distance to the goal REGION and
+                called it a distance to the goal. Separates the three ways a dwell fails:
+                never arriving (``in`` stays ~0), arriving and holding but running out of
+                episode (``max_run`` climbs then the episode ends), and chattering on the disc
+                edge (``in`` healthy but ``max_run`` never climbs).
             asset_cfg: Robot scene entity.
 
         Returns:
@@ -681,6 +694,23 @@ class freeform_goal_dwell(ManagerTermBase):
         # CONSECUTIVE: any step outside puts the counter back to zero.
         self._steps_inside = torch.where(inside, self._steps_inside + 1,
                                          torch.zeros_like(self._steps_inside))
+        if int(debug_every) > 0:
+            self._peak = torch.maximum(getattr(self, "_peak", torch.zeros_like(
+                self._steps_inside)), self._steps_inside)
+            # CUMULATIVE firings, because the peak alone cannot distinguish "reached 250 and
+            # the episode reset" from "never got there": both leave the surviving maximum just
+            # under the threshold.
+            self._fired = getattr(self, "_fired", 0) + int(
+                (self._steps_inside >= self._dwell_steps).sum())
+            t = int(env.common_step_counter)
+            if t % int(debug_every) == 0:
+                q = torch.quantile(d.float(), torch.tensor([0.25, 0.5], device=d.device))
+                print(f"[dwell t={t:>5}] dist p25 {q[0]:.2f} p50 {q[1]:.2f} m | "
+                      f"inside now {100.0 * inside.float().mean():5.1f}% | "
+                      f"counter now max {int(self._steps_inside.max()):>4} | "
+                      f"BEST RUN this episode max {int(self._peak.max()):>4} "
+                      f"mean {self._peak.float().mean():6.1f} | need {self._dwell_steps} "
+                      f"| FIRED so far {self._fired}")
         return self._steps_inside >= self._dwell_steps
 
 

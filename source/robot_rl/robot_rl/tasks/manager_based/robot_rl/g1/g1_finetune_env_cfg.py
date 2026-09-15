@@ -645,6 +645,11 @@ class G1WallsFinetuneTerminationCfg(G1FinetuneFreeformTerminationCfg):
         func=mdp.freeform_goal_dwell,
         params={"radius_m": WALLS_GOAL_RADIUS_M,
                 "dwell_s": WALLS_DWELL_S,
+                # DECLARED so it is overridable, exactly as `freeform_goal_reached`'s own
+                # comment says of its tolerance: hydra's struct mode refuses a key absent from
+                # the dict, so a param omitted here cannot be set from the CLI at all. 0 is
+                # silent and is what every real run uses.
+                "debug_every": 0,
                 # The same height datum the pass-through goal uses, and NOT optional here: a
                 # robot that has fallen inside the disc would otherwise keep accruing dwell and
                 # be scored as having stopped, which is the opposite of the point.

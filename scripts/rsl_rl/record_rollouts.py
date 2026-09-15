@@ -670,6 +670,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         accum = accumulate.EpisodeAccumulator(env, dt=float(u.step_dt),
                                               fall_min_height=float(args_cli.min_height))
         accum.attach_goal_region(spec)
+        # THE ENVIRONMENT'S OWN goal termination is authoritative where one exists. A dwell
+        # rule cannot be re-derived in the accumulator (see `attach_goal_termination`), so a
+        # course that declares one is scored by the term that actually ends its episodes.
+        _goal_terms = [t for t in ("goal_dwell",)
+                       if t in getattr(env.unwrapped.termination_manager, "active_terms", [])]
+        if _goal_terms:
+            accum.attach_goal_termination(_goal_terms[0])
         # The STRICT tracking checks. Latched, never terminating: the episode runs on, so one
         # rollout yields both the strict and the loose verdict and a threshold change
         # afterwards is an offline relabel rather than a re-collection. `--tracking_spec`
@@ -837,6 +844,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     obs, _, dones, _ = env.step(policy(obs))
                     steps += 1
                     tracker.fold(dones)
+                    # Latched from the env's own term, BEFORE the auto-reset can move the
+                    # robot: `dones` and the term's output describe the step just taken.
+                    if tracker.accum._goal_term_name is not None:
+                        tracker.accum.note_goal_termination(
+                            env.unwrapped.termination_manager.get_term(
+                                tracker.accum._goal_term_name))
                     # Zero the ring for envs that just reset BEFORE pushing this step, or a
                     # window emitted in the first H steps of a new episode carries rows from
                     # the previous one -- which for a fall is precisely the signature the
