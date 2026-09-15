@@ -475,6 +475,13 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument(
+        "--resume_from", type=str, default="",
+        help="Continue training from this checkpoint: model, optimizer moments, EMA shadow "
+             "and step, and the epoch counter are all restored, so it is a true resume rather "
+             "than a warm restart. Runs from the checkpoint's epoch+1 to --num_epochs. "
+             "Refuses a checkpoint whose architecture or data hash disagrees with this run. "
+             "The RNG is not restored, so data order differs from an uninterrupted run.")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument(
         "--lr_warmup_steps", type=int, default=FlowMatchingConfig().lr_warmup_steps,
@@ -618,6 +625,92 @@ def channel_metrics(
 _CONS_KEYS = ("vel_consistency", "joint_vel_consistency", "fk_pose",
               "body_pose_root", "body_pose_root_pos", "body_pose_root_ori",
               "body_pose_world", "body_pose_world_pos", "body_pose_world_ori")
+
+
+def _restore_for_resume(path: str, model, opt, ema, cfg, device) -> tuple[int, int]:
+    """Restore model, optimizer and EMA from a checkpoint and say where to carry on.
+
+    **A TRUE resume, not a warm restart, and the difference is the optimizer.** Reloading only
+    the weights would reset Adam's first and second moments and restart the LR warmup, which is
+    a different optimisation problem wearing the same name -- and one whose output would be
+    quietly not comparable with an uninterrupted run of the same config. What makes the faithful
+    version possible here is that the checkpoint already carries everything stateful:
+
+    * ``optimizer`` -- the moments;
+    * ``model_ema`` + ``ema_state`` -- the shadow weights and the EMA's own step count, which
+      ``best.pt`` is selected on;
+    * ``epoch``, and through ``ema_state["step"]`` the global optimizer step.
+
+    ``global_step`` is taken from the EMA's step because there is exactly one EMA update per
+    optimizer step, and it is needed rather than cosmetic: :func:`scheduled_lr` is CLOSED FORM
+    in ``(epoch, step)``, so those two numbers fully determine the learning rate. There is no
+    scheduler object whose state could be lost -- which is precisely why that design makes a
+    resume tractable.
+
+    **What is NOT restored: the RNG.** Data order after a resume differs from an uninterrupted
+    run, so the two are statistically equivalent rather than bit-identical. Say so when
+    reporting a resumed run rather than implying reproducibility it does not have.
+
+    **A mismatched resume is REFUSED**, because it is the dangerous case: continuing training
+    from weights fitted to different data or a different architecture produces a model that
+    loads, trains and reports plausible numbers while meaning nothing.
+
+    Args:
+        path: Checkpoint to resume from.
+        model: The constructed model, modified in place.
+        opt: The optimizer, modified in place.
+        ema: The weight EMA, or ``None``; modified in place.
+        cfg: The run's config, checked against the checkpoint's.
+        device: Device the model lives on.
+
+    Returns:
+        ``(start_epoch, global_step)`` -- the first epoch to run, and the optimizer step count.
+
+    Raises:
+        FileNotFoundError: If the checkpoint is missing.
+        ValueError: On an architecture or data mismatch, or a checkpoint with no optimizer
+            state (which could only give a warm restart).
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"--resume_from {path!r} does not exist.")
+    ck = torch.load(path, map_location=device, weights_only=False)
+    if "optimizer" not in ck:
+        raise ValueError(
+            f"{path} carries no optimizer state, so this could only be a WARM RESTART with "
+            "Adam's moments reset and the LR warmup replayed -- a different optimisation "
+            "problem. Train from scratch instead, or resume from a checkpoint that has one.")
+    old = ck.get("config", {}) or {}
+    arch = ("d_model", "nhead", "num_layers", "dim_feedforward", "state_dim", "history_dim",
+            "extero_source", "extero_sensor_count", "extero_sensor_dim", "extero_channels",
+            "attention_mode", "history_source")
+    bad = [(k, old.get(k), getattr(cfg, k, None)) for k in arch
+           if k in old and old[k] != getattr(cfg, k, None)]
+    if bad:
+        raise ValueError(
+            "REFUSING to resume: the checkpoint's config disagrees with this run's on "
+            + ", ".join(f"{k} ({a!r} -> {b!r})" for k, a, b in bad)
+            + ". Resuming across an architecture change trains weights that no longer mean "
+              "what they did.")
+    want = getattr(cfg, "data_sha256", None) or ck.get("data_sha256")
+    if ck.get("data_sha256") and want and ck["data_sha256"] != want:
+        raise ValueError(
+            f"REFUSING to resume: the checkpoint was fitted on data_sha256 "
+            f"{ck['data_sha256'][:16]}... and this run has {str(want)[:16]}....")
+    model.load_state_dict(ck["model"])
+    opt.load_state_dict(ck["optimizer"])
+    st = dict(ck.get("ema_state") or {})
+    if ema is not None and "model_ema" in ck:
+        ema.shadow = {k: v.to(device) for k, v in ck["model_ema"].items()}
+        ema.step = int(st.get("step", 0))
+    start_epoch = int(ck.get("epoch", -1)) + 1
+    global_step = int(st.get("step", 0))
+    print(f"[INFO] RESUMED from {path}: epoch {ck.get('epoch')} -> starting at {start_epoch} "
+          f"of {cfg.num_epochs}, global_step {global_step}, optimizer moments and EMA "
+          f"restored (EMA step {st.get('step')}). The RNG is NOT restored, so the data order "
+          "differs from an uninterrupted run -- statistically equivalent, not bit-identical. "
+          "`best.pt` in THIS run directory is the best over the resumed span only; the "
+          "earlier run's own best.pt is untouched.")
+    return start_epoch, global_step
 
 
 def scheduled_lr(base_lr: float, epoch: int, num_epochs: int, step: int,
@@ -1098,7 +1191,11 @@ def main() -> None:
 
     best_val = math.inf
     global_step = 0
-    for epoch in range(cfg.num_epochs):
+    start_epoch = 0
+    if args.resume_from:
+        start_epoch, global_step = _restore_for_resume(
+            args.resume_from, model, opt, ema, cfg, device)
+    for epoch in range(start_epoch, cfg.num_epochs):
         model.train()
         epoch_start = time.perf_counter()
         epoch_loss, n = 0.0, 0
