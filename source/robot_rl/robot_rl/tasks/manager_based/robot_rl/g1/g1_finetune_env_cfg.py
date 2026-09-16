@@ -575,39 +575,27 @@ WALLS_APPROACH_KP: float = 0.6
 #: Range at which the whole command triple goes to zero (m). EQUAL to the dwell radius.
 #:
 #: **Equal because the command should say one thing: the moment you are in the circle, stand.**
-#: **MEASURED, and the reason this is no longer the dwell radius.** With the two equal, the
-#: controller's equilibrium is a SHELL on the scoring boundary rather than the goal: the P
-#: term's setpoint is `to_go == stop_r` and the hard cut fires at the same range, so the robot
-#: aims at the rim. Over 12,598 uncensored episodes of the first wall arm the closest approach
-#: was a tight annulus -- p10 0.66, median 0.80, p90 0.89 m against a 1.0 m disc -- and ~1% of
-#: episodes ever came within 0.5 m of the goal. The 0.20 m of margin the median robot had was
-#: coast, not aim.
+#: NO HARD CUT. The command is the P law and nothing else, so it decays to zero AT the goal
+#: rather than stepping to zero on a surface around it.
 #:
-#: That cost dwells, and increasingly with speed. Splitting those episodes by where they came
-#: to rest: the ~8% that stopped in the outer 0.1 m held the disc 0.862 of the time at
-#: 0.40 m/s and only 0.611 at 1.50, against 0.938 / 0.884 for the 91% that stopped between 0.5
-#: and 0.9 m. A robot parked on the rim is one shuffle from resetting a consecutive counter.
+#: This number only ever existed to serve :data:`WALLS_APPROACH_MIN_SPEED`. With a floor the
+#: command cannot decay -- it is pinned at the floor until something switches it off -- so a cut
+#: radius is required, and it has to be set to the coast distance or the robot arrives at the
+#: floor speed and overshoots. With the floor gone the P term self-terminates and there is
+#: nothing left to switch.
 #:
-#: It also meant the course was not running its own drill. Half the goals sit 0.5-1.5 m in front
-#: of a wall and the robot always arrives from the near side, so stopping 1.0 m short left it
-#: ~1.5 m off the wall it was supposed to be learning to stop for.
+#: HOW WE GOT HERE, because both intermediate states were wrong in instructive ways. Set equal
+#: to the dwell radius (the original), the law's equilibrium is a SHELL on the scoring boundary:
+#: measured over 12,598 episodes, closest approach p10 0.66 / median 0.80 / p90 0.89 m against a
+#: 1.0 m disc, ~1% ever within 0.5 m, and the ~8% that stopped in the outer 0.1 m held the dwell
+#: 0.611 of the time at 1.50 m/s against 0.884 for those that stopped deeper. Set to 0.25 m (the
+#: coast distance) the robot lands on the goal, but only by arithmetic -- the law still aimed at
+#: a shell and the coast happened to cancel it.
 #:
-#: 0.25 m is the coast distance, rounded up: the command steps from the 0.3 m/s floor to zero
-#: and momentum carries the robot the measured ~0.20 m, so it comes to rest a little short of
-#: the goal point rather than past it. Short matters on the near-wall tiles -- overshooting the
-#: centre there is travel toward the wall.
-#:
-#: THE EARLIER ARGUMENT FOR EQUALITY IS NOT REFUTED, IT IS NARROWER THAN IT LOOKED. It said a
-#: smaller stop radius trains the robot to treat the goal as somewhere to pass THROUGH. That is
-#: only true of a setpoint past the goal point; 0.25 m is still short of it, so the robot is
-#: never commanded beyond the thing it is being scored on. (A separate earlier claim -- that a
-#: smaller radius would let the speed floor walk the robot back OUT -- was simply wrong and is
-#: recorded as wrong: inside the disc and outside the stop radius the floor commands motion
-#: INWARD.)
-#:
-#: Moving the stop radius in does NOT drag the steering in with it; see
-#: :data:`WALLS_YAW_QUIET_RADIUS_M`.
-WALLS_STOP_RADIUS_M: float = 0.25
+#: The cost of removing the floor is real and is recorded on that constant. Watch the collect:
+#: if the robot consistently settles SHORT of the disc rather than in it, the floor is what was
+#: holding it out of the walking deadband and this pair should come back together.
+WALLS_STOP_RADIUS_M: float = 0.0
 
 #: Where the approach controller AIMS: the goal point itself.
 #:
@@ -616,11 +604,9 @@ WALLS_STOP_RADIUS_M: float = 0.25
 #: equilibrium is a SHELL around the goal and the robot parks on it: measured, a median closest
 #: approach of 0.80 m against a 1.0 m disc.
 #:
-#: 0.0 says what the course means: go to the middle of the region you are scored on. It does
-#: NOT by itself decide where the robot stops. :data:`WALLS_APPROACH_MIN_SPEED` floors the
-#: command below ``floor/kp + target`` = 0.5 m, so the last stretch is the floor and then the
-#: cut at :data:`WALLS_STOP_RADIUS_M`. Change this to say what the controller means; change the
-#: stop radius to move where the robot ends up.
+#: 0.0 says what the course means: go to the middle of the region you are scored on. With the
+#: floor and the cut both off it is now the ONLY thing setting where the robot ends up -- the
+#: command is ``clamp(kp * to_go, 0, drawn_speed)``, which is at rest exactly here.
 WALLS_APPROACH_TARGET_R_M: float = 0.0
 
 #: Range (m) at which the STEERING channel goes quiet -- the DISC, not the stop radius.
@@ -638,14 +624,26 @@ WALLS_APPROACH_TARGET_R_M: float = 0.0
 #: arrived, so lateral error accumulated over that stretch cannot cost the arrival it has.
 WALLS_YAW_QUIET_RADIUS_M: float = WALL_DWELL_RADIUS_M
 
-#: Floor on the commanded forward speed while the goal is still ahead (m/s).
+#: NO FLOOR: the commanded speed is the P law clamped by the episode's own drawn ceiling, and
+#: nothing else. ``vx = clamp(kp * to_go, 0, drawn_speed)``.
 #:
-#: Without it the P law decays through the 0.05-0.3 m/s band on the last stretch, the robot
-#: stops walking wherever its own deadband lands, and it comes to rest SHORT of the goal while
-#: otherwise behaving correctly -- observed directly on this course. 0.3 keeps the command
-#: either zero or inside the band the generator trained on, so the approach is a ramp to 0.3,
-#: held, then a step to zero at the disc.
-WALLS_APPROACH_MIN_SPEED: float = 0.3
+#: WHAT THE FLOOR WAS FOR, and why it is worth a try without it. Under the P law alone the last
+#: ``floor/kp`` metres are commanded in the 0.05-0.3 m/s band -- which is both where the robot
+#: stops walking for reasons no reward can see, and a band the generator has thin coverage of
+#: (5.8% of its command rows are |vx| < 0.1 and ~7% fall in 0.1-0.3). The floor kept every
+#: commanded value either zero or inside the trained band, at the price of a discontinuity.
+#:
+#: That price stopped being worth paying when the controller started aiming at the goal instead
+#: of at the disc edge. Aiming at the 1.0 m shell, the P term hit zero at the rim and the floor
+#: carried the robot the whole way from 1.5 m to 1.0 m -- it was doing the approach. Aiming at
+#: the goal it covers only 0.50 m to 0.25 m, a quarter of a metre, and in exchange it forces a
+#: switching surface that has to be tuned against the coast distance.
+#:
+#: SO THIS IS THE EXPERIMENT, not a settled default. The failure mode to watch for in the first
+#: collect is the robot coming to rest SHORT of the disc -- deadband, exactly what the floor
+#: prevented. `min_dist_to_goal_m` piling up just above 1.0 m is the signature; the previous
+#: arm's was a pile-up just BELOW it, which is the opposite problem.
+WALLS_APPROACH_MIN_SPEED: float = 0.0
 
 #: The dwell disc's radius (m) -- 2 m diameter. IMPORTED, not restated: the terrain module
 #: stamps the same number into this course's goal spec, and the debug marker reads it back off

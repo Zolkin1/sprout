@@ -107,10 +107,22 @@ def test_the_controller_aims_at_the_CENTRE_and_the_steering_stops_at_the_DISC() 
     c = _module_constants(_TERRAIN)
     stop = _module_constants(_ENV_CFG).get("WALLS_STOP_RADIUS_M")
     assert stop is not None, "WALLS_STOP_RADIUS_M is gone"
-    assert 0.0 < stop < c["DWELL_RADIUS_M"], (
-        f"WALLS_STOP_RADIUS_M is {stop} against a {c['DWELL_RADIUS_M']} m disc. It must be "
-        "strictly inside the disc (so the robot aims at the centre) and strictly positive (so "
-        "the command is a ramp-then-step rather than a decay into the walking deadband).")
+    assert 0.0 <= stop < c["DWELL_RADIUS_M"], (
+        f"WALLS_STOP_RADIUS_M is {stop} against a {c['DWELL_RADIUS_M']} m disc. A cut ON or "
+        "OUTSIDE the boundary puts the law's equilibrium on a shell around the goal, which is "
+        "the arrangement that produced the 0.80 m median closest approach.")
+    floor = _module_constants(_ENV_CFG).get("WALLS_APPROACH_MIN_SPEED")
+    assert floor is not None, "WALLS_APPROACH_MIN_SPEED is gone"
+    # The two are a PAIR and the pairing is the thing to protect. A floor pins the command so
+    # it cannot decay, which makes a cut radius mandatory -- and the cut then has to be tuned
+    # against the coast distance or the robot arrives at the floor speed and overshoots the
+    # goal, which on a near-wall tile is travel toward the wall. A cut with no floor is merely
+    # redundant; a floor with no cut is a robot that never stops being told to walk.
+    assert not (floor > 0.0 and stop == 0.0), (
+        f"WALLS_APPROACH_MIN_SPEED is {floor} with no stop radius: the floor prevents the P "
+        "term from decaying, so nothing ever commands the robot to stop and it walks through "
+        "the goal at the floor speed. Set a cut radius of about the coast distance, or set "
+        "the floor to 0 and let the P law self-terminate.")
     assert "WALLS_YAW_QUIET_RADIUS_M: float = WALL_DWELL_RADIUS_M" in src, (
         "the yaw-quiet radius must BE the terrain module's dwell radius, not a copy of its "
         "value and not the stop radius -- see this test's docstring for what happens when the "

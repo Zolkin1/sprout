@@ -1300,13 +1300,17 @@ class FmTrackingCommand(MotionSequenceCommand):
             tgt_r = stop_r if tgt_r < 0.0 else tgt_r
             quiet_r = float(getattr(self.cfg, "freeform_yaw_quiet_radius_m", 0.0) or 0.0)
             quiet_r = stop_r if quiet_r <= stop_r else quiet_r
+            # The three surfaces described separately, because a reader of this line needs to
+            # know which of them are actually in play: with no floor and no cut the law is the
+            # P term alone and the other two phrases would be describing nothing.
+            cut = (f", and exactly 0 within {stop_r} m of it" if stop_r > 0.0
+                   else " and decays to 0 AT the goal (no cut radius)")
+            flr = f"{floor}" if floor > 0.0 else "no floor"
             approach = (
                 f" APPROACH CONTROLLER ON: vx = clamp({a_kp} * (along_track_to_go - {tgt_r}) "
-                f"- {self.cfg.freeform_approach_kd} * closing_rate, {floor}, the drawn speed) "
-                f"while the goal is AHEAD, and exactly 0 within {stop_r} m of it (wz is zeroed "
-                f"within {quiet_r} m). AIMS at {tgt_r} m and STOPS at {stop_r} m -- equal "
-                f"unless a course separates them, and when they are equal the law's "
-                f"equilibrium is a shell around the goal rather than the goal. The draw above is therefore a CEILING, not the command. "
+                f"- {self.cfg.freeform_approach_kd} * closing_rate, {flr}, the drawn speed) "
+                f"while the goal is AHEAD{cut} (wz is zeroed within {quiet_r} m). AIMS at "
+                f"{tgt_r} m. The draw above is therefore a CEILING, not the command. "
                 f"Distance-to-go is SIGNED along the route, so an overshoot does not command "
                 f"the robot further away. Standing still inside the stop radius pays FULL "
                 f"marks on the reward's exp(-|v_err|/sigma) term, which is what makes stopping "
