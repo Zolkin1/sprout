@@ -1312,9 +1312,10 @@ class FmTrackingCommand(MotionSequenceCommand):
                 f"while the goal is AHEAD{cut} (wz is zeroed within {quiet_r} m). AIMS at "
                 f"{tgt_r} m. The draw above is therefore a CEILING, not the command. "
                 f"Distance-to-go is SIGNED along the route, so an overshoot does not command "
-                f"the robot further away. Standing still inside the stop radius pays FULL "
+                f"the robot further away. Standing still WHERE THE COMMAND IS ZERO pays FULL "
                 f"marks on the reward's exp(-|v_err|/sigma) term, which is what makes stopping "
-                f"trainable rather than penalised.")
+                f"trainable rather than penalised -- that is inside the stop radius where there "
+                f"is one, and at the goal itself where the law decays instead.")
         else:
             approach = ""
         print(
