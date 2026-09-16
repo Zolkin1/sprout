@@ -49,6 +49,8 @@ if _p not in sys.path:
 import rollout_outcomes as ro  # noqa: E402
 from awr_buffer import first_per_env  # noqa: E402
 
+import stats  # noqa: E402
+
 #: Bootstrap resamples.
 N_BOOT: int = 20000
 
@@ -143,17 +145,25 @@ def report(name: str, cells_a: dict, cells_b: dict, *, n_boot: int = N_BOOT,
             "arm's eval never produced an episode table -- check its run directory for a "
             "bare `train_v*.log` with no directory beside it.")
     n_env = sum(a.size for a, _ in per_cell)
-    delta = float(np.mean([b.mean() - a.mean() for a, b in per_cell]))
+    # One paired delta per CELL, differenced within env first. The cell is the unit of
+    # independence, so this array -- not the episode list -- is the sample the interval is built
+    # from, and its length is the effective n.
+    per_cell_delta = np.array([(b - a).mean() for a, b in per_cell])
+    delta, lo, hi = stats.cluster_t_interval(per_cell_delta)
+
+    # SINGLE-STAGE cluster bootstrap, as a robustness check on the closed form above.
+    #
+    # It used to resample cells AND THEN envs inside each drawn cell, and that was wrong rather
+    # than cautious: a cell's own delta is already estimated from finitely many envs, so the
+    # spread of cell deltas across cells ALREADY carries within-cell noise, and drawing envs
+    # again adds it twice. Measured across this campaign's arms it inflated widths by 14-29% and
+    # flipped one conclusion (up-into-down `arrived`: [-0.0581, +0.0070] -> [-0.0506, -0.0002]).
+    # Resampling clusters only, contents intact, agrees with the t-interval to within 0.0008.
     boots = np.empty(n_boot)
     for i in range(n_boot):
-        idx = rng.integers(0, len(per_cell), len(per_cell))
-        acc = 0.0
-        for j in idx:
-            a, b = per_cell[j]
-            k = rng.integers(0, a.size, a.size)      # resample ENVS, differencing within env
-            acc += (b[k] - a[k]).mean()
-        boots[i] = acc / len(idx)
-    lo, hi = np.percentile(boots, [2.5, 97.5])
+        boots[i] = per_cell_delta[rng.integers(0, per_cell_delta.size,
+                                               per_cell_delta.size)].mean()
+    blo, bhi = np.percentile(boots, [2.5, 97.5])
     # Exact McNemar over discordant pairs, pooled across cells.
     b_win = sum(int(((b - a) > 0).sum()) for a, b in per_cell)
     a_win = sum(int(((b - a) < 0).sum()) for a, b in per_cell)
@@ -169,10 +179,13 @@ def report(name: str, cells_a: dict, cells_b: dict, *, n_boot: int = N_BOOT,
     print(f"\n{name}")
     print(f"  {len(cells)} cells, {n_env} paired envs")
     print(f"  paired delta   {delta:+.4f}  95% CI [{lo:+.4f}, {hi:+.4f}]   "
-          f"(width {hi - lo:.4f})")
+          f"(width {hi - lo:.4f})  [cluster t, C-1={len(per_cell_delta) - 1} df]")
+    print(f"  bootstrap check           [{blo:+.4f}, {bhi:+.4f}]   "
+          f"(width {bhi - blo:.4f})  [single-stage, cells only]")
     print(f"  McNemar        {b_win} envs improved, {a_win} regressed, "
           f"{n_env - m} unchanged   p={p:.3g}")
     return {"delta": delta, "lo": float(lo), "hi": float(hi), "n_env": n_env,
+            "boot_lo": float(blo), "boot_hi": float(bhi),
             "n_cells": len(cells), "improved": b_win, "regressed": a_win,
             "unchanged": n_env - m, "mcnemar_p": p}
 

@@ -17,10 +17,15 @@ lower-better. That is the whole reason both panels are needed here -- the arm th
 is clearly worse on (b), and a success-only figure would report the ablation as a three-way tie
 at the top.
 
-Intervals are the reduction's own: a 95% cluster bootstrap over ``(tile, speed)`` cells,
-resampling the cell and then the episodes within it. A pooled binomial has 14-70% actual coverage
-on this data because episodes sharing a tile share its geometry, so the CELL count -- printed on
-the figure -- is the real limit on precision.
+**THE INTERVALS.** 95% cluster-t over ``(tile, speed)`` cells: one value per cell, then
+``mean +- t(C-1) * SD / sqrt(C)``. Episodes sharing a tile share its geometry, so the CELL is the
+unit of independence and C -- not the episode count -- is the sample size. A single-stage cluster
+bootstrap (resampling cells, contents intact) agrees with this to within 0.0008 on every arm
+measured, and is the robustness check rather than the headline.
+
+Do NOT resample cells and then episodes within them: a cell's own value already carries
+within-cell sampling noise, so the second stage counts it twice. Measured here, that inflated
+widths by 14-29% and flipped one arm's conclusion.
 
 Reads ``fig_reduce.py``'s json and restates none of its numbers.
 """
@@ -144,11 +149,13 @@ def main() -> None:
         "Fine-tune algorithm ablation on the held-out box course, all arms from one "
         "pre-trained generator. (a) success rate, higher is better; (b) mean contact penalty, "
         "lower is better. Bars are the fine-tuned arm; the dashed line and grey band are the "
-        "shared pre-trained generator and its interval. Error bars are 95% cluster bootstrap "
-        "intervals over (tile, speed) cells, resampling the cell and then the episodes within "
-        "it -- a pooled binomial interval has 14-70% actual coverage here, because episodes "
-        "sharing a tile share its geometry. Success is scored over each environment's first "
-        "episode, the design whose membership cannot depend on episode duration. The contact "
+        "shared pre-trained generator and its interval. "
+        "Error bars are 95% cluster-t intervals over (tile, speed) cells -- one value "
+        "per cell, mean +- t(C-1) x SD/sqrt(C) -- because episodes sharing a tile share "
+        "its geometry, so the cell is the unit of independence and the cell count is "
+        "the sample size. A single-stage cluster bootstrap agrees to within 0.0008. "
+        "Success is scored over each environment's first episode, the design whose "
+        "membership cannot depend on episode duration. The contact "
         "penalty is exposure-standardised over downrange position, so a longer-surviving arm "
         "is not charged for reaching deeper course. Red marks an arm that moved the wrong way.")
     for f in plot_style.save_figure(fig, a.out, caption=caption):

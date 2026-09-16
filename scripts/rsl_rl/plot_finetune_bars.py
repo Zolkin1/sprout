@@ -7,12 +7,15 @@
 Two panels, both clustered by TERRAIN and coloured by ARM (pre-trained vs fine-tuned), reading
 the reduction `fig_reduce.py` produces.  Imports no IsaacLab and no torch.
 
-**What the error bars are, and why not a binomial.**  They are a 95% cluster bootstrap over
-``(tile, speed)`` cells, resampling the cell and then the episodes within it.  A binomial
-interval over pooled episodes has an actual coverage of 14-70% against a nominal 95% on this
-data, because episodes sharing a tile share its geometry -- so a pooled interval would be
-several times too narrow and would keep getting narrower with more robots per tile.  The number
-of CELLS is therefore the real limit on precision, and it is printed on the panel.
+**THE INTERVALS.** 95% cluster-t over ``(tile, speed)`` cells: one value per cell, then
+``mean +- t(C-1) * SD / sqrt(C)``. Episodes sharing a tile share its geometry, so the CELL is the
+unit of independence and C -- not the episode count -- is the sample size. A single-stage cluster
+bootstrap (resampling cells, contents intact) agrees with this to within 0.0008 on every arm
+measured, and is the robustness check rather than the headline.
+
+Do NOT resample cells and then episodes within them: a cell's own value already carries
+within-cell sampling noise, so the second stage counts it twice. Measured here, that inflated
+widths by 14-29% and flipped one arm's conclusion.
 
 **Panel B is the requested mean penalty, and it is the weaker of the two panels.**  The total is
 ``68.0 * contact_penalty + 0.107 * penetration_sum_m`` -- the spec's own weights, which put each
@@ -50,6 +53,14 @@ PANEL_B = {
     **{f"deep{c}": (f"deep{c:02d}",
                     rf"Deep penetration rate ($\geq${c} cm)", True)
        for c in (3, 4, 5, 6)},
+    # The SAME contact statistic, plotted as `1 - x` so the panel reads the way (a) does.
+    # A linear flip is the only faithful way to turn this one upward: it preserves every gap
+    # exactly, and because it is monotone the per-cell ordering, the sign test and the
+    # percentile intervals all carry over unchanged. The two flips a reader might reach for
+    # instead do NOT: `contact_reward` is the legacy hover kernel (it measures contact
+    # COVERAGE and falls under this fine-tune), and a zero-penalty "clean plan" rate also
+    # falls -- the gain here is fewer SEVERE contacts, not more perfect plans.
+    "contact_score": ("con", r"Contact score ($1-$penalty)", False),
 }
 
 #: Short, WRAPPED tick labels.  Matplotlib does not wrap tick text, and at the paper's 16 pt
@@ -59,6 +70,8 @@ TERRAIN_LABELS = {
     "Two boxes": "Two\nboxes",
     "Stairs up-into-down": "Up-into-\ndown",
     "Stairs down (in-dist.)": "Stairs\ndown",
+    "Varied multi-terrain": "Varied\nmulti",
+    "In-distribution": "In-\ndist.",
 }
 
 #: Clusters measured on the terrain the generator was TRAINED on, rather than on an
@@ -66,10 +79,12 @@ TERRAIN_LABELS = {
 #: are different -- one is "it learns a course it has never seen", the other "it does not pay
 #: for that on the terrain it already knew" -- and three undifferentiated clusters invite a
 #: reader to take all three as OOD.
-IN_DISTRIBUTION = ("Stairs down (in-dist.)",)
+IN_DISTRIBUTION = ("Stairs down (in-dist.)", "In-distribution")
 
 #: Course-class labels for the mode panel's clusters.
-KLASS_LABELS = {"two_box_course": "Two boxes", "up_into_down": "Up-into-down"}
+KLASS_LABELS = {"two_box_course": "Two boxes", "up_into_down": "Up-into-down",
+                "stairs_up": "Entry stairs", "stairs_down": "Entry stairs (down)",
+                "box": "Box"}
 
 
 def wilson(k: int, n: int, z: float = 1.959963985) -> tuple[float, float, float]:
@@ -120,19 +135,34 @@ def parse_args() -> argparse.Namespace:
                         "two halves.")
     p.add_argument("--mode_json", nargs="*", default=(),
                    help="Reduced mode-probe numbers from `mode_probe.py --stage report "
-                        "--json`, one file per (course, speed). Adds panel (c): the human "
-                        "MODE labels, clustered by course and speed.")
+                        "--json`, one file per probe. Adds panel (c): the human MODE labels. "
+                        "Write `path=Label` to name a cluster explicitly (a literal newline "
+                        "in the label wraps it); otherwise the label is the course class, "
+                        "with the TILE ID appended whenever two probes would otherwise get "
+                        "the same one -- several tiles of a single course is the normal "
+                        "shape now, and two identically-labelled clusters is a figure that "
+                        "cannot be read.")
     p.add_argument("--both_mode_panels", action="store_true",
                    help="Draw BOTH mode metrics, as panels (c) and (d) on a second row. The "
                         "two courses dissociate -- the two-box gain is selection and the "
                         "staircase gain is execution -- so either metric alone misreads one "
                         "of them. Off by default: one row of three is the figure that fits a "
                         "page, and the dropped panel is one flag away.")
+    p.add_argument("--mode_scope", default="all", choices=("all", "first"),
+                   help="What the human actually graded, which sets panel (c)'s axis label. "
+                        "'all' (default) is a session run with `mode_probe --stage label "
+                        "--whole`, where the operator watches the traverse and the trial "
+                        "counts as correct only if EVERY mode decision was right. 'first' is "
+                        "the truncated label window, where only the opening decision is "
+                        "judged. The stored counts are identical -- `correct` over `n` either "
+                        "way -- so nothing but the reader can tell them apart, which is why "
+                        "it is stated rather than inferred.")
     p.add_argument("--mode_metric", default="correct", choices=("correct", "survival"),
                    help="Which mode metric panel (c) shows; ignored under "
                         "--both_mode_panels. "
-                        "'correct' is the fraction of trials whose FIRST mode was the right "
-                        "one -- the selection question. 'survival' is the fraction that then "
+                        "'correct' is the fraction of trials whose mode labels were all right "
+                        "-- the selection question; see --mode_scope. 'survival' is the "
+                        "fraction that then "
                         "reached the goal, conditioned on having chosen right -- the execution "
                         "question. The two dissociate: on the two-box course the gain is "
                         "selection, on the staircase selection is near ceiling and the gain is "
@@ -142,7 +172,8 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _bars(ax, res: dict, terrains: list[str], field: str, ylabel: str) -> None:
+def _bars(ax, res: dict, terrains: list[str], field: str, ylabel: str,
+          flip: bool = False) -> None:
     """One clustered bar panel with cluster-bootstrap error bars.
 
     Args:
@@ -151,15 +182,32 @@ def _bars(ax, res: dict, terrains: list[str], field: str, ylabel: str) -> None:
         terrains: Terrain order, left to right.
         field: The json field stem, e.g. ``"pen"``.
         ylabel: Axis label.
+        flip: Plot ``1 - value``, so a lower-is-better quantity points the same way as the
+            success panel. The interval flips with it -- ``[lo, hi]`` becomes
+            ``[1 - hi, 1 - lo]`` -- because a percentile interval maps through a monotone
+            transform exactly.
+
+    Raises:
+        SystemExit: If a flipped value or interval bound would fall below zero, i.e. the
+            penalty exceeded 1 and ``1 - x`` is no longer a score on the same scale as (a).
     """
     width = 0.36
     for j, (arm, label, colour) in enumerate(ARMS):
         xs = [i + (j - 0.5) * width for i in range(len(terrains))]
-        ys = [res[t][f"{field}_{arm}"] for t in terrains]
+        vs = [res[t][f"{field}_{arm}"] for t in terrains]
+        ls = [res[t][f"{field}_{arm}_lo"] for t in terrains]
+        hs = [res[t][f"{field}_{arm}_hi"] for t in terrains]
+        if flip and min([1.0 - h for h in hs] + [1.0 - v for v in vs]) < 0.0:
+            raise SystemExit(
+                f"REFUSING to flip {field!r}: a value or interval bound exceeds 1, so "
+                "`1 - x` is not a score on the same 0-1 scale as panel (a). Plot the "
+                "quantity itself.")
+        ys = [1.0 - v for v in vs] if flip else vs
         # Asymmetric by construction: a percentile bootstrap interval is not centred on the
         # estimate, and forcing it to be would misreport the direction of the uncertainty.
-        lo = [res[t][f"{field}_{arm}"] - res[t][f"{field}_{arm}_lo"] for t in terrains]
-        hi = [res[t][f"{field}_{arm}_hi"] - res[t][f"{field}_{arm}"] for t in terrains]
+        # Under the flip the two arms swap roles: the upper bound becomes the lower one.
+        lo = [h - v for v, h in zip(vs, hs)] if flip else [v - l for v, l in zip(vs, ls)]
+        hi = [v - l for v, l in zip(vs, ls)] if flip else [h - v for v, h in zip(vs, hs)]
         ax.bar(xs, ys, width, label=label, color=colour, edgecolor="black", linewidth=1.2,
                zorder=2)
         ax.errorbar(xs, ys, yerr=[lo, hi], fmt="none", ecolor="black", elinewidth=1.6,
@@ -179,7 +227,7 @@ def _bars(ax, res: dict, terrains: list[str], field: str, ylabel: str) -> None:
                    zorder=1)
 
 
-def _mode_panel(ax, files: list[str], metric: str) -> list[str]:
+def _mode_panel(ax, files: list[str], metric: str, scope: str = "all") -> list[str]:
     """Panel (c): the human mode labels, clustered by course and grouped by speed.
 
     The speed axis is the finding, not decoration.  On the two-box course the parent reads the
@@ -192,17 +240,34 @@ def _mode_panel(ax, files: list[str], metric: str) -> list[str]:
         ax: The axes.
         files: The reduced json files, one per (course, speed).
         metric: ``"correct"`` or ``"survival"``; see the CLI help.
+        scope: ``"all"`` or ``"first"`` -- what the operator graded; sets the axis label.
 
     Returns:
         Cluster labels, so the caller can annotate counts.
     """
     recs = []
     for f in files:
-        with open(f, encoding="utf-8") as fh:
-            recs.append(json.load(fh))
-    # Course first, speed within it, so a cluster pair reads left-to-right as slow then fast.
-    recs.sort(key=lambda r: (KLASS_LABELS.get(r["klass"], r["klass"]), r["speed"]))
-    labels = [f"{KLASS_LABELS.get(r['klass'], r['klass'])}\n{r['speed']:.2f} m/s" for r in recs]
+        path, _, given = f.partition("=")
+        with open(path, encoding="utf-8") as fh:
+            r = json.load(fh)
+        r["_label"] = given.replace("\\n", "\n") if given else ""
+        recs.append(r)
+    # Course first, speed within it, so a cluster pair reads left-to-right as slow then fast
+    # -- but a caller who NAMED every cluster gets the order they passed, because the point of
+    # naming them is usually to line panel (c) up with panel (a), and (a)'s order is the
+    # reduction's, not alphabetical.
+    if not all(r["_label"] for r in recs):
+        recs.sort(key=lambda r: (KLASS_LABELS.get(r["klass"], r["klass"]), r["speed"],
+                                 int(r.get("terrain_id", -1))))
+    # The tile id joins the label only where it has to. Several tiles of ONE course is the
+    # normal shape of this probe now (the boxes course alone has four rolled), and without
+    # this two of them render as the same cluster label with different bars under it.
+    stem = [r["_label"] or KLASS_LABELS.get(r["klass"], r["klass"]) for r in recs]
+    dup = {t for t in stem if stem.count(t) > 1}
+    labels = []
+    for r, t in zip(recs, stem):
+        head = f"{t} (t{int(r['terrain_id'])})" if t in dup and not r["_label"] else t
+        labels.append(f"{head}\n{r['speed']:.2f} m/s")
 
     width = 0.36
     for j, (arm, label, colour) in enumerate(ARMS):
@@ -213,6 +278,15 @@ def _mode_panel(ax, files: list[str], metric: str) -> list[str]:
                 continue
             k, n = ((a["correct"], a["n"]) if metric == "correct"
                     else (a["surv_success"], a["surv_n"]))
+            if metric == "survival" and n > 0 and k == 0 and a["correct"] > 0:
+                raise SystemExit(
+                    f"REFUSING --mode_metric survival on {r.get('course')!r} tile "
+                    f"{r.get('terrain_id')}: {a['correct']} trials chose the right mode and "
+                    "NONE is recorded as surviving. `mode_probe` rolls with "
+                    "stop_on_goal=False, and `runner.run_episode` only ever sets "
+                    "verdict='success' inside that branch -- so this is a structural zero, "
+                    "not a measurement. Use --mode_metric correct, and take arrival from "
+                    "`add_goal_arrival.py`'s goal.json instead.")
             pt, l, h = wilson(int(k), int(n))
             xs.append(i + (j - 0.5) * width)
             ys.append(pt)
@@ -225,17 +299,35 @@ def _mode_panel(ax, files: list[str], metric: str) -> list[str]:
     ax.set_xticks(range(len(recs)))
     ax.set_xticklabels(labels)
     ax.tick_params(axis="x", length=0)
-    ax.set_ylabel("Correct first mode" if metric == "correct"
-                  else r"Reached goal $\mid$ correct mode")
+    ax.set_ylabel(("All modes correct" if scope == "all" else "Correct first mode")
+                  if metric == "correct" else r"Reached goal $\mid$ correct mode")
     ax.set_xlim(-0.6, len(recs) - 0.4)
     ax.set_ylim(0.0, 1.0)
     ax.yaxis.grid(True, color="0.85", linewidth=1.0, zorder=0)
     ax.set_axisbelow(True)
-    for i in range(1, len(recs)):
-        if recs[i]["klass"] != recs[i - 1]["klass"]:
-            ax.axvline(i - 0.5, color="0.55", linewidth=1.2, linestyle=(0, (4, 3)), zorder=1)
-    return [f"{KLASS_LABELS.get(r['klass'], r['klass'])} @ {r['speed']:.2f}: "
-            f"{r['arms'][next(iter(r['arms']))]['n']} trials/arm" for r in recs]
+    # Head each dashed group with its COURSE, the same device panels (a) and (b) use for the
+    # two regimes: the dashed rule alone says "these belong together" without saying what they
+    # are, and the cluster labels below then have to carry both the course and the variant.
+    bounds = [0] + [i for i in range(1, len(recs))
+                    if recs[i]["klass"] != recs[i - 1]["klass"]] + [len(recs)]
+    for i in bounds[1:-1]:
+        ax.axvline(i - 0.5, color="0.55", linewidth=1.2, linestyle=(0, (4, 3)), zorder=1)
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        ax.annotate(KLASS_LABELS.get(recs[lo]["klass"], recs[lo]["klass"]),
+                    xy=((lo + hi - 1) / 2.0, 1.015), xycoords=("data", "axes fraction"),
+                    ha="center", va="bottom", fontsize=12, color="0.35",
+                    annotation_clip=False)
+    # The note uses the CLUSTER's own label, not the class label: with several tiles per
+    # course the class label repeats, and a note reading "Up-into-down ... Up-into-down" names
+    # neither of them. Per-arm counts are spelled out whenever they differ, which happens
+    # while a probe is part-graded -- a figure must not round 24 up to "25 trials/arm".
+    out = []
+    for r, t in zip(recs, stem):
+        ns = {a: int(v["n"]) for a, v in r["arms"].items()}
+        cnt = (f"{next(iter(ns.values()))} trials/arm" if len(set(ns.values())) == 1
+               else ", ".join(f"{a} {n}" for a, n in sorted(ns.items())) + " trials")
+        out.append(f"{t.replace(chr(10), ' ')} @ {r['speed']:.2f}: {cnt}")
+    return out
 
 
 def main() -> int:
@@ -263,7 +355,8 @@ def main() -> int:
                          for k in terrains)
             + "\n  Re-grade the arms against one reward spec before plotting them together.")
     weights = dict(zip(_wk, next(iter(_seen)))) if _seen else {}
-    field, ylabel, _ = PANEL_B[args.panel_b]
+    field, ylabel, _lower_better = PANEL_B[args.panel_b]
+    flip_b = not _lower_better
 
     plot_style.apply_paper_style()
     import matplotlib.pyplot as plt  # noqa: PLC0415
@@ -278,9 +371,9 @@ def main() -> int:
         fig, grid = plt.subplots(2, 2, figsize=(fig_w, base_h * 2.0))
         axes = [grid[0][0], grid[0][1], grid[1][0], grid[1][1]]
         _bars(axes[0], res, terrains, "succ", "Success rate")
-        _bars(axes[1], res, terrains, field, ylabel)
-        mode_note = _mode_panel(axes[2], list(args.mode_json), "correct")
-        _mode_panel(axes[3], list(args.mode_json), "survival")
+        _bars(axes[1], res, terrains, field, ylabel, flip=flip_b)
+        mode_note = _mode_panel(axes[2], list(args.mode_json), "correct", args.mode_scope)
+        _mode_panel(axes[3], list(args.mode_json), "survival", args.mode_scope)
     elif n_mode:
         # One row of three. Width follows the CLUSTER count rather than the panel count: a
         # wrapped tick label is as wide as its own bar pair, so a panel cannot be squeezed
@@ -290,19 +383,25 @@ def main() -> int:
                                  gridspec_kw={"width_ratios": widths})
         axes = list(np.atleast_1d(grid))
         _bars(axes[0], res, terrains, "succ", "Success rate")
-        _bars(axes[1], res, terrains, field, ylabel)
-        mode_note = _mode_panel(axes[2], list(args.mode_json), args.mode_metric)
+        _bars(axes[1], res, terrains, field, ylabel, flip=flip_b)
+        mode_note = _mode_panel(axes[2], list(args.mode_json), args.mode_metric,
+                                args.mode_scope)
     else:
         fig_w = base_w * (1.0 + 0.20 * max(len(terrains) - 2, 0))
         fig, grid = plt.subplots(1, 2, figsize=(fig_w, base_h))
         axes = list(np.atleast_1d(grid))
         _bars(axes[0], res, terrains, "succ", "Success rate")
-        _bars(axes[1], res, terrains, field, ylabel)
+        _bars(axes[1], res, terrains, field, ylabel, flip=flip_b)
     axes[0].set_ylim(0.0, 1.0)
-    axes[1].set_ylim(0.0, None)
+    # A flipped panel shares (a)'s axis on purpose: the point of the flip is that the two
+    # panels read alike, and an auto-scaled 0.6-1.0 axis would exaggerate the gaps it keeps.
+    axes[1].set_ylim(0.0, 1.0 if flip_b else None)
     for ax, tag in zip(axes, "abcd"):
         ax.set_title(f"({tag})", loc="left")
-    axes[0].legend(loc="upper left", frameon=True)
+    # One ROW of two entries, not a two-row box: the cluster count changes between
+    # campaigns, and a tall upper-left box clipped the second cluster's bar at four
+    # clusters. A single row sits above every bar on a 0-1 success axis.
+    axes[0].legend(loc="upper left", ncol=2, frameon=True)
 
     if not args.no_counts:
         # The cell count is the precision limit, so it belongs on the figure rather than only in
@@ -326,18 +425,40 @@ def main() -> int:
                             annotation_clip=False)
 
     fig.tight_layout()
+    # The OOD course count is COUNTED, not stated: this figure is redrawn per campaign and the
+    # number of clusters changes with it, so a hardcoded "two" silently mislabels the next one.
+    n_ood = sum(1 for t in terrains if t not in IN_DISTRIBUTION)
+    n_word = {1: "one", 2: "two", 3: "three", 4: "four", 5: "five"}.get(n_ood, str(n_ood))
     caption = (
-        "AWR fine-tuning of the flow-matching generator on two out-of-distribution courses. "
-        f"(a) success rate; (b) {ylabel.lower()}. Bars are cell-averaged; error bars are 95% "
-        "cluster bootstrap intervals over (tile, speed) cells, resampling the cell and then the "
-        "episodes within it -- a pooled binomial interval has 14-70% actual coverage here, "
-        "because episodes sharing a tile share its geometry. Success is scored over each "
-        "environment's first episode, the design whose membership cannot depend on episode "
+        f"AWR fine-tuning of the flow-matching generator on {n_word} out-of-distribution "
+        f"course{'' if n_ood == 1 else 's'}. "
+        f"(a) success rate; (b) {ylabel.lower()}. Bars are cell-averaged. "
+        "Error bars are 95% cluster-t intervals over (tile, speed) cells -- one value "
+        "per cell, mean +- t(C-1) x SD/sqrt(C) -- because episodes sharing a tile share "
+        "its geometry, so the cell is the unit of independence and the cell count is "
+        "the sample size. A single-stage cluster bootstrap agrees to within 0.0008. "
+        "Success is scored over each environment's first episode, the design whose "
+        "membership cannot depend on episode "
         "duration. The penalty is exposure-standardised over downrange position, so a "
         "longer-surviving arm is not charged for reaching deeper course."
         + (f" Penalty weights: contact {weights['contact_weight']:g}, penetration "
            f"{weights['penetration_weight']:g}."
-           if weights.get("contact_weight") is not None else ""))
+           if weights.get("contact_weight") is not None else "")
+        # Panel (c) is a different measurement from (a) and (b) -- a human judgement, one
+        # tile, independent noise draws -- so it needs its own sentence rather than inheriting
+        # theirs. In particular its interval is BINOMIAL and that is correct here, which is
+        # exactly the opposite of the claim the sentence above makes about (a) and (b).
+        + ((" (c) the fraction of trials in which EVERY mode decision of the traverse was the "
+            "correct one for the course"
+            if args.mode_scope == "all" else
+            " (c) the fraction of trials whose FIRST mode decision was the correct one for "
+            "the course")
+           + ", labelled by a human who was shown the trials blind and interleaved "
+           "between arms, with the arm neither displayed nor recoverable. Each cluster is one "
+           "tile at one commanded speed, and the arms differ only in the flow-matching noise "
+           "draw; error bars are 95% Wilson intervals, which unlike (a) and (b) is the right "
+           "interval here because the trials share no tile to cluster on."
+           if mode_note else ""))
     paths = plot_style.save_figure(fig, args.out, caption=caption)
     for p in paths:
         print(f"wrote {p}")
