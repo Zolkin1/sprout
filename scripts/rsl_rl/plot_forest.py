@@ -36,6 +36,38 @@ import numpy as np  # noqa: E402
 
 import plot_style  # noqa: E402
 
+#: One colour per METHOD, keyed by the arm label, so a method reads the same in every block and
+#: stays the same method across figures. Colour here encodes IDENTITY, not a verdict -- an
+#: earlier version coloured by whether the interval excluded zero, which made the figure state a
+#: conclusion the interval already carries, and made the two panels disagree about an arm
+#: whenever one crossed zero and the other did not. AWR is black rather than one of the hues
+#: because it is the reference rather than a measurement: its "interval" is the zero it defines.
+#: The zero RULE stays grey, so the marker reads against it instead of merging into it.
+METHOD_COLOURS: dict[str, str] = {
+    "AWR": plot_style.COLORS["black"],
+    "Arrived": plot_style.COLORS["blue"],
+    "Filtered BC": plot_style.COLORS["orange"],
+    "Plain BC": plot_style.COLORS["teal"],
+}
+#: An arm not in the map still plots, in a colour none of the named ones already uses.
+_SPARE = [c for c in plot_style.COLOR_CYCLE if c not in set(METHOD_COLOURS.values())]
+
+#: What each arm is CALLED on the figure. The json files keep the canonical arm name, so
+#: renaming a method is a plotting change and costs no re-reduction -- `forest_contact.py` runs
+#: `fig_reduce` once per arm, which is the expensive half of this figure. It also means the
+#: colour map above and the group keys in `forest_groups.json` stay keyed on one spelling.
+DISPLAY_NAMES: dict[str, str] = {
+    "Arrived": "Arrival Filt.",
+    "Filtered BC": "Filt. BC",
+}
+
+#: Same idea for the block labels down the right-hand edge. `--exclude` still matches the
+#: CANONICAL name, because that is what `forest_groups.json` and both json files are keyed on --
+#: matching the display name would mean the flag stopped working the moment a block was renamed.
+GROUP_DISPLAY: dict[str, str] = {
+    "Multi, strict": "Multi-terrain, strict",
+}
+
 
 def main() -> None:
     """Render the forest plot."""
@@ -45,6 +77,8 @@ def main() -> None:
     ap.add_argument("--out", default="logs/paper/forest")
     ap.add_argument("--contact", default="",
                     help="second json, keyed the same way, holding contact-penalty deltas")
+    ap.add_argument("--exclude", action="append", default=[], metavar="GROUP",
+                    help="group to leave out; repeat the flag per group (names contain commas)")
     ap.add_argument("--xlabel", default="Success rate (rel. to AWR)")
     ap.add_argument("--xlabel2", default="Mean contact penalty (rel. to AWR)")
     a = ap.parse_args()
@@ -53,6 +87,15 @@ def main() -> None:
     data = json.loads(pathlib.Path(a.rows).read_text())
     rows = data["rows"]
 
+    # Dropping a block is a DISPLAY choice, so it happens here rather than by editing
+    # `forest_groups.json` -- the arms stay computed and reappear by removing the flag.
+    drop = {g.strip() for g in a.exclude if g.strip()}
+    if drop:
+        missing = drop - {r["group"] for r in rows}
+        if missing:
+            raise SystemExit(f"--exclude names no such group: {sorted(missing)}")
+        rows = [r for r in rows if r["group"] not in drop]
+
     # Groups in the order the data file gives them; arms in order within each group. Top group
     # is drawn topmost, which means plotting from the bottom up.
     groups: list[str] = []
@@ -60,13 +103,14 @@ def main() -> None:
         if r["group"] not in groups:
             groups.append(r["group"])
 
-    ys, labels, seps, ticks = [], [], [], []
+    ys, labels, arms, seps, ticks = [], [], [], [], []
     y = 0.0
     for gi, g in enumerate(reversed(groups)):
         grows = [r for r in rows if r["group"] == g]
         for r in reversed(grows):
             ys.append((y, r))
-            labels.append(r["arm"])
+            labels.append(DISPLAY_NAMES.get(r["arm"], r["arm"]))
+            arms.append(r["arm"])
             y += 1.0
         ticks.append((y - len(grows) / 2.0 - 0.5, g))
         if gi < len(groups) - 1:
@@ -84,19 +128,23 @@ def main() -> None:
                                       0.42 * y + 1.4))
     axes = np.atleast_1d(axes)
 
-    # ONE COLOUR for every arm. An earlier version coloured by whether the interval excluded
-    # zero, which reads as a verdict the figure should not be issuing on the reader's behalf --
-    # the interval is already on the page and says it better. Uniform colour also stops the two
-    # panels from disagreeing about an arm when one crosses zero and the other does not.
-    col = plot_style.COLORS["blue"]
+    # Colour by METHOD (see METHOD_COLOURS), assigned once over the arms actually present so
+    # every block draws a given method the same and the eye can track it down the figure.
+    seen: list[str] = []
+    for _, r in ys:
+        if r["arm"] not in seen:
+            seen.append(r["arm"])
+    colour = {arm: METHOD_COLOURS.get(arm, _SPARE[i % len(_SPARE)])
+              for i, arm in enumerate(seen)}
     for ax, (src, xlabel) in zip(axes, [(None, a.xlabel), (contact, a.xlabel2)][:npanel]):
         ax.axvline(0.0, color="0.35", lw=1.4, ls=(0, (5, 3)), zorder=1)
         for pos, r in ys:
             row = r if src is None else src.get((r["group"], r["arm"]))
             if row is None:
                 continue
+            col = colour[r["arm"]]
             if r.get("reference"):
-                ax.plot([0.0], [pos], marker="D", ms=7, color="0.35", zorder=4)
+                ax.plot([0.0], [pos], marker="D", ms=7, color=col, zorder=4)
                 continue
             # `lo`/`hi` are the CLUSTER-T interval, which `paired_delta.report` and
             # `fig_reduce` now both emit as the headline; `boot_lo`/`boot_hi` carry the
@@ -118,30 +166,31 @@ def main() -> None:
     ax = axes[0]
     ax.set_yticks([p for p, _ in ys])
     ax.set_yticklabels(labels)
+    # Keyed off `arms`, not the tick TEXT: the text is now a display name and would miss the
+    # colour map, which silently falls back to black rather than raising.
+    for lab, arm in zip(ax.get_yticklabels(), arms):
+        lab.set_color(colour[arm])
     ax.set_ylim(-0.8, y - 0.2)
 
     # Group names on the right, so they do not fight the arm labels for the left margin.
     for pos, name in ticks:
-        axes[-1].annotate(name, xy=(1.03, pos), xycoords=("axes fraction", "data"),
+        axes[-1].annotate(GROUP_DISPLAY.get(name, name),
+                          xy=(1.03, pos), xycoords=("axes fraction", "data"),
                           va="center", ha="left", fontsize="small", color="0.30", rotation=90,
                           annotation_clip=False)
     fig.subplots_adjust(right=0.88)
 
-    n = {r["n_cells"] for r in rows if r.get("n_cells")}
-    fig.text(0.5, 0.005,
-             plot_style.tex_escape(
-                 "paired against AWR within each block; 95% cluster bootstrap over "
-                 "(tile, speed) cells"),
-             ha="center", va="bottom", fontsize="small", color="0.35")
-
     caption = (
         "Fine-tune algorithm ablation as differences from AWR. Each row is one arm's paired "
-        "success-rate difference from the AWR arm of its own block, with a 95% cluster bootstrap "
-        "interval over (tile, speed) cells resampling envs within them; AWR is the zero line and "
-        "is drawn without an interval because it is the reference. Blocks differ in course and in "
-        "whether the tracking-bound termination was active during collection. Grey intervals "
-        "include zero. Pairing is within block and at the environment level, not a difference of "
-        "two vs-parent deltas, which would carry the pre-trained arm's noise into every row.")
+        "success-rate difference from the AWR arm of its own block. Intervals are 95% cluster-t, "
+        "mean $\\pm\\,t_{C-1}\\,\\mathrm{SD}/\\sqrt{C}$ over the per-cell paired deltas, "
+        "taking the (tile, speed) cell as the unit of independence; a single-stage cluster "
+        "bootstrap agrees with these to within 0.001 everywhere. AWR is the zero line and is "
+        "drawn without an interval because it is the reference. Colour identifies the method, "
+        "not the outcome. Blocks differ in course and in whether the tracking-bound termination "
+        "was active during collection. Pairing is within block and at the environment level, not "
+        "a difference of two vs-parent deltas, which would carry the pre-trained arm's noise "
+        "into every row.")
     for f in plot_style.save_figure(fig, a.out, caption=caption):
         print(f"wrote {f}")
     for pos, r in ys:

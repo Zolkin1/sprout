@@ -181,29 +181,55 @@ def _artist_count(fig) -> int:
     return int(n)
 
 
-def save_figure(fig, path_no_ext, *, svg: bool = True, caption: str | None = None
-                ) -> list[str]:
+def save_figure(fig, path_no_ext, *, svg: bool = True, caption: str | None = None,
+                exact_size: bool = False) -> list[str]:
     """Save PNG (+ SVG) and, optionally, a caption sidecar. Never PDF.
 
     The caption file is what makes the "no titles, use captions" rule workable: it holds the
     definitions in force for that figure -- which success notion, which stratum, which
     interval -- so a reader is never left guessing and the text can be pasted into LaTeX.
+
+    Args:
+        fig: The figure.
+        path_no_ext: Output path without an extension.
+        svg: Also write an SVG, unless the artist count makes it unopenable.
+        caption: Caption text for the sidecar.
+        exact_size: Write the figure at its DECLARED size instead of cropping to content.
+            The default ``savefig.bbox="tight"`` trims each figure to its own ink, so two
+            figures declared at the same width come out a few pixels apart and their panel
+            columns no longer line up when one is STACKED above the other. Set this for
+            figures meant to be stacked; it costs a little whitespace at the margins.
+
+    Returns:
+        The paths written.
     """
     import pathlib  # noqa: PLC0415
 
     p = pathlib.Path(str(path_no_ext))
     p.parent.mkdir(parents=True, exist_ok=True)
     fig.tight_layout()
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    # `bbox_inches=None` does NOT mean "the whole canvas": matplotlib falls back to
+    # rcParams["savefig.bbox"], which this style sets to "tight". Only the rcParam turns
+    # the crop off, so exact_size goes through an rc_context rather than the kwarg.
+    #
+    # A FRESH context per save: `rc_context` is a generator-based context manager and
+    # entering one twice raises, which made the second (SVG) write fail whenever the figure
+    # was small enough for an SVG to be written at all.
+    overrides = {"savefig.bbox": "standard"} if exact_size else {}
     written = []
     png = str(p) + ".png"
-    fig.savefig(png, dpi=pixel_budget_dpi(fig))
+    with plt.rc_context(overrides):
+        fig.savefig(png, dpi=pixel_budget_dpi(fig))
     written.append(png)
     if svg:
         if _artist_count(fig) > _SVG_ARTIST_MAX:
             print(f"[plot_style] {p.name}: skipping SVG ({_artist_count(fig)} artists or an "
                   "image); the vector file would be tens of MB and unopenable.")
         else:
-            fig.savefig(str(p) + ".svg")
+            with plt.rc_context(overrides):
+                fig.savefig(str(p) + ".svg")
             written.append(str(p) + ".svg")
     if caption:
         cap = str(p) + ".caption.txt"
