@@ -75,8 +75,29 @@ between arms is the objective and not the data -- pinned by parsing the script
 |---|---|---|---|
 | `awr` | `w = clip(exp(A / (beta * sd A)), 0, 20)` | yes | ~10-15% effective |
 | `fbc` | filtered BC on the top 30% by advantage | yes | 30% |
-| `arrived` | BC on episodes that ARRIVED before failing | **no** | ~8.8% |
+| `arrived` | BC on episodes that ARRIVED before failing | **no** | 45-65%, see below |
 | `bc` | plain BC on every row | **no** | 100% |
+
+**`arrived`'s yield is a property of the COURSE, not of the algorithm, and the 8.8% this table
+used to quote is stale.** Measured on the 2026-09-15 ladder, per iteration:
+
+| course | iter 1 | iter 5 | trend |
+|---|---|---|---|
+| boxes | 0.450 | 0.535 | rises as the policy improves |
+| updown | 0.624 | 0.627 (it 4) | |
+| multi | 0.552 | 0.556 (it 2) | |
+
+Two consequences. **A starved `arrived` arm is a real hazard and it is not the current regime** --
+the 8.8%, and the 0.40% the `loose` section below records, come from a weaker parent scored
+differently, so do not reason about this arm from those numbers. And **`arrived` adapts its data
+budget while `fbc` cannot**: fbc keeps exactly 30% at every iteration because it is a top-quantile
+filter, so late in training it is still discarding 70% of rollouts when half of them succeeded,
+where arrived keeps the half that did. That is a plausible mechanism for arrived beating fbc by
++0.0773 paired (p=2.3e-10) on boxes, and it is measured rather than inferred -- but it is one
+course, and the updown/multi arms are what would make it a finding.
+
+`awr`'s figure is an EFFECTIVE sample size, not a keep fraction, and it is current: the ladder
+arm logged `awr/ess_frac 0.160`. `bc` writes no label file at all, which is what its 100% means.
 
 **AWR's hot limit is unweighted BC on the labelled rows and its sharp limit under `global`
 normalization IS filtered BC**, so the ladder only means something if each arm is actually its own
