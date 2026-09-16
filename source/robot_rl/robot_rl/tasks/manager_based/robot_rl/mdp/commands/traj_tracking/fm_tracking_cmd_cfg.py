@@ -635,6 +635,30 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     under ``"replan"`` it additionally bounds how often the env can re-roll.
     """
 
+    freeform_approach_target_r_m: float = -1.0
+    """Range the approach controller AIMS at, when it must differ from where it stops (m).
+
+    NEGATIVE (the default) means "use :attr:`freeform_stop_radius_m`", which is what the law
+    did when one number served both, so nothing changes by default. A negative sentinel rather
+    than ``None`` on purpose: hydra's struct mode refuses to override a key whose value is
+    ``None``, and both free-form launchers set these unconditionally.
+
+    ``0.0`` aims at the goal POINT. That is what a dwell course wants -- the region being
+    scored is a disc and the middle of it is the only place with margin on every side.
+
+    Separate from the stop radius because the two are different physical statements: this is
+    where the P term's error goes to zero, and the stop radius is where forward speed is CUT.
+    A single number conflates "where I am trying to get to" with "where I give up trying",
+    which is only harmless while they coincide.
+
+    **It has less effect than it looks, and the reason is worth knowing before tuning it.**
+    :attr:`freeform_approach_min_speed` floors the command, so below
+    ``min_speed / kp + target_r`` the commanded speed is the floor whatever this says -- at the
+    wall course's ``kp = 0.6`` and floor 0.3 that is everything inside 0.5 m. Where the robot
+    comes to REST is set by the stop radius plus coast, not by this. Change it to say what the
+    controller means; change the stop radius to move the robot.
+    """
+
     freeform_yaw_quiet_radius_m: float = 0.0
     """Range at which the STEERING channel goes quiet, when it must differ from the stop radius.
 

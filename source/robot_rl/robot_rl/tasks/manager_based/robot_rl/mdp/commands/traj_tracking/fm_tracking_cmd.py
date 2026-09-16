@@ -1296,11 +1296,17 @@ class FmTrackingCommand(MotionSequenceCommand):
                     f"{self.cfg.freeform_stop_radius_m}; it is a range.")
             floor = float(getattr(self.cfg, "freeform_approach_min_speed", 0.0) or 0.0)
             stop_r = float(getattr(self.cfg, "freeform_stop_radius_m", 0.0) or 0.0)
+            tgt_r = float(getattr(self.cfg, "freeform_approach_target_r_m", -1.0))
+            tgt_r = stop_r if tgt_r < 0.0 else tgt_r
+            quiet_r = float(getattr(self.cfg, "freeform_yaw_quiet_radius_m", 0.0) or 0.0)
+            quiet_r = stop_r if quiet_r <= stop_r else quiet_r
             approach = (
-                f" APPROACH CONTROLLER ON: vx = clamp({a_kp} * (along_track_to_go - {stop_r}) "
+                f" APPROACH CONTROLLER ON: vx = clamp({a_kp} * (along_track_to_go - {tgt_r}) "
                 f"- {self.cfg.freeform_approach_kd} * closing_rate, {floor}, the drawn speed) "
-                f"while the goal is AHEAD, and exactly 0 within {stop_r} m of it (where wz is "
-                f"zeroed too). The draw above is therefore a CEILING, not the command. "
+                f"while the goal is AHEAD, and exactly 0 within {stop_r} m of it (wz is zeroed "
+                f"within {quiet_r} m). AIMS at {tgt_r} m and STOPS at {stop_r} m -- equal "
+                f"unless a course separates them, and when they are equal the law's "
+                f"equilibrium is a shell around the goal rather than the goal. The draw above is therefore a CEILING, not the command. "
                 f"Distance-to-go is SIGNED along the route, so an overshoot does not command "
                 f"the robot further away. Standing still inside the stop radius pays FULL "
                 f"marks on the reward's exp(-|v_err|/sigma) term, which is what makes stopping "
@@ -1551,8 +1557,10 @@ class FmTrackingCommand(MotionSequenceCommand):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Forward speed from distance-to-goal, and the two range masks the caller needs.
 
-        ``vx = clamp(kp * (to_go - stop_radius) - kd * closing, floor, drawn_speed)`` outside
-        the stop radius, and exactly ``0`` inside it.
+        ``vx = clamp(kp * (to_go - target_r) - kd * closing, floor, drawn_speed)`` outside the
+        stop radius, and exactly ``0`` inside it -- where ``target_r`` is where the controller
+        AIMS and the stop radius is where it CUTS. One number serves both unless a course sets
+        :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.freeform_approach_target_r_m`.
 
         **``to_go`` is SIGNED ALONG-TRACK, not Euclidean range, and that is a bug fix rather
         than a refinement.** With an unsigned range a robot that coasts past the goal reads a
@@ -1590,7 +1598,8 @@ class FmTrackingCommand(MotionSequenceCommand):
         was a tight annulus, median 0.80 m and p90 0.89 m, with ~1% of episodes ever reaching
         within 0.5 m of the goal. The 0.20 m it does get past the shell is coast -- the command
         steps from the 0.3 m/s floor to zero and momentum carries it. A course that wants the
-        robot to stand at the CENTRE therefore sets ``stop_r`` to about that coast distance,
+        robot to stand at the CENTRE therefore aims at the goal point
+        (``freeform_approach_target_r_m = 0``), sets ``stop_r`` to about that coast distance,
         and uses
         :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.freeform_yaw_quiet_radius_m` to keep
         steering from ending at the same small range.
@@ -1614,7 +1623,13 @@ class FmTrackingCommand(MotionSequenceCommand):
         to_go = to_goal[:, 0] * ux + to_goal[:, 1] * uy                         # signed
         vel_xy = wp.to_torch(self.robot.data.root_lin_vel_w)[:, :2]
         closing = vel_xy[:, 0] * ux + vel_xy[:, 1] * uy      # >0 while running down the route
-        vx = kp * (to_go - stop_r) - kd * closing
+        # WHERE IT AIMS, which is not where it stops. Negative = "the stop radius", the old
+        # single-number behaviour; the wall course sets 0.0 so the error goes to zero at the
+        # goal POINT rather than on a shell around it.
+        target_r = float(getattr(self.cfg, "freeform_approach_target_r_m", -1.0))
+        if target_r < 0.0:
+            target_r = stop_r
+        vx = kp * (to_go - target_r) - kd * closing
         vx = vx.clamp(min=0.0).minimum(self._ff_speed)
         if floor > 0.0:
             # Per env, and capped by that env's OWN draw: an episode that drew 0.6 m/s must not

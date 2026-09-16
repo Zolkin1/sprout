@@ -115,6 +115,13 @@ def test_the_controller_aims_at_the_CENTRE_and_the_steering_stops_at_the_DISC() 
         "the yaw-quiet radius must BE the terrain module's dwell radius, not a copy of its "
         "value and not the stop radius -- see this test's docstring for what happens when the "
         "steering is allowed to stay live inside the scored region.")
+    assert _module_constants(_ENV_CFG).get("WALLS_APPROACH_TARGET_R_M") == 0.0, (
+        "WALLS_APPROACH_TARGET_R_M must be 0.0 -- the controller aims at the goal POINT. Set "
+        "equal to the stop radius it aims at a shell around the goal, which is the arrangement "
+        "that produced the 0.80 m median closest approach this docstring describes.")
+    assert "freeform_approach_target_r_m = WALLS_APPROACH_TARGET_R_M" in src, (
+        "G1WallsFinetuneEnvCfg must wire the aim point; declaring the constant without "
+        "assigning it leaves the P term's setpoint on the stop radius.")
     assert "freeform_yaw_quiet_radius_m = WALLS_YAW_QUIET_RADIUS_M" in src, (
         "G1WallsFinetuneEnvCfg must actually wire the yaw-quiet radius; declaring the constant "
         "and not assigning it leaves the steering gated on the 0.25 m stop radius.")

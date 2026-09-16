@@ -609,6 +609,20 @@ WALLS_APPROACH_KP: float = 0.6
 #: :data:`WALLS_YAW_QUIET_RADIUS_M`.
 WALLS_STOP_RADIUS_M: float = 0.25
 
+#: Where the approach controller AIMS: the goal point itself.
+#:
+#: The P term's error is ``to_go - target``, so this is the only range at which the law is
+#: actually at rest. With it equal to the stop radius -- one number for both, as it was -- the
+#: equilibrium is a SHELL around the goal and the robot parks on it: measured, a median closest
+#: approach of 0.80 m against a 1.0 m disc.
+#:
+#: 0.0 says what the course means: go to the middle of the region you are scored on. It does
+#: NOT by itself decide where the robot stops. :data:`WALLS_APPROACH_MIN_SPEED` floors the
+#: command below ``floor/kp + target`` = 0.5 m, so the last stretch is the floor and then the
+#: cut at :data:`WALLS_STOP_RADIUS_M`. Change this to say what the controller means; change the
+#: stop radius to move where the robot ends up.
+WALLS_APPROACH_TARGET_R_M: float = 0.0
+
 #: Range (m) at which the STEERING channel goes quiet -- the DISC, not the stop radius.
 #:
 #: These were one number while the robot stopped at the rim, and they have to come apart now
@@ -729,6 +743,7 @@ class G1WallsFinetuneEnvCfg(G1FinetuneFreeformEnvCfg):
         # approach is damped already; raise this only if the robot visibly overshoots.
         self.commands.traj_ref.freeform_approach_kd = 0.0
         self.commands.traj_ref.freeform_approach_min_speed = WALLS_APPROACH_MIN_SPEED
+        self.commands.traj_ref.freeform_approach_target_r_m = WALLS_APPROACH_TARGET_R_M
         self.commands.traj_ref.freeform_yaw_quiet_radius_m = WALLS_YAW_QUIET_RADIUS_M
         # NO num_rows OVERRIDE, and the reasoning that said there should be one was wrong
         # on both counts. `num_rows` replicates the whole tile set and env origins are tile

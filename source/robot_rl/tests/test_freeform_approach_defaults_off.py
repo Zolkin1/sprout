@@ -32,6 +32,11 @@ OFF_DEFAULTS: dict[str, float] = {
     "freeform_stop_radius_m": 0.0,
     "freeform_approach_min_speed": 0.0,
     "freeform_yaw_quiet_radius_m": 0.0,
+    #: NEGATIVE, not 0.0: this one's "off" is a sentinel meaning "use the stop radius", because
+    #: 0.0 is a MEANINGFUL value here (aim at the goal point). A None default would read better
+    #: and is not available -- hydra's struct mode refuses to override a key whose value is
+    #: None, and both free-form launchers set these unconditionally.
+    "freeform_approach_target_r_m": -1.0,
 }
 
 
