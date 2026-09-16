@@ -1535,18 +1535,21 @@ class FmTrackingCommand(MotionSequenceCommand):
         # AttributeError. Any new knob added here must be read the same way.
         kp = float(getattr(self.cfg, "freeform_approach_kp", 0.0) or 0.0)
         if kp > 0.0:
-            vx, stopped = self._freeform_approach_speed(root_xy, kp)
-            # Inside the stop radius the yaw channel goes quiet too: the look-ahead bearing is
-            # measuring the last of the approach error over a shrinking baseline, so a robot
-            # holding station would be told to keep turning.
-            wz = torch.where(stopped, zero, wz)
+            vx, _stopped, quiet = self._freeform_approach_speed(root_xy, kp)
+            # The yaw channel goes quiet on its OWN radius, which defaults to the stop radius
+            # and is larger wherever the two differ. A yaw rate commanded to a robot that has
+            # stopped is a step input it can only answer by turning on the spot -- so steering
+            # must end no later than forward motion does, and on a dwell course it should end
+            # at the scored region rather than at whatever smaller radius the speed is cut at.
+            wz = torch.where(quiet, zero, wz)
         self._ff_cmd[:, 0] = torch.where(held, zero, vx)
         self._ff_cmd[:, 1] = FREEFORM_VY
         self._ff_cmd[:, 2] = torch.where(held, zero, wz)
 
-    def _freeform_approach_speed(self, root_xy: torch.Tensor,
-                                 kp: float) -> tuple[torch.Tensor, torch.Tensor]:
-        """Forward speed from distance-to-goal, and which envs are inside the stop radius.
+    def _freeform_approach_speed(
+        self, root_xy: torch.Tensor, kp: float
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Forward speed from distance-to-goal, and the two range masks the caller needs.
 
         ``vx = clamp(kp * (to_go - stop_radius) - kd * closing, floor, drawn_speed)`` outside
         the stop radius, and exactly ``0`` inside it.
@@ -1580,11 +1583,24 @@ class FmTrackingCommand(MotionSequenceCommand):
             root_xy: ``[N, 2]`` root world position.
             kp: Proportional gain (1/s); the caller has already checked it is positive.
 
+        **THE STOP RADIUS IS WHERE THE ROBOT COMES TO REST, NOT WHERE IT AIMS TO STAND.** The
+        P term's setpoint is ``to_go == stop_r`` and the hard cut fires at the same range, so
+        the equilibrium of this law is a SHELL at ``stop_r``, not the goal point. Measured on
+        the wall course with ``stop_r`` equal to the 1.0 m dwell radius: the closest approach
+        was a tight annulus, median 0.80 m and p90 0.89 m, with ~1% of episodes ever reaching
+        within 0.5 m of the goal. The 0.20 m it does get past the shell is coast -- the command
+        steps from the 0.3 m/s floor to zero and momentum carries it. A course that wants the
+        robot to stand at the CENTRE therefore sets ``stop_r`` to about that coast distance,
+        and uses
+        :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.freeform_yaw_quiet_radius_m` to keep
+        steering from ending at the same small range.
+
         Returns:
-            ``(vx, stopped)`` -- ``[N]`` commanded forward speed and a ``[N]`` bool mask of the
-            envs within
+            ``(vx, stopped, yaw_quiet)`` -- ``[N]`` commanded forward speed, a ``[N]`` bool mask
+            of the envs within
             :attr:`~.fm_tracking_cmd_cfg.FmTrackingCommandCfg.freeform_stop_radius_m` of their
-            goal, whose yaw channel the caller also zeroes.
+            goal, and a ``[N]`` bool mask of those within the yaw-quiet radius (the same thing
+            unless a course set the two apart).
         """
         stop_r = float(getattr(self.cfg, "freeform_stop_radius_m", 0.0) or 0.0)
         kd = float(getattr(self.cfg, "freeform_approach_kd", 0.0) or 0.0)
@@ -1608,7 +1624,13 @@ class FmTrackingCommand(MotionSequenceCommand):
             lift = torch.minimum(torch.full_like(vx, floor), self._ff_speed)
             vx = torch.where(to_go > stop_r, torch.maximum(vx, lift), vx)
         stopped = rng <= stop_r
-        return torch.where(stopped, torch.zeros_like(vx), vx), stopped
+        # Defaults to the stop radius, and is taken as the LARGER of the two where a course
+        # sets it: a yaw-quiet radius inside the stop radius would describe a band in which the
+        # robot is standing still and still being told to turn, which is the failure this knob
+        # exists to remove rather than to relocate.
+        quiet_r = float(getattr(self.cfg, "freeform_yaw_quiet_radius_m", 0.0) or 0.0)
+        quiet = stopped if quiet_r <= stop_r else (rng <= quiet_r)
+        return torch.where(stopped, torch.zeros_like(vx), vx), stopped, quiet
 
     # --- the four command-velocity accessors, overridden as one set -----------------
     #

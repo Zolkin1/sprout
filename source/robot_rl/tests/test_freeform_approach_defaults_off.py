@@ -31,6 +31,7 @@ OFF_DEFAULTS: dict[str, float] = {
     "freeform_approach_kd": 0.0,
     "freeform_stop_radius_m": 0.0,
     "freeform_approach_min_speed": 0.0,
+    "freeform_yaw_quiet_radius_m": 0.0,
 }
 
 

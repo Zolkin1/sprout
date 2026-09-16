@@ -575,28 +575,54 @@ WALLS_APPROACH_KP: float = 0.6
 #: Range at which the whole command triple goes to zero (m). EQUAL to the dwell radius.
 #:
 #: **Equal because the command should say one thing: the moment you are in the circle, stand.**
-#: A stop radius INSIDE the disc would command the robot to keep walking after it had already
-#: entered the region it is scored on, training it to treat the goal as somewhere to pass
-#: through on the way to a deeper point -- which is the opposite of the association this course
-#: exists to build.
+#: **MEASURED, and the reason this is no longer the dwell radius.** With the two equal, the
+#: controller's equilibrium is a SHELL on the scoring boundary rather than the goal: the P
+#: term's setpoint is `to_go == stop_r` and the hard cut fires at the same range, so the robot
+#: aims at the rim. Over 12,598 uncensored episodes of the first wall arm the closest approach
+#: was a tight annulus -- p10 0.66, median 0.80, p90 0.89 m against a 1.0 m disc -- and ~1% of
+#: episodes ever came within 0.5 m of the goal. The 0.20 m of margin the median robot had was
+#: coast, not aim.
 #:
-#: An earlier version of this comment argued the equality from the other side, claiming a
-#: smaller stop radius would let the speed floor walk the robot back OUT of the disc. That is
-#: wrong and worth recording as wrong: between a smaller stop radius and the disc edge the
-#: floor commands motion INWARD, toward the goal, so it would drive the robot deeper in, never
-#: out. The equality is a statement about what the command MEANS, not a guard against that.
+#: That cost dwells, and increasingly with speed. Splitting those episodes by where they came
+#: to rest: the ~8% that stopped in the outer 0.1 m held the disc 0.862 of the time at
+#: 0.40 m/s and only 0.611 at 1.50, against 0.938 / 0.884 for the 91% that stopped between 0.5
+#: and 0.9 m. A robot parked on the rim is one shuffle from resetting a consecutive counter.
 #:
-#: **The real cost of the equality is that the switching surface sits exactly on the scoring
-#: boundary**, and the command steps discontinuously from the floor to zero across it. A robot
-#: that settles just outside is commanded 0.3 m/s inward, crosses, is commanded zero, coasts,
-#: and can drift back out -- a limit cycle on the disc edge, which would show up as dwell
-#: counters repeatedly resetting rather than as any kind of crash. If that appears in the first
-#: collect, the fix that keeps this comment's semantics intact is HYSTERESIS -- stop on entry at
-#: the dwell radius, resume only past it by some margin -- not moving the stop radius inward.
+#: It also meant the course was not running its own drill. Half the goals sit 0.5-1.5 m in front
+#: of a wall and the robot always arrives from the near side, so stopping 1.0 m short left it
+#: ~1.5 m off the wall it was supposed to be learning to stop for.
 #:
-#: Momentum makes it less likely than it sounds: at the 0.3 m/s floor the robot coasts ~0.1 m
-#: past the boundary before standing, so it settles inside rather than on it.
-WALLS_STOP_RADIUS_M: float = WALL_DWELL_RADIUS_M
+#: 0.25 m is the coast distance, rounded up: the command steps from the 0.3 m/s floor to zero
+#: and momentum carries the robot the measured ~0.20 m, so it comes to rest a little short of
+#: the goal point rather than past it. Short matters on the near-wall tiles -- overshooting the
+#: centre there is travel toward the wall.
+#:
+#: THE EARLIER ARGUMENT FOR EQUALITY IS NOT REFUTED, IT IS NARROWER THAN IT LOOKED. It said a
+#: smaller stop radius trains the robot to treat the goal as somewhere to pass THROUGH. That is
+#: only true of a setpoint past the goal point; 0.25 m is still short of it, so the robot is
+#: never commanded beyond the thing it is being scored on. (A separate earlier claim -- that a
+#: smaller radius would let the speed floor walk the robot back OUT -- was simply wrong and is
+#: recorded as wrong: inside the disc and outside the stop radius the floor commands motion
+#: INWARD.)
+#:
+#: Moving the stop radius in does NOT drag the steering in with it; see
+#: :data:`WALLS_YAW_QUIET_RADIUS_M`.
+WALLS_STOP_RADIUS_M: float = 0.25
+
+#: Range (m) at which the STEERING channel goes quiet -- the DISC, not the stop radius.
+#:
+#: These were one number while the robot stopped at the rim, and they have to come apart now
+#: that it drives to the centre. Steering must end no later than forward motion, because a yaw
+#: rate commanded to a stopped robot is a step input it can only answer by turning on the spot,
+#: and a robot pirouetting inside the disc is one drift from breaking a dwell it had earned.
+#: Left equal to the 0.25 m stop radius, that is exactly what would happen to every env that
+#: comes to rest off-centre: `vx` clamps to zero on the along-track term while `rng` is still
+#: above 0.25, so it would stand and turn.
+#:
+#: The cost is the last 0.75 m being driven open-loop in heading. That is acceptable HERE and
+#: would not be everywhere: by the time the robot is inside the disc it is already scored as
+#: arrived, so lateral error accumulated over that stretch cannot cost the arrival it has.
+WALLS_YAW_QUIET_RADIUS_M: float = WALL_DWELL_RADIUS_M
 
 #: Floor on the commanded forward speed while the goal is still ahead (m/s).
 #:
@@ -703,6 +729,7 @@ class G1WallsFinetuneEnvCfg(G1FinetuneFreeformEnvCfg):
         # approach is damped already; raise this only if the robot visibly overshoots.
         self.commands.traj_ref.freeform_approach_kd = 0.0
         self.commands.traj_ref.freeform_approach_min_speed = WALLS_APPROACH_MIN_SPEED
+        self.commands.traj_ref.freeform_yaw_quiet_radius_m = WALLS_YAW_QUIET_RADIUS_M
         # NO num_rows OVERRIDE, and the reasoning that said there should be one was wrong
         # on both counts. `num_rows` replicates the whole tile set and env origins are tile
         # centres, so with fewer slots than envs several robots share an origin -- which looked

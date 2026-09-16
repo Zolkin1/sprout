@@ -73,26 +73,51 @@ def test_the_task_imports_the_dwell_numbers_rather_than_restating_them() -> None
         "WALLS_DWELL_S must BE the terrain module's dwell time, not a copy of its value")
 
 
-def test_the_stop_radius_equals_the_dwell_radius() -> None:
-    """The command must zero exactly where the dwell region begins.
+def test_the_controller_aims_at_the_CENTRE_and_the_steering_stops_at_the_DISC() -> None:
+    """Two radii, and the ordering between them is the whole contract.
 
-    So the command says one thing: the moment you are in the circle, stand. A stop radius
-    INSIDE the disc would keep commanding the robot forward after it had entered the region it
-    is scored on, training it to walk THROUGH the goal toward a deeper point.
+    This test used to pin ``WALLS_STOP_RADIUS_M == WALL_DWELL_RADIUS_M`` on the argument that
+    the command should say one thing: the moment you are in the circle, stand. The argument was
+    sound and the consequence was not measured. With the two equal, the P term's setpoint is
+    ``to_go == stop_r`` and the hard cut fires at the same range, so the law's equilibrium is a
+    SHELL on the scoring boundary. Over 12,598 uncensored episodes the closest approach came out
+    as a tight annulus -- p10 0.66, median 0.80, p90 0.89 m against a 1.0 m disc -- with ~1% of
+    episodes ever reaching within 0.5 m of the goal, and the ~8% that stopped in the outer 0.1 m
+    held the dwell 0.611 of the time at 1.50 m/s against 0.884 for those that stopped deeper.
 
-    Larger than the disc is the other failure, and a harder one: a band where the robot is told
-    to stand still while still scored as not arrived -- which ``freeform_goal_dwell.__init__``
-    refuses outright.
+    It also meant the course skipped its own drill: half the goals sit 0.5-1.5 m from a wall and
+    the robot arrives from the near side, so stopping 1.0 m short left it ~1.5 m off the wall it
+    is supposed to be learning to stop for.
 
-    NOT the reason, though an earlier version of this docstring said so: a smaller stop radius
-    does NOT let the speed floor walk the robot out of the disc. Between a smaller stop radius
-    and the disc edge the floor commands motion INWARD. The equality is about what the command
-    means, not about that.
+    So the stop radius is now the COAST distance and the robot rests near the centre. What must
+    hold, and what this pins:
+
+    * the stop radius is STRICTLY INSIDE the disc -- otherwise nothing changed;
+    * it is not zero, because the floor-to-zero step is what makes a stop a stop rather than a
+      crawl through the 0.05-0.3 m/s band the generator barely trained on;
+    * the YAW-quiet radius is the disc, not the stop radius. Left equal to 0.25 m, an env that
+      comes to rest off-centre has ``vx`` clamped to zero by the along-track term while ``rng``
+      is still above the stop radius -- so it would stand inside the scored region and be told
+      to keep turning, one drift from resetting a dwell it had earned.
+
+    ``freeform_goal_dwell.__init__`` refuses the other direction (a stop radius LARGER than the
+    disc), which would leave a band where the robot is told to stand and scored as not arrived.
     """
     src = _ENV_CFG.read_text()
-    assert "WALLS_STOP_RADIUS_M: float = WALL_DWELL_RADIUS_M" in src, (
-        "the stop radius must be the dwell radius; see this test's docstring for both "
-        "directions of the failure.")
+    c = _module_constants(_TERRAIN)
+    stop = _module_constants(_ENV_CFG).get("WALLS_STOP_RADIUS_M")
+    assert stop is not None, "WALLS_STOP_RADIUS_M is gone"
+    assert 0.0 < stop < c["DWELL_RADIUS_M"], (
+        f"WALLS_STOP_RADIUS_M is {stop} against a {c['DWELL_RADIUS_M']} m disc. It must be "
+        "strictly inside the disc (so the robot aims at the centre) and strictly positive (so "
+        "the command is a ramp-then-step rather than a decay into the walking deadband).")
+    assert "WALLS_YAW_QUIET_RADIUS_M: float = WALL_DWELL_RADIUS_M" in src, (
+        "the yaw-quiet radius must BE the terrain module's dwell radius, not a copy of its "
+        "value and not the stop radius -- see this test's docstring for what happens when the "
+        "steering is allowed to stay live inside the scored region.")
+    assert "freeform_yaw_quiet_radius_m = WALLS_YAW_QUIET_RADIUS_M" in src, (
+        "G1WallsFinetuneEnvCfg must actually wire the yaw-quiet radius; declaring the constant "
+        "and not assigning it leaves the steering gated on the 0.25 m stop radius.")
 
 
 def test_the_goal_spec_declares_the_same_dwell_as_the_task() -> None:

@@ -635,6 +635,26 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     under ``"replan"`` it additionally bounds how often the env can re-roll.
     """
 
+    freeform_yaw_quiet_radius_m: float = 0.0
+    """Range at which the STEERING channel goes quiet, when it must differ from the stop radius.
+
+    ``0.0`` (the default) means "use :attr:`freeform_stop_radius_m`", which is what every
+    course did when the two were one number, so nothing changes by default.
+
+    They have to come apart once the approach controller aims at the goal CENTRE rather than
+    at the edge of the region being scored. The two radii answer different questions:
+
+    * the STOP radius is where forward speed is cut, and wants to be small, so the robot comes
+      to rest near the middle of the disc with margin on every side;
+    * the YAW-quiet radius is where steering stops, and wants to be the DISC, because a yaw
+      rate commanded to a robot that has stopped is a step input it can only answer by turning
+      on the spot -- and a robot pirouetting inside the region is one drift away from breaking
+      a dwell it had already earned.
+
+    Set smaller than the stop radius it is meaningless (the robot is already stopped), so a
+    course that wants them equal should leave this at 0.0 rather than restate the number.
+    """
+
     debug_vis_goal_disc: bool = False
     """Draw the DWELL disc the robot has to stop inside, one translucent cylinder per env.
 
