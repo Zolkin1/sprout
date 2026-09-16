@@ -154,6 +154,21 @@ case "$ALGO" in awr|fbc|bc|arrived) ;; *)
 #: `loose` reproduces the pre-termination behaviour and is what a recording made before this
 #: must be scored under -- under `strict`, on a recording that did NOT terminate, the cut
 #: deleted the success bonus row from 95.3% of arriving episodes.
+#: Extra hydra overrides for the COLLECT stage only, space separated and word-split on purpose.
+#: Empty by default, so every existing invocation composes the identical env.
+#:
+#: It exists for the LOOSER-TERMINATION arm: `env.terminations.tracking_violation=null` removes
+#: the reference-relative bound, which is doing 100% of the failure work on these courses --
+#: measured, falls are 0.0% of episode endings on boxes, updown, multi and indist, because the
+#: tracking bound (0.2 m lateral, 0.12 m height) always fires long before the 0.3 m fall bound.
+#: An arm collected that way MUST also set FAILURE_RULE=loose, or grade and the arrival filter
+#: score a recording that did NOT terminate under a rule that assumes it did; see that variable
+#: for what that costs.
+#:
+#: Echoed below rather than left implicit: it changes what the recording IS, and a run whose
+#: collect differed from the default has to say so in its own log.
+COLLECT_OVERRIDES="${COLLECT_OVERRIDES:-}"
+
 FAILURE_RULE="${FAILURE_RULE:-strict}"
 case "$FAILURE_RULE" in strict|loose) ;; *)
   echo "REFUSING: FAILURE_RULE must be strict or loose; got '$FAILURE_RULE'."; exit 2;; esac
@@ -318,6 +333,8 @@ echo "[awr] failed $FAILURE_RULE -- $([ "$FAILURE_RULE" = "strict" ] \
   && echo "fall OR the tracking bounds (Isaac TERMINATES on them: height 0.12 m)" \
   || echo "the FALL alone -- for scoring a recording made before the termination landed")"
 echo "[awr] arms   camera 0.5 (dead, per-replan), history-null 0.0, speed-mismatch $SPEED_MISMATCH"
+[ -n "$COLLECT_OVERRIDES" ] && \
+  echo "[awr] collect OVERRIDES: $COLLECT_OVERRIDES  <- this run's collect is not the default"
 echo "[awr] hist   $HISTORY_FROM$([ "$HISTORY_FROM" = "measured" ] && echo " -- OFF-DISTRIBUTION by design; the eval must pass the same" || echo "")"
 echo "[awr] clip   $CLIP"
 echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
@@ -420,6 +437,7 @@ for (( it=1; it<=ITERS; it++ )); do
       env.commands.traj_ref.freeform_speed_max="$SPEED_MAX" \
       env.episode_length_s=40.0 \
       env.terminations.goal_reached.params.height_tol_m="$HEIGHT_TOL" \
+      $COLLECT_OVERRIDES \
       > "$INC/collect.log" 2>&1 || fail "collect (see $INC/collect.log)" "$it"
   fi
 
