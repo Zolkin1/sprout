@@ -59,6 +59,7 @@ from isaaclab.envs import ManagerBasedRLEnv
 
 from robot_rl.flow_matching.knot_basis import knot_basis
 from robot_rl.flow_matching.window import residual_scale_vector
+from motion_gen.progress_reward import PROGRESS_REWARD_SPEC, terrain_gate
 from robot_rl.rl.adjuster_policy import residual_from_action
 from robot_rl.rl.frozen_tracker import FrozenTracker
 from robot_rl.tasks.manager_based.robot_rl import mdp
@@ -572,6 +573,20 @@ class AdjusterEnv(ManagerBasedRLEnv):
             log[f"Diagnostics/violation_{name}"] = (count / denom).item()
         log["Diagnostics/residual_energy_sigma2"] = self._residual_energy_sq
         log["Diagnostics/residual_mean_energy_frac"] = self._residual_mean_frac
+
+        # THE SUCCESS GATE, which is otherwise invisible and is the likeliest part of this
+        # reward to be quietly near-zero. It is `sin(pi/2 * worst_R**3)` on the episode's worst
+        # chunk, so a worst chunk of 0.23 -- ordinary on this course, where the MEAN chunk
+        # grades ~0.42 -- pays 2% of the arrival bonus. Nothing else in the log separates that
+        # from "arrivals are rare": `Episode_Reward/progress_success` is an average over every
+        # step and reads ~0 either way. Read off the reward's own cache, so it is the number the
+        # reward used and not a second computation of it.
+        cached = getattr(self, "_progress_reward_cache", None)
+        if cached is not None:
+            worst = cached[1]["worst"]
+            log["Diagnostics/progress_worst_R"] = float(worst.mean())
+            log["Diagnostics/progress_gate_worst"] = float(
+                terrain_gate(worst, PROGRESS_REWARD_SPEC.success_gate_sharpness).mean())
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
