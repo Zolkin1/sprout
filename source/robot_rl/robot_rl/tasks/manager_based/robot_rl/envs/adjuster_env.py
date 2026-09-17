@@ -583,10 +583,24 @@ class AdjusterEnv(ManagerBasedRLEnv):
         # reward used and not a second computation of it.
         cached = getattr(self, "_progress_reward_cache", None)
         if cached is not None:
-            worst = cached[1]["worst"]
+            terms = cached[1]
+            worst = terms["worst"]
+            gate = terrain_gate(worst, PROGRESS_REWARD_SPEC.success_gate_sharpness)
             log["Diagnostics/progress_worst_R"] = float(worst.mean())
-            log["Diagnostics/progress_gate_worst"] = float(
-                terrain_gate(worst, PROGRESS_REWARD_SPEC.success_gate_sharpness).mean())
+            log["Diagnostics/progress_gate_worst"] = float(gate.mean())
+            # THE GATE THAT ACTUALLY PAYS, which is a different number and the one to read.
+            # Averaged over every env at every step, the running worst has not finished
+            # falling -- most envs are mid-episode. The bonus is paid on the TERMINAL step of
+            # an ARRIVING episode, by which point the worst has had the whole episode to get
+            # worse, so the mean above is optimistic. Measured on the first run: 0.61 over all
+            # envs against an effective ~0.28 backed out of the reward, i.e. the unconditioned
+            # number overstates it by ~2x.
+            paying = terms["is_last"] & self.ended_by["goal_reached"]
+            n_pay = int(paying.sum())
+            if n_pay:
+                log["Diagnostics/progress_gate_at_arrival"] = float(gate[paying].mean())
+                log["Diagnostics/progress_worst_R_at_arrival"] = float(worst[paying].mean())
+            log["Diagnostics/progress_arrivals_this_step"] = float(n_pay)
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
