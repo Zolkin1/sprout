@@ -18,6 +18,8 @@ from isaaclab.utils.math import (
 
 from motion_gen.world_lift import anchor_mask_from_free
 
+from ..events.resets import freeform_route, tile_local_xy
+
 if TYPE_CHECKING:
     from isaaclab.assets import Articulation
 
@@ -250,6 +252,161 @@ def clip_end_reached(
     if slack_s:
         last_step = last_step + int(round(float(slack_s) / float(env.step_dt)))
     return (cmd.start_step + env.episode_length_buf) >= last_step
+
+def base_height_below_termination(
+    env, min_height: float = 0.3, asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base world height drops below ``min_height``: the fall detector.
+
+    The height half of :func:`base_fallen` with the attitude half left out, because a
+    generator-driven run grades attitude against the REFERENCE instead
+    (:func:`fm_base_tilt_error_termination`) and the two would otherwise double-count.
+
+    **Absolute, deliberately, and it is the reference-relative version that fails here.**
+    Height error against the served reference looks like the consistent choice, but under
+    ``ego_anchor_fraction=1.0`` the reference is re-datumed onto the robot at every re-plan,
+    so that error collapses toward zero every ``fm_update_every`` steps -- a slow sink walks
+    straight through it. World z has no such hole.
+
+    The cost is that this assumes the terrain never goes below world zero: if it did, a
+    healthy robot descending far enough would trip it. That holds for the shipped libraries
+    (every tile builds upward from the ground plane) and is why the bound can sit as low as
+    0.3 m -- deep under any standing pose, so it fires on a collapse rather than on a stoop.
+
+    Args:
+        env: IsaacLab environment.
+        min_height: Base world height below which the episode ends (m).
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    robot = env.scene[asset_cfg.name]
+    return wp.to_torch(robot.data.root_pos_w)[:, 2] < min_height
+
+
+def fm_base_tilt_error_termination(
+    env, command_name: str = "traj_ref", max_tilt_rad: float = 1.047,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate when the base tilts too far from the REFERENCE's attitude (yaw ignored).
+
+    :func:`base_orientation_from_upright` measures against world upright, which is the wrong
+    datum once the reference itself leans -- climbing and jumping both pitch the base on
+    purpose, so a fixed cone around vertical either fires on healthy motion or has to be
+    slackened until it catches nothing.  This measures the angle between the robot's own up
+    axis and the REFERENCE's, so the allowance travels with the motion.
+
+    Yaw drops out by construction: comparing up axes says nothing about heading, which is the
+    same reason :func:`base_orientation_from_upright` ignores it.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The tracking command term.
+        max_tilt_rad: Maximum angle between the two up axes (rad); 1.047 = 60 deg.
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    cmd = env.command_manager.get_term(command_name)
+    robot = env.scene[asset_cfg.name]
+    up = torch.zeros(env.num_envs, 3, device=env.device)
+    up[:, 2] = 1.0
+    ref_up = quat_apply(cmd.reference_world_state()[:, 3:7], up)
+    act_up = quat_apply(wp.to_torch(robot.data.root_quat_w), up)
+    cos = (ref_up * act_up).sum(-1).clamp(-1.0, 1.0)
+    return torch.arccos(cos) > max_tilt_rad
+
+
+def fm_tracking_violation_termination(
+    env,
+    command_name: str = "traj_ref",
+    spec: "object | None" = None,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Terminate where the robot leaves the STRICT tracking bounds around the served node.
+
+    The union of the three checks in :func:`mdp.tracking_error.violation_checks` -- lateral,
+    height, tilt -- evaluated against the reference the generator actually served this step.
+    It goes through those functions rather than restating the tests, so this termination and
+    every offline consumer of ``first_violation_step`` cannot disagree about what a violation
+    is; the bounds likewise come from ``BOOTSTRAP_SPEC`` rather than being written here.
+
+    **Why this is a TERMINATION and not just the offline latch it used to be.**  The recording
+    used to run on past a violation and every consumer then cut the episode there offline,
+    which left the two halves incoherent: the run reached the goal and banked the progress
+    reward's success bonus, and the offline cut then deleted the very row that bonus was paid
+    on -- measured at 95.3% of arriving episodes.  Terminating makes the episode END where
+    every consumer already thought it ended, so the bonus is simply never earned by a run that
+    left the bounds, no truncation is needed anywhere, and ``reached_goal`` and
+    ``rollout_outcomes.terminal_reward`` become the same question.
+
+    **It cannot fire before the generator has planned.**  ``_pred_valid`` is False until the
+    first re-plan, and before that there is no served reference to be far from -- a real state
+    rather than an error.  Without this gate every episode would terminate on step 0, which
+    is indistinguishable from a policy that cannot stand up.
+
+    **The height bound is doing the work here, and it is chunk-local.**  Under
+    ``window_anchor="plan"`` the served node is expressed against the robot's own root at the
+    last re-plan, so a height excursion has to accumulate inside one re-plan (0.24 s at
+    K=12).  That is why this does not contradict
+    :func:`base_height_below_termination`'s docstring, which rejects a reference-relative
+    height bound as a FALL detector: a slow sink re-datums away and is invisible here, which
+    is exactly why the absolute-height term stays.
+
+    Args:
+        env: IsaacLab environment.
+        command_name: The tracking command term.
+        spec: A ``tracking_error.TrackingErrorSpec``, or ``None`` for ``BOOTSTRAP_SPEC``.
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs that should terminate.
+    """
+    from ..tracking_error import BOOTSTRAP_SPEC, tracking_error, violates  # noqa: PLC0415
+
+    cmd = env.command_manager.get_term(command_name)
+    robot = env.scene[asset_cfg.name]
+    sp = BOOTSTRAP_SPEC if spec is None else spec
+    # Offset 0 -- the node being tracked THIS step, which is what the accumulator grades and
+    # what `first_violation_step` is recorded against.
+    zero = torch.zeros(1, dtype=torch.long, device=env.device)
+    pos_w, quat_w, lin_w, ang_w = cmd.get_future_world_base(zero)
+    jp, _ = cmd.get_future_joint_state(zero)
+    # **`robot.data`'s buffers are WARP arrays here and must be converted.** `eval.accumulate`
+    # reads them through a `_Data` shim that calls `wp.to_torch` on every attribute access, so
+    # copying its accessor NAMES without its shim gets a `vec3f` where a tensor is wanted and
+    # raises inside `tracking_error`'s first subtraction -- at the first step of collection,
+    # after the simulator has launched. Every other termination in this file converts
+    # explicitly (see `base_height_below_termination`), which is the idiom.
+    #
+    # `root_link_*`, NOT `root_lin_vel_w`: the latter is the CoM twist. The same choice as
+    # `eval.accumulate`, and mixing the two would put a systematic offset on the velocity
+    # term in one place only.
+    err = tracking_error(
+        pos_w[:, 0], quat_w[:, 0], lin_w[:, 0], ang_w[:, 0], jp[:, 0],
+        wp.to_torch(robot.data.root_pos_w), wp.to_torch(robot.data.root_quat_w),
+        wp.to_torch(robot.data.root_link_lin_vel_w),
+        wp.to_torch(robot.data.root_link_ang_vel_w),
+        wp.to_torch(robot.data.joint_pos))
+    hit = violates(err, sp)
+    # THE GATE IS REQUIRED, not optional. `_pred_valid` is allocated only when the command has
+    # a generator (`fm_enabled`); on the clip arm `_post_init` returns before that, so a
+    # `getattr(..., None)` fallback would SKIP the gate exactly where there is no served
+    # prediction to be far from -- terminating from step 0 on a task nothing here measured,
+    # which reads as a policy that cannot stand up. Refuse instead: this term belongs to the
+    # generator arm and says so.
+    valid = getattr(cmd, "_pred_valid", None)
+    if valid is None:
+        raise ValueError(
+            f"command {command_name!r} has no `_pred_valid`, so it is serving no generator "
+            "prediction (reference_source is not 'fm', or no fm_checkpoint was given). The "
+            "strict tracking bounds are defined against the SERVED node, so there is nothing "
+            "for this termination to measure -- remove `tracking_violation` from the "
+            "terminations for this arm rather than letting it fire from step 0.")
+    return hit & valid.reshape(-1).to(hit.device)
+
 
 def base_orientation_from_upright(
     env,
@@ -583,3 +740,298 @@ class GoalReached(ManagerTermBase):
             root_pos_w, self._goal_pos_w, self._goal_yaw
         )
         return goal_region.in_goal(down, lat, hz, self._goal_tol) & self._valid
+
+
+def freeform_goal_reached(
+    env,
+    min_half_width: float = 2.5,
+    height_tol_m: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Truncate (good termination) when the robot has walked its free-form section.
+
+    The clip-free replacement for :func:`clip_end_reached`, which bounds an episode by the
+    length of a motion that no longer exists. Wire it as ``DoneTerm(..., time_out=True)``:
+    walking the section IS the task, so its end is a truncation and RSL-RL bootstraps the
+    value from the final state rather than scoring it as a failure. Keep the task's plain
+    ``time_out`` alongside -- this fires only on success.
+
+    **A wide BAND across the section, not a disc**, and that is the lesson mjeval paid for:
+    a 0.5 m circle on the centreline scored most of its timeouts as "did not get through"
+    when the robot had cleared the terrain cleanly and passed BESIDE the disc, because a few
+    degrees of accumulated heading error over six metres is more than half a metre of lateral
+    miss (``mjeval.terrains.GOAL_HALF_WIDTH_FLOOR``). Measuring the absence of a heading
+    controller is not what this is for. So: any lateral position within the band, and any
+    downrange position at or past the goal line.
+
+    **Downrange it is a HALF-PLANE, where mjeval uses a 2 m-deep band.** mjeval polls
+    ``in_goal`` as a verdict on a trial that keeps running, so it needs a far edge; here the
+    first step past the line ENDS the episode, so a far edge could only add a way to step over
+    the goal and miss it.
+
+    **The HEIGHT test is OPTIONAL and off by default** (``height_tol_m = 0``), and the reason
+    to turn it on depends entirely on the terrain.
+
+    On an AUTHORED section the hole it closes is small: the band overhangs the tile floor by at
+    most 0.1395 m per side on 5.9% of tiles, stairs only
+    (``motion_gen.terrain.freeform.GOAL_HALF_WIDTH_FLOOR_M`` carries the sweep), and inside
+    that overhang a robot on the floor scores the same truncation as one on the runout.
+
+    On a section whose goal is UP -- a raised landing, a box top -- the hole is not small at
+    all, and it is the whole measurement. A clip-library ``stairs_up`` tile has 0.90 m of open
+    floor either side of a 2.25 m flight, and ``min_half_width`` clamps the band to at least
+    that, so a robot that never left the floor can pass the goal line and score. The two
+    DESCENDING families are immune for a different reason -- their goal is at floor level and
+    their spawn is on the platform, so the height change is unavoidable -- which is why this is
+    a parameter rather than a constant: it is needed exactly where the goal is above the spawn.
+
+    Off by DEFAULT because turning it on silently would change the termination of every
+    free-form task, including arms already measured, and a success rate that moved for that
+    reason is indistinguishable from one that moved because the policy did.
+
+    The datum is the PELVIS, matching :func:`~.goal_region.freeform_goal_anchor_world`: the
+    route's ``goal_z`` is the walkable SURFACE, and a standing robot's root sits a nominal
+    height above it, so comparing raw ``root_z`` against ``goal_z`` would put every genuine
+    arrival ~0.79 m outside a 0.5 m tolerance. That asymmetry already cost this stack a run
+    where every arrival recorded as a failure.
+
+    Args:
+        env: IsaacLab environment (``env.scene.terrain`` must carry ``terrain_route``).
+        min_half_width: Floor on the band's half-extent (m), applied over each section's own
+            declared ``goal_half_width``. mjeval's floor, for its reason: the widest feature in
+            that catalogue is 3.96 m across, and 2.5 m clears everything with margin.
+        height_tol_m: Also require the PELVIS within this many metres of the goal's own
+            standing height.  ``0`` (default) disables the test entirely and reproduces the
+            downrange-and-lateral behaviour every existing task was measured under.
+        asset_cfg: Robot scene entity.
+
+    Returns:
+        Boolean ``[num_envs]`` -- True for envs at or past their section's goal line.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    root_pos_w = wp.to_torch(asset.data.root_pos_w)
+    route = freeform_route(env.scene.terrain,
+                           torch.arange(env.num_envs, device=root_pos_w.device))
+    local = tile_local_xy(route["corner"], route["frame_yaw"], root_pos_w)
+    half_w = torch.clamp(route["goal_half_width"], min=float(min_half_width))
+    hit = ((local[:, 0] >= route["goal_x"])
+           & ((local[:, 1] - route["goal_y"]).abs() <= half_w))
+    if float(height_tol_m) > 0.0:
+        # The goal's own STANDING height: the tile corner, plus the route's walkable `goal_z`,
+        # plus the asset's nominal root height -- the same three terms
+        # `freeform_goal_anchor_world` sums, so the line the episode ends on and the anchor the
+        # outcome is folded against cannot disagree about where "there" is.
+        # Indexed rather than `.get(..., 0)`: the defensive read meant this datum was the tile
+        # FLOOR on every library, since `goal_z` was not a route field at all.
+        gz = route["goal_z"].to(root_pos_w.device)
+        nominal_z = wp.to_torch(asset.data.default_root_pose)[:, 2].to(root_pos_w.device)
+        goal_h = route["corner"][:, 2].to(root_pos_w.device) + nominal_z + gz
+        hit = hit & ((root_pos_w[:, 2] - goal_h).abs() <= float(height_tol_m))
+    return hit
+
+
+class freeform_goal_dwell(ManagerTermBase):
+    """Truncate when the robot has HELD a disc around its goal for ``dwell_s`` seconds.
+
+    The stopping counterpart to :func:`freeform_goal_reached`, and a SEPARATE term rather than
+    a flag on that one: every existing course is wired to the function and keeps taking the
+    identical path, so a course that opts into dwelling cannot change what any other course
+    measures. The two are not meant to be wired together -- the first success rule that fires
+    ends the episode, so a task carrying both would be scored by whichever is looser.
+
+    **The region is a DISC, where :func:`freeform_goal_reached` is a downrange half-plane.**
+    That is the whole difference and it is forced: you cannot "stay within" a half-plane --
+    walking further on keeps satisfying it -- so a dwell test needs a bounded region. The
+    half-plane exists there because that course's question is "did it get through"; here the
+    question is "did it stop".
+
+    **What this exists to catch.** A pass-through goal scores an arrival the instant the line
+    is crossed, and the episode ends there, so what the robot does next is invisible: reaching
+    a goal and then jumping at the wall behind it, or walking on into that wall, both record as
+    clean successes. Requiring the robot to still be inside the disc, upright and unfallen,
+    several seconds later makes both of those the failures they are -- and it does so without
+    a post-goal failure rule, because the dwell window IS the run-out.
+
+    **It needs the approach controller to be winnable.** With the free-form command's constant
+    per-episode ``vx``, nothing tells the robot to stop and the reward's velocity term
+    ``exp(-|v_err|/sigma)`` actively pays for continuing to move; a robot obeying its command
+    cannot hold a 0.5 m disc. Pair it with
+    :attr:`~...fm_tracking_cmd_cfg.FmTrackingCommandCfg.freeform_approach_kp` (and a
+    ``freeform_stop_radius_m`` no larger than ``radius_m``), which drives the command to zero
+    on the approach and makes standing still pay FULL marks on that same velocity term.
+    :meth:`__init__` refuses the unwinnable combination rather than letting it train.
+
+    The counter is CONSECUTIVE: leaving the disc resets it, so a robot that passes through,
+    turns around and comes back has to hold it from scratch. Dwelling does not have to be the
+    first arrival, only an unbroken one.
+    """
+
+    def __init__(self, cfg, env):
+        """Allocate the per-env dwell counter and check the configuration is winnable.
+
+        Args:
+            cfg: The term cfg; ``params`` carries ``radius_m``, ``dwell_s`` and the optional
+                ``height_tol_m`` / ``asset_cfg``.
+            env: The environment.
+
+        Raises:
+            ValueError: If ``radius_m`` or ``dwell_s`` is not positive, or if the free-form
+                approach controller is off -- see the class docstring for why that pairing
+                cannot be satisfied.
+        """
+        super().__init__(cfg, env)
+        self._radius = float(cfg.params.get("radius_m", 0.5))
+        dwell_s = float(cfg.params.get("dwell_s", 5.0))
+        if self._radius <= 0.0 or dwell_s <= 0.0:
+            raise ValueError(
+                f"freeform_goal_dwell needs a positive radius_m and dwell_s; got "
+                f"({self._radius}, {dwell_s}). To score arrival without dwelling, wire "
+                "freeform_goal_reached instead -- that is what it is for.")
+        self._dwell_steps = int(round(dwell_s / float(env.step_dt)))
+        cmd = getattr(getattr(env, "cfg", None), "commands", None)
+        traj = getattr(cmd, "traj_ref", None) if cmd is not None else None
+        kp = float(getattr(traj, "freeform_approach_kp", 0.0) or 0.0) if traj else 0.0
+        if kp <= 0.0:
+            raise ValueError(
+                "freeform_goal_dwell requires commands.traj_ref.freeform_approach_kp > 0. "
+                "Without it the commanded vx is a constant held for the whole episode and the "
+                "velocity reward pays for tracking it, so holding a "
+                f"{self._radius:.2f} m disc is not a behaviour the policy can be rewarded "
+                "into -- the arm would train against itself and report near-zero success.")
+        stop_r = float(getattr(traj, "freeform_stop_radius_m", 0.0) or 0.0)
+        if stop_r > self._radius:
+            raise ValueError(
+                f"freeform_stop_radius_m ({stop_r}) exceeds the dwell radius "
+                f"({self._radius}): the command would zero before the robot is inside the "
+                "region it has to hold, leaving a band where it is told to stand still and "
+                "scored as not yet arrived.")
+        self._steps_inside = torch.zeros(env.num_envs, dtype=torch.long, device=env.device)
+
+    def reset(self, env_ids: Sequence[int] | None = None) -> None:
+        """Clear the dwell counter for the envs being reset.
+
+        Args:
+            env_ids: Envs to clear, or ``None`` for all.
+        """
+        if env_ids is None:
+            self._steps_inside[:] = 0
+            if hasattr(self, "_peak"):
+                self._peak[:] = 0
+        else:
+            self._steps_inside[env_ids] = 0
+            if hasattr(self, "_peak"):
+                self._peak[env_ids] = 0
+
+    def __call__(self, env, radius_m: float = 0.5, dwell_s: float = 5.0,
+                 height_tol_m: float = 0.5, debug_every: int = 0,
+                 asset_cfg: SceneEntityCfg = SceneEntityCfg("robot")) -> torch.Tensor:
+        """Advance the dwell counter and report which envs have completed it.
+
+        Args:
+            env: IsaacLab environment (``env.scene.terrain`` must carry ``terrain_route``).
+            radius_m: Disc radius about the goal (m). Read in :meth:`__init__`; repeated here
+                because the manager passes every param.
+            dwell_s: Seconds the robot must hold the disc. Read in :meth:`__init__`.
+            height_tol_m: Also require the PELVIS within this many metres of the goal's own
+                standing height, the same datum :func:`freeform_goal_reached` uses. ``0``
+                disables the height clause. It is NOT decoration here: without it a robot that
+                has fallen inside the disc keeps accruing dwell and is scored as having
+                stopped, which is the opposite of what the term is for.
+            debug_every: Print an aggregate trace every this many steps; ``0`` (default) is
+                silent and is what every real run uses. The quantities that decide this term
+                are computed here and NOWHERE ELSE, so a diagnostic that rebuilt them outside
+                would be answering about its own reimplementation -- which is how the first
+                attempt at measuring this course reported a distance to the goal REGION and
+                called it a distance to the goal. Separates the three ways a dwell fails:
+                never arriving (``in`` stays ~0), arriving and holding but running out of
+                episode (``max_run`` climbs then the episode ends), and chattering on the disc
+                edge (``in`` healthy but ``max_run`` never climbs).
+            asset_cfg: Robot scene entity.
+
+        Returns:
+            Boolean ``[num_envs]`` -- True for envs that have held the disc for ``dwell_s``.
+        """
+        asset: Articulation = env.scene[asset_cfg.name]
+        root_pos_w = wp.to_torch(asset.data.root_pos_w)
+        route = freeform_route(env.scene.terrain,
+                               torch.arange(env.num_envs, device=root_pos_w.device))
+        local = tile_local_xy(route["corner"], route["frame_yaw"], root_pos_w)
+        d = torch.linalg.norm(
+            torch.stack([local[:, 0] - route["goal_x"], local[:, 1] - route["goal_y"]], -1),
+            dim=-1)
+        inside = d <= self._radius
+        if float(height_tol_m) > 0.0:
+            # The same three terms `freeform_goal_reached` sums, so the two terms cannot
+            # disagree about where "there" is: tile corner + nominal standing height + the
+            # route's walkable goal_z.
+            gz = route["goal_z"].to(root_pos_w.device)
+            nominal_z = wp.to_torch(asset.data.default_root_pose)[:, 2].to(root_pos_w.device)
+            goal_h = route["corner"][:, 2].to(root_pos_w.device) + nominal_z + gz
+            inside = inside & ((root_pos_w[:, 2] - goal_h).abs() <= float(height_tol_m))
+        # CONSECUTIVE: any step outside puts the counter back to zero.
+        self._steps_inside = torch.where(inside, self._steps_inside + 1,
+                                         torch.zeros_like(self._steps_inside))
+        if int(debug_every) > 0:
+            self._peak = torch.maximum(getattr(self, "_peak", torch.zeros_like(
+                self._steps_inside)), self._steps_inside)
+            # CUMULATIVE firings, because the peak alone cannot distinguish "reached 250 and
+            # the episode reset" from "never got there": both leave the surviving maximum just
+            # under the threshold.
+            self._fired = getattr(self, "_fired", 0) + int(
+                (self._steps_inside >= self._dwell_steps).sum())
+            t = int(env.common_step_counter)
+            if t % int(debug_every) == 0:
+                q = torch.quantile(d.float(), torch.tensor([0.25, 0.5], device=d.device))
+                print(f"[dwell t={t:>5}] dist p25 {q[0]:.2f} p50 {q[1]:.2f} m | "
+                      f"inside now {100.0 * inside.float().mean():5.1f}% | "
+                      f"counter now max {int(self._steps_inside.max()):>4} | "
+                      f"BEST RUN this episode max {int(self._peak.max()):>4} "
+                      f"mean {self._peak.float().mean():6.1f} | need {self._dwell_steps} "
+                      f"| FIRED so far {self._fired}")
+        return self._steps_inside >= self._dwell_steps
+
+
+def freeform_goal_disabled(
+    env,
+    min_half_width: float = 0.0,
+    height_tol_m: float = 0.0,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Never fires. Stands in for :func:`freeform_goal_reached` on a course that replaces it.
+
+    **The signature MIRRORS the term it replaces, and that is required, not tidy.**
+    ``ManagerBase._prepare_terms`` checks a term's declared params against the function's
+    actual arguments and raises ``The term 'goal_reached' expects mandatory parameters: ['_']``
+    for a ``**kwargs``-only stub. So the replacement has to accept the same names -- and
+    accepting them is also what lets hydra address them.
+
+    **This exists because deleting a termination is not the same as disabling it here.** Both
+    launchers override the goal term's tolerance unconditionally --
+    ``run_finetune_loop.sh`` and ``run_quick_eval.sh`` both pass
+    ``env.terminations.goal_reached.params.height_tol_m=...`` -- and hydra's struct mode
+    refuses an override whose key is absent OR whose value is ``None`` (``Could not override
+    'env.terminations.goal_reached.params.height_tol_m'``). Setting the term to ``None`` on a
+    course that replaces it therefore kills the run at config composition, before the GPU is
+    touched, with an error that names hydra rather than the course.
+
+    ``freeform_goal_reached``'s own comment already records the other half of this: its
+    ``height_tol_m`` is "declared EXPLICITLY rather than omitted, so it is overridable". This
+    keeps that contract while making the term inert.
+
+    **The overridden params are genuinely ignored**, and that is the cost: a launcher setting
+    ``height_tol_m`` on a course wired to this gets no error and no effect. It is the lesser
+    evil against a run that cannot start, but it means the params on such a term are
+    documentation, not configuration -- so say so at the wiring site, as
+    ``G1WallsFinetuneTerminationCfg`` does.
+
+    Args:
+        env: IsaacLab environment.
+        min_half_width: Accepted and ignored; see above.
+        height_tol_m: Accepted and ignored; see above.
+        asset_cfg: Accepted and ignored.
+
+    Returns:
+        Boolean ``[num_envs]``, all False.
+    """
+    del min_half_width, height_tol_m, asset_cfg
+    return torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)

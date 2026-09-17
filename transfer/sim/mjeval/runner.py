@@ -128,6 +128,12 @@ class ArmRun:
             as a run, so its ``manifest.json`` belongs here too.
         robot_name: MuJoCo robot prefix; the scenes are emitted as ``<robot>_<course>.xml``.
         providers: onnxruntime execution providers, as ``resolve_providers`` takes them.
+        num_threads: onnxruntime intra-op threads. ``0`` is ORT's own default, which is ONE
+            THREAD PER CORE -- on a 128-core shared box that is a 254-thread process at 6000%
+            CPU for a job whose heavy half is on the GPU, and it collapses its own throughput:
+            measured on talos, episodes went from 40 s to over 4 minutes once the box was
+            oversubscribed, with this process the largest single contributor. A small number
+            is both faster here and a better neighbour.
         fall_height: Metres of pelvis clearance above the scene's LOWEST terrain surface below
             which the episode is a fall.  On a descending course that datum is the bottom of
             the flight, so up top only the tilt cone is guarding -- see
@@ -162,6 +168,9 @@ class ArmRun:
         terrain_ref: A ``terrain_class.py`` reference set.  Empty means no plan classification,
             and the four ``n_plans*`` columns are then legitimately zero rather than missing.
         max_courses: Truncate the catalogue, for a smoke run.  ``0`` runs all of it.
+        only_courses: Comma-separated course NAMES to keep.  Independent of
+            ``max_courses``, which can only take a PREFIX of the catalogue and so cannot
+            select one course by name.
         max_speeds: Truncate each course's ladder, for a smoke run.  ``0`` runs all of it.
         attrs: Provenance from the caller, stamped onto ``episodes.h5`` verbatim.  What the
             RUNNER resolved (dt, cadence, the lag it actually applied) is added on top, so the
@@ -175,6 +184,8 @@ class ArmRun:
     out_dir: str
     robot_name: str = "g1_perceptive"
     providers: tuple[str, ...] = ("auto",)
+    #: 8 rather than ORT's one-thread-per-core default -- see the attribute docs above.
+    num_threads: int = 8
     fall_height: float = 0.2
     fall_tilt_deg: float = 70.0
     spawn_z_offset: float = 0.03
@@ -231,6 +242,8 @@ class ArmRun:
     shards: int = 1
     shard: int = 0
     max_courses: int = 0
+    #: Comma-separated course NAMES to run, or "" for all of them.
+    only_courses: str = ""
     max_speeds: int = 0
     attrs: dict[str, Any] = field(default_factory=dict)
 
@@ -431,6 +444,7 @@ def load_arm(cfg: ArmRun) -> tuple[GenTrackerPolicy, FmDepthLag, Spawn]:
         zero_noise=bool(cfg.zero_noise),
         seed=int(cfg.fm_seed),
         providers=list(cfg.providers) or None,
+        num_threads=int(getattr(cfg, "num_threads", 0)),
         # One generator against two trackers exported at different times, which is the A/B's
         # whole premise.  The field that can disagree is `mjcf_sha256`, and it reaches nothing
         # in this loop: the generator never reads the MJCF (its FK loss used it offline, at
@@ -610,7 +624,8 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 steer_wz_max: float = STEER_WZ_MAX,
                 cfg_hold: float = terrains.CMD_HOLD_S,
                 probe=None, tracking_spec=None,
-                stop_on_violation: bool = True, episode_seed=None) -> tuple[str, str, Any]:
+                stop_on_violation: bool = True, stop_on_goal: bool = True,
+                episode_seed=None) -> tuple[str, str, Any]:
     """One deterministic trial: spawn, drive at ``cmd``, and stop on a fall, the target or time.
 
     **Three orderings inside the loop are load-bearing.**  The fall test runs BEFORE the target
@@ -638,6 +653,12 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             what makes the replay THE episode rather than a similar one.
         tracking_spec: A ``deploy.tracking_error.TrackingErrorSpec`` turning on the STRICT
             checks, or ``None`` to leave them off.
+        stop_on_goal: Whether ARRIVAL ends the episode.  Default True, which is what
+            scoring wants.  False runs to the fall or the time budget instead, which is
+            what a RECORDING for human inspection wants: ``in_goal`` is a
+            +/- ``GOAL_DEPTH / 2`` BAND, so on the up-into-down course its near edge falls
+            at the descent LIP -- an arriving episode was cut off at the TOP of the
+            descent and the second half of the course never reached the footage.
         stop_on_violation: End the episode at the first strict violation. **Defaults True**:
             a violation is a failure under the strict rule, so everything downstream of a
             recording terminates on it. The verdict comes from ``schema.derive_success``
@@ -741,7 +762,9 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             # The traversal gate is the second half of "got through": these lanes are finite in
             # y on an infinite floor, so the circle alone can be entered by walking beside the
             # course.
-            if (course.in_goal(float(robot.mj_data.qpos[0]), float(robot.mj_data.qpos[1]))
+            if (stop_on_goal
+                    and course.in_goal(float(robot.mj_data.qpos[0]),
+                                       float(robot.mj_data.qpos[1]))
                     and acc.traversed):
                 verdict = "success"
                 break
@@ -768,12 +791,30 @@ def run_arm(cfg: ArmRun) -> str:
     if cfg.max_courses:
         courses = courses[:cfg.max_courses]
 
+    # **A NAME filter must SKIP, never slice.** `terrain_idx` is the GLOBAL catalogue index --
+    # `view_cell` and `report` both map it back through `terrains.catalogue()` -- so removing
+    # entries renumbers every course after them. Slicing to select box2 (global index 17)
+    # recorded it as 0, and `--list` then named it `mjeval_up_w122_modal`, which is course 0.
+    # This is the same hazard the shard note below describes, arrived at from the other side;
+    # `max_courses` gets away with slicing only because it keeps a PREFIX, so no surviving
+    # index moves.
+    keep: set[int] | None = None
+    if cfg.only_courses:
+        want = {n.strip() for n in cfg.only_courses.split(",") if n.strip()}
+        missing = want - {c.name for c in courses}
+        if missing:
+            raise ValueError(
+                f"--courses named {sorted(missing)}, which this catalogue does not contain. "
+                f"Available: {sorted(c.name for c in courses)}")
+        keep = {i for i, c in enumerate(courses) if c.name in want}
+
     # The catalogue is enumerated in FULL and the shard skips what is not its own, so
     # `terrain_idx` stays the global catalogue index in every shard.  Slicing the list instead
     # would renumber the courses per shard, and the merged table would then carry several
     # different courses under one `terrain_idx` -- which the report clusters on, so the
     # bootstrap would resample a cluster that does not exist.
-    mine = [i for i in range(len(courses)) if i % cfg.shards == cfg.shard]
+    mine = [i for i in range(len(courses))
+            if i % cfg.shards == cfg.shard and (keep is None or i in keep)]
 
     table = schema.EpisodeTable()
     interrupted = False

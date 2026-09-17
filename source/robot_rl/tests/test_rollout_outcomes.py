@@ -22,6 +22,8 @@ are what stop it drifting back into two.
 
 from __future__ import annotations
 
+import json
+
 import os
 import pathlib
 import sys
@@ -54,6 +56,8 @@ def _row(**over):
         "max_goal_downrange_m": 0.0,
         "goal_pos_w_x": 0.0, "goal_pos_w_y": 0.0, "goal_pos_w_z": 0.0,
         "goal_frame_yaw": 0.0, "spawned_in_goal": 0, "goal_travel_m": 5.0,
+        # Ground level, which is what every synthetic row here means by "it spawned".
+        "spawn_base_z_w": 0.0,
     }
     base.update(over)
     return {k: np.asarray([v]) for k, v in base.items()}
@@ -431,3 +435,210 @@ def test_the_window_writer_sizes_the_track_err_block():
             pass
         with h5py.File(off, "r") as f:
             assert "track_err_prev" not in f
+
+
+def test_every_window_column_is_actually_allocated(tmp_path):
+    """A column in the schema tuple but not in the writer's `shapes` is dropped in SILENCE.
+
+    `RolloutWindowWriter` allocates from an explicit `shapes` dict, not from
+    :data:`ROLLOUT_WINDOW_COLUMNS`, so the two can disagree -- and the failure is a column
+    that every reader believes exists, that nothing wrote, and that no error mentions.
+    """
+    import rollout_outcomes as ro
+
+    w = ro.RolloutWindowWriter(
+        str(tmp_path / "w.h5"), num_windows=4, num_history=2, state_dim=3,
+        extero_shape=(2, 5), future_len=6, cmd_dim=3, proprio_hw=(2, 4), scan_dim=7,
+        track_hw=(2, 3), attrs={})
+    try:
+        allocated = set(w._keys)
+    finally:
+        w.close()
+    declared = set(ro.ROLLOUT_WINDOW_NAMES)
+    assert declared - allocated == set(), (
+        f"declared but never allocated: {sorted(declared - allocated)}")
+    assert allocated - declared == set(), (
+        f"allocated but not declared: {sorted(allocated - declared)}")
+
+
+def test_the_perturbation_arms_are_recorded_per_window():
+    """The only on-disk record that a row's ACTION came from perturbed conditioning.
+
+    `history` and `extero` store the TRUE measurement by design, so without these flags the
+    perturbed and pristine populations are indistinguishable and the advantage cannot be split
+    by arm.  Distinct from `history_null`, which is the post-reset transient and is true of the
+    recorded history.
+    """
+    import rollout_outcomes as ro
+
+    for col in ("perturb_null_history", "perturb_noisy_upper_cam",
+                "perturb_speed_mismatch"):
+        assert col in ro.ROLLOUT_WINDOW_NAMES, col
+        assert dict(ro.ROLLOUT_WINDOW_COLUMNS)[col] == "u1", f"{col} should be one byte"
+    # The speed arm records its OFFSET as well as its flag, because unlike the other two the
+    # corruption is a MAGNITUDE: the flag alone cannot say what the generator was shown, and
+    # `cmd_future` deliberately keeps the TRUE command.
+    assert "perturb_speed_offset_mps" in ro.ROLLOUT_WINDOW_NAMES
+    assert dict(ro.ROLLOUT_WINDOW_COLUMNS)["perturb_speed_offset_mps"] == "f4"
+    assert "history_null" in ro.ROLLOUT_WINDOW_NAMES, (
+        "history_null is a different signal and must not have been replaced")
+    assert ro.SCHEMA_VERSION >= 4, "adding columns must bump the schema version"
+
+
+def test_the_reader_still_loads_a_pre_perturbation_recording(tmp_path):
+    """Bumping the schema must not orphan the data already on disk.
+
+    The perturbation columns took SCHEMA_VERSION 2 -> 3 and instantly made every existing
+    recording unreadable -- including the 32k-episode set the critic was fitted on.  A
+    schema-2 file has to keep loading, with the arms filled as "not perturbed", which is what
+    is TRUE of a file written before the arms existed rather than a zero standing in for an
+    unknown.
+    """
+    import h5py
+    import numpy as np
+
+    import rollout_outcomes as ro
+
+    p = tmp_path / "old.h5"
+    n = 3
+    with h5py.File(p, "w") as f:
+        f.attrs["schema_version"] = 2
+        f.attrs["num_windows"] = n
+        f.attrs["num_windows_written"] = n
+        f.create_dataset("episode_uid", data=np.arange(n, dtype=np.int64))
+        f.create_dataset("replan_index", data=np.zeros(n, np.int32))
+
+    got, attrs = ro.read_rollout_windows(
+        str(p), columns=["episode_uid", "replan_index",
+                         "perturb_null_history", "perturb_noisy_upper_cam"])
+    assert attrs["schema_version"] == 2
+    assert got["episode_uid"].tolist() == [0, 1, 2]
+    for col in ("perturb_null_history", "perturb_noisy_upper_cam"):
+        assert got[col].shape == (n,)
+        assert not got[col].any(), f"{col} must backfill as NOT perturbed"
+
+    # A column that is genuinely missing -- not merely newer than the file -- still refuses.
+    import pytest as _pytest
+    with _pytest.raises(ValueError, match="no column"):
+        ro.read_rollout_windows(str(p), columns=["episode_uid", "not_a_real_column"])
+
+
+def test_the_reader_still_loads_a_SCHEMA_3_recording(tmp_path):
+    """The bump this change makes, tested in its own right.
+
+    Schema 3 is not a historical curiosity: every AWR buffer and every graded increment on
+    disk right now is schema 3, so the speed arm's columns going in must leave those loading
+    with the arm filled as "not mismatched". The 2 -> 3 bump orphaned the 32k-episode critic
+    set and this is the same mistake one version later.
+    """
+    import h5py
+    import numpy as np
+
+    import rollout_outcomes as ro
+
+    p = tmp_path / "v3.h5"
+    n = 4
+    with h5py.File(p, "w") as f:
+        f.attrs["schema_version"] = 3
+        f.attrs["num_windows"] = n
+        f.attrs["num_windows_written"] = n
+        f.create_dataset("episode_uid", data=np.arange(n, dtype=np.int64))
+        f.create_dataset("replan_index", data=np.zeros(n, np.int32))
+        # A schema-3 file HAS the first two arms and lacks only the speed one.
+        f.create_dataset("perturb_null_history", data=np.ones(n, np.uint8))
+        f.create_dataset("perturb_noisy_upper_cam", data=np.zeros(n, np.uint8))
+
+    got, attrs = ro.read_rollout_windows(
+        str(p), columns=["episode_uid", "perturb_null_history",
+                         "perturb_speed_mismatch", "perturb_speed_offset_mps"])
+    assert attrs["schema_version"] == 3
+    # The columns it HAS come through unchanged -- the backfill must not overwrite real data.
+    assert got["perturb_null_history"].all(), "a present column was backfilled over"
+    assert not got["perturb_speed_mismatch"].any()
+    assert not got["perturb_speed_offset_mps"].any()
+
+
+def test_only_the_post_schema2_columns_are_backfillable():
+    """The backfill table must not grow into a general "absent means zero" policy.
+
+    That rule exists to be broken here and nowhere else: the perturbation arms did not exist
+    when a schema-2 file was written, so "not perturbed" is accurate.  `penetration_volume_m3`
+    is the counter-case -- absent when the collider model has no areas, where a zero would
+    assert a geometrically perfect plan.
+    """
+    import rollout_outcomes as ro
+
+    assert set(ro.WINDOW_SCHEMA_BACKFILL) == {
+        "perturb_null_history", "perturb_noisy_upper_cam",
+        "perturb_speed_mismatch", "perturb_speed_offset_mps"}
+    assert ro.READABLE_SCHEMAS == frozenset((2, 3, 4))
+    for col in ro.WINDOW_SCHEMA_BACKFILL:
+        assert col in ro.ROLLOUT_WINDOW_NAMES
+
+
+def test_every_reader_admits_every_readable_schema():
+    """No reader may keep a strict `!= SCHEMA_VERSION` check.
+
+    `schema_version` is ONE number stamped on both tables, so a reader that accepts only the
+    newest orphans an older recording -- and there are two readers.  Fixing one and shipping
+    was exactly the failure: the window reader was loosened, the EPISODE reader was not, and
+    the sizing sweep failed a second time on the same class of error one call site along.
+    """
+    import inspect
+    import pathlib
+
+    import rollout_outcomes as ro
+
+    src = pathlib.Path(inspect.getsourcefile(ro)).read_text()
+    assert "!= SCHEMA_VERSION" not in src, (
+        "a reader still pins one exact schema; use READABLE_SCHEMAS")
+    # Both readers must consult the shared set.
+    assert src.count("if version not in READABLE_SCHEMAS:") == 2, (
+        "expected exactly two version gates (episodes and windows)")
+
+
+def test_the_episode_reader_loads_a_pre_perturbation_recording(tmp_path):
+    """The episode table is unchanged across schemas 2 and 3, so it needs only admitting."""
+    import h5py
+    import numpy as np
+
+    import rollout_outcomes as ro
+
+    p = tmp_path / "old.episodes.h5"
+    n = 2
+    with h5py.File(p, "w") as f:
+        f.attrs["schema_version"] = 2
+        f.attrs["family_names"] = json.dumps(["a"])
+        f.attrs["columns"] = json.dumps(list(ro.ROLLOUT_COLUMN_NAMES))
+        for name, dtype in ro.ROLLOUT_EPISODE_COLUMNS:
+            f.create_dataset(name, data=np.zeros(n, dtype=dtype))
+    got, attrs = ro.read_rollout_episodes(str(p))
+    assert attrs["schema_version"] == 2
+    assert got["episode_uid"].shape == (n,)
+
+
+def test_read_rollout_episodes_skips_the_terrain_reward_chunks_group(tmp_path):
+    """A live-graded recording must be READABLE, not a TypeError from deep inside the reader.
+
+    ``--terrain_reward`` writes the per-chunk grade into a ``chunks`` GROUP inside the same
+    episodes file.  The reader used to do ``f[key][...]`` over every key, which on a group
+    raises ``TypeError: Accessing a group is done with bytes or str, not <class 'ellipsis'>``
+    -- so every recording graded live was unreadable here and unmergeable, while
+    ``box2_ic_report`` worked because it reaches for h5py directly.
+    """
+    import h5py
+    import numpy as np
+
+    path = str(tmp_path / "r.episodes.h5")
+    with h5py.File(path, "w") as f:
+        f.attrs["schema_version"] = ro.SCHEMA_VERSION
+        f.create_dataset("episode_uid", data=np.arange(3, dtype=np.int64))
+        f.create_dataset("reached_goal", data=np.ones(3, dtype=np.int64))
+        grp = f.create_group("chunks")
+        grp.create_dataset("episode_uid", data=np.arange(9, dtype=np.int64))
+        grp.create_dataset("contact_penalty", data=np.zeros(9, dtype=np.float64))
+
+    cols, attrs = ro.read_rollout_episodes(path)
+    assert sorted(cols) == ["episode_uid", "reached_goal"]
+    assert "chunks" not in cols
+    assert attrs["schema_version"] == ro.SCHEMA_VERSION

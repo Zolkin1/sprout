@@ -231,15 +231,20 @@ def variance_decomposition(x: np.ndarray, group: np.ndarray) -> dict[str, float]
 
 
 def awr_weights(advantage: np.ndarray, *, beta: float, w_max: float | None = 20.0,
-                standardize: bool = True) -> np.ndarray:
+                standardize: bool = True, fit: np.ndarray | None = None) -> np.ndarray:
     """Advantage-weighted-regression weights ``w = clip(exp(A / beta), 0, w_max)``.
 
     Args:
         advantage: ``[n]`` advantages.
         beta: Temperature; smaller is sharper.
-        w_max: Upper clip, or ``None`` for none.  Reported both ways because the clip is what
-            stops one row from owning the update, and how much mass it removes is itself a
-            statement about the advantage's tail.
+        w_max: Upper clip as a multiple of the MEAN weight, or ``None`` for none.  Reported
+            both ways because the clip is what stops one row from owning the update, and how
+            much mass it removes is itself a statement about the advantage's tail.
+        fit: ``[n]`` bool selecting the rows the clip LEVEL is estimated from, or ``None``
+            for all of them.  The level is a statistic of the sample, so computing it over
+            rows a run also validates against makes the training weights a function of the
+            val split -- measured at 3.1x on individual weights at ``beta = 0.5`` with an
+            episode-clustered split.
         standardize: Divide by the advantage's own standard deviation first, so ``beta`` means
             the same thing across estimators whose scales differ by an order of magnitude.
             **The mean is NOT subtracted**: a constant shift is exactly cancelled by the
@@ -267,7 +272,171 @@ def awr_weights(advantage: np.ndarray, *, beta: float, w_max: float | None = 20.
     if w_max is not None:
         # The clip is stated relative to the MEAN weight, which is what "no row is worth more
         # than 20 rows" means; clipping the raw exponential would depend on the shift above.
-        w = np.minimum(w, float(w_max) * w.mean())
+        #
+        # ITERATED TO A FIXED POINT, because clipping LOWERS the mean and so lowers the level
+        # the clip is stated against. Applied once against the pre-clip mean the property is
+        # not delivered at all where it is most needed: measured post-clip max/mean was 20.0
+        # at beta 1.0 but 103 at beta 0.25 and 1061 at beta 0.1 -- i.e. exactly in the sharp
+        # arm the clip exists for, a single row could still own the update by 1061 rows'
+        # worth while the run reported a clip of 20. The map is monotone decreasing and
+        # bounded, so this converges; the cap is a guard, not a schedule.
+        m = np.ones(w.shape[0], dtype=bool) if fit is None else np.asarray(fit, dtype=bool)
+        if m.shape[0] != w.shape[0]:
+            raise ValueError(f"fit has length {m.shape[0]}, expected {w.shape[0]}")
+        # Solved by BISECTION rather than by iterating the map. `L -> w_max * mean(min(w, L))`
+        # is a contraction but a slow one when a large mass sits at the clip -- 64 passes
+        # still left max/mean at 20.000016 -- and the level is a scalar root, so bisecting it
+        # is both exact to machine precision and cheap. `g` is positive for small `L` (where
+        # it reduces to `(w_max - 1) * L`, and `w_max > 1` in any sane use) and negative
+        # beyond `max(w)`, so the bracket is guaranteed.
+        wm = float(w_max)
+        fit_w = w[m]
+
+        def _g(level: float) -> float:
+            return wm * float(np.minimum(fit_w, level).mean()) - level
+
+        lo, hi = 0.0, float(w.max())
+        if wm > 1.0 and _g(hi) < 0.0:
+            for _ in range(200):
+                mid = 0.5 * (lo + hi)
+                if _g(mid) > 0.0:
+                    lo = mid
+                else:
+                    hi = mid
+            w = np.minimum(w, lo)
+        else:
+            # `w_max <= 1` has no positive fixed point (the level would have to sit at or
+            # below the mean it is a multiple of), and a bracket that never goes negative
+            # means the clip does not bind at all. Apply it once and stop.
+            w = np.minimum(w, wm * float(w[m].mean()))
+    return w
+
+
+def stratified_awr_weights(
+    advantage: np.ndarray,
+    *,
+    beta: float,
+    strata: np.ndarray | None = None,
+    fit: np.ndarray | None = None,
+    w_max: float | None = 20.0,
+    center: bool = True,
+    balance: bool = True,
+) -> np.ndarray:
+    """AWR weights whose exponent is centered WITHIN each stratum.
+
+    :func:`awr_weights` deliberately does not subtract a mean, because a GLOBAL shift cancels
+    under the ``w / sum(w)`` every consumer applies.  That argument does not survive
+    stratification: a per-stratum offset does NOT cancel, so a cell whose advantages sit
+    higher takes systematically more weight than a cell whose sit lower -- which is a
+    property of the cell, not of any chunk in it.
+
+    That is the same selection effect ``advantage.binarize`` corrects by taking its
+    percentile threshold inside the cell rather than across it, and it is measurable: an
+    uncorrected Monte-Carlo advantage keeps 0.33 of rows above 1.3 m/s against 0.23 below
+    0.9.  Centering here is the weighted arm's version of that correction, so a filtered-BC
+    and an AWR run select over the same population and their comparison is about the
+    weighting rather than about the speed distribution.
+
+    **The scale stays POOLED on purpose.**  Dividing by each stratum's own standard deviation
+    would equalize cells whose advantages genuinely differ in spread, amplifying the noise in
+    a flat cell to match the signal in an informative one -- the failure ``null_spread``
+    exists to prevent.  One pooled sigma keeps ``beta`` comparable across runs while leaving
+    a low-spread cell with low-spread weights.
+
+    Args:
+        advantage: ``[n]`` advantages for the rows being weighted.
+        beta: Temperature; smaller is sharper.
+        strata: ``[n]`` stratum id per row (``advantage.group_ids``), or ``None`` to center
+            globally -- which, as above, is the same as not centering at all.
+        fit: ``[n]`` bool selecting the rows the mean and sigma are ESTIMATED from, or
+            ``None`` for all of them.  Pass the training split: estimating the scale on rows
+            the run also validates against makes ``beta`` a mild function of the val set.
+            A stratum with no ``fit`` row falls back to the global fit mean rather than to
+            zero, which would leave it centered on nothing.
+        w_max: Upper clip as a multiple of the mean weight, or ``None``.
+        center: Subtract each stratum's own mean.  ``False`` is the CONTROL arm and differs
+            in that alone -- the scale stays the within-cell residual sd either way, so the
+            two arms run at the same temperature and the comparison is about the centering.
+        balance: Rescale each stratum's TOTAL weight to its share of the rows, which is what
+            makes AWR's cell composition match filtered BC's.  Centering alone does not:
+            ``binarize`` keeps a fixed 30% of EVERY cell, so its keep-set composition equals
+            the data's by construction, while centering only removes a cell's MEAN offset
+            and leaves its SPREAD free -- and since the scale is pooled, a wider-spread cell
+            produces more extreme weights whose upper tail dominates the sum.  Measured on
+            the box2 v2 labels at ``beta = 1.0``: max deviation from the row share is 0.29
+            points for filtered BC, 3.71 uncentered, 2.54 centered, and ~0 with this on,
+            correlating with cell spread at ``+0.627``.  Without it an AWR-vs-filtered-BC
+            comparison moves the cell composition as well as the weighting, which is a
+            second variable in the one contrast the arm exists to make.  It preserves the
+            WITHIN-cell ranking exactly -- only each cell's total is rescaled.
+
+            **It loosens ``w_max`` from a global bound to a per-cell one.**  The rescale is
+            applied after the clip, so a cell scaled up carries its clipped rows past the
+            global level -- measured 21.19x the mean against a stated 20x, about 6%.  The
+            clip's purpose (no single row owning the update) survives that; the exact global
+            multiple does not, so a caller reporting it should read the REALISED max rather
+            than restate ``w_max``.
+
+    Returns:
+        ``[n]`` non-negative weights.
+
+    Raises:
+        ValueError: On a non-positive ``beta``, or ragged inputs.
+    """
+    a = np.asarray(advantage, dtype=np.float64)
+    m = np.ones(a.shape[0], dtype=bool) if fit is None else np.asarray(fit, dtype=bool)
+    if m.shape[0] != a.shape[0]:
+        raise ValueError(f"fit has length {m.shape[0]}, expected {a.shape[0]}")
+    if not m.any():
+        raise ValueError("`fit` selects no rows, so there is nothing to estimate the "
+                         "centering and scale from.")
+    # The SCALE is the within-cell residual sd in BOTH arms, so `center` toggles exactly one
+    # thing. Deriving it from the centered residual only when centering is on made the
+    # uncentered arm divide by the TOTAL sd instead -- larger by the between-cell variance,
+    # so the "control" also ran cooler: 1.03x / 1.13x / 1.37x sharper at the same beta as
+    # that fraction went 0.05 / 0.20 / 0.50. An A/B that moves the temperature with the
+    # treatment cannot attribute its own result.
+    resid = a.copy()
+    if strata is not None:
+        s_all = np.asarray(strata)
+        if s_all.shape[0] != a.shape[0]:
+            raise ValueError(f"strata has length {s_all.shape[0]}, expected {a.shape[0]}")
+        _, inv_all = np.unique(s_all, return_inverse=True)
+        k_all = int(inv_all.max()) + 1
+        c_all = np.bincount(inv_all[m], minlength=k_all).astype(np.float64)
+        t_all = np.bincount(inv_all[m], weights=a[m], minlength=k_all)
+        mu_all = np.where(c_all > 0, np.divide(t_all, np.maximum(c_all, 1.0)),
+                          float(a[m].mean()))
+        resid = a - mu_all[inv_all]
+    sd = float(resid[m].std())
+
+    z = a.copy()
+    if center and strata is not None:
+        s = np.asarray(strata)
+        if s.shape[0] != a.shape[0]:
+            raise ValueError(f"strata has length {s.shape[0]}, expected {a.shape[0]}")
+        _, inv = np.unique(s, return_inverse=True)
+        k = int(inv.max()) + 1
+        cnt = np.bincount(inv[m], minlength=k).astype(np.float64)
+        tot = np.bincount(inv[m], weights=a[m], minlength=k)
+        # A cell with no fit row keeps the global fit mean: centering it on 0 would leave it
+        # carrying the raw advantage's offset while every other cell had lost it.
+        mean = np.where(cnt > 0, np.divide(tot, np.maximum(cnt, 1.0)), float(a[m].mean()))
+        z = a - mean[inv]
+    if sd > 0.0:
+        z = z / sd
+    w = awr_weights(z, beta=beta, w_max=w_max, standardize=False, fit=m)
+    if balance and strata is not None:
+        # Each cell's total weight -> its share of the FIT rows. Applied AFTER the clip, so
+        # the clip still bounds a row within its own cell; a per-cell rescale is a positive
+        # scalar per cell, so no row's rank inside its cell moves.
+        s2 = np.asarray(strata)
+        _, inv = np.unique(s2, return_inverse=True)
+        k = int(inv.max()) + 1
+        want = np.bincount(inv[m], minlength=k).astype(np.float64)
+        have = np.bincount(inv, weights=w, minlength=k)
+        scale = np.divide(want, have, out=np.ones(k), where=have > 0)
+        w = w * scale[inv]
     return w
 
 

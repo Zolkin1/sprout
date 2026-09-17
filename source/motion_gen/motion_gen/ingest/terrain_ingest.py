@@ -33,7 +33,8 @@ import numpy as np
 import torch
 
 from . import ingest_common as IC
-from .clean_ingest import _clip_to_state, _read_manifest, _resolve_dir, _truthy
+from .clean_ingest import (_clip_to_state, _read_manifest, _resolve_dir, _truthy,
+                          solve_converged, summarize_convergence)
 from .motion_db import BONES, MotionSource
 
 _ANKLE_KEY = "ankle_roll_link"   # contact body suffix identifying a foot
@@ -67,6 +68,38 @@ def _norm_terrain_geom(terr: dict) -> dict:
         for b in terr.get("boxes", [])
     ]
     return out
+
+
+
+def _measured_steady_vel(root_pos, root_quat, dt: float, device) -> "torch.Tensor":
+    """Mean body-frame ``(vx, vy, wz)`` over a clip, for a reference whose manifest omits it.
+
+    The manifest's ``vel_x``/``vel_y``/``vel_yaw`` columns are BLANK for essentially every box row
+    (11 of 12 ``jump_on``, 7 of 7 ``jump_off_front``), and the parse failure was swallowed into
+    ``steady_vel = None``. ``terrain_place.select_terrain_reference`` then scores a source with no
+    recorded command as 0 m/s, so every box candidate at a given height tied at zero and its
+    "nearest speed" stage silently degraded to "take the first" -- invisible today because there is
+    one speed per height, and it would have stayed invisible after a solve delivering several.
+
+    MEASURED, not assumed: over the 12 ``jump_on`` references the mean heading-frame forward speed
+    is 0.327 m/s for every one of them, against the 0.334 the single populated manifest row
+    records. A 2% match, so this reproduces the solver's own definition rather than inventing one.
+    """
+    d = (root_pos[1:, :2] - root_pos[:-1, :2]) / float(dt)
+    psi = _yaw_from_quat_wxyz_series(root_quat[:-1])
+    c, s_ = torch.cos(psi), torch.sin(psi)
+    vx = (d[:, 0] * c + d[:, 1] * s_).mean()
+    vy = (-d[:, 0] * s_ + d[:, 1] * c).mean()
+    psi_all = _yaw_from_quat_wxyz_series(root_quat)
+    dpsi = torch.atan2(torch.sin(psi_all[1:] - psi_all[:-1]), torch.cos(psi_all[1:] - psi_all[:-1]))
+    wz = (dpsi / float(dt)).mean()
+    return torch.tensor([float(vx), float(vy), float(wz)], dtype=torch.float32, device=device)
+
+
+def _yaw_from_quat_wxyz_series(q: "torch.Tensor") -> "torch.Tensor":
+    """Z-up yaw ``[F]`` from wxyz quaternions ``[F, 4]``."""
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    return torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
 
 
 def ingest_terrain_library(
@@ -103,7 +136,9 @@ def ingest_terrain_library(
         st = _clip_to_state(npz_path, dt, device)
         if st is None or st[0].shape[0] < min_frames:
             continue
-        joint_pos, root_pos_t, root_quat_t, root_lin_vel, root_ang_vel = st
+        # _clip_to_state also returns the solver contact now; terrain reads contact_flags itself
+        # below (same nearest-resampling), so that copy stays authoritative here.
+        joint_pos, root_pos_t, root_quat_t, root_lin_vel, root_ang_vel, _ = st
         F = int(joint_pos.shape[0])
 
         z = np.load(npz_path, allow_pickle=True)
@@ -123,15 +158,27 @@ def ingest_terrain_library(
             steady_vel = torch.tensor(
                 [float(r["vel_x"]), float(r["vel_y"]), float(r["vel_yaw"])],
                 dtype=torch.float32, device=device)
+            vel_from = "manifest"
         except (KeyError, ValueError, TypeError):
-            steady_vel = None
+            # Recovered from the motion rather than left as None. A None here does not read as
+            # "unknown" downstream -- select_terrain_reference scores it as 0 m/s, which is a
+            # positive claim, and a wrong one.
+            steady_vel = _measured_steady_vel(root_pos_t, root_quat_t, dt, device)
+            vel_from = "measured"
 
         terrain_meta = {
             "terrain": _norm_terrain_geom(meta.get("terrain", {})),
             "contact_bodies": bodies,
             "heading_yaw0": _yaw_from_quat_wxyz(root_quat_t[0]),
             "vel_cmd": None if steady_vel is None else steady_vel.tolist(),
+            "vel_cmd_from": vel_from,
             "skill": skill,
+            # Carried, not filtered on. A terrain reference is REPLAYED verbatim, so whether its
+            # solve converged is a property the tile author needs -- authoring a staircase around a
+            # failed solve produces geometry nothing in the library can walk. Which consumers act
+            # on it is their decision; see solve_converged.
+            "converged": solve_converged(r),
+            "status": (r.get("status") or "").strip(),
         }
         wrap = "periodic" if _truthy(r.get("periodic", "true")) else "episodic"
         stem = os.path.splitext(os.path.basename(rel))[0]
@@ -146,4 +193,22 @@ def ingest_terrain_library(
         ))
         if limit is not None and len(sources) >= limit:
             break
+
+    # Say out loud how many of these the solver actually converged on. Nothing read the status
+    # column before, so a library where three quarters of one skill failed to converge looked
+    # exactly like one where none did.
+    n_bad = sum(1 for s in sources if not (s.terrain_meta or {}).get("converged", True))
+    if n_bad:
+        per = {}
+        for s in sources:
+            tm = s.terrain_meta or {}
+            k = tm.get("skill", "?")
+            c = per.setdefault(k, [0, 0])
+            c[0] += int(bool(tm.get("converged", True)))
+            c[1] += 1
+        detail = "  ".join(f"{k} {c}/{t}" for k, (c, t) in sorted(per.items()) if c < t)
+        print(f"[terrain_ingest] {len(sources) - n_bad}/{len(sources)} references converged "
+              f"({detail}). A non-converged reference is still REPLAYED verbatim; whether its "
+              f"geometry may be authored INTO a stair tile is the tile author's decision "
+              f"(mb_plan_library, stair_allow_non_converged), and it prints which way it went.")
     return sources

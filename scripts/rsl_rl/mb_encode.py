@@ -3,8 +3,25 @@
 
 """Stage 1' (Motion Bricks env): drive Motion Bricks with OUR optimized strides as the target pose.
 
-Phase-2 FLAT generation. Unlike ``mb_generate.py`` (which lets Motion Bricks free-run its built-in style
-clips), this drives the model from a scripted ``(vx, vy, wz)`` command schedule and, at every replan,
+**BROKEN AND OFF THE PIPELINE (2026-09-09). Kept on purpose -- read this before deleting it.**
+
+It does not run: ``sample_schedule`` below calls ``command_schedule.sample_command_schedule`` with
+``run_vx_range`` / ``back_vx_range`` / ``side_vy`` / ``turn_max`` / ``stand_frac``, and the command
+envelope rewrite replaced all five with one continuous ``(vx_range, vy_range, wz_range)`` plus
+declared masses -- so the first call raises TypeError. ``generate_mb_library`` hard-exits if a
+recipe selects this path.
+
+Why it is kept: it is the MIDDLE ARM of the comparison the paper needs. ``mb_baseline.py`` is
+Motion Bricks ALONE (its own poses, its own root); the live pipeline is our exact looped strides
+spliced with bounded in-betweenings; THIS is Motion Bricks' root with OUR poses and no exact loops.
+That isolates whether the win comes from the optimized poses or from the exact looping -- the
+"why not just pin your poses into Motion Bricks?" question -- and nothing else in the tree can
+answer it. Reviving it is a small fix (the five arguments collapse onto the new signature) plus a
+path from its output into ``mb_baseline``'s scorer.
+
+Phase-2 FLAT generation. Unlike letting Motion Bricks free-run its own built-in style clips (which is
+what ``scripts/interactive_demo_g1.py`` in the MB clone does, and what ``mb_baseline.py`` scores us
+against), this drives the model from a scripted ``(vx, vy, wz)`` command schedule and, at every replan,
 supplies the *target pose* from our velocity-matched optimized steady stride (the stride bank written by
 ``export_stride_bank.py``) instead of Motion Bricks' style-clip holder. Motion Bricks' own spring-model
 root/heading realignment is kept -- so the ROOT trajectory (where the robot goes) is Motion Bricks'
@@ -43,59 +60,31 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mb_env  # noqa: E402
+from motion_gen.command_schedule import sample_command_schedule  # noqa: E402
 
-
-def _seg_vel(rng: np.random.Generator, args) -> tuple[float, float, float, str]:
-    """Random ``(vx, vy, wz, label)`` for one MOVING segment, covering the whole command space.
-
-    Mirrors ``generate_mm_clips._seg_vel`` (the DP flat family's distribution) mode-for-mode, so the MB
-    and DP flat libraries are directly comparable: forward / backward / sidestep / turn-while-walking /
-    diagonal, with forward over-weighted 3:1 and a 30% chance of a superimposed turn.
-    """
-    mode = str(rng.choice(["forward", "forward", "forward", "backward", "sidestep", "turn", "diagonal"]))
-    vx = vy = wz = 0.0
-    if mode == "forward":
-        vx = float(rng.uniform(0.45, 1.0)) * (args.run_vx if rng.random() < 0.4 else args.walk_vx)
-        wz = float(rng.uniform(-1.0, 1.0)) * args.turn_max if rng.random() < 0.3 else 0.0
-    elif mode == "backward":
-        vx = -float(rng.uniform(0.4, 0.9)) * args.back_vx
-    elif mode == "sidestep":
-        vy = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.4, 1.0)) * args.side_vy
-    elif mode == "turn":
-        vx = float(rng.uniform(0.2, 0.7)) * args.walk_vx
-        wz = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.5, 1.0)) * args.turn_max
-    elif mode == "diagonal":
-        vx = float(rng.uniform(0.3, 0.8)) * args.walk_vx
-        vy = float(rng.choice([-1.0, 1.0])) * float(rng.uniform(0.3, 0.7)) * args.side_vy
-    return vx, vy, wz, mode
+# Historical flat-family shape, kept explicit now that the sampler is shared: a clean
+# standing lead-in so every clip starts settled, and a 12% chance a segment is a pause.
+_LEAD_IN_S = 1.0
+_STAND_FRAC = 0.12
 
 
 def sample_schedule(rng: np.random.Generator, args) -> list[tuple]:
     """One randomized ``[(duration_s, vx, vy, wz), ...]`` schedule for a clip of ``args.clip_length``.
 
-    A clean standing lead-in (so every clip starts from a settled stand), then mostly-moving segments of
-    ``U(1.5, 3.0)`` s with a 12% chance of a pause -- the ``generate_mm_clips._schedule`` recipe. The
-    velocity is what MB is COMMANDED; the target pose is snapped to the nearest bank stride, so the
-    achieved steady velocity is the snapped one (see ``--rl-vels`` on the Stage-2 side).
+    Delegates to :func:`motion_gen.command_schedule.sample_command_schedule`, the ONE sampler every
+    clip family uses. The flat family passes the full command space -- forward / backward / sidestep
+    / turn / diagonal, a standing lead-in and pauses -- and nothing overrides the result, so the
+    generated motion tracks this schedule end to end. The terrain families call the same function
+    with forward-only bands and let the terrain override it near the interaction.
 
-    The final segment is stretched/trimmed so the schedule totals EXACTLY ``clip_length``. Stage 2 fits to
-    that length either way, so an overshoot would be generated GPU time thrown away and an undershoot would
-    be repeat-last padding; pinning the total makes every clip full-length real motion (``clip_len == T``).
-    The adjustment is always < 1 s and can never zero the segment (the loop exits with at least 0.5 s left).
+    Velocity is what MB is COMMANDED; the target pose is snapped to the nearest bank stride, so the
+    achieved steady velocity is the snapped one (see ``--rl-vels`` on the Stage-2 side).
     """
-    segs = [(1.0, 0.0, 0.0, 0.0)]
-    t = 1.0
-    while t < args.clip_length - 0.5:
-        if rng.random() < 0.12:
-            vx, vy, wz = 0.0, 0.0, 0.0
-        else:
-            vx, vy, wz, _ = _seg_vel(rng, args)
-        dur = float(rng.uniform(1.5, 3.0))
-        segs.append((dur, vx, vy, wz))
-        t += dur
-    d, vx, vy, wz = segs[-1]
-    segs[-1] = (d + (float(args.clip_length) - t), vx, vy, wz)
-    return segs
+    return sample_command_schedule(
+        rng, duration=float(args.clip_length), seg_dur_range=tuple(args.seg_dur_range),
+        vx_range=tuple(args.walk_vx_range), run_vx_range=tuple(args.run_vx_range),
+        back_vx_range=tuple(args.back_vx_range), side_vy=float(args.side_vy),
+        turn_max=float(args.turn_max), stand_frac=_STAND_FRAC, lead_in_s=_LEAD_IN_S)
 
 
 def _schedule_set(name: str) -> list[dict]:
@@ -132,6 +121,7 @@ def _generate_clip(mb: mb_env.MBAgent, targeter: mb_env.StrideTargeter, segs: li
     command that was asked for; Stage 2 picks which one the RL sees (``--rl-vels``) and reports the gap.
     """
     mb.reset(seed)
+    targeter.reset_phase()                                    # gait phase is per-clip, not per stride index
     total_s = sum(d for d, *_ in segs)
     n_steps = max(2, int(round(total_s * mb.fps)))
     bounds = mb_env.schedule_bounds(segs)
@@ -167,13 +157,27 @@ def main() -> int:
     p.add_argument("--n-clips", type=int, default=None,
                    help="Generate N clips from RANDOMLY SAMPLED command schedules (library mode). Overrides "
                         "--schedule-set / --steady-vx; the schedule distribution mirrors the DP flat family.")
-    p.add_argument("--clip-length", type=float, default=9.0,
-                   help="Sampled-schedule clip duration (s); should match the Stage-2 --clip-length.")
+    p.add_argument("--clip-length", type=float, default=20.0,
+                   help="Sampled-schedule clip duration (s); should match the Stage-2 --clip-length. "
+                        "20 s is what the shipped libraries were built at (g1_mb_v5 carries "
+                        "clip_length_s=20.0, every flat clip 999 steps); the old 9.0 default was "
+                        "stale and never used for one.")
     p.add_argument("--schedule-set", default="demo", help="Named command-schedule set.")
-    # Velocity envelope of the sampled schedules (same knobs + defaults as generate_mm_clips.py).
-    p.add_argument("--run-vx", type=float, default=2.5, help="Forward RUN speed scale (m/s).")
-    p.add_argument("--walk-vx", type=float, default=1.0, help="Forward WALK speed scale (m/s).")
-    p.add_argument("--back-vx", type=float, default=1.2, help="Backward speed scale (m/s).")
+    p.add_argument("--seg-dur-range", type=float, nargs=2, default=(1.5, 5.5),
+                   metavar=("MIN", "MAX"),
+                   help="Duration band (s) of one command segment in a sampled schedule. Longer "
+                        "segments mean fewer command changes per clip but more settled time at each.")
+    # Velocity envelope of the sampled schedules. Expressed as explicit (min, max) BANDS rather than
+    # the old scale-times-fraction form: the fractions made the reachable range implicit (forward was
+    # U(0.45,1)*2.5 -> [1.125, 2.5] with a hole below it) and there was no way to set a floor.
+    # The walk and run bands are contiguous by default, so forward speed covers [0.1, 3.0] with no gap
+    # while keeping the 60/40 walk/run weighting.
+    p.add_argument("--walk-vx-range", type=float, nargs=2, default=(0.1, 1.0), metavar=("MIN", "MAX"),
+                   help="Forward WALK band (m/s); also the base band for turn/diagonal segments.")
+    p.add_argument("--run-vx-range", type=float, nargs=2, default=(1.0, 3.0), metavar=("MIN", "MAX"),
+                   help="Forward RUN band (m/s), used on the 40%% of forward segments that run.")
+    p.add_argument("--back-vx-range", type=float, nargs=2, default=(0.1, 1.5), metavar=("MIN", "MAX"),
+                   help="Backward SPEED band (m/s), magnitudes; emitted as negative vx.")
     p.add_argument("--side-vy", type=float, default=1.0, help="Lateral (sidestep) speed scale (m/s).")
     p.add_argument("--turn-max", type=float, default=0.8, help="Yaw-rate scale (rad/s).")
     p.add_argument("--steady-vx", type=float, default=None,
@@ -181,6 +185,12 @@ def main() -> int:
                         "(m/s), e.g. a flat baseline matched to a terrain traversal speed.")
     p.add_argument("--steady-secs", type=float, default=6.0, help="Duration (s) of the --steady-vx clip.")
     p.add_argument("--repeats", type=int, default=1, help="Generate each schedule this many times (varied seed).")
+    p.add_argument("--bank-dt", type=float, default=None,
+                   help="DIAGNOSTIC: override the stride bank's own sampling period (s) when advancing the "
+                        "target-pose phase. The bank records its dt and that is what should be used; setting "
+                        "this to the MB frame period (1/30) reproduces the pre-fix behaviour, where the pinned "
+                        "pose walked the stride one BANK frame per MB frame -- 0.6x the cadence the root was "
+                        "driven at. Only useful for measuring what that cost.")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--controller", default="random")          # unused; keeps build_demo_args happy
     p.add_argument("--allowed-mode", default=None)
@@ -201,7 +211,13 @@ def main() -> int:
           f"wz[{bmin[2]:+.2f},{bmax[2]:+.2f}]  ({len(np.unique(np.round(steady_vel[:, 0], 2)))} distinct vx)")
 
     mb = mb_env.MBAgent(args, capture_keyframes=True)
-    targeter = mb_env.StrideTargeter(strides, steady_vel, mb.nfpt)
+    # The bank is stored at the RL control period and MB generates at its own fps; the targeter needs both
+    # so the pinned pose walks the stride at the cadence the root is being driven at (see StrideTargeter).
+    bank_dt = float(args.bank_dt) if args.bank_dt else float(bank_meta["dt"])
+    if args.bank_dt:
+        print(f"[mb_encode] DIAGNOSTIC: bank dt overridden {bank_meta['dt']} -> {bank_dt} "
+              f"(pose cadence {bank_dt / mb.dt:.2f}x)")
+    targeter = mb_env.StrideTargeter(strides, steady_vel, mb.nfpt, bank_dt=bank_dt, mb_dt=mb.dt)
     print(f"[mb_encode] {mb.describe()}")
 
     # Three mutually exclusive modes: sampled library (--n-clips), one steady clip (--steady-vx), or a
@@ -215,7 +231,8 @@ def main() -> int:
         rng = np.random.default_rng(args.seed)
         schedules = [{"name": "rand", "segs": sample_schedule(rng, args)} for _ in range(args.n_clips)]
         print(f"[mb_encode] sampled {len(schedules)} schedules (clip_length={args.clip_length}s, "
-              f"run_vx={args.run_vx} walk_vx={args.walk_vx} back_vx={args.back_vx} "
+              f"seg_dur={tuple(args.seg_dur_range)}s, walk_vx={tuple(args.walk_vx_range)} "
+              f"run_vx={tuple(args.run_vx_range)} back_vx={tuple(args.back_vx_range)} "
               f"side_vy={args.side_vy} turn_max={args.turn_max})")
     elif args.steady_vx is not None:
         schedules = [{"name": f"steady_vx{args.steady_vx:.2f}",

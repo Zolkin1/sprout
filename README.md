@@ -107,24 +107,42 @@ python scripts/list_envs.py --keyword G1
 
 ### 1. Generate a clip library
 
-Motion Bricks runs in its own conda env (GPU), so generation is staged: the driver
-shells out and skips stages that are already done.
+**Full runbook: [`docs/generating_clips.md`](docs/generating_clips.md).** Stages, both conda envs,
+the traps, and what to look at afterwards.
+
+Motion Bricks runs in its own conda env on a GPU, so generation is staged; the driver shells out and
+skips stages that are already done.
 
 ```bash
-python scripts/rsl_rl/generate_mb_library.py --out clips/g1_mb_v5.h5 [--stage N] [--quick]
+python scripts/rsl_rl/generate_mb_library.py \
+    --config   configs/clip_gen/g1_mb_v6.yaml \
+    --work-dir mb_raw/lib_v7 \
+    --out      clips/g1_mb_v7.h5 \
+    --source   hf/trajectories/retargeted/2026-06-13_15-10-58_merged \
+    --library  trajectories/skills/library_v2 \
+    --mb-root  /abs/path/to/GR00T-WholeBodyControl/motionbricks
 ```
 
-It orchestrates `export_stride_bank` -> `mb_plan_library` -> `mb_terrain_segments` /
-`mb_encode` (in the `motionbricks` env) -> `mb_assemble_library` / `generate_mb_clips` /
-`mb_distractor_clips` -> `compose_terrain_library`.
+All six flags are REQUIRED -- there are no defaults, because a stale library or source silently
+trains on motion nobody solved for this robot, and `--library` is stamped into the output as
+provenance. `--mb-root` may be relative -- the driver resolves it against the repo and then walks
+up looking for the clone, printing what it found -- but a stage script run BY HAND has no such
+fallback and needs an absolute path.
 
-Then check what came out:
+Stages, in order: `export_stride_bank` -> `mb_plan_library` -> (`mb_terrain_segments`,
+`mb_flat_transients` in the `motionbricks` env) -> (`mb_assemble_library`, `mb_pure_stair_clips`,
+`mb_flat_clips`) -> `compose_terrain_library` -> `decorate_terrain` -> `mb_qc --gate` ->
+`clip_library_report`. The gate and the report run as part of the build; a library that fails the
+gate fails the build.
+
+**The finished library is `clips/g1_mb_v7_decor.h5`, not `--out`.** Decoration writes a new file,
+and it is the one to train, record and view against -- an undecorated library has no stair-width
+variation at all.
 
 ```bash
-python scripts/rsl_rl/mb_qc.py --lib clips/g1_mb_v5.h5        # objective quality report
-python scripts/rsl_rl/inspect_clip.py --mode timeseries --lib clips/g1_mb_v5.h5 --clip 0
-python scripts/rsl_rl/view_clip_viser.py --lib clips/g1_mb_v5.h5    # interactive
-python scripts/rsl_rl/view_terrain_isaac.py --lib clips/g1_mb_v5.h5 # per-family tile split
+python scripts/rsl_rl/view_clip_viser.py    --lib clips/g1_mb_v7_decor.h5 --clip 0
+python scripts/rsl_rl/view_terrain_viser.py --lib clips/g1_mb_v7_decor.h5 --traj 3
+python scripts/rsl_rl/mb_qc.py --lib clips/g1_mb_v7_decor.h5      # the report, without the gate
 ```
 
 ### 2. Train the teacher
@@ -579,7 +597,92 @@ breakdown.
 rewrites `robots/g1/<robot>_<course>.xml` before loading it, and a speed sweep shares geometry,
 so the race tears the file silently. The generated scenes are derived and not committed.
 
-### 4d. Train an ADJUSTER on the generator's plan: `G1-adjuster-fm-terrain-depth`
+### 4d. Fine-tune on FREE-FORM terrain
+
+> **Looking for the AWR / filtered-BC generator fine-tune?** That is a different pipeline and
+> it lives in **[`scripts/flow_matching/FINETUNE.md`](scripts/flow_matching/FINETUNE.md)** --
+> `run_finetune_loop.sh`, the four algorithms, the terrain libraries and their fingerprints,
+> the eval entry point, and **which generator every published number was fine-tuned from**.
+> Nothing in this section calls `finetune_generator.py`; what follows is the TEACHER's PPO
+> fine-tune on free-form ground, which is a prerequisite for it rather than the same thing.
+
+`G1-teacher-clf-terrain-depth-finetune-freeform` runs the generator-graded fine-tune on
+terrain that **no clip was ever generated for**. Every other library here exists to match one
+recorded motion per tile; under `reference_source="fm"` the reference is predicted from the
+cameras, so that constraint is gone and the ground can be free-form -- larger flat extents,
+boxes met off-square, and straight staircases with 1-15 steps per flight, four flights per
+section, each independently up or down.
+
+The terrain ships as a **manifest-only `.h5`** -- terrain and zero clips -- and is still
+passed with `--clip`, which points the importer and the command at one file as always.
+
+```bash
+# 1. Author the terrain (no simulator, seconds). Half the stair tiles are sampled from the
+#    building-code box (IBC / IRC / OSHA, Blondel-coupled) and half from the grid the shipped
+#    library actually used; the manifest records WHICH per tile, so the two can be reported
+#    apart. --like copies an existing library's channel layout.
+python scripts/rsl_rl/make_freeform_terrain.py \
+    --out clips/freeform_v1.h5 --seed 0 --flat 8 --boxes 16 --stairs 24
+
+# 2. Fine-tune a trained depth teacher on it, against a FROZEN generator.
+python scripts/rsl_rl/train.py --task G1-teacher-clf-terrain-depth-finetune-freeform \
+    --clip clips/freeform_v1.h5 \
+    --load_run <teacher run> --resume \
+    --fm_checkpoint logs/flow_matching/<fm run>/best.pt \
+    --num_envs 1024 --headless
+```
+
+What the clip stops supplying, and what replaces it:
+
+| the clip supplied | the free-form task uses |
+|---|---|
+| the terrain mesh | the same `ClipTerrainImporter`, on the manifest-only library |
+| the spawn pose | `mdp.reset_on_freeform_section` -- each section's `route` block |
+| `target_vel` | `FmTrackingCommandCfg.freeform_command` -- a per-episode speed draw after a 0.5 s standing hold, `vy = 0`, and a yaw-rate P controller aiming down the section |
+| `clip_end` | `mdp.freeform_goal_reached` -- the section's goal band, a truncation |
+| the critic's global drift | `tracking_error_global(datum="plan_anchor")` -- same width, so a teacher checkpoint still resumes with no surgery |
+
+**Three distribution changes ride along. None is free, and each is deliberate:**
+
+* **Steering is off-distribution on a staircase.** The generator was commanded `|wz| max =
+  0.0000` over all 3500 stair clips of the library it was fitted on, and it is frozen here, so
+  on a flight it is extrapolating in yaw rate. It is on anyway because nothing else in the loop
+  steers and these sections are tens of metres long -- without it, accumulated heading error
+  walks the robot off the side of the flight and what gets measured is the drift.
+* **The command is held across the window offsets**, where the clip path served a per-offset
+  future. That direction removes a train/deploy mismatch (both deploy runtimes hold one command
+  over the whole horizon), but the tracker's reference encoder now sees 13 copies of one row.
+* **The stairwell walls collide** -- they join the ground mesh and appear in the height scan,
+  where the decoration the generator was fitted on did neither. Nothing in this stack avoids
+  obstacles, so a scan-conditioned number measured here is not comparable to one measured on a
+  clip library.
+
+**A zero-clip library is a defined thing, in three places.** `FmTrackingCommand` inherits
+`MotionSequenceCommand`, which builds a `MotionClipManager` at construction and used to raise
+on such a library (`clip_len_or_full` -> `num_steps` -> `y_des.shape[1]`, IndexError). What
+makes it work is not a special case in the task cfg:
+
+* the WRITER emits the clip datasets at zero extent but full RANK (`ClipLibraryWriter` at
+  `num_clips=0`; it drops the per-clip chunking, which h5py refuses on a zero-extent axis, and
+  keeps the shapes), so `num_steps` is a real number and the manager constructs;
+* the MANAGER answers every layout question and REFUSES every gather by name
+  (`MotionClipManager._require_clips`), so a clip-consuming term left wired on this task fails
+  saying so rather than indexing an empty table or returning an empty tensor;
+* the COMMAND skips the clip half of the step (`_advance_without_a_clip`), keeping only the
+  plan-anchor latch, so `self._step` never marches and `as_clip_reference()` is refused.
+
+The permission is per configuration (`accepts_clip_free_library`, true only under
+`reference_source="fm"`), and the four clip-phase knobs -- `history_from`,
+`seed_history_from_clip`, `random_start_phase`, `random_start_before_terrain_start` -- are
+refused at construction if left on, because three of them would otherwise fail only at the
+first reset and one would never fail at all.
+
+**Pass `--like <a real clip library>` when generating it.** The FM checkpoint's `frame_names`
+are checked against the ee frames resolved from the library's OWN channel names, so the
+minimal 7-channel layout admits only a generator with no extra frames. `--like
+clips/g1_mb_v5_body_mode11_decor.h5` gives the shipped 155/137-channel, 29-joint layout.
+
+### 4e. Train an ADJUSTER on the generator's plan: `G1-adjuster-fm-terrain-depth`
 
 The generator, not the tracker, is the limit on terrain (clip 0.930-0.941 against fm
 0.618-0.672). Everything tried so far improved the reference *within the generator's own

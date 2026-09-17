@@ -71,7 +71,37 @@ for _d in (os.path.join(_HERE, "eval"), _HERE):
 
 #: Bump on any column removal, rename or change of meaning.
 # 2: the per-chunk tracking-error block (`track_err`) and the strict violation columns.
-SCHEMA_VERSION: int = 2
+SCHEMA_VERSION: int = 4
+
+#: Schema versions the readers accept.  ONE set, because ``schema_version`` is a single
+#: number stamped on both tables -- so a reader that accepts only the newest orphans the
+#: episode table of an older recording as surely as the window table.
+#:
+#: Bumping :data:`SCHEMA_VERSION` alone makes every recording already on disk unreadable, which
+#: is what happened when the perturbation columns landed: the 32k-episode v1 set the critic was
+#: fitted on stopped loading.  So the reader states which versions it can read, and what it
+#: substitutes for each one's missing columns.
+READABLE_SCHEMAS: frozenset[int] = frozenset((2, 3, 4))
+
+#: Columns added after schema 2, with the value to fill for an older file.  Keyed by column
+#: rather than by version because the reader's job is "substitute for what is missing", and a
+#: schema-2 file is missing everything a schema-3 one is missing plus more.
+#:
+#: **This is not the "absent is not zero" rule being broken -- it is the case that rule exists
+#: to distinguish.** `penetration_volume_m3` is absent when the collider model carries no
+#: areas, where a zero would assert a geometrically perfect plan; here the perturbation arms
+#: did not EXIST when a schema-2 file was written, so "this row was not perturbed" is the
+#: accurate statement about it rather than a guess standing in for one.
+WINDOW_SCHEMA_BACKFILL: dict[str, tuple[int, str]] = {
+    "perturb_null_history": (0, "u1"),
+    "perturb_noisy_upper_cam": (0, "u1"),
+    # Schema 4: the speed-mismatch arm. The OFFSET backfills to 0.0, which is the accurate
+    # statement about a file written before the arm existed -- and it is an offset rather
+    # than an absolute speed precisely so that 0 means "no mismatch" instead of "commanded
+    # 0 m/s", which is a real and very different thing on this task.
+    "perturb_speed_mismatch": (0, "u1"),
+    "perturb_speed_offset_mps": (0, "f4"),
+}
 
 _F = "f4"
 _I = "i4"
@@ -138,9 +168,86 @@ ROLLOUT_EPISODE_COLUMNS: tuple[tuple[str, str], ...] = (
     # `mdp.goal_region.goal_travel_m`. Recorded per episode so a library nobody has measured
     # cannot hide the same defect the shipped one did.
     ("goal_travel_m", _F),
+    # The base height the episode OPENED at. Recorded so the eval's spawn rule -- training
+    # draws every declared area, every eval draws the course's LOWEST -- is checkable from
+    # the artifact rather than from the launcher's banner. That gap was real: the rule was
+    # asserted from a unit test while the recorded data could not confirm it.
+    #
+    # NaN means no episode was opened for that row, not "ground". A course whose spawn is a
+    # platform records a positive value legitimately, so 0.0 is not a safe sentinel.
+    ("spawn_base_z_w", _F),
 )
 
 ROLLOUT_COLUMN_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_EPISODE_COLUMNS)
+
+
+#: One row per RE-PLAN of the terrain-consistency grade, written when
+#: ``record_rollouts.py --terrain_reward`` is on.
+#:
+#: **The columns are the offline sidecar's, deliberately.**  ``inspect_terrain_reward.py
+#: --stage reward`` writes ``contact_penalty`` / ``penetration_sum_m`` per window under the
+#: same ``(episode_uid, replan_index)`` key, and the critic regresses on
+#: ``contact_penalty * contact_weight + penetration_sum_m * penetration_weight`` built from
+#: exactly those two.  Recording the same names under the same key is what makes the live and
+#: offline numbers joinable and diffable rather than merely similar -- which is the whole
+#: point of :mod:`test_terrain_reward_parity`.
+#:
+#: **The RAW terms are stored, never the penalty and never a reward**, matching this module's
+#: existing rule for the tracking error.  ``tau``, the per-body penetration weights and the
+#: contact/penetration mix all stay offline knobs, so a re-weighting costs an array op
+#: instead of a re-capture.
+ROLLOUT_CHUNK_COLUMNS: tuple[tuple[str, str], ...] = (
+    # --- identity / join; the SAME key the window table and the sidecar use ---------------
+    ("episode_uid", _L),
+    ("replan_index", _I),
+    ("env_id", _I),
+    # --- THE two terms the critic is fitted on -------------------------------------------
+    ("contact_penalty", _F),
+    ("penetration_sum_m", _F),
+    # --- the served-window twins (first `served_nodes` nodes) ----------------------------
+    # Recorded but NOT what the critic uses: the mode error lives in the tail of the plan,
+    # not in the 12 nodes that get executed.  Here so that choice stays measurable.
+    ("contact_penalty_served", _F),
+    ("penetration_sum_m_served", _F),
+    # --- alternative reductions and the vacuity guards ------------------------------------
+    ("penetration_volume_m3", _F),   # area-weighted, density-invariant
+    ("penetration_mean", _F),
+    ("max_penetration_m", _F),
+    ("contact_reward", _F),
+    ("clearance", _F),
+    ("support_fraction", _F),        # a plan that never plants a foot is charged nothing
+    ("contact_coverage", _F),
+    ("exempt_fraction", _F),
+    # --- WHERE ON THE COURSE this re-plan happened --------------------------------------
+    #
+    # Signed downrange to the goal anchor in the TERRAIN frame at the instant of the re-plan
+    # -- the same quantity, from the same function, the window table records per window.
+    #
+    # **This is what makes the penalty comparison position-matched rather than
+    # phase-matched.** The penalty is a per-re-plan average, and a better policy survives
+    # longer, so its re-plans come from further down the course where the geometry is harder;
+    # an unmatched average charges it for getting further. Capping on `replan_index` corrects
+    # most of that (pooled +0.39 -> -0.07 on the 30-cell grid) but matches TIME, not
+    # POSITION: a policy that tracks better covers more ground per second, so residual bias
+    # survives in its favour. Binning on this column compares plans made at the same PLACE.
+    ("goal_downrange_m", _F),
+)
+
+ROLLOUT_CHUNK_NAMES: tuple[str, ...] = tuple(n for n, _ in ROLLOUT_CHUNK_COLUMNS)
+
+#: Columns of :data:`ROLLOUT_CHUNK_COLUMNS` the recorder supplies ITSELF rather than reading
+#: from the grader: the three join keys and the course position.
+CHUNK_NON_TERM_COLUMNS: frozenset[str] = frozenset(
+    ("episode_uid", "replan_index", "env_id", "goal_downrange_m"))
+
+#: The :func:`~motion_gen.terrain_consistency.terrain_consistency` keys the chunk table reads.
+#:
+#: Derived by SUBTRACTION, so a new column is excluded by naming it above rather than by
+#: remembering to. Getting this wrong is a KeyError on the first re-plan of a run --
+#: `_terrain_chunk_batch` looks every one of these up in the grader's output -- which is loud,
+#: but only after a simulator launch.
+TERRAIN_CHUNK_TERMS: tuple[str, ...] = tuple(
+    n for n in ROLLOUT_CHUNK_NAMES if n not in CHUNK_NON_TERM_COLUMNS)
 
 
 # TODO(jump-off-front): this family fails far more than any other and it is not understood.
@@ -215,6 +322,81 @@ class ProprioRing:
         m = dones.to(torch.bool)
         if bool(m.any()):
             self.buf[m] = 0.0
+
+
+#: The bound fields of a stamped ``tracking_spec`` that decide what the STRICT columns MEAN.
+#: The kernel widths and weights shape a reward, not a latch, so they are not compared.
+TRACKING_BOUND_FIELDS: tuple[str, ...] = ("max_lateral_m", "max_height_m", "max_tilt_rad")
+
+
+def read_tracking_spec(path: str) -> dict | None:
+    """The ``tracking_spec`` an episode table was written under, or ``None``.
+
+    ``record_rollouts`` stamps it for a stated reason -- ``first_violation_step`` and
+    ``track_reward_mean`` are only interpretable against the bounds that produced them -- and
+    for a long time nothing read it back.
+
+    Args:
+        path: An ``*.episodes.h5``.
+
+    Returns:
+        The spec dict, or ``None`` on a table written before it was stamped.
+    """
+    import json                                                            # noqa: PLC0415
+
+    import h5py                                                           # noqa: PLC0415
+
+    with h5py.File(path, "r") as f:
+        raw = f.attrs.get("tracking_spec")
+    if raw is None:
+        return None
+    return json.loads(raw) if isinstance(raw, (str, bytes)) else dict(raw)
+
+
+def assert_tracking_bounds_agree(paths: dict[str, str]) -> dict:
+    """Refuse to compare arms whose STRICT columns were latched at different bounds.
+
+    **This is the guard that was missing when the height bound moved 0.20 -> 0.12.**  Two arms
+    recorded either side of that change carry ``first_violation_step`` latched at different
+    thresholds, so any rule that reads it -- and ``strict`` is the default everywhere -- puts a
+    40% bound tightening into the reported delta and attributes it to the policy.  Nothing in
+    the numbers looks wrong: both arms have the column, both are populated, both are plausible.
+
+    Args:
+        paths: ``{arm label: an *.episodes.h5 from that arm}``.
+
+    Returns:
+        The agreed bounds, or ``{}`` when no arm stamped a spec.
+
+    Raises:
+        SystemExit: If two arms disagree on any of :data:`TRACKING_BOUND_FIELDS`.
+    """
+    seen: dict[tuple, list[str]] = {}
+    for label, p in paths.items():
+        spec = read_tracking_spec(p)
+        if spec is None:
+            continue
+        key = tuple(round(float(spec.get(f, float("nan"))), 9)
+                    for f in TRACKING_BOUND_FIELDS)
+        seen.setdefault(key, []).append(label)
+    if len(seen) <= 1:
+        return ({f: v for f, v in zip(TRACKING_BOUND_FIELDS, next(iter(seen)))}
+                if seen else {})
+    lines = [f"      {dict(zip(TRACKING_BOUND_FIELDS, k))}  <- {', '.join(v)}"
+             for k, v in seen.items()]
+    raise SystemExit(
+        "REFUSING: these arms were recorded under DIFFERENT strict tracking bounds, so their "
+        "`first_violation_step` columns do not mean the same thing:\n"
+        + "\n".join(lines)
+        + "\n  Every success rule except `--metric reached_goal --failure_rule loose` reads "
+          "that column, so a delta across this boundary contains the bound change.\n"
+          "  RE-RECORD the older arm under the current bounds. `--metric reached_goal "
+          "--failure_rule loose` is NOT an escape hatch once the bounds TERMINATE: the "
+          "episode ends at the violation, so the robot is prevented from ever arriving and "
+          "`reached_goal` carries the bound change too -- more severely, not less. Measured "
+          "on one unchanged parent checkpoint over 4200 box2 episodes: reached_goal 0.2440 "
+          "under a LATCHED 0.20 bound against 0.0002 under a TERMINATING 0.12 one. That "
+          "1000x is the termination, not the policy.")
 
 
 def first_bad_step(cols: dict[str, np.ndarray], *, strict: bool = True) -> np.ndarray:
@@ -346,12 +528,16 @@ class RolloutOutcomeTable:
         """Episodes appended so far."""
         return len(self._rows)
 
-    def write(self, path: str, attrs: dict | None = None) -> None:
+    def write(self, path: str, attrs: dict | None = None,
+              chunks: "ChunkRewardTable | None" = None) -> None:
         """Write the table plus its provenance.
 
         Args:
             path: Destination ``.h5``.  Parent directories are created.
             attrs: Run provenance; every value is JSON-encoded so nested dicts survive.
+            chunks: An optional per-re-plan terrain-reward table, written into a ``chunks``
+                GROUP of the same file.  One artifact rather than two, because the chunk rows
+                join to these episodes and a pair of files can be separated.
         """
         import h5py
 
@@ -365,6 +551,106 @@ class RolloutOutcomeTable:
             f.attrs["family_names"] = json.dumps(self.family_names)
             for key, value in (attrs or {}).items():
                 f.attrs[key] = json.dumps(value, default=str)
+            if chunks is not None:
+                chunks.write_into(f)
+
+
+class ChunkRewardTable:
+    """Append-only per-RE-PLAN terrain-consistency table, written beside the episodes.
+
+    One row per re-plan, keyed ``(episode_uid, replan_index)`` -- the same key the window
+    table stamps and the same key ``inspect_terrain_reward.py --stage reward`` writes its
+    sidecar under.  That is what lets the live and offline grades be joined and differenced
+    rather than merely compared in aggregate.
+
+    Held in memory like :class:`RolloutOutcomeTable`: a 4000-episode arm is ~150k rows of 15
+    small columns, under 10 MB.
+    """
+
+    def __init__(self, spec_meta: dict | None = None) -> None:
+        """Start an empty table.
+
+        Args:
+            spec_meta: The :class:`~motion_gen.terrain_consistency.TerrainConsistencySpec`
+                and contact settings the rows were graded under, stamped onto the group.  The
+                offline re-grade READS this rather than restating its own defaults, so the
+                two sides cannot drift into grading different things while reporting the same
+                column names.
+        """
+        self._cols: dict[str, list[np.ndarray]] = {n: [] for n in ROLLOUT_CHUNK_NAMES}
+        self._n = 0
+        self.spec_meta = dict(spec_meta or {})
+
+    def append_batch(self, batch: dict[str, np.ndarray]) -> int:
+        """Add one row per element of ``batch``'s arrays.
+
+        Args:
+            batch: A dict whose keys are exactly :data:`ROLLOUT_CHUNK_NAMES`.
+
+        Returns:
+            How many rows were added.
+
+        Raises:
+            ValueError: On a missing or unexpected key, or on ragged lengths.  A missing
+                ``penetration_volume_m3`` is the expected way to get here: it is ABSENT (not
+                zero) when the collider model carries no areas, i.e. when the model was built
+                in extreme-point mode instead of by surface sampling.
+        """
+        want, got = set(ROLLOUT_CHUNK_NAMES), set(batch)
+        if want != got:
+            raise ValueError(
+                f"terrain chunk batch does not match the schema: missing {sorted(want - got)}"
+                f", unexpected {sorted(got - want)}. A missing `penetration_volume_m3` means "
+                "the collider model has no areas -- build it with a surface `spacing` rather "
+                "than in extreme-point mode.")
+        lengths = {len(np.atleast_1d(v)) for v in batch.values()}
+        if len(lengths) != 1:
+            raise ValueError(f"ragged terrain chunk batch: column lengths {lengths}")
+        n = lengths.pop()
+        for name, dtype in ROLLOUT_CHUNK_COLUMNS:
+            self._cols[name].append(np.asarray(batch[name], dtype=dtype).reshape(-1))
+        self._n += n
+        return n
+
+    def __len__(self) -> int:
+        """Rows appended so far."""
+        return self._n
+
+    def write_into(self, f) -> None:
+        """Write the rows as a ``chunks`` group of an open episodes file.
+
+        Args:
+            f: An open, writable :class:`h5py.File`.
+        """
+        g = f.create_group("chunks")
+        for name, dtype in ROLLOUT_CHUNK_COLUMNS:
+            parts = self._cols[name]
+            data = (np.concatenate(parts) if parts else np.zeros(0, dtype=dtype))
+            g.create_dataset(name, data=data.astype(dtype))
+        g.attrs["columns"] = json.dumps(list(ROLLOUT_CHUNK_NAMES))
+        g.attrs["n_rows"] = int(self._n)
+        g.attrs["spec"] = json.dumps(self.spec_meta, sort_keys=True, default=str)
+
+
+def read_rollout_chunks(path: str) -> tuple[dict[str, np.ndarray], dict]:
+    """Read the ``chunks`` group written by :meth:`ChunkRewardTable.write_into`.
+
+    Args:
+        path: The episodes ``.h5``.
+
+    Returns:
+        ``(columns, spec)``; ``({}, {})`` when the file carries no chunk group (which is what
+        a run without ``--terrain_reward`` produces).
+    """
+    import h5py
+
+    with h5py.File(path, "r") as f:
+        if "chunks" not in f:
+            return {}, {}
+        g = f["chunks"]
+        cols = {name: g[name][:] for name in ROLLOUT_CHUNK_NAMES if name in g}
+        spec = json.loads(g.attrs.get("spec", "{}"))
+    return cols, spec
 
 
 def read_rollout_episodes(path: str) -> tuple[dict[str, np.ndarray], dict]:
@@ -386,11 +672,24 @@ def read_rollout_episodes(path: str) -> tuple[dict[str, np.ndarray], dict]:
     attrs: dict = {}
     with h5py.File(str(path), "r") as f:
         version = int(f.attrs.get("schema_version", -1))
-        if version != SCHEMA_VERSION:
+        # The episode table's COLUMNS are unchanged across schemas 2 and 3 -- the
+        # perturbation arms went into the window table and the terrain grade into its own
+        # `chunks` group -- so an older file needs no backfill here, only admitting.
+        if version not in READABLE_SCHEMAS:
             raise ValueError(
-                f"{path} is schema_version {version}; this reader knows {SCHEMA_VERSION}. "
+                f"{path} is schema_version {version}; this reader knows "
+                f"{sorted(READABLE_SCHEMAS)}. "
                 "Re-record rather than reading it through the wrong contract.")
         for key in f.keys():
+            # DATASETS ONLY. `--terrain_reward` puts the per-chunk grade in a `chunks` GROUP
+            # inside this same file (`ChunkRewardTable.write_into`), and `f[key][...]` on a
+            # group raises `TypeError: Accessing a group is done with bytes or str, not
+            # <class 'ellipsis'>` -- so every recording graded live was unreadable through
+            # this reader, and unmergeable, while `box2_ic_report` worked because it uses
+            # h5py directly. The chunk table has its own reader (`read_rollout_chunks`);
+            # this one returns the episode COLUMNS and must skip anything that is not one.
+            if not isinstance(f[key], h5py.Dataset):
+                continue
             cols[key] = f[key][...]
         for key, raw in f.attrs.items():
             if key == "schema_version":
@@ -418,6 +717,28 @@ ROLLOUT_WINDOW_COLUMNS: tuple[tuple[str, str], ...] = (
     ("extero", "f2"),             # (T, K) -- the reading ACTUALLY served, lag included
     ("cmd_future", "f4"),         # (F, cmd_dim) -- the command over the horizon
     ("depth_lag_used", _U8),      # lag served, in control steps
+    # --- HOW THE GENERATOR WAS PERTURBED WHEN IT PRODUCED THIS CHUNK --------------------
+    #
+    # The two diagnostic arms are a BEHAVIOUR POLICY: the generator is conditioned on a dead
+    # upper camera and/or the learned null-history embedding to widen the distribution of
+    # states and plans a run visits, while `history` and `extero` above store the TRUE
+    # measurement -- so the critic and the fine-tune learn from what actually happened.
+    #
+    # That makes these flags the only record that a row's ACTION came from conditioning other
+    # than the state stored beside it.  Without them the perturbed and pristine populations are
+    # indistinguishable on disk: the advantage could not be split by arm, and a fine-tune could
+    # not weight, drop or balance them.  Two bytes a window against ~30 kB of conditioning.
+    #
+    # `history_null` above is a DIFFERENT thing and both are needed: it is the post-reset
+    # transient, true of the recorded history, whereas this is the deliberate arm applied to
+    # the model while the recorded history stayed complete.
+    ("perturb_null_history", _U8),   # the learned null embedding replaced the real history
+    ("perturb_noisy_upper_cam", _U8),  # the upper (far) camera was replaced with garbage
+    ("perturb_speed_mismatch", _U8),   # the CONDITIONING command speed was offset
+    # The OFFSET, in m/s, signed. Recorded rather than the absolute conditioning speed
+    # because `cmd_future` already carries the TRUE command, so the pair is complete and a
+    # zero here reads as "no mismatch" rather than as a commanded standstill.
+    ("perturb_speed_offset_mps", _F),
     # --- the action a_t -----------------------------------------------------------------
     ("fm_plan", "f4"),            # (F, D) -- the emitted chunk, in window space
     # --- where it happened, for privileged critic features and diagnostics --------------
@@ -607,6 +928,13 @@ class RolloutWindowWriter:
             "env_id": (num_windows,), "clip_id": (num_windows,),
             "family_code": (num_windows,), "history_null": (num_windows,),
             "depth_lag_used": (num_windows,), "clip_step": (num_windows,),
+            # The behaviour-policy arms. Declared HERE as well as in
+            # ROLLOUT_WINDOW_COLUMNS because `shapes` is what actually gets allocated -- a
+            # column present only in the tuple is created by nothing and dropped in silence.
+            "perturb_null_history": (num_windows,),
+            "perturb_noisy_upper_cam": (num_windows,),
+            "perturb_speed_mismatch": (num_windows,),
+            "perturb_speed_offset_mps": (num_windows,),
             "history": (num_windows, int(num_history), int(state_dim)),
             "extero": (num_windows, int(extero_shape[0]), int(extero_shape[1])),
             "cmd_future": (num_windows, int(future_len), int(cmd_dim)),
@@ -721,15 +1049,24 @@ def read_rollout_windows(path: str, columns: list[str] | None = None
     attrs: dict = {}
     with h5py.File(str(path), "r") as f:
         version = int(f.attrs.get("schema_version", -1))
-        if version != SCHEMA_VERSION:
+        if version not in READABLE_SCHEMAS:
             raise ValueError(
-                f"{path} is schema_version {version}; this reader knows {SCHEMA_VERSION}.")
+                f"{path} is schema_version {version}; this reader knows "
+                f"{sorted(READABLE_SCHEMAS)}.")
         n = int(f.attrs.get("num_windows_written", f.attrs.get("num_windows", 0)))
         want = list(columns) if columns is not None else [k for k in f.keys()]
-        absent = [c for c in want if c not in f]
+        # A column added after this file's schema is BACKFILLED with the value that is true of
+        # a file written before the feature existed; anything else absent is still a refusal.
+        fill = {c: WINDOW_SCHEMA_BACKFILL[c] for c in want
+                if c not in f and c in WINDOW_SCHEMA_BACKFILL}
+        absent = [c for c in want if c not in f and c not in fill]
         if absent:
             raise ValueError(f"{path} has no column(s) {absent}")
         for key in want:
+            if key in fill:
+                value, dtype = fill[key]
+                data[key] = np.full(n, value, dtype=dtype)
+                continue
             data[key] = f[key][:n]
         for key, raw in f.attrs.items():
             if key in ("schema_version", "num_windows", "num_windows_written"):
@@ -782,6 +1119,13 @@ class RolloutEpisodeTracker:
         self._next_uid = int(n)
         self.armed = False
         self.harvested = 0
+        #: Episodes each env has completed NATURALLY (the end-of-run flush does not count).
+        #: A rollout that stops on a total episode count stops as soon as the fastest
+        #: episodes have finished, which under a per-episode speed draw selects the shortest
+        #: ones and discards every slow episode still in flight. Stopping instead once EVERY
+        #: env has completed the same number makes the collected set a complete design over
+        #: (env, round) whose membership does not depend on how long an episode took.
+        self.completed_per_env = np.zeros(n, dtype=np.int64)
         self._term_names: list[str] = []
 
     # ------------------------------------------------------------------
@@ -811,6 +1155,7 @@ class RolloutEpisodeTracker:
     # ------------------------------------------------------------------
     def __call__(self, env, env_ids, **kwargs):
         """Harvest the ending episodes, then delegate to the real clip reset."""
+        self._latch_goal_termination(env)
         if self.armed and env_ids is not None and len(env_ids) > 0:
             self._harvest(env, env_ids)
         self.armed = True
@@ -821,8 +1166,41 @@ class RolloutEpisodeTracker:
         self._refresh_goal(env, env_ids)
         return out
 
+    def _latch_goal_termination(self, env) -> None:
+        """OR this step's goal TERMINATION into the accumulator, before anything harvests.
+
+        HERE, and not after ``env.step`` returns. The harvest runs inside this very reset
+        hook -- ``env.step`` calls it -- so a latch applied after ``env.step`` returns lands
+        on the accumulator of the episode that has just BEGUN. Measured, on the wall course:
+        each env's first episode read ``reached_goal`` 0.0000 and every later one carried its
+        predecessor's outcome, against an identical ``min_dist_to_goal_m``, identical
+        ``steps_survived`` and an identical fall rate. Nothing else in the row moved, which is
+        what made it look like a policy that cannot stop rather than an off-by-one episode.
+
+        The damage is worst in exactly the reduction this repo reports: FIRST-PER-ENV has no
+        predecessor to inherit from, so it reads a flat zero, while the all-episode mean is
+        only diluted by one episode in N and still looks plausible.
+
+        Safe to read after the auto-reset: ``TerminationManager.reset`` clears the class
+        terms' own counters but never ``_term_dones``, which is what ``get_term`` returns and
+        which still describes the step just taken.
+
+        A no-op unless ``attach_goal_termination`` named a term, which only a course with a
+        dwell rule does.
+
+        Args:
+            env: The unwrapped env, for its termination manager.
+        """
+        name = getattr(self.accum, "_goal_term_name", None)
+        if name is None:
+            return
+        self.accum.note_goal_termination(env.termination_manager.get_term(name))
+
     def _refresh_goal(self, env, env_ids) -> None:
         """Re-resolve the goal anchor and per-family tolerances for the envs that reset."""
+        # Before the goal-spec early return: the spawn height describes the RUN, not the
+        # scoring, so a rollout with no goal spec attached must still record it.
+        self.accum.record_spawn_z(env_ids)
         if getattr(self.accum, "_gr", None) is None:
             return
         if self.goal_spec is not None and self.family_codes is not None:
@@ -877,8 +1255,16 @@ class RolloutEpisodeTracker:
         clip_ids = cmd.clip_id.detach().to("cpu").numpy().astype(np.int64)[ids_np]
         lib = cmd.manager.lib
         tid = getattr(lib, "terrain_id", None)
-        terrain = (tid.detach().to("cpu").numpy()[clip_ids].astype(np.int64)
-                   if tid is not None and tid.numel() else np.full(ids_np.size, -1))
+        if tid is not None and tid.numel():
+            terrain = tid.detach().to("cpu").numpy()[clip_ids].astype(np.int64)
+        else:
+            # A CLIP-FREE library has no per-clip tile table, but the env is still standing on
+            # a tile and the importer knows which. Without this the column is -1 on every row
+            # and the tile an episode ran on -- which on the free-form terrain IS its initial
+            # condition -- is unrecoverable from the table.
+            env_tid = getattr(getattr(env.scene, "terrain", None), "env_terrain_id", None)
+            terrain = (env_tid.detach().to("cpu").numpy()[ids_np].astype(np.int64)
+                       if env_tid is not None else np.full(ids_np.size, -1))
         fam = (self.family_codes.detach().to("cpu").numpy()[clip_ids]
                if self.family_codes is not None else np.zeros(ids_np.size))
 
@@ -917,10 +1303,21 @@ class RolloutEpisodeTracker:
             # means "never".
             "spawned_in_goal": (red["first_goal_step"] == 1).astype(np.uint8),
             "goal_travel_m": travel,
+            "spawn_base_z_w": self.accum.spawn_z[ids].detach().to("cpu").numpy(),
         })
         self.harvested += ids_np.size
+        if not censored:
+            np.add.at(self.completed_per_env, ids_np, 1)
         self.accum.reset_envs(ids)
         self.reissue(ids)
+
+    def rounds_complete(self) -> int:
+        """How many episodes EVERY env has finished -- the number of complete rounds.
+
+        Returns:
+            ``min`` over envs of the naturally-completed episode count.
+        """
+        return int(self.completed_per_env.min()) if self.completed_per_env.size else 0
 
     def reissue(self, ids: torch.Tensor) -> None:
         """Give ``ids`` fresh identities: a new uid each, and a re-plan index back at 0.

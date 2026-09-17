@@ -53,11 +53,6 @@ import numpy as np
 #: projected_gravity_b(3). Pinned by ``rollout_outcomes.PROPRIO_DIM``.
 PROPRIO_DIM = 64
 
-#: Height-scan fold. ``transforms.scan_grid_shape(0.1, [1.5, 1.0], "xy")`` -> ``(n_y, n_x)``,
-#: the row-major fold of the y-outer/x-inner cast ``Robot.compute_height_scan`` returns. The
-#: grid is NOT square, so a transposed fold fails loudly here -- unlike the privileged 121x121
-#: scan, where it is shape-silent.
-SCAN_HW = (11, 16)
 
 
 class ProprioRing:
@@ -167,9 +162,9 @@ def twist_yaw(root_quat_xyzw: np.ndarray, lin_vel_w: np.ndarray,
 
 @dataclass
 class CriticInputs:
-    """The seven raw arrays a :class:`FailureCritic` consumes, batch of 1.
+    """The seven raw arrays a :class:`ValueCritic` consumes, batch of 1.
 
-    Raw means PRE-normalizer: :meth:`FailureCritic.p_fail` applies the generator's own
+    Raw means PRE-normalizer: :meth:`ValueCritic.value` applies the generator's own
     ``state_norm`` / ``extero_norm`` / ``cmd_norm`` itself, exactly as ``fit_value._batch``
     does.  Handing it an already-normalized array is the port's most likely silent failure and
     is why :meth:`from_runtime` exists.
@@ -179,8 +174,6 @@ class CriticInputs:
         extero: ``(T, K)`` or flat -- the exteroception row it was served.
         cmd_future: ``(F, cmd_dim)`` UNSTRIDED future command; striding is applied downstream.
         history_null: True while the ring had not filled.
-        scan: ``(11, 16)`` privileged height scan, or ``None``.
-        proprio: ``(10, 64)`` proprioception ring, newest last, or ``None``.
         goal: ``(3,)`` downrange / lateral / height error, METRES (scaled downstream).
         twist: ``(6,)`` yaw-frame base twist, linear then angular.
     """
@@ -191,8 +184,6 @@ class CriticInputs:
     history_null: bool
     goal: np.ndarray
     twist: np.ndarray
-    scan: np.ndarray | None = None
-    proprio: np.ndarray | None = None
 
     @classmethod
     def from_runtime(cls, policy, robot, state: dict, *, anchor: np.ndarray,
@@ -212,8 +203,11 @@ class CriticInputs:
             robot: The ``transfer.sim.robot.Robot``, for the height-scan cast.
             state: The dict ``build_state`` produced for this step.
             anchor: ``(3,)`` goal anchor in MuJoCo world coords (:mod:`goal_anchor`).
-            ring: The proprioception ring, or ``None`` for a non-privileged critic.
-            want_scan: Cast the 176-ray height scan (privileged critic only).
+            ring: Accepted and IGNORED -- the critic has no proprio tokens. Kept so
+                existing callers still run; the ring itself is still pushed by
+                ``CriticScorer`` because it costs nothing and mirrors the recorder.
+            want_scan: Accepted and IGNORED -- the critic has no scan trunk to feed. Kept
+                in the signature so existing callers still run.
 
         Returns:
             The assembled inputs.
@@ -229,16 +223,9 @@ class CriticInputs:
         cmd_future = np.asarray(plan["future_cmd"], dtype=np.float32).reshape(
             -1, int(np.asarray(plan["future_cmd"]).shape[-1]))
 
-        scan = None
-        if want_scan:
-            # `state["root_quat"]` is XYZW -- `build_state` stores wxyz_to_xyzw(qpos[3:7])
-            # (gen_tracker_runner.py:239) and `compute_height_scan` wants exactly that, which
-            # is why it is passed through unconverted here and converted below.
-            clr, _ = robot.compute_height_scan(state["root_pos"], state["root_quat"])
-            # -inf for a miss, matching the Isaac recording; `transforms.sanitize_extero`
-            # downstream is what maps it into the band. A finite fill here would be a second,
-            # disagreeing sanitiser.
-            scan = np.where(np.isnan(clr), -np.inf, clr).astype(np.float32).reshape(*SCAN_HW)
+        # No height-scan cast. This used to call `robot.compute_height_scan` -- ~20 ms of
+        # per-ray MuJoCo work every scored re-plan -- to feed the critic's scan trunk, which
+        # is gone. `want_scan` is accepted and ignored so existing callers still run.
 
         return cls(
             history=hist, extero=extero, cmd_future=cmd_future,
@@ -247,8 +234,6 @@ class CriticInputs:
             # No conversion: state["root_quat"] and deploy.quat_math_np are both XYZW.
             twist=twist_yaw(state["root_quat"],
                             state["root_lin_vel_w"], state["root_ang_vel_w"]),
-            scan=scan,
-            proprio=(None if ring is None else ring.buf.copy()),
         )
 
 
@@ -268,8 +253,13 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-class FailureCritic:
-    """A trained ``P(fail)`` head, loaded for inference in the MuJoCo process.
+class ValueCritic:
+    """A trained ``V(s)`` head, loaded for inference in the MuJoCo process.
+
+    Named ``ValueCritic`` because that is what it returns. It was ``FailureCritic`` and
+    returned ``P(fail | s)`` from a survival head that no longer exists -- the fine-tune drops
+    that head's loss, so no reported result used it. **The sign of every comparison against
+    this score is therefore inverted from the old one**: high is good.
 
     Args:
         ckpt: A ``fit_value.py`` checkpoint (``V_priv.fold0.pt`` and friends).
@@ -337,32 +327,44 @@ class FailureCritic:
         # rather than today's default re-resolved onto an older artifact, which is the trap
         # CLAUDE.md records for `extero_clip`, `attention_mode` and `skip_families`.
         self.goal_context = bool(ck.get("goal_context", True))
+        #: Whether the critic's context token carries the worst-terrain-penalty-so-far block.
+        #: Read from the checkpoint and never assumed: such a fit is one block WIDER, so a
+        #: check omitting the flag rejects a good critic -- and, if the widths ever coincided,
+        #: would accept a wrong one.
+        self.worst_penalty_context = bool(ck.get("worst_penalty_context", False))
         self.ctx = online.load_fm_context(use, device=device)
-        # The QUALITY head's width has to be known BEFORE the load, because the head is built
-        # by the ctor and `load_state_dict` is strict. Preference order, and the fallback is
-        # not a guess: `quality_support` is a persistent buffer of exactly `quality_bins` bin
-        # centres, so an unstamped checkpoint still STATES its own width -- it just states it
-        # in the tensor rather than in a scalar. Stamped is better only because it also
-        # carries the spec, which no shape can recover.
-        self.quality_bins = int(ck.get("quality_bins", 0)) or int(
-            ck["model"]["quality_support"].numel() if "quality_support" in ck["model"] else 0)
+        # ONE head. The critic used to carry a survival head predicting P(fail|s) alongside
+        # a value head, and this wrapper had to know the value head's bin count BEFORE the
+        # load because `load_state_dict` is strict. Both the second head and the
+        # distributional form of this one are gone -- the fine-tune dropped the survival loss,
+        # so no reported result used it -- leaving a scalar regression with nothing to size.
+        # Checkpoints fitted before that cut do not load, by design.
         self.model = value.FlowValueModel(
             copy.deepcopy(self.ctx.model),
-            scan_hw=(tuple(ck["scan_hw"]) if self.privileged else None),
-            proprio_dim=(int(ck["proprio_hw"][-1]) if self.privileged else 0),
-            proprio_steps=(int(ck["proprio_hw"][0]) if self.privileged else 0),
-            context_dim=int(ck["context_dim"]),
-            quality_bins=self.quality_bins).to(device)
+            context_dim=int(ck["context_dim"])).to(device)
         # The stamp against the width the two flags imply. `load_state_dict` checks the
         # checkpoint against the MODEL and both come from `context_dim`, so it cannot see a
         # stamp that disagrees with them -- and the failure mode is not a shape error but a
         # linear layer reading the twist out of the goal's columns.
+        if self.worst_penalty_context:
+            # A critic fitted with `--worst_context` reads the worst terrain penalty seen so
+            # far in the episode, and NOTHING on this path computes a terrain penalty -- there
+            # is no grader in this loop and no running worst to hand it. Refused here, at load,
+            # rather than at the context builder: the builder would report a missing piece,
+            # which reads as a bug in this file instead of as the missing plumbing it is.
+            raise SystemExit(
+                f"{os.path.basename(ckpt)} was fitted with --worst_context, whose context "
+                "block is the worst terrain penalty BEFORE each chunk. This consumer has no "
+                "terrain grader and cannot supply it. Fit the critic without --worst_context "
+                "to score it here, or add a running worst-penalty accumulator to this path.")
         want = value.context_width(privileged=self.privileged,
-                                   goal_context=self.goal_context)
+                                   goal_context=self.goal_context,
+                                   worst_penalty_context=self.worst_penalty_context)
         if int(ck["context_dim"]) != want:
             raise ValueError(
                 f"{os.path.basename(ckpt)} stamps context_dim={int(ck['context_dim'])} but "
-                f"privileged={self.privileged} + goal_context={self.goal_context} build "
+                f"privileged={self.privileged} + goal_context={self.goal_context} + "
+                f"worst_penalty_context={self.worst_penalty_context} build "
                 f"{want}. One of the three is wrong, and every combination of the other two "
                 "produces a context vector that is finite, plausible and reading the wrong "
                 "columns.")
@@ -379,52 +381,32 @@ class FailureCritic:
             self.tracking_spec = TrackingErrorSpec.from_dict(dict(ck["tracking_spec"]))
         self.gamma = float(ck.get("gamma", 0.0)) or (
             float(self.tracking_spec.gamma) if self.tracking_spec is not None else 0.0)
-        self.scan_hw = tuple(ck["scan_hw"]) if self.privileged else None
-        if self.privileged and self.scan_hw != SCAN_HW:
-            raise ValueError(f"critic expects scan {self.scan_hw}, this port casts {SCAN_HW}")
+        # No scan-fold agreement check. It compared the checkpoint's stamped `scan_hw`
+        # against this port's cast, because 176 rays is both 11x16 and 16x11 and a transposed
+        # grid is scrambled input to a convolution. There is no convolution and no cast now.
 
-    @property
-    def has_quality(self) -> bool:
-        """Whether this checkpoint carries a quality head at all."""
-        return self.quality_bins > 0
+    def value(self, x: CriticInputs) -> float:
+        """``V(s)`` for one state -- the expected normalized return, larger is better.
 
-    def p_fail(self, x: CriticInputs) -> float:
-        """Failure probability for one state.
+        This replaces ``p_fail`` and ``read``. The critic had two heads: a survival head
+        returning ``P(fail | s)`` in [0, 1] and a value head returning the return; ``read``
+        existed to get both from ONE encoder pass, because the borrowed layer stack is ~97% of
+        the parameters and reading it twice doubled the cost for nothing.
 
-        Args:
-            x: The raw inputs.
-
-        Returns:
-            ``P(fail)`` in [0, 1].
-        """
-        import torch  # noqa: PLC0415
-
-        with torch.no_grad():
-            return float(self.model.p_fail(self._inputs(x)).item())
-
-    def read(self, x: CriticInputs) -> tuple[float, float | None]:
-        """Both heads for one state, from ONE encoder pass.
-
-        What the selector calls. Two separate calls would run the borrowed layer stack twice
-        over identical tokens, and the stack is ~97% of the parameters and essentially all of
-        the cost -- so reading the second head is free and reading it separately is not.
+        With one head there is one number and nothing to amortise. **The sign is the opposite
+        of what it replaced**: a HIGH value is good, where a high ``p_fail`` was bad, so any
+        caller ordering candidates has to flip its comparison rather than swap the call.
 
         Args:
             x: The raw inputs.
 
         Returns:
-            ``(P(fail), G_hat)``, the second ``None`` if this checkpoint has no quality head.
+            ``V(s)``, unbounded -- deliberately not squashed into [0, 1]. It is a regression
+            of the return, and an out-of-range prediction is information about the fit.
         """
         import torch  # noqa: PLC0415
-
         with torch.no_grad():
-            v = self._inputs(x)
-            fail_logit, q_logits = self.model.heads(v)
-            p = float(torch.sigmoid(fail_logit).item())
-            if q_logits is None:
-                return p, None
-            probs = torch.softmax(q_logits, dim=-1)
-            return p, float((probs * self.model.quality_support).sum(dim=-1).item())
+            return float(self.model.quality(self._inputs(x)).item())
 
     def _inputs(self, x: CriticInputs):
         """Normalize and assemble one state into a ``value.ValueInputs``.
@@ -453,34 +435,32 @@ class FailureCritic:
         if ctx.cmd_dim > 0:
             steps = torch.as_tensor(ctx.cmd_steps, dtype=torch.long, device=self.device)
             cmd = ctx.cmd_norm.normalize(t(x.cmd_future)[:, steps, :])
-        scan = proprio = None
-        if self.privileged:
-            if x.scan is None or x.proprio is None:
-                raise ValueError(f"{self.variant} is privileged and needs both a height scan "
-                                 "and a proprioception ring; got "
-                                 f"scan={x.scan is None and 'None' or 'ok'}, "
-                                 f"proprio={x.proprio is None and 'None' or 'ok'}")
-            scan = transforms.sanitize_extero(t(x.scan), "height_scan").reshape(1, *SCAN_HW)
-            proprio = t(x.proprio)
+        # No scan and no proprio. The critic's scan trunk and proprio tokens are gone, so
+        # neither is normalised here and `privileged` no longer gates a token stream -- it
+        # decides the TWIST block's width alone (the full base twist against the
+        # onboard-observable angular half), which is what it always meant for the context.
         tw = np.asarray(x.twist, dtype=np.float32)
         # ONBOARD keeps only the ANGULAR half: an IMU measures body rates, but nothing on the
         # robot measures the linear half without odometry. Slicing it away is what makes the
         # two variants' gap a statement about information rather than about architecture.
-        blocks = [tw if self.privileged else tw[3:]]
+        # `value.build_context` owns the order -- the same call the fit makes, so this reader
+        # and the process that trained the checkpoint cannot disagree about which column is
+        # which. Built as tensors rather than numpy for that reason.
+        pieces = {"twist": t(np.asarray(tw, dtype=np.float64))}
         if self.goal_context:
-            # PREPENDED, matching `fit_value._batch`: the goal owns columns 0:3.
-            blocks.insert(0, np.nan_to_num(
+            pieces["goal"] = t(np.nan_to_num(
                 np.asarray(x.goal, dtype=np.float64) / GOAL_SCALE_M,
                 nan=0.0, posinf=0.0, neginf=0.0))
-        context = t(np.concatenate(blocks))
+        context = value.build_context(privileged=self.privileged,
+                                      goal_context=self.goal_context, **pieces)
         return value.ValueInputs(
             history=hist, extero=ext, cmd_tokens=cmd,
             history_null=t(np.array([x.history_null]), torch.bool).reshape(1),
-            scan=scan, proprio=proprio, context=context)
+            context=context)
 
 
 class CriticScorer:
-    """Drives a :class:`FailureCritic` from inside ``runner.run_episode``.
+    """Drives a :class:`ValueCritic` from inside ``runner.run_episode``.
 
     Passed as that function's ``probe``.  It owns the proprioception ring because the ring
     runs at the CONTROL rate while the critic is only read at a re-plan, so the two cadences
@@ -499,7 +479,7 @@ class CriticScorer:
             depending on family (see :mod:`goal_anchor`).
     """
 
-    def __init__(self, critic: FailureCritic, anchor, robot) -> None:
+    def __init__(self, critic: ValueCritic, anchor, robot) -> None:
         if anchor is None:
             raise ValueError(
                 "this course carries no goal_anchor_xyz, so the critic's three goal features "
@@ -511,7 +491,7 @@ class CriticScorer:
         self.anchor = np.asarray(anchor, dtype=np.float64)
         self.robot = robot
         self.ring = ProprioRing() if critic.privileged else None
-        self.p_fail: list[float] = []
+        self.value: list[float] = []
         self.replan_step: list[int] = []
         self._step = 0
 
@@ -524,7 +504,7 @@ class CriticScorer:
         """
         if self.ring is not None:
             self.ring.invalidate()
-        self.p_fail.clear()
+        self.value.clear()
         self.replan_step.clear()
         self._step = 0
 
@@ -544,7 +524,7 @@ class CriticScorer:
             x = CriticInputs.from_runtime(
                 policy, robot, state, anchor=self.anchor, ring=self.ring,
                 want_scan=self.critic.privileged)
-            self.p_fail.append(self.critic.p_fail(x))
+            self.value.append(self.critic.value(x))
             self.replan_step.append(self._step)
         self._step += 1
 
@@ -558,9 +538,13 @@ class CriticScorer:
         Returns:
             ``{}`` when nothing was scored, else the aggregates.
         """
-        if not self.p_fail:
+        if not self.value:
             return {}
-        p = np.asarray(self.p_fail, dtype=np.float64)
-        return {"p_fail_mean": float(p.mean()), "p_fail_max": float(p.max()),
-                "p_fail_first": float(p[0]), "p_fail_last": float(p[-1]),
-                "n_critic_calls": int(p.size)}
+        v = np.asarray(self.value, dtype=np.float64)
+        # `min` where this used to report `max`: the quantity flipped from P(fail), where the
+        # worst moment of an episode is the LARGEST, to V(s), where it is the smallest. A
+        # summary that kept reporting `max` would name the episode's best moment while every
+        # reader took it for its worst.
+        return {"value_mean": float(v.mean()), "value_min": float(v.min()),
+                "value_first": float(v[0]), "value_last": float(v[-1]),
+                "n_critic_calls": int(v.size)}

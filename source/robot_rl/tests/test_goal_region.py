@@ -293,6 +293,11 @@ class _FakeManager:
 class _FakeCmd:
     """Just enough of MotionSequenceCommand for goal_anchor_step."""
 
+    #: `last_usable_step` and `goal_anchor_world` dispatch on this: a manifest-only library
+    #: has no clip to read a terminal pose from and resolves its goal off the route instead.
+    #: These tests are about the CLIP anchor, so the clip branch is the one under test.
+    has_clips = True
+
     def __init__(self, traj, clip_len, clip_id, frame_yaw=0.0):
         self.manager = _FakeManager(traj, clip_len)
         self.clip_id = clip_id

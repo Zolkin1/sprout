@@ -254,3 +254,63 @@ TEST_F(PolicyParamsFixture, TheCameraContractCarriesItsIntrinsicsAndNominalMount
 
 }  // namespace
 }  // namespace g1_deploy
+
+// ---------------------------------------------------------------------------------------
+// CameraKey: the rule two artifacts match cameras by.
+//
+// This is the C++ half of `transfer/deploy/depth_obs.camera_key`, which is the oracle. The
+// rig match used raw `obs_term` instead, and that refused every correctly exported SUBSET
+// pair -- the shipped shape, where the tracker reads the near camera and the generator reads
+// both. The tracker's term is `depth_near`; the generator's is `fm_depth_near`, because
+// `install_fm_depth_group` prefixes its own sampling of a lens. They name ONE lens.
+//
+// The failure mode is what makes this worth pinning: the python runtime matched on the key,
+// so `export_to_hardware.py` validated the pair and uploaded it, and only the C++ controller
+// refused -- arming and disarming once per tick, with the robot never under control.
+
+TEST(CameraKey, PrefersTheSensorNameOverTheObsTerm) {
+  g1_deploy::DepthCameraSpec cam;
+  cam.sensor = "depth_camera_near";
+  cam.obs_term = "depth_near";
+  EXPECT_EQ(g1_deploy::CameraKey(cam), "depth_camera_near");
+}
+
+TEST(CameraKey, FallsBackToTheObsTermWhenNoSensorIsCarried) {
+  g1_deploy::DepthCameraSpec cam;
+  cam.obs_term = "depth_near";
+  EXPECT_EQ(g1_deploy::CameraKey(cam), "depth_near");
+}
+
+TEST(CameraKey, StripsTheGeneratorsSamplingPrefix) {
+  g1_deploy::DepthCameraSpec cam;
+  cam.obs_term = "fm_depth_near";
+  EXPECT_EQ(g1_deploy::CameraKey(cam), "depth_near");
+}
+
+TEST(CameraKey, TheV6gSubsetPairAgreesOnEverySharedLens) {
+  // Exactly what the two artifacts carry, read off the exported ONNX metadata.
+  g1_deploy::DepthCameraSpec tracker_near;
+  tracker_near.sensor = "depth_camera_near";
+  tracker_near.obs_term = "depth_near";
+
+  g1_deploy::DepthCameraSpec gen_near;
+  gen_near.sensor = "depth_camera_near";
+  gen_near.obs_term = "fm_depth_near";
+
+  g1_deploy::DepthCameraSpec gen_far;
+  gen_far.sensor = "depth_camera_far";
+  gen_far.obs_term = "fm_depth_far";
+
+  EXPECT_EQ(g1_deploy::CameraKey(tracker_near), g1_deploy::CameraKey(gen_near))
+      << "the tracker's near camera must resolve to the generator's near camera; comparing "
+         "raw obs_terms is what disarmed the controller on every tick";
+  EXPECT_NE(g1_deploy::CameraKey(tracker_near), g1_deploy::CameraKey(gen_far))
+      << "near must not match far -- that is the transposed-camera trap, and it loads clean";
+}
+
+TEST(CameraKey, APrefixOnlyInTheMiddleIsNotStripped) {
+  // `rfind(prefix, 0)` is a PREFIX test; `find` would strip an interior match.
+  g1_deploy::DepthCameraSpec cam;
+  cam.obs_term = "depth_fm_near";
+  EXPECT_EQ(g1_deploy::CameraKey(cam), "depth_fm_near");
+}

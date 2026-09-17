@@ -52,7 +52,7 @@ def test_the_margin_reads_the_SHORT_tail_not_the_spread():
     """
     overshooting = np.full(200, +3.0)          # every episode ends 3 m PAST the endpoint
     zeros = np.zeros(200)
-    fit = bgr._fit_family(overshooting, zeros, zeros, 0.99, 0.5)
+    fit = bgr._fit_family(overshooting, zeros, zeros, 0.99, 0.5, height_pad=0.1)
     assert fit["fitted_q_short_m"] == pytest.approx(0.0)
     # The margin's pad is its OWN, small, one -- the 0.5 m lateral pad must not reach it.
     assert fit["approach_margin_m"] == pytest.approx(bgr.DEFAULT_MARGIN_PAD_M)
@@ -74,7 +74,7 @@ def test_one_outlier_does_not_set_a_familys_band():
     """
     lat = np.zeros(1000)
     lat[0] = 25.0                                              # one wild episode
-    fit = bgr._fit_family(np.zeros(1000), lat, np.zeros(1000), 0.99, 0.5)
+    fit = bgr._fit_family(np.zeros(1000), lat, np.zeros(1000), 0.99, 0.5, height_pad=0.1)
     assert fit["half_width_m"] < 2.0, "one outlier dragged the whole band out"
 
 
@@ -94,16 +94,35 @@ def test_floors_stop_a_tight_clip_arm_producing_an_unreachably_small_region():
 
 def test_the_pad_only_ever_widens():
     zeros, spread = np.zeros(500), np.linspace(-3.0, 3.0, 500)
-    no_pad = bgr._fit_family(zeros, spread, zeros, 0.99, 0.0)
-    padded = bgr._fit_family(zeros, spread, zeros, 0.99, 0.5)
+    no_pad = bgr._fit_family(zeros, spread, zeros, 0.99, 0.0,
+                         margin_pad=0.0, height_pad=0.0)
+    padded = bgr._fit_family(zeros, spread, zeros, 0.99, 0.5, height_pad=0.1)
     assert padded["half_width_m"] > no_pad["half_width_m"]
 
 
 def test_the_height_band_is_two_sided():
     """A tile family that ends BELOW its clip datum needs the band on that side too."""
     below = np.full(300, -0.4)
-    fit = bgr._fit_family(np.zeros(300), np.zeros(300), below, 0.99, 0.1)
-    assert fit["height_tol_m"] == pytest.approx(0.5)
+    fit = bgr._fit_family(np.zeros(300), np.zeros(300), below, 0.99, 0.5, height_pad=0.1)
+    assert fit["height_tol_m"] == pytest.approx(0.5)       # |−0.4| + 0.1 vertical pad
+
+
+def test_the_vertical_pad_is_not_the_horizontal_one():
+    """A stair riser is 0.13-0.18 m, so the downrange number cannot be reused vertically.
+
+    Measured on the v6g clip arm, the tracker's own height error at the goal is 0.040-0.072 m.
+    Padding that with the horizontal 0.5 m produced a 0.54-0.57 m tolerance -- three to four
+    steps, so a robot most of a flight below the goal scored as arrived, on exactly the
+    families the eval exists to separate. The two pads were one parameter until this test.
+    """
+    hz = np.full(300, 0.05)                       # the tracker's real vertical error
+    wide = bgr._fit_family(np.zeros(300), np.zeros(300), hz, 0.99, 0.5, height_pad=0.5)
+    split = bgr._fit_family(np.zeros(300), np.zeros(300), hz, 0.99, 0.5, height_pad=0.1)
+    assert wide["height_tol_m"] > 0.5, "the collapsed-pad behaviour, kept here as the contrast"
+    assert split["height_tol_m"] < 0.18, "a height tolerance must stay inside one riser"
+    # The horizontal axes are untouched by the split -- that is the whole point of the asymmetry.
+    assert split["half_width_m"] == pytest.approx(wide["half_width_m"])
+    assert split["approach_margin_m"] == pytest.approx(wide["approach_margin_m"])
 
 
 def test_fitting_from_a_generator_arm_is_refused(tmp_path):

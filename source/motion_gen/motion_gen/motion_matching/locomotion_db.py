@@ -23,7 +23,7 @@ from ..ingest.bones_ingest import load_cache
 from ..ingest.clean_ingest import _resolve_dir, ingest_clean_library
 from .dp import DPConfig, DPMatcher
 from .graph import _GRAPH_CACHE_VERSION, CandidateGraph, GraphConfig, build_candidate_graph, graph_cache_path
-from .vanilla import POSE_POSTURAL_IDX, VanillaConfig
+from .vanilla import POSE_POSTURAL_IDX, VanillaConfig, VanillaMatcher
 
 # FLAT-locomotion bones filter: keep walking/jogging/running/turning on the feet; DROP everything that
 # leaves flat ground (``climbing box`` / jumps / stairs / obstacles).  Backward + sidestep + turning are
@@ -48,11 +48,13 @@ APPROACH_FILTERS = {
 
 def build_locomotion_matcher(*, bones_cache: str, clean_source: str, clean_hf_repo: str | None = "zolkin/robot_rl",
                              bones_limit: int | None = None, leadin_limit: int | None = None,
-                             include_leadins: bool = True, dt: float = 0.02, device="cpu",
+                             include_leadins: bool = True, include_clean: bool = True,
+                             dt: float = 0.02, device="cpu",
                              cut_penalty: float = 3.0, w_traj: float = 1.0, w_track: float = 0.0,
                              ground_penalty: float = 12.0, max_pelvis_z: float = 0.95,
                              graph_k_min: int = 25, graph_k_max: int = 50, graph_k_target: int = 40,
-                             use_graph_cache: bool = True, log=print) -> DPMatcher:
+                             use_graph_cache: bool = True, matcher_kind: str = "dp",
+                             log=print) -> DPMatcher | VanillaMatcher:
     """Build the shared locomotion :class:`DPMatcher` (union DB + candidate graph, categorised).
 
     ``include_leadins=False`` skips the lead-in load entirely (flat/stairs/distractor never need it);
@@ -60,20 +62,53 @@ def build_locomotion_matcher(*, bones_cache: str, clean_source: str, clean_hf_re
     DP cost weights (``cut_penalty`` / ``w_traj`` / ...) do not affect the DB or graph -- only matching
     at generate time -- so passing family-specific weights keeps the library identical across families.
 
+    ``include_clean=False`` drops the clean(library_v2) steady strides, leaving the bones ALONE.
+    Those strides are our own trajectory-optimized solutions, so a baseline that keeps them is
+    searching a pool that contains our steady-state library -- generous, and the right default for
+    a matcher-vs-matcher comparison, but it confounds any claim of the form "motion matching over
+    MOCAP does X".  Turning it off is how that arm is run.  It is folded into the graph cache key,
+    so a bones-only DP run cannot load a with-clean graph.
+
+    ``matcher_kind`` picks the SEARCH over that one DB.  ``"dp"`` (default) is the exact backward
+    dynamic program every live generator uses.  ``"vanilla"`` is the greedy local-lookahead matcher
+    -- the standard real-time motion-matching baseline -- and is offered for the paper ablation, so
+    both arms are scored over an identical DB and an identical feature space (both take the same
+    ``VanillaConfig``) and differ ONLY in how the path through it is chosen.  Vanilla needs the
+    full-feature KD-tree the DP skips, and uses NO candidate graph, so that build is skipped too.
+
+    **Vanilla cannot honour a per-generate category filter** -- ``allowed_categories`` lives on
+    :class:`DPMatcher`, not on the base class -- so it is refused whenever the DB contains lead-ins,
+    i.e. whenever a filter would have anything to do.  On a ``{flat, clean}`` DB every
+    :data:`APPROACH_FILTERS` entry that may be used is the whole DB, so dropping the filter there is
+    provably a no-op rather than a silently unfiltered match.
+
     ``use_graph_cache`` (default on) content-addresses the candidate graph to
     ``graph_cache_path(...)``: the DB build is deterministic given (bones cache, filters, limits, clean
     lib, lead-in flag), so the first family to run a given DB variant builds the graph and every later
     family loads it instead of rebuilding -- the two variants (with / without lead-ins) get distinct
     keys and never collide.  The matcher itself is always rebuilt (cheap next to the graph).
     """
+    if matcher_kind not in ("dp", "vanilla"):
+        raise ValueError(f"matcher_kind must be 'dp' or 'vanilla', got {matcher_kind!r}.")
+    if matcher_kind == "vanilla" and include_leadins:
+        raise ValueError(
+            "matcher_kind='vanilla' with include_leadins=True: the greedy matcher has no "
+            "allowed_categories, so the lead-ins it must not match could not be filtered out and "
+            "an elevated on-box frame would leak onto flat ground. Vanilla is only available on a "
+            "{flat, clean} DB (include_leadins=False), where no filter has anything to do.")
     log(f"[locomotion_db] flat-locomotion bones (limit={bones_limit}) ...")
     flat, _ = load_cache(bones_cache, filters={"package": "Locomotion",
                          "content_type_of_movement": _FLAT_MOVEMENT, "content_body_position": "standing"},
                          exclude_name_substrings=_FLAT_EXCLUDE, limit=bones_limit, device=device)
     log(f"[locomotion_db]   + {len(flat)} flat bones")
-    log(f"[locomotion_db] clean library {clean_source} ...")
-    clean = ingest_clean_library(clean_source, hf_repo=clean_hf_repo, dt=dt, device=device)
-    log(f"[locomotion_db]   + {len(clean)} clean steady strides (fwd/back/run + sidestep/diagonal/turn)")
+    if include_clean:
+        log(f"[locomotion_db] clean library {clean_source} ...")
+        clean = ingest_clean_library(clean_source, hf_repo=clean_hf_repo, dt=dt, device=device)
+        log(f"[locomotion_db]   + {len(clean)} clean steady strides (fwd/back/run + sidestep/diagonal/turn)")
+    else:
+        clean = []
+        log("[locomotion_db] clean library EXCLUDED (--no-clean-library): bones only, so the DB "
+            "holds no trajectory-optimized motion")
     leadins = []
     if include_leadins:
         leadins, _ = load_cache(bones_cache, filters={"package": "Locomotion"},
@@ -82,16 +117,25 @@ def build_locomotion_matcher(*, bones_cache: str, clean_source: str, clean_hf_re
         log(f"[locomotion_db]   + {len(leadins)} jump lead-ins")
     sources = flat + clean + leadins
     categories = ["flat"] * len(flat) + ["clean"] * len(clean) + ["leadin"] * len(leadins)
+    log(f"[locomotion_db] {matcher_kind} matcher DB: {len(sources)} clips, "
+        f"{sum(s.n for s in sources)} frames")
+    if matcher_kind == "vanilla":
+        # Greedy arm: the same sources and the same VanillaConfig feature space as the DP arm, but
+        # searched with the KD-tree instead of the graph + backward DP.  No graph is built at all.
+        log(f"[locomotion_db] building vanilla full-feature KD-tree ({sum(s.n for s in sources)} frames) ...")
+        return VanillaMatcher(sources, VanillaConfig(dt=dt), device=device, build_tree=True)
+
     dcfg = DPConfig(dt=dt, cut_penalty=cut_penalty, w_traj=w_traj, w_track=w_track,
                     w_ground=ground_penalty, ground_z=0.0, max_pelvis_z=max_pelvis_z)
-    log(f"[locomotion_db] DP matcher DB: {len(sources)} clips, {sum(s.n for s in sources)} frames")
     matcher = DPMatcher(sources, VanillaConfig(dt=dt), dcfg, device=device, categories=categories)
 
     cfg = GraphConfig(k_min=graph_k_min, k_max=graph_k_max, k_target=graph_k_target, dt=dt)
     graph, cache_key = None, None
     if use_graph_cache:
-        cache_key = _graph_cache_key(bones_cache, bones_limit, include_leadins, leadin_limit,
-                                     clean_library_fingerprint(clean_source, clean_hf_repo)["hash"], cfg)
+        cache_key = _graph_cache_key(
+            bones_cache, bones_limit, include_leadins, leadin_limit,
+            clean_library_fingerprint(clean_source, clean_hf_repo)["hash"] if include_clean else None,
+            cfg, include_clean)
         cache_file = graph_cache_path(cache_key)
         graph = CandidateGraph.load(cache_file, expected_key=cache_key)
         if graph is not None:
@@ -112,9 +156,11 @@ def build_locomotion_matcher(*, bones_cache: str, clean_source: str, clean_hf_re
 
 
 def _graph_cache_key(bones_cache: str, bones_limit: int | None, include_leadins: bool,
-                     leadin_limit: int | None, clean_hash: str, cfg: GraphConfig) -> str:
+                     leadin_limit: int | None, clean_hash: str | None, cfg: GraphConfig,
+                     include_clean: bool = True) -> str:
     """Content hash of EVERYTHING the candidate graph depends on: the bones cache file identity, the
-    flat + lead-in filter sets and limits, the clean library content, and the graph params + version.
+    flat + lead-in filter sets and limits, the clean library content AND whether it is in the DB at
+    all, and the graph params + version.
 
     The lead-in flag/filter/limit are folded in so the with-lead-ins graph (box/jump) and the
     without-lead-ins graph (flat/distractor/stairs) get DISTINCT keys and never load each other's."""
@@ -129,6 +175,10 @@ def _graph_cache_key(bones_cache: str, bones_limit: int | None, include_leadins:
         "flat_movement": sorted(_FLAT_MOVEMENT), "flat_exclude": sorted(_FLAT_EXCLUDE),
         "bones_limit": bones_limit,
         "clean_hash": clean_hash,
+        # Folded in SEPARATELY from clean_hash: without it a bones-only DB would key identically to
+        # a with-clean one built from the same library, and the DP would silently load a graph over
+        # clips its DB does not contain.
+        "include_clean": bool(include_clean),
         "include_leadins": bool(include_leadins),
         "leadin_include": sorted(_TERRAIN_INCLUDE), "leadin_exclude": sorted(_TERRAIN_EXCLUDE),
         "leadin_limit": leadin_limit,

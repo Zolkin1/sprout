@@ -264,6 +264,16 @@ class PolicyRuntime {
   bool clip_mode() const { return clip_source_ != nullptr; }
   bool clip_exhausted() const { return clip_source_ != nullptr && clip_source_->exhausted(); }
 
+  /// EVERY camera the deployment publishes, in the order readings must be supplied.
+  ///
+  /// The GENERATOR's list when one is loaded (`fm_meta.extero_spec` -- the only artifact that
+  /// names the whole rig), and the tracker's own in clip playback, where there is no generator
+  /// and the policy's cameras ARE the rig. Since `efe93b4e` the policy reads the near camera
+  /// alone while the generator reads both, so these are different lists and the caller must
+  /// publish the RIG: the tracker then takes its subset by name. Sizing the readings off the
+  /// policy instead is what left the generator's second camera reading as zeros.
+  const std::vector<DepthCameraSpec>& rig_cameras() const;
+
   /// The generator's own metadata: F, D, N, cmd_dim, extero_source. Throws with no fm.onnx.
   const FmMeta& fm_meta() const;
 

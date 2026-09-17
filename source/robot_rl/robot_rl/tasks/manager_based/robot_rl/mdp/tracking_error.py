@@ -78,7 +78,27 @@ class TrackingErrorSpec:
     """
 
     max_lateral_m: float = 0.2
-    max_height_m: float = 0.2
+    #: **0.12, not 0.20, and it is a MEASURED choice rather than a fitted one.**  Watching the
+    #: two-box course showed proper box jump-downs peaking at 0.130-0.182 m against the old
+    #: 0.20 bound -- nowhere near it -- while stairs-down-off-a-box dismounts came close, so
+    #: the bound is being used to separate a correct dismount from the wrong MODE rather than
+    #: to catch a fall.  The cost was measured on the real opening data set before the change
+    #: (`awr_vm30/inc_001`, 2000 parent episodes, DR on): clean arrivals 21.70% -> 16.85% of
+    #: all episodes, and 95.7% -> 93.4% of windows survive a cut at the latch.  Ground-start
+    #: clean arrivals do collapse, 4.18% -> 0.46%, so at this bound every clean success in an
+    #: opening set is a box-top dismount; that scarcity predates the change and is what
+    #: box-top spawns exist for.
+    #:
+    #: **The re-anchoring objection does not apply.**  `base_height_below_termination`'s
+    #: docstring rejects a reference-relative height bound as a FALL detector, because ego
+    #: re-anchoring re-datums the reference every re-plan and a slow sink never accumulates.
+    #: That is right, and it is a different use: this bound is chunk-local by construction, so
+    #: 0.12 m means "within one re-plan the robot went 12 cm from where the plan put it",
+    #: which is a plan-vs-robot disagreement and not a sink.
+    #:
+    #: Still `bootstrap: True` -- nothing has been FITTED, `fit_tracking_thresholds.py` still
+    #: does not exist, and publishing consumers must keep refusing it.
+    max_height_m: float = 0.12
     max_tilt_rad: float = math.radians(30.0)
 
     sigma_pos_m: float = 0.10

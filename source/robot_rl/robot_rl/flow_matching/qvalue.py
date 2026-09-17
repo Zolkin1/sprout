@@ -2,6 +2,25 @@
 
 """``Q(s, a)`` over the generator's own samples: score the CHUNK, not just the state.
 
+**DEPRECATED 2026-09-10, and currently BROKEN. Not a warning about style -- it does not run.**
+
+``Q(s, a)`` borrows its token assembly from :class:`~robot_rl.flow_matching.value.FlowValueModel`
+(``FlowQModel.value_tokens`` calls ``super().value_tokens``), and that critic was cut down to the
+architecture the paper describes: ONE readout token, ONE scalar value head, and no scan or proprio
+token streams. Q therefore lost the exteroception it was fitted with, and ``ValueInputs`` no longer
+accepts ``scan=`` / ``proprio=``.
+
+Left broken deliberately rather than quietly rewired, because reviving it is a RESEARCH decision
+and not a mechanical fix: Q would need its own scan and proprio streams, inserted before its action
+tokens so its own token order is preserved, and every fitted ``Q*.pt`` predates that and would need
+refitting anyway. Doing it silently would re-specify a second experiment as a side effect of a
+documentation goal.
+
+To revive: give ``FlowQModel`` its own scan/proprio encoders and type embeddings (it already owns
+its head, for the same reason), then refit. The best-of-K result this line produced is recorded in
+``oracle-gain-ceiling`` -- one oracle decision was worth +0.0099 of success, which is the number
+that should decide whether reviving it is worth the GPU time.
+
 :class:`~robot_rl.flow_matching.value.FlowValueModel` is ``V(s)`` -- it scores a state.
 Best-of-K needs a ranking over the K chunks drawn from ONE state, which is a question about
 the ACTION, and a state-only critic answers it identically for every candidate.  This adds the
@@ -110,6 +129,19 @@ class FlowQModel(FlowValueModel):
         # 63 is 1.26 s out, and a permutation-invariant read of it would discard the ordering
         # that makes one chunk a step and another a stumble.
         self.action_pos = nn.Parameter(torch.zeros(1, self.action_steps, self.d_model))
+        # Q's OWN head, no longer inherited. `FlowValueModel` used to carry a survival head
+        # (`self.head`, predicting P(fail | s)) which this class read for P(fail | s, a); that
+        # head is gone from V, because the fine-tune drops its loss and no reported result
+        # used it. The question Q answers is still a failure probability, so the head moves
+        # here rather than disappearing -- V is a value regression, Q is a ranking score, and
+        # they were only ever sharing a module by accident of inheritance.
+        # `hidden` MUST match what the inherited head used, or every fitted Q checkpoint
+        # becomes unloadable for a reason nothing states: at the production d_model of 512 a
+        # `d_model // 2` width is (256, 512) against the real (128, 512). Same default, read
+        # from the same kwarg the parent reads.
+        _hidden = int(kw.get("hidden", 128))
+        self.head = nn.Sequential(nn.Linear(self.d_model, _hidden), nn.SiLU(),
+                                  nn.Linear(_hidden, 1))
 
     def value_tokens(self, x) -> torch.Tensor:  # type: ignore[override]
         """The state stream with the action tokens appended.

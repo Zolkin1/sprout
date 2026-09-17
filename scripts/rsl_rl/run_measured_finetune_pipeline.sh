@@ -128,8 +128,8 @@ else
 fi
 
 # ---- 3. advantages from the QUALITY head alone -------------------------------------------
-# --w_fail 0 -> V = 1.0 * G_hat - 0 * P(fail): the quality head only, as asked. The failure
-# head is still fitted and still stamped; it is there for later, not for this label.
+# The critic has ONE head and the advantage is A = G - V, so "quality only" is structural
+# rather than a flag: the survival head that `--w_fail 0` used to switch off is gone.
 # Stratified on all three axes: family is the per-family percentile the labeller already
 # applies, plus equal-count speed bins and normalized-progress (phase) bins.
 LABELS="$CRITIC/labels_top30.npz"
@@ -138,7 +138,6 @@ if run_from label && [ ! -f "$LABELS" ]; then
   "$PY" scripts/flow_matching/label_advantage.py "$CRITIC/predictions.npz" \
       --out "$LABELS" \
       --variant V_priv \
-      --w_fail 0.0 \
       --percentile 70.0 \
       --rollout "$STEM" \
       --speed_bins 3 \

@@ -152,7 +152,9 @@ date
 # Everything above is complete at this point, so this is additive: if it is still running in
 # the morning, kill it and nothing is lost.
 echo "[chain] 7/8 single-critic control"
-fit_and_label "$VAL_F1" 1 --variants V_priv
+# No `--variants`: V_priv is the only critic now, so the flag is gone rather than
+# defaulted -- the non-privileged V_onboard arm was never fitted for a reported result.
+fit_and_label "$VAL_F1" 1
 python scripts/flow_matching/compare_advantage_labels.py \
     "${VAL}/advantage.npz" "${VAL_F1}/advantage.npz" \
     --names cross_fit in_sample 2>&1 | tee "${VAL_F1}/compare.log"

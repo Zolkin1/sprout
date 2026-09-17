@@ -30,7 +30,8 @@ mb_assemble_library = pytest.importorskip("mb_assemble_library")
 
 
 def _plan(*, skill="stairs_up", n=60, entry=5, exit_=50, approach_surf_z=0.15, exit_surf_z=0.90,
-          approach_vx=1.0, exit_vx=1.0, entry_vx=0.62, exit_speed=0.64, approach_s=2.5, exit_s=2.5,
+          approach_vx=1.0, exit_vx=1.0, entry_vx=0.62, exit_speed=0.64,
+          approach_dist=3.75, exit_dist=3.75,
           z_shift=0.0) -> TerrainPlan:
     """A synthetic plan whose replay climbs steadily; ``z_shift`` lifts the whole thing rigidly."""
     q = np.zeros((n, 36), np.float32)
@@ -44,7 +45,8 @@ def _plan(*, skill="stairs_up", n=60, entry=5, exit_=50, approach_surf_z=0.15, e
         entry_frame=entry, exit_frame=exit_,
         approach_surf_z=approach_surf_z + z_shift, exit_surf_z=exit_surf_z + z_shift,
         approach_vx=approach_vx, exit_vx=exit_vx, entry_vx=entry_vx, exit_speed=exit_speed,
-        approach_mode="walk", exit_mode="walk", approach_s=approach_s, exit_s=exit_s,
+        approach_mode="walk", exit_mode="walk",
+        approach_dist=approach_dist, exit_dist=exit_dist,
         meta={"terrain_id": 0, "clip_type": "transition", "has_floor": True},
     )
 
@@ -68,11 +70,13 @@ def test_segment_keys_split_on_what_mb_actually_sees():
     # approach command / ramp target / duration -> different approach segment
     assert mb_plan_library._segment_keys(_plan(approach_vx=2.0), "hard", "hard")[0] != base[0]
     assert mb_plan_library._segment_keys(_plan(entry_vx=1.4), "hard", "hard")[0] != base[0]
-    assert mb_plan_library._segment_keys(_plan(approach_s=3.0), "hard", "hard")[0] != base[0]
+    # The travel BUDGET splits the key, not a duration: the budget is what the generator reaches
+    # for, and the duration is emergent from it and the speed.
+    assert mb_plan_library._segment_keys(_plan(approach_dist=5.0), "hard", "hard")[0] != base[0]
     # exit command / ramp start / duration -> different exit segment
     assert mb_plan_library._segment_keys(_plan(exit_vx=2.0), "hard", "hard")[1] != base[1]
     assert mb_plan_library._segment_keys(_plan(exit_speed=1.2), "hard", "hard")[1] != base[1]
-    assert mb_plan_library._segment_keys(_plan(exit_s=3.0), "hard", "hard")[1] != base[1]
+    assert mb_plan_library._segment_keys(_plan(exit_dist=5.0), "hard", "hard")[1] != base[1]
     # the pin mode changes the generation entirely
     assert mb_plan_library._segment_keys(_plan(), "soft", "hard")[0] != base[0]
     assert mb_plan_library._segment_keys(_plan(), "hard", "soft")[1] != base[1]

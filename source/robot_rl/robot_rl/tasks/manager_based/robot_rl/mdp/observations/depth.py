@@ -36,12 +36,18 @@ actually observes rather than the ones its scene happens to hold.
 """
 
 FM_DEPTH_OBS_GROUP: str = "fm_depth"
-"""Observation group holding the GENERATOR's cameras when it samples at its own resolution.
+"""Observation group holding the GENERATOR's cameras.
 
-A separate group rather than extra terms in ``policy`` for two reasons: the policy's
-observation vector must not change (that is the whole point of decoupling the two), and
-:func:`depth_obs_stack` stacks every depth term it is given into one array, which cannot
-hold images of two different widths. See :func:`fm_depth_groups`.
+Present whenever the generator is in the loop or being recorded, and it covers EVERY depth
+camera on the scene -- which is a strict superset of the policy's, since the policy reads
+the near camera alone (the far one exists to read terrain ahead, which is the generator's
+job). See ``g1_depth_env_cfg.install_fm_depth_group``.
+
+A separate group rather than extra terms in ``policy`` for three reasons: the policy's
+observation vector must not change (that is the whole point of decoupling the two); the two
+camera sets differ; and :func:`depth_obs_stack` stacks every depth term it is given into one
+array, which cannot hold images of two different widths when the generator samples on its
+own grid. See :func:`fm_depth_groups`.
 """
 
 
@@ -277,7 +283,12 @@ def depth_image(
 
     noiser = get_depth_noiser(env, sensor_cfg.name)
     if noiser is not None:
-        d = noiser(d)
+        # ONE PHYSICAL CAMERA, ONE FRAME PER CONTROL STEP. The near camera is read by the
+        # policy's own term AND by the generator's fm_depth term, and a third time by
+        # depth_xyz_stack when the generator unprojects it -- where the hardware hands all
+        # of them one image. The step counter is what ties those calls together; see
+        # DepthNoiser.__call__ for what would otherwise differ between them.
+        d = noiser(d, frame_id=getattr(env, "common_step_counter", None))
     return d
 
 
@@ -321,11 +332,13 @@ def _walk_depth_obs_terms(
 def fm_depth_groups(env: "ManagerBasedRLEnv") -> list[str] | None:
     """The observation group holding the GENERATOR's cameras, or ``None`` if there is none.
 
-    ``None`` means "every group", which is the pre-existing behaviour -- so every consumer
-    that scopes itself with this is a no-op on a task whose FM and policy share one camera
-    pair, and no flag has to be plumbed anywhere to keep it that way. The pair only exists
-    when :func:`~robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg.add_fm_depth_pair`
-    put it there, i.e. when the generator's depth resolution differs from the policy's.
+    ``None`` means "every group". That fallback is now a LAST RESORT rather than the normal
+    path: with the policy reading the near camera alone, a task that forgot to install the
+    group would hand the generator one camera and stamp a one-camera contract into every
+    artifact it produces -- self-consistent, and half blind. ``install_fm_depth_group``
+    therefore installs it unconditionally wherever the generator runs or is recorded, and
+    asserts it covers every camera on the scene. The ``None`` arm survives for tasks that
+    genuinely have no separate generator group (the height-scan paths).
 
     Args:
         env: The environment instance.
@@ -341,7 +354,10 @@ def rl_depth_groups(env: "ManagerBasedRLEnv") -> list[str]:
     """Every observation group EXCEPT the generator's -- i.e. the policy's own cameras.
 
     Not simply ``["policy"]``: the ``-image`` task variant puts the policy's depth in its
-    own per-camera groups, so the policy's cameras are "whatever is not the FM's".
+    own per-camera group, so the policy's cameras are "whatever is not the FM's".
+
+    This is a strict SUBSET of what :func:`fm_depth_groups` resolves to, not the same set
+    seen from another angle: the policy reads the near camera and the generator reads both.
 
     Args:
         env: The environment instance.
@@ -365,10 +381,12 @@ def find_depth_obs_terms(
 
     Args:
         env: The environment instance.
-        groups: Observation groups to search, or ``None`` for all of them. Pass
-            :func:`fm_depth_groups` / :func:`rl_depth_groups` when the task carries both a
-            policy and a generator camera pair at different resolutions -- unscoped, the
-            two would be returned as one list.
+        groups: Observation groups to search, or ``None`` for all of them. SCOPE IT --
+            :func:`fm_depth_groups` for the generator, :func:`rl_depth_groups` for the
+            policy. The two sets differ in which cameras they name (the policy reads the
+            near one alone) and, when the generator samples on its own grid, in which
+            sensors those names resolve to; unscoped, the deduplication silently returns a
+            mixture of both.
 
     Returns:
         ``[(sensor_name, params), ...]``, deduplicated, in observation-group order.

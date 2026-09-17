@@ -336,10 +336,46 @@ def derived_columns(cell: dict, plan: dict,
     if success_rule == "spatial":
         out["reached_goal"] = arrived.astype(float)
         out["min_dist_to_goal_m"] = d["min_dist_to_goal_m"].astype(float)
+        # FALL-ONLY FAMILIES, rescored here rather than at the spec: what changes is the
+        # QUESTION being asked, not the geometry Isaac recorded, so the goal columns stay in
+        # the table (a reader can still see where the robot got to) and are simply not what
+        # success means. Blanking them to NaN is what keeps them out of the spatial averages.
+        # Guarded on BOTH halves: a table with no family column cannot have a family singled
+        # out of it, and that is not an error -- the per-family reduction below is skipped for
+        # the same tables. Reading the column unconditionally made every fixture without one
+        # a KeyError deep inside the success rule.
+        fam_codes = cell["meta"].get("family_codes") or {}
+        code_to_fam = {int(v): k for k, v in fam_codes.items()}
+        fam_of = (np.array([code_to_fam.get(int(c), "?") for c in d["family_code"]])
+                  if fam_codes and "family_code" in d else np.array([], dtype=object))
+        fall_only = (np.isin(fam_of, FALL_ONLY_FAMILIES) if fam_of.size
+                     else np.zeros(len(arrived), dtype=bool))
+        if fall_only.any():
+            upright = (out["fell"] < 0.5) & ~censored
+            for k in ("success", "success_strict", "success_loose"):
+                out[k] = np.where(fall_only, upright.astype(float), out[k])
+            for k in ("reached_goal", "min_dist_to_goal_m"):
+                out[k] = np.where(fall_only, np.nan, out[k])
     return out
 
 
 #: Metrics reported per cell and per family: ``(column, binary?, label)``.
+#: Families scored by the FALL RULE ALONE, in their own pool.
+#:
+#: `flat` has no meaningful goal region and never has. Its clips are 20 s of driving around on
+#: open ground with no terrain feature to reach, so "the end of the clip" is an arbitrary point
+#: on a plane rather than a place the task is about, and a tolerance fitted there measures the
+#: sampler's speed draw and not the policy. Scoring it spatially also imported a failure mode
+#: that reads backwards: a robot that falls early can still DRIFT into the region afterwards,
+#: so `reached_goal` overstates while `success` (arrival BEFORE failing) is the real number,
+#: and the gap between them looks like a goal-region problem when it is simply falling.
+#:
+#: So on these families success is "stayed upright", and they are held OUT of the pooled
+#: spatial rate -- one number, one rule. `--success_rule legacy_temporal` is unaffected: it
+#: has no arrival requirement anywhere.
+FALL_ONLY_FAMILIES: tuple[str, ...] = ("flat",)
+
+
 REPORTED = (
     ("success", True, "success rate"),
     # The pair BESIDE the headline, because what the tracking checks cost is a result in its
@@ -412,8 +448,16 @@ def reduce_cell(cell: dict, plan: dict, args) -> dict:
     # and would NOT be right for a missing primitive -- the difference is that these two are
     # derived, and their absence is already a stated property of the rule in force.
     reported = [(c, b, lbl) for c, b, lbl in REPORTED if c in der]
+    # THE POOLED NUMBER IS ONE RULE. Fall-only families answer a different question ("stayed
+    # upright") from the spatial ones ("got where its reference goes"), and averaging the two
+    # produces a figure whose meaning moves with the family MIX -- change the flat/terrain
+    # ratio in the plan and the headline moves with no policy change at all. So they are held
+    # out here and reported on their own row, which is also why `by_family` below is computed
+    # over every family regardless.
+    spatial_pool = ~np.isin(fam, FALL_ONLY_FAMILIES)
+    out["pooled_excludes"] = sorted(set(fam[~spatial_pool].tolist()))
     for col, binary, _label in reported:
-        out["overall"][col] = _est(col, binary).as_dict()
+        out["overall"][col] = _est(col, binary, spatial_pool).as_dict()
 
     # Terrain completion is only reported where it is not identical to success.
     informative = der["completion_informative"].astype(bool)
@@ -640,16 +684,31 @@ def format_report(reduced: dict) -> str:
         # where they diverge is one where the robot stays up and does not get there, which
         # reads as the same number as falling if only the product is shown.
         spatial = any("reached_goal" in v for v in c["by_family"].values())
-        head = (f"    {'family':<18} {'tiles':>5} {'eps':>6} {'success':>24} ")
+        # BOTH success rules, side by side. They differ only by whether a tracking violation
+        # counts as a failure, and with no tracking columns they are identical BY
+        # CONSTRUCTION -- which is itself worth seeing, because a reader cannot otherwise tell
+        # "the checks cost nothing" from "the checks never ran". `fell` sits beside them for
+        # the same reason `reached goal` does: success is `arrived BEFORE failing`, so a
+        # family where success trails arrival is one that fell on the way, and without the
+        # fall column that reads identically to one that never got there.
+        head = (f"    {'family':<18} {'tiles':>5} {'eps':>6} "
+                f"{'success (strict)':>24} {'success (loose)':>24} {'fell':>24} ")
         head += f"{'reached goal':>24} " if spatial else ""
         a(head + f"{'terrain done':>24} {'progress':>24}")
         for fam in sorted(c["by_family"]):
             f = c["by_family"][fam]
             row = (f"    {fam:<18} {f['n_tiles']:>5} {f['n_episodes']:>6} "
-                   f"{_fmt(f['success']):>24} ")
+                   f"{_fmt(f.get('success_strict', f['success'])):>24} "
+                   f"{_fmt(f.get('success_loose', f['success'])):>24} "
+                   f"{_fmt(f.get('fell')):>24} ")
             row += f"{_fmt(f.get('reached_goal')):>24} " if spatial else ""
             a(row + f"{_fmt(f.get('terrain_completed')):>24} "
               f"{_fmt(f.get('terrain_progress')):>24}")
+        excl = c.get("pooled_excludes") or []
+        if excl:
+            a(f"    {', '.join(excl)}: scored by the FALL rule ('stayed upright'), not by "
+              "arrival, and held OUT of the pooled rate above -- one number, one rule. Its "
+              "goal columns read nan because the region is not what success means there.")
         degen = [k for k, v in c["by_family"].items() if not v["completion_informative"]]
         if degen:
             a(f"    -- : terrain_end_step >= last usable step for every clip of "

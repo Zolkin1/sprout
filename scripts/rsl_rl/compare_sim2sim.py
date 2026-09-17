@@ -188,8 +188,19 @@ def stage_prep(args) -> int:
     os.makedirs(args.out_dir, exist_ok=True)
     scene_dir = os.path.join(_REPO, "transfer", "sim", "robots", "g1")
     summary = {}
-    for case in _CASES:
-        clip_i, tid = _pick_clip(args.lib, case)
+    # An explicit --clip_id builds exactly that ONE case, named by --case, so a clip flagged
+    # elsewhere (e.g. by clip_ab_sweep.py) can be replayed by index. Without it, build the
+    # two heuristic cases as before.
+    if args.clip_id is not None:
+        with h5py.File(args.lib, "r") as f:
+            tid_all = np.asarray(f["terrain_id"][:]).reshape(-1)
+        n = tid_all.shape[0]
+        if not 0 <= args.clip_id < n:
+            raise SystemExit(f"[prep] --clip_id {args.clip_id} out of range (library has {n})")
+        plan = [(args.case, int(args.clip_id), int(tid_all[args.clip_id]))]
+    else:
+        plan = [(c, *_pick_clip(args.lib, c)) for c in _CASES]
+    for case, clip_i, tid in plan:
         lib_out = os.path.join(args.out_dir, f"s2s_{case}.h5")
         info = _write_single_clip_library(args.lib, lib_out, clip_i)
         with h5py.File(lib_out, "r") as f:
@@ -223,20 +234,32 @@ def _cases(out_dir: str) -> dict:
 def stage_isaac(args) -> int:
     """Record the Isaac Lab rollout by delegating to debug_episodes.py."""
     case = _cases(args.out_dir)[args.case]
-    # Both cases run the SAME task: the ClipTerrainImporter builds its mesh from whatever
+    # Every case runs the SAME task: the ClipTerrainImporter builds its mesh from whatever
     # single-clip library ``prep`` wrote, so the flat case gets a flat mesh and the stair
     # case a staircase. Using one task also means the Isaac and MuJoCo sides differ only in
     # geometry, never in env wiring.
-    task = "G1-tracker-clf-fm-terrain-play"
+    #
+    # It is a FLAG, not a constant: it used to be hardcoded to the height-scan tracker, which
+    # silently builds the wrong observation for a depth-trained policy (a height scanner it
+    # never saw, and a different obs width).
+    task = args.task
     cmd = [sys.executable, os.path.join(_REPO, "scripts", "rsl_rl", "debug_episodes.py"),
            "--task", task, "--checkpoint", args.checkpoint,
            "--clip", os.path.abspath(case["path"]), "--clip_device", "cpu",
            "--num_envs", "4", "--episodes", "1", "--steps", str(case["clip_len"]),
            "--out", os.path.join(args.out_dir, f"isaac_{args.case}.npz")]
-    if args.fm_checkpoint:
-        cmd += ["--fm_checkpoint", args.fm_checkpoint]
-    if not args.gaussian_noise:
-        cmd += ["--fm_zero_noise"]
+    if args.clip_only:
+        # Generator OFF on both sides: the clip drives the tracker and no FM is built (an
+        # empty fm_checkpoint means "no generator at all"). Ego anchoring must be every step
+        # or the clip is not the reference the policy trained against.
+        cmd += ["env.commands.traj_ref.reference_source=clip",
+                "env.commands.traj_ref.ego_anchor_fraction=1.0",
+                "env.commands.traj_ref.ego_anchor_every=1"]
+    else:
+        if args.fm_checkpoint:
+            cmd += ["--fm_checkpoint", args.fm_checkpoint]
+        if not args.gaussian_noise:
+            cmd += ["--fm_zero_noise"]
     print("[isaac] " + " ".join(cmd))
     return subprocess.call(cmd, cwd=_REPO, env={**os.environ, "PYTHONPATH": os.pathsep.join(
         [os.path.join(_REPO, "source", "robot_rl"), os.path.join(_REPO, "source", "motion_gen"),
@@ -252,10 +275,18 @@ def stage_mujoco(args) -> int:
     cmd = [sys.executable, "gen_tracker_runner.py", "--mode", "eval",
            "--scene", case["scene"], "--robot_name", args.robot,
            "--load_run", args.run_name, "--clip", os.path.abspath(case["path"]),
-           "--clip_id", "0", "--clip_handoff_time", str(args.clip_handoff_time),
+           "--clip_id", "0",
+           "--clip_ego_anchor", "--clip_ego_anchor_every", "1",
            "--fm_update_every", str(args.fm_update_every),
+           # The runner clamps this to the window length, so anything >= F logs the WHOLE
+           # predicted window. Its own default is 0 = log nothing, which silently left the
+           # viser ribbon and every downstream .pred.npy empty.
+           "--fm_traj_points", str(args.fm_traj_points),
            ("--gaussian_noise" if args.gaussian_noise else "--zero_noise"),
            "--headless", "--total_time", str(case["clip_len"] * 0.02), "--log"]
+    # Clip-only: omit --clip_handoff_time entirely so no fm.onnx is loaded at all.
+    if not args.clip_only:
+        cmd += ["--clip_handoff_time", str(args.clip_handoff_time)]
     print("[mujoco] " + " ".join(cmd))
     rc = subprocess.call(cmd, cwd=os.path.join(_REPO, "transfer", "sim"))
     if rc != 0:
@@ -274,7 +305,7 @@ def stage_mujoco(args) -> int:
     else:
         print("[mujoco] WARN: no .scan.npy beside the log; the scan plot will be skipped.")
     # Per-step FM predicted windows (root + extra frames) for the viser per-step ribbons.
-    for ext in (".pred.npy", ".predf.npy"):
+    for ext in (".pred.npy", ".predf.npy", ".depth.npy"):
         if os.path.exists(f"{src}{ext}"):
             shutil.copyfile(f"{src}{ext}", f"{dst}{ext}")
             print(f"[mujoco] copied the FM predicted windows -> {dst}{ext}")
@@ -285,8 +316,13 @@ def stage_mujoco(args) -> int:
 
 # --------------------------------------------------------------------------- compare
 
-def _load_isaac(path: str) -> dict:
-    """Isaac trace (episode 0) from a debug_episodes bundle -> the common schema.
+def _load_isaac(path: str, ep: int = 0) -> dict:
+    """Isaac trace (episode ``ep``) from a debug_episodes bundle -> the common schema.
+
+    ``ep`` selects which captured env to read. It defaults to 0 -- the single-clip case this
+    file's own stages produce -- but a bundle whose envs were PINNED to different clips holds
+    one clip per episode, which is what ``view_clip_ab_viser.py`` reads to show many clips
+    from a single GPU run.
 
     Positions are converted to CLIP coordinates by subtracting the clip's world placement.
     Isaac reports WORLD coordinates and places the clip somewhere in a large multi-tile grid,
@@ -308,9 +344,20 @@ def _load_isaac(path: str) -> dict:
     """
     d = np.load(path, allow_pickle=True)
     meta = json.loads(str(d["meta_json"]))
-    ep = 0
+    ep = int(ep)
     corner = np.asarray(d["cell_corner"][ep], dtype=np.float64)
-    has_overlay_tile = bool(np.any(corner != 0.0))
+    # Ask the env which tile it ran on rather than inferring it from the corner. The old test
+    # -- "a non-zero corner means an overlay tile" -- rests on the importer leaving a flat
+    # env's corner at exactly zero, and that is not true: flat clip 7208 came back with
+    # corner (-13.515, -3.177) while its real datum, clip_world_pos, was (-11.515, -0.449).
+    # Picking the corner there put the Isaac robot 2.0 m out in x and 2.7 m in y.
+    # It stayed invisible because on an OVERLAY tile the two datums are identical (verified
+    # on clip 4092: both (-6.385, -2.299)), so only flat clips are affected -- and this is
+    # the first flat clip run through these stages.
+    if "terrain_id" in d:
+        has_overlay_tile = int(np.asarray(d["terrain_id"]).ravel()[ep]) >= 0
+    else:                                    # pre-terrain_id bundles: the old heuristic
+        has_overlay_tile = bool(np.any(corner != 0.0))
     key = "cell_corner" if has_overlay_tile or "clip_world_pos" not in d else "clip_world_pos"
     off = np.asarray(d[key][ep], dtype=np.float64)                 # [3]
     return {
@@ -323,6 +370,14 @@ def _load_isaac(path: str) -> dict:
         "ref_pos": d["ref_pos"][:, ep] - off,             # [T, F, 3] pelvis + feet
         "body_pos": d["body_pos"][:, ep] - off,
         "scan": d["scan_raw"][:, ep] if "scan_raw" in d else None,
+        # (T, num_cameras, H*W) normalised depth -- the same units the MuJoCo side logs.
+        "depth": d["depth"][:, ep] if "depth" in d else None,
+        # Commanded joint target (action after scale + default offset) and the torque the
+        # actuators applied. The MuJoCo side logs the same two as ctrl_<joint> / tau_<joint>,
+        # so a divergence can be attributed to the COMMAND or to the ACTUATOR rather than
+        # only observed in the outcome.
+        "ctrl": d["ctrl"][:, ep] if "ctrl" in d else None,
+        "torque": d["torque"][:, ep] if "torque" in d else None,
         "done": (np.asarray(d["done"])[:, ep].astype(bool) if "done" in d
                  else np.zeros(d["cmd_vel"].shape[0], dtype=bool)),
         "joint_names": list(meta["joint_names"]), "frames": list(meta["frames"]),
@@ -380,6 +435,10 @@ def _load_mujoco(csv_path: str) -> dict:
         "joint_pos": data[:, jp_cols] if jp_cols else None,
         "joint_ref": data[:, jpref_cols] if jpref_cols else None,
         "scan": np.load(scan_path) if os.path.exists(scan_path) else None,
+        # Normalised depth images (T, num_cameras, H*W), the exteroception a depth policy
+        # actually consumes -- and the one signal neither trace used to carry.
+        "depth": (np.load(f"{csv_path}.depth.npy")
+                  if os.path.exists(f"{csv_path}.depth.npy") else None),
         "jp_names": jp_names,
         # Per-step FM predicted window sidecars (NaN-padded before the generator is valid).
         "fm_pred": (np.load(f"{csv_path}.pred.npy")
@@ -510,6 +569,183 @@ def _rpy_to_wxyz(rpy: np.ndarray) -> np.ndarray:
                      cr * sp * cy + sr * cp * sy, cr * cp * sy - sr * sp * cy], axis=-1)
 
 
+# --------------------------------------------------------------------------- viser helpers
+
+def _depth_camera_layout(args) -> list[tuple[str, int, int]]:
+    """``(name, height, width)`` per depth camera, from the tracker artifact's contract.
+
+    The image grid is not recoverable from the flat observation vector alone (780 could be
+    30x26 or 26x30, and transposing it looks plausible), so it is read from the same
+    ``depth_camera_spec`` every other consumer reads.
+    """
+    run = args.run_name
+    if not run:
+        return []
+    path = os.path.join(_REPO, "logs", "rsl_rl", "g1", run, "exported",
+                        "policy_parameters.yaml")
+    if not os.path.exists(path):
+        return []
+    import yaml
+    spec = (yaml.safe_load(open(path)) or {}).get("depth_camera_spec") or []
+    return [(c.get("sensor", f"cam{i}"), int(c["height"]), int(c["width"]))
+            for i, c in enumerate(spec)]
+
+
+def _depth_to_rgb(flat: np.ndarray, hgt: int, wid: int, upscale: int = 8) -> np.ndarray:
+    """One normalised depth vector -> an RGB image on a FIXED scale, nearest-neighbour zoomed.
+
+    Fixed to the observation term's clip (-2, 2) rather than per-frame min/max: an
+    auto-scaled panel makes every frame look similar and hides exactly the thing worth
+    seeing, a camera that has gone blank. Near = bright.
+
+    ``upscale`` exists because the cameras are 30x26 -- unreadable at 1:1 in a GUI panel.
+    Nearest-neighbour on purpose: interpolation would invent gradients across the very
+    pixel edges (a foot against the floor, a step riser) that make a depth image legible.
+    """
+    img = np.asarray(flat, dtype=np.float64).reshape(hgt, wid)
+    u = np.clip((img + 2.0) / 4.0, 0.0, 1.0)
+    g = (u * 255.0).astype(np.uint8)
+    if upscale > 1:
+        g = np.repeat(np.repeat(g, upscale, axis=0), upscale, axis=1)
+    return np.repeat(g[:, :, None], 3, axis=2)
+
+
+def _mujoco_collision_geoms(args, case) -> dict | None:
+    """The MuJoCo model's COLLIDING geoms, as viser-ready meshes plus their local offsets.
+
+    Returns the model/data needed to re-pose them per frame, so the overlay follows the
+    robot rather than being baked at one configuration. ``None`` when MuJoCo is unavailable
+    or the scene cannot be built.
+    """
+    try:
+        import mujoco  # noqa: PLC0415
+    except ImportError:
+        return None
+    xml = os.path.join(_REPO, "transfer", "sim", "robots", "g1",
+                       f"{args.robot}_{case['scene']}.xml")
+    if not os.path.exists(xml):
+        return None
+    m = mujoco.MjModel.from_xml_path(xml)
+    d = mujoco.MjData(m)
+    bn = lambda b: mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_BODY, b)
+    ids, names = [], []
+    for g in range(m.ngeom):
+        if not (m.geom_contype[g] or m.geom_conaffinity[g]):
+            continue
+        if bn(m.geom_bodyid[g]) == "world":          # the floor is not part of the robot
+            continue
+        ids.append(g)
+        names.append(f"{bn(m.geom_bodyid[g])}:{g}")
+    if not ids:
+        return None
+    return {"model": m, "data": d, "ids": ids, "names": names,
+            "jnames": [mujoco.mj_id2name(m, mujoco.mjtObj.mjOBJ_JOINT, j)
+                       for j in range(1, m.njnt)]}
+
+
+def _geom_mesh(m, g: int):
+    """``(vertices, faces)`` for one MuJoCo geom, in its own frame."""
+    import mujoco  # noqa: PLC0415
+
+    t, size = int(m.geom_type[g]), m.geom_size[g]
+    if t == mujoco.mjtGeom.mjGEOM_MESH:
+        mid = int(m.geom_dataid[g])
+        v0, nv = int(m.mesh_vertadr[mid]), int(m.mesh_vertnum[mid])
+        f0, nf = int(m.mesh_faceadr[mid]), int(m.mesh_facenum[mid])
+        return (np.asarray(m.mesh_vert[v0:v0 + nv], dtype=np.float32).reshape(-1, 3),
+                np.asarray(m.mesh_face[f0:f0 + nf], dtype=np.uint32).reshape(-1, 3))
+    if t == mujoco.mjtGeom.mjGEOM_BOX:
+        sx, sy, sz = size[:3]
+        v = np.array([[x, y, z] for x in (-sx, sx) for y in (-sy, sy) for z in (-sz, sz)],
+                     dtype=np.float32)
+        f = np.array([[0, 1, 3], [0, 3, 2], [4, 7, 5], [4, 6, 7], [0, 4, 5], [0, 5, 1],
+                      [2, 3, 7], [2, 7, 6], [0, 2, 6], [0, 6, 4], [1, 5, 7], [1, 7, 3]],
+                     dtype=np.uint32)
+        return v, f
+    if t in (mujoco.mjtGeom.mjGEOM_CYLINDER, mujoco.mjtGeom.mjGEOM_CAPSULE,
+             mujoco.mjtGeom.mjGEOM_SPHERE):
+        r = float(size[0])
+        h = float(size[1]) if t != mujoco.mjtGeom.mjGEOM_SPHERE else 0.0
+        n = 16
+        th = np.linspace(0, 2 * np.pi, n, endpoint=False)
+        ring = np.stack([r * np.cos(th), r * np.sin(th)], axis=1)
+        v = np.concatenate([np.c_[ring, np.full(n, -h)], np.c_[ring, np.full(n, h)]]
+                           ).astype(np.float32)
+        f = []
+        for i in range(n):
+            j = (i + 1) % n
+            f += [[i, j, n + i], [j, n + j, n + i]]
+        return v, np.asarray(f, dtype=np.uint32)
+    return None
+
+
+def _draw_collision(coll, handles, server, mjc, root_wxyz, k: int, dy: float,
+                    visible: bool) -> None:
+    """Pose the MuJoCo collision geoms at trace step ``k`` (or hide them).
+
+    ``root_wxyz`` comes from the caller because the MuJoCo trace stores the base orientation
+    as roll/pitch/yaw, and the viser stage has already converted it once.
+    """
+    if not visible:
+        for h in handles.values():
+            h.visible = False
+        return
+    import mujoco  # noqa: PLC0415
+
+    m, d = coll["model"], coll["data"]
+    # Drive the model from the trace: root pose + measured joint angles, then FK. Same
+    # trick the predicted-frame ribbon uses -- no extra state has to be logged.
+    d.qpos[0:3] = mjc["root_pos"][k]
+    d.qpos[3:7] = root_wxyz[k]                                   # already (w, x, y, z)
+    if mjc["joint_pos"] is not None:
+        order = [mjc["jp_names"].index(n) if n in mjc["jp_names"] else None
+                 for n in coll["jnames"]]
+        for qi, src in enumerate(order):
+            if src is not None:
+                d.qpos[7 + qi] = mjc["joint_pos"][k][src]
+    mujoco.mj_kinematics(m, d)
+    for g, name in zip(coll["ids"], coll["names"]):
+        h = handles.get(name)
+        if h is None:
+            mesh = _geom_mesh(m, g)
+            if mesh is None:
+                continue
+            v, f = mesh
+            scale = m.geom_size[g][0] if int(m.geom_type[g]) == mujoco.mjtGeom.mjGEOM_MESH else 1.0
+            h = server.scene.add_mesh_simple(f"/collision/{name}", vertices=v, faces=f,
+                                             color=(1.0, 0.25, 0.25), opacity=0.45,
+                                             wireframe=False)
+            handles[name] = h
+            _ = scale
+        pos = np.asarray(d.geom_xpos[g], dtype=float).copy()
+        pos[1] += dy
+        R = np.asarray(d.geom_xmat[g], dtype=float).reshape(3, 3)
+        h.position = tuple(pos)
+        h.wxyz = tuple(_mat_to_wxyz(R))
+        h.visible = True
+
+
+def _mat_to_wxyz(R: np.ndarray) -> np.ndarray:
+    """Rotation matrix -> ``(w, x, y, z)`` quaternion."""
+    tr = float(np.trace(R))
+    if tr > 0.0:
+        S = np.sqrt(tr + 1.0) * 2.0
+        return np.array([0.25 * S, (R[2, 1] - R[1, 2]) / S,
+                         (R[0, 2] - R[2, 0]) / S, (R[1, 0] - R[0, 1]) / S])
+    i = int(np.argmax(np.diag(R)))
+    if i == 0:
+        S = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        return np.array([(R[2, 1] - R[1, 2]) / S, 0.25 * S,
+                         (R[0, 1] + R[1, 0]) / S, (R[0, 2] + R[2, 0]) / S])
+    if i == 1:
+        S = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        return np.array([(R[0, 2] - R[2, 0]) / S, (R[0, 1] + R[1, 0]) / S,
+                         0.25 * S, (R[1, 2] + R[2, 1]) / S])
+    S = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+    return np.array([(R[1, 0] - R[0, 1]) / S, (R[0, 2] + R[2, 0]) / S,
+                     (R[1, 2] + R[2, 1]) / S, 0.25 * S])
+
+
 def stage_viser(args) -> int:
     """Replay BOTH rollouts in viser, side by side on the shared terrain.
 
@@ -578,6 +814,38 @@ def stage_viser(args) -> int:
     win_r = gui.add_slider("FM ribbon radius [m]", min=0.004, max=0.03, step=0.002,
                            initial_value=0.010)
     readout = gui.add_markdown("")
+
+    # --- live DEPTH panels ---------------------------------------------------------
+    # The policy's exteroception, side by side, updating as the robots move. Shown as the
+    # NORMALISED observation (what the network reads), not metres, so the two panels are
+    # directly comparable; the shared colour scale is fixed to the term's clip so a frame
+    # cannot look different merely because its own min/max moved.
+    depth_spec = _depth_camera_layout(args)
+    depth_handles: list = []
+    if depth_spec and (iso.get("depth") is not None or mjc.get("depth") is not None):
+        with gui.add_folder("depth (as the policy sees it)"):
+            show_depth = gui.add_checkbox("update depth panels", initial_value=True)
+            depth_zoom = gui.add_slider("depth zoom", min=2, max=16, step=1, initial_value=8)
+            for cam_i, (cam_name, hgt, wid) in enumerate(depth_spec):
+                for sim in ("isaac", "mujoco"):
+                    if (iso if sim == "isaac" else mjc).get("depth") is None:
+                        continue
+                    h = gui.add_image(np.zeros((hgt, wid, 3), np.uint8),
+                                      label=f"{sim} {cam_name}")
+                    depth_handles.append((h, sim, cam_i, hgt, wid))
+    else:
+        show_depth = depth_zoom = None
+        print("[viser] no depth in the traces; re-run the isaac/mujoco stages to capture it.")
+
+    # --- MuJoCo COLLISION geometry --------------------------------------------------
+    # What MuJoCo actually collides, drawn on the MuJoCo robot. Worth seeing because the
+    # collision set is nearly disjoint from the training USD's: the legs have no collider
+    # above the ankle here, while the USD has hip_roll + knee cylinders. A wireframe-ish
+    # overlay makes "which geoms exist and where" answerable by looking.
+    coll = _mujoco_collision_geoms(args, case)
+    show_coll = gui.add_checkbox(f"MuJoCo collision geoms ({len(coll['names'])})",
+                                 initial_value=False) if coll else None
+    coll_handles: dict[str, object] = {}
     png_dir = os.path.join(args.out_dir, f"compare_{args.case}")
     with gui.add_folder("comparison plots"):
         tabs = gui.add_tab_group()
@@ -651,6 +919,20 @@ def stage_viser(args) -> int:
                 if h is not None:
                     h.visible = False
 
+        # Depth panels: reshape the flat per-camera vector back to the image grid. Row-major
+        # with v=0 the TOP row, matching transfer/sim/depth_camera.py's ray layout.
+        if show_depth is not None and show_depth.value:
+            for h, sim, cam_i, hgt, wid in depth_handles:
+                src = (iso if sim == "isaac" else mjc)["depth"]
+                if src is None or k >= len(src) or cam_i >= src.shape[1]:
+                    continue
+                h.image = _depth_to_rgb(src[k, cam_i], hgt, wid, int(depth_zoom.value))
+
+        # MuJoCo collision geoms, posed from this step's joint angles.
+        if show_coll is not None:
+            _draw_collision(coll, coll_handles, server, mjc, mjc_q, k, y_off.value,
+                            bool(show_coll.value))
+
         dv = np.abs(iso["ach"][k] - mjc["ach"][k])
         widx = (int(iso["fm_pred_idx"][k]) if iso["fm_pred_idx"] is not None else -1)
         readout.content = (
@@ -663,8 +945,13 @@ def stage_viser(args) -> int:
             f"Isaac FM window: applying frame {widx}/{(iso['fm_pred'].shape[1] - 1) if iso['fm_pred'] is not None else '?'}"
             f" (re-plans every {args.fm_update_every})")
 
-    for _ctl in (step, y_off, show_paths, show_wrists, win_r):
-        _ctl.on_update(lambda _evt: pose(int(step.value)))
+    # Every control that changes what is DRAWN has to re-run pose(); the scene is only
+    # rebuilt there. Omitting one makes its checkbox look dead until the slider is nudged,
+    # which is exactly how the collision-geom toggle appeared broken.
+    for _ctl in (step, y_off, show_paths, show_wrists, win_r,
+                 show_coll, show_depth, depth_zoom):
+        if _ctl is not None:
+            _ctl.on_update(lambda _evt: pose(int(step.value)))
 
     pose(0)
     print(f"[viser] serving on http://localhost:{args.port}  (blue = Isaac, orange = MuJoCo)")
@@ -684,14 +971,35 @@ def main() -> int:
     p.add_argument("--stage", required=True,
                    choices=("prep", "isaac", "mujoco", "plot", "viser"))
     p.add_argument("--out-dir", default="logs/sim2sim", help="Where cases + traces + PNGs live.")
-    p.add_argument("--case", default="flat", choices=_CASES)
+    p.add_argument("--case", default="flat",
+                   help="Case name. One of %s, or any name when --clip_id is given." % (_CASES,))
+    p.add_argument("--task", default="G1-tracker-clf-fm-terrain-depth-play",
+                   help="[isaac] Play task. MUST match what the policy was trained with: the "
+                        "depth tracker for a depth policy, G1-tracker-clf-fm-terrain-play for "
+                        "a height-scan one. Getting this wrong builds an env with an "
+                        "exteroception the policy never saw.")
+    p.add_argument("--clip_id", type=int, default=None,
+                   help="[prep] Extract THIS clip instead of the per-case heuristic (which "
+                        "takes the longest flat / transition clip). Use it to replay a "
+                        "specific clip -- e.g. one clip_ab_sweep.py flagged as diverging.")
+    p.add_argument("--clip_only", action="store_true",
+                   help="Generator OFF on both sides: the clip drives the tracker and no FM "
+                        "is loaded anywhere. This is the policy+physics sim2sim baseline.")
     p.add_argument("--lib", default="clips/g1_mb_v1_nodistract.h5", help="[prep] source library.")
     p.add_argument("--robot", default="g1_perceptive",
                help="MuJoCo robot name (scene prefix).")
     p.add_argument("--checkpoint", default=None, help="[isaac] RL policy .pt (absolute).")
     p.add_argument("--fm_checkpoint", default=None, help="[isaac] FM .pt (absolute).")
     p.add_argument("--run-name", default=None, help="[mujoco] RL run dir NAME holding exported/.")
-    p.add_argument("--fm_update_every", type=int, default=12, help="[mujoco] FM re-plan cadence.")
+    p.add_argument("--fm_update_every", type=int, default=1,
+                   help="[mujoco] FM re-plan cadence. 1 (not 12) because the deploy runtime "
+                        "takes it from the tracker artifact's metadata anyway, so a mismatched "
+                        "default here was silently ignored.")
+    p.add_argument("--fm_traj_points", type=int, default=256,
+                   help="[mujoco] Predicted-window nodes to log per step. The runner clamps "
+                        "to the window length F, so any value >= F logs the WHOLE window; "
+                        "the default is deliberately above every F we ship. Its own default "
+                        "is 0 = log NOTHING, which leaves the viser ribbon empty.")
     p.add_argument("--gaussian_noise", action="store_true",
                    help="Sample the FM stochastically on BOTH sides (training-matched). The "
                         "default instead runs both sides zero-noise, i.e. deterministic given "

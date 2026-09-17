@@ -48,7 +48,6 @@ import importlib.util
 import os
 import sys
 import time
-from functools import partial
 
 import numpy as np
 import viser
@@ -56,7 +55,7 @@ import yourdfpy
 from viser.extras import ViserUrdf
 
 _REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir, os.pardir))
-from robot_rl.flow_matching.viz.robot import DEFAULT_URDF  # noqa: E402
+from robot_rl.flow_matching.viz.robot import DEFAULT_URDF, load_urdf  # noqa: E402
 
 _DEFAULT_URDF = os.path.join(_REPO, DEFAULT_URDF)
 
@@ -266,13 +265,13 @@ def main() -> None:
     args = p.parse_args()
 
     print(f"[view] loading {args.urdf}")
-    # Same mesh resolution the other viewers use (robot_rl.flow_matching.viz.robot.load_urdf):
-    # yourdfpy calls the handler with a ``fname`` KEYWORD, so a bare lambda(fn) raises.
-    urdf = yourdfpy.URDF.load(
-        args.urdf, build_scene_graph=True, load_meshes=True,
-        filename_handler=partial(yourdfpy.filename_handler_magic,
-                                 dir=os.path.dirname(args.urdf)),
-    )
+    # The SHARED loader, not a local yourdfpy.URDF.load. It resolves meshes the same way, and
+    # it also renames the three <visual> tags whose name is their own link's -- which this
+    # viewer of all of them cannot do without. Those three are the two camera mounts and the
+    # backpack shell: exactly the parts this viewer exists to check, and without the rename
+    # ViserUrdf applies their mount transform twice and hangs them off the robot by it. A
+    # datum check that draws the datum error twice is not a datum check.
+    urdf = load_urdf(args.urdf)
     cams = sorted(n[: -len("_optical_link")] for n in urdf.link_map
                   if n.endswith("_optical_link"))
     if not cams:

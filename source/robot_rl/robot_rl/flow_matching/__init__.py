@@ -28,6 +28,7 @@ from .extero_encoder import (
 )
 from .dataset import (
     FutureStateDataset,
+    apply_camera_subset,
     build_train_val,
     resolve_skip_families,
     resolve_term_slice,
@@ -110,6 +111,7 @@ __all__ = [
     "FutureStateDataset",
     "snap_windows",
     "Normalizer",
+    "apply_camera_subset",
     "build_train_val",
     "resolve_skip_families",
     "resolve_term_slice",

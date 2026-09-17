@@ -76,16 +76,22 @@ DEFAULT_PAD_M: float = 0.5
 DEFAULT_MARGIN_PAD_M: float = 0.1
 
 #: Additive slack on the HEIGHT band, metres.  This is the one that was wrong, and by a lot.
-#: The fitted quantity -- the clip arm's terminal height error -- is 0.016-0.129 m across the
-#: five families, so :data:`DEFAULT_PAD_M` was **4 to 30x the thing it was padding** and
-#: produced bands of 0.52-0.63 m.  The terrain those bands have to discriminate is 0.25-0.75 m
-#: tall (``jump_on`` boxes; 47% of them shorter than 0.528 m), so the band could not tell "on
-#: the box" from "on the ground beside it" at all -- which is exactly the failure the height
-#: check exists to catch, and it was open on 77% of ``jump_on`` clips.
 #:
 #: A height band is a LEVEL test against decimetre terrain features, not a drift bound in
-#: metres, so it gets its own pad.  0.1 m leaves every family at 2-8x its own fitted p99 while
-#: staying under the shortest box in the library.
+#: metres, so the asymmetry argument above -- widen when in doubt -- does not transfer to it.
+#: Two independent measurements agree on the size of the error:
+#:
+#: * the clip arm's terminal height error is 0.016-0.129 m across the five families (0.040-0.072
+#:   on the v6g arm), so :data:`DEFAULT_PAD_M` was **4 to 30x the thing it was padding** and
+#:   produced bands of 0.52-0.63 m;
+#: * the terrain those bands must discriminate is 0.25-0.75 m tall (``jump_on`` boxes; 47% of
+#:   them shorter than 0.528 m) and a stair riser is 0.13-0.18 m, so a 0.5 m band is three to
+#:   four steps and cannot tell "on the box" from "on the ground beside it" -- which is exactly
+#:   the failure the height check exists to catch, and it was open on 77% of ``jump_on`` clips.
+#:
+#: 0.1 m leaves every family at 2-8x its own fitted p99 while staying under the shortest box in
+#: the library.  It is also what the shipped ``goal_regions_anchor_v3.json`` was fitted with
+#: (its provenance records ``height_pad_m: 0.1``), before the two pads were collapsed into one.
 DEFAULT_HEIGHT_PAD_M: float = 0.1
 
 #: Floors, so a family whose clip arm happens to be very tight cannot produce a region so
@@ -99,6 +105,9 @@ DEFAULT_HEIGHT_PAD_M: float = 0.1
 #: band by construction.
 MIN_MARGIN_M: float = 0.0
 MIN_HALF_WIDTH_M: float = 1.5
+#: Below one stair riser (0.13-0.18 m), so the floor cannot by itself merge two steps. 0.35
+#: dominated every fitted height (0.040-0.072 + 0.1) and would have made the per-axis pad above
+#: a no-op; v3's fitted heights ran 0.12-0.23, i.e. under the old floor entirely.
 MIN_HEIGHT_TOL_M: float = 0.12
 
 
@@ -200,9 +209,10 @@ def _fit_family(down: np.ndarray, lat: np.ndarray, hz: np.ndarray,
         lat: ``[k]`` terminal lateral offsets.
         hz: ``[k]`` terminal height errors.
         quantile: See :data:`DEFAULT_QUANTILE`.
-        pad: Lateral pad; see :data:`DEFAULT_PAD_M`.
-        margin_pad: See :data:`DEFAULT_MARGIN_PAD_M`.
-        height_pad: See :data:`DEFAULT_HEIGHT_PAD_M`.
+        pad: LATERAL slack. See :data:`DEFAULT_PAD_M`.
+        margin_pad: DOWNRANGE slack, which does not share the lateral number. See
+            :data:`DEFAULT_MARGIN_PAD_M`.
+        height_pad: VERTICAL slack, which shares neither. See :data:`DEFAULT_HEIGHT_PAD_M`.
 
     Returns:
         A dict of the three tolerances plus the raw fitted quantiles, for the report.
@@ -232,21 +242,38 @@ def main() -> int:
     p.add_argument("--write_bootstrap", default="",
                    help="emit an UNCALIBRATED spec here and exit; run the clip arm against "
                         "it to produce the table this script then fits")
-    p.add_argument("--skip_families", default="jump_off,distractor,stairs_dn_pure,stairs_up_pure",
+    p.add_argument("--skip_families",
+                   default=("jump_off,distractor,stairs_dn_pure,stairs_up_pure,"
+                            "pure_stairs_down,pure_stairs_up,flat"),
                    help="Families excluded from the FIT. The same two the rest of the "
                         "pipeline drops: `jump_off` travels backwards so its goal sits "
                         "behind the spawn, `distractor` travels less in total than a typical "
                         "approach margin, and the "
                         "`*_pure` families open ON the stairs so their first re-plan runs on "
                         "a null-history embedding fitted on flat. Fitting tolerances from any "
-                        "of them would size the region to a task that is not one.")
+                        "of them would size the region to a task that is not one. BOTH "
+                        "spellings of the pure families are listed because the name changed "
+                        "with the library: `stairs_up_pure` in the v5-era libraries, "
+                        "`pure_stairs_up` in v6. `normalize_family` only strips the `family_` "
+                        "prefix and the `.h5` suffix, so a stale spelling matches nothing and "
+                        "the family is fitted rather than skipped -- silently, and in the "
+                        "direction that sizes the region to a task that is not one. "
+                        "`flat` is skipped for a different reason and the same effect: it has "
+                        "no terrain feature to reach, so its clip end is an arbitrary point on "
+                        "a plane, and a tolerance fitted there measures the sampler\'s speed "
+                        "draw rather than the policy. It is scored by the FALL rule instead -- "
+                        "see report.FALL_ONLY_FAMILIES.")
     p.add_argument("--quantile", type=float, default=DEFAULT_QUANTILE)
     p.add_argument("--pad_m", type=float, default=DEFAULT_PAD_M,
-                   help="lateral pad (m)")
+                   help="LATERAL slack (m) added to the fitted quantile.")
     p.add_argument("--margin_pad_m", type=float, default=DEFAULT_MARGIN_PAD_M,
-                   help="downrange pad (m); small by design, see DEFAULT_MARGIN_PAD_M")
+                   help="DOWNRANGE slack (m), separate from --pad_m and small by design: "
+                        "the margin absorbs a measured undershoot of centimetres, so half a "
+                        "metre on top puts the boundary before the box.")
     p.add_argument("--height_pad_m", type=float, default=DEFAULT_HEIGHT_PAD_M,
-                   help="height pad (m); must keep the band under the shortest box")
+                   help="VERTICAL slack (m), separate from --pad_m: a stair riser is "
+                        "0.13-0.18 m, so the horizontal number applied here would merge "
+                        "several steps into one goal.")
     args = p.parse_args()
 
     goal_region = _load_goal_region()
@@ -335,7 +362,8 @@ def main() -> int:
     spec.save(args.out)
 
     print(f"\n{'family':<18} {'n':>6}  {'margin':>8} {'half-w':>8} {'height':>8}   "
-          f"(q + per-axis pad)")
+          f"(q{args.quantile:g} + {args.margin_pad_m:g} m downrange, {args.pad_m:g} m lateral, "
+          f"{args.height_pad_m:g} m vertical)")
     print("-" * 72)
     for name, fit in rows:
         print(f"{name:<18} {fit['n_survivors']:>6}  {fit['approach_margin_m']:>8.2f} "

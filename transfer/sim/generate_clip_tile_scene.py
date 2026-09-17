@@ -255,6 +255,177 @@ def first_step(overlays: list[dict]) -> dict | None:
         if steps else None
 
 
+def authors_ground(entry: dict, overlays: list[dict], *, tol_m: float = 0.05) -> bool:
+    """Whether the tile authors its OWN ground slab, making a substitute floor a duplicate.
+
+    The free-form courses emit a full-footprint slab whose TOP is the tile's z=0 -- that slab
+    IS the floor, and it is what Isaac builds.  They also carry ``has_floor=False``, which
+    makes :func:`tile_geoms` emit the infinite plane at z=0 as a substitute; the two are then
+    exactly coplanar and z-fight in every viewer.
+
+    The test is footprint AND height, because either alone is wrong: a clip-library tile's
+    approach platform also spans the whole footprint (7.50 x 3.84 on one) but its top is a
+    riser up at +0.170, so it is a PLATFORM and the tile really does need a floor under it.
+
+    Args:
+        entry: The manifest tile entry.
+        overlays: Its emittable overlays.
+        tol_m: Slack on both the footprint match and the top-at-zero test.
+
+    Returns:
+        Whether some walkable overlay is the tile's own ground.
+    """
+    sx, sy = float(entry.get("size_x", 0.0)), float(entry.get("size_y", 0.0))
+    if sx <= 0.0 or sy <= 0.0:
+        return False
+    for ov in walkable(overlays):
+        top = float(ov["base_z"]) + float(ov["size_xyz"][2])
+        if abs(top) > tol_m:
+            continue
+        if (abs(float(ov["size_xyz"][0]) - sx) <= tol_m
+                and abs(float(ov["size_xyz"][1]) - sy) <= tol_m):
+            return True
+    return False
+
+
+def first_raised(overlays: list[dict], floor_top: float, *, min_rise_m: float = 0.05,
+                 from_x: float = -1e30) -> dict | None:
+    """The lowest-x walkable overlay whose top stands above ``floor_top`` -- the first OBSTACLE.
+
+    :func:`first_step` answers a different question: the flight's first TREAD, filtered to at
+    most :data:`_STEP_MAX_TREAD_M` deep so a railing post cannot be mistaken for a riser.  That
+    filter makes it blind to a deep obstacle -- the two-box course's boxes are 1.20 m along
+    travel, so ``first_step`` returns ``None`` on them and the tile reads as "not a feature
+    course" -- which is the ``TODO(first-step-vs-first-obstacle)`` on that function.  This is
+    the other half it names: the approach DATUM, with no depth filter, keyed on standing above
+    the floor instead.
+
+    Args:
+        overlays: The tile's emittable overlays.
+        floor_top: Surface height at the spawn (m); an overlay must exceed it to count.
+        min_rise_m: How far above ``floor_top`` counts as raised.  The ground overlay itself is
+            walkable and must not be selected.
+        from_x: Ignore overlays whose NEAR face is at or behind this tile-local x -- a feature
+            begins at its near face, so that is what "ahead" means. Filtering on the FAR face
+            instead picks the tile-spanning GROUND overlay, whose far face is ahead of every
+            spawn and whose near face is at x=0, giving a negative approach distance.
+
+    Returns:
+        The overlay dict, or ``None`` when nothing ahead stands above the floor.
+    """
+    best = None
+    for ov in walkable(overlays):
+        top = float(ov["base_z"]) + float(ov["size_xyz"][2])
+        if top <= floor_top + float(min_rise_m):
+            continue
+        near = float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0
+        if near <= float(from_x):
+            continue
+        if best is None or near < best[0]:
+            best = (near, ov)
+    return None if best is None else best[1]
+
+
+def first_drop(overlays: list[dict], floor_top: float, *, min_drop_m: float = 0.05,
+               from_x: float = -1e30) -> dict | None:
+    """The nearest walkable overlay ahead that sits BELOW ``floor_top`` -- the first DESCENT.
+
+    The mirror of :func:`first_raised`, and needed for the same reason from the other side: a
+    robot standing on a top platform has nothing raised ahead of it, so a raised datum finds
+    nothing and the tile reads as having no feature.  What is ahead is a drop, and its near
+    face -- the platform's lip -- is where the descent decision is made.
+
+    Args:
+        overlays: The tile's emittable overlays.
+        floor_top: Surface height at the spawn (m); an overlay must sit below it to count.
+        min_drop_m: How far below ``floor_top`` counts as a drop.
+        from_x: Ignore overlays whose NEAR face is at or behind this tile-local x; see
+            :func:`first_raised`.
+
+    Returns:
+        The overlay dict, or ``None`` when nothing ahead is lower.
+    """
+    best = None
+    for ov in walkable(overlays):
+        top = float(ov["base_z"]) + float(ov["size_xyz"][2])
+        if top >= floor_top - float(min_drop_m):
+            continue
+        near = float(ov["pos_xy"][0]) - float(ov["size_xyz"][0]) / 2.0
+        if near <= float(from_x):
+            continue
+        if best is None or near < best[0]:
+            best = (near, ov)
+    return None if best is None else best[1]
+
+
+def area_spawn(entry: dict, overlays: list[dict], which: str = "top"
+                ) -> tuple[float, float, float, str]:
+    """A spawn taken from one of the tile's DECLARED spawn areas.
+
+    The free-form courses declare several -- the ground start and each raised surface -- and
+    the RL reset draws among them by weight, so half of an up-into-down arm's training
+    episodes begin on the top platform.  Reproducing that start is what makes the descent a
+    first decision rather than something only the surviving minority of ground-start trials
+    ever reaches.
+
+    Args:
+        entry: The tile's manifest entry.
+        overlays: Its emittable overlays.
+        which: ``"top"`` for the highest area, ``"ground"`` for the lowest.
+
+    Returns:
+        ``(x, y, z, why)`` tile-local, ``z`` the walkable surface at that xy.
+
+    Raises:
+        ValueError: If the tile declares no spawn areas, or ``which`` is unknown.
+    """
+    areas = ((entry.get("route") or {}).get("spawn_areas")) or []
+    if not areas:
+        raise ValueError(
+            f"tile {entry.get('terrain_id')} declares no spawn areas; use spawn_from='route'.")
+    if which == "top":
+        a = max(areas, key=lambda r: float(r["z"]))
+    elif which == "ground":
+        a = min(areas, key=lambda r: float(r["z"]))
+    else:
+        raise ValueError(f"which must be 'top' or 'ground', got {which!r}")
+    x, y = float(a["x"]), float(a["y"])
+    # The area's own z is the surface it sits on; re-derive it from the geometry anyway, so a
+    # stale declared z cannot spawn the robot inside a tread or a few cm above one.
+    z = terrain_top_at(walkable(overlays), x, y)
+    return x, y, z, (f"the tile's {which} spawn AREA (tile-local x={x:.3f}, y={y:.3f}, "
+                     f"surface z={z:.3f})")
+
+
+def route_spawn(entry: dict, overlays: list[dict]) -> tuple[float, float, float, str]:
+    """The spawn the tile's own ROUTE declares, standing on the surface there.
+
+    :func:`spawn_point` DERIVES a spawn ``approach`` metres before the first tread, which is
+    right for a clip-library tile that declares no route.  The free-form courses do declare
+    one, and Isaac spawns exactly there -- so taking it makes the two simulators agree by
+    construction rather than approximately.  ``spawn_point``'s no-tread fallback is the tile
+    CENTRE, which on a two-box tile is metres from where an Isaac episode opens.
+
+    Args:
+        entry: The tile's manifest entry.
+        overlays: Its emittable overlays.
+
+    Returns:
+        ``(x, y, z, why)`` tile-local, ``z`` the walkable surface at that xy.
+
+    Raises:
+        ValueError: If the tile declares no route.
+    """
+    route = entry.get("route") or {}
+    if "start_x" not in route or "start_y" not in route:
+        raise ValueError(
+            f"tile {entry.get('terrain_id')} declares no route start; use the derived spawn "
+            "(spawn_from='approach') for a clip-library tile.")
+    x, y = float(route["start_x"]), float(route["start_y"])
+    z = terrain_top_at(walkable(overlays), x, y)
+    return x, y, z, f"the tile's own route spawn (tile-local x={x:.3f}, y={y:.3f})"
+
+
 def spawn_point(entry: dict, overlays: list[dict], approach: float) -> tuple[float, float, str]:
     """Where the robot should stand, in tile-local metres.
 

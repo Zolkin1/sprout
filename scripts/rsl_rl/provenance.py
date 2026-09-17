@@ -210,3 +210,38 @@ def check_run_conventions(log_dir: str, env_cfg: Any = None) -> None:
         print("[WARN] re-plan cadences differ from the trained run (trained -> now): "
               + ", ".join(f"{k} {a} -> {b}" for k, (a, b) in drift.items())
               + ". Behaviour will differ; this is allowed as a deliberate override.")
+
+
+def policy_far_camera_in_run(log_dir: str) -> bool | None:
+    """Did the POLICY of the run at ``log_dir`` read the far depth camera?
+
+    The policy reads the near camera alone as of ``efe93b4e``, so a near-only task builds 2222
+    inputs where every earlier tracker expects 3002 -- measured on the actual checkpoints, and
+    the difference is exactly 780, one 30x26 camera. A run trained before that change cannot be
+    loaded at all without putting the term back, and the far block is the WHOLE difference: the
+    ``height_scan`` those runs also list under ``observations.policy`` does not reach the
+    vector, which the arithmetic settles (3002 - 2222 = 780, not 780 + a scan).
+
+    Read off the run's OWN ``params/env.yaml`` rather than taken as a flag, deliberately: a
+    flag added to the eval's parser is not forwarded to the cell subprocess unless
+    ``stage_grid`` restates it, and reverts to its argparse default in the child SILENTLY --
+    measured twice on this harness. A property of the artifact cannot be dropped that way.
+
+    Args:
+        log_dir: The run directory holding ``params/env.yaml``.
+
+    Returns:
+        ``True`` / ``False`` when the record exists, ``None`` when it does not -- an old run
+        with no ``params/`` is unknowable here and the caller decides what that means.
+    """
+    import yaml  # noqa: PLC0415
+
+    path = os.path.join(log_dir, "params", "env.yaml")
+    if not os.path.isfile(path):
+        return None
+    with open(path) as fh:
+        cfg = yaml.unsafe_load(fh)
+    policy = ((cfg or {}).get("observations") or {}).get("policy") or {}
+    if "depth_far" not in policy:
+        return None
+    return policy["depth_far"] is not None

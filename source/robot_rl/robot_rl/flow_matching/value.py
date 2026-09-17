@@ -70,7 +70,6 @@ from typing import Sequence
 import torch
 import torch.nn as nn
 
-from .extero_encoder import ExteroImageEncoder
 from .model import _token_mlp
 
 
@@ -83,8 +82,6 @@ class ValueInputs:
         extero: ``(B, T * K)`` the exteroception row it was served.
         cmd_tokens: ``(B, n_cmd, cmd_dim)`` strided command, or ``None``.
         history_null: ``(B,)`` bool; True while the ring had not filled.
-        scan: ``(B, H, W)`` privileged height scan, or ``None``.
-        proprio: ``(B, P, proprio_dim)`` per-timestep proprioception, or ``None``.
         context: ``(B, C)`` scalar context -- goal offsets and the base twist.
     """
 
@@ -92,8 +89,6 @@ class ValueInputs:
     extero: torch.Tensor
     cmd_tokens: torch.Tensor | None
     history_null: torch.Tensor | None
-    scan: torch.Tensor | None = None
-    proprio: torch.Tensor | None = None
     context: torch.Tensor | None = None
 
 
@@ -102,15 +97,32 @@ class ValueInputs:
 GOAL_BLOCK_WIDTH: int = 3
 
 
-def context_width(*, privileged: bool, goal_context: bool = True) -> int:
-    """Width of the scalar-context token, the ONE place that arithmetic is done.
+#: Width of the worst-penalty-so-far block: one scalar.
+#:
+#: Naming: the FLAG is ``worst_penalty_context`` and the PIECE is ``worst_penalty``, mirroring
+#: ``goal_context`` / ``goal``.  They must differ -- :func:`build_context` takes the pieces as
+#: ``**kwargs``, so a flag sharing a piece's name is a syntax error at every call site that
+#: passes both.
+WORST_BLOCK_WIDTH: int = 1
 
-    Four sites build this vector -- the fit, the mjeval reader, the Isaac online scorer and
-    the out-of-fold predictor -- and every one of them used to restate ``3 + (6 if priv else
-    3)``. With ``goal_context`` now a per-checkpoint property that is four chances for the
-    stamp and the built width to disagree, and a disagreement is a linear layer fed the wrong
-    columns rather than a shape error: drop the goal from the batch but not from the model and
-    the twist slides into the goal's slots, which is finite and plausible.
+
+def context_layout(*, privileged: bool, goal_context: bool = True,
+                   worst_penalty_context: bool = False) -> tuple[tuple[str, int], ...]:
+    """The scalar-context token's blocks, in order, as ``(name, width)``.
+
+    **The layout is DATA, and it is the only statement of it.**  Five sites build this vector
+    -- the fit, ``fit_q``, the mjeval reader, the Isaac online scorer and the out-of-fold
+    predictor -- and each used to assemble it by hand, so the ORDER lived five times while the
+    width lived once.  That is the dangerous shape: a disagreement is a linear layer fed the
+    wrong columns rather than a shape error.  Drop the goal from the batch but not from the
+    model and the twist slides into the goal's slots, which is finite and plausible and shows
+    up as a critic that merely predicts a bit worse.
+
+    So both :func:`context_width` and :func:`build_context` read this, and a caller supplies
+    NAMED pieces rather than a concatenation order.  Adding a block is one edit here.
+
+    Order note: ``goal`` is first because every existing checkpoint has it in columns 0:3, and
+    new blocks are APPENDED so those positions never move.
 
     Args:
         privileged: The ``V_priv`` variant, which gets the FULL base twist. ``V_onboard`` gets
@@ -119,63 +131,119 @@ def context_width(*, privileged: bool, goal_context: bool = True) -> int:
         goal_context: Whether the goal offsets are in the token at all. ``False`` is the
             ablation arm: it asks whether the critic can predict failure with no idea how far
             the goal is, which the module docstring above predicts it cannot.
+        worst_penalty_context: Whether the WORST TERRAIN PENALTY SO FAR is in the token.  It is a
+            property of the episode's history, and it is what lets the critic predict a
+            return whose success term is gated on the episode's worst chunk -- without it,
+            ``V(s_t)`` has no way to know that the bonus has already been forfeited.
+            **Strictly the chunks BEFORE t**: including t's own penalty would leak part of
+            ``r_t`` into ``V(s_t)`` and cancel exactly that much of the advantage.
+
+    Returns:
+        The blocks, in concatenation order.
+    """
+    blocks: list[tuple[str, int]] = []
+    if goal_context:
+        blocks.append(("goal", GOAL_BLOCK_WIDTH))
+    blocks.append(("twist", 6 if privileged else 3))
+    if worst_penalty_context:
+        blocks.append(("worst_penalty", WORST_BLOCK_WIDTH))
+    return tuple(blocks)
+
+
+def context_width(*, privileged: bool, goal_context: bool = True,
+                  worst_penalty_context: bool = False) -> int:
+    """Width of the scalar-context token, derived from :func:`context_layout`.
+
+    Args:
+        privileged: See :func:`context_layout`.
+        goal_context: See :func:`context_layout`.
+        worst_penalty_context: See :func:`context_layout`.
 
     Returns:
         The width, in scalars.
     """
-    return (GOAL_BLOCK_WIDTH if goal_context else 0) + (6 if privileged else 3)
+    return sum(w for _, w in context_layout(privileged=privileged,
+                                            goal_context=goal_context,
+                                            worst_penalty_context=worst_penalty_context))
 
 
-def two_hot(target: torch.Tensor, support: torch.Tensor) -> torch.Tensor:
-    """Distribute each scalar target across the two support bins that bracket it.
+def build_context(*, privileged: bool, goal_context: bool = True,
+                  worst_penalty_context: bool = False,
+                  **pieces: torch.Tensor) -> torch.Tensor:
+    """Assemble the scalar-context token from NAMED pieces, in the canonical order.
 
-    The standard two-hot encoding for a distributional value head: a cross-entropy against
-    this has the same MEAN as the scalar target while training far more stably than an MSE on
-    returns, whose gradient scales with the error and whose target moves as the critic does.
+    The counterpart to :func:`context_layout`: callers pass ``goal=``, ``twist=`` and
+    ``worst_penalty=`` and never choose an order.  Every block the layout asks for must be
+    supplied at the width it asks for, and anything extra is refused -- a silently ignored
+    piece is a caller that thinks it contributed a feature and did not.
 
-    Exact in the mean by construction, which is the property the head's ``quality`` mean
-    accessor relies on -- and it is asserted in the tests rather than argued here.
-
-    Args:
-        target: ``(B,)`` values; clamped into the support's range rather than dropped, since a
-            value outside it means the reward's own bound was wrong and silently discarding
-            those rows would hide it.
-        support: ``(bins,)`` ascending bin centres.
-
-    Returns:
-        ``(B, bins)`` non-negative, summing to 1 along the last axis.
-    """
-    bins = support.numel()
-    if bins < 2:
-        raise ValueError(f"a two-hot target needs at least 2 bins, got {bins}")
-    lo, hi = float(support[0]), float(support[-1])
-    width = (hi - lo) / (bins - 1)
-    pos = ((target.clamp(lo, hi) - lo) / width)
-    low = pos.floor().clamp(0, bins - 2).long()
-    frac = (pos - low.to(pos.dtype)).clamp(0.0, 1.0)
-    out = torch.zeros(target.shape[0], bins, device=target.device, dtype=pos.dtype)
-    out.scatter_(1, low.unsqueeze(1), (1.0 - frac).unsqueeze(1))
-    out.scatter_add_(1, (low + 1).unsqueeze(1), frac.unsqueeze(1))
-    return out
-
-
-def quality_loss(logits: torch.Tensor, target: torch.Tensor,
-                 support: torch.Tensor) -> torch.Tensor:
-    """Cross-entropy of ``logits`` against the two-hot encoding of ``target``.
+    ``twist`` is passed FULL (6 wide) and sliced here for the onboard variant, so the "keep
+    only the angular half" rule lives with the layout rather than at each call site.
 
     Args:
-        logits: ``(B, bins)`` from :meth:`FlowValueModel.quality_logits`.
-        target: ``(B,)`` normalized returns in the support's range.
-        support: ``(bins,)`` bin centres.
+        privileged: See :func:`context_layout`.
+        goal_context: See :func:`context_layout`.
+        worst_penalty_context: See :func:`context_layout`.
+        **pieces: ``(B, w)`` tensors by block name.  ``twist`` may be ``(B, 6)`` on either
+            variant.
 
     Returns:
-        Scalar mean loss.
+        ``(B, context_width(...))``.
+
+    Raises:
+        ValueError: On a missing block, an unexpected one, or a width that does not match.
     """
-    return -(two_hot(target, support) * torch.log_softmax(logits, dim=-1)).sum(-1).mean()
+    layout = context_layout(privileged=privileged, goal_context=goal_context,
+                            worst_penalty_context=worst_penalty_context)
+    want = {n for n, _ in layout}
+    extra = sorted(set(pieces) - want)
+    if extra:
+        raise ValueError(
+            f"build_context got {extra}, which this layout does not carry "
+            f"(privileged={privileged}, goal_context={goal_context}, "
+            f"worst_penalty_context={worst_penalty_context}). A piece silently dropped is a "
+            "CALLER that believes it contributed a feature and did not.")
+    out: list[torch.Tensor] = []
+    for name, width in layout:
+        if name not in pieces:
+            raise ValueError(f"build_context needs {name!r} ({width} wide) for this layout.")
+        t = pieces[name]
+        if name == "twist" and t.shape[-1] == 6 and width == 3:
+            t = t[..., 3:]          # the ANGULAR half; see context_layout
+        if t.shape[-1] != width:
+            raise ValueError(
+                f"build_context got {name!r} {tuple(t.shape)} but the layout wants width "
+                f"{width}.")
+        out.append(t)
+    return torch.cat(out, dim=-1)
+
+
+def quality_mse_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Plain MSE of a SCALAR quality head against its return target.
+
+    The alternative to :func:`quality_loss`'s two-hot cross-entropy, and the two are kept side
+    by side so the choice can be A/B'd rather than argued: the distributional head trains more
+    stably in general, but it needs a declared support, and an MSE needs only that the target
+    be bounded -- which the clipped window return guarantees by construction (``[-1, 0]``).
+
+    Args:
+        pred: ``(B,)`` scalar prediction.
+        target: ``(B,)`` return target.
+
+    Returns:
+        Scalar mean squared error.
+    """
+    return torch.nn.functional.mse_loss(pred.reshape(-1), target.reshape(-1))
 
 
 class FlowValueModel(nn.Module):
-    """A failure-probability head reading one readout token over the generator's encoder.
+    """A VALUE head reading one readout token over the generator's frozen encoder.
+
+    ``V(s)`` is a scalar regression of the normalized return. ONE head and ONE readout: this
+    class used to carry a survival head predicting ``P(fail | s)`` on its own readout token,
+    and a distributional (two-hot) form of the value head. Neither produced a reported result
+    -- the fine-tune drops the survival loss (``--quality_only``) and regresses a scalar
+    (``--quality_kind mse``) -- so both are deleted rather than described.
 
     The query stream is ``[readout | scan patches | proprio steps | context]``; the keys and
     values are that stream concatenated with the generator's own prefix, which
@@ -187,26 +255,15 @@ class FlowValueModel(nn.Module):
     Args:
         fm: A trained :class:`FlowMatchingTransformer`, used as encoder and as the layer stack
             the value tokens run through.
-        scan_hw: ``(H, W)`` height-scan grid, or ``None`` to omit the scan tokens.
-        proprio_dim: Width of one proprioception row; 0 omits those tokens.
-        proprio_steps: How many proprioception rows become tokens.
         context_dim: Width of the scalar-context vector; 0 omits that token.
-        scan_channels: Conv widths for the scan trunk.
-        scan_grid: Pooled token grid for the scan, i.e. how many patch tokens it becomes.
         hidden: Head width.
         freeze_trunk: Keep the generator's weights fixed. The default, and not merely the
             cheap option: it asks the sharper question first -- is the generator's own
             representation predictive of failure -- and answers it in minutes.
-        quality_bins: Bins for the QUALITY head's distribution over the normalized tracking
-            return, or 0 to omit it. 0 reproduces the survival-only model exactly, so an
-            existing checkpoint loads and scores unchanged.
     """
 
-    def __init__(self, fm, *, scan_hw: tuple[int, int] | None = None,
-                 proprio_dim: int = 0, proprio_steps: int = 0, context_dim: int = 0,
-                 scan_channels: Sequence[int] = (16, 32), scan_grid: tuple[int, int] = (2, 3),
-                 hidden: int = 128, freeze_trunk: bool = True,
-                 quality_bins: int = 0) -> None:
+    def __init__(self, fm, *, context_dim: int = 0,
+                 hidden: int = 128, freeze_trunk: bool = True) -> None:
         super().__init__()
         if getattr(fm, "attention_mode", "full") != "prefix":
             raise ValueError(
@@ -234,51 +291,38 @@ class FlowValueModel(nn.Module):
         # probe rather than a strong opinion about where to look.
         self.readout = nn.Parameter(torch.randn(1, 1, d) * 0.02)
 
-        self.scan_enc = None
-        if scan_hw is not None:
-            self.scan_enc = ExteroImageEncoder(
-                (int(scan_hw[0]), int(scan_hw[1])), d, tuple(scan_channels),
-                grid=(int(scan_grid[0]), int(scan_grid[1])), row_channels=1)
-        self.proprio_steps = int(proprio_steps)
-        self.proprio_in = (_token_mlp(int(proprio_dim), d) if proprio_dim > 0 else None)
+        # NO scan and NO proprio tokens. The critic used to add a CNN trunk over the
+        # privileged height scan (pooled to a 2x3 patch grid) and one token per
+        # proprioception step, each with its own type embedding. Both are gone: the
+        # architecture the paper describes reads the generator's own conditioning plus a
+        # scalar-context token, and nothing else.
+        #
+        # This is the one cut here that CHANGES V rather than removing something untrained --
+        # the scan and proprio tokens were live inputs the value readout attended to. Judge a
+        # refit on `critic.log`'s n1 DIFFERENCE ratio (1.01 with the scan, 4.55 at round 0),
+        # not on the success rate: that ratio is sd(predicted change)/sd(real change) between
+        # ADJACENT chunks, which is exactly what AWR exponentiates, and a success rate can
+        # stay flat for several iterations while it degrades.
         self.context_in = (_token_mlp(int(context_dim), d) if context_dim > 0 else None)
 
-        # One learned type embedding per stream, so the encoder can tell a proprio token from
-        # a scan patch. Without them the streams are distinguishable only by content, and the
-        # borrowed layers were never trained to make that distinction.
+        # One learned type embedding per stream, so the borrowed layers can tell the readout
+        # from the context token by more than content -- they were never trained to make that
+        # distinction. Two streams now; there used to be four, with a POSITION on the proprio
+        # tokens because that stream was a time series. Both single tokens need no position.
         self.readout_type = nn.Parameter(torch.zeros(1, 1, d))
-        self.scan_type = nn.Parameter(torch.zeros(1, 1, d))
-        self.proprio_type = nn.Parameter(torch.zeros(1, 1, d))
         self.context_type = nn.Parameter(torch.zeros(1, 1, d))
-        # Proprioception is a time series, so its tokens get a position; the others do not
-        # (a scan patch's position is the CNN's learned spatial slot, and readout and context
-        # are single tokens).
-        self.proprio_pos = nn.Parameter(torch.zeros(1, max(self.proprio_steps, 1), d))
 
-        self.head = nn.Sequential(nn.Linear(d, hidden), nn.SiLU(), nn.Linear(hidden, 1))
-
-        # ---- the QUALITY head, optional and additive ----------------------------------
+        # ONE readout and ONE head: a scalar regression of the normalized return.
         #
-        # A SECOND readout rather than a second head on the shared one. The readout's whole
-        # argument (above) is that attention lets it learn WHAT TO LOOK AT from its own query
-        # -- and "will this fall" and "how cleanly is it tracking" are not the same question,
-        # so sharing one query would force one compromise representation for both. One extra
-        # token against a 129-token sequence.
-        self.quality_bins = int(quality_bins)
-        self.quality_readout = None
-        self.quality_head = None
-        if self.quality_bins > 0:
-            self.quality_readout = nn.Parameter(torch.randn(1, 1, d) * 0.02)
-            self.quality_type = nn.Parameter(torch.zeros(1, 1, d))
-            self.quality_head = nn.Sequential(nn.Linear(d, hidden), nn.SiLU(),
-                                              nn.Linear(hidden, self.quality_bins))
-            # The support is DECLARED, not fitted, and that is a property of the reward rather
-            # than a convenience: a step reward is bounded in (0, 1] because the DeepMimic
-            # weights sum to 1, and the normalized return carries the (1 - gamma) factor, so
-            # G lands in [0, 1] by construction. Nothing here has to track a running scale,
-            # and two checkpoints fitted on different data are directly comparable.
-            self.register_buffer("quality_support",
-                                 torch.linspace(0.0, 1.0, self.quality_bins))
+        # There used to be a second, SURVIVAL head predicting P(fail | s) with its own readout
+        # token -- "will this fall" and "how cleanly is it tracking" are not the same question,
+        # so they did not share a query -- plus a distributional (two-hot) form of this head.
+        # All of it is gone. None of it produced a reported result: the fine-tune loop passes
+        # `--quality_only`, which drops the survival loss entirely, and `--quality_kind mse`.
+        # Carrying them meant the architecture could not be described without also describing
+        # experiments that never ran.
+        self.quality_head = nn.Sequential(nn.Linear(d, hidden), nn.SiLU(),
+                                          nn.Linear(hidden, 1))
 
     def value_tokens(self, x: ValueInputs) -> torch.Tensor:
         """Assemble the query stream, readout FIRST.
@@ -287,7 +331,7 @@ class FlowValueModel(nn.Module):
             x: The batch.
 
         Returns:
-            ``(B, 1 + n_scan + n_proprio + n_context, d_model)``.
+            ``(B, 1 + n_context, d_model)``.
 
         Raises:
             ValueError: When a stream the model was built with is missing from the batch. A
@@ -296,19 +340,6 @@ class FlowValueModel(nn.Module):
             """
         b = x.history.shape[0]
         parts = [self.readout.expand(b, 1, self.d_model) + self.readout_type]
-        # Index 1 when present. The survival readout stays at 0 so a survival-only
-        # checkpoint's head keeps reading the same token.
-        if self.quality_readout is not None:
-            parts.append(self.quality_readout.expand(b, 1, self.d_model) + self.quality_type)
-        if self.scan_enc is not None:
-            if x.scan is None:
-                raise ValueError("this model has scan tokens but the batch carries no scan; "
-                                 "it would score every state as if the ground were flat.")
-            parts.append(self.scan_enc(x.scan.reshape(b, -1)) + self.scan_type)
-        if self.proprio_in is not None:
-            if x.proprio is None:
-                raise ValueError("this model has proprio tokens but the batch carries none.")
-            parts.append(self.proprio_in(x.proprio) + self.proprio_pos + self.proprio_type)
         if self.context_in is not None:
             if x.context is None:
                 raise ValueError(
@@ -319,17 +350,17 @@ class FlowValueModel(nn.Module):
         return torch.cat(parts, dim=1)
 
     def forward(self, x: ValueInputs) -> torch.Tensor:
-        """Predict the failure LOGIT from the readout token.
+        """``V(s)`` for a batch.
 
         Args:
             x: The batch.
 
         Returns:
-            ``(B,)`` logits; ``sigmoid`` gives ``P(fail | s)`` and ``V = -P(fail | s)``.
+            ``(B,)`` expected normalized return.
         """
         # Exactly what the generator computes for its own conditioning -- `prefix` attention
         # means the tokens added below cannot perturb it.
-        return self.head(self._encode(x)[:, 0]).squeeze(-1)   # the survival readout, only
+        return self.quality(x)
 
     def _encode(self, x: ValueInputs) -> torch.Tensor:
         """Run the token stream through the borrowed layers once.
@@ -351,31 +382,29 @@ class FlowValueModel(nn.Module):
         return h
 
     def quality_logits(self, x: ValueInputs) -> torch.Tensor:
-        """Logits over the normalized-return bins, from the QUALITY readout.
+        """The head's raw output, from the readout token.
 
         Args:
             x: The batch.
 
         Returns:
-            ``(B, quality_bins)``.
-
-        Raises:
-            ValueError: If this model has no quality head. Not a zero fallback: a zero return
-                is the worst possible value, so a silent one would rank every candidate as
-                maximally bad and read as the selector being broken rather than absent.
+            ``(B, 1)``.
         """
-        if self.quality_head is None:
-            raise ValueError(
-                "this critic has no quality head (quality_bins=0), so there is no tracking "
-                "return to read. Fit one with --quality_bins, or score on survival alone.")
-        return self.quality_head(self._encode(x)[:, 1])
+        # Token 0, and the ONLY readout. It was token 1 while a survival readout occupied 0,
+        # and moving it is not cosmetic: this token ATTENDS to the rest of the stream, so
+        # dropping one key/value changes the representation the head reads. Every critic
+        # fitted before that cut is a different function rather than a checkpoint with an
+        # extra unused head -- which is why they do not load, and why numbers measured with
+        # one do not describe this model.
+        return self.quality_head(self._encode(x)[:, 0])
 
     def quality(self, x: ValueInputs) -> torch.Tensor:
-        """``G_hat(s)`` in ``[0, 1]`` -- the expected normalized tracking return.
+        """``V(s)`` -- the expected normalized return.
 
-        The distribution's MEAN over the declared support, not its argmax: the head is
-        distributional for training stability, but the selector needs a scalar to order
-        candidates by and the mean is the one that matches the regression target.
+        The head's single output IS the prediction and is returned RAW -- deliberately not
+        clamped into the reward's range. An advantage is ``G - V``, so clamping would bias it
+        wherever the critic is miscalibrated, and an out-of-range prediction is information
+        about the fit rather than something to hide.
 
         Args:
             x: The batch.
@@ -383,68 +412,8 @@ class FlowValueModel(nn.Module):
         Returns:
             ``(B,)``.
         """
-        probs = torch.softmax(self.quality_logits(x), dim=-1)
-        return (probs * self.quality_support).sum(dim=-1)
-
-    def p_fail(self, x: ValueInputs) -> torch.Tensor:
-        """``P(fail | s)`` in ``[0, 1]``."""
-        return torch.sigmoid(self.forward(x))
-
-    def heads(self, x: ValueInputs) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Both heads from ONE encoder pass: ``(fail_logit, quality_logits or None)``.
-
-        What training and the selector should call. Two separate calls would run the borrowed
-        layer stack twice for the same tokens.
-
-        Args:
-            x: The batch.
-
-        Returns:
-            ``((B,) survival logit, (B, bins) quality logits or None)``.
-        """
-        h = self._encode(x)
-        fail = self.head(h[:, 0]).squeeze(-1)
-        qual = None if self.quality_head is None else self.quality_head(h[:, 1])
-        return fail, qual
-
-    def combined_value(self, x: ValueInputs, *, w_fail: float = 1.0) -> torch.Tensor:
-        """``V(s) = w_track * G_hat(s) - w_fail * P(fail | s)``, larger is better.
-
-        ONE definition, used by the advantage label and by the selector, so the thing being
-        maximised at run time is the thing the fine-tune's label is computed from -- by
-        construction rather than by two matching implementations.
-
-        ``w_track = 1 - w_fail``, so ``w_fail = 1`` is exactly the survival-only
-        ``V = -P(fail)`` this class shipped with and is therefore the control arm rather than
-        a new configuration.
-
-        Args:
-            x: The batch.
-            w_fail: Weight on the survival term, in ``[0, 1]``.
-
-        Returns:
-            ``(B,)``.
-
-        Raises:
-            ValueError: If ``w_fail < 1`` on a model with no quality head -- asking for a
-                tracking term that does not exist.
-        """
-        if not 0.0 <= float(w_fail) <= 1.0:
-            raise ValueError(f"w_fail must be in [0, 1], got {w_fail!r}")
-        fail_logit, qual_logits = self.heads(x)
-        v = -float(w_fail) * torch.sigmoid(fail_logit)
-        if float(w_fail) >= 1.0:
-            return v
-        if qual_logits is None:
-            raise ValueError(
-                f"w_fail={w_fail} asks for the tracking term, but this critic has no quality "
-                "head. Fit one, or score at w_fail=1.")
-        probs = torch.softmax(qual_logits, dim=-1)
-        return v + (1.0 - float(w_fail)) * (probs * self.quality_support).sum(dim=-1)
-
-    def value(self, x: ValueInputs) -> torch.Tensor:
-        """``V(s) = -P(fail | s)``, in ``(-1, 0)``."""
-        return -self.p_fail(x)
+        out = self.quality_logits(x)
+        return out.reshape(out.shape[0])
 
     def trainable_parameters(self):
         """The parameters an optimizer should see."""

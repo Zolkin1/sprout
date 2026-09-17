@@ -321,10 +321,16 @@ def test_pitch_quaternion_is_identity_at_zero():
 ##
 
 def _specs():
-    """The depth contract for the real ``G1-teacher-clf-terrain-depth`` cfgs.
+    """The POLICY's depth contract for the real ``G1-teacher-clf-terrain-depth`` cfgs.
 
     Goes through the same simulator-free entry point the sim2sim verification tools use,
     so this checks the contract the task actually declares rather than a restatement of it.
+
+    NEAR ONLY: the policy group holds one camera. :func:`_fm_specs` is the physical pair --
+    the far camera's numbers are still exported, just into the GENERATOR's artifact.
+
+    Returns:
+        One dict per camera the policy observes, in observation order.
     """
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
         depth_camera_specs_from_cfg,
@@ -333,12 +339,71 @@ def _specs():
     return depth_camera_specs_from_cfg()
 
 
+def _fm_specs():
+    """The GENERATOR's depth contract: the ``fm_depth`` group over the same scene.
+
+    This is the contract that describes the whole physical pair, so every per-camera number
+    below (intrinsics, range, normalisation, mount pose) is measured against it. Reading
+    them off the policy's contract instead would leave the far camera -- which only the
+    generator observes, and which ``fm.onnx`` embeds -- checked nowhere at all.
+
+    Returns:
+        One dict per camera the generator observes, in observation order.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+        G1FmDepthObservationsCfg,
+        depth_camera_specs_from_cfg,
+    )
+    from robot_rl.tasks.manager_based.robot_rl.mdp import FM_DEPTH_OBS_GROUP
+
+    # The SHARED-sampling arm of install_fm_depth_group: the group exactly as declared,
+    # whose terms already name the scene's own sensors. The split arm rewrites those to
+    # ``fm_`` duplicates and is covered where the task installs it.
+    observations = SimpleNamespace(**{FM_DEPTH_OBS_GROUP: G1FmDepthObservationsCfg()})
+    return depth_camera_specs_from_cfg(observations=observations, group=FM_DEPTH_OBS_GROUP)
+
+
 def test_camera_spec_order_and_identity():
-    """The contract lists both cameras in observation order, keyed to their obs terms."""
-    specs = _specs()
-    assert [s["obs_term"] for s in specs] == ["depth_near", "depth_far"]
-    assert [s["sensor"] for s in specs] == ["depth_camera_near", "depth_camera_far"]
-    assert all(s["mount_body"] == "torso_link" for s in specs)
+    """The POLICY reads the near camera; the GENERATOR reads the pair, near first.
+
+    Three properties, each of which fails silently on its own:
+
+    * the policy's contract is a strict SUBSET of the generator's -- there is ONE physical
+      pair and the policy is conditioned on part of it, so a policy camera the generator
+      lacks would be a tracker reading a lens its reference was never placed from;
+    * the generator's covers BOTH cameras. A missing one is a half-blind generator whose
+      recording, checkpoint and ``fm.onnx`` all agree with each other;
+    * ORDER is near-then-far in both. The FM binds one CNN trunk per camera BY INDEX, each
+      with its own angular position embedding (the cones are 100x70 and 70x42 deg), so a
+      swapped order is shape-clean and mislabels the far camera's tokens by 1.43x.
+    """
+    specs, fm_specs = _specs(), _fm_specs()
+    assert [s["obs_term"] for s in specs] == ["depth_near"]
+    assert [s["sensor"] for s in specs] == ["depth_camera_near"]
+    assert [s["obs_term"] for s in fm_specs] == ["fm_depth_near", "fm_depth_far"]
+    assert [s["sensor"] for s in fm_specs] == ["depth_camera_near", "depth_camera_far"]
+    assert all(s["mount_body"] == "torso_link" for s in specs + fm_specs)
+
+    policy_cameras = [s["sensor"] for s in specs]
+    fm_cameras = [s["sensor"] for s in fm_specs]
+    assert set(policy_cameras) < set(fm_cameras), "the policy reads part of one pair"
+    # ...and the shared cameras keep the same ORDER in both contracts.
+    assert [c for c in fm_cameras if c in set(policy_cameras)] == policy_cameras
+
+
+def test_the_two_contracts_describe_the_same_lens():
+    """One physical camera read by two observation terms must export identical numbers.
+
+    The two groups reach the same sensor through separate ``ObsTerm``s, each with its own
+    copy of the normalisation params, so nothing but this stops the generator's reading of
+    the near camera drifting onto a different affine or a different range from the policy's
+    -- which would be two artifacts describing one lens differently, with no shape to
+    reveal it. Only ``obs_term`` may differ: that names the term, not the camera.
+    """
+    near = _specs()[0]
+    fm_near = next(s for s in _fm_specs() if s["sensor"] == "depth_camera_near")
+    assert {k: v for k, v in near.items() if k != "obs_term"} == \
+        {k: v for k, v in fm_near.items() if k != "obs_term"}
 
 
 def test_camera_spec_intrinsics_match_the_effective_fov():
@@ -346,10 +411,13 @@ def test_camera_spec_intrinsics_match_the_effective_fov():
 
     The apertures are derived from the effective FOV, so this is the check that the
     exported intrinsics describe the rays actually cast rather than the physical lens.
+
+    Measured on the GENERATOR's contract: it is the one covering both cameras, and a ``zip``
+    against the policy's near-only list would drop the far camera without failing.
     """
     from robot_rl.tasks.manager_based.robot_rl.g1 import g1_depth_env_cfg as dcfg
 
-    for spec, cam in zip(_specs(), (dcfg._NEAR, dcfg._FAR)):
+    for spec, cam in zip(_fm_specs(), (dcfg._NEAR, dcfg._FAR), strict=True):
         width, height = spec["width"], spec["height"]
         assert (width, height) == (dcfg._DEPTH_W, dcfg._DEPTH_H)
         expect_fx = width / (2.0 * math.tan(math.radians(cam.effective_fov_h_deg) / 2.0))
@@ -364,11 +432,12 @@ def test_camera_spec_carries_the_normalisation_and_range():
 
     A deploy that reproduces the rays but not this arithmetic would feed the policy a
     differently-scaled image, so every argument ``normalize_depth`` takes is exported --
-    including the ones the term leaves at their default.
+    including the ones the term leaves at their default. Both cameras, via the generator's
+    contract (see :func:`_fm_specs`).
     """
     from robot_rl.tasks.manager_based.robot_rl.g1 import g1_depth_env_cfg as dcfg
 
-    for spec, cam in zip(_specs(), (dcfg._NEAR, dcfg._FAR)):
+    for spec, cam in zip(_fm_specs(), (dcfg._NEAR, dcfg._FAR), strict=True):
         assert spec["max_distance"] == cam.max_distance_m
         assert spec["min_dist"] == cam.min_distance_m
         assert spec["max_dist"] == pytest.approx(cam.max_distance_m - dcfg._RANGE_SENTINEL_MARGIN_M)
@@ -381,10 +450,13 @@ def test_camera_spec_carries_the_normalisation_and_range():
 
 
 def test_camera_spec_mount_pose_is_the_nominal_offset():
-    """The exported mount pose is the cfg offset, in the mount body's frame."""
+    """The exported mount pose is the cfg offset, in the mount body's frame.
+
+    Both cameras, via the generator's contract (see :func:`_fm_specs`).
+    """
     from robot_rl.tasks.manager_based.robot_rl.g1 import g1_depth_env_cfg as dcfg
 
-    for spec, cam in zip(_specs(), (dcfg._NEAR, dcfg._FAR)):
+    for spec, cam in zip(_fm_specs(), (dcfg._NEAR, dcfg._FAR), strict=True):
         assert spec["offset_pos"] == pytest.approx(list(cam.pos))
         assert spec["offset_quat_xyzw"] == pytest.approx(
             list(dcfg._pitch_down_quat_xyzw(cam.pitch_deg))
@@ -413,7 +485,7 @@ def test_camera_spec_is_empty_without_depth_terms():
 
     The scan-only teacher's own group, so this is the real "no cameras" case rather than
     a hand-emptied one -- and it pins that the contract follows the OBSERVED terms, not
-    the cameras the scene happens to hold.
+    the cameras the scene happens to hold (both cameras stay on the scene here).
     """
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
         G1TeacherTerrainDepthObservationsCfg,
@@ -421,8 +493,19 @@ def test_camera_spec_is_empty_without_depth_terms():
     )
 
     observations = G1TeacherTerrainDepthObservationsCfg()
+    # Clearing a term the group does NOT have creates a stray attribute rather than
+    # emptying anything -- a silent no-op that would leave this passing against a contract
+    # it had not cleared. So the term list is asserted before it is cleared: the policy
+    # group holds the near camera alone.
+    depth_terms = [n for n in vars(observations.policy) if n.startswith("depth_")]
+    # BOTH slots are declared: `depth_far` exists as None so that
+    # `enable_policy_far_camera` can fill it without changing the term ORDER (configclass
+    # resolves order from the declarations, and appending it later would transpose the two
+    # cameras in the policy vector). Declared-and-None contributes no contract, which is
+    # what the assertion below then shows.
+    assert depth_terms == ["depth_near", "depth_far"], depth_terms
+    assert observations.policy.depth_far is None, "the far slot must default OFF"
     observations.policy.depth_near = None
-    observations.policy.depth_far = None
     assert depth_camera_specs_from_cfg(observations=observations) == []
 
 

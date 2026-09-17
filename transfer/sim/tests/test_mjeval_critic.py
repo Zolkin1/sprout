@@ -4,7 +4,7 @@
 
 Two halves, and the second is what makes the first mean anything.
 
-**Reproduction** -- ``critic.FailureCritic.p_fail`` against ``fit_value``'s own batcher and
+**Reproduction** -- ``critic.ValueCritic.value`` against ``fit_value``'s own batcher and
 model on the same real windows.  Measured 2.1e-07 mean / 1.1e-06 max, which is fp32
 accumulation order between a batched and a single-sample forward.
 
@@ -68,16 +68,34 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(scope="module")
 def fitted():
-    """The critic, a representative window sample, and the baseline ``p_fail``.
+    """The critic, a representative window sample, and the baseline ``V(s)``.
+
+    SKIPS on a pre-cut checkpoint, rather than failing. The critic used to carry a survival
+    head (``head.*``, predicting ``P(fail | s)``) beside the value head; both it and the
+    distributional form of the value head are gone, so a checkpoint fitted before that cut
+    carries ``head.*`` and no ``quality_head.*`` and is refused by strict loading -- by design,
+    since the surviving head's representation changed too and such a checkpoint is a different
+    function rather than a compatible one.
+
+    The sabotage cases below are worth keeping for the next critic, so this states the reason
+    and waits rather than being deleted. Refit with ``fit_value.py`` to re-enable.
 
     Returns:
-        ``(FailureCritic, windows dict, baseline p_fail array)``.
+        ``(ValueCritic, windows dict, baseline V array)``.
     """
     import h5py
+    import torch
 
     import critic as C
 
-    fc = C.FailureCritic(CKPT, device="cpu")
+    sd = torch.load(CKPT, map_location="cpu", weights_only=False).get("model", {})
+    if "quality_head.0.weight" not in sd:
+        pytest.skip(
+            f"{CKPT} predates the single-head critic cut (carries "
+            f"{sorted(k for k in sd if k.startswith('head.'))!r} and no quality_head). "
+            "Refit with fit_value.py to re-enable these parity + sabotage cases.")
+
+    fc = C.ValueCritic(CKPT, device="cpu")
     cols = ("history", "extero", "cmd_future", "history_null", "height_scan", "proprio",
             "goal_downrange_m", "goal_lateral_m", "goal_height_err_m", "base_twist_yaw")
     with h5py.File(ROLLOUT, "r") as f:
@@ -88,7 +106,7 @@ def fitted():
     assert W["history_null"].mean() < 0.25, (
         f"history_null is {W['history_null'].mean():.2f} in this sample -- these are opening "
         "re-plans with an empty ring, and every history sabotage reads 0.0 against them")
-    base = np.array([fc.p_fail(_inputs(C, W, i)) for i in range(N_WINDOWS)])
+    base = np.array([fc.value(_inputs(C, W, i)) for i in range(N_WINDOWS)])
     return fc, W, base
 
 
@@ -117,7 +135,7 @@ def _inputs(C, W, i, **override):
 
 
 def test_reproduces_the_fit(fitted):
-    """``FailureCritic`` must agree with ``fit_value``'s own pipeline on real windows."""
+    """``ValueCritic`` must agree with ``fit_value``'s own pipeline on real windows."""
     import importlib.util
 
     fc, W, base = fitted
@@ -186,7 +204,7 @@ def test_a_goal_context_stamp_that_contradicts_context_dim_is_REFUSED(tmp_path):
     bad = tmp_path / "V_priv_bad_stamp.pt"
     torch.save(ck, bad)
     with pytest.raises(ValueError, match="context_dim"):
-        C.FailureCritic(str(bad), device="cpu")
+        C.ValueCritic(str(bad), device="cpu")
 
 
 #: ``(sabotage, measured mean |dp|, margin)`` over this module's own 64-window sample.
@@ -246,7 +264,7 @@ def test_the_suite_can_see_this_error(fitted, name, measured, margin):
             return {"twist": np.zeros(6, np.float32)}
         raise AssertionError(name)
 
-    p = np.array([fc.p_fail(_inputs(C, W, i, **sab(i))) for i in range(N_WINDOWS)])
+    p = np.array([fc.value(_inputs(C, W, i, **sab(i))) for i in range(N_WINDOWS)])
     d = np.abs(p - base)
     v = d.mean() if stat == "mean" else d.max()
     assert v > margin, (
@@ -257,23 +275,6 @@ def test_the_suite_can_see_this_error(fitted, name, measured, margin):
         "floor is 0.005, so a fall to that level means the critic stopped reading the input.")
 
 
-def test_the_scan_fold_is_not_square_so_a_transpose_cannot_be_silent():
-    """The one structural guard covering an arm the sabotage suite is measurably blind to.
-
-    A transposed scan fold moves ``p_fail`` by 0.0049 -- 14x less than zeroing the scan -- so
-    no delta test can catch it.  What makes it safe is that ``(11, 16)`` is not square, so the
-    wrong fold raises on shape instead.  If the grid ever becomes square this guard is gone
-    and the error becomes genuinely silent, which is what this test is here to announce.
-    """
-    import critic as C
-
-    h, w = C.SCAN_HW
-    assert h != w, (
-        f"SCAN_HW is {C.SCAN_HW}, which is SQUARE. A transposed fold is now shape-silent and "
-        "the sabotage suite is measurably blind to it (0.0049 against a 0.05 margin). Add a "
-        "positive orientation check -- see transfer/sim/tests/test_height_scan_grid.py, which "
-        "pins the dense 121x121 grid against the coarse cast for exactly this reason.")
-    assert h * w == 176, f"the coarse scan is 176 rays, {C.SCAN_HW} is {h * w}"
 
 #: ``(name, root_quat_xyzw, expected gravity_b, expected yaw-frame twist of world [1,0,0])``.
 #:

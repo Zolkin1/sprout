@@ -47,30 +47,28 @@ import argparse
 import os
 from dataclasses import dataclass
 
-# Training terrain step geometry, MEASURED from the MB library the current policy trains on
-# (clips/g1_mb_v1_nodistract.h5 terrain_manifest, 70 stair tiles):
-#     riser  in {0.13, 0.15, 0.17}      tread in {0.22, 0.25, 0.28}      n_steps 3..39
-# The defaults below are the MODAL pair. The previous defaults (0.135 / 0.233) came from the
-# older DP library clips/g1_terrain_v2.h5 and sat BETWEEN grid points, i.e. slightly
-# out-of-distribution for every trained tile.
-TRAINED_RISERS = (0.13, 0.131, 0.15, 0.17)
-#: 0.209 was MISSING here and is not a rounding of 0.22: four stairs_up transition tiles
-#: (1, 3, 8, 15) carry it, and it is the tread the clip library walks at HALF speed --
-#: 0.32 m/s against 0.61-0.69 on every other tread. So the one geometry whose reference
-#: behaves differently was the one the playground could not build.
-#: UP and DOWN staircases use DIFFERENT tread sets, and the old constant listed only the UP
-#: one.  Measured identically on g1_mb_v5_body.h5, g1_mb_v5_body_mode11.h5 and the decorated
-#: library -- so 0.178 / 0.19 did not arrive with any of those passes, they were always there
-#: and were simply never written down:
-#:
-#:     stairs_up, stairs_up_pure     0.209  0.22  0.221  0.25  0.28
-#:     stairs_down, stairs_dn_pure   0.178  0.19  0.22   0.25
-#:
-#: A descending flight is therefore steeper per tread than any ascending one the robot has
-#: seen, which a probe sweeping ``--run`` should know before calling 0.19 out-of-distribution.
-TRAINED_TREADS = (0.178, 0.19, 0.209, 0.22, 0.221, 0.25, 0.28)
+# Training terrain step geometry, MEASURED from the library the current policy trains on
+# (clips/g1_mb_v6g_decor.h5 terrain_manifest, 82 stair tiles, 408 tread/riser pairs):
+#
+#     riser  in {0.130, 0.1312, 0.1381, 0.155, 0.180}
+#     tread  in {0.1899, 0.2092, 0.280,  0.305, 0.330}
+#
+# **The v6 regeneration MOVED THIS GRID and these constants did not follow.** They previously
+# read riser {0.13, 0.15, 0.17} / tread {0.178, 0.19, 0.209, 0.22, 0.221, 0.25, 0.28},
+# measured on g1_mb_v1_nodistract and re-checked on the v5 libraries. Of those treads only
+# 0.28 still exists: 0.178, 0.22, 0.221 and 0.25 are gone entirely. So `_warn_off_grid` was
+# scoring lanes against a staircase set the robot no longer trains on, and the two default
+# lanes it did NOT warn about (0.25 and 0.22 tread) are the two that are actually
+# out-of-distribution now.
+TRAINED_RISERS = (0.130, 0.1312, 0.1381, 0.155, 0.180)
+#: UP and DOWN staircases still use DIFFERENT tread sets, but in v6g the split is narrower
+#: than it was: the main grid {0.280, 0.305, 0.330} is shared, and only the STEEP cell differs
+#: -- 0.2092 exists on ascending flights only, 0.1899 on descending only. So a descending
+#: flight is still steeper per tread than any ascending one the robot has seen, which a probe
+#: sweeping ``--run`` should know before calling 0.19 out-of-distribution.
+TRAINED_TREADS = (0.1899, 0.2092, 0.280, 0.305, 0.330)
 #: The ascending half of that split, for a probe that only builds up-staircases.
-TRAINED_TREADS_UP = (0.209, 0.22, 0.221, 0.25, 0.28)
+TRAINED_TREADS_UP = (0.2092, 0.280, 0.305, 0.330)
 
 # Lateral step WIDTH, measured from the manifest of the library the deployed pair trains on
 # (clips/g1_mb_v5_body_mode11_decor.h5, 2026-08-27), as the narrowest flight in each tile:
@@ -121,8 +119,9 @@ REAL_STAIR_WIDTHS: dict[str, float] = {"min": 1.22, "indoor": 1.52, "outdoor": 2
 #: robot, which is the interesting end for a stairs-read-as-box question.
 TRAINED_NARROW_FLIGHT_WIDTH = 0.86
 
-DEFAULT_RISE = 0.15  # step height (m) -- modal riser
-DEFAULT_RUN = 0.25   # step depth / tread run (m) -- modal tread
+DEFAULT_RISE = 0.155  # step height (m) -- modal riser on v6g
+DEFAULT_RUN = 0.305   # step depth / tread run (m) -- modal tread on v6g (89 of 408 pairs at
+                      # (0.155, 0.305) and 89 more at (0.180, 0.305); the old 0.25 is absent)
 
 # Box (jump-on / jump-off) geometry, re-measured on clips/g1_mb_v5_body_mode11_decor.h5
 # (2026-08-27), over the leading walkable overlay of each box tile:
@@ -182,24 +181,44 @@ class Lane:
 # planned stairs on 11 of 12. Driving the old centre lane was driving the one width where the
 # training library says a raised thing is more likely a box than a staircase.
 #
-# The four (riser, tread) pairs are unchanged -- shallow-deep, modal, steep-shallow and the
-# slow-gait tread -- so the scene still spans that grid; only the widths and the names moved.
+# The four (riser, tread) pairs are all REAL v6g cells, re-snapped when the v6 regeneration
+# moved the grid: `center` is the modal cell (0.155, 0.305), `indoor` the deep-steep corner
+# (0.180, 0.330), `outdoor` the shallow corner (0.130, 0.280) and `slow_tread` the steep
+# ascending-only cell (0.1312, 0.2092). Before that re-snap `center` ran a 0.25 tread and
+# `indoor` a 0.22 -- neither of which exists anywhere in v6g, so the lane straight ahead of
+# spawn was out of distribution on the one axis the scene is for.
 DEFAULT_LANES: tuple[Lane, ...] = (
     # Straight ahead of spawn: the NARROWEST staircase that actually exists. This is the hard
     # case now, and unlike 0.86 m it is a hard case the robot will meet.
     Lane(name="center", y=0.0, width=REAL_STAIR_WIDTHS["min"], steps=6,
-         rise=0.15, run=0.25),
+         rise=0.155, run=0.305),
     Lane(name="indoor", y=-3.5, width=REAL_STAIR_WIDTHS["indoor"], steps=4,
-         rise=0.17, run=0.22),
+         rise=0.180, run=0.330),
     Lane(name="outdoor", y=4.0, width=REAL_STAIR_WIDTHS["outdoor"], steps=8,
-         rise=0.13, run=0.28),
+         rise=0.130, run=0.280),
     # The SLOW-GAIT geometry, which the other three lanes cannot express. Measured over the
     # library: tread 0.209 / riser 0.131 is walked at 0.32 m/s, while every tread of 0.22 and
     # above is walked at 0.61-0.69 -- a 2x split with nothing in between, across a geometry
     # sweep that is otherwise continuous. Its width used to be tile 15's 0.86 m; at a real
     # width the tread is the only thing that makes it special, which is the point of it.
     Lane(name="slow_tread", y=8.0, width=REAL_STAIR_WIDTHS["indoor"], steps=6,
-         rise=0.131, run=0.209),
+         rise=0.1312, run=0.2092),
+    # A TALL real staircase: 20 steps at a tape-measured 5.5 in x 12.5 in (0.1397 / 0.3175 m),
+    # the same cell `configs/finetune/*.yaml` carries in `updown_measured_cells`.
+    #
+    # What is new here is the HEIGHT, not the step. The cell INTERPOLATES inside the trained
+    # grid -- 0.1397 sits between the 0.130 and 0.155 risers, 0.3175 between the 0.305 and
+    # 0.330 treads -- so every individual step is a shape the robot has seen. Measured over
+    # v6g's 82 stair tiles, flights run 1..18 steps (p50 5) and 0.13..2.49 m (p50 0.77); at 20
+    # steps this is 2.794 m, 1.12x the tallest flight in the library and ~4x the median.
+    #
+    # That makes it the one lane where a failure is about SUSTAINING the gait rather than
+    # entering it: the others are all over within a few steps of the first riser, and a
+    # generator that re-plans its way onto a staircase correctly can still drift off one over
+    # twenty. `_warn_off_grid` will flag the cell, correctly -- it is not a library cell, it
+    # is a real building's.
+    Lane(name="tall", y=12.0, width=REAL_STAIR_WIDTHS["indoor"], steps=20,
+         rise=0.1397, run=0.3175),
 )
 
 
@@ -661,9 +680,18 @@ def main() -> None:
         if round(b.height, 3) not in TRAINED_BOX_HEIGHTS:
             print(f"[WARN] box '{b.name}' height {b.height} m is OUTSIDE the trained set "
                   f"{TRAINED_BOX_HEIGHTS} -- deliberate OOD test?")
+    # TOLERANCE, not `round(x, 3) in tuple`. The grid is stated to four decimals because two
+    # of its cells are (0.1312, 0.2092) and (0.1381, 0.1899) -- rounding those to three puts
+    # them 0.2 mm outside their own tuple, so the check fired on the very lanes that sit
+    # exactly ON the grid. A false warning here is worse than none: it is printed beside the
+    # real ones, on a run whose whole purpose is to say which lanes are off-distribution.
+    def _on_grid(v: float, grid: tuple[float, ...], tol: float = 1e-3) -> bool:
+        """Whether ``v`` matches a grid value to within a millimetre."""
+        return any(abs(v - g) <= tol for g in grid)
+
     for ln in lanes:
         r, rn = ln.rise if ln.rise is not None else args.rise, ln.run if ln.run is not None else args.run
-        if round(r, 3) not in TRAINED_RISERS or round(rn, 3) not in TRAINED_TREADS:
+        if not _on_grid(r, TRAINED_RISERS) or not _on_grid(rn, TRAINED_TREADS):
             print(f"[WARN] lane '{ln.name}' rise/run {r}/{rn} is off the trained grid "
                   f"{TRAINED_RISERS}/{TRAINED_TREADS} -- deliberate OOD test?")
         # Width had no check at all, which is how a 2.2 m centre lane -- wider than any

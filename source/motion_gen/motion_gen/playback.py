@@ -57,18 +57,73 @@ def inertialize_seam(root_pos, root_quat, joints, seam, blend_n, *, anchored_aft
         blend_n: blend length in frames.
         anchored_after: ``True`` if the anchored (terrain) segment is AFTER the seam.
     """
+    off = seam_offset(root_pos, root_quat, joints, seam, anchored_after=anchored_after)
+    return apply_seam_offset(root_pos, root_quat, joints, seam, off, blend_n,
+                             anchored_after=anchored_after)
+
+
+def seam_offset(root_pos, root_quat, joints, seam, *, anchored_after, welded=False):
+    """The RESIDUAL at a seam -- the mismatch that should not be there, with legitimate travel removed.
+
+    Split out of :func:`inertialize_seam` so a clip with MANY seams can capture every offset from the
+    UNMODIFIED concatenation before any of them is applied.  Capturing lazily, seam by seam, makes the
+    result depend on call order whenever two seams are closer than ``2 * blend_n``: the second capture
+    reads frames the first ease already moved, and its window reaches back over the first seam, reopening
+    it.  Harmless for a 3-segment terrain clip whose replay is long, wrong for
+    ``[loop][transient][loop][transient]...``.
+
+    **The root-position part subtracts one frame of the anchored side's own travel.**  Taking the raw
+    difference between the two boundary frames treats a frame of legitimate forward motion as if it were
+    a discontinuity, and easing it lands the free boundary frame exactly ON the anchored one -- the root
+    stops dead for a frame.  That is what makes a spliced terrain clip report a suspiciously perfect
+    ``seam_speed`` of 0.000 while actually carrying a velocity dip at every splice.
+
+    ``welded=True`` says the placement ALREADY made the position continuous (a chained
+    ``align_and_concat`` join does), in which case the correct positional residual is exactly zero and is
+    returned as such.  Subtracting travel is not good enough there: it computes one step minus the NEXT
+    step, which cancels only if the gait's step length is constant, and a real gait's is not -- measured,
+    that injected enough noise to take the flat per-seam ratio p95 from 0.51 to 4.61.  After a GROUNDED
+    placement the surface residual is real, and there the travel subtraction is what stops a frame of
+    legitimate motion being eased away.
+
+    Returns ``(off_p, off_q, off_j)``, or ``None`` if the seam has no free frames to ease.
+    """
+    n = root_pos.shape[0]
+    ref = seam if anchored_after else seam - 1
+    free = seam - 1 if anchored_after else seam
+    if not (0 <= ref < n and 0 <= free < n):
+        return None
+    if welded:
+        off_p = torch.zeros_like(root_pos[ref])
+    else:
+        off_p = root_pos[ref] - root_pos[free]
+        # One frame of the ANCHORED side's motion, in the direction that carries it toward the seam.
+        nxt = seam + 1 if anchored_after else seam - 2
+        if 0 <= nxt < n:
+            travel = (root_pos[nxt] - root_pos[ref]) if anchored_after else (root_pos[ref] - root_pos[nxt])
+            off_p = off_p - travel
+    return (off_p,
+            quat_mul(root_quat[ref].unsqueeze(0), quat_inv(root_quat[free].unsqueeze(0)))[0],
+            joints[ref] - joints[free])
+
+
+def apply_seam_offset(root_pos, root_quat, joints, seam, off, blend_n, *, anchored_after):
+    """Decay a captured seam ``off`` into the FREE side over ``blend_n`` frames (returns modified copies).
+
+    The correction is full at the free boundary frame and fades to zero ``blend_n`` frames away, so the
+    free side eases in while staying on its own ground further out.  Because :func:`seam_offset` has
+    already removed one frame of legitimate travel, "full" here means the free frame lands where the
+    anchored side's motion says it should -- not on top of it.
+    """
     root_pos, root_quat, joints = root_pos.clone(), root_quat.clone(), joints.clone()
-    T = root_pos.shape[0]
+    if off is None or int(blend_n) < 1:
+        return root_pos, root_quat, joints
+    off_p, off_q, off_j = off
+    t = root_pos.shape[0]
     if anchored_after:                        # anchored starts at `seam`; ease the free TAIL (< seam)
-        ref = seam
         idxs = [(seam - 1 - j, j) for j in range(min(int(blend_n), seam))]
     else:                                     # anchored ends at `seam-1`; ease the free HEAD (>= seam)
-        ref = seam - 1
-        idxs = [(seam + j, j) for j in range(min(int(blend_n), T - seam))]
-    off_p = root_pos[ref] - root_pos[idxs[0][0]] if idxs else None
-    off_j = joints[ref] - joints[idxs[0][0]] if idxs else None
-    off_q = (quat_mul(root_quat[ref].unsqueeze(0), quat_inv(root_quat[idxs[0][0]].unsqueeze(0)))[0]
-             if idxs else None)
+        idxs = [(seam + j, j) for j in range(min(int(blend_n), t - seam))]
     for f, j in idxs:
         d = smoothstep(1.0 - j / float(blend_n))
         root_pos[f] = root_pos[f] + off_p * d

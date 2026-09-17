@@ -173,6 +173,19 @@ transfer/sim/robots/g1/*_stair_probe_*.xml
 # without the XML.
 transfer/sim/robots/g1/*_mjeval_*.xml
 
+# Per-tile scenes written by transfer/sim/mode_probe.py, one per probed tile (and per
+# --scene_tag when two probes share a tile). Rebuilt deterministically from the clip library's
+# terrain_manifest on every stage, including --stage label, which is the point: the labeller
+# regenerating the same geometry is what keeps the replay in the world the trials ran in.
+transfer/sim/robots/g1/*_modeprobe_*.xml
+
+# Lanes written by transfer/sim/vel_tracking_sweep.py -- one per terrain class (and per
+# --scene_tag when two sweeps run concurrently). Regenerated deterministically from the CLI's
+# approach/runout and geometry on every run, so they are build output rather than assets, and
+# the run's summary.json records the profile each lane was emitted with -- which is also what
+# the figure is drawn from, so a result stays readable without the XML.
+transfer/sim/robots/g1/*_veltrack_*.xml
+
 # Per-tile scenes written by transfer/sim/fm_noise_attribution.py. `CourseRig` rewrites
 # robots/g1/<robot>_<course>.xml from the course before loading it, and the sweep shards give
 # each worker its own scene TAG so concurrent workers cannot tear one file -- so a run leaves

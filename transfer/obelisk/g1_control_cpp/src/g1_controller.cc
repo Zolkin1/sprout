@@ -79,7 +79,13 @@ G1Controller::G1Controller(const std::string& name)
       "sub_vel_cmd",
       [this](const obelisk_control_msgs::msg::VelocityCommand& msg) {
         std::lock_guard<std::mutex> lock(cmd_mutex_);
-        vel_cmd_ = Vec3(msg.v_x, msg.v_y, msg.w_z);
+        // CLAMPED HERE, so the envelope covers every publisher of this topic -- the joystick,
+        // the scripted node, and anything else that ever drives it -- rather than only the
+        // one that happens to have a scale parameter. The raw message is still on the wire
+        // and in the bag, so nothing is lost by storing the clamped value.
+        vel_cmd_ = Vec3(std::clamp(msg.v_x, vel_cmd_x_min_, vel_cmd_x_max_),
+                        std::clamp(msg.v_y, -vel_cmd_y_abs_max_, vel_cmd_y_abs_max_),
+                        std::clamp(msg.w_z, -vel_cmd_yaw_abs_max_, vel_cmd_yaw_abs_max_));
         vel_cmd_time_ = this->now().seconds();
       });
 
@@ -110,6 +116,14 @@ void G1Controller::DeclareParams() {
                                                   std::vector<std::string>{});
   this->declare_parameter<double>("depth_timeout", 0.15);
   this->declare_parameter<double>("vel_cmd_timeout", 1.0);
+  // The commanded-velocity ENVELOPE. Asymmetric in x on purpose: the generator has two
+  // forward-facing cameras and nothing behind, so backwards is the direction it cannot see
+  // the ground it is about to step on. A joystick `v_x_scale` cannot express this -- the axis
+  // is [-1, 1], so a scale is symmetric by construction.
+  this->declare_parameter<double>("vel_cmd_x_min", -0.4);
+  this->declare_parameter<double>("vel_cmd_x_max", 0.8);
+  this->declare_parameter<double>("vel_cmd_y_abs_max", 0.0);
+  this->declare_parameter<double>("vel_cmd_yaw_abs_max", 0.6);
   this->declare_parameter<bool>("verbose", false);
   this->declare_parameter<bool>("debug_topics", true);
   // The generator's LEAD, not its cadence. The cadence comes from tracker.onnx metadata and
@@ -198,6 +212,28 @@ G1Controller::on_configure(const rclcpp_lifecycle::State& prev) {
   depth_topics_ = this->get_parameter("depth_topics").as_string_array();
   depth_timeout_ = this->get_parameter("depth_timeout").as_double();
   vel_cmd_timeout_ = this->get_parameter("vel_cmd_timeout").as_double();
+  {
+    // Under the lock: the subscription is already live at on_configure time, so the callback
+    // can be reading these on another thread while this assigns them.
+    std::lock_guard<std::mutex> lock(cmd_mutex_);
+    vel_cmd_x_min_ = this->get_parameter("vel_cmd_x_min").as_double();
+    vel_cmd_x_max_ = this->get_parameter("vel_cmd_x_max").as_double();
+    vel_cmd_y_abs_max_ = this->get_parameter("vel_cmd_y_abs_max").as_double();
+    vel_cmd_yaw_abs_max_ = this->get_parameter("vel_cmd_yaw_abs_max").as_double();
+    if (vel_cmd_x_min_ > vel_cmd_x_max_ || vel_cmd_y_abs_max_ < 0.0 ||
+        vel_cmd_yaw_abs_max_ < 0.0) {
+      // An inverted or negative envelope clamps every command to a single value (or to an
+      // empty range), which reads as "the policy ignores the joystick" rather than as a
+      // config error. Refuse it at configure time instead.
+      RCLCPP_ERROR(this->get_logger(),
+                   "velocity envelope is empty: x [%.3f, %.3f], |y| <= %.3f, |yaw| <= %.3f",
+                   vel_cmd_x_min_, vel_cmd_x_max_, vel_cmd_y_abs_max_, vel_cmd_yaw_abs_max_);
+      return rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn::FAILURE;
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "velocity envelope: v_x [%.2f, %.2f], |v_y| <= %.2f, |w_z| <= %.2f m/s",
+                vel_cmd_x_min_, vel_cmd_x_max_, vel_cmd_y_abs_max_, vel_cmd_yaw_abs_max_);
+  }
   verbose_ = this->get_parameter("verbose").as_bool();
   debug_topics_ = this->get_parameter("debug_topics").as_bool();
   fm_lead_sec_ = this->get_parameter("fm_lead_sec").as_double();
@@ -415,7 +451,7 @@ void G1Controller::SetupCameraFk() {
                 "the generator reads depth alone (1 channel); no camera FK needed");
     return;
   }
-  const auto& cams = policy_->params().depth_cameras;
+  const auto& cams = policy_->rig_cameras();
   if (cams.empty()) {
     // A scan generator on a camera-less tracker: the xyz channels are the SCAN's, and it
     // carries its own metric coordinates. Nothing to FK.
@@ -443,19 +479,22 @@ void G1Controller::SetupCameraFk() {
 }
 
 void G1Controller::SetupDepth() {
-  const auto& cams = policy_->params().depth_cameras;
+  const auto& cams = policy_->rig_cameras();
   if (cams.empty()) {
     if (!depth_topics_.empty()) {
       RCLCPP_WARN(this->get_logger(),
-                  "depth_topics is set but this policy reads no depth cameras; ignoring");
+                  "depth_topics is set but this deployment publishes no depth cameras; "
+                  "ignoring");
     }
     return;
   }
   if (depth_topics_.size() != cams.size()) {
     throw std::runtime_error(
-        "this policy reads " + std::to_string(cams.size()) + " depth camera(s) but " +
+        "this deployment publishes " + std::to_string(cams.size()) + " depth camera(s) but " +
         std::to_string(depth_topics_.size()) +
-        " topic(s) are configured. The order is the CONTRACT order from the artifact metadata, "
+        " topic(s) are configured. The list is the RIG -- the GENERATOR's cameras when one is "
+        "loaded, which since the near-only policy is MORE than the tracker reads; the tracker "
+        "takes its subset by name. The order is the CONTRACT order from the artifact metadata, "
         "not an arbitrary list: swapping near and far is invisible in every shape.");
   }
   depth_.assign(cams.size(), {});
@@ -475,12 +514,12 @@ void G1Controller::SetupDepth() {
         [this, i](const sensor_msgs::msg::Image::SharedPtr msg) { DepthCallback(msg, i); },
         opts));
     RCLCPP_INFO(this->get_logger(), "depth camera %zu ('%s') <- %s", i,
-                policy_->params().depth_cameras[i].obs_term.c_str(), depth_topics_[i].c_str());
+                policy_->rig_cameras()[i].obs_term.c_str(), depth_topics_[i].c_str());
   }
 }
 
 void G1Controller::DepthCallback(const sensor_msgs::msg::Image::SharedPtr msg, size_t index) {
-  const auto& cam = policy_->params().depth_cameras[index];
+  const auto& cam = policy_->rig_cameras()[index];
   // VALIDATE before casting. The python has a TODO here and gets away with it because
   // np.frombuffer raises; in C++ a reinterpret_cast over a short buffer is an out-of-bounds
   // read. A wrong-sized frame is a different camera, not a resizable image.
@@ -555,8 +594,8 @@ void G1Controller::Arm() {
             "would publish empty commands until it does, and the robot would fall while the "
             "policy was never asked for anything.",
             c, depth_.size(),
-            (policy_ && c < policy_->params().depth_cameras.size()
-                 ? policy_->params().depth_cameras[c].obs_term.c_str()
+            (policy_ && c < policy_->rig_cameras().size()
+                 ? policy_->rig_cameras()[c].obs_term.c_str()
                  : "?"));
         return;
       }
@@ -626,7 +665,7 @@ void G1Controller::Disarm(const std::string& why) {
 void G1Controller::UpdateWatchdogs() {
   const double now = this->now().seconds();
 
-  if (!policy_->params().depth_cameras.empty() && depth_timeout_ > 0.0) {
+  if (!policy_->rig_cameras().empty() && depth_timeout_ > 0.0) {
     bool any_stale = false;
     {
       std::lock_guard<std::mutex> lock(depth_mutex_);

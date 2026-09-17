@@ -40,26 +40,9 @@ control:
       # all 29 joints and their order are unchanged. The C++ runtime additionally refuses that
       # one outright now, since it is robot_now-anchored and this deploy path has no odometry.
       # Override per run with `run_sim_low.sh --policy <folder>` rather than editing this.
-      hf_policy_folder: "2026-08-20_16-36-10_mode11_decor_plan_v1"
+      hf_policy_folder: "2026-09-13_v6g_partial_trk9200_hw_ready"
       use_cuda: true
-      # Arm a pair whose robot_asset fingerprints disagree, warning on every load instead of
-      # refusing. ON, for one specific and understood delta:
-      #
-      #   tracker mjcf_sha256 245672ef...  vs  generator 0078e0d0...
-      #
-      # Commit 3ddab280 (2026-08-24) changed ONE line of g1_perceptive.xml -- the hip-pitch
-      # position gains, 40.18/2.56 -> 99.0984/6.3088 -- and nothing else. The generators in use
-      # were trained before it. `robot_asset` is baked into an FM CHECKPOINT at training time
-      # and is NOT recomputed at export, so re-exporting the generator does not clear this; only
-      # retraining would. Actuator gains are never read by the generator, and reach the robot
-      # from the TRACKER's metadata over the wire, so the pair is compatible.
-      #
-      # TURN THIS BACK OFF once the generators are retrained on a tree that carries 3ddab280.
-      # It is not a general permission: it also suppresses a joint-order, body-set or link
-      # geometry mismatch, which is exactly what the guard exists to catch. The C++ prints
-      # every differing field on every load -- read it, and if it is not the gains line above,
-      # stop.
-      allow_robot_asset_mismatch: true
+      allow_robot_asset_mismatch: false
       # 4, not the onnxruntime default of 0 (auto): auto measured ~3x SLOWER here (the FM at
       # 251 ms vs 87 ms on the 27M). Revisit per machine -- this is a measured local optimum,
       # not a portable constant.
@@ -99,6 +82,21 @@ control:
       # Likewise if no velocity command arrives -- a dead high level must not leave the
       # robot walking at the last commanded speed.
       vel_cmd_timeout: 1.0
+
+      # ---- Commanded-velocity envelope ----
+      # THE LIMIT lives here, in the controller, and the joystick's `v_*_scale` below is the
+      # STICK MAPPING. They are different things and the split is deliberate:
+      #   * a scale is symmetric by construction (the axis is [-1, 1]), so it cannot express
+      #     "0.8 forward, 0.4 back" at all;
+      #   * a scale constrains the JOYSTICK only, while /obelisk/g1/vel_cmd is equally
+      #     reachable by the scripted node and by any future high-level planner.
+      # Backwards is held to half of forwards because the generator has two forward-facing
+      # cameras and nothing behind it: reversing is the one direction where it cannot see the
+      # ground it is about to step onto.
+      vel_cmd_x_min: -0.4
+      vel_cmd_x_max: 0.8
+      vel_cmd_y_abs_max: 0.0
+      vel_cmd_yaw_abs_max: 0.6
 
       # ---- Bring-up ----
       # There is no PD warm-up, and the runtime no longer has a way to add one. On entering
@@ -157,9 +155,14 @@ control:
     pkg: obelisk_unitree_cpp
     executable: obelisk_unitree_joystick
     params:
+      # The stick MAPPING, not the limit -- see the envelope in the controller params above,
+      # which is what actually bounds the command. Forward full-stick is 0.8 and yaw
+      # full-stick is 0.6, so those two sticks reach exactly the envelope's edge and no
+      # further; full-stick BACKWARD asks for -0.8 and the envelope clamps it to -0.4, which
+      # is the asymmetry a scale cannot express on its own.
       v_x_scale: 0.8
       v_y_scale: 0.0
-      w_z_scale: 0.7
+      w_z_scale: 0.6
       # Yaw on the RIGHT STICK HORIZONTAL (RX = 3 + AXIS_OFFSET). The upstream default is RY
       # -- right stick VERTICAL -- which reads as "yaw does nothing" to anyone who pushes the
       # stick sideways expecting to turn.

@@ -377,8 +377,12 @@ def read_fm_extero_meta(checkpoint: str, map_location: str = "cpu") -> dict:
 
     Returns:
         ``{"extero_source", "extero_sensor_count", "extero_sensor_dim", "extero_encoder",
-        "extero_spec", "width", "height"}``. ``width``/``height`` are ``None`` unless the
-        checkpoint conditions on depth and states a per-camera geometry.
+        "extero_spec", "width", "height", "cameras"}``. ``width``/``height`` are ``None``
+        unless the checkpoint conditions on depth and states a per-camera geometry.
+        ``cameras`` is the SCENE SENSOR NAMES this generator conditions on, in spec order,
+        and is what an env is entitled to install its generator group over -- ``None`` when
+        the checkpoint does not name them, which must be read as "no subset declared" and
+        therefore every camera.
 
     Raises:
         ValueError: If a depth checkpoint's cameras disagree on resolution, or if the stated
@@ -397,6 +401,7 @@ def read_fm_extero_meta(checkpoint: str, map_location: str = "cpu") -> dict:
         "extero_spec": spec,
         "width": None,
         "height": None,
+        "cameras": None,
     }
     if cfg.extero_source != "depth" or not spec:
         return out
@@ -407,6 +412,14 @@ def read_fm_extero_meta(checkpoint: str, map_location: str = "cpu") -> dict:
             "share one resolution (they are stacked into one array)."
         )
     width, height = sizes.pop()
+    # The scene sensor name, and ONLY that field. `camera_name`'s three-way fallback exists to
+    # MATCH two specs that spell a camera differently; here the name is about to be handed to
+    # `install_fm_depth_group` as the thing to build, so a guess is worse than an abstention:
+    # returning None means "no subset declared", the env installs every camera, and the
+    # command term's own row-count check fires with a message that says so.
+    named = [str(c.get("sensor") or "").strip() for c in spec]
+    if all(named):
+        out["cameras"] = named
     # Against the PIXEL count: a multi-channel row is ``channels * H * W``, and this is the
     # function play.py uses to SIZE the generator's cameras -- comparing the whole row width
     # would demand a camera four times too large.

@@ -36,6 +36,11 @@ bias**. The defences are `null_cond_prob` and the history-token noise — which 
 `REFERENCE_WINDOW_NOISE` table the policy's reference observation is corrupted with, because
 both stand in for the same thing (this model's prediction error).
 
+**Fine-tuning an already-trained generator on terrain** (AWR, filtered BC and their controls)
+is a separate pipeline that consumes this one's output: see
+[`FINETUNE.md`](FINETUNE.md), which also records which generator every published fine-tune
+number started from.
+
 Pipeline: **record data → train → deploy**. Recording needs Isaac Sim; training is pure
 PyTorch (no Isaac). You **record once and train many** FM variants on the same recording —
 only re-record when the base policy or the recorded state layout changes.

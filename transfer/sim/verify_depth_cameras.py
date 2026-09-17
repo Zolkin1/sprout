@@ -15,15 +15,24 @@ same properties on the IsaacLab side. Four checks, in order of how much they pin
 4. **Articulation** -- bending the knees must change the census, proving the images track
    live kinematics rather than a frozen pose.
 
-The camera contract comes from an exported ``tracker.onnx`` when one is given (the real
-deployment path), otherwise from the training env cfg via ``--from_env_cfg`` (which needs
-isaaclab importable, but no simulator).
+EVERY camera the deployment carries, always -- which means the contract is read off the
+GENERATOR's side, not the policy's. The policy is conditioned on the NEAR camera alone
+while the generator reads both, so ``tracker.onnx``'s own ``depth_camera_spec`` names half
+the rig; and because every check below pairs ``spec`` with ``cams.cameras`` positionally, a
+camera missing from the contract does not fail anything -- it VANISHES, and this gate
+prints "ALL DEPTH CAMERA CHECKS PASSED" over one lens.
 
-``--from_env_cfg`` reads the LIVE ``G1-teacher-clf-terrain-depth`` cfgs
-(``G1TeacherTerrainDepthObservationsCfg`` policy group + ``G1TeacherTerrainDepthSceneCfg``,
-i.e. ``g1_depth_env_cfg``'s ``_NEAR`` / ``_FAR``), so it always reflects what the task
-currently declares.  The robot geometry is separate and comes from the MuJoCo model
-(``--robot_name`` / ``--scene``, default ``robots/g1/g1_perceptive_basic_scene.xml``).
+* ``--load_run`` takes the UNION of ``tracker.onnx``'s cameras and those of the ``fm.onnx``
+  beside it, which is the list the deployed runtime casts
+  (``GenTrackerPolicy.get_depth_camera_spec``). With no generator exported yet only the
+  tracker's cameras can be described, and that is said out loud rather than passed over.
+* ``--from_env_cfg`` reads the LIVE ``G1-teacher-clf-terrain-depth`` cfgs -- the
+  generator's ``fm_depth`` observation group over ``G1TeacherTerrainDepthSceneCfg``, i.e.
+  ``g1_depth_env_cfg``'s ``_NEAR`` / ``_FAR`` -- so it always reflects what the task
+  currently declares, and the group is checked to cover every camera on the scene.
+
+The robot geometry is separate and comes from the MuJoCo model (``--robot_name`` /
+``--scene``, default ``robots/g1/g1_perceptive_basic_scene.xml``).
 
 ``--viewer`` opens the MuJoCo viewer with the live hit cloud (yellow = near, cyan-green =
 far) plus each camera's mount frame as RGB axes -- red is +x, the optical axis, which is
@@ -57,14 +66,104 @@ from depth_camera import MujocoDepthCameras  # noqa: E402
 ROOT = os.path.abspath(os.path.join(_SIM, "..", ".."))
 
 
-def spec_from_tracker(run_dir: str) -> list[dict]:
-    """Read the depth contract out of a run's exported ``tracker.onnx``.
+def fm_spec_from_export(exported_dir: str, explicit: str | None = None) -> list[dict]:
+    """The GENERATOR's depth cameras, from the ``fm.onnx`` beside a tracker (if there is one).
+
+    The generator is the artifact that names every lens, so this is what stops the checks
+    below from narrowing to the policy's single camera.  Read through the same primitives the
+    deploy path uses (``resolve_fm_onnx`` -> ``load_fm_context`` -> ``parse_extero_spec``), so
+    an ambiguous ``exported/`` raises here exactly as it does for the runtime rather than
+    being resolved to whichever export happened to be newest.
+
+    Loaded on the CPU on purpose: only the graph's metadata is wanted, and a 27M-parameter
+    generator has no business taking a GPU to be asked what cameras it trained on.
 
     Args:
-        run_dir: Run directory (its ``exported/tracker.onnx`` is read).
+        exported_dir: A run's ``exported`` directory.
+        explicit: A generator named on the command line, which always wins.  Needed when the
+            directory holds several: a teacher's ``exported/`` collects every generator
+            trained against it, and the resolver refuses to guess between them.
 
     Returns:
-        The per-camera contract.
+        One dict per camera the generator conditions on.  Empty when the directory holds no
+        generator, or when the one it holds conditions on a height scan rather than depth
+        (a legitimate pair -- the robot has cameras, the generator reads the ground).
+    """
+    from deploy.artifacts import resolve_fm_onnx
+
+    fm_onnx = resolve_fm_onnx(exported_dir, explicit, required=False)
+    if fm_onnx is None:
+        return []
+
+    from deploy.fm_session import load_fm_context
+    from deploy.scan_obs import parse_extero_spec
+
+    name = os.path.basename(fm_onnx)
+    ctx = load_fm_context(fm_onnx, providers=["cpu"])
+    if ctx.extero_source != "depth":
+        print(f"[INFO] {name} conditions on '{ctx.extero_source}', not depth, so it names no "
+              "cameras to add to the tracker's.")
+        return []
+    return parse_extero_spec(ctx.extero_spec, ctx.extero_source, name)
+
+
+def union_cameras(tracker_spec: list[dict], fm_spec: list[dict]) -> list[dict]:
+    """Every physical camera the deployed pair reads, matched by NAME and never by index.
+
+    Built the way ``GenTrackerPolicy._resolve_depth_cameras`` builds the list the runtime
+    casts: ordered as the GENERATOR's (the superset), a shared lens contributing the
+    TRACKER's entry so its ``obs_term`` / ``sensor`` names stay what they always were, then
+    any tracker-only camera appended.  With the two contracts listing different cameras,
+    position ``i`` no longer names one lens, so pairing by it would compare the policy's near
+    camera against the generator's far one.
+
+    Args:
+        tracker_spec: ``tracker.onnx``'s cameras (the policy's -- the near one alone).
+        fm_spec: ``fm.onnx``'s cameras (the generator's -- every lens), possibly empty.
+
+    Returns:
+        One entry per physical camera, in cast order.
+    """
+    from deploy.depth_obs import camera_key, index_cameras_by_key
+
+    if not fm_spec:
+        return list(tracker_spec)
+    by_key = index_cameras_by_key(tracker_spec, "tracker.onnx")
+    union = [by_key.get(camera_key(cam), cam) for cam in fm_spec]
+    seen = {camera_key(cam) for cam in union}
+    for cam in tracker_spec:
+        if camera_key(cam) not in seen:
+            union.append(cam)
+            seen.add(camera_key(cam))
+
+    grids = {(int(cam["width"]), int(cam["height"])) for cam in union}
+    if len(grids) > 1:
+        # A SPLIT sampling: the generator samples a shared lens on its own grid. One cast
+        # cannot hold two pixel widths (MujocoDepthCameras refuses it), so verify the
+        # GENERATOR's sampling -- it is the one that names every lens, and what differs on
+        # the shared one is the ray grid, not the mount, cone or range these checks are about.
+        print(f"[WARN] the tracker and the generator sample a shared lens on different grids "
+              f"{sorted(grids)}; checking the GENERATOR's sampling, so the tracker's own grid "
+              "on the shared camera is not separately verified here.")
+        return list(fm_spec)
+    return union
+
+
+def spec_from_tracker(run_dir: str, fm_onnx: str | None = None) -> list[dict]:
+    """The depth contract for every camera a run's exported artifacts describe.
+
+    NOT the tracker's own contract.  ``tracker.onnx`` carries the POLICY's cameras, which is
+    the near one alone, and a one-camera contract passes every check in this file while
+    saying nothing about the far camera -- the pairing with ``cams.cameras`` stays
+    self-consistent and the far lens simply drops out of the gate.  So the generator beside
+    it is read too and the two are unioned (see :func:`union_cameras`).
+
+    Args:
+        run_dir: Run directory (its ``exported/`` is read).
+        fm_onnx: Which generator to read the camera set from, when the run holds several.
+
+    Returns:
+        The per-camera contract, in cast order.
 
     Raises:
         FileNotFoundError: If the run has no exported tracker.
@@ -72,7 +171,8 @@ def spec_from_tracker(run_dir: str) -> list[dict]:
     """
     from deploy.tracker_session import TrackerSession
 
-    onnx_path = os.path.join(run_dir, "exported", "tracker.onnx")
+    exported = os.path.join(run_dir, "exported")
+    onnx_path = os.path.join(exported, "tracker.onnx")
     if not os.path.exists(onnx_path):
         raise FileNotFoundError(
             f"{onnx_path} not found; export it with scripts/rsl_rl/export_tracker_onnx.py."
@@ -83,24 +183,55 @@ def spec_from_tracker(run_dir: str) -> list[dict]:
             f"{onnx_path} has no depth_camera_spec -- either the policy has no cameras, or "
             "it was exported before the contract existed (re-export it)."
         )
-    return spec
+    fm_spec = fm_spec_from_export(exported, fm_onnx)
+    if not fm_spec:
+        print(f"[WARN] no depth generator in {exported}, so only the camera(s) "
+              f"{[str(cam.get('sensor', cam['obs_term'])) for cam in spec]} that tracker.onnx "
+              "reads can be checked. The policy reads the NEAR camera alone -- a deployment "
+              "also carries the far one, and nothing here can see it. Export the generator, "
+              "or use --from_env_cfg, to cover the whole rig.")
+    return union_cameras(spec, fm_spec)
 
 
 def spec_from_env_cfg() -> list[dict]:
     """Build the depth contract from the training env cfg, without a simulator.
+
+    Read off the GENERATOR's observation group, not the policy's, and for the same reason
+    ``scripts/rsl_rl/compare_depth_sim2sim.py::_isaac_spec`` is: the policy group holds the
+    near camera alone, so describing it here would silently drop the far camera from an
+    acceptance gate that would then still print PASSED.  The task's own
+    ``assert_fm_depth_group_covers_every_camera`` is what says the group covers the scene --
+    a camera list restated here is a list that can go stale.
 
     Goes through ``g1_depth_env_cfg.depth_camera_specs_from_cfg``, which instantiates the
     REAL observation and scene cfgs, so this reflects whatever the task currently declares
     -- no camera number, term name or clip is restated here.
 
     Returns:
-        The per-camera contract for ``G1-teacher-clf-terrain-depth``.
+        The per-camera contract for ``G1-teacher-clf-terrain-depth``, every camera the scene
+        carries.
+
+    Raises:
+        ValueError: If the generator's group does not name every camera on the scene.
     """
+    from types import SimpleNamespace
+
     from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+        G1FmDepthObservationsCfg,
+        G1TeacherTerrainDepthSceneCfg,
+        assert_fm_depth_group_covers_every_camera,
         depth_camera_specs_from_cfg,
     )
+    from robot_rl.tasks.manager_based.robot_rl.mdp.observations.depth import FM_DEPTH_OBS_GROUP
 
-    return depth_camera_specs_from_cfg()
+    scene = G1TeacherTerrainDepthSceneCfg(num_envs=1, env_spacing=2.5)
+    observations = SimpleNamespace(**{FM_DEPTH_OBS_GROUP: G1FmDepthObservationsCfg()})
+    assert_fm_depth_group_covers_every_camera(
+        SimpleNamespace(scene=scene, observations=observations)
+    )
+    return depth_camera_specs_from_cfg(
+        observations=observations, scene=scene, group=FM_DEPTH_OBS_GROUP
+    )
 
 
 def denormalise(image: np.ndarray, cam: dict) -> np.ndarray:
@@ -285,11 +416,17 @@ def main() -> None:
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--load_run", default=None,
-                        help="Run name under logs/rsl_rl/<experiment>/ whose tracker.onnx "
-                             "carries the camera contract (the deployment path).")
+                        help="Run name under logs/rsl_rl/<experiment>/ whose exported pair "
+                             "carries the camera contract (the deployment path): the union "
+                             "of tracker.onnx's cameras and the fm.onnx's beside it.")
     source.add_argument("--from_env_cfg", action="store_true",
-                        help="Take the contract straight from the training env cfg "
+                        help="Take the contract straight from the training env cfg -- the "
+                             "generator's obs group, i.e. every camera on the scene "
                              "(needs isaaclab importable; no simulator, no export).")
+    parser.add_argument("--fm_onnx", default=None,
+                        help="Which generator names the camera set, for a run whose "
+                             "exported/ holds several (the resolver refuses to choose, and "
+                             "lists them). A path, or a filename inside exported/.")
     parser.add_argument("--experiment", default="g1")
     parser.add_argument("--robot_name", default="g1_perceptive")
     parser.add_argument("--scene", default="basic_scene",
@@ -306,8 +443,8 @@ def main() -> None:
 
     spec = (spec_from_env_cfg() if args.from_env_cfg
             else spec_from_tracker(os.path.join(ROOT, "logs", "rsl_rl", args.experiment,
-                                                args.load_run)))
-    print("== camera contract ==")
+                                                args.load_run), args.fm_onnx))
+    print(f"== camera contract ({len(spec)} camera(s)) ==")
     for cam in spec:
         print(f"  {cam.get('sensor', cam['obs_term']):20s} {cam['width']}x{cam['height']} "
               f"on {cam['mount_body']} at {[round(v, 4) for v in cam['offset_pos']]}, "
@@ -395,7 +532,12 @@ def main() -> None:
                 viewer.sync()
         os._exit(0)
 
-    print("\n" + ("ALL DEPTH CAMERA CHECKS PASSED" if ok else "SOME CHECKS FAILED"))
+    # The camera COUNT rides in the verdict. Every check above pairs the contract with the
+    # caster positionally, so a camera the contract never named cannot fail one -- it is
+    # simply absent, and an unqualified "PASSED" would then claim a rig this never looked at.
+    covered = ", ".join(str(cam.get("sensor", cam["obs_term"])) for cam in spec)
+    print("\n" + ("ALL DEPTH CAMERA CHECKS PASSED" if ok else "SOME CHECKS FAILED")
+          + f" ({len(spec)} camera(s): {covered})")
     sys.exit(0 if ok else 1)
 
 

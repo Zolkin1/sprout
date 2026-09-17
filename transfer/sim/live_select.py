@@ -198,7 +198,7 @@ class SelectedChunkWriter:
             cmd_future: np.ndarray, fm_plan: np.ndarray,
             cand_plans: np.ndarray | None = None, cand_scores: np.ndarray | None = None,
             cand_verdict: np.ndarray | None = None, sel_index: int = 0,
-            cand_pfail: np.ndarray | None = None, cand_ghat: np.ndarray | None = None,
+            cand_ghat: np.ndarray | None = None,
             cand_reward: np.ndarray | None = None) -> None:
         """Append one selected chunk with the conditioning it was drawn from.
 
@@ -215,7 +215,6 @@ class SelectedChunkWriter:
             cand_scores: ``(K,)`` the value each was ranked on.
             cand_verdict: ``(K,)`` per-candidate CHUNK verdict codes.
             sel_index: Which candidate was committed.
-            cand_pfail: ``(K,)`` the survival head's ``P(fail)`` per candidate.
             cand_ghat: ``(K,)`` the quality head's ``G_hat`` per candidate, ``None`` on the
                 survival-only control arm.
             cand_reward: ``(K,)`` MEASURED mean chunk reward per candidate; NaN where every
@@ -240,7 +239,7 @@ class SelectedChunkWriter:
             # the row because the survival-only control arm produces no G_hat -- absent, not
             # zero-filled: a zero G_hat is the WORST possible return and would read as the
             # quality head condemning every candidate.
-            for key, val, dt in (("cand_pfail", cand_pfail, np.float32),
+            for key, val, dt in (
                                  ("cand_ghat", cand_ghat, np.float32),
                                  ("cand_reward", cand_reward, np.float32)):
                 if val is not None:
@@ -255,7 +254,7 @@ class SelectedChunkWriter:
             cols += ["cand_plans", "cand_scores", "cand_verdict", "sel_index"]
             # Only what every row actually carries, so a control-arm file has no half-written
             # column and `close()`'s stack never sees a missing key.
-            cols += [c for c in ("cand_pfail", "cand_ghat", "cand_reward")
+            cols += [c for c in ("cand_ghat", "cand_reward")
                      if self.rows and c in self.rows[0]]
         return cols
 
@@ -397,14 +396,16 @@ def _ep_quality(probe) -> float:
     return float(np.mean(probe.chunk_rewards)) if probe.chunk_rewards else float("nan")
 
 
-def selection_score(p_fail: float, g_hat: float | None, chunk_rewards, *,
-                    w_fail: float, gamma: float) -> float:
+def selection_score(g_hat: float | None, chunk_rewards, *, gamma: float) -> float:
     """BADNESS of one candidate: lower is better, so the caller's ``argmin`` is unchanged.
 
-    The quantity being ordered is ``J = w_track * G_hat_n - w_fail * P_fail``, negated. Both
-    terms are in ``[0, 1]`` and the weights sum to 1, so ``w_fail`` is the single knob and its
-    ratio against quality is ``w_fail / (1 - w_fail)`` -- 0.75 is 3x, 0.8 is 4x, 0.833 is 5x.
-    That bounds the result in ``[-w_track, w_fail] <= [-1, 1]``, which is what lets a
+    The quantity being ordered is ``J = G_hat_n``, negated -- the n-step value of the
+    candidate, built from its MEASURED chunk rewards with the critic's estimate as the tail.
+
+    It used to be ``J = w_track * G_hat_n - w_fail * P_fail``, blending in the critic's
+    survival head at a weight ``w_fail``. That head is gone (the fine-tune dropped its loss,
+    so no reported result used it), which removes the blend and its single knob.
+    That bounds the result in ``[-1, 1]``, which is what lets a
     terminal candidate keep the historical ``+/-1.0`` sentinels as strict bounds.
 
     ``G_hat_n`` is the n-step estimate of the normalized return, from the identity
@@ -427,19 +428,15 @@ def selection_score(p_fail: float, g_hat: float | None, chunk_rewards, *,
         g_hat: The quality head's ``G_hat(s')``, or ``None`` on a survival-only checkpoint.
         chunk_rewards: Measured per-chunk mean rewards for the chunks this candidate ran,
             earliest first. May be empty when every step fell inside the opening hold.
-        w_fail: Weight on failure, in ``[0, 1]``.
         gamma: Per-chunk discount, from the tracking spec.
 
     Returns:
         The badness, to be minimized.
     """
-    if w_fail >= 1.0:
-        return float(p_fail)
-    w_track = 1.0 - float(w_fail)
     if g_hat is None:
         raise ValueError(
-            "w_fail < 1 asks for the quality term, but this checkpoint has no quality head. "
-            "Refit with --quality_bins > 0, or run the control arm at --w_fail 1.")
+            "selection_score needs the critic's value estimate as the n-step tail, and this "
+            "candidate carries none.")
     tail = float(g_hat)
     g_n = tail
     if len(chunk_rewards):
@@ -447,7 +444,7 @@ def selection_score(p_fail: float, g_hat: float | None, chunk_rewards, *,
         for i, r in enumerate(chunk_rewards):
             acc += (gamma ** i) * float(r)
         g_n = (1.0 - gamma) * acc + (gamma ** len(chunk_rewards)) * tail
-    return -(w_track * g_n - float(w_fail) * float(p_fail))
+    return -g_n
 
 
 def _chunk(rig, policy, fm_lag, cmd, n_steps, cfg, zex, scorer=None,
@@ -567,7 +564,7 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                          steer_wz_max: float = 0.68, same_noise: bool = False,
                          recorder=None, episode_uid: int = -1, family_code: int = 0,
                          lookahead: int = 1, random_select: bool = False,
-                         cmd_hold_s: float = 0.0, w_fail: float = 0.75,
+                         cmd_hold_s: float = 0.0,
                          spec=None, gamma: float = 0.95):
     """One episode driven by a live lookahead selector over ``k`` candidate chunks.
 
@@ -578,7 +575,7 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
         spawn: The initial condition.
         cmd: ``(3,)`` commanded twist.
         cfg: The ``ArmRun``.
-        crit: A ``critic.FailureCritic``, or ``None`` at ``k == 1``.
+        crit: A ``critic.ValueCritic``, or ``None`` at ``k == 1``.
         anchor: Goal anchor for the critic's goal features.
         k: Candidates per re-plan.  ``k == 1`` takes the selector's own path with no choice to
             make, so it must reproduce the plain runner exactly -- that is the harness check,
@@ -607,11 +604,9 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             the committed verdict stays the first chunk's.  Ignored on the ``k == 1`` path,
             which makes no choice and so has nothing to look ahead for.
 
-        w_fail: Weight on the survival head in the selection score; ``1.0`` is the
-            survival-only control arm and reproduces it bit for bit.  See
-            :func:`selection_score`.
-        spec: The ``TrackingErrorSpec`` the quality head was fitted under, or ``None`` to run
-            without a tracking probe (only valid at ``w_fail = 1``).
+        spec: The ``TrackingErrorSpec`` the value head was fitted under. Required whenever a
+            choice is made (``k > 1``): the selection score is the n-step value and needs the
+            probe's measured chunk rewards.
         gamma: Per-chunk discount for the n-step return, from ``spec``.
 
     Returns:
@@ -626,11 +621,13 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
     # blew through the bounds mid-chunk would be scored as clean by the one term that cannot
     # see it. Refused rather than run, and refused HERE so the library entry point is as safe
     # as the CLI, whose defaults it now matches.
-    if k > 1 and w_fail < 1.0 and spec is None:
+    if k > 1 and spec is None:
         raise ValueError(
-            f"w_fail={w_fail} asks for the quality term but no tracking spec was given, so "
-            "there is no probe: the measured reward would be absent and the strict violation "
-            "latch would never fire. Pass `spec`, or run the control arm at w_fail=1.")
+            "selecting among candidates needs the tracking spec, so there is a probe: the "
+            "selection score is the n-step value built from MEASURED chunk rewards, and "
+            "without them it would be the critic's tail estimate alone. It used to be legal "
+            "to omit the spec for the survival-only control arm; that arm is gone with the "
+            "survival head.")
 
     robot, course = rig.robot, rig.course
     mujoco.mj_resetData(robot.mj_model, robot.mj_data)
@@ -706,7 +703,7 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
         all_cands = []
         want_cands = recorder is not None and recorder.record_candidates
         cand_plans, cand_scores, cand_verdict = [], [], []
-        cand_pfail, cand_ghat, cand_reward = [], [], []
+        cand_ghat, cand_reward = [], []
         #: EVERY candidate's score, collected unconditionally -- `cand_scores` above is only
         #: filled under --record_candidates, and the `spread` diagnostic must not depend on a
         #: recording flag being set.
@@ -826,14 +823,15 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                 if st_replan is not None:
                     st_score = st_replan
 
-            # The sentinels have to BOUND whatever the survivor branch can return, and that
-            # range widens once the quality term is on. At w_fail = 1 they stay at the
-            # historical +/-1.0 so the control arm reproduces every recorded score exactly.
+            # The sentinels have to BOUND whatever the survivor branch can return. The score
+            # is `-g_n`, an n-step value on the reward's normalized scale, so +/-1.0 bounds it.
+            # It used to also have to bound a survival term weighted by `w_fail`; that term is
+            # gone with the critic's survival head.
             # Set for EVERY candidate, terminal ones included, so the diagnostic arrays stay
             # index-aligned with `cand_plans` / `cand_scores`. Appending only in the survivor
             # branch would shift them by one for every re-plan where a candidate fell, which
             # is a plausible-looking table of the wrong candidates.
-            p_f, g_hat, r_meas = float("nan"), float("nan"), float("nan")
+            g_hat, r_meas = float("nan"), float("nan")
             if cprobe is not None:
                 cprobe.finish()
             if v_score in ("fall", "violation"):
@@ -841,8 +839,8 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                 # VIOLATION is a failure, scored identically to a fall rather than discounted
                 # for having stayed upright. Scored rather than skipped, so a re-plan where
                 # EVERY candidate fails still has an argmin and the episode ends the way it
-                # would have anyway. 1.0 bounds the survivor range, which is [-w_track,
-                # w_fail] and so never exceeds it.
+                # would have anyway. 1.0 bounds the survivor range, which is `-g_n` on the
+                # reward's normalized scale and so never exceeds it.
                 score = 1.0
             elif v_score == "success":
                 score = -1.0
@@ -856,12 +854,12 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                 # reward are its own.
                 x = C.CriticInputs.from_runtime(policy, robot, st_score, anchor=anchor,
                                                 ring=cand_ring, want_scan=crit.privileged)
-                p_f, g_read = crit.read(x)
+                g_read = crit.value(x)
                 if cprobe is not None and cprobe.chunk_rewards:
                     r_meas = float(np.mean(cprobe.chunk_rewards))
                 score = selection_score(
-                    p_f, g_read, (cprobe.chunk_rewards if cprobe is not None else ()),
-                    w_fail=w_fail, gamma=gamma)
+                    g_read, (cprobe.chunk_rewards if cprobe is not None else ()),
+                    gamma=gamma)
                 g_hat = float("nan") if g_read is None else float(g_read)
             # `v`/`f`/`cz` are the FIRST chunk's -- the continuation's verdict scores the
             # branch but is never the episode's, because the episode never ran it.
@@ -885,7 +883,6 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
                 # state -- across states they correlate trivially, because a hard state is
                 # both low-quality and high-failure -- and that comparison needs the two
                 # stored per candidate rather than reduced to the score.
-                cand_pfail.append(p_f)
                 cand_ghat.append(g_hat)
                 cand_reward.append(r_meas)
         if random_select:
@@ -911,7 +908,6 @@ def run_episode_selected(rig, policy, fm_lag, spawn, cmd, cfg, crit, anchor, *,
             extra_c = ({"cand_plans": np.stack(cand_plans),
                         "cand_scores": np.asarray(cand_scores, dtype=np.float32),
                         "cand_verdict": np.asarray(cand_verdict, dtype=np.uint8),
-                        "cand_pfail": np.asarray(cand_pfail, dtype=np.float32),
                         "cand_ghat": np.asarray(cand_ghat, dtype=np.float32),
                         "cand_reward": np.asarray(cand_reward, dtype=np.float32),
                         "sel_index": sel_index} if want_cands else {})
@@ -988,7 +984,7 @@ def run(args) -> int:
         # `--fm_pt` applies here too, not just to the Q arms: a V_priv checkpoint names the
         # generator it was fitted against by ABSOLUTE path, so a critic trained on one machine
         # cannot be read on another without it.
-        scorer = C.FailureCritic(args.critic_ckpt, fm_pt=(args.fm_pt or None),
+        scorer = C.ValueCritic(args.critic_ckpt, fm_pt=(args.fm_pt or None),
                                  device=args.device)
     crit = scorer
     # THE TRACKING SPEC, resolved once. The quality head predicts a normalized return under
@@ -1033,26 +1029,16 @@ def run(args) -> int:
               f"TERMINATING, on every arm including K=1. spec "
               f"{'FITTED' if not track_spec.is_bootstrap else 'BOOTSTRAP'}", flush=True)
     if ks != [1]:
-        if args.w_fail < 1.0:
-            if track_spec is None:
-                raise SystemExit(
-                    "--w_fail < 1 needs the tracking spec the quality head was fitted under. "
-                    f"{os.path.basename(args.critic_ckpt or '?')} carries no `tracking_spec` "
-                    "stamp (it predates the stamping fix). Pass --tracking_spec <spec.json> "
-                    "-- the same file the recording was made with -- or refit.")
-            if getattr(crit, "has_quality", False) is False:
-                raise SystemExit(
-                    f"--w_fail {args.w_fail} asks for the quality term but "
-                    f"{os.path.basename(args.critic_ckpt or '?')} has no quality head. Refit "
-                    "with --quality_bins > 0, or run the control arm at --w_fail 1.")
-            print(f"[live] selection score: J = {1.0 - args.w_fail:.3f}*G_hat - "
-                  f"{args.w_fail:.3f}*P_fail  (failure weighted "
-                  f"{args.w_fail / max(1e-9, 1.0 - args.w_fail):.2f}x quality), gamma "
-                  f"{track_gamma:.3f}", flush=True)
-        else:
-            print("[live] selection score: P_fail only (--w_fail 1.0) -- the CONTROL arm, "
-                  "bit-identical to every number measured before the quality head existed.",
-                  flush=True)
+        if track_spec is None:
+            raise SystemExit(
+                "selection needs the tracking spec the value head was fitted under. "
+                f"{os.path.basename(args.critic_ckpt or '?')} carries no `tracking_spec` "
+                "stamp (it predates the stamping fix). Pass --tracking_spec <spec.json> "
+                "-- the same file the recording was made with -- or refit.")
+        # No `has_quality` check: the critic has exactly one head and it IS the value head,
+        # so a loaded checkpoint always carries it.
+        print(f"[live] selection score: J = G_hat_n (n-step value, measured chunk rewards "
+              f"with the critic's estimate as the tail), gamma {track_gamma:.3f}", flush=True)
     os.makedirs(args.out, exist_ok=True)
     recorder = None
     if args.random_select and args.same_noise:
@@ -1175,7 +1161,6 @@ def run(args) -> int:
                          "family_code": int(uid) // 20,
                          "lookahead": args.lookahead,
                          "cmd_hold_s": args.cmd_hold_s,
-                         "w_fail": args.w_fail,
                          "spec": track_spec, "gamma": track_gamma})
                 v, f, nr, sc, q = fn(
                     rig, policy, fm_lag, spawn, cmd, cfg, crit, course.goal_anchor_xyz,
@@ -1226,17 +1211,6 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--out", required=True)
     p.add_argument("--critic_ckpt", default="", help="V(s) critic, for the rollout selector.")
-    p.add_argument("--w_fail", type=float, default=0.75,
-                   help="Weight on the survival head in the selection score: "
-                        "J = (1-w)*G_hat - w*P_fail, so the failure:quality RATIO is "
-                        "w/(1-w) -- DEFAULT 0.75 is 3x, 0.8 is 4x, 0.833 is 5x. Needs a "
-                        "--quality_bins>0 checkpoint. **--w_fail 1 is the CONTROL arm**: it "
-                        "short-circuits to P_fail and reproduces every number measured before "
-                        "the quality head existed, bit for bit. Note the authority of each "
-                        "input across its [0,1] range is w on P_fail, (1-w)*gamma on G_hat "
-                        "and (1-w)*(1-gamma) on the MEASURED chunk -- so the predicted tail "
-                        "is gamma/(1-gamma) = 19x the measured chunk at gamma 0.95, which is "
-                        "what a 1-step lookahead is rather than a weighting choice.")
     p.add_argument("--tracking_spec", default="",
                    help="tracking_spec.json, ONLY as a fallback for a critic checkpoint that "
                         "predates the spec stamp. When the checkpoint carries one, that wins "
@@ -1512,7 +1486,7 @@ class StateCritic:
 
     The ablated arm was trained with its action tokens zeroed, so it is a state critic that
     happens to be a :class:`FlowQModel`.  This exposes it behind the same two members the
-    rollout selector reads from ``critic.FailureCritic`` -- ``privileged`` and ``p_fail`` --
+    rollout selector reads from ``critic.ValueCritic`` -- ``privileged`` and ``p_fail`` --
     so the same loop can be driven by either.
 
     **The action is passed as ZEROS, matching training.**  Feeding it a real chunk would put

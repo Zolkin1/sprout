@@ -251,3 +251,69 @@ def test_auc_within_stratum_finds_REAL_signal_when_present():
     failed = rng.random(400) < 0.3
     score = np.where(failed, rng.normal(0.8, 0.1, 400), rng.normal(0.2, 0.1, 400))
     assert auc_within_stratum(score, failed, tile) > 0.85
+
+
+# --- difference gates ----------------------------------------------------------------
+# An advantage never uses a value LEVEL, so a gate on levels cannot say whether one will
+# work. These pin the level/difference distinction, which is the whole reason the gate exists.
+
+
+def test_a_perfect_predictor_scores_one_on_both_rho_and_ratio():
+    """The trivial fixed point: predicting the target exactly gets every difference right."""
+    rng = np.random.default_rng(0)
+    ep = np.repeat(np.arange(40), 25)
+    ix = np.tile(np.arange(25), 40)
+    g = rng.normal(size=ep.size)
+    out = vg.difference_gates(g.copy(), g, ep, ix, horizons=(1, 4))
+    for n, r in out.items():
+        assert r["rho"] == pytest.approx(1.0, abs=1e-9), (n, r)
+        assert r["ratio"] == pytest.approx(1.0, abs=1e-9), (n, r)
+
+
+def test_a_level_accurate_but_difference_noisy_value_is_caught():
+    """The case the level gates cannot see, and the one the real critic is in.
+
+    A predictor that tracks a slow trend plus independent per-step noise correlates strongly
+    with the LEVEL and barely at all with the step-to-step CHANGE -- and its predicted change
+    is far larger than the real one, which is exactly what inflates an advantage built from
+    it.
+    """
+    rng = np.random.default_rng(1)
+    ep = np.repeat(np.arange(60), 30)
+    ix = np.tile(np.arange(30), 60)
+    trend = np.tile(np.linspace(0.0, 1.0, 30), 60)          # the slow, predictable part
+    g = trend + 0.02 * rng.normal(size=ep.size)
+    pred = trend + 0.30 * rng.normal(size=ep.size)          # right level, wrong differences
+    assert vg.spearman(pred, g) > 0.6, "fixture must be level-accurate"
+    out = vg.difference_gates(pred, g, ep, ix, horizons=(1,))
+    assert out[1]["rho"] < 0.25, out[1]
+    assert out[1]["ratio"] > 3.0, ("the inflation of the predicted change is the number that "
+                                   "diagnoses this, and it did not fire")
+
+
+def test_differences_are_taken_WITHIN_an_episode():
+    """A pair straddling a boundary compares two unrelated trajectories.
+
+    Built so the across-boundary pairing would be strongly ANTI-correlated: each episode
+    ramps up, so the last row of one against the first of the next is a large negative step
+    where every within-episode step is positive.
+    """
+    ep = np.repeat(np.arange(30), 10)
+    ix = np.tile(np.arange(10), 30)
+    # Steps must VARY, or every within-episode difference is the same number and Spearman on
+    # a constant is undefined -- which is the honest answer, and not what this test is about.
+    step = np.random.default_rng(2).uniform(0.5, 1.5, 10)
+    g = np.tile(np.cumsum(step), 30)
+    out = vg.difference_gates(g.copy(), g, ep, ix, horizons=(1,))
+    # 30 episodes x 9 within-episode pairs; a leaky implementation would find 299.
+    assert out[1]["n_pairs"] == 30 * 9, out[1]["n_pairs"]
+    assert out[1]["rho"] == pytest.approx(1.0, abs=1e-9)
+
+
+def test_a_horizon_longer_than_every_episode_is_omitted_not_nan():
+    """Reported as absent rather than as a NaN that a reader might average."""
+    ep = np.repeat(np.arange(5), 4)
+    ix = np.tile(np.arange(4), 5)
+    g = np.arange(20.0)
+    out = vg.difference_gates(g.copy(), g, ep, ix, horizons=(1, 8))
+    assert 1 in out and 8 not in out, sorted(out)

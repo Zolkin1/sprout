@@ -19,6 +19,10 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     The clip library supplies **only** the reset spawn pose (and the terrain meshed from
     it) and the ``target_vel`` command -- there is no clip fallback for the reference
     itself, not even during warmup. See :attr:`strict_fm_only`.
+
+    On the free-form terrain sections it supplies neither: :attr:`freeform_command` generates
+    the velocity command instead, and the reset spawns off the manifest, so that library needs
+    no clips at all.
     """
 
     stash_conditioning: bool = False
@@ -296,7 +300,450 @@ class FmTrackingCommandCfg(MotionSequenceCommandCfg):
     ``--gaussian_noise``) defaults it ON, so a default Isaac run and a default MuJoCo run are
     NOT comparing like with like. ``x0 = 0`` is off the training distribution."""
 
+    # --- Free-form velocity command (the terrain sections of the FM fine-tune) ---
+    #
+    # Every field below is inert while ``freeform_command`` is False, which is the default, so
+    # the five clip tasks keep the library's ``target_vel`` untouched.
+
+    freeform_command: bool = False
+    """Generate the velocity command HERE instead of reading the clip's ``target_vel``.
+
+    The clip-driven tasks take the command from the library because the clip WAS generated
+    from it -- reference and command are one artefact. The free-form terrain sections have no
+    clips: the reference is whatever the generator predicts from depth, so a command has to be
+    manufactured, and it is manufactured the way the deployed joystick supplies one -- a
+    forward speed plus a yaw rate that keeps the robot pointed down the section.
+
+    Turning this on replaces all four command-velocity accessors
+    (:meth:`~.fm_tracking_cmd.FmTrackingCommand.get_command_velocity` and the three
+    look-ahead forms), which is every path the command reaches: the FM's own conditioning
+    tokens, the policy's ``command_window`` observation, the recorder's ``target_vel`` column
+    and the eval accumulator's tracking target. It also makes the command self-sufficient of a
+    library ``target_vel`` -- ``command_velocity_available`` reports True regardless -- which
+    is what lets a manifest-only terrain ``.h5`` be passed as ``--clip``.
+
+    **The command is HELD across every offset**, where the clip path serves a per-offset
+    future. See :attr:`freeform_speed_min` for why that is a train/deploy mismatch being
+    removed rather than a simplification.
+    """
+
+    freeform_speed_min: float = 0.6
+    """Low end of the per-episode forward-speed draw (m/s), inclusive.
+
+    One constant per EPISODE, drawn uniformly in ``[min, max]`` at reset and held for the
+    whole rollout -- which is how every terrain clip in the training library was generated
+    (one commanded velocity per clip, no ramp, from frame 0). ``vy`` is always exactly 0.0:
+    the hardware controller ships ``v_y_scale: 0.0`` and the library measures
+    ``|vy| max = 0.0000`` across all 3500 stair clips, so a lateral channel would train
+    something the deployed pair cannot ask for.
+
+    The default band is the trained stair grid's endpoints (``transfer/sim/mjeval/terrains``
+    ``STAIR_SPEEDS``: a uniform 0.600 .. 2.600 over 3500 clips). Restated rather than imported
+    because ``robot_rl`` must not import the MuJoCo half.
+
+    **That is the DEFAULT's provenance, not a statement about the library in use, and it has
+    already misled once.** ``STAIR_SPEEDS`` describes the 3500-clip library v6g replaced.
+    Measured on ``g1_mb_v6g_decor.h5`` (10000 clips): commanded vx spans -1.000 .. 2.500, the
+    three terrain families floor at 0.200, flat reaches -1.000 because it includes backwards
+    walking, and 55.5% of clips dip below 0.6 somewhere. A band below 0.6 is therefore well
+    inside what the tracker and the generator were trained on -- read ``target_vel`` off the
+    library rather than inferring a floor from this number.
+
+    **The whole (vx, 0, wz) triple is broadcast across every window offset and across the
+    generator's F-step horizon.** The clip path instead serves ``target_vel`` sampled at each
+    offset, which is a future no deployed runtime has: both ``transfer/deploy/gen_tracker.py``
+    and the C++ runtime hold ONE command across the offsets and over F ("the future command is
+    not knowable; hold the one from request time"). So holding it here removes a train/deploy
+    mismatch for free -- but it does change what the tracker's reference-group encoder sees,
+    because ``command_window`` goes from 13 distinct rows to 13 copies of one.
+    """
+
+    freeform_speed_max: float = 2.6
+    """High end of the per-episode forward-speed draw (m/s), inclusive.
+
+    See :attr:`freeform_speed_min`. Must be ``>=`` it; equal pins every episode to one speed.
+    """
+
+    freeform_cmd_hold_s: float = 0.5
+    """Seconds of ZERO command at the start of every episode, before the step to the draw.
+
+    The robot spawns from a standing pose at rest and would otherwise be told the full speed
+    on the very first control step. A HOLD then a STEP, not a ramp: a ramp is its own
+    off-distribution shape, while standing-to-walk transitions at a command that starts at 0.0
+    are something the flat family actually contains. The number is
+    ``transfer/sim/mjeval/terrains.CMD_HOLD_S``, where it was measured: on the first
+    400-episode MuJoCo grid 59% of the baseline's falls (94 of 159) never reached the terrain
+    at all, and in the fast half of the ladder the median fall was 0.40 m from spawn.
+
+    Rounded to whole control steps against ``env.step_dt``; ``0`` restores the instant-full-
+    speed opening.
+    """
+
+    freeform_steer_kp: float = 1.0
+    """Proportional gain (1/s) from heading error to commanded yaw rate.
+
+    ``0`` disables steering and leaves ``wz = 0`` -- the constant ``(vx, 0, 0)`` the training
+    clips carry -- while everything else about the free-form command stays on. See
+    :func:`~.fm_tracking_cmd.freeform_yaw_rate` for the law, the cross-track gain it implies
+    with :attr:`freeform_lookahead_m`, and the distribution change it is.
+    """
+
+    freeform_lookahead_m: float = 5.0
+    """Distance along the section centreline to the point the robot is aimed at (m).
+
+    Must be ``> 0``. A pure P on BEARING has effective cross-track gain ``kp / L``, so this
+    and :attr:`freeform_steer_kp` are not independent: at the default pair that is 0.2 1/s,
+    and 5 m of look-ahead across a 1.219 m flight is a weak restoring gain. ``L`` is therefore
+    the first thing to tune if lateral drift persists -- shortening it stiffens the loop
+    without touching ``kp``.
+    """
+
+    freeform_approach_kp: float = 0.0
+    """Proportional gain (1/s) from RANGE-TO-GOAL to commanded forward speed. ``0`` is OFF.
+
+    **Off by default, and off is the exact behaviour every existing config was measured
+    under**: at ``0`` the commanded ``vx`` is the per-episode draw held for the whole episode,
+    unchanged, and none of the goal state below is even read. Only a course that opts in pays
+    for it. ``test_freeform_approach_defaults_off.py`` pins that across every registered task.
+
+    Switched on, the forward channel joins the yaw channel on one controller:
+    ``vx = clamp(kp * (range - stop_radius) - kd * range_rate, 0, drawn_speed)``.
+
+    **The per-episode draw becomes a CEILING rather than the command**, which is what keeps
+    :attr:`freeform_speed_min` / :attr:`freeform_speed_max` meaning what they meant: far from
+    the goal ``kp * range`` saturates the clamp, so the robot cruises at its drawn speed
+    exactly as before, and the gain only bites on the approach. At the default 1.5 m stop
+    radius a gain of 0.6 starts decelerating a 2.5 m/s episode about 5.7 m out.
+
+    The floor at 0 matters: a P controller past its setpoint would command BACKWARDS, and
+    reversing is both off-distribution for the generator and not what "stop" means.
+    """
+
+    freeform_approach_kd: float = 0.0
+    """Damping gain (dimensionless) on the CLOSING RATE, the D half of the approach controller.
+
+    Subtracted from the P term, so it brakes when the robot is closing fast. The rate is the
+    root's planar velocity projected onto the goal direction -- a real derivative off the
+    state, not a finite difference of the range, so it carries no sampling noise and needs no
+    filter. ``0`` leaves a pure P, which is stable here because the tracker is itself a closed
+    loop on the commanded velocity; raise it only if the approach visibly overshoots.
+
+    Ignored entirely when :attr:`freeform_approach_kp` is ``0``.
+    """
+
+    freeform_approach_min_speed: float = 0.0
+    """FLOOR on the commanded forward speed while the goal is still ahead (m/s). ``0`` is off.
+
+    Without it the P law decays continuously and the command spends the last couple of metres
+    in the 0.05-0.3 m/s band -- which is both where the robot stops walking for reasons no
+    reward can see, and a band the generator has barely trained on (5.8% of its command rows
+    are ``|vx| < 0.1``; ~7% fall in 0.1-0.3). The robot then settles wherever its own deadband
+    put it, SHORT of the goal, and is scored as not having arrived: observed directly, robots
+    coming to rest just outside the goal region while otherwise behaving correctly.
+
+    With a floor the command is a RAMP then a STEP -- cruise, decelerate to the floor, hold it
+    to the stop radius, then zero -- so every commanded value is either 0 or inside the trained
+    band, and the robot is still walking when it crosses into the region it has to hold.
+    :attr:`freeform_cmd_hold_s` makes the same ramp-vs-step argument at the other end of the
+    episode.
+
+    Capped per env by that episode's own drawn speed, so a slow draw is never sped up and
+    :attr:`freeform_speed_min` keeps defining the band. Not applied past the goal -- there the
+    floor would drive the robot further away, into whatever is behind it.
+
+    Ignored entirely when :attr:`freeform_approach_kp` is ``0``.
+    """
+
+    freeform_stop_radius_m: float = 0.0
+    """Range within which the WHOLE command triple is zeroed (m). ``0`` disables the stop.
+
+    Inside it the robot is commanded to stand: ``vx = 0`` and ``wz = 0``. Zeroing yaw too is
+    not tidiness -- :func:`~.fm_tracking_cmd.freeform_yaw_rate` aims at a point ``lookahead``
+    metres down the centreline, and once the robot is AT the goal that bearing is measuring
+    the last of the approach error at ever-shorter baseline, so a robot trying to hold station
+    would be commanded to keep turning. It mirrors the opening hold, which zeroes the triple
+    for the same reason: a yaw rate on a standing robot is as much a step input as a speed is.
+
+    Subtracted inside the P term as well, so the commanded speed reaches 0 AT the radius
+    rather than stepping to it -- the two are one continuous law, not a ramp plus a cliff.
+
+    Ignored entirely when :attr:`freeform_approach_kp` is ``0``.
+    """
+
+    freeform_wz_max: float = 0.68
+    """Symmetric clip on the steering yaw rate (rad/s).
+
+    0.68 is the largest ``|wz|`` the training library ever commands, on the box family
+    (``transfer/sim/mjeval/runner.STEER_WZ_MAX``, restated because ``robot_rl`` cannot import
+    the MuJoCo half). It is a bound on how far outside the commanded distribution the
+    generator is pushed, not a physical limit.
+    """
+
     # --- Debug visualization ---
+    fm_perturb_fraction: float = 1.0
+    """Fraction of envs ELIGIBLE for the diagnostic perturbations, drawn per episode.
+
+    An outer gate over :attr:`fm_upper_camera_noise_fraction` and
+    :attr:`fm_history_null_fraction`: an env outside it is pristine no matter what those say.
+
+    **Why a gate rather than just halving the two fractions.** Independent draws at 0.5 each
+    leave only ``0.5 * 0.5 = 25%`` of envs untouched, and which envs those are moves with every
+    draw.  A gate guarantees a clean control population of a stated size, in the SAME run and
+    therefore on the same terrain, tiles and command distribution -- which is what lets the
+    recording be split by arm afterwards instead of compared across runs.
+
+    ``1.0`` (default) reproduces the ungated behaviour: every env is eligible.
+
+    **MEASURED WORTH IT (2026-09-08).**  The AWR arm trained on data collected with the
+    upper-camera perturbation moved Isaac box2 success ``0.1421 -> 0.2650`` (+0.125, 30 of 30
+    matched cells) against ``+0.050`` for the unperturbed v1 arms, with a correspondingly
+    wider advantage (sd 0.117 vs 0.088) -- the perturbation's job is to widen the state and
+    plan distribution, and it did.  **Confounded**: that run also changed course (v2 adds 3 m
+    of run-out past the second box), so this is not an isolated attribution.  See
+    ``scripts/flow_matching/finetune_generator.py``'s module docstring.
+
+    **The perturbations are a BEHAVIOUR POLICY, not a data corruption.** They are applied to
+    what the generator is CONDITIONED on, and the recorder stores the true history and the true
+    camera regardless -- so the critic and the fine-tune learn from the measurement that
+    actually occurred, and the perturbation's only job is to widen the distribution of states
+    and plans the run visits.  That split is load-bearing and is pinned by
+    ``test_the_recording_stores_the_TRUE_conditioning``.
+    """
+
+    fm_upper_camera_noise_fraction: float = 0.0
+    """Fraction of envs whose UPPER (far) depth camera is replaced with garbage, re-drawn per
+    episode.
+
+    The upper camera is the one that previews terrain AHEAD -- mounted at z = 0.285 m and
+    pitched 15 deg down, with its boresight meeting the ground 4.25 m out, against the near
+    camera's 0.51 m.  So this is the knob that asks whether a plan's MODE depends on forward
+    terrain preview: if the generator still commits to the same box dismount with the far
+    camera destroyed, the decision is not coming from looking ahead.
+
+    **Which sensor is "upper" is DERIVED from the checkpoint's own ``extero_spec``** (the
+    highest ``offset_pos[2]``), never from a hardcoded index.  The obs group's term order is
+    what fixes the sensor axis today, and a reordering there would silently corrupt the near
+    camera instead while the flag went on claiming otherwise.
+
+    See :attr:`fm_upper_camera_noise_mode` for what "garbage" means -- the choice matters more
+    than the fraction does.
+    """
+
+    fm_upper_camera_noise_mode: str = "gaussian"
+    """How :attr:`fm_upper_camera_noise_fraction` corrupts the camera: ``"gaussian"`` or
+    ``"dead"``.  **These test different things and only one of them is in distribution.**
+
+    ``"dead"`` is what a failed or fully-occluded camera looks like: every pixel at the far end
+    of the depth band, xyz zeroed, and the VALIDITY channel set to 0.  The model was trained
+    with 6.4-8.9% of pixels carrying no reading and has a validity channel for exactly this, so
+    a whole camera reading "no data" is an extrapolation along a direction it understands.
+
+    ``"gaussian"`` replaces every channel -- validity included -- with unit-variance noise.
+    Nothing in training looks like this: the model is handed an input asserting, incoherently,
+    that it has valid readings of random geometry.  It is the harsher test of "can this be
+    ignored", but a behaviour change under it does not distinguish "the plan needed that
+    camera" from "the model was pushed off distribution", so read a result from it narrowly.
+    """
+
+    fm_upper_camera_noise_cadence: str = "episode"
+    """How often :attr:`fm_upper_camera_noise_fraction` is re-drawn: ``"episode"`` or
+    ``"replan"``.  **They ask different questions.**
+
+    ``"episode"`` (default) is a BROKEN camera: drawn once at reset and held, so a robot is
+    either on the arm for a whole traverse or not at all.  That is the right shape for "can
+    this policy work without forward preview" and for domain randomisation, and it is the only
+    cadence under which an episode's outcome is attributable to the arm.
+
+    ``"replan"`` is intermittent DROPOUT: re-drawn for every env that re-plans, so the camera
+    can be fine on approach and dead at the moment the plan commits to a dismount.  That is
+    the sharper probe of whether a particular DECISION uses the preview, and it avoids a
+    confound the per-episode cadence has: training corrupted 20% of windows independently
+    (``null_cond_prob``), never a whole episode, so a failure late in a fully-corrupted episode
+    may be compounding state drift rather than the camera mattering at that moment.
+
+    Under ``"replan"`` the ribbon's root colour changes as the arm does, so each drawn plan is
+    coloured by the conditioning it was actually sampled under.
+    """
+
+    fm_history_null_fraction: float = 0.0
+    """Fraction of envs served the model's learned NULL-HISTORY embedding instead of their
+    own history, re-drawn on :attr:`fm_history_null_cadence`.
+
+    **What this is for: breaking a committed MODE.** The generator is autoregressive on its
+    own past output, so once it reads a box top as a descending staircase it keeps being
+    conditioned on a plan that says "stairs down" and the reading persists.  History-nulling
+    removes that conditioning, so the mode is re-decided from exteroception and the command
+    alone at every re-plan of an affected env.
+
+    **It is IN DISTRIBUTION, not a hack.** Training nulls the history on ``null_prob`` of its
+    windows (0.3 by default) and the model carries a learned ``null_history`` embedding for
+    exactly that case -- the same embedding that already covers the first steps after a reset,
+    where no history exists yet (see :meth:`BatchedHistory.null_mask`).  What is new here is
+    only WHICH envs get it and for how long.
+
+    **Drawn at random per env, never strided.** Envs map to tiles through a structured grid
+    lookup, so taking every n-th env would risk putting every history-nulled env on the same
+    tile and confounding the comparison with terrain.
+
+    ``0.0`` (default) leaves the serve path exactly as it was: the mask is then whatever
+    ``BatchedHistory.null_mask`` says, i.e. post-reset underfill only.
+    """
+
+    fm_history_null_cadence: str = "episode"
+    """How often :attr:`fm_history_null_fraction` is re-drawn: ``"episode"`` or ``"replan"``.
+    Mirrors :attr:`fm_upper_camera_noise_cadence` field for field, so the two arms can be
+    configured the same way and a run can state one cadence for both.
+
+    ``"episode"`` (default) draws once at reset and holds, so one robot plans without history
+    from spawn to fall.  That is the cadence under which an EPISODE's outcome is attributable
+    to the arm, and it is what a recording split by arm wants.
+
+    ``"replan"`` re-draws for every env about to sample, so the conditioning changes mid
+    episode.  Two reasons to want it, and the first is the stronger:
+
+    * **It is what TRAINING did.** The model nulls history on ``null_prob`` of its WINDOWS
+      (0.3 by default), independently, never for a whole episode -- so per-re-plan is the
+      cadence the learned ``null_history`` embedding was actually fitted under.  Under
+      ``"episode"`` a failure late in a fully-nulled episode may be compounding state drift
+      rather than the missing history mattering at that moment; this removes that confound,
+      exactly as the camera arm's own ``"replan"`` does.
+    * **It is far easier to SEE.** The arm is gated by
+      :attr:`fm_perturb_fraction`, so at a small ``--num_envs`` a per-episode draw leaves
+      most resets with no affected env at all and nothing to look at for a whole episode.
+
+    The cost, and it is real: an episode is then a mixture, so no episode-level outcome can be
+    attributed to the arm.  Use ``"episode"`` for anything being measured and ``"replan"`` for
+    anything being watched or compared per PLAN.
+
+    Under either cadence the ribbon colours each drawn plan by the conditioning it was
+    actually sampled under, because the draw lands before the plan does (see
+    ``_snapshot_and_infer``); under ``"replan"`` an env on the history arm therefore alternates
+    between the two arm colours as the camera arm re-rolls beside it.
+    """
+
+    fm_speed_mismatch_fraction: float = 0.0
+    """Fraction of envs whose CONDITIONING command speed is offset from the one the robot is
+    actually being asked for, re-drawn on :attr:`fm_speed_mismatch_cadence` and held for
+    :attr:`fm_speed_mismatch_replans`.
+
+    **What this is for: the approach speed is a MODE choice, and the generator only ever sees
+    one.** On the free-form path the episode draws a single speed and holds it, so the command
+    channel is constant for the whole run and the generator has never had to plan a box
+    approach at a speed other than the one it is travelling at. That makes the command a
+    near-redundant input, and it is the input a deployed joystick moves most.
+
+    **It is a CONDITIONING corruption, not a new command.** The override reaches
+    ``fut_cmd`` inside :meth:`_run_fm` and nothing else, so the robot is still ASKED for the
+    nominal speed: the tracking rewards, the ``command_window`` observation, the eval's
+    tracking target and the recorded ``cmd_future`` all keep the true value. The right reading
+    is the dead upper camera's, not a curriculum's -- an input the generator must stay robust
+    to, and one the progress reward deliberately scores against the NOMINAL speed so a
+    generator that follows the corrupted number is penalised for it.
+
+    **Drawn at random per env, never strided**, for the same reason as the other two arms:
+    envs map to tiles through a structured grid lookup, so every n-th env risks putting the
+    whole arm on one tile and confounding it with terrain.
+
+    ``0.0`` (default) leaves the conditioning exactly as it was.
+    """
+
+    fm_speed_mismatch_range_mps: float = 0.75
+    """Half-width of the uniform OFFSET applied to the conditioning speed, in m/s.
+
+    An OFFSET rather than an absolute speed, because :meth:`reset` redraws the episode's
+    nominal ``_ff_speed`` AFTER the arm's own draw -- an absolute would be stale by exactly
+    one episode, and stale in a way that still looks like a plausible speed.
+
+    0.75 against the free-form band's own 0.5--2.2 m/s: large enough that the conditioning
+    names a different gait regime than the body is in, small enough that the offset speed is
+    still inside the range the generator was trained on. A corruption that pushed the command
+    outside the training band would test extrapolation instead of robustness.
+    """
+
+    fm_speed_mismatch_replans: tuple[int, int] = (2, 3)
+    """Inclusive range of consecutive re-plans one drawn offset is HELD for.
+
+    A mismatch has to outlast a single plan to matter: the generator re-plans every 0.24 s and
+    a one-window corruption is corrected before the body has moved. Holding it for 2--3
+    re-plans (0.48--0.72 s) covers most of an approach stride while still letting several
+    draws land in one episode.
+
+    The countdown decrements per re-plan and a fresh activation is rolled ONLY where it has
+    reached zero, so an active hold is never re-rolled mid-persistence -- which is what makes
+    the hold length mean what it says.
+    """
+
+    fm_speed_mismatch_cadence: str = "episode"
+    """How often :attr:`fm_speed_mismatch_fraction` is re-drawn: ``"episode"`` or ``"replan"``.
+
+    Mirrors :attr:`fm_history_null_cadence` and :attr:`fm_upper_camera_noise_cadence` field
+    for field, with the same trade-off: ``"episode"`` makes an episode's outcome attributable
+    to the arm and is what a recording being MEASURED wants, while ``"replan"`` re-rolls the
+    activation whenever a hold expires and is easier to WATCH at small env counts.
+
+    Note the hold in :attr:`fm_speed_mismatch_replans` applies under BOTH cadences -- under
+    ``"episode"`` it decides how long each activation within an eligible episode lasts, and
+    under ``"replan"`` it additionally bounds how often the env can re-roll.
+    """
+
+    freeform_approach_target_r_m: float = -1.0
+    """Range the approach controller AIMS at, when it must differ from where it stops (m).
+
+    NEGATIVE (the default) means "use :attr:`freeform_stop_radius_m`", which is what the law
+    did when one number served both, so nothing changes by default. A negative sentinel rather
+    than ``None`` on purpose: hydra's struct mode refuses to override a key whose value is
+    ``None``, and both free-form launchers set these unconditionally.
+
+    ``0.0`` aims at the goal POINT. That is what a dwell course wants -- the region being
+    scored is a disc and the middle of it is the only place with margin on every side.
+
+    Separate from the stop radius because the two are different physical statements: this is
+    where the P term's error goes to zero, and the stop radius is where forward speed is CUT.
+    A single number conflates "where I am trying to get to" with "where I give up trying",
+    which is only harmless while they coincide.
+
+    **It has less effect than it looks, and the reason is worth knowing before tuning it.**
+    :attr:`freeform_approach_min_speed` floors the command, so below
+    ``min_speed / kp + target_r`` the commanded speed is the floor whatever this says -- at the
+    wall course's ``kp = 0.6`` and floor 0.3 that is everything inside 0.5 m. Where the robot
+    comes to REST is set by the stop radius plus coast, not by this. Change it to say what the
+    controller means; change the stop radius to move the robot.
+    """
+
+    freeform_yaw_quiet_radius_m: float = 0.0
+    """Range at which the STEERING channel goes quiet, when it must differ from the stop radius.
+
+    ``0.0`` (the default) means "use :attr:`freeform_stop_radius_m`", which is what every
+    course did when the two were one number, so nothing changes by default.
+
+    They have to come apart once the approach controller aims at the goal CENTRE rather than
+    at the edge of the region being scored. The two radii answer different questions:
+
+    * the STOP radius is where forward speed is cut, and wants to be small, so the robot comes
+      to rest near the middle of the disc with margin on every side;
+    * the YAW-quiet radius is where steering stops, and wants to be the DISC, because a yaw
+      rate commanded to a robot that has stopped is a step input it can only answer by turning
+      on the spot -- and a robot pirouetting inside the region is one drift away from breaking
+      a dwell it had already earned.
+
+    Set smaller than the stop radius it is meaningless (the robot is already stopped), so a
+    course that wants them equal should leave this at 0.0 rather than restate the number.
+    """
+
+    debug_vis_goal_disc: bool = False
+    """Draw the DWELL disc the robot has to stop inside, one translucent cylinder per env.
+
+    Off by default, like every other course-specific marker, and it draws nothing unless the
+    task also wires :class:`~...terminations.terminations.freeform_goal_dwell` -- the radius is
+    read back OFF THAT TERM rather than restated here, so the picture cannot disagree with the
+    rule it is a picture of. A cfg that asks for the disc with no dwell term WARNS rather than
+    drawing nothing silently: an absent marker reads exactly like a region correctly placed
+    off-screen, which is the one reading a goal visualiser must never allow --
+    ``MotionSequenceCommand._load_goal_spec`` records the same hazard for the gate.
+
+    Needs the master ``debug_vis`` on and ``--viz kit``, like the rest.
+    """
+
     debug_vis_show_fm_prediction: bool = True
     """Draw the FM's predicted world-frame trajectory as a ribbon of spheres (one color per
     frame). Overlay it on the yellow observation-window ribbon (``debug_vis_obs_window``) to

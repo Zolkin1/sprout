@@ -112,7 +112,7 @@ def _sample_cloud(rig, policy, fm_lag, snap, cmd, cfg, zex, crit, anchor, n, see
         cmd: Commanded twist.
         cfg: The ``ArmRun``.
         zex: Episode z extremes at the branch point.
-        crit: A ``critic.FailureCritic``.
+        crit: A ``critic.ValueCritic``.
         anchor: Goal anchor for the critic's goal features.
         n: Number of draws.
         seed: Noise-key seed, shared across models so draw ``i`` is the same key in both.
@@ -145,7 +145,8 @@ def _sample_cloud(rig, policy, fm_lag, snap, cmd, cfg, zex, crit, anchor, n, see
         else:
             x = C.CriticInputs.from_runtime(policy, robot, st, anchor=anchor, ring=ring,
                                             want_scan=crit.privileged)
-            score = float(crit.p_fail(x))
+            # V(s), so HIGH is good -- the opposite of the p_fail this replaced.
+            score = float(crit.value(x))
         plans.append(np.asarray(cap.get("fm_plan"), dtype=np.float32))
         scores.append(score)
         verds.append(SelectedChunkWriter.VERDICT_CODES.get(v, 0))
@@ -185,7 +186,7 @@ def stage_record(args) -> int:
 
     cfg_a, pol_a, lag_a, spawn = _arm(args.fm_onnx)
     rig = mjrunner.CourseRig(course, pol_a, cfg_a, spawn)
-    crit = C.FailureCritic(args.critic_ckpt, fm_pt=(args.fm_pt or None), device=args.device)
+    crit = C.ValueCritic(args.critic_ckpt, fm_pt=(args.fm_pt or None), device=args.device)
     ring = C.ProprioRing() if crit.privileged else None
     cmd = np.array([float(args.speed), 0.0, 0.0], dtype=np.float64)
 
@@ -309,7 +310,7 @@ def stage_scan(args) -> int:
         cmd_hold_s=0.0, steer_kp=0.0, zero_noise=False, fm_seed=0)
     policy, fm_lag, spawn = mjrunner.load_arm(cfg)
     rig = mjrunner.CourseRig(course, policy, cfg, spawn)
-    crit = C.FailureCritic(args.critic_ckpt, fm_pt=(args.fm_pt or None), device=args.device)
+    crit = C.ValueCritic(args.critic_ckpt, fm_pt=(args.fm_pt or None), device=args.device)
     ring = C.ProprioRing() if crit.privileged else None
     cmd = np.array([float(args.speed), 0.0, 0.0], dtype=np.float64)
 

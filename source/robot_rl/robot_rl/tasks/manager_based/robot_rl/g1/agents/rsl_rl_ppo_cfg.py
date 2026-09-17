@@ -107,7 +107,11 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """
 
     num_steps_per_env = 24
-    max_iterations = 10000
+    # 20000, which is what the tracker that every result on disk was measured with actually ran
+    # (`2026-08-20_16-36-10_mode11_decor_plan_v1`). The repo said 10000 and that run passed
+    # `--max_iterations 20000` on the command line, so the pairing lived only in a shell
+    # history -- and a naive re-launch trained for half as long with nothing saying so.
+    max_iterations = 20000
     # A checkpoint is ~98 MB, so this is the dominant consumer of log storage: at the old
     # 200 a full run wrote ~10 GB and the archive had reached 3500 checkpoints / 92 GB.
     # 400 halves that while keeping the exposure on a crash under an hour (~55 min at the
@@ -161,6 +165,25 @@ class FinetunePPORunnerCfg(PPORunnerCfg):
     These live HERE, on the agent config the task names, rather than as CLI overrides. A flag
     that has to be retyped is a flag that eventually is not -- the eval harness lost a whole
     grid to exactly that (see the eval README on ``stage_grid`` forwarding).
+    """
+
+    load_critic = False
+    """Skip restoring ``critic_state_dict``; ``play.py`` honours this.
+
+    The free-form tasks build a DIFFERENT critic group from any teacher the actor came from
+    -- a clip-free library has no clip terms to observe, so the critic is 1961 wide here
+    against 2533 in the `model_*_padded.pt` checkpoints -- while the ACTOR's groups are
+    identical. Loading the critic therefore couples `play.py` to a width that has nothing to
+    do with what it is about to run, and it failed outright: `size mismatch for mlp.0.weight
+    ... [1024, 2533] vs [1024, 1961]`, before a single frame was drawn.
+
+    `record_rollouts.py` already passes `load_cfg={"critic": False}` unconditionally and
+    documents the same numbers, so this makes the viewer agree with the recorder rather than
+    be the one entry point that cannot open these tasks. Actor weights are still loaded
+    STRICTLY, so a genuine policy mismatch fails as loudly as before.
+
+    A plain attribute rather than a field of the rsl-rl base cfg, which has no such knob --
+    so it cannot be set from the hydra CLI and has to live here.
     """
 
     algorithm = AuxPpoAlgorithmCfg(**{

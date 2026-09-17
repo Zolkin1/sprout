@@ -78,6 +78,7 @@ Example::
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.metadata as metadata
 import json
 import math
@@ -138,9 +139,42 @@ parser.add_argument("--num_episodes", type=int, default=0,
                          "a terminal-only reward every window of an episode carries the same "
                          "label, so the effective sample size is the episode count and a "
                          "window quota is only a proxy for it. 0 = no episode limit.")
+parser.add_argument("--episodes_per_env", type=int, default=0,
+                    help="Stop once EVERY env has completed this many episodes, rather than "
+                         "once a TOTAL count has finished. Use this whenever episode length "
+                         "varies with the commanded speed: a total-count stop fires as soon "
+                         "as the fastest episodes finish, so it keeps the short ones and "
+                         "discards every slow episode still in flight -- on the box2 band "
+                         "that made the kept episodes last 177 steps against a population "
+                         "median of 392. Rounds keep the collected set a complete design "
+                         "over (env, round), whose membership cannot depend on duration. "
+                         "The cost is waiting for the slowest env, bounded by "
+                         "episode_length_s. 0 = use --num_episodes instead.")
 parser.add_argument("--num_windows", type=int, default=100000,
                     help="Hard cap on re-plan windows; also sizes the pre-allocated file, so "
                          "set it above what --num_episodes will produce.")
+parser.add_argument("--terrain_reward", action="store_true",
+                    help="Grade the plan's terrain consistency ONCE PER RE-PLAN and write it "
+                         "as a `chunks` group of the episode file: one row per re-plan, keyed "
+                         "(episode_uid, replan_index), holding the SAME raw terms "
+                         "`inspect_terrain_reward.py --stage reward` writes per window. About "
+                         "60 bytes a row against ~30 kB for the window it is graded from, so "
+                         "it composes with --no_windows to give a terrain-reward eval that "
+                         "records nothing else. The spec it graded under is stamped on the "
+                         "group, and the offline re-grade reads that rather than its own "
+                         "defaults -- see tests/test_terrain_reward_parity.py.")
+parser.add_argument("--no_windows", action="store_true",
+                    help="Record OUTCOMES ONLY -- write the episode table and no window "
+                         "table at all. An EVAL needs success, the failure mode and "
+                         "`track_reward_mean`, all of which live in the episode table; the "
+                         "window table is the entire cost of a recording (~7.7 GB and most "
+                         "of the per-step CPU per 5000 episodes, since `_emit` assembles the "
+                         "depth rows, the proprio ring and the scan for every re-plan). It "
+                         "also frees the run from `--num_windows`, which is a HARD CAP on the "
+                         "loop rather than only a file size, so an eval sized for episodes "
+                         "could otherwise stop early. REQUIRES --num_episodes or "
+                         "--max_steps, since the window quota is what would otherwise "
+                         "terminate the loop.")
 parser.add_argument("--max_steps", type=int, default=0,
                     help="Also stop after this many control steps (0 = no ceiling).")
 parser.add_argument("--goal_regions", default="",
@@ -221,11 +255,20 @@ def _apply_overrides(env_cfg) -> None:
         cmd.fm_checkpoint = args_cli.fm_checkpoint
     if not getattr(cmd, "fm_checkpoint", ""):
         raise ValueError("a rollout needs --fm_checkpoint; see the flag's help.")
-    fallen = getattr(getattr(env_cfg, "terminations", None), "base_fallen", None)
+    # The height-fall term is spelled differently on the two task families and is the SAME
+    # test either way -- `mdp.base_height_below_termination` on absolute world z, taking
+    # `min_height`. The tracker calls it `base_fallen`; the fine-tune tasks call it
+    # `base_height` (`G1FinetuneTerminationCfg`, whose other failure term is a
+    # reference-relative tilt). Accepting both by NAME rather than renaming either: the names
+    # are load-bearing in their own configs and downstream tables.
+    terms = getattr(env_cfg, "terminations", None)
+    fallen = next((t for t in (getattr(terms, "base_fallen", None),
+                               getattr(terms, "base_height", None)) if t is not None), None)
     if fallen is None:
         raise ValueError(
-            "this task has no `base_fallen` termination, which on the tracker is the only "
-            "FAILURE term and therefore the only thing a reward can read as a fall.")
+            "this task has no `base_fallen` (tracker) or `base_height` (fine-tune) "
+            "termination, which is the only world-z FAILURE term and therefore the only "
+            "thing a reward can read as a fall.")
     fallen.params["min_height"] = float(args_cli.min_height)
     if args_cli.clip is not None:
         cmd.path = args_cli.clip
@@ -237,16 +280,72 @@ def _apply_overrides(env_cfg) -> None:
     # "cfg:" on purpose. This runs before the generator's context is built, so it can only
     # echo what was just assigned -- which is not the value the sampler ends up reading.
     # `_assert_sampler_is_stochastic` prints the resolved truth, and measures it.
-    reset = getattr(getattr(env_cfg, "events", None), "reset_on_clip", None)
+    # A clip-free task spawns from the manifest's route block (`reset_on_section`) and has no
+    # clip PHASE at all, so there is no start step to pin -- and pinning one would be a
+    # parameter the term does not take. Refuse a non-default `--start_step` there rather than
+    # dropping it silently: it would read as having been applied.
+    events = getattr(env_cfg, "events", None)
+    reset = getattr(events, "reset_on_clip", None)
     if reset is None:
-        raise ValueError("this task has no `reset_on_clip` event to pin the start step on.")
-    reset.params["pin_start_step"] = (None if int(args_cli.start_step) < 0
-                                      else int(args_cli.start_step))
+        section = getattr(events, "reset_on_section", None)
+        if section is None:
+            raise ValueError(
+                "this task has neither a `reset_on_clip` event to pin the start step on nor "
+                "a `reset_on_section` one to spawn from a manifest route.")
+        if int(args_cli.start_step) > 0:
+            raise ValueError(
+                f"--start_step {args_cli.start_step} was given, but this task spawns from a "
+                "free-form section's route block and has no clip phase to pin. Drop the flag.")
+    else:
+        reset.params["pin_start_step"] = (None if int(args_cli.start_step) < 0
+                                          else int(args_cli.start_step))
     print(f"[rollout] cfg: reference_source=fm history_from={args_cli.history_from} "
           f"allow_history_source_mismatch={bool(args_cli.allow_history_source_mismatch)} "
           f"fm_zero_noise=False "
-          f"base_fallen.min_height={args_cli.min_height} "
-          f"pin_start_step={reset.params['pin_start_step']}")
+          f"fall_min_height={args_cli.min_height} "
+          + (f"pin_start_step={reset.params['pin_start_step']}" if reset is not None
+             else "spawn=free-form route (no clip phase to pin)"))
+    _install_generator_cameras(env_cfg, str(cmd.fm_checkpoint))
+
+
+def _install_generator_cameras(env_cfg, fm_checkpoint: str) -> None:
+    """Re-point the generator's obs group at the cameras THIS checkpoint conditions on.
+
+    The task installs the group in ``__post_init__`` over every camera the scene carries,
+    which is right for the two-camera generator every fine-tune so far has used and wrong for
+    a near-only one: the camera ablation drops the far camera at DATASET build, so its
+    checkpoint states one sensor row and ``FmTrackingCommand._check_extero_shape`` refuses an
+    env serving two. Unlike ``play.py``, this script never called the installer at all, so the
+    near-only arm could not be rolled out -- which is a capability gap, not a policy: the
+    numbers it would produce are exactly the near-only half of the camera ablation.
+
+    Silent and a no-op in every existing case: a two-camera checkpoint names both cameras, and
+    a checkpoint that names none leaves the group as the task built it.
+
+    Args:
+        env_cfg: The composed env config, mutated in place.
+        fm_checkpoint: Path to the generator ``.pt`` the rollout will run.
+    """
+    from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg  # noqa: PLC0415
+
+    scene = getattr(env_cfg, "scene", None)
+    if scene is None or not any(isinstance(s, MultiMeshRayCasterCameraCfg)
+                                for s in vars(scene).values()):
+        return                                   # a height-scan task: no cameras to choose
+    from robot_rl.flow_matching.online import read_fm_extero_meta  # noqa: PLC0415
+    meta = read_fm_extero_meta(fm_checkpoint)
+    if meta["extero_source"] != "depth" or not meta["cameras"]:
+        return
+    on_scene = sorted(name for name, s in vars(scene).items()
+                      if isinstance(s, MultiMeshRayCasterCameraCfg)
+                      and not name.startswith("fm_"))
+    if sorted(meta["cameras"]) == on_scene:
+        return                                   # the usual pair: leave the task's own group
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (  # noqa: PLC0415
+        install_fm_depth_group,
+    )
+    install_fm_depth_group(env_cfg, meta["width"], meta["height"],
+                           cameras=meta["cameras"])
 
 
 def _assert_families_are_filtered(codes, names) -> None:
@@ -379,7 +478,92 @@ def _twist_yaw(rd):
                       quat_apply_inverse(q, rd.root_ang_vel_w)], dim=-1)
 
 
-def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None) -> dict | None:
+def _replanned(cmd, tracker, quota: int = 0):
+    """Claim ``(episode_uid, replan_index)`` for the envs that re-planned this step.
+
+    **Hoisted out of :func:`_emit` because the claim must happen in BOTH modes.**  ``_emit``
+    is skipped entirely under ``--no_windows`` -- it is most of the per-step cost and none of
+    it reaches the episode table -- so while the claim lived inside it, a windowless run left
+    ``replan_index`` at zero and wrote ``n_replans = 0`` on every episode.  The terrain chunk
+    table is keyed on exactly that index and is most useful in precisely that mode, so the
+    counter now advances whether or not a window is written, and both consumers are handed
+    the same claim rather than each taking their own.
+
+    Args:
+        cmd: The ``FmTrackingCommand``.
+        tracker: The :class:`rollout_outcomes.RolloutEpisodeTracker`.
+        quota: Under ``--episodes_per_env``, stop claiming for an env once it has completed
+            this many episodes.  0 disables the gate.
+
+            **This is what keeps a round-based collection the same SIZE as what it keeps.**
+            A round ends when the slowest env finishes its k-th episode, so a fast env spends
+            most of the run on episodes 2, 3, 4 -- which `awr_buffer.first_per_env` then
+            discards, because keeping them would reintroduce the duration bias rounds exist
+            to remove. Recording them anyway wrote 150 windows per env where 33 were wanted:
+            the window cap bound at 300k, and raising it would have meant ~9 GB increments to
+            grade and store for a quarter of the content. The episode still SIMULATES to its
+            end -- only the window claim is skipped -- so nothing about the run changes except
+            what reaches the table.
+
+    Returns:
+        ``(idx, uid, ridx)`` for the re-planning envs, or ``None`` when none did.
+    """
+    mask = cmd._fm_reinfer_mask
+    if quota > 0:
+        done = torch.as_tensor(tracker.completed_per_env >= int(quota),
+                               device=mask.device)
+        mask = mask & ~done
+    if not bool(mask.any()):
+        return None
+    idx = mask.nonzero(as_tuple=False).flatten()
+    uid, ridx = tracker.on_replan(idx)
+    return idx, uid, ridx
+
+
+def _terrain_chunk_batch(env, command_name: str, claim, tracker) -> dict:
+    """Grade the live plan for the re-planning envs, as one chunk-table batch.
+
+    Reads :func:`mdp.plan_terrain_terms`, which is the cached producer the three terrain
+    reward terms read, so the row recorded here is the number those terms would report.
+
+    **Graded over the WHOLE plan, which is what the critic was fitted on.**  The sidecar's
+    penalty is built from the unsuffixed ``contact_penalty`` / ``penetration_sum_m``, i.e. all
+    62 nodes; the ``_served`` twins are recorded beside them but are not that number.  A
+    served-only grade would score the 12 nodes that get executed and miss the tail, which is
+    where a plan that has read a staircase as a box commits to the jump.
+
+    Args:
+        env: The unwrapped env.
+        command_name: The :class:`FmTrackingCommand` term name.
+        claim: The ``(idx, uid, ridx)`` from :func:`_replanned`.
+        tracker: The episode tracker, for the goal anchor the downrange is measured from.
+
+    Returns:
+        A batch keyed by :data:`rollout_outcomes.ROLLOUT_CHUNK_NAMES`.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.mdp import plan_terrain_terms  # noqa: PLC0415
+
+    idx, uid, ridx = claim
+    terms = plan_terrain_terms(env, command_name)
+    # WHERE this re-plan happened, through the same function the window table and the outcome
+    # fold use, so the three cannot disagree about which way a tile faces.
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region  # noqa: PLC0415
+    down, _lat, _hz = goal_region.goal_frame_offsets(
+        tracker.accum.rd.root_pos_w, tracker.accum._goal_pos_w, tracker.accum._goal_yaw)
+    out = {"episode_uid": uid, "replan_index": ridx,
+           "env_id": idx.detach().to("cpu").numpy().astype(np.int32),
+           "goal_downrange_m": down[idx].detach().to("cpu").numpy().astype(np.float32)}
+    for name in ro.TERRAIN_CHUNK_TERMS:
+        if name not in terms:
+            raise KeyError(
+                f"terrain_consistency returned no {name!r}; the chunk table's schema and the "
+                f"grader have diverged. Present: {sorted(k for k in terms)}")
+        out[name] = terms[name][idx].detach().to("cpu").numpy().astype(np.float32)
+    return out
+
+
+def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None,
+          claim=None) -> dict | None:
     """Assemble one batch of windows for the envs that re-planned this step.
 
     Everything here is read at ONE instant -- after ``env.step`` has run
@@ -394,15 +578,16 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None) -
         env: The unwrapped env.
         ring: The :class:`ProprioRing`.
         track_ring: The :class:`TrackErrRing`, or ``None`` when the strict checks are off.
+        claim: The ``(idx, uid, ridx)`` from :func:`_replanned`.  Required -- passing it is
+            what keeps the window and chunk tables on ONE claim, since ``on_replan`` bumps
+            the index and calling it twice per step would number them apart.
 
     Returns:
         The batch, or ``None`` when no env re-planned.
     """
-    mask = cmd._fm_reinfer_mask
-    if not bool(mask.any()):
+    if claim is None:
         return None
-    idx = mask.nonzero(as_tuple=False).flatten()
-    uid, ridx = tracker.on_replan(idx)
+    idx, uid, ridx = claim
     cpu = lambda t: t.detach().to("cpu").numpy()  # noqa: E731
 
     nominal = int(getattr(cmd, "_depth_lag_steps", 0) or 0)
@@ -422,6 +607,17 @@ def _emit(cmd, tracker, family_codes, scan_sensor, env, ring, track_ring=None) -
         "extero": cpu(cmd._lagged_extero()[idx]).astype(np.float16),
         "cmd_future": cpu(cmd.get_command_velocity_horizon(cmd.ctx.F)[idx]).astype(np.float32),
         "depth_lag_used": np.full(idx.numel(), served, dtype=np.uint8),
+        # The behaviour-policy arms this chunk was generated under. Read from the command
+        # term's own flags at the instant of the re-plan, which is when the corruption was
+        # applied -- `history` and `extero` above are the TRUE measurement either way.
+        "perturb_null_history": cpu(cmd.history_nulled()[idx]).astype(np.uint8),
+        "perturb_noisy_upper_cam": cpu(cmd.upper_camera_noised()[idx]).astype(np.uint8),
+        # The speed arm's flag AND its offset. A row whose action came from other
+        # conditioning must say so, and the offset is what makes the statement checkable:
+        # `cmd_future` holds the TRUE command, so the two together recover exactly what the
+        # generator was shown without the recording ever storing a corrupted command.
+        "perturb_speed_mismatch": cpu(cmd.speed_mismatched()[idx]).astype(np.uint8),
+        "perturb_speed_offset_mps": cpu(cmd.speed_mismatch_offset()[idx]).astype(np.float32),
         "fm_plan": cpu(cmd._pred_window[idx]).astype(np.float32),
         "anchor_pos": cpu(cmd._anchor_pos[idx]).astype(np.float32),
         "anchor_quat": cpu(cmd._anchor_quat[idx]).astype(np.float32),
@@ -515,6 +711,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         accum = accumulate.EpisodeAccumulator(env, dt=float(u.step_dt),
                                               fall_min_height=float(args_cli.min_height))
         accum.attach_goal_region(spec)
+        # THE ENVIRONMENT'S OWN goal termination is authoritative where one exists. A dwell
+        # rule cannot be re-derived in the accumulator (see `attach_goal_termination`), so a
+        # course that declares one is scored by the term that actually ends its episodes.
+        _goal_terms = [t for t in ("goal_dwell",)
+                       if t in getattr(env.unwrapped.termination_manager, "active_terms", [])]
+        if _goal_terms:
+            accum.attach_goal_termination(_goal_terms[0])
         # The STRICT tracking checks. Latched, never terminating: the episode runs on, so one
         # rollout yields both the strict and the loose verdict and a threshold change
         # afterwards is an offline relabel rather than a re-collection. `--tracking_spec`
@@ -530,7 +733,43 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                  if _spec.is_bootstrap else f"  (from {args_cli.tracking_spec})"))
         accum.attach_tracking(_spec)
         table = ro.RolloutOutcomeTable(family_names=family_names)
-        term_cfg = u.event_manager.get_term_cfg("reset_on_clip")
+        # The terrain grade is a property of the PLAN and the ground, so it needs no rollout
+        # state beyond the command term -- but the spec it ran under does have to travel, or
+        # an offline re-grade silently applies its own defaults to rows graded under others.
+        chunks = None
+        if bool(args_cli.terrain_reward):
+            from motion_gen import plan_geometry as _pg  # noqa: PLC0415
+            from motion_gen.terrain_consistency import TerrainConsistencySpec  # noqa: PLC0415
+            _tc = TerrainConsistencySpec()
+            chunks = ro.ChunkRewardTable(spec_meta={
+                "contact_speed_thresh": float(_tc.contact_speed_thresh),
+                "contact_dilate_nodes": int(_tc.contact_dilate_nodes),
+                "contact_max_gap_nodes": int(_pg.CONTACT_MAX_GAP_NODES),
+                "collider_spacing": float(_pg.DEFAULT_COLLIDER_SPACING),
+                "penetration_tol_m": float(_tc.penetration_tol_m),
+                "contact_deadband_m": float(_tc.contact_deadband_m),
+                "contact_weight": float(_tc.contact_weight),
+                "penetration_weight": float(_tc.penetration_weight),
+                "penetration_default_weight": float(_tc.penetration_default_weight),
+                "body_penetration_weights": dict(_tc.body_penetration_weights),
+                "served_nodes": int(_tc.served_nodes),
+                "graded": "whole_plan",
+            })
+            print(f"[terrain] grading every re-plan over the WHOLE plan "
+                  f"(spacing {_pg.DEFAULT_COLLIDER_SPACING:.3f} m, "
+                  f"thresh {_tc.contact_speed_thresh:.3f} m/s)")
+        # The reset term the episode tracker wraps, so it can refresh the goal anchor INSIDE
+        # the reset -- after the new episode has committed. A clip-free task spawns from the
+        # manifest's route block instead, and the term is named for what it does.
+        _reset_name = next(
+            (n for n in ("reset_on_clip", "reset_on_section")
+             if n in u.event_manager.active_terms.get("reset", [])), None)
+        if _reset_name is None:
+            raise ValueError(
+                "no reset term to hang the episode tracker on: expected `reset_on_clip` "
+                "(clip tasks) or `reset_on_section` (free-form). Without it the goal anchor "
+                "is never refreshed and every episode folds against its predecessor's goal.")
+        term_cfg = u.event_manager.get_term_cfg(_reset_name)
         tracker = ro.RolloutEpisodeTracker(term_cfg.func, env=u, accum=accum, table=table,
                                            family_codes=family_codes, goal_spec=spec)
         term_cfg.func = tracker
@@ -614,18 +853,31 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         steps = 0
         t0 = time.time()
         ceiling = int(args_cli.max_steps) or None
-        with ro.RolloutWindowWriter(
+        no_win = bool(args_cli.no_windows)
+        if no_win and not (int(args_cli.num_episodes) or int(args_cli.episodes_per_env)
+                           or ceiling):
+            raise SystemExit(
+                "--no_windows needs --num_episodes (or --max_steps): the window quota is "
+                "what bounds the loop otherwise, so without one of these the recording "
+                "would never stop.")
+        writer_cm = (contextlib.nullcontext(_NullWindowWriter()) if no_win
+                     else ro.RolloutWindowWriter(
             win_path, num_windows=int(args_cli.num_windows), num_history=int(cmd.ctx.N),
             state_dim=int(cmd.ctx.D), future_len=int(cmd.ctx.F), cmd_dim=int(cmd.ctx.cmd_dim),
             extero_shape=(int(extero.shape[1]), int(extero.shape[2])),
             proprio_hw=(ro.PROPRIO_HISTORY, ro.PROPRIO_DIM), scan_dim=scan_dim,
-            track_hw=track_hw, attrs=prov,
-        ) as writer:
+            track_hw=track_hw, attrs=prov))
+        with writer_cm as writer:
             with torch.inference_mode():
                 want_ep = int(args_cli.num_episodes) or None
-                while writer.written < int(args_cli.num_windows):
+                want_rounds = int(args_cli.episodes_per_env) or None
+                while no_win or writer.written < int(args_cli.num_windows):
                     if ceiling is not None and steps >= ceiling:
                         print(f"[rollout] step ceiling {ceiling} reached")
+                        break
+                    if want_rounds is not None and tracker.rounds_complete() >= want_rounds:
+                        print(f"[rollout] every env completed {want_rounds} episode(s); "
+                              f"{tracker.harvested} harvested")
                         break
                     if want_ep is not None and tracker.harvested >= want_ep:
                         print(f"[rollout] {tracker.harvested} episodes reached")
@@ -633,6 +885,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     obs, _, dones, _ = env.step(policy(obs))
                     steps += 1
                     tracker.fold(dones)
+                    # The goal TERMINATION is latched inside the reset hook
+                    # (`RolloutEpisodeTracker._latch_goal_termination`), not here. It used to
+                    # be here, and it was one episode too late every time: the harvest runs
+                    # inside `env.step`, so by the time this line ran the ending episode had
+                    # already been written and the latch landed on its successor.
                     # Zero the ring for envs that just reset BEFORE pushing this step, or a
                     # window emitted in the first H steps of a new episode carries rows from
                     # the previous one -- which for a fall is precisely the signature the
@@ -646,9 +903,21 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                         # the signature the critic is being asked to learn.
                         track_ring.invalidate(dones)
                         track_ring.push(tracker.accum.last_track_err)
-                    batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring, track_ring)
-                    if batch is not None:
-                        writer.write_batch(batch)
+                    # Skipped entirely under --no_windows: `_emit` is where the depth
+                    # rows, the proprio ring and the scan are assembled per re-plan, so it is
+                    # most of the per-step cost and none of it reaches the episode table.
+                    # ONE claim per re-plan, shared: `on_replan` bumps `replan_index`, so
+                    # letting the window and chunk paths each claim would number them apart
+                    # and break the join they exist to support.
+                    claim = _replanned(cmd, tracker, quota=(want_rounds or 0))
+                    if claim is not None and chunks is not None:
+                        chunks.append_batch(
+                            _terrain_chunk_batch(u, "traj_ref", claim, tracker))
+                    if not no_win:
+                        batch = _emit(cmd, tracker, family_codes, scan_sensor, u, ring,
+                                      track_ring, claim=claim)
+                        if batch is not None:
+                            writer.write_batch(batch)
                     if steps % 500 == 0:
                         el = time.time() - t0
                         # flush=True: this is the ONLY progress signal a multi-hour run
@@ -664,11 +933,33 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                 # them inference tensors, and those cannot be updated in place outside it.
                 tracker.flush(u, torch.arange(int(u.num_envs), device=u.device))
         _report_goal_sanity(table)
-        table.write(ep_path, attrs=prov)
+        table.write(ep_path, attrs=prov, chunks=chunks)
         git_snapshot(stem + ".provenance")
-        print(f"[rollout] {writer.written} windows -> {win_path}")
+        if no_win:
+            print("[rollout] --no_windows: no window table written (outcomes only)")
+        else:
+            print(f"[rollout] {writer.written} windows -> {win_path}")
         print(f"[rollout] {len(table)} episodes -> {ep_path}")
+        if chunks is not None:
+            print(f"[rollout] {len(chunks)} terrain chunks -> {ep_path}:/chunks")
         env.close()
+
+
+class _NullWindowWriter:
+    """A window writer that writes nothing, for ``--no_windows``.
+
+    A stand-in rather than a branch at every call site: the loop's progress print and its
+    closing report both read ``written``, and threading ``None`` through them would put an
+    ``if`` on three lines that have nothing to do with the choice.  ``write_batch`` is never
+    reached under the flag (``_emit`` is skipped) and is a no-op rather than an error so that
+    the object cannot half-work if that ever changes.
+    """
+
+    written: int = 0
+
+    def write_batch(self, batch) -> None:
+        """Discard a batch of windows."""
+        return None
 
 
 def _report_goal_sanity(table) -> None:

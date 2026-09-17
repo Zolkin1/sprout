@@ -1,0 +1,72 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# CONFIG 1: randomised boxes. One or two, with drawn height / depth / width / gap.
+#
+# The randomised generator (motion_gen.terrain.varied_courses.make_boxes_tile), NOT the pinned
+# two-box course in terrain/box2.py. The pinned one is an mjeval clone -- fixed geometry, one
+# tile per approach distance -- and every earlier fine-tune number was measured on it, so it
+# stays untouched and comparable. This one varies the geometry instead, and a tile is therefore
+# geometry rather than an initial condition: the approach distribution is a CHAIN of ground
+# spawn areas along each tile's own route.
+name: boxes
+# The plain FREE-FORM fine-tune, not G1-box2-finetune. That variant exists only to put the FAR
+# camera back into the policy observation, for tracker checkpoints trained before the near-only
+# change that expect 3002 inputs. Its own docstring says to retire it once a near-only teacher
+# exists -- and the v6g tracker IS near-only (its tracker.onnx reads depth_camera_near alone),
+# so the far camera would build an observation it was never trained on.
+task: G1-teacher-clf-terrain-depth-finetune-freeform
+clip: clips/ft_boxes_train.h5
+goals: logs/ft_boxes/goal_regions.json
+
+# 2000 / 500: a single-terrain course. The multi config runs 4000 / 1000 because it has four
+# tile types to cover and the same churn would refresh a quarter as much of each.
+buffer: 2000
+refresh: 500
+iters: 5
+num_envs: 2048
+
+ballast_chunks: 0
+ballast_flat_frac: 0.0
+ballast_rollout: ""
+
+tiles_boxes: 30
+tiles_updown: 0
+tiles_indist: 0
+tiles_entry_stairs: 0
+# The wall field, which this course does not use. Stated rather than omitted: the
+# loader requires the full key set, so a new tile type is a visible edit to every
+# config rather than a default that silently applies.
+tiles_walls: 0
+
+# No stairs here; the keys stay so the schema is total and a config cannot omit a decision.
+updown_cells: []
+updown_measured_cells: []
+updown_measured_frac: 0.0
+updown_steps_range: [1, 10]
+updown_width_range_m: [1.219, 3.048]
+updown_platform_range_m: [1.50, 3.00]
+updown_wall_height_range_m: [1.2, 2.4]
+
+# Height spans the trained 0.46 m box and goes well past it; depth and width sit inside the
+# trained bands. Gap is ignored at one box.
+boxes_per_tile_range: [1, 2]
+box_height_range_m: [0.25, 0.75]
+box_depth_range_m: [0.45, 1.40]
+box_width_range_m: [1.20, 4.00]
+box_gap_range_m: [1.50, 4.00]
+
+# 0.4 m/s at the low end is IN distribution, measured on the library actually in use rather
+# than assumed from a default's provenance. Over g1_mb_v6g_decor.h5's 10000 clips the
+# commanded vx spans -1.000 .. 2.500; the three terrain families floor at 0.200 and flat goes
+# to -1.000 (it includes backwards walking), and 55.5% of clips dip below 0.6 at some point.
+#
+# So the old 0.6 floor was not the edge of anything -- it is the low end of mjeval's
+# STAIR_SPEEDS grid, which `fm_tracking_cmd_cfg.freeform_speed_min` still cites as its
+# default's justification over a 3500-clip library that v6g replaced. Do not re-derive this
+# band from that docstring; measure target_vel on the library being used.
+#
+# Stamped into the library at build and read back by run_finetune_loop.sh via
+# `clip_io.read_commanded_speed_range`, so CHANGING THIS REQUIRES REBUILDING THE LIBRARY --
+# the band travels in the .h5, not in the launcher.
+commanded_speed_range_mps: [0.4, 2.5]
+seed: 0

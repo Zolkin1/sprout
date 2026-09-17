@@ -106,11 +106,34 @@ class GoalTolerances:
             coordinate.
         height_tol_m: Absolute band on ``|robot_z - goal_z|``.  Catches the robot that
             reached the right (x, y) while standing on the floor beside or below the terrain.
+            **0 turns the test OFF**, the same as in
+            :func:`~mdp.terminations.terminations.freeform_goal_reached` -- see
+            :func:`in_goal` for the arm this cost when the two disagreed.
+        dwell_radius_m: Radius of a DISC about the goal that the robot must hold, in metres.
+            ``0`` (default) leaves every course on the half-plane test above and is what every
+            library predating the wall field declares.
+        dwell_s: Seconds the robot must hold that disc, CONSECUTIVELY, before it counts as
+            having arrived. ``0`` disables the dwell.
+
+    **A spec that declares a dwell CHANGES WHAT ``reached_goal`` MEANS**, from "was ever inside
+    the region" to "held the disc for ``dwell_s``", and that is deliberate rather than a second
+    column. `scripts/flow_matching/CLAUDE.md` states the rule this keeps: success is defined
+    ONCE and three places have to agree -- the reward pays on ``reached_goal``, the critic
+    keeps windows up to the first failure, and the eval reports ``terminal_reward >= 0``. A
+    parallel ``dwell_reached`` column would have left the REWARD still paying for the
+    pass-through behaviour while the report showed the dwell rate, which is the worst of both:
+    the arm would train toward one definition and be measured against another.
+
+    The cost is that ``reached_goal`` is not comparable across specs that disagree about this.
+    `accumulate` prints the rule at load and stamps ``goal_rule`` into the episodes file, so a
+    reader can tell which one a recording was scored under rather than having to know.
     """
 
     approach_margin_m: float = 0.25
     half_width_m: float = 2.5
     height_tol_m: float = 0.15
+    dwell_radius_m: float = 0.0
+    dwell_s: float = 0.0
 
 
 @dataclass
@@ -293,6 +316,17 @@ def last_usable_step(cmd) -> torch.Tensor:
     Returns:
         ``[N]`` long, on ``cmd.clip_id``'s device, never below 0.
     """
+    if not cmd.has_clips:
+        # No clip, so no clip length. The quantity this stands for is "the last step of this
+        # episode that could still serve a full look-ahead window", and on a clip-free task the
+        # episode is bounded by the time-out horizon rather than by a motion -- so that is what
+        # it resolves to. Constant across envs, which is correct: every section shares it.
+        horizon = int(getattr(cmd._env, "max_episode_length", 0))
+        step = torch.full_like(cmd.clip_id, max(horizon - 1, 0))
+        offsets = cmd.obs_window_offsets()
+        if offsets is not None and offsets.numel() > 0:
+            step = step - int(offsets.max().item())
+        return step.clamp_min(0).long()
     clip_len = cmd.manager.clip_len
     step = clip_len[cmd.clip_id.to(clip_len.device)].to(cmd.clip_id.device) - 1
     offsets = cmd.obs_window_offsets()
@@ -393,12 +427,78 @@ def goal_anchor_step(cmd) -> torch.Tensor:
     return cached
 
 
+def freeform_goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
+    """The goal anchor for a CLIP-FREE section, read off the manifest's route block.
+
+    :func:`goal_anchor_world` recovers the anchor from the placed clip's own terminal pose, and
+    on a manifest-only library there is no clip to ask -- every gather refuses by name
+    (``MotionClipManager._require_clips``).  A free-form section declares its goal instead, in
+    tile-local coordinates, and this is the inverse of the lift
+    ``mdp.terminations.freeform_goal_reached`` applies to the robot: local ``(goal_x, goal_y,
+    goal_z)`` rotated by the tile's ``frame_yaw`` and translated to its corner.
+
+    **The two must agree, and they do by construction**: both read the SAME route row through
+    :func:`~.events.resets.freeform_route`, so the anchor the outcome is folded against and
+    the line the episode terminates on cannot drift apart.  The termination tests a half-plane
+    plus a lateral band while the fold measures a signed displacement from this point; that is
+    the same geometry read two ways, not two goals.
+
+    Args:
+        cmd: A :class:`MotionSequenceCommand` (or subclass) whose env carries a route-bearing
+            terrain.
+
+    Returns:
+        ``(goal_pos_w [N, 3], frame_yaw [N])`` on the env device.
+
+    Raises:
+        TypeError: If the terrain carries no ``terrain_route`` -- a clip library, or a
+            free-form library built before the route block existed.
+    """
+    from .events.resets import freeform_route  # noqa: PLC0415
+
+    dev = cmd._mask_frame_yaw.device
+    n = cmd._mask_frame_yaw.shape[0]
+    route = freeform_route(cmd._env.scene.terrain, torch.arange(n, device=dev))
+    yaw = route["frame_yaw"]
+    cos_y, sin_y = torch.cos(yaw), torch.sin(yaw)
+    gx, gy = route["goal_x"], route["goal_y"]
+    # Indexed, NOT `.get(..., 0)`. It used to ride beyond FREEFORM_ROUTE_FIELDS and be read
+    # defensively -- which meant it was read as absent on EVERY library, so the anchor sat at
+    # the tile floor no matter how high the goal was. `_freeform_route_table` refuses a route
+    # missing any field, so an indexing read turns that into a loud error at load instead of a
+    # height band centred a metre low.
+    gz = route["goal_z"]
+    corner = route["corner"]
+    # **The anchor is a PELVIS height, not a ground height**, because that is what the clip
+    # anchor is -- `goal_anchor_world` returns the clip's terminal BASE pose -- and
+    # `height_tol_m` is applied to `|root_z - goal_z|`. A route's `goal_z` is the walkable
+    # SURFACE there, so using it raw would put a standing robot ~0.79 m outside a 0.5 m
+    # tolerance at every goal: `in_goal` could never fire while `freeform_goal_reached` still
+    # terminated, and the recorder would label every arrival a failure.
+    # The standing height is read off the asset's own `default_root_pose`, which is the same
+    # quantity `reset_on_freeform_section` adds to `start_z` when it places the spawn -- so
+    # the two ends of the episode are measured against one number rather than two.
+    import warp as wp  # noqa: PLC0415
+
+    asset = cmd._env.scene["robot"]
+    nominal_z = wp.to_torch(asset.data.default_root_pose)[:, 2].to(dev)
+    pos = torch.stack((corner[:, 0] + cos_y * gx - sin_y * gy,
+                       corner[:, 1] + sin_y * gx + cos_y * gy,
+                       corner[:, 2] + gz + nominal_z), dim=-1)
+    return pos, yaw.to(pos.device)
+
+
 def goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
     """Where the clip ENDS UP, in the world, and the terrain heading to measure in.
 
     "Ends up" rather than "finishes": the step is :func:`goal_anchor_step`, the furthest
     downrange point of the clip's tail window, NOT ``last_usable_step`` -- which on the box
     families falls before the mount and put the goal in mid-air short of the box.
+
+    **Dispatches on whether there is a clip at all.**  A manifest-only library refuses every
+    gather, so a clip-free run reads its declared route goal instead
+    (:func:`freeform_goal_anchor_world`).  Branching here rather than at each of the four call
+    sites keeps "where is the goal" one question with one answer.
 
     Uses the GLOBAL placement -- ``_reset_world_pos`` / ``_reset_world_yaw``, the reset-time
     terrain-cell anchor -- exactly as :func:`base_pose_error_termination` does, and for the
@@ -414,6 +514,8 @@ def goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
     """
     from isaaclab.utils.math import quat_from_angle_axis
 
+    if not cmd.has_clips:
+        return freeform_goal_anchor_world(cmd)
     yaw = cmd._reset_world_yaw
     world_quat = quat_from_angle_axis(yaw, cmd._world_z.expand(yaw.shape[0], 3))
     state = cmd.reference_world_state_at(
@@ -457,6 +559,17 @@ def goal_travel_m(cmd) -> torch.Tensor:
     """
     from isaaclab.utils.math import quat_from_angle_axis
 
+    if not cmd.has_clips:
+        # The clip-free answer is the SECTION's own downrange run: spawn to goal line, both
+        # declared in the route block. There is no motion to ask how far it travels, and the
+        # quantity this feeds -- the degenerate-goal / `spawned_in_goal` check -- is asking
+        # whether the goal sits ahead of the spawn at all, which the route answers directly.
+        from .events.resets import freeform_route  # noqa: PLC0415
+
+        dev = cmd._mask_frame_yaw.device
+        route = freeform_route(cmd._env.scene.terrain,
+                               torch.arange(cmd._mask_frame_yaw.shape[0], device=dev))
+        return route["goal_x"] - route["start_x"]
     goal, yaw = goal_anchor_world(cmd)
     world_quat = quat_from_angle_axis(cmd._reset_world_yaw,
                                       cmd._world_z.expand(cmd._reset_world_yaw.shape[0], 3))
@@ -531,6 +644,21 @@ def in_goal(
 ) -> torch.Tensor:
     """Whether the base is inside the region.
 
+    **A ``height_tol_m`` of 0 means the height test is OFF, matching
+    :func:`~mdp.terminations.terminations.freeform_goal_reached`.**  It used to mean an EXACT
+    equality here -- ``|height_err| <= 0`` on a continuous quantity, which is never satisfiable
+    -- while the termination guarded with ``if height_tol_m > 0.0`` and treated the same value
+    as "skip this test". One field, two meanings, both reachable from one run: a varied-terrain
+    spec that declared 0 read 0.0000 over 8400 episodes AND zeroed the progress reward's
+    success term for five whole training iterations, and the two tells pointed the wrong way
+    (episodes ended at ~474 steps rather than timing out, so the TERMINATION was firing while
+    `in_goal` could not).
+
+    Zero is now legal and means what it means at the other end. What it does NOT mean is safe:
+    with the test off, a goal ABOVE the spawn can be scored from the floor beside the terrain,
+    which is exactly what the tolerance exists to catch. `terminations.freeform_goal_reached`
+    says the same thing in its own docstring, and the eval's banner prints which it is.
+
     Args:
         downrange: ``[N]`` from :func:`goal_frame_offsets`.
         lateral: ``[N]``.
@@ -542,7 +670,10 @@ def in_goal(
         ``[N]`` bool.
     """
     margin, width, height = _tol_columns(tol, downrange)
-    return (downrange >= -margin) & (lateral.abs() <= width) & (height_err.abs() <= height)
+    # `| (height <= 0)` rather than a python branch: `height` may be a per-env COLUMN, so the
+    # "off" case has to be elementwise too.
+    ok_height = (height_err.abs() <= height) | (height <= 0)
+    return (downrange >= -margin) & (lateral.abs() <= width) & ok_height
 
 
 #: Default clip on the steering controller's yaw rate (rad/s).  0.68 is the largest ``|wz|``
@@ -619,3 +750,35 @@ def goal_distance_m(
     wide = (lateral.abs() - width).clamp_min(0.0)
     high = (height_err.abs() - height).clamp_min(0.0)
     return torch.sqrt(short * short + wide * wide + high * high)
+
+
+def in_goal_disc(downrange: torch.Tensor, lateral: torch.Tensor,
+                 height_err: torch.Tensor, radius_m: float,
+                 height_tol_m: float) -> torch.Tensor:
+    """Whether the base is inside a DISC about the goal, for the dwell rule.
+
+    A separate function from :func:`in_goal` rather than a mode on it, because the two answer
+    different questions and only one of them can be "held": ``in_goal`` is a downrange
+    half-plane crossed with a lateral band, which a robot keeps satisfying as it walks away
+    downrange. Nothing can dwell in a half-plane.
+
+    **This must agree with the RUNTIME's dwell test**
+    (:class:`~mdp.terminations.terminations.freeform_goal_dwell`), which measures
+    ``|(x, y) - goal|`` in the tile frame. ``downrange`` and ``lateral`` are the same offset
+    resolved on the goal's own axes, so the Euclidean norm of the pair is that distance -- the
+    two are one quantity in two frames, not two definitions.
+
+    Args:
+        downrange: ``[N]`` from :func:`goal_frame_offsets`.
+        lateral: ``[N]``.
+        height_err: ``[N]``.
+        radius_m: Disc radius (m). Must be positive; the caller gates on the spec.
+        height_tol_m: Band on ``|robot_z - goal_z|``; ``0`` turns the height test off, the
+            same convention as everywhere else here.
+
+    Returns:
+        ``[N]`` bool.
+    """
+    ok_height = (height_err.abs() <= height_tol_m) if height_tol_m > 0.0 \
+        else torch.ones_like(height_err, dtype=torch.bool)
+    return (torch.hypot(downrange, lateral) <= float(radius_m)) & ok_height

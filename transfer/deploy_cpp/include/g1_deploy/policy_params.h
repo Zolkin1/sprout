@@ -91,6 +91,21 @@ struct DepthCameraSpec {
   int pixels() const { return width * height; }
 };
 
+/// The PHYSICAL camera a contract entry describes, as a name two artifacts can match on.
+///
+/// Mirrors `transfer/deploy/depth_obs.camera_key`, which is the oracle. `sensor` is the scene
+/// name and is the identity; `obs_term` is the fallback for a contract carrying no sensor
+/// name; a leading `fm_` is stripped because `install_fm_depth_group` names the GENERATOR's
+/// own sampling of a lens `fm_depth_near` -- a second grid on the SAME mount, not a second
+/// camera.
+///
+/// Matching on raw `obs_term` instead is why a correctly exported subset pair was refused on
+/// every tick: the tracker says `depth_near`, the generator says `fm_depth_near`, and the two
+/// name one lens. The python runtime accepted the same pair, so the pair validated at export
+/// and then failed only in the C++ controller.
+std::string CameraKey(const DepthCameraSpec& cam);
+
+
 /// The command-window contract, when the policy observes one.
 struct CommandWindowSpec {
   std::vector<int> offsets;

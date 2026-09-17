@@ -560,6 +560,8 @@ def flow_matching_loss(
     mask_frame_yaw_rel: torch.Tensor | None = None,
     pinned_axis_weight: float = 1.0,
     advantage: torch.Tensor | None = None,
+    sample_weight: torch.Tensor | None = None,
+    weight_reduction: str = "batch",
 ) -> dict[str, torch.Tensor]:
     """Compute the flow-matching loss (+ optional consistency / FK terms).
 
@@ -592,6 +594,31 @@ def flow_matching_loss(
         blocks: The window's block selection; defaults to all five.
         report_consistency: Compute ``vel_consistency`` as a METRIC even when its
             weight is 0. For validation; the training step should leave it off.
+        sample_weight: ``(B,)`` non-negative per-sample loss weight (advantage-weighted
+            regression), or ``None`` for a uniform one.  How it is reduced is
+            ``weight_reduction``'s job, and the two options are genuinely different
+            estimators rather than a scaling convention -- see below.  Mutually exclusive
+            with the pinned-axis path, which does its own reduction.
+        weight_reduction: How the weights are reduced, and it decides what the sharp limit
+            of AWR IS.
+
+            ``"global"`` expects weights pre-scaled to global mean 1 and takes a plain
+            ``mean(w * mse_i)``.  This is the unbiased weighted-risk estimator -- classic AWR
+            -- so a batch of low-advantage rows genuinely contributes a smaller step and the
+            sharp limit IS filtered BC at a shrinking percentile.
+
+            ``"batch"`` self-normalizes inside each batch, ``sum(w * mse_i) / sum(w)``,
+            dividing by the BATCH'S OWN weight sum.  That rescales every batch to a full-size
+            step however small its weights are: a batch of mediocre rows lands the same total
+            gradient as one holding a genuinely high-advantage row, so the advantage signal
+            survives WITHIN a batch and is normalized away ACROSS batches.  Its sharp limit is
+            best-of-batch, and the realized effective sample size floors at roughly
+            ``n / (batch / 2)`` however small beta goes.  It is kept because it has the lower
+            gradient variance, which is a real cost of ``"global"``.
+
+            ``finetune_generator.py`` defaults to ``"global"``; this function's own default
+            stays ``"batch"`` so that a direct caller passing only ``sample_weight`` is not
+            silently switched to an estimator that assumes a pre-scaling it never applied.
 
     Returns:
         Dict with ``loss`` and detached metrics: ``flow_mse`` and, when enabled,
@@ -608,10 +635,46 @@ def flow_matching_loss(
     flow_mse = sq.mean()
     train_loss = flow_mse
     if anchor_mask is not None and float(pinned_axis_weight) != 1.0:
+        if sample_weight is not None:
+            raise ValueError(
+                "sample_weight and the pinned-axis loss cannot be combined: "
+                "`pinned_axis_flow_loss` reduces over the batch itself, so a per-sample "
+                "weight applied around it would be ignored silently rather than refused.")
         train_loss = pinned_axis_flow_loss(
             err, sq, anchor_mask, mask_frame_yaw_rel, float(pinned_axis_weight),
             state_norm, num_joints, num_extra_frames, blocks,
         )
+    elif sample_weight is not None:
+        # Per-sample mean first, THEN the weighted average -- so a weight scales a whole
+        # window rather than one of its F*D entries.
+        per_sample = sq.flatten(1).mean(dim=1)
+        # A `(B, 1)` weight would BROADCAST against the `(B,)` per-sample losses into a
+        # `(B, B)` outer product and return a finite, entirely wrong number -- measured
+        # 10.03 where the answer is 2.21. Shape-checked rather than trusted.
+        if sample_weight.dim() != 1 or sample_weight.shape[0] != per_sample.shape[0]:
+            raise ValueError(
+                f"sample_weight must be 1-D of length {per_sample.shape[0]}, got shape "
+                f"{tuple(sample_weight.shape)}. A trailing singleton axis broadcasts into an "
+                "outer product here instead of failing.")
+        if any(w > 0.0 for w in (vel_weight, joint_vel_weight, fk_pose_weight,
+                                 body_pose_root_weight, body_pose_world_weight)):
+            raise ValueError(
+                "sample_weight does not compose with the auxiliary consistency/FK terms: "
+                "each is added as an UNWEIGHTED batch mean, so the weighting would apply to "
+                "the flow term alone while the total looked correctly weighted.")
+        w = sample_weight.to(dtype=per_sample.dtype, device=per_sample.device)
+        # `clamp_min` covers an all-zero batch, which is reachable at a sharp beta once the
+        # clip has pushed most of the mass onto a few rows. Without it the batch returns NaN
+        # and the run dies several steps later somewhere else.
+        if weight_reduction == "batch":
+            train_loss = (w * per_sample).sum() / w.sum().clamp_min(1e-12)
+        elif weight_reduction == "global":
+            # `w` already carries a global mean of 1, so this is an unbiased estimate of the
+            # weighted risk rather than a per-batch conditional one.
+            train_loss = (w * per_sample).mean()
+        else:
+            raise ValueError(f"weight_reduction must be 'batch' or 'global', got "
+                             f"{weight_reduction!r}")
     out = {"loss": train_loss, "flow_mse": flow_mse.detach()}
 
     packed = set(resolve_reference_blocks(blocks))

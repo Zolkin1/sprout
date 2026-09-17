@@ -387,7 +387,21 @@ class FlowMatchingConfig:
     # it in the re-plan FRAME would need the root displacement over the lag, and this robot has
     # no base-velocity estimate to integrate. So the terrain arrives correctly registered to
     # where the robot WAS, and the model compensates from its history.
-    depth_latency_probs: tuple[float, ...] | None = None
+    #
+    # **DEFAULTS ON, to :data:`DEPTH_LATENCY_PROBS`.** Every generator that has gone near a
+    # robot carries this tuple -- the deployed ``..._lag48_aug`` pair and the canonical
+    # fine-tune parent both do -- while this defaulted to ``None``, so a run that did not name
+    # the flag trained on fresh frames and regressed the property the hardware failure was
+    # root-caused to (the generator cannot tolerate a stale depth image; the cliff sits between
+    # 20 and 40 ms). ``run_fm_pipeline.sh`` never named it, which is how the v6g generator came
+    # to be trained without it.
+    #
+    # The default lives HERE and not on ``train.py``'s flag, because an argparse default is a
+    # second place for a default to live and the two drift silently --
+    # ``test_the_cli_does_not_shadow_any_config_default`` exists because that once discarded
+    # three quarters of every depth image. ``None`` still means OFF and stays reachable as the
+    # no-latency ablation via ``--depth_latency_probs none``.
+    depth_latency_probs: tuple[float, ...] | None = DEPTH_LATENCY_PROBS
 
     # How many exteroception SENSOR readings there are, and how wide ONE of them is. Both
     # resolved from the recorded array's shape at dataset build time: 1 x 176 rays for the
@@ -458,6 +472,18 @@ class FlowMatchingConfig:
     # transposed shape are legal, so this is stated per sensor rather than once.
     # ``None`` for the height scan, which has no image shape in an FM recording.
     extero_image_hw: list[list[int]] | None = None
+
+    #: Camera names to KEEP from a depth recording, or ``None`` for all of them.
+    #:
+    #: The paper's near-only ablation. The recording holds both cameras and a camera is dropped
+    #: at dataset build (:func:`~robot_rl.flow_matching.dataset.apply_camera_subset`), so the
+    #: ablation holds the DATA fixed and varies only what the model is shown -- which is the
+    #: comparison being claimed. Re-recording near-only would vary the rollouts too.
+    #:
+    #: Stored on the checkpoint like every other resolved extero knob, so ``fm_meta``'s
+    #: ``extero_spec`` carries one camera and both simulators cast one grid without being told.
+    #: ``None`` means every camera, which is what every existing checkpoint stores.
+    extero_keep_cameras: list[str] | None = None
     # Output channels per stride-2 k3p1 convolution; ``len`` sets the depth, so it sets how
     # many times the image is halved. Three entries take 26x30 to 4x4; a fourth reaches 2x2
     # natively, which is the CHEAPER way to shrink the sequence (pooling pays for the
@@ -1300,6 +1326,15 @@ class FlowMatchingConfig:
         # but it is the sole provenance of a training set, so it must not drift.
         if kwargs.get("skip_families") is None:
             kwargs["skip_families"] = [] if "skip_families" in renamed else list(DEFAULT_SKIP_FAMILIES)
+        # A FIFTH instance, created the moment `depth_latency_probs` gained a non-None default.
+        # A checkpoint written before the field existed is definitionally a NO-LATENCY model --
+        # the machinery did not exist and its recording carries no `depth_lag` -- so an ABSENT
+        # key must resolve to None, never to the current default. Unlike `skip_families` this
+        # one REACHES INFERENCE: `gen_tracker_runner`'s `FmDepthLag` is derived from it, so a
+        # mis-resolved default would make MuJoCo delay frames for a model that never trained on
+        # delayed ones. A stored `null` already survives -- it rides `kwargs` explicitly and so
+        # overrides the dataclass default.
+        kwargs.setdefault("depth_latency_probs", None)
         # A FIFTH instance, and this one CAN corrupt inference. A checkpoint written before
         # ``history_source`` existed was trained on the applied reference, definitionally --
         # the measured path did not exist. So an absent key resolves to "reference" and never

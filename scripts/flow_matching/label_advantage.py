@@ -7,7 +7,7 @@ keyed by window index in the SAME order as the rollout ``.h5``, so the fine-tune
 joins it on ``(episode_uid, replan_index)`` -- see ``rollout_dataset.join_labels`` for why a
 positional join would be silently wrong.
 
-Also runs the plan's **G2 gate**, which is the load-bearing one and the reason this is a
+It used to also run a **G2 gate** -- the load-bearing statistic here, and the reason this was a
 separate stage rather than a line inside the trainer::
 
     within narrow bands of V(s_t), do positive-labelled chunks fail less than
@@ -44,40 +44,75 @@ for _p in (os.path.join(_ROOT, "source", "robot_rl"), os.path.join(_ROOT, "sourc
 
 from robot_rl.flow_matching import advantage as adv_mod  # noqa: E402
 
+#: Reward sources that ARE the terrain signal, so `--terrain_only` accepts them. Both are
+#: per-chunk terrain-gated rewards measured by the SAME grader; `terrain_progress` adds a
+#: gated velocity term and a one-off terminal bonus on top of `terrain`'s geometry, which
+#: changes the reward's RANGE (and its reducer) but not what the advantage means. Restated
+#: here rather than imported from `fit_value` because that module launches an argparse and
+#: reads h5; the two are pinned equal by `test_label_advantage.py`.
+TERRAIN_REWARD_SOURCES: tuple[str, ...] = ("terrain", "terrain_progress")
 
-def _bandwise_gate(p_state: np.ndarray, labels: np.ndarray, failed: np.ndarray,
-                   n_bands: int = 5) -> list[dict]:
-    """G2: compare positive- and negative-labelled chunks WITHIN narrow ``V(s_t)`` bands.
+#: The progress reward specifically, whose target is bootstrapped and whose per-chunk range
+#: is not `terrain`'s. Named so the one condition that differs can name it.
+PROGRESS_REWARD_SOURCE: str = "terrain_progress"
+
+
+
+def check_reward_consistency(fitted_on: str, estimator: str,
+                             terrain_only: bool, fitted_hash: str = "?",
+                             quality_range: tuple[float, float] = (0.0, 1.0)) -> None:
+    """Refuse an advantage that would silently mix two different rewards.
+
+    "Terrain rewards only" was three conditions; the first is now structural rather than
+    checked. There is no survival half to switch off -- the critic has one head and the
+    advantage is ``A = G - V`` -- so what remains is:
+
+    1. the estimator must be ``mc``, or the quality half bootstraps on the critic's own
+       prediction at ``t + n`` and stops being a difference against measured terrain reward;
+    2. the critic's head must have been FITTED on the terrain reward, or the difference is
+       against a prediction of a different quantity -- meaningless while looking normal.
 
     Args:
-        p_state: ``[W]`` ``P(fail | s_t)``.
-        labels: ``[W]`` in ``{0, 1, 2}``.
-        failed: ``[W]`` bool, the realized episode outcome.
-        n_bands: Number of equal-count bands over ``p_state``.
+        fitted_on: The ``reward_source`` stamped into the predictions.
+        estimator: ``"mc"`` or otherwise.
+        terrain_only: Whether the caller asked for the terrain-only signal.
+        fitted_hash: The reward hash, for the log line.
+        quality_range: The support the value head was fitted over, for the log line.
 
-    Returns:
-        One record per band: its ``P(fail)`` range, the counts, the realized failure rate
-        under each label and their difference.  A band with fewer than 50 of either label
-        reports ``None`` for the rates rather than a number off a handful of episodes.
+    Raises:
+        SystemExit: If ``terrain_only`` is asked for and either condition does not hold.
     """
-    edges = np.quantile(p_state, np.linspace(0.0, 1.0, n_bands + 1))
-    edges[-1] = np.inf
-    out = []
-    for i in range(n_bands):
-        sel = (p_state >= edges[i]) & (p_state < edges[i + 1])
-        pos = sel & (labels == adv_mod.LABEL_POSITIVE)
-        neg = sel & (labels == adv_mod.LABEL_NEGATIVE)
-        rec = {"band": i, "p_lo": float(edges[i]),
-               "p_hi": float(edges[i + 1]) if np.isfinite(edges[i + 1]) else 1.0,
-               "n_pos": int(pos.sum()), "n_neg": int(neg.sum())}
-        if pos.sum() >= 50 and neg.sum() >= 50:
-            rec["fail_pos"] = float(failed[pos].mean())
-            rec["fail_neg"] = float(failed[neg].mean())
-            rec["delta"] = rec["fail_neg"] - rec["fail_pos"]
-        else:
-            rec["fail_pos"] = rec["fail_neg"] = rec["delta"] = None
-        out.append(rec)
-    return out
+    if terrain_only:
+        if fitted_on not in TERRAIN_REWARD_SOURCES:
+            raise SystemExit(
+                f"--terrain_only, but this critic was fitted on {fitted_on!r}, which is not "
+                f"one of {TERRAIN_REWARD_SOURCES}. Its value "
+                "head predicts a different reward from the one the advantage would measure, "
+                "so the difference would be meaningless while looking entirely normal. "
+                "Refit with: fit_value.py --reward_npz <terrain sidecar>.")
+        if estimator != "mc":
+            raise SystemExit(
+                "--terrain_only needs --estimator mc: an n-step quality half bootstraps on "
+                "the critic's prediction at t+n, so it is not a difference against measured "
+                "terrain reward.")
+        if fitted_on == PROGRESS_REWARD_SOURCE:
+            # The ADVANTAGE stays MC -- G is still the realized return. What changed is the
+            # BASELINE: under fitted value iteration the critic's head was fitted against a
+            # bootstrapped target, so V(s) estimates the discounted return rather than the
+            # 3-chunk window sum. That is the intent (a terminal bonus cannot reach 3 chunks
+            # back), but it means `G - V` differences a full-horizon baseline against a
+            # windowed return unless G is built the same way. Stated rather than refused,
+            # because `fit_value` bounds both by the same `return_max` and the loop builds G
+            # with the same reducer.
+            print("[label] NOTE: this critic was fitted on the PROGRESS reward, whose target "
+                  "is the (1-gamma)-weighted return with a terminal bonus. G must be built "
+                  "by the same reducer (bootstrapped_window_return) and bounded by the same "
+                  "return_max, or the advantage differences two scales.")
+        print(f"[label] TERRAIN ONLY: A = G - V, MC target, critic fitted on "
+              f"{fitted_on!r} (hash {fitted_hash}), scalar head over "
+              f"[{quality_range[0]:g}, {quality_range[1]:g}]")
+
+
 
 
 def _commanded_speed(stem: str, uid: np.ndarray, ridx: np.ndarray) -> np.ndarray:
@@ -118,17 +153,20 @@ def main() -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("predictions", help="predictions.npz from fit_value.py")
     p.add_argument("--out", required=True, help="Output .npz sidecar.")
-    p.add_argument("--variant", default="V_priv", choices=("V_priv", "V_onboard"),
+    p.add_argument("--variant", default="V_priv", choices=("V_priv",),
                    help="Which critic to label with.")
-    p.add_argument("--w_fail", type=float, default=1.0,
-                   help="Weight on the SURVIVAL term of V = w_track*G_hat - w_fail*P(fail), "
-                        "with w_track = 1 - w_fail. 1.0 (the default) is the survival-only "
-                        "label this script has always produced and is the CONTROL ARM -- it "
-                        "takes a separate code path rather than routing through the combined "
-                        "function, so it cannot be perturbed by a change to it. Below 1 needs "
-                        "a predictions.npz from a fit with a quality head.")
-    p.add_argument("--n", type=int, default=8,
-                   help="Advantage look-ahead in re-plans (8 = 1.92 s at K=12, 50 Hz).")
+    p.add_argument("--terrain_only", action="store_true",
+                   help="the advantage is the TERRAIN reward and nothing else. Requires "
+                        "--estimator mc and a critic fitted on a terrain reward "
+                        "sidecar; each is CHECKED, because any one missing gives a plausible "
+                        "wrong label rather than an error.")
+    p.add_argument("--estimator", default="mc", choices=("mc",),
+                   help="How the advantage target is formed. `mc` differences the REALIZED "
+                        "return against the critic's baseline: A = G - V, no bootstrap. "
+                        "The `n_step` alternative bootstrapped on the critic's own prediction "
+                        "at t+n and blended a survival half; both went with the survival "
+                        "head, and neither produced a reported result. `--estimator n_step` is now "
+                        "an argparse error rather than a silent fallback.")
     p.add_argument("--rollout", default="",
                    help="Rollout stem, needed only for --speed_bins: the commanded velocity "
                         "lives in the recording's `cmd_future`, not in predictions.npz. "
@@ -151,11 +189,6 @@ def main() -> int:
                         "Monte-Carlo advantage is biased positive there -- the critic hedges "
                         "while the outcome is uncertain and the survivors beat the hedge. 5 "
                         "flattens the keep rate across the episode.")
-    p.add_argument("--tail_chunks", type=int, default=1,
-                   help="Trailing chunks the non-failure tail averages. MUST match the value "
-                        "the critic's own fit used (fit_value.py stamps it as `tail_chunks`); "
-                        "a mismatch makes this advantage's G a different quantity from the "
-                        "one its baseline was trained to predict.")
     p.add_argument("--percentile", type=float, default=35.0,
                    help="Within-family percentile below which a chunk is negative.")
     p.add_argument("--null_spread", type=float, default=0.02,
@@ -168,10 +201,9 @@ def main() -> int:
     args = p.parse_args()
 
     d = np.load(args.predictions)
-    key = f"p_{args.variant}"
-    if key not in d:
-        raise SystemExit(f"{args.predictions} has no {key}; it holds "
-                         f"{[k for k in d.files if k.startswith('p_')]}")
+    # No `p_{variant}` guard: `fit_value` writes no survival prediction any more, so a check
+    # for one refused every valid file. It aborted the loop at stage 7/8 on the very first
+    # iteration -- the READ was deleted with the survival head and the GUARD was left behind.
     folds = int(d["num_folds"]) if "num_folds" in d.files else 1
     if folds == 1:
         print("[label] WARNING: the critic was fit with --folds 1, so most of these "
@@ -180,38 +212,51 @@ def main() -> int:
               "onto the realized outcome and the advantage goes to zero, so the label degrades "
               "to noise rather than becoming wrong. Refit with --folds 2 (same wall-clock).")
 
-    p_fail = d[key]
+    # `p_<variant>` is gone: fit_value no longer writes a survival prediction.
     uid, ridx, fam = d["episode_uid"], d["replan_index"], d["family_code"]
     failed, val_tile = d["failed"].astype(bool), d["val_tile"].astype(bool)
 
-    # The COMBINED advantage when a quality head is present and asked for.
-    # `w_fail = 1` takes the survival-only path explicitly rather than passing w_fail=1.0
-    # through the combined function: the two are equal by construction and tested to be, but
-    # routing the control arm through the code it is controlling for is how a control stops
-    # controlling for anything.
+    fitted_on = str(d["reward_source"]) if "reward_source" in d.files else "track_err"
+    fitted_hash = str(d["reward_hash"]) if "reward_hash" in d.files else "?"
+    q_range = (tuple(d["quality_range"].tolist()) if "quality_range" in d.files
+               else (0.0, 1.0))
+    check_reward_consistency(fitted_on, args.estimator,
+                             bool(args.terrain_only), fitted_hash, q_range)
+
     qkey = f"q_{args.variant}"
-    if float(args.w_fail) >= 1.0:
-        a, boot = adv_mod.n_step_advantage(p_fail, uid, ridx, failed, args.n)
-    elif qkey not in d.files:
+    # ONE estimator. The n-step alternatives (`n_step_advantage`,
+    # `combined_n_step_advantage`) differenced against the critic's own prediction at t+n and
+    # blended a SURVIVAL half; both are gone with the survival head, and neither produced a
+    # reported result -- the loop passes `--estimator mc`.
+    if qkey not in d.files or "g" not in d.files:
         raise SystemExit(
-            f"--w_fail {args.w_fail} asks for the tracking term, but {args.predictions} has "
-            f"no {qkey}. It was written by a fit with --quality_bins 0, or before the quality "
-            "head existed. Refit with a quality head, or label at --w_fail 1.")
+            f"needs the value head and the realized return, but {args.predictions} has no "
+            f"{qkey}/g. Refit with a value head.")
+    # **`g_mc` when the file has it.** Under fitted value iteration `g` is the target that
+    # round FITTED, which past round 0 is `r + gamma^N V_prev` -- so differencing it against
+    # the head gives a TD advantage rather than `G_real - V`. `g_mc` is the realized Monte
+    # Carlo return the same reducer produced; a file without it either predates the split or
+    # was a pure MC fit, in which case `g` IS the realized return.
+    g_hat = d[qkey]
+    if "g_mc" in d.files:
+        g = d["g_mc"]
+        print("[label] G = the realized MONTE CARLO return (`g_mc`); the critic's own "
+              "target was bootstrapped, which is the intended split.")
     else:
-        g_hat, g_valid = d[qkey], d["g_valid"].astype(bool)
-        reward = d["chunk_reward"]
-        gamma = float(d["gamma"]) if "gamma" in d.files else 0.95
-        # The validity mask is PASSED, not pre-zeroed. Zero-filling the last window of each
-        # episode charges it for a chunk that was never measured; dropping it is what
-        # `normalized_returns` -- the recursion the quality head was fitted to -- does, and it
-        # is what makes this advantage's G the same quantity its own baseline predicts.
-        a, boot = adv_mod.combined_n_step_advantage(
-            p_fail, g_hat, reward, uid, ridx, failed, args.n,
-            gamma=gamma, w_fail=float(args.w_fail), valid=g_valid,
-            tail_chunks=int(args.tail_chunks))
-        print(f"[label] combined V: w_fail {args.w_fail:.2f} / w_track "
-              f"{1 - float(args.w_fail):.2f}, gamma {gamma}, "
-              f"{int(g_valid.sum())}/{g_valid.size} windows carry a measured reward")
+        g = d["g"]
+        _boot = ("fvi_bootstrap_from" in d.files
+                 and str(d["fvi_bootstrap_from"]).strip() not in ("", "None"))
+        if _boot:
+            raise SystemExit(
+                f"{args.predictions} was fitted with --bootstrap_v but carries no "
+                "`g_mc`, so the only return in it is the BOOTSTRAPPED target. "
+                "Differencing that against the head gives a TD advantage, not "
+                "G_real - V. Refit with a fit_value that writes `g_mc`.")
+    g_valid = d["g_valid"].astype(bool)
+    a, boot = adv_mod.mc_advantage(g, g_hat, valid=g_valid)
+    boot = np.zeros_like(boot)          # nothing is bootstrapped by construction
+    print(f"[label] MC advantage A = G - V, "
+          f"{int(g_valid.sum())}/{g_valid.size} windows carry a measured return")
     # PROGRESS STRATA, crossed with the family. A Monte-Carlo advantage is systematically
     # positive early in a surviving episode (the critic hedges when the outcome is still
     # uncertain, and the survivors beat the hedge), so a family-only cut over-selects episode
@@ -244,7 +289,7 @@ def main() -> int:
         labels = np.where(val_tile, adv_mod.LABEL_NULL, labels)
 
     counts = {name: int((labels == i).sum()) for i, name in enumerate(adv_mod.LABEL_NAMES)}
-    print(f"[label] n={args.n} re-plans, variant {args.variant}, {folds} fold(s)")
+    print(f"[label] variant {args.variant}, {folds} fold(s)")
     print(f"[label] advantage: mean {a.mean():+.4f}  sd {a.std():.4f}  "
           f"|A|>0.05 on {float((np.abs(a) > 0.05).mean()):.1%} of windows  "
           f"({float(boot.mean()):.1%} bootstrapped on the outcome)")
@@ -254,36 +299,43 @@ def main() -> int:
             f"thr {r['threshold']:+.4f}  positive {r['positive_frac']:.1%}"
         print(f"    family {f}: n={r['n']:7d}  IQR {r['iqr']:.4f}  {tag}")
 
-    gate = _bandwise_gate(p_fail, labels, failed)
-    print("[label] G2 -- realized failure rate by label, WITHIN P(fail|s_t) bands:")
-    print("        (the unbanded comparison is true by construction; only this one is a test)")
-    for r in gate:
-        if r["delta"] is None:
-            print(f"    [{r['p_lo']:.3f}, {r['p_hi']:.3f})  n_pos {r['n_pos']:6d} "
-                  f"n_neg {r['n_neg']:6d}   -- too few to report")
-        else:
-            print(f"    [{r['p_lo']:.3f}, {r['p_hi']:.3f})  n_pos {r['n_pos']:6d} "
-                  f"n_neg {r['n_neg']:6d}   fail pos {r['fail_pos']:.3f} / "
-                  f"neg {r['fail_neg']:.3f}   delta {r['delta']:+.3f}")
-    good = [r["delta"] for r in gate if r["delta"] is not None]
-    if good:
-        print(f"[label] G2 median band delta {float(np.median(good)):+.3f} "
-              f"({sum(x > 0 for x in good)}/{len(good)} bands positive). A delta at or below "
-              "zero means the label is reproducing state difficulty and conditioning on it "
-              "cannot work.")
+    # The G2 gate is GONE, not skipped-by-flag. It banded the label by ``P(fail|s_t)`` to ask
+    # whether the advantage was merely reproducing state difficulty -- a real question, and
+    # the only one of these statistics that was a test rather than true by construction. It
+    # needed a trained survival head to band by, and that head no longer exists. Nothing here
+    # substitutes for it: banding by ``V(s_t)`` instead would condition the label on the very
+    # quantity it is built from, which is not the same test.
+    #
+    # TODO(g2-gate): band by a difficulty proxy the critic does not produce -- terrain class,
+    # or the course's own approach distance -- and restore the test.
 
+    # WRITTEN IN BOTH BRANCHES, and at THIS indentation deliberately. This block used to sit
+    # inside the `else` above, so a `--quality_only` fit skipped the G2 gate and silently
+    # skipped the WRITE with it: the run printed every statistic, returned 0, and left no
+    # advantage.npz -- which a downstream fine-tune then either refused or, worse, satisfied
+    # from a stale file. `meta`'s own `g2_skipped` field is the evidence it was always meant to
+    # run without the gate. Pinned by test_label_advantage_writes_under_quality_only.
     os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
-    meta = {"n": int(args.n), "variant": args.variant, "percentile": float(args.percentile),
+    # No "n" and no "tail_chunks": both described the n-step estimator, and stamping them
+    # into an MC label was false provenance -- a later reader saw `meta["n"] = 8` and
+    # concluded the label had been bootstrapped 8 chunks ahead.
+    meta = {"estimator": "mc", "variant": args.variant,
+            "percentile": float(args.percentile),
             "null_spread": float(args.null_spread), "num_folds": folds,
-            "w_fail": float(args.w_fail), "progress_bins": int(args.progress_bins),
+            "progress_bins": int(args.progress_bins),
             "speed_bins": int(args.speed_bins), "rollout": args.rollout,
-            "tail_chunks": int(args.tail_chunks),
             "predictions": os.path.abspath(args.predictions),
             "counts": counts, "per_family": {str(k): v for k, v in per_family.items()},
-            "g2_bands": gate}
+            "g2_skipped": "the survival head it banded by was removed"}
+    # `stratum` is the CELL binarize cut within, not a convenience: a consumer that
+    # re-derives the family x progress x speed crossing from `family_code` alone gets a
+    # different partition, and AWR standardizing over the wrong one puts back exactly the
+    # speed skew the stratified threshold removed (0.33 keep rate above 1.3 m/s against 0.23
+    # below 0.9). Saved so it is read rather than rebuilt.
     np.savez(args.out, label=labels.astype(np.int8), advantage=a.astype(np.float32),
              bootstrapped=boot, episode_uid=uid, replan_index=ridx, family_code=fam,
-             val_tile=val_tile, meta=json.dumps(meta))
+             stratum=adv_mod.group_ids(fam, strata), val_tile=val_tile,
+             meta=json.dumps(meta))
     print(f"[label] wrote {args.out}")
     return 0
 

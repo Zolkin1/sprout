@@ -9,6 +9,16 @@ plus a per-env ``gather`` of the dense clip-world reference by
 ``(clip_id, step)``.  All the online machinery (Bezier eval, domains,
 contact gates, skill selection) is absent -- a clip is tracked open-loop by
 a pure step index, so the manager is a gather, not an evaluator.
+
+**A CLIP-FREE library builds a manager and refuses every gather.** The free-form terrain
+fine-tune passes a ``.h5`` carrying a terrain manifest and zero clips (its reference comes from
+the generator, not from disk), and that library still has to answer every LAYOUT question the
+command term asks at construction -- output names and order, reference frames, ``dt``, contact
+frames, the total time. Those are all metadata and are all present, so this class constructs
+normally on it. What cannot work is indexing motion that is not there, so each ``gather*``
+raises :class:`ClipFreeLibraryError` naming the library and the task instead of letting an
+empty index table produce an ``IndexError`` -- or worse, an empty tensor -- somewhere in the
+middle of a step. See :attr:`has_clips`.
 """
 
 from __future__ import annotations
@@ -18,6 +28,16 @@ import torch
 from ..manager_base import ManagerBase
 from ..manager_base import TrajectoryType
 from .clip_io import ClipLibraryData
+
+
+class ClipFreeLibraryError(RuntimeError):
+    """Raised when motion is asked of a library that carries a terrain manifest and no clips.
+
+    Its own type rather than a bare ``RuntimeError`` so a caller that legitimately runs
+    clip-free (the free-form fine-tune) can be written to branch on
+    :attr:`MotionClipManager.has_clips` while a caller that does not can let this propagate and
+    name the cause. Never caught in this package.
+    """
 
 
 class MotionClipManager(ManagerBase):
@@ -47,6 +67,16 @@ class MotionClipManager(ManagerBase):
         self.dt: float = float(lib.meta["dt"])
         self.num_steps: int = int(lib.meta["num_steps"])
         self.num_clips: int = lib.num_clips
+        # T is stated TWICE on a library with motion -- by the metadata above and by the
+        # ``y_des`` step axis -- and only the metadata survives on a clip-free one. They must
+        # therefore agree, or the buffers the command sizes from ``num_steps`` would index
+        # ``y_des`` out of range on some other line entirely.
+        if lib.has_clips and lib.y_des.shape[1] != self.num_steps:
+            raise ValueError(
+                f"clip library disagrees with itself about its length: meta['num_steps'] = "
+                f"{self.num_steps} but y_des has {lib.y_des.shape[1]} steps. The file is "
+                "corrupt or was written by two different generators; regenerate it."
+            )
 
         # Per-clip root-DOF anchor bitmask (bit SET = FREE). A pre-mask library
         # resolves to the legacy mask for every clip here (single interpretation
@@ -69,6 +99,46 @@ class MotionClipManager(ManagerBase):
         # base ``_update_command`` can read ``manager.phase``).  Allocated by
         # the command via :meth:`ensure_state`.
         self.phase: torch.Tensor | None = None
+
+    @property
+    def has_clips(self) -> bool:
+        """Does the library carry any motion? ``False`` for a terrain-only library.
+
+        The one thing every clip-consuming caller reachable from the free-form fine-tune is
+        expected to branch on. ``FmTrackingCommand`` reads it through
+        ``MotionSequenceCommand.has_clips`` to decide whether to build a clip reference at all.
+        """
+        return self.num_clips > 0
+
+    def _require_clips(self, what: str) -> None:
+        """Refuse ``what`` when there are no clips to index.
+
+        The alternative was measured and is worse in both directions: an index tensor into a
+        zero-length table raises ``IndexError`` from inside ``torch``, with no mention of the
+        library; and an EMPTY index tensor (a masked subset that happens to select nothing)
+        silently returns an empty result, so a wrong wiring shows up as a reference that never
+        moves rather than as an error.
+
+        Args:
+            what: The operation being refused, named as the caller.
+
+        Raises:
+            ClipFreeLibraryError: Always, when :attr:`has_clips` is False.
+        """
+        if self.num_clips:
+            return
+        raise ClipFreeLibraryError(
+            f"{what} was asked of a CLIP-FREE library: it carries a terrain manifest and zero "
+            "clips, so there is no motion to index. That library comes from "
+            "scripts/rsl_rl/make_freeform_terrain.py and is only valid for the free-form "
+            "fine-tune (task G1-teacher-clf-terrain-depth-finetune-freeform, cfg "
+            "G1FinetuneFreeformEnvCfg), where reference_source='fm' predicts the reference "
+            "from the cameras, the spawn comes from the manifest's route block and the "
+            "velocity command is manufactured. Reaching here means a clip-consuming term is "
+            "still wired on -- check events.reset_on_clip, terminations.clip_end, "
+            "random_start_phase and seed_history_from_clip. Otherwise, pass a real clip "
+            "library with --clip."
+        )
 
     def _compute_terrain_span(self) -> tuple[torch.Tensor, torch.Tensor]:
         """First and last frame index of each clip's terrain-PINNED run.
@@ -182,7 +252,16 @@ class MotionClipManager(ManagerBase):
         per-env slice across the bus.  Same-device (GPU-resident lib) is a no-op.
         Works for ``[N]`` indices (``[N, ...]`` result) and ``[N, K]`` indices
         (``[N, K, ...]`` result).
+
+        Every ``gather_*`` below funnels through here, so this is the ONE place the clip-free
+        refusal has to be -- except the three that index a per-clip table directly
+        (:meth:`gather_anchor_mask`, :meth:`gather_terrain_start_step`,
+        :meth:`gather_terrain_end_step`), which state it themselves.
+
+        Raises:
+            ClipFreeLibraryError: If the library carries no clips (see :meth:`_require_clips`).
         """
+        self._require_clips("gather()")
         out_dev = clip_id.device
         lib_dev = tensor.device
         out = tensor[clip_id.to(lib_dev), step.to(lib_dev)]
@@ -214,7 +293,11 @@ class MotionClipManager(ManagerBase):
         Step-invariant (a clip's mask is constant over its length), so this takes
         only ``clip_id``.  Follows the same CPU-lib / CUDA-env device shuttle as
         :meth:`gather`.
+
+        Raises:
+            ClipFreeLibraryError: If the library carries no clips.
         """
+        self._require_clips("gather_anchor_mask()")
         return self.anchor_mask[clip_id.to(self.anchor_mask.device)].to(clip_id.device)
 
     def gather_anchor_mask_at_step(self, clip_id: torch.Tensor, step: torch.Tensor) -> torch.Tensor:
@@ -232,7 +315,11 @@ class MotionClipManager(ManagerBase):
 
         Step-invariant, so this takes only ``clip_id``.  Follows the same CPU-lib / CUDA-env
         device shuttle as :meth:`gather`.  See :meth:`_compute_terrain_span`.
+
+        Raises:
+            ClipFreeLibraryError: If the library carries no clips.
         """
+        self._require_clips("gather_terrain_end_step()")
         return self.terrain_end_step[clip_id.to(self.terrain_end_step.device)].to(clip_id.device)
 
     def gather_terrain_start_step(self, clip_id: torch.Tensor) -> torch.Tensor:
@@ -240,7 +327,11 @@ class MotionClipManager(ManagerBase):
 
         ``-1`` where the clip has no pinned frame at all.  Step-invariant, so this takes
         only ``clip_id``.  See :meth:`_compute_terrain_span`.
+
+        Raises:
+            ClipFreeLibraryError: If the library carries no clips.
         """
+        self._require_clips("gather_terrain_start_step()")
         return self.terrain_start_step[clip_id.to(self.terrain_start_step.device)].to(clip_id.device)
 
     # ------------------------------------------------------------------

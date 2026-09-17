@@ -113,7 +113,11 @@ class TrackingErrorSpec:
     marks them, and consumers that publish a number refuse a bootstrap spec rather than
     reporting one -- the same rule ``eval/report.py`` already applies to a bootstrap goal
     region, and for the same reason: a threshold nobody measured produces a confident wrong
-    number instead of an error.  ``scripts/rsl_rl/fit_tracking_thresholds.py`` writes a real one.
+    number instead of an error.  **There is no script that writes a real one yet** -- `fit_tracking_thresholds.py`
+    is named in `TODO(fit-tracking-thresholds)` and has never existed. What DOES
+    exist is `transfer/sim/measure_tracking_error.py` (the distributions, in MuJoCo)
+    and `transfer/sim/watch_tracking.py` (what a given excursion LOOKED like), which
+    are the two halves its docstring says to read together before choosing a bound.
 
     **There is deliberately no downrange bound and no yaw bound.**  Not an omission and not a
     value of ``inf`` -- the fields do not exist, so nothing can quietly start reading one.  See
@@ -141,7 +145,27 @@ class TrackingErrorSpec:
     """
 
     max_lateral_m: float = 0.2
-    max_height_m: float = 0.2
+    #: **0.12, not 0.20, and it is a MEASURED choice rather than a fitted one.**  Watching the
+    #: two-box course showed proper box jump-downs peaking at 0.130-0.182 m against the old
+    #: 0.20 bound -- nowhere near it -- while stairs-down-off-a-box dismounts came close, so
+    #: the bound is being used to separate a correct dismount from the wrong MODE rather than
+    #: to catch a fall.  The cost was measured on the real opening data set before the change
+    #: (`awr_vm30/inc_001`, 2000 parent episodes, DR on): clean arrivals 21.70% -> 16.85% of
+    #: all episodes, and 95.7% -> 93.4% of windows survive a cut at the latch.  Ground-start
+    #: clean arrivals do collapse, 4.18% -> 0.46%, so at this bound every clean success in an
+    #: opening set is a box-top dismount; that scarcity predates the change and is what
+    #: box-top spawns exist for.
+    #:
+    #: **The re-anchoring objection does not apply.**  `base_height_below_termination`'s
+    #: docstring rejects a reference-relative height bound as a FALL detector, because ego
+    #: re-anchoring re-datums the reference every re-plan and a slow sink never accumulates.
+    #: That is right, and it is a different use: this bound is chunk-local by construction, so
+    #: 0.12 m means "within one re-plan the robot went 12 cm from where the plan put it",
+    #: which is a plan-vs-robot disagreement and not a sink.
+    #:
+    #: Still `bootstrap: True` -- nothing has been FITTED, `fit_tracking_thresholds.py` still
+    #: does not exist, and publishing consumers must keep refusing it.
+    max_height_m: float = 0.12
     max_tilt_rad: float = float(np.deg2rad(30.0))
 
     sigma_pos_m: float = 0.10
