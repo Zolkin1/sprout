@@ -67,6 +67,9 @@ from .g1_depth_env_cfg import (
     G1TeacherTerrainDepthEnvCfg,
     G1TeacherTerrainDepthObservationsCfg,
 )
+# The MDP the off-policy fine-tune ladder is measured on, composed wholesale by the free-form
+# adjuster arm at the bottom of this file.
+from .g1_finetune_env_cfg import G1FinetuneFreeformEnvCfg
 # The closed-loop FM command, imported rather than inherited. It is the one genuinely shared
 # piece: ~40 lines of reasoned config (the "plan" anchor, the CLF weights, no default clip or
 # checkpoint, the CPU clip device) that must not be restated and drift.
@@ -130,6 +133,41 @@ GOAL_SLACK_S: float = mdp.GOAL_DEADLINE_SLACK_S
 #: than the binding constraint on the 20 s flat clips.
 EPISODE_LENGTH_S: float = 24.0
 
+#: Episode budget for the FREE-FORM arm, seconds.
+#:
+#: 40.0, and it is not a choice: it is what `run_finetune_loop.sh` passes at collect
+#: (`env.episode_length_s=40.0`), so the off-policy arms' episodes are this long and the PPO
+#: arm's must be too. On this course the budget is genuinely non-binding on the slow x far
+#: cells, which is the property that keeps a time-out from being scored as a policy failure.
+FREEFORM_EPISODE_LENGTH_S: float = 40.0
+
+#: Envs the free-form arm trains on. What `configs/finetune/boxes.yaml` declares and what the
+#: off-policy collect runs, so the two arms see the same throughput per iteration. NOT part of
+#: the MDP; at EVAL it is, because it sets the censored fraction.
+FREEFORM_NUM_ENVS: int = 2048
+
+#: Knots along the plan's node axis for the free-form arm: ONE PER NODE, so the action is the
+#: full 62 x 44 = 2728-dim residual. `knot_basis(F, F)` is exactly the identity (verified,
+#: `max|B - I| = 0.0`), so this is a config field rather than a second code path -- and 13,
+#: the clip arm's value, is the documented fallback if the mean cannot move at full width.
+FREEFORM_NUM_KNOTS: int = 62
+
+#: Reciprocals of a characteristic (downrange, lateral, height) size on the BOXES course, m.
+#:
+#: The clip families' numbers do not transfer, so they are restated rather than reused:
+#:
+#: * downrange 10 m -- a boxes tile's goal sits `last_box + RUNOUT_M(3.0) + TARGET_LEAD_M(1.5)
+#:   - GOAL_DEPTH_M/2(1.0)` from its start, which over the drawn geometry of
+#:   `configs/finetune/boxes.yaml` is ~8-14 m;
+#: * lateral 0.75 m -- the route's own `goal_half_width`, floored at `GOAL_HALF_WIDTH_FLOOR_M`,
+#:   which is what `logs/ft_boxes/goal_regions.json` declares and what the termination passes
+#:   as `min_half_width`;
+#: * height 0.5 m -- the `height_tol_m` both launchers pass.
+#:
+#: So 1.0 reads "about one goal-region away", the scale the termination thresholds on. Declared
+#: rather than fitted, so it means the same thing in every run.
+FREEFORM_GOAL_OFFSET_SCALE: tuple[float, float, float] = (1.0 / 10.0, 1.0 / 0.75, 1.0 / 0.5)
+
 
 @configclass
 class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
@@ -171,10 +209,12 @@ class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
     that an empirical normalizer would demote to a dataset statistic.
     """
 
-    def __post_init__(self) -> None:
-        """Silence the inherited reference-window noise; see the class docstring."""
-        super().__post_init__()
-        self.reference.reference_window.noise = None
+    #: Whether the ENV silences the inherited reference-window noise. Not done here, because
+    #: the two adjuster tasks answer it differently and an observation group is the wrong place
+    #: to record an MDP decision: the CLIP-terrain arm silences it (the argument above), while
+    #: the free-form arm keeps it, because there the noise is part of a transition kernel the
+    #: off-policy arm being compared against also runs under. See each env cfg's
+    #: ``__post_init__``.
 
     @configclass
     class FmCondCfg(ObsGroup):
@@ -443,6 +483,13 @@ class G1AdjusterEnvCfg(G1TeacherTerrainDepthEnvCfg, AdjusterEnvCfg):
         super().__post_init__()
         self.rewards = G1AdjusterRewardCfg()
 
+        # Silence the tracker's reference-window jitter. Moved here from the observations cfg
+        # because it is a statement about THIS task's MDP: the learned correction reached
+        # ~0.006 m of base position after 840 iterations, an order of magnitude under the
+        # +-0.06 m being added to the channel it writes into. The free-form arm deliberately
+        # does NOT do this -- see `G1AdjusterFreeformEnvCfg`.
+        self.observations.reference.reference_window.noise = None
+
         # JOINT tracking mode. The depth teacher is a BODY-tracking env and
         # ``FmTrackingCommand`` refuses body mode: the body CLF grades 13 ``@root`` links the
         # generator does not predict, so under ``strict_fm_only`` every one of them is NaN.
@@ -637,3 +684,228 @@ class G1AdjusterEnvCfgPlay(G1AdjusterEnvCfg):
         # them per env would be 300k+ at 1024 envs.
         self.scene.terrain_rays.debug_vis = True
         self.scene.terrain_base_patch.debug_vis = True
+
+
+##
+# ==========================================================================================
+# THE FREE-FORM ARM: the same adjuster, on the MDP the off-policy fine-tune is measured on
+# ==========================================================================================
+##
+#
+# Everything above trains on the CLIP terrain teacher, with a tracking-quality reward and
+# clip-derived terminations. That is a different MDP from the one `awr` / `fbc` / `arrived` /
+# `bc` are graded on, so a PPO number measured there answers a different question than the
+# ladder does.
+#
+# This subclass exists so the two can be compared. It composes `G1FinetuneFreeformEnvCfg` --
+# the EXACT task `configs/finetune/boxes.yaml` names -- with the four env-class fields a frozen
+# tracker needs, and installs the online twin of the offline progress reward. What is left
+# different is the ACTION SPACE, which is the point of the comparison: the off-policy arms
+# re-fit the generator's own weights, so they can only move the reference inside its sampling
+# support; this one adds a bounded residual to its output, which can leave that support.
+#
+# ONE deliberate departure, recorded here because it is the only one: the three generator-side
+# corruptions `run_finetune_loop.sh` applies at COLLECT time -- `fm_perturb_fraction`,
+# `fm_upper_camera_noise_fraction` and `fm_speed_mismatch_fraction` -- are left at their cfg
+# defaults of 0. The first exists to manufacture the behavioural spread AWR reweights, which is
+# a job PPO's own Gaussian does. The teacher's world DR (`events`: actuator gains, mass,
+# friction, pushes, camera extrinsics, depth noise) and the tracker's observation corruption are
+# UNTOUCHED and identical to the collect. None of the three affects scoring: they are
+# collect-only overrides and `run_quick_eval.sh` applies none of them.
+
+
+@configclass
+class G1ProgressRewardCfg:
+    """The offline progress reward, computed live, and nothing else.
+
+    Three terms at weight 1.0 each, so ``Episode_Reward/*`` reports exactly the three columns
+    the offline sidecar stores and a training log can be diffed against a graded rollout
+    directly. The weights are NOT free parameters here -- they are 1.0 because the reward being
+    reproduced has no weights, and moving one would make this a different reward from the one
+    the arms being compared against were graded by.
+
+    Every term the clip-terrain arm carries is gone, and each for a reason rather than by
+    omission:
+
+    * ``trackability`` graded how well the tracker followed the plan. The off-policy arms are
+      not graded on that at all -- their reward is geometric plus progress -- so keeping it
+      would be the largest single difference between the two MDPs.
+    * ``residual_l2`` / ``residual_rate_l2`` are a penalty on the ACTION. The off-policy arms
+      have no action to penalise, and the residual is already bounded hard in
+      ``apply_plan_residual`` (0.20 m position, 15 deg tilt), so this was a soft anchor on top
+      of a real cap rather than part of the task.
+    * ``goal_bonus`` / ``failed`` / ``ran_out_of_time`` are replaced by the progress reward's
+      own terminal term, which is gated by the episode's worst chunk -- so arrival is paid for
+      only in proportion to how cleanly the whole traverse was planned. ``ran_out_of_time`` has
+      no counterpart at all: the offline reward pays nothing for running the clock out, and its
+      tail convention continues at the last ongoing reward rather than charging a penalty.
+    """
+
+    progress_terrain: RewTerm = RewTerm(
+        func=mdp.progress_terrain, weight=1.0, params={"command_name": "traj_ref"})
+    progress_velocity: RewTerm = RewTerm(
+        func=mdp.progress_velocity, weight=1.0, params={"command_name": "traj_ref"})
+    progress_success: RewTerm = RewTerm(
+        func=mdp.progress_success, weight=1.0, params={"command_name": "traj_ref"})
+
+
+@configclass
+class G1AdjusterFreeformObservationsCfg(G1AdjusterObservationsCfg):
+    """The adjuster's groups, with the free-form task's global-drift channel added back.
+
+    ``G1AdjusterObservationsCfg`` dropped ``tracking_error_global`` when it narrowed the critic
+    (it was a clip-datum channel, and the adjuster had no clip to measure against). The
+    free-form base REQUIRES it -- ``G1FinetuneFreeformEnvCfg.__post_init__`` re-points its
+    ``datum`` by name and is an ``AttributeError`` against a group that lacks it.
+
+    Adding it back is not merely appeasing that line, and it is why this is a subclass rather
+    than a change to the parent. Under ``history_from="generator"`` -- which this arm is forced
+    into, the parent generator being a reference-history checkpoint -- the history rows in
+    ``fm_cond`` are the model's own past output, so the ACTOR has no channel carrying how far
+    the tracker has fallen behind the plan. Plan-anchor drift is exactly that quantity, it
+    re-zeros at every re-plan so it is bounded by ``K * dt * speed`` and stays O(1), and giving
+    it to the critic is the cheapest recovery of what the history arm costs. Six channels.
+
+    A subclass so the CLIP-terrain arm's critic width is untouched: its checkpoints resume.
+    """
+
+    @configclass
+    class CriticCfg(G1AdjusterObservationsCfg.CriticCfg):
+        """The adjuster's critic group plus the plan-anchor drift."""
+
+        #: Declared with the free-form datum already set, so the base's re-point is a no-op
+        #: restatement rather than the only thing that makes it correct.
+        tracking_error_global: ObsTerm = ObsTerm(
+            func=mdp.tracking_error_global,
+            params={"command_name": "traj_ref", "datum": "plan_anchor"})
+
+    critic: CriticCfg = CriticCfg()
+
+
+@configclass
+class G1AdjusterFreeformEnvCfg(G1FinetuneFreeformEnvCfg, AdjusterEnvCfg):
+    """The adjuster on the free-form fine-tune MDP -- the PPO arm of the algorithm ladder.
+
+    Base order is load-bearing. ``G1FinetuneFreeformEnvCfg`` supplies the whole MDP (the
+    manifest-only terrain, the section spawn, the steered free-form command, the five
+    terminations, the world DR); ``AdjusterEnvCfg`` supplies only the four fields
+    :class:`AdjusterEnv` reads off the cfg and defines no ``__post_init__``, so it goes last and
+    contributes nothing to the composition order.
+
+    **Almost nothing is declared at class level, and that is deliberate.** ``commands``,
+    ``terminations``, ``events`` and ``rewards`` are all INHERITED: declaring a second
+    ``commands`` (as the clip-terrain arm does, importing the tracker's) would replace the
+    object ``G1FinetuneFreeformEnvCfg.__post_init__`` mutates, and ``reference_source``,
+    ``seed_history_from_clip`` and ``random_start_before_terrain_start`` would all silently
+    revert to the clip task's values. ``rewards`` is installed in ``__post_init__`` rather than
+    declared for the reason the clip arm documents: the teacher's own ``__post_init__`` reaches
+    ``self.rewards.undesired_contacts`` by name while it runs.
+
+    **What the clip-terrain arm sets and this one must NOT**, each checked against a
+    constructed cfg rather than read off the class:
+
+    ======================================  ==========================================
+    the clip arm does                        why it is wrong here
+    ======================================  ==========================================
+    ``history_from = "measured"``            FATAL, not a preference. The ladder's parent
+                                             is a ``reference``-history checkpoint and
+                                             ``assert_history_source_matches`` refuses the
+                                             pair at generator load.
+    ``stand_start`` / ``cmd_hold_s``         Read by the CLIP reset, which is ``None`` here.
+                                             ``freeform_cmd_hold_s`` (0.5 s) is the real hold
+                                             and the section spawn already stands the robot up.
+    ``seed_history_from_stand``              NOT inert -- ``_snapshot_and_infer`` seeds
+                                             regardless of the command source, so it would
+                                             change the opening plan. The off-policy collect
+                                             opens on the learned null-history embedding.
+    ``tracking_mode`` / ``random_start_phase``  Already set by the free-form base, with reasons.
+    ``steer_kp = 1.5``                       The free-form command steers itself
+                                             (``freeform_steer_kp``). The adjuster's installer
+                                             also scans for a ``mdp.GoalReached`` INSTANCE,
+                                             which this task does not have -- it uses the
+                                             ``freeform_goal_reached`` function -- so leaving
+                                             it on raises at construction.
+    ``episode_length_s = 24.0``              The collect runs 40 s.
+    silencing ``reference_window`` noise     It is part of the transition kernel both arms run
+                                             under, so removing it for one makes the MDPs differ.
+    ======================================  ==========================================
+    """
+
+    #: The critic keeps the adjuster's widened group plus the plan-anchor drift; the two actor
+    #: groups and the tracker's two come with it. Declared because the base chain MUTATES
+    #: observation terms by name.
+    observations: G1AdjusterFreeformObservationsCfg = G1AdjusterFreeformObservationsCfg()
+
+    #: Fitted goal regions. Unused by the terminations on this task -- the free-form goal is
+    #: declared by the manifest route, not fitted from clips -- and kept only so
+    #: ``--goal_regions`` composes and the debug viz can draw them.
+    goal_regions_path: str = ""
+
+    def __post_init__(self) -> None:
+        """Compose the free-form fine-tune, then make it an adjuster task."""
+        super().__post_init__()
+        self.rewards = G1ProgressRewardCfg()
+
+        # The collect's budget. The free-form base leaves the teacher's 20 s, which would cut
+        # the slow x far cells before the goal band could fire and convert an arrival into a
+        # time-out.
+        self.episode_length_s = FREEFORM_EPISODE_LENGTH_S
+        # ...and the collect's env count, which is where it actually binds (`--num_envs` still
+        # wins). It is not part of the MDP -- it changes throughput, and at EVAL it sets the
+        # censored fraction, which is why `run_quick_eval.sh` insists the arms match there.
+        self.scene.num_envs = FREEFORM_NUM_ENVS
+
+        # FULL-WIDTH action: one knot per plan node, so `knot_basis` is the identity and the
+        # residual is the whole 62 x 44 window. Must match the actor's `num_knots`.
+        self.num_knots = FREEFORM_NUM_KNOTS
+
+        # OFF, and it must be set rather than left: `AdjusterEnv._install_steering` refuses a
+        # non-zero gain unless a `mdp.GoalReached` term is active, and this task steers through
+        # the command's own pure-pursuit controller instead.
+        self.steer_kp = 0.0
+
+        # The generator-side collect corruptions, OFF and stated rather than left at their
+        # defaults. The two inner fractions already default to 0, so this gate changes no
+        # behaviour -- but it defaults to 1.0, which READS as "perturbation on", and this is the
+        # one place a reader looks to find out whether this arm carries them. It does not: see
+        # the block comment above this class for why the perturbation arm in particular is the
+        # off-policy loop's exploration device rather than part of the task.
+        self.commands.traj_ref.fm_perturb_fraction = 0.0
+
+        # The generator's conditioning and its final-step flow field ARE the actor's two
+        # observation groups. Set on the command cfg rather than called on the env, because the
+        # observation manager probes every term's shape while the managers are still building.
+        self.commands.traj_ref.stash_conditioning = True
+        self.commands.traj_ref.stash_flow = True
+
+        # The two privileged terrain sensors the critic reads. `ray_alignment="yaw"` puts both
+        # in the base's YAW frame: under the full orientation the pattern would pitch with the
+        # torso and a lean would read as terrain moving.
+        self.scene.terrain_base_patch = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/Geometry/pelvis_link",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.2, 0.0, 20.0)),
+            ray_alignment="yaw",
+            pattern_cfg=patterns.GridPatternCfg(resolution=0.1, size=[1.2, 0.8]),
+            mesh_prim_paths=["/World/ground"],
+            debug_vis=False,
+        )
+        self.scene.terrain_rays = RayCasterCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/Geometry/pelvis_link",
+            offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 20.0)),
+            ray_alignment="yaw",
+            pattern_cfg=RayFanPatternCfg(),
+            mesh_prim_paths=["/World/ground"],
+            debug_vis=False,
+        )
+
+        # The critic's goal channel, rescaled for THIS course. `mdp.goal_geometry` already
+        # dispatches clip-free -- `goal_anchor_world` branches on `cmd.has_clips` to
+        # `freeform_goal_anchor_world`, and `last_usable_step` has its own clip-free branch --
+        # so only the three scalars change, and `slack_s` goes to 0 because `clip_end` is
+        # disabled here and `time_out` is the only deadline.
+        self.observations.critic.goal_geometry.params = {
+            "command_name": "traj_ref",
+            "slack_s": 0.0,
+            "step_scale": 1.0 / (FREEFORM_EPISODE_LENGTH_S / CONTROL_DT),
+            "offset_scale": FREEFORM_GOAL_OFFSET_SCALE,
+        }

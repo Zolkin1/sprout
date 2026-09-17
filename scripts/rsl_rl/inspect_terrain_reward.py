@@ -45,6 +45,7 @@ import json
 import os
 import pathlib
 import sys
+from dataclasses import replace
 
 import h5py
 import numpy as np
@@ -56,6 +57,10 @@ from motion_gen import features as MGF                                    # noqa
 from motion_gen.clip_output import foot_box_corners                       # noqa: E402
 from motion_gen.joint_names import G1_JOINT_NAMES                         # noqa: E402
 from motion_gen.math_utils import quat_apply                              # noqa: E402
+from motion_gen.progress_reward import (                                  # noqa: E402
+    PROGRESS_REWARD_SPEC,
+    terrain_gate,
+)
 from motion_gen.plan_geometry import (                                    # noqa: E402
     CONTACT_DILATE_NODES,
     CONTACT_MAX_GAP_NODES,
@@ -97,7 +102,12 @@ CONTROL_DT: float = 0.02
 #:
 #: 1.0 because the reference weights already put each term near 1.0 at its own p95, so a unit
 #: temperature spends the reward's range on exactly the band the terms were scaled to.
-REWARD_TAU: float = 1.0
+#:
+#: READ from the shared spec, not restated: the live reward
+#: (``robot_rl...mdp.rewards.progress``) computes this same quantity on the same rollouts, and
+#: a constant that disagreed between them would turn an algorithm comparison into a reward
+#: comparison with nothing in either run's output to say so.
+REWARD_TAU: float = PROGRESS_REWARD_SPEC.tau
 
 #: Name stamped into the sidecar and checked by ``label_advantage``.
 REWARD_SOURCE: str = "terrain"
@@ -670,7 +680,7 @@ def per_step_reward_max(success_const: float) -> float:
         ``1 + 1 + C`` -- terrain and the gated velocity term are each bounded by 1, and the
         terminal chunk of a successful episode additionally carries ``gate_worst * C``.
     """
-    return 2.0 + float(success_const)
+    return replace(PROGRESS_REWARD_SPEC, success_const=float(success_const)).per_chunk_max
 
 
 def _progress_terms(rollout: str, rows: np.ndarray, uid: np.ndarray, rep: np.ndarray,
@@ -785,7 +795,7 @@ def _progress_terms(rollout: str, rows: np.ndarray, uid: np.ndarray, rep: np.nda
 
     err = np.abs(v_fwd - cmd_vx_all[rows])
     vel = np.exp(-err / float(vel_sigma))
-    gate = np.sin(0.5 * np.pi * np.power(np.clip(reward_terrain, 0.0, 1.0), float(sharpness)))
+    gate = terrain_gate(np.asarray(reward_terrain), sharpness)
 
     # The EPISODE gate is the worst chunk's, so success only pays when the robot was
     # consistent throughout -- not when it was clean once and destructive elsewhere.
@@ -793,8 +803,7 @@ def _progress_terms(rollout: str, rows: np.ndarray, uid: np.ndarray, rep: np.nda
     worst_by_ep = np.full(int(inv.max()) + 1 if inv.size else 0, np.inf, dtype=np.float64)
     np.minimum.at(worst_by_ep, inv, reward_terrain)
     worst_arr = worst_by_ep[inv]
-    gate_worst = np.sin(0.5 * np.pi
-                        * np.power(np.clip(worst_arr, 0.0, 1.0), float(success_sharpness)))
+    gate_worst = terrain_gate(worst_arr, success_sharpness)
     # **TERMINAL, on the episode's last re-plan only.** Two earlier shapes were tried and
     # measured: adding C to every chunk made the target near-binary (unsuccessful rows 0.11,
     # successful 0.95, with terrain and velocity confined to the bottom sixth of the range),
@@ -1029,14 +1038,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "sidecar is the terrain grade alone -- which five AWR iterations "
                         "drove to 0.20 m/s against a commanded 1.35, because a per-re-plan "
                         "geometric penalty is very nearly maximised by standing still.")
-    p.add_argument("--gate_sharpness", type=float, default=2.0,
+    p.add_argument("--gate_sharpness", type=float, default=PROGRESS_REWARD_SPEC.gate_sharpness,
                    help="s in the gate sin((pi/2) * R**s). It MULTIPLIES THE PENALTY before "
                         "gating (exp(-s*p/tau) == R**s), so s=2 gates as though every "
                         "chunk's terrain penalty were twice as large. Default 2.0: at s=1 a "
                         "penalty of 0.5 still passes 82%% of its velocity credit, which "
                         "reintroduces the sloppy-but-fast failure one level up; s=2 halves "
                         "that to 55%%.")
-    p.add_argument("--success_gate_sharpness", type=float, default=3.0,
+    p.add_argument("--success_gate_sharpness", type=float, default=PROGRESS_REWARD_SPEC.success_gate_sharpness,
                    help="s in the EPISODE gate sin((pi/2) * min_t(R)**s) on the success term. "
                         "Separate from --gate_sharpness and higher (3.0 vs 2.0) because this "
                         "gate reads the episode's WORST chunk: one destructive re-plan should "
@@ -1062,10 +1071,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "dismounts the gate exists to refuse. Box-top spawns are what make a "
                         "clean success reachable, and only then does a strict gate select "
                         "rather than annihilate.")
-    p.add_argument("--vel_sigma", type=float, default=0.5,
+    p.add_argument("--vel_sigma", type=float, default=PROGRESS_REWARD_SPEC.vel_sigma_mps,
                    help="exp(-|v_err| / sigma) for the velocity term, m/s. 0.5 means "
                         "tracking within 0.5 m/s scores 0.37 and perfect tracking 1.0.")
-    p.add_argument("--success_const", type=float, default=10.0,
+    p.add_argument("--success_const", type=float, default=PROGRESS_REWARD_SPEC.success_const,
                    help="C in gate_worst * C * reached_goal. 10 makes reaching the goal worth "
                         "about ten re-plans of perfect velocity tracking.")
     p.add_argument("--stage", default="all",

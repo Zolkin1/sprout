@@ -13,6 +13,13 @@ import isaaclab.envs.mdp as _isaaclab_envs_mdp
 from isaaclab_tasks.manager_based.locomotion.velocity.mdp import *  # Inherit from the base envs
 
 from .rewards.rewards import *  # noqa: F401, F403
+# EXPLICIT, not `import *`: these three are the live twin of the offline progress
+# grader and are meant to be found by name when someone is chasing the two apart.
+from .rewards.progress import (  # noqa: F401
+    progress_success,
+    progress_terrain,
+    progress_velocity,
+)
 from .observations.observations import *  # noqa: F401, F403
 from .observations.depth import (  # noqa: F401
     DEPTH_OBS_FUNCS,

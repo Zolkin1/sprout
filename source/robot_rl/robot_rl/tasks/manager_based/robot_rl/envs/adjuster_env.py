@@ -52,12 +52,14 @@ drop the penalty on every terminating interval.
 from __future__ import annotations
 
 import json
+import os
 
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 
 from robot_rl.flow_matching.knot_basis import knot_basis
 from robot_rl.flow_matching.window import residual_scale_vector
+from robot_rl.rl.adjuster_policy import residual_from_action
 from robot_rl.rl.frozen_tracker import FrozenTracker
 from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region, tracking_error
@@ -100,12 +102,17 @@ class AdjusterEnv(ManagerBasedRLEnv):
                 "inside this env, so there is nothing to run without it -- and a default "
                 "would be a path to an artifact, which rots quietly."
             )
-        if not cfg.tracking_spec_path:
-            raise ValueError(
-                "AdjusterEnvCfg.tracking_spec_path is unset. The dense reward's kernel widths "
-                "come from a fitted spec, and BOOTSTRAP_SPEC's are placeholders roughly 2x "
-                "blunter -- so there is no safe default."
-            )
+        # `tracking_spec_path` is NO LONGER REQUIRED, and the distinction is the whole point
+        # of the free-form arm. On the CLIP task the dense reward's kernel widths come from a
+        # fitted spec and BOOTSTRAP_SPEC's are placeholders roughly 2x blunter, so a default
+        # there would be unsafe -- and that arm still passes one. The free-form arm has no
+        # dense tracking reward at all (its reward is geometric plus progress), and its failure
+        # bound MUST be BOOTSTRAP_SPEC, because that is what
+        # `mdp.fm_tracking_violation_termination` uses and what every off-policy arm it is
+        # compared against terminated on. A fitted spec there would give this arm different
+        # failure bounds and `rollout_outcomes.assert_tracking_bounds_agree` would refuse the
+        # comparison outright -- the same parent has measured 0.2440 under one bound and
+        # 0.0002 under the other. The fallback is taken, and printed, further down.
         super().__init__(cfg, **kwargs)
 
         cmd = self.command_manager.get_term(cfg.command_name)
@@ -115,8 +122,31 @@ class AdjusterEnv(ManagerBasedRLEnv):
                 f"fm_update_every must be >= 1 to be an interval length, got "
                 f"{self.replan_period}."
             )
+        self._assert_speed_band_is_the_librarys(cmd)
         self.fm_cadence_buf = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.track_mean = torch.zeros(self.num_envs, device=self.device)
+        # -- what the PROGRESS reward needs, and why the env owns it rather than the term ----
+        #
+        # All three are properties of the INTERVAL, latched at the re-plan that opened it, and
+        # a reward term run at the interval's end cannot recover them: the free-form command's
+        # 0.5 s zero hold ends mid-interval on one chunk of every episode, so reading the
+        # command at reward time would grade that chunk against a speed it was not conditioned
+        # on. The anchor pair is unchanged through the interval (only `_run_fm` writes it, and
+        # that happens after rewards), but it is latched here anyway so the three travel
+        # together and a future re-ordering cannot silently split them.
+        self.progress_anchor_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self.progress_anchor_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        self.progress_anchor_quat[:, 3] = 1.0                       # XYZW identity
+        self.progress_cmd_vx = torch.zeros(self.num_envs, device=self.device)
+        # The episode's WORST terrain grade so far. `+inf` rather than 1.0 so the first chunk
+        # sets it outright; the success gate reads it only on the terminal chunk, by which
+        # point every chunk has been folded in.
+        self.worst_terrain_R = torch.full((self.num_envs,), float("inf"), device=self.device)
+        # `(1 - gamma)`, the factor the arrival bonus carries. See `mdp.progress_success` for
+        # the derivation; the short version is that rsl-rl bootstraps `gamma * V(s)` at a
+        # truncation and the offline reducer does not, so a bonus at face value would recur
+        # 1/(1-gamma) times. Sourced from the cfg so one number reaches both this and PPO.
+        self.progress_gamma_scale = 1.0 - float(cfg.progress_gamma)
         # WHICH TERM ended each episode, recorded per term so a sparse reward can name its
         # cause. These are real terminations -- the episode ends and the env resets. This
         # exists only because the reset is deferred to the interval boundary: an env can
@@ -142,13 +172,23 @@ class AdjusterEnv(ManagerBasedRLEnv):
             for name in self.termination_manager.active_terms
         }
         self._track_offsets = torch.zeros(1, dtype=torch.long, device=self.device)
-        # ONE spec, and this ENFORCES it rather than assuming it. The dense reward's kernel
-        # widths and the failure termination's bounds have to come from the same file, or the
-        # reward grades against one calibration while the episode ends on another -- silently,
-        # since both are valid specs. `TrackingViolation` prefers its own `spec_path` param
+        # ONE spec, enforced WHERE THERE IS ONE TO ENFORCE. The dense reward's kernel widths
+        # and the failure termination's bounds have to come from the same file, or the reward
+        # grades against one calibration while the episode ends on another -- silently, since
+        # both are valid specs. `TrackingViolation` prefers its own `spec_path` param
         # (hydra-overridable) and only falls back to the env cfg, so the two CAN diverge.
         # Take the term's resolved answer where there is one; that way the override still
         # works and both halves move together.
+        #
+        # **The scan finds nothing on the FREE-FORM arm, and that is correct rather than a
+        # gap.** That task terminates on `mdp.fm_tracking_violation_termination`, a plain
+        # FUNCTION reading `BOOTSTRAP_SPEC`, not a `TrackingViolation` instance -- because
+        # `BOOTSTRAP_SPEC`'s bounds are what every off-policy arm it is compared against
+        # terminated on, and `rollout_outcomes.assert_tracking_bounds_agree` refuses a
+        # comparison across two different ones. So on that arm there is no fitted spec, the
+        # loop below matches nothing, and `track_mean` falls back to `BOOTSTRAP_SPEC` as a
+        # diagnostic -- which is then the SAME calibration the termination uses, so the
+        # property this block exists to guarantee holds there by construction.
         spec_path = str(cfg.tracking_spec_path)
         violation = None
         for name in self.termination_manager.active_terms:
@@ -162,8 +202,20 @@ class AdjusterEnv(ManagerBasedRLEnv):
                           f"{spec_path} -- the reward and the termination stay on one file.")
                     spec_path = override
                 break
-        with open(spec_path) as f:
-            self._track_spec = tracking_error.TrackingErrorSpec.from_dict(json.load(f))
+        if spec_path:
+            with open(spec_path) as f:
+                self._track_spec = tracking_error.TrackingErrorSpec.from_dict(json.load(f))
+        else:
+            # No fitted spec, so `track_mean` is reported against the same bounds the
+            # termination uses. NOT a silent default: nothing is GRADED by this on the arm
+            # that takes this branch -- its reward is geometric plus progress -- and a
+            # `BOOTSTRAP_SPEC` reward WOULD be a bad default, which is why the clip-terrain
+            # arm still passes a fitted file and why this says which one it took.
+            self._track_spec = tracking_error.BOOTSTRAP_SPEC
+            print("[INFO] AdjusterEnv: no --tracking_spec, so `Diagnostics/track_mean` is "
+                  "reported against BOOTSTRAP_SPEC -- the same bounds "
+                  "`fm_tracking_violation_termination` ends the episode on. Nothing is "
+                  "graded by it.")
         if violation is not None and violation.spec != self._track_spec:
             raise ValueError(
                 "AdjusterEnv: the dense reward and the tracking_violation termination "
@@ -214,6 +266,56 @@ class AdjusterEnv(ManagerBasedRLEnv):
               f"episode <= {self.max_episode_length // self.replan_period} agent steps")
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _assert_speed_band_is_the_librarys(cmd) -> None:
+        """Refuse a free-form command whose speed band is not the one the library declares.
+
+        **The band is a property of the COURSE**, stamped into the library by its generator and
+        read back with ``clip_io.read_commanded_speed_range``. The off-policy loop derives it
+        that way at collect; nothing on the RL side did, so a training run took the cfg default
+        (0.6-2.6) while the library declared something else (0.4-2.5 on the boxes course) and
+        the two arms were asked for different speeds with nothing in either output saying so.
+        That is the exact failure ``read_commanded_speed_range``'s own docstring was written
+        for, one layer up.
+
+        A refusal rather than a silent override, because a deliberate sweep is a real use and
+        this cannot tell it from a mistake -- so it names the overrides to pass.
+
+        Args:
+            cmd: The :class:`FmTrackingCommand` term.
+
+        Raises:
+            ValueError: If the library declares a band and the cfg does not match it.
+        """
+        if not getattr(cmd.cfg, "freeform_command", False):
+            return
+        path = getattr(cmd.cfg, "path", "") or ""
+        if not path:
+            return
+        from motion_gen.clips.clip_io import read_commanded_speed_range   # noqa: PLC0415
+
+        declared = read_commanded_speed_range(path)
+        if declared is None:
+            print(f"[INFO] AdjusterEnv: {os.path.basename(path)} declares no commanded-speed "
+                  f"band; using the cfg's {cmd.cfg.freeform_speed_min}-"
+                  f"{cmd.cfg.freeform_speed_max} m/s.")
+            return
+        lo, hi = float(declared[0]), float(declared[1])
+        have = (float(cmd.cfg.freeform_speed_min), float(cmd.cfg.freeform_speed_max))
+        if abs(have[0] - lo) > 1e-6 or abs(have[1] - hi) > 1e-6:
+            raise ValueError(
+                f"the commanded-speed band does not match the course. "
+                f"{os.path.basename(path)} declares {lo}-{hi} m/s; this run is configured for "
+                f"{have[0]}-{have[1]}. The off-policy arms collect at the library's band, so a "
+                f"run at a different one is not the same MDP. Pass:\n"
+                f"  env.commands.traj_ref.freeform_speed_min={lo} "
+                f"env.commands.traj_ref.freeform_speed_max={hi}\n"
+                f"...or override deliberately and say so in the run's own log."
+            )
+        print(f"[INFO] AdjusterEnv: commanded speed {lo}-{hi} m/s, declared by "
+              f"{os.path.basename(path)}.")
+
+    # ------------------------------------------------------------------
     def _reset_idx(self, env_ids) -> None:
         """Reset, and zero the re-plan phase for those envs.
 
@@ -221,6 +323,10 @@ class AdjusterEnv(ManagerBasedRLEnv):
             env_ids: Environments to reset.
         """
         super()._reset_idx(env_ids)
+        # The progress reward's success gate reads the episode's worst chunk, so it has to
+        # start over. Safe here and only here: rewards are folded BEFORE the reset, so the
+        # terminal chunk has already read the value this clears.
+        self.worst_terrain_R[env_ids] = float("inf")
         # Zero AFTER the parent: its command-manager reset is what invalidates the prediction,
         # and a fresh phase plus an invalid prediction is what makes the next command compute
         # re-plan for these envs exactly once (``reinfer | ~_pred_valid``).
@@ -288,6 +394,19 @@ class AdjusterEnv(ManagerBasedRLEnv):
         self.obs_buf["reference"] = self.observation_manager.compute_group(
             "reference", update_history=False
         )
+
+        # The interval's opening state, for the progress reward's velocity term. `_anchor_pos`
+        # IS `root_pos_w` at the re-plan (see `_run_fm`), so differencing it against
+        # `root_pos_w` at the interval's end gives the mean velocity over exactly the interval
+        # the plan governed -- the same quantity the offline grader gets by differencing
+        # consecutive recorded anchors.
+        self.progress_anchor_pos.copy_(cmd._anchor_pos)
+        self.progress_anchor_quat.copy_(cmd._anchor_quat)
+        # The NOMINAL command. `_override_cmd_speed` perturbs only the copy handed to the
+        # generator, so this accessor is the uncorrupted one by construction -- the robot is
+        # asked to achieve the speed it was really given, and the speed-mismatch arm stays an
+        # input corruption to reject rather than a reward it can chase.
+        self.progress_cmd_vx.copy_(cmd.get_command_velocity_horizon(1)[:, 0, 0])
 
         rd = self.scene["robot"].data
         is_rendering = self.sim.is_rendering
@@ -597,9 +716,9 @@ class AdjusterEnv(ManagerBasedRLEnv):
         prev = self._knot_action
         self._knot_action = shaped.detach()
         self._knot_action_prev = prev if prev is not None else torch.zeros_like(self._knot_action)
-        # KNOTS -> NODES first, then squash. The order is load-bearing: `tanh` after the
-        # lift is what keeps the per-channel cap exactly as it was at full width, because
-        # Catmull-Rom overshoots by up to 25% between knots and squashing the knots first
-        # would let the interpolated window exceed the cap it is supposed to respect.
-        lifted = torch.einsum("fk,bkd->bfd", self._knot_lift, shaped)
-        return torch.tanh(lifted) * self._residual_scale
+        # ONE PRODUCER, shared with anything that drives a trained adjuster from outside this
+        # env. The lift-then-squash-then-scale order is load-bearing and is documented there;
+        # a second transcription of it is how a scored rollout comes to differ from the
+        # rollouts that trained the policy.
+        return residual_from_action(shaped.reshape(shaped.shape[0], -1),
+                                    self._knot_lift, self._residual_scale)

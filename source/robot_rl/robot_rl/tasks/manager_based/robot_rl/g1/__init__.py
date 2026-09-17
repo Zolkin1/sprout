@@ -367,4 +367,21 @@ if not _registered:
         },
     )
 
+    # The PPO arm of the algorithm ladder: the SAME adjuster, on the MDP `configs/finetune/
+    # boxes.yaml` names, so a PPO number drops into the same forest-plot block as awr / fbc /
+    # arrived / bc. A separate id rather than a flag on the one above, because the two differ
+    # in terrain, reward and terminations -- everything a task id exists to name -- and the
+    # clip-terrain arm stays runnable.
+    gym.register(
+        id="G1-adjuster-ft-freeform",
+        entry_point=f"{envs.__name__}.adjuster_env:AdjusterEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_adjuster_env_cfg:G1AdjusterFreeformEnvCfg",
+            "rsl_rl_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_ppo_cfg:AdjusterFreeformPPORunnerCfg"
+            ),
+        },
+    )
+
     _registered = True

@@ -102,6 +102,26 @@ class AdjusterEnvCfg(ManagerBasedRLEnvCfg):
     interpolation, so the per-channel cap still binds exactly.
     """
 
+    progress_gamma: float = 0.95
+    """The discount the PROGRESS reward's arrival bonus is scaled by, as `1 - gamma`.
+
+    It MUST equal the PPO discount, and `scripts/rsl_rl/train.py` REFUSES a run where it
+    does not -- that being the only place the env cfg and the agent cfg are both in hand. The
+    offline grader builds the `(1-gamma)`-weighted average `G = (1-gamma) * sum gamma^i r`, so
+    a one-off arrival bonus enters the off-policy arm's target with weight `(1-gamma)`. On this
+    side `goal_reached` is a truncation and rsl-rl adds `gamma * V(s)` there, where `V` at a
+    goal-adjacent state is defined through itself -- fixed point `(r + b)/(1-gamma)` -- so a
+    bonus paid at face value recurs with weight `1/(1-gamma)`, twenty times what the other arm
+    sees. Paying `(1-gamma) * gate_worst * C` removes that factor of twenty. It does NOT make
+    the two returns identical -- the offline tail averages three trailing rewards where this
+    bootstrap continues at one -- see `mdp.rewards.progress.progress_success` for the residual
+    and why it is left.
+
+    0.95 is the offline reducer's own per-chunk discount (`advantage.bootstrapped_window_return`),
+    and a chunk is a chunk on both sides. Not the 0.96 the clip-terrain adjuster arm settled on:
+    that was fitted to its own episode length and is not the number being matched here.
+    """
+
     zero_residual: bool = False
     tracker_run_dir: str = ""
     tracker_checkpoint: str = "model_19999.pt"

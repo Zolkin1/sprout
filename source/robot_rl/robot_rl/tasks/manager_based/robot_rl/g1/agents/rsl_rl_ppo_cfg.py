@@ -508,6 +508,69 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
 
 
 @configclass
+class AdjusterFreeformPPORunnerCfg(AdjusterPPORunnerCfg):
+    """PPO for the free-form arm: the FULL per-node action, and the off-policy arm's discount.
+
+    Three changes from the clip-terrain arm, and each is about matching the thing being
+    compared against rather than about tuning:
+
+    * **`gamma` 0.96 -> 0.95.** 0.96 was fitted to the clip task's ~6.2 s episode. 0.95 is the
+      offline reducer's own per-chunk discount (`advantage.bootstrapped_window_return`), and a
+      chunk is a chunk on both sides. It must equal `AdjusterEnvCfg.progress_gamma`, because
+      that is what scales the arrival bonus so the two returns are the same object -- pinned by
+      `test_adjuster_freeform_cfg.py`.
+    * **the action is FULL WIDTH again**, 62 x 44 = 2728. `knot_basis(F, F)` is exactly the
+      identity (verified: `max|B - I| = 0.0`), so this is one config field rather than a second
+      code path, and `ChunkPPO`'s `T` becomes 62. This is the arm the paper describes as "PPO
+      on the full continuous action space", so the parameterisation is the claim.
+
+      The risk is measured and is the one to watch: at 1024 envs x 8 steps the full-width run
+      held ~96-97% exploration variance over 840 iterations, because one scalar advantage
+      against 2728 dims is ~3 samples per dimension per iteration. At 2048 envs x 24 steps it
+      is ~18, six times better sampled, and `group_init_std` keeps the grouped std (5 + 62 = 67
+      learned numbers, not 2728). `Diagnostics/residual_mean_energy_frac` is the go/no-go;
+      `num_knots = 13` on both this and the env cfg is the documented fallback.
+    The env count is NOT set here -- `RslRlOnPolicyRunnerCfg` has no such field, so assigning
+    one would be inert and would read as a decision. It lives on the env cfg's `scene.num_envs`
+    (2048, matching the off-policy collect) and `--num_envs` still overrides it.
+
+    `entropy_coef = 0.0`, `desired_kl = 0.01` and `clip_param = 0.2` are inherited unchanged:
+    `ChunkPPO` factors the ratio per node, so they are per-STEP statistics and the stock values
+    are the regime they were tuned for.
+    """
+
+    experiment_name = "g1_adjuster_freeform"
+    actor = AdjusterModelCfg(
+        hidden_dims=[1],
+        activation="elu",
+        distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.15, std_type="log"),
+        obs_normalization=False,
+        # FULL WIDTH: one knot per node, so the lift is the identity and the action is the
+        # whole 62 x 44 window. Must match `AdjusterEnvCfg.num_knots`; the width assertion in
+        # `AdjusterEnv._residual_from_action` catches a mismatch rather than applying it.
+        num_knots=62,
+        knot_kind="catmull",
+        group_init_std={
+            "base_pos": 0.05,
+            "base_ori": 0.05,
+            "base_lin_vel": 0.10,
+            "base_ang_vel": 0.10,
+            "joint_pos": 0.15,
+        },
+    )
+    algorithm = ChunkPpoAlgorithmCfg(**{
+        **_PPO_KWARGS,
+        "clip_param": 0.2,
+        "desired_kl": 0.01,
+        "entropy_coef": 0.0,
+        # The offline reducer's per-chunk discount. See the class docstring.
+        "gamma": 0.95,
+        "num_mini_batches": 12,
+        "critic_warmup_iterations": 30,
+    })
+
+
+@configclass
 class AdjusterPlayPPORunnerCfg(AdjusterPPORunnerCfg):
     """Watch an adjuster checkpoint. Same actor, no critic restored.
 

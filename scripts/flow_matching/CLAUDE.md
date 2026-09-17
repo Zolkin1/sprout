@@ -6,7 +6,7 @@ the chunks, update the generator, x5. `run_finetune_loop.sh` runs the whole thin
 per stage; **`FINETUNE.md` is the runbook** and carries the artifact provenance, the library
 fingerprints and the traps.
 
-This is NOT the teacher PPO fine-tune `README.md` §4c documents. Nothing here calls
+This is NOT the teacher PPO fine-tune `README.md` §4d documents. Nothing here calls
 `scripts/rsl_rl/train.py`.
 
 # BUILDING a generator from scratch: `run_fm_pipeline.sh`

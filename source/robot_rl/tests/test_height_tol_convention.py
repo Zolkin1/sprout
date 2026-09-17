@@ -17,7 +17,6 @@ still a real band.
 
 from __future__ import annotations
 
-import pytest
 import torch
 
 from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region as gr

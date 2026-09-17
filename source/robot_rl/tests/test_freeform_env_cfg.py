@@ -105,6 +105,11 @@ _FREEFORM_COMMAND_TASKS: tuple[str, ...] = (
     # additionally switches the free-form APPROACH controller on, which no other task does --
     # `test_freeform_approach_defaults_off.py` is what pins that.
     "G1-teacher-clf-terrain-depth-finetune-walls",
+    # The PPO arm of the algorithm ladder. It COMPOSES `G1FinetuneFreeformEnvCfg` rather than
+    # turning the switch on itself, which is the point: it is the same MDP with a residual
+    # policy bolted on, so it inherits this exactly as it inherits the terminations.
+    # `test_adjuster_freeform_cfg.py` pins the whole match.
+    "G1-adjuster-ft-freeform",
 )
 
 

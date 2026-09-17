@@ -21,7 +21,7 @@ Also checks the zero-residual identity in place: with the action forced to zero 
 plan must be BIT-identical, since ``project_window_rotations`` is a Gram-Schmidt round trip
 that is not the identity in float32.
 
-Run with the same artifact flags as ``train.py``; see README section 4d.
+Run with the same artifact flags as ``train.py``; see README section 4e.
 """
 
 import argparse

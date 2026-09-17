@@ -223,6 +223,28 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 setattr(env_cfg, field, value)
                 print(f"[INFO] {field}='{value}' (--{flag}).")
 
+        # ONE discount, two config objects, and this is the only place both are in hand.
+        #
+        # The progress reward's arrival bonus is paid as `(1 - progress_gamma) * gate_worst * C`
+        # so that PPO's bootstrapped return lines up with the `(1-gamma)`-weighted average the
+        # off-policy arms' critic fits. If the two numbers split -- a hydra override on either
+        # side does it -- the bonus is mis-scaled by up to 20x, the run trains and logs
+        # normally, and nothing else looks wrong. Checked here rather than asserted in a
+        # docstring, which is what this was before.
+        _pg = getattr(env_cfg, "progress_gamma", None)
+        if _pg is not None:
+            _ag = float(getattr(getattr(agent_cfg, "algorithm", None), "gamma", _pg))
+            if abs(float(_pg) - _ag) > 1e-12:
+                raise ValueError(
+                    f"env_cfg.progress_gamma ({_pg}) != agent_cfg.algorithm.gamma ({_ag}). "
+                    "The arrival bonus is scaled by 1 - progress_gamma precisely so the return "
+                    "matches the one the off-policy arms are graded on; a split makes that "
+                    "scaling wrong by (1-a)/(1-b) and nothing downstream reports it. Set both "
+                    "or neither."
+                )
+            print(f"[INFO] progress reward: gamma {_pg}, arrival bonus scaled by "
+                  f"{1.0 - float(_pg):g}.")
+
         agent_cfg.max_iterations = (
             args_cli.max_iterations if args_cli.max_iterations is not None else agent_cfg.max_iterations
         )

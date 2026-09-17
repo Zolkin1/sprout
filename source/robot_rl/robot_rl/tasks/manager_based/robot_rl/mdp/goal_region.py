@@ -142,9 +142,14 @@ class GoalRegionSpec:
 
     Serialised to ``goal_regions.json`` and hashed into the run manifest, so every stage of a
     collection/eval campaign resolves the identical definition rather than each re-deriving
-    one.  The ANCHOR is not stored: it is the placed clip's own terminal base pose, recovered
-    exactly at any step from ``_reset_world_pos`` / ``_reset_world_yaw``, so storing it would
-    duplicate the clip library.
+    one.  The anchor POSE is not stored -- it is recovered exactly at any step from
+    ``_reset_world_pos`` / ``_reset_world_yaw``, so storing it would duplicate the clip library
+    -- but WHICH STEP it is taken at now is, under ``provenance["goal_anchor"]``, because that
+    changed: it was ``last_usable_step`` and is now :func:`goal_anchor_step`, up to a full 1.02 s
+    look-ahead reserve further along the clip (~2.6 m at the top commanded speed).  The
+    tolerances are fitted AGAINST that anchor, and ``MIN_MARGIN_M`` dropped 1.0 -> 0.0 as its
+    companion, so a spec and an anchor from opposite sides of that change are wrong together.
+    :meth:`load` says so rather than letting it pass.
 
     Attributes:
         default: Tolerances used for any family without an override.
@@ -246,9 +251,36 @@ class GoalRegionSpec:
 
     @classmethod
     def load(cls, path: str) -> "GoalRegionSpec":
-        """Read a spec written by :meth:`save`."""
+        """Read a spec written by :meth:`save`, warning if it predates the anchor move.
+
+        A WARNING and not a refusal, deliberately. The specs that lack the key are real and
+        still in use -- ``logs/rollouts/v1`` and ``v2``, which
+        ``scripts/rsl_rl/run_advantage_pipeline.sh`` defaults to -- and refusing would break
+        those pipelines with no path forward short of a refit. What it must not do is pass
+        silently: the tolerances were fitted against a goal up to 2.6 m short of where the
+        anchor now sits, so the symptom is a uniform, unexplained ``reached_goal`` collapse
+        across EVERY arm of a run, which reads as a broken policy rather than a stale file.
+
+        Specs marked ``declared`` are exempt: a manifest-only course states its band outright
+        and never had a clip to fit against, so the anchor cannot reach it.
+
+        Args:
+            path: The ``goal_regions.json`` to read.
+
+        Returns:
+            The spec.
+        """
         with open(path) as f:
-            return cls.from_dict(json.load(f))
+            raw = json.load(f)
+        prov = raw.get("provenance") or {}
+        if not prov.get("declared") and not prov.get("goal_anchor"):
+            print(f"[WARN] {path} records no `goal_anchor`, so it was FITTED before the "
+                  f"anchor moved from `last_usable_step` to the clip's tail-window maximum "
+                  f"(up to ~2.6 m further along). Its margins were fitted against the old "
+                  f"goal and MIN_MARGIN_M has since dropped 1.0 -> 0.0. Refit with "
+                  f"`scripts/rsl_rl/build_goal_regions.py`, or expect `reached_goal` to read "
+                  f"low on every arm at once.")
+        return cls.from_dict(raw)
 
 
 def clip_family_codes(cmd) -> tuple[torch.Tensor | None, list[str]]:

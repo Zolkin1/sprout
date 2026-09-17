@@ -764,6 +764,79 @@ and the post-loop `command_manager.compute` early-returns on `_last_step_seen`. 
 of every task here -- the guard is what makes the second call idempotent -- so "one re-plan
 per env per agent step" holds while WHICH call performs it varies with whether anything reset.
 
+### 4f. The PPO arm of the fine-tune ladder: `G1-adjuster-ft-freeform`
+
+`awr`, `fbc`, `arrived` and `bc` are four ways of REWEIGHTING the generator's own samples, so
+all four are bounded by its sampling support. This is the on-policy arm: PPO on the full
+continuous action space -- a per-node residual on the generator's 62x44 reference window, 2728
+dimensions, generator and tracker both frozen.
+
+**It is the same MDP as 4d, by construction**: `G1AdjusterFreeformEnvCfg` COMPOSES
+`G1FinetuneFreeformEnvCfg` rather than restating it, so the terrain, the section spawn, the
+steered free-form command, the five terminations and the teacher's whole DR chain are inherited
+objects, not copies. `test_adjuster_freeform_cfg.py` diffs the two constructed cfgs term by
+term. What differs:
+
+- **the reward is computed LIVE** instead of offline, and is the same function:
+  `motion_gen.progress_reward` holds the five constants and the gate, and both
+  `inspect_terrain_reward.py --progress` and `mdp.progress_{terrain,velocity,success}` import
+  them. `test_progress_reward_parity.py` pins the arithmetic, including the XYZW yaw projection.
+- **the arrival bonus is scaled by `1 - gamma`.** The offline reducer builds the
+  `(1-gamma)`-weighted average, and rsl-rl bootstraps `gamma * V(s)` at the arrival truncation
+  where `V` is defined through itself -- so a bonus at face value would recur 20x. Paying
+  `(1-gamma) * gate_worst * C` removes that. It does NOT make the returns identical: the offline
+  progress branch averages three trailing rewards in its tail (`bootstrapped_window_return`'s
+  default, which `fit_value.py` does not override) where this bootstrap continues at one, which
+  leaves a bias on arrivals and time-outs. Left as-is because all four off-policy arms were
+  fitted under it. `progress_gamma` on the env cfg and `gamma` on the agent cfg are one number,
+  and `train.py` refuses a run where they differ.
+- **the three generator-side collect corruptions are OFF** -- `fm_perturb_fraction`,
+  `fm_upper_camera_noise_fraction`, `fm_speed_mismatch_fraction`. That is the ONE deliberate
+  departure: they perturb the generator rather than the world, and the first exists to
+  manufacture the behavioural spread AWR reweights, which PPO's own Gaussian does. The
+  teacher's world DR and the tracker's observation corruption are untouched. None of the three
+  affects scoring -- they are collect-only overrides and `run_quick_eval.sh` applies none.
+
+```bash
+python scripts/rsl_rl/train.py --task=G1-adjuster-ft-freeform \
+    --clip clips/ft_boxes_train.h5 --clip_device cpu \
+    --goal_regions logs/ft_boxes/goal_regions.json \
+    --fm_checkpoint logs/flow_matching/2026-09-13_10-08-38/best.pt \
+    --tracker_run logs/rsl_rl/g1/2026-09-11_11-45-14_paper_v6g_v1 \
+    --tracker_checkpoint model_19999.pt \
+    --num_envs 2048 --headless \
+    env.commands.traj_ref.freeform_speed_min=0.4 \
+    env.commands.traj_ref.freeform_speed_max=2.5
+```
+
+Things worth knowing before reading a run:
+
+- **The generator must be the LADDER's parent**, `2026-09-13_10-08-38`. It is a `prefix`-
+  attention, `reference`-history, 8-layer, two-camera checkpoint, which is what the borrowed
+  encoder needs; and it is what all four off-policy arms were fine-tuned from, which is what
+  makes the comparison one about algorithms. `history_from="measured"` is not an option here --
+  `assert_history_source_matches` refuses the pair at load.
+- **The speed band is REFUSED if it is not the library's.** `AdjusterEnv` reads
+  `read_commanded_speed_range` off the clip library and raises unless the cfg matches -- the
+  boxes library declares 0.4-2.5 and the cfg default is 0.6-2.6, so without this the PPO arm
+  would train on a different speed distribution than every arm it is compared against. Hence
+  the two overrides above; the error message names them.
+- **Run `zero_residual=True` first.** It forces the applied residual to exactly zero while
+  leaving every code path identical, so its collect-time success must land on the bare parent's.
+  That is the cheapest end-to-end check that the re-targeted env, reward and terminations
+  describe the intended MDP.
+- **Watch `Diagnostics/residual_mean_energy_frac`.** At full width the measured failure is that
+  it does not move: one scalar advantage against 2728 dims was ~3 samples per dimension per
+  iteration at 1024 envs x 8 steps, and over 840 iterations the residual stayed ~96-97%
+  exploration variance. At 2048 x 24 it is ~18, and the grouped std keeps 5 + 62 = 67 learned
+  std numbers rather than 2728. If it is still under 0.05 after ~150 iterations past warm-up,
+  `num_knots = 13` on both the env and actor cfgs is the documented fallback.
+- **Scoring is not wired yet.** `run_quick_eval.sh` takes an FM checkpoint and a trained
+  adjuster is not one. The hook is one call in `record_rollouts.py`, masked by
+  `cmd.fm_reinfer_mask`, using `rl.adjuster_policy.residual_from_action` -- but it also needs a
+  way to rebuild the actor from a checkpoint, which `WindowAdjusterModel` does not have, and
+  there is no trained arm to write it against. See that module's docstring.
+
 ### 5. Hardware
 
 Upload an exported run to HuggingFace; the obelisk controller pulls from there.

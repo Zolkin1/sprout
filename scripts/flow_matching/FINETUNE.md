@@ -7,7 +7,7 @@ own behaviour, without a simulator in the training loop: collect rollouts, grade
 value function, weight or filter the chunks, and update the generator. `run_finetune_loop.sh`
 runs the whole thing and is resumable per stage.
 
-This is NOT the teacher PPO fine-tune that `README.md` §4c documents; nothing here calls
+This is NOT the teacher PPO fine-tune that `README.md` §4d documents; nothing here calls
 `train.py`.
 
 ## THE ARTIFACTS, and the one that has been mistaken for the other
