@@ -72,6 +72,36 @@ class AdjusterEnvCfg(ManagerBasedRLEnvCfg):
     steer_wz_max: float = 0.68
     """Symmetric clip on the steering yaw rate (rad/s). Matches the eval's default."""
 
+    num_knots: int = 13
+    """``K``: how many knots the action carries along the plan's node axis.
+
+    The action is ``K * D`` wide and the served residual is ``knot_basis(F, K) @ u``, so the
+    tracker still gets a full ``F * D`` window. At ``F = 62`` this is 572 dimensions rather
+    than 2728, and the interpolation makes the residual smooth along the horizon by
+    construction instead of by a penalty.
+
+    **Why the action shrank.** Measured over 840 iterations of the full-width run: the
+    residual stayed ~96-97% exploration noise and ~3% learned mean, because one scalar
+    advantage per decision against 2728 dimensions gives ~3 samples per dimension per
+    iteration. The mean could not move and the per-dimension stds could not either.
+
+    13 is not a guess -- see :mod:`robot_rl.flow_matching.knot_basis` for the least-squares
+    fit of the correction the generator actually needs, which a 13-knot Catmull-Rom basis
+    captures at R^2 0.99 on base position, orientation and joints.
+
+    It must MATCH the actor's ``num_knots``; a mismatch is caught by the action-width check
+    in :meth:`AdjusterEnv._residual_from_action` rather than being applied silently.
+    """
+
+    knot_kind: str = "catmull"
+    """Interpolation for the knot lift, one of ``knot_basis.KNOT_KINDS``.
+
+    Cubic beats linear in every channel group of the offline fit (ALL R^2 0.9338 vs 0.9288)
+    and gives smooth joint targets. Its weights carry negative lobes, so it overshoots by up
+    to 25% (worst row L1 1.2499) -- harmless here because ``tanh`` is applied AFTER the
+    interpolation, so the per-channel cap still binds exactly.
+    """
+
     zero_residual: bool = False
     tracker_run_dir: str = ""
     tracker_checkpoint: str = "model_19999.pt"

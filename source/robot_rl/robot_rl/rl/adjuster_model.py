@@ -66,6 +66,12 @@ from tensordict import TensorDict
 import copy
 
 from robot_rl.flow_matching import online
+from robot_rl.rl.knot_distribution import GroupedKnotGaussian, channel_groups
+from robot_rl.flow_matching.knot_basis import (
+    DEFAULT_NUM_KNOTS,
+    knot_basis,
+    knot_sample_matrix,
+)
 
 
 class _PerTokenHead(nn.Module):
@@ -134,6 +140,9 @@ class WindowAdjusterModel(MLPModel):
         plan_obs_group: str = "fm_plan",
         cond_obs_group: str = "fm_cond",
         num_frozen_layers: int = 6,
+        num_knots: int = DEFAULT_NUM_KNOTS,
+        knot_kind: str = "catmull",
+        group_init_std: dict | None = None,
     ) -> None:
         """Build the adjuster.
 
@@ -157,6 +166,18 @@ class WindowAdjusterModel(MLPModel):
             cond_obs_group: Group carrying the generator's conditioning, as it was USED.
             num_frozen_layers: Borrowed layers to keep frozen. The remainder become trainable
                 copies warm-started from the generator's weights.
+            num_knots: ``K``, the action's knot count along the node axis. The action is
+                ``K * D`` wide and the served residual is ``knot_basis(F, K) @ u``. 13 is
+                measured -- see :mod:`robot_rl.flow_matching.knot_basis` for the fit that
+                chose it and for why more knots buy mostly unmodellable velocity noise.
+            knot_kind: Interpolation, one of
+                :data:`~robot_rl.flow_matching.knot_basis.KNOT_KINDS`.
+            group_init_std: Per channel-group initial exploration width, keyed as the
+                window's own sub-blocks (``base_pos``, ``base_ori``, ``base_lin_vel``,
+                ``base_ang_vel``, ``joint_pos``). When given, the std becomes
+                :class:`~robot_rl.rl.knot_distribution.GroupedKnotGaussian` -- 18 learned
+                numbers instead of ``K * D`` -- replacing whatever ``distribution_cfg``
+                built. ``None`` keeps the stock per-dimension Gaussian.
 
         Raises:
             ValueError: If the generator is not a ``prefix`` checkpoint, if ``output_dim`` does
@@ -182,14 +203,23 @@ class WindowAdjusterModel(MLPModel):
                 "a statistic of whichever rollout filled the buffer first."
             )
 
-        self.num_nodes = int(ctx.F)
+        # TWO counts, and conflating them is the trap this split exists to avoid.
+        # `plan_nodes` is F, the generator's window length: it sizes the `fm_plan`
+        # OBSERVATION and the interpolation's output. `num_nodes` is K, the KNOT count: it
+        # sizes the ACTION, the query stream and the head -- and it is the name `ChunkPPO`
+        # reads to factor the importance ratio, so it must be the action's axis and not the
+        # plan's, or the ratio would slice 13 knots into 62 groups and every shape would
+        # still check out.
+        self.plan_nodes = int(ctx.F)
         self.node_dim = int(ctx.D)
+        self.num_nodes = int(num_knots)
         if int(output_dim) != self.num_nodes * self.node_dim:
             raise ValueError(
-                f"output_dim {int(output_dim)} != F * D = {self.num_nodes} * {self.node_dim} "
-                f"= {self.num_nodes * self.node_dim}. The action IS the per-node residual, so "
+                f"output_dim {int(output_dim)} != K * D = {self.num_nodes} * {self.node_dim} "
+                f"= {self.num_nodes * self.node_dim}. The action is the residual's KNOTS, so "
                 "the env's action term must declare exactly that width."
             )
+        self._knot_kind = str(knot_kind)
 
         self._plan_group = str(plan_obs_group)
         self._cond_group = str(cond_obs_group)
@@ -210,7 +240,44 @@ class WindowAdjusterModel(MLPModel):
         # variant touches the trunk), so nothing the parent did to `self.mlp` is lost.
         self.mlp = _PerTokenHead(self.num_nodes, self._d_model, self.node_dim)
 
-        # Query-token embedding: each node's [flow velocity | predicted node] pair.
+        # The FACTORED std replaces the parent's per-dimension one, and is safe to swap for
+        # the same reason the head is: `MLPModel.__init__` used the distribution only for
+        # `input_dim` (unchanged -- both are `output_dim` wide) and for `init_mlp_weights`,
+        # a no-op on every Gaussian here. Doing it in the config instead would mean handing
+        # `distribution_cfg` the joint count and the block layout, which are properties of
+        # the LOADED generator and not knowable when the config is written.
+        if group_init_std is not None:
+            idx, names = channel_groups(int(ctx.nj), int(ctx.target_num_extra_frames),
+                                        tuple(ctx.reference_blocks))
+            if len(idx) != self.node_dim:
+                raise ValueError(
+                    f"the generator's layout gives {len(idx)} channels per node but D = "
+                    f"{self.node_dim}. The channel grouping and the action would describe "
+                    "different windows."
+                )
+            self.distribution = GroupedKnotGaussian(
+                int(output_dim), self.num_nodes, idx, names,
+                init_std=dict(group_init_std), std_type="log",
+            )
+
+        # Registered AFTER the parent ran: `register_buffer` needs `Module.__init__`, and
+        # these were originally set beside `plan_nodes` above, which raised
+        # "cannot assign buffer before Module.__init__() call".
+        #
+        # `knot_lift` is the env's business -- it is what turns the action into the served
+        # window -- and is carried here anyway so a checkpoint records the basis it was
+        # trained under rather than inheriting whatever the config says at load time.
+        self.register_buffer(
+            "knot_lift",
+            torch.as_tensor(knot_basis(self.plan_nodes, self.num_nodes, self._knot_kind),
+                            dtype=torch.float32), persistent=True)
+        self.register_buffer(
+            "knot_sample",
+            torch.as_tensor(knot_sample_matrix(self.plan_nodes, self.num_nodes),
+                            dtype=torch.float32), persistent=True)
+
+        # Query-token embedding: each KNOT's [flow velocity | predicted node] pair,
+        # interpolated to the knot position by `knot_sample`.
         self.token_in = nn.Linear(2 * self.node_dim, self._d_model)
         # Learned rather than borrowed from the generator's sinusoidal timeline: node 0 is one
         # control step out and node F-1 is over a second, so what a slot MEANS here is a
@@ -243,7 +310,8 @@ class WindowAdjusterModel(MLPModel):
         for p in self.tuned_layers.parameters():
             p.requires_grad_(True)
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        print(f"[INFO] WindowAdjusterModel: F={self.num_nodes} D={self.node_dim} "
+        print(f"[INFO] WindowAdjusterModel: F={self.plan_nodes} K={self.num_nodes} "
+              f"D={self.node_dim} "
               f"d_model={self._d_model}, {self.num_frozen_layers} borrowed layers frozen + "
               f"{len(self.tuned_layers)} trainable copies, {trainable} trainable parameters "
               "(the generator is borrowed, not owned)")
@@ -251,6 +319,29 @@ class WindowAdjusterModel(MLPModel):
     # ------------------------------------------------------------------
     # Group resolution
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    def lr_capped_groups(self) -> list[tuple[list, float]]:
+        """Parameter sets that must not take the shared learning rate at full size.
+
+        The trunk copies are WARM-STARTED from the generator, so they begin at a good
+        solution and a large step is pure damage; the head and the input projection begin at
+        zero and have to travel. One shared rate cannot serve both, and the adaptive
+        controller drives it from the KL, which is dominated by the head.
+
+        Returned as caps rather than scales because the controller's rate moves over three
+        orders of magnitude (1e-2 down to a hardcoded 1e-5 floor): a multiplier would shrink
+        with it and stop protecting anything, while ``min(lr, cap)`` binds only when the
+        rate is high.
+
+        Returns:
+            ``[(params, lr_max)]``; parameters absent from every entry take the shared rate.
+        """
+        return [
+            (list(self.tuned_layers.parameters()), 1e-4),
+            (list(self.mlp.parameters()) + list(self.token_in.parameters())
+             + [self.node_pos, self.query_type], 3e-4),
+        ]
+
     def _get_obs_dim(self, obs, obs_groups, obs_set) -> tuple[list[str], int]:
         """Resolve and check the two groups; see :meth:`MLPModel._get_obs_dim`.
 
@@ -280,12 +371,14 @@ class WindowAdjusterModel(MLPModel):
                 )
         fm_ctx = online.active_fm_context()
 
-        want_plan = 2 * self.num_nodes * self.node_dim
+        # F, not K: the observation is the generator's full window, whatever the action's
+        # knot count is.
+        want_plan = 2 * self.plan_nodes * self.node_dim
         have_plan = int(obs[self._plan_group].shape[-1])
         if have_plan != want_plan:
             raise ValueError(
                 f"group {self._plan_group!r} is {have_plan} wide but the generator's plan plus "
-                f"its flow field is 2 * F * D = 2 * {self.num_nodes} * {self.node_dim} = "
+                f"its flow field is 2 * F * D = 2 * {self.plan_nodes} * {self.node_dim} = "
                 f"{want_plan}."
             )
 
@@ -400,9 +493,15 @@ class WindowAdjusterModel(MLPModel):
         null_hist = cond[:, -1] > 0.5
 
         plan = obs[self._plan_group]
-        half = self.num_nodes * self.node_dim
-        window = plan[:, :half].reshape(-1, self.num_nodes, self.node_dim)
-        flow = plan[:, half:].reshape(-1, self.num_nodes, self.node_dim)
+        half = self.plan_nodes * self.node_dim
+        window = plan[:, :half].reshape(-1, self.plan_nodes, self.node_dim)
+        flow = plan[:, half:].reshape(-1, self.plan_nodes, self.node_dim)
+        # One query per KNOT, carrying the plan's own value interpolated AT that knot. The
+        # alternative -- 62 node queries read out at 13 positions -- costs 4.8x the trunk
+        # compute for the same 13 outputs, and the knots sit at fractional node positions
+        # (5.083 at F=62, K=13) so there is no token to read out anyway.
+        window = torch.einsum("kf,bfd->bkd", self.knot_sample, window)
+        flow = torch.einsum("kf,bfd->bkd", self.knot_sample, flow)
 
         # The conditioning prefix is entirely frozen, so it needs no graph. This is the one
         # expensive part of the forward and it is recomputed rather than cached because the

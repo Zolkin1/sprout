@@ -56,8 +56,10 @@ import json
 import torch
 from isaaclab.envs import ManagerBasedRLEnv
 
+from robot_rl.flow_matching.knot_basis import knot_basis
 from robot_rl.flow_matching.window import residual_scale_vector
 from robot_rl.rl.frozen_tracker import FrozenTracker
+from robot_rl.tasks.manager_based.robot_rl import mdp
 from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region, tracking_error
 from robot_rl.tasks.manager_based.robot_rl.mdp.terminations.terminations import (
     GoalReached,
@@ -170,6 +172,16 @@ class AdjusterEnv(ManagerBasedRLEnv):
                 "and the failure bounds disagree with no symptom."
             )
         # Per-channel residual authority, resolved once from the generator's own layout.
+        self._knot_action: torch.Tensor | None = None
+        self._knot_action_prev: torch.Tensor | None = None
+        self._residual_energy_sq: float = 0.0
+        self._residual_mean_frac: float = 0.0
+        # The knot -> node lift, built once. Same producer the actor's input sampler and the
+        # offline basis fit read, so the three cannot drift.
+        self._knot_lift = torch.as_tensor(
+            knot_basis(int(cmd.ctx.F), int(self.cfg.num_knots), str(self.cfg.knot_kind)),
+            dtype=torch.float32, device=self.device,
+        )
         self._residual_scale = torch.tensor(
             residual_scale_vector(cmd.ctx.nj, cmd.ctx.target_num_extra_frames,
                                   cmd.ctx.reference_blocks),
@@ -361,6 +373,52 @@ class AdjusterEnv(ManagerBasedRLEnv):
         # magnitudes. Multiplying by a step time would make them a function of the cadence.
         self.reward_buf = self.reward_manager.compute(dt=1.0)
 
+        # The action's MEAN/NOISE split, in KNOT space. This is the primary "is the policy
+        # learning anything" signal, and it is a derived quantity rather than something the
+        # logger can read directly: the mean and the sampled action are both available, but
+        # the MEAN alone is not, because the rollout stores only what was sampled.
+        #
+        # For an action i.i.d. across decisions, `E[(du)^2] = 2 Var`, so
+        # `Var = E[(du)^2] / 2` and the learned mean's share of the action's energy is
+        # `1 - Var / E[u^2]`.
+        #
+        # THE BIASES GO BOTH WAYS, and an earlier version of this comment had the first one
+        # backwards. Stated properly:
+        #
+        # * a time-VARYING mean adds `E[(dmu)^2]` to `E[(du)^2]`, which inflates the variance
+        #   estimate and therefore DEFLATES this number -- so it under-reports learning. This
+        #   is the dominant residual bias here and it makes the metric CONSERVATIVE: a rise is
+        #   trustworthy, a flat reading is the ambiguous case.
+        # * SATURATION inflates it. Once the width is large enough that `tanh` clips,
+        #   consecutive actions both sit near the same cap, so `E[(du)^2] << 2 Var`. Measured
+        #   at a shared width of 1.0 on a zero-initialised head: 0.36, with a mean of exactly
+        #   zero. Trust this only where the squash is near-linear.
+        # * ZEROING the previous action at an episode boundary inflates it, by exactly
+        #   `1 / (2 * episode_length)`. That is not done here -- the previous action carries
+        #   across resets on purpose, since both are draws from the same distribution -- but
+        #   the full-width runs computed this from `plan_residual_rate_l2`, whose previous
+        #   residual IS zeroed per episode, and at ~26 decisions per episode that is a
+        #   +0.019 offset. Their frozen-actor reading, where the mean is provably zero, was
+        #   0.0186. Subtract it before comparing any v6/v7 number against this one.
+        #
+        # An EXACT computation is possible and is not done here: the rollout buffer stores the
+        # distribution's mean at full width (`distribution_params`), so `E[mu^2] / E[u^2]`
+        # could be formed directly inside the algorithm's update with no i.i.d. assumption.
+        # The env has the sampled action and not the mean, which is the only reason this is an
+        # inference. `TODO(adjuster-mean-frac-exact)`.
+        #
+        # Reference points from the FULL-WIDTH runs, for reading the number: v6 ran 0.019 ->
+        # 0.036 over 840 iterations, i.e. the tracker was served ~96% exploration noise
+        # throughout. Section 7 of the v8 spec expects >~0.1 within ~100 iterations after
+        # warm-up if the knot geometry fixed the problem.
+        if self._knot_action is not None:
+            u, up = self._knot_action, self._knot_action_prev
+            sq = u.pow(2).mean()
+            dsq = (u - up).pow(2).mean()
+            var = (dsq * 0.5).clamp_max(sq)
+            self._residual_energy_sq = float(sq)
+            self._residual_mean_frac = float((sq - var) / sq.clamp_min(1e-12))
+
         if len(self.recorder_manager.active_terms) > 0:
             self.obs_buf = self.observation_manager.compute()
             self.recorder_manager.record_post_step()
@@ -393,6 +451,8 @@ class AdjusterEnv(ManagerBasedRLEnv):
         denom = self._violation_steps.clamp_min(1.0)
         for name, count in self._violation_counts.items():
             log[f"Diagnostics/violation_{name}"] = (count / denom).item()
+        log["Diagnostics/residual_energy_sigma2"] = self._residual_energy_sq
+        log["Diagnostics/residual_mean_energy_frac"] = self._residual_mean_frac
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
 
@@ -522,11 +582,24 @@ class AdjusterEnv(ManagerBasedRLEnv):
             ValueError: If the action width is not ``F * D``.
         """
         cmd = self.command_manager.get_term(self.cfg.command_name)
-        nodes, dim = int(cmd.ctx.F), int(cmd.ctx.D)
-        if action.shape[-1] != nodes * dim:
+        knots, dim = int(self.cfg.num_knots), int(cmd.ctx.D)
+        if action.shape[-1] != knots * dim:
             raise ValueError(
-                f"AdjusterEnv expects an action of width F * D = {nodes} * {dim} = "
-                f"{nodes * dim}, got {int(action.shape[-1])}."
+                f"AdjusterEnv expects an action of width K * D = {knots} * {dim} = "
+                f"{knots * dim}, got {int(action.shape[-1])}. K comes from "
+                "`cfg.num_knots` and the actor must have been built with the same value."
             )
-        shaped = action.to(self.device).view(-1, nodes, dim)
-        return torch.tanh(shaped) * self._residual_scale
+        shaped = action.to(self.device).view(-1, knots, dim)
+        # Kept for `Diagnostics/residual_mean_energy_frac`, computed in KNOT space rather
+        # than on the interpolated window: `B` mixes knots into every node, so an energy
+        # split taken after the lift is weighted by the basis's conditioning instead of
+        # being a statement about the action. Detached -- a diagnostic must not hold a graph.
+        prev = self._knot_action
+        self._knot_action = shaped.detach()
+        self._knot_action_prev = prev if prev is not None else torch.zeros_like(self._knot_action)
+        # KNOTS -> NODES first, then squash. The order is load-bearing: `tanh` after the
+        # lift is what keeps the per-channel cap exactly as it was at full width, because
+        # Catmull-Rom overshoots by up to 25% between knots and squashing the knots first
+        # would let the interpolated window exceed the cap it is supposed to respect.
+        lifted = torch.einsum("fk,bkd->bfd", self._knot_lift, shaped)
+        return torch.tanh(lifted) * self._residual_scale

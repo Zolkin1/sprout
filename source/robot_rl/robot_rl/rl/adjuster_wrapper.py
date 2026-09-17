@@ -51,7 +51,10 @@ class RslRlAdjusterVecEnvWrapper(RslRlVecEnvWrapper):
         super().__init__(env, clip_actions=clip_actions)
 
         cmd = unwrapped.command_manager.get_term(unwrapped.cfg.command_name)
-        self.num_actions = int(cmd.ctx.F) * int(cmd.ctx.D)
+        # K * D, not F * D: the action is the residual's KNOTS and the env lifts them to
+        # the full window. Read from the env cfg so this and the actor cannot disagree
+        # silently -- and if they do, the env's action-width check names it.
+        self.num_actions = int(env.unwrapped.cfg.num_knots) * int(cmd.ctx.D)
         # `max_episode_length` is deliberately NOT overridden. It has exactly one reader in
         # rsl-rl -- `OnPolicyRunner.learn`'s `init_at_random_ep_len`, which seeds
         # `episode_length_buf` from it -- and on this env that buffer counts CONTROL steps

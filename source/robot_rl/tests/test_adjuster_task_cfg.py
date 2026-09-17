@@ -96,45 +96,64 @@ def test_the_chunk_layout_matches_the_action_width() -> None:
     assert alg.chunk_steps is None and alg.chunk_dim is None
 
 
-def test_gamma_and_the_minibatch_count_are_inherited_on_purpose() -> None:
-    """Both are the teacher's values, and both carry a TODO rather than a justification.
+def test_gamma_matches_the_episode_and_the_minibatch_size_is_pinned() -> None:
+    """``gamma`` is now CHOSEN; ``num_mini_batches`` is still the teacher's.
 
-    This is a deliberately weak assertion, and saying so is the point: unlike ``entropy_coef``
-    and ``desired_kl`` above -- which MUST be rescaled or the run fails silently -- these two
-    are open questions, not settled decisions. Pinning a band around an untuned placeholder
-    would dress a guess up as a requirement.
+    A decision here is 0.24 s, so the teacher's 0.99 was a ~24 s horizon against a ~6.2 s
+    episode (~26 decisions) -- the critic was predicting a nearly undiscounted return and
+    ``TODO(adjuster-gamma)`` recorded that as an open item through runs v1-v7. 0.96 is ~6 s
+    and matches the episode.
 
-    What is worth recording is that ``gamma`` does NOT mean here what it means for the teacher:
-    it is a per-STEP discount and a step is 12 control steps long, so 0.99 is a much weaker
-    discount per unit time than the teacher's 0.99 and the return is close to undiscounted over
-    an episode. See ``TODO(adjuster-gamma)``.
+    It could only be applied together with the goal becoming a terminal REWARD: while
+    arrival was a bootstrapped truncation, ``gamma`` set the arrival value's scale
+    (fixed point ``r / (1 - gamma)``), so changing one without the other would have moved
+    the thing being rewarded rather than the horizon.
     """
-    adjuster, teacher = AdjusterPPORunnerCfg().algorithm, PPORunnerCfg().algorithm
-    assert adjuster.gamma == teacher.gamma
-    assert adjuster.num_mini_batches == teacher.num_mini_batches
-    # The consequence, stated so a future change to either value is made with it in view.
-    assert adjuster.gamma ** 100 > 0.3, (
-        "at ~100 decisions per episode this gamma leaves the return nearly undiscounted; that "
-        "is a known open item, not a claim that it is right"
+    cfg = AdjusterPPORunnerCfg()
+    adjuster, teacher = cfg.algorithm, PPORunnerCfg().algorithm
+    assert adjuster.gamma == 0.96, "the episode-matched horizon, not the teacher's 0.99"
+    assert adjuster.gamma != teacher.gamma, "no longer inherited; it is chosen here"
+    # `num_mini_batches` is no longer the teacher's either, and what is pinned is the
+    # MINIBATCH SIZE rather than the count. The cost that binds in `update()` is the
+    # recomputed conditioning prefix -- 8 layers x B x 128 tokens x 512 -- so B is what
+    # decides whether the run fits. 2048 is the size the full-width runs proved out; at 24
+    # steps/env and 4 minibatches it would be 6144 and the run OOMs at 91.7 GB of 93.
+    assert cfg.num_steps_per_env * 1024 // adjuster.num_mini_batches == 2048, (
+        "minibatch size must stay at the 2048 samples the prefix recompute is known to fit"
+    )
+    # ~26 decisions per episode: the far end of an episode must still be discounted enough
+    # to distinguish arriving early from arriving late.
+    assert 0.2 < adjuster.gamma ** 26 < 0.5, (
+        "gamma should discount the episode's far end appreciably but not erase it"
     )
 
 
 # ----------------------------------------------------------------------------------
 # The termination flags are the reward design
 # ----------------------------------------------------------------------------------
-def test_only_the_goal_bootstraps_its_value() -> None:
-    """The whole mechanism for rewarding arrival, since neither ending carries a bonus."""
-    term = G1AdjusterEnvCfg().terminations
-    assert term.goal_reached.time_out is True, (
-        "goal_reached must be a truncation: rsl-rl adds gamma*V(s) only to those, and that "
-        "asymmetry is what makes arriving worth more than running the clock out"
-    )
-    for name in ("clip_end", "time_out", "tracking_violation"):
+def test_nothing_bootstraps_and_arriving_is_paid_explicitly() -> None:
+    """Arrival is a TERMINAL REWARD now, not a value bootstrap.
+
+    It used to be a truncation, so rsl_rl added ``gamma * V(s_goal)``. But V at a
+    goal-adjacent state is defined only through itself -- fixed point ``r / (1 - gamma)``,
+    ~100 decisions of trackability at gamma 0.99 -- so the arrival value's SCALE was an
+    artefact of gamma and not a statement about the task. ``goal_bonus`` says it directly.
+
+    So every ending here is a true termination and nothing in this task is bootstrapped.
+    """
+    cfg = G1AdjusterEnvCfg()
+    term, rew = cfg.terminations, cfg.rewards
+    for name in ("goal_reached", "clip_end", "time_out", "tracking_violation"):
         assert getattr(term, name).time_out is False, (
-            f"{name} must terminate, not truncate -- flagged as a truncation it would collect "
-            "a positive value bootstrap and the return would stop distinguishing failing from "
-            "arriving"
+            f"{name} must terminate, not truncate: a truncation collects a value bootstrap, "
+            "and with arrival paid explicitly there is nothing left that should get one"
         )
+    assert rew.goal_bonus.weight > 0, "arriving must be paid"
+    assert rew.goal_bonus.params["term_keys"] == ["goal_reached"]
+    # It has to beat running the clock out, and not by so much that the dense signal
+    # shaping HOW the robot arrives stops mattering.
+    assert rew.goal_bonus.weight > abs(rew.ran_out_of_time.weight)
+    assert rew.goal_bonus.weight < abs(rew.failed.weight)
 
 
 def test_the_absolute_fall_termination_is_absent() -> None:

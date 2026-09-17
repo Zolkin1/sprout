@@ -263,8 +263,18 @@ class AuxPPO(PPO):
                         self.learning_rate = lr_tensor.item()
 
                     # Update the learning rate for all parameter groups
+                    # [robot_rl] `lr_max` is the ONE deviation from upstream's loop. The
+                    # adaptive controller sets a single rate from the measured KL, which is
+                    # dominated by the newly-initialised head; the trunk copies are
+                    # warm-started from the generator and a step that size damages them. A
+                    # cap binds only while the rate is high and disappears as the controller
+                    # winds down, which is the behaviour wanted -- see
+                    # `WindowAdjusterModel.lr_capped_groups`. Groups without `lr_max` take
+                    # the shared rate, so this is a no-op on every other task.
                     for param_group in self.optimizer.param_groups:
-                        param_group["lr"] = self.learning_rate
+                        cap = param_group.get("lr_max")
+                        param_group["lr"] = (self.learning_rate if cap is None
+                                             else min(self.learning_rate, float(cap)))
 
             # Surrogate loss
             # [robot_rl] via a hook. The default IS the upstream four lines.

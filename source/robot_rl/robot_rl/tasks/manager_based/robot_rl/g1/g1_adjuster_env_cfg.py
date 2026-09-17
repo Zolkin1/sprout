@@ -144,8 +144,24 @@ class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
     named it; without that check it would have surfaced as a ``load_state_dict`` shape error
     about ``mlp.0.weight``.
 
-    So ``policy`` and ``reference`` are inherited untouched -- the tracker is frozen and its
-    observation contract is fixed by its checkpoint.
+    So ``policy`` and ``reference`` are inherited untouched in WIDTH and term list -- the
+    tracker is frozen and its observation contract is fixed by its checkpoint -- but
+    ``reference``'s NOISE is switched off here, which changes no shape and is measured.
+
+    The teacher hardens its tracker against ``REFERENCE_WINDOW_NOISE`` (base position
+    +-0.06/0.06/0.03 m, joints +-0.1 rad, velocities +-0.25) because at deploy the generator
+    predicts the reference and its output is not clean. That is right for TRAINING THE
+    TRACKER. It is wrong here, because the adjuster's whole job is to write a correction into
+    the same channels, and it has to arrive through the tracker's encoder to change anything:
+    on v6 the learned correction reached ~0.006 m of base position after 840 iterations, an
+    order of magnitude UNDER the +-0.06 m of i.i.d. jitter being added to the very channel it
+    was writing into. The tracker is also already near-indifferent to i.i.d. reference jitter
+    -- the eval measured all DR on costing at most 2.7 points -- so this noise buys robustness
+    the tracker has and costs the adjuster its signal.
+
+    Note this corrupts only the tracker's VIEW; the reward grades the served plan, which the
+    residual changes directly. The two are different channels, and it is the view that decides
+    behaviour.
 
     ``fm_cond`` and ``fm_plan`` are the adjuster's, and they are observations rather than
     something the policy recomputes because PPO's rollout runs under ``inference_mode``:
@@ -154,6 +170,11 @@ class G1AdjusterObservationsCfg(G1TeacherTerrainDepthObservationsCfg):
     generator's own state, not a sensor, and the plan arrives in a DECLARED normalized space
     that an empirical normalizer would demote to a dataset statistic.
     """
+
+    def __post_init__(self) -> None:
+        """Silence the inherited reference-window noise; see the class docstring."""
+        super().__post_init__()
+        self.reference.reference_window.noise = None
 
     @configclass
     class FmCondCfg(ObsGroup):
@@ -289,7 +310,11 @@ class G1AdjusterTerminationCfg:
     goal_reached: DoneTerm = DoneTerm(
         func=mdp.GoalReached,
         params={"command_name": "traj_ref", "spec_path": ""},
-        time_out=True,
+        # NOT a truncation any more. With `time_out=True` rsl_rl bootstraps `gamma * V(s)`
+        # at arrival, and V there is a self-referential fixed point whose scale is set by
+        # gamma; `G1AdjusterRewardCfg.goal_bonus` states the arrival value directly instead.
+        # Every ending on this task is now a true termination, so nothing is bootstrapped.
+        time_out=False,
     )
     tracking_violation: DoneTerm = DoneTerm(
         func=mdp.TrackingViolation,
@@ -329,11 +354,47 @@ class G1AdjusterRewardCfg:
     #
     # These scale as sigma^2, so they are coupled to `init_std`: raising it 0.15 -> 0.30
     # multiplies them by ~3.3 and would re-create the cancellation. Move the two together.
+    # MEASURED again on v6, and the weight came down a second time. `residual_l2` charges
+    # `E[r^2] = mean^2 + var`, and over 840 iterations the sampled residual stayed ~96%
+    # VARIANCE (see `residual_rate_l2` below for how that is read off) -- so all but a few
+    # percent of this penalty is a tax on the policy's own exploration noise, which supplies
+    # no gradient toward a better mean and, with `entropy_coef = 0`, is the only pressure
+    # left on sigma. It grew from -0.043 to -0.071 while trackability fell 0.460 -> 0.416 and
+    # `goal_reached` moved +0.036, i.e. the run spent its reward budget on the tax rather
+    # than the task. The residual is already bounded HARD in `apply_plan_residual`, so this
+    # is a soft anchor on top of a real cap and does not need to be large.
     residual_l2: RewTerm = RewTerm(
-        func=mdp.plan_residual_l2, weight=-0.5, params={"command_name": "traj_ref"}
+        func=mdp.plan_residual_l2, weight=-0.15, params={"command_name": "traj_ref"}
     )
+    # OFF, and it is a measured duplicate rather than a judgement call. For a residual that
+    # is i.i.d. across re-plans, `E[(dr)^2] = 2 Var`, so at the old weights (-0.5 level,
+    # -0.25 rate) the two logged rewards are EQUAL -- and over the whole of v6 the ratio sat
+    # at 0.964-0.981, never leaving that regime. It was therefore charging the same
+    # exploration noise `residual_l2` already charges, for half the penalty budget and
+    # essentially no independent gradient. It only starts to say something different once
+    # the learned mean becomes temporally structured, which is the regime it was written for
+    # and which no run has reached.
+    #
+    # Kept at weight 0 rather than deleted: at 0 the TERM still runs, so
+    # `Episode_Reward/residual_rate_l2` keeps reporting 0 and the ratio above is no longer
+    # recoverable from it -- which is why `Diagnostics/residual_*` in `AdjusterEnv.step`
+    # now computes the mean/variance split directly. Re-enable by giving it a weight.
     residual_rate_l2: RewTerm = RewTerm(
-        func=mdp.plan_residual_rate_l2, weight=-0.25, params={"command_name": "traj_ref"}
+        func=mdp.plan_residual_rate_l2, weight=0.0, params={"command_name": "traj_ref"}
+    )
+    # EXPLICIT, replacing the bootstrap. `goal_reached` used to be a truncation, so rsl_rl
+    # added `gamma * V(s_goal)` -- but V at a goal-adjacent state is defined only through
+    # ITSELF, with fixed point `r / (1 - gamma)`, so the arrival value was ~100 decisions of
+    # trackability at gamma 0.99 and its scale was an artefact of gamma rather than a
+    # statement about the task. A terminal reward says what arriving is worth.
+    #
+    # Sized from the measured per-decision trackability (~0.45-0.50): 8.0 is ~16-18 decisions
+    # of it, so arriving beats dawdling to the deadline (which at gamma 0.96 accumulates
+    # ~0.45 * (1 - 0.96^20) / 0.04 ~= 6.1 and then takes the timeout penalty with no
+    # bootstrap) without swamping the dense signal that shapes HOW it arrives.
+    goal_bonus: RewTerm = RewTerm(
+        func=mdp.episode_ended_by, weight=8.0,
+        params={"term_keys": ["goal_reached"]},
     )
     failed: RewTerm = RewTerm(
         func=mdp.episode_ended_by, weight=-10.0,

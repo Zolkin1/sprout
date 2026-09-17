@@ -272,6 +272,28 @@ class AdjusterModelCfg(RslRlMLPModelCfg):
     #: Borrowed layers kept frozen; the rest become trainable copies warm-started from the
     #: generator. 6 of 8 leaves ~6.4M trainable against a 26.8M borrowed trunk.
     num_frozen_layers: int = 6
+    #: ``K``, the action's knot count. MUST equal the env cfg's ``num_knots`` -- the two are
+    #: separate config objects, and the cross-check is the action-width assertion in
+    #: ``AdjusterEnv._residual_from_action``, which names the mismatch rather than letting a
+    #: 13-knot actor drive a 21-knot lift.
+    num_knots: int = 13
+    #: Interpolation for the knot lift; must likewise match the env cfg's ``knot_kind``.
+    knot_kind: str = "catmull"
+    #: Per channel-group initial exploration width, which turns the std into 18 factored
+    #: numbers (``log sigma[g,j] = log s[g] + log h[j]``) instead of one per action dim.
+    #:
+    #: DIFFERENT PER GROUP on purpose, and the sizes come from the offline correction fit:
+    #: the correction the generator needs is 0.19-0.52 of each channel's cap depending on
+    #: the group, so a single width was over-exploring some and under-exploring others.
+    #: Base position and orientation get the smallest, because those are the channels the
+    #: tracking-violation bound is measured on (0.2 m lateral / height, 30 deg tilt) and
+    #: noise there converts directly into failures -- the frozen-actor dose response showed
+    #: goal-reached falling 0.32 -> 0.22 -> 0.17 as a single shared width went 1e-4 -> 0.15
+    #: -> 0.5.
+    #:
+    #: These are a STARTING POINT to be replaced by the dose response, not a fitted result.
+    #: Set to ``None`` to fall back to the stock per-dimension Gaussian.
+    group_init_std: dict | None = None
 
 
 @configclass
@@ -321,7 +343,13 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
 
     """
 
-    num_steps_per_env = 8
+    # 24, the rsl_rl default, up from 8. ~1 episode per env per iteration (~26 decisions),
+    # so ~24k decisions per iteration at 1024 envs instead of 8k. Together with the knot
+    # action this is the samples-per-dimension fix: at full width and 8 steps it was ~3
+    # samples per action dimension per iteration, which is why neither the mean nor the
+    # per-dimension stds could move; at 572 dims and 24 steps it is ~42, a 14x improvement.
+    # Rollout storage grows to ~2 GB, which fits.
+    num_steps_per_env = 24
     max_iterations = 2000
     # ~35-42 s/iteration at 1024 envs, so this is ~30-45 min of crash exposure -- the same
     # trade PPORunnerCfg.save_interval documents, at a much longer iteration.
@@ -360,6 +388,17 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
         # the residual -- which is what the cap table is for.
         distribution_cfg=RslRlMLPModelCfg.GaussianDistributionCfg(init_std=0.15, std_type="log"),
         obs_normalization=False,
+        num_knots=13,
+        knot_kind="catmull",
+        # `distribution_cfg`'s init_std above is what the stock per-dimension Gaussian would
+        # use and is kept only so the fallback stays valid; THIS is what the model builds.
+        group_init_std={
+            "base_pos": 0.05,
+            "base_ori": 0.05,
+            "base_lin_vel": 0.10,
+            "base_ang_vel": 0.10,
+            "joint_pos": 0.15,
+        },
     )
     critic = RslRlMLPModelCfg(
         hidden_dims=[1024, 512, 256, 128],
@@ -406,7 +445,28 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
         # `Policy/mean_noise_std`. TODO(adjuster-entropy-coef): if sigma collapses, ~2e-5
         # puts entropy at roughly 5-10% of the surrogate's gradient instead of 56%.
         "entropy_coef": 0.0,
-        # num_mini_batches and gamma stay at the teacher's values -- see the TODOs above.
+        # 0.96, finally applied. A step here is 0.24 s, so 0.99 is a ~24 s horizon against a
+        # ~6.2 s episode (~26 decisions) -- the critic was effectively predicting a
+        # near-constant return. 0.96 is ~6 s, matching the episode. This was the original
+        # design intent and had been inherited from the teacher, unexamined, since v1;
+        # `TODO(adjuster-gamma)` above is now closed.
+        #
+        # It composes with the goal becoming a TERMINAL REWARD rather than a bootstrapped
+        # truncation: with nothing bootstrapped, gamma no longer sets the arrival value's
+        # scale, so the two changes had to land together.
+        "gamma": 0.96,
+        # 12, not 4, and this is a MEMORY requirement rather than a tuning choice. The
+        # binding cost in `update()` is the recomputed conditioning prefix, which scales with
+        # MINIBATCH SIZE: 8 layers x B x 128 prefix tokens x 512 floats. Tripling
+        # `num_steps_per_env` to 24 tripled B at 4 minibatches and the run OOM'd at 91.7 GB
+        # of a 93 GB card, having allocated ~26 GB for that cache alone. 12 restores the
+        # 2048-sample minibatch the full-width runs proved out (~8.6 GB), while keeping the
+        # 3x larger rollout the samples-per-dimension fix needs.
+        #
+        # It is NOT a FLOP change and not a different optimisation: `num_learning_epochs *
+        # (num_steps_per_env * num_envs / num_mini_batches) * num_mini_batches` is invariant,
+        # so the same samples are seen the same number of times in smaller groups.
+        "num_mini_batches": 12,
         # 30, not the 100 this started at. The critic is a third of its old width, with
         # `window_residual` (the majority of it) gone and input normalization on, so it has
         # far less to fit and better-conditioned inputs to fit it from. What warm-up buys is

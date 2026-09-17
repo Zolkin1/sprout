@@ -122,6 +122,51 @@ class ChunkPPO(AuxPPO):
         #: Diagnostics from the most recent minibatch, merged into ``update``'s loss dict.
         self.chunk_diagnostics: dict[str, float] = {}
 
+        self._install_lr_caps()
+
+    # ------------------------------------------------------------------
+    def _install_lr_caps(self) -> None:
+        """Re-group the optimizer so the borrowed trunk copies take a smaller step.
+
+        rsl_rl builds ONE Adam over ``chain(actor, critic)``, and ``AuxPPO`` records why an
+        ``lr = 0`` group was rejected there: re-grouping makes the checkpoint's
+        ``optimizer_state_dict`` unloadable, so ``--resume`` breaks. That cost does not apply
+        to this model -- its action width is ``K * D``, so no full-width checkpoint is
+        resumable across the change regardless -- and it is stated here so the trade is
+        visible rather than rediscovered.
+
+        A no-op unless the actor declares caps, so this class stays usable elsewhere.
+        Momentum and every other Adam option are carried over from the group the optimizer
+        was built with, so only the grouping changes.
+        """
+        declare = getattr(self.actor, "lr_capped_groups", None)
+        if declare is None:
+            return
+        capped = declare()
+        seen: set[int] = set()
+        groups: list[dict] = []
+        base = self.optimizer.param_groups[0]
+        carry = {k: v for k, v in base.items() if k not in ("params", "lr")}
+        for params, cap in capped:
+            live = [q for q in params if q.requires_grad and id(q) not in seen]
+            if not live:
+                continue
+            seen.update(id(q) for q in live)
+            groups.append({"params": live, "lr": min(self.learning_rate, float(cap)),
+                           "lr_max": float(cap), **carry})
+        rest = [q for g in self.optimizer.param_groups for q in g["params"]
+                if id(q) not in seen]
+        if rest:
+            groups.append({"params": rest, "lr": self.learning_rate, **carry})
+        n_capped = sum(len(g["params"]) for g in groups if "lr_max" in g)
+        if n_capped == 0:
+            return
+        self.optimizer = type(self.optimizer)(groups, lr=self.learning_rate)
+        print(f"[INFO] ChunkPPO: {len(groups)} optimizer groups, "
+              + ", ".join(f"{len(g['params'])} params cap {g['lr_max']:.0e}"
+                          for g in groups if "lr_max" in g)
+              + f", {len(rest)} params uncapped")
+
     # ------------------------------------------------------------------
     def _split(self, flat: torch.Tensor) -> torch.Tensor:
         """Reshape a flat ``(B, T*D)`` tensor to ``(B, T, D)``.
@@ -168,7 +213,12 @@ class ChunkPPO(AuxPPO):
         per_dim = kl_divergence(Normal(self._split(old_mean), self._split(old_std)),
                                 Normal(self._split(new_mean), self._split(new_std)))
         per_step = per_dim.sum(dim=-1)                      # (B, T)
-        self.chunk_diagnostics["kl_per_step"] = per_step.mean().item()
+        # Per KNOT, and the axis change matters for the LR controller: this is a MEAN over
+        # factors, so folding 62 nodes into 13 knots multiplies it ~4.8x for the same total
+        # chunk KL. `desired_kl` is unchanged at 0.01, so watch this against
+        # `Loss/learning_rate` -- the full-width run sat at 0.018 here and spent most of its
+        # life on rsl_rl's hardcoded 1e-5 LR floor.
+        self.chunk_diagnostics["kl_per_knot"] = per_step.mean().item()
         self.chunk_diagnostics["kl_chunk_total"] = per_step.sum(dim=-1).mean().item()
         return per_step.mean()
 
@@ -221,9 +271,9 @@ class ChunkPPO(AuxPPO):
                 # Where along the chunk it happens: early nodes execute before the next
                 # re-plan, late ones mostly do not, so they need not behave alike.
                 per_node = clipped.float().mean(dim=0)
-                self.chunk_diagnostics["clip_fraction_first_node"] = per_node[0].item()
-                self.chunk_diagnostics["clip_fraction_last_node"] = per_node[-1].item()
-            self.chunk_diagnostics["log_ratio_std_per_step"] = log_ratio.std().item()
+                self.chunk_diagnostics["clip_fraction_first_knot"] = per_node[0].item()
+                self.chunk_diagnostics["clip_fraction_last_knot"] = per_node[-1].item()
+            self.chunk_diagnostics["log_ratio_std_per_knot"] = log_ratio.std().item()
             # The statistic this class exists to avoid, kept for comparison.
             self.chunk_diagnostics["log_ratio_std_joint"] = log_ratio.sum(dim=-1).std().item()
         return loss
@@ -261,5 +311,15 @@ class ChunkPPO(AuxPPO):
             per-step and joint log-ratio spreads, and the per-step and whole-chunk KL.
         """
         out = super().update()
+        # The factored exploration width, one scalar per learned parameter. 18 numbers, so
+        # logging all of them is cheap and it is the only way to see the shape the policy
+        # chose: the full-width runs' `Mean action std` was a mean over 2728 dims and hid a
+        # spread of 0.0025 across them entirely.
+        dist = getattr(self.actor, "distribution", None)
+        if dist is not None and hasattr(dist, "group_std"):
+            for name, v in zip(dist.group_names, dist.group_std.tolist()):
+                out[f"std_group_{name}"] = float(v)
+            for j, v in enumerate(dist.knot_std.tolist()):
+                out[f"std_knot_{j:02d}"] = float(v)
         out.update(self.chunk_diagnostics)
         return out

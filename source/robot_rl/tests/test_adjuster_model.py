@@ -54,7 +54,11 @@ N_ENVS = 5
 # set `encode_prefix` swaps the whole history for a learned embedding.
 COND_DIM = N * D + SENSORS * SENSOR_DIM + len(range(0, F, CMD_STRIDE)) * CMD_DIM + 1
 PLAN_DIM = 2 * F * D
-ACTION_DIM = F * D
+#: The action is the residual's KNOTS, not its nodes: `K * D`, lifted to `F * D` by the
+#: env. `F` still sizes the OBSERVATION, and keeping the two apart is the thing these
+#: tests now pin -- conflating them is what `plan_nodes` vs `num_nodes` exists to prevent.
+K = 5
+ACTION_DIM = K * D
 
 
 def _context(attention_mode: str = "prefix") -> online.FmOnlineContext:
@@ -113,7 +117,7 @@ def _model(obs: TensorDict, **kwargs) -> WindowAdjusterModel:
         distribution_cfg={"class_name": "GaussianDistribution", "init_std": 0.5,
                           "std_type": "log"},
         num_frozen_layers=LAYERS - 1,
-        **kwargs,
+        **{"num_knots": K, **kwargs},
     )
 
 
@@ -126,8 +130,13 @@ def test_the_initial_residual_is_exactly_zero(published) -> None:
     assert float(out.detach().abs().max()) == 0.0, "the head must be zero-initialised"
 
 
-def test_the_head_is_shared_across_nodes(published) -> None:
-    """Permuting the input nodes permutes the output blocks identically.
+def test_the_head_is_shared_across_knots(published) -> None:
+    """Permuting the input KNOT tokens permutes the output blocks identically.
+
+    The query stream is K knots, not F nodes, so this is over K -- the head is one shared
+    ``Linear(d_model -> D)`` applied per token, which is what makes output slot ``(j, c)``
+    structurally correspond to knot ``j`` instead of a correspondence the policy gradient
+    would have to discover.
 
     Checked after perturbing the head off zero, since at exactly zero every permutation is
     trivially equal and the test would pass on a flat trunk too.
@@ -142,10 +151,10 @@ def test_the_head_is_shared_across_nodes(published) -> None:
         # in would test the embedding rather than the head.
         model.node_pos.zero_()
 
-    latent = model.get_latent(obs).view(N_ENVS, F, -1)
-    perm = torch.randperm(F, generator=torch.Generator().manual_seed(3))
-    direct = model.mlp(latent.reshape(N_ENVS, -1)).view(N_ENVS, F, D)
-    permuted = model.mlp(latent[:, perm].reshape(N_ENVS, -1)).view(N_ENVS, F, D)
+    latent = model.get_latent(obs).view(N_ENVS, K, -1)
+    perm = torch.randperm(K, generator=torch.Generator().manual_seed(3))
+    direct = model.mlp(latent.reshape(N_ENVS, -1)).view(N_ENVS, K, D)
+    permuted = model.mlp(latent[:, perm].reshape(N_ENVS, -1)).view(N_ENVS, K, D)
     torch.testing.assert_close(permuted, direct[:, perm])
 
 
@@ -265,8 +274,9 @@ def test_a_full_attention_generator_is_refused() -> None:
 def test_the_action_width_must_match_the_generators_layout(published) -> None:
     """The action IS the per-node residual, so a mismatch is a wrong-width residual."""
     obs = _obs()
-    with pytest.raises(ValueError, match=r"output_dim .* != F \* D"):
-        WindowAdjusterModel(obs, {"actor": ["fm_cond", "fm_plan"]}, "actor", ACTION_DIM + 1)
+    with pytest.raises(ValueError, match=r"output_dim .* != K \* D"):
+        WindowAdjusterModel(obs, {"actor": ["fm_cond", "fm_plan"]}, "actor",
+                            ACTION_DIM + 1, num_knots=K)
 
 
 def test_a_group_of_the_wrong_width_names_the_generators_own_layout(published) -> None:
