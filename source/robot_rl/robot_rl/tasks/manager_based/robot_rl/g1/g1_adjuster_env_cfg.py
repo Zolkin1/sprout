@@ -120,7 +120,10 @@ STAND_SETTLE_S: float = 0.3
 the command is still zero, so the robot is standing before it is asked to move.
 """
 
-GOAL_SLACK_S: float = 3.0
+#: Seconds of grace past the clip's last usable step. NOT restated here: the goal anchor sits
+#: in the clip's final 1.5 s, past that step, so the slack is what makes the region reachable
+#: at all -- one decision, one constant, shared with the eval harness's added `clip_end`.
+GOAL_SLACK_S: float = mdp.GOAL_DEADLINE_SLACK_S
 
 #: Episode budget in seconds. The longest clip's last usable step is 948 control steps; plus
 #: the slack that is 1098, so 24.0 s (1200 steps) leaves ``time_out`` a genuine backstop rather

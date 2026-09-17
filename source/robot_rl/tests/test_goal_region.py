@@ -21,11 +21,16 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from robot_rl.tasks.manager_based.robot_rl.mdp.goal_region import (  # noqa: E402
+    GOAL_ANCHOR_STRIDE,
+    GOAL_ANCHOR_WINDOW_S,
+    GOAL_DEADLINE_SLACK_S,
     GoalRegionSpec,
     GoalTolerances,
+    goal_anchor_step,
     goal_distance_m,
     goal_frame_offsets,
     in_goal,
+    last_usable_step,
 )
 
 TOL = GoalTolerances(approach_margin_m=1.0, half_width_m=2.5, height_tol_m=0.5)
@@ -266,3 +271,119 @@ def test_the_bootstrap_spec_survives_the_json_round_trip(tmp_path):
     path = str(tmp_path / "boot.json")
     GoalRegionSpec.bootstrap().save(path)
     assert GoalRegionSpec.load(path).provenance["bootstrap"] is True
+
+# ----------------------------------------------------------------------------------------
+# The ANCHOR: where the clip ends UP, not where its usable window stops.
+# ----------------------------------------------------------------------------------------
+
+class _FakeManager:
+    """Minimal clip manager: a per-clip xyz trajectory and a length."""
+
+    def __init__(self, traj, clip_len, dt=0.02):
+        self.traj = traj                        # [C, T, 3]
+        self.clip_len = clip_len                # [C]
+        self.dt = dt
+        self.gather_calls = 0
+
+    def gather_desired(self, clip_id, step):
+        self.gather_calls += 1
+        return self.traj[clip_id, step], None
+
+
+class _FakeCmd:
+    """Just enough of MotionSequenceCommand for goal_anchor_step."""
+
+    def __init__(self, traj, clip_len, clip_id, frame_yaw=0.0):
+        self.manager = _FakeManager(traj, clip_len)
+        self.clip_id = clip_id
+        n = clip_id.shape[0]
+        self._reset_world_pos = torch.zeros(n, 3, dtype=torch.float64)
+        self._reset_world_yaw = torch.zeros(n, dtype=torch.float64)
+        self._mask_frame_yaw = torch.full((n,), float(frame_yaw), dtype=torch.float64)
+        self._world_z = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64)
+        self._offsets = torch.arange(0, 51, 50, dtype=torch.long)
+
+    def obs_window_offsets(self):
+        return self._offsets
+
+    def reference_world_state_at(self, clip_id, step, world_pos, world_quat):
+        pos, _ = self.manager.gather_desired(clip_id, step)
+        return torch.cat([pos + world_pos, torch.zeros(pos.shape[0], 10,
+                                                       dtype=pos.dtype)], dim=-1)
+
+
+def _ramp_clip(t_len, tail=None):
+    """A clip walking +x at 1 cm/step, optionally with a different tail."""
+    xyz = torch.zeros(1, t_len, 3, dtype=torch.float64)
+    xyz[0, :, 0] = torch.arange(t_len, dtype=torch.float64) * 0.01
+    if tail is not None:
+        xyz[0, -len(tail):, 0] = torch.tensor(tail, dtype=torch.float64)
+    return xyz
+
+
+def test_the_anchor_is_the_clips_LAST_frame_not_its_last_usable_step():
+    """The whole point: ``last_usable_step`` reserves 1.02 s, and on the box families the
+    mount happens inside that reserve -- measured, the anchor there sat 0.276 m above spawn
+    against 0.496 m at the clip's real end, and on 45% of ``jump_on`` clips the mount had
+    not happened at all.
+    """
+    T = 400
+    cmd = _FakeCmd(_ramp_clip(T), torch.tensor([T]), torch.tensor([0]))
+    assert int(goal_anchor_step(cmd)[0]) == T - 1
+    assert int(last_usable_step(cmd)[0]) == T - 1 - 50
+    assert int(goal_anchor_step(cmd)[0]) > int(last_usable_step(cmd)[0])
+
+
+def test_the_anchor_takes_the_MAX_over_the_window_not_the_final_frame():
+    """A clip whose tail retreats must anchor on its furthest reach, not where it stops."""
+    T = 400
+    # Walk to 3.99 m then back off 40 cm over the last 20 frames.
+    tail = [3.99 - 0.02 * i for i in range(20)]
+    cmd = _FakeCmd(_ramp_clip(T, tail=tail), torch.tensor([T]), torch.tensor([0]))
+    step = int(goal_anchor_step(cmd)[0])
+    assert step < T - 1, "anchored on the retreating final frame"
+    assert step >= T - 1 - int(round(GOAL_ANCHOR_WINDOW_S / 0.02))
+
+
+def test_the_anchor_window_reaches_no_further_back_than_declared():
+    """A clip that is furthest at its very START must still anchor inside the tail window."""
+    T = 400
+    xyz = torch.zeros(1, T, 3, dtype=torch.float64)
+    xyz[0, 0, 0] = 100.0                       # a huge value far outside the window
+    cmd = _FakeCmd(xyz, torch.tensor([T]), torch.tensor([0]))
+    step = int(goal_anchor_step(cmd)[0])
+    assert step >= T - 1 - int(round(GOAL_ANCHOR_WINDOW_S / 0.02)) - GOAL_ANCHOR_STRIDE
+
+
+def test_the_anchor_is_cached_and_only_recomputed_when_the_clip_changes():
+    """It is read every control step by the termination, the critic obs and the accumulator,
+    so a windowed search per call would cost ~26 library gathers per step per consumer.
+    """
+    T = 400
+    cmd = _FakeCmd(_ramp_clip(T), torch.tensor([T]), torch.tensor([0]))
+    goal_anchor_step(cmd)
+    after_first = cmd.manager.gather_calls
+    assert after_first > 1, "the window was not actually searched"
+    for _ in range(5):
+        goal_anchor_step(cmd)
+    assert cmd.manager.gather_calls == after_first, "cache missed on an unchanged clip"
+    cmd.clip_id = torch.tensor([0])            # same VALUE, new tensor -> still a hit
+    goal_anchor_step(cmd)
+    assert cmd.manager.gather_calls == after_first
+    cmd.manager.traj = torch.cat([cmd.manager.traj, _ramp_clip(T)], dim=0)
+    cmd.manager.clip_len = torch.tensor([T, T])
+    cmd.clip_id = torch.tensor([1])            # a different clip -> must recompute
+    goal_anchor_step(cmd)
+    assert cmd.manager.gather_calls > after_first
+
+
+def test_the_deadline_slack_can_actually_reach_the_anchor():
+    """The anchor is past ``last_usable_step``, so the slack is a PRECONDITION, not comfort.
+
+    Both the adjuster task and the eval harness read ``GOAL_DEADLINE_SLACK_S``; if it were
+    ever 0 the region would sit past the deadline and every arm would score zero.
+    """
+    reserve_s = 51 * 0.02                      # max_offset + 1, the reserve to be recovered
+    assert GOAL_DEADLINE_SLACK_S > reserve_s, (
+        f"slack {GOAL_DEADLINE_SLACK_S} s cannot even reach the clip's last frame "
+        f"({reserve_s} s of reserve)")

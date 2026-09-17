@@ -62,17 +62,44 @@ import sampler  # noqa: E402
 #: then buys margin back, so the region is generous without being hostage to one episode.
 DEFAULT_QUANTILE: float = 0.99
 
-#: Additive slack on each fitted tolerance, metres.  Deliberately generous: the asymmetry of
+#: Additive slack on the LATERAL tolerance, metres.  Deliberately generous: the asymmetry of
 #: this parameter is severe.  Too WIDE costs a little discrimination at the margin; too TIGHT
 #: penalises every arm for something no policy here can do, and looks exactly like a policy
 #: result.  When in doubt, widen.
 DEFAULT_PAD_M: float = 0.5
 
+#: Additive slack on the DOWNRANGE margin, metres.  Small on purpose.  The margin's whole job
+#: is to absorb how far short the tracker stops, and that is measured at 0.115-0.235 m -- so a
+#: 0.5 m pad on top made the boundary a metre back from the anchor, which on the box families
+#: is BEFORE the box.  0.1 m keeps the boundary at "where the clip got to, plus what the
+#: tracker demonstrably undershoots by".
+DEFAULT_MARGIN_PAD_M: float = 0.1
+
+#: Additive slack on the HEIGHT band, metres.  This is the one that was wrong, and by a lot.
+#: The fitted quantity -- the clip arm's terminal height error -- is 0.016-0.129 m across the
+#: five families, so :data:`DEFAULT_PAD_M` was **4 to 30x the thing it was padding** and
+#: produced bands of 0.52-0.63 m.  The terrain those bands have to discriminate is 0.25-0.75 m
+#: tall (``jump_on`` boxes; 47% of them shorter than 0.528 m), so the band could not tell "on
+#: the box" from "on the ground beside it" at all -- which is exactly the failure the height
+#: check exists to catch, and it was open on 77% of ``jump_on`` clips.
+#:
+#: A height band is a LEVEL test against decimetre terrain features, not a drift bound in
+#: metres, so it gets its own pad.  0.1 m leaves every family at 2-8x its own fitted p99 while
+#: staying under the shortest box in the library.
+DEFAULT_HEIGHT_PAD_M: float = 0.1
+
 #: Floors, so a family whose clip arm happens to be very tight cannot produce a region so
 #: small that ordinary variation misses it.
-MIN_MARGIN_M: float = 1.0
+#:
+#: ``MIN_MARGIN_M`` is 0.0 because the anchor moved: it is now the clip's own furthest
+#: downrange reach (:func:`mdp.goal_anchor_step`) rather than a point 1.02 s before the clip
+#: ends, so "no additional margin beyond the tracker's undershoot" is the definition, and a
+#: 1.0 m floor would put the boundary back before the box.  ``MIN_HEIGHT_TOL_M`` must stay
+#: under the shortest walkable box in the library (0.250 m) or a ground-level robot passes the
+#: band by construction.
+MIN_MARGIN_M: float = 0.0
 MIN_HALF_WIDTH_M: float = 1.5
-MIN_HEIGHT_TOL_M: float = 0.35
+MIN_HEIGHT_TOL_M: float = 0.12
 
 
 #: The only columns the fit reads.  Named so the loader can ask for them rather than pulling
@@ -158,15 +185,24 @@ def _load_clip_cells(run_dir: str) -> list[tuple[str, dict, dict]]:
 
 
 def _fit_family(down: np.ndarray, lat: np.ndarray, hz: np.ndarray,
-                quantile: float, pad: float) -> dict:
-    """Tolerances containing ``quantile`` of one family's surviving endpoints, plus ``pad``.
+                quantile: float, pad: float,
+                margin_pad: float = DEFAULT_MARGIN_PAD_M,
+                height_pad: float = DEFAULT_HEIGHT_PAD_M) -> dict:
+    """Tolerances containing ``quantile`` of one family's surviving endpoints, plus a pad.
+
+    Each axis gets its OWN pad, because they are not the same kind of quantity: lateral is a
+    drift bound in metres, the margin absorbs a measured undershoot of centimetres, and the
+    height band is a LEVEL test against decimetre terrain.  One shared 0.5 m pad is what
+    broke the height band -- see :data:`DEFAULT_HEIGHT_PAD_M`.
 
     Args:
         down: ``[k]`` terminal downrange offsets, metres (negative = short of the clip's end).
         lat: ``[k]`` terminal lateral offsets.
         hz: ``[k]`` terminal height errors.
         quantile: See :data:`DEFAULT_QUANTILE`.
-        pad: See :data:`DEFAULT_PAD_M`.
+        pad: Lateral pad; see :data:`DEFAULT_PAD_M`.
+        margin_pad: See :data:`DEFAULT_MARGIN_PAD_M`.
+        height_pad: See :data:`DEFAULT_HEIGHT_PAD_M`.
 
     Returns:
         A dict of the three tolerances plus the raw fitted quantiles, for the report.
@@ -176,9 +212,9 @@ def _fit_family(down: np.ndarray, lat: np.ndarray, hz: np.ndarray,
     wide = np.quantile(np.abs(lat), quantile)
     high = np.quantile(np.abs(hz), quantile)
     return {
-        "approach_margin_m": float(max(short + pad, MIN_MARGIN_M)),
+        "approach_margin_m": float(max(short + margin_pad, MIN_MARGIN_M)),
         "half_width_m": float(max(wide + pad, MIN_HALF_WIDTH_M)),
-        "height_tol_m": float(max(high + pad, MIN_HEIGHT_TOL_M)),
+        "height_tol_m": float(max(high + height_pad, MIN_HEIGHT_TOL_M)),
         "fitted_q_short_m": float(short),
         "fitted_q_lateral_m": float(wide),
         "fitted_q_height_m": float(high),
@@ -205,7 +241,12 @@ def main() -> int:
                         "a null-history embedding fitted on flat. Fitting tolerances from any "
                         "of them would size the region to a task that is not one.")
     p.add_argument("--quantile", type=float, default=DEFAULT_QUANTILE)
-    p.add_argument("--pad_m", type=float, default=DEFAULT_PAD_M)
+    p.add_argument("--pad_m", type=float, default=DEFAULT_PAD_M,
+                   help="lateral pad (m)")
+    p.add_argument("--margin_pad_m", type=float, default=DEFAULT_MARGIN_PAD_M,
+                   help="downrange pad (m); small by design, see DEFAULT_MARGIN_PAD_M")
+    p.add_argument("--height_pad_m", type=float, default=DEFAULT_HEIGHT_PAD_M,
+                   help="height pad (m); must keep the band under the shortest box")
     args = p.parse_args()
 
     goal_region = _load_goal_region()
@@ -265,10 +306,11 @@ def main() -> int:
             "admin-censored at the ceiling); give the clip arm enough steps to finish.")
     all_pts = np.concatenate([np.concatenate(v) for v in fams.values()], axis=0)
     default = _fit_family(all_pts[:, 0], all_pts[:, 1], all_pts[:, 2],
-                          args.quantile, args.pad_m)
+                          args.quantile, args.pad_m, args.margin_pad_m, args.height_pad_m)
     for name, chunks in sorted(fams.items()):
         pts = np.concatenate(chunks, axis=0)
-        fit = _fit_family(pts[:, 0], pts[:, 1], pts[:, 2], args.quantile, args.pad_m)
+        fit = _fit_family(pts[:, 0], pts[:, 1], pts[:, 2], args.quantile, args.pad_m,
+                          args.margin_pad_m, args.height_pad_m)
         by_family[name] = {k: fit[k] for k in
                            ("approach_margin_m", "half_width_m", "height_tol_m")}
         rows.append((name, fit))
@@ -283,6 +325,9 @@ def main() -> int:
             "arm": "clip",
             "quantile": float(args.quantile),
             "pad_m": float(args.pad_m),
+            "margin_pad_m": float(args.margin_pad_m),
+            "height_pad_m": float(args.height_pad_m),
+            "goal_anchor": "tail_window_max_downrange",
             "n_surviving_episodes": int(total),
             "per_family": {n: f for n, f in rows},
         },
@@ -290,7 +335,7 @@ def main() -> int:
     spec.save(args.out)
 
     print(f"\n{'family':<18} {'n':>6}  {'margin':>8} {'half-w':>8} {'height':>8}   "
-          f"(q{args.quantile:g} + {args.pad_m:g} m pad)")
+          f"(q + per-axis pad)")
     print("-" * 72)
     for name, fit in rows:
         print(f"{name:<18} {fit['n_survivors']:>6}  {fit['approach_margin_m']:>8.2f} "

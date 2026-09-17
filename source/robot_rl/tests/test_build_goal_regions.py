@@ -36,6 +36,12 @@ def _load():
 bgr = _load()
 
 
+#: Shortest walkable box in ``g1_mb_v5_body_mode11_decor`` -- measured over all 53 walkable
+#: overlays of the two box families (``jump_on`` 0.250-0.750, ``jump_off_front`` 0.250-0.750).
+#: The height band has to sit UNDER this or it cannot tell the box top from the ground.
+SHORTEST_WALKABLE_BOX_M: float = 0.250
+
+
 def test_the_margin_reads_the_SHORT_tail_not_the_spread():
     """A clip arm that consistently overshoots must not get a huge approach margin.
 
@@ -48,14 +54,16 @@ def test_the_margin_reads_the_SHORT_tail_not_the_spread():
     zeros = np.zeros(200)
     fit = bgr._fit_family(overshooting, zeros, zeros, 0.99, 0.5)
     assert fit["fitted_q_short_m"] == pytest.approx(0.0)
-    assert fit["approach_margin_m"] == pytest.approx(bgr.MIN_MARGIN_M)
+    # The margin's pad is its OWN, small, one -- the 0.5 m lateral pad must not reach it.
+    assert fit["approach_margin_m"] == pytest.approx(bgr.DEFAULT_MARGIN_PAD_M)
 
 
 def test_the_margin_contains_a_clip_arm_that_stops_short():
     short_by = np.full(200, -2.0)              # every episode ends 2 m short
     zeros = np.zeros(200)
     fit = bgr._fit_family(short_by, zeros, zeros, 0.99, 0.5)
-    assert fit["approach_margin_m"] == pytest.approx(2.5)      # 2.0 + 0.5 pad
+    # 2.0 short + the MARGIN pad, not the lateral one.
+    assert fit["approach_margin_m"] == pytest.approx(2.0 + bgr.DEFAULT_MARGIN_PAD_M)
 
 
 def test_one_outlier_does_not_set_a_familys_band():
@@ -78,7 +86,7 @@ def test_floors_stop_a_tight_clip_arm_producing_an_unreachably_small_region():
     end up with the tightest region and read as the hardest.
     """
     tiny = np.zeros(500)
-    fit = bgr._fit_family(tiny, tiny, tiny, 0.99, 0.0)
+    fit = bgr._fit_family(tiny, tiny, tiny, 0.99, 0.0, 0.0, 0.0)
     assert fit["approach_margin_m"] == pytest.approx(bgr.MIN_MARGIN_M)
     assert fit["half_width_m"] == pytest.approx(bgr.MIN_HALF_WIDTH_M)
     assert fit["height_tol_m"] == pytest.approx(bgr.MIN_HEIGHT_TOL_M)
@@ -186,3 +194,37 @@ def test_a_table_without_clip_end_is_refused(tmp_path):
     cells = bgr._load_clip_cells(str(tmp_path))
     terms = list(cells[0][2]["termination_terms"])
     assert "clip_end" not in terms   # the condition the fitter raises on
+
+def test_the_height_band_stays_under_the_shortest_walkable_box():
+    """The height band must be able to tell "on the box" from "on the ground beside it".
+
+    This is the defect the per-axis pads exist to fix.  One shared 0.5 m pad on a fitted
+    terminal height error of 0.016-0.129 m produced bands of 0.52-0.63 m, against ``jump_on``
+    boxes that are 0.250-0.750 m tall -- so on 77% of those clips a robot at spawn level
+    satisfied the height test, and combined with the old 1.0 m margin 62.5% of them scored
+    ``goal_reached`` without ever leaving the ground.
+    """
+    # The worst real case: stairs_down's fitted q0.99, the largest of the five families.
+    worst_fitted_q = 0.1292
+    hz = np.full(500, worst_fitted_q)
+    fit = bgr._fit_family(np.zeros(500), np.zeros(500), hz, 0.99, 0.5)
+    assert fit["height_tol_m"] < SHORTEST_WALKABLE_BOX_M, (
+        f"height band {fit['height_tol_m']:.3f} m does not discriminate a "
+        f"{SHORTEST_WALKABLE_BOX_M} m box")
+    # ...and still generous against what the tracker actually does.
+    assert fit["height_tol_m"] > worst_fitted_q
+
+
+def test_the_height_floor_also_stays_under_the_shortest_box():
+    """A family with a perfect clip arm gets the floor, and the floor must discriminate too."""
+    assert bgr.MIN_HEIGHT_TOL_M < SHORTEST_WALKABLE_BOX_M
+
+
+def test_the_margin_floor_does_not_reach_back_before_the_terrain():
+    """``MIN_MARGIN_M`` must be 0: the anchor is now the clip's own furthest reach.
+
+    With the anchor at ``goal_anchor_step`` -- the tail window's max downrange, ON the box --
+    a 1.0 m floor would put the half-plane boundary a metre back, which is where the old
+    region admitted a robot standing on the ground in front of the box.
+    """
+    assert bgr.MIN_MARGIN_M == 0.0

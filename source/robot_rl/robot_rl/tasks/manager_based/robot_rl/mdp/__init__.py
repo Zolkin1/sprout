@@ -61,6 +61,8 @@ from .goal_region import (  # noqa: F401
     GoalRegionSpec,
     GoalTolerances,
     clip_family_codes,
+    GOAL_DEADLINE_SLACK_S,
+    goal_anchor_step,
     goal_anchor_world,
     goal_distance_m,
     goal_frame_offsets,

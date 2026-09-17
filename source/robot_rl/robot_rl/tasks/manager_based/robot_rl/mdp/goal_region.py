@@ -64,6 +64,35 @@ KNOWN_FAMILIES: tuple[str, ...] = (
     "distractor", "stairs_dn_pure", "stairs_up_pure",
 )
 
+#: Seconds of the clip's TAIL the downrange anchor is maximised over, ending at its LAST
+#: frame -- see :func:`goal_anchor_step`.
+GOAL_ANCHOR_WINDOW_S: float = 1.5
+
+#: Stride, in control steps, at which that window is sampled.  3 steps is 60 ms of a 1.5 s
+#: window (26 samples); the anchor moves by at most one sample of clip travel, ~5 cm at
+#: 2.6 m/s, which is far inside the fitted downrange margin.  Sampling exists because the
+#: search runs per reset and each sample is a library gather.
+GOAL_ANCHOR_STRIDE: int = 3
+
+#: Seconds the episode is allowed to run PAST the clip's last usable step, so the anchor
+#: :func:`goal_anchor_step` returns is actually REACHABLE.
+#:
+#: ``last_usable_step`` is ``clip_len - 1 - max_offset``, i.e. 1.02 s before the clip's real
+#: end, and the anchor now sits in that final window -- so with no slack the goal would be
+#: past the deadline and no arm could ever score (measured: the clip arm itself scored
+#: **0.001**).  Both the adjuster task and the eval harness's ``clip_end`` term read THIS
+#: constant, because a goal definition and the deadline that makes it reachable are one
+#: decision and were previously two.
+#:
+#: **1.5 s, not 3.0, and the difference is measured.**  Past the clip's end the cursor clamps
+#: and the command HOLDS the last commanded velocity, so slack is time the robot spends
+#: walking with no reference left -- and on a finite tile it walks off.  At 3.0 s the clip
+#: arm's fall rate went 0.121 -> 0.352 and the refitted margins blew back out to metre scale
+#: (``jump_off_front`` 2.04 m), undoing the very thing the new anchor buys.  1.5 s covers the
+#: 1.02 s reserve plus the tracker's own lag with margin to spare: even at the library's top
+#: commanded speed of 2.6 m/s it is 3.9 m of travel against a 2.65 m reserve.
+GOAL_DEADLINE_SLACK_S: float = 1.5
+
 
 @dataclass(frozen=True)
 class GoalTolerances:
@@ -79,9 +108,9 @@ class GoalTolerances:
             reached the right (x, y) while standing on the floor beside or below the terrain.
     """
 
-    approach_margin_m: float = 1.0
+    approach_margin_m: float = 0.25
     half_width_m: float = 2.5
-    height_tol_m: float = 0.5
+    height_tol_m: float = 0.15
 
 
 @dataclass
@@ -272,8 +301,104 @@ def last_usable_step(cmd) -> torch.Tensor:
     return step.clamp_min(0).long()
 
 
+def _anchor_step_for(cmd, ids: torch.Tensor) -> torch.Tensor:
+    """The max-downrange step in the tail window, for the envs in ``ids``.
+
+    Args:
+        cmd: A :class:`MotionSequenceCommand` (or subclass).
+        ids: ``[K]`` env indices to solve for.
+
+    Returns:
+        ``[K]`` long clip-step indices, on ``cmd.clip_id``'s device.
+    """
+    from isaaclab.utils.math import quat_from_angle_axis
+
+    dev = cmd.clip_id.device
+    clip_len = cmd.manager.clip_len
+    clip_id = cmd.clip_id[ids]
+    end = (clip_len[clip_id.to(clip_len.device)].to(dev) - 1).clamp_min(0).long()
+
+    dt = float(getattr(cmd.manager, "dt", 0.02))
+    n_back = max(int(round(float(GOAL_ANCHOR_WINDOW_S) / dt)), 0)
+    back = torch.arange(0, n_back + 1, int(GOAL_ANCHOR_STRIDE), device=dev, dtype=torch.long)
+    steps = (end.unsqueeze(-1) - back.unsqueeze(0)).clamp_min(0)          # [K, S]
+
+    yaw = cmd._reset_world_yaw[ids]
+    world_quat = quat_from_angle_axis(yaw, cmd._world_z.expand(yaw.shape[0], 3))
+    world_pos = cmd._reset_world_pos[ids]
+    fy = cmd._mask_frame_yaw[ids].to(dev)
+    cos_y, sin_y = torch.cos(fy), torch.sin(fy)
+
+    best = torch.full((ids.shape[0],), -float("inf"), device=dev, dtype=torch.float32)
+    best_step = steps[:, 0].clone()
+    for j in range(steps.shape[1]):
+        pos = cmd.reference_world_state_at(
+            clip_id, steps[:, j], world_pos, world_quat)[:, 0:3].to(dev)
+        # Only the PROJECTION onto the downrange axis is compared, so the goal position it
+        # would be measured against cancels and no anchor is needed to find the anchor.
+        down = cos_y * pos[:, 0] + sin_y * pos[:, 1]
+        take = down > best
+        best = torch.where(take, down, best)
+        best_step = torch.where(take, steps[:, j], best_step)
+    return best_step
+
+
+def goal_anchor_step(cmd) -> torch.Tensor:
+    """The clip step the goal is anchored on: FURTHEST DOWNRANGE in the clip's tail window.
+
+    Not ``last_usable_step``, and the difference is a measured defect rather than a
+    refinement.  ``last_usable_step`` reserves one observation window (1.02 s at
+    ``max_offset = 50``), and on the ``jump_on`` family the box mount happens inside that
+    reserve: over 120 clips the anchor there sat a median 0.276 m above the spawn against
+    0.496 m at the clip's real end, and on **45%** of clips it was below half the clip's own
+    maximum rise -- i.e. the mount had not happened yet, so the goal was a point in mid-air
+    before the box.  Combined with the old 1.0 m approach margin, **62.5%** of ``jump_on``
+    clips let a robot standing on the ground a metre short of the box sit fully inside the
+    region and score ``goal_reached`` without ever jumping.
+
+    Anchoring on the tail window instead puts the goal where the clip ENDS UP -- on the box
+    it climbed onto -- which is what makes both the downrange half-plane and the height band
+    discriminate.  The MAXIMUM over the window rather than its last frame is what keeps that
+    true for a clip whose tail drifts backwards; on ``jump_on`` the tail is monotonically
+    forward (measured max-minus-final gap 0.000 m), so it costs nothing there and is a
+    guard for the families nobody has looked at.
+
+    **This step is past ``last_usable_step``, so the deadline must be extended to reach it**
+    -- see :data:`GOAL_DEADLINE_SLACK_S`, which both consumers read.
+
+    Cached per env and recomputed only when ``clip_id`` changes, because the answer is a pure
+    function of the clip: the window search costs one library gather per sample and this is
+    called every control step by the termination, the critic observation and the accumulator.
+
+    Args:
+        cmd: A :class:`MotionSequenceCommand` (or subclass).
+
+    Returns:
+        ``[N]`` long, on ``cmd.clip_id``'s device.
+    """
+    clip_id = cmd.clip_id
+    cached = getattr(cmd, "_goal_anchor_step", None)
+    cached_id = getattr(cmd, "_goal_anchor_clip_id", None)
+    if cached is None or cached_id is None or cached.shape != clip_id.shape:
+        stale = torch.ones_like(clip_id, dtype=torch.bool)
+        cached = torch.zeros_like(clip_id)
+    else:
+        stale = cached_id != clip_id
+    if bool(stale.any()):
+        ids = torch.nonzero(stale).flatten()
+        cached = cached.clone()
+        cached[ids] = _anchor_step_for(cmd, ids)
+        cmd._goal_anchor_step = cached
+        cmd._goal_anchor_clip_id = clip_id.clone()
+    return cached
+
+
 def goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
-    """Where the clip itself finishes, in the world, and the terrain heading to measure in.
+    """Where the clip ENDS UP, in the world, and the terrain heading to measure in.
+
+    "Ends up" rather than "finishes": the step is :func:`goal_anchor_step`, the furthest
+    downrange point of the clip's tail window, NOT ``last_usable_step`` -- which on the box
+    families falls before the mount and put the goal in mid-air short of the box.
 
     Uses the GLOBAL placement -- ``_reset_world_pos`` / ``_reset_world_yaw``, the reset-time
     terrain-cell anchor -- exactly as :func:`base_pose_error_termination` does, and for the
@@ -292,7 +417,7 @@ def goal_anchor_world(cmd) -> tuple[torch.Tensor, torch.Tensor]:
     yaw = cmd._reset_world_yaw
     world_quat = quat_from_angle_axis(yaw, cmd._world_z.expand(yaw.shape[0], 3))
     state = cmd.reference_world_state_at(
-        cmd.clip_id, last_usable_step(cmd), cmd._reset_world_pos, world_quat
+        cmd.clip_id, goal_anchor_step(cmd), cmd._reset_world_pos, world_quat
     )
     return state[:, 0:3], cmd._mask_frame_yaw.to(state.device)
 

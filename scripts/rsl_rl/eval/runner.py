@@ -593,17 +593,40 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
     notes["tracking_mode"] = getattr(traj, "tracking_mode", None)
 
     # --- episode length from the CLIP, not from the 20 s wall --------------------------
+    # The SLACK is set on whichever term ends up here, added or pre-existing, and that
+    # distinction cost a whole validation run: the play tasks already define `clip_end`, so
+    # setting the slack only on the add path left the deadline at `last_usable_step` while
+    # the goal anchor had moved into the clip's final 1.5 s (`mdp.goal_anchor_step`). The
+    # reserve is 1.02 s, which at the library's top commanded speed of 2.6 m/s is 2.65 m of
+    # travel, so the clip arm itself finished 0.4-2.5 m short and scored 0.001 -- a region
+    # unreachable by the tracker, which is the one failure `build_goal_regions.py` warns
+    # about because every generator arm inherits it as if it were a policy result.
+    from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: PLC0415
+
+    slack_s = float(mdp.GOAL_DEADLINE_SLACK_S)
     if getattr(env_cfg.terminations, "clip_end", None) is None:
         from isaaclab.managers import TerminationTermCfg as DoneTerm  # noqa: PLC0415
-        from robot_rl.tasks.manager_based.robot_rl import mdp  # noqa: PLC0415
 
         env_cfg.terminations.clip_end = DoneTerm(
             func=mdp.clip_end_reached,
-            params={"command_name": "traj_ref", "reserve_lookahead": True},
+            params={"command_name": "traj_ref", "reserve_lookahead": True,
+                    "slack_s": slack_s},
             time_out=True)
         notes["terminations_added"] = ["clip_end"]
     else:
+        env_cfg.terminations.clip_end.params["slack_s"] = slack_s
         notes["terminations_added"] = []
+    notes["clip_end_slack_s"] = slack_s
+
+    # `time_out` must stay a BACKSTOP rather than the binding deadline. The longest clip's
+    # last usable step is 948 control steps and the slack adds 150, so a 20 s (1000-step)
+    # budget would cut the flat clips before `clip_end` -- silently converting a truncation
+    # the goal is measured against into a wall-clock one.
+    need_s = (mdp.MAX_LAST_USABLE_STEP_S if hasattr(mdp, "MAX_LAST_USABLE_STEP_S")
+              else 19.0) + slack_s + 1.0
+    if float(getattr(env_cfg, "episode_length_s", 0.0)) < need_s:
+        notes["episode_length_s"] = [float(env_cfg.episode_length_s), float(need_s)]
+        env_cfg.episode_length_s = float(need_s)
 
     # --- the fall plane -------------------------------------------------------------------
     # 0.50 m, the historical value, sits INSIDE jump_off_front's own reference envelope: the
