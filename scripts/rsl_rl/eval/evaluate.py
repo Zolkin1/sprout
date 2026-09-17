@@ -139,7 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--tiles_per_family", type=int, default=0,
                    help="0 = every tile the family has (the default; tile count is what "
                         "sets the interval width, not robots per clip)")
-    g.add_argument("--clips_per_tile", type=int, default=2)
+    g.add_argument("--clips_per_tile", type=int, default=4,
+                   help="clips per tile. The tiled families are a per-tile SWEEP over "
+                        "commanded speed, and the pick is endpoint-inclusive, so 2 samples "
+                        "ONLY the slowest and fastest clip of every tile -- which is what "
+                        "every plan before 2026-09-04 did. 4 gives two interior points.")
     g.add_argument("--flat_tiles", type=int, default=12,
                    help="flat COLUMNS to build; 12 covers all 12 flat_tile_decor variants, "
                         "and the decor is in the depth cameras' target list")
@@ -150,7 +154,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="comma list of terrain families to drop (flat is controlled by "
                         "--flat_tiles, not here)")
     g.add_argument("--tile_pick", default="spread", choices=sampler.TILE_PICKS)
-    g.add_argument("--clip_pick", default="spread", choices=sampler.CLIP_PICKS)
+    g.add_argument("--clip_pick", default="speed", choices=sampler.CLIP_PICKS,
+                   help="'speed' spreads a tile's clips over their COMMANDED SPEED; "
+                        "'spread' spreads over the library's write order (what plans before "
+                        "2026-09-04 used, kept only to reproduce one)")
+    g.add_argument("--allow_degenerate_speeds", action="store_true",
+                   help="accept a selection covering fewer than "
+                        f"{sampler.MIN_SAMPLED_SPEED_LEVELS} commanded-speed levels in a "
+                        "family the library sweeps. Refused by default: the tables it "
+                        "produces look normal and their per-family means are averages over "
+                        "the extremes rather than rates at any speed.")
     g.add_argument("--min_clip_len", type=int, default=0,
                    help="0 = max(REFERENCE_OFFSETS) + 2, the shortest clip with an "
                         "unsaturated observation window")
@@ -471,6 +484,24 @@ def stage_plan(args) -> dict:
     print(f"[plan] selected {len(clips)} clips over {len(columns)} tile columns "
           f"({len(columns) - flat_tiles} terrain + {flat_tiles} flat)")
 
+    # The commanded-speed distribution is PRINTED and then CHECKED. Printed because a
+    # selection's speed coverage was invisible in the recorded plan for every run to date,
+    # and the one number that was visible (a family median) sat in a gap no clip occupied.
+    speed_summary = _speed_summary(index, clips)
+    for line in _format_speed_summary(speed_summary):
+        print(f"[plan] {line}")
+    complaints = sampler.check_speed_coverage(index, clips)
+    if complaints and clips_per_tile > 1:
+        for c in complaints:
+            print(f"[plan] SPEED COVERAGE: {c}")
+        if not args.allow_degenerate_speeds:
+            raise SystemExit(
+                "refusing to write a plan whose per-family commanded-speed coverage is "
+                "degenerate (see above). Raise --clips_per_tile or pass "
+                "--allow_degenerate_speeds."
+            )
+        print("[plan] --allow_degenerate_speeds: accepted anyway")
+
     subset_path = pathlib.Path(args.subset_out or (out_dir / "eval_clips.h5")).resolve()
     _build_subset(args.lib, subset_path, clips, flat_tiles)
     spans = _terrain_spans(str(subset_path), max_offset=DEFAULT_MAX_OFFSET)
@@ -498,12 +529,14 @@ def stage_plan(args) -> dict:
                            "counts_flat": index.num_flat_tiles_source},
         "subset_library": {"path": str(subset_path), "sha256": sha256_file(str(subset_path)),
                            "num_clips": len(clips), "flat_tiles": flat_tiles},
+        "cmd_speed_by_family": speed_summary,
         "selection": {"tiles_per_family": tiles_per_family, "clips_per_tile": clips_per_tile,
                       "flat_tiles": flat_tiles, "flat_clips": args.flat_clips or None,
                       "min_clip_len": min_clip_len, "families": list(families or []),
                       "exclude_families": [f for f in args.exclude_families.split(",")
                                            if f.strip()],
                       "tile_pick": args.tile_pick, "clip_pick": args.clip_pick,
+                      "allow_degenerate_speeds": bool(args.allow_degenerate_speeds),
                       "seed": args.plan_seed},
         "tile_columns": [int(c) for c in columns],
         "dt": index.dt,
@@ -528,6 +561,73 @@ def stage_plan(args) -> dict:
     _write_manifest(args, out_dir, plan)
     _report_plan(plan)
     return plan
+
+
+def _speed_summary(index, clips: list) -> dict[str, dict]:
+    """Per-family commanded-speed coverage of a selection, for the plan record.
+
+    Recorded because it was previously unrecoverable from a finished run: nothing in
+    ``plan.json`` said which speeds a family had been sampled at, so a per-family rate could
+    not be read against the speeds that produced it.  ``flat`` is reported with a null
+    ``levels`` -- its command varies within the clip, so its first-frame speed is not a
+    speed (see :attr:`sampler.ClipIndex.cmd_speed`).
+
+    Args:
+        index: The source library's :class:`sampler.ClipIndex`.
+        clips: The selected clips.
+
+    Returns:
+        ``family -> {"levels", "min", "max", "values", "available_levels"}``; ``levels`` is
+        ``None`` for flat.
+    """
+    import numpy as np  # noqa: PLC0415 - matches this module's lazy-numpy convention
+
+    if index.cmd_speed is None:
+        return {}
+    fam_of_tile = index.family_of_tile
+    by_fam: dict[str, list[int]] = {}
+    for sc in clips:
+        by_fam.setdefault(sc.family, []).append(int(sc.source_clip_id))
+    out: dict[str, dict] = {}
+    for fam in sorted(by_fam):
+        got = index.cmd_speed[np.asarray(by_fam[fam], dtype=np.int64)]
+        if fam == "flat":
+            out[fam] = {"levels": None, "min": None, "max": None, "values": None,
+                        "available_levels": None, "n_clips": len(by_fam[fam])}
+            continue
+        tiles = [t for t, f in fam_of_tile.items() if f == fam]
+        avail = index.cmd_speed[np.isin(index.terrain_id, tiles)]
+        vals = sorted(float(v) for v in np.unique(np.round(got, 2)))
+        out[fam] = {
+            "levels": sampler.speed_levels(got),
+            "min": float(got.min()), "max": float(got.max()),
+            "values": vals if len(vals) <= 12 else None,
+            "available_levels": sampler.speed_levels(avail),
+            "n_clips": len(by_fam[fam]),
+        }
+    return out
+
+
+def _format_speed_summary(summary: dict[str, dict]) -> list[str]:
+    """One printable line per family from :func:`_speed_summary`.
+
+    Args:
+        summary: The mapping :func:`_speed_summary` returned.
+
+    Returns:
+        Lines to print, empty when the library carried no commanded speeds.
+    """
+    lines: list[str] = []
+    for fam, d in summary.items():
+        if d["levels"] is None:
+            lines.append(f"speeds {fam:16s} n={d['n_clips']:3d}  (time-varying command; "
+                         "not speed-stratified)")
+            continue
+        vals = (", ".join(f"{v:.2f}" for v in d["values"]) if d["values"]
+                else f"{d['min']:.2f}-{d['max']:.2f}")
+        lines.append(f"speeds {fam:16s} n={d['n_clips']:3d}  "
+                     f"{d['levels']:2d}/{d['available_levels']:2d} levels  [{vals}] m/s")
+    return lines
 
 
 def _build_subset(src: str, dst: pathlib.Path, clips: list, flat_tiles: int) -> None:

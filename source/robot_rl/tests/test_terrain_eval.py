@@ -19,6 +19,7 @@ are the seams between them, which is where a silent mistake survives:
 
 from __future__ import annotations
 
+import dataclasses
 import pathlib
 import re
 import sys
@@ -222,28 +223,113 @@ def test_cell_key_round_trips_including_the_empty_generator():
 # ---------------------------------------------------------------------------
 # 2. Selection.
 # ---------------------------------------------------------------------------
-def _index(n_fam=3, tiles_per_fam=4, clips_per_tile=5, n_flat=20, flat_len=999):
-    """A synthetic ClipIndex: no h5 needed, so selection is tested in microseconds."""
+def _index(n_fam=3, tiles_per_fam=4, clips_per_tile=5, n_flat=20, flat_len=999,
+           speed_lo=0.6, speed_hi=2.6):
+    """A synthetic ClipIndex: no h5 needed, so selection is tested in microseconds.
+
+    The commanded speeds ASCEND within each tile's contiguous block, mirroring
+    ``g1_mb_v5_body_mode11_decor``'s real layout -- that coincidence between write order and
+    a swept parameter is what made ``clip_pick="spread"`` sample only the two extremes, so a
+    fixture without it could not exhibit the defect the speed pick fixes.
+    """
     fams = [f"fam{i}" for i in range(n_fam)]
-    man, tid, tcode, clen = [], [], [], []
+    man, tid, tcode, clen, spd = [], [], [], [], []
     next_tile = 0
+    sweep = np.linspace(speed_lo, speed_hi, clips_per_tile)
     for fi, fam in enumerate(fams):
         for _ in range(tiles_per_fam):
             man.append({"terrain_id": next_tile, "type": "box", "family": f"family_{fam}.h5"})
             for k in range(clips_per_tile):
                 tid.append(next_tile); tcode.append(4)
                 clen.append(200 + 10 * fi + k)      # distinct, so "longest" is unambiguous
+                spd.append(float(sweep[k]))
             next_tile += 1
     tid += [sampler.FLAT_TERRAIN_ID] * n_flat
     tcode += [0] * n_flat
     clen += [flat_len] * n_flat
+    spd += [0.0] * n_flat                            # flat: time-varying command, frame 0 = 0
     return sampler.ClipIndex(
         path="<synthetic>", terrain_id=np.array(tid, dtype=np.int64),
         terrain_type_code=np.array(tcode, dtype=np.int64),
         clip_len=np.array(clen, dtype=np.int64),
         anchor_mask=np.full(len(tid), 2, dtype=np.int64),
         manifest=man, terrain_type_names=["flat", "terrain", "transition", "slope", "box"],
-        num_flat_tiles_source=6, dt=0.02, num_steps=1000)
+        num_flat_tiles_source=6, dt=0.02, num_steps=1000,
+        cmd_speed=np.array(spd, dtype=np.float64))
+
+
+def test_the_write_order_pick_samples_only_the_speed_extremes():
+    """Pin the DEFECT the speed pick exists to fix, so it cannot come back unnoticed.
+
+    ``g1_mb_v5_body_mode11_decor`` writes each tile's clips in ascending commanded speed, so
+    an endpoint-inclusive spread over the WRITE ORDER at ``clips_per_tile=2`` takes the
+    slowest and the fastest and nothing between.  Measured consequence on the real library:
+    ``stairs_up`` scored 0.900 at 0.600 m/s and 0.458 at 2.600, and the family headline
+    0.679 was the mean of those two -- reported beside a median of 1.60 m/s that no clip had.
+    """
+    idx = _index(n_fam=1, tiles_per_fam=4, clips_per_tile=50, n_flat=4)
+    clips, _ = sampler.select_clips(idx, clips_per_tile=2, flat_tiles=1,
+                                    clip_pick="spread")
+    got = idx.cmd_speed[np.array([c.source_clip_id for c in clips if c.family == "fam0"])]
+    assert sampler.speed_levels(got) == 2, "the fixture no longer reproduces the defect"
+    assert sorted(np.unique(np.round(got, 2))) == [0.6, 2.6]
+
+
+def test_the_speed_pick_spreads_over_speed_and_reaches_the_interior():
+    """``clip_pick="speed"`` puts interior points in the sample, and spans the full range."""
+    idx = _index(n_fam=1, tiles_per_fam=4, clips_per_tile=50, n_flat=4)
+    for k, want in ((3, [0.6, 1.6, 2.6]), (4, [0.6, 1.27, 1.93, 2.6])):
+        clips, _ = sampler.select_clips(idx, clips_per_tile=k, flat_tiles=1,
+                                        clip_pick="speed")
+        got = idx.cmd_speed[np.array([c.source_clip_id for c in clips
+                                      if c.family == "fam0"])]
+        assert sampler.speed_levels(got) == k
+        assert np.allclose(sorted(np.unique(np.round(got, 2))), want, atol=0.02)
+
+
+def test_the_speed_pick_takes_the_median_at_one_clip_per_tile():
+    """One slot cannot span a range, so it must not silently mean "the slowest".
+
+    ``linspace``'s first index is the minimum, which is what ``--quick`` used to get: every
+    tile at its slowest clip, a degeneracy at the other end from the two-extreme one.
+    """
+    idx = _index(n_fam=1, tiles_per_fam=3, clips_per_tile=51, n_flat=2)
+    clips, _ = sampler.select_clips(idx, clips_per_tile=1, flat_tiles=1, clip_pick="speed")
+    got = idx.cmd_speed[np.array([c.source_clip_id for c in clips if c.family == "fam0"])]
+    assert np.allclose(got, 1.6, atol=0.03), got
+
+
+def test_speed_coverage_refuses_a_two_level_selection_and_accepts_the_default():
+    """The GUARD, not the picker, is what prevents recurrence.
+
+    A speed-spread at ``k=2`` is still exactly the two endpoints, and a future family whose
+    generator emits in some new order would dodge the picker entirely -- so the check is on
+    the RESULT, and it is what makes the failure impossible to ship silently.
+    """
+    idx = _index(n_fam=1, tiles_per_fam=4, clips_per_tile=50, n_flat=4)
+    for pick in ("spread", "speed"):
+        clips, _ = sampler.select_clips(idx, clips_per_tile=2, flat_tiles=1, clip_pick=pick)
+        bad = sampler.check_speed_coverage(idx, clips)
+        assert len(bad) == 1 and "fam0" in bad[0], (pick, bad)
+        assert "--clips_per_tile" in bad[0], "the complaint must name the fix"
+    clips, _ = sampler.select_clips(idx, flat_tiles=1)      # defaults: speed, k=4
+    assert sampler.check_speed_coverage(idx, clips) == []
+
+
+def test_speed_coverage_is_quiet_on_a_family_the_library_does_not_sweep():
+    """A family generated at one speed is not a defect and must not be reported as one."""
+    idx = _index(n_fam=1, tiles_per_fam=4, clips_per_tile=50, n_flat=4,
+                 speed_lo=1.0, speed_hi=1.0)
+    clips, _ = sampler.select_clips(idx, clips_per_tile=2, flat_tiles=1, clip_pick="speed")
+    assert sampler.check_speed_coverage(idx, clips) == []
+
+
+def test_the_speed_pick_refuses_a_library_with_no_commanded_speeds():
+    """Absent speeds are refused BY NAME rather than falling back to the write order."""
+    idx = dataclasses.replace(_index(), cmd_speed=None)
+    with pytest.raises(ValueError, match="target_vel"):
+        sampler.select_clips(idx, clips_per_tile=2, flat_tiles=1, clip_pick="speed")
+    sampler.select_clips(idx, clips_per_tile=2, flat_tiles=1, clip_pick="spread")
 
 
 def test_selection_is_stratified_and_column_ordered():

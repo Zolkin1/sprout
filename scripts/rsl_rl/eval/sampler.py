@@ -38,7 +38,18 @@ FLAT_TERRAIN_ID: int = -1
 TERRAIN_CLASS_ORDER: tuple[str, ...] = ("terrain", "transition", "slope", "box")
 
 TILE_PICKS: tuple[str, ...] = ("spread", "random", "first")
-CLIP_PICKS: tuple[str, ...] = ("spread", "longest", "random")
+CLIP_PICKS: tuple[str, ...] = ("speed", "spread", "longest", "random")
+
+#: Below this many commanded-speed levels available in a family, its speed distribution
+#: cannot be sampled meaningfully and :func:`check_speed_coverage` stays quiet -- a family
+#: generated at one speed is not a defect. The stair families offer 50.
+MIN_SPEED_LEVELS_TO_STRATIFY: int = 4
+
+#: Distinct commanded-speed levels a stratifiable family must end up with. 2 is the
+#: measured failure -- ``clips_per_tile=2`` with an endpoint-inclusive spread over a
+#: speed-ordered library samples ONLY the extremes (0.600 and 2.600 m/s on the stairs),
+#: which reads as a spread and reports a median no clip occupies.
+MIN_SAMPLED_SPEED_LEVELS: int = 3
 
 
 def normalize_family(raw: str) -> str:
@@ -80,6 +91,13 @@ class ClipIndex:
     num_flat_tiles_source: int      # generator_config.counts.flat as found
     dt: float
     num_steps: int
+    #: ``[N]`` commanded planar speed (m/s) at each clip's FIRST frame, or ``None`` when the
+    #: library has no ``target_vel``.  Frame 0 is exact for every TILED family -- their
+    #: command is constant over the clip (verified: max |frame0 - usable-span mean| = 0 over
+    #: all 9976 non-flat clips of ``g1_mb_v5_body_mode11_decor``) -- while the flat clips
+    #: carry a time-varying command whose first frame is 0.0.  Flat is selected clip-wise
+    #: with no tile structure, so it is not speed-stratified and that zero is never read.
+    cmd_speed: np.ndarray | None = None
 
     @property
     def num_clips(self) -> int:
@@ -143,6 +161,13 @@ def read_clip_index(lib_path: str) -> ClipIndex:
         type_code = f["terrain_type_code"][:].astype(np.int64)
         clip_len = f["clip_len"][:].astype(np.int64)
         anchor_mask = f["anchor_mask"][:].astype(np.int64)
+        # Commanded speed, so selection can stratify by the quantity that actually moves
+        # outcomes rather than by the library's write order. Absent on an older library;
+        # `clip_pick="speed"` then refuses by name rather than silently reordering nothing.
+        cmd_speed = (
+            np.linalg.norm(np.asarray(f["target_vel"][:, 0, :2], dtype=np.float64), axis=-1)
+            if "target_vel" in f else None
+        )
 
         def _attr(name: str, default):
             raw = f.attrs.get(name)
@@ -163,7 +188,7 @@ def read_clip_index(lib_path: str) -> ClipIndex:
         path=str(lib_path), terrain_id=terrain_id, terrain_type_code=type_code,
         clip_len=clip_len, anchor_mask=anchor_mask, manifest=list(manifest),
         terrain_type_names=list(type_names), num_flat_tiles_source=num_flat,
-        dt=dt, num_steps=num_steps,
+        dt=dt, num_steps=num_steps, cmd_speed=cmd_speed,
     )
 
 
@@ -214,11 +239,128 @@ def _pick_spread(items: np.ndarray, k: int) -> np.ndarray:
     Systematic rather than random: the library writes clips grouped by family and tile, so
     a prefix would be a handful of tiles and a random draw can clump.  Evenly spaced spans
     the generation order, which is the same reason ``make_flat_clip_lib`` uses it.
+
+    **Spanning the generation ORDER is not spanning any physical quantity**, and where the
+    two coincide this is a trap -- see :func:`_pick_spread_by_speed`.  Keep using it for
+    TILES, where the order carries no parameter.
     """
     if k >= items.size:
         return items
     idx = np.unique(np.linspace(0, items.size - 1, k).round().astype(np.int64))
     return items[idx]
+
+
+def _pick_spread_by_speed(items: np.ndarray, speeds: np.ndarray, k: int) -> np.ndarray:
+    """``k`` of ``items`` spread over their COMMANDED SPEED rather than their index order.
+
+    This exists because of a measured defect.  ``g1_mb_v5_body_mode11_decor`` writes each
+    stair tile's 50 clips contiguously and in ASCENDING commanded speed (0.600 -> 2.600 m/s
+    in 50 even steps, one clip per level), so ``_pick_spread`` at ``clips_per_tile=2`` --
+    which is endpoint-inclusive, ``linspace(0, 49, 2) = [0, 49]`` -- selected exactly the
+    slowest and fastest clip of every tile, deterministically, on every eval ever run.  The
+    resulting sample has TWO speeds and no interior point, yet reports a median of 1.60 m/s
+    that no clip occupies.  Measured on that sample: ``stairs_up`` scores 0.900 at 0.600 m/s
+    and 0.458 at 2.600, so the family's headline 0.679 is the mean of two very different
+    populations and is not a statement about any speed.
+
+    ``jump_on`` / ``jump_off_front`` are contiguous but NOT speed-ordered, so the same call
+    landed them on two arbitrary speeds -- unbiased, but equally unstated.  Sorting by the
+    quantity itself makes the sample a stated function of speed for every family, whatever
+    order its generator happened to emit.
+
+    At ``k == 1`` the MEDIAN speed is taken, not the first entry: one slot cannot span a
+    range, and ``linspace``'s first index would put every tile at its slowest clip -- the
+    same degeneracy at the other end, which is what ``--quick`` used to get.
+
+    Args:
+        items: Candidate clip indices (any order).
+        speeds: ``items``-aligned commanded speeds.
+        k: How many to take.
+
+    Returns:
+        The picked clip indices, ASCENDING (selection order must not depend on speed, only
+        the membership does).
+    """
+    if k >= items.size:
+        return np.sort(items)
+    order = items[np.argsort(speeds, kind="stable")]
+    if k == 1:
+        return np.array([order[order.size // 2]], dtype=items.dtype)
+    idx = np.unique(np.linspace(0, order.size - 1, k).round().astype(np.int64))
+    return np.sort(order[idx])
+
+
+def speed_levels(speeds: np.ndarray, *, decimals: int = 2) -> int:
+    """Number of DISTINCT commanded-speed levels in ``speeds``, rounded to ``decimals``.
+
+    Rounded because the library's levels are an even sweep in float32 (0.6409999...), so
+    exact equality would count 50 levels as 50 regardless of how few were really sampled --
+    which is correct here, but would also count two clips 1e-7 apart as two levels.
+
+    Args:
+        speeds: Commanded speeds.
+        decimals: Rounding applied before counting.
+
+    Returns:
+        The distinct level count.
+    """
+    return int(np.unique(np.round(np.asarray(speeds, dtype=np.float64), decimals)).size)
+
+
+def check_speed_coverage(
+    index: ClipIndex,
+    clips: list[SelectedClip],
+    *,
+    min_levels: int = MIN_SAMPLED_SPEED_LEVELS,
+) -> list[str]:
+    """Report families whose SELECTED clips cover too few commanded speeds.
+
+    The guard, rather than the default, is what prevents recurrence: a new family whose
+    generator emits in a new order, or an explicit ``--clips_per_tile 2``, both reintroduce
+    the bimodal sample and both produce tables that look entirely normal.  A family is only
+    judged when the library actually offers speeds to spread over
+    (:data:`MIN_SPEED_LEVELS_TO_STRATIFY`), so a single-speed family is not a finding.
+
+    Flat is skipped: its clips carry a time-varying command whose first frame is 0.0, so its
+    ``cmd_speed`` is not a speed and there is no tile structure to stratify.
+
+    Args:
+        index: The source library's index (for what was AVAILABLE).
+        clips: The selection to judge.
+        min_levels: Distinct levels a stratifiable family must reach.
+
+    Returns:
+        One human-readable complaint per offending family; empty when the selection is fine.
+    """
+    if index.cmd_speed is None:
+        return []
+    fam_of_tile = index.family_of_tile
+    by_fam: dict[str, list[int]] = {}
+    for sc in clips:
+        if sc.family == "flat" or sc.terrain_id == FLAT_TERRAIN_ID:
+            continue
+        by_fam.setdefault(sc.family, []).append(int(sc.source_clip_id))
+    out: list[str] = []
+    for fam in sorted(by_fam):
+        tiles = [t for t, f in fam_of_tile.items() if f == fam]
+        avail = index.cmd_speed[np.isin(index.terrain_id, tiles)]
+        n_avail = speed_levels(avail)
+        if n_avail < MIN_SPEED_LEVELS_TO_STRATIFY:
+            continue
+        got = index.cmd_speed[np.asarray(by_fam[fam], dtype=np.int64)]
+        n_got = speed_levels(got)
+        if n_got < min_levels:
+            uniq = np.unique(np.round(got, 2))
+            out.append(
+                f"family {fam!r}: the selection covers {n_got} commanded-speed level(s) "
+                f"({', '.join(f'{v:.2f}' for v in uniq)} m/s) out of {n_avail} the library "
+                f"offers ({avail.min():.2f}-{avail.max():.2f} m/s). A per-speed result cannot "
+                f"be read from this, and the pooled mean is an average over those levels "
+                f"rather than a rate at any of them. Raise --clips_per_tile (>= "
+                f"{min_levels} gives interior points) or pass --allow_degenerate_speeds to "
+                f"accept it."
+            )
+    return out
 
 
 @dataclass(frozen=True)
@@ -236,14 +378,14 @@ def select_clips(
     index: ClipIndex,
     *,
     tiles_per_family: int | None = None,
-    clips_per_tile: int = 2,
+    clips_per_tile: int = 4,
     flat_tiles: int = 12,
     flat_clips: int | None = None,
     min_clip_len: int = 52,
     families: tuple[str, ...] | None = None,
     exclude_families: tuple[str, ...] = (),
     tile_pick: str = "spread",
-    clip_pick: str = "spread",
+    clip_pick: str = "speed",
     seed: int = 20260820,
 ) -> tuple[list[SelectedClip], list[int]]:
     """Choose a stratified clip set and the tile columns it will run on.
@@ -260,7 +402,15 @@ def select_clips(
         tiles_per_family: Tiles to take from each family; ``None`` takes every tile the
             family has, which maximises the number of bootstrap clusters and is the default
             because tile count -- not robots per clip -- is what sets the interval width.
-        clips_per_tile: Clips per chosen tile.
+        clips_per_tile: Clips per chosen tile.  Defaults to 4 because the tiled families
+            are generated as a per-tile SWEEP over commanded speed (50 levels, 0.600-2.600
+            m/s on the stairs), and ``clip_pick="speed"`` spreads over it endpoint-inclusive
+            -- so 2 buys only the two extremes, 3 adds one interior point and 4 gives
+            0.60 / 1.25 / 1.95 / 2.60.  Speed roughly halves stair success across that range
+            (measured: ``stairs_up`` 0.900 -> 0.458), so this is the axis a stair result is
+            most sensitive to.  It multiplies the episode count: the harness's own budget
+            note ("2x the tiles at half the robots is free and 21% tighter") applies here
+            too -- prefer halving ``robots_per_clip`` over cutting this back to 2.
         flat_tiles: Flat COLUMNS to build.  Defaults to 12 because ``flat_tile_decor`` holds
             12 room variants handed round-robin per flat tile, and the decor is in the depth
             cameras' target list -- fewer tiles silently drops variants from what the policy
@@ -274,7 +424,10 @@ def select_clips(
             TERRAIN families only -- flat is not one of them, and is controlled by
             ``flat_tiles``.
         tile_pick: One of :data:`TILE_PICKS`.
-        clip_pick: One of :data:`CLIP_PICKS`.
+        clip_pick: One of :data:`CLIP_PICKS`.  ``"speed"`` (the default) spreads over the
+            clips' COMMANDED SPEED; ``"spread"`` spreads over the library's write order and
+            is what every plan before this change used -- kept so an old plan can be
+            reproduced, not because it is a reasonable choice on a swept library.
         seed: Seed for the ``random`` pick modes.
 
     Returns:
@@ -284,7 +437,8 @@ def select_clips(
     Raises:
         ValueError: On an unknown pick mode, a requested family the library lacks, a family
             with fewer tiles than requested, a tile that cannot supply ``clips_per_tile``
-            long-enough clips, or a flat request the library cannot fill.
+            long-enough clips, a flat request the library cannot fill, or
+            ``clip_pick="speed"`` against a library carrying no ``target_vel``.
     """
     if tile_pick not in TILE_PICKS:
         raise ValueError(f"tile_pick must be one of {TILE_PICKS}, got {tile_pick!r}")
@@ -348,7 +502,16 @@ def select_clips(
                     f"tile {tile} (family {fam!r}) has only {ok.size} clips with "
                     f"clip_len >= {min_clip_len}, but {clips_per_tile} were requested."
                 )
-            if clip_pick == "spread":
+            if clip_pick == "speed":
+                if index.cmd_speed is None:
+                    raise ValueError(
+                        f"clip_pick='speed' needs commanded speeds, but library "
+                        f"{index.path} has no 'target_vel' dataset. Pass "
+                        "--clip_pick spread to select on the library's write order "
+                        "instead, and read the speed caveat on _pick_spread_by_speed."
+                    )
+                picked = _pick_spread_by_speed(ok, index.cmd_speed[ok], clips_per_tile)
+            elif clip_pick == "spread":
                 picked = _pick_spread(ok, clips_per_tile)
             elif clip_pick == "longest":
                 picked = np.sort(ok[np.argsort(-index.clip_len[ok], kind="stable")][:clips_per_tile])
@@ -369,6 +532,9 @@ def select_clips(
                 f"library {index.path} has {ok.size} flat clips with clip_len >= "
                 f"{min_clip_len}, but {n_flat} were requested."
             )
+        # Flat is NOT speed-stratified: its command varies within the clip, so a
+        # first-frame speed is 0.0 for all 3000 flat clips and sorting by it would be
+        # sorting by nothing. Generation-order spread is the honest choice here.
         picked = _pick_spread(ok, n_flat) if clip_pick != "random" else np.sort(
             rng.choice(ok, size=n_flat, replace=False))
         flat_selected = [
