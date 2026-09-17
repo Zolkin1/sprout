@@ -511,8 +511,9 @@ class AdjusterPPORunnerCfg(PPORunnerCfg):
 class AdjusterFreeformPPORunnerCfg(AdjusterPPORunnerCfg):
     """PPO for the free-form arm: the FULL per-node action, and the off-policy arm's discount.
 
-    Three changes from the clip-terrain arm, and each is about matching the thing being
-    compared against rather than about tuning:
+    Four changes from the clip-terrain arm. Three are about matching the thing being compared
+    against rather than about tuning; the fourth is a memory requirement that follows from the
+    env count:
 
     * **`gamma` 0.96 -> 0.95.** 0.96 was fitted to the clip task's ~6.2 s episode. 0.95 is the
       offline reducer's own per-chunk discount (`advantage.bootstrapped_window_return`), and a
@@ -565,7 +566,20 @@ class AdjusterFreeformPPORunnerCfg(AdjusterPPORunnerCfg):
         "entropy_coef": 0.0,
         # The offline reducer's per-chunk discount. See the class docstring.
         "gamma": 0.95,
-        "num_mini_batches": 12,
+        # 24, NOT the 12 this class used to inherit, and it is arithmetic rather than a tune.
+        # The binding cost in `update()` is the recomputed conditioning prefix, which scales
+        # with MINIBATCH SIZE -- and 12 was sized for the clip arm's 1024 envs, where it gives
+        # 1024 * 24 / 12 = 2048 samples per minibatch, the figure that class's comment calls
+        # "proved out (~8.6 GB)". At this arm's 2048 envs the same 12 gives 4096, double that.
+        #
+        # MEASURED: it OOM'd inside `update()` at iteration 1, after a rollout that had already
+        # succeeded -- 90.94 GB in use of a 93.09 GB card, asking for 4.03 more with 2.09 free.
+        # 2048 * 24 / 24 = 2048 restores the proved-out minibatch exactly.
+        #
+        # It is NOT a FLOP change and not a different optimisation: `num_learning_epochs *
+        # (num_steps_per_env * num_envs / num_mini_batches) * num_mini_batches` is invariant, so
+        # the same samples are seen the same number of times in smaller groups.
+        "num_mini_batches": 24,
         "critic_warmup_iterations": 30,
     })
 
