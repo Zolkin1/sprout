@@ -57,6 +57,15 @@ export PYTHONPATH=source/robot_rl:source/motion_gen
 PY=./env_isaaclab/bin/python
 
 #: The course. Everything below is a DEFAULT for it, not a constraint.
+#: A trained ADJUSTER checkpoint, or empty. When set, the generator named by <fm_checkpoint>
+#: stays FROZEN and this policy's deterministic residual is applied to its plan once per
+#: re-plan -- which is how an on-policy (PPO) arm gets scored by the same instrument as the
+#: off-policy ones. Everything else is untouched, so the two recordings differ in one thing.
+#:
+#: The <fm_checkpoint> must be the generator the adjuster TRAINED against (its parent), not a
+#: fine-tuned one: the residual is a correction to that generator's output.
+ADJUSTER="${ADJUSTER:-}"
+
 TERRAIN=${TERRAIN:-box2}
 case "$TERRAIN" in
   box2)
@@ -229,6 +238,7 @@ for spd in $SPEEDS; do
     --clip "$CLIP" --clip_device cpu --goal_regions "$GR" \
     --num_envs $NENV --episodes_per_env "$ROUNDS" --no_windows --terrain_reward \
     --history_from "$HISTORY_FROM" \
+    ${ADJUSTER:+--adjuster_checkpoint "$ADJUSTER"} \
     --output_dir "$d" \
     env.commands.traj_ref.freeform_speed_min=$spd \
     env.commands.traj_ref.freeform_speed_max=$spd \

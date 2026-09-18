@@ -131,6 +131,15 @@ parser.add_argument("--allow_history_source_mismatch", action="store_true",
                     help="Record under an arm the generator was not fitted for. Needed to "
                          "bootstrap a fine-tune onto a new arm (the rollouts ARE the "
                          "training set), and wrong for anything being measured as-is.")
+parser.add_argument("--adjuster_checkpoint", type=str, default=None,
+                    help="A trained ADJUSTER (model_*.pt). Applies its deterministic residual "
+                         "to the generator's plan once per re-plan, so a PPO arm can be scored "
+                         "by the same eval as the off-policy arms. The generator stays the one "
+                         "--fm_checkpoint names, and must be the one the adjuster trained "
+                         "against: the residual corrects THAT generator's output.")
+parser.add_argument("--adjuster_num_knots", type=int, default=None,
+                    help="K for the adjuster's action. Read from the run's params/agent.yaml "
+                         "when omitted; a wrong K reshapes the action silently.")
 parser.add_argument("--clip", type=str, default=None, help="Clip library .h5 to run on.")
 parser.add_argument("--clip_device", type=str, default=None,
                     help="'cpu' keeps a large library off the GPU.")
@@ -305,6 +314,13 @@ def _apply_overrides(env_cfg) -> None:
           f"fall_min_height={args_cli.min_height} "
           + (f"pin_start_step={reset.params['pin_start_step']}" if reset is not None
              else "spawn=free-form route (no clip phase to pin)"))
+    if args_cli.adjuster_checkpoint:
+        # Both are behaviour-neutral -- a buffer copy inside `_run_fm`, and a flow field the
+        # sampler is documented as producing bit-identically -- and they are what the two
+        # actor observation terms read. Set on the CFG because the observation manager probes
+        # term shapes while the managers are still being built.
+        cmd.stash_conditioning = True
+        cmd.stash_flow = True
     _install_generator_cameras(env_cfg, str(cmd.fm_checkpoint))
 
 
@@ -685,6 +701,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         env = gym.make(args_cli.task, cfg=env_cfg)
         env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
         u = env.unwrapped
+
+        # The adjuster, if this is a PPO arm. Built AFTER the env because it is sized from the
+        # live generator's own layout, and it refuses rather than guesses on every artifact.
+        adjuster = None
+        if args_cli.adjuster_checkpoint:
+            from robot_rl.rl.adjuster_policy import AdjusterPolicy       # noqa: PLC0415
+            adjuster = AdjusterPolicy(args_cli.adjuster_checkpoint, u,
+                                      num_knots=args_cli.adjuster_num_knots)
         runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None,
                                 device=agent_cfg.device)
         # ACTOR ONLY. A rollout runs the policy in inference; the critic is never asked for
@@ -910,6 +934,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     # letting the window and chunk paths each claim would number them apart
                     # and break the join they exist to support.
                     claim = _replanned(cmd, tracker, quota=(want_rounds or 0))
+                    if adjuster is not None:
+                        # BEFORE the chunk grade and before `_emit`: the terrain reward and the
+                        # recorded plan must both describe the window the robot actually
+                        # followed, not the one the generator proposed. Masked internally to
+                        # the envs that just re-planned.
+                        adjuster.apply()
                     if claim is not None and chunks is not None:
                         chunks.append_batch(
                             _terrain_chunk_batch(u, "traj_ref", claim, tracker))
