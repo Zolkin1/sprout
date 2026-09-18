@@ -59,36 +59,50 @@ def residual_from_action(action: torch.Tensor, knot_lift: torch.Tensor,
 
 
 
-def _knots_from_run(checkpoint: str, knot_kind: str | None) -> tuple[int, str]:
-    """Read ``num_knots`` / ``knot_kind`` from the run that wrote this checkpoint.
+def actor_cfg_from_run(checkpoint: str) -> dict:
+    """The actor config the run was TRAINED with, read from its own ``params/agent.yaml``.
 
-    The checkpoint carries no config, and ``K`` decides how the flat action is reshaped -- a
-    wrong value reshapes it silently rather than failing, so it is read from the run's own
-    ``params/agent.yaml`` instead of defaulted.
+    Every field matters and none can be defaulted safely:
+
+    * ``num_knots`` decides how the flat action is reshaped, so a wrong value RESHAPES it
+      silently instead of failing;
+    * ``group_init_std`` decides whether the distribution is a stock diagonal Gaussian or a
+      :class:`GroupedKnotGaussian`, and the two have different PARAMETERS -- omitting it builds
+      an actor the checkpoint's ``distribution.*`` tensors do not fit (measured: `unexpected=
+      ['distribution.log_group_scale', 'distribution.log_knot_scale', 'distribution.
+      channel_group']`);
+    * ``num_frozen_layers`` decides how much of the borrowed trunk is trainable, and therefore
+      which layers the checkpoint's weights belong to.
+
+    So the whole block is read and passed through rather than reconstructed field by field --
+    the rebuilt actor is configured exactly as the trained one, and a field added later comes
+    along for free.
 
     Args:
         checkpoint: Path to ``<run>/model_*.pt``.
-        knot_kind: Override, or ``None`` to read it too.
 
     Returns:
-        ``(num_knots, knot_kind)``.
+        Keyword arguments for :class:`WindowAdjusterModel`, minus the ones the caller supplies
+        (``obs``, ``obs_groups``, ``obs_set``, ``output_dim``).
 
     Raises:
-        ValueError: If the file is absent or states no ``num_knots``.
+        ValueError: If the file is absent or carries no actor block.
     """
     import yaml                                                             # noqa: PLC0415
 
     p = os.path.join(os.path.dirname(os.path.abspath(checkpoint)), "params", "agent.yaml")
     if not os.path.isfile(p):
         raise ValueError(
-            f"cannot resolve num_knots: {p} does not exist. Pass --adjuster_num_knots "
-            "explicitly; a wrong K reshapes the action silently.")
+            f"cannot rebuild the actor: {p} does not exist. The checkpoint carries no config, "
+            "and every field this needs changes the shape or the parameter set.")
     with open(p) as f:
         d = yaml.safe_load(f)
-    actor = (d or {}).get("actor") or {}
-    if "num_knots" not in actor:
-        raise ValueError(f"{p} states no actor.num_knots.")
-    return int(actor["num_knots"]), str(knot_kind or actor.get("knot_kind", "catmull"))
+    actor = dict((d or {}).get("actor") or {})
+    if not actor:
+        raise ValueError(f"{p} carries no `actor` block.")
+    # `class_name` selects the model and is the caller's business; the rest are its kwargs.
+    actor.pop("class_name", None)
+    return actor
 
 
 class AdjusterPolicy:
@@ -115,15 +129,15 @@ class AdjusterPolicy:
     """
 
     def __init__(self, checkpoint: str, env, command_name: str = "traj_ref",
-                 num_knots: int | None = None, knot_kind: str | None = None) -> None:
+                 num_knots: int | None = None) -> None:
         """Rebuild the actor against the live env and restore its weights.
 
         Args:
             checkpoint: A ``model_*.pt`` from the adjuster's runner.
             env: The live UNWRAPPED env, already built.
             command_name: The :class:`FmTrackingCommand` term name.
-            num_knots: ``K``; read from the run's ``params/agent.yaml`` when omitted.
-            knot_kind: Likewise.
+            num_knots: Override for ``K``. Normally omitted -- the whole actor config is
+                read from the run's ``params/agent.yaml``, which is the only record of it.
 
         Raises:
             FileNotFoundError: If the checkpoint is missing.
@@ -141,9 +155,11 @@ class AdjusterPolicy:
         self._env, self._name = env, command_name
         cmd = env.command_manager.get_term(command_name)
         self._cmd = cmd
-        if num_knots is None:
-            num_knots, knot_kind = _knots_from_run(checkpoint, knot_kind)
-        self._k, kind = int(num_knots), str(knot_kind or "catmull")
+        cfg = actor_cfg_from_run(checkpoint)
+        if num_knots is not None:
+            cfg["num_knots"] = int(num_knots)
+        self._k = int(cfg["num_knots"])
+        kind = str(cfg.get("knot_kind", "catmull"))
 
         # Both groups are pure reads of the command's stash, so the model is sized from a
         # synthetic dict rather than by installing observation groups on the eval task -- which
@@ -155,7 +171,7 @@ class AdjusterPolicy:
         f, d = int(cmd.ctx.F), int(cmd.ctx.D)
         self.model = WindowAdjusterModel(
             obs=obs, obs_groups={"actor": ["fm_cond", "fm_plan"]}, obs_set="actor",
-            output_dim=f * d, num_knots=self._k, knot_kind=kind).to(env.device)
+            output_dim=f * d, **cfg).to(env.device)
 
         payload = torch.load(checkpoint, map_location=env.device, weights_only=False)
         state = payload.get("actor_state_dict") or payload.get("model_state_dict")
