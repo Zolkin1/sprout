@@ -59,50 +59,73 @@ def residual_from_action(action: torch.Tensor, knot_lift: torch.Tensor,
 
 
 
+def actor_cfg_from_checkpoint(state: dict, cmd) -> dict:
+    """The SHAPE-CRITICAL actor config, derived from the checkpoint's own tensors.
+
+    The authoritative source, and the reason this exists rather than trusting the run's yaml:
+    ``params/agent.yaml`` parsed correctly standalone and came back WITHOUT ``num_knots`` inside
+    a running Kit process, deterministically, on the same file (`KeyError: 'num_knots'`, all
+    five eval cells). Whatever Omniverse does to the import environment, the checkpoint's own
+    tensors cannot be shadowed by it -- ``distribution.log_knot_scale`` IS ``[K]`` and
+    ``distribution.log_group_scale`` IS ``[G]``.
+
+    Only the two fields that decide the parameter SET are taken here. Everything else is either
+    inert or caught: the caller's ``load_state_dict`` check refuses any mismatch, so a wrong
+    ``num_frozen_layers`` fails loudly rather than loading a partial actor.
+
+    Args:
+        state: The actor ``state_dict`` from the checkpoint.
+        cmd: The live :class:`FmTrackingCommand`, for the channel layout.
+
+    Returns:
+        Keyword arguments for :class:`WindowAdjusterModel`; possibly empty.
+    """
+    from robot_rl.rl.knot_distribution import channel_groups                # noqa: PLC0415
+
+    cfg: dict = {}
+    knots = state.get("distribution.log_knot_scale")
+    if knots is not None:
+        cfg["num_knots"] = int(knots.shape[0])
+    if "distribution.log_group_scale" in state:
+        # The NAMES are what size the grouping; the values are overwritten by the load. Taken
+        # from the same producer the model uses, so the two cannot disagree about the packing.
+        _, names = channel_groups(cmd.ctx.nj, cmd.ctx.target_num_extra_frames,
+                                  cmd.ctx.reference_blocks)
+        cfg["group_init_std"] = {n: 0.1 for n in names}
+    return cfg
+
+
 def actor_cfg_from_run(checkpoint: str) -> dict:
-    """The actor config the run was TRAINED with, read from its own ``params/agent.yaml``.
+    """The actor config the run was trained with, BEST EFFORT, from ``params/agent.yaml``.
 
-    Every field matters and none can be defaulted safely:
-
-    * ``num_knots`` decides how the flat action is reshaped, so a wrong value RESHAPES it
-      silently instead of failing;
-    * ``group_init_std`` decides whether the distribution is a stock diagonal Gaussian or a
-      :class:`GroupedKnotGaussian`, and the two have different PARAMETERS -- omitting it builds
-      an actor the checkpoint's ``distribution.*`` tensors do not fit (measured: `unexpected=
-      ['distribution.log_group_scale', 'distribution.log_knot_scale', 'distribution.
-      channel_group']`);
-    * ``num_frozen_layers`` decides how much of the borrowed trunk is trainable, and therefore
-      which layers the checkpoint's weights belong to.
-
-    So the whole block is read and passed through rather than reconstructed field by field --
-    the rebuilt actor is configured exactly as the trained one, and a field added later comes
-    along for free.
+    Supplies the fields the checkpoint's tensors cannot show -- ``num_frozen_layers``,
+    ``activation``, the observation group names. Best effort on purpose: this file has been
+    observed to parse incompletely inside a running Kit process, so a failure here warns and
+    returns what it has rather than killing the eval. Everything it could get wrong is verified
+    by the caller's ``load_state_dict`` check.
 
     Args:
         checkpoint: Path to ``<run>/model_*.pt``.
 
     Returns:
-        Keyword arguments for :class:`WindowAdjusterModel`, minus the ones the caller supplies
-        (``obs``, ``obs_groups``, ``obs_set``, ``output_dim``).
-
-    Raises:
-        ValueError: If the file is absent or carries no actor block.
+        Keyword arguments for :class:`WindowAdjusterModel`; possibly empty.
     """
-    import yaml                                                             # noqa: PLC0415
-
     p = os.path.join(os.path.dirname(os.path.abspath(checkpoint)), "params", "agent.yaml")
-    if not os.path.isfile(p):
-        raise ValueError(
-            f"cannot rebuild the actor: {p} does not exist. The checkpoint carries no config, "
-            "and every field this needs changes the shape or the parameter set.")
-    with open(p) as f:
-        d = yaml.safe_load(f)
-    actor = dict((d or {}).get("actor") or {})
-    if not actor:
-        raise ValueError(f"{p} carries no `actor` block.")
-    # `class_name` selects the model and is the caller's business; the rest are its kwargs.
-    actor.pop("class_name", None)
-    return actor
+    try:
+        import yaml                                                         # noqa: PLC0415
+
+        with open(p) as f:
+            d = yaml.safe_load(f)
+        actor = dict((d or {}).get("actor") or {})
+        actor.pop("class_name", None)
+        if not actor:
+            raise ValueError("no `actor` block")
+        return actor
+    except Exception as exc:                                       # noqa: BLE001 -- see above
+        print(f"[WARN] AdjusterPolicy: could not read {p} ({exc}); falling back to the "
+              "checkpoint's own tensors plus defaults. The state-dict check below is what "
+              "makes that safe.")
+        return {}
 
 
 class AdjusterPolicy:
@@ -155,9 +178,22 @@ class AdjusterPolicy:
         self._env, self._name = env, command_name
         cmd = env.command_manager.get_term(command_name)
         self._cmd = cmd
+        payload = torch.load(checkpoint, map_location=env.device, weights_only=False)
+        state = payload.get("actor_state_dict") or payload.get("model_state_dict")
+        if state is None:
+            raise KeyError(f"{os.path.basename(checkpoint)} carries no actor weights "
+                           f"(keys: {sorted(payload)}).")
+        # yaml first for the descriptive fields, then the CHECKPOINT over the top for the two
+        # that decide the parameter set. The checkpoint wins because it is the thing being
+        # loaded: if the two ever disagree, the yaml is the one that is wrong.
         cfg = actor_cfg_from_run(checkpoint)
+        cfg.update(actor_cfg_from_checkpoint(state, cmd))
         if num_knots is not None:
             cfg["num_knots"] = int(num_knots)
+        if "num_knots" not in cfg:
+            raise KeyError(
+                "cannot determine K: the checkpoint has no `distribution.log_knot_scale` and "
+                "the run's agent.yaml gave nothing. Pass --adjuster_num_knots.")
         self._k = int(cfg["num_knots"])
         kind = str(cfg.get("knot_kind", "catmull"))
 
@@ -173,11 +209,6 @@ class AdjusterPolicy:
             obs=obs, obs_groups={"actor": ["fm_cond", "fm_plan"]}, obs_set="actor",
             output_dim=f * d, **cfg).to(env.device)
 
-        payload = torch.load(checkpoint, map_location=env.device, weights_only=False)
-        state = payload.get("actor_state_dict") or payload.get("model_state_dict")
-        if state is None:
-            raise KeyError(f"{os.path.basename(checkpoint)} carries no actor weights "
-                           f"(keys: {sorted(payload)}).")
         # The borrowed generator is held in a plain list so it stays out of `state_dict`, so a
         # `fm.*` key missing is expected and anything else is not: a silent partial load is the
         # difference between scoring the trained policy and scoring a freshly initialised one.
