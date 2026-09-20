@@ -191,9 +191,24 @@ class AdjusterPolicy:
         if num_knots is not None:
             cfg["num_knots"] = int(num_knots)
         if "num_knots" not in cfg:
+            # SELF-DESCRIBING, because this has now failed twice for reasons that were not
+            # visible from the message. Prints inside a Kit process are unreliable (Kit
+            # captures stdout during startup), but an exception's text always reaches the log.
+            import hashlib                                                  # noqa: PLC0415
+
+            try:
+                h = hashlib.md5(open(checkpoint, "rb").read(1 << 20)).hexdigest()[:8]
+                size = os.path.getsize(checkpoint)
+            except Exception as exc:                                        # noqa: BLE001
+                h, size = f"<{exc}>", -1
             raise KeyError(
-                "cannot determine K: the checkpoint has no `distribution.log_knot_scale` and "
-                "the run's agent.yaml gave nothing. Pass --adjuster_num_knots.")
+                "cannot determine K. "
+                f"checkpoint={checkpoint!r} exists={os.path.isfile(checkpoint)} "
+                f"size={size} md5_1mb={h} | payload keys={sorted(payload)} | "
+                f"state type={type(state).__name__} n={len(state)} "
+                f"first={list(state)[:6]} | "
+                f"distribution keys={[k for k in state if 'distribution' in k]} | "
+                f"yaml gave={sorted(actor_cfg_from_run(checkpoint))}")
         self._k = int(cfg["num_knots"])
         kind = str(cfg.get("knot_kind", "catmull"))
 
