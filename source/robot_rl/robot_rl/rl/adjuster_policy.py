@@ -62,12 +62,17 @@ def residual_from_action(action: torch.Tensor, knot_lift: torch.Tensor,
 def actor_cfg_from_checkpoint(state: dict, cmd) -> dict:
     """The SHAPE-CRITICAL actor config, derived from the checkpoint's own tensors.
 
-    The authoritative source, and the reason this exists rather than trusting the run's yaml:
-    ``params/agent.yaml`` parsed correctly standalone and came back WITHOUT ``num_knots`` inside
-    a running Kit process, deterministically, on the same file (`KeyError: 'num_knots'`, all
-    five eval cells). Whatever Omniverse does to the import environment, the checkpoint's own
-    tensors cannot be shadowed by it -- ``distribution.log_knot_scale`` IS ``[K]`` and
-    ``distribution.log_group_scale`` IS ``[G]``.
+    The authoritative source: ``distribution.log_knot_scale`` IS ``[K]`` and
+    ``distribution.log_group_scale`` IS ``[G]``, in the very file being loaded, so this cannot
+    disagree with the weights the way a sidecar config can.
+
+    **It was introduced on a WRONG diagnosis and kept on a right one.** The failure that
+    prompted it -- ``params/agent.yaml`` yielding no ``num_knots`` -- was blamed on Omniverse
+    shadowing ``yaml`` inside a Kit process. That was false. A launcher had silently passed the
+    frozen TRACKER's checkpoint as the adjuster (a ``CKPT`` name collision), so the yaml being
+    read was the tracker's, which legitimately has no ``num_knots``. Deriving the shape from
+    the checkpoint is still the better design -- one file, no sidecar to desynchronise -- but
+    it is not a workaround for anything, and nothing here is defending against Omniverse.
 
     Only the two fields that decide the parameter SET are taken here. Everything else is either
     inert or caught: the caller's ``load_state_dict`` check refuses any mismatch, so a wrong
@@ -99,10 +104,9 @@ def actor_cfg_from_run(checkpoint: str) -> dict:
     """The actor config the run was trained with, BEST EFFORT, from ``params/agent.yaml``.
 
     Supplies the fields the checkpoint's tensors cannot show -- ``num_frozen_layers``,
-    ``activation``, the observation group names. Best effort on purpose: this file has been
-    observed to parse incompletely inside a running Kit process, so a failure here warns and
-    returns what it has rather than killing the eval. Everything it could get wrong is verified
-    by the caller's ``load_state_dict`` check.
+    ``activation``, the observation group names. Best effort: a failure warns and returns what
+    it has rather than killing the eval, because everything it could get wrong is verified by
+    the caller's ``load_state_dict`` check, which refuses any missing or unexpected key.
 
     Args:
         checkpoint: Path to ``<run>/model_*.pt``.
@@ -186,6 +190,15 @@ class AdjusterPolicy:
         # yaml first for the descriptive fields, then the CHECKPOINT over the top for the two
         # that decide the parameter set. The checkpoint wins because it is the thing being
         # loaded: if the two ever disagree, the yaml is the one that is wrong.
+        # IS THIS EVEN AN ADJUSTER? A tracker checkpoint loads without complaint this far --
+        # it is a `model_*.pt` with an `actor_state_dict` too -- and every symptom downstream
+        # then reads as a config problem rather than as the wrong file. That mistake cost three
+        # debugging rounds and a wrong diagnosis, so it is now named at the point of entry.
+        if not any(k.startswith("token_in") or k.startswith("tuned_layers") for k in state):
+            raise KeyError(
+                f"{checkpoint} is not an adjuster checkpoint: its actor has no `token_in` or "
+                f"`tuned_layers` (it holds {list(state)[:5]}...). A frozen TRACKER checkpoint "
+                "looks like this. Check what the launcher passed as --adjuster_checkpoint.")
         cfg = actor_cfg_from_run(checkpoint)
         cfg.update(actor_cfg_from_checkpoint(state, cmd))
         if num_knots is not None:
