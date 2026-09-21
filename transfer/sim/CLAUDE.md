@@ -159,3 +159,68 @@ Deployed pair, tile 6 = stairs_up 5 risers +0.850 m, tile 20 = stairs_down 7 ste
   with `failed()` as its predicate half. `gen_tracker_metrics.py` records `verdict_source` (which
   answer was used) beside `failure_reason` (what the runner saw) -- the `fell` column was once
   written BEFORE the fall check, so every fall read as a survival.
+
+# Named videos for the paper / talk / website
+
+`record_videos.py` + `video_render.py`. Every clip has a NAME in a registry (`SHOTS`), so it can
+be asked for again and regenerated; `--stage list` prints them, `logs/video/INDEX.md` is written
+from the manifests each run.
+
+- **Two stages, and the split is load-bearing.** `roll` runs the policy and writes
+  `logs/video/<shot>/trace.npz` (poses + the `vel_tracking_sweep.TraceRecorder` columns); `render`
+  turns a trace into an mp4. The look WILL be re-tuned, and re-tuning it must not re-run the
+  policy, or each pass shows a different episode and a parent/fine-tune pair stops being a pair.
+- **A probe shot is verified against `mode_probe`'s own table** -- verdict, failure code, step
+  count and furthest x -- and REFUSES to write if it does not reproduce. That is what lets a clip
+  be quoted with its blind human mode label out of `labels.json`.
+- **Rendering never touches physics**: a second copy of the scene is loaded and restyled. Themes
+  replace the shared `<visual>`+`<asset>` block (and raise if a scene does not carry it); geom
+  colours, lighting and wall transparency are `mjModel` edits after load.
+- **Walls are found geometrically, not by name.** On `varied_updown` tiles 13 and 23 the stairwell
+  walls are `tile_slab11` / `tile_slab12` -- solid, 1.77 m, both sides of a 1.75 m corridor, and
+  they hide the robot completely. On the entry-stairs tile nine of them come out named
+  `tile_step*`. `wall_geoms` takes tall + thin + world-fixed + **at least 8x longer than thick**;
+  `--wall_alpha` fades them.
+  - **The aspect test is not optional.** Tall + thin alone also caught the UPPER TREADS of
+    terrain_scene's 20-riser `tall` flight -- a 0.32 m tread is thin, and past riser 8 it is over
+    1.10 m up -- and rendered the top half of the staircase see-through. A tread is 4.8x longer
+    than thick; the walls it has to be told apart from are 26-53x.
+- `LANES` also carries the playground's own staircases (`terrain_scene_tall_stairs_up` /
+  `_over`). `_scene_lane_geoms` COPIES each geom's attributes, so a lane whose walls are
+  visual-only in the playground stays visual-only here; only the name, the lateral position and
+  optionally the lateral extent are rewritten. `--lane_spacing` is REFUSED on a staircase: a
+  flight is its rise and run, and respacing the treads would author a different one.
+- The velocity panel's shaded bands are read off the COMPILED MODEL's geometry, so the band and the
+  terrain on screen cannot disagree. `--span_pad` widens them, and anything above 0 is a
+  readability choice rather than a measurement.
+- **The pelvis velocity swings ~1 m/s inside one stride**, so the panel's heavy line is a 0.4 s
+  mean by default (`--vel_smooth`) with the raw line still drawn thin underneath.
+- **Both stages want `env_isaaclab`.** `render` needs no onnxruntime but does need `imageio` +
+  `imageio-ffmpeg`, and `transfer/requirements.txt` carries neither on purpose -- `env_transfer`
+  is sized for a Jetson.
+- **The AUTHORED scenes cap the render at 1920x1080** -- `<global offwidth/offheight>` is the
+  offscreen framebuffer, not a hint, and `render_trace` refuses a larger frame. Every theme raises
+  it to 3840x2160, so `--width 2560 --height 1440` and up work. The first cut went out at 720p and
+  read as soft; 8x multisampling and CRF 5 were already on, so size was the whole story.
+- The panel's dpi scales with the frame (`100 * width / 1280`). Font sizes are in POINTS, so they
+  follow dpi on their own; the subplot margins are not, and are written as a dpi-100 pixel count
+  times that scale. Without it, doubling the frame halved the axis labels' share of it.
+
+## What the four-box lane measured, and why it is not terrain_scene's geometry
+
+The lane is read out of `g1_perceptive_terrain_scene.xml` (heights 0.25 / 0.40 / 0.55 / 0.70 m),
+not restated. Two things about it had to be changed, and both are properties of the RECORDING:
+
+- **Nothing in this stack keeps a lane**, so a held forward command drifts sideways. Unsteered, the
+  first roll was 5.0 m off centre by x=11 m and walked PAST two boxes on the floor. At
+  `steer_kp=1.0` and terrain_scene's own 2.59 m width, **0 of 40 draws climbed all four** -- 24
+  walked past one -- with peak lateral excursion to 3.4 m against a 1.30 m box half-width. Slowing
+  to 1.0 m/s made it worse (the drift has longer to build) and `steer_kp=1.5` did not help either.
+  Widening the boxes laterally removes the lane-keeping failure and changes the climb not at all.
+- **At 3 m spacing the pair never recovers the command between boxes**: mean achieved 0.77 m/s of a
+  commanded 1.5, and 0.89 even off a feature, while the same pair holds 1.40-1.45 m/s on open flat.
+  So "the command is tracked except across a traversal" has nowhere to show at that spacing; at
+  6 m it reads straight off the panel -- **1.40 off a feature against 0.48 over one**.
+- The heading controller is not free: at `steer_kp=1.0` its yaw command SATURATES at `steer_wz_max`
+  for most of the run and the mean forward speed falls to 0.54 m/s. A lane clip trades lateral
+  drift against forward speed and the trade is steep.
