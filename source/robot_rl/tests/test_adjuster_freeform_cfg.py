@@ -234,3 +234,48 @@ def test_steering_is_the_commands_not_the_adjusters(cfgs) -> None:
     a, b = cfgs
     assert a.steer_kp == 0.0
     assert a.commands.traj_ref.freeform_steer_kp == b.commands.traj_ref.freeform_steer_kp > 0.0
+
+
+# ==============================================================================================
+# The PLAY variant: watchable, and behaviourally the trained task
+# ==============================================================================================
+def test_play_differs_from_training_only_in_what_is_WATCHED() -> None:
+    """A play cfg that quietly changed the task would show something that was never scored.
+
+    So the allowed differences are enumerated: fewer envs on one terrain row, the randomisation
+    off, and three debug draws. Everything that decides BEHAVIOUR -- the command, the
+    terminations, the frozen pair's settings, the speed band -- must be the training task's.
+    """
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_adjuster_env_cfg import (
+        G1AdjusterFreeformEnvCfgPlay,
+    )
+
+    play, train = G1AdjusterFreeformEnvCfgPlay(), G1AdjusterFreeformEnvCfg()
+
+    assert play.scene.num_envs < train.scene.num_envs
+    assert play.scene.terrain.num_rows == 1
+    for group in ("policy", "reference"):
+        assert getattr(play.observations, group).enable_corruption is False
+    assert play.commands.traj_ref.debug_vis is True
+    assert play.scene.terrain_rays.debug_vis is True
+    assert play.scene.terrain_base_patch.debug_vis is True
+
+    # Decoration STAYS ON, unlike the clip-terrain play cfg. The generator was fitted on
+    # decorated scenes and misreads a bare vertical surface as a box, so watching it without
+    # decoration is watching a different input distribution.
+    assert play.scene.terrain.render_decor is True
+
+    # ...and nothing behavioural moved.
+    assert play.episode_length_s == train.episode_length_s
+    assert play.progress_gamma == train.progress_gamma
+    assert play.num_knots == train.num_knots
+    assert play.steer_kp == train.steer_kp
+    for f in ("history_from", "freeform_command", "tracking_mode", "freeform_speed_min",
+              "freeform_speed_max", "fm_update_every", "fm_perturb_fraction"):
+        assert getattr(play.commands.traj_ref, f) == getattr(train.commands.traj_ref, f), f
+    ta, tb = vars(play.terminations), vars(train.terminations)
+    assert set(ta) == set(tb)
+    for k in ta:
+        assert (ta[k] is None) == (tb[k] is None), k
+        if ta[k] is not None:
+            assert ta[k].func is tb[k].func and ta[k].time_out == tb[k].time_out, k

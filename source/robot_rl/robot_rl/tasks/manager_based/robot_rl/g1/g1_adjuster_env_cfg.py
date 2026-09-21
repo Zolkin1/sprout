@@ -909,3 +909,34 @@ class G1AdjusterFreeformEnvCfg(G1FinetuneFreeformEnvCfg, AdjusterEnvCfg):
             "step_scale": 1.0 / (FREEFORM_EPISODE_LENGTH_S / CONTROL_DT),
             "offset_scale": FREEFORM_GOAL_OFFSET_SCALE,
         }
+
+
+@configclass
+class G1AdjusterFreeformEnvCfgPlay(G1AdjusterFreeformEnvCfg):
+    """Watch the free-form adjuster: few envs, the plan DRAWN, the randomisation off.
+
+    Everything that decides BEHAVIOUR is inherited unchanged -- the reward set is irrelevant
+    here, but the command, the terminations, the speed band and both frozen networks are the
+    ones the policy was trained under, so what is on screen is what was scored.
+
+    ``render_decor`` STAYS ON, unlike the clip-terrain play cfg which turns it off for speed.
+    The generator was fitted on decorated scenes and misreads a bare vertical surface as a box,
+    so watching it without decoration is watching a different input distribution.
+    """
+
+    def __post_init__(self) -> None:
+        """Compose the training task, then make it watchable."""
+        super().__post_init__()
+        self.scene.num_envs = 4
+        # On the TERRAIN, not the scene: the scene cfg treats an unknown attribute as an asset
+        # and refuses it by name. One replica row, so each tile of the library appears once.
+        self.scene.terrain.num_rows = 1
+        # DR off: the point is to see what the policy does, not what a disturbance did. The
+        # tracker's observation corruption goes with it -- on a 4-env view a noise draw is a
+        # confound you cannot average out.
+        for group in ("policy", "reference"):
+            getattr(self.observations, group).enable_corruption = False
+        # The generator's served plan, the goal band, and the two privileged terrain sensors.
+        self.commands.traj_ref.debug_vis = True
+        self.scene.terrain_rays.debug_vis = True
+        self.scene.terrain_base_patch.debug_vis = True

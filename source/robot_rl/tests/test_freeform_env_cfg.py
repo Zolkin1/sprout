@@ -110,6 +110,9 @@ _FREEFORM_COMMAND_TASKS: tuple[str, ...] = (
     # policy bolted on, so it inherits this exactly as it inherits the terminations.
     # `test_adjuster_freeform_cfg.py` pins the whole match.
     "G1-adjuster-ft-freeform",
+    # ...and its play variant, which changes only the env count, the DR and the debug
+    # draws. `test_adjuster_freeform_play_cfg` pins that it changes nothing else.
+    "G1-adjuster-ft-freeform-play",
 )
 
 

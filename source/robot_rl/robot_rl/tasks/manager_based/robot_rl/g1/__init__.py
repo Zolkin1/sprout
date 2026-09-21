@@ -384,4 +384,20 @@ if not _registered:
         },
     )
 
+    # Watch the PPO arm. `play.py` picks the interval-stepping wrapper off the env's
+    # `replan_period`, so the same script drives it as drives every other task.
+    gym.register(
+        id="G1-adjuster-ft-freeform-play",
+        entry_point=f"{envs.__name__}.adjuster_env:AdjusterEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": (
+                f"{__name__}.g1_adjuster_env_cfg:G1AdjusterFreeformEnvCfgPlay"
+            ),
+            "rsl_rl_cfg_entry_point": (
+                f"{agents.__name__}.rsl_rl_ppo_cfg:AdjusterFreeformPlayPPORunnerCfg"
+            ),
+        },
+    )
+
     _registered = True

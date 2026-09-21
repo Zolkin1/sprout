@@ -585,6 +585,18 @@ class AdjusterFreeformPPORunnerCfg(AdjusterPPORunnerCfg):
 
 
 @configclass
+class AdjusterFreeformPlayPPORunnerCfg(AdjusterFreeformPPORunnerCfg):
+    """Watch the free-form adjuster. Same actor, no critic restored.
+
+    ``play.py`` never evaluates the value function, so skipping the critic load lets a
+    checkpoint drive the robot even if the critic group later moves. The actor is still loaded
+    STRICTLY, so a genuine policy mismatch fails loudly rather than driving a fresh network.
+    """
+
+    load_critic = False
+
+
+@configclass
 class AdjusterPlayPPORunnerCfg(AdjusterPPORunnerCfg):
     """Watch an adjuster checkpoint. Same actor, no critic restored.
 

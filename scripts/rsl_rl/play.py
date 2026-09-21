@@ -639,6 +639,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # parameters in its metadata -- see export_tracker_onnx.py below.
         export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
 
+        # Whether `policy.pt` was actually written. The ONNX export reads it, so a policy that
+        # legitimately refuses to export must switch both off together.
+        exported_jit = True
         if version.parse(installed_version) >= version.parse("4.0.0"):
             # use the new export functions for rsl-rl >= 4.0.0
             try:
@@ -649,6 +652,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 # alone) would emit a graph that is not the policy. Exporting is a side effect
                 # of playing, not its purpose, so watching one must not require it.
                 print(f"[INFO] Skipping the policy export: {exc}")
+                # ...and therefore the ONNX export too. It reads the `policy.pt` that was
+                # never written, so leaving it on turns a refusal into a confusing
+                # `ValueError: filename ... does not exist` from inside torch.jit, AFTER the
+                # policy has loaded and the scene has been built.
+                exported_jit = False
             policy_nn = None  # Not needed for rsl-rl >= 4.0.0
         else:
             # extract the neural network for rsl-rl < 4.0.0
@@ -731,7 +739,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # left a run directory that looks complete but holds a stale fm.onnx (or none) --
         # which is then what gets benchmarked, sim2sim'd, and uploaded to the robot. A
         # broken export is a broken export; fail here where it is one line to read.
-        if not args_cli.no_deploy_onnx:
+        if not args_cli.no_deploy_onnx and exported_jit:
             export_tracker_onnx(export_model_dir)
             _trk = os.path.join(export_model_dir, "tracker.onnx")
             print(f"[INFO] wrote {_trk} ({os.path.getsize(_trk) / 1e6:.1f} MB)")
