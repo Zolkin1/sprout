@@ -41,8 +41,10 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import hashlib
 import json
+import math
 import os
 import sys
 import time
@@ -61,6 +63,7 @@ for _d in (_HERE, os.path.join(_REPO, "source", "motion_gen")):
         sys.path.insert(0, _d)
 
 import video_render as vr                                              # noqa: E402
+import experiments.velocity_commands as vc                             # noqa: E402
 from mjeval import terrains                                            # noqa: E402
 
 #: Where the shots go.
@@ -91,6 +94,13 @@ class Shot:
             widened and what it does and does not change.
         lane_spacing: Distance between a lane shot's feature centres (m); 0 keeps the source
             scene's own.
+        lane_lookahead: Aim distance for :func:`centreline_steer` (m); 0 takes
+            :data:`LANE_LOOKAHEAD_M`.
+        cmd_profile: Name of a ``experiments.velocity_commands`` profile to drive a LANE shot
+            with, instead of a held constant.  It supplies its own yaw, so it overrides
+            ``steer_kp``.
+        follow_yaw: Rotate the camera with the robot's heading; see
+            :attr:`video_render.RenderSpec.follow_yaw`.
         steer_kp: Heading-controller gain for a LANE shot (1/s); a probe shot takes the
             probe's own, which is stamped in its manifest.  Unsteered, a held forward command
             on an open lane drifts: the first roll of ``four_box_sweep`` was 5.0 m off centre
@@ -123,6 +133,9 @@ class Shot:
     steer_kp: float = 0.0
     lane_width: float = 0.0
     lane_spacing: float = 0.0
+    lane_lookahead: float = 0.0
+    cmd_profile: str = ""
+    follow_yaw: bool = False
     tracker_onnx: str = ""
     fm_onnx: str = ""
     camera: str = "quarter"
@@ -213,12 +226,15 @@ SHOTS: tuple[Shot, ...] = (
          fm_onnx=f"{_CKPT}/ft_multi_lag_i5_fm.onnx",
          camera="quarter", vel_plot="bottom", vel_channels=("vx",)),
     Shot("four_box_sweep_steered",
-         "The same four-box ladder with the heading controller ON (steer_kp 1.0, what the "
-         "free-form fine-tune task itself runs), so the robot holds the lane instead of "
-         "drifting off it. 10 of 12 draws climb all four at a 6 m lateral width. The trade "
-         "is steep and the panel shows it: steering costs most of the forward speed.",
+         "The same four-box ladder with a CENTRELINE controller on (centreline_steer, "
+         "kp 1.0): pure pursuit at a 3 m aim point on the lane, so it is steered back to the "
+         "middle while always pointed downrange. mjeval's own steer_yaw_rate aims at the "
+         "goal POINT instead, which crabs across the lane and then turns the robot around "
+         "past the goal -- that is what the first cut of this clip showed. Still needs the "
+         "6 m width: the residual drift is the pair sliding sideways over a box, which a "
+         "yaw command cannot fix.",
          "lane", lane="terrain_scene_boxes", speed=1.5, steer_kp=1.0, lane_width=6.0,
-         seed=0, stop_x_pad=4.0,
+         seed=1, stop_x_pad=4.0,
          tracker_onnx=f"{_CKPT}/exported/tracker.onnx",
          fm_onnx=f"{_CKPT}/ft_multi_lag_i5_fm.onnx",
          camera="quarter", vel_plot="bottom", vel_channels=("vx", "wz")),
@@ -228,15 +244,31 @@ SHOTS: tuple[Shot, ...] = (
          "terrain_scene's LONG staircase: 20 risers to +2.79 m at 0.14 rise / 0.32 run, one "
          "held forward command at 1.0 m/s, cut at the top platform. Draw 4 -- 6 of 10 draws "
          "climbed the whole flight, and 4 is the one that stayed most nearly on the "
-         "centreline of a 1.52 m-wide flight.",
+         "centreline of a 1.52 m-wide flight. The playground's DESCENT is not emitted at "
+         "all (part='up'), so the top platform is the end of the world and the footage is "
+         "cut 0.4 m short of its far face.",
          "lane", lane="terrain_scene_tall_stairs_up", speed=1.0, steer_kp=0.0,
-         seed=4, stop_x_pad=1.2,
+         seed=4, stop_x_pad=0.6,
          tracker_onnx=f"{_CKPT}/exported/tracker.onnx",
          fm_onnx=f"{_CKPT}/ft_multi_lag_i5_fm.onnx",
          # Side-on and well back: a 20-riser flight is 6.4 m long and 2.8 m tall, and the
          # three-quarter preset frames about five treads of it.
          camera="side", cam_distance=7.5, cam_elevation=-6.0, cam_height=0.6,
          vel_plot="off"),
+    Shot("flat_locomotion",
+         "Flat-ground locomotion in one take: stand, side-step +y then -y (pure lateral, no "
+         "forward, no yaw), break into a 2.20 m/s RUN while turning at 0.55 rad/s, settle to "
+         "a 0.80 m/s walk, stop. The scripted profile is "
+         "`velocity_commands.flat_locomotion_demo` and every value sits inside the training "
+         "library's own FLAT command envelope (vx [-1.00, 2.50], vy [-0.59, 0.60], wz "
+         "[-0.79, 0.78] over its 3000 flat clips). The camera follows the heading, so the "
+         "turn does not swing the robot out of frame.",
+         "lane", lane="flat", speed=2.2, cmd_profile="flat_locomotion_demo",
+         seed=0, stop_x_pad=None,
+         tracker_onnx=f"{_CKPT}/exported/tracker.onnx",
+         fm_onnx=f"{_CKPT}/ft_multi_lag_i5_fm.onnx",
+         camera="quarter", cam_distance=4.2, cam_height=0.45, follow_yaw=True,
+         vel_plot="both", vel_channels=("vx", "vy", "wz")),
     Shot("entry_stairs_down",
          "Descending the measured building entrance (entry_stairs_down, tile 45): off the "
          "raised clearing, through the narrowing doorway, down both flights. Chosen for a "
@@ -411,7 +443,8 @@ def _scene_lane_geoms(prefix: str, width: float = 0.0) -> tuple[list[str], list[
 
 
 def terrain_scene_stairs(speed: float, name: str, width: float = 0.0, spacing: float = 0.0, *,
-                         lane: str = "tall", goal: str = "platform") -> terrains.Course:
+                         lane: str = "tall", goal: str = "platform",
+                         part: str = "all") -> terrains.Course:
     """One staircase lane of ``terrain_scene``, as an mjeval course.
 
     The playground's five flights are the in-distribution geometry this stack is benchmarked
@@ -419,10 +452,10 @@ def terrain_scene_stairs(speed: float, name: str, width: float = 0.0, spacing: f
     is lifted out of the committed scene by :func:`_scene_lane_geoms`, so the treads here and
     the treads a joystick run sees are the same objects.
 
-    **The whole lane is emitted even for an ``up`` shot.**  Dropping the descent would leave
-    the top platform a cliff and the episode would walk off it; keeping it and putting the
-    GOAL on the platform means the footage is cut at the top (``stop_x_pad``) while the robot
-    is still standing on ground the scene actually has.
+    ``part="up"`` emits the ASCENT ONLY -- treads and platform, nothing past the platform's
+    far face.  The top is then a cliff and the episode ends by walking off it, so a shot that
+    does this has to cut the footage BEFORE the far edge (``stop_x_pad`` against a goal on the
+    platform); ``part="all"`` keeps the descent and has no such constraint.
 
     Args:
         speed: Commanded forward speed (m/s); sets the time budget.
@@ -433,6 +466,8 @@ def terrain_scene_stairs(speed: float, name: str, width: float = 0.0, spacing: f
         lane: Which flight; see :func:`_scene_lane_geoms`.
         goal: ``"platform"`` puts the goal on the top platform (the ascent); ``"end"`` puts it
             2.5 m past the last geom (the whole up-and-over).
+        part: ``"all"`` emits the flight as the playground has it, up and back down;
+            ``"up"`` drops everything past the top platform's far face.
 
     Returns:
         The course.
@@ -446,12 +481,26 @@ def terrain_scene_stairs(speed: float, name: str, width: float = 0.0, spacing: f
                          "staircase rather than record this one.")
     if goal not in ("platform", "end"):
         raise ValueError(f"goal must be 'platform' or 'end', got {goal!r}")
+    if part not in ("all", "up"):
+        raise ValueError(f"part must be 'all' or 'up', got {part!r}")
     lines, meta = _scene_lane_geoms(lane, width)
     solid = [g for g in meta if g["solid"]]
     steps = [g for g in solid if "_step" in g["name"]]
     plat = next((g for g in solid if g["name"].endswith("_platform")), None)
     if not steps or plat is None:
         raise ValueError(f"lane {lane!r} has no '_step'/'_platform' geoms to aim at")
+    if part == "up":
+        # Compared on the CENTRE, not the near face. The first descending tread's near face
+        # is 10.8499 m against the platform's far face of 10.8500 -- the scene rounds its
+        # pos and size to 4 dp -- so a near-face test kept it by a tenth of a millimetre and
+        # left one step of the descent standing past the platform. A descending tread's
+        # CENTRE is always beyond that face, by half its own run.
+        far = float(plat["pos"][0] + plat["size"][0])
+        keep = [n for n, g in enumerate(meta) if g["pos"][0] <= far + 1e-6]
+        lines = [lines[n] for n in keep]
+        meta = [meta[n] for n in keep]
+        solid = [g for g in meta if g["solid"]]
+        steps = [g for g in solid if "_step" in g["name"]]
     first_face = min(g["pos"][0] - g["size"][0] for g in steps)
     top = max(g["pos"][2] + g["size"][2] for g in solid)
     if goal == "platform":
@@ -479,12 +528,49 @@ def terrain_scene_stairs(speed: float, name: str, width: float = 0.0, spacing: f
     )
 
 
-def _stairs_lane(lane: str, goal: str):
+def flat_lane(speed: float, name: str, width: float = 0.0,
+              spacing: float = 0.0) -> terrains.Course:
+    """Bare level ground: the infinite plane and nothing else.
+
+    A Course with no geoms at all.  Everything else in :data:`LANES` exists to put a feature
+    in front of the robot; this one exists so a SCRIPTED command profile has somewhere to run
+    where nothing but the command is changing.
+
+    ``obstacle_x_m`` is parked past the goal, so every scored step counts as approach and the
+    velocity summary has no on-feature half to report -- which is correct here: there is no
+    feature.  ``flight_height_m`` is 0, which disables the traversal gate for the same reason.
+
+    Args:
+        speed: Nominal speed (m/s); only sets the time budget, since a profile states its own.
+        name: Scene name for the emitted XML.
+        width / spacing: Meaningless without features; refused rather than ignored.
+
+    Returns:
+        The course.
+
+    Raises:
+        ValueError: If ``width`` or ``spacing`` is given.
+    """
+    if width or spacing:
+        raise ValueError("flat_lane has no features, so --lane_width / --lane_spacing have "
+                         "nothing to act on; they are refused rather than silently dropped.")
+    reach = 60.0
+    return terrains.Course(
+        name=name, klass="box", variant=0, geoms=(), floor_z=0.0,
+        target_xy=(reach, 0.0), course_length_m=reach, flight_height_m=0.0,
+        obstacle_x_m=reach + 10.0, speeds=(float(speed),),
+        note="bare level ground for a scripted command profile; no features at all",
+        params={"kind": "flat"},
+        budget_s_override=float(terrains.CMD_HOLD_S + vc.DEMO_DURATION_S + 2.0))
+
+
+def _stairs_lane(lane: str, goal: str, part: str = "all"):
     """A :data:`LANES` builder bound to one flight of the playground.
 
     Args:
         lane: Lane prefix in ``terrain_scene``.
         goal: ``"platform"`` or ``"end"``; see :func:`terrain_scene_stairs`.
+        part: ``"all"`` or ``"up"``; see :func:`terrain_scene_stairs`.
 
     Returns:
         A ``(speed, name, width, spacing) -> Course`` callable.
@@ -492,21 +578,69 @@ def _stairs_lane(lane: str, goal: str):
     def build(speed: float, name: str, width: float = 0.0,
               spacing: float = 0.0) -> terrains.Course:
         """Build this flight's course."""
-        return terrain_scene_stairs(speed, name, width, spacing, lane=lane, goal=goal)
+        return terrain_scene_stairs(speed, name, width, spacing, lane=lane, goal=goal,
+                                    part=part)
     return build
 
 
 #: Lane builders, by name: ``(speed, scene_name, width, spacing) -> Course``.
 LANES = {
     "terrain_scene_boxes": terrain_scene_boxes,
-    "terrain_scene_tall_stairs_up": _stairs_lane("tall", "platform"),
+    "terrain_scene_tall_stairs_up": _stairs_lane("tall", "platform", part="up"),
     "terrain_scene_tall_stairs_over": _stairs_lane("tall", "end"),
+    "flat": flat_lane,
 }
 
 
 # =============================================================================================
 # Rolling
 # =============================================================================================
+
+#: Look-ahead for :func:`centreline_steer`, in metres.  Long enough that the yaw command is
+#: gentle at a realistic lateral error (1 m off centre asks for 18 deg, i.e. 0.32 rad/s at
+#: kp=1) and short enough that the correction actually happens inside the lane rather than
+#: over its whole length.
+LANE_LOOKAHEAD_M: float = 3.0
+
+
+def centreline_steer(course, x: float, y: float, yaw: float, kp: float,
+                     wz_max: float, lookahead: float = 0.0) -> float:
+    """Pure pursuit onto the lane centreline -- steer straight, never turn around.
+
+    Drop-in for :func:`mjeval.runner.steer_yaw_rate`, which this replaces on LANE shots.
+    That one aims at ``target_xy``, a fixed POINT, and a point is the wrong thing to aim at
+    on a lane in two ways:
+
+    * off-centre and still short of the goal, the bearing points diagonally across the lane,
+      so the robot crabs toward the goal instead of easing back onto the centreline; and
+    * **past the goal the bearing points BACKWARD** and it commands a hard turn to go back --
+      measured on the four-box lane at ``kp=1.0``, yaw 70 deg at x=18.1 m and 140 deg two
+      seconds later with x decreasing.  ``steer_yaw_rate`` returns 0 inside the goal BAND,
+      which hides this until the root leaves the band's far edge.
+
+    Aiming instead at the point :data:`LANE_LOOKAHEAD_M` ahead of the ROBOT on the centreline
+    makes the commanded heading a function of lateral error alone, bounded by +-90 deg and
+    zero when centred, so the robot is always pointed downrange.
+
+    Args:
+        course: The course; only its lane centreline ``target_xy[1]`` is read.
+        x: Root world x (m).  Unused -- the aim point is relative to the robot -- and kept so
+            the signature matches the law this substitutes for.
+        y: Root world y (m).
+        yaw: Root heading (rad).
+        kp: Proportional gain (1/s).
+        wz_max: Symmetric clip on the output (rad/s).
+        lookahead: Aim distance (m); ``0`` takes :data:`LANE_LOOKAHEAD_M`.  Shorter corrects
+            harder for the same lateral error and will eventually weave.
+
+    Returns:
+        The commanded yaw rate (rad/s).
+    """
+    bearing = math.atan2(float(course.target_xy[1]) - y,
+                         float(lookahead) if lookahead > 0 else LANE_LOOKAHEAD_M)
+    err = math.atan2(math.sin(bearing - yaw), math.cos(bearing - yaw))
+    return float(np.clip(kp * err, -wz_max, wz_max))
+
 
 def _sha256(path: str) -> str:
     """First 8 hex digits of a file's sha256, for the manifest."""
@@ -579,6 +713,9 @@ class _Loaded:
     tracker: str
     fm: str
     provenance: dict
+    kind: str
+    lookahead: float
+    cmd_fn: object
 
 
 def _load_shot(shot: Shot, args) -> _Loaded:
@@ -640,10 +777,21 @@ def _load_shot(shot: Shot, args) -> _Loaded:
         # zero_noise False + a per-trial RNG is exactly what mode_probe rolled under, and it
         # is what makes "the same seed in both arms" a thing that can be said at all.
         steer_kp=steer_kp, zero_noise=False, fm_seed=0)
+    cmd_fn = None
+    if shot.cmd_profile:
+        if shot.kind != "lane":
+            raise SystemExit(f"shot {shot.name!r}: --cmd_profile is for lane shots; a probe "
+                             "shot must drive what the probe drove or it will not reproduce.")
+        cmd_fn = getattr(vc, shot.cmd_profile, None)
+        if not callable(cmd_fn):
+            raise SystemExit(f"shot {shot.name!r}: experiments.velocity_commands has no "
+                             f"profile {shot.cmd_profile!r}")
+        provenance["cmd_profile"] = shot.cmd_profile
     policy, fm_lag, spawn = mjrunner.load_arm(cfg)
     rig = mjrunner.CourseRig(course, policy, cfg, spawn)
     return _Loaded(policy, fm_lag, spawn, rig, cfg, course, speed, steer_kp, stop_on_goal,
-                   robot_name, tracker, fm, provenance)
+                   robot_name, tracker, fm, provenance, shot.kind,
+                   float(args.lane_lookahead or shot.lane_lookahead), cmd_fn)
 
 
 def _run_seed(ld: _Loaded, seed: int) -> tuple[str, str, np.ndarray, np.ndarray, np.ndarray]:
@@ -674,7 +822,12 @@ def _run_seed(ld: _Loaded, seed: int) -> tuple[str, str, np.ndarray, np.ndarray,
     cmd = np.array([ld.speed, 0.0, 0.0], dtype=np.float64)
     verdict, failure, _acc = mjrunner.run_episode(
         ld.rig, ld.policy, ld.fm_lag, ld.spawn, cmd, None, recorder=record, probe=trace,
-        steer_kp=ld.cfg.steer_kp, cfg_hold=ld.cfg.cmd_hold_s, stop_on_goal=ld.stop_on_goal)
+        steer_kp=ld.cfg.steer_kp, cfg_hold=ld.cfg.cmd_hold_s, stop_on_goal=ld.stop_on_goal,
+        # A PROBE shot re-rolls a trial mode_probe already ran, so it must use the law that
+        # probe ran under -- mjeval's own -- or it would not reproduce. A lane shot is ours.
+        cmd_fn=ld.cmd_fn,
+        steer_fn=(functools.partial(centreline_steer, lookahead=ld.lookahead)
+                  if ld.kind == "lane" and ld.cmd_fn is None else None))
     return (verdict, failure,
             np.array([f[1] for f in frames], dtype=np.float32),
             np.array([f[0] for f in frames], dtype=np.float32),
@@ -856,6 +1009,7 @@ def roll_shot(shot: Shot, args) -> dict:
         "roll": {"verdict": verdict, "failure": failure, "steps": int(q.shape[0]),
                  "max_x_m": max_x, "speed": ld.speed, "steer_kp": ld.steer_kp,
                  "stop_on_goal": ld.stop_on_goal, "seed": seed,
+                 "cmd_profile": shot.cmd_profile,
                  "max_abs_y_m": float(np.abs(q[:, 1]).max()) if q.size else 0.0,
                  "features": feature_climbs(ld.rig.robot.mj_model, q),
                  "velocity": velocity_summary(
@@ -964,8 +1118,15 @@ def render_shot(shot: Shot, args) -> list[str]:
             qpos, t = qpos[:k], t[:k]
             tr = tr[:k] if tr.size else tr
 
-    placements = (("bottom", "inset") if args.vel_plot == "both"
-                  else (args.vel_plot or shot.vel_plot,))
+    # Resolve WHICH placement first, then expand -- "both" has to mean the same thing whether
+    # it came from the flag or from the shot, and expanding only the flag rendered a shot that
+    # asked for both as a single file named for neither.
+    #
+    # "both" is CLEAN + ANNOTATED, the pair a talk actually needs -- one cut to play and one
+    # to explain it -- and they come from the same roll, so they cannot drift apart. `inset`
+    # stays selectable on its own; it was never the second half anyone wanted.
+    want = args.vel_plot or shot.vel_plot
+    placements = ("off", "bottom") if want == "both" else (want,)
     channels = tuple(c.strip() for c in args.vel_channels.split(",") if c.strip()) \
         if args.vel_channels else shot.vel_channels
     caption = ()
@@ -994,6 +1155,7 @@ def render_shot(shot: Shot, args) -> list[str]:
             geom_groups=tuple(int(g) for g in args.geom_groups.split(",") if g.strip()),
             vel_plot=place, vel_channels=channels,
             vel_smooth_s=float(args.vel_smooth), span_pad_m=float(args.span_pad),
+            follow_yaw=bool(shot.follow_yaw or args.follow_yaw),
             caption=caption,
             shadows=not args.no_shadows,
             hold_end_s=(shot.hold_end_s if args.hold_end_s is None else args.hold_end_s),
@@ -1141,6 +1303,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Distance between a LANE shot's feature centres (m); 0 keeps the "
                         "source scene's own. At terrain_scene's 3 m the pair never recovers "
                         "the command between boxes, so a velocity-tracking clip needs more.")
+    p.add_argument("--lane_lookahead", type=float, default=0.0,
+                   help="Aim distance for the LANE shots' centreline controller (m); 0 takes "
+                        "the module default. Shorter corrects harder and eventually weaves.")
     p.add_argument("--steer_kp", type=float, default=None,
                    help="Override a LANE shot's heading gain (1/s); 0 drives the raw "
                         "constant command and drifts off an open lane. Ignored by a probe "
@@ -1184,8 +1349,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "Below 1 they are see-through, which is the only way to watch a robot "
                         "inside a 1.75 m corridor from the side.")
     p.add_argument("--vel_plot", default="", choices=("", "off", "bottom", "inset", "both"),
-                   help="Commanded-vs-achieved velocity panel. 'both' writes one mp4 per "
-                        "placement, so the plotted and unplotted cuts stay in step.")
+                   help="Commanded-vs-achieved velocity panel. 'both' writes the clean "
+                        "cut AND the annotated one from the same roll, so a talk's play "
+                        "cut and its explain cut cannot drift apart.")
     p.add_argument("--vel_channels", default="",
                    help="Comma-separated subset of vx,vy,wz for the panel.")
     p.add_argument("--vel_smooth", type=float, default=0.4,
@@ -1200,6 +1366,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--geom_groups", default="1,2",
                    help="MuJoCo geom groups to draw: 1 is the robot's visual meshes and 2 "
                         "the terrain; 0 is the collision primitives.")
+    p.add_argument("--follow_yaw", action="store_true",
+                   help="Rotate the camera with the robot's heading, so the camera preset's "
+                        "azimuth is an offset from the robot rather than a world bearing. "
+                        "Needed on any clip with a turn in it.")
     p.add_argument("--no_shadows", action="store_true")
     p.add_argument("--hold_end_s", type=float, default=None,
                    help="Seconds of freeze on the last frame.")

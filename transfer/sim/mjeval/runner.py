@@ -625,7 +625,7 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
                 cfg_hold: float = terrains.CMD_HOLD_S,
                 probe=None, tracking_spec=None,
                 stop_on_violation: bool = True, stop_on_goal: bool = True,
-                episode_seed=None) -> tuple[str, str, Any]:
+                episode_seed=None, steer_fn=None, cmd_fn=None) -> tuple[str, str, Any]:
     """One deterministic trial: spawn, drive at ``cmd``, and stop on a fall, the target or time.
 
     **Three orderings inside the loop are load-bearing.**  The fall test runs BEFORE the target
@@ -679,6 +679,33 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             it -- see :func:`_reset_episode_state`, which explains why a SWEEP must pass it
             and a single-cell caller need not.  ``None`` resumes, which is the old behaviour
             and is invisible under ``zero_noise`` because nothing draws.
+        steer_fn: The steering law, with :func:`steer_yaw_rate`'s signature
+            ``(course, x, y, yaw, kp, wz_max) -> wz``.  ``None`` uses that function, so every
+            caller that does not pass one is unchanged and no measured number moves.
+
+            It exists because aiming at ``target_xy`` is a GOAL-SEEKING law, not a
+            lane-keeping one, and the two differ in ways a lane clip shows plainly: once the
+            root is laterally off, the bearing to a goal still metres downrange turns the
+            robot ACROSS the lane rather than easing it back onto the centreline, and past
+            the goal band the bearing flips and it turns around and walks back.  Measured on
+            the four-box lane at ``kp=1.0``: heading wandering +-20 deg the whole traverse,
+            then yaw 70 deg at x=18.1 and 140 deg two seconds later with x DECREASING.  A
+            pure-pursuit law aimed at a look-ahead point on the centreline has neither
+            failure, and is what ``record_videos.centreline_steer`` supplies.
+        cmd_fn: A SCRIPTED command, ``(t) -> (vx, vy, wz)``, with
+            ``experiments.velocity_commands``' signature.  ``None`` (the default) keeps the
+            held constant that every terrain clip in the training library was generated
+            under, which is the in-distribution way to drive at a piece of terrain and is
+            what every measurement here uses.  It overrides ``steer_kp`` -- a profile states
+            its own yaw rate -- and its ``t`` is measured from the END of the opening hold,
+            so a profile is authored from its own zero rather than from ``cfg_hold``.
+
+            For a DEMO of flat-ground locomotion, where the point is the transitions
+            themselves, a constant cannot say what is wanted.  A profile is off-distribution
+            on the stair families, where the library carries ``|wz| max = |vy| max = 0``
+            exactly; on FLAT (terrain code 0, 3000 clips) the trained envelope is
+            ``vx [-1.00, +2.50]``, ``vy [-0.59, +0.60]``, ``wz [-0.79, +0.78]`` and does vary
+            within a clip, so a profile inside that envelope is not.
 
     Returns:
         ``(verdict, failure_code, accumulator)``, the first two being
@@ -712,14 +739,18 @@ def run_episode(rig: CourseRig, policy: GenTrackerPolicy, fm_lag: FmDepthLag, sp
             holding = robot.mj_data.time < hold_until
             if holding:
                 live_cmd = _ZERO_CMD
+            elif cmd_fn is not None:
+                live_cmd = np.asarray(cmd_fn(robot.mj_data.time - hold_until),
+                                      dtype=np.float64).reshape(3)
             elif steer_kp > 0.0:
                 qw, qx, qy, qz = (float(v) for v in robot.mj_data.qpos[3:7])
                 yaw = math.atan2(2.0 * (qw * qz + qx * qy),
                                  1.0 - 2.0 * (qy * qy + qz * qz))
+                steer = steer_fn if steer_fn is not None else steer_yaw_rate
                 live_cmd = np.array([cmd[0], cmd[1],
-                                     steer_yaw_rate(course, float(robot.mj_data.qpos[0]),
-                                                    float(robot.mj_data.qpos[1]), yaw,
-                                                    steer_kp, steer_wz_max)])
+                                     steer(course, float(robot.mj_data.qpos[0]),
+                                           float(robot.mj_data.qpos[1]), yaw,
+                                           steer_kp, steer_wz_max)])
             else:
                 live_cmd = cmd
             state = build_state(robot, policy, live_cmd, rig.depth_cams, want_depth_hits=False,

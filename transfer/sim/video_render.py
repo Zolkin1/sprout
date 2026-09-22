@@ -774,6 +774,13 @@ class RenderSpec:
         shadows / reflections: Renderer flags.
         vel_smooth_s: Moving-average window for the panel's achieved line (s); 0 draws the
             raw per-step velocity alone.  See :class:`VelocityPanel`.
+        follow_yaw: Rotate the camera with the robot's heading, so ``camera``'s azimuth
+            becomes an offset FROM the robot rather than a world bearing.  A fixed azimuth is
+            right for a lane, where the robot goes one way; on a clip with a turn in it the
+            robot swings through the frame and ends up walking away from the camera.  The
+            heading is low-passed by ``follow_yaw_tau`` -- the raw yaw carries the gait's own
+            oscillation, which a camera locked to it would put into every frame.
+        follow_yaw_tau: Smoothing time constant for that rotation (s).
         span_pad_m: Widen every shaded feature span by this much at each end.  0 means a
             shaded interval is exactly "the root's x is over the feature"; anything larger is
             a readability choice and not a measurement, which is why it is 0 by default even
@@ -795,6 +802,8 @@ class RenderSpec:
     vel_plot: str = "off"
     vel_channels: tuple[str, ...] = ("vx",)
     vel_smooth_s: float = 0.0
+    follow_yaw: bool = False
+    follow_yaw_tau: float = 1.2
     span_pad_m: float = 0.0
     caption: tuple[str, ...] = ()
     shadows: bool = True
@@ -887,6 +896,7 @@ def render_trace(scene_xml: str, qpos: np.ndarray, time_s: np.ndarray, trace: np
     renderer.scene.flags[mujoco.mjtRndFlag.mjRND_REFLECTION] = int(bool(spec.reflections))
     writer = iio.get_writer(out_mp4, fps=spec.fps, codec="libx264", quality=9,
                             pixelformat="yuv420p", macro_block_size=1)
+    base_az, yaw_s = float(cam.azimuth), None
     try:
         prev_t = None
         for n, k in enumerate(frame_k):
@@ -895,6 +905,19 @@ def render_trace(scene_xml: str, qpos: np.ndarray, time_s: np.ndarray, trace: np
             step = (frame_t[n] - prev_t) if prev_t is not None else dt
             prev_t = frame_t[n]
             cam.lookat[:] = follow(qpos[k, :3], max(step, 1e-3))
+            if spec.follow_yaw:
+                w, qx, qy, qz = (float(v) for v in qpos[k, 3:7])
+                yaw = math.degrees(math.atan2(2.0 * (w * qz + qx * qy),
+                                              1.0 - 2.0 * (qy * qy + qz * qz)))
+                if yaw_s is None:
+                    yaw_s = yaw
+                else:
+                    # Unwrap against the filter state, or a pass through +-180 deg would spin
+                    # the camera the long way round in a single frame.
+                    yaw += 360.0 * round((yaw_s - yaw) / 360.0)
+                    a = 1.0 - math.exp(-max(step, 1e-3) / max(spec.follow_yaw_tau, 1e-3))
+                    yaw_s += a * (yaw - yaw_s)
+                cam.azimuth = base_az + yaw_s
             renderer.update_scene(data, camera=cam, scene_option=opt)
             frame = renderer.render()
             if spec.caption:
