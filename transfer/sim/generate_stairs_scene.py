@@ -592,15 +592,24 @@ def _parse_lane(spec: str, index: int) -> Lane:
 
 
 def _parse_box(spec: str, index: int) -> Box:
-    """Parse a ``height[:x][:y]`` box spec (metres)."""
+    """Parse a ``height[:x[:y[:depth[:width]]]]`` box spec (metres).
+
+    ``depth`` and ``width`` default to the trained box footprint. They are exposed because the
+    DEPTH is a second, independent way off the trained distribution and nothing warned about
+    it: at :data:`TRAINED_BOX_DEPTH` (0.46 m) the box is under one stride and the robot never
+    stands on top, so a deeper one is a climb-then-dismount rather than a step-over -- a
+    different MODE, not a harder instance of the same one.
+    """
     parts = spec.split(":")
     try:
         height = float(parts[0])
         x = float(parts[1]) if len(parts) > 1 else 3.0 + 3.0 * index
         y = float(parts[2]) if len(parts) > 2 else -6.5
+        depth = float(parts[3]) if len(parts) > 3 else TRAINED_BOX_DEPTH
+        width = float(parts[4]) if len(parts) > 4 else TRAINED_BOX_WIDTH
     except (ValueError, IndexError) as exc:
         raise argparse.ArgumentTypeError(f"bad box spec '{spec}': {exc}") from exc
-    return Box(name=f"box{index}", x=x, y=y, height=height)
+    return Box(name=f"box{index}", x=x, y=y, height=height, depth=depth, width=width)
 
 
 def main() -> None:
@@ -626,7 +635,9 @@ def main() -> None:
     parser.add_argument("--lane", action="append", dest="lanes", type=str, default=None,
                         help="Add a staircase 'width:steps[:y]' (repeatable). Omit for the default 3 lanes.")
     parser.add_argument("--box", action="append", dest="boxes", type=str, default=None,
-                        help="Add a jump box 'height[:x][:y]' in metres (repeatable). Omit for the "
+                        help="Add a jump box 'height[:x[:y[:depth[:width]]]]' in metres "
+                             "(repeatable; depth/width default to the trained footprint). "
+                             "Omit for the "
                              f"default row at heights {(0.25, 0.40, 0.55, 0.70)} spanning the "
                              f"trained grid {TRAINED_BOX_HEIGHTS}. Use --no_boxes for none.")
     parser.add_argument("--wall_lanes", type=str, default="center,indoor",
@@ -680,6 +691,13 @@ def main() -> None:
         if round(b.height, 3) not in TRAINED_BOX_HEIGHTS:
             print(f"[WARN] box '{b.name}' height {b.height} m is OUTSIDE the trained set "
                   f"{TRAINED_BOX_HEIGHTS} -- deliberate OOD test?")
+        # DEPTH had no check, and it is the axis that changes the MODE rather than the margin:
+        # the trained 0.46 m is under one stride, so the robot steps over and never stands on
+        # top. Anything materially deeper is a climb, a stance, and a dismount.
+        if abs(b.depth - TRAINED_BOX_DEPTH) > 0.05:
+            print(f"[WARN] box '{b.name}' depth {b.depth} m is off the trained "
+                  f"{TRAINED_BOX_DEPTH} m -- deep enough to stand on, which is a different "
+                  f"mode (climb + dismount), not a harder step-over.")
     # TOLERANCE, not `round(x, 3) in tuple`. The grid is stated to four decimals because two
     # of its cells are (0.1312, 0.2092) and (0.1381, 0.1899) -- rounding those to three puts
     # them 0.2 mm outside their own tuple, so the check fired on the very lanes that sit

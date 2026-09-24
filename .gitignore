@@ -210,3 +210,9 @@ transfer/sim/robots/g1/*_clip*.xml
 # the XML. Same rule as the mjeval courses above.
 transfer/sim/robots/g1/*_video_*.xml
 transfer/sim/robots/g1/*__view_*.xml
+
+# Ad-hoc scenes: mode_probe's `--stage watch` views, and one-off generate_stairs_scene.py
+# benches/pallets built to match a real-world obstacle. Rebuilt from their command line.
+transfer/sim/robots/g1/*_modeview_*.xml
+transfer/sim/robots/g1/*_pallet*.xml
+transfer/sim/robots/g1/*_bench*.xml
