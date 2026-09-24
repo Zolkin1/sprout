@@ -40,7 +40,14 @@ control:
       # all 29 joints and their order are unchanged. The C++ runtime additionally refuses that
       # one outright now, since it is robot_now-anchored and this deploy path has no odometry.
       # Override per run with `run_sim_low.sh --policy <folder>` rather than editing this.
-      hf_policy_folder: "2026-09-13_v6g_partial_trk9200_hw_ready"
+      #
+      # The current pair: the FULLY trained near-only tracker (paper_v6g_v1 model_19999) against
+      # the AWR-fine-tuned 2-camera LAG generator (ft_multi_lag_iter005). Three folders on the hub
+      # carry that identical tracker and differ ONLY in the generator -- `..._fm_lag_full` is it
+      # before the fine-tune, `2026-09-13_v6g_trk20k_fm_e65_partial_lag` a partial one -- so the
+      # name here is the only thing separating them. The root CLAUDE.md's deployment table is the
+      # record; change the two together.
+      hf_policy_folder: "2026-09-14_v6g_trk20k_fm_lag_full_awr_multi"
       use_cuda: true
       allow_robot_asset_mismatch: false
       # 4, not the onnxruntime default of 0 (auto): auto measured ~3x SLOWER here (the FM at
@@ -87,14 +94,15 @@ control:
       # THE LIMIT lives here, in the controller, and the joystick's `v_*_scale` below is the
       # STICK MAPPING. They are different things and the split is deliberate:
       #   * a scale is symmetric by construction (the axis is [-1, 1]), so it cannot express
-      #     "0.8 forward, 0.4 back" at all;
+      #     "2.0 forward, 0.4 back" at all;
       #   * a scale constrains the JOYSTICK only, while /obelisk/g1/vel_cmd is equally
       #     reachable by the scripted node and by any future high-level planner.
-      # Backwards is held to half of forwards because the generator has two forward-facing
+      # Backwards is held far below forwards because the generator has two forward-facing
       # cameras and nothing behind it: reversing is the one direction where it cannot see the
-      # ground it is about to step onto.
+      # ground it is about to step onto. Forward was raised from 0.8 to 2.0 in 2026-09,
+      # alongside the switch to the v6g pair.
       vel_cmd_x_min: -0.4
-      vel_cmd_x_max: 0.8
+      vel_cmd_x_max: 2.0
       vel_cmd_y_abs_max: 0.0
       vel_cmd_yaw_abs_max: 0.6
 
@@ -156,11 +164,11 @@ control:
     executable: obelisk_unitree_joystick
     params:
       # The stick MAPPING, not the limit -- see the envelope in the controller params above,
-      # which is what actually bounds the command. Forward full-stick is 0.8 and yaw
+      # which is what actually bounds the command. Forward full-stick is 2.0 and yaw
       # full-stick is 0.6, so those two sticks reach exactly the envelope's edge and no
-      # further; full-stick BACKWARD asks for -0.8 and the envelope clamps it to -0.4, which
+      # further; full-stick BACKWARD asks for -2.0 and the envelope clamps it to -0.4, which
       # is the asymmetry a scale cannot express on its own.
-      v_x_scale: 0.8
+      v_x_scale: 2.0
       v_y_scale: 0.0
       w_z_scale: 0.6
       # Yaw on the RIGHT STICK HORIZONTAL (RX = 3 + AXIS_OFFSET). The upstream default is RY

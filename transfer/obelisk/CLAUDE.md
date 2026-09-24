@@ -136,6 +136,16 @@ number, and it is in the bag.
 
 # Hardware: what has actually run
 
+**Which PAIR deployed, in every session, lives in one table -- "What has ACTUALLY been deployed" in
+the root `CLAUDE.md`.** Kept there rather than here because it is the artifact question, and because
+the `exported/` file sitting beside a generator is not evidence of a pairing; the HF folder is.
+
+**This section is BEHIND that table.** The 2026-08-25 run below is the FIRST hardware run and no
+longer the only one: terrain, stairs included, has since been driven on the real robot with the v6g
+pairs, and the details have not been written up. `docs/scratchpad.md`'s hardware log is the only
+record and is explicitly provisional, so do not promote a number out of it -- but equally, do not
+quote the "Stairs: NOT tested" below as current. It describes 2026-08-25 alone.
+
 **The pair drove the real G1 on 2026-08-25** -- ZED pair over the ssh link, the perceptive generator
 and the tracker on the brain, the C++ controller commanding the motors, first attempt. What was
 tested, and nothing beyond it:
@@ -143,11 +153,12 @@ tested, and nothing beyond it:
 - **A box jump-up: it got onto the box but stumbled at the top.** Unexplained.
 - **Stairs: NOT tested.** Neither up nor down.
 
-So the claim this supports is "the deployed pair walks on flat ground and can climb a box", and
+So the claim THAT SESSION supports is "the pair walks on flat ground and can climb a box", and
 specifically not that terrain works. The pair: tracker `2026-08-20_16-36-10_mode11_decor_plan_v1`,
 generator `2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx`. **That generator is a record of what
-drove the robot, NOT the one to run now** -- see "WHICH ARTIFACTS TO USE" in the root
-`CLAUDE.md`, which names the current one and why this one keeps being picked up by mistake.
+drove the robot on that date, NOT the one to run now and no longer the one that deploys** -- see
+"WHICH ARTIFACTS TO USE" and the deployment table in the root `CLAUDE.md`, which name the current
+pair and why this one keeps being picked up by mistake.
 
 The stack had been run in the obelisk sim for weeks; what had never been exercised was the ROBOT half
 -- the driver, the motors, the real cameras, the real IMU -- and that is the part that worked first
@@ -299,11 +310,16 @@ Traps, each of which cost a debugging cycle:
 
 # The deployed artifacts
 
-`logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1` holds `tracker.onnx`,
-`policy_parameters.yaml`, and `2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx` -- the pair that drove
-the robot. `config/scan/depth_{near,far}.yml` are regenerated from that run and carry the far camera
-at 15 deg (`rot: [0.99144, 0, 0.13053, 0]`), not the 35 deg placeholder. `low_level.yml`'s
-`hf_policy_folder` names it.
+**The current pair is the HF folder `policies/2026-09-14_v6g_trk20k_fm_lag_full_awr_multi`** --
+`2026-09-11_11-45-14_paper_v6g_v1`'s `model_19999` (NEAR-ONLY, 2321 obs) against the AWR-fine-tuned
+2-camera lag generator `ft_multi_lag_iter005`. The root `CLAUDE.md`'s deployment table carries the
+full list and how each was verified; what belongs HERE is that `low_level.yml`'s `hf_policy_folder`
+is what selects it, and that it and the table have to be changed together.
+
+The 2026-08 pair it replaced: `logs/rsl_rl/g1/2026-08-20_16-36-10_mode11_decor_plan_v1` holds
+`tracker.onnx`, `policy_parameters.yaml`, and `2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx`.
+`config/scan/depth_{near,far}.yml` are regenerated from that run and carry the far camera
+at 15 deg (`rot: [0.99144, 0, 0.13053, 0]`), not the 35 deg placeholder.
 
 **A default path to an artifact is a thing that rots quietly**, and this stack has been bitten three
 times by the same defect -- a `_DEFAULT_RUN_DIR` or `G1_DEPLOY_POLICY_DIR` missing the `policies/`

@@ -33,9 +33,10 @@ row are identical in width, so a mismatch merely steers wrong. Use these two and
 until a newer one is trained and named here.
 
 **The trap: `2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx` sits in the SAME `exported/`
-directory and is NOT it.** That one is the DEPLOYED generator -- the pair that drove the robot,
-which is why the hardware section below still names it -- and nothing was ever fine-tuned from
-it. Reaching for it because it is the one this file quotes is a mistake that has been made.
+directory and is NOT it.** That one drove the robot in 2026-08 -- which is why the hardware
+sections name it -- and nothing was ever fine-tuned from it. It is no longer what deploys either;
+see the deployment table below. Reaching for it because it is the one this file quotes is a
+mistake that has been made.
 Related: the three `lag48_aug` runs carry `skip_families=None`, i.e. they INCLUDE the backwards
 jump-off, so `2026-08-23_18-25-31_plan_v1_lag48_aug_h64_27M` is not "the no-jump-off one"
 either. **`nojumpoff` drops only the BACKWARDS dismount**; `family_jump_off_front`, the forward
@@ -45,6 +46,35 @@ one, is still in the training set, which is what the box work needs.
 there is no "newest wins" default. Each fine-tune's `finetune.json` records its own parent under
 `args.pretrained`, and that is the authority if any of this drifts.
 `scripts/flow_matching/FINETUNE.md` carries the full provenance.
+
+## What has ACTUALLY been deployed, newest first
+
+A hardware run pulls ONE HuggingFace folder under `zolkin/robot_rl` `policies/`, named by
+`low_level.yml`'s `hf_policy_folder`. The folder IS the pair (`tracker.onnx` + `fm.onnx`), so this
+table -- not a run directory, and not the `exported/` file sitting next to a generator -- is the
+record of what drove the robot.
+
+| HF `policies/` folder | tracker | generator |
+|---|---|---|
+| **`2026-09-14_v6g_trk20k_fm_lag_full_awr_multi`** -- CURRENT | `2026-09-11_11-45-14_paper_v6g_v1` `model_19999`, NEAR-ONLY (2321 obs) | `ft_multi_lag_iter005` -- AWR fine-tune (iter 5) of the multi-terrain queue on the LAG base `2026-09-13_10-08-38` |
+| `2026-09-13_v6g_partial_trk9200_hw_ready` | same run, `model_9200` (PARTIAL, 9200 of 20000) | `2026-09-12_09-25-46` -- 2 cameras, NO lag |
+| `2026-08-20_16-36-10_mode11_decor_plan_v1` | that run's `tracker.onnx` | `2026-08-22_19-14-39_plan_v1_lag48_aug_fm.onnx` |
+
+Two siblings sit beside the current one and are NOT it: `2026-09-14_v6g_trk20k_fm_lag_full` is the
+same tracker with the generator BEFORE the AWR fine-tune, and `2026-09-13_v6g_trk20k_fm_e65_partial_lag`
+with a partial (epoch 65) one. All three carry the identical `tracker.onnx`, so the folder name is
+the only thing distinguishing them on the robot.
+
+**The deployed shape is a SINGLE-camera tracker against a TWO-camera generator**, which is the
+subset pair `e56a62e2` wired: the policy reads `depth_near` alone (2321 inputs, trunk 2222), the
+generator reads both and the rig is its `extero_spec`. It is not a mismatch to be fixed.
+
+**Verify a folder by CONTENT, never by name.** The current one was confirmed so: its `fm.onnx` is
+byte-identical (sha256 `d1c11c23`) to `.../exported/ft_multi_lag_iter005_fm.onnx`, and its
+`tracker.onnx` carries `model_19999`'s actor matrices exactly -- `mlp.0.weight` (1024x2222) and both
+encoder weights -- while `model_9200` matches NONE of them. `exported/tracker.onnx` is overwritten by
+every `play.py` and the export stamps no checkpoint name or sha, so the local file beside a generator
+proves nothing about the pairing; the weights do.
 
 # Architecture
 
