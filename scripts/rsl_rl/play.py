@@ -109,6 +109,23 @@ parser.add_argument(
          "Default off — offsets are world-aligned.",
 )
 parser.add_argument(
+    "--video_from_viewport", action="store_true", default=False,
+    help="Record the INTERACTIVE viewport camera (/OmniverseKit_Persp) instead of the "
+         "dedicated follow cam -- i.e. record what you are looking at, framed by hand with "
+         "the mouse. Needs --viz kit, and overrides --video_follow_robot (nothing may drive "
+         "the camera while you are flying it). --video_eye / --video_lookat / "
+         "--video_focal_length are all ignored: the viewport owns the framing. Match "
+         "--video_resolution to the WINDOW's aspect ratio, or the recorded vertical extent "
+         "will not be the one you framed.",
+)
+parser.add_argument(
+    "--skip_critic", action="store_true", default=False,
+    help="Load actor weights only, as if the runner cfg set load_critic=False. For playing a "
+         "teacher whose privileged group has since changed: the critic's width tracks that "
+         "group while the actor's does not, so restoring a value function that playing never "
+         "evaluates fails the load outright. Actor weights are still loaded strictly.",
+)
+parser.add_argument(
     "--disable_fabric", action="store_true", default=False, help="Disable fabric and use USD I/O operations."
 )
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
@@ -303,6 +320,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # invisible in every shape. Absence counts as a mismatch -- see check_run_conventions.
         check_run_conventions(log_dir, env_cfg)
 
+        # Adopt the checkpoint's CAMERA SET, the same way and for the same reason as
+        # ``scripts/rsl_rl/eval/runner.py`` -- keep the two in step.
+        #
+        # The policy reads the near camera alone as of ``efe93b4e``, taken ahead of a teacher
+        # retrain that has not happened, so a near-only task builds 2222 inputs where every
+        # tracker on disk expects 3002. The difference is exactly 780: one 30x26 camera.
+        #
+        # This can only ever turn a HARD FAILURE into a correct load, never change a run that
+        # works today: it fires only when the task's slot is empty AND the trained run filled
+        # it, which is precisely the state in which ``load_state_dict`` raises on a 3002-wide
+        # actor. A near-only retrain makes it a no-op.
+        #
+        # ``enable_policy_far_camera`` FILLS THE DECLARED SLOT rather than appending: written
+        # the obvious way the far block lands past ``command_window`` and the vector comes out
+        # the right WIDTH with two 780-wide blocks transposed -- which reads as a policy that
+        # cannot do the task rather than as a config bug.
+        #
+        # Guarded on the slot EXISTING, which runner.py need not be: it only composes depth
+        # tasks, while play.py also plays scan and blind ones that declare no ``depth_far``.
+        _policy_obs = getattr(getattr(env_cfg, "observations", None), "policy", None)
+        if _policy_obs is not None and getattr(_policy_obs, "depth_far", "absent") is None:
+            from provenance import policy_far_camera_in_run  # isort: skip
+
+            if policy_far_camera_in_run(log_dir):
+                from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (
+                    enable_policy_far_camera,
+                )
+
+                print("[INFO] policy cameras: the trained run reads the FAR camera and this "
+                      "task does not -- restoring it in its declared slot (params/env.yaml)")
+                enable_policy_far_camera(env_cfg)
+
         # Trajectory-library version check: the saved env.yaml records the
         # portable content fingerprint of the library this policy trained
         # against.  The cfg built from the gym registry has it unset, so inject
@@ -451,38 +500,61 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                     f"--video_resolution must be 'WxH', got '{args_cli.video_resolution}': {exc}"
                 )
 
-            from pxr import UsdGeom
-            import omni.usd
+            if args_cli.video_from_viewport:
+                # Record the camera the MOUSE drives. ``ViewerCfg.cam_prim_path`` already
+                # defaults to the viewport's persp camera; the dedicated ``/World/RecordingCam``
+                # below exists for AUTOMATED follow shots, and points the render product away
+                # from the interactive view. Naming it here rather than relying on the default
+                # keeps this correct for a task cfg that set its own.
+                #
+                # ``origin_type="world"`` is what makes the framing yours: under any other
+                # value the viewer cfg's built-in tracker drives ``/OmniverseKit_Persp`` via
+                # ``sim.set_camera_view`` every step, which is exactly the camera being flown
+                # -- it would snap back to the robot under the cursor. ``record_cam_state``
+                # stays None for the same reason: nothing in the loop may move this camera.
+                env_cfg.viewer.cam_prim_path = "/OmniverseKit_Persp"
+                env_cfg.viewer.origin_type = "world"
+                print(
+                    f"[INFO] Video recording: {env_cfg.viewer.resolution[0]}x"
+                    f"{env_cfg.viewer.resolution[1]} from the INTERACTIVE viewport camera "
+                    "(/OmniverseKit_Persp) -- fly it with the mouse; --video_eye / "
+                    "--video_lookat / --video_focal_length are ignored"
+                )
+                if args_cli.video_follow_robot:
+                    print("[INFO]   (--video_follow_robot overridden: the camera is yours)")
+            else:
+                from pxr import UsdGeom
+                import omni.usd
 
-            stage = omni.usd.get_context().get_stage()
-            recording_cam_path = "/World/RecordingCam"
-            cam_prim = stage.GetPrimAtPath(recording_cam_path)
-            if not cam_prim.IsValid():
-                cam_prim = UsdGeom.Camera.Define(stage, recording_cam_path).GetPrim()
-            # Dial the focal length on the USD camera so the framing isn't
-            # the default telephoto.  ``horizontalAperture`` stays at the
-            # USD default (20.955 mm, 35 mm-equivalent); focal length is
-            # the per-shot zoom knob.
-            UsdGeom.Camera(cam_prim).GetFocalLengthAttr().Set(args_cli.video_focal_length)
-            env_cfg.viewer.cam_prim_path = recording_cam_path
-            # Disable the built-in asset tracker — it would move /OmniverseKit_Persp,
-            # not our recording cam.  We drive the recording cam ourselves below.
-            env_cfg.viewer.origin_type = "world"
+                stage = omni.usd.get_context().get_stage()
+                recording_cam_path = "/World/RecordingCam"
+                cam_prim = stage.GetPrimAtPath(recording_cam_path)
+                if not cam_prim.IsValid():
+                    cam_prim = UsdGeom.Camera.Define(stage, recording_cam_path).GetPrim()
+                # Dial the focal length on the USD camera so the framing isn't
+                # the default telephoto.  ``horizontalAperture`` stays at the
+                # USD default (20.955 mm, 35 mm-equivalent); focal length is
+                # the per-shot zoom knob.
+                UsdGeom.Camera(cam_prim).GetFocalLengthAttr().Set(args_cli.video_focal_length)
+                env_cfg.viewer.cam_prim_path = recording_cam_path
+                # Disable the built-in asset tracker — it would move /OmniverseKit_Persp,
+                # not our recording cam.  We drive the recording cam ourselves below.
+                env_cfg.viewer.origin_type = "world"
 
-            record_cam_state = {
-                "prim_path": recording_cam_path,
-                "eye_offset": np.asarray(args_cli.video_eye, dtype=float),
-                "lookat_offset": np.asarray(args_cli.video_lookat, dtype=float),
-                "env_index": args_cli.video_env_index,
-                "follow_robot": args_cli.video_follow_robot,
-                "track_yaw": args_cli.video_track_yaw,
-            }
-            print(
-                f"[INFO] Video recording: {env_cfg.viewer.resolution[0]}x{env_cfg.viewer.resolution[1]}"
-                f" via dedicated USD camera '{recording_cam_path}'"
-                + (f", following robot in env {args_cli.video_env_index}"
-                   if args_cli.video_follow_robot else ", static world camera")
-            )
+                record_cam_state = {
+                    "prim_path": recording_cam_path,
+                    "eye_offset": np.asarray(args_cli.video_eye, dtype=float),
+                    "lookat_offset": np.asarray(args_cli.video_lookat, dtype=float),
+                    "env_index": args_cli.video_env_index,
+                    "follow_robot": args_cli.video_follow_robot,
+                    "track_yaw": args_cli.video_track_yaw,
+                }
+                print(
+                    f"[INFO] Video recording: {env_cfg.viewer.resolution[0]}x{env_cfg.viewer.resolution[1]}"
+                    f" via dedicated USD camera '{recording_cam_path}'"
+                    + (f", following robot in env {args_cli.video_env_index}"
+                       if args_cli.video_follow_robot else ", static world camera")
+                )
 
         # create isaac environment
         env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -552,7 +624,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # lets ANY teacher checkpoint drive it -- the actor's observation groups are
         # identical across tracking modes, only the critic's width moves. Actor weights are
         # still loaded strictly, so a genuine policy mismatch still fails loudly.
-        if getattr(agent_cfg, "load_critic", True):
+        # ``--skip_critic`` is the same opt-out reached from the command line, for a task whose
+        # runner cfg does NOT set the field: the teacher's own play task uses ``PPORunnerCfg``,
+        # which trains a real critic, so the flag is the only way to play a teacher whose
+        # privileged group has since moved (``size mismatch ... [1024, 2533] vs [1024, 1961]``).
+        if getattr(agent_cfg, "load_critic", True) and not args_cli.skip_critic:
             runner.load(resume_path)
         else:
             print("[INFO] Skipping the critic (play-only runner): loading actor weights only.")
