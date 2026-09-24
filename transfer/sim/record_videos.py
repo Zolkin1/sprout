@@ -164,13 +164,17 @@ SHOTS: tuple[Shot, ...] = (
     # is never sure it is stairs; the fine-tune calls it STAIRS on 39 of 50.  Arrival follows:
     # 2/25 against 22/25 on the scored half of the probe.
     Shot("wall_stairs_parent_a",
-         "Parent generator, narrow walled staircase: plans a BOX onto the first riser and "
-         "falls there (human label 'box'; furthest x 4.05 m of 14.2).",
+         "Parent generator, narrow walled staircase: reads the first riser as a BOX and goes "
+         "down on it (human label 'box'; furthest x 4.05 m of 14.2). It does NOT leave the "
+         "ground -- 0.02 s of airborne, i.e. one frame pair -- so this is the misread, not a "
+         "leap; `wall_stairs_parent_c` is the one with a real launch.",
          "probe", probe="logs/mode_lag/updown_wall_t23", arm="parent", seed=9,
          camera="chase", wall_alpha=0.28),
     Shot("wall_stairs_ft_a",
          "Same tile, same seed, same tracker, AWR fine-tuned generator: plans STAIRS and "
-         "walks the flight (human label 'stairs'; reaches the goal).",
+         "walks the flight (human label 'stairs'; reaches the goal). Note it nearly STOPS on "
+         "the top platform -- down to 0.15 m/s, 23% of its 4.6 s up there under 0.25 -- "
+         "which is what the `_c` pair was chosen to avoid.",
          "probe", probe="logs/mode_lag/updown_wall_t23", arm="finetuned", seed=9,
          camera="chase", wall_alpha=0.28),
     # The OTHER shape of the same failure, and the reason this pair is seed 28 rather than
@@ -193,6 +197,22 @@ SHOTS: tuple[Shot, ...] = (
          "Same seed, fine-tuned: up the flight, across the platform and STEPPED down the "
          "far side, out to 14.41 m.",
          "probe", probe="logs/mode_lag/updown_wall_t23", arm="finetuned", seed=28,
+         camera="chase", wall_alpha=0.28),
+
+    # A third draw, chosen on two measurements the other two fail: the parent LEAVES THE
+    # GROUND at the first riser (0.38 s with both feet >12 cm clear, x 4.51 -> 4.68, against
+    # seed 9's 0.02 s), and the fine-tune crosses the top platform WITHOUT stopping -- 0.64
+    # m/s at its slowest and no sample under 0.25, against seed 9's 0.15 m/s and 23%.
+    Shot("wall_stairs_parent_c",
+         "Parent generator, third draw: a real LAUNCH at the first riser -- 0.38 s with both "
+         "feet clear -- and it goes down at x 4.87 m (human label 'box').",
+         "probe", probe="logs/mode_lag/updown_wall_t23", arm="parent", seed=32,
+         camera="chase", wall_alpha=0.28),
+    Shot("wall_stairs_ft_c",
+         "Same seed, fine-tuned: stairs, and a CONTINUOUS traverse -- up the flight, across "
+         "the platform at 0.64 m/s or better the whole way, down the far side, out to "
+         "14.51 m. The pair to use where the robot should not pause.",
+         "probe", probe="logs/mode_lag/updown_wall_t23", arm="finetuned", seed=32,
          camera="chase", wall_alpha=0.28),
 
     # -- two boxes (varied_boxes tile 6, the library's tallest first box at 0.722 m) ---------
@@ -224,7 +244,7 @@ SHOTS: tuple[Shot, ...] = (
          seed=0, stop_x_pad=4.0,
          tracker_onnx=f"{_CKPT}/exported/tracker.onnx",
          fm_onnx=f"{_CKPT}/ft_multi_lag_i5_fm.onnx",
-         camera="quarter", vel_plot="bottom", vel_channels=("vx",)),
+         camera="quarter", vel_plot="both", vel_channels=("vx",)),
     Shot("four_box_sweep_steered",
          "The same four-box ladder with a CENTRELINE controller on (centreline_steer, "
          "kp 1.0): pure pursuit at a 3 m aim point on the lane, so it is steered back to the "
@@ -237,7 +257,7 @@ SHOTS: tuple[Shot, ...] = (
          seed=1, stop_x_pad=4.0,
          tracker_onnx=f"{_CKPT}/exported/tracker.onnx",
          fm_onnx=f"{_CKPT}/ft_multi_lag_i5_fm.onnx",
-         camera="quarter", vel_plot="bottom", vel_channels=("vx", "wz")),
+         camera="quarter", vel_plot="both", vel_channels=("vx", "wz")),
 
     # -- the playground's own long flight, and a real building's entrance ---------------------
     Shot("tall_stairs_up",
