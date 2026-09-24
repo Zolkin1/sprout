@@ -1113,7 +1113,8 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
                       goal_anchor_max_offset: int | None = None,
                       isaac_matched: bool = False,
                       spawn_from: str = "approach",
-                      obstacle_from: str = "tread") -> Course:
+                      obstacle_from: str = "tread",
+                      goal_from: str = "far_top") -> Course:
     """A :class:`Course` that IS one tile of a clip library, geometry for geometry.
 
     Every other course in this module is deliberately NOT a trained tile -- authored to vary
@@ -1145,6 +1146,26 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
             course opens exactly where an Isaac episode on it opens -- and avoids
             :func:`~generate_clip_tile_scene.spawn_point`'s no-tread fallback, which is the
             tile centre.
+        goal_from: ``"far_top"`` (the default) puts the goal at the farthest walkable top's
+            CENTRE, which on a clip-library tile IS the far platform and is right. On a
+            FREE-FORM course it is not: the farthest walkable top is the SECOND BOX, so the
+            goal lands ON the obstacle -- measured on ``ft_boxes_holdout`` tile 6, goal at
+            x=8.90 inside the second box's 8.22..9.59 span, against the tile's own
+            ``route.goal_x`` of 13.09 out on the ground beyond it. ``"route"`` reads that
+            authored goal instead, which is the row Isaac's ``freeform_goal_reached``
+            terminates on, so a course scored here and an Isaac episode agree about where
+            "there" is.
+
+            It also decides where :func:`~.runner.steer_yaw_rate` AIMS, and a near goal is
+            not merely imprecise there: that controller returns 0 inside ``in_goal`` and
+            aims at ``target_xy`` outside it, so past the far edge of a too-near band the
+            bearing points BACKWARD and it commands a hard turn at the clip trying to return
+            to it. Measured on tile 6 at ``steer_kp=1.0``: peak ``|y|`` median 0.85 m
+            unsteered against 2.71 m steered, and arrival FELL 12/25 -> 7/25.
+
+            Default stays ``"far_top"``: moving it would move ``target_xy``, ``in_goal`` and
+            ``course_length_m`` for every mjeval table already reduced against them,
+            including the clip-library courses where the inferred rule is the correct one.
         obstacle_from: ``"tread"`` uses the first stair TREAD (the default), which is filtered
             to at most 0.60 m deep so a railing post cannot pass as a riser -- and is therefore
             blind to a 1.20 m box.  ``"raised"`` uses the first walkable overlay standing above
@@ -1249,6 +1270,8 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
     target_x = float(far["pos_xy"][0]) - sx
     target_z = gcts.terrain_top_at(gcts.walkable(overlays),
                                    float(far["pos_xy"][0]), float(far["pos_xy"][1]))
+    if goal_from not in ("far_top", "route"):
+        raise ValueError(f"goal_from must be 'far_top' or 'route', got {goal_from!r}")
 
     # The floor plane's z, read back out of the emitted geom rather than recomputed, so this
     # cannot disagree with the scene it describes.
@@ -1375,13 +1398,28 @@ def isaac_tile_course(clip_path: str, terrain_id: int, *, speeds: tuple[float, .
     # the success-rule unification rather than as a fourth special case here.
     # Until then tile 86 is excluded from the watch/eval tile sets.
 
+    # The AUTHORED goal, applied last and to the GOAL ALONE. `target_z` stays the far top:
+    # it is what `flight_height_m` -- and through it the `traversed` gate and the fall datum --
+    # is derived from, and a free-form route goal is out on the FLOOR, so substituting it
+    # earlier zeroes the flight height and reads as "nothing to traverse to".
+    route_goal_y = 0.0
+    if goal_from == "route":
+        route = entry.get("route") or {}
+        if not {"goal_x", "goal_y"} <= set(route):
+            raise ValueError(
+                f"tile {terrain_id} declares no route goal, so goal_from='route' has nothing "
+                "to read. The clip-library tiles are manifest-plus-clips and carry no route "
+                "block; only the free-form courses author one.")
+        target_x = float(route["goal_x"]) - float(sx)
+        route_goal_y = float(route["goal_y"]) - float(sy)
+
     return Course(
         name=name or f"tile{terrain_id}",
         klass=klass,
         variant=int(terrain_id),
         geoms=tuple(lines),
         floor_z=floor_z,
-        target_xy=(target_x, 0.0),
+        target_xy=(target_x, route_goal_y),
         course_length_m=float(target_x),
         flight_height_m=float(target_z - sz),
         obstacle_x_m=float(obstacle_x),
