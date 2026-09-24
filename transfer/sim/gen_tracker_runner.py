@@ -1629,6 +1629,10 @@ def main() -> None:
                              "the verdict a sweep reads only exists when --log is on -- so a "
                              "sweep that wants the verdict and not the plots had to take both, "
                              "at a few seconds and a screenful of JSON per run.")
+    parser.add_argument("--plot_dpi", type=int, default=None,
+                        help="Raster density for the --log figures (default: "
+                             "gen_tracker_metrics.PLOT_DPI). Raise it to zoom in on one joint "
+                             "of the 29-subplot grids; the cost is only file size.")
     parser.add_argument("--log_dir", type=str, default=None,
                         help="Where --log writes sim_log.csv + metrics (default: "
                              "<run_dir>/mujoco_gen_tracker_logs). That default is ONE fixed "
@@ -2051,7 +2055,7 @@ def main() -> None:
 
         if args.metrics:
             import gen_tracker_metrics
-            gen_tracker_metrics.create_metrics(os.path.dirname(log_path))
+            gen_tracker_metrics.create_metrics(os.path.dirname(log_path), dpi=args.plot_dpi)
 
     # Hard-exit to skip the native GL teardown. At interpreter exit the MuJoCo viewer's
     # GLFW context and pygame/SDL (joystick) race destroying their GLX contexts on the X

@@ -79,7 +79,7 @@ def _plot_velocity_tracking(cols, out_dir, meta) -> dict:
     axes[-1].set_xlabel("time [s]")
     fig.suptitle("Commanded vs achieved base velocity")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "velocity_tracking.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "velocity_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return rms
 
@@ -117,7 +117,7 @@ def _plot_reference_tracking(cols, out_dir, meta) -> dict:
     axes[2][1].set_xlabel("time [s]")
     fig.suptitle("Base pose: FM reference vs actual")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return summary
 
@@ -140,7 +140,7 @@ def _plot_reference_tracking_legacy(cols, out_dir, meta) -> dict:
     axes[-1].set_xlabel("time [s]")
     fig.suptitle("Tracker-vs-generator reference error")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return summary
 
@@ -197,7 +197,7 @@ def _plot_survival(cols, out_dir, meta) -> dict:
     ax.set_xlabel("time [s]"); ax.set_ylabel("base z [m]"); ax.grid(alpha=0.3); ax.legend()
     fig.suptitle("Survival / base height")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "survival.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "survival.png"), dpi=PLOT_DPI)
     plt.close(fig)
     # survived_meta is the loop's own answer and is authoritative when present. The DERIVED
     # height/tilt rule above is the fallback for a run recorded before the verdict was stamped,
@@ -244,11 +244,18 @@ def _plot_torques(cols, meta, out_dir) -> dict:
     for j in range(n, len(axes)):
         axes[j].axis("off")
     fig.suptitle("Joint torque vs effort limit")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "torques.png"), dpi=120)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(os.path.join(out_dir, "torques.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return {"peak_utilization": util,
             "max_utilization": (max(util.values()) if util else None)}
+
+
+#: Raster density for every figure here. 120 is legible at a glance and unreadable zoomed in,
+#: which is the wrong trade for a 29-subplot grid where the question is usually about ONE joint.
+#: Overridable per run (`--dpi`, or `--plot_dpi` on the runner) because the cost is file size:
+#: joint_tracking.png is ~12x4 in, so 200 dpi is ~2400x3400 px.
+PLOT_DPI: int = 200
 
 
 def _plot_joint_tracking(cols, meta, out_dir) -> dict:
@@ -270,6 +277,15 @@ def _plot_joint_tracking(cols, meta, out_dir) -> dict:
             continue
         ax.plot(t, r, lw=1.3, label="FM ref")
         ax.plot(t, a, lw=1.0, alpha=0.85, label="actual")
+        # The PD TARGET -- the policy's action after scaling and the default-pose offset, i.e.
+        # what the servo was actually asked for. `ref` and `actual` alone cannot separate
+        # "the joint could not get there" from "the policy never asked it to": with the target
+        # drawn, a target that tracks the reference while the actual lags is the joint failing
+        # to deliver, and a target that ignores the reference is the policy. The column has
+        # been in the CSV since it was written; only this plot was not reading it.
+        c = cols.get(f"ctrl_{jn}")
+        if c is not None:
+            ax.plot(t, c, lw=0.9, ls="--", alpha=0.8, label="PD target")
         rms[jn] = float(np.sqrt(np.mean((r - a) ** 2)))
         _mark_handoff(ax, meta)
         ax.set_title(f"{jn}  (rms={rms[jn]:.3f})", fontsize=7)
@@ -278,8 +294,8 @@ def _plot_joint_tracking(cols, meta, out_dir) -> dict:
     for j in range(n, len(axes)):
         axes[j].axis("off")
     fig.suptitle("Per-joint position: FM reference vs actual [rad]")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "joint_tracking.png"), dpi=120)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(os.path.join(out_dir, "joint_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return {"rms": rms, "max_rms": (max(rms.values()) if rms else None)}
 
@@ -308,12 +324,12 @@ def _plot_ee_tracking(cols, meta, out_dir) -> dict:
     axes[-1][0].set_xlabel("time [s]")
     fig.suptitle("Per-EE position (base frame): FM reference vs actual [m]")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "ee_tracking.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "ee_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return {"rms_norm": summary, "max_rms_norm": (max(summary.values()) if summary else None)}
 
 
-def create_metrics(log_dir: str) -> dict:
+def create_metrics(log_dir: str, dpi: int | None = None) -> dict:
     """Generate all metric plots + a summary JSON for a finished run.
 
     Args:
@@ -322,6 +338,9 @@ def create_metrics(log_dir: str) -> dict:
     Returns:
         The summary dict (also written to ``metrics_summary.json``).
     """
+    global PLOT_DPI
+    if dpi:
+        PLOT_DPI = int(dpi)
     cols, meta = _load(log_dir)
     out_dir = os.path.join(log_dir, "plots")
     os.makedirs(out_dir, exist_ok=True)
@@ -341,6 +360,6 @@ def create_metrics(log_dir: str) -> dict:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: python gen_tracker_metrics.py <log_dir>")
-    create_metrics(sys.argv[1])
+    if len(sys.argv) not in (2, 3):
+        sys.exit(f"usage: python gen_tracker_metrics.py <log_dir> [dpi]   (default {PLOT_DPI})")
+    create_metrics(sys.argv[1], dpi=int(sys.argv[2]) if len(sys.argv) == 3 else None)

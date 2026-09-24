@@ -45,6 +45,10 @@ import plot_style  # noqa: E402
 #: The zero RULE stays grey, so the marker reads against it instead of merging into it.
 METHOD_COLOURS: dict[str, str] = {
     "AWR": plot_style.COLORS["black"],
+    # The same update with the conditioning perturbations off. Its own hue rather than a muted
+    # AWR: grey read as "de-emphasised" next to four saturated arms, which is the opposite of
+    # what an ablation row should say.
+    "AWR no-perturb": plot_style.COLORS["magenta"],
     "Arrived": plot_style.COLORS["blue"],
     "Filtered BC": plot_style.COLORS["orange"],
     "Plain BC": plot_style.COLORS["teal"],
@@ -57,6 +61,7 @@ _SPARE = [c for c in plot_style.COLOR_CYCLE if c not in set(METHOD_COLOURS.value
 #: `fig_reduce` once per arm, which is the expensive half of this figure. It also means the
 #: colour map above and the group keys in `forest_groups.json` stay keyed on one spelling.
 DISPLAY_NAMES: dict[str, str] = {
+    "AWR no-perturb": "AWR (no pert.)",
     "Arrived": "Arrival Filt.",
     "Filtered BC": "Filt. BC",
 }

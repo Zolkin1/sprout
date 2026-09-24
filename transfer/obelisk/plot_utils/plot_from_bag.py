@@ -630,6 +630,9 @@ def main() -> int:
                    help="Display the static figures instead of writing them.")
     p.add_argument("--figures", default=None,
                    help=f"Comma-separated subset of {','.join(FIGURES)}.")
+    p.add_argument("--dpi", type=int, default=200,
+                   help="Raster density of the saved figures. 200 so a 29-subplot joints.png "
+                        "survives being zoomed into; drop it to 120 for smaller files.")
     p.add_argument("--start", type=float, default=None, help="Trim to after this second.")
     p.add_argument("--end", type=float, default=None, help="Trim to before this second.")
     args = p.parse_args()
@@ -680,7 +683,7 @@ def main() -> int:
         fig.tight_layout()
         if not args.show:
             out = os.path.join(save_dir, f"{name}.png")
-            fig.savefig(out, dpi=120)
+            fig.savefig(out, dpi=args.dpi)
             print(f"[INFO] wrote {out}")
     if args.show:
         plt.show()

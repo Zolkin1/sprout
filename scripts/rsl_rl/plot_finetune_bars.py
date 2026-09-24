@@ -67,10 +67,10 @@ PANEL_B = {
 #: serif two full terrain names in a 3.5 inch panel overlap into each other -- which is legible
 #: in a draft and not in a submission.  Wrapping is explicit so the break point is a choice.
 TERRAIN_LABELS = {
-    "Two boxes": "Two\nboxes",
-    "Stairs up-into-down": "Up-into-\ndown",
+    "Two boxes": "Boxes",
+    "Stairs up-into-down": "Stairs",
     "Stairs down (in-dist.)": "Stairs\ndown",
-    "Varied multi-terrain": "Varied\nmulti",
+    "Varied multi-terrain": "Multi-\nterrain",
     "In-distribution": "In-\ndist.",
 }
 
@@ -82,8 +82,17 @@ TERRAIN_LABELS = {
 IN_DISTRIBUTION = ("Stairs down (in-dist.)", "In-distribution")
 
 #: Course-class labels for the mode panel's clusters.
-KLASS_LABELS = {"two_box_course": "Two boxes", "up_into_down": "Up-into-down",
-                "stairs_up": "Entry stairs", "stairs_down": "Entry stairs (down)",
+#: The heading over each (c) cluster names the COURSE, in the same words as TERRAIN_LABELS --
+#: (c) sits beside (a) and (b) on one figure and one course under two names reads as two
+#: courses. The TICK under each bar pair names the specific tile instead ("Two boxes",
+#: "Stairs (wide)"), so the two lines read general-over-specific rather than repeating.
+#:
+#: `stairs_up` is the entry staircase of the MULTI-TERRAIN course -- the class says what the
+#: geometry is, the heading says which course it was probed on, and in this campaign the only
+#: stairs_up probe is that one. A stairs_up probe rolled on a different course would need its
+#: own key rather than this label.
+KLASS_LABELS = {"two_box_course": "Boxes", "up_into_down": "Stairs",
+                "stairs_up": "Multi-terrain", "stairs_down": "Multi-terrain",
                 "box": "Box"}
 
 
@@ -267,7 +276,10 @@ def _mode_panel(ax, files: list[str], metric: str, scope: str = "all") -> list[s
     labels = []
     for r, t in zip(recs, stem):
         head = f"{t} (t{int(r['terrain_id'])})" if t in dup and not r["_label"] else t
-        labels.append(f"{head}\n{r['speed']:.2f} m/s")
+        # No speed on the tick: every probe in this figure is at the same one, so repeating it
+        # four times says nothing and costs a line of label height. The speed is still in the
+        # count note under the figure and belongs in the caption.
+        labels.append(head)
 
     width = 0.36
     for j, (arm, label, colour) in enumerate(ARMS):
@@ -308,15 +320,18 @@ def _mode_panel(ax, files: list[str], metric: str, scope: str = "all") -> list[s
     # Head each dashed group with its COURSE, the same device panels (a) and (b) use for the
     # two regimes: the dashed rule alone says "these belong together" without saying what they
     # are, and the cluster labels below then have to carry both the course and the variant.
+    head_of = [KLASS_LABELS.get(r["klass"], r["klass"]) for r in recs]
     bounds = [0] + [i for i in range(1, len(recs))
-                    if recs[i]["klass"] != recs[i - 1]["klass"]] + [len(recs)]
+                    if head_of[i] != head_of[i - 1]] + [len(recs)]
     for i in bounds[1:-1]:
         ax.axvline(i - 0.5, color="0.55", linewidth=1.2, linestyle=(0, (4, 3)), zorder=1)
     for lo, hi in zip(bounds[:-1], bounds[1:]):
-        ax.annotate(KLASS_LABELS.get(recs[lo]["klass"], recs[lo]["klass"]),
+        # Black, matching the regime labels over (a) and (b): the three sit in one band across
+        # the top of the figure, so one grey and one black reads as an oversight.
+        ax.annotate(head_of[lo],
                     xy=((lo + hi - 1) / 2.0, 1.015), xycoords=("data", "axes fraction"),
-                    ha="center", va="bottom", fontsize=12, color="0.35",
-                    annotation_clip=False)
+                    ha="center", va="bottom", fontsize=12,
+                    color=plot_style.COLORS["black"], annotation_clip=False)
     # The note uses the CLUSTER's own label, not the class label: with several tiles per
     # course the class label repeats, and a note reading "Up-into-down ... Up-into-down" names
     # neither of them. Per-arm counts are spelled out whenever they differ, which happens
@@ -421,8 +436,8 @@ def main() -> int:
         for ax in axes[:2]:
             for x, lbl in ((mid_ood, "out-of-distribution"), (mid_id, "in-distribution")):
                 ax.annotate(lbl, xy=(x, 1.015), xycoords=("data", "axes fraction"),
-                            ha="center", va="bottom", fontsize=12, color="0.35",
-                            annotation_clip=False)
+                            ha="center", va="bottom", fontsize=12,
+                            color=plot_style.COLORS["black"], annotation_clip=False)
 
     fig.tight_layout()
     # The OOD course count is COUNTED, not stated: this figure is redrawn per campaign and the
