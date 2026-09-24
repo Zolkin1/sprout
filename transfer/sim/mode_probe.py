@@ -2,7 +2,7 @@
 # Copyright 2026 Zachary Olkin. All rights reserved.
 """Mode-selection probe: N noise draws on ONE Isaac tile, then a human labels the first mode.
 
-Three stages, each a separate invocation so the human half is resumable:
+Four stages, each a separate invocation so the human half is resumable:
 
     # 1. run both arms, headless.  Only the flow-noise draw differs between trials.
     python transfer/sim/mode_probe.py --stage run --out logs/mode/box2 --arm parent \\
@@ -10,7 +10,10 @@ Three stages, each a separate invocation so the human half is resumable:
         --tracker_onnx <...>/tracker.onnx --fm_onnx <...>/parent_fm.onnx
     python transfer/sim/mode_probe.py --stage run --out logs/mode/box2 --arm finetuned ...
 
-    # 2. label them, BLIND and interleaved, in the viewer
+    # 2a. just LOOK at them -- arm shown, fixed order, nothing written
+    python transfer/sim/mode_probe.py --stage watch --out logs/mode/box2
+
+    # 2b. label them, BLIND and interleaved, in the viewer
     python transfer/sim/mode_probe.py --stage label --out logs/mode/box2
 
     # 3. compare
@@ -48,7 +51,9 @@ the first flight) and not the rest of the traverse.  The full trajectory is stil
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import math
 import os
 import pathlib
 import random
@@ -101,7 +106,8 @@ def build_parser() -> argparse.ArgumentParser:
     """The command line."""
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--stage", required=True, choices=("run", "label", "report"))
+    p.add_argument("--stage", required=True,
+                   choices=("run", "watch", "label", "report", "migrate"))
     p.add_argument("--out", required=True, help="Probe directory, shared by every stage.")
     # --- run ---
     p.add_argument("--arm", default="", help="Arm name for --stage run, e.g. parent.")
@@ -114,6 +120,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--fm_onnx", default="", help="Absolute path to this arm's generator.")
     p.add_argument("--speed", type=float, default=1.17, help="Commanded forward speed (m/s).")
     p.add_argument("--trials", type=int, default=50, help="Noise draws.")
+    p.add_argument("--seed_start", type=int, default=0,
+                   help="--stage run: roll seeds [seed_start, trials) and APPEND them to the "
+                        "arm's existing trials instead of re-rolling from 0. The seed IS the "
+                        "trial index, so extending a 25-trial probe to 50 is "
+                        "`--trials 50 --seed_start 25`: the first 25 trajectories are left "
+                        "untouched on disk and keep their labels.")
+    p.add_argument("--obstacle_from", default="raised",
+                   choices=("raised", "tread", "drop"),
+                   help="What the approach and the label window are measured to. 'raised' "
+                        "(default) is the first walkable overlay ABOVE the spawn, which is "
+                        "the ascent case and the only one that works on a box course. 'drop' "
+                        "is the first one BELOW it -- required where the robot spawns ON a "
+                        "platform and what it faces is a DESCENT, as the entry_stairs_down "
+                        "family does: 'raised' there finds the flight BEHIND the spawn and "
+                        "returns a NEGATIVE approach, which silently collapses the label "
+                        "window to a single frame rather than failing. 'tread' is mjeval's "
+                        "original first-stair-tread finder, filtered to 0.60 m and therefore "
+                        "blind to a 1.20 m box.")
+    p.add_argument("--steer_kp", type=float, default=0.0,
+                   help="P gain on heading error toward the goal (1/s); 0 (default) leaves "
+                        "the probe unsteered, which is what every probe before this flag "
+                        "was. Set it to MATCH THE TASK when the probe is being read against "
+                        "an Isaac number: the free-form fine-tune runs "
+                        "`fm_tracking_cmd.freeform_yaw_rate` at kp=1.0, and it wires a 0.75 m "
+                        "goal band BECAUSE that controller runs -- so scoring an unsteered "
+                        "rollout against that band charges it for the absence of a "
+                        "controller the task has. Still off by default, and still "
+                        "off-distribution on the stair families (|wz| max = 0.0000 over 3500 "
+                        "stair clips), so this is a boxes/flat instrument.")
+    p.add_argument("--steer_law", default="goal", choices=("goal", "centreline"),
+                   help="WHICH steering law --steer_kp drives. 'goal' (default, what every "
+                        "probe before this flag used) is mjeval's `steer_yaw_rate`: bearing "
+                        "straight at the course goal, so the effective cross-track gain is "
+                        "kp/distance_to_goal and it STIFFENS as the robot closes. 'centreline' "
+                        "is the Isaac free-form law `fm_tracking_cmd.freeform_yaw_rate`: aim at "
+                        "a point --steer_lookahead_m ahead of the robot's own projection onto "
+                        "the route centreline, so the gain is a constant kp/lookahead. The two "
+                        "are NOT the same controller at the same kp -- use 'centreline' when "
+                        "the probe is being read against an Isaac number.")
+    p.add_argument("--steer_lookahead_m", type=float, default=5.0,
+                   help="Look-ahead for --steer_law centreline (m). Isaac's default is 5.0, "
+                        "which with kp=1.0 is a 0.2 1/s cross-track gain. Ignored by the "
+                        "'goal' law, which has no look-ahead.")
     p.add_argument("--klass", default="", choices=("", *terrains.CLASS_CODES),
                    help="Override the course class inferred from the manifest family.")
     p.add_argument("--label_margin_m", type=float, default=2.0,
@@ -142,6 +191,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="--stage report: also write the reduced numbers here, for the figure. "
                         "The plot script reads these rather than importing this module, which "
                         "would drag mjeval and mujoco into a plotting job.")
+    p.add_argument("--by_arm", action="store_true",
+                   help="--stage watch: walk one arm end to end instead of interleaving the "
+                        "arms seed by seed. The default pairs them, because the same seed on "
+                        "two arms is the SAME flow-noise draw through a different generator.")
+    p.add_argument("--window_only", action="store_true",
+                   help="--stage watch: open on the label window instead of the "
+                        "whole episode. No effect on --stage label, which is "
+                        "window-first already.")
+    p.add_argument("--whole", action="store_true",
+                   help="--stage label: open every trial on the WHOLE episode instead of the "
+                        "label window. The window ends `--label_margin_m` past the FIRST "
+                        "feature, which on a two-box course is between the boxes, so a "
+                        "decision made at the second one is not in it at all. Note what this "
+                        "changes about the DATA: `expected_mode` and the report's "
+                        "correct-mode rate are defined on the FIRST decision, so a label "
+                        "given for a later one is a different measurement under the same "
+                        "column name.")
     p.add_argument("--relabel", action="store_true",
                    help="Re-ask trials that already carry a label.")
     return p
@@ -206,6 +272,40 @@ def load_probe(out: str) -> dict:
 # ---------------------------------------------------------------------------------------------
 # Stage: run
 # ---------------------------------------------------------------------------------------------
+def centreline_yaw_rate(course, x: float, y: float, yaw: float, kp: float,
+                        wz_max: float, *, lookahead: float) -> float:
+    """Isaac's free-form steering law, as a drop-in for mjeval's ``steer_yaw_rate``.
+
+    The port of ``fm_tracking_cmd.freeform_yaw_rate``: aim at the point ``lookahead`` metres
+    ahead of the robot's OWN projection onto the route centreline, rather than at the goal.
+    That distinction is the whole reason this exists -- bearing-to-goal has an effective
+    cross-track gain of ``kp / distance_to_goal``, which stiffens without bound as the robot
+    closes on the goal, while this one holds a constant ``kp / lookahead``.  At Isaac's
+    defaults (``kp=1.0``, ``lookahead=5.0``) that is 0.2 1/s.
+
+    The route here runs along +x, so the centreline is ``y = course.target_xy[1]`` and the
+    robot's own projection onto it is its ``x``; the aim point is therefore
+    ``(x + lookahead, cy)`` and the port needs nothing from the tile's frame.  Unlike
+    ``steer_yaw_rate`` there is NO in-goal short circuit, because the Isaac law has none.
+
+    Args:
+        course: The course, for the centreline's lateral offset.
+        x: Root world x (m).
+        y: Root world y (m).
+        yaw: Root heading (rad).
+        kp: Proportional gain (1/s).
+        wz_max: Symmetric clip on the output (rad/s).
+        lookahead: Distance to the aim point along the centreline (m).
+
+    Returns:
+        The commanded yaw rate (rad/s).
+    """
+    _, cy = course.target_xy
+    bearing = math.atan2(cy - y, lookahead)
+    err = math.atan2(math.sin(bearing - yaw), math.cos(bearing - yaw))
+    return float(np.clip(kp * err, -wz_max, wz_max))
+
+
 def stage_run(args) -> int:
     """Roll ``--trials`` noise draws for one arm and save every trajectory."""
     for need, flag in ((args.arm, "--arm"), (args.clip, "--clip"),
@@ -223,13 +323,16 @@ def stage_run(args) -> int:
             pm = json.load(fh)
         for k, v in (("clip", args.clip), ("terrain_id", int(args.terrain_id)),
                      ("speed", float(args.speed)),
+                     ("steer_kp", float(args.steer_kp)),
+                     ("steer_law", str(args.steer_law)),
+                     ("obstacle_from", str(args.obstacle_from)),
                      ("label_margin_m", float(args.label_margin_m))):
             if k in pm and pm[k] != v:
                 raise SystemExit(
                     f"REFUSING: this probe directory was built with {k}={pm[k]!r}, and this "
                     f"run asks for {k}={v!r}. The arms must differ ONLY in the generator, or "
                     "the labels compare two different experiments. Use a new --out.")
-        if args.arm in (pm.get("arms") or {}):
+        if args.arm in (pm.get("arms") or {}) and int(args.seed_start) == 0:
             print(f"[mode] note: overwriting the existing arm {args.arm!r}")
 
     entry = tile_entry(args.clip, args.terrain_id)
@@ -240,34 +343,71 @@ def stage_run(args) -> int:
     # which a 1.20 m box reads as "not a feature course" at all.
     course = terrains.isaac_tile_course(
         args.clip, args.terrain_id, speeds=(args.speed,), klass=klass, name=name,
-        spawn_from="route", obstacle_from="raised")
+        spawn_from="route", obstacle_from=args.obstacle_from,
+        goal_from="route")
     approach = float(course.obstacle_x_m)
+    if approach <= 0.0:
+        raise SystemExit(
+            f"REFUSING: the first obstacle is {approach:.2f} m AHEAD of the spawn, i.e. "
+            f"behind it, under --obstacle_from {args.obstacle_from!r}. The label window "
+            f"would end at x={approach + args.label_margin_m:.2f} m, which the first frame "
+            "already satisfies, so every trial would be cut to one frame and labelled on "
+            "nothing. A tile whose robot spawns ON a platform faces a DESCENT: pass "
+            "--obstacle_from drop.")
     label_x = float(course.obstacle_x_m) + float(args.label_margin_m)
     print(f"[mode] tile {args.terrain_id} of {os.path.basename(args.clip)}  "
           f"family {entry.get('family', '?')}  class {klass}")
     print(f"[mode] spawn = the tile's OWN route start; first feature {approach:.3f} m ahead; "
           f"label window ends {args.label_margin_m:.2f} m past it (x={label_x:.3f} m)")
     print(f"[mode] expected first mode: {EXPECTED_MODE.get(klass, '?')}")
-    print(f"[mode] arm {args.arm!r}  speed {args.speed} m/s  {args.trials} noise draws")
+    print(f"[mode] arm {args.arm!r}  speed {args.speed} m/s  {args.trials} noise draws  "
+          f"steer_kp={args.steer_kp:g}"
+          f"{'' if args.steer_kp > 0 else ' (UNSTEERED)'}"
+          f"{f' law={args.steer_law}' if args.steer_kp > 0 else ''}"
+          f"{f' lookahead={args.steer_lookahead_m:g}m' if args.steer_kp > 0 and args.steer_law == 'centreline' else ''}")
 
     cfg = mjrunner.ArmRun(
         arm=0, label=f"mode_{args.arm}", tracker_onnx=args.tracker_onnx,
         fm_onnx=args.fm_onnx, out_dir=args.out,
         providers=tuple(x.strip() for x in args.providers.split(",") if x.strip()),
         fall_height=float(args.fall_height), fall_tilt_deg=float(args.fall_tilt_deg),
-        # steer_kp stays 0: a heading controller would be a second thing varying and is
-        # off-distribution on the stair courses anyway.
-        steer_kp=0.0, zero_noise=False, fm_seed=0,
+        # `--steer_kp` 0 by default: a heading controller is a second thing varying, and it
+        # is off-distribution on the stair courses. It is exposed because the Isaac
+        # free-form task DOES steer, and its 0.75 m goal band is narrow for that reason.
+        steer_kp=float(args.steer_kp), zero_noise=False, fm_seed=0,
     )
     policy, fm_lag, spawn = mjrunner.load_arm(cfg)
     rig = mjrunner.CourseRig(course, policy, cfg, spawn)
     cmd = np.array([float(args.speed), 0.0, 0.0], dtype=np.float64)
+    # None keeps mjeval's own `steer_yaw_rate`, which is what `goal` means; `run_episode`
+    # consults either only when steer_kp > 0, so an unsteered probe is unaffected by both.
+    steer_fn = None
+    if args.steer_law == "centreline":
+        steer_fn = functools.partial(centreline_yaw_rate,
+                                     lookahead=float(args.steer_lookahead_m))
 
     arm_dir = os.path.join(args.out, "trials", args.arm)
     os.makedirs(arm_dir, exist_ok=True)
     rows = []
+    start = int(args.seed_start)
+    if start:
+        # Keep the existing trials byte-for-byte rather than trusting the roll to be
+        # reproducible: the seeding is deterministic, but the CONTACT dynamics are not
+        # invariant to everything (removing a duplicate ground plane once moved a trajectory
+        # from 409 to 419 steps), and a silently re-rolled trial would invalidate its label.
+        prev = (pm.get("arms") or {}).get(args.arm)
+        if prev is None:
+            raise SystemExit(f"REFUSING: --seed_start {start} but arm {args.arm!r} has no "
+                             "existing trials to append to.")
+        rows = [r for r in prev["rows"] if int(r["seed"]) < start]
+        if len(rows) != start:
+            raise SystemExit(
+                f"REFUSING: arm {args.arm!r} has {len(rows)} trial(s) below seed {start}; "
+                f"--seed_start needs a contiguous 0..{start - 1} to append to.")
+        print(f"[mode] appending: keeping seeds 0..{start - 1}, rolling "
+              f"{start}..{int(args.trials) - 1}")
     t0 = time.time()
-    for seed in range(int(args.trials)):
+    for seed in range(start, int(args.trials)):
         frames: list[tuple[float, np.ndarray]] = []
 
         def record(robot, _policy, _f=frames) -> None:
@@ -285,7 +425,8 @@ def stage_run(args) -> int:
         # these courses come from the Isaac evals, which use their own goal line.
         verdict, failure, _acc = mjrunner.run_episode(
             rig, policy, fm_lag, spawn, cmd, None, recorder=record,
-            steer_kp=cfg.steer_kp, cfg_hold=cfg.cmd_hold_s, stop_on_goal=False)
+            steer_kp=cfg.steer_kp, cfg_hold=cfg.cmd_hold_s, stop_on_goal=False,
+            steer_fn=steer_fn)
         q = np.array([f[1] for f in frames], dtype=np.float32)
         t = np.array([f[0] for f in frames], dtype=np.float32)
         # Where the label window ends: the first step past the feature, or the whole episode
@@ -313,7 +454,14 @@ def stage_run(args) -> int:
                "obstacle_x_m": float(course.obstacle_x_m),
                "label_x_m": label_x, "label_margin_m": float(args.label_margin_m),
                "tracker_onnx": args.tracker_onnx, "modes": list(MODES),
-               "robot_name": str(cfg.robot_name), "stop_on_goal": False})
+               "robot_name": str(cfg.robot_name), "stop_on_goal": False,
+               # Stamped so a steered probe and an unsteered one cannot be confused, and so
+               # the refusal above can catch two arms that disagree about it.
+               "steer_kp": float(args.steer_kp),
+               "steer_law": str(args.steer_law),
+               "steer_lookahead_m": float(args.steer_lookahead_m),
+               "obstacle_from": str(args.obstacle_from),
+               "steer_wz_max": float(cfg.steer_wz_max)})
     pm.setdefault("arms", {})[args.arm] = {
         "fm_onnx": args.fm_onnx, "trials": int(args.trials), "rows": rows}
     with open(probe_path(args.out), "w", encoding="utf-8") as fh:
@@ -329,23 +477,81 @@ def stage_run(args) -> int:
 # ---------------------------------------------------------------------------------------------
 # Stage: label
 # ---------------------------------------------------------------------------------------------
-def _rollout_fingerprint(pm: dict) -> str:
-    """A short digest of every trial's OUTCOME, so a re-roll cannot pass as the same data.
 
-    The arm set and the shuffle seed do not change when the trials are re-rolled -- and a
-    re-roll happens for real: removing a duplicate coplanar ground plane from these courses
-    changed the contact dynamics and moved one trajectory from 409 to 419 steps.  Labels
-    describe TRAJECTORIES, so they have to be invalidated by anything that moves them.
+
+def label_key(arm: str, seed: int) -> str:
+    """Storage key for one trial's label.
+
+    Keyed by the TRIAL, not by its position in the blinded order. Position keys meant that
+    rolling more trials re-shuffled the sequence and silently re-pointed every existing label
+    at a different trajectory -- so extending a probe cost a full re-label of work already
+    done. The presentation order is still shuffled; only the storage key is stable.
+
+    Args:
+        arm: Arm name.
+        seed: The trial's noise seed, which is also its index.
+
+    Returns:
+        The key used in ``labels.json``.
+    """
+    return f"{arm}:{int(seed)}"
+
+
+def trial_fingerprints(pm: dict) -> dict[str, str]:
+    """One outcome digest per trial, keyed like the labels.
+
+    Replaces the whole-probe digest, which could not distinguish "this trial was re-rolled and
+    moved" from "trials were added". A label describes a TRAJECTORY, so it has to be dropped by
+    anything that moves that trajectory -- and only that one.
+
+    Args:
+        pm: The probe manifest.
+
+    Returns:
+        ``{label_key: digest}``.
     """
     import hashlib  # noqa: PLC0415
 
-    h = hashlib.sha256()
+    out: dict[str, str] = {}
     for arm, d in sorted(pm["arms"].items()):
-        h.update(arm.encode())
-        for r in sorted(d["rows"], key=lambda x: x["seed"]):
-            h.update(f"{r['seed']}:{r['verdict']}:{r['failure']}:{r['steps']}:{r['cut']}"
-                     .encode())
-    return h.hexdigest()[:16]
+        for r in d["rows"]:
+            h = hashlib.sha256(
+                f"{r['seed']}:{r['verdict']}:{r['failure']}:{r['steps']}:{r['cut']}".encode())
+            out[label_key(arm, r["seed"])] = h.hexdigest()[:16]
+    return out
+
+
+def _load_labels(out_dir: str, pm: dict, *, what: str) -> tuple[dict, dict, list]:
+    """Labels, the fresh fingerprint map, and the keys whose trial has since been re-rolled.
+
+    Args:
+        out_dir: Probe directory.
+        pm: The probe manifest.
+        what: Verb for the refusal message.
+
+    Returns:
+        ``(labels, fingerprints, stale_keys)``.
+    """
+    import os  # noqa: PLC0415
+
+    lab_path = os.path.join(out_dir, "labels.json")
+    labels: dict[str, str] = {}
+    if os.path.isfile(lab_path):
+        with open(lab_path, encoding="utf-8") as fh:
+            labels = json.load(fh)
+    if labels and all(k.isdigit() for k in labels):
+        raise SystemExit(
+            f"REFUSING to {what}: {lab_path} is keyed by POSITION in the blinded order, the "
+            "old scheme. Run `--stage migrate` first -- it rewrites the keys as arm:seed "
+            "using the shuffle seed the labels were made with, so nothing is re-labelled.")
+    fps = trial_fingerprints(pm)
+    old: dict[str, str] = {}
+    ctx_path = os.path.join(out_dir, "label_context.json")
+    if os.path.isfile(ctx_path):
+        with open(ctx_path, encoding="utf-8") as fh:
+            old = (json.load(fh) or {}).get("trials", {})
+    stale = [k for k in labels if k in old and fps.get(k) != old[k]]
+    return labels, fps, stale
 
 
 def order_of(pm: dict, seed: int) -> list[tuple[str, int]]:
@@ -363,6 +569,119 @@ def order_of(pm: dict, seed: int) -> list[tuple[str, int]]:
     return keys
 
 
+def stage_watch(args) -> int:
+    """Replay trials for a human to WATCH, writing nothing.
+
+    The labelling stage cannot do this job.  It is blind by construction and it advances only
+    on one of :data:`KEYS`, so "just look at them" there means inventing a label per trial and
+    leaving it in ``labels.json`` -- which is the one file a probe's conclusion rests on.  This
+    stage therefore shows the arm, plays in a fixed order rather than a shuffled one, advances
+    when the pass ends, and never opens ``labels.json`` at all.
+
+    Defaults to the WHOLE episode, since watching is usually about how a trial ended rather
+    than about the first mode; ``[v]`` still toggles back to the label window.
+
+    Args:
+        args: Parsed CLI arguments; ``--out`` and optionally ``--arm`` (one arm instead of
+            all), ``--whole`` / ``--rt`` / ``--passes`` as in ``--stage label``.
+
+    Returns:
+        Process exit status.
+    """
+    import mujoco  # noqa: PLC0415
+    import mujoco.viewer  # noqa: PLC0415
+
+    from mjeval import view_cell  # noqa: PLC0415
+
+    pm = load_probe(args.out)
+    if args.clip:
+        pm["clip"] = args.clip
+    arms = sorted(pm["arms"])
+    if args.arm:
+        if args.arm not in pm["arms"]:
+            raise SystemExit(f"no arm {args.arm!r} in {args.out}; have {', '.join(arms)}")
+        arms = [args.arm]
+    # Fixed order, NOT `order_of`: blinding exists to keep a labeller honest, and nothing is
+    # recorded here. The default is SEED-MAJOR because the seed IS the noise draw --
+    # `stage_run` sets `policy._rng = default_rng(seed)` and nothing else varies within an arm
+    # -- so one seed across two arms is a single draw through two generators, which is the only
+    # pairing in this data that holds the randomness fixed. Watching those back to back is what
+    # makes a difference attributable to the generator rather than to the draw.
+    have = {(a, r["seed"]) for a in arms for r in pm["arms"][a]["rows"]}
+    seeds = sorted({sd for _, sd in have})
+    if args.by_arm:
+        order = [(a, sd) for a in arms for sd in seeds if (a, sd) in have]
+    else:
+        order = [(a, sd) for sd in seeds for a in arms if (a, sd) in have]
+    if not order:
+        print("[mode] no trials to watch.")
+        return 0
+    paired = not args.by_arm and len(arms) > 1
+    print(f"[mode] {len(order)} trial(s) across {len(arms)} arm(s): {', '.join(arms)}")
+    if paired:
+        print("[mode] PAIRED: the same seed back to back across arms -- one flow-noise draw, "
+              f"{len(arms)} generators. Order: " + " -> ".join(arms))
+    incomplete = [sd for sd in seeds if sum((a, sd) in have for a in arms) != len(arms)]
+    if paired and incomplete:
+        print(f"[mode] note: {len(incomplete)} seed(s) are not on every arm and so are "
+              f"unpaired ({', '.join(str(x) for x in incomplete[:8])}"
+              f"{', ...' if len(incomplete) > 8 else ''}).")
+    print(f"[mode] tile {pm['terrain_id']} ({pm['klass']}), label window ends at "
+          f"x={pm['label_x_m']:.2f} m")
+    print("[mode] WATCH ONLY -- nothing is written, and the arm IS shown.")
+    print("[mode]   [space] pause/resume   [r] replay   [v] window/whole   [q] quit   "
+          "any other key: next")
+
+    # Whole episode by default here, the opposite of --stage label's default.
+    full = bool(args.whole) or not args.window_only
+    course = terrains.isaac_tile_course(
+        pm["clip"], int(pm["terrain_id"]), speeds=(float(pm["speed"]),),
+        klass=pm["klass"], name=f"modeprobe_t{pm['terrain_id']}",
+        spawn_from="route", obstacle_from=str(pm.get("obstacle_from", "raised")),
+        goal_from="route")
+    terrains.write_scene(course, pm["robot_name"])
+    model = Robot(robot_name=pm["robot_name"], scene_name=course.name,
+                  joystick_scaling=np.ones(3), input_function=lambda _t: np.zeros(3),
+                  fall_height=0.2, fall_tilt_rad=float(np.deg2rad(70.0))).mj_model
+
+    data = mujoco.MjData(model)
+    target_z = course.floor_z if course.flight_height_m < 0 else course.flight_height_m
+    quit_now = False
+    with cbreak_stdin() as live, mujoco.viewer.launch_passive(model, data) as viewer:
+        for n_seen, (arm, seed) in enumerate(order, start=1):
+            if quit_now or not viewer.is_running():
+                break
+            z = np.load(os.path.join(args.out, "trials", arm, f"trial_{seed:04d}.npz"),
+                        allow_pickle=False)
+            q, t, cut = z["qpos"], z["time"], int(z["cut"])
+            drain_keys()
+            while True:
+                if not viewer.is_running():
+                    quit_now = True
+                    break
+                n = q.shape[0] if full else cut
+                pair_pos = (f"  [{arms.index(arm) + 1}/{len(arms)} of seed {seed}]"
+                            if paired else "")
+                print(f"\n[{n_seen}/{len(order)}]  seed {seed}  arm {arm}{pair_pos}  "
+                      f"{'WHOLE episode' if full else 'to the first feature'}: "
+                      f"{t[n - 1] - t[0]:.2f} s at {args.rt:g}x  "
+                      f"({z['verdict']}{'/' + str(z['failure']) if str(z['failure']) else ''})",
+                      flush=True)
+                ans = _play(viewer, model, data, q[:n], t[:n], course, target_z,
+                            float(args.rt), view_cell, live)
+                if ans == "__closed__" or ans == "q":
+                    quit_now = True
+                    break
+                if ans == "r":
+                    continue
+                if ans == "v":
+                    full = not full
+                    continue
+                break           # played out, or any other key -> next trial
+    print("[mode] done; nothing was written.")
+    return 0
+
+
 def stage_label(args) -> int:
     """Replay each trial blind and record the human's mode call."""
     import mujoco  # noqa: PLC0415
@@ -376,37 +695,21 @@ def stage_label(args) -> int:
     order = order_of(pm, int(args.shuffle_seed))
     lab_path = os.path.join(args.out, "labels.json")
     ctx_path = os.path.join(args.out, "label_context.json")
-    ctx = {"arms": sorted(pm["arms"]), "shuffle_seed": int(args.shuffle_seed),
-           "trials": {a: len(d["rows"]) for a, d in sorted(pm["arms"].items())},
-           "rollout": _rollout_fingerprint(pm)}
-    labels: dict[str, str] = {}
-    if os.path.isfile(lab_path):
-        with open(lab_path, encoding="utf-8") as fh:
-            labels = json.load(fh)
-        # A label is keyed by its POSITION in the blinded order, and that order is a shuffle
-        # over every arm in the manifest -- so adding an arm, or changing the seed, re-points
-        # every existing label at a different trial. Silently: the file still parses and the
-        # report still runs. Refusing is the only way that cannot happen.
-        old_ctx = {}
-        if os.path.isfile(ctx_path):
-            with open(ctx_path, encoding="utf-8") as fh:
-                old_ctx = json.load(fh)
-        if labels and old_ctx and old_ctx != ctx:
-            raise SystemExit(
-                "REFUSING: this probe's arms or shuffle seed changed since "
-                f"{len(labels)} label(s) were recorded.\n"
-                f"  labelled against: {old_ctx}\n"
-                f"  now:              {ctx}\n"
-                "Labels are keyed by position in the blinded order, which is a shuffle over "
-                "every arm, so they now point at different trials. Either finish rolling ALL "
-                "arms before labelling, or delete labels.json and start over.")
-        if labels and not old_ctx:
-            print("[mode] note: these labels predate the context check; assuming they were "
-                  "made against the current arm set.")
+    # Labels are keyed by TRIAL, so adding trials leaves every existing one valid and only the
+    # new ones are asked. A trial that was RE-ROLLED and moved still invalidates its own label,
+    # which is the property the old whole-probe digest was protecting.
+    labels, fps, stale = _load_labels(args.out, pm, what="label")
+    for k in stale:
+        labels.pop(k, None)
+    if stale:
+        print(f"[mode] {len(stale)} trial(s) have been re-rolled since they were labelled; "
+              "those labels are dropped and the trials will be asked again.")
+        with open(lab_path, "w", encoding="utf-8") as fh:
+            json.dump(labels, fh, indent=2)
     with open(ctx_path, "w", encoding="utf-8") as fh:
-        json.dump(ctx, fh, indent=2)
-    todo = [i for i, _ in enumerate(order)
-            if args.relabel or str(i) not in labels]
+        json.dump({"trials": fps}, fh, indent=2)
+    todo = [i for i, (arm, seed) in enumerate(order)
+            if args.relabel or label_key(arm, seed) not in labels]
     print(f"[mode] {len(order)} trials across {len(pm['arms'])} arms; "
           f"{len(order) - len(todo)} already labelled, {len(todo)} to go")
     if not todo:
@@ -419,10 +722,14 @@ def stage_label(args) -> int:
           + "  ".join(f"[{k}] {v}" for k, v in KEYS.items()))
     print("[mode]   [space] pause/resume   [r] replay   [v] whole episode   [q] save+quit")
 
+    # Sticky across trials: `[v]` used to be reset to the window at the top of every trial,
+    # so a whole-episode session meant pressing it once per trial.
+    full = bool(args.whole)
     course = terrains.isaac_tile_course(
         pm["clip"], int(pm["terrain_id"]), speeds=(float(pm["speed"]),),
         klass=pm["klass"], name=f"modeprobe_t{pm['terrain_id']}",
-        spawn_from="route", obstacle_from="raised")
+        spawn_from="route", obstacle_from=str(pm.get("obstacle_from", "raised")),
+        goal_from="route")
     # The rig's own two lines, without the policy: it needs one only for the PD gains, and a
     # replay steps no physics.
     terrains.write_scene(course, pm["robot_name"])
@@ -443,7 +750,6 @@ def stage_label(args) -> int:
             z = np.load(os.path.join(args.out, "trials", arm, f"trial_{seed:04d}.npz"),
                         allow_pickle=False)
             q, t, cut = z["qpos"], z["time"], int(z["cut"])
-            full = False
             done = 0
             drain_keys()
             while True:
@@ -478,7 +784,7 @@ def stage_label(args) -> int:
                     full = not full
                     continue
                 if ans in KEYS:
-                    labels[str(i)] = KEYS[ans]
+                    labels[label_key(arm, seed)] = KEYS[ans]
                     # Written after EVERY answer: a labelling session is human time, and a
                     # crash at trial 80 must not cost the first 79.
                     with open(lab_path, "w", encoding="utf-8") as fh:
@@ -591,6 +897,78 @@ def _play(viewer, model, data, q, t, course, target_z, rt: float, view_cell,
 # ---------------------------------------------------------------------------------------------
 # Stage: report
 # ---------------------------------------------------------------------------------------------
+def stage_migrate(args) -> int:
+    """Rewrite position-keyed labels as arm:seed, in place, labelling nothing new.
+
+    The old scheme keyed a label by its index in the blinded order. That order is
+    ``order_of(pm, shuffle_seed)``, and it is reproducible -- so as long as the probe still has
+    the trials it had when the labels were made, position i maps back to exactly the trial the
+    human watched. The shuffle seed comes from the probe's own ``label_context.json`` rather
+    than from the command line, because using a different one here would re-point every label
+    silently, which is the failure this whole change exists to remove.
+
+    Args:
+        args: Parsed CLI arguments.
+
+    Returns:
+        Process exit status.
+    """
+    pm = load_probe(args.out)
+    lab_path = os.path.join(args.out, "labels.json")
+    ctx_path = os.path.join(args.out, "label_context.json")
+    if not os.path.isfile(lab_path):
+        raise SystemExit(f"no labels at {lab_path}; nothing to migrate.")
+    with open(lab_path, encoding="utf-8") as fh:
+        labels = json.load(fh)
+    if not labels:
+        raise SystemExit("labels.json is empty; nothing to migrate.")
+    if not all(k.isdigit() for k in labels):
+        print(f"[mode] {lab_path} is already keyed by arm:seed; nothing to do.")
+        return 0
+
+    old_ctx = {}
+    if os.path.isfile(ctx_path):
+        with open(ctx_path, encoding="utf-8") as fh:
+            old_ctx = json.load(fh) or {}
+    seed = int(old_ctx.get("shuffle_seed", args.shuffle_seed))
+    # The trial COUNTS decide the order, so a probe that has already been extended cannot be
+    # migrated -- position i no longer means what it meant. Refuse rather than mis-map.
+    now_counts = {a: len(d["rows"]) for a, d in sorted(pm["arms"].items())}
+    was_counts = old_ctx.get("trials")
+    if was_counts and {k: int(v) for k, v in was_counts.items()} != now_counts:
+        raise SystemExit(
+            f"REFUSING: the labels were made when the arms held {was_counts} trials and they "
+            f"now hold {now_counts}. Position keys only map back against the counts they were "
+            "recorded under, so migrate BEFORE rolling more trials.")
+
+    order = order_of(pm, seed)
+    out: dict[str, str] = {}
+    for i_str, mode in labels.items():
+        i = int(i_str)
+        if not 0 <= i < len(order):
+            raise SystemExit(f"REFUSING: label index {i} is outside the {len(order)} trials "
+                             "this probe holds; the labels do not belong to it.")
+        arm, tseed = order[i]
+        out[label_key(arm, tseed)] = mode
+    if len(out) != len(labels):
+        raise SystemExit(f"REFUSING: {len(labels)} labels collapsed to {len(out)} keys, so two "
+                         "positions mapped to one trial. Not migrating.")
+
+    backup = lab_path + ".position_keyed.bak"
+    os.replace(lab_path, backup)
+    with open(lab_path, "w", encoding="utf-8") as fh:
+        json.dump(out, fh, indent=2)
+    with open(ctx_path, "w", encoding="utf-8") as fh:
+        json.dump({"trials": trial_fingerprints(pm)}, fh, indent=2)
+    per_arm: dict[str, int] = {}
+    for k in out:
+        per_arm[k.rsplit(":", 1)[0]] = per_arm.get(k.rsplit(":", 1)[0], 0) + 1
+    print(f"[mode] migrated {len(out)} label(s) using shuffle_seed={seed}: "
+          + ", ".join(f"{a} {n}" for a, n in sorted(per_arm.items())))
+    print(f"[mode] previous file kept at {backup}")
+    return 0
+
+
 def stage_report(args) -> int:
     """Join the blind labels back to their arms and compare."""
     pm = load_probe(args.out)
@@ -600,18 +978,13 @@ def stage_report(args) -> int:
         raise SystemExit(f"no labels at {lab_path}; run --stage label first.")
     with open(lab_path, encoding="utf-8") as fh:
         labels = json.load(fh)
-    ctx_path = os.path.join(args.out, "label_context.json")
-    if os.path.isfile(ctx_path):
-        with open(ctx_path, encoding="utf-8") as fh:
-            ctx = json.load(fh)
-        now = {"arms": sorted(pm["arms"]), "shuffle_seed": int(args.shuffle_seed),
-               "trials": {a: len(d["rows"]) for a, d in sorted(pm["arms"].items())},
-               "rollout": _rollout_fingerprint(pm)}
-        if ctx != now:
-            raise SystemExit(
-                f"REFUSING to report: the labels were made against {ctx} and the probe is now "
-                f"{now}. The blinded order differs, so the join would attribute labels to the "
-                "wrong arm.")
+    _, _, stale = _load_labels(args.out, pm, what="report")
+    if stale:
+        raise SystemExit(
+            f"REFUSING to report: {len(stale)} labelled trial(s) have been re-rolled since "
+            f"they were labelled ({', '.join(sorted(stale)[:6])}"
+            f"{' ...' if len(stale) > 6 else ''}). The label describes the OLD trajectory. "
+            "Re-run `--stage label` -- it drops exactly those and asks them again.")
 
     want = pm.get("expected_mode", "")
     # Baseline first, whatever it is called, so the delta is always ARM - BASELINE.
@@ -619,8 +992,8 @@ def stage_report(args) -> int:
     arms = sorted(pm["arms"], key=lambda a: (a.lower() not in order_hint, a))
     counts = {a: dict.fromkeys(MODES, 0) for a in arms}
     verdicts = {a: {} for a in arms}
-    for i, (arm, seed) in enumerate(order):
-        m = labels.get(str(i))
+    for arm, seed in order:
+        m = labels.get(label_key(arm, seed))
         if m is None:
             continue
         counts[arm][m] += 1
@@ -720,7 +1093,8 @@ def _fisher(a: int, b: int, c: int, d: int) -> float:
 def main() -> int:
     """Dispatch a stage."""
     args = build_parser().parse_args()
-    return {"run": stage_run, "label": stage_label, "report": stage_report}[args.stage](args)
+    return {"run": stage_run, "watch": stage_watch, "label": stage_label,
+            "report": stage_report, "migrate": stage_migrate}[args.stage](args)
 
 
 if __name__ == "__main__":

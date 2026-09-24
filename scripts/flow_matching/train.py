@@ -54,6 +54,7 @@ from robot_rl.flow_matching import (  # noqa: E402
     MEASURED_HISTORY_FALLBACK,
     FlowMatchingTransformer,
     FutureStateDataset,
+    apply_camera_subset,
     build_train_val,
     resolve_skip_families,
     flow_matching_loss,
@@ -111,6 +112,14 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
                         help="N autoregressive context tokens: the reference-window nodes the "
                              "generator emitted at the N previous control steps. Needs a "
                              "recording with history_len >= N + 1.")
+    parser.add_argument(
+        "--extero_keep_cameras", type=str, default="",
+        help="Comma-separated camera names to KEEP (e.g. 'near'). Empty keeps every camera, "
+             "which is what every run before this did. The recording holds both, so this drops "
+             "one at dataset build: the near-only ABLATION then varies what the model is shown "
+             "and nothing else, where re-recording near-only would vary the rollouts too. "
+             "Fewer cameras means fewer extero tokens and no sensor-type embedding, so the "
+             "resulting checkpoint is deliberately not loadable into a two-camera model.")
     parser.add_argument("--extero_source", type=str, default=FlowMatchingConfig().extero_source,
                         choices=list(EXTERO_SOURCES),
                         help="Which recorded exteroception feeds the conditioning tokens. "
@@ -307,8 +316,11 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
              "CONTROL STEPS, so '0,0.10,0.40,0.50' is P(0 ms), P(20 ms), P(40 ms), P(60 ms) "
              "-- the camera and control both run at 50 Hz, so a step is exactly 20 ms. "
              "'shipped' uses DEPTH_LATENCY_PROBS (that same tuple, mean 48 ms, matching the "
-             "measured depth-compute-plus-ROS lag). Omit for NO latency: the frame captured "
-             "at the re-plan, which is what every recording before 2026-08-21 supports. "
+             "measured depth-compute-plus-ROS lag) and is now what OMITTING the flag gives "
+             "too -- the config defaults to it, because every generator that has gone near a "
+             "robot carries it. Pass 'none' (or 'off') for the no-latency ablation: the frame "
+             "captured at the re-plan, which is what every recording before 2026-08-21 "
+             "supports. "
              "Needs a recording that carries 'depth_lag'; it raises rather than silently "
              "falling back. Keep lag 0 at zero -- a frame cannot arrive in the step it was "
              "captured in, and it is the easiest case.")
@@ -463,6 +475,13 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument(
+        "--resume_from", type=str, default="",
+        help="Continue training from this checkpoint: model, optimizer moments, EMA shadow "
+             "and step, and the epoch counter are all restored, so it is a true resume rather "
+             "than a warm restart. Runs from the checkpoint's epoch+1 to --num_epochs. "
+             "Refuses a checkpoint whose architecture or data hash disagrees with this run. "
+             "The RNG is not restored, so data order differs from an uninterrupted run.")
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument(
         "--lr_warmup_steps", type=int, default=FlowMatchingConfig().lr_warmup_steps,
@@ -538,8 +557,13 @@ def parse_args() -> tuple[FlowMatchingConfig, argparse.Namespace]:
     if args.extero_clip is not None:
         cfg.extero_clip = float(args.extero_clip)
     if args.depth_latency_probs is not None:
+        # `none` is the OFF switch, and it has to be a spelled word rather than an omitted
+        # flag: the config now DEFAULTS to DEPTH_LATENCY_PROBS, so omitting this gives lag.
+        # Without an explicit off there is no way to run the no-latency ablation the recorder
+        # keeps every frame for.
         cfg.depth_latency_probs = (
-            DEPTH_LATENCY_PROBS if args.depth_latency_probs == "shipped"
+            None if args.depth_latency_probs.lower() in ("none", "off")
+            else DEPTH_LATENCY_PROBS if args.depth_latency_probs == "shipped"
             else tuple(float(x) for x in args.depth_latency_probs.split(",") if x.strip()))
     return cfg, args
 
@@ -601,6 +625,92 @@ def channel_metrics(
 _CONS_KEYS = ("vel_consistency", "joint_vel_consistency", "fk_pose",
               "body_pose_root", "body_pose_root_pos", "body_pose_root_ori",
               "body_pose_world", "body_pose_world_pos", "body_pose_world_ori")
+
+
+def _restore_for_resume(path: str, model, opt, ema, cfg, device) -> tuple[int, int]:
+    """Restore model, optimizer and EMA from a checkpoint and say where to carry on.
+
+    **A TRUE resume, not a warm restart, and the difference is the optimizer.** Reloading only
+    the weights would reset Adam's first and second moments and restart the LR warmup, which is
+    a different optimisation problem wearing the same name -- and one whose output would be
+    quietly not comparable with an uninterrupted run of the same config. What makes the faithful
+    version possible here is that the checkpoint already carries everything stateful:
+
+    * ``optimizer`` -- the moments;
+    * ``model_ema`` + ``ema_state`` -- the shadow weights and the EMA's own step count, which
+      ``best.pt`` is selected on;
+    * ``epoch``, and through ``ema_state["step"]`` the global optimizer step.
+
+    ``global_step`` is taken from the EMA's step because there is exactly one EMA update per
+    optimizer step, and it is needed rather than cosmetic: :func:`scheduled_lr` is CLOSED FORM
+    in ``(epoch, step)``, so those two numbers fully determine the learning rate. There is no
+    scheduler object whose state could be lost -- which is precisely why that design makes a
+    resume tractable.
+
+    **What is NOT restored: the RNG.** Data order after a resume differs from an uninterrupted
+    run, so the two are statistically equivalent rather than bit-identical. Say so when
+    reporting a resumed run rather than implying reproducibility it does not have.
+
+    **A mismatched resume is REFUSED**, because it is the dangerous case: continuing training
+    from weights fitted to different data or a different architecture produces a model that
+    loads, trains and reports plausible numbers while meaning nothing.
+
+    Args:
+        path: Checkpoint to resume from.
+        model: The constructed model, modified in place.
+        opt: The optimizer, modified in place.
+        ema: The weight EMA, or ``None``; modified in place.
+        cfg: The run's config, checked against the checkpoint's.
+        device: Device the model lives on.
+
+    Returns:
+        ``(start_epoch, global_step)`` -- the first epoch to run, and the optimizer step count.
+
+    Raises:
+        FileNotFoundError: If the checkpoint is missing.
+        ValueError: On an architecture or data mismatch, or a checkpoint with no optimizer
+            state (which could only give a warm restart).
+    """
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"--resume_from {path!r} does not exist.")
+    ck = torch.load(path, map_location=device, weights_only=False)
+    if "optimizer" not in ck:
+        raise ValueError(
+            f"{path} carries no optimizer state, so this could only be a WARM RESTART with "
+            "Adam's moments reset and the LR warmup replayed -- a different optimisation "
+            "problem. Train from scratch instead, or resume from a checkpoint that has one.")
+    old = ck.get("config", {}) or {}
+    arch = ("d_model", "nhead", "num_layers", "dim_feedforward", "state_dim", "history_dim",
+            "extero_source", "extero_sensor_count", "extero_sensor_dim", "extero_channels",
+            "attention_mode", "history_source")
+    bad = [(k, old.get(k), getattr(cfg, k, None)) for k in arch
+           if k in old and old[k] != getattr(cfg, k, None)]
+    if bad:
+        raise ValueError(
+            "REFUSING to resume: the checkpoint's config disagrees with this run's on "
+            + ", ".join(f"{k} ({a!r} -> {b!r})" for k, a, b in bad)
+            + ". Resuming across an architecture change trains weights that no longer mean "
+              "what they did.")
+    want = getattr(cfg, "data_sha256", None) or ck.get("data_sha256")
+    if ck.get("data_sha256") and want and ck["data_sha256"] != want:
+        raise ValueError(
+            f"REFUSING to resume: the checkpoint was fitted on data_sha256 "
+            f"{ck['data_sha256'][:16]}... and this run has {str(want)[:16]}....")
+    model.load_state_dict(ck["model"])
+    opt.load_state_dict(ck["optimizer"])
+    st = dict(ck.get("ema_state") or {})
+    if ema is not None and "model_ema" in ck:
+        ema.shadow = {k: v.to(device) for k, v in ck["model_ema"].items()}
+        ema.step = int(st.get("step", 0))
+    start_epoch = int(ck.get("epoch", -1)) + 1
+    global_step = int(st.get("step", 0))
+    print(f"[INFO] RESUMED from {path}: epoch {ck.get('epoch')} -> starting at {start_epoch} "
+          f"of {cfg.num_epochs}, global_step {global_step}, optimizer moments and EMA "
+          f"restored (EMA step {st.get('step')}). The RNG is NOT restored, so the data order "
+          "differs from an uninterrupted run -- statistically equivalent, not bit-identical. "
+          "`best.pt` in THIS run directory is the best over the resumed span only; the "
+          "earlier run's own best.pt is untouched.")
+    return start_epoch, global_step
 
 
 def scheduled_lr(base_lr: float, epoch: int, num_epochs: int, step: int,
@@ -862,6 +972,13 @@ def main() -> None:
     cfg.dt = float(args.dt) if args.dt is not None else float(meta.dt)
     print(f"[auto] target_source={cfg.target_source}, cmd_array={cfg.cmd_array or 'none'}, "
           f"skip_families={cfg.skip_families or 'none'}")
+    # CAMERA SUBSET, before anything derives a sensor count. Downstream everything reads the
+    # shape of `data` and the contract on `meta`, so slicing both here is the whole change --
+    # tokens, the per-sensor angular position embedding, the xyz unprojection and the exported
+    # extero_spec all follow from it. A no-op (and not even a copy) when nothing is dropped.
+    cfg.extero_keep_cameras = (
+        [c.strip() for c in str(args.extero_keep_cameras).split(",") if c.strip()] or None)
+    data, meta = apply_camera_subset(data, meta, cfg.extero_keep_cameras, cfg.extero_source)
     train_ds, val_ds = build_train_val(data, meta, cfg)
     num_joints = train_ds.num_joints
     print(f"[INFO] window blocks={list(train_ds.blocks)} -> {cfg.state_dim}/node "
@@ -1074,7 +1191,11 @@ def main() -> None:
 
     best_val = math.inf
     global_step = 0
-    for epoch in range(cfg.num_epochs):
+    start_epoch = 0
+    if args.resume_from:
+        start_epoch, global_step = _restore_for_resume(
+            args.resume_from, model, opt, ema, cfg, device)
+    for epoch in range(start_epoch, cfg.num_epochs):
         model.train()
         epoch_start = time.perf_counter()
         epoch_loss, n = 0.0, 0

@@ -5,7 +5,7 @@
 
 A critic borrows the generator's encoder AND its three normalizers, so reading one against the
 wrong generator loads with every shape agreeing and three wrong input scales -- which nothing
-downstream can detect.  ``FailureCritic`` therefore refuses a ``--critic_fm_pt`` that differs
+downstream can detect.  ``ValueCritic`` therefore refuses a ``--critic_fm_pt`` that differs
 from the path the checkpoint names unless it can verify the pair by content, and a checkpoint
 fitted before ``fit_value.py`` began stamping ``fm_checkpoint_sha256`` names an absolute path
 on the machine that fitted it and carries no hash.  Moved to another box, that critic is

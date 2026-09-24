@@ -39,6 +39,17 @@ cd "$W" || exit 1
 TAG=""; GPU=""; BUFFER=4000; REFRESH=1000; ITERS=5; ROOT=""
 PARENT="${PARENT:-/mnt/zolkin_new/sprout/terrain_reward_smoke/fm/best.pt}"
 TRK="${TRK:-2026-08-20_16-36-10_mode11_decor_plan_v1}"
+#: PIN the tracker checkpoint, rather than letting `--load_run` take the newest.
+#:
+#: `get_checkpoint_path` resolves a run NAME to its latest file, which is correct for a
+#: finished run and wrong for one still training: the generator was fitted on the rollouts of
+#: ONE tracker checkpoint, and grading it against a later one measures the pair rather than the
+#: generator. On a shared box the tracker is often still going, so "newest" moves between two
+#: jobs of the same campaign and nothing in the output says which was used.
+#:
+#: Empty keeps the old behaviour. The recording stamps `checkpoint_path`, so the value to pin
+#: is recoverable from the FM's own training data.
+CKPT="${CKPT:-}"
 #: The two-box TRAINING library: v2 geometry with the three spawn areas declared. The old
 #: default `box2_v2_train.h5` was retired on 2026-09-09 -- it declares 0 spawn areas, which
 #: today's generator cannot reproduce, and it is in `clips/_retired_2026-09-09/`. The eval
@@ -63,12 +74,26 @@ SUCCESS_C="${SUCCESS_C:-10.0}"
 #: later round refits against `r + gamma^N V` with V FROZEN as the previous round's
 #: predictions on disk. 1 = pure MC, i.e. the old behaviour.
 FVI_ROUNDS="${FVI_ROUNDS:-2}"
-#: The SPEED-MISMATCH arm's fraction, within the eligible population. Off by default: it is a
-#: third change on top of the reward and the spawns, and an arm nobody asked for should not be
-#: in a run's data silently. Set it per run (SPEED_MISMATCH=0.5) once the reward itself has a
-#: baseline. The reward scores velocity against the NOMINAL speed, so this arm is a
-#: corruption to reject rather than a command to follow -- see the cfg field's docstring.
-SPEED_MISMATCH="${SPEED_MISMATCH:-0.0}"
+#: The SPEED-MISMATCH arm's fraction, within the eligible population (so 0.30 of the perturbed
+#: envs is ~15% of episodes). The reward scores velocity against the NOMINAL speed, so this arm
+#: is an input corruption to REJECT rather than a command to follow -- see the cfg field's
+#: docstring.
+#:
+#: 0.30 because EVERY REPORTED RESULT WAS MEASURED AT 0.30, and the default used to be 0.0.
+#: The whole `vm30_*` ladder ran at it -- awr_h05 0.7838, box2 0.6379, fbc 0.5305, arrived
+#: 0.4719, bc 0.0000, plus the up-into-down and in-distribution arms -- each arm's own loop
+#: banner ("speed-mismatch 0.30") being the evidence. Only the superseded `prog_s3` ran at 0.0.
+#: A re-launch from the old default therefore reproduced none of the numbers we report, and
+#: nothing in the output said so; the arm now travels in the repo instead of in three talos
+#: launchers.
+#:
+#: **This value is NOT justified by a measured gain, and do not quote one.** The nearest
+#: comparison, `prog_s3` at 0.0, scored 0.5333 against vm30_box2's 0.6379 -- but that is
+#: pooled over 7591 episodes versus first-per-env over 4200, i.e. a different reducer AND a
+#: different episode count, and the pooled number is biased low (see `first_per_env`). The
+#: 0.30-vs-0.0 A/B at matched settings has never been run. What justifies 0.30 is
+#: reproducibility of the reported ladder, nothing more.
+SPEED_MISMATCH="${SPEED_MISMATCH:-0.30}"
 BETA="${BETA:-0.5}"
 WORKERS="${WORKERS:-16}"
 PROJECT="${PROJECT:-robot_rl_awr}"
@@ -129,6 +154,21 @@ case "$ALGO" in awr|fbc|bc|arrived) ;; *)
 #: `loose` reproduces the pre-termination behaviour and is what a recording made before this
 #: must be scored under -- under `strict`, on a recording that did NOT terminate, the cut
 #: deleted the success bonus row from 95.3% of arriving episodes.
+#: Extra hydra overrides for the COLLECT stage only, space separated and word-split on purpose.
+#: Empty by default, so every existing invocation composes the identical env.
+#:
+#: It exists for the LOOSER-TERMINATION arm: `env.terminations.tracking_violation=null` removes
+#: the reference-relative bound, which is doing 100% of the failure work on these courses --
+#: measured, falls are 0.0% of episode endings on boxes, updown, multi and indist, because the
+#: tracking bound (0.2 m lateral, 0.12 m height) always fires long before the 0.3 m fall bound.
+#: An arm collected that way MUST also set FAILURE_RULE=loose, or grade and the arrival filter
+#: score a recording that did NOT terminate under a rule that assumes it did; see that variable
+#: for what that costs.
+#:
+#: Echoed below rather than left implicit: it changes what the recording IS, and a run whose
+#: collect differed from the default has to say so in its own log.
+COLLECT_OVERRIDES="${COLLECT_OVERRIDES:-}"
+
 FAILURE_RULE="${FAILURE_RULE:-strict}"
 case "$FAILURE_RULE" in strict|loose) ;; *)
   echo "REFUSING: FAILURE_RULE must be strict or loose; got '$FAILURE_RULE'."; exit 2;; esac
@@ -252,6 +292,29 @@ HEAD="$(git rev-parse --short HEAD)"
 echo "==================================================================="
 echo "[awr] tag $TAG  gpu $GPU  worktree $HEAD"
 echo "[awr] buffer $BUFFER episodes, refresh $REFRESH, $ITERS iterations"
+#: The upper-camera dropout arm needs an UPPER CAMERA. A near-only generator has one camera,
+#: and `FmTrackingCommand._post_init` refuses the term outright rather than perturbing nothing:
+#:   "fm_upper_camera_noise_fraction is set but the upper camera could not be identified"
+#: -- which kills the collect before a single episode, and reads as a checkpoint fault.
+#:
+#: So it is DERIVED from the parent's own extero_sensor_count rather than assumed to be 2.
+#: This is a real difference in the collect distribution between a near-only arm and a
+#: two-camera one, and an unavoidable one: you cannot drop a camera the model does not have.
+#: Say so when comparing them.
+UPPER_CAM_NOISE=$("$PY" - "$PARENT" <<'PYEOF'
+import sys, torch
+try:
+    ck = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+    n = int((ck.get("config") or {}).get("extero_sensor_count", 2) or 2)
+except Exception:
+    n = 2
+print("0.5" if n >= 2 else "0.0")
+PYEOF
+)
+echo "[awr] upper-cam noise $UPPER_CAM_NOISE (parent has $("$PY" -c "
+import sys, torch
+ck = torch.load(sys.argv[1], map_location='cpu', weights_only=False)
+print(int((ck.get('config') or {}).get('extero_sensor_count', 2) or 2))" "$PARENT") camera(s))"
 echo "[awr] parent $PARENT"
 echo "[awr] root   $ROOT"
 echo "[awr] wandb  $PROJECT / ONE run 'loop_$TAG' / seed $SEED"
@@ -270,6 +333,8 @@ echo "[awr] failed $FAILURE_RULE -- $([ "$FAILURE_RULE" = "strict" ] \
   && echo "fall OR the tracking bounds (Isaac TERMINATES on them: height 0.12 m)" \
   || echo "the FALL alone -- for scoring a recording made before the termination landed")"
 echo "[awr] arms   camera 0.5 (dead, per-replan), history-null 0.0, speed-mismatch $SPEED_MISMATCH"
+[ -n "$COLLECT_OVERRIDES" ] && \
+  echo "[awr] collect OVERRIDES: $COLLECT_OVERRIDES  <- this run's collect is not the default"
 echo "[awr] hist   $HISTORY_FROM$([ "$HISTORY_FROM" = "measured" ] && echo " -- OFF-DISTRIBUTION by design; the eval must pass the same" || echo "")"
 echo "[awr] clip   $CLIP"
 echo "[awr] speed  $SPEED_MIN-$SPEED_MAX m/s, continuous per episode ($SPEED_SRC)"
@@ -356,13 +421,13 @@ for (( it=1; it<=ITERS; it++ )); do
     # then serves the generator arm to a measured-trained checkpoint and
     # `assert_history_source_matches` kills it after the simulator has launched.
     "$PY" -u scripts/rsl_rl/record_rollouts.py \
-      --task="$TASK" --load_run "$TRK" --fm_checkpoint "$POLICY" \
+      --task="$TASK" --load_run "$TRK" ${CKPT:+--checkpoint "$CKPT"} --fm_checkpoint "$POLICY" \
       --clip "$CLIP" --clip_device cpu --goal_regions "$GOALS" \
       --num_envs "$ENVS" --episodes_per_env "$ROUNDS" --num_windows "$NWIN" \
       --history_from "$HISTORY_FROM" \
       --output_dir "$INC" \
       env.commands.traj_ref.fm_perturb_fraction="$PERTURB_FRAC" \
-      env.commands.traj_ref.fm_upper_camera_noise_fraction=0.5 \
+      env.commands.traj_ref.fm_upper_camera_noise_fraction="$UPPER_CAM_NOISE" \
       env.commands.traj_ref.fm_upper_camera_noise_mode=dead \
       env.commands.traj_ref.fm_upper_camera_noise_cadence=replan \
       env.commands.traj_ref.fm_history_null_fraction=0.0 \
@@ -372,6 +437,7 @@ for (( it=1; it<=ITERS; it++ )); do
       env.commands.traj_ref.freeform_speed_max="$SPEED_MAX" \
       env.episode_length_s=40.0 \
       env.terminations.goal_reached.params.height_tol_m="$HEIGHT_TOL" \
+      $COLLECT_OVERRIDES \
       > "$INC/collect.log" 2>&1 || fail "collect (see $INC/collect.log)" "$it"
   fi
 
@@ -473,9 +539,9 @@ for (( it=1; it<=ITERS; it++ )); do
         --fm_checkpoint "$PARENT" \
         --reward_npz "$BUF_NPZ" \
         "${REWARD_ARGS[@]}" "${BOOT_ARGS[@]}" \
-        --window 3 --quality_kind mse --quality_only \
+        --window 3 \
         --failure_rule "$FAILURE_RULE" \
-        --folds 2 --epochs "$EPOCHS_CRITIC" --variants V_priv --device cuda \
+        --folds 2 --epochs "$EPOCHS_CRITIC" --device cuda \
         --out "$RDIR" >> "$ITD/critic.log" 2>&1 \
         || fail "critic round $fr (see $ITD/critic.log)" "$it"
       PREV_PRED="$RDIR/predictions.npz"
@@ -518,7 +584,7 @@ for (( it=1; it<=ITERS; it++ )); do
     # inheriting the script default of 35 that nothing chose.
     echo "[awr] 7/8 label       MC advantage, terrain only, percentile $PERCENTILE"
     "$PY" -u scripts/flow_matching/label_advantage.py "$CRITIC/predictions.npz" \
-      --terrain_only --w_fail 0 --estimator mc --variant V_priv \
+      --terrain_only --estimator mc --variant V_priv \
       --percentile "$PERCENTILE" \
       --out "$CRITIC/advantage.npz" >> "$ITD/critic.log" 2>&1 || fail label "$it"
   fi
@@ -550,10 +616,21 @@ for (( it=1; it<=ITERS; it++ )); do
   # was the one `is_plain_arm`'s own docstring warned would be missed.
   bc)  ALGO_ARGS=(--unconditioned);;
     esac
+    # BALLAST rides on every ALGO. It is not an algorithm choice -- the ladder's four arms
+    # differ in how the GRADED rows are weighted, and the ballast rows are ungraded -- so
+    # putting it in ALGO_ARGS would make one arm's data set differ from another's, which is
+    # exactly the property test_finetune_loop_algos.py pins by parsing this file.
+    BALLAST_ARGS=()
+    if [ "${BALLAST_CHUNKS:-0}" -gt 0 ]; then
+      [ -n "${BALLAST_ROLLOUT:-}" ] || fail "BALLAST_CHUNKS is set but BALLAST_ROLLOUT is not" "$it"
+      BALLAST_ARGS=(--ballast "$BALLAST_ROLLOUT" --ballast_chunks "$BALLAST_CHUNKS"
+                    --ballast_flat_frac "${BALLAST_FLAT_FRAC:-0.0}")
+    fi
     "$PY" -u scripts/flow_matching/finetune_generator.py --no_wandb \
       --pretrained "$POLICY" \
       --rollout "${BUF_STEM}.h5" \
       "${ALGO_ARGS[@]}" \
+      "${BALLAST_ARGS[@]}" \
       --batch_size 256 --num_workers "$WORKERS" \
       --epochs "$EPOCHS_FT" --ckpt_every 1 --device cuda \
       --out "$FT" > "$ITD/ft.log" 2>&1 || fail "finetune (see $ITD/ft.log)" "$it"

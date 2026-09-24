@@ -536,63 +536,18 @@ def stage_select(args) -> int:
 
         tracker = _GoalView(accum)
 
-        scorer = None
-        if args.scorer == "v":
-            import copy  # noqa: PLC0415
-
-            import headroom_value  # noqa: PLC0415
-            from robot_rl.flow_matching import value as fmvalue  # noqa: PLC0415
-
-            ck = torch.load(args.v_checkpoint, map_location="cpu", weights_only=False)
-            named = str(ck["fm_checkpoint"])
-            running = str(getattr(cmd.cfg, "fm_checkpoint", "") or plan_fm_path)
-            # The encoder, state_norm, extero_norm and cmd_norm ALL come from the generator.
-            # A critic fitted over one generator and scored through another's context loads
-            # with the right shapes and three wrong normalizers, and nothing downstream can
-            # detect it -- so the pairing is checked here rather than assumed.
-            # By CONTENT, not by path. `logs/` is reached through both the worktree and
-            # the main checkout, so two spellings of one file compare unequal as strings --
-            # a check that fires on the correct pairing is worse than none, because the way
-            # past it is to disable it.
-            def _sha(path: str) -> str:
-                """SHA-256 of a file, streamed."""
-                import hashlib  # noqa: PLC0415
-
-                h = hashlib.sha256()
-                with open(path, "rb") as fh:
-                    for chunk in iter(lambda: fh.read(1 << 20), b""):
-                        h.update(chunk)
-                return h.hexdigest()
-
-            same = (os.path.realpath(named) == os.path.realpath(running)
-                    or (os.path.exists(named) and os.path.exists(running)
-                        and _sha(named) == _sha(running)))
-            if not same:
-                raise SystemExit(
-                    f"critic {os.path.basename(args.v_checkpoint)} was fitted over\n"
-                    f"  {named}\nbut this run's generator is\n  {running}\n"
-                    "and they differ in CONTENT. The encoder, state_norm, extero_norm and "
-                    "cmd_norm all come from the generator, so this loads with the right "
-                    "shapes and three wrong normalizers and nothing downstream can detect "
-                    "it. Re-plan against the critic's generator, or refit the critic.")
-            priv = bool(ck["privileged"])
-            # See `fit_value`'s stamp: absent means "fitted before the flag existed", and
-            # every such checkpoint carried the goal.
-            goal_ctx = bool(ck.get("goal_context", True))
-            model = fmvalue.FlowValueModel(
-                copy.deepcopy(cmd.ctx.model),
-                scan_hw=(tuple(ck["scan_hw"]) if priv else None),
-                proprio_dim=(int(ck["proprio_hw"][-1]) if priv else 0),
-                proprio_steps=(int(ck["proprio_hw"][0]) if priv else 0),
-                context_dim=int(ck["context_dim"])).to(device)
-            model.load_state_dict(ck["model"])
-            scorer = headroom_value.OnlineValueScorer(
-                model, cmd.ctx, priv=priv, scan_hw=(tuple(ck["scan_hw"]) if priv else None),
-                device=device, scan_sensor=(args.scan_sensor if priv else None),
-                goal_context=goal_ctx)
-            print(f"[select] critic {ck.get('variant','?')} priv={priv} "
-                  f"goal_context={goal_ctx} "
-                  f"fitted over {os.path.basename(os.path.dirname(named))}")
+        # The value scorer is GONE, and `--scorer` offers `oracle` only. It read
+        # `FlowValueModel.p_fail`, the critic's survival head, which no longer exists: the
+        # fine-tune drops that head's loss, so it was untrained in every reported result and
+        # was deleted with the rest of the two-head architecture.
+        #
+        # The ORACLE scorer is untouched, and it is the one that carries the measurement --
+        # "keep whichever candidate survived" is the upper bound on what any selector could
+        # manufacture from simulator noise, which is what this harness exists to bound.
+        #
+        # TODO(headroom-v): rebuild it on the surviving VALUE head (`FlowValueModel.quality`,
+        # a return regression) if a learned scorer is wanted again. That is a different score
+        # from P(fail) and not a drop-in: it ranks by expected return, not by failure risk.
 
         if args.steer_kp != 0.0:
             # Installed on the COMMAND, so the generator's conditioning, the reward and the
@@ -795,14 +750,11 @@ def stage_select(args) -> int:
                     # terminated; the slowest one sets the pace.
                     ge.carrier = np.array([g * group_size for g in range(num_groups)])
 
-                if scorer is not None:
-                    # score() returns P(fail): LOWER is better, so the sign flips before an
-                    # argmax. Getting this backwards would produce a selector that reliably
-                    # picks the worst candidate and still looks like a working experiment.
-                    pfail = scorer.score(cmd, tracker, ring, u, all_envs)
-                    scores = -pfail
-                else:
-                    scores = oracle_scores(outcome)
+                # ORACLE only. There used to be a learned arm here reading the critic's
+                # survival head, whose score was P(fail) and so needed its sign flipped
+                # before the argmax. The head is gone, `--scorer` offers `oracle` alone, and
+                # keeping the branch meant a careful sign comment guarding nothing.
+                scores = oracle_scores(outcome)
                 if args.no_selection:
                     # THE STRUCTURAL CONTROL. Nine envs are still built, stacked, restored
                     # and rolled exactly as in the selector arms -- but the group follows

@@ -3,6 +3,7 @@
 #include "g1_deploy/policy_params.h"
 
 #include "g1_deploy/depth_obs.h"
+#include "depth_camera_json.h"
 #include "robot_asset_json.h"
 
 #include <nlohmann/json.hpp>
@@ -182,36 +183,7 @@ PolicyParams ParsePolicyParameters(const std::string& json) {
   // read from the array as written -- not sorted, and not keyed by name.
   if (root.contains("depth_camera_spec") && root["depth_camera_spec"].is_array()) {
     for (const auto& cam : root["depth_camera_spec"]) {
-      DepthCameraSpec d;
-      if (cam.contains("sensor")) d.sensor = cam.at("sensor").get<std::string>();
-      d.obs_term = cam.at("obs_term").get<std::string>();
-      if (cam.contains("mount_body")) d.mount_body = cam.at("mount_body").get<std::string>();
-      d.width = cam.at("width").get<int>();
-      d.height = cam.at("height").get<int>();
-      d.offset = cam.at("offset").get<double>();
-      d.scale = cam.at("scale").get<double>();
-      d.min_dist = cam.at("min_dist").get<double>();
-      d.max_dist = cam.at("max_dist").get<double>();
-      d.min_clip_val = cam.at("min_clip_val").get<double>();
-      d.max_clip_val = cam.at("max_clip_val").get<double>();
-      // Optional: a contract exported before the xyz channels carries no intrinsics, and a
-      // 1-channel generator never asks for them. A multi-channel one does, and is refused
-      // at the point of use rather than here, where the reason would be less obvious.
-      if (cam.contains("fx")) d.fx = cam.at("fx").get<double>();
-      if (cam.contains("fy")) d.fy = cam.at("fy").get<double>();
-      if (cam.contains("cx")) d.cx = cam.at("cx").get<double>();
-      if (cam.contains("cy")) d.cy = cam.at("cy").get<double>();
-      if (cam.contains("offset_pos")) {
-        for (size_t i = 0; i < 3 && i < cam.at("offset_pos").size(); ++i) {
-          d.offset_pos[i] = cam.at("offset_pos")[i].get<double>();
-        }
-      }
-      if (cam.contains("offset_quat_xyzw")) {
-        for (size_t i = 0; i < 4 && i < cam.at("offset_quat_xyzw").size(); ++i) {
-          d.offset_quat_xyzw[i] = cam.at("offset_quat_xyzw")[i].get<double>();
-        }
-      }
-      p.depth_cameras.push_back(std::move(d));
+      p.depth_cameras.push_back(ParseDepthCameraSpecJson(cam));
     }
   }
   // Whether a height scan is needed comes from the OBS TERMS, not from the presence of a
@@ -228,6 +200,15 @@ PolicyParams ParsePolicyParameters(const std::string& json) {
   // the generator's happens in PolicyRuntime::Load, where both artifacts are in hand.
   p.robot_asset = ParseRobotAsset(root);
   return p;
+}
+
+std::string CameraKey(const DepthCameraSpec& cam) {
+  // `sensor` first: it is the scene name, i.e. the lens itself. `obs_term` is only a fallback
+  // for a contract exported without one.
+  std::string name = !cam.sensor.empty() ? cam.sensor : cam.obs_term;
+  static const std::string kFmSamplingPrefix = "fm_";
+  if (name.rfind(kFmSamplingPrefix, 0) == 0) name = name.substr(kFmSamplingPrefix.size());
+  return name;
 }
 
 CameraGeom GeomFromSpec(const DepthCameraSpec& spec) {

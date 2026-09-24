@@ -56,19 +56,21 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from ..motionbricks.approach_zone import APPROACH_ZONE_M  # noqa: F401  (re-exported)
+
 
 #: How far ahead of a terrain feature a robot moving toward it is expected to latch on (m).
 #:
-#: One declared number, not a fitted one, and deliberately generous. It exists so that
-#: "is this decoy far enough from the path?" has a single answer that the clip generator can
-#: later be made to honour -- the same distance at which a clip should stop tracking the
-#: steady-state command and start following the terrain motion. Today the clips have no such
-#: contract (the latch is abrupt and its extent varies by an order of magnitude between
-#: families), so this is the definition arriving before the thing it will govern.
+#: IMPORTED, not declared. This used to be a local 2.5 whose docstring said it was "the definition
+#: arriving before the thing it will govern" -- one number the clutter pass could veto against and
+#: the clip generator could "later be made to honour". The generator now honours it, so the two
+#: read the same constant instead of agreeing by inspection. See
+#: :mod:`motion_gen.motionbricks.approach_zone` for why it is 2.0 and why it is hard-coded.
 #:
-#: A decoy is vetoed if the path enters its zone AT ALL, so an over-estimate costs placement
-#: opportunities while an under-estimate costs the training signal. Prefer the former.
-APPROACH_ZONE_M: float = 2.5
+#: Note this MOVED the veto 2.5 -> 2.0, so re-running ``author_clutter.py`` places decoys slightly
+#: closer than before. That is the right direction: a decoy is vetoed if the path enters its zone AT
+#: ALL, so an over-estimate costs placement opportunities -- and the whole point of the clutter pass
+#: is that clutter gets SEEN.
 
 #: Half-width of the robot in plan, for the "never walk into it" veto (m).
 #:

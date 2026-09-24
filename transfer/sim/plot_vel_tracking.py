@@ -43,6 +43,7 @@ import os
 import shlex
 import sys
 import warnings
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -183,9 +184,61 @@ class Column:
         """Of ``idx``, those that traversed."""
         return idx[self.traces["ep_verdict"][idx] == self.success_code]
 
-    def title(self, multi: bool) -> str:
-        """Column heading: the terrain, plus the run when several are drawn."""
+    def traversed(self, speeds: Sequence[float]) -> tuple[int, int]:
+        """How many of this column's DRAWN episodes traversed, pooled over ``speeds``.
+
+        Pooled rather than per speed because the heading names the panel and the panel holds
+        every speed; the per-speed split stays in the caption, which is where a reader who
+        needs it looks.  Counted over the speeds actually drawn, not over the run's own list,
+        so a ``--speed``-filtered figure reports the figure rather than the run behind it.
+
+        Args:
+            speeds: The commanded speeds this figure draws.
+
+        Returns:
+            ``(traversed, total)``.  ``(0, 0)`` when the column draws nothing.
+        """
+        ok = total = 0
+        for speed in speeds:
+            pick = self.pick(speed)
+            if pick.size == 0:
+                continue
+            ok += int(self.survived(pick).size)
+            total += int(pick.size)
+        return ok, total
+
+    def title(self, multi: bool, speeds: Sequence[float] = ()) -> str:
+        """Column heading: the terrain, the run when several are drawn, and what traversed.
+
+        The traversed share is shown as a PERCENTAGE; the raw counts behind it stay in the
+        caption, per speed, which is where the denominator belongs.  One decimal because at
+        the usual 50 trials x 3 speeds one episode is 0.67 %, so the digit is resolution
+        rather than noise -- it is not a claim about precision.
+
+        Args:
+            multi: Whether the figure draws more than one run.
+            speeds: The speeds drawn, which the traversed share pools over.  Empty omits the
+                share entirely, which is what a caller that has not resolved its speeds yet
+                gets rather than a wrong denominator.
+
+        Returns:
+            The heading, one or two lines.
+        """
         base = KIND_LABEL.get(self.kind, self.kind)
+        ok, total = self.traversed(speeds) if speeds else (0, 0)
+        if total:
+            import matplotlib as mpl  # noqa: PLC0415  -- lazy, as plot_run imports pyplot
+            # `%` opens a comment in LaTeX, so under `text.usetex` it must be escaped -- and
+            # under mathtext it must NOT be, or the backslash renders literally.  Read off the
+            # live rcParam rather than off `--no_tex`, because apply_paper_style also falls
+            # back to mathtext on its own when LaTeX is simply not installed.
+            mark = r"\%" if mpl.rcParams["text.usetex"] else "%"
+            # Parenthesised on the TERRAIN line, which costs no extra line in the figure --
+            # vertical space is the scarce thing in a paper.  It goes here rather than on the
+            # run-name line because `base` is a short fixed word from KIND_LABEL, so the
+            # heading's width stays bounded; appending it to `label` instead made a three-run
+            # heading as wide as the caller's `--label` and it collided with its neighbour.
+            base = f"{base} ({100.0 * ok / total:.1f}{mark})"
         return f"{base}\n{self.label}" if (multi and self.label) else base
 
 
@@ -291,6 +344,15 @@ def trial_alpha(n: int) -> float:
     return float(min(0.25, max(0.03, 3.0 / max(1, n))))
 
 
+#: Alpha for the failure-end markers.  A CONSTANT, deliberately: it used to scale as
+#: ``12 / n_failures`` per (column, speed), on the constant-ink reasoning behind
+#: :func:`trial_alpha`, and the side effect was that transparency silently encoded how badly a
+#: speed did -- the cell with the most failures drew the FAINTEST crosses, and two panels of
+#: one figure ended up on different scales.  Density still reads, because the crosses sit at
+#: distinct end positions and pile up darker on their own; it now reads the same way in every
+#: panel of every figure instead of being rescaled per cell.
+FAIL_MARKER_ALPHA: float = 0.75
+
 #: Panel text sizes for a multi-column grid.  The shared paper rcParams are sized for a
 #: single full-width plot (22 pt titles, 20 pt labels); four columns of it at journal width
 #: give each panel under 2 inches, where those sizes collide -- the first draft of this figure
@@ -378,16 +440,39 @@ def resolve_block_shape(ncols: int, mode: str,
     return shape
 
 
+#: Width per column in ``rows`` mode (inches).  At 1.9 the four-terrain figure came out
+#: 7.6 in wide and its panel TITLES overlapped -- "stairs up (71.3%)" ran into "stairs down"
+#: -- because matplotlib does not shrink or wrap title text to fit its axes.  The titles carry
+#: the per-terrain success rate, so the collision lands on a number rather than on decoration.
+#: 3.25 clears them with room to spare and gives the downrange axis its 5 m ticks instead of
+#: only 0 and 20; the height is unchanged, so the panels widen rather than the figure growing.
+_ROW_COL_W_IN: float = 3.25
+
+
 def layout_figsize(nrows: int, block_rows: int, block_cols: int, ncols: int, mode: str,
-                   multi: bool) -> tuple[float, float]:
+                   multi: bool, width: float = 0.0) -> tuple[float, float]:
     """Figure size, computed before the figure exists.
 
     ``grid`` is sized per BLOCK rather than per column, so four terrains stay near journal
     width instead of stretching into four full-height columns.
+
+    Args:
+        nrows: Panels per column.
+        block_rows: Block rows, for ``grid``.
+        block_cols: Block columns, for ``grid``.
+        ncols: Number of columns.
+        mode: ``"rows"`` or ``"grid"``.
+        multi: Several runs share the figure, which needs a little more height for labels.
+        width: Explicit figure WIDTH in inches; ``0`` derives it from the column count.
+            The height is derived either way, so the panels get wider rather than taller.
+
+    Returns:
+        ``(width, height)`` in inches.
     """
     if mode == "rows":
-        return (max(7.0, 1.9 * ncols), 2.15 * nrows + 0.45 + (0.25 if multi else 0.0))
-    return (max(7.0, 3.7 * block_cols),
+        return (max(7.0, width or _ROW_COL_W_IN * ncols),
+                2.15 * nrows + 0.45 + (0.25 if multi else 0.0))
+    return (max(7.0, width or 3.7 * block_cols),
             (1.72 * nrows + 0.75) * block_rows + (0.2 if multi else 0.0))
 
 
@@ -408,7 +493,7 @@ class Layout:
     """
 
     def __init__(self, fig, nrows: int, ncols: int, mode: str,
-                 shape: tuple[int, int]) -> None:
+                 shape: tuple[int, int], multi: bool = False) -> None:
         """Create the axes.
 
         Args:
@@ -417,6 +502,9 @@ class Layout:
             ncols: Number of columns (terrain/run pairs).
             mode: ``"rows"`` or ``"grid"``.
             shape: ``(block_rows, block_cols)``, from :func:`resolve_block_shape`.
+            multi: Several runs share the figure, so every block title carries a SECOND line
+                (the arm label). In ``grid`` that line grows down into the block above's
+                x-axis label, so the gap between block rows opens up to hold it.
         """
         self.mode, self.nrows, self.ncols = mode, nrows, ncols
         self.block_rows, self.block_cols = shape
@@ -427,7 +515,7 @@ class Layout:
             self._pos = [(0, c) for c in range(ncols)]
             return
         br, bc = shape
-        outer = fig.add_gridspec(br, bc, hspace=0.30, wspace=0.18)
+        outer = fig.add_gridspec(br, bc, hspace=0.55 if multi else 0.30, wspace=0.18)
         cells: list[list] = [[None] * ncols for _ in range(nrows)]
         self._pos = []
         for ci in range(ncols):
@@ -448,7 +536,7 @@ def plot_run(runs: list[tuple[str, dict, dict]], *, channels: tuple[str, ...],
              vel_axis: str, show_all: bool, grid_points: int,
              only_speeds: tuple[float, ...] = (), only_kinds: tuple[str, ...] = (),
              min_trials: int = MIN_TRIALS, layout: str = "rows",
-             grid_shape: tuple[int, int] | None = None):
+             grid_shape: tuple[int, int] | None = None, fig_width: float = 0.0):
     """Build the figure: one column per (run, terrain), one row per channel plus the path.
 
     **The rows do not always share an abscissa, and that is why nothing here uses
@@ -479,6 +567,7 @@ def plot_run(runs: list[tuple[str, dict, dict]], *, channels: tuple[str, ...],
         layout: ``"rows"`` (terrains across, channels down) or ``"grid"`` (a block of stacked
             panels per terrain, near-square).  See :class:`Layout`.
         grid_shape: ``(block_rows, block_cols)`` for ``"grid"``; ``None`` picks near-square.
+        fig_width: Figure width in inches; ``0`` derives it from the column count.
 
     Returns:
         ``(fig, caption)``.
@@ -492,8 +581,9 @@ def plot_run(runs: list[tuple[str, dict, dict]], *, channels: tuple[str, ...],
     nrows = 1 + len(channels)
 
     shape = resolve_block_shape(len(cols), layout, grid_shape)
-    fig = plt.figure(figsize=layout_figsize(nrows, *shape, len(cols), layout, multi))
-    lay = Layout(fig, nrows, len(cols), layout, shape)
+    fig = plt.figure(figsize=layout_figsize(nrows, *shape, len(cols), layout, multi,
+                                            fig_width))
+    lay = Layout(fig, nrows, len(cols), layout, shape, multi)
     axes = lay.axes
     for ci in range(len(cols)):
         for row in range(2, nrows):
@@ -553,7 +643,7 @@ def plot_run(runs: list[tuple[str, dict, dict]], *, channels: tuple[str, ...],
             if bad.size:
                 ax_traj.plot(tr["ep_end_x"][bad], tr["ep_end_z"][bad], "x", color=fail_colour,
                              markersize=5, markeredgewidth=1.4, linestyle="none", zorder=5,
-                             alpha=float(min(1.0, max(0.35, 12.0 / bad.size))),
+                             alpha=FAIL_MARKER_ALPHA,
                              label="failed" if (ci == 0 and i_s == 0) else None)
 
             if shared_x:
@@ -617,7 +707,7 @@ def plot_run(runs: list[tuple[str, dict, dict]], *, channels: tuple[str, ...],
             if not lay.wants_ylabel(ci):
                 a.tick_params(labelleft=False)
     for ci, c in enumerate(cols):
-        axes[0][ci].set_title(c.title(multi), fontsize=f["title"])
+        axes[0][ci].set_title(c.title(multi, speeds), fontsize=f["title"])
         if lay.wants_ylabel(ci):
             axes[0][ci].set_ylabel(r"root $z$ [m]", fontsize=f["label"])
             for row, ch in enumerate(channels, start=1):
@@ -717,6 +807,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "bottom-right). Scales are shared across blocks either way.")
     p.add_argument("--grid_shape", default="",
                    help="'RxC' block arrangement for --layout grid. Default: near-square.")
+    p.add_argument("--exact_size", action="store_true",
+                   help="Write the figure at its DECLARED size instead of cropping to its "
+                        "own ink. Use it for figures you intend to STACK: the default tight "
+                        "crop trims each one differently, so two figures at the same "
+                        "--fig_width land a few pixels apart and their panel columns do not "
+                        "line up once both are scaled to the text width.")
+    p.add_argument("--fig_width", type=float, default=0.0,
+                   help="Figure WIDTH in inches. 0 derives it from the column count "
+                        f"({_ROW_COL_W_IN:g} in per terrain in 'rows' mode). The height is "
+                        "derived either way, so a wider figure gets wider panels rather than "
+                        "a different aspect. Raise it when panel titles collide.")
     p.add_argument("--min_trials", type=int, default=MIN_TRIALS,
                    help="Cut each curve where fewer than this many episodes still contribute, "
                         "and end the axis there. The time axis otherwise runs to the slowest "
@@ -771,7 +872,8 @@ def main() -> int:
                             show_all=not args.no_all_trials, grid_points=args.grid_points,
                             only_speeds=only, only_kinds=tuple(args.terrain or ()),
                             min_trials=max(0, int(args.min_trials)),
-                            layout=args.layout, grid_shape=shape)
+                            layout=args.layout, grid_shape=shape,
+                            fig_width=max(0.0, float(args.fig_width)))
     stem = args.out or os.path.join(specs[0][0], "fig_vel_tracking")
     # The command goes in the caption sidecar, because a figure that cannot say how it was
     # made is not reproducible in practice however deterministic the code is: these are
@@ -779,7 +881,8 @@ def main() -> int:
     # arm, and none of that is recoverable from the image or from the sweeps it drew on.
     cmd = " ".join(shlex.quote(a) for a in [os.path.basename(sys.argv[0]), *sys.argv[1:]])
     caption = f"{caption}\n\nRegenerate: cd transfer/sim && python {cmd}"
-    for w in plot_style.save_figure(fig, stem, caption=caption):
+    for w in plot_style.save_figure(fig, stem, caption=caption,
+                                    exact_size=bool(args.exact_size)):
         print(f"[plot] {w}")
     return 0
 

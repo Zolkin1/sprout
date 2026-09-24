@@ -175,6 +175,9 @@ class EpisodeAccumulator:
         self.clf_v = z()
         self.min_h = torch.full((self.n,), float("inf"), device=self.device)
         self.max_tilt = z()
+        #: Quaternion slot order of `root_quat_w`: True = (w,x,y,z), False =
+        #: (x,y,z,w), None = not yet resolvable. See `_upright_cos`.
+        self._quat_wxyz: bool | None = None
         self.first_fall = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
         # Per-episode tally of what KIND of motion each re-plan produced. Stays all-zero
         # unless a classifier is attached (the clip arm loads no generator).
@@ -213,7 +216,23 @@ class EpisodeAccumulator:
         self._goal_pos_w = torch.zeros(self.n, 3, device=self.device)
         self._goal_yaw = torch.zeros(self.n, device=self.device)
         self._goal_valid = torch.zeros(self.n, dtype=torch.bool, device=self.device)
+        # The base height the episode OPENED at, so the eval's spawn rule is checkable from
+        # the recorded artifact instead of from a launcher banner. NaN until an episode has
+        # been opened, which is the honest value for "nobody recorded this" -- 0.0 would be
+        # indistinguishable from a real ground-level spawn.
+        self.spawn_z = torch.full((self.n,), float("nan"), device=self.device)
         self._goal_tol = torch.zeros(self.n, 3, device=self.device)
+        #: The DWELL rule, resolved from the goal spec in `set_goal_regions`. All zero means
+        #: no dwell and the half-plane latch below is what `reached_goal` records -- which is
+        #: every library predating the wall field.
+        #: Name of the ENVIRONMENT's own goal termination, when one is authoritative. Set by
+        #: `attach_goal_termination`; while set, `reached_goal` is latched from that term and
+        #: the offline disc test below is NOT run.
+        self._goal_term_name = None
+        self._dwell_steps = 0
+        self._dwell_radius = 0.0
+        self._dwell_height_tol = 0.0
+        self._steps_in_disc = torch.zeros(self.n, dtype=torch.long, device=self.device)
         self.goal_reached = torch.zeros(self.n, dtype=torch.bool, device=self.device)
         self.first_goal = torch.full((self.n,), -1, device=self.device, dtype=torch.long)
         self.min_goal_dist = torch.full((self.n,), float("inf"), device=self.device)
@@ -368,6 +387,30 @@ class EpisodeAccumulator:
         self._gr = goal_region
         self.goal_spec = spec
         self.set_goal_families(family_of_env)
+        # The DWELL rule is a property of the SPEC, not of a family: a course either scores
+        # arrivals by holding a disc or by crossing a line, and mixing the two inside one
+        # library would make `reached_goal` mean two things in one file. Taken from the
+        # default tolerances for that reason, and PRINTED, because it silently changes what
+        # every downstream consumer of `reached_goal` is measuring.
+        t = spec.default
+        self._dwell_radius = float(getattr(t, "dwell_radius_m", 0.0) or 0.0)
+        self._dwell_height_tol = float(t.height_tol_m)
+        dwell_s = float(getattr(t, "dwell_s", 0.0) or 0.0)
+        self._dwell_steps = (int(round(dwell_s / float(self.dt)))
+                             if dwell_s > 0.0 and self._dwell_radius > 0.0 else 0)
+        if self._dwell_steps > 0:
+            print(f"[eval.accumulate] GOAL RULE = DWELL: reached_goal means the robot held a "
+                  f"{self._dwell_radius:.2f} m disc about the goal for {dwell_s:.1f} s "
+                  f"({self._dwell_steps} steps) consecutively, within "
+                  f"{self._dwell_height_tol:.2f} m of the goal's standing height -- NOT the "
+                  f"usual 'was ever inside the half-plane'. Numbers from this recording are "
+                  f"not comparable with a pass-through course's.")
+        elif self._dwell_radius > 0.0 or dwell_s > 0.0:
+            raise ValueError(
+                f"the goal spec declares a partial dwell rule (dwell_radius_m="
+                f"{self._dwell_radius}, dwell_s={dwell_s}); both must be positive or both "
+                "zero. One alone would silently score the pass-through rule while reading as "
+                "a stopping course.")
 
     def set_goal_families(self, family_of_env=None, env_ids: torch.Tensor | None = None) -> None:
         """Write per-env tolerances from each env's family.
@@ -395,6 +438,52 @@ class EpisodeAccumulator:
             [[r.approach_margin_m, r.half_width_m, r.height_tol_m] for r in rows],
             device=self.device, dtype=self._goal_tol.dtype)
 
+    def attach_goal_termination(self, name: str) -> None:
+        """Take ``reached_goal`` from the ENVIRONMENT's own goal termination, not from here.
+
+        **One rule, computed once.** A dwell -- "stay inside a disc for N consecutive steps" --
+        cannot be re-derived offline as safely as a latch can, because it is destroyed by a
+        SINGLE bad sample where a latch is not. This module folds the goal twice: once per step
+        and once more on the terminal frame, and the terminal fold's own comment says a
+        post-reset read "can corrupt ``min_dist_to_goal_m`` but can never falsely mark an
+        episode as having arrived". That benignness is a property of ``goal_reached |= inside``.
+        Under a consecutive counter the same stray sample zeroes it -- on precisely the step the
+        dwell completes, since the environment truncates the episode the moment it fires.
+
+        Measured: the env-side term fired 73 times in 1400 steps over 64 envs while this
+        module's re-derivation reported 0 arrivals in 6299 episodes.
+
+        So the environment is the single source, exactly as ``tracking_error.violation_checks``
+        is for the tracking bounds. Callers must then feed :meth:`note_goal_termination` every
+        step, or nothing will ever latch.
+
+        Args:
+            name: The termination term's name, for the error messages and the stamp.
+        """
+        self._goal_term_name = str(name)
+        print(f"[eval.accumulate] GOAL RULE = FROM THE ENVIRONMENT's '{name}' termination. "
+              "reached_goal is latched from the term that ends the episode, not re-derived "
+              "here -- a dwell cannot be reconstructed offline as safely as a latch.")
+
+    def note_goal_termination(self, fired: torch.Tensor) -> None:
+        """Latch ``reached_goal`` from the environment's goal termination for this step.
+
+        Args:
+            fired: ``[n]`` bool, the term's output this step.
+
+        Raises:
+            RuntimeError: If no termination was attached, where the caller has fed a signal
+                this accumulator was never told to prefer.
+        """
+        if self._goal_term_name is None:
+            raise RuntimeError(
+                "note_goal_termination() without attach_goal_termination(); the accumulator "
+                "would be scoring its own re-derivation while being fed the env's.")
+        fired = fired.to(self.goal_reached.device).bool()
+        newly = fired & ~self.goal_reached
+        self.first_goal = torch.where(newly, self.steps, self.first_goal)
+        self.goal_reached = self.goal_reached | fired
+
     def refresh_goal_anchor(self, env_ids: torch.Tensor | None = None) -> None:
         """Resolve where the clip itself finishes, for ``env_ids``, once per episode.
 
@@ -420,6 +509,24 @@ class EpisodeAccumulator:
         self._goal_yaw[ids] = yaw[ids].to(self._goal_yaw.dtype)
         self._goal_valid[ids] = True
 
+    def record_spawn_z(self, env_ids: torch.Tensor | None = None) -> None:
+        """Latch the base height these envs just spawned at.
+
+        Must be called AFTER the reset has committed the new pose, for the same reason
+        :meth:`refresh_goal_anchor` must -- called before, it records the height the PREVIOUS
+        episode ended at, which on a course whose spawn is a platform is a plausible-looking
+        wrong number rather than an obvious one.
+
+        Unlike the goal anchor this is recorded even with no goal spec attached: it describes
+        where the robot started, which is a property of the run rather than of the scoring.
+
+        Args:
+            env_ids: Envs to latch, or ``None`` for all.
+        """
+        ids = (torch.arange(self.n, device=self.device) if env_ids is None
+               else env_ids.to(self.device))
+        self.spawn_z[ids] = self.rd.root_pos_w[ids, 2].to(self.spawn_z.dtype)
+
     def _fold_goal(self, m: torch.Tensor) -> None:
         """Fold this step's goal geometry for the envs in ``m``."""
         if self._gr is None:
@@ -429,6 +536,41 @@ class EpisodeAccumulator:
         live = m & self._goal_valid
         inside = self._gr.in_goal(down, lat, hz, self._goal_tol) & live
         dist = self._gr.goal_distance_m(down, lat, hz, self._goal_tol)
+
+        # THE DWELL RULE, when the spec declares one. `reached_goal` then means "held the disc
+        # for dwell_s" instead of "was ever inside the region", and that redefinition is the
+        # point: the progress reward, the critic's arrived set and `terminal_reward` all read
+        # this one column, so changing it here is what makes the three agree on a stopping
+        # course. A parallel column would have left the REWARD paying for pass-through
+        # behaviour while the report showed the dwell rate.
+        #
+        # Why the half-plane cannot serve: `in_goal` is satisfied by ANY point downrange of the
+        # boundary inside the lateral band, so a robot that crosses the line and keeps walking
+        # -- into the wall this course is about -- satisfies it forever. A disc can be left,
+        # and leaving it resets the count.
+        if self._goal_term_name is not None:
+            # The environment's term is authoritative; `note_goal_termination` does the
+            # latching. Everything else in this function (distances, the terminal offsets) is
+            # still folded, because those are diagnostics rather than the success rule.
+            inside = torch.zeros_like(inside)
+        elif self._dwell_steps > 0:
+            # REFUSED, not attempted. Re-deriving a dwell here is what reported 0 arrivals in
+            # 6299 episodes while the environment's own term fired normally, and it fails in
+            # the direction that looks like a policy that cannot do the task. A spec that
+            # declares a dwell must be paired with `attach_goal_termination`.
+            raise RuntimeError(
+                "the goal spec declares a dwell rule (dwell_radius_m="
+                f"{self._dwell_radius}, {self._dwell_steps} steps) but no environment goal "
+                "termination was attached. A dwell cannot be re-derived here: this module "
+                "folds the goal again on the terminal frame, and a post-reset read -- benign "
+                "for a latch, which cannot be un-set -- zeroes a consecutive counter on "
+                "exactly the step the dwell completes. Call attach_goal_termination() and "
+                "feed note_goal_termination() each step.")
+            held = self._gr.in_goal_disc(down, lat, hz, self._dwell_radius,
+                                         self._dwell_height_tol) & live
+            self._steps_in_disc = torch.where(held, self._steps_in_disc + 1,
+                                              torch.zeros_like(self._steps_in_disc))
+            inside = self._steps_in_disc >= self._dwell_steps
 
         newly = inside & ~self.goal_reached
         self.first_goal = torch.where(newly, self.steps, self.first_goal)
@@ -624,39 +766,109 @@ class EpisodeAccumulator:
         Returns:
             ``[num_envs]`` tilt angle in radians.
         """
-        q = d.root_quat_w
-        cos = (1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])).clamp(-1.0, 1.0)
-        return torch.acos(cos)
+        return torch.acos(self._upright_cos(d))
 
-    # TODO(terminal-tilt): `max_tilt_rad` is CONTAMINATED and `first_fall_step` may be too.
+    def _upright_cos(self, d) -> torch.Tensor:
+        """``cos(tilt)`` -- the world-z component of the body's up-axis -- CONVENTION-RESOLVED.
+
+        For a unit quaternion the body up-axis's world-z component is ``1 - 2(x^2 + y^2)``, so
+        the answer depends entirely on WHICH TWO SLOTS hold x and y. ``(w, x, y, z)`` puts them
+        at 1 and 2; ``(x, y, z, w)`` puts them at 0 and 1, and reading the wrong pair returns
+        ``1 - 2(y^2 + z^2)``, which for a pure yaw of theta is exactly ``cos(theta)``. That
+        does not look like a bug: it reads as a robot tilting in proportion to how much it
+        turns, which only the families that TURN can show.
+
+        **This was live.** ``robot.data`` hands several buffers back as warp arrays and the
+        shim converts them without reordering, so the slot order here is a property of the
+        buffer and not of this file. Measured on a v6 clip-arm eval: `flat` -- the only family
+        whose robot actually rotates, terrain traversals being world-pinned replays -- reported
+        a 42.7% fall rate against a 1.0% height-based one, with median "tilt" 58.9 deg, p95
+        179.5 deg, and correlation 0.893 between the recorded angle and the clip's own
+        commanded yaw. Terrain families were unaffected, which is why it survived review.
+
+        So the convention is RESOLVED against ``projected_gravity_b``, which is a vector and
+        therefore has no slot ambiguity, and the resolution is asserted rather than assumed.
+        Deferred until a sample can actually tell the two apart. The two readings coincide
+        exactly when ``q[0]^2 == q[2]^2`` -- a ~90 deg PITCH, not an upright robot; an identity
+        quaternion is in fact maximally discriminating (+1 one way, -1 the other). So the
+        undecidable sample is a robot already on its side, which is the one case where guessing
+        would matter most.
+
+        Args:
+            d: The converting view over ``robot.data``.
+
+        Returns:
+            ``[num_envs]`` ``cos(tilt)``, clamped to ``[-1, 1]``.
+        """
+        q = d.root_quat_w
+        cos_wxyz = (1.0 - 2.0 * (q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2])).clamp(-1.0, 1.0)
+        if self._quat_wxyz is True:
+            return cos_wxyz
+        cos_xyzw = (1.0 - 2.0 * (q[:, 0] * q[:, 0] + q[:, 1] * q[:, 1])).clamp(-1.0, 1.0)
+        if self._quat_wxyz is False:
+            return cos_xyzw
+        self._resolve_quat_convention(d, cos_wxyz, cos_xyzw)
+        return cos_wxyz if self._quat_wxyz else cos_xyzw
+
+    def _resolve_quat_convention(self, d, cos_wxyz, cos_xyzw) -> None:
+        """Decide the quaternion slot order ONCE, against gravity, or leave it undecided.
+
+        ``projected_gravity_b`` is the world down-vector in the body frame, so its z component
+        is ``-cos(tilt)`` under any quaternion convention -- it cannot be ambiguous, which is
+        what makes it the arbiter. It lags one step after a reset (the defect ``_tilt`` was
+        rewritten to avoid), so this only decides on samples where the two candidates DISAGREE
+        by more than the lag could explain; anything else is left undecided and retried.
+
+        Raises:
+            RuntimeError: If a discriminating sample matches NEITHER reading. That means the
+                buffer is not a unit quaternion in either order, and every tilt number after it
+                would be fiction.
+        """
+        g = getattr(d, "projected_gravity_b", None)
+        if g is None:
+            return
+        cos_g = (-g[:, 2] / torch.linalg.vector_norm(g, dim=-1).clamp_min(1e-9)).clamp(-1.0, 1.0)
+        spread = (cos_wxyz - cos_xyzw).abs().median()
+        if float(spread) < 0.05:     # |q0| == |q2|, a ~90 deg pitch: both readings agree, so
+                                     # this sample cannot name the convention. Retry on the next.
+            return
+        e_w = float((cos_wxyz - cos_g).abs().median())
+        e_x = float((cos_xyzw - cos_g).abs().median())
+        if min(e_w, e_x) > 0.10:
+            raise RuntimeError(
+                f"root_quat_w matches NEITHER quaternion convention against gravity (median "
+                f"|cos err| wxyz={e_w:.3f}, xyzw={e_x:.3f}). Every tilt and every derived fall "
+                "flag downstream would be fiction, so this refuses rather than picking one.")
+        self._quat_wxyz = e_w <= e_x
+        if not self._quat_wxyz:
+            print("[eval] root_quat_w is (x, y, z, w), not (w, x, y, z) -- tilt read from slots "
+                  f"0,1 (median |cos err| vs gravity {e_x:.4f} against {e_w:.4f} the other way). "
+                  "Read the wrong way this returns the YAW angle.")
+
+    # RESOLVED(terminal-tilt), 2026-09-12: it was the QUATERNION SLOT ORDER, not the max().
     #
-    # A non-trivial fraction of SUCCESSFUL episodes record `max_tilt_rad` ABOVE the 70 deg
-    # termination limit, some of them far above it. That is impossible if the column measured
-    # what it claims -- `base_fallen` would have ended those episodes -- so a transient is
-    # being folded in. First seen on a closed-loop rollout; re-derive the rate from any
-    # `episodes.h5` by taking `max_tilt_rad` over the episodes the reward scores a success.
+    # The old note here blamed `fold_terminal`'s max() folding in a mid-teleport pose. That was
+    # wrong, and the evidence against it is specific: on a v6 clip-arm eval the spurious falls
+    # land at a MEDIAN OF 33% THROUGH the episode and ZERO of them are on the last step, which
+    # no terminal-fold mechanism can produce. What it actually was: `root_quat_w` arrives in a
+    # slot order this file did not own, and `1 - 2(q[1]^2 + q[2]^2)` read the wrong pair, which
+    # returns the YAW angle (see `_upright_cos`). Only `flat` could show it -- terrain
+    # traversals are world-pinned replays that never rotate -- and it cost that family 42.7%
+    # against a real 1.0%, with correlation 0.893 between the recorded "tilt" and the clip's
+    # own commanded yaw.
     #
-    # The suspect is the `max()` below. It is deliberate and well argued for ordering
-    # robustness, but max(a, b) where one input is a mid-teleport pose is that pose. If
-    # `root_quat_w` is momentarily garbage inside the reset hook rather than merely fresh,
-    # this picks it up and nothing downstream can tell.
+    # The old note also said "the success verdict is SAFE". That held for terrain (a spurious
+    # tilt lands after arrival, so the first-event ordering absorbs it) and was FALSE for flat,
+    # whose goal is the end of a 20 s clip and therefore has a long pre-arrival window: 36 of
+    # its 72 arrivals were scored as having fallen first. Measured cost of the fix, per family:
+    # flat +0.375 success, every terrain family 0.000, pooled +0.042.
     #
-    # WHAT IS AFFECTED, and what is not:
-    #   * `max_tilt_rad` -- unusable as reported.
-    #   * `first_fall_step` -- `fold_terminal` sets it when EITHER limb crosses, so a
-    #     spurious tilt marks an episode as having fallen when it did not. That makes the
-    #     fall-vs-stall SPLIT unreliable.
-    #   * the success verdict is SAFE: it comes from `reached_goal` and the first-event
-    #     ordering, and an episode that reached the goal before the terminal frame keeps its
-    #     success regardless. That is why this hid.
-    #   * the eval harness shares this accumulator, so its `max_tilt_rad` and derived `fell`
-    #     column may carry the same defect. CLAUDE.md records a PREVIOUS bug in this exact
-    #     place (the derived fall flag inheriting the previous episode's orientation), so
-    #     check whether this is a recurrence rather than a new fault.
-    #
-    # To diagnose: log both limbs separately at the terminal fold for a few hundred episodes
-    # and compare against the per-step maximum, which is computed from a buffer that is not
-    # mid-reset. Blocks TODO(jump-off-front).
+    # STILL OPEN, and unrelated: TODO(align-tilt-convention) on `mdp.base_fallen` -- that
+    # termination tests roll and pitch PER AXIS while this column uses the TOTAL angle from
+    # upright. The per-axis test is a strict subset (zero counter-examples over 2e6 uniform
+    # orientations); they differ on 1.54% of the sphere and the worst pose the termination
+    # admits is 75.6 deg total. Aligning them changes WHEN episodes end and therefore every
+    # published rate, so it stays a deliberate decision rather than a silent edit.
     def _tilt_terminal(self, d) -> torch.Tensor:
         """Tilt for the TERMINAL fold, where the two buffers disagree on purpose.
 
@@ -871,6 +1083,10 @@ class EpisodeAccumulator:
         self.contact_steps[ids] = 0.0
         self._have_prev[ids] = False
         self.goal_reached[ids] = False
+        # Consecutive, so a new episode starts the count from zero. Without this
+        # an env that ended mid-disc would carry its partial dwell into the next
+        # episode and could be scored as having stopped somewhere it never stood.
+        self._steps_in_disc[ids] = 0
         self.first_goal[ids] = -1
         self.min_goal_dist[ids] = float("inf")
         self.max_goal_down[ids] = -float("inf")

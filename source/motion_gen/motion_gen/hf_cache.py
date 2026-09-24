@@ -7,14 +7,28 @@ cache convention without pulling in the managers.
 
 The cache is keyed only by path, and a cached folder is never re-checked against the remote --
 so two machines can end up holding *different* libraries at the same path. That is what
-``library_fingerprint`` / ``library_metadata.read_library_metadata(verify_fingerprint=...)``
-exist to catch; use them rather than trusting the path.
+``library_fingerprint`` / ``library_metadata.read_library_metadata(verify_fingerprint=...)`` and
+``clips.clip_fingerprint.fingerprint_solved_library`` exist to catch; use them rather than
+trusting the path.
+
+The cache lives at ``<repo>/hf``, anchored on THIS package's location rather than on
+``os.getcwd()``. It used to follow the cwd, which silently built a second full copy whenever
+anything ran from a subdirectory -- measured: one call from ``source/motion_gen`` downloaded all
+308 files of ``library_v2`` again into ``source/motion_gen/hf`` (103 MB), and then reported a
+different fingerprint than the same call from the repo root would have. A cache that moves with
+the cwd is a cache that cannot be reasoned about.
 """
 
 from __future__ import annotations
 
 import os
+import pathlib
 from pathlib import Path
+
+# <repo>/source/motion_gen/motion_gen/hf_cache.py -> parents[3] == <repo>. Derived from the package
+# location, not counted from the cwd; see motion_gen.features._REPO_ROOT for the same idiom and
+# CLAUDE.md for why a hop count from __file__ is the lesser evil against a cwd-relative path.
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
 
 
 def resolve_library_path(source: str | Path, hf_repo: str | None = None) -> Path:
@@ -42,7 +56,7 @@ def download_from_hf(hf_repo: str, hf_path: str) -> Path:
     Returns:
         Local ``Path`` to the downloaded folder.
     """
-    cache_dir = os.path.join(os.path.abspath(os.getcwd()), "hf")
+    cache_dir = str(_REPO_ROOT / "hf")
     os.makedirs(cache_dir, exist_ok=True)
     local_folder = os.path.join(cache_dir, hf_path)
 

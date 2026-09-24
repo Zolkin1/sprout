@@ -11,6 +11,30 @@ for the runbook.
 PARENT because four plotters outside the eval use it (and `import robot_rl.anything` drags in
 IsaacLab); importing it does not touch `rcParams`, only `apply_paper_style()` does.
 
+## The cell follows the CHECKPOINT, not the task
+
+Two properties are read off the trained run's own `params/` and applied in `_apply_env_overrides`,
+because the task's default is a statement about today's code and the checkpoint is a statement about
+what it was trained under. Both failures are silent -- same width, wrong meaning.
+
+- **`window_anchor`** comes from `params/conventions.yaml`, so a plan-anchored checkpoint runs on a
+  `robot_now` task instead of being refused by `check_run_conventions`.
+- **The far depth camera** comes from `params/env.yaml` (`provenance.policy_far_camera_in_run`). The
+  policy reads the NEAR camera alone as of `efe93b4e`, so every tracker trained before it expects
+  **3002** inputs where a near-only task builds **2222** -- and the gap is exactly **780**, one 30x26
+  camera, verified against both checkpoints' `mlp.0.weight`. Without this an older policy cannot be
+  evaluated at all, which is the only thing the near-only retrain can be compared against. The
+  `height_scan` those runs also list under `observations.policy` is a red herring: 3002 - 2222 is one
+  camera, not a camera plus a scan.
+
+**Both are DERIVED, never flags.** A flag added to the parser is not forwarded to the cell subprocess
+unless `stage_grid` restates it and reverts to its argparse default in the child silently -- the same
+trap recorded below, measured twice. A property read off the artifact cannot be dropped that way.
+`enable_policy_far_camera` fills the DECLARED slot rather than appending; appended, the vector is the
+right width with two 780-wide blocks transposed, `load_state_dict` passes, and the tracker reads the
+far camera as the near one (over 64 episodes, transposed vs correct: `reached_goal` 0.000 -> 0.188,
+median `steps_survived` 143 -> 517). Pinned by `test_policy_far_camera_from_run.py`.
+
 ## Load-bearing, each found by a failure
 
 - **The tracker task has no `clip_end` termination**, so the harness ADDS one. Without it every
@@ -196,6 +220,14 @@ the resulting states with a `fit_value.py` critic and carries the winner forward
   best-of-K number is luck. Read that before restarting any selection work.
 
 # The failure critic (`fit_value.py`)
+
+> **SUPERSEDED 2026-09-10 — the `P(fail)` head this describes is DELETED.** The critic now has
+> ONE head, a scalar regression of the return (`FlowValueModel.quality`); the survival head and
+> its own readout token are gone, because the fine-tune loop dropped its loss and no reported
+> result used it. **Every `p_fail` number below predates that cut and does not describe the
+> current code** -- and neither do the quality-head numbers, because removing the survival
+> readout changed the key/value stream the surviving head attends to, making it a different
+> function rather than the same one minus a head. Kept as the record of what was measured.
 
 Trains a `P(fail)` head over the generator's frozen encoder. Three of its context features are
 goal-region quantities needing a live `MotionSequenceCommand`, which is why it could only be read in

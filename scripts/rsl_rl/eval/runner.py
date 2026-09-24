@@ -528,6 +528,32 @@ def _apply_env_overrides(env_cfg, args, plan: dict, manifest: dict, cell: dict) 
               f"{want_anchor!r} (from the run's params/conventions.yaml)")
         traj.window_anchor = want_anchor
     notes["window_anchor"] = getattr(traj, "window_anchor", None)
+
+    # Adopt the checkpoint's CAMERA SET too, for the same reason and from the same place.
+    #
+    # The policy reads the near camera alone as of ``efe93b4e``; every tracker trained before
+    # it expects 3002 inputs where a near-only task builds 2222, and the difference is exactly
+    # 780 -- one 30x26 camera, verified against both checkpoints' actor weights. Without this
+    # an older policy cannot be evaluated at all, which would leave the near-only retrain with
+    # nothing to be compared against.
+    #
+    # ``enable_policy_far_camera`` FILLS THE DECLARED SLOT rather than appending: written the
+    # obvious way the far block lands after ``command_window`` and the vector comes out the
+    # right WIDTH with two 780-wide blocks transposed -- ``load_state_dict`` passes and the
+    # tracker reads the far camera as the near one. Measured over 64 episodes, transposed vs
+    # correct: reached_goal 0.000 -> 0.188, median steps_survived 143 -> 517. Nothing in the
+    # first row reads as a config bug; it reads as a policy that cannot do the task.
+    from provenance import policy_far_camera_in_run  # noqa: PLC0415
+    wants_far = policy_far_camera_in_run(manifest["policy"]["log_dir"])
+    has_far = getattr(env_cfg.observations.policy, "depth_far", None) is not None
+    if wants_far and not has_far:
+        from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (  # noqa: PLC0415
+            enable_policy_far_camera,
+        )
+        print("[cell] policy cameras: the trained run reads the FAR camera and this task does "
+              "not -- restoring it in its declared slot (params/env.yaml)")
+        enable_policy_far_camera(env_cfg)
+    notes["policy_far_camera"] = bool(wants_far) if wants_far is not None else None
     notes["trained_window_anchor"] = want_anchor
     notes["reference_source"] = getattr(traj, "reference_source", None)
     # Recorded because ``reference_source`` alone cannot distinguish fm from fm_tf: both run

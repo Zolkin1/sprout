@@ -158,8 +158,12 @@ from robot_rl.flow_matching.critic_eval import (  # noqa: E402
     effective_sample_size, stratified_awr_weights,
 )
 from robot_rl.flow_matching.rollout_dataset import (  # noqa: E402
-    RolloutWindowDataset, join_labels, join_values,
+    ConcatWindowDataset, RolloutWindowDataset, join_labels, join_values,
 )
+
+from ballast import build_ballast_dataset  # noqa: E402
+from ballast import describe as describe_ballast  # noqa: E402
+from ballast import select_ballast_rows  # noqa: E402
 
 #: The state-dict keys the conversion adds, per injection mode.  Anything else missing means
 #: the pretrained checkpoint is not the architecture this script thinks it is.
@@ -169,6 +173,7 @@ _NEW_KEYS = {
     # the prefix does.
     "prefix_token": {"advantage_emb.weight", "advantage_type"},
 }
+
 
 
 def is_plain_arm(args) -> bool:
@@ -365,6 +370,19 @@ def main() -> int:
                         "self-distillation control -- the same data and the same number of "
                         "steps with the label carrying nothing, which is what separates 'the "
                         "label helped' from 'more training on rollout data helped'.")
+    p.add_argument("--ballast", default="",
+                   help="Pre-training window .h5 to carry BALLAST from: a fixed slice trained "
+                        "on at weight 1 alongside the buffer, so AWR pulling toward one "
+                        "course cannot quietly cost the distribution the generator was "
+                        "pre-trained on. Its own FILE, never merged into the buffer -- that "
+                        "is what keeps it out of the critic and the advantage structurally "
+                        "rather than by a flag nobody re-checks.")
+    p.add_argument("--ballast_chunks", type=int, default=0,
+                   help="How many ballast windows. 0 disables.")
+    p.add_argument("--ballast_flat_frac", type=float, default=0.0,
+                   help="Share of the ballast drawn from FLAT windows. A terrain course "
+                        "contains none, so without this the fine-tune has no flat rows at all "
+                        "and drift there is invisible to it.")
     p.add_argument("--out", required=True, help="Output run directory.")
     p.add_argument("--epochs", type=int, default=6)
     p.add_argument("--batch_size", type=int, default=256,
@@ -786,6 +804,54 @@ def main() -> int:
     val_ds = (RolloutWindowDataset(args.rollout, va_rows, null_prob=0.0,
                                    weight=weight, **common)
               if va_rows.size else None)
+
+    # ---- BALLAST ---------------------------------------------------------------------
+    # TRAIN ONLY, and weight exactly 1. Two deliberate choices:
+    #
+    # * Train only, because `best.pt` is selected on the val metric. Putting ballast in val
+    #   would make that metric partly a statement about the pre-training distribution, so the
+    #   selected checkpoint would change for a reason unrelated to the course being fitted --
+    #   and every earlier fine-tune number was selected on the buffer's val alone.
+    # * Weight 1, which is the AWR arm's AVERAGE row: `--awr_normalize global` scales the AWR
+    #   weights to mean 1 over the train rows, and that scaling is computed BEFORE the ballast
+    #   is attached, so the ballast neither shifts the AWR temperature nor is shifted by it.
+    #
+    # The ballast carries no label (LABEL_NULL), which is already a trained input -- the
+    # conditioned arm nulls labels at `--null_prob` throughout training -- so it needs no
+    # special case in the model.
+    ballast_rows = np.zeros(0, dtype=np.int64)
+    if args.ballast_chunks and not args.ballast:
+        raise SystemExit(
+            f"--ballast_chunks {args.ballast_chunks} needs --ballast: there is no recording "
+            "to draw the pre-training windows from.")
+    if args.ballast and not args.ballast_chunks:
+        raise SystemExit(
+            "--ballast needs --ballast_chunks: a named file with no count would load nothing "
+            "and read in the manifest as though ballast had been carried.")
+    if args.ballast_chunks:
+        ballast_rows = select_ballast_rows(args.ballast, int(args.ballast_chunks),
+                                           float(args.ballast_flat_frac), seed=args.seed)
+        # THE BALLAST'S OPTIONAL KEYS MUST MIRROR THE BUFFER'S, and this is not cosmetic.
+        # `RolloutWindowDataset.__getitem__` adds `weight` and `advantage` only when it was
+        # given them, and `_collate` takes its key set from `batch[0]` and indexes every other
+        # item with it -- so a batch mixing a buffer row without `weight` and a ballast row
+        # with one either raises KeyError or silently drops the ballast's weight, depending on
+        # which row happened to land first. The buffer only carries weights in the AWR arm and
+        # only carries labels in the conditioned arm, so both are mirrored here rather than
+        # passed unconditionally.
+        #
+        # Passing `weight=None` on a plain arm is not a loss of the "weight 1" property: the
+        # loss takes an unweighted mean there, so an unweighted row IS a weight-1 row. The
+        # ones-array exists only to keep the key sets equal in the arm that has weights.
+        # The BALLAST'S OPTIONAL KEYS MIRROR THE BUFFER'S -- see the comment above.
+        ballast_ds = build_ballast_dataset(
+            args.ballast, ballast_rows, ctx, cfg, null_prob=args.null_prob, seed=args.seed,
+            label=labels is not None, weight=weight is not None)
+        print(f"[ft] {describe_ballast(args.ballast, ballast_rows)}")
+        n_total = len(train_ds) + len(ballast_ds)
+        print(f"[ft]     {len(ballast_ds)} of {n_total} train windows "
+              f"({len(ballast_ds) / max(n_total, 1):.1%}) are ungraded pre-training rows")
+        train_ds = ConcatWindowDataset([train_ds, ballast_ds])
     print(f"[ft] {len(train_ds)} train / {0 if val_ds is None else len(val_ds)} val windows "
           f"over {int(np.unique(uid[rows]).size)} episodes")
     if labels is not None:
@@ -1112,6 +1178,16 @@ def _save(args, cfg, model, opt, ema, epoch: int, history: list, path: str) -> N
     ckpt["finetune"] = {"pretrained": os.path.abspath(args.pretrained),
                         "rollout": os.path.abspath(args.rollout),
                         "labels": os.path.abspath(args.labels) if args.labels else "",
+                        # BALLAST is part of what this checkpoint was trained on and is
+                        # invisible in every other record: the buffer path is unchanged, the
+                        # label sidecar is unchanged, and the ballast rows carry no label, so
+                        # nothing downstream could tell a ballasted run from a plain one.
+                        "ballast": os.path.abspath(args.ballast) if args.ballast else "",
+                        # The FLAG, not the selection: `select_ballast_rows` returns exactly
+                        # this many or raises, so a short draw can never be recorded as a full
+                        # one.
+                        "ballast_chunks": int(args.ballast_chunks) if args.ballast else 0,
+                        "ballast_flat_frac": float(args.ballast_flat_frac),
                         "lr": args.lr, "epochs": args.epochs, "history": history}
     if ema is not None:
         ckpt["model_ema"] = {k: v.detach().cpu() for k, v in ema.shadow.items()}

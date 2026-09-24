@@ -306,7 +306,11 @@ def real_freeform_library(tmp_path_factory) -> str:
     manifest = ff.generate_freeform_manifest(cfg)
     ff.validate_manifest(manifest)
     path = str(tmp_path_factory.mktemp("freeform") / "lib.h5")
-    maker.write_terrain_library(path, manifest, maker.library_meta(None), cfg)
+    # The bare SCHEMA, deliberately: this file never builds a trajectory command, so it
+    # needs no joint channels. `library_meta` refuses None because a COURSE built that
+    # way dies inside Isaac; that refusal is right, and this is the honest way to ask
+    # for the layout it does not apply to.
+    maker.write_terrain_library(path, manifest, maker.schema_only_layout(), cfg)
     return path
 
 

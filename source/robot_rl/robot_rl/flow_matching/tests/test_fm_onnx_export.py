@@ -73,6 +73,12 @@ def _tiny_checkpoint(tmp_path, extero_encoder: str = "auto",
     state_dim = window_dim(nj, k)
     n = 2
     cfg = FlowMatchingConfig(
+        # This fixture's synthetic recording carries no `depth_lag` array, and this file
+        # is not about camera latency. `depth_latency_probs` now defaults to the shipped
+        # tuple and the dataset REFUSES a depth recording without the lagged frames rather
+        # than silently falling back -- so the opt-out is stated here, keeping that refusal
+        # meaningful where it matters: a real recording that predates the arrays.
+        depth_latency_probs=None,
         num_history_states=n, future_len=f, cmd_array="target_vel", cmd_stride=4,
         target_source="ego_anchored_clip_future", val_fraction=0.34, seed=0,
         d_model=32, nhead=4, num_layers=2, dim_feedforward=64,

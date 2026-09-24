@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "g1_deploy/depth_obs.h"
+#include "depth_camera_json.h"
 #include "robot_asset_json.h"
 
 namespace g1_deploy {
@@ -109,6 +110,22 @@ FmMeta ParseFmMeta(const std::string& json) {
     for (const auto& hw : root.at("extero_image_hw")) {
       m.extero_image_hw.emplace_back(hw.at(0).get<int>(), hw.at(1).get<int>());
     }
+  }
+  // THE RIG. Only this artifact names it: since the policy went near-only, the tracker's
+  // `depth_camera_spec` is a SUBSET, and sizing the generator's row off that left the missing
+  // camera's plane at 0.0 with nothing raising. Parsed with the SAME parser the tracker's block
+  // uses, so the two cannot be read differently. A scan generator names no cameras and that is
+  // not an error; a DEPTH one that names none is refused below, where the reason is specific.
+  if (root.contains("extero_spec") && root.at("extero_spec").is_array()) {
+    for (const auto& cam : root.at("extero_spec")) {
+      m.cameras.push_back(ParseDepthCameraSpecJson(cam));
+    }
+  }
+  if (!m.cameras.empty() && static_cast<int>(m.cameras.size()) != m.extero_tokens) {
+    throw std::runtime_error(
+        "fm_meta names " + std::to_string(m.cameras.size()) + " camera(s) in extero_spec but "
+        "declares extero_sensor_count=" + std::to_string(m.extero_tokens) +
+        "; the row is sized from the count and filled from the list, so they must agree.");
   }
   if (m.extero_channels < 1 || m.height_dim % m.extero_channels != 0) {
     throw std::runtime_error(

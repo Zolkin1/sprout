@@ -88,6 +88,18 @@ def _steady_cmd(vx: float):
     return lambda _t: (float(vx), 0.0, 0.0)
 
 
+def _max_dp_steps(args) -> int:
+    """The longest horizon any one DP solve in this run will use, in control steps.
+
+    Only for sizing the fork pool (``DPMatcher.solve_bytes``), so it takes the WORST case over both
+    ways a duration is chosen -- the fixed ``--approach-s`` / ``--recovery-s`` and the per-clip draws
+    from their ``*-range`` -- rather than tracking which path a given mode takes.  The approach and
+    exit DPs run in sequence inside a worker, so the peak is the longer of the two."""
+    longest = max(float(args.approach_s), float(args.recovery_s),
+                  float(args.approach_s_range[1]), float(args.recovery_s_range[1]))
+    return max(1, int(round(longest / float(args.dt))))
+
+
 def _ramp_cmd(vx0: float, approach_s: float, ramp_s: float, vx1: float = 0.0):
     """Hold ``vx0``, then linearly decelerate to ``vx1`` over the last ``ramp_s`` seconds.
 
@@ -1260,7 +1272,10 @@ def main() -> int:
         # independent.  unit_pool flattens the per-tile record lists in tile order.
         _SHARED.update(args=args, dev=dev, matcher=matcher, builder=builder, variants=variants,
                        tvels=tvels, tiles=tiles)
-        n_workers = default_workers(len(tiles), args.workers)
+        # Sized by the LONGEST horizon a worker will solve: the approach and exit DPs run one after
+        # the other, so the peak is the larger table, not their sum (see DPMatcher.solve_bytes).
+        n_workers = default_workers(len(tiles), args.workers, log=lambda m: print(f"[box] {m}"),
+                                    bytes_per_worker=matcher.solve_bytes(_max_dp_steps(args)))
         print(f"[box] generating {len(tiles)} stair tiles x {len(tvels)} clips across {n_workers} worker(s) ...")
         records.extend(unit_pool(_stair_tile_worker, range(len(tiles)), n_workers))
     elif args.num_box_tiles > 0:
@@ -1284,7 +1299,8 @@ def main() -> int:
         # per-tile velocity/duration RNG seeded by (tile_seed, terrain_id) inside the worker.
         _SHARED.update(args=args, dev=dev, matcher=matcher, builder=builder, terr_srcs=terr_srcs,
                        approach_len=approach_len, box_tiles=box_tiles, _px=_px, _py=_py, buf=buf)
-        n_workers = default_workers(len(box_tiles), args.workers)
+        n_workers = default_workers(len(box_tiles), args.workers, log=lambda m: print(f"[box] {m}"),
+                                    bytes_per_worker=matcher.solve_bytes(_max_dp_steps(args)))
         print(f"[box] generating {len(box_tiles)} box tiles x {C} clips across {n_workers} worker(s), "
               f"approach_len={approach_len:.1f} m, vel range [{vlo:.1f},{vhi:.1f}] from {len(terr_srcs)} source(s)")
         records.extend(unit_pool(_box_tile_worker, range(len(box_tiles)), n_workers))

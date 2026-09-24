@@ -121,6 +121,10 @@ Deployed pair, tile 6 = stairs_up 5 risers +0.850 m, tile 20 = stairs_down 7 ste
   jump_off_front +4.92 (the sign flips). It keeps owning `in_goal` / success and is untouched, so
   every mjeval number already measured stays comparable. **Tile -1 is REFUSED, not approximated** --
   the flat sentinel has no tile frame at all (spread 129 m).
+- **SUPERSEDED 2026-09-10:** the numbers in this bullet came from `critic_gate.py`, which is
+  DELETED along with the `P(fail)` head it gated -- its lead-time gate was defined by
+  `p_fail` crossing 0.5, and a scalar return regression has no such threshold. Kept as the
+  record of what was measured.
 - Critic transfer measured against MuJoCo's OWN outcomes (`critic_gate.py`, 48 episodes / 11 falls,
   tiles 6 + 20): AUC(`p_fail_mean`) **0.946** with a label-shuffle control at **0.517 +/- 0.097**,
   AUC(`p_fail_max`) 0.846. The shuffle landing at 0.50 is what makes the rest mean anything. Read
@@ -155,3 +159,127 @@ Deployed pair, tile 6 = stairs_up 5 risers +0.850 m, tile 20 = stairs_down 7 ste
   with `failed()` as its predicate half. `gen_tracker_metrics.py` records `verdict_source` (which
   answer was used) beside `failure_reason` (what the runner saw) -- the `fell` column was once
   written BEFORE the fall check, so every fall read as a survival.
+
+# Named videos for the paper / talk / website
+
+`record_videos.py` + `video_render.py`. Every clip has a NAME in a registry (`SHOTS`), so it can
+be asked for again and regenerated; `--stage list` prints them, `logs/video/INDEX.md` is written
+from the manifests each run.
+
+- **Two stages, and the split is load-bearing.** `roll` runs the policy and writes
+  `logs/video/<shot>/trace.npz` (poses + the `vel_tracking_sweep.TraceRecorder` columns); `render`
+  turns a trace into an mp4. The look WILL be re-tuned, and re-tuning it must not re-run the
+  policy, or each pass shows a different episode and a parent/fine-tune pair stops being a pair.
+- **Which generator each shot runs, and it is not one answer.** Every SHOWCASE shot (the two
+  four-box lanes, `tall_stairs_up`, `flat_locomotion`, `entry_stairs_down`) runs
+  `ft_multi_lag_i5_fm.onnx`, sha `d1c11c23` -- byte-identical to the DEPLOYED
+  `ft_multi_lag_iter005_fm.onnx`, so those clips are the shipped policy. The A/B PAIRS run
+  the PER-COURSE fine-tunes instead (`ft_updown_lag_i5` on the walled staircase,
+  `ft_boxes_lag_i5` on the two-box course), because that is what those mode probes were
+  rolled with and a different one would not reproduce their table. All thirteen share one
+  tracker, sha `ccb94c27`. `INDEX.md` prints the pair per shot; do not read a pair's
+  "fine-tuned" arm as the deployed generator.
+- **A probe shot is verified against `mode_probe`'s own table** -- verdict, failure code, step
+  count and furthest x -- and REFUSES to write if it does not reproduce. That is what lets a clip
+  be quoted with its blind human mode label out of `labels.json`.
+- **Rendering never touches physics**: a second copy of the scene is loaded and restyled. Themes
+  replace the shared `<visual>`+`<asset>` block (and raise if a scene does not carry it); geom
+  colours, lighting and wall transparency are `mjModel` edits after load.
+- **Walls are found geometrically, not by name.** On `varied_updown` tiles 13 and 23 the stairwell
+  walls are `tile_slab11` / `tile_slab12` -- solid, 1.77 m, both sides of a 1.75 m corridor, and
+  they hide the robot completely. On the entry-stairs tile nine of them come out named
+  `tile_step*`. `wall_geoms` takes tall + thin + world-fixed + **at least 8x longer than thick**;
+  `--wall_alpha` fades them.
+  - **The aspect test is not optional.** Tall + thin alone also caught the UPPER TREADS of
+    terrain_scene's 20-riser `tall` flight -- a 0.32 m tread is thin, and past riser 8 it is over
+    1.10 m up -- and rendered the top half of the staircase see-through. A tread is 4.8x longer
+    than thick; the walls it has to be told apart from are 26-53x.
+- `LANES` also carries the playground's own staircases (`terrain_scene_tall_stairs_up` /
+  `_over`) and a featureless `flat` lane for scripted-command demos. `_scene_lane_geoms` COPIES each geom's attributes, so a lane whose walls are
+  visual-only in the playground stays visual-only here; only the name, the lateral position and
+  optionally the lateral extent are rewritten. `--lane_spacing` is REFUSED on a staircase: a
+  flight is its rise and run, and respacing the treads would author a different one.
+  `part="up"` drops everything past the top platform's far face, which makes that face a
+  CLIFF -- so a shot using it must cut the footage short of the edge (`tall_stairs_up` cuts
+  0.4 m before it and the episode does then walk off and fall, after the clip ends).
+- **A SCRIPTED command is `run_episode(cmd_fn=...)`**, additive and defaulting to the held
+  constant every terrain clip was generated under. Its `t` runs from the END of the opening
+  hold, so a profile is authored from its own zero; it states its own yaw, so it overrides
+  `steer_kp`. Profiles live in `experiments/velocity_commands.py`, next to the ones
+  `gen_tracker_runner --mode eval` uses.
+  - **A profile is off-distribution on the stair families and in-distribution on flat.** The
+    two stair families carry `|vy| max = |wz| max = 0.0000` EXACTLY; the 3000 flat clips
+    (`terrain_type_code == 0` of `g1_mb_v6g.h5`) span `vx [-1.00, +2.50]`, `vy [-0.59,
+    +0.60]`, `wz [-0.79, +0.78]` and do vary within a clip. `flat_locomotion_demo` stays
+    inside that envelope, which is why it is a FLAT demo and says so in its name. Measured on
+    it: commanded/achieved 0.50/0.58 side +y, -0.50/-0.38 side -y, (2.20, 0.55)/(2.02, 0.49)
+    on the turning run, 0.80/0.83 walking, 0.01 stopped -- and no fall over the whole 27.5 s.
+- **`--follow_yaw` is needed on any clip with a turn in it.** A fixed azimuth is right for a
+  lane; with a 0.55 rad/s turn in the middle the robot swings through the frame and ends up
+  walking away from the camera. The heading is low-passed before the camera uses it, since
+  the raw yaw carries the gait's own oscillation, and unwrapped against the filter state, or
+  a pass through +-180 deg spins the camera the long way in one frame.
+- `--vel_plot both` is the CLEAN cut plus the ANNOTATED one from the same roll -- a talk's
+  play cut and its explain cut, which must not be two different rolls. Expand it from the
+  RESOLVED placement, not from the flag: doing only the flag rendered a shot whose own
+  default was `both` as a single file named for neither.
+- The velocity panel's shaded bands are read off the COMPILED MODEL's geometry, so the band and the
+  terrain on screen cannot disagree. `--span_pad` widens them, and anything above 0 is a
+  readability choice rather than a measurement.
+- **The pelvis velocity swings ~1 m/s inside one stride**, so the panel's heavy line is a 0.4 s
+  mean by default (`--vel_smooth`) with the raw line still drawn thin underneath.
+- **Both stages want `env_isaaclab`.** `render` needs no onnxruntime but does need `imageio` +
+  `imageio-ffmpeg`, and `transfer/requirements.txt` carries neither on purpose -- `env_transfer`
+  is sized for a Jetson.
+- **The AUTHORED scenes cap the render at 1920x1080** -- `<global offwidth/offheight>` is the
+  offscreen framebuffer, not a hint, and `render_trace` refuses a larger frame. Every theme raises
+  it to 3840x2160, so `--width 2560 --height 1440` and up work. The first cut went out at 720p and
+  read as soft; 8x multisampling and CRF 5 were already on, so size was the whole story.
+- The panel's dpi scales with the frame (`100 * width / 1280`). Font sizes are in POINTS, so they
+  follow dpi on their own; the subplot margins are not, and are written as a dpi-100 pixel count
+  times that scale. Without it, doubling the frame halved the axis labels' share of it.
+
+## What the four-box lane measured, and why it is not terrain_scene's geometry
+
+The lane is read out of `g1_perceptive_terrain_scene.xml` (heights 0.25 / 0.40 / 0.55 / 0.70 m),
+not restated. Two things about it had to be changed, and both are properties of the RECORDING:
+
+- **Nothing in this stack keeps a lane**, so a held forward command drifts sideways. Unsteered, the
+  first roll was 5.0 m off centre by x=11 m and walked PAST two boxes on the floor. At
+  `steer_kp=1.0` and terrain_scene's own 2.59 m width, **0 of 40 draws climbed all four** -- 24
+  walked past one -- with peak lateral excursion to 3.4 m against a 1.30 m box half-width. Slowing
+  to 1.0 m/s made it worse (the drift has longer to build) and `steer_kp=1.5` did not help either.
+  Widening the boxes laterally removes the lane-keeping failure and changes the climb not at all.
+- **At 3 m spacing the pair never recovers the command between boxes**: mean achieved 0.77 m/s of a
+  commanded 1.5, and 0.89 even off a feature, while the same pair holds 1.40-1.45 m/s on open flat.
+  So "the command is tracked except across a traversal" has nowhere to show at that spacing; at
+  6 m it reads straight off the panel -- **1.40 off a feature against 0.48 over one**.
+- The heading controller is not free: at `steer_kp=1.0` its yaw command SATURATES at `steer_wz_max`
+  for most of the run and the mean forward speed falls to 0.54 m/s. A lane clip trades lateral
+  drift against forward speed and the trade is steep.
+
+## `steer_yaw_rate` seeks a GOAL; a lane wants a CENTRELINE
+
+Two different jobs, and mjeval's controller does the first. Aiming at `target_xy` -- a fixed
+POINT -- fails a lane clip in two ways, both measured on the four-box lane at `kp=1.0`:
+
+- **off-centre and still short of the goal**, the bearing points diagonally across the lane, so
+  the robot crabs toward the goal rather than easing back onto the centreline: heading wandering
+  +-20 deg for the whole traverse; and
+- **past the goal band the bearing points BACKWARD** and it commands a hard turn to walk back --
+  yaw 70 deg at x=18.1 m and 140 deg two seconds later with x DECREASING. `steer_yaw_rate`
+  returns 0 INSIDE the band, which hides this until the root leaves the band's far edge, so a
+  clip cut a few metres past the goal contains the turn-around.
+
+`run_episode(steer_fn=...)` is the injection point -- additive, defaulting to `steer_yaw_rate`,
+so no measured number moves -- and `record_videos.centreline_steer` is the lane law: pure pursuit
+at a `LANE_LOOKAHEAD_M` aim point on the centreline, so the commanded heading is a function of
+LATERAL ERROR alone, bounded by +-90 deg and zero when centred. **A probe shot keeps mjeval's
+law**, because it re-rolls a trial `mode_probe` ran and would not otherwise reproduce.
+
+What it bought and what it did not: the steered lane run went from x_max 18 m to 28-31 m and
+peak `|y|` from 2.5-4.6 m to 1.5-2.0 m. It still does NOT hold terrain_scene's own 2.59 m box
+width -- every draw came out `1101`, missing the third box -- and shortening the look-ahead from
+3.0 to 2.0 m moved peak `|y|` only 1.96 -> 1.84. **The residual is the pair sliding sideways
+while crossing a box, which a yaw-rate command cannot correct at 1.5 m/s**, so the widened lane
+stays necessary for a four-box clip either way.

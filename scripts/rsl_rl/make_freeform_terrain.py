@@ -91,7 +91,9 @@ from motion_gen.clips.clip_io import ClipLibraryWriter, load_clip_library  # noq
 from motion_gen.clips.clip_manager import MotionClipManager  # noqa: E402
 # The ONE copy. These were duplicated here when they moved out; two byte-identical
 # definitions of `verify` is exactly the drift the move existed to prevent.
-from terrain_library import _MINIMAL_META, library_meta, verify  # noqa: E402,F401
+from terrain_library import (  # noqa: E402,F401
+    _MINIMAL_META, library_meta, schema_only_layout, verify,
+)
 
 from motion_gen.terrain.freeform import (  # noqa: E402
     COMMANDED_SPEED_RANGE_MPS,

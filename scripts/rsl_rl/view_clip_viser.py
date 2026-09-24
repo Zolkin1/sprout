@@ -6,8 +6,7 @@
 Serves a 3D scene in the browser showing, for one clip:
 
   * every reference frame's world trajectory (pelvis, both feet, both
-    wrists, ...) as a coloured polyline, with a marker at each foot
-    touchdown;
+    wrists, ...) as a coloured polyline;
   * a row of translucent "ghost" robot meshes posed in the clip's joint
     configuration at evenly-spaced points along the trajectory; and
   * one solid robot you can scrub/play through the whole clip with a frame
@@ -21,6 +20,12 @@ Example::
 
     python scripts/rsl_rl/view_clip_viser.py --lib clips/g1_flat_v1.h5 --clip 0
     # then open the printed http://localhost:8080 URL
+
+For a figure, the robot draws in its own URDF materials by default (light shells, dark
+joints, darker camera mounts and backpack); ``--env-map studio`` adds HDRI lighting on top,
+and ``--robot-color`` takes it back to a flat colour when a silhouette reads better::
+
+    python scripts/rsl_rl/view_clip_viser.py --lib clips/g1_mb_v5.h5 --clip 24 --env-map studio
 """
 
 from __future__ import annotations
@@ -49,7 +54,12 @@ _FRAME_COLORS = [
     (0.20, 0.80, 0.85),  # cyan
     (0.85, 0.80, 0.20),  # yellow
 ]
-_SCRUBBER_COLOR = (1.0, 1.0, 1.0)       # solid white-ish robot
+# The solid robot's colour, when it is overridden at all.  ``--robot-color urdf`` (the
+# DEFAULT) overrides nothing and lets the model's own <material> tags through, which is
+# what a figure wants: the G1 is a light-grey shell with dark joints, and the camera
+# mounts and backpack are their own darker grey.  A flat override paints all of that one
+# colour, which is why every part used to read as the same piece of off-white plastic.
+_SCRUBBER_COLOR = (1.0, 1.0, 1.0)       # solid white-ish robot (--robot-color white)
 _GHOST_COLOR = (0.45, 0.55, 0.70)       # translucent steel-blue ghosts
 _GHOST_ALPHA_NEAR, _GHOST_ALPHA_FAR = 0.7, 0.18
 _KEYFRAME_COLOR = (0.95, 0.80, 0.15)    # gold -- pinned target keyframes (Phase-2 mb_encode overlay)
@@ -60,7 +70,39 @@ _KEYFRAME_ALPHA = 0.55
 # what Motion Bricks was asked to reach, while its PLACE is wherever the commanded velocity happened to
 # put it -- not where the terrain is.  Gold ghosts (our steady stride) are pose-only by design.
 _KEYFRAME_TERRAIN_COLOR = (0.90, 0.25, 0.20)
+# Declared ONCE, in robot_rl.flow_matching.viz.robot -- five viewers used to carry their own copy and
+# three had drifted.  A 21-DOF default actuates neither waist roll/pitch nor any of the 6 wrists, so
+# posing a 29-joint clip with it silently FROZE those 8 joints at zero: the motion looked subtly wrong
+# (stiff torso) in a way that was easy to blame on the clip rather than the viewer.
 _DEFAULT_URDF = DEFAULT_URDF
+
+
+def _parse_robot_color(spec: str) -> tuple[float, float, float, float] | None:
+    """Turn a ``--robot-color`` string into a ``ViserUrdf`` mesh colour override.
+
+    Args:
+        spec: ``"urdf"`` to keep the model's own materials, ``"white"`` for the flat white
+            the viewer used to force, or ``"r,g,b"`` with each component in ``[0, 1]``.
+
+    Returns:
+        An RGBA tuple to pass as ``mesh_color_override``, or ``None`` for ``"urdf"`` --
+        which is not the same as white: ``None`` makes ViserUrdf take the ``add_mesh_trimesh``
+        path, the only one that carries the URDF's per-link material colours through.
+
+    Raises:
+        ValueError: If ``spec`` is neither keyword nor three floats in ``[0, 1]``.
+    """
+    if spec == "urdf":
+        return None
+    if spec == "white":
+        return (*_SCRUBBER_COLOR, 1.0)
+    try:
+        rgb = tuple(float(x) for x in spec.split(","))
+    except ValueError as exc:
+        raise ValueError(f"--robot-color: expected 'urdf', 'white' or 'r,g,b', got {spec!r}") from exc
+    if len(rgb) != 3 or not all(0.0 <= c <= 1.0 for c in rgb):
+        raise ValueError(f"--robot-color: 'r,g,b' needs three components in [0, 1], got {spec!r}")
+    return (*rgb, 1.0)
 
 
 def _load_keyframe_sidecar(path: str, urdf) -> dict[int, dict]:
@@ -376,6 +418,48 @@ def _central_diff(a: np.ndarray, dt: float) -> np.ndarray:
     return d
 
 
+def _contact_image(contact: np.ndarray, foot_z: np.ndarray, foot_speed: np.ndarray,
+                   names: list, dt: float):
+    """Render the per-foot contact SCHEDULE as a timeline, over foot height and foot speed.
+
+    Three rows that have to be read together to judge a stride: the contact raster (when the clip says
+    a foot is planted), the foot's height, and its horizontal speed.  A planted foot should be flat on
+    both of the latter for the whole shaded span -- any ramp there IS the skate, and any shading while
+    the foot is high is the schedule disagreeing with the motion.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return None
+    n = contact.shape[0]
+    t = np.arange(n) * dt
+    fig, axes = plt.subplots(3, 1, figsize=(7.2, 4.6), sharex=True,
+                             gridspec_kw={"height_ratios": [0.6, 1, 1]})
+    cols = [(0.85, 0.25, 0.2), (0.2, 0.45, 0.85)]
+    for k in range(contact.shape[1]):
+        c = contact[:, k].astype(bool)
+        axes[0].fill_between(t, k, k + 0.8, where=c, color=cols[k % 2], step="mid", lw=0)
+        axes[1].plot(t, foot_z[:, k], color=cols[k % 2], lw=1.2, label=names[k])
+        axes[2].plot(t, foot_speed[:, k], color=cols[k % 2], lw=1.2)
+        for ax in axes[1:]:
+            ax.fill_between(t, *ax.get_ylim(), where=c, color=cols[k % 2], alpha=0.10, step="mid", lw=0)
+    axes[0].set_yticks([0.4, 1.4][:contact.shape[1]])
+    axes[0].set_yticklabels([nm.replace("_ankle_roll_link", "") for nm in names], fontsize=7)
+    axes[0].set_ylim(0, contact.shape[1]); axes[0].set_title("contact schedule", fontsize=8)
+    axes[1].set_ylabel("foot z (m)", fontsize=8)
+    axes[2].set_ylabel("foot speed (m/s)", fontsize=8); axes[2].set_xlabel("t (s)", fontsize=8)
+    for ax in axes:
+        ax.tick_params(labelsize=7); ax.grid(alpha=0.25)
+    axes[1].legend(fontsize=6, loc="upper right")
+    fig.tight_layout(pad=0.4)
+    fig.canvas.draw()
+    img = np.asarray(fig.canvas.buffer_rgba())[:, :, :3].copy()
+    plt.close(fig)
+    return img
+
+
 def _tracking_image(base_pos: np.ndarray, base_quat_wxyz: np.ndarray,
                     target_vel: np.ndarray, dt: float):
     """Render a body-frame root-velocity-vs-target tracking plot to an RGB array.
@@ -421,7 +505,21 @@ def _tracking_image(base_pos: np.ndarray, base_quat_wxyz: np.ndarray,
 class ClipScene:
     """Builds and updates all viser nodes for one clip at a time."""
 
-    def __init__(self, server: viser.ViserServer, lib, urdf, max_ghosts: int, term_dist: float = 0.25):
+    def __init__(self, server: viser.ViserServer, lib, urdf, max_ghosts: int,
+                 term_dist: float = 0.25,
+                 robot_color: tuple[float, float, float, float] | None = None):
+        """Build every static node for the scene; ``load_clip`` fills in the per-clip ones.
+
+        Args:
+            server: The viser server.
+            lib: The loaded clip library.
+            urdf: Shared loaded URDF (see ``viz.robot.load_urdf``).
+            max_ghosts: Trajectory-ghost pool size.
+            term_dist: Base-pose-error termination distance (m), drawn as a corridor tube.
+            robot_color: RGBA override for the solid robot, or ``None`` to render it with
+                the URDF's own materials (see :func:`_parse_robot_color`). The ghosts are
+                always overridden -- their whole job is to be a flat translucent colour.
+        """
         self.server = server
         self.lib = lib
         self.urdf = urdf
@@ -452,12 +550,11 @@ class ClipScene:
 
         # Static frame-trajectory polylines (one handle per frame, reused).
         self._track_handles: dict[str, viser.SceneNodeHandle] = {}
-        self._touchdown_handles: list[viser.SceneNodeHandle] = []
         # Robot mesh pool: solid scrubber + translucent ghosts.
         self._scrub_frame = server.scene.add_frame("/scrubber", show_axes=False)
         self._scrub = ViserUrdf(
             server, urdf, root_node_name="/scrubber",
-            mesh_color_override=(*_SCRUBBER_COLOR, 1.0),
+            mesh_color_override=robot_color,
         )
         self._ghosts: list[tuple[viser.FrameHandle, ViserUrdf]] = []
         for s in range(max_ghosts):
@@ -473,6 +570,7 @@ class ClipScene:
         # Pinned-keyframe ghost pool (gold) -- the Phase-2 target poses fed to Motion Bricks' predict().
         # Populated only when a --keyframes sidecar is supplied; sized on first set_keyframes.
         self._keyframes: dict[int, dict] | None = None
+        self._kf_max = 12                 # pool cap; see _ensure_kf_pool
         # One entry per keyframe slot: {"stride": (frame, urdf), "terrain": (frame, urdf)}.
         self._kf_ghosts: list[dict[str, tuple[viser.FrameHandle, ViserUrdf]]] = []
         self._kf_markers: viser.SceneNodeHandle | None = None
@@ -492,6 +590,7 @@ class ClipScene:
         self._cmd_handle = None       # command-reference path polyline
         self.show_plot = True
         self._plot_handle = None      # body-frame velocity-tracking plot (GUI image)
+        self._contact_handle = None   # per-foot contact-schedule timeline (GUI image)
         self.num_ghosts = min(max_ghosts, max_ghosts)
         self.clip_idx = -1
 
@@ -639,39 +738,56 @@ class ClipScene:
                 self._plot_handle = self.server.gui.add_image(
                     img, label="tracking: body vel vs target", visible=self.show_plot)
 
-        # Foot touchdown markers (contact rising edges per contact frame).
-        for h in self._touchdown_handles:
-            h.remove()
-        self._touchdown_handles = []
-        for ci, cf in enumerate(self.contact_frames):
-            if cf not in self.frame_pos:
-                continue
-            track = self._world_track(y, self.frame_pos[cf])
-            c = contact[:, ci].astype(bool)
-            td = np.where(c[1:] & ~c[:-1])[0] + 1
-            if td.size == 0:
-                continue
-            fi = list(self.frame_pos).index(cf)
-            h = self.server.scene.add_point_cloud(
-                f"/touchdown/{cf}", points=track[td].astype(np.float32),
-                colors=_FRAME_COLORS[fi % len(_FRAME_COLORS)], point_size=0.04,
-                point_shape="circle", visible=self.show_tracks,
-            )
-            self._touchdown_handles.append(h)
+        # Contact schedule as a timeline, beside the foot height and speed it should agree with.
+        if self._contact_handle is not None:
+            self._contact_handle.remove()
+            self._contact_handle = None
+        if contact is not None and contact.shape[0] >= 2:
+            fz, fs = [], []
+            for cf in self.contact_frames:
+                if cf not in self.frame_pos:
+                    fz, fs = [], []
+                    break
+                tr = self._world_track(y, self.frame_pos[cf])
+                fz.append(tr[:, 2])
+                fs.append(np.r_[0.0, np.linalg.norm(np.diff(tr[:, :2], axis=0), axis=-1)
+                                / float(self.lib.meta["dt"])])
+            if fz:
+                img = _contact_image(contact, np.stack(fz, 1), np.stack(fs, 1),
+                                     list(self.contact_frames), float(self.lib.meta["dt"]))
+                if img is not None:
+                    self._contact_handle = self.server.gui.add_image(
+                        img, label="contact schedule / foot z / foot speed", visible=self.show_plot)
+
+        # NOTE: foot-touchdown markers used to be drawn here from the ``contact`` dataset.  Removed --
+        # nothing in the loops-and-in-betweening generator computes contact from the spliced motion, so
+        # the flag the clip carries is whatever ClipOutputBuilder derived geometrically and the dots did
+        # not line up with what the robot was visibly doing.  Better absent than quietly wrong.
 
         self.refresh_ghosts()
         self._refresh_keyframes()
         self.set_frame(0)
 
-    def set_keyframes(self, kf_by_clip: dict[int, dict]) -> None:
-        """Attach pinned-keyframe data and build the ghost pool sized to the busiest clip.
-
-        Two ghosts per slot -- gold and red -- because ``ViserUrdf`` takes its colour at construction and
-        slots are reused as you switch clips, so a slot cannot be recoloured in place.  Exactly one of
-        each pair is ever visible (see :meth:`_refresh_keyframes`).
-        """
+    def set_keyframes(self, kf_by_clip: dict[int, dict], max_ghosts: int = 12) -> None:
+        """Attach pinned-keyframe data. Builds NO geometry -- see :meth:`_ensure_kf_pool`."""
         self._keyframes = kf_by_clip
-        pool = max((len(v["pos"]) for v in kf_by_clip.values()), default=0)
+        self._kf_max = int(max_ghosts)
+
+    def _ensure_kf_pool(self) -> None:
+        """Build the keyframe ghost pool, ONCE, the first time they are actually shown.
+
+        Deliberately lazy and capped. Two ghosts per slot -- gold and red -- because ``ViserUrdf``
+        fixes its colour at construction and slots are reused as you switch clips, so a slot cannot
+        be recoloured in place. That doubling is what makes an eager pool expensive: sizing it to the
+        busiest clip built 37 x 2 = 74 full G1 URDFs (~2000 meshes) at STARTUP even though
+        ``show_keyframes`` defaults off, which hung the browser before a single keyframe was
+        requested. Now nothing is built until the toggle goes on, and never more than ``--max-
+        keyframes`` slots; a clip with more keyframes than that is SUBSAMPLED evenly (reported, not
+        silently truncated -- see :meth:`_refresh_keyframes`).
+        """
+        if self._kf_ghosts or not self._keyframes:
+            return
+        pool = min(self._kf_max, max((len(v["pos"]) for v in self._keyframes.values()), default=0))
         for s in range(pool):
             pair = {}
             for tag, col in (("stride", _KEYFRAME_COLOR), ("terrain", _KEYFRAME_TERRAIN_COLOR)):
@@ -680,6 +796,15 @@ class ClipScene:
                                mesh_color_override=(*col, _KEYFRAME_ALPHA))
                 pair[tag] = (fr, gh)
             self._kf_ghosts.append(pair)
+        print(f"[view_clip_viser] built {pool} keyframe ghost slots on first show "
+              f"({2 * pool} robots)")
+
+    def _kf_slots(self, kf: dict) -> np.ndarray:
+        """Which of this clip's keyframes get a ghost: all of them, or an even subsample."""
+        n = len(kf["pos"])
+        if n <= len(self._kf_ghosts):
+            return np.arange(n)
+        return np.unique(np.round(np.linspace(0, n - 1, len(self._kf_ghosts))).astype(int))
 
     def _refresh_keyframes(self) -> None:
         """Pose the keyframe ghosts (+ root markers) for the current clip; hide the rest.
@@ -690,17 +815,23 @@ class ClipScene:
         commanded velocity, not of where the terrain actually is.
         """
         kf = (self._keyframes or {}).get(self.clip_idx)
+        if self.show_keyframes and kf is not None:
+            self._ensure_kf_pool()
         if self._kf_markers is not None:
             self._kf_markers.remove()
             self._kf_markers = None
+        # ROOT markers below show EVERY keyframe; only the posed robots are subsampled, so a capped
+        # pool still tells you where all of them are.
+        sel = self._kf_slots(kf) if (kf is not None and self._kf_ghosts) else np.zeros(0, int)
         for s, pair in enumerate(self._kf_ghosts):
-            live = (kf is not None and self.show_keyframes and s < len(kf["pos"]))
-            tag = str(kf["kind"][s]) if live else ""
+            live = (kf is not None and self.show_keyframes and s < len(sel))
+            src = int(sel[s]) if live else 0
+            tag = str(kf["kind"][src]) if live else ""
             for name, (fr, gh) in pair.items():
                 if live and name == (tag if tag in pair else "stride"):
-                    fr.position = kf["pos"][s]
-                    fr.wxyz = kf["wxyz"][s]
-                    gh.update_cfg(kf["cfg"][s])
+                    fr.position = kf["pos"][src]
+                    fr.wxyz = kf["wxyz"][src]
+                    gh.update_cfg(kf["cfg"][src])
                     fr.visible = True
                 else:
                     fr.visible = False
@@ -747,8 +878,6 @@ class ClipScene:
         self.show_tracks = show
         for h in self._track_handles.values():
             h.visible = show
-        for h in self._touchdown_handles:
-            h.visible = show
 
     def set_num_ghosts(self, n: int) -> None:
         self.num_ghosts = int(np.clip(n, 0, self.max_ghosts))
@@ -768,6 +897,8 @@ class ClipScene:
         self.show_plot = show
         if self._plot_handle is not None:
             self._plot_handle.visible = show
+        if self._contact_handle is not None:
+            self._contact_handle.visible = show
 
     def target_vel_at(self, step: int) -> np.ndarray | None:
         """Sampled (vx, vy, wz) command at ``step``, or None if not stored."""
@@ -791,7 +922,22 @@ def main() -> int:
                    help="Base-pose-error termination distance (m); radius of the corridor tube.")
     p.add_argument("--keyframes", default=None,
                    help="Optional mb_encode.py _keyframes.npz sidecar: overlay the pinned target poses (gold).")
+    p.add_argument("--robot-color", default="urdf",
+                   help="Solid robot colour: 'urdf' (default -- the model's own <material> tags, "
+                        "which is what the real robot looks like and what a figure wants), "
+                        "'white' (the flat white this viewer used to force), or 'r,g,b' in 0-1.")
+    p.add_argument("--env-map", default="none",
+                   choices=["none", "apartment", "city", "dawn", "forest", "lobby", "night",
+                            "park", "studio", "sunset", "warehouse"],
+                   help="Light the scene with a preset HDRI instead of viser's default lights. "
+                        "'studio' or 'warehouse' give a figure soft shading and specular "
+                        "highlights; the map itself stays out of the background.")
+    p.add_argument("--max-keyframes", type=int, default=12,
+                   help="Posed keyframe robots to build (each costs TWO URDFs, gold + red). Built "
+                        "lazily on first show; a clip with more keyframes is subsampled evenly, "
+                        "while the root markers still show every one.")
     args = p.parse_args()
+    robot_color = _parse_robot_color(args.robot_color)
 
     lib = load_clip_library(args.lib, "cpu")
     urdf = load_urdf(args.urdf)
@@ -799,12 +945,17 @@ def main() -> int:
 
     server = viser.ViserServer(port=args.port)
     server.scene.set_up_direction("+z")  # grid is (re)created per clip in load_clip, sized to the chunk
+    if args.env_map != "none":
+        # background=False: light the robot with the HDRI, but keep the plain backdrop -- a
+        # photographed warehouse behind a figure is noise, and a white page wants a white page.
+        server.scene.configure_environment_map(args.env_map, background=False)
 
-    scene = ClipScene(server, lib, urdf, max_ghosts=args.max_ghosts, term_dist=args.term_dist)
+    scene = ClipScene(server, lib, urdf, max_ghosts=args.max_ghosts, term_dist=args.term_dist,
+                      robot_color=robot_color)
     scene.num_ghosts = min(args.ghosts, args.max_ghosts)
     keyframes = _load_keyframe_sidecar(args.keyframes, urdf) if args.keyframes else None
     if keyframes is not None:
-        scene.set_keyframes(keyframes)
+        scene.set_keyframes(keyframes, max_ghosts=args.max_keyframes)
         nkf = sum(len(v["pos"]) for v in keyframes.values())
         print(f"[view_clip_viser] loaded {nkf} pinned keyframes over {len(keyframes)} clips from {args.keyframes}")
 

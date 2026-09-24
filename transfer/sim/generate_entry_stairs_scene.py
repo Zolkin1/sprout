@@ -64,9 +64,16 @@ HALL_RISE_IN: float = 5.25
 HALL_RUN_IN: float = 13.00
 HALL_WIDTH_IN: float = 100.0
 
-#: Flat ground before the first riser (m).  3.0 so the robot has room to reach commanded
-#: speed and the far camera sees the flight before the feet are on it.
-APPROACH_M: float = 3.0
+#: Flat ground before the first riser (m).  Room to reach commanded speed, and for the far
+#: camera to see the flight before the feet are on it.
+#:
+#: 5.5 rather than the 3.0 it started at, and the number comes from the ISAAC side: the tile
+#: there spawns over a chain covering ``approach_range_m`` (up to 4.0 m back from the first
+#: riser) whose farthest area sits 1.25 m in, so anything under 5.25 m hangs the chain off the
+#: tile.  Held equal here by ``test_entry_stairs_matches_mjeval.py`` -- the two simulators show
+#: the same building standing on the same amount of ground, and a robot driven at this
+#: staircase in MuJoCo gets the run-up its Isaac counterpart was trained with.
+APPROACH_M: float = 5.5
 #: The indoor CLEARING the hallway opens into, at the top level (m).  A lobby: the hallway
 #: constrains the robot laterally and then releases it, which is the opposite transition to
 #: the narrowing and is the one a building actually makes on the way in.
@@ -81,6 +88,34 @@ CLEARING_WIDTH_M: float = 8.0
 WALL_H_M: float = 1.2
 #: Wall thickness (m).
 WALL_T_M: float = 0.15
+
+# --- the side box -----------------------------------------------------------------------
+# A SECOND OBSTACLE, beside the approach, so one scene exercises both modes the generator has
+# to choose between: drive straight and it is a staircase, steer left and it is a box jump-up.
+# That choice is the thing that fails on hardware -- the wall-as-box misread and the stumble
+# at the top of a box are both MODE errors -- and having both in view at once is what a single
+# joystick session cannot otherwise test.
+#
+# **MuJoCo ONLY, deliberately: this is NOT part of the measured building.** The Isaac tile in
+# `motion_gen.terrain.entry_stairs` is unchanged, and must stay so -- those tiles are in the
+# `multi` fine-tune library, whose terrain fingerprint is baked into a run. Adding geometry
+# there would invalidate it. `test_entry_stairs_matches_mjeval.py` lists these constants as
+# explicitly MuJoCo-side so the completeness check still refuses anything else that diverges.
+#
+# 0.40 m is the canonical tested height: it is `mjeval_box2_h040`'s, the one the box2 overfit
+# set is built around, and the height the deployed pair actually got onto on the real robot
+# (it stumbled at the top -- which is the behaviour worth putting a joystick in front of).
+# 1.20 m deep matches box2 as well, so the approach is the trained one.
+SIDE_BOX_H_M: float = 0.40
+SIDE_BOX_DEPTH_M: float = 1.20
+SIDE_BOX_WIDTH_M: float = 1.60
+#: Downrange centre (m). Inside the approach run-up, so it is reachable before the first
+#: riser and both obstacles are in the far camera's frame from the spawn.
+SIDE_BOX_X_M: float = 3.00
+#: Lateral centre (m). The wide flight is 200" = 5.08 m, i.e. +-2.54 m, so this leaves ~1.2 m
+#: of clear ground between the box's near edge and the staircase: enough that a robot aimed at
+#: one is not accidentally on the other, and close enough that both are visible at once.
+SIDE_BOX_Y_M: float = 4.30
 
 
 def _step_pillars(name: str, x0: float, y: float, width: float, steps: int,
@@ -162,6 +197,10 @@ def geometry(solid_walls: bool = True) -> tuple[list[str], dict[str, float]]:
     x_end = x_hall1 + CLEARING_LEN_M
 
     g: list[str] = []
+    # The side box, on the ground beside the approach. First so it is easy to find in the xml.
+    g += _slab("side_box", SIDE_BOX_X_M - SIDE_BOX_DEPTH_M / 2.0,
+               SIDE_BOX_X_M + SIDE_BOX_DEPTH_M / 2.0,
+               SIDE_BOX_Y_M, SIDE_BOX_WIDTH_M, SIDE_BOX_H_M)
     # The wide lower flight, then the landing it rises onto.
     g += _step_pillars("wide", x_wide0, 0.0, w_wide, WIDE_STEPS, w_rise, w_run, 0.0)
     g += _slab("landing", x_wide1, x_land1, 0.0, w_wide, z_landing)
@@ -199,7 +238,8 @@ def geometry(solid_walls: bool = True) -> tuple[list[str], dict[str, float]]:
     g += _return_face("room_far", x_end - WALL_T_M / 2.0, -y_room, y_room,
                       z_top, WALL_H_M, WALL_T_M, solid_walls)
 
-    marks = {"x_wide_first_riser": x_wide0, "x_landing": x_wide1, "z_landing": z_landing,
+    marks = {"side_box_xy": (SIDE_BOX_X_M, SIDE_BOX_Y_M), "side_box_h": SIDE_BOX_H_M,
+             "x_wide_first_riser": x_wide0, "x_landing": x_wide1, "z_landing": z_landing,
              "x_hall_first_riser": x_land1, "x_hall_top": x_hall1, "z_top": z_top,
              "x_end": x_end, "wide_width_m": w_wide, "hall_width_m": h_wide,
              "clearing_w": CLEARING_WIDTH_M}

@@ -308,12 +308,59 @@ def loop_periodic(rp: torch.Tensor, rq: torch.Tensor, jt: torch.Tensor,
         segs = [(rp[start:], rq[start:], jt[start:])] + [(rp, rq, jt)] * (n_loops - 1)
         lrp, lrq, ljt, _, _ = align_and_concat(segs)
     else:
+        # The offset path repeats the ORIENTATION verbatim (below), so it can only express a stride whose
+        # net per-period rotation is zero.  Reachable today only from the uniform stair geometry, whose
+        # strides are straight -- but a turning stride would be silently translated while keeping the
+        # first period's absolute heading, which looks like a correct clip and is not one.  Use
+        # ``offset=None`` for anything that turns.
+        dyaw = (_yaw_of(rq[-1]) - _yaw_of(rq[0]) + math.pi) % (2.0 * math.pi) - math.pi
+        if abs(dyaw) > 1e-3:
+            raise ValueError(
+                f"loop_periodic(offset=...) is translation-only but this stride turns {dyaw:+.4f} rad "
+                f"per period; pass offset=None so each period is rigid-SE(2) aligned instead.")
         off = torch.as_tensor(offset, device=rp.device, dtype=rp.dtype)
         lrp = torch.cat([rp[start:]] + [rp[1:] + i * off for i in range(1, n_loops)])
         lrq = torch.cat([rq[start:]] + [rq[1:]] * (n_loops - 1))    # pure translation between periods
         ljt = torch.cat([jt[start:]] + [jt[1:]] * (n_loops - 1))
     lc = None if contact is None else torch.cat([contact[start:]] + [contact[1:]] * (n_loops - 1))
     return lrp, lrq, ljt, lc
+
+
+def loop_frames(rp: torch.Tensor, rq: torch.Tensor, jt: torch.Tensor,
+                contact: torch.Tensor | None, n_frames: int, start: int = 0):
+    """Replay a periodic stride for EXACTLY ``n_frames`` frames, entering at phase ``start``.
+
+    The steady-state primitive of flat clip generation: a commanded duration is an arbitrary frame
+    count, not a whole number of gait cycles, so :func:`loop_periodic` (whole periods only, with just
+    the FIRST one partial) is looped past the requested length and cut.  Entering at ``start`` is what
+    lets a Motion Bricks transient hand off at whatever gait phase it was aimed at, and the trailing cut
+    is what makes a clip's total length exact to the frame.
+
+    Exact by construction, with nothing blended: the stride's closure is bit-exact in pose (see
+    :mod:`motion_gen.motionbricks.stride_bank`) and :func:`align_and_concat` welds root position and
+    orientation, so every period seam is already C0 and the replay tracks the stride's own measured
+    velocity.  Cutting mid-period is likewise free -- the frames are the stride's own.
+
+    Args:
+        rp, rq, jt: the WHOLE stride, ``F`` frames (``rq`` wxyz).  Frame ``F-1`` duplicates frame 0.
+        contact: optional ``[F, C]``, carried along.
+        n_frames: how many frames to return.  Must be >= 1.
+        start: entry phase, a frame index in ``[0, F-1)``.
+
+    Returns ``(rp, rq, jt, contact)`` each with exactly ``n_frames`` rows.
+    """
+    if n_frames < 1:
+        raise ValueError(f"loop_frames needs n_frames >= 1, got {n_frames}")
+    f = int(rp.shape[0])
+    period = f - 1                                    # closure frame is the wrap point, not a new frame
+    if period < 1:
+        raise ValueError(f"loop_frames needs a stride of >= 2 frames, got {f}")
+    start = int(start) % period
+    have = f - start                                  # frames the first (partial) period yields
+    n_loops = 1 if n_frames <= have else 1 + -(-(n_frames - have) // period)   # ceil-div
+    lrp, lrq, ljt, lc = loop_periodic(rp, rq, jt, contact, n_loops, offset=None, start=start)
+    s = slice(0, n_frames)
+    return lrp[s], lrq[s], ljt[s], (None if lc is None else lc[s])
 
 
 def _quat_yaw_wxyz(theta: float) -> torch.Tensor:

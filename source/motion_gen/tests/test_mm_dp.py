@@ -20,7 +20,7 @@ from motion_gen.motion_matching.beam import BeamConfig, BeamMatcher
 from motion_gen.motion_matching.dp import DPConfig, DPMatcher
 from motion_gen.motion_matching.graph import VARIED, GraphConfig, build_candidate_graph
 from motion_gen.features import G1_JOINT_NAMES as _G1_JN
-from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig
+from motion_gen.motion_matching.vanilla import POSE_POSTURAL_IDX, VanillaConfig, VanillaMatcher
 
 _NJ = len(_G1_JN)                                    # joint-DOF count (29); synthetic clips match the DB width
 
@@ -191,6 +191,63 @@ def test_dp_objective_le_unconstrained_beam():
     dp_obj = _path_objective(dm, dp_path, dp_j, T)
     be_obj = _path_objective(dm, be_path, be_j, T)          # score beam's path under the same objective
     assert dp_obj <= be_obj + 1e-4, f"DP {dp_obj} should be <= beam {be_obj}"
+
+
+# ---- the per-worker memory footprint of one solve -------------------------------------
+# These pin the arithmetic AGAINST the shape of the arrays it runs on.  The action table and the
+# all-frames cost are sized by the DB (millions of frames) and are written by every solve, so they
+# are what a fork worker pays privately -- and shrinking them once OOM-killed the whole desktop.
+# Any of these three can be "fixed" by making the solve allocate the straightforward way again,
+# which is why the pins are here rather than in a comment.
+
+def test_traj_cost_chunking_is_bit_identical():
+    # The chunked trajectory cost must be BIT-identical to the whole-array expression, not merely
+    # close: the DP compares costs with `<=` to break ties toward `continue`, so a 1-ulp difference
+    # can move a cut and change the clip that gets generated.
+    srcs = [_clip(150, seed=1, vx=0.0), _clip(150, seed=2, vx=1.0), _clip(140, seed=3, vx=0.5, wz=0.4)]
+    dm = _dp(srcs, dcfg=DPConfig(dt=0.02, w_traj=1.0, w_track=0.0))
+    T = 60
+    dm._prepare(lambda t: (1.0, 0.0, 0.0) if t < 0.6 else (0.0, 0.6, 0.4), T)
+    for t in (0, 1, 17, T - 2, T - 1):
+        d = dm._traj_feat - dm._dtraj[t]                        # the un-chunked form
+        assert np.array_equal(dm._traj_cost_all(t), (d * d * dm._traj_w).sum(1)), f"t={t}"
+
+
+def test_action_table_is_int8_and_time_major():
+    # int8 halves the table and time-major makes each step a contiguous write; both are load-bearing
+    # at DB scale (5.1 vs 10.2 GiB per concurrent solve at N=5.5M, T=1000).  The reconstruction reads
+    # `action[t, f]`, so a layout change here silently transposes it -- the path check is the guard.
+    srcs = [_clip(120, seed=1, vx=0.0), _clip(120, seed=2, vx=1.0)]
+    dm = _dp(srcs, dcfg=DPConfig(dt=0.02, cut_penalty=3.0))
+    T = 90
+    dm._prepare(_const_cmd(1.0), T)
+    action = dm._dp_backward(T)
+    N = dm._bvel.shape[0]
+    assert action.dtype == np.int8 and action.shape == (T, N), (action.dtype, action.shape)
+    path, _ = dm._reconstruct(action, T)
+    assert len(path) == T and dm.owner.numpy()[path].max() < len(srcs)     # a real, in-range path
+
+
+def test_a_wide_candidate_graph_is_refused_not_truncated():
+    # 0=continue and 1+k for a jump, so int8 holds k_max<=126.  A wider graph must RAISE: silently
+    # wrapping would store slot 130 as a negative action and reconstruct a different motion.
+    srcs = [_clip(120, seed=1, vx=0.0), _clip(120, seed=2, vx=1.0)]
+    dm = _dp(srcs, dcfg=DPConfig(dt=0.02))
+    dm._cand = np.zeros((dm._bvel.shape[0], 130), dtype=np.int32)         # pretend k_max=130
+    dm._prepare(_const_cmd(1.0), 10)
+    with pytest.raises(ValueError, match="k_max=130"):
+        dm._dp_backward(10)
+
+
+def test_solve_bytes_tracks_the_horizon_and_dwarfs_the_greedy_matcher():
+    # A fork pool is sized by this, so it has to MOVE with T (the action table is O(T*N)); a constant
+    # would size a 1000-step solve like a 100-step one, which is how the pool came to ask for ~200 GiB.
+    srcs = [_clip(150, seed=1, vx=0.0), _clip(150, seed=2, vx=1.0)]
+    dm = _dp(srcs, dcfg=DPConfig(dt=0.02, w_traj=1.0, w_track=0.0))
+    N = dm._bvel.shape[0]
+    assert dm.solve_bytes(1000) - dm.solve_bytes(100) == 900 * N          # exactly the table's growth
+    vm = VanillaMatcher(srcs, VanillaConfig(dt=0.02), device="cpu", build_tree=False)
+    assert vm.solve_bytes(1000) < dm.solve_bytes(1000)
 
 
 # ---- clean STEADY-tier cost (one-sided, regime-ramped) ---------------------------------

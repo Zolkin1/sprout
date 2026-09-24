@@ -54,8 +54,33 @@ class BaseTrajectoryCommandCfg(CommandTermCfg):
     channel.  The per-subgroup CLF energies (``v_pelvis_pos``, ``v_joint_pos``,
     ``v_root_body_pos``, ...) are always logged and cover the usual need."""
 
-    strict_fingerprint: bool = False
+    strict_fingerprint: bool = True
     """If True, a trajectory/clip library fingerprint mismatch at construction *raises*
     instead of warning -- a guardrail for deploy / cross-machine runs where the loaded
-    library must match the trained-against one. Set via a hydra override, e.g.
-    ``env.commands.traj_ref.strict_fingerprint=true``. Default warns (non-fatal)."""
+    library must match the trained-against one.
+    ``env.commands.traj_ref.strict_fingerprint=false`` downgrades it to a warning.
+
+    **True is the intent, but as of 2026-09-10 this flag is UNREACHABLE on every current
+    task, in both directions.** Both call sites need a *trained-against* fingerprint to
+    have been injected into this cfg, and on the clip stack neither is:
+
+    - :meth:`BaseTrajectoryCommand._record_library_fingerprint` reads
+      ``self.manager.library_fingerprint``, and the clip tasks' manager is
+      ``MotionClipManager``, which has no such attribute -- so it returns on its first
+      line. ``play.py`` does inject ``cfg.library_fingerprint`` from the saved
+      ``env.yaml``, but that injection is dead code for this stack.
+    - :meth:`MotionSequenceCommand._record_clip_fingerprint` compares
+      ``cfg.clip_fingerprint``, which **nothing injects** -- it is only ever written BACK
+      after a load. So ``trained is None`` on every run.
+
+    The deployed teacher ``2026-08-20_16-36-10_mode11_decor_plan_v1`` recorded
+    ``strict_fingerprint: true``, passed on its command line; that was already a no-op.
+    The default is flipped so the stated intent lives in the repo rather than in a shell
+    history, and so wiring the injection later needs no second decision.
+
+    **Wiring it is NOT free, which is why it is not done here.** Injecting
+    ``clip_fingerprint`` at play time the way ``library_fingerprint`` is injected would
+    make every deliberate cross-library run fatal -- the box2 / varied / indist / curb
+    evals all run the deployed tracker against a course library it never trained on, by
+    design, and so does ``fm_debug.py``. Those paths need an explicit exemption before the
+    guard can be turned on for real."""

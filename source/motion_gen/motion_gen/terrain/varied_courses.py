@@ -154,10 +154,31 @@ class VariedCoursesCfg:
             named here so a reader does not take "up into down" to imply a staircase.
         updown_width_range_m: Corridor width (m).  ``(1.219, 3.048)`` is 4 to 10 feet, which
             brackets both of mjeval's stair widths (1.22 and 1.96).
-        updown_rise_m: Riser height (m).  Fixed at the trained mode: the riser is the axis the
-            step-geometry sweep already covers, and varying it here would confound this
-            library's terrain axes with that one's.
-        updown_run_m: Tread depth (m); the only tread in both trained sets.
+        updown_cells: ``(rise, run)`` pairs a tile's staircase is drawn from, in metres.  The
+            default is the TRAINED grid, read from ``library_v3``'s manifest: risers
+            ``{0.130, 0.155, 0.180}`` against treads ``{0.280, 0.305, 0.330}``, which in inches
+            is ``{5.12, 6.10, 7.09}`` by ``{11.02, 12.01, 12.99}``.
+
+            **Nine cells, not the ten each direction solves.**  ``library_v3`` also carries one
+            steep cell per direction -- ``stairs_up`` ``(0.1312, 0.2092)`` and ``stairs_down``
+            ``(0.1381, 0.1899)`` -- and neither can build a tile here, because both flights of
+            an up-into-down share one geometry and those cells exist going only one way.
+
+            **Rise and run are ONE draw.**  Drawn independently they produce combinations no
+            building has: a 0.180 m riser on a 0.2092 m tread is a ladder, and nothing
+            downstream would question it, because each number is individually in range.  This
+            replaced a fixed ``0.150 / 0.250``, which was neither a trained riser nor a trained
+            tread -- its comment claimed the run was "the only tread in both trained sets",
+            true of ``library_v2`` and no longer true of ``v3``, whose treads are 0.28-0.33.
+        updown_measured_cells: ``(rise, run)`` pairs from MEASURED real staircases, drawn
+            instead of :attr:`updown_cells` for :attr:`updown_measured_frac` of tiles.
+            Deliberately not named for out-of-distribution testing: ``(0.1778, 0.3048)`` is the
+            trained ``(7", 12")`` cell to within 2.2 mm and ``(0.1270, 0.3302)`` is ``(5", 13")``
+            to within 3.0 mm, so two of the three are in-distribution and only
+            ``(0.1397, 0.3175)`` -- 5.5 in by 12.5 in -- is new geometry, interpolated INSIDE
+            the grid rather than outside it.
+        updown_measured_frac: Share of up-into-down tiles drawn from
+            :attr:`updown_measured_cells`.  ``0.0`` disables them.
         updown_platform_range_m: Flat platform between the two flights (m).
         updown_wall_sides: The wall draws.  One or two walls, never none -- an unwalled flight
             has ground-level apron beside it and no vertical surface to stop a robot walking
@@ -181,8 +202,13 @@ class VariedCoursesCfg:
 
     updown_steps_range: tuple[int, int] = (1, 10)
     updown_width_range_m: tuple[float, float] = (1.219, 3.048)
-    updown_rise_m: float = 0.150
-    updown_run_m: float = 0.250
+    updown_cells: tuple[tuple[float, float], ...] = (
+        (0.130, 0.280), (0.130, 0.305), (0.130, 0.330),
+        (0.155, 0.280), (0.155, 0.305), (0.155, 0.330),
+        (0.180, 0.280), (0.180, 0.305), (0.180, 0.330))
+    updown_measured_cells: tuple[tuple[float, float], ...] = (
+        (0.1397, 0.3175), (0.1778, 0.3048), (0.1270, 0.3302))
+    updown_measured_frac: float = 0.0
     updown_platform_range_m: tuple[float, float] = (1.50, 3.00)
     updown_wall_sides: tuple[tuple[str, ...], ...] = (
         ("left", "right"), ("left",), ("right",))
@@ -435,7 +461,13 @@ def make_updown_tile(terrain_id: int, cfg: VariedCoursesCfg) -> dict:
     sides = tuple(cfg.updown_wall_sides[int(rng.integers(0, len(cfg.updown_wall_sides)))])
     wall_h = float(rng.uniform(*cfg.updown_wall_height_range_m))
 
-    rise, run = float(cfg.updown_rise_m), float(cfg.updown_run_m)
+    # ONE draw for the pair -- see `updown_cells`. The measured set is chosen per TILE, before
+    # the cell, so a config asking for a third measured tiles gets a third of its tiles on a
+    # measured staircase rather than a third of each tile's geometry mixed.
+    pool = cfg.updown_cells
+    if cfg.updown_measured_cells and float(rng.random()) < float(cfg.updown_measured_frac):
+        pool = cfg.updown_measured_cells
+    rise, run = (float(v) for v in pool[int(rng.integers(0, len(pool)))])
     approach_hi = float(cfg.approach_range_m[1])
     first_riser = _spawn_x() + approach_hi
     plat0 = first_riser + steps * run

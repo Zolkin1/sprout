@@ -339,3 +339,68 @@ def holm(pvalues: dict[str, float]) -> dict[str, float]:
         running = max(running, min(1.0, (m - i) * p))
         out[k] = running
     return out
+
+
+def t_crit(df: int, conf: float = 0.95) -> float:
+    """Two-sided Student-t critical value, without scipy.
+
+    Cornish-Fisher expansion of the t quantile about the normal one. Accurate to ~1e-4 for
+    ``df >= 20`` and to ~0.2% at ``df = 5``, which is well inside the precision any interval
+    here is reported to.
+
+    scipy has this exactly and is installed, but this module is pinned scipy-free
+    (``test_stats_module_does_not_pull_in_scipy``) so that the eval report stays runnable in the
+    small ``env_transfer``. That constraint is why this exists rather than a one-line import.
+
+    Args:
+        df: Degrees of freedom; clamped at 1.
+        conf: Two-sided confidence level.
+
+    Returns:
+        The critical value. ``df >= 1000`` returns the normal quantile.
+    """
+    z = _z(conf)
+    d = max(int(df), 1)
+    if d >= 1000:
+        return z
+    z3, z5 = z ** 3, z ** 5
+    return float(z + (z3 + z) / (4 * d)
+                 + (5 * z5 + 16 * z3 + 3 * z) / (96 * d ** 2)
+                 + (3 * z5 * z ** 2 + 19 * z5 + 17 * z3 - 15 * z) / (384 * d ** 3))
+
+
+def cluster_t_interval(per_cluster: np.ndarray, conf: float = 0.95) -> tuple[float, float, float]:
+    """Mean and t-interval over CLUSTER-level values -- the estimator to reach for by default.
+
+    ``mean +- t(C-1) * SD / sqrt(C)`` over one value per cluster. The cluster is the unit of
+    independence, so the cluster count C is the sample size no matter how many episodes sit
+    inside them.
+
+    **WHY THIS RATHER THAN A TWO-STAGE BOOTSTRAP.** A cluster's own value is already an estimate
+    from finitely many episodes, so the observed spread of cluster values across clusters ALREADY
+    contains within-cluster sampling noise. A bootstrap that resamples clusters and then
+    resamples episodes inside each drawn cluster adds that variance a second time: measured on
+    this campaign's arms it inflated the interval by 14-29% and flipped one arm's conclusion
+    (up-into-down `arrived`, from crossing zero to touching it). The correctly specified cluster
+    bootstrap resamples CLUSTERS ONLY, keeps each drawn cluster's contents intact, and then
+    agrees with this closed form to within 0.0008 on every arm measured.
+
+    So: use this, and use a single-stage cluster bootstrap as a robustness check. Never resample
+    two levels for an interval on a cluster-level mean.
+
+    Args:
+        per_cluster: One value per cluster -- a per-cell rate, or a per-cell paired delta.
+        conf: Two-sided confidence level.
+
+    Returns:
+        ``(mean, lo, hi)``; a degenerate ``(v, v, v)`` for a single cluster, which has no spread.
+    """
+    v = np.asarray(per_cluster, dtype=np.float64)
+    v = v[np.isfinite(v)]
+    if v.size == 0:
+        return float("nan"), float("nan"), float("nan")
+    m = float(v.mean())
+    if v.size == 1:
+        return m, m, m
+    half = t_crit(v.size - 1, conf) * float(v.std(ddof=1)) / np.sqrt(v.size)
+    return m, m - half, m + half

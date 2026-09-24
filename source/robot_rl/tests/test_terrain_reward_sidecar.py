@@ -99,10 +99,6 @@ def test_a_sidecar_for_a_different_rollout_is_refused(fit_mod, tmp_path):
 # -----------------------------------------------------------------------------------------
 # the "terrain only" guard
 # -----------------------------------------------------------------------------------------
-def test_terrain_only_accepts_the_one_consistent_combination(label_mod, capsys):
-    """w_fail 0 + mc + a critic fitted on terrain, and nothing else."""
-    label_mod.check_reward_consistency("terrain", 0.0, "mc", True, "abc123")
-    assert "TERRAIN ONLY" in capsys.readouterr().out
 
 
 def test_terrain_only_refuses_a_critic_fitted_on_the_TRACKING_reward(label_mod):
@@ -111,71 +107,31 @@ def test_terrain_only_refuses_a_critic_fitted_on_the_TRACKING_reward(label_mod):
         label_mod.check_reward_consistency("track_err", 0.0, "mc", True)
 
 
-def test_terrain_only_refuses_a_nonzero_survival_weight(label_mod):
-    """At w_fail > 0 the advantage mixes in the realized fall outcome."""
-    with pytest.raises(SystemExit, match="w_fail 0"):
-        label_mod.check_reward_consistency("terrain", 1.0, "mc", True)
-    with pytest.raises(SystemExit, match="w_fail 0"):
-        label_mod.check_reward_consistency("terrain", 0.25, "mc", True)
-
-
 def test_terrain_only_refuses_the_bootstrapped_estimator(label_mod):
     """n_step's quality half differences against the critic, not against measured reward."""
     with pytest.raises(SystemExit, match="estimator mc"):
         label_mod.check_reward_consistency("terrain", 0.0, "n_step", True)
 
 
-def test_a_terrain_critic_used_WITHOUT_terrain_only_warns(label_mod, capsys):
-    """Silently mixing is the mistake; it should at least say so."""
-    label_mod.check_reward_consistency("terrain", 1.0, "n_step", False)
-    assert "WARNING" in capsys.readouterr().out
 
 
 def test_the_default_path_is_unaffected(label_mod, capsys):
     """A tracking critic labelled the old way must stay silent, or the warning is noise."""
-    label_mod.check_reward_consistency("track_err", 1.0, "n_step", False)
+    label_mod.check_reward_consistency("track_err", "mc", False)
     assert capsys.readouterr().out == ""
 
 
 # -----------------------------------------------------------------------------------------
 # a quality-only critic
 # -----------------------------------------------------------------------------------------
-def test_a_quality_only_critic_refuses_any_survival_weight(label_mod):
-    """Its ``p_fail`` was never trained, so reading it at all is a bug, not a setting.
-
-    Refused rather than warned: an untrained sigmoid head still emits numbers in [0, 1] that
-    look exactly like probabilities, so nothing downstream would notice.
-    """
-    for w in (1.0, 0.5, 0.01):
-        with pytest.raises(SystemExit, match="UNTRAINED"):
-            label_mod.check_reward_consistency("terrain", w, "mc", False, quality_only=True)
-
-
-def test_a_quality_only_critic_is_fine_at_w_fail_zero(label_mod, capsys):
-    """Which is exactly the terrain-only configuration."""
-    label_mod.check_reward_consistency("terrain", 0.0, "mc", True, "abc",
-                                        (-1.0, 0.0), "mse", True)
-    out = capsys.readouterr().out
-    assert "TERRAIN ONLY" in out
-    assert "survival head UNTRAINED" in out
-    assert "[-1, 0]" in out
 
 
 def test_the_range_and_kind_are_reported_so_a_mismatch_is_visible(label_mod, capsys):
     """[0,1] and [-1,0] are both plausible-looking; an advantage across them is nonsense."""
-    label_mod.check_reward_consistency("terrain", 0.0, "mc", True, "h",
-                                        (0.0, 1.0), "two_hot", False)
+    label_mod.check_reward_consistency("terrain", "mc", True, "h", (0.0, 1.0))
     out = capsys.readouterr().out
-    assert "two_hot head over [0, 1]" in out
-    assert "UNTRAINED" not in out
-
-
-def test_fit_value_offers_quality_only_and_drops_the_bce():
-    """The loss must be dropped, not down-weighted: a small weight still shapes the encoder."""
-    src = (_SCRIPTS / "fit_value.py").read_text()
-    assert '"--quality_only"' in src
-    assert "torch.zeros((), device=device) if quality_only" in src
-    assert "quality_only=bool(args.quality_only)" in src
-    # ...and the model must not be selected on an untrained head's AUC.
-    assert 'select_name = "val quality MSE" if quality_only else "val AUC"' in src
+    assert "scalar head over [0, 1]" in out
+    # `A = G - V` is stated in the banner, because it is the whole estimator now and a reader
+    # should not have to infer which of several it was.
+    assert "A = G - V" in out
 

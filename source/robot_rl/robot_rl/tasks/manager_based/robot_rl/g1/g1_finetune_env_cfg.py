@@ -53,6 +53,8 @@ from isaaclab.utils import configclass
 # IsaacLab-free and this module (numpy + math only) imports nothing heavier, so this costs the
 # env cfg nothing at import time.
 from motion_gen.terrain.freeform import GOAL_HALF_WIDTH_FLOOR_M
+from motion_gen.terrain.wall_field import DWELL_RADIUS_M as WALL_DWELL_RADIUS_M
+from motion_gen.terrain.wall_field import DWELL_S as WALL_DWELL_S
 
 from robot_rl.tasks.manager_based.robot_rl import mdp
 
@@ -488,6 +490,19 @@ class G1FinetuneFreeformEnvCfg(G1FinetuneTerrainDepthEnvCfg):
         # bearing down the section. This is also what makes a clip-free library admissible --
         # ``command_velocity_available`` stops depending on a ``target_vel`` dataset.
         cmd.freeform_command = True
+        # JOINT tracking, for the same reason the clip knobs below go off: there is no clip.
+        # The teacher chain sets ``tracking_mode = "body"``
+        # (:class:`G1TeacherTerrainEnvCfg`), which needs a library carrying root-frame body
+        # channels -- and a manifest-only section library carries no channels at all, so
+        # ``base_trajectory_cmd._resolve_tracked_vel_names`` raises at command-manager init:
+        #
+        #     tracking_mode='body' needs a clip library carrying root-frame body channels
+        #     (@root), but this library has none.
+        #
+        # ``g1_tracker_env_cfg`` pins the same value for the same reason, and the two are the
+        # generator-driven paths. Set AFTER ``super()`` because ``_apply_tracking_mode`` runs
+        # as a validation during it.
+        cmd.tracking_mode = "joint"
         # Every clip-phase knob is now meaningless, and each one would otherwise be a claim
         # about a library that has no clips. Off explicitly rather than left at the teacher's
         # value, so a reader of this cfg is not left inferring which of them still apply.
@@ -544,3 +559,203 @@ class G1Box2FinetuneEnvCfg(G1FinetuneFreeformEnvCfg):
         # AFTER super(): the ancestors build the observation groups, and this fills a slot
         # they declared. Before it, there is nothing to fill.
         enable_policy_far_camera(self)
+
+
+##
+# The WALL-FIELD course: enclosed rooms, and a goal you have to STOP in
+##
+#: Range-to-goal gain for the approach controller on this course (1/s).
+#:
+#: With :data:`WALLS_STOP_RADIUS_M`, a 2.5 m/s episode starts decelerating about 5.7 m out.
+#: Chosen so the deceleration is gentle relative to the 1.10 m corridor rather than tuned:
+#: nothing here has been measured, and the first thing to look at if the robot overshoots the
+#: disc is this and ``freeform_approach_kd``, in that order.
+WALLS_APPROACH_KP: float = 0.6
+
+#: Range at which the whole command triple goes to zero (m). EQUAL to the dwell radius.
+#:
+#: **Equal because the command should say one thing: the moment you are in the circle, stand.**
+#: NO HARD CUT. The command is the P law and nothing else, so it decays to zero AT the goal
+#: rather than stepping to zero on a surface around it.
+#:
+#: This number only ever existed to serve :data:`WALLS_APPROACH_MIN_SPEED`. With a floor the
+#: command cannot decay -- it is pinned at the floor until something switches it off -- so a cut
+#: radius is required, and it has to be set to the coast distance or the robot arrives at the
+#: floor speed and overshoots. With the floor gone the P term self-terminates and there is
+#: nothing left to switch.
+#:
+#: HOW WE GOT HERE, because both intermediate states were wrong in instructive ways. Set equal
+#: to the dwell radius (the original), the law's equilibrium is a SHELL on the scoring boundary:
+#: measured over 12,598 episodes, closest approach p10 0.66 / median 0.80 / p90 0.89 m against a
+#: 1.0 m disc, ~1% ever within 0.5 m, and the ~8% that stopped in the outer 0.1 m held the dwell
+#: 0.611 of the time at 1.50 m/s against 0.884 for those that stopped deeper. Set to 0.25 m (the
+#: coast distance) the robot lands on the goal, but only by arithmetic -- the law still aimed at
+#: a shell and the coast happened to cancel it.
+#:
+#: The cost of removing the floor is real and is recorded on that constant. Watch the collect:
+#: if the robot consistently settles SHORT of the disc rather than in it, the floor is what was
+#: holding it out of the walking deadband and this pair should come back together.
+WALLS_STOP_RADIUS_M: float = 0.0
+
+#: Where the approach controller AIMS: the goal point itself.
+#:
+#: The P term's error is ``to_go - target``, so this is the only range at which the law is
+#: actually at rest. With it equal to the stop radius -- one number for both, as it was -- the
+#: equilibrium is a SHELL around the goal and the robot parks on it: measured, a median closest
+#: approach of 0.80 m against a 1.0 m disc.
+#:
+#: 0.0 says what the course means: go to the middle of the region you are scored on. With the
+#: floor and the cut both off it is now the ONLY thing setting where the robot ends up -- the
+#: command is ``clamp(kp * to_go, 0, drawn_speed)``, which is at rest exactly here.
+WALLS_APPROACH_TARGET_R_M: float = 0.0
+
+#: Range (m) at which the STEERING channel goes quiet -- the DISC, not the stop radius.
+#:
+#: These were one number while the robot stopped at the rim, and they have to come apart now
+#: that it drives to the centre. Steering must end no later than forward motion, because a yaw
+#: rate commanded to a stopped robot is a step input it can only answer by turning on the spot,
+#: and a robot pirouetting inside the disc is one drift from breaking a dwell it had earned.
+#: Left equal to the 0.25 m stop radius, that is exactly what would happen to every env that
+#: comes to rest off-centre: `vx` clamps to zero on the along-track term while `rng` is still
+#: above 0.25, so it would stand and turn.
+#:
+#: The cost is the last 0.75 m being driven open-loop in heading. That is acceptable HERE and
+#: would not be everywhere: by the time the robot is inside the disc it is already scored as
+#: arrived, so lateral error accumulated over that stretch cannot cost the arrival it has.
+WALLS_YAW_QUIET_RADIUS_M: float = WALL_DWELL_RADIUS_M
+
+#: NO FLOOR: the commanded speed is the P law clamped by the episode's own drawn ceiling, and
+#: nothing else. ``vx = clamp(kp * to_go, 0, drawn_speed)``.
+#:
+#: WHAT THE FLOOR WAS FOR, and why it is worth a try without it. Under the P law alone the last
+#: ``floor/kp`` metres are commanded in the 0.05-0.3 m/s band -- which is both where the robot
+#: stops walking for reasons no reward can see, and a band the generator has thin coverage of
+#: (5.8% of its command rows are |vx| < 0.1 and ~7% fall in 0.1-0.3). The floor kept every
+#: commanded value either zero or inside the trained band, at the price of a discontinuity.
+#:
+#: That price stopped being worth paying when the controller started aiming at the goal instead
+#: of at the disc edge. Aiming at the 1.0 m shell, the P term hit zero at the rim and the floor
+#: carried the robot the whole way from 1.5 m to 1.0 m -- it was doing the approach. Aiming at
+#: the goal it covers only 0.50 m to 0.25 m, a quarter of a metre, and in exchange it forces a
+#: switching surface that has to be tuned against the coast distance.
+#:
+#: SO THIS IS THE EXPERIMENT, not a settled default. The failure mode to watch for in the first
+#: collect is the robot coming to rest SHORT of the disc -- deadband, exactly what the floor
+#: prevented. `min_dist_to_goal_m` piling up just above 1.0 m is the signature; the previous
+#: arm's was a pile-up just BELOW it, which is the opposite problem.
+WALLS_APPROACH_MIN_SPEED: float = 0.0
+
+#: The dwell disc's radius (m) -- 2 m diameter. IMPORTED, not restated: the terrain module
+#: stamps the same number into this course's goal spec, and the debug marker reads it back off
+#: the termination below, so the spec, the rule and the picture cannot drift apart.
+WALLS_GOAL_RADIUS_M: float = WALL_DWELL_RADIUS_M
+
+#: Seconds the robot must hold the disc, upright, before the episode counts as a success.
+WALLS_DWELL_S: float = WALL_DWELL_S
+
+
+@configclass
+class G1WallsFinetuneTerminationCfg(G1FinetuneFreeformTerminationCfg):
+    """Terminations for the wall course: the pass-through goal replaced by a DWELL goal.
+
+    ``goal_reached`` is set to ``None`` rather than left alongside the dwell term. The first
+    success rule to fire ends the episode, so a task carrying both would be scored by whichever
+    is looser -- and the pass-through one is looser by construction, which would make the dwell
+    requirement decorative while still appearing in the config.
+    """
+
+    #: KEPT AND INERT, not removed. Both launchers unconditionally override
+    #: `env.terminations.goal_reached.params.height_tol_m`, and hydra refuses an override whose
+    #: key is missing or None -- so deleting this term kills every collect and every eval at
+    #: config composition, before the GPU is touched. `never_terminates` keeps the key and the
+    #: params addressable while the term does nothing.
+    #:
+    #: THE PARAMS BELOW ARE THEREFORE DOCUMENTATION, NOT CONFIGURATION. A launcher setting
+    #: `height_tol_m` here gets no error and no effect; the tolerance that matters on this
+    #: course is `goal_dwell`'s.
+    goal_reached = DoneTerm(
+        func=mdp.freeform_goal_disabled,
+        params={"min_half_width": FREEFORM_GOAL_MIN_HALF_WIDTH_M, "height_tol_m": 0.5},
+        time_out=True,
+    )
+
+    goal_dwell = DoneTerm(
+        func=mdp.freeform_goal_dwell,
+        params={"radius_m": WALLS_GOAL_RADIUS_M,
+                "dwell_s": WALLS_DWELL_S,
+                # DECLARED so it is overridable, exactly as `freeform_goal_reached`'s own
+                # comment says of its tolerance: hydra's struct mode refuses a key absent from
+                # the dict, so a param omitted here cannot be set from the CLI at all. 0 is
+                # silent and is what every real run uses.
+                "debug_every": 0,
+                # The same height datum the pass-through goal uses, and NOT optional here: a
+                # robot that has fallen inside the disc would otherwise keep accruing dwell and
+                # be scored as having stopped, which is the opposite of the point.
+                "height_tol_m": 0.5},
+        time_out=True,
+    )
+
+
+@configclass
+class G1WallsFinetuneEnvCfg(G1FinetuneFreeformEnvCfg):
+    """The wall-field fine-tune: enclosed rooms, walls to ignore, and a goal to STOP in.
+
+    Takes ``--clip clips/ft_walls_train.h5`` (or ``_holdout``) from
+    ``scripts/rsl_rl/make_walls_terrain.py``. See ``motion_gen.terrain.wall_field`` for the
+    course and its corridor invariant.
+
+    **This is the only task that switches the approach controller on**, and that is deliberately
+    visible: ``test_freeform_approach_defaults_off.py`` asserts no other G1 cfg assigns those
+    knobs, so turning them on anywhere else is an edit to that test's allow-list rather than
+    something a shared base class can do on a course's behalf. Every other free-form arm --
+    boxes, updown, indist, multi -- keeps the constant per-episode ``vx`` its numbers were
+    measured under.
+
+    **Why the forward channel joins the yaw channel.** The other courses are traverse-and-exit:
+    the goal is a downrange line, crossing it ends the episode, and nothing after that is
+    observed. Here the question is whether the robot STOPS, which a constant velocity command
+    makes unanswerable -- the reward's ``exp(-|v_err|/sigma)`` term pays for continuing to move,
+    so holding a 0.5 m disc would be a behaviour the policy is penalised into failing. With the
+    range-driven command the same term pays FULL marks for standing still at the goal, and
+    stopping becomes trainable without touching the reward.
+
+    **The GRADING follows the dwell too, and that took a change outside this file.** The
+    recorded ``reached_goal`` column used to be a latch over a downrange half-plane, so a robot
+    that crossed the goal line and then walked into the wall graded as an arrival -- and the
+    progress reward pays on exactly that column. This course's goal spec now declares
+    ``dwell_radius_m`` / ``dwell_s``, which makes ``eval.accumulate`` score ``reached_goal`` as
+    "held the disc for dwell_s" instead. The reward, the critic's arrived set and
+    ``terminal_reward`` all read that one column, so all three follow. ``reached_goal`` is
+    therefore NOT comparable between this course and a pass-through one;
+    ``accumulate`` prints which rule it scored under.
+    """
+
+    terminations: G1WallsFinetuneTerminationCfg = G1WallsFinetuneTerminationCfg()
+
+    def __post_init__(self):
+        """Switch on the approach controller. The tile replicas are deliberately inherited."""
+        super().__post_init__()
+        self.commands.traj_ref.freeform_approach_kp = WALLS_APPROACH_KP
+        self.commands.traj_ref.freeform_stop_radius_m = WALLS_STOP_RADIUS_M
+        # Pure P. The tracker is itself a closed loop on the commanded velocity, so the
+        # approach is damped already; raise this only if the robot visibly overshoots.
+        self.commands.traj_ref.freeform_approach_kd = 0.0
+        self.commands.traj_ref.freeform_approach_min_speed = WALLS_APPROACH_MIN_SPEED
+        self.commands.traj_ref.freeform_approach_target_r_m = WALLS_APPROACH_TARGET_R_M
+        self.commands.traj_ref.freeform_yaw_quiet_radius_m = WALLS_YAW_QUIET_RADIUS_M
+        # NO num_rows OVERRIDE, and the reasoning that said there should be one was wrong
+        # on both counts. `num_rows` replicates the whole tile set and env origins are tile
+        # centres, so with fewer slots than envs several robots share an origin -- which looked
+        # like a problem this course had and the others did not, because a wall tile declares
+        # ONE small spawn rectangle inside a room where the others declare a chain.
+        #
+        # It is not a problem. `InteractiveSceneCfg.filter_collisions` defaults True and
+        # nothing in robot_rl overrides it, so co-located robots do not interpenetrate; they
+        # get correlated spawns, which every other free-form arm already has at 10 rows.
+        #
+        # And 86 rows would not have fixed it anyway: IsaacLab draws the ROW at random
+        # (`terrain_levels = randint(0, max_init_level)`) and only the COLUMN evenly, so at
+        # 2048 envs over 86x24 slots ~63% of envs still share one. What it does buy is an
+        # 8.9 km world extent and 252k triangles against 2.9k, for nothing.
+        #
+        # So this inherits the 10 that every other free-form course runs.

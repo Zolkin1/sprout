@@ -68,11 +68,26 @@ DEFAULT_QUANTILE: float = 0.99
 #: result.  When in doubt, widen.
 DEFAULT_PAD_M: float = 0.5
 
+#: Additive slack on the HEIGHT tolerance specifically, metres.
+#:
+#: Separate from :data:`DEFAULT_PAD_M` because the asymmetry argument above is about DOWNRANGE
+#: and LATERAL slack, where half a metre costs a little discrimination and buys a lot of safety.
+#: Vertically it does not transfer: a stair riser is 0.13-0.18 m, so a 0.5 m height tolerance is
+#: three to four steps and a robot standing most of a flight below the goal scores as arrived --
+#: on exactly the families the eval exists to separate. Measured on the v6g clip arm, the
+#: tracker's own height error at the goal is 0.040-0.072 m, so a 0.5 m pad is ~10x the thing it
+#: is padding. 0.1 is what the shipped goal_regions_anchor_v3.json was fitted with (its
+#: provenance records `height_pad_m: 0.1`), before the two pads were collapsed into one.
+DEFAULT_HEIGHT_PAD_M: float = 0.1
+
 #: Floors, so a family whose clip arm happens to be very tight cannot produce a region so
 #: small that ordinary variation misses it.
 MIN_MARGIN_M: float = 1.0
 MIN_HALF_WIDTH_M: float = 1.5
-MIN_HEIGHT_TOL_M: float = 0.35
+#: Below one stair riser (0.13-0.18 m), so the floor cannot by itself merge two steps. 0.35
+#: dominated every fitted height (0.040-0.072 + 0.1) and would have made the per-axis pad above
+#: a no-op; v3's fitted heights ran 0.12-0.23, i.e. under the old floor entirely.
+MIN_HEIGHT_TOL_M: float = 0.12
 
 
 #: The only columns the fit reads.  Named so the loader can ask for them rather than pulling
@@ -158,7 +173,7 @@ def _load_clip_cells(run_dir: str) -> list[tuple[str, dict, dict]]:
 
 
 def _fit_family(down: np.ndarray, lat: np.ndarray, hz: np.ndarray,
-                quantile: float, pad: float) -> dict:
+                quantile: float, pad: float, height_pad: float) -> dict:
     """Tolerances containing ``quantile`` of one family's surviving endpoints, plus ``pad``.
 
     Args:
@@ -166,7 +181,9 @@ def _fit_family(down: np.ndarray, lat: np.ndarray, hz: np.ndarray,
         lat: ``[k]`` terminal lateral offsets.
         hz: ``[k]`` terminal height errors.
         quantile: See :data:`DEFAULT_QUANTILE`.
-        pad: See :data:`DEFAULT_PAD_M`.
+        pad: Downrange and lateral slack. See :data:`DEFAULT_PAD_M`.
+        height_pad: Vertical slack, which does NOT share the horizontal number. See
+            :data:`DEFAULT_HEIGHT_PAD_M`.
 
     Returns:
         A dict of the three tolerances plus the raw fitted quantiles, for the report.
@@ -178,7 +195,7 @@ def _fit_family(down: np.ndarray, lat: np.ndarray, hz: np.ndarray,
     return {
         "approach_margin_m": float(max(short + pad, MIN_MARGIN_M)),
         "half_width_m": float(max(wide + pad, MIN_HALF_WIDTH_M)),
-        "height_tol_m": float(max(high + pad, MIN_HEIGHT_TOL_M)),
+        "height_tol_m": float(max(high + height_pad, MIN_HEIGHT_TOL_M)),
         "fitted_q_short_m": float(short),
         "fitted_q_lateral_m": float(wide),
         "fitted_q_height_m": float(high),
@@ -196,16 +213,34 @@ def main() -> int:
     p.add_argument("--write_bootstrap", default="",
                    help="emit an UNCALIBRATED spec here and exit; run the clip arm against "
                         "it to produce the table this script then fits")
-    p.add_argument("--skip_families", default="jump_off,distractor,stairs_dn_pure,stairs_up_pure",
+    p.add_argument("--skip_families",
+                   default=("jump_off,distractor,stairs_dn_pure,stairs_up_pure,"
+                            "pure_stairs_down,pure_stairs_up,flat"),
                    help="Families excluded from the FIT. The same two the rest of the "
                         "pipeline drops: `jump_off` travels backwards so its goal sits "
                         "behind the spawn, `distractor` travels less in total than a typical "
                         "approach margin, and the "
                         "`*_pure` families open ON the stairs so their first re-plan runs on "
                         "a null-history embedding fitted on flat. Fitting tolerances from any "
-                        "of them would size the region to a task that is not one.")
+                        "of them would size the region to a task that is not one. BOTH "
+                        "spellings of the pure families are listed because the name changed "
+                        "with the library: `stairs_up_pure` in the v5-era libraries, "
+                        "`pure_stairs_up` in v6. `normalize_family` only strips the `family_` "
+                        "prefix and the `.h5` suffix, so a stale spelling matches nothing and "
+                        "the family is fitted rather than skipped -- silently, and in the "
+                        "direction that sizes the region to a task that is not one. "
+                        "`flat` is skipped for a different reason and the same effect: it has "
+                        "no terrain feature to reach, so its clip end is an arbitrary point on "
+                        "a plane, and a tolerance fitted there measures the sampler\'s speed "
+                        "draw rather than the policy. It is scored by the FALL rule instead -- "
+                        "see report.FALL_ONLY_FAMILIES.")
     p.add_argument("--quantile", type=float, default=DEFAULT_QUANTILE)
-    p.add_argument("--pad_m", type=float, default=DEFAULT_PAD_M)
+    p.add_argument("--pad_m", type=float, default=DEFAULT_PAD_M,
+                   help="Downrange and lateral slack (m) added to each fitted quantile.")
+    p.add_argument("--height_pad_m", type=float, default=DEFAULT_HEIGHT_PAD_M,
+                   help="VERTICAL slack (m), separate from --pad_m: a stair riser is "
+                        "0.13-0.18 m, so the horizontal number applied here would merge "
+                        "several steps into one goal.")
     args = p.parse_args()
 
     goal_region = _load_goal_region()
@@ -265,10 +300,11 @@ def main() -> int:
             "admin-censored at the ceiling); give the clip arm enough steps to finish.")
     all_pts = np.concatenate([np.concatenate(v) for v in fams.values()], axis=0)
     default = _fit_family(all_pts[:, 0], all_pts[:, 1], all_pts[:, 2],
-                          args.quantile, args.pad_m)
+                          args.quantile, args.pad_m, args.height_pad_m)
     for name, chunks in sorted(fams.items()):
         pts = np.concatenate(chunks, axis=0)
-        fit = _fit_family(pts[:, 0], pts[:, 1], pts[:, 2], args.quantile, args.pad_m)
+        fit = _fit_family(pts[:, 0], pts[:, 1], pts[:, 2], args.quantile, args.pad_m,
+                          args.height_pad_m)
         by_family[name] = {k: fit[k] for k in
                            ("approach_margin_m", "half_width_m", "height_tol_m")}
         rows.append((name, fit))
@@ -283,6 +319,7 @@ def main() -> int:
             "arm": "clip",
             "quantile": float(args.quantile),
             "pad_m": float(args.pad_m),
+            "height_pad_m": float(args.height_pad_m),
             "n_surviving_episodes": int(total),
             "per_family": {n: f for n, f in rows},
         },
@@ -290,7 +327,7 @@ def main() -> int:
     spec.save(args.out)
 
     print(f"\n{'family':<18} {'n':>6}  {'margin':>8} {'half-w':>8} {'height':>8}   "
-          f"(q{args.quantile:g} + {args.pad_m:g} m pad)")
+          f"(q{args.quantile:g} + {args.pad_m:g} m pad, {args.height_pad_m:g} m vertical)")
     print("-" * 72)
     for name, fit in rows:
         print(f"{name:<18} {fit['n_survivors']:>6}  {fit['approach_margin_m']:>8.2f} "

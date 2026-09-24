@@ -79,7 +79,7 @@ def _plot_velocity_tracking(cols, out_dir, meta) -> dict:
     axes[-1].set_xlabel("time [s]")
     fig.suptitle("Commanded vs achieved base velocity")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "velocity_tracking.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "velocity_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return rms
 
@@ -117,7 +117,7 @@ def _plot_reference_tracking(cols, out_dir, meta) -> dict:
     axes[2][1].set_xlabel("time [s]")
     fig.suptitle("Base pose: FM reference vs actual")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return summary
 
@@ -140,21 +140,48 @@ def _plot_reference_tracking_legacy(cols, out_dir, meta) -> dict:
     axes[-1].set_xlabel("time [s]")
     fig.suptitle("Tracker-vs-generator reference error")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "reference_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return summary
 
 
+#: Isaac Lab's ``base_fallen`` thresholds (the tracker task's termination params). Kept here
+#: so a MuJoCo run is scored by the SAME predicate the RL side terminates on.
+FALL_MIN_HEIGHT = 0.5
+FALL_TILT_DEG = 70.0
+
+
 def _plot_survival(cols, out_dir, meta) -> dict:
-    """Base height + fall flag over time; returns survival summary."""
+    """Base height + fall over time; returns survival summary.
+
+    Survival is recomputed from the trajectory, NOT read from the logged ``fell`` column.
+    That column is ``Robot.failed()`` (``qpos[2] < 0.2``) sampled at log time, and it has two
+    problems: the run stops the moment it trips, so the failure usually never reaches the
+    log at all -- measured 1/100 flagged where the runner itself reported 30/100 fallen --
+    and even when it does fire it is height-only at 0.2 m, less than half Isaac Lab's 0.5 m,
+    with no orientation check. A robot face-down at 0.21 m and 96 degrees of pitch scored as
+    SURVIVED. Anything comparing MuJoCo against Isaac Lab on "success" inherits that.
+
+    The rule here is Isaac's: below :data:`FALL_MIN_HEIGHT`, or tilted past
+    :data:`FALL_TILT_DEG` in roll or pitch, at any logged step. Agrees with the runner's own
+    live verdict on 98/100 clips, and unlike it, means the same thing the RL side means.
+    """
     t = cols["time"]
-    # The RUNNER'S verdict wins when it is present. The `fell` column cannot be trusted for
-    # this: it is written before each step's physics and the loop exits on the fall without
-    # writing a further row, so a run that fell logs a column of zeros. Inferring from it
-    # reported survival for runs the loop had already scored as falls.
+    # The RUNNER'S verdict wins when it is present, and the fall is DERIVED from state rather
+    # than read from the `fell` column -- both branches independently fixed the same bug and
+    # each fixed half of it.  `fell` cannot be trusted: it is written before each step's
+    # physics and the loop exits on the fall without writing a further row, so a run that fell
+    # logs a column of zeros, and inferring from it reported survival for runs the loop had
+    # already scored as falls.  Deriving it instead applies ISAAC'S rule (below
+    # FALL_MIN_HEIGHT, or past FALL_TILT_DEG in roll or pitch, at any logged step), which is
+    # what makes the two simulators score a rollout identically.
     survived_meta = meta.get("survived") if isinstance(meta, dict) else None
-    fell = cols["fell"] > 0.5
-    fell_idx = np.argmax(fell) if fell.any() else -1
+    tilt = np.radians(FALL_TILT_DEG)
+    fell = cols["base_z"] < FALL_MIN_HEIGHT
+    for axis in ("act_roll", "act_pitch"):
+        if axis in cols:
+            fell = fell | (np.abs(cols[axis]) > tilt)
+    fell_idx = int(np.argmax(fell)) if fell.any() else -1
     time_to_fall = float(t[fell_idx]) if fell_idx >= 0 else None
     if survived_meta is False and time_to_fall is None:
         time_to_fall = meta.get("time_to_fall_s")
@@ -162,25 +189,27 @@ def _plot_survival(cols, out_dir, meta) -> dict:
             time_to_fall = float(time_to_fall)
     fig, ax = plt.subplots(figsize=(9, 3.5))
     ax.plot(t, cols["base_z"], lw=1.5, label="base height")
+    ax.axhline(FALL_MIN_HEIGHT, color="0.6", ls=":", lw=1.0,
+               label=f"fall height {FALL_MIN_HEIGHT} m")
     if time_to_fall is not None:
         ax.axvline(time_to_fall, color="r", ls="--", label=f"fall @ {time_to_fall:.2f}s")
     _mark_handoff(ax, meta)
     ax.set_xlabel("time [s]"); ax.set_ylabel("base z [m]"); ax.grid(alpha=0.3); ax.legend()
     fig.suptitle("Survival / base height")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "survival.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "survival.png"), dpi=PLOT_DPI)
     plt.close(fig)
-    # survived_meta is the loop's own answer and is authoritative when present. Inferring
-    # survival from the `fell` column cannot be right: that flag is written before the loop's
-    # fall check and the loop returns on the next step, so the row where the fall happens is
-    # never written and every fall would read as a survival. The time-derived form is only the
-    # fallback for a run recorded before the verdict was stamped, and `verdict_source` says
-    # which of the two answered. `time_to_fall_s` is back-filled from the runner above for the
-    # same reason -- it is a timestamp, and the column has none on a run that fell.
+    # survived_meta is the loop's own answer and is authoritative when present. The DERIVED
+    # height/tilt rule above is the fallback for a run recorded before the verdict was stamped,
+    # and `verdict_source` says which of the two answered. Note what is deliberately NOT used
+    # here: the logged `fell` column. That flag is written before the loop's fall check and the
+    # loop returns on the next step, so the row where the fall happens is never written and
+    # every fall would read as a survival. `time_to_fall_s` is back-filled from the runner
+    # above for the same reason -- it is a timestamp, and the column has none on a run that fell.
     survived = (time_to_fall is None) if survived_meta is None else bool(survived_meta)
     return {"survived": survived, "time_to_fall_s": time_to_fall,
             "final_time_s": float(t[-1]),
-            "verdict_source": "runner" if survived_meta is not None else "fell_column",
+            "verdict_source": "runner" if survived_meta is not None else "derived",
             "failure_reason": (meta.get("failure_reason", "") if isinstance(meta, dict) else "")}
 
 
@@ -215,11 +244,18 @@ def _plot_torques(cols, meta, out_dir) -> dict:
     for j in range(n, len(axes)):
         axes[j].axis("off")
     fig.suptitle("Joint torque vs effort limit")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "torques.png"), dpi=120)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(os.path.join(out_dir, "torques.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return {"peak_utilization": util,
             "max_utilization": (max(util.values()) if util else None)}
+
+
+#: Raster density for every figure here. 120 is legible at a glance and unreadable zoomed in,
+#: which is the wrong trade for a 29-subplot grid where the question is usually about ONE joint.
+#: Overridable per run (`--dpi`, or `--plot_dpi` on the runner) because the cost is file size:
+#: joint_tracking.png is ~12x4 in, so 200 dpi is ~2400x3400 px.
+PLOT_DPI: int = 200
 
 
 def _plot_joint_tracking(cols, meta, out_dir) -> dict:
@@ -241,6 +277,15 @@ def _plot_joint_tracking(cols, meta, out_dir) -> dict:
             continue
         ax.plot(t, r, lw=1.3, label="FM ref")
         ax.plot(t, a, lw=1.0, alpha=0.85, label="actual")
+        # The PD TARGET -- the policy's action after scaling and the default-pose offset, i.e.
+        # what the servo was actually asked for. `ref` and `actual` alone cannot separate
+        # "the joint could not get there" from "the policy never asked it to": with the target
+        # drawn, a target that tracks the reference while the actual lags is the joint failing
+        # to deliver, and a target that ignores the reference is the policy. The column has
+        # been in the CSV since it was written; only this plot was not reading it.
+        c = cols.get(f"ctrl_{jn}")
+        if c is not None:
+            ax.plot(t, c, lw=0.9, ls="--", alpha=0.8, label="PD target")
         rms[jn] = float(np.sqrt(np.mean((r - a) ** 2)))
         _mark_handoff(ax, meta)
         ax.set_title(f"{jn}  (rms={rms[jn]:.3f})", fontsize=7)
@@ -249,8 +294,8 @@ def _plot_joint_tracking(cols, meta, out_dir) -> dict:
     for j in range(n, len(axes)):
         axes[j].axis("off")
     fig.suptitle("Per-joint position: FM reference vs actual [rad]")
-    fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "joint_tracking.png"), dpi=120)
+    fig.tight_layout(rect=(0, 0, 1, 0.98))
+    fig.savefig(os.path.join(out_dir, "joint_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return {"rms": rms, "max_rms": (max(rms.values()) if rms else None)}
 
@@ -279,12 +324,12 @@ def _plot_ee_tracking(cols, meta, out_dir) -> dict:
     axes[-1][0].set_xlabel("time [s]")
     fig.suptitle("Per-EE position (base frame): FM reference vs actual [m]")
     fig.tight_layout()
-    fig.savefig(os.path.join(out_dir, "ee_tracking.png"), dpi=120)
+    fig.savefig(os.path.join(out_dir, "ee_tracking.png"), dpi=PLOT_DPI)
     plt.close(fig)
     return {"rms_norm": summary, "max_rms_norm": (max(summary.values()) if summary else None)}
 
 
-def create_metrics(log_dir: str) -> dict:
+def create_metrics(log_dir: str, dpi: int | None = None) -> dict:
     """Generate all metric plots + a summary JSON for a finished run.
 
     Args:
@@ -293,6 +338,9 @@ def create_metrics(log_dir: str) -> dict:
     Returns:
         The summary dict (also written to ``metrics_summary.json``).
     """
+    global PLOT_DPI
+    if dpi:
+        PLOT_DPI = int(dpi)
     cols, meta = _load(log_dir)
     out_dir = os.path.join(log_dir, "plots")
     os.makedirs(out_dir, exist_ok=True)
@@ -312,6 +360,6 @@ def create_metrics(log_dir: str) -> dict:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        sys.exit("usage: python gen_tracker_metrics.py <log_dir>")
-    create_metrics(sys.argv[1])
+    if len(sys.argv) not in (2, 3):
+        sys.exit(f"usage: python gen_tracker_metrics.py <log_dir> [dpi]   (default {PLOT_DPI})")
+    create_metrics(sys.argv[1], dpi=int(sys.argv[2]) if len(sys.argv) == 3 else None)

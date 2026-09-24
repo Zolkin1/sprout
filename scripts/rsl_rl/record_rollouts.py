@@ -305,6 +305,47 @@ def _apply_overrides(env_cfg) -> None:
           f"fall_min_height={args_cli.min_height} "
           + (f"pin_start_step={reset.params['pin_start_step']}" if reset is not None
              else "spawn=free-form route (no clip phase to pin)"))
+    _install_generator_cameras(env_cfg, str(cmd.fm_checkpoint))
+
+
+def _install_generator_cameras(env_cfg, fm_checkpoint: str) -> None:
+    """Re-point the generator's obs group at the cameras THIS checkpoint conditions on.
+
+    The task installs the group in ``__post_init__`` over every camera the scene carries,
+    which is right for the two-camera generator every fine-tune so far has used and wrong for
+    a near-only one: the camera ablation drops the far camera at DATASET build, so its
+    checkpoint states one sensor row and ``FmTrackingCommand._check_extero_shape`` refuses an
+    env serving two. Unlike ``play.py``, this script never called the installer at all, so the
+    near-only arm could not be rolled out -- which is a capability gap, not a policy: the
+    numbers it would produce are exactly the near-only half of the camera ablation.
+
+    Silent and a no-op in every existing case: a two-camera checkpoint names both cameras, and
+    a checkpoint that names none leaves the group as the task built it.
+
+    Args:
+        env_cfg: The composed env config, mutated in place.
+        fm_checkpoint: Path to the generator ``.pt`` the rollout will run.
+    """
+    from isaaclab.sensors.ray_caster import MultiMeshRayCasterCameraCfg  # noqa: PLC0415
+
+    scene = getattr(env_cfg, "scene", None)
+    if scene is None or not any(isinstance(s, MultiMeshRayCasterCameraCfg)
+                                for s in vars(scene).values()):
+        return                                   # a height-scan task: no cameras to choose
+    from robot_rl.flow_matching.online import read_fm_extero_meta  # noqa: PLC0415
+    meta = read_fm_extero_meta(fm_checkpoint)
+    if meta["extero_source"] != "depth" or not meta["cameras"]:
+        return
+    on_scene = sorted(name for name, s in vars(scene).items()
+                      if isinstance(s, MultiMeshRayCasterCameraCfg)
+                      and not name.startswith("fm_"))
+    if sorted(meta["cameras"]) == on_scene:
+        return                                   # the usual pair: leave the task's own group
+    from robot_rl.tasks.manager_based.robot_rl.g1.g1_depth_env_cfg import (  # noqa: PLC0415
+        install_fm_depth_group,
+    )
+    install_fm_depth_group(env_cfg, meta["width"], meta["height"],
+                           cameras=meta["cameras"])
 
 
 def _assert_families_are_filtered(codes, names) -> None:
@@ -670,6 +711,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
         accum = accumulate.EpisodeAccumulator(env, dt=float(u.step_dt),
                                               fall_min_height=float(args_cli.min_height))
         accum.attach_goal_region(spec)
+        # THE ENVIRONMENT'S OWN goal termination is authoritative where one exists. A dwell
+        # rule cannot be re-derived in the accumulator (see `attach_goal_termination`), so a
+        # course that declares one is scored by the term that actually ends its episodes.
+        _goal_terms = [t for t in ("goal_dwell",)
+                       if t in getattr(env.unwrapped.termination_manager, "active_terms", [])]
+        if _goal_terms:
+            accum.attach_goal_termination(_goal_terms[0])
         # The STRICT tracking checks. Latched, never terminating: the episode runs on, so one
         # rollout yields both the strict and the loose verdict and a threshold change
         # afterwards is an offline relabel rather than a re-collection. `--tracking_spec`
@@ -837,6 +885,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg,
                     obs, _, dones, _ = env.step(policy(obs))
                     steps += 1
                     tracker.fold(dones)
+                    # The goal TERMINATION is latched inside the reset hook
+                    # (`RolloutEpisodeTracker._latch_goal_termination`), not here. It used to
+                    # be here, and it was one episode too late every time: the harvest runs
+                    # inside `env.step`, so by the time this line ran the ending episode had
+                    # already been written and the latch landed on its successor.
                     # Zero the ring for envs that just reset BEFORE pushing this step, or a
                     # window emitted in the first H steps of a new episode carries rows from
                     # the previous one -- which for a fall is precisely the signature the

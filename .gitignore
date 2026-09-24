@@ -201,3 +201,18 @@ transfer/sim/robots/g1/*_veltrack_*.xml
 transfer/sim/robots/g1/*_tile*.xml
 transfer/sim/robots/g1/*_clip*.xml
 !transfer/sim/robots/g1/*_scene.xml
+
+# Scenes written by transfer/sim/record_videos.py: one per named shot, plus a `__view_<theme>`
+# restyled COPY per theme that the renderer loads instead of the original. Both are rebuilt
+# deterministically -- the shot's own from the clip library's terrain_manifest (probe shots) or
+# from terrain_scene's box lane, the themed copy by string-substituting one block -- and the
+# shot's manifest records the geometry it was emitted with, so a clip stays readable without
+# the XML. Same rule as the mjeval courses above.
+transfer/sim/robots/g1/*_video_*.xml
+transfer/sim/robots/g1/*__view_*.xml
+
+# Ad-hoc scenes: mode_probe's `--stage watch` views, and one-off generate_stairs_scene.py
+# benches/pallets built to match a real-world obstacle. Rebuilt from their command line.
+transfer/sim/robots/g1/*_modeview_*.xml
+transfer/sim/robots/g1/*_pallet*.xml
+transfer/sim/robots/g1/*_bench*.xml

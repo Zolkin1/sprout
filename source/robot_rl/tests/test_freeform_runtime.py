@@ -27,11 +27,16 @@ from robot_rl.tasks.manager_based.robot_rl.mdp.terminations import terminations 
 #: One section, its start platform at the tile's own datum and its goal 6 m downrange.
 _ROUTE = {
     "start_x": 1.0, "start_y": 2.0, "start_z": 0.0, "start_yaw": 0.0,
-    "goal_x": 7.0, "goal_y": 2.0, "goal_half_width": 1.5,
+    "goal_x": 7.0, "goal_y": 2.0, "goal_half_width": 1.5, "goal_z": 0.0,
 }
 #: A second section whose lowest platform is the tile datum but which STARTS a flight up, so
 #: its start surface sits above it -- the descending-first case the z rule exists for.
 _ROUTE_RAISED = dict(_ROUTE, start_z=1.2, goal_x=5.0)
+#: A section whose GOAL is above the tile datum -- a staircase that ends on a landing rather
+#: than back on the floor.  Every other fixture here declares ``goal_z = 0``, and so did every
+#: course in the library for months, which is exactly why the height datum could be dropped
+#: entirely and no test notice: zero is the right answer when the traverse ends on the ground.
+_ROUTE_HIGH_GOAL = dict(_ROUTE, goal_z=1.2)
 
 _NOMINAL_BASE_Z = 0.785      # the G1's ``init_state`` base height
 _N_JOINTS = 4
@@ -492,13 +497,54 @@ def test_the_goal_anchor_is_a_PELVIS_height_not_the_walkable_surface(monkeypatch
 
     env, _asset = _env(n=2)
     pos, _ = goal_region.freeform_goal_anchor_world(_StubGoalCmd(env))
-    surface_z = _ROUTE["start_z"]                      # this section is flat: goal_z == 0.0
+    surface_z = _ROUTE["goal_z"]                       # this section is flat: goal_z == 0.0
     assert pos[0, 2] > surface_z + 0.5, (
         "the anchor sits at the walkable surface; a standing robot is then ~0.79 m from it and "
         "outside the 0.5 m height tolerance, so in_goal can never fire.")
     standing_root_z = surface_z + _NOMINAL_BASE_Z
     assert abs(standing_root_z - pos[0, 2].item()) < 0.5, (
         "a robot standing at the goal must be INSIDE the default 0.5 m height tolerance.")
+
+
+def test_the_anchor_rises_with_a_RAISED_goal(monkeypatch):
+    """The bug this fixture exists for: ``goal_z`` reaching the runtime at all.
+
+    ``goal_z`` was written into every manifest by ``_route`` and was NOT in
+    ``FREEFORM_ROUTE_FIELDS``, which is the only thing ``freeform_route`` returns -- so both
+    consumers' ``route.get("goal_z")`` read ``None`` and silently fell back to zero. The
+    anchor therefore sat at the TILE FLOOR however high the goal was.
+
+    It was invisible because zero was the right answer everywhere it was looked at: the box
+    and up-into-down courses end their traverse back on the ground, and every fixture in this
+    file declared a flat section. It becomes fatal on the first course that finishes on a
+    landing -- the goal is then a full storey above the datum, ``|height_err|`` is that whole
+    height, and ``in_goal`` can never fire while the termination still ends the episode.
+    """
+    _plain_warp(monkeypatch)
+    from robot_rl.tasks.manager_based.robot_rl.mdp import goal_region
+
+    env, _asset = _env(n=2, routes={0: dict(_ROUTE_HIGH_GOAL)})
+    pos, _ = goal_region.freeform_goal_anchor_world(_StubGoalCmd(env))
+    want = _ROUTE_HIGH_GOAL["goal_z"] + _NOMINAL_BASE_Z
+    assert torch.allclose(pos[:, 2], torch.full((2,), want)), (
+        f"the anchor is at z={pos[0, 2].item():.3f}, not the goal's own surface "
+        f"({_ROUTE_HIGH_GOAL['goal_z']:.3f}) plus the standing height -- goal_z is being "
+        "dropped on the way to the runtime.")
+
+
+def test_a_route_without_a_goal_z_is_REFUSED_not_defaulted(monkeypatch):
+    """The silent zero is what hid this for months, so absence must now be loud.
+
+    ``.get("goal_z")`` with a zero fallback is indistinguishable from a correct flat course.
+    As a required field the table builder refuses it by name instead.
+    """
+    _plain_warp(monkeypatch)
+    from robot_rl.tasks.manager_based.robot_rl.mdp.events import resets
+
+    stale = {k: v for k, v in _ROUTE.items() if k != "goal_z"}
+    env, _asset = _env(n=1, routes={0: stale})
+    with pytest.raises(ValueError, match="goal_z"):
+        resets.freeform_route(env.scene.terrain, torch.zeros(1, dtype=torch.long))
 
 
 def test_the_anchor_follows_a_rotated_tile_frame(monkeypatch):

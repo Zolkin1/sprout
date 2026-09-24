@@ -2,6 +2,25 @@
 
 """Is the ACTION worth anything?  ``Q(s, a)`` against ``V(s)`` on identical ranking pairs.
 
+**DEPRECATED 2026-09-10, and currently BROKEN. Not a warning about style -- it does not run.**
+
+``Q(s, a)`` borrows its token assembly from :class:`~robot_rl.flow_matching.value.FlowValueModel`
+(``FlowQModel.value_tokens`` calls ``super().value_tokens``), and that critic was cut down to the
+architecture the paper describes: ONE readout token, ONE scalar value head, and no scan or proprio
+token streams. Q therefore lost the exteroception it was fitted with, and ``ValueInputs`` no longer
+accepts ``scan=`` / ``proprio=``.
+
+Left broken deliberately rather than quietly rewired, because reviving it is a RESEARCH decision
+and not a mechanical fix: Q would need its own scan and proprio streams, inserted before its action
+tokens so its own token order is preserved, and every fitted ``Q*.pt`` predates that and would need
+refitting anyway. Doing it silently would re-specify a second experiment as a side effect of a
+documentation goal.
+
+To revive: give ``FlowQModel`` its own scan/proprio encoders and type embeddings (it already owns
+its head, for the same reason), then refit. The best-of-K result this line produced is recorded in
+``oracle-gain-ceiling`` -- one oracle decision was worth +0.0099 of success, which is the number
+that should decide whether reviving it is worth the GPU time.
+
 ``fit_q`` reports a within-state ranking accuracy, and on its own that number cannot be read.
 ``V`` is not at chance on the same task: the two episodes in a ``(clip, replan)`` group have
 diverged a little even though they share terrain, command and start, so a state-only critic
@@ -59,6 +78,12 @@ def _v_batch(ctx, W, idx, device, scan_hw):
 
 def main() -> int:
     """Score both models on one pair set and report the gap."""
+    raise SystemExit(
+        "DEPRECATED and BROKEN: the Q(s, a) line borrows its tokens from FlowValueModel, "
+        "which was cut to one readout, one scalar head and NO scan/proprio streams for the "
+        "paper. Q lost the exteroception it was fitted with, and ValueInputs no longer takes "
+        "scan=/proprio=. Reviving it means giving FlowQModel its own scan/proprio streams and "
+        "refitting -- a research decision, not a mechanical fix. See the module docstring.")
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--rollout", required=True)
@@ -106,7 +131,13 @@ def main() -> int:
             j = idx[i:i + args.batch]
             b = fit_q._batch(ctx, W, j, args.device, scan_hw, steps)
             pq[i:i + j.size] = q.p_fail(b).cpu().numpy()
-            pv[i:i + j.size] = v.p_fail(b.state).cpu().numpy()
+            # V's side is its VALUE head, negated. It used to be `v.p_fail`, a survival
+            # probability on the same scale as Q's -- but that head is gone from
+            # FlowValueModel, and this comparison does not need the scales to match: both
+            # sides go through `within_state_ranking`, which reads the ORDER alone. The sign
+            # does matter, and flips: a higher P(fail) predicts failure, while a higher
+            # expected RETURN predicts success.
+            pv[i:i + j.size] = -v.quality(b.state).cpu().numpy()
 
     f = lab["failed"]
     rq = fit_q.within_state_ranking(pq, f, W["clip_id"], W["replan_index"])

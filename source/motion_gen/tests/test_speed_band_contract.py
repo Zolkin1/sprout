@@ -26,7 +26,7 @@ import re
 import pytest
 
 from motion_gen.clips import clip_io
-from motion_gen.terrain import box2, step_courses, varied_courses
+from motion_gen.terrain import box2, step_courses, varied_courses, wall_field
 
 _REPO = pathlib.Path(__file__).resolve().parents[3]
 _SCRIPTS = _REPO / "scripts" / "rsl_rl"
@@ -38,6 +38,12 @@ BUILDERS: dict[str, str] = {
     "make_varied_terrain.py": "varied_courses",
     "make_indist_routes.py": "indist_routes",
     "make_freeform_terrain.py": "freeform",
+    # "freeform", not "wall_field": this table names the block the BAND is in, and the reader
+    # searches a fixed list that a new course's own block is not on. The wall field stamps
+    # both -- its own block for provenance, "freeform" for the band -- and stamping only the
+    # former made the band unreadable, so the fine-tune loop silently fell back to its own
+    # default while the eval hard-refused.
+    "make_walls_terrain.py": "freeform",
 }
 
 #: The band each course declares, as a constant, so a builder and a test cannot drift apart
@@ -46,6 +52,7 @@ BANDS: dict[str, tuple[float, float]] = {
     "box2": box2.COMMANDED_SPEED_RANGE_MPS,
     "updown": step_courses.UPDOWN_SPEED_RANGE_MPS,
     "varied": varied_courses.COMMANDED_SPEED_RANGE_MPS,
+    "walls": wall_field.COMMANDED_SPEED_RANGE_MPS,
 }
 
 
@@ -111,7 +118,7 @@ def test_every_builder_stamps_the_band_key_and_not_only_a_ladder(script: str,
     terr = _REPO / "source" / "motion_gen" / "motion_gen" / "terrain"
     src = path.read_text() + "".join(
         f.read_text() for f in sorted(terr.glob("*.py")) if block.split("_")[0] in f.stem
-        or f.stem in ("freeform", "box2", "step_courses", "varied_courses"))
+        or f.stem in ("freeform", "box2", "step_courses", "varied_courses", "wall_field"))
     assert "commanded_speed_range_mps" in src, (
         f"{script} writes generator_config['{block}'] without a band; a loop pointed at its "
         "library falls back to a default nobody chose")
@@ -134,7 +141,8 @@ def test_the_updown_HOLDOUT_stamps_the_band_too() -> None:
 #: in the repo -- so this is a local/talos check rather than a CI one.
 _LIBS = ("box2_v2spawn_train.h5", "box2_v2spawn_holdout.h5",
          "updown_p020_r030_train.h5", "updown_p020_r030_holdout.h5",
-         "varied60_train.h5", "varied60_holdout.h5", "indist_train.h5")
+         "varied60_train.h5", "varied60_holdout.h5", "indist_train.h5",
+         "ft_walls_train.h5", "ft_walls_holdout.h5")
 
 
 @pytest.mark.parametrize("lib", _LIBS)
@@ -185,7 +193,8 @@ def test_every_course_restates_the_same_goal_geometry(name: str) -> None:
 # The GOAL spec, which is the other half of the contract and used to be hand-kept.
 # ---------------------------------------------------------------------------------------------
 @pytest.mark.parametrize("script", ["make_box2_terrain.py", "make_step_courses_terrain.py",
-                                    "make_varied_terrain.py", "make_indist_routes.py"])
+                                    "make_varied_terrain.py", "make_indist_routes.py",
+                                    "make_walls_terrain.py"])
 def test_every_builder_emits_its_goal_spec(script: str) -> None:
     """A course whose geometry regenerates but whose goal spec does not is half reproducible.
 

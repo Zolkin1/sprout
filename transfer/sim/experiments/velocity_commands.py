@@ -170,3 +170,109 @@ def ramped_speed_steps(sim_time):
         vx = (1 - alpha) * v0 + alpha * v1
 
     return np.array([vx, 0.0, 0.0])
+
+
+# ---------------------------------------------------------------------------------------------
+# A flat-ground locomotion demo
+# ---------------------------------------------------------------------------------------------
+
+#: The FLAT half of the training library's own command envelope, measured over the 3000
+#: ``terrain_type_code == 0`` clips of ``g1_mb_v6g.h5`` (the library the deployed tracker
+#: trained on): ``vx [-1.00, +2.50]``, ``vy [-0.59, +0.60]``, ``wz [-0.79, +0.78]``.
+#:
+#: :func:`flat_locomotion_demo` stays inside it on purpose.  The two stair families carry
+#: ``|vy| max = |wz| max = 0.0000`` exactly, so a profile with a side-step or a turn in it is
+#: off-distribution on a staircase and in-distribution on flat -- which is why this one is a
+#: FLAT demo and says so in its name.
+FLAT_ENVELOPE: dict[str, tuple[float, float]] = {
+    "vx": (-1.00, 2.50), "vy": (-0.59, 0.60), "wz": (-0.79, 0.78),
+}
+
+#: Peak commands for :func:`flat_locomotion_demo`, each inside :data:`FLAT_ENVELOPE` with
+#: margin.  Named rather than inline for the same reason as ``CONSTANT_FORWARD_SPEED``: the
+#: profile exists to be re-recorded, and two cuts should not differ by a number nobody named.
+DEMO_SIDE_VY: float = 0.50
+DEMO_RUN_VX: float = 2.20
+DEMO_RUN_WZ: float = 0.55
+DEMO_WALK_VX: float = 0.80
+
+#: Segment boundaries in seconds, measured from the END of the opening hold.
+DEMO_MARKS: tuple[float, ...] = (1.0, 4.0, 7.0, 8.5, 10.5, 15.5, 17.5, 21.5, 23.0, 25.0)
+
+#: Total length of the profile (s); a course carrying it needs at least this much budget.
+DEMO_DURATION_S: float = DEMO_MARKS[-1]
+
+
+def _ramp(t: float, t0: float, t1: float, a: float, b: float) -> float:
+    """Smoothstep from ``a`` at ``t0`` to ``b`` at ``t1``, clamped outside.
+
+    Smooth rather than linear because the transitions ARE the demo: a step changes the command
+    faster than the body can follow, and what the clip would then show is the tracker catching
+    up rather than the gait changing.
+
+    Args:
+        t: Time (s).
+        t0 / t1: Start and end of the transition (s).
+        a / b: Values at ``t0`` and ``t1``.
+
+    Returns:
+        The interpolated value.
+    """
+    if t <= t0:
+        return a
+    if t >= t1:
+        return b
+    u = (t - t0) / (t1 - t0)
+    return a + (b - a) * u * u * (3.0 - 2.0 * u)
+
+
+def flat_locomotion_demo(sim_time):
+    """Stand, side-step both ways, break into a turning run, settle to a walk, stop.
+
+    The flat-ground counterpart to the terrain clips: one continuous take through every gait
+    the pair has on level ground, in an order that shows each transition rather than each
+    gait on its own.  Segment by segment, with :data:`DEMO_MARKS` as the boundaries:
+
+    ===============  ==========================================================
+    0.0 - 1.0 s      stand
+    1.0 - 4.0 s      pure LATERAL, +y (no forward, no yaw)
+    4.0 - 7.0 s      pure lateral, -y -- back across its own track
+    7.0 - 8.5 s      lateral out, forward in
+    8.5 - 15.5 s     RUN at ``DEMO_RUN_VX`` while turning at ``DEMO_RUN_WZ``
+    15.5 - 17.5 s    yaw out, speed down
+    17.5 - 21.5 s    WALK at ``DEMO_WALK_VX``
+    21.5 - 23.0 s    decelerate
+    23.0 - 25.0 s    stand
+    ===============  ==========================================================
+
+    Every value sits inside :data:`FLAT_ENVELOPE`, the library's own flat-clip range, so the
+    demo asks for nothing the generator was not trained to be asked for.
+
+    Args:
+        sim_time: Seconds since the command started (i.e. since the end of the opening hold).
+
+    Returns:
+        ``(vx, vy, wz)``.
+    """
+    t = float(sim_time)
+    m = DEMO_MARKS
+    # Lateral: out to +y, across to -y, then back to zero as the run starts.
+    if t < m[1]:
+        vy = _ramp(t, m[0], m[0] + 0.6, 0.0, DEMO_SIDE_VY)
+    elif t < m[2]:
+        vy = _ramp(t, m[1], m[1] + 0.8, DEMO_SIDE_VY, -DEMO_SIDE_VY)
+    else:
+        vy = _ramp(t, m[2], m[3], -DEMO_SIDE_VY, 0.0)
+    # Forward: nothing until the lateral section ends, then run, then walk, then stop.
+    if t < m[3]:
+        vx = 0.0
+    elif t < m[5]:
+        vx = _ramp(t, m[3], m[4], 0.0, DEMO_RUN_VX)
+    elif t < m[7]:
+        vx = _ramp(t, m[5], m[6], DEMO_RUN_VX, DEMO_WALK_VX)
+    else:
+        vx = _ramp(t, m[7], m[8], DEMO_WALK_VX, 0.0)
+    # Yaw: only while running, so the turn is unambiguously part of the run.
+    wz = (_ramp(t, m[4] - 0.5, m[4] + 0.5, 0.0, DEMO_RUN_WZ) if t < m[5]
+          else _ramp(t, m[5], m[6], DEMO_RUN_WZ, 0.0))
+    return np.array([vx, vy, wz])

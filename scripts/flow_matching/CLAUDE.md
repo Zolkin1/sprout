@@ -6,7 +6,34 @@ the chunks, update the generator, x5. `run_finetune_loop.sh` runs the whole thin
 per stage; **`FINETUNE.md` is the runbook** and carries the artifact provenance, the library
 fingerprints and the traps.
 
-This is NOT the teacher PPO fine-tune `README.md` §4c documents. Nothing here calls `train.py`.
+This is NOT the teacher PPO fine-tune `README.md` §4c documents. Nothing here calls
+`scripts/rsl_rl/train.py`.
+
+# BUILDING a generator from scratch: `run_fm_pipeline.sh`
+
+The other direction, and the one to reach for after a teacher retrain: `run_fm_pipeline.sh
+<tracker_run_name> [<clip_library>]` runs record -> augment -> train in one go. It reproduces how the
+SHIPPED generator (`2026-08-25_09-03-39_plan_v1_h64_27M_nojumpoff`) was actually built, read off its
+own `params/data.yaml` rather than from memory.
+
+- **Training takes BOTH recordings, comma-separated** (`--data <recorded>,<augmented>`), not the
+  augmented one alone. That is the step easiest to get wrong and nothing downstream would say so.
+- **`NUM_ENVS=1024`, and the number is load-bearing.** Windows snap every 12 control steps
+  (`fm_snap_every`), so a full clip yields ~77 and an env only reaches a clip's LATE phase if
+  `num_windows / num_envs` comfortably exceeds that. Measured on the shipped recording: 200k windows
+  at 256 envs is 781/env, ~10 episodes, covering **6065 distinct clips** with `clip_step` spanning
+  12..924. 1024 still gives 195/env and holds coverage; **4096 would give 49/env -- less than ONE
+  episode**, so the run ends mid-first-episode for nearly every env and every window comes from the
+  early phase of its clip. That bias is invisible in the output.
+- **It asserts the recording carries TWO cameras.** The generator reads both; the policy reads the
+  near one alone since `efe93b4e`. `record_data` installs the `fm_depth` group unconditionally on a
+  depth task for exactly this reason, but a one-camera recording would train a half-blind generator
+  that the checkpoint, the `fm.onnx` and every eval then agree about, so the check is worth its line.
+- **The exteroception constants are DERIVED, and nothing should declare them.**
+  `extero_xyz_offset` resolves from the recording's own camera contract; on the as-built cameras it
+  comes out `[[0.51, 0.03, -0.79], [4.25, 0.06, -0.79]]`. Passing the older
+  `[[0.55, 0, -0.79], [1.8, 0, -0.79]]` would be the 35-degree far camera, 2.45 m out -- which is
+  what `_XYZ_OFFSET_DRIFT_WARN_M` shouts about.
 
 **WHAT IT BUYS, on the two-box course, paired at the ENV level** (both arms draw the same reset
 stream, so every env's first episode opens at a bit-identical downrange -- max |diff| 0.00e+00, which
@@ -48,8 +75,29 @@ between arms is the objective and not the data -- pinned by parsing the script
 |---|---|---|---|
 | `awr` | `w = clip(exp(A / (beta * sd A)), 0, 20)` | yes | ~10-15% effective |
 | `fbc` | filtered BC on the top 30% by advantage | yes | 30% |
-| `arrived` | BC on episodes that ARRIVED before failing | **no** | ~8.8% |
+| `arrived` | BC on episodes that ARRIVED before failing | **no** | 45-65%, see below |
 | `bc` | plain BC on every row | **no** | 100% |
+
+**`arrived`'s yield is a property of the COURSE, not of the algorithm, and the 8.8% this table
+used to quote is stale.** Measured on the 2026-09-15 ladder, per iteration:
+
+| course | iter 1 | iter 5 | trend |
+|---|---|---|---|
+| boxes | 0.450 | 0.535 | rises as the policy improves |
+| updown | 0.624 | 0.627 (it 4) | |
+| multi | 0.552 | 0.556 (it 2) | |
+
+Two consequences. **A starved `arrived` arm is a real hazard and it is not the current regime** --
+the 8.8%, and the 0.40% the `loose` section below records, come from a weaker parent scored
+differently, so do not reason about this arm from those numbers. And **`arrived` adapts its data
+budget while `fbc` cannot**: fbc keeps exactly 30% at every iteration because it is a top-quantile
+filter, so late in training it is still discarding 70% of rollouts when half of them succeeded,
+where arrived keeps the half that did. That is a plausible mechanism for arrived beating fbc by
++0.0773 paired (p=2.3e-10) on boxes, and it is measured rather than inferred -- but it is one
+course, and the updown/multi arms are what would make it a finding.
+
+`awr`'s figure is an EFFECTIVE sample size, not a keep fraction, and it is current: the ladder
+arm logged `awr/ess_frac 0.160`. `bc` writes no label file at all, which is what its 100% means.
 
 **AWR's hot limit is unweighted BC on the labelled rows and its sharp limit under `global`
 normalization IS filtered BC**, so the ladder only means something if each arm is actually its own

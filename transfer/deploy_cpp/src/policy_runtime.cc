@@ -265,6 +265,11 @@ const FmConditioning& PolicyRuntime::last_conditioning() const {
   return fm_source_ ? fm_source_->conditioning() : kEmpty;
 }
 
+const std::vector<DepthCameraSpec>& PolicyRuntime::rig_cameras() const {
+  if (fm_source_ && !fm_source_->meta().cameras.empty()) return fm_source_->meta().cameras;
+  return tracker_->params().depth_cameras;
+}
+
 const FmMeta& PolicyRuntime::fm_meta() const {
   if (!fm_source_) {
     throw std::runtime_error("no fm.onnx is loaded (this is clip playback), so there is no "
@@ -371,15 +376,49 @@ void PolicyRuntime::BuildValues(const HardwareReadings& readings) {
   // Exteroception. Required-ness comes from the ARTIFACTS, not from the caller: a policy that
   // reads terrain and is handed none would otherwise fail deep inside the observation assembly.
   if (!p.depth_cameras.empty()) {
-    if (readings.depth_raw.size() != p.depth_cameras.size()) {
+    // THE TRACKER TAKES ITS SUBSET, BY NAME.
+    //
+    // Readings arrive in RIG order -- every camera the deployment publishes, which is the
+    // GENERATOR's list when one is loaded and the tracker's own in clip playback. Since
+    // `efe93b4e` the policy reads the near camera alone while the generator reads both, so
+    // the two lists are no longer the same length and an index into one is not an index into
+    // the other. Matching on `obs_term` is what makes a subset expressible at all; matching by
+    // POSITION is how the far camera's pixels would be fed to the near camera's slot, which
+    // loads clean and reads as a policy that cannot do the task (measured elsewhere: 64
+    // episodes, reached_goal 0.000 against 0.188).
+    const std::vector<DepthCameraSpec>& rig = rig_cameras();
+    if (readings.depth_raw.size() != rig.size()) {
       throw std::runtime_error(
-          "this policy reads " + std::to_string(p.depth_cameras.size()) +
+          "the deployment publishes " + std::to_string(rig.size()) +
           " depth camera(s) but " + std::to_string(readings.depth_raw.size()) +
-          " reading(s) were supplied (metres, one per camera, in contract order)");
+          " reading(s) were supplied (metres, one per camera, in RIG order -- the generator's "
+          "contract when one is loaded, this policy's own in clip playback)");
     }
     for (size_t c = 0; c < p.depth_cameras.size(); ++c) {
       const DepthCameraSpec& cam = p.depth_cameras[c];
-      const std::vector<double>& raw = readings.depth_raw[c];
+      // Matched on CameraKey, not on raw `obs_term`. The two artifacts name the same lens
+      // differently by construction: the tracker's term is `depth_near` while the generator's
+      // is `fm_depth_near`, because `install_fm_depth_group` prefixes its own sampling of a
+      // lens. Comparing the raw terms refuses every correctly exported subset pair -- and
+      // does so only HERE, since the python runtime matches on the key, so a pair validates
+      // at export and then disarms on the controller's first tick.
+      const std::string want = CameraKey(cam);
+      size_t at = rig.size();
+      for (size_t r = 0; r < rig.size(); ++r) {
+        if (CameraKey(rig[r]) == want) { at = r; break; }
+      }
+      if (at == rig.size()) {
+        std::string have;
+        for (size_t r = 0; r < rig.size(); ++r) {
+          have += (r ? ", " : "") + CameraKey(rig[r]);
+        }
+        throw std::runtime_error(
+            "this policy reads camera '" + want +
+            "' but the rig does not publish it (rig: [" + have +
+            "]). The rig is the generator's extero_spec; a camera the tracker reads and the "
+            "generator does not is a genuine contract violation, not a subset.");
+      }
+      const std::vector<double>& raw = readings.depth_raw[at];
       if (static_cast<int>(raw.size()) != cam.pixels()) {
         throw std::runtime_error("camera '" + cam.obs_term + "' expects " +
                                  std::to_string(cam.pixels()) + " pixels, got " +

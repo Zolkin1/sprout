@@ -84,6 +84,55 @@ def test_the_policy_reads_the_near_camera_alone():
     assert [n for n, _ in dcfg._POLICY_CAMERAS] == ["depth_camera_near"]
 
 
+def test_the_far_camera_is_never_cast_on_the_teacher_task():
+    """The far camera is on the scene and costs NO RAYS, and here is the whole reason.
+
+    ``SensorBase.update`` only stamps ``_is_outdated``; the cast happens in the ``.data``
+    property, and ``update`` forces it only ``if force_recompute or self._is_visualizing``.
+    ``InteractiveScene`` passes ``force_recompute=not cfg.lazy_sensor_update``. So a sensor
+    is free exactly when all three hold: lazy update on, ``debug_vis`` off, and NO
+    observation term reading it. ``MultiMeshRayCaster`` does not override ``update`` at all
+    and does its ``track_mesh_transforms`` work INSIDE ``_update_buffers_impl``, so the 33
+    tracked link transforms are not updated either.
+
+    The third condition is the fragile one, and it is why this test looks at EVERY group
+    rather than at the policy group alone: adding an ``fm_depth`` group to the teacher task
+    (which every generator task does deliberately) silently doubles the depth cost of a
+    12k-iteration teacher run, and nothing in the output would say so. The teacher task
+    must therefore carry no such group -- ``install_fm_depth_group`` is called by the
+    tracker and fine-tune cfgs and by ``record_data.py``, never here.
+
+    What the far camera does still cost is its per-env ray buffers and one timestamp kernel
+    launch per step. That is the price of keeping one scene description of the physical pair,
+    which is what lets the DR terms, ``test_camera_mount_matches_urdf`` and MuJoCo's
+    extrinsics mirroring all describe the same robot.
+    """
+    cfg = _env_cfg()
+
+    assert cfg.scene.lazy_sensor_update is True, (
+        "lazy_sensor_update off makes InteractiveScene pass force_recompute=True, which casts "
+        "EVERY sensor on the scene every step whether or not anything reads it"
+    )
+    assert cfg.scene.depth_camera_far.debug_vis is False, (
+        "debug_vis sets _is_visualizing, which casts the sensor regardless of any reader"
+    )
+
+    groups = [g for g, v in vars(cfg.observations).items()
+              if not g.startswith("_") and hasattr(v, "__dict__")]
+    assert "policy" in groups, groups
+    assert FM_DEPTH_OBS_GROUP not in groups, (
+        f"the teacher task must not carry the generator's depth group: {groups}"
+    )
+    readers = {g: _sensors(cfg, g) for g in groups}
+    assert all("depth_camera_far" not in s for s in readers.values()), readers
+    assert readers["policy"] == ["depth_camera_near"], readers
+
+    # And the converse, so this test fails if the mechanism is what changes rather than the
+    # cfg: the generator's group IS a reader, so installing it makes the far camera cast.
+    dcfg.install_fm_depth_group(cfg)
+    assert "depth_camera_far" in _sensors(cfg, FM_DEPTH_OBS_GROUP)
+
+
 def test_the_image_variant_reads_the_same_cameras_as_the_flat_one():
     """The two depth teachers differ in observation SHAPE and in nothing else.
 

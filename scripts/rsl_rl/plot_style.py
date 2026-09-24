@@ -106,7 +106,7 @@ def apply_paper_style(usetex: bool | None = None) -> bool:
     mpl.rcParams.update({
         "text.usetex": use,
         "font.family": "serif",
-        "font.serif": ["Computer Modern Roman"],
+        "font.serif": ["Times", "Nimbus Roman", "Computer Modern Roman"],
         "lines.linewidth": 4, "lines.markersize": 10, "lines.markeredgewidth": 2,
         "axes.linewidth": 1.5, "axes.labelsize": 20, "axes.titlesize": 22,
         "axes.titlepad": 12, "axes.labelpad": 8,
@@ -123,7 +123,18 @@ def apply_paper_style(usetex: bool | None = None) -> bool:
         "axes.prop_cycle": mpl.cycler(color=COLOR_CYCLE),
     })
     if use:
-        mpl.rcParams["text.latex.preamble"] = r"\usepackage{amsmath} \usepackage{amssymb}"
+        # TIMES, not Computer Modern. IEEE classes typeset in Times, and matplotlib's usetex
+        # default is Computer Modern -- lighter strokes at the same point size, so a figure reads
+        # THINNER than the body text beside it at matching sizes. A typeface difference, not a
+        # weight one: bolding to compensate lands heavier than the body and reads as emphasis.
+        #
+        # `\let\Bbbk\relax` is load-bearing. amssymb and newtxmath both define \Bbbk and
+        # loading newtx second raises "Command \Bbbk already defined" -- which matplotlib
+        # surfaces as a failed render with NO FILE WRITTEN, so it looks like a missing figure
+        # rather than a font problem.
+        mpl.rcParams["text.latex.preamble"] = (
+            r"\usepackage{amsmath} \usepackage{amssymb}"
+            r" \let\Bbbk\relax \usepackage{newtxtext,newtxmath}")
     else:
         mpl.rcParams["mathtext.fontset"] = "cm"
         if not _APPLIED:
@@ -181,29 +192,60 @@ def _artist_count(fig) -> int:
     return int(n)
 
 
-def save_figure(fig, path_no_ext, *, svg: bool = True, caption: str | None = None
-                ) -> list[str]:
+def save_figure(fig, path_no_ext, *, svg: bool = True, caption: str | None = None,
+                exact_size: bool = False, tight: bool = True) -> list[str]:
     """Save PNG (+ SVG) and, optionally, a caption sidecar. Never PDF.
 
     The caption file is what makes the "no titles, use captions" rule workable: it holds the
     definitions in force for that figure -- which success notion, which stratum, which
     interval -- so a reader is never left guessing and the text can be pasted into LaTeX.
+
+    Args:
+        fig: The figure.
+        path_no_ext: Output path without an extension.
+        svg: Also write an SVG, unless the artist count makes it unopenable.
+        caption: Caption text for the sidecar.
+        tight: Run ``fig.tight_layout()`` before saving. Pass False when the caller has already
+            laid the figure out and needs that layout preserved -- ``tight_layout`` computes ONE
+            ``wspace`` for every column gap, so a figure with labels hanging off one axes gets
+            that overhang inserted between every pair of panels.
+        exact_size: Write the figure at its DECLARED size instead of cropping to content.
+            The default ``savefig.bbox="tight"`` trims each figure to its own ink, so two
+            figures declared at the same width come out a few pixels apart and their panel
+            columns no longer line up when one is STACKED above the other. Set this for
+            figures meant to be stacked; it costs a little whitespace at the margins.
+
+    Returns:
+        The paths written.
     """
     import pathlib  # noqa: PLC0415
 
     p = pathlib.Path(str(path_no_ext))
     p.parent.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
+    if tight:
+        fig.tight_layout()
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
+    # `bbox_inches=None` does NOT mean "the whole canvas": matplotlib falls back to
+    # rcParams["savefig.bbox"], which this style sets to "tight". Only the rcParam turns
+    # the crop off, so exact_size goes through an rc_context rather than the kwarg.
+    #
+    # A FRESH context per save: `rc_context` is a generator-based context manager and
+    # entering one twice raises, which made the second (SVG) write fail whenever the figure
+    # was small enough for an SVG to be written at all.
+    overrides = {"savefig.bbox": "standard"} if exact_size else {}
     written = []
     png = str(p) + ".png"
-    fig.savefig(png, dpi=pixel_budget_dpi(fig))
+    with plt.rc_context(overrides):
+        fig.savefig(png, dpi=pixel_budget_dpi(fig))
     written.append(png)
     if svg:
         if _artist_count(fig) > _SVG_ARTIST_MAX:
             print(f"[plot_style] {p.name}: skipping SVG ({_artist_count(fig)} artists or an "
                   "image); the vector file would be tens of MB and unopenable.")
         else:
-            fig.savefig(str(p) + ".svg")
+            with plt.rc_context(overrides):
+                fig.savefig(str(p) + ".svg")
             written.append(str(p) + ".svg")
     if caption:
         cap = str(p) + ".caption.txt"

@@ -1194,10 +1194,25 @@ class FutureStateDataset(Dataset):
         # windows; what it does not do is show the same window at two different lags.
         pose_meas = snap_meas
         self.depth_latency_probs = None
-        if cfg.depth_latency_probs is not None:
+        # GATED ON THE SOURCE, not just on the field being set. The latency being modelled is
+        # the DEPTH pipeline's -- image compute plus ROS transport -- and a height scan has no
+        # such pipeline: it is privileged, sim-only, and its recordings carry no `depth_lag`
+        # array at all. Before `depth_latency_probs` defaulted on, a scan run reached here with
+        # None and the question never arose; with the default flipped, a scan run would raise
+        # on a missing array for a model that cannot apply to it.
+        #
+        # This does NOT weaken the loud failure where it matters: a DEPTH recording that
+        # predates the lagged arrays still raises, which is the case the refusal exists for.
+        if cfg.depth_latency_probs is not None and cfg.extero_source == "depth":
             self.depth_latency_probs = _select_depth_lag(
                 cfg, data, rows, hs, n_sensors, sensor_dim, snap_meas, self)
             hs, pose_meas = self._lagged_hs, self._lagged_pose
+        elif cfg.depth_latency_probs is not None:
+            # Printed rather than passed over in silence: the checkpoint will record None, and
+            # a reader comparing it against the run's flags deserves to see why.
+            print(f"[fm-data] depth_latency_probs set but extero_source="
+                  f"{cfg.extero_source!r}: camera latency models the depth pipeline, so it "
+                  f"does not apply here and the checkpoint records None.")
         # Sanitize before the normalizer fit so a non-finite entry cannot poison the
         # per-dimension mean and yield a NaN loss (matches the deploy token builder). The band
         # is the config's, so a run can widen it past the per-source default -- a 1 m band
@@ -1970,6 +1985,127 @@ class FutureStateDataset(Dataset):
         if self.cmd_tokens is not None:
             item["cmd_tokens"] = self.cmd_tokens[i]
         return item
+
+
+#: Arrays carrying a SENSOR axis, and which axis it is. Depth is ``(W, T, K)`` and its lag
+#: buffer ``(W, L, T, K)``; ``depth_lag_state`` is per-LAG robot state with no sensor axis, and
+#: a height scan is one sensor. Listed rather than inferred: an array whose sensor axis was
+#: guessed from a length would be sliced on the wrong axis the moment two sizes coincided.
+_SENSOR_AXIS: dict[str, int] = {"depth": 1, "depth_lag": 2}
+
+
+def camera_name(entry: dict) -> str | None:
+    """The short name of a camera in a depth contract, or ``None`` if it names itself nowhere.
+
+    Recordings have spelled this three ways -- ``camera_key`` on the tracker's exported spec,
+    ``sensor`` (``depth_camera_near``) and ``obs_term`` (``fm_depth_near``) on a recording's --
+    so all three are read and reduced to the bare name. The same normalisation
+    ``assert_depth_specs_agree`` performs when it matches the two artifacts BY NAME rather than
+    by list index, and for the same reason: index pairing is what once compared the policy's
+    near camera against the generator's far one.
+
+    Args:
+        entry: One entry of a depth camera spec.
+
+    Returns:
+        ``"near"`` / ``"far"``, or ``None``.
+    """
+    for field in ("camera_key", "sensor", "obs_term"):
+        raw = entry.get(field)
+        if not raw:
+            continue
+        name = str(raw)
+        for prefix in ("fm_", "depth_camera_", "depth_"):
+            if name.startswith(prefix):
+                name = name[len(prefix):]
+        return name
+    return None
+
+
+def apply_camera_subset(data: dict, meta: Any, keep: "list[str] | None",
+                        source: str = "depth") -> tuple[dict, Any]:
+    """Restrict a recording to a subset of its cameras, in place of re-recording one.
+
+    An ABLATION seam. The generator reads both cameras; asking what it would do on the near
+    one alone is a question about the MODEL, so the honest comparison holds the data fixed and
+    drops a camera at training time. Re-recording near-only would change the rollouts as well
+    as the input, and would trip ``assert_fm_depth_group_covers_every_camera`` on the recording
+    side -- a missing camera group there is a FAULT rather than an opt-out, precisely so a
+    half-blind generator cannot be produced by accident.
+
+    Every downstream consumer derives the sensor count from ``data``'s SHAPE and the contract
+    from ``meta``, so slicing both here leaves the rest of the pipeline unchanged: the token
+    count, the per-sensor angular position embedding, the xyz unprojection and the exported
+    ``extero_spec`` all follow. That is why this is one function called once rather than a flag
+    threaded through the dataset.
+
+    **It returns its inputs UNTOUCHED when nothing is dropped**, so the default path does not
+    even copy, let alone change.
+
+    Args:
+        data: The recording's arrays, modified only by replacement of the sliced ones.
+        meta: Recording metadata; its depth contract is filtered to match.
+        keep: Camera names to keep (see :func:`camera_name`). ``None`` or empty keeps all.
+        source: The extero source; only ``depth`` has cameras to subset.
+
+    Returns:
+        ``(data, meta)``, sliced.
+
+    Raises:
+        ValueError: If the recording carries no camera contract, if a requested name is not in
+            it, or if the selection is empty -- each of which would otherwise train on a
+            different camera set than the one that was asked for.
+    """
+    import dataclasses
+
+    if not keep:
+        return data, meta
+    if source != "depth":
+        raise ValueError(
+            f"extero_keep_cameras was given for extero_source={source!r}, which has no "
+            "cameras to choose between. Only a depth recording does.")
+    spec = list(getattr(meta, "depth_camera_spec", None) or [])
+    if not spec:
+        raise ValueError(
+            "extero_keep_cameras needs the recording's depth_camera_spec to know which "
+            "camera is which, and this recording carries none.")
+    names = [camera_name(c) for c in spec]
+    if any(n is None for n in names):
+        raise ValueError(
+            f"camera {names.index(None)} of this recording names itself in none of "
+            "camera_key / sensor / obs_term, so it cannot be selected by name -- and "
+            "selecting by INDEX is how the policy's near camera once got paired with the "
+            "generator's far one.")
+    want = [str(k).strip() for k in keep]
+    missing = [k for k in want if k not in names]
+    if missing:
+        raise ValueError(
+            f"extero_keep_cameras names {missing}, which this recording does not have. It "
+            f"carries {names}. A name that matches nothing would silently leave every camera "
+            "in, which is the arm this flag exists to distinguish itself from.")
+    idx = [i for i, n in enumerate(names) if n in want]
+    if not idx:
+        raise ValueError("extero_keep_cameras selected no cameras at all.")
+    if len(idx) == len(spec):
+        return data, meta                       # nothing dropped: byte-identical default
+
+    out = dict(data)
+    for key, axis in _SENSOR_AXIS.items():
+        arr = data.get(key)
+        if arr is None:
+            continue
+        if arr.ndim <= axis or arr.shape[axis] != len(spec):
+            raise ValueError(
+                f"'{key}' has shape {arr.shape}, whose axis {axis} is not the {len(spec)} "
+                "cameras the contract declares; refusing to slice it rather than guess.")
+        out[key] = np.take(arr, idx, axis=axis)
+    kept = [spec[i] for i in idx]
+    meta = dataclasses.replace(meta, depth_camera_spec=kept) \
+        if dataclasses.is_dataclass(meta) else meta
+    print(f"[fm-data] CAMERA SUBSET: keeping {[names[i] for i in idx]} of {names} -- "
+          f"{len(kept)} of {len(spec)} cameras, "
+          f"{[tuple(np.asarray(out[k]).shape) for k in _SENSOR_AXIS if k in out]}")
+    return out, meta
 
 
 def build_train_val(

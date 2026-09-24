@@ -37,6 +37,12 @@ from ..playback import play_frame_path
 from .vanilla import VanillaConfig, VanillaMatcher
 
 
+# Frames per chunk in the all-frames match-cost passes.  The costs are per frame, so chunking is
+# bit-identical and buys only a bound on the [chunk, feature] temporaries -- which is what keeps a
+# fork worker's footprint at the action table rather than at a multiple of the feature block.
+_MC_CHUNK = 500_000
+
+
 @dataclass
 class DPConfig:
     cut_penalty: float = 3.0           # additive cost per cut (only switching control -- no cooldown)
@@ -213,9 +219,8 @@ class DPMatcher(VanillaMatcher):
         N = self._bvel.shape[0]
         lo = self._ss[self._owner_np]; hi = lo + self._sl[self._owner_np] - 1
         out = np.empty(N)
-        CH = 500_000
-        for s in range(0, N, CH):
-            e = min(N, s + CH)
+        for s in range(0, N, _MC_CHUNK):
+            e = min(N, s + _MC_CHUNK)
             base = np.arange(s, e)
             idx = np.clip(base[:, None] + w[None, :], lo[s:e, None], hi[s:e, None])
             diff = self._bvel[idx] - tgt[None]
@@ -239,6 +244,22 @@ class DPMatcher(VanillaMatcher):
                     i = frame_of[s]; out[t, 4 * i:4 * i + 4] = (px, py, np.cos(th), np.sin(th))
         return out
 
+    def _traj_cost_all(self, t: int) -> np.ndarray:
+        """Weighted trajectory-feature distance for EVERY frame at time ``t``, chunked over frames.
+
+        Bit-identical to the whole-array expression -- each frame's sum is over its own row and does
+        not depend on how many rows are passed at once -- but it bounds the temporaries: at N=5.5M
+        the ``[N, traj_dim]`` intermediates are ~0.5 GiB EACH with three live at once, paid per fork
+        worker and re-paid every one of the T steps.  Same chunking as :meth:`_match_cost_all_exact`."""
+        N = self._traj_feat.shape[0]
+        b = self._dtraj[t]
+        out = np.empty(N)
+        for s in range(0, N, _MC_CHUNK):
+            e = min(N, s + _MC_CHUNK)
+            d = self._traj_feat[s:e] - b
+            out[s:e] = (d * d * self._traj_w).sum(1)
+        return out
+
     def _match_cost_all(self, t: int) -> np.ndarray:
         """``mc(f,t)`` for every frame at time ``t`` = w_track*velocity + w_traj*trajectory.
         Velocity uses the fast A/B/C form (exact gather near command boundaries); trajectory is a
@@ -249,8 +270,7 @@ class DPMatcher(VanillaMatcher):
             track = track + (self._mc_from_g(self._target[t]) if self._constant_window[t]
                              else self._match_cost_all_exact(t))
         if dc.w_traj != 0.0:
-            d = self._traj_feat - self._dtraj[t]                    # [N, traj_dim]
-            track = track + dc.w_traj * (d * d * self._traj_w).sum(1)
+            track = track + dc.w_traj * self._traj_cost_all(t)
         # Transition window: ramp the command-tracking weight down (``_mc_scale``) and the terrain-entry
         # pin up (``_pin_scale``) over the last frames, so the DP smoothly transitions from tracking the
         # steady approach to funnelling into the pinned entry -- a distributed pin (not just at the
@@ -280,30 +300,72 @@ class DPMatcher(VanillaMatcher):
 
     # ---- the exact backward DP -------------------------------------------------------
     def _dp_backward(self, T: int):
-        """Backward pass -> action table ``A_act[N,T]`` (0=continue, else 1+jump-slot); also
+        """Backward pass -> action table ``A_act[T,N]`` (0=continue, else 1+jump-slot); also
         sets ``self._V0`` = cost-to-go from the start layer.
 
         The terrain-entry pin (``self._boundary_pin`` weighted by ``self._pin_scale``) is folded
-        into ``mc(f, t)`` in :meth:`_match_cost_all`, so the terminal layer already carries it."""
+        into ``mc(f, t)`` in :meth:`_match_cost_all`, so the terminal layer already carries it.
+
+        The action table and the ``[N,K]`` jump-value scratch are this solve's whole memory cost and
+        are written every step, so they are PRIVATE to a fork worker rather than inherited read-only
+        -- see :meth:`solve_bytes`, which is what sizes the pool."""
         N = self._bvel.shape[0]
         cut = self.dcfg.cut_penalty
         cand, jc, nxt = self._cand, self._jcost, self._next
+        K = cand.shape[1]
+        if K > 126:
+            raise ValueError(f"candidate graph k_max={K} does not fit the int8 action table "
+                             "(0=continue, 1+k for a jump, so k_max<=126).")
         has_cont = nxt != -1
         safe_next = np.where(has_cont, nxt, 0)               # safe index; masked to inf below
-        action = np.zeros((N, T), dtype=np.int16)            # 1+k <= 1+k_max; int16 headroom
+        # 0=continue, else 1+jump-slot.  int8 (K<=126, checked above) and TIME-MAJOR are both memory
+        # decisions, not style: at N=5.5M frames and T=1000 this table is 5.1 GiB, and the [N,T]
+        # int16 it replaces was 10.2 GiB written one strided column per step.
+        action = np.zeros((T, N), dtype=np.int8)
         idxN = np.arange(N)
+        # Reused every step.  Building this [N,K] float64 as an expression kept three of it live at
+        # once (the gather, +jc, +cut); at N=5.5M, K=50 that is 6.1 GiB of churn per worker for 2.0
+        # GiB of state, so the gather goes straight into the buffer and the rest is in place.  Every
+        # `cand` slot is a valid frame index (unused slots are marked by an inf `jc`, not by the
+        # index), so mode="clip" is equivalent to the default and skips np.take's raise-mode buffer.
+        Vj_all = np.empty((N, K), dtype=np.float64)
 
         V_next = self._match_cost_all(T - 1)                 # V[:, T-1] (incl. the terminal pin)
         for t in range(T - 2, -1, -1):
             Vc = np.where(has_cont, V_next[safe_next], np.inf)          # continue value
-            Vj_all = V_next[cand] + jc + cut                           # [N,K] (inf slots stay inf)
+            np.take(V_next, cand, out=Vj_all, mode="clip")              # [N,K] jump values; the
+            Vj_all += jc                                                # unused slots go inf here
+            Vj_all += cut                                               # and stay inf
             kbest = np.argmin(Vj_all, axis=1)
             Vj = Vj_all[idxN, kbest]
             take_cont = Vc <= Vj                                       # ties -> continue (fewer cuts)
-            action[:, t] = np.where(take_cont, 0, 1 + kbest).astype(np.int16)
+            action[t] = np.where(take_cont, 0, 1 + kbest).astype(np.int8)
             V_next = self._match_cost_all(t) + np.where(take_cont, Vc, Vj)
         self._V0 = V_next
         return action
+
+    def solve_bytes(self, T: int) -> int:
+        """Peak PRIVATE bytes one :meth:`generate` call needs, for sizing a fork pool.
+
+        The DB, the candidate graph and the features are read-only and inherited by fork, so they
+        cost one copy for the whole pool and are NOT counted.  What IS counted is everything a solve
+        WRITES -- the ``[T,N]`` action table, the ``[N,K]`` jump scratch, the handful of ``[N]``
+        cost vectors and the chunked match-cost temporaries -- because that is per worker, and it is
+        the term that decides how wide the pool can be.  At N=5.5M frames, T=1000, K=50 it is ~7
+        GiB, so a 32-core box can afford far fewer workers than it has cores."""
+        N = self._bvel.shape[0]
+        K = self._cand.shape[1] if self.graph is not None else 0
+        # Only the ENABLED cost terms allocate: the widest chunk temporary is the trajectory
+        # compare's [chunk, traj_dim] or the exact velocity window's [chunk, 2W+1, 3].
+        chunk_feats = 0
+        if self.dcfg.w_traj != 0.0:
+            chunk_feats = max(chunk_feats, self._traj_feat.shape[1])
+        if self.dcfg.w_track != 0.0:
+            chunk_feats = max(chunk_feats, 3 * (2 * self.dcfg.track_window + 1))
+        return int(T * N                        # action table, int8
+                   + N * K * 8                  # Vj_all scratch, float64
+                   + 8 * N * 8                  # V_next / Vc / Vj / mc + the np.where temporaries
+                   + 4 * _MC_CHUNK * chunk_feats * 8)
 
     def _reconstruct(self, action: np.ndarray, T: int, start_frame: int | None = None):
         """Forward-reconstruct the optimal frame path from the action table.
@@ -320,7 +382,7 @@ class DPMatcher(VanillaMatcher):
             path[t] = f
             if t == T - 1:
                 break
-            a = int(action[f, t])
+            a = int(action[t, f])
             if a == 0:                                       # continue
                 nf = int(nxt[f])
                 if nf == -1:                                 # guard: should not happen for finite V

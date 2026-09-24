@@ -101,6 +101,10 @@ _FREEFORM_COMMAND_TASKS: tuple[str, ...] = (
     # The same fine-tune pinned to the fixed two-box course, with the policy's far camera
     # restored so an existing two-camera tracker can run it.
     "G1-box2-finetune",
+    # The wall field: enclosed rooms, walls to ignore, and a goal the robot must STOP in. It
+    # additionally switches the free-form APPROACH controller on, which no other task does --
+    # `test_freeform_approach_defaults_off.py` is what pins that.
+    "G1-teacher-clf-terrain-depth-finetune-walls",
 )
 
 
@@ -323,7 +327,9 @@ def freeform_library(tmp_path_factory):
     manifest = ff.generate_freeform_manifest(cfg)
     ff.validate_manifest(manifest)
     path = str(tmp_path_factory.mktemp("freeform") / "lib.h5")
-    maker.write_terrain_library(path, manifest, maker.library_meta(None), cfg)
+    # The bare SCHEMA -- see test_clip_free_library. Nothing here resolves a joint
+    # output, so the layout `library_meta` refuses is exactly the right one to use.
+    maker.write_terrain_library(path, manifest, maker.schema_only_layout(), cfg)
     return path, manifest
 
 

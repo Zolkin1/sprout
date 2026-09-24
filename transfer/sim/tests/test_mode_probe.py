@@ -312,5 +312,12 @@ def test_the_rollout_fingerprint_moves_when_a_trial_moves() -> None:
                                           "steps": 409, "cut": 409}]}}}
     moved = {"arms": {"parent": {"rows": [{"seed": 0, "verdict": "fall", "failure": "tilt",
                                            "steps": 419, "cut": 413}]}}}
-    assert mode_probe._rollout_fingerprint(base) == mode_probe._rollout_fingerprint(same)
-    assert mode_probe._rollout_fingerprint(base) != mode_probe._rollout_fingerprint(moved)
+    key = mode_probe.label_key("parent", 0)
+    assert mode_probe.trial_fingerprints(base) == mode_probe.trial_fingerprints(same)
+    assert mode_probe.trial_fingerprints(base)[key] != mode_probe.trial_fingerprints(moved)[key]
+
+    # ADDING a trial must leave the existing one's digest alone -- the whole-probe digest this
+    # replaced could not tell "a trial moved" from "trials were added" and dropped every label.
+    grown = {"arms": {"parent": {"rows": base["arms"]["parent"]["rows"] + [
+        {"seed": 1, "verdict": "success", "failure": "", "steps": 600, "cut": 600}]}}}
+    assert mode_probe.trial_fingerprints(grown)[key] == mode_probe.trial_fingerprints(base)[key]

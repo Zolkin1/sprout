@@ -52,7 +52,90 @@ def xyzw_to_wxyz(q: np.ndarray) -> np.ndarray:
     return q[..., [3, 0, 1, 2]]
 
 
-def load_urdf(urdf_path: str) -> yourdfpy.URDF:
+def _disambiguate_geometry_names(robot: yourdfpy.Robot) -> int:
+    """Rename every ``<visual>``/``<collision>`` whose ``name`` is not usable as a scene-graph
+    node, in place, and return how many were renamed.
+
+    A URDF may name a visual anything it likes, including the name of its own link -- and
+    ``make_perceptive_urdf.py`` does exactly that for the two camera mounts and the backpack
+    shell. That is legal URDF and correct everywhere else in the stack (Isaac and MuJoCo both
+    place those meshes right); it breaks ONLY the yourdfpy -> viser path, because the two
+    disagree about what the name means:
+
+    * yourdfpy passes the visual's name to ``trimesh.Scene.add_geometry`` as the GEOMETRY key,
+      and trimesh then picks a NODE name that is unique among existing nodes -- so a visual
+      named ``backpack_shell_link`` becomes geometry ``backpack_shell_link`` hanging off node
+      ``backpack_shell_link_1``, because the link already owns the bare name;
+    * ``ViserUrdf`` iterates ``scene.geometry.items()`` and uses each key as if it were the
+      node name, so it looks up the LINK's parent (the torso) instead of the mesh's, and bakes
+      the fixed-joint transform into the vertices of a mesh that is then parented under that
+      same joint frame.
+
+    The mesh is thus posed by its mount transform TWICE and hangs off the robot by it. There
+    is no shape or count error anywhere: all 39 meshes load, the joint tree is right, and the
+    only symptom is three parts floating in space.
+
+    The fix belongs here rather than in the URDF: ``robot_assets/g1_perceptive/g1_perceptive.urdf``
+    is fingerprinted into every exported ``tracker.onnx``/``fm.onnx`` (see ``motion_gen.robot_asset``),
+    so editing an attribute no simulator reads would invalidate every checkpoint on disk to fix
+    a rendering bug.
+
+    Args:
+        robot: A parsed ``yourdfpy.Robot`` (mutated in place).
+
+    Returns:
+        Number of renamed geometry entries.
+    """
+    link_names = {link.name for link in robot.links}
+    taken: set[str] = set()
+    renamed = 0
+    for link in robot.links:
+        for kind, geoms in (("visual", link.visuals), ("collision", link.collisions)):
+            for i, g in enumerate(geoms):
+                # A ``None`` name is the common case and is SAFE: trimesh then derives the key
+                # from the mesh file (``pelvis.STL``), which cannot collide with a link name.
+                # Leave it alone -- those names are what the viser scene tree shows.
+                if g.name is None or (g.name not in link_names and g.name not in taken):
+                    if g.name is not None:
+                        taken.add(g.name)
+                    continue
+                base = f"{link.name}_{kind}_{i}"
+                new, k = base, 0
+                while new in link_names or new in taken:
+                    k += 1
+                    new = f"{base}_{k}"
+                g.name, renamed = new, renamed + 1
+                taken.add(new)
+    return renamed
+
+
+def _assert_every_mesh_is_its_own_node(scene, urdf_path: str, which: str) -> None:
+    """Raise unless every geometry key in ``scene`` is also the graph node that holds it.
+
+    This is the invariant :class:`ViserUrdf` assumes and never checks; when it fails the
+    meshes still render, just in the wrong place (see :func:`_disambiguate_geometry_names`).
+    A silent misplacement is exactly the failure this repo keeps paying for, so assert it.
+
+    Args:
+        scene: ``urdf.scene`` or ``urdf.collision_scene``.
+        urdf_path: Path, for the error message.
+        which: ``"visual"`` or ``"collision"``, for the error message.
+
+    Raises:
+        ValueError: If any geometry key is not a geometry node of the same name.
+    """
+    geom, nodes = set(scene.geometry), set(scene.graph.nodes_geometry)
+    if geom != nodes:
+        raise ValueError(
+            f"{urdf_path}: the {which} scene graph names a mesh differently from the node that "
+            f"holds it, which ViserUrdf would silently render in the wrong place.\n"
+            f"  geometry keys with no matching node: {sorted(geom - nodes)}\n"
+            f"  mesh nodes with no matching key    : {sorted(nodes - geom)}\n"
+            "  (_disambiguate_geometry_names was supposed to have prevented this)"
+        )
+
+
+def load_urdf(urdf_path: str, with_collision: bool = False) -> yourdfpy.URDF:
     """Load a URDF with meshes resolved relative to the URDF's directory.
 
     The returned instance is meant to be loaded ONCE and shared by every
@@ -62,13 +145,40 @@ def load_urdf(urdf_path: str) -> yourdfpy.URDF:
     updates are serialized (the viewer holds a lock around frame updates).
     Relies on viser 1.0.x internals; fall back to one ``load_urdf`` per
     ViserUrdf if an upgrade breaks this.
+
+    The URDF is parsed twice on purpose: :func:`_disambiguate_geometry_names` has to run
+    before the scene graph exists, and re-parsing the XML costs nothing next to loading the
+    meshes (which the first pass skips).
+
+    Args:
+        urdf_path: Path to the URDF.
+        with_collision: Also build and load the COLLISION scene. Off by default -- only
+            ``view_terrain_reward_viser`` overlays the collision primitives, and loading them
+            doubles the mesh work for every other viewer.
+
+    Returns:
+        The loaded URDF, with its visual (and optionally collision) scene built.
     """
-    return yourdfpy.URDF.load(
-        urdf_path,
+    handler = partial(yourdfpy.filename_handler_magic, dir=os.path.dirname(urdf_path))
+    parsed = yourdfpy.URDF.load(
+        urdf_path, build_scene_graph=False, load_meshes=False, filename_handler=handler,
+    )
+    renamed = _disambiguate_geometry_names(parsed.robot)
+    if renamed:
+        print(f"[urdf] {renamed} visual/collision name(s) collided with a link name and were "
+              f"renamed for rendering ({os.path.basename(urdf_path)}); the file on disk is untouched.")
+    urdf = yourdfpy.URDF(
+        robot=parsed.robot,
         build_scene_graph=True,
         load_meshes=True,
-        filename_handler=partial(yourdfpy.filename_handler_magic, dir=os.path.dirname(urdf_path)),
+        build_collision_scene_graph=with_collision,
+        load_collision_meshes=with_collision,
+        filename_handler=handler,
     )
+    _assert_every_mesh_is_its_own_node(urdf.scene, urdf_path, "visual")
+    if with_collision:
+        _assert_every_mesh_is_its_own_node(urdf.collision_scene, urdf_path, "collision")
+    return urdf
 
 
 def recording_to_urdf_perm(recording_joint_names: list[str], urdf: yourdfpy.URDF) -> np.ndarray:
@@ -86,6 +196,14 @@ def recording_to_urdf_perm(recording_joint_names: list[str], urdf: yourdfpy.URDF
         ValueError: If any actuated URDF joint is missing from the recording.
     """
     actuated = list(urdf.actuated_joint_names)
+    # The reverse direction is NOT an error -- a URDF may legitimately pose a subset -- but it is
+    # almost always a mistake, and a silent one: the extra joints simply stay at their default, so a
+    # 29-DOF motion rendered on a 21-DOF URDF looks stiff rather than broken.  Say so.
+    extra = [n for n in recording_joint_names if n not in actuated]
+    if extra:
+        print(f"[urdf] WARNING: {len(extra)} recorded joint(s) are not actuated by this URDF and will "
+              f"be frozen at their default: {', '.join(extra[:8])}"
+              f"{' ...' if len(extra) > 8 else ''}")
     missing = [n for n in actuated if n not in recording_joint_names]
     if missing:
         raise ValueError(

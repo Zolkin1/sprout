@@ -46,6 +46,7 @@ conditioning by default and the MuJoCo sim2sim path, which are separate entry po
 from __future__ import annotations
 
 import math
+from collections.abc import Collection, Sequence
 from types import SimpleNamespace
 from typing import NamedTuple
 
@@ -458,6 +459,19 @@ class G1TeacherTerrainDepthObservationsCfg(G1TeacherObservationsCfg):
         #: ``None`` is the default because near-only is the decision for the next teacher
         #: retrain; :func:`enable_policy_far_camera` turns it back on for running an EXISTING
         #: two-camera checkpoint, which is every one on disk today.
+        #:
+        #: **THE ASYMMETRY IS DELIBERATE: the RL policy reads the NEAR camera alone, and the
+        #: FM generator still reads BOTH.** They are different consumers of the same pair --
+        #: the policy has to run on a robot and the generator places a reference from what it
+        #: can see ahead, which is what the far camera is for. So this default is NOT a
+        #: statement that the far camera is unhelpful, and it must not be propagated to the
+        #: generator's own exteroception (``extero_source`` / ``add_fm_depth_pair``, which
+        #: samples the same physical pair on its own grid).
+        #:
+        #: Practical consequence for a retrain: a tracker trained under this default has a
+        #: DIFFERENT policy observation from every checkpoint on disk, so it is not a drop-in
+        #: and its numbers are not comparable to the two-camera ones without re-running the
+        #: eval arms.
         #: NOTE the missing type annotation, and it is load-bearing: ``depth_near`` above is an
         #: un-annotated class attribute, and ``configclass`` orders ANNOTATED fields ahead of
         #: un-annotated ones. Written as ``depth_far: ObsTerm | None = None`` this slot lands
@@ -553,8 +567,12 @@ class G1TeacherTerrainDepthEnvCfg(G1TeacherTerrainBodyEnvCfg):
     A/B controlled too.
     """
 
+    # 8192, matching the tracker that every result on disk was measured with
+    # (`2026-08-20_16-36-10_mode11_decor_plan_v1`, which passed `--num_envs 8192`). The repo
+    # said 4096, so the pairing lived only in a shell history. The PLAY cfgs below stay small
+    # on purpose -- nothing wants 8192 robots in a viewer.
     scene: G1TeacherTerrainDepthSceneCfg = G1TeacherTerrainDepthSceneCfg(
-        num_envs=4096, env_spacing=2.5
+        num_envs=8192, env_spacing=2.5
     )
     observations: G1TeacherTerrainDepthObservationsCfg = G1TeacherTerrainDepthObservationsCfg()
     events: G1TeacherTerrainDepthEventsCfg = G1TeacherTerrainDepthEventsCfg()
@@ -754,7 +772,9 @@ class G1FmDepthObservationsCfg(ObsGroup):
         self.enable_corruption = True
 
 
-def assert_fm_depth_group_covers_every_camera(cfg) -> None:
+def assert_fm_depth_group_covers_every_camera(
+    cfg, expect: Collection[str] | None = None
+) -> None:
     """Refuse a generator group that does not name every depth camera on the scene.
 
     THE FAILURE THIS EXISTS FOR IS SILENT, and nothing downstream can catch it. The policy
@@ -765,12 +785,23 @@ def assert_fm_depth_group_covers_every_camera(cfg) -> None:
     self-consistent about a half-blind generator, and indistinguishable from a deliberate
     one-camera design.
 
+    ``expect`` is the ONE way to ask for less, and it exists because a near-only generator is
+    a real artifact: the camera ablation drops the far camera at dataset build, so its
+    checkpoint conditions on one sensor row and an env serving two is refused downstream by
+    ``FmTrackingCommand._check_extero_shape``. What keeps this from being the hole the
+    paragraph above describes is WHERE the subset comes from -- the CHECKPOINT'S OWN
+    ``extero_spec``, read by ``read_fm_extero_meta``, never a flag and never a default. A
+    generator that names both cameras still gets both, and a group that quietly lost one is
+    still a fault.
+
     Args:
         cfg: A depth env cfg carrying ``scene`` and ``observations``.
+        expect: The camera set the group is REQUIRED to name, when a checkpoint declares a
+            subset. ``None`` (the default) means every camera on the scene.
 
     Raises:
-        ValueError: If the group is absent, or names a different set of physical cameras
-            than the scene carries.
+        ValueError: If the group is absent, names a different set of physical cameras than
+            it is required to, or if ``expect`` names a camera the scene does not carry.
     """
     group = getattr(cfg.observations, mdp.FM_DEPTH_OBS_GROUP, None)
     if group is None:
@@ -789,12 +820,28 @@ def assert_fm_depth_group_covers_every_camera(cfg) -> None:
         name for name, sensor in vars(cfg.scene).items()
         if isinstance(sensor, MultiMeshRayCasterCameraCfg) and not name.startswith(_FM_PREFIX)
     }
-    if observed != on_scene:
+    if expect is None:
+        if observed != on_scene:
+            raise ValueError(
+                f"the generator's '{mdp.FM_DEPTH_OBS_GROUP}' group observes "
+                f"{sorted(observed)} but the scene carries {sorted(on_scene)}. The generator "
+                "must see every camera the robot has -- a missing one is a half-blind "
+                "generator whose recording, checkpoint and fm.onnx all agree with each other."
+            )
+        return
+    want = {str(name) for name in expect}
+    off_scene = sorted(want - on_scene)
+    if off_scene:
+        raise ValueError(
+            f"a checkpoint asks the generator for cameras {off_scene}, which this scene does "
+            f"not carry (it has {sorted(on_scene)}). The artifact and the task describe "
+            "different robots; nothing here can reconcile them."
+        )
+    if observed != want:
         raise ValueError(
             f"the generator's '{mdp.FM_DEPTH_OBS_GROUP}' group observes {sorted(observed)} "
-            f"but the scene carries {sorted(on_scene)}. The generator must see every camera "
-            "the robot has -- a missing one is a half-blind generator whose recording, "
-            "checkpoint and fm.onnx all agree with each other."
+            f"but its checkpoint declares {sorted(want)}. The subset is read off the "
+            "checkpoint, so this is a wiring fault rather than a choice."
         )
 
 
@@ -822,16 +869,26 @@ def _clear_fm_depth_sampling(cfg) -> None:
             term.params["sensor_cfg"] = SceneEntityCfg(name)
 
 
-def install_fm_depth_group(cfg, width: int | None = None, height: int | None = None) -> str:
+def install_fm_depth_group(cfg, width: int | None = None, height: int | None = None,
+                           cameras: Sequence[str] | None = None) -> str:
     """Give the GENERATOR its observation group, covering EVERY depth camera on the scene.
 
-    ALWAYS installs the group, and the group always names both cameras. That is the whole
+    ALWAYS installs the group, and by default the group names both cameras. That is the whole
     point: the policy reads the near camera alone, so "no group" no longer means "the
     generator and the policy see the same thing" -- it means the generator sees half the
     robot's cameras, silently (see :func:`assert_fm_depth_group_covers_every_camera`). Call
     this wherever the generator runs or is recorded: the FM tracker and fine-tune tasks do it
     in ``__post_init__``, ``record_data.py`` / ``play.py`` / ``augment_registration.py`` do it
     before ``gym.make``.
+
+    ``cameras`` is the near-only arm and the ONLY way to install less than everything. Pass
+    the sensor names a CHECKPOINT declares (``read_fm_extero_meta(...)["cameras"]``), never a
+    list someone typed: the camera ablation drops the far camera at DATASET build, so its
+    generator conditions on one sensor row and an env serving two rows is refused by
+    ``FmTrackingCommand._check_extero_shape`` -- correctly, and three stages downstream of
+    anything that says why. A dropped camera also stops being ray-cast (``lazy_sensor_update``
+    casts only what an observation term reads), so the near-only arm really is near-only
+    rather than paying for a view it discards.
 
     Two arms, and only the SAMPLING differs between them:
 
@@ -854,12 +911,15 @@ def install_fm_depth_group(cfg, width: int | None = None, height: int | None = N
             place.
         width: Rays across for the generator's cameras. ``None`` = the policy's.
         height: Rays down. ``None`` = the policy's.
+        cameras: Scene sensor names the generator conditions on, as a checkpoint declares
+            them. ``None`` (the default) = every camera on the scene.
 
     Returns:
         The observation group name that was installed.
 
     Raises:
-        ValueError: If ``cfg`` carries no depth cameras to observe.
+        ValueError: If ``cfg`` carries no depth cameras to observe, or if ``cameras`` is
+            empty or names one the scene does not have.
 
     TODO(one-sampling): the SPLIT arm is a DEVELOPMENT feature -- it lets the generator's grid
     change without retraining the teacher. The long-term intent is that the two match, and
@@ -878,10 +938,33 @@ def install_fm_depth_group(cfg, width: int | None = None, height: int | None = N
     h = _DEPTH_H if height is None else int(height)
     split = (w, h) != (_DEPTH_W, _DEPTH_H)
 
+    on_scene = [name for name, _ in _DEPTH_CAMERAS]
+    if cameras is None:
+        keep = set(on_scene)
+    else:
+        keep = {str(name) for name in cameras}
+        if not keep:
+            raise ValueError(
+                "install_fm_depth_group(cameras=[]) would leave the generator with no "
+                "exteroception at all. Pass None for every camera on the scene.")
+        unknown = sorted(keep - set(on_scene))
+        if unknown:
+            raise ValueError(
+                f"install_fm_depth_group was asked for cameras {unknown}, which this scene "
+                f"does not carry (it has {on_scene}). Names come from a checkpoint's "
+                "extero_spec 'sensor' field and must be scene sensor names.")
+
     _clear_fm_depth_sampling(cfg)
 
     group = G1FmDepthObservationsCfg()
     for term_name, (camera, spec) in zip(_FM_DEPTH_TERMS, _DEPTH_CAMERAS, strict=True):
+        if camera not in keep:
+            # None, not delattr: the ObservationManager skips a None term, and leaving the
+            # ATTRIBUTE in place keeps the declared field order intact for the cameras that
+            # remain -- the same reason `depth_far` is declared as None on the policy group
+            # rather than added later, which is how two 780-wide blocks once got transposed.
+            setattr(group, term_name, None)
+            continue
         if split:
             setattr(cfg.scene, f"{_FM_PREFIX}{camera}",
                     _make_depth_camera(spec, width=w, height=h))
@@ -891,8 +974,12 @@ def install_fm_depth_group(cfg, width: int | None = None, height: int | None = N
     setattr(cfg.observations, mdp.FM_DEPTH_OBS_GROUP, group)
 
     if split:
-        # One draw per physical camera, now covering both of its samplings.
+        # One draw per physical camera, now covering both of its samplings. Only the kept
+        # ones have a second sampling to cover; a dropped camera keeps its single-sensor DR
+        # term, which `_clear_fm_depth_sampling` has just restored.
         for camera, _ in _DEPTH_CAMERAS:
+            if camera not in keep:
+                continue
             suffix = camera.rsplit("_", 1)[-1]                # "near" / "far"
             shared = [SceneEntityCfg(camera), SceneEntityCfg(f"{_FM_PREFIX}{camera}")]
             for template in _DEPTH_DR_TERMS:
@@ -902,18 +989,26 @@ def install_fm_depth_group(cfg, width: int | None = None, height: int | None = N
                 term.params.pop("sensor_cfg", None)
                 term.params["sensor_cfgs"] = shared
 
-    assert_fm_depth_group_covers_every_camera(cfg)
+    assert_fm_depth_group_covers_every_camera(cfg, expect=keep)
 
     rays = w * h
+    kept = [name for name in on_scene if name in keep]
     if split:
-        print(f"[INFO] fm depth pair added at {w}x{h} ({rays} px/camera, {2 * rays} total) "
-              f"in obs group '{mdp.FM_DEPTH_OBS_GROUP}'; the policy keeps "
-              f"{_DEPTH_W}x{_DEPTH_H}. Ray cost scales with the pixel count, so this pair is "
-              f"{rays / (_DEPTH_W * _DEPTH_H):.2g}x the policy pair's.")
+        print(f"[INFO] fm depth cameras added at {w}x{h} ({rays} px/camera, "
+              f"{len(kept) * rays} total) in obs group '{mdp.FM_DEPTH_OBS_GROUP}' over "
+              f"{kept}; the policy keeps {_DEPTH_W}x{_DEPTH_H}. Ray cost scales with the "
+              f"pixel count, so each is {rays / (_DEPTH_W * _DEPTH_H):.2g}x a policy "
+              "camera's.")
     else:
         print(f"[INFO] obs group '{mdp.FM_DEPTH_OBS_GROUP}' installed over the scene's own "
-              f"{w}x{h} cameras {[n for n, _ in _DEPTH_CAMERAS]}; no second sampling, no "
-              f"second ray cast. The policy reads {[n for n, _ in _POLICY_CAMERAS]}.")
+              f"{w}x{h} cameras {kept}; no second sampling, no second ray cast. The policy "
+              f"reads {[n for n, _ in _POLICY_CAMERAS]}.")
+    if len(kept) != len(on_scene):
+        dropped = [name for name in on_scene if name not in keep]
+        print(f"[INFO] the generator conditions on {len(kept)} of this scene's "
+              f"{len(on_scene)} cameras; {dropped} is NOT observed and therefore not "
+              "ray-cast. This is the camera ablation, and it is legitimate only because the "
+              "checkpoint itself declares the subset.")
     return mdp.FM_DEPTH_OBS_GROUP
 
 

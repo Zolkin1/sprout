@@ -2,6 +2,25 @@
 
 """Fit ``Q(s, a)`` over the generator's own chunks, and measure it against ``V(s)``.
 
+**DEPRECATED 2026-09-10, and currently BROKEN. Not a warning about style -- it does not run.**
+
+``Q(s, a)`` borrows its token assembly from :class:`~robot_rl.flow_matching.value.FlowValueModel`
+(``FlowQModel.value_tokens`` calls ``super().value_tokens``), and that critic was cut down to the
+architecture the paper describes: ONE readout token, ONE scalar value head, and no scan or proprio
+token streams. Q therefore lost the exteroception it was fitted with, and ``ValueInputs`` no longer
+accepts ``scan=`` / ``proprio=``.
+
+Left broken deliberately rather than quietly rewired, because reviving it is a RESEARCH decision
+and not a mechanical fix: Q would need its own scan and proprio streams, inserted before its action
+tokens so its own token order is preserved, and every fitted ``Q*.pt`` predates that and would need
+refitting anyway. Doing it silently would re-specify a second experiment as a side effect of a
+documentation goal.
+
+To revive: give ``FlowQModel`` its own scan/proprio encoders and type embeddings (it already owns
+its head, for the same reason), then refit. The best-of-K result this line produced is recorded in
+``oracle-gain-ceiling`` -- one oracle decision was worth +0.0099 of success, which is the number
+that should decide whether reviving it is worth the GPU time.
+
 ``fit_value.py`` fits ``V(s)`` -- a state score, which answers identically for every candidate
 drawn at one state and therefore cannot rank them.  Best-of-K needs a ranking.  This fits the
 same architecture with the emitted chunk added as a token stream
@@ -243,6 +262,12 @@ def _predict(model, ctx, W, idx, device, scan_hw, action_steps, batch) -> np.nda
 
 def main() -> int:
     """Fit Q and report it against V on the ranking metric."""
+    raise SystemExit(
+        "DEPRECATED and BROKEN: the Q(s, a) line borrows its tokens from FlowValueModel, "
+        "which was cut to one readout, one scalar head and NO scan/proprio streams for the "
+        "paper. Q lost the exteroception it was fitted with, and ValueInputs no longer takes "
+        "scan=/proprio=. Reviving it means giving FlowQModel its own scan/proprio streams and "
+        "refitting -- a research decision, not a mechanical fix. See the module docstring.")
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--rollout", required=True, help="Rollout stem, without .h5")

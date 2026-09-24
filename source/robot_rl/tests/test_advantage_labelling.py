@@ -14,8 +14,8 @@ import numpy as np
 import pytest
 
 from robot_rl.flow_matching.advantage import (
-    LABEL_NEGATIVE, LABEL_NULL, LABEL_POSITIVE, binarize, combined_n_step_advantage,
-    label_from_name, n_step_advantage, normalized_returns,
+    LABEL_NEGATIVE, LABEL_NULL, LABEL_POSITIVE, binarize,
+    label_from_name, normalized_returns,
 )
 from robot_rl.flow_matching.rollout_dataset import join_labels
 
@@ -24,51 +24,6 @@ def _episode(uid: int, p: list[float], failed: bool):
     """Build the four parallel arrays for one episode."""
     n = len(p)
     return (np.array(p), np.full(n, uid), np.arange(n), np.full(n, failed))
-
-
-def test_interior_advantage_is_the_n_step_difference():
-    """``A = P(fail|s_t) - P(fail|s_{t+n})`` wherever the look-ahead lands inside."""
-    p, uid, ridx, failed = _episode(0, [0.5, 0.4, 0.3, 0.2, 0.1, 0.05], failed=False)
-    a, boot = n_step_advantage(p, uid, ridx, failed, n=2)
-    assert a[0] == pytest.approx(0.5 - 0.3)
-    assert a[3] == pytest.approx(0.2 - 0.05)
-    assert not boot[:4].any()
-
-
-def test_the_tail_bootstraps_on_the_REALIZED_outcome():
-    """Past the last recorded re-plan the future value is the outcome, not a prediction.
-
-    Those rows are the ones nearest the terminal and so the most informative; dropping them
-    would discard exactly the chunks whose consequence is known.
-    """
-    p, uid, ridx, failed = _episode(0, [0.2, 0.3, 0.9], failed=True)
-    a, boot = n_step_advantage(p, uid, ridx, failed, n=2)
-    assert boot[1] and boot[2] and not boot[0]
-    assert a[2] == pytest.approx(0.9 - 1.0)     # it failed: V(s_{t+n}) = -1
-    p2, uid2, ridx2, ok = _episode(1, [0.2, 0.3, 0.1], failed=False)
-    a2, _ = n_step_advantage(p2, uid2, ridx2, ok, n=2)
-    assert a2[2] == pytest.approx(0.1 - 0.0)    # it arrived: V(s_{t+n}) = 0
-
-
-def test_episodes_do_not_leak_into_each_other():
-    """The look-ahead is per episode; row t+n of a DIFFERENT episode is not a future."""
-    p = np.array([0.5, 0.5, 0.9, 0.9])
-    uid = np.array([0, 0, 1, 1])
-    ridx = np.array([0, 1, 0, 1])
-    failed = np.array([False, False, False, False])
-    a, boot = n_step_advantage(p, uid, ridx, failed, n=1)
-    # Episode 0's last row bootstraps on ITS outcome (0.5 - 0.0), not on episode 1's 0.9.
-    assert a[1] == pytest.approx(0.5)
-    assert boot[1] and boot[3]
-
-
-def test_rows_need_not_arrive_sorted():
-    """The table is grouped internally, so a shuffled file gives the same answer."""
-    p, uid, ridx, failed = _episode(7, [0.5, 0.4, 0.3, 0.2], failed=False)
-    a_sorted, _ = n_step_advantage(p, uid, ridx, failed, n=1)
-    perm = np.array([2, 0, 3, 1])
-    a_shuf, _ = n_step_advantage(p[perm], uid[perm], ridx[perm], failed[perm], n=1)
-    assert a_shuf == pytest.approx(a_sorted[perm])
 
 
 def test_a_family_with_no_spread_is_null_not_negative():
@@ -245,49 +200,6 @@ def test_the_return_stays_in_the_declared_support_and_flags_unusable_episodes():
         adv.normalized_returns(r, ok, uid, ridx, np.zeros(m, bool), gamma=1.0)
 
 
-def test_the_combined_advantage_at_a_long_horizon_IS_the_monte_carlo_one():
-    """``w_fail = 0`` with ``n`` past the longest episode must equal ``G - G_hat`` exactly.
-
-    That is the identity the filtered-BC label rests on: ``A_MC = G_t - V(s_t)`` is only an
-    advantage if its ``G`` is the quantity the baseline was fitted to predict, which is
-    :func:`normalized_returns`'. Two things used to break it, and both are invisible in the
-    output -- the reward sum included each episode's placeholder final row, and the
-    non-failure tail closed on ``G_hat[-1]`` (a prediction) where ``normalized_returns``
-    closes on ``r[-1]`` (the last measurement). They agreed on FAILED episodes, where the
-    tail is 0 either way, so half the data looked correct.
-    """
-    rng = np.random.default_rng(5)
-    uid, ri, rew, fail, ok = [], [], [], [], []
-    for e in range(9):
-        m = int(rng.integers(3, 12))
-        f = bool(e % 3 == 0)
-        uid += [e] * m
-        ri += list(range(m))
-        rew += list(rng.uniform(0.1, 1.0, size=m - 1)) + [0.0]   # the placeholder last row
-        fail += [f] * m
-        ok += [True] * (m - 1) + [False]
-    order = rng.permutation(len(uid))                            # rows need not arrive sorted
-    uid = np.asarray(uid)[order]
-    ri = np.asarray(ri)[order]
-    rew = np.asarray(rew)[order]
-    fail = np.asarray(fail)[order]
-    ok = np.asarray(ok)[order]
-    gam = 0.95
-
-    g, g_ok = normalized_returns(rew, ok, uid, ri, fail, gamma=gam)
-    q = g + rng.normal(0.0, 0.05, size=g.size)                   # a plausible baseline
-    a, _ = combined_n_step_advantage(np.zeros(g.size), q, rew, uid, ri, fail, 500,
-                                     gamma=gam, w_fail=0.0, valid=ok)
-    assert np.abs(a[g_ok] - (g - q)[g_ok]).max() < 1e-12
-
-    # And the survival control arm is untouched by any of it.
-    p = rng.uniform(0.0, 1.0, size=g.size)
-    s1, _ = combined_n_step_advantage(p, q, rew, uid, ri, fail, 4, gamma=gam,
-                                      w_fail=1.0, valid=ok)
-    s2, _ = n_step_advantage(p, uid, ri, fail, 4)
-    assert np.abs(s1 - s2).max() == 0.0
-
-
 def test_the_cut_can_be_stratified_beyond_the_family():
     """``strata`` must make the positive rate flat in the stratum, not just in the family.
 
@@ -357,69 +269,42 @@ def test_the_success_tail_can_average_several_chunks_and_defaults_to_one():
     assert short[1] == pytest.approx((1 - g) * 0.8 + g * float(np.mean([0.4, 0.8])))
 
 
-def test_the_combined_advantage_tracks_the_same_tail():
-    """``combined_n_step_advantage`` must use the SAME tail, or ``A_MC`` stops being one.
+def test_the_sidecar_write_is_UNCONDITIONAL():
+    """``np.savez`` must sit at the function's top level, not inside any branch.
 
-    Its baseline is a head fitted to ``normalized_returns``' target, so the two tails have to
-    agree for ``G - G_hat`` to be a difference of like quantities. At a long horizon the
-    identity is exact, which is what this checks -- at ``tail_chunks=3`` on both sides.
-    """
-    rng = np.random.default_rng(11)
-    uid, ri, rew, fail, ok = [], [], [], [], []
-    for e in range(7):
-        m = int(rng.integers(4, 11))
-        f = bool(e % 2)
-        uid += [e] * m
-        ri += list(range(m))
-        rew += list(rng.uniform(0.1, 1.0, size=m - 1)) + [0.0]
-        fail += [f] * m
-        ok += [True] * (m - 1) + [False]
-    uid, ri = np.asarray(uid), np.asarray(ri)
-    rew, fail, ok = np.asarray(rew), np.asarray(fail), np.asarray(ok)
+    It once sat inside the G2 gate's ``else``, and the failure was silent in the worst way: a
+    ``--quality_only`` fit skipped that gate (it banded by ``P(fail|s_t)``, and the survival
+    head was untrained), and the write went with it -- so the run printed every statistic,
+    returned 0, and produced no ``advantage.npz``. A pipeline reading it then either refused
+    or, if a previous run had left one, trained on a STALE label with nothing saying so.
 
-    g, g_ok = normalized_returns(rew, ok, uid, ri, fail, gamma=0.95, tail_chunks=3)
-    q = g + rng.normal(0.0, 0.05, size=g.size)
-    a, _ = combined_n_step_advantage(np.zeros(g.size), q, rew, uid, ri, fail, 500,
-                                     gamma=0.95, w_fail=0.0, valid=ok, tail_chunks=3)
-    assert np.abs(a[g_ok] - (g - q)[g_ok]).max() < 1e-12
+    The `quality_only` flag and the G2 gate are both gone now, so the original guard has no
+    condition left to name. The INVARIANT is what survives, and stated structurally it is
+    stronger than the old form: the write is not nested inside anything, so no future branch
+    can swallow it either.
 
-
-def test_label_advantage_writes_under_quality_only():
-    """The sidecar write must not be nested inside the G2 gate's `else`.
-
-    It was, and the failure was silent in the worst way: a ``--quality_only`` fit skips the G2
-    gate (that gate bands by ``P(fail|s_t)`` and the survival head is untrained), and the write
-    went with it -- so the run printed every statistic, returned 0, and produced no
-    ``advantage.npz``.  A pipeline reading it then either refused or, if a previous run had left
-    one, trained on a STALE label with nothing anywhere saying so.
-
-    Checked structurally rather than by running the script, which needs a fitted
-    ``predictions.npz``: the ``np.savez`` must not be a descendant of the ``if quality_only``
-    statement in either direction.
+    Checked by AST rather than by running the script, which needs a fitted
+    ``predictions.npz``.
     """
     import ast
     import pathlib
 
     src = pathlib.Path(__file__).resolve().parents[3] / "scripts/flow_matching/label_advantage.py"
     tree = ast.parse(src.read_text())
-
-    def is_quality_only_test(node: ast.If) -> bool:
-        return isinstance(node.test, ast.Name) and node.test.id == "quality_only"
-
-    gates = [n for n in ast.walk(tree) if isinstance(n, ast.If) and is_quality_only_test(n)]
-    assert gates, "the `if quality_only:` gate is gone; re-check where the write sits"
+    main = next(n for n in tree.body
+                if isinstance(n, ast.FunctionDef) and n.name == "main")
 
     def saves(node) -> bool:
         return any(isinstance(c, ast.Attribute) and c.attr == "savez"
                    for c in ast.walk(node))
 
-    for gate in gates:
-        for branch, name in ((gate.body, "body"), (gate.orelse, "orelse")):
-            for stmt in branch:
-                assert not saves(stmt), (
-                    f"np.savez is inside the `if quality_only` {name}; a quality_only fit "
-                    "would write no advantage.npz while still returning 0")
-
-    # And it must actually still be there at all.
-    assert any(isinstance(n, ast.Attribute) and n.attr == "savez" for n in ast.walk(tree)), \
-        "label_advantage no longer writes a sidecar"
+    top = [s for s in main.body if saves(s)]
+    assert top, (
+        "no top-level np.savez in main(): either the write moved into a branch -- the bug this "
+        "test exists for -- or it is gone entirely")
+    nested = [n for n in ast.walk(main)
+              if isinstance(n, (ast.If, ast.For, ast.While, ast.Try))
+              and any(saves(s) for s in getattr(n, "body", []) + getattr(n, "orelse", []))]
+    assert not nested, (
+        f"np.savez is nested inside {[type(n).__name__ for n in nested]}; a branch that does "
+        "not run silently produces no advantage.npz")

@@ -226,23 +226,17 @@ def main() -> int:
 
         # --- 3. matched pairs, for a viewer ----------------------------------------
         if a.dump_pairs:
+            # NO difficulty match. This used to stratify the pairs by `p_fail` from the
+            # critic's survival head so a high- and a low-advantage chunk were compared at
+            # similar difficulty. That head is gone, and its obvious replacement is not a
+            # replacement: matching on V(s) conditions on the very quantity the advantage is
+            # built from (`A = G - V`), which would partly cancel the contrast the pairs exist
+            # to show -- the same reason `label_advantage`'s G2 gate was deleted rather than
+            # rebased onto V.
+            #
+            # TODO(pair-match): stratify on a difficulty proxy the critic does not produce --
+            # terrain class, or the course's own approach distance.
             pf = None
-            if a.predictions:
-                pr = dict(np.load(a.predictions))
-                # HELD-OUT ROWS ONLY. `fit_value` writes predictions OUT OF FOLD, so at
-                # `num_folds = 1` every training row carries a constant 0.0 -- and matching
-                # two chunks on that is matching on a fill value, which looks like a perfect
-                # match and controls for nothing. Restricting to `val | val_tile` is what
-                # makes "matched on p_fail" mean anything.
-                real = pr["val"].astype(bool) | pr["val_tile"].astype(bool)
-                pfa, _, phit = join({"episode_uid": pr["episode_uid"][real],
-                                     "replan_index": pr["replan_index"][real],
-                                     "advantage": pr["p_V_priv"][real],
-                                     "label": np.zeros(int(real.sum()), np.int8)},
-                                    uid, ridx)
-                pf = np.where(phit, pfa, np.nan)
-                print(f"[adv] p_fail available on {int(np.isfinite(pf).sum())} of {n} rows "
-                      f"(held-out only; train rows carry no out-of-fold prediction)")
             pairs = []
             # SPREAD THE CLIMBERS ACROSS DIFFICULTY. Taking the highest-advantage ones
             # returns a set that is entirely `p_fail = 0.000` -- the label's favourite

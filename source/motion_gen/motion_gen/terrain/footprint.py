@@ -68,6 +68,26 @@ class TileFootprint:
     x_max: float
     y_min_sized: float
     y_max_sized: float
+    # The same envelope over the TRAVERSAL frames only (``anchor_mask_t == 2``), i.e. the feet that
+    # are actually on the terrain. A flight has to carry those and nothing else; the whole-clip
+    # envelope also contains the approach and exit, which happen on the flat PLATFORMS.
+    #
+    # Sizing a flight from the whole clip is why the shipped stairs are as wide as they are: measured
+    # on the v6b build, the whole-clip union over a tile's 50 clips is 2.51 m median while the
+    # traversal-only union is 0.35 m (max 0.56). The difference is not the robot wandering -- one
+    # clip spans 0.61 m -- it is the 50 clips being laterally offset from each other by ~1 m on the
+    # platforms, which a staircase has no reason to span.
+    #
+    # ``None`` where a caller could not compute it (a library with no anchor mask); consumers then
+    # fall back to the whole-clip envelope, which is the safe direction.
+    tread_y_min_sized: float | None = None
+    tread_y_max_sized: float | None = None
+
+    def tread_envelope(self) -> tuple:
+        """``(lo, hi)`` a FLIGHT must span: the traversal feet if known, else the whole clip."""
+        if self.tread_y_min_sized is None or self.tread_y_max_sized is None:
+            return (self.y_min_sized, self.y_max_sized)
+        return (float(self.tread_y_min_sized), float(self.tread_y_max_sized))
 
     @property
     def width(self) -> float:
@@ -110,7 +130,9 @@ def foot_corners(pos: np.ndarray, quat_wxyz: np.ndarray) -> np.ndarray:
 
 
 def tile_footprint(ankle_pos: np.ndarray, ankle_quat: np.ndarray, terrain_id: int,
-                   n_clips: int, allowance: float = EGO_ANCHOR_ALLOWANCE_M) -> TileFootprint:
+                   n_clips: int, allowance: float = EGO_ANCHOR_ALLOWANCE_M,
+                   tread_pos: np.ndarray | None = None,
+                   tread_quat: np.ndarray | None = None) -> TileFootprint:
     """Reduce one tile's foot samples to an envelope.
 
     Args:
@@ -139,4 +161,10 @@ def tile_footprint(ankle_pos: np.ndarray, ankle_quat: np.ndarray, terrain_id: in
         y_min=y_min, y_max=y_max,
         x_min=float(corners[:, 0].min()), x_max=float(corners[:, 0].max()),
         y_min_sized=y_min - allowance, y_max_sized=y_max + allowance,
+        tread_y_min_sized=(None if tread_pos is None or len(tread_pos) == 0
+                           else float(foot_corners(tread_pos, tread_quat).reshape(-1, 3)[:, 1].min())
+                           - allowance),
+        tread_y_max_sized=(None if tread_pos is None or len(tread_pos) == 0
+                           else float(foot_corners(tread_pos, tread_quat).reshape(-1, 3)[:, 1].max())
+                           + allowance),
     )

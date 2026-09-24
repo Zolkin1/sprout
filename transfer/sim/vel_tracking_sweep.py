@@ -498,6 +498,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "sweep the geometry is identical, so the race tears the file silently "
                         "rather than failing to load.")
     p.add_argument("--providers", default="auto", help="onnxruntime providers.")
+    p.add_argument("--num_threads", type=int, default=8,
+                   help="onnxruntime intra-op threads. 0 is ORT's default of one per core, "
+                        "which on a 128-core shared box is a 254-thread process at 6000% CPU "
+                        "for a job whose heavy half runs on the GPU -- and it throttles "
+                        "itself: episodes measured at 40 s stretched past 4 minutes once the "
+                        "box was oversubscribed, this process being the largest contributor.")
     p.add_argument("--fall_height", type=float, default=0.2,
                    help="Pelvis clearance (m) above the scene's lowest terrain below which "
                         "the episode is a fall.")
@@ -682,6 +688,7 @@ def main() -> int:
         arm=0, label="veltrack", tracker_onnx=os.path.abspath(args.tracker_onnx),
         fm_onnx=os.path.abspath(args.fm_onnx), out_dir=args.out,
         providers=tuple(x.strip() for x in args.providers.split(",") if x.strip()),
+        num_threads=int(args.num_threads),
         fall_height=float(args.fall_height), fall_tilt_deg=float(args.fall_tilt_deg),
         cmd_hold_s=float(args.cmd_hold_s), steer_kp=float(args.steer_kp),
         steer_wz_max=float(args.steer_wz_max),

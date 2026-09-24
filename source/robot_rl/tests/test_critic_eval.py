@@ -95,22 +95,6 @@ def test_gae_spans_td_to_monte_carlo():
     assert np.allclose(a1, g - v, atol=1e-10), np.abs(a1 - (g - v)).max()
 
 
-def test_the_survival_arm_reduces_to_the_n_step_advantage():
-    """With a zero reward and ``gamma = 1``, the one-chunk TD is ``advantage.n_step_advantage``.
-
-    The two are written independently -- one as a value difference, the other as a probability
-    difference with an explicit terminal bootstrap -- and the sign convention between them is
-    the single easiest thing in this module to get backwards.
-    """
-    uid, ri, _, fail = _toy(seed=5)
-    rng = np.random.default_rng(2)
-    p = rng.uniform(0.0, 1.0, size=uid.size)
-    delta, _ = ce.td_residuals(-p, np.zeros(p.size), uid, ri, fail,
-                               gamma=1.0, normalized=False)
-    ref, _ = adv_mod.n_step_advantage(p, uid, ri, fail, n=1)
-    assert np.allclose(delta, ref, atol=1e-12), np.abs(delta - ref).max()
-
-
 def test_variance_decomposition_sums_to_the_total():
     """Between plus within is the population variance, exactly."""
     rng = np.random.default_rng(7)

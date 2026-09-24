@@ -105,16 +105,16 @@ FAMILIES: tuple[str, str, str] = ("flat", "boxes", "stairs")
 # ``tests/test_freeform_terrain.py`` loads the real file and fails if the two ever drift.
 
 #: Riser heights (m) the shipped clip library's stair tiles were generated on.
-TRAINED_RISERS: tuple[float, ...] = (0.13, 0.131, 0.15, 0.17)
+TRAINED_RISERS: tuple[float, ...] = (0.130, 0.1312, 0.1381, 0.155, 0.180)
 #: Every trained tread (m), ascending and descending pooled.
-TRAINED_TREADS: tuple[float, ...] = (0.178, 0.19, 0.209, 0.22, 0.221, 0.25, 0.28)
+TRAINED_TREADS: tuple[float, ...] = (0.1899, 0.2092, 0.280, 0.305, 0.330)
 #: The ASCENDING half.  Up and down flights used different tread sets, so a flight drawing from
 #: the pooled set would put a descending tread under an ascending flight -- a pair no tile has.
-TRAINED_TREADS_UP: tuple[float, ...] = (0.209, 0.22, 0.221, 0.25, 0.28)
+TRAINED_TREADS_UP: tuple[float, ...] = (0.2092, 0.280, 0.305, 0.330)
 #: The DESCENDING half.  Stated in ``generate_stairs_scene``'s ``TRAINED_TREADS`` comment rather
 #: than exported as its own constant; the test pins ``set(UP) | set(DOWN) == set(TRAINED_TREADS)``
 #: so a change to either side of the split cannot land on one file only.
-TRAINED_TREADS_DOWN: tuple[float, ...] = (0.178, 0.19, 0.22, 0.25)
+TRAINED_TREADS_DOWN: tuple[float, ...] = (0.1899, 0.280, 0.305, 0.330)
 #: Jump-on / jump-off box heights (m), a 0.05 grid over the library's measured 0.25-0.75 range.
 TRAINED_BOX_HEIGHTS: tuple[float, ...] = (0.25, 0.30, 0.35, 0.40, 0.45,
                                           0.55, 0.60, 0.65, 0.70, 0.75)
@@ -513,27 +513,21 @@ def _riser_slab(x0: float, x1: float, cy: float, width: float, top_z: float) -> 
     return _overlay((x0 + x1) / 2.0, cy, 0.0, max(x1 - x0, 1e-3), width, top_z)
 
 
-# ---------------------------------------------------------------------------------------------
-# The route: one straight ray per section
-# ---------------------------------------------------------------------------------------------
-#: The fields every section's ``route`` block declares, in the TILE-LOCAL CORNER frame, and the
-#: exact set the RL side reads (``mdp.events.resets.FREEFORM_ROUTE_FIELDS``).  Lengths in metres,
-#: angles in radians; ``x`` is downrange within the tile's own ``frame_yaw`` and ``y`` lateral.
+#: The route fields every free-form tile declares, mirrored by the RL side's
+#: ``mdp.events.resets.FREEFORM_ROUTE_FIELDS`` and pinned equal by a test.
 #:
-#: * ``start_x`` / ``start_y`` -- where the robot spawns.
-#: * ``start_z`` -- the WALKABLE SURFACE there, not a base height: the top of the start platform.
-#:   0.0 on flat and boxes; on stairs it follows from the geometry rule that offsets the whole
-#:   structure so its LOWEST platform top sits at z = 0.
-#: * ``start_yaw`` -- the route's heading relative to the tile frame.  0.0 = straight down the
-#:   section; non-zero is how the boxes family produces an angled approach to an axis-aligned box.
-#: * ``goal_x`` -- the downrange goal line: past it, the section has been walked.
-#: * ``goal_y`` / ``goal_half_width`` -- the goal band's lateral centre and half-extent.
-#:
-#: ``goal_z`` is emitted too, beyond this tuple: the walkable surface at the goal, which is the
-#: last platform's top on a descending or climbing stairs section.  The RL table reads only the
-#: seven, so the extra key costs it nothing.
+#: ``goal_z`` joined them in 2026-09: it was written into every manifest from the start and
+#: read by NOBODY, because ``freeform_route`` returns exactly this tuple -- so both height
+#: consumers fell back to zero and scored every goal at the tile floor.
 ROUTE_FIELDS: tuple[str, ...] = (
     "start_x", "start_y", "start_z", "start_yaw", "goal_x", "goal_y", "goal_half_width",
+    # `goal_z` is the walkable surface at the goal, and it is a FIELD rather than an extra
+    # because both consumers need it and neither could get it: `freeform_route` builds its
+    # dict from this tuple alone, so their `route.get("goal_z")` read `None` on every library
+    # ever built and silently fell back to zero -- scoring every goal as though it sat at the
+    # tile's own floor. Invisible wherever a traverse ends on the ground (the box and
+    # up-into-down courses, where zero IS the answer) and fatal the moment one does not.
+    "goal_z",
 )
 
 #: Floor on a goal band's half-width (m).  The band is otherwise half the WALKABLE surface at the
@@ -712,8 +706,8 @@ def _route(start_xy: tuple[float, float], start_z: float, start_yaw: float,
             library needs regenerating to keep working.
 
     Returns:
-        The route dict, carrying :data:`ROUTE_FIELDS` plus ``goal_z`` and, when given,
-        ``spawn_areas``.  The consuming table reads only :data:`ROUTE_FIELDS` and ignores
+        The route dict, carrying :data:`ROUTE_FIELDS` and, when given,
+        ``spawn_areas``.  The consuming table reads :data:`ROUTE_FIELDS` and ignores
         extra keys, which is what lets a list ride inside a block of scalars.
     """
     out = {"start_x": float(start_xy[0]), "start_y": float(start_xy[1]),

@@ -18,11 +18,23 @@ offline while the motion stays exactly as recorded, which is what the passes her
 - **Grow in place, never re-centre**: `size_y` is the bounding box of the tile's CLIPS' lateral
   travel, not of its flight, so `size_y / 2` is where the motion wandered and the flight sits off it
   by a median 0.149 m.
+- **Stair flights land in a 4-8 ft band** (`min_tread_m` 1.219 / `max_tread_m` 2.438), because that
+  is what real stairwells are. The flight is sized from the TRAVERSAL foot envelope
+  (`anchor_mask_t == 2`), never the whole clip's: measured on v6b those are 1.05 m and 2.53 m median
+  per tile, and the difference is the approach and exit wandering ~1 m BETWEEN clips on the flat
+  PLATFORMS. Sizing a flight from the whole clip is what made the shipped stairs 0.80-5.47 m wide.
+  Platforms still answer to the whole-clip envelope -- they do carry that wander.
 - The **decoration channel is VISUAL ONLY** and lives on its own prim (`decor.DECOR_PRIM_PATH` =
   `/World/decor`), which the depth cameras cast against and physics ignores. It is the one thing that
-  changes what the robot SEES without changing what it stands on. Walls ring the RENDERED FLOOR
-  rather than the manifest tile, up to four per tile, and the flat tiles get rooms
-  (`test_wall_footprint.py`, `test_decor_prim_is_mandatory.py`).
+  changes what the robot SEES without changing what it stands on.
+- **Walls and flat rooms are OFF in the BASE GEOMETRY**, and that is a build-time decision, not a
+  render-time one: the pass still exists (walls ring the RENDERED FLOOR rather than the manifest
+  tile, up to four per tile; flat tiles get rooms; `test_wall_footprint.py` and
+  `test_decor_prim_is_mandatory.py` pin both), but the build driver passes `--no_walls
+  --flat_room_variants 0`, so nothing authors them. Nothing in this stack avoids obstacles, so a
+  wall is only ever something to be misread as a box -- which is the live hardware symptom. Putting
+  them back is a driver flag, not a rewrite. The floating steps and voids are unaffected: they come
+  from the GENERATOR (`stair_float_frac`, `stair_floor_frac`), not from decoration.
 - **The RL TEACHER renders none of it** (`ClipTerrainImporterCfg.render_decor`, default `True`, set
   `False` on `G1TeacherTerrainSceneCfg`) -- nothing in this stack avoids obstacles, so walls and
   rooms teach the tracker nothing while costing render time and depth pixels over ~12k iterations.

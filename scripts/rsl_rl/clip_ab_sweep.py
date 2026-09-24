@@ -274,16 +274,59 @@ def stage_isaac(args, ids: list[int], out: pathlib.Path) -> int:
         print(f"[isaac] IGNORED {stale} -- older than this run, i.e. left by a previous one.")
     if rc != 0:
         print(f"[isaac] FAILED -- see {log_path}")
-    elif "tracking_per_env.csv" not in got:
+        return rc
+    if "tracking_per_env.csv" not in got:
         print("[isaac] WARNING: no fresh tracking_per_env.csv, so the Isaac distribution "
               "will be empty. Either play_plots did not run, or it predates the per-env "
               "columns.")
+    _snapshot_export_for_mujoco(args, out, started)
     return rc
+
+
+def _snapshot_export_for_mujoco(args, out: pathlib.Path, started: float) -> None:
+    """Pin the ONNX export this Isaac run just produced, for MuJoCo to replay.
+
+    Without this the two halves can silently run DIFFERENT policies: ``play.py`` re-exports
+    ``<run>/exported/`` on every rollout, while the MuJoCo side loads a hand-made run dir
+    (``--mj_run``) that nothing ties to ``--checkpoint``. They happened to agree once; a
+    checkpoint bump is all it takes to break it, and the comparison would still produce a
+    plausible table.
+
+    So: take the export this run wrote (mtime-checked, like the stats) and copy it into a run
+    dir named after this sweep, which :func:`mujoco_argv` then loads. Both sims are now
+    provably the same weights.
+    """
+    src = REPO / "logs" / "rsl_rl" / "g1" / args.teacher_run / "exported"
+    dst_run = REPO / "logs" / "rsl_rl" / "g1" / f"clip_ab_{out.name}"
+    dst = dst_run / "exported"
+    needed = ("policy.pt", "policy_parameters.yaml", "tracker.onnx")
+    fresh = [n for n in needed if (src / n).is_file() and (src / n).stat().st_mtime >= started]
+    if len(fresh) != len(needed):
+        print(f"[isaac] WARNING: {src} has no fresh {[n for n in needed if n not in fresh]}; "
+              f"MuJoCo will fall back to --mj_run {args.mj_run!r}, which is NOT tied to "
+              "--checkpoint. Verify the two by hand before trusting the comparison.")
+        return
+    dst.mkdir(parents=True, exist_ok=True)
+    for n in needed:
+        shutil.copyfile(src / n, dst / n)
+    args.mj_run = dst_run.name
+    print(f"[isaac] pinned this run's export -> {dst_run.name} (MuJoCo will replay the SAME "
+          f"weights as {args.checkpoint})")
 
 
 def stage_mujoco(args, ids: list[int], out: pathlib.Path) -> int:
     """Run every clip through MuJoCo, up to ``--jobs`` at a time."""
     sim_dir = REPO / "transfer" / "sim"
+    # Prefer the export the isaac stage pinned for this sweep; it is the only run dir tied to
+    # --checkpoint. Falling back to --mj_run is allowed (running the halves separately is a
+    # feature) but is exactly where the two sims can drift onto different weights, so say so.
+    pinned = REPO / "logs" / "rsl_rl" / "g1" / f"clip_ab_{out.name}" / "exported" / "tracker.onnx"
+    if pinned.is_file():
+        args.mj_run = pinned.parent.parent.name
+    else:
+        print(f"[mujoco] using --mj_run {args.mj_run!r}: NOT tied to --checkpoint "
+              f"{args.checkpoint!r}. Run --stage isaac first (it pins its own export) or "
+              "confirm by hand that this run dir holds the same weights.")
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(
         [str(REPO / "source" / "robot_rl"), str(REPO / "source" / "motion_gen"),
          str(REPO), os.environ.get("PYTHONPATH", "")])}
@@ -357,23 +400,64 @@ def collect_isaac(out: pathlib.Path, ids: list[int]) -> dict[str, np.ndarray]:
     return cols
 
 
+#: Isaac's ``base_fallen`` thresholds (``G1TrackerRewardCfg``'s termination params). MuJoCo's
+#: own ``Robot.failed()`` is ``qpos[2] < 0.2`` -- height only, at less than half this height,
+#: and with NO orientation check -- so a robot pitched past 70 degrees or sagging to 0.3 m
+#: counts as surviving there while Isaac Lab has already terminated it. Scoring each sim by
+#: its own rule made MuJoCo look BETTER than Isaac (99 vs 91 on one checkpoint); rescoring
+#: MuJoCo by this rule puts it at 68. Success is the headline number, so it has to be the
+#: same predicate on both sides.
+FALL_MIN_HEIGHT = 0.5
+FALL_TILT_RAD = math.radians(70.0)
+
+
+def _mujoco_success(csv_path: pathlib.Path) -> float:
+    """Did this MuJoCo rollout survive, judged by ISAAC's fall criterion?
+
+    Recomputed from the logged trajectory rather than read from ``survival.survived``,
+    because that flag is the runner's much more lenient height-only test.
+
+    Args:
+        csv_path: The run's ``sim_log.csv``.
+
+    Returns:
+        1.0 survived, 0.0 fell, ``nan`` if the columns are missing.
+    """
+    with open(csv_path) as f:
+        rows = list(csv.reader(f))
+    if len(rows) < 2:
+        return float("nan")
+    head, data = rows[0], np.array(rows[1:], dtype=float)
+    try:
+        z = data[:, head.index("base_z")]
+        roll = data[:, head.index("act_roll")]
+        pitch = data[:, head.index("act_pitch")]
+    except ValueError:
+        return float("nan")
+    fell = ((z < FALL_MIN_HEIGHT) | (np.abs(roll) > FALL_TILT_RAD)
+            | (np.abs(pitch) > FALL_TILT_RAD))
+    return float(not bool(np.nan_to_num(fell, nan=0.0).any()))
+
+
 def collect_mujoco(out: pathlib.Path, ids: list[int]) -> dict[str, np.ndarray]:
-    """Per-clip MuJoCo metrics from each run's ``metrics_summary.json``."""
-    keep, rows = [], []
+    """Per-clip MuJoCo metrics from each run's ``metrics_summary.json`` (+ its CSV)."""
+    keep, rows, succ = [], [], []
     for cid in ids:
-        p = out / "mj" / f"clip_{cid:05d}" / "metrics_summary.json"
+        run = out / "mj" / f"clip_{cid:05d}"
+        p = run / "metrics_summary.json"
         if not p.is_file():
             continue
         try:
             rows.append(json.loads(p.read_text()))
-            keep.append(cid)
         except json.JSONDecodeError:
             continue
+        keep.append(cid)
+        csv_path = run / "sim_log.csv"
+        succ.append(_mujoco_success(csv_path) if csv_path.is_file() else float("nan"))
     if not rows:
         return {}
     cols: dict[str, np.ndarray] = {"clip_id": np.asarray(keep, dtype=float)}
-    surv = [_dotted(r, "survival.survived") for r in rows]
-    cols["success"] = np.array([np.nan if s is None else float(bool(s)) for s in surv])
+    cols["success"] = np.asarray(succ, dtype=float)
     for name, _isaac, mj_key in COMPARED:
         pick = mj_key if callable(mj_key) else (lambda r, k=mj_key: _dotted(r, k))
         vals = [pick(r) for r in rows]
@@ -574,16 +658,27 @@ def main() -> int:
         ids = choose_clips(REPO / args.lib, args.clips, args.seed, args.min_clip_len)
         ids_path.write_text(json.dumps(ids))
         print(f"[setup] drew {len(ids)} clips (seed {args.seed}) -> {ids_path}")
-    # The manifest is the record of what made the two runs comparable.
-    (out / "manifest.json").write_text(json.dumps({
-        "task": TASK, "library": args.lib, "clips": ids, "seed": args.seed,
-        "teacher_run": args.teacher_run, "checkpoint": args.checkpoint,
-        "fm_checkpoint": args.fm_checkpoint, "mj_run": args.mj_run,
-        "robot": args.robot, "scene": args.scene,
-        "isaac_max_steps": args.max_steps, "mujoco_seconds": args.clip_seconds,
-        "matched": {"start_step": 0, "ego_anchor_every": 1, "ego_anchor_fraction": 1.0,
-                    "reference_source": "clip", "generator": "off"},
-    }, indent=2))
+    # The manifest is the provenance record, so it is written ONCE, at creation, and never
+    # rewritten. A later `--stage report` used to overwrite it with whatever the defaults
+    # were by then -- which silently mis-stated the checkpoint of a finished run. The one
+    # file whose job is to say what ran must not be the one that lies about it.
+    man_path = out / "manifest.json"
+    if not man_path.is_file():
+        man_path.write_text(json.dumps({
+            "task": TASK, "library": args.lib, "clips": ids, "seed": args.seed,
+            "teacher_run": args.teacher_run, "checkpoint": args.checkpoint,
+            "fm_checkpoint": args.fm_checkpoint, "mj_run": args.mj_run,
+            "robot": args.robot, "scene": args.scene,
+            "isaac_max_steps": args.max_steps, "mujoco_seconds": args.clip_seconds,
+            "matched": {"start_step": 0, "ego_anchor_every": 1, "ego_anchor_fraction": 1.0,
+                        "reference_source": "clip", "generator": "off"},
+        }, indent=2))
+    else:
+        prior = json.loads(man_path.read_text())
+        if prior.get("checkpoint") != args.checkpoint:
+            print(f"[setup] NOTE: this run dir was created for checkpoint "
+                  f"{prior.get('checkpoint')!r}; you passed {args.checkpoint!r}. The manifest "
+                  "keeps the original. Use a fresh --out for a different checkpoint.")
 
     rc = 0
     if args.stage in ("all", "isaac"):

@@ -170,12 +170,15 @@ _ASINH_SCALE: float = 0.01
 def _load_urdf_with_collision(urdf_path: str):
     """Load the URDF with BOTH scenes, so the collision primitives can be shown.
 
-    ``viz.robot.load_urdf`` builds only the visual scene, which is right for every other
-    viewer -- but here the collision geometry is the point: the collider samples come from
-    exactly those primitives, so being able to overlay the two is how you confirm the
-    sampling sits on the robot rather than near it.  Loaded here rather than by widening the
-    shared helper, whose docstring turns on the visual scene being shared between many
-    ``ViserUrdf`` instances.
+    Every other viewer wants the visual scene alone, but here the collision geometry is the
+    point: the collider samples come from exactly those primitives, so being able to overlay
+    the two is how you confirm the sampling sits on the robot rather than near it.
+
+    This used to call ``yourdfpy`` directly rather than widen the shared helper, and that cost
+    it the helper's geometry-name fix -- three fixed-joint meshes rendered metres off the
+    robot.  It goes through ``viz.robot.load_urdf`` now; the sharing contract in that
+    docstring is about reusing ONE loaded URDF across many ``ViserUrdf`` instances, which this
+    viewer does too.
 
     Args:
         urdf_path: The URDF to load.
@@ -183,19 +186,8 @@ def _load_urdf_with_collision(urdf_path: str):
     Returns:
         A ``yourdfpy.URDF`` with a collision scene built.
     """
-    import os as _os                                                        # noqa: PLC0415
-    from functools import partial                                           # noqa: PLC0415
-
-    import yourdfpy                                                         # noqa: PLC0415
-    return yourdfpy.URDF.load(
-        urdf_path,
-        build_scene_graph=True,
-        build_collision_scene_graph=True,
-        load_meshes=True,
-        load_collision_meshes=True,
-        filename_handler=partial(yourdfpy.filename_handler_magic,
-                                 dir=_os.path.dirname(urdf_path)),
-    )
+    from robot_rl.flow_matching.viz.robot import load_urdf                   # noqa: PLC0415
+    return load_urdf(urdf_path, with_collision=True)
 
 
 class TerrainRewardScene:

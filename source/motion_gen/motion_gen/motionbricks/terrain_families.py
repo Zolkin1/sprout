@@ -23,16 +23,40 @@ SEES, and they are deliberately different:
   walks the robot into the box at full speed (measured: arrives at 1.14 m/s where the replay's entry
   frame is at 0.11).  Releasing that root pin near the boundary does not fix it; the deceleration has to
   be prescribed.  It is derived per clip from the chosen reference, and never leaves the generator.
-* The RL / flow-matching command is what a USER or PLANNER would ask for: one steady velocity, ignorant
-  of the terrain.  Adapting it to the terrain is the flow model's job, and the FM can only learn that if
-  the clips pair a terrain-agnostic command with a terrain-aware motion.
+* The RL / flow-matching command is what a USER or PLANNER would ask for, ignorant of the terrain.
+  Adapting it to the terrain is the flow model's job, and the FM can only learn that if the clips pair
+  a terrain-agnostic command with a terrain-aware motion.
 
-So a family carries no "what does the RL see over the replay" knob -- that is one constant per clip,
-written by :mod:`scripts.rsl_rl.mb_terrain_clips`.
+That second command is a SCHEDULE, not a constant, and the traversal is where it matters most. The
+motion there is one fixed solved replay, so a clip that only ever commands that replay's own speed
+shows the generator a command and a motion that always agree -- from which it cannot learn that a
+command SELECTS a reference, which is most of what it has to do on terrain. So several commands play
+over one replay, and none of them changes the motion.
+
+The constraint is CONSISTENCY, not agreement: every command must be one for which
+``terrain_place.select_terrain_reference`` would return THIS reference -- inside its Voronoi cell,
+computed by ``terrain_place.terrain_speed_cell`` from the selector's own two stages. Outside it the
+command points at a different solved motion, which teaches the opposite lesson. On a stair tile whose
+solved speeds are {0.31, 0.69} the cells split at 0.50, so a clip playing 0.69 may legitimately be
+commanded 2.6; where a geometry has only one solved speed the cell is unbounded and only the family's
+band binds. The cell narrows as the solved library gains speeds, which is the right direction -- the
+freedom to disagree shrinks exactly as the reason for it does.
+
+So a family still carries no "what does the RL see over the replay" knob: the schedule is authored by
+:mod:`scripts.rsl_rl.mb_terrain_clips`, where the reference -- and therefore the cell -- is chosen.
+
 
 This module is numpy-only (no torch, no Motion Bricks, no IsaacLab imports) so it loads in the Motion
 Bricks conda env as well as in ``env_isaaclab`` -- the terrain plan (:mod:`.terrain_plan`) is built on one
 side and consumed on the other.
+
+
+
+The LEAD-UP stays forward-only by decision, not omission: diagonal and yawing approaches were scoped
+and dropped (2026-09-09), because the traversal already carries the lateral and yaw commands the
+generator needs to learn to ignore. See the note in ``mb_plan_library._rl_holds`` for why arrival
+geometry was never the obstacle.
+
 """
 
 from __future__ import annotations
@@ -275,7 +299,7 @@ def episodic_boundaries(n_frames: int) -> tuple[int, int]:
     return 0, n_frames - 1
 
 
-def pick_boundary(gate: BoundaryGate, *, prefer: str = "first") -> int:
+def pick_boundary(gate: BoundaryGate, *, prefer: str = "first", rng=None) -> int:
     """Choose ONE frame from a candidate gate -- the hand-picked hard-pin frame.
 
     ``prefer="first"`` takes the earliest candidate: for an ENTRY that is the earliest clean hand-off in
@@ -283,6 +307,13 @@ def pick_boundary(gate: BoundaryGate, *, prefer: str = "first") -> int:
     arrival on the far surface (the traversal stops as soon as it has landed, never stepping onto a
     phantom tread past the tile).  ``prefer="last"`` takes the latest, ``prefer="middle"`` the median
     candidate (a phase in the interior of the window, away from both edges).
+
+    ``prefer="sample"`` draws uniformly from the candidates using ``rng``, and is what an ENTRY should
+    use.  The entry frame IS the gait phase at which the approach hands over to the terrain, and it is
+    an input we choose, not something recovered afterwards -- with a fixed preference every clip sharing
+    a reference enters at the identical phase, so the teacher and the flow-matching model only ever see
+    one hand-off pose out of the whole gate.  The gate has already filtered the candidates down to
+    frames that stand on a tread with the swing foot clear, so any of them is a legal entry.
     """
     if gate.frames.size == 0:
         raise ValueError(f"no boundary candidates to pick from ({gate.reason})")
@@ -292,4 +323,8 @@ def pick_boundary(gate: BoundaryGate, *, prefer: str = "first") -> int:
         return int(gate.frames[-1])
     if prefer == "middle":
         return int(gate.frames[gate.frames.size // 2])
-    raise ValueError(f"unknown boundary preference {prefer!r} (first | last | middle)")
+    if prefer == "sample":
+        if rng is None:
+            raise ValueError("prefer='sample' needs an rng")
+        return int(gate.frames[int(rng.integers(0, gate.frames.size))])
+    raise ValueError(f"unknown boundary preference {prefer!r} (first | last | middle | sample)")

@@ -107,7 +107,11 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     """
 
     num_steps_per_env = 24
-    max_iterations = 10000
+    # 20000, which is what the tracker that every result on disk was measured with actually ran
+    # (`2026-08-20_16-36-10_mode11_decor_plan_v1`). The repo said 10000 and that run passed
+    # `--max_iterations 20000` on the command line, so the pairing lived only in a shell
+    # history -- and a naive re-launch trained for half as long with nothing saying so.
+    max_iterations = 20000
     # A checkpoint is ~98 MB, so this is the dominant consumer of log storage: at the old
     # 200 a full run wrote ~10 GB and the archive had reached 3500 checkpoints / 92 GB.
     # 400 halves that while keeping the exposure on a crash under an hour (~55 min at the

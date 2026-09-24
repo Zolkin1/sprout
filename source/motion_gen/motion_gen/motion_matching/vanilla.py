@@ -356,6 +356,17 @@ class VanillaMatcher:
         return torch.cdist(self._norm, d,
                            compute_mode="donot_use_mm_for_euclid_dist").min(dim=1).values.detach().cpu().numpy()
 
+    def solve_bytes(self, T: int) -> int:
+        """Peak PRIVATE bytes one :meth:`generate` call needs, for sizing a fork pool.
+
+        Everything large -- the DB features, ``_norm``, the KD-tree -- is read-only and inherited by
+        fork, so it costs the pool one copy and is not counted.  The greedy search keeps no
+        per-(frame, step) table at all: it queries the shared tree and carries ``O(T)`` path state,
+        so a solve's own writes are small and roughly flat in the DB size.  :class:`~.dp.DPMatcher`
+        overrides this with a figure thousands of times larger, which is the whole reason the pool
+        width is asked of the matcher rather than assumed."""
+        return int((128 << 20) + 4096 * T)
+
     def _precompute_regime(self, target: np.ndarray, ramp_s: float) -> np.ndarray:
         """Smoothed steady/transition signal in ``[0,1]`` (1 = steady), ramped over ``ramp_s``
         seconds around command changes (a ramp keeps it ~0 throughout; a jump dips it ~ramp_s
@@ -494,6 +505,10 @@ class VanillaMatcher:
         """Greedy match against ``command(t_seconds) -> (vx, vy, omega)``, then play the
         selected path.  Returns world ``(root_pos[T,3], root_quat[T,4] wxyz, joints[T,21])``."""
         frame_path, jumped = self._select_path(command, T)
+        # Part of the shared output contract (`generate` / `dbg` / `src_names` / `n_cuts`) that
+        # DPMatcher's docstring already claims for all three matchers -- vanilla was the one that
+        # never set it, so a caller reading it via getattr(..., 0) recorded a plausible ZERO.
+        self.n_cuts = int(sum(jumped))
         root_pos, root_quat, joints, dbg = play_frame_path(
             frame_path, jumped, self, self.cfg, debug=debug)
         self.dbg = dbg

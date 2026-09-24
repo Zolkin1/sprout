@@ -56,6 +56,8 @@ def _row(**over):
         "max_goal_downrange_m": 0.0,
         "goal_pos_w_x": 0.0, "goal_pos_w_y": 0.0, "goal_pos_w_z": 0.0,
         "goal_frame_yaw": 0.0, "spawned_in_goal": 0, "goal_travel_m": 5.0,
+        # Ground level, which is what every synthetic row here means by "it spawned".
+        "spawn_base_z_w": 0.0,
     }
     base.update(over)
     return {k: np.asarray([v]) for k, v in base.items()}

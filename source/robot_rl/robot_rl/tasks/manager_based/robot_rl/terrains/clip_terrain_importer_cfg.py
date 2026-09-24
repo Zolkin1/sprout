@@ -110,7 +110,23 @@ class ClipTerrainImporterCfg(TerrainImporterCfg):
     """Void gap (m) between replica strips along y."""
 
     size_margin: float = 1.0
-    """Extra flat (m) added to the terrain / transition footprints."""
+    """Extra flat (m) added to the terrain / transition footprints.
+
+    Kept at 1.0 for now, and that is load-bearing rather than lazy: ``decorate.py`` resolves
+    walls OFFLINE into absolute manifest positions against
+    ``class_footprints(manifest, size_margin=...)``, and ``clips/g1_mb_v5_body_mode11_decor.h5``
+    was decorated at 1.0. Raising this without re-running ``decorate_terrain.py`` puts every wall
+    ~14 m inside the floor it is meant to bound -- and ``test_wall_footprint.py`` would NOT catch
+    it, because it compares ``class_footprints`` against ``_class_fp`` (two constants) rather than
+    against the library. See ``assemble_clip_terrain``'s wall-footprint guard.
+
+    The case for a much larger value (fm-reference-window used 15.0 here and for
+    :attr:`flat_buffer`): a rollout that drifts off its reference reaching the tile edge is a
+    termination that looks exactly like a tracking failure, so a too-small margin silently
+    converts "wandered" into "fell" in every survival number. 15 m covers ~5 s of drift at the
+    library's top commanded speed. That argument is sound and unresolved -- but the sweep is
+    confounded (changing the margin moves every env origin), so the prerequisite is a
+    ``base_off_tile`` termination that makes off-mesh observable. TODO(tile-margin)."""
 
     flat_buffer: float = DEFAULT_FLAT_BUFFER
     """Flat-tile margin (m) on each side beyond the flat clips' bbox.

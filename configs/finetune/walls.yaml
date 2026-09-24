@@ -1,0 +1,80 @@
+# Copyright 2026 Zachary Olkin. All rights reserved.
+#
+# CONFIG 5: THE WALL FIELD. Enclosed rooms, walls to be IGNORED, and a goal to STOP in.
+#
+# The question this config exists to answer: can the generator be taught to stop reading a
+# vertical face as a climbable box, and to halt in front of one rather than walking into it?
+# Those are the two live hardware symptoms, and neither is a planning failure -- the root
+# CLAUDE.md is explicit that nothing in this stack avoids obstacles and that walking AT a wall
+# is partly correct behaviour. What is a real fault is planning a JUMP at one.
+#
+# So every goal is reachable in a STRAIGHT LINE without crossing a wall: the policy is never
+# asked to route around anything, because it has no machinery to. `wall_field` enforces that as
+# a hard constraint of the draw (a 1.10 m protected corridor, sized for the ARM sweep rather
+# than the torso) instead of as a reward term.
+#
+# HALF THE TILES put the goal 0.5-1.5 m in front of the room's far wall. That is the stopping
+# drill; the rest place it in open floor so the two cases can be reported apart. NOTE they also
+# differ in route bearing -- the bearing is clamped by the room's width and the two goal kinds
+# reserve different lateral clearance -- so the near-wall half is steered slightly harder.
+#
+# THIS IS THE ONLY COURSE WITH A DIFFERENT SUCCESS RULE. Every other arm is traverse-and-exit
+# (cross a downrange line, episode ends). Here the robot must hold a 2 m-diameter disc for 5 s,
+# upright. Its success number is therefore NOT comparable with boxes / updown / indist / multi
+# and must not be put in the same table.
+name: walls
+# The dedicated task, NOT the plain freeform one: it is the only task that switches the
+# range-driven approach controller on (`G1WallsFinetuneEnvCfg`), which is what makes stopping a
+# behaviour the reward can pay for rather than one it penalises. See that class for why, and
+# `test_freeform_approach_defaults_off.py` for the guarantee that no other course is touched.
+task: G1-teacher-clf-terrain-depth-finetune-walls
+clip: clips/ft_walls_train.h5
+goals: logs/ft_walls/goal_regions.json
+
+# The single-terrain numbers (2000 / 500), matching boxes and updown: one family, one tile
+# type, so the buffer does not have to cover four distributions the way `multi` does.
+buffer: 2000
+refresh: 500
+iters: 5
+# 24 tiles x 86 replica rows = 2064 spawn slots, one per env. See G1WallsFinetuneEnvCfg for why
+# the rows matter here in a way they do not on the other courses: a wall tile declares ONE small
+# spawn rectangle inside a room, where co-located envs would interpenetrate at reset.
+num_envs: 2048
+
+# NO BALLAST, matching boxes / updown / indist. Ballast anchors the generator to its own
+# pre-training distribution and only `multi` carries it; adding it here would confound the
+# first look at whether the course does anything at all.
+ballast_chunks: 0
+ballast_flat_frac: 0.0
+ballast_rollout: ""
+tiles_walls: 24
+tiles_boxes: 0
+tiles_updown: 0
+tiles_indist: 0
+tiles_entry_stairs: 0
+
+# INERT HERE, and stated only because the loader requires the full key set in both directions
+# (an unknown key is a typo, a missing one would take a default the file exists to state). The
+# tile counts above are what decide whether any of this is read; at 0 boxes and 0 updown none
+# of it is. The WALL geometry is deliberately not here -- `make_walls_terrain.py` owns it and
+# stamps it into the library's own generator_config, so there is one declaration of it.
+updown_cells: []
+updown_measured_cells: []
+updown_measured_frac: 0.0
+updown_steps_range: [1, 10]
+updown_width_range_m: [1.219, 3.048]
+updown_platform_range_m: [1.50, 3.00]
+updown_wall_height_range_m: [1.2, 2.4]
+boxes_per_tile_range: [1, 2]
+box_height_range_m: [0.25, 0.75]
+box_depth_range_m: [0.45, 1.40]
+box_width_range_m: [1.20, 4.00]
+box_gap_range_m: [1.50, 4.00]
+
+# The band the WALL LIBRARY declares (motion_gen.terrain.wall_field), restated here because the
+# loader requires it. [0.4, 2.5] is what boxes / updown / indist / multi all run, so a wall arm
+# and a box arm are commanded the same way. With the approach controller on it is a CRUISE
+# CEILING rather than an arrival speed: the command decays to the 0.3 m/s floor and then to zero
+# inside the goal disc regardless of what was drawn.
+commanded_speed_range_mps: [0.4, 2.5]
+seed: 0

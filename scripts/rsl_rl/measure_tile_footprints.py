@@ -73,17 +73,29 @@ def measure(clip_path: str, max_clips_per_tile: int | None) -> list[TileFootprin
                 used = members[np.linspace(0, len(members) - 1,
                                            max_clips_per_tile).astype(int)]
             pos_all, quat_all = [], []
+            # The TRAVERSAL feet, kept separately. `anchor_mask_t == 2` marks the world-pinned
+            # terrain replay -- the frames whose feet are actually on the flight. Sizing a flight
+            # from the whole clip widens it to carry the approach and exit, which happen on the
+            # flat PLATFORMS and wander ~1 m between clips; see TileFootprint.tread_envelope.
+            tread_pos, tread_quat = [], []
+            has_mask = "anchor_mask_t" in f
             for c in used:
                 # clip_len bounds the real frames; the tail is padding that repeats the last
                 # sample, which would weight the envelope towards wherever the clip ended.
                 n = int(clip_len[c])
                 row = f["y_des"][int(c)][:n]
+                on_terrain = (np.asarray(f["anchor_mask_t"][int(c)][:n]) == 2) if has_mask else None
                 for body in ANKLES:
                     pcols, qcols = cols[body]
                     pos_all.append(row[:, pcols])
                     quat_all.append(row[:, qcols])
+                    if on_terrain is not None and bool(on_terrain.any()):
+                        tread_pos.append(row[on_terrain][:, pcols])
+                        tread_quat.append(row[on_terrain][:, qcols])
             fp = tile_footprint(np.concatenate(pos_all), np.concatenate(quat_all),
-                                tid, len(members))
+                                tid, len(members),
+                                tread_pos=(np.concatenate(tread_pos) if tread_pos else None),
+                                tread_quat=(np.concatenate(tread_quat) if tread_quat else None))
             out.append(fp)
             if len(used) < len(members):
                 print(f"[footprint]   tile {tid}: sampled {len(used)} of {len(members)} clips")

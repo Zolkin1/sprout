@@ -218,6 +218,175 @@ class RolloutWindowDataset(Dataset):
         return {name: int((lab == i).sum()) for i, name in enumerate(LABEL_NAMES)}
 
 
+class PretrainWindowAdapter(Dataset):
+    """Pre-training windows presented in the fine-tune's item shape.
+
+    The two recordings are the same thing assembled in different places -- ``recorded_*.h5``
+    keeps the raw ingredients and :class:`~robot_rl.flow_matching.dataset.FutureStateDataset`
+    builds the model-space window at load, while a rollout file stores it already built -- and
+    both end as the same four tensors in the same loss. So ballast from the pre-training set
+    needs the pre-training reader and a projection, not a converted file.
+
+    What the projection does:
+
+    * keeps ``state`` / ``history`` / ``extero`` / ``cmd_tokens``, which the two agree on --
+      both yield extero FLAT, because both end in ``online.build_extero_tokens``, which
+      returns ``(V, T*dim)`` and lets the model reshape internally;
+    * adds ``history_null``, which the fine-tune's loss takes per row and pre-training does not
+      record at all -- its own trainer draws a null mask from ``null_cond_prob`` instead. These
+      rows are marked as HAVING history, and the fine-tune's ``--null_prob`` dropout then
+      applies to them exactly as it does to the buffer's;
+    * drops ``p_ref`` / ``q_ref`` / ``anchor_mask`` / ``mask_frame_yaw_rel``, which belong to
+      pre-training's own terrain and mask losses and which the fine-tune never reads. They are
+      dropped rather than passed through because :class:`ConcatWindowDataset` requires the
+      parts to agree on their key set -- the collate reads one key set from the batch's first
+      row.
+
+    Attributes:
+        base: The wrapped pre-training dataset.
+    """
+
+    def __init__(self, base, path: str = "", label: "np.ndarray | None" = None,
+                 weight: "np.ndarray | None" = None) -> None:
+        """Wrap a pre-training dataset.
+
+        Args:
+            base: A :class:`FutureStateDataset` (or anything with its item shape).
+            path: The recording it came from, for error messages.
+            label: ``[len(base)]`` int8 label per row, or ``None``.  Present only to MIRROR
+                the buffer's key set; ballast is ungraded, so this is the null label.
+            weight: ``[len(base)]`` loss weight per row, or ``None``.  1.0 where the buffer
+                carries weights; ``None`` where it does not, since an unweighted mean already
+                treats a row as weight 1.
+        """
+        self.base = base
+        self.path = str(path)
+        self.label = None if label is None else np.asarray(label, dtype=np.int64)
+        self.weight = None if weight is None else np.asarray(weight, dtype=np.float64)
+        probe = base[0] if len(base) else {}
+        # `extero_shape` is the SOURCE RECORDING's per-window sensor geometry -- what
+        # `RolloutWindowDataset` reads off `f["extero"].shape[1:]` -- and NOT the item shape.
+        # The two are different things and conflating them is a live trap: the buffer's file
+        # rows are `(n_sensors, sensor_dim)` while its ITEMS are flat, because both datasets
+        # end in `online.build_extero_tokens`, which flattens. Comparing this field against an
+        # item shape reports a mismatch between two datasets that agree, and "fixing" that by
+        # reshaping the items breaks the collate for real.
+        self.extero_shape = (int(getattr(base, "extero_sensor_count", 1) or 1),
+                             int(getattr(base, "extero_sensor_dim", 0) or 0))
+        self.cmd_dim = int(probe["cmd_tokens"].shape[-1]) if "cmd_tokens" in probe else 0
+        self._has_cmd = "cmd_tokens" in probe
+
+    def __len__(self) -> int:
+        """Windows."""
+        return len(self.base)
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        """One window, projected onto the fine-tune's keys."""
+        src = self.base[i]
+        item = {"state": src["state"], "history": src["history"], "extero": src["extero"],
+                "history_null": torch.tensor(False)}
+        if self._has_cmd:
+            item["cmd_tokens"] = src["cmd_tokens"]
+        if self.label is not None:
+            item["advantage"] = torch.tensor(int(self.label[i]), dtype=torch.long)
+        if self.weight is not None:
+            item["weight"] = torch.tensor(float(self.weight[i]), dtype=torch.float64)
+        return item
+
+    def label_counts(self) -> dict[str, int]:
+        """Labels by name, for the run banner."""
+        if self.label is None:
+            return {}
+        return {name: int((self.label == i).sum()) for i, name in enumerate(LABEL_NAMES)}
+
+
+class ConcatWindowDataset(Dataset):
+    """Several :class:`RolloutWindowDataset` read as one, for BALLAST.
+
+    The fine-tune trains on the AWR buffer plus a fixed slice of the ORIGINAL pre-training
+    windows, and those live in a different file. Concatenating the FILES was the obvious
+    alternative and is the worse one: the join key downstream is ``(episode_uid,
+    replan_index)`` and a merge would have to renumber the ballast into a uid range no
+    iteration can ever reach, which is a correctness property nothing checks and one bad
+    offset makes a ballast window indistinguishable from a graded one. Keeping the files
+    apart makes the exclusion STRUCTURAL: ``fit_value`` and ``label_advantage`` are never
+    pointed at the ballast file, so it cannot enter the critic or the advantage however the
+    loop is wired.
+
+    Only what the fine-tune loop actually calls is proxied -- length, indexing and the label
+    banner. It is deliberately not a general concatenation: the parts must agree on the
+    model context, which is checked, because two window files from different checkpoints
+    would differ in window WIDTH and the mismatch would surface as a shape error inside a
+    worker rather than here.
+
+    Attributes:
+        parts: The datasets, in order.
+    """
+
+    def __init__(self, parts: "list[RolloutWindowDataset]") -> None:
+        """Hold the parts and index them end to end.
+
+        Args:
+            parts: One or more datasets. The first is the primary; its context defines what
+                the others must match.
+
+        Raises:
+            ValueError: If no part is given, if two parts disagree on the window geometry, or
+                if they emit different ITEM KEYS.
+        """
+        if not parts:
+            raise ValueError("a ConcatWindowDataset needs at least one part.")
+        first = parts[0]
+        for p in parts[1:]:
+            if (p.extero_shape, p.cmd_dim) != (first.extero_shape, first.cmd_dim):
+                raise ValueError(
+                    f"{p.path} holds extero {p.extero_shape} / cmd {p.cmd_dim} against "
+                    f"{first.path}'s {first.extero_shape} / {first.cmd_dim}. These are two "
+                    "different recordings and the mismatch would surface inside a worker.")
+            # THE KEY SETS, checked here because the collate cannot check them. `__getitem__`
+            # adds `advantage` and `weight` only when this dataset was GIVEN a label or a
+            # weight, and the trainer's collate takes its key set from the first item of the
+            # batch and indexes every other item with it. Two parts that disagree therefore
+            # fail in one of two ways depending on which row a shuffle happened to put first:
+            # a KeyError, or the extra key SILENTLY DROPPED for the whole batch. Neither names
+            # the cause, and the second changes what the model trains on without any error at
+            # all -- so the disagreement is refused here, at construction, where the fix is
+            # obvious.
+            if (p.label is None) != (first.label is None) or \
+                    (p.weight is None) != (first.weight is None):
+                def _keys(d):
+                    """The optional keys a part will emit."""
+                    return sorted(["advantage"] * (d.label is not None)
+                                  + ["weight"] * (d.weight is not None)) or ["(none)"]
+                raise ValueError(
+                    f"{p.path} emits optional keys {_keys(p)} against {first.path}'s "
+                    f"{_keys(first)}. Every part must be given a label if any is, and a "
+                    "weight if any is -- the collate reads one key set from the batch's "
+                    "first row, so a mismatch either raises or silently drops a key.")
+        self.parts = list(parts)
+        self._sizes = np.array([len(p) for p in self.parts], dtype=np.int64)
+        self._offsets = np.concatenate([[0], np.cumsum(self._sizes)])
+
+    def __len__(self) -> int:
+        """Windows across every part."""
+        return int(self._offsets[-1])
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        """One window, from whichever part holds index ``i``."""
+        if i < 0:
+            i += len(self)
+        k = int(np.searchsorted(self._offsets, i, side="right") - 1)
+        return self.parts[k][int(i - self._offsets[k])]
+
+    def label_counts(self) -> dict[str, int]:
+        """Labels across every part, for the run banner."""
+        out: dict[str, int] = {}
+        for p in self.parts:
+            for k, v in p.label_counts().items():
+                out[k] = out.get(k, 0) + v
+        return out
+
+
 def join_labels(sidecar: dict[str, np.ndarray], episode_uid: np.ndarray,
                 replan_index: np.ndarray) -> np.ndarray:
     """Expand a label sidecar onto every row of the window file, on ``(uid, replan)``.
