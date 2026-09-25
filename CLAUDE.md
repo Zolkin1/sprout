@@ -20,6 +20,8 @@ governs and loads when you work there:
 `README.md` is the stage-by-stage runbook. `scripts/flow_matching/FINETUNE.md` is the fine-tune
 runbook. `docs/claude_md_archive_2026-09-09.md` is the previous single-file version of all of this,
 kept verbatim -- reach for it when you need the reasoning behind a rule, or a number someone quoted.
+**`docs/paper_2026_journal.md` maps every figure and table of the 2026 journal submission (tag
+`2026_journal_submission`) to its data and artifacts -- start there for reviewer revisions.**
 Also `docs/seed_headroom_report.md`, `docs/critic_advantage_eval_report.md`,
 `docs/seed_variance_mujoco_report.md`.
 
