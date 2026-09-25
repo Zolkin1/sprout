@@ -145,4 +145,31 @@ if not _registered:
             "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
         },
     )
+
+    ## =========================================
+    # SONIC baseline: NVIDIA's released whole-body tracker, for comparison / ablation
+    ## =========================================
+    # Same terrain, clips, terminations and episode length as the teacher play envs; SONIC's own
+    # G1 and action scale. The policy is NOT an rsl-rl checkpoint -- it is the released ONNX pair,
+    # driven by robot_rl.baselines.sonic. Run these through debug_episodes.py --policy sonic
+    # (there is no rsl-rl runner to load, so play.py does not apply). The rsl_rl entry point is
+    # still declared because the hydra task config plumbing expects one.
+    gym.register(
+        id="G1-sonic-terrain-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_sonic_env_cfg:G1SonicTerrainPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
+    gym.register(
+        id="G1-sonic-fm-terrain-play",
+        entry_point="isaaclab.envs:ManagerBasedRLEnv",
+        disable_env_checker=True,
+        kwargs={
+            "env_cfg_entry_point": f"{__name__}.g1_sonic_env_cfg:G1SonicFmTerrainPlayEnvCfg",
+            "rsl_rl_cfg_entry_point": f"{agents.__name__}.rsl_rl_ppo_cfg:PPORunnerCfg",
+        },
+    )
     _registered = True

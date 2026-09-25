@@ -640,6 +640,16 @@ class MotionSequenceCommand(BaseTrajectoryCommand):
         ``y_des``/``dy_des`` joint channels at steps ``self._step + offsets`` -- the
         look-ahead counterpart of the joint block in :meth:`reference_world_state`.
         Used by the data recorder to capture the ego-anchored clip future target.
+
+        **Channel order is the ARTICULATION's DOF order, not the clip's.**
+        ``_base_idx["joint_pos"]`` is built by
+        :meth:`~...base_trajectory_cmd.BaseTrajectoryCommand._reference_world_indices`, which
+        iterates ``self.robot.joint_names`` and looks each one up in
+        ``ordered_pos_output_names`` -- so the gather already reorders clip channels into the
+        robot's order and a caller must NOT permute again. Stated explicitly because assuming
+        "clip order" here silently scrambled the SONIC baseline's entire reference: the values
+        were right, the arrangement was not, so it commanded nonsense from the first step while
+        every value-wise check passed.
         """
         cid, steps = self._future_step_indices(offsets)
         y = self.manager.gather(self.manager.lib.y_des, cid, steps)    # [N, K, P]

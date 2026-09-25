@@ -177,8 +177,12 @@ def _commit_clip_reset(
     asset.write_joint_velocity_to_sim_index(velocity=joint_vel, env_ids=env_ids)
 
 
-def sample_terrain_clips(env_tid: torch.Tensor, groups: dict[int, torch.Tensor]) -> torch.Tensor:
-    """Sample, per env, a random clip whose ``terrain_id`` matches the env's tile.
+def sample_terrain_clips(
+    env_tid: torch.Tensor,
+    groups: dict[int, torch.Tensor],
+    clip_pick: int | None = None,
+) -> torch.Tensor:
+    """Choose, per env, a clip whose ``terrain_id`` matches the env's tile.
 
     Pure-tensor helper (no sim), shared by :func:`reset_on_terrain_motion_sequence`
     and its unit test.
@@ -188,6 +192,13 @@ def sample_terrain_clips(env_tid: torch.Tensor, groups: dict[int, torch.Tensor])
         groups: ``{terrain_id: clip_indices}`` (from
             :func:`...clips.clip_io.group_clips_by_terrain`); each value is a 1-D long
             tensor of clip indices for that terrain.
+        clip_pick: ``None`` (default) samples uniformly at random -- the training behaviour.
+            An int instead selects the ``clip_pick``-th clip of each terrain's group
+            (wrapping on short groups), which makes the assignment depend only on the tile.
+            A shared ``--seed`` is NOT enough for an A/B comparison: two policies terminate at
+            different steps, so their reset streams diverge and they stop drawing the same
+            clips after the first termination. Pinning removes the RNG from the choice
+            entirely, so "same clips" holds however the episodes play out.
 
     Returns:
         ``[k]`` long clip index per env, on ``env_tid``'s device.
@@ -210,7 +221,15 @@ def sample_terrain_clips(env_tid: torch.Tensor, groups: dict[int, torch.Tensor])
     for t in torch.unique(env_tid).tolist():
         mask = env_tid == t
         g = groups[int(t)].to(device)
-        pick = torch.randint(0, int(g.numel()), (int(mask.sum()),), device=device)
+        n = int(g.numel())
+        if clip_pick is None:
+            pick = torch.randint(0, n, (int(mask.sum()),), device=device)
+        else:
+            # Sorted so the k-th clip of a terrain is a property of the library, not of dict
+            # iteration order, and therefore reproducible across processes and runs.
+            pick = torch.full((int(mask.sum()),), int(clip_pick) % n, dtype=torch.long,
+                              device=device)
+            g = torch.sort(g).values
         clip_id[mask] = g[pick]
     return clip_id
 
@@ -221,6 +240,7 @@ def reset_on_terrain_motion_sequence(
     command_name: str,
     base_frame_name: str = "pelvis_link",
     asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+    clip_pick: int | None = None,
 ):
     """Reset each env onto a clip whose terrain matches the env's terrain tile.
 
@@ -246,6 +266,9 @@ def reset_on_terrain_motion_sequence(
         command_name: The :class:`MotionSequenceCommand` term name.
         base_frame_name: Trajectory base frame (must match the command cfg).
         asset_cfg: Robot asset config.
+        clip_pick: Forwarded to :func:`sample_terrain_clips`. ``None`` keeps the random
+            training behaviour; an int pins each tile to the same clip on every reset, which is
+            what a policy-vs-policy comparison needs (see that function's docstring).
     """
     from motion_gen.clips.clip_io import (
         group_clips_by_terrain,
@@ -288,7 +311,7 @@ def reset_on_terrain_motion_sequence(
 
     # 1. Per-env terrain id -> sample a matching clip + a start step.
     env_tid = importer.env_terrain_id[env_ids].to(torch.long)
-    clip_id = sample_terrain_clips(env_tid, groups)
+    clip_id = sample_terrain_clips(env_tid, groups, clip_pick=clip_pick)
     if cmd.cfg.random_start_phase:
         margin = int(round(cmd.cfg.random_start_min_remaining_s / cmd.manager.dt))
         # Per-clip: leave >= margin frames before EACH clip's OWN real end (clip_len), not num_steps,

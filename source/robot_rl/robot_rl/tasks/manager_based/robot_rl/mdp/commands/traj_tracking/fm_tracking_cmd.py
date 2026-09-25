@@ -115,6 +115,12 @@ class FmTrackingCommand(MotionSequenceCommand):
         self._robot_to_fm_jperm = torch.tensor(
             [robot_joints.index(nm) for nm in self.ctx.joint_names], dtype=torch.long, device=dev
         )
+        # The reverse: FM-order (``ctx.joint_names``) -> articulation order, for anything that has
+        # to answer in the robot's DOF order (see :meth:`get_future_joint_state`). Distinct from
+        # ``_fm_jperm``, which targets the clip-output layout of ``y_des``.
+        self._fm_to_robot_jperm = torch.tensor(
+            [self.ctx.joint_names.index(nm) for nm in robot_joints], dtype=torch.long, device=dev
+        )
         self._ee_body_idx = (
             torch.tensor([self.robot.body_names.index(f) for f in self.ctx.frame_names], dtype=torch.long, device=dev)
             if self.ctx.num_extra_frames > 0 else None
@@ -366,6 +372,38 @@ class FmTrackingCommand(MotionSequenceCommand):
             torch.where(use_fm, self._pred_root_quat[ar, idx], quat_c),
             torch.where(use_fm, self._pred_root_lin[ar, idx], lin_c),
             torch.where(use_fm, self._pred_root_ang[ar, idx], ang_c),
+        )
+
+    def get_future_joint_state(
+        self, offsets: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Future reference joint pos/vel ``([N, K, nj], [N, K, nj])``, source-selected per env.
+
+        The joint counterpart of :meth:`get_future_world_base`: serves the FM prediction's own
+        future window (``_pred_idx + offsets``, clamped to the F-step horizon) for warmed-up envs
+        and the clip look-ahead for the rest, matching how :meth:`_update_command` selects the
+        CURRENT step's joint targets.
+
+        Without this override the base class would answer from the CLIP even while the FM drives
+        the reference. The teacher never noticed, because its observations carry only the current
+        ``joint_pos_ref`` plus a future BASE pose -- no future joint window. A joint-space tracker
+        does: the SONIC baseline's entire reference is future joint targets, so on an FM run it
+        would have been handed the clip and quietly graded as though it were tracking the
+        generator.
+
+        Both branches come out in the **ARTICULATION's DOF order**, which is what the base class
+        returns (see its docstring). ``_pred_*`` is in ``ctx.joint_names`` order, so the FM branch
+        needs :attr:`_fm_to_robot_jperm` -- NOT ``_fm_jperm``, which targets the clip-output
+        layout used when writing ``y_des``. Mixing the two makes the FM branch disagree with the
+        clip branch, which is invisible to any per-value check.
+        """
+        jp_c, jv_c = super().get_future_joint_state(offsets)
+        idx = torch.clamp(self._pred_idx[:, None] + offsets[None, :], max=self.ctx.F - 1)  # [N,K]
+        ar = self._arange_n[:, None].expand_as(idx)
+        use_fm = self._pred_valid[:, None, None]
+        return (
+            torch.where(use_fm, self._pred_jp[ar, idx][..., self._fm_to_robot_jperm], jp_c),
+            torch.where(use_fm, self._pred_jv[ar, idx][..., self._fm_to_robot_jperm], jv_c),
         )
 
     # ------------------------------------------------------------------
