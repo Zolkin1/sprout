@@ -386,17 +386,24 @@ one (`gen_tracker_runner.py --fm_onnx`, `benchmark.py --fm`, `export_sensor_conf
   `extero_sensor_count`) are refused at load and need one `export_fm_onnx.py` call; the `.pt`
   is unaffected.
 
-## MVP: the depth-camera generator RUNS in sim2sim (2026-08-18)
+## MVP: the depth-camera generator RUNS in sim2sim (2026-08-18) — HISTORICAL
 
 The first generator trained on the 5-channel depth row drives the tracker through MuJoCo
-sim2sim, and the architecture is **working** — this is the minimum viable product for
+sim2sim, and the architecture is **working** — this was the minimum viable product for
 camera-only exteroception, replacing the privileged height scan on the deploy path.
 
-Covered in MuJoCo, with the generator in the loop: **flat ground, stairs UP, jump-ups,
-jump-downs.** **Stairs DOWN still needs work** and is the open item — the one locomotion mode
-the pair does not yet handle.
+**Kept as the record of when the architecture first ran, not as current status.** Both the pair
+below and its stairs-down verdict have been superseded: the deployed pair is named in "THE PAIR
+DROVE THE ROBOT", and the terrain numbers are in "What the harness has established". Do not
+quote this section for either.
 
-The pair, so the result is reproducible:
+Covered in MuJoCo at the time, with the generator in the loop: **flat ground, stairs UP,
+jump-ups, jump-downs**, with stairs DOWN the open item. That framing did not survive
+measurement: the eval harness finds `stairs_dn_pure` sits at an ~8-14%/tread hazard shared by
+all four stair families, i.e. long exposure rather than a unique defect. On the ROBOT, stairs
+have not been tested in either direction.
+
+The MVP-era pair, so that result stays reproducible — **not** the pair to run today:
 - generator `logs/flow_matching/2026-08-17_12-53-18_depth_xyz5_contract_v1` (epoch 94 of 100,
   EMA weights, 27M), exported as `<run>_best_banded_fm.onnx`
 - tracker `logs/rsl_rl/g1/2026-08-04_21-55-17_yaw_k12_v1` (`G1-teacher-clf-terrain-depth`),
@@ -452,13 +459,16 @@ rewritten offline while the motion stays exactly as recorded, which is what the 
   agree everywhere, hands included, to a few mm). `--save_dir` writes labelled colour panels and
   `--dump` feeds `scripts/rsl_rl/view_depth_compare_viser.py`, which shows both sims' robots,
   camera frames and hit clouds in 3-D.
-- The HANDS must stay real fixed-joint links (`robot_assets/g1/g1_21j/make_hand_links_urdf.py`,
-  asset `g1_21j_box_merged_29j_hands`). As bare `<visual>` elements on the wrist — how the stock
-  URDF ships them — the importer gives them a non-identity mesh->body offset, and
+- The HANDS must stay real fixed-joint links. As bare `<visual>` elements on the wrist — how the
+  stock URDF ships them — the importer gives them a non-identity mesh->body offset, and
   `MultiMeshRayCaster` does not intersect meshes on that path: the cameras saw every limb EXCEPT
   the hands while the viewer looked perfect. They are the only meshes that ever used that path,
-  which is why nothing else was affected. Joint count/order are unchanged by the fix (29, same
-  order), so checkpoints still load; only `body_names` grows 30 -> 46, old list an exact prefix.
+  which is why nothing else was affected. **The rule outlived the asset it was found on.** It was
+  measured on `g1_21j_box_merged_29j_hands`; the trained robot is now `g1_perceptive`, whose
+  passive rubber hands are still real links, decided in `make_perceptive_urdf.py`. The body-count
+  arithmetic from that era (30 -> 46, old list an exact prefix) is superseded and was WRONG to
+  carry forward: see "The robot is `g1_perceptive`" — 39 bodies, and `body_names` is **no longer
+  a prefix**, so positional indexing shifts silently.
 - sim2sim is ONNX-ONLY (the torch `gen_tracker_policy.py` is gone). The vendored torch FM copy
   (`transfer/fm`) is gone too — once deployment moved to ONNX and `fm_test_bench.py` was deleted,
   nothing loaded a model through it. What survives is `transfer/torch_math/quat_math.py`, the
@@ -537,6 +547,14 @@ Things here that are load-bearing and were each found by a failure:
 Tracker `2026-08-20_09-04-12_mode11_decor_v1`, generator
 `2026-08-22_12-26-34_mode11_decor_lag48_aug` (epoch 39/100). Clip-averaged, tile-clustered.
 
+**These numbers are the `robot_now` arm**, which the C++ deploy runtime refuses by design (see
+"The reference window has TWO conventions"). They are a statement about the generator, and a
+sound one -- the eval reads `window_anchor` off the checkpoint (`runner.py`) rather than off the
+task, so nothing here ran under the wrong convention -- but they are NOT a statement about the
+pair that drove the robot, which is `plan`-anchored. Until the `plan` pair is measured on the
+same 264 clips, read every number below as "the architecture, on the arm we could measure",
+not as the deployed system's score.
+
 - **The generator, not the tracker, is the limit**: fm/train 0.468 against clip/train 0.930,
   paired delta -0.462 [-0.513, -0.411], p<0.001 over 264 clips.
 - **Exposure bias is largely RULED OUT.** Teacher forcing (`fm_tf`) buys +0.078 overall, but
@@ -559,7 +577,10 @@ Tracker `2026-08-20_09-04-12_mode11_decor_v1`, generator
   loop, 0.073 teacher-forced, 0.087 after the lag-ring fix, against a clip ceiling of 0.939.
   Normalised per tread all four stair families share an ~8-14%/tread hazard, so its 0.048 is
   25.4 treads of exposure rather than a unique defect. Deprioritised in favour of the four
-  families that matter on hardware: `stairs_up`, `stairs_down`, `jump_on`, `jump_off_front`.
+  families closest to what a robot would be asked to do: `stairs_up`, `stairs_down`, `jump_on`,
+  `jump_off_front`. That is a judgement about intended use, NOT a read of hardware evidence --
+  the armed run covered flat ground and one box jump-up, and **stairs were not tested in either
+  direction**.
 - **~48% of FM-attributable falls on the transition families happen on FLAT ground**, before the
   terrain is reached.
 - **The augmentation was VERIFIED SOUND**, not a suspect: the delta-0 self-check's scan residual
@@ -1031,11 +1052,23 @@ rclpy, so `tests/test_params_are_live.py` fails the build on one (this bit `log`
 `log_decimation`, `config_name` and `fm_update_every`). The generator's re-plan cadence
 comes from `tracker.onnx` metadata and nowhere else.
 
-# STATE: the training refresh and the deploy stack are MERGED (2026-08-23)
+# STATE: the training refresh, the deploy stack and the eval harness are MERGED (2026-08-25)
 
-`worktree-robot-terrain-refresh` (the perceptive robot, terrain decoration, the `plan` anchor,
-the camera-lag model) and `cpp-deploy-port` (the C++ deploy runtime, the obelisk C++ controller,
-the two-box split, the ZED bring-up) are one tree. 12 files were touched by both; the four that
+Three lineages, one tree. `worktree-robot-terrain-refresh` (the perceptive robot, terrain
+decoration, the `plan` anchor, the camera-lag model) and `cpp-deploy-port` (the C++ deploy
+runtime, the obelisk C++ controller, the two-box split, the ZED bring-up) merged on 2026-08-23;
+`worktree-eval-harness` (`scripts/rsl_rl/eval/`, the terrain evaluation harness and
+`terrain_class.py`) merged main in on 2026-08-25.
+
+**What the eval merge was FOR**, since it is not obvious from its diff: `FmTrackingCommand`'s
+plan arm indexed `self._pred`, a buffer no class in the hierarchy allocates, so every `fm` /
+`fm_tf` cell against a `plan`-anchored tracker died inside `gym.make` -- and the grid catches a
+failing cell and continues, so the symptom was a cell missing from the report rather than an
+error. That is fixed on main (`a0ba8b7b`); this branch had already fixed the mirror-image bug on
+the CLIP arm (`window_anchor()` reaching for `_anchor_pos` with no generator loaded). Both are
+needed, and only together can the harness measure the pair that drove the robot.
+
+The 2026-08-23 merge, for the record: 12 files were touched by both; the four that
 conflicted were `gen_tracker.py`, `gen_tracker_metrics.py`, `robot.py` and `gen_tracker_runner.py`.
 
 Two resolutions worth knowing, because both branches had independently invented the same thing:
@@ -1101,6 +1134,21 @@ binaries. A default path to an artifact is a thing that rots quietly.
   Libraries record this in an `fk_refresh` attr.
 - `d66420e7`'s local scene tuning (jump-up boxes near spawn, `depth_near.yml viz` re-enabled) was
   lost in an earlier merge and has not been restored.
+
+Open on the EVAL side, from the harness's own findings:
+- **`jump_off` should be dropped from the eval AND from FM training.** It jumps BACKWARDS, which
+  no forward-facing camera can see, so teacher forcing on it credits the model with an
+  unobservable -- it is most of the apparent exposure-bias effect. Not yet removed from either.
+- **The terrain-misidentification split is unmade.** `terrain_class.py` shows stairs->jump
+  confusion rising from 0.104 open-loop to 0.174 closed-loop, but nothing yet dumps the depth
+  image beside a flagged plan, which is the one thing that separates "the image genuinely looks
+  box-like" from "image fine, plan wrong".
+- **A tracker-side perturbation, if built, should ramp with look-ahead and be drawn per re-plan.**
+  The measured FM error grows 5.1x from node 0 to node 50 and is rigid-dominated; a per-step
+  i.i.d. term is the wrong shape, and DR is already known not to be the lever.
+- **The eval manifest does not record `robot_asset`.** `evaluate.py:fm_contract` reads a fixed
+  key list that omits it, so a pre-mode_11 generator can be scored against the mode_11 robot in
+  silence -- exactly what the fingerprint catches on the deploy path.
 
 # General Guidelines
 - Don't care for backwards compatibility.
